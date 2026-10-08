@@ -161,6 +161,7 @@ bool Glm5Model::fast_setup(std::string& err) {
     auto* F = new FastState();
     fast_ = F;
     const Glm5Geometry& g = g_;
+    if (const char* rs = getenv("STRATA_GLM_RAM_SHADOW")) F->ram_shadow = std::atoi(rs) != 0;
     F->timing = getenv("STRATA_GLM_TIMING") != nullptr;
     F->prof_on = getenv("STRATA_GLM_PROF") != nullptr;
     if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("STRATA_GLM_PROF")));
@@ -1575,7 +1576,8 @@ void Glm5Model::fast_service() {
                     }
                     // exclusive tiers: its RAM copy is released at the next boundary (the fetch reads it now)
                     const int rs = F->ram_of[(size_t) key];
-                    if (rs >= 0 && R.st[(size_t) rs] == FastState::kRHold) R.st[(size_t) rs] = FastState::kRRelease;
+                    if (!F->ram_shadow && rs >= 0 && R.st[(size_t) rs] == FastState::kRHold)
+                        R.st[(size_t) rs] = FastState::kRRelease;
                 } else if (((fetch | miss) >> i) & 1u) {
                     F->scratch_uses.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -1623,7 +1625,8 @@ void Glm5Model::fast_service() {
                     for (int j = 0; j < gf::kSpares; ++j)
                         if (P1.spare[j] == s) P1.spare[j] = -1;
                     const int rs = F->ram_of[(size_t) key];
-                    if (rs >= 0 && R1.st[(size_t) rs] == FastState::kRHold) R1.st[(size_t) rs] = FastState::kRRelease;
+                    if (!F->ram_shadow && rs >= 0 && R1.st[(size_t) rs] == FastState::kRHold)
+                        R1.st[(size_t) rs] = FastState::kRRelease;
                     F->prefetches.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -1658,7 +1661,8 @@ void Glm5Model::fast_service() {
                             }
                             ++F->ah_used;
                         }
-                        if ((promo >> mi[m]) & 1u) {   // promoted: a pure staging use, freed at the boundary
+                        if ((promo >> mi[m]) & 1u && !F->ram_shadow) {
+                            // Exclusive tiers: a promoted disk read is only staging and frees at the boundary.
                             R.st[(size_t) rs] = FastState::kRRelease;
                             R.key[(size_t) rs] = -1;
                             F->ram_of[(size_t) key] = -1;
@@ -1677,10 +1681,11 @@ void Glm5Model::fast_service() {
                     if (rs >= 0) {
                         R.key[(size_t) rs] = key;
                         R.tick[(size_t) rs] = F->clock;
-                        R.st[(size_t) rs] = ((promo >> mi[m]) & 1u) ? FastState::kRRelease : FastState::kRNew;
-                        F->ram_of[(size_t) key] = ((promo >> mi[m]) & 1u) ? -1 : rs;
+                        const bool staging = ((promo >> mi[m]) & 1u) && !F->ram_shadow;
+                        R.st[(size_t) rs] = staging ? FastState::kRRelease : FastState::kRNew;
+                        F->ram_of[(size_t) key] = staging ? -1 : rs;
                         dst[m] = R.base + (size_t) rs * R.stride;
-                        if ((promo >> mi[m]) & 1u) R.key[(size_t) rs] = -1;   // a pure staging use: freed at the boundary
+                        if (staging) R.key[(size_t) rs] = -1;   // a pure staging use: freed at the boundary
                     } else {
                         dst[m] = F->stage[(size_t) m];
                     }
@@ -1983,6 +1988,8 @@ void Glm5Model::fast_boundary() {
                 const int key = R.key[(size_t) s];
                 const int ro = key >= 0 ? F->ram_of[(size_t) key] : -1;
                 if (key >= 0 && ro == s && F->slot_of[(size_t) key] < 0) continue;   // the normal case
+                if (F->ram_shadow && key >= 0 && ro == s && F->slot_of[(size_t) key] >= 0)
+                    continue;   // an intentional redundant copy; step (4) reclaims shadows before unique copies
                 if (key >= 0 && ro < 0 && F->slot_of[(size_t) key] < 0) {
                     F->ram_of[(size_t) key] = s;
                     upd(F->rtab_key(key), (unsigned long long) (R.base + (size_t) s * R.stride));
@@ -2054,20 +2061,44 @@ void Glm5Model::fast_boundary() {
             upd(F->tab_key(vkey), 0ull);
             F->slot_of[(size_t) vkey] = -1;
             ++P.evictions;
+            const int kept = F->ram_of[(size_t) vkey];
+            if (F->ram_shadow && kept >= 0 && R.st[(size_t) kept] == FastState::kRHold) {
+                // The bytes already live in RAM: reuse this VRAM slot without a device-to-host copy.
+                P.st[(size_t) v] = FastState::kSpare;
+                P.key[(size_t) v] = -1;
+                P.spare[j] = v;
+                upd(F->spare_key(il, j), (unsigned long long) P.slot_ptr(v));
+                continue;
+            }
             // demote it into the RAM tier: a free slot, else the RAM tier's victim (if colder than it)
             int rs = -1;
             uint32_t rc_min = UINT32_MAX;
+            bool redundant = false;
             for (int s2 = 0; s2 < R.n; ++s2)
                 if (R.st[(size_t) s2] == FastState::kRFree) {
                     rs = s2;
                     rc_min = 0;
                     break;
                 }
+            if (rs < 0 && F->ram_shadow) {
+                // Replace a redundant shadow before considering an expert's only RAM copy.  This preserves the
+                // combined VRAM+RAM working set while the hot set moves between the tiers.
+                uint64_t bt2 = UINT64_MAX;
+                for (int s2 = 0; s2 < R.n; ++s2) {
+                    if (R.st[(size_t) s2] != FastState::kRHold) continue;
+                    const int old = R.key[(size_t) s2];
+                    if (old >= 0 && F->slot_of[(size_t) old] >= 0 && R.tick[(size_t) s2] < bt2) {
+                        rs = s2;
+                        bt2 = R.tick[(size_t) s2];
+                        redundant = true;
+                    }
+                }
+            }
             if (rs < 0) {
                 rs = ram_victim(R);
                 if (rs >= 0) rc_min = F->cnt[(size_t) R.key[(size_t) rs]];
             }
-            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || rc_min < bc)) {
+            if (rs >= 0 && (redundant || R.st[(size_t) rs] == FastState::kRFree || rc_min < bc)) {
                 if (R.st[(size_t) rs] == FastState::kRHold) {
                     const int old = R.key[(size_t) rs];
                     F->left[(size_t) old] = 2;
@@ -2107,7 +2138,20 @@ void Glm5Model::fast_boundary() {
         int nfree = 0;
         for (char c : R.st) nfree += c == FastState::kRFree;
         while (nfree < keep_free) {
-            const int best = ram_victim(R);
+            int best = -1;
+            if (F->ram_shadow) {
+                // A shadow is redundant with VRAM, so reclaim it before removing an expert's only RAM copy.
+                uint64_t bt = UINT64_MAX;
+                for (int s = 0; s < R.n; ++s) {
+                    if (R.st[(size_t) s] != FastState::kRHold) continue;
+                    const int key = R.key[(size_t) s];
+                    if (key >= 0 && F->slot_of[(size_t) key] >= 0 && R.tick[(size_t) s] < bt) {
+                        best = s;
+                        bt = R.tick[(size_t) s];
+                    }
+                }
+            }
+            if (best < 0) best = ram_victim(R);
             if (best < 0) break;
             upd(F->rtab_key(R.key[(size_t) best]), 0ull);
             F->ram_of[(size_t) R.key[(size_t) best]] = -1;

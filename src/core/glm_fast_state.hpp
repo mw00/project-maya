@@ -298,6 +298,9 @@ struct Glm5Model::FastState {
     uint64_t diag_disk[4] = {0, 0, 0, 0}, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_b = 0;
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
     size_t ram_bytes = 0;
+    // STRATA_GLM_RAM_SHADOW: keep promoted experts' existing RAM copies while space permits; these redundant
+    // shadows are the first RAM slots reclaimed when the tier needs room.
+    bool ram_shadow = false;
     // ---- demotions VRAM -> RAM (copy stream, D2H) of the victims that make room for spares
     struct Drain {
         int il, vslot, key, rclass, rslot;

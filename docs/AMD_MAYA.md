@@ -34,6 +34,20 @@ Available RAM, rather than installed RAM, determines how much can be cached.
 The engine reduces its RAM-tier allocation if ROCm cannot pin the requested
 amount.
 
+## RAM shadows (`STRATA_GLM_RAM_SHADOW=1`)
+
+With the default exclusive tiers an expert lives in VRAM or in the RAM tier, never both: promoting it frees its RAM
+copy, and when it is evicted from VRAM later it is either copied back or reread from the SSD. With
+`STRATA_GLM_RAM_SHADOW=1` the RAM copy stays as a shadow while the RAM tier has room; shadows are the first RAM slots
+reclaimed, and an evicted expert that still has one needs no copy back. It helps when the RAM tier is large enough to
+hold most of the model (here a 90 GB tier). Measured on v1.0.11, Maya-S, greedy, 256-token answers:
+
+| | exclusive | RAM shadows |
+|---|---|---|
+| one RX 7900 XT, answers | 15.2 tok/s | 18.5 tok/s |
+| one RX 7900 XT, SSD read per request | 13.2 GB | 4.6 GB |
+| R9700 + RX 7900 XT, answers | 33.2 tok/s | 35.6 tok/s |
+
 ## Prompt speed
 
 Prompts run in chunks, and inside a chunk the mixers and the dense FFN run in
