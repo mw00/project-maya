@@ -1938,6 +1938,25 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
     const int64_t lat_floats = fast_mode_ ? (int64_t) g_.kv_lora * max_ctx / 2 : (int64_t) g_.kv_lora * max_ctx;
+    // the indexer's key/gate rows: a ring on the fast path (glm_model.hpp, ik_ring_).  It must hold the rows a prompt
+    // sub-batch writes plus the kpool - 1 before it (the pools it completes) - 8192 covers every mixer sub-batch
+    // (STRATA_GLM_PREFILL_SUB tops out at 8192); the NextN block's prompt fill runs in sub-batches of the same bound.
+    ik_ring_ = 0;
+    if (fast_mode_) {
+        const int64_t kp = g_.idx_kpool;
+        int64_t ring = ((8192 + kp + kp - 1) / kp) * kp;
+        if (const char* r = getenv("STRATA_GLM_IK_RING")) {
+            const long long v = std::atoll(r);
+            if (v < 0 || (v > 0 && v < 2 * kp)) {
+                err = std::string("STRATA_GLM_IK_RING: ") + r + " (0 = off, else at least " + std::to_string(2 * kp) +
+                      " positions)";
+                return false;
+            }
+            ring = v == 0 ? 0 : ((v + kp - 1) / kp) * kp;
+        }
+        if (ring > 0 && ring < max_ctx) ik_ring_ = ring;
+    }
+    const int64_t ik_rows = ik_ring_ > 0 ? ik_ring_ : max_ctx;
     // (one entry past the trunk: the NextN block's DSA caches, when this half carries it)
     kda_S_.assign((size_t) g_.n_layers + 1, 0);
     kda_conv_.assign((size_t) g_.n_layers + 1, 0);
@@ -1949,9 +1968,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         dsa_lat_[(size_t) mtp_il_] = floats;
         floats += lat_floats;
         dsa_ik_[(size_t) mtp_il_] = floats;
-        floats += (int64_t) g_.idx_key * max_ctx;
+        floats += (int64_t) g_.idx_key * ik_rows;
         dsa_ig_[(size_t) mtp_il_] = floats;
-        floats += (int64_t) g_.idx_key * max_ctx;
+        floats += (int64_t) g_.idx_key * ik_rows;
         dsa_pool_[(size_t) mtp_il_] = floats;
         floats += (int64_t) g_.idx_key * max_pools;
     }
@@ -1966,9 +1985,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             dsa_lat_[(size_t) il] = floats;
             floats += lat_floats;
             dsa_ik_[(size_t) il] = floats;
-            floats += (int64_t) g_.idx_key * max_ctx;
+            floats += (int64_t) g_.idx_key * ik_rows;
             dsa_ig_[(size_t) il] = floats;
-            floats += (int64_t) g_.idx_key * max_ctx;
+            floats += (int64_t) g_.idx_key * ik_rows;
             dsa_pool_[(size_t) il] = floats;
             floats += (int64_t) g_.idx_key * max_pools;
         }

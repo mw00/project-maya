@@ -121,6 +121,7 @@ struct DsaPrepArgs {
     const float* ape = nullptr; float* pooled = nullptr;
     int idx_key = 128, kpool = 4;
     int p = 0;
+    int ring = 0;   // the ik / ig caches hold position p in row p % ring (0: row p) - a multiple of kpool
     float eps = 1e-5f;
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);

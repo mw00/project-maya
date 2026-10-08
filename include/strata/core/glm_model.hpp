@@ -197,6 +197,12 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
+    // the indexer's key and gate rows (dsa_ik_ / dsa_ig_) are read only to build the pool their position completes, so
+    // the fast path keeps them in a RING of ik_ring_ positions (a multiple of idx_kpool; position p in row p % ik_ring_)
+    // instead of max_ctx rows; 0 = no ring (row p).  The unfinished pool's rows are running state: the snapshot keeps
+    // them (snap_tail_).  STRATA_GLM_IK_RING=0 turns the ring off, =<n> sets its positions.
+    int64_t ik_ring_ = 0;
+    int64_t ik_row(int64_t p) const { return ik_ring_ > 0 ? p % ik_ring_ : p; }
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -349,6 +355,9 @@ public:
     int fast_sample(strata::kernels::SamplerParams& sp, std::string& err);   // this half's logits, sampled on its stream
     int64_t ram_budget_ = -1;                              // bytes of pinned RAM tier for this half (-1: derive)
     float* snap_ = nullptr;                                // the saved KDA states + conv histories (this half)
+    float* snap_tail_ = nullptr;                           // ... and every DSA layer's unfinished pool (ik, ig rows)
+    std::vector<int> snap_dsa_layers() const;              // the DSA layers here in snapshot order (NextN block first)
+    bool snap_tail_copy(int64_t n, bool restore);          // the unfinished pool at position n <-> snap_tail_ (async)
     int64_t snap_pos_ = -1;
     std::string pack_dir_;
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers

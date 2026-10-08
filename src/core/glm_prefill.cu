@@ -1368,14 +1368,22 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.idx_key = g.idx_key;
                 d.p0 = pt;
                 d.T = tn;
+                d.ring = (int) ik_ring_;
                 d.eps = g.norm_eps;
+                // the ring holds this sub-batch's rows and the kpool - 1 before it (glm_model.cu sizes it for 8192)
+                const int kp = g.idx_kpool;
+                if (ik_ring_ > 0 && (int64_t) tn + kp > ik_ring_) {
+                    err = "glm prefill: a sub-batch of " + std::to_string(tn) + " tokens exceeds the indexer ring (" +
+                          std::to_string(ik_ring_) + " positions; STRATA_GLM_IK_RING)";
+                    return false;
+                }
                 gb::dsa_prep(d, s);
                 // the pools completed inside this sub-batch: pool pi ends at position (pi + 1) * kpool - 1
-                const int kp = g.idx_kpool;
                 const int pool_lo = (pt + kp) / kp - 1, pool_hi = (pt + tn) / kp - 1;
                 if (pool_hi >= pool_lo)
                     gb::dsa_pool(state_ + dsa_ik_[(size_t) il], state_ + dsa_ig_[(size_t) il], Ly.ape,
-                                 state_ + dsa_pool_[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s);
+                                 state_ + dsa_pool_[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
+                                 (int) ik_ring_);
                 hgemm_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr16, g.q_lora, B.q, g.n_head * g.qk_nope, tn, 0.0f);
                 sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq, g.idx_heads * g.idx_key,
                            tn, 1.0f);
@@ -2220,27 +2228,35 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
             sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
             sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f);
-            gb::DsaPrepArgs d;
-            d.kv_raw = kv;
-            d.kv_norm = Ly.kv_a_norm;
-            d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
-            d.kv_lora = g.kv_lora;
-            d.ik_raw = ik;
-            d.k_norm_w = Ly.k_norm_w;
-            d.k_norm_b = Ly.k_norm_b;
-            d.ik_cache = state_ + dsa_ik_[(size_t) mtp_il_];
-            d.ig_raw = ig;
-            d.ig_cache = state_ + dsa_ig_[(size_t) mtp_il_];
-            d.idx_key = g.idx_key;
-            d.p0 = (int) p0;
-            d.T = Tv;
-            d.eps = g.norm_eps;
-            gb::dsa_prep(d, s);
+            // the cache fill in sub-batches the indexer ring holds (each with the kpool - 1 rows before it)
             const int kp = g.idx_kpool;
-            const int pool_lo = (int) ((p0 + kp) / kp - 1), pool_hi = (int) ((p0 + Tv) / kp - 1);
-            if (pool_hi >= pool_lo)
-                gb::dsa_pool(state_ + dsa_ik_[(size_t) mtp_il_], state_ + dsa_ig_[(size_t) mtp_il_], Ly.ape,
-                             state_ + dsa_pool_[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s);
+            const int step = ik_ring_ > 0 ? (int) std::min<int64_t>(Tv, ik_ring_ - kp) : Tv;
+            for (int t0 = 0; t0 < Tv; t0 += step) {
+                const int tn = std::min(step, Tv - t0);
+                const int64_t pt = p0 + t0;
+                gb::DsaPrepArgs d;
+                d.kv_raw = kv + (size_t) t0 * g.kv_lora;
+                d.kv_norm = Ly.kv_a_norm;
+                d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+                d.kv_lora = g.kv_lora;
+                d.ik_raw = ik + (size_t) t0 * g.idx_key;
+                d.k_norm_w = Ly.k_norm_w;
+                d.k_norm_b = Ly.k_norm_b;
+                d.ik_cache = state_ + dsa_ik_[(size_t) mtp_il_];
+                d.ig_raw = ig + (size_t) t0 * g.idx_key;
+                d.ig_cache = state_ + dsa_ig_[(size_t) mtp_il_];
+                d.idx_key = g.idx_key;
+                d.p0 = (int) pt;
+                d.T = tn;
+                d.ring = (int) ik_ring_;
+                d.eps = g.norm_eps;
+                gb::dsa_prep(d, s);
+                const int pool_lo = (int) ((pt + kp) / kp - 1), pool_hi = (int) ((pt + tn) / kp - 1);
+                if (pool_hi >= pool_lo)
+                    gb::dsa_pool(state_ + dsa_ik_[(size_t) mtp_il_], state_ + dsa_ig_[(size_t) mtp_il_], Ly.ape,
+                                 state_ + dsa_pool_[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
+                                 (int) ik_ring_);
+            }
             S->mark("mtp_cache", s);
         }
     }

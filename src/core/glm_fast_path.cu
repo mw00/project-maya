@@ -1769,6 +1769,10 @@ void Glm5Model::fast_destroy() {
         cudaFree(snap_);
         snap_ = nullptr;
     }
+    if (snap_tail_) {
+        cudaFree(snap_tail_);
+        snap_tail_ = nullptr;
+    }
     if (kda_bak_) {
         cudaFree(kda_bak_);
         kda_bak_ = nullptr;
@@ -2821,6 +2825,7 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     d.idx_key = g.idx_key;
     d.kpool = g.idx_kpool;
     d.p = (int) p;
+    d.ring = (int) ik_ring_;
     d.eps = g.norm_eps;
     gf::dsa_prep(d, s);
     if (F->prof_on) F->mark("dsa_prep");
@@ -3578,8 +3583,44 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
 
 // ---------------------------------------------------------------- conversation reuse
 // The sequence state that cannot be rebuilt from the position alone is the KDA layers' recurrent state and conv
-// history (one contiguous run per KDA layer in state_); the DSA caches are append-only, so restoring the position
-// is enough for them (entries past it are rewritten as the new tokens arrive).
+// history (one contiguous run per KDA layer in state_) and each DSA layer's unfinished pool - the indexer key/gate rows
+// of the positions since the last complete pool, which live in a ring (ik_ring_) that later positions overwrite.  The
+// rest of the DSA caches is append-only, so restoring the position is enough for it (entries past it are rewritten
+// as the new tokens arrive).
+std::vector<int> Glm5Model::snap_dsa_layers() const {
+    std::vector<int> v;
+    if (mtp_il_ >= 0) v.push_back(mtp_il_);
+    for (int il = l0_; il < l1_; ++il)
+        if (!g_.is_recr(il)) v.push_back(il);
+    return v;
+}
+
+// per DSA layer: kpool ik rows, then kpool ig rows (the first n % kpool of each hold the unfinished pool)
+bool Glm5Model::snap_tail_copy(int64_t n, bool restore) {
+    const Glm5Geometry& g = g_;
+    const std::vector<int> ls = snap_dsa_layers();
+    if (ls.empty()) return true;
+    const int64_t kp = g.idx_kpool, K = g.idx_key, per = 2 * kp * K;
+    if (snap_tail_ == nullptr && cudaMalloc(&snap_tail_, (size_t) ls.size() * per * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        snap_tail_ = nullptr;
+        return false;
+    }
+    const int64_t r = n % kp;
+    if (r == 0) return true;
+    const int64_t row = ik_row(n - r);   // the pool's first member: its r rows are contiguous (ring % kpool == 0)
+    for (size_t j = 0; j < ls.size(); ++j) {
+        float* ik = state_ + dsa_ik_[(size_t) ls[j]] + K * row;
+        float* ig = state_ + dsa_ig_[(size_t) ls[j]] + K * row;
+        float* t = snap_tail_ + (size_t) j * per;
+        cudaMemcpyAsync(restore ? ik : t, restore ? t : ik, (size_t) (r * K) * sizeof(float), cudaMemcpyDeviceToDevice,
+                        fast_->cs);
+        cudaMemcpyAsync(restore ? ig : t + kp * K, restore ? t + kp * K : ig, (size_t) (r * K) * sizeof(float),
+                        cudaMemcpyDeviceToDevice, fast_->cs);
+    }
+    return true;
+}
+
 bool Glm5Model::snapshot_save() {
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
@@ -3600,6 +3641,10 @@ bool Glm5Model::snapshot_save() {
             if (g.is_recr(il))
                 cudaMemcpyAsync(m->snap_ + (size_t) k++ * run, m->state_ + m->kda_S_[(size_t) il], run * sizeof(float),
                                 cudaMemcpyDeviceToDevice, m->fast_->cs);
+        if (!m->snap_tail_copy(pos_, false)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
         cudaStreamSynchronize(m->fast_->cs);
         m->snap_pos_ = pos_;
     }
@@ -3619,6 +3664,10 @@ bool Glm5Model::snapshot_restore() {
             if (g.is_recr(il))
                 cudaMemcpyAsync(m->state_ + m->kda_S_[(size_t) il], m->snap_ + (size_t) k++ * run, run * sizeof(float),
                                 cudaMemcpyDeviceToDevice, m->fast_->cs);
+        if (!m->snap_tail_copy(m->snap_pos_, true)) {
+            cudaSetDevice(dev_);
+            return false;
+        }
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
     }
@@ -3628,29 +3677,27 @@ bool Glm5Model::snapshot_restore() {
 
 // ---------------------------------------------------------------- conversation slots
 // A conversation set aside while others run: per half, the snapshot's KDA states (snap_, taken just before its prompt's
-// last token) and every DSA cache's rows up to that position - the latents, the indexer's two key rows and the pools,
-// the NextN block's too.  The file: a header (magic, halves, positions, per half its layer range and run sizes), then
-// per half the KDA snapshot and the DSA runs in that order.
+// last token), its DSA layers' unfinished pools (snap_tail_) and every DSA cache's rows up to that position - the
+// latents and the pools, the NextN block's too.  The file: a header (magic, halves, positions, per half its layer
+// range and run sizes), then per half the KDA snapshot and the runs in that order.
 namespace {
-constexpr uint64_t kSlotMagic = 0x3154534C4159414Dull;   // "MAYALST1"
+constexpr uint64_t kSlotMagic = 0x3254534C4159414Dull;   // "MAYALST2" (v2: the indexer rows as the unfinished pool)
 
-// (state_ offset, floats) of each DSA cache run a slot of n positions holds on one half, in file order
-std::vector<std::pair<int64_t, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bool fast_mode, int l0, int l1, int mtp_il,
-                                                       const std::vector<int64_t>& lat, const std::vector<int64_t>& ik,
-                                                       const std::vector<int64_t>& ig, const std::vector<int64_t>& pool,
-                                                       int64_t n) {
-    std::vector<std::pair<int64_t, int64_t>> r;
+// (device pointer, floats) of each run a slot of n positions holds on one half besides the KDA snapshot, in file order
+std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bool fast_mode, float* state,
+                                                      float* tail, const std::vector<int>& layers,
+                                                      const std::vector<int64_t>& lat,
+                                                      const std::vector<int64_t>& pool, int64_t n) {
+    std::vector<std::pair<float*, int64_t>> r;
     const int64_t lat_pp = fast_mode ? g.kv_lora / 2 : g.kv_lora;   // FP16 latents take half a float each
     const int64_t pools = (n + g.idx_kpool - 1) / g.idx_kpool;
-    const auto dsa = [&](size_t il) {
-        r.push_back({lat[il], n * lat_pp});
-        r.push_back({ik[il], n * g.idx_key});
-        r.push_back({ig[il], n * g.idx_key});
-        r.push_back({pool[il], pools * g.idx_key});
-    };
-    if (mtp_il >= 0) dsa((size_t) mtp_il);
-    for (int il = l0; il < l1; ++il)
-        if (!g.is_recr(il)) dsa((size_t) il);
+    const int64_t per = 2 * (int64_t) g.idx_kpool * g.idx_key;
+    for (size_t j = 0; j < layers.size(); ++j) {
+        const size_t il = (size_t) layers[j];
+        r.push_back({state + lat[il], n * lat_pp});
+        r.push_back({tail + (int64_t) j * per, per});
+        r.push_back({state + pool[il], pools * g.idx_key});
+    }
     return r;
 }
 }  // namespace
@@ -3682,8 +3729,12 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
         int32_t n_rec = 0;
         for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
-        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->l0_, m->l1_, m->mtp_il_, m->dsa_lat_, m->dsa_ik_,
-                                        m->dsa_ig_, m->dsa_pool_, n);
+        if (m->snap_tail_ == nullptr && !m->snap_dsa_layers().empty()) {
+            err = "no snapshot tail to save";
+            return 0;
+        }
+        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->state_, m->snap_tail_, m->snap_dsa_layers(), m->dsa_lat_,
+                                        m->dsa_pool_, n);
         const int32_t hdr[4] = {m->l0_, m->l1_, n_rec, (int32_t) runs.size()};
         put(hdr, sizeof(hdr));
         put(&run, 8);
@@ -3694,7 +3745,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
         t_sync += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();
         std::vector<std::pair<const float*, int64_t>> src;
         if (n_rec > 0) src.push_back({m->snap_, (int64_t) n_rec * run});
-        for (const auto& r : runs) src.push_back({m->state_ + r.first, r.second});
+        for (const auto& r : runs) src.push_back({r.first, r.second});
         for (const auto& s : src) {
             constexpr int64_t kChunk = (int64_t) 16 << 20;   // floats
             for (int64_t at = 0; at < s.second; at += kChunk) {
@@ -3754,8 +3805,19 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
         int32_t n_rec = 0;
         for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
-        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->l0_, m->l1_, m->mtp_il_, m->dsa_lat_, m->dsa_ik_,
-                                        m->dsa_ig_, m->dsa_pool_, n);
+        const std::vector<int> dls = m->snap_dsa_layers();
+        cudaSetDevice(m->dev_);
+        if (m->snap_tail_ == nullptr && !dls.empty() &&
+            cudaMalloc(&m->snap_tail_, dls.size() * 2 * (size_t) g.idx_kpool * g.idx_key * sizeof(float)) !=
+                cudaSuccess) {
+            cudaGetLastError();
+            m->snap_tail_ = nullptr;
+            cudaSetDevice(dev_);
+            err = "the snapshot tail did not allocate";
+            return false;
+        }
+        cudaSetDevice(dev_);
+        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->state_, m->snap_tail_, dls, m->dsa_lat_, m->dsa_pool_, n);
         int32_t hdr[4] = {};
         int64_t frun = 0;
         if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || hdr[0] != m->l0_ || hdr[1] != m->l1_ || hdr[2] != n_rec ||
@@ -3782,7 +3844,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         }
         std::vector<std::pair<float*, int64_t>> dst;
         if (n_rec > 0) dst.push_back({m->snap_, (int64_t) n_rec * run});
-        for (const auto& r : runs) dst.push_back({m->state_ + r.first, r.second});
+        for (const auto& r : runs) dst.push_back({r.first, r.second});
         for (const auto& d : dst) {
             constexpr int64_t kChunk = (int64_t) 16 << 20;
             for (int64_t at = 0; at < d.second; at += kChunk) {

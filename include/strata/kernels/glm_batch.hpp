@@ -75,12 +75,13 @@ struct DsaPrepArgs {
     const float* ig_raw = nullptr; float* ig_cache = nullptr;
     int idx_key = 128;
     int p0 = 0, T = 0;
+    int ring = 0;   // the ik / ig caches hold position p in row p % ring (0: row p) - a multiple of kpool
     float eps = 1e-5f;
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
-/// The pooled keys of pools [pool0, pool0 + n) (their cells all in the caches).
+/// The pooled keys of pools [pool0, pool0 + n) (their cells all in the caches; ring as in DsaPrepArgs).
 void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, float* pooled, int idx_key, int kpool,
-              int pool0, int n, cudaStream_t s);
+              int pool0, int n, cudaStream_t s, int ring = 0);
 /// score[t][p] = sum_h relu(iq[t]_h . pooled_p) * iw[t][h] for the pools visible at position p0 + t.
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int p0, int kpool,
                int T, int max_vis, float* score, int score_ld, cudaStream_t s);

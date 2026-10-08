@@ -1566,19 +1566,22 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ D
     const float s2 = block_sum(v * v, sred);
     const float mu = s1 / (float) K;
     const float inv = rsqrtf(s2 / (float) K - mu * mu + a.eps);
+    // (a ring of a.ring rows, a multiple of kpool: a pool's members stay contiguous)
+    const size_t row = (size_t) (a.ring > 0 ? a.p % a.ring : a.p);
     if (tid < K) {
-        a.ik_cache[(size_t) K * a.p + tid] = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
-        a.ig_cache[(size_t) K * a.p + tid] = a.ig_raw[tid];
+        a.ik_cache[(size_t) K * row + tid] = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
+        a.ig_cache[(size_t) K * row + tid] = a.ig_raw[tid];
     }
     if ((a.p + 1) % a.kpool != 0) return;
     __syncthreads();
     __threadfence_block();
     const int pi = (a.p + 1) / a.kpool - 1;
+    const size_t row0 = row + 1 - (size_t) a.kpool;   // the pool's first member
     if (tid < K) {
         float lg[16];
         float mx = -INFINITY;
         for (int m = 0; m < a.kpool; ++m) {
-            lg[m] = a.ig_cache[(size_t) tid + (size_t) K * (pi * a.kpool + m)] + a.ape[tid + K * m];
+            lg[m] = a.ig_cache[(size_t) tid + (size_t) K * (row0 + m)] + a.ape[tid + K * m];
             mx = fmaxf(mx, lg[m]);
         }
         float den = 0.0f;
@@ -1588,7 +1591,7 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ D
         }
         float acc = 0.0f;
         for (int m = 0; m < a.kpool; ++m)
-            acc += (lg[m] / den) * a.ik_cache[(size_t) tid + (size_t) K * (pi * a.kpool + m)];
+            acc += (lg[m] / den) * a.ik_cache[(size_t) tid + (size_t) K * (row0 + m)];
         a.pooled[(size_t) tid + (size_t) K * pi] = acc;
     }
 }

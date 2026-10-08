@@ -473,20 +473,23 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
     const float s2 = block_sum(v * v, sred);
     const float mu = s1 / (float) K;
     const float inv = rsqrtf(s2 / (float) K - mu * mu + a.eps);
+    const size_t row = (size_t) (a.ring > 0 ? p % a.ring : p);   // a ring of a.ring rows (0: row p)
     if (tid < K) {
-        a.ik_cache[(size_t) K * p + tid] = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
-        a.ig_cache[(size_t) K * p + tid] = a.ig_raw[(size_t) t * K + tid];
+        a.ik_cache[(size_t) K * row + tid] = (v - mu) * inv * a.k_norm_w[tid] + a.k_norm_b[tid];
+        a.ig_cache[(size_t) K * row + tid] = a.ig_raw[(size_t) t * K + tid];
     }
 }
 
 __global__ void dsa_pool_kernel(const float* __restrict__ ik, const float* __restrict__ ig, const float* __restrict__ ape,
-                                float* __restrict__ pooled, int K, int kpool, int pool0) {
+                                float* __restrict__ pooled, int K, int kpool, int pool0, int ring) {
     const int pi = pool0 + blockIdx.x, tid = threadIdx.x;
     if (tid >= K) return;
+    // the pool's first member's row (ring a multiple of kpool: the members stay contiguous)
+    const size_t row0 = (size_t) (ring > 0 ? ((int64_t) pi * kpool) % ring : (int64_t) pi * kpool);
     float lg[16];
     float mx = -INFINITY;
     for (int m = 0; m < kpool && m < 16; ++m) {
-        lg[m] = ig[(size_t) tid + (size_t) K * (pi * kpool + m)] + ape[tid + K * m];
+        lg[m] = ig[(size_t) tid + (size_t) K * (row0 + m)] + ape[tid + K * m];
         mx = fmaxf(mx, lg[m]);
     }
     float den = 0.0f;
@@ -495,7 +498,7 @@ __global__ void dsa_pool_kernel(const float* __restrict__ ik, const float* __res
         den += lg[m];
     }
     float acc = 0.0f;
-    for (int m = 0; m < kpool && m < 16; ++m) acc += (lg[m] / den) * ik[(size_t) tid + (size_t) K * (pi * kpool + m)];
+    for (int m = 0; m < kpool && m < 16; ++m) acc += (lg[m] / den) * ik[(size_t) tid + (size_t) K * (row0 + m)];
     pooled[(size_t) tid + (size_t) K * pi] = acc;
 }
 
@@ -1673,9 +1676,10 @@ void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
 }
 
 void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, float* pooled, int idx_key, int kpool,
-              int pool0, int n, cudaStream_t s) {
+              int pool0, int n, cudaStream_t s, int ring) {
     if (n <= 0) return;
-    dsa_pool_kernel<<<n, ((idx_key + 31) / 32) * 32, 0, s>>>(ik_cache, ig_cache, ape, pooled, idx_key, kpool, pool0);
+    dsa_pool_kernel<<<n, ((idx_key + 31) / 32) * 32, 0, s>>>(ik_cache, ig_cache, ape, pooled, idx_key, kpool, pool0,
+                                                             ring);
     check("dsa_pool");
 }
 
