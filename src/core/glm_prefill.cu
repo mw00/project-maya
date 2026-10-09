@@ -502,6 +502,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
         if (has_dsa) { Carve d; carve_dsa(d, ts, g, S->max_pools); uni = std::max(uni, d.off); }
         if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
         if (has_moe) { Carve m; carve_moe(m, T, (size_t) S->sh_sub(), g); uni = std::max(uni, m.off); }
+        // the NextN block's cache fill (prefill_carve takes the same): it outgrows the MoE's region past ~9K tokens -
+        // left out here, a longer chunk on the half that carries the block carved past the lent tail
+        if (mtp_il_ >= 0) uni = std::max(uni, T * (size_t) (6 * g.n_embd + g.kv_lora + 2 * g.idx_key) * 4 + 8 * 256);
         return std::make_pair(c.off, uni);
     };
     // the budget: two GPUs ~6% of the card, 1-2 GB.  A bigger chunk re-stages the non-resident experts fewer times per
@@ -2321,7 +2324,14 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
                                             : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
-        m->prefill_carve(Trun);
+        // the chunk's buffers must fit the tail the pool lends (a carve past it wrote into other allocations)
+        if (m->prefill_carve(Trun) > m->pf_->region_bytes) {
+            err = "glm prefill: CUDA" + std::to_string(m->dev_) + " a chunk of " + std::to_string(Trun) + " tokens needs " +
+                  std::to_string(m->pf_->need >> 20) + " MB, the pool lends " +
+                  std::to_string(m->pf_->region_bytes >> 20) + " MB (STRATA_GLM_PREFILL_CHUNK / _MB)";
+            cudaSetDevice(dev_);
+            return false;
+        }
         m->prefill_lend();
     }
     const bool ok = prefill_run(tokens, err);
