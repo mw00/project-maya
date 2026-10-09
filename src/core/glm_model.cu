@@ -100,11 +100,65 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
     return true;
 }
 
+// a dense row's kind, as STRATA_GLM_TIMING names it (by the name after "blk.<il>.")
+static std::string dense_kind_of(const std::string& n) {
+    if (n == "output.weight") return "output head";
+    if (n.find("_shexp") != std::string::npos) return "shared experts";
+    if (n.find("ffn_gate_inp") != std::string::npos) return "routers";
+    if (n.find("attn_k_b") != std::string::npos || n.find("attn_v_b") != std::string::npos) return "mla k_b/v_b";
+    if (n.find("attn_q_a") != std::string::npos || n.find("attn_q_b") != std::string::npos ||
+        n.find("attn_kv_a") != std::string::npos) return "mla q/kv";
+    if (n.find("indexer") != std::string::npos || n.find("idx") != std::string::npos) return "dsa indexer";
+    if (n.find("attn_q.") != std::string::npos || n.find("attn_k.") != std::string::npos ||
+        n.find("attn_v.") != std::string::npos) return "kda q/k/v";
+    if (n.find("attn_output") != std::string::npos) return "attn output";
+    if (n.find("ssm_") != std::string::npos) return "kda small";
+    if (n.find("hc_") != std::string::npos) return "mhc";
+    if (n.find("ffn_") != std::string::npos) return "dense ffn";
+    if (n.find("norm") != std::string::npos) return "norms";
+    return "other";
+}
+
+// STRATA_GLM_DENSE_QUANT=q5_k|q4_k (fast path): the natively served dense rows of a higher-precision type (Q6_K, Q8_0)
+// are requantized to that type at load - VRAM for the expert pool and fewer bytes read a token, at a quality cost
+// (measure it: STRATA_GLM_SCORE).  STRATA_GLM_DENSE_QUANT<n> = one GPU's own (CUDA<n> of the split; 0 = off),
+// STRATA_GLM_DENSE_QUANT_FROM=<layer> = only from that layer on, STRATA_GLM_DENSE_QUANT_KINDS=<kind,..> = those kinds
+// (dense_kind_of's names; default every kind but the output head).  The files are not touched.
+// The setting for a device: the ggml type, -1 = off, -2 = not a valid value.
+static int dense_quant_setting(int dev) {
+    const char* d = dev >= 0 ? getenv(("STRATA_GLM_DENSE_QUANT" + std::to_string(dev)).c_str()) : nullptr;
+    const char* v = d != nullptr ? d : getenv("STRATA_GLM_DENSE_QUANT");
+    if (v == nullptr || v[0] == '\0' || std::string(v) == "0") return -1;
+    const std::string s = v;
+    return s == "q5_k" ? 13 : s == "q4_k" ? 12 : s == "q6_k" ? 14 : -2;
+}
+// the type a row is requantized to on that device (-1: kept as it is)
+static int dense_requant_to(const std::string& name, const strata::TensorInfo* t, int dev, bool fast) {
+    const int target = fast ? dense_quant_setting(dev) : -1;
+    if (target < 0 || t == nullptr || name.rfind("blk.", 0) != 0) return -1;
+    const auto bpw = [](int ty) { return ty == 8 ? 8.5 : ty == 14 ? 6.5625 : ty == 13 ? 5.5 : ty == 12 ? 4.5 : 0.0; };
+    if (bpw((int) t->type) <= bpw(target) || t->shape[0] % 256 != 0) return -1;   // K-quant rows: whole 256-blocks
+    if (const char* f = getenv("STRATA_GLM_DENSE_QUANT_FROM"); f != nullptr && std::atoi(name.c_str() + 4) < std::atoi(f))
+        return -1;
+    static const std::vector<std::string> kinds = [] {
+        std::vector<std::string> k = {"kda q/k/v", "attn output", "shared experts", "dense ffn", "mla q/kv"};
+        if (const char* e = getenv("STRATA_GLM_DENSE_QUANT_KINDS")) {
+            k.clear();
+            std::stringstream ss(e);
+            std::string one;
+            while (std::getline(ss, one, ',')) k.push_back(one);
+        }
+        return k;
+    }();
+    const std::string kind = dense_kind_of(name.substr(name.find('.', 4) + 1));
+    return std::find(kinds.begin(), kinds.end(), kind) != kinds.end() ? target : -1;
+}
+
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
-// rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
-// token_embd on the host (the embedding row is dequantized there from the shard mapping)
+// rows (kind 4) BF16 and the natively served rows (kind 0) quantized (requantized: requant >= 0), dequantizes the rest
+// to F32, and leaves token_embd on the host (the embedding row is dequantized there from the shard mapping)
 static uint64_t pack_row_vram(const std::string& name, const std::string& kind, const strata::TensorInfo* t, bool fast,
-                              std::string* how = nullptr) {
+                              std::string* how = nullptr, int requant = -1) {
     if (fast && name == "token_embd.weight") return 0;
     if (fast && kind == "4" && t->elements() >= 65536) {
         if (how) *how = " bf16";
@@ -114,8 +168,9 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind, 
         if (how) *how = " f32";
         return ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
     }
-    if (how) *how = " q" + std::to_string((int) t->type);
-    return (strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]) + 255u) &
+    const int ty = requant >= 0 ? requant : (int) t->type;
+    if (how) *how = " q" + std::to_string(ty);
+    return (strata::kernels::native_mmvq_weight_bytes(ty, (int) t->shape[0], (int) t->shape[1]) + 255u) &
            ~(uint64_t) 255u;
 }
 
@@ -913,7 +968,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             ss >> nm >> served >> kind;
             const strata::TensorInfo* t = find(nm);
             if (t == nullptr) continue;
-            const double b = (double) pack_row_vram(nm, kind, t, fast);
+            // (STRATA_GLM_DENSE_QUANT counts; a per-GPU STRATA_GLM_DENSE_QUANT<n> is not priced in)
+            const double b = (double) pack_row_vram(nm, kind, t, fast, nullptr, dense_requant_to(nm, t, -1, fast));
             if (nm.rfind("blk.", 0) == 0) {
                 const int il = std::atoi(nm.c_str() + 4);
                 if (il >= 0 && il < L) dense[(size_t) il] += b;
@@ -2211,23 +2267,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     const auto skip_upload = [&](const Row& r) { return fast_mode_ && r.name == "token_embd.weight"; };
     uint64_t bytes = 0;
     std::map<std::string, uint64_t> by_kind;   // STRATA_GLM_TIMING: the dense weights' VRAM by kind and storage
-    const auto kind_of = [](const std::string& n) -> std::string {
-        if (n == "output.weight") return "output head";
-        if (n.find("_shexp") != std::string::npos) return "shared experts";
-        if (n.find("ffn_gate_inp") != std::string::npos) return "routers";
-        if (n.find("attn_k_b") != std::string::npos || n.find("attn_v_b") != std::string::npos) return "mla k_b/v_b";
-        if (n.find("attn_q_a") != std::string::npos || n.find("attn_q_b") != std::string::npos ||
-            n.find("attn_kv_a") != std::string::npos) return "mla q/kv";
-        if (n.find("indexer") != std::string::npos || n.find("idx") != std::string::npos) return "dsa indexer";
-        if (n.find("attn_q.") != std::string::npos || n.find("attn_k.") != std::string::npos ||
-            n.find("attn_v.") != std::string::npos) return "kda q/k/v";
-        if (n.find("attn_output") != std::string::npos) return "attn output";
-        if (n.find("ssm_") != std::string::npos) return "kda small";
-        if (n.find("hc_") != std::string::npos) return "mhc";
-        if (n.find("ffn_") != std::string::npos) return "dense ffn";
-        if (n.find("norm") != std::string::npos) return "norms";
-        return "other";
-    };
+    if (fast_mode_ && dense_quant_setting(dev_) == -2) {
+        err = "STRATA_GLM_DENSE_QUANT(" + std::to_string(dev_) + "): not q6_k, q5_k, q4_k or 0";
+        return false;
+    }
+    uint64_t dq_before = 0, dq_after = 0;
     for (const auto& r : rows) {
         if (!row_in_range(r.name)) continue;   // the other half's rows live on the other device
         const strata::TensorInfo* t = find_tensor(r.name);
@@ -2237,10 +2281,21 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
         if (skip_upload(r)) continue;
         std::string how;
-        const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how);
+        const int si = find_shard_of(r.name);
+        const int rq = r.kind == "0" ? dense_requant_to(r.name, si >= 0 ? gfs[(size_t) si]->find(r.name) : nullptr,
+                                                        dev_, fast_mode_) : -1;
+        const uint64_t b = pack_row_vram(r.name, r.kind, t, fast_mode_, &how, rq);
         bytes += b;
-        by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + how] += b;
+        by_kind[dense_kind_of(r.name.substr(r.name.find('.', 4) + 1)) + how] += b;
+        if (rq >= 0) {
+            dq_before += pack_row_vram(r.name, r.kind, t, fast_mode_);
+            dq_after += b;
+        }
     }
+    if (dq_after > 0)
+        std::fprintf(stderr, "glm pack: CUDA%d dense rows requantized to %s at load: %.2f -> %.2f GB\n", dev_,
+                     ggml_type_name((ggml_type) dense_quant_setting(dev_)), (double) dq_before / 1073741824.0,
+                     (double) dq_after / 1073741824.0);
     if (getenv("STRATA_GLM_TIMING") != nullptr) {
         std::vector<std::pair<uint64_t, std::string>> v;
         for (auto& kv : by_kind) v.push_back({kv.second, kv.first});
@@ -2298,11 +2353,37 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 return false;
             }
             const strata::TensorInfo* ti = gfs[(size_t) si]->find(r.name);
-            const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ti->type, (int) ti->shape[0],
-                                                                            (int) ti->shape[1]);
             const uint8_t* src = pack_shards_[(size_t) si].base + gfs[(size_t) si]->data_start() + ti->offset;
+            const int rq = dense_requant_to(r.name, ti, dev_, fast_mode_);
+            const int ty = rq >= 0 ? rq : (int) ti->type;
+            const size_t nbytes = strata::kernels::native_mmvq_weight_bytes(ty, (int) ti->shape[0], (int) ti->shape[1]);
+            if (rq >= 0) {
+                // dequantize (ggml's traits) and quantize to the target type, rows split across the cores
+                const int64_t n_in = ti->shape[0], n_rows = ti->shape[1];
+                const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) ti->type);
+                const size_t src_row = ggml_row_size((ggml_type) ti->type, n_in), dst_row = ggml_row_size((ggml_type) ty, n_in);
+                if (tt == nullptr || tt->to_float == nullptr || dst_row * (size_t) n_rows != nbytes) {
+                    err = "pack: cannot requantize " + r.name + " (type " + std::to_string((int) ti->type) + " -> " +
+                          std::to_string(ty) + ")";
+                    return false;
+                }
+                raw.resize(nbytes);
+                const int nth = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+                std::vector<std::thread> th;
+                for (int k = 0; k < nth; ++k)
+                    th.emplace_back([&, k] {
+                        std::vector<float> f((size_t) n_in);
+                        for (int64_t row = n_rows * k / nth; row < n_rows * (k + 1) / nth; ++row) {
+                            tt->to_float(src + (size_t) row * src_row, f.data(), n_in);
+                            ggml_quantize_chunk((ggml_type) ty, f.data(), raw.data() + (size_t) row * dst_row, 0, 1, n_in,
+                                                nullptr);
+                        }
+                    });
+                for (auto& x : th) x.join();
+                src = raw.data();
+            }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, src, nbytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
-            ws_map_[r.name] = strata::core::WSlot{nullptr, (int) ti->type, (const void*) ((uint8_t*) w_arena_ + at),
+            ws_map_[r.name] = strata::core::WSlot{nullptr, ty, (const void*) ((uint8_t*) w_arena_ + at),
                                     (int64_t) ti->shape[0], (int64_t) ti->shape[1]};
             if (r.name == "token_embd.weight") {
                 pack_emb_src_ = src;
