@@ -421,5 +421,167 @@ class HipSetupTests(unittest.TestCase):
                 maya.main()
 
 
+HIPINFO = """
+--------------------------------------------------------------------------------
+device#                           0
+Name:                             AMD Radeon(TM) 8065S Graphics
+pciBusID:                         195
+totalGlobalMem:                   96.00 GB
+gcnArchName:                      gfx1151
+isIntegrated:                     1
+--------------------------------------------------------------------------------
+device#                           1
+Name:                             AMD Radeon RX 7900 XTX
+totalGlobalMem:                   23.98 GB
+gcnArchName:                      gfx1100:sramecc-:xnack-
+isIntegrated:                     0
+"""
+
+
+class WindowsDetectionTests(unittest.TestCase):
+    def test_hipinfo_lists_gpus_in_hip_order(self):
+        gpus = maya.S.parse_hipinfo(HIPINFO)
+        self.assertEqual([(g["index"], g["arch"]) for g in gpus], [(0, "gfx1151"), (1, "gfx1100")])
+        self.assertEqual(gpus[0]["name"], "AMD Radeon(TM) 8065S Graphics")
+        self.assertAlmostEqual(gpus[0]["vram_gb"], 96.0)
+        self.assertTrue(gpus[0]["integrated"])
+        self.assertFalse(gpus[1]["integrated"])
+        self.assertEqual(maya.S.parse_hipinfo("hipInfo: no devices\n"), [])
+
+    def test_registry_adapters_by_device_id_then_name(self):
+        one = json.dumps({"DriverDesc": "AMD Radeon(TM) 8060S Graphics",
+                          "MatchingDeviceId": "pci\\ven_1002&dev_1586&rev_c1", "DriverVersion": "32.0.21",
+                          "HardwareInformation.qwMemorySize": 96 * 2**30})
+        g, = maya.S.parse_display_adapters(one)            # one adapter: an object, not a list
+        self.assertEqual((g["index"], g["arch"], g["driver"]), (0, "gfx1151", "32.0.21"))
+        self.assertAlmostEqual(g["vram_gb"], 96.0)
+        rows = json.dumps([{"DriverDesc": "AMD Radeon(TM) 8065S Graphics", "MatchingDeviceId": "pci\\ven_1002&dev_9999"},
+                           {"DriverDesc": "AMD Radeon RX 9070 XT", "MatchingDeviceId": "pci\\ven_1002&dev_7550"},
+                           {"DriverDesc": "AMD Radeon(TM) Graphics", "MatchingDeviceId": "pci\\ven_1002&dev_164e"}])
+        self.assertEqual([g["arch"] for g in maya.S.parse_display_adapters(rows)], ["gfx1151", "gfx1201", "unknown"])
+        self.assertEqual(maya.S.parse_display_adapters(""), [])
+        self.assertEqual(maya.S.parse_display_adapters("not json"), [])
+
+    def test_windows_apu_names_are_unified_memory(self):
+        for name in ("AMD Radeon(TM) 8060S Graphics", "AMD Radeon(TM) 8065S Graphics", "Radeon 8050S"):
+            self.assertTrue(maya.hip_unified_memory({"arch": "unknown", "name": name}), name)
+        self.assertFalse(maya.hip_unified_memory({"arch": "gfx1100", "name": "AMD Radeon RX 7900 XTX"}))
+
+
+class WindowsHipSetupTests(unittest.TestCase):
+    """START-MAYA.bat --backend hip on a Strix Halo / Gorgon Halo PC, with TheRock's ROCm wheels."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.rocm = self.root / "_rocm_sdk_devel"        # TheRock's layout
+        (self.rocm / "lib/llvm/bin").mkdir(parents=True)
+        (self.rocm / "lib/llvm/bin/clang++.exe").touch()
+        (self.rocm / "lib/llvm/bin/clang.exe").touch()
+        (self.rocm / "lib/hipblas.lib").touch()
+        (self.rocm / "bin").mkdir()
+        (self.rocm / "bin/hipblas.dll").touch()
+        self.apu = {"index": 0, "arch": "gfx1151", "vendor": "amd", "name": "AMD Radeon(TM) 8065S Graphics",
+                    "vram_gb": 96, "driver": "windows"}
+        for ctx in (
+            patch.object(maya, "ROOT", self.root),
+            patch.object(maya, "BUILD", self.root / "build"),
+            patch.object(maya, "EXE", self.root / "build/strata.exe"),
+            patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
+            patch.object(maya, "WIN", True),
+            patch.object(maya.S, "amd_gpus", return_value=[self.apu]),
+            patch.object(maya.S, "gpus", side_effect=AssertionError("HIP must not query NVIDIA")),
+            patch.object(maya.S, "find_vcvars", return_value=Path("C:/VS/vcvars64.bat")),
+            patch.object(maya.S, "cpu_info", return_value=("AMD RYZEN AI MAX+ PRO 495", True, True)),
+            patch.object(maya, "mem_gb", return_value=(32, 24)),
+            patch.object(maya, "tool_version", return_value=(7, 14)),
+        ):
+            ctx.start()
+            self.addCleanup(ctx.stop)
+        self.a = SimpleNamespace(backend="hip", gpu=None, gpus=None, no_vision=False, env=[], check=False, yes=True,
+                                 port=8099, host=None, api_key=None, gguf_dir=None)
+
+    def test_check_finds_therock_and_the_apu(self):
+        with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}):
+            pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [self.apu])
+        self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
+        self.assertEqual(pc["rocm_bin"], str(self.rocm.resolve() / "bin"))
+        self.assertEqual(maya.EXE, self.root / "build-hip/strata.exe")
+
+    def test_check_without_rocm_says_the_pip_command(self):
+        with patch.object(maya, "windows_rocm", return_value=(None, None)), \
+                patch.object(maya, "run", side_effect=AssertionError("--check installs nothing")), \
+                patch.object(maya, "fail", side_effect=SystemExit) as stop:
+            self.a.check = True
+            with self.assertRaises(SystemExit):
+                maya.check_pc(self.a)
+        hint = stop.call_args.args[1]
+        self.assertIn(maya.THEROCK_INDEX, hint)
+        self.assertIn(f"rocm[libraries,devel,device-gfx1151]=={maya.THEROCK_VERSION}", hint)
+
+    def test_setup_installs_rocm_into_the_venv_then_checks_again(self):
+        found = iter([(None, None), (self.rocm, self.rocm / "bin"), (self.rocm, self.rocm / "bin")])
+        with patch.object(maya, "windows_rocm", side_effect=lambda: next(found)), \
+                patch.object(maya, "run") as pip, patch.object(sys, "base_prefix", "/somewhere/else"):
+            pc = maya.check_pc(self.a)
+        cmd = pip.call_args.args[0]
+        self.assertEqual(cmd[:4], [sys.executable, "-m", "pip", "install"])
+        self.assertIn(maya.THEROCK_INDEX, cmd)
+        self.assertEqual(pc["rocm"], str(self.rocm))
+
+    def test_check_needs_visual_studio(self):
+        with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}), \
+                patch.object(maya.S, "find_vcvars", return_value=None):
+            with self.assertRaises(SystemExit):
+                maya.check_pc(self.a)
+
+    def test_windows_build_uses_therock_clang_and_ninja(self):
+        with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}):
+            pc = maya.check_pc(self.a)
+        maya.BUILD.mkdir()
+        with patch.object(maya, "pick_cmake", return_value="cmake"), \
+                patch.object(maya, "venv_tool", return_value="C:/maya/.venv/Scripts/ninja.exe"), \
+                patch.object(maya, "cmake_steps", return_value=None) as build:
+            meta = maya.compile_engine_hip(pc, self.root / "llama", "source-sha")
+        conf, _, env, bat = build.call_args.args
+        root = self.rocm.resolve().as_posix()
+        self.assertEqual(conf[1:3], ["-G", "Ninja"])
+        for want in (f"-DCMAKE_CXX_COMPILER={root}/lib/llvm/bin/clang++.exe",
+                     f"-DCMAKE_C_COMPILER={root}/lib/llvm/bin/clang.exe",
+                     f"-DCMAKE_HIP_COMPILER={root}/lib/llvm/bin/clang++.exe",
+                     f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+                     "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
+                     "-DSTRATA_PORTABLE=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201;gfx1151"):
+            self.assertIn(want, conf)
+        if " " not in root:
+            self.assertIn(f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={root}/lib/llvm/amdgcn/bitcode",
+                          conf)
+        self.assertEqual(env["HIP_DEVICE_LIB_PATH"], str(self.rocm.resolve() / "lib/llvm/amdgcn/bitcode"))
+        self.assertEqual(env["HIP_PATH"], str(self.rocm.resolve()))
+        self.assertTrue(bat.endswith(".bat"))
+        self.assertEqual(meta["lib_dirs"], [str(self.rocm.resolve() / "bin")])
+
+    def test_windows_apu_config(self):
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        (tables / "gfx1151-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1151 100202\n")
+        with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}):
+            pc = maya.check_pc(self.a)
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "bin")]}, self.root / "pack", "Maya-L", 32768,
+                              self.root / "data", None)
+        cfg = json.loads(p.read_text())
+        self.assertEqual(p.name, "maya-maya-l-hip.json")
+        self.assertEqual((cfg["backend"], cfg["gpu"], cfg["exe"]), ("hip", [0], str(self.root / "build-hip/strata.exe")))
+        self.assertEqual(cfg["lib_dirs"], [str(self.rocm / "bin")])
+        env = cfg["env"]
+        self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")    # the desktop runs on the APU's GPU too
+        self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "6144")    # 32 GB Windows + 96 GB the GPU's
+        self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "1024")
+        self.assertEqual(env["STRATA_GLM_SPLIT"], "0")
+        self.assertNotIn("STRATA_GLM_POOL_GB", env)
+
+
 if __name__ == "__main__":
     unittest.main()

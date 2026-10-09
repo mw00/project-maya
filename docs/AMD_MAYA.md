@@ -1,8 +1,9 @@
-# Experimental Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo
+# Experimental Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
-engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo). It uses one GPU, or two discrete cards that split the
+engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two discrete cards that split the
 layers (see [Two GPUs](#two-gpus)), and serves text. Images are not enabled by this installer.
+Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
 3.10+, CMake 3.24+, and a C++20 compiler. `ROCM_PATH` selects an installation
@@ -89,6 +90,42 @@ Measured on a 128 GB Strix Halo box with ROCm 7.2.2 and manually tuned settings:
 in the GPU pool (288 slots/layer, 12,096 total, ~99.9% hits). These measurements
 precede the automatic sizing change; verify its startup log and repeated
 prompt/answer rounds on the real box. See [tracking issue #6](https://github.com/mw00/project-maya/issues/6).
+
+## Windows
+
+`START-MAYA.bat --backend hip` sets Maya up natively on Windows 10/11 for the same GPUs, Strix Halo and Gorgon Halo
+included (Ryzen AI Max 300 / 400, Radeon 8050S / 8060S / 8065S, all `gfx1151`). It compiles the engine with AMD's
+ROCm SDK for Windows (TheRock's pip wheels) and ROCm's clang, in Visual Studio's environment, with Ninja, as
+`tools\hip\build_maya_windows.bat` does (#54). The download, the pack and the dashboard are the same as on an NVIDIA PC.
+
+1. Install once: [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with
+   "Desktop development with C++", 64-bit Python 3.12 (`winget install -e --id Python.Python.3.12 --scope user`)
+   and Git.
+2. On an APU, give the GPU most of the memory: Variable Graphics Memory in AMD Software (Performance > Tuning), or
+   the iGPU memory size in the BIOS, e.g. 96 GB on a 128 GB PC. Restart.
+3. Then:
+
+   ```bat
+   START-MAYA.bat --backend hip --gpu 0 --check
+   START-MAYA.bat --backend hip --gpu 0 --setup --model Maya-L
+   ```
+
+   Without a ROCm SDK the setup offers to install one into Maya's `.venv` (pip, from `repo.amd.com/rocm/whl-multi-arch`:
+   `rocm[libraries,devel,device-<arch>]==7.14.1`, the first with Gorgon Halo); `--check` prints that command instead.
+   `ROCM_PATH` (a ROCm root) or `ROCM_VENV` (a venv with TheRock's `rocm-sdk`) selects another one.
+
+GPU numbers are hipInfo's (HIP's own order); without hipInfo, Windows' AMD display adapters in the registry's order.
+
+**Memory on a Windows APU.** Windows gives the APU's GPU a fixed carve-out and does not count it as RAM: a 128 GB PC
+with 96 GB of Variable Graphics Memory shows 32 GB of RAM. The engine therefore sizes it like a discrete card - the
+expert pool from the GPU memory HIP reports free, the RAM tier from the free RAM and commit, the rest read from the
+SSD - and not from `MemAvailable` as on Linux above. Setup writes a 3 GiB reserve (the desktop runs on the same
+GPU), `STRATA_GLM_PREFILL_SUB=1024`, and a 6144 MiB prompt budget when RAM and GPU memory together are at least
+96 GiB (4096 MiB otherwise). The `gfx1151` hipBLASLt table was measured with Linux ROCm 7.2's hipBLASLt; the engine
+refuses a table made for another version and keeps plain hipBLAS.
+
+Status: this installer path has not run on Windows yet. The startup log's "VRAM before the expert pool" line and
+`START-MAYA.bat --report` show how the engine sized the memory; please report them.
 
 ## Prompt speed
 

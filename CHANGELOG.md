@@ -4,6 +4,18 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+- **AMD on Windows, Strix Halo / Gorgon Halo included (experimental):** `START-MAYA.bat --backend hip` sets Maya up
+  on Windows 10/11 as `./maya.sh --backend hip` does on Linux. It finds the GPUs with ROCm's hipInfo (else Windows'
+  display adapters), offers to install AMD's ROCm SDK 7.14.1 wheels into `.venv`, and compiles the engine with
+  ROCm's clang and Ninja in Visual Studio's environment, like `tools\hip\build_maya_windows.bat` (#54).
+  - Ryzen AI Max 300 / 400 (Radeon 8050S / 8060S / 8065S, `gfx1151`): Windows gives the GPU a fixed carve-out
+    (Variable Graphics Memory) that it does not count as RAM, so the engine sizes it there like a discrete card: the
+    pool from the GPU memory HIP reports free, the RAM tier from the free RAM and commit. Linux keeps its
+    unified-memory sizing.
+  - Not run on Windows yet: `START-MAYA.bat --report` after the first start helps.
+
 ## v1.0.27 - 2026-10-09
 
 The setup and Maya get a screen of their own in the terminal, the crash after a long prompt is fixed, a stuck prompt

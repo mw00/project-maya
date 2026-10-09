@@ -434,14 +434,86 @@ def pip_install(packages, what):
 
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",
              "gfx1201": "AMD Radeon RX 9070 / AI PRO R9700 (gfx1201)"}   # when sysfs has no product name
+# Windows without ROCm's hipInfo yet: the architecture from the adapter's PCI device ID (Navi 31, Navi 48, the
+# Strix Halo / Gorgon Halo APU), else from its name ("AMD Radeon(TM) 8060S Graphics", 8050S, 8065S, ...)
+AMD_DEVICE_ARCHS = {"744c": "gfx1100", "7550": "gfx1201", "7551": "gfx1201", "1586": "gfx1151"}
+AMD_NAME_ARCHS = ((r"Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", "gfx1151"), (r"RX\s*7900", "gfx1100"),
+                  (r"RX\s*9070|R9700", "gfx1201"))
 
 
-def amd_gpus():
+def parse_hipinfo(text: str) -> list:
+    """ROCm's hipInfo output as amd_gpus() lists GPUs, in HIP's order (its "device#" lines)."""
+    found = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("device#"):
+            num = re.search(r"\d+", s)
+            found.append({"index": int(num.group()) if num else len(found), "name": "", "vram_gb": 0.0, "arch": "",
+                          "driver": "windows", "vendor": "amd"})
+            continue
+        key, _, val = s.partition(":")
+        key, val = key.strip(), val.strip()
+        if not found or not val:
+            continue
+        g = found[-1]
+        if key == "Name":
+            g["name"] = val
+        elif key == "gcnArchName":
+            g["arch"] = val.split(":")[0]               # gfx1151, or gfx90a:sramecc+:xnack- -> gfx90a
+        elif key == "totalGlobalMem":
+            m = re.match(r"([\d.]+)\s*([KMGT]?B)?", val, re.I)
+            if m:
+                scale = {"KB": 2**-20, "MB": 2**-10, "GB": 1, "TB": 2**10}.get((m.group(2) or "").upper(), 2**-30)
+                g["vram_gb"] = float(m.group(1)) * scale
+        elif key in ("isIntegrated", "integrated"):
+            g["integrated"] = val not in ("0", "false", "False")
+    for g in found:
+        g["name"] = g["name"] or f"AMD Radeon ({g['arch'] or 'unknown'})"
+    return [g for g in found if g["arch"]]
+
+
+def parse_display_adapters(text: str) -> list:
+    """Windows' AMD display adapters (the registry's display class as JSON, from windows_amd_adapters), numbered in
+    its order - HIP's own with one AMD GPU."""
+    try:
+        rows = json.loads(text) if text.strip() else []
+    except ValueError:
+        return []
+    found = []
+    for r in rows if isinstance(rows, list) else [rows]:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("DriverDesc") or "AMD Radeon")
+        dev = re.search(r"dev_([0-9a-f]{4})", str(r.get("MatchingDeviceId") or ""), re.I)
+        arch = AMD_DEVICE_ARCHS.get(dev.group(1).lower(), "") if dev else ""
+        arch = arch or next((a for pat, a in AMD_NAME_ARCHS if re.search(pat, name, re.I)), "unknown")
+        try:
+            vram = int(r.get("HardwareInformation.qwMemorySize") or 0) / 2**30
+        except (TypeError, ValueError):
+            vram = 0.0
+        found.append({"index": len(found), "name": name, "vram_gb": vram, "arch": arch,
+                      "driver": str(r.get("DriverVersion") or "windows"), "vendor": "amd", "source": "registry"})
+    return found
+
+
+def windows_amd_adapters() -> list:
+    # the registry's display class has each adapter's full memory size (WMI's AdapterRAM stops at 4 GB)
+    ps = ("Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Class\\{4d36e968-e325-11ce-bfc1-08002be10318}"
+          "\\0*' -ErrorAction SilentlyContinue | Where-Object { $_.MatchingDeviceId -match 'ven_1002' } | "
+          "Select-Object DriverDesc, MatchingDeviceId, DriverVersion, 'HardwareInformation.qwMemorySize' | "
+          "ConvertTo-Json -Compress")
+    return parse_display_adapters(out(["powershell", "-NoProfile", "-Command", ps]))
+
+
+def amd_gpus(hipinfo=None):
     """AMD GPUs from the kernel's KFD topology (the amdgpu driver; no ROCm needed), numbered as HIP numbers them:
-    the GPU nodes in order, the CPU nodes skipped.  Integrated GPUs are listed too (not supported)."""
+    the GPU nodes in order, the CPU nodes skipped.  Integrated GPUs are listed too (not supported).  On Windows:
+    ROCm's hipInfo (`hipinfo`, its path), else Windows' AMD display adapters (windows_amd_adapters)."""
+    if WIN:
+        return (parse_hipinfo(out([str(hipinfo)])) if hipinfo else []) or windows_amd_adapters()
     base = Path("/sys/class/kfd/kfd/topology/nodes")
     found = []
-    if WIN or not base.is_dir():
+    if not base.is_dir():
         return found
     for node in sorted((p for p in base.iterdir() if p.name.isdigit()), key=lambda p: int(p.name)):
         try:

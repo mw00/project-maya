@@ -439,7 +439,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     cudaSetDevice(dev_);
     auto* F = new FastState();
     fast_ = F;
-#if defined(STRATA_USE_HIP)
+    // Not on Windows: there an APU's GPU memory is a fixed carve-out (AMD's Variable Graphics Memory, or the BIOS)
+    // that Windows does not count as RAM, so it is sized like a discrete card - the pool from what HIP reports free,
+    // the RAM tier from the free RAM and commit (below)
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
     int integrated = 0;
     if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev_) == cudaSuccess)
         F->unified_memory = integrated != 0;
