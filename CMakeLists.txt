@@ -908,6 +908,15 @@ if(STRATA_BUILD_TESTS)
   endif()
 endif()
 
+# Windows' HIP runtime submits launches lazily: a test kernel that waits for the CPU would never start (the engine
+# sets this itself, src/program/generate.cpp)
+if(STRATA_ENABLE_HIP AND WIN32)
+  get_property(_strata_all_tests DIRECTORY PROPERTY TESTS)
+  if(_strata_all_tests)
+    set_property(TEST ${_strata_all_tests} APPEND PROPERTY ENVIRONMENT "GPU_FLUSH_ON_EXECUTION=1")
+  endif()
+endif()
+
 if(STRATA_BUILD_TESTS)
   enable_testing()
   # Model-level checks may be absent from source distributions.

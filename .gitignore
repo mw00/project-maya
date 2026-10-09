@@ -39,6 +39,7 @@ td.log
 /run-maya-*.bat
 /maya-report.txt
 /build-strata.bat
+/build-maya*.bat
 
 # image encoder (setup.py --vision): build output and the generated build script
 build-vision*/

@@ -296,9 +296,11 @@ def hip_unified_memory(g) -> bool:
 
 
 def hip_clang(root: Path) -> Path | None:
-    """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), or <root>/lib/llvm/bin (TheRock's wheels)."""
+    """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), <root>/lib/llvm/bin (TheRock's wheels), or <root>/bin
+    (AMD's HIP SDK for Windows)."""
     exe = "clang++.exe" if WIN else "clang++"
-    return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe) if p.exists()), None)
+    return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe, root / "bin" / exe)
+                 if p.exists()), None)
 
 
 def rocm_sdk() -> str | None:
@@ -312,21 +314,26 @@ def rocm_sdk() -> str | None:
 
 def windows_rocm() -> tuple:
     """(ROCm's root, the folder of its DLLs) on Windows, or (None, None): ROCM_PATH, else TheRock's wheels (their
-    first `rocm-sdk init` unpacks the compiler, the headers and the device libraries)."""
+    first `rocm-sdk init` unpacks the compiler, the headers and the device libraries), else AMD's HIP SDK for Windows
+    (HIP_PATH, which its installer sets, else the newest in C:\\Program Files\\AMD\\ROCm)."""
     if os.environ.get("ROCM_PATH"):
         root = Path(os.environ["ROCM_PATH"]).resolve()
         return root, root / "bin"
     sdk = rocm_sdk()
-    if sdk is None:
-        return None, None
-    path = lambda what: (S.out([sdk, "path", what]).strip().splitlines() or [""])[-1].strip()
-    root = path("--root")
-    if not root:
-        return None, None
-    if hip_clang(Path(root)) is None:
-        say("  Unpacking AMD's ROCm SDK (rocm-sdk init, once) ...")
-        run([sdk, "init"], check=False)
-    return Path(root), Path(path("--bin") or Path(root) / "bin")
+    if sdk is not None:
+        path = lambda what: (S.out([sdk, "path", what]).strip().splitlines() or [""])[-1].strip()
+        root = path("--root")
+        if root:
+            if hip_clang(Path(root)) is None:
+                say("  Unpacking AMD's ROCm SDK (rocm-sdk init, once) ...")
+                run([sdk, "init"], check=False)
+            return Path(root), Path(path("--bin") or Path(root) / "bin")
+    base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "AMD" / "ROCm"
+    sdks = sorted(base.glob("[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)], reverse=True)
+    for root in ([Path(os.environ["HIP_PATH"])] if os.environ.get("HIP_PATH") else []) + sdks:
+        if hip_clang(root) is not None:
+            return root.resolve(), root.resolve() / "bin"
+    return None, None
 
 
 def hip_info(bindir) -> str | None:

@@ -563,6 +563,46 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertTrue(bat.endswith(".bat"))
         self.assertEqual(meta["lib_dirs"], [str(self.rocm.resolve() / "bin")])
 
+    def hip_sdk(self):
+        """AMD's HIP SDK for Windows' layout: clang, hipInfo and the DLLs in bin, the device libraries in amdgcn."""
+        sdk = self.root / "Program Files/AMD/ROCm/7.2"
+        for f in ("bin/clang++.exe", "bin/clang.exe", "bin/hipcc.exe", "bin/hipblas.dll", "lib/hipblas.lib"):
+            (sdk / f).parent.mkdir(parents=True, exist_ok=True)
+            (sdk / f).touch()
+        return sdk
+
+    def test_hip_sdk_found_by_hip_path_and_program_files(self):
+        sdk = self.hip_sdk()
+        old = self.root / "Program Files/AMD/ROCm/6.4/bin"
+        old.mkdir(parents=True)
+        (old / "clang++.exe").touch()
+        clean = {k: v for k, v in os.environ.items() if k not in ("ROCM_PATH", "ROCM_VENV", "HIP_PATH")}
+        with patch.object(maya, "rocm_sdk", return_value=None):
+            with patch.dict(os.environ, {**clean, "HIP_PATH": str(sdk) + os.sep}, clear=True):
+                self.assertEqual(maya.windows_rocm(), (sdk.resolve(), sdk.resolve() / "bin"))
+            with patch.dict(os.environ, {**clean, "ProgramFiles": str(self.root / "Program Files")}, clear=True):
+                self.assertEqual(maya.windows_rocm(), (sdk.resolve(), sdk.resolve() / "bin"))   # the newest
+            with patch.dict(os.environ, {**clean, "ProgramFiles": str(self.root / "none")}, clear=True):
+                self.assertEqual(maya.windows_rocm(), (None, None))
+        self.assertEqual(maya.hip_clang(sdk), sdk / "bin/clang++.exe")
+
+    def test_hip_sdk_build_in_a_folder_with_a_space(self):
+        sdk = self.hip_sdk()
+        with patch.dict(os.environ, {"ROCM_PATH": str(sdk)}):
+            pc = maya.check_pc(self.a)
+        maya.BUILD.mkdir()
+        with patch.object(maya, "pick_cmake", return_value="cmake"), \
+                patch.object(maya, "venv_tool", return_value="C:/maya/.venv/Scripts/ninja.exe"), \
+                patch.object(maya, "cmake_steps", return_value=None) as build:
+            maya.compile_engine_hip(pc, self.root / "llama", "source-sha")
+        conf, _, env, _ = build.call_args.args
+        root = sdk.resolve()
+        self.assertIn(f"-DCMAKE_HIP_COMPILER={(root / 'bin/clang++.exe').as_posix()}", conf)
+        self.assertIn(f"-DCMAKE_C_COMPILER={(root / 'bin/clang.exe').as_posix()}", conf)
+        self.assertFalse([x for x in conf if x.startswith("-DCMAKE_HIP_FLAGS=")])   # "Program Files": the env instead
+        self.assertEqual(env["HIP_PATH"], str(root))
+        self.assertEqual(env["HIP_DEVICE_LIB_PATH"], str(root / "amdgcn/bitcode"))
+
     def test_windows_apu_config(self):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)

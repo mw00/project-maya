@@ -88,7 +88,7 @@ int main() {
         hipGraphExec_t exec;
         CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
         gf::moe_route(logits, bias, E, K, 1.0f, true, 0, input, N, d, nullptr, nullptr, 1.0f, 0, nullptr,
-                      stream, nullptr, nullptr, 0, nullptr, nullptr, 0, false, plan);
+                      stream, nullptr, nullptr, 0, nullptr, nullptr, 0, K, plan);   // skip_from K: none left out
         gf::moe_wait(d, N, stream);
         gf::moe_cpu_wait(d, N, output, stream);
         CHECK(hipStreamEndCapture(stream, &graph));
@@ -168,7 +168,7 @@ int main() {
     for (int reset = 0; reset < 2; ++reset) {
         if (reset) *route_error = 0;
         gf::moe_route(logits, nullptr, E, K, 1.0f, true, reset ? 0 : 7, input, N, d,
-                      nullptr, nullptr, 1.0f, 0, nullptr, stream, nullptr, nullptr, 0, nullptr, nullptr, 0, true);
+                      nullptr, nullptr, 1.0f, 0, nullptr, stream, nullptr, nullptr, 0, nullptr, nullptr, 0, 0);
         gf::moe_wait(d, N, stream);
         CHECK(hipStreamSynchronize(stream));
         if (ring[2 + reset].seq != (unsigned) (2 + reset) ||

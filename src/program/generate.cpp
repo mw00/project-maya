@@ -1947,6 +1947,15 @@ int main(int argc, char** argv) {
         setenv("CUDA_MODULE_LOADING", "EAGER", 0);
 #endif
     }
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    // Windows' HIP runtime gathers launches and submits them when the host waits on the GPU: the routing graph's
+    // kernel that waits for the CPU's answer never started, while the CPU waited for its request - a deadlock that
+    // Linux, which submits every launch, never meets (tests/hip/glm_handoff.cpp).  Submit every launch.
+    if (std::getenv("GPU_FLUSH_ON_EXECUTION") == nullptr) {
+        _putenv_s("GPU_FLUSH_ON_EXECUTION", "1");
+        SetEnvironmentVariableA("GPU_FLUSH_ON_EXECUTION", "1");
+    }
+#endif
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;

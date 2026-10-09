@@ -137,7 +137,10 @@ Metrics run_product(Context & ctx, hipStream_t stream, const std::string & name,
     hip_check(hipMemcpy(ddst.p, dst_ids.data(), dst_ids.size() * sizeof(int32_t), hipMemcpyHostToDevice), "copy dst ids");
     hip_check(hipMemcpy(dbounds.p, bounds.data(), bounds.size() * sizeof(int32_t), hipMemcpyHostToDevice), "copy bounds");
     hip_check(hipMemcpy(dw.p, w.data(), w.size(), hipMemcpyHostToDevice), "copy weights and zero tail");
-    hip_check(hipMemset(dy.p, 0xff, (size_t) rows * (size_t) out_rows * sizeof(float)), "initialize output sentinel");
+    // on the product's stream: a non-blocking stream does not wait for the null stream's memset (Windows' runtime
+    // submits it late enough to land after the product)
+    hip_check(hipMemsetAsync(dy.p, 0xff, (size_t) rows * (size_t) out_rows * sizeof(float), stream),
+              "initialize output sentinel");
 
     quantize(dx.as<float>(), dsrc.as<int32_t>(), dxq.p, (int) type, cols, cols, rows, (void *) stream);
     const int max_rows = *std::max_element(counts.begin(), counts.end());
