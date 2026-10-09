@@ -189,7 +189,10 @@ def main():
         plan.append((name, shape, t, nbytes))
     total = sum(p[3] for p in plan)
     print(f"{len(plan)} tensors, {total / 1e9:.2f} GB", flush=True)
-    arch = field_value(readers[0].fields["general.architecture"])
+    # the architecture as llama.cpp names it: "glm5-next".  A reference that says "glm5next" (unsloth's early
+    # spelling) gave every Maya quant before v1.0.28 a name llama.cpp does not load (tools/gguf_fix_arch.py renames those)
+    src_arch = field_value(readers[0].fields["general.architecture"])
+    arch = "glm5-next" if src_arch == "glm5next" else src_arch
     w = gguf.GGUFWriter(a.out, arch=arch, split_max_size=int(a.split_gb * 1e9))
     # from the reference: the architecture's keys and the tokenizer only - its general.* (name, who quantized it, its
     # repo, tags) and quantize.* (its imatrix) describe that file, not this one
@@ -199,6 +202,8 @@ def main():
         if k.startswith(("split.", "quantize.", "GGUF.")) or (k.startswith("general.") and k not in keep_general):
             continue
         sub = f.types[1] if f.types[0] == gguf.GGUFValueType.ARRAY else None
+        if k.startswith(src_arch + "."):
+            k = arch + k[len(src_arch):]
         w.add_key_value(k, field_value(f), f.types[0], sub)
     S, U32 = gguf.GGUFValueType.STRING, gguf.GGUFValueType.UINT32
     w.add_key_value("general.name", a.name, S)

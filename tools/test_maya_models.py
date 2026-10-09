@@ -44,7 +44,19 @@ class ModelChoice(unittest.TestCase):
         for q, m in maya.MODELS.items():
             names = {m["file"].format(i=i, n=m["shards"]) for i in range(1, m["shards"] + 1)}
             self.assertEqual(set(m["sha256"]), names, q)
-            self.assertTrue(all(len(h) == 64 for h in m["sha256"].values()), q)
+            for h in m["sha256"].values():                   # a hash, or several (a header republished: v1.0.28)
+                self.assertTrue(all(len(x) == 64 for x in ([h] if isinstance(h, str) else h)), q)
+
+    def test_a_download_matches_any_published_hash(self):
+        import hashlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "x.gguf"
+            p.write_bytes(b"maya")
+            good = hashlib.sha256(b"maya").hexdigest()
+            self.assertTrue(maya.sha256_ok(p, good))
+            self.assertTrue(maya.sha256_ok(p, ["0" * 64, good.upper()]))
+            self.assertFalse(maya.sha256_ok(p, ["0" * 64]))
 
 
 class RestartAfterUpdate(unittest.TestCase):

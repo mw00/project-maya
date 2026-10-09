@@ -8,13 +8,39 @@ only what changed and starts; the model is not downloaded again.
 
 - **AMD on Windows, Strix Halo / Gorgon Halo included (experimental):** `START-MAYA.bat --backend hip` sets Maya up
   on Windows 10/11 as `./maya.sh --backend hip` does on Linux. It finds the GPUs with ROCm's hipInfo (else Windows'
-  display adapters), offers to install AMD's ROCm SDK 7.14.1 wheels into `.venv`, and compiles the engine with
-  ROCm's clang and Ninja in Visual Studio's environment, like `tools\hip\build_maya_windows.bat` (#54).
+  display adapters), uses AMD's HIP SDK for Windows (or offers AMD's ROCm SDK 7.14.1 wheels in `.venv` when there is
+  none), and compiles the engine with ROCm's clang and Ninja in Visual Studio's environment, like
+  `tools\hip\build_maya_windows.bat` (#54).
   - Ryzen AI Max 300 / 400 (Radeon 8050S / 8060S / 8065S, `gfx1151`): Windows gives the GPU a fixed carve-out
     (Variable Graphics Memory) that it does not count as RAM, so the engine sizes it there like a discrete card: the
     pool from the GPU memory HIP reports free, the RAM tier from the free RAM and commit. Linux keeps its
     unified-memory sizing.
-  - Not run on Windows yet: `START-MAYA.bat --report` after the first start helps.
+  - Windows' HIP runtime submits launches late: the engine's GPU-to-CPU handoff waited forever. The engine now has
+    every launch submitted (`GPU_FLUSH_ON_EXECUTION=1`).
+  - Two HIP checks were wrong on every platform: `hip_glm_handoff` still passed a removed `bool` (it skipped every
+    miss), and `hip_prefill_mmq_parity` raced its output sentinel's memset.
+  - Checked on a Ryzen AI Max+ PRO 495 (Radeon 8065S, 192 GB, 160 GB of it the GPU's), Windows 11, HIP SDK 7.2: the
+    setup builds the engine, and all 15 HIP checks of docs/AMD_MAYA.md pass.
+
+## v1.0.29 - 2026-10-09
+
+Documentation: the README and v1.0.28's entry below describe the model files' new architecture name more plainly.
+
+## v1.0.28 - 2026-10-09
+
+The model files name their architecture with the standard GGUF name, `glm5-next`.
+
+- **The model files say `glm5-next`.** Maya's quants had copied `glm5next`, an early spelling, from the file they
+  were made from. Standard GGUF tools don't recognize that spelling.
+  - On Hugging Face, the first file of each model is published again with only its header changed. Every byte of
+    the model stays where it was, so installed models and their packs keep working, and nothing has to be
+    downloaded again. Setup accepts both versions of that file.
+  - `tools/gguf_fix_arch.py` renames a file downloaded earlier, in place (only the header).
+  - The quantizer writes `glm5-next` from now on, and Maya reads either name.
+- Checked:
+  - Maya's greedy tokens are the same with the new header (Tesla V100, CPU lane off);
+  - the four new files are the old ones byte for byte after the header;
+  - the GitHub checks.
 
 ## v1.0.27 - 2026-10-09
 
