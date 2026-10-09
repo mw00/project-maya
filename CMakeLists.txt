@@ -836,8 +836,10 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
+      src/prefill/moe_fused_rdna4.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_mmq}/quantize.cu")
+    target_compile_definitions(strata_engine PRIVATE STRATA_HIP_PREFILL_FUSED=1)
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
@@ -860,6 +862,12 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME hip_prefill_mmq_parity COMMAND hip_prefill_mmq_parity)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
+    add_executable(hip_prefill_fused_parity tests/hip/prefill_fused_parity.cpp)
+    target_include_directories(hip_prefill_fused_parity PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_fused_parity PRIVATE strata_prefill strata_kernels)
+    add_test(NAME hip_prefill_fused_parity COMMAND hip_prefill_fused_parity)
+    set_tests_properties(hip_prefill_fused_parity PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    list(APPEND _strata_hip_tests hip_prefill_fused_parity)
   endif()
   if(STRATA_ENABLE_HIP)
     # Optional real-model diagnostic: pass the GGUF shard containing the native PLE key.
