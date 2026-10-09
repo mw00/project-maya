@@ -421,6 +421,17 @@ class HipSetupTests(unittest.TestCase):
                 maya.main()
 
 
+class ConfigsTests(unittest.TestCase):
+    def test_dashboard_settings_beside_a_config_are_not_a_config(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(maya, "ROOT", Path(d)):
+            cfg = Path(d) / "maya-maya-l-hip.json"
+            cfg.write_text(json.dumps({"backend": "hip", "exe": "strata.exe"}))
+            side = Path(d) / "maya-maya-l-hip.shared-settings.json"
+            side.write_text(json.dumps({"temperature": 0.7}))
+            os.utime(cfg, (1, 1))   # the settings file is the newer one, as after a dashboard change
+            self.assertEqual(maya.configs(), [cfg])
+
+
 HIPINFO = """
 --------------------------------------------------------------------------------
 device#                           0

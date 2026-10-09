@@ -71,8 +71,9 @@ int main(){
   CHECK(hipMemcpyAsync(copy_ids_device,copy_route_ids.data(),10*4,hipMemcpyHostToDevice,stream));
   CHECK(hipMemcpyAsync(copy_weights_device,copy_route_weights.data(),10*4,hipMemcpyHostToDevice,stream));
   CHECK(hipGraphLaunch(exec,stream));
+  (void)hipStreamQuery(stream);  // submit (Windows' runtime holds launches until the host waits), never wait
   const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
-  // Do not query or synchronize the stream before validating the mapped payload.
+  // Do not synchronize the stream before validating the mapped payload.
   while(__atomic_load_n(copy_seq,__ATOMIC_ACQUIRE)!=(uint32_t)r){
    if(std::chrono::steady_clock::now()>deadline){std::fprintf(stderr,"separate copy/ring timeout\n");return 10;}
    std::this_thread::yield();
@@ -103,8 +104,9 @@ int main(){
   CHECK(hipMemcpyAsync(gi,ids_src.data(),40,hipMemcpyHostToDevice,stream));
   CHECK(hipMemcpyAsync(gw,ws.data(),40,hipMemcpyHostToDevice,stream));
   CHECK(hipGraphLaunch(exec,stream));
+  (void)hipStreamQuery(stream);  // submit only, as the engine's service thread does
   const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
-  // No driver query or stream sync may make the payload visible to this observer.
+  // No stream sync may make the payload visible to this observer.
   while(__atomic_load_n(flag,__ATOMIC_ACQUIRE)!=(uint32_t)r){
    if(std::chrono::steady_clock::now()>deadline){std::fprintf(stderr,"publish timeout\n");return 7;}
    std::this_thread::yield();

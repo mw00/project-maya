@@ -87,6 +87,7 @@ then `--report`, in a
 | --- | ---: | ---: | --- |
 | **2x NVIDIA CMP 170HX 64 GB** (Ampere GA100; PCIe Gen2 x4 each), 2x Xeon E5-2690 v4, 91 GB RAM - **Maya-M**, every expert in VRAM | 61.3 tokens/s (mean of 3 answers) | 514 tokens/s (8K-token prompt) | @ZackO2o (v1.0.6, #22) |
 | **NVIDIA RTX 4090 24 GB** (PCIe 4.0 x16), Ryzen 9 9950X3D, 192 GB DDR5-6000 (2 channels), Windows 11 - **Maya-L**, 128K context, every expert in VRAM or RAM | 16.4 tokens/s (mean of 3 answers) | 1371 tokens/s (8K-token prompt) | @npc97 (v1.0.24, #63) |
+| **AMD Ryzen AI Max+ PRO 495 / Radeon 8065S** (Gorgon Halo, 192 GB LPDDR5X, 160 GB of it the GPU's), Windows 11, HIP SDK 7.2 - **Maya-L**, 32K context, every expert in VRAM | 15.9 tokens/s (mean of 3 answers) | 345 tokens/s (8K-token prompt) | #69 |
 
 ## What you need
 
@@ -328,9 +329,10 @@ and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built wi
 - A Tesla V100 runs it too, built with CUDA 12.4 ([#57](https://github.com/mw00/project-maya/issues/57)). Run
   `--calibrate` once: it tunes Maya for your PC, and a setup for another context keeps its settings.
 - AMD on Windows (more experimental still), Strix Halo / Gorgon Halo included: `START-MAYA.bat --backend hip --gpu 0
-  --setup` builds the HIP engine with AMD's ROCm SDK wheels and offers to install them into `.venv`
-  ([docs/AMD_MAYA.md](docs/AMD_MAYA.md#windows)). `tools\hip\build_maya_windows.bat` builds it by hand (an RX 7900
-  XTX, [#54](https://github.com/mw00/project-maya/pull/54)).
+  --setup` builds the HIP engine with AMD's HIP SDK, or offers AMD's ROCm SDK wheels in `.venv` when there is none
+  ([docs/AMD_MAYA.md](docs/AMD_MAYA.md#windows)); a Gorgon Halo runs Maya-L at 15.9 tokens/s (the table above).
+  `tools\hip\build_maya_windows.bat` builds it by hand (an RX 7900 XTX,
+  [#54](https://github.com/mw00/project-maya/pull/54)).
 
 ## Support
 

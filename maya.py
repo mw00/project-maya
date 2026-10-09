@@ -205,8 +205,10 @@ def read_json(path: Path) -> dict:
 
 
 def configs() -> list:
-    """The installed models' configs, the most recently used first."""
-    return sorted(ROOT.glob("maya-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    """The installed models' configs, the most recently used first - not the dashboard's settings the server keeps
+    beside each (<config>.shared-settings.json), which a restart took for a config of the CUDA backend."""
+    return sorted((p for p in ROOT.glob("maya-*.json") if not p.name.endswith(".shared-settings.json")),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def mem_gb() -> tuple:

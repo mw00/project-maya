@@ -312,6 +312,8 @@ struct Glm5Model::FastState {
     std::vector<uint32_t> usage;
     uint64_t cnt_events = 0;
     uint8_t* pool = nullptr;
+    // the main slots' further allocations, where one did not allocate (each holds whole layers: lp[il].base)
+    std::vector<uint8_t*> pool_more;
     size_t pool_bytes = 0;
     int64_t pool_slots = 0;
     // the lendable tail (every layer's slots [n_main, n)) is its own allocation: an on-demand vision encoder can

@@ -94,15 +94,16 @@ prompt/answer rounds on the real box. See [tracking issue #6](https://github.com
 ## Windows
 
 `START-MAYA.bat --backend hip` sets Maya up natively on Windows 10/11 for the same GPUs, Strix Halo and Gorgon Halo
-included (Ryzen AI Max 300 / 400, Radeon 8050S / 8060S / 8065S, all `gfx1151`). It compiles the engine with AMD's
-ROCm SDK for Windows (TheRock's pip wheels) and ROCm's clang, in Visual Studio's environment, with Ninja, as
-`tools\hip\build_maya_windows.bat` does (#54). The download, the pack and the dashboard are the same as on an NVIDIA PC.
+included (Ryzen AI Max 300 / 400, Radeon 8050S / 8060S / 8065S, all `gfx1151`). It compiles the engine with ROCm's
+clang in Visual Studio's environment, with Ninja, as `tools\hip\build_maya_windows.bat` does (#54). The download, the
+pack and the dashboard are the same as on an NVIDIA PC.
 
 1. Install once: [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with
-   "Desktop development with C++", 64-bit Python 3.12 (`winget install -e --id Python.Python.3.12 --scope user`)
-   and Git.
+   "Desktop development with C++", 64-bit Python 3.12 (`winget install -e --id Python.Python.3.12 --scope user`),
+   Git, and [AMD's HIP SDK for Windows](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (7.2 is
+   measured below).
 2. On an APU, give the GPU most of the memory: Variable Graphics Memory in AMD Software (Performance > Tuning), or
-   the iGPU memory size in the BIOS, e.g. 96 GB on a 128 GB PC. Restart.
+   the iGPU memory size in the BIOS - 160 GB of 192 GB on the PC below, 96 GB on a 128 GB one. Restart.
 3. Then:
 
    ```bat
@@ -110,22 +111,30 @@ ROCm SDK for Windows (TheRock's pip wheels) and ROCm's clang, in Visual Studio's
    START-MAYA.bat --backend hip --gpu 0 --setup --model Maya-L
    ```
 
-   Without a ROCm SDK the setup offers to install one into Maya's `.venv` (pip, from `repo.amd.com/rocm/whl-multi-arch`:
-   `rocm[libraries,devel,device-<arch>]==7.14.1`, the first with Gorgon Halo); `--check` prints that command instead.
-   `ROCM_PATH` (a ROCm root) or `ROCM_VENV` (a venv with TheRock's `rocm-sdk`) selects another one.
+The setup takes the ROCm it finds first: `ROCM_PATH`, TheRock's `rocm-sdk` (`ROCM_VENV`, Maya's `.venv` or PATH), AMD's
+HIP SDK (`HIP_PATH`, else the newest in `C:\Program Files\AMD\ROCm`). With none it offers AMD's ROCm SDK wheels in
+Maya's `.venv` (pip, from `repo.amd.com/rocm/whl-multi-arch`: `rocm[libraries,devel,device-<arch>]==7.14.1`, the first
+with Gorgon Halo); `--check` prints that command instead. GPU numbers are hipInfo's (HIP's own order); without
+hipInfo, Windows' AMD display adapters in the registry's order.
 
-GPU numbers are hipInfo's (HIP's own order); without hipInfo, Windows' AMD display adapters in the registry's order.
+**Memory on a Windows APU.** Windows gives the APU's GPU a fixed carve-out and does not count it as RAM: the 192 GB PC
+below, with 160 GB of Variable Graphics Memory, shows 32 GB of RAM, and HIP reports 171.9 GB (the carve-out and three
+quarters of Windows' shared half of its RAM). The engine therefore sizes it like a discrete card - the expert pool from
+the GPU memory HIP reports free, the RAM tier from the free RAM and commit, the rest read from the SSD - and not from
+`MemAvailable` as on Linux above. Windows' HIP runtime allocates at most 64 GiB plus the RAM Windows sees in one
+piece (95.7 GiB there), so a larger pool goes into several allocations, each holding whole layers. Setup writes a
+3 GiB reserve (the desktop runs on the same GPU), `STRATA_GLM_PREFILL_SUB=1024`, and a 6144 MiB prompt budget when RAM
+and GPU memory together are at least 96 GiB (4096 MiB otherwise).
 
-**Memory on a Windows APU.** Windows gives the APU's GPU a fixed carve-out and does not count it as RAM: a 128 GB PC
-with 96 GB of Variable Graphics Memory shows 32 GB of RAM. The engine therefore sizes it like a discrete card - the
-expert pool from the GPU memory HIP reports free, the RAM tier from the free RAM and commit, the rest read from the
-SSD - and not from `MemAvailable` as on Linux above. Setup writes a 3 GiB reserve (the desktop runs on the same
-GPU), `STRATA_GLM_PREFILL_SUB=1024`, and a 6144 MiB prompt budget when RAM and GPU memory together are at least
-96 GiB (4096 MiB otherwise). The `gfx1151` hipBLASLt table was measured with Linux ROCm 7.2's hipBLASLt; the engine
-refuses a table made for another version and keeps plain hipBLAS.
+**Kernel submission.** Windows' HIP runtime keeps launches in a batch until the host waits on the GPU; Linux submits
+each one. The engine's service thread waits for routes the GPU writes into host memory, so after 1 ms without one it
+submits the batch (`cudaStreamQuery`, which does not wait). `GPU_FLUSH_ON_EXECUTION=1`, the runtime's own switch to
+submit every launch, also works but cost ~31 us a launch here: decode 9.8 instead of 15.9 tokens/s.
 
-Status: this installer path has not run on Windows yet. The startup log's "VRAM before the expert pool" line and
-`START-MAYA.bat --report` show how the engine sized the memory; please report them.
+Measured on a Ryzen AI Max+ PRO 495 / Radeon 8065S (Gorgon Halo, 192 GB LPDDR5X, 160 GB of it the GPU's), Windows 11,
+HIP SDK 7.2 (HIP 7.2.60201), driver 32.0.31041, Maya-L, 32K context: all 15 HIP checks of [Validation](#validation)
+pass; every expert sits in the GPU pool (134.3 GB, 288 slots a layer, warmed from the NVMe in 44 s); `--bench` decodes
+15.9 tokens/s (3 answers of 256 tokens) and reads 297 tokens/s of a 2K-token prompt, 345 of an 8K one.
 
 ## Prompt speed
 

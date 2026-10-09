@@ -952,18 +952,60 @@ bool Glm5Model::fast_setup(std::string& err) {
                 nmin = std::min(nmin, nsl[(size_t) il]);
                 nmax = std::max(nmax, nsl[(size_t) il]);
             }
-        if (cudaMalloc(&F->pool, tot - xtot) != cudaSuccess ||
-            (xtot > 0 && cudaMalloc(&F->xpool, xtot) != cudaSuccess)) {
+        // the main slots in one allocation - or, where the driver caps a single allocation below them (Windows gives
+        // a 160 GiB APU carve-out in blocks of at most ~96 GiB), in several, each holding whole layers: a layer's
+        // slots are addressed from its own base (P.base), never across layers
+        std::vector<uint8_t*> segs;
+        std::vector<int> seg_of((size_t) NL, 0);
+        const size_t main_bytes = tot - xtot;
+        if (uint8_t* one = nullptr; cudaMalloc(&one, main_bytes) == cudaSuccess) {
+            segs.push_back(one);
+        } else {
+            cudaGetLastError();
+            size_t layer_max = 0;
+            for (int il = l0_; il < lt_; ++il)
+                if (F->L[(size_t) il].moe)
+                    layer_max = std::max(layer_max, (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il));
+            for (size_t cap = main_bytes / 2; segs.empty() && cap >= layer_max && layer_max > 0; cap /= 2) {
+                std::vector<size_t> sizes(1, 0);
+                for (int il = l0_; il < lt_; ++il) {
+                    if (!F->L[(size_t) il].moe) continue;
+                    const size_t lb = (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il);
+                    if (sizes.back() > 0 && sizes.back() + lb > cap) sizes.push_back(0);
+                    sizes.back() += lb;
+                    seg_of[(size_t) il] = (int) sizes.size() - 1;
+                }
+                for (size_t sz : sizes) {
+                    uint8_t* p = nullptr;
+                    if (cudaMalloc(&p, sz) != cudaSuccess) {
+                        cudaGetLastError();
+                        for (uint8_t* q : segs) cudaFree(q);
+                        segs.clear();
+                        break;
+                    }
+                    segs.push_back(p);
+                }
+            }
+            if (!segs.empty())
+                std::fprintf(stderr, "glm fast: CUDA%d one allocation of %.2f GB did not allocate: the expert pool is in "
+                                     "%zu\n", dev_, (double) main_bytes / 1073741824.0, segs.size());
+        }
+        if (segs.empty() || (xtot > 0 && cudaMalloc(&F->xpool, xtot) != cudaSuccess)) {
+            for (uint8_t* q : segs) cudaFree(q);
             err = "glm fast: the expert pool (" + std::to_string(tot >> 20) + " MB) did not allocate";
             return false;
         }
+        F->pool = segs[0];
+        F->pool_more.assign(segs.begin() + 1, segs.end());
         F->pool_bytes = tot;
         F->xpool_bytes = xtot;
         uint8_t* b = F->pool;
+        int cur_seg = 0;
         for (int il = l0_; il < lt_; ++il) {
             if (!F->L[(size_t) il].moe) continue;
             auto& P = F->lp[(size_t) il];
             const int nl = nsl[(size_t) il];
+            if (seg_of[(size_t) il] != cur_seg) b = segs[(size_t) (cur_seg = seg_of[(size_t) il])];
             P.stride = slot_stride(il);
             P.n = nl;
             P.n_main = nl - k_extra;
@@ -2053,6 +2095,7 @@ void Glm5Model::fast_destroy() {
     if (F->mtp_tok_h) cudaFreeHost(F->mtp_tok_h);
     if (F->ev_mtp) cudaEventDestroy(F->ev_mtp);
     if (F->pool) cudaFree(F->pool);
+    for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
     if (F->arena) cudaFree(F->arena);
     if (F->ps) cudaStreamSynchronize(F->ps);
@@ -2167,6 +2210,10 @@ void Glm5Model::fast_service() {
     auto last_route = std::chrono::steady_clock::now();
     int idle = 0;                        // 0 spinning, 1 short sleeps, 2 long sleeps
     unsigned int polls = 0;
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    auto last_kick = last_route;
+    unsigned int kick_polls = 0;
+#endif
     while (!F->quit.load(std::memory_order_relaxed)) {
         gf::MoeRequest* rq = F->ring_h + (next % gf::kRingSize);
         const unsigned int sq = rq->seq;
@@ -2177,6 +2224,23 @@ void Glm5Model::fast_service() {
                 F->processed.fetch_add((uint64_t) (sq - next), std::memory_order_release);
                 next = sq;
             } else {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+                // Windows' HIP runtime submits queued launches only when the host waits on the GPU (Linux submits
+                // each): a route the main thread queued can sit there while this thread waits for it.  After 1 ms
+                // without a route, submit what is queued - cudaStreamQuery does without waiting (not while a graph is
+                // being captured on the stream).  Submitting every launch instead (GPU_FLUSH_ON_EXECUTION=1) cost
+                // ~31 us a launch on a Radeon 8065S: decode 9.8 instead of 15.2 tokens/s
+                if ((++kick_polls & 63u) == 0 || idle != 0) {
+                    const auto now = std::chrono::steady_clock::now();
+                    if (now - last_route > std::chrono::milliseconds(1) && now - last_kick > std::chrono::milliseconds(1)) {
+                        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+                        if (cudaStreamIsCapturing(F->cs, &cap) == cudaSuccess && cap == cudaStreamCaptureStatusNone)
+                            (void) cudaStreamQuery(F->cs);
+                        (void) cudaGetLastError();
+                        last_kick = now;
+                    }
+                }
+#endif
                 if (idle == 2) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 } else if (idle == 1) {

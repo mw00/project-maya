@@ -101,6 +101,9 @@ int main() {
             CHECK(hipMemcpyAsync(input, values.data(), N * 4, hipMemcpyHostToDevice, stream));
             CHECK(hipMemsetAsync(output, 0, N * 4, stream));
             CHECK(hipGraphLaunch(exec, stream));
+            // submit without waiting: Windows' runtime holds launches until the host waits on the GPU (the engine's
+            // service thread does the same when no route comes)
+            (void) hipStreamQuery(stream);
             auto* request = ring + (r % gf::kRingSize);
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
             while (__atomic_load_n(&request->seq, __ATOMIC_ACQUIRE) != (unsigned int) r) {
