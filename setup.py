@@ -287,16 +287,20 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
-def find_vcvars():
+def find_vcvars(cuda=True):
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
     # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
-    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none
-    p = out([str(vswhere), "-latest", "-products", "*", "-version", "[16.0,18.0)", "-requires",
-             "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
-    v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
-    return v if v and v.exists() else None
+    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none.
+    # ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first
+    for versions in ([["-version", "[16.0,18.0)"]] if cuda else [["-version", "[16.0,18.0)"], []]):
+        p = out([str(vswhere), "-latest", "-products", "*", *versions, "-requires",
+                 "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
+        v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
+        if v and v.exists():
+            return v
+    return None
 
 
 # ------------------------------------------------------------------------------------------------ downloads

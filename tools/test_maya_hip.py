@@ -468,6 +468,9 @@ class WindowsDetectionTests(unittest.TestCase):
         self.assertFalse(maya.hip_unified_memory({"arch": "gfx1100", "name": "AMD Radeon RX 7900 XTX"}))
 
 
+ROCM_DEVICES_MISSING, FIND_VCVARS = maya.rocm_devices_missing, maya.S.find_vcvars   # (setUp replaces them)
+
+
 class WindowsHipSetupTests(unittest.TestCase):
     """START-MAYA.bat --backend hip on a Strix Halo / Gorgon Halo PC, with TheRock's ROCm wheels."""
 
@@ -496,11 +499,92 @@ class WindowsHipSetupTests(unittest.TestCase):
             patch.object(maya.S, "cpu_info", return_value=("AMD RYZEN AI MAX+ PRO 495", True, True)),
             patch.object(maya, "mem_gb", return_value=(32, 24)),
             patch.object(maya, "tool_version", return_value=(7, 14)),
+            patch.object(maya, "rocm_devices_missing", return_value=[]),
         ):
             ctx.start()
             self.addCleanup(ctx.stop)
         self.a = SimpleNamespace(backend="hip", gpu=None, gpus=None, no_vision=False, env=[], check=False, yes=True,
                                  port=8099, host=None, api_key=None, gguf_dir=None)
+
+    def test_visual_studio_is_checked_before_the_rocm_download(self):
+        with patch.object(maya.S, "find_vcvars", return_value=None), \
+                patch.object(maya, "windows_rocm", side_effect=AssertionError("no ROCm lookup without VS")), \
+                patch.object(maya, "run", side_effect=AssertionError("no pip without VS")):
+            with self.assertRaises(SystemExit):
+                maya.check_pc(self.a)
+
+    def test_visual_studio_2026_is_taken_for_hip_not_for_cuda(self):
+        pf = self.root / "pf86"
+        (pf / "Microsoft Visual Studio/Installer").mkdir(parents=True)
+        (pf / "Microsoft Visual Studio/Installer/vswhere.exe").touch()
+        vs = self.root / "VS2026"
+        (vs / "VC/Auxiliary/Build").mkdir(parents=True)
+        (vs / "VC/Auxiliary/Build/vcvars64.bat").touch()
+        only_2026 = lambda cmd: "" if "-version" in cmd else str(vs)
+        with patch.dict(os.environ, {"ProgramFiles(x86)": str(pf)}), patch.object(maya.S, "out", side_effect=only_2026):
+            self.assertIsNone(FIND_VCVARS())                         # CUDA 12/13: 2019 or 2022 only
+            self.assertEqual(FIND_VCVARS(cuda=False), vs / "VC/Auxiliary/Build/vcvars64.bat")
+
+    def test_rocm_sdk_init_runs_before_any_path_query(self):
+        sdk = str(self.root / "venv/Scripts/rocm-sdk.exe")
+        calls = []
+
+        def out(cmd):
+            calls.append(("out", cmd[1:]))
+            return {"--root": f"{self.rocm}\n", "--bin": f"{self.rocm / 'bin'}\n"}.get(cmd[-1], "")
+        env = {k: v for k, v in os.environ.items() if k != "ROCM_PATH"}
+        with patch.dict(os.environ, env, clear=True), patch.object(maya, "rocm_sdk", return_value=sdk), \
+                patch.object(maya, "run", side_effect=lambda cmd, **kw: calls.append(("run", cmd[1:]))), \
+                patch.object(maya.S, "out", side_effect=out):
+            self.assertEqual(maya.windows_rocm(), (self.rocm, self.rocm / "bin"))
+        self.assertEqual(calls[0], ("run", ["init"]))                # unpacks, seen and with no time limit
+        self.assertEqual([c[1] for c in calls[1:]], [["path", "--root"], ["path", "--bin"]])
+
+    def test_missing_device_wheel_is_offered(self):
+        with patch.object(maya, "windows_rocm", return_value=(self.rocm, self.rocm / "bin")), \
+                patch.object(maya, "rocm_devices_missing", side_effect=[["gfx1151"], []]), \
+                patch.object(maya, "run") as pip, patch.object(sys, "base_prefix", "/somewhere/else"):
+            pc = maya.check_pc(self.a)
+        self.assertIn(f"rocm[libraries,devel,device-gfx1151]=={maya.THEROCK_VERSION}", pip.call_args.args[0])
+        self.assertEqual(pc["gpus"], [self.apu])
+        self.a.check = True                                       # --check installs nothing: it says so
+        with patch.object(maya, "windows_rocm", return_value=(self.rocm, self.rocm / "bin")), \
+                patch.object(maya, "rocm_devices_missing", return_value=["gfx1151"]), \
+                patch.object(maya, "run", side_effect=AssertionError("--check installs nothing")), \
+                patch.object(maya, "warn") as warned:
+            maya.check_pc(self.a)
+        self.assertTrue(any("no library kernels for gfx1151" in c.args[0] for c in warned.call_args_list))
+
+    def test_device_wheels_are_looked_up_only_in_mayas_venv(self):
+        sdk = str(self.root / "venv/Scripts/rocm-sdk.exe")
+        Path(sdk).parent.mkdir(parents=True)
+        Path(sdk).touch()
+        from importlib import metadata
+
+        def version(name):
+            if name == "rocm-sdk-device-gfx1151":
+                raise metadata.PackageNotFoundError(name)
+            return maya.THEROCK_VERSION
+        env = {k: v for k, v in os.environ.items() if k not in ("ROCM_PATH", "ROCM_VENV")}
+        real = ROCM_DEVICES_MISSING
+        with patch.dict(os.environ, env, clear=True), patch.object(maya, "venv_tool", return_value=sdk), \
+                patch("importlib.metadata.version", side_effect=version):
+            self.assertEqual(real(["gfx1151", "gfx1100", "gfx1151"]), ["gfx1151"])
+            with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}):
+                self.assertEqual(real(["gfx1151"]), [])             # another ROCm: not this Python's to check
+            with patch.dict(os.environ, {"ROCM_VENV": str(self.root / "other")}), \
+                    patch.object(maya.shutil, "which", return_value=None):
+                (self.root / "other/Scripts").mkdir(parents=True)
+                (self.root / "other/Scripts/rocm-sdk.exe").touch()
+                self.assertEqual(real(["gfx1151"]), [])
+
+    def test_hipinfo_that_sees_no_gpu_warns_before_the_download(self):
+        with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}), \
+                patch.object(maya, "hip_info", return_value=str(self.rocm / "bin/hipInfo.exe")), \
+                patch.object(maya.S, "amd_gpus", return_value=[dict(self.apu, source="registry")]), \
+                patch.object(maya, "warn") as warned:
+            maya.check_pc(self.a)
+        self.assertTrue(any("hipInfo sees no AMD GPU" in c.args[0] for c in warned.call_args_list))
 
     def test_check_finds_therock_and_the_apu(self):
         with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}):
@@ -541,11 +625,18 @@ class WindowsHipSetupTests(unittest.TestCase):
         with patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}):
             pc = maya.check_pc(self.a)
         maya.BUILD.mkdir()
+        for dll in ("amdhip64_7.dll", "amd_comgr0702.dll", "rocm_kpack.dll"):
+            (self.rocm / "bin" / dll).touch()
         with patch.object(maya, "pick_cmake", return_value="cmake"), \
                 patch.object(maya, "venv_tool", return_value="C:/maya/.venv/Scripts/ninja.exe"), \
                 patch.object(maya, "cmake_steps", return_value=None) as build:
             meta = maya.compile_engine_hip(pc, self.root / "llama", "source-sha")
         conf, _, env, bat = build.call_args.args
+        self.assertEqual(build.call_args.kwargs["vcvars"], Path("C:/VS/vcvars64.bat"))
+        # the HIP runtime it was built with sits next to strata.exe (else System32's, the driver's, loads first);
+        # the libraries stay in lib_dirs
+        self.assertEqual(sorted(p.name for p in maya.EXE.parent.glob("*.dll")),
+                         ["amd_comgr0702.dll", "amdhip64_7.dll", "rocm_kpack.dll"])
         root = self.rocm.resolve().as_posix()
         self.assertEqual(conf[1:3], ["-G", "Ninja"])
         for want in (f"-DCMAKE_CXX_COMPILER={root}/lib/llvm/bin/clang++.exe",

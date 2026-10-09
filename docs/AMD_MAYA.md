@@ -98,7 +98,8 @@ included (Ryzen AI Max 300 / 400, Radeon 8050S / 8060S / 8065S, all `gfx1151`). 
 ROCm SDK for Windows (TheRock's pip wheels) and ROCm's clang, in Visual Studio's environment, with Ninja, as
 `tools\hip\build_maya_windows.bat` does (#54). The download, the pack and the dashboard are the same as on an NVIDIA PC.
 
-1. Install once: [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with
+1. Install once: a current AMD driver (AMD Software: Adrenalin Edition),
+   [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) 2022 or 2026 with
    "Desktop development with C++", 64-bit Python 3.12 (`winget install -e --id Python.Python.3.12 --scope user`)
    and Git.
 2. On an APU, give the GPU most of the memory: Variable Graphics Memory in AMD Software (Performance > Tuning), or
@@ -115,6 +116,8 @@ ROCm SDK for Windows (TheRock's pip wheels) and ROCm's clang, in Visual Studio's
    `ROCM_PATH` (a ROCm root) or `ROCM_VENV` (a venv with TheRock's `rocm-sdk`) selects another one.
 
 GPU numbers are hipInfo's (HIP's own order); without hipInfo, Windows' AMD display adapters in the registry's order.
+The build copies the ROCm SDK's HIP runtime (`amdhip64_7.dll`, `amd_comgr*.dll`, `rocm_kpack.dll`) next to
+`build-hip\strata.exe`: Windows would otherwise load the driver's own from System32 before the SDK's.
 
 **Memory on a Windows APU.** Windows gives the APU's GPU a fixed carve-out and does not count it as RAM: a 128 GB PC
 with 96 GB of Variable Graphics Memory shows 32 GB of RAM. The engine therefore sizes it like a discrete card - the
