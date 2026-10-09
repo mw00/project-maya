@@ -9,8 +9,9 @@ only what changed and starts; the model is not downloaded again.
 - **AMD on Windows, Strix Halo / Gorgon Halo included (experimental):** `START-MAYA.bat --backend hip` sets Maya up
   on Windows 10/11 as `./maya.sh --backend hip` does on Linux. It finds the GPUs with ROCm's hipInfo (else Windows'
   display adapters), uses AMD's HIP SDK for Windows (or offers AMD's ROCm SDK 7.14.1 wheels in `.venv` when there is
-  none), and compiles the engine with ROCm's clang and Ninja in Visual Studio's environment, like
-  `tools\hip\build_maya_windows.bat` (#54).
+  none), and compiles the engine with ROCm's clang and Ninja in Visual Studio's environment (2022 or 2026), like
+  `tools\hip\build_maya_windows.bat` (#54). The SDK's HIP runtime goes next to `strata.exe`, so the driver's own in
+  System32 is not loaded instead.
   - Ryzen AI Max 300 / 400 (Radeon 8050S / 8060S / 8065S, `gfx1151`): Windows gives the GPU a fixed carve-out
     (Variable Graphics Memory) that it does not count as RAM, so the engine sizes it there like a discrete card: the
     pool from the GPU memory HIP reports free, the RAM tier from the free RAM and commit. Linux keeps its

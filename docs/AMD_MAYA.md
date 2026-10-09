@@ -98,10 +98,11 @@ included (Ryzen AI Max 300 / 400, Radeon 8050S / 8060S / 8065S, all `gfx1151`). 
 clang in Visual Studio's environment, with Ninja, as `tools\hip\build_maya_windows.bat` does (#54). The download, the
 pack and the dashboard are the same as on an NVIDIA PC.
 
-1. Install once: [Visual Studio 2022 Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with
+1. Install once: a current AMD driver (AMD Software: Adrenalin Edition),
+   [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) 2022 or 2026 with
    "Desktop development with C++", 64-bit Python 3.12 (`winget install -e --id Python.Python.3.12 --scope user`),
    Git, and [AMD's HIP SDK for Windows](https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html) (7.2 is
-   measured below).
+   measured below; without it the setup offers AMD's ROCm SDK wheels).
 2. On an APU, give the GPU most of the memory: Variable Graphics Memory in AMD Software (Performance > Tuning), or
    the iGPU memory size in the BIOS - 160 GB of 192 GB on the PC below, 96 GB on a 128 GB one. Restart.
 3. Then:
@@ -116,6 +117,9 @@ HIP SDK (`HIP_PATH`, else the newest in `C:\Program Files\AMD\ROCm`). With none 
 Maya's `.venv` (pip, from `repo.amd.com/rocm/whl-multi-arch`: `rocm[libraries,devel,device-<arch>]==7.14.1`, the first
 with Gorgon Halo); `--check` prints that command instead. GPU numbers are hipInfo's (HIP's own order); without
 hipInfo, Windows' AMD display adapters in the registry's order.
+
+The build copies the ROCm SDK's HIP runtime (`amdhip64_7.dll`, `amd_comgr*.dll`, `rocm_kpack.dll`) next to
+`build-hip\strata.exe`: Windows would otherwise load the driver's own from System32 before the SDK's.
 
 **Memory on a Windows APU.** Windows gives the APU's GPU a fixed carve-out and does not count it as RAM: the 192 GB PC
 below, with 160 GB of Variable Graphics Memory, shows 32 GB of RAM, and HIP reports 171.9 GB (the carve-out and three

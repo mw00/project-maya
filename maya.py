@@ -320,20 +320,21 @@ def rocm_sdk() -> str | None:
 
 
 def windows_rocm() -> tuple:
-    """(ROCm's root, the folder of its DLLs) on Windows, or (None, None): ROCM_PATH, else TheRock's wheels (their
-    first `rocm-sdk init` unpacks the compiler, the headers and the device libraries), else AMD's HIP SDK for Windows
-    (HIP_PATH, which its installer sets, else the newest in C:\\Program Files\\AMD\\ROCm)."""
+    """(ROCm's root, the folder of its DLLs) on Windows, or (None, None): ROCM_PATH, else TheRock's wheels, else AMD's
+    HIP SDK for Windows (HIP_PATH, which its installer sets, else the newest in C:\\Program Files\\AMD\\ROCm)."""
     if os.environ.get("ROCM_PATH"):
         root = Path(os.environ["ROCM_PATH"]).resolve()
         return root, root / "bin"
     sdk = rocm_sdk()
     if sdk is not None:
+        # the first `rocm-sdk init` unpacks the compiler, the headers and the libraries (about 3 GB, minutes) and links
+        # the device wheels in; later ones only check. Before any `rocm-sdk path`: that would unpack it too, unseen and
+        # within S.out's minute, and start over on every run (as llama.cpp's Windows CI does: init, then path)
+        say("  AMD's ROCm SDK: rocm-sdk init (the first time it unpacks about 3 GB) ...")
+        run([sdk, "init"], check=False)
         path = lambda what: (S.out([sdk, "path", what]).strip().splitlines() or [""])[-1].strip()
         root = path("--root")
         if root:
-            if hip_clang(Path(root)) is None:
-                say("  Unpacking AMD's ROCm SDK (rocm-sdk init, once) ...")
-                run([sdk, "init"], check=False)
             return Path(root), Path(path("--bin") or Path(root) / "bin")
     base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "AMD" / "ROCm"
     sdks = sorted(base.glob("[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)], reverse=True)
@@ -341,6 +342,22 @@ def windows_rocm() -> tuple:
         if hip_clang(root) is not None:
             return root.resolve(), root.resolve() / "bin"
     return None, None
+
+
+def rocm_devices_missing(archs) -> list:
+    """Of these architectures, those whose library kernels (TheRock's rocm-sdk-device-<arch> wheel) are not in this
+    .venv; [] for a ROCm SDK elsewhere (ROCM_PATH, ROCM_VENV, PATH: not checked)."""
+    if os.environ.get("ROCM_PATH") or rocm_sdk() is None or rocm_sdk() != venv_tool("rocm-sdk"):
+        return []
+    from importlib import invalidate_caches, metadata
+    invalidate_caches()
+    missing = []
+    for arch in dict.fromkeys(archs):
+        try:
+            metadata.version(f"rocm-sdk-device-{arch}")
+        except metadata.PackageNotFoundError:
+            missing.append(arch)
+    return missing
 
 
 def hip_info(bindir) -> str | None:
@@ -362,12 +379,15 @@ def rocm_pip(archs) -> list:
 
 
 def install_rocm(a, chosen) -> None:
-    """Windows: AMD's ROCm SDK into Maya's .venv (asked first; nothing goes outside this folder), else the command."""
-    cmd = rocm_pip(g["arch"] for g in chosen)
+    """Windows: AMD's ROCm SDK with the kernels for these GPUs into Maya's .venv (asked first; nothing goes outside
+    this folder), else the command."""
+    archs = sorted({g["arch"] for g in chosen})
+    cmd = rocm_pip(archs)
+    what = f"AMD's ROCm SDK for Windows with the kernels for {', '.join(archs)}"
     if getattr(a, "check", False) or sys.prefix == sys.base_prefix:
-        fail("AMD's ROCm SDK for Windows is not installed", f"install it into Maya's Python environment: {cmdline(cmd)}"
+        fail(f"{what} is not installed", f"install it into Maya's Python environment: {cmdline(cmd)}"
              f" - then run {ME} again (or set ROCM_PATH / ROCM_VENV to a ROCm 7 that has one)")
-    if ask(f"Install AMD's ROCm SDK {THEROCK_VERSION} for Windows into .venv now (pip, from repo.amd.com)?",
+    if ask(f"Install {what} ({THEROCK_VERSION}) into .venv now (pip, from repo.amd.com)?",
            ["y", "n"], "y", getattr(a, "yes", False)) != "y":
         fail("Maya's HIP engine is compiled with AMD's ROCm SDK", f"install it with: {cmdline(cmd)}")
     run(cmd)
@@ -376,18 +396,28 @@ def install_rocm(a, chosen) -> None:
              "messages")
 
 
-def check_hip_pc(a) -> dict:
+def check_hip_pc(a, installed=False) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's experimental HIP backend runs on native Linux or Windows")
+    if WIN and S.find_vcvars(cuda=False) is None:      # (before ROCm's download: ROCm's clang needs its headers)
+        fail("Visual Studio Build Tools (2022 or 2026) are needed: ROCm's compiler uses their headers and libraries",
+             "winget install -e --id Microsoft.VisualStudio.2022.BuildTools --override \"--wait --passive --add "
+             "Microsoft.VisualStudio.Workload.VCTools --includeRecommended\" - or "
+             "https://visualstudio.microsoft.com/visual-cpp-build-tools/ with 'Desktop development with C++'")
     root, bindir = windows_rocm() if WIN else (None, None)
-    found = S.amd_gpus(hip_info(bindir)) if WIN else S.amd_gpus()
+    hipinfo = hip_info(bindir) if WIN else None
+    found = S.amd_gpus(hipinfo) if WIN else S.amd_gpus()
     usable = [g for g in found if g["arch"] in HIP_ARCHS]
     for g in found:
         say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by Maya's HIP build"))
     if not usable:
         fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 9070 / AI PRO R9700 "
              "(gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / 8065S (gfx1151)")
-    if WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
+    if WIN and hipinfo and all(g.get("source") == "registry" for g in found):
+        warn(f"ROCm's hipInfo sees no AMD GPU (the list above is Windows'): the engine cannot start until it does - "
+             f"update AMD's driver (AMD Software: Adrenalin Edition, https://www.amd.com/en/support), restart, and "
+             f"check with {hipinfo}")
+    elif WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
         warn("these GPU numbers are Windows' order (ROCm's hipInfo was not found): HIP's own can differ")
     if a.gpus:
         # two cards split the layers (each caches the experts of its own half); the larger card goes first, as it
@@ -414,9 +444,17 @@ def check_hip_pc(a) -> dict:
             fail(f"GPU {a.gpu} is not a supported AMD card")
         chosen = [one]
     if WIN:
-        if root is None:
+        # no ROCm SDK, or Maya's without the library kernels (rocm-sdk-device-<arch>) for a chosen GPU: offered once,
+        # then checked again with ROCm there (its hipInfo numbers the GPUs as HIP does)
+        missing = sorted({g["arch"] for g in chosen}) if root is None else rocm_devices_missing(g["arch"] for g in chosen)
+        if missing and not installed and (root is None or not getattr(a, "check", False)):   # (--check: says so below)
             install_rocm(a, chosen)
-            return check_hip_pc(a)                     # again with ROCm there: its hipInfo numbers the GPUs as HIP does
+            return check_hip_pc(a, installed=True)
+        if root is None:
+            fail("AMD's ROCm SDK for Windows was not found after its install", f"run {ME} again")
+        if missing:
+            warn(f"the ROCm SDK still has no library kernels for {', '.join(missing)} (rocm-sdk-device-...): hipBLAS "
+                 f"fails on that GPU - {cmdline(rocm_pip(g['arch'] for g in chosen))}")
         if hip_clang(root) is None or not (list(root.glob("lib/hipblas*.lib")) or list(bindir.glob("hipblas*.dll"))):
             fail(f"ROCm's HIP compiler and hipBLAS are not in {root}",
                  f"install AMD's ROCm SDK into Maya's .venv: {cmdline(rocm_pip(g['arch'] for g in chosen))} - or set "
@@ -424,11 +462,6 @@ def check_hip_pc(a) -> dict:
         hipcc = next((p for p in (bindir / "hipcc.exe", root / "bin" / "hipcc.exe") if p.exists()), None)
         if hipcc is not None and tool_version(str(hipcc)) < (7, 0):
             fail("Maya's HIP port requires ROCm 7 or newer")
-        # ROCm's clang compiles the host code too, with Visual Studio's headers and libraries
-        if S.find_vcvars() is None:
-            fail("Visual Studio 2022 Build Tools are needed (ROCm's compiler uses its headers and libraries)",
-                 "https://visualstudio.microsoft.com/visual-cpp-build-tools/ - in the installer tick 'Desktop "
-                 "development with C++'")
     else:
         root = Path(os.environ.get("ROCM_PATH") or "/opt/rocm")
         if not os.environ.get("ROCM_PATH") and not root.exists():
@@ -882,7 +915,7 @@ def shell_join(cmd) -> str:
     return cmdline(cmd) if WIN else shlex.join(cmd)
 
 
-def cmake_steps(conf, build, env, bat_name: str) -> str | None:
+def cmake_steps(conf, build, env, bat_name: str, vcvars=None) -> str | None:
     """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
     worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
     compiler's environment - the way Strata's setup.py builds there (cmake_build)."""
@@ -894,7 +927,7 @@ def cmake_steps(conf, build, env, bat_name: str) -> str | None:
             if run(build, env=env, check=False).returncode != 0:
                 return "compiling"
         return None
-    vcvars = S.find_vcvars()
+    vcvars = vcvars or S.find_vcvars()
     if vcvars is None:
         return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
     bat = ROOT / bat_name
@@ -1002,11 +1035,21 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False) -> dict | No
     jobs = max(1, min(4, (os.cpu_count() or 4) // 2))
     say("  Compiling Maya for AMD " + ", ".join(pc["archs"]) + " ...")
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "strata", "-j", str(jobs)], env,
-                   "build-maya-hip.bat"):
+                   "build-maya-hip.bat", vcvars=S.find_vcvars(cuda=False) if WIN else None):
         if soft:
             warn("HIP rebuild failed; starting the previous engine")
             return None
         fail("the HIP engine build failed", "see the compiler output above")
+    if WIN:
+        # Windows takes a program's DLLs from its own folder, then System32 - where AMD's driver puts its own HIP
+        # runtime - and PATH only after: the runtime the engine was built with goes next to it (as llama.cpp's
+        # Windows builds do; with the driver's, cudaMemGetInfo failed there). lib_dirs keeps the libraries
+        for pattern in ("amdhip64*.dll", "amd_comgr*.dll", "rocm_kpack*.dll"):
+            for dll in bindir.glob(pattern):
+                try:
+                    shutil.copy2(dll, EXE.parent)
+                except OSError as e:                   # (in use: an engine still running keeps the one it has)
+                    warn(f"could not copy {dll.name} next to the engine ({e})")
     meta = {"backend": "hip", "src": src, "archs": pc["archs"], "rocm": str(root),
             "gpu_ids": [g["index"] for g in pc["gpus"]], "llama": str(llama),
             "lib_dirs": [str(bindir if WIN else root / "lib")], "date": time.strftime("%Y-%m-%d %H:%M")}
