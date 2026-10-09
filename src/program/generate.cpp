@@ -14,6 +14,13 @@
 // AND IT IS PHASE 2, so hit rate is `h = 0` and the number it prints is slow on purpose
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
+#ifdef _WIN32
+// MSVC has no POSIX setenv(); _putenv_s always overwrites, which only differs from
+// setenv(..., 0) when an existing value must survive - not the case at the call site below.
+#include <stdlib.h>
+static inline int setenv(const char* name, const char* value, int) { return _putenv_s(name, value); }
+#endif
+
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/remote_experts.hpp"
