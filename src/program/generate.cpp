@@ -1388,7 +1388,22 @@ static int glm_pack_generate(const Options& o) {
             double nll = 0.0, kl = 0.0, kl_max = 0.0;
             size_t n = 0, top1 = 0, same = 0, nref = 0;
             const auto ts = std::chrono::steady_clock::now();
-            for (size_t i = 0; i + 1 < o.tokens.size(); ++i) {
+            // STRATA_GLM_SCORE_PREFILL=1: the first c - 1 tokens go through the prompt path (the batched prefill) and
+            // the decode takes over from token c - 1 - the same scored positions, read over a prefilled context
+            size_t i0 = 0;
+            if (getenv("STRATA_GLM_SCORE_PREFILL") != nullptr && c >= 2 && c < o.tokens.size()) {
+                const std::vector<int32_t> head(o.tokens.begin(), o.tokens.begin() + (long) (c - 1));
+                if (model.prefill(head, err, (int32_t) o.tokens[c - 1])) {
+                    i0 = c - 1;
+                } else if (!err.empty()) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                } else {
+                    std::fprintf(stderr, "strata generate: no prompt path - the score reads the context token by token\n");
+                    model.reset();
+                }
+            }
+            for (size_t i = i0; i + 1 < o.tokens.size(); ++i) {
                 if (!model.forward({(int32_t) o.tokens[i]}, lg, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
