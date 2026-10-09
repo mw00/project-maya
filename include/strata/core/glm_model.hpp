@@ -202,6 +202,9 @@ private:
     // instead of max_ctx rows; 0 = no ring (row p).  The unfinished pool's rows are running state: the snapshot keeps
     // them (snap_tail_).  STRATA_GLM_IK_RING=0 turns the ring off, =<n> sets its positions.
     int64_t ik_ring_ = 0;
+    // STRATA_GLM_LAT8=1: the fast path's DSA latent cache in INT8 - a row of kv_lora codes and one FP16 scale per 32
+    // values (544 bytes at kv_lora 512 instead of FP16's 1024)
+    bool lat8_ = false;
     int64_t ik_row(int64_t p) const { return ik_ring_ > 0 ? p % ik_ring_ : p; }
 
 public:

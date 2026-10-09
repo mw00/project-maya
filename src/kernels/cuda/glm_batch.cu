@@ -65,6 +65,28 @@ __device__ __forceinline__ float block_sum(float v, float* sh) {
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
 __device__ __forceinline__ float lat_f(uint16_t v) { return __half2float(__ushort_as_half(v)); }
 __device__ __forceinline__ uint16_t lat_h(float v) { return __half_as_ushort(__float2half(v)); }
+// the INT8 latent (STRATA_GLM_LAT8; glm_fast.cu has the same layout): a row is kv_lora int8 codes, then one FP16 scale
+// per 32 values (kv_lora * 17 / 16 bytes).  The prompt attention reads 4 or 8 values at a time as FP16 bits - what an
+// FP16 row's uint2 / uint4 would hold (KV = 512 rows, the only width the attention takes)
+__device__ __forceinline__ size_t lat8_row(int kv_lora) { return (size_t) kv_lora + (size_t) kv_lora / 16; }
+__device__ __forceinline__ uint32_t lat8_pair(int8_t a, int8_t b, float sc) {
+    return (uint32_t) lat_h((float) a * sc) | ((uint32_t) lat_h((float) b * sc) << 16);
+}
+__device__ __forceinline__ uint2 lat_ld4(const uint16_t* lat, int lat8, int cell, int c4) {
+    if (!lat8) return ((const uint2*) (lat + (size_t) 512 * cell))[c4];
+    const int8_t* row = (const int8_t*) lat + lat8_row(512) * (size_t) cell;
+    const char4 q = ((const char4*) row)[c4];
+    const float sc = __half2float(((const __half*) (row + 512))[c4 >> 3]);
+    return make_uint2(lat8_pair(q.x, q.y, sc), lat8_pair(q.z, q.w, sc));
+}
+__device__ __forceinline__ uint4 lat_ld8(const uint16_t* lat, int lat8, int cell, int c8) {
+    if (!lat8) return ((const uint4*) (lat + (size_t) 512 * cell))[c8];
+    const int8_t* row = (const int8_t*) lat + lat8_row(512) * (size_t) cell;
+    const uint2 w = ((const uint2*) row)[c8];
+    const float sc = __half2float(((const __half*) (row + 512))[c8 >> 2]);
+    const char4 a = *(const char4*) &w.x, b = *(const char4*) &w.y;
+    return make_uint4(lat8_pair(a.x, a.y, sc), lat8_pair(a.z, a.w, sc), lat8_pair(b.x, b.y, sc), lat8_pair(b.z, b.w, sc));
+}
 __device__ __forceinline__ float dsigmoid(float x) { return 1.0f / (1.0f + __expf(-x)); }
 
 std::atomic<int> g_errors{0};
@@ -464,7 +486,18 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
         const float v = tid < a.kv_lora ? a.kv_raw[(size_t) t * a.kv_lora + tid] : 0.0f;
         const float ss = block_sum(v * v, sred);
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
-        if (tid < a.kv_lora) a.lat[(size_t) a.kv_lora * p + tid] = lat_h(v * inv * a.kv_norm[tid]);
+        if (a.lat8) {   // INT8: one scale per warp's 32 values (kv_lora % 32 == 0: a warp is all in or all out)
+            if (tid < a.kv_lora) {
+                const float y = v * inv * a.kv_norm[tid];
+                int8_t* row = (int8_t*) a.lat + lat8_row(a.kv_lora) * (size_t) p;
+                const __half hs = __float2half(warp_max(fabsf(y)) / 127.0f);
+                const float sc = __half2float(hs);
+                row[tid] = (int8_t) fmaxf(-127.0f, fminf(127.0f, sc > 0.0f ? rintf(y / sc) : 0.0f));
+                if ((tid & 31) == 0) ((__half*) (row + a.kv_lora))[tid >> 5] = hs;
+            }
+        } else if (tid < a.kv_lora) {
+            a.lat[(size_t) a.kv_lora * p + tid] = lat_h(v * inv * a.kv_norm[tid]);
+        }
         return;
     }
     const int K = a.idx_key;
@@ -649,7 +682,8 @@ constexpr size_t kF32Smem = (size_t) MB_CH * 512 * sizeof(uint16_t) + (size_t) M
 static_assert(kF32Smem <= 48 * 1024, "the F32 prompt attention must fit the default 48 KB of shared memory");
 __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                        const int* __restrict__ cells_all, const int* __restrict__ n_sel_arr,
-                                                       int n_sel_max, int n_head, float scale, float* __restrict__ ctx) {
+                                                       int n_sel_max, int n_head, float scale, float* __restrict__ ctx,
+                                                       int lat8) {
     constexpr int KV = 512;
     extern __shared__ float sm[];
     uint16_t* sL = (uint16_t*) sm;   // MB_CH x KV, FP16
@@ -682,7 +716,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
         for (int i = tid; i < MB_CH * KV / 4; i += blockDim.x) {
             const int s = i / (KV / 4), c4 = i - s * (KV / 4);
             const int cell = s_cell[s];
-            ((uint2*) sL)[i] = cell >= 0 ? ((const uint2*) (lat + (size_t) KV * cell))[c4] : make_uint2(0u, 0u);
+            ((uint2*) sL)[i] = cell >= 0 ? lat_ld4(lat, lat8, cell, c4) : make_uint2(0u, 0u);
         }
         __syncthreads();
         for (int s = 0; s < MB_CH; ++s) {
@@ -760,7 +794,7 @@ constexpr size_t kTcSmem = (size_t) TC_HG * 512 * 4 + (size_t) TC_HG * 512 * 2 +
 __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                           const int* __restrict__ cells_all,
                                                           const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
-                                                          float scale, float* __restrict__ ctx) {
+                                                          float scale, float* __restrict__ ctx, int lat8) {
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -792,7 +826,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
         for (int k = 0; k < PRE; ++k) {
             const int i = tid + k * 256, s = i / (KV / 8), c8 = i - s * (KV / 8);
             const int cell = c0 + s < ns ? cl[c0 + s] : -1;
-            pre[k] = cell >= 0 ? ((const uint4*) (lat + (size_t) KV * cell))[c8] : make_uint4(0u, 0u, 0u, 0u);
+            pre[k] = cell >= 0 ? lat_ld8(lat, lat8, cell, c8) : make_uint4(0u, 0u, 0u, 0u);
         }
     };
     issue(0);
@@ -879,7 +913,7 @@ constexpr size_t kTcRegSmem = (size_t) TC_HG * 512 * 2 + (size_t) TC_CH * 512 * 
 __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                               const int* __restrict__ cells_all,
                                                               const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
-                                                              float scale, float* __restrict__ ctx) {
+                                                              float scale, float* __restrict__ ctx, int lat8) {
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -912,7 +946,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
         for (int k = 0; k < PRE; ++k) {
             const int i = tid + k * 256, s = i / (KV / 8), c8 = i - s * (KV / 8);
             const int cell = c0 + s < ns ? cl[c0 + s] : -1;
-            pre[k] = cell >= 0 ? ((const uint4*) (lat + (size_t) KV * cell))[c8] : make_uint4(0u, 0u, 0u, 0u);
+            pre[k] = cell >= 0 ? lat_ld8(lat, lat8, cell, c8) : make_uint4(0u, 0u, 0u, 0u);
         }
     };
     issue(0);
@@ -1057,7 +1091,7 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
                                                            const uint16_t* __restrict__ lat,
                                                            const int* __restrict__ cells_all,
                                                            const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
-                                                           float scale, float* __restrict__ ctx) {
+                                                           float scale, float* __restrict__ ctx, int lat8) {
     extern __shared__ __align__(16) unsigned char mt_sm[];
     __half* sQ = (__half*) mt_sm;                 // MT_H x MT_LD
     __half* sL = sQ + MT_H * MT_LD;               // MT_C x MT_LD
@@ -1106,7 +1140,7 @@ __global__ void __launch_bounds__(256) mla_attn_mma_kernel(const float* __restri
             const int r = i / (MT_KV / 8), c8 = i - r * (MT_KV / 8);
             const int cell = s_cell[r];
             uint4 v = make_uint4(0u, 0u, 0u, 0u);
-            if (cell >= 0) v = ((const uint4*) (lat + (size_t) MT_KV * cell))[c8];
+            if (cell >= 0) v = lat_ld8(lat, lat8, cell, c8);
             *(uint4*) (sL + r * MT_LD + 8 * c8) = v;
         }
         __syncthreads();
@@ -1216,7 +1250,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
                                                             const uint16_t* __restrict__ lat,
                                                             const int* __restrict__ cells_all,
                                                             const int* __restrict__ n_sel_arr, int n_sel_max,
-                                                            int n_head, float scale, float* __restrict__ ctx) {
+                                                            int n_head, float scale, float* __restrict__ ctx, int lat8) {
     namespace wm = rocwmma;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char hw_sm[];
@@ -1245,7 +1279,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
         for (int k = 0; k < PRE; ++k) {
             const int i = tid + k * 256, s = i / (KV / 8), c8 = i - s * (KV / 8);
             const int cell = c0 + s < ns ? cl[c0 + s] : -1;
-            pre[k] = cell >= 0 ? ((const uint4*) (lat + (size_t) KV * cell))[c8] : make_uint4(0u, 0u, 0u, 0u);
+            pre[k] = cell >= 0 ? lat_ld8(lat, lat8, cell, c8) : make_uint4(0u, 0u, 0u, 0u);
         }
     };
     issue(0);
@@ -1711,7 +1745,7 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
 }
 
 void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,
-              int kv_lora, float scale, int T, float* ctx, cudaStream_t s) {
+              int kv_lora, float scale, int T, float* ctx, cudaStream_t s, int lat8) {
     if (T <= 0) return;
     if (kv_lora != 512 || n_head % MB_HG != 0) {
         std::fprintf(stderr, "glm_batch mla_attn: kv_lora %d / n_head %d unsupported\n", kv_lora, n_head);
@@ -1762,17 +1796,17 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
     if (tc_ok[dev] > 0 && !f32_only) {
         if (tc_ok[dev] == 3)
             mla_attn_mma_kernel<<<dim3((unsigned) T, (unsigned) (n_head / MT_H)), 256, kMtSmem, s>>>(
-                q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+                q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat8);
         else if (tc_ok[dev] == 2)
-            mla_attn_tc_reg_kernel<<<grid, 256, kTcRegSmem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+            mla_attn_tc_reg_kernel<<<grid, 256, kTcRegSmem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat8);
         else
-            mla_attn_tc_kernel<<<grid, 256, kTcSmem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+            mla_attn_tc_kernel<<<grid, 256, kTcSmem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat8);
         check("mla_attn_tc");
         if (check_tc) {
             const size_t n = (size_t) T * n_head * 512;
             float* ref = nullptr;
             if (cudaMalloc(&ref, n * sizeof(float)) == cudaSuccess) {
-                mla_attn_kernel<<<grid, 256, kF32Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ref);
+                mla_attn_kernel<<<grid, 256, kF32Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ref, lat8);
                 std::vector<float> A(n), B(n);
                 cudaStreamSynchronize(s);
                 cudaMemcpy(A.data(), ctx, n * sizeof(float), cudaMemcpyDeviceToHost);
@@ -1798,7 +1832,7 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
         return;
     }
 #endif
-    mla_attn_kernel<<<grid, 256, kF32Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+    mla_attn_kernel<<<grid, 256, kF32Smem, s>>>(q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat8);
     check("mla_attn");
 }
 
@@ -1812,7 +1846,8 @@ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, c
     }
     // kHwSmem is below the 64 KiB a workgroup may take without opting in
     const dim3 grid((unsigned) T, (unsigned) (n_head / HW_HG));
-    mla_attn_wmma_kernel<<<grid, 256, kHwSmem, s>>>((const _Float16*) q16, lat, cells, n_sel, n_sel_max, n_head, scale, ctx);
+    mla_attn_wmma_kernel<<<grid, 256, kHwSmem, s>>>((const _Float16*) q16, lat, cells, n_sel, n_sel_max, n_head, scale, ctx,
+                                                    0);   // (FP16 latents only: an INT8 cache takes mla_attn)
     check("mla_attn_wmma");
 }
 #endif

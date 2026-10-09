@@ -1529,6 +1529,25 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
 __device__ __forceinline__ float lat_f(uint16_t v) { return __half2float(__ushort_as_half(v)); }
 __device__ __forceinline__ uint16_t lat_h(float v) { return __half_as_ushort(__float2half(v)); }
+// ... or INT8 (STRATA_GLM_LAT8): a row is kv_lora int8 codes, then one FP16 scale per 32 values (kv_lora * 17 / 16
+// bytes); value c of row `cell` = code * scale, handed out as FP16 bits like the FP16 cache's
+__device__ __forceinline__ size_t lat8_row(int kv_lora) { return (size_t) kv_lora + (size_t) kv_lora / 16; }
+__device__ __forceinline__ uint16_t lat_ld(const uint16_t* lat, int lat8, int kv_lora, int cell, int c) {
+    if (!lat8) return lat[(size_t) kv_lora * cell + c];
+    const int8_t* row = (const int8_t*) lat + lat8_row(kv_lora) * (size_t) cell;
+    const float sc = __half2float(((const __half*) (row + kv_lora))[c >> 5]);
+    return lat_h((float) row[c] * sc);
+}
+// one row's value at c, written as INT8: a warp holds 32 consecutive values (c % 32 == lane), one scale a warp
+__device__ __forceinline__ void lat8_store_warp(uint16_t* lat, int kv_lora, int p, int c, float v) {
+    int8_t* row = (int8_t*) lat + lat8_row(kv_lora) * (size_t) p;
+    const float amax = warp_max(fabsf(v));
+    const __half hs = __float2half(amax / 127.0f);
+    const float sc = __half2float(hs);
+    const float q = sc > 0.0f ? rintf(v / sc) : 0.0f;
+    row[c] = (int8_t) fmaxf(-127.0f, fminf(127.0f, q));
+    if ((c & 31) == 0) ((__half*) (row + kv_lora))[c >> 5] = hs;
+}
 // ---------------------------------------------------------------- DSA
 __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ DsaPrepArgs a) {
     __shared__ float sred[32];
@@ -1556,7 +1575,11 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ D
         float v = tid < a.kv_lora ? a.kv_raw[tid] : 0.0f;
         const float ss = block_sum(v * v, sred);
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
-        if (tid < a.kv_lora) a.lat[(size_t) a.kv_lora * a.p + tid] = lat_h(v * inv * a.kv_norm[tid]);
+        if (a.lat8) {   // (kv_lora % 32 == 0: a warp is all in or all out)
+            if (tid < a.kv_lora) lat8_store_warp(a.lat, a.kv_lora, a.p, tid, v * inv * a.kv_norm[tid]);
+        } else if (tid < a.kv_lora) {
+            a.lat[(size_t) a.kv_lora * a.p + tid] = lat_h(v * inv * a.kv_norm[tid]);
+        }
         return;
     }
     // block 2: the indexer key (layer norm) and the compressor gate into their caches; the pool
@@ -1638,7 +1661,7 @@ __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restric
 __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, const uint16_t* __restrict__ wk_b,
                                                   const uint16_t* __restrict__ wv_b, const uint16_t* __restrict__ lat,
                                                   const int* __restrict__ cells, int n_sel, int qk_nope, int kv_lora,
-                                                  int v_head, block_q8_1* __restrict__ out) {
+                                                  int v_head, block_q8_1* __restrict__ out, int lat8) {
     extern __shared__ float smem[];
     float* s_q = smem;                    // qk_nope
     float* s_qa = s_q + qk_nope;          // kv_lora
@@ -1663,9 +1686,8 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
         const int cell = cells[s];
         float dot = -INFINITY;
         if (cell >= 0) {
-            const uint16_t* lr = lat + (size_t) kv_lora * cell;
             float acc = 0.0f;
-            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lat_f(lr[e]);
+            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lat_f(lat_ld(lat, lat8, kv_lora, cell, e));
             dot = warp_sum(acc) * scale;
         }
         if (lane == 0) s_p[s] = dot;
@@ -1686,7 +1708,7 @@ __global__ void __launch_bounds__(256) mla_kernel(const float* __restrict__ q, c
         float acc = 0.0f;
         for (int s = 0; s < n_sel; ++s) {
             const int cell = cells[s];
-            if (cell >= 0) acc += (s_p[s] * invd) * lat_f(lat[(size_t) c + (size_t) kv_lora * cell]);
+            if (cell >= 0) acc += (s_p[s] * invd) * lat_f(lat_ld(lat, lat8, kv_lora, cell, c));
         }
         s_ctx[c] = acc;
     }
@@ -1731,7 +1753,7 @@ __global__ void __launch_bounds__(256) headwise_gemv_kernel(const uint16_t* __re
 
 __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                        const int* __restrict__ cells, int n_sel, int qk_nope,
-                                                       int kv_lora, float* __restrict__ ctx) {
+                                                       int kv_lora, float* __restrict__ ctx, int lat8) {
     extern __shared__ float smem[];
     float* s_qa = smem;               // kv_lora
     float* s_p = s_qa + kv_lora;      // n_sel
@@ -1744,9 +1766,8 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
         const int cell = cells[s];
         float dot = -INFINITY;
         if (cell >= 0) {
-            const uint16_t* lr = lat + (size_t) kv_lora * cell;
             float acc = 0.0f;
-            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lat_f(lr[e]);
+            for (int e = lane; e < kv_lora; e += 32) acc += s_qa[e] * lat_f(lat_ld(lat, lat8, kv_lora, cell, e));
             dot = warp_sum(acc) * scale;
         }
         if (lane == 0) s_p[s] = dot;
@@ -1767,7 +1788,7 @@ __global__ void __launch_bounds__(256) mla_attn_kernel(const float* __restrict__
         float acc = 0.0f;
         for (int s = 0; s < n_sel; ++s) {
             const int cell = cells[s];
-            if (cell >= 0) acc += (s_p[s] * invd) * lat_f(lat[(size_t) c + (size_t) kv_lora * cell]);
+            if (cell >= 0) acc += (s_p[s] * invd) * lat_f(lat_ld(lat, lat8, kv_lora, cell, c));
         }
         ctx[(size_t) kv_lora * h + c] = acc;
     }
@@ -1784,7 +1805,7 @@ constexpr int MLA_CHUNK = 32;
 constexpr int MLA_HPB = 16;
 __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
                                                         const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
-                                                        int kv_lora, float* __restrict__ part) {
+                                                        int kv_lora, float* __restrict__ part, int lat8) {
     extern __shared__ float smem[];
     uint16_t* sL = (uint16_t*) smem;                   // MLA_CHUNK x kv_lora, FP16
     float* sS = smem + MLA_CHUNK * kv_lora / 2;        // MLA_HPB x MLA_CHUNK scores -> weights
@@ -1798,7 +1819,7 @@ __global__ void __launch_bounds__(256) mla_split_kernel(const float* __restrict_
     for (int i = tid; i < MLA_CHUNK * kv_lora; i += blockDim.x) {
         const int s = i / kv_lora, c = i - s * kv_lora;
         const int cell = s_cell[s];
-        sL[i] = cell >= 0 ? lat[(size_t) kv_lora * cell + c] : (uint16_t) 0;
+        sL[i] = cell >= 0 ? lat_ld(lat, lat8, kv_lora, cell, c) : (uint16_t) 0;
     }
     __syncthreads();
     const float scale = rsqrtf((float) qk_nope);
@@ -3015,7 +3036,7 @@ void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_s
 }
 
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s) {
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, int lat8) {
     // scratch for q_abs and ctx (n_head * kv_lora each), per device
     static float* scratch[16] = {};
     int dev = 0;
@@ -3023,7 +3044,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
     if (getenv("STRATA_GLM_MLA1") != nullptr || dev >= 16 || kv_lora % 32 || v_head % 32) {
         const size_t smem = ((size_t) qk_nope + 2 * kv_lora + v_head + n_sel) * sizeof(float);
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
-                                             (block_q8_1*) out_q8_1);
+                                             (block_q8_1*) out_q8_1, lat8);
         launch_check("mla");
         return;
     }
@@ -3032,7 +3053,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
         cudaGetLastError();
         const size_t smem = ((size_t) qk_nope + 2 * kv_lora + v_head + n_sel) * sizeof(float);
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
-                                             (block_q8_1*) out_q8_1);
+                                             (block_q8_1*) out_q8_1, lat8);
         launch_check("mla");
         return;
     }
@@ -3076,11 +3097,11 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
     if (split_ok[dev] && part[dev] != nullptr && part_chunks[dev] >= n_chunks && kv_lora <= 512 &&
         getenv("STRATA_GLM_MLA_ATTN1") == nullptr) {
         mla_split_kernel<<<dim3(n_chunks, (n_head + MLA_HPB - 1) / MLA_HPB), 256, smem, s>>>(
-            q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part[dev]);
+            q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part[dev], lat8);
         mla_combine_kernel<<<n_head, 256, 0, s>>>(part[dev], n_chunks, n_head, kv_lora, ctx);
     } else {
         mla_attn_kernel<<<n_head, 256, ((size_t) kv_lora + n_sel) * sizeof(float), s>>>(q_abs, lat, cells, n_sel,
-                                                                                        qk_nope, kv_lora, ctx);
+                                                                                        qk_nope, kv_lora, ctx, lat8);
     }
     headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
                                                               (block_q8_1*) out_q8_1);

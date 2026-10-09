@@ -1358,6 +1358,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.kv_raw = B.kv_raw;
                 d.kv_norm = Ly.kv_a_norm;
                 d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+                d.lat8 = lat8_ ? 1 : 0;
                 d.kv_lora = g.kv_lora;
                 d.ik_raw = B.ik_raw;
                 d.k_norm_w = Ly.k_norm_w;
@@ -1399,7 +1400,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 #if defined(STRATA_USE_HIP)
                 // FP16 products; q is packed per head into B.attn's space and the context into B.q_abs's (both idle there)
                 const bool f16 = mla_f16_on() && (int64_t) g.qk_nope <= 2 * (int64_t) g.v_head;
-                const bool wmma = f16 && mla_wmma_on();
+                const bool wmma = f16 && mla_wmma_on() && !lat8_;   // (the WMMA kernel reads FP16 latents only)
                 uint16_t* const hp_q = (uint16_t*) B.attn;
                 uint16_t* const hp_c = (uint16_t*) B.q_abs;
                 if (f16) {
@@ -1430,7 +1431,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 else
 #endif
                 gb::mla_attn(B.q_abs, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), B.cells, B.n_sel, g.n_sel_max(), g.n_head,
-                             g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn, B.ctx, s);
+                             g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn, B.ctx, s, lat8_ ? 1 : 0);
                 S->mark("dsa_attn", s);
                 // out[t][h] = wv_b[h] (v_head x kv_lora) . ctx[t][h]
 #if defined(STRATA_USE_HIP)
@@ -2238,6 +2239,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.kv_raw = kv + (size_t) t0 * g.kv_lora;
                 d.kv_norm = Ly.kv_a_norm;
                 d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+                d.lat8 = lat8_ ? 1 : 0;
                 d.kv_lora = g.kv_lora;
                 d.ik_raw = ik + (size_t) t0 * g.idx_key;
                 d.k_norm_w = Ly.k_norm_w;

@@ -1937,7 +1937,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     int64_t floats = 2 * hc_dim;
     // the fast path keeps the DSA latent cache in FP16 (half the bytes: at 128k context ~0.8 GB more for experts on
     // each card, and the prompt attention reads half as much); the reference path (STRATA_GLM_SLOW) keeps F32
-    const int64_t lat_floats = fast_mode_ ? (int64_t) g_.kv_lora * max_ctx / 2 : (int64_t) g_.kv_lora * max_ctx;
+    lat8_ = fast_mode_ && getenv("STRATA_GLM_LAT8") != nullptr && std::atoi(getenv("STRATA_GLM_LAT8")) != 0;
+    if (lat8_ && g_.kv_lora % 32 != 0) {
+        err = "STRATA_GLM_LAT8: kv_lora " + std::to_string(g_.kv_lora) + " is not a multiple of 32";
+        return false;
+    }
+    // (INT8: kv_lora codes + kv_lora / 32 FP16 scales a row = kv_lora * 17 / 16 bytes)
+    const int64_t lat_floats = lat8_       ? (int64_t) g_.kv_lora * 17 / 64 * max_ctx
+                               : fast_mode_ ? (int64_t) g_.kv_lora * max_ctx / 2
+                                            : (int64_t) g_.kv_lora * max_ctx;
     // the indexer's key/gate rows: a ring on the fast path (glm_model.hpp, ik_ring_).  It must hold the rows a prompt
     // sub-batch writes plus the kpool - 1 before it (the pools it completes) - 8192 covers every mixer sub-batch
     // (STRATA_GLM_PREFILL_SUB tops out at 8192); the NextN block's prompt fill runs in sub-batches of the same bound.

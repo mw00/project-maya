@@ -2813,6 +2813,7 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     d.kv_raw = F->kv_raw;
     d.kv_norm = Ly.kv_a_norm;
     d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+    d.lat8 = lat8_ ? 1 : 0;
     d.kv_lora = g.kv_lora;
     d.ik_raw = F->ik_raw;
     d.k_norm_w = Ly.k_norm_w;
@@ -2848,7 +2849,7 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
     if (F->prof_on) F->mark("dsa_score_select");
     gf::mla(F->q, Ly.k_b, Ly.v_b, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), F->cells, n_sel, g.n_head, g.qk_nope,
-            g.kv_lora, g.v_head, F->attn_q, s);
+            g.kv_lora, g.v_head, F->attn_q, s, lat8_ ? 1 : 0);
     if (F->prof_on) F->mark("mla");
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type,
                    g.n_head * g.v_head, g.n_embd};
@@ -3684,12 +3685,13 @@ namespace {
 constexpr uint64_t kSlotMagic = 0x3254534C4159414Dull;   // "MAYALST2" (v2: the indexer rows as the unfinished pool)
 
 // (device pointer, floats) of each run a slot of n positions holds on one half besides the KDA snapshot, in file order
-std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bool fast_mode, float* state,
+std::vector<std::pair<float*, int64_t>> slot_dsa_runs(const Glm5Geometry& g, bool fast_mode, bool lat8, float* state,
                                                       float* tail, const std::vector<int>& layers,
                                                       const std::vector<int64_t>& lat,
                                                       const std::vector<int64_t>& pool, int64_t n) {
     std::vector<std::pair<float*, int64_t>> r;
-    const int64_t lat_pp = fast_mode ? g.kv_lora / 2 : g.kv_lora;   // FP16 latents take half a float each
+    // FP16 latents take half a float each, INT8 ones (codes + a scale per 32) 17 / 64
+    const int64_t lat_pp = lat8 ? g.kv_lora * 17 / 64 : fast_mode ? g.kv_lora / 2 : g.kv_lora;
     const int64_t pools = (n + g.idx_kpool - 1) / g.idx_kpool;
     const int64_t per = 2 * (int64_t) g.idx_kpool * g.idx_key;
     for (size_t j = 0; j < layers.size(); ++j) {
@@ -3733,7 +3735,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
             err = "no snapshot tail to save";
             return 0;
         }
-        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->state_, m->snap_tail_, m->snap_dsa_layers(), m->dsa_lat_,
+        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat8_, m->state_, m->snap_tail_, m->snap_dsa_layers(), m->dsa_lat_,
                                         m->dsa_pool_, n);
         const int32_t hdr[4] = {m->l0_, m->l1_, n_rec, (int32_t) runs.size()};
         put(hdr, sizeof(hdr));
@@ -3817,7 +3819,7 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
             return false;
         }
         cudaSetDevice(dev_);
-        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->state_, m->snap_tail_, dls, m->dsa_lat_, m->dsa_pool_, n);
+        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat8_, m->state_, m->snap_tail_, dls, m->dsa_lat_, m->dsa_pool_, n);
         int32_t hdr[4] = {};
         int64_t frun = 0;
         if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || hdr[0] != m->l0_ || hdr[1] != m->l1_ || hdr[2] != n_rec ||

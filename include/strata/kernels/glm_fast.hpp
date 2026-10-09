@@ -115,6 +115,7 @@ struct DsaPrepArgs {
     const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr_q = nullptr;
     int q_lora = 1536;
     const float* kv_raw = nullptr; const float* kv_norm = nullptr; uint16_t* lat = nullptr; int kv_lora = 512;
+    int lat8 = 0;   // the latent cache is INT8 (rows of kv_lora codes + kv_lora / 32 FP16 scales), not FP16
     const float* ik_raw = nullptr; const float* k_norm_w = nullptr; const float* k_norm_b = nullptr;
     float* ik_cache = nullptr;
     const float* ig_raw = nullptr; float* ig_cache = nullptr;
@@ -134,7 +135,7 @@ void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_s
 /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
 /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s);
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, int lat8 = 0);
 
 /// SwiGLU with GLM's clamp (gate above, up both sides) and the q8_1 of h, n values.
 void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s);
