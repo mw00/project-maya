@@ -59,6 +59,10 @@ all of it there and decodes 16.4 tokens/s ([#63](https://github.com/mw00/project
 `./setup.sh --setup --model Maya-L` (Windows: `START-MAYA.bat --setup --model Maya-L`).
 Details: [bench/results/MAYA-L.md](bench/results/MAYA-L.md).
 
+**Files downloaded before 2026-10-09** name the architecture `glm5next`, an early spelling.
+`python tools/gguf_fix_arch.py <the model's first .gguf> --in-place` gives them the standard name, `glm5-next`,
+rewriting only the header. Maya reads either name.
+
 ## How fast is it?
 
 Measured with Maya-S. A token is about ¾ of a word. `./maya.sh --bench` measures your machine the same way.

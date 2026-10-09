@@ -90,7 +90,8 @@ HF = "https://huggingface.co/{repo}/resolve/{revision}/{path}"
 # its top).  "file": the names on Hugging Face, with the quant label its file list groups (and adds up) them by -
 # one label per model; "was": the names they had there before (v1.0.18 and earlier: no label; v1.0.19: Maya-S24 as
 # IQ2_XXS, which Hugging Face added to Maya-S's) - a download under them is used as it is.  "sha256" per file name (the
-# Hugging Face one): every download is verified.  "vision": the image encoder's files (the mmproj,
+# Hugging Face one): every download is verified; a list holds every version published (v1.0.28: the first shards' header
+# names the architecture "glm5-next", as llama.cpp does - the data is the same, so a download of either is good).  "vision": the image encoder's files (the mmproj,
 # made from the official vision tower, and the tokenizer it reads its markers with) - from "repo" / "revision" when
 # it names them, else the model's own repo.
 MODELS = {
@@ -101,7 +102,8 @@ MODELS = {
         "file": "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 96.5,
         "sha256": {
             "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00001-of-00003.gguf":
-                "a507f2b7b25e04624ee55c631d3b281caea7cfffc747e5247970cd5a7ea91b3f",
+                ["e56ef50efd71d81ddf6249e08bd2ef5af96ed348c2b7a004491d46168d0ecaa7",    # "glm5-next" (v1.0.28)
+                 "a507f2b7b25e04624ee55c631d3b281caea7cfffc747e5247970cd5a7ea91b3f"],   # "glm5next", before
             "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00002-of-00003.gguf":
                 "2d65d88a69f8dc124c8d24bd33b33161ddab218918b4253ad4f500aeede84df5",
             "GLM-5.3-Flash-Maya-S-v2-IQ2_XXS-00003-of-00003.gguf":
@@ -123,7 +125,8 @@ MODELS = {
                 "GLM-5.3-Flash-Maya-S24-{i:05d}-of-{n:05d}.gguf"], "shards": 3, "download_gb": 94.7,
         "sha256": {
             "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00001-of-00003.gguf":
-                "3dc347757686c1435eae36c4872f5c151191cc5063bc188ce699b97700aae076",
+                ["8ebd5c74bcf65ece2a8699b7b6fd2b8d177f350ed252cee252fdd99b86a0138c",
+                 "3dc347757686c1435eae36c4872f5c151191cc5063bc188ce699b97700aae076"],
             "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf":
                 "4bd445da3a0128a9c5b32228c924e0a622aa4a132c7a8dc9a2c207a4beea8e34",
             "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00003-of-00003.gguf":
@@ -144,7 +147,8 @@ MODELS = {
         "was": ["GLM-5.3-Flash-Maya-M-{i:05d}-of-{n:05d}.gguf"], "shards": 3, "download_gb": 116.0,
         "sha256": {
             "GLM-5.3-Flash-Maya-M-IQ2_S-00001-of-00003.gguf":
-                "3ac0f066ec45af3432d59b33de49bdfb29156432b627240b35769c7d02cc6c02",
+                ["3f740d1b1022b4a0ddad50cd861bb071dd415bde94afa1292d0476641186c638",
+                 "3ac0f066ec45af3432d59b33de49bdfb29156432b627240b35769c7d02cc6c02"],
             "GLM-5.3-Flash-Maya-M-IQ2_S-00002-of-00003.gguf":
                 "285951d2afa0cd98285b03d0dc4aa68d83daf1a6f4a2594fe40b0cdd27ade485",
             "GLM-5.3-Flash-Maya-M-IQ2_S-00003-of-00003.gguf":
@@ -165,7 +169,8 @@ MODELS = {
         "was": ["GLM-5.3-Flash-Maya-L-{i:05d}-of-{n:05d}.gguf"], "shards": 4, "download_gb": 156.3,
         "sha256": {
             "GLM-5.3-Flash-Maya-L-IQ3_S-00001-of-00004.gguf":
-                "5fc82a6c9af4c6898e8d45cf32964f9a7b10640caf51e82be735d2d50e9f3d45",
+                ["c41aeaf3a3e0022150b7c355e7f4df6c92ba68c4794e3e827e02e56b54886b9e",
+                 "5fc82a6c9af4c6898e8d45cf32964f9a7b10640caf51e82be735d2d50e9f3d45"],
             "GLM-5.3-Flash-Maya-L-IQ3_S-00002-of-00004.gguf":
                 "351d59366afb7be7dfc3fb7af91281f7ccf00760b17dc45f82090325a7b34f64",
             "GLM-5.3-Flash-Maya-L-IQ3_S-00003-of-00004.gguf":
@@ -1201,13 +1206,15 @@ def quant_of(first: Path) -> str:
     return m.group(1) if m else first.parent.name
 
 
-def sha256_ok(path: Path, want: str) -> bool:
+def sha256_ok(path: Path, want) -> bool:
+    """`want`: the published sha256, or a list of them - a file published again with only its header changed (v1.0.28:
+    the architecture spelled as llama.cpp spells it) keeps the earlier download valid."""
     import hashlib
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for b in iter(lambda: f.read(64 << 20), b""):
             h.update(b)
-    return h.hexdigest() == want.lower()
+    return h.hexdigest() in [w.lower() for w in ([want] if isinstance(want, str) else want)]
 
 
 def offer_download(a, quant: str, d: Path, shards: list) -> bool:

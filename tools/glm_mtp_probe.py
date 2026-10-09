@@ -25,9 +25,9 @@ for r in readers:
     for t in r.tensors:
         T[t.name] = t
     for k, f in r.fields.items():
-        if k.startswith("glm5next.") and len(f.data) == 1:
+        if k.startswith(("glm5next.", "glm5-next.")) and len(f.data) == 1:   # both spellings (gguf_fix_arch.py)
             try:
-                meta[k] = f.parts[f.data[0]].tolist()
+                meta["glm5next." + k.split(".", 1)[1]] = f.parts[f.data[0]].tolist()
             except Exception:
                 pass
 for k in sorted(meta):
