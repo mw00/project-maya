@@ -310,13 +310,16 @@ bool Glm5Model::fast_moe_rows(int il, int T, std::string& err) {
                       g.swiglu_shexp, FFs, F->sh_hq, s, nullptr, nullptr, 0, nullptr, nullptr, 0, 8,
                       lane ? F->cpu_plan : 0ull, promote_min_env());
         ++F->expected;
-        gf::moe_wait(md, g.n_embd, s);
-        gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+        // (every expert in VRAM: no route waits or fetches - fast_moe's all_resident; 2 launches a row and layer)
+        if (!F->all_resident) {
+            gf::moe_wait(md, g.n_embd, s);
+            gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
+        }
         gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, xqt, F->hq, Ly.sh_down.q,
                         Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
         gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
                      Ly.sh_down.q != nullptr ? F->sh_out : nullptr, ft, s);
-        if (lane) gf::moe_cpu_wait(md, g.n_embd, ft, s);
+        if (lane && !F->all_resident) gf::moe_cpu_wait(md, g.n_embd, ft, s);
     }
     if (F->prof_on) F->mark("v_moe_rows");
     return true;
@@ -449,6 +452,8 @@ bool Glm5Model::fast_layers_rows(int64_t p0, int T, std::string& err) {
         } else {
             if (!fast_moe_rows(il, T, err)) return false;
         }
+        // Windows HIP: the queued layers go to the GPU now (the first at once, then every few: fast_layers')
+        if (const int fe = glmfast::submit_every(); fe > 0 && (il - l0_) % fe == 0) glmfast::submit_queued(s);
     }
     // the last layer's write half; each row's residual back in its first buffer
     for (int t = 0; t < T; ++t) {
