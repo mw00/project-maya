@@ -3132,12 +3132,12 @@ namespace {
 // on a Radeon 8065S (glm_mv_bench --sweep: -4..-17% per batch, the head even).  More rows per wave (the activation
 // shared) or U = 4 ran slower: the extra VGPRs cost occupancy, and the latency is hidden by waves, not by registers.
 // LDS (lds < 0: auto) only where it measured a win: one row (mv) with K <= 4096 - the small batches (the DSA
-// projections 52.5 -> 46.1 us, the router + shared expert 82.2 -> 77.7); K = 12288 / 16384 and the window's rows
-// (mv_rows) ran slower with it (the 24-48 KB of LDS per block cost occupancy).
+// projections 52.5 -> 46.1 us, the router + shared expert 82.2 -> 77.7); K = 12288 / 16384 ran slower with it (the
+// 24-48 KB of LDS per block cost occupancy).
 std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
 // The device the launch runs on: by default the RDNA 3.5 APUs (gfx115x - measured on a Radeon 8065S), whose LPDDR5X
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
-// STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t / mv_rows_kernel (A/B)
+// STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
 bool mv_rdna_device() {
     static const int mode = [] {   // -1: default, 0: off, 1: every gfx11
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
