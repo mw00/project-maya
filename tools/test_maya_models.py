@@ -22,11 +22,23 @@ class ModelChoice(unittest.TestCase):
             kind, quant = maya.choose_model(args, Path(d), inst)
         return kind, quant, "\n".join(lines)
 
-    def test_new_setup_offers_the_four_maya_quants(self):
+    def test_new_setup_offers_the_maya_quants(self):
         kind, quant, text = self.choose({})
         self.assertEqual((kind, quant), ("download", "Maya-S-v2-IQ2_XXS"))
-        for q in ("Maya-S-v2-IQ2_XXS:", "Maya-S24:", "Maya-M:", "Maya-L:"):
+        for q in ("Maya-S-v2-IQ2_XXS:", "Maya-S24:", "Maya-M:", "Maya-M-Derisked:", "Maya-L:"):
             self.assertIn(q, text)
+
+    def test_maya_m_derisked_downloads_from_its_own_repo_with_mayas_vision_files(self):
+        m = maya.MODELS["Maya-M-Derisked"]
+        names = maya.shard_names(m)
+        self.assertEqual(names[0], "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00001-of-00003.gguf")
+        self.assertEqual(maya.hf_url(m["repo"], m["revision"], m["folder"], names[0]),
+                         "https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF/resolve/main/"
+                         "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00001-of-00003.gguf")
+        self.assertEqual(maya.quant_of(Path(names[0])), "Maya-M-Derisked")
+        self.assertEqual(maya.quant_of(Path(maya.shard_names(maya.MODELS["Maya-M"])[0])), "Maya-M")
+        self.assertEqual(m["vision"]["repo"], maya.MODELS["Maya-M"]["repo"])   # its repo holds no vision files
+        self.assertEqual(m["vision"]["sha256"], maya.MODELS["Maya-M"]["vision"]["sha256"])
 
     def test_24gb_cards_get_maya_s24(self):
         self.assertEqual(self.choose({}, vram_gb=24.0)[1], "Maya-S24")
@@ -169,9 +181,11 @@ class LabelledNames(unittest.TestCase):
         self.assertEqual(maya.shard_names(maya.MODELS["Maya-M"])[2], "GLM-5.3-Flash-Maya-M-IQ2_S-00003-of-00003.gguf")
         self.assertEqual(maya.shard_names(maya.MODELS["Maya-S24"])[1],
                          "GLM-5.3-Flash-Maya-S24-IQ2_XXS_S-00002-of-00003.gguf")
-        # one label per model: Hugging Face adds up the files that share one (Maya-S is IQ2_XXS)
-        labels = [maya.shard_names(m)[0].split("-")[-4] for m in maya.MODELS.values()]
-        self.assertEqual(len(labels), len(set(labels)), labels)
+        # one label per model in a repo: Hugging Face adds up the files that share one (Maya-S is IQ2_XXS); a model in
+        # a repo of its own may share a label (Maya-M-Derisked's IQ2_S)
+        for repo in {m["repo"] for m in maya.MODELS.values()}:
+            labels = [maya.shard_names(m)[0].split("-")[-4] for m in maya.MODELS.values() if m["repo"] == repo]
+            self.assertEqual(len(labels), len(set(labels)), (repo, labels))
 
     def test_a_fresh_folder_downloads_the_new_names(self):
         m = maya.MODELS["Maya-L"]

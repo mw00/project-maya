@@ -19,7 +19,7 @@ dashboard started from Strata's and were reworked for Maya (a new dashboard, ima
 **AMD (experimental):** Linux and Windows on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo (Radeon 8060S / 8065S), one GPU or two (Strix Halo: one), text only - see
 [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
 
-## The models: Maya-S, Maya-S24, Maya-M and Maya-L
+## The models: Maya-S, Maya-S24, Maya-M, Maya-M-Derisked and Maya-L
 
 Maya installs **Maya-S**, Project Maya's own compact quant of GLM-5.3-Flash (96.5 GB,
 [on Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF)), made for PCs with a smaller memory
@@ -49,11 +49,19 @@ of the time; on the zero-shot tasks both keep 97.9% of the FP8 model's accuracy.
 up with `./setup.sh --setup --model Maya-M` (Windows: `START-MAYA.bat --setup --model Maya-M`).
 Details: [bench/results/MAYA-M.md](bench/results/MAYA-M.md).
 
+**Maya-M-Derisked** (116 GB) is Maya-M with a directional weight modification by
+[Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals. It is not a new quant: the same IQ2_S
+files, tensors, MTP draft block and size as Maya-M, with some of its weights changed. It is experimental - how close it
+stays to Maya-M has not been measured yet - and it has
+[a repo of its own](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF); it reads pictures
+with Maya's vision files, like the other models. Set it up with `./setup.sh --setup --model Maya-M-Derisked`
+(Windows: `START-MAYA.bat --setup --model Maya-M-Derisked`).
+
 **Maya-L** (156.3 GB) is the largest, made for PCs with the biggest memory pool: Maya-M's recipe one step up -
 IQ3_S gate/up experts, IQ4_XS down projections and Q5_K in the most sensitive layers - with Maya-M's FP8 statistics and
 error-feedback rounding. It is the closest to the FP8 model: **99.2% of its zero-shot accuracy** (the same score on
 HellaSwag and PIQA), a KL divergence 35% below Maya-M's (0.188 vs 0.291, the same engine), and the same next token as
-the FP8 model 90% of the time. It is the most demanding of the four: it is fastest when VRAM and RAM together hold most
+the FP8 model 90% of the time. It is the most demanding of them: it is fastest when VRAM and RAM together hold most
 of its 156 GB (what does not fit is read from the SSD while it answers): a user's RTX 4090 with 192 GB of RAM holds
 all of it there and decodes 16.4 tokens/s ([#63](https://github.com/mw00/project-maya/issues/63)). Set it up with
 `./setup.sh --setup --model Maya-L` (Windows: `START-MAYA.bat --setup --model Maya-L`).
@@ -94,7 +102,7 @@ then `--report`, in a
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 or newer (V100 and newer); one GPU, or up to 16 that share the model (two split the layers in the middle; with more, each takes a share sized to its free VRAM). The engine fills whatever VRAM you have with the most-used experts: more VRAM is faster. Measured: 1 and 2x V100 32 GB; by users: 2x CMP 170HX (above), 1x RTX 3090 and nine GPUs (8x RTX 5060 Ti 16 GB + the 3090). **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070 (one GPU or two) and Strix Halo / Gorgon Halo, Radeon 8060S / 8065S (one GPU), text only ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)). |
 | **RAM** | It runs with **32 GB** (the 2x V100 machine in the speed table above has 30 GB). More RAM keeps more experts close and is faster; what does not fit is read from the SSD while it answers. |
-| **Disk** | **~100 GB free on a fast NVMe SSD** (Maya-S is 96.5 GB, its pictures encoder 1.1 GB, and the engine reads from the model while it answers; Maya-M needs ~120 GB, Maya-L ~160 GB). Not a hard disk. |
+| **Disk** | **~100 GB free on a fast NVMe SSD** (Maya-S is 96.5 GB, its pictures encoder 1.1 GB, and the engine reads from the model while it answers; Maya-M and Maya-M-Derisked need ~120 GB, Maya-L ~160 GB). Not a hard disk. |
 | **System** | Linux (x86-64; a CPU with AVX2 is best - without it the engine still runs, its CPU expert lane on ggml's slower kernels), NVIDIA driver, CUDA toolkit 12.x (CUDA 13 can be used for Turing and newer, but it no longer compiles for Volta/V100), g++, Python 3.10+. Windows 10/11: experimental, with Visual Studio 2022 Build Tools instead of g++ ([Windows](#windows)). Not WSL2. AMD: ROCm 7 instead of the NVIDIA driver and CUDA (on Windows AMD's ROCm SDK wheels, which the setup offers to install). |
 
 The installer checks all of this and prints the exact command for anything missing. It installs nothing
@@ -119,7 +127,7 @@ model - is set up for you, the way Strata does it. On an AMD RX 7900 XT / XTX, R
 3. The setup runs on a screen of its own in the terminal - the steps as tabs along the top (Tab shows an earlier
    step's output), below them what runs now with its progress and output. Answer a few questions with the arrow keys
    and Enter - or just press Enter each time for the recommended choice: which GPUs, how much context, which model
-   (Maya-S, Maya-S24, Maya-M or Maya-L), pictures. Then it downloads and builds everything (it shows each download
+   (Maya-S, Maya-S24, Maya-M, Maya-M-Derisked or Maya-L), pictures. Then it downloads and builds everything (it shows each download
    first; Ctrl+C stops, and the next run picks up where it left off) and **starts the model** on the same screen: its
    Running tab shows the dashboard's address, when the model is ready and the last answer's speed (Ctrl+C stops it).
    Open the dashboard at `http://127.0.0.1:8080`.
@@ -139,7 +147,7 @@ It takes 20-40 minutes plus the download:
 
 1. checks the PC (GPUs, driver, CUDA toolkit, compiler, RAM, CPU);
 2. asks which GPUs to use (all of them by default, up to 16), how much context (32K recommended) and which model to
-   download: Maya-S (recommended; Maya-S24 on cards of 24 GB or less), Maya-M or Maya-L;
+   download: Maya-S (recommended; Maya-S24 on cards of 24 GB or less), Maya-M, Maya-M-Derisked or Maya-L;
 3. installs its Python packages into `.venv` and gets llama.cpp's source at a pinned commit (it lists both and asks);
 4. compiles the engine for your GPU(s) (10-30 minutes, once);
 5. **the model**: it shows the source, the size (Maya-S: 96.5 GB) and the exact `curl` commands, and downloads only
