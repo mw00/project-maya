@@ -709,7 +709,8 @@ bool Glm5Model::kv_stream_setup(int64_t cells, std::string& err) {
         K->host_arena = nullptr;
         char b[320];
         std::snprintf(b, sizeof b, "KV streaming: cannot pin %.2f GB of RAM for the latent cache - lower the context, or "
-                      "run without --kv-resident (under WSL the driver pins only about 1 GB in all)",
+                      "turn it off (--kv-streaming off in the config's args; under WSL the driver pins only about 1 GB in "
+                      "all)",
                       (double) K->host_bytes / 1e9);
         err = b;
         return false;
