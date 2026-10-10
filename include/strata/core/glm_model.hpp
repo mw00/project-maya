@@ -365,6 +365,7 @@ public:
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     bool fast_setup(std::string& err);
     bool fast_setup_finish(std::string& err);
+    void ram_left_check() const;
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
     bool fast_token(int32_t token, std::string& err);

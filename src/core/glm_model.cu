@@ -767,6 +767,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
                      ") on CUDA" + std::to_string(devs[(size_t) i]);
         }
+        ram_left_check();
     } else {
     Glm5Model* prev = nullptr;
     Glm5Model* m = this;
