@@ -248,6 +248,41 @@ struct Glm5Model::FastState {
     int* mtp_tok = nullptr;
     int* mtp_tok_h = nullptr;    // pinned
     cudaEvent_t ev_mtp = nullptr;
+    // ---- the MTP verify window (src/core/glm_mtp.cu): every per-token activation as rows ([row][...] contiguous, the
+    //      strides mv_rows reads), the per-row scratch of the one-token path reused row after row
+    struct Rows {
+        int cap = 0;
+        void* arena = nullptr;
+        size_t bytes = 0;
+        float* R = nullptr;                      // cap x 2 x hc * n_embd: each row's two residual buffers
+        float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *emb = nullptr;
+        float *pre = nullptr, *post = nullptr, *comb = nullptr;   // cap x 8, 8, 16
+        float* part = nullptr;                   // cap x kHcPart: each row's mHC scratch ...
+        unsigned int* counter = nullptr;         // ... and its barrier counter (16 words a row, zeroed once)
+        static constexpr int kHcPart = 1024;
+        void* xq = nullptr;
+        float* proj[3] = {nullptr, nullptr, nullptr};
+        float *fa = nullptr, *ga = nullptr, *kq = nullptr, *g2 = nullptr;
+        void* gated_q = nullptr;
+        float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
+        float *q = nullptr, *iq = nullptr;
+        void *qr_q = nullptr, *attn_q = nullptr;
+        float *rlog = nullptr, *sh_g = nullptr, *sh_u = nullptr, *dg = nullptr, *du = nullptr;
+        void* dhq = nullptr;
+        float* head_x = nullptr;
+        void* head_xq = nullptr;
+        float* logits = nullptr;                 // cap x n_vocab (the part that computes the head)
+        int* tok = nullptr;
+        void* catq = nullptr;                    // the NextN block's cache fill: eh_proj's input rows ...
+        float* hid = nullptr;                    // ... and its output rows
+        // per recurrent layer of this part (rec[il] is its index) and row: what the commit replays - the conv'd k and v,
+        // the decay and beta - and the conv history after the row
+        std::vector<int> rec;
+        float *keep_k = nullptr, *keep_v = nullptr, *keep_g1 = nullptr, *keep_beta = nullptr, *conv_after = nullptr;
+        float* emb_h = nullptr;                  // pinned: cap x n_embd
+        float* hop_h = nullptr;                  // pinned: cap x hc x n_embd (the residual rows into the next part)
+        int* tok_h = nullptr;                    // pinned: cap
+    } rows;
     // routing
     gf::MoeDev md;
     unsigned long long* tab = nullptr;
@@ -470,6 +505,11 @@ struct Glm5Model::FastState {
         return false;
     }
 };
+
+// the MTP speculative decode (src/core/glm_mtp.cu): the drafts per round at most (STRATA_GLM_MTP_DRAFT, 3), and whether
+// it is wanted at all (not turned off, not the earlier pipelined decode)
+int glm_mtp_draft_cap();
+bool glm_mtp_decode_wanted();
 
 
 }  // namespace strata::core

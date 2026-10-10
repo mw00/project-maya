@@ -650,6 +650,7 @@ void Glm5Model::reset() {
     cudaSetDevice(dev_);
     cudaMemset(state_, 0, state_bytes_);
     pos_ = 0;
+    mtp_hx_pos_ = -1;
     if (fast_ && fast_->route_error_h && cudaStreamSynchronize(fast_->cs) == cudaSuccess)
         *fast_->route_error_h = 0;   // a failed route belongs to the previous request
     if (split_next_) {
@@ -871,8 +872,8 @@ static double host_read_bps() {
 //     the expert's bytes over the parts' share of the host's RAM read speed, measured here - the CPU lane computes
 //     the experts VRAM does not hold (Strata prices a fitted miss over the PCIe link);
 //   - a token: the parts' times added (Strata), the slowest part breaking a tie - except the pipelined decode of a
-//     two-part split with the draft block, where the GPUs work on consecutive tokens: there a token costs the slower
-//     part (the draft on the last one), and the sum breaks the tie;
+//     two-part split with the draft block (STRATA_GLM_MTP_PIPELINE=1), where the GPUs work on consecutive tokens:
+//     there a token costs the slower part (the draft on the last one), and the sum breaks the tie;
 //   - the startability gate (Strata #1094): every part keeps its pool's floor and can lend a 512-token prompt chunk.
 // Two to four GPUs try every placement (memoised per part and range, as Strata's four-way search); more keep the
 // proportional split (glm_auto_bounds).  STRATA_GLM_SPLIT_LOG=1 prints every placement's prediction.
@@ -976,7 +977,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             mtp = true;
         }
     }
-    const bool pipelined = n == 2 && mtp && getenv("STRATA_GLM_NO_SPEC") == nullptr;
+    // (the MTP decode verifies a window through the parts in turn: a token costs them added, as without drafts)
+    const bool pipelined = n == 2 && mtp && getenv("STRATA_GLM_NO_SPEC") == nullptr &&
+                           getenv("STRATA_GLM_MTP_PIPELINE") != nullptr;
     // each layer's routes per expert: this machine's usage, else the pack's routing profile
     std::vector<std::vector<double>> cnt((size_t) L + 1);
     {
@@ -1260,8 +1263,10 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
         // the NextN draft block (2x V100, split 22 / 23 / 24 / 25 / 26 -> 36.3 / 36.7 / 40.0 / 37.3 / 39.4 tok/s)
         if (devs.size() <= 4) bounds = glm_search_bounds(pack_dir, max_ctx, devs);
         if (bounds.empty() && devs.size() == 2)
-            bounds = {g_.n_layers / 2 +
-                      (getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr ? 2 : 0)};
+            bounds = {g_.n_layers / 2 + (getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr &&
+                                                 getenv("STRATA_GLM_MTP_PIPELINE") != nullptr
+                                             ? 2
+                                             : 0)};
         if (bounds.empty()) bounds = glm_auto_bounds(pack_dir, g_.n_layers, devs);
     }
     if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr && !spec.empty() && spec != "auto")
@@ -2396,8 +2401,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // 4b. the NextN (MTP) block on the LAST half of the fast path: its own weights from the shards (the pack never
     //     carried blk.<n_layers>.*), its experts through the tiers like any MoE layer
     lt_ = l1_;
-    // (only the tail of a split uses it - the pipelined speculative decode; one device would carry its weights and
-    // expert slots for nothing until a batched verify exists; STRATA_GLM_MTP=1 loads it anyway)
+    // (the MTP decode drafts with it on any device count - src/core/glm_mtp.cu; without that decode only the earlier
+    // pipelined one of a split reads it, and one device loads it with STRATA_GLM_MTP=1 only)
     // STRATA_GLM_MTP_GGUF=<a GGUF holding blk.<n_layers>.* of the same model>: the draft block from that file - for a
     // quant published without one (the block reads the trunk's hidden state and the embedding, so any quant's block
     // fits), or a more precise block than the model's own: load_mtp looks there first.
@@ -2420,9 +2425,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         std::fprintf(stderr, "glm mtp: CUDA%d the draft block from %s%s\n", dev_, mtp_gguf,
                      own ? " (instead of the model's own)" : "");
     }
-    // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded)
     if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
-        (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr)) {   // any split: the speculative decode runs on 2+ parts
+        (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || glm_mtp_decode_wanted())) {
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
     }

@@ -35,6 +35,11 @@ struct MvJob {
 constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// The rows of a verify window: each job's weight against nt activations at once (nt <= kMaxRows), the weight read
+/// once.  Row t's input is xq + t * (n_in / 32) q8_1 blocks (xf + t * n_in floats), its output y + t * n_out.  Each
+/// row's dot runs exactly the sequence mv() runs for it alone, so a row's value is bit for bit mv()'s.
+constexpr int kMaxRows = 8;
+bool mv_rows(const MvJob* jobs, int n, int nt, cudaStream_t s);
 /// Whether mv() serves this weight type.
 bool mv_supported(int type);
 /// Whether moe_gate_up() / moe_down() serve routed experts of this type.
@@ -75,6 +80,12 @@ struct HcArgs {
     unsigned int* counter = nullptr;  // zero-initialised; the kernel leaves it zero
 };
 void hc(const HcArgs& a, cudaStream_t s);
+/// hc() for T rows in one launch (a verify window): row t's arguments are a's moved by t rows - block_out, x by
+/// n_embd, R_old / R_new by ld_R floats, pre/post (and post_in) by 8, comb (comb_in) by 16, xq by n_embd / 32 q8_1
+/// blocks, part by ld_part floats, counter by 16 words (each row's own, zero at the start).  Each row's arithmetic is
+/// hc()'s.  false (nothing launched) where hc() would not run its fused kernel or the rows do not fit on the device at
+/// once: then call hc() per row.
+bool hc_rows(const HcArgs& a, int T, int ld_R, int ld_part, cudaStream_t s);
 /// The write half alone (the split boundary / the head): R_new = post (x) block_out + comb . R_old.
 void hc_post(const float* block_out, const float* R_old, const float* post, const float* comb, int n_embd,
              float* R_new, cudaStream_t s);
@@ -89,6 +100,7 @@ struct KdaPrepArgs {
     const float* proj[3] = {nullptr, nullptr, nullptr};     // q, k, v projections (d_inner)
     const float* conv_w[3] = {nullptr, nullptr, nullptr};   // [d_inner][d_conv] f32
     float* conv_state = nullptr;                            // 3 x d_inner x (d_conv-1), this layer
+    float* conv_state_out = nullptr;                        // the slid history goes here (nullptr: conv_state)
     float* out[3] = {nullptr, nullptr, nullptr};
     const float* fa = nullptr;                              // head_dim (f_a output)
     const float* ga = nullptr;                              // head_dim (g_a output)
@@ -102,15 +114,27 @@ struct KdaPrepArgs {
     int n_head = 64, head_dim = 128, d_conv = 4;
 };
 void kda_prep(const KdaPrepArgs& a, cudaStream_t s);
+/// kda_prep for T consecutive rows in one launch: a holds row 0's pointers - proj, out, g1, g2 move by d_inner a row,
+/// fa / ga by head_dim, and row t's history after it goes to conv_state_out + t * 3 * d_inner * (d_conv - 1) (required);
+/// conv_state (the history before the window) is only read.  Each row's values are kda_prep's for it in turn.
+void kda_prep_rows(const KdaPrepArgs& a, int T, cudaStream_t s);
 /// The gated delta recurrence (one token) + the output gate (rms over head_dim * norm_w *
 /// sigmoid(g2)) + q8_1 of the gated output (the attn_output GEMV's input).
 void kda_rec(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw,
              float* state, const float* g2, const float* norm_w, float eps, int n_head, int head_dim,
              void* out_q8_1, cudaStream_t s);
+/// The same recurrence over T consecutive rows (row t's q/k/v/g1/g2 at + t * d_inner, beta_raw at + t * n_head, its
+/// output at + t * d_inner / 32 q8_1 blocks), each head's state kept in registers between them - row t's arithmetic is
+/// kda_rec's, so its output is bit for bit T kda_rec calls'.  advance == false (a verify window): the outputs, and the
+/// state is NOT written; advance == true (the commit): no outputs (q, g2, out unused), the state after the T rows.
+void kda_rec_rows(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw, float* state,
+                  const float* g2, const float* norm_w, float eps, int n_head, int head_dim, int T, bool advance,
+                  void* out_q8_1, cudaStream_t s);
 
 /// DSA, after the first projections: q_a norm (-> qr f32 + q8_1), kv_a norm into the latent cache
 /// at position p, the indexer key's layer norm into its cache, the compressor gate into its cache,
-/// and the completed pool's pooled key when (p + 1) % kpool == 0.
+/// and the completed pool's pooled key when (p + 1) % kpool == 0.  qr_raw == nullptr: the caches only (no query - the
+/// NextN block's cache fill).
 struct DsaPrepArgs {
     const float* qr_raw = nullptr; const float* q_a_norm = nullptr; float* qr = nullptr; void* qr_q = nullptr;
     int q_lora = 1536;
@@ -267,5 +291,7 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 
 /// argmax over n floats -> *out (device int).  Ties: lowest index.
 void argmax(const float* x, int n, int* out, cudaStream_t s);
+/// The same for T rows of n floats -> out[0..T).
+void argmax_rows(const float* x, int n, int T, int* out, cudaStream_t s);
 
 }  // namespace strata::kernels::glmf

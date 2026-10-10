@@ -91,6 +91,9 @@ struct Carve {
 };
 
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
+// the NextN block's cache fill takes a chunk's rows this many at a time: its scratch for a whole 32K chunk was ~1.9 GB
+// more of the expert pool lent (and its experts dropped) every prompt
+constexpr size_t kMtpFillRows = 2048;
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
@@ -844,8 +847,10 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     if (has_dsa) { Carve d; carve_dsa(d, ts, g, max_pools); uni = std::max(uni, d.off); }
     if (has_dense) { Carve d; carve_dense(d, ts, g); uni = std::max(uni, d.off); }
     if (has_moe) { Carve m; carve_moe(m, T, (size_t) (sub_env > 0 ? sub_env : kSub), g); uni = std::max(uni, m.off); }
-    // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own
-    if (mtp) uni = std::max(uni, T * (size_t) (6 * g.n_embd + g.kv_lora + 2 * g.idx_key) * 4 + 8 * 256);
+    // the NextN block's cache fill (the last half) carves 4 n_embd + 1.5 n_embd rows of its own, for at most
+    // kMtpFillRows rows at a time
+    if (mtp)
+        uni = std::max(uni, std::min(T, kMtpFillRows) * (size_t) (6 * g.n_embd + g.kv_lora + 2 * g.idx_key) * 4 + 8 * 256);
     return {a.off, uni};
 }
 
@@ -2446,24 +2451,17 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt mtp embedding", err)) return false;
             for (int t = 0; t < Tv; ++t)
                 tt->to_float(pack_emb_src_ + (size_t) next_ids[t] * row_b, S->emb_h + (size_t) t * E, E);
+            // kMtpFillRows rows at a time (chunk_bytes sizes the scratch for that many)
+            const int sub = (int) std::min<size_t>((size_t) Tv, kMtpFillRows);
             Carve c{S->uni};
-            float* h = c.take<float>((size_t) Tv * E);
-            float* emb = c.take<float>((size_t) Tv * E);
-            uint16_t* cat16 = c.take<uint16_t>((size_t) Tv * 2 * E);
-            float* hid = c.take<float>((size_t) Tv * E);
-            float* kv = c.take<float>((size_t) Tv * g.kv_lora);
-            float* ik = c.take<float>((size_t) Tv * g.idx_key);
-            float* ig = c.take<float>((size_t) Tv * g.idx_key);
-            cudaMemcpyAsync(emb, S->emb_h, (size_t) Tv * E * sizeof(float), cudaMemcpyHostToDevice, s);
-            gb::head_rows(S->R, w_.at("output_norm.weight"), g.norm_eps, Tv, E, h, s);
-            gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, Tv, E, cat16, s);
-            hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, Tv, 0.0f);
-            gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, Tv, E, S->x, S->x16, s);
-            hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, Tv, 0.0f);
-            sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, Tv, 1.0f);
-            sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, Tv, 1.0f);
+            float* h = c.take<float>((size_t) sub * E);
+            float* emb = c.take<float>((size_t) sub * E);
+            uint16_t* cat16 = c.take<uint16_t>((size_t) sub * 2 * E);
+            float* hid = c.take<float>((size_t) sub * E);
+            float* kv = c.take<float>((size_t) sub * g.kv_lora);
+            float* ik = c.take<float>((size_t) sub * g.idx_key);
+            float* ig = c.take<float>((size_t) sub * g.idx_key);
             gb::DsaPrepArgs d;
-            d.kv_raw = kv;
             d.kv_norm = Ly.kv_a_norm;
             d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
             d.lat_q8 = lat_q8_;
@@ -2477,23 +2475,36 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             d.idx_key = g.idx_key;
             d.ring = ik_ring_;
             d.eps = g.norm_eps;
-            // in pieces the indexer's key / gate ring holds with the open pool before them (a one-GPU chunk is up to
-            // 32K positions, the ring ~8K): each piece's rows are pooled before the next one overwrites the ring
             const int kp = g.idx_kpool;
             const int piece = std::max(kp, ik_ring_ - 64);
-            for (int t0 = 0; t0 < Tv; t0 += piece) {
-                const int tn = std::min(piece, Tv - t0);
-                d.kv_raw = kv + (size_t) t0 * g.kv_lora;
-                d.ik_raw = ik + (size_t) t0 * g.idx_key;
-                d.ig_raw = ig + (size_t) t0 * g.idx_key;
-                d.p0 = (int) p0 + t0;
-                d.T = tn;
-                gb::dsa_prep(d, s);
-                const int pool_lo = (int) ((p0 + t0 + kp) / kp - 1), pool_hi = (int) ((p0 + t0 + tn) / kp - 1);
-                if (pool_hi >= pool_lo)
-                    gb::dsa_pool(state_ + dsa_ik_[(size_t) mtp_il_], state_ + dsa_ig_[(size_t) mtp_il_], Ly.ape,
-                                 state_ + dsa_pool_[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
-                                 ik_ring_);
+            for (int r0 = 0; r0 < Tv; r0 += sub) {
+                const int rn = std::min(sub, Tv - r0);
+                cudaMemcpyAsync(emb, S->emb_h + (size_t) r0 * E, (size_t) rn * E * sizeof(float), cudaMemcpyHostToDevice,
+                                s);
+                gb::head_rows(S->R + (size_t) r0 * g.hc * E, w_.at("output_norm.weight"), g.norm_eps, rn, E, h, s);
+                gb::mtp_in_rows(emb, h, Ly.enorm, Ly.hnorm, g.norm_eps, rn, E, cat16, s);
+                hgemm_q(Ly.eh, E, 2 * E, cat16, 2 * E, hid, E, rn, 0.0f);
+                gb::rms_rows(hid, Ly.attn_norm, g.norm_eps, rn, E, S->x, S->x16, s);
+                hgemm_q(Ly.kv_a, g.kv_lora, E, S->x16, E, kv, g.kv_lora, rn, 0.0f);
+                sgemm_bf16(Ly.idx_k, g.idx_key, E, S->x, E, ik, g.idx_key, rn, 1.0f);
+                sgemm_bf16(Ly.idx_gate, g.idx_key, E, S->x, E, ig, g.idx_key, rn, 1.0f);
+                // in pieces the indexer's key / gate ring holds with the open pool before them (the ring ~8K
+                // positions): each piece's rows are pooled before the next one overwrites the ring
+                for (int t0 = 0; t0 < rn; t0 += piece) {
+                    const int tn = std::min(piece, rn - t0);
+                    const int64_t q0 = p0 + r0 + t0;
+                    d.kv_raw = kv + (size_t) t0 * g.kv_lora;
+                    d.ik_raw = ik + (size_t) t0 * g.idx_key;
+                    d.ig_raw = ig + (size_t) t0 * g.idx_key;
+                    d.p0 = (int) q0;
+                    d.T = tn;
+                    gb::dsa_prep(d, s);
+                    const int pool_lo = (int) ((q0 + kp) / kp - 1), pool_hi = (int) ((q0 + tn) / kp - 1);
+                    if (pool_hi >= pool_lo)
+                        gb::dsa_pool(state_ + dsa_ik_[(size_t) mtp_il_], state_ + dsa_ig_[(size_t) mtp_il_], Ly.ape,
+                                     state_ + dsa_pool_[(size_t) mtp_il_], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1,
+                                     s, ik_ring_);
+                }
             }
             S->mark("mtp_cache", s);
         }

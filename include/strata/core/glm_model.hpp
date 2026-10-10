@@ -427,6 +427,44 @@ public:
     bool hop_to_next(Glm5Model* B, int64_t p, std::string& err);
     bool spec_head(int64_t p, int32_t token, std::string& err);
     bool spec_tail(Glm5Model* head, int64_t p, std::string& err);
+    /// The MTP speculative decode (src/core/glm_mtp.cu) - llama.cpp's draft-mtp for GLM5-Next: each round the NextN
+    /// block drafts up to n tokens in a chain (its own hidden state feeding the next step), the trunk verifies the
+    /// window [last token, drafts...] in ONE batched pass through every part (one GPU or a split), the target's samples
+    /// accept the drafts while they match, the recurrent states roll back to the last kept row, and the NextN block's
+    /// cache takes the kept rows with the trunk's hidden states.  Any device count; the same tokens the
+    /// token-at-a-time loop would produce for the same samples.  mtp_ready(): this model can run it.
+    bool mtp_ready() const;
+    bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                    int64_t& produced, std::string& err);
+    uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
+    uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
+private:
+    int mtp_rows_ = 0;                                     // the verify window's rows this part is sized for (0: none)
+    int64_t mtp_hx_pos_ = -1;                              // the tail: the position whose trunk hidden state head_x holds
+    // the adaptive draft length: per length n, the rounds' wall time (EMA, ms) and how many; per draft position, how
+    // often it was reached (its earlier drafts all accepted) and accepted
+    double mtp_ms_[9] = {};
+    uint64_t mtp_seen_[9] = {};
+    uint64_t mtp_reach_[9] = {}, mtp_hit_[9] = {};
+    uint64_t mtp_round_no_ = 0;
+    int mtp_best_ = -1;                                    // the length in use, the probe gap and the next probe
+    uint64_t mtp_gap_ = 32, mtp_next_probe_ = 0;
+    bool mtp_probe_up_ = false;
+    int mtp_stint_n_ = 0, mtp_stint_left_ = 0;             // a length's run of rounds (exploring, probing)
+    int mtp_prev_n_ = -1, mtp_same_ = 0;                   // the last round's length and the rounds of it in a row
+    int mtp_choose(int n_cap);
+    bool mtp_rows_setup(int rows, std::string& err);       // fast_setup: the window's buffers on this part
+    void mtp_rows_free();
+    bool fast_rows(const int32_t* toks, int T, int64_t p0, std::string& err);   // the window through every part
+    bool fast_layers_rows(int64_t p0, int T, std::string& err);   // this part's layers over the window's rows
+    bool fast_dsa_rows(int il, int64_t p0, int T, std::string& err);
+    bool fast_moe_rows(int il, int T, std::string& err);
+    bool mtp_commit(int T, int keep, std::string& err);   // every part: the recurrent states advanced by the kept rows
+    // the NextN block's cache-writing half for n entries from p0: entry p0 + i from h + i * n_embd (device, this part)
+    // and the token next[i] - eh_proj, the attention norm, kv_a and the indexer's key/gate, no query, no FFN
+    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err);
+public:
+    bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;
