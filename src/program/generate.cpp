@@ -150,6 +150,7 @@ struct Options {
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
+    std::string kv_streaming;          ///< --kv-streaming on|off: streaming with kv_resident's window (32768 if none)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -345,7 +346,12 @@ void usage() {
                  "                       (vs int8's 1,056); not with --kv-resident\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
-                 "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
+                 "                       all of it in VRAM. A context of N cells or fewer is not streamed. With\n"
+                 "                       --glm-pack: N positions of each DSA layer's latent cache\n"
+                 "                       (STRATA_GLM_KV_RESIDENT)\n"
+                 "  --kv-streaming on|off  KV streaming as a switch (the setup writes `on` into the config): on keeps\n"
+                 "                       --kv-resident's N cells in VRAM, 32768 when it gives none; off keeps all\n"
+                 "                       of the KV in VRAM whatever --kv-resident says\n"
                  "  --stream-token       enqueue token work on the session stream (experimental)\n"
                  "  --check-logits       copy and check all logits in the stream-token path\n"
                  "  --gr-fp32-activations  experimental CUDA-oracle GR activation precision\n"
@@ -978,10 +984,11 @@ static int glm_pack_generate(const Options& o) {
         // INFO facts for the server's Monitor tab (strata app): the expert tiers this engine runs with
         const auto st = model.fast_stats();
         // (+ the CPU lane setup's calibration reads: its threads and its PCIe share, as the engine started)
-        std::printf("INFO context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast experts=%d "
-                    "vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d vision_lend=%zu cpu_threads=%d "
-                    "pcie_share=%.2f\n",
-                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) st.pool_slots,
+        std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld engine_kind=glm-fast "
+                    "experts=%d vram_slots=%lld vram_gb=%.1f ram_slots=%lld ram_gb=%.1f mtp=%d vision_lend=%zu "
+                    "cpu_threads=%d pcie_share=%.2f\n",
+                    (long long) o.max_context, model.kv_int8() ? "int8" : "fp16", (long long) model.kv_resident(),
+                    (long long) st.pool_slots,
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
                     model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
@@ -1607,6 +1614,16 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.spec_hits_ - hits0),
                              (unsigned long long) (model.spec_steps_ - spec0),
                              100.0 * (double) (model.spec_hits_ - hits0) / (double) (model.spec_steps_ - spec0));
+            if (model.kv_resident() > 0) {
+                // KV streaming, cumulative over the process: the blocks the decode's selections named, and those
+                // read from RAM (every part summed)
+                const auto kv = model.kv_stream_stats();
+                std::fprintf(stderr, "glm kv: KV streaming: %.2f%% of %llu block reads hit VRAM, %.1f MiB read from RAM%s\n",
+                             kv.lookups ? 100.0 * (double) (kv.lookups - kv.misses) / (double) kv.lookups : 100.0,
+                             (unsigned long long) kv.lookups,
+                             (double) kv.misses * kv.block_bytes / 1048576.0,
+                             kv.overflow ? " - OVERFLOW (too few resident positions)" : "");
+            }
         }
         return 0;
     };
@@ -2021,6 +2038,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
+        else if (a == "--kv-streaming") o.kv_streaming = next("--kv-streaming");
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -2159,9 +2177,29 @@ int main(int argc, char** argv) {
     // session/graph machinery is qwen4exp's; a GLM pack runs the verified Glm5Model runner instead,
     // see glm_pack_generate).  --glm-pack with an explicit non-default --pack is almost certainly a
     // mistake worth saying out loud.
+    // --kv-streaming on|off: on streams with --kv-resident's window (32768 when it gives none), off keeps every cell in
+    // VRAM whatever --kv-resident says
+    if (!o.kv_streaming.empty()) {
+        if (o.kv_streaming == "on") {
+            if (o.kv_resident <= 0) o.kv_resident = 32768;
+        } else if (o.kv_streaming == "off") {
+            o.kv_resident = 0;
+        } else {
+            std::fprintf(stderr, "maya generate: --kv-streaming takes on or off (not %s)\n", o.kv_streaming.c_str());
+            return 2;
+        }
+    }
     if (!o.glm_pack.empty()) {
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
+        // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
+        if (o.kv_resident < 0) {
+            std::fprintf(stderr, "maya generate: --kv-resident must be 0 or more\n");
+            return 2;
+        }
+        if (o.kv_resident > 0 && std::getenv("STRATA_GLM_KV_RESIDENT") == nullptr)
+            set_env("STRATA_GLM_KV_RESIDENT", std::to_string(o.kv_resident).c_str());
+        if (o.kv_streaming == "off") set_env("STRATA_GLM_KV_RESIDENT", "0");   // (off whatever the environment says)
         if (o.pack != "pack/full") {
             std::fprintf(stderr, "maya generate: note: --glm-pack supersedes --pack (%s ignored)\n", o.pack.c_str());
         }

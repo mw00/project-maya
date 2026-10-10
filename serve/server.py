@@ -1055,6 +1055,7 @@ class Service:
             reload = dict(self.reload) if self.reload else None
         return {"context": self.engine.max_context, "min": CONTEXT_MIN, "max": max(top, self.engine.max_context),
                 "trained": self.trained_context, "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
+                "kv_resident": info.get("kv_resident") or 0,
                 "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload}
 
     def set_context(self, n: int) -> dict:

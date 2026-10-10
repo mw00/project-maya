@@ -363,6 +363,13 @@ public:
     // the fast path's latent cache in INT8 records (--kv int8 / STRATA_GLM_KV_INT8=1; glm_fast.hpp lat8_rec_bytes):
     // 544 bytes a position and layer against FP16's 1024
     bool lat_q8_ = false;
+    // KV streaming (--kv-resident N / STRATA_GLM_KV_RESIDENT; strata/kernels/glm_kv_stream.hpp): the fast path's DSA
+    // layers keep their latent cache in pinned RAM and N positions of it in VRAM - state_ + dsa_lat_[il] is then the
+    // layer's VRAM slots.  Null: every position in VRAM.  (glm_fast_state.hpp)
+    struct KvStream;
+    KvStream* kv_ = nullptr;
+    bool kv_stream_setup(int64_t cells, std::string& err);   // load_pack, once the state arena is in
+    void kv_stream_reset_maps();                             // nothing resident (reset, slot_load)
     float* snap_pool_ = nullptr;
     std::vector<int> dsa_layers() const;                   // this half's DSA layers (NextN block first), slot order
     void snap_pool_copy(bool restore);
@@ -384,6 +391,19 @@ public:
     int mtp_draft(int32_t next_tok, std::string& err);
     bool has_mtp() const;
     bool kv_int8() const { return lat_q8_; }   // the latent cache in INT8 (STRATA_GLM_KV_INT8=1)
+    /// KV streaming: the positions of each DSA layer kept in VRAM (0: all of them - not streamed); and what
+    /// STRATA_GLM_KV_RESIDENT gives for a context: rounded up to whole pools and to glmf::kKvResidentMin, 0 when unset
+    /// or when the context fits in that many anyway
+    int64_t kv_resident() const;
+    static int64_t kv_resident_cells(int kpool, int64_t max_ctx);
+    /// ... and its block reads since the start, every part summed: those the selections named, those read from RAM
+    struct KvStreamStats {
+        uint64_t lookups = 0, misses = 0;
+        bool overflow = false;   // a resolve could not place every block (never, with a legal slot count)
+        double host_gb = 0;      // the pinned host copies
+        int block_bytes = 0;     // one page of latent rows: what a miss reads
+    };
+    KvStreamStats kv_stream_stats() const;
     /// Images (the vision path): rows of n_embd floats that stand in for the token embeddings at these absolute
     /// positions - the prompt's <|image|> tokens, in order; an empty call clears them.  Read wherever a token is
     /// embedded (the prompt path and the token path); the draft block keeps the token embedding (drafts only).
@@ -474,8 +494,9 @@ private:
 };
 
 /// What a part with these layer kinds lends the prompt path for a chunk of T tokens, its prestage buffer aside
-/// (src/core/glm_prefill.cu) - the layer split search's startability gate.
+/// (src/core/glm_prefill.cu) - the layer split search's startability gate.  kv_stage: KV streaming's staging copy of
+/// one layer's latent cache (0: not streamed).
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
-                              bool has_moe, bool mtp, int64_t max_ctx, size_t gstride);
+                              bool has_moe, bool mtp, int64_t max_ctx, size_t gstride, size_t kv_stage = 0);
 
 }  // namespace strata::core

@@ -319,6 +319,14 @@ struct Glm5Model::PrefillState {
     float *pre = nullptr, *post = nullptr, *comb = nullptr, *ss = nullptr, *mix = nullptr;
     uint16_t* x16 = nullptr;
     int* iota = nullptr;
+    // KV streaming: one layer's latent cache in position order, staged from its host copy - what the prompt attention
+    // reads (a chunk's selections can name any position, so the slots' window does not hold them).  The copy runs on
+    // kv_ss once the attention before has read the stage (kv_free), while the layers in between compute; the layer it
+    // is for waits on kv_ready (kv_next: that layer, -1 none).  STRATA_GLM_KV_PREFETCH=0: on the compute stream.
+    uint8_t* kv_stage = nullptr;
+    cudaStream_t kv_ss = nullptr;
+    cudaEvent_t kv_ready = nullptr, kv_free = nullptr;
+    int kv_next = -1;
     uint8_t* uni = nullptr;          // the per-layer region (KDA | DSA | dense | MoE)
     // weight scratch
     uint16_t* w16 = nullptr;
@@ -759,6 +767,18 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     for (auto& e : S->ev_land) create_event(e, cudaEventDisableTiming);
     create_event(S->ev_hop, cudaEventDisableTiming);
+    static const bool kv_prefetch = [] {
+        const char* v = getenv("STRATA_GLM_KV_PREFETCH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (kv_ != nullptr && has_dsa && kv_prefetch) {   // (no side stream: the stage copies on the compute stream)
+        if (cudaStreamCreateWithFlags(&S->kv_ss, cudaStreamNonBlocking) != cudaSuccess) {
+            cudaGetLastError();
+            S->kv_ss = nullptr;
+        }
+        create_event(S->kv_ready, cudaEventDisableTiming);
+        create_event(S->kv_free, cudaEventDisableTiming);
+    }
     if (S->NP > 0) {
         S->ev_pdone.assign((size_t) (S->NP + PrefillState::kPreEv - 1) / PrefillState::kPreEv, nullptr);
         for (auto& e : S->ev_pdone) create_event(e, cudaEventDisableTiming);
@@ -821,10 +841,11 @@ bool Glm5Model::prefill_bind(uint8_t* region, size_t bytes, std::string& err) {
     return true;
 }
 
-// a chunk of T tokens' device buffers: {the rows kept across a layer, the largest of the mixers' / FFN's / NextN cache
-// fill's scratch} - the layout prefill_carve lays out
+// a chunk of T tokens' device buffers: {the rows kept across a layer (and KV streaming's staging copy, kv_stage bytes),
+// the largest of the mixers' / FFN's / NextN cache fill's scratch} - the layout prefill_carve lays out
 static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa,
-                                             bool has_dense, bool has_moe, int max_pools, int sub_env, bool mtp) {
+                                             bool has_dense, bool has_moe, int max_pools, int sub_env, bool mtp,
+                                             size_t kv_stage) {
     const size_t E = (size_t) g.n_embd;
     Carve a;
     a.take<float>(T * 4 * E);                    // R
@@ -838,6 +859,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T);
     a.take<float>(T * 24);
     a.take<int>(T * (size_t) g.n_exp_used);      // iota
+    a.take<uint8_t>(kv_stage);
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
     if (has_kda) { Carve k; carve_kda(k, ts, g); uni = std::max(uni, k.off); }
@@ -851,18 +873,20 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
 
 std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T) const {
     const PrefillState* S = pf_;
-    return chunk_bytes(g_, T, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env, mtp_il_ >= 0);
+    const size_t kv_stage = kv_ != nullptr ? (size_t) kv_->n_blocks * kv_->page * kv_->row_bytes : 0;
+    return chunk_bytes(g_, T, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env, mtp_il_ >= 0,
+                       kv_stage);
 }
 
 
 // what a part with these layers lends the prompt path for a chunk of T tokens, its prestage buffer aside (the split
 // search's startability gate: prefill_setup's layout without a PrefillState)
 size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, bool has_dsa, bool has_dense,
-                              bool has_moe, bool mtp, int64_t max_ctx, size_t gstride) {
+                              bool has_moe, bool mtp, int64_t max_ctx, size_t gstride, size_t kv_stage) {
     const int max_pools = (int) std::max<int64_t>(1, max_ctx / g.idx_kpool);
     int sub_env = 0;
     if (const char* v = getenv("STRATA_GLM_PREFILL_SUB")) sub_env = std::clamp(std::atoi(v), 16, 8192);
-    const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp);
+    const auto pu = chunk_bytes(g, T, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env, mtp, kv_stage);
     const auto ws = weight_scratch(g, has_dsa);
     Carve c;
     c.take<uint8_t>(pu.first + pu.second);
@@ -900,6 +924,7 @@ size_t Glm5Model::prefill_carve(int Tn) {
     S->ss = a.take<float>(T);
     S->mix = a.take<float>(T * 24);
     S->iota = a.take<int>(T * (size_t) g.n_exp_used);
+    S->kv_stage = kv_ != nullptr ? a.take<uint8_t>((size_t) kv_->n_blocks * kv_->page * kv_->row_bytes) : nullptr;
     S->uni = S->arena + a.off;
     cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
     S->T_bound = Tn;
@@ -1144,7 +1169,9 @@ bool Glm5Model::prefill_return(std::string& err) {
     if (F == nullptr || S == nullptr || !S->lent) return true;
     cudaSetDevice(dev_);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm return compute", err) ||
-        !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm return copies", err)) return false;
+        !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm return copies", err) ||
+        (S->kv_ss && !glmfast::cuda_ok(cudaStreamSynchronize(S->kv_ss), "glm return KV stage", err))) return false;
+    S->kv_next = -1;   // (a prompt that ended early leaves a staged layer nobody waits for)
     std::lock_guard<std::mutex> lk(F->mu);
     for (int il = l0_; il < lt_; ++il) {
         auto& P = F->lp[(size_t) il];
@@ -1192,6 +1219,12 @@ void Glm5Model::prefill_destroy() {
     if (S->ev_pstart) cudaEventDestroy(S->ev_pstart);
     if (S->ev_pfree) cudaEventDestroy(S->ev_pfree);
     if (S->xs) cudaStreamDestroy(S->xs);
+    if (S->kv_ss) {
+        cudaStreamSynchronize(S->kv_ss);
+        cudaStreamDestroy(S->kv_ss);
+    }
+    if (S->kv_ready) cudaEventDestroy(S->kv_ready);
+    if (S->kv_free) cudaEventDestroy(S->kv_free);
     S->mq.reset();
     if (S->blas) cublasDestroy(S->blas);
     for (int b = 0; b < PrefillState::NG; ++b) {
@@ -1521,7 +1554,28 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return ok;
     };
 
+    // KV streaming: a DSA layer's cache before the chunk (whole pages: a chunk starting inside one finds it complete)
+    // goes into the stage on kv_ss once the work queued so far has read the stage, so the layers before that DSA
+    // layer overlap the copy (glm DSA layers have recurrent ones between them)
+    const auto kv_stage_bytes = [&]() { return (size_t) ((p0 + kv_->page - 1) / kv_->page) * kv_->page * kv_->row_bytes; };
+    const auto kv_dsa_from = [&](int il) {
+        for (; il < l1_; ++il)
+            if (!g.is_recr(il)) return il;
+        return -1;
+    };
+    const auto kv_prefetch = [&](int il) -> bool {
+        if (S->kv_ss == nullptr || kv_ == nullptr || p0 <= 0 || il < 0 || kv_->host[(size_t) il] == nullptr) return true;
+        if (!glmfast::cuda_ok(cudaEventRecord(S->kv_free, s), "glm prefill: the KV stage", err) ||
+            !glmfast::cuda_ok(cudaStreamWaitEvent(S->kv_ss, S->kv_free, 0), "glm prefill: the KV stage", err) ||
+            !glmfast::cuda_ok(cudaMemcpyAsync(S->kv_stage, kv_->host[(size_t) il], kv_stage_bytes(), cudaMemcpyDefault,
+                                              S->kv_ss), "glm prefill: the KV stage", err) ||
+            !glmfast::cuda_ok(cudaEventRecord(S->kv_ready, S->kv_ss), "glm prefill: the KV stage", err))
+            return false;
+        S->kv_next = il;
+        return true;
+    };
     S->mark("start", s);
+    if (!kv_prefetch(kv_dsa_from(l0_))) return false;   // (the layers before the first DSA layer run meanwhile)
     prestage(next_moe(l0_));   // (the dense layers before the first MoE one run meanwhile)
     for (auto& t : S->tr) t.on = false;
     for (int il = l0_; il < l1_; ++il) {
@@ -1533,6 +1587,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         hc_read(il == l0_ ? nullptr : S->ffn, Ly.hc_attn_fn, Ly.hc_attn_scale, Ly.hc_attn_base, Ly.attn_norm);
         S->mark("hc", s);
         dump_row("attn_norm-" + std::to_string(il), S->x, E);
+        // KV streaming: the layer's cache before the chunk, from its host copy into the staging copy (whole pages: a
+        // chunk starting inside one finds it complete), which the chunk's rows are written into too and the attention
+        // reads; the host copy and the resident slots get the chunk's rows as well (dsa_prep)
+        uint8_t* const kv_host = !Ly.recr && kv_ != nullptr ? kv_->host[(size_t) il] : nullptr;
+        if (kv_host != nullptr && p0 > 0) {
+            if (S->kv_next == il) {   // staged on kv_ss meanwhile
+                if (!glmfast::cuda_ok(cudaStreamWaitEvent(s, S->kv_ready, 0), "glm prefill: the KV stage wait", err))
+                    return false;
+                S->kv_next = -1;
+                S->mark("kv_wait", s);
+            } else {
+                if (!glmfast::cuda_ok(cudaMemcpyAsync(S->kv_stage, kv_host, kv_stage_bytes(), cudaMemcpyDefault, s),
+                                      "glm prefill: the KV stage", err))
+                    return false;
+                S->mark("kv_stage", s);
+            }
+        }
+        uint16_t* const lat = kv_host != nullptr ? (uint16_t*) S->kv_stage : (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
 
         // ---- the mixer, in sub-batches of S->sub tokens (the recurrences carry their state across)
         for (int t0 = 0; t0 < T; t0 += S->sub) {
@@ -1579,7 +1651,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.q_lora = g.q_lora;
                 d.kv_raw = B.kv_raw;
                 d.kv_norm = Ly.kv_a_norm;
-                d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+                d.lat = lat;
+                if (kv_host != nullptr) {
+                    d.lat_host = (uint16_t*) kv_host;
+                    d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+                    d.lat_table = kv_->map[(size_t) il].page_table;
+                    d.lat_page = kv_->page;
+                }
                 d.lat_q8 = lat_q8_;
                 d.kv_lora = g.kv_lora;
                 d.ik_raw = B.ik_raw;
@@ -1643,16 +1721,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->mark("dsa_qabs", s);
 #if defined(STRATA_USE_HIP)
                 if (use_f16q)
-                    gb::mla_attn_f16q((const uint16_t*) B.q_abs, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), B.cells,
+                    gb::mla_attn_f16q((const uint16_t*) B.q_abs, lat, B.cells,
                                       B.n_sel, g.n_sel_max(), g.n_head, g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn,
                                       B.ctx, s, lat_q8_);
                 else if (use_wmma2)
-                    gb::mla_attn_wmma2(B.q_abs, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), B.cells,
+                    gb::mla_attn_wmma2(B.q_abs, lat, B.cells,
                                        B.n_sel, g.n_sel_max(), g.n_head, g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn,
                                        B.ctx, s, lat_q8_);
                 else
 #endif
-                gb::mla_attn(B.q_abs, (const uint16_t*) (state_ + dsa_lat_[(size_t) il]), B.cells, B.n_sel, g.n_sel_max(), g.n_head,
+                gb::mla_attn(B.q_abs, lat, B.cells, B.n_sel, g.n_sel_max(), g.n_head,
                              g.kv_lora, 1.0f / std::sqrt((float) g.qk_nope), tn, B.ctx, s, lat_q8_);
                 S->mark("dsa_attn", s);
                 // out[t][h] = wv_b[h] (v_head x kv_lora) . ctx[t][h]
@@ -1693,6 +1771,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             }
         }
+        if (kv_host != nullptr && !kv_prefetch(kv_dsa_from(il + 1))) return false;   // (the stage is read: the next one's)
 
         S->mark(Ly.recr ? "kda" : "dsa", s);
         if (skip_output) continue;   // every KDA/DSA cache update above still ran; these output rows feed nothing
@@ -2466,6 +2545,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             d.kv_raw = kv;
             d.kv_norm = Ly.kv_a_norm;
             d.lat = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+            if (kv_ != nullptr && kv_->host[(size_t) mtp_il_] != nullptr) {   // KV streaming: no attention here, no stage
+                d.lat = nullptr;
+                d.lat_host = (uint16_t*) kv_->host[(size_t) mtp_il_];
+                d.lat_slots = (uint16_t*) (state_ + dsa_lat_[(size_t) mtp_il_]);
+                d.lat_table = kv_->map[(size_t) mtp_il_].page_table;
+                d.lat_page = kv_->page;
+            }
             d.lat_q8 = lat_q8_;
             d.kv_lora = g.kv_lora;
             d.ik_raw = ik;

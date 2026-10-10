@@ -452,6 +452,20 @@ __global__ void __launch_bounds__(128) kda_out_kernel(const float* __restrict__ 
 }
 
 // ---------------------------------------------------------------- DSA
+// value c of a latent row y into row `row` of a cache (FP16 rows, or INT8 records written by whole warps)
+__device__ __forceinline__ void lat_put(uint16_t* lat, int row, float y, bool q8, int kv_lora, int c) {
+    if (q8) {
+        uint8_t* rec = (uint8_t*) lat8_rec(lat, kv_lora, row);
+        float amax = fabsf(y);
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        const __half d16 = __float2half(amax / 127.0f);
+        const float d = __half2float(d16);
+        ((int8_t*) rec)[c] = (int8_t) (d > 0.0f ? max(-127, min(127, __float2int_rn(y / d))) : 0);
+        if ((c & 31) == 0) ((__half*) (rec + kv_lora))[c >> 5] = d16;
+    } else {
+        lat[(size_t) kv_lora * row + c] = lat_h(y);
+    }
+}
 __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
     __shared__ float sred[32];
     const int t = blockIdx.x, role = blockIdx.y, tid = threadIdx.x;
@@ -482,16 +496,11 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
             const float y = v * inv * a.kv_norm[tid];
-            if (a.lat_q8) {
-                uint8_t* rec = (uint8_t*) lat8_rec(a.lat, a.kv_lora, p);
-                float amax = fabsf(y);
-                for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-                const __half d16 = __float2half(amax / 127.0f);
-                const float d = __half2float(d16);
-                ((int8_t*) rec)[tid] = (int8_t) (d > 0.0f ? max(-127, min(127, __float2int_rn(y / d))) : 0);
-                if ((tid & 31) == 0) ((__half*) (rec + a.kv_lora))[tid >> 5] = d16;
-            } else {
-                a.lat[(size_t) a.kv_lora * p + tid] = lat_h(y);
+            if (a.lat != nullptr) lat_put(a.lat, p, y, a.lat_q8, a.kv_lora, tid);
+            if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
+                lat_put(a.lat_host, p, y, a.lat_q8, a.kv_lora, tid);
+                const int sl = a.lat_table[p / a.lat_page];
+                if (sl >= 0) lat_put(a.lat_slots, sl * a.lat_page + p % a.lat_page, y, a.lat_q8, a.kv_lora, tid);
             }
         }
         return;
