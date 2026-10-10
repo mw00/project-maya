@@ -2303,13 +2303,17 @@ void Glm5Model::fast_service() {
             int ids[8];
             for (int i = 0; i < K; ++i) ids[i] = rq->ids[i];
             // STRATA_GLM_ROUTE_LOG=<prefix>: "layer e0 .. e7 tier-mask" per route into <prefix>.<device> (cache studies)
+            // - the tier masks are fetch, miss and cpu (bits over e0..e7), then " | n0 .. n15": the near misses, the
+            //   route's next ranks after the top k, best first
             static const char* rlog = getenv("STRATA_GLM_ROUTE_LOG");
             if (rlog != nullptr) {
                 static thread_local FILE* rf = std::fopen((std::string(rlog) + "." + std::to_string(dev_)).c_str(), "w");
                 if (rf != nullptr) {
                     std::fprintf(rf, "%d", il);
                     for (int i = 0; i < K; ++i) std::fprintf(rf, " %d", ids[i]);
-                    std::fprintf(rf, " %u %u %u\n", fetch, miss, cpu);
+                    std::fprintf(rf, " %u %u %u |", fetch, miss, cpu);
+                    for (int i = 0; i < 16 && rq->near[i] >= 0; ++i) std::fprintf(rf, " %d", (int) rq->near[i]);
+                    std::fputc('\n', rf);
                 }
             }
             uint64_t nh = 0;
@@ -3272,11 +3276,12 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         const char* v = getenv("STRATA_GLM_PREFETCH_RANK");
         return v != nullptr ? std::max(1, std::atoi(v)) : 0;
     }();
+    static const int near_n = getenv("STRATA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
     gf::moe_route(F->rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
                   g.n_embd, md, F->sh_g, F->sh_u, g.swiglu_shexp, FFs, F->sh_hq, s,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, il == mtp_il_ ? mtp_skip_from() : 8,
-                  lane ? F->cpu_plan : 0ull, promote_min, pf_rank);
+                  lane ? F->cpu_plan : 0ull, promote_min, pf_rank, near_n);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:
