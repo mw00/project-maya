@@ -90,6 +90,225 @@ bool glm_mtp_decode_wanted() {
            getenv("STRATA_GLM_MTP_PIPELINE") == nullptr && glm_mtp_draft_cap() > 0;
 }
 
+// ---------------------------------------------------------------- the draft head
+// A draft step ran the whole output head - 154880 x 4096 Q6_K, 0.52 GB, ~2.4 ms of the ~4 ms a step on the Radeon 8065S
+// (Gorgon Halo) - to argmax one guess.  A draft only has to be a good guess: the verify decides every token, the output
+// is the same whatever the drafts are.  So the draft head runs over a DRAFT VOCABULARY: the full head's own rows for its
+// tokens (a draft that lies in it is the one the full head makes), the rest left out.
+//
+// Which tokens.  GLM's byte-level BPE lays its vocabulary out by script: ids [0, 98304) the Latin / code block (English,
+// code, markup, the Latin-script languages), then the Han block (the most frequent first) with the multi-digit numbers
+// in it, then Cyrillic, Arabic, Kana ..., the control tokens from 154820.  English or code output stays in the first
+// block but for its numbers.  Maya-S's greedy answers to the bench's prompts (2304 tokens: Python, Rust, HTML/JS,
+// TCP/UDP, photosynthesis, the history of computing) had 2 tokens outside the vocabulary below (98,304 + 437 rows, 64%
+// of the head) - and 10% outside the first 32K ids (' TCP', '```', '**:', ' dictionaries': the ids
+// follow the merge order, not the frequency), 4.5% outside the first 64K.  A miss costs the round its later drafts,
+// ~0.9% of the tokens a round for each 1% missed (82% of the drafts accepted), against the ~2% of a round the smaller
+// head saves at 64% - a 32K head saves ~4% and loses ~9%.  So the vocabulary is read from the GGUF's tokens:
+//   - the leading block: the ids up to the first 1024 of which fewer than half are ASCII, and the ASCII ones that
+//     begin that thousand;
+//   - after it, the tokens that are digits only, and the control / user-defined ones (the roles, <think>, the tool-call
+//     tags: a draft can still end a turn or open a call).
+// STRATA_GLM_MTP_DRAFT_VOCAB=<K>: the first K ids as the leading block (the rest as above); 0 = the whole head.  Where
+// the answer leaves the vocabulary (another script) the drafts go back to the whole head by themselves (decode_mtp:
+// the share of the emitted tokens outside it).
+
+// a GPT-2 byte-level token's text: all of its bytes ASCII (code points 0x21-0x7E stand for themselves, 0x100-0x120 for
+// the bytes 0x00-0x20, 0x121 for 0x7F), and all of it digits
+static void token_kind(const std::string& s, bool& ascii, bool& digits) {
+    ascii = digits = !s.empty();
+    for (size_t i = 0; i < s.size();) {
+        uint32_t c = (uint8_t) s[i];
+        int len = 1;
+        if (c >= 0xF0) {
+            c &= 0x07;
+            len = 4;
+        } else if (c >= 0xE0) {
+            c &= 0x0F;
+            len = 3;
+        } else if (c >= 0xC0) {
+            c &= 0x1F;
+            len = 2;
+        }
+        for (int k = 1; k < len && i + (size_t) k < s.size(); ++k) c = (c << 6) | ((uint8_t) s[i + (size_t) k] & 0x3Fu);
+        i += (size_t) len;
+        if (!((c >= 0x21 && c <= 0x7E) || (c >= 0x100 && c <= 0x121))) ascii = false;
+        if (c < '0' || c > '9') digits = false;
+    }
+}
+
+// load_pack, the part with the NextN block: the draft vocabulary from the GGUF's tokenizer (mtp_vlead_, mtp_vextra_,
+// mtp_vin_; left empty - the whole head - without a byte-level BPE vocabulary of n_vocab tokens, or where it would
+// not pay: more than 90% of the head, or a leading block under an eighth of it)
+void Glm5Model::mtp_vocab_scan(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs) {
+    mtp_vlead_ = 0;
+    mtp_vextra_.clear();
+    mtp_vin_.clear();
+    static const int env = [] {
+        const char* e = getenv("STRATA_GLM_MTP_DRAFT_VOCAB");
+        return e != nullptr ? std::max(0, std::atoi(e)) : -1;
+    }();
+    if (env == 0) return;
+    // (the reader's metadata keeps a sample of each array: the two arrays read whole)
+    strata::MetaValue toks_v, types_v;
+    const strata::MetaValue *toks = nullptr, *types = nullptr, *model = nullptr;
+    for (const auto& gf : gfs) {
+        if (toks == nullptr && gf->get_full("tokenizer.ggml.tokens", toks_v)) toks = &toks_v;
+        if (types == nullptr && gf->get_full("tokenizer.ggml.token_type", types_v)) types = &types_v;
+        if (model == nullptr) model = gf->get("tokenizer.ggml.model");
+    }
+    const int64_t N = g_.n_vocab;
+    if (toks == nullptr || model == nullptr || model->s != "gpt2" || (int64_t) toks->items.size() != N) {
+        std::fprintf(stderr, "glm mtp: no byte-level BPE vocabulary of %lld tokens in the GGUF - the drafts take the "
+                             "whole head\n", (long long) N);
+        return;
+    }
+    if (types != nullptr && (int64_t) types->items.size() != N) types = nullptr;
+    std::vector<uint8_t> asc((size_t) N), dig((size_t) N);
+    for (int64_t i = 0; i < N; ++i) {
+        bool a = false, d = false;
+        token_kind(toks->items[(size_t) i].s, a, d);
+        asc[(size_t) i] = a;
+        dig[(size_t) i] = d;
+    }
+    int64_t lead = 0;
+    if (env > 0) {
+        lead = std::min<int64_t>(env, N);
+    } else {
+        constexpr int64_t kBucket = 1024;
+        while (lead < N) {
+            const int64_t n = std::min(kBucket, N - lead);
+            int64_t a = 0;
+            for (int64_t i = lead; i < lead + n; ++i) a += asc[(size_t) i];
+            if (2 * a < n) break;
+            lead += n;
+        }
+        while (lead < N && asc[(size_t) lead]) ++lead;
+    }
+    std::vector<int32_t> extra;
+    for (int64_t i = lead; i < N; ++i) {
+        const int ty = types != nullptr ? (int) types->items[(size_t) i].u : 1;
+        if (dig[(size_t) i] || ty == 3 || ty == 4) extra.push_back((int32_t) i);   // (3 control, 4 user-defined)
+    }
+    const int64_t n = lead + (int64_t) extra.size();
+    if (n > N * 9 / 10 || (env < 0 && lead < N / 8)) return;
+    mtp_vlead_ = (int) lead;
+    mtp_vextra_ = std::move(extra);
+    mtp_vin_.assign((size_t) N, 0);
+    std::fill(mtp_vin_.begin(), mtp_vin_.begin() + lead, (uint8_t) 1);
+    for (const int32_t i : mtp_vextra_) mtp_vin_[(size_t) i] = 1;
+}
+
+// STRATA_GLM_MTP_CHAIN: the drafts of a round go out as one chain on the device - each step's argmax feeds the next
+// step's embedding there (token_embd kept on the device, embed_tok) - and the host reads them back once, instead of a
+// wait, a host dequantization and a copy per step; nor does the round wait for the device before its drafts or its
+// NextN cache rows (the host's own rows go through their own pinned buffers).  Unset: on where the device holds every
+// routed expert and token_embd (0.52 GB for Maya's Q6_K) besides; 1 = on wherever token_embd is Q6_K or Q8_0; 0 = off
+// (the drafts step by step, as before).
+bool glm_mtp_chain() {
+    static const bool v = [] {
+        const char* e = getenv("STRATA_GLM_MTP_CHAIN");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return v;
+}
+
+// fast_setup, the part with the NextN block: the draft head's gathered rows, and the chain's token_embd
+void Glm5Model::mtp_draft_setup() {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const WSlot& ow = ws_map_.at("output.weight");
+    const size_t hb = ow.type == 0 ? (size_t) g.n_embd * sizeof(float) : ggml_row_size((ggml_type) ow.type, g.n_embd);
+    const void* head = ow.type == 0 ? (const void*) ow.f32 : ow.q;
+    if (mtp_vlead_ > 0 && head != nullptr) {
+        const int dx = (int) mtp_vextra_.size();
+        bool ok = true;
+        if (dx > 0) {
+            ok = cudaMalloc(&F->mtp_dx_w, (size_t) dx * hb) == cudaSuccess &&
+                 cudaMalloc((void**) &F->mtp_dx_ids, (size_t) dx * sizeof(int)) == cudaSuccess;
+            for (int i = 0; i < dx && ok; ++i)
+                ok = cudaMemcpy((uint8_t*) F->mtp_dx_w + (size_t) i * hb,
+                                (const uint8_t*) head + (size_t) mtp_vextra_[(size_t) i] * hb, hb,
+                                cudaMemcpyDeviceToDevice) == cudaSuccess;
+            ok = ok && cudaMemcpy(F->mtp_dx_ids, mtp_vextra_.data(), (size_t) dx * sizeof(int),
+                                  cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        if (ok) {
+            F->mtp_dv = mtp_vlead_;
+            F->mtp_dx = dx;
+        } else {
+            cudaGetLastError();
+            if (F->mtp_dx_w) cudaFree(F->mtp_dx_w);
+            if (F->mtp_dx_ids) cudaFree(F->mtp_dx_ids);
+            F->mtp_dx_w = nullptr;
+            F->mtp_dx_ids = nullptr;
+            mtp_vin_.clear();
+        }
+    }
+    // the chain: token_embd as stored, where the device has the room (or STRATA_GLM_MTP_CHAIN=1 says so)
+    const char* ce = getenv("STRATA_GLM_MTP_CHAIN");
+    const bool want = ce == nullptr || std::atoi(ce) != 0, forced = ce != nullptr && std::atoi(ce) != 0;
+    const size_t rb = ggml_row_size((ggml_type) pack_emb_type_, g.n_embd);
+    const size_t tb = (size_t) g.n_vocab * rb;
+    bool room = forced;
+    if (want && !forced) {
+        size_t free_b = 0, total_b = 0;
+        cudaMemGetInfo(&free_b, &total_b);
+        size_t experts = 0;
+        for (int il = l0_; il < lt_; ++il)
+            if (F->L[(size_t) il].moe) experts += F->L[(size_t) il].blob * (size_t) g.n_expert;
+        room = free_b > experts + tb + ((size_t) 4 << 30);
+    }
+    if (want && room && pack_emb_src_ != nullptr &&
+        (pack_emb_type_ == GGML_TYPE_Q6_K || pack_emb_type_ == GGML_TYPE_Q8_0) && g.n_embd % 256 == 0) {
+        bool ok = cudaMalloc(&F->mtp_emb, tb) == cudaSuccess &&
+                  cudaMemcpy(F->mtp_emb, pack_emb_src_, tb, cudaMemcpyHostToDevice) == cudaSuccess &&
+                  cudaHostAlloc((void**) &F->mtp_emb_h, (size_t) g.n_embd * sizeof(float), cudaHostAllocDefault) ==
+                      cudaSuccess &&
+                  cudaEventCreateWithFlags(&F->ev_mtp_emb, cudaEventDisableTiming) == cudaSuccess;
+        F->mtp_emb_type = (int) pack_emb_type_;
+        // the device's rows against the host's dequantization (the token path's): the same floats, or no chain
+        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+        int* d_i = nullptr;
+        float* d_row = nullptr;
+        ok = ok && tt != nullptr && tt->to_float != nullptr && cudaMalloc((void**) &d_i, sizeof(int)) == cudaSuccess &&
+             cudaMalloc((void**) &d_row, (size_t) g.n_embd * sizeof(float)) == cudaSuccess;
+        std::vector<float> want_r((size_t) g.n_embd), got((size_t) g.n_embd);
+        for (const int i : {0, 1000, (int) g.n_vocab / 2, (int) g.n_vocab - 60}) {
+            if (!ok) break;
+            cudaMemcpy(d_i, &i, sizeof(int), cudaMemcpyHostToDevice);
+            gf::embed_tok(F->mtp_emb, F->mtp_emb_type, (int) g.n_vocab, d_i, g.n_embd, d_row, nullptr);
+            ok = cudaMemcpy(got.data(), d_row, got.size() * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
+            tt->to_float(pack_emb_src_ + (size_t) i * rb, want_r.data(), g.n_embd);
+            ok = ok && std::memcmp(want_r.data(), got.data(), got.size() * sizeof(float)) == 0;
+        }
+        if (d_i) cudaFree(d_i);
+        if (d_row) cudaFree(d_row);
+        if (!ok) {
+            cudaGetLastError();
+            if (F->mtp_emb) cudaFree(F->mtp_emb);
+            if (F->mtp_emb_h) cudaFreeHost(F->mtp_emb_h);
+            if (F->ev_mtp_emb) cudaEventDestroy(F->ev_mtp_emb);
+            F->mtp_emb = nullptr;
+            F->mtp_emb_h = nullptr;
+            F->ev_mtp_emb = nullptr;
+            std::fprintf(stderr, "glm mtp: CUDA%d token_embd did not set up on the device - the drafts go step by step\n",
+                         dev_);
+        }
+    }
+    const int n = F->mtp_dv + F->mtp_dx;
+    if (F->mtp_dv > 0)
+        std::fprintf(stderr, "glm mtp: CUDA%d the draft head over %d of %lld tokens (the ids below %d and %d more: %.0f "
+                             "of %.0f MB a draft)", dev_, n, (long long) g.n_vocab, F->mtp_dv, F->mtp_dx,
+                     (double) n * (double) hb / 1048576.0, (double) g.n_vocab * (double) hb / 1048576.0);
+    else
+        std::fprintf(stderr, "glm mtp: CUDA%d the draft head over the whole vocabulary", dev_);
+    if (F->mtp_emb)
+        std::fprintf(stderr, ", the drafts chained on the device (token_embd there, %.0f MB)\n", (double) tb / 1048576.0);
+    else
+        std::fprintf(stderr, "\n");
+}
+
 // ---------------------------------------------------------------- the window's buffers (fast_setup, before the pool)
 bool Glm5Model::mtp_rows_setup(int rows, std::string& err) {
     FastState* F = fast_;
@@ -578,7 +797,7 @@ bool Glm5Model::mtp_commit(int T, int keep, std::string& err) {
 // entries p0 .. p0 + n - 1 of the draft block's DSA caches: entry p0 + i from the trunk's hidden state h + i * n_embd
 // and the token next[i] (the one at p0 + i + 1) - the cache-writing half of the block (glm_prefill.cu's for a prompt):
 // eh_proj, the attention norm, kv_a and the indexer's key and gate.  This part carries the block.
-bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err) {
+bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (F == nullptr || mtp_il_ < 0 || n <= 0) return true;
@@ -596,8 +815,9 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
         return false;
     }
     cudaSetDevice(dev_);
-    // the pinned rows may still feed an earlier copy of this stream
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp cache sync", err)) return false;
+    // the pinned rows may still feed an earlier copy of this stream (sync = false: the caller knows they do not - the
+    // MTP decode's round, after the verify it waited for)
+    if (sync && !glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp cache sync", err)) return false;
     const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, g.n_embd);
     for (int i = 0; i < n; ++i) tt->to_float(pack_emb_src_ + (size_t) next[i] * row_b, B.emb_h + (size_t) i * E, g.n_embd);
     cudaMemcpyAsync(B.emb, B.emb_h, (size_t) n * E * sizeof(float), cudaMemcpyHostToDevice, s);
@@ -660,10 +880,16 @@ bool Glm5Model::mtp_fill_prev(int32_t token, int64_t p, std::string& err) {
 }
 
 // ---------------------------------------------------------------- the draft length
-// The length that gives the most tokens per second on this machine: each length's round time (an EMA of the measured
-// wall time) against the tokens a round of it yields - 1 + a1 + a1 a2 + ..., a_i the share of rounds that reached
-// draft i (all before it accepted) and accepted it.  Every length is tried a few rounds first, then one round in 32
-// tries a neighbour of the best (the estimates of lengths not in use go stale).  STRATA_GLM_MTP_ADAPT=0: always n_cap.
+// The length that gives the most tokens per second on this machine: each length's round time (measured wall time: the
+// mean of its first rounds, then an EMA) against the tokens a round of it yields - 1 + a1 + a1 a2 + ..., a_i the share
+// of rounds that reached draft i (all before it accepted) and accepted it.  STRATA_GLM_MTP_ADAPT=0: always n_cap.
+//
+// The search starts at STRATA_GLM_MTP_START (2) and climbs: the start runs a stint of measured rounds, then each
+// neighbour of the best a short probe, until the best's neighbours are both measured and lose.  Every length used to
+// be tried 8 rounds first, longest to none: a machine's first request paid for the token-by-token rounds and the
+// longest window it would never use (Maya-S on the Radeon 8065S: 12.7 tok/s for the first answer, 21-27 after; length
+// 2 wins there).  The token path (length 0) is now only tried where length 1 is the best.  Then, as before, one
+// neighbour of the best gets a probe now and then, the gap doubling while the best stays.
 int Glm5Model::mtp_choose(int n_cap) {
     static const bool fixed = [] {
         const char* e = getenv("STRATA_GLM_MTP_ADAPT");
@@ -674,6 +900,10 @@ int Glm5Model::mtp_choose(int n_cap) {
     static const int forced_n = [] {
         const char* e = getenv("STRATA_GLM_MTP_FIXED");
         return e != nullptr ? std::max(0, std::atoi(e)) : -1;
+    }();
+    static const int start_n = [] {
+        const char* e = getenv("STRATA_GLM_MTP_START");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 2;
     }();
     if (forced_n >= 0) return std::min(forced_n, n_cap);
     if (n_cap <= 0) return 0;
@@ -686,19 +916,30 @@ int Glm5Model::mtp_choose(int n_cap) {
         --mtp_stint_left_;
         return mtp_stint_n_;
     }
-    constexpr uint64_t kTry = 6;
-    for (int n = n_cap; n >= 0; --n)
-        if (mtp_seen_[n] < kTry) {
-            mtp_stint_n_ = n;
-            mtp_stint_left_ = (int) (kTry - mtp_seen_[n]) + 1;   // + 2 unmeasured, this one included
-            return n;
-        }
+    const auto stint = [&](int n, int measured) {
+        mtp_stint_n_ = n;
+        mtp_stint_left_ = measured + 1;   // + 2 unmeasured, this one included
+        return n;
+    };
+    constexpr uint64_t kTry = 6, kProbe = 2;   // the start's measured rounds, a probe's
+    const int s0 = std::min(start_n, n_cap);
+    if (mtp_seen_[s0] < kTry) return stint(s0, (int) (kTry - mtp_seen_[s0]));
+    // the acceptance of draft i: its own count, pulled toward draft i - 1's (a few rounds of a long window say little
+    // about its last draft; the share falls slowly with the depth)
+    double a[9] = {};
+    double prior = 0.75;
+    for (int i = 1; i <= n_cap; ++i) {
+        constexpr double kPull = 4.0;
+        a[i] = (mtp_hit_[i] + kPull * prior) / (mtp_reach_[i] + kPull);
+        prior = a[i];
+    }
     double best = -1.0;
-    int bn = 0;
+    int bn = s0;
     for (int n = 0; n <= n_cap; ++n) {
+        if (mtp_seen_[n] < kProbe && n != s0) continue;   // (not measured yet)
         double e = 1.0, run = 1.0;
         for (int i = 1; i <= n; ++i) {
-            run *= mtp_reach_[i] > 0 ? (double) mtp_hit_[i] / (double) mtp_reach_[i] : 0.0;
+            run *= a[i];
             e += run;
         }
         const double rate = e / std::max(1e-3, mtp_ms_[n]);
@@ -707,6 +948,9 @@ int Glm5Model::mtp_choose(int n_cap) {
             bn = n;
         }
     }
+    // the climb: the best's neighbours, the longer first, each probed until it is measured
+    for (const int alt : {bn + 1, bn - 1})
+        if (alt >= 0 && alt <= n_cap && mtp_seen_[alt] < kProbe) return stint(alt, (int) (kProbe - mtp_seen_[alt]));
     // a probe of a neighbour every mtp_gap_ rounds: the gap doubles (to 1024) while the best length stays, so a
     // machine where drafting does not pay spends ever fewer rounds finding that out again
     if (bn != mtp_best_) {
@@ -719,11 +963,7 @@ int Glm5Model::mtp_choose(int n_cap) {
         mtp_next_probe_ = mtp_round_no_ + mtp_gap_;
         int alt = (mtp_probe_up_ = !mtp_probe_up_) ? bn + 1 : bn - 1;
         if (alt < 0 || alt > n_cap) alt = bn + 1 <= n_cap ? bn + 1 : bn - 1;
-        if (alt >= 0 && alt <= n_cap) {
-            mtp_stint_n_ = alt;
-            mtp_stint_left_ = 3;   // a probe: four rounds, two of them measured
-            return alt;
-        }
+        if (alt >= 0 && alt <= n_cap) return stint(alt, (int) kProbe);   // a probe: four rounds, two of them measured
     }
     return bn;
 }
@@ -771,6 +1011,28 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
     mtp_same_ = 0;       // (a request's first rounds carry its prompt's tier work: not measured)
     std::vector<int32_t> win((size_t) n_cap + 1);
     bool ok = true;
+    // the draft vocabulary's misses: every emitted token outside it moves mtp_out_ (an EMA over ~64 tokens) - above
+    // kOutMax a round's drafts take the whole head (another script than the vocabulary's: a CJK answer, say, drafts as
+    // before).  With ~82% of the drafts accepted a round loses ~0.9% of its tokens for each 1% missed, against the ~2%
+    // the smaller head saves: 2% is about where the two meet.
+    constexpr double kOutMax = 0.02;
+    // the acceptance a length's choice weighs is the recent text's: each draft position's counts decay over its last
+    // STRATA_GLM_MTP_ACC_WINDOW (64) comparisons (0: every comparison since the load, as before).  A whole-session
+    // count let a request's easy start speak for its hard part: Maya-S on the Radeon 8065S kept 2 drafts through a
+    // 1536-token essay (57% of the drafts accepted, 21.3 tok/s) where 1 gives ~22.5, on the short answers' record.
+    static const double acc_keep = [] {
+        const char* e = getenv("STRATA_GLM_MTP_ACC_WINDOW");
+        const int w = e != nullptr ? std::max(0, std::atoi(e)) : 64;
+        return w > 0 ? 1.0 - 1.0 / (double) w : 1.0;
+    }();
+    int64_t n_out = 0, n_full = 0, n_drafting = 0;
+    const bool chain = FT->mtp_emb != nullptr && glm_mtp_chain();
+    const auto note = [&](int tok) {
+        const bool out = !TL->mtp_vin_.empty() && tok >= 0 && tok < (int) TL->mtp_vin_.size() && !TL->mtp_vin_[(size_t) tok];
+        n_out += out ? 1 : 0;
+        mtp_out_ += ((out ? 1.0 : 0.0) - mtp_out_) / 64.0;
+    };
+    note(y);
     // the drafting rounds' host time: drafts, verify (to the tokens), accept + commit + cache; [3]: the drafts' wait
     // for the device before their first step
     double ph[4] = {0, 0, 0, 0};
@@ -792,25 +1054,45 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             // ---- 1. the drafts: the NextN block at p0 - 1 + i on (its last hidden state, the last token)
             // (the tiers' boundary runs before the verify: the drafts route with the tables as they are -
             // STRATA_GLM_MTP_DRAFT_BOUNDARY=1 runs one before them too)
+            // (the chain queues them behind the last round's commit and cache rows: nothing of the host's they read
+            // is still in flight)
             static const bool draft_boundary = getenv("STRATA_GLM_MTP_DRAFT_BOUNDARY") != nullptr;
             cudaSetDevice(TL->dev_);
-            if (!glmfast::cuda_ok(cudaStreamSynchronize(FT->cs), "glm mtp draft sync", err) || !FT->route_ok(err) ||
-                (draft_boundary && !TL->fast_boundary(err))) {
+            if (((!chain || draft_boundary) &&
+                 !glmfast::cuda_ok(cudaStreamSynchronize(FT->cs), "glm mtp draft sync", err)) ||
+                !FT->route_ok(err) || (draft_boundary && !TL->fast_boundary(err))) {
                 ok = false;
                 break;
             }
             ph[3] += ms_since(t0);
-            int32_t tok = y;
-            for (int i = 0; i < n; ++i) {
-                if (!TL->fast_mtp(p0 - 1 + i, tok, err) ||
-                    !glmfast::wait_event(FT->ev_mtp, "glm mtp draft", err) || !FT->route_ok(err)) {
-                    ok = false;
-                    break;
+            // the draft vocabulary while the answer stays in it, the whole head while it does not (mtp_out_)
+            const bool sub = FT->mtp_dv > 0 && mtp_out_ < kOutMax;
+            if (chain) {
+                // the chain: every step queued at once, each step's argmax the next one's token on the device; the
+                // host reads the n drafts back once
+                for (int i = 0; i < n && ok; ++i) ok = TL->fast_mtp(p0 - 1 + i, i == 0 ? y : -1, err, i, sub, false);
+                if (ok) {
+                    cudaMemcpyAsync(FT->mtp_tok_h, FT->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
+                    cudaEventRecord(FT->ev_mtp, FT->cs);
+                    ok = glmfast::wait_event(FT->ev_mtp, "glm mtp drafts", err) && FT->route_ok(err);
                 }
-                tok = FT->mtp_tok_h[0];
-                win[(size_t) i + 1] = tok;
-                ++nd;
+                for (int i = 0; i < n && ok; ++i) win[(size_t) i + 1] = FT->mtp_tok_h[i];
+                if (ok) nd = n;
+            } else {
+                int32_t tok = y;
+                for (int i = 0; i < n; ++i) {
+                    if (!TL->fast_mtp(p0 - 1 + i, tok, err, i, sub) ||
+                        !glmfast::wait_event(FT->ev_mtp, "glm mtp draft", err) || !FT->route_ok(err)) {
+                        ok = false;
+                        break;
+                    }
+                    tok = FT->mtp_tok_h[i];
+                    win[(size_t) i + 1] = tok;
+                    ++nd;
+                }
             }
+            n_full += sub ? 0 : 1;
+            ++n_drafting;
             TL->mtp_hx_pos_ = -1;   // (head_x holds the block's hidden state now)
             cudaSetDevice(dev_);
             if (!ok) break;
@@ -841,6 +1123,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             last_tok_ = y2;
             ++produced;
             y = y2;
+            note(y2);
             more = emit(y2) && produced < max_new && p0 + 2 < max_ctx_;
         } else {
             // ---- 2. the verify: the window through every part, then every row's token
@@ -879,11 +1162,14 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                 ++produced;
                 keep = t + 1;
                 y = yy;
+                note(yy);
                 more = emit(yy) && produced < max_new && p0 + keep + 1 < max_ctx_;
                 if (!more || t + 1 >= T) break;
-                ++mtp_reach_[t + 1];   // draft t + 1 is compared (every draft before it stood)
+                // draft t + 1 is compared (every draft before it stood): its counts decay first (acc_keep)
+                mtp_hit_[t + 1] *= acc_keep;
+                mtp_reach_[t + 1] = mtp_reach_[t + 1] * acc_keep + 1.0;
                 if (yy != win[(size_t) t + 1]) break;
-                ++mtp_hit_[t + 1];
+                mtp_hit_[t + 1] += 1.0;
                 ++acc;
             }
             // ---- 4. the commit: the recurrent states advanced by the kept rows (positions p0 .. p0 + keep - 1)
@@ -893,7 +1179,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             }
             // ---- 5. the NextN cache: entries p0 .. p0 + keep - 2 from the kept rows' trunk states and the accepted
             //         drafts; entry p0 + keep - 1 is the next round's first draft step (or the token path's)
-            if (keep > 1 && !TL->mtp_cache_rows(p0, keep - 1, BT.head_x, win.data() + 1, err)) {
+            if (keep > 1 && !TL->mtp_cache_rows(p0, keep - 1, BT.head_x, win.data() + 1, err, !chain)) {
                 ok = false;
                 break;
             }
@@ -919,7 +1205,8 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             mtp_same_ = 0;
         }
         if (mtp_same_ >= 2) {
-            mtp_ms_[nd] = mtp_seen_[nd] == 0 ? ms : 0.9 * mtp_ms_[nd] + 0.1 * ms;
+            // (the mean of the first ten, then an EMA: one slow first round does not stand for the length)
+            mtp_ms_[nd] += (ms - mtp_ms_[nd]) / (double) std::min<uint64_t>(mtp_seen_[nd] + 1, 10);
             ++mtp_seen_[nd];
         }
         if (trace)
@@ -943,6 +1230,10 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
         std::fprintf(stderr, "glm mtp: a drafting round's host time - drafts %.2f ms (%.2f of them waiting for the "
                              "device), verify %.2f ms, accept + commit + cache %.2f ms (%lld rounds)\n", ph[0] / n_ph,
                      ph[3] / n_ph, ph[1] / n_ph, ph[2] / n_ph, (long long) n_ph);
+    if (FT->mtp_dv > 0 && produced > 0)
+        std::fprintf(stderr, "glm mtp: the draft vocabulary (%d + %d tokens) - %lld of %lld emitted tokens outside it, "
+                             "%lld of %lld drafting rounds on the whole head\n", FT->mtp_dv, FT->mtp_dx,
+                     (long long) n_out, (long long) produced, (long long) n_full, (long long) n_drafting);
     if (ok && !check()) ok = false;
     return ok;
 }

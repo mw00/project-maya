@@ -291,6 +291,20 @@ struct Glm5Model::FastState {
     int* mtp_tok = nullptr;
     int* mtp_tok_h = nullptr;    // pinned
     cudaEvent_t ev_mtp = nullptr;
+    // the draft head over the draft vocabulary (Glm5Model::mtp_vocab_scan; mtp_dv == 0: the whole head): the head's
+    // first mtp_dv rows in place, then mtp_dx rows gathered from the rest (mtp_dx_w) whose tokens are mtp_dx_ids
+    // (device: the argmax writes a token id either way)
+    int mtp_dv = 0, mtp_dx = 0;
+    void* mtp_dx_w = nullptr;
+    int* mtp_dx_ids = nullptr;
+    // the chained drafts (STRATA_GLM_MTP_CHAIN): token_embd on the device as stored (Q6_K / Q8_0), the token of a
+    // step after the first read there; null: every draft step takes its embedding from the host.  The host's own rows
+    // for a draft step go through mtp_emb_h, its copy out ordered by ev_mtp_emb
+    void* mtp_emb = nullptr;
+    int mtp_emb_type = -1;
+    float* mtp_emb_h = nullptr;   // pinned
+    cudaEvent_t ev_mtp_emb = nullptr;
+    bool mtp_emb_pending = false;
     // ---- the MTP verify window (src/core/glm_mtp.cu): every per-token activation as rows ([row][...] contiguous, the
     //      strides mv_rows reads), the per-row scratch of the one-token path reused row after row
     struct Rows {
@@ -579,6 +593,8 @@ struct Glm5Model::FastState {
 // it is wanted at all (not turned off, not the earlier pipelined decode)
 int glm_mtp_draft_cap();
 bool glm_mtp_decode_wanted();
+// whether the drafts of a round go out in one chain on the device (STRATA_GLM_MTP_CHAIN, on where token_embd fits)
+bool glm_mtp_chain();
 
 
 }  // namespace strata::core

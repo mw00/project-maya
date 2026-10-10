@@ -2680,6 +2680,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     pack_ = true;
     loaded_ = true;
     if (fast_mode_) pack_release_views();   // before fast_setup: its RAM tier sees the embedding's heap copy
+    if (fast_mode_ && mtp_il_ >= 0) mtp_vocab_scan(gfs);   // the draft head's vocabulary (glm_mtp.cu)
     if (fast_mode_ && !fast_setup(err)) return false;
     reset();
     return true;
