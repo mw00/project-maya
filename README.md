@@ -59,6 +59,13 @@ all of it there and decodes 16.4 tokens/s ([#63](https://github.com/mw00/project
 `./setup.sh --setup --model Maya-L` (Windows: `START-MAYA.bat --setup --model Maya-L`).
 Details: [bench/results/MAYA-L.md](bench/results/MAYA-L.md).
 
+**EXL3 (experimental, NVIDIA only).** The setup can also download turboderp's
+[EXL3 quant of GLM-5.3-Flash](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) at 3.05 bits per
+weight (125.3 GB, exllamav3's format, with the MTP block). The engine reads its weights in place from the
+safetensors; the pack step (`tools/exl3_pack.py`) writes a small GGUF of the unquantized tensors (about 2 GB) beside
+them. Its accuracy has not been measured against the FP8 model the way the Maya quants' has. Set it up with
+`./setup.sh --setup --model EXL3-3.05bpw` (tested on Linux only).
+
 **Files downloaded before 2026-10-09** name the architecture `glm5next`, an early spelling.
 `python tools/gguf_fix_arch.py <the model's first .gguf> --in-place` gives them the standard name, `glm5-next`,
 rewriting only the header. Maya reads either name.
@@ -94,7 +101,7 @@ then `--report`, in a
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 or newer (V100 and newer); one GPU, or up to 16 that share the model (two split the layers in the middle; with more, each takes a share sized to its free VRAM). The engine fills whatever VRAM you have with the most-used experts: more VRAM is faster. Measured: 1 and 2x V100 32 GB; by users: 2x CMP 170HX (above), 1x RTX 3090 and nine GPUs (8x RTX 5060 Ti 16 GB + the 3090). **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070 (one GPU or two) and Strix Halo / Gorgon Halo, Radeon 8060S / 8065S (one GPU), text only ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)). |
 | **RAM** | It runs with **32 GB** (the 2x V100 machine in the speed table above has 30 GB). More RAM keeps more experts close and is faster; what does not fit is read from the SSD while it answers. |
-| **Disk** | **~100 GB free on a fast NVMe SSD** (Maya-S is 96.5 GB, its pictures encoder 1.1 GB, and the engine reads from the model while it answers; Maya-M needs ~120 GB, Maya-L ~160 GB). Not a hard disk. |
+| **Disk** | **~100 GB free on a fast NVMe SSD** (Maya-S is 96.5 GB, its pictures encoder 1.1 GB, and the engine reads from the model while it answers; Maya-M needs ~120 GB, Maya-L ~160 GB, the EXL3 model ~130 GB). Not a hard disk. |
 | **System** | Linux (x86-64; a CPU with AVX2 is best - without it the engine still runs, its CPU expert lane on ggml's slower kernels), NVIDIA driver, CUDA toolkit 12.x (CUDA 13 can be used for Turing and newer, but it no longer compiles for Volta/V100), g++, Python 3.10+. Windows 10/11: experimental, with Visual Studio 2022 Build Tools instead of g++ ([Windows](#windows)). Not WSL2. AMD: ROCm 7 instead of the NVIDIA driver and CUDA (on Windows AMD's ROCm SDK wheels, which the setup offers to install). |
 
 The installer checks all of this and prints the exact command for anything missing. It installs nothing
