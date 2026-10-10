@@ -2246,7 +2246,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         for (int d2 = 0; d2 < kAhead; ++d2)
             for (int i = 0; i < 8; ++i) rq->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
         if (a.near_n > 0)   // the host reads them only for the route log: no extra writes over PCIe without it
-            for (int i = 0; i < 16; ++i) rq->near[i] = i < a.near_n ? (short) s_near[i] : (short) -1;
+            for (int i = 0; i < 16; ++i) rq->near_ids[i] = i < a.near_n ? (short) s_near[i] : (short) -1;
     }
     __threadfence_system();
     __syncthreads();

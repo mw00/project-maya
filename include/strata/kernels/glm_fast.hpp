@@ -205,7 +205,7 @@ struct MoeRequest {
     short ahead[kAhead][8];      // layer + 1 + d's router on this layer's FFN input: its top-k (-1: none)
     unsigned int cpu_mask;       // the CPU LANE: RAM-tier experts the host computes (the device skips them) ...
     unsigned long long cpu_src[8];   // ... their RAM-tier blobs
-    short near[16];              // STRATA_GLM_ROUTE_LOG only: the route's next ranks after the top k (-1: none)
+    short near_ids[16];          // STRATA_GLM_ROUTE_LOG only: the route's next ranks after the top k (-1: none)
     float x[4096];               // the FFN input, written only when cpu_mask != 0
 };
 /// The host's answer to a request with misses.

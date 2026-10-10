@@ -2312,7 +2312,7 @@ void Glm5Model::fast_service() {
                     std::fprintf(rf, "%d", il);
                     for (int i = 0; i < K; ++i) std::fprintf(rf, " %d", ids[i]);
                     std::fprintf(rf, " %u %u %u |", fetch, miss, cpu);
-                    for (int i = 0; i < 16 && rq->near[i] >= 0; ++i) std::fprintf(rf, " %d", (int) rq->near[i]);
+                    for (int i = 0; i < 16 && rq->near_ids[i] >= 0; ++i) std::fprintf(rf, " %d", (int) rq->near_ids[i]);
                     std::fputc('\n', rf);
                 }
             }
