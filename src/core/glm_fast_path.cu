@@ -38,6 +38,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -1464,6 +1465,34 @@ static int physical_cores() {
 #endif
 }
 
+// STRATA_GLM_CPU_CAL file: replace key's line with vals (empty: drop it)
+static void cal_put(const std::string& file, const std::string& key, const std::string& vals) {
+    std::string keep;
+    if (FILE* cf = std::fopen(file.c_str(), "r")) {
+        char line[2048];
+        while (std::fgets(line, sizeof line, cf)) {
+            const char* tab = std::strrchr(line, '\t');
+            if (tab == nullptr || std::string(line, (size_t) (tab - line)) != key) keep += line;
+        }
+        std::fclose(cf);
+    }
+    if (!vals.empty()) keep += key + "\t" + vals + "\n";
+    const std::string tmp = file + ".tmp";
+    if (FILE* cf = std::fopen(tmp.c_str(), "w")) {
+        const bool ok = std::fputs(keep.c_str(), cf) >= 0;
+        if (std::fclose(cf) == 0 && ok) {
+            std::error_code ec;
+            std::filesystem::rename(tmp, file, ec);
+        }
+    }
+}
+
+static std::string cal_vals(double c, double p, double ps, double ref) {
+    char v[128];
+    std::snprintf(v, sizeof v, ref > 0.0 ? "%.4f %.4f %.4f %.4f" : "%.4f %.4f %.4f", c, p, ps, ref);
+    return v;
+}
+
 // The CPU LANE, on by default: one thread per physical core (split evenly across the parts of a layer split);
 // STRATA_GLM_CPU_LANE=<threads> sets the count, 0 turns it off; STRATA_GLM_CPU_LANE<n>=<threads> sets one GPU's own
 // (CUDA<n>: a slow link wants more threads than a fast one).  Measures this machine once - one expert on the CPU
@@ -1600,6 +1629,40 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
     }
+    // STRATA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
+    const char* calf = getenv("STRATA_GLM_CPU_CAL");
+    std::string cal_key;
+    double c_ms = 0.0, p_ms = 0.0, ps_ms = 0.0;
+    bool cached = false;
+    if (calf != nullptr && *calf != '\0') {
+        char bus[32] = "?";
+        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev_) != cudaSuccess) cudaGetLastError();
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev_) != cudaSuccess) {
+            cudaGetLastError();
+            prop.name[0] = 0;
+        }
+        std::error_code ec;
+        const std::filesystem::path pd = std::filesystem::weakly_canonical(pack_dir_, ec);
+        cal_key = std::string(STRATA_VERSION) + " " + __DATE__ + " " + __TIME__ + " | " + (ec ? pack_dir_ : pd.string()) + " | layer " + std::to_string(il_cal) +
+                  " | " + std::to_string(F->L[(size_t) il_cal].blob) + " B | " + bus + " " + prop.name + " | " +
+                  std::to_string(threads) + (shared ? " threads shared" : " threads") + " | " + std::to_string(n_cal);
+        if (FILE* cf = std::fopen(calf, "r")) {
+            char line[2048];
+            while (!cached && std::fgets(line, sizeof line, cf)) {
+                char* tab = std::strrchr(line, '\t');
+                if (tab == nullptr) continue;
+                *tab = 0;
+                double ref = 0.0;
+                cached = cal_key == line && std::sscanf(tab + 1, "%lf %lf %lf %lf", &c_ms, &p_ms, &ps_ms, &ref) >= 3 &&
+                         c_ms > 0.0 && p_ms > 0.0 && ps_ms > 0.0;
+                if (cached) F->cal_ref = ref;
+            }
+            std::fclose(cf);
+        }
+    }
+    const size_t blob = F->L[(size_t) il_cal].blob;
+    if (!cached) {
     // ---- calibration, each lane alone: the CPU after 100 ms of the same work (an idle CPU's clocks take tens of ms to
     //      ramp up - a decode keeps them up), then the mean of 16 runs
     std::vector<float> x((size_t) g.n_embd), out((size_t) g.n_embd);
@@ -1609,7 +1672,6 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     for (const auto tw = std::chrono::steady_clock::now();
          std::chrono::steady_clock::now() - tw < std::chrono::milliseconds(100);)
         fast_cpu_experts(il_cal, n_cal, cal_set(set++), w4, x.data(), out.data());
-    double c_ms = 0.0;
     for (int rep = 0; rep < 16; ++rep) {
         const uint8_t* const* cals = cal_set(set++);
         const auto t0 = std::chrono::steady_clock::now();
@@ -1617,11 +1679,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         c_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
     c_ms /= 16.0 * n_cal;   // an expert's share of a call
-    const size_t blob = F->L[(size_t) il_cal].blob;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
-    double p_ms = 0.0;
     // the link is timed with the GPU awake (see glm_link_wake): 400 ms for the clocks and the link to ramp up, then
     // 1.1 s of the kernel left for both measurements below
     cudaStream_t wake = nullptr;
@@ -1641,7 +1701,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     p_ms /= 16.0;
     // ... and its streaming rate - copies back to back, the way the prompt path stages experts (a 3090 on PCIe 3.0 x8:
     // 2.09 ms for one copy, 1.57 a copy in a stream): the prompt's CPU / PCIe split plans with this one
-    double ps_ms = p_ms;
+    ps_ms = p_ms;
     {
         cudaEventRecord(e0, F->cs);
         for (int rep = 0; rep < 8; ++rep) cudaMemcpyAsync(F->scratch, cal, blob, cudaMemcpyHostToDevice, F->cs);
@@ -1656,6 +1716,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
+    if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, 0.0));
+    }
     F->cpu_c_ms = c_ms;   // (the prompt path splits its staged experts by them too)
     F->cpu_p_ms = p_ms;
     F->cpu_ps_ms = ps_ms;
@@ -1694,6 +1756,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     F->cpu_plan = plan;
     F->cpu_plan_start = plan;
+    if (!cal_key.empty()) F->cal_file = calf, F->cal_key = cal_key;
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
     // the route counts that pick the coldest RAM-tier experts for the host, seeded with the tiers' LFU counts
@@ -1714,6 +1777,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                  : (" on " + std::to_string(pin_cpus.size()) + " CPUs of its own" +
                     (pin_node >= 0 ? " (NUMA node " + std::to_string(pin_node) + ")" : std::string())).c_str(),
                  c_ms, p_ms, tab.c_str());
+    if (cached) std::fprintf(stderr, "glm fast: CUDA%d CPU lane: those times from %s (not timed)\n", dev_, calf);
     // STRATA_GLM_CPU_LANE_CHECK=1: the calibration expert on one normalised input three ways - the device's decode
     // kernels, the CPU lane, and a double-precision reference from ggml's dequantised rows - and their distances
     if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr) {
@@ -2190,6 +2254,31 @@ static double plan_share(unsigned long long plan) {
     double s = 0.0;
     for (int f = 1; f <= 8; ++f) s += (double) (f - (int) ((plan >> (4 * f)) & 15ull)) / f;
     return s / 8.0;
+}
+
+void Glm5Model::lane_drift_check() {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        FastState* F = m->fast_;
+        if (F == nullptr || F->cpu_pool == nullptr || F->cal_key.empty()) continue;
+        const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load();
+        if (e - F->drift_e0 < 2000) continue;
+        const double ms = (double) (us - F->drift_us0) / 1000.0 / (double) (e - F->drift_e0);
+        F->drift_e0 = e, F->drift_us0 = us;
+        if (F->cal_ref <= 0.0) {   // first window after timing: the reference
+            F->cal_ref = ms;
+            cal_put(F->cal_file, F->cal_key, cal_vals(F->cpu_c_ms, F->cpu_p_ms, F->cpu_ps_ms, ms));
+            continue;
+        }
+        const int dir = ms > 1.15 * F->cal_ref ? 1 : ms < F->cal_ref / 1.15 ? -1 : 0;
+        F->drift_n = dir != 0 && dir == F->drift_dir ? F->drift_n + 1 : dir != 0;
+        F->drift_dir = dir;
+        if (F->drift_n >= 5) {   // 5 requests in a row: the calibration is off, the next start times it
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane: decode %.3f ms an expert vs %.3f at calibration - dropped from "
+                                 "%s\n", m->dev_, ms, F->cal_ref, F->cal_file.c_str());
+            cal_put(F->cal_file, F->cal_key, "");
+            F->cal_key.clear();
+        }
+    }
 }
 
 double Glm5Model::pcie_share() const {

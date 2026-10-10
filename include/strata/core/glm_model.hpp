@@ -128,6 +128,8 @@ public:
     /// threads taking its jobs; set_cpu_lane_threads(n): at most n of the pool's, n <= 0 all of them.  Both are for
     /// setup's calibration (per request, no restart); false when this engine has no CPU lane.
     double pcie_share() const;
+    /// STRATA_GLM_CPU_CAL: once a request (2000+ lane experts a window), drop a calibration decode stays >15% from
+    void lane_drift_check();
     bool set_pcie_share(double share);
     int cpu_lane_threads() const;
     bool set_cpu_lane_threads(int n);

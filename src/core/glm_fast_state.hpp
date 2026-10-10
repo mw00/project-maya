@@ -390,6 +390,10 @@ struct Glm5Model::FastState {
     std::shared_ptr<glmfast::Workers> cpu_pool;
     int cpu_node = -1;                         // the NUMA node the pool is pinned to (-1: unpinned) ...
     std::vector<int> cpu_pin;                  // ... and its CPUs (the service thread runs there too)
+    std::string cal_file, cal_key;             // STRATA_GLM_CPU_CAL
+    double cal_ref = 0.0;                      // decode's CPU ms an expert after calibrating (0: not measured yet)
+    uint64_t drift_e0 = 0, drift_us0 = 0;
+    int drift_n = 0, drift_dir = 0;            // windows in a row >15% off, and which way
     double cpu_c_ms = 0.0, cpu_p_ms = 0.0;   // the lane's calibration: an expert on the CPU, one over PCIe
     double cpu_ps_ms = 0.0;                  // ... one in a stream of copies (the prompt's staging)
     unsigned long long cpu_plan = 0;
