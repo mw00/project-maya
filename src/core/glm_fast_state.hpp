@@ -394,6 +394,8 @@ struct Glm5Model::FastState {
     double cal_ref = 0.0;                      // decode's CPU ms an expert after calibrating (0: not measured yet)
     uint64_t drift_e0 = 0, drift_us0 = 0;
     int drift_n = 0, drift_dir = 0;            // windows in a row >15% off, and which way
+    bool lane_pending = false;                 // the lane and the service thread wait for fast_setup_finish
+    int64_t ram_check_head = 0;                // a parallel load: the headroom ram_left_check holds the free RAM to
     double cpu_c_ms = 0.0, cpu_p_ms = 0.0;   // the lane's calibration: an expert on the CPU, one over PCIe
     double cpu_ps_ms = 0.0;                  // ... one in a stream of copies (the prompt's staging)
     unsigned long long cpu_plan = 0;

@@ -723,9 +723,54 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
               " boundaries (2.." + std::to_string(kMaxParts) + " devices)";
         return false;
     }
+    std::string where;
+    // STRATA_GLM_PARALLEL_LOAD=0: sequential. Parts stay unlinked until loaded (load_pack's reset() walks split_next_)
+    const char* pl = getenv("STRATA_GLM_PARALLEL_LOAD");
+    if (pl == nullptr || std::atoi(pl) != 0) {
+        std::vector<std::unique_ptr<Glm5Model>> owned((size_t) n);
+        std::vector<Glm5Model*> parts((size_t) n, this);
+        for (int i = 1; i < n; ++i) owned[(size_t) i].reset(new Glm5Model()), parts[(size_t) i] = owned[(size_t) i].get();
+        SplitLoad sl(n);
+        std::vector<std::string> errs((size_t) n);
+        std::vector<char> ok((size_t) n, 0);
+        std::vector<std::thread> th;
+        for (int i = 0; i < n; ++i) {
+            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+            Glm5Model* p = parts[(size_t) i];
+            p->n_parts_ = n;
+            p->part_ = i;
+            p->split_devs_ = devs;
+            p->split_load_ = &sl;
+            p->defer_lane_ = true;
+            th.emplace_back([&, i, l0, l1, p] {
+                ok[(size_t) i] = p->load_pack(pack_dir, max_ctx, errs[(size_t) i], devs[(size_t) i], l0, l1);
+                sl.pass(i);
+            });
+        }
+        for (auto& t : th) t.join();
+        for (int i = 0; i < n; ++i) {
+            parts[(size_t) i]->split_load_ = nullptr;
+            parts[(size_t) i]->defer_lane_ = false;
+        }
+        for (int i = 0; i < n; ++i)
+            if (!ok[(size_t) i]) {
+                err = errs[(size_t) i];
+                return false;
+            }
+        for (int i = n - 1; i >= 1; --i) parts[(size_t) i - 1]->split_next_ = std::move(owned[(size_t) i]);
+        for (int i = 0; i < n; ++i) {
+            if (!parts[(size_t) i]->fast_setup_finish(err)) {
+                split_next_.reset();
+                return false;
+            }
+            const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
+            where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
+                     ") on CUDA" + std::to_string(devs[(size_t) i]);
+        }
+        ram_left_check();
+    } else {
     Glm5Model* prev = nullptr;
     Glm5Model* m = this;
-    std::string where;
     for (int i = 0; i < n; ++i) {
         const int l0 = i == 0 ? 0 : bounds[(size_t) i - 1], l1 = i + 1 < n ? bounds[(size_t) i] : 0;
         if (prev != nullptr) {
@@ -742,6 +787,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
                  ") on CUDA" + std::to_string(devs[(size_t) i]);
         prev = m;
+    }
     }
     // the chunks are the smallest part's (as Strata's split): the others keep their pinned staging to that, and a
     // later card that holds the first one's chunk down is named (Strata #448: a small card in a split caps every

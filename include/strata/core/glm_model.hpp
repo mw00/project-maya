@@ -216,6 +216,28 @@ public:
     int part_ = 0;                                         // ... and which of them this one is (0 = the first layers)
     std::vector<int> split_devs_;                          // ... and the CUDA devices of all of them, part by part
     std::unique_ptr<Glm5Model> split_next_;
+    // parallel split load: parts take the RAM budget in part order; CPU lane setup waits until all have loaded
+    struct SplitLoad {
+        std::mutex mu;
+        std::condition_variable cv;
+        std::vector<bool> passed;
+        int turn = 0;
+        explicit SplitLoad(int n) : passed((size_t) n, false) {}
+        void wait(int part) {
+            std::unique_lock<std::mutex> lk(mu);
+            cv.wait(lk, [&] { return turn >= part; });
+        }
+        void pass(int part) {
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                passed[(size_t) part] = true;
+                while (turn < (int) passed.size() && passed[(size_t) turn]) ++turn;
+            }
+            cv.notify_all();
+        }
+    };
+    SplitLoad* split_load_ = nullptr;
+    bool defer_lane_ = false;
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
     bool step_layers(int64_t p, std::string& err);
@@ -342,6 +364,8 @@ public:
     int32_t force_tok_ = -1;                               // force_next()
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     bool fast_setup(std::string& err);
+    bool fast_setup_finish(std::string& err);
+    void ram_left_check() const;
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
     bool fast_token(int32_t token, std::string& err);

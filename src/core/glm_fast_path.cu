@@ -303,8 +303,13 @@ static void* numa_pinned(size_t bytes) {
     if (!huge_known || huge_free >= bytes + ((size_t) 1 << 30)) madvise(p, bytes, MADV_HUGEPAGE);
     // (the registration faults the pages in, one thread: faulting them from 16 threads first started ~40 s sooner but
     // left fewer huge pages - the CPU lane read its experts 6-8% slower, 2-socket Xeon 6152)
-    if (syscall(SYS_mbind, p, bytes, 3 /* MPOL_INTERLEAVE */, mask, (unsigned long) (sizeof mask * 8), 0u) != 0 ||
-        cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+    // fault in before registering: cudaHostRegister holds the driver lock, stalling other parts' copies
+    if (syscall(SYS_mbind, p, bytes, 3 /* MPOL_INTERLEAVE */, mask, (unsigned long) (sizeof mask * 8), 0u) != 0) {
+        munmap(p, bytes);
+        return nullptr;
+    }
+    for (size_t o = 0; o < bytes; o += 4096) ((volatile char*) p)[o] = 0;
+    if (cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
         cudaGetLastError();
         munmap(p, bytes);
         return nullptr;
@@ -768,6 +773,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             for (int i = 0; i < 8; ++i) sp[i] = (unsigned long long) (F->scratch + (size_t) i * sstride);
             cudaMemcpy(F->md.scratch, sp, sizeof sp, cudaMemcpyHostToDevice);
         }
+        // a parallel split load: the parts pin their prompt paths, size their pools and plan their RAM tiers one at a
+        // time, in part order - the first part's RAM measurement then sees none of the later parts' prompt staging, as
+        // when they load one after another (it took that staging twice: once pinned, once in the headroom)
+        if (split_load_ != nullptr) split_load_->wait(part_);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
         size_t free_b = 0, total_b = 0;
@@ -1071,10 +1080,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         // controllers, ~60 instead of ~92 GB/s).  Pages some process still maps stay.  STRATA_GLM_DROP_CACHE=0 keeps it.
 #ifdef __linux__   // (numa_nodes() is empty elsewhere; posix_fadvise is POSIX)
         {
-            static bool dropped = false;
+            static std::atomic<bool> dropped{false};
             const char* dc = getenv("STRATA_GLM_DROP_CACHE");
-            if (!dropped && (dc == nullptr || std::atoi(dc) != 0) && numa_nodes().size() >= 2) {
-                dropped = true;
+            if ((dc == nullptr || std::atoi(dc) != 0) && numa_nodes().size() >= 2 && !dropped.exchange(true)) {
                 for (const Shard& sh : pack_shards_)
                     if (sh.fd >= 0) posix_fadvise(sh.fd, 0, 0, POSIX_FADV_DONTNEED);
             }
@@ -1126,6 +1134,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the headroom free.
         static int64_t total = -1, remaining = -1;
         static int remaining_layers = 0;
+        static int64_t unpinned = 0;   // a parallel load: the earlier parts' planned tiers, none pinned yet
         const auto pinned_pf = prefill_pinned();
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
@@ -1175,25 +1184,45 @@ bool Glm5Model::fast_setup(std::string& err) {
             budget = l1_ >= g.n_layers ? remaining
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
-            // a later part: no more than is free now, less what is still to come and half the headroom
+            // a later part: no more than is free now, less what is still to come and half the headroom (a parallel
+            // load: and less the earlier parts' tiers, planned but not pinned yet)
             if (part_ > 0 && !fixed_ram) {
                 const int64_t now = avail_ram_now();
-                if (now > 0) budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - head_b / 2 - unseen_pf));
+                if (now > 0)
+                    budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - unpinned - head_b / 2 - unseen_pf));
             }
         }
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
+        std::vector<int64_t> cls_n(cls_stride.size(), 0), cls_cap(cls_stride.size(), 0);
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
-            auto& R = F->rc[c];
-            R.stride = cls_stride[c];
-            int64_t n = (int64_t) ((double) budget * cls_weight[c] / wsum / (double) R.stride);
+            int64_t n = (int64_t) ((double) budget * cls_weight[c] / wsum / (double) cls_stride[c]);
             n = std::max<int64_t>(n, 16);   // a floor so a miss always has somewhere to land
             // never more than the experts of the class that the VRAM pool does not hold, plus the free slots
             // fast_boundary keeps per class for disk reads and reads ahead.  When the pool holds every expert (a big
             // card: 288 of 288 slots a layer, or a split across many GPUs) that is a few spares' worth - below the floor
             // for a class of one layer (the NextN block), which then never allocated and stopped the start ("did not
             // allocate")
-            const int64_t cap = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) R.stride)) + 16;
-            n = std::min<int64_t>(n, cap);
+            cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
+            cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
+        }
+        // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
+        // have planned (a later part's measurement then sees no tier half pinned), all of them at once
+        if (split_load_ != nullptr) {
+            int64_t planned = 0;
+            for (size_t c = 0; c < cls_n.size(); ++c) planned += cls_n[c] * (int64_t) cls_stride[c];
+            if (!staging_only && ram_budget_ < 0 && remaining >= 0) {
+                remaining = std::max<int64_t>(0, remaining - planned);
+                remaining_layers -= n_moe;
+            }
+            unpinned += planned;
+            split_load_->pass(part_);
+            split_load_->wait(n_parts_);
+        }
+        for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
+            auto& R = F->rc[c];
+            R.stride = cls_stride[c];
+            int64_t n = cls_n[c];
+            const int64_t cap = cls_cap[c];
             const int64_t least = std::min<int64_t>(16, cap);   // the floor, or the whole cap when that is smaller
             void* p = nullptr;
             while (n >= least) {
@@ -1224,12 +1253,15 @@ bool Glm5Model::fast_setup(std::string& err) {
             R.tick.assign((size_t) n, 0);
             F->ram_bytes += (size_t) n * R.stride;
         }
-        if (!staging_only && ram_budget_ < 0 && remaining >= 0) {
+        if (split_load_ == nullptr && !staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
             remaining_layers -= n_moe;
         }
-        // pinned memory cannot be swapped out: say so when what is left free is short of the headroom
-        if (!staging_only && !fixed_ram && ram_budget_ < 0) {
+        // pinned memory cannot be swapped out: say so when what is left free is short of the headroom (a parallel
+        // load: once every part has pinned, ram_left_check)
+        if (!staging_only && !fixed_ram && ram_budget_ < 0 && split_load_ != nullptr) {
+            F->ram_check_head = head_b;
+        } else if (!staging_only && !fixed_ram && ram_budget_ < 0) {
             const int64_t left = avail_ram_now();
             if (left > 0 && left - unseen_pf < head_b / 2)
                 std::fprintf(stderr, "glm fast: WARNING - CUDA%d: %.1f GB of RAM free after its RAM tier, and the prompt "
@@ -1309,10 +1341,34 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm fast: CUDA%d RAM-resident verified: all %d experts are in VRAM or pinned RAM\n",
                          dev_, total);
         }
-        if (!fast_cpu_lane_setup(err)) return false;
-        F->svc = std::thread([this] { fast_service(); });
-        glmfast::pin_thread(F->svc.native_handle(), F->cpu_pin);   // (the CPU lane's last worker: on its pool's node)
+        F->lane_pending = true;
+        if (!defer_lane_ && !fast_setup_finish(err)) return false;
     }
+    return true;
+}
+
+// A parallel split load checks the free RAM once every part has pinned its tier (a part's own check would see the
+// others half pinned)
+void Glm5Model::ram_left_check() const {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        if (F == nullptr || F->ram_check_head <= 0) continue;
+        const int64_t left = avail_ram_now();
+        if (left > 0 && left < F->ram_check_head / 2)
+            std::fprintf(stderr, "glm fast: WARNING - %.1f GB of RAM free after the split's RAM tiers: if the system "
+                                 "swaps or stalls, set STRATA_GLM_RAM_GB lower\n", (double) left / 1073741824.0);
+        return;
+    }
+}
+
+bool Glm5Model::fast_setup_finish(std::string& err) {
+    FastState* F = fast_;
+    if (F == nullptr || !F->lane_pending) return true;
+    F->lane_pending = false;
+    cudaSetDevice(dev_);
+    if (!fast_cpu_lane_setup(err)) return false;
+    F->svc = std::thread([this] { fast_service(); });
+    glmfast::pin_thread(F->svc.native_handle(), F->cpu_pin);   // (the CPU lane's last worker: on its pool's node)
     return true;
 }
 
