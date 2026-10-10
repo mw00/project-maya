@@ -4,6 +4,38 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.0.32 - 2026-10-11
+
+A new model to download, Maya-M-Derisked. A split's GPUs now load at once, a split of three or more GPUs no longer
+pins more RAM than the PC has, the Ryzen AI Max APUs decode faster, and the setup takes a first shard that holds
+metadata only.
+
+- **Maya-M-Derisked** (#97): Maya-M with a directional weight modification by Blackfrost_AI that reduces blanket
+  refusals. It is not a new quant: the same IQ2_S files, tensors, MTP draft block and size as Maya-M (116 GB), with
+  some of its weights changed. It is experimental, and it has a repo of its own on Hugging Face. `./setup.sh --setup
+  --model Maya-M-Derisked` (Windows: `START-MAYA.bat --setup --model Maya-M-Derisked`); the setup's model menu offers
+  it too. It reads pictures with Maya's vision files, like the other models.
+- **A split's GPUs load at once** (#80 by @ksanislo): a thread per GPU instead of one GPU after another. On 4x Tesla T4
+  with Maya-L, start to the first token went from 142 to 96 s. The GPUs plan their RAM tiers in turn, in GPU order, so
+  each gets the same tier as before; then they pin and warm them at the same time. `STRATA_GLM_PARALLEL_LOAD=0` keeps
+  the old order.
+- **The CPU lane's timing, kept across starts** (#81 by @ksanislo): with `STRATA_GLM_CPU_CAL=<file>`, the CPU lane's
+  timing at start (~1.7 s a GPU) is written once and read by later starts. A new build, another card or thread count
+  times again, and a timing that decode finds off is dropped. Unset, nothing changes.
+- **Three GPUs or more on Linux no longer freeze the desktop at start** (#85, issue #77): the later GPUs' prompt buffers
+  are now set aside when the RAM tier is sized, each later GPU measures the free RAM again, and a warning says when
+  what is left is short. A pinned split's CPU lane runs a thread a physical core.
+- **Faster decode on Ryzen AI Max APUs** (#95, from the Gorgon Halo work): the decode's dense projections run in one
+  RDNA3 kernel that keeps two blocks' loads in flight, bit for bit the original kernels' results. Radeon 8065S with
+  Maya-S: decode +3.1%. On by default on gfx115x; `STRATA_GLM_MV_RDNA=1` on other gfx11 cards, `0` = off.
+- **The setup accepts a first shard of metadata only** (#85, issue #83): a GGUF whose first shard holds only the
+  tokenizer and settings (as unsloth's do) stopped the setup as incomplete.
+- **For cache studies** (by @sociolog):
+  - `STRATA_GLM_VRAM_EVICT=lru` refills a layer's spares by evicting its least recently used expert (#78);
+  - `STRATA_GLM_ROUTE_LOG` writes each route's 16 near misses (#90);
+  - `tools/glm_tier_replay.py` replays a route log through a model of the VRAM tier's rules and alternatives (#91).
+- The README has rows for the new settings.
+
 ## v1.0.31 - 2026-10-10
 
 The expert prefetch can now pay on a RAM-bound split: three settings choose when its copy starts, how many GPU blocks it
