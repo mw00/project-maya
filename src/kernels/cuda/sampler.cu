@@ -216,43 +216,173 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     int k = (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX;
     if (k > n_vocab) k = n_vocab;
 
-    // ---- top_k: k rounds of a block argmax over the not-yet-taken.  `sel_*` holds the kept ids and their
-    // raw logits in selection order: descending by value, ties to the lower index, which is the order the
-    // top_p cut below is defined over.
+    // ---- top_k: an exact RADIX SELECT, then a rank sort of the k survivors.  The order is the serial one:
+    // descending by (penalised) logit, ties to the lower index - i.e. descending by the composite key
+    // (ordered(score) << 32) | ~index, which is distinct for every token.  So: find the k-th largest ordered score
+    // T byte by byte (4 histogram passes over the vocabulary), keep every token above T and the lowest-indexed
+    // ones equal to T, then rank the k of them by the composite key.  The k block-argmax rounds this replaces
+    // re-scanned the taken list for every token in every round: 1.5 ms a sample at top_k 20 and 11 ms at 64 on an
+    // RTX 4090 (the tail card's critical path in every sampled decode step).
+    // THE COMMON CASE takes two passes: a coarse histogram of the top 11 bits finds the bin that holds the k-th
+    // largest; every token in that bin or above (at most kCap) is copied to shared memory and ranked there by the
+    // composite key.  A flat distribution with more than kCap tokens there takes the full radix select below.
     __shared__ int sel_ids[KMAX];
     __shared__ float sel_logit[KMAX];
-    __shared__ float sv[32];
-    __shared__ int si[32];
-    for (int i = 0; i < k; ++i) {
-        // `n_vocab` is the "no candidate" index: it loses every comparison to a real one (same convention as
-        // the greedy kernel, whose tie rule this reduction shares).
-        float bv = __int_as_float(0xff800000);   // -inf
-        int best = n_vocab;
-        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
-            bool taken = false;
-            for (int j = 0; j < i; ++j) if (sel_ids[j] == v) { taken = true; break; }
-            if (taken) continue;
-            const float s = apply_penalties(l[v], hit_count(v), p);
-            if (s > bv) { bv = s; best = v; }
-        }
-        for (int off = 16; off > 0; off >>= 1) {
-            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
-            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
-            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
-        }
-        const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
-        if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+    __shared__ unsigned int sh_prefix, sh_remaining, sh_ncand, sh_tie_base;
+    // ONE shared pool, its parts reused phase by phase: the penalty bitmap (dynamic shared memory, 31 KB at a Qwen
+    // vocabulary) must still fit beside it under the 48 KB a launch gets without opting in.
+    //   [0, 2048)     the coarse histogram, then (once its bin is known) the candidates' scores and ids;
+    //                 in the fallback, the byte histogram and the k candidates
+    //   [2048, 3072)  the block scan
+    constexpr int kBins = 2048, kCap = 1024;   // the coarse histogram: the ordered score's top 11 bits
+    __shared__ unsigned int pool[kBins + 1024];
+    unsigned int* coarse = pool;
+    unsigned int* ccand_u = pool;
+    int* ccand_i = (int*) pool + kCap;
+    unsigned int* hist = pool;
+    unsigned int* cand_u = pool + 256;
+    int* cand_i = (int*) pool + 256 + KMAX;
+    unsigned int* scan = pool + kBins;
+    __shared__ int sh_bin;
+    __shared__ unsigned int sh_ncoarse;
+    // a score's ordered bits: larger float -> larger unsigned; NaN below everything (never kept before a number)
+    auto ordered = [](float x) -> unsigned int {
+        unsigned int b = __float_as_uint(x);
+        if ((b & 0x7fffffffu) > 0x7f800000u) return 0u;
+        if (b == 0x80000000u) b = 0u;   // -0 ties with +0, as the float comparison it replaces
+        return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    };
+    auto score = [&](int v) -> float { return apply_penalties(l[v], hit_count(v), p); };
+    for (int b = threadIdx.x; b < kBins; b += blockDim.x) coarse[b] = 0u;
+    if (threadIdx.x == 0) sh_ncoarse = 0u;
+    __syncthreads();
+    for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) atomicAdd(&coarse[ordered(score(v)) >> 21], 1u);
+    __syncthreads();
+    {   // the bin holding the k-th largest: suffix counts over the bins (2 bins a thread, a block scan)
+        const int nt = (int) blockDim.x, per = (kBins + nt - 1) / nt;
+        const int b_hi = kBins - 1 - (int) threadIdx.x * per;   // this thread's bins, from the top down
+        unsigned int mine = 0u;
+        for (int j = 0; j < per && b_hi - j >= 0; ++j) mine += coarse[b_hi - j];
+        scan[threadIdx.x] = mine;
         __syncthreads();
-        if (warp == 0) {
-            const int nw = (int) ((blockDim.x + 31) >> 5);
-            float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
-            int wi = lane < nw ? si[lane] : n_vocab;
-            for (int off = 16; off > 0; off >>= 1) {
-                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
-                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
-                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+        for (int off = 1; off < nt; off <<= 1) {
+            const unsigned int add = (int) threadIdx.x >= off ? scan[threadIdx.x - off] : 0u;
+            __syncthreads();
+            scan[threadIdx.x] += add;
+            __syncthreads();
+        }
+        unsigned int above = scan[threadIdx.x] - mine;   // tokens in the bins above this thread's
+        if (above < (unsigned int) k && above + mine >= (unsigned int) k) {
+            for (int j = 0; j < per && b_hi - j >= 0; ++j) {
+                above += coarse[b_hi - j];
+                if (above >= (unsigned int) k) { sh_bin = b_hi - j; sh_tie_base = above; break; }
             }
-            if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
+        }
+        __syncthreads();
+    }
+    const int bin = sh_bin;
+    const bool coarse_ok = sh_tie_base <= (unsigned int) kCap;   // the tokens in that bin and above fit
+    if (coarse_ok) {
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            const unsigned int u = ordered(score(v));
+            if ((int) (u >> 21) >= bin) {
+                const unsigned int at = atomicAdd(&sh_ncoarse, 1u);
+                if (at < (unsigned int) kCap) { ccand_u[at] = u; ccand_i[at] = v; }
+            }
+        }
+        __syncthreads();
+        const int nc = (int) min(sh_ncoarse, (unsigned int) kCap);
+        for (int i = threadIdx.x; i < nc; i += blockDim.x) {
+            const unsigned int ui = ccand_u[i];
+            const int ii = ccand_i[i];
+            int r = 0;
+            for (int j = 0; j < nc && r < k; ++j) {
+                const unsigned int uj = ccand_u[j];
+                r += uj > ui || (uj == ui && ccand_i[j] < ii);
+            }
+            if (r < k) {
+                sel_ids[r] = ii;
+                sel_logit[r] = score(ii);
+            }
+        }
+        __syncthreads();
+    } else {
+        if (threadIdx.x == 0) {
+            sh_prefix = 0u;
+            sh_remaining = (unsigned int) k;
+            sh_ncand = 0u;
+        }
+        unsigned int mask = 0u;
+        for (int pass = 0; pass < 4; ++pass) {
+            const int shift = 24 - 8 * pass;
+            for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0u;
+            __syncthreads();
+            const unsigned int prefix = sh_prefix;
+            for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+                const unsigned int u = ordered(score(v));
+                if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255u], 1u);
+            }
+            __syncthreads();
+            if (threadIdx.x == 0) {   // the digit that holds the remaining-th largest, from the top
+                unsigned int cum = 0u, rem = sh_remaining;
+                int d = 255;
+                for (; d > 0; --d) {
+                    if (cum + hist[d] >= rem) break;
+                    cum += hist[d];
+                }
+                sh_remaining = rem - cum;
+                sh_prefix = prefix | ((unsigned int) d << shift);
+            }
+            mask |= 255u << shift;
+            __syncthreads();
+        }
+        const unsigned int T = sh_prefix;      // the k-th largest ordered score
+        const unsigned int need = sh_remaining; // how many tokens equal to T are kept (the lowest-indexed ones)
+        // every token above T (fewer than k of them)
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            const unsigned int u = ordered(score(v));
+            if (u > T) {
+                const unsigned int at = atomicAdd(&sh_ncand, 1u);
+                if (at < (unsigned int) KMAX) { cand_u[at] = u; cand_i[at] = v; }
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) sh_tie_base = sh_ncand;
+        // the ties in index order: each thread counts its own contiguous range, an exclusive scan orders the ranges
+        {
+            const int nt = (int) blockDim.x;
+            const int chunk = (n_vocab + nt - 1) / nt;
+            const int lo = (int) threadIdx.x * chunk, hi = min(n_vocab, lo + chunk);
+            unsigned int mine = 0u;
+            for (int v = lo; v < hi; ++v) mine += ordered(score(v)) == T;
+            scan[threadIdx.x] = mine;
+            __syncthreads();
+            for (int off = 1; off < nt; off <<= 1) {   // Hillis-Steele inclusive scan
+                const unsigned int add = (int) threadIdx.x >= off ? scan[threadIdx.x - off] : 0u;
+                __syncthreads();
+                scan[threadIdx.x] += add;
+                __syncthreads();
+            }
+            unsigned int rank = scan[threadIdx.x] - mine;   // ties before this range
+            for (int v = lo; v < hi && rank < need; ++v)
+                if (ordered(score(v)) == T) {
+                    const unsigned int at = sh_tie_base + rank;
+                    if (at < (unsigned int) KMAX) { cand_u[at] = T; cand_i[at] = v; }
+                    ++rank;
+                }
+        }
+        __syncthreads();
+        // rank sort: candidate i's place is the number of candidates with a larger composite key
+        if ((int) threadIdx.x < k) {
+            const unsigned int ui = cand_u[threadIdx.x];
+            const int ii = cand_i[threadIdx.x];
+            int r = 0;
+            for (int j = 0; j < k; ++j) {
+                const unsigned int uj = cand_u[j];
+                r += uj > ui || (uj == ui && cand_i[j] < ii);
+            }
+            sel_ids[r] = ii;
+            sel_logit[r] = score(ii);
         }
         __syncthreads();
     }
@@ -261,6 +391,9 @@ __global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, in
     // then temperature and one Philox draw - llama.cpp's order (issue #53).  Every thread computes the same chain
     // redundantly over `sel_*` - the arithmetic is the serial kernel's, instruction for instruction - so they
     // agree on `pick` and thread 0 writes it.
+    // (one thread: the chain is serial and in double precision, which consumer cards run at 1/64 rate - 1024
+    // threads computing it redundantly cost more than the whole selection above)
+    if (threadIdx.x != 0) return;
     int n_keep = k;
     float mx = sel_logit[0];
     for (int i = 1; i < k; ++i) mx = fmaxf(mx, sel_logit[i]);
