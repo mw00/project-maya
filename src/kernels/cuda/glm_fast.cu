@@ -1007,6 +1007,123 @@ __global__ void __launch_bounds__(256) mv_kernel_t(const __grid_constant__ MvBat
     if (lane == 0) J.y[row] = J.alpha * s + (J.bias ? J.bias[row] : 0.0f);
 }
 
+// ---------------------------------------------------------------- multi-row GEMV (a verify window's rows)
+// A warp's output row against NT activations: the weight's bytes come in once, and each activation's dot is the exact
+// sequence of row_dot / row_dot_bf16 / row_dot_f32 (the same calls, the same lane order, then warp_sum).  NT is a
+// template argument: the accumulators stay in registers (a runtime count indexed them into local memory).
+template<int T, int NT>
+__device__ __forceinline__ void rows_dot_q(const uint8_t* row, const block_q8_1* x, int n_in, int lane, float (&s)[NT]) {
+    using Fm = F<T>;
+    const int nb = n_in / Fm::qk;
+    const int xs = n_in / 32;   // q8_1 blocks per activation row
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+    for (int k = lane; k < nb * Fm::ipb; k += 32) {
+        const int kbx = k / Fm::ipb, iqs = Fm::step * (k % Fm::ipb);
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[t] += Fm::dot(row, x + (size_t) t * xs + kbx * (Fm::qk / 32), kbx, iqs);
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) s[t] = warp_sum(acc[t]);
+}
+template<int NT>
+__device__ __forceinline__ void rows_dot_f32(const float* row, const float* x, int n_in, int lane, float (&s)[NT]) {
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+    const float4* r4 = (const float4*) row;
+    for (int k = lane; k < n_in / 4; k += 32) {
+        const float4 a = r4[k];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4 b = ((const float4*) (x + (size_t) t * n_in))[k];
+            acc[t] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) s[t] = warp_sum(acc[t]);
+}
+template<int NT>
+__device__ __forceinline__ void rows_dot_bf16(const uint16_t* row, const float* x, int n_in, int lane, float (&s)[NT]) {
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+    const uint4* r8 = (const uint4*) row;
+    for (int k = lane; k < n_in / 8; k += 32) {
+        const uint4 w = r8[k];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4* x4 = (const float4*) (x + (size_t) t * n_in);
+            const float4 a = x4[2 * k], b = x4[2 * k + 1];
+            acc[t] += __uint_as_float(w.x << 16) * a.x + __uint_as_float(w.x & 0xffff0000u) * a.y +
+                      __uint_as_float(w.y << 16) * a.z + __uint_as_float(w.y & 0xffff0000u) * a.w +
+                      __uint_as_float(w.z << 16) * b.x + __uint_as_float(w.z & 0xffff0000u) * b.y +
+                      __uint_as_float(w.w << 16) * b.z + __uint_as_float(w.w & 0xffff0000u) * b.w;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) s[t] = warp_sum(acc[t]);
+}
+template<int NT>
+__device__ __forceinline__ void any_rows_dot(int type, const void* w, int row, const void* xq, const float* xf, int n_in,
+                                             int lane, float (&s)[NT]) {
+    switch (type) {
+        case kTypeF32: rows_dot_f32<NT>((const float*) w + (size_t) row * n_in, xf, n_in, lane, s); return;
+        case kTypeBF16: rows_dot_bf16<NT>((const uint16_t*) w + (size_t) row * n_in, xf, n_in, lane, s); return;
+#define GF_RCASE(T) case T: rows_dot_q<T, NT>((const uint8_t*) w + (size_t) row * rbytes<T>(n_in), (const block_q8_1*) xq, n_in, lane, s); return;
+        GF_RCASE(12) GF_RCASE(13) GF_RCASE(14) GF_RCASE(8) GF_RCASE(16) GF_RCASE(18) GF_RCASE(19) GF_RCASE(23)
+        GF_RCASE(10) GF_RCASE(11) GF_RCASE(17) GF_RCASE(22) GF_RCASE(21) GF_RCASE(29)
+#undef GF_RCASE
+        default:
+#pragma unroll
+            for (int t = 0; t < NT; ++t) s[t] = 0.0f;
+            return;
+    }
+}
+struct MvRowsBatch {
+    MvJob j[kMaxMvJobs];
+    int blk_end[kMaxMvJobs];
+    int n;
+};
+// TY < 0: the generic kernel (a switch over the types); else compiled for that type alone (kTypeBF16 included)
+template<int TY, int NT>
+__global__ void __launch_bounds__(256) mv_rows_kernel(const __grid_constant__ MvRowsBatch b) {
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int row = (bid - blk0) * MV_ROWS + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= J.n_out) return;
+    float s[NT];
+    if constexpr (TY < 0)
+        any_rows_dot<NT>(J.type, J.w, row, J.xq, J.xf, J.n_in, lane, s);
+    else if constexpr (TY == kTypeBF16)
+        rows_dot_bf16<NT>((const uint16_t*) J.w + (size_t) row * J.n_in, J.xf, J.n_in, lane, s);
+    else
+        rows_dot_q<TY, NT>((const uint8_t*) J.w + (size_t) row * rbytes<TY>(J.n_in), (const block_q8_1*) J.xq, J.n_in,
+                           lane, s);
+    if (lane == 0) {
+        const float bias = J.bias ? J.bias[row] : 0.0f;
+#pragma unroll
+        for (int t = 0; t < NT; ++t) J.y[(size_t) t * J.n_out + row] = J.alpha * s[t] + bias;
+    }
+}
+template<int TY>
+void mv_rows_launch(const MvRowsBatch& b, int blocks, int nt, cudaStream_t s) {
+    switch (nt) {
+        case 2: mv_rows_kernel<TY, 2><<<blocks, 256, 0, s>>>(b); break;
+        case 3: mv_rows_kernel<TY, 3><<<blocks, 256, 0, s>>>(b); break;
+        case 4: mv_rows_kernel<TY, 4><<<blocks, 256, 0, s>>>(b); break;
+        case 5: mv_rows_kernel<TY, 5><<<blocks, 256, 0, s>>>(b); break;
+        case 6: mv_rows_kernel<TY, 6><<<blocks, 256, 0, s>>>(b); break;
+        case 7: mv_rows_kernel<TY, 7><<<blocks, 256, 0, s>>>(b); break;
+        default: mv_rows_kernel<TY, 8><<<blocks, 256, 0, s>>>(b); break;
+    }
+}
+
 __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n % 32 == 0: whole warps only
@@ -1260,7 +1377,8 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const __grid_constant__
 // (8 bf16 per lane per stream segment, uint4) BEFORE it computes its R values, the partial sums are reduced by whole
 // warps (lane = block) instead of one thread walking 32 of them, and the second barrier's total likewise.
 // 32 blocks of 128 embedding values; n_embd == 4096 only.
-__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__ HcArgs a) {
+// (the body takes its arguments by reference: hc3_kernel passes its own, hc3_rows_kernel a row's)
+__device__ __forceinline__ void hc3_body(const HcArgs& a) {
     const int hc = 4;
     const int n_embd = a.n_embd;
     const unsigned int nb = gridDim.x;   // 32
@@ -1379,6 +1497,32 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__
         q8_1_store_warp(xv, (block_q8_1*) a.xq + e / 32, lane);
     }
 }
+__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const __grid_constant__ HcArgs a) { hc3_body(a); }
+// the same for the rows of a verify window, one row per blockIdx.y (each row's barriers on its own counter): row t's
+// arguments are row 0's moved by the strides below - its arithmetic is hc3_kernel's for that row alone
+struct HcRows {
+    HcArgs a;      // row 0
+    int ld_R;      // floats between the rows' R_old (and R_new)
+    int ld_part;   // floats between the rows' scratch
+};
+__global__ void __launch_bounds__(HC_THREADS) hc3_rows_kernel(const __grid_constant__ HcRows r) {
+    const int t = blockIdx.y;
+    HcArgs a = r.a;
+    const int E = a.n_embd;
+    if (a.block_out != nullptr) a.block_out += (size_t) t * E;
+    a.R_old += (size_t) t * r.ld_R;
+    a.R_new += (size_t) t * r.ld_R;
+    a.post_in += (size_t) t * 8;
+    a.comb_in += (size_t) t * 16;
+    a.pre += (size_t) t * 8;
+    a.post += (size_t) t * 8;
+    a.comb += (size_t) t * 16;
+    a.x += (size_t) t * E;
+    a.xq = (block_q8_1*) a.xq + (size_t) t * (E / 32);
+    a.part += (size_t) t * r.ld_part;
+    a.counter += (size_t) t * 16;   // a 64-byte line each
+    hc3_body(a);
+}
 
 __global__ void hc_post_kernel(const float* __restrict__ block_out, const float* __restrict__ R_old,
                                const float* __restrict__ post, const float* __restrict__ comb, int n_embd,
@@ -1430,15 +1574,17 @@ __global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ K
     if (role < 3) {
         const int c = h * hd + tid;
         const int hist = a.d_conv - 1;
-        float* st = a.conv_state + (size_t) role * d_inner * hist + (size_t) hist * c;
+        const size_t at = (size_t) role * d_inner * hist + (size_t) hist * c;
+        float* st = a.conv_state + at;
+        float* so = (a.conv_state_out != nullptr ? a.conv_state_out : a.conv_state) + at;
         const float* w = a.conv_w[role] + (size_t) a.d_conv * c;
         const float xp = a.proj[role][c];
         float acc = 0.0f;
         for (int tap = 0; tap < hist; ++tap) acc += w[tap] * st[tap];
         acc += w[hist] * xp;
         float y = acc / (1.0f + __expf(-acc));
-        for (int j = 0; j + 1 < hist; ++j) st[j] = st[j + 1];
-        st[hist - 1] = xp;
+        for (int j = 0; j + 1 < hist; ++j) so[j] = st[j + 1];
+        so[hist - 1] = xp;
         if (role < 2) {
             const float ss = block_sum(y * y, sred);
             y = y * rsqrtf(ss + 1e-6f);
@@ -1467,6 +1613,62 @@ __global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ K
                 a.g1[c] = a.lower_bound * dsigmoid(-v * a.ssm_a[h]);
             } else {
                 a.g2[c] = acc;
+            }
+        }
+    }
+}
+
+// kda_prep_kernel for T rows at once (blockIdx.z = row): row t's conv taps read the inputs before it - the live history
+// for the times before the window, the earlier rows' projections after - in the order the one-row kernel reads its
+// history, so each row's values are that kernel's; each row's history after it goes to conv_state_out + t * (its size).
+// Row t's arguments: proj / out / g1 / g2 + t * d_inner, fa / ga + t * head_dim.
+__global__ void __launch_bounds__(128) kda_prep_rows_kernel(const __grid_constant__ KdaPrepArgs a) {
+    const int h = blockIdx.x, role = blockIdx.y, r = blockIdx.z, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int hd = a.head_dim;
+    const int d_inner = a.n_head * hd;
+    __shared__ float sred[32];
+    __shared__ float sv[128];
+    if (role < 3) {
+        const int c = h * hd + tid;
+        const int hist = a.d_conv - 1;
+        const size_t at = (size_t) role * d_inner * hist + (size_t) hist * c;
+        const float* st = a.conv_state + at;
+        float* so = a.conv_state_out + (size_t) r * 3 * d_inner * hist + at;
+        const float* w = a.conv_w[role] + (size_t) a.d_conv * c;
+        const float* pr = a.proj[role] + c;   // row 0's input of this channel; row j's at + j * d_inner
+        const auto in = [&](int tau) { return tau < 0 ? st[hist + tau] : pr[(size_t) tau * d_inner]; };
+        const float xp = in(r);
+        float acc = 0.0f;
+        for (int tap = 0; tap < hist; ++tap) acc += w[tap] * in(r - hist + tap);
+        acc += w[hist] * xp;
+        float y = acc / (1.0f + __expf(-acc));
+        for (int j = 0; j < hist; ++j) so[j] = in(r - hist + 1 + j);
+        if (role < 2) {
+            const float ss = block_sum(y * y, sred);
+            y = y * rsqrtf(ss + 1e-6f);
+        }
+        a.out[role][(size_t) r * d_inner + c] = y;
+        return;
+    }
+    const bool is_g1 = role < 7;
+    const int quarter = (role - 3) & 3;
+    const float* in = (is_g1 ? a.fa : a.ga) + (size_t) r * hd;
+    const uint16_t* W = is_g1 ? a.f_b : a.g_b;
+    sv[tid] = in[tid];
+    __syncthreads();
+    const int rbase = quarter * (hd / 4) + warp * (hd / 16);
+    for (int rr = rbase; rr < rbase + hd / 16; ++rr) {
+        const int c = h * hd + rr;
+        const uint16_t* wr = W + (size_t) c * hd;
+        float acc = 0.0f;
+        for (int j = lane; j < hd; j += 32) acc += bf(wr[j]) * sv[j];
+        acc = warp_sum(acc);
+        if (lane == 0) {
+            if (is_g1) {
+                const float v = acc + a.dt_bias[c];
+                a.g1[(size_t) r * d_inner + c] = a.lower_bound * dsigmoid(-v * a.ssm_a[h]);
+            } else {
+                a.g2[(size_t) r * d_inner + c] = acc;
             }
         }
     }
@@ -1526,6 +1728,75 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
     }
 }
 
+// kda_rec_kernel over T rows, the head's state in registers between them (each row's arithmetic is that kernel's, the
+// state's round trip through memory exact): advance == 0 writes the rows' outputs and leaves the state as it was,
+// advance == 1 writes the state after the rows and no outputs
+__global__ void __launch_bounds__(256) kda_rec_rows_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                                           const float* __restrict__ v, const float* __restrict__ g1,
+                                                           const float* __restrict__ beta_raw, float* __restrict__ state,
+                                                           const float* __restrict__ g2,
+                                                           const float* __restrict__ norm_w, float eps, int n_head,
+                                                           int T, int advance, block_q8_1* __restrict__ out) {
+    constexpr int HD = 128;
+    const int h = blockIdx.x, t = threadIdx.x, j = t & (HD - 1), half = t >> 7, lane = t & 31;
+    const int DI = n_head * HD;
+    __shared__ float sq[HD], sk[HD], sdec[HD], sdel[HD];
+    __shared__ float sacc[2][HD];
+    __shared__ float sred[32];
+    float* Sh = state + (size_t) h * HD * HD;
+    float reg[64];
+#pragma unroll
+    for (int ii = 0; ii < 64; ++ii) reg[ii] = Sh[(half * 64 + ii) * HD + j];
+    for (int r = 0; r < T; ++r) {
+        const size_t ro = (size_t) r * DI + (size_t) h * HD;
+        __syncthreads();   // the last row's readers of the shared rows are done
+        if (t < HD) {
+            if (!advance) sq[t] = q[ro + t];
+            sk[t] = k[ro + t];
+            sdec[t] = __expf(g1[ro + t]);
+        }
+        const float b = 1.0f / (1.0f + expf(-beta_raw[(size_t) r * n_head + h]));
+        __syncthreads();
+        float A = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 64; ++ii) {
+            const int i = half * 64 + ii;
+            const float s = reg[ii] * sdec[i];
+            reg[ii] = s;
+            A += s * sk[i];
+        }
+        sacc[half][j] = A;
+        __syncthreads();
+        if (half == 0) sdel[j] = b * (v[ro + j] - (sacc[0][j] + sacc[1][j]));
+        __syncthreads();
+        const float dl = sdel[j];
+        float O = 0.0f;
+#pragma unroll
+        for (int ii = 0; ii < 64; ++ii) {
+            const int i = half * 64 + ii;
+            const float s2 = reg[ii] + sk[i] * dl;
+            reg[ii] = s2;
+            O += s2 * sq[i];
+        }
+        if (advance) continue;
+        __syncthreads();
+        sacc[half][j] = O;
+        __syncthreads();
+        const float o = (sacc[0][j] + sacc[1][j]) * rsqrtf((float) HD);
+        float ss = half == 0 ? o * o : 0.0f;
+        ss = block_sum(ss, sred);
+        const float inv = rsqrtf(ss / (float) HD + eps);
+        if (half == 0) {
+            const float gv = o * inv * norm_w[j] * dsigmoid(g2[ro + j]);
+            q8_1_store_warp(gv, out + (size_t) r * (DI / 32) + h * (HD / 32) + (j >> 5), lane);
+        }
+    }
+    if (advance) {
+#pragma unroll
+        for (int ii = 0; ii < 64; ++ii) Sh[(half * 64 + ii) * HD + j] = reg[ii];
+    }
+}
+
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
 __device__ __forceinline__ float lat_f(uint16_t v) { return __half2float(__ushort_as_half(v)); }
 __device__ __forceinline__ uint16_t lat_h(float v) { return __half_as_ushort(__float2half(v)); }
@@ -1554,6 +1825,7 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const __grid_constant__ D
     __shared__ float sred[32];
     const int tid = threadIdx.x, lane = tid & 31;
     if (blockIdx.x == 0) {
+        if (a.qr_raw == nullptr) return;   // the caches only (the NextN block's cache fill)
         // q_a norm -> qr (f32) and qr_q (q8_1); q_lora <= 2048 (stride 512 keeps warps on 32-runs)
         float vals[4];
         float ss = 0.0f;
@@ -2134,8 +2406,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             unsigned long long src = 0ull;
             s_pp[i] = 0ull;
             s_cs[i] = 0ull;
-            if (ptr == 0ull && i >= a.skip_from) {
-                // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
+            if (ptr == 0ull && (i >= a.skip_from || (a.skip_from < 8 && rtab[key] == 0ull))) {
+                // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess) - and a
+                // draft's (skip_from < 8) expert that is only on disk always: a disk read on the draft's path cost
+                // more than the guess gains
             } else if (ptr == 0ull) {
                 src = rtab[key];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
@@ -2995,6 +3269,57 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     return true;
 }
 
+bool mv_rows(const MvJob* jobs, int n, int nt, cudaStream_t s) {
+    if (nt == 1) return mv(jobs, n, s);
+    if (n <= 0 || n > kMaxMvJobs || nt < 1 || nt > kMaxRows) return false;
+    for (int i = 0; i < n; ++i)
+        if (!mv_type_ok(jobs[i].type)) {
+            std::fprintf(stderr, "glm_fast mv_rows: type %d unsupported\n", jobs[i].type);
+            return false;
+        }
+    // as mv(): the common dense types each to a kernel compiled for that type (BF16 too: the window's small
+    // projections), the rest to the generic one
+    static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
+    constexpr int kTyped[] = {14, 8, 12, 13, kTypeBF16};
+    bool done[kMaxMvJobs] = {};
+    if (typed) {
+        for (const int T : kTyped) {
+            MvRowsBatch b{};
+            int acc = 0, m = 0;
+            for (int i = 0; i < n; ++i)
+                if (jobs[i].type == T) {
+                    b.j[m] = jobs[i];
+                    acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
+                    b.blk_end[m++] = acc;
+                    done[i] = true;
+                }
+            if (m == 0) continue;
+            b.n = m;
+            switch (T) {
+                case 14: mv_rows_launch<14>(b, acc, nt, s); break;
+                case 8: mv_rows_launch<8>(b, acc, nt, s); break;
+                case 12: mv_rows_launch<12>(b, acc, nt, s); break;
+                case 13: mv_rows_launch<13>(b, acc, nt, s); break;
+                case kTypeBF16: mv_rows_launch<kTypeBF16>(b, acc, nt, s); break;
+            }
+        }
+    }
+    MvRowsBatch b{};
+    int acc = 0, m = 0;
+    for (int i = 0; i < n; ++i) {
+        if (done[i]) continue;
+        b.j[m] = jobs[i];
+        acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
+        b.blk_end[m++] = acc;
+    }
+    if (m > 0) {
+        b.n = m;
+        mv_rows_launch<-1>(b, acc, nt, s);
+    }
+    launch_check("mv_rows");
+    return true;
+}
+
 void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
     quantize_kernel<<<(n + 255) / 256, 256, 0, s>>>(x, (block_q8_1*) xq, n);
     launch_check("quantize");
@@ -3029,6 +3354,27 @@ void hc(const HcArgs& a, cudaStream_t s) {
     launch_check("hc");
 }
 
+bool hc_rows(const HcArgs& a, int T, int ld_R, int ld_part, cudaStream_t s) {
+    // only where hc() runs hc3 (the same arithmetic) and every row's blocks fit on the device at once (each spins in
+    // its barriers); else the caller runs hc() row by row
+    static int room = -1;
+    if (room < 0) {
+        int dev = 0, sms = 0, per = 0, per3 = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
+        cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
+        const bool mode3 = getenv("STRATA_GLM_HC1") == nullptr && getenv("STRATA_GLM_HC2") == nullptr &&
+                           per * sms >= 4096 / HC2_EB && per3 * sms >= 4096 / HC2_EB;
+        room = mode3 && getenv("STRATA_GLM_HC_ROWS1") == nullptr ? per3 * sms : 0;
+    }
+    if (a.n_embd != 4096 || T < 1 || room < T * (a.n_embd / HC2_EB)) return false;
+    const HcRows r{a, ld_R, ld_part};
+    hc3_rows_kernel<<<dim3(a.n_embd / HC2_EB, T), HC_THREADS, 0, s>>>(r);
+    launch_check("hc3_rows");
+    return true;
+}
+
 void hc_post(const float* block_out, const float* R_old, const float* post, const float* comb, int n_embd,
              float* R_new, cudaStream_t s) {
     hc_post_kernel<<<(4 * n_embd + 255) / 256, 256, 0, s>>>(block_out, R_old, post, comb, n_embd, R_new);
@@ -3060,6 +3406,25 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
     kda_rec_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head,
                                           (block_q8_1*) out_q8_1);
     launch_check("kda_rec");
+}
+
+void kda_prep_rows(const KdaPrepArgs& a, int T, cudaStream_t s) {
+    if (T <= 0 || a.conv_state_out == nullptr) return;
+    kda_prep_rows_kernel<<<dim3(a.n_head, 11, T), 128, 0, s>>>(a);
+    launch_check("kda_prep_rows");
+}
+
+void kda_rec_rows(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw, float* state,
+                  const float* g2, const float* norm_w, float eps, int n_head, int head_dim, int T, bool advance,
+                  void* out_q8_1, cudaStream_t s) {
+    if (head_dim != 128) {
+        std::fprintf(stderr, "glm_fast kda_rec_rows: head_dim %d (the kernel is built for 128)\n", head_dim);
+        return;
+    }
+    if (T <= 0) return;
+    kda_rec_rows_kernel<<<n_head, 256, 0, s>>>(q, k, v, g1, beta_raw, state, g2, norm_w, eps, n_head, T,
+                                               advance ? 1 : 0, (block_q8_1*) out_q8_1);
+    launch_check("kda_rec_rows");
 }
 
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
@@ -3438,6 +3803,11 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 void argmax(const float* x, int n, int* out, cudaStream_t s) {
     argmax_kernel<<<1, 1024, 0, s>>>(x, n, out);
     launch_check("argmax");
+}
+
+void argmax_rows(const float* x, int n, int T, int* out, cudaStream_t s) {
+    for (int t = 0; t < T; ++t) argmax_kernel<<<1, 1024, 0, s>>>(x + (size_t) t * n, n, out + t);
+    launch_check("argmax_rows");
 }
 
 }  // namespace strata::kernels::glmf

@@ -716,6 +716,42 @@ bool Glm5Model::fast_setup(std::string& err) {
             return false;
         }
     }
+    // the MTP decode's verify window (every part: the window's rows go through all of them), sized before the expert
+    // pool takes the free memory; without it the decode runs token by token
+    if ((g.nextn > 0 || mtp_il_ >= 0 || getenv("STRATA_GLM_MTP_GGUF") != nullptr) && glm_mtp_decode_wanted()) {
+        // where VRAM holds less than a third of the experts they stream from RAM, a verify row costs its experts in
+        // full and drafting does not pay: the decode runs token by token and the NextN block stays out of the tiers
+        // and the caches (one V100: 18.1 tok/s against 17.1 with the block loaded and 16.7 drafting) - unless
+        // STRATA_GLM_MTP_DRAFT asks for drafts
+        bool use = true;
+        if (getenv("STRATA_GLM_MTP_DRAFT") == nullptr && !F->unified_memory) {
+            size_t free_b = 0, total_b = 0;
+            cudaMemGetInfo(&free_b, &total_b);
+            size_t blob_sum = 0;
+            for (int il = l0_; il < l1_; ++il)
+                if (F->L[(size_t) il].moe) blob_sum += F->L[(size_t) il].blob;
+            const double cover = blob_sum > 0 ? (double) pool_avail(free_b, total_b) / (double) blob_sum /
+                                                    (double) g.n_expert
+                                              : 1.0;
+            use = cover >= 0.35;
+            if (!use)
+                std::fprintf(stderr, "glm mtp: CUDA%d VRAM holds ~%.0f%% of the experts - decoding token by token "
+                                     "(STRATA_GLM_MTP_DRAFT=3 drafts anyway)\n", dev_, 100.0 * cover);
+        }
+        std::string werr;
+        if (use && !mtp_rows_setup(glm_mtp_draft_cap() + 1, werr)) {
+            std::fprintf(stderr, "glm mtp: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
+            use = false;
+        }
+        if (!use && mtp_il_ >= 0) {
+            mtp_il_ = -1;   // the block out of the tiers, the prompt path and the snapshots; its weights freed
+            lt_ = l1_;
+            if (mtp_arena_ != nullptr) {
+                cudaFree(mtp_arena_);
+                mtp_arena_ = nullptr;
+            }
+        }
+    }
 
     // ---- host-mapped routing ring + response, pinned staging for the embedding / hop / token
     void* hp = nullptr;
@@ -924,8 +960,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
                 if (nm > 0) {
                     for (double& x : mean) x /= nm;
+                    // ... for the NextN block in full where the pool holds most of the experts (>= 45%: the machine
+                    // the batched verify pays on, and the block's hits are its drafts' quality - 2x V100 at a quarter
+                    // share: 85.0 -> 71.3% of single drafts kept), else at a quarter: its drafts leave the experts they
+                    // miss out but for the best two, the length settles shorter where the experts stream from RAM,
+                    // and the slots serve the trunk better there (one V100 at the full share: 63 slots fewer for the
+                    // trunk, its hits 77.7 -> 75.4%).  STRATA_GLM_MTP_SLOT_SHARE=<f> sets it.
+                    const char* sv = getenv("STRATA_GLM_MTP_SLOT_SHARE");
+                    const double mtp_share = sv != nullptr ? std::max(0.0, std::atof(sv))
+                                             : per >= (int) (0.45 * g.n_expert) ? 1.0
+                                                                                 : 0.25;
                     for (int il = l0_; il < lt_; ++il)
-                        if (F->L[(size_t) il].moe && share[(size_t) il].empty()) share[(size_t) il] = mean;
+                        if (F->L[(size_t) il].moe && share[(size_t) il].empty()) {
+                            share[(size_t) il] = mean;
+                            if (il == mtp_il_)
+                                for (double& x : share[(size_t) il]) x *= mtp_share;
+                        }
                 }
             }
             bool all = true;
@@ -1972,12 +2022,15 @@ bool Glm5Model::fast_warm(std::string& err) {
         }
         next[(size_t) il] = nv;
     }
-    // the RAM tier, round-robin over the layers so every layer gets its share of a class that cannot hold all
+    // the RAM tier, round-robin over the layers so every layer gets its share of a class that cannot hold all - the
+    // trunk's first, the NextN block's from what they leave (its drafts leave out what is only on disk)
     std::vector<int> rfree(F->rc.size(), 0), rcur(F->rc.size(), 0);
     for (size_t c = 0; c < F->rc.size(); ++c) rfree[c] = F->rc[c].n;
+    for (int pass = 0; pass < 2; ++pass)
     for (bool progress = true; progress;) {
         progress = false;
         for (int il = l0_; il < lt_; ++il) {
+            if ((il == mtp_il_) != (pass == 1)) continue;
             if (!F->L[(size_t) il].moe || next[(size_t) il] >= g.n_expert) continue;
             const int c = F->layer_rc[(size_t) il];
             auto& R = F->rc[(size_t) c];
@@ -2046,6 +2099,7 @@ void Glm5Model::fast_destroy() {
     if (F == nullptr) return;
     cudaSetDevice(dev_);
     prefill_destroy();
+    mtp_rows_free();
     F->quit.store(true);
     if (F->svc.joinable()) F->svc.join();
     {
@@ -3536,9 +3590,18 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     const Glm5Geometry& g = g_;
     const int64_t p = pos_++;
     // between tokens (every device idle): finished promotions go live in the device tables
+    Glm5Model* last = this;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
         if (!m->fast_boundary(err)) return false;
+        last = m;
+    }
+    // the MTP decode's NextN cache: its entry p - 1 from the trunk's hidden state of p - 1 and this token (on the last
+    // part, queued before this token's layers there)
+    if (last->mtp_il_ >= 0 && last->mtp_rows_ > 0) {
+        cudaSetDevice(last->dev_);
+        if (!last->mtp_fill_prev(token, p, err)) return false;
+        last->mtp_hx_pos_ = -1;
     }
     cudaSetDevice(dev_);
     // ---- the embedding row (host-dequantized from the shard mapping) -> the 4 streams
@@ -3627,6 +3690,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         return false;
     }
     last_tok_ = FT->tok_h[0];
+    tail->mtp_hx_pos_ = p;   // head_x: the trunk's hidden state of p
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ && m->fast_->prof_on) {
             cudaSetDevice(m->dev_);
@@ -3656,6 +3720,7 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err) {
         err = "glm mtp: no embedding dequantizer";
         return false;
     }
+    mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
     if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp embedding sync", err) || !F->route_ok(err))
         return false;   // emb_h may still feed an earlier copy
     tt->to_float(pack_emb_src_ + (size_t) next_tok * ggml_row_size((ggml_type) pack_emb_type_, E), F->emb_h, E);
@@ -3758,7 +3823,10 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // position with the real token.  Only the head speculates - the tail, the NextN block and the sampler see confirmed
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
-    if (fast_ == nullptr || split_next_ == nullptr || getenv("STRATA_GLM_NO_SPEC") != nullptr) return false;
+    // (the MTP decode of src/core/glm_mtp.cu replaced it: STRATA_GLM_MTP_PIPELINE=1 runs this one instead)
+    if (fast_ == nullptr || split_next_ == nullptr || getenv("STRATA_GLM_NO_SPEC") != nullptr ||
+        getenv("STRATA_GLM_MTP_PIPELINE") == nullptr)
+        return false;
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
@@ -4234,6 +4302,7 @@ bool Glm5Model::snapshot_restore() {
         m->snap_pool_copy(true);
         cudaStreamSynchronize(m->fast_->cs);
         m->pos_ = m->snap_pos_;
+        m->mtp_hx_pos_ = -1;
     }
     cudaSetDevice(dev_);
     return true;

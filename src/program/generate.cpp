@@ -1546,8 +1546,18 @@ static int glm_pack_generate(const Options& o) {
             }
             return produced < max_new;
         };
-        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_;
-        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+        const uint64_t spec0 = model.spec_steps_, hits0 = model.spec_hits_, rounds0 = model.mtp_rounds_;
+        uint64_t len0[9];
+        std::copy(model.mtp_round_n_, model.mtp_round_n_ + 9, len0);
+        if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_ready()) {
+            // the MTP decode (llama.cpp's draft-mtp): the NextN block drafts, the trunk verifies the window in one
+            // batched pass (any device count; same tokens as the loop below)
+            int64_t n_spec = 0;
+            if (!model.decode_mtp(sp, max_new, on_token, n_spec, err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
             int64_t n_spec = 0;
@@ -1607,6 +1617,15 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.spec_hits_ - hits0),
                              (unsigned long long) (model.spec_steps_ - spec0),
                              100.0 * (double) (model.spec_hits_ - hits0) / (double) (model.spec_steps_ - spec0));
+            if (model.mtp_rounds_ > rounds0) {
+                std::string lens;
+                for (int i = 0; i < 9; ++i)
+                    if (model.mtp_round_n_[i] > len0[i])
+                        lens += " " + std::to_string(i) + ":" + std::to_string(model.mtp_round_n_[i] - len0[i]);
+                std::fprintf(stderr, "glm mtp: %llu rounds, %.2f tokens a round | rounds by draft length%s\n",
+                             (unsigned long long) (model.mtp_rounds_ - rounds0),
+                             (double) produced / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
+            }
         }
         return 0;
     };
