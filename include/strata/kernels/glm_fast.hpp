@@ -289,8 +289,12 @@ void mtp_in(const float* emb, const float* h, const float* enorm, const float* h
 /// h += add (add may be null), then x = rms(h) * w and its q8_1 (a plain pre-norm residual step).  n <= 4096.
 void rms_q8(float* h, const float* add, const float* w, float eps, int n, float* x, void* xq, cudaStream_t s);
 
-/// argmax over n floats -> *out (device int).  Ties: lowest index.
-void argmax(const float* x, int n, int* out, cudaStream_t s);
+/// A chained draft's embedding: out = row *tok (a device int) of token_embd on the device (n_rows rows of type 14 =
+/// Q6_K or 8 = Q8_0), dequantized as ggml's to_float does (the same floats).  n_embd % 256 == 0.
+void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_embd, float* out, cudaStream_t s);
+/// argmax over n floats -> *out (device int).  Ties: lowest index.  map: an index i >= map_from is written as
+/// map[i - map_from] (a draft head's gathered rows -> their token ids).
+void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map = nullptr, int map_from = 0);
 /// The same for T rows of n floats -> out[0..T).
 void argmax_rows(const float* x, int n, int T, int* out, cudaStream_t s);
 

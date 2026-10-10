@@ -268,7 +268,8 @@ struct MetaValue {
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
 
-inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
+// keep: the items of an array kept (the rest are read past) - a sample by default, the count is what matters
+inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0, uint64_t keep = 64) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
     MetaValue v;
     v.type = t;
@@ -316,10 +317,10 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, keep));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (i < keep) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
         }
         break;
     }
@@ -359,6 +360,26 @@ public:
     const MetaValue* get(const std::string& key) const {
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
+    }
+    // A metadata value with every item of its arrays (metadata() keeps a sample of each): the header walked again to
+    // the key - for the few readers that want a whole array (the tokenizer's tokens).  false: no such key.
+    bool get_full(const std::string& key, MetaValue& out) const {
+        if (meta_.find(key) == meta_.end()) return false;
+        Cursor c(base_, size_);
+        c.read<uint32_t>();   // magic, version, n_tensors (parse() checked them)
+        c.read<uint32_t>();
+        c.read<uint64_t>();
+        const uint64_t n_kv = c.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            const std::string k = c.str();
+            const MetaType t = (MetaType)c.read<uint32_t>();
+            if (k == key) {
+                out = read_value(c, t, 0, UINT64_MAX);
+                return true;
+            }
+            read_value(c, t, 0, 0);
+        }
+        return false;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 

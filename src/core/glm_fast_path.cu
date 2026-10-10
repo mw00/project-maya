@@ -732,6 +732,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 mtp_arena_ = nullptr;
             }
         }
+        if (use && mtp_il_ >= 0) mtp_draft_setup();   // the draft head's vocabulary and the chain's embedding rows
     }
 
     // ---- host-mapped routing ring + response, pinned staging for the embedding / hop / token
@@ -2169,6 +2170,11 @@ void Glm5Model::fast_destroy() {
     if (F->mtp_tok) cudaFree(F->mtp_tok);
     if (F->mtp_tok_h) cudaFreeHost(F->mtp_tok_h);
     if (F->ev_mtp) cudaEventDestroy(F->ev_mtp);
+    if (F->mtp_emb) cudaFree(F->mtp_emb);
+    if (F->mtp_dx_w) cudaFree(F->mtp_dx_w);
+    if (F->mtp_dx_ids) cudaFree(F->mtp_dx_ids);
+    if (F->mtp_emb_h) cudaFreeHost(F->mtp_emb_h);
+    if (F->ev_mtp_emb) cudaEventDestroy(F->ev_mtp_emb);
     if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
@@ -3633,8 +3639,16 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
 // ---------------------------------------------------------------- the NextN draft block
 // At position p (whose final hidden state the head left in head_x): eh_proj([enorm(emb(next)), hnorm(h_p)]) -> a DSA
 // mixer and a MoE FFN with plain pre-norm residuals (the trunk's own kernels: fast_dsa / fast_moe on the block's layer
-// index; its caches at p) -> shared_head_norm -> the output head -> argmax into mtp_tok (mtp_tok_h after ev_mtp).
-bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err) {
+// index; its caches at p) -> shared_head_norm -> the output head -> argmax into mtp_tok[step] (mtp_tok_h[step] after
+// ev_mtp when read_back).
+//   - sub: the head over the draft vocabulary (glm_mtp.cu: its first mtp_dv rows in place and mtp_dx gathered ones, one
+//     launch) - a draft only has to be a good guess, the verify decides every token; the rows are the full head's own,
+//     so a draft in the vocabulary is the one the full head makes.  The argmax writes the token either way.
+//   - next_tok < 0 (the chain): the token is the previous step's draft, still on the device - its embedding row comes
+//     from token_embd there (embed_tok: the host's floats) and the step queues behind the one before it with no host
+//     round trip.  Else the host dequantizes the token's row: through mtp_emb_h where the chain is set up (its last
+//     copy out waited for alone), else through emb_h after a sync of the stream (it may still feed an earlier copy).
+bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step, bool sub, bool read_back) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -3645,16 +3659,35 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err) {
     }
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd;
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-    if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
-        err = "glm mtp: no embedding dequantizer";
-        return false;
-    }
+    sub = sub && F->mtp_dv > 0;
     mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
-    if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp embedding sync", err) || !F->route_ok(err))
-        return false;   // emb_h may still feed an earlier copy
-    tt->to_float(pack_emb_src_ + (size_t) next_tok * ggml_row_size((ggml_type) pack_emb_type_, E), F->emb_h, E);
-    cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+    if (next_tok < 0) {
+        if (F->mtp_emb == nullptr || step < 1) {
+            err = "glm mtp: a chained draft step without token_embd on the device";
+            return false;
+        }
+        gf::embed_tok(F->mtp_emb, F->mtp_emb_type, (int) g.n_vocab, F->mtp_tok + step - 1, E, F->emb, s);
+    } else {
+        const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+        if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
+            err = "glm mtp: no embedding dequantizer";
+            return false;
+        }
+        const size_t row = (size_t) next_tok * ggml_row_size((ggml_type) pack_emb_type_, E);
+        if (F->mtp_emb_h != nullptr) {
+            if (F->mtp_emb_pending && !glmfast::cuda_ok(cudaEventSynchronize(F->ev_mtp_emb), "glm mtp embedding", err))
+                return false;
+            tt->to_float(pack_emb_src_ + row, F->mtp_emb_h, E);
+            cudaMemcpyAsync(F->emb, F->mtp_emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+            cudaEventRecord(F->ev_mtp_emb, s);
+            F->mtp_emb_pending = true;
+        } else {
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp embedding sync", err) || !F->route_ok(err))
+                return false;   // emb_h may still feed an earlier copy
+            tt->to_float(pack_emb_src_ + row, F->emb_h, E);
+            cudaMemcpyAsync(F->emb, F->emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+        }
+    }
     gf::mtp_in(F->emb, F->head_x, Ly.enorm, Ly.hnorm, g.norm_eps, E, F->mtp_catq, s);
     gf::MvJob eh = {Ly.eh.q, F->mtp_catq, nullptr, F->mtp_h, nullptr, 1.0f, Ly.eh.type, 2 * E, E};
     if (!gf::mv(&eh, 1, s)) {
@@ -3668,15 +3701,29 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err) {
     if (!fast_moe(il, pf_pending, err)) return false;
     gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
     const WSlot& ow = ws_map_.at("output.weight");
-    gf::MvJob o = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
-    if (ow.type == 0) o.w = ow.f32;
-    if (!gf::mv(&o, 1, s)) {
+    gf::MvJob o[2];
+    o[0] = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
+    if (ow.type == 0) o[0].w = ow.f32;
+    int n_rows = g.n_vocab, n_jobs = 1;
+    if (sub) {
+        // the first mtp_dv rows and the gathered ones, their logits side by side
+        o[0].n_out = F->mtp_dv;
+        o[1] = o[0];
+        o[1].w = F->mtp_dx_w;
+        o[1].y = F->mtp_logits + F->mtp_dv;
+        o[1].n_out = F->mtp_dx;
+        n_rows = F->mtp_dv + F->mtp_dx;
+        n_jobs = F->mtp_dx > 0 ? 2 : 1;
+    }
+    if (!gf::mv(o, n_jobs, s)) {
         err = "glm mtp: the head";
         return false;
     }
-    gf::argmax(F->mtp_logits, g.n_vocab, F->mtp_tok, s);
-    cudaMemcpyAsync(F->mtp_tok_h, F->mtp_tok, sizeof(int), cudaMemcpyDeviceToHost, s);
-    cudaEventRecord(F->ev_mtp, s);
+    gf::argmax(F->mtp_logits, n_rows, F->mtp_tok + step, s, sub ? F->mtp_dx_ids : nullptr, F->mtp_dv);
+    if (read_back) {
+        cudaMemcpyAsync(F->mtp_tok_h + step, F->mtp_tok + step, sizeof(int), cudaMemcpyDeviceToHost, s);
+        cudaEventRecord(F->ev_mtp, s);
+    }
     return true;
 }
 

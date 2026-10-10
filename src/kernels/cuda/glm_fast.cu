@@ -3050,6 +3050,34 @@ __global__ void rows_q8_kernel(const float* __restrict__ x, int ld, int rows, in
 }
 
 // ---------------------------------------------------------------- the NextN block's glue
+// A chained draft's embedding row: row *tok of token_embd kept on the device, the token the previous draft step's argmax
+// left there.  Dequantized as ggml's to_float does it, so the floats are the host's bit for bit: Q6_K d * scale * q (the
+// two products in that order, dequantize_row_q6_K), Q8_0 q * d.  One thread a value.
+__global__ void embed_tok_kernel(const void* __restrict__ table, int type, int n_rows, const int* __restrict__ tok,
+                                 int n_embd, float* __restrict__ out) {
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= n_embd) return;
+    const int t = *tok;
+    if (t < 0 || t >= n_rows) {   // (never: a draft is a row of the head)
+        out[e] = 0.0f;
+        return;
+    }
+    if (type == 8) {
+        const block_q8_0* b = (const block_q8_0*) table + (size_t) t * (n_embd / QK8_0) + e / QK8_0;
+        out[e] = (float) b->qs[e % QK8_0] * __half2float(b->d);
+        return;
+    }
+    // Q6_K: 256 values a block in two halves of 128, each four runs of 32 (ggml-quants.c's loop order)
+    const block_q6_K* b = (const block_q6_K*) table + (size_t) t * (n_embd / QK_K) + e / QK_K;
+    const int j = e % QK_K, h = j / 128, r = j % 128, quarter = r / 32, l = r % 32, is = l / 16;
+    const uint8_t* ql = b->ql + 64 * h;
+    const uint8_t* qh = b->qh + 32 * h;
+    const int8_t* sc = b->scales + 8 * h;
+    const int lo = quarter & 1 ? ql[l + 32] : ql[l];
+    const int q = (quarter < 2 ? (lo & 0xF) : (lo >> 4)) | (((qh[l] >> (2 * quarter)) & 3) << 4);
+    out[e] = __half2float(b->d) * (float) sc[is + 2 * quarter] * (float) (int8_t) (q - 32);
+}
+
 // cat = [rms(emb) * enorm, rms(h) * hnorm] as q8_1 (eh_proj's input); n_embd <= 4096, one block of 1024
 __global__ void __launch_bounds__(1024) mtp_in_kernel(const float* __restrict__ emb, const float* __restrict__ h,
                                                       const float* __restrict__ enorm, const float* __restrict__ hnorm,
@@ -3109,7 +3137,9 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
 }
 
 // one block: float4 loads, four in flight per thread (the vocabulary is ~0.6 MB; scalar loads ran at ~10 GB/s)
-__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ x, int n, int* __restrict__ out) {
+// map (may be null): an index from map_from on is map[index - map_from] (a draft head's gathered rows -> their tokens)
+__global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ x, int n, int* __restrict__ out,
+                                                      const int* __restrict__ map, int map_from) {
     __shared__ float sv[32];
     __shared__ int si[32];
     float best = -INFINITY;
@@ -3161,7 +3191,7 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
     if (threadIdx.x == 0) {
         for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
             if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
-        *out = bi;
+        *out = map != nullptr && bi >= map_from ? map[bi - map_from] : bi;
     }
 }
 
@@ -3790,13 +3820,18 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
     launch_check("rms_q8");
 }
 
-void argmax(const float* x, int n, int* out, cudaStream_t s) {
-    argmax_kernel<<<1, 1024, 0, s>>>(x, n, out);
+void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map, int map_from) {
+    argmax_kernel<<<1, 1024, 0, s>>>(x, n, out, map, map_from);
     launch_check("argmax");
 }
 
+void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_embd, float* out, cudaStream_t s) {
+    embed_tok_kernel<<<(n_embd + 255) / 256, 256, 0, s>>>(table, type, n_rows, tok, n_embd, out);
+    launch_check("embed_tok");
+}
+
 void argmax_rows(const float* x, int n, int T, int* out, cudaStream_t s) {
-    for (int t = 0; t < T; ++t) argmax_kernel<<<1, 1024, 0, s>>>(x + (size_t) t * n, n, out + t);
+    for (int t = 0; t < T; ++t) argmax_kernel<<<1, 1024, 0, s>>>(x + (size_t) t * n, n, out + t, nullptr, 0);
     launch_check("argmax_rows");
 }
 
