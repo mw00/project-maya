@@ -3267,26 +3267,42 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
+    // STRATA_GLM_PREFETCH_RANK=<n>: prefetch only the prediction's first n ranks (unset: any of its top k)
+    static const int pf_rank = [] {
+        const char* v = getenv("STRATA_GLM_PREFETCH_RANK");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 0;
+    }();
     gf::moe_route(F->rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
                   g.n_embd, md, F->sh_g, F->sh_u, g.swiglu_shexp, FFs, F->sh_hq, s,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, il == mtp_il_ ? mtp_skip_from() : 8,
-                  lane ? F->cpu_plan : 0ull, promote_min);
+                  lane ? F->cpu_plan : 0ull, promote_min, pf_rank);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
-    if (pred && F->max_pf > 0) {
-        // the side stream copies the next layer's predicted experts while this layer computes
+    // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:
+    // when that copy starts - "route" (the default: at once, beside this layer's own PCIe fetch and CPU lane),
+    // "fetch" (after this layer's own fetch: the link is free) or "cpu" (after this layer's CPU-lane answer: RAM is
+    // free too; the copy then runs beside the next layer's attention).  The prefetch lists are double-buffered by
+    // layer parity and the next layer waits for this copy before its experts run, so any of the three is safe.
+    static const int pf_at = [] {
+        const char* v = getenv("STRATA_GLM_PREFETCH_AT");
+        return v == nullptr ? 0 : std::strcmp(v, "fetch") == 0 ? 1 : std::strcmp(v, "cpu") == 0 ? 2 : 0;
+    }();
+    const bool pf = pred && F->max_pf > 0;
+    const auto issue_prefetch = [&] {
         cudaEventRecord(F->ev_pred, s);
         cudaStreamWaitEvent(F->ps, F->ev_pred, 0);
         gf::moe_prefetch(md, F->L[(size_t) il + 1].blob, F->ps);
         cudaEventRecord(F->ev_pf, F->ps);
-    }
+    };
+    if (pf && pf_at == 0) issue_prefetch();
     // disk-only experts (rare once warm) park the device until the host has read them; everything not
     // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM
     gf::moe_wait(md, g.n_embd, s);
     if (F->prof_on) F->mark("moe_wait");
     gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
     if (F->prof_on) F->mark("moe_fetch");
+    if (pf && pf_at == 1) issue_prefetch();
     // this layer's own prefetched experts (issued one layer ago) must have landed before they are read
     if (pf_pending) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
     pf_pending = false;
@@ -3302,7 +3318,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }
-    if (pred && F->max_pf > 0) {
+    if (pf && pf_at == 2) issue_prefetch();
+    if (pf) {
         std::swap(F->ev_pf, F->ev_pf_prev);   // the next layer waits on THIS layer's prefetch
         pf_pending = true;
     }
