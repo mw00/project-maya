@@ -106,11 +106,15 @@ class GGUFFile:
         if isinstance(align, int) and align:
             self.alignment = align
         pos = fh.tell()
+        self.header_end = pos   # (a shard of metadata alone may end here, inside the alignment padding)
         self._data_start = (pos + self.alignment - 1) // self.alignment * self.alignment
 
     def _str(self, fh) -> str:
         (n,) = struct.unpack("<Q", fh.read(8))
-        return fh.read(n).decode("utf-8", "replace")
+        b = fh.read(n)
+        if len(b) < n:   # (a cut file: its header ends early)
+            raise ValueError(f"{self.path.name}: the header ends inside a string")
+        return b.decode("utf-8", "replace")
 
     def _value(self, fh):
         (t,) = struct.unpack("<I", fh.read(4))

@@ -315,6 +315,25 @@ static void* numa_pinned(size_t bytes) {
 #endif
 }
 
+// the RAM free now: MemAvailable (Windows: the smaller of the free RAM and the free commit, which pinning is charged to);
+// 0 when unknown
+static int64_t avail_ram_now() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (int64_t) std::min(ms.ullAvailPhys, ms.ullAvailPageFile) : 0;
+#else
+    long long kb = 0;
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f))
+            if (std::sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+        std::fclose(f);
+    }
+    return (int64_t) kb * 1024;
+#endif
+}
+
 static void numa_pinned_free(void* p, size_t bytes) {
 #ifdef __linux__
     cudaHostUnregister(p);
@@ -1099,8 +1118,21 @@ bool Glm5Model::fast_setup(std::string& err) {
         // half sees): MemAvailable minus headroom for the OS, the server and the page cache the disk reads go
         // through; STRATA_GLM_RAM_GB pins it.  Each half takes its share of the MoE layers still unserved,
         // and whatever a half cannot use (its experts already fit) passes on to the next half.
+        // The later parts' prompt path pins after this measurement (their token rows and landing ring, and the rows a
+        // middle part hands on), and that came out of the headroom: one part's staging fits in it (two GPUs: 2x V100,
+        // as v1.0.30), three parts' did not and froze a Linux desktop (#77).  What a third part on adds is set aside
+        // here (estimated from this part's own sizes), and each later part measures again and leaves at least half
+        // the headroom free.
         static int64_t total = -1, remaining = -1;
         static int remaining_layers = 0;
+        const auto pinned_pf = prefill_pinned();
+        const int later = n_parts_ - 1 - part_;   // the parts that start after this one
+        const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
+                                  (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
+        double head_gb = F->unified_memory ? 16.0 : 6.0;
+        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
+        const bool fixed_ram = getenv("STRATA_GLM_RAM_GB") != nullptr;
         if (budget < 0) {
             if (total < 0) {
                 if (const char* rg = getenv("STRATA_GLM_RAM_GB")) {
@@ -1133,9 +1165,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                         std::fclose(mf);
                     }
 #endif
-                    double head_gb = F->unified_memory ? 16.0 : 6.0;
-                    if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::atof(h);
-                    total = std::max<int64_t>(0, avail_kb * 1024 - (int64_t) (head_gb * 1073741824.0));
+                    total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf);
                 }
                 remaining = total;
                 remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
@@ -1144,6 +1174,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             budget = l1_ >= g.n_layers ? remaining
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
+            // a later part: no more than is free now, less what is still to come and half the headroom
+            if (part_ > 0 && !fixed_ram) {
+                const int64_t now = avail_ram_now();
+                if (now > 0) budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - head_b / 2 - unseen_pf));
+            }
         }
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
@@ -1191,6 +1226,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (!staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
             remaining_layers -= n_moe;
+        }
+        // pinned memory cannot be swapped out: say so when what is left free is short of the headroom
+        if (!staging_only && !fixed_ram && ram_budget_ < 0) {
+            const int64_t left = avail_ram_now();
+            if (left > 0 && left - unseen_pf < head_b / 2)
+                std::fprintf(stderr, "glm fast: WARNING - CUDA%d: %.1f GB of RAM free after its RAM tier, and the prompt "
+                                     "path still pins up to %.1f GB: if the system swaps or stalls, set "
+                                     "STRATA_GLM_RAM_GB lower\n", dev_, (double) left / 1073741824.0,
+                             (double) unseen_pf / 1073741824.0);
         }
         int64_t ram_slots = 0;
         for (auto& R : F->rc) ram_slots += R.n;
@@ -1485,7 +1529,16 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         for (int d : split_devs_) gpu_node.push_back(gpu_numa_node(d));
         int spare = 4;
         pin_cpus = part_cpus(part_, n_parts_, gpu_node, pin_node, spare);
-        if (!pin_cpus.empty() && lv == nullptr) threads = std::max(2, (int) pin_cpus.size() - spare);
+        // a thread a physical core, as unpinned - their SMT siblings are the CPUs left free (one CCD of a 5900X a
+        // part: 10 threads on its 6 cores 10.88 tok/s, 6 threads 11.45, #77); no siblings: those CPUs less the spare
+        if (!pin_cpus.empty() && lv == nullptr) {
+            std::vector<std::pair<int, int>> pc;
+            for (int c : pin_cpus) pc.push_back(cpu_core(c));
+            std::sort(pc.begin(), pc.end());
+            const int n_cores = (int) (std::unique(pc.begin(), pc.end()) - pc.begin());
+            threads = n_cores < (int) pin_cpus.size() ? std::max(2, n_cores)
+                                                      : std::max(2, (int) pin_cpus.size() - spare);
+        }
     }
     if (threads <= 0 || g.n_embd > 4096 || g.n_exp_used > 8) return true;
     namespace kc = strata::kernels::cpu;

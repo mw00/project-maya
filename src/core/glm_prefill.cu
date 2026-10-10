@@ -849,6 +849,16 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     return {a.off, uni};
 }
 
+Glm5Model::PinnedPrompt Glm5Model::prefill_pinned() const {
+    const PrefillState* S = pf_;
+    if (S == nullptr) return {};
+    const size_t T = (size_t) S->T, E = (size_t) g_.n_embd;
+    PinnedPrompt p;
+    p.staging = T * E * sizeof(float) + (S->gpin != nullptr ? (size_t) S->nland * S->gstride : 0);
+    p.hop = (size_t) 2 * T * 4 * E * sizeof(float);
+    return p;
+}
+
 std::pair<size_t, size_t> Glm5Model::prefill_bytes_for(size_t T) const {
     const PrefillState* S = pf_;
     return chunk_bytes(g_, T, S->has_kda, S->has_dsa, S->has_dense, S->has_moe, S->max_pools, S->sub_env, mtp_il_ >= 0);
