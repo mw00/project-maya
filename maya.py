@@ -1201,7 +1201,10 @@ def incomplete(path: Path):
         g = GGUFFile(path)
     except Exception as e:                             # noqa: BLE001 - a partial header raises anything
         return f"not a whole GGUF file ({e})"
-    need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+    # a shard of metadata alone (unsloth's first: the tokenizer, no tensors) is whole at its header's end - its writer
+    # leaves out the alignment padding no data follows (#83), and the engine reads it so
+    need = (g.data_start + max(t.offset + (t.expected_bytes() or 0) for t in g.tensors) if g.tensors
+            else g.header_end)
     have = path.stat().st_size
     return None if have >= need else f"short: {have:,} of {need:,} bytes"
 
