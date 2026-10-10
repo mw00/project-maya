@@ -242,6 +242,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_batch.cu
+                          src/kernels/cuda/exl3.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -251,6 +252,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_layer_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME glm_layer_graph_test COMMAND glm_layer_graph_test)
     set_tests_properties(glm_layer_graph_test PROPERTIES TIMEOUT 60)
+    # the EXL3 kernels against the scalar CPU reference (random matrices, no model)
+    add_executable(exl3_test tests/exl3_test.cu)
+    target_link_libraries(exl3_test PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+    add_test(NAME exl3_test COMMAND exl3_test)
+    set_tests_properties(exl3_test PROPERTIES TIMEOUT 120)
   endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON
@@ -709,7 +715,8 @@ if(STRATA_BUILD_TESTS)
 endif()
 
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp)
+            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3_ref.cpp
+            src/kernels/cpu/exl3_cpu.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).

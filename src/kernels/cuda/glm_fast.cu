@@ -6,6 +6,7 @@
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/exl3.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/kernels/glm_expert_bench.hpp"
 #include <cstring>
@@ -2895,6 +2896,7 @@ int mv_type_ok(int t) {
     switch (t) {
         case kTypeF32: case kTypeBF16: case 12: case 13: case 14: case 8: case 16: case 18: case 19: case 23: case 10: case 11:
         case 17: case 22: case 21: case 29: return 1;
+        case exl3::kTypeEXL3: return 1;   // forwarded to the EXL3 kernels (mv below)
         default: return 0;
     }
 }
@@ -2918,7 +2920,7 @@ bool moe_supported(int type) {   // moe_gate_up's and moe_down's instantiations
            type == 18 || type == 19 || type == 21 || type == 22 || type == 23 || type == 29;
 }
 
-int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed); }
+int launch_errors() { return g_launch_errors.load(std::memory_order_relaxed) + exl3::launch_errors(); }
 
 size_t row_bytes(int type, int64_t n_in) {
     switch (type) {
@@ -2954,6 +2956,24 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     constexpr int kTyped[] = {14, 8, 12, 13};
     bool done[kMaxMvJobs] = {};
+    // EXL3 weights (w: an exl3::Mat): their own kernels, F32 input when the job has it, else the q8_1
+    {
+        exl3::MvJob xj[kMaxMvJobs];
+        int nx = 0;
+        for (int i = 0; i < n; ++i)
+            if (jobs[i].type == exl3::kTypeEXL3) {
+                xj[nx].m = (const exl3::Mat*) jobs[i].w;
+                xj[nx].xf = jobs[i].xf;
+                xj[nx].xq = jobs[i].xq;
+                xj[nx].y = jobs[i].y;
+                xj[nx].bias = jobs[i].bias;
+                xj[nx].alpha = jobs[i].alpha;
+                ++nx;
+                done[i] = true;
+            }
+        if (nx > 0 && !exl3::mv(xj, nx, s)) return false;
+        if (nx == n) return true;
+    }
     if (typed) {
         for (const int T : kTyped) {
             MvBatch b{};

@@ -29,6 +29,10 @@ void init_once() {
 bool native_experts_available() noexcept { return true; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
+    if (gu_type < 0 || gu_type >= GGML_TYPE_COUNT || d_type < 0 || d_type >= GGML_TYPE_COUNT) {
+        err = "native experts: type " + std::to_string(gu_type) + "/" + std::to_string(d_type) + " is not a ggml type";
+        return false;
+    }
     init_once();
     const ggml_type_traits_cpu* tg = traits(gu_type);
     const ggml_type_traits_cpu* td = traits(d_type);

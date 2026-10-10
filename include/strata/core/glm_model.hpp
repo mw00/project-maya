@@ -21,6 +21,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <algorithm>
@@ -244,8 +245,24 @@ public:
         strata::kernels::cpu::NativeFmt fmt;
         int gate_shard = 0, up_shard = 0, down_shard = 0;
         uint64_t gate_off = 0, up_off = 0, down_off = 0;   // absolute file offsets of the tensors
+        // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) lies at
+        // x_off[9 e + 3 r + j] of shard x_shard[...]; the blob is [gate | up | down], a part [trellis | suh | svh]
+        int x_cb = -1;
+        int x_K[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};
+        std::vector<int> x_shard;
+        std::vector<uint64_t> x_off;
+        size_t x_piece(int r, int j) const {
+            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_K[r] / 8
+                          : 2 * (size_t) (j == 1 ? x_k[r] : x_n[r]);
+        }
+        size_t x_part(int r) const { return x_piece(r, 0) + x_piece(r, 1) + x_piece(r, 2); }
     };
     std::vector<NativeLayer> pack_layers_;                 // indexed by layer id (dense lead = null)
+    // ---- an EXL3 pack (tools/exl3_pack.py): the trellis-coded matrices, read from the model's safetensors (shards
+    // exl3_shard0_ on, after the GGUF), uploaded per piece; the WSlots of type exl3::kTypeEXL3 point at exl3_mats_
+    bool exl3_ = false;
+    int exl3_shard0_ = -1;
+    std::map<std::string, strata::kernels::exl3::Mat> exl3_mats_;
     std::vector<float> host_x_, host_moe_, host_h_;        // per-token CPU MoE scratch
     std::vector<float> host_probs_b_;                      // the per-layer router bias (prefetch ranking)
     std::vector<float> host_ff_, host_dn_;                 // per-expert gate/up and down outputs
@@ -349,6 +366,7 @@ public:
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
+    void fast_read_expert_x3(int il, int e, uint8_t* blob);   // a whole EXL3 expert in as few reads as it allows
     void fast_ahead_route(int il, const int* ids, unsigned int miss, const short (*ahead)[8]);   // LOOKAHEAD
     void fast_ahead_reader();
     bool fast_boundary(std::string& err);                  // between tokens: apply finished promotions

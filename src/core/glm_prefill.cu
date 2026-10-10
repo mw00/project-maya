@@ -21,6 +21,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #if defined(STRATA_USE_HIP)
@@ -511,7 +512,8 @@ bool Glm5Model::prefill_setup(std::string& err) {
     size_t gstride = 0;
     std::string why;
     const auto deq_ok = [&](const WSlot& w, const char* nm, int il) {
-        if (w.q == nullptr || (w.type != gf::kTypeBF16 && !strata::kernels::dequant_bf16_supported(w.type)))
+        if (w.q == nullptr || (w.type != gf::kTypeBF16 && w.type != strata::kernels::exl3::kTypeEXL3 &&
+                               !strata::kernels::dequant_bf16_supported(w.type)))
             why += "blk." + std::to_string(il) + "." + nm + " (type " + std::to_string(w.type) + ") ";
     };
     for (int il = l0_; il < l1_; ++il) {
@@ -524,6 +526,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         } else {
             has_dsa = true;
             deq_ok(Ly.q_a, "attn_q_a", il);
+            if (Ly.idx_q_b == nullptr) deq_ok(Ly.idx_q_b_x, "indexer.attn_q_b", il);
             deq_ok(Ly.q_b, "attn_q_b", il);
             deq_ok(Ly.kv_a, "attn_kv_a", il);
         }
@@ -533,7 +536,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
             deq_ok(Ly.sh_gate, "ffn_gate_shexp", il);
             deq_ok(Ly.sh_up, "ffn_up_shexp", il);
             deq_ok(Ly.sh_down, "ffn_down_shexp", il);
-            if (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type))
+            if (!Ly.exl3 && (!mmq::supported(Ly.gu_type) || !mmq::supported(Ly.d_type)))   // (EXL3: run_set_x3)
                 why += "blk." + std::to_string(il) + " experts (types " + std::to_string(Ly.gu_type) + "/" +
                        std::to_string(Ly.d_type) + ") ";
             gstride = std::max(gstride, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
@@ -1250,11 +1253,19 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         if (S->lt) S->lt->rebind(S->w16, S->w16_elems, S->ws, S->ws_bytes);
 #endif
-        const int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / Kd));
+        // an EXL3 weight: reconstructed in slices of whole 128-row output rotation blocks (at a sub-batch's 1-2K rows
+        // the decode once + cuBLAS beat exl3::gemm_rows, which decodes again for every 32 rows: KDA projections 2.3 vs
+        // 3.3 s over 9 GPUs for a 6.4K-token prompt)
+        const bool x3w = w.type == strata::kernels::exl3::kTypeEXL3;
+        int rows = (int) std::max<int64_t>(1, std::min<int64_t>(N, S->w16_elems / Kd));
+        if (x3w) rows = std::max(128, rows / 128 * 128);
         for (int r0 = 0; r0 < N; r0 += rows) {
             const int n = std::min(rows, N - r0);
             if (w.type == gf::kTypeBF16)
                 gb::bf16_to_f16((const uint16_t*) w.q + (size_t) r0 * Kd, S->w16, (int64_t) n * Kd, s);
+            else if (x3w)
+                strata::kernels::exl3::reconstruct_rows(
+                    strata::kernels::exl3::view(*(const strata::kernels::exl3::Mat*) w.q, r0, n), S->w16, false, s);
             else
                 strata::kernels::dequant_f16(w.type, w.q, r0, n, Kd, S->w16, s);
 #if defined(STRATA_USE_HIP)
@@ -1495,7 +1506,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }();
     const auto cpu_lane = [&](int il) {
         return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
-               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
+               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
+               !F->L[(size_t) il].exl3;   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
     const auto cpu_bufs = [&](int cpu_nrows) {
@@ -1602,8 +1614,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                  state_ + dsa_pool_[(size_t) il], g.idx_key, kp, pool_lo, pool_hi - pool_lo + 1, s,
                                  ik_ring_);
                 hgemm_q(Ly.q_b, g.n_head * g.qk_nope, g.q_lora, B.qr16, g.q_lora, B.q, g.n_head * g.qk_nope, tn, 0.0f);
-                sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq, g.idx_heads * g.idx_key,
-                           tn, 1.0f);
+                if (Ly.idx_q_b_x.q != nullptr)   // an EXL3 pack quantizes it
+                    hgemm_q(Ly.idx_q_b_x, g.idx_heads * g.idx_key, g.q_lora, B.qr16, g.q_lora, B.iq,
+                            g.idx_heads * g.idx_key, tn, 0.0f);
+                else
+                    sgemm_bf16(Ly.idx_q_b, g.idx_heads * g.idx_key, g.q_lora, B.qr, g.q_lora, B.iq,
+                               g.idx_heads * g.idx_key, tn, 1.0f);
                 S->mark("dsa_proj", s);
                 const int max_vis = (pt + tn) / kp;
                 if (max_vis > g.top_pools_max())
@@ -2069,6 +2085,109 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 i0 = i1;
             }
         };
+        // EXL3 experts (MMQ does not read their trellis), each by its row count: a lightly routed one through the
+        // tensor-core kernels (sm_80+; they decode the trellis once a 32-row block - cheaper than reconstructing 50 MB
+        // of FP16 for a few rows), the rest reconstructed to FP16 and multiplied by cuBLAS (the decode once, the GEMM
+        // at the tensor cores' FP16 rate).  Both write the window's OUTP rows as run_set's; w16 is their scratch.
+        // STRATA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none)
+        static const int mma_rows = [] {
+            const char* v = getenv("STRATA_GLM_EXL3_MMA_ROWS");
+            return v ? std::max(0, std::atoi(v)) : 64;
+        }();
+        const bool use_mma = mma_rows > 0 && strata::kernels::exl3::mma_supported();
+        // experts [i0, i1) of the set through the tensor-core kernels, in parts whose rows fit the window and w16's h
+        const auto run_mma = [&](const uint8_t* wbase, size_t stride, const int* d_bounds, const int* hb, int r0, int i0,
+                                 int i1) {
+            namespace x3 = strata::kernels::exl3;
+            const int cap = std::min(W, (int) std::max<int64_t>(1, S->w16_elems / nff));
+            while (i0 < i1) {
+                int j = i0 + 1;
+                while (j < i1 && hb[j + 1] - hb[i0] <= cap) ++j;
+                const int a = hb[i0], nrows = hb[j] - a;
+                int max_rows = 0;
+                for (int i = i0; i < j; ++i) max_rows = std::max(max_rows, hb[i + 1] - hb[i]);
+                if (nrows > 0) {
+                    x3::SetArgs sa;
+                    sa.wbase = wbase + (size_t) i0 * stride;
+                    sa.stride = stride;
+                    sa.lay = Ly.xl;
+                    sa.n_exp = j - i0;
+                    sa.bounds = d_bounds + i0;
+                    sa.row0 = a;
+                    sa.max_rows = max_rows;
+                    sa.n_embd = E;
+                    sa.n_ff = nff;
+                    sa.limit = g.swiglu_exp;
+                    const int o = place(r0 + a, nrows);
+                    x3::set_gate_up(sa, S->x, E, M.row_tok + r0 + a, S->w16, nff, s);
+                    x3::set_down(sa, S->w16, nff, M.OUTP + (size_t) o * E, E, s);
+                }
+                i0 = j;
+            }
+        };
+        // one expert through reconstruct + cuBLAS
+        const auto run_blas = [&](const uint8_t* blob, int a, int nrows, int r0) {
+            namespace x3 = strata::kernels::exl3;
+            const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
+            const int gu_rows = (int) std::max<int64_t>(1, (S->w16_elems - wgu) / E);
+            const int dn_rows = (int) std::max<int64_t>(1, (S->w16_elems - wdn) / nff);
+            const auto mat = [&](int r) {
+                x3::Mat m;
+                m.trellis = (const uint32_t*) (blob + Ly.xl.trellis[r]);
+                m.suh = (const uint16_t*) (blob + Ly.xl.suh[r]);
+                m.svh = (const uint16_t*) (blob + Ly.xl.svh[r]);
+                m.k = r < 2 ? E : nff;
+                m.n = r < 2 ? nff : E;
+                m.K = Ly.xl.K[r];
+                m.cb = Ly.xl.cb;
+                return m;
+            };
+            const int o = place(r0 + a, nrows);
+            float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the expert's own OUTP rows hold its gate/up
+            x3::reconstruct_rows(mat(0), S->w16, false, s);
+            x3::reconstruct_rows(mat(1), S->w16 + (size_t) nff * E, false, s);
+            uint16_t* X16 = S->w16 + wgu;
+            for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+                const int n = std::min(gu_rows, nrows - c0);
+                x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
+                                     X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm exl3 gate/up");
+            }
+            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            x3::reconstruct_rows(mat(2), S->w16, false, s);
+            uint16_t* H16 = S->w16 + wdn;
+            for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
+                const int n = std::min(dn_rows, nrows - c0);
+                x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
+                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm exl3 down");
+            }
+        };
+        // in set order (the window takes the rows in order): runs of light experts to the tensor cores, the rest alone
+        const auto run_set_x3 = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
+                                    int r0) {
+            for (int i = 0; i < n_exp;) {
+                const int rows = hb[i + 1] - hb[i];
+                if (use_mma && rows <= mma_rows) {
+                    int j = i + 1;
+                    while (j < n_exp && hb[j + 1] - hb[j] <= mma_rows) ++j;
+                    run_mma(wbase, stride, d_bounds, hb, r0, i, j);
+                    i = j;
+                } else {
+                    if (rows > 0) run_blas(wbase + (size_t) i * stride, hb[i], rows, r0);
+                    ++i;
+                }
+            }
+        };
+        const auto run_any = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
+                                 int r0) {
+            if (Ly.exl3) run_set_x3(wbase, n_exp, stride, d_bounds, hb, r0);
+            else run_set(wbase, n_exp, stride, d_bounds, hb, r0);
+        };
         if (2 * nff != E) {
             err = "glm prefill: 2 * n_ff_exp != n_embd (the gate/up rows would not fit the set's output rows)";
             return false;
@@ -2157,14 +2276,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             std::fprintf(stderr, "glm prefill light check layer %d: %d experts, %d rows, rel L2 %.3e, worst row %.3e\n", il,
                          n_light, nl_rows, std::sqrt(num / std::max(1e-30, den)), worst);
         }
-        run_set(P.base, P.n_main, P.stride, M.bounds + b_res, S->h_bounds + b_res, 0);
+        run_any(P.base, P.n_main, P.stride, M.bounds + b_res, S->h_bounds + b_res, 0);
         (void) max_res;
         S->rows_resident += (uint64_t) rows_res;
         S->mark("moe_resident", s);
         if (S->pre_layer == il) {
             if (rows_pre > 0) {
                 cudaStreamWaitEvent(s, S->ev_pready, 0);
-                run_set(S->pbuf, (int) S->pre_e.size(), P.stride, M.bounds + b_pre, S->h_bounds + b_pre, rows_res);
+                run_any(S->pbuf, (int) S->pre_e.size(), P.stride, M.bounds + b_pre, S->h_bounds + b_pre, rows_res);
                 S->pre_rows += (uint64_t) rows_pre;
             }
             cudaEventRecord(S->ev_pfree, s);   // (the next layer's prestage overwrites pbuf after this)
@@ -2208,7 +2327,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             (void) dk0;
             cudaEventRecord(S->ev_ready[b], F->copy);
             cudaStreamWaitEvent(s, S->ev_ready[b], 0);
-            run_set(gdst, gr.n, P.stride, M.bounds + gr.b_off, S->h_bounds + gr.b_off, gr.r0);
+            run_any(gdst, gr.n, P.stride, M.bounds + gr.b_off, S->h_bounds + gr.b_off, gr.r0);
             cudaEventRecord(S->ev_free[b], s);
             S->rows_staged += (uint64_t) gr.nrows;
         }
