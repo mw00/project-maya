@@ -53,6 +53,49 @@ inline void cpu_relax() {
 #endif
 }
 
+// Windows' HIP runtime holds the launches a stream queues until the host waits on the GPU (Linux and CUDA submit each),
+// so a token's first layers sat queued while the main thread went on enqueuing the rest, until fast_service's 1 ms kick
+// (or the token's own wait) submitted them.  This submits what `s` has queued without waiting: cudaStreamQuery, whose
+// "not ready" is no error - it is taken back off the thread's last error, which launch_check reads after every launch.
+// A launch error already pending stays for the caller's check (no submit then).  Elsewhere a no-op.
+// STRATA_GLM_FLUSH=<n>: the decode submits after its first layer and then every n layers (submit_every), 0: never -
+// the default: on the 8065S (Maya-S, MTP drafting 2) a submission every 4 layers lost ~4% of the decode (26.5 against
+// 27.7 tok/s, same answers); the runtime's own batching plus the service thread's kick keep the GPU fed already.
+inline void submit_queued(cudaStream_t s) {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    if (cudaPeekAtLastError() != cudaSuccess) return;
+    const cudaError_t e = cudaStreamQuery(s);
+    if (e == cudaErrorNotReady || e == cudaSuccess) (void) cudaGetLastError();
+#else
+    (void) s;
+#endif
+}
+inline int submit_every() {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_FLUSH");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+    }();
+    return v;
+#else
+    return 0;
+#endif
+}
+// ... and the prompt path after each mixer sub-batch and each layer's experts: STRATA_GLM_PREFILL_FLUSH=1 (off by
+// default: Maya-S on the 8065S, 2K / 8K / 16K prompts 271 / 323 / 325 tok/s with it against 273-276 / 323-325 /
+// 329-339 without - the sub-batches are long enough that the runtime's batching costs nothing)
+inline bool prefill_submit() {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    static const bool v = [] {
+        const char* e = getenv("STRATA_GLM_PREFILL_FLUSH");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+#else
+    return false;
+#endif
+}
+
 // a thread's CPUs: `cpus` (empty: left to the OS).  Linux only; elsewhere a no-op.
 inline void pin_thread(std::thread::native_handle_type h, const std::vector<int>& cpus) {
 #ifdef __linux__
@@ -248,6 +291,20 @@ struct Glm5Model::FastState {
     int* mtp_tok = nullptr;
     int* mtp_tok_h = nullptr;    // pinned
     cudaEvent_t ev_mtp = nullptr;
+    // the draft head over the draft vocabulary (Glm5Model::mtp_vocab_scan; mtp_dv == 0: the whole head): the head's
+    // first mtp_dv rows in place, then mtp_dx rows gathered from the rest (mtp_dx_w) whose tokens are mtp_dx_ids
+    // (device: the argmax writes a token id either way)
+    int mtp_dv = 0, mtp_dx = 0;
+    void* mtp_dx_w = nullptr;
+    int* mtp_dx_ids = nullptr;
+    // the chained drafts (STRATA_GLM_MTP_CHAIN): token_embd on the device as stored (Q6_K / Q8_0), the token of a
+    // step after the first read there; null: every draft step takes its embedding from the host.  The host's own rows
+    // for a draft step go through mtp_emb_h, its copy out ordered by ev_mtp_emb
+    void* mtp_emb = nullptr;
+    int mtp_emb_type = -1;
+    float* mtp_emb_h = nullptr;   // pinned
+    cudaEvent_t ev_mtp_emb = nullptr;
+    bool mtp_emb_pending = false;
     // ---- the MTP verify window (src/core/glm_mtp.cu): every per-token activation as rows ([row][...] contiguous, the
     //      strides mv_rows reads), the per-row scratch of the one-token path reused row after row
     struct Rows {
@@ -346,6 +403,32 @@ struct Glm5Model::FastState {
     };
     std::vector<LayerPool> lp;   // indexed by absolute layer
     std::vector<int> slot_of;    // il * n_expert + e -> slot in lp[il], -1 absent
+    // the pool is COMPLETE (glmfast::complete_pool: every layer's main slots hold every expert and the spares; fast_setup
+    // sized it so) ...
+    bool complete = false;
+    // ... and, as of the last boundary, every expert of every MoE layer IS in VRAM (the device tables point at all of
+    // them): a route can neither miss nor fetch, so the per-route moe_wait / moe_fetch / moe_cpu_wait launches - no-ops
+    // then - are left out (fast_moe, fast_moe_rows).  Only the boundary and the prompt path's lending change the tables
+    // (a promotion only adds), so it is set there (check_resident) and holds until the next one.
+    // STRATA_GLM_RESIDENT_SKIP=0 launches them anyway (A/B).
+    bool all_resident = false;
+    void check_resident(int l0, int lt, int n_expert) {
+        static const bool on = [] {
+            const char* v = getenv("STRATA_GLM_RESIDENT_SKIP");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        bool all = on;
+        for (int il = l0; il < lt && all; ++il) {
+            if (!L[(size_t) il].moe) continue;
+            const int* so = slot_of.data() + (size_t) il * n_expert;
+            for (int e = 0; e < n_expert; ++e)
+                if (so[e] < 0) {
+                    all = false;
+                    break;
+                }
+        }
+        all_resident = all;
+    }
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
     // the warm-up fills the tiers in its order (this user's experts first)
@@ -510,6 +593,8 @@ struct Glm5Model::FastState {
 // it is wanted at all (not turned off, not the earlier pipelined decode)
 int glm_mtp_draft_cap();
 bool glm_mtp_decode_wanted();
+// whether the drafts of a round go out in one chain on the device (STRATA_GLM_MTP_CHAIN, on where token_embd fits)
+bool glm_mtp_chain();
 
 
 }  // namespace strata::core

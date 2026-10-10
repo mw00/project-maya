@@ -377,7 +377,15 @@ public:
     int lt_ = 0;                                           // the tier layers: [l0_, lt_) = the trunk's + the draft's
     void* mtp_arena_ = nullptr;
     bool load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err);
-    bool fast_mtp(int64_t p, int32_t next_tok, std::string& err);   // the draft block at position p -> mtp_tok
+    // the draft block at position p -> mtp_tok[step] (see glm_fast_path.cu: the chained drafts and the draft head)
+    bool fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step = 0, bool sub = false, bool read_back = true);
+    void mtp_draft_setup();                                // fast_setup: the draft head's rows, the chain's embeddings
+    // the draft vocabulary (load_pack, from the GGUF's tokenizer - see glm_mtp.cu): ids [0, mtp_vlead_) and
+    // mtp_vextra_; mtp_vin_[id] != 0 for each (empty: the whole head)
+    int mtp_vlead_ = 0;
+    std::vector<int32_t> mtp_vextra_;
+    std::vector<uint8_t> mtp_vin_;
+    void mtp_vocab_scan(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs);
 public:
     /// The NextN draft for the token after next: after forward() of position p, given the token chosen for p + 1,
     /// returns the block's greedy proposal for p + 2 (-1: no draft block).  Fills the block's caches at p.
@@ -442,16 +450,19 @@ private:
     int mtp_rows_ = 0;                                     // the verify window's rows this part is sized for (0: none)
     int64_t mtp_hx_pos_ = -1;                              // the tail: the position whose trunk hidden state head_x holds
     // the adaptive draft length: per length n, the rounds' wall time (EMA, ms) and how many; per draft position, how
-    // often it was reached (its earlier drafts all accepted) and accepted
+    // often it was reached (its earlier drafts all accepted) and accepted - decayed counts, the recent text's
+    // (STRATA_GLM_MTP_ACC_WINDOW)
     double mtp_ms_[9] = {};
     uint64_t mtp_seen_[9] = {};
-    uint64_t mtp_reach_[9] = {}, mtp_hit_[9] = {};
+    double mtp_reach_[9] = {}, mtp_hit_[9] = {};
     uint64_t mtp_round_no_ = 0;
     int mtp_best_ = -1;                                    // the length in use, the probe gap and the next probe
     uint64_t mtp_gap_ = 32, mtp_next_probe_ = 0;
     bool mtp_probe_up_ = false;
     int mtp_stint_n_ = 0, mtp_stint_left_ = 0;             // a length's run of rounds (exploring, probing)
     int mtp_prev_n_ = -1, mtp_same_ = 0;                   // the last round's length and the rounds of it in a row
+    double mtp_out_ = 0.0;                                 // the share of emitted tokens outside the draft vocabulary
+                                                           // (an EMA over ~64): above 4%, drafts take the whole head
     int mtp_choose(int n_cap);
     bool mtp_rows_setup(int rows, std::string& err);       // fast_setup: the window's buffers on this part
     void mtp_rows_free();
@@ -462,7 +473,7 @@ private:
     bool mtp_commit(int T, int keep, std::string& err);   // every part: the recurrent states advanced by the kept rows
     // the NextN block's cache-writing half for n entries from p0: entry p0 + i from h + i * n_embd (device, this part)
     // and the token next[i] - eh_proj, the attention norm, kv_a and the indexer's key/gate, no query, no FFN
-    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err);
+    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync = true);
 public:
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
     // ---- the batched prompt path (src/core/glm_prefill.cu)
