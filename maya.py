@@ -186,6 +186,9 @@ MODELS = {
 }
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
+# the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
+# its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
+PROFILE = ROOT / "data" / "expert-profile-glm.bin"
 PACK_FILES = ("index.txt", "native_experts.txt", "dense.bin", "tokenizer/vocab.json", "tokenizer/merges.txt",
               "tokenizer/token_type.json", "tokenizer/chat_template.jinja")
 
@@ -1531,8 +1534,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
+    if PROFILE.exists():
+        cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
-        kept = keep_args(read_json(cfg_path).get("args") or [], cfg["args"], ("--prefill",))
+        old = read_json(cfg_path).get("args") or []
+        kept = keep_args(old, cfg["args"], ("--prefill", "--expert-profile-save", "--expert-profile-save-every"))
+        kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
@@ -1592,6 +1599,35 @@ def keep_args(old: list, new: list, flags: tuple) -> list:
             new += [flag, v]
         kept.append(f"{flag} {v}")
     return kept
+
+
+def flag_value(args: list, flag: str):
+    """The value after `flag` in an argument list, or None."""
+    return args[args.index(flag) + 1] if flag in args[:-1] else None
+
+
+def add_profile(cfg: dict) -> bool:
+    """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
+    would write it: an update restarts the installed config without setting up again.  True when `cfg` changed."""
+    args = cfg.get("args")
+    if not isinstance(args, list) or "--glm-pack" not in args[:-1] or "--expert-profile" in args or not PROFILE.exists():
+        return False
+    args += ["--expert-profile", str(PROFILE)]
+    return True
+
+
+def keep_profile(old: list, new: list) -> list:
+    """A learned expert profile wired in by hand: the old config's --expert-profile replaces the
+    shipped one only when it is another file that still exists (a moved or deleted one falls back to the shipped
+    profile).  `new` is changed in place; what was kept is returned."""
+    mine, shipped = flag_value(old, "--expert-profile"), flag_value(new, "--expert-profile")
+    if not mine or mine == shipped or Path(mine).name == PROFILE.name or not Path(mine).exists():
+        return []                                         # (the shipped one, or another copy's own)
+    if shipped is not None:
+        new[new.index("--expert-profile") + 1] = mine
+    else:
+        new += ["--expert-profile", mine]
+    return ["--expert-profile " + mine]
 
 
 # ------------------------------------------------------------------------------------------------ calibration
@@ -1719,6 +1755,9 @@ def server_command(cfg_path: Path, a) -> tuple:
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
+    if add_profile(cfg):                               # a config written before the expert profile (an update)
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        ok(f"{cfg_path.name}: starts from the shipped expert profile now (--expert-profile {PROFILE})")
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
     port = a.port or cfg.get("port") or 8080

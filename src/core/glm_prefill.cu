@@ -1756,6 +1756,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                   std::to_string(counted) + " of " + std::to_string(T * K) + " routes)";
             return false;
         }
+        if (glmfast::route_dumping()) {   // --dump-routing: the chunk's routes at this layer, position by position
+            std::vector<int> hid((size_t) T * K);
+            std::vector<float> hw((size_t) T * K);
+            cudaMemcpy(hid.data(), M.ids, hid.size() * sizeof(int), cudaMemcpyDeviceToHost);
+            cudaMemcpy(hw.data(), M.rw, hw.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            for (int t = 0; t < T; ++t)
+                glmfast::route_dump(il, K, hid.data() + (size_t) t * K, hw.data() + (size_t) t * K);
+        }
         const auto tp = std::chrono::steady_clock::now();
         // (the split's balance measures both lanes from here: the compute stream is idle, the event is the plan's start)
         if (S->ev_c0 == nullptr) {

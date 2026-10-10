@@ -13,8 +13,8 @@ engine start reads the whole expert set from disk (minutes).  Decode speed only:
 shares itself, layer by layer.
 
 Every measurement answers prompts it has not answered before (PROMPTS), the way a chat's text is new to the expert
-tiers, and the engine works on a copy of this PC's expert usage file (usage_copy) - its own answers must not lead the
-next start's warm-up.
+tiers, and the engine works on a copy of this PC's expert usage file (usage_copy) and saves no learned expert profile
+(without_writes) - its own answers must not lead the next start's warm-up.
 
 A setting is kept only when it beats the engine's own by more than MIN_GAIN in an interleaved re-measurement - the
 expert tiers follow the text and the OS adds noise, so single measurements differ by a few percent.
@@ -194,25 +194,39 @@ class Session:
 def usage_copy(cfg: dict, tmp: Path) -> dict:
     """The env that has the calibration's engine read and write a copy of this PC's expert usage file in `tmp`: the
     engine saves the usage after every answer and the next start's warm-up loads the experts in that order, so ~60
-    answers to the tuning's prompts would lead it with their experts.  The file is the config's STRATA_GLM_USAGE or
-    the pack's expert_usage.txt (the engine's own default); "0" (no usage file) stays."""
-    env = cfg.get("env") or {}
-    own = str(env.get("STRATA_GLM_USAGE", ""))
-    if own == "0":
+    answers to the tuning's prompts would lead it with their experts.  The file is the config's STRATA_GLM_USAGE
+    (opt-in); without one (or "0") the engine keeps none, as the config's own starts do."""
+    own = str((cfg.get("env") or {}).get("STRATA_GLM_USAGE", ""))
+    if own in ("", "0"):
         return {"STRATA_GLM_USAGE": "0"}
-    args = list(cfg.get("args") or [])
-    src = Path(own) if own else (Path(args[args.index("--glm-pack") + 1]) / "expert_usage.txt"
-                                 if "--glm-pack" in args[:-1] else None)
     dst = tmp / "expert_usage.txt"
-    if src is not None and src.is_file():
-        shutil.copyfile(src, dst)
+    if Path(own).is_file():
+        shutil.copyfile(own, dst)
     return {"STRATA_GLM_USAGE": str(dst)}
+
+
+# engine arguments that write the user's files: the learned expert profile (--expert-profile-save) and the routing trace
+WRITES = ("--expert-profile-save", "--expert-profile-save-every", "--dump-routing")
+
+
+def without_writes(args: list) -> list:
+    """`args` less WRITES and their values: the tuning's prompts must not end up in this PC's learned profile (the
+    next start would fill VRAM with their experts) or replace a routing trace."""
+    out, i = [], 0
+    while i < len(args):
+        if args[i] in WRITES:
+            i += 2
+            continue
+        out.append(args[i])
+        i += 1
+    return out
 
 
 def run(cfg: dict, say=print, start_engine=None) -> dict:
     """Measure on the engine `cfg` describes; returns {"settings": {env: value}, "report": {...}}.  The engine runs
     with the config's environment less the settings a calibration owns, so the start's own choice is the baseline,
-    and on a copy of the expert usage file (usage_copy).
+    on a copy of the expert usage file (usage_copy) and without the arguments that write the user's files
+    (without_writes).
     `start_engine(cfg)` returns a started engine (serve.server.StrataEngine, or a stand-in in tests)."""
     if start_engine is None:
         from serve.server import StrataEngine, child_env, engine_args
@@ -220,7 +234,8 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
         def start_engine(c):
             return StrataEngine(c["exe"], engine_args(c), cwd=c.get("cwd"), log=c.get("log"), env=child_env(c))
     with tempfile.TemporaryDirectory(prefix="maya-calibrate-") as tmp:
-        base = {**cfg, "env": {**apply(cfg.get("env") or {}, {}), **usage_copy(cfg, Path(tmp))}}
+        base = {**cfg, "args": without_writes(list(cfg.get("args") or [])),
+                "env": {**apply(cfg.get("env") or {}, {}), **usage_copy(cfg, Path(tmp))}}
         return measure(base, prompt_ids(cfg), start_engine, say, host_thread_extras())
 
 

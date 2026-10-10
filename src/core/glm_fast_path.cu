@@ -16,6 +16,7 @@
 // slot while it is overwritten: the device is parked in that layer's wait kernel, the layer's
 // resident experts are excluded, and every other layer's slots are untouched.
 #include "glm_fast_state.hpp"
+#include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -863,10 +864,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "encoder\n", dev_, per, vb >> 20);
             }
         }
-        // the slots PER LAYER: uniform, or - with the pack's expert_counts.txt (tools/glm_expert_prior.py) - by routing
-        // share: every layer gets a floor, then each further slot goes to the layer whose next-most-routed expert serves
-        // the largest share of its lookups (early layers spread their routing wide and gain the most).
-        // STRATA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
+        // the expert profile (--expert-profile, Strata's profile.bin): read once per half, before the split below
+        if (!profile_path_.empty() && profile_.empty()) {
+            int64_t pslots = 0;
+            std::string perr;
+            if (!read_expert_profile(profile_path_, profile_layers(), g.n_expert, profile_, pslots, perr)) {
+                err = "glm fast: --expert-profile: " + perr;
+                return false;
+            }
+            if (l0_ == 0)
+                std::fprintf(stderr, "glm fast: the expert profile %s ranks %zu (layer, expert) pairs\n",
+                             profile_path_.c_str(), profile_.size());
+        }
+        // the slots PER LAYER: uniform, or - with the expert profile, else the pack's expert_counts.txt
+        // (tools/glm_expert_prior.py) - by routing share: every layer gets a floor, then each further slot goes to the
+        // layer whose next-most-routed expert serves the largest share of its lookups (early layers spread their
+        // routing wide and gain the most).  STRATA_GLM_UNIFORM_SLOTS=1 keeps the uniform split (A/B).
         std::vector<int> nsl((size_t) NL, 0);
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) nsl[(size_t) il] = per;
@@ -874,7 +887,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         // layer rather than spending the capped budget on uneven partitions/spares.
         if (getenv("STRATA_GLM_UNIFORM_SLOTS") == nullptr && !(F->unified_memory && per == g.n_expert)) {
             std::vector<std::vector<double>> share((size_t) NL);
-            std::ifstream cf(pack_dir_ + "/expert_counts.txt");
+            // a profile's ranking as shares: each layer's experts in profile order, valued 1 / (1 + their rank in
+            // the whole profile) - the split below then gives the next slot to the layer whose next expert ranks
+            // highest, so VRAM fills in the profile's order (Strata's --expert-profile), above the floors
+            for (size_t r = 0; r < profile_.size(); ++r) {
+                const int il = profile_[r].first;
+                if (il >= l0_ && il < lt_ && F->L[(size_t) il].moe) share[(size_t) il].push_back(1.0 / (1.0 + (double) r));
+            }
+            std::ifstream cf(profile_.empty() ? pack_dir_ + "/expert_counts.txt" : std::string());
             std::string line;
             while (std::getline(cf, line)) {
                 std::istringstream ss(line);
@@ -1735,13 +1755,15 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
 }
 
 // ---------------------------------------------------------------- the usage profile
-// Where this machine's expert usage is kept between sessions: STRATA_GLM_USAGE=<file> (0: none), else
-// expert_usage.txt in the pack's folder.
-std::string Glm5Model::usage_path() const {
+// Where this machine's expert usage is kept between sessions: only STRATA_GLM_USAGE=<file> (opt-in; unset or 0: none).
+// As in Strata, a start goes by the expert profile and nothing else is learned across starts unless asked for
+// (--expert-profile-save).
+std::string glmfast::usage_file() {
     const char* u = getenv("STRATA_GLM_USAGE");
-    if (u != nullptr) return std::string(u) == "0" ? std::string() : std::string(u);
-    return pack_dir_.empty() ? std::string() : pack_dir_ + "/expert_usage.txt";
+    return u == nullptr || std::string(u) == "0" ? std::string() : std::string(u);
 }
+
+std::string Glm5Model::usage_path() const { return glmfast::usage_file(); }
 
 // Every half's long-memory routes ("layer e:count ..."), one file, written whole and renamed into place.
 bool Glm5Model::save_usage() {
@@ -1780,19 +1802,77 @@ bool Glm5Model::save_usage() {
     return std::rename(tmp.c_str(), up.c_str()) == 0;
 }
 
+// ---------------------------------------------------------------- the expert profile and the routing trace
+namespace glmfast {
+namespace {
+std::mutex g_route_mu;
+std::FILE* g_route_file = nullptr;
+}  // namespace
+bool route_dumping() { return g_route_file != nullptr; }
+void route_dump(int layer, int k, const int* ids, const float* w) {
+    const int32_t rec[2] = {(int32_t) layer, (int32_t) k};
+    std::lock_guard<std::mutex> lk(g_route_mu);
+    if (g_route_file == nullptr) return;
+    std::fwrite(rec, sizeof rec, 1, g_route_file);
+    std::fwrite(ids, sizeof(int32_t), (size_t) k, g_route_file);
+    std::fwrite(w, sizeof(float), (size_t) k, g_route_file);
+}
+}  // namespace glmfast
+
+bool Glm5Model::set_routing_dump(const std::string& path, std::string& err) {
+    std::lock_guard<std::mutex> lk(glmfast::g_route_mu);
+    if (glmfast::g_route_file != nullptr) std::fclose(glmfast::g_route_file);
+    glmfast::g_route_file = path.empty() ? nullptr : std::fopen(path.c_str(), "wb");
+    if (!path.empty() && glmfast::g_route_file == nullptr) {
+        err = "cannot write the routing trace " + path;
+        return false;
+    }
+    return true;
+}
+
+// What the tiers learned, as a profile: every half's experts in VRAM now (a fetch in flight counts: it lands), the
+// routes this run counted (and the usage file's, when STRATA_GLM_USAGE keeps one), then the profile this run started
+// from.
+bool Glm5Model::save_expert_profile(const std::string& path, std::string& err) {
+    if (fast_ == nullptr) {
+        err = "the expert profile needs the fast path";
+        return false;
+    }
+    const int64_t NL = profile_layers(), NE = g_.n_expert;
+    std::vector<uint8_t> resident((size_t) (NL * NE), 0);
+    std::vector<double> heat((size_t) (NL * NE), 0.0);
+    const std::vector<std::pair<int32_t, int32_t>>* prior = &profile_;   // (a half without MoE layers reads none)
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (prior->empty()) prior = &m->profile_;
+        FastState* F = m->fast_;
+        if (F == nullptr) continue;
+        std::lock_guard<std::mutex> lk(F->mu);
+        for (int il = m->l0_; il < m->lt_ && il < NL; ++il)
+            for (int64_t e = 0; e < NE; ++e) {
+                const size_t key = (size_t) (il * NE + e);
+                if (key < F->slot_of.size() && F->slot_of[key] >= 0) resident[key] = 1;
+                if (key < F->usage.size()) heat[key] = (double) F->usage[key];
+            }
+    }
+    return write_expert_profile(path, NL, NE, rank_learned_profile(NL, NE, resident, heat, *prior), err);
+}
+
 // ---------------------------------------------------------------- load-time warm-up
 // VRAM and the pinned RAM tier together hold (nearly) every routed expert, so the whole model is streamed from the
-// shards ONCE at load: each layer's most frequently routed experts (the pack's expert_prior.txt, written by
-// tools/glm_expert_prior.py from routing traces; id order without it) fill its VRAM slots - all but the spares - and
-// the rest fill the RAM tier (a few slots per class stay free for disk reads).  The first request then runs warm and
-// the disk is touched again only for experts that fit nowhere.  STRATA_GLM_WARM=0 skips it (the tiers fill on demand).
+// shards ONCE at load: each layer's experts in the expert profile's order (--expert-profile; without one the pack's
+// expert_prior.txt, written by tools/glm_expert_prior.py from routing traces; id order without either) fill its VRAM
+// slots - all but the spares - and the rest fill the RAM tier (a few slots per class stay free for disk reads).  The
+// first request then runs warm and the disk is touched again only for experts that fit nowhere.  STRATA_GLM_WARM=0
+// skips it (the tiers fill on demand).
 bool Glm5Model::fast_warm(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const auto t0 = std::chrono::steady_clock::now();
     const int NL = g.n_layers + 1;
     std::vector<std::vector<int>> order((size_t) NL);
-    {
+    for (const auto& [il, e] : profile_)
+        if (il >= 0 && il < NL && e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
+    if (profile_.empty()) {
         std::ifstream pf(pack_dir_ + "/expert_prior.txt");
         std::string line;
         while (std::getline(pf, line)) {
@@ -1804,8 +1884,9 @@ bool Glm5Model::fast_warm(std::string& err) {
                 if (e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
         }
     }
-    // THIS user's experts first: the usage profile of earlier sessions (save_usage) leads each layer's order, its
-    // counts become the long memory again, and the LFU counts start from them scaled to at most 32 (enough to keep
+    // With a usage file (STRATA_GLM_USAGE, opt-in) THIS user's experts first: the usage of earlier sessions
+    // (save_usage) leads each layer's order, ahead of the expert profile's, its counts become the long memory
+    // again, and the LFU counts start from them scaled to at most 32 (enough to keep
     // the profile's experts against one-off routes, little enough that a new task takes over within ~100 tokens;
     // a restart then hits ~75% instead of ~67% over the first 50 tokens on one V100, simulated)
     // the routing profile's counts per expert id (expert_counts.txt), for the blend below
@@ -2302,6 +2383,7 @@ void Glm5Model::fast_service() {
             ++F->clock;
             int ids[8];
             for (int i = 0; i < K; ++i) ids[i] = rq->ids[i];
+            if (glmfast::route_dumping()) glmfast::route_dump(il, K, ids, rq->w);   // --dump-routing
             // STRATA_GLM_ROUTE_LOG=<prefix>: "layer e0 .. e7 tier-mask" per route into <prefix>.<device> (cache studies)
             static const char* rlog = getenv("STRATA_GLM_ROUTE_LOG");
             if (rlog != nullptr) {

@@ -209,8 +209,8 @@ it loading the model), with a few splits of the RAM-tier experts between the CPU
 threads - more threads than the memory can feed only wait, and on a hybrid CPU the efficiency cores can hold the rest
 up. Every measurement answers prompts it has not answered before, as a chat's text is new to the expert tiers (the
 same few answers over and over left VRAM holding exactly their experts, and the speed it reported was one no chat
-reached), and the engine works on a copy of your expert usage file, so the tuning's answers do not change what the
-next start loads first. A setting is kept when it is more than 3% faster than the engine's own choice. The result
+reached), and the engine saves no learned expert profile (`--expert-profile-save`) and works on a copy of a usage file
+(`STRATA_GLM_USAGE`), so the tuning's answers do not change what the next start loads first. A setting is kept when it is more than 3% faster than the engine's own choice. The result
 goes into the config's `"env"` (`STRATA_GLM_PCIE_SHARE`, `STRATA_GLM_CPU_LANE`) and into
 `~/.config/project-maya/calibration.json` for this PC, model and context, so setting up again keeps it. Stop a
 running server first: the tuning needs the GPU(s).
@@ -236,7 +236,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_PREFILL_LEND_PCT`, `STRATA_GLM_PREFILL_MB` | 90 or 85, unset | `--prefill auto`: the share of each card's expert-pool slots a prompt may borrow for its buffers - as Strata, 90 when at least 90% of the experts' bytes are held pinned (in VRAM or the RAM tier), else 85 - or a fixed budget in MB |
 | `STRATA_GLM_PREFILL_TAIL_SKIP` | on | single-device prompts without a loaded NextN/MTP block: skip the last layer's attention output projection and FFN after updating all its caches; `0` restores the full computation. Splits and `GLM_CB_DIR` seam dumps keep the full path |
 | `STRATA_GLM_PREFILL_WINDOW` | the chunk's tokens | prompts: the expert output rows kept on the GPU at once - each expert set's rows are added into the layer's output as the window fills, instead of every routed row waiting for one combine (~40 KB a token instead of ~185, so a chunk holds ~2x the tokens); `0` = every row (the old layout) |
-| `STRATA_GLM_USAGE` | `<pack>/expert_usage.txt` | where your expert usage is kept between starts (the warm-up loads your experts first); `0` = off |
+| `STRATA_GLM_USAGE` | off | a file to keep your expert usage in between starts (written after every request; the warm-up then loads your experts ahead of the expert profile's). Off, a start goes by the expert profile alone (below); a pack's old `expert_usage.txt` is no longer read unless this names it |
 | `STRATA_GLM_SLOTS` | 4 | conversations kept aside on the SSD, so switching back to one doesn't re-read its prompt; `0` = off |
 | `STRATA_GLM_SLOT_MIN`, `STRATA_GLM_SLOT_GB`, `STRATA_GLM_SLOT_DIR` | 1024, 16, `<pack>/slots` | the shortest conversation kept aside (tokens, down to 1), their total size on disk (GB), and the folder |
 | `STRATA_GLM_SLOT_KEEP`, `STRATA_GLM_SLOT_DAYS` | off, 7 | `1`: the kept conversations outlive the engine - the folder is not emptied at start (a slot is kept when its `.meta` names this model, engine version and pack, else removed), the conversation in the model is kept when the engine ends, and a slot unused for `STRATA_GLM_SLOT_DAYS` days is removed. With a supervisor that stops the model when it idles (llama-swap), the next request after a restart reads only its new tokens (a 4K-token conversation back in 0.2 s instead of re-read) |
@@ -256,7 +256,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_DSA_SCORE` | on | prompts: the sparse attention's indexer scores as a register-tiled FP32 GEMM (a 3090, 4096 tokens at position 10K: 78.8 -> 5.6 ms); `0` = the warp-per-pool kernel |
 | `STRATA_GLM_PREFILL_ATTN` | tensor cores | prompts' sparse attention kernel: on Ampere and newer an mma.sync kernel with 32 heads a block (a 3090, 26.6K-token prompt: 832 -> 966 tok/s); `wmma` = the 91 KB shared-memory kernel Volta runs, `tcreg` = the register kernel Turing runs, `f32` = the FP32 kernel. AMD: `wmma2`, the default on gfx12 (R9700 / RX 9070: prompts +8-10%), or `f16q`, the default on gfx11 and Strix Halo. `STRATA_GLM_PREFILL_ATTN_CHECK=1` compares the chosen kernel with the FP32 one (debug) |
 | `STRATA_GLM_DROP_CACHE` | on with 2+ NUMA nodes | before the RAM tier is pinned, the model files' clean page cache is dropped (the engine reads experts with O_DIRECT): a cached GGUF filling one node made the interleaved tier land 78% on the other, and the CPU lane read one socket's memory; `0` = keep it |
-| `STRATA_GLM_PROFILE_WEIGHT` | 1 | the weight of the pack's routing profile (`expert_counts.txt`) against your usage file in the start-up order of the expert tiers; `0` = your usage only |
+| `STRATA_GLM_PROFILE_WEIGHT` | 1 | with `STRATA_GLM_USAGE`: the weight of the pack's routing profile (`expert_counts.txt`) against your usage file in the start-up order of the expert tiers; `0` = your usage only |
 | `STRATA_GLM_LOOP_THINK`, `STRATA_GLM_LOOP_ANSWER` | 256, 1024 | the loop guard: when the last this-many generated tokens are one pattern of at most 32 tokens repeated exactly (a quantized model can fall into `0 0 0 ...` until `max_tokens`), thinking is closed at once, and in the answer the model's current tool-call argument (or else the turn) is closed so an agent goes on; a second loop in the same answer ends it. `0` = off |
 | `STRATA_GLM_TIMING`, `STRATA_GLM_POOL_STATS` | off | `1` = timing and cache statistics in the engine log |
 | `STRATA_GLM_SCORE_PREFILL` | off | with `STRATA_GLM_SCORE=<c>` (score `--tokens` after the first c): `1` reads those c tokens through the prompt path instead of one by one, so a long context is scored in minutes (debug: comparing KV-cache formats at long context) |
@@ -267,10 +267,29 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_ENGINE_QUIT_S` | 50 | the server: how long the engine gets to end (and keep its conversation, with `STRATA_GLM_SLOT_KEEP`) after a stop - SIGTERM is handled like Ctrl+C, a second one is ignored; a supervisor's own grace (llama-swap's `unloadTimeout`) should exceed it |
 | `STRATA_ENGINE_WRAP_S` | 40 | the server: on a stop, a request in progress is wrapped up instead of dropped - its thinking is closed at once and it answers for up to this long (then it is cut), so the client gets an answer and the turn ends; requests still queued are refused. Keep it plus the engine's end inside the supervisor's grace (llama-swap's `unloadTimeout`); `0` = cut at once |
 
-**A routing profile for a GGUF of your own.** At start the engine fills VRAM with each layer's most used experts:
-your usage file (above) blended with the pack's profile, `expert_counts.txt` / `expert_prior.txt`. To make one, start
-the model with `STRATA_GLM_USAGE=/tmp/profile.txt` (a fresh file), send it requests typical of your use (code, docs,
-chat, languages), stop it, then run `python tools/glm_expert_prior.py <pack folder> /tmp/profile.txt`.
+**The expert profile** (Strata's `profile.bin`). At start the engine fills VRAM with the experts a profile ranks
+first. That profile ranks every (layer, expert) pair, and its order also decides how many VRAM slots each layer
+gets. Setup passes the shipped one, `data/expert-profile-glm.bin`, to every model (`--expert-profile` in the config's
+`"args"`; a config written before it gets it at its next start, so an update needs no setup). It comes from the router's routing, so it serves every quant of GLM-5.3-Flash: a routing trace of Maya-L
+with the MTP draft block running, over 66 requests (code, math with thinking, chat, eight languages, tool calls, long
+documents). Maya-L on an RTX 3090 + 8x RTX 5060 Ti, a fresh start: decode 40.7 tok/s on average against 35.4 without
+a profile, 96% of the routes served from VRAM at first against 89%. Nothing is
+learned across starts unless you ask for it: while it runs, the engine still moves the experts you use into VRAM, but
+the next start begins from the profile again. These engine arguments go in the config's `"args"`; a setup again keeps
+them:
+
+| Argument | What it does |
+| --- | --- |
+| `--expert-profile FILE` | start from this profile instead of the shipped one |
+| `--expert-profile-save FILE` | save what the expert tiers learned as a profile: the experts in VRAM, then the routing counted, then the profile it started from. Written on exit and every `--expert-profile-save-every MIN` minutes between requests (default 10; `0` = on exit only). Point `--expert-profile` at it to start from there (a file of your own, not the shipped one: a setup again keeps it) |
+| `--dump-routing FILE` | write every route (prompt and answer) as a routing trace, `tools/make_profile.py`'s input |
+
+To build a profile for your own use: start the model once with `--dump-routing /tmp/trace.bin`, send it requests
+typical of your use (code, docs, chat, languages), stop it, then run
+`python tools/make_profile.py --glm --no-base /tmp/trace.bin --out my-profile.bin`. The tool also reads the engine's
+text records - a usage file (`STRATA_GLM_USAGE`), a pack's `expert_counts.txt` - and `--equal` weighs several inputs
+the same. Without any profile, the engine reads a pack's own `expert_counts.txt` / `expert_prior.txt`
+(`tools/glm_expert_prior.py`), else fills in expert order.
 
 **Prompt chunks** (Strata's `--prefill`). The engine reads a prompt in chunks, and every expert a chunk routes to is
 copied into VRAM once per chunk, so larger chunks read long prompts faster; a chunk's buffers are borrowed from the
