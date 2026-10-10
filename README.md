@@ -59,6 +59,13 @@ all of it there and decodes 16.4 tokens/s ([#63](https://github.com/mw00/project
 `./setup.sh --setup --model Maya-L` (Windows: `START-MAYA.bat --setup --model Maya-L`).
 Details: [bench/results/MAYA-L.md](bench/results/MAYA-L.md).
 
+**EXL3 (experimental, NVIDIA only).** The setup can also download turboderp's
+[EXL3 quant of GLM-5.3-Flash](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) at 3.05 bits per
+weight (125.3 GB, exllamav3's format, with the MTP block). The engine reads its weights in place from the
+safetensors; the pack step (`tools/exl3_pack.py`) writes a small GGUF of the unquantized tensors (about 2 GB) beside
+them. Its accuracy has not been measured against the FP8 model the way the Maya quants' has. Set it up with
+`./setup.sh --setup --model EXL3-3.05bpw` (tested on Linux only).
+
 **Files downloaded before 2026-10-09** name the architecture `glm5next`, an early spelling.
 `python tools/gguf_fix_arch.py <the model's first .gguf> --in-place` gives them the standard name, `glm5-next`,
 rewriting only the header. Maya reads either name.
@@ -94,7 +101,7 @@ then `--report`, in a
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 or newer (V100 and newer); one GPU, or up to 16 that share the model (two split the layers in the middle; with more, each takes a share sized to its free VRAM). The engine fills whatever VRAM you have with the most-used experts: more VRAM is faster. Measured: 1 and 2x V100 32 GB; by users: 2x CMP 170HX (above), 1x RTX 3090 and nine GPUs (8x RTX 5060 Ti 16 GB + the 3090). **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070 (one GPU or two) and Strix Halo / Gorgon Halo, Radeon 8060S / 8065S (one GPU), text only ([docs/AMD_MAYA.md](docs/AMD_MAYA.md)). |
 | **RAM** | It runs with **32 GB** (the 2x V100 machine in the speed table above has 30 GB). More RAM keeps more experts close and is faster; what does not fit is read from the SSD while it answers. |
-| **Disk** | **~100 GB free on a fast NVMe SSD** (Maya-S is 96.5 GB, its pictures encoder 1.1 GB, and the engine reads from the model while it answers; Maya-M needs ~120 GB, Maya-L ~160 GB). Not a hard disk. |
+| **Disk** | **~100 GB free on a fast NVMe SSD** (Maya-S is 96.5 GB, its pictures encoder 1.1 GB, and the engine reads from the model while it answers; Maya-M needs ~120 GB, Maya-L ~160 GB, the EXL3 model ~130 GB). Not a hard disk. |
 | **System** | Linux (x86-64; a CPU with AVX2 is best - without it the engine still runs, its CPU expert lane on ggml's slower kernels), NVIDIA driver, CUDA toolkit 12.x (CUDA 13 can be used for Turing and newer, but it no longer compiles for Volta/V100), g++, Python 3.10+. Windows 10/11: experimental, with Visual Studio 2022 Build Tools instead of g++ ([Windows](#windows)). Not WSL2. AMD: ROCm 7 instead of the NVIDIA driver and CUDA (on Windows AMD's ROCm SDK wheels, which the setup offers to install). |
 
 The installer checks all of this and prints the exact command for anything missing. It installs nothing
@@ -255,6 +262,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_KV_INT8` | off | `1` (or `--kv int8` in the config's `"args"`): the attention's latent cache in INT8 - 512 codes and one FP16 scale per 32 values, 544 bytes a token and layer instead of 1024. One V100, 128K context: state 1.78 -> 1.13 GB, 84 more expert slots; no measurable quality change (KL against FP16 within FP16's own run-to-run spread) |
 | `STRATA_GLM_DSA_SCORE` | on | prompts: the sparse attention's indexer scores as a register-tiled FP32 GEMM (a 3090, 4096 tokens at position 10K: 78.8 -> 5.6 ms); `0` = the warp-per-pool kernel |
 | `STRATA_GLM_PREFILL_ATTN` | tensor cores | prompts' sparse attention kernel: on Ampere and newer an mma.sync kernel with 32 heads a block (a 3090, 26.6K-token prompt: 832 -> 966 tok/s); `wmma` = the 91 KB shared-memory kernel Volta runs, `tcreg` = the register kernel Turing runs, `f32` = the FP32 kernel. AMD: `wmma2`, the default on gfx12 (R9700 / RX 9070: prompts +8-10%), or `f16q`, the default on gfx11 and Strix Halo. `STRATA_GLM_PREFILL_ATTN_CHECK=1` compares the chosen kernel with the FP32 one (debug) |
+| `STRATA_GLM_EXL3_MMA_ROWS` | 64 | EXL3 packs' prompts: an expert routed at most this many of a chunk's tokens runs in tensor-core kernels that decode its trellis as they go (RTX 30 and newer); a busier one is decoded to FP16 once and multiplied by cuBLAS. `0` = cuBLAS for every expert |
 | `STRATA_GLM_DROP_CACHE` | on with 2+ NUMA nodes | before the RAM tier is pinned, the model files' clean page cache is dropped (the engine reads experts with O_DIRECT): a cached GGUF filling one node made the interleaved tier land 78% on the other, and the CPU lane read one socket's memory; `0` = keep it |
 | `STRATA_GLM_PROFILE_WEIGHT` | 1 | the weight of the pack's routing profile (`expert_counts.txt`) against your usage file in the start-up order of the expert tiers; `0` = your usage only |
 | `STRATA_GLM_LOOP_THINK`, `STRATA_GLM_LOOP_ANSWER` | 256, 1024 | the loop guard: when the last this-many generated tokens are one pattern of at most 32 tokens repeated exactly (a quantized model can fall into `0 0 0 ...` until `max_tokens`), thinking is closed at once, and in the answer the model's current tool-call argument (or else the turn) is closed so an agent goes on; a second loop in the same answer ends it. `0` = off |

@@ -94,11 +94,15 @@ public:
         if (n <= 0) return;
         std::lock_guard<std::mutex> one(run_mu_);   // a pool a split's parts share: one batch at a time
         const uint64_t g = (gen_.load(std::memory_order_relaxed) + 1) & 0xffffffffu;
-        fn_ = &fn;
-        total_.store(n, std::memory_order_relaxed);
-        done_.store(0, std::memory_order_relaxed);
         // the ticket packs (generation, next index): a straggler of an older batch can never claim (or burn)
-        // an index of this one - its CAS fails on the generation
+        // an index of this one - its CAS fails on the generation.  The old batch's ticket is CLOSED before total_
+        // changes: a straggler that read the spent ticket (old generation, index n_old) and then this batch's larger
+        // total_ would otherwise claim index n_old of the old batch - and run this batch's job with it, done_ counting
+        // it too, so run() could return while a job still ran (a crash once the caller's frame was gone)
+        ticket_.store((g << 32) | 0x7fffffffu, std::memory_order_seq_cst);   // (an index no batch reaches)
+        fn_ = &fn;
+        total_.store(n, std::memory_order_release);
+        done_.store(0, std::memory_order_relaxed);
         ticket_.store(g << 32, std::memory_order_release);
         gen_.store(g, std::memory_order_release);
         if (sleeping_.load(std::memory_order_acquire) > 0) {
@@ -169,6 +173,10 @@ void read_slice(const Glm5Model::Shard& sh, uint64_t off, size_t len, uint8_t* d
 // 16 bytes divide it - llama.cpp's MMQ addresses expert e of a pool partition as base + e * stride in WHOLE blocks,
 // so the prompt path multiplies the resident experts where they lie.
 inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
+    // an EXL3 blob: every piece is a multiple of 256 bytes, no ggml blocks to keep whole (the prompt path does not
+    // multiply these with MMQ)
+    if (gu_type == strata::kernels::exl3::kTypeEXL3 || d_type == strata::kernels::exl3::kTypeEXL3)
+        return (blob + 255) / 256 * 256;
     size_t a = 16;
     const size_t b1 = ggml_type_size((ggml_type) gu_type), b2 = ggml_type_size((ggml_type) d_type);
     if (b1 > 0) a = std::lcm(a, b1);
@@ -278,6 +286,10 @@ struct Glm5Model::FastState {
         WSlot ffn_gate, ffn_up, ffn_down;
         int gu_type = 0, d_type = 0;
         size_t blob = 0, down_off = 0, gu_bytes = 0, dn_bytes = 0;
+        // EXL3 (an exl3.txt pack): the routed experts' blob layout, and the indexer's q_b when it is an EXL3 matrix
+        bool exl3 = false;
+        strata::kernels::exl3::ExpertLayout xl;
+        WSlot idx_q_b_x;
     };
     std::vector<Layer> L;
     // ---- the VRAM tier: per-layer partitions.  A slot is FREE, RESIDENT (in tab), a SPARE (handed to the
@@ -400,6 +412,8 @@ struct Glm5Model::FastState {
     std::vector<strata::kernels::cpu::NativeFmt> cpu_fmt;   // per layer; n_ff == 0: the lane skips that layer
     std::vector<uint8_t> cpu_act, cpu_hq;                    // x's activation quant; 8 h quants
     std::vector<float> cpu_ff, cpu_dn;                       // 8 x n_ff; 8 x n_embd
+    std::vector<float> cpu_x3;                               // EXL3: per expert gate / up inputs, h, down input, out
+    float cpu_x3s[8][3] = {};                                // ... and the three prepared inputs' sums
     std::atomic<uint64_t> cpu_experts{0}, cpu_routes{0}, cpu_us{0};
     std::thread svc;
     std::atomic<bool> quit{false};

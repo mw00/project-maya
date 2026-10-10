@@ -20,6 +20,8 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/exl3_cpu.hpp"
+#include "strata/kernels/cpu/exl3_ref.hpp"
 
 #include "ggml.h"
 
@@ -495,6 +497,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         err = "glm fast: streams/events did not create";
         return false;
     }
+    // an EXL3 pack: its kernels' scratch on the compute stream now (a graph capture cannot allocate it)
+    if (exl3_ && !strata::kernels::exl3::prepare(F->cs)) {
+        err = "glm fast: the EXL3 scratch did not allocate";
+        return false;
+    }
 
     // ---- the weights, resolved once
     const int NL = g.n_layers + 1;   // every per-layer table: the trunk + the NextN block's slot
@@ -577,7 +584,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             Ly.ape = f32("indexer_compressor_ape.weight");
             Ly.idx_k = b16("indexer.attn_k.weight");
             Ly.idx_gate = b16("indexer_compressor_gate.weight");
-            Ly.idx_q_b = b16("indexer.attn_q_b.weight");
+            if (const auto xi = ws_map_.find(P + "indexer.attn_q_b.weight");
+                xi != ws_map_.end() && xi->second.type == strata::kernels::exl3::kTypeEXL3)
+                Ly.idx_q_b_x = xi->second;   // an EXL3 pack quantizes it
+            else
+                Ly.idx_q_b = b16("indexer.attn_q_b.weight");
             Ly.idx_proj = b16("indexer.proj.weight");
             Ly.k_b = b16("attn_k_b.weight");
             Ly.v_b = b16("attn_v_b.weight");
@@ -592,6 +603,22 @@ bool Glm5Model::fast_setup(std::string& err) {
             const auto& nl = pack_layers_[(size_t) il];
             if (nl.layer < 0) {
                 missing += P + "native experts ";
+            } else if (nl.x_cb >= 0) {
+                // EXL3: the blob is [gate | up | down], a part [trellis | suh | svh]
+                Ly.exl3 = true;
+                Ly.gu_type = Ly.d_type = strata::kernels::exl3::kTypeEXL3;
+                Ly.gu_bytes = nl.x_part(0);
+                Ly.dn_bytes = nl.x_part(2);
+                Ly.down_off = 2 * Ly.gu_bytes;
+                Ly.blob = 2 * Ly.gu_bytes + Ly.dn_bytes;
+                Ly.xl.cb = nl.x_cb;
+                for (int r = 0; r < 3; ++r) {
+                    const size_t base = r == 0 ? 0 : r == 1 ? Ly.gu_bytes : Ly.down_off;
+                    Ly.xl.trellis[r] = base;
+                    Ly.xl.suh[r] = base + nl.x_piece(r, 0);
+                    Ly.xl.svh[r] = base + nl.x_piece(r, 0) + nl.x_piece(r, 1);
+                    Ly.xl.K[r] = nl.x_K[r];
+                }
             } else {
                 Ly.gu_type = nl.fmt.gu_type;
                 Ly.d_type = nl.fmt.d_type;
@@ -1338,6 +1365,76 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
         const char* v = getenv("STRATA_GLM_CPU_SPLIT");
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
     }();
+    if (Ly.exl3) {
+        // EXL3 (mul1), in jobs of ~260K weights so a route's few experts still fill the pool: (1) each expert's gate
+        // and up inputs; (2) per expert, matrix, band of 128 columns and half of the inputs, the byte-sum products;
+        // (3) per expert and band, gate and up finished, the clamped swiglu, and that block of the down input; (4) per
+        // expert and band of 128 outputs, the down rows; the weighted sum in i order
+        const int E = n_embd, FF = n_ff, GB = FF / 128, DB = E / 128, KH = E / 32;   // KH: 16-row slices a half
+        // per expert: xg[E] xu[E] xd[FF] dn[E] acc[2 GB 2 128] xds[GB]
+        const size_t per = 3 * (size_t) E + (size_t) FF + 2 * (size_t) GB * 2 * 128 + (size_t) GB;
+        float* buf = F->cpu_x3.data();
+        const auto part = [&](int i, int r) {
+            kc::Exl3Part p;
+            p.trellis = (const uint32_t*) (blob[i] + Ly.xl.trellis[r]);
+            p.suh = (const uint16_t*) (blob[i] + Ly.xl.suh[r]);
+            p.svh = (const uint16_t*) (blob[i] + Ly.xl.svh[r]);
+            p.k = r < 2 ? E : FF;
+            p.n = r < 2 ? FF : E;
+            p.K = Ly.xl.K[r];
+            return p;
+        };
+        const auto xg = [&](int i) { return buf + (size_t) i * per; };
+        const auto xd = [&](int i) { return buf + (size_t) i * per + 2 * (size_t) E; };
+        const auto dn = [&](int i) { return buf + (size_t) i * per + 2 * (size_t) E + FF; };
+        const auto acc = [&](int i, int r, int b, int h) {
+            return buf + (size_t) i * per + 3 * (size_t) E + FF + (((size_t) r * GB + b) * 2 + h) * 128;
+        };
+        const auto xds = [&](int i) { return buf + (size_t) i * per + 3 * (size_t) E + FF + 2 * (size_t) GB * 2 * 128; };
+        F->cpu_pool->run(2 * ne, [&](int job) {
+            const int i = job >> 1, r = job & 1;
+            F->cpu_x3s[i][r] = kc::exl3_cpu_prepare(part(i, r), x, xg(i) + (size_t) r * E);
+        });
+        F->cpu_pool->run(ne * 2 * GB * 2, [&](int job) {
+            const int h = job & 1, b = (job >> 1) % GB, r = (job >> 1) / GB % 2, i = (job >> 1) / GB / 2;
+            kc::exl3_cpu_band_acc(part(i, r), xg(i) + (size_t) r * E, b * 128, h * KH, (h + 1) * KH, acc(i, r, b, h));
+        });
+        const float lim = g.swiglu_exp;
+        F->cpu_pool->run(ne * GB, [&](int job) {
+            const int i = job / GB, b = job % GB;
+            float y[2][128], a[128];
+            for (int r = 0; r < 2; ++r) {
+                const float* a0 = acc(i, r, b, 0);
+                const float* a1 = acc(i, r, b, 1);
+                for (int j = 0; j < 128; ++j) a[j] = a0[j] + a1[j];
+                kc::exl3_cpu_band_out(part(i, r), a, F->cpu_x3s[i][r], b * 128, y[r]);
+            }
+            float hb[128];
+            for (int j = 0; j < 128; ++j) {
+                float gv = y[0][j], uv = y[1][j];
+                if (lim > 0.0f) {
+                    gv = std::min(gv, lim);
+                    uv = std::min(std::max(uv, -lim), lim);
+                }
+                hb[j] = gv / (1.0f + std::exp(-gv)) * uv;
+            }
+            xds(i)[b] = kc::exl3_cpu_prepare_block(part(i, 2).suh + b * 128, hb, xd(i) + (size_t) b * 128);
+        });
+        F->cpu_pool->run(ne * DB, [&](int job) {
+            const int i = job / DB, b = job % DB;
+            float s = 0.0f, a[128];
+            for (int j = 0; j < GB; ++j) s += xds(i)[j];
+            const kc::Exl3Part pd = part(i, 2);
+            kc::exl3_cpu_band_acc(pd, xd(i), b * 128, 0, FF / 16, a);
+            kc::exl3_cpu_band_out(pd, a, s, b * 128, dn(i) + (size_t) b * 128);
+        });
+        for (int r = 0; r < E; ++r) {
+            float m = 0.0f;
+            for (int i = 0; i < ne; ++i) m += w[i] * dn(i)[r];
+            out[r] = m;
+        }
+        return;
+    }
     const int threads = F->cpu_pool->active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
     kc::native_quant_act(nf, x, F->cpu_act.data());
@@ -1373,7 +1470,7 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     // STRATA_GLM_CPU_LANE_VERIFY=1 (debug, slow): the same experts in double precision from ggml's dequantised rows;
     // the relative L2 distance of the lane's sum, accumulated and printed every 16 calls
     static const bool verify = getenv("STRATA_GLM_CPU_LANE_VERIFY") != nullptr;
-    if (verify) {
+    if (verify && !Ly.exl3) {
         static double e2 = 0, n2 = 0, worst = 0;
         static int calls = 0;
         const ggml_type_traits* tg = ggml_get_type_traits((ggml_type) Ly.gu_type);
@@ -1547,6 +1644,17 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.moe || Ly.mtp) continue;
+        if (Ly.exl3) {
+            // EXL3: the CPU kernel takes the mul1 codebook (the others stay on the PCIe lane); n_ff marks the layer
+            if (Ly.xl.cb == 2) {
+                auto& f = F->cpu_fmt[(size_t) il];
+                f.gu_type = f.d_type = strata::kernels::exl3::kTypeEXL3;
+                f.n_embd = g.n_embd;
+                f.n_ff = g.n_ff_exp;
+                if (il_cal < 0) il_cal = il;
+            }
+            continue;
+        }
         std::string e2;
         kc::NativeFmt f;
         if (kc::native_fmt(Ly.gu_type, Ly.d_type, g.n_embd, g.n_ff_exp, f, e2) && f.h_bytes <= kc::kNativeHBytes)
@@ -1592,6 +1700,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     F->cpu_hq.assign((size_t) 8 * kc::kNativeHBytes, 0);
     F->cpu_ff.assign((size_t) 8 * g.n_ff_exp, 0.0f);
     F->cpu_dn.assign((size_t) 8 * g.n_embd, 0.0f);
+    if (exl3_)   // (fast_cpu_experts' EXL3 layout, per expert)
+        F->cpu_x3.assign((size_t) 8 * (3 * (size_t) g.n_embd + (size_t) g.n_ff_exp + 4 * (size_t) g.n_ff_exp +
+                                       (size_t) g.n_ff_exp / 128), 0.0f);
     // the service thread is the pool's last worker; idle workers spin 20 ms (a decode's routes come ~1 ms apart)
     if (shared) {
         F->cpu_pool = shared_cpu_pool(threads);
@@ -1716,7 +1827,73 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                  c_ms, p_ms, tab.c_str());
     // STRATA_GLM_CPU_LANE_CHECK=1: the calibration expert on one normalised input three ways - the device's decode
     // kernels, the CPU lane, and a double-precision reference from ggml's dequantised rows - and their distances
-    if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr) {
+    if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr && F->L[(size_t) il_cal].exl3) {
+        // EXL3: the device's kernels, the CPU lane, and the scalar reference (exl3_ref, double sums)
+        namespace x3 = strata::kernels::exl3;
+        const int E = g.n_embd, FFE = g.n_ff_exp;
+        const auto& Ly = F->L[(size_t) il_cal];
+        std::vector<float> xc((size_t) E), og((size_t) E), oc((size_t) E);
+        double ss = 0;
+        for (int i = 0; i < E; ++i) {
+            xc[(size_t) i] = std::sin(0.71f * i) + ((i % 97) == 0 ? 6.0f : 0.0f);
+            ss += (double) xc[(size_t) i] * xc[(size_t) i];
+        }
+        for (auto& v : xc) v = (float) (v / std::sqrt(ss / E));
+        float *dx = nullptr, *dout = nullptr;
+        cudaMalloc(&dx, (size_t) E * 4);
+        cudaMalloc(&dout, (size_t) E * 4);
+        cudaMemcpy(dx, xc.data(), (size_t) E * 4, cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(F->scratch, cal, blob, cudaMemcpyHostToDevice, F->cs);
+        const unsigned long long sp = (unsigned long long) F->scratch;
+        const float one = 1.0f;
+        cudaMemcpyAsync(F->md.plan_ptr, &sp, 8, cudaMemcpyHostToDevice, F->cs);
+        cudaMemcpyAsync(F->md.plan_w, &one, 4, cudaMemcpyHostToDevice, F->cs);
+        cudaMemsetAsync(F->md.cpu_flag, 0, 4, F->cs);
+        x3::MoeArgs xa;
+        xa.plan_ptr = F->md.plan_ptr;
+        xa.plan_w = F->md.plan_w;
+        xa.cpu_part = F->md.cpu_part;
+        xa.cpu_flag = F->md.cpu_flag;
+        xa.lay = Ly.xl;
+        xa.k = 1;
+        xa.n_embd = E;
+        xa.n_ff = FFE;
+        xa.limit = g.swiglu_exp;
+        x3::moe_gate_up(xa, dx, nullptr, F->cs);
+        x3::moe_down(xa, nullptr, nullptr, dout, F->cs);
+        cudaMemcpyAsync(og.data(), dout, (size_t) E * 4, cudaMemcpyDeviceToHost, F->cs);
+        cudaStreamSynchronize(F->cs);
+        fast_cpu_experts(il_cal, 1, &cal, &one, xc.data(), oc.data());
+        // the reference
+        const auto ref_mv = [&](int r, const float* in, float* o) {
+            const int k = r < 2 ? E : FFE, n = r < 2 ? FFE : E;
+            std::vector<float> wt((size_t) k * n);
+            kc::exl3_inner((const uint32_t*) (cal + Ly.xl.trellis[r]), n / 16, k, n, Ly.xl.K[r], Ly.xl.cb, wt.data());
+            kc::exl3_mv(wt.data(), (const uint16_t*) (cal + Ly.xl.suh[r]), (const uint16_t*) (cal + Ly.xl.svh[r]), k, n,
+                        in, o);
+        };
+        std::vector<float> gr((size_t) FFE), ur((size_t) FFE), hr((size_t) FFE), orf((size_t) E);
+        ref_mv(0, xc.data(), gr.data());
+        ref_mv(1, xc.data(), ur.data());
+        const float lim = g.swiglu_exp;
+        for (int r = 0; r < FFE; ++r) {
+            const float gs = std::min(gr[(size_t) r], lim), us = std::min(std::max(ur[(size_t) r], -lim), lim);
+            hr[(size_t) r] = gs / (1.0f + std::exp(-gs)) * us;
+        }
+        ref_mv(2, hr.data(), orf.data());
+        double nr = 0, eg = 0, ec = 0, egc = 0;
+        for (int r = 0; r < E; ++r) {
+            nr += (double) orf[(size_t) r] * orf[(size_t) r];
+            eg += (double) (og[(size_t) r] - orf[(size_t) r]) * (og[(size_t) r] - orf[(size_t) r]);
+            ec += (double) (oc[(size_t) r] - orf[(size_t) r]) * (oc[(size_t) r] - orf[(size_t) r]);
+            egc += (double) (og[(size_t) r] - oc[(size_t) r]) * (og[(size_t) r] - oc[(size_t) r]);
+        }
+        std::fprintf(stderr, "glm fast: CPU lane check (layer %d, EXL3 K %d/%d/%d): relative L2 error vs the reference: "
+                             "device %.5f, CPU lane %.5f; device vs CPU lane %.5f\n", il_cal, Ly.xl.K[0], Ly.xl.K[1],
+                     Ly.xl.K[2], std::sqrt(eg / nr), std::sqrt(ec / nr), std::sqrt(egc / nr));
+        cudaFree(dx);
+        cudaFree(dout);
+    } else if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr) {
         const int E = g.n_embd, FFE = g.n_ff_exp;
         const auto& Ly = F->L[(size_t) il_cal];
         const auto& nf = F->cpu_fmt[(size_t) il_cal];
@@ -1996,6 +2173,16 @@ bool Glm5Model::fast_warm(std::string& err) {
             progress = true;
         }
     }
+    // EXL3 experts in file order: the warm-up reads whole experts (fast_read_expert_x3), and in the order the
+    // routes rank them the reads seek all over the model's files (a cold read from a disk at ~0.05 GB/s)
+    if (exl3_)
+        std::stable_sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
+            const auto& na = pack_layers_[(size_t) a.il];
+            const auto& nb2 = pack_layers_[(size_t) b.il];
+            if (na.x_cb < 0 || nb2.x_cb < 0) return false;
+            const size_t ia = (size_t) a.e * 9, ib = (size_t) b.e * 9;
+            return std::make_pair(na.x_shard[ia], na.x_off[ia]) < std::make_pair(nb2.x_shard[ib], nb2.x_off[ib]);
+        });
     // stream them: 8 experts per batch, 3 slices each in parallel; VRAM ones through the pinned staging
     size_t done_bytes = 0, total_bytes = 0;
     for (const auto& j : jobs) total_bytes += F->L[(size_t) j.il].blob;
@@ -2007,6 +2194,10 @@ bool Glm5Model::fast_warm(std::string& err) {
             const int role = job % 3;
             const auto& Ly = F->L[(size_t) J.il];
             const auto& nl = pack_layers_[(size_t) J.il];
+            if (nl.x_cb >= 0) {   // EXL3: the expert's nine pieces in as few reads as they allow (the first job of 3)
+                if (role == 0) fast_read_expert_x3(J.il, J.e, J.vram ? F->stage[(size_t) (job / 3)] : J.dst);
+                return;
+            }
             const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
             const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) J.e * Ly.gu_bytes
                                  : role == 1 ? nl.up_off + (uint64_t) J.e * Ly.gu_bytes
@@ -2593,11 +2784,71 @@ void Glm5Model::fast_service() {
     }
 }
 
+// a whole EXL3 expert into its blob: the nine pieces sorted by file offset, those less than 64 KB apart read as one
+// range through a bounce buffer (the 3.05 bpw files keep an expert's three trellises together and its scales elsewhere:
+// two reads instead of nine; files that keep the whole expert together: one)
+void Glm5Model::fast_read_expert_x3(int il, int e, uint8_t* blob) {
+    const auto& Ly = fast_->L[(size_t) il];
+    const auto& nl = pack_layers_[(size_t) il];
+    struct Piece {
+        int sh;
+        uint64_t off;
+        size_t len;
+        uint8_t* dst;
+    } p[9];
+    for (int r = 0; r < 3; ++r) {
+        uint8_t* at = blob + (r == 0 ? 0 : r == 1 ? Ly.gu_bytes : Ly.down_off);
+        for (int j = 0; j < 3; ++j) {
+            const size_t i = (size_t) e * 9 + (size_t) r * 3 + (size_t) j;
+            p[r * 3 + j] = Piece{nl.x_shard[i], nl.x_off[i], nl.x_piece(r, j), at};
+            at += nl.x_piece(r, j);
+        }
+    }
+    std::sort(p, p + 9, [](const Piece& a, const Piece& b) { return std::make_pair(a.sh, a.off) < std::make_pair(b.sh, b.off); });
+    static thread_local std::vector<uint8_t> bounce;
+    for (int a = 0; a < 9;) {
+        int b = a + 1;
+        uint64_t end = p[a].off + p[a].len;
+        while (b < 9 && p[b].sh == p[a].sh && p[b].off <= end + (64u << 10)) {
+            end = std::max<uint64_t>(end, p[b].off + p[b].len);
+            ++b;
+        }
+        const Shard& sh = pack_shards_[(size_t) p[a].sh];
+        if (b == a + 1) {
+            read_slice(sh, p[a].off, p[a].len, p[a].dst);
+        } else {
+            bounce.resize((size_t) (end - p[a].off));
+            read_slice(sh, p[a].off, (size_t) (end - p[a].off), bounce.data());
+            for (int k = a; k < b; ++k) std::memcpy(p[k].dst, bounce.data() + (p[k].off - p[a].off), p[k].len);
+        }
+        a = b;
+    }
+}
+
 // one part (0 gate, 1 up, 2 down) of expert e of layer il - or its chunk-th of n_chunks equal pieces - from the shards
 // into its place in the blob at `blob`
 void Glm5Model::fast_read_part(int il, int e, int role, uint8_t* blob, int chunk, int n_chunks) {
     const auto& Ly = fast_->L[(size_t) il];
     const auto& nl = pack_layers_[(size_t) il];
+    if (nl.x_cb >= 0) {
+        // EXL3: the part's three pieces (trellis, suh, svh) from wherever the safetensors keep them; the chunks split
+        // the trellis, the scales come with the first
+        size_t at = role == 0 ? 0 : role == 1 ? Ly.gu_bytes : Ly.down_off;
+        for (int j = 0; j < 3; ++j) {
+            const size_t i = (size_t) e * 9 + (size_t) role * 3 + (size_t) j;
+            const size_t len = nl.x_piece(role, j);
+            const Shard& xs = pack_shards_[(size_t) nl.x_shard[i]];
+            if (j == 0) {
+                const size_t piece = ((len + (size_t) n_chunks - 1) / (size_t) n_chunks + 4095) & ~(size_t) 4095;
+                const size_t c0 = std::min(len, (size_t) chunk * piece), c1 = std::min(len, c0 + piece);
+                if (c1 > c0) read_slice(xs, nl.x_off[i] + c0, c1 - c0, blob + at + c0);
+            } else if (chunk == 0) {
+                read_slice(xs, nl.x_off[i], len, blob + at);
+            }
+            at += len;
+        }
+        return;
+    }
     const Shard& sh = pack_shards_[(size_t) (role == 0 ? nl.gate_shard : role == 1 ? nl.up_shard : nl.down_shard)];
     const uint64_t off = role == 0   ? nl.gate_off + (uint64_t) e * Ly.gu_bytes
                          : role == 1 ? nl.up_off + (uint64_t) e * Ly.gu_bytes
@@ -3235,8 +3486,12 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     gf::dsa_prep(d, s);
     if (F->prof_on) F->mark("dsa_prep");
     gf::MvJob j2[2];
-    j2[0] = {Ly.q_b.q, F->qr_q, nullptr, F->q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.qk_nope};
-    j2[1] = {Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora, g.idx_heads * g.idx_key};
+    j2[0] = {Ly.q_b.q, F->qr_q, F->qr, F->q, nullptr, 1.0f, Ly.q_b.type, g.q_lora, g.n_head * g.qk_nope};
+    j2[1] = Ly.idx_q_b_x.q != nullptr
+                ? gf::MvJob{Ly.idx_q_b_x.q, F->qr_q, F->qr, F->iq, nullptr, 1.0f, Ly.idx_q_b_x.type, g.q_lora,
+                            g.idx_heads * g.idx_key}
+                : gf::MvJob{Ly.idx_q_b, nullptr, F->qr, F->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
+                            g.idx_heads * g.idx_key};
     if (!gf::mv(j2, 2, s)) { err = "glm fast: dsa q"; return false; }
     if (F->prof_on) F->mark("dsa_q_mv");
     if (dumps) {
@@ -3286,8 +3541,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     gf::MvJob j[gf::kMaxMvJobs];
     int nj = 3;
     j[0] = {Ly.router, nullptr, F->x, F->rlog, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_expert};
-    j[1] = {Ly.sh_gate.q, F->xq, nullptr, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
-    j[2] = {Ly.sh_up.q, F->xq, nullptr, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
+    j[1] = {Ly.sh_gate.q, F->xq, F->x, F->sh_g, nullptr, 1.0f, Ly.sh_gate.type, g.n_embd, FFs};
+    j[2] = {Ly.sh_up.q, F->xq, F->x, F->sh_u, nullptr, 1.0f, Ly.sh_up.type, g.n_embd, FFs};
     // the next layer's router on THIS layer's FFN input: its experts, one layer early
     // (only with prefetch on: the prediction costs a router GEMV and a second top-k per layer)
     const bool pred = F->max_pf > 0 && il + 1 < l1_ && F->L[(size_t) il + 1].moe;
@@ -3359,6 +3614,29 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     // this layer's own prefetched experts (issued one layer ago) must have landed before they are read
     if (pf_pending) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
     pf_pending = false;
+    if (Ly.exl3) {
+        // EXL3: the shared expert's down first (its h is moe_route's q8_1), then the routed experts' gate/up/swiglu
+        // and down over the F32 FFN input, summed in plan order with the CPU lane's part and the shared expert
+        if (Ly.sh_down.q != nullptr) {
+            const gf::MvJob sd = {Ly.sh_down.q, F->sh_hq, nullptr, F->sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs,
+                                  g.n_embd};
+            if (!gf::mv(&sd, 1, s)) { err = "glm fast: shared expert down"; return false; }
+        }
+        strata::kernels::exl3::MoeArgs xa;
+        xa.plan_ptr = md.plan_ptr;
+        xa.plan_w = md.plan_w;
+        xa.cpu_part = md.cpu_part;
+        xa.cpu_flag = md.cpu_flag;
+        xa.lay = Ly.xl;
+        xa.k = g.n_exp_used;
+        xa.n_embd = g.n_embd;
+        xa.n_ff = g.n_ff_exp;
+        xa.limit = g.swiglu_exp;
+        strata::kernels::exl3::moe_gate_up(xa, F->x, nullptr, s);
+        if (F->prof_on) F->mark("moe_gate_up");
+        strata::kernels::exl3::moe_down(xa, nullptr, Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
+        if (F->prof_on) F->mark("moe_down");
+    } else {
     // (the shared expert's down rides the gate/up launch: sh_out)
     gf::moe_gate_up(Ly.gu_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, g.swiglu_exp, F->xq, F->hq, Ly.sh_down.q,
                     Ly.sh_down.type, F->sh_hq, FFs, F->sh_out, s);
@@ -3366,6 +3644,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     gf::moe_down(Ly.d_type, md, g.n_exp_used, g.n_embd, g.n_ff_exp, Ly.down_off, F->hq,
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, F->ffn, s);
     if (F->prof_on) F->mark("moe_down");
+    }
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked
     if (lane) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
@@ -3431,9 +3710,9 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
         if (Ly.recr) {
             const int DI = g.d_inner();
             gf::MvJob j[6];
-            j[0] = {Ly.q.q, F->xq, nullptr, F->proj[0], nullptr, 1.0f, Ly.q.type, g.n_embd, DI};
-            j[1] = {Ly.k.q, F->xq, nullptr, F->proj[1], nullptr, 1.0f, Ly.k.type, g.n_embd, DI};
-            j[2] = {Ly.v.q, F->xq, nullptr, F->proj[2], nullptr, 1.0f, Ly.v.type, g.n_embd, DI};
+            j[0] = {Ly.q.q, F->xq, F->x, F->proj[0], nullptr, 1.0f, Ly.q.type, g.n_embd, DI};
+            j[1] = {Ly.k.q, F->xq, F->x, F->proj[1], nullptr, 1.0f, Ly.k.type, g.n_embd, DI};
+            j[2] = {Ly.v.q, F->xq, F->x, F->proj[2], nullptr, 1.0f, Ly.v.type, g.n_embd, DI};
             j[3] = {Ly.f_a, nullptr, F->x, F->fa, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
             j[4] = {Ly.g_a, nullptr, F->x, F->ga, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.kda_head_dim};
             j[5] = {Ly.beta, nullptr, F->x, F->beta, nullptr, 1.0f, gf::kTypeBF16, g.n_embd, g.n_head};
@@ -3490,8 +3769,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
 
         if (!Ly.moe) {
             gf::MvJob j[2];
-            j[0] = {Ly.ffn_gate.q, F->xq, nullptr, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
-            j[1] = {Ly.ffn_up.q, F->xq, nullptr, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
+            j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
+            j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
             if (!gf::mv(j, 2, s)) { err = "glm fast: dense ffn"; return false; }
             if (F->prof_on) F->mark("dense_gu_mv");
             gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);

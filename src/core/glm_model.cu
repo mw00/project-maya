@@ -99,6 +99,108 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
     return true;
 }
 
+// tools/exl3_pack.py's exl3.txt (an EXL3 pack; absent for a GGUF pack): the safetensors files, the EXL3 matrices
+// (index rows of kind x) and every routed expert's nine pieces.  false + empty err: no such file.
+namespace {
+struct Exl3Table {
+    std::vector<std::string> files;
+    struct Mat {
+        int file = 0;
+        uint64_t tr = 0, suh = 0, svh = 0;
+        int k = 0, n = 0, K = 0, cb = 2;
+        uint64_t vram() const {   // as load_pack uploads it: each piece 256-aligned
+            const auto up = [](uint64_t b) { return (b + 255u) & ~(uint64_t) 255u; };
+            return up((uint64_t) k * n * K / 8) + up(2 * (uint64_t) k) + up(2 * (uint64_t) n);
+        }
+    };
+    std::map<std::string, Mat> mats;
+    struct Layer {
+        int cb = -1, K[3] = {0, 0, 0}, k[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+        std::vector<int> file;        // [9 e + 3 r + j]
+        std::vector<uint64_t> off;
+        uint64_t part(int r) const { return (uint64_t) k[r] * n[r] * K[r] / 8 + 2 * (uint64_t) k[r] + 2 * (uint64_t) n[r]; }
+        uint64_t blob() const { return 2 * part(0) + part(2); }
+    };
+    std::map<int, Layer> layers;
+};
+}  // namespace
+
+static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& err, int n_expert = 0) {
+    err.clear();
+    std::ifstream f(pack_dir + "/exl3.txt");
+    if (!f) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string what;
+        ss >> what;
+        if (what == "file") {
+            int i = -1;
+            std::string nm;
+            if (!(ss >> i >> nm) || i != (int) t.files.size()) {
+                err = "exl3.txt: bad file line: " + line;
+                return false;
+            }
+            t.files.push_back(nm);
+        } else if (what == "mat") {
+            std::string nm;
+            Exl3Table::Mat m;
+            if (!(ss >> nm >> m.file >> m.tr >> m.suh >> m.svh >> m.k >> m.n >> m.K >> m.cb) || m.file < 0 ||
+                m.file >= (int) t.files.size()) {
+                err = "exl3.txt: bad mat line: " + line;
+                return false;
+            }
+            t.mats[nm] = m;
+        } else if (what == "layer") {
+            int il = -1;
+            Exl3Table::Layer L;
+            uint64_t gu = 0, dn = 0;
+            if (!(ss >> il >> L.cb >> L.K[0] >> L.K[1] >> L.K[2] >> L.k[0] >> L.n[0] >> L.k[2] >> L.n[2] >> gu >> dn)) {
+                err = "exl3.txt: bad layer line: " + line;
+                return false;
+            }
+            L.k[1] = L.k[0];
+            L.n[1] = L.n[0];
+            if (L.part(0) != gu || L.part(2) != dn) {
+                err = "exl3.txt: layer " + std::to_string(il) + "'s part sizes disagree with its shapes";
+                return false;
+            }
+            if (n_expert > 0) {
+                L.file.assign((size_t) n_expert * 9, -1);
+                L.off.assign((size_t) n_expert * 9, 0);
+            }
+            t.layers[il] = std::move(L);
+        } else if (what == "e") {
+            if (n_expert <= 0) continue;   // the sizing passes need the layers only
+            int il = -1, e = -1;
+            ss >> il >> e;
+            auto it = t.layers.find(il);
+            if (it == t.layers.end() || e < 0 || e >= n_expert) {
+                err = "exl3.txt: expert line for an unknown layer / expert: " + line;
+                return false;
+            }
+            for (int j = 0; j < 9; ++j) {
+                int fi = -1;
+                uint64_t off = 0;
+                if (!(ss >> fi >> off) || fi < 0 || fi >= (int) t.files.size()) {
+                    err = "exl3.txt: bad expert line: " + line;
+                    return false;
+                }
+                it->second.file[(size_t) e * 9 + (size_t) j] = fi;
+                it->second.off[(size_t) e * 9 + (size_t) j] = off;
+            }
+        }
+    }
+    for (const auto& kv : t.layers)
+        for (size_t i = 0; i < kv.second.file.size(); ++i)
+            if (kv.second.file[i] < 0) {
+                err = "exl3.txt: layer " + std::to_string(kv.first) + " lacks expert " + std::to_string(i / 9);
+                return false;
+            }
+    return true;
+}
+
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
 // token_embd on the host (the embedding row is dequantized there from the shard mapping)
@@ -789,6 +891,11 @@ static std::vector<int> glm_auto_bounds(const std::string& pack_dir, int n_layer
             if (ss >> layer >> gu >> dt >> off >> blob && layer >= 0 && layer < n_layers)
                 cost[(size_t) layer] += (double) blob * n_expert;
         }
+        Exl3Table xt;   // an EXL3 pack keeps its experts in exl3.txt
+        std::string xe;
+        if (exl3_table(pack_dir, xt, xe))
+            for (const auto& kv : xt.layers)
+                if (kv.first >= 0 && kv.first < n_layers) cost[(size_t) kv.first] += (double) kv.second.blob() * n_expert;
     }
     int cur = 0;
     cudaGetDevice(&cur);
@@ -900,6 +1007,11 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     const auto tensor_bytes = [](const strata::TensorInfo* t) {
         return (double) ggml_row_size((ggml_type) t->type, t->shape[0]) * (double) (t->elements() / t->shape[0]);
     };
+    Exl3Table xtab;   // an EXL3 pack: its matrices (index kind x) and experts
+    {
+        std::string xe;
+        exl3_table(pack_dir, xtab, xe);
+    }
     // the dense weights: per layer, the rows every part loads, the head's (the last part) and token_embd (the first,
     // off the fast path)
     std::vector<double> dense((size_t) L + 1, 0.0);
@@ -913,8 +1025,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             std::string nm, served, kind;
             ss >> nm >> served >> kind;
             const strata::TensorInfo* t = find(nm);
-            if (t == nullptr) continue;
-            const double b = (double) pack_row_vram(nm, kind, t, fast);
+            const auto xm = xtab.mats.find(nm);
+            if (t == nullptr && (kind != "x" || xm == xtab.mats.end())) continue;
+            const double b = kind == "x" ? (double) xm->second.vram() : (double) pack_row_vram(nm, kind, t, fast);
             if (nm.rfind("blk.", 0) == 0) {
                 const int il = std::atoi(nm.c_str() + 4);
                 if (il >= 0 && il < L) dense[(size_t) il] += b;
@@ -945,6 +1058,12 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             blob[(size_t) il] = (double) b;
             stride[(size_t) il] = (double) glmfast::expert_stride((size_t) b, (int) gu, (int) dt);
         }
+        for (const auto& kv : xtab.layers)
+            if (kv.first >= 0 && kv.first < L) {
+                blob[(size_t) kv.first] = (double) kv.second.blob();
+                stride[(size_t) kv.first] = (double) glmfast::expert_stride(
+                    (size_t) kv.second.blob(), strata::kernels::exl3::kTypeEXL3, strata::kernels::exl3::kTypeEXL3);
+            }
     }
     // the NextN draft block: the last part of a two-part split carries it (load_pack), from the model's GGUF or
     // STRATA_GLM_MTP_GGUF's; the pipelined decode drafts with it once a token
@@ -973,6 +1092,23 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             blob[(size_t) L] = (tensor_bytes(tg) + tensor_bytes(tu) + tensor_bytes(td)) / g.n_expert;
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
+            mtp = true;
+        } else if (g.nextn > 0 && xtab.mats.count(P + "nextn.eh_proj.weight") && xtab.layers.count(L)) {
+            // an EXL3 pack: the block's matrices and experts from exl3.txt, its floats from the GGUF (as load_mtp)
+            double d = 0;
+            for (const char* nm : kMtpRaw)
+                if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
+            for (const char* nm : kMtpB16) {
+                if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
+                else if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 2;
+            }
+            for (const char* nm : kMtpF32)
+                if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 4;
+            blob[(size_t) L] = (double) xtab.layers.at(L).blob();
+            stride[(size_t) L] = (double) glmfast::expert_stride((size_t) xtab.layers.at(L).blob(),
+                                                                 strata::kernels::exl3::kTypeEXL3,
+                                                                 strata::kernels::exl3::kTypeEXL3);
+            mtp_dense = d;
             mtp = true;
         }
     }
@@ -2200,6 +2336,59 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
 
+    // 3b. an EXL3 pack (tools/exl3_pack.py's exl3.txt): the model's safetensors join the shards after the GGUF; each
+    //     routed expert is nine pieces in them (gate, up, down x trellis, suh, svh), assembled into the usual
+    //     [gate | up | down] blob as it is read; the matrices are index rows of kind x, uploaded below
+    namespace x3 = strata::kernels::exl3;
+    Exl3Table xt;
+    {
+        std::string xe;
+        if (exl3_table(pack_dir, xt, xe, g_.n_expert)) {
+            exl3_ = true;
+            exl3_shard0_ = (int) pack_shards_.size();
+            for (const auto& fn : xt.files) {
+                Shard s;
+                if (!pack_shard_mmap(dir2 + "/" + fn, s, 0, err)) return false;
+                pack_shards_.push_back(s);
+            }
+            for (auto& kv : xt.layers) {
+                const int il = kv.first;
+                const Exl3Table::Layer& X = kv.second;
+                if (il < 0 || il >= g_.n_layers) continue;
+                if (X.k[0] != g_.n_embd || X.n[0] != g_.n_ff_exp || X.k[2] != g_.n_ff_exp || X.n[2] != g_.n_embd) {
+                    err = "pack: exl3.txt layer " + std::to_string(il) + "'s expert shapes disagree with the geometry";
+                    return false;
+                }
+                NativeLayer nl;
+                nl.layer = il;
+                nl.fmt.gu_type = nl.fmt.d_type = x3::kTypeEXL3;
+                nl.x_cb = X.cb;
+                for (int r = 0; r < 3; ++r) {
+                    nl.x_K[r] = X.K[r];
+                    nl.x_k[r] = X.k[r];
+                    nl.x_n[r] = X.n[r];
+                }
+                nl.x_off = X.off;
+                nl.x_shard.resize(X.file.size());
+                for (size_t i = 0; i < X.file.size(); ++i) {
+                    nl.x_shard[i] = exl3_shard0_ + X.file[i];
+                    const int r = (int) (i % 9) / 3, j = (int) (i % 3);
+                    if (X.off[i] + nl.x_piece(r, j) > pack_shards_[(size_t) nl.x_shard[i]].size) {
+                        err = "pack: exl3.txt layer " + std::to_string(il) + " expert " + std::to_string(i / 9) +
+                              " lies past the end of " + xt.files[(size_t) X.file[i]];
+                        return false;
+                    }
+                }
+                pack_layers_[(size_t) il] = std::move(nl);
+            }
+            std::fprintf(stderr, "glm pack: CUDA%d EXL3: %zu safetensors, %zu matrices, %zu expert layers\n", dev_,
+                         xt.files.size(), xt.mats.size(), xt.layers.size());
+        } else if (!xe.empty()) {
+            err = "pack: " + xe;
+            return false;
+        }
+    }
+
     // 4. the dense tensors: dequantize everything into the F32 device arena.  F32 rows come
     //    straight out of dense.bin; every other kind (BF16 rows and the natively-served
     //    quantized rows) is resolved through the GGUF shards and dequantized by ggml's traits.
@@ -2233,6 +2422,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // so this is lossless; F32 expansion doubled their bytes and their read time) and does not upload
     // token_embd at all (the embedding row is dequantized on the host from the shard mapping)
     fast_mode_ = getenv("STRATA_GLM_SLOW") == nullptr;
+    if (exl3_ && !fast_mode_) {
+        err = "pack: an EXL3 model runs on the fast path only (unset STRATA_GLM_SLOW)";
+        return false;
+    }
     const auto keep16 = [&](const Row& r, const strata::TensorInfo* t) {
         return fast_mode_ && r.kind == "4" && t->elements() >= 65536;
     };
@@ -2258,6 +2451,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     };
     for (const auto& r : rows) {
         if (!row_in_range(r.name)) continue;   // the other half's rows live on the other device
+        if (r.kind == "x") {   // an EXL3 matrix (exl3.txt)
+            const auto xm = xt.mats.find(r.name);
+            if (xm == xt.mats.end()) {
+                err = "pack: EXL3 row " + r.name + " is not in exl3.txt";
+                return false;
+            }
+            bytes += xm->second.vram();
+            by_kind[kind_of(r.name.substr(r.name.find('.', 4) + 1)) + " exl3"] += xm->second.vram();
+            continue;
+        }
         const strata::TensorInfo* t = find_tensor(r.name);
         if (!t) {
             err = "pack: tensor " + r.name + " is in index.txt but in no shard";
@@ -2289,6 +2492,50 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     std::vector<uint8_t> raw;
     for (const auto& r : rows) {
         if (!row_in_range(r.name)) continue;   // the other half's rows live on the other device
+        if (r.kind == "x") {
+            // the trellis, suh and svh straight from the safetensors mapping, each 256-aligned in the arena
+            const Exl3Table::Mat& m = xt.mats.at(r.name);
+            const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
+            const uint64_t nb[3] = {(uint64_t) m.k * m.n * m.K / 8, 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
+            const uint64_t src[3] = {m.tr, m.suh, m.svh};
+            uint8_t* dst[3] = {nullptr, nullptr, nullptr};
+            for (int j = 0; j < 3; ++j) {
+                if (src[j] + nb[j] > sh.size) {
+                    err = "pack: EXL3 " + r.name + " lies past the end of " + xt.files[(size_t) m.file];
+                    return false;
+                }
+                dst[j] = (uint8_t*) w_arena_ + at;
+                { cudaError_t e_ = cudaMemcpy(dst[j], sh.base + src[j], (size_t) nb[j], cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                at += (nb[j] + 255u) & ~(uint64_t) 255u;
+            }
+            x3::Mat M;
+            M.trellis = (const uint32_t*) dst[0];
+            M.suh = (const uint16_t*) dst[1];
+            M.svh = (const uint16_t*) dst[2];
+            M.k = m.k;
+            M.n = m.n;
+            M.K = m.K;
+            M.cb = m.cb;
+            if (!x3::supported(M)) {
+                err = "pack: EXL3 " + r.name + " (k " + std::to_string(m.k) + " n " + std::to_string(m.n) + " K " +
+                      std::to_string(m.K) + " cb " + std::to_string(m.cb) + ") is not covered by the kernels";
+                return false;
+            }
+            const x3::Mat& slot = exl3_mats_[r.name] = M;
+            ws_map_[r.name] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, m.n};
+            // the fused KDA projection: q, k and v are its column thirds (tools/exl3_pack.py keeps llama.cpp's order)
+            const std::string fused = "attn_qkv.weight";
+            if (r.name.size() > fused.size() && r.name.compare(r.name.size() - fused.size(), fused.size(), fused) == 0) {
+                const std::string P = r.name.substr(0, r.name.size() - fused.size());
+                const int third = m.n / 3;
+                const char* part[3] = {"attn_q.weight", "attn_k.weight", "attn_v.weight"};
+                for (int i = 0; i < 3; ++i) {
+                    const x3::Mat& v = exl3_mats_[P + part[i]] = x3::view(M, i * third, third);
+                    ws_map_[P + part[i]] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &v, m.k, third};
+                }
+            }
+            continue;
+        }
         const strata::TensorInfo* t = find_tensor(r.name);
         if (skip_upload(r)) {
             const int si = find_shard_of(r.name);
@@ -2705,12 +2952,42 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         return nullptr;
     };
     int si = -1;
-    if (find(P + "nextn.eh_proj.weight", si) == nullptr) return true;   // a GGUF without the draft block
+    // an EXL3 pack: the block's quantized projections and routed experts are in exl3.txt (its floats in the GGUF)
+    Exl3Table xt;
+    if (exl3_) {
+        std::string xe;
+        if (!exl3_table(pack_dir_, xt, xe, g_.n_expert)) {
+            err = "mtp: " + (xe.empty() ? std::string("exl3.txt is gone") : xe);
+            return false;
+        }
+        if (xt.mats.count(P + "nextn.eh_proj.weight") == 0) return true;   // packed without the draft block
+    } else if (find(P + "nextn.eh_proj.weight", si) == nullptr) {
+        return true;   // a GGUF without the draft block
+    }
+    const auto x3 = [&](const std::string& n) { return exl3_ && xt.mats.count(n) != 0; };
     const auto& raw_names = kMtpRaw;
     const auto& b16_names = kMtpB16;
     const auto& f32_names = kMtpF32;
     uint64_t bytes = 0;
-    if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err)) return false;
+    if (exl3_) {
+        for (const char* n : raw_names) {
+            if (!x3(P + n)) { err = "mtp: " + P + n + " is not in exl3.txt"; return false; }
+            bytes += xt.mats.at(P + n).vram();
+        }
+        for (const char* n : b16_names) {
+            if (x3(P + n)) { bytes += xt.mats.at(P + n).vram(); continue; }
+            const strata::TensorInfo* t = find(P + n, si);
+            if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
+            bytes += ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
+        }
+        for (const char* n : f32_names) {
+            const strata::TensorInfo* t = find(P + n, si);
+            if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
+            bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
+        }
+    } else if (!mtp_dense_vram([&](const std::string& n) { return find(n, si); }, il, bytes, err)) {
+        return false;
+    }
     if (cudaMalloc(&mtp_arena_, bytes) != cudaSuccess) {
         cudaGetLastError();
         err = "mtp: the draft block's weights (" + std::to_string(bytes >> 20) + " MB) did not allocate";
@@ -2730,7 +3007,40 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         }
         return pack_dequant_tensor(*t, src_of(t, s), host, err);
     };
+    // an EXL3 matrix: its trellis, suh and svh from the safetensors, each 256-aligned (as load_pack's)
+    const auto up_x3 = [&](const std::string& n) -> bool {
+        const Exl3Table::Mat& m = xt.mats.at(n);
+        const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
+        const uint64_t nb[3] = {(uint64_t) m.k * m.n * m.K / 8, 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
+        const uint64_t src[3] = {m.tr, m.suh, m.svh};
+        uint8_t* dst[3] = {nullptr, nullptr, nullptr};
+        for (int j = 0; j < 3; ++j) {
+            if (src[j] + nb[j] > sh.size) { err = "mtp: EXL3 " + n + " lies past the end of its file"; return false; }
+            dst[j] = base + at;
+            if (cudaMemcpy(dst[j], sh.base + src[j], (size_t) nb[j], cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "mtp: upload";
+                return false;
+            }
+            at += (nb[j] + 255u) & ~(uint64_t) 255u;
+        }
+        strata::kernels::exl3::Mat M;
+        M.trellis = (const uint32_t*) dst[0];
+        M.suh = (const uint16_t*) dst[1];
+        M.svh = (const uint16_t*) dst[2];
+        M.k = m.k;
+        M.n = m.n;
+        M.K = m.K;
+        M.cb = m.cb;
+        if (!strata::kernels::exl3::supported(M)) { err = "mtp: EXL3 " + n + " is not covered by the kernels"; return false; }
+        const strata::kernels::exl3::Mat& slot = exl3_mats_[n] = M;
+        ws_map_[n] = strata::core::WSlot{nullptr, strata::kernels::exl3::kTypeEXL3, &slot, m.k, m.n};
+        return true;
+    };
     for (const char* n : raw_names) {
+        if (exl3_) {
+            if (!up_x3(P + n)) return false;
+            continue;
+        }
         const strata::TensorInfo* t = find(P + n, si);
         const size_t nb = strata::kernels::native_mmvq_weight_bytes(t->type, (int) t->shape[0], (int) t->shape[1]);
         if (cudaMemcpy(base + at, src_of(t, si), nb, cudaMemcpyHostToDevice) != cudaSuccess) { err = "mtp: upload"; return false; }
@@ -2740,6 +3050,10 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     }
     std::vector<uint16_t> b16;
     for (const char* n : b16_names) {
+        if (x3(P + n)) {   // (an EXL3 pack quantizes the indexer's q_b: the fast path reads it from ws_map_)
+            if (!up_x3(P + n)) return false;
+            continue;
+        }
         const strata::TensorInfo* t = find(P + n, si);
         if (!to_host(t, si)) return false;
         b16.resize(host.size());
@@ -2764,6 +3078,47 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     // the routed experts: gate/up/down by absolute offset, like native_experts.txt rows
     NativeLayer nl;
     nl.layer = il;
+    if (exl3_) {   // EXL3: nine pieces an expert, as load_pack's layers
+        const auto xl = xt.layers.find(il);
+        if (xl == xt.layers.end()) {
+            err = "mtp: exl3.txt has no experts for blk." + std::to_string(il);
+            return false;
+        }
+        const Exl3Table::Layer& X = xl->second;
+        if (X.k[0] != g_.n_embd || X.n[0] != g_.n_ff_exp || X.k[2] != g_.n_ff_exp || X.n[2] != g_.n_embd) {
+            err = "mtp: the draft block's expert shapes disagree with the geometry";
+            return false;
+        }
+        nl.fmt.gu_type = nl.fmt.d_type = strata::kernels::exl3::kTypeEXL3;
+        nl.x_cb = X.cb;
+        for (int r = 0; r < 3; ++r) {
+            nl.x_K[r] = X.K[r];
+            nl.x_k[r] = X.k[r];
+            nl.x_n[r] = X.n[r];
+        }
+        nl.x_off = X.off;
+        nl.x_shard.resize(X.file.size());
+        for (size_t i = 0; i < X.file.size(); ++i) {
+            nl.x_shard[i] = exl3_shard0_ + X.file[i];
+            if (X.off[i] + nl.x_piece((int) (i % 9) / 3, (int) (i % 3)) > pack_shards_[(size_t) nl.x_shard[i]].size) {
+                err = "mtp: an expert of the draft block lies past the end of its file";
+                return false;
+            }
+        }
+        if (pack_layers_.size() < (size_t) il + 1) pack_layers_.resize((size_t) il + 1);
+        pack_layers_[(size_t) il] = std::move(nl);
+        if (pack_emb_src_ == nullptr) {
+            int se = -1;
+            const strata::TensorInfo* te = find("token_embd.weight", se);
+            if (te == nullptr) { err = "mtp: token_embd not found"; return false; }
+            pack_emb_src_ = src_of(te, se);
+            pack_emb_type_ = (int) te->type;
+        }
+        mtp_il_ = il;
+        std::fprintf(stderr, "glm mtp: CUDA%d the NextN block (blk.%d) loaded: %.0f MB dense, EXL3 experts K %d/%d/%d\n",
+                     dev_, il, (double) bytes / 1048576.0, X.K[0], X.K[1], X.K[2]);
+        return true;
+    }
     int sg = -1, su = -1, sd = -1;
     const strata::TensorInfo* tg = find(P + "ffn_gate_exps.weight", sg);
     const strata::TensorInfo* tu = find(P + "ffn_up_exps.weight", su);
