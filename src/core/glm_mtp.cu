@@ -925,7 +925,7 @@ int Glm5Model::mtp_choose(int n_cap) {
     double prior = 0.75;
     for (int i = 1; i <= n_cap; ++i) {
         constexpr double kPull = 4.0;
-        a[i] = ((double) mtp_hit_[i] + kPull * prior) / ((double) mtp_reach_[i] + kPull);
+        a[i] = (mtp_hit_[i] + kPull * prior) / (mtp_reach_[i] + kPull);
         prior = a[i];
     }
     double best = -1.0;
@@ -1011,6 +1011,15 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
     // before).  With ~82% of the drafts accepted a round loses ~0.9% of its tokens for each 1% missed, against the ~2%
     // the smaller head saves: 2% is about where the two meet.
     constexpr double kOutMax = 0.02;
+    // the acceptance a length's choice weighs is the recent text's: each draft position's counts decay over its last
+    // STRATA_GLM_MTP_ACC_WINDOW (64) comparisons (0: every comparison since the load, as before).  A whole-session
+    // count let a request's easy start speak for its hard part: Maya-S on the Radeon 8065S kept 2 drafts through a
+    // 1536-token essay (57% of the drafts accepted, 21.3 tok/s) where 1 gives ~22.5, on the short answers' record.
+    static const double acc_keep = [] {
+        const char* e = getenv("STRATA_GLM_MTP_ACC_WINDOW");
+        const int w = e != nullptr ? std::max(0, std::atoi(e)) : 64;
+        return w > 0 ? 1.0 - 1.0 / (double) w : 1.0;
+    }();
     int64_t n_out = 0, n_full = 0, n_drafting = 0;
     const bool chain = FT->mtp_emb != nullptr && glm_mtp_chain();
     const auto note = [&](int tok) {
@@ -1151,9 +1160,11 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                 note(yy);
                 more = emit(yy) && produced < max_new && p0 + keep + 1 < max_ctx_;
                 if (!more || t + 1 >= T) break;
-                ++mtp_reach_[t + 1];   // draft t + 1 is compared (every draft before it stood)
+                // draft t + 1 is compared (every draft before it stood): its counts decay first (acc_keep)
+                mtp_hit_[t + 1] *= acc_keep;
+                mtp_reach_[t + 1] = mtp_reach_[t + 1] * acc_keep + 1.0;
                 if (yy != win[(size_t) t + 1]) break;
-                ++mtp_hit_[t + 1];
+                mtp_hit_[t + 1] += 1.0;
                 ++acc;
             }
             // ---- 4. the commit: the recurrent states advanced by the kept rows (positions p0 .. p0 + keep - 1)

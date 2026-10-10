@@ -450,10 +450,11 @@ private:
     int mtp_rows_ = 0;                                     // the verify window's rows this part is sized for (0: none)
     int64_t mtp_hx_pos_ = -1;                              // the tail: the position whose trunk hidden state head_x holds
     // the adaptive draft length: per length n, the rounds' wall time (EMA, ms) and how many; per draft position, how
-    // often it was reached (its earlier drafts all accepted) and accepted
+    // often it was reached (its earlier drafts all accepted) and accepted - decayed counts, the recent text's
+    // (STRATA_GLM_MTP_ACC_WINDOW)
     double mtp_ms_[9] = {};
     uint64_t mtp_seen_[9] = {};
-    uint64_t mtp_reach_[9] = {}, mtp_hit_[9] = {};
+    double mtp_reach_[9] = {}, mtp_hit_[9] = {};
     uint64_t mtp_round_no_ = 0;
     int mtp_best_ = -1;                                    // the length in use, the probe gap and the next probe
     uint64_t mtp_gap_ = 32, mtp_next_probe_ = 0;

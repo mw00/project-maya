@@ -45,7 +45,10 @@ and moves), so the first two rounds after a change of length, and a request's fi
 The search starts at `STRATA_GLM_MTP_START` (2) and climbs: the start runs 8 rounds (6 measured), then each untried
 neighbour of the best a 4-round probe (2 measured), until both neighbours of the best are measured and lose. A round's
 time is the mean of its length's first ten rounds, then an EMA (one slow round does not stand for its length), and the
-acceptance of a draft position is pulled toward the one before it while it has few rounds. Every length used to be
+acceptance of a draft position is pulled toward the one before it while it has few rounds. The acceptance counts
+decay over each position's last 64 comparisons (`STRATA_GLM_MTP_ACC_WINDOW`, 0 = every comparison since the load): with
+whole-session counts a request's easy start spoke for its hard part (Maya-S kept 2 drafts through a 1536-token essay
+with 57% of the drafts accepted, 21.3 tok/s, where 1 draft gives ~22). Every length used to be
 tried for 8 rounds first, the longest first and token by token last, so a machine's first request paid for lengths it
 would not use. The token path (length 0) is now only tried where length 1 is the best. Then a neighbour of the best
 gets a 4-round probe now and then; the gap doubles while the best stays, up to 1024 rounds. Where the routed experts
@@ -81,6 +84,20 @@ step's embedding there, and the host reads the round's drafts back once. The hos
 the cache rows) go through their own pinned buffers, so nothing in flight is overwritten and the round no longer waits
 before them. `STRATA_GLM_MTP_CHAIN` is on where the device holds every routed expert and `token_embd` besides; `1`
 forces it, `0` restores the step-by-step drafts.
+
+### Measured (Maya-S, Radeon 8065S / Gorgon Halo, greedy)
+
+A round of 2 drafts went from ~100 ms to ~95 ms (the draft vocabulary ~4 ms of it, the chain ~1 ms; the draft vocabulary
+held every token of the bench's English and code answers, so no draft changed). Against the MTP decode before these
+changes, same session:
+
+| | before | after |
+|---|---|---|
+| 5 answers x 256 tokens, mean | 25.1 tok/s (first 25.0) | 27.8 tok/s (first 28.6) |
+| the warm-up request (63 tokens, the length search) | 24.5 tok/s | 26.7 tok/s |
+| 1536-token essay | 22.1 tok/s | 22.0 tok/s (1 draft a round: little to save) |
+| 512 tokens after an 8K-token prompt | 22.0 tok/s | 23.6 tok/s |
+| 3 x 2048 tokens + 1024 after an 8K prompt | 22.65 (20.9 / 24.2 / 22.5; 23.9) | 23.10 (21.9 / 24.8 / 22.6; 23.6) |
 
 ## Where it runs
 
