@@ -128,6 +128,8 @@ public:
     /// threads taking its jobs; set_cpu_lane_threads(n): at most n of the pool's, n <= 0 all of them.  Both are for
     /// setup's calibration (per request, no restart); false when this engine has no CPU lane.
     double pcie_share() const;
+    /// STRATA_GLM_CPU_CAL: once a request (2000+ lane experts a window), drop a calibration decode stays >15% from
+    void lane_drift_check();
     bool set_pcie_share(double share);
     int cpu_lane_threads() const;
     bool set_cpu_lane_threads(int n);
@@ -464,6 +466,12 @@ public:
     void prefill_cap(int T, const char* why);              // its pinned staging for chunks of at most T
     void prefill_settle(double pinned_share);              // --prefill auto's lend cap from the pinned share (85/90%)
     std::pair<size_t, size_t> prefill_bytes_for(size_t T) const;   // a chunk's device buffers {kept rows, scratch}
+    // the pinned host bytes a part's prompt path takes at its start (the token rows and the disk landing ring) and the
+    // residual rows a part that hands on adds - this part's sizes
+    struct PinnedPrompt {
+        size_t staging = 0, hop = 0;
+    };
+    PinnedPrompt prefill_pinned() const;
     static size_t pool_avail(size_t free_b, size_t total_b);   // the expert pool's bytes from the free VRAM
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder

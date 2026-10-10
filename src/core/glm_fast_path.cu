@@ -38,6 +38,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -317,6 +318,25 @@ static void* numa_pinned(size_t bytes) {
 #else
     (void) bytes;
     return nullptr;
+#endif
+}
+
+// the RAM free now: MemAvailable (Windows: the smaller of the free RAM and the free commit, which pinning is charged to);
+// 0 when unknown
+static int64_t avail_ram_now() {
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    return GlobalMemoryStatusEx(&ms) ? (int64_t) std::min(ms.ullAvailPhys, ms.ullAvailPageFile) : 0;
+#else
+    long long kb = 0;
+    if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f))
+            if (std::sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+        std::fclose(f);
+    }
+    return (int64_t) kb * 1024;
 #endif
 }
 
@@ -1104,8 +1124,21 @@ bool Glm5Model::fast_setup(std::string& err) {
         // half sees): MemAvailable minus headroom for the OS, the server and the page cache the disk reads go
         // through; STRATA_GLM_RAM_GB pins it.  Each half takes its share of the MoE layers still unserved,
         // and whatever a half cannot use (its experts already fit) passes on to the next half.
+        // The later parts' prompt path pins after this measurement (their token rows and landing ring, and the rows a
+        // middle part hands on), and that came out of the headroom: one part's staging fits in it (two GPUs: 2x V100,
+        // as v1.0.30), three parts' did not and froze a Linux desktop (#77).  What a third part on adds is set aside
+        // here (estimated from this part's own sizes), and each later part measures again and leaves at least half
+        // the headroom free.
         static int64_t total = -1, remaining = -1;
         static int remaining_layers = 0;
+        const auto pinned_pf = prefill_pinned();
+        const int later = n_parts_ - 1 - part_;   // the parts that start after this one
+        const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
+                                  (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.hop;
+        double head_gb = F->unified_memory ? 16.0 : 6.0;
+        if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
+        const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
+        const bool fixed_ram = getenv("STRATA_GLM_RAM_GB") != nullptr;
         if (budget < 0) {
             if (total < 0) {
                 if (const char* rg = getenv("STRATA_GLM_RAM_GB")) {
@@ -1138,9 +1171,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                         std::fclose(mf);
                     }
 #endif
-                    double head_gb = F->unified_memory ? 16.0 : 6.0;
-                    if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::atof(h);
-                    total = std::max<int64_t>(0, avail_kb * 1024 - (int64_t) (head_gb * 1073741824.0));
+                    total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf);
                 }
                 remaining = total;
                 remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
@@ -1149,6 +1180,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             budget = l1_ >= g.n_layers ? remaining
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
+            // a later part: no more than is free now, less what is still to come and half the headroom
+            if (part_ > 0 && !fixed_ram) {
+                const int64_t now = avail_ram_now();
+                if (now > 0) budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - head_b / 2 - unseen_pf));
+            }
         }
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
         std::vector<int64_t> cls_n(cls_stride.size(), 0), cls_cap(cls_stride.size(), 0);
@@ -1211,6 +1247,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (split_load_ == nullptr && !staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
             remaining_layers -= n_moe;
+        }
+        // pinned memory cannot be swapped out: say so when what is left free is short of the headroom
+        if (!staging_only && !fixed_ram && ram_budget_ < 0) {
+            const int64_t left = avail_ram_now();
+            if (left > 0 && left - unseen_pf < head_b / 2)
+                std::fprintf(stderr, "glm fast: WARNING - CUDA%d: %.1f GB of RAM free after its RAM tier, and the prompt "
+                                     "path still pins up to %.1f GB: if the system swaps or stalls, set "
+                                     "STRATA_GLM_RAM_GB lower\n", dev_, (double) left / 1073741824.0,
+                             (double) unseen_pf / 1073741824.0);
         }
         int64_t ram_slots = 0;
         for (auto& R : F->rc) ram_slots += R.n;
@@ -1450,6 +1495,34 @@ static int physical_cores() {
 #endif
 }
 
+// STRATA_GLM_CPU_CAL file: replace key's line with vals (empty: drop it)
+static void cal_put(const std::string& file, const std::string& key, const std::string& vals) {
+    std::string keep;
+    if (FILE* cf = std::fopen(file.c_str(), "r")) {
+        char line[2048];
+        while (std::fgets(line, sizeof line, cf)) {
+            const char* tab = std::strrchr(line, '\t');
+            if (tab == nullptr || std::string(line, (size_t) (tab - line)) != key) keep += line;
+        }
+        std::fclose(cf);
+    }
+    if (!vals.empty()) keep += key + "\t" + vals + "\n";
+    const std::string tmp = file + ".tmp";
+    if (FILE* cf = std::fopen(tmp.c_str(), "w")) {
+        const bool ok = std::fputs(keep.c_str(), cf) >= 0;
+        if (std::fclose(cf) == 0 && ok) {
+            std::error_code ec;
+            std::filesystem::rename(tmp, file, ec);
+        }
+    }
+}
+
+static std::string cal_vals(double c, double p, double ps, double ref) {
+    char v[128];
+    std::snprintf(v, sizeof v, ref > 0.0 ? "%.4f %.4f %.4f %.4f" : "%.4f %.4f %.4f", c, p, ps, ref);
+    return v;
+}
+
 // The CPU LANE, on by default: one thread per physical core (split evenly across the parts of a layer split);
 // STRATA_GLM_CPU_LANE=<threads> sets the count, 0 turns it off; STRATA_GLM_CPU_LANE<n>=<threads> sets one GPU's own
 // (CUDA<n>: a slow link wants more threads than a fast one).  Measures this machine once - one expert on the CPU
@@ -1515,7 +1588,16 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         for (int d : split_devs_) gpu_node.push_back(gpu_numa_node(d));
         int spare = 4;
         pin_cpus = part_cpus(part_, n_parts_, gpu_node, pin_node, spare);
-        if (!pin_cpus.empty() && lv == nullptr) threads = std::max(2, (int) pin_cpus.size() - spare);
+        // a thread a physical core, as unpinned - their SMT siblings are the CPUs left free (one CCD of a 5900X a
+        // part: 10 threads on its 6 cores 10.88 tok/s, 6 threads 11.45, #77); no siblings: those CPUs less the spare
+        if (!pin_cpus.empty() && lv == nullptr) {
+            std::vector<std::pair<int, int>> pc;
+            for (int c : pin_cpus) pc.push_back(cpu_core(c));
+            std::sort(pc.begin(), pc.end());
+            const int n_cores = (int) (std::unique(pc.begin(), pc.end()) - pc.begin());
+            threads = n_cores < (int) pin_cpus.size() ? std::max(2, n_cores)
+                                                      : std::max(2, (int) pin_cpus.size() - spare);
+        }
     }
     if (threads <= 0 || g.n_embd > 4096 || g.n_exp_used > 8) return true;
     namespace kc = strata::kernels::cpu;
@@ -1577,6 +1659,40 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         F->cpu_node = pin_node;
         F->cpu_pin = pin_cpus;
     }
+    // STRATA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
+    const char* calf = getenv("STRATA_GLM_CPU_CAL");
+    std::string cal_key;
+    double c_ms = 0.0, p_ms = 0.0, ps_ms = 0.0;
+    bool cached = false;
+    if (calf != nullptr && *calf != '\0') {
+        char bus[32] = "?";
+        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev_) != cudaSuccess) cudaGetLastError();
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev_) != cudaSuccess) {
+            cudaGetLastError();
+            prop.name[0] = 0;
+        }
+        std::error_code ec;
+        const std::filesystem::path pd = std::filesystem::weakly_canonical(pack_dir_, ec);
+        cal_key = std::string(STRATA_VERSION) + " " + __DATE__ + " " + __TIME__ + " | " + (ec ? pack_dir_ : pd.string()) + " | layer " + std::to_string(il_cal) +
+                  " | " + std::to_string(F->L[(size_t) il_cal].blob) + " B | " + bus + " " + prop.name + " | " +
+                  std::to_string(threads) + (shared ? " threads shared" : " threads") + " | " + std::to_string(n_cal);
+        if (FILE* cf = std::fopen(calf, "r")) {
+            char line[2048];
+            while (!cached && std::fgets(line, sizeof line, cf)) {
+                char* tab = std::strrchr(line, '\t');
+                if (tab == nullptr) continue;
+                *tab = 0;
+                double ref = 0.0;
+                cached = cal_key == line && std::sscanf(tab + 1, "%lf %lf %lf %lf", &c_ms, &p_ms, &ps_ms, &ref) >= 3 &&
+                         c_ms > 0.0 && p_ms > 0.0 && ps_ms > 0.0;
+                if (cached) F->cal_ref = ref;
+            }
+            std::fclose(cf);
+        }
+    }
+    const size_t blob = F->L[(size_t) il_cal].blob;
+    if (!cached) {
     // ---- calibration, each lane alone: the CPU after 100 ms of the same work (an idle CPU's clocks take tens of ms to
     //      ramp up - a decode keeps them up), then the mean of 16 runs
     std::vector<float> x((size_t) g.n_embd), out((size_t) g.n_embd);
@@ -1586,7 +1702,6 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     for (const auto tw = std::chrono::steady_clock::now();
          std::chrono::steady_clock::now() - tw < std::chrono::milliseconds(100);)
         fast_cpu_experts(il_cal, n_cal, cal_set(set++), w4, x.data(), out.data());
-    double c_ms = 0.0;
     for (int rep = 0; rep < 16; ++rep) {
         const uint8_t* const* cals = cal_set(set++);
         const auto t0 = std::chrono::steady_clock::now();
@@ -1594,11 +1709,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         c_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
     c_ms /= 16.0 * n_cal;   // an expert's share of a call
-    const size_t blob = F->L[(size_t) il_cal].blob;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
-    double p_ms = 0.0;
     // the link is timed with the GPU awake (see glm_link_wake): 400 ms for the clocks and the link to ramp up, then
     // 1.1 s of the kernel left for both measurements below
     cudaStream_t wake = nullptr;
@@ -1618,7 +1731,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     p_ms /= 16.0;
     // ... and its streaming rate - copies back to back, the way the prompt path stages experts (a 3090 on PCIe 3.0 x8:
     // 2.09 ms for one copy, 1.57 a copy in a stream): the prompt's CPU / PCIe split plans with this one
-    double ps_ms = p_ms;
+    ps_ms = p_ms;
     {
         cudaEventRecord(e0, F->cs);
         for (int rep = 0; rep < 8; ++rep) cudaMemcpyAsync(F->scratch, cal, blob, cudaMemcpyHostToDevice, F->cs);
@@ -1633,6 +1746,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
+    if (!cal_key.empty()) cal_put(calf, cal_key, cal_vals(c_ms, p_ms, ps_ms, 0.0));
+    }
     F->cpu_c_ms = c_ms;   // (the prompt path splits its staged experts by them too)
     F->cpu_p_ms = p_ms;
     F->cpu_ps_ms = ps_ms;
@@ -1671,6 +1786,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     F->cpu_plan = plan;
     F->cpu_plan_start = plan;
+    if (!cal_key.empty()) F->cal_file = calf, F->cal_key = cal_key;
     F->md.cpu_seq = F->cpu_seq_d;
     F->md.cpu_ans = dp;
     // the route counts that pick the coldest RAM-tier experts for the host, seeded with the tiers' LFU counts
@@ -1691,6 +1807,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                  : (" on " + std::to_string(pin_cpus.size()) + " CPUs of its own" +
                     (pin_node >= 0 ? " (NUMA node " + std::to_string(pin_node) + ")" : std::string())).c_str(),
                  c_ms, p_ms, tab.c_str());
+    if (cached) std::fprintf(stderr, "glm fast: CUDA%d CPU lane: those times from %s (not timed)\n", dev_, calf);
     // STRATA_GLM_CPU_LANE_CHECK=1: the calibration expert on one normalised input three ways - the device's decode
     // kernels, the CPU lane, and a double-precision reference from ggml's dequantised rows - and their distances
     if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr) {
@@ -2167,6 +2284,31 @@ static double plan_share(unsigned long long plan) {
     double s = 0.0;
     for (int f = 1; f <= 8; ++f) s += (double) (f - (int) ((plan >> (4 * f)) & 15ull)) / f;
     return s / 8.0;
+}
+
+void Glm5Model::lane_drift_check() {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        FastState* F = m->fast_;
+        if (F == nullptr || F->cpu_pool == nullptr || F->cal_key.empty()) continue;
+        const uint64_t e = F->cpu_experts.load(), us = F->cpu_us.load();
+        if (e - F->drift_e0 < 2000) continue;
+        const double ms = (double) (us - F->drift_us0) / 1000.0 / (double) (e - F->drift_e0);
+        F->drift_e0 = e, F->drift_us0 = us;
+        if (F->cal_ref <= 0.0) {   // first window after timing: the reference
+            F->cal_ref = ms;
+            cal_put(F->cal_file, F->cal_key, cal_vals(F->cpu_c_ms, F->cpu_p_ms, F->cpu_ps_ms, ms));
+            continue;
+        }
+        const int dir = ms > 1.15 * F->cal_ref ? 1 : ms < F->cal_ref / 1.15 ? -1 : 0;
+        F->drift_n = dir != 0 && dir == F->drift_dir ? F->drift_n + 1 : dir != 0;
+        F->drift_dir = dir;
+        if (F->drift_n >= 5) {   // 5 requests in a row: the calibration is off, the next start times it
+            std::fprintf(stderr, "glm fast: CUDA%d CPU lane: decode %.3f ms an expert vs %.3f at calibration - dropped from "
+                                 "%s\n", m->dev_, ms, F->cal_ref, F->cal_file.c_str());
+            cal_put(F->cal_file, F->cal_key, "");
+            F->cal_key.clear();
+        }
+    }
 }
 
 double Glm5Model::pcie_share() const {
@@ -2874,13 +3016,20 @@ bool Glm5Model::fast_boundary(std::string& err) {
             // A full unified pool needs spares only in empty slots (e.g. after
             // prompt lending). Never evict an expert just to reserve a spare.
             if (glmfast::full_unified_pool(F->unified_memory, P.n, g.n_expert)) break;
-            // evict the least-used resident of this layer (recency breaks ties)
+            // evict the least-used resident of this layer (recency breaks ties).  STRATA_GLM_VRAM_EVICT=lru: the
+            // least recently used instead - route traces replayed through these rules (Maya-M, 3090 + 3060 split):
+            // the aged counts keep experts that were frequent a while ago, the smaller half's pool most of all (VRAM
+            // hits 55.7 -> 65.2 %, off-card experts a token 57.7 -> 45.4 on the 3060; 71.8 -> 64.6 on the 3090)
+            static const bool vram_lru = [] {
+                const char* ve = getenv("STRATA_GLM_VRAM_EVICT");
+                return ve != nullptr && std::strcmp(ve, "lru") == 0;
+            }();
             int v = -1;
             uint32_t bc = UINT32_MAX;
             uint64_t bt = UINT64_MAX;
             for (int s2 = 0; s2 < P.n; ++s2) {
                 if (P.st[(size_t) s2] != FastState::kResident) continue;
-                const uint32_t c = F->cnt[(size_t) il * g.n_expert + P.key[(size_t) s2]];
+                const uint32_t c = vram_lru ? 0u : F->cnt[(size_t) il * g.n_expert + P.key[(size_t) s2]];
                 if (c < bc || (c == bc && P.tick[(size_t) s2] < bt)) {
                     bc = c;
                     bt = P.tick[(size_t) s2];
@@ -3297,26 +3446,42 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
         return v ? std::max(0, std::atoi(v)) : 0;
     }();
+    // STRATA_GLM_PREFETCH_RANK=<n>: prefetch only the prediction's first n ranks (unset: any of its top k)
+    static const int pf_rank = [] {
+        const char* v = getenv("STRATA_GLM_PREFETCH_RANK");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 0;
+    }();
     gf::moe_route(F->rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
                   g.n_embd, md, F->sh_g, F->sh_u, g.swiglu_shexp, FFs, F->sh_hq, s,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
                   pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, il == mtp_il_ ? mtp_skip_from() : 8,
-                  lane ? F->cpu_plan : 0ull, promote_min);
+                  lane ? F->cpu_plan : 0ull, promote_min, pf_rank);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
-    if (pred && F->max_pf > 0) {
-        // the side stream copies the next layer's predicted experts while this layer computes
+    // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:
+    // when that copy starts - "route" (the default: at once, beside this layer's own PCIe fetch and CPU lane),
+    // "fetch" (after this layer's own fetch: the link is free) or "cpu" (after this layer's CPU-lane answer: RAM is
+    // free too; the copy then runs beside the next layer's attention).  The prefetch lists are double-buffered by
+    // layer parity and the next layer waits for this copy before its experts run, so any of the three is safe.
+    static const int pf_at = [] {
+        const char* v = getenv("STRATA_GLM_PREFETCH_AT");
+        return v == nullptr ? 0 : std::strcmp(v, "fetch") == 0 ? 1 : std::strcmp(v, "cpu") == 0 ? 2 : 0;
+    }();
+    const bool pf = pred && F->max_pf > 0;
+    const auto issue_prefetch = [&] {
         cudaEventRecord(F->ev_pred, s);
         cudaStreamWaitEvent(F->ps, F->ev_pred, 0);
         gf::moe_prefetch(md, F->L[(size_t) il + 1].blob, F->ps);
         cudaEventRecord(F->ev_pf, F->ps);
-    }
+    };
+    if (pf && pf_at == 0) issue_prefetch();
     // disk-only experts (rare once warm) park the device until the host has read them; everything not
     // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM
     gf::moe_wait(md, g.n_embd, s);
     if (F->prof_on) F->mark("moe_wait");
     gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
     if (F->prof_on) F->mark("moe_fetch");
+    if (pf && pf_at == 1) issue_prefetch();
     // this layer's own prefetched experts (issued one layer ago) must have landed before they are read
     if (pf_pending) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
     pf_pending = false;
@@ -3332,7 +3497,8 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
         gf::moe_cpu_wait(md, g.n_embd, F->ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }
-    if (pred && F->max_pf > 0) {
+    if (pf && pf_at == 2) issue_prefetch();
+    if (pf) {
         std::swap(F->ev_pf, F->ev_pf_prev);   // the next layer waits on THIS layer's prefetch
         pf_pending = true;
     }

@@ -1053,6 +1053,7 @@ static int glm_pack_generate(const Options& o) {
         }).detach();
     }
     const auto next_line = [&](std::string& out) -> bool {
+        model.lane_drift_check();
         std::unique_lock<std::mutex> lk(in_mu);
         in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof || quit_req.load(); });
         if (in_lines.empty()) return false;   // EOF or QUIT with nothing queued behind it

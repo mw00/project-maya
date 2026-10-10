@@ -59,6 +59,44 @@ class ModelChoice(unittest.TestCase):
             self.assertFalse(maya.sha256_ok(p, ["0" * 64]))
 
 
+class WholeShards(unittest.TestCase):
+    """incomplete(): a shard is whole as far as its own tensor directory says - and a shard of metadata alone
+    (unsloth's first: the tokenizer, no tensors) at its header's end, without the alignment padding (#83)."""
+
+    @staticmethod
+    def gguf(n_tensors: int, pad: bool) -> bytes:
+        import struct
+
+        def s(t):
+            b = t.encode()
+            return struct.pack("<Q", len(b)) + b
+        kv = s("general.architecture") + struct.pack("<I", 8) + s("glm5next")
+        kv += s("tokenizer.ggml.model") + struct.pack("<I", 8) + s("gpt2x")      # an odd length: the header unaligned
+        tinfo = b"".join(s(f"t{i}") + struct.pack("<I", 1) + struct.pack("<Q", 8) + struct.pack("<IQ", 0, 32 * i)
+                         for i in range(n_tensors))
+        head = b"GGUF" + struct.pack("<IQQ", 3, n_tensors, 2) + kv + tinfo
+        out = head + (bytes(-len(head) % 32) if pad or n_tensors else b"")
+        return out + bytes(32 * n_tensors)
+
+    def check(self, data: bytes):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "m-00001-of-00002.gguf"
+            p.write_bytes(data)
+            return maya.incomplete(p)
+
+    def test_a_metadata_shard_without_padding_is_whole(self):
+        data = self.gguf(0, pad=False)
+        self.assertNotEqual(len(data) % 32, 0)           # (the case: the header ends inside the padding)
+        self.assertIsNone(self.check(data))
+        self.assertIsNone(self.check(self.gguf(0, pad=True)))
+
+    def test_a_cut_header_or_data_is_short(self):
+        self.assertIsNotNone(self.check(self.gguf(0, pad=False)[:-3]))
+        whole = self.gguf(3, pad=True)
+        self.assertIsNone(self.check(whole))
+        self.assertTrue(self.check(whole[:-1]).startswith("short"))
+
+
 class RestartAfterUpdate(unittest.TestCase):
     """The dashboard's Update ends the server with UPDATE_EXIT: maya.py starts the new version - the same model and
     settings, no setup flags, no question - and nothing else (no download, no pack)."""
