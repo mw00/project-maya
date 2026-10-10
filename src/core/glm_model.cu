@@ -478,6 +478,22 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
 Glm5Model::~Glm5Model() {
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
+    if (!seq_.empty()) {   // STRATA_GLM_SEQS: sequence 0 goes back to the members (freed below), the others here
+        seq_bind(0);
+        for (size_t s = 0; s < seq_.size(); ++s) {
+            SeqCtx& c = seq_[s];
+            if (s > 0) {
+                for (float* d : {c.state, c.snap, c.snap_pool, c.kda_bak})
+                    if (d) cudaFree(d);
+            }
+            if (c.hop_h) cudaFreeHost(c.hop_h);
+            if (c.emb_h) cudaFreeHost(c.emb_h);
+            if (c.tok_h) cudaFreeHost(c.tok_h);
+            if (c.ev_hop) cudaEventDestroy(c.ev_hop);
+            if (c.ev_done) cudaEventDestroy(c.ev_done);
+        }
+        seq_.clear();
+    }
     fast_destroy();
     if (!stage_workers_.empty()) {
         // stop the staging pool: without this the workers block in stage_cv_ forever and the
@@ -2491,6 +2507,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     state_bytes_ = (uint64_t) floats * sizeof(float);
     { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
 
     const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
     int64_t s = 0;
