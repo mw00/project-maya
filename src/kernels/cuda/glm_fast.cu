@@ -1124,6 +1124,184 @@ void mv_rows_launch(const MvRowsBatch& b, int blocks, int nt, cudaStream_t s) {
     }
 }
 
+#if defined(STRATA_USE_HIP)
+// ---------------------------------------------------------------- the dense GEMV on RDNA3 (gfx11)
+// Q6_K is ~64% of a decode token's bytes (Maya-S: the KDA/DSA projections, the shared experts, the dense FFN and the
+// head), and on a Radeon 8065S row_dot<14> ran them at 165-220 GB/s of the 273 the LPDDR5X gives: its loop is not
+// unrolled, so each wave keeps ONE 210-byte block (9 loads) in flight and then waits ~1-2 us for it - the APU's
+// memory latency, not its bandwidth, set the pace.  These kernels issue the loads of U blocks before the arithmetic of
+// the first, give a wave R output rows that share one activation load, and do Q6_K's "-32" with a second dot instead
+// of __vsubss4's ten-instruction SWAR emulation (q - 32 never saturates: sum (q - 32) u = sum q u + sum (-32) u, both
+// exact in v_dot4_i32_iu8).  Every row's value is still dot_q6_K's arithmetic in row_dot's order - lane L takes iqs L
+// of every super-block, the blocks in order, then warp_sum - so the outputs are bit for bit mv_kernel_t's.
+struct Q6W {   // one lane's share of one Q6_K super-block (dot_q6_K's loads)
+    int vl, vh, sc0, sc1;
+    float d;
+};
+struct Q6X {   // ... and of the q8_1 activation blocks it meets
+    int u0, u1;
+    float d0, d1;
+};
+__device__ __forceinline__ Q6W q6_wload(const block_q6_K* w, int lane) {
+    Q6W r;
+    r.vl = get_int_b2(w->ql, lane);
+    r.vh = get_int_b2(w->qh, 8 * (lane / 16) + lane % 8) >> (2 * ((lane % 16) / 8));
+    const int8_t* sc = w->scales + 8 * (lane / 16) + (lane % 16) / 4;
+    r.sc0 = sc[0];
+    r.sc1 = sc[4];
+    r.d = __half2float(w->d);
+    return r;
+}
+__device__ __forceinline__ Q6X q6_xload(const block_q8_1* x, int lane) {   // x: the super-block's 8 q8_1 blocks
+    const block_q8_1* b = x + 4 * (lane / 16) + (lane % 16) / 8;
+    Q6X r;
+    r.u0 = ((const int*) b[0].qs)[lane % 8];
+    r.d0 = __low2float(b[0].ds);
+    r.u1 = ((const int*) b[2].qs)[lane % 8];
+    r.d1 = __low2float(b[2].ds);
+    return r;
+}
+// sum (q_i - 32) u_i for four 6-bit q: __dp4a(__vsubss4(q, 0x20202020), u, 0) without the SWAR subtract
+__device__ __forceinline__ int q6_idot(int q, int u) {
+#if __has_builtin(__builtin_amdgcn_sudot4) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__))
+    return __builtin_amdgcn_sudot4(true, (int) 0xe0e0e0e0u, true, u, __builtin_amdgcn_sudot4(false, q, true, u, 0, false),
+                                   false);
+#else
+    return __dp4a(__vsubss4(q, 0x20202020), u, 0);
+#endif
+}
+// dot_q6_K's float arithmetic, term for term (the same products, sums and order)
+__device__ __forceinline__ float q6_val(const Q6W& w, const Q6X& x) {
+    float sumf = 0.0f;
+    sumf += x.d0 * (q6_idot((w.vl & 0x0f0f0f0f) | ((w.vh << 4) & 0x30303030), x.u0) * w.sc0);
+    sumf += x.d1 * (q6_idot(((w.vl >> 4) & 0x0f0f0f0f) | (w.vh & 0x30303030), x.u1) * w.sc1);
+    return w.d * sumf;
+}
+// R weight rows (rb bytes apart) x NT activations (xs q8_1 blocks apart), nb super-blocks, U of them per step
+template<int R, int NT, int U>
+__device__ __forceinline__ void q6_rows_rdna(const uint8_t* w0, size_t rb, const block_q8_1* x, size_t xs, int nb,
+                                             int lane, float (&s)[R][NT]) {
+    float acc[R][NT];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) acc[r][t] = 0.0f;
+    int b = 0;
+    for (; b + U <= nb; b += U) {
+        Q6W w[U][R];
+        Q6X xv[U][NT];
+#pragma unroll
+        for (int k = 0; k < U; ++k) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) w[k][r] = q6_wload((const block_q6_K*) (w0 + (size_t) r * rb) + b + k, lane);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) xv[k][t] = q6_xload(x + (size_t) t * xs + (size_t) (b + k) * 8, lane);
+        }
+#pragma unroll
+        for (int k = 0; k < U; ++k)
+#pragma unroll
+            for (int r = 0; r < R; ++r)
+#pragma unroll
+                for (int t = 0; t < NT; ++t) acc[r][t] += q6_val(w[k][r], xv[k][t]);
+    }
+    for (; b < nb; ++b) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const Q6W w = q6_wload((const block_q6_K*) (w0 + (size_t) r * rb) + b, lane);
+#pragma unroll
+            for (int t = 0; t < NT; ++t) acc[r][t] += q6_val(w, q6_xload(x + (size_t) t * xs + (size_t) b * 8, lane));
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+#pragma unroll
+        for (int t = 0; t < NT; ++t) s[r][t] = warp_sum(acc[r][t]);
+}
+// rows_dot_bf16 / row_dot_bf16 with U loads in flight per lane (the same expression per 8 values, the same order)
+template<int NT, int U>
+__device__ __forceinline__ void bf16_rows_rdna(const uint16_t* row, const float* x, int n_in, int lane, float (&s)[NT]) {
+    float acc[NT];
+#pragma unroll
+    for (int t = 0; t < NT; ++t) acc[t] = 0.0f;
+    const uint4* r8 = (const uint4*) row;
+#pragma unroll U
+    for (int k = lane; k < n_in / 8; k += 32) {
+        const uint4 w = r8[k];
+#pragma unroll
+        for (int t = 0; t < NT; ++t) {
+            const float4* x4 = (const float4*) (x + (size_t) t * n_in);
+            const float4 a = x4[2 * k], b = x4[2 * k + 1];
+            acc[t] += __uint_as_float(w.x << 16) * a.x + __uint_as_float(w.x & 0xffff0000u) * a.y +
+                      __uint_as_float(w.y << 16) * a.z + __uint_as_float(w.y & 0xffff0000u) * a.w +
+                      __uint_as_float(w.z << 16) * b.x + __uint_as_float(w.z & 0xffff0000u) * b.y +
+                      __uint_as_float(w.w << 16) * b.z + __uint_as_float(w.w & 0xffff0000u) * b.w;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < NT; ++t) s[t] = warp_sum(acc[t]);
+}
+// One launch for a batch's Q6_K AND BF16 jobs (the router, the KDA gates, the indexer projections ride along with the
+// big Q6_K GEMVs instead of a second, 36-block launch behind them).  A Q6_K job's block holds WPB waves of R rows, a
+// BF16 job's WPB waves of one row; the dispatcher puts the BF16 jobs first so their long-K rows start early.
+template<int R, int NT, int U, int WPB, bool XL>
+__global__ void __launch_bounds__(WPB * 32) mv_rdna_kernel(const __grid_constant__ MvBatch b) {
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+    if (J.type == 14) {
+        const block_q8_1* xq = (const block_q8_1*) J.xq;
+        if constexpr (XL) {   // the block's activation rows staged in LDS once (dynamic: NT * n_in / 32 q8_1 blocks)
+            extern __shared__ int mv_rdna_xs[];
+            const int nw = NT * (J.n_in / 32) * (int) (sizeof(block_q8_1) / 4);
+            for (int i = threadIdx.x; i < nw; i += WPB * 32) mv_rdna_xs[i] = ((const int*) J.xq)[i];
+            __syncthreads();
+            xq = (const block_q8_1*) mv_rdna_xs;
+        }
+        const int row = ((bid - blk0) * WPB + wave) * R;
+        if (row >= J.n_out) return;
+        const size_t rb = (size_t) (J.n_in / 256) * sizeof(block_q6_K);
+        float s[R][NT];
+        if (row + R <= J.n_out) {
+            q6_rows_rdna<R, NT, U>((const uint8_t*) J.w + (size_t) row * rb, rb, xq, (size_t) (J.n_in / 32),
+                                   J.n_in / 256, lane, s);
+        } else {   // the job's last rows: one at a time
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (row + r >= J.n_out) break;
+                float s1[1][NT];
+                q6_rows_rdna<1, NT, U>((const uint8_t*) J.w + (size_t) (row + r) * rb, rb, xq, (size_t) (J.n_in / 32),
+                                       J.n_in / 256, lane, s1);
+#pragma unroll
+                for (int t = 0; t < NT; ++t) s[r][t] = s1[0][t];
+            }
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (row + r >= J.n_out) break;
+                const float bias = J.bias ? J.bias[row + r] : 0.0f;
+#pragma unroll
+                for (int t = 0; t < NT; ++t) J.y[(size_t) t * J.n_out + row + r] = J.alpha * s[r][t] + bias;
+            }
+        }
+    } else {   // kTypeBF16
+        const int row = (bid - blk0) * WPB + wave;
+        if (row >= J.n_out) return;
+        float s[NT];
+        bf16_rows_rdna<NT, 4>((const uint16_t*) J.w + (size_t) row * J.n_in, J.xf, J.n_in, lane, s);
+        if (lane == 0) {
+            const float bias = J.bias ? J.bias[row] : 0.0f;
+#pragma unroll
+            for (int t = 0; t < NT; ++t) J.y[(size_t) t * J.n_out + row] = J.alpha * s[t] + bias;
+        }
+    }
+}
+#endif
+
 __global__ void quantize_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;   // n % 32 == 0: whole warps only
@@ -3216,6 +3394,116 @@ size_t row_bytes(int type, int64_t n_in) {
     }
 }
 
+#if defined(STRATA_USE_HIP)
+namespace {
+// The RDNA3 GEMV's shape: R rows per wave, U super-blocks in flight, WPB waves per block, the Q6_K activations in LDS
+// or not.  The bench sets it (hip_expert_bench::mv_config); r == 0 is the original kernels, r < 0 the default: one row
+// per wave, two super-blocks in flight, 8 waves - the one shape never slower than the originals at any decode shape
+// on a Radeon 8065S (glm_mv_bench --sweep: -4..-17% per batch, the head even).  More rows per wave (the activation
+// shared) or U = 4 ran slower: the extra VGPRs cost occupancy, and the latency is hidden by waves, not by registers.
+// LDS (lds < 0: auto) only where it measured a win: one row (mv) with K <= 4096 - the small batches (the DSA
+// projections 52.5 -> 46.1 us, the router + shared expert 82.2 -> 77.7); K = 12288 / 16384 and the window's rows
+// (mv_rows) ran slower with it (the 24-48 KB of LDS per block cost occupancy).
+std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
+// gfx11 only (the device the launch runs on); STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t / mv_rows_kernel (A/B)
+bool mv_rdna_device() {
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_GLM_MV_RDNA");
+        return v && v[0] == '0';
+    }();
+    if (off || g_mv_r.load(std::memory_order_relaxed) == 0) return false;
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    static thread_local int cached_device = -1;
+    static thread_local bool gfx11 = false;
+    if (cached_device != device) {
+        hipDeviceProp_t prop{};
+        if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
+        gfx11 = std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
+        cached_device = device;
+    }
+    return gfx11;
+}
+template<int NT, int R, int U>
+void mv_rdna_launch_w(const MvBatch& b, int blocks, int wpb, int lds, cudaStream_t s) {
+    if (lds > 0) {
+        if (wpb == 4) mv_rdna_kernel<R, NT, U, 4, true><<<blocks, 128, lds, s>>>(b);
+        else mv_rdna_kernel<R, NT, U, 8, true><<<blocks, 256, lds, s>>>(b);
+    } else {
+        if (wpb == 4) mv_rdna_kernel<R, NT, U, 4, false><<<blocks, 128, 0, s>>>(b);
+        else mv_rdna_kernel<R, NT, U, 8, false><<<blocks, 256, 0, s>>>(b);
+    }
+}
+template<int NT>
+void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds, cudaStream_t s) {
+    if constexpr (NT == 1) {
+        switch (r * 10 + u) {
+            case 11: mv_rdna_launch_w<NT, 1, 1>(b, blocks, wpb, lds, s); break;
+            case 12: mv_rdna_launch_w<NT, 1, 2>(b, blocks, wpb, lds, s); break;
+            case 14: mv_rdna_launch_w<NT, 1, 4>(b, blocks, wpb, lds, s); break;
+            case 21: mv_rdna_launch_w<NT, 2, 1>(b, blocks, wpb, lds, s); break;
+            case 22: mv_rdna_launch_w<NT, 2, 2>(b, blocks, wpb, lds, s); break;
+            case 24: mv_rdna_launch_w<NT, 2, 4>(b, blocks, wpb, lds, s); break;
+            case 41: mv_rdna_launch_w<NT, 4, 1>(b, blocks, wpb, lds, s); break;
+            case 42: mv_rdna_launch_w<NT, 4, 2>(b, blocks, wpb, lds, s); break;
+            default: mv_rdna_launch_w<NT, 4, 4>(b, blocks, wpb, lds, s); break;
+        }
+    } else {
+        switch (r * 10 + u) {
+            case 11: mv_rdna_launch_w<NT, 1, 1>(b, blocks, wpb, lds, s); break;
+            case 12: mv_rdna_launch_w<NT, 1, 2>(b, blocks, wpb, lds, s); break;
+            case 21: mv_rdna_launch_w<NT, 2, 1>(b, blocks, wpb, lds, s); break;
+            default: mv_rdna_launch_w<NT, 1, 4>(b, blocks, wpb, lds, s); break;
+        }
+    }
+}
+// The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device.
+bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
+    if (!mv_rdna_device()) return false;
+    int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
+    const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
+    if (r < 0) { r = 1; u = 2; }
+    if (nt > 1 && r > 2) r = 2;
+    MvBatch b{};
+    int acc = 0, m = 0, max_in = 0;
+    for (const int T : {kTypeBF16, 14})
+        for (int i = 0; i < n; ++i)
+            if (jobs[i].type == T) {
+                b.j[m] = jobs[i];
+                acc += (jobs[i].n_out + (T == 14 ? wpb * r : wpb) - 1) / (T == 14 ? wpb * r : wpb);
+                b.blk_end[m++] = acc;
+                done[i] = true;
+                if (T == 14) max_in = std::max(max_in, jobs[i].n_in);
+            }
+    if (m == 0) return true;
+    b.n = m;
+    const int lds_mode = g_mv_lds.load(std::memory_order_relaxed);
+    const bool use_lds = lds_mode > 0 || (lds_mode < 0 && nt == 1 && max_in <= 4096);
+    int lds = use_lds ? nt * (max_in / 32) * (int) sizeof(block_q8_1) : 0;
+    if (lds > 48 * 1024) lds = 0;
+    switch (nt) {
+        case 1: mv_rdna_launch<1>(b, acc, r, u, wpb, lds, s); break;
+        case 2: mv_rdna_launch<2>(b, acc, r, u, wpb, lds, s); break;
+        case 3: mv_rdna_launch<3>(b, acc, r, u, wpb, lds, s); break;
+        case 4: mv_rdna_launch<4>(b, acc, r, u, wpb, lds, s); break;
+        case 5: mv_rdna_launch<5>(b, acc, r, u, wpb, lds, s); break;
+        case 6: mv_rdna_launch<6>(b, acc, r, u, wpb, lds, s); break;
+        case 7: mv_rdna_launch<7>(b, acc, r, u, wpb, lds, s); break;
+        default: mv_rdna_launch<8>(b, acc, r, u, wpb, lds, s); break;
+    }
+    return true;
+}
+}  // namespace
+namespace hip_expert_bench {
+void mv_config(int r, int u, int wpb, int lds) {
+    g_mv_r.store(r);
+    g_mv_u.store(u);
+    g_mv_wpb.store(wpb);
+    g_mv_lds.store(lds);
+}
+}  // namespace hip_expert_bench
+#endif
+
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > kMaxMvJobs) return false;
     for (int i = 0; i < n; ++i)
@@ -3228,12 +3516,15 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     constexpr int kTyped[] = {14, 8, 12, 13};
     bool done[kMaxMvJobs] = {};
+#if defined(STRATA_USE_HIP)
+    if (typed) mv_rdna(jobs, n, 1, done, s);
+#endif
     if (typed) {
         for (const int T : kTyped) {
             MvBatch b{};
             int acc = 0, m = 0;
             for (int i = 0; i < n; ++i)
-                if (jobs[i].type == T) {
+                if (!done[i] && jobs[i].type == T) {
                     b.j[m] = jobs[i];
                     acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
                     b.blk_end[m++] = acc;
@@ -3278,12 +3569,15 @@ bool mv_rows(const MvJob* jobs, int n, int nt, cudaStream_t s) {
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     constexpr int kTyped[] = {14, 8, 12, 13, kTypeBF16};
     bool done[kMaxMvJobs] = {};
+#if defined(STRATA_USE_HIP)
+    if (typed) mv_rdna(jobs, n, nt, done, s);
+#endif
     if (typed) {
         for (const int T : kTyped) {
             MvRowsBatch b{};
             int acc = 0, m = 0;
             for (int i = 0; i < n; ++i)
-                if (jobs[i].type == T) {
+                if (!done[i] && jobs[i].type == T) {
                     b.j[m] = jobs[i];
                     acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
                     b.blk_end[m++] = acc;
