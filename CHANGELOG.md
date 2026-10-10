@@ -4,6 +4,23 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.0.31 - 2026-10-10
+
+The expert prefetch can now pay on a RAM-bound split: three settings choose when its copy starts, how many GPU blocks it
+takes and which predictions it copies.
+
+- **The expert prefetch, tunable** (#84 by @sociolog): `STRATA_GLM_PREFETCH_N` copies the next layer's predicted
+  experts that are not in VRAM into that layer's spares while a layer computes. As it was, it cost more than it saved
+  on a RAM-bound split. Three settings for it; the prefetch stays off by default and nothing else changes:
+  - `STRATA_GLM_PREFETCH_AT=route|fetch|cpu`: when the copy starts - at once (as before), after this layer's own
+    fetch, or after its CPU-lane answer;
+  - `STRATA_GLM_PREFETCH_BLOCKS=<n>`: the copy's GPU blocks (half the SMs before);
+  - `STRATA_GLM_PREFETCH_RANK=<n>`: copy only the prediction's first n ranks. Its first guesses are right almost
+    always, its 5th-8th mostly not.
+
+  Maya-M on an RTX 3090 + 3060 at 21K context: decode (writing the answer) 19.64 tok/s without the prefetch, 20.22
+  with `N=1 AT=fetch BLOCKS=4 RANK=2`, and +4.7% over a 40-turn agent-like conversation. The README has a row for it.
+
 ## v1.0.30 - 2026-10-10
 
 AMD GPUs set up on Windows too, Windows reads its experts from the SSD much faster, the CPU lane times itself
