@@ -22,7 +22,7 @@ What the first run does (each step is skipped when it is already done):
      on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
-     Maya-S24, Maya-M or Maya-L)
+     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
@@ -153,6 +153,28 @@ MODELS = {
             "GLM-5.3-Flash-Maya-M-IQ2_S-00003-of-00003.gguf":
                 "ebf1ce713f71207747e10eeebed87597969d8b5e1d9dd817420d2c2f7ca51e0e"},
         "vision": {
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # Maya-M with Blackfrost_AI's weight edit, in a repo of its own (the same label as Maya-M's: Hugging Face groups by
+    # it per repo); the vision files are Maya's, from the main repo
+    "Maya-M-Derisked": {
+        "about": "Maya-M-Derisked, Maya-M with a directional weight edit by Blackfrost_AI that reduces blanket "
+                 "refusals: the same IQ2_S quant, files and size, some of its weights changed (experimental)",
+        "repo": "peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF", "revision": "main", "folder": "",
+        "file": "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-{i:05d}-of-{n:05d}.gguf", "shards": 3, "download_gb": 116.0,
+        "sha256": {
+            "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00001-of-00003.gguf":
+                "da6a9755946f85a68aed34e80e86a7cf942f4ca637e605be81481979c871591e",
+            "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00002-of-00003.gguf":
+                "afc0705798bb293495168889a63186193fcd84e271aea3cde53c4814e9c96449",
+            "GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-00003-of-00003.gguf":
+                "e397c79669b84e8f54b7c946def0ea94f59771eecd7575766a3f70abfdd12157"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main",
             "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
             "download_gb": 1.14,
             "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
