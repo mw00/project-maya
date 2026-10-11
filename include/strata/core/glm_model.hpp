@@ -133,6 +133,10 @@ public:
     bool set_pcie_share(double share);
     int cpu_lane_threads() const;
     bool set_cpu_lane_threads(int n);
+    /// The decode's disk reads: each expert read from the SSD in 3 x n pieces at once (STRATA_GLM_READ_CHUNKS, 8).
+    /// set_read_chunks(n): n (1-16) from the next read on, n <= 0 the engine's own - for setup's calibration (per
+    /// request, no restart): the best size depends on the drive, its driver and the CPU
+    void set_read_chunks(int n);
     /// Conversation reuse (the fast path): save the sequence state at the current position - the recurrent KDA
     /// states and conv histories (the DSA caches are append-only, so the position alone restores them) - and
     /// restore it later to continue a prompt that extends the saved one.  false when unsupported.

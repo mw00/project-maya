@@ -215,11 +215,12 @@ free RAM, and measures the CPU against the PCIe link at start to decide how many
 expert each way; the tuning measures the real output speed instead, in one engine run (about 10-15 minutes, most of
 it loading the model), with a few splits of the RAM-tier experts between the CPU and the PCIe link and with fewer CPU
 threads - more threads than the memory can feed only wait, and on a hybrid CPU the efficiency cores can hold the rest
-up. Every measurement answers prompts it has not answered before, as a chat's text is new to the expert tiers (the
+up - and, when part of the model is read from the SSD, with smaller disk reads (the best size depends on the drive and
+its driver). Every measurement answers prompts it has not answered before, as a chat's text is new to the expert tiers (the
 same few answers over and over left VRAM holding exactly their experts, and the speed it reported was one no chat
 reached), and the engine works on a copy of your expert usage file, so the tuning's answers do not change what the
 next start loads first. A setting is kept when it is more than 3% faster than the engine's own choice. The result
-goes into the config's `"env"` (`STRATA_GLM_PCIE_SHARE`, `STRATA_GLM_CPU_LANE`) and into
+goes into the config's `"env"` (`STRATA_GLM_PCIE_SHARE`, `STRATA_GLM_CPU_LANE`, `STRATA_GLM_READ_CHUNKS`) and into
 `~/.config/project-maya/calibration.json` for this PC, model and context, so setting up again keeps it. Stop a
 running server first: the tuning needs the GPU(s).
 
@@ -242,6 +243,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_PCIE_SHARE` | measured at start | the share of a token's RAM-tier experts copied over PCIe and run on the GPU instead of on the CPU: `0` = the CPU takes every one, `1` = none (the tuning sets it; `STRATA_GLM_CPU_PLAN` = the split per expert count, digits for 0..8) |
 | `STRATA_GLM_PREFETCH_N` | 0 | `1` or `2` (more is read as 2; the engine log says the settings at start): each layer copies up to this many of the next layer's predicted experts (its router on this layer's input) that are not in VRAM into that layer's spares while it computes. `STRATA_GLM_PREFETCH_AT`: when the copy starts - `route` (the default: at once, beside this layer's own PCIe fetch and CPU lane), `fetch` (after this layer's fetch) or `cpu` (after its CPU lane); `STRATA_GLM_PREFETCH_BLOCKS`: the copy's blocks (default half the SMs); `STRATA_GLM_PREFETCH_RANK`: copy only the prediction's first n ranks (its first guesses are right almost always, its 5th-8th mostly not). Maya-M on an RTX 3090 + 3060 with `RAM_RESIDENT=1`, decode at 21K: off 19.64, `N=1` 17.0, `N=1 AT=fetch BLOCKS=4` 19.75, `+ RANK=2` 20.22 tokens/s (VRAM hits 64 -> 69 %); Maya-L there (bigger experts, a busier link): no gain |
 | `STRATA_GLM_NUMA` | on with 2+ NUMA nodes | `0` = allocate the RAM tier without spreading it page by page over the sockets' memory |
+| `STRATA_GLM_READ_CHUNKS` | 8 | the experts read from the SSD while it answers (and a prompt's): each part of one in this many pieces at once, 1-16. The best size depends on the drive, its driver and the CPU - 8 on a Linux NVMe, 4 on a Windows laptop's Intel RST RAID (decode +15%) - and the tuning measures 4 and 2 against 8 when part of the model lives on the SSD |
 | `STRATA_GLM_PREFILL_CHUNK` | unset | `--prefill N` from the environment (the older setting; it wins over the config's `--prefill`) |
 | `STRATA_PREFILL_LEND_PCT`, `STRATA_GLM_PREFILL_MB` | 90 or 85, unset | `--prefill auto`: the share of each card's expert-pool slots a prompt may borrow for its buffers - as Strata, 90 when at least 90% of the experts' bytes are held pinned (in VRAM or the RAM tier), else 85 - or a fixed budget in MB |
 | `STRATA_GLM_PREFILL_TAIL_SKIP` | on | single-device prompts without a loaded NextN/MTP block: skip the last layer's attention output projection and FFN after updating all its caches; `0` restores the full computation. Splits and `GLM_CB_DIR` seam dumps keep the full path |

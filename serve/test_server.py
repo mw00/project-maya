@@ -364,6 +364,13 @@ class SamplingKeys(unittest.TestCase):
         bad = self.keys(strata_tune={"pcie_frac": 3, "spec_min_p": True, "pool_workers": 2})
         self.assertFalse([x for x in bad if x.split("=")[0] in ("pcie_frac", "spec_min_p", "pool_workers")])
 
+    def test_read_chunks_tune_key(self):
+        # setup's calibration of the disk reads' size (#67): 1-16 pieces, nothing else
+        self.assertIn("read_chunks=4", self.keys(temperature=0, strata_tune={"read_chunks": 4}))
+        for bad in (0, 17, True, 2.5, "4"):
+            self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"read_chunks": bad})
+                              if k.startswith("read_chunks=")], bad)
+
     def test_penalty_window(self):
         self.assertIn("penalty_last_n=64", self.keys(presence_penalty=1.5))
         self.assertIn("penalty_last_n=4096", self.keys(repetition_penalty=1.1, penalty_last_n=4096))

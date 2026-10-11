@@ -1845,6 +1845,7 @@ static int glm_pack_generate(const Options& o) {
             req_think_end = -1;
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
             int req_threads = 0;
+            int req_chunks = 0;   // ... and its disk reads' pieces (0: as the engine started)
             std::string tok2, ids, emb_path;
             while (ss >> tok2) {
                 const size_t eq = tok2.find('=');
@@ -1867,6 +1868,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
                 else if (k == "cpu_threads") { req_threads = std::atoi(v.c_str()); }
+                else if (k == "read_chunks") { req_chunks = std::atoi(v.c_str()); }
                 // penalty_* need machinery this mode does not have (history rows): ignored rather than approximated
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
@@ -1874,6 +1876,7 @@ static int glm_pack_generate(const Options& o) {
             // the CPU lane for this request: what it names, else what the engine started with
             model.set_pcie_share(req_pcie >= 0.0 && req_pcie <= 1.0 ? req_pcie : -1.0);
             model.set_cpu_lane_threads(req_threads > 0 ? req_threads : 0);
+            model.set_read_chunks(req_chunks > 0 ? req_chunks : 0);
             std::vector<int64_t> toks;
             std::string e;
             if (max_new <= 0 || ids.empty() || !parse_i64_list(ids.c_str(), toks, e)) {

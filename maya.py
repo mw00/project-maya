@@ -35,10 +35,11 @@ What the first run does (each step is skipped when it is already done):
      http://127.0.0.1:8080
 
 The tuning (tools/calibrate_glm.py): decode speed measured with a few splits of the RAM-tier
-experts between the CPU and the PCIe link, and with fewer CPU threads, in one engine run (~10-15 minutes, the model
-loads first); a setting is kept when it is more than 3% faster than the engine's own choice.  The result goes into the
-config's "env" (STRATA_GLM_PCIE_SHARE, STRATA_GLM_CPU_LANE) and into ~/.config/project-maya/calibration.json for this
-PC, model and context, so a setup again keeps it.
+experts between the CPU and the PCIe link, with fewer CPU threads, and - when part of the model is read from the SSD -
+with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when it is more
+than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
+STRATA_GLM_CPU_LANE, STRATA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
+context, so a setup again keeps it.
 
 Nothing is installed system-wide: a missing tool is reported with the command that installs it.
 """

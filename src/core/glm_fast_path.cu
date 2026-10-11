@@ -2426,6 +2426,11 @@ bool Glm5Model::set_cpu_lane_threads(int n) {
     return any;
 }
 
+void Glm5Model::set_read_chunks(int n) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_ != nullptr) m->fast_->read_chunks = n > 0 ? std::min(16, n) : 0;
+}
+
 Glm5Model::FastStats Glm5Model::fast_stats() const {
     FastStats s;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
@@ -2725,11 +2730,13 @@ void Glm5Model::fast_service() {
                     }
                 }
                 // each part in chunks across the workers: the O_DIRECT bounce copy of a whole part was ~0.4 ms of the
-                // wait (Mercury: 3.6 -> 3.1 ms a disk wait at 8 chunks; STRATA_GLM_READ_CHUNKS overrides)
-                static const int rch = [] {
+                // wait (Mercury: 3.6 -> 3.1 ms a disk wait at 8 chunks; STRATA_GLM_READ_CHUNKS overrides - a Windows
+                // laptop on an Intel RST RAID read 15% faster with 4, #67 - and setup's calibration tries 4 and 2)
+                static const int rch_env = [] {
                     const char* v = getenv("STRATA_GLM_READ_CHUNKS");
                     return std::max(1, std::min(16, v ? std::atoi(v) : 8));
                 }();
+                const int rch = F->read_chunks > 0 ? F->read_chunks : rch_env;
                 F->workers->run(nr * 3 * rch, [&](int job) {
                     const int m = rd[job / (3 * rch)], part = job % (3 * rch);
                     fast_read_part(il, ids[mi[m]], part / rch, dst[m], part % rch, rch);

@@ -101,6 +101,54 @@ class Measure(unittest.TestCase):
         self.assertEqual(eng.requests, [])
 
 
+class DiskEngine(FakeEngine):
+    """A FakeEngine whose model does not fit VRAM and RAM (the decode reads from the SSD): its speed also depends on
+    the request's read_chunks (8 when it names none)."""
+
+    def __init__(self, speed, experts=12384, held=9000, **kw):
+        super().__init__(lambda s, t: 0.0, **kw)
+        self.speed3 = speed
+        self.info.update(experts=experts, vram_slots=held // 2, ram_slots=held - held // 2)
+        self.chunks = []
+
+    def generate(self, ids, max_new, sampling, cancel):
+        tune = sampling.get("strata_tune") or {}
+        c = tune.get("read_chunks", 8)
+        self.chunks.append(c)
+        self.speed = lambda s, t: self.speed3(s, t, c)
+        return super().generate(ids, max_new, sampling, cancel)
+
+
+class ReadChunks(unittest.TestCase):
+    def test_a_faster_read_size_is_kept(self):
+        # a Windows laptop on an Intel RST RAID (#67): 4 pieces 15% faster than the engine's 8
+        eng = DiskEngine(lambda s, t, c: 14.5 * (1.15 if c == 4 else 1.0))
+        res, _ = run_measure(eng)
+        self.assertEqual(res["settings"], {CAL.CHUNKS_ENV: "4"})
+        self.assertAlmostEqual(res["report"]["tok_s"], 16.7, places=1)
+
+    def test_fewer_pieces_slower_keeps_the_engines_own_and_stops(self):
+        # a Linux NVMe (Mercury): 8 > 4 > 2 - nothing kept, and 2 is not tried once 4 lost
+        eng = DiskEngine(lambda s, t, c: {8: 12.6, 4: 12.2, 2: 11.6}[c])
+        res, _ = run_measure(eng)
+        self.assertEqual(res["settings"], {})
+        self.assertIn(4, eng.chunks)
+        self.assertNotIn(2, eng.chunks)
+
+    def test_no_disk_no_read_size(self):
+        # every expert in VRAM or RAM: the disk reads' size is not measured
+        eng = DiskEngine(lambda s, t, c: 20.0, experts=9000, held=9000)
+        res, _ = run_measure(eng)
+        self.assertEqual(res["settings"], {})
+        self.assertEqual(set(eng.chunks), {8})
+
+    def test_reads_disk(self):
+        self.assertTrue(CAL.reads_disk({"experts": 12384, "vram_slots": 3000, "ram_slots": 5000}))
+        self.assertFalse(CAL.reads_disk({"experts": 12384, "vram_slots": 7000, "ram_slots": 6000}))
+        self.assertFalse(CAL.reads_disk({"cpu_threads": 40}))
+        self.assertFalse(CAL.reads_disk({"experts": "x", "vram_slots": 1}))
+
+
 class Helpers(unittest.TestCase):
     def test_apply_replaces_and_clears(self):
         env = {"STRATA_GLM_RAM_HEADROOM_GB": "4", CAL.SHARE_ENV: "0.50", CAL.THREADS_ENV: "12"}

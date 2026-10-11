@@ -427,6 +427,7 @@ struct Glm5Model::FastState {
     bool ram_resident = false;   // STRATA_GLM_RAM_RESIDENT=1 / --glm-ram-resident: the RAM tier holds EVERY expert
                                  // VRAM does not, nothing ever drops to disk; the start fails if the tier is small
     int ram_slack = 0;           // extra RAM-tier slots per MoE layer (STRATA_GLM_RAM_SLACK; default 16 resident)
+    int read_chunks = 0;         // set_read_chunks: a disk read's pieces (0: STRATA_GLM_READ_CHUNKS, else 8)
     // ---- STRATA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
     bool kda_graph_on = false;   // experimental, single-device ordinary decode only
