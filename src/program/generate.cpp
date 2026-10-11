@@ -1004,6 +1004,9 @@ static int glm_pack_generate(const Options& o) {
     std::atomic<bool> stop_req{false}, quit_req{false};
     // WRAP (the server is stopping): a request still thinking closes its reasoning at the next token and answers
     std::atomic<bool> wrap_req{false};
+    // PAUSE (the server's fair slices): STOP, and the conversation's state is kept with what the request wrote (the
+    // snapshot moves to the last token fed), so the request that continues it reads only its last token
+    std::atomic<bool> pause_req{false}, pause_keep{false};
     std::mutex in_mu;
     std::condition_variable in_cv;
     std::deque<std::string> in_lines;
@@ -1038,6 +1041,12 @@ static int glm_pack_generate(const Options& o) {
             while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 if (l == "STOP") { stop_req.store(true); continue; }
+                if (l == "PAUSE" || l == "PAUSE keep") {   // keep: the prompt's state is set aside first
+                    pause_keep.store(l == "PAUSE keep");
+                    pause_req.store(true);
+                    stop_req.store(true);
+                    continue;
+                }
                 if (l == "WRAP") { wrap_req.store(true); continue; }
                 if (l == "QUIT") {                       // cancel an in-flight request AND queue the line:
                     quit_req.store(true);
@@ -1093,6 +1102,9 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int32_t> tokens;
         std::string path;
         uint64_t bytes = 0, used = 0;
+        // a paused request's prompt (PAUSE keep): the next turn of that chat continues it, not the written answer
+        // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
+        bool anchor = false;
     };
     constexpr uint64_t kNoImages = 1469598103934665603ull;   // img_hash() of a prefix without pictures
     std::vector<Slot> slots;
@@ -1248,7 +1260,7 @@ static int glm_pack_generate(const Options& o) {
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages) return;
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (slots[i].tokens.size() <= snap_tokens.size() &&
+            if (!slots[i].anchor && slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
@@ -1316,6 +1328,7 @@ static int glm_pack_generate(const Options& o) {
         snap_img_hash = kNoImages;
         snap_in_slot = true;
         slots[best].used = ++slot_clock;
+        slots[best].anchor = false;
         if (slot_keep) {   // its age counts from its last use
             std::error_code ec;
             fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
@@ -1331,6 +1344,8 @@ static int glm_pack_generate(const Options& o) {
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
         stop_req.store(false);
+        pause_req.store(false);
+        pause_keep.store(false);
         model.force_next(-1);
         bool in_think = req_think_budget > 0 && req_think_end >= 0;
         std::vector<int32_t> prompt;
@@ -1457,6 +1472,7 @@ static int glm_pack_generate(const Options& o) {
         static const int loop_w_think = (int) env_num("STRATA_GLM_LOOP_THINK", 256);
         static const int loop_w_answer = (int) env_num("STRATA_GLM_LOOP_ANSWER", 1024);
         std::vector<int> gen_hist;
+        std::vector<int32_t> emitted;   // every token this request wrote (a PAUSE keeps the state they lead to)
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
         int guard_fired = 0;     // soft landings in this answer: a second loop ends it
         const auto looping = [&](int w) -> int {   // the pattern's period, 0 when the tail is not one
@@ -1472,6 +1488,7 @@ static int glm_pack_generate(const Options& o) {
         const auto on_token = [&](int tok) -> bool {
             std::printf("T %d\n", tok);
             ++produced;
+            emitted.push_back((int32_t) tok);
             strata::core::progress_at("decode: after token", produced);   // the watchdog's heartbeat (issue #40)
             strata::core::progress_beat();
             gen_hist.push_back(tok);
@@ -1587,6 +1604,38 @@ static int glm_pack_generate(const Options& o) {
                     (unsigned long long) (model.spec_hits_ - hits0), (unsigned long long) (model.spec_steps_ - spec0),
                     reuse, (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         std::fflush(stdout);
+        // PAUSE: the snapshot moves from the prompt to the last token fed (the decode feeds every written token but
+        // the last), so prompt + what was written continues it with one token to read instead of all it wrote.
+        // Text only, and only when the state stands exactly there (the decode paths leave pos = fed tokens).
+        if (pause_req.load() && std::strcmp(finish, "cancel") == 0 && model.fast() && cur_img_pos.empty() &&
+            !emitted.empty() &&
+            getenv("STRATA_GLM_NO_REUSE") == nullptr) {
+            const int64_t p = model.position();
+            const int64_t full = (int64_t) (prompt.size() + emitted.size());
+            if (pause_keep.load() && slot_max > 0 && p > (int64_t) prompt.size() && p < full) {
+                // the request's first slice: its prompt's state goes to a slot (unless one holds it already) and is
+                // anchored there, for this chat's next turn
+                bool held = false;
+                for (auto& sl : slots)
+                    if (sl.tokens == snap_tokens) sl.anchor = held = true;
+                if (!held && !snap_tokens.empty()) {
+                    slot_put(" (a paused request's prompt, kept for its next turn)");
+                    for (auto& sl : slots)
+                        if (sl.tokens == snap_tokens) sl.anchor = true;
+                }
+            }
+            if (p > (int64_t) prompt.size() && p < full && model.snapshot_save()) {
+                snap_tokens.assign(prompt.begin(), prompt.end());
+                snap_tokens.insert(snap_tokens.end(), emitted.begin(), emitted.begin() + (p - (int64_t) prompt.size()));
+                snap_img_hash = img_hash(snap_tokens.size());
+                snap_in_slot = false;
+                std::fprintf(stderr, "glm slots: paused at %lld tokens (%lld written): the state is kept there\n",
+                             (long long) p, (long long) emitted.size());
+            } else if (p > (int64_t) prompt.size()) {
+                std::fprintf(stderr, "glm slots: paused, but the state stands at %lld of %lld tokens: not kept\n",
+                             (long long) p, (long long) full);
+            }
+        }
         // this machine's expert usage, for the next start's warm-up (after DONE: the client is not kept waiting)
         if (model.fast()) model.save_usage();
         if (model.fast() && produced > 0) {
@@ -1739,7 +1788,7 @@ static int glm_pack_generate(const Options& o) {
     // the serve wire contract (serve/server.py): READY <max_context> [stop] once, then GEN <max_new>
     // [<key>=<value> ...] <id,id,...> lines - the sampling keys are per request and the ids are the LAST
     // token.  "stop" is NOT advertised: a request runs to its end (no mid-request cancel in M3.1).
-    std::printf("READY %lld stop\n", (long long) o.max_context);
+    std::printf("READY %lld stop pause\n", (long long) o.max_context);   // "pause": PAUSE keeps the written state
     std::fprintf(stderr, "maya generate: glm5-next serve (M3.1): GEN <max_new> [keys] <ids>, GENI <max_new> [keys] "
                          "<embeddings> <ids>; QUIT to end\n");
     // GENI: the embeddings file is one or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd

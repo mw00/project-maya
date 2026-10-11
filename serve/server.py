@@ -127,6 +127,86 @@ class MockEngine:
             yield t
 
 
+class FairLock:
+    """The service's FIFO: waiters get the engine in the order they asked (threading.Lock promises no order), and the
+    holder can see that someone is waiting (`waiting()`, the fair slices).  acquire/release/with as threading.Lock."""
+
+    def __init__(self):
+        self._cv = threading.Condition(threading.Lock())
+        self._queue: collections.deque = collections.deque()
+        self._held = False
+
+    def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+        with self._cv:
+            if not self._held and not self._queue:
+                self._held = True
+                return True
+            if not blocking:
+                return False
+        me = self.enqueue()
+        if self.wait_turn(me, timeout):
+            return True
+        self.leave(me)
+        return False
+
+    def enqueue(self) -> object:
+        """A place in line (wait_turn waits for it, leave gives it up): a waiter that wakes up now and then (to send
+        a heartbeat) keeps its place."""
+        me = object()
+        with self._cv:
+            self._queue.append(me)
+        return me
+
+    def wait_turn(self, me: object, timeout: float = -1) -> bool:
+        """Wait until `me` is first in line and the lock is free, then hold it (True); False after `timeout`, still
+        in line."""
+        with self._cv:
+            end = None if timeout is None or timeout < 0 else time.monotonic() + timeout
+            while self._held or self._queue[0] is not me:
+                left = None if end is None else end - time.monotonic()
+                if left is not None and left <= 0:
+                    return False
+                self._cv.wait(left)
+            self._queue.popleft()
+            self._held = True
+            return True
+
+    def leave(self, me: object):
+        with self._cv:
+            if me in self._queue:
+                self._queue.remove(me)
+                self._cv.notify_all()                   # the next one may now be first in line
+
+    def release(self):
+        with self._cv:
+            if not self._held:
+                raise RuntimeError("release of an unheld FairLock")
+            self._held = False
+            self._cv.notify_all()
+
+    def locked(self) -> bool:
+        return self._held
+
+    def waiting(self) -> int:
+        return len(self._queue)
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+
+
+def fair_slice_seconds() -> float:
+    """STRATA_FAIR_SLICE_S: a request that has been answering this long while others wait gives the engine to the next
+    one and queues again behind them (0, the default: it keeps the engine to the end, as before)."""
+    try:
+        return max(0.0, float(os.environ.get("STRATA_FAIR_SLICE_S", "0") or 0))
+    except ValueError:
+        return 0.0
+
+
 class EngineDied(RuntimeError):
     """The engine process ended in the middle of a request (issue #27: on Linux, the out-of-memory killer)."""
 
@@ -246,6 +326,7 @@ class StrataEngine:
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.prefill_tok_s_mean = None
@@ -265,6 +346,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_pause = "pause" in f[2:]
                 break
         loading.set()
         if self.max_context <= 0:
@@ -599,6 +681,17 @@ class StrataEngine:
         """The server is stopping: a request still thinking closes its reasoning at the next token and answers."""
         try:
             self.proc.stdin.write("WRAP\n")
+            self.proc.stdin.flush()
+        except OSError:
+            pass
+
+    def pause(self, keep: bool = False):
+        """End the request in flight at its next step and keep the conversation's state with what it wrote (the
+        fair slices: prompt + written tokens then continues with one token to read).  The tokens it still writes
+        before its DONE come as usual.  keep (a request's first slice): the engine first sets its prompt's state
+        aside for the chat's next turn, whose history does not repeat the answer as written (no reasoning)."""
+        try:
+            self.proc.stdin.write("PAUSE keep\n" if keep else "PAUSE\n")
             self.proc.stdin.flush()
         except OSError:
             pass
@@ -960,7 +1053,7 @@ class Service:
         self.default_effort = None                    # the run config's `reasoning_effort`: a request without one
         self.shared = {}                              # the web app's Chat settings for every client (POST /settings)
         self.shared_path = None                       # where they are kept between starts (next to the config)
-        self.fifo = threading.Lock()
+        self.fifo = FairLock()
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -1423,6 +1516,108 @@ class Service:
                   f"{el:.0f} s", flush=True)
         return now
 
+    @contextlib.contextmanager
+    def _turn(self, hold):
+        """The engine's turn for one request: the FIFO, given back at the end unless a fair slice already did."""
+        self.fifo.acquire()
+        hold[0] = True
+        try:
+            yield
+        finally:
+            if hold[0]:
+                hold[0] = False
+                self.fifo.release()
+
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold) -> Iterator[int | None]:
+        """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
+        another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
+        queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
+        engine's conversation slots hold this prompt's state, so only the tokens written since are read again (a
+        prompt read is ~30x a decode step's speed).  Concurrent chats then all move on instead of waiting behind the
+        longest answer, and a short side request (an agent's title, a summary) no longer waits for a whole turn.
+        The caller sees one stream of token ids (None: a heartbeat, also while queued again).  `hold[0]` says
+        whether this request holds the FIFO now.  Not for image prompts: their state is never kept in a slot."""
+        produced, cur, left, smp = [], list(ids), max_new, sampling
+        segments = []                                   # each slice's DONE (engine.last), summed at the end
+        while True:
+            last0 = getattr(self.engine, "last", None)
+            gen = self.engine.generate(cur, left, smp, cancel, embeddings=emb) if emb else \
+                self.engine.generate(cur, left, smp, cancel)
+            slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
+            try:
+                for t in gen:
+                    yield t
+                    if t is None:
+                        continue
+                    produced.append(t)
+                    if t0 is None:
+                        t0 = time.monotonic()
+                    if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
+                            and self.fifo.waiting() and time.monotonic() - t0 >= slice_s:
+                        if getattr(self.engine, "can_pause", False):
+                            # PAUSE: the engine keeps the state with what it wrote; the tokens it still writes
+                            # before its DONE go to the client as usual, so the next prompt continues that state
+                            self.engine.pause(keep=len(cur) == len(ids))   # its first slice
+                            pausing = True
+                        else:
+                            cut = True
+                            break
+                if pausing:
+                    done = getattr(self.engine, "last", None)
+                    cut = len(produced) < max_new and (done is last0 or (done or {}).get("finish") == "cancel")
+            finally:
+                gen.close()                             # STOP + drain to this slice's DONE, still holding the FIFO
+                fresh = getattr(self.engine, "last", None)
+                if fresh is not None and fresh is not last0:
+                    segments.append(fresh)
+            if not cut:
+                break
+            with self.status_lock:
+                mine = dict(self.status)
+                self.status["busy"] = False
+                self.status["queued"] += 1
+            waiting = self.fifo.waiting()
+            place = self.fifo.enqueue()                 # in line before letting go: behind whoever waits now
+            hold[0] = False
+            self.fifo.release()
+            print(f"[maya] fair slice: {len(produced)} tokens written, the engine goes to the next request "
+                  f"({waiting} waiting); this one continues after it", flush=True)
+            try:
+                while not self.fifo.wait_turn(place, timeout=10):
+                    yield None                          # keeps the client's watchdog calm while queued again
+                hold[0] = True
+            finally:
+                if not hold[0]:                         # the client went away while queued again
+                    self.fifo.leave(place)
+                with self.status_lock:
+                    self.status["queued"] -= 1
+            with self.status_lock:
+                self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "first_token",
+                                                         "tool", "tail", "max_tokens") if k in mine},
+                                   generated=len(produced))
+                self.rate.clear()
+            if self.stopping or cancel.is_set():
+                break
+            if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
+                print("[maya] the engine had stopped; starting it again (a minute or two) ...", flush=True)
+                self.engine.restart()
+            cur, left = list(ids) + produced, max_new - len(produced)
+            tb = (sampling or {}).get("_think_budget")
+            if isinstance(tb, int) and tb > 0:          # the thinking budget counts from where it got to
+                smp = dict(sampling)
+                if (sampling or {}).get("_think_end") in produced:
+                    smp.pop("_think_budget", None)
+                    smp.pop("_think_end", None)
+                else:
+                    smp["_think_budget"] = max(1, tb - len(produced))
+        if len(segments) > 1:                           # the request's figures, over all its slices
+            first, last = segments[0], segments[-1]
+            merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
+            for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
+                if all(k in sg for sg in segments):
+                    merged[k] = sum(sg[k] for sg in segments)
+            self.engine.last = merged
+
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
         defaults = {**self.sampling_defaults, **self.shared}   # the config's, then the Chat settings shared with apps
@@ -1446,8 +1641,9 @@ class Service:
         engine_last0 = getattr(self.engine, "last", None)
         with self.status_lock:
             self.status["queued"] += 1
+        hold = [False]                                  # this request holds the FIFO (fair slices let go of it)
         try:
-            with self.fifo:
+            with self._turn(hold):
                 with self.status_lock:
                     self.status["queued"] -= 1
                 if self.stopping:
@@ -1480,8 +1676,7 @@ class Service:
                     think_budget = max(1, min(think_budget, int(max_new) - reserve))
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
-                gen = self.engine.generate(ids, max_new, sampling, cancel, embeddings=emb) if emb else \
-                    self.engine.generate(ids, max_new, sampling, cancel)
+                gen = self._sliced(ids, max_new, sampling, cancel, emb, hold)
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
@@ -2545,7 +2740,7 @@ class Server(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB")
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S")
 
 
 def apply_server_env(cfg: dict) -> None:
