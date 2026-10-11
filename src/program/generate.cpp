@@ -1122,7 +1122,9 @@ static int glm_pack_generate(const Options& o) {
         // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
         bool anchor = false;
     };
-    constexpr uint64_t kNoImages = 1469598103934665603ull;   // img_hash() of a prefix without pictures
+    // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
+    // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
+    static constexpr uint64_t kNoImages = 1469598103934665603ull;   // img_hash() of a prefix without pictures
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
