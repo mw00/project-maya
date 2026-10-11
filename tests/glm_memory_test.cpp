@@ -10,6 +10,8 @@ int main() {
     using strata::core::glmfast::minimal_ram_tier;
     using strata::core::glmfast::full_unified_pool;
     using strata::core::glmfast::warm_pool_slots;
+    using strata::core::glmfast::complete_pool;
+    using strata::core::glmfast::complete_pool_slots;
     constexpr size_t G = size_t{1} << 30;
     constexpr size_t experts = 80 * G + 174 * (size_t{1} << 20);
 
@@ -39,5 +41,20 @@ int main() {
     assert(!full_unified_pool(true, 192, 288));
     assert(warm_pool_slots(false, 288, 288, 3) == 285);
     assert(!full_unified_pool(false, 288, 288));
+    // A complete pool (every expert + the spares in the main slots, the prompt's tail beyond them - the Windows APU's
+    // carve-out): the warm-up fills each expert once, never past the 288-entry order
+    assert(warm_pool_slots(false, 288 + 3 + 21, 288, 3) == 288);
+    assert(warm_pool_slots(false, 290, 288, 3) == 287);
+    assert(complete_pool(291, 288, 3));
+    assert(!complete_pool(290, 288, 3));
+    assert(!complete_pool(288 - 21, 288, 3));
+    // 158 GiB of budget, 308 MiB a slot over every MoE layer: 288 + 3 + 18 slots fit; 40 GiB do not; nothing on zeros
+    constexpr size_t M = size_t{1} << 20;
+    assert(complete_pool_slots(158 * G, 308 * M, 288, 3, 18) == 309);
+    assert(complete_pool_slots(309 * 308 * M, 308 * M, 288, 3, 18) == 309);
+    assert(complete_pool_slots(309 * 308 * M - 1, 308 * M, 288, 3, 18) == 0);
+    assert(complete_pool_slots(40 * G, 308 * M, 288, 3, 18) == 0);
+    assert(complete_pool_slots(158 * G, 0, 288, 3, 18) == 0);
+    assert(complete_pool_slots(158 * G, 308 * M, 288, 3, -5) == 291);
     std::puts("GLM memory policy checks passed (CPU only)");
 }

@@ -607,6 +607,29 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // the prestage buffer (the ring): one GPU (a split's parts hold most of their experts); STRATA_GLM_PRESTAGE=<slots>
     int ring_max = has_moe && n_parts_ == 1 ? kPreSlots : 0;
     if (const char* v = getenv("STRATA_GLM_PRESTAGE")) ring_max = has_moe ? std::max(0, std::atoi(v)) : 0;
+    // A COMPLETE pool to come (fast_setup: every expert and the spares in each layer's main slots, this path's buffers
+    // in the tail beyond them - the Windows APU's carve-out): no expert is outside VRAM, so there is nothing to prestage
+    // (the ring only copies RAM-tier experts: Maya-S lent 1153 MB for it, ~4 slots a layer more for nothing) and
+    // nothing to land from the disk (the smallest landing ring: ~0.4 GB of the 8065S's 32 GB of OS RAM less pinned).
+    // Priced with the largest chunk's buffers and a margin; fast_setup decides from what is free then (short of it
+    // there, the pool is the capped one - without a prestage buffer).  STRATA_GLM_COMPLETE_POOL=0: never.
+    bool complete = false;
+    if (const char* cv = getenv("STRATA_GLM_COMPLETE_POOL");
+        (cv == nullptr || std::atoi(cv) != 0) && !F->unified_memory && has_moe && stride_sum > 0 && ceiling > 0) {
+        const auto pu = prefill_bytes_for((size_t) ceiling);
+        size_t bufs = pu.first + pu.second + (size_t) w16_elems * 2 + (size_t) w32_elems * 4 + ws_bytes + gbuf + 4096;
+        if (const char* v = getenv("STRATA_GLM_VISION_LEND_MB"); v != nullptr && dev_ == 0)
+            bufs = std::max(bufs, (size_t) std::max(0LL, std::atoll(v)) << 20);
+        const size_t margin = std::max<size_t>((size_t) 1 << 30, 2 * stride_sum);
+        const int tail = (int) ((bufs + stride_sum - 1) / stride_sum);
+        complete = avail > margin &&
+                   glmfast::complete_pool_slots(avail - margin, stride_sum, g.n_expert, gf::kSpares, tail) > 0;
+        if (complete && ring_max > 0) {
+            std::fprintf(stderr, "glm prefill: CUDA%d the expert pool will hold every expert: no prestage buffer, the "
+                                 "smallest disk landing ring\n", dev_);
+            ring_max = 0;
+        }
+    }
     // the chunk and its prestage slots for a lend cap of `pct`% of the pool's slots ({0, 0}: no chunk fits)
     S->choose = [=, this](int64_t pct) -> std::pair<int64_t, int> {
         size_t lendable = 0;   // the bytes the pool can lend the prompt path
@@ -720,7 +743,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
                                                                                       (double) gstride)));
         // On an APU these pinned pages compete with the expert pool. A small
         // landing ring suffices for disk reads while the prompt borrows its tail.
-        if (F->unified_memory) want = kMinLand;
+        if (F->unified_memory || complete) want = kMinLand;
         if (const char* v = getenv("STRATA_GLM_PREFILL_LAND")) want = std::max(kMinLand, std::atoi(v));
         int n = want;
         while (cudaHostAlloc((void**) &S->gpin, (size_t) n * gstride, cudaHostAllocDefault) != cudaSuccess) {
@@ -1143,6 +1166,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         }
         flush();
         if (!ok) return false;
+        F->check_resident(l0_, lt_, NE);   // (a lent slot's expert left VRAM: the decode's routes wait and fetch again)
     }
     F->bg_hold = false;
     return true;
@@ -1703,6 +1727,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     dump_row("pf_attn-" + Ls, B.attn, g.n_head * g.v_head, tn - 1);
                 }
             }
+            // Windows HIP: the sub-batch goes to the GPU while the next one queues (glmfast::submit_queued)
+            if (glmfast::prefill_submit()) glmfast::submit_queued(s);
         }
 
         S->mark(Ly.recr ? "kda" : "dsa", s);
@@ -2434,6 +2460,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->mark("combine", s);
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
+        if (glmfast::prefill_submit()) glmfast::submit_queued(s);   // (Windows HIP: the experts start now)
     }
     // the last layer's write half: R = post x ffn + comb . R
     if (!tail_skip) {
