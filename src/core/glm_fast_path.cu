@@ -4408,6 +4408,10 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     }
     cudaSetDevice(dev_);
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pos_ = TL->pos_;
+    // the head's recurrent states back to the tail's position (the backup after q+1): the whole model then stands at
+    // pos_ exactly, so a snapshot taken now (the server's PAUSE) continues the sequence; a reset or a restore after
+    // this overwrites them anyway
+    if (ok && !kda_all(true)) ok = false;
     if (sprof && np > 0) {
         std::fprintf(stderr, "glm spec prof (%lld steps, ms/step): wait tail token %.2f | draft %.2f | redo %.2f | "
                              "enqueue tail %.2f | enqueue head %.2f | emit %.2f\n", (long long) np, tp[0] / np, tp[1] / np,

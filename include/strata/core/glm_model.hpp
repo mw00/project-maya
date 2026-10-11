@@ -457,6 +457,51 @@ public:
     bool hop_to_next(Glm5Model* B, int64_t p, std::string& err);
     bool spec_head(int64_t p, int32_t token, std::string& err);
     bool spec_tail(Glm5Model* head, int64_t p, std::string& err);
+    // ---- several conversations at once (src/core/glm_multi.cu, STRATA_GLM_SEQS=<n>): each part keeps n sequence
+    // states (the state arena: residual, KDA states, DSA caches; the position, the snapshot) and binds one at a time -
+    // every path that reads `state_` (the token path, the prompt path, snapshots, slots) then works on the bound one.
+    // The pipelined decode issues a token of one sequence through every part without waiting, so with n sequences in
+    // flight each part works on a different one (a layer split's cards no longer wait for each other).
+    struct SeqCtx {
+        float* state = nullptr;
+        int64_t pos = 0, snap_pos = -1;
+        // its own context (STRATA_GLM_SEQ_CTX: the extra sequences can be smaller than the first) and so its own
+        // arena layout
+        int64_t max_ctx = 0;
+        uint64_t bytes = 0;
+        int ik_ring = 0;
+        std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool;
+        float *snap = nullptr, *snap_pool = nullptr, *kda_bak = nullptr;
+        int last_tok = -1;
+        std::vector<int64_t> img_pos;
+        std::vector<float> img_rows;
+        // the pipeline's per-sequence buffers on this part: the boundary hop (a sequence's next token waits for its
+        // last one, so one slot each is enough), the embedding row (head part), the sampled token (tail part)
+        float* hop_h = nullptr;
+        cudaEvent_t ev_hop = nullptr;
+        float* emb_h = nullptr;
+        int* tok_h = nullptr;
+        cudaEvent_t ev_done = nullptr;
+    };
+    std::vector<SeqCtx> seq_;                              // empty: one sequence (the classic engine)
+    int cur_seq_ = 0;
+    int seq_count() const { return seq_.empty() ? 1 : (int) seq_.size(); }
+    int seq_bound() const { return cur_seq_; }
+    void seq_bind(int s);                                  // this part
+    void seq_bind_all(int s);                              // every part of the split
+    bool seq_alloc_arenas(std::string& err);               // load: the extra arenas (STRATA_GLM_SEQS), before the pool
+    uint64_t seq_layout(int64_t ctx, SeqCtx& c) const;     // load_pack's arena layout for a context of ctx tokens
+    int64_t seq_max_ctx(int s) const {                     // a sequence's context (the bound one's is max_ctx_)
+        return seq_.empty() || s == cur_seq_ ? max_ctx_ : seq_[(size_t) s].max_ctx;
+    }
+    bool seq_pipe_ready(std::string& err);                 // the pipeline buffers (once)
+    /// The pipelined decode: `token` of sequence s at its next position through every part and the head, sampled with
+    /// `sp` (greedy when sp.greedy) on the tail's stream - nothing is waited for.  multi_take(s) waits for that token.
+    bool multi_issue(int s, int32_t token, const strata::kernels::SamplerParams& sp, std::string& err);
+    int multi_take(int s, std::string& err);
+    /// Every part idle, then the between-token tier work (fast_boundary) on each: once every few rounds.
+    bool multi_boundary(std::string& err);
+
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;
