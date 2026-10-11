@@ -25,6 +25,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_fused_rdna4.hpp"
 #endif
 #include "strata/prefill/moe_mmq.hpp"
 
@@ -224,6 +225,9 @@ struct MoeBufs {
     float *sh_g, *sh_u;
     uint16_t* sh16;
     int *ids, *rank, *counts, *base, *row_tok, *pos, *bounds;
+#if defined(STRATA_HIP_PREFILL_FUSED)
+    int* tiles;
+#endif
     uint8_t *Xq, *Hq;
 };
 MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
@@ -240,8 +244,21 @@ MoeBufs carve_moe(Carve& c, size_t T, size_t sub, const Glm5Geometry& g) {
     b.base = c.take<int>((size_t) g.n_expert);
     b.bounds = c.take<int>(8192);
     const size_t W = (size_t) moe_window_rows(T, g);
-    b.Xq = c.take<uint8_t>(mmq::q8_bytes((int64_t) W, g.n_embd));
-    b.Hq = c.take<uint8_t>(mmq::q8_bytes((int64_t) W, g.n_ff_exp));
+#if defined(STRATA_HIP_PREFILL_FUSED)
+    const bool fused = g.n_embd == 4096 && g.n_ff_exp == 2048 &&
+                       strata::prefill::rdna4::available();
+    if (fused) b.tiles = c.take<int>(2 * ((W + 63) / 64 + g.n_expert));
+#endif
+    size_t x_bytes = mmq::q8_bytes((int64_t) W, g.n_embd);
+    size_t h_bytes = mmq::q8_bytes((int64_t) W, g.n_ff_exp);
+#if defined(STRATA_HIP_PREFILL_FUSED)
+    if (fused) {
+        x_bytes = std::max(x_bytes, strata::prefill::rdna4::act_bytes(T, g.n_embd));
+        h_bytes = std::max(h_bytes, strata::prefill::rdna4::act_bytes(W, g.n_ff_exp));
+    }
+#endif
+    b.Xq = c.take<uint8_t>(x_bytes);
+    b.Hq = c.take<uint8_t>(h_bytes);
     // each set's gate/up rows live in its own OUTP rows until the down product, the swiglu over their gate halves
     b.OUTP = c.take<float>(W * g.n_embd);
     b.OUTPc = c.take<float>(W * g.n_embd);
@@ -2027,6 +2044,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return a - wb;
         };
         const size_t qblk = mmq::q8_block_bytes();
+#if defined(STRATA_HIP_PREFILL_FUSED)
+        // X is rounded once per token; the fused GU epilogue writes rounded H.
+        // The shared scratch reserves the larger of the two activation formats.
+        const bool fused = E == 4096 && nff == 2048 &&
+                           strata::prefill::rdna4::supported(Ly.gu_type, Ly.d_type);
+        bool fused_x_ready = false;
+#endif
         // one expert set through gate/up, swiglu and down: its rows [r0 + hb[0], r0 + hb[n_exp]) of the sorted order
         // (hb: the set's bounds on the host, d_bounds the same on the device), in parts of at most W rows
         const auto run_set = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
@@ -2039,6 +2063,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 for (int i = i0; i < i1; ++i) max_rows = std::max(max_rows, hb[i + 1] - hb[i]);
                 if (nrows > 0) {
                     const int o = place(r0 + a, nrows);
+#if defined(STRATA_HIP_PREFILL_FUSED)
+                    if (fused) {
+                        namespace rf = strata::prefill::rdna4;
+                        if (!fused_x_ready) {
+                            rf::quantize(S->x, T, E, M.Xq, s);
+                            fused_x_ready = true;
+                        }
+                        const rf::Geometry geo{Ly.gu_type, Ly.d_type,
+                            Ly.gu_bytes / (size_t) nff, Ly.dn_bytes / (size_t) E,
+                            Ly.gu_bytes, Ly.down_off, g.swiglu_exp};
+                        rf::experts(wbase + (size_t) i0 * stride, stride, geo, i1 - i0,
+                                    d_bounds + i0, hb + i0, M.tiles, M.Xq, M.row_tok + r0 + a, M.Hq,
+                                    M.OUTP + (size_t) o * E, s);
+                        S->mark("moe_fused", s);
+                        i0 = i1;
+                        continue;
+                    }
+#endif
                     mmq::quantize(S->x, M.row_tok + r0 + a, M.Xq, Ly.gu_type, E, E, nrows, s);
                     // the part's bounds are the set's (from a): the activations and the destination are addressed a
                     // rows back so that bound a is the part's first row
