@@ -100,7 +100,9 @@ at `http://127.0.0.1:8080`. Ctrl+C stops it; `./setup.sh` again starts it right 
 - **Pictures:** attach one in the chat, or send `image_url` parts (OpenAI) / `image` blocks (Anthropic). The image
   encoder runs only while a new picture is read, in GPU memory the model lends it.
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** others wait their turn.
+- **Several requests:** one at a time by default, the others in turn. `STRATA_FAIR_SLICE_S` lets a short request in
+  during a long answer, and on two GPUs or more `STRATA_GLM_SEQS` answers several at once
+  ([docs/SETTINGS.md](docs/SETTINGS.md)).
 
 ## Tuning
 
