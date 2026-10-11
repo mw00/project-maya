@@ -79,6 +79,11 @@ HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix 
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768
+# KV streaming, on in every config (--kv-streaming on): the attention layers' latent cache lives in RAM and 32768
+# positions of each layer in VRAM (--kv-resident N, beside it, sets another window) - from a context above that (a
+# shorter one is not streamed); 12 KB of RAM a context token, 1.6 GB at 128K.  "--kv-streaming", "off" in the config's
+# args turns it off; a setup again keeps what the config says
+KV_STREAMING = "on"
 MODEL_NAME = "glm-5.3-flash"
 SAMPLING = {"temperature": 1.0, "top_p": 0.95}     # the dashboard's and the API's defaults for requests that set none
 EFFORT = "high"                                    # thinking level for requests that name none (GLM's High)
@@ -1509,7 +1514,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     port = a.port or 8080
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
     # can lend, up to 8192; a number (`32768`) sets the chunk itself
-    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto"],
+    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto",
+                                     "--kv-streaming", KV_STREAMING],
            "cwd": str(ROOT),
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
@@ -1557,7 +1563,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
     if cfg_path.exists():
-        kept = keep_args(read_json(cfg_path).get("args") or [], cfg["args"], ("--prefill",))
+        kept = keep_args(read_json(cfg_path).get("args") or [], cfg["args"],
+                         ("--prefill", "--kv-streaming", "--kv-resident"))
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):

@@ -242,6 +242,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/cuda/glm_fast.cu
                           src/kernels/cuda/glm_batch.cu
+                          src/kernels/cuda/glm_kv_stream.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -480,6 +481,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(glm_dsa_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_dsa_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME glm_dsa_parity COMMAND glm_dsa_parity --selftest)
+
+  # KV streaming of the DSA latent cache (glm_kv_stream.hpp): streamed vs resident attention, bitwise (GPU, synthetic)
+  add_executable(glm_kv_stream_parity src/kernels/glm_kv_stream_parity.cpp)
+  target_include_directories(glm_kv_stream_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_kv_stream_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME glm_kv_stream_parity COMMAND glm_kv_stream_parity --selftest)
 
   add_executable(glm_layer_parity src/kernels/glm_layer_parity.cpp)
   target_include_directories(glm_layer_parity PRIVATE ${_strata_gpu_include_directories})

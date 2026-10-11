@@ -5,6 +5,7 @@
 
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "glm_memory.hpp"
 #include "glm_layer_graphs.hpp"
@@ -202,6 +203,7 @@ struct Glm5Model::FastState {
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
     int* cells = nullptr;
+    int* slot_cells = nullptr;   // KV streaming: the selection in VRAM slot rows (glm_kv_resolve), what the attention reads
     void *qr_q = nullptr, *attn_q = nullptr;
     float *rlog = nullptr, *plog = nullptr, *sh_g = nullptr, *sh_u = nullptr;
     float* sh_out = nullptr;   // the shared expert's down (n_embd), computed alongside the routed gate/up
@@ -475,6 +477,21 @@ struct Glm5Model::FastState {
         err = "glm router: layer " + std::to_string(e / 4) + " " + kind + " invalid expert ID or non-finite score";
         return false;
     }
+};
+
+// KV streaming (Glm5Model::kv_stream_setup): per DSA layer of this part (the NextN block's too), its latent cache in
+// pinned host memory - the authoritative copy, position order - and the residency map of its VRAM slots, which are
+// state_ + dsa_lat_[il] (slots * page rows).
+struct Glm5Model::KvStream {
+    int64_t slots = 0;     // VRAM pages a layer
+    int page = 4;          // positions a page: one indexer pool
+    int row_bytes = 0;     // one position's latent row: FP16 kv_lora, or an INT8 record (lat8_rec_bytes)
+    int64_t n_blocks = 0;  // pages of the context
+    std::vector<uint8_t*> host;                          // per layer: the host copy (device-mapped), null: not a DSA layer
+    std::vector<strata::kernels::KvStreamMap> map;       // per layer
+    uint8_t* host_arena = nullptr;                       // pinned: every layer's host copy
+    void* map_arena = nullptr;                           // device: every layer's map
+    uint64_t host_bytes = 0;
 };
 
 

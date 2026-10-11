@@ -71,6 +71,9 @@ struct DsaPrepArgs {
     int q_lora = 1536;
     const float* kv_raw = nullptr; const float* kv_norm = nullptr; uint16_t* lat = nullptr; int kv_lora = 512;
     int lat_q8 = 0;   // INT8 latent records (kv_lora codes + kv_lora / 32 FP16 scales) instead of FP16 rows
+    // KV streaming (glm_kv_stream.hpp): the rows also go to the host copy, and to their block's VRAM slot when lat_table
+    // names one (lat: the identity-layout cache - the prompt path's staging copy for a streamed layer - or null)
+    uint16_t* lat_host = nullptr; uint16_t* lat_slots = nullptr; const int* lat_table = nullptr; int lat_page = 4;
     const float* ik_raw = nullptr; const float* k_norm_w = nullptr; const float* k_norm_b = nullptr;
     float* ik_cache = nullptr;
     const float* ig_raw = nullptr; float* ig_cache = nullptr;
