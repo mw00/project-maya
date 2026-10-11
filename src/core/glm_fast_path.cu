@@ -1766,9 +1766,12 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const size_t blob = F->L[(size_t) il_cal].blob;
     if (!cached) {
     // ---- calibration, each lane alone: the CPU after 100 ms of the same work (an idle CPU's clocks take tens of ms to
-    //      ramp up - a decode keeps them up), then the median of 16 runs.  Not their mean: a few runs slowed by
-    //      something else on the CPU set the plan for the engine's whole life (1x V100: one start timed an expert at
-    //      0.63 ms against the usual 0.32, its CPU lane took half its share and decode lost 16%; #56)
+    //      ramp up - a decode keeps them up), then five rounds of 16 runs ~100 ms apart (the same work between them
+    //      keeps the clocks up), and an expert's time is the fastest round's median.  One round takes ~40 ms, so a
+    //      burst of other work on the CPU (the OS reclaiming memory after the RAM tier was pinned, a desktop's
+    //      background jobs) covered all of its runs at once: one start timed 0.63 ms an expert against the usual 0.32,
+    //      its CPU lane took half its share and decode lost 16% for the engine's life (#56).  Interference only adds
+    //      time, so the fastest round is the CPU's own speed
     const auto median16 = [](std::array<double, 16>& v) {
         std::sort(v.begin(), v.end());
         return 0.5 * (v[7] + v[8]);
@@ -1777,17 +1780,26 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     for (int i = 0; i < g.n_embd; ++i) x[(size_t) i] = 0.01f * (float) ((i * 37) % 101 - 50);
     const float w4[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     int set = 0;
-    for (const auto tw = std::chrono::steady_clock::now();
-         std::chrono::steady_clock::now() - tw < std::chrono::milliseconds(100);)
-        fast_cpu_experts(il_cal, n_cal, cal_set(set++), w4, x.data(), out.data());
+    const auto busy = [&](int ms) {
+        for (const auto tw = std::chrono::steady_clock::now();
+             std::chrono::steady_clock::now() - tw < std::chrono::milliseconds(ms);)
+            fast_cpu_experts(il_cal, n_cal, cal_set(set++), w4, x.data(), out.data());
+    };
+    busy(100);
     std::array<double, 16> runs{};
-    for (int rep = 0; rep < 16; ++rep) {
-        const uint8_t* const* cals = cal_set(set++);
-        const auto t0 = std::chrono::steady_clock::now();
-        fast_cpu_experts(il_cal, n_cal, cals, w4, x.data(), out.data());
-        runs[(size_t) rep] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    double best = 0.0;
+    for (int round = 0; round < 5; ++round) {
+        if (round > 0) busy(100);
+        for (int rep = 0; rep < 16; ++rep) {
+            const uint8_t* const* cals = cal_set(set++);
+            const auto t0 = std::chrono::steady_clock::now();
+            fast_cpu_experts(il_cal, n_cal, cals, w4, x.data(), out.data());
+            runs[(size_t) rep] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        const double med = median16(runs);
+        best = round == 0 ? med : std::min(best, med);
     }
-    c_ms = median16(runs) / n_cal;   // an expert's share of a call
+    c_ms = best / n_cal;   // an expert's share of a call
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
