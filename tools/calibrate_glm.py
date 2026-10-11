@@ -8,9 +8,12 @@ GPU runs the rest.  Two of its settings depend on the PC more than on the model:
   STRATA_GLM_CPU_LANE    the CPU threads that compute them.  Every core is not always fastest: the experts are read
                          from RAM, and past the memory's bandwidth more threads only wait (or, on a hybrid CPU, the
                          efficiency cores make the rest wait for them).
-Both are measured through ONE running engine - per-request `strata_tune` keys (pcie_frac, cpu_threads) - because an
-engine start reads the whole expert set from disk (minutes).  Decode speed only: a prompt balances its CPU and PCIe
-shares itself, layer by layer.
+  STRATA_GLM_READ_CHUNKS the pieces (x3) each expert the decode reads from the SSD comes in, when part of the model
+                         lives there.  The best size depends on the drive, its driver and the CPU: 8 (the engine's) on
+                         a Linux NVMe, 4 on a Windows laptop's Intel RST RAID (#67).
+All are measured through ONE running engine - per-request `strata_tune` keys (pcie_frac, cpu_threads, read_chunks) -
+because an engine start reads the whole expert set from disk (minutes).  Decode speed only: a prompt balances its CPU
+and PCIe shares itself, layer by layer.
 
 Every measurement answers prompts it has not answered before (PROMPTS), the way a chat's text is new to the expert
 tiers, and the engine works on a copy of this PC's expert usage file (usage_copy) - its own answers must not lead the
@@ -75,8 +78,9 @@ PROMPTS = tuple(p for c, e, l in zip(CODE, EXPLAIN, LISTS) for p in (
     f"Explain in two paragraphs how {e}.",
     f"List twelve {l} with one sentence about each."))
 GROUP = 3                                # prompts a measurement (the median of their rates)
-SHARE_ENV, THREADS_ENV = "STRATA_GLM_PCIE_SHARE", "STRATA_GLM_CPU_LANE"
-KEYS = (SHARE_ENV, THREADS_ENV)          # the environment settings a calibration owns (apply() sets or clears them)
+SHARE_ENV, THREADS_ENV, CHUNKS_ENV = "STRATA_GLM_PCIE_SHARE", "STRATA_GLM_CPU_LANE", "STRATA_GLM_READ_CHUNKS"
+KEYS = (SHARE_ENV, THREADS_ENV, CHUNKS_ENV)   # the environment settings a calibration owns (apply() sets or clears them)
+READ_CHUNKS = (4, 2)                     # tried against the engine's own (8) when part of the model is read from the SSD
 
 
 def prompt_ids(cfg: dict) -> list[list[int]]:
@@ -148,14 +152,26 @@ def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     return best if med[best] > med[default_key] * (1.0 + min_gain) else default_key
 
 
-def tune_keys(share, threads) -> dict:
+def tune_keys(share, threads, chunks=None) -> dict:
     """The request's `strata_tune`: None = what the engine started with."""
     t = {}
     if share is not None:
         t["pcie_frac"] = float(share)
     if threads is not None:
         t["cpu_threads"] = int(threads)
+    if chunks is not None:
+        t["read_chunks"] = int(chunks)
     return t
+
+
+def reads_disk(info: dict) -> bool:
+    """Whether part of the model lives on the SSD: more experts than the VRAM and RAM tiers have slots."""
+    try:
+        experts = int(info.get("experts") or 0)
+        held = int(info.get("vram_slots") or 0) + int(info.get("ram_slots") or 0)
+    except (TypeError, ValueError):
+        return False
+    return experts > held > 0
 
 
 class Session:
@@ -270,13 +286,39 @@ def measure(cfg: dict, ids_list, start_engine, say=print, extra_threads=()) -> d
         report.update(share_sweep={("own" if k is None else f"{k:.2f}"): v for k, v in by_share.items()},
                       thread_sweep={str(k): v for k, v in by_threads.items()},
                       confirm={f"{'own' if k[0] is None else f'{k[0]:.2f}'}/{k[1]}": v for k, v in confirm.items()})
+        rates = confirm.get(chosen) or (by_share.get(None) if chosen == dflt else None)
+        # 4. the disk reads' size, at those settings - only when part of the model is read from the SSD while it
+        #    answers; a size is kept as the others are, by beating the engine's own in an interleaved re-measurement
+        chunks = None
+        if reads_disk(info):
+            at = (chosen[0], None if chosen[1] == d_threads else chosen[1])
+            by_chunks = {None: [s.rate(tune_keys(*at))]}
+            say(f"    the engine's own disk reads (8 pieces an expert part): {by_chunks[None][0]:.1f} tok/s")
+            for c in READ_CHUNKS:
+                by_chunks[c] = [s.rate(tune_keys(*at, c))]
+                say(f"    {c} pieces: {by_chunks[c][0]:.1f} tok/s")
+                if by_chunks[c][0] <= by_chunks[None][0]:   # fewer only get slower from there (Mercury: 8 > 4 > 2)
+                    break
+            best_c = max(by_chunks, key=lambda k: by_chunks[k][0])
+            confirm_c = {None: [], best_c: []}
+            if best_c is not None:
+                say("    confirming the disk reads' size ...")
+                for _ in range(3):
+                    for k in (None, best_c):
+                        confirm_c[k].append(s.rate(tune_keys(*at, k)))
+                chunks = pick(confirm_c, None)
+            report.update(chunk_sweep={("own" if k is None else str(k)): v for k, v in by_chunks.items()},
+                          chunk_confirm={("own" if k is None else str(k)): v for k, v in confirm_c.items()})
+            if chunks is not None:
+                rates = confirm_c[chunks]
     finally:
         close(eng)
     if chosen[0] is not None:
         settings[SHARE_ENV] = f"{chosen[0]:.2f}"
     if chosen[1] != d_threads:
         settings[THREADS_ENV] = str(chosen[1])
-    rates = confirm.get(chosen) or (by_share.get(None) if chosen == dflt else None)
+    if chunks is not None:
+        settings[CHUNKS_ENV] = str(chunks)
     report["tok_s"] = round(statistics.median(rates), 1) if rates else None
     report["seconds"] = round(time.time() - t0)
     return {"settings": settings, "report": report}

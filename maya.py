@@ -35,10 +35,11 @@ What the first run does (each step is skipped when it is already done):
      http://127.0.0.1:8080
 
 The tuning (tools/calibrate_glm.py): decode speed measured with a few splits of the RAM-tier
-experts between the CPU and the PCIe link, and with fewer CPU threads, in one engine run (~10-15 minutes, the model
-loads first); a setting is kept when it is more than 3% faster than the engine's own choice.  The result goes into the
-config's "env" (STRATA_GLM_PCIE_SHARE, STRATA_GLM_CPU_LANE) and into ~/.config/project-maya/calibration.json for this
-PC, model and context, so a setup again keeps it.
+experts between the CPU and the PCIe link, with fewer CPU threads, and - when part of the model is read from the SSD -
+with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when it is more
+than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
+STRATA_GLM_CPU_LANE, STRATA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
+context, so a setup again keeps it.
 
 Nothing is installed system-wide: a missing tool is reported with the command that installs it.
 """
@@ -232,8 +233,26 @@ def configs() -> list:
                   key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def zfs_arc_gb(path: str = "/proc/spl/kstat/zfs/arcstats") -> float:
+    """What ZFS's ARC holds above its floor (c_min), in GiB: it gives that back under pressure, as the page cache does,
+    but MemAvailable leaves it out (#89); 0 without ZFS."""
+    vals = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 3 and p[0] in ("size", "c_min") and p[2].isdigit():
+                    vals[p[0]] = int(p[2])
+    except OSError:
+        return 0.0
+    if "size" not in vals or "c_min" not in vals:
+        return 0.0
+    return max(0, vals["size"] - vals["c_min"]) / 2**30
+
+
 def mem_gb() -> tuple:
-    """(total, available) RAM in GiB - the engine sizes its RAM tier from MemAvailable (on Windows ullAvailPhys)."""
+    """(total, available) RAM in GiB - the engine sizes its RAM tier from MemAvailable and ZFS's reclaimable ARC (on
+    Windows ullAvailPhys)."""
     if WIN:
         m = S._memory_status()
         return m.ullTotalPhys / 2**30, m.ullAvailPhys / 2**30
@@ -245,7 +264,8 @@ def mem_gb() -> tuple:
                 info[k] = int(v.split()[0]) * 1024 / 2**30
     except (OSError, ValueError):
         pass
-    return info.get("MemTotal", 0.0), info.get("MemAvailable", 0.0)
+    avail = info.get("MemAvailable", 0.0)
+    return info.get("MemTotal", 0.0), avail + zfs_arc_gb() if avail > 0 else avail
 
 
 def existing(path: Path) -> Path:

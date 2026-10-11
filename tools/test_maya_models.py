@@ -231,5 +231,28 @@ class LabelledNames(unittest.TestCase):
                          "Maya-S-v2-IQ2_XXS")
 
 
+class ZfsArc(unittest.TestCase):
+    """ZFS's ARC above its floor counts as free RAM (#89): MemAvailable leaves it out, though it is given back."""
+
+    def arc(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "arcstats"
+            p.write_text(text)
+            return maya.zfs_arc_gb(str(p))
+
+    def test_the_arc_above_its_floor(self):
+        stats = ("13 1 0x01 123 33456 2734597123 2851726412342\n"
+                 "name                            type data\n"
+                 "hits                            4    123456\n"
+                 "c_min                           4    2147483648\n"
+                 "size                            4    57982058496\n")
+        self.assertAlmostEqual(self.arc(stats), 52.0, places=3)
+
+    def test_no_zfs_or_an_arc_at_its_floor(self):
+        self.assertEqual(maya.zfs_arc_gb("/nonexistent/arcstats"), 0.0)
+        self.assertEqual(self.arc("name type data\nc_min 4 4096\nsize 4 1024\n"), 0.0)
+        self.assertEqual(self.arc("name type data\nsize 4 1024\n"), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()
