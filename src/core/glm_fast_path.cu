@@ -3505,6 +3505,26 @@ static int mtp_skip_from() {
     return v;
 }
 
+// STRATA_GLM_TRUNK_KEEP=<n> (opt-in, changes the answers): the model's own routes leave their experts that are not in
+// VRAM out from route rank n on, as the draft block does above - for a RAM-bound split that would rather be faster than
+// exact.  The lowest-ranked experts carry the least weight and are the coldest, so they are the ones most often off
+// the card.  STRATA_GLM_TRUNK_KEEP_MAP=<digits>: the same per layer, character il for layer il ('1'..'8'; any other
+// character, or a layer past the string's end, takes STRATA_GLM_TRUNK_KEEP) - GLM-5.3's early layers notice a left-out
+// expert far more than its late ones.  Unset (8): every expert is computed, as before.
+static int trunk_skip_from(int il) {
+    static const int v = [] {
+        const char* k = getenv("STRATA_GLM_TRUNK_KEEP");
+        return k != nullptr ? std::max(1, std::min(8, std::atoi(k))) : 8;
+    }();
+    static const std::string map = [] {
+        const char* m = getenv("STRATA_GLM_TRUNK_KEEP_MAP");
+        return std::string(m != nullptr ? m : "");
+    }();
+    if (il >= 0 && il < (int) map.size() && map[(size_t) il] >= '1' && map[(size_t) il] <= '8')
+        return map[(size_t) il] - '0';
+    return v;
+}
+
 bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -3557,8 +3577,9 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     gf::moe_route(F->rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, F->x,
                   g.n_embd, md, F->sh_g, F->sh_u, g.swiglu_shexp, FFs, F->sh_hq, s,
                   pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
-                  pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah, il == mtp_il_ ? mtp_skip_from() : 8,
-                  lane ? F->cpu_plan : 0ull, promote_min, pf_rank, near_n);
+                  pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
+                  il == mtp_il_ ? mtp_skip_from() : trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
+                  pf_rank, near_n);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:

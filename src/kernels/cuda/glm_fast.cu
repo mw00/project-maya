@@ -2140,7 +2140,7 @@ struct RouteArgs {
     const float* ahead_bias[kAhead];
     int n_ahead;
     int skip_from;              // experts not in VRAM at route rank >= skip_from are left out (no fetch, no wait):
-                                // the draft block (0: all of them; >= k: none)
+                                // the draft block, STRATA_GLM_TRUNK_KEEP (0: all of them; >= k: none)
     unsigned long long cpu_plan;   // the CPU LANE: of f RAM-tier experts, (plan >> 4 f) & 15 go to the host (0: off)
     int promote_min;            // STRATA_GLM_PROMOTE_MIN: keep a fetched expert only when its aged route count
                                 // clears this; 0 keeps the old rule (a spare, if one is free)
