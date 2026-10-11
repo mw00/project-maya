@@ -176,6 +176,16 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
     return (blob + a - 1) / a * a;
 }
 
+// --dump-routing (Glm5Model::set_routing_dump): whether a trace file is open, and one route appended to it as
+// Strata's trace record (int32 layer, int32 k, then k int32 expert ids and k float weights), under a lock - the
+// decode's CPU-lane threads (one per half) and the prompt path write to the same file
+bool route_dumping();
+void route_dump(int layer, int k, const int* ids, const float* w);
+
+// The expert usage file (opt-in, as Strata keeps nothing between starts but --expert-profile-save's profile):
+// STRATA_GLM_USAGE=<file>; unset or 0, none - the warm-up and the split search then go by the expert profile
+std::string usage_file();
+
 }  // namespace glmfast
 
 namespace gf = strata::kernels::glmf;

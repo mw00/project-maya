@@ -3,13 +3,14 @@
     python tools/glm_expert_prior.py <pack_dir> <trace|usage> [<trace|usage> ...]
 
 Each trace is the routing record `STRATA_GLM_TRACE=<file>` writes (one "layer expert" line per routed expert); a
-usage file is what the fast path saves after every request (`STRATA_GLM_USAGE=<file>`, default
-<pack>/expert_usage.txt: "layer e:count e:count ...", the routes of every prompt and answer since it started) - a
-session over a corpus typical of the model's use, with STRATA_GLM_USAGE pointing at a fresh file, is a profile.
+usage file is what the fast path saves after every request when `STRATA_GLM_USAGE=<file>` names one ("layer
+e:count e:count ...", the routes of every prompt and answer since it started) - a session over a corpus typical of the
+model's use, with STRATA_GLM_USAGE pointing at a fresh file, is a profile.
 Writes <pack_dir>/expert_prior.txt: one line per MoE layer, "layer e0 e1 ... e287", the layer's experts in
 descending frequency (ties: lower id first; experts never seen keep their id order at the end).  At load the engine
 puts each layer's first experts in VRAM and the rest in the pinned RAM tier, so the first request runs warm; the
-live LFU takes over from there.  A pack without the file warms in id order.
+live LFU takes over from there.  The engine reads the file only without an expert profile (--expert-profile, which
+setup passes: tools/make_profile.py --glm writes one); a pack without either warms in id order.
 """
 from __future__ import annotations
 

@@ -33,6 +33,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -137,9 +138,23 @@ public:
     /// states and conv histories (the DSA caches are append-only, so the position alone restores them) - and
     /// restore it later to continue a prompt that extends the saved one.  false when unsupported.
     bool snapshot_save();
-    // the expert usage profile kept between sessions (the warm-up follows it): written after each request
+    // the expert usage file (opt-in, STRATA_GLM_USAGE=<file>: the warm-up follows it ahead of the expert profile):
+    // written after each request.  Without it nothing is kept between sessions but --expert-profile-save's profile.
     bool save_usage();
     std::string usage_path() const;
+    /// The expert profile (Strata's `profile.bin`, tools/make_profile.py --glm; setup passes the shipped
+    /// data/expert-profile-glm.bin): its ranking of every (layer, expert) pair decides how many VRAM slots each layer
+    /// gets and which experts the warm-up puts in them, in place of the pack's expert_counts.txt / expert_prior.txt.
+    /// Set before load_pack*: every half reads it.  Its layer axis is profile_layers(): the decoder layers, then the
+    /// NextN block.
+    void set_expert_profile(const std::string& path) { profile_path_ = path; }
+    int64_t profile_layers() const { return g_.n_layers + 1; }
+    /// --expert-profile-save: what the tiers learned, as a profile --expert-profile reads (rank_learned_profile over
+    /// every half: the experts in VRAM now, then the routing counted, then the profile this run started from).
+    bool save_expert_profile(const std::string& path, std::string& err);
+    /// --dump-routing: every route (the decode's and the prompt's) appended to `path` as Strata's trace records -
+    /// int32 layer, int32 k, then k int32 expert ids and k float weights - tools/make_profile.py's input.
+    static bool set_routing_dump(const std::string& path, std::string& err);
     bool snapshot_restore();
     int64_t snapshot_pos() const { return snap_pos_; }
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
@@ -394,6 +409,8 @@ public:
     void snap_pool_copy(bool restore);
     int64_t snap_pos_ = -1;
     std::string pack_dir_;
+    std::string profile_path_;                             // --expert-profile (empty: the pack's own files)
+    std::vector<std::pair<int32_t, int32_t>> profile_;     // its ranked (layer, expert) pairs, read by fast_setup
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
     void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);

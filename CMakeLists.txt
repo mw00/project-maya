@@ -331,6 +331,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME file_expert_source_test COMMAND file_expert_source_test)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
+  # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
+  # (a version other than 1 is refused by its number): CPU only
+  foreach(_t expert_profile_save_test expert_profile_version_test)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
+      enable_testing()
+      add_executable(${_t} tests/core/${_t}.cpp)
+      target_link_libraries(${_t} PRIVATE strata_engine)
+      add_test(NAME ${_t} COMMAND ${_t})
+      set_tests_properties(${_t} PROPERTIES TIMEOUT 60)
+    endif()
+  endforeach()
 
   # `strata generate` (P2.S6).  The FIRST user-facing program: everything under it is a component, and this is
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits

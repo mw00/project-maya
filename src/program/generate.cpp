@@ -210,8 +210,14 @@ struct Options {
     /// R4.2e: a `profile.bin` from `tools/make_profile.py`.  **When given, it decides residency instead of the
     /// compulsory-miss policy**, which is the whole point: a profile ranked by routing frequency over a whole
     /// trace is what the plan's `h = 0.6447` refers to, and compulsory-miss measured 0.4864 because it fills
-    /// with whatever the prompt touched FIRST.  Empty means no profile.
+    /// with whatever the prompt touched FIRST.  Empty means no profile.  A GLM pack (--glm-pack) reads it too: its
+    /// ranking decides each layer's VRAM slots and the warm-up's order (data/expert-profile-glm.bin).
     std::string expert_profile;
+    /// #477 (--serve, opt-in): where to save what the expert tiers learned, as a profile `--expert-profile` reads
+    /// (the resident experts first, then the routing counted); on QUIT and every `expert_profile_save_min` minutes
+    /// between requests.  Empty (the default): nothing is written.  GLM packs (--glm-pack) only.
+    std::string expert_profile_save;
+    double expert_profile_save_min = 10.0;
     /// R4.2d: **ON by default**, because the measurement is unambiguous and the alternative is known-broken.
     /// Without it, 17 of 10,562 layers had the hit work done when the pool returned; with it, 9,190.  The
     /// A/B arm is `--no-hit-poke`.
@@ -419,6 +425,10 @@ void usage() {
                  "                       real graph that --stage-timing cannot give.  Prints and exits.\n"
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
+                 "  --expert-profile-save P  --serve, #477 (--glm-pack): save what the expert tiers learned (the\n"
+                 "                       experts in VRAM, then the routing counted) as a profile at P, on QUIT\n"
+                 "                       and every --expert-profile-save-every MIN minutes (default 10; 0 = on\n"
+                 "                       QUIT only) between requests; start from it with --expert-profile P\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -966,6 +976,13 @@ static int glm_pack_generate(const Options& o) {
     // the prompt chunk, set in the config's args like Strata's: --prefill auto | N (a chunk of N tokens) | 0
     // (the engine reads it as STRATA_GLM_PREFILL; without either, auto)
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
+    // the expert profile (Strata's profile.bin: setup passes data/expert-profile-glm.bin) and the routing trace
+    // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other
+    if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
+    if (!o.dump_routing.empty() && !strata::core::Glm5Model::set_routing_dump(o.dump_routing, err)) {
+        std::fprintf(stderr, "maya generate: --dump-routing: %s\n", err.c_str());
+        return 1;
+    }
     // the layer split across the visible GPUs: STRATA_GLM_SPLIT, else --layer-split (auto | K1,K2,..)
     if (!model.load_pack_env(o.glm_pack, o.max_context, err, o.layer_split)) {
         std::fprintf(stderr, "maya generate: %s\n", err.c_str());
@@ -2452,6 +2469,18 @@ static int glm_pack_generate(const Options& o) {
     // tokens take no positions of their own: the rows only replace the embeddings)
     constexpr int64_t kGlmImageToken = 154854;   // <|image|>
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
+    // #477 --expert-profile-save: what the expert tiers learned, every --expert-profile-save-every minutes before the
+    // next request (a prompt's lent slots are back by then) and after the last one
+    Clock::time_point profile_saved_at = Clock::now();
+    const auto save_profile = [&](const char* why) {
+        if (o.expert_profile_save.empty() || !model.fast()) return;
+        std::string e;
+        if (model.save_expert_profile(o.expert_profile_save, e))
+            std::fprintf(stderr, "maya serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(), why);
+        else
+            std::fprintf(stderr, "maya serve: the expert profile was not saved: %s\n", e.c_str());
+        profile_saved_at = Clock::now();
+    };
     std::string line;
     for (;;) {
         if (multi && !pending.empty()) admit_pending();
@@ -2476,6 +2505,9 @@ static int glm_pack_generate(const Options& o) {
             continue;
         }
         if (cmd == "STOP") continue;   // a stray one between requests: ignore
+        if (o.expert_profile_save_min > 0 &&
+            Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
+            save_profile("periodic");
         // the watchdog watches a command from here until this iteration ends, whichever way it ends
         struct BusyScope {
             BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("the request"); }
@@ -2676,6 +2708,8 @@ static int glm_pack_generate(const Options& o) {
         return 0;
     }
     if (slot_keep) slot_put(" on shutdown");
+    save_profile("quit");   // #477
+    strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
     return 0;
 }
 
@@ -2884,6 +2918,9 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
+        else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
+        else if (a == "--expert-profile-save-every")
+            o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--resident-cpu-experts") o.resident_cpu_experts = true;

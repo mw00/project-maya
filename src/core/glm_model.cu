@@ -796,6 +796,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->n_parts_ = n;
         m->part_ = i;
         m->split_devs_ = devs;
+        m->profile_path_ = profile_path_;   // every half reads the same profile
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
             if (prev != nullptr) prev->split_next_.reset();
             return false;
@@ -925,8 +926,8 @@ static double host_read_bps() {
 //   - a part's room for experts: its free VRAM less its layers' dense weights and state at the context (index.txt and
 //     the GGUF directory, as load_pack sizes them), the head and the draft block on the last part, its scratch, and
 //     the reserve fast_setup keeps (pool_avail); the pool gives every layer the same number of slots;
-//   - the experts those slots hold: each layer's most routed, their share of its routes read off this machine's usage
-//     counts (expert_usage.txt; the pack's expert_counts.txt without them; Strata's coverage curve 1 - (1 - f)^3,
+//   - the experts those slots hold: each layer's most routed, their share of its routes read off the usage file's
+//     counts (STRATA_GLM_USAGE, opt-in; the pack's expert_counts.txt without it; Strata's coverage curve 1 - (1 - f)^3,
 //     STRATA_SPLIT_COVER_B, without either - that is what Strata has to assume, its profile carries only a ranking);
 //   - a layer's time on its card: the bytes it reads (its dense weights and its VRAM experts' share of the routed
 //     ones) over the card's memory bandwidth - Strata scales a fitted per-layer time by SMs x clock; and each miss:
@@ -1039,12 +1040,10 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         }
     }
     const bool pipelined = n == 2 && mtp && getenv("STRATA_GLM_NO_SPEC") == nullptr;
-    // each layer's routes per expert: this machine's usage, else the pack's routing profile
+    // each layer's routes per expert: the usage file (opt-in), else the pack's routing profile
     std::vector<std::vector<double>> cnt((size_t) L + 1);
     {
-        const char* u = getenv("STRATA_GLM_USAGE");
-        const std::string up = u != nullptr ? (std::string(u) == "0" ? std::string() : std::string(u))
-                                            : pack_dir + "/expert_usage.txt";
+        const std::string up = glmfast::usage_file();
         std::ifstream uf(up);
         std::string line;
         while (!up.empty() && std::getline(uf, line)) {
