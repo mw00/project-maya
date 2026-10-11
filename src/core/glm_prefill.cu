@@ -60,7 +60,8 @@ namespace mmq = strata::prefill::mmq;
 
 namespace {
 
-// the RAM free now (MemAvailable; Windows: the smaller of free RAM and free commit), 0 when unknown
+// the RAM free now (MemAvailable and ZFS's reclaimable ARC; Windows: the smaller of free RAM and free commit), 0 when
+// unknown
 int64_t avail_ram_bytes() {
 #ifdef _WIN32
     MEMORYSTATUSEX ms{};
@@ -74,7 +75,7 @@ int64_t avail_ram_bytes() {
             if (std::sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
         std::fclose(f);
     }
-    return (int64_t) kb * 1024;
+    return kb > 0 ? (int64_t) kb * 1024 + glmfast::zfs_arc_reclaimable() : 0;
 #endif
 }
 

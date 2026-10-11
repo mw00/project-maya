@@ -176,6 +176,11 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
     return (blob + a - 1) / a * a;
 }
 
+// Linux with ZFS: what its ARC holds above its floor (c_min). The ARC gives that memory back under pressure, as the
+// page cache does, but MemAvailable leaves it out (#89: an ARC of 54 GB after a 95 GB download, MemAvailable 5 GB),
+// so the RAM-free measurements add it.  0 without ZFS and elsewhere.
+int64_t zfs_arc_reclaimable();
+
 }  // namespace glmfast
 
 namespace gf = strata::kernels::glmf;

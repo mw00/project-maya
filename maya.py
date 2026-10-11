@@ -232,8 +232,26 @@ def configs() -> list:
                   key=lambda p: p.stat().st_mtime, reverse=True)
 
 
+def zfs_arc_gb(path: str = "/proc/spl/kstat/zfs/arcstats") -> float:
+    """What ZFS's ARC holds above its floor (c_min), in GiB: it gives that back under pressure, as the page cache does,
+    but MemAvailable leaves it out (#89); 0 without ZFS."""
+    vals = {}
+    try:
+        with open(path) as f:
+            for line in f:
+                p = line.split()
+                if len(p) == 3 and p[0] in ("size", "c_min") and p[2].isdigit():
+                    vals[p[0]] = int(p[2])
+    except OSError:
+        return 0.0
+    if "size" not in vals or "c_min" not in vals:
+        return 0.0
+    return max(0, vals["size"] - vals["c_min"]) / 2**30
+
+
 def mem_gb() -> tuple:
-    """(total, available) RAM in GiB - the engine sizes its RAM tier from MemAvailable (on Windows ullAvailPhys)."""
+    """(total, available) RAM in GiB - the engine sizes its RAM tier from MemAvailable and ZFS's reclaimable ARC (on
+    Windows ullAvailPhys)."""
     if WIN:
         m = S._memory_status()
         return m.ullTotalPhys / 2**30, m.ullAvailPhys / 2**30
@@ -245,7 +263,8 @@ def mem_gb() -> tuple:
                 info[k] = int(v.split()[0]) * 1024 / 2**30
     except (OSError, ValueError):
         pass
-    return info.get("MemTotal", 0.0), info.get("MemAvailable", 0.0)
+    avail = info.get("MemAvailable", 0.0)
+    return info.get("MemTotal", 0.0), avail + zfs_arc_gb() if avail > 0 else avail
 
 
 def existing(path: Path) -> Path:
