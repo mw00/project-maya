@@ -484,16 +484,24 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
       detail = `${fmt(live.prompt_tokens)} prompt tokens`;
     }
   } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Writing";
+    const cap = (p) => (p ? p[0].toUpperCase() + p.slice(1) : "Writing");
+    const reqs = live.requests || [];
     state = "generating";
     delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens${took(live.elapsed_s)}`;
+    if (reqs.length > 1) {   // several answers at once: each one's phase and count (a bar would mix their budgets)
+      label = reqs.map((r) => cap(r.phase)).join(" · ");
+      detail = reqs.map((r) => `${fmt(r.generated)} tokens${took(r.elapsed_s)}`).join(" · ");
+    } else {
+      label = cap(live.phase);
+      pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
+      detail = `${fmt(live.generated)} tokens${took(live.elapsed_s)}`;
+    }
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last answer: ${fmt(last.output_tokens)} tokens${took(last.duration_s)}`;
   }
-  if (live.active > 1) label = `${label} · ${live.active} answers at once`;
+  if (live.active > 1 && !(live.state === "generating" && (live.requests || []).length > 1))
+    label = `${label} · ${live.active} answers at once`;
   if (live.queued > 0) label = `${label} · ${live.queued} queued`;
   badge.textContent = label;
   badge.dataset.s = state;

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import sys
@@ -381,6 +382,75 @@ class SamplingKeys(unittest.TestCase):
         self.assertFalse([k for k in self.keys(temperature=0.7) if k.startswith("penalty")])
 
 
+class PrefixCheckpoint(unittest.TestCase):
+    """GEN cp=<n>: where a prompt's system part (the leading system messages and the tools) ends, when its tokens are a
+    prefix of the prompt's - the engine keeps a shared slot there."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = ByteTokenizer()
+        cls.tmpl = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        cls.svc = Service(MockEngine(cls.tok, "ok", max_context=CTX), cls.tok, cls.tmpl)
+
+    def cp(self, msgs, tools=None):
+        kw = {}
+        ids, _, _ = self.svc.prepare(msgs, tools, kw)
+        return kw.get("_checkpoint"), ids
+
+    def test_key(self):
+        self.assertIn("cp=1500", StrataEngine.sampling_keys({"temperature": 0, "_checkpoint": 1500}).split())
+        self.assertIn("cp=1500", StrataEngine.sampling_keys({"temperature": 0.7, "_checkpoint": 1500}).split())
+        for bad in (0, -1, True, 2.5, "1500", None):
+            self.assertFalse([k for k in StrataEngine.sampling_keys({"_checkpoint": bad}).split() if k.startswith("cp=")],
+                             bad)
+
+    def test_system_part(self):
+        sysm = {"role": "system", "content": "You are a careful agent. " * 20}
+        n, ids = self.cp([sysm, {"role": "user", "content": "task one"}])
+        alone = self.tok.encode(self.tmpl.render([sysm], add_generation_prompt=False), parse_special=True)
+        self.assertEqual(n, len(alone))
+        self.assertEqual(ids[:n], alone)
+        n2, _ = self.cp([sysm, {"role": "user", "content": "another task"}])
+        self.assertEqual(n2, n)                          # the same system prompt: the same checkpoint
+
+    def test_none(self):
+        self.assertEqual(self.cp([{"role": "user", "content": "no system part"}])[0], 0)
+        self.assertEqual(self.cp([{"role": "system", "content": "only a system part"}])[0], 0)
+
+    def test_gen_tail(self):
+        kw = {}
+        ids, _, _ = self.svc.prepare([{"role": "user", "content": "hello"}], None, kw)
+        n = kw.get("_gen_tail")
+        self.assertGreater(n, 0)
+        bare = self.tok.encode(self.tmpl.render([{"role": "user", "content": "hello"}], add_generation_prompt=False),
+                               parse_special=True)
+        self.assertEqual(ids[:len(ids) - n], bare)   # the state kept before the reply's opening: the history alone
+        self.assertIn("gt=3", StrataEngine.sampling_keys({"temperature": 0, "_gen_tail": 3}).split())
+
+    def test_reaches_the_engine(self):
+        seen = {}
+
+        class Recording(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                seen.update(sampling or {})
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        svc = Service(Recording(self.tok, "ok", max_context=CTX), self.tok, self.tmpl)
+        httpd = serve(svc, port=0)
+        try:
+            body = {"model": "m", "max_tokens": 4, "messages": [{"role": "system", "content": "rules " * 50},
+                                                                 {"role": "user", "content": "hi"}]}
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                r.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+        self.assertGreater(seen.get("_checkpoint", 0), 0)
+        self.assertGreater(seen.get("_gen_tail", 0), 0)
+
+
 class GpuChoice(unittest.TestCase):
     """Issue #51: the config's \"gpu\" reaches the engine as CUDA_VISIBLE_DEVICES, numbered like nvidia-smi."""
 
@@ -545,6 +615,31 @@ class LiveRate(unittest.TestCase):
         list(gen)
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
+
+    def test_a_prompt_read_beside_an_answer(self):
+        # several requests at once: one answers while another reads its prompt - the Monitor shows the reading one's
+        # progress and rate (from its own record), not nothing
+        now = time.time()
+        with self.svc.status_lock:
+            self.svc.status["busy"] = True
+            self.svc.live[901] = {"key": 901, "phase": "answering", "generated": 50, "started": now - 30,
+                                  "first_token": now - 20, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "rate": collections.deque([(now - 1, 40), (now, 50)], maxlen=32)}
+            self.svc.live[902] = {"key": 902, "phase": "reading the prompt", "generated": 0, "started": now - 5,
+                                  "first_token": None, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "rate": collections.deque(maxlen=32), "prompt_read": 4096, "prompt_total": 9000,
+                                  "prefill_tok_s": 431.0}
+        try:
+            live = self.metrics()["live"]
+            self.assertEqual(live["state"], "generating")
+            self.assertEqual((live["prompt_read"], live["prompt_total"]), (4096, 9000))
+            self.assertEqual(live["prefill_tok_s_mean"], 431.0)
+            self.assertEqual(self.svc._prefill_tok_s_mean(), 431.0)
+        finally:
+            with self.svc.status_lock:
+                self.svc.live.pop(901, None)
+                self.svc.live.pop(902, None)
+                self.svc.status["busy"] = False
 
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()

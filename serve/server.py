@@ -555,6 +555,10 @@ class StrataEngine:
             self.last.update(drafts_accepted=int(f[6]), drafts_offered=int(f[7]), reused=int(f[8]))
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
+        tls = getattr(self, "_tls", None)
+        if tls is not None:
+            tls.done = dict(self.last)                    # this thread's request's own DONE (multi mode: not the
+                                                          # others'; shared `last` stays for anything that reads it)
 
     def _parse_stat(self, line):
         """STAT key=value ... (the GLM engine, every few tokens): live expert-tier counters for the Monitor."""
@@ -601,7 +605,8 @@ class StrataEngine:
         if isinstance(t, (int, float)) and not isinstance(t, bool) and float(t) <= 0.0:
             # temperature 0 is greedy: the engine reads temperature=0 as that whatever else the line says, and no other
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic)
-            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling)
+            return " temperature=0" + think + tune_keys + StrataEngine.projection_key(sampling) + \
+                StrataEngine.checkpoint_key(sampling)
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -637,7 +642,20 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.projection_key(sampling) + StrataEngine.checkpoint_key(sampling)
+
+    @staticmethod
+    def checkpoint_key(sampling: dict) -> str:
+        """`cp=<n>`: the prompt's first n tokens are its system part (prepare) - the engine keeps a slot there, so
+        another conversation with the same system prompt starts from it.  `gt=<n>`: its last n tokens open the reply -
+        the engine keeps the conversation's state before them, so the next request continues it even when this answer
+        is cancelled or dropped from the history."""
+        keys = ""
+        for name, key in (("_checkpoint", "cp"), ("_gen_tail", "gt")):
+            v = sampling.get(name)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 0:
+                keys += f" {key}={v}"
+        return keys
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -655,6 +673,9 @@ class StrataEngine:
             return
         self.progress = None
         self.prefill_tok_s_mean = None
+        tls = getattr(self, "_tls", None)
+        if tls is not None:               # this request's own thread: a stale DONE from an earlier one must not be its own
+            tls.progress = tls.prefill_tok_s_mean = tls.done = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -694,6 +715,9 @@ class StrataEngine:
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
                         self.progress = (int(f[1]), int(f[2]))             # prompt progress, one per chunk: also a heartbeat (the
                         self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        tls = getattr(self, "_tls", None)
+                        if tls is not None:
+                            tls.progress, tls.prefill_tok_s_mean = self.progress, self.prefill_tok_s_mean
                     if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
                         return                            # would send no keep-alives at all)
                     yield None
@@ -763,6 +787,9 @@ class StrataEngine:
         self._tls.rid = rid
         self.progress = None
         self.prefill_tok_s_mean = None
+        tls = getattr(self, "_tls", None)
+        if tls is not None:               # this request's own thread: a stale DONE from an earlier one must not be its own
+            tls.progress = tls.prefill_tok_s_mean = tls.done = None
         keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         done = False
@@ -801,6 +828,9 @@ class StrataEngine:
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
                         self.progress = (int(f[2]), int(f[3]))
                         self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
+                        tls = getattr(self, "_tls", None)
+                        if tls is not None:
+                            tls.progress, tls.prefill_tok_s_mean = self.progress, self.prefill_tok_s_mean
                     if cancel.is_set():
                         return
                     yield None
@@ -1208,9 +1238,10 @@ class Service:
         # pages on OTHER origins allowed to call /v1/* from a browser (CORS; the config's "cors_origins"): exact origins
         # like "http://127.0.0.1:8090", or "*" for every page.  Empty = no CORS headers at all.
         self.cors_origins: list[str] = []
-        self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.status = {"busy": False, "queued": 0}      # GET /status: busy/queued; each request's progress is its
+        self.live = {}                                  # own record here (key -> dict, status_lock): phase, counts,
+        self.live_seq = itertools.count(1)              # tail, rate window - one per active request, gone at its end
         self.active = 0                                 # requests with the engine now (several: READY multi=<n>)
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -1434,32 +1465,47 @@ class Service:
         return any(isinstance(u, (int, float)) and u > STALL_GPU_BUSY for u in utils)
 
     def _tok_s(self):
-        """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating."""
-        with self.status_lock:
-            s = dict(self.status)
-            rate = list(self.rate)
-        if not s.get("busy") or not s.get("first_token"):
-            return 0.0
+        """tok/s over the last RATE_WINDOW_S seconds, summed over the requests that are generating.  Returns 0.0
+        while nothing is generating."""
         now = time.time()
-        newest = rate[-1] if rate else None
-        oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
-        if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
-            return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
-        return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
+        total = 0.0
+        for r in self._live_records():
+            if r.get("queued") or not r.get("first_token"):
+                continue
+            rate = r["rate"]
+            newest = rate[-1] if rate else None
+            oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
+            if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
+                total += max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
+            else:
+                total += r["generated"] / max(RATE_MIN_SPAN_S, now - r["first_token"])
+        return total
 
     def _tok_s_mean(self):
         """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
-        with self.status_lock:
-            s = dict(self.status)
-        if not s.get("busy") or not s.get("first_token"):
-            return 0.0
-        return s["generated"] / max(1e-6, time.time() - s["first_token"])
+        now = time.time()
+        total = 0.0
+        for r in self._live_records():
+            if r.get("queued") or not r.get("first_token"):
+                continue
+            total += r["generated"] / max(1e-6, now - r["first_token"])
+        return total
 
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
         with self.status_lock:
-            reading = self.status.get("busy") and self.status.get("first_token") is None
-        return getattr(self.engine, "prefill_tok_s_mean", None) if reading else 0.0
+            busy = bool(self.status.get("busy"))
+            recs = [r for r in self.live.values() if not r.get("queued")]
+        if not busy:
+            return 0.0
+        rates = [r["prefill_tok_s"] for r in recs if r.get("first_token") is None and r.get("prefill_tok_s") is not None]
+        if rates:   # a request reading its prompt, whatever the others do
+            return rates[-1]
+        if recs:
+            reading = all(r.get("first_token") is None for r in recs)
+        else:
+            reading = self.status.get("first_token") is None   # a status set without a record (older callers)
+        return self._engine_prefill() if reading else 0.0
 
     def metrics(self, all_requests=False) -> dict:
         """GET /metrics: what the Monitor tab shows - the engine's facts, what it is doing, the last requests, and
@@ -1470,24 +1516,39 @@ class Service:
             totals = dict(self.totals)
             active = self.active
         now = time.time()
-        progress = getattr(self.engine, "progress", None)
-        if s.get("busy") and s.get("first_token") is None:
-            state = "reading"
-        elif s.get("busy"):
+        recs = [r for r in self._live_records() if not r.get("queued")]
+        progress = self._engine_progress()
+        busy = bool(s.get("busy"))
+        gen_recs = [r for r in recs if r.get("first_token")]
+        if busy and gen_recs:
             state = "generating"
+        elif busy and recs:
+            state = "reading"
         else:
             state = "idle"
+        r0 = min(recs, key=lambda r: r.get("started") or now) if recs else None
+        # the request reading its prompt now (its own record), even while another one answers
+        rd = [r for r in recs if not r.get("first_token") and r.get("prompt_total")]
+        rr = max(rd, key=lambda r: r.get("started") or now) if rd else None
         live = {"state": state, "queued": s.get("queued", 0), "active": active,   # (answering at once: --parallel)
-                "phase": s.get("phase") if s.get("busy") else None,
-                "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
-                "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
-                "max_tokens": s.get("max_tokens") if s.get("busy") else None,
-                "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
+                "phase": r0.get("phase") if busy and r0 else None,
+                "prompt_tokens": r0.get("prompt_tokens") if busy and r0 else None,
+                "prompt_read": None, "prompt_total": None,
+                "generated": sum(r["generated"] for r in gen_recs) if busy else None,
+                "max_tokens": r0.get("max_tokens") if busy and r0 else None,
+                "elapsed_s": round(now - r0["started"], 1) if busy and r0 and r0.get("started") else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
-                "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
-                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
-        if state == "reading" and progress:
+                "prefill_tok_s_mean": (rr.get("prefill_tok_s") if rr else self._engine_prefill()) if busy else None,
+                "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None,
+                "requests": [{"id": r.get("key"), "phase": r.get("phase"), "generated": r.get("generated"),
+                              "max_tokens": r.get("max_tokens"),
+                              "elapsed_s": round(now - r["started"], 1) if r.get("started") else None,
+                              "tok_s_mean": round(r["generated"] / max(1e-6, now - r["first_token"]), 1)
+                              if r.get("first_token") else None} for r in recs]}
+        if rr is not None:
+            live["prompt_read"], live["prompt_total"] = rr["prompt_read"], rr["prompt_total"]
+        elif state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
@@ -1569,6 +1630,30 @@ class Service:
             prompt += prefill
         given["_prefill"] = prefill
         ids = self.tok.encode(prompt, parse_special=True)
+        # the reply's opening: the tokens the generation prompt (and a thinking-off close or a forced call) adds
+        given["_gen_tail"] = 0
+        try:
+            bare = self.template.render(messages, tools=tools, **{**kwargs, "add_generation_prompt": False})
+            if prompt.startswith(bare) and len(prompt) > len(bare):
+                tail = self.tok.encode(prompt[len(bare):], parse_special=True)
+                if 0 < len(tail) < len(ids) and ids[-len(tail):] == tail:
+                    given["_gen_tail"] = len(tail)
+        except Exception:   # a template that cannot render without the generation prompt: the last token only
+            pass
+        # the system part's end (the leading system messages and the tools), when it is a prefix of the prompt's tokens
+        given["_checkpoint"] = 0
+        lead = 0
+        while lead < len(messages) and messages[lead].get("role") == "system":
+            lead += 1
+        if 0 < lead < len(messages) and not images_of(messages[:lead]):
+            try:
+                sys_ids = self.tok.encode(self.template.render(messages[:lead], tools=tools,
+                                                               **{**kwargs, "add_generation_prompt": False}),
+                                          parse_special=True)
+                if 0 < len(sys_ids) < len(ids) - 1 and ids[:len(sys_ids)] == sys_ids:
+                    given["_checkpoint"] = len(sys_ids)
+            except Exception:   # a template that cannot render the system part alone: no checkpoint
+                pass
         self.embeddings.path = None
         images = images_of(messages)
         if images:
@@ -1637,41 +1722,95 @@ class Service:
         return {"tokens": len(self.tok.encode(prompt, parse_special=True)), "images": images,
                 "approximate": images > 0, "max_context": self.engine.max_context}
 
-    def _note(self, n, evs):
+    def _note(self, key, n, evs):
+        """This request's progress record: its own counts and tail, so concurrent requests do not write over each
+        other's (the shared status once made one request's tally meet another's clock)."""
         with self.status_lock:
-            s = self.status
-            s["generated"] = n
-            if s.get("first_token") is None:
-                s["first_token"] = time.time()
-            self.rate.append((time.time(), n))          # the live rate's window over the last RATE_WINDOW_S
+            rec = self.live.get(key)
+            if rec is None:
+                return
+            rec["generated"] = n
+            if rec["first_token"] is None:
+                rec["first_token"] = time.time()
+            rec["rate"].append((time.time(), n))          # the live rate's window over the last RATE_WINDOW_S
             for ev in evs:
                 if ev.kind == "reasoning":
-                    s["phase"] = "thinking"
+                    rec["phase"] = "thinking"
                 elif ev.kind == "content":
-                    s["phase"] = "answering"
+                    rec["phase"] = "answering"
                 elif ev.kind == "tool_start":
-                    s["phase"], s["tool"] = f"writing a tool call: {ev.call.name}", ev.call.name
+                    rec["phase"], rec["tool"] = f"writing a tool call: {ev.call.name}", ev.call.name
                 elif ev.kind == "tool_call":
-                    s["phase"] = "tool call complete"
-                s["tail"] = (s["tail"] + (ev.text or ""))[-600:]
+                    rec["phase"] = "tool call complete"
+                rec["tail"] = (rec["tail"] + (ev.text or ""))[-600:]
 
-    def _progress(self, last_print, every=1.0):
-        """A progress line in the server window every `every` seconds while a request runs."""
+    def _note_prompt(self, key):
+        """This request's prompt progress and prefill rate, into its own record (the request's thread reads the
+        engine's thread-local): the Monitor shows a prompt read beside another request's answer, not only the first."""
+        progress, rate = self._engine_progress(), self._engine_prefill()
+        with self.status_lock:
+            rec = self.live.get(key)
+            if rec is None or rec["first_token"] is not None:
+                return
+            if progress:
+                rec["prompt_read"], rec["prompt_total"] = progress
+            if rate is not None:
+                rec["prefill_tok_s"] = rate
+
+    def _progress(self, key, last_print, every=1.0):
+        """A progress line in the server window every `every` seconds while a request runs (its own record)."""
         now = time.time()
         if now - last_print < every:
             return last_print
         with self.status_lock:
-            s = dict(self.status)
-        el = now - s.get("started", now)
-        if s.get("first_token") is None:
-            pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
-            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
+            rec = self.live.get(key)
+            rec = dict(rec) if rec else None
+        if rec is None:
+            return last_print
+        el = now - rec["started"]
+        if rec["first_token"] is None:
+            pr = self._engine_progress()   # (position reached, prompt tokens): a reused prefix counts
+            done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{rec.get('prompt_tokens', 0):,}"   # as read (#29)
             print(f"[maya] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
-            rate = s["generated"] / max(1e-6, now - s["first_token"])
-            print(f"[maya] {s['phase']}: {s['generated']} of max {s.get('max_tokens')} tokens, {rate:.1f} tok/s, "
+            rate = rec["generated"] / max(1e-6, now - rec["first_token"])
+            print(f"[maya] {rec['phase']}: {rec['generated']} of max {rec['max_tokens']} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
+
+    def _engine_progress(self):
+        """The reading request's prompt progress (PP): the engine's thread-local when it keeps one, else the
+        engine's attribute (the mock's)."""
+        tls = getattr(self.engine, "_tls", None)
+        if tls is not None and hasattr(tls, "progress"):
+            return tls.progress
+        return getattr(self.engine, "progress", None)
+
+    def _engine_prefill(self):
+        tls = getattr(self.engine, "_tls", None)
+        if tls is not None and hasattr(tls, "prefill_tok_s_mean"):
+            return tls.prefill_tok_s_mean
+        return getattr(self.engine, "prefill_tok_s_mean", None)
+
+    def _engine_done(self, marker=None):
+        """This request's own DONE figures.  Engines that keep a thread-local (`done`, reset when its request's
+        generate starts) hand over theirs; others (the mock) hand over `last` unless it is still the caller's
+        marker object - the caller holds the identity `last` had at its slice's or request's start."""
+        tls = getattr(self.engine, "_tls", None)
+        if tls is not None and hasattr(tls, "done"):
+            return tls.done
+        last = getattr(self.engine, "last", None)
+        return None if last is marker else last
+
+    def _live_records(self):
+        """Snapshots of the active requests' progress records (queued ones marked): safe copies under the lock."""
+        with self.status_lock:
+            recs = []
+            for r in self.live.values():
+                d = dict(r)
+                d["rate"] = list(r["rate"])
+                recs.append(d)
+        return recs
 
     @contextlib.contextmanager
     def _turn(self, hold):
@@ -1685,7 +1824,7 @@ class Service:
                 hold[0] = False
                 self.fifo.release(units=1)
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold) -> Iterator[int | None]:
+    def _sliced(self, key, engine_last0, ids, max_new, sampling, cancel, emb, hold) -> Iterator[int | None]:
         """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -1720,17 +1859,19 @@ class Service:
                             cut = True
                             break
                 if pausing:
-                    done = getattr(self.engine, "last", None)
-                    cut = len(produced) < max_new and (done is last0 or (done or {}).get("finish") == "cancel")
+                    done = self._engine_done(last0)
+                    cut = len(produced) < max_new and (done is None or (done or {}).get("finish") == "cancel")
             finally:
                 gen.close()                             # STOP + drain to this slice's DONE, still holding the FIFO
-                fresh = getattr(self.engine, "last", None)
-                if fresh is not None and fresh is not last0:
+                fresh = self._engine_done(last0)        # this slice's own DONE (never another request's)
+                if fresh is not None:
                     segments.append(fresh)
             if not cut:
                 break
             with self.status_lock:
-                mine = dict(self.status)
+                rec = self.live.get(key)
+                if rec is not None:
+                    rec["queued"] = True
                 self.active -= 1
                 hold[1] = False
                 self.status["busy"] = self.active > 0
@@ -1751,12 +1892,12 @@ class Service:
                 with self.status_lock:
                     self.status["queued"] -= 1
             with self.status_lock:
+                rec = self.live.get(key)
+                if rec is not None:
+                    rec["queued"] = False
                 self.active += 1
                 hold[1] = True
-                self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "first_token",
-                                                         "tool", "tail", "max_tokens") if k in mine},
-                                   generated=len(produced))
-                self.rate.clear()
+                self.status["busy"] = True
             if self.stopping or cancel.is_set():
                 break
             if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
@@ -1778,6 +1919,9 @@ class Service:
                 if all(k in sg for sg in segments):
                     merged[k] = sum(sg[k] for sg in segments)
             self.engine.last = merged
+            tls = getattr(self.engine, "_tls", None)
+            if tls is not None:
+                tls.done = merged                       # this thread's request reads its own merged figures
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..})."""
@@ -1794,7 +1938,7 @@ class Service:
         # apply to the answer, not inside the reasoning; the model's own end-of-turn markers apply everywhere
         client_stops = client_stop_strings(sampling)
         matched = None                                  # the client stop string that ended the answer
-        timings, before = None, None                    # this request's timings; the engine's `last` before it
+        timings = None                                  # this request's timings (the engine's own clock)
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb = getattr(self.embeddings, "path", None)
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
@@ -1819,15 +1963,20 @@ class Service:
                           "(a minute or two) ...", flush=True)
                     self.engine.restart()
                     print("[maya] the engine is running again", flush=True)
+                key = next(self.live_seq)
                 with self.status_lock:
-                    self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
-                                       started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
+                    self.live[key] = {"key": key, "phase": "reading the prompt", "prompt_tokens": len(ids),
+                                      "generated": 0, "started": time.time(), "first_token": None, "tool": None,
+                                      "tail": "", "max_tokens": max_new, "queued": False,
+                                      "rate": collections.deque(maxlen=32)}
+                    self.status["busy"] = True
                     self.active += 1
                     counted = hold[1] = True
-                    my_started = self.status["started"]
+                    my_started = self.live[key]["started"]
                     self.last_request_at = time.time()
-                    self.rate.clear()               # the previous request's samples must not leak into this one
-                before = getattr(self.engine, "last", None)
+                    tls = getattr(self.engine, "_tls", None)
+                    if tls is not None:
+                        tls.done = None             # a DONE that arrives is this request's; death leaves it None
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
@@ -1841,13 +1990,14 @@ class Service:
                     think_budget = max(1, min(think_budget, int(max_new) - reserve))
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
-                gen = self._sliced(ids, max_new, sampling, cancel, emb, hold)
+                gen = self._sliced(key, engine_last0, ids, max_new, sampling, cancel, emb, hold)
                 for ev in pre_events:                   # a required call's opening (prepare put it in the prompt)
                     yield "event", ev
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
+                            self._note_prompt(key)
+                            last_print = self._progress(key, last_print)
                             yield "ping", None
                             continue
                         n += 1
@@ -1877,8 +2027,8 @@ class Service:
                                          if held.endswith(s[:j])), default=0)
                                 text, held = held[:len(held) - k], held[len(held) - k:]
                         evs = parser.feed(text)
-                        self._note(n, evs)
-                        last_print = self._progress(last_print)
+                        self._note(key, n, evs)
+                        last_print = self._progress(key, last_print)
                         for ev in evs:
                             yield "event", ev
                         if stopped:
@@ -1913,9 +2063,9 @@ class Service:
                 Path(emb).unlink(missing_ok=True)
             with self.status_lock:
                 if counted:
-                    # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
-                    last = dict(getattr(self.engine, "last", {}) or {}) \
-                        if getattr(self.engine, "last", None) is not engine_last0 else {}
+                    # only this request's DONE counts: the thread-local stays None when none arrived (death, error,
+                    # disconnect); the mock's marker identity plays the same role
+                    last = dict(self._engine_done(engine_last0) or {})
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -1939,20 +2089,21 @@ class Service:
                     t["output_tokens"] += n
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
-                    fresh = getattr(self.engine, "last", None)
-                    if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                    if last:                                       # the engine's clock for THIS request
                         timings = request_timings(len(ids), n, last)
                         self.last_timings = dict(timings, at=int(time.time())) if timings else None
                     self.last_request_at = time.time()
                     now = time.time()
                     el = now - my_started
-                    ft = my_first or (self.status.get("first_token") if self.active <= 1 else None)
+                    ft = my_first or ((self.live.get(key) or {}).get("first_token")
+                                      if self.active <= 1 else None)
                     rate = n / max(1e-6, now - ft) if ft else 0.0
                     hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
                     print(f"[maya] done: {n} tokens in {el:.0f} s ({rate:.1f} tok/s) "
                           f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                     if os.environ.get("STRATA_DEBUG") and raw_ids:
                         print(f"[maya] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                    self.live.pop(key, None)        # this request's record goes with its end
                 if hold[1]:
                     hold[1] = False
                     self.active -= 1
@@ -2629,11 +2780,22 @@ def make_handler(svc: Service):
                 with svc.status_lock:
                     s = dict(svc.status)
                 now = time.time()
-                if s.get("busy"):
-                    s["elapsed_s"] = round(now - s["started"], 1)
-                    if s.get("first_token"):
+                recs = [r for r in svc._live_records() if not r.get("queued")]
+                if s.get("busy") and recs:
+                    r0 = min(recs, key=lambda r: r.get("started") or now)
+                    gen = [r for r in recs if r.get("first_token")]
+                    s.update(phase=r0.get("phase"), prompt_tokens=r0.get("prompt_tokens"), tool=r0.get("tool"),
+                             generated=sum(r["generated"] for r in gen), max_tokens=r0.get("max_tokens"),
+                             tail=r0.get("tail"))
+                    if r0.get("started"):
+                        s["elapsed_s"] = round(now - r0["started"], 1)
+                    if gen:
                         s["tokens_per_s"] = round(svc._tok_s(), 1)
                         s["tokens_per_s_mean"] = round(svc._tok_s_mean(), 1)
+                s["requests"] = [{"id": r.get("key"), "phase": r.get("phase"), "generated": r.get("generated"),
+                                  "max_tokens": r.get("max_tokens"), "tail": r.get("tail"),
+                                  "elapsed_s": round(now - r["started"], 1) if r.get("started") else None}
+                                 for r in recs]
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
@@ -2824,6 +2986,9 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            for k in ("_checkpoint", "_gen_tail"):
+                if kw.get(k):
+                    req = {**req, k: kw[k]}
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
@@ -2914,6 +3079,9 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new)
             if kw.get("_prefill"):                             # a required tool call starts the answer
                 req = {**req, "_prefill": kw["_prefill"]}
+            for k in ("_checkpoint", "_gen_tail"):
+                if kw.get(k):
+                    req = {**req, k: kw[k]}
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel)
