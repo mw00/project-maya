@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import collections
 import json
 import os
 import sys
@@ -545,6 +546,31 @@ class LiveRate(unittest.TestCase):
         list(gen)
         self.svc.status["busy"] = False
         self.assertIsNone(self.metrics()["live"]["prefill_tok_s_mean"])
+
+    def test_a_prompt_read_beside_an_answer(self):
+        # several requests at once: one answers while another reads its prompt - the Monitor shows the reading one's
+        # progress and rate (from its own record), not nothing
+        now = time.time()
+        with self.svc.status_lock:
+            self.svc.status["busy"] = True
+            self.svc.live[901] = {"key": 901, "phase": "answering", "generated": 50, "started": now - 30,
+                                  "first_token": now - 20, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "rate": collections.deque([(now - 1, 40), (now, 50)], maxlen=32)}
+            self.svc.live[902] = {"key": 902, "phase": "reading the prompt", "generated": 0, "started": now - 5,
+                                  "first_token": None, "tool": None, "tail": "", "max_tokens": 500, "queued": False,
+                                  "rate": collections.deque(maxlen=32), "prompt_read": 4096, "prompt_total": 9000,
+                                  "prefill_tok_s": 431.0}
+        try:
+            live = self.metrics()["live"]
+            self.assertEqual(live["state"], "generating")
+            self.assertEqual((live["prompt_read"], live["prompt_total"]), (4096, 9000))
+            self.assertEqual(live["prefill_tok_s_mean"], 431.0)
+            self.assertEqual(self.svc._prefill_tok_s_mean(), 431.0)
+        finally:
+            with self.svc.status_lock:
+                self.svc.live.pop(901, None)
+                self.svc.live.pop(902, None)
+                self.svc.status["busy"] = False
 
     def test_the_live_number_is_a_rate(self):
         live_samples, stop = [], threading.Event()

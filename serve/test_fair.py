@@ -150,7 +150,7 @@ class FairSlices(unittest.TestCase):
         out = {}
         a = threading.Thread(target=collect, args=(self.svc, "long one", 4096, out), kwargs=kw)
         a.start()
-        while not self.svc.status.get("first_token"):
+        while not any(r.get("first_token") for r in self.svc._live_records()):
             time.sleep(0.001)
         b = threading.Thread(target=collect, args=(self.svc, "short one", 4096, out))
         b.start()
@@ -207,7 +207,7 @@ class FairSlices(unittest.TestCase):
         a = threading.Thread(target=collect, args=(self.svc, "long one", 4096, out),
                              kwargs={"stop_after": 50})
         a.start()
-        while not self.svc.status.get("first_token"):
+        while not any(r.get("first_token") for r in self.svc._live_records()):
             time.sleep(0.001)
         b = threading.Thread(target=collect, args=(self.svc, "short one", 4096, out))
         b.start()

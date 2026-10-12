@@ -586,7 +586,8 @@ Glm5Model::~Glm5Model() {
         for (size_t s = 0; s < seq_.size(); ++s) {
             SeqCtx& c = seq_[s];
             if (s > 0) {
-                for (float* d : {c.state, c.snap, c.snap_pool, c.kda_bak})
+                for (float* d : {el_.empty() ? c.state : nullptr, el_.empty() ? c.snap : nullptr,
+                                 el_.empty() ? c.snap_pool : nullptr, c.kda_bak})
                     if (d) cudaFree(d);
             }
             if (c.hop_h) cudaFreeHost(c.hop_h);
@@ -631,7 +632,8 @@ Glm5Model::~Glm5Model() {
     if (d_tok_) cudaFree(d_tok_);
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
-    if (state_) cudaFree(state_);
+    if (!el_.empty()) el_destroy();   // (every sequence's reservation, state_ among them)
+    else if (state_) cudaFree(state_);
     if (sc_) cudaFree(sc_);
     if (d_pos_) cudaFree(d_pos_);
     if (pool_) cudaFree(pool_);
@@ -1124,8 +1126,8 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     // the state at the context, as load_pack lays it out
     const double max_pools = (double) (max_ctx / g.idx_kpool);
     const double lat = fast ? (double) g.kv_lora * (double) max_ctx / 2 : (double) g.kv_lora * (double) max_ctx;
-    const double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
-    const double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
+    double dsa_state = 4.0 * (lat + 2.0 * g.idx_key * (double) max_ctx + (double) g.idx_key * max_pools);
+    double kda_state = 4.0 * ((double) g.d_inner() * g.kda_head_dim + 3.0 * g.d_inner() * (g.d_conv - 1));
     // a DFlash drafter (STRATA_GLM_DFLASH): its file and ring on the last part; every part keeps the verify window's
     // buffers - per KDA layer its state backup and the window's inputs, and ~32 MB of rows and logits
     double dflash = 0, win_kda = 0, win_fixed = 0;
@@ -1135,6 +1137,22 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         dflash = (ec ? 0.0 : (double) fsz) + (double) (96u << 20);
         win_kda = kda_state + 4.0 * Glm5Model::kWinMax * (3.0 * g.d_inner() + 2.0 * g.kda_head_dim + g.n_head);
         win_fixed = (double) (32u << 20);
+    }
+    // elastic contexts (glm_multi.cu): the first sequence's fixed part (its KDA states and snapshot, its DSA index rings)
+    // is backed at load; the other sequences and every context-sized cache come out of the budget per card - with the
+    // elastic pool a fixed amount, without it one whole context's (per DSA layer)
+    double el_card = 0.0;
+    if (const char* ev = getenv("STRATA_GLM_ELASTIC"); fast && ev != nullptr && std::atoi(ev) != 0) {
+        const double ring = (double) std::min<int64_t>(max_ctx, 8192 + 64);
+        const double grow = 4.0 * (lat + (double) g.idx_key * max_pools);
+        const char* kv = getenv("STRATA_GLM_ELASTIC_KV_GB");
+        const char* pv = getenv("STRATA_GLM_ELASTIC_POOL");
+        const bool pool_on = pv == nullptr || std::atoi(pv) != 0;
+        // (only the first sequence's fixed part - its state and its snapshot - is backed at load; the others' when a
+        // conversation is in them, out of the budget)
+        dsa_state = 4.0 * 2.0 * g.idx_key * ring + (kv || pool_on ? 0.0 : grow);
+        kda_state *= 2.0;
+        el_card = kv ? std::atof(kv) * 1e9 : pool_on ? (double) (250u << 20) : 0.0;
     }
     // the experts: a layer's blob and its VRAM slot's stride (native_experts.txt)
     std::vector<double> blob((size_t) L + 1, 0.0), stride((size_t) L + 1, 0.0);
@@ -1317,7 +1335,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         if (const auto it = memo.find(key); it != memo.end()) return it->second;
         const bool last = i == n - 1;
         const Card& c = cards[(size_t) i];
-        double used = common + fixed + 4.0 * 2 * g.hc * g.n_embd + (i == 0 ? embd : 0.0) + win_fixed;
+        double used = common + fixed + 4.0 * 2 * g.hc * g.n_embd + (i == 0 ? embd : 0.0) + win_fixed + el_card;
         double bsum = 0, ssum = 0, smax = 0;
         bool kda = false, dsa = false, dense_ffn = false, moe = false;
         for (int l = lb; l < le; ++l) {
@@ -2912,7 +2930,39 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
     state_bytes_ = (uint64_t) floats * sizeof(float);
-    { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    // STRATA_GLM_ELASTIC=1: the state reserves the whole context and backs its context-sized caches as they fill
+    // (src/core/glm_multi.cu) - the layout above is replaced by the elastic one
+    const char* el_env = getenv("STRATA_GLM_ELASTIC");
+    SeqCtx ec;
+    std::string el_err;
+    if (fast_mode_ && el_env != nullptr && std::atoi(el_env) != 0 && el_create(max_ctx, ec, el_err)) {
+        kda_S_ = ec.kda_S;
+        kda_conv_ = ec.kda_conv;
+        dsa_lat_ = ec.dsa_lat;
+        dsa_ik_ = ec.dsa_ik;
+        dsa_ig_ = ec.dsa_ig;
+        dsa_pool_ = ec.dsa_pool;
+        ik_ring_ = ec.ik_ring;
+        state_ = ec.state;
+        state_bytes_ = ec.bytes;
+        snap_ = ec.snap;             // (its snapshot lives in the reservation's fixed part)
+        snap_pool_ = ec.snap_pool;
+        // the base budget: with the elastic expert pool (default) a little - the contexts take expert slots beyond it;
+        // without, one whole context's caches
+        const char* kv = getenv("STRATA_GLM_ELASTIC_KV_GB");
+        const char* elp_env = getenv("STRATA_GLM_ELASTIC_POOL");
+        const size_t whole = (size_t) (floats * sizeof(float) - state_bytes_);
+        const bool elp_on = elp_env == nullptr || std::atoi(elp_env) != 0;
+        el_budget_ = kv ? (size_t) (std::atof(kv) * 1e9) : elp_on ? std::min<size_t>(whole, (size_t) 250 << 20) : whole;
+        el_budget0_ = el_budget_;
+        std::fprintf(stderr, "glm elastic: CUDA%d the state reserves %lld tokens: %.2f GB fixed, the context caches backed "
+                     "as written out of %.2f GB\n", dev_, (long long) max_ctx, (double) state_bytes_ / 1e9,
+                     (double) el_budget_ / 1e9);
+    } else {
+        if (!el_err.empty()) std::fprintf(stderr, "%s - static state\n", el_err.c_str());
+        cudaError_t e_ = cudaMalloc(&state_, state_bytes_);
+        if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; }
+    }
     if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
 
     const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
