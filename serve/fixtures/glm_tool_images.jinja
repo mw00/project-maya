@@ -1,0 +1,20 @@
+{%- macro visible_text(content) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- else -%}
+        {%- for item in content -%}
+            {%- if item.type == 'image' -%}
+                {{- '<|begin_of_image|><|image|><|end_of_image|>' -}}
+            {%- elif item.type == 'text' -%}
+                {{- item.text -}}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+{%- for message in messages -%}
+    {%- if message.role == 'tool' -%}
+        {{- '<|observation|><tool_response>' + visible_text(message.content) + '</tool_response>' -}}
+    {%- else -%}
+        {{- '<|' + message.role + '|>' + visible_text(message.content) -}}
+    {%- endif -%}
+{%- endfor -%}

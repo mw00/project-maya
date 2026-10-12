@@ -72,7 +72,7 @@ class ToolImages(unittest.TestCase):
         messages, tools, kwargs = anthropic_to_messages(req)
         for template_path, pad, start, end in (
                 ("serve/chat_template.jinja", "<|image_pad|>", "<|vision_start|>", "<|vision_end|>"),
-                ("tools/glm_chat_template.jinja", "<|image|>", "<|begin_of_image|>", "<|end_of_image|>")):
+                ("serve/fixtures/glm_tool_images.jinja", "<|image|>", "<|begin_of_image|>", "<|end_of_image|>")):
             with self.subTest(template=template_path), tempfile.TemporaryDirectory() as directory:
                 template = ChatTemplate(ROOT / template_path)
                 rendered = template.render(messages, tools=tools, **kwargs)
