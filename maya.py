@@ -1021,6 +1021,15 @@ def arch_setting(archs) -> str:
     return ";".join(str(x) for x in archs) if min(archs) >= 75 else "native"
 
 
+def toolkit_root_defs(nvcc) -> list:
+    """CUDAToolkit_ROOT for the toolkit whose nvcc builds the engine.  Without it CMake can take cudart and cuBLAS from
+    another toolkit: with --nvcc /opt/cuda-13.0/bin/nvcc on Ubuntu 24.04 that also has the distribution's CUDA 12.0
+    (nvidia-cuda-toolkit), the engine was compiled with the 13.0 headers but linked libcudart.so.12 from
+    /usr/lib/x86_64-linux-gnu.  The distribution's own nvcc (/usr/bin) keeps CMake's search as before (Strata #1359)."""
+    root = Path(nvcc).resolve().parent.parent
+    return [] if root == Path("/usr") else [f"-DCUDAToolkit_ROOT={root}"]
+
+
 def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False) -> dict | None:
     """cmake configure + build of the `strata` target in build/; the exact commands are printed as they run.
     soft: a failure warns and returns None (the engine already there keeps working) instead of stopping."""
@@ -1050,7 +1059,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     conf += ["-S", str(ROOT), "-B", str(BUILD), "-DCMAKE_BUILD_TYPE=Release",
              "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
              "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
-             f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"]
+             f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}"]
     if host_compiler:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(host_compiler) or host_compiler}")
     # "native" is what CMake sees: only the chosen cards, numbered as nvidia-smi numbers them
@@ -1631,7 +1640,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
              f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
              "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
-             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}"]
+             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
+             *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
     if meta.get("host_compiler"):
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
