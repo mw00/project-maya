@@ -235,7 +235,7 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": block.get("input") or {}}})
             elif kind == "tool_result":
-                messages.append({"role": "tool", "content": _text_of(block.get("content"))})
+                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
         if text or calls or reasoning:
             out = {"role": m["role"], "content": "".join(text)}
             if reasoning:
