@@ -192,11 +192,39 @@ class Plan:
         """The floats added since index n0 go into maya-exl3.gguf but not into index.txt / dense.bin."""
         self.floats[n0:] = [(n, sh, ty + ":gguf", fn) for n, sh, ty, fn in self.floats[n0:]]
 
+    def stname(self, hf: str) -> str:
+        """The first tensor name present: hf, else hf with any of its '.'-parts swapped for alternatives.
+        neko-legends' experts-only quant keeps the KDA projections unfused (q_proj / k_proj / v_proj
+        separately) where Maya's own quants fuse them (qkv_proj)."""
+        st = self.st
+        if st.has(hf + ".trellis") or st.has(hf + ".weight"):
+            return hf
+        alts = {"qkv_proj": ("q_proj", "k_proj", "v_proj")}
+        for full, parts in alts.items():
+            tail = "." + full
+            if hf.endswith(tail):
+                base = hf[: -len(tail)]
+                if all(st.has(base + "." + p + ".weight") for p in parts):
+                    return base + "." + full  # virtual: build() special-cases the split
+        return hf
+
     def mat(self, gname: str, hf: str):
         st = self.st
         if not st.has(hf + ".trellis"):
             if st.has(hf + ".weight"):
-                raise SystemExit("%s is stored unquantized; the packer expects it as EXL3" % hf)
+                # an unquantized matrix (neko-legends' 4bpw quantizes the routed experts only): a float
+                # row - the engine's matmul serves F32 and BF16 rows as well as EXL3 ones
+                dt, shp = st.t[hf + ".weight"][1], st.t[hf + ".weight"][2]
+                if dt not in ("F32", "F16", "BF16"):
+                    raise SystemExit("%s is %s; the packer needs it F32/F16/BF16 to store it unquantized" % (hf, dt))
+                g = lambda hf=hf: st.f32(hf + ".weight")  # noqa: E731
+                if dt in ("BF16", "F16"):
+                    self.bf16(gname, list(reversed(shp)), g)
+                else:
+                    self.f32(gname, list(reversed(shp)), g)
+                self.notes.append("%s stored unquantized (%s in the source) - a float row, served dequantized"
+                                  % (hf, dt))
+                return
             raise SystemExit("%s: no tensor %s.trellis" % (gname, hf))
         if not st.has(hf + ".suh") or not st.has(hf + ".svh"):
             raise SystemExit("%s: EXL3 without suh/svh (an old packed-sign checkpoint); not supported" % hf)
@@ -233,7 +261,16 @@ class Plan:
                 self.f32(P + "hc_%s_base.weight" % s, None, g(H + "hc_%s_base" % s))
                 self.f32(P + "hc_%s_scale.weight" % s, None, g(H + "hc_%s_scale" % s))
             if il < n_layers and t["layer_types"][il] == "linear_attention":
-                self.mat(P + "attn_qkv.weight", A + "qkv_proj")
+                st0 = self.st
+                if not st0.has(A + "qkv_proj.trellis") and not st0.has(A + "qkv_proj.weight") \
+                        and all(st0.has(A + p + ".weight") for p in ("q_proj", "k_proj", "v_proj")):
+                    # the source keeps the KDA projections unfused: emit them as three float rows (they
+                    # are unquantized in the experts-only quants); the engine reads attn_q/k/v.weight
+                    # from the pack (fused rows or three rows alike serve the same slots)
+                    for q_, nm in zip("qkv", ("q_proj", "k_proj", "v_proj")):
+                        self.mat(P + "attn_%s.weight" % q_, A + nm)
+                else:
+                    self.mat(P + "attn_qkv.weight", A + "qkv_proj")
                 self.mat(P + "attn_output.weight", A + "o_proj")
                 self.f32(P + "ssm_a", None, lambda A=A: -np.exp(st.f32(A + "A_log").reshape(-1)[:n_head]))
                 self.f32(P + "ssm_dt.bias", None, g(A + "dt_bias"))
