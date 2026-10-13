@@ -30,6 +30,7 @@
 #include "ggml.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cctype>
@@ -2952,10 +2953,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                     const float d = amax / 127.f;
                     const float inv = d != 0.f ? 1.f / d : 0.f;
                     uint16_t dh;
-                    {   // round-to-nearest, keep the top 16 bits (the b16() upload idiom)
-                        uint32_t db = 0; std::memcpy(&db, &d, 4);
-                        db += 0x7fffu + ((db >> 16) & 1u);
-                        dh = (uint16_t) (db >> 16);
+                    {   // float->fp16, round-to-nearest-even (IEEE binary16, the field
+                        // DecW<8> decodes with __half2float).  NOTE: the memcpy/shift idiom
+                        // used at the b16() upload above is float->BF16 and is NOT float->FP16.
+                        dh = __half_as_ushort(__float2half_rn(d));
                     }
                     std::memcpy(q8.data() + b * 34, &dh, 2);
                     for (size_t j = 0; j < 32; ++j) {
