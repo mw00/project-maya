@@ -758,7 +758,11 @@ def main() -> int:
     st = SafeTensors(d)
     plan = Plan(st, t)
     nextn = int(t.get("num_nextn_predict_layers", 0) or 0)
-    mtp = nextn > 0 and not a.no_mtp and st.has("model.language_model.layers.%d.eh_proj.trellis" % t["num_hidden_layers"])
+    # the NextN block either EXL3-quantized (eh_proj.trellis) or carried unquantized (eh_proj.weight,
+    # the experts-only community quants): build() emits its matrices as float rows either way
+    mtp = nextn > 0 and not a.no_mtp and (
+        st.has("model.language_model.layers.%d.eh_proj.trellis" % t["num_hidden_layers"]) or
+        st.has("model.language_model.layers.%d.eh_proj.weight" % t["num_hidden_layers"]))
     if nextn > 0 and not mtp and not a.no_mtp:
         print("note: the config names a NextN block but the files do not carry it - packed without MTP")
     plan.build(mtp=mtp)
