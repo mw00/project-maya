@@ -209,8 +209,11 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind, 
                               std::string* how = nullptr) {
     if (fast && name == "token_embd.weight") return 0;
     if (fast && kind == "4" && t->elements() >= 65536) {
-        if (how) *how = " bf16";
-        return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
+        // BF16 row + the Q8_0 twin the fast path's q() slots read (see the keep16 branch)
+        if (how) *how = " bf16+q8";
+        const uint64_t ne = (uint64_t) t->elements();
+        const uint64_t q8 = (ne / 32) * 34 + (ne % 32 ? 34 : 0);
+        return (((ne * 2) + 255u) & ~(uint64_t) 255u) + ((q8 + 255u) & ~(uint64_t) 255u);
     }
     if (kind != "0" || name == "attn_k_b.weight" || name == "attn_v_b.weight") {
         if (how) *how = " f32";
@@ -2928,7 +2931,50 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             }
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
-            at += (r.bytes + 255u) & ~(uint64_t) 255u;
+            // experts-only community quants keep the attention/dense-FFN projections BF16.  The
+            // fast path's q() slots dot those weights against a q8_1 activation, so a BF16 row
+            // cannot serve them; quantize the row to Q8_0 on the host and register that copy in
+            // ws_map_ (type 8; mv_type_ok accepts it).  The BF16 copy above still serves b16().
+            {
+                const uint64_t ne = (uint64_t) t->elements();
+                const size_t nblocks = (size_t) ((ne + 31) / 32);
+                std::vector<uint8_t> q8(nblocks * 34);
+                const uint16_t* sb = (const uint16_t*) raw.data();
+                auto bf16_bits_to_f32 = [](uint32_t b) { const uint32_t bits = b << 16; float f; std::memcpy(&f, &bits, 4); return f; };
+                for (size_t b = 0; b < nblocks; ++b) {
+                    const size_t i0 = (size_t) b * 32;
+                    const size_t n = std::min<size_t>(32, (size_t) ne - i0);
+                    float amax = 0.f;
+                    for (size_t j = 0; j < n; ++j)
+                        amax = std::max(amax, std::abs(bf16_bits_to_f32(sb[i0 + j])));
+                    // ggml's quantize_row_q8_0_ref: d = amax/127 in F32, id uses that F32 d
+                    // (the fp16-rounded d would let |q| round to 128 and wrap int8)
+                    const float d = amax / 127.f;
+                    const float inv = d != 0.f ? 1.f / d : 0.f;
+                    uint16_t dh;
+                    {   // round-to-nearest, keep the top 16 bits (the b16() upload idiom)
+                        uint32_t db = 0; std::memcpy(&db, &d, 4);
+                        db += 0x7fffu + ((db >> 16) & 1u);
+                        dh = (uint16_t) (db >> 16);
+                    }
+                    std::memcpy(q8.data() + b * 34, &dh, 2);
+                    for (size_t j = 0; j < 32; ++j) {
+                        int8_t q = 0;
+                        if (j < n)
+                            q = (int8_t) std::round(bf16_bits_to_f32(sb[i0 + j]) * inv);
+                        q8[b * 34 + 2 + j] = (uint8_t) q;
+                    }
+                }
+                const size_t qbytes = q8.size();
+                const uint64_t qat = ((at + (uint64_t) r.bytes) + 255u) & ~(uint64_t) 255u;
+                { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + qat, q8.data(), qbytes,
+                                              cudaMemcpyHostToDevice);
+                  if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                ws_map_[r.name] = strata::core::WSlot{nullptr, 8 /*GGML Q8_0*/,
+                    (const void*) ((uint8_t*) w_arena_ + qat),
+                    (int64_t) t->shape[0], (int64_t) t->shape[1]};
+                at = qat + ((qbytes + 255u) & ~(uint64_t) 255u);
+            }
             continue;
         }
         if (!dequant_at_load(r.name)) {
