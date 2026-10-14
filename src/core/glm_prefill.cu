@@ -472,6 +472,10 @@ struct Glm5Model::PrefillState {
     std::vector<std::pair<int, int>> sev_layer;    // a layer's stage events: [first, end) in sev
     cudaEvent_t sev_a = nullptr, sev_b = nullptr;  // the chunk's span on the compute stream
     cudaEvent_t sev_h0 = nullptr, sev_h1 = nullptr;   // ... and the hop in, on the receiving stream
+    bool sev_hop = false;                          // prefill_run recorded sev_h0/sev_h1 for the chunk prefill_half is
+                                                   // about to run (the head part has no hop, and reading an event that
+                                                   // was never recorded is an error, not a -1: it would fail the
+                                                   // chunk's own cudaGetLastError check)
     size_t sn = 0;                                 // sev's used slots (a chunk)
     int chunk_i = 0, chunk_n = 0;                  // this chunk's ordinal and the prompt's chunk count
     // per chunk (they reset as the line prints): the bytes a lane staged, the experts, the host's plan and disk waits
@@ -1758,6 +1762,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         return true;
     };
     S->mark("start", s);
+    const bool hop_on = S->sev_hop;   // (this chunk's hand-over, if it came over one: read once, here)
+    S->sev_hop = false;
     if (S->stages) {   // (the stage line's events: the chunk's span starts here; the counters reset as the line prints)
         S->sn = 0;
         S->sev_layer.clear();
@@ -3195,7 +3201,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (!glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm prompt stages", err)) return false;
         const auto el = [](cudaEvent_t a, cudaEvent_t b) {
             float v = 0.0f;
-            return a != nullptr && b != nullptr && cudaEventElapsedTime(&v, a, b) == cudaSuccess ? (double) v : -1.0;
+            if (a == nullptr || b == nullptr) return -1.0;
+            if (cudaEventElapsedTime(&v, a, b) != cudaSuccess) {
+                cudaGetLastError();   // (the query's own: an event with nothing recorded reads -1, and the line says
+                return -1.0;          //  so - the chunk's own cudaGetLastError check below must not see it)
+            }
+            return (double) v;
         };
         const auto at = [&](int i) { return (size_t) i < S->sev.size() ? S->sev[(size_t) i] : nullptr; };
         // the lane's own span is [first group in, last group's copies landed]: before it (lead) the chunk's dense and
@@ -3223,7 +3234,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const double lead = first_a >= 0 ? el(S->sev_a, at(first_a)) : 0.0;
         const double tail = last_c >= 0 ? el(at(last_c), S->sev_b) : wall;
         const double lane = wait + busy + windows + inner;       // == last_c - first_a: lead + lane + tail = wall
-        const double hm = el(S->sev_h0, S->sev_h1);   // (the chunk's hand-over: never recorded for the first part)
+        const double hm = hop_on ? el(S->sev_h0, S->sev_h1) : -1.0;   // (the chunk's hand-over; the head has none)
         if (hm >= 0.0) S->ct_hop_in += hm;
         const double gb = 1073741824.0;
         const double moved = (double) (S->ct_ram + S->ct_disk) / gb;
@@ -3533,6 +3544,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 cudaSetDevice(m->dev_);
                 cudaStreamWaitEvent(m->fast_->cs, SP->ev_hop, 0);
                 if (m->pf_->stages && m->pf_->sev_h0 != nullptr) cudaEventRecord(m->pf_->sev_h0, m->fast_->cs);
+                m->pf_->sev_hop = m->pf_->stages;   // (m->prefill_half below reads it: this chunk came over the hop)
                 cudaMemcpyAsync(m->pf_->R, SP->hop_h, hop, cudaMemcpyHostToDevice, m->fast_->cs);
                 if (m->pf_->stages && m->pf_->sev_h1 != nullptr) cudaEventRecord(m->pf_->sev_h1, m->fast_->cs);
                 m->pos_ = p0;
@@ -3608,6 +3620,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + (int64_t) c * Tc;
                     if (m->pf_->stages && m->pf_->sev_h0 != nullptr) cudaEventRecord(m->pf_->sev_h0, m->fast_->cs);
+                    m->pf_->sev_hop = m->pf_->stages;   // (this chunk arrived over the hop: the line below reads it)
                     cudaMemcpyAsync(m->pf_->R, up->pf_->hop_h + (size_t) (c & 1) * slot,
                                     (size_t) T * 4 * E * sizeof(float), cudaMemcpyHostToDevice, m->fast_->cs);
                     if (m->pf_->stages && m->pf_->sev_h1 != nullptr) cudaEventRecord(m->pf_->sev_h1, m->fast_->cs);
@@ -3709,7 +3722,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             if (m->pf_->pr_hop > 0.5)
                 per_part += " (hop in " + std::to_string((long long) std::llround(m->pf_->pr_hop)) + " ms)";
         }
-        std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms (%.2f ms/token, %.0f tok/s), %d chunk%s of %d | %s\n",
+        std::fprintf(stderr, "glm prefill: %lld tokens in %.1f ms (%.2f ms/token, %.0f tok/s), %d chunk%s of %d "
+                             "tokens | %s\n",
                      (long long) n, ms, ms / (double) n, 1000.0 * (double) n / ms, nc, nc == 1 ? "" : "s", Tc,
                      per_part.c_str());
     }
