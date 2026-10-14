@@ -1236,7 +1236,8 @@ static double host_read_bps() {
 // where Strata's are fits to its model:
 //   - a part's room for experts: its free VRAM less its layers' dense weights and state at the context (index.txt and
 //     the GGUF directory, as load_pack sizes them), the head and the draft block on the last part, its scratch, and
-//     the reserve fast_setup keeps (pool_avail); the pool gives every layer the same number of slots;
+//     the reserve fast_setup keeps (pool_budget: --vram-reserve-mib, or --expert-cache N on the first GPU); the pool
+//     gives every layer the same number of slots;
 //   - the experts those slots hold: each layer's most routed, their share of its routes read off the usage file's
 //     counts (STRATA_GLM_USAGE, opt-in; the pack's expert_counts.txt without it; Strata's coverage curve 1 - (1 - f)^3,
 //     an EXL3 pack's ^1.4, STRATA_SPLIT_COVER_B, without either - that is what Strata has to assume, its profile
@@ -1542,7 +1543,9 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             }
         }
         const double room =
-            c.free > used ? (double) Glm5Model::pool_avail((size_t) (c.free - used), (size_t) c.total) : 0.0;
+            c.free > used ? (double) Glm5Model::pool_budget((size_t) (c.free - used), (size_t) c.total, i,
+                                                            (size_t) ((double) keep * ssum), (size_t) smax).avail
+                          : 0.0;
         Eval ev;
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;
         while (ev.per > 0 && (double) ev.per * ssum > room) --ev.per;

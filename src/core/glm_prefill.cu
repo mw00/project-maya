@@ -627,17 +627,18 @@ bool Glm5Model::prefill_setup(std::string& err) {
     // the pool to come: `per` slots a layer over the tier layers, as fast_setup sizes it from the same free VRAM
     size_t dev_free = 0, dev_total = 0;
     cudaMemGetInfo(&dev_free, &dev_total);
-    const size_t avail = pool_avail(dev_free, dev_total);
-    size_t blob_sum = 0, stride_sum = 0;
+    size_t blob_sum = 0, stride_sum = 0, stride_max = 0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         if (!Ly.moe) continue;
         blob_sum += Ly.blob;
         stride_sum += glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+        stride_max = std::max(stride_max, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
     }
+    const int64_t keep = g.n_exp_used + gf::kSpares + 2;
+    const size_t avail = part_budget(dev_free, dev_total, (size_t) keep * stride_sum, stride_max).avail;
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
-    const int64_t keep = g.n_exp_used + gf::kSpares + 2;
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? (size_t) PrefillState::NG * PrefillState::GE * gstride : 0;

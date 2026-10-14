@@ -148,6 +148,28 @@ what you changed there):
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
 
+## The expert pool's size
+
+What each GPU's VRAM holds besides the model's dense weights, its context state and the drafter goes to experts (the
+expert pool), less a reserve for the driver, the sampler and what is allocated later (the verify windows' graphs,
+captured on first use). The setup writes `--expert-cache auto` into the config's `"args"`; a number of your own
+there, and the reserves below, go there too, and a setup again keeps them (`STRATA_GLM_EXPERT_CACHE`,
+`STRATA_GLM_RESERVE_MB` and `STRATA_GLM_RESERVE_LATER_MB` set the same from the environment; the config's args win):
+
+| Argument | What it does |
+| --- | --- |
+| `--expert-cache auto` | the default: the pool takes the free VRAM less the reserve. Once that budget is written, the free VRAM is read again: under Windows an allocation counts only once it is touched, the free figure read before it can be about a gigabyte too high, and a card filled past it pages GPU memory to system RAM instead of failing (decode several times slower; a request can stall for good). Short of the reserve, the pool gives back the difference and is checked again; an allocation the driver refuses (Windows also charges VRAM to the commit, RAM + page file) ends it at what the driver gave. `STRATA_GLM_POOL_CHECK=0` skips the check |
+| `--expert-cache N` | your own size: the first GPU's pool holds at most N experts (N of its largest expert slots); a split's later GPUs stay on `auto`. It is not checked once written: a card it fills too far is only reported at start |
+| `--vram-reserve-mib N` | the VRAM left free beside the pool: 700 MiB by default (1024 on a Ryzen AI Max APU under Linux). On a small card where that would leave the pool less than a route's experts and the spares in every layer, `auto` lowers it as far as 300 MiB and says so; a number set here is kept. The setup takes it too (`--vram-reserve-mib N`) |
+| `--vram-reserve-later-mib N` | the same on a split's later GPUs (default: `--vram-reserve-mib`'s) - a card that drives no display needs less |
+
+At start the engine log says how much VRAM each GPU has free with everything loaded (`maya serve: CUDA0: ... MiB of
+VRAM free with everything loaded`). Under 256 MiB (512 on a split's later GPUs) it adds `LOW` and the reserve that would
+leave room. The engine only says so: raise `--vram-reserve-mib` (`--vram-reserve-later-mib`), lower `--max-context`, or
+close other programs that use the GPU. A drafter's verify windows allocate on first use, after the start: an RTX 3090
+with DFlash2 at 32K had 431 MiB free at start and 77 MiB after the first request - fine on Linux, where a full card
+fails an allocation instead of paging, but on Windows a reason to raise the reserve.
+
 ## Several requests at once
 
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:

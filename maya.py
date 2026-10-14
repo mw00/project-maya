@@ -1900,10 +1900,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                  choice: tuple | None = None, dflash: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
+    # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
+    # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
     # can lend, up to 8192; a number (`32768`) sets the chunk itself
-    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--prefill", "auto",
-                                     "--kv-streaming", KV_STREAMING],
+    cfg = {"exe": str(EXE), "args": ["--glm-pack", str(pack), "--max-context", str(ctx), "--expert-cache", "auto",
+                                     "--prefill", "auto", "--kv-streaming", KV_STREAMING],
            "cwd": str(ROOT),
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": dict(SAMPLING), "reasoning_effort": EFFORT, "lib_dirs": meta.get("lib_dirs") or [],
@@ -1955,13 +1957,17 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     if cfg_path.exists():
         old = read_json(cfg_path).get("args") or []
         kept = keep_args(old, cfg["args"],
-                         ("--prefill", "--parallel", "--expert-profile-save", "--expert-profile-save-every",
-                          "--kv-streaming", "--kv-resident"))
+                         ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
+                          "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",
+                          "--kv-resident"))
         kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
     if getattr(a, "parallel", None):
         set_arg(cfg["args"], "--parallel", a.parallel)
+    if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
+        set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
+        ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
         ok(line)
     gguf_dir = local.parent if local else Path(a.gguf_dir).expanduser().resolve() if a.gguf_dir else None
@@ -2832,6 +2838,9 @@ def main() -> int:
                     help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "
                          "decoded together, more tokens per second in all; each extra conversation keeps its own "
                          "context in VRAM, which the expert cache gives up")
+    ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
+                    help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
+                         "programs (default 700), kept in the config")
     ap.add_argument("--port", type=int, help="the dashboard's and the API's port (default 8080)")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this machine only (default), 0.0.0.0 = also "
                                    "other devices on your network (set --api-key too)")
@@ -2862,6 +2871,8 @@ def main() -> int:
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
+    if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
+        ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.config is not None:
         if not a.config.is_file():
             ap.error(f"config not found: {a.config}")

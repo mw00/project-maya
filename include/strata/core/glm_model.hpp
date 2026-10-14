@@ -134,6 +134,15 @@ public:
         double pool_gb = 0, ram_gb = 0;
     };
     FastStats fast_stats() const;
+    /// Every GPU's expert pool as it was sized (part order): the device, the VRAM kept free beside it (MiB), whether the
+    /// default reserve was lowered so a small card's pool holds its floor, and --expert-cache N (0: auto) - for the
+    /// driver's free-VRAM lines, which name the setting that leaves room
+    struct PoolVram {
+        int dev = 0, reserve_mib = 0;
+        bool adapted = false;
+        int64_t fixed = 0;
+    };
+    std::vector<PoolVram> pool_vram() const;
     /// The CPU LANE (a decode's RAM-tier experts): the share of them copied over PCIe to the GPU instead of computed
     /// on the CPU - 0: the CPU takes every one, 1: none (of f such experts in a route, f - round(share f) go to the
     /// CPU).  pcie_share(): the split in use, as a share; set_pcie_share(s): this split from the next token on, s < 0
@@ -779,7 +788,22 @@ public:
         size_t staging = 0, hop = 0;
     };
     PinnedPrompt prefill_pinned() const;
-    static size_t pool_avail(size_t free_b, size_t total_b);   // the expert pool's bytes from the free VRAM
+    // the expert pool's bytes on part `part` from its free VRAM (glm_fast_path.cu): --expert-cache auto | N and the VRAM
+    // reserve (STRATA_GLM_EXPERT_CACHE, STRATA_GLM_RESERVE_MB / _RESERVE_LATER_MB; the driver sets them from the
+    // config's args).  floor_b: the pool's floor (a route's experts and the spares, every layer), which a small card's
+    // default reserve gives way to; slot_b: the part's largest expert slot (--expert-cache N is N of them)
+    struct PoolBudget {
+        size_t avail = 0, reserve = 0;
+        int64_t fixed = 0;              // --expert-cache N (the first GPU), 0: auto
+        bool reserve_given = false;     // a reserve set by hand is kept as it is
+        bool adapted = false;           // the default reserve lowered so the pool holds its floor
+    };
+    static PoolBudget pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
+                                  bool unified = false);
+    PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
+    void pool_check(size_t floor_b, size_t slot_b);        // auto: the budget written once, the free VRAM read again
+    size_t pool_short_ = 0;                                // what that check found short of the reserve
+    PoolBudget pool_b_;                                    // the budget the pool was carved from
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)

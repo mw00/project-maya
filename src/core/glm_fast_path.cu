@@ -950,6 +950,22 @@ bool Glm5Model::fast_setup(std::string& err) {
         // time, in part order - the first part's RAM measurement then sees none of the later parts' prompt staging, as
         // when they load one after another (it took that staging twice: once pinned, once in the headroom)
         if (split_load_ != nullptr) split_load_->wait(part_);
+        // a layer's slot stride: MMQ-addressable (glmfast::expert_stride), so the prompt path multiplies the pool
+        // partition in place
+        const auto slot_stride = [&](int il) {
+            const auto& Ly = F->L[(size_t) il];
+            return glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
+        };
+        // the pool's floor (a route's experts and the spares, every layer) and its largest slot: the budget's terms
+        size_t stride_sum = 0, stride_max = 0;
+        for (int il = l0_; il < lt_; ++il)
+            if (F->L[(size_t) il].moe) {
+                stride_sum += slot_stride(il);
+                stride_max = std::max(stride_max, slot_stride(il));
+            }
+        const size_t floor_b = (size_t) (g.n_exp_used + gf::kSpares + 2) * stride_sum;
+        // --expert-cache auto: the budget checked once written, before the prompt path sizes its chunk from it
+        pool_check(floor_b, stride_max);
         // the batched prompt path: its sizes (it borrows the pool's tail, see below)
         if (!prefill_setup(err)) return false;
         size_t free_b = 0, total_b = 0;
@@ -963,11 +979,16 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (long long) max_ctx_, (double) state_bytes_ / G,
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
-        // headroom: cuBLAS-free path; the context's own growth is already allocated (state arena);
-        // keep ~700 MB for the driver, the sampler and kernel launches' local memory
-        size_t reserve = (size_t) (F->unified_memory ? 1024 : 700) << 20;
-        if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
-        size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
+        // the budget: the free VRAM less the reserve (--vram-reserve-mib), or --expert-cache N's (pool_budget)
+        pool_b_ = part_budget(free_b, total_b, floor_b, stride_max);
+        const size_t reserve = pool_b_.reserve;
+        size_t avail = pool_b_.avail;
+        if (pool_b_.adapted)
+            std::fprintf(stderr, "glm fast: CUDA%d the default %d MiB VRAM reserve leaves the expert pool too few slots "
+                                 "on this card: a %zu MiB reserve instead\n", dev_, 700, reserve >> 20);
+        if (pool_b_.fixed > 0)
+            std::fprintf(stderr, "glm fast: CUDA%d --expert-cache %lld: at most %.2f GB for the expert pool\n", dev_,
+                         (long long) pool_b_.fixed, (double) pool_b_.fixed * (double) stride_max / 1073741824.0);
 #if defined(STRATA_USE_HIP)
         if (F->unified_memory) {
             // Measure after dense/KV/scratch and pinned prompt staging are allocated.
@@ -1007,12 +1028,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                          dev_, (double) cap / 1073741824.0, (double) used / 1073741824.0, (double) room / 1073741824.0);
             avail = std::min(avail, room);
         }
-        // a layer's slot stride: MMQ-addressable (glmfast::expert_stride), so the prompt path multiplies the pool
-        // partition in place
-        const auto slot_stride = [&](int il) {
-            const auto& Ly = F->L[(size_t) il];
-            return glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type);
-        };
+        if (pool_b_.fixed > 0) avail = std::min(avail, (size_t) pool_b_.fixed * stride_max);   // (an APU's too)
         // every layer gets the same number of slots: avail / sum(blob over layers)
         size_t blob_sum = 0;
         for (int il = l0_; il < lt_; ++il)
@@ -1027,12 +1043,23 @@ bool Glm5Model::fast_setup(std::string& err) {
             --per;
         }
         if (per < g.n_exp_used) {
-            err = "glm fast: not enough VRAM for the expert pool (" + std::to_string(per) + " slots per layer)";
+            // what is short, and what makes room
+            const size_t need = (size_t) g.n_exp_used * stride_sum;
+            const size_t short_mib = ((need > avail ? need - avail : 0) >> 20) + 1;
+            err = "glm fast: CUDA" + std::to_string(dev_) + " has no room for the expert pool: " + std::to_string(per) +
+                  " slots a layer, at least " + std::to_string(g.n_exp_used) + " needed (about " +
+                  std::to_string(short_mib) + " MiB more). To make room: " +
+                  (pool_b_.fixed > 0 ? "a larger --expert-cache (" + std::to_string(pool_b_.fixed) + " now) or auto, "
+                                     : std::string()) +
+                  (pool_b_.reserve_given
+                       ? std::string(part_ > 0 && getenv("STRATA_GLM_RESERVE_LATER_MB") ? "a smaller --vram-reserve-later-mib ("
+                                                                                       : "a smaller --vram-reserve-mib (") +
+                             std::to_string(reserve >> 20) + " now), "
+                       : std::string()) +
+                  "a smaller --max-context, " + (kv_int8() ? "" : "--kv int8, ") +
+                  (kv_ != nullptr ? "" : "--kv-streaming on, ") + "or close other programs that use the GPU";
             return false;
         }
-        size_t stride_sum = 0;
-        for (int il = l0_; il < lt_; ++il)
-            if (F->L[(size_t) il].moe) stride_sum += slot_stride(il);
         // the prompt path borrows the pool's TAIL: the last k slots of every layer, laid out as one region after all
         // the main segments - the prompt path's buffers while a prompt runs, expert slots the rest of the time
         int k_extra = 0;
@@ -5216,24 +5243,112 @@ int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::strin
     return F->tok_h[0];
 }
 
-// the bytes the expert pool may take from what is free: headroom kept (cuBLAS-free path; the context's own growth is
-// already allocated in the state arena) - ~700 MB for the driver, the sampler and kernel launches' local memory,
-// STRATA_GLM_RESERVE_MB; STRATA_GLM_POOL_GB caps it; STRATA_GLM_VRAM_GB=<n> behaves like a card with n GB (the cap
-// counts everything this process already holds on the device, so the pool gets what such a card would have).  The
-// prompt path and the layer split search size from the same number, before the pool is carved (a discrete card's:
-// fast_setup prices a unified-memory APU's pool itself).
-size_t Glm5Model::pool_avail(size_t free_b, size_t total_b) {
-    size_t reserve = (size_t) 700 << 20;
-    if (const char* r = getenv("STRATA_GLM_RESERVE_MB")) reserve = (size_t) std::atoll(r) << 20;
-    size_t avail = glmfast::expert_pool_budget(false, free_b, 0, reserve, 0, 0);
+// the bytes the expert pool may take from what is free.  The reserve: VRAM kept free beside the pool (the context's own
+// growth is already allocated in the state arena) for the driver, the sampler, kernel launches' local memory and what
+// is allocated after the pool (the verify windows' graphs), 700 MiB (1024 on a unified-memory APU), the config's
+// --vram-reserve-mib (STRATA_GLM_RESERVE_MB) - a split's later GPUs --vram-reserve-later-mib (STRATA_GLM_RESERVE_LATER_MB)
+// where it is set.  --expert-cache auto (the default) takes the rest; a number N (STRATA_GLM_EXPERT_CACHE) caps the
+// first GPU's pool at N of its largest expert slots (the later GPUs keep auto).  On a small card whose default reserve
+// would leave the pool short of its floor (floor_b: a route's experts and the spares in every layer), auto lowers the
+// reserve to what leaves exactly that, down to 300 MiB, and the start says so (`adapted`); a reserve set by hand is
+// kept.
+// STRATA_GLM_POOL_GB caps the pool; STRATA_GLM_VRAM_GB=<n> behaves like a card with n GB (the cap counts everything
+// this process already holds on the device, so the pool gets what such a card would have).  The prompt path and the
+// layer split search size from the same number, before the pool is carved (a discrete card's: fast_setup prices a
+// unified-memory APU's pool from its RAM).
+Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
+                                             bool unified) {
+    PoolBudget b;
+    const char* later = part > 0 ? getenv("STRATA_GLM_RESERVE_LATER_MB") : nullptr;
+    const char* r = later != nullptr && later[0] ? later : getenv("STRATA_GLM_RESERVE_MB");
+    b.reserve_given = r != nullptr && r[0];
+    b.reserve = (size_t) (b.reserve_given ? std::max(0LL, std::atoll(r)) : unified ? 1024 : 700) << 20;
+    if (const char* ec = getenv("STRATA_GLM_EXPERT_CACHE"); ec != nullptr && part == 0)
+        b.fixed = std::max(0LL, std::atoll(ec));   // ("auto": 0)
+    if (!unified)
+        std::tie(b.reserve, b.adapted) =
+            glmfast::pool_reserve(free_b, b.reserve, b.reserve_given, b.fixed > 0, floor_b, (size_t) 300 << 20);
+    b.avail = glmfast::expert_pool_budget(false, free_b, 0, b.reserve, 0, 0);
+    if (b.fixed > 0 && slot_b > 0) b.avail = std::min(b.avail, (size_t) b.fixed * slot_b);
     if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
-        avail = std::min(avail, (size_t) (std::atof(cap) * 1073741824.0));
+        b.avail = std::min(b.avail, (size_t) (std::atof(cap) * 1073741824.0));
     if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
         const size_t cap = (size_t) (std::atof(vc) * 1073741824.0);
         const size_t used = total_b - free_b;
-        avail = std::min(avail, cap > used + reserve ? cap - used - reserve : (size_t) 0);
+        b.avail = std::min(b.avail, cap > used + b.reserve ? cap - used - b.reserve : (size_t) 0);
     }
-    return avail;
+    return b;
+}
+
+// this part's budget: the one above, less what pool_check found short of the reserve once it was written
+Glm5Model::PoolBudget Glm5Model::part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const {
+    PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, fast_ != nullptr && fast_->unified_memory);
+    b.avail = b.avail > pool_short_ ? b.avail - pool_short_ : 0;
+    return b;
+}
+
+// --expert-cache auto: the budget is checked once it is WRITTEN.  Under Windows' WDDM an allocation is resident only
+// once it is touched, and the free figure read before it can be ~1 GB high; a pool sized from it fills the card, and
+// there an over-full card pages to system RAM instead of failing - the start looks normal and decode is several times
+// slower (a verify window can wait on a page-in for good).  So the budget is allocated in 1 GiB pieces, zeroed, and
+// the free VRAM read again: short of the reserve, the budget gives back the difference (the first two reads of nearly
+// nothing free 1 GiB each, later ones a quarter) and is checked again, at most six times.  A piece the driver refuses
+// (Windows also charges VRAM to the commit, RAM + page file) ends the budget at what it gave.  What was found short
+// stays in pool_short_, so the prompt path's chunk and the pool are sized from the same figure.  A fixed
+// --expert-cache N and a unified-memory APU (its budget is RAM's) are not checked.  STRATA_GLM_POOL_CHECK=0: off.
+void Glm5Model::pool_check(size_t floor_b, size_t slot_b) {
+    if (fast_ == nullptr || fast_->unified_memory) return;
+    if (const char* v = getenv("STRATA_GLM_POOL_CHECK"); v != nullptr && std::atoi(v) == 0) return;
+    constexpr size_t kPiece = (size_t) 1 << 30;
+    cudaSetDevice(dev_);
+    size_t free_b = 0, total_b = 0;
+    cudaMemGetInfo(&free_b, &total_b);
+    int zero_reads = 0;
+    for (int attempt = 0; attempt < 6; ++attempt) {
+        const PoolBudget b = part_budget(free_b, total_b, floor_b, slot_b);
+        if (b.fixed > 0 || b.avail == 0) return;
+        std::vector<void*> got;
+        size_t have = 0;
+        while (have < b.avail) {
+            const size_t sz = std::min(kPiece, b.avail - have);
+            void* p = nullptr;
+            if (cudaMalloc(&p, sz) != cudaSuccess) {
+                cudaGetLastError();
+                break;
+            }
+            cudaMemset(p, 0, sz);
+            got.push_back(p);
+            have += sz;
+        }
+        cudaDeviceSynchronize();
+        size_t fr = 0, tot = 0;
+        cudaMemGetInfo(&fr, &tot);
+        for (void* p : got) cudaFree(p);
+        // STRATA_GLM_POOL_CHECK_TEST_MB=N (a test): the free figure read before the budget ran N MiB high, as Windows'
+        if (const char* t = getenv("STRATA_GLM_POOL_CHECK_TEST_MB")) {
+            const size_t hi = (size_t) std::max(0LL, std::atoll(t)) << 20;
+            fr = fr > hi ? fr - hi : 0;
+        }
+        const size_t give = glmfast::pool_give_back(b.avail, have, fr, b.reserve, zero_reads);
+        if (give == 0) return;
+        pool_short_ += give;
+        if (have < b.avail)
+            std::fprintf(stderr, "glm fast: CUDA%d the driver gave %.2f of the expert pool's %.2f GB (%zu MiB free then, "
+                                 "reserve %zu MiB): %.2f GB less\n", dev_, (double) have / 1073741824.0,
+                         (double) b.avail / 1073741824.0, fr >> 20, b.reserve >> 20, (double) give / 1073741824.0);
+        else
+            std::fprintf(stderr, "glm fast: CUDA%d only %zu MiB free once the expert pool's %.2f GB are written "
+                                 "(reserve %zu MiB): %.2f GB less\n", dev_, fr >> 20, (double) b.avail / 1073741824.0,
+                         b.reserve >> 20, (double) give / 1073741824.0);
+    }
+}
+
+std::vector<Glm5Model::PoolVram> Glm5Model::pool_vram() const {
+    std::vector<PoolVram> v;
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_ != nullptr)
+            v.push_back({m->dev_, (int) (m->pool_b_.reserve >> 20), m->pool_b_.adapted, m->pool_b_.fixed});
+    return v;
 }
 
 bool Glm5Model::has_mtp() const {
