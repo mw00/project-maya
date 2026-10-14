@@ -8,6 +8,7 @@
 // The format: include/strata/kernels/exl3.hpp.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::kernels::cpu {
@@ -34,6 +35,20 @@ void exl3_cpu_band_acc(const Exl3Part& m, const float* xh, int c0, int ks0, int 
 constexpr int kExl3CpuMaxN = 8;
 void exl3_cpu_band_acc_n(const Exl3Part& m, const float* const* xh, int n, int c0, int ks0, int ks1,
                          float* const* acc);
+/// The byte-sum products of the slices [ks0, ks1) for EVERY column (acc: m.n floats, overwritten) - a split-K piece,
+/// whose tile rows lie in memory order where a band's are 1 KB runs a whole tile row apart (from DRAM, ~1.5x the
+/// bands' speed).  Each column's sums are exl3_cpu_band_acc's over the same slices, bit for bit.
+void exl3_cpu_rows_acc(const Exl3Part& m, const float* xh, int ks0, int ks1, float* acc);
+/// ... for n activations at once (xh[i] -> acc[i]), each tile row decoded once; acc[i] is the call for xh[i] alone.
+void exl3_cpu_rows_acc_n(const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, float* const* acc);
+/// The byte-sum products of nb bands from c0 (128 nb columns; acc[i]: 128 nb floats) over every input for any n
+/// activations, as a GEMM: each 256-input chunk of a band decoded once into F32 in `wc` (exl3_cpu_gemm_scratch()
+/// floats, 64-byte aligned, the caller's), then multiplied for all n, the chunk of the activations kept in L2 across
+/// the nb bands - for many tokens an expert (the prompt path), where the band kernels decode a tile row again every
+/// kExl3CpuMaxN.  The same sums as exl3_cpu_band_acc, in its order.
+size_t exl3_cpu_gemm_scratch();
+void exl3_cpu_band_gemm(const Exl3Part& m, const float* const* xh, int n, int c0, int nb, float* const* acc,
+                        float* wc);
 /// ... and, with the parts' acc summed over every slice, the outputs (the codebook's affine form, H, svh).
 void exl3_cpu_band_out(const Exl3Part& m, const float* acc, float xsum, int c0, float* y);
 

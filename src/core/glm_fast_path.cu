@@ -1738,22 +1738,28 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
 }
 
 // ---------------------------------------------------------------- the CPU lane
-// EXL3 on the CPU lane, one (token, expert) entry's rows: the gate and up inputs xh = H(x * suh), the down input, the
-// expert's output, the gate/up byte-sum products per band of 128 columns and half of the inputs, and the down input's
-// block sums.  lane_experts and win_cpu_merged both finish an entry with x3_gate_up_block / x3_down_block - the same
-// code, so a merged window token's answer is lane_experts' bit for bit
+// EXL3 on the CPU lane, one (token, expert) entry's rows: the gate and up inputs xh = H(x * suh) and their 128-value
+// block sums, the down input and its block sums, the expert's output, and the byte-sum products of the split-K pieces:
+// gate/up in pieces of kX3GuIn inputs, down in pieces of kX3DnIn = 128 (one gate/up band), each over every column (the
+// tile rows in memory order: exl3_cpu_rows_acc).  The pieces are fixed, so an entry's answer does not depend on how a
+// pool cuts the work; lane_experts and win_cpu_merged both finish an entry with x3_gate_up_block / x3_down_block - the
+// same code, so a merged window token's answer is lane_experts' bit for bit
 namespace {
+constexpr int kX3GuIn = 256, kX3DnIn = 128;
 struct X3Rows {
     float* p;
     int E, FF;
-    static size_t floats(int E, int FF) { return 3 * (size_t) E + 5 * (size_t) FF + (size_t) FF / 128; }
+    static size_t floats(int E, int FF) {
+        return 3 * (size_t) E + FF + 2 * (size_t) (E / kX3GuIn) * FF + (size_t) (FF / kX3DnIn) * E +
+               2 * (size_t) (E / 128) + (size_t) FF / 128;
+    }
     float* x(int r) const { return p + (size_t) r * E; }
     float* xd() const { return p + 2 * (size_t) E; }
     float* dn() const { return p + 2 * (size_t) E + FF; }
-    float* acc(int r, int b, int h) const {
-        return p + 3 * (size_t) E + FF + (((size_t) r * (FF / 128) + b) * 2 + h) * 128;
-    }
-    float* xds() const { return p + 3 * (size_t) E + 5 * (size_t) FF; }
+    float* gu(int r, int q) const { return p + 3 * (size_t) E + FF + ((size_t) r * (E / kX3GuIn) + q) * FF; }
+    float* dp(int q) const { return gu(2, 0) + (size_t) q * E; }
+    float* xsb(int r) const { return dp(FF / kX3DnIn) + (size_t) r * (E / 128); }
+    float* xds() const { return xsb(2); }
 };
 
 // matrix r (0 gate, 1 up, 2 down) of an EXL3 expert blob
@@ -1769,15 +1775,36 @@ strata::kernels::cpu::Exl3Part x3_part(const uint8_t* blob, const strata::kernel
     return p;
 }
 
-// band b of the gate and up outputs from their summed halves, the clamped swiglu, and that block of the down input
-void x3_gate_up_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part* pt, const float* xs, int b, float lim) {
+// piece q of matrix r (0 gate, 1 up) for the entries R[0..n) of one expert: their inputs' blocks of that piece (x[i]:
+// entry i's token input), then the piece's byte-sum products, the tile rows decoded once for all n
+void x3_gate_up_piece(const X3Rows* R, const float* const* x, int n, const strata::kernels::cpu::Exl3Part& p, int r,
+                      int q) {
+    namespace kc = strata::kernels::cpu;
+    constexpr int kN = Glm5Model::kWinMax;
+    const float* xh[kN];
+    float* acc[kN];
+    for (int i = 0; i < n; ++i) {
+        for (int b = q * (kX3GuIn / 128); b < (q + 1) * (kX3GuIn / 128); ++b)
+            R[i].xsb(r)[b] = kc::exl3_cpu_prepare_block(p.suh + b * 128, x[i] + b * 128, R[i].x(r) + b * 128);
+        xh[i] = R[i].x(r);
+        acc[i] = R[i].gu(r, q);
+    }
+    kc::exl3_cpu_rows_acc_n(p, xh, n, q * (kX3GuIn / 16), (q + 1) * (kX3GuIn / 16), acc);
+}
+
+// band b of the gate and up outputs from their pieces, the clamped swiglu, and that block of the down input
+void x3_gate_up_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part* pt, int b, float lim) {
     namespace kc = strata::kernels::cpu;
     float y[2][128], a[128];
     for (int r = 0; r < 2; ++r) {
-        const float* a0 = R.acc(r, b, 0);
-        const float* a1 = R.acc(r, b, 1);
-        for (int j = 0; j < 128; ++j) a[j] = a0[j] + a1[j];
-        kc::exl3_cpu_band_out(pt[r], a, xs[r], b * 128, y[r]);
+        for (int j = 0; j < 128; ++j) a[j] = 0.0f;
+        for (int q = 0; q < R.E / kX3GuIn; ++q) {
+            const float* aq = R.gu(r, q) + b * 128;
+            for (int j = 0; j < 128; ++j) a[j] += aq[j];
+        }
+        double xs = 0.0;   // (exl3_cpu_prepare's sum)
+        for (int k = 0; k < R.E / 128; ++k) xs += R.xsb(r)[k];
+        kc::exl3_cpu_band_out(pt[r], a, (float) xs, b * 128, y[r]);
     }
     float hb[128];
     for (int j = 0; j < 128; ++j) {
@@ -1791,11 +1818,64 @@ void x3_gate_up_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part* pt,
     R.xds()[b] = kc::exl3_cpu_prepare_block(pt[2].suh + b * 128, hb, R.xd() + (size_t) b * 128);
 }
 
-// band b of the down output from its byte-sum products a
-void x3_down_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part& pd, const float* a, int b) {
+// down piece q (its input is gate/up band q) for the entries R[0..n) of one expert: that band of each, then the
+// piece's byte-sum products, decoded once for all n
+void x3_down_piece(const X3Rows* R, int n, const strata::kernels::cpu::Exl3Part* pt, int q, float lim) {
+    static_assert(kX3DnIn == 128, "a down piece's input is one gate/up band");
+    constexpr int kN = Glm5Model::kWinMax;
+    const float* xh[kN];
+    float* acc[kN];
+    for (int i = 0; i < n; ++i) {
+        x3_gate_up_block(R[i], pt, q, lim);
+        xh[i] = R[i].xd();
+        acc[i] = R[i].dp(q);
+    }
+    strata::kernels::cpu::exl3_cpu_rows_acc_n(pt[2], xh, n, q * (kX3DnIn / 16), (q + 1) * (kX3DnIn / 16), acc);
+}
+
+// band b of the down output from its pieces
+void x3_down_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part& pd, int b) {
+    float a[128];
+    for (int j = 0; j < 128; ++j) a[j] = 0.0f;
+    for (int q = 0; q < R.FF / kX3DnIn; ++q) {
+        const float* aq = R.dp(q) + b * 128;
+        for (int j = 0; j < 128; ++j) a[j] += aq[j];
+    }
     float s = 0.0f;
     for (int j = 0; j < R.FF / 128; ++j) s += R.xds()[j];
     strata::kernels::cpu::exl3_cpu_band_out(pd, a, s, b * 128, R.dn() + (size_t) b * 128);
+}
+
+// n experts through their gate/up pieces gu(i, r, q), down pieces dn(i, q) and output bands out(i, b) as ONE batch of
+// jobs in that order: expert i's down pieces wait for its own gate/up pieces, its bands for its down pieces, never for
+// another expert's - so the phases overlap, where a batch each waited for its slowest job (40 threads, ~6 RAM-tier
+// experts: the down pieces' ~100 jobs took three rounds for two and a third rounds' work).  A job waits only for jobs
+// claimed before it, which run, so the pool cannot deadlock
+template <class GU, class DN, class OUT>
+void x3_jobs(glmfast::Workers& pool, int n, int GQ, int DQ, int DB, const GU& gu, const DN& dn, const OUT& out) {
+    constexpr int kN = 8 * Glm5Model::kWinMax;
+    std::atomic<int> c_gu[kN], c_dn[kN];
+    for (int i = 0; i < n; ++i) {
+        c_gu[i].store(0, std::memory_order_relaxed);
+        c_dn[i].store(0, std::memory_order_relaxed);
+    }
+    const int a = n * 2 * GQ, b = a + n * DQ;
+    pool.run(b + n * DB, [&](int job) {
+        if (job < a) {
+            const int q = job % GQ, r = job / GQ % 2, i = job / GQ / 2;
+            gu(i, r, q);
+            c_gu[i].fetch_add(1, std::memory_order_release);
+        } else if (job < b) {
+            const int i = (job - a) / DQ, q = (job - a) % DQ;
+            while (c_gu[i].load(std::memory_order_acquire) < 2 * GQ) glmfast::cpu_relax();
+            dn(i, q);
+            c_dn[i].fetch_add(1, std::memory_order_release);
+        } else {
+            const int i = (job - b) / DB, k = (job - b) % DB;
+            while (c_dn[i].load(std::memory_order_acquire) < DQ) glmfast::cpu_relax();
+            out(i, k);
+        }
+    });
 }
 }  // namespace
 
@@ -1826,36 +1906,23 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
         return v ? std::max(1, std::min(64, std::atoi(v))) : 0;
     }();
     if (Ly.exl3) {
-        // EXL3 (mul1), in jobs of ~260K weights so a route's few experts still fill the pool: (1) each expert's gate
-        // and up inputs; (2) per expert, matrix, band of 128 columns and half of the inputs, the byte-sum products;
-        // (3) per expert and band, gate and up finished, the clamped swiglu, and that block of the down input; (4) per
-        // expert and band of 128 outputs, the down rows; the weighted sum in i order.  x3: the caller's rows (8
-        // experts' X3Rows), so the two window lanes run at once
-        const int E = n_embd, FF = n_ff, GB = FF / 128, DB = E / 128, KH = E / 32;   // KH: 16-row slices a half
+        // EXL3 (mul1), in split-K pieces of 128-256 K weights (X3Rows), one batch of jobs (x3_jobs): per expert,
+        // matrix and piece of the inputs, those inputs' blocks and the piece's byte-sum products over every column;
+        // per expert and down piece, its gate/up band finished (the clamped swiglu, that block of the down input) and
+        // the piece's products; per expert and band of 128 outputs, the down rows; then the weighted sum in i order.
+        // x3: the caller's rows (8 experts' X3Rows), so the two window lanes run at once
+        const int E = n_embd, FF = n_ff, GQ = E / kX3GuIn, DQ = FF / kX3DnIn, DB = E / 128;
         const size_t per = X3Rows::floats(E, FF);
         const auto rows = [&](int i) { return X3Rows{x3 + (size_t) i * per, E, FF}; };
         const auto part = [&](int i, int r) { return x3_part(blob[i], Ly.xl, r, E, FF); };
-        float xs[8][2];
-        pool.run(2 * ne, [&](int job) {
-            const int i = job >> 1, r = job & 1;
-            xs[i][r] = kc::exl3_cpu_prepare(part(i, r), x, rows(i).x(r));
-        });
-        pool.run(ne * 2 * GB * 2, [&](int job) {
-            const int h = job & 1, b = (job >> 1) % GB, r = (job >> 1) / GB % 2, i = (job >> 1) / GB / 2;
-            kc::exl3_cpu_band_acc(part(i, r), rows(i).x(r), b * 128, h * KH, (h + 1) * KH, rows(i).acc(r, b, h));
-        });
-        pool.run(ne * GB, [&](int job) {
-            const int i = job / GB, b = job % GB;
+        x3_jobs(pool, ne, GQ, DQ, DB, [&](int i, int r, int q) {
+            const X3Rows R = rows(i);
+            x3_gate_up_piece(&R, &x, 1, part(i, r), r, q);
+        }, [&](int i, int q) {
+            const X3Rows R = rows(i);
             const kc::Exl3Part pt[3] = {part(i, 0), part(i, 1), part(i, 2)};
-            x3_gate_up_block(rows(i), pt, xs[i], b, g.swiglu_exp);
-        });
-        pool.run(ne * DB, [&](int job) {
-            const int i = job / DB, b = job % DB;
-            float a[128];
-            const kc::Exl3Part pd = part(i, 2);
-            kc::exl3_cpu_band_acc(pd, rows(i).xd(), b * 128, 0, FF / 16, a);
-            x3_down_block(rows(i), pd, a, b);
-        });
+            x3_down_piece(&R, 1, pt, q, g.swiglu_exp);
+        }, [&](int i, int b) { x3_down_block(rows(i), part(i, 2), b); });
         for (int r = 0; r < E; ++r) {
             float m = 0.0f;
             for (int i = 0; i < ne; ++i) m += w[i] * rows(i).dn()[r];
@@ -1954,11 +2021,11 @@ struct Glm5Model::FastState::WinLane {
 // native_*_rows_split give every token exactly ggml's dot (the multi-token rows are checked bit for bit against it)
 // and each token's sum adds its own experts in its own order: every answer is fast_cpu_experts' for it alone, bit for
 // bit.  STRATA_GLM_WIN_CPU=0: a token a lane instead.
-// EXL3: the same with exl3_cpu_band_acc_n, which decodes each tile row once for all the tokens of an expert (after
+// EXL3: the same with exl3_cpu_rows_acc_n, which decodes each tile row once for all the tokens of an expert (after
 // exllamav3's CPU kernel, which takes up to 4 token rows) - an extra token costs ~0.2 of one (K 3, one thread of a
-// Xeon 6152: 1 / 2 / 4 / 8 tokens 0.061 / 0.068 / 0.090 / 0.138 ms a band).  The kernel is compute-bound (~12
-// instructions a 16-weight row), where the GGUF rows are DRAM-bound, so the second lane's socket adds its cores.  The
-// entries' rows are lane_experts' (X3Rows, x3_gate_up_block, x3_down_block): bit for bit its answers.
+// Xeon 6152: 1 / 2 / 4 / 8 tokens 0.061 / 0.068 / 0.090 / 0.138 ms a band), so the second lane's socket adds its
+// cores.  The entries' rows are lane_experts' (X3Rows, x3_gate_up_piece, x3_down_piece, x3_down_block): bit for bit
+// its answers.
 void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, gf::CpuAnswer* const* ans,
                                const unsigned int* seq) {
     FastState* F = fast_;
@@ -2058,54 +2125,34 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
             kc::native_down_rows_split(nf, ublob[u] + Ly.down_off, hh, u_n[u], o, r0, r1);
         });
     };
-    // EXL3: lane_experts' four steps over a half's entries, the byte-sum products per distinct expert for all its
+    // EXL3: lane_experts' jobs over a half's distinct experts, each piece's byte-sum products for all the expert's
     // tokens at once (jobs claimed in turn: an expert's jobs cost more the more tokens it serves)
-    const int GB = n_ff / 128, DB = n_embd / 128, KH = n_embd / 32;
+    const int GQ = n_embd / kX3GuIn, DQ = n_ff / kX3DnIn, DB = n_embd / 128;
     const size_t x3_per = X3Rows::floats(n_embd, n_ff);
     const auto x3_rows = [&](int e) { return X3Rows{C.x3.data() + (size_t) e * x3_per, n_embd, n_ff}; };
     const auto x3_p = [&](int u, int r) { return x3_part(ublob[u], Ly.xl, r, n_embd, n_ff); };
-    float x3_s[kMaxE][2];
     const auto run_half_x3 = [&](int h, glmfast::Workers& pool) {
         const int* hu = half[h];
         const int n = nh[h];
         if (n == 0) return;
-        int me[kMaxE], mu[kMaxE], M = 0;   // the half's entries and their distinct experts
-        for (int k = 0; k < n; ++k)
-            for (int q = 0; q < u_n[hu[k]]; ++q) {
-                me[M] = u_ent[hu[k]][q];
-                mu[M++] = hu[k];
+        x3_jobs(pool, n, GQ, DQ, DB, [&](int i, int r, int q) {
+            const int u = hu[i];
+            X3Rows R[kWinMax] = {};
+            const float* x[kWinMax];
+            for (int k = 0; k < u_n[u]; ++k) {
+                R[k] = x3_rows(u_ent[u][k]);
+                x[k] = rq[u_ent[u][k] / 8]->x;
             }
-        pool.run(2 * M, [&](int job) {
-            const int m = job >> 1, r = job & 1, e = me[m];
-            x3_s[e][r] = kc::exl3_cpu_prepare(x3_p(mu[m], r), rq[e / 8]->x, x3_rows(e).x(r));
-        });
-        pool.run(n * 2 * GB * 2, [&](int job) {
-            const int hh = job & 1, b = (job >> 1) % GB, r = (job >> 1) / GB % 2, u = hu[(job >> 1) / GB / 2];
-            const float* xh[kWinMax];
-            float* acc[kWinMax];
-            for (int q = 0; q < u_n[u]; ++q) {
-                xh[q] = x3_rows(u_ent[u][q]).x(r);
-                acc[q] = x3_rows(u_ent[u][q]).acc(r, b, hh);
-            }
-            kc::exl3_cpu_band_acc_n(x3_p(u, r), xh, u_n[u], b * 128, hh * KH, (hh + 1) * KH, acc);
-        });
-        pool.run(M * GB, [&](int job) {
-            const int m = job / GB, b = job % GB, e = me[m];
-            const kc::Exl3Part pt[3] = {x3_p(mu[m], 0), x3_p(mu[m], 1), x3_p(mu[m], 2)};
-            x3_gate_up_block(x3_rows(e), pt, x3_s[e], b, g.swiglu_exp);
-        });
-        pool.run(n * DB, [&](int job) {
-            const int u = hu[job / DB], b = job % DB;
-            float a[kWinMax][128];
-            const float* xh[kWinMax];
-            float* acc[kWinMax];
-            for (int q = 0; q < u_n[u]; ++q) {
-                xh[q] = x3_rows(u_ent[u][q]).xd();
-                acc[q] = a[q];
-            }
-            const kc::Exl3Part pd = x3_p(u, 2);
-            kc::exl3_cpu_band_acc_n(pd, xh, u_n[u], b * 128, 0, n_ff / 16, acc);
-            for (int q = 0; q < u_n[u]; ++q) x3_down_block(x3_rows(u_ent[u][q]), pd, a[q], b);
+            x3_gate_up_piece(R, x, u_n[u], x3_p(u, r), r, q);
+        }, [&](int i, int q) {
+            const int u = hu[i];
+            X3Rows R[kWinMax] = {};
+            for (int k = 0; k < u_n[u]; ++k) R[k] = x3_rows(u_ent[u][k]);
+            const kc::Exl3Part pt[3] = {x3_p(u, 0), x3_p(u, 1), x3_p(u, 2)};
+            x3_down_piece(R, u_n[u], pt, q, g.swiglu_exp);
+        }, [&](int i, int b) {
+            const int u = hu[i];
+            for (int k = 0; k < u_n[u]; ++k) x3_down_block(x3_rows(u_ent[u][k]), x3_p(u, 2), b);
         });
     };
     // half 1 on the second lane, half 0 here on the first lane's pool (its thread is idle: no window token is queued)

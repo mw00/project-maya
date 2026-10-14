@@ -19,6 +19,7 @@
 #include "glm_fast_state.hpp"
 
 #include "strata/core/progress.hpp"
+#include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -420,6 +421,7 @@ struct Glm5Model::PrefillState {
     size_t rows_h_n = 0;
     std::vector<uint8_t> c_act, c_hq, c_pack;
     std::vector<float> c_ff;
+    std::vector<float> c_x3;   // EXL3: the CPU rows' inputs, byte sums and down inputs
     uint64_t cpu_experts = 0, cpu_rows = 0;
     double ms_cpu = 0, row_ms = 0.05;   // row_ms: the host's cost of a row, learned (the split's estimate)
     // the split's balance, learned: the host's estimates times kappa, nudged each layer by the host's time over the
@@ -1658,8 +1660,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     }();
     const auto cpu_lane = [&](int il) {
         return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
-               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0 &&
-               !F->L[(size_t) il].exl3;   // (EXL3: no multi-row CPU kernel yet - its staged experts all go over PCIe)
+               (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
     const auto cpu_bufs = [&](int cpu_nrows) {
@@ -2224,6 +2225,136 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         S->mark("plan", s);
         S->ms_plan += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+        // EXL3: the host's experts (cpu_set) on a thread of their own from here, while this one enqueues the staged
+        // experts' copies and products - that loop blocks once the device's launch queue is full, and the host's
+        // experts, queued after it, started near the end of the copies they were planned beside (an 8K prompt on one
+        // 3090: at plan + ~290 of a layer's ~400 ms, ~110 ms of work).  Joined before their outputs go up
+        const auto x3_cpu = [&]() {
+            namespace kc = strata::kernels::cpu;
+            const int ncx = (int) cpu_set.size();
+            std::vector<int> r_of((size_t) ncx);   // each expert's first row in the CPU segment
+            for (int j = 0; j < ncx; ++j) r_of[(size_t) j] = S->h_base[cpu_set[(size_t) j].e] - cpu_r0;
+            // EXL3 (the CPU lane's kernels): per expert and matrix its rows' gate and up inputs; per expert, matrix
+            // and group of bands, the byte sums of all its rows (bands); per expert and band the clamped swiglu and
+            // that block of each row's down input; per expert and group of bands of the outputs, the down rows into
+            // out_h.  The most routed experts' jobs first (cpu_set is in ascending row count), so the pool ends
+            // together
+            const int GB = nff / 128, DB = E / 128, NX = kc::kExl3CpuMaxN;
+            const size_t per = 2 * (size_t) E + 3 * (size_t) nff + (size_t) nff / 128 + 2;
+            if (S->c_x3.size() < (size_t) cpu_nrows * per) S->c_x3.resize((size_t) cpu_nrows * per);
+            float* const X3 = S->c_x3.data();
+            const auto xh = [&](int r, int m) { return X3 + (size_t) r * per + (size_t) m * E; };
+            const auto acc = [&](int r, int m) { return X3 + (size_t) r * per + 2 * (size_t) E + (size_t) m * nff; };
+            const auto xd = [&](int r) { return acc(r, 2); };
+            const auto xds = [&](int r) { return xd(r) + nff; };
+            const auto xsum = [&](int r) { return xds(r) + nff / 128; };
+            const auto part = [&](int j, int m) {
+                const uint8_t* blob = cpu_set[(size_t) j].ram;
+                kc::Exl3Part p;
+                p.trellis = (const uint32_t*) (blob + Ly.xl.trellis[m]);
+                p.suh = (const uint16_t*) (blob + Ly.xl.suh[m]);
+                p.svh = (const uint16_t*) (blob + Ly.xl.svh[m]);
+                p.k = m < 2 ? E : nff;
+                p.n = m < 2 ? nff : E;
+                p.K = Ly.xl.K[m];
+                return p;
+            };
+            // (jobs of an expert's rows: one a row and band were ~175K claims of one counter a layer)
+            F->cpu_pool->run(ncx * 2, [&](int job) {
+                const int j = ncx - 1 - (job >> 1), m = job & 1, r0 = r_of[(size_t) j];
+                const kc::Exl3Part p = part(j, m);
+                for (int r = r0; r < r0 + S->h_counts[cpu_set[(size_t) j].e]; ++r)
+                    xsum(r)[m] = kc::exl3_cpu_prepare(p, S->x_h + (size_t) S->rt_h[r] * E, xh(r, m));
+            });
+            // expert j's rows through the kNB bands from b0 of matrix m (k = the matrix's inputs; out(r): the row's
+            // 128 kNB outputs): up to NX of them from one decode of each tile row, more as a GEMM over each band's
+            // chunks decoded once, the rows' chunk of inputs kept in L2 for all kNB bands (exl3_cpu_band_gemm)
+            constexpr int kNB = 4;
+            const auto bands = [&](int j, int m, int b0, const std::function<const float*(int)>& in,
+                                   const std::function<float*(int)>& out) {
+                const kc::Exl3Part p = part(j, m);
+                const int cnt = S->h_counts[cpu_set[(size_t) j].e], r0 = r_of[(size_t) j];
+                thread_local std::vector<const float*> xp;
+                thread_local std::vector<float*> ap;
+                xp.resize((size_t) cnt);
+                ap.resize((size_t) cnt);
+                for (int i = 0; i < cnt; ++i) {
+                    xp[(size_t) i] = in(r0 + i);
+                    ap[(size_t) i] = out(r0 + i);
+                }
+                if (cnt <= NX) {
+                    thread_local std::vector<float*> bp;
+                    bp.resize((size_t) cnt);
+                    for (int b = 0; b < kNB; ++b) {
+                        for (int i = 0; i < cnt; ++i) bp[(size_t) i] = ap[(size_t) i] + b * 128;
+                        kc::exl3_cpu_band_acc_n(p, xp.data(), cnt, (b0 + b) * 128, 0, p.k / 16, bp.data());
+                    }
+                    return;
+                }
+                thread_local std::vector<float> wc;
+                wc.resize(kc::exl3_cpu_gemm_scratch() + 16);
+                float* const w64 = (float*) (((uintptr_t) wc.data() + 63) & ~(uintptr_t) 63);
+                kc::exl3_cpu_band_gemm(p, xp.data(), cnt, b0 * 128, kNB, ap.data(), w64);
+            };
+            const int GG = GB / kNB, DG = DB / kNB;   // band groups of gate/up, of down
+            F->cpu_pool->run(ncx * 2 * GG, [&](int job) {
+                const int j = ncx - 1 - job / (2 * GG), m = job / GG % 2, b0 = job % GG * kNB;
+                bands(j, m, b0, [&](int r) { return (const float*) xh(r, m); },
+                      [&](int r) { return acc(r, m) + b0 * 128; });
+            });
+            F->cpu_pool->run(ncx * GB, [&](int job) {
+                const int j = ncx - 1 - job / GB, b = job % GB, r0 = r_of[(size_t) j];
+                const kc::Exl3Part pt[3] = {part(j, 0), part(j, 1), part(j, 2)};
+                for (int r = r0; r < r0 + S->h_counts[cpu_set[(size_t) j].e]; ++r) {
+                    float y[2][128], hb[128];
+                    for (int m = 0; m < 2; ++m)
+                        kc::exl3_cpu_band_out(pt[m], acc(r, m) + b * 128, xsum(r)[m], b * 128, y[m]);
+                    const float lim = g.swiglu_exp;
+                    for (int c = 0; c < 128; ++c) {
+                        float gv = y[0][c], uv = y[1][c];
+                        if (lim > 0.0f) {
+                            gv = std::min(gv, lim);
+                            uv = std::min(std::max(uv, -lim), lim);
+                        }
+                        hb[c] = gv / (1.0f + std::exp(-gv)) * uv;
+                    }
+                    xds(r)[b] = kc::exl3_cpu_prepare_block(pt[2].suh + b * 128, hb, xd(r) + (size_t) b * 128);
+                }
+            });
+            F->cpu_pool->run(ncx * DG, [&](int job) {
+                const int j = ncx - 1 - job / DG, b0 = job % DG * kNB;
+                thread_local std::vector<float> a;
+                a.resize((size_t) S->h_counts[cpu_set[(size_t) j].e] * 128 * kNB);
+                const int r0 = r_of[(size_t) j];
+                bands(j, 2, b0, [&](int r) { return (const float*) xd(r); },
+                      [&](int r) { return a.data() + (size_t) (r - r0) * 128 * kNB; });
+                const kc::Exl3Part pd = part(j, 2);
+                for (int t = 0; t < S->h_counts[cpu_set[(size_t) j].e]; ++t) {
+                    float s = 0.0f;
+                    for (int k = 0; k < nff / 128; ++k) s += xds(r0 + t)[k];
+                    for (int b = 0; b < kNB; ++b)
+                        kc::exl3_cpu_band_out(pd, a.data() + ((size_t) t * kNB + b) * 128, s, (b0 + b) * 128,
+                                              S->out_h + (size_t) (r0 + t) * E + (b0 + b) * 128);
+                }
+            });
+        };
+        std::thread x3_th;
+        struct Join {
+            std::thread& t;
+            ~Join() {
+                if (t.joinable()) t.join();
+            }
+        } x3_join{x3_th};
+        bool x3_ok = true;
+        auto x3_t0 = std::chrono::steady_clock::now(), x3_t1 = x3_t0;
+        if (cpu_nrows > 0 && Ly.exl3)
+            x3_th = std::thread([&] {
+                cudaSetDevice(dev_);
+                x3_t0 = std::chrono::steady_clock::now();
+                x3_ok = cudaStreamSynchronize(S->xs) == cudaSuccess;
+                if (x3_ok) x3_cpu();
+                x3_t1 = std::chrono::steady_clock::now();
+            });
 
         // ---- the OUTPUT WINDOW: OUTP row 0 is sorted row wb; rows [w_lo, w_hi) are computed and not yet added into ffn.
         //      A set's rows go in contiguous with what it holds, else the window is added into ffn first (moe_combine_add)
@@ -2656,158 +2787,169 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (cpu_nrows == 0) prestage(next_moe(il + 1));
         if (cpu_nrows > 0) {
             namespace kc = strata::kernels::cpu;
-            const auto tc = std::chrono::steady_clock::now();
+            auto tc = std::chrono::steady_clock::now();
             const auto& nf = F->cpu_fmt[(size_t) il];
             constexpr size_t kA = kc::kNativeActBytes, kH = kc::kNativeHBytes;
             constexpr int kGu = 32, kDn = 64;
-            if (S->c_act.size() < (size_t) cpu_nrows * kA) S->c_act.resize((size_t) cpu_nrows * kA);
-            if (S->c_hq.size() < (size_t) cpu_nrows * kH) S->c_hq.resize((size_t) cpu_nrows * kH);
-            if (S->c_ff.size() < (size_t) cpu_nrows * nff) S->c_ff.resize((size_t) cpu_nrows * nff);
-            if (!glmfast::cuda_ok(cudaStreamSynchronize(S->xs), "glm prompt CPU rows", err)) return false;
             const int ncx = (int) cpu_set.size();
             std::vector<int> r_of((size_t) ncx);   // each expert's first row in the CPU segment
             for (int j = 0; j < ncx; ++j) r_of[(size_t) j] = S->h_base[cpu_set[(size_t) j].e] - cpu_r0;
-            F->cpu_pool->run(cpu_nrows, [&](int r) {
-                kc::native_quant_act(nf, S->x_h + (size_t) S->rt_h[r] * E, S->c_act.data() + (size_t) r * kA);
-            });
-            // experts with enough rows take the multi-row AVX-512 kernel (a weight row unpacked once for all of them,
-            // ~2x ggml's per-pair dots from 8 rows on - kq_avx512.hpp); their activations packed once each
-            static const bool kq_on = [] {
-                const char* v = getenv("STRATA_GLM_KQ");
-                return kc::kq_avx512_ok() && (v == nullptr || std::atoi(v) != 0);
-            }();
-            const auto kq_use = [&](int type, int act_type, int cnt) {
-                return kq_on && kc::kq_type_ok(type) && act_type == 15 /* Q8_K */ && cnt >= (type == 11 ? 8 : 12);
-            };
-            std::vector<size_t> off_a((size_t) ncx, SIZE_MAX), off_h((size_t) ncx, SIZE_MAX);
-            size_t pack_a = 0, pack_h = 0;
-            for (int j = 0; j < ncx; ++j) {
-                const int cnt = S->h_counts[cpu_set[(size_t) j].e];
-                if (kq_use(nf.gu_type, nf.gu_act, cnt)) {
-                    off_a[(size_t) j] = pack_a;
-                    pack_a += (kc::kq_act_bytes(cnt, E) + 63) & ~(size_t) 63;
+            if (Ly.exl3) {
+                x3_th.join();   // (the host's experts, from the plan on)
+                if (!x3_ok) {
+                    err = "glm prefill: the CPU experts' inputs did not come down";
+                    return false;
                 }
-                if (kq_use(nf.d_type, nf.d_act, cnt)) {
-                    off_h[(size_t) j] = pack_h;
-                    pack_h += (kc::kq_act_bytes(cnt, nff) + 63) & ~(size_t) 63;
-                }
-            }
-            if (S->c_pack.size() < pack_a + pack_h + 64) S->c_pack.resize(pack_a + pack_h + 64);
-            uint8_t* pk = (uint8_t*) (((uintptr_t) S->c_pack.data() + 63) & ~(uintptr_t) 63);
-            uint8_t* pk_h = pk + pack_a;
-            const auto pack = [&](bool gu) {
-                F->cpu_pool->run(ncx, [&](int j) {
-                    const size_t off = gu ? off_a[(size_t) j] : off_h[(size_t) j];
-                    if (off == SIZE_MAX) return;
-                    const int cnt = S->h_counts[cpu_set[(size_t) j].e], b = r_of[(size_t) j];
-                    thread_local std::vector<const void*> a;
-                    a.resize((size_t) cnt);
-                    for (int t = 0; t < cnt; ++t)
-                        a[(size_t) t] = gu ? (const void*) (S->c_act.data() + (size_t) (b + t) * kA)
-                                           : (const void*) (S->c_hq.data() + (size_t) (b + t) * kH);
-                    kc::kq_pack_act(a.data(), cnt, gu ? E : nff, (gu ? pk : pk_h) + off);
+                tc = x3_t0;
+                cudaMemcpyAsync(M.OUTPc, S->out_h, (size_t) cpu_nrows * E * sizeof(float), cudaMemcpyHostToDevice,
+                                F->copy);
+            } else {
+                if (S->c_act.size() < (size_t) cpu_nrows * kA) S->c_act.resize((size_t) cpu_nrows * kA);
+                if (S->c_hq.size() < (size_t) cpu_nrows * kH) S->c_hq.resize((size_t) cpu_nrows * kH);
+                if (S->c_ff.size() < (size_t) cpu_nrows * nff) S->c_ff.resize((size_t) cpu_nrows * nff);
+                if (!glmfast::cuda_ok(cudaStreamSynchronize(S->xs), "glm prompt CPU rows", err)) return false;
+                F->cpu_pool->run(cpu_nrows, [&](int r) {
+                    kc::native_quant_act(nf, S->x_h + (size_t) S->rt_h[r] * E, S->c_act.data() + (size_t) r * kA);
                 });
-            };
-            if (pack_a > 0) pack(true);
-            F->cpu_pool->run(ncx * (nff / kGu), [&](int job) {
-                const int j = job % ncx, r0 = (job / ncx) * kGu, b = r_of[(size_t) j];
-                const int cnt = S->h_counts[cpu_set[(size_t) j].e];
-                const uint8_t* blob = cpu_set[(size_t) j].ram;
-                if (off_a[(size_t) j] != SIZE_MAX) {
-                    // gate and up rows [r0, r0 + kGu) for every row of the expert, then the clamped swiglu
-                    thread_local std::vector<float> gu_t;
-                    thread_local std::vector<float*> go, uo;
-                    gu_t.resize((size_t) 2 * cnt * kGu);
-                    go.resize((size_t) cnt);
-                    uo.resize((size_t) cnt);
-                    for (int t = 0; t < cnt; ++t) {
-                        go[(size_t) t] = gu_t.data() + (size_t) t * kGu;
-                        uo[(size_t) t] = gu_t.data() + (size_t) (cnt + t) * kGu;
+                // experts with enough rows take the multi-row AVX-512 kernel (a weight row unpacked once for all of them,
+                // ~2x ggml's per-pair dots from 8 rows on - kq_avx512.hpp); their activations packed once each
+                static const bool kq_on = [] {
+                    const char* v = getenv("STRATA_GLM_KQ");
+                    return kc::kq_avx512_ok() && (v == nullptr || std::atoi(v) != 0);
+                }();
+                const auto kq_use = [&](int type, int act_type, int cnt) {
+                    return kq_on && kc::kq_type_ok(type) && act_type == 15 /* Q8_K */ && cnt >= (type == 11 ? 8 : 12);
+                };
+                std::vector<size_t> off_a((size_t) ncx, SIZE_MAX), off_h((size_t) ncx, SIZE_MAX);
+                size_t pack_a = 0, pack_h = 0;
+                for (int j = 0; j < ncx; ++j) {
+                    const int cnt = S->h_counts[cpu_set[(size_t) j].e];
+                    if (kq_use(nf.gu_type, nf.gu_act, cnt)) {
+                        off_a[(size_t) j] = pack_a;
+                        pack_a += (kc::kq_act_bytes(cnt, E) + 63) & ~(size_t) 63;
                     }
-                    const void* pa = pk + off_a[(size_t) j];
-                    kc::kq_rows_packed(nf.gu_type, blob + (size_t) r0 * nf.gu_row, nf.gu_row, E, pa, cnt, go.data(), 0,
-                                       kGu);
-                    kc::kq_rows_packed(nf.gu_type, blob + Ly.gu_bytes + (size_t) r0 * nf.gu_row, nf.gu_row, E, pa,
-                                       cnt, uo.data(), 0, kGu);
-                    const float lim = g.swiglu_exp;
-                    for (int t = 0; t < cnt; ++t) {
-                        float* ff = S->c_ff.data() + (size_t) (b + t) * nff + r0;
-                        for (int r = 0; r < kGu; ++r) {
-                            const float gg = std::fmin(go[(size_t) t][r], lim);
-                            const float uu = std::fmin(std::fmax(uo[(size_t) t][r], -lim), lim);
-                            ff[r] = (gg / (1.f + std::exp(-gg))) * uu;
+                    if (kq_use(nf.d_type, nf.d_act, cnt)) {
+                        off_h[(size_t) j] = pack_h;
+                        pack_h += (kc::kq_act_bytes(cnt, nff) + 63) & ~(size_t) 63;
+                    }
+                }
+                if (S->c_pack.size() < pack_a + pack_h + 64) S->c_pack.resize(pack_a + pack_h + 64);
+                uint8_t* pk = (uint8_t*) (((uintptr_t) S->c_pack.data() + 63) & ~(uintptr_t) 63);
+                uint8_t* pk_h = pk + pack_a;
+                const auto pack = [&](bool gu) {
+                    F->cpu_pool->run(ncx, [&](int j) {
+                        const size_t off = gu ? off_a[(size_t) j] : off_h[(size_t) j];
+                        if (off == SIZE_MAX) return;
+                        const int cnt = S->h_counts[cpu_set[(size_t) j].e], b = r_of[(size_t) j];
+                        thread_local std::vector<const void*> a;
+                        a.resize((size_t) cnt);
+                        for (int t = 0; t < cnt; ++t)
+                            a[(size_t) t] = gu ? (const void*) (S->c_act.data() + (size_t) (b + t) * kA)
+                                               : (const void*) (S->c_hq.data() + (size_t) (b + t) * kH);
+                        kc::kq_pack_act(a.data(), cnt, gu ? E : nff, (gu ? pk : pk_h) + off);
+                    });
+                };
+                if (pack_a > 0) pack(true);
+                F->cpu_pool->run(ncx * (nff / kGu), [&](int job) {
+                    const int j = job % ncx, r0 = (job / ncx) * kGu, b = r_of[(size_t) j];
+                    const int cnt = S->h_counts[cpu_set[(size_t) j].e];
+                    const uint8_t* blob = cpu_set[(size_t) j].ram;
+                    if (off_a[(size_t) j] != SIZE_MAX) {
+                        // gate and up rows [r0, r0 + kGu) for every row of the expert, then the clamped swiglu
+                        thread_local std::vector<float> gu_t;
+                        thread_local std::vector<float*> go, uo;
+                        gu_t.resize((size_t) 2 * cnt * kGu);
+                        go.resize((size_t) cnt);
+                        uo.resize((size_t) cnt);
+                        for (int t = 0; t < cnt; ++t) {
+                            go[(size_t) t] = gu_t.data() + (size_t) t * kGu;
+                            uo[(size_t) t] = gu_t.data() + (size_t) (cnt + t) * kGu;
                         }
+                        const void* pa = pk + off_a[(size_t) j];
+                        kc::kq_rows_packed(nf.gu_type, blob + (size_t) r0 * nf.gu_row, nf.gu_row, E, pa, cnt, go.data(), 0,
+                                           kGu);
+                        kc::kq_rows_packed(nf.gu_type, blob + Ly.gu_bytes + (size_t) r0 * nf.gu_row, nf.gu_row, E, pa,
+                                           cnt, uo.data(), 0, kGu);
+                        const float lim = g.swiglu_exp;
+                        for (int t = 0; t < cnt; ++t) {
+                            float* ff = S->c_ff.data() + (size_t) (b + t) * nff + r0;
+                            for (int r = 0; r < kGu; ++r) {
+                                const float gg = std::fmin(go[(size_t) t][r], lim);
+                                const float uu = std::fmin(std::fmax(uo[(size_t) t][r], -lim), lim);
+                                ff[r] = (gg / (1.f + std::exp(-gg))) * uu;
+                            }
+                        }
+                        return;
                     }
-                    return;
-                }
-                thread_local std::vector<const void*> a;
-                thread_local std::vector<float*> o;
-                a.resize((size_t) cnt);
-                o.resize((size_t) cnt);
-                for (int t = 0; t < cnt; ++t) {
-                    a[(size_t) t] = S->c_act.data() + (size_t) (b + t) * kA;
-                    o[(size_t) t] = S->c_ff.data() + (size_t) (b + t) * nff;
-                }
-                kc::native_gu_rows_split(nf, blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
-                                         g.swiglu_exp);
-            });
-            F->cpu_pool->run(cpu_nrows, [&](int r) {
-                kc::native_quant_h(nf, S->c_ff.data() + (size_t) r * nff, S->c_hq.data() + (size_t) r * kH);
-            });
-            if (pack_h > 0) pack(false);
-            // the down rows in two parts: the first part's outputs (about two thirds of the rows) go up on the copy
-            // stream while the second part computes
-            int j_split = ncx;
-            for (int j = 0; j < ncx; ++j)
-                if (r_of[(size_t) j] >= cpu_nrows * 2 / 3) {
-                    j_split = j;
-                    break;
-                }
-            const auto down = [&](int j0, int j1) {
-              const int nj = j1 - j0;
-              if (nj <= 0) return;
-              F->cpu_pool->run(nj * (E / kDn), [&](int job) {
-                const int j = j0 + job % nj, r0 = (job / nj) * kDn, b = r_of[(size_t) j];
-                const int cnt = S->h_counts[cpu_set[(size_t) j].e];
-                thread_local std::vector<const void*> h;
-                thread_local std::vector<float*> o;
-                h.resize((size_t) cnt);
-                o.resize((size_t) cnt);
-                const uint8_t* down = cpu_set[(size_t) j].ram + Ly.down_off;
-                if (off_h[(size_t) j] != SIZE_MAX) {
-                    for (int t = 0; t < cnt; ++t) o[(size_t) t] = S->out_h + (size_t) (b + t) * E + r0;
-                    kc::kq_rows_packed(nf.d_type, down + (size_t) r0 * nf.d_row, nf.d_row, nff, pk_h + off_h[(size_t) j],
-                                       cnt, o.data(), 0, kDn);
-                    return;
-                }
-                for (int t = 0; t < cnt; ++t) {
-                    h[(size_t) t] = S->c_hq.data() + (size_t) (b + t) * kH;
-                    o[(size_t) t] = S->out_h + (size_t) (b + t) * E;
-                }
-                kc::native_down_rows_split(nf, down, h.data(), cnt, o.data(), r0, r0 + kDn);
-              });
-            };
-            const auto up = [&](int ra, int rb) {
-                if (rb > ra)
-                    cudaMemcpyAsync(M.OUTPc + (size_t) ra * E, S->out_h + (size_t) ra * E,
-                                    (size_t) (rb - ra) * E * sizeof(float), cudaMemcpyHostToDevice, F->copy);
-            };
-            const int r_split = j_split < ncx ? r_of[(size_t) j_split] : cpu_nrows;
-            down(0, j_split);
-            up(0, r_split);
-            down(j_split, ncx);
-            up(r_split, cpu_nrows);
+                    thread_local std::vector<const void*> a;
+                    thread_local std::vector<float*> o;
+                    a.resize((size_t) cnt);
+                    o.resize((size_t) cnt);
+                    for (int t = 0; t < cnt; ++t) {
+                        a[(size_t) t] = S->c_act.data() + (size_t) (b + t) * kA;
+                        o[(size_t) t] = S->c_ff.data() + (size_t) (b + t) * nff;
+                    }
+                    kc::native_gu_rows_split(nf, blob, blob + Ly.gu_bytes, a.data(), cnt, o.data(), r0, r0 + kGu,
+                                             g.swiglu_exp);
+                });
+                F->cpu_pool->run(cpu_nrows, [&](int r) {
+                    kc::native_quant_h(nf, S->c_ff.data() + (size_t) r * nff, S->c_hq.data() + (size_t) r * kH);
+                });
+                if (pack_h > 0) pack(false);
+                // the down rows in two parts: the first part's outputs (about two thirds of the rows) go up on the copy
+                // stream while the second part computes
+                int j_split = ncx;
+                for (int j = 0; j < ncx; ++j)
+                    if (r_of[(size_t) j] >= cpu_nrows * 2 / 3) {
+                        j_split = j;
+                        break;
+                    }
+                const auto down = [&](int j0, int j1) {
+                  const int nj = j1 - j0;
+                  if (nj <= 0) return;
+                  F->cpu_pool->run(nj * (E / kDn), [&](int job) {
+                    const int j = j0 + job % nj, r0 = (job / nj) * kDn, b = r_of[(size_t) j];
+                    const int cnt = S->h_counts[cpu_set[(size_t) j].e];
+                    thread_local std::vector<const void*> h;
+                    thread_local std::vector<float*> o;
+                    h.resize((size_t) cnt);
+                    o.resize((size_t) cnt);
+                    const uint8_t* down = cpu_set[(size_t) j].ram + Ly.down_off;
+                    if (off_h[(size_t) j] != SIZE_MAX) {
+                        for (int t = 0; t < cnt; ++t) o[(size_t) t] = S->out_h + (size_t) (b + t) * E + r0;
+                        kc::kq_rows_packed(nf.d_type, down + (size_t) r0 * nf.d_row, nf.d_row, nff, pk_h + off_h[(size_t) j],
+                                           cnt, o.data(), 0, kDn);
+                        return;
+                    }
+                    for (int t = 0; t < cnt; ++t) {
+                        h[(size_t) t] = S->c_hq.data() + (size_t) (b + t) * kH;
+                        o[(size_t) t] = S->out_h + (size_t) (b + t) * E;
+                    }
+                    kc::native_down_rows_split(nf, down, h.data(), cnt, o.data(), r0, r0 + kDn);
+                  });
+                };
+                const auto up = [&](int ra, int rb) {
+                    if (rb > ra)
+                        cudaMemcpyAsync(M.OUTPc + (size_t) ra * E, S->out_h + (size_t) ra * E,
+                                        (size_t) (rb - ra) * E * sizeof(float), cudaMemcpyHostToDevice, F->copy);
+                };
+                const int r_split = j_split < ncx ? r_of[(size_t) j_split] : cpu_nrows;
+                down(0, j_split);
+                up(0, r_split);
+                down(j_split, ncx);
+                up(r_split, cpu_nrows);
+            }
             cudaEventRecord(S->ev_out, F->copy);
             cudaStreamWaitEvent(s, S->ev_out, 0);   // (the combine reads them; the next layer's x overwrites x after)
             prestage(next_moe(il + 1));
-            const double dt = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
+            const auto tend = Ly.exl3 ? x3_t1 : std::chrono::steady_clock::now();   // the host's experts' end
+            const double dt = std::chrono::duration<double, std::milli>(tend - tc).count();
             S->cpu_experts += (uint64_t) ncx;
             S->cpu_rows += (uint64_t) cpu_nrows;
             S->ms_cpu += dt;
             if (S->trace) {
                 S->tr[(size_t) il].dcpu = dt;
-                S->tr[(size_t) il].dl =
-                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+                S->tr[(size_t) il].dl = std::chrono::duration<double, std::milli>(tend - tp).count();
             }
             if (cpu_nrows >= 64)   // (a layer with a few rows says little about the per-row cost)
                 S->row_ms = 0.5 * S->row_ms +
@@ -2815,7 +2957,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // the balance: when the copy stream's staged copies ended against when the host's experts did, both from
             // the plan's start (prestage copies it still owed and x's way down included)
             if (n_staged_pcie > 0) {
-                const double dl = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+                const double dl = std::chrono::duration<double, std::milli>(tend - tp).count();
                 cudaEventSynchronize(S->ev_c1);
                 float pc = 0.0f;
                 if (cudaEventElapsedTime(&pc, S->ev_c0, S->ev_c1) == cudaSuccess && pc > 1.0f && dl > 1.0)
@@ -2826,7 +2968,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             // difference; else (the plan balanced the two) the same
             // (not the chunk's first MoE layer: its copies had the dense layers before it too)
             if (pre_n > 0 && il != next_moe(l0_)) {
-                const double dl = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tp).count();
+                const double dl = std::chrono::duration<double, std::milli>(tend - tp).count();
                 cudaEventSynchronize(S->ev_c1);
                 float landed = 0.0f, pc = 0.0f, pt = 0.0f;
                 if (cudaEventElapsedTime(&landed, S->ev_c0, S->ev_pready) == cudaSuccess &&

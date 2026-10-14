@@ -789,6 +789,114 @@ void test_cpu_n(int k, int n, int K) {
     if (diff != 0) ++g_fail;
 }
 
+// the CPU lane's split-K pieces (every column, slices [ks0, ks1)) against the bands over the same slices, and for
+// several activations at once against one call each: the same bits
+void test_cpu_rows(int k, int n, int K) {
+    HostMat h = make_mat(k, n, K, 2);
+    cpu::Exl3Part m;
+    m.trellis = h.tr.data();
+    m.suh = h.suh.data();
+    m.svh = h.svh.data();
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    constexpr int NT = 11;
+    std::vector<std::vector<float>> xh;
+    const float* xp[NT];
+    for (int i = 0; i < NT; ++i) xh.push_back(rand_x(k));
+    for (int i = 0; i < NT; ++i) xp[i] = xh[(size_t) i].data();
+    std::vector<float> band(128), one((size_t) NT * n), all((size_t) NT * n);
+    float* ap[NT];
+    for (int i = 0; i < NT; ++i) ap[i] = all.data() + (size_t) i * n;
+    size_t diff = 0;
+    for (int nt = 1; nt <= NT; ++nt) {
+        const int ks0 = nt % 3, ks1 = k / 16 - (nt % 2);
+        for (int i = 0; i < nt; ++i) {
+            cpu::exl3_cpu_rows_acc(m, xp[i], ks0, ks1, one.data() + (size_t) i * n);
+            for (int c0 = 0; c0 < n; c0 += 128) {
+                cpu::exl3_cpu_band_acc(m, xp[i], c0, ks0, ks1, band.data());
+                for (int j = 0; j < 128; ++j)
+                    diff += std::memcmp(&band[(size_t) j], &one[(size_t) i * n + c0 + j], sizeof(float)) != 0;
+            }
+        }
+        if (nt > 1) {
+            cpu::exl3_cpu_rows_acc_n(m, xp, nt, ks0, ks1, ap);
+            for (size_t i = 0; i < (size_t) nt * n; ++i) diff += std::memcmp(&one[i], &all[i], sizeof(float)) != 0;
+        }
+    }
+    const std::string what = "cpu rows x1..11 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
+    std::printf("  %-44s %zu differ from the bands / one call each  %s\n", what.c_str(), diff, diff == 0 ? "ok" : "FAIL");
+    if (diff != 0) ++g_fail;
+}
+
+// the CPU lane's input block (x * suh, the 128-point transform) against the scalar transform: the same bits
+void test_cpu_had() {
+    size_t diff = 0;
+    for (int rep = 0; rep < 64; ++rep) {
+        std::vector<float> x = rand_x(128, 3.0f), want(128), got(128);
+        std::vector<uint16_t> suh(128);
+        for (int i = 0; i < 128; ++i) suh[(size_t) i] = (uint16_t) (0x3800 + (rep * 131 + i * 37) % 0x800);   // [0.5, 1)
+        for (int i = 0; i < 128; ++i) want[(size_t) i] = x[(size_t) i] * strata::kernels::f32_from_f16(suh[(size_t) i]);
+        for (int h = 1; h < 128; h <<= 1)
+            for (int i = 0; i < 128; i += 2 * h)
+                for (int j = i; j < i + h; ++j) {
+                    const float a = want[(size_t) j], b = want[(size_t) (j + h)];
+                    want[(size_t) j] = a + b;
+                    want[(size_t) (j + h)] = a - b;
+                }
+        for (int i = 0; i < 128; ++i) want[(size_t) i] *= 0.088388347648f;
+        cpu::exl3_cpu_prepare_block(suh.data(), x.data(), got.data());
+        for (int i = 0; i < 128; ++i) diff += std::memcmp(&want[(size_t) i], &got[(size_t) i], sizeof(float)) != 0;
+    }
+    std::printf("  %-44s %zu of 8192 differ from the scalar transform  %s\n", "cpu input blocks (128-point transform)",
+                diff, diff == 0 ? "ok" : "FAIL");
+    if (diff != 0) ++g_fail;
+}
+
+// the prompt path's CPU GEMM (a band decoded once for many activations) against the band kernel: the same sums up to
+// F32 rounding (another order)
+void test_cpu_gemm(int k, int n, int K) {
+    HostMat h = make_mat(k, n, K, 2);
+    cpu::Exl3Part m;
+    m.trellis = h.tr.data();
+    m.suh = h.suh.data();
+    m.svh = h.svh.data();
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    constexpr int NT = 21;   // 3 tiles of 6 and 3 left over
+    std::vector<std::vector<float>> xh;
+    const float* xp[NT];
+    for (int i = 0; i < NT; ++i) xh.push_back(rand_x(k));
+    for (int i = 0; i < NT; ++i) xp[i] = xh[(size_t) i].data();
+    std::vector<float> one(128), all((size_t) NT * 128), wc(cpu::exl3_cpu_gemm_scratch() + 16);
+    float* const w64 = (float*) (((uintptr_t) wc.data() + 63) & ~(uintptr_t) 63);
+    float* ap[NT];
+    for (int i = 0; i < NT; ++i) ap[i] = all.data() + (size_t) i * 128;
+    double worst = 0.0;
+    for (int nb : {1, 2}) {
+        all.assign((size_t) NT * 128 * nb, 0.0f);
+        for (int i = 0; i < NT; ++i) ap[i] = all.data() + (size_t) i * 128 * nb;
+        for (int c0 = 0; c0 + 128 * nb <= n; c0 += 128 * nb) {
+            cpu::exl3_cpu_band_gemm(m, xp, NT, c0, nb, ap, w64);
+            for (int i = 0; i < NT; ++i)
+                for (int b = 0; b < nb; ++b) {
+                    cpu::exl3_cpu_band_acc(m, xp[i], c0 + 128 * b, 0, k / 16, one.data());
+                    double mx = 0.0, d = 0.0;
+                    for (int j = 0; j < 128; ++j) {
+                        mx = std::max(mx, (double) std::fabs(one[(size_t) j]));
+                        d = std::max(d, (double) std::fabs(one[(size_t) j] - ap[i][128 * b + j]));
+                    }
+                    worst = std::max(worst, d / std::max(mx, 1e-30));
+                }
+        }
+    }
+    const std::string what = "cpu gemm x21 nb1,2 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
+    const bool ok = worst < 1e-5;
+    std::printf("  %-44s worst %.2e of the band's largest  %s\n", what.c_str(), worst, ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+}
+
 // the CPU lane's kernel (mul1) against the reference: every band of a k x n matrix
 void test_cpu(int k, int n, int K) {
     HostMat h = make_mat(k, n, K, 2);
@@ -847,6 +955,9 @@ int main() {
     test_win(3, 1, 2);
     test_win(3, 2, 16);
     for (int K : {1, 3, 6, 8}) test_cpu_n(512, 256, K);
+    for (int K : {2, 3, 4, 5, 8}) test_cpu_rows(512, 384, K);
+    for (int K : {3, 4, 6}) test_cpu_gemm(768, 256, K);
+    test_cpu_had();
     std::printf("exl3_test: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok", g_fail,
                 ex::launch_errors());
     return g_fail || ex::launch_errors() ? 1 : 0;
