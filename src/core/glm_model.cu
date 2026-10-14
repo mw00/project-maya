@@ -203,6 +203,28 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
     return true;
 }
 
+// the keep16 rows the fast path reads ONLY through q() (a q8_1 activation dotted against the weights; glm_fast_path.cu
+// resolves these names from ws_map_ alone, never from w16_): at load such a row gets its Q8_0 copy INSTEAD of the
+// BF16 one.  Every other keep16 row - the routers, hc_*_fn, the ssm gates, the indexer, attn_k_b / attn_v_b (b16()),
+// and attn_q_a / attn_kv_a_mqa (q_or_b16(), which wants the exact BF16 over a requantized twin) - keeps only its
+// BF16 copy.  The suffix after the "blk.N." prefix must match exactly: indexer.attn_q_b.weight is a b16() row and
+// must not match attn_q_b.weight.
+static bool keep16_q_only(const std::string& name) {
+    size_t b = 0;
+    if (name.rfind("blk.", 0) == 0) {
+        const size_t dot = name.find('.', 4);
+        if (dot == std::string::npos) return false;
+        b = dot + 1;
+    }
+    const char* const q_only[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_q_b.weight",
+                                  "attn_output.weight", "output.weight",
+                                  "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                                  "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
+    for (const char* n : q_only)
+        if (name.compare(b, name.size() - b, n) == 0) return true;
+    return false;
+}
+
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
 // token_embd on the host (the embedding row is dequantized there from the shard mapping)
@@ -210,11 +232,14 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind, 
                               std::string* how = nullptr) {
     if (fast && name == "token_embd.weight") return 0;
     if (fast && kind == "4" && t->elements() >= 65536) {
-        // BF16 row + the Q8_0 twin the fast path's q() slots read (see the keep16 branch)
-        if (how) *how = " bf16+q8";
         const uint64_t ne = (uint64_t) t->elements();
-        const uint64_t q8 = (ne / 32) * 34 + (ne % 32 ? 34 : 0);
-        return (((ne * 2) + 255u) & ~(uint64_t) 255u) + ((q8 + 255u) & ~(uint64_t) 255u);
+        const uint64_t q8 = (ne / 32) * 34 + (ne % 32 ? 34 : 0);   // the Q8_0 copy's bytes
+        if (keep16_q_only(name)) {   // only q() reads it: the Q8_0 copy replaces the BF16 one
+            if (how) *how = " q8";
+            return (q8 + 255u) & ~(uint64_t) 255u;
+        }
+        if (how) *how = " bf16";     // b16()/q_or_b16() read it: BF16 only, as before the twins
+        return ((ne * 2) + 255u) & ~(uint64_t) 255u;
     }
     if (kind != "0" || name == "attn_k_b.weight" || name == "attn_v_b.weight") {
         if (how) *how = " f32";
@@ -2956,13 +2981,12 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 err = "pack: short read on dense.bin for " + r.name;
                 return false;
             }
-            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
-            w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
-            // experts-only community quants keep the attention/dense-FFN projections BF16.  The
-            // fast path's q() slots dot those weights against a q8_1 activation, so a BF16 row
-            // cannot serve them; quantize the row to Q8_0 on the host and register that copy in
-            // ws_map_ (type 8; mv_type_ok accepts it).  The BF16 copy above still serves b16().
-            {
+            if (keep16_q_only(r.name)) {
+                // experts-only community quants keep the attention/dense-FFN projections (and the head)
+                // BF16.  The fast path's q() slots dot those weights against a q8_1 activation, so a
+                // BF16 row cannot serve them; quantize the row to Q8_0 on the host and register ONLY
+                // that copy in ws_map_ (type 8; mv_type_ok accepts it) - no BF16 copy is uploaded,
+                // nothing reads one (b16()/q_or_b16() are never called on these names).
                 const uint64_t ne = (uint64_t) t->elements();
                 const size_t nblocks = (size_t) ((ne + 31) / 32);
                 std::vector<uint8_t> q8(nblocks * 34);
@@ -2993,7 +3017,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                     }
                 }
                 const size_t qbytes = q8.size();
-                const uint64_t qat = ((at + (uint64_t) r.bytes) + 255u) & ~(uint64_t) 255u;
+                const uint64_t qat = (at + 255u) & ~(uint64_t) 255u;
                 { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + qat, q8.data(), qbytes,
                                               cudaMemcpyHostToDevice);
                   if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
@@ -3001,7 +3025,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                     (const void*) ((uint8_t*) w_arena_ + qat),
                     (int64_t) t->shape[0], (int64_t) t->shape[1]};
                 at = qat + ((qbytes + 255u) & ~(uint64_t) 255u);
+                continue;
             }
+            // every other keep16 row keeps ONLY its BF16 copy (b16() reads the routers, hc_*_fn, the
+            // ssm gates, the indexer, attn_k_b / attn_v_b; q_or_b16() reads attn_q_a / attn_kv_a_mqa
+            // and prefers the exact BF16 to a requantized twin).  No Q8_0 twin: nothing reads one.
+            { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+            w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
+            at += (r.bytes + 255u) & ~(uint64_t) 255u;
             continue;
         }
         if (!dequant_at_load(r.name)) {
