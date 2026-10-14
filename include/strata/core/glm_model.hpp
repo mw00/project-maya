@@ -880,6 +880,9 @@ public:
     void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
     size_t pool_short_ = 0;                                // what that check found short of the reserve
     PoolBudget pool_b_;                                    // the budget the pool was carved from
+    // the slots a layer must keep while the pool lends the prompt path: one route's experts, the device's spares, +2
+    // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
+    static int pool_keep(int n_exp_used);
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)

@@ -1107,11 +1107,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (pf_ != nullptr) {
             k_extra = tail_slots(prefill_borrow_bytes());
             // (the prestage buffer is the part that can shrink: to what the pool can lend, else none)
-            const int k_max = per - (g.n_exp_used + gf::kSpares + 2);
+            const int k_keep = pool_keep(g.n_exp_used);
+            const int k_max = per - k_keep;
             if (k_extra > k_max && k_max > 0) k_extra = tail_slots(prefill_trim_prestage((size_t) k_max * stride_sum));
             // (a prompt runs alone - no decode beside it, unlike the vision encoder's lending below - so its main
             // slots need little more than one route's experts and the spares)
-            if (per - k_extra < g.n_exp_used + gf::kSpares + 2) {
+            if (per - k_extra < k_keep) {
                 std::fprintf(stderr, "glm prefill: CUDA%d the pool (%d slots/layer) cannot lend %zu MB - token by token\n",
                              dev_, per, prefill_borrow_bytes() >> 20);
                 prefill_destroy();
@@ -5815,6 +5816,21 @@ std::vector<Glm5Model::PoolVram> Glm5Model::pool_vram() const {
         if (m->fast_ != nullptr)
             v.push_back({m->dev_, (int) (m->pool_b_.reserve >> 20), m->pool_b_.adapted, m->pool_b_.fixed});
     return v;
+}
+
+// The floor a lend leaves the pool: a layer keeps one route's experts and the device's spares, +2 for the token that
+// lands as the loan is taken back (Strata's number, the same in the prompt path's sizing, the lend and its refusal).
+// STRATA_GLM_PREFILL_KEEP=<slots> lowers it - the prompt path's buffers then take more of the pool and the chunk
+// grows, at the resident cache's expense (the tail still serves decode between prompts); route + spares is the floor
+// the pool's own sizing needs (fast_setup's `need`), so a smaller number is clamped up, not obeyed.
+int Glm5Model::pool_keep(int n_exp_used) {
+    const int floor_slots = n_exp_used + gf::kSpares;
+    int keep = floor_slots + 2;
+    if (const char* v = getenv("STRATA_GLM_PREFILL_KEEP")) {
+        const int want = std::atoi(v);
+        if (want > 0) keep = std::max(floor_slots, want);
+    }
+    return keep;
 }
 
 bool Glm5Model::has_mtp() const {
