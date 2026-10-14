@@ -195,6 +195,13 @@ class GpuMap(unittest.TestCase):
         self.assertEqual(g["free"], g["total"] - own - other)
         self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
 
+    def test_the_drivers_reserve_is_not_another_program(self):
+        # (9 GPUs, the engine alone on each: NVML's used memory ~0.58 GB beyond its process - the driver's reserve)
+        engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own, reserve = engine + 500 * 2**20, 590 * 2**20
+        (g,) = self.gm.view([self.r], [self.card(own + reserve, {100: own})], engine_pid=100)
+        self.assertEqual((g["parts"]["other"], g["parts"]["rest"]), (0, 500 * 2**20 + reserve))
+
     def test_found_by_pci_not_by_place(self):
         cards = [self.card(1 * GB, {}, index=0, pci="0000:02:00"), self.card(23 * GB, {100: 22 * GB}, index=1)]
         (g,) = self.gm.view([self.r], cards, engine_pid=100)

@@ -368,7 +368,7 @@ function gpuDetail(g, segs, m) {
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
       .filter(Boolean).join(" · "),
     vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
-    rest: "the driver's context, conversation snapshots and small buffers",
+    rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
     free: (g.free || 0) < 1.5 * GIB ? "kept free for the driver and the sampler" : "unused",
   };

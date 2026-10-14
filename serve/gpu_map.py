@@ -1,7 +1,8 @@
 """The Monitor's map of a GPU ("What fills the GPU"): the GLM engine's VRAM lines - what each part of the model holds on
 its card, measured once it has loaded - joined with what NVML sees on that card now: the engine's own process, the
 vision encoder's, other programs and the free memory.  What the engine's parts do not explain of its own process is the
-CUDA context and the small buffers (the conversation snapshots, the KV streaming maps, the sampler)."""
+CUDA context and the small buffers (the conversation snapshots, the KV streaming maps, the sampler); with the memory the
+driver keeps outside every process (its reserve), that is "CUDA and the rest"."""
 from __future__ import annotations
 
 # the VRAM line's byte counts (Glm5Model::VramReport, src/program/generate.cpp)
@@ -82,8 +83,11 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
         if used is None:                                 # (no NVML: that measurement - a lent tail moved, not added)
             used = start
         if own is not None:                              # (NVML says what the engine's process holds here)
-            rest = max(0, own - engine)
-            other = max(0, used - own - (enc or 0))
+            # other programs: what other processes hold, as NVML lists them - the card's used memory beyond every
+            # process (the driver's reserve, ~0.45 GB a card; what it keeps outside them) is the rest's, not theirs
+            held = [b for pid, b in procs.items() if pid not in (engine_pid, vision_pid)]
+            other = sum(held) if None not in held else max(0, used - own - (enc or 0))
+            rest = max(0, used - engine - (enc or 0) - other)
         else:                                            # (it can't: what the parts did not explain at the start -
             rest = max(0, start - engine - (vision if lent else 0))   # other programs then among it)
             other = max(0, used - engine - rest - vision)
