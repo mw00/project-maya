@@ -192,37 +192,20 @@ class Plan:
         """The floats added since index n0 go into maya-exl3.gguf but not into index.txt / dense.bin."""
         self.floats[n0:] = [(n, sh, ty + ":gguf", fn) for n, sh, ty, fn in self.floats[n0:]]
 
-    def stname(self, hf: str) -> str:
-        """The first tensor name present: hf, else hf with any of its '.'-parts swapped for alternatives.
-        neko-legends' experts-only quant keeps the KDA projections unfused (q_proj / k_proj / v_proj
-        separately) where Maya's own quants fuse them (qkv_proj)."""
-        st = self.st
-        if st.has(hf + ".trellis") or st.has(hf + ".weight"):
-            return hf
-        alts = {"qkv_proj": ("q_proj", "k_proj", "v_proj")}
-        for full, parts in alts.items():
-            tail = "." + full
-            if hf.endswith(tail):
-                base = hf[: -len(tail)]
-                if all(st.has(base + "." + p + ".weight") for p in parts):
-                    return base + "." + full  # virtual: build() special-cases the split
-        return hf
-
     def mat(self, gname: str, hf: str):
         st = self.st
         if not st.has(hf + ".trellis"):
             if st.has(hf + ".weight"):
-                # an unquantized matrix (neko-legends' 4bpw quantizes the routed experts only): a float
-                # row - the engine's matmul serves F32 and BF16 rows as well as EXL3 ones
+                # an unquantized matrix (neko-legends' 4bpw quantizes the routed experts only): a BF16
+                # float row - the engine's matmul serves BF16 rows as well as EXL3 ones, and the rows
+                # only q() reads become Q8_0 at load (F32/F16 sources convert here, at pack time)
                 dt, shp = st.t[hf + ".weight"][1], st.t[hf + ".weight"][2]
                 if dt not in ("F32", "F16", "BF16"):
-                    raise SystemExit("%s is %s; the packer needs it F32/F16/BF16 to store it unquantized" % (hf, dt))
+                    raise SystemExit("%s is %s; the packer needs it F32/F16/BF16 to store it as a BF16 float row"
+                                     % (hf, dt))
                 g = lambda hf=hf: st.f32(hf + ".weight")  # noqa: E731
-                if dt in ("BF16", "F16"):
-                    self.bf16(gname, list(reversed(shp)), g)
-                else:
-                    self.f32(gname, list(reversed(shp)), g)
-                self.notes.append("%s stored unquantized (%s in the source) - a float row, served dequantized"
+                self.bf16(gname, list(reversed(shp)), g)
+                self.notes.append("%s stored unquantized (%s in the source) - a BF16 float row, served dequantized"
                                   % (hf, dt))
                 return
             raise SystemExit("%s: no tensor %s.trellis" % (gname, hf))
