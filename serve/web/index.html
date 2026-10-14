@@ -195,12 +195,19 @@
         <p class="tier-advice muted small" id="tier-advice" hidden></p>
       </div>
 
-      <div class="st-card gpus-card" id="gpus-card" hidden>
-        <div class="card-head"><span class="card-title">GPUs</span><span class="muted small" id="gpus-sub"></span></div>
-        <div class="table-wrap">
-          <table class="st-table"><thead><tr><th>GPU</th><th class="num">Load</th><th class="num">VRAM</th><th class="num">Power</th>
-            <th class="num">Temp</th><th class="num">PCIe</th></tr></thead><tbody id="gpus-body"></tbody></table>
+      <!-- the GPUs: what fills each (the GLM engine's VRAM lines and NVML's processes) and, with several, each one's load,
+           power, temperature and PCIe link.  A row a GPU, the parts' colours once above them, a row's own parts when
+           opened; an engine without VRAM lines: NVML's memory only, from five GPUs (app.js renderGpuMap) -->
+      <div class="st-card gpumap-card" id="gpumap-card" hidden>
+        <div class="card-head">
+          <span class="card-title" id="gpumap-title">What fills the GPU</span>
+          <span class="muted small" id="gpumap-sub"></span>
         </div>
+        <div class="gpukey" id="gpukey" hidden></div>
+        <div class="gpurows" id="gpurows"></div>
+        <p class="gpumap-now muted small" id="gpumap-now" hidden></p>
+        <p class="tier-advice muted small" id="gpumap-advice" hidden></p>
+        <div class="gpubar-tip" id="gpubar-tip" role="tooltip" hidden></div>
       </div>
 
       <div class="section-title">Hardware</div>

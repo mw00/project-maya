@@ -261,6 +261,7 @@ struct Glm5Model::FastState {
     int* pf_n_buf[2] = {nullptr, nullptr};
     void* arena = nullptr;
     size_t arena_bytes = 0;
+    size_t scratch_bytes = 0, win_bytes = 0;   // the scratch slots; the verify window's buffers (the VRAM report)
     // activations (device)
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
     float* part = nullptr;

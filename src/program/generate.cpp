@@ -1023,6 +1023,17 @@ static int glm_pack_generate(const Options& o) {
                     (long long) (st.pool_gb * 1024.0), model.geometry().n_expert * (model.geometry().n_layers - model.geometry().dense_lead),
                     (long long) st.pool_slots, st.pool_gb, (long long) st.ram_slots, st.ram_gb, model.has_mtp() ? 1 : 0,
                     model.dflash_ready() ? 1 : 0, model.vision_lend_bytes(), model.cpu_lane_threads(), model.pcie_share());
+        // the Monitor's map of each GPU: what each part holds on its card, in bytes (Glm5Model::VramReport) - the
+        // server finds the card NVML numbers by its PCI address and adds what NVML sees besides
+        for (const auto& r : model.vram_report())
+            std::printf("VRAM dev=%d pci=%s total=%llu free=%llu weights=%llu kv=%llu kv_ram=%llu act=%llu drafter=%llu "
+                        "window=%llu pool=%llu tail=%llu borrow=%llu vision=%llu slots=%lld ctx=%lld layers=%d-%d\n",
+                        r.dev, r.pci.empty() ? "-" : r.pci.c_str(), (unsigned long long) r.total,
+                        (unsigned long long) r.free, (unsigned long long) r.weights, (unsigned long long) r.kv,
+                        (unsigned long long) r.kv_ram, (unsigned long long) r.act, (unsigned long long) r.drafter,
+                        (unsigned long long) r.window, (unsigned long long) r.pool, (unsigned long long) r.tail,
+                        (unsigned long long) r.borrow, (unsigned long long) r.vision, (long long) r.slots,
+                        (long long) r.ctx, r.l0, r.l1);
     }
 
     strata::kernels::SamplerParams sp;

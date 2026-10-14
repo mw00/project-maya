@@ -912,6 +912,9 @@ bool Glm5Model::fast_setup(std::string& err) {
     }
 
     // a DFlash drafter: the verify window's buffers and the recurrent-state backup before the pool takes the VRAM
+    // (what they and the MTP decode's below take, measured for the VRAM report)
+    size_t win_free0 = 0, win_total = 0;
+    cudaMemGetInfo(&win_free0, &win_total);
     if (dflash_on_ && !win_reserve(err)) return false;
     // the one-GPU MTP decode (glm_mtp.cu; load_pack loaded the NextN block for it): the same window, the NextN cache
     // fill's rows, the draft head and the chain's token_embd - before the pool too; without them, token by token
@@ -923,6 +926,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         } else {
             std::fprintf(stderr, "glm mtp: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
         }
+    }
+    {
+        size_t f1 = 0, t1 = 0;
+        cudaMemGetInfo(&f1, &t1);
+        F->win_bytes = win_free0 > f1 ? win_free0 - f1 : 0;
     }
     // ---- the expert pool: per-layer partitions (equal quota per layer within its size class)
     size_t blob_max = 0;
@@ -941,6 +949,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             err = "glm fast: the scratch slots did not allocate";
             return false;
         }
+        F->scratch_bytes = 8 * sstride;
         {
             unsigned long long sp[8];
             for (int i = 0; i < 8; ++i) sp[i] = (unsigned long long) (F->scratch + (size_t) i * sstride);
@@ -3476,6 +3485,45 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
         s.ms = fast_->ms;
     }
     return s;
+}
+
+std::vector<Glm5Model::VramReport> Glm5Model::vram_report() const {
+    std::vector<VramReport> out;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        const FastState* F = m->fast_;
+        VramReport r;
+        r.dev = m->dev_;
+        cudaSetDevice(m->dev_);
+        size_t fr = 0, tot = 0;
+        if (cudaMemGetInfo(&fr, &tot) == cudaSuccess) {
+            r.free = fr;
+            r.total = tot;
+        }
+        char bus[32] = {};
+        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, m->dev_) == cudaSuccess) r.pci = bus;
+        cudaGetLastError();
+        r.weights = m->w_arena_bytes_;
+        r.kv = m->state_bytes_;
+        r.kv_ram = m->kv_ != nullptr ? m->kv_->host_bytes : 0;
+        r.act = m->sc_bytes_ + (F != nullptr ? F->arena_bytes + F->scratch_bytes : 0);
+        r.drafter = m->mtp_arena_bytes_ + (m->dflash_ ? m->dflash_->bytes() : 0);
+        if (F != nullptr) {
+            r.window = F->win_bytes;
+            r.pool = F->pool_bytes;
+            r.tail = F->xpool_bytes;
+            r.slots = F->pool_slots;
+        }
+        r.borrow = m->prefill_borrow_bytes();
+        r.vision = m->vision_lend_bytes();
+        r.ctx = m->max_ctx_;
+        r.l0 = m->l0_;
+        r.l1 = m->l1_;
+        out.push_back(r);
+    }
+    cudaSetDevice(cur);
+    return out;
 }
 
 // ---------------------------------------------------------------- the service thread

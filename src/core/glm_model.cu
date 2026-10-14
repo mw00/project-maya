@@ -3384,6 +3384,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         err = "mtp: the draft block's weights (" + std::to_string(bytes >> 20) + " MB) did not allocate";
         return false;
     }
+    mtp_arena_bytes_ = bytes;
     uint64_t at = 0;
     uint8_t* base = (uint8_t*) mtp_arena_;
     std::vector<float> host;
