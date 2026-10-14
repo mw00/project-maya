@@ -309,15 +309,25 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.
-void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s);
+/// blocks > 0: that many thread blocks (a fetch on a side stream beside the expert kernels needs only a few to keep the
+/// PCIe link busy); 0: one a multiprocessor.
+void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, int blocks = 0);
+/// FETCH OVERLAP: the route's plan split in two (device, 8 entries each) - res = the planned experts already in VRAM
+/// (no fetch source), fet = the ones the fetch kernel pulls over PCIe.  A MoeDev whose plan_ptr is res (fet) makes
+/// moe_gate_up / moe_down run only those, so the resident experts compute while the fetch is still on the link.
+void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s);
 /// The routed gate/up rows of the planned (resident) experts, the clamped swiglu, the q8_1 of h; and (sh_down and
 /// sh_out given) the shared expert's down rows over its h in sh_hq into sh_out, by extra blocks of the same launch.
 void moe_gate_up(int gu_type, const MoeDev& d, int k, int n_embd, int n_ff, float limit, const void* xq, void* hq,
                  const void* sh_down, int sh_type, const void* sh_hq, int n_ff_sh, float* sh_out, cudaStream_t s);
 /// out[r] = (sum_i w_i * down_i(r) . h_i over the resident experts) [+ cpu_part[r]] + sh_out[r] (when given).
 /// down_off = the byte offset of the down rows inside an expert blob ([gate | up | down]).
+/// part_mode (FETCH OVERLAP, part_buf = 8 x n_embd floats): 1 = only store each plan entry's down row values in
+/// part_buf (0 for an entry this launch does not compute) and write nothing to out; 2 = compute this launch's
+/// entries, take the others' values from part_buf, then the combine as with 0 - the same per-entry values summed in
+/// the same plan order, so two launches give bit for bit what one launch gives.  0: the one launch.
 void moe_down(int d_type, const MoeDev& d, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
-              const float* sh_out, float* out, cudaStream_t s);
+              const float* sh_out, float* out, cudaStream_t s, float* part_buf = nullptr, int part_mode = 0);
 
 /// The prompt path's LIGHTLY routed experts (a few rows each - MMQ's 64-128-token tiles would be mostly empty):
 /// light[3 i .. 3 i + 2] = {slot, r0, nr} (device): expert i is the blob at base + slot * stride, its rows are

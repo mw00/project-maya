@@ -3418,7 +3418,8 @@ template<int TD>
 #endif
 __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_embd, int n_ff, size_t down_off,
                                                        const block_q8_1* __restrict__ hq,
-                                                       const float* __restrict__ sh_out, float* __restrict__ out) {
+                                                       const float* __restrict__ sh_out, float* __restrict__ out,
+                                                       float* __restrict__ part_buf = nullptr, int part_mode = 0) {
     if (d.skip != nullptr && *d.skip) return;
 #if !defined(STRATA_USE_HIP)
     constexpr int NR = DOWN_ROWS;
@@ -3467,6 +3468,16 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
             for (int j = 0; j < NR; ++j) s_part[warp][j] = s[j];
     }
     __syncthreads();
+    // FETCH OVERLAP (moe_down's part_mode): the resident entries' values wait in part_buf for the fetched ones
+    if (part_mode != 0 && (int) threadIdx.x < 8 * NR) {
+        const int i = (int) threadIdx.x / NR, j = (int) threadIdx.x % NR;
+        if (part_mode == 1)
+            part_buf[(size_t) i * n_embd + r0 + j] = s_part[i][j];
+        else if (s_ptr[i] == 0ull)
+            s_part[i][j] = part_buf[(size_t) i * n_embd + r0 + j];
+    }
+    if (part_mode == 1) return;
+    if (part_mode != 0) __syncthreads();
     if (threadIdx.x < NR) {
         const int j = threadIdx.x, r = r0 + j;
         float m = 0.0f;
@@ -4582,7 +4593,7 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
     launch_check("moe_prefetch");
 }
 
-void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
+void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s, int blocks) {
     static int sms = 0;
     if (sms == 0) {
         int dev = 0;
@@ -4590,8 +4601,22 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         if (sms <= 0) sms = 80;
     }
-    moe_fetch_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
+    moe_fetch_kernel<<<blocks > 0 ? blocks : sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
     launch_check("moe_fetch");
+}
+
+__global__ void moe_split_plan_kernel(MoeDev d, int k, unsigned long long* res, unsigned long long* fet) {
+    const int i = threadIdx.x;
+    if (i >= 8) return;
+    const unsigned long long p = i < k ? d.plan_ptr[i] : 0ull;
+    const bool fetched = i < k && d.fetch_src[i] != 0ull;
+    res[i] = fetched ? 0ull : p;
+    fet[i] = fetched ? p : 0ull;
+}
+
+void moe_split_plan(const MoeDev& d, int k, unsigned long long* res, unsigned long long* fet, cudaStream_t s) {
+    moe_split_plan_kernel<<<1, 32, 0, s>>>(d, k, res, fet);
+    launch_check("moe_split_plan");
 }
 
 #if defined(STRATA_USE_HIP)
@@ -4646,9 +4671,9 @@ void launch_expert_gu(const MoeDev& d, int k, int n_embd, int n_ff, float limit,
 }
 template<int T, int NR, bool GLOBAL = false, bool LUT = true, bool DIRECT = false, bool WIDE = false>
 void launch_expert_down(const MoeDev& d, int k, int n_embd, int n_ff, size_t off, const void* hq,
-               const float* sh, float* out, cudaStream_t s) {
+               const float* sh, float* out, cudaStream_t s, float* part_buf = nullptr, int part_mode = 0) {
     moe_down_kernel<T, NR, LUT, GLOBAL, DIRECT, WIDE><<<n_embd / NR, 256, 0, s>>>(d, k, n_embd, n_ff, off,
-        (const block_q8_1*) hq, sh, out);
+        (const block_q8_1*) hq, sh, out, part_buf, part_mode);
 }
 } // namespace
 #endif
@@ -4764,16 +4789,19 @@ bool rows_experts(int gu_type, int d_type, const uint8_t* base, size_t stride, s
 }
 
 void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_t down_off, const void* hq,
-              const float* sh_out, float* out, cudaStream_t s) {
+              const float* sh_out, float* out, cudaStream_t s, float* part_buf, int part_mode) {
     MoeDev d = d_in;
     d.skip = g_skip;
+    if (part_buf == nullptr) part_mode = 0;
 #if defined(STRATA_USE_HIP)
     // IQ3_XXS down regresses on gfx1151; let it use the original dispatch below.
     if ((d_type == 22 || d_type == 18) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(d_type == 22)) {
         // Two rows lower the register budget; IQ2_S prefers global grid reads,
         // while the smaller IQ3_XXS grid is faster in LDS on gfx1100.
-        if (d_type == 22) launch_expert_down<22, 2, true, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
-        else launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s);
+        if (d_type == 22) launch_expert_down<22, 2, true, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s,
+                                                                       part_buf, part_mode);
+        else launch_expert_down<18, 2, false, true, true>(d, k, n_embd, n_ff, down_off, hq, sh_out, out, s,
+                                                          part_buf, part_mode);
         launch_check("moe_down RDNA3");
         return;
     }
@@ -4782,7 +4810,8 @@ void moe_down(int d_type, const MoeDev& d_in, int k, int n_embd, int n_ff, size_
     const auto* H = (const block_q8_1*) hq;
     switch (d_type) {
 #define GLMF_DN(T) \
-        case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out); break;
+        case T: moe_down_kernel<T><<<blocks, 256, 0, s>>>(d, k, n_embd, n_ff, down_off, H, sh_out, out, part_buf, \
+                                                          part_mode); break;
         GLMF_DN(16) GLMF_DN(18) GLMF_DN(19) GLMF_DN(23) GLMF_DN(10) GLMF_DN(11) GLMF_DN(17) GLMF_DN(22) GLMF_DN(21) GLMF_DN(29)
         GLMF_DN(12) GLMF_DN(13) GLMF_DN(14)
 #undef GLMF_DN

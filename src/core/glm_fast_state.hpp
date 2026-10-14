@@ -211,6 +211,14 @@ namespace gf = strata::kernels::glmf;
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
+    // FETCH OVERLAP (STRATA_GLM_FETCH_OVERLAP): the route's PCIe fetch on its own stream while the resident experts
+    // compute on cs; the plan split (res | fet, 8 + 8 device entries), the resident down values (8 x n_embd floats)
+    cudaStream_t fs = nullptr;
+    cudaEvent_t ev_fsplit = nullptr, ev_fetch = nullptr;
+    unsigned long long* plan_split = nullptr;
+    float* down_part = nullptr;
+    bool fetch_overlap = false;
+    int fetch_blocks = 0;
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
