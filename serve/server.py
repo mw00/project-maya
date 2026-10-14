@@ -317,10 +317,11 @@ def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
 
 
 # A FROZEN engine (Strata #1317).  Silence alone proves nothing: on a slow PC the engine reads a long prompt chunk for
-# minutes without a line.  But one that prints nothing for ENGINE_STALL_S and in that time uses no CPU, reads or writes
-# no disk and leaves its GPUs idle is not slow, it is stuck (a deadlock, a driver stall), and waiting cannot help: it is
-# ended, the request gets an error, and the next request starts it again.  One that is silent but working is never
-# ended.  STRATA_ENGINE_STALL_S sets it (0 = off); it needs psutil (setup installs it), without it nothing is ended.
+# minutes without a line.  A healthy prompt or decode moves the GPUs, so silence with idle GPUs for ENGINE_STALL_S is
+# treated as stuck even when CPU threads still spin (futex busy-wait while decode is dead).  Without GPU telemetry the
+# older check still applies: no CPU and no disk in that window.  The engine is ended, the request gets an error, and
+# the next request starts it again.  One that is silent but working on the GPUs is never ended.  STRATA_ENGINE_STALL_S
+# sets it (0 = off); the CPU/disk fallback needs psutil (setup installs it).
 def _stall_seconds() -> float:
     try:
         return max(0.0, float(os.environ.get("STRATA_ENGINE_STALL_S", "90")))
@@ -571,24 +572,34 @@ class StrataEngine:
             return None
 
     def _stall_check(self, heard: float, state: dict) -> str | None:
-        """Called while the engine is silent (since `heard`, monotonic): a baseline soon after its last line, and at
-        ENGINE_STALL_S of silence the comparison - no CPU, disk or GPU work in all that time: why it is ended."""
+        """Called while the engine is silent (since `heard`, monotonic). A healthy prompt/decode moves the GPUs.
+        Silence with idle GPUs for ENGINE_STALL_S means a hang: CPU alone is not enough (service threads can spin
+        on futexes while decode is dead). Without GPU telemetry, fall back to the old CPU/disk freeze check."""
         t = time.monotonic()
         age = t - heard
         if "base" not in state:
             state["base"], state["t"], state["next"] = self._activity(), t, ENGINE_STALL_S
             return None
-        if state["base"] is None or age < state["next"]:
+        if age < ENGINE_STALL_S:
             return None
         now = self._activity()
         try:
-            gpu = bool(self.gpu_busy()) if self.gpu_busy is not None else False
+            have_gpu = self.gpu_busy is not None
+            gpu = bool(self.gpu_busy()) if have_gpu else False
         except Exception:  # noqa: BLE001 - a telemetry hiccup must not decide anything
-            gpu = False
-        if now is not None and not gpu and engine_frozen(state["base"], now, t - state["t"]):
-            return (f"the engine said nothing for {age:.0f} s and used no CPU, disk or GPU in that time, so it was stuck "
+            have_gpu, gpu = False, False
+        if have_gpu:
+            if gpu:
+                state["base"], state["t"] = now, t
+                return None
+            return (f"the engine said nothing for {age:.0f} s and its GPUs stayed idle, so it was stuck "
                     "and has been ended (STRATA_ENGINE_STALL_S sets this, 0 = off)")
-        state["base"], state["t"], state["next"] = now, t, age + ENGINE_STALL_S   # working: look again a window later
+        if state["base"] is None or age < state.get("next", ENGINE_STALL_S):
+            return None
+        if now is not None and engine_frozen(state["base"], now, t - state["t"]):
+            return (f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time, so it was stuck "
+                    "and has been ended (STRATA_ENGINE_STALL_S sets this, 0 = off)")
+        state["base"], state["t"], state["next"] = now, t, age + ENGINE_STALL_S
         return None
 
     def _end(self, why: str):
