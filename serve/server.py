@@ -48,6 +48,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve import gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             effort_kwargs, effort_level, images_of, literal_tags, mark_literals,
                             openai_to_messages, unmark_literals)
@@ -429,6 +430,7 @@ class StrataEngine:
         self._tls = threading.local()                   # the request this thread is generating (pause())
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
+        self.vram = []                   # VRAM lines: what each part holds on its GPU (the Monitor's GPU map)
         self.prefill_tok_s_mean = None
         self.progress = None             # (read, total, reuse, ms) prompt progress while a prompt is read, from PP lines
         try:                             # a ready-made engine's BUILD.json says its version
@@ -442,6 +444,10 @@ class StrataEngine:
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
                     self.info[k] = int(v) if v.lstrip("-").isdigit() else v
+            if line.startswith("VRAM "):
+                part = gpu_map.parse(line)
+                if part:
+                    self.vram.append(part)
             if line.startswith("READY"):
                 f = line.split()
                 self.max_context = int(f[1])
@@ -1620,10 +1626,26 @@ class Service:
             sh = list(getattr(self.engine, "stat_history", []) or [])
             tiers = {"now": stat, "history": {k: [s.get(k) for s in sh] for k in
                                               ("tok_s", "ms_tok", "vram_hit", "ram_fetch", "disk", "promo")}}
-        return {"engine": engine, "live": live, "tiers": tiers, "requests": hist[::-1][:None if all_requests else 12],
-                "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
+        hw = dict(tel["now"])
+        cards = hw.pop("vram", None)                      # (each card's processes: for the GPU map only)
+        return {"engine": engine, "live": live, "tiers": tiers, "gpu_map": self._gpu_map(cards),
+                "requests": hist[::-1][:None if all_requests else 12],
+                "requests_kept": len(hist), "totals": totals, "hardware": hw,
                 "hardware_static":
                 tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
+
+    def _gpu_map(self, cards):
+        """What fills each GPU (serve/gpu_map.py): the engine's VRAM lines and NVML's cards, with the engine's and the
+        vision encoder's processes told apart from other programs; None for an engine without VRAM lines."""
+        report = getattr(self.engine, "vram", None)
+        if not report:
+            return None
+        proc = getattr(self.engine, "proc", None)
+        v = self.vision
+        vproc = getattr(v, "proc", None) if v is not None else None
+        lent = v is not None and getattr(v, "lend", None) is not None and (vproc is not None or getattr(v, "owed", False))
+        return gpu_map.view(report, cards, proc.pid if proc is not None else None,
+                            vproc.pid if vproc is not None else None, lent)
 
     # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",

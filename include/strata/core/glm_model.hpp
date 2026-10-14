@@ -134,6 +134,22 @@ public:
         double pool_gb = 0, ram_gb = 0;
     };
     FastStats fast_stats() const;
+    /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
+    /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
+    /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the
+    /// activations, a drafter's weights (DFlash or the NextN block) and the verify window's buffers, the expert pool
+    /// with its lendable tail and what a prompt (borrow, at most) or the vision encoder borrows of that tail.  The
+    /// CUDA context and the small buffers are not counted: total - free - the parts.
+    struct VramReport {
+        int dev = 0;
+        std::string pci;
+        uint64_t total = 0, free = 0;
+        uint64_t weights = 0, kv = 0, kv_ram = 0, act = 0, drafter = 0, window = 0;
+        uint64_t pool = 0, tail = 0, borrow = 0, vision = 0;
+        int64_t slots = 0, ctx = 0;
+        int l0 = 0, l1 = 0;
+    };
+    std::vector<VramReport> vram_report() const;
     /// Every GPU's expert pool as it was sized (part order): the device, the VRAM kept free beside it (MiB), whether the
     /// default reserve was lowered so a small card's pool holds its floor, and --expert-cache N (0: auto) - for the
     /// driver's free-VRAM lines, which name the setting that leaves room
@@ -531,6 +547,7 @@ public:
     int mtp_src_ = -1;                                     // the shard of STRATA_GLM_MTP_GGUF's block, -1: the model's
     int lt_ = 0;                                           // the tier layers: [l0_, lt_) = the trunk's + the draft's
     void* mtp_arena_ = nullptr;
+    uint64_t mtp_arena_bytes_ = 0;                         // (the VRAM report)
     bool load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err);
     // the draft block at position p -> mtp_tok[step] (see glm_fast_path.cu: the chained drafts and the draft head)
     bool fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step = 0, bool sub = false, bool read_back = true);

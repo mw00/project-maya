@@ -159,6 +159,98 @@ class ContextCost(unittest.TestCase):
         self.assertEqual(eng.spawn[1], ["--glm-pack", "p", "--max-context", "131072"])
 
 
+GB = 2**30
+# the 3090 alone with EXL3-4.05bpw and DFlash2, as its start measured it (glm fast: CUDA0 VRAM before the expert pool ...)
+LINE = ("VRAM dev=0 pci=0000:01:00.0 total=25296896000 free=751828992 weights=6678575104 kv=665719603 kv_ram=0 "
+        "act=107374182 drafter=751828992 window=246415360 pool=15536793108 tail=7945689497 borrow=7945689497 "
+        "vision=0 slots=1231 ctx=32768 layers=0-45\n")
+
+
+class GpuMap(unittest.TestCase):
+    """What fills each GPU: the engine's VRAM lines, joined with NVML's cards and processes (serve/gpu_map.py)."""
+
+    def setUp(self):
+        from serve import gpu_map
+        self.gm = gpu_map
+        self.r = gpu_map.parse(LINE)
+
+    def card(self, used, procs, index=0, pci="0000:01:00"):
+        return {"index": index, "pci": pci, "name": "NVIDIA GeForce RTX 3090", "used": used, "total": 25296896000,
+                "procs": procs}
+
+    def test_parse(self):
+        self.assertEqual((self.r["dev"], self.r["pci"], self.r["layers"], self.r["slots"]), (0, "0000:01:00", [0, 45], 1231))
+        self.assertEqual(self.r["pool"], 15536793108)
+        self.assertIsNone(self.gm.parse("INFO context=32768"))
+        self.assertEqual(self.gm.pci_key("00000000:0A:00.0"), "0000:0a:00")
+
+    def test_nvml_tells_the_engine_from_other_programs(self):
+        engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own, other = engine + 400 * 2**20, 600 * 2**20
+        (g,) = self.gm.view([self.r], [self.card(own + other, {100: own, 200: other})], engine_pid=100)
+        self.assertEqual((g["index"], g["measured"]), (0, "nvml"))
+        self.assertEqual(g["parts"]["rest"], 400 * 2**20)        # the CUDA context and the small buffers
+        self.assertEqual(g["parts"]["other"], other)
+        self.assertEqual(g["parts"]["drafter"], self.r["drafter"] + self.r["window"])
+        self.assertEqual(g["free"], g["total"] - own - other)
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+
+    def test_the_drivers_reserve_is_not_another_program(self):
+        # (9 GPUs, the engine alone on each: NVML's used memory ~0.58 GB beyond its process - the driver's reserve)
+        engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own, reserve = engine + 500 * 2**20, 590 * 2**20
+        (g,) = self.gm.view([self.r], [self.card(own + reserve, {100: own})], engine_pid=100)
+        self.assertEqual((g["parts"]["other"], g["parts"]["rest"]), (0, 500 * 2**20 + reserve))
+
+    def test_found_by_pci_not_by_place(self):
+        cards = [self.card(1 * GB, {}, index=0, pci="0000:02:00"), self.card(23 * GB, {100: 22 * GB}, index=1)]
+        (g,) = self.gm.view([self.r], cards, engine_pid=100)
+        self.assertEqual(g["index"], 1)
+
+    def test_without_nvml_the_start_measurement(self):
+        (g,) = self.gm.view([self.r], [], engine_pid=100)
+        start = self.r["total"] - self.r["free"]
+        engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        self.assertEqual((g["measured"], g["parts"]["rest"], g["parts"]["other"]), ("start", start - engine, 0))
+        self.assertEqual(g["free"], self.r["free"])
+
+    def test_the_vision_encoder_has_the_tail(self):
+        r = dict(self.r, vision=self.r["tail"])
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool")) - r["tail"]
+        own, enc = engine + 400 * 2**20, r["tail"] - 50 * 2**20
+        (g,) = self.gm.view([r], [self.card(own + enc, {100: own, 300: enc})], 100, vision_pid=300, vision_lent=True)
+        self.assertTrue(g["vision_lent"])
+        self.assertEqual((g["parts"]["pool"], g["parts"]["vision"]), (r["pool"] - r["tail"], enc))
+        self.assertEqual(g["parts"]["other"], 0)
+
+    def test_never_more_than_the_card(self):
+        (g,) = self.gm.view([self.r], [self.card(26 * GB, {100: 25 * GB, 200: 2 * GB})], engine_pid=100)
+        self.assertLessEqual(sum(g["parts"].values()), g["total"])
+        self.assertEqual(g["free"], 0)
+
+    def test_two_parts_on_one_card_add_up(self):
+        a = dict(self.r, layers=[0, 20], slots=500)
+        b = dict(self.r, layers=[20, 45], slots=700, free=self.r["free"] - GB)
+        (m,) = self.gm.merge([a, b])
+        self.assertEqual((m["layers"], m["slots"], m["pool"], m["free"]), ([0, 45], 1200, 2 * self.r["pool"], b["free"]))
+
+    def test_metrics_carry_it(self):
+        from types import SimpleNamespace
+        tok = ByteTokenizer()
+        eng = MockEngine(tok, "hi", max_context=32768)
+        eng.vram, eng.proc = [self.r], SimpleNamespace(pid=100)
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        card = self.card(24 * GB, {100: 23 * GB})
+        svc.telemetry = SimpleNamespace(snapshot=lambda: {"now": {"gpu_mem_used": 24 * GB, "vram": [card]},
+                                                          "history": {}, "static": {}})
+        m = svc.metrics()
+        self.assertNotIn("vram", m["hardware"])                  # (the processes stay in the server)
+        self.assertEqual(m["gpu_map"][0]["slots"], 1231)
+        json.dumps(m)
+        eng.vram = []
+        self.assertIsNone(svc.metrics()["gpu_map"])             # (an engine without VRAM lines: no card)
+
+
 class GpuRelease(unittest.TestCase):
     """A reload starts the new engine only once the GPUs have dropped the old one (its memory is freed after it ends)."""
 
