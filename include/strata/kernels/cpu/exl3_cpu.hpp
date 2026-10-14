@@ -4,7 +4,8 @@
 // FMA on the device).  The CPU keeps the affine form without the FP16 rounding, so a 128-output band is
 //   y' = k_inv * sum_k xh_k s_kc + (1024 k_inv + k_bias) * sum_k xh_k,   xh = H(x * suh)
 // and y = H(y') * svh.  The byte sums come from AVX-512 (permutes and funnel shifts pull 16 columns' states at once,
-// vpmaddubsw / vpmaddwd add the bytes up, an F32 FMA takes the activation); a CPU without AVX-512 runs a scalar loop.
+// vpmaddubsw / vpmaddwd add the bytes up, an F32 FMA takes the activation), or from AVX2 + FMA the same way 8 columns
+// at a time - the same FMAs in the same order, so the two give the same bits; a CPU with neither runs a scalar loop.
 // The format: include/strata/kernels/exl3.hpp.
 #pragma once
 
@@ -20,8 +21,11 @@ struct Exl3Part {
     const uint16_t* svh = nullptr;   // FP16 bits [n]
     int k = 0, n = 0, K = 0;
 };
-/// Whether the vector kernel runs here (AVX-512F/BW); the scalar one otherwise.
+/// Whether a vector kernel runs here (AVX-512F/BW or AVX2 + FMA); the scalar one otherwise.
 bool exl3_cpu_vector();
+/// The kernel the functions below run here: 2 AVX-512 (F, BW), 1 AVX2 + FMA (+ F16C), 0 scalar.  STRATA_FORCE_AVX2=1
+/// keeps an AVX-512 CPU on AVX2 (to compare the two; they give the same bits).
+int exl3_cpu_tier();
 /// xh = H(x * suh) (k values, k % 128 == 0); returns the sum of xh.
 float exl3_cpu_prepare(const Exl3Part& m, const float* x, float* xh);
 /// One 128-value block of that: xh[i] = H(x * suh)[i] for i < 128 (suh: the block's 128 scales); returns its sum.
@@ -49,6 +53,10 @@ void exl3_cpu_rows_acc_n(const Exl3Part& m, const float* const* xh, int n, int k
 size_t exl3_cpu_gemm_scratch();
 void exl3_cpu_band_gemm(const Exl3Part& m, const float* const* xh, int n, int c0, int nb, float* const* acc,
                         float* wc);
+/// exl3_cpu_band_acc_n on a given tier (0, 1, 2 as exl3_cpu_tier) - tests and benchmarks; false (nothing computed)
+/// where this CPU cannot run it.
+bool exl3_cpu_band_acc_on(int tier, const Exl3Part& m, const float* const* xh, int n, int c0, int ks0, int ks1,
+                          float* const* acc);
 /// ... and, with the parts' acc summed over every slice, the outputs (the codebook's affine form, H, svh).
 void exl3_cpu_band_out(const Exl3Part& m, const float* acc, float xsum, int c0, float* y);
 
