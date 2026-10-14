@@ -36,9 +36,9 @@ What the first run does (each step is skipped when it is already done):
      http://127.0.0.1:8080
 
 The tuning (tools/calibrate_glm.py): decode speed measured with a few splits of the RAM-tier
-experts between the CPU and the PCIe link, with fewer CPU threads, and - when part of the model is read from the SSD -
-with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when it is more
-than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
+experts between the CPU and the PCIe link, with fewer and more CPU threads, and - when part of the model is read from
+the SSD - with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when
+it is more than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
 STRATA_GLM_CPU_LANE, STRATA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
 context, so a setup again keeps it.
 
@@ -2145,8 +2145,8 @@ def calibrate_config(cfg_path: Path) -> bool:
         return False
     say()
     say("  Tuning Maya for this PC: the output speed is measured with a few splits of the work between the CPU and")
-    say("  the PCIe link, and with fewer CPU threads. It takes about 10-15 minutes (the model loads first); the PC is")
-    say("  busy meanwhile.")
+    say("  the PCIe link, and with fewer and more CPU threads. It takes about 10-15 minutes (the model loads first);")
+    say("  the PC is busy meanwhile.")
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:

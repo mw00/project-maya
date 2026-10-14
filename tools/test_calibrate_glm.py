@@ -39,13 +39,13 @@ class FakeEngine:
             yield i
 
 
-def run_measure(engine):
+def run_measure(engine, env=None):
     started = []
 
     def start(cfg):
         started.append(cfg)
         return engine
-    res = CAL.measure({"env": {}}, [[1, 2, 3]] * 3, start, say=lambda *a: None, extra_threads=())
+    res = CAL.measure({"env": env or {}}, [[1, 2, 3]] * 3, start, say=lambda *a: None, extra_threads=())
     return res, started
 
 
@@ -93,6 +93,29 @@ class Measure(unittest.TestCase):
         self.assertLessEqual(len(eng.prompts), len(ids))
         self.assertEqual(len(set(eng.prompts)), len(eng.prompts))
         self.assertEqual(eng.prompts[:6], [(0,), (1,), (2,), (3,), (4,), (5,)])
+
+    def test_more_threads_than_the_engines_own(self):
+        # a 16-vCPU KVM guest (#177): the engine takes 10, 14 is the fastest and all 16 far slower
+        rate = {10: 14.9, 12: 17.0, 14: 18.4, 15: 18.0, 16: 11.4}
+        eng = FakeEngine(lambda s, t: rate.get(t, 12.0), threads=10)
+        res, _ = run_measure(eng, {CAL.MAX_ENV: "16"})
+        self.assertEqual(res["settings"], {CAL.THREADS_ENV: "14"})
+        self.assertTrue({12, 14} <= {r[1] for r in eng.requests})
+        self.assertFalse({15, 16} & {r[1] for r in eng.requests})       # the CPUs less two at most
+
+    def test_more_threads_stop_once_slower(self):
+        # past the memory's bandwidth: 12 threads lose to the engine's own 10, so 14 is not tried
+        eng = FakeEngine(lambda s, t: {10: 15.0, 12: 14.0, 14: 13.0}.get(t, 10.0), threads=10)
+        res, _ = run_measure(eng, {CAL.MAX_ENV: "16"})
+        self.assertEqual(res["settings"], {})
+        self.assertIn(12, {r[1] for r in eng.requests})
+        self.assertNotIn(14, {r[1] for r in eng.requests})
+
+    def test_no_pool_room_no_more_threads(self):
+        # an engine started without MAX_ENV has no threads above its own to give a request
+        eng = FakeEngine(lambda s, t: 15.0 + t, threads=10)
+        run_measure(eng)
+        self.assertLessEqual(max(r[1] for r in eng.requests), 10)
 
     def test_no_cpu_lane(self):
         eng = FakeEngine(lambda s, t: 30.0, threads=0, own_share=1.0)
@@ -160,6 +183,12 @@ class Helpers(unittest.TestCase):
         self.assertEqual(CAL.thread_candidates(40, (43, 21)), [40, 30, 27, 20, 10, 21])
         self.assertEqual(CAL.thread_candidates(3), [3, 2])
 
+    def test_more_thread_candidates(self):
+        self.assertEqual(CAL.more_thread_candidates(10, 16), [12, 14])
+        self.assertEqual(CAL.more_thread_candidates(13, 16), [14])
+        self.assertEqual(CAL.more_thread_candidates(14, 16), [])
+        self.assertEqual(CAL.more_thread_candidates(10, 0), [])
+
     def test_pick(self):
         self.assertEqual(CAL.pick({"a": [10.0], "b": [10.2]}, "a"), "a")
         self.assertEqual(CAL.pick({"a": [10.0], "b": [10.5]}, "a"), "b")
@@ -213,6 +242,7 @@ class Helpers(unittest.TestCase):
             finally:
                 CAL.prompt_ids = orig
             self.assertNotIn(CAL.THREADS_ENV, seen[0]["env"])                              # the engine's own choice
+            self.assertEqual(seen[0]["env"][CAL.MAX_ENV], str(CAL.lane_max()))            # room to try more
             self.assertNotEqual(Path(seen[0]["env"]["STRATA_GLM_USAGE"]), own)            # not this PC's own file
             self.assertEqual(own.read_text(), "3 7:12\n")
             # the learned profile and the trace are not written; the profile it starts from stays
