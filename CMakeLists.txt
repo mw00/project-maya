@@ -1031,6 +1031,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(pool_stress src/kernels/cpu/pool_stress.cpp)
   target_link_libraries(pool_stress PRIVATE strata_kernels_cpu)
   add_test(NAME pool_stress COMMAND pool_stress 20)
+  # the EXL3 CPU lane's tiers on random experts: a band's compute speed, and an expert's time on T threads from DRAM
+  # in the engine's jobs (what the start-up timing compares with a copy over PCIe) - a benchmark, not a test
+  add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
+  target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
