@@ -4487,6 +4487,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
         constexpr uint32_t bg_ratio = 2;
         bool lane_all = F->cpu_plan != 0ull;   // the CPU lane takes every RAM-tier expert of a route
         for (int f = 1; f <= g.n_exp_used && lane_all; ++f) lane_all = (int) ((F->cpu_plan >> (4 * f)) & 15ull) == f;
+        // ... and so do a DFlash verify window's routes on two CPU lanes (glm_window.cu's all-CPU plan,
+        // STRATA_GLM_WIN_ALLCPU): no route promotes then, so the swaps below keep the VRAM tier following the
+        // conversation (without them the hit rate falls while DFlash drafts)
+        static const bool win_all_cpu = [] {
+            const char* v = getenv("STRATA_GLM_WIN_ALLCPU");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (!lane_all && win_all_cpu && dflash_on_ && F->cpu_plan != 0ull && F->win_lane[0] != nullptr &&
+            F->win_lane[1] != nullptr)
+            lane_all = true;
         // (the refill into FREE slots runs whatever the plan: a slot a prompt's lending gave back holds nothing - a
         // split whose cards send one of 7-8 RAM-tier experts over PCIe left ~13% of VRAM empty after a long prompt;
         // the swaps below stay with the all-CPU plan, beside which the routes' own promotions do not run)
