@@ -1357,6 +1357,10 @@ void Glm5Model::prefill_destroy() {
     if (S->ev_hidle) cudaEventDestroy(S->ev_hidle);
     for (auto e : S->ev_land)
         if (e) cudaEventDestroy(e);
+    for (auto e : S->sev)   // (the stage line's: grown on demand, one pool per part)
+        if (e) cudaEventDestroy(e);
+    for (cudaEvent_t e : {S->sev_a, S->sev_b, S->sev_h0, S->sev_h1})
+        if (e) cudaEventDestroy(e);
     if (S->ev_hop) cudaEventDestroy(S->ev_hop);
     if (S->gpin) cudaFreeHost(S->gpin);
     if (S->emb_h) cudaFreeHost(S->emb_h);
