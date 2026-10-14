@@ -428,6 +428,22 @@ class HipSetupTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 maya.main()
 
+    def first_run_backend(self, nvidia, amd):
+        with patch.object(maya, "configs", return_value=[]), \
+                patch.dict(os.environ, MAYA_SH="1"), \
+                patch.object(sys, "argv", ["maya.py", "--check"]), \
+                patch.object(maya.S, "gpus", return_value=nvidia), \
+                patch.object(maya.S, "amd_gpus", return_value=amd), \
+                patch.object(maya, "check_pc", return_value={"gpus": [{"index": 0}]}) as check:
+            self.assertEqual(maya.main(), 0)
+        return check.call_args.args[0].backend
+
+    def test_first_run_without_backend_picks_hip_on_an_amd_only_pc(self):
+        strix = {"index": 0, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 96}
+        self.assertEqual(self.first_run_backend([], [strix]), "hip")
+        self.assertEqual(self.first_run_backend([], [self.gpus[2]]), "cuda")   # (unsupported iGPU: CUDA's message)
+        self.assertEqual(self.first_run_backend([{"index": 0, "arch": "70"}], [strix]), "cuda")
+
 
 class ConfigsTests(unittest.TestCase):
     def test_dashboard_settings_beside_a_config_are_not_a_config(self):
