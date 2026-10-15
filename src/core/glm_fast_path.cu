@@ -4317,13 +4317,15 @@ bool Glm5Model::fast_boundary(std::string& err) {
             if (glmfast::full_unified_pool(F->unified_memory, P.n, g.n_expert) ||
                 glmfast::complete_pool(P.n_main, g.n_expert, gf::kSpares))
                 break;
-            // evict the least-used resident of this layer (recency breaks ties).  STRATA_GLM_VRAM_EVICT=lru: the
-            // least recently used instead - route traces replayed through these rules (Maya-M, 3090 + 3060 split):
-            // the aged counts keep experts that were frequent a while ago, the smaller half's pool most of all (VRAM
-            // hits 55.7 -> 65.2 %, off-card experts a token 57.7 -> 45.4 on the 3060; 71.8 -> 64.6 on the 3090)
+            // the least recently used resident of this layer goes (the engine's own rule now).  It is kept
+            // STRATA_GLM_VRAM_EVICT=least (or 0): the least-used by the aged counts, recency breaking ties - route
+            // traces replayed through these rules (Maya-M, 3090 + 3060 split): the aged counts keep experts that
+            // were frequent a while ago, the smaller half's pool most of all (VRAM hits 55.7 -> 65.2 %, off-card
+            // experts a token 57.7 -> 45.4 on the 3060; 71.8 -> 64.6 on the 3090), while the recency won the decode
+            // there (+2.6%) and on Maya-S over 3x V100-16GB with an NVMe tier (24.8 -> 26.1 tok/s, interleaved runs)
             static const bool vram_lru = [] {
                 const char* ve = getenv("STRATA_GLM_VRAM_EVICT");
-                return ve != nullptr && std::strcmp(ve, "lru") == 0;
+                return ve == nullptr || std::strcmp(ve, "lru") == 0;
             }();
             int v = -1;
             uint32_t bc = UINT32_MAX;
