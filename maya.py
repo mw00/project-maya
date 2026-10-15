@@ -663,11 +663,8 @@ def check_hip_pc(a, installed=False) -> dict:
         for i, g in zip(want, picked):
             if g is None:
                 fail(f"GPU {i} is not a supported AMD card")
-        apu = next((g for g in picked if hip_unified_memory(g)), None)
-        if apu is not None:
-            fail(f"GPU {apu['index']} ({apu['name']}) is an APU with unified memory, which stays single-GPU",
-                 "use --gpu N for it, or pick two discrete cards with --gpus")
-        chosen = sorted(picked, key=lambda g: -g["vram_gb"])
+        # A mixed pair puts the discrete GPU first and the unified-memory APU last.
+        chosen = sorted(picked, key=lambda g: (hip_unified_memory(g), -g["vram_gb"]))
     else:
         one = next((g for g in usable if g["index"] == a.gpu), None) if a.gpu is not None else max(
             usable, key=lambda g: g["vram_gb"])
@@ -1921,7 +1918,10 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
             hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
-        if any(hip_unified_memory(g) for g in gpus):   # an APU is always the only GPU (check_hip_pc)
+        if any(hip_unified_memory(g) for g in gpus):
+            if len(gpus) > 1:
+                # Pin the first part's RAM tier before the APU measures the shared memory left.
+                hip_env["STRATA_GLM_PARALLEL_LOAD"] = "0"
             total_ram, _ = mem_gb()
             if WIN:     # Windows counts the GPU's carve-out apart from its RAM, and its desktop runs on that GPU
                 total_ram += sum(g.get("vram_gb", 0) for g in gpus)

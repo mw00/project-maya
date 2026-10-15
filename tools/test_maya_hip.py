@@ -118,12 +118,18 @@ class HipSetupTests(unittest.TestCase):
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(json.loads(p.read_text())["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
 
-    def test_gpus_with_an_apu_is_rejected(self):
-        self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 4})
+    def test_gpus_with_an_apu_use_discrete_first_and_sequential_loading(self):
+        self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 112})
         self.a.gpu = None
-        self.a.gpus = "1,3"
-        with self.assertRaises(SystemExit):
-            maya.check_pc(self.a)
+        for order in ("1,3", "3,1"):
+            self.a.gpus = order
+            pc = maya.check_pc(self.a)
+            self.assertEqual(pc["gpus"], [self.gpus[1], self.gpus[3]])
+            p = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data", None)
+            cfg = json.loads(p.read_text())
+            self.assertEqual(cfg["gpu"], [1, 3])
+            self.assertEqual(cfg["env"]["STRATA_GLM_PARALLEL_LOAD"], "0")
+            self.assertNotIn("STRATA_GLM_SPLIT", cfg["env"])
         self.a.gpus = None
         self.a.gpu = 3
         self.assertEqual(maya.check_pc(self.a)["gpus"], [self.gpus[3]])

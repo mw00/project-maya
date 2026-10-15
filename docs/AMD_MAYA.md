@@ -1,7 +1,7 @@
 # Experimental Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
-engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two discrete cards that split the
+engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the
 layers (see [Two GPUs](#two-gpus)), and serves text. Images are not enabled by this installer;
 Linux users can opt into the existing [CPU image encoder](#cpu-image-encoder-on-linux).
 Windows: see [Windows](#windows).
@@ -111,7 +111,9 @@ Windows, large-image limits, and multiple-image workloads were not tested here.
 half, and the second half also runs the model's MTP block, which drafts the next token so both cards stay busy. Setup
 puts the card with more VRAM first (it takes the bigger first half), leaves the split point to the engine, and writes
 one hipBLASLt table per architecture (`STRATA_HIPBLASLT_TUNING` takes a `:`-separated list; each card uses the table
-for its own architecture). The two cards may be different architectures. The split passes one small host-memory hop
+for its own architecture). A discrete GPU paired with a unified-memory APU puts the discrete GPU first and loads the
+parts sequentially (`STRATA_GLM_PARALLEL_LOAD=0`), so the APU sizes its pool after the first part pins its RAM tier.
+The two cards may be different architectures. The split passes one small host-memory hop
 per token, so no peer-to-peer access between the cards is needed.
 
 Measured on an AI PRO R9700 (32 GB, first) + RX 7900 XT (20 GB), 192 GB RAM, Maya-S, 8K context, 90 GB RAM tier,
@@ -133,8 +135,8 @@ HIP setup command above, selecting its GPU number and omitting the
 reports only a small VRAM carve-out. It writes a 1 GiB reserve, 16 GiB of
 system headroom, `STRATA_GLM_PREFILL_SUB=1024`, and a 6144 MiB prompt budget
 when system RAM is at least 96 GiB (4096 MiB otherwise), plus the existing
-`gfx1151` hipBLASLt table. An APU stays single-GPU: `--gpus` with it is
-rejected (use `--gpu N`). It leaves `POOL_GB` and `RAM_GB` unset.
+`gfx1151` hipBLASLt table. Use `--gpu N` for the APU alone, or `--gpus D,N` to pair it with a supported discrete GPU
+(see [Two GPUs](#two-gpus)). It leaves `POOL_GB` and `RAM_GB` unset.
 
 For integrated HIP devices the engine sizes the pool from `/proc/meminfo`'s
 `MemAvailable` **after** dense weights, KV and prompt staging are allocated:
