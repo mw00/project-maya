@@ -157,8 +157,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual(CAL.apply(env, {}), {"STRATA_GLM_RAM_HEADROOM_GB": "4"})
 
     def test_thread_candidates(self):
-        self.assertEqual(CAL.thread_candidates(40, (43, 21)), [40, 30, 27, 20, 10, 21])
+        self.assertEqual(CAL.thread_candidates(40, (43, 21)), [40, 30, 27, 20, 10, 43, 21])
         self.assertEqual(CAL.thread_candidates(3), [3, 2])
+        # a 3+-GPU split's pool (one NUMA node) and the other socket's CPUs as the extra - more than the default
+        self.assertEqual(CAL.thread_candidates(14, (27,)), [14, 10, 9, 7, 4, 27])
+        self.assertEqual(CAL.thread_candidates(14, (14,)), [14, 10, 9, 7, 4])
 
     def test_pick(self):
         self.assertEqual(CAL.pick({"a": [10.0], "b": [10.2]}, "a"), "a")

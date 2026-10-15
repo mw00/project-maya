@@ -101,11 +101,13 @@ def prompt_ids(cfg: dict) -> list[list[int]]:
 
 
 def thread_candidates(default: int, extra=()) -> list[int]:
-    """The engine's own count, and fewer: three quarters, two thirds, a half and a quarter (at least 2), plus `extra`
-    (the performance cores less one on a hybrid CPU, one socket's cores less one on a 2-socket PC), no repeats."""
+    """The engine's own count, fewer: three quarters, two thirds, a half and a quarter (at least 2), plus `extra`
+    (the performance cores less one on a hybrid CPU, one socket's CPUs less one on a 2-socket PC - also when more
+    than the default: a split of three or more GPUs sizes its one pool from one NUMA node, and the other socket's
+    CPUs are a candidate of their own there), no repeats."""
     c = [default]
     for w in (round(default * 3 / 4), round(default * 2 / 3), round(default / 2), round(default / 4), *extra):
-        if 2 <= w < default and w not in c:
+        if 2 <= w and w != default and w not in c:
             c.append(w)
     return c
 
