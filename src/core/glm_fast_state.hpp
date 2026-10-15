@@ -560,6 +560,9 @@ struct Glm5Model::FastState {
     // have that memory while it runs (vision_lend frees it, vision_reclaim allocates it again)
     uint8_t* xpool = nullptr;
     size_t xpool_bytes = 0;
+    // how far the prompt's lending (lend_tail) freed xpool: the first tail slot it kept, so [xpool + the prompt's
+    // need, lend_end) is a loan the layout did not use - where the prompt path's MMQ scratch lives (mmq::pool_slab)
+    size_t lend_end = 0;
     // ---- the RAM tier: pinned host slots per blob size class, holding experts that are NOT in VRAM
     //      (exclusive tiers).  rtab (on the device) points at HOLDING slots only.
     // kRPin: still the expert's live copy, being promoted (never a victim until the copy landed)

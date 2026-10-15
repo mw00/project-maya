@@ -1004,6 +1004,18 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (pool_b_.fixed > 0)
             std::fprintf(stderr, "glm fast: CUDA%d --expert-cache %lld: at most %.2f GB for the expert pool\n", dev_,
                          (long long) pool_b_.fixed, (double) pool_b_.fixed * (double) stride_max / 1073741824.0);
+        // the prompt path's MMQ context keeps a scratch pool (llama.cpp's stream-k fixup tiles) that it fills lazily,
+        // out of free VRAM, on the first product of a chunk - so what the pool leaves free must cover it (the prompt
+        // path's own borrow is the tail, which this shrinks and prefill_setup sizes the chunk against)
+        if (pf_ != nullptr) {
+            const size_t sc = mmq_scratch_reserve();
+            if (sc > 0) {
+                avail -= std::min(avail, sc);
+                std::fprintf(stderr, "glm fast: CUDA%d the prompt path's MMQ scratch pool keeps %.0f MB of the free VRAM "
+                                     "(STRATA_GLM_MMQ_RESERVE_MB): the expert pool is sized without it\n",
+                             dev_, (double) sc / 1048576.0);
+            }
+        }
 #if defined(STRATA_USE_HIP)
         if (F->unified_memory) {
             // Measure after dense/KV/scratch and pinned prompt staging are allocated.
@@ -5657,6 +5669,7 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
             glmfast::pool_reserve(free_b, b.reserve, b.reserve_given, b.fixed > 0, floor_b, (size_t) 300 << 20);
     b.avail = glmfast::expert_pool_budget(false, free_b, 0, b.reserve, 0, 0);
     if (b.fixed > 0 && slot_b > 0) b.avail = std::min(b.avail, (size_t) b.fixed * slot_b);
+
     if (const char* cap = getenv("STRATA_GLM_POOL_GB"))
         b.avail = std::min(b.avail, (size_t) (std::atof(cap) * 1073741824.0));
     if (const char* vc = getenv("STRATA_GLM_VRAM_GB")) {
@@ -5665,6 +5678,21 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
         b.avail = std::min(b.avail, cap > used + b.reserve ? cap - used - b.reserve : (size_t) 0);
     }
     return b;
+}
+
+// The prompt path's MMQ scratch pool (mmq::Context -> llama.cpp's CachingPool) allocates its buffers lazily, on the
+// first product of a chunk, and never gives them back: they are the stream-k fixup tiles of the launch (one float
+// buffer of block_nums x J x I, tens of MB, and the ids tables of the MoE path).  Nothing sizes them today, so they
+// land on free VRAM - and at a 16,384-token chunk on the head card (56 slots/layer, 4.53 GB pool + 2.89 GB held, ~110
+// MB free) the first MoE product's allocation failed and ggml_cuda_error aborted the engine mid-prompt.  The number is
+// a worst case read off a chunk of that size (STRATA_GLM_MMQ_RESERVE_MB, see its log line): both fast_setup (the pool)
+// and prefill_setup (the lendable the chunk is chosen against) subtract it, so the pool it sizes is the pool it gets.
+size_t Glm5Model::mmq_scratch_reserve() {
+    static const size_t r = [] {
+        const char* v = getenv("STRATA_GLM_MMQ_RESERVE_MB");
+        return v != nullptr ? (size_t) std::max(0LL, std::atoll(v)) << 20 : (size_t) 0;
+    }();
+    return r;
 }
 
 // this part's budget: the one above, less what pool_check found short of the reserve once it was written

@@ -95,6 +95,9 @@ struct Carve {
 };
 
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
+// the loan (past a layout's need) the MMQ kernels' stream-k fixup buffers get: see prefill_lend and the pool's
+// size classes (src/prefill/ggml_cuda_host.cu) for why 16 MB bounds every product a chunk launches, at any chunk size
+constexpr size_t kMmqSlab = (size_t) 16 << 20;
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
@@ -299,7 +302,9 @@ int mixer_sub(size_t T, const Glm5Geometry& g, bool kda, bool dsa, bool dense, b
 }
 
 void blas_ck(cublasStatus_t st, const char* what) {
-    if (st != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d\n", what, (int) st);
+    if (st != CUBLAS_STATUS_SUCCESS)
+        std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d (cuda: %s)\n", what, (int) st,
+                     cudaGetErrorString(cudaGetLastError()));
 }
 
 }  // namespace
@@ -639,7 +644,10 @@ bool Glm5Model::prefill_setup(std::string& err) {
         stride_max = std::max(stride_max, glmfast::expert_stride(Ly.blob, Ly.gu_type, Ly.d_type));
     }
     const int64_t keep = g.n_exp_used + gf::kSpares + 2;
-    const size_t avail = part_budget(dev_free, dev_total, (size_t) keep * stride_sum, stride_max).avail;
+    size_t avail = part_budget(dev_free, dev_total, (size_t) keep * stride_sum, stride_max).avail;
+    // ... less the prompt path's MMQ scratch pool: fast_setup sizes the expert pool without it, so the lendable the
+    // chunk below is chosen against must be computed from the same number (mmq_scratch_reserve; 0 with the slab)
+    avail -= std::min(avail, mmq_scratch_reserve());
     int64_t per = std::min<int64_t>(g.n_expert, (int64_t) (avail / std::max<size_t>(1, blob_sum)));
     while (per > 0 && (size_t) per * stride_sum > avail) --per;
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
@@ -809,6 +817,34 @@ bool Glm5Model::prefill_setup(std::string& err) {
     }
     cublasSetStream(S->blas, F->cs);
     cublasSetMathMode(S->blas, CUBLAS_DEFAULT_MATH);
+    // cuBLAS loads its kernels - and whatever device memory they need - lazily, on the first call on a device.  By
+    // the time a prompt runs the expert pool has taken the card, so that lazy load lands on a full card and fails:
+    // it is a launch that returns CUBLAS_STATUS_EXECUTION_FAILED with no CUDA error behind it (CUDA0 at 4.53 GB of a
+    // 7.53 GB 5060, 110 MB free, failed on every GEMM of the chunk; the same card at 480 MB free ran them).  One
+    // small GEMM of each kind now, while the pool is not allocated yet, and the pool's fill cannot take it away.
+    {
+        void *wa = nullptr, *wb = nullptr, *wc = nullptr, *wws = nullptr;
+        if (cudaMalloc(&wa, 4096) == cudaSuccess && cudaMalloc(&wb, 4096) == cudaSuccess &&
+            cudaMalloc(&wc, 4096) == cudaSuccess && cudaMalloc(&wws, kPfWorkspace) == cudaSuccess) {
+            const float one = 1.0f, zero = 0.0f;
+            blas_ck(cublasSetWorkspace(S->blas, wws, kPfWorkspace), "warm-up set workspace");
+            const cublasStatus_t w1 = cublasSgemm(S->blas, CUBLAS_OP_N, CUBLAS_OP_N, 16, 16, 16, &one,
+                                                  (const float*) wa, 16, (const float*) wb, 16, &zero, (float*) wc, 16);
+            const cublasStatus_t w2 =
+                cublasGemmEx(S->blas, CUBLAS_OP_N, CUBLAS_OP_N, 16, 16, 16, &one, wa, CUDA_R_16F, 16, wb, CUDA_R_16F,
+                             16, &zero, wc, CUDA_R_32F, 16, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            const cudaError_t we = cudaStreamSynchronize(F->cs);
+            std::fprintf(stderr, "glm prefill: CUDA%d cuBLAS warm-up: sgemm %d, gemm f16 %d, sync %s\n", dev_,
+                         (int) w1, (int) w2, cudaGetErrorString(we));
+        } else {
+            cudaGetLastError();
+            std::fprintf(stderr, "glm prefill: CUDA%d cuBLAS warm-up skipped (no scratch)\n", dev_);
+        }
+        if (wa != nullptr) cudaFree(wa);
+        if (wb != nullptr) cudaFree(wb);
+        if (wc != nullptr) cudaFree(wc);
+        if (wws != nullptr) cudaFree(wws);
+    }
     S->mq = std::make_unique<mmq::Context>();
     // an event that did not create (a GPU the expert pool filled) stays null and the prompt runs token by token:
     // the staging below records and waits on every one of them, and a null event there is no event at all
@@ -1002,9 +1038,12 @@ size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->iota = a.take<int>(T * (size_t) g.n_exp_used);
     S->kv_stage = stage > 0 ? a.take<uint8_t>(stage) : nullptr;
     S->uni = S->arena + a.off;
-    cublasSetWorkspace(S->blas, S->ws, S->ws_bytes);
+    blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
     S->T_bound = Tn;
     S->need = c.off;
+    if (S->region != nullptr && S->need > S->region_bytes)
+        std::fprintf(stderr, "glm prefill: CUDA%d the layout needs %zu bytes of a %zu-byte loan\n", dev_, S->need,
+                     S->region_bytes);
     return c.off;
 }
 
@@ -1015,7 +1054,36 @@ bool Glm5Model::prefill_lend(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || S->lent) return true;
     cudaSetDevice(dev_);
-    if (!lend_tail(S->need, S->moved, S->dropped, err)) return false;
+    // The MMQ kernels' scratch (their stream-k fixup tiles, allocated through ggml_cuda_pool) rides in the loan: the
+    // lending frees kMmqSlab bytes past this layout's need and [need, need + kMmqSlab) is where the pool's buffers
+    // live.  It costs no cudaMalloc - and on a card whose free VRAM is a few MB by the time a chunk runs (measured:
+    // CUDA1 wanting 1.2 MB with 3.4 MB of 7,707 MB left) that cudaMalloc is what aborted the engine mid-prompt.
+    //
+    // kMmqSlab is a bound, not a guess.  mmq.cuh allocates block_nums_stream_k.x * J*I floats for the stream-k fixup
+    // only when the problem is a poor tile fit, and then block_nums_stream_k.x is nsm (30/28 here), never ntiles_dst
+    // (a perfect fit needs no fixup at all) - so a buffer is at most nsm * J * I * 4 with J from its 8..128 search,
+    // i.e. 2 MB, whatever the chunk is.  The pool rounds those to size classes (128 KB .. 2 MB), so a chunk's
+    // products - gate/up and down here - hold ~4 MB each: 16 MB covers them with room for a third.  Lending the few
+    // slots that pay for it is the cheap side of the trade: those experts go to the RAM tier and come back as spares,
+    // while a VRAM reserve big enough to matter on CUDA1 (it lends 3021 MB of a 3048 MB maximum) would halve its
+    // chunk - which is exactly what the flatten-to-smallest rule then spreads to all four parts.
+    const uint64_t dropped_before = S->dropped;
+    if (!lend_tail(S->need + kMmqSlab, S->moved, S->dropped, err)) return false;
+    {
+        const size_t base = (size_t) (S->region + S->need);
+        const size_t end = std::min((size_t) (S->region + S->need + kMmqSlab), F->lend_end);
+        const size_t nbytes = end > base ? end - base : 0;
+        mmq::pool_slab(dev_, nbytes > 0 ? (void*) base : nullptr, nbytes);
+        static bool said[8] = {};
+        if (dev_ >= 0 && dev_ < 8 && !said[dev_]) {
+            said[dev_] = true;
+            std::fprintf(stderr,
+                         "glm prefill: CUDA%d the MMQ scratch pool has %.1f MB of the loan (%.1f MB past the layout's "
+                         "need; %llu experts more lent for it)\n",
+                         dev_, (double) nbytes / 1048576.0, (double) kMmqSlab / 1048576.0,
+                         (unsigned long long) (S->dropped - dropped_before));
+        }
+    }
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
     mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used, F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
@@ -1104,6 +1172,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         return false;
     }
     const int NE = g_.n_expert;
+    F->lend_end = (size_t) F->xpool + F->xpool_bytes;   // narrowed below to the first slot the lending keeps
     {
         std::lock_guard<std::mutex> lk(F->mu);
         int nu = 0;
@@ -1192,7 +1261,11 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             size_t ci = 0;
             for (int s = P.n_main; s < P.n; ++s) {
                 // a slot past the bytes this lending uses (a prompt's layout) stays with the decode
-                if (P.slot_ptr(s) >= F->xpool + limit) continue;
+                if (P.slot_ptr(s) >= F->xpool + limit) {
+                    // ... and it is the first live byte of this layer's tail: what precedes it is a loan nobody uses
+                    F->lend_end = std::min(F->lend_end, (size_t) P.slot_ptr(s));
+                    continue;
+                }
                 char& st = P.st[(size_t) s];
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
@@ -1245,6 +1318,7 @@ bool Glm5Model::prefill_return(std::string& err) {
     PrefillState* S = pf_;
     if (F == nullptr || S == nullptr || !S->lent) return true;
     cudaSetDevice(dev_);
+    mmq::pool_slab(dev_, nullptr, 0);   // the region goes back to the decode's experts: the scratch's loan is over
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm return compute", err) ||
         !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm return copies", err) ||
         (S->kv_ss && !glmfast::cuda_ok(cudaStreamSynchronize(S->kv_ss), "glm return KV stage", err))) return false;
@@ -1332,6 +1406,43 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     const cudaStream_t s = F->cs;
     const int E = g.n_embd, DI = g.d_inner(), HD = g.kda_head_dim, K = g.n_exp_used;
     const float one = 1.0f, zero = 0.0f;
+    {   // an error left in the thread's state by an earlier kernel is what the first cuBLAS call reports
+        const cudaError_t stale = cudaGetLastError();
+        if (stale != cudaSuccess)
+            std::fprintf(stderr, "glm prefill: CUDA%d stale CUDA error before this chunk's layers: %s\n", dev_,
+                         cudaGetErrorString(stale));
+    }
+
+    // the first GEMM a device fails, in full: its arguments, where A/B/C sit in the lent region, the layout's
+    // numbers and the card's free VRAM.  A cuBLAS refusal leaves no CUDA error behind when it never launched the
+    // kernel, so blas_ck's status alone could not say which of the two it was - this is what found that one
+    const auto gemm_fail = [&](cublasStatus_t st, const char* what, const void* A, const void* B, const void* C, int m,
+                               int n, int k, int lda, int ldb, int ldc) {
+        if (st == CUBLAS_STATUS_SUCCESS) return;
+        static bool once[8] = {};
+        if (dev_ < 0 || dev_ >= 8 || once[dev_]) return;
+        once[dev_] = true;
+        int cur = -1;
+        (void) cudaGetDevice(&cur);
+        const uint8_t* R = S->region;
+        const auto off = [&](const void* p) -> long long {
+            return (p == nullptr || R == nullptr) ? -1 : (long long) ((const uint8_t*) p - R);
+        };
+        std::fprintf(stderr,
+                     "glm prefill diag: CUDA%d %s failed %d: m=%d n=%d k=%d lda=%d ldb=%d ldc=%d A=%p B=%p C=%p "
+                     "A_off=%lld B_off=%lld C_off=%lld region=%p bytes=%zu need=%zu T=%d sub=%d\n",
+                     dev_, what, (int) st, m, n, k, lda, ldb, ldc, A, B, C, off(A), off(B), off(C), (const void*) R,
+                     S->region_bytes, S->need, S->T, S->sub);
+        size_t freeb = 0, totb = 0;
+        (void) cudaMemGetInfo(&freeb, &totb);
+        std::fprintf(stderr,
+                     "glm prefill diag: CUDA%d w16=%p(%zu) w32=%p(%zu) ws=%p(%zu) gbuf=%p(%zu) pbuf=%p(%zu) blas=%p "
+                     "cs=%p curdev=%d free=%zuMB of %zuMB cuda=%s\n",
+                     dev_, (const void*) S->w16, S->w16_elems, (const void*) S->w32, S->w32_elems, (const void*) S->ws,
+                     S->ws_bytes, (const void*) S->gbuf, S->gbuf_bytes, (const void*) S->pbuf, S->pbuf_bytes,
+                     (const void*) S->blas, (const void*) F->cs, cur, freeb >> 20, totb >> 20,
+                     cudaGetErrorString(cudaGetLastError()));
+    };
 
     // Y[t][N] (row stride ldy) = alpha * X[t][K] (F32, row stride ldx) . W[N][K]^T, W BF16 (widened in slices)
     const auto sgemm_bf16 = [&](const uint16_t* W, int N, int Kd, const float* X, int ldx, float* Y, int ldy, int Tn,
@@ -1340,9 +1451,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         for (int r0 = 0; r0 < N; r0 += rows) {
             const int n = std::min(rows, N - r0);
             gb::bf16_to_f32(W + (size_t) r0 * Kd, S->w32, (int64_t) n * Kd, s);
-            blas_ck(cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &alpha, S->w32, Kd, X, ldx, &zero, Y + r0,
-                                ldy),
-                    "sgemm");
+            {   // an error the widen kernels left behind would be what this GEMM reports as its own
+                static bool once = false;
+                if (!once) {
+                    once = true;   // an error the widen kernels left behind would be what the GEMM below reports
+                    const cudaError_t e = cudaGetLastError();
+                    if (e != cudaSuccess)
+                        std::fprintf(stderr, "glm prefill: CUDA%d stale CUDA error before the first GEMM: %s\n", dev_,
+                                     cudaGetErrorString(e));
+                }
+            }
+            const cublasStatus_t st = cublasSgemm(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &alpha, S->w32, Kd, X,
+                                                  ldx, &zero, Y + r0, ldy);
+            gemm_fail(st, "sgemm", S->w32, X, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
+            blas_ck(st, "sgemm");
         }
     };
     // Y[t][N] = X16[t][K] . deq(W)[N][K]^T (tensor cores, F32 accumulate); beta = 1 adds to Y.  A BF16 weight (a
@@ -1384,10 +1506,11 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 continue;
             }
 #endif
-            blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16, CUDA_R_16F, Kd, X16,
-                                 CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
-                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                    "gemm f16");
+            const cublasStatus_t st = cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16,
+                                                   CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy,
+                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+            gemm_fail(st, "gemm f16", S->w16, X16, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
+            blas_ck(st, "gemm f16");
         }
     };
     // the mHC read half for the whole chunk: (write half of the previous block,) mix dots, gates, x / x16

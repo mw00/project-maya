@@ -880,6 +880,7 @@ public:
     void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
     size_t pool_short_ = 0;                                // what that check found short of the reserve
     PoolBudget pool_b_;                                    // the budget the pool was carved from
+    static size_t mmq_scratch_reserve();      // ... of which the prompt path's MMQ scratch pool needs this much
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)
