@@ -1190,26 +1190,62 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         }
     }
     }
-    // the chunks are the smallest part's (as Strata's split): the others keep their pinned staging to that, and a
+    // The chunks are the smallest part's (as Strata's split): the others keep their pinned staging to that, and a
     // later card that holds the first one's chunk down is named (Strata #448: a small card in a split caps every
     // stage's chunk - prompts read slower than on the first card alone)
-    int tmin = 0;
-    for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get())
-        if (p->prefill_chunk() > 0) tmin = tmin == 0 ? p->prefill_chunk() : std::min(tmin, p->prefill_chunk());
-    if (tmin > 0) {
-        const int alone = prefill_chunk();
-        for (Glm5Model* p = split_next_.get(); p != nullptr; p = p->split_next_.get())
-            if (alone > tmin && p->prefill_chunk() == tmin) {
-                cudaDeviceProp prop{};
-                if (cudaGetDeviceProperties(&prop, p->dev_) != cudaSuccess) {
-                    cudaGetLastError();
-                    prop.name[0] = 0;
+    //
+    // STRATA_GLM_PREFILL_NEST=1 instead gives each part its own chunk, as a whole number of the step the part feeding
+    // it runs (glm_prefill's hop copies the sender's rows out one chunk at a time, so a receiver's step may be that
+    // many of the sender's; the unit chains part to part, so ratios that are not powers of two still line up, and a
+    // part whose own value is below its sender's step keeps it - the slice hop tolerates a step that starts or ends
+    // inside a sender chunk).  Only lowering happens: prefill_setup already proved each own value fits on its card.
+    // MEASURED 2026-10-15 on the byte-identical 100,535-token read, and why it is off by default: nesting makes every
+    // part's own sweep cheaper a token - CUDA1 0.695 -> 0.503 ms/token, CUDA2 0.737 -> 0.625, CUDA3 0.592 -> 0.535,
+    // 34.4 s less work over the four - but the pipeline cannot hide the fill and drain of steps twice as long: the
+    // read went 91.7 -> 98.6 s (0.91 -> 0.98 ms/token).  The head becomes the pacing part (0.702 ms/token, above
+    // every nested part) and 27.6 s of the 98.6 is chain fill and drain against 17.6 s of 91.7 before.  Worth
+    // revisiting only with a split that makes the head cheaper than the others.
+    // STRATA_GLM_PREFILL_SERIAL runs the equal-chunk shape too, one chunk for every part; glm_prefill reads the same
+    // values, so its carve needs no second test either way.
+    {
+        int T0 = 0;
+        for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get())
+            if (p->prefill_chunk() > 0) T0 = T0 == 0 ? p->prefill_chunk() : std::min(T0, p->prefill_chunk());
+        const bool serial = getenv("STRATA_GLM_PREFILL_SERIAL") != nullptr;
+        const bool nest = !serial && getenv("STRATA_GLM_PREFILL_NEST") != nullptr;
+        std::string nested;
+        if (T0 > 0) {
+            int unit = T0, unit_dev = dev_;   // what the part feeding this one runs: the next one nests on it
+            for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get()) {
+                const int own = p->prefill_chunk(), send_unit = unit, send_dev = unit_dev;
+                if (own <= 0) continue;
+                const int fit = nest ? (own >= send_unit ? own / send_unit * send_unit : own) : T0;
+                if (fit != own) {
+                    char why[192];
+                    if (serial)
+                        std::snprintf(why, sizeof why, "STRATA_GLM_PREFILL_SERIAL: one chunk for every part");
+                    else if (nest && own >= send_unit)
+                        std::snprintf(why, sizeof why, "a whole number of CUDA%d's %d (it fits %d alone)", send_dev,
+                                      send_unit, own);
+                    else if (nest)
+                        std::snprintf(why, sizeof why, "under CUDA%d's %d a step, so it keeps its own", send_dev,
+                                      send_unit);
+                    else
+                        std::snprintf(why, sizeof why, "the split's smallest");
+                    p->prefill_cap(fit, why);
                 }
-                std::fprintf(stderr, "glm prefill: WARNING: prompt chunk %d tokens, not %d: CUDA%d (%s) can lend only "
-                                     "that much of its expert pool - prompts read slower than on CUDA%d alone\n",
-                             tmin, alone, p->dev_, prop.name, dev_);
+                if (p != this && nest && fit > send_unit) {
+                    if (!nested.empty()) nested += ", ";
+                    nested += "CUDA" + std::to_string(p->dev_) + " " + std::to_string(fit / send_unit) + "x" +
+                              std::to_string(send_unit);
+                }
+                unit = fit;
+                unit_dev = p->dev_;
             }
-        for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get()) p->prefill_cap(tmin, "the split's smallest");
+        }
+        if (!nested.empty())
+            std::fprintf(stderr, "glm prefill: the split's chunks nest: CUDA%d %d, then %s\n", dev_, T0,
+                         nested.c_str());
     }
     cudaSetDevice(dev_);
     std::fprintf(stderr, "glm split: layers %s (one 64 KB host hop per boundary per token)\n", where.c_str());
