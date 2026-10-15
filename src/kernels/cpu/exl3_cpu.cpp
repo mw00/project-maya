@@ -532,7 +532,8 @@ EXL3_AVX2_INLINE __m256i avx2_odd_class(const __m256i (&R)[K], __m256i acc) {
     if constexpr (J == K) {
         return acc;
     } else {
-        return avx2_odd_class<K, RHO, J + 1>(R, _mm256_blend_epi32(acc, R[J], avx2_odd_mask<K, RHO, J>()));
+        constexpr int m = avx2_odd_mask<K, RHO, J>();   // (clang's _mm256_blend_epi32 is a macro: no template commas)
+        return avx2_odd_class<K, RHO, J + 1>(R, _mm256_blend_epi32(acc, R[J], m));
     }
 }
 template <int K, int... RHO>
@@ -563,7 +564,8 @@ EXL3_AVX2_INLINE __m256i avx2_gen_class(const __m256i (&R)[K], __m256i acc) {
                                     avx2_gen_lane<K, RHO, J, 2>(), avx2_gen_lane<K, RHO, J, 3>(),
                                     avx2_gen_lane<K, RHO, J, 4>(), avx2_gen_lane<K, RHO, J, 5>(),
                                     avx2_gen_lane<K, RHO, J, 6>(), avx2_gen_lane<K, RHO, J, 7>()));
-        return avx2_gen_class<K, RHO, J + 1>(R, _mm256_blend_epi32(acc, p, avx2_gen_mask<K, RHO, J>()));
+        constexpr int m = avx2_gen_mask<K, RHO, J>();   // (a macro under clang, as above)
+        return avx2_gen_class<K, RHO, J + 1>(R, _mm256_blend_epi32(acc, p, m));
     }
 }
 template <int K, int... RHO>
