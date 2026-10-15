@@ -470,6 +470,28 @@ static std::string prefill_mode() {
     return "auto";
 }
 
+// This part's own ceiling on the chunk: STRATA_GLM_PREFILL_MAX="7168,8192,16384,16384", one entry per part in the
+// split's order (the CUDA index), 0 or absent = no ceiling.  --prefill stays the whole split's ceiling and each part
+// still fits itself below it (a cap is a maximum, never a floor: a card that cannot lend the chunk keeps its own
+// smaller one).  The reason it exists: a chunk's buffers come out of that card's expert pool, so on the small cards
+// the loan is what decides how many experts stay resident while the prompt runs - a 16,384-token chunk on a 5060
+// borrows 2,775 MB of its 7.5 GB (measured: CUDA0's prestage ring 49 experts, CUDA1's none at all), and a chunk half
+// that size leaves the pool about that much more.  The parts are a chain, so the sizes need not be equal at all: the
+// hop copies a receiver's step out of its sender's chunks a piece at a time (glm_prefill's slice loop), and
+// load_pack_split leaves each part at whatever this says.
+static int prefill_max_cap(int dev) {
+    const char* v = getenv("STRATA_GLM_PREFILL_MAX");
+    if (v == nullptr || !v[0]) return 0;
+    int i = 0;
+    for (const char* p = v; *p != '\0'; ++i) {
+        const char* q = p;
+        while (*q != '\0' && *q != ',') ++q;
+        if (i == dev) return (int) std::max<int64_t>(0, std::atoll(std::string(p, (size_t) (q - p)).c_str()));
+        p = *q == ',' ? q + 1 : q;
+    }
+    return 0;
+}
+
 // a split's chunks are its smallest part's (prefill()): a part set up for longer ones keeps its pinned staging to that
 // (a 24 GB card sized for 32K tokens beside a 16 GB card's 22K would pin ~1.5 GB of hop and embedding rows no chunk
 // uses)
@@ -626,7 +648,12 @@ bool Glm5Model::prefill_setup(std::string& err) {
     const std::string mode = prefill_mode();
     const bool is_auto = mode == "auto";
     const int64_t auto_max = n_parts_ == 1 ? 32768 : 8192;
-    const int64_t ceiling = is_auto ? auto_max : (int64_t) std::atoll(mode.c_str());
+    const int64_t asked = is_auto ? auto_max : (int64_t) std::atoll(mode.c_str());
+    const int64_t cap = prefill_max_cap(dev_);   // STRATA_GLM_PREFILL_MAX: this part's own ceiling (0: none)
+    if (cap > 0 && cap < asked)
+        std::fprintf(stderr, "glm prefill: CUDA%d at most %lld tokens a chunk (STRATA_GLM_PREFILL_MAX)\n", dev_,
+                     (long long) cap);
+    const int64_t ceiling = cap > 0 && cap < asked ? cap : asked;
     // the pool to come: `per` slots a layer over the tier layers, as fast_setup sizes it from the same free VRAM
     size_t dev_free = 0, dev_total = 0;
     cudaMemGetInfo(&dev_free, &dev_total);
@@ -3150,11 +3177,12 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     if (const char* mn = getenv("STRATA_GLM_PREFILL_MIN")) min_n = std::max<int64_t>(1, std::atoll(mn));
     if ((int64_t) tokens.size() < min_n) return false;
     // the chunk for this prompt: no bigger than it needs (rounded up to 64), so it borrows only that much; a prompt
-    // longer than the head's chunk is cut into EQUAL chunks - the head's grid.  With STRATA_GLM_PREFILL_NEST=1 each
-    // later part's step is a whole number of the step of the part feeding it (load_pack_split reconciled each part's
-    // chunk to a multiple of its sender's), so a part with a bigger pool reads the same rows in fewer, longer steps:
-    // the hop copies the sender's chunks into it one at a time.  A single head chunk has nothing to nest (every part
-    // reads the whole prompt) and goes to every part as it is.  Without the knob - and under STRATA_GLM_PREFILL_SERIAL
+    // longer than the head's chunk is cut into EQUAL chunks - the head's grid.  With STRATA_GLM_PREFILL_NEST=1 every
+    // part keeps its own chunk (load_pack_split lowers none of them, and STRATA_GLM_PREFILL_MAX caps each where its
+    // card needs it), so a part with a bigger pool reads the same rows in fewer, longer steps and the hop copies the
+    // sender's chunks into it a piece at a time - a step may start or end inside a sender chunk.  A single head chunk
+    // has nothing to nest (every part reads the whole prompt) and goes to every part as it is.  Without the knob - and
+    // under STRATA_GLM_PREFILL_SERIAL
     // - load_pack_split left every part at the smallest part's chunk, so this same arithmetic gives them all the grid
     // (the multiple is 1) and the equal-chunk behavior needs no second test here.
     const int T0 = pf_->T;
@@ -3165,12 +3193,15 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
                                             : (int) std::min<int64_t>(T0, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
-    int step = Trun, send_chunk = T0;   // the sender's step (the head's grid to start) and the sender's own chunk
+    const int64_t n64 = (nn + 63) / 64 * 64;   // the whole prompt on the 64-token grid: no step needs to exceed it
+    int step = Trun;   // the head's grid, and every later part's step while the split has one chunk size
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
-        if (nchunks > 1 && m != this) {
-            const int own = m->prefill_chunk(), send_step = step;   // (own: never above its own - the cap holds it)
-            step = (int) std::min<int64_t>((int64_t) own, (int64_t) std::max<int>(1, own / send_chunk) * send_step);
-            send_chunk = own;
+        if (m != this) {
+            // a part the split left at a chunk of its own (STRATA_GLM_PREFILL_NEST with STRATA_GLM_PREFILL_MAX, so
+            // the parts' chunks differ) reads its own step: longer, shorter or unrelated to the head's, since the hop
+            // takes a step that starts or ends anywhere in its sender's chunks.  Equal chunks: the head's step.
+            const int own = m->prefill_chunk();   // never above its own - the cap holds it
+            step = nchunks > 1 && own != T0 ? (int) std::min<int64_t>((int64_t) own, n64) : std::min(step, own);
         }
         cudaSetDevice(m->dev_);
         m->prefill_carve(step, pos_ + nn);
