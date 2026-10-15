@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
 
@@ -11,6 +12,33 @@
 #include <vector>
 
 namespace strata::core {
+
+/// GLM's RAM-tier experts computed by a unified-memory helper. The existing
+/// portable pinned tier is the helper's weight storage; no second copy is made.
+class RamExpertHelper {
+public:
+    RamExpertHelper() = default;
+    ~RamExpertHelper();
+    RamExpertHelper(const RamExpertHelper&) = delete;
+    RamExpertHelper& operator=(const RamExpertHelper&) = delete;
+    bool open(int device, int n_embd, int n_ff,
+              const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+    bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                 const uint8_t* const* blobs, const float* weights, const float* x,
+                 float* out, std::string& err);
+    void close();
+    int device() const { return device_; }
+
+private:
+    struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
+    std::vector<Region> regions_;
+    int device_ = -1, n_embd_ = 0, n_ff_ = 0;
+    cudaStream_t stream_ = nullptr;
+    uint8_t* arena_ = nullptr;
+    float *x_ = nullptr, *out_ = nullptr;
+    void *xq_ = nullptr, *hq_ = nullptr;
+    strata::kernels::glmf::MoeDev plan_;
+};
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.

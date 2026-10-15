@@ -1692,13 +1692,58 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     if (F == nullptr || !F->lane_pending) return true;
     F->lane_pending = false;
     cudaSetDevice(dev_);
-    if (!fast_cpu_lane_setup(err)) return false;
+    if (!fast_cpu_lane_setup(err)) return false;   // keep the existing CPU pool/calibration for batched prefill
+    if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
+        if (!fast_helper_setup(err)) return false;
     F->svc = std::thread([this] { fast_service(); });
     glmfast::pin_thread(F->svc.native_handle(), F->cpu_pin);   // (the CPU lane's last worker: on its pool's node)
     return true;
 }
 
 // ---------------------------------------------------------------- the CPU lane
+bool Glm5Model::fast_helper_setup(std::string& err) {
+    FastState* F = fast_;
+    if (n_parts_ != 1 || exl3_ || g_.n_embd > 4096 || g_.n_exp_used > 8) {
+        err = "GLM expert helper: use one trunk GPU and native GGUF experts (up to 8 per route)";
+        return false;
+    }
+    std::vector<std::pair<void*, size_t>> regions;
+    for (const auto& r : F->rc) regions.push_back({r.base, (size_t) r.n * r.stride});
+    const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
+    if (device == dev_ || !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
+    win_lanes_stop();   // verify-window requests use the helper too, not the optional CPU window lanes
+    if (F->cpu_ans_h == nullptr) {
+        void* hp = nullptr;
+        if (!glmfast::cuda_ok(cudaHostAlloc(&hp, sizeof(gf::CpuAnswer), cudaHostAllocMapped | cudaHostAllocPortable),
+                             "GLM helper answer", err)) return false;
+        F->cpu_ans_h = (gf::CpuAnswer*) hp;
+        std::memset(hp, 0, sizeof(gf::CpuAnswer));
+    }
+    void* dp = nullptr;
+    if (!glmfast::cuda_ok(cudaHostGetDevicePointer(&dp, F->cpu_ans_h, 0), "GLM helper answer mapping", err) ||
+        (F->cpu_seq_d == nullptr && !glmfast::cuda_ok(cudaMalloc((void**) &F->cpu_seq_d, 64), "GLM helper sequence", err)) ||
+        !glmfast::cuda_ok(cudaMemset(F->cpu_seq_d, 0, 64), "GLM helper sequence reset", err)) return false;
+    F->md.cpu_seq = F->cpu_seq_d;
+    F->md.cpu_ans = dp;
+    if (F->cpu_fmt.size() != F->L.size()) F->cpu_fmt.assign(F->L.size(), strata::kernels::cpu::NativeFmt{});
+    for (int il = l0_; il < lt_; ++il) {
+        const auto& ly = F->L[(size_t) il];
+        if (ly.moe && gf::moe_supported(ly.gu_type) && gf::moe_supported(ly.d_type)) {
+            if (!strata::kernels::cpu::native_fmt(ly.gu_type, ly.d_type, g_.n_embd, g_.n_ff_exp,
+                                                 F->cpu_fmt[(size_t) il], err)) return false;
+        }
+    }
+    F->cpu_plan = 0;
+    for (int f = 1; f <= 8; ++f) F->cpu_plan |= (unsigned long long) f << (4 * f);
+    F->cpu_plan_start = F->cpu_plan;
+    F->cpu_retime = false;
+    F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helper's lane
+    std::fprintf(stderr, "glm helper: CUDA%d computes RAM-tier experts from %.2f GiB of mapped RAM; "
+                         "CUDA%d keeps all trunk layers and MTP; prefill unchanged\n",
+                 device, (double) F->ram_bytes / 1073741824.0, dev_);
+    return true;
+}
+
 // EXL3 on the CPU lane, one (token, expert) entry's rows: the gate and up inputs xh = H(x * suh), the down input, the
 // expert's output, the gate/up byte-sum products per band of 128 columns and half of the inputs, and the down input's
 // block sums.  lane_experts and win_cpu_merged both finish an entry with x3_gate_up_block / x3_down_block - the same
@@ -3178,6 +3223,12 @@ void Glm5Model::fast_destroy() {
     F->workers.reset();
     win_lanes_stop();   // (after the service thread: it hands them their routes)
     F->cpu_pool.reset();
+    if (F->helper.device() >= 0) {
+        std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms\n", F->helper.device(),
+                     (unsigned long long) F->helper_experts.load(), (unsigned long long) F->helper_routes.load(),
+                     (double) F->helper_us.load() / 1000.0);
+        F->helper.close();
+    }
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
     if (F->cpu_seq_d) cudaFree(F->cpu_seq_d);
     if (F->dcnt_d) cudaFree(F->dcnt_d);
@@ -3844,7 +3895,22 @@ void Glm5Model::fast_service() {
             // a verify window's token answers into its own slot (the device waits for them at the layer's end)
             gf::CpuAnswer* ans = F->cpu_ans_h;
             if (rq->win > 0 && rq->win < 16 && F->win.ans_h[rq->win] != nullptr) ans = F->win.ans_h[rq->win];
-            if (rq->win_n > 0 && F->win_lane[0] != nullptr && F->win_lane[1] != nullptr) {
+            if (F->helper.device() >= 0) {
+                const auto& ly = F->L[(size_t) rq->layer];
+                if (F->helper_failed.load(std::memory_order_acquire) ||
+                    !F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, ne, blob, w, rq->x,
+                                       ans->part, F->helper_error)) {
+                    // Retire the request so the main GPU can finish and report the error, not spin forever.
+                    std::fill_n(ans->part, g.n_embd, 0.0f);
+                    F->helper_failed.store(true, std::memory_order_release);
+                }
+                F->helper_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+                F->helper_routes.fetch_add(1, std::memory_order_relaxed);
+                F->helper_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+                std::atomic_thread_fence(std::memory_order_release);
+                ans->seq = next;
+            } else if (rq->win_n > 0 && F->win_lane[0] != nullptr && F->win_lane[1] != nullptr) {
                 // a batched window's token: its lane (token t on lane t % 2) answers it while this thread takes the
                 // next token's route (the ring entry, rq->x with it, stays until the device has the answer)
                 FastState::WinLane::Job j;

@@ -127,6 +127,22 @@ v1.0.11, greedy, 256-token answers (median of 10 requests):
 39 back-to-back requests (1.8-4K-token prompts) ran without an error. The default split (the midpoint + 2) measured
 best: moving two or four more layers to the first card did not speed up answers.
 
+### Experimental RAM-tier expert helper
+
+`STRATA_GLM_EXPERT_HELPER=1` is an opt-in alternative to a layer split: visible GPU 0 keeps every trunk layer,
+attention, state and MTP; visible GPU 1 computes the decode's RAM-tier experts. The helper must be a unified-memory
+GPU. It maps the existing portable pinned RAM tier, rather than allocating a duplicate expert cache. The primary
+GPU computes its resident experts concurrently; the existing CPU-lane answer channel returns the helper's sum.
+Experts in neither tier still use the existing disk-fetch path. Batched prefill keeps its primary-GPU staging path
+(the decode's CPU lane is replaced, but the existing CPU pool/calibration still serves prefill).
+Native GGUF experts only; EXL3 is not supported.
+
+For physical device 0 = 8060S and 1 = R9700, run the engine with `HIP_VISIBLE_DEVICES=1,0`,
+`STRATA_GLM_EXPERT_HELPER=1` and `STRATA_GLM_SPLIT=0`. The indices are process-local; the system order is unchanged.
+Keep the normal pack, context, headroom and MTP settings. Do not combine the helper with `--layer-split` or a
+nonzero `STRATA_GLM_SPLIT`. Unset `STRATA_GLM_EXPERT_HELPER` to restore the existing behavior. This experimental
+path does not claim general multi-GPU support or a speedup; measure it on the target hardware.
+
 ## Strix Halo
 
 Ryzen AI Max+ 395 / Radeon 8060S (`gfx1151`) uses unified memory. Use the same

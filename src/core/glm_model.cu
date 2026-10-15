@@ -1731,6 +1731,15 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
     // two-part split (default 1), STRATA_GLM_DEVS the devices of any split.
     const char* sp = getenv("STRATA_GLM_SPLIT");
     const std::string spec = sp != nullptr ? std::string(sp) : layer_split;
+    if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0') {
+        if ((!spec.empty() && spec != "0") || std::strspn(h, "0123456789") != std::strlen(h)) {
+            err = "GLM expert helper: give a helper device index, without a layer split";
+            return false;
+        }
+        double free_gib = 0;
+        if (!RemoteExperts::preflight(std::atoi(h), free_gib, err)) return false;
+        return load_pack(pack_dir, max_ctx, err);   // dense/state/MTP stay on device 0
+    }
     const auto ints = [](const std::string& s, std::vector<int>& out) {
         out.clear();
         std::stringstream ss(s);

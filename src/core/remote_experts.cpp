@@ -61,6 +61,96 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
 }
 } // namespace
 
+RamExpertHelper::~RamExpertHelper() { close(); }
+
+bool RamExpertHelper::open(int device, int n_embd, int n_ff,
+                           const std::vector<std::pair<void*, size_t>>& regions, std::string& err) {
+    close();
+    DeviceScope scope(device);
+    if (!scope.ok) { err = scope.error(device); return false; }
+    int integrated = 0;
+    if (!check(cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device), "integrated memory", err, device))
+        return false;
+    if (!integrated || n_embd <= 0 || n_embd > 4096 || n_embd % 32 || n_ff <= 0 || n_ff % 32) {
+        err = "GLM expert helper needs a unified-memory GPU and supported expert dimensions";
+        return false;
+    }
+    device_ = device;
+    n_embd_ = n_embd;
+    n_ff_ = n_ff;
+    for (const auto& [host, bytes] : regions) {
+        void* mapped = nullptr;
+        if (!check(cudaHostGetDevicePointer(&mapped, host, 0), "map RAM tier", err, device)) return false;
+        regions_.push_back({(const uint8_t*) host, (uint8_t*) mapped, bytes});
+    }
+    const size_t need = 2 * (size_t) n_embd * sizeof(float) + (size_t) (n_embd + 8 * n_ff) / 32 * 36 + 1024;
+    if (!check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "helper stream", err, device) ||
+        !check(cudaMalloc((void**) &arena_, need), "helper scratch", err, device)) return false;
+    uint8_t* at = arena_;
+    const auto take = [&](size_t bytes) {
+        void* p = at;
+        at += (bytes + 63u) & ~(size_t) 63u;
+        return p;
+    };
+    x_ = (float*) take((size_t) n_embd * sizeof(float));
+    out_ = (float*) take((size_t) n_embd * sizeof(float));
+    xq_ = take((size_t) n_embd / 32 * 36);
+    hq_ = take((size_t) 8 * n_ff / 32 * 36);
+    plan_.plan_ptr = (unsigned long long*) take(8 * sizeof(unsigned long long));
+    plan_.plan_w = (float*) take(8 * sizeof(float));
+    plan_.cpu_flag = (int*) take(64);
+    return check(cudaMemset(plan_.cpu_flag, 0, 64), "helper flags", err, device);
+}
+
+bool RamExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                              const uint8_t* const* blobs, const float* weights, const float* x,
+                              float* out, std::string& err) {
+    namespace gf = strata::kernels::glmf;
+    if (device_ < 0 || ne < 1 || ne > 8 || !gf::moe_supported(gu_type) || !gf::moe_supported(d_type)) {
+        err = "GLM expert helper: unsupported expert types or route width";
+        return false;
+    }
+    unsigned long long ptr[8] = {};
+    for (int i = 0; i < ne; ++i) {
+        const uintptr_t p = (uintptr_t) blobs[i];
+        for (const auto& r : regions_)
+            if (p >= (uintptr_t) r.host && p - (uintptr_t) r.host < r.bytes) {
+                ptr[i] = (unsigned long long) (r.mapped + (p - (uintptr_t) r.host));
+                break;
+            }
+        if (ptr[i] == 0) { err = "GLM expert helper: expert outside the mapped RAM tier"; return false; }
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    if (!check(cudaMemcpyAsync(x_, x, (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice, stream_),
+               "helper input", err, device_) ||
+        !check(cudaMemcpyAsync(plan_.plan_ptr, ptr, (size_t) ne * sizeof(ptr[0]), cudaMemcpyHostToDevice, stream_),
+               "helper pointers", err, device_) ||
+        !check(cudaMemcpyAsync(plan_.plan_w, weights, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
+               "helper weights", err, device_)) return false;
+    gf::quantize_q8_1(x_, xq_, n_embd_, stream_);
+    gf::moe_gate_up(gu_type, plan_, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
+    gf::moe_down(d_type, plan_, ne, n_embd_, n_ff_, down_off, hq_, nullptr, out_, stream_);
+    return check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+                 "helper result", err, device_) &&
+           check(cudaStreamSynchronize(stream_), "helper finish", err, device_);
+}
+
+void RamExpertHelper::close() {
+    if (device_ < 0) return;
+    DeviceScope scope(device_);
+    if (scope.ok) {
+        if (stream_) cudaStreamSynchronize(stream_);
+        if (arena_) cudaFree(arena_);
+        if (stream_) cudaStreamDestroy(stream_);
+    }
+    device_ = -1;
+    arena_ = nullptr;
+    stream_ = nullptr;
+    regions_.clear();
+    plan_ = {};
+}
+
 RemoteExperts::~RemoteExperts() { close(); }
 
 bool RemoteExperts::preflight(int device, double& free_gib, std::string& err) {
