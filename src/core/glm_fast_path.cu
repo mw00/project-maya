@@ -1851,8 +1851,8 @@ void x3_down_block(const X3Rows& R, const strata::kernels::cpu::Exl3Part& pd, in
 // another expert's - so the phases overlap, where a batch each waited for its slowest job (40 threads, ~6 RAM-tier
 // experts: the down pieces' ~100 jobs took three rounds for two and a third rounds' work).  A job waits only for jobs
 // claimed before it, which run, so the pool cannot deadlock
-template <class GU, class DN, class OUT>
-void x3_jobs(glmfast::Workers& pool, int n, int GQ, int DQ, int DB, const GU& gu, const DN& dn, const OUT& out) {
+template <class GU, class DN, class BandOut>
+void x3_jobs(glmfast::Workers& pool, int n, int GQ, int DQ, int DB, const GU& gu, const DN& dn, const BandOut& out) {
     constexpr int kN = 8 * Glm5Model::kWinMax;
     std::atomic<int> c_gu[kN], c_dn[kN];
     for (int i = 0; i < n; ++i) {
