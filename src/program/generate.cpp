@@ -2018,6 +2018,7 @@ static int glm_pack_generate(const Options& o) {
     };
     std::vector<std::unique_ptr<Gen>> gens;
     std::deque<Gen*> flight;     // issued, oldest first
+    std::deque<int> flight_groups;   // split rows: the sizes of the issued groups, oldest first
     // a request no idle context can hold yet (its prompt needs the large first context, which is busy): it waits
     // here with what its GEN line said, and is admitted when one frees
     struct Pending {
@@ -2037,6 +2038,20 @@ static int glm_pack_generate(const Options& o) {
     static const int64_t multi_room = (int64_t) env_num("STRATA_GLM_MULTI_ROOM", 16384);
     static const int multi_boundary_every = (int) env_num("STRATA_GLM_MULTI_BOUNDARY", 32);
     static const bool multi_spec = env_num("STRATA_GLM_MULTI_SPEC", 1) != 0;
+    static const int split_rows = std::clamp((int) env_num("STRATA_GLM_SPLIT_ROWS", 0), 0,
+                                             strata::core::Glm5Model::rows_max());
+    // Reuse split-row scheduler buffers; allocating vectors for each decode group defeats part of the batching gain.
+    std::vector<Gen*> split_group;
+    std::vector<int> split_seqs;
+    std::vector<int32_t> split_toks;
+    std::vector<strata::kernels::SamplerParams> split_sps;
+    if (split_rows > 0) {
+        const size_t cap = (size_t) split_rows;
+        split_group.reserve(cap);
+        split_seqs.reserve(cap);
+        split_toks.reserve(cap);
+        split_sps.reserve(cap);
+    }
     int since_boundary = 0;
     uint64_t multi_n = 0;        // tokens since the engine last had nothing to do (the STAT lines' rate)
     std::chrono::steady_clock::time_point multi_t1;
@@ -2207,6 +2222,7 @@ static int glm_pack_generate(const Options& o) {
             if (tok < 0) return false;
             gen_took(g, tok);
         }
+        flight_groups.clear();
         return true;
     };
     // a just-admitted request's first token, while the tail's logits are still its own
@@ -2238,6 +2254,7 @@ static int glm_pack_generate(const Options& o) {
             gp->done = true;
         }
         flight.clear();
+        flight_groups.clear();
         for (int c = 0; c < (int) ctxs.size(); ++c) {
             bind_ctx(c);
             snap_tokens.clear();
@@ -2469,6 +2486,57 @@ static int glm_pack_generate(const Options& o) {
             gen_sweep();
             return;
         }
+        if (split_rows > 0 && model.split_rows_ok()) {
+            split_group.clear();
+            const auto issue = [&]() -> bool {          // one batched step of the gathered group
+                if (split_group.empty()) return true;
+                split_seqs.clear();
+                split_toks.clear();
+                split_sps.clear();
+                for (Gen* gp : split_group) {
+                    split_seqs.push_back(gp->ctx);
+                    split_toks.push_back(gp->pending);
+                    split_sps.push_back(gp->sp);
+                }
+                if (!model.multi_issue_rows(split_seqs.data(), split_toks.data(), split_sps.data(),
+                                           (int) split_group.size(), err))
+                    return false;
+                for (Gen* gp : split_group) {
+                    gp->sp.counter += 1;
+                    gp->pending = -1;
+                    gp->inflight = true;
+                    flight.push_back(gp);
+                }
+                flight_groups.push_back((int) split_group.size());
+                split_group.clear();
+                return true;
+            };
+            for (auto& gp : gens) {
+                if (gp->done || gp->inflight || gp->pending < 0) continue;
+                split_group.push_back(gp.get());
+                if ((int) split_group.size() == split_rows && !issue()) { multi_fail(err); return; }
+            }
+            if (!issue()) { multi_fail(err); return; }
+            if (flight.empty()) { gen_sweep(); return; }
+            const int k = flight_groups.front();   // the oldest group, all of it
+            flight_groups.pop_front();
+            for (int j = 0; j < k; ++j) {
+                Gen& g = *flight.front();
+                flight.pop_front();
+                const int tok = model.multi_take(g.ctx, err);
+                g.inflight = false;
+                if (tok < 0) { multi_fail(err); return; }
+                gen_took(g, tok);
+            }
+            since_boundary += k;
+            if (multi_boundary_every > 0 &&
+                since_boundary >= multi_boundary_every * (int) std::max<size_t>(1, gens.size())) {
+                since_boundary = 0;
+                if (!multi_drain() || !model.multi_boundary(err)) { multi_fail(err); return; }
+            }
+            gen_sweep();
+            return;
+        }
         for (auto& gp : gens) {
             Gen& g = *gp;
             if (g.done || g.inflight || g.pending < 0) continue;
@@ -2506,7 +2574,7 @@ static int glm_pack_generate(const Options& o) {
 
     // STRATA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs STRATA_GLM_SEQS >= n): n synthetic
     // prompts of <prompt> tokens, then <gen> greedy tokens each - sequence 0 alone through the token path first (the
-    // reference), then all n at once through the pipelined decode; prints both rates and whether sequence 0 wrote the
+    // reference), then all n through the selected together, split-rows or pipelined path; prints both rates and whether
     // same tokens both ways.
     if (const char* mb = getenv("STRATA_GLM_MULTI_BENCH")) {
         int n = 2, L = 512, G = 256, K = 32, same_prompt = 0;
@@ -2588,6 +2656,8 @@ static int glm_pack_generate(const Options& o) {
         const auto t0 = now();
         int since = 0, boundaries = 0;
         const bool rows = model.rows_ok();   // one GPU: all n together, one step per token of each
+        const bool srows = !rows && split_rows > 0 && model.split_rows_ok();
+        const char* path = rows ? "together" : srows ? "split-rows" : "pipelined";
         if (rows) {
             std::vector<int> seqs((size_t) n), next((size_t) n);
             std::vector<int32_t> toks((size_t) n);
@@ -2600,9 +2670,70 @@ static int glm_pack_generate(const Options& o) {
                 ++boundaries;   // (one before every step, in the step itself)
             }
         }
-        for (int s = 0; s < n && !rows; ++s) {
+        for (int s = 0; s < n && !rows && !srows; ++s) {
             if (!model.multi_issue(s, out[(size_t) s].back(), g0, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
             q.push_back(s);
+        }
+        if (srows) {
+            std::deque<int> qg;
+            const auto issue_rows = [&](const std::vector<int>& seqs) -> bool {
+                for (size_t first = 0; first < seqs.size(); first += (size_t) split_rows) {
+                    const int k = std::min(split_rows, (int) (seqs.size() - first));
+                    std::vector<int> group_seqs;
+                    std::vector<int32_t> toks;
+                    std::vector<strata::kernels::SamplerParams> sps((size_t) k, g0);
+                    for (int j = 0; j < k; ++j) {
+                        const int s = seqs[first + (size_t) j];
+                        group_seqs.push_back(s);
+                        toks.push_back((int32_t) out[(size_t) s].back());
+                    }
+                    if (!model.multi_issue_rows(group_seqs.data(), toks.data(), sps.data(), k, err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return false;
+                    }
+                    for (const int s : group_seqs) q.push_back(s);
+                    qg.push_back(k);
+                }
+                return true;
+            };
+            std::vector<int> initial((size_t) n);
+            for (int s = 0; s < n; ++s) initial[(size_t) s] = s;
+            if (!issue_rows(initial)) return 1;
+            while (!qg.empty()) {
+                std::vector<int> again;
+                const auto take_group = [&](int k) -> bool {
+                    for (int j = 0; j < k; ++j) {
+                        const int s = q.front();
+                        q.pop_front();
+                        const int tok = model.multi_take(s, err);
+                        if (tok < 0) {
+                            std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                            return false;
+                        }
+                        out[(size_t) s].push_back(tok);
+                        if ((int) out[(size_t) s].size() < G) again.push_back(s);
+                    }
+                    return true;
+                };
+                const int k = qg.front();
+                qg.pop_front();
+                if (!take_group(k)) return 1;
+                since += k;
+                if (K > 0 && since >= K * n) {
+                    while (!qg.empty()) {
+                        const int k2 = qg.front();
+                        qg.pop_front();
+                        if (!take_group(k2)) return 1;
+                    }
+                    if (!model.multi_boundary(err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return 1;
+                    }
+                    ++boundaries;
+                    since = 0;
+                }
+                if (!issue_rows(again)) return 1;
+            }
         }
         while (!q.empty()) {
             const int s = q.front();
@@ -2633,7 +2764,7 @@ static int glm_pack_generate(const Options& o) {
         const double multi_s = secs(t0, now());
         st_b = model.fast_stats();
         tiers("solo", solo_a, solo_b, G);
-        tiers(model.rows_ok() ? "together" : "pipelined", st_a, st_b, n * G);
+        tiers(path, st_a, st_b, n * G);
         const auto agree = [](const std::vector<int>& a, const std::vector<int>& b) {
             size_t k = 0;
             while (k < a.size() && k < b.size() && a[k] == b[k]) ++k;
@@ -2646,7 +2777,7 @@ static int glm_pack_generate(const Options& o) {
                         agree(out[(size_t) s], solo));
         std::printf("MULTI BENCH %d seqs, prompt %d, %d tokens each: solo %.1f tok/s | %s %.1f tok/s total, "
                     "%.1f per sequence (%d boundaries) | sequence 0 same tokens: %zu of %zu\n", n, L, G,
-                    (G - 1) / solo_s, rows ? "together" : "pipelined", (double) n * (G - 1) / multi_s,
+                    (G - 1) / solo_s, path, (double) n * (G - 1) / multi_s,
                     (G - 1) / multi_s, boundaries, same, solo.size());
         for (int s = 0; s < n; ++s) {
             std::printf("  seq %d:", s);

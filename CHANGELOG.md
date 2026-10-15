@@ -4,6 +4,15 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+- **Batched decode across layer-split GPUs.** Opt-in `STRATA_GLM_SPLIT_ROWS=1..8` batches up to k requests on each
+  part, sharing dense weight reads while keeping sequence-specific attention and routed experts separate. On four RTX
+  4000 Ada GPUs with Maya-M, k=2 reached 94.50 tok/s aggregate for eight requests versus 74.42 tok/s for the legacy
+  pipeline (+27%, below the 30% target). Single-request timings stayed within 5%, and the long-context needle check
+  passed 8/8. At four requests, k=1 was within run-to-run noise of legacy, while larger groups reduced throughput;
+  k=2 is not a universal optimum. See [several requests at once](docs/SETTINGS.md#several-requests-at-once).
+
 ## v1.1.11 - 2026-10-15
 
 What fills each GPU, in the Monitor, and the expert pool's size as a setting in the config.

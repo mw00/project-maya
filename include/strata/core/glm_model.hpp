@@ -708,10 +708,22 @@ public:
     /// through the token path's own kernels, so each sequence gets the token the token path would give it.
     /// tokens_out[i]: sequence seqs[i]'s next token after tokens[i] (greedy, or sampled with sps[i]); every
     /// sequence's position advances by one.  n <= rows_max().
-    bool rows_ok() const { return rows_ != nullptr && split_next_ == nullptr && fast_ != nullptr; }
+    bool rows_ok() const { return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr; }
     static int rows_max();
     bool multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                     int* tokens_out, std::string& err);
+    /// LAYER SPLIT (glm_rows.cu): one token of each of n sequences through every part as one batched step per part,
+    /// queued like multi_issue (nothing waited for); multi_take(seqs[i]) returns each one's token.  n <= rows_max().
+    bool split_rows_ok() const;
+    bool multi_issue_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
+                          std::string& err);
+private:
+    struct RowSeq;
+    bool rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err);
+    bool rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err);
+    bool rows_layers(RowSeq* rw, int n, std::string& err);
+    bool rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err);
+public:
     struct RowsState;
     RowsState* rows_ = nullptr;
     bool rows_alloc(std::string& err);                     // load, several sequences on one GPU: before the pool
