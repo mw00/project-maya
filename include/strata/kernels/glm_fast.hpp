@@ -194,6 +194,7 @@ constexpr int kSpares = 3;
 /// The per-device routing state (device memory unless noted).
 struct MoeDev {
     unsigned long long* tab = nullptr;         // [3 tables, see above]
+    const uint8_t* helper_owned = nullptr;      // optional GLM helper ownership, checked before primary admission
     int n_keys = 0;                            // N = n_layers * n_expert
     unsigned long long* scratch = nullptr;     // [8] VRAM slots for fetched experts that could not be promoted
     unsigned long long* plan_ptr = nullptr;    // [8]

@@ -512,7 +512,7 @@ bool Glm5Model::fast_moe_window(int il, int t0, int T, int part, int gid, std::s
         a.limit = g.swiglu_exp;
         return a;
     };
-    const bool lane = F->cpu_plan != 0ull && F->cpu_fmt[(size_t) il].n_ff > 0;
+    const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
     // STRATA_GLM_TRUNK_KEEP / _MAP: a window token leaves out the same experts the token path would (8: none)
     const int keep = il == mtp_il_ ? 8 : glmfast::trunk_skip_from(il);
     static const int promote_min = [] {

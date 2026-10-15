@@ -1711,6 +1711,41 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     for (const auto& r : F->rc) regions.push_back({r.base, (size_t) r.n * r.stride});
     const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
     if (device == dev_ || !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
+    std::vector<int> ranked;
+    size_t requested = 0;
+    for (int il = l0_; il < lt_; ++il) {
+        const auto& ly = F->L[(size_t) il];
+        if (!ly.moe || !gf::moe_supported(ly.gu_type) || !gf::moe_supported(ly.d_type)) continue;
+        const int c = F->layer_rc[(size_t) il];
+        if (c < 0) continue;
+        const auto& R = F->rc[(size_t) c];
+        for (int e = 0; e < g_.n_expert; ++e) {
+            const int key = il * g_.n_expert + e;
+            if (F->slot_of[(size_t) key] >= 0) continue;
+            const int rs = F->ram_of[(size_t) key];
+            if (F->helper.integrated() && (rs < 0 || R.st[(size_t) rs] != FastState::kRHold)) continue;
+            ranked.push_back(key);
+            requested += R.stride;
+        }
+    }
+    if (!F->helper.reserve(F->n_keys, requested, err)) return false;
+    std::stable_sort(ranked.begin(), ranked.end(), [&](int a, int b) { return F->usage[(size_t) a] > F->usage[(size_t) b]; });
+    int resident = 0;
+    for (int key : ranked) {
+        const int il = key / g_.n_expert, e = key % g_.n_expert;
+        auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        if (R.stride > F->helper.available()) continue;
+        const int rs = F->ram_of[(size_t) key];
+        const uint8_t* host = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
+        if (!F->helper.insert(key, host, F->L[(size_t) il].blob, R.stride, err)) return false;
+        if (F->helper.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
+        ++resident;
+    }
+    if (!glmfast::cuda_ok(cudaMalloc((void**) &F->helper_owned_d, (size_t) F->n_keys), "GLM helper ownership", err) ||
+        !glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(), (size_t) F->n_keys,
+                                    cudaMemcpyHostToDevice), "GLM helper ownership upload", err)) return false;
+    F->md.helper_owned = F->helper_owned_d;
     win_lanes_stop();   // verify-window requests use the helper too, not the optional CPU window lanes
     if (F->cpu_ans_h == nullptr) {
         void* hp = nullptr;
@@ -1733,15 +1768,56 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
                                                  F->cpu_fmt[(size_t) il], err)) return false;
         }
     }
-    F->cpu_plan = 0;
-    for (int f = 1; f <= 8; ++f) F->cpu_plan |= (unsigned long long) f << (4 * f);
-    F->cpu_plan_start = F->cpu_plan;
     F->cpu_retime = false;
     F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helper's lane
-    std::fprintf(stderr, "glm helper: CUDA%d computes RAM-tier experts from %.2f GiB of mapped RAM; "
+    std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s; "
                          "CUDA%d keeps all trunk layers and MTP; prefill unchanged\n",
-                 device, (double) F->ram_bytes / 1073741824.0, dev_);
+                 device, resident, (double) F->helper.used() / 1073741824.0,
+                 F->helper.integrated() ? "mapped RAM (no extra weight copy)" : "VRAM (auto, 512 MiB headroom)", dev_);
     return true;
+}
+
+bool Glm5Model::fast_helper_adapt(std::string& err) {
+    FastState* F = fast_;
+    if (F->helper.device() < 0 || F->bg_hold) return true;
+    auto primary = F->slot_of;
+    for (const auto& m : F->bg) if (m.up) primary[(size_t) m.key] = m.vslot;
+    // A pending RAM read/copy is not a candidate until it lands.
+    for (size_t key = 0; key < primary.size(); ++key) {
+        const int rs = F->ram_of[key];
+        if (rs < 0) continue;
+        const auto& R = F->rc[(size_t) F->layer_rc[key / g_.n_expert]];
+        if (R.st[(size_t) rs] != FastState::kRHold && R.st[(size_t) rs] != FastState::kRHelper) primary[key] = 0;
+    }
+    const auto swaps = F->helper.swaps(F->cnt, primary, g_.n_expert, 8);
+    for (const auto& s : swaps) {
+        const int il = s.in / g_.n_expert;
+        auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
+        const int rs = F->ram_of[(size_t) s.in];
+        const uint8_t* src = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
+        if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, s.in % g_.n_expert, role, F->stage[0], 0, 1);
+        if (!F->helper.replace(s.out, s.in, src, err)) return false;
+        if (F->helper.integrated()) {
+            const int dst = F->ram_of[(size_t) s.out];
+            if (rs >= 0) {
+                R.st[(size_t) dst] = FastState::kRHold;
+                R.st[(size_t) rs] = FastState::kRHelper;
+            } else {
+                R.key[(size_t) dst] = s.in;
+                R.tick[(size_t) dst] = F->clock;
+                F->ram_of[(size_t) s.out] = -1;
+                F->ram_of[(size_t) s.in] = dst;
+                const unsigned long long zero = 0, ptr = (unsigned long long) (R.base + (size_t) dst * R.stride);
+                if (!glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.out), &zero, sizeof(zero), cudaMemcpyHostToDevice),
+                                     "helper old RAM entry", err) ||
+                    !glmfast::cuda_ok(cudaMemcpy(F->tab + F->rtab_key(s.in), &ptr, sizeof(ptr), cudaMemcpyHostToDevice),
+                                     "helper new RAM entry", err)) return false;
+            }
+        }
+        ++F->helper_swaps;
+    }
+    return swaps.empty() || glmfast::cuda_ok(cudaMemcpy(F->helper_owned_d, F->helper.owners().data(),
+                         (size_t) F->n_keys, cudaMemcpyHostToDevice), "helper adapted ownership", err);
 }
 
 // EXL3 on the CPU lane, one (token, expert) entry's rows: the gate and up inputs xh = H(x * suh), the down input, the
@@ -3224,11 +3300,12 @@ void Glm5Model::fast_destroy() {
     win_lanes_stop();   // (after the service thread: it hands them their routes)
     F->cpu_pool.reset();
     if (F->helper.device() >= 0) {
-        std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms\n", F->helper.device(),
+        std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.device(),
                      (unsigned long long) F->helper_experts.load(), (unsigned long long) F->helper_routes.load(),
-                     (double) F->helper_us.load() / 1000.0);
+                     (double) F->helper_us.load() / 1000.0, (unsigned long long) F->helper_swaps);
         F->helper.close();
     }
+    if (F->helper_owned_d) cudaFree(F->helper_owned_d);
     if (F->cpu_ans_h) cudaFreeHost(F->cpu_ans_h);
     if (F->cpu_seq_d) cudaFree(F->cpu_seq_d);
     if (F->dcnt_d) cudaFree(F->dcnt_d);
@@ -3519,7 +3596,7 @@ Glm5Model::FastStats Glm5Model::fast_stats() const {
             for (char c : P.st) s.pool_used += c == FastState::kResident;
         for (const auto& R : F->rc) {
             s.ram_slots += R.n;
-            for (char c : R.st) s.ram_used += c == FastState::kRHold || c == FastState::kRNew;
+            for (char c : R.st) s.ram_used += c == FastState::kRHold || c == FastState::kRNew || c == FastState::kRHelper;
         }
     }
     if (fast_ != nullptr) {
@@ -3887,25 +3964,45 @@ void Glm5Model::fast_service() {
             int ne = 0;
             const uint8_t* blob[8];
             float w[8];
+            int hn = 0, helper_keys[8];
+            float helper_w[8];
             for (int i = 0; i < g.n_exp_used; ++i)
                 if ((cm >> i) & 1u) {
-                    blob[ne] = (const uint8_t*) rq->cpu_src[i];
-                    w[ne++] = rq->w[i];
+                    const int key = rq->layer * g.n_expert + rq->ids[i];
+                    if (F->helper.owns(key)) {
+                        helper_keys[hn] = key;
+                        helper_w[hn++] = rq->w[i];
+                    } else {
+                        blob[ne] = (const uint8_t*) rq->cpu_src[i];
+                        w[ne++] = rq->w[i];
+                    }
                 }
             // a verify window's token answers into its own slot (the device waits for them at the layer's end)
             gf::CpuAnswer* ans = F->cpu_ans_h;
             if (rq->win > 0 && rq->win < 16 && F->win.ans_h[rq->win] != nullptr) ans = F->win.ans_h[rq->win];
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];
-                if (F->helper_failed.load(std::memory_order_acquire) ||
-                    !F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, ne, blob, w, rq->x,
-                                       ans->part, F->helper_error)) {
+                std::fill_n(ans->part, g.n_embd, 0.0f);
+                if (F->helper_failed.load(std::memory_order_acquire) || (hn > 0 &&
+                    !F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys, helper_w,
+                                       rq->x, ans->part, F->helper_error))) {
                     // Retire the request so the main GPU can finish and report the error, not spin forever.
                     std::fill_n(ans->part, g.n_embd, 0.0f);
                     F->helper_failed.store(true, std::memory_order_release);
                 }
-                F->helper_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
-                F->helper_routes.fetch_add(1, std::memory_order_relaxed);
+                // Quantize on the CPU only when this route actually has CPU fallback.
+                if (ne > 0) {
+                    const auto cpu_t0 = std::chrono::steady_clock::now();
+                    float cpu_part[4096];
+                    fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
+                    for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
+                    F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+                    F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
+                    F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - cpu_t0).count(), std::memory_order_relaxed);
+                }
+                F->helper_experts.fetch_add((uint64_t) hn, std::memory_order_relaxed);
+                F->helper_routes.fetch_add(hn > 0, std::memory_order_relaxed);
                 F->helper_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                           std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
                 std::atomic_thread_fence(std::memory_order_release);
@@ -4508,7 +4605,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 int ntop = 0;
                 for (int e = 0; e < NE; ++e) {
                     const size_t key = (size_t) il * NE + e;
-                    if (F->slot_of[key] >= 0) continue;
+                    if (F->slot_of[key] >= 0 || F->helper.owns((int) key)) continue;
                     const int rs = F->ram_of[key];
                     if (rs < 0 || R.st[(size_t) rs] != FastState::kRHold) continue;
                     const uint32_t h = F->cnt[key];
@@ -4564,6 +4661,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
     }
     flush();
+    if (ok && !fast_helper_adapt(err)) return false;
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
     static const bool diag = getenv("STRATA_GLM_TIER_DIAG") != nullptr;
     if (diag && ++F->diag_b % 64 == 0)
@@ -4775,7 +4873,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     md.pf_dst = F->pf_buf[il & 1] + 8;
     md.pf_n = F->pf_n_buf[il & 1];
     // the CPU lane splits this layer's RAM-tier experts when the CPU has a dot product for its types
-    const bool lane = F->cpu_plan != 0ull && F->cpu_fmt[(size_t) il].n_ff > 0;
+    const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
     // STRATA_GLM_PROMOTE_MIN=<n>: a fetched expert is kept in VRAM only when its aged route count clears n.
     // Unset or <= 1: the old rule (keep it whenever a spare is free).
     static const int promote_min = [] {

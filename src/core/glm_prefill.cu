@@ -1571,7 +1571,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         for (int e = 0; e < g.n_expert; ++e) {
             if (res[(size_t) e]) continue;
             const int rs = F->ram_of[(size_t) il * g.n_expert + e];
-            if (rs >= 0 && RC.st[(size_t) rs] == FastState::kRHold) continue;
+            if (rs >= 0 && (RC.st[(size_t) rs] == FastState::kRHold || RC.st[(size_t) rs] == FastState::kRHelper)) continue;
             const int vs = F->slot_of[(size_t) il * g.n_expert + e];   // a tail slot this prompt did not borrow
             if (vs >= 0 && P.st[(size_t) vs] == FastState::kResident) continue;
             v.push_back(e);
@@ -1614,7 +1614,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (vs >= 0 && vs < P.n && P.st[(size_t) vs] == FastState::kResident && P.key[(size_t) vs] == e)
                     continue;   // in VRAM (a main slot, or a tail slot this prompt did not borrow)
                 const int rs = F->ram_of[key];
-                if (rs < 0 || RC.st[(size_t) rs] != FastState::kRHold) continue;   // (disk: the reader's)
+                if (rs < 0 || (RC.st[(size_t) rs] != FastState::kRHold && RC.st[(size_t) rs] != FastState::kRHelper))
+                    continue;   // (disk: the reader's)
                 double sh = 0.0, w = 0.0;
                 if (us > 0.0) sh += F->usage[key] / us, w += 1.0;
                 if (ls > 0.0 && !lc.empty()) sh += lc[(size_t) e] / ls, w += 1.0;
@@ -2089,7 +2090,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const bool dev = vs >= P.n_main && vs < P.n && P.st[(size_t) vs] == FastState::kResident &&
                                  P.key[(size_t) vs] == e;
                 if (dev) src = P.slot_ptr(vs);
-                else if (rs >= 0 && RC.st[(size_t) rs] == FastState::kRHold) src = RC.base + (size_t) rs * RC.stride;
+                else if (rs >= 0 && (RC.st[(size_t) rs] == FastState::kRHold || RC.st[(size_t) rs] == FastState::kRHelper))
+                    src = RC.base + (size_t) rs * RC.stride;
                 staged.push_back(Staged{e, src, dev});
             }
             // the prompt's routing feeds the LFU counts the decode's tiers evict by

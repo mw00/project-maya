@@ -506,7 +506,8 @@ public:
     std::vector<std::pair<int32_t, int32_t>> profile_;     // its ranked (layer, expert) pairs, read by fast_setup
     bool fast_warm(std::string& err);                      // load-time: stream every expert into the tiers
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
-    bool fast_helper_setup(std::string& err);              // STRATA_GLM_EXPERT_HELPER: RAM-tier lane on a unified GPU
+    bool fast_helper_setup(std::string& err);              // STRATA_GLM_EXPERT_HELPER: complementary GPU cache
+    bool fast_helper_adapt(std::string& err);              // helper-only, at an idle boundary
     void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);
     // the same on `pool` with the rows act / hq / ff / dn, or x3 for an EXL3 pack (a verify window's CPU lanes:
     // FastState::win_lane, each with its own rows)

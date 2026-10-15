@@ -127,14 +127,18 @@ v1.0.11, greedy, 256-token answers (median of 10 requests):
 39 back-to-back requests (1.8-4K-token prompts) ran without an error. The default split (the midpoint + 2) measured
 best: moving two or four more layers to the first card did not speed up answers.
 
-### Experimental RAM-tier expert helper
+### Experimental expert helper
 
 `STRATA_GLM_EXPERT_HELPER=1` is an opt-in alternative to a layer split: visible GPU 0 keeps every trunk layer,
-attention, state and MTP; visible GPU 1 computes the decode's RAM-tier experts. The helper must be a unified-memory
-GPU. It maps the existing portable pinned RAM tier, rather than allocating a duplicate expert cache. The primary
-GPU computes its resident experts concurrently; the existing CPU-lane answer channel returns the helper's sum.
-Experts in neither tier still use the existing disk-fetch path. Batched prefill keeps its primary-GPU staging path
-(the decode's CPU lane is replaced, but the existing CPU pool/calibration still serves prefill).
+attention, state and MTP; visible GPU 1 owns a complementary expert cache. A unified-memory helper reserves slots
+in the existing portable pinned RAM tier (no second weight copy); a discrete helper uses its own VRAM, automatically
+sized by aligned expert bytes with 512 MiB left free. Primary admissions, prefetch and background promotions exclude
+helper-owned experts. At idle boundaries, colder helper experts can be replaced by hotter unowned experts of the same
+layer, using the cache coordination from [Strata PR #578](https://github.com/Niko1221/Strata/pull/578).
+The helper quantizes activations and reduces weighted expert outputs on its GPU before returning one vector per token.
+CPU quantization runs only for actual CPU fallback; uncovered experts retain the existing CPU/PCIe/disk paths.
+Batched prefill retains its primary-GPU staging and CPU pool, and may read helper-owned UMA slots without evicting them.
+All of this is part of the single helper switch; there is no separate optimization flag.
 Native GGUF experts only; EXL3 is not supported.
 
 For physical device 0 = 8060S and 1 = R9700, run the engine with `HIP_VISIBLE_DEVICES=1,0`,

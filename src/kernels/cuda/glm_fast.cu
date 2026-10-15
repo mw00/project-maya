@@ -3080,7 +3080,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             for (int i = 0; i < a.k; ++i) {
                 const size_t key = (size_t) a.layer * E + s_ids[i];
                 const unsigned int c = a.d.dcnt != nullptr ? ++a.d.dcnt[key] : 0u;
-                if (i < skip_from && a.d.tab[key] == 0ull && rtab[key] != 0ull) {
+                if (i < skip_from && a.d.tab[key] == 0ull && rtab[key] != 0ull &&
+                    !(a.d.helper_owned && a.d.helper_owned[key])) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
                 }
@@ -3103,6 +3104,10 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             s_cs[i] = 0ull;
             if (ptr == 0ull && i >= skip_from) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
+            } else if (ptr == 0ull && a.d.helper_owned && a.d.helper_owned[key]) {
+                // A helper resident is claimed BEFORE PCIe quotas, promotion or disk skipping.
+                // cpu_src stays zero: the host resolves this key in the helper's own cache.
+                cpu |= 1u << i;
             } else if (ptr == 0ull) {
                 src = rtab[key];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
@@ -3182,7 +3187,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                 const int e = s_pred[i];
                 if (e < 0) continue;
                 const size_t key = (size_t) L1 * E + e;
-                if (a.d.tab[key] != 0ull) continue;
+                if (a.d.tab[key] != 0ull || (a.d.helper_owned && a.d.helper_owned[key])) continue;
                 const unsigned long long src = rtab[key];
                 if (src == 0ull) continue;
                 int navail = 0, first = -1;
