@@ -8,9 +8,9 @@ GPU runs the rest.  Two of its settings depend on the PC more than on the model:
   STRATA_GLM_CPU_LANE    the CPU threads that compute them.  Every core is not always fastest: the experts are read
                          from RAM, and past the memory's bandwidth more threads only wait (or, on a hybrid CPU, the
                          efficiency cores make the rest wait for them).  Nor is the engine's own count always enough:
-                         it takes two thirds of CPUs without SMT siblings, which a VM's vCPUs also are - the engine
-                         runs with STRATA_GLM_CPU_LANE_MAX set to this PC's CPUs, so counts above its own are measured
-                         too.
+                         it takes two thirds of CPUs without SMT siblings, which a VM's vCPUs also are - on one GPU
+                         and such CPUs the engine runs with STRATA_GLM_CPU_LANE_MAX set to this PC's CPUs, so counts
+                         above its own, up to the pool it reports (INFO cpu_threads_max), are measured too.
   STRATA_GLM_READ_CHUNKS the pieces (x3) each expert the decode reads from the SSD comes in, when part of the model
                          lives there.  The best size depends on the drive, its driver and the CPU: 8 (the engine's) on
                          a Linux NVMe, 4 on a Windows laptop's Intel RST RAID (#67).
@@ -131,6 +131,24 @@ def lane_max() -> int:
     except (AttributeError, OSError):
         n = os.cpu_count() or 0
     return min(64, n)
+
+
+def smt_visible(sys_cpu: Path = Path("/sys/devices/system/cpu")) -> bool:
+    """Whether any CPU has an SMT sibling (its topology's thread_siblings_list names more than itself).  There the
+    engine's own count is already a thread per physical core, and more only adds siblings or another socket."""
+    try:
+        return any(len(cpu_list(f.read_text())) > 1 for f in sys_cpu.glob("cpu[0-9]*/topology/thread_siblings_list"))
+    except (OSError, ValueError):
+        return False
+
+
+def lane_max_env(cfg: dict, sys_cpu: Path = Path("/sys/devices/system/cpu")) -> dict:
+    """The calibration engine's MAX_ENV: a pool of this PC's CPUs - on one GPU without SMT siblings only (a split's
+    GPUs have a pool each or share one, and on SMT the counts above are siblings); {} elsewhere."""
+    if len(cfg.get("gpu") or [0]) != 1 or smt_visible(sys_cpu):
+        return {}
+    n = lane_max()
+    return {MAX_ENV: str(n)} if n > 0 else {}
 
 
 def cpu_list(text: str) -> list[int]:
@@ -274,7 +292,7 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
             return StrataEngine(c["exe"], engine_args(c), cwd=c.get("cwd"), log=c.get("log"), env=child_env(c))
     with tempfile.TemporaryDirectory(prefix="maya-calibrate-") as tmp:
         base = {**cfg, "args": without_writes(list(cfg.get("args") or [])),
-                "env": {**apply(cfg.get("env") or {}, {}), **usage_copy(cfg, Path(tmp)), MAX_ENV: str(lane_max())}}
+                "env": {**apply(cfg.get("env") or {}, {}), **usage_copy(cfg, Path(tmp)), **lane_max_env(cfg)}}
         return measure(base, prompt_ids(cfg), start_engine, say, host_thread_extras())
 
 
@@ -304,8 +322,11 @@ def measure(cfg: dict, ids_list, start_engine, say=print, extra_threads=()) -> d
             if by_share[f][0] < STOP_BELOW * max(v[0] for v in by_share.values()):
                 break
         best_share = max(by_share, key=lambda k: by_share[k][0])
-        # 2. the CPU threads, at that share: the engine's own count and fewer, then more (an engine whose pool has
-        #    room above its own count: MAX_ENV) - upward only while each count beats the best so far
+        # 2. the CPU threads, at that share: the engine's own count and fewer, then more - up to the pool the engine
+        #    reports (cpu_threads_max: MAX_ENV's pool, or the engine's own count where MAX_ENV does not apply - a pool
+        #    a split shares, DFlash2's two lanes, an engine without it), as a request's cpu_threads is capped at the
+        #    pool and a higher count would only measure the engine's own again (#178) - upward only while each count
+        #    beats the best so far
         by_threads = {}
         for w in sorted(thread_candidates(d_threads, extra_threads), reverse=True):
             by_threads[w] = [s.rate(tune_keys(best_share, None if w == d_threads else w))]
@@ -313,8 +334,8 @@ def measure(cfg: dict, ids_list, start_engine, say=print, extra_threads=()) -> d
             if by_threads[w][0] < STOP_BELOW * max(v[0] for v in by_threads.values()):
                 break
         try:
-            most = int((cfg.get("env") or {}).get(MAX_ENV) or 0)
-        except ValueError:
+            most = int(info.get("cpu_threads_max") or 0)
+        except (TypeError, ValueError):
             most = 0
         for w in more_thread_candidates(d_threads, most):
             best_so_far = max(v[0] for v in by_threads.values())

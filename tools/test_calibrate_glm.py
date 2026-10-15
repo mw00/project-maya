@@ -17,14 +17,20 @@ import calibrate_glm as CAL  # noqa: E402
 
 
 class FakeEngine:
-    """Decode tok/s = speed(share, threads); the engine started with share `own_share` and `threads` threads."""
+    """Decode tok/s = speed(share, threads); the engine started with share `own_share` and `threads` threads, in a
+    pool of `pool` (its own count when None; 0: an engine that does not report its pool) that caps a request's
+    cpu_threads as Workers::set_active does - `ran` holds the counts that really ran."""
 
-    def __init__(self, speed, threads=40, own_share=0.0):
+    def __init__(self, speed, threads=40, own_share=0.0, pool=None):
         self.speed = speed
         self.own = (own_share, threads)
+        self.pool = threads if pool is None else pool
         self.info = {"cpu_threads": threads, "pcie_share": f"{own_share:.2f}"}
+        if self.pool:
+            self.info["cpu_threads_max"] = self.pool
         self.last = {}
         self.requests = []
+        self.ran = []
         self.prompts = []
         self.closed = False
 
@@ -34,7 +40,9 @@ class FakeEngine:
         share = tune.get("pcie_frac", self.own[0])
         threads = tune.get("cpu_threads", self.own[1])
         self.requests.append((share, threads))
-        self.last = {"decode_ms": max_new / self.speed(share, threads) * 1000.0}
+        ran = min(threads, max(self.pool, self.own[1]))
+        self.ran.append(ran)
+        self.last = {"decode_ms": max_new / self.speed(share, ran) * 1000.0}
         for i in range(max_new):
             yield i
 
@@ -95,26 +103,43 @@ class Measure(unittest.TestCase):
         self.assertEqual(eng.prompts[:6], [(0,), (1,), (2,), (3,), (4,), (5,)])
 
     def test_more_threads_than_the_engines_own(self):
-        # a 16-vCPU KVM guest (#177): the engine takes 10, 14 is the fastest and all 16 far slower
+        # a 16-vCPU KVM guest (#177): the engine takes 10 in a pool of 16, 14 is the fastest and all 16 far slower
         rate = {10: 14.9, 12: 17.0, 14: 18.4, 15: 18.0, 16: 11.4}
-        eng = FakeEngine(lambda s, t: rate.get(t, 12.0), threads=10)
-        res, _ = run_measure(eng, {CAL.MAX_ENV: "16"})
+        eng = FakeEngine(lambda s, t: rate.get(t, 12.0), threads=10, pool=16)
+        res, _ = run_measure(eng)
         self.assertEqual(res["settings"], {CAL.THREADS_ENV: "14"})
         self.assertTrue({12, 14} <= {r[1] for r in eng.requests})
         self.assertFalse({15, 16} & {r[1] for r in eng.requests})       # the CPUs less two at most
 
     def test_more_threads_stop_once_slower(self):
         # past the memory's bandwidth: 12 threads lose to the engine's own 10, so 14 is not tried
-        eng = FakeEngine(lambda s, t: {10: 15.0, 12: 14.0, 14: 13.0}.get(t, 10.0), threads=10)
-        res, _ = run_measure(eng, {CAL.MAX_ENV: "16"})
+        eng = FakeEngine(lambda s, t: {10: 15.0, 12: 14.0, 14: 13.0}.get(t, 10.0), threads=10, pool=16)
+        res, _ = run_measure(eng)
         self.assertEqual(res["settings"], {})
         self.assertIn(12, {r[1] for r in eng.requests})
         self.assertNotIn(14, {r[1] for r in eng.requests})
 
     def test_no_pool_room_no_more_threads(self):
-        # an engine started without MAX_ENV has no threads above its own to give a request
+        # an engine whose pool is its own count (MAX_ENV unset) has no threads above it to give a request
         eng = FakeEngine(lambda s, t: 15.0 + t, threads=10)
         run_measure(eng)
+        self.assertLessEqual(max(r[1] for r in eng.requests), 10)
+
+    def test_a_pool_that_ignores_max_is_never_asked_for_more(self):
+        # a pool a split of 3+ GPUs shares (or DFlash2's two lanes) does not take MAX_ENV: 22 threads on an 88-CPU
+        # Xeon.  Asked for 42, it would run 22 again, and a noisy measurement there could save a count it never ran
+        # (#178's review: kept {PCIE_SHARE 0.10, CPU_LANE 42}).  The engine's reported pool is the limit
+        noise = iter([1.01] + [1.0] * 1000)
+        eng = FakeEngine(lambda s, t: 20.0 * (1.05 if abs(s - 0.1) < 1e-9 else 1.0) * next(noise), threads=22)
+        res, _ = run_measure(eng, {CAL.MAX_ENV: "64"})
+        self.assertLessEqual(max(r[1] for r in eng.requests), 22)
+        self.assertEqual(eng.ran, [r[1] for r in eng.requests])           # every count asked for really ran
+        self.assertLessEqual(int(res["settings"].get(CAL.THREADS_ENV, 22)), 22)
+
+    def test_an_engine_without_its_pool_size_gets_no_more(self):
+        # an engine older than cpu_threads_max: no upward sweep, whatever MAX_ENV says
+        eng = FakeEngine(lambda s, t: 15.0 + t, threads=10, pool=0)
+        run_measure(eng, {CAL.MAX_ENV: "16"})
         self.assertLessEqual(max(r[1] for r in eng.requests), 10)
 
     def test_no_cpu_lane(self):
@@ -183,6 +208,22 @@ class Helpers(unittest.TestCase):
         self.assertEqual(CAL.thread_candidates(40, (43, 21)), [40, 30, 27, 20, 10, 21])
         self.assertEqual(CAL.thread_candidates(3), [3, 2])
 
+    def test_lane_max_env(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "cpu"
+            for c in range(4):
+                t = root / f"cpu{c}" / "topology"
+                t.mkdir(parents=True)
+                t.joinpath("thread_siblings_list").write_text(f"{c}\n")          # a VM's vCPUs: no siblings
+            self.assertFalse(CAL.smt_visible(root))
+            self.assertEqual(CAL.lane_max_env({"gpu": [0]}, root), {CAL.MAX_ENV: str(CAL.lane_max())})
+            self.assertEqual(CAL.lane_max_env({}, root), {CAL.MAX_ENV: str(CAL.lane_max())})
+            self.assertEqual(CAL.lane_max_env({"gpu": [0, 1]}, root), {})            # a split: one GPU only
+            (root / "cpu0" / "topology" / "thread_siblings_list").write_text("0,2\n")
+            self.assertTrue(CAL.smt_visible(root))
+            self.assertEqual(CAL.lane_max_env({"gpu": [0]}, root), {})               # SMT: a core each already
+        self.assertFalse(CAL.smt_visible(Path(d) / "none"))                        # unreadable: no siblings known
+
     def test_more_thread_candidates(self):
         self.assertEqual(CAL.more_thread_candidates(10, 16), [12, 14])
         self.assertEqual(CAL.more_thread_candidates(13, 16), [14])
@@ -242,7 +283,8 @@ class Helpers(unittest.TestCase):
             finally:
                 CAL.prompt_ids = orig
             self.assertNotIn(CAL.THREADS_ENV, seen[0]["env"])                              # the engine's own choice
-            self.assertEqual(seen[0]["env"][CAL.MAX_ENV], str(CAL.lane_max()))            # room to try more
+            self.assertEqual({k: v for k, v in seen[0]["env"].items() if k == CAL.MAX_ENV},   # room to try more:
+                             CAL.lane_max_env(cfg))                                        # one GPU, no SMT
             self.assertNotEqual(Path(seen[0]["env"]["STRATA_GLM_USAGE"]), own)            # not this PC's own file
             self.assertEqual(own.read_text(), "3 7:12\n")
             # the learned profile and the trace are not written; the profile it starts from stays

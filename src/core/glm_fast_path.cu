@@ -2570,7 +2570,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
                                      "%d, %d on node %d\n", dev_, ta, groups[a].first, tb, groups[b].first);
             else
                 std::fprintf(stderr, "glm fast: CUDA%d a verify window's tokens on two CPU lanes of %d and %d threads, "
-                                     "unpinned\n", dev_, F->cpu_pool->size(), tb);
+                                     "unpinned\n", dev_, F->cpu_pool->active(), tb);
         }
     }
     // STRATA_GLM_CPU_CAL=<file>: reuse the timed values across starts, keyed by build, model, layer, card and pool
@@ -3477,6 +3477,10 @@ bool Glm5Model::set_pcie_share(double share) {
 
 int Glm5Model::cpu_lane_threads() const {
     return fast_ != nullptr && fast_->cpu_pool != nullptr ? fast_->cpu_pool->active() : 0;
+}
+
+int Glm5Model::cpu_lane_threads_max() const {
+    return fast_ != nullptr && fast_->cpu_pool != nullptr ? fast_->cpu_pool->size() : 0;
 }
 
 bool Glm5Model::set_cpu_lane_threads(int n) {
