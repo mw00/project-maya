@@ -132,6 +132,7 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
         }
         cv_.notify_all();
+        idle_cv_.notify_all();
         for (auto& t : th_) t.join();
     }
     void run(int n, const std::function<void(int)>& fn) {
@@ -158,8 +159,13 @@ public:
     }
     int size() const { return (int) th_.size() + 1; }
     // only the caller and the first n - 1 workers take jobs (fewer threads without a restart: setup's calibration);
-    // a batch's job count should be active() for one job a thread
-    void set_active(int n) { active_.store(std::max(1, std::min(n, size())), std::memory_order_release); }
+    // a batch's job count should be active() for one job a thread.  The workers left out wait on idle_cv_, which only
+    // this wakes (under mu_, so none misses it)
+    void set_active(int n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        active_.store(std::max(1, std::min(n, size())), std::memory_order_release);
+        idle_cv_.notify_all();
+    }
     int active() const { return active_.load(std::memory_order_acquire); }
 
 private:
@@ -177,17 +183,26 @@ private:
     void loop(int id) {
         uint64_t seen = gen_.load();
         for (;;) {
-            const auto t0 = std::chrono::steady_clock::now();
-            int spins = 0;
             // a worker set_active left out sleeps at once: spinning, it held a CPU the active ones and the disk
             // readers wanted, so the setup's calibration timed fewer threads on a CPU still full of spinners
-            // (24-core Ultra 9 275HX, no SMT, Windows: a decode's disk wait 16.8 ms with 24 threads, 8.1 ms with 16)
-            const bool idle = id + 1 >= active_.load(std::memory_order_acquire);
+            // (24-core Ultra 9 275HX, no SMT, Windows: a decode's disk wait 16.8 ms with 24 threads, 8.1 ms with 16).
+            // It sleeps on idle_cv_ until set_active takes it in, outside sleeping_: on cv_, every batch's notify_all
+            // woke it to sleep again, and the pool's sleepers made run() notify at all - the fewer threads active, the
+            // more of them, so a calibration measured the lower counts slower than they run (#178)
+            if (id + 1 >= active_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(mu_);
+                idle_cv_.wait(lk, [&] { return quit_.load() || id + 1 < active_.load(std::memory_order_acquire); });
+                if (quit_.load()) return;
+                seen = gen_.load(std::memory_order_acquire);   // (a batch already running goes on without it)
+                continue;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            int spins = 0;
             while (gen_.load(std::memory_order_acquire) == seen) {
                 if (quit_.load(std::memory_order_relaxed)) return;
                 cpu_relax();
-                if (idle || ((++spins & 255) == 0 &&
-                             std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_))) {
+                if ((++spins & 255) == 0 &&
+                    std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_)) {
                     std::unique_lock<std::mutex> lk(mu_);
                     sleeping_.fetch_add(1);
                     cv_.wait(lk, [&] { return quit_.load() || gen_.load() != seen; });
@@ -203,7 +218,7 @@ private:
     int spin_us_;
     std::vector<std::thread> th_;
     std::mutex mu_, run_mu_;
-    std::condition_variable cv_;
+    std::condition_variable cv_, idle_cv_;
     const std::function<void(int)>* volatile fn_ = nullptr;
     std::atomic<int> total_{0}, done_{0}, sleeping_{0}, active_;
     std::atomic<uint64_t> ticket_{0}, gen_{0};
@@ -513,6 +528,9 @@ struct Glm5Model::FastState {
     //      weighted sum (cpu_ans_h) before its down combine.  cpu_plan: how many of f RAM-tier experts go to the host.
     //      A split of 3+ GPUs shares one pool across its parts (fast_cpu_lane_setup).
     std::shared_ptr<glmfast::Workers> cpu_pool;
+    // the lane's own thread count when cpu_pool holds more (STRATA_GLM_CPU_LANE_MAX): a request that names no
+    // cpu_threads returns to it, not to the whole pool; 0 = the pool's size
+    int cpu_threads0 = 0;
     // one GPU with a DFlash drafter, on a host of two NUMA nodes or more (STRATA_GLM_WIN_LANES, on): a batched verify
     // window's tokens' CPU-lane experts go to two lane threads, token t to lane t % 2 - lane 0 drives cpu_pool (then
     // pinned to the GPU's node), lane 1 a pool of its own on another node - so the window's tokens run on both
