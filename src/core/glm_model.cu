@@ -2952,7 +2952,9 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         head_c0_ = hm.n / 2 / 128 * 128;
         const uint64_t nc = (uint64_t) (hm.n - head_c0_);
         bytes += al((uint64_t) hm.k * nc * hm.K / 8) + al(2 * (uint64_t) hm.k) + al(2 * nc) +
-                 al((uint64_t) kPipeSlots * g_.n_embd * 4) + al((uint64_t) kPipeSlots * nc * 4) + al(kPipeSlots * 8);
+                 al((uint64_t) kPipeSlots * g_.n_embd * 4) + al((uint64_t) kPipeSlots * nc * 4) + al(kPipeSlots * 8) +
+                 // a draft's head rows (GlmDflash::split_head)
+                 al((uint64_t) kWinMax * g_.n_embd * 4) + al((uint64_t) kWinMax * nc * 4) + al(kHdCandBytes) + al(4);
     }
     { cudaError_t e_ = cudaMalloc(&w_arena_, bytes); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
     w_arena_bytes_ = bytes;
@@ -3144,6 +3146,15 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         at += al((uint64_t) kPipeSlots * nc * 4);
         hh_pair_ = (int*) (base + at);
         at += al(kPipeSlots * 8);
+        hd_x_ = (float*) (base + at);
+        at += al((uint64_t) kWinMax * g_.n_embd * 4);
+        hd_lg_ = (float*) (base + at);
+        at += al((uint64_t) kWinMax * nc * 4);
+        hd_cand_ = base + at;
+        at += al(kHdCandBytes);
+        hh_skip_d_ = (int*) (base + at);
+        at += al(4);
+        cudaMemset(hh_skip_d_, 0, 4);
         x3::Mat M;
         M.trellis = (const uint32_t*) tr;
         M.suh = (const uint16_t*) suh;
@@ -3156,7 +3167,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         ws_map_["output.weight.hi"] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, nc};
         int lo = 0, hi = 0;
         cudaDeviceGetStreamPriorityRange(&lo, &hi);
-        if (cudaStreamCreateWithPriority(&hh_s_, cudaStreamNonBlocking, hi) != cudaSuccess) {
+        if (cudaStreamCreateWithPriority(&hh_s_, cudaStreamNonBlocking, hi) != cudaSuccess ||
+            cudaStreamCreateWithPriority(&hd_s_, cudaStreamNonBlocking, hi) != cudaSuccess) {
             err = "pack: the head split's stream";
             return false;
         }

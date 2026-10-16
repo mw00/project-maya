@@ -1296,9 +1296,13 @@ int mv_occ(int K) {
 // shared expert's 4096 x 2048 17.4 -> 16.5); with two a SM, a launch that would spill a short second wave (more blocks
 // than the SMs keep, less than one and a half times) takes twice the splits (RTX 5060 Ti, K5: that gate 99.4 -> 84.8
 // us, that down 100.6 -> 84.9)
-void mv_split(const Mat& m, int sms, int occ, int& S, int& kr) {
-    const int groups = m.n / kCols;
+// call_groups: the output blocks of the call's jobs of this code together - where an SM keeps three or more they
+// count against the target, not the job's own (RTX 3090, K6, a KDA layer's q, k and v, three 4096 x 8192 jobs:
+// 1536 blocks 119.6 us, 384 blocks 105.9); at two a SM the job's own (RTX 5060 Ti: the MLA layer's q_a and kv_a
+// together would lose 8%).  Never the activations: a window's token gets the token path's split
+void mv_split(const Mat& m, int sms, int occ, int& S, int& kr, int call_groups = 0) {
     const bool many = occ >= 3;
+    const int groups = many ? std::max(m.n / kCols, call_groups) : m.n / kCols;
     const int kr_min = many ? 128 : 256, target = (many ? 4 : 2) * sms, P = occ * sms;
     S = (m.k + kMaxKR - 1) / kMaxKR;
     while (groups * S < target && m.k / (S * 2) >= kr_min) S *= 2;
@@ -1373,6 +1377,11 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
         for (int c0 = 0; c0 < jobs[j].ncol; c0 += run) units[nu++] = {j, c0, std::min(run, jobs[j].ncol - c0)};
     }
+    // each job's call_groups (mv_split): the output blocks of the call's jobs of its code
+    int cg[kMaxMvJobs] = {};
+    for (int j = 0; j < n; ++j)
+        for (int q = 0; q < n; ++q)
+            if (jobs[q].m->K == jobs[j].m->K && jobs[q].m->cb == jobs[j].m->cb) cg[j] += jobs[q].m->n / kCols;
     bool done[sizeof(units) / sizeof(units[0])] = {};
     for (int i = 0; i < nu; ++i) {
         if (done[i]) continue;
@@ -1388,7 +1397,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             if (done[u] || m.K != m0.K || m.cb != m0.cb) continue;
             const int c0 = units[u].c0, nc = units[u].nc, groups = m.n / kCols;
             int S = 1, kr = 0;
-            mv_split(m, sms, mv_occ(m.K), S, kr);
+            mv_split(m, sms, mv_occ(m.K), S, kr, cg[units[u].j]);
             const size_t need = S > 1 ? (size_t) S * m.n * nc : 0;
             if (S > 1 && (part_at + need > kPartFloats || cnt_at + (size_t) groups > kCounters)) {
                 if (nb > 0) continue;   // the next launch

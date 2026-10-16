@@ -130,6 +130,16 @@ void kda_prep(const KdaPrepArgs& a, cudaStream_t s);
 void kda_rec(const float* q, const float* k, const float* v, const float* g1, const float* beta_raw,
              float* state, const float* g2, const float* norm_w, float eps, int n_head, int head_dim,
              void* out_q8_1, cudaStream_t s);
+/// kda_prep then kda_rec of one token through n <= kKdaLayers recurrent layers at once (two launches; each layer's
+/// arithmetic the one-layer kernels' bit for bit), the states only - no gated output (a window commit's replay).
+/// rec[i]'s q / k / v / g1 / g2: prep[i]'s out[0..2] / g1 / g2
+constexpr int kKdaLayers = 8;
+struct KdaRecArgs {
+    const float *q = nullptr, *k = nullptr, *v = nullptr, *g1 = nullptr, *beta_raw = nullptr;
+    float* state = nullptr;
+    const float *g2 = nullptr, *norm_w = nullptr;
+};
+void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps, cudaStream_t s);
 
 /// DSA, after the first projections: q_a norm (-> qr f32 + q8_1), kv_a norm into the latent cache
 /// at position p, the indexer key's layer norm into its cache, the compressor gate into its cache,
@@ -178,6 +188,13 @@ void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_hea
                float* q_abs, int64_t qa_stride, cudaStream_t s);
 bool mla_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int qk_nope,
                 int kv_lora, float* ctx, cudaStream_t s, bool lat_q8);
+/// mla_attend of T tokens in a few launches (up to kMlaTokMax tokens each; the tensor-core attention: NVIDIA sm_80+,
+/// kv_lora 512): token t's q_abs at q_abs + t * q_stride, its n_sel[t] cells at cells + t * c_stride, its ctx at
+/// ctx + t * ctx_stride - each token's sums mla_attend's bit for bit.  false: not available here (mla_attend per token)
+constexpr int kMlaTokMax = 8;
+bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
+                      const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+                      cudaStream_t s, bool lat_q8);
 void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
              void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
 /// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values

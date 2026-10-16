@@ -299,6 +299,12 @@ public:
     int* hh_pair_ = nullptr;           // ... and their argmax pairs (argmax_pair)
     cudaStream_t hh_s_ = nullptr;      // ... the stream they run on (the highest priority)
     cudaEvent_t hh_ev_[64] = {};       // ... a slot's result out (pair or logits copied to the host)
+    float* hd_x_ = nullptr;            // (the helper) a draft's head rows (kWinMax x n_embd), their logits (n_vocab - c0)
+    float* hd_lg_ = nullptr;
+    void* hd_cand_ = nullptr;          // ... and their slices' top-k candidates (kHdCandBytes)
+    cudaStream_t hd_s_ = nullptr;      // ... the stream they run on (not hh_s_: behind a window's late picks there)
+    int* hh_skip_d_ = nullptr;         // (the helper) its skip flag for a pick's half (a token past a wrong draft)
+    static constexpr size_t kHdCandBytes = (size_t) 1 << 20;
     float* ht_x_h_ = nullptr;          // (the last part) pinned: the slots' head inputs, the helper's logits, pairs
     float* ht_lg_h_ = nullptr;
     int* ht_pair_h_ = nullptr;
@@ -632,6 +638,8 @@ public:
     double spec_dev_ms_ = 0, spec_gap_ms_ = 0;
     int64_t spec_dev_n_ = 0;
     float* kda_bak_ = nullptr;                             // the head's saved recurrent states
+    bool kda_bak_cur_ = false;   // win_commit_part left kda_bak_ equal to the live states (the next pipelined begin's
+                                 // backup is not needed)
     float* spec_hop_h_[2] = {nullptr, nullptr};            // pinned hop slots by position parity
     cudaEvent_t spec_ev_hop_[2] = {nullptr, nullptr};
     bool spec_kda_copy(bool restore);
@@ -801,7 +809,10 @@ public:
     void win_crew_stop();
     /// window_pipe's token t: KDA layer il's projections go to its window input rows (window_commit replays from them)
     void win_kda_rows(int il, int t, float** proj, float** fa, float** ga, float** beta);
-    bool window_commit(int n_keep, std::string& err);
+    // (wait = false, a pipelined window: the parts' commit enqueues are not waited for - the next window's begin is
+    //  queued behind each on its crew thread; win_commit_wait before anything else reads the state)
+    bool window_commit(int n_keep, std::string& err, bool wait = true);
+    void win_commit_wait();
     bool win_reserve(std::string& err);                    // the window's buffers and state backup, before the pool
     void win_prof_report();                                // STRATA_GLM_WIN_PROF: each part's window time, then reset
     // ---- the DFlash drafter (src/core/glm_dflash.cu): the part with the head holds it, on its device

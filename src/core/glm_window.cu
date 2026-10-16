@@ -155,8 +155,8 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
                         al(T * (size_t) g.n_expert * f4) + 2 * al(T * FF * f4) + 2 * al(T * (size_t) g.n_ff_dense * f4) +
                         al(T * W.dhq_s) + al(TS * E * f4) + al(TS * W.xq_s) + al(TL * (size_t) g.n_vocab * f4) +
                         al(TS * sizeof(int)) + al(TS * E * f4) + al((size_t) n_kda * W.kin_layer * f4) +
-                        // the absorbed MLA's rows
-                        2 * al(T * (size_t) g.n_head * g.kv_lora * f4) +
+                        // the absorbed MLA's rows and the tokens' cells
+                        2 * al(T * (size_t) g.n_head * g.kv_lora * f4) + al(T * (size_t) g.n_sel_max() * sizeof(int)) +
                         // the batched MoE
                         2 * al(T * 8 * 8) + 2 * al(T * 8 * f4) + al(T * E * f4) + al(T * f4) +
                         al(T * ((size_t) FF / 32 * q8)) + al(T * E * f4) + al(T * 8 * ((size_t) g.n_ff_exp / 32 * q8)) +
@@ -202,6 +202,7 @@ bool Glm5Model::win_alloc(int tmax, std::string& err) {
     W.kin = n_kda > 0 ? take_f(at, (size_t) n_kda * W.kin_layer) : nullptr;
     W.q_abs = take_f(at, T * (size_t) g.n_head * g.kv_lora);
     W.ctx = take_f(at, T * (size_t) g.n_head * g.kv_lora);
+    W.cells = (int*) take_b(at, T * (size_t) g.n_sel_max() * sizeof(int));
     W.mplan_ptr = (unsigned long long*) take_b(at, T * 8 * 8);
     W.mfetch = (unsigned long long*) take_b(at, T * 8 * 8);
     W.mplan_w = take_f(at, T * 8);
@@ -299,6 +300,11 @@ bool Glm5Model::win_reserve(std::string& err) {
         err = "glm window: the recurrent-state backup did not allocate";
         return false;
     }
+    if (n_rec > 0 && F->rep == nullptr &&
+        cudaMalloc((void**) &F->rep, (size_t) gf::kKdaLayers * 5 * g.d_inner() * sizeof(float)) != cudaSuccess) {
+        cudaGetLastError();
+        F->rep = nullptr;   // (the commit replays layer by layer)
+    }
     if (F->cap == nullptr) {
         if (cudaMalloc((void**) &F->cap, (size_t) kWinMax * g.n_embd * sizeof(float)) != cudaSuccess) {
             cudaGetLastError();
@@ -336,6 +342,9 @@ void Glm5Model::win_free() {
     if (fast_->cap) cudaFree(fast_->cap);
     fast_->cap = nullptr;
     fast_->cap_rows = 0;
+    if (fast_->rep) cudaFree(fast_->rep);
+    fast_->rep = nullptr;
+    kda_bak_cur_ = false;
 }
 
 // tokens t0 .. t0 + T - 1 of the window (a staggered window's group; all of it: t0 0)
@@ -427,6 +436,13 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
     if (batched)
         gf::mla_q_abs(W.q + (size_t) t0 * qd, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, T, W.q_abs + (size_t) t0 * ad,
                       ad, s);
+    uint16_t* const lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
+    // every token's selection into its own row of W.cells, then one batched attention (not under KV streaming: there a
+    // token's blocks are made resident right before its own attention)
+    const int64_t nsm = g.n_sel_max();
+    thread_local std::vector<int> nsel;
+    nsel.clear();
+    const bool rows = batched && W.cells != nullptr && !kv_streamed(kv_, il);
     for (int t = t0; t < t0 + T; ++t) {
         const int64_t p = p0 + t;
         const float* iq = W.iq + (size_t) t * g.idx_heads * g.idx_key;
@@ -437,10 +453,14 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
                           pool_done, F->score, s);
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
-        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, F->cells, s);
-        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
+        int* const sel = rows ? W.cells + (size_t) (t - t0) * nsm : F->cells;
+        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
+        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
+        if (rows) {
+            nsel.push_back(n_sel);
+            continue;
+        }
         // KV streaming: this token's blocks resident before its attention (the next token's resolve runs after it)
-        uint16_t* const lat = (uint16_t*) (state_ + dsa_lat_[(size_t) il]);
         const int* cells = kv_attend_cells(kv_, il, lat, F->cells, n_sel, F->slot_cells, s);
         if (batched && gf::mla_attend(W.q_abs + (size_t) t * ad, lat, cells, n_sel, g.n_head, g.qk_nope, g.kv_lora,
                                       W.ctx + (size_t) t * ad, s, lat_q8_))
@@ -454,6 +474,25 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         }
         gf::mla(W.q + (size_t) t * qd, Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head, g.qk_nope, g.kv_lora, g.v_head,
                 (uint8_t*) W.attn_q + (size_t) t * W.aq_s, s, lat_q8_);
+    }
+    if (rows && !gf::mla_attend_batch(W.q_abs + (size_t) t0 * ad, ad, lat, W.cells, nsm, nsel.data(), T, g.n_head,
+                                      g.qk_nope, g.kv_lora, W.ctx + (size_t) t0 * ad, ad, s, lat_q8_)) {
+        for (int t = t0; t < t0 + T; ++t) {   // (no tensor-core attention here: per token, as without the rows)
+            const int* cells = W.cells + (size_t) (t - t0) * nsm;
+            const int n_sel = nsel[(size_t) (t - t0)];
+            if (batched && gf::mla_attend(W.q_abs + (size_t) t * ad, lat, cells, n_sel, g.n_head, g.qk_nope, g.kv_lora,
+                                          W.ctx + (size_t) t * ad, s, lat_q8_))
+                continue;
+            if (batched) {
+                batched = false;
+                if (t > t0) {
+                    err = "glm window: the batched MLA lost its attention mid-window";
+                    return false;
+                }
+            }
+            gf::mla(W.q + (size_t) t * qd, Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head, g.qk_nope, g.kv_lora, g.v_head,
+                    (uint8_t*) W.attn_q + (size_t) t * W.aq_s, s, lat_q8_);
+        }
     }
     if (batched)
         gf::mla_out(W.ctx + (size_t) t0 * ad, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, T,
@@ -1167,6 +1206,7 @@ struct Glm5Model::PipeCrew {
     std::vector<std::unique_ptr<Worker>> w;
     std::atomic<bool> failed{false};
     std::atomic<bool> fresh{false};   // this window's begin waits for the devices (win_pipe_begin_part)
+    std::vector<unsigned> commit_want;   // a commit not waited for (window_commit's wait = false): each part's count
     std::mutex emu;
     std::string err;
 };
@@ -1269,10 +1309,15 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
     Glm5Model* h = head_helper_;
     cudaMemcpyAsync(ht_x_h_ + (size_t) sl * E, hx, (size_t) E * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
     cudaEventRecord(ht_ev_[sl], F->cs);
-    // the helper's half on its own stream (no skip flag: this device's)
+    // the helper's half on its own stream, skipped with the token past a wrong draft by its own flag (the skip word is
+    // mapped for every device; this device's flag is not the helper's)
     gf::set_skip(nullptr);
     cudaSetDevice(h->dev_);
     cudaStreamWaitEvent(h->hh_s_, ht_ev_[sl], 0);
+    if (W.from != nullptr && h->hh_skip_d_ != nullptr) {
+        gf::skip_gate(W.from, t, h->hh_skip_d_, h->hh_s_);
+        gf::set_skip(h->hh_skip_d_);
+    }
     float* hxd = h->hh_x_ + (size_t) sl * E;
     float* hlg = h->hh_lg_ + (size_t) sl * nc;
     int* hpr = h->hh_pair_ + (size_t) sl * 2;
@@ -1287,6 +1332,7 @@ bool Glm5Model::win_head_split(int t, int sl, const float* hx, float* lg, std::s
         cudaMemcpyAsync(ht_pair_h_ + (size_t) sl * 2, hpr, 2 * sizeof(int), cudaMemcpyDeviceToHost, h->hh_s_);
     }
     cudaEventRecord(h->hh_ev_[sl], h->hh_s_);
+    gf::set_skip(nullptr);
     cudaSetDevice(dev_);
     gf::set_skip(W.from != nullptr ? W.skip_d : nullptr);
     if (!ok_h) {
@@ -1375,7 +1421,10 @@ bool Glm5Model::win_pipe_begin_part(bool fresh, std::string& err) {
         if (!idle) cudaGetLastError();
     }
     if (idle && !fast_boundary(err)) return false;
-    if (!spec_kda_copy(false)) {
+    // (a fresh window - the first of a decode, every 8th - backs up whatever the last commit left)
+    const bool cur = kda_bak_cur_ && !fresh;
+    kda_bak_cur_ = false;
+    if (!cur && !spec_kda_copy(false)) {
         err = "glm window: the recurrent-state backup did not allocate";
         return false;
     }
@@ -1552,6 +1601,7 @@ void Glm5Model::win_pipe_cancel_from(int t) {
 }
 
 void Glm5Model::win_pipe_drain() {
+    win_commit_wait();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
         if (m->fast_ != nullptr) cudaStreamSynchronize(m->fast_->cs);
@@ -1691,6 +1741,68 @@ void Glm5Model::win_commit_part(int n_keep) {
     const Glm5Geometry& g = g_;
     auto& W = F->win;
     cudaSetDevice(dev_);
+    // the kept tokens replayed onto the backup (the states before the window) through every recurrent layer at once,
+    // then the backup copied to the live states: one copy (not a restore and the next window's backup) and two
+    // launches a token (not two a token and layer).  STRATA_GLM_WIN_REPLAY=0: restored, then layer by layer (A/B)
+    static const bool batched = [] {
+        const char* v = getenv("STRATA_GLM_WIN_REPLAY");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (batched && F->rep != nullptr && kda_bak_ != nullptr && g.kda_head_dim == 128) {
+        const size_t sd = (size_t) g.d_inner() * g.kda_head_dim;
+        const size_t run = sd + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
+        const size_t di = (size_t) g.d_inner();
+        std::vector<int> layers;
+        for (int il = l0_; il < l1_; ++il)
+            if (g.is_recr(il)) layers.push_back(il);
+        for (int t = 0; t < n_keep; ++t)
+            for (size_t c0 = 0; c0 < layers.size(); c0 += gf::kKdaLayers) {
+                gf::KdaPrepArgs pa[gf::kKdaLayers];
+                gf::KdaRecArgs ra[gf::kKdaLayers];
+                const int n = (int) std::min<size_t>(gf::kKdaLayers, layers.size() - c0);
+                for (int i = 0; i < n; ++i) {
+                    const int il = layers[c0 + (size_t) i];
+                    const auto& Ly = F->L[(size_t) il];
+                    float* bak = kda_bak_ + (c0 + (size_t) i) * run;
+                    float* sc = F->rep + (size_t) i * 5 * di;
+                    const KdaIn in = kda_in(g, W.kin + (size_t) W.kin_of[(size_t) il] * W.kin_layer, W.tmax, t);
+                    gf::KdaPrepArgs& k = pa[i];
+                    for (int r = 0; r < 3; ++r) {
+                        k.proj[r] = in.proj[r];
+                        k.conv_w[r] = Ly.conv[r];
+                        k.out[r] = sc + (size_t) r * di;
+                    }
+                    k.conv_state = bak + sd;
+                    k.fa = in.fa;
+                    k.ga = in.ga;
+                    k.f_b = Ly.f_b;
+                    k.g_b = Ly.g_b;
+                    k.dt_bias = Ly.dt_bias;
+                    k.ssm_a = Ly.ssm_a;
+                    k.lower_bound = g.kda_lb;
+                    k.g1 = sc + 3 * di;
+                    k.g2 = sc + 4 * di;
+                    k.n_head = g.n_head;
+                    k.head_dim = g.kda_head_dim;
+                    k.d_conv = g.d_conv;
+                    gf::KdaRecArgs& r = ra[i];
+                    r.q = k.out[0];
+                    r.k = k.out[1];
+                    r.v = k.out[2];
+                    r.g1 = k.g1;
+                    r.beta_raw = in.beta;
+                    r.state = bak;
+                    r.g2 = k.g2;
+                    r.norm_w = Ly.ssm_norm;
+                }
+                gf::kda_layers(pa, ra, n, g.norm_eps, F->cs);
+            }
+        for (size_t i = 0; i < layers.size(); ++i)
+            cudaMemcpyAsync(state_ + kda_S_[(size_t) layers[i]], kda_bak_ + i * run, run * sizeof(float),
+                            cudaMemcpyDeviceToDevice, F->cs);
+        kda_bak_cur_ = true;
+        return;
+    }
     spec_kda_copy(true);
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -1702,7 +1814,14 @@ void Glm5Model::win_commit_part(int n_keep) {
     }
 }
 
-bool Glm5Model::window_commit(int n_keep, std::string& err) {
+void Glm5Model::win_commit_wait() {
+    if (crew_ == nullptr || crew_->commit_want.empty()) return;
+    for (size_t i = 0; i < crew_->w.size() && i < crew_->commit_want.size(); ++i)
+        while (crew_->w[i]->commits.load(std::memory_order_acquire) < crew_->commit_want[i]) std::this_thread::yield();
+    crew_->commit_want.clear();
+}
+
+bool Glm5Model::window_commit(int n_keep, std::string& err, bool wait) {
     if (fast_ == nullptr || fast_->win.T < 1 || n_keep < 1 || n_keep > fast_->win.T) {
         err = "glm window: commit of " + std::to_string(n_keep) + " without a window of as many tokens";
         return false;
@@ -1715,6 +1834,7 @@ bool Glm5Model::window_commit(int n_keep, std::string& err) {
     const bool crewed = n_keep < T && fast_->win.piped && crew_ != nullptr && win_threads_on() &&
                         split_next_ != nullptr && !crew_->failed.load();
     if (crewed) {
+        win_commit_wait();
         std::vector<unsigned> want;
         for (auto& wk : crew_->w) {
             want.push_back(wk->commits.load(std::memory_order_acquire) + 1);
@@ -1724,8 +1844,8 @@ bool Glm5Model::window_commit(int n_keep, std::string& err) {
             }
             wk->cv.notify_one();
         }
-        for (size_t i = 0; i < crew_->w.size(); ++i)
-            while (crew_->w[i]->commits.load(std::memory_order_acquire) < want[i]) std::this_thread::yield();
+        crew_->commit_want = std::move(want);
+        if (wait) win_commit_wait();
     }
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (n_keep < T && !crewed) m->win_commit_part(n_keep);

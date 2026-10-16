@@ -2311,8 +2311,9 @@ __global__ void embed_streams_kernel(const float* __restrict__ emb, float* __res
 }
 
 // ---------------------------------------------------------------- KDA
-__global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ KdaPrepArgs a) {
-    const int h = blockIdx.x, role = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+// one block of kda_prep (head h, role) - the one-layer kernel's and the layers' (kda_layers) alike
+__device__ __forceinline__ void kda_prep_block(const KdaPrepArgs& a, int h, int role) {
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int hd = a.head_dim;
     const int d_inner = a.n_head * hd;
     __shared__ float sred[32];
@@ -2362,13 +2363,24 @@ __global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ K
     }
 }
 
-__global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ q, const float* __restrict__ k,
-                                                      const float* __restrict__ v, const float* __restrict__ g1,
-                                                      const float* __restrict__ beta_raw, float* __restrict__ state,
-                                                      const float* __restrict__ g2, const float* __restrict__ norm_w,
-                                                      float eps, int n_head, block_q8_1* __restrict__ out) {
+__global__ void __launch_bounds__(128) kda_prep_kernel(const __grid_constant__ KdaPrepArgs a) {
+    kda_prep_block(a, blockIdx.x, blockIdx.y);
+}
+struct KdaPrepBatch {
+    KdaPrepArgs a[kKdaLayers];
+};
+__global__ void __launch_bounds__(128) kda_prep_layers_kernel(const __grid_constant__ KdaPrepBatch b) {
+    kda_prep_block(b.a[blockIdx.z], blockIdx.x, blockIdx.y);
+}
+
+// one block (head h) of kda_rec; out == nullptr: the state only (a commit's replay)
+__device__ __forceinline__ void kda_rec_block(const float* __restrict__ q, const float* __restrict__ k,
+                                              const float* __restrict__ v, const float* __restrict__ g1,
+                                              const float* __restrict__ beta_raw, float* __restrict__ state,
+                                              const float* __restrict__ g2, const float* __restrict__ norm_w,
+                                              float eps, block_q8_1* __restrict__ out, int h) {
     constexpr int HD = 128;
-    const int h = blockIdx.x, t = threadIdx.x, j = t & (HD - 1), half = t >> 7, lane = t & 31;
+    const int t = threadIdx.x, j = t & (HD - 1), half = t >> 7, lane = t & 31;
     __shared__ float sq[HD], sk[HD], sdec[HD], sdel[HD];
     __shared__ float sacc[2][HD];
     __shared__ float sred[32];
@@ -2403,6 +2415,7 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
         O += s2 * sq[i];
     }
     __syncthreads();
+    if (out == nullptr) return;   // (uniform: the whole block)
     sacc[half][j] = O;
     __syncthreads();
     const float o = (sacc[0][j] + sacc[1][j]) * rsqrtf((float) HD);
@@ -2414,6 +2427,22 @@ __global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ 
         const float gv = o * inv * norm_w[j] * dsigmoid(g2[h * HD + j]);
         q8_1_store_warp(gv, out + h * (HD / 32) + (j >> 5), lane);
     }
+}
+
+__global__ void __launch_bounds__(256) kda_rec_kernel(const float* __restrict__ q, const float* __restrict__ k,
+                                                      const float* __restrict__ v, const float* __restrict__ g1,
+                                                      const float* __restrict__ beta_raw, float* __restrict__ state,
+                                                      const float* __restrict__ g2, const float* __restrict__ norm_w,
+                                                      float eps, int n_head, block_q8_1* __restrict__ out) {
+    kda_rec_block(q, k, v, g1, beta_raw, state, g2, norm_w, eps, out, blockIdx.x);
+}
+struct KdaRecBatch {
+    KdaRecArgs a[kKdaLayers];
+    float eps;
+};
+__global__ void __launch_bounds__(256) kda_rec_layers_kernel(const __grid_constant__ KdaRecBatch b) {
+    const KdaRecArgs& r = b.a[blockIdx.y];
+    kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, nullptr, blockIdx.x);
 }
 
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
@@ -2829,6 +2858,252 @@ __global__ void mla_combine_kernel(const float* __restrict__ part, int n_chunks,
         }
         ctx[(size_t) kv_lora * h + c] = acc * invL;
     }
+}
+
+// mla_split_kernel's chunk on tensor cores (NVIDIA sm_80+, kv_lora 512): the scores are a 16-head x 32-cell product
+// over 512 latent values and the context a 16 x 512 product over the 32 cells, so FP16 mma.sync (F32 sums) takes both
+// instead of one shared-memory read per multiply-add.  q (with the score scale folded in) and the exp-weights enter as
+// FP16 high + low parts, two mma each, so the products keep F32's precision; the latents are FP16 already.
+// The 4 warps split the scores' 512 values (their partial scores summed in a fixed order) and the context's columns.
+constexpr int MLA_KV = 512;
+constexpr int MLA_ROW = MLA_KV + 8;   // halves per shared latent row: 16 bytes of pad put ldmatrix's 8 rows on distinct banks
+constexpr int MLA_PROW = MLA_CHUNK + 8;
+constexpr size_t MLA_MMA_SMEM = (size_t) MLA_CHUNK * MLA_ROW * 2 + (size_t) 4 * 16 * MLA_CHUNK * 4 + (size_t) 2 * 16 * MLA_PROW * 2;
+__device__ __forceinline__ void mla_h2(float a, float b, uint32_t& hi, uint32_t& lo) {
+    const __half2 h = __floats2half2_rn(a, b);
+    const float2 r = __half22float2(h);
+    const __half2 l = __floats2half2_rn(a - r.x, b - r.y);
+    hi = *(const uint32_t*) &h;
+    lo = *(const uint32_t*) &l;
+}
+// a token's cells per block: at most MLA_NC blocks per head group, whole MLA_CHUNKs - a function of its cell count
+// alone, so a token's sums are the same whichever tokens share its launch
+constexpr int MLA_NC = 16;
+__host__ __device__ __forceinline__ int mla_cblk(int n_sel) {
+    return max(MLA_CHUNK, ((n_sel + MLA_NC - 1) / MLA_NC + MLA_CHUNK - 1) / MLA_CHUNK * MLA_CHUNK);
+}
+// the tokens of one launch (blockIdx.z): each one's selected cell count
+struct MlaToks {
+    int n_sel[kMlaTokMax];
+};
+// a block: 16 heads of one token over its cells [blockIdx.x * cblk, + cblk), MLA_CHUNK at a time with a running max
+// and sum per head (the context rows rescaled when the max grows), so a block's partial covers cblk cells
+__global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restrict__ q_abs, int64_t q_stride,
+                                                            const uint16_t* __restrict__ lat,
+                                                            const int* __restrict__ cells, int64_t c_stride, MlaToks nt,
+                                                            int n_head, int qk_nope, float* __restrict__ part, bool q8) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(STRATA_USE_HIP)
+    extern __shared__ uint4 smem4[];
+    uint16_t* sL = (uint16_t*) smem4;                       // MLA_CHUNK x MLA_ROW
+    float* sS = (float*) (sL + MLA_CHUNK * MLA_ROW);        // per warp: 16 heads x MLA_CHUNK partial scores
+    uint16_t* sP = (uint16_t*) (sS + 4 * 16 * MLA_CHUNK);   // exp-weights' high / low parts: 2 x 16 x MLA_PROW
+    __shared__ int s_cell[MLA_CHUNK];
+    __shared__ float s_m[16], s_l[16], s_a[16];
+    const int tk = blockIdx.z, n_sel = nt.n_sel[tk], cblk = mla_cblk(n_sel);
+    const int c_begin = blockIdx.x * cblk;
+    if (c_begin >= n_sel) return;
+    const int c_end = min(n_sel, c_begin + cblk);
+    q_abs += tk * q_stride;
+    cells += tk * c_stride;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
+    const int h0 = blockIdx.y * 16, nh = min(16, n_head - h0);
+    float* pm = part + (((size_t) tk * MLA_NC + blockIdx.x) * n_head + h0) * (MLA_KV + 2);
+    if (tid < 16) {
+        s_m[tid] = -INFINITY;
+        s_l[tid] = 0.0f;
+    }
+    const float scale = rsqrtf((float) qk_nope);
+    const uint32_t sL_a = (uint32_t) __cvta_generic_to_shared(sL);
+    const int m = lane >> 3, r = lane & 7;
+    float ctx[8][2][4] = {};   // this warp's 128 context columns of the 16 heads
+    for (int sc = c_begin; sc < c_end; sc += MLA_CHUNK) {
+        if (tid < MLA_CHUNK) s_cell[tid] = sc + tid < c_end ? cells[sc + tid] : -1;
+        __syncthreads();
+        if (!q8) {
+            uint4 v[MLA_CHUNK * MLA_KV / 8 / 128];
+#pragma unroll
+            for (int j = 0; j < MLA_CHUNK * MLA_KV / 8 / 128; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
+                const int cell = s_cell[s];
+                v[j] = cell < 0 ? make_uint4(0, 0, 0, 0) : ((const uint4*) (lat + (size_t) MLA_KV * cell))[c8];
+            }
+#pragma unroll
+            for (int j = 0; j < MLA_CHUNK * MLA_KV / 8 / 128; ++j) {
+                const int i = tid + 128 * j, s = i / (MLA_KV / 8), c8 = i % (MLA_KV / 8);
+                *(uint4*) (sL + s * MLA_ROW + 8 * c8) = v[j];
+            }
+        } else {
+            for (int i = tid; i < MLA_CHUNK * MLA_KV; i += 128) {
+                const int s = i / MLA_KV, c = i - s * MLA_KV, cell = s_cell[s];
+                sL[s * MLA_ROW + c] = cell < 0 ? (uint16_t) 0 : lat_h(lat_any(lat, true, MLA_KV, cell, c));
+            }
+        }
+        __syncthreads();
+        {   // scores over this warp's 128 latent values
+            float acc[4][4] = {};
+            const float* q0 = q_abs + (size_t) MLA_KV * (h0 + g) + 128 * warp + 2 * t;
+            const float* q1 = q0 + (size_t) MLA_KV * 8;
+            const bool r0 = g < nh, r1 = g + 8 < nh;
+#pragma unroll
+            for (int ks = 0; ks < 8; ++ks) {
+                const int k0 = 128 * warp + 16 * ks;
+                const float2 x[4] = {r0 ? *(const float2*) (q0 + 16 * ks) : make_float2(0.f, 0.f),
+                                     r1 ? *(const float2*) (q1 + 16 * ks) : make_float2(0.f, 0.f),
+                                     r0 ? *(const float2*) (q0 + 16 * ks + 8) : make_float2(0.f, 0.f),
+                                     r1 ? *(const float2*) (q1 + 16 * ks + 8) : make_float2(0.f, 0.f)};
+                uint32_t ah[4], al[4];
+#pragma unroll
+                for (int i = 0; i < 4; ++i) mla_h2(x[i].x * scale, x[i].y * scale, ah[i], al[i]);
+#pragma unroll
+                for (int np = 0; np < 2; ++np) {   // two cell tiles of 8 per ldmatrix.x4
+                    uint32_t b[4];
+                    const uint32_t addr =
+                        sL_a + 2u * (uint32_t) ((16 * np + (m >> 1) * 8 + r) * MLA_ROW + k0 + (m & 1) * 8);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                 : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(addr));
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        float* c = acc[2 * np + h];
+#pragma unroll
+                        for (int lo = 0; lo < 2; ++lo) {
+                            const uint32_t* a = lo ? al : ah;
+                            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, "
+                                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2 * h]), "r"(b[2 * h + 1]));
+                        }
+                    }
+                }
+            }
+            float* sw = sS + warp * 16 * MLA_CHUNK;
+#pragma unroll
+            for (int n8 = 0; n8 < 4; ++n8) {
+                *(float2*) (sw + g * MLA_CHUNK + 8 * n8 + 2 * t) = make_float2(acc[n8][0], acc[n8][1]);
+                *(float2*) (sw + (g + 8) * MLA_CHUNK + 8 * n8 + 2 * t) = make_float2(acc[n8][2], acc[n8][3]);
+            }
+        }
+        __syncthreads();
+        // per head: the running max and sum, the rescale of the context so far, the exp-weights' FP16 parts
+        for (int hh = warp; hh < 16; hh += 4) {
+            const float sc4 = sS[hh * MLA_CHUNK + lane] + sS[(16 + hh) * MLA_CHUNK + lane] +
+                              sS[(32 + hh) * MLA_CHUNK + lane] + sS[(48 + hh) * MLA_CHUNK + lane];
+            const float v = s_cell[lane] >= 0 && hh < nh ? sc4 : -INFINITY;
+            const float m_old = s_m[hh], m_new = fmaxf(m_old, warp_max(v));
+            const float alpha = m_old == -INFINITY ? 0.0f : expf(m_old - m_new);
+            const float e = (v == -INFINITY) ? 0.0f : expf(v - m_new);
+            const float l = warp_sum(e);
+            const __half eh = __float2half_rn(e);
+            sP[hh * MLA_PROW + lane] = __half_as_ushort(eh);
+            sP[(16 + hh) * MLA_PROW + lane] = __half_as_ushort(__float2half_rn(e - __half2float(eh)));
+            __syncwarp();
+            if (lane == 0) {
+                s_m[hh] = m_new;
+                s_l[hh] = s_l[hh] * alpha + l;
+                s_a[hh] = alpha;
+            }
+        }
+        __syncthreads();
+        {   // the exp-weighted context over this warp's 128 columns
+            uint32_t ah[2][4], al[2][4];
+#pragma unroll
+            for (int ks = 0; ks < 2; ++ks) {
+#pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const uint16_t* P = sP + 16 * q * MLA_PROW;
+                    uint32_t* a = q ? al[ks] : ah[ks];
+                    a[0] = *(const uint32_t*) (P + g * MLA_PROW + 16 * ks + 2 * t);
+                    a[1] = *(const uint32_t*) (P + (g + 8) * MLA_PROW + 16 * ks + 2 * t);
+                    a[2] = *(const uint32_t*) (P + g * MLA_PROW + 16 * ks + 8 + 2 * t);
+                    a[3] = *(const uint32_t*) (P + (g + 8) * MLA_PROW + 16 * ks + 8 + 2 * t);
+                }
+            }
+            const float a0 = s_a[g], a1 = s_a[g + 8];
+#pragma unroll
+            for (int np = 0; np < 8; ++np) {   // two column tiles of 8 per ldmatrix.x4.trans
+                const int c0 = 128 * warp + 16 * np;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    ctx[np][h][0] *= a0;
+                    ctx[np][h][1] *= a0;
+                    ctx[np][h][2] *= a1;
+                    ctx[np][h][3] *= a1;
+                }
+#pragma unroll
+                for (int ks = 0; ks < 2; ++ks) {
+                    uint32_t b[4];
+                    const uint32_t addr =
+                        sL_a + 2u * (uint32_t) ((16 * ks + (m & 1) * 8 + r) * MLA_ROW + c0 + (m >> 1) * 8);
+                    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                                 : "=r"(b[0]), "=r"(b[1]), "=r"(b[2]), "=r"(b[3]) : "r"(addr));
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                        for (int q = 0; q < 2; ++q) {
+                            const uint32_t* a = q ? al[ks] : ah[ks];
+                            float* c = ctx[np][h];
+                            asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, "
+                                         "{%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                                         : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                                         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[2 * h]), "r"(b[2 * h + 1]));
+                        }
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int np = 0; np < 8; ++np) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int c = 128 * warp + 16 * np + 8 * h + 2 * t;
+            if (g < nh) *(float2*) (pm + (size_t) g * (MLA_KV + 2) + c) = make_float2(ctx[np][h][0], ctx[np][h][1]);
+            if (g + 8 < nh)
+                *(float2*) (pm + (size_t) (g + 8) * (MLA_KV + 2) + c) = make_float2(ctx[np][h][2], ctx[np][h][3]);
+        }
+    }
+    if (tid < nh) {
+        pm[(size_t) tid * (MLA_KV + 2) + MLA_KV] = s_m[tid];
+        pm[(size_t) tid * (MLA_KV + 2) + MLA_KV + 1] = s_l[tid];
+    }
+#endif
+}
+
+// the merge of mla_split_mma_kernel's partials (MLA_NC slots a token): a block per (head, 128 columns, token), the
+// chunks' weights computed once into shared memory, then one coalesced pass over the chunks' partial rows
+__global__ void __launch_bounds__(128) mla_combine_wide_kernel(const float* __restrict__ part, MlaToks nt, int n_head,
+                                                               int kv_lora, float* __restrict__ ctx, int64_t ctx_stride) {
+    __shared__ float s_w[MLA_NC];
+    __shared__ float s_red[4];
+    const int h = blockIdx.x, tk = blockIdx.z, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int n_chunks = (nt.n_sel[tk] + mla_cblk(nt.n_sel[tk]) - 1) / mla_cblk(nt.n_sel[tk]);
+    const size_t st = (size_t) n_head * (kv_lora + 2);
+    const float* ph = part + (size_t) tk * MLA_NC * st + (size_t) h * (kv_lora + 2);
+    float M = -INFINITY;
+    for (int b = tid; b < n_chunks; b += 128) M = fmaxf(M, ph[b * st + kv_lora]);
+    M = warp_max(M);
+    if (lane == 0) s_red[warp] = M;
+    __syncthreads();
+    M = fmaxf(fmaxf(s_red[0], s_red[1]), fmaxf(s_red[2], s_red[3]));
+    __syncthreads();
+    float L = 0.0f;
+    for (int b = tid; b < n_chunks; b += 128) {
+        const float mb = ph[b * st + kv_lora];
+        const float w = mb == -INFINITY ? 0.0f : expf(mb - M);
+        s_w[b] = w;
+        L += w * ph[b * st + kv_lora + 1];
+    }
+    L = warp_sum(L);
+    if (lane == 0) s_red[warp] = L;
+    __syncthreads();
+    L = (s_red[0] + s_red[1]) + (s_red[2] + s_red[3]);
+    const float invL = L > 0.0f ? 1.0f / L : 0.0f;
+    const int c = blockIdx.y * 128 + tid;
+    if (c >= kv_lora) return;
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int b = 0; b < n_chunks; ++b) acc += s_w[b] * ph[b * st + c];
+    ctx[tk * ctx_stride + (size_t) kv_lora * h + c] = acc * invL;
 }
 
 __global__ void swiglu_q8_kernel(const float* __restrict__ gate, const float* __restrict__ up, float limit, int n,
@@ -4581,6 +4856,25 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
     launch_check("kda_rec");
 }
 
+void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps, cudaStream_t s) {
+    if (n <= 0) return;
+    if (n > kKdaLayers || prep[0].head_dim != 128) {
+        std::fprintf(stderr, "glm_fast kda_layers: %d layers, head_dim %d (at most %d, 128)\n", n, prep[0].head_dim,
+                     kKdaLayers);
+        return;
+    }
+    KdaPrepBatch pb;
+    KdaRecBatch rb;
+    for (int i = 0; i < n; ++i) {
+        pb.a[i] = prep[i];
+        rb.a[i] = rec[i];
+    }
+    rb.eps = eps;
+    kda_prep_layers_kernel<<<dim3(prep[0].n_head, 11, n), 128, 0, s>>>(pb);
+    kda_rec_layers_kernel<<<dim3(prep[0].n_head, n), 256, 0, s>>>(rb);
+    launch_check("kda_layers");
+}
+
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
     dsa_prep_kernel<<<3, 512, 0, s>>>(a);
     launch_check("dsa_prep");
@@ -4647,13 +4941,78 @@ void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_h
     launch_check("mla_out");
 }
 
+// the split attention's partials buffer of this device, at least `chunks` (chunk, n_head) slots; nullptr: not allocated
+static float* mla_part(int dev, int n_head, int kv_lora, int chunks, int* cap) {
+    static float* part[16] = {};
+    static int part_chunks[16] = {};
+    if (part_chunks[dev] < chunks) {
+        if (part[dev]) cudaFree(part[dev]);
+        const int want = std::max(chunks, 80);
+        if (cudaMalloc(&part[dev], (size_t) want * n_head * (kv_lora + 2) * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            part[dev] = nullptr;
+            part_chunks[dev] = 0;
+        } else {
+            part_chunks[dev] = want;
+        }
+    }
+    *cap = part_chunks[dev];
+    return part[dev];
+}
+
+// whether this device takes the tensor-core attention (NVIDIA sm_80+); STRATA_GLM_MLA_MMA=0: the F32 chunks (A/B)
+static bool mla_mma_on(int dev) {
+    static int on_[16] = {};
+    if (on_[dev] == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        const char* v = getenv("STRATA_GLM_MLA_MMA");
+        bool on = major >= 8 && (v == nullptr || std::atoi(v) != 0) && getenv("STRATA_GLM_MLA_ATTN1") == nullptr;
+#if defined(STRATA_USE_HIP)
+        on = false;
+#endif
+        if (on && cudaFuncSetAttribute(mla_split_mma_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                       (int) MLA_MMA_SMEM) != cudaSuccess) {
+            cudaGetLastError();
+            on = false;
+        }
+        on_[dev] = on ? 1 : 2;
+    }
+    return on_[dev] == 1;
+}
+
+bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
+                      const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+                      cudaStream_t s, bool lat_q8) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 16 || kv_lora != MLA_KV || T < 1 || getenv("STRATA_GLM_MLA1") != nullptr ||
+        !mla_mma_on(dev))
+        return false;
+    int cap = 0;
+    float* part = mla_part(dev, n_head, kv_lora, MLA_NC, &cap);
+    if (part == nullptr) return false;
+    // tokens a launch: their partials in the buffer at once
+    const int G = std::max(1, std::min({T, cap / MLA_NC, kMlaTokMax}));
+    for (int t0 = 0; t0 < T; t0 += G) {
+        const int nt = std::min(G, T - t0);
+        MlaToks tk{};
+        for (int i = 0; i < nt; ++i) tk.n_sel[i] = n_sel[t0 + i];
+        mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
+            q_abs + t0 * q_stride, q_stride, lat, cells + t0 * c_stride, c_stride, tk, n_head, qk_nope, part, lat_q8);
+        mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
+                                                                                         ctx + t0 * ctx_stride, ctx_stride);
+    }
+    launch_check("mla_attend_batch");
+    return true;
+}
+
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
                              int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8) {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev >= 16) return false;
-    static float* part[16] = {};
-    static int part_chunks[16] = {};
+    if (mla_attend_batch(q_abs, 0, lat, cells, 0, &n_sel, 1, n_head, qk_nope, kv_lora, ctx, 0, s, lat_q8)) return true;
     const int n_chunks = (n_sel + MLA_CHUNK - 1) / MLA_CHUNK;
     const size_t smem = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) MLA_HPB * MLA_CHUNK * sizeof(float);
     static int attr_smem[16] = {};
@@ -4669,24 +5028,14 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
                                  "attention instead\n", smem);
         }
     }
-    if (split_ok[dev] && kv_lora <= 512 && n_head <= 128 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr) {
-        if (part_chunks[dev] < n_chunks) {
-            if (part[dev]) cudaFree(part[dev]);
-            const int want = std::max(n_chunks, 80);
-            if (cudaMalloc(&part[dev], (size_t) want * n_head * (kv_lora + 2) * sizeof(float)) != cudaSuccess) {
-                cudaGetLastError();
-                part[dev] = nullptr;
-                part_chunks[dev] = 0;
-            } else {
-                part_chunks[dev] = want;
-            }
-        }
-    }
-    if (split_ok[dev] && part[dev] != nullptr && part_chunks[dev] >= n_chunks && kv_lora <= 512 &&
-        getenv("STRATA_GLM_MLA_ATTN1") == nullptr) {
+    int cap = 0;
+    float* part = split_ok[dev] && kv_lora <= 512 && n_head <= 128 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr
+                      ? mla_part(dev, n_head, kv_lora, n_chunks, &cap)
+                      : nullptr;
+    if (part != nullptr && cap >= n_chunks) {
         mla_split_kernel<<<dim3(n_chunks, (n_head + MLA_HPB - 1) / MLA_HPB), 256, smem, s>>>(
-            q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part[dev], lat_q8);
-        mla_combine_kernel<<<n_head, 256, 0, s>>>(part[dev], n_chunks, n_head, kv_lora, ctx);
+            q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, lat_q8);
+        mla_combine_kernel<<<n_head, 256, 0, s>>>(part, n_chunks, n_head, kv_lora, ctx);
     } else {
         mla_attn_kernel<<<n_head, 256, ((size_t) kv_lora + n_sel) * sizeof(float), s>>>(q_abs, lat, cells, n_sel,
                                                                                         qk_nope, kv_lora, ctx, lat_q8);

@@ -5213,8 +5213,10 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        // a pipelined window's token: is it past a wrong draft by now (its heavy kernels then do nothing)
-        if (F->win.pipe_t >= 0 && F->win.from != nullptr && F->win.skip_d != nullptr)
+        // a pipelined window's token: is it past a wrong draft by now (its heavy kernels then do nothing).  The
+        // window's first token never is (the first wrong draft is token 1 or later): its first layer here clears the
+        // flag a cancelled token may have left, and its other layers go without the gate (a host-memory read each)
+        if (F->win.pipe_t >= 0 && F->win.from != nullptr && F->win.skip_d != nullptr && (F->win.pipe_t > 0 || il == l0_))
             gf::skip_gate(F->win.from, F->win.pipe_t, F->win.skip_d, s);
         // the speculative pass of the two-half decode (STRATA_GLM_SPEC_CANCEL): was its draft found wrong meanwhile
         if (F->spec_gate) gf::skip_gate(F->spec_live_h, 0, F->spec_skip_d, s);
@@ -5876,6 +5878,7 @@ bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err) {
 bool Glm5Model::spec_kda_copy(bool restore) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
+    kda_bak_cur_ = false;
     const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
     int n_rec = 0;
     for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il);

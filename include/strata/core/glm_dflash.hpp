@@ -77,6 +77,13 @@ public:
     //  confidences up to it is at least p_cum)
     bool draft_finish(std::vector<int32_t>& out, std::string& err, std::vector<float>* conf = nullptr, int n_min = 0,
                       float p_cum = 0.0f);
+    /// The target's head split for the drafts' head (Glm5Model::head_split_link): its columns [0, c0) here (`lo`) and
+    /// [c0, vocab) on device `hdev` (`hi`, on its stream `hs`) at once, each side its own slices' top-k candidates,
+    /// the helper's copied in for the merge.  On the helper: `hx` (rows x n_embd floats), `hlg` (rows x (vocab - c0)
+    /// floats), `hcand` (cand_bytes).  A draft of more rows, or a c0 off the top-k's slices, keeps the whole head here.
+    /// STRATA_GLM_DFLASH_HEAD_SPLIT=0: off.  false: its pinned rows did not allocate
+    bool split_head(const WSlot* lo, const WSlot* hi, int c0, int hdev, cudaStream_t hs, float* hx, float* hlg,
+                    void* hcand, size_t cand_bytes, int rows, std::string& err);
     /// Forget every cached position at or past `from` (0: a new sequence, or a state loaded from elsewhere; else the
     /// sequence went back to `from` and the positions after it will hold other tokens).
     void reset(int64_t from = 0);

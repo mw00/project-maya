@@ -381,6 +381,7 @@ struct Glm5Model::FastState {
     float* conv[3] = {nullptr, nullptr, nullptr};
     float *fa = nullptr, *ga = nullptr, *beta = nullptr, *g1 = nullptr, *g2 = nullptr;
     void* gated_q = nullptr;
+    float* rep = nullptr;   // a window commit's replay (win_commit_part): kKdaLayers x 5 x d_inner (q k v g1 g2)
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
     int* cells = nullptr;
@@ -650,6 +651,7 @@ struct Glm5Model::FastState {
         float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
         float *q = nullptr, *iq = nullptr;
         float *q_abs = nullptr, *ctx = nullptr;   // the absorbed MLA's per-token rows (n_head x kv_lora each)
+        int* cells = nullptr;                     // each token's selected cells (n_sel_max a row): one batched attention
         void *qr_q = nullptr, *attn_q = nullptr;
         float *rlog = nullptr, *sh_g = nullptr, *sh_u = nullptr, *dg = nullptr, *du = nullptr;
         void* dhq = nullptr;
