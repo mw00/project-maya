@@ -20,6 +20,7 @@
 #define cudaDevAttrIntegrated hipDeviceAttributeIntegrated
 #define cudaDeviceGetAttribute hipDeviceGetAttribute
 #define cudaDeviceGetPCIBusId hipDeviceGetPCIBusId
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaDeviceCanAccessPeer hipDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess hipDeviceEnablePeerAccess
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
@@ -73,6 +74,7 @@
 #define cudaMallocHost(...) (::strata::hip_compat::malloc_host(__VA_ARGS__))
 #define cudaMemGetInfo hipMemGetInfo
 #define cudaMemcpy hipMemcpy
+#define cudaMemcpy2D hipMemcpy2D
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyDefault hipMemcpyDefault
@@ -90,6 +92,7 @@
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamEndCapture hipStreamEndCapture
 #define cudaStreamIsCapturing hipStreamIsCapturing
