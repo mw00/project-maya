@@ -196,7 +196,18 @@ class Plan:
         st = self.st
         if not st.has(hf + ".trellis"):
             if st.has(hf + ".weight"):
-                raise SystemExit("%s is stored unquantized; the packer expects it as EXL3" % hf)
+                # an unquantized matrix (neko-legends' 4bpw quantizes the routed experts only): a BF16
+                # float row - the engine's matmul serves BF16 rows as well as EXL3 ones, and the rows
+                # only q() reads become Q8_0 at load (F32/F16 sources convert here, at pack time)
+                dt, shp = st.t[hf + ".weight"][1], st.t[hf + ".weight"][2]
+                if dt not in ("F32", "F16", "BF16"):
+                    raise SystemExit("%s is %s; the packer needs it F32/F16/BF16 to store it as a BF16 float row"
+                                     % (hf, dt))
+                g = lambda hf=hf: st.f32(hf + ".weight")  # noqa: E731
+                self.bf16(gname, list(reversed(shp)), g)
+                self.notes.append("%s stored unquantized (%s in the source) - a BF16 float row, served dequantized"
+                                  % (hf, dt))
+                return
             raise SystemExit("%s: no tensor %s.trellis" % (gname, hf))
         if not st.has(hf + ".suh") or not st.has(hf + ".svh"):
             raise SystemExit("%s: EXL3 without suh/svh (an old packed-sign checkpoint); not supported" % hf)
@@ -233,7 +244,16 @@ class Plan:
                 self.f32(P + "hc_%s_base.weight" % s, None, g(H + "hc_%s_base" % s))
                 self.f32(P + "hc_%s_scale.weight" % s, None, g(H + "hc_%s_scale" % s))
             if il < n_layers and t["layer_types"][il] == "linear_attention":
-                self.mat(P + "attn_qkv.weight", A + "qkv_proj")
+                st0 = self.st
+                if not st0.has(A + "qkv_proj.trellis") and not st0.has(A + "qkv_proj.weight") \
+                        and all(st0.has(A + p + ".weight") for p in ("q_proj", "k_proj", "v_proj")):
+                    # the source keeps the KDA projections unfused: emit them as three float rows (they
+                    # are unquantized in the experts-only quants); the engine reads attn_q/k/v.weight
+                    # from the pack (fused rows or three rows alike serve the same slots)
+                    for q_, nm in zip("qkv", ("q_proj", "k_proj", "v_proj")):
+                        self.mat(P + "attn_%s.weight" % q_, A + nm)
+                else:
+                    self.mat(P + "attn_qkv.weight", A + "qkv_proj")
                 self.mat(P + "attn_output.weight", A + "o_proj")
                 self.f32(P + "ssm_a", None, lambda A=A: -np.exp(st.f32(A + "A_log").reshape(-1)[:n_head]))
                 self.f32(P + "ssm_dt.bias", None, g(A + "dt_bias"))
@@ -721,7 +741,11 @@ def main() -> int:
     st = SafeTensors(d)
     plan = Plan(st, t)
     nextn = int(t.get("num_nextn_predict_layers", 0) or 0)
-    mtp = nextn > 0 and not a.no_mtp and st.has("model.language_model.layers.%d.eh_proj.trellis" % t["num_hidden_layers"])
+    # the NextN block either EXL3-quantized (eh_proj.trellis) or carried unquantized (eh_proj.weight,
+    # the experts-only community quants): build() emits its matrices as float rows either way
+    mtp = nextn > 0 and not a.no_mtp and (
+        st.has("model.language_model.layers.%d.eh_proj.trellis" % t["num_hidden_layers"]) or
+        st.has("model.language_model.layers.%d.eh_proj.weight" % t["num_hidden_layers"]))
     if nextn > 0 and not mtp and not a.no_mtp:
         print("note: the config names a NextN block but the files do not carry it - packed without MTP")
     plan.build(mtp=mtp)
