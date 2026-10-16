@@ -653,6 +653,10 @@ struct GlmDflash::Impl {
     void *xq = nullptr, *aq = nullptr, *actq = nullptr;
     float* attn_part = nullptr;        // the split attention's partials: kAttnSplits x n_kv x kAttnQ x kAttnPart
     cudaStream_t ds = nullptr;         // its own stream (stream()): it drafts while the target's parts run
+    cudaStream_t is = nullptr;         // the context injection's stream (inject: beside the next draft's first layer)
+    cudaEvent_t ev_s = nullptr;        // ... ordered after the drafter's stream
+    std::vector<cudaEvent_t> ev_kv;    // ... each layer's context rows in the ring (the draft's attention waits)
+    bool inj_pending = false;          // an injection the next draft waits for, layer by layer
     cudaStream_t pend_s = nullptr;     // draft_start's stream, its drafts (0: none pending) and cut
     int pend_n = 0;
     float pend_p_min = 0.0f;
@@ -1107,6 +1111,30 @@ bool GlmDflash::inject(int64_t lo, int64_t hi, cudaStream_t s, std::string& err)
     const uint32_t full = m.K >= 32 ? 0xffffffffu : (1u << m.K) - 1u;
     const int KE = m.K * m.E, kvd = m.n_kv * kHeadDim;
     cudaSetDevice(m.dev);
+    // on a stream of its own, after the drafter's: the next draft's first layer runs beside it, each layer's attention
+    // waiting for that layer's context rows (ev_kv).  STRATA_GLM_DFLASH_INJ_OVERLAP=0: on `s` (A/B)
+    static const bool ovl = [] {
+        const char* v = getenv("STRATA_GLM_DFLASH_INJ_OVERLAP");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (ovl && m.is == nullptr) {
+        int least = 0, greatest = 0;
+        if (cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) greatest = 0;
+        bool ok = cudaStreamCreateWithPriority(&m.is, cudaStreamNonBlocking, greatest) == cudaSuccess &&
+                  cudaEventCreateWithFlags(&m.ev_s, cudaEventDisableTiming) == cudaSuccess;
+        m.ev_kv.assign((size_t) m.n_layer, nullptr);
+        for (auto& e : m.ev_kv) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+        if (!ok) {
+            cudaGetLastError();
+            m.is = nullptr;
+        }
+    }
+    const cudaStream_t ws = s;
+    if (ovl && m.is != nullptr) {
+        cudaEventRecord(m.ev_s, ws);
+        cudaStreamWaitEvent(m.is, m.ev_s, 0);
+        s = m.is;
+    }
     // the runs of consecutive positions to take: staged in full, not in the ring yet
     std::vector<std::pair<int64_t, int64_t>> runs;
     {
@@ -1134,6 +1162,8 @@ bool GlmDflash::inject(int64_t lo, int64_t hi, cudaStream_t s, std::string& err)
                 return false;
             i += len;
         }
+        // (the positions first: a draft's attention of a layer reads them once that layer's rows are in)
+        kv_pos_kernel<<<(n + 127) / 128, 128, 0, s>>>(p0, n, m.ring, m.kv_pos);
         gf::quantize_q8_1(m.feat, m.fq, n * KE, s);
         if (!mv_cols({m.fc.w, m.fq, nullptr, m.g, nullptr, 1.0f, m.fc.type, KE, m.E}, n, m.q8(KE), 0, m.E, s)) {
             err = "glm dflash: fc";
@@ -1152,10 +1182,11 @@ bool GlmDflash::inject(int64_t lo, int64_t hi, cudaStream_t s, std::string& err)
                                                                            m.rope_base);
             const size_t lay = (size_t) il * m.ring * kvd;
             kv_store_kernel<<<n, 256, 0, s>>>(m.kc, m.vc, kvd, p0, m.ring, m.Kr + lay, m.Vr + lay);
+            if (s != ws) cudaEventRecord(m.ev_kv[(size_t) il], s);
         }
-        kv_pos_kernel<<<(n + 127) / 128, 128, 0, s>>>(p0, n, m.ring, m.kv_pos);
         for (int i = 0; i < n; ++i) m.kv_pos_h[(size_t) ((p0 + i) % m.ring)] = p0 + i;
     }
+    if (s != ws && !runs.empty()) m.inj_pending = true;
     if (!ck(cudaGetLastError(), "inject", err)) return false;
     return true;
 }
@@ -1242,6 +1273,7 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
                                                                         m.rope_base);
         if (il == 0) dump("q0", m.q, (size_t) B * qd, s), dump("k0", m.kb, (size_t) B * kvd, s), dump("v0", m.vb, (size_t) B * kvd, s);
         const size_t lay = (size_t) il * m.ring * kvd;
+        if (m.inj_pending) cudaStreamWaitEvent(s, m.ev_kv[(size_t) il], 0);   // (this layer's context rows: inject)
         if (split) {
             attn_split_kernel<<<dim3(m.n_kv, splits), 256, 0, s>>>(m.q, m.Kr + lay, m.Vr + lay, m.kv_pos, m.kb, m.vb,
                                                                   B, m.n_head, m.n_kv, n_past, m.ring, m.window, scale,
@@ -1277,6 +1309,7 @@ bool GlmDflash::draft_start(int32_t anchor, int64_t n_past, int n_max, float p_m
         add_kernel<<<(B * E + 255) / 256, 256, 0, s>>>(m.h, m.xc, B * E);
         if (il == 0) dump("l0", m.h, (size_t) B * E, s);
     }
+    m.inj_pending = false;
     // the mask rows' final norm, the target's head, the selector's gate, the candidates and the walk
     const int n = B - 1;
     rms_rows_kernel<<<n, 256, 0, s>>>(m.h + E, E, m.out_norm, m.eps, E, m.x, E);
