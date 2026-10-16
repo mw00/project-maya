@@ -4322,11 +4322,11 @@ bool Glm5Model::fast_boundary(std::string& err) {
             // traces replayed through these rules (Maya-M, 3090 + 3060 split): the aged counts keep experts that
             // were frequent a while ago, the smaller half's pool most of all (VRAM hits 55.7 -> 65.2 %, off-card
             // experts a token 57.7 -> 45.4 on the 3060; 71.8 -> 64.6 on the 3090), while the recency won the decode
-            // there (+2.6%) and on Maya-S over 3x V100-16GB with an NVMe tier (24.8 -> 26.1 tok/s, interleaved runs)
-            static const bool vram_lru = [] {
-                const char* ve = getenv("STRATA_GLM_VRAM_EVICT");
-                return ve == nullptr || std::strcmp(ve, "lru") == 0;
-            }();
+            // there (+2.6%) and on Maya-S over 3x V100-16GB with an NVMe tier (24.8 -> 26.1 tok/s, interleaved runs).
+            // With several conversations at once (--parallel) the default stays the aged counts: they take turns, and
+            // the most recent one's experts pushed out what all of them use, and decode slowed there
+            static const char* const ve = getenv("STRATA_GLM_VRAM_EVICT");
+            const bool vram_lru = ve == nullptr ? seq_count() <= 1 : std::strcmp(ve, "lru") == 0;
             int v = -1;
             uint32_t bc = UINT32_MAX;
             uint64_t bt = UINT64_MAX;
