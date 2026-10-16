@@ -93,8 +93,14 @@ class _Nvml:
         except (AttributeError, OSError):
             return None
 
-    def pids(self):
-        """The processes with a compute context on this GPU, or None when NVML can't say."""
+    class Pci(ctypes.Structure):                         # nvmlPciInfo_t
+        _fields_ = [("bus_legacy", ctypes.c_char * 16), ("domain", ctypes.c_uint), ("bus", ctypes.c_uint),
+                    ("device", ctypes.c_uint), ("pci_device_id", ctypes.c_uint), ("pci_subsystem_id", ctypes.c_uint),
+                    ("bus_id", ctypes.c_char * 32)]
+
+    def procs(self):
+        """{pid: bytes it holds on this GPU (None: NVML can't say, as on Windows)} of the processes with a compute
+        context on it, or None when NVML can't list them."""
         for fn, st in (("nvmlDeviceGetComputeRunningProcesses_v3", self.Proc2),
                        ("nvmlDeviceGetComputeRunningProcesses_v2", self.Proc2),
                        ("nvmlDeviceGetComputeRunningProcesses", self.Proc1)):
@@ -103,8 +109,25 @@ class _Nvml:
                 continue
             n, buf = ctypes.c_uint(256), (st * 256)()
             try:
-                if f(self.dev, ctypes.byref(n), buf) == 0:
-                    return {buf[i].pid for i in range(n.value)}
+                if f(self.dev, ctypes.byref(n), buf) == 0:      # (NVML_VALUE_NOT_AVAILABLE: all ones)
+                    return {buf[i].pid: None if buf[i].used >= 2**63 else buf[i].used for i in range(n.value)}
+            except OSError:
+                pass
+        return None
+
+    def pids(self):
+        """The processes with a compute context on this GPU, or None when NVML can't say."""
+        p = self.procs()
+        return None if p is None else set(p)
+
+    def pci(self):
+        """The card's PCI address as "0000:01:00" (domain:bus:device; the engine's VRAM lines carry CUDA's), or None."""
+        info = self.Pci()
+        for fn in ("nvmlDeviceGetPciInfo_v3", "nvmlDeviceGetPciInfo_v2", "nvmlDeviceGetPciInfo"):
+            f = getattr(self.lib, fn, None)
+            try:
+                if f is not None and f(self.dev, ctypes.byref(info)) == 0:
+                    return f"{info.domain:04x}:{info.bus:02x}:{info.device:02x}"
             except OSError:
                 pass
         return None
@@ -226,6 +249,7 @@ class Telemetry:
         self.gpus = [(i, _Nvml(i)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
+        self.cards = [(i, g.pci(), g.name()) for i, g in self.gpus] if self.gpu.ok() else []   # (the GPU map's)
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -279,6 +303,9 @@ class Telemetry:
                               "pcie_rx_mb": r.get("pcie_rx_mb")}
                              for i, r in reads]
             s.update({f"gpu_{k}": v for k, v in g.items()})
+            # each card's memory and the processes holding it, for the Monitor's map of a GPU (serve/gpu_map.py)
+            s["vram"] = [{"index": i, "pci": pci, "name": name, "used": r.get("mem_used"), "total": r.get("mem_total"),
+                          "procs": g.procs()} for (i, pci, name), (_, r), (_, g) in zip(self.cards, reads, self.gpus)]
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)

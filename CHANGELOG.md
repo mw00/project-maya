@@ -4,6 +4,53 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.12 - 2026-10-15
+
+EXL3 on one GPU with the CPU's help, batched answers across a layer split (opt-in), the VRAM tier following the
+conversation while DFlash2 drafts, and AMD RDNA 2 cards as experimental.
+
+- **EXL3 on one GPU: the CPU takes more of the experts, faster** (#188 by @needmorevram). On one GPU most of an EXL3
+  model's experts run on the CPU. The CPU now reads each expert in memory order (split-K pieces) and runs a route's
+  experts as one batch of jobs, and CPUs without AVX-512 (Intel desktop chips, Zen 2 and 3) get an AVX2 tier of their
+  own. Prompts give their least-used experts to the CPU too, as GGUF prompts already did. On an RTX 3090 alone:
+  EXL3-3.05bpw decode 14.3-16.8 -> 20.9-22.1 tokens/s, 22.4 -> 29.2 with DFlash2; EXL3-4.05bpw 14.4-15.1 -> 18.9-19.6;
+  an 8K prompt 384-396 -> 422-489 tokens/s. The answers are the same tokens as before.
+- **Batched answers across a layer split, opt-in** (#204 by @zetlaw). With `STRATA_GLM_SPLIT_ROWS=k` (1-8) and several
+  requests at once, each GPU of a split takes up to k requests in one step, reading the shared weights once for all of
+  them. On four RTX 4000 Ada GPUs with Maya-M and eight requests, `k=2` gave 94.5 tokens/s in all against 74.4 (+27%);
+  larger groups were slower there, so it stays off by default. See
+  [several requests at once](docs/SETTINGS.md#several-requests-at-once).
+- **The VRAM tier keeps following the conversation while DFlash2 drafts** (#198 by @merbanan). With the drafter's
+  verify window on two CPU lanes, the background swaps that move the experts you use into VRAM had stopped. They run
+  again: on a V100 with a Ryzen 9 7950X, the share of experts found in VRAM went from 49-62% to 54-67%.
+- **AMD RDNA 2, experimental** (#205). The setup accepts the RX 6800 / 6900 series and the Radeon PRO V620 / W6800
+  (`gfx1030`), and compiles for them only when one is chosen. Maya has not been validated on such a card yet: please
+  tell us how it goes in an issue.
+
+NVIDIA GPUs give v1.1.11's tokens.
+
+## v1.1.11 - 2026-10-15
+
+What fills each GPU, in the Monitor, and the expert pool's size as a setting in the config.
+
+- **The Monitor shows what fills each GPU** (#191 by @needmorevram). The GPUs table becomes a card with a bar for each
+  GPU: the model's weights, the KV cache, the activations, a drafter and its verify window, the expert pool, CUDA and
+  the rest, other programs and the free memory, with that GPU's load, power, temperature and PCIe link under its bar.
+  Pointing at a part picks it out in every bar; a click opens a GPU's row with a sentence for each part, and the advice
+  names the GPU (other programs holding memory that a restart would give to the expert pool, say). On two Tesla V100s
+  the parts add up to what the NVIDIA driver reports for each card; on AMD, where the driver does not list the memory a
+  process holds, the card shows the engine's own measurement at its start.
+- **The expert pool's size in the config** (#192 by @needmorevram). `--expert-cache auto`, the default the setup now
+  writes, sizes the pool from the free VRAM less a reserve as before, and then checks that budget once it is written:
+  under Windows the free figure read before an allocation can run about a gigabyte high, and a card filled past it
+  pages GPU memory to system RAM, where decode runs several times slower. Short of the reserve, the pool gives back the
+  difference. `--expert-cache N` caps the first GPU's pool at N experts; `--vram-reserve-mib N` (and
+  `--vram-reserve-later-mib N` for a split's later GPUs) sets the reserve. At start the log says how much VRAM each GPU
+  has free with everything loaded, and warns when it is low. The check is left out on the Ryzen AI Max APUs and where
+  the free VRAM is far beyond what the pool can take.
+
+NVIDIA GPUs give v1.1.10's tokens, and the Ryzen AI Max APUs keep v1.1.10's speed.
+
 ## v1.1.10 - 2026-10-14
 
 The Strix Halo and Gorgon Halo release: faster answers and faster prompts on the Ryzen AI Max APUs, a faster cold start

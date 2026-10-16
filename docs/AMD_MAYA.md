@@ -24,6 +24,12 @@ are the kernel KFD topology order shown by `--check`; on the test machine the
 7900 XT is GPU 0, an R9700 is GPU 1, and the integrated GPU is GPU 2. This
 installer accepts `gfx1100`, `gfx1201` and `gfx1151` and compiles one binary for
 `gfx1100;gfx1201;gfx1151`.
+
+RDNA 2 (`gfx1030`: RX 6800 / 6800 XT / 6900 XT / 6950 XT, Radeon PRO V620 / W6800) is accepted too, as experimental:
+Maya has not been validated on such a card yet, so please report how it goes in an issue. These cards have no matrix cores (WMMA), so the engine uses
+its portable kernels there (the prompt attention on the F32 kernel), and the binary also gets `gfx1030` only when such
+a card is chosen. The ROCm installation needs its library kernels (hipBLAS) for `gfx1030`.
+
 Configs are named `maya-<quant>-hip.json` and
 select the AMD device through `HIP_VISIBLE_DEVICES`.
 

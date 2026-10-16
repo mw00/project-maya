@@ -134,6 +134,31 @@ public:
         double pool_gb = 0, ram_gb = 0;
     };
     FastStats fast_stats() const;
+    /// What a part holds on its GPU, in bytes (generate's VRAM lines, the Monitor's map of a GPU): the device's total
+    /// and free memory now, its PCI address (the server finds the GPU NVML numbers by it), the dense weights, the
+    /// sequence state (the DSA latent cache, KDA states, indexer keys; kv_ram: KV streaming's pinned copy in RAM), the
+    /// activations, a drafter's weights (DFlash or the NextN block) and the verify window's buffers, the expert pool
+    /// with its lendable tail and what a prompt (borrow, at most) or the vision encoder borrows of that tail.  The
+    /// CUDA context and the small buffers are not counted: total - free - the parts.
+    struct VramReport {
+        int dev = 0;
+        std::string pci;
+        uint64_t total = 0, free = 0;
+        uint64_t weights = 0, kv = 0, kv_ram = 0, act = 0, drafter = 0, window = 0;
+        uint64_t pool = 0, tail = 0, borrow = 0, vision = 0;
+        int64_t slots = 0, ctx = 0;
+        int l0 = 0, l1 = 0;
+    };
+    std::vector<VramReport> vram_report() const;
+    /// Every GPU's expert pool as it was sized (part order): the device, the VRAM kept free beside it (MiB), whether the
+    /// default reserve was lowered so a small card's pool holds its floor, and --expert-cache N (0: auto) - for the
+    /// driver's free-VRAM lines, which name the setting that leaves room
+    struct PoolVram {
+        int dev = 0, reserve_mib = 0;
+        bool adapted = false;
+        int64_t fixed = 0;
+    };
+    std::vector<PoolVram> pool_vram() const;
     /// The CPU LANE (a decode's RAM-tier experts): the share of them copied over PCIe to the GPU instead of computed
     /// on the CPU - 0: the CPU takes every one, 1: none (of f such experts in a route, f - round(share f) go to the
     /// CPU).  pcie_share(): the split in use, as a share; set_pcie_share(s): this split from the next token on, s < 0
@@ -524,6 +549,7 @@ public:
     int mtp_src_ = -1;                                     // the shard of STRATA_GLM_MTP_GGUF's block, -1: the model's
     int lt_ = 0;                                           // the tier layers: [l0_, lt_) = the trunk's + the draft's
     void* mtp_arena_ = nullptr;
+    uint64_t mtp_arena_bytes_ = 0;                         // (the VRAM report)
     bool load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err);
     // the draft block at position p -> mtp_tok[step] (see glm_fast_path.cu: the chained drafts and the draft head)
     bool fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step = 0, bool sub = false, bool read_back = true);
@@ -684,10 +710,22 @@ public:
     /// through the token path's own kernels, so each sequence gets the token the token path would give it.
     /// tokens_out[i]: sequence seqs[i]'s next token after tokens[i] (greedy, or sampled with sps[i]); every
     /// sequence's position advances by one.  n <= rows_max().
-    bool rows_ok() const { return rows_ != nullptr && split_next_ == nullptr && fast_ != nullptr; }
+    bool rows_ok() const { return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr; }
     static int rows_max();
     bool multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                     int* tokens_out, std::string& err);
+    /// LAYER SPLIT (glm_rows.cu): one token of each of n sequences through every part as one batched step per part,
+    /// queued like multi_issue (nothing waited for); multi_take(seqs[i]) returns each one's token.  n <= rows_max().
+    bool split_rows_ok() const;
+    bool multi_issue_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
+                          std::string& err);
+private:
+    struct RowSeq;
+    bool rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err);
+    bool rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err);
+    bool rows_layers(RowSeq* rw, int n, std::string& err);
+    bool rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err);
+public:
     struct RowsState;
     RowsState* rows_ = nullptr;
     bool rows_alloc(std::string& err);                     // load, several sequences on one GPU: before the pool
@@ -781,7 +819,22 @@ public:
         size_t staging = 0, hop = 0;
     };
     PinnedPrompt prefill_pinned() const;
-    static size_t pool_avail(size_t free_b, size_t total_b);   // the expert pool's bytes from the free VRAM
+    // the expert pool's bytes on part `part` from its free VRAM (glm_fast_path.cu): --expert-cache auto | N and the VRAM
+    // reserve (STRATA_GLM_EXPERT_CACHE, STRATA_GLM_RESERVE_MB / _RESERVE_LATER_MB; the driver sets them from the
+    // config's args).  floor_b: the pool's floor (a route's experts and the spares, every layer), which a small card's
+    // default reserve gives way to; slot_b: the part's largest expert slot (--expert-cache N is N of them)
+    struct PoolBudget {
+        size_t avail = 0, reserve = 0;
+        int64_t fixed = 0;              // --expert-cache N (the first GPU), 0: auto
+        bool reserve_given = false;     // a reserve set by hand is kept as it is
+        bool adapted = false;           // the default reserve lowered so the pool holds its floor
+    };
+    static PoolBudget pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
+                                  bool unified = false);
+    PoolBudget part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const;   // ... less pool_short_
+    void pool_check(size_t floor_b, size_t slot_b, size_t all_b);   // auto: the budget written once, free VRAM read again
+    size_t pool_short_ = 0;                                // what that check found short of the reserve
+    PoolBudget pool_b_;                                    // the budget the pool was carved from
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)

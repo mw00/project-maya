@@ -142,6 +142,74 @@ main { min-height: 0; min-width: 0; display: flex; }
 .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
 .dot--vram { background: var(--st-accent); } .dot--ram { background: var(--st-info); } .dot--disk { background: var(--st-warn); }
 
+/* ---------------------------------------------------------------- monitor: what fills the GPU */
+/* one hue a part, in the bar's order (each next to the next told apart under the three colour blindnesses, on both
+   themes); the expert pool keeps the experts card's VRAM colour, the CUDA context a neutral grey, free the bare track */
+.gpumap-card { position: relative; display: flex; flex-direction: column; gap: var(--st-s-4);
+               --gm-weights: #2a78d6; --gm-kv: #1baf7a; --gm-act: #eda100; --gm-drafter: #e87ba4; --gm-pool: var(--st-accent);
+               --gm-vision: #008300; --gm-rest: color-mix(in srgb, var(--st-ink-muted) 60%, var(--st-surface-3)); --gm-other: #eb6834;
+               --gm-used: var(--st-accent); }
+[data-theme="dark"] .gpumap-card { --gm-weights: #3987e5; --gm-kv: #199e70; --gm-act: #c98500; --gm-drafter: #d55181;
+                                   --gm-other: #d95926; }
+/* the key (several GPUs): a part's colour and its GB over all of them; pointing at one picks it out in every bar */
+.gpukey { display: flex; flex-wrap: wrap; gap: var(--st-s-2) var(--st-s-5); font-size: var(--st-fs-sm); }
+.gpukey__item { display: inline-flex; align-items: center; gap: 7px; color: var(--st-ink-muted); white-space: nowrap; }
+.gpukey__item b { color: var(--st-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.gpumap-card .dot { background: var(--gm-c); flex: none; }
+.gpumap-card .dot--free { background: transparent; box-shadow: inset 0 0 0 1.5px var(--st-ink-muted); }
+/* a row a GPU: its name and layers, its bar (the whole card, whatever its size), what is in use; the columns fixed so
+   the bars start and end together */
+.gpurows { display: flex; flex-direction: column; gap: 2px; margin: 0 -10px; }
+.gpurow__line { display: grid; grid-template-columns: 150px minmax(0, 1fr) 132px; align-items: center; column-gap: var(--st-s-4);
+                row-gap: 6px; width: 100%; padding: 6px 10px; border: 0; border-radius: var(--st-r-sm); background: transparent;
+                color: inherit; font: inherit; text-align: left; }
+button.gpurow__line { cursor: pointer; }
+button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var(--st-surface-2); }
+button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline-offset: -2px; }
+.gpurow__name { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
+.gpurow__name b { font-size: var(--st-fs-sm); font-weight: 650; }
+.gpurow__name span, .gpurow__used { font-size: var(--st-fs-xs); color: var(--st-ink-muted); white-space: nowrap; }
+.gpurow__name span { overflow: hidden; text-overflow: ellipsis; }
+.gpurow__used { display: inline-flex; align-items: center; justify-content: flex-end; gap: 6px; font-variant-numeric: tabular-nums; }
+.gpurow__used b { font-size: var(--st-fs-sm); font-weight: 650; color: var(--st-ink); }
+.gpurow__used .st-chev { color: var(--st-ink-muted); transform: rotate(-90deg); transition: transform var(--st-dur); }
+.gpurow.is-open .gpurow__used .st-chev { transform: none; }
+.gpurow__track { display: block; min-width: 0; }
+/* a GPU's readings under its bar (several GPUs): load, power, temperature, PCIe */
+.gpustat { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 5px; font-size: var(--st-fs-xs); color: var(--st-ink-muted);
+           font-variant-numeric: tabular-nums; }
+.gpustat:empty { display: none; }
+.gpustat b { color: var(--st-ink-soft); font-weight: 600; }
+.gpustat .is-warm b { color: var(--st-warn-text); }
+.gpustat .is-hot b { color: var(--st-danger-text); }
+.gpurow__detail { padding: var(--st-s-3) 10px var(--st-s-2); }
+.gpubar { display: flex; height: 18px; border-radius: 6px; overflow: hidden; background: var(--st-surface-3); gap: 2px; }
+.gpumap-card.is-one .gpubar { height: 22px; }
+.gpubar__seg { position: relative; display: block; height: 100%; min-width: 2px; flex: 0 1 0; background: var(--gm-c);
+               transition: flex-grow 400ms var(--st-ease), opacity var(--st-dur); }   /* (grown by its bytes: the gaps come off every part) */
+.gpubar__seg[data-k="free"] { background: transparent; min-width: 0; }
+.gpubar__seg[data-k="pool"] { background: linear-gradient(90deg, var(--st-accent), color-mix(in srgb, var(--st-accent) 70%, var(--st-accent-2))); }
+.gpubar__lent { position: absolute; top: 0; right: 0; bottom: 0; width: 0;
+                background: repeating-linear-gradient(135deg, rgba(255, 255, 255, .6) 0 3px, transparent 3px 7px); }
+.gpurows[data-focus] .gpubar__seg { opacity: .3; }
+.gpurows[data-focus="weights"] .gpubar__seg[data-k="weights"], .gpurows[data-focus="kv"] .gpubar__seg[data-k="kv"],
+.gpurows[data-focus="act"] .gpubar__seg[data-k="act"], .gpurows[data-focus="drafter"] .gpubar__seg[data-k="drafter"],
+.gpurows[data-focus="pool"] .gpubar__seg[data-k="pool"], .gpurows[data-focus="vision"] .gpubar__seg[data-k="vision"],
+.gpurows[data-focus="rest"] .gpubar__seg[data-k="rest"], .gpurows[data-focus="other"] .gpubar__seg[data-k="other"] { opacity: 1; }
+.gpubar-tip { position: absolute; transform: translate(-50%, calc(-100% - 8px)); padding: 6px 10px; white-space: nowrap;
+              border-radius: var(--st-r-sm); background: var(--st-surface); border: 1px solid var(--st-line);
+              box-shadow: var(--st-sh-pop); font-size: var(--st-fs-xs); color: var(--st-ink-soft); pointer-events: none; z-index: 2; }
+.gpubar-tip b { color: var(--st-ink); font-weight: 650; }
+.gpumap-now { margin: 0; }
+/* an opened row: its parts, a sentence each */
+.gpulegend { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: var(--st-s-3) var(--st-s-6);
+             font-size: var(--st-fs-sm); }
+.gpulegend__item { display: grid; grid-template-columns: 10px minmax(0, 1fr) auto; align-items: center; align-content: start;
+                   column-gap: 8px; row-gap: 2px; }
+.gpulegend__item > span { color: var(--st-ink-muted); }
+.gpulegend__item b { color: var(--st-ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+.gpulegend__sub { grid-column: 2 / -1; font-size: var(--st-fs-xs); color: var(--st-ink-muted); line-height: 1.35; }
+
 /* ---------------------------------------------------------------- monitor: metric grids */
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--st-s-4); }
 .metrics.metrics--tiers { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--st-s-3); }
@@ -256,6 +324,9 @@ main { min-height: 0; min-width: 0; display: flex; }
   .hero { padding: var(--st-s-5); }
   .hero__speeds { gap: var(--st-s-5); }
   .tierlegend { gap: var(--st-s-2) var(--st-s-4); }
+  .gpulegend { grid-template-columns: minmax(0, 1fr); gap: var(--st-s-2); }
+  .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
+  .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }
 
 /* ---------------------------------------------------------------- the chats (sidebar list; a left panel on narrow screens) */
@@ -340,7 +411,7 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .spark-wrap.is-empty .spark-empty { display: flex; }
 .tiers-card.is-stale .tierbar, .tiers-card.is-stale .metrics--tiers, .tiers-card.is-stale .tierlegend { opacity: .55; }
 .tier-advice { margin: 0; padding: 8px 12px; border-radius: var(--st-r-sm); background: var(--st-surface-2); color: var(--st-ink-soft); }
-.gpus-card, .trouble-card { display: flex; flex-direction: column; gap: var(--st-s-3); min-width: 0; }
+.trouble-card { display: flex; flex-direction: column; gap: var(--st-s-3); min-width: 0; }
 .trouble-actions { display: inline-flex; gap: var(--st-s-2); flex-wrap: wrap; }
 .trouble-note { margin: 0; }
 .report-pre { margin: 0; max-height: 360px; overflow: auto; padding: 12px 14px; border-radius: var(--st-r-md); background: var(--st-code-bg);

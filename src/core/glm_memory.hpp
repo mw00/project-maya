@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <utility>
 
 namespace strata::core::glmfast {
 
@@ -34,6 +35,30 @@ inline size_t expert_pool_budget(bool unified, size_t device_free, size_t ram_av
     if (!unified) return device_free > reserve ? device_free - reserve : 0;
     const size_t room = ram_available > ram_headroom ? ram_available - ram_headroom : 0;
     return std::min(expert_bytes, room > reserve ? room - reserve : 0);
+}
+
+// The VRAM kept free beside a discrete card's expert pool: the reserve, except on a small card where the default
+// one would leave the pool short of its floor (a route's experts and the spares in every layer) - there an automatic
+// budget lowers it to what leaves exactly the floor, down to `small`.  A reserve set by hand, a fixed budget
+// (--expert-cache N) and a card short even at `small` keep it.  {reserve, lowered}
+inline std::pair<size_t, bool> pool_reserve(size_t device_free, size_t reserve, bool given, bool fixed, size_t floor,
+                                            size_t small) {
+    if (given || fixed || device_free >= reserve + floor || device_free < floor + small) return {reserve, false};
+    return {device_free - floor, true};
+}
+
+// The check of a written budget: the bytes it gives back once `have` of the `asked` bytes were allocated and touched
+// and `free_after` was read - what the driver refused, plus what the reserve is short by and 64 MiB.  A read of
+// nearly nothing free (under 16 MiB) only says "at least": the first two give back 1 GiB each, later ones a quarter.
+inline size_t pool_give_back(size_t asked, size_t have, size_t free_after, size_t reserve, int& zero_reads) {
+    constexpr size_t kSlack = size_t{64} << 20, kGiB = size_t{1} << 30;
+    size_t give = asked > have ? asked - have : 0;
+    if (free_after + kSlack < reserve) {
+        size_t g = reserve - free_after + kSlack;
+        if (free_after < (size_t{16} << 20)) g = std::max(g, ++zero_reads <= 2 ? kGiB : asked / 4);
+        give += g;
+    }
+    return std::min(give, asked);
 }
 
 inline bool minimal_ram_tier(bool unified, bool all_experts_fit, bool explicit_budget) {

@@ -1,18 +1,18 @@
-// src/core/glm_rows.cu - several conversations decoded together on one GPU (Glm5Model::multi_rows).
+// src/core/glm_rows.cu - several conversations decoded together (Glm5Model::multi_rows / multi_issue_rows).
 //
-// A decode token reads every weight of the model once, and on one GPU that read is most of its time.  A step that
-// takes ONE token of each of n conversations through the model together reads the dense weights once for all of
-// them: the attention projections, the shared experts, the dense FFN and the head go through mv_nt, which fetches
-// each weight row once for the n activations and gives each activation the very bits mv() gives it alone.  What
+// A decode token reads its part's weights once.  The one-GPU path takes ONE token of each of n conversations through
+// the model together, reading the dense weights once for all; the split path does the same on each part per group.
+// The attention projections, shared experts, dense FFN and head go through mv_nt, fetching each weight row once for the
+// n activations and giving each activation the very bits mv() gives it alone.  What
 // depends on a conversation's own history runs per row, through the token path's own kernels: the residual mixing
 // (mHC), the KDA recurrence, the DSA indexer and attention against that conversation's caches, and the routed
 // experts (the tiers serve the n routes one after another, as they serve the layers of a token).  So each row's
 // token is the one the token path gives that conversation alone - as long as the tiers hold the same experts
 // (greedy with the CPU lane off: the multi bench compares them).
 //
-// The rows' activations live in their own arena (rows_alloc, at load, before the expert pool takes the rest of the
+// Each part's row activations live in its own arena (rows_alloc, at load, before the expert pool takes the rest of the
 // card); the per-row scratch the token path's kernels use in between (the conv outputs, the gates, the DSA scores and
-// cells, the experts' h) is the token path's own, used by one row after the other on the one stream.
+// cells, the experts' h) is the token path's own, used by one row after the other on that part's stream.
 #include "glm_fast_state.hpp"
 
 #include "strata/kernels/sampler.hpp"
@@ -34,6 +34,8 @@ const float* image_row_in(const std::vector<int64_t>& pos, const std::vector<flo
     if (it == pos.end() || *it != p) return nullptr;
     return rows.data() + (size_t) (it - pos.begin()) * (size_t) n_embd;
 }
+float* row_at(float* b, int64_t per, int i) { return b + (size_t) i * (size_t) per; }
+uint8_t* rowq_at(uint8_t* b, int64_t n_in, int i) { return b + (size_t) i * (size_t) (n_in / 32) * kQ8; }
 }  // namespace
 
 // rows_max() rows of each activation, one row after the other (mv_nt reads and writes them so)
@@ -56,6 +58,18 @@ struct Glm5Model::RowsState {
     int* tok = nullptr;
     int* tok_h = nullptr;   // pinned
     cudaEvent_t ev_done = nullptr;
+};
+// one row's sequence on this part: state, position, caches, KV stream and image row
+struct Glm5Model::RowSeq {
+    int seq = 0;
+    float* state = nullptr;
+    float *Rc = nullptr, *Ro = nullptr;   // the residual pair (the token path's convention, per row)
+    int64_t p = 0;
+    int ring = 0;
+    const std::vector<int64_t> *kda_S = nullptr, *kda_conv = nullptr, *dsa_lat = nullptr, *dsa_ik = nullptr,
+                               *dsa_ig = nullptr, *dsa_pool = nullptr;
+    const float* img = nullptr;
+    const KvStream* kv = nullptr;   // KV streaming: that sequence's stream (null: not streamed)
 };
 
 int Glm5Model::rows_max() { return gf::kMaxMvNt; }
@@ -146,49 +160,9 @@ void Glm5Model::rows_destroy() {
     rows_ = nullptr;
 }
 
-bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
-                           int* tokens_out, std::string& err) {
-    if (!rows_ok() || n_parts_ != 1 || seq_.empty() || n < 1 || n > rows_max()) {
-        err = "glm rows: not available here (one GPU, several sequences, 1.." + std::to_string(rows_max()) + " rows)";
-        return false;
-    }
-    if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;   // (each sequence's pinned embedding row)
-    FastState* F = fast_;
-    RowsState* S = rows_;
+bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) {
     const Glm5Geometry& g = g_;
-    const int E = g.n_embd, DI = g.d_inner(), FFs = g.n_ff_exp * g.n_shared;
-    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
-    if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
-        err = "glm rows: no embedding dequantizer";
-        return false;
-    }
-    cudaSetDevice(dev_);
-    cudaStream_t s = F->cs;
-    // between steps (the device idle): finished promotions go live and the layers get fresh spare slots, as the
-    // token path does between tokens - every 32 steps instead, the spares ran dry and the VRAM tier stopped following
-    // the routes (two conversations on a V100 streaming its experts from RAM: 27.1 tok/s in all against 34.2)
-    if (!fast_boundary(err)) return false;
-    // (the token path's profiler collects one token's marks at a time: none from a batched step)
-    struct ProfOff {
-        FastState* F;
-        bool was;
-        ~ProfOff() { F->prof_on = was; }
-    } prof_off{F, F->prof_on};
-    F->prof_on = false;
-
-    // each row's sequence: its arena, its layout, its position (the bound sequence's live in the members)
-    struct Row {
-        int seq = 0;
-        float* state = nullptr;
-        float *Rc = nullptr, *Ro = nullptr;   // the residual pair (the token path's convention, per row)
-        int64_t p = 0;
-        int ring = 0;
-        const std::vector<int64_t> *kda_S = nullptr, *kda_conv = nullptr, *dsa_lat = nullptr, *dsa_ik = nullptr,
-                                   *dsa_ig = nullptr, *dsa_pool = nullptr;
-        const float* img = nullptr;
-        const KvStream* kv = nullptr;   // KV streaming: that sequence's stream (null: not streamed)
-    };
-    Row rw[gf::kMaxMvNt];
+    const int E = g.n_embd;
     for (int i = 0; i < n; ++i) {
         const int sq = seqs[i];
         if (sq < 0 || sq >= seq_count()) {
@@ -200,7 +174,7 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
                 err = "glm rows: sequence " + std::to_string(sq) + " twice in one step";
                 return false;
             }
-        Row& r = rw[i];
+        RowSeq& r = rw[i];
         r.seq = sq;
         int64_t max_ctx = 0;
         if (sq == cur_seq_) {
@@ -238,7 +212,19 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         r.Rc = r.state;
         r.Ro = r.state + (int64_t) g.hc * E;
     }
+    return true;
+}
 
+bool Glm5Model::rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err) {
+    FastState* F = fast_;
+    const int E = g_.n_embd;
+    const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
+    if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
+        err = "glm rows: no embedding dequantizer";
+        return false;
+    }
+    cudaSetDevice(dev_);
+    cudaStream_t s = F->cs;
     // ---- the embeddings: each row's token (or image row) into its own residual's 4 streams
     const size_t emb_row = ggml_row_size((ggml_type) pack_emb_type_, E);
     for (int i = 0; i < n; ++i) {
@@ -249,9 +235,18 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         cudaMemcpyAsync(F->emb, c.emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
         gf::embed_streams(F->emb, rw[i].state, E, s);
     }
+    return true;
+}
 
-    const auto rows = [&](float* b, int64_t per, int i) { return b + (size_t) i * (size_t) per; };
-    const auto rows_q = [&](uint8_t* b, int64_t n_in, int i) { return b + (size_t) i * (size_t) (n_in / 32) * kQ8; };
+bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
+    FastState* F = fast_;
+    RowsState* S = rows_;
+    const Glm5Geometry& g = g_;
+    const int E = g.n_embd, DI = g.d_inner(), FFs = g.n_ff_exp * g.n_shared;
+    cudaSetDevice(dev_);
+    cudaStream_t s = F->cs;
+    auto& rows = row_at;
+    auto& rows_q = rowq_at;
     const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
         if (gf::mv_nt(j, nj, n, s)) return true;
         err = std::string("glm rows: ") + what;
@@ -434,7 +429,23 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         if (rw[i].Ro != rw[i].state)
             cudaMemcpyAsync(rw[i].state, rw[i].Ro, (size_t) g.hc * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
     }
+    return true;
+}
 
+bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err) {
+    FastState* F = fast_;
+    RowsState* S = rows_;
+    const Glm5Geometry& g = g_;
+    const int E = g.n_embd;
+    cudaSetDevice(dev_);
+    cudaStream_t s = F->cs;
+    auto& rows = row_at;
+    auto& rows_q = rowq_at;
+    const auto mv = [&](gf::MvJob* j, int nj, const char* what) -> bool {
+        if (gf::mv_nt(j, nj, n, s)) return true;
+        err = std::string("glm rows: ") + what;
+        return false;
+    };
     // ---- the head: one read of the output matrix for every row, then each row's draw
     for (int i = 0; i < n; ++i)
         gf::head_prep(rw[i].state, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, i),
@@ -450,8 +461,36 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
         else
             strata::kernels::sample_tokens(lg, 1, (int) g.n_vocab, nullptr, 0, sps[i], S->tok + i, s);
     }
-    cudaMemcpyAsync(S->tok_h, S->tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, s);
-    cudaEventRecord(S->ev_done, s);
+    return true;
+}
+
+bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
+                           int* tokens_out, std::string& err) {
+    if (!rows_ok() || n_parts_ != 1 || seq_.empty() || n < 1 || n > rows_max()) {
+        err = "glm rows: not available here (one GPU, several sequences, 1.." + std::to_string(rows_max()) + " rows)";
+        return false;
+    }
+    if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;   // (each sequence's pinned embedding row)
+    cudaSetDevice(dev_);
+    // between steps (the device idle): finished promotions go live and the layers get fresh spare slots, as the
+    // token path does between tokens - every 32 steps instead, the spares ran dry and the VRAM tier stopped following
+    // the routes (two conversations on a V100 streaming its experts from RAM: 27.1 tok/s in all against 34.2)
+    if (!fast_boundary(err)) return false;
+    FastState* F = fast_;
+    RowsState* S = rows_;
+    // (the token path's profiler collects one token's marks at a time: none from a batched step)
+    struct ProfOff {
+        FastState* F;
+        bool was;
+        ~ProfOff() { F->prof_on = was; }
+    } prof_off{F, F->prof_on};
+    F->prof_on = false;
+    RowSeq rw[gf::kMaxMvNt];
+    if (!rows_bind(seqs, n, rw, err) || !rows_embed(rw, tokens, n, err) || !rows_layers(rw, n, err) ||
+        !rows_head(rw, sps, n, err))
+        return false;
+    cudaMemcpyAsync(S->tok_h, S->tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+    cudaEventRecord(S->ev_done, F->cs);
     // the step back (the service threads answer the routes' misses meanwhile)
     if (!glmfast::wait_event(S->ev_done, "glm rows step", err) || !F->route_ok(err)) return false;
     if (gf::launch_errors() > 0) {
@@ -474,6 +513,94 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             ++c.pos;
             c.last_tok = tok;
         }
+    }
+    return true;
+}
+
+bool Glm5Model::split_rows_ok() const {
+    if (n_parts_ <= 1 || seq_.empty()) return false;
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_ == nullptr || m->rows_ == nullptr) return false;
+    return true;
+}
+
+bool Glm5Model::multi_issue_rows(const int* seqs, const int32_t* tokens,
+                                 const strata::kernels::SamplerParams* sps, int n, std::string& err) {
+    if (!split_rows_ok() || n < 1 || n > rows_max()) {
+        err = "glm rows: the split batch is not available here (every part's row arena, 1.." +
+              std::to_string(rows_max()) + " rows)";
+        return false;
+    }
+    if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;
+
+    struct ProfOff {
+        FastState* fast[kMaxParts];
+        bool was[kMaxParts];
+        int n = 0;
+        ~ProfOff() {
+            for (int i = n; i-- > 0;) fast[i]->prof_on = was[i];
+        }
+    } prof_off;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        prof_off.fast[prof_off.n] = m->fast_;
+        prof_off.was[prof_off.n] = m->fast_->prof_on;
+        m->fast_->prof_on = false;
+        ++prof_off.n;
+    }
+
+    RowSeq cur[gf::kMaxMvNt];
+    if (!rows_bind(seqs, n, cur, err) || !rows_embed(cur, tokens, n, err) || !rows_layers(cur, n, err))
+        return false;
+    int64_t p0[8];
+    for (int i = 0; i < n; ++i) p0[i] = cur[i].p;
+
+    Glm5Model* tail = this;
+    const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
+    for (Glm5Model* B = split_next_.get(); B != nullptr; B = B->split_next_.get()) {
+        RowSeq nxt[8];
+        if (!B->rows_bind(seqs, n, nxt, err)) return false;
+        for (int i = 0; i < n; ++i)
+            if (nxt[i].p != p0[i]) {
+                err = "glm rows: sequence " + std::to_string(seqs[i]) + " is at a different position on CUDA" +
+                      std::to_string(B->dev_);
+                return false;
+            }
+        cudaSetDevice(tail->dev_);
+        for (int i = 0; i < n; ++i) {
+            SeqCtx& ca = tail->seq_[(size_t) seqs[i]];
+            cudaMemcpyAsync(ca.hop_h, cur[i].state, hop, cudaMemcpyDeviceToHost, tail->fast_->cs);
+            cudaEventRecord(ca.ev_hop, tail->fast_->cs);
+        }
+        cudaSetDevice(B->dev_);
+        for (int i = 0; i < n; ++i) {
+            SeqCtx& ca = tail->seq_[(size_t) seqs[i]];
+            cudaStreamWaitEvent(B->fast_->cs, ca.ev_hop, 0);
+            cudaMemcpyAsync(nxt[i].state, ca.hop_h, hop, cudaMemcpyHostToDevice, B->fast_->cs);
+        }
+        if (!B->rows_layers(nxt, n, err)) return false;
+        for (int i = 0; i < n; ++i) cur[i] = nxt[i];
+        tail = B;
+    }
+
+    if (!tail->rows_head(cur, sps, n, err)) return false;
+    cudaSetDevice(tail->dev_);
+    for (int i = 0; i < n; ++i) {
+        SeqCtx& ct = tail->seq_[(size_t) seqs[i]];
+        cudaMemcpyAsync(ct.tok_h, tail->rows_->tok + i, sizeof(int), cudaMemcpyDeviceToHost, tail->fast_->cs);
+        cudaEventRecord(ct.ev_done, tail->fast_->cs);
+    }
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        for (int i = 0; i < n; ++i) {
+            if (seqs[i] == m->cur_seq_)
+                ++m->pos_;
+            else
+                ++m->seq_[(size_t) seqs[i]].pos;
+        }
+    cudaSetDevice(dev_);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("glm rows: ") + cudaGetErrorString(e);
+        return false;
     }
     return true;
 }

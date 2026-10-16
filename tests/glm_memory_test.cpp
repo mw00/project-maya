@@ -56,5 +56,29 @@ int main() {
     assert(complete_pool_slots(40 * G, 308 * M, 288, 3, 18) == 0);
     assert(complete_pool_slots(158 * G, 0, 288, 3, 18) == 0);
     assert(complete_pool_slots(158 * G, 308 * M, 288, 3, -5) == 291);
+    // The pool's reserve: 700 MiB, except where it leaves the pool short of its floor (here 2 GiB) - an automatic budget
+    // then lowers it to leave exactly the floor, never below 300 MiB; one set by hand or a fixed budget keeps it
+    using strata::core::glmfast::pool_reserve;
+    const size_t R = 700 * M, S = 300 * M;
+    assert(pool_reserve(10 * G, R, false, false, 2 * G, S) == std::make_pair(R, false));            // room for both
+    assert(pool_reserve(2 * G + 500 * M, R, false, false, 2 * G, S) == std::make_pair(500 * M, true));
+    assert(pool_reserve(2 * G + 300 * M, R, false, false, 2 * G, S) == std::make_pair(S, true));
+    assert(pool_reserve(2 * G + 299 * M, R, false, false, 2 * G, S) == std::make_pair(R, false));    // short anyway
+    assert(pool_reserve(2 * G + 500 * M, R, true, false, 2 * G, S) == std::make_pair(R, false));     // given
+    assert(pool_reserve(2 * G + 500 * M, R, false, true, 2 * G, S) == std::make_pair(R, false));     // --expert-cache N
+    // The written budget's check (20 GiB asked, 700 MiB reserve): free as planned gives nothing back; 200 MiB free
+    // gives back the 500 short + 64; nearly nothing free 1 GiB twice, then a quarter; a refused piece what it refused
+    using strata::core::glmfast::pool_give_back;
+    int zr = 0;
+    assert(pool_give_back(20 * G, 20 * G, 700 * M, R, zr) == 0);
+    assert(pool_give_back(20 * G, 20 * G, 640 * M, R, zr) == 0);
+    assert(pool_give_back(20 * G, 20 * G, 200 * M, R, zr) == 564 * M);
+    assert(pool_give_back(20 * G, 20 * G, 0, R, zr) == G && zr == 1);
+    assert(pool_give_back(20 * G, 20 * G, 0, R, zr) == G && zr == 2);
+    assert(pool_give_back(20 * G, 20 * G, 0, R, zr) == 5 * G && zr == 3);
+    zr = 0;
+    assert(pool_give_back(20 * G, 18 * G, 2 * G, R, zr) == 2 * G);
+    assert(pool_give_back(20 * G, 18 * G, 100 * M, R, zr) == 2 * G + 664 * M);
+    assert(pool_give_back(G, 0, 0, R, zr) == G);   // never more than was asked
     std::puts("GLM memory policy checks passed (CPU only)");
 }

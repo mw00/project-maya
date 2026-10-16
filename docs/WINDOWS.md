@@ -48,6 +48,12 @@ and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built wi
   recommends, with enough free disk space: System > About > Advanced system settings > Performance > Settings >
   Advanced > Virtual memory. Restart Windows after changing it. "System managed" can remain too small on a
   large-RAM PC ([#20](https://github.com/mw00/project-maya/issues/20)).
+- **A GPU filled to the brim pages instead of failing.** Windows' driver moves GPU memory to system RAM when the card
+  runs out, and decode then falls to a few tokens per second. The expert pool checks the free VRAM again once it is
+  written (`--expert-cache auto`, the default), and the engine log says at start how much is free on each GPU
+  (`LOW` below 256 MiB). A drafter (DFlash2) takes a few hundred MB more on its first request. If it warns, or
+  answers slow down after the first one, add `"--vram-reserve-mib", "1500"` (say) to the config's `"args"`, or set up
+  again with `--vram-reserve-mib 1500` ([the expert pool's size](SETTINGS.md#the-expert-pools-size)).
 - With several CUDA toolkits installed, setup chooses the newest compatible one. To select one explicitly, add
   `--nvcc "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin\nvcc.exe"` to the setup command.
 - After setup, stop any running Maya server and run `.\START-MAYA.bat --calibrate --no-start` to tune the CPU/PCIe

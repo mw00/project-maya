@@ -53,6 +53,15 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(pc["gpus"], [self.gpus[1]])
         self.assertEqual(maya.EXE, self.root / "build-hip/strata")
 
+    def test_rdna2_is_experimental_and_compiled_only_when_chosen(self):
+        pc = maya.check_pc(self.a)      # the RX 7900 XT: the three architectures, as before
+        self.assertEqual(pc["archs"], list(maya.HIP_ARCHS))
+        self.gpus.append({"index": 3, "arch": "gfx1030", "vendor": "amd", "name": "Radeon PRO V620", "vram_gb": 32})
+        self.a.gpu = 3
+        pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [self.gpus[3]])
+        self.assertEqual(pc["archs"], list(maya.HIP_ARCHS) + ["gfx1030"])
+
     def test_rejects_unsupported_card_and_bad_gpu_lists(self):
         self.a.gpu = 2
         with self.assertRaises(SystemExit):

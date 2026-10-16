@@ -312,6 +312,216 @@ function renderTiers(t, eng) {
   $("tier-advice").textContent = tip;
 }
 
+// the GPUs (/metrics gpu_map: the GLM engine's VRAM lines and NVML's processes): a row a GPU, its bar the whole card (its
+// size in GB beside it); with several, the parts' colours once above the rows with their GB over all of them, each row's
+// load, power, temperature and PCIe link under its bar, and a row opened (a click) shows its parts with a sentence each -
+// one GPU: its row, opened (the hardware cards have its readings)
+const GPU_PARTS = [
+  {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
+  {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
+  {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
+];
+const GIB = 1073741824;
+const GPU_PLAIN_FROM = 5;   // an engine without VRAM lines: the rows (NVML's memory and readings) from five GPUs
+const gpuKey = (g) => String(g.index != null ? g.index : `d${g.dev}`);
+const gpuLabel = (g) => `GPU ${g.index ?? g.dev}`;
+const gpuName = (g) => (g.name || "").replace(/^NVIDIA /, "").replace(/^GeForce /, "").replace(/^AMD /, "").replace(/^Radeon /, "");
+const gpuGb = (b) => `${gb(b, b < GIB ? 2 : 1)} GB`;
+const gpuList = (gs) => gs.length === 1 ? gpuLabel(gs[0])
+  : `GPUs ${gs.slice(0, -1).map((g) => g.index ?? g.dev).join(", ")} and ${gs[gs.length - 1].index ?? gs[gs.length - 1].dev}`;
+let gpuOpen = store.get("gpu-open", null);   // the row opened (several GPUs), remembered in this browser
+let gpuShown = {};                           // each row's parts by its GPU, for the tooltip
+
+function gpuSegs(g, eng) {
+  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : eng.mtp ? "MTP" : "";
+  return GPU_PARTS.filter((d) => (p[d.key] || 0) > 0 || d.key === "pool" || d.key === "kv")
+    .map((d) => ({key: d.key, bytes: p[d.key] || 0, label: d.key === "drafter" && draft ? `Drafter (${draft})` : d.label}))
+    .concat([{key: "free", label: "Free", bytes: g.free || 0}]);
+}
+
+// a GPU's NVML readings under its bar: load, power, temperature (warm from 80 °C, hot from 87) and PCIe link
+function gpuStats(r) {
+  if (!r) return "";
+  const gen = r.pcie_gen_max || r.pcie_gen, mb = r.pcie_rx_mb;
+  const heat = r.temp >= 87 ? " is-hot" : r.temp >= 80 ? " is-warm" : "";
+  const rate = mb == null ? "" : ` · ${mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`}`;
+  return [r.util != null ? `<span><b>${fmt(r.util)}%</b> load</span>` : "",
+          r.power != null ? `<span><b>${fmt(r.power)}</b>${r.power_limit ? ` / ${fmt(r.power_limit)}` : ""} W</span>` : "",
+          r.temp != null ? `<span class="${heat.trim()}"><b>${fmt(r.temp)}</b> °C</span>` : "",
+          gen ? `<span>PCIe <b>Gen${gen}</b>${r.pcie_width ? ` x${r.pcie_width}` : ""}${rate}</span>` : ""].join("");
+}
+
+// an opened row: each part with what it is
+function gpuDetail(g, segs, m) {
+  const eng = m.engine || {}, live = m.live || {}, last = (m.requests || [])[0];
+  const ctx = g.ctx || eng.max_context || 0;
+  const inUse = live.state !== "idle" ? (live.prompt_tokens || 0) + (live.generated || 0)
+              : last ? (last.prompt_tokens || 0) + (last.output_tokens || 0) : 0;
+  const sub = {
+    weights: "attention, shared experts and the other dense tensors",
+    kv: (eng.kv_resident ? `${ctxfmt(eng.kv_resident)} of ${ctxfmt(ctx)} positions here, the rest in RAM`
+                         : `${ctxfmt(ctx)} positions`) + (inUse ? ` · ${kfmt(inUse)} in use` : "") +
+        (g.kv_ram ? ` · ${gb(g.kv_ram)} GB pinned in RAM` : ""),
+    act: "one token's working buffers",
+    drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""]
+      .filter(Boolean).join(" · "),
+    pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
+      .filter(Boolean).join(" · "),
+    vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
+    rest: "the driver's reserve and context, conversation snapshots and small buffers",
+    other: "processes that are not Maya's",
+    free: (g.free || 0) < 1.5 * GIB ? "kept free for the driver and the sampler" : "unused",
+  };
+  return `<div class="gpulegend">` + segs.map((s) =>
+    `<div class="gpulegend__item" data-k="${s.key}"><i class="dot${s.key === "free" ? " dot--free" : ""}" ` +
+    `style="--gm-c:var(--gm-${s.key})"></i><span>${esc(s.label)}</span><b>${esc(gpuGb(s.bytes))}</b>` +
+    `<span class="gpulegend__sub">${esc(sub[s.key] || "")}</span></div>`).join("") + `</div>`;
+}
+
+// pointing at a part (in a bar or the key) picks it out in every bar; a bar's part says its size
+function gpuFocus(k) {
+  const box = $("gpurows");
+  if (k && k !== "free") box.dataset.focus = k;
+  else delete box.dataset.focus;
+}
+$("gpurows").addEventListener("pointermove", (e) => {
+  const seg = e.target.closest(".gpubar__seg"), tip = $("gpubar-tip");
+  const r = seg && gpuShown[seg.closest(".gpurow").dataset.gpu];
+  const s = r && r.segs.find((x) => x.key === seg.dataset.k);
+  gpuFocus(s && s.key);
+  if (!s) { tip.hidden = true; return; }
+  const card = $("gpumap-card").getBoundingClientRect(), bar = seg.parentElement.getBoundingClientRect();
+  tip.innerHTML = (Object.keys(gpuShown).length > 1 ? `${esc(gpuLabel(r.g))} · ` : "") +
+    `<b>${esc(s.label)}</b> · ${esc(gpuGb(s.bytes))} · ${esc(fmt((100 * s.bytes) / (r.g.total || 1), 1))}% of the card`;
+  tip.style.left = `${Math.min(Math.max(e.clientX - card.left, 130), card.width - 130)}px`;
+  tip.style.top = `${bar.top - card.top}px`;
+  tip.hidden = false;
+});
+$("gpurows").addEventListener("pointerleave", () => { gpuFocus(null); $("gpubar-tip").hidden = true; });
+$("gpurows").addEventListener("click", (e) => {
+  const line = e.target.closest("button.gpurow__line");
+  if (!line) return;
+  const k = line.parentElement.dataset.gpu;
+  gpuOpen = gpuOpen === k ? null : k;
+  store.set("gpu-open", gpuOpen);
+  if (lastMetrics) renderGpuMap(lastMetrics.gpu_map, lastMetrics);
+});
+$("gpukey").addEventListener("pointerover", (e) => { const it = e.target.closest(".gpukey__item"); gpuFocus(it && it.dataset.k); });
+$("gpukey").addEventListener("pointerleave", () => gpuFocus(null));
+
+// true when the rows carry each GPU's readings (the hardware cards then keep their totals)
+function renderGpuMap(map, m) {
+  const card = $("gpumap-card"), reads = (m.hardware || {}).gpus || [];
+  const plain = !map || !map.length;   // (no VRAM lines: NVML's memory in use, from five GPUs)
+  if (plain && reads.length >= GPU_PLAIN_FROM) {
+    const names = ((m.hardware_static || {}).gpu_name || "").split(" + ");
+    map = reads.map((r, i) => ({index: r.index, name: names.length === reads.length ? names[i] : "", total: r.mem_total || 0,
+                                free: Math.max(0, (r.mem_total || 0) - (r.mem_used || 0)), parts: {used: r.mem_used || 0}}));
+  }
+  if (!map || !map.length) { card.hidden = true; gpuShown = {}; return false; }
+  card.hidden = false;
+  const eng = m.engine || {}, live = m.live || {}, one = map.length === 1, fold = !one && !plain;   // (fold: rows open)
+  card.classList.toggle("is-one", one);
+  const byIndex = Object.fromEntries(reads.map((r) => [String(r.index), r]));
+  const rows = map.map((g) => ({g, key: gpuKey(g), read: one ? null : byIndex[String(g.index)],
+                                segs: plain ? [{key: "used", label: "In use", bytes: g.parts.used}, {key: "free", label: "Free", bytes: g.free}]
+                                            : gpuSegs(g, eng)}));
+  gpuShown = Object.fromEntries(rows.map((r) => [r.key, r]));
+  const open = plain ? null : one ? rows[0].key : gpuOpen;
+  const sum = (f) => map.reduce((a, g) => a + (f(g) || 0), 0);
+  const total = sum((g) => g.total), used = sum((g) => g.total - (g.free || 0));
+  $("gpumap-title").textContent = plain ? "GPUs" : one ? "What fills the GPU" : "What fills the GPUs";
+  $("gpumap-sub").textContent = [one ? "" : `${map.length} GPUs`, `${gb(used)} of ${gb(total, 0)} GB in use`,
+                                 map.some((g) => g.measured === "start") ? "as measured at the start" : ""].filter(Boolean).join(" · ");
+
+  // the key: each part's GB over all the GPUs (one GPU: its opened row says it; NVML's memory alone: nothing to tell apart)
+  const key = $("gpukey");
+  key.hidden = one || plain;
+  if (!key.hidden) {
+    const tot = {}, label = {};
+    for (const r of rows) for (const s of r.segs) { tot[s.key] = (tot[s.key] || 0) + s.bytes; label[s.key] = s.label; }
+    const html = GPU_PARTS.map((d) => d.key).concat(["free"]).filter((k) => tot[k] > 0).map((k) =>
+      `<span class="gpukey__item" data-k="${k}"><i class="dot${k === "free" ? " dot--free" : ""}" style="--gm-c:var(--gm-${k})">` +
+      `</i>${esc(label[k])} <b>${esc(gpuGb(tot[k]))}</b></span>`).join("");
+    if (key._html !== html) { key.innerHTML = html; key._html = html; }
+  }
+
+  // the rows: built when the GPUs or their parts change, else updated in place (a pointed-at part keeps its focus)
+  const box = $("gpurows");
+  const sig = rows.map((r) => `${r.key}:${r.segs.map((s) => s.key).join("+")}`).join(",") + (one ? "|one" : plain ? "|plain" : "");
+  if (box.dataset.sig !== sig) {
+    box.dataset.sig = sig;
+    box.innerHTML = rows.map((r) => {
+      const tag = fold ? "button" : "div", k = esc(r.key);
+      return `<div class="gpurow" data-gpu="${k}"><${tag} class="gpurow__line"` +
+        (fold ? ` type="button" aria-expanded="false" aria-controls="gpurow-d-${k}"` : "") + `>` +
+        `<span class="gpurow__name"><b></b><span></span></span><span class="gpurow__track"><span class="gpubar" role="img">` +
+        r.segs.map((s) => `<span class="gpubar__seg" data-k="${s.key}" style="--gm-c:var(--gm-${s.key})">` +
+                          (s.key === "pool" ? `<i class="gpubar__lent"></i>` : "") + `</span>`).join("") +
+        `</span>${one ? "" : `<span class="gpustat"></span>`}</span><span class="gpurow__used"><b></b><span></span>` +
+        `${fold ? icon("chevron", "st-icon st-icon--sm st-chev") : ""}</span></${tag}>` +
+        `<div class="gpurow__detail" id="gpurow-d-${k}" hidden></div></div>`;
+    }).join("");
+  }
+  const reading = live.state === "reading";
+  for (const [i, r] of rows.entries()) {
+    const g = r.g, p = g.parts || {}, el = box.children[i], isOpen = r.key === open;
+    el.classList.toggle("is-open", isOpen);
+    if (fold) el.firstElementChild.setAttribute("aria-expanded", String(isOpen));
+    el.querySelector(".gpurow__name b").textContent = gpuLabel(g);
+    el.querySelector(".gpurow__name span").textContent =
+      [gpuName(g), g.layers && g.layers[1] > g.layers[0] ? `layers ${g.layers[0]}–${g.layers[1] - 1}` : ""]
+        .filter(Boolean).join(" · ");
+    el.querySelector(".gpurow__used b").textContent = gb(Math.max(0, g.total - (g.free || 0)));
+    el.querySelector(".gpurow__used span").textContent = `/ ${gb(g.total, 0)} GB`;
+    const bar = el.querySelector(".gpubar");
+    for (const s of r.segs) bar.querySelector(`[data-k="${s.key}"]`).style.flexGrow = String(s.bytes / (g.total || 1));
+    const lent = bar.querySelector(".gpubar__lent");   // (a prompt borrows each pool's tail; the vision encoder's: prompts wait)
+    if (lent) lent.style.width = reading && !g.vision_lent && g.borrow > 0 && p.pool > 0
+      ? `${Math.min(100, (100 * g.borrow) / p.pool)}%` : "0";
+    bar.setAttribute("aria-label", `${gpuLabel(g)}: ` + r.segs.map((s) => `${s.label} ${gpuGb(s.bytes)}`).join(", "));
+    const stat = el.querySelector(".gpustat");
+    if (stat) {
+      const html = gpuStats(r.read);
+      if (stat._html !== html) { stat.innerHTML = html; stat._html = html; }
+    }
+    const d = el.lastElementChild;
+    d.hidden = !isOpen;
+    if (isOpen) {
+      const html = gpuDetail(g, r.segs, m);
+      if (d._html !== html) { d.innerHTML = html; d._html = html; }
+    }
+  }
+
+  // what is happening now: a prompt borrows the pools' tails, the vision encoder GPU 0's
+  const vis = map.find((g) => g.vision_lent);
+  const lentNow = reading ? sum((g) => !g.vision_lent && g.borrow > 0 && (g.parts || {}).pool > 0 ? Math.min(g.borrow, g.parts.pool) : 0) : 0;
+  const now = vis ? `The vision encoder has ${gb(vis.parts.vision || vis.lendable)} GB of ${one ? "the" : `${gpuLabel(vis)}'s`} expert pool while it encodes.`
+            : lentNow ? `Reading a prompt: the expert pool${one ? " lends" : "s lend"} it up to ${gb(lentNow)} GB (hatched).` : "";
+  $("gpumap-now").hidden = !now;
+  $("gpumap-now").textContent = now;
+
+  // advice: memory the expert pool could have at the next start
+  const complete = eng.expert_slots && eng.experts && eng.expert_slots >= eng.experts;   // (every expert in VRAM already)
+  const more = (g, b) => (g.slots && g.parts.pool ? Math.max(0, Math.floor(b / (g.parts.pool / g.slots))) : 0);
+  const where = (gs) => (one ? "this GPU" : gpuList(gs));
+  const pools = (gs) => (one ? "the expert pool" : gs.length > 1 ? "their expert pools" : "its expert pool");
+  const others = complete ? [] : map.filter((g) => (g.parts.other || 0) >= 0.5 * GIB);
+  const frees = complete ? [] : map.filter((g) => !g.vision_lent && (g.free || 0) >= 2 * GIB);
+  let tip = "";
+  if (others.length) {
+    const b = others.reduce((a, g) => a + g.parts.other, 0), n = others.reduce((a, g) => a + more(g, g.parts.other), 0);
+    tip = `Other programs hold ${gb(b)} GB on ${where(others)}: with them closed, a restart gives ${pools(others)} about ` +
+          `${fmt(n)} more experts.`;
+  } else if (frees.length) {
+    const b = frees.reduce((a, g) => a + g.free, 0), n = frees.reduce((a, g) => a + more(g, g.free - GIB), 0);
+    tip = `${gb(b)} GB of ${where(frees)} are free: a restart gives ${pools(frees)} about ${fmt(n)} more experts.`;
+  }
+  $("gpumap-advice").hidden = !tip;
+  $("gpumap-advice").textContent = tip;
+  return rows.some((r) => r.read);
+}
+
 // a sparkline; false when there is nothing to draw (no data, or only zeros: idle)
 function spark(id, values, max) {
   const svg = $(id);
@@ -379,10 +589,10 @@ function render(m) {
   liveCtx();                                     // the context meter follows the answer being written
   if (tab === "monitor") {
     renderBanners(m);
-    renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept);
+    const gpuEach = renderGpuMap(m.gpu_map, m);
+    renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, gpuEach);
     renderTiers(m.tiers, eng);
     renderHero(live, h, last, eng, m.tiers, m.totals);
-    renderGpus(hw);
   }
   if (tab === "about") renderAbout(eng, hw, st, m.storage);
 }
@@ -436,23 +646,6 @@ function renderHero(live, h, last, eng, tiers, totals) {
   $("hero-req").textContent = totals && totals.requests != null ? fmt(totals.requests) : "–";
 }
 
-// five GPUs or more: one row each (up to four, the hardware cards list every GPU's own value - each figure once)
-const GPU_TABLE_FROM = 5;
-function renderGpus(hw) {
-  const gpus = hw.gpus || [];
-  $("gpus-card").hidden = gpus.length < GPU_TABLE_FROM;
-  if (gpus.length < GPU_TABLE_FROM) return;
-  $("gpus-sub").textContent = `${gpus.length} cards`;
-  $("gpus-body").innerHTML = gpus.map((g) => {
-    const gen = g.pcie_gen_max || g.pcie_gen;
-    const pcie = gen ? `Gen${gen}${g.pcie_width ? ` x${g.pcie_width}` : ""}${g.pcie_rx_mb != null ? ` · ${fmt(g.pcie_rx_mb, g.pcie_rx_mb < 10 ? 1 : 0)} MB/s` : ""}` : "–";
-    return `<tr><td>GPU ${esc(g.index)}</td><td class="num">${g.util == null ? "–" : `${fmt(g.util)}%`}</td>` +
-      `<td class="num">${g.mem_used == null ? "–" : `${gb(g.mem_used)}${g.mem_total ? ` / ${gb(g.mem_total, 0)}` : ""} GB`}</td>` +
-      `<td class="num">${g.power == null ? "–" : `${fmt(g.power)}${g.power_limit ? ` / ${fmt(g.power_limit)}` : ""} W`}</td>` +
-      `<td class="num">${g.temp == null ? "–" : `${fmt(g.temp)} °C`}</td><td class="num">${esc(pcie)}</td></tr>`;
-  }).join("");
-}
-
 function renderTotals(t) {
   if (!t || !t.requests) return "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
@@ -463,7 +656,7 @@ function renderTotals(t) {
          `${fmt(t.output_tokens)} written${oSpeed}`;
 }
 const API_NAMES = {web: "Chat", openai: "OpenAI", anthropic: "Anthropic"};
-function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
+function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEach) {
   // model state
   const prog = $("state-progress"), badge = $("state-badge");
   const took = (s) => (s == null ? "" : s < 90 ? ` · ${fmt(s)} s` : ` · ${fmt(Math.floor(s / 60))} min ${fmt(s % 60)} s`);
@@ -500,10 +693,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;
 
-  // the hardware cards: the total (or the mean / the hottest) and its history; with two to four GPUs the line under it
-  // has every GPU's own value (from five, the GPUs table above has them and the cards keep their totals)
+  // the hardware cards: the total (or the mean / the hottest) and its history; with several GPUs the line under it has
+  // every GPU's own value - unless the GPU card's rows have them (gpuEach), each figure shown once
   const gpus = hw.gpus || [];
-  const multi = gpus.length > 1, each = multi && gpus.length < GPU_TABLE_FROM;
+  const multi = gpus.length > 1, each = multi && !gpuEach;
   const per = (f) => gpus.map((g) => `GPU ${g.index} ${f(g)}`.replace(/ /g, " ")).join(" · ");   // wraps between GPUs only
   const rate = (mb) => (mb == null ? "–" : mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`);
   setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
