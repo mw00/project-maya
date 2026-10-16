@@ -1296,13 +1296,14 @@ int mv_occ(int K) {
 // shared expert's 4096 x 2048 17.4 -> 16.5); with two a SM, a launch that would spill a short second wave (more blocks
 // than the SMs keep, less than one and a half times) takes twice the splits (RTX 5060 Ti, K5: that gate 99.4 -> 84.8
 // us, that down 100.6 -> 84.9)
-// call_groups: the output blocks of the call's jobs of this code together - where an SM keeps three or more they
-// count against the target, not the job's own (RTX 3090, K6, a KDA layer's q, k and v, three 4096 x 8192 jobs:
-// 1536 blocks 119.6 us, 384 blocks 105.9); at two a SM the job's own (RTX 5060 Ti: the MLA layer's q_a and kv_a
-// together would lose 8%).  Never the activations: a window's token gets the token path's split
+// call_groups: the output blocks the call's jobs of this code count together against the target, not the job's own -
+// where an SM keeps three or more, all of them (RTX 3090, K6, a KDA layer's q, k and v, three 4096 x 8192 jobs: 1536
+// blocks 119.6 us, 384 blocks 105.9); at two a SM only jobs of the same shape (RTX 5060 Ti: those q, k and v 191 ->
+// 185 us, a shared expert's gate and up 35.9 -> 35.0; the MLA layer's q_a and kv_a together would lose 8%).  Never the
+// activations: a window's token gets the token path's split
 void mv_split(const Mat& m, int sms, int occ, int& S, int& kr, int call_groups = 0) {
     const bool many = occ >= 3;
-    const int groups = many ? std::max(m.n / kCols, call_groups) : m.n / kCols;
+    const int groups = std::max(m.n / kCols, call_groups);
     const int kr_min = many ? 128 : 256, target = (many ? 4 : 2) * sms, P = occ * sms;
     S = (m.k + kMaxKR - 1) / kMaxKR;
     while (groups * S < target && m.k / (S * 2) >= kr_min) S *= 2;
@@ -1377,11 +1378,17 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         }
         for (int c0 = 0; c0 < jobs[j].ncol; c0 += run) units[nu++] = {j, c0, std::min(run, jobs[j].ncol - c0)};
     }
-    // each job's call_groups (mv_split): the output blocks of the call's jobs of its code
+    // each job's call_groups (mv_split): the output blocks of the call's jobs of its code - of its shape too where an SM
+    // keeps fewer than three
     int cg[kMaxMvJobs] = {};
-    for (int j = 0; j < n; ++j)
-        for (int q = 0; q < n; ++q)
-            if (jobs[q].m->K == jobs[j].m->K && jobs[q].m->cb == jobs[j].m->cb) cg[j] += jobs[q].m->n / kCols;
+    for (int j = 0; j < n; ++j) {
+        const Mat& a = *jobs[j].m;
+        const bool many = mv_occ(a.K) >= 3;
+        for (int q = 0; q < n; ++q) {
+            const Mat& b = *jobs[q].m;
+            if (b.K == a.K && b.cb == a.cb && (many || (b.k == a.k && b.n == a.n))) cg[j] += b.n / kCols;
+        }
+    }
     bool done[sizeof(units) / sizeof(units[0])] = {};
     for (int i = 0; i < nu; ++i) {
         if (done[i]) continue;
