@@ -232,6 +232,27 @@ public:
     /// strata::kernels::sample_tokens, which is a kernel and takes device memory (see sampler.hpp).
     const float* device_logits() const { return sc_ + sc_logits; }
 
+    /// NaN guard: the head-logits finite guard.  `guard_logits` records one GPU check of `rows` rows (`n` floats a row)
+    /// of `logits` at positions pos0.. on stream `s`, beside the argmax/sampler the window already runs;
+    /// `nonfinite_row` is the first row that held a NaN or an infinity (-1: none, or the guard is off) and
+    /// `nonfinite_pos` its position.  The flags are mapped host memory, so the caller must have read the stream (the
+    /// window's own sync) first.  STRATA_GLM_NAN_GUARD=0 turns the guard off; STRATA_GLM_NAN_INJECT=<n>[,<n>...]
+    /// (debug) reports the n-th checked window of the process as non-finite, to exercise the recovery without a real
+    /// fire.  With a layer split the head lives on the tail, so both walk the split chain.
+    static bool nan_guard_on();
+    void guard_logits(const float* logits, int rows, int n, int64_t pos0, cudaStream_t s);
+    int nonfinite_row();
+    int64_t nonfinite_pos();
+    /// The pipelined window's tokens each check into their own flag row (their slot) instead: `guard_slot` records
+    /// slot `slot`'s check, `nf_pipe_begin` clears the window's verdict, and `nf_pipe_read` reads slot `slot` once its
+    /// pick is in (window token `t` at position `pos`), keeping the first flagged token.
+    void guard_slot(const float* logits, int n, int slot, cudaStream_t s);
+    void nf_pipe_begin();
+    void nf_pipe_read(int slot, int t, int64_t pos);
+    /// Only the first `n` rows of the pending check count (the window's kept tokens; drafts after the first wrong
+    /// one are rolled back, so a non-finite row there does not end the reply).
+    void nf_keep_rows(int n);
+
     /// The position the next token will occupy (tokens consumed since the last reset).
     int64_t position() const { return pos_; }
     const Glm5Geometry& geometry() const { return g_; }
@@ -465,6 +486,13 @@ public:
     int last_tok_ = -1;                                    // the greedy argmax of the last fast forward
     const strata::kernels::SamplerParams* mtp_sample_ = nullptr;   // decode_spec, STRATA_GLM_SPEC_SAMPLE: fast_mtp DRAWS
     int32_t force_tok_ = -1;                               // force_next()
+    // NaN guard: the head-logits finite guard's state (glm_fast_path.cu)
+    bool nf_pending_ = false;                             // a check ran; its flags are not read yet
+    int nf_rows_ = 0;                                     // the rows the pending check covers
+    int nf_row_ = -1;                                     // the last read's first non-finite row (-1: none)
+    int64_t nf_pos_ = -1;                                 // its position
+    int64_t nf_pos_base_ = -1;                            // the first row's position
+    long long nf_window_ = 0;                             // its 1-based window index (STRATA_GLM_NAN_INJECT)
     std::map<std::string, const uint16_t*> w16_;           // the pack's big BF16 rows, kept BF16 (fast mode)
     bool fast_setup(std::string& err);
     bool fast_setup_finish(std::string& err);

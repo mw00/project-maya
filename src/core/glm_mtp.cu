@@ -678,6 +678,11 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             const auto t2 = std::chrono::steady_clock::now();
             ph[0] += std::chrono::duration<double, std::milli>(t1 - t0).count();
             ph[1] += std::chrono::duration<double, std::milli>(t2 - t1).count();
+            {   // NaN guard: only the rows that can be kept count (a forced token can only end the run sooner)
+                int k = 1;
+                while (k < T && out[(size_t) k - 1] == win[(size_t) k]) ++k;
+                nf_keep_rows(k);
+            }
             // ---- 3. accept: row t's pick is the truth for p0 + t + 1; draft t + 1 stands while they match
             for (int t = 0; t < T; ++t) {
                 const int yy = forced(out[(size_t) t]);

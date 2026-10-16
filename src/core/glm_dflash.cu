@@ -1687,6 +1687,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         // reasoning closed by the caller - ends the run there, like a wrong draft)
         int acc = 0;
         while (acc < T - 1 && tok[(size_t) acc + 1] == out[(size_t) acc]) ++acc;
+        nf_keep_rows(acc + 1);   // NaN guard: only the kept rows count (the drafts after a wrong one are rolled back)
         if (stats != nullptr) {
             const auto t_win = std::chrono::steady_clock::now();
             const auto lm = lane_of();

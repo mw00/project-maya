@@ -492,6 +492,8 @@ struct Glm5Model::FastState {
     std::vector<BgMove> bg;
     bool bg_hold = false;   // lend_tail: no new moves while the pool's tail is lent
     volatile int* route_error_h = nullptr;   // in the mapped ring allocation, visible after compute completion
+    uint32_t* nf_h = nullptr;   // NaN guard: mapped per-window non-finite flags (kNonfiniteBlocks words a row)
+    uint32_t* nf_d = nullptr;   // its device alias
     uint64_t bg_up = 0, bg_down = 0;
     std::vector<cudaEvent_t> ev_free;
     int* upd_key_h = nullptr;

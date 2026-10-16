@@ -1773,6 +1773,7 @@ static int glm_pack_generate(const Options& o) {
         std::vector<int32_t> emitted;   // every token this request wrote (a PAUSE keeps the state they lead to)
         bool in_arg = false;     // inside a tool call's <arg_value> (the answer's position, for the loop guard)
         int guard_fired = 0;     // soft landings in this answer: a second loop ends it
+        bool nan_nonfinite = false;   // NaN guard: a decode window's head logits held a NaN or an infinity
         const auto looping = [&](int w) -> int {   // the pattern's period, 0 when the tail is not one
             const int n = (int) gen_hist.size();
             if (w <= 0 || n < w) return 0;
@@ -1784,6 +1785,15 @@ static int glm_pack_generate(const Options& o) {
             return 0;
         };
         const auto on_token = [&](int tok) -> bool {
+            // NaN guard: this window's head logits held a NaN or an infinity (the GPU check beside the head, read after the
+            // window's own sync).  None of the window's tokens goes out; the ERR names it "non-finite", so
+            // drop_if_poisoned drops the state that may carry it and the server runs the request again once.
+            if (model.nonfinite_row() >= 0) {
+                nan_nonfinite = true;
+                std::fprintf(stderr, "glm nan guard: non-finite logits in a decode window at position %lld "
+                                     "(row %d)\n", (long long) model.nonfinite_pos(), model.nonfinite_row());
+                return false;
+            }
             std::printf("T %d\n", tok);
             ++produced;
             emitted.push_back((int32_t) tok);
@@ -1931,6 +1941,14 @@ static int glm_pack_generate(const Options& o) {
                     return 1;
                 }
             }
+        }
+        if (nan_nonfinite) {
+            // NaN guard: report through #146's recovery: the ERR names the poison, drop_if_poisoned drops the snapshot,
+            // the checkpoints and the slots that may carry it, and the server's retry reads the prompt from token 0.
+            err = "a decode window's head logits are non-finite";
+            drop_if_poisoned(prompt, err);
+            std::printf("ERR %s\n", err.c_str());
+            return 1;
         }
         const auto t2 = std::chrono::steady_clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();

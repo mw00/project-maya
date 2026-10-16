@@ -1036,6 +1036,7 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
         err = "glm window: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    tail->guard_logits(WT.logits, T, g.n_vocab, p0, FT->cs);   // NaN guard: every row's logits, beside the picks
     if (sp != nullptr && !sp->greedy) {
         // row t is drawn with the counter the token loop would use for the token after tokens[t]
         strata::kernels::sample_tokens(WT.logits, T, (int) g.n_vocab, nullptr, 0, *sp, WT.tok, FT->cs);
@@ -1232,6 +1233,7 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
         err = "glm window: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    m->guard_slot(lg, g.n_vocab, sl, F->cs);   // NaN guard: this token's own flag row, read after its pick
     if (W.pick_sampled) {
         strata::kernels::SamplerParams sp = W.pick_sp;
         sp.counter += (uint64_t) t;
@@ -1292,6 +1294,7 @@ bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::ke
         W.pick_sampled = sp != nullptr && !sp->greedy;
         if (W.pick_sampled) W.pick_sp = *sp;
     }
+    nf_pipe_begin();   // NaN guard: this window's verdict starts clean; each pick reads its own token's row
     // the tokens past a wrong draft skip their heavy kernels (STRATA_GLM_WIN_SKIP=0: they run anyway)
     static const bool skip_on = [] {
         const char* v = getenv("STRATA_GLM_WIN_SKIP");
@@ -1436,6 +1439,7 @@ bool Glm5Model::win_pipe_pick(int t, int32_t& pick, std::string& err) {
         return false;
     }
     pick = WT.tok_h[sl];
+    tail->nf_pipe_read(sl, t, fast_->win.p0 + t);   // NaN guard: the pick's event follows its check on this stream
     return true;
 }
 

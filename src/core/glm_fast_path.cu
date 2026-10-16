@@ -907,6 +907,16 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->resp_h = (gf::MoeResponse*) hp;
     cudaHostGetDevicePointer(&dp, hp, 0);
     F->md.resp = dp;
+    // NaN guard: the head-logits finite check writes its per-row flags here.  Mapped, so the host reads them after the
+    // window's own sync (the check itself adds no sync).
+    if (cudaHostAlloc(&hp, (size_t) gf::kNonfiniteBlocks * kWinMax * sizeof(uint32_t), cudaHostAllocMapped) != cudaSuccess) {
+        err = "glm fast: the non-finite-logits flag allocation failed";
+        return false;
+    }
+    std::memset(hp, 0, (size_t) gf::kNonfiniteBlocks * kWinMax * sizeof(uint32_t));
+    F->nf_h = (uint32_t*) hp;
+    cudaHostGetDevicePointer(&dp, hp, 0);
+    F->nf_d = (uint32_t*) dp;
     if (cudaHostAlloc((void**) &F->emb_h, (size_t) E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->hop_h, (size_t) g.hc * E * sizeof(float), cudaHostAllocDefault) != cudaSuccess ||
         cudaHostAlloc((void**) &F->tok_h, 64, cudaHostAllocDefault) != cudaSuccess) {
@@ -3499,6 +3509,7 @@ void Glm5Model::fast_destroy() {
     if (F->upd_val_d) cudaFree(F->upd_val_d);
     if (F->ring_h) cudaFreeHost(F->ring_h);
     if (F->resp_h) cudaFreeHost(F->resp_h);
+    if (F->nf_h) cudaFreeHost(F->nf_h);
     if (F->emb_h) cudaFreeHost(F->emb_h);
     if (F->hop_h) cudaFreeHost(F->hop_h);
     if (F->tok_h) cudaFreeHost(F->tok_h);
@@ -5349,6 +5360,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
         err = "glm fast: output head (type " + std::to_string(ow.type) + ")";
         return false;
     }
+    tail->guard_logits(tail->sc_ + tail->sc_logits, 1, g.n_vocab, p, FT->cs);   // NaN guard: beside the pick, no extra sync
     gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     cudaMemcpyAsync(FT->tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     cudaEventRecord(FT->ev_done, FT->cs);
@@ -5518,6 +5530,136 @@ int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::strin
     cudaMemcpyAsync(F->tok_h, d_tok_, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm sampler (verify)", err) || !F->route_ok(err)) return -1;
     return F->tok_h[0];
+}
+
+// NaN guard: STRATA_GLM_NAN_GUARD=0 turns the guard off (read once: the check kernel is recorded beside the head, as
+// Strata does).  The check itself is one small kernel; its flags are mapped host memory read after the window's
+// own sync, so the guard adds no sync.
+bool Glm5Model::nan_guard_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GLM_NAN_GUARD");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+namespace {
+// STRATA_GLM_NAN_INJECT=<n>[,<n>...] (debug): the windows (counted from 1 over the process) the guard reports as
+// non-finite, so the whole recovery path can be exercised without a real fire.
+const std::vector<long long>& glm_nan_inject_list() {
+    static const std::vector<long long> list = [] {
+        std::vector<long long> v;
+        if (const char* e = std::getenv("STRATA_GLM_NAN_INJECT"))
+            for (const char* q = e; *q != 0;) {
+                char* end = nullptr;
+                const long long n = std::strtoll(q, &end, 10);
+                if (end == q) break;
+                if (n > 0) v.push_back(n);
+                q = *end == ',' ? end + 1 : end;
+            }
+        return v;
+    }();
+    return list;
+}
+std::atomic<long long> g_glm_nf_windows{0};
+}  // namespace
+
+void Glm5Model::guard_logits(const float* logits, int rows, int n, int64_t pos0, cudaStream_t s) {
+    nf_row_ = -1;
+    nf_pos_ = -1;
+    nf_pending_ = false;
+    if (!nan_guard_on() || logits == nullptr || rows <= 0 || n <= 0) return;
+    FastState* F = fast_;
+    if (F == nullptr || F->nf_d == nullptr) return;
+    const int r = std::min(rows, (int) kWinMax);
+    if (F->prof_on) F->mark("pre_guard");                      // STRATA_GLM_PROF=1: the check's own GPU time
+    gf::logits_nonfinite_rows(logits, r, n, F->nf_d, s);
+    if (F->prof_on) F->mark("logits_nonfinite");
+    nf_rows_ = r;
+    nf_pos_base_ = pos0;
+    nf_window_ = ++g_glm_nf_windows;
+    nf_pending_ = true;
+}
+
+int Glm5Model::nonfinite_row() {
+    if (!nan_guard_on()) return -1;
+    if (nf_pending_) {
+        nf_pending_ = false;
+        FastState* F = fast_;
+        int row = -1;
+        if (F != nullptr && F->nf_h != nullptr) {
+            const volatile uint32_t* f = F->nf_h;
+            for (int t = 0; t < nf_rows_ && t < (int) kWinMax && row < 0; ++t)
+                for (int b = 0; b < gf::kNonfiniteBlocks; ++b)
+                    if (f[t * gf::kNonfiniteBlocks + b] != 0) { row = t; break; }
+        }
+        const std::vector<long long>& inj = glm_nan_inject_list();
+        if (row < 0 && !inj.empty() && std::find(inj.begin(), inj.end(), nf_window_) != inj.end()) {
+            row = 0;
+            std::fprintf(stderr, "maya glm: STRATA_GLM_NAN_INJECT: window %lld reported as non-finite\n", nf_window_);
+        }
+        if (row >= 0) {
+            nf_row_ = row;
+            nf_pos_ = nf_pos_base_ >= 0 ? nf_pos_base_ + row : row;
+        }
+    }
+    if (nf_row_ >= 0) return nf_row_;
+    for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get())
+        if (m->nonfinite_row() >= 0) return m->nf_row_;
+    return -1;
+}
+
+int64_t Glm5Model::nonfinite_pos() {
+    if (nf_row_ >= 0) return nf_pos_;
+    for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
+        const int64_t p = m->nonfinite_pos();
+        if (p >= 0) return p;
+    }
+    return -1;
+}
+
+void Glm5Model::guard_slot(const float* logits, int n, int slot, cudaStream_t s) {
+    if (!nan_guard_on() || logits == nullptr || n <= 0 || slot < 0 || slot >= (int) kWinMax) return;
+    FastState* F = fast_;
+    if (F == nullptr || F->nf_d == nullptr) return;
+    gf::logits_nonfinite_rows(logits, 1, n, F->nf_d + (size_t) slot * gf::kNonfiniteBlocks, s);
+}
+
+void Glm5Model::nf_pipe_begin() {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        m->nf_pending_ = false;
+        m->nf_row_ = -1;
+        m->nf_pos_ = -1;
+    }
+    if (nan_guard_on()) {
+        Glm5Model* tail = this;
+        while (tail->split_next_) tail = tail->split_next_.get();
+        tail->nf_window_ = ++g_glm_nf_windows;
+    }
+}
+
+void Glm5Model::nf_pipe_read(int slot, int t, int64_t pos) {
+    if (!nan_guard_on() || nf_row_ >= 0 || slot < 0 || slot >= (int) kWinMax) return;
+    FastState* F = fast_;
+    bool bad = false;
+    if (F != nullptr && F->nf_h != nullptr) {
+        const volatile uint32_t* f = F->nf_h + (size_t) slot * gf::kNonfiniteBlocks;
+        for (int b = 0; b < gf::kNonfiniteBlocks && !bad; ++b) bad = f[b] != 0;
+    }
+    const std::vector<long long>& inj = glm_nan_inject_list();
+    if (!bad && t == 0 && !inj.empty() && std::find(inj.begin(), inj.end(), nf_window_) != inj.end()) {
+        bad = true;
+        std::fprintf(stderr, "maya glm: STRATA_GLM_NAN_INJECT: window %lld reported as non-finite\n", nf_window_);
+    }
+    if (bad) {
+        nf_row_ = t;
+        nf_pos_ = pos;
+    }
+}
+
+void Glm5Model::nf_keep_rows(int n) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->nf_pending_) m->nf_rows_ = std::max(0, std::min(m->nf_rows_, n));
 }
 
 // the bytes the expert pool may take from what is free.  The reserve: VRAM kept free beside the pool (the context's own
@@ -5958,6 +6100,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             err = "glm spec: output head";
             return false;
         }
+        m->guard_logits(m->sc_ + m->sc_logits, 1, g.n_vocab, p, FL->cs);   // NaN guard
         gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
         cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         cudaEventRecord(FL->ev_done, FL->cs);
@@ -5972,6 +6115,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         err = "glm spec: output head";
         return false;
     }
+    guard_logits(sc_ + sc_logits, 1, g.n_vocab, p, F->cs);   // NaN guard
     gf::argmax(sc_ + sc_logits, g.n_vocab, F->tok, F->cs);
     cudaMemcpyAsync(F->tok_h, F->tok, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
     cudaEventRecord(F->ev_done, F->cs);

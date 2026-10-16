@@ -792,6 +792,9 @@ void Glm5Model::reset() {
     }
     pos_ = 0;
     mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
+    nf_pending_ = false;             // a new sequence has no window to report
+    nf_row_ = -1;
+    nf_pos_ = -1;
     dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
     if (split_next_) {
         split_next_->reset();
