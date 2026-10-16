@@ -140,7 +140,7 @@ attention, state and MTP; visible GPU 1 owns a complementary expert cache. A uni
 in the existing portable pinned RAM tier (no second weight copy); a discrete helper uses its own VRAM, automatically
 sized by aligned expert bytes with 512 MiB left free. Primary admissions, prefetch and background promotions exclude
 helper-owned experts. At idle boundaries, colder helper experts can be replaced by hotter unowned experts of the same
-layer, using the cache coordination from [Strata PR #578](https://github.com/Niko1221/Strata/pull/578).
+layer.
 The helper quantizes activations and reduces weighted expert outputs on its GPU before returning one vector per token.
 CPU quantization runs only for actual CPU fallback; uncovered experts retain the existing CPU/PCIe/disk paths.
 Batched prefill retains its primary-GPU staging and CPU pool, and may read helper-owned UMA slots without evicting them.

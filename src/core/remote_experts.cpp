@@ -61,7 +61,15 @@ bool check(cudaError_t result, const char* what, std::string& err, int device) {
 }
 } // namespace
 
-GlmExpertHelper::~GlmExpertHelper() { close(); }
+// (nothing may leave a destructor: caught here, so GCC 14+ emits no __cxa_call_terminate for it - a build whose
+// link finds an older libstdc++ first, as CUDA 12.0 with GCC 13 as nvcc's host compiler beside a GCC 15 default,
+// lacked that symbol)
+GlmExpertHelper::~GlmExpertHelper() {
+    try {
+        close();
+    } catch (...) {
+    }
+}
 
 bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
                            const std::vector<std::pair<void*, size_t>>& regions, std::string& err) {
