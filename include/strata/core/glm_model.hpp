@@ -647,6 +647,8 @@ public:
     float* spec_hop_h_[2] = {nullptr, nullptr};            // pinned hop slots by position parity
     cudaEvent_t spec_ev_hop_[2] = {nullptr, nullptr};
     bool spec_kda_copy(bool restore);
+    size_t spec_kda_bytes() const;                         // the head's saved recurrent states on this part
+    bool spec_kda_reserve(std::string& err);               // ... taken at setup, before the expert pool
     // the speculative decode on a split of more than two parts: the HEAD GROUP is this part and the ones after it
     // up to spec_head_last() (STRATA_GLM_SPEC_HEAD=<parts>, default half), the TAIL GROUP the rest; each group runs
     // its parts one after another and the two groups overlap as the two halves of a two-part split do

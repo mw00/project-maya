@@ -95,6 +95,15 @@ namespace strata::core {
 using glmfast::cpu_relax;
 using glmfast::Workers;
 
+// the spec path's head group is the parts [0, h) with h = half the split (STRATA_GLM_SPEC_HEAD=<parts> overrides), the
+// TAIL GROUP the rest.  fast_setup asks for h alone: it runs before the parts are linked (split_next_ is set after
+// every part has loaded), so it counts them instead of walking the chain.
+static int spec_head_parts(int n) {
+    int h = n / 2;
+    if (const char* e = getenv("STRATA_GLM_SPEC_HEAD")) h = std::atoi(e);
+    return std::max(1, std::min(n - 1, h));
+}
+
 // The NUMA nodes this machine has (sysfs "online" list), and the most of this process's CPUs on any one of them;
 // {} / 0 when unknown or on a single node.
 static std::vector<int> numa_nodes() {
@@ -935,6 +944,13 @@ bool Glm5Model::fast_setup(std::string& err) {
         cudaMemGetInfo(&f1, &t1);
         F->win_bytes = win_free0 > f1 ? win_free0 - f1 : 0;
     }
+    // a NextN block on a split: the head group's recurrent-state backups, same place and same reason - the spec path
+    // would take them on its first decode step, when the pool holds all but the reserve and the reserve is not all
+    // allocatable.  The head group is the parts [0, h) that kda_all walks; h comes from part_/n_parts_ because
+    // split_next_ is linked only after every part has loaded.
+    if (!dflash_on_ && g_.nextn > 0 && n_parts_ > 1 && part_ < spec_head_parts(n_parts_) &&
+        getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr && !spec_kda_reserve(err))
+        return false;
     // ---- the expert pool: per-layer partitions (equal quota per layer within its size class)
     size_t blob_max = 0;
     int n_moe = 0;
@@ -5868,9 +5884,7 @@ bool Glm5Model::spec_ready() const {
 Glm5Model* Glm5Model::spec_head_last() {
     int n = 0;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) ++n;
-    int h = n / 2;
-    if (const char* e = getenv("STRATA_GLM_SPEC_HEAD")) h = std::atoi(e);
-    h = std::max(1, std::min(n - 1, h));
+    const int h = spec_head_parts(n);
     Glm5Model* m = this;
     for (int i = 1; i < h; ++i) m = m->split_next_.get();
     return m;
@@ -5896,20 +5910,50 @@ bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err) {
     return B->fast_layers(p, true, err);
 }
 
+// one recurrent layer's saved state: S (d_inner x head_dim) then the conv histories (3 x d_inner x (d_conv - 1))
+static size_t spec_kda_run(const Glm5Geometry& g) {
+    return ((size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1)) * sizeof(float);
+}
+
+// this part's share of the head's saved recurrent states (0: nothing recurrent here, so every caller may skip it)
+size_t Glm5Model::spec_kda_bytes() const {
+    int n_rec = 0;
+    for (int il = l0_; il < l1_; ++il) n_rec += g_.is_recr(il);
+    return (size_t) n_rec * spec_kda_run(g_);
+}
+
+// the same backup, taken at setup instead of on the spec path's first decode step: by then the pool holds all but the
+// reserve, and the reserve is not all allocatable - the driver's own cost for a pool this size comes out of it, so a
+// malloc a 700 MB reserve still satisfied fails at 200 (measured: a probe process could not even make a CUDA context).
+// win_reserve takes a DFlash drafter's this way; a NextN block's head group takes its here, before the pools are sized.
+bool Glm5Model::spec_kda_reserve(std::string& err) {
+    const size_t bytes = spec_kda_bytes();
+    if (bytes == 0 || kda_bak_ != nullptr) return true;
+    cudaSetDevice(dev_);
+    if (cudaMalloc(&kda_bak_, bytes) != cudaSuccess) {
+        cudaGetLastError();
+        kda_bak_ = nullptr;
+        err = "glm spec: the recurrent-state backup did not allocate";
+        return false;
+    }
+    std::fprintf(stderr, "glm spec: CUDA%d the head's recurrent-state backup (%.0f MB) before the expert pool\n", dev_,
+                 (double) bytes / 1048576.0);
+    return true;
+}
+
 // the head's KDA states (S + conv history of every recurrent layer here: one contiguous run each) <-> kda_bak_
 bool Glm5Model::spec_kda_copy(bool restore) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     kda_bak_cur_ = false;
-    const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
-    int n_rec = 0;
-    for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il);
-    if (n_rec == 0) return true;
-    if (kda_bak_ == nullptr && cudaMalloc(&kda_bak_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
+    const size_t bytes = spec_kda_bytes();
+    if (bytes == 0) return true;
+    if (kda_bak_ == nullptr && cudaMalloc(&kda_bak_, bytes) != cudaSuccess) {
         cudaGetLastError();
         kda_bak_ = nullptr;
         return false;
     }
+    const size_t run = spec_kda_run(g) / sizeof(float);
     int k = 0;
     for (int il = l0_; il < l1_; ++il)
         if (g.is_recr(il)) {
