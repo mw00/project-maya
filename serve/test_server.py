@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import sys
 import threading
 import time
@@ -1433,30 +1434,123 @@ class TimingsDrafts(unittest.TestCase):
 
 
 class StallWatchdog(unittest.TestCase):
-    """A silent engine is ended only when it also used no CPU, disk or GPU in the window (from Strata #1317)."""
+    """Silence plus idle GPUs ends the engine even when its threads still spin (Strata #1317, the futex hang).
+    Without GPU telemetry the old rule remains: no CPU and no disk across the window."""
 
     def check(self, first, second, gpu=False):
         e = StrataEngine.__new__(StrataEngine)            # no process: its activity samples are given
         samples = iter([first, second])
         e._activity = lambda: next(samples)
-        e.gpu_busy = lambda: gpu
+        e.gpu_busy = None if gpu is None else (lambda: bool(gpu))
         state = {}
         self.assertIsNone(e._stall_check(time.monotonic(), state))           # the baseline, soon after a line
         return e._stall_check(time.monotonic() - 1000.0, state), state       # long silent since then
 
     def test_stuck(self):
         why, _ = self.check((10.0, 1000), (10.2, 1000 + 4096))
-        self.assertIn("stuck", why)
+        self.assertIn("GPUs stayed idle", why)
 
-    def test_working(self):
-        for second in ((30.0, 0), (10.0, 50 << 20)):                        # CPU time, disk bytes
-            why, state = self.check((10.0, 0), second)
-            self.assertIsNone(why, second)
-            self.assertEqual(state["base"], second)                          # the next window starts here
+    def test_idle_gpu_ends_a_spinning_engine(self):
+        why, _ = self.check((10.0, 0), (400.0, 0), gpu=False)                 # CPU time climbed; the cards did not
+        self.assertIn("GPUs stayed idle", why)
+
+    def test_busy_gpu_is_not_ended(self):
         self.assertIsNone(self.check((10.0, 0), (10.0, 0), gpu=True)[0])
 
+    def test_working_without_gpu_telemetry(self):
+        for second in ((30.0, 0), (10.0, 50 << 20)):                        # CPU time, disk bytes
+            why, state = self.check((10.0, 0), second, gpu=None)
+            self.assertIsNone(why, second)
+            self.assertEqual(state["base"], second)                          # the next window starts here
+
+    def test_frozen_without_gpu_telemetry(self):
+        why, _ = self.check((10.0, 1000), (10.2, 1000 + 4096), gpu=None)
+        self.assertIn("no CPU or disk", why)
+
     def test_without_psutil_nothing_is_ended(self):
-        self.assertIsNone(self.check(None, None)[0])
+        self.assertIsNone(self.check(None, None, gpu=None)[0])
+
+    def _bare(self):
+        e = StrataEngine.__new__(StrataEngine)
+        e.ended = False
+        e._stall_why = None
+        e._stall_lock = threading.Lock()
+        e._stall_state = {}
+        e._inflight = 1
+        e._heard = time.monotonic() - 1000
+        e.gpu_busy = lambda: False
+        e._activity = lambda: (400.0, 0)                                     # spinning, the hang we ship
+        e._end = lambda why: setattr(e, "_stall_why", why) or setattr(e, "ended", True)
+        return e
+
+    def test_the_side_thread_ends_a_request_nobody_is_polling(self):
+        e = self._bare()
+        e._stall_watch_once()                                                 # first look is already past the window
+        self.assertIn("GPUs stayed idle", e._stall_why)
+
+    def test_the_side_thread_ignores_an_idle_engine_between_requests(self):
+        e = self._bare()
+        e._inflight = 0
+        e._stall_watch_once()
+        self.assertIsNone(e._stall_why)
+
+    def test_the_side_thread_leaves_a_busy_decode(self):
+        e = self._bare()
+        e._heard = time.monotonic()                                           # a line just arrived
+        e.gpu_busy = lambda: True
+        e._stall_watch_once()
+        self.assertIsNone(e._stall_why)
+
+    def test_drain_ends_a_wedged_engine_after_the_reader_left(self):
+        """The hang: STOP's drain used to block on DONE forever, so the poll that would kill never ran again."""
+        import serve.server as S
+        saved = S.ENGINE_STALL_S
+        S.ENGINE_STALL_S = 0.4
+        try:
+            e = StrataEngine.__new__(StrataEngine)
+            e.multi = 0
+            e.lines = queue.Queue()
+            e.can_stop = True
+            e.progress = None
+            e.prefill_tok_s_mean = None
+            e.ended = False
+            e._stall_why = None
+            e._stall_lock = threading.Lock()
+            e._stall_state = {}
+            e._heard = time.monotonic()
+            e._inflight = 0
+            e.gpu_busy = lambda: False
+            e._activity = lambda: (400.0, 0)
+            killed = []
+
+            class In:
+                def write(self, _s):
+                    pass
+
+                def flush(self):
+                    pass
+
+            class P:
+                stdin = In()
+
+                def kill(self):
+                    killed.append(1)
+
+                def wait(self, timeout=None):
+                    return -9
+
+            e.proc = P()
+            e.lines.put("T 7\n")
+            gen = e.generate([1, 2], 8, {}, threading.Event())
+            self.assertEqual(next(gen), 7)
+            e._heard = time.monotonic() - 10                                  # the engine then went silent
+            e._stall_state.clear()
+            gen.close()                                                       # client gone: STOP + drain, no DONE ever
+            self.assertTrue(killed)
+            self.assertIn("GPUs stayed idle", e._stall_why)
+            self.assertEqual(e._inflight, 0)
+        finally:
+            S.ENGINE_STALL_S = saved
 
     def test_the_config_env_reaches_the_server(self):
         import serve.server as S

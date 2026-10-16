@@ -318,10 +318,14 @@ def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
 
 
 # A FROZEN engine (Strata #1317).  Silence alone proves nothing: on a slow PC the engine reads a long prompt chunk for
-# minutes without a line.  But one that prints nothing for ENGINE_STALL_S and in that time uses no CPU, reads or writes
-# no disk and leaves its GPUs idle is not slow, it is stuck (a deadlock, a driver stall), and waiting cannot help: it is
-# ended, the request gets an error, and the next request starts it again.  One that is silent but working is never
-# ended.  STRATA_ENGINE_STALL_S sets it (0 = off); it needs psutil (setup installs it), without it nothing is ended.
+# minutes without a line.  A healthy prompt or decode moves the GPUs, so silence with idle GPUs for ENGINE_STALL_S is
+# treated as stuck even when CPU threads still spin (futex busy-wait while decode is dead).  Without GPU telemetry the
+# older check still applies: no CPU and no disk in that window.  The engine is ended, the request gets an error, and
+# the next request starts it again.  One that is silent but working on the GPUs is never ended.  The check cannot live
+# only in the request thread: that thread blocks in the socket write when a client stops reading, and after STOP it
+# blocks forever on DONE that a wedged engine will never send, so the poll never runs again.  A side thread watches
+# the engine's own stdout and the GPUs for as long as a request is in flight, including that drain.  STRATA_ENGINE_STALL_S
+# sets it (0 = off); the CPU/disk fallback needs psutil (setup installs it).
 def _stall_seconds() -> float:
     try:
         return max(0.0, float(os.environ.get("STRATA_ENGINE_STALL_S", "90")))
@@ -466,7 +470,15 @@ class StrataEngine:
             self._context_cost(log_start)
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
+        self._heard = time.monotonic()          # last stdout line; the stall thread's clock, not the request thread's
+        self._inflight = 0                      # generate() calls in progress, drain included
+        self._stall_state: dict = {}
+        self._stall_lock = threading.Lock()
+        self._stall_why = None                  # set once when the stall thread (or the reader) ends the engine
+        self._stall_stop = threading.Event()
         threading.Thread(target=self._pump, daemon=True).start()
+        threading.Thread(target=self._stall_watch, args=(self._stall_stop, self.proc), daemon=True,
+                         name="strata-stall").start()
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the
@@ -498,6 +510,9 @@ class StrataEngine:
     def stop(self, timeout: float = 60.0):
         """Ask the engine to end (QUIT: it frees its GPU memory itself), and end it if it does not in time - then wait
         until the GPUs have that memory back."""
+        stop = getattr(self, "_stall_stop", None)
+        if stop is not None:
+            stop.set()
         try:
             self.proc.stdin.write("QUIT\n")
             self.proc.stdin.flush()
@@ -511,8 +526,39 @@ class StrataEngine:
         self.ended = True
         wait_gpu_release(self.proc.pid)
 
+    def _stall_ensure(self):
+        """Tests build an engine with __new__ and call generate(); a real start sets these in __init__."""
+        if getattr(self, "_stall_lock", None) is None:
+            self._stall_lock = threading.Lock()
+            self._heard = time.monotonic()
+            self._inflight = 0
+            self._stall_state = {}
+            self._stall_why = None
+
+    def _mark_heard(self):
+        """The engine printed a line.  Resets the stall window (a line is progress, whatever queue it lands on)."""
+        self._stall_ensure()
+        with self._stall_lock:
+            self._heard = time.monotonic()
+            self._stall_state.clear()
+
+    def _stall_arm(self):
+        """A request is in flight, including the STOP drain after the client has gone."""
+        self._stall_ensure()
+        with self._stall_lock:
+            self._inflight += 1
+            self._heard = time.monotonic()
+            self._stall_state.clear()
+
+    def _stall_disarm(self):
+        self._stall_ensure()
+        with self._stall_lock:
+            self._inflight = max(0, self._inflight - 1)
+            self._stall_state.clear()
+
     def _pump(self):
         for line in self.proc.stdout:
+            self._mark_heard()
             if self.multi and self._route(line):
                 continue
             self.lines.put(line)
@@ -547,6 +593,8 @@ class StrataEngine:
 
     def death_note(self) -> str:
         """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        if getattr(self, "_stall_why", None):
+            return ""
         tail = ""
         try:
             with open(self.log_path, "rb") as f:
@@ -577,35 +625,101 @@ class StrataEngine:
             return None
 
     def _stall_check(self, heard: float, state: dict) -> str | None:
-        """Called while the engine is silent (since `heard`, monotonic): a baseline soon after its last line, and at
-        ENGINE_STALL_S of silence the comparison - no CPU, disk or GPU work in all that time: why it is ended."""
+        """Called while the engine is silent (since `heard`, monotonic). A healthy prompt/decode moves the GPUs.
+        Silence with idle GPUs for ENGINE_STALL_S means a hang: CPU alone is not enough (service threads can spin
+        on futexes while decode is dead). Without GPU telemetry, fall back to the old CPU/disk freeze check.
+        The first look inside the window only records a CPU/disk baseline; a look that is already past the window
+        decides immediately when the GPUs are idle."""
         t = time.monotonic()
         age = t - heard
-        if "base" not in state:
-            state["base"], state["t"], state["next"] = self._activity(), t, ENGINE_STALL_S
-            return None
-        if state["base"] is None or age < state["next"]:
+        if age < ENGINE_STALL_S:
+            if "base" not in state:
+                state["base"], state["t"], state["next"] = self._activity(), t, ENGINE_STALL_S
             return None
         now = self._activity()
         try:
-            gpu = bool(self.gpu_busy()) if self.gpu_busy is not None else False
+            have_gpu = self.gpu_busy is not None
+            gpu = bool(self.gpu_busy()) if have_gpu else False
         except Exception:  # noqa: BLE001 - a telemetry hiccup must not decide anything
-            gpu = False
-        if now is not None and not gpu and engine_frozen(state["base"], now, t - state["t"]):
-            return (f"the engine said nothing for {age:.0f} s and used no CPU, disk or GPU in that time, so it was stuck "
+            have_gpu, gpu = False, False
+        if have_gpu:
+            if gpu:
+                state["base"], state["t"] = now, t
+                return None
+            return (f"the engine said nothing for {age:.0f} s and its GPUs stayed idle, so it was stuck "
                     "and has been ended (STRATA_ENGINE_STALL_S sets this, 0 = off)")
-        state["base"], state["t"], state["next"] = now, t, age + ENGINE_STALL_S   # working: look again a window later
+        if "base" not in state or state["base"] is None:
+            state["base"], state["t"], state["next"] = now, t, age + ENGINE_STALL_S
+            return None
+        if age < state.get("next", ENGINE_STALL_S):
+            return None
+        if now is not None and engine_frozen(state["base"], now, t - state["t"]):
+            return (f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time, so it was stuck "
+                    "and has been ended (STRATA_ENGINE_STALL_S sets this, 0 = off)")
+        state["base"], state["t"], state["next"] = now, t, age + ENGINE_STALL_S
         return None
 
+    def _stall_watch_once(self) -> None:
+        """One look from the side thread.  No request in flight: an idle engine is normal, not a hang."""
+        self._stall_ensure()
+        if ENGINE_STALL_S <= 0 or self._inflight <= 0 or self.ended or self._stall_why:
+            return
+        why = self._stall_check(self._heard, self._stall_state)
+        if why:
+            self._end(why)
+
+    def _stall_watch(self, stop: threading.Event, proc) -> None:
+        while proc.poll() is None and not stop.is_set():
+            try:
+                self._stall_watch_once()
+            except Exception:  # noqa: BLE001 - a sample must not kill the watcher
+                pass
+            if stop.wait(2.0):
+                return
+
     def _end(self, why: str):
-        """End a stuck engine now; the next request starts it again (Service.run)."""
+        """End a stuck engine now; the next request starts it again (Service.run).  Once only: the reader and the
+        stall thread can both notice."""
+        lock = getattr(self, "_stall_lock", None)
+        if lock is None:
+            lock = self._stall_lock = threading.Lock()
+        with lock:
+            if getattr(self, "_stall_why", None):
+                return
+            self._stall_why = why
+            self.ended = True
         print(f"[maya] {why}", flush=True)
-        self.ended = True
         try:
             self.proc.kill()
             self.proc.wait(timeout=20)
         except (OSError, subprocess.TimeoutExpired):
             pass
+
+    def _drain_stopped(self, q: queue.Queue, multi: bool = False) -> None:
+        """After STOP, read until DONE.  A wedged engine never sends it, and this is where a client that already
+        left used to wait forever (the token loop's stall check no longer runs).  Same rule as that loop."""
+        self._stall_ensure()
+        stall: dict = {}
+        err, done = ("ERR ", "DONE ") if multi else ("ERR", "DONE")
+        pause = min(10.0, max(0.2, ENGINE_STALL_S / 4)) if ENGINE_STALL_S > 0 else 10.0
+        while True:
+            if self._stall_why:
+                return
+            try:
+                line = q.get(timeout=pause)
+            except queue.Empty:
+                if ENGINE_STALL_S > 0:
+                    why = self._stall_check(self._heard, stall)
+                    if why:
+                        self._end(why)
+                if self._stall_why:
+                    return
+                continue
+            if line is None or line.startswith(err):
+                return
+            if line.startswith(done):
+                self._parse_done("DONE " + line.split(None, 2)[2] if multi else line)
+                return
 
     def exit_code(self):
         try:
@@ -615,6 +729,9 @@ class StrataEngine:
 
     def restart(self):
         """Start the engine again (the same command) after it died; the new process has its own line queue."""
+        stop = getattr(self, "_stall_stop", None)
+        if stop is not None:
+            stop.set()                              # the old watcher must not outlive this process
         try:
             self.proc.kill()
             self.proc.wait(timeout=20)
@@ -749,71 +866,69 @@ class StrataEngine:
         except OSError:                                  # the pipe is gone: the engine died (not the client)
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
-        heard, stall = time.monotonic(), {}               # the last line's time; the stall watchdog's samples
+        stall = {}                                        # the request thread's samples; the side thread has its own
+        self._stall_arm()
         try:
-            while True:
-                try:
-                    line = self.lines.get(timeout=10)
-                except queue.Empty:
-                    if cancel.is_set():
-                        return
-                    if ENGINE_STALL_S > 0:
-                        why = self._stall_check(heard, stall)
-                        if why:
-                            done = True                   # no STOP and no drain: nothing is listening
-                            self._end(why)
-                            raise EngineDied(why)
-                    yield None
-                    continue
-                if line is None:
-                    done = True
-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                heard = time.monotonic()
-                stall.clear()
-                if line.startswith("T "):
-                    if cancel.is_set():
-                        return
-                    yield int(line[2:])
-                elif line.startswith("PP "):
-                    f = line.split()
-                    if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
-                        # (read, total, reuse, ms): prompt progress, one per chunk: also a heartbeat (the
-                        # lines reset the 10 s wait, so without this a long prompt would send no keep-alives at all).
-                        # `reuse` (engines that print the field): what the conversation cache already held,
-                        # `ms` the prompt read's own clock - both go to the stream's prompt_progress
-                        self.progress = (int(f[1]), int(f[2]),
-                                         int(f[5]) if len(f) >= 6 and f[5].isdigit() else 0,
-                                         float(f[3]) if len(f) >= 4 else 0.0)
-                        self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
-                    if cancel.is_set():                   # lines reset the 10 s wait, so without this a long prompt
-                        return                            # would send no keep-alives at all)
-                    yield None
-                elif line.startswith("STAT "):
-                    self._parse_stat(line)
-                elif line.startswith("NOTE "):                # what happens to the kept conversations
-                    print("[maya] " + line[5:].strip(), flush=True)
-                elif line.startswith("DONE"):
-                    self._parse_done(line)
-                    done = True
-                    return
-                elif line.startswith("ERR"):
-                    done = True
-                    raise ValueError(line[4:].strip())
-        finally:
-            if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
-                    try:
-                        self.proc.stdin.write("STOP\n")
-                        self.proc.stdin.flush()
-                    except OSError:
-                        pass
+            try:
                 while True:
-                    line = self.lines.get()
-                    if line is None or line.startswith("ERR"):
-                        break
-                    if line.startswith("DONE"):
+                    try:
+                        line = self.lines.get(timeout=10)
+                    except queue.Empty:
+                        if cancel.is_set():
+                            return
+                        if ENGINE_STALL_S > 0:
+                            why = self._stall_check(self._heard, stall)
+                            if why:
+                                done = True               # no STOP and no drain: nothing is listening
+                                self._end(why)
+                                raise EngineDied(self._stall_why or why)
+                        yield None
+                        continue
+                    if line is None:
+                        done = True
+                        raise EngineDied(self._stall_why or
+                                         f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    stall.clear()
+                    if line.startswith("T "):
+                        if cancel.is_set():
+                            return
+                        yield int(line[2:])
+                    elif line.startswith("PP "):
+                        f = line.split()
+                        if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
+                            # (read, total, reuse, ms): prompt progress, one per chunk: also a heartbeat (the
+                            # lines reset the 10 s wait, so without this a long prompt would send no keep-alives at all).
+                            # `reuse` (engines that print the field): what the conversation cache already held,
+                            # `ms` the prompt read's own clock - both go to the stream's prompt_progress
+                            self.progress = (int(f[1]), int(f[2]),
+                                             int(f[5]) if len(f) >= 6 and f[5].isdigit() else 0,
+                                             float(f[3]) if len(f) >= 4 else 0.0)
+                            self.prefill_tok_s_mean = float(f[4]) if len(f) >= 5 else None
+                        if cancel.is_set():               # lines reset the 10 s wait, so without this a long prompt
+                            return                        # would send no keep-alives at all)
+                        yield None
+                    elif line.startswith("STAT "):
+                        self._parse_stat(line)
+                    elif line.startswith("NOTE "):            # what happens to the kept conversations
+                        print("[maya] " + line[5:].strip(), flush=True)
+                    elif line.startswith("DONE"):
                         self._parse_done(line)
-                        break
+                        done = True
+                        return
+                    elif line.startswith("ERR"):
+                        done = True
+                        raise ValueError(line[4:].strip())
+            finally:
+                if not done:                              # the consumer stopped early: stop the engine, drain to DONE
+                    if self.can_stop:
+                        try:
+                            self.proc.stdin.write("STOP\n")
+                            self.proc.stdin.flush()
+                        except OSError:
+                            pass
+                    self._drain_stopped(self.lines)
+        finally:
+            self._stall_disarm()
 
     def command(self, line: str, expect: str, timeout: float = 60.0) -> str:
         """One control line between requests (the GLM engine's VLEND / VRECLAIM) -> its answer line; ValueError on
@@ -857,70 +972,68 @@ class StrataEngine:
         keys = self.sampling_keys(sampling or {}) + f" rid={rid}"
         head = f"GENI {int(max_new)}{keys} {embeddings}" if embeddings else f"GEN {int(max_new)}{keys}"
         done = False
+        self._stall_arm()
         try:
             try:
-                self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
-                self.proc.stdin.flush()
-            except OSError:
-                raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
-            heard, stall = time.monotonic(), {}
-            while True:
                 try:
-                    line = q.get(timeout=10)
-                except queue.Empty:
-                    if cancel.is_set():
-                        return
-                    if ENGINE_STALL_S > 0:
-                        why = self._stall_check(heard, stall)
-                        if why:
-                            done = True
-                            self._end(why)
-                            raise EngineDied(why)
-                    yield None
-                    continue
-                if line is None:
-                    done = True
-                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
-                heard = time.monotonic()
-                stall.clear()
-                f = line.split()
-                if line.startswith("T "):
-                    if cancel.is_set():
-                        return
-                    yield int(f[2])
-                elif line.startswith("PP "):
-                    if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
-                        self.progress = (int(f[2]), int(f[3]),
-                                         int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
-                                         float(f[4]) if len(f) >= 5 else 0.0)
-                        self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
-                    if cancel.is_set():
-                        return
-                    yield None
-                elif line.startswith("DONE "):
-                    self._parse_done("DONE " + line.split(None, 2)[2])
-                    done = True
-                    return
-                elif line.startswith("ERR "):
-                    done = True
-                    raise ValueError(line.split(None, 2)[2].strip() if len(f) > 2 else "engine error")
-        finally:
-            if not done:                                  # the consumer stopped early: stop this request, drain it
-                try:
-                    self.proc.stdin.write(f"STOP {rid}\n")
+                    self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
                     self.proc.stdin.flush()
                 except OSError:
-                    pass
+                    raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
+                stall = {}
                 while True:
-                    line = q.get()
-                    if line is None or line.startswith("ERR "):
-                        break
-                    if line.startswith("DONE "):
+                    try:
+                        line = q.get(timeout=10)
+                    except queue.Empty:
+                        if cancel.is_set():
+                            return
+                        if ENGINE_STALL_S > 0:
+                            why = self._stall_check(self._heard, stall)
+                            if why:
+                                done = True
+                                self._end(why)
+                                raise EngineDied(self._stall_why or why)
+                        yield None
+                        continue
+                    if line is None:
+                        done = True
+                        raise EngineDied(self._stall_why or
+                                         f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                    stall.clear()
+                    f = line.split()
+                    if line.startswith("T "):
+                        if cancel.is_set():
+                            return
+                        yield int(f[2])
+                    elif line.startswith("PP "):
+                        if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
+                            self.progress = (int(f[2]), int(f[3]),
+                                             int(f[6]) if len(f) >= 7 and f[6].isdigit() else 0,
+                                             float(f[4]) if len(f) >= 5 else 0.0)
+                            self.prefill_tok_s_mean = float(f[5]) if len(f) >= 6 else None
+                        if cancel.is_set():
+                            return
+                        yield None
+                    elif line.startswith("DONE "):
                         self._parse_done("DONE " + line.split(None, 2)[2])
-                        break
-            with self._routes_lock:
-                self._routes.pop(rid, None)
-            self._tls.rid = None
+                        done = True
+                        return
+                    elif line.startswith("ERR "):
+                        done = True
+                        raise ValueError(line.split(None, 2)[2].strip() if len(f) > 2 else "engine error")
+            finally:
+                if not done:                              # the consumer stopped early: stop this request, drain it
+                    try:
+                        self.proc.stdin.write(f"STOP {rid}\n")
+                        self.proc.stdin.flush()
+                    except OSError:
+                        pass
+                    self._drain_stopped(q, multi=True)
+                with self._routes_lock:
+                    self._routes.pop(rid, None)
+                self._tls.rid = None
+        finally:
+            self._stall_disarm()
 
     def pause(self, keep: bool = False):
         """End the request in flight at its next step and keep the conversation's state with what it wrote (the
@@ -3026,6 +3139,13 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
+            # each send, not the whole answer: a client that stops reading must not pin the engine behind a full
+            # TCP window.  A steady reader finishes every write at once (a 13-minute answer is unaffected).
+            if ENGINE_STALL_S > 0:
+                try:
+                    self.connection.settimeout(ENGINE_STALL_S)
+                except OSError:
+                    pass
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
