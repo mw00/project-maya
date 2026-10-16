@@ -852,6 +852,11 @@ public:
     size_t prefill_carve(int T, int64_t end = -1);
     bool prefill_lend(std::string& err);                    // the tail slots -> the prompt path (drops their experts)
     bool prefill_return(std::string& err);                  // ... and back to the expert pool
+    // A long prompt's extra room: the part that holds the drafter gives its decode-only memory back (unload) and the
+    // pool's tail is allocated that much bigger, the ring taking it - open before the first chunk (before prefill_lend),
+    // close after the last one (after prefill_return; it puts the tail and the drafter back).  Short prompts: no-op.
+    bool prefill_room_open(int64_t tokens, std::string& err);
+    bool prefill_room_close(std::string& err);
     void prefill_destroy();
     void prefill_cap(int T, const char* why);              // its pinned staging for chunks of at most T
     void prefill_settle(double pinned_share);              // --prefill auto's lend cap from the pinned share (85/90%)

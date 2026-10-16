@@ -98,6 +98,7 @@ constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the s
 // prestaging (PrefillState::pbuf): the buffer's slots on one GPU, the chunk from which it is carved, and the fewest
 // predicted rows an expert is prestaged for (below that it may not be routed at all)
 constexpr int kPreSlots = 160, kPreMinT = 1024, kPreMinRows = 4;
+constexpr int kPreSink = 1 << 20;   // a split's ring cap when STRATA_GLM_PRESTAGE is unset: only the lend bounds it
 // resident experts routed by at most kLightRows rows of a chunk take the light kernels (gf::rows_experts) instead of
 // MMQ (STRATA_GLM_PREFILL_LIGHT overrides, 0 = MMQ only); their {slot, r0, nr} ride the bounds array from kLightOff
 constexpr int kLightRows = 32, kLightOff = 6144, kLightMax = (8192 - kLightOff) / 3;
@@ -308,7 +309,7 @@ struct Glm5Model::PrefillState {
     int T = 0;                       // tokens per chunk
     // --prefill: the chunk and its prestage slots for a lend cap (% of the pool's slots), the cap it was sized with,
     // whether the measured pinned share may still lower it (prefill_settle), and how it reads in the log
-    std::function<std::pair<int64_t, int>(int64_t)> choose;
+    std::function<std::pair<int64_t, int>(int64_t, int64_t)> choose;
     int64_t lend_pct = 90;
     bool lend_pct_fixed = false;
     std::string mode;
@@ -335,6 +336,13 @@ struct Glm5Model::PrefillState {
     size_t need = 0;                 // ... and the bytes of the region that layout uses
     uint64_t dropped = 0;            // experts the lending evicted from VRAM (cumulative)
     uint64_t moved = 0;              // ... of which a lent slot's expert took a colder one's slot instead
+    // the room a long prompt takes that the decode cannot (prefill_room_open/close): the tail is cut `tail_grown_k`
+    // slots a layer bigger than fast_setup made it, the ring taking the difference, and the setup's own sizes are
+    // kept here to put back when it shrinks
+    int tail_grown_k = 0;
+    int np_saved = 0;
+    size_t pbuf_saved = 0, borrow_saved = 0;
+    size_t lendable_fixed = 0;       // the lend the chunk and the ring are chosen against when it is not the pool's own
     // per chunk, across layers
     float *R = nullptr, *x = nullptr, *mixer = nullptr, *ffn = nullptr;
     float *pre = nullptr, *post = nullptr, *comb = nullptr, *ss = nullptr, *mix = nullptr;
@@ -503,7 +511,7 @@ void Glm5Model::prefill_settle(double pinned_share) {
     PrefillState* S = pf_;
     if (S == nullptr || S->lend_pct_fixed || pinned_share >= 0.9) return;
     S->lend_pct = 85;
-    const auto pick = S->choose(S->lend_pct);
+    const auto pick = S->choose(S->lend_pct, 0);
     std::fprintf(stderr, "glm prefill: CUDA%d %.0f%% of the experts' bytes are held pinned: the pool lends at most 85%% "
                          "of its slots\n", dev_, 100.0 * pinned_share);
     if (pick.first == 0) {
@@ -645,8 +653,15 @@ bool Glm5Model::prefill_setup(std::string& err) {
     const char* pct_env = getenv("STRATA_PREFILL_LEND_PCT");
     const char* mb_env = getenv("STRATA_GLM_PREFILL_MB");
     const size_t gbuf = has_moe ? (size_t) PrefillState::NG * PrefillState::GE * gstride : 0;
-    // the prestage buffer (the ring): one GPU (a split's parts hold most of their experts); STRATA_GLM_PRESTAGE=<slots>
-    int ring_max = has_moe && n_parts_ == 1 ? kPreSlots : 0;
+    // the prestage buffer (the ring): one GPU, and a split that has not been asked for the room below, keeps Strata's
+    // kPreSlots.  STRATA_GLM_ROOM_MIN on a split (two parts or more) makes the ring the *sink* for what the chunk
+    // leaves beside its buffers - the part's pool holds most of its experts, so those bytes have no other use while a
+    // prompt runs (measured on Maya-L: CUDA2/3 sat at 160 - the old cap - of the ~400 their lend allows).
+    // STRATA_GLM_PRESTAGE=<slots> is the cap in both cases (0: none).
+    int ring_max = has_moe ? kPreSlots : 0;
+    const bool ring_sink = has_moe && n_parts_ > 1 && getenv("STRATA_GLM_PRESTAGE") == nullptr &&
+                           getenv("STRATA_GLM_ROOM_MIN") != nullptr;
+    if (ring_sink) ring_max = kPreSink;
     if (const char* v = getenv("STRATA_GLM_PRESTAGE")) ring_max = has_moe ? std::max(0, std::atoi(v)) : 0;
     // A COMPLETE pool to come (fast_setup: every expert and the spares in each layer's main slots, this path's buffers
     // in the tail beyond them - the Windows APU's carve-out): no expert is outside VRAM, so there is nothing to prestage
@@ -672,10 +687,14 @@ bool Glm5Model::prefill_setup(std::string& err) {
             ring_max = 0;
         }
     }
-    // the chunk and its prestage slots for a lend cap of `pct`% of the pool's slots ({0, 0}: no chunk fits)
-    S->choose = [=, this](int64_t pct) -> std::pair<int64_t, int> {
+    // the chunk and its prestage slots for a lend cap of `pct`% of the pool's slots ({0, 0}: no chunk fits).  `cmax`:
+    // a ceiling on the chunk (0: the setup's own; the tail's growth passes the chunk the prompt path already chose,
+    // whose pinned staging and mixers are sized from it), so a bigger lend only grows the ring
+    S->choose = [=, this](int64_t pct, int64_t cmax) -> std::pair<int64_t, int> {
         size_t lendable = 0;   // the bytes the pool can lend the prompt path
-        if (mb_env != nullptr) {
+        if (S->lendable_fixed > 0) {
+            lendable = S->lendable_fixed;
+        } else if (mb_env != nullptr) {
             lendable = (size_t) (std::atof(mb_env) * 1048576.0);
         } else if (stride_sum == 0) {
             lendable = avail;
@@ -684,6 +703,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (is_auto) k = std::min<int64_t>(k, pct * per / 100);
             lendable = (size_t) k * stride_sum;
         }
+        const int64_t lim = cmax > 0 ? std::min(ceiling, cmax) : ceiling;
         const auto nonring = [&](int64_t T) -> size_t {
             const auto pu = prefill_bytes_for((size_t) T);
             Carve c;
@@ -704,7 +724,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         };
         // Strata's biggest_chunk: every test rises with T, so the largest chunk that passes is a bisection on the grid
         const auto biggest = [&](int64_t floor) -> int64_t {
-            int64_t lo = 1, hi = ceiling / 256, best = 0;
+            int64_t lo = 1, hi = lim / 256, best = 0;
             while (lo <= hi) {
                 const int64_t mid = lo + (hi - lo) / 2;
                 if (room(mid * 256) >= floor) {
@@ -722,12 +742,12 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (T == 0 && ring_max > kRingMin) T = biggest(kRingMin);
             if (T == 0) T = biggest(0);
         } else {
-            for (int64_t c = ceiling; c >= 256; c /= 2)
+            for (int64_t c = lim; c >= 256; c /= 2)
                 if (room(c) >= 0) {
                     T = c;
                     break;
                 }
-            if (T == 0 && ceiling > 0 && ceiling < 256 && room(ceiling) >= 0) T = ceiling;
+            if (T == 0 && lim > 0 && lim < 256 && room(lim) >= 0) T = lim;
         }
         const int64_t r = T > 0 ? room(T) : 0;
         return {T, T >= kPreMinT && r >= kRingMin ? (int) r : 0};
@@ -735,7 +755,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
     S->lend_pct = pct_env != nullptr ? (int64_t) std::atoi(pct_env) : 90;
     S->lend_pct_fixed = pct_env != nullptr || mb_env != nullptr || !is_auto;
     S->mode = is_auto ? "auto, up to " + std::to_string(auto_max) : mode;
-    const auto pick = S->choose(S->lend_pct);
+    const auto pick = S->choose(S->lend_pct, 0);
     const int64_t T = pick.first;
     if (T == 0) {
         std::fprintf(stderr, "glm prefill: CUDA%d the expert pool (%lld slots a layer) can lend no prompt chunk "
@@ -743,6 +763,9 @@ bool Glm5Model::prefill_setup(std::string& err) {
         prefill_destroy();
         return true;
     }
+    if (ring_sink)
+        std::fprintf(stderr, "glm prefill: CUDA%d the prestage ring is the sink for what a chunk leaves "
+                             "(STRATA_GLM_PRESTAGE unset: the pool's lend is the only cap)\n", dev_);
     if (!is_auto && T != ceiling)
         std::fprintf(stderr, "glm prefill: CUDA%d prompt chunk %lld -> %lld tokens so its buffers fit in the expert "
                              "pool\n", dev_, (long long) ceiling, (long long) T);
@@ -1257,6 +1280,222 @@ bool Glm5Model::prefill_return(std::string& err) {
     }
     S->lent = false;
     return true;
+}
+
+// ---------------------------------------------------------------- a long prompt's extra room
+// The decode-only memory the prompt can take: the part that holds the drafter gives its weights and buffers back
+// (unload; the copies are pinned host, so putting them back is a DMA) and the pool's tail - every layer's last slots,
+// which the prompt path's buffers already lie over - is allocated that much bigger, the ring taking all of it.  The
+// chunk does not change (its pinned staging, its mixers and the split's pacing are sized from it): it is the ring,
+// the layer's predicted experts in VRAM before they are routed, that grows.  Called before the first chunk's carve
+// and lend; prefill_room_close puts everything back after prefill_return.
+bool Glm5Model::prefill_room_open(int64_t tokens, std::string& err) {
+    FastState* F = fast_;
+    PrefillState* S = pf_;
+    if (F == nullptr || S == nullptr) return true;
+    // A short prompt pays more for the round trip (~0.7 GB each way) than a bigger ring gives back, and unset is the
+    // switch: no prompt takes the room unless STRATA_GLM_ROOM_MIN asks for it (the layout, the ring's cap and the
+    // drafter all stay exactly as they were).  `0` = every prompt.
+    static const int64_t min_tokens = [] {
+        const char* v = getenv("STRATA_GLM_ROOM_MIN");
+        return v != nullptr ? std::max<int64_t>(0, std::atoll(v)) : (int64_t) -1;
+    }();
+    if (min_tokens < 0 || tokens < min_tokens || S->tail_grown_k > 0 || S->lendable_fixed != 0) return true;
+    size_t stride_sum = 0;
+    for (int il = l0_; il < lt_; ++il)
+        if (F->L[(size_t) il].moe) stride_sum += F->lp[(size_t) il].stride;
+    // the drafter's decode-only memory (this part holds it, or none does): the only bytes a prompt can free
+    size_t extra = 0;
+    if (dflash_ != nullptr) {
+        cudaSetDevice(dev_);
+        extra = dflash_->unload_bytes();
+    }
+    if (extra == 0) {
+        // No drafter here (or it holds nothing): the NextN block's own slots are the decode-only memory this part
+        // has, and fast_setup laid every one of them in the lendable tail (its n_main is 0).  They are already inside
+        // this region, so nothing is freed or reallocated: the budget becomes the region itself - the same budget the
+        // drafter's growth hands over - and the ring takes what the boot chooser left on the table.  A part with no
+        // ring configured has nowhere to put it and keeps the layout it booted with.
+        const bool draft = mtp_il_ >= l0_ && mtp_il_ < lt_ && F->L[(size_t) mtp_il_].moe;
+        if (!draft || F->lp[(size_t) mtp_il_].n_main != 0 || stride_sum == 0) return true;
+        S->np_saved = S->NP;
+        S->pbuf_saved = S->pbuf_bytes;
+        S->borrow_saved = S->borrow_bytes;
+        S->lendable_fixed = F->xpool_bytes;
+        const auto pick = S->choose(S->lend_pct, S->T);
+        if (pick.first == S->T && pick.second > S->NP) {
+            S->NP = pick.second;
+            S->pbuf_bytes = (size_t) pick.second * S->gstride;
+            Carve c;
+            c.take<uint8_t>(S->arena_bytes);
+            c.take<uint16_t>((size_t) S->w16_elems);
+            c.take<float>(S->w32_elems);
+            c.take<uint8_t>(S->ws_bytes);
+            c.take<uint8_t>(S->gbuf_bytes);
+            c.take<uint8_t>(S->pbuf_bytes);
+            S->borrow_bytes = c.off;
+            if (!prefill_bind(F->xpool, F->xpool_bytes, err)) return false;
+            std::fprintf(stderr, "glm prefill: CUDA%d the draft layer's %d experts are the prompt's to take: the "
+                                 "prestage ring %d -> %d experts, borrowing %.0f MB\n", dev_,
+                         F->lp[(size_t) mtp_il_].n, S->np_saved, S->NP, (double) S->borrow_bytes / 1048576.0);
+        } else {
+            S->lendable_fixed = 0;
+            std::fprintf(stderr, "glm prefill: CUDA%d the draft layer's room is the prompt's to take, but there is no "
+                                 "ring to fill (%d experts): the prompt runs as it was\n", dev_, S->NP);
+        }
+        return true;
+    }
+    if (stride_sum == 0) return true;                 // nothing to grow: the prompt runs as it always did
+    // rounded up, not down: close hands back exactly k2*stride_sum bytes and the drafter's reload must live on them -
+    // a floor leaves the size modulo the stride (676 MB is 4 strides and 122 MB over here) to be found in unrelated
+    // free VRAM, which the display card that holds the drafter does not have mid-prompt: "the buffers: out of
+    // memory" at the first decode.  The overshoot is under one stride and the margin pays it; a margin that cannot
+    // falls back below and the prompt runs with the ring it came with.
+    const int k2 = (int) ((extra + stride_sum - 1) / stride_sum);
+    if (k2 <= 0) return true;                         // (less than a slot a layer: not worth the round trip)
+    if (dflash_ != nullptr && !dflash_->unload(err)) return false;
+    // the tail's slots hold experts the decode may have put there (they are the pool's): every one of them leaves
+    // first, exactly as a prompt's own lending does - the region is about to be freed under them
+    uint64_t moved = 0, dropped = 0;
+    if (!lend_tail(F->xpool_bytes, moved, dropped, err)) return false;
+    const size_t old_bytes = F->xpool_bytes;
+    const size_t grown = old_bytes + (size_t) k2 * stride_sum;
+    cudaSetDevice(dev_);
+    cudaFree(F->xpool);
+    F->xpool = nullptr;
+    for (int il = l0_; il < lt_; ++il) F->lp[(size_t) il].xbase = nullptr;
+    uint8_t* p = nullptr;
+    if (cudaMalloc(&p, grown) != cudaSuccess) {
+        cudaGetLastError();
+        // the tail as it was: nothing else has taken those bytes, so this is the allocation that just came back
+        if (cudaMalloc(&p, old_bytes) != cudaSuccess) {
+            cudaGetLastError();
+            err = "glm prefill: CUDA" + std::to_string(dev_) + ": the pool's tail (and with it the expert pool) did "
+                  "not come back after the prompt's own lending";
+            return false;
+        }
+        F->xpool = p;
+        F->xpool_bytes = old_bytes;
+        for (int il = l0_; il < lt_; ++il) {
+            auto& P = F->lp[(size_t) il];
+            if (!F->L[(size_t) il].moe) continue;
+            P.xbase = p;
+            p += (size_t) (P.n - P.n_main) * P.stride;
+        }
+        if (pf_ != nullptr && !prefill_bind(F->xpool, F->xpool_bytes, err)) return false;
+        if (dflash_ != nullptr && !dflash_->reload(err)) return false;
+        std::fprintf(stderr, "glm prefill: CUDA%d no room for a bigger prestage ring (%.0f MB wanted of %.0f MB free) "
+                             "- the prompt runs with %d experts\n", dev_, (double) grown / 1048576.0,
+                     (double) old_bytes / 1048576.0, S->NP);
+        return true;
+    }
+    // the grown tail: k2 more slots a layer, the ring choosing against all of it
+    F->xpool = p;
+    F->xpool_bytes = grown;
+    int nmo = 0;
+    for (int il = l0_; il < lt_; ++il) {
+        auto& P = F->lp[(size_t) il];
+        if (!F->L[(size_t) il].moe) continue;
+        ++nmo;
+        P.n += k2;
+        P.key.resize((size_t) P.n, -1);
+        P.tick.resize((size_t) P.n, 0);
+        P.st.resize((size_t) P.n, FastState::kFree);
+        P.xbase = p;
+        p += (size_t) (P.n - P.n_main) * P.stride;
+    }
+    F->pool_slots += (int64_t) k2 * nmo;
+    S->np_saved = S->NP;
+    S->pbuf_saved = S->pbuf_bytes;
+    S->borrow_saved = S->borrow_bytes;
+    S->tail_grown_k = k2;
+    S->lendable_fixed = grown;
+    const auto pick = S->choose(S->lend_pct, S->T);   // the chunk is the prompt path's own: the bytes go to the ring
+    // the whole region is the budget now, so the layout fits by construction: the chunk cannot have grown out of it
+    // (the growth is on top of what already held it) - a pick that says otherwise keeps the ring the prompt came with
+    if (pick.first == S->T && pick.second >= S->np_saved) {
+        S->NP = pick.second;
+        S->pbuf_bytes = (size_t) pick.second * S->gstride;
+    } else {
+        std::fprintf(stderr, "glm prefill: CUDA%d the bigger tail does not fit the chunk beside a bigger prestage "
+                             "ring: the prompt keeps %d experts\n", dev_, S->NP);
+    }
+    {
+        Carve c;
+        c.take<uint8_t>(S->arena_bytes);
+        c.take<uint16_t>((size_t) S->w16_elems);
+        c.take<float>((size_t) S->w32_elems);
+        c.take<uint8_t>(S->ws_bytes);
+        c.take<uint8_t>(S->gbuf_bytes);
+        c.take<uint8_t>(S->pbuf_bytes);
+        S->borrow_bytes = c.off;
+    }
+    if (!prefill_bind(F->xpool, F->xpool_bytes, err)) return false;
+    std::fprintf(stderr, "glm prefill: CUDA%d the pool's tail is %.0f MB bigger for this prompt (%d experts more a "
+                         "layer): the prestage ring %d -> %d experts, borrowing %.0f MB\n", dev_,
+                 (double) ((size_t) k2 * stride_sum) / 1048576.0, k2, S->np_saved, S->NP,
+                 (double) S->borrow_bytes / 1048576.0);
+    return true;
+}
+
+// ... and back after the last chunk (prefill_return has run): the tail shrinks to what fast_setup sized, the ring with
+// it, and the drafter's weights and buffers are allocated again.  The order matters on the part that has both: the
+// shrink is what frees the bytes the drafter's cudaMalloc needs.
+bool Glm5Model::prefill_room_close(std::string& err) {
+    FastState* F = fast_;
+    PrefillState* S = pf_;
+    if (F == nullptr || S == nullptr) return true;
+    bool ok = true;
+    if (S->tail_grown_k > 0) {
+        size_t stride_sum = 0;
+        for (int il = l0_; il < lt_; ++il)
+            if (F->L[(size_t) il].moe) stride_sum += F->lp[(size_t) il].stride;
+        const size_t old_bytes = F->xpool_bytes - (size_t) S->tail_grown_k * stride_sum;
+        int nmo = 0;
+        for (int il = l0_; il < lt_; ++il)
+            if (F->L[(size_t) il].moe) ++nmo;
+        cudaSetDevice(dev_);
+        cudaFree(F->xpool);
+        F->xpool = nullptr;
+        uint8_t* p = nullptr;
+        for (int il = l0_; il < lt_; ++il) F->lp[(size_t) il].xbase = nullptr;
+        if (cudaMalloc(&p, old_bytes) != cudaSuccess) {
+            cudaGetLastError();
+            err = "glm prefill: CUDA" + std::to_string(dev_) + ": the pool's tail (%.0f MB) did not allocate again " +
+                  "after the prompt";
+            ok = false;
+        } else {
+            F->xpool = p;
+            F->xpool_bytes = old_bytes;
+            for (int il = l0_; il < lt_; ++il) {
+                auto& P = F->lp[(size_t) il];
+                if (!F->L[(size_t) il].moe) continue;
+                P.n -= S->tail_grown_k;
+                P.key.resize((size_t) P.n);
+                P.tick.resize((size_t) P.n);
+                P.st.resize((size_t) P.n);
+                P.xbase = p;
+                p += (size_t) (P.n - P.n_main) * P.stride;
+            }
+            F->pool_slots -= (int64_t) S->tail_grown_k * (int64_t) nmo;
+            S->NP = S->np_saved;
+            S->pbuf_bytes = S->pbuf_saved;
+            S->borrow_bytes = S->borrow_saved;
+            S->lendable_fixed = 0;
+            S->tail_grown_k = 0;
+            if (!prefill_bind(F->xpool, F->xpool_bytes, err)) ok = false;
+        }
+    } else if (S->lendable_fixed != 0) {
+        // the NextN block's room (room_open's drafter-less branch): the tail itself never moved - its slots were in
+        // this region all along - so this is the ring and the borrow going back to what fast_setup sized, nothing else
+        S->NP = S->np_saved;
+        S->pbuf_bytes = S->pbuf_saved;
+        S->borrow_bytes = S->borrow_saved;
+        S->lendable_fixed = 0;
+        if (!prefill_bind(F->xpool, F->xpool_bytes, err)) ok = false;
+    }
+    if (dflash_ != nullptr && !dflash_->reload(err)) ok = false;
+    return ok;
 }
 
 void Glm5Model::prefill_destroy() {
@@ -3162,6 +3401,11 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         cudaSetDevice(m->dev_);
+        // a long prompt: this part's decode-only room, taken before the carve lays the buffers over the tail
+        if (!m->prefill_room_open(nn, err)) {
+            ok = false;
+            break;
+        }
         m->prefill_carve(Trun, pos_ + nn);
         if (!m->prefill_lend(err)) { ok = false; break; }
     }
@@ -3186,6 +3430,15 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         std::string return_err;
         if (!m->prefill_return(return_err)) {
             if (ok) err = return_err;
+            ok = false;
+        }
+    }
+    // ... and the room it took for itself: the tail back to the pool's size and, on the part that holds it, the
+    // drafter's weights and buffers again (before the decode, which reads them)
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        std::string close_err;
+        if (!m->prefill_room_close(close_err)) {
+            if (ok) err = close_err;
             ok = false;
         }
     }
