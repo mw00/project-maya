@@ -172,6 +172,37 @@ close other programs that use the GPU. A drafter's verify windows allocate on fi
 with DFlash2 at 32K had 431 MiB free at start and 77 MiB after the first request - fine on Linux, where a full card
 fails an allocation instead of paging, but on Windows a reason to raise the reserve.
 
+## Repeatable answers
+
+A greedy request (`temperature` 0) returns the same tokens after a restart only if every expert is computed by the same
+path each time. With the CPU lane on it is not: a RAM-tier expert goes to the lane or over PCIe to the GPU depending on
+where it sits, and the two paths round differently - the GPU's kernels quantise the activations in blocks of 32 values,
+ggml-cpu's dot (the lane) in blocks of 256, and an expert's output differs by about 2% (relative L2, median of 150 lane
+calls over 42 layers of Maya-S, against a double-precision reference the lane is 1.7% off and the GPU 1.1%). The router's
+top-8 amplifies that: once the lane computes one expert that the GPU did before, within a few tokens a quarter or more of the layers
+pick a different set of 8 experts, and the greedy tokens part within some tens of tokens. What changes which
+experts the lane computes from one start to the next:
+
+| What | Why it differs | What fixes it |
+| --- | --- | --- |
+| the VRAM pool | `--expert-cache auto` takes the free VRAM less the reserve, so a few hundred MiB used by another program is some hundred experts fewer (the start's `tiers warm: N experts` and `only ... MiB free once the expert pool ... GB less` lines; 9,453-9,488 experts in five starts of one PC) | `--expert-cache N` in the config's `"args"` (they win over `STRATA_GLM_EXPERT_CACHE`), N a little under what `auto` gave |
+| the lane's split | timed at start: where an expert costs about the same on the CPU and over PCIe (0.137 and 0.141 ms), starts land on neighbouring splits (`... 3 3 3` and `... 3 3 4`) | `STRATA_GLM_PCIE_SHARE` or `STRATA_GLM_CPU_PLAN` |
+| the split timed again | `STRATA_GLM_CPU_RETIME` plans it again from decode's own timing | `STRATA_GLM_CPU_RETIME=0` |
+| background moves between the tiers | they go live when their copies finish | `STRATA_GLM_PROMOTE=0` |
+| the RAM tier | sized from the free RAM unless `STRATA_GLM_RAM_GB` is set | set it |
+
+With those fixed (RTX 5090, Maya-S-v2-IQ2_XXS, a 42 GB RAM tier, `--expert-cache 3250`, `STRATA_GLM_PROMOTE=0`,
+`STRATA_GLM_CPU_RETIME=0`, `STRATA_GLM_CPU_PLAN=001122333`; six prompts of 256 tokens, greedy, five engine starts) all
+70 pairs of token streams were identical, also with 300 MiB less VRAM free at the start (105 of 105 pairs against the
+first five starts) - decode 18.31 tok/s against 18.26 with the defaults (medians of five). With the same 300 MiB taken and
+`--expert-cache auto`, none of 105 pairs matched. With the defaults, 17 of 70 pairs of starts matched.
+
+`STRATA_GLM_CPU_LANE=0` takes the question away: every expert is computed by the GPU's kernels wherever it sits, so the
+tokens are the same after every restart and with any RAM tier (identical for 26 and 42 GB here), at 4% (26 GB) to 10%
+(42 GB) lower decode speed. Neither way makes two different settings agree: a different pool, RAM tier or split gives
+different, equally valid tokens, and so does another build or driver. Measured on one PC; DFlash2, MTP, several GPUs, Linux
+and AMD were not tried.
+
 ## Several requests at once
 
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
