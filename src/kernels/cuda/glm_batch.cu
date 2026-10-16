@@ -1906,6 +1906,73 @@ void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, fl
     check("dsa_pool");
 }
 
+#if !defined(STRATA_USE_HIP)
+// The tiled kernel's scores on the FP16 tensor cores (the default on CUDA; STRATA_GLM_DSA_SCORE=2 as well): the same tile - 4 tokens' 128 (token,
+// head) query rows against 64 pools, the whole 128-long k in shared memory as FP16 - eight warps of 16 rows x 64 pools
+// (four m16n16k16 accumulators), FP32 sums; the epilogue as the tiled one's (relu(dot) * w over the 32 heads, FP32).
+constexpr int TC_LDA = 128 + 8, TC_LDC = 64 + 4;
+constexpr size_t dsa_tc_smem() {
+    return std::max((size_t) (128 + 64) * TC_LDA * 2, (size_t) 128 * TC_LDC * 4);
+}
+__global__ void __launch_bounds__(256) dsa_score_tc_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                           const float* __restrict__ iw, int p0, int kpool, int T,
+                                                           int max_vis, float* __restrict__ score, int score_ld) {
+    using namespace nvcuda;
+    constexpr int H = 32, K = 128;
+    extern __shared__ __align__(32) unsigned char sm_raw[];
+    __half* As = (__half*) sm_raw;            // [128 rows][TC_LDA]
+    __half* Bs = As + 128 * TC_LDA;          // [64 pools][TC_LDA]
+    float* Cs = (float*) sm_raw;             // [128 rows][TC_LDC] (after the products)
+    const int t0 = blockIdx.y * TS_T, pbeg = blockIdx.x * TS_P;
+    const int t_last = min(T, t0 + TS_T) - 1;
+    if (pbeg >= (p0 + t_last + 1) / kpool) return;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    for (int i = tid; i < 128 * (K / 4); i += 256) {
+        const int r = i / (K / 4), k = (i % (K / 4)) * 4, t = t0 + (r >> 5);
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (t < T) v = *(const float4*) (iq + ((size_t) t * H + (r & 31)) * K + k);
+        __half2* d = (__half2*) (As + r * TC_LDA + k);
+        d[0] = __floats2half2_rn(v.x, v.y);
+        d[1] = __floats2half2_rn(v.z, v.w);
+    }
+    for (int i = tid; i < 64 * (K / 4); i += 256) {
+        const int pp = i / (K / 4), k = (i % (K / 4)) * 4, p = pbeg + pp;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (p < max_vis) v = *(const float4*) (pooled + (size_t) p * K + k);
+        __half2* d = (__half2*) (Bs + pp * TC_LDA + k);
+        d[0] = __floats2half2_rn(v.x, v.y);
+        d[1] = __floats2half2_rn(v.z, v.w);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) wmma::fill_fragment(acc[n], 0.0f);
+#pragma unroll
+    for (int k = 0; k < K; k += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+        wmma::load_matrix_sync(a, As + warp * 16 * TC_LDA + k, TC_LDA);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+            wmma::load_matrix_sync(b, Bs + n * 16 * TC_LDA + k, TC_LDA);
+            wmma::mma_sync(acc[n], a, b, acc[n]);
+        }
+    }
+    __syncthreads();   // (the operands are dead: the same storage holds the dots)
+#pragma unroll
+    for (int n = 0; n < 4; ++n) wmma::store_matrix_sync(Cs + warp * 16 * TC_LDC + n * 16, acc[n], TC_LDC, wmma::mem_row_major);
+    __syncthreads();
+    {   // 256 threads = 4 tokens x 64 pools: relu(dot) * w summed over the token's 32 heads
+        const int ot = tid >> 6, op = tid & 63, tok = t0 + ot, p = pbeg + op;
+        if (tok < T && p < (p0 + tok + 1) / kpool) {
+            float sum = 0.0f;
+            for (int h = 0; h < H; ++h) sum += fmaxf(Cs[(ot * 32 + h) * TC_LDC + op], 0.0f) * iw[(size_t) tok * H + h];
+            score[(size_t) tok * score_ld + p] = sum;
+        }
+    }
+}
+#endif
+
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int p0, int kpool,
                int T, int max_vis, float* score, int score_ld, cudaStream_t s) {
     if (T <= 0 || max_vis <= 0) return;
@@ -1914,6 +1981,21 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
         const char* v = getenv("STRATA_GLM_DSA_SCORE");
         return v == nullptr || std::atoi(v) != 0;
     }();
+#if !defined(STRATA_USE_HIP)
+    // (the default on CUDA; STRATA_GLM_DSA_SCORE=1: the FP32 tiled kernel, 0: the warp kernel) - 27K prompt dsa_index
+    // 826 / 826 -> 495 / 495 ms, prompt 36.9 / 37.0 -> 36.6 / 36.6 s, the needle answered
+    static const bool tc = getenv("STRATA_GLM_DSA_SCORE") == nullptr || std::atoi(getenv("STRATA_GLM_DSA_SCORE")) == 2;
+    if (tc && idx_heads == 32 && key_dim == 128) {
+        static const bool attr = cudaFuncSetAttribute(dsa_score_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                      (int) dsa_tc_smem()) == cudaSuccess;
+        if (attr) {
+            dsa_score_tc_kernel<<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + TS_T - 1) / TS_T)), 256,
+                                  dsa_tc_smem(), s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
+            check("dsa_score_tc");
+            return;
+        }
+    }
+#endif
     if (tiled && idx_heads == 32 && key_dim == 128) {
         dsa_score_tiled_kernel<<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + TS_T - 1) / TS_T)), 256,
                                  0, s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
