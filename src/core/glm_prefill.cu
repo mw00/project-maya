@@ -786,6 +786,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         // On an APU these pinned pages compete with the expert pool. A small
         // landing ring suffices for disk reads while the prompt borrows its tail.
         if (F->unified_memory || complete) want = kMinLand;
+        else if (F->ram_resident) want = std::min(want, 2 * kMinLand);
         if (const char* v = getenv("STRATA_GLM_PREFILL_LAND")) want = std::max(kMinLand, std::atoi(v));
         int n = want;
         while (cudaHostAlloc((void**) &S->gpin, (size_t) n * gstride, cudaHostAllocDefault) != cudaSuccess) {
@@ -1655,11 +1656,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->pre_issued += (uint64_t) n;
     };
 
-    // whether layer il's plan may give experts to the CPU (STRATA_GLM_PREFILL_CPU=0: never)
-    static const bool pf_cpu = [] {
+    // whether layer il's plan may give experts to the CPU (STRATA_GLM_PREFILL_CPU=0: never; without AVX-512 multi-row
+    // packing or when RAM-resident mode already pinned host memory, off by default unless STRATA_GLM_PREFILL_CPU=1)
+    static const int pf_cpu_env = [] {
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
-        return v == nullptr || std::atoi(v) != 0;
+        return v == nullptr ? -1 : std::atoi(v);
     }();
+    const bool pf_cpu = pf_cpu_env >= 0 ? (pf_cpu_env != 0)
+                                        : (strata::kernels::cpu::kq_avx512_ok() && !F->ram_resident);
     const auto cpu_lane = [&](int il) {
         return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
@@ -2132,7 +2136,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             static const char* row_env = getenv("STRATA_GLM_PREFILL_CPU_ROW_MS");
             // the planning cost of a row: the env's, else learned from the layers before (their host time less an
             // expert's weights each, over their rows; one 3090 beside 2x Xeon 6152: ~0.056 ms)
-            const double row_ms = row_env != nullptr ? std::atof(row_env) : S->row_ms;
+            const double default_row_ms = strata::kernels::cpu::kq_avx512_ok() ? 0.05 : std::max(0.05, 0.5 * F->cpu_c_ms);
+            const double row_ms = row_env != nullptr ? std::atof(row_env) : (S->row_ms > 0.0 ? S->row_ms : default_row_ms);
             if (cpu_lane(il)) {
                 std::vector<size_t> ram_i;
                 int n_pcie = 0;

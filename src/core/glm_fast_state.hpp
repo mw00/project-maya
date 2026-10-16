@@ -128,9 +128,15 @@ public:
     // (empty: any)
     explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false)
         : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent) {
+        static const bool one_to_one = getenv("STRATA_GLM_CPU_PIN_1TO1") != nullptr &&
+                                       std::atoi(getenv("STRATA_GLM_CPU_PIN_1TO1")) != 0;
         for (int i = 0; i < n; ++i) {
             th_.emplace_back([this, i] { concurrent_ ? loop_c(i) : loop(i); });
-            pin_thread(th_.back().native_handle(), cpus);
+            if (one_to_one && cpus.size() >= (size_t) n) {
+                pin_thread(th_.back().native_handle(), {cpus[(size_t) i]});
+            } else {
+                pin_thread(th_.back().native_handle(), cpus);
+            }
         }
     }
     ~Workers() {
@@ -181,15 +187,17 @@ private:
         return p;
     }
     void work(uint64_t g) {
+        int my_done = 0;
         for (;;) {
             uint64_t t = ticket_.load(std::memory_order_acquire);
-            if ((t >> 32) != g) return;
+            if ((t >> 32) != g) break;
             const int n = total_.load(std::memory_order_acquire);
-            if ((int) (t & 0xffffffffu) >= n) return;
+            if ((int) (t & 0xffffffffu) >= n) break;
             if (!ticket_.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
             (*fn_)((int) (t & 0xffffffffu));
-            done_.fetch_add(1, std::memory_order_acq_rel);
+            ++my_done;
         }
+        if (my_done > 0) done_.fetch_add(my_done, std::memory_order_acq_rel);
     }
     void loop(int id) {
         uint64_t seen = gen_.load();
@@ -311,10 +319,12 @@ private:
     std::vector<std::thread> th_;
     std::mutex mu_, run_mu_;
     std::condition_variable cv_;
-    const std::function<void(int)>* volatile fn_ = nullptr;
-    std::atomic<int> total_{0}, done_{0}, sleeping_{0}, active_;
-    std::atomic<uint64_t> ticket_{0}, gen_{0};
+    alignas(64) const std::function<void(int)>* volatile fn_ = nullptr;
+    std::atomic<int> total_{0}, sleeping_{0}, active_;
     std::atomic<bool> quit_{false};
+    alignas(64) std::atomic<uint64_t> gen_{0};
+    alignas(64) std::atomic<uint64_t> ticket_{0};
+    alignas(64) std::atomic<int> done_{0};
     const bool concurrent_;
     Slot slots_[kSlots];
     std::atomic<uint64_t> epoch_{0};

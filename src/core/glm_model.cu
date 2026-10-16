@@ -3285,54 +3285,67 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     if (kv_cells > 0 && !kv_stream_setup(kv_cells, err)) return false;
     if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
 
-    const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
-    int64_t s = 0;
-    auto take = [&](int64_t n) {
-        const int64_t at2 = s;
-        s += n;
-        return at2;
-    };
-    sc_mixed = take(g_.n_embd);
-    sc_emb = take(g_.n_embd);
-    sc_x = take(g_.n_embd);
-    sc_pre = take(g_.hc);
-    sc_post = take(g_.hc);
-    sc_comb = take((int64_t) g_.hc * g_.hc);
-    sc_inv = take(1);
-    sc_proj = take(g_.d_inner());
-    sc_conv[0] = take(g_.d_inner());
-    sc_conv[1] = take(g_.d_inner());
-    sc_conv[2] = take(g_.d_inner());
-    sc_g = take(g_.d_inner());
-    sc_g1 = take(g_.d_inner());
-    sc_beta = take(g_.n_head);
-    sc_tmp = take(std::max<long long>({g_.kda_head_dim, g_.q_lora, g_.idx_key, (int64_t) g_.n_expert}));
-    sc_scan = take(g_.d_inner());
-    sc_g2 = take(g_.d_inner());
-    sc_gated = take(g_.d_inner());
-    sc_qr = take(g_.q_lora);
-    sc_kv = take(g_.kv_lora);
-    sc_q = take((int64_t) g_.n_head * g_.qk_nope);
-    sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
-    sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
-    sc_iw = take(g_.idx_heads);
-    sc_score = take(max_pools);
-    sc_cells = take(g_.n_sel_max());
-    sc_attn = take((int64_t) g_.v_head * g_.n_head);
-    sc_gate = take(ff_max);
-    sc_up = take(ff_max);
-    sc_h = take(ff_max);
-    sc_dn = take(g_.n_embd);
-    sc_moe = take(g_.n_embd);
-    sc_sh = take(g_.n_embd);
-    sc_ffn = take(g_.n_embd);
-    sc_mixer = take(g_.n_embd);
-    sc_head = take(g_.n_embd);
-    sc_logits = take(g_.n_vocab);
-    sc_ids = take(g_.n_exp_used);
-    sc_rw = take(g_.n_exp_used);
-    sc_bytes_ = (uint64_t) s * sizeof(float);
-    { cudaError_t e_ = cudaMalloc(&sc_, sc_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    if (fast_mode_) {
+        if (l1_ == g_.n_layers) {
+            sc_logits = 0;
+            sc_bytes_ = (uint64_t) g_.n_vocab * sizeof(float);
+            cudaError_t e_ = cudaMalloc(&sc_, sc_bytes_);
+            if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; }
+        } else {
+            sc_logits = 0;
+            sc_bytes_ = 0;
+            sc_ = nullptr;
+        }
+    } else {
+        const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
+        int64_t s = 0;
+        auto take = [&](int64_t n) {
+            const int64_t at2 = s;
+            s += n;
+            return at2;
+        };
+        sc_mixed = take(g_.n_embd);
+        sc_emb = take(g_.n_embd);
+        sc_x = take(g_.n_embd);
+        sc_pre = take(g_.hc);
+        sc_post = take(g_.hc);
+        sc_comb = take((int64_t) g_.hc * g_.hc);
+        sc_inv = take(1);
+        sc_proj = take(g_.d_inner());
+        sc_conv[0] = take(g_.d_inner());
+        sc_conv[1] = take(g_.d_inner());
+        sc_conv[2] = take(g_.d_inner());
+        sc_g = take(g_.d_inner());
+        sc_g1 = take(g_.d_inner());
+        sc_beta = take(g_.n_head);
+        sc_tmp = take(std::max<long long>({g_.kda_head_dim, g_.q_lora, g_.idx_key, (int64_t) g_.n_expert}));
+        sc_scan = take(g_.d_inner());
+        sc_g2 = take(g_.d_inner());
+        sc_gated = take(g_.d_inner());
+        sc_qr = take(g_.q_lora);
+        sc_kv = take(g_.kv_lora);
+        sc_q = take((int64_t) g_.n_head * g_.qk_nope);
+        sc_qabs = take((int64_t) g_.kv_lora * g_.n_head);
+        sc_iq = take((int64_t) g_.idx_heads * g_.idx_key);
+        sc_iw = take(g_.idx_heads);
+        sc_score = take(max_pools);
+        sc_cells = take(g_.n_sel_max());
+        sc_attn = take((int64_t) g_.v_head * g_.n_head);
+        sc_gate = take(ff_max);
+        sc_up = take(ff_max);
+        sc_h = take(ff_max);
+        sc_dn = take(g_.n_embd);
+        sc_moe = take(g_.n_embd);
+        sc_sh = take(g_.n_embd);
+        sc_ffn = take(g_.n_embd);
+        sc_mixer = take(g_.n_embd);
+        sc_head = take(g_.n_embd);
+        sc_logits = take(g_.n_vocab);
+        sc_ids = take(g_.n_exp_used);
+        sc_rw = take(g_.n_exp_used);
+        sc_bytes_ = (uint64_t) s * sizeof(float);
+        { cudaError_t e_ = cudaMalloc(&sc_, sc_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+    }
     { cudaError_t e_ = cudaMalloc(&d_pos_, sizeof(int)); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
 
     // STRATA_GLM_TIMING=1: the phase events (step() records them; ~10 us/token)

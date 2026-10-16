@@ -23,6 +23,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -553,26 +554,369 @@ inline float dot1_iq3_s(const uint8_t* row, int nb, const block_q8_K* y) {
     return hsum_ggml(accumf);
 }
 
+// IQ2_XXS's 7-bit sign indices -> 0xFF where the value's sign bit is set (sgn7_vec's steps as a neg mask)
+struct Neg7 {
+    __m256i shifts, spread, bits, parity, m127, m15;
+    Neg7()
+        : shifts(_mm256_setr_epi32(0, 0, 7, 7, 14, 14, 21, 21)),
+          spread(_mm256_setr_epi8(0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12,
+                                  0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12)),
+          bits(_mm256_set1_epi64x((long long) 0x8040201008040201ull)),
+          parity(_mm256_broadcastsi128_si256(
+              _mm_setr_epi8(0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0))),
+          m127(_mm256_set1_epi32(127)), m15(_mm256_set1_epi8(15)) {}
+    inline __m256i operator()(uint32_t w) const {
+        __m256i s = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int) w), shifts), m127);
+        s = _mm256_or_si256(s, _mm256_shuffle_epi8(parity, _mm256_and_si256(_mm256_xor_si256(s, _mm256_srli_epi32(s, 4)), m15)));
+        s = _mm256_shuffle_epi8(s, spread);
+        return _mm256_cmpeq_epi8(_mm256_and_si256(s, bits), bits);
+    }
+};
+
+// one 64-value step of IQ2_XXS (ggml's ib32 pair): q = the block's qs + 16*j, the two halves into s1/s2
+inline void iq2xxs_step(const Neg7& neg, const uint8_t* q, __m256i q8_1, __m256i q8_2, __m256i& s1, __m256i& s2) {
+    const uint32_t w0 = u32(q), w1 = u32(q + 4), w2 = u32(q + 8), w3 = u32(q + 12);
+    const __m256i g1 = _mm256_set_epi64x((long long) iq2xxs_grid[w0 >> 24], (long long) iq2xxs_grid[(w0 >> 16) & 255],
+                                         (long long) iq2xxs_grid[(w0 >> 8) & 255], (long long) iq2xxs_grid[w0 & 255]);
+    const __m256i g2 = _mm256_set_epi64x((long long) iq2xxs_grid[w2 >> 24], (long long) iq2xxs_grid[(w2 >> 16) & 255],
+                                         (long long) iq2xxs_grid[(w2 >> 8) & 255], (long long) iq2xxs_grid[w2 & 255]);
+    const __m256i n0 = neg(w1), n1 = neg(w3);
+    const __m256i d1 = _mm256_maddubs_epi16(g1, _mm256_sub_epi8(_mm256_xor_si256(q8_1, n0), n0));
+    const __m256i d2 = _mm256_maddubs_epi16(g2, _mm256_sub_epi8(_mm256_xor_si256(q8_2, n1), n1));
+    s1 = _mm256_add_epi32(s1, _mm256_madd_epi16(d1, _mm256_set1_epi16((short) (2 * (w1 >> 28) + 1))));
+    s2 = _mm256_add_epi32(s2, _mm256_madd_epi16(d2, _mm256_set1_epi16((short) (2 * (w3 >> 28) + 1))));
+}
+
+// ggml_vec_dot_iq2_xxs_q8_K's AVX2 lanes and float steps, the signs in registers (no keven_signs loads)
+inline float dot1_iq2_xxs(const uint8_t* row, int nb, const block_q8_K* y) {
+    const Neg7 neg;
+    const block_iq2_xxs* x = (const block_iq2_xxs*) row;
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        _mm_prefetch((const char*)(x + i + 4), _MM_HINT_T0);
+        const float d = h2f(x[i].d) * y[i].d;
+        const uint8_t* q = (const uint8_t*) x[i].qs;
+        const int8_t* q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int j = 0; j < 4; ++j) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j));
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j + 32));
+            iq2xxs_step(neg, q + 16 * j, q8_1, q8_2, sumi1, sumi2);
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return 0.125f * hsum_ggml(accumf);
+}
+
+// gate and up rows of IQ2_XXS against one activation: each the same steps as dot1_iq2_xxs (bit-identical), the
+// activation's vectors loaded once for both
+inline void dot1_gu_iq2_xxs(const uint8_t* gr, const uint8_t* ur, int nb, const block_q8_K* y, float& og, float& ou) {
+    const Neg7 neg;
+    const block_iq2_xxs* xg = (const block_iq2_xxs*) gr;
+    const block_iq2_xxs* xu = (const block_iq2_xxs*) ur;
+    __m256 ag = _mm256_setzero_ps(), au = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        _mm_prefetch((const char*)(xg + i + 4), _MM_HINT_T0);
+        _mm_prefetch((const char*)(xu + i + 4), _MM_HINT_T0);
+        const float dg = h2f(xg[i].d) * y[i].d;
+        const float du = h2f(xu[i].d) * y[i].d;
+        const uint8_t* qg = (const uint8_t*) xg[i].qs;
+        const uint8_t* qu = (const uint8_t*) xu[i].qs;
+        const int8_t* q8 = y[i].qs;
+        __m256i g1 = _mm256_setzero_si256(), g2 = _mm256_setzero_si256();
+        __m256i u1 = _mm256_setzero_si256(), u2 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int j = 0; j < 4; ++j) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j));
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j + 32));
+            iq2xxs_step(neg, qg + 16 * j, q8_1, q8_2, g1, g2);
+            iq2xxs_step(neg, qu + 16 * j, q8_1, q8_2, u1, u2);
+        }
+        ag = _mm256_fmadd_ps(_mm256_set1_ps(dg), _mm256_cvtepi32_ps(_mm256_add_epi32(g1, g2)), ag);
+        au = _mm256_fmadd_ps(_mm256_set1_ps(du), _mm256_cvtepi32_ps(_mm256_add_epi32(u1, u2)), au);
+    }
+    og = 0.125f * hsum_ggml(ag);
+    ou = 0.125f * hsum_ggml(au);
+}
+
+// ggml_vec_dot_iq2_s_q8_K's AVX2 lanes and float steps; the 16-value scales as two broadcast halves (the same
+// int16 lanes as ggml's scale shuffle), the inner loop unrolled
+inline float dot1_iq2_s(const uint8_t* row, int nb, const block_q8_K* y) {
+    const __m256i mask1 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                           2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i mask2 = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
+    const block_iq2_s* x = (const block_iq2_s*) row;
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        _mm_prefetch((const char*)(x + i + 4), _MM_HINT_T0);
+        const float d = h2f(x[i].d) * y[i].d;
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint8_t* signs = x[i].qs + QK_K / 8;
+        const uint8_t* sc = x[i].scales;
+        const int8_t* q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int j = 0; j < 4; ++j) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j));
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j + 32));
+            const uint8_t* q = qs + 8 * j;
+            const uint32_t h0 = qh[2 * j], h1 = qh[2 * j + 1];
+            const __m256i q2_1 = _mm256_set_epi64x((long long) iq2s_grid[q[3] | ((h0 << 2) & 0x300)],
+                                                   (long long) iq2s_grid[q[2] | ((h0 << 4) & 0x300)],
+                                                   (long long) iq2s_grid[q[1] | ((h0 << 6) & 0x300)],
+                                                   (long long) iq2s_grid[q[0] | ((h0 << 8) & 0x300)]);
+            const __m256i q2_2 = _mm256_set_epi64x((long long) iq2s_grid[q[7] | ((h1 << 2) & 0x300)],
+                                                   (long long) iq2s_grid[q[6] | ((h1 << 4) & 0x300)],
+                                                   (long long) iq2s_grid[q[5] | ((h1 << 6) & 0x300)],
+                                                   (long long) iq2s_grid[q[4] | ((h1 << 8) & 0x300)]);
+            __m256i aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs + 8 * j)), mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+            aux = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs + 8 * j + 4)), mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+            const int sb0 = sc[2 * j], sb1 = sc[2 * j + 1];
+            const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc16(2 * (sb0 & 15) + 1, 2 * (sb0 >> 4) + 1));
+            const __m256i p2 = _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc16(2 * (sb1 & 15) + 1, 2 * (sb1 >> 4) + 1));
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    return 0.125f * hsum_ggml(accumf);
+}
+
+// 2 rows of IQ2_S against one activation: activation loaded once, signs and grids computed per row
+inline void dot2_iq2_s(const uint8_t* row0, const uint8_t* row1, int nb, const block_q8_K* y, float& out0, float& out1) {
+    const __m256i mask1 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+                                           2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
+    const __m256i mask2 = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
+    const block_iq2_s* x0 = (const block_iq2_s*) row0;
+    const block_iq2_s* x1 = (const block_iq2_s*) row1;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        _mm_prefetch((const char*)(x0 + i + 4), _MM_HINT_T0);
+        _mm_prefetch((const char*)(x1 + i + 4), _MM_HINT_T0);
+        const float yd = y[i].d;
+        const float d0 = h2f(x0[i].d) * yd;
+        const float d1 = h2f(x1[i].d) * yd;
+        const uint8_t* qs0 = x0[i].qs;
+        const uint8_t* qs1 = x1[i].qs;
+        const uint8_t* qh0 = x0[i].qh;
+        const uint8_t* qh1 = x1[i].qh;
+        const uint8_t* signs0 = x0[i].qs + QK_K / 8;
+        const uint8_t* signs1 = x1[i].qs + QK_K / 8;
+        const uint8_t* sc0 = x0[i].scales;
+        const uint8_t* sc1 = x1[i].scales;
+        const int8_t* q8 = y[i].qs;
+        __m256i s1_0 = _mm256_setzero_si256(), s2_0 = _mm256_setzero_si256();
+        __m256i s1_1 = _mm256_setzero_si256(), s2_1 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int j = 0; j < 4; ++j) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j));
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) (q8 + 64 * j + 32));
+
+            // Row 0
+            const uint8_t* q0 = qs0 + 8 * j;
+            const uint32_t h0_0 = qh0[2 * j], h1_0 = qh0[2 * j + 1];
+            const __m256i q2_1_0 = _mm256_set_epi64x((long long) iq2s_grid[q0[3] | ((h0_0 << 2) & 0x300)],
+                                                     (long long) iq2s_grid[q0[2] | ((h0_0 << 4) & 0x300)],
+                                                     (long long) iq2s_grid[q0[1] | ((h0_0 << 6) & 0x300)],
+                                                     (long long) iq2s_grid[q0[0] | ((h0_0 << 8) & 0x300)]);
+            const __m256i q2_2_0 = _mm256_set_epi64x((long long) iq2s_grid[q0[7] | ((h1_0 << 2) & 0x300)],
+                                                     (long long) iq2s_grid[q0[6] | ((h1_0 << 4) & 0x300)],
+                                                     (long long) iq2s_grid[q0[5] | ((h1_0 << 6) & 0x300)],
+                                                     (long long) iq2s_grid[q0[4] | ((h1_0 << 8) & 0x300)]);
+            __m256i aux0 = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs0 + 8 * j)), mask1), mask2);
+            const __m256i m2_1_0 = _mm256_cmpeq_epi8(aux0, mask2);
+            const __m256i q8s_1_0 = _mm256_sub_epi8(_mm256_xor_si256(m2_1_0, q8_1), m2_1_0);
+            aux0 = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs0 + 8 * j + 4)), mask1), mask2);
+            const __m256i m2_2_0 = _mm256_cmpeq_epi8(aux0, mask2);
+            const __m256i q8s_2_0 = _mm256_sub_epi8(_mm256_xor_si256(m2_2_0, q8_2), m2_2_0);
+            const int sb0_0 = sc0[2 * j], sb1_0 = sc0[2 * j + 1];
+            s1_0 = _mm256_add_epi32(s1_0, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1_0, q8s_1_0), sc16(2 * (sb0_0 & 15) + 1, 2 * (sb0_0 >> 4) + 1)));
+            s2_0 = _mm256_add_epi32(s2_0, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2_0, q8s_2_0), sc16(2 * (sb1_0 & 15) + 1, 2 * (sb1_0 >> 4) + 1)));
+
+            // Row 1
+            const uint8_t* q1 = qs1 + 8 * j;
+            const uint32_t h0_1 = qh1[2 * j], h1_1 = qh1[2 * j + 1];
+            const __m256i q2_1_1 = _mm256_set_epi64x((long long) iq2s_grid[q1[3] | ((h0_1 << 2) & 0x300)],
+                                                     (long long) iq2s_grid[q1[2] | ((h0_1 << 4) & 0x300)],
+                                                     (long long) iq2s_grid[q1[1] | ((h0_1 << 6) & 0x300)],
+                                                     (long long) iq2s_grid[q1[0] | ((h0_1 << 8) & 0x300)]);
+            const __m256i q2_2_1 = _mm256_set_epi64x((long long) iq2s_grid[q1[7] | ((h1_1 << 2) & 0x300)],
+                                                     (long long) iq2s_grid[q1[6] | ((h1_1 << 4) & 0x300)],
+                                                     (long long) iq2s_grid[q1[5] | ((h1_1 << 6) & 0x300)],
+                                                     (long long) iq2s_grid[q1[4] | ((h1_1 << 8) & 0x300)]);
+            __m256i aux1 = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs1 + 8 * j)), mask1), mask2);
+            const __m256i m2_1_1 = _mm256_cmpeq_epi8(aux1, mask2);
+            const __m256i q8s_1_1 = _mm256_sub_epi8(_mm256_xor_si256(m2_1_1, q8_1), m2_1_1);
+            aux1 = _mm256_and_si256(_mm256_shuffle_epi8(_mm256_set1_epi32((int) u32(signs1 + 8 * j + 4)), mask1), mask2);
+            const __m256i m2_2_1 = _mm256_cmpeq_epi8(aux1, mask2);
+            const __m256i q8s_2_1 = _mm256_sub_epi8(_mm256_xor_si256(m2_2_1, q8_2), m2_2_1);
+            const int sb0_1 = sc1[2 * j], sb1_1 = sc1[2 * j + 1];
+            s1_1 = _mm256_add_epi32(s1_1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1_1, q8s_1_1), sc16(2 * (sb0_1 & 15) + 1, 2 * (sb0_1 >> 4) + 1)));
+            s2_1 = _mm256_add_epi32(s2_1, _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2_1, q8s_2_1), sc16(2 * (sb1_1 & 15) + 1, 2 * (sb1_1 >> 4) + 1)));
+        }
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(_mm256_add_epi32(s1_0, s2_0)), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(_mm256_add_epi32(s1_1, s2_1)), acc1);
+    }
+    out0 = 0.125f * hsum_ggml(acc0);
+    out1 = 0.125f * hsum_ggml(acc1);
+}
+
+// 2 rows of IQ3_XXS against one activation: activation loaded once, signs and grids computed per row
+inline void dot2_iq3_xxs(const uint8_t* row0, const uint8_t* row1, int nb, const block_q8_K* y, float& out0, float& out1) {
+    const Neg7 neg;
+    const block_iq3_xxs* x0 = (const block_iq3_xxs*) row0;
+    const block_iq3_xxs* x1 = (const block_iq3_xxs*) row1;
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        _mm_prefetch((const char*)(x0 + i + 4), _MM_HINT_T0);
+        _mm_prefetch((const char*)(x1 + i + 4), _MM_HINT_T0);
+        const float yd = y[i].d;
+        const float d0 = h2f(x0[i].d) * yd;
+        const float d1 = h2f(x1[i].d) * yd;
+        const uint8_t* q3_0 = x0[i].qs;
+        const uint8_t* q3_1 = x1[i].qs;
+        const uint8_t* gas0 = x0[i].qs + QK_K / 4;
+        const uint8_t* gas1 = x1[i].qs + QK_K / 4;
+        const int8_t* q8 = y[i].qs;
+        __m256i s1_0 = _mm256_setzero_si256(), s2_0 = _mm256_setzero_si256();
+        __m256i s1_1 = _mm256_setzero_si256(), s2_1 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+
+            // Row 0
+            const __m256i q2_1_0 = _mm256_set_epi32((int) iq3xxs_grid[q3_0[7]], (int) iq3xxs_grid[q3_0[6]], (int) iq3xxs_grid[q3_0[5]],
+                                                   (int) iq3xxs_grid[q3_0[4]], (int) iq3xxs_grid[q3_0[3]], (int) iq3xxs_grid[q3_0[2]],
+                                                   (int) iq3xxs_grid[q3_0[1]], (int) iq3xxs_grid[q3_0[0]]);
+            q3_0 += 8;
+            const __m256i q2_2_0 = _mm256_set_epi32((int) iq3xxs_grid[q3_0[7]], (int) iq3xxs_grid[q3_0[6]], (int) iq3xxs_grid[q3_0[5]],
+                                                   (int) iq3xxs_grid[q3_0[4]], (int) iq3xxs_grid[q3_0[3]], (int) iq3xxs_grid[q3_0[2]],
+                                                   (int) iq3xxs_grid[q3_0[1]], (int) iq3xxs_grid[q3_0[0]]);
+            q3_0 += 8;
+            const uint32_t a0_0 = u32(gas0), a1_0 = u32(gas0 + 4);
+            gas0 += 8;
+            const __m256i n0_0 = neg(a0_0), n1_0 = neg(a1_0);
+            const __m256i dot1_0 = _mm256_maddubs_epi16(q2_1_0, _mm256_sub_epi8(_mm256_xor_si256(q8_1, n0_0), n0_0));
+            const __m256i dot2_0 = _mm256_maddubs_epi16(q2_2_0, _mm256_sub_epi8(_mm256_xor_si256(q8_2, n1_0), n1_0));
+            s1_0 = _mm256_add_epi32(s1_0, _mm256_madd_epi16(dot1_0, _mm256_set1_epi16((short) (2 * (a0_0 >> 28) + 1))));
+            s2_0 = _mm256_add_epi32(s2_0, _mm256_madd_epi16(dot2_0, _mm256_set1_epi16((short) (2 * (a1_0 >> 28) + 1))));
+
+            // Row 1
+            const __m256i q2_1_1 = _mm256_set_epi32((int) iq3xxs_grid[q3_1[7]], (int) iq3xxs_grid[q3_1[6]], (int) iq3xxs_grid[q3_1[5]],
+                                                   (int) iq3xxs_grid[q3_1[4]], (int) iq3xxs_grid[q3_1[3]], (int) iq3xxs_grid[q3_1[2]],
+                                                   (int) iq3xxs_grid[q3_1[1]], (int) iq3xxs_grid[q3_1[0]]);
+            q3_1 += 8;
+            const __m256i q2_2_1 = _mm256_set_epi32((int) iq3xxs_grid[q3_1[7]], (int) iq3xxs_grid[q3_1[6]], (int) iq3xxs_grid[q3_1[5]],
+                                                   (int) iq3xxs_grid[q3_1[4]], (int) iq3xxs_grid[q3_1[3]], (int) iq3xxs_grid[q3_1[2]],
+                                                   (int) iq3xxs_grid[q3_1[1]], (int) iq3xxs_grid[q3_1[0]]);
+            q3_1 += 8;
+            const uint32_t a0_1 = u32(gas1), a1_1 = u32(gas1 + 4);
+            gas1 += 8;
+            const __m256i n0_1 = neg(a0_1), n1_1 = neg(a1_1);
+            const __m256i dot1_1 = _mm256_maddubs_epi16(q2_1_1, _mm256_sub_epi8(_mm256_xor_si256(q8_1, n0_1), n0_1));
+            const __m256i dot2_1 = _mm256_maddubs_epi16(q2_2_1, _mm256_sub_epi8(_mm256_xor_si256(q8_2, n1_1), n1_1));
+            s1_1 = _mm256_add_epi32(s1_1, _mm256_madd_epi16(dot1_1, _mm256_set1_epi16((short) (2 * (a0_1 >> 28) + 1))));
+            s2_1 = _mm256_add_epi32(s2_1, _mm256_madd_epi16(dot2_1, _mm256_set1_epi16((short) (2 * (a1_1 >> 28) + 1))));
+        }
+        acc0 = _mm256_fmadd_ps(_mm256_set1_ps(d0), _mm256_cvtepi32_ps(_mm256_add_epi32(s1_0, s2_0)), acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_set1_ps(d1), _mm256_cvtepi32_ps(_mm256_add_epi32(s1_1, s2_1)), acc1);
+    }
+    out0 = 0.25f * hsum_ggml(acc0);
+    out1 = 0.25f * hsum_ggml(acc1);
+}
+
+template <int TY>
+inline float dot1(const uint8_t* row, int nb, const block_q8_K* y) {
+    if constexpr (TY == 16) return dot1_iq2_xxs(row, nb, y);
+    else if constexpr (TY == 18) return dot1_iq3_xxs(row, nb, y);
+    else if constexpr (TY == 21) return dot1_iq3_s(row, nb, y);
+    else return dot1_iq2_s(row, nb, y);
+}
+
 template <int TY>
 void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     const int nb = n / QK_K;
+    if constexpr (TY == 18) {
+        if (nt == 1) {
+            const block_q8_K* y = (const block_q8_K*) act[0];
+            float* o = out[0];
+            int r = r0;
+            for (; r + 2 <= r1; r += 2) {
+                dot2_iq3_xxs(w + (size_t) r * row_bytes, w + (size_t) (r + 1) * row_bytes, nb, y, o[r], o[r + 1]);
+            }
+            for (; r < r1; ++r) {
+                o[r] = dot1_iq3_xxs(w + (size_t) r * row_bytes, nb, y);
+            }
+            return;
+        }
+    } else if constexpr (TY == 22) {
+        if (nt == 1) {
+            const block_q8_K* y = (const block_q8_K*) act[0];
+            float* o = out[0];
+            int r = r0;
+            for (; r + 2 <= r1; r += 2) {
+                dot2_iq2_s(w + (size_t) r * row_bytes, w + (size_t) (r + 1) * row_bytes, nb, y, o[r], o[r + 1]);
+            }
+            for (; r < r1; ++r) {
+                o[r] = dot1_iq2_s(w + (size_t) r * row_bytes, nb, y);
+            }
+            return;
+        }
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
-        for (int t = 0; t < nt; ++t) {
-            const block_q8_K* y = (const block_q8_K*) act[t];
-            out[t][r] = TY == 18 ? dot1_iq3_xxs(row, nb, y) : dot1_iq3_s(row, nb, y);
-        }
+        for (int t = 0; t < nt; ++t) out[t][r] = dot1<TY>(row, nb, (const block_q8_K*) act[t]);
     }
 }
 
 }  // namespace
 
-bool iq256_rows1_supported(int type) noexcept { return type == 18 || type == 21; }
+bool iq256_rows1_supported(int type) noexcept { return type == 16 || type == 18 || type == 21 || type == 22; }
 
 void iq256_rows1(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
-    if (type == 18) rows1<18>(w, row_bytes, n, act, nt, out, r0, r1);
+    if (type == 16) rows1<16>(w, row_bytes, n, act, nt, out, r0, r1);
+    else if (type == 18) rows1<18>(w, row_bytes, n, act, nt, out, r0, r1);
     else if (type == 21) rows1<21>(w, row_bytes, n, act, nt, out, r0, r1);
+    else if (type == 22) rows1<22>(w, row_bytes, n, act, nt, out, r0, r1);
+}
+
+bool iq256_gu_rows1_supported(int type) noexcept { return type == 16; }
+
+void iq256_gu_rows1(int type, const uint8_t* gate, const uint8_t* up, size_t gu_row, int n, const void* act,
+                    float* ff, int r0, int r1, float swiglu_limit) {
+    if (type != 16) return;
+    const int nb = n / QK_K;
+    const block_q8_K* y = (const block_q8_K*) act;
+    const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
+    for (int r = r0; r < r1; ++r) {
+        float g = 0.f, u = 0.f;
+        dot1_gu_iq2_xxs(gate + (size_t) r * gu_row, up + (size_t) r * gu_row, nb, y, g, u);
+        if (clamp) {
+            g = std::fmin(g, swiglu_limit);
+            u = std::fmin(std::fmax(u, -swiglu_limit), swiglu_limit);
+        }
+        ff[r] = (g / (1.f + std::exp(-g))) * u;
+    }
 }
 
 bool iq256_supported(int type) noexcept {
@@ -652,6 +996,25 @@ void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* c
             const int k = nt - t0 < 4 ? nt - t0 : 4;
             iq4nl256_down_rows(w, row_bytes, n, hq + t0, k, out + t0, r0, r1);
         }
+    }
+}
+
+void native_accum_out(int n_embd, int ne, const float* w, const float* dn, float* out) {
+    int r = 0;
+    __m256 vw[8];
+    for (int i = 0; i < ne; ++i) vw[i] = _mm256_set1_ps(w[i]);
+    for (; r + 8 <= n_embd; r += 8) {
+        __m256 acc = _mm256_setzero_ps();
+        for (int i = 0; i < ne; ++i) {
+            const __m256 vi = _mm256_loadu_ps(dn + (size_t) i * n_embd + r);
+            acc = _mm256_fmadd_ps(vw[i], vi, acc);
+        }
+        _mm256_storeu_ps(out + r, acc);
+    }
+    for (; r < n_embd; ++r) {
+        float m = 0.0f;
+        for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
+        out[r] = m;
     }
 }
 
