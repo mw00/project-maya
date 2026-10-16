@@ -45,6 +45,10 @@ void exl3_cpu_band_acc_n(const Exl3Part& m, const float* const* xh, int n, int c
 void exl3_cpu_rows_acc(const Exl3Part& m, const float* xh, int ks0, int ks1, float* acc);
 /// ... for n activations at once (xh[i] -> acc[i]), each tile row decoded once; acc[i] is the call for xh[i] alone.
 void exl3_cpu_rows_acc_n(const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, float* const* acc);
+/// ... over the columns [c0, c1) alone (multiples of 128; acc[i] indexed by column, only those overwritten): a piece cut
+/// by columns too, for more jobs than pieces - each column's sums are the whole piece's, bit for bit.
+void exl3_cpu_rows_acc_cols_n(const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, int c0, int c1,
+                              float* const* acc);
 /// The byte-sum products of nb bands from c0 (128 nb columns; acc[i]: 128 nb floats) over every input for any n
 /// activations, as a GEMM: each 256-input chunk of a band decoded once into F32 in `wc` (exl3_cpu_gemm_scratch()
 /// floats, 64-byte aligned, the caller's), then multiplied for all n, the chunk of the activations kept in L2 across

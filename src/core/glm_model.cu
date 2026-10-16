@@ -637,6 +637,20 @@ Glm5Model::~Glm5Model() {
         cudaSetDevice(dev_);
     }
     if (d_tok_) cudaFree(d_tok_);
+    // the head split's own (the helper's rows live in w_arena_)
+    if (hh_s_) cudaStreamDestroy(hh_s_);
+    for (cudaEvent_t& e : hh_ev_)
+        if (e) cudaEventDestroy(e), e = nullptr;
+    for (cudaEvent_t& e : ht_ev_)
+        if (e) cudaEventDestroy(e), e = nullptr;
+    if (ht_x_h_) cudaFreeHost(ht_x_h_);
+    if (ht_lg_h_) cudaFreeHost(ht_lg_h_);
+    if (ht_pair_h_) cudaFreeHost(ht_pair_h_);
+    if (ht_pair_d_) cudaFree(ht_pair_d_);
+    hh_s_ = nullptr;
+    ht_x_h_ = ht_lg_h_ = nullptr;
+    ht_pair_h_ = ht_pair_d_ = nullptr;
+    head_helper_ = nullptr;
     if (w_arena_) cudaFree(w_arena_);
     if (mtp_arena_) cudaFree(mtp_arena_);
     kv_stream_free(kv_);
@@ -1033,6 +1047,44 @@ int Glm5Model::sample_token(strata::kernels::SamplerParams& sp, std::string& err
     return tok;
 }
 
+// the last part's side of the head split: the helper and the pinned rows a pick crosses with
+bool Glm5Model::head_split_link(Glm5Model* helper, std::string& err) {
+    if (helper == nullptr || !helper->head_half_ || helper->hh_s_ == nullptr || !exl3_) return true;
+    namespace x3 = strata::kernels::exl3;
+    cudaSetDevice(dev_);
+    const size_t E = (size_t) g_.n_embd, nc = (size_t) (g_.n_vocab - helper->head_c0_);
+    if (cudaHostAlloc((void**) &ht_x_h_, kPipeSlots * E * sizeof(float), cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc((void**) &ht_lg_h_, kPipeSlots * nc * sizeof(float), cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostAlloc((void**) &ht_pair_h_, kPipeSlots * 2 * sizeof(int), cudaHostAllocPortable) != cudaSuccess ||
+        cudaMalloc((void**) &ht_pair_d_, kPipeSlots * 4 * sizeof(int)) != cudaSuccess) {
+        cudaGetLastError();
+        err = "glm split: the head split's rows did not allocate";
+        return false;
+    }
+    for (int i = 0; i < kPipeSlots; ++i) cudaEventCreateWithFlags(&ht_ev_[i], cudaEventDisableTiming);
+    // the halves' logits are the whole row's bit for bit only while mv takes each in one piece of the inputs, as it
+    // takes the whole matrix (every column's sum then the same): checked on both devices, else no split
+    const auto it = exl3_mats_.find("output.weight");
+    const auto ih = helper->exl3_mats_.find("output.weight.hi");
+    if (it == exl3_mats_.end() || ih == helper->exl3_mats_.end()) return true;
+    const x3::Mat lo = x3::view(it->second, 0, helper->head_c0_);
+    cudaSetDevice(helper->dev_);
+    const int s_hi = x3::mv_splits(ih->second);
+    cudaSetDevice(dev_);
+    const int s_full = x3::mv_splits(it->second), s_lo = x3::mv_splits(lo);
+    if (s_hi != 1 || s_full != 1 || s_lo != 1) {
+        std::fprintf(stderr, "glm split: no head split (the head's GEMV in %d / %d / %d pieces)\n", s_full, s_lo, s_hi);
+        return true;
+    }
+    const x3::Mat& slot = exl3_mats_["output.weight.lo"] = lo;
+    ws_map_["output.weight.lo"] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, lo.k, lo.n};
+    head_helper_ = helper;
+    head_c0_ = helper->head_c0_;
+    std::fprintf(stderr, "glm split: the head's columns [0, %d) on CUDA%d, [%d, %d) on CUDA%d at once (a pipelined "
+                         "window's pick)\n", head_c0_, dev_, head_c0_, (int) g_.n_vocab, helper->dev_);
+    return true;
+}
+
 bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, const std::vector<int>& bounds,
                                 const std::vector<int>& devs, std::string& err) {
     const int n = (int) devs.size();
@@ -1042,6 +1094,18 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         return false;
     }
     std::string where;
+    // the head split's helper (head_half_): of the parts between the first and the last, the one of the fewest
+    // layers, the later on a tie (nearer the last part); 3+ parts with the DFlash drafter only (the pipelined window
+    // is the split's one user - without it the copy would only cost the helper its expert slots)
+    int helper = -1;
+    {
+        const char* hs = getenv("STRATA_GLM_HEAD_SPLIT");
+        if (n >= 3 && !dflash_path_.empty() && (hs == nullptr || std::atoi(hs) != 0))
+            for (int i = 1; i + 1 < n; ++i) {
+                const int cnt = bounds[(size_t) i] - bounds[(size_t) i - 1];
+                if (helper < 0 || cnt <= bounds[(size_t) helper] - bounds[(size_t) helper - 1]) helper = i;
+            }
+    }
     // STRATA_GLM_PARALLEL_LOAD=0: sequential. Parts stay unlinked until loaded (load_pack's reset() walks split_next_)
     const char* pl = getenv("STRATA_GLM_PARALLEL_LOAD");
     if (pl == nullptr || std::atoi(pl) != 0) {
@@ -1062,6 +1126,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             p->defer_lane_ = true;
             p->dflash_path_ = dflash_path_;   // the drafter: the part with the head loads it, every part sizes for it
             p->profile_path_ = profile_path_;   // every part reads the same profile
+            p->head_half_ = i == helper;
             th.emplace_back([&, i, l0, l1, p] {
                 ok[(size_t) i] = p->load_pack(pack_dir, max_ctx, errs[(size_t) i], devs[(size_t) i], l0, l1);
                 sl.pass(i);       // (a part that stopped early, or never reached those turns, lets the others on)
@@ -1079,6 +1144,10 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
                 return false;
             }
         for (int i = n - 1; i >= 1; --i) parts[(size_t) i - 1]->split_next_ = std::move(owned[(size_t) i]);
+        if (helper > 0 && parts[(size_t) helper]->head_half_ && !parts[(size_t) n - 1]->head_split_link(parts[(size_t) helper], err)) {
+            split_next_.reset();
+            return false;
+        }
         for (int i = 0; i < n; ++i) {
             if (!parts[(size_t) i]->fast_setup_finish(err)) {
                 split_next_.reset();
@@ -1103,6 +1172,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->split_devs_ = devs;
         m->dflash_path_ = dflash_path_;
         m->profile_path_ = profile_path_;   // every part reads the same profile
+        m->head_half_ = i == helper;
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
             if (prev != nullptr) prev->split_next_.reset();
             return false;
@@ -1110,6 +1180,14 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         where += (i ? ", [" : "[") + std::to_string(l0) + ", " + std::to_string(i + 1 < n ? l1 : g_.n_layers) +
                  ") on CUDA" + std::to_string(devs[(size_t) i]);
         prev = m;
+    }
+    if (helper > 0) {
+        Glm5Model* h = this;
+        for (int i = 0; i < helper; ++i) h = h->split_next_.get();
+        if (h->head_half_ && !prev->head_split_link(h, err)) {
+            split_next_.reset();
+            return false;
+        }
     }
     }
     // the chunks are the smallest part's (as Strata's split): the others keep their pinned staging to that, and a
@@ -2866,6 +2944,16 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         for (auto& e : v) s += " | " + e.second + " " + std::to_string((int) (e.first >> 20)) + " MB";
         std::fprintf(stderr, "glm pack: CUDA%d dense weights %.2f GB:%s\n", dev_, (double) bytes / 1073741824.0, s.c_str());
     }
+    // the head split's helper: its copy of the head's columns [head_c0_, n_vocab), then the rows its picks use
+    const auto al = [](uint64_t b) { return (b + 255u) & ~(uint64_t) 255u; };
+    if (head_half_ && (!exl3_ || xt.mats.count("output.weight") == 0)) head_half_ = false;
+    if (head_half_) {
+        const Exl3Table::Mat& hm = xt.mats.at("output.weight");
+        head_c0_ = hm.n / 2 / 128 * 128;
+        const uint64_t nc = (uint64_t) (hm.n - head_c0_);
+        bytes += al((uint64_t) hm.k * nc * hm.K / 8) + al(2 * (uint64_t) hm.k) + al(2 * nc) +
+                 al((uint64_t) kPipeSlots * g_.n_embd * 4) + al((uint64_t) kPipeSlots * nc * 4) + al(kPipeSlots * 8);
+    }
     { cudaError_t e_ = cudaMalloc(&w_arena_, bytes); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
     w_arena_bytes_ = bytes;
     std::ifstream dense(pack_dir + "/dense.bin", std::ios::binary);
@@ -3024,6 +3112,57 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         w_[r.name] = (const float*) ((uint8_t*) w_arena_ + at);
         ws_map_[r.name] = strata::core::WSlot{(const float*) ((uint8_t*) w_arena_ + at), 0, nullptr, 0, 0};
         at += (n_f32 * 4 + 255u) & ~(uint64_t) 255u;
+    }
+    if (head_half_) {
+        // the helper's half of the head: per 16-row slice the tiles of columns [c0, n) (a 2-D copy out of the
+        // safetensors mapping), the input scales whole, the output scales from c0; then its rows
+        const Exl3Table::Mat& m = xt.mats.at("output.weight");
+        const int c0 = head_c0_, nc = m.n - c0;
+        const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
+        const size_t tile_b = (size_t) 32 * m.K, slice_b = (size_t) (m.n / 16) * tile_b, run_b = (size_t) (nc / 16) * tile_b;
+        if (m.tr + slice_b * (m.k / 16) > sh.size || m.svh + 2 * (uint64_t) m.n > sh.size) {
+            err = "pack: the head lies past the end of its file";
+            return false;
+        }
+        uint8_t* base = (uint8_t*) w_arena_;
+        uint8_t* tr = base + at;
+        if (cudaMemcpy2D(tr, run_b, sh.base + m.tr + (size_t) (c0 / 16) * tile_b, slice_b, run_b, (size_t) (m.k / 16),
+                         cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = std::string("pack: the head's half: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        at += al(run_b * (m.k / 16));
+        uint8_t* suh = base + at;
+        cudaMemcpy(suh, sh.base + m.suh, 2 * (size_t) m.k, cudaMemcpyHostToDevice);
+        at += al(2 * (uint64_t) m.k);
+        uint8_t* svh = base + at;
+        cudaMemcpy(svh, sh.base + m.svh + 2 * (size_t) c0, 2 * (size_t) nc, cudaMemcpyHostToDevice);
+        at += al(2 * (uint64_t) nc);
+        hh_x_ = (float*) (base + at);
+        at += al((uint64_t) kPipeSlots * g_.n_embd * 4);
+        hh_lg_ = (float*) (base + at);
+        at += al((uint64_t) kPipeSlots * nc * 4);
+        hh_pair_ = (int*) (base + at);
+        at += al(kPipeSlots * 8);
+        x3::Mat M;
+        M.trellis = (const uint32_t*) tr;
+        M.suh = (const uint16_t*) suh;
+        M.svh = (const uint16_t*) svh;
+        M.k = m.k;
+        M.n = nc;
+        M.K = m.K;
+        M.cb = m.cb;
+        const x3::Mat& slot = exl3_mats_["output.weight.hi"] = M;
+        ws_map_["output.weight.hi"] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, nc};
+        int lo = 0, hi = 0;
+        cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        if (cudaStreamCreateWithPriority(&hh_s_, cudaStreamNonBlocking, hi) != cudaSuccess) {
+            err = "pack: the head split's stream";
+            return false;
+        }
+        for (int i = 0; i < kPipeSlots; ++i) cudaEventCreateWithFlags(&hh_ev_[i], cudaEventDisableTiming);
+        std::fprintf(stderr, "glm pack: CUDA%d holds the head's columns [%d, %d) (%.0f MB): a pipelined window's pick "
+                             "reads both halves at once\n", dev_, c0, m.n, (double) (run_b * (m.k / 16)) / 1048576.0);
     }
 
     // 4b. the NextN (MTP) block on the LAST half of the fast path: its own weights from the shards (the pack never

@@ -2887,6 +2887,55 @@ __device__ void topk_argmax(float* sel, int E, int k, int* out, float* s_bv, int
     }
 }
 
+// topk_argmax's picks (the largest first, ties to the lower id, a non-finite pick -1; the picks left at -inf in sel)
+// for E <= 512, by warp 0 alone: its 16 values a lane in registers and k rounds of a warp arg-max, no block barrier -
+// topk_argmax's k rounds of two barriers each were half of a 20 us route on an RTX 5060 Ti.  The block waits for it
+__device__ void topk_warp(float* sel, int E, int k, int* out) {
+    if (threadIdx.x < 32) {
+        const int lane = threadIdx.x;
+        float v[16];
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int e = lane + 32 * j;
+            v[j] = e < E ? sel[e] : -INFINITY;
+        }
+        for (int r = 0; r < k; ++r) {
+            float bv = -INFINITY;
+            int bi = 0x7fffffff;
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int e = lane + 32 * j;
+                if (e < E && (v[j] > bv || (v[j] == bv && e < bi))) {
+                    bv = v[j];
+                    bi = e;
+                }
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+                if (ov > bv || (ov == bv && oi < bi)) {
+                    bv = ov;
+                    bi = oi;
+                }
+            }
+            const bool ok = bi >= 0 && bi < E && isfinite(bv);
+            if (ok) {
+#pragma unroll
+                for (int j = 0; j < 16; ++j)
+                    if (lane + 32 * j == bi) v[j] = -INFINITY;
+            }
+            if (lane == 0) out[r] = ok ? bi : -1;
+        }
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int e = lane + 32 * j;
+            if (e < E) sel[e] = v[j];
+        }
+    }
+    __syncthreads();
+}
+
 struct RouteArgs {
     const float* logits;
     const float* bias;
@@ -2961,14 +3010,18 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __syncthreads();
-    topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
+    if (E <= 512) topk_warp(s_sel, E, a.k, s_ids);
+    else topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
     // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
     // the top k are -inf in s_sel now, so the selection simply goes on (s_sel is rewritten for the prediction below)
     __shared__ int s_near[16];
-    if (a.near_n > 0) topk_argmax(s_sel, E, a.near_n, s_near, s_bv, s_bi);
+    if (a.near_n > 0) {
+        if (E <= 512) topk_warp(s_sel, E, a.near_n, s_near);
+        else topk_argmax(s_sel, E, a.near_n, s_near, s_bv, s_bi);
+    }
     // the next layer's predicted top-k (same selection rule, its own bias)
     __shared__ int s_pred[8];
     if (tid < 8) s_pred[tid] = -1;
@@ -2980,7 +3033,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             if (!isfinite(a.pred_logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 2);
         }
         __syncthreads();
-        topk_argmax(s_sel, E, a.k, s_pred, s_bv, s_bi);
+        if (E <= 512) topk_warp(s_sel, E, a.k, s_pred);
+        else topk_argmax(s_sel, E, a.k, s_pred, s_bv, s_bi);
         if (tid == 0)
             for (int i = 0; i < a.k; ++i)
                 if (s_pred[i] < 0 || s_pred[i] >= E) atomicMax(&bad, 2);
@@ -3031,6 +3085,15 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             }
         }
     }
+    // the routed experts' VRAM and RAM-tier table entries, loaded at once (thread 0's plan below read them one after
+    // another, each a dependent global load)
+    __shared__ unsigned long long s_tab[8], s_rtab[8];
+    if (tid < a.k && tid < 8) {
+        const int e = s_ids[tid];
+        const size_t key = (size_t) a.layer * E + (size_t) (e >= 0 && e < E ? e : 0);
+        s_tab[tid] = a.d.tab[key];
+        s_rtab[tid] = a.d.tab[(size_t) a.d.n_keys + key];
+    }
     __syncthreads();
     if (bad != 0) {
         if (tid == 0) {
@@ -3062,6 +3125,14 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
     __shared__ unsigned long long s_pp[8], s_cs[8];
     __shared__ int s_npf, s_pfid[8];
     __shared__ unsigned long long s_pfptr[8];
+    // the route counts the CPU lane's plan reads, one thread an expert (a route's experts are distinct keys): thread
+    // 0's loop below took them one dependent read-modify-write after another
+    __shared__ unsigned int s_cnt[8];
+    __shared__ unsigned long long s_plan[8], s_fsrc[8];
+    const bool lane_plan = a.cpu_plan != 0ull && skip_from > 0;
+    if (tid < a.k && tid < 8)
+        s_cnt[tid] = lane_plan && a.d.dcnt != nullptr ? ++a.d.dcnt[(size_t) a.layer * E + s_ids[tid]] : 0u;
+    __syncthreads();
     if (tid == 0) {
         double sum = 0.0;
         for (int i = 0; i < a.k; ++i) sum += (double) s_p[s_ids[i]];
@@ -3074,13 +3145,13 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         // host from their RAM-tier blobs while the device pulls the others over PCIe - the COLDEST by the route counts
         // (ties: the later in route order), so the hot ones are still promoted into VRAM
         unsigned int host_set = 0;
-        if (a.cpu_plan != 0ull && skip_from > 0) {
+        if (lane_plan) {
             int f_ram = 0, ri[8];
             unsigned int rcnt[8];
             for (int i = 0; i < a.k; ++i) {
                 const size_t key = (size_t) a.layer * E + s_ids[i];
-                const unsigned int c = a.d.dcnt != nullptr ? ++a.d.dcnt[key] : 0u;
-                if (i < skip_from && a.d.tab[key] == 0ull && rtab[key] != 0ull &&
+                const unsigned int c = s_cnt[i];
+                if (i < skip_from && s_tab[i] == 0ull && s_rtab[i] != 0ull &&
                     !(a.d.helper_owned && a.d.helper_owned[key])) {
                     ri[f_ram] = i;
                     rcnt[f_ram++] = c;
@@ -3098,7 +3169,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
             const float w = (float) ((double) s_p[s_ids[i]] * inv * a.w_scale);
             s_w[i] = w;
             const size_t key = (size_t) a.layer * E + s_ids[i];
-            unsigned long long ptr = a.d.tab[key];
+            unsigned long long ptr = s_tab[i];
             unsigned long long src = 0ull;
             s_pp[i] = 0ull;
             s_cs[i] = 0ull;
@@ -3109,7 +3180,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                 // cpu_src stays zero: the host resolves this key in the helper's own cache.
                 cpu |= 1u << i;
             } else if (ptr == 0ull) {
-                src = rtab[key];
+                src = s_rtab[i];
                 if (src != 0ull && ((host_set >> i) & 1u)) {
                     // to the host: a null plan entry (the expert kernels skip it), no spare, no fetch
                     cpu |= 1u << i;
@@ -3162,12 +3233,9 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
                     else mask |= 1u << i;   // only on disk: the host provides the source
                 }
             }
-            a.d.plan_ptr[i] = ptr;
-            a.d.fetch_src[i] = src;
-            a.d.plan_w[i] = w;
-            a.d.plan_id[i] = s_ids[i];
+            s_plan[i] = ptr;   // (out to the device's plan below, a thread an entry)
+            s_fsrc[i] = src;
         }
-        for (int i = a.k; i < 8; ++i) a.d.fetch_src[i] = 0ull;
         s_mask = mask;
         s_fetch = fetch;
         s_promo = promo;
@@ -3217,36 +3285,53 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         *a.d.cpu_flag = 0;
     }
     __syncthreads();
+    if (tid < 8) {
+        const bool on = tid < a.k;
+        if (on) {
+            a.d.plan_ptr[tid] = s_plan[tid];
+            a.d.plan_w[tid] = s_w[tid];
+            a.d.plan_id[tid] = s_ids[tid];
+        }
+        a.d.fetch_src[tid] = on ? s_fsrc[tid] : 0ull;
+    }
     MoeRequest* rq = (MoeRequest*) a.d.ring + (s_seq % kRingSize);
     if (s_cpu != 0u)
         for (int e = tid; e < a.n_embd; e += ROUTE_THREADS) rq->x[e] = a.x[e];
+    // the request's fields before x: put together in shared memory by thread 0, then out over PCIe in 8-byte words by
+    // as many threads at once (thread 0's ~70 scalar stores to host memory one after another were most of the
+    // kernel's time); the first word holds seq (written last, below) and layer - layer goes alone
+    constexpr int kHeadWords = (int) (offsetof(MoeRequest, x) / 8);
+    static_assert(offsetof(MoeRequest, x) % 8 == 0 && offsetof(MoeRequest, layer) == 4, "MoeRequest's head");
+    __shared__ unsigned long long s_rq[kHeadWords];
     if (tid == 0) {
-        rq->layer = a.layer;
-        rq->error = 0;
-        rq->miss_mask = s_mask;
-        rq->fetch_mask = s_fetch;
-        rq->promo_mask = s_promo;
-        rq->cpu_mask = s_cpu;
-        rq->win = a.win;
-        rq->win_n = a.win_n;
-        rq->skip_mask = s_skip;
-        for (int i = 0; i < a.k; ++i) {
-            rq->ids[i] = s_ids[i];
-            rq->w[i] = s_w[i];
-            rq->promo_ptr[i] = s_pp[i];
-            rq->pred[i] = s_pred[i];
-            rq->cpu_src[i] = s_cs[i];
+        MoeRequest* q = (MoeRequest*) s_rq;
+        q->layer = a.layer;
+        q->error = 0;
+        q->miss_mask = s_mask;
+        q->fetch_mask = s_fetch;
+        q->promo_mask = s_promo;
+        q->cpu_mask = s_cpu;
+        q->win = a.win;
+        q->win_n = a.win_n;
+        q->skip_mask = s_skip;
+        for (int i = 0; i < 8; ++i) {
+            const bool on = i < a.k;   // (the entries past k as the host never reads them: zero)
+            q->ids[i] = on ? s_ids[i] : 0;
+            q->w[i] = on ? s_w[i] : 0.0f;
+            q->promo_ptr[i] = on ? s_pp[i] : 0ull;
+            q->pred[i] = on ? s_pred[i] : 0;
+            q->cpu_src[i] = on ? s_cs[i] : 0ull;
+            q->pf_ids[i] = i < s_npf ? s_pfid[i] : 0;
+            q->pf_ptr[i] = i < s_npf ? s_pfptr[i] : 0ull;
         }
-        rq->pf_n = s_npf;
-        for (int i = 0; i < s_npf; ++i) {
-            rq->pf_ids[i] = s_pfid[i];
-            rq->pf_ptr[i] = s_pfptr[i];
-        }
+        q->pf_n = s_npf;
         for (int d2 = 0; d2 < kAhead; ++d2)
-            for (int i = 0; i < 8; ++i) rq->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
-        if (a.near_n > 0)   // the host reads them only for the route log: no extra writes over PCIe without it
-            for (int i = 0; i < 16; ++i) rq->near_ids[i] = i < a.near_n ? (short) s_near[i] : (short) -1;
+            for (int i = 0; i < 8; ++i) q->ahead[d2][i] = d2 < a.n_ahead && i < a.k ? s_ah[d2][i] : (short) -1;
+        for (int i = 0; i < 16; ++i) q->near_ids[i] = i < a.near_n ? (short) s_near[i] : (short) -1;
+        rq->layer = a.layer;
     }
+    __syncthreads();
+    for (int w8 = 1 + tid; w8 < kHeadWords; w8 += ROUTE_THREADS) ((unsigned long long*) rq)[w8] = s_rq[w8];
     __threadfence_system();
     __syncthreads();
     if (tid == 0) {
@@ -4515,6 +4600,27 @@ void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_s
     launch_check("dsa_select");
 }
 
+// every pool's cells in pool order, then the tail (dsa_select's when it takes all n_vis pools - the same cells, in
+// position order instead of the scores')
+__global__ void dsa_select_all_kernel(int n_vis, int kpool, int n_sel, int pos, int* __restrict__ cells) {
+    const int full = n_vis * kpool;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n_sel; i += gridDim.x * blockDim.x)
+        cells[i] = i < full || (i - full < kpool - 1 && i <= pos) ? i : -1;
+}
+
+bool dsa_select_all_on() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_DSA_ALL");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s) {
+    dsa_select_all_kernel<<<(n_sel + 255) / 256, 256, 0, s>>>(n_vis, kpool, n_sel, pos, cells);
+    launch_check("dsa_select_all");
+}
+
 // the split attention of one token: q_abs (n_head x kv_lora) over its selected cells -> ctx; false when the split
 // kernels are not available on this device (mla() then runs its one-kernel form)
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
@@ -5126,7 +5232,10 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
     launch_check("rms_q8");
 }
 
-void set_skip(const int* flag) { g_skip = flag; }
+void set_skip(const int* flag) {
+    g_skip = flag;
+    exl3::set_skip(flag);   // (the EXL3 weights' kernels: the same flag)
+}
 
 void skip_gate(const volatile int* host_from, int t, int* flag, cudaStream_t s) {
     skip_gate_kernel<<<1, 1, 0, s>>>(host_from, t, flag);
@@ -5141,6 +5250,82 @@ void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_em
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map, int map_from) {
     argmax_kernel<<<1, 1024, 0, s>>>(x, n, out, map, map_from);
     launch_check("argmax");
+}
+
+// argmax_kernel's pick with its value: out[0] the index (0x7fffffff: none finite), out[1] the value's bits
+__global__ void __launch_bounds__(1024) argmax_pair_kernel(const float* __restrict__ x, int n, int* __restrict__ out) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    float best = -INFINITY;
+    int bi = 0x7fffffff;
+    const auto take = [&](float v, int i) {
+        if (v > best || (v == best && i < bi)) {
+            best = v;
+            bi = i;
+        }
+    };
+    // (argmax_kernel's loads: float4, four in flight a thread)
+    const int B = (int) blockDim.x;
+    int tail = 0;
+    if ((((uintptr_t) x) & 15u) == 0) {
+        const float4* x4 = (const float4*) x;
+        const int n4 = n >> 2;
+        int i = threadIdx.x;
+        for (; i + 3 * B < n4; i += 4 * B) {
+            float4 a[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) a[u] = x4[i + u * B];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int b = 4 * (i + u * B);
+                take(a[u].x, b);
+                take(a[u].y, b + 1);
+                take(a[u].z, b + 2);
+                take(a[u].w, b + 3);
+            }
+        }
+        for (; i < n4; i += B) {
+            const float4 a = x4[i];
+            take(a.x, 4 * i);
+            take(a.y, 4 * i + 1);
+            take(a.z, 4 * i + 2);
+            take(a.w, 4 * i + 3);
+        }
+        tail = 4 * n4;
+    }
+    for (int i = tail + threadIdx.x; i < n; i += B) take(x[i], i);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > best || (ov == best && oi < bi)) { best = ov; bi = oi; }
+    }
+    const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+    if (lane == 0) { sv[w] = best; si[w] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
+            if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
+        out[0] = bi;
+        out[1] = __float_as_int(best);
+    }
+}
+
+// the pick over two halves' argmax_pair results (b's indices from c0 on): b only when strictly greater - the whole
+// row's argmax, ties to the lower index
+__global__ void argmax_join_kernel(const int* __restrict__ a, const int* __restrict__ b, int c0, int* __restrict__ out) {
+    const bool bv = b[0] != 0x7fffffff, av = a[0] != 0x7fffffff;
+    *out = bv && (!av || __int_as_float(b[1]) > __int_as_float(a[1])) ? c0 + b[0] : a[0];
+}
+
+void argmax_pair(const float* x, int n, int* out, cudaStream_t s) {
+    argmax_pair_kernel<<<1, 1024, 0, s>>>(x, n, out);
+    launch_check("argmax_pair");
+}
+
+void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s) {
+    argmax_join_kernel<<<1, 1, 0, s>>>(a, b, c0, out);
+    launch_check("argmax_join");
 }
 
 }  // namespace strata::kernels::glmf

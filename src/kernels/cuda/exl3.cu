@@ -61,6 +61,7 @@ struct Q81 {   // the engine's q8_1 block (ggml block_q8_1): d, sum, 32 int8
 };
 
 std::atomic<int> g_launch_errors{0};
+thread_local const int* g_skip = nullptr;   // set_skip: the calling thread's flag (nullptr: none)
 void launch_check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
@@ -478,6 +479,7 @@ struct KBatch {
     KJob j[kMaxMvJobs];
     int blk_end[kMaxMvJobs];
     int n;
+    const int* skip;   // set_skip's flag: non-zero = a pipelined window's token past a wrong draft (nullptr: none)
 };
 
 // a launch's blocks: its jobs' (output block, input split) pairs, each for all of the job's nc activations at once
@@ -494,6 +496,9 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K>) mv_kernel(const KBatch b) {
     const int g = local / J.S, sp = local % J.S;
     const int k0 = sp * J.kr, k1 = min(J.k, k0 + J.kr);
     const int warp = threadIdx.x >> 5;
+    // a skipped token (set_skip): no work.  The flag changes only between launches (skip_gate, on the same stream), so
+    // every block of the launch returns and no split counter moves
+    if (b.skip != nullptr && *b.skip) return;
     Xin x;
     if (warp < J.nc) {
         if (J.xf != nullptr) x.f = J.xf + warp * J.xf_cs;
@@ -545,6 +550,7 @@ struct KMoe {
     size_t suh[3], svh[3], tr[3];
     int k, n_embd, n_ff;
     float limit;
+    const int* skip;     // set_skip's flag (nullptr: none)
 };
 
 // the pieces the token's experts (moe_*_kernel) and a window's grouped experts (win_*_kernel) share, so each window
@@ -595,6 +601,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_gate_up_kernel(const KMoe a) {
     const int ei = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
     const unsigned long long ptr = a.plan_ptr[ei];
     if (ptr == 0ull) return;
+    if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
     const uint8_t* blob = (const uint8_t*) ptr;
     const int warp = threadIdx.x >> 5;
     Xin x;
@@ -619,6 +626,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K>) moe_down_kernel(const KMoe a) {
     const unsigned long long ptr = a.plan_ptr[ei];
     const int warp = threadIdx.x >> 5;
     float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
+    if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
     if (ptr != 0ull) {
         const uint8_t* blob = (const uint8_t*) ptr;
         Xin x;
@@ -1255,12 +1263,46 @@ bool use_legacy() {
 #endif
 }
 
-// mv's input split for m: S blocks of kr inputs per output block, at most kMaxKR inputs a block and about two blocks
-// per SM (the same for every activation count, so a job of several sums each activation as a job of one)
-void mv_split(const Mat& m, int sms, int& S, int& kr) {
+// the blocks of mv_kernel<K> an SM of the current device keeps at once (its registers and shared memory), asked once
+// per device and K
+template <int K, int cb> struct OccMv {
+    static void run(int& n) {
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&n, mv_kernel<K, cb>, kThreads, 0) != cudaSuccess) {
+            cudaGetLastError();
+            n = 2;
+        }
+    }
+};
+int mv_occ(int K) {
+    static std::atomic<int> cache[64][9];   // 0: not asked
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64 || K < 1 || K > 8) return 2;
+    int n = cache[dev][K].load(std::memory_order_acquire);
+    if (n == 0) {
+        n = 2;
+        dispatch<OccMv>(K, 2, n);
+        n = std::max(1, n);
+        cache[dev][K].store(n, std::memory_order_release);
+    }
+    return n;
+}
+
+// mv's input split for m: S blocks of kr inputs per output block, at most kMaxKR inputs a block (the same for every
+// activation count, so a job of several sums each activation as a job of one).  About two blocks per SM; where an SM
+// keeps three or more (`occ`: the RTX 3090's at K > 4) four a SM, down to 128 inputs a block - its decode sets the pace
+// there, and the more, shorter blocks balance it over the SMs (RTX 3090, K6 / K5, us: a KDA layer's 8192 x 4096
+// output 47.6 -> 45.5, the dense layers' 4096 x 12288 gate 58.9 -> 52.5 and 12288 x 4096 down 59.3 -> 52.2, the
+// shared expert's 4096 x 2048 17.4 -> 16.5); with two a SM, a launch that would spill a short second wave (more blocks
+// than the SMs keep, less than one and a half times) takes twice the splits (RTX 5060 Ti, K5: that gate 99.4 -> 84.8
+// us, that down 100.6 -> 84.9)
+void mv_split(const Mat& m, int sms, int occ, int& S, int& kr) {
     const int groups = m.n / kCols;
+    const bool many = occ >= 3;
+    const int kr_min = many ? 128 : 256, target = (many ? 4 : 2) * sms, P = occ * sms;
     S = (m.k + kMaxKR - 1) / kMaxKR;
-    while (groups * S < 2 * sms && m.k / (S * 2) >= 256) S *= 2;
+    while (groups * S < target && m.k / (S * 2) >= kr_min) S *= 2;
+    if (!many && groups * S > P && 2 * groups * S < 3 * P && m.k / (S * 2) >= kr_min) S *= 2;
     kr = ((m.k + S - 1) / S + 127) / 128 * 128;
     S = (m.k + kr - 1) / kr;
 }
@@ -1279,6 +1321,15 @@ Mat view(const Mat& m, int c0, int nc) {
 bool supported(const Mat& m) {
     return m.trellis != nullptr && m.suh != nullptr && m.svh != nullptr && m.k > 0 && m.n > 0 && m.k % 128 == 0 &&
            m.n % 128 == 0 && m.K >= 1 && m.K <= 8 && m.cb >= 0 && m.cb <= 2;
+}
+
+void set_skip(const int* flag) { g_skip = flag; }
+
+int mv_splits(const Mat& m) {
+    if (!supported(m)) return 0;
+    int S = 1, kr = 0;
+    mv_split(m, sm_count(), mv_occ(m.K), S, kr);
+    return S;
 }
 
 int launch_errors() {
@@ -1337,7 +1388,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             if (done[u] || m.K != m0.K || m.cb != m0.cb) continue;
             const int c0 = units[u].c0, nc = units[u].nc, groups = m.n / kCols;
             int S = 1, kr = 0;
-            mv_split(m, sms, S, kr);
+            mv_split(m, sms, mv_occ(m.K), S, kr);
             const size_t need = S > 1 ? (size_t) S * m.n * nc : 0;
             if (S > 1 && (part_at + need > kPartFloats || cnt_at + (size_t) groups > kCounters)) {
                 if (nb > 0) continue;   // the next launch
@@ -1371,6 +1422,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             b.blk_end[nb++] = blocks;
         }
         b.n = nb;
+        b.skip = g_skip;
         if (!dispatch<RunMv>(m0.K, m0.cb, b, blocks, s)) return false;
     }
     launch_check("mv");
@@ -1405,6 +1457,7 @@ static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     m.n_embd = a.n_embd;
     m.n_ff = a.n_ff;
     m.limit = a.limit;
+    m.skip = g_skip;
     return true;
 }
 

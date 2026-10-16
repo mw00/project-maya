@@ -700,12 +700,25 @@ GlmDflash::~GlmDflash() {
 
 int GlmDflash::dev() const { return d_->dev; }
 
+// The drafter's stream at the device's highest priority: a round's drafts gate every draft token's entry into the
+// pipelined window, and at the round's start the head's card is still running the layer a cancelled token was in
+// (the skip takes effect at the next layer) - ~1.7 ms of such work shared the GPU with each draft and stretched it
+// from ~3.4 to 4-6 ms (EXL3-4.05bpw over 9 GPUs, nsys).  STRATA_GLM_DFLASH_PRIO=0: an ordinary stream (A/B)
 cudaStream_t GlmDflash::stream() {
     if (d_->ds == nullptr) {
         int cur = 0;
         cudaGetDevice(&cur);
         cudaSetDevice(d_->dev);
-        if (cudaStreamCreateWithFlags(&d_->ds, cudaStreamNonBlocking) != cudaSuccess) {
+        static const bool prio = [] {
+            const char* v = getenv("STRATA_GLM_DFLASH_PRIO");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        int least = 0, greatest = 0;
+        if (!prio || cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
+            cudaGetLastError();
+            greatest = least = 0;
+        }
+        if (cudaStreamCreateWithPriority(&d_->ds, cudaStreamNonBlocking, greatest) != cudaSuccess) {
             cudaGetLastError();
             d_->ds = nullptr;
         }
@@ -1498,6 +1511,18 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     n_max = std::max(1, std::min({n_max, D.block() - 1, kWinMax - 1}));
     const WSlot& head = tail->ws_map_.at("output.weight");
     static const bool prof = getenv("STRATA_GLM_DFLASH_PROF") != nullptr;
+    // STRATA_GLM_DFLASH_TL=<file>: a line a pipelined round - ms from its anchor's start: drafts ready, drafts pushed,
+    // each pick (the tokens out of the last part), the commit done
+    static FILE* tl = [] {
+        const char* f = getenv("STRATA_GLM_DFLASH_TL");
+        return f != nullptr && f[0] ? std::fopen(f, "a") : nullptr;
+    }();
+    auto t_anchor = std::chrono::steady_clock::now();
+    std::vector<double> tl_pick;
+    double tl_begun = 0, tl_inj = 0, tl_ds = 0;   // the anchor's begin returned, inject queued, draft queued
+    const auto ms_since = [](std::chrono::steady_clock::time_point a) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+    };
     double t_draft = 0, t_win = 0, t_rest = 0;
     double ph_begin = 0, ph_dwait = 0, ph_push = 0, ph_end = 0;   // the pipelined rounds' host phases
     bool begun = false;              // the pipelined window's anchor already queued (at the end of the last round)
@@ -1601,16 +1626,21 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         // previous one's late tokens without waiting for the devices; every 8th waits, so the tiers' boundary runs
         // even when no window finds the devices idle
         const auto hp0 = std::chrono::steady_clock::now();
-        if (pipe && !begun && !win_pipe_begin(y, err, &sp, rounds % 8 == 0)) return false;
+        if (pipe && !begun) {
+            t_anchor = std::chrono::steady_clock::now();
+            if (!win_pipe_begin(y, err, &sp, rounds % 8 == 0)) return false;
+        }
         begun = false;
         if (inj_hi > inj_lo) {
             cudaSetDevice(tail->dev_);
             if (!D.inject(inj_lo, inj_hi, ts, err)) return false;
             inj_lo = inj_hi = 0;
         }
+        if (tl != nullptr) tl_inj = ms_since(t_anchor);
         if (room > 0 && !D.draft_start(y, N, explore ? D.block() - 1 : room, explore ? 0.0f : p_min, head,
                                        pack_emb_src_, pack_emb_type_, ts, err))
             return false;
+        if (tl != nullptr) tl_ds = ms_since(t_anchor);
         const auto hp1 = std::chrono::steady_clock::now();
         if (!D.draft_finish(d, err, stats != nullptr ? &conf : nullptr, explore ? 0 : n_min, explore ? 0.0f : p_cum))
             return false;
@@ -1663,10 +1693,14 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
             for (int i = 1; i < T; ++i)
                 if (!win_pipe_push(tok[(size_t) i], err)) return false;
             const auto hq1 = std::chrono::steady_clock::now();
+            const double tl_ready = std::chrono::duration<double, std::milli>(hq0 - t_anchor).count();
+            const double tl_pushed = std::chrono::duration<double, std::milli>(hq1 - t_anchor).count();
+            tl_pick.clear();
             // the picks as their tokens come out of the last part, up to the first that is not the next draft: the
             // tokens after it are still in flight, and the commit and the next window queue behind them
             for (int t = 0; t < T; ++t) {
                 if (!win_pipe_pick(t, out[(size_t) t], err)) return false;
+                if (tl != nullptr) tl_pick.push_back(ms_since(t_anchor));
                 if (t + 1 >= T) break;
                 if (tok[(size_t) t + 1] != out[(size_t) t]) {
                     win_pipe_cancel_from(t + 1);   // the drafts after it: their work still queued is skipped
@@ -1674,6 +1708,14 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
                 }
             }
             if (!win_pipe_settle(err)) return false;
+            if (tl != nullptr) {
+                const auto b0 = win_pipe_begun_at(0), bl = win_pipe_begun_at(n_parts_ - 1);
+                std::fprintf(tl, "%d %.3f %.3f %.3f %.3f %.3f %.3f %.3f |", T - 1, tl_ready, tl_pushed, tl_begun, tl_inj,
+                             tl_ds, std::chrono::duration<double, std::milli>(b0 - t_anchor).count(),
+                             std::chrono::duration<double, std::milli>(bl - t_anchor).count());
+                for (const double v : tl_pick) std::fprintf(tl, " %.3f", v);
+                std::fprintf(tl, "\n");
+            }
             if (prof) {
                 ph_push += std::chrono::duration<double, std::milli>(hq1 - hq0).count();
                 ph_pushed += T - 1;
@@ -1729,7 +1771,10 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         y = y2;
         if (pipe) {
             // the next window's anchor now, behind the commit; the drafter's catch-up at the top of the round
+            if (tl != nullptr) std::fprintf(tl, "c %.3f\n", ms_since(t_anchor));
+            t_anchor = std::chrono::steady_clock::now();
             if (!win_pipe_begin(y, err, &sp, (rounds % 8) == 0)) return false;
+            if (tl != nullptr) tl_begun = ms_since(t_anchor);
             begun = true;
             inj_lo = N;
             inj_hi = N + keep;
@@ -1737,6 +1782,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     }
     cudaSetDevice(dev_);
     if (stats != nullptr) std::fflush(stats);
+    if (tl != nullptr) std::fflush(tl);
     win_prof_report();
     if (prof && rounds > 0)
         std::fprintf(stderr, "glm dflash prof (%lld rounds, %lld of them no draft: %.2f drafts, %.2f accepted a round): "

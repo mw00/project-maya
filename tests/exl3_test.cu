@@ -823,6 +823,14 @@ void test_cpu_rows(int k, int n, int K) {
             cpu::exl3_cpu_rows_acc_n(m, xp, nt, ks0, ks1, ap);
             for (size_t i = 0; i < (size_t) nt * n; ++i) diff += std::memcmp(&one[i], &all[i], sizeof(float)) != 0;
         }
+        // the same piece cut into runs of columns (uneven: 1..3 bands a run, the lane's cuts): the uncut call's bits
+        std::fill(all.begin(), all.end(), -1.0f);
+        for (int c0 = 0; c0 < n;) {
+            const int c1 = std::min(n, c0 + 128 * (1 + (c0 / 128 + nt) % 3));
+            cpu::exl3_cpu_rows_acc_cols_n(m, xp, nt, ks0, ks1, c0, c1, ap);
+            c0 = c1;
+        }
+        for (size_t i = 0; i < (size_t) nt * n; ++i) diff += std::memcmp(&one[i], &all[i], sizeof(float)) != 0;
     }
     const std::string what = "cpu rows x1..11 k" + std::to_string(k) + " n" + std::to_string(n) + " K" + std::to_string(K);
     std::printf("  %-44s %zu differ from the bands / one call each  %s\n", what.c_str(), diff, diff == 0 ? "ok" : "FAIL");

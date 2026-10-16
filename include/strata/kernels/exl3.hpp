@@ -61,6 +61,14 @@ struct MvJob {
 constexpr int kMaxMvJobs = 8;
 constexpr int kMaxMvCols = 16;   // a job's activations at most
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// The calling thread's launches of mv(), moe_gate_up() and moe_down() read `flag` (a device int) first and do no work
+/// while it is non-zero (glmf::set_skip's, which sets it: a pipelined window's tokens past a wrong draft); nullptr (the
+/// default): no check.  The flag changes only between launches (skip_gate, on the same stream).  (v1.1.8's kernels
+/// before sm_80 do not read it.)
+void set_skip(const int* flag);
+/// How many pieces mv cuts m's inputs into on the current device (0: not covered) - one piece, and every column's
+/// sum is the same whatever columns the job holds (a view's, or the whole matrix's).
+int mv_splits(const Mat& m);
 
 /// Allocates the per-stream scratch of mv / moe / win_experts on the current device (call once per stream before a
 /// graph capture; the first use does it otherwise).

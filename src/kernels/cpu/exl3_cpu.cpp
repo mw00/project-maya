@@ -245,13 +245,16 @@ EXL3_AVX512 void band_avx512_n(const Exl3Part& m, const float* const* xh, int tc
         for (int t = 0; t < 8; ++t) _mm512_storeu_ps(out[i] + t * 16, acc[t][i]);
 }
 
-// rows_avx512_n: slices [ks0, ks1) of EVERY column - a split-K piece - for N activations (xh[i] -> acc[i], n floats
-// each, overwritten).  The tile rows are read in memory order, where a band's tiles are 1 KB runs a whole tile row
-// apart: 40 threads of a 2-socket Xeon 6152 read a K4 expert from DRAM in 0.14 ms in pieces, 0.21 in bands (~90 vs
-// ~60 GB/s), the kernel the same.  A tile's 16 sums per activation live in acc between slices; each row's decode and
-// FMAs are band_avx512's, so acc[i] is the N = 1 call's for xh[i] alone, bit for bit.
+// rows_avx512_n: slices [ks0, ks1) of the tile columns [t0, t1) - a split-K piece, or a run of its columns - for N
+// activations (xh[i] -> acc[i], indexed by column; columns 16 t0 .. 16 t1 overwritten).  The tile rows are read in
+// memory order, where a band's tiles are 1 KB runs a whole tile row apart: 40 threads of a 2-socket Xeon 6152 read a K4
+// expert from DRAM in 0.14 ms in pieces, 0.21 in bands (~90 vs ~60 GB/s), the kernel the same.  A tile's 16 sums per
+// activation live in acc between slices; each row's decode and FMAs are band_avx512's, so acc[i] is the N = 1 call's
+// for xh[i] alone, bit for bit, whatever the columns' run.  The prefetch runs 16 tiles ahead in the job's own order
+// (into the next slice past the run's end, not the next job's columns)
 template <int K, int N>
-EXL3_AVX512 void rows_avx512_n(const Exl3Part& m, const float* const* xh, int ks0, int ks1, float* const* acc) {
+EXL3_AVX512 void rows_avx512_n(const Exl3Part& m, const float* const* xh, int ks0, int ks1, int t0, int t1,
+                               float* const* acc) {
     constexpr int W = 8 * K;
     static constexpr RowTab<K> T = make_rowtab<K>();
     constexpr auto ld_mask = [](int n) -> __mmask16 {
@@ -264,15 +267,17 @@ EXL3_AVX512 void rows_avx512_n(const Exl3Part& m, const float* const* xh, int ks
     const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
     const __m512i low16 = _mm512_set1_epi32(0xffff);
     for (int i = 0; i < N; ++i)
-        for (int c = 0; c < m.n; c += 16) _mm512_storeu_ps(acc[i] + c, _mm512_setzero_ps());
+        for (int c = 16 * t0; c < 16 * t1; c += 16) _mm512_storeu_ps(acc[i] + c, _mm512_setzero_ps());
+    const int span = t1 - t0;
     const uint32_t* row = m.trellis + (size_t) ks0 * row_words;
     for (int ks = ks0; ks < ks1; ++ks, row += row_words) {
         float xk[N][16];
         for (int i = 0; i < N; ++i)
             for (int r = 0; r < 16; ++r) xk[i][r] = xh[i][ks * 16 + r];
-        for (int t = 0; t < ld; ++t) {
+        for (int t = t0; t < t1; ++t) {
             const uint32_t* w = row + (size_t) t * W;
-            for (int l = 0; l < W * 4; l += 64) _mm_prefetch((const char*) (w + 16 * W) + l, _MM_HINT_T0);
+            const uint32_t* pf = t + 16 < t1 || span == ld ? w + 16 * W : row + row_words + (size_t) (t + 16 - span) * W;
+            for (int l = 0; l < W * 4; l += 64) _mm_prefetch((const char*) pf + l, _MM_HINT_T0);
             const __m512i p0 = _mm512_maskz_loadu_epi32(m0, w);
             const __m512i p1 = m1 ? _mm512_maskz_loadu_epi32(m1, w + 16) : _mm512_setzero_si512();
             const __m512i p2 = m2 ? _mm512_maskz_loadu_epi32(m2, w + 32) : _mm512_setzero_si512();
@@ -768,21 +773,24 @@ EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, i
 // tile rows in memory order, a tile's sums in acc between slices; each row's decode and FMAs are band_avx2's, so acc[i]
 // is the band kernel's for its columns and xh[i] alone, bit for bit (and rows_avx512_n's)
 template <int K, int N>
-EXL3_AVX2 void rows_avx2_n(const Exl3Part& m, const float* const* xh, int ks0, int ks1, float* const* acc) {
+EXL3_AVX2 void rows_avx2_n(const Exl3Part& m, const float* const* xh, int ks0, int ks1, int t0, int t1,
+                           float* const* acc) {
     static_assert(kAvx2Tab<K>.ok, "EXL3 tile layout: a half row's words must share a residue class and a shift");
     constexpr int W = 8 * K;
     const int ld = m.n / 16;
     const size_t row_words = (size_t) ld * W;
     const Avx2Consts k = avx2_consts();
     for (int i = 0; i < N; ++i)
-        for (int c = 0; c < m.n; c += 8) _mm256_storeu_ps(acc[i] + c, _mm256_setzero_ps());
+        for (int c = 16 * t0; c < 16 * t1; c += 8) _mm256_storeu_ps(acc[i] + c, _mm256_setzero_ps());
+    const int span = t1 - t0;
     const uint32_t* row = m.trellis + (size_t) ks0 * row_words;
     for (int ks = ks0; ks < ks1; ++ks, row += row_words) {
         const float* xk[N];
         for (int i = 0; i < N; ++i) xk[i] = xh[i] + ks * 16;
-        for (int t = 0; t < ld; ++t) {
+        for (int t = t0; t < t1; ++t) {
             const uint32_t* w = row + (size_t) t * W;
-            for (int l = 0; l < W * 4; l += 64) _mm_prefetch((const char*) (w + 16 * W) + l, _MM_HINT_T0);
+            const uint32_t* pf = t + 16 < t1 || span == ld ? w + 16 * W : row + row_words + (size_t) (t + 16 - span) * W;
+            for (int l = 0; l < W * 4; l += 64) _mm_prefetch((const char*) pf + l, _MM_HINT_T0);
             __m256i C[K];
             avx2_classes<K>(w, C);
             if constexpr (N == 1) {
@@ -1052,37 +1060,39 @@ void band_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int t
     for (int i = 0; i < n; ++i) band_on<K>(tier, m, xh[i], tc0, ks0, ks1, acc[i]);
 }
 
-// a split-K piece for n activations (1..kExl3CpuMaxN); the scalar loop: each column's band_scalar
+// a split-K piece's tile columns [t0, t1) for n activations (1..kExl3CpuMaxN); the scalar loop: each band's
+// band_scalar (t0, t1 multiples of 8 there)
 template <int K>
-void rows_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, float* const* acc) {
+void rows_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, int t0, int t1,
+               float* const* acc) {
 #if defined(EXL3_X86)
     if (tier == 2) {
         switch (n) {
-            case 1: rows_avx512_n<K, 1>(m, xh, ks0, ks1, acc); return;
-            case 2: rows_avx512_n<K, 2>(m, xh, ks0, ks1, acc); return;
-            case 3: rows_avx512_n<K, 3>(m, xh, ks0, ks1, acc); return;
-            case 4: rows_avx512_n<K, 4>(m, xh, ks0, ks1, acc); return;
-            case 5: rows_avx512_n<K, 5>(m, xh, ks0, ks1, acc); return;
-            case 6: rows_avx512_n<K, 6>(m, xh, ks0, ks1, acc); return;
-            case 7: rows_avx512_n<K, 7>(m, xh, ks0, ks1, acc); return;
-            default: rows_avx512_n<K, 8>(m, xh, ks0, ks1, acc); return;
+            case 1: rows_avx512_n<K, 1>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 2: rows_avx512_n<K, 2>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 3: rows_avx512_n<K, 3>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 4: rows_avx512_n<K, 4>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 5: rows_avx512_n<K, 5>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 6: rows_avx512_n<K, 6>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 7: rows_avx512_n<K, 7>(m, xh, ks0, ks1, t0, t1, acc); return;
+            default: rows_avx512_n<K, 8>(m, xh, ks0, ks1, t0, t1, acc); return;
         }
     }
     if (tier == 1) {
         switch (n) {
-            case 1: rows_avx2_n<K, 1>(m, xh, ks0, ks1, acc); return;
-            case 2: rows_avx2_n<K, 2>(m, xh, ks0, ks1, acc); return;
-            case 3: rows_avx2_n<K, 3>(m, xh, ks0, ks1, acc); return;
-            case 4: rows_avx2_n<K, 4>(m, xh, ks0, ks1, acc); return;
-            case 5: rows_avx2_n<K, 5>(m, xh, ks0, ks1, acc); return;
-            case 6: rows_avx2_n<K, 6>(m, xh, ks0, ks1, acc); return;
-            case 7: rows_avx2_n<K, 7>(m, xh, ks0, ks1, acc); return;
-            default: rows_avx2_n<K, 8>(m, xh, ks0, ks1, acc); return;
+            case 1: rows_avx2_n<K, 1>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 2: rows_avx2_n<K, 2>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 3: rows_avx2_n<K, 3>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 4: rows_avx2_n<K, 4>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 5: rows_avx2_n<K, 5>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 6: rows_avx2_n<K, 6>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 7: rows_avx2_n<K, 7>(m, xh, ks0, ks1, t0, t1, acc); return;
+            default: rows_avx2_n<K, 8>(m, xh, ks0, ks1, t0, t1, acc); return;
         }
     }
 #endif
     for (int i = 0; i < n; ++i)
-        for (int c0 = 0; c0 < m.n; c0 += 128) band_scalar<K>(m, xh[i], c0 / 16, ks0, ks1, acc[i] + c0);
+        for (int c0 = 16 * t0; c0 < 16 * t1; c0 += 128) band_scalar<K>(m, xh[i], c0 / 16, ks0, ks1, acc[i] + c0);
 }
 
 void band_acc_tier(int tier, const Exl3Part& m, const float* xh, int c0, int ks0, int ks1, float* acc) {
@@ -1166,24 +1176,30 @@ bool exl3_cpu_band_acc_on(int tier, const Exl3Part& m, const float* const* xh, i
     return true;
 }
 
-void exl3_cpu_rows_acc_n(const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, float* const* acc) {
+void exl3_cpu_rows_acc_cols_n(const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, int c0, int c1,
+                              float* const* acc) {
     const int tier = exl3_cpu_tier();
+    const int t0 = c0 / 16, t1 = c1 / 16;
     for (int i0 = 0; i0 < n; i0 += kExl3CpuMaxN) {
         const int c = std::min(kExl3CpuMaxN, n - i0);
         switch (m.K) {
-            case 1: rows_on_n<1>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
-            case 2: rows_on_n<2>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
-            case 3: rows_on_n<3>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
-            case 4: rows_on_n<4>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
-            case 5: rows_on_n<5>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
-            case 6: rows_on_n<6>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
-            case 7: rows_on_n<7>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
-            case 8: rows_on_n<8>(tier, m, xh + i0, c, ks0, ks1, acc + i0); break;
+            case 1: rows_on_n<1>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
+            case 2: rows_on_n<2>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
+            case 3: rows_on_n<3>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
+            case 4: rows_on_n<4>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
+            case 5: rows_on_n<5>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
+            case 6: rows_on_n<6>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
+            case 7: rows_on_n<7>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
+            case 8: rows_on_n<8>(tier, m, xh + i0, c, ks0, ks1, t0, t1, acc + i0); break;
             default:
                 for (int i = 0; i < c; ++i)
-                    for (int j = 0; j < m.n; ++j) acc[i0 + i][j] = 0.0f;
+                    for (int j = c0; j < c1; ++j) acc[i0 + i][j] = 0.0f;
         }
     }
+}
+
+void exl3_cpu_rows_acc_n(const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, float* const* acc) {
+    exl3_cpu_rows_acc_cols_n(m, xh, n, ks0, ks1, 0, m.n, acc);
 }
 
 size_t exl3_cpu_gemm_scratch() { return (size_t) kGemmK * 128; }

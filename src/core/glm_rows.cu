@@ -370,12 +370,14 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
                 const int64_t p = rw[i].p;
                 const int pool_done = (int) ((p + 1) / g.idx_kpool);
                 const float* pooled = rw[i].state + (*rw[i].dsa_pool)[(size_t) il];
-                if (pool_done > 0)
+                const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
+                if (pool_done > 0 && !all)
                     gf::dsa_score(rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i), pooled,
                                   rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, F->score, s);
                 const int top_pools = std::min(g.top_pools_max(), pool_done);
                 const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
-                gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
+                if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, F->cells, s);
+                else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
                 uint16_t* const lat = (uint16_t*) (rw[i].state + (*rw[i].dsa_lat)[(size_t) il]);
                 const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
                 gf::mla(rows(S->q, (int64_t) g.n_head * g.qk_nope, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,

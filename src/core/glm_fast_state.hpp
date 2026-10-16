@@ -117,13 +117,19 @@ inline void pin_thread(std::thread::native_handle_type h, const std::vector<int>
 // when all finished.  Jobs are claimed lock-free; a worker spins ~300 us for the next batch before it sleeps,
 // because one miss request runs its batches back to back (reads, gate/up, down) and a futex wake per batch
 // was most of the CPU path's latency.
+// `concurrent`: several callers' batches at once (a pool a split's parts share - the parts' CPU-lane experts):
+// each run() takes one of kSlots batch slots, works its own batch and waits for it, and the workers take jobs from
+// the batch of the highest priority (set_thread_prio: the caller thread's; ties to the lower slot) a job at a time.
+// One batch at a time (the default) held a part's route behind another's whole batch - a lone expert's down
+// pieces leave most threads idle, and those threads now take the other part's jobs.
 class Workers {
 public:
     // spin_us: how long an idle worker spins for the next batch before it sleeps; cpus: the CPUs the workers run on
     // (empty: any)
-    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}) : spin_us_(spin_us), active_(n + 1) {
+    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false)
+        : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent) {
         for (int i = 0; i < n; ++i) {
-            th_.emplace_back([this, i] { loop(i); });
+            th_.emplace_back([this, i] { concurrent_ ? loop_c(i) : loop(i); });
             pin_thread(th_.back().native_handle(), cpus);
         }
     }
@@ -137,6 +143,10 @@ public:
     }
     void run(int n, const std::function<void(int)>& fn) {
         if (n <= 0) return;
+        if (concurrent_) {
+            run_c(n, fn);
+            return;
+        }
         std::lock_guard<std::mutex> one(run_mu_);   // a pool a split's parts share: one batch at a time
         const uint64_t g = (gen_.load(std::memory_order_relaxed) + 1) & 0xffffffffu;
         // the ticket packs (generation, next index): a straggler of an older batch can never claim (or burn)
@@ -162,8 +172,14 @@ public:
     // a batch's job count should be active() for one job a thread
     void set_active(int n) { active_.store(std::max(1, std::min(n, size())), std::memory_order_release); }
     int active() const { return active_.load(std::memory_order_acquire); }
+    // the priority of this thread's batches on a concurrent pool (higher first; default 0)
+    static void set_thread_prio(int p) { tl_prio() = p; }
 
 private:
+    static int& tl_prio() {
+        static thread_local int p = 0;
+        return p;
+    }
     void work(uint64_t g) {
         for (;;) {
             uint64_t t = ticket_.load(std::memory_order_acquire);
@@ -201,6 +217,96 @@ private:
             if (id + 1 < active_.load(std::memory_order_acquire)) work(seen);
         }
     }
+    // ---- the concurrent pool: a slot's ticket packs (generation, next index) as above, its own generation
+    static constexpr int kSlots = 16;
+    static constexpr uint64_t kClosed = 0x7fffffffu;
+    struct Slot {
+        std::atomic<uint64_t> ticket{kClosed};
+        std::atomic<int> total{0}, done{0}, prio{0};
+        std::atomic<const std::function<void(int)>*> fn{nullptr};
+        std::atomic<bool> busy{false};
+        uint64_t gen = 0;   // (its owner's alone)
+    };
+    // one job of slot s's batch g (false: none left to claim)
+    bool claim(Slot& S, uint64_t g) {
+        for (;;) {
+            uint64_t t = S.ticket.load(std::memory_order_acquire);
+            if ((t >> 32) != g || (t & 0xffffffffu) == kClosed) return false;
+            if ((int) (t & 0xffffffffu) >= S.total.load(std::memory_order_acquire)) return false;
+            if (!S.ticket.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
+            (*S.fn.load(std::memory_order_acquire))((int) (t & 0xffffffffu));
+            S.done.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        }
+    }
+    void run_c(int n, const std::function<void(int)>& fn) {
+        int s = 0;
+        for (bool got = false; !got;)
+            for (s = 0; s < kSlots && !got; ++s) {
+                bool f = false;
+                got = slots_[s].busy.compare_exchange_strong(f, true, std::memory_order_acq_rel);
+                if (got) break;
+            }
+        Slot& S = slots_[s];
+        const uint64_t g = ++S.gen & 0xffffffffu;
+        S.ticket.store((g << 32) | kClosed, std::memory_order_seq_cst);
+        S.fn.store(&fn, std::memory_order_relaxed);
+        S.prio.store(tl_prio(), std::memory_order_relaxed);
+        S.total.store(n, std::memory_order_release);
+        S.done.store(0, std::memory_order_relaxed);
+        S.ticket.store(g << 32, std::memory_order_seq_cst);
+        epoch_.fetch_add(1, std::memory_order_seq_cst);
+        if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            cv_.notify_all();
+        }
+        while (claim(S, g)) {
+        }
+        while (S.done.load(std::memory_order_acquire) < n) cpu_relax();
+        S.ticket.store((g << 32) | kClosed, std::memory_order_seq_cst);
+        S.busy.store(false, std::memory_order_release);
+    }
+    // the open slot of the highest priority with a job left (-1: none), its generation in g
+    int pick(uint64_t& g) {
+        int best = -1, bp = 0;
+        for (int s = 0; s < kSlots; ++s) {
+            Slot& S = slots_[s];
+            const uint64_t t = S.ticket.load(std::memory_order_acquire);
+            if ((t & 0xffffffffu) == kClosed || (int) (t & 0xffffffffu) >= S.total.load(std::memory_order_acquire))
+                continue;
+            const int p = S.prio.load(std::memory_order_relaxed);
+            if (best < 0 || p > bp) best = s, bp = p, g = t >> 32;
+        }
+        return best;
+    }
+    void loop_c(int id) {
+        for (;;) {
+            const auto t0 = std::chrono::steady_clock::now();
+            int spins = 0;
+            for (;;) {
+                if (quit_.load(std::memory_order_relaxed)) return;
+                const uint64_t e = epoch_.load(std::memory_order_acquire);
+                if (id + 1 < active_.load(std::memory_order_acquire)) {
+                    uint64_t g = 0;
+                    const int s = pick(g);
+                    if (s >= 0) {
+                        claim(slots_[s], g);
+                        break;
+                    }
+                }
+                cpu_relax();
+                const bool idle = id + 1 >= active_.load(std::memory_order_acquire);
+                if (idle || ((++spins & 255) == 0 &&
+                             std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_))) {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    sleeping_.fetch_add(1, std::memory_order_seq_cst);
+                    cv_.wait(lk, [&] { return quit_.load() || epoch_.load(std::memory_order_seq_cst) != e; });
+                    sleeping_.fetch_sub(1);
+                    break;
+                }
+            }
+        }
+    }
     int spin_us_;
     std::vector<std::thread> th_;
     std::mutex mu_, run_mu_;
@@ -209,6 +315,9 @@ private:
     std::atomic<int> total_{0}, done_{0}, sleeping_{0}, active_;
     std::atomic<uint64_t> ticket_{0}, gen_{0};
     std::atomic<bool> quit_{false};
+    const bool concurrent_;
+    Slot slots_[kSlots];
+    std::atomic<uint64_t> epoch_{0};
 };
 
 // [off, off + len) of a shard into dst (O_DIRECT when the shard has a direct fd; see glm_fast_path.cu)
@@ -558,8 +667,8 @@ struct Glm5Model::FastState {
         float* emb_h = nullptr;             // pinned, tmax x n_embd
         float* hop_h = nullptr;             // pinned, tmax x hc x n_embd: the rows to the next part
         cudaEvent_t ev_hop = nullptr;
-        cudaEvent_t ev_tok[16] = {};        // window_pipe's hop of each token (its threads record and wait out of turn)
-        cudaEvent_t ev_pick[16] = {};       // ... and (the last part) each token's pick copied out
+        cudaEvent_t ev_tok[32] = {};        // window_pipe's hop of each token slot (its threads record and wait out of
+        cudaEvent_t ev_pick[32] = {};       // turn) ... and (the last part) each token's pick copied out (kPipeSlots)
         int bank = 0;                       // ... the slots' bank this window (they alternate: kPipeMax a bank)
         bool pick_sampled = false;          // ... the picks drawn with pick_sp (row t at its counter + t), not argmax
         // ... the tokens past the first wrong draft skip their heavy kernels: the head part's pinned word per bank
@@ -603,6 +712,7 @@ struct Glm5Model::FastState {
         gf::CpuAnswer* ans_h[16] = {};      // host-mapped answer slots for tokens 1.. (token 0: cpu_ans_h)
         void* ans_d[16] = {};
         bool per_token = false;             // the batched MoE off for this pass (the redo after a scratch clash)
+        bool piped = false;                 // this window is a pipelined one (win_pipe_begin), not window()'s
         int pipe_t = -1;                    // window_pipe: the token whose layers are being enqueued (its KDA inputs
                                             // to kin row pipe_t); -1 otherwise
         void mark(const char* nm, cudaStream_t st) {

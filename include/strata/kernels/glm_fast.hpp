@@ -158,6 +158,12 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s);
+/// While a token's every pool is in its selection (n_vis <= the top pools, a context of at most idx_top_k positions):
+/// dsa_select's cells in position order - no scores needed (the indexer's query and dsa_score are left out).  The
+/// decode's paths all take it alike (dsa_select_all_on; STRATA_GLM_DSA_ALL=0: off), so a window's token is the
+/// token path's bit for bit
+bool dsa_select_all_on();
+void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s);
 /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
 /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
 /// lat_q8: the cache holds INT8 latent records (see lat8_rec_bytes), else FP16 rows of kv_lora.
@@ -356,5 +362,10 @@ void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_em
 /// argmax over n floats -> *out (device int).  Ties: lowest index.  map: an index i >= map_from is written as
 /// map[i - map_from] (a draft head's gathered rows -> their token ids).
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map = nullptr, int map_from = 0);
+/// argmax over x[0..n) with its value: out[0] the index (0x7fffffff when nothing is finite), out[1] the value's bits.
+void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
+/// The pick of a row split in two at c0 from both halves' argmax_pair (b's index relative to c0): argmax's for the
+/// whole row, ties to the lower index.
+void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s);
 
 }  // namespace strata::kernels::glmf
