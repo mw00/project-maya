@@ -132,6 +132,10 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
   streamed as the model writes them, and a long prompt's reading progress too when a request asks for it
   (`"return_progress": true`). A web page served from another address can call it too once you allow its
   address (`"cors_origins"`, [docs/SETUP.md](docs/SETUP.md#web-pages-on-another-address)).
+- **Responses API:** `/v1/responses` supports text/image conversations, streaming,
+  function tool calls, schema-validated output, background tasks with cancellation/replay,
+  and optional shared in-memory history (`store:true`, `previous_response_id`).
+  Responses are not stored by default. Options and limits: [docs/RESPONSES.md](docs/RESPONSES.md).
 - **Thinking:** Off, Low, High (the default) or Max, in Settings or per request.
 - **Pictures:** attach one in the chat, or send image parts through either API.
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.

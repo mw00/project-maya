@@ -30,7 +30,7 @@ jobs:
       - name: Python packages
         run: |
           python -m venv "$RUNNER_TEMP/venv"
-          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil 'jsonschema>=4.18,<5'
       - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
         run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
       - name: Server tests

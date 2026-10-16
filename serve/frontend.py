@@ -410,6 +410,7 @@ class Event:
     kind: str                     # "reasoning" | "content" | "tool_call"
     text: str = ""
     call: ToolCall | None = None
+    complete: bool = True          # false when the model never closed the call's syntax
 
 
 THINK_END = "</think>"
@@ -498,7 +499,8 @@ class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 strict_tools: bool = False, single_tool: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
@@ -508,6 +510,7 @@ class OutputParser:
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
         # nothing until the call is complete, which for a large file write can be many minutes.
         self.stream_tools = stream_tools
+        self.strict_tools, self.single_tool, self.finished = strict_tools, single_tool, False
         # the answer text that has gone out, followed to tell a call from a quoted one (Strata #1058): the open code
         # fence, the current line, and the backticks of the current paragraph
         self.fence, self.line, self.ticks = "", "", 0
@@ -695,6 +698,8 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        if self.finished:
+            return []
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -746,11 +751,18 @@ class OutputParser:
                 self.state = "call"
             else:
                 i = self.buf.find(CALL_END)
+                complete = True
                 if self.stream_tools:
                     if i >= 0:
                         whole, self.buf = self.buf, self.buf[:i]     # scan only the body
                         out += self._scan()
-                        out += self._close_scan()
+                        if self.strict_tools and self.scall is not None:
+                            if self.glm:
+                                complete = self.ss == "between" and not self.buf[self.sp:].strip()
+                            else:
+                                complete = self.ss == "done" and not self.buf[self.sp:].strip()
+                        if complete or not self.strict_tools:
+                            out += self._close_scan()
                         self.buf = whole
                     else:
                         out += self._scan()
@@ -761,21 +773,31 @@ class OutputParser:
                 call = parse_tool_call(body, self.schemas.get(call_name(body)))
                 if self.scall is not None:
                     call.id = self.scall.id
-                out.append(Event("tool_call", call=call))
+                out.append(Event("tool_call", call=call, complete=complete))
                 self._reset_scan()
                 self.state, self.lead = "content", True
+                if self.single_tool and complete:
+                    self.buf, self.finished = "", True
+                    return out
 
     def finish(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
         out = []
+        if self.finished:
+            return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
-            out += self._close_scan()
-            out.append(Event("tool_call", call=self.scall))
+            if not self.strict_tools:
+                out += self._close_scan()
+            out.append(Event("tool_call", call=self.scall, complete=not self.strict_tools))
             self.buf = ""
             self._reset_scan()
             return out
         if self.buf:
+            if self.strict_tools and self.state == "call":
+                out.append(Event("tool_incomplete", complete=False))
+                self.buf = ""
+                return out
             kind = {"reasoning": "reasoning", "content": "content"}.get(self.state, "content")
             text = self.buf if self.state != "call" else CALL_START + self.buf
             out.append(Event(kind, text))
