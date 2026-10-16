@@ -3,7 +3,7 @@
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
     python -m serve.server --engine strata --config strata.json --port 8080   (the real engine, resident)
 
-Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
+Endpoints: POST /v1/chat/completions and /v1/responses (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
@@ -53,6 +53,11 @@ from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthr
                             effort_kwargs, effort_level, images_of, literal_tags, mark_literals,
                             openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
+from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
+                             new_response, response_collect, response_events)
+from serve.response_config import ENV_KEYS as RESPONSE_ENV_KEYS, limits_from_env  # noqa: E402
+from serve.response_jobs import BackgroundJobs, JobError  # noqa: E402
+from serve.response_store import StoreBusy  # noqa: E402
 from serve.update import Updater  # noqa: E402
 
 try:                        # Project Maya's release (the dashboard's About; the engine's INFO carries none)
@@ -1299,6 +1304,9 @@ class Service:
         self.stopping = False            # the server is ending: a request still queued is refused, not started
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
+        self.response_limits = limits_from_env()
+        self.responses = ResponseStore.from_limits(self.response_limits)
+        self.response_jobs = BackgroundJobs(self.responses, self.response_limits)
         # pages on OTHER origins allowed to call /v1/* from a browser (CORS; the config's "cors_origins"): exact origins
         # like "http://127.0.0.1:8090", or "*" for every page.  Empty = no CORS headers at all.
         self.cors_origins: list[str] = []
@@ -1404,7 +1412,7 @@ class Service:
 
     def close_for_restart(self):
         """Before the server ends for an update: the engine, the pictures encoder and the MCP servers stop first."""
-        for part in (self.engine, self.vision, self.mcp):
+        for part in (self.response_jobs, self.engine, self.vision, self.mcp):
             try:
                 if part is not None and hasattr(part, "close"):
                     part.close()
@@ -1684,6 +1692,11 @@ class Service:
         ]
         rows += [(f"maya:engine_{k}", "gauge", h, stat[k]) for k, h in self.PROM_STAT.items()
                  if isinstance(stat.get(k), (int, float)) and not isinstance(stat.get(k), bool)]
+        for category, values in (("cache", self.responses.stats()), ("jobs", self.response_jobs.stats())):
+            gauges = {"entries", "blocks", "bytes", "inflight_bytes", "peak_inflight_bytes", "max_entries",
+                      "max_bytes", "ttl_s", "records", "running", "queued", "event_bytes", "readers"}
+            rows += [(f"maya:responses_{category}_{key}", "gauge" if key in gauges else "counter",
+                      f"Responses {category} {key}", value) for key, value in values.items()]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
                        for name, kind, help_, value in rows)
 
@@ -1711,7 +1724,10 @@ class Service:
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
             "concurrency": {"serving": places, "requested": places},   # more than that wait their turn
-            "dialects": ["/v1/chat/completions", "/v1/messages"],
+            "dialects": ["/v1/chat/completions", "/v1/responses", "/v1/messages"],
+            "responses": {"cache": self.responses.stats(), "jobs": self.response_jobs.stats(),
+                          "structured_outputs": {"mode": "validate-before-publish", "schema_draft": "2020-12",
+                                                 "constrained_decoding": False}},
             "vision": {"enabled": images, "available": images, "error": None},
             "activity": {"requests": totals["requests"] + max(int(busy), active),
                          "in_flight": max(int(busy), active) + int(s.get("queued") or 0),
@@ -1725,7 +1741,7 @@ class Service:
                 "ram": {"used_gib": scaled(hw.get("ram_used"), 2 ** 30, 1),
                         "total_gib": scaled(hw.get("ram_total"), 2 ** 30, 1)} if hw.get("ram_total") else None}}
 
-    def prepare(self, messages, tools, kwargs, max_new=None):
+    def prepare(self, messages, tools, kwargs, max_new=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  A tool_choice that requires a call ("_force_tool": "" any, else the tool's name)
         starts the answer with the call's opening, thinking off; that text goes back in kwargs["_prefill"] for run()."""
@@ -1758,8 +1774,17 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self.fifo, self.vision.active():
-                encoded = [self.vision.encode(src) for src in images]
+            with self._turn([False, False], cancel, units=None):
+                if cancel is not None and cancel.is_set():
+                    raise ValueError("image preparation was cancelled")
+                with self.vision.active():
+                    encoded = []
+                    for src in images:
+                        if cancel is not None and cancel.is_set():
+                            raise ValueError("image preparation was cancelled")
+                        encoded.append(self.vision.encode(src))
+                if cancel is not None and cancel.is_set():
+                    raise ValueError("image preparation was cancelled")
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -1846,16 +1871,26 @@ class Service:
         return now
 
     @contextlib.contextmanager
-    def _turn(self, hold):
+    def _turn(self, hold, cancel=None, units=1):
         """The engine's turn for one request: the FIFO, given back at the end unless a fair slice already did."""
-        self.fifo.acquire(units=1)
-        hold[0] = True
+        place = None
+        if cancel is None:
+            self.fifo.acquire(units=units)
+            hold[0] = True
+        else:
+            place = self.fifo.enqueue(units=units)
+            while not cancel.is_set():
+                if self.fifo.wait_turn(place, timeout=0.05):
+                    hold[0] = True
+                    break
         try:
             yield
         finally:
+            if place is not None:
+                self.fifo.leave(place)
             if hold[0]:
                 hold[0] = False
-                self.fifo.release(units=1)
+                self.fifo.release(units=units)
 
     def _sliced(self, ids, max_new, sampling, cancel, emb, hold) -> Iterator[int | None]:
         """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
@@ -1914,7 +1949,9 @@ class Service:
             print(f"[maya] fair slice: {len(produced)} tokens written, the engine goes to the next request "
                   f"({waiting} waiting); this one continues after it", flush=True)
             try:
-                while not self.fifo.wait_turn(place, timeout=10):
+                while not self.fifo.wait_turn(place, timeout=0.1):
+                    if cancel.is_set() or self.stopping:
+                        return
                     yield None                          # keeps the client's watchdog calm while queued again
                 hold[0] = True
             finally:
@@ -1957,10 +1994,14 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        responses = (sampling or {}).get("_responses") is True
+        single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                              strict_tools=responses, single_tool=single_tool)
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
+        reasoning_tokens = 0
         held = ""                                       # text that may be the start of a stop marker (stop_texts)
         # the client's own stop strings (OpenAI "stop", Anthropic "stop_sequences"): the answer ends before one.  They
         # apply to the answer, not inside the reasoning; the model's own end-of-turn markers apply everywhere
@@ -1977,9 +2018,12 @@ class Service:
             self.status["queued"] += 1
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
         try:
-            with self._turn(hold):
+            with self._turn(hold, cancel):
                 with self.status_lock:
                     self.status["queued"] -= 1
+                if cancel.is_set():
+                    yield "done", {"finish": "cancel", "completion_tokens": 0}
+                    return
                 if self.stopping:
                     raise ValueError("the server is stopping: send the request again once the model is back")
                 if self.vision is not None and self.vision.owed:   # memory an encode borrowed, not back yet
@@ -2055,6 +2099,8 @@ class Service:
                             finish = "stop"
                             raw_ids.append(t)
                             break
+                        if parser.state == "reasoning":
+                            reasoning_tokens += 1
                         raw_ids.append(t)
                         text, stopped = detok.push(t), False
                         stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
@@ -2074,6 +2120,9 @@ class Service:
                         last_print = self._progress(last_print)
                         for ev in evs:
                             yield "event", ev
+                            if single_tool and ev.kind == "tool_call" and ev.complete:
+                                stopped = True
+                                break
                         if stopped:
                             finish = "stop"
                             break
@@ -2163,7 +2212,8 @@ class Service:
                 self.status["busy"] = self.active > 0
         for ev in parser.finish():
             yield "event", ev
-        yield "done", {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
+        yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
+                       "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
 
 
@@ -2735,7 +2785,7 @@ def make_handler(svc: Service):
             allow = self._cors_allow()
             self.send_response(204 if allow else 403)
             if allow:
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
                 asked = self.headers.get("Access-Control-Request-Headers")
                 self.send_header("Access-Control-Allow-Headers", asked or "Content-Type, Authorization, x-api-key")
                 self.send_header("Access-Control-Max-Age", "600")
@@ -2752,8 +2802,119 @@ def make_handler(svc: Service):
             self._json(401, {"error": {"type": "authentication_error", "message": "missing or wrong API key"}})
             return False
 
+        def _response_owner(self):
+            if not svc.api_key:
+                return "public"
+            auth = self.headers.get("Authorization", "")
+            given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
+            return hashlib.sha256(given.encode()).hexdigest()
+
+        def _response_lookup(self, owner, response_id):
+            try:
+                return svc.response_jobs.get(owner, response_id)
+            except KeyError:
+                return svc.responses.get(owner, response_id)
+
+        def _background_stream(self, owner, response_id, after=-1):
+            try:
+                svc.response_jobs.check_cursor(owner, response_id, after)
+            except KeyError:
+                raise JobError(409, "background event history is no longer retained") from None
+            with svc.response_jobs.reader(owner, response_id, after) as events:
+                self._write_background_stream(events, after)
+
+        def _write_background_stream(self, events, after):
+            self.connection.settimeout(svc.response_limits["STREAM_TIMEOUT_S"])
+            self._sse()
+            try:
+                for item in events:
+                    if item is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        name, payload = item
+                        after = payload["sequence_number"]
+                        self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                         json.dumps(payload, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+            except (JobError, KeyError) as exc:
+                payload = {"type": "error", "code": "event_history_unavailable", "param": None,
+                           "message": str(exc), "sequence_number": after + 1}
+                try:
+                    self.wfile.write(b"event: error\ndata: " + json.dumps(payload).encode() + b"\n\n")
+                except OSError:
+                    pass
+            except OSError:
+                pass
+            finally:
+                events.close()
+
+        def _response_resource(self, delete=False):
+            if not self._authorized():
+                return
+            parts = self.path.split("?")[0].rstrip("/").removeprefix("/v1/responses/").split("/")
+            query = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if len(parts) > 2 or (len(parts) == 2 and (parts[1] != "input_items" or delete)):
+                return self._json(404, {"error": {"message": "not found"}})
+            try:
+                owner = self._response_owner()
+                if delete:
+                    if query:
+                        raise ValueError("response deletion does not support query options")
+                    removed = False
+                    for store in (svc.response_jobs, svc.responses):
+                        try:
+                            store.delete(owner, parts[0])
+                            removed = True
+                        except KeyError:
+                            pass
+                    if not removed:
+                        raise KeyError(parts[0])
+                    return self._json(200, {"id": parts[0], "object": "response.deleted", "deleted": True})
+                stored = self._response_lookup(owner, parts[0])
+                if len(parts) == 1 and query:
+                    if (set(query) - {"stream", "starting_after"} or query.get("stream") != ["true"] or
+                            any(len(value) != 1 for value in query.values())):
+                        raise ValueError("retrieve accepts stream=true and optional starting_after")
+                    after = int(query["starting_after"][0]) if "starting_after" in query else -1
+                    if "starting_after" in query and after < 0:
+                        raise ValueError("starting_after must be nonnegative")
+                    return self._background_stream(owner, parts[0], after)
+                result = input_page(stored["input"], query) if len(parts) == 2 else stored["response"]
+                self._json(200, result)
+            except KeyError:
+                self._json(404, {"error": {"type": "invalid_request_error", "message": "stored response not found"}})
+            except (JobError, StoreBusy) as exc:
+                self._json(getattr(exc, "status", 503), {"error": {"type": "server_error", "message": str(exc)}})
+            except ValueError as exc:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(exc)}})
+
+        def _response_cancel(self, path):
+            parts = path.removeprefix("/v1/responses/").split("/")
+            if len(parts) != 2 or parts[1] != "cancel" or "?" in self.path:
+                return self._json(404, {"error": {"message": "not found"}})
+            owner = self._response_owner()
+            try:
+                out = svc.response_jobs.cancel(owner, parts[0])
+            except KeyError:
+                try:
+                    out = self._response_lookup(owner, parts[0])["response"]
+                except KeyError:
+                    return self._json(404, {"error": {"message": "background response not found"}})
+                if not out.get("background"):
+                    raise ValueError("only background responses can be cancelled")
+            self._json(200, out)
+
+        def do_DELETE(self):
+            if self.path.split("?")[0].startswith("/v1/responses/"):
+                self._response_resource(delete=True)
+            elif self._authorized():
+                self._json(404, {"error": {"message": "not found"}})
+
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/responses/"):
+                self._response_resource()
+                return
             if path.startswith("/fonts/"):
                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
                 name = path[len("/fonts/"):]
@@ -2893,6 +3054,9 @@ def make_handler(svc: Service):
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
+                if path.startswith("/v1/responses/") and path.endswith("/cancel"):
+                    self._response_cancel(path)
+                    return
                 if path == "/settings":
                     self._settings()
                     return
@@ -2911,7 +3075,7 @@ def make_handler(svc: Service):
                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
                     self._json(200, svc.count_tokens(req))
                     return
-                if path in ("/v1/chat/completions", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
+                if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
                     why = ("Project Maya is updating and starts again in a few minutes" if svc.updater.busy() else
                            "the model is reloading with a new context size; try again in a minute")
@@ -2925,12 +3089,16 @@ def make_handler(svc: Service):
                     return
                 if path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/v1/responses":
+                    self._responses(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except BadBody as e:
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except (JobError, StoreBusy) as e:
+                self._json(getattr(e, "status", 503), {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
             except EngineDied as e:                          # before the answer started (not streamed)
@@ -3026,6 +3194,91 @@ def make_handler(svc: Service):
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
+
+        def _responses(self, req):
+            owner = self._response_owner()
+            try:
+                previous = req.get("previous_response_id")
+                if previous is not None:
+                    if not isinstance(previous, str) or not previous:
+                        raise ValueError("previous_response_id must be a nonempty string")
+                    stored = self._response_lookup(owner, previous)
+                    if stored["response"]["status"] not in ("completed", "incomplete"):
+                        raise JobError(409, "previous response is not a completed or incomplete generation")
+                    added = req.get("input", [])
+                    if isinstance(added, str):
+                        added = [{"role": "user", "content": added}]
+                    if not isinstance(added, list):
+                        raise ValueError("input must be a string or array of input items")
+                    req = {**req, "input": stored["input"] + stored["response"]["output"] + added}
+            except KeyError:
+                return self._json(404, {"error": {"type": "invalid_request_error",
+                                                 "message": "previous_response_id: stored response not found"}})
+            sampling = normalize_request(req)
+            validation = sampling.pop("_response_validation")
+            history = input_items(req["input"]) if req.get("store") else None
+            sampling = svc.with_shared(sampling, "openai")
+            sampling["_api"] = "openai"
+            sampling["_responses"] = True
+            svc.check_request(sampling)
+            if req.get("background"):
+                initial = new_response(svc.model, req, status="queued")
+                work = lambda cancel, rid: self._response_work(req, sampling, history, validation, owner, cancel, rid, False)
+                svc.response_jobs.store = svc.responses
+                out = svc.response_jobs.submit(owner, initial, history, work)
+                if req.get("stream"):
+                    return self._background_stream(owner, out["id"])
+                return self._json(200, out)
+            cancel = threading.Event()
+            events = self._response_work(req, sampling, history, validation, owner, cancel)
+            try:
+                if not req.get("stream"):
+                    out = response_collect(events)
+                    return self._json(500 if out["status"] == "failed" else 200, out)
+                first = next(events)
+                self._sse()
+                for item in itertools.chain([first], events):
+                    if item is None:
+                        self.wfile.write(b": keep-alive\n\n")
+                    else:
+                        name, data = item
+                        self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                         json.dumps(data, ensure_ascii=False).encode() + b"\n\n")
+                    self.wfile.flush()
+            except OSError:
+                cancel.set()
+                if not self.answer_started:
+                    self._json(500, {"error": {"type": "server_error", "message": "could not prepare the response"}})
+            finally:
+                events.close()
+
+        def _response_work(self, req, sampling, history, validation, owner, cancel, response_id=None, persist=True):
+            sampling = dict(sampling)
+            # Shared thinking defaults must be resolved by the same normalizer as request values.
+            messages, tools, kw = openai_to_messages(sampling)
+            max_new = int(sampling.get("max_completion_tokens") or sampling.get("max_tokens") or 0)
+            events = None
+            svc.embeddings.path = None
+            try:
+                if cancel.is_set():
+                    raise ValueError("generation was cancelled before preparation")
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, cancel=cancel)
+                if kw.get("_prefill"):
+                    sampling["_prefill"] = kw["_prefill"]
+                effective = {**svc.sampling_defaults, **svc.shared, **sampling}
+                config = {**req, **{k: effective[k] for k in ("temperature", "top_p") if k in effective}}
+                run = svc.run(ids, thinking, tools, max_new, sampling, cancel)
+                save = (lambda out: svc.responses.put(owner, out, history)) if req.get("store") and persist else None
+                events = response_events(svc.model, config, run, len(ids), persist=save, response_id=response_id,
+                                         validation=validation, cancel=cancel)
+                yield from events
+            finally:
+                if events is not None:
+                    events.close()
+                # A disconnect before the generator starts, or failed preparation, cannot run Service.run's cleanup.
+                emb = getattr(svc.embeddings, "path", None)
+                if emb:
+                    Path(emb).unlink(missing_ok=True)
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
@@ -3173,12 +3426,20 @@ class Server(ThreadingHTTPServer):
     # (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = _backlog()
 
+    def server_close(self):
+        service = getattr(self, "response_service", None)
+        try:
+            if service is not None:
+                service.response_jobs.close()
+        finally:
+            super().server_close()
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
 
 
-SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S")
+SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_HTTP_BACKLOG", "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S") + RESPONSE_ENV_KEYS
 
 
 def apply_server_env(cfg: dict) -> None:
@@ -3235,6 +3496,7 @@ def lan_addresses() -> list[str]:
 def serve(svc: Service, host="127.0.0.1", port=8095) -> ThreadingHTTPServer:
     svc.start_telemetry()
     httpd = Server((host, port), make_handler(svc))
+    httpd.response_service = svc
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 
@@ -3506,7 +3768,7 @@ def main() -> int:
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
-    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
+    print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, /v1/responses, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)

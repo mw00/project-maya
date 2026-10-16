@@ -3,6 +3,11 @@
 Everything on this page is optional: the engine sizes itself for the PC it runs on. Back to the
 [README](../README.md).
 
+Responses API cache, background queue, event/reader limits and owner quotas are
+server settings under `STRATA_GLM_RESPONSES_*`, with defaults and units in
+[Responses settings](RESPONSES.md#settings-and-metrics). They can be set in the same
+config `env` block; response storage and background work remain request opt-ins.
+
 The engine sizes itself: it splits the layers across the GPUs it is given (up to 16; with more than two, each GPU
 takes layers in proportion to its free VRAM), fills each GPU's free VRAM with experts, sizes its RAM tier from the
 free RAM, and measures the CPU against the PCIe link at start to decide how many RAM experts the CPU computes itself.
