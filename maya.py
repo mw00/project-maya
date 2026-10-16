@@ -658,14 +658,14 @@ def check_hip_pc(a, installed=False) -> dict:
     elif WIN and len(found) > 1 and any(g.get("source") == "registry" for g in found):
         warn("these GPU numbers are Windows' order (ROCm's hipInfo was not found): HIP's own can differ")
     if a.gpus:
-        # two cards split the layers (each caches the experts of its own half); the larger card goes first, as it
-        # takes the bigger first half - the order measured on an R9700 + RX 7900 XT
+        # two or more cards split the layers (each caches the experts of its own portion); the larger card goes first, as it
+        # takes the bigger first portion - the order measured on an R9700 + RX 7900 XT
         try:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()]
         except ValueError:
-            fail(f"--gpus takes two GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
-        if len(want) != 2 or want[0] == want[1]:
-            fail("Maya's HIP port runs on one GPU or splits the model across two: --gpu 0, or --gpus 0,1")
+            fail(f"--gpus takes GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
+        if not 2 <= len(want) <= MAX_GPUS or len(set(want)) != len(want):
+            fail("Maya's HIP port runs on one GPU or splits the model across two or more: --gpu 0, or --gpus 0,1,2,3")
         picked = [next((g for g in usable if g["index"] == i), None) for i in want]
         for i, g in zip(want, picked):
             if g is None:
@@ -716,8 +716,8 @@ def check_hip_pc(a, installed=False) -> dict:
     if not avx2:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
     total, avail = mem_gb()
-    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, "
-       f"{'two GPUs (layer split)' if len(chosen) == 2 else 'one GPU'}, text only")
+    split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}, text only")
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if any(hip_unified_memory(g) for g in chosen) and WIN:
@@ -1940,7 +1940,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         hip_env = {"STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16"}
         gpus = pc["gpus"]
         if len(gpus) == 1:
-            hip_env["STRATA_GLM_SPLIT"] = "0"   # two cards: the engine picks the split (and drafts with MTP)
+            hip_env["STRATA_GLM_SPLIT"] = "0"   # two or more cards: the engine picks the split (and drafts with MTP)
         # Larger prompt sub-batches feed the matrix cores much better (7900 XT: ~250 -> ~410 tok/s); they need
         # a bigger prompt budget, borrowed from the expert pool only while a prompt runs.
         if any(hip_unified_memory(g) for g in gpus):
@@ -2957,7 +2957,7 @@ def main() -> int:
         pc = check_pc(a)
         say()
         if a.backend == "hip":
-            pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) == 2
+            pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) > 1
                     else f"--gpu {pc['gpus'][0]['index']}")
             say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to try the experimental port.")
         else:
