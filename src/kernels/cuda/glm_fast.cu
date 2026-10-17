@@ -4766,21 +4766,13 @@ void mv_nt_launch(const MvJob* jobs, int n, bool typed, bool* done, cudaStream_t
         mv_kernel_nt<NT><<<acc, 256, 0, s>>>(b);
     }
 }
-}  // namespace
-
-bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
-    if (nt <= 1) return mv(jobs, n, s);
-    if (n <= 0 || n > kMaxMvJobs || nt > kMaxMvNt) return false;
-    for (int i = 0; i < n; ++i)
-        if (!mv_type_ok(jobs[i].type) || jobs[i].ncol != 1) {
-            std::fprintf(stderr, "glm_fast mv_nt: type %d / %d columns unsupported\n", jobs[i].type, jobs[i].ncol);
-            return false;
-        }
+bool mv_nt_small(const MvJob* jobs, int n, int nt, cudaStream_t s) {
+    if (nt == 1) return mv(jobs, n, s);
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
-    if (!exl3_jobs(jobs, n, nt, done, s)) return false;   // (EXL3: one EXL3 job an activation)
+    if (!exl3_jobs(jobs, n, nt, done, s)) return false;
 #if defined(STRATA_USE_HIP)
-    if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
+    if (typed) mv_rdna(jobs, n, nt, done, s);
 #endif
     switch (nt) {
         case 2: mv_nt_launch<2>(jobs, n, typed, done, s); break;
@@ -4789,7 +4781,42 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
         case 5: mv_nt_launch<5>(jobs, n, typed, done, s); break;
         case 6: mv_nt_launch<6>(jobs, n, typed, done, s); break;
         case 7: mv_nt_launch<7>(jobs, n, typed, done, s); break;
-        default: mv_nt_launch<8>(jobs, n, typed, done, s); break;
+        case 8: mv_nt_launch<8>(jobs, n, typed, done, s); break;
+#if !defined(STRATA_USE_HIP)
+        case 32: mv_nt_launch<32>(jobs, n, typed, done, s); break;
+#endif
+        default: return false;
+    }
+    launch_check("mv_nt");
+    return true;
+}
+}  // namespace
+
+bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
+    if (nt <= 1) return mv(jobs, n, s);
+    if (jobs == nullptr || n <= 0 || n > kMaxMvJobs || nt > kMaxMvNt) return false;
+    for (int i = 0; i < n; ++i)
+        if (!mv_type_ok(jobs[i].type) || jobs[i].ncol != 1) {
+            std::fprintf(stderr, "glm_fast mv_nt: type %d / %d columns unsupported\\n", jobs[i].type, jobs[i].ncol);
+            return false;
+        }
+    if (nt <= 8) return mv_nt_small(jobs, n, nt, s);
+#if !defined(STRATA_USE_HIP)
+    if (nt == 32) return mv_nt_small(jobs, n, nt, s);
+#endif
+    // Intermediate widths are split into <=8-column kernels. CUDA's 32-column DFMULTI case has a dedicated
+    // register-heavy kernel so each weight row can still be shared across the entire 4 x 8 window; HIP splits it.
+    for (int base = 0; base < nt; base += 8) {
+        const int width = std::min(8, nt - base);
+        MvJob part[kMaxMvJobs];
+        for (int i = 0; i < n; ++i) {
+            part[i] = jobs[i];
+            if (part[i].xq != nullptr)
+                part[i].xq = (const uint8_t*) jobs[i].xq + (size_t) base * (jobs[i].n_in / 32) * sizeof(block_q8_1);
+            if (part[i].xf != nullptr) part[i].xf = jobs[i].xf + (size_t) base * jobs[i].n_in;
+            part[i].y = jobs[i].y + (size_t) base * jobs[i].n_out;
+        }
+        mv_nt_small(part, n, width, s);
     }
     launch_check("mv_nt");
     return true;

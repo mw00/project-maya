@@ -806,6 +806,7 @@ void Glm5Model::reset() {
     }
     pos_ = 0;
     mtp_hx_pos_ = -1;   // (head_x holds no position of the new sequence)
+    cap_floor_ = 0;     // a new sequence stages its captures from the first position
     dflash_reset();   // a new sequence: the drafter's cached positions belong to the old one
     if (split_next_) {
         split_next_->reset();

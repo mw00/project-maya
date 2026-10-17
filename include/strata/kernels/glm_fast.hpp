@@ -45,10 +45,10 @@ constexpr int kMaxMvCols = 16;   // a verify window's tokens, a draft block's
 constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
-/// The most activations mv_nt() takes at once (the conversations of one batched decode step).
-constexpr int kMaxMvNt = 8;
+/// The maximum activations mv_nt() takes at once. DFMULTI can flatten four depth-eight request windows into 32 rows.
+constexpr int kMaxMvNt = 32;
 /// mv() for nt activations at once (nt <= kMaxMvNt; 1 = mv()), the jobs' ncol 1: each job's xq / xf hold nt activations
-/// one after another (n_in values each) and its y nt outputs (n_out each).  Output t is bit for bit what mv() gives
+/// one after another (n_in values each) and its y nt outputs (n_out each). Output t is bit for bit what mv() gives
 /// for activation t alone, and each weight row is read from memory once for all of them.
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s);
 /// Whether mv() serves this weight type.

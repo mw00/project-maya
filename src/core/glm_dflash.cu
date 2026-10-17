@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <map>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -643,6 +644,27 @@ struct GlmDflash::Impl {
     std::mutex mu;
     std::vector<int64_t> st_pos;
     std::vector<uint32_t> st_mask;
+    // per-conversation drafter state (one GPU, several conversations): a swap key -> the conversation's own K/V ring,
+    // its position records and its staging.  ctx_swap moves the pointer set: no contents are copied, the live set
+    // simply becomes another conversation's.  The staging is swapped with it (its slots are position-keyed, two
+    // conversations' positions would collide in one buffer).
+    struct ConvState {
+        __half* kr = nullptr;                       // the ring's K and V, layer-major (as Kr / Vr are laid out)
+        __half* vr = nullptr;
+        long long* kv_pos_d = nullptr;              // the ring's position records on the device
+        std::vector<int64_t> kv_pos_h;             // ... and on the host (as Impl's kv_pos_h)
+        float* stage = nullptr;                     // the pinned trunk staging (ring x K x E floats)
+        std::vector<int64_t> st_pos;
+        std::vector<uint32_t> st_mask;
+        int64_t max_pos = 0;                        // the conversation's model position when it was last live
+    };
+    std::map<uint64_t, ConvState> conv;
+    uint64_t conv_live = 0;                         // the key of the set in Kr / Vr / kv_pos / stage now
+    bool conv_seen = false;                         // conv_live holds a conversation (false: the startup set, unowned)
+    __half *kr0 = nullptr, *vr0 = nullptr;          // the startup buffers (the live set before the first swap;
+    long long* kv_pos0 = nullptr;                   //  an own set freed on drop restores them)
+    float* stage0 = nullptr;
+
     // buffers
     void* buf = nullptr;
     size_t buf_bytes = 0;
@@ -708,6 +730,19 @@ GlmDflash::~GlmDflash() {
     if (d_->Vr) cudaFree(d_->Vr);
     if (d_->kv_pos) cudaFree(d_->kv_pos);
     if (d_->stage) cudaFreeHost(d_->stage);
+    if (d_->kr0 != nullptr && d_->kr0 != d_->Kr) {   // the startup set: freed above when it was the live one
+        cudaFree(d_->kr0);
+        cudaFree(d_->vr0);
+        cudaFree(d_->kv_pos0);
+        cudaFreeHost(d_->stage0);
+    }
+    for (auto& [key, c] : d_->conv)
+        if (c.kr != nullptr && c.kr != d_->Kr) {     // the live set's buffers were freed above (a first sight
+            cudaFree(c.kr);                          // adopts them; a later own set does not alias)
+            cudaFree(c.vr);
+            cudaFree(c.kv_pos_d);
+            cudaFreeHost(c.stage);
+        }
     if (d_->tok_h) cudaFreeHost(d_->tok_h);
     if (d_->conf_h) cudaFreeHost(d_->conf_h);
     if (d_->emb_h) cudaFreeHost(d_->emb_h);
@@ -1019,6 +1054,10 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     m.st_pos.assign((size_t) m.ring, -1);
     m.st_mask.assign((size_t) m.ring, 0u);
     if (!ck(cudaMemset(m.kv_pos, 0xff, (size_t) m.ring * sizeof(long long)), "ring reset", err)) return false;
+    m.kr0 = m.Kr;
+    m.vr0 = m.Vr;
+    m.kv_pos0 = m.kv_pos;
+    m.stage0 = m.stage;
     return true;
 }
 
@@ -1061,6 +1100,148 @@ void GlmDflash::staged(int64_t p, int k) {
     }
     m.st_mask[s] |= 1u << k;
 }
+
+// ---- per-conversation drafter state (one GPU, several conversations) ------------------------------
+// Each conversation owns a K/V ring, its position records (device + host) and a trunk staging of its own; the live
+// set is what Impl's Kr / Vr / kv_pos / stage point at.  ctx_swap(key) moves the pointer set: nothing is copied, the
+// outgoing conversation's set is stored under its key and the incoming one's takes the Impl slots (a first sight
+// adopts the startup buffers; a conversation whose set could not allocate shares the live buffers, cleared).  The
+// device is synchronized first: queued drafter-stream work references the old pointers.
+
+bool GlmDflash::ctx_swap(uint64_t key, std::string& err) {
+    Impl& m = *d_;
+    using ConvState = Impl::ConvState;
+    if (m.conv_seen && m.conv_live == key) return true;   // already live: nothing to move
+    int cur = 0;
+    cudaGetDevice(&cur);
+    cudaSetDevice(m.dev);
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        cudaGetLastError();
+        err = "glm dflash: the device did not settle before the drafter's context swap";
+        cudaSetDevice(cur);
+        return false;
+    }
+    // swap out: the live set's records go back to their owner (a sharer runs on the startup set, transiently -
+    // its records are not kept; the next stint rebuilds them)
+    if (m.conv_seen) {
+        ConvState& c = m.conv[m.conv_live];
+        if (c.kr != nullptr) {                       // an owner: its set is live, the records are its
+            c.kv_pos_h = std::move(m.kv_pos_h);
+            std::lock_guard<std::mutex> lk(m.mu);
+            c.st_pos = std::move(m.st_pos);
+            c.st_mask = std::move(m.st_mask);
+        }
+        // (a sharer's kr is null: the live set is the startup one; nothing to store)
+    }
+    // swap in: the conversation's own set, or the startup set for a sharer
+    const auto it = m.conv.find(key);
+    if (it != m.conv.end() && it->second.kr != nullptr) {
+        ConvState& c = it->second;
+        m.Kr = c.kr;
+        m.Vr = c.vr;
+        m.kv_pos = c.kv_pos_d;
+        m.kv_pos_h = std::move(c.kv_pos_h);
+        {
+            std::lock_guard<std::mutex> lk(m.mu);
+            m.st_pos = std::move(c.st_pos);
+            m.st_mask = std::move(c.st_mask);
+        }
+        m.stage = c.stage;
+    } else {
+        bool sharer = it != m.conv.end();            // an existing entry with no own set: a sharer again
+        if (!sharer) {                               // the conversation's first stint: try a set of its own
+            ConvState c;
+            const size_t ring_b = (size_t) m.ring * (size_t) m.n_layer * (size_t) m.n_kv * kHeadDim * sizeof(__half);
+            const size_t stage_b = (size_t) m.ring * (size_t) m.K * (size_t) m.E * sizeof(float);
+            if (cudaMalloc((void**) &c.kr, ring_b) == cudaSuccess &&
+                cudaMalloc((void**) &c.vr, ring_b) == cudaSuccess &&
+                cudaMalloc((void**) &c.kv_pos_d, (size_t) m.ring * sizeof(long long)) == cudaSuccess &&
+                cudaHostAlloc((void**) &c.stage, stage_b, cudaHostAllocPortable) == cudaSuccess) {
+                cudaMemset(c.kv_pos_d, 0xff, (size_t) m.ring * sizeof(long long));   // no position held (-1)
+                c.kv_pos_h.assign((size_t) m.ring, -1);
+                c.st_pos.assign((size_t) m.ring, -1);
+                c.st_mask.assign((size_t) m.ring, 0u);
+                m.Kr = c.kr;
+                m.Vr = c.vr;
+                m.kv_pos = c.kv_pos_d;
+                m.kv_pos_h = std::move(c.kv_pos_h);
+                {
+                    std::lock_guard<std::mutex> lk(m.mu);
+                    m.st_pos = std::move(c.st_pos);
+                    m.st_mask = std::move(c.st_mask);
+                }
+                m.stage = c.stage;
+                m.conv[key] = std::move(c);
+                std::fprintf(stderr, "glm dflash: a drafter state of its own for context %llu (%.0f MB device, "
+                                     "%.0f MB pinned)\n", (unsigned long long) key,
+                             (double) (2 * ring_b + (size_t) m.ring * sizeof(long long)) / 1048576.0,
+                             (double) stage_b / 1048576.0);
+            } else {                                 // no room: a sharer of the startup set (correct, slower)
+                cudaGetLastError();
+                m.conv[key] = ConvState{};
+                sharer = true;
+                std::fprintf(stderr, "glm dflash: no room for context %llu's own drafter state - it shares the "
+                                     "startup one (its drafts rebuild after every switch)\n",
+                             (unsigned long long) key);
+            }
+        }
+        if (sharer) {                                // the startup set serves, cleared
+            m.Kr = m.kr0;
+            m.Vr = m.vr0;
+            m.kv_pos = m.kv_pos0;
+            m.stage = m.stage0;
+            m.kv_pos_h.assign((size_t) m.ring, -1);
+            {
+                std::lock_guard<std::mutex> lk(m.mu);
+                m.st_pos.assign((size_t) m.ring, -1);
+                m.st_mask.assign((size_t) m.ring, 0u);
+            }
+            cudaMemcpy(m.kv_pos, m.kv_pos_h.data(), (size_t) m.ring * sizeof(long long), cudaMemcpyHostToDevice);
+            cudaDeviceSynchronize();                 // (as reset() does: a pageable copy may land late)
+        }
+    }
+    m.conv_seen = true;
+    m.conv_live = key;
+    cudaSetDevice(cur);
+    return true;
+}
+
+bool GlmDflash::ctx_owned(uint64_t key) const {
+    const auto it = d_->conv.find(key);
+    return it != d_->conv.end() && it->second.kr != nullptr;
+}
+
+void GlmDflash::ctx_drop(uint64_t key) {
+    Impl& m = *d_;
+    const auto it = m.conv.find(key);
+    if (it == m.conv.end()) return;
+    const bool live = m.conv_seen && m.conv_live == key;
+    if (it->second.kr != nullptr) {
+        if (live) {                                  // its set is live: the startup set takes over, cleared
+            m.Kr = m.kr0;
+            m.Vr = m.vr0;
+            m.kv_pos = m.kv_pos0;
+            m.stage = m.stage0;
+            m.kv_pos_h.assign((size_t) m.ring, -1);
+            cudaMemcpy(m.kv_pos, m.kv_pos_h.data(), (size_t) m.ring * sizeof(long long), cudaMemcpyHostToDevice);
+            {
+                std::lock_guard<std::mutex> lk(m.mu);
+                m.st_pos.assign((size_t) m.ring, -1);
+                m.st_mask.assign((size_t) m.ring, 0u);
+            }
+            m.conv_seen = false;
+        }
+        cudaFree(it->second.kr);
+        cudaFree(it->second.vr);
+        cudaFree(it->second.kv_pos_d);
+        cudaFreeHost(it->second.stage);
+    } else if (live) {
+        m.conv_seen = false;                         // a sharer was live on the startup set: it is nobody's now
+    }
+    m.conv.erase(it);
+}
+
+int GlmDflash::conv_live_key() const { return d_->conv_seen ? (int) d_->conv_live : -1; }
 
 void GlmDflash::reset(int64_t from) {
     Impl& m = *d_;
@@ -1650,13 +1831,15 @@ bool Glm5Model::dflash_bind(std::string& err) {
 
 // rows [0, n) of R (hc x n_embd floats each, positions p0..): the input of layer il.  The rows the drafter reads -
 // at or past cap_floor_ - leave as their stream mean through `scratch` (at least min(n, rows) rows) to the staging
-void Glm5Model::dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s) {
+void Glm5Model::dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s,
+                              int64_t capture_floor) {
     if (cap_d_ == nullptr || il >= (int) cap_k_.size() || cap_k_[(size_t) il] < 0 || scratch == nullptr || rows <= 0)
         return;
     const int k = cap_k_[(size_t) il];
     const Glm5Geometry& g = g_;
     const int E = g.n_embd;
-    const int t0 = (int) std::max<int64_t>(0, cap_floor_ - p0);
+    const int64_t floor = capture_floor >= 0 ? capture_floor : cap_floor_;
+    const int t0 = (int) std::max<int64_t>(0, floor - p0);
     for (int a = t0; a < n; a += rows) {
         const int m = std::min(rows, n - a);
         hc_mean_kernel<<<m, 256, 0, s>>>(R + (size_t) a * g.hc * E, g.hc, E, scratch);
@@ -1680,6 +1863,58 @@ void Glm5Model::dflash_reset() {
     if (cap_d_) cap_d_->reset();
 }
 
+bool Glm5Model::dflash_ctx_swap(uint64_t key, std::string& err) {
+    if (cap_d_ == nullptr) return true;
+    return cap_d_->ctx_swap(key, err);
+}
+
+bool Glm5Model::dflash_ctx_owned(uint64_t key) const {
+    return cap_d_ != nullptr && cap_d_->ctx_owned(key);
+}
+
+void Glm5Model::dflash_ctx_drop(uint64_t key) {
+    if (cap_d_) cap_d_->ctx_drop(key);
+}
+
+bool Glm5Model::dflash_propose(int32_t anchor, int n_max, std::vector<int32_t>& drafts, std::string& err) {
+    return dflash_draft_start(anchor, n_max, err) && dflash_draft_finish(drafts, err);
+}
+
+// The propose above in two calls: draft_start queues the drafter's block on the drafter's stream (the target's
+// window work of this step, and other conversations' drafts, run meanwhile on other streams), draft_finish waits
+// for it and returns the drafts.  The conversation must be bound and its drafter state swapped in: the captures
+// this step staged for it feed the block (inject(0, pos_) takes them), like dflash_propose.
+bool Glm5Model::dflash_draft_start(int32_t anchor, int n_max, std::string& err) {
+    if (!dflash_ready()) {
+        err = "glm dflash: no draft loaded";
+        return false;
+    }
+    GlmDflash& D = *cap_d_;
+    const int room = (int) std::max<int64_t>(0, max_ctx_ - pos_ - 1);
+    n_max = n_max < 0 ? D.block() - 1 : n_max;
+    n_max = std::max(0, std::min({n_max, D.block() - 1, kWinMax - 1, room}));
+    if (n_max <= 0) return true;
+    cudaSetDevice(dev_);
+    cudaStream_t ts = D.stream() != nullptr ? D.stream() : fast_->cs;
+    if (!D.inject(0, pos_, ts, err)) return false;
+    const WSlot& head = ws_map_.at("output.weight");
+    const float p_min = 0.95f;   // the one-GPU DFlash confidence cut (decode_dflash's default)
+    if (!D.draft_start(anchor, pos_, n_max, p_min, head, pack_emb_src_, pack_emb_type_, ts, err)) return false;
+    return true;
+}
+
+bool Glm5Model::dflash_draft_finish(std::vector<int32_t>& drafts, std::string& err) {
+    drafts.clear();
+    if (!dflash_ready()) {
+        err = "glm dflash: no draft loaded";
+        return false;
+    }
+    GlmDflash& D = *cap_d_;
+    const int n_min = getenv("STRATA_GLM_DFLASH_MIN") ? std::max(0, std::atoi(getenv("STRATA_GLM_DFLASH_MIN"))) : 0;
+    const float p_cum = getenv("STRATA_GLM_DFLASH_CUM") ? (float) std::atof(getenv("STRATA_GLM_DFLASH_CUM")) : 0.0f;
+    return D.draft_finish(drafts, err, nullptr, n_min, p_cum);
+}
+
 // The DFlash decode: each round the drafter's block for the last accepted token (up to n_max drafts, or fewer when the
 // selector's confidence falls below p_min), a verify window of that token and the drafts, its longest right prefix and
 // the pick after it kept (window_commit) - the same tokens the token-at-a-time loop produces for the same samples -
@@ -1688,6 +1923,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
                               const std::function<bool(int)>& emit, int64_t& produced, std::string& err, int n_min,
                               float p_cum) {
     produced = 0;
+    dflash_yielded_ = false;
     if (!dflash_ready()) {
         err = "glm dflash: no draft loaded";
         return false;
@@ -1888,6 +2124,10 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
             ++produced;
             last_tok_ = y2;
             if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
+            if (dflash_stint_ >= 0 && produced >= dflash_stint_) {   // a stint's budget: yield at the round's end
+                dflash_yielded_ = true;
+                break;
+            }
             y = y2;
             continue;
         }
@@ -1997,6 +2237,10 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         ++produced;
         last_tok_ = y2;
         if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
+        if (dflash_stint_ >= 0 && produced >= dflash_stint_) {   // a stint's budget: yield at the round's end
+            dflash_yielded_ = true;                              // (the pick is emitted but not fed: the
+            break;                                               //  scheduler resumes by feeding it)
+        }
         y = y2;
         if (pipe) {
             // the next window's anchor now, behind the commit; the drafter's catch-up at the top of the round

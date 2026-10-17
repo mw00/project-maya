@@ -1982,18 +1982,24 @@ static int glm_pack_generate(const Options& o) {
         return 0;
     };
 
-    // ---- SEVERAL CONVERSATIONS AT ONCE (serve, STRATA_GLM_SEQS=<n> > 1).  GEN lines carry rid=<id>, and every line
-    // a request causes carries it after its keyword (T <rid> <id>, PP <rid> ..., DONE <rid> ..., ERR <rid> ...);
-    // STOP <rid> and PAUSE <rid> [keep] end one request, STOP alone all of them.  Each request runs in one of the n
-    // sequence states, a CONTEXT: an idle context whose snapshot the prompt extends is taken as it stands (nothing
-    // read, nothing loaded), else the least recently used idle one, whose conversation goes to a slot first.  A
-    // request alone decodes through the speculative path (the fastest for one); as soon as a second one comes, both go
-    // through the pipelined decode (Glm5Model::multi_issue), each card of the split on a different conversation.
+    // ---- SEVERAL CONVERSATIONS AT ONCE (serve, STRATA_GLM_SEQS=<n> > 1).  DFMULTI keeps DFlash proposals per
+    // conversation and verifies one target token for every ready conversation in the same multi_rows call.
     const bool multi = o.serve && model.fast() && model.seq_count() > 1;
+    static const double dfmulti_cfg = env_num("STRATA_GLM_DFMULTI", 0.0);
+    const bool dfmulti_on = dfmulti_cfg > 0.0;
+    const int dfmulti_depth = std::clamp((int) env_num("STRATA_GLM_DFMULTI_DEPTH", 2.0), 2,
+                                         std::max(2, model.rows_max() / 4));
+    const int dfmulti_solo_depth = std::clamp((int) env_num("STRATA_GLM_DFMULTI_SOLO_DEPTH", 8.0), 2,
+                                              std::max(2, model.rows_max()));
+    const int dfmulti_pair_depth = std::clamp((int) env_num("STRATA_GLM_DFMULTI_PAIR_DEPTH", 4.0), 2,
+                                              std::max(2, model.rows_max() / 2));
     if (multi && model.dflash_ready())
-        std::fprintf(stderr, "glm dflash: not used with STRATA_GLM_SEQS=%d - the several-conversation scheduler decodes "
-                             "without it (and without the MTP block, which --dflash leaves unloaded)\n",
-                     model.seq_count());
+        std::fprintf(stderr, dfmulti_on
+                                 ? "glm dflash: STRATA_GLM_DFMULTI=%.0f - per-request drafts, batched target verification\n"
+                                 : "glm dflash: not used with STRATA_GLM_SEQS=%.0f - the several-conversation scheduler "
+                                   "decodes without it (and without the MTP block, which --dflash leaves unloaded)\n",
+                     dfmulti_on ? dfmulti_cfg : (double) model.seq_count());
+    const bool dfmulti = dfmulti_on && model.dflash_ready();
     struct Ctx {   // a context's driver-side state while another one is bound (the bound one's is in the globals)
         std::vector<int32_t> snap_tokens;
         uint64_t snap_img_hash = kNoImages;
@@ -2033,6 +2039,11 @@ static int glm_pack_generate(const Options& o) {
         int32_t force = -1;      // the next token instead of the sampled one (the thinking budget, the loop guard)
         int32_t pending = -1;    // written, not fed yet
         bool ready = false;      // just admitted: the first sample's logits are on the tail
+        int req_spec_flag = 0;   // the GEN line's spec= (1: this request asked for no speculative decode)
+        std::vector<int32_t> dflash_drafts;
+        size_t dflash_next = 0;
+        uint64_t dflash_steps = 0, dflash_hits = 0;
+        bool dflash_draft_queued = false;   // the drafter's next block for this conversation is already in flight
         bool inflight = false, done = false, pause = false, keep = false;
         const char* finish = "length";
         size_t reuse = 0;
@@ -2198,11 +2209,12 @@ static int glm_pack_generate(const Options& o) {
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - g.t1).count();
         const auto st2 = model.fast_stats();
         const uint64_t d_hits = st2.hits - g.st1.hits, d_miss = st2.misses - g.st1.misses;
-        std::printf("DONE %d %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu\n", g.rid, (long long) g.produced,
-                    (long long) g.prompt.size(), prompt_ms, decode_ms, g.finish,
-                    (unsigned long long) (model.spec_hits_ - g.spec_hits0),
-                    (unsigned long long) (model.spec_steps_ - g.spec_steps0), g.reuse, (unsigned long long) d_hits,
-                    (unsigned long long) (d_hits + d_miss));
+        const uint64_t req_hits = dfmulti ? g.dflash_hits : model.spec_hits_ - g.spec_hits0;
+        const uint64_t req_steps = dfmulti ? g.dflash_steps : model.spec_steps_ - g.spec_steps0;
+        std::printf("DONE %d %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu\n", g.rid,
+                    (long long) g.produced, (long long) g.prompt.size(), prompt_ms, decode_ms, g.finish,
+                    (unsigned long long) req_hits, (unsigned long long) req_steps, g.reuse,
+                    (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
         if (g.pause && std::strcmp(g.finish, "cancel") == 0) {
             bind_ctx(g.ctx);
             pause_snapshot(g.prompt, g.emitted, g.keep);
@@ -2215,6 +2227,7 @@ static int glm_pack_generate(const Options& o) {
             std::lock_guard<std::mutex> lk(ctl_mu);
             ctl.erase(g.rid);
         }
+        if (dfmulti) model.dflash_ctx_drop((uint64_t) g.ctx);   // the conversation's drafter state is no longer needed
         ctxs[(size_t) g.ctx].busy = false;
         ctxs[(size_t) g.ctx].used = ++ctx_clock;
         g.done = true;
@@ -2274,11 +2287,16 @@ static int glm_pack_generate(const Options& o) {
                         slot_drop(i);
                 }
             std::printf("ERR %d %s\n", gp->rid, why.c_str());
+            gp->dflash_drafts.clear();
+            gp->dflash_next = 0;
+            gp->dflash_draft_queued = false;
             ctxs[(size_t) gp->ctx].busy = false;
             gp->done = true;
         }
         flight.clear();
         flight_groups.clear();
+        if (dfmulti)
+            for (int c = 0; c < (int) ctxs.size(); ++c) model.dflash_ctx_drop((uint64_t) c);
         for (int c = 0; c < (int) ctxs.size(); ++c) {
             bind_ctx(c);
             snap_tokens.clear();
@@ -2356,6 +2374,12 @@ static int glm_pack_generate(const Options& o) {
         }
         if (gens.empty()) stop_req.store(false);
         bind_ctx(best);
+        if (dfmulti) {   // the drafter's state follows the conversation: swap before the prompt's captures run
+            std::string swap_err;
+            if (!model.dflash_ctx_swap((uint64_t) best, swap_err))
+                std::fprintf(stderr, "glm dflash: context %d's drafter state: %s (the drafts rebuild)\n", best,
+                             swap_err.c_str());
+        }
         model.set_image_rows(cur_img_pos, cur_img_rows);
         model.force_next(-1);
         ctxs[(size_t) best].busy = true;
@@ -2385,6 +2409,7 @@ static int glm_pack_generate(const Options& o) {
             gen_sweep();
             return;
         }
+        g->req_spec_flag = req_spec;
         g->ready = true;
         gens.push_back(std::move(g));
         if (gens.size() > 1 && !resolve_ready()) multi_fail(err);   // the others decode: its first token now
@@ -2426,10 +2451,272 @@ static int glm_pack_generate(const Options& o) {
             gen_admit(w2.rid, w2.ids, w2.max_new, w2.rq);
         }
     };
-    // one step of the scheduler: a stint of the speculative path for a request alone, else one token back from the
-    // pipelined decode (and every request with a token to feed issued first).  Errors end the running requests.
+    // In DFMULTI, draft proposals remain conversation-local, but target verification is a single multi_rows call for
+    // every request with a token to feed. A target mismatch invalidates only that conversation's remaining proposals.
     const auto multi_step = [&] {
         std::vector<float> lg;
+        if (dfmulti) {
+            if (!model.rows_ok()) {
+                multi_fail("STRATA_GLM_DFMULTI requires the single-GPU batched target-row path");
+                return;
+            }
+            if (!resolve_ready()) {
+                multi_fail(err);
+                return;
+            }
+            int drafted_rows = 0;
+            std::vector<Gen*> window_gens;
+            for (auto& gp : gens) {
+                Gen& g = *gp;
+                if (g.done || g.inflight || g.pending < 0 || g.force >= 0 || g.req_spec_flag == 1)
+                    continue;
+                if (g.dflash_next < g.dflash_drafts.size()) {
+                    window_gens.push_back(&g);
+                    continue;
+                }
+                bind_ctx(g.ctx);
+                std::string swap_err;
+                if (!model.dflash_ctx_swap((uint64_t) g.ctx, swap_err)) {
+                    multi_fail("DFlash context swap failed: " + swap_err);
+                    return;
+                }
+                if (!model.dflash_ctx_owned((uint64_t) g.ctx)) {
+                    multi_fail("DFMULTI needs an isolated DFlash state per request; context " +
+                               std::to_string(g.ctx) + " could not allocate one");
+                    return;
+                }
+                const int req_n_max = g.req_spec_flag >= 2 ? g.req_spec_flag - 1 : -1;
+                if (g.dflash_draft_queued) {   // the block was kicked ahead last step: wait for it, no new pass
+                    g.dflash_draft_queued = false;
+                    if (!model.dflash_draft_finish(g.dflash_drafts, err)) {
+                        multi_fail(err);
+                        return;
+                    }
+                } else if (!model.dflash_propose(g.pending, req_n_max, g.dflash_drafts, err)) {
+                    multi_fail(err);
+                    return;
+                }
+                if (!g.dflash_drafts.empty()) {
+                    ++drafted_rows;
+                    window_gens.push_back(&g);
+                }
+            }
+            const int active_count = (int) std::count_if(gens.begin(), gens.end(), [](const auto& gp) {
+                return !gp->done;
+            });
+            // RAGGED WINDOWS: every active, unforced request with a token to feed takes rows in one target call -
+            // a context with usable drafts takes up to its active-count depth (its drafts plus the anchor, clamped
+            // to its output budget), every other context exactly its one pending row. Nothing waits for a fully
+            // ready step: partial readiness batches too (the old one-row fallback becomes a 1-row context here).
+            const int depth_cap = active_count <= 1 ? dfmulti_solo_depth
+                                  : active_count == 2 ? dfmulti_pair_depth : dfmulti_depth;
+            std::vector<Gen*> ragged;
+            std::vector<int> counts;
+            int rows_total = 0;
+            for (auto& gp : gens) {
+                Gen& g = *gp;
+                if (g.done || g.inflight || g.pending < 0 || g.force >= 0 || g.req_spec_flag == 1) continue;
+                const int64_t budget = g.max_new - g.produced;
+                if (budget < 1) continue;
+                const bool has_drafts = g.dflash_next < g.dflash_drafts.size();
+                const int drafts_left = has_drafts ? (int) (g.dflash_drafts.size() - g.dflash_next) : 0;
+                const int rows = has_drafts
+                                     ? std::max(1, (int) std::min<int64_t>({depth_cap, budget, drafts_left + 1}))
+                                     : 1;
+                if (rows_total + rows > strata::core::Glm5Model::rows_max()) continue;   // (cannot happen at <= 4 x 8)
+                ragged.push_back(&g);
+                counts.push_back(rows);
+                rows_total += rows;
+            }
+            if (!ragged.empty()) {
+                const int nc = (int) ragged.size();
+                std::vector<int> row0((size_t) nc);
+                for (int c = 0, at = 0; c < nc; at += counts[(size_t) c], ++c) row0[(size_t) c] = at;
+                std::vector<int> wseq((size_t) nc);
+                std::vector<int32_t> wtoks((size_t) rows_total), wpicks((size_t) rows_total);
+                std::vector<int> wkeep((size_t) nc, 1);
+                std::vector<strata::kernels::SamplerParams> wsps((size_t) rows_total);
+                for (int c = 0; c < nc; ++c) {
+                    Gen& g = *ragged[(size_t) c];
+                    wseq[(size_t) c] = g.ctx;
+                    for (int t = 0; t < counts[(size_t) c]; ++t)
+                        wtoks[(size_t) row0[(size_t) c] + t] =
+                            t == 0 ? g.pending : g.dflash_drafts[g.dflash_next + (size_t) t - 1];
+                }
+                for (int c = 0; c < nc; ++c)
+                    for (int t = 0; t < counts[(size_t) c]; ++t) {
+                        const int row = row0[(size_t) c] + t;
+                        wsps[(size_t) row] = ragged[(size_t) c]->sp;
+                        wsps[(size_t) row].counter += t;
+                    }
+                if (!model.multi_window_rows(wseq.data(), wtoks.data(), counts.data(), nc, wsps.data(),
+                                             wpicks.data(), err)) {
+                    multi_fail(err);
+                    return;
+                }
+                int accepted_drafts = 0;
+                std::vector<bool> retain_queue((size_t) nc, false);
+                for (int c = 0; c < nc; ++c) {
+                    Gen& g = *ragged[(size_t) c];
+                    const size_t next = g.dflash_next;
+                    const int depth = counts[(size_t) c];
+                    const int drafts_left = (int) (g.dflash_drafts.size() - next);
+                    const int output_count = depth;
+                    int accepted = 0, compared = 0, keep = 0;
+                    bool mismatch = false;
+                    for (int t = 0; t < output_count; ++t) {
+                        const int pick = wpicks[(size_t) row0[(size_t) c] + t];
+                        keep = t + 1;
+                        if (t < drafts_left) {
+                            ++compared;
+                            if (pick == g.dflash_drafts[next + (size_t) t]) {
+                                ++accepted;
+                            } else {
+                                mismatch = true;
+                                break;
+                            }
+                        } else {
+                            break;   // bonus target token after every available draft matched
+                        }
+                        if (stop_on_eos && std::find(eos.begin(), eos.end(), (int64_t) pick) != eos.end()) {
+                            mismatch = true;   // do not keep later draft rows after an EOS token
+                            break;
+                        }
+                    }
+                    wkeep[(size_t) c] = std::max(1, keep);
+                    retain_queue[(size_t) c] = !mismatch && accepted < drafts_left;
+                    accepted_drafts += accepted;
+                    g.dflash_steps += (uint64_t) compared;
+                    model.spec_steps_ += (uint64_t) compared;
+                    g.dflash_hits += (uint64_t) accepted;
+                    model.spec_hits_ += (uint64_t) accepted;
+                    g.dflash_next += (size_t) accepted;
+                }
+                if (!model.commit_window_rows(wseq.data(), wkeep.data(), nc, err)) {
+                    multi_fail(err);
+                    return;
+                }
+                // The next window's drafter block: kicked ahead of the emission and the commit's host work on the
+                // drafter's stream, waited for at the top of the next step (dflash_draft_queued).  The commit's
+                // replay staged these positions' trunk features for each conversation (rows_layers' per-row
+                // ctx_swap + capture), so the block has its context; its inject(0, pos_) takes them.  One in-flight
+                // drafter pass at a time: the drafter's pending-draft state is global, so a second conversation's
+                // kick would overwrite the first one's drafts.  Warm matched A/B on this one-GPU rig measured the
+                // solo effect neutral (within noise, +1.9%); kept opt-in (STRATA_GLM_DFMULTI_AHEAD=1), default off,
+                // since it buys nothing here but may overlap on split rigs.
+                static const bool draft_ahead_on = env_num("STRATA_GLM_DFMULTI_AHEAD", 0.0) != 0.0;
+                bool draft_in_flight = std::any_of(gens.begin(), gens.end(), [](const auto& gp) {
+                    return gp->dflash_draft_queued;
+                });
+                int draft_ahead_kicks = 0;
+                if (draft_ahead_on && !draft_in_flight) {
+                for (int c = 0; c < nc && !draft_in_flight; ++c) {
+                    Gen& g = *ragged[(size_t) c];
+                    if (retain_queue[(size_t) c] || g.done || g.force >= 0 || g.req_spec_flag == 1) continue;
+                    const int64_t left = g.max_new - g.produced - wkeep[(size_t) c];
+                    if (left < 2) continue;
+                    const int64_t room = model.seq_max_ctx(g.ctx) - (model.seq_pos(g.ctx) + 1);
+                    if (room <= 0) continue;
+                    bind_ctx(g.ctx);
+                    std::string swap_err;
+                    if (!model.dflash_ctx_swap((uint64_t) g.ctx, swap_err)) {
+                        multi_fail("DFlash context swap failed: " + swap_err);
+                        return;
+                    }
+                    const int anchor = wpicks[(size_t) row0[(size_t) c] + wkeep[(size_t) c] - 1];
+                    if (!model.dflash_draft_start(anchor, -1, err)) {   // the whole block, room-clamped
+                        multi_fail(err);
+                        return;
+                    }
+                    g.dflash_draft_queued = true;
+                    draft_in_flight = true;
+                    ++draft_ahead_kicks;
+                }
+                }
+                int emitted_positions = 0, committed_prefix = 0;
+                for (int c = 0; c < nc; ++c) {
+                    const int count = wkeep[(size_t) c];
+                    committed_prefix += count;
+                    Gen& g = *ragged[(size_t) c];
+                    if (!retain_queue[(size_t) c] || g.dflash_next >= g.dflash_drafts.size()) {
+                        g.dflash_drafts.clear();
+                        g.dflash_next = 0;
+                    }
+                    g.pending = -1;
+                    for (int t = 0; t < count && !g.done; ++t) {
+                        ++g.sp.counter;
+                        gen_took(g, wpicks[(size_t) row0[(size_t) c] + t]);
+                        ++emitted_positions;
+                    }
+                    if (g.done) {
+                        g.dflash_drafts.clear();
+                        g.dflash_next = 0;
+                    }
+                }
+                if (getenv("STRATA_GLM_DFMULTI_TRACE"))
+                    std::fprintf(stderr,
+                                 "glm dflash window: batch_contexts=%d window_depth=%d target_rows=%d "
+                                 "verification_positions=%d emitted_positions=%d committed_prefix=%d "
+                                 "accepted_drafts=%d serial_target_calls_avoided=%d draft_ahead_kicks=%d\n",
+                                 nc, rows_total / std::max(1, nc), rows_total, rows_total, emitted_positions,
+                                 committed_prefix, accepted_drafts, 1, draft_ahead_kicks);
+                gen_sweep();
+                return;
+            }
+            std::vector<Gen*> rg;
+            std::vector<int> seqs, out;
+            std::vector<int32_t> toks;
+            std::vector<strata::kernels::SamplerParams> sps;
+            for (auto& gp : gens)
+                if (!gp->done && !gp->inflight && gp->pending >= 0 && (int) rg.size() < strata::core::Glm5Model::rows_max()) {
+                    rg.push_back(gp.get());
+                    seqs.push_back(gp->ctx);
+                    toks.push_back(gp->pending);
+                    sps.push_back(gp->sp);
+                }
+            if (rg.empty()) {
+                gen_sweep();
+                return;
+            }
+            out.resize(rg.size());
+            if (!model.multi_rows(seqs.data(), toks.data(), sps.data(), (int) rg.size(), out.data(), err)) {
+                multi_fail(err);
+                return;
+            }
+            int verified_rows = 0, accepted_rows = 0;
+            for (size_t i = 0; i < rg.size(); ++i) {
+                Gen& g = *rg[i];
+                g.sp.counter += 1;
+                if (g.force >= 0) {
+                    g.dflash_drafts.clear();
+                    g.dflash_next = 0;
+                }
+                if (g.dflash_next < g.dflash_drafts.size()) {
+                    ++verified_rows;
+                    ++g.dflash_steps;
+                    ++model.spec_steps_;
+                    if (out[i] == g.dflash_drafts[g.dflash_next]) {
+                        ++accepted_rows;
+                        ++g.dflash_hits;
+                        ++model.spec_hits_;
+                        if (++g.dflash_next >= g.dflash_drafts.size()) {
+                            g.dflash_drafts.clear();
+                            g.dflash_next = 0;
+                        }
+                    } else {
+                        g.dflash_drafts.clear();
+                        g.dflash_next = 0;
+                    }
+                }
+                g.pending = -1;
+                gen_took(g, out[i]);
+            }
+            if (getenv("STRATA_GLM_DFMULTI_TRACE"))
+                std::fprintf(stderr, "glm dflash fallback: target_rows=%zu drafted_contexts=%d verified_contexts=%d accepted_contexts=%d\n",
+                             rg.size(), drafted_rows, verified_rows, accepted_rows);
+            gen_sweep();
+            return;
+        }
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
         if (only != nullptr && !only->inflight && multi_spec && model.spec_ready()) {
             Gen& g = *only;

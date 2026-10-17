@@ -709,6 +709,7 @@ public:
         std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool;
         float *snap = nullptr, *snap_pool = nullptr, *kda_bak = nullptr;
         int last_tok = -1;
+        int64_t cap_floor = 0;    // the DFlash drafter's capture floor for this sequence (positions below are not staged)
         std::vector<int64_t> img_pos;
         std::vector<float> img_rows;
         // the pipeline's per-sequence buffers on this part: the boundary hop (a sequence's next token waits for its
@@ -731,6 +732,9 @@ public:
     int64_t seq_max_ctx(int s) const {                     // a sequence's context (the bound one's is max_ctx_)
         return seq_.empty() || s == cur_seq_ ? max_ctx_ : seq_[(size_t) s].max_ctx;
     }
+    int64_t seq_pos(int s) const {                         // a sequence's next-write position (the bound one's is pos_)
+        return seq_.empty() || s == cur_seq_ ? pos_ : seq_[(size_t) s].pos;
+    }
     bool seq_pipe_ready(std::string& err);                 // the pipeline buffers (once)
     /// The pipelined decode: `token` of sequence s at its next position through every part and the head, sampled with
     /// `sp` (greedy when sp.greedy) on the tail's stream - nothing is waited for.  multi_take(s) waits for that token.
@@ -748,6 +752,14 @@ public:
     static int rows_max();
     bool multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                     int* tokens_out, std::string& err);
+    bool multi_window_rows(const int* seqs, const int32_t* tokens, const int* counts, int n_contexts,
+                           const strata::kernels::SamplerParams* sps, int32_t* picks, std::string& err);
+    bool commit_window_rows(const int* seqs, const int* keep, int n_contexts, std::string& err);
+    /// One batched context-by-depth verifier on one GPU. Inputs are context-major: T tokens per sequence; picks has
+    /// one target pick per input row. The window remains pending until commit_window_prefixes().
+    bool multi_window(const int* seqs, const int32_t* tokens, int n_contexts, int depth,
+                      const strata::kernels::SamplerParams* sps, int32_t* picks, std::string& err);
+    bool commit_window_prefixes(const int* seqs, const int* keep, int n_contexts, int depth, std::string& err);
     /// LAYER SPLIT (glm_rows.cu): one token of each of n sequences through every part as one batched step per part,
     /// queued like multi_issue (nothing waited for); multi_take(seqs[i]) returns each one's token.  n <= rows_max().
     bool split_rows_ok() const;
@@ -756,6 +768,8 @@ public:
 private:
     struct RowSeq;
     bool rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err);
+    bool rows_bind_window_rows(const int* seqs, const int* counts, int n_contexts, RowSeq* rw, std::string& err);
+    bool rows_bind_window(const int* seqs, int n_contexts, int depth, RowSeq* rw, std::string& err);
     bool rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err);
     bool rows_layers(RowSeq* rw, int n, std::string& err);
     bool rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err);
@@ -828,9 +842,19 @@ public:
     int64_t cap_floor_ = 0;                                // ... positions below it are not captured (a long prompt)
     bool dflash_load(const std::string& path, int dev, std::string& err);
     bool dflash_bind(std::string& err);                    // after the parts loaded: the captures wired
-    void dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s);
+    void dflash_capture(int il, const float* R, int n, int64_t p0, float* scratch, int rows, cudaStream_t s,
+                        int64_t cap_floor = -1);
+    bool dflash_propose(int32_t anchor, int n_max, std::vector<int32_t>& drafts, std::string& err);
+    /// dflash_propose in two calls, so the drafter's block runs beside the caller's target work: dflash_draft_start
+    /// queues the pass on the drafter's stream for the conversation already bound (its captures in), and
+    /// dflash_draft_finish waits for it and hands out the drafts (an empty list: the block cut itself short).
+    /// n_max < 0: the engine default (the whole block, room-clamped).
+    bool dflash_draft_start(int32_t anchor, int n_max, std::string& err);
+    bool dflash_draft_finish(std::vector<int32_t>& drafts, std::string& err);
     bool dflash_ready() const;
     void dflash_reset();
+    int64_t dflash_stint_ = -1;                            // decode_dflash: emit at most this many tokens (a stint)
+    bool dflash_yielded_ = false;                          // ... and the last call returned on such a yield
     /// The DFlash decode (Strata's serial speculative loop with a block drafter): each round the drafter's block for
     /// the last token (up to n_max drafts, fewer where the selector's confidence is below p_min; n_max < 0: the
     /// drafter's block, p_min < 0: 0.5 on a split, 0.9 on one GPU) is checked by one verify window - pipelined on a split (window_pipe's steps, stopped at
@@ -840,6 +864,17 @@ public:
     bool decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_new, int n_max, float p_min,
                        const std::function<bool(int)>& emit, int64_t& produced, std::string& err, int n_min = -1,
                        float p_cum = -1.0f);
+    /// decode_dflash's stint control (STRATA_GLM_DFMULTI): the call yields (dflash_yielded_, a clean return) after
+    /// emitting this many tokens, always at a verify round's end - the pick emitted but not yet fed, so the
+    /// scheduler resumes the request by feeding its last written token (the same pending mechanism as an input
+    /// interruption).  < 0: never yield - the decode runs to its end.
+    void dflash_stint(int64_t tokens) { dflash_stint_ = tokens; }
+    bool dflash_yielded() const { return dflash_yielded_; }
+    /// The drafter's per-conversation state (STRATA_GLM_DFMULTI): swap it with the conversation now bound to `key`.
+    /// A failed swap falls back to a full reset (the drafts then rebuild from the token path's captures).
+    bool dflash_ctx_swap(uint64_t key, std::string& err);
+    bool dflash_ctx_owned(uint64_t key) const;
+    void dflash_ctx_drop(uint64_t key);
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;

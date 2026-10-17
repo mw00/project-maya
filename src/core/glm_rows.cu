@@ -42,7 +42,19 @@ uint8_t* rowq_at(uint8_t* b, int64_t n_in, int i) { return b + (size_t) i * (siz
 struct Glm5Model::RowsState {
     void* arena = nullptr;
     size_t bytes = 0;
-    float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
+    float* x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
+    float *row_residual0 = nullptr, *row_residual1 = nullptr;  // private mHC residual streams for every row
+    float *row_kin = nullptr, *kda_backup = nullptr;           // per-row KDA inputs; per-window-slot KDA snapshots
+    int n_kda = 0;
+    size_t kda_run_floats = 0, kin_layer_floats = 0;
+    std::vector<int> kin_of;
+    std::vector<int> pending_seqs;
+    std::vector<int64_t> pending_pos;
+    std::vector<int> pending_counts;   // per context: its row count in the pending window
+    std::vector<int> pending_row0;     // ... and the first row index of each context in it
+    std::vector<float*> pending_residual;
+    int pending_contexts = 0;
+    bool window_pending = false;
     uint8_t* xq = nullptr;
     float* proj[3] = {nullptr, nullptr, nullptr};
     float *fa = nullptr, *ga = nullptr, *beta = nullptr;
@@ -57,6 +69,7 @@ struct Glm5Model::RowsState {
     float* logits = nullptr;
     int* tok = nullptr;
     int* tok_h = nullptr;   // pinned
+    float* emb_h = nullptr; // pinned token embeddings, one per flattened context-depth row
     cudaEvent_t ev_done = nullptr;
 };
 // one row's sequence on this part: state, position, caches, KV stream and image row
@@ -65,6 +78,7 @@ struct Glm5Model::RowSeq {
     float* state = nullptr;
     float *Rc = nullptr, *Ro = nullptr;   // the residual pair (the token path's convention, per row)
     int64_t p = 0;
+    int64_t cap_floor = 0;
     int ring = 0;
     const std::vector<int64_t> *kda_S = nullptr, *kda_conv = nullptr, *dsa_lat = nullptr, *dsa_ik = nullptr,
                                *dsa_ig = nullptr, *dsa_pool = nullptr;
@@ -80,6 +94,12 @@ bool Glm5Model::rows_alloc(std::string& err) {
     const size_t R = (size_t) rows_max();
     const int64_t E = g.n_embd, DI = g.d_inner(), FFs = (int64_t) g.n_ff_exp * g.n_shared;
     auto* S = new RowsState();
+    S->kin_of.assign((size_t) g.n_layers, -1);
+    for (int il = l0_; il < l1_; ++il)
+        if (g.is_recr(il)) S->kin_of[(size_t) il] = S->n_kda++;
+    S->kda_run_floats = (size_t) g.d_inner() * g.kda_head_dim +
+                        (size_t) 3 * g.d_inner() * (g.d_conv - 1);
+    S->kin_layer_floats = (size_t) 3 * g.d_inner() + 2 * g.kda_head_dim + g.n_head;
     uint8_t* base = nullptr;
     size_t at = 0;
     const auto take = [&](size_t row_bytes) -> uint8_t* {   // R rows of row_bytes (256-aligned as a block)
@@ -97,6 +117,12 @@ bool Glm5Model::rows_alloc(std::string& err) {
         S->pre = f32(8);
         S->post = f32(8);
         S->comb = f32(16);
+        S->row_residual0 = f32((int64_t) g.hc * E);
+        S->row_residual1 = f32((int64_t) g.hc * E);
+        if (S->n_kda > 0) {
+            S->row_kin = f32((int64_t) S->n_kda * (int64_t) S->kin_layer_floats);
+            S->kda_backup = f32((int64_t) S->n_kda * (int64_t) S->kda_run_floats);
+        }
         for (auto& p : S->proj) p = f32(DI);
         S->fa = f32(g.kda_head_dim);
         S->ga = f32(g.kda_head_dim);
@@ -138,6 +164,7 @@ bool Glm5Model::rows_alloc(std::string& err) {
     at = 0;
     carve();   // the pointers
     if (cudaHostAlloc((void**) &S->tok_h, R * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
+        cudaHostAlloc((void**) &S->emb_h, R * (size_t) E * sizeof(float), cudaHostAllocPortable) != cudaSuccess ||
         cudaEventCreateWithFlags(&S->ev_done, cudaEventDisableTiming) != cudaSuccess) {
         cudaGetLastError();
         rows_ = S;
@@ -155,6 +182,7 @@ void Glm5Model::rows_destroy() {
     cudaSetDevice(dev_);
     if (S->arena) cudaFree(S->arena);
     if (S->tok_h) cudaFreeHost(S->tok_h);
+    if (S->emb_h) cudaFreeHost(S->emb_h);
     if (S->ev_done) cudaEventDestroy(S->ev_done);
     delete S;
     rows_ = nullptr;
@@ -163,6 +191,12 @@ void Glm5Model::rows_destroy() {
 bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) {
     const Glm5Geometry& g = g_;
     const int E = g.n_embd;
+    RowsState* S = rows_;
+    if (S == nullptr) {
+        err = "glm rows: row buffers are not allocated";
+        return false;
+    }
+    const int64_t hcE = (int64_t) g.hc * E;
     for (int i = 0; i < n; ++i) {
         const int sq = seqs[i];
         if (sq < 0 || sq >= seq_count()) {
@@ -180,6 +214,7 @@ bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) 
         if (sq == cur_seq_) {
             r.state = state_;
             r.p = pos_;
+            r.cap_floor = cap_floor_;
             r.ring = ik_ring_;
             r.kda_S = &kda_S_;
             r.kda_conv = &kda_conv_;
@@ -194,6 +229,7 @@ bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) 
             const SeqCtx& c = seq_[(size_t) sq];
             r.state = c.state;
             r.p = c.pos;
+            r.cap_floor = c.cap_floor;
             r.ring = c.ik_ring;
             r.kda_S = &c.kda_S;
             r.kda_conv = &c.kda_conv;
@@ -205,19 +241,112 @@ bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) 
             r.img = image_row_in(c.img_pos, c.img_rows, r.p, E);
             max_ctx = c.max_ctx;
         }
-        if (r.p + 1 >= max_ctx) {
+        if (r.p >= max_ctx) {
             err = "glm rows: the context of sequence " + std::to_string(sq) + " is full";
             return false;
         }
-        r.Rc = r.state;
-        r.Ro = r.state + (int64_t) g.hc * E;
+        r.Rc = row_at(S->row_residual0, hcE, i);
+        r.Ro = row_at(S->row_residual1, hcE, i);
+    }
+    return true;
+}
+
+bool Glm5Model::rows_bind_window_rows(const int* seqs, const int* counts, int n_contexts, RowSeq* rw, std::string& err) {
+    if (n_contexts < 1 || n_contexts > rows_max()) {
+        err = "glm rows: a window needs 1.." + std::to_string(rows_max()) + " contexts";
+        return false;
+    }
+    int rows_total = 0;
+    for (int c = 0; c < n_contexts; ++c) {
+        if (counts[c] < 1 || counts[c] > rows_max()) {
+            err = "glm rows: context " + std::to_string(c) + " asks for " + std::to_string(counts[c]) + " rows (1.." +
+                  std::to_string(rows_max()) + ")";
+            return false;
+        }
+        rows_total += counts[c];
+    }
+    if (rows_total > rows_max()) {
+        err = "glm rows: a window of " + std::to_string(rows_total) + " rows exceeds the arena's " +
+              std::to_string(rows_max());
+        return false;
+    }
+    RowsState* S = rows_;
+    if (S == nullptr) {
+        err = "glm rows: row buffers are not allocated";
+        return false;
+    }
+    RowSeq base[gf::kMaxMvNt];
+    if (!rows_bind(seqs, n_contexts, base, err)) return false;
+    const Glm5Geometry& g = g_;
+    const int E = g.n_embd;
+    const int64_t hcE = (int64_t) g.hc * E;
+    int row = 0;
+    for (int c = 0; c < n_contexts; ++c) {
+        int64_t max_ctx = base[c].seq == cur_seq_ ? max_ctx_ : seq_[(size_t) base[c].seq].max_ctx;
+        for (int t = 0; t < counts[c]; ++t) {   // context c's rows after the contexts before it, row-major
+            rw[row] = base[c];
+            rw[row].p = base[c].p + t;
+            if (rw[row].p >= max_ctx) {
+                err = "glm rows: context window of sequence " + std::to_string(base[c].seq) + " is full";
+                return false;
+            }
+            if (base[c].seq == cur_seq_)
+                rw[row].img = image_row(rw[row].p);
+            else {
+                const SeqCtx& sc = seq_[(size_t) base[c].seq];
+                rw[row].img = image_row_in(sc.img_pos, sc.img_rows, rw[row].p, E);
+            }
+            rw[row].Rc = row_at(S->row_residual0, hcE, row);
+            rw[row].Ro = row_at(S->row_residual1, hcE, row);
+            ++row;
+        }
+    }
+    return true;
+}
+
+bool Glm5Model::rows_bind_window(const int* seqs, int n_contexts, int depth, RowSeq* rw, std::string& err) {
+    if (depth < 2 || n_contexts < 1 || n_contexts * depth > rows_max()) {
+        err = "glm rows: a context window needs at least one context and 2.." + std::to_string(rows_max()) + " rows";
+        return false;
+    }
+    RowsState* S = rows_;
+    if (S == nullptr) {
+        err = "glm rows: row buffers are not allocated";
+        return false;
+    }
+    RowSeq base[gf::kMaxMvNt];
+    if (!rows_bind(seqs, n_contexts, base, err)) return false;
+    const Glm5Geometry& g = g_;
+    const int E = g.n_embd;
+    const int64_t hcE = (int64_t) g.hc * E;
+    for (int c = 0; c < n_contexts; ++c) {
+        int64_t max_ctx = base[c].seq == cur_seq_ ? max_ctx_ : seq_[(size_t) base[c].seq].max_ctx;
+        for (int t = 0; t < depth; ++t) {
+            const int row = c * depth + t;
+            rw[row] = base[c];
+            rw[row].p = base[c].p + t;
+            if (rw[row].p >= max_ctx) {
+                err = "glm rows: context window of sequence " + std::to_string(base[c].seq) + " is full";
+                return false;
+            }
+            if (base[c].seq == cur_seq_)
+                rw[row].img = image_row(rw[row].p);
+            else {
+                const SeqCtx& sc = seq_[(size_t) base[c].seq];
+                rw[row].img = image_row_in(sc.img_pos, sc.img_rows, rw[row].p, E);
+            }
+            rw[row].Rc = row_at(S->row_residual0, hcE, row);
+            rw[row].Ro = row_at(S->row_residual1, hcE, row);
+        }
     }
     return true;
 }
 
 bool Glm5Model::rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err) {
     FastState* F = fast_;
+    RowsState* S = rows_;
     const int E = g_.n_embd;
+    const int64_t hcE = (int64_t) g_.hc * E;
     const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
     if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
         err = "glm rows: no embedding dequantizer";
@@ -228,12 +357,11 @@ bool Glm5Model::rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::
     // ---- the embeddings: each row's token (or image row) into its own residual's 4 streams
     const size_t emb_row = ggml_row_size((ggml_type) pack_emb_type_, E);
     for (int i = 0; i < n; ++i) {
-        SeqCtx& c = seq_[(size_t) rw[i].seq];
-        // its own pinned row: the step before has completed, so no copy still reads it
-        tt->to_float(pack_emb_src_ + (size_t) tokens[i] * emb_row, c.emb_h, E);
-        if (rw[i].img != nullptr) std::memcpy(c.emb_h, rw[i].img, (size_t) E * sizeof(float));
-        cudaMemcpyAsync(F->emb, c.emb_h, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
-        gf::embed_streams(F->emb, rw[i].state, E, s);
+        float* emb = row_at(S->emb_h, E, i);
+        tt->to_float(pack_emb_src_ + (size_t) tokens[i] * emb_row, emb, E);
+        if (rw[i].img != nullptr) std::memcpy(emb, rw[i].img, (size_t) E * sizeof(float));
+        cudaMemcpyAsync(F->emb, emb, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
+        gf::embed_streams(F->emb, row_at(S->row_residual0, hcE, i), E, s);
     }
     return true;
 }
@@ -285,6 +413,17 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, i));
             if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
         }
+        // The target rows belong to independent conversations. Capture each trunk row into its own DFlash staging
+        // state; ctx_swap drains the shared stream before changing the drafter's staging pointer.
+        if (cap_d_ != nullptr && il < (int) cap_k_.size() && cap_k_[(size_t) il] >= 0)
+            for (int i = 0; i < n; ++i) {
+                std::string swap_err;
+                if (!dflash_ctx_swap((uint64_t) rw[i].seq, swap_err)) {
+                    err = "glm rows: DFlash staging context: " + swap_err;
+                    return false;
+                }
+                dflash_capture(il, rw[i].Rc, 1, rw[i].p, F->cap, F->cap_rows, s, rw[i].cap_floor);
+            }
 
         if (Ly.recr) {
             gf::MvJob j[6];
@@ -295,6 +434,20 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             j[4] = {Ly.g_a, nullptr, S->x, S->ga, nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
             j[5] = {Ly.beta, nullptr, S->x, S->beta, nullptr, 1.0f, gf::kTypeBF16, E, g.n_head};
             if (!mv(j, 6, "kda projections")) return false;
+            const int kin_layer = S->kin_of[(size_t) il];
+            for (int i = 0; i < n; ++i) {
+                float* dst = S->row_kin + ((size_t) i * S->n_kda + (size_t) kin_layer) * S->kin_layer_floats;
+                float* src[6] = {rows(S->proj[0], DI, i), rows(S->proj[1], DI, i), rows(S->proj[2], DI, i),
+                                 rows(S->fa, g.kda_head_dim, i), rows(S->ga, g.kda_head_dim, i), rows(S->beta, g.n_head, i)};
+                const size_t nbytes[6] = {(size_t) DI * sizeof(float), (size_t) DI * sizeof(float),
+                                          (size_t) DI * sizeof(float), (size_t) g.kda_head_dim * sizeof(float),
+                                          (size_t) g.kda_head_dim * sizeof(float), (size_t) g.n_head * sizeof(float)};
+                size_t off = 0;
+                for (int j = 0; j < 6; ++j) {
+                    cudaMemcpyAsync(dst + off, src[j], nbytes[j], cudaMemcpyDeviceToDevice, s);
+                    off += nbytes[j] / sizeof(float);
+                }
+            }
             for (int i = 0; i < n; ++i) {
                 gf::KdaPrepArgs k;
                 for (int c = 0; c < 3; ++c) {
@@ -450,7 +603,7 @@ bool Glm5Model::rows_head(const RowSeq* rw, const strata::kernels::SamplerParams
     };
     // ---- the head: one read of the output matrix for every row, then each row's draw
     for (int i = 0; i < n; ++i)
-        gf::head_prep(rw[i].state, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, i),
+        gf::head_prep(rw[i].Ro, w_.at("output_norm.weight"), g.norm_eps, E, rows(S->head_x, E, i),
                       rows_q(S->head_xq, E, i), s);
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o = {ow.q, S->head_xq, S->head_x, S->logits, nullptr, 1.0f, ow.type, E, g.n_vocab};
@@ -516,6 +669,391 @@ bool Glm5Model::multi_rows(const int* seqs, const int32_t* tokens, const strata:
             c.last_tok = tok;
         }
     }
+    return true;
+}
+
+bool Glm5Model::multi_window_rows(const int* seqs, const int32_t* tokens, const int* counts, int n_contexts,
+                                  const strata::kernels::SamplerParams* sps, int32_t* picks, std::string& err) {
+    if (!rows_ok() || n_parts_ != 1 || seq_.empty() || seqs == nullptr || tokens == nullptr || counts == nullptr ||
+        sps == nullptr || picks == nullptr || n_contexts < 1) {
+        err = "glm rows: the ragged multi-window needs one GPU and 1+ contexts with per-context row counts";
+        return false;
+    }
+    RowsState* S = rows_;
+    if (S->window_pending) {
+        err = "glm rows: the previous multi-window has not been committed";
+        return false;
+    }
+    if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;
+    if (!fast_boundary(err)) return false;
+    FastState* F = fast_;
+    struct ProfOff {
+        FastState* F;
+        bool was;
+        ~ProfOff() { F->prof_on = was; }
+    } prof_off{F, F->prof_on};
+    F->prof_on = false;
+
+    const int n = std::accumulate(counts, counts + n_contexts, 0);
+    strata::kernels::SamplerParams row_sps[gf::kMaxMvNt];
+    RowSeq rw[gf::kMaxMvNt];
+    for (int c = 0; c < n_contexts; ++c) {
+        for (int k = 0; k < c; ++k)
+            if (seqs[k] == seqs[c]) {
+                err = "glm rows: multi-window context " + std::to_string(seqs[c]) + " appears twice";
+                return false;
+            }
+    }
+    int row = 0;
+    for (int c = 0; c < n_contexts; ++c)
+        for (int t = 0; t < counts[c]; ++t) {
+            row_sps[row] = sps[c];
+            row_sps[row].counter += t;
+            ++row;
+        }
+    if (!rows_bind_window_rows(seqs, counts, n_contexts, rw, err)) return false;
+    S->pending_seqs.assign(seqs, seqs + n_contexts);
+    S->pending_counts.assign(counts, counts + n_contexts);
+    S->pending_row0.assign((size_t) n_contexts, 0);
+    for (int c = 0, at = 0; c < n_contexts; at += counts[c], ++c) S->pending_row0[(size_t) c] = at;
+    S->pending_pos.resize((size_t) n_contexts);
+    S->pending_contexts = n_contexts;
+    for (int c = 0; c < n_contexts; ++c) {
+        S->pending_pos[(size_t) c] = rw[S->pending_row0[(size_t) c]].p;
+        float* backup = row_at(S->kda_backup, (int64_t) S->n_kda * (int64_t) S->kda_run_floats, c);
+        for (int il = l0_; il < l1_; ++il) {
+            if (!g_.is_recr(il)) continue;
+            const int k = S->kin_of[(size_t) il];
+            cudaMemcpyAsync(backup + (size_t) k * S->kda_run_floats,
+                            rw[S->pending_row0[(size_t) c]].state + (*rw[S->pending_row0[(size_t) c]].kda_S)[(size_t) il],
+                            S->kda_run_floats * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        }
+    }
+    if (!rows_embed(rw, tokens, n, err) || !rows_layers(rw, n, err)) {
+        S->pending_contexts = 0;
+        S->pending_seqs.clear();
+        S->pending_counts.clear();
+        S->pending_row0.clear();
+        S->pending_pos.clear();
+        S->pending_residual.clear();
+        return false;
+    }
+    S->pending_residual.resize((size_t) n);
+    for (int i = 0; i < n; ++i) S->pending_residual[(size_t) i] = rw[i].Ro;
+    if (!rows_head(rw, row_sps, n, err)) {
+        S->pending_contexts = 0;
+        S->pending_seqs.clear();
+        S->pending_counts.clear();
+        S->pending_row0.clear();
+        S->pending_pos.clear();
+        S->pending_residual.clear();
+        return false;
+    }
+    cudaMemcpyAsync(S->tok_h, S->tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+    cudaEventRecord(S->ev_done, F->cs);
+    if (!glmfast::wait_event(S->ev_done, "glm rows multi-window", err) || !F->route_ok(err)) return false;
+    if (gf::launch_errors() > 0) {
+        err = "glm rows: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed in multi-window";
+        return false;
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("glm rows multi-window: ") + cudaGetErrorString(e);
+        return false;
+    }
+    for (int i = 0; i < n; ++i) picks[i] = (int32_t) S->tok_h[i];
+    S->window_pending = true;
+    return true;
+}
+
+bool Glm5Model::multi_window(const int* seqs, const int32_t* tokens, int n_contexts, int depth,
+                             const strata::kernels::SamplerParams* sps, int32_t* picks, std::string& err) {
+    if (!rows_ok() || n_parts_ != 1 || seq_.empty() || seqs == nullptr || tokens == nullptr || sps == nullptr ||
+        picks == nullptr || n_contexts < 1 || depth < 2 || n_contexts * depth > rows_max()) {
+        err = "glm rows: multi-window needs one GPU, 1+ contexts, depth 2+, and at most " +
+              std::to_string(rows_max()) + " rows";
+        return false;
+    }
+    RowsState* S = rows_;
+    if (S->window_pending) {
+        err = "glm rows: the previous multi-window has not been committed";
+        return false;
+    }
+    if (seq_[0].hop_h == nullptr && !seq_pipe_ready(err)) return false;
+    if (!fast_boundary(err)) return false;
+    FastState* F = fast_;
+    struct ProfOff {
+        FastState* F;
+        bool was;
+        ~ProfOff() { F->prof_on = was; }
+    } prof_off{F, F->prof_on};
+    F->prof_on = false;
+
+    const int n = n_contexts * depth;
+    strata::kernels::SamplerParams row_sps[gf::kMaxMvNt];
+    RowSeq rw[gf::kMaxMvNt];
+    for (int c = 0; c < n_contexts; ++c) {
+        for (int k = 0; k < c; ++k)
+            if (seqs[k] == seqs[c]) {
+                err = "glm rows: multi-window context " + std::to_string(seqs[c]) + " appears twice";
+                return false;
+            }
+        for (int t = 0; t < depth; ++t) {
+            const int row = c * depth + t;
+            row_sps[row] = sps[c];
+            row_sps[row].counter += t;
+        }
+    }
+    if (!rows_bind_window(seqs, n_contexts, depth, rw, err)) return false;
+    S->pending_seqs.assign(seqs, seqs + n_contexts);
+    {
+        std::vector<int> counts((size_t) n_contexts, depth);
+        S->pending_counts.assign(counts.begin(), counts.end());
+        S->pending_row0.assign((size_t) n_contexts, 0);
+        for (int c = 0, at = 0; c < n_contexts; at += depth, ++c) S->pending_row0[(size_t) c] = at;
+    }
+    S->pending_pos.resize((size_t) n_contexts);
+    S->pending_contexts = n_contexts;
+    for (int c = 0; c < n_contexts; ++c) {
+        S->pending_pos[(size_t) c] = rw[c * depth].p;
+        float* backup = row_at(S->kda_backup, (int64_t) S->n_kda * (int64_t) S->kda_run_floats, c);
+        for (int il = l0_; il < l1_; ++il) {
+            if (!g_.is_recr(il)) continue;
+            const int k = S->kin_of[(size_t) il];
+            cudaMemcpyAsync(backup + (size_t) k * S->kda_run_floats,
+                            rw[c * depth].state + (*rw[c * depth].kda_S)[(size_t) il],
+                            S->kda_run_floats * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        }
+    }
+    if (!rows_embed(rw, tokens, n, err) || !rows_layers(rw, n, err)) {
+        S->pending_contexts = 0;
+        S->pending_seqs.clear();
+        S->pending_counts.clear();
+        S->pending_row0.clear();
+        S->pending_pos.clear();
+        S->pending_residual.clear();
+        return false;
+    }
+    S->pending_residual.resize((size_t) n);
+    for (int i = 0; i < n; ++i) S->pending_residual[(size_t) i] = rw[i].Ro;
+    if (!rows_head(rw, row_sps, n, err)) {
+        S->pending_contexts = 0;
+        S->pending_seqs.clear();
+        S->pending_counts.clear();
+        S->pending_row0.clear();
+        S->pending_pos.clear();
+        S->pending_residual.clear();
+        return false;
+    }
+    cudaMemcpyAsync(S->tok_h, S->tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost, F->cs);
+    cudaEventRecord(S->ev_done, F->cs);
+    if (!glmfast::wait_event(S->ev_done, "glm rows multi-window", err) || !F->route_ok(err)) return false;
+    if (gf::launch_errors() > 0) {
+        err = "glm rows: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed in multi-window";
+        return false;
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("glm rows multi-window: ") + cudaGetErrorString(e);
+        return false;
+    }
+    for (int i = 0; i < n; ++i) picks[i] = (int32_t) S->tok_h[i];
+    S->window_pending = true;
+    return true;
+}
+
+bool Glm5Model::commit_window_rows(const int* seqs, const int* keep, int n_contexts, std::string& err) {
+    RowsState* S = rows_;
+    if (!rows_ok() || S == nullptr || !S->window_pending || seqs == nullptr || keep == nullptr ||
+        n_contexts != S->pending_contexts) {
+        err = "glm rows: no matching multi-window transaction to commit";
+        return false;
+    }
+    for (int c = 0; c < n_contexts; ++c) {
+        if (seqs[c] != S->pending_seqs[(size_t) c] || keep[c] < 1 || keep[c] > S->pending_counts[(size_t) c]) {
+            err = "glm rows: invalid context order or prefix length in multi-window commit";
+            return false;
+        }
+    }
+    RowSeq base[gf::kMaxMvNt];
+    if (!rows_bind(seqs, n_contexts, base, err)) return false;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaSetDevice(dev_);
+    for (int c = 0; c < n_contexts; ++c) {
+        const int depth = S->pending_counts[(size_t) c];   // this context's own row count in the pending window
+        const int row0 = S->pending_row0[(size_t) c];      // ... where its rows start (row-major, ragged)
+        if (keep[c] < depth) {
+            const float* backup = row_at(S->kda_backup,
+                                         (int64_t) S->n_kda * (int64_t) S->kda_run_floats, c);
+            // Restore only recurrent KDA state. DSA cache rows beyond the committed position are request-local and
+            // are overwritten before a later query can read those positions, as in window_commit().
+            for (int il = l0_; il < l1_; ++il) {
+                if (!g.is_recr(il)) continue;
+                const int k = S->kin_of[(size_t) il];
+                cudaMemcpyAsync(base[c].state + (*base[c].kda_S)[(size_t) il],
+                                backup + (size_t) k * S->kda_run_floats,
+                                S->kda_run_floats * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+            }
+            for (int t = 0; t < keep[c]; ++t)
+                for (int il = l0_; il < l1_; ++il) {
+                    if (!g.is_recr(il)) continue;
+                    const auto& Ly = F->L[(size_t) il];
+                    const int k = S->kin_of[(size_t) il];
+                    const int row = row0 + t;
+                    const float* in = S->row_kin + ((size_t) row * S->n_kda + (size_t) k) * S->kin_layer_floats;
+                    const int DI = g.d_inner();
+                    const int HD = g.kda_head_dim;
+                    gf::KdaPrepArgs pa;
+                    for (int j = 0; j < 3; ++j) {
+                        pa.proj[j] = const_cast<float*>(in + (size_t) j * DI);
+                        pa.conv_w[j] = Ly.conv[j];
+                        pa.out[j] = F->conv[j];
+                    }
+                    pa.conv_state = base[c].state + (*base[c].kda_conv)[(size_t) il];
+                    pa.fa = const_cast<float*>(in + (size_t) 3 * DI);
+                    pa.ga = const_cast<float*>(in + (size_t) 3 * DI + HD);
+                    pa.f_b = Ly.f_b;
+                    pa.g_b = Ly.g_b;
+                    pa.dt_bias = Ly.dt_bias;
+                    pa.ssm_a = Ly.ssm_a;
+                    pa.lower_bound = g.kda_lb;
+                    pa.g1 = F->g1;
+                    pa.g2 = F->g2;
+                    pa.n_head = g.n_head;
+                    pa.head_dim = HD;
+                    pa.d_conv = g.d_conv;
+                    gf::kda_prep(pa, F->cs);
+                    const float* beta = in + (size_t) 3 * DI + 2 * HD;
+                    gf::kda_rec(F->conv[0], F->conv[1], F->conv[2], F->g1, beta,
+                                base[c].state + (*base[c].kda_S)[(size_t) il], F->g2, Ly.ssm_norm, g.norm_eps,
+                                g.n_head, HD, F->gated_q, F->cs);
+                }
+        }
+        const int64_t p = S->pending_pos[(size_t) c] + keep[c];
+        if (keep[c] < depth)
+            cudaMemcpyAsync(base[c].state, S->pending_residual[(size_t) row0 + keep[c] - 1],
+                            (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        const int last = S->tok_h[row0 + keep[c] - 1];
+        if (seqs[c] == cur_seq_) {
+            pos_ = p;
+            last_tok_ = last;
+        } else {
+            SeqCtx& sc = seq_[(size_t) seqs[c]];
+            sc.pos = p;
+            sc.last_tok = last;
+        }
+    }
+    cudaStreamSynchronize(F->cs);
+    if (gf::launch_errors() > 0) {
+        err = "glm rows: KDA prefix replay failed in multi-window commit";
+        return false;
+    }
+    S->window_pending = false;
+    S->pending_contexts = 0;
+    S->pending_seqs.clear();
+    S->pending_counts.clear();
+    S->pending_row0.clear();
+    S->pending_pos.clear();
+    S->pending_residual.clear();
+    return true;
+}
+
+bool Glm5Model::commit_window_prefixes(const int* seqs, const int* keep, int n_contexts, int depth,
+                                       std::string& err) {
+    RowsState* S = rows_;
+    if (!rows_ok() || S == nullptr || !S->window_pending || seqs == nullptr || keep == nullptr ||
+        n_contexts != S->pending_contexts || (int) S->pending_counts.size() != n_contexts ||
+        depth != S->pending_counts[(size_t) 0]) {
+        err = "glm rows: no matching multi-window transaction to commit";
+        return false;
+    }
+    for (int c = 0; c < n_contexts; ++c) {
+        if (seqs[c] != S->pending_seqs[(size_t) c] || keep[c] < 1 || keep[c] > depth) {
+            err = "glm rows: invalid context order or prefix length in multi-window commit";
+            return false;
+        }
+    }
+    RowSeq base[gf::kMaxMvNt];
+    if (!rows_bind(seqs, n_contexts, base, err)) return false;
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    cudaSetDevice(dev_);
+    for (int c = 0; c < n_contexts; ++c) {
+        const int row0 = S->pending_row0.empty() ? c * depth : S->pending_row0[(size_t) c];
+        if (keep[c] < depth) {
+            const float* backup = row_at(S->kda_backup,
+                                         (int64_t) S->n_kda * (int64_t) S->kda_run_floats, c);
+            // Restore only recurrent KDA state. DSA cache rows beyond the committed position are request-local and
+            // are overwritten before a later query can read those positions, as in window_commit().
+            for (int il = l0_; il < l1_; ++il) {
+                if (!g.is_recr(il)) continue;
+                const int k = S->kin_of[(size_t) il];
+                cudaMemcpyAsync(base[c].state + (*base[c].kda_S)[(size_t) il],
+                                backup + (size_t) k * S->kda_run_floats,
+                                S->kda_run_floats * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+            }
+            for (int t = 0; t < keep[c]; ++t)
+                for (int il = l0_; il < l1_; ++il) {
+                    if (!g.is_recr(il)) continue;
+                    const auto& Ly = F->L[(size_t) il];
+                    const int k = S->kin_of[(size_t) il];
+                    const int row = row0 + t;
+                    const float* in = S->row_kin + ((size_t) row * S->n_kda + (size_t) k) * S->kin_layer_floats;
+                    const int DI = g.d_inner();
+                    const int HD = g.kda_head_dim;
+                    gf::KdaPrepArgs pa;
+                    for (int j = 0; j < 3; ++j) {
+                        pa.proj[j] = const_cast<float*>(in + (size_t) j * DI);
+                        pa.conv_w[j] = Ly.conv[j];
+                        pa.out[j] = F->conv[j];
+                    }
+                    pa.conv_state = base[c].state + (*base[c].kda_conv)[(size_t) il];
+                    pa.fa = const_cast<float*>(in + (size_t) 3 * DI);
+                    pa.ga = const_cast<float*>(in + (size_t) 3 * DI + HD);
+                    pa.f_b = Ly.f_b;
+                    pa.g_b = Ly.g_b;
+                    pa.dt_bias = Ly.dt_bias;
+                    pa.ssm_a = Ly.ssm_a;
+                    pa.lower_bound = g.kda_lb;
+                    pa.g1 = F->g1;
+                    pa.g2 = F->g2;
+                    pa.n_head = g.n_head;
+                    pa.head_dim = HD;
+                    pa.d_conv = g.d_conv;
+                    gf::kda_prep(pa, F->cs);
+                    const float* beta = in + (size_t) 3 * DI + 2 * HD;
+                    gf::kda_rec(F->conv[0], F->conv[1], F->conv[2], F->g1, beta,
+                                base[c].state + (*base[c].kda_S)[(size_t) il], F->g2, Ly.ssm_norm, g.norm_eps,
+                                g.n_head, HD, F->gated_q, F->cs);
+                }
+        }
+        const int64_t p = S->pending_pos[(size_t) c] + keep[c];
+        if (keep[c] < depth)
+            cudaMemcpyAsync(base[c].state, S->pending_residual[(size_t) row0 + keep[c] - 1],
+                            (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        const int last = S->tok_h[row0 + keep[c] - 1];
+        if (seqs[c] == cur_seq_) {
+            pos_ = p;
+            last_tok_ = last;
+        } else {
+            SeqCtx& sc = seq_[(size_t) seqs[c]];
+            sc.pos = p;
+            sc.last_tok = last;
+        }
+    }
+    cudaStreamSynchronize(F->cs);
+    if (gf::launch_errors() > 0) {
+        err = "glm rows: KDA prefix replay failed in multi-window commit";
+        return false;
+    }
+    S->window_pending = false;
+    S->pending_contexts = 0;
+    S->pending_seqs.clear();
+    S->pending_counts.clear();
+    S->pending_row0.clear();
+    S->pending_pos.clear();
+    S->pending_residual.clear();
     return true;
 }
 

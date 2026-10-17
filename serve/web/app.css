@@ -296,17 +296,20 @@ button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline
   .facts dd { margin-bottom: var(--st-s-2); }
 }
 
-/* the hero's two rates: decode (the headline) and prefill (prompt tokens read a second, the cached prefix not
-   counted), each a swatch of its curve on the graph - prefill in the second accent, dashed, on its own scale */
+/* the hero's rates: combined decode, average per active request, and prefill (prompt tokens read a second, the cached
+   prefix not counted).  Only the total decode and prefill have history curves; per-request is total / active decoders. */
 .hero__speeds { display: flex; align-items: flex-end; gap: var(--st-s-6); flex-wrap: wrap; }
 .hero__rate { display: flex; flex-direction: column; gap: 4px; }
+.hero__rate--per-request .hero__value { font-size: 44px; }
 .hero__rate--prefill .hero__value { font-size: 44px; }
 .hero__speed-sub::before { content: ""; display: inline-block; width: 10px; height: 10px; margin-right: 6px;
   border: 1.5px solid var(--st-line); border-radius: 2px; background: var(--st-accent); vertical-align: -1px; }
+.hero__rate--per-request .hero__speed-sub::before { background: var(--st-surface-2); border-style: dashed; }
 .hero__rate--prefill .hero__speed-sub::before { background: var(--st-accent-2); }
 .hero__spark-prefill { color: var(--st-accent-2); }
 @media (max-width: 560px) {
   .hero__value { font-size: 48px; }
+  .hero__rate--per-request .hero__value { font-size: 32px; }
   .hero__rate--prefill .hero__value { font-size: 32px; }
 }
 

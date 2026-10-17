@@ -34,6 +34,7 @@ void Glm5Model::seq_bind(int s) {
     o.max_ctx = max_ctx_;
     o.bytes = state_bytes_;
     o.ik_ring = ik_ring_;
+    o.cap_floor = cap_floor_;
     std::swap(o.kda_S, kda_S_);
     std::swap(o.kda_conv, kda_conv_);
     std::swap(o.dsa_lat, dsa_lat_);
@@ -56,6 +57,7 @@ void Glm5Model::seq_bind(int s) {
     max_ctx_ = n.max_ctx;
     state_bytes_ = n.bytes;
     ik_ring_ = n.ik_ring;
+    cap_floor_ = n.cap_floor;
     std::swap(n.kda_S, kda_S_);
     std::swap(n.kda_conv, kda_conv_);
     std::swap(n.dsa_lat, dsa_lat_);
@@ -159,6 +161,29 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
     int n_rec = 0;
     for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il) ? 1 : 0;
+    const char* dfmulti_env = std::getenv("STRATA_GLM_DFMULTI");
+    // The drafter is loaded after the sequence arenas are allocated, so dflash_on_ is not set yet here; the explicit
+    // DFMULTI opt-in is the reliable startup signal for reserving its per-sequence verify backups.
+    const bool need_dflash_backups = n > 1 && dfmulti_env != nullptr && std::atof(dfmulti_env) > 0.0;
+    const size_t backup_bytes = (size_t) n_rec * run * sizeof(float);
+    if (need_dflash_backups && n_rec > 0) {
+        // reserve every sequence's verify-window rollback buffer before the expert pool takes the remaining VRAM;
+        // lazy cudaMalloc in spec_kda_copy can otherwise fail after DFlash has allocated per-conversation drafter rings.
+        if (kda_bak_ == nullptr && cudaMalloc(&kda_bak_, backup_bytes) != cudaSuccess) {
+            cudaGetLastError();
+            err = "glm multi: the DFlash recurrent-state backup does not fit before the expert pool";
+            return false;
+        }
+        for (int s = 1; s < n; ++s) {
+            SeqCtx& c = seq_[(size_t) s];
+            if (c.kda_bak == nullptr && cudaMalloc(&c.kda_bak, backup_bytes) != cudaSuccess) {
+                cudaGetLastError();
+                err = "glm multi: DFlash recurrent-state backup for sequence " + std::to_string(s) + " of " +
+                      std::to_string(n) + " does not fit before the expert pool";
+                return false;
+            }
+        }
+    }
     const size_t pool_floats = dsa_layers().size() * 2 * (size_t) ((g.idx_kpool - 1) * g.idx_key);
     for (int s = 0; s < n; ++s) {
         float*& snap = s == 0 ? snap_ : seq_[(size_t) s].snap;
@@ -173,9 +198,11 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
         }
         more += (uint64_t) ((n_rec > 0 ? (size_t) n_rec * run : 0) + pool_floats) * sizeof(float);
     }
+    if (need_dflash_backups && n_rec > 0) more += (uint64_t) backup_bytes * n;
     std::fprintf(stderr, "glm multi: CUDA%d %d sequence states: the first for %lld tokens (%.2f GB), %d more for %lld "
-                 "(%.2f GB in all, with every sequence's snapshot)\n", dev_, n, (long long) max_ctx_,
-                 (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9);
+                 "(%.2f GB in all, with every sequence's snapshot%s)\n", dev_, n, (long long) max_ctx_,
+                 (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9,
+                 need_dflash_backups ? " and DFlash backup" : "");
     // one GPU decodes the sequences together; opt-in split rows need the same activations on every part, before its pool
     const char* sr = getenv("STRATA_GLM_SPLIT_ROWS");
     if (n_parts_ == 1 || (sr != nullptr && std::atoi(sr) > 0)) return rows_alloc(err);

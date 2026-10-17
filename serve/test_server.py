@@ -946,6 +946,42 @@ class LiveRate(unittest.TestCase):
         self.assertEqual(self.metrics()["live"]["state"], "idle")
         self.assertIsNone(self.metrics()["live"]["tok_s"])
 
+    def test_two_live_requests_report_aggregate_and_per_request_decode_rates(self):
+        """With an engine that admits two streams, the monitor separates their combined rate from each request's rate."""
+        self.svc.fifo.set_capacity(2)
+        body = json.dumps({"model": "m", "max_tokens": self.TOKENS, "temperature": 0,
+                           "messages": [{"role": "user", "content": "hi"}]}).encode()
+        errors = []
+
+        def call():
+            try:
+                with urllib.request.urlopen(urllib.request.Request(self.base + "/v1/chat/completions", data=body,
+                                                                   headers={"Content-Type": "application/json"}),
+                                            timeout=30) as r:
+                    r.read()
+            except Exception as e:
+                errors.append(e)
+
+        a, b = threading.Thread(target=call), threading.Thread(target=call)
+        a.start(); b.start()
+        live = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            candidate = self.metrics()["live"]
+            if candidate.get("generating") == 2 and candidate.get("tok_s") and candidate.get("tok_s_per_request"):
+                live = candidate
+                break
+            time.sleep(0.01)
+        a.join(30); b.join(30)
+        self.assertFalse(errors, errors)
+        if live is None:
+            self.fail("the two requests never produced a concurrent live monitor sample")
+        self.assertEqual(live["active"], 2)
+        self.assertEqual(live["generating"], 2)
+        self.assertGreater(live["tok_s"], 0)
+        self.assertGreater(live["tok_s_per_request"], 0)
+        self.assertAlmostEqual(live["tok_s"], 2 * live["tok_s_per_request"], delta=2.0)
+
     def test_a_request_without_a_done_keeps_no_engine_counters(self):
         """An engine that dies mid-answer: the previous request's `last` must not become this row's decode rate."""
         class HalfDead(MockEngine):
