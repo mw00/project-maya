@@ -199,10 +199,10 @@ void test_mv(int k, int n, int K, int cb, bool q8, int view_c0 = -1, int view_n 
     cudaFree(d_y);
 }
 
-void test_batch() {
+void test_batch(int Ka, int Kc) {
     // three jobs, two bit widths: the launch per (K, cb) and the per-job scratch ranges
     const int k = 8192;
-    HostMat a = make_mat(k, 512, 4, 2), b = make_mat(k, 256, 4, 2), c = make_mat(1024, 384, 3, 2);
+    HostMat a = make_mat(k, 512, Ka, 2), b = make_mat(k, 256, Ka, 2), c = make_mat(1024, 384, Kc, 2);
     HostMat* hm[3] = {&a, &b, &c};
     ex::Mat m[3];
     ex::MvJob j[3];
@@ -1027,8 +1027,10 @@ int main() {
     test_mv(12288, 256, 4, 2, false);       // k > 4096
     test_mv(2048, 4096, 5, 2, true);        // q8_1 input
     test_mv(4096, 1024, 2, 2, false, 384, 256);   // a column view
-    test_batch();
-    for (int K : {2, 3, 4}) test_moe(K, 2);
+    test_batch(4, 3);
+    test_batch(8, 6);                       // 8-bit attention / shared experts (EXL3-sc_4.10bpw)
+    // routed experts above 4 bits: EXL3-sc_4.10bpw's first MoE layer is 5-bit
+    for (int K : {2, 3, 4, 5, 6, 8}) test_moe(K, 2);
     test_moe(3, 1);
     for (int K : {2, 5}) test_recon(256, 384, K, 2);
     test_recon(256, 256, 3, 0);
@@ -1037,7 +1039,7 @@ int main() {
     for (int K : {2, 3, 5, 8}) test_gemm_rows(512, 384, K, 2, 45);
     test_gemm_rows(4096, 256, 3, 1, 100);
     test_gemm_rows(1024, 128, 4, 0, 7);
-    for (int K : {2, 3, 4}) test_set(K, 2);
+    for (int K : {2, 3, 4, 5, 8}) test_set(K, 2);
     for (int K = 1; K <= 8; ++K) test_cpu(512, 256, K);
     test_cpu(4096, 2048, 3);
     test_cpu(2048, 4096, 3);
@@ -1047,12 +1049,12 @@ int main() {
     for (int nc : {2, 4, 7, 16}) test_mv_n(4096, 512, 3, 2, false, nc);   // occupancy split
     test_mv_n(12288, 256, 6, 2, false, 6);                                  // k > 4096
     test_mv_n(2048, 4096, 5, 2, true, 8);                                   // q8_1 input
-    for (int K : {2, 3, 4, 8}) test_win(K, 2, 7);
+    for (int K : {2, 3, 4, 5, 8}) test_win(K, 2, 7);
     test_win(3, 1, 2);
     test_win(3, 2, 16);
-    for (int K : {1, 3, 6, 8}) test_cpu_n(512, 256, K);
+    for (int K : {1, 3, 5, 6, 8}) test_cpu_n(512, 256, K);
     for (int K : {2, 3, 4, 5, 8}) test_cpu_rows(512, 384, K);
-    for (int K : {3, 4, 6}) test_cpu_gemm(768, 256, K);
+    for (int K : {3, 4, 5, 6}) test_cpu_gemm(768, 256, K);
     test_cpu_had();
     // the CPU tiers against an exact model of their arithmetic (odd slice counts too: 37 slices)
     for (int K = 1; K <= 8; ++K) test_cpu_exact(512, 256, K);

@@ -47,6 +47,7 @@ The setup asks which one to download and recommends one for your PC. How they're
 | --- | ---: | --- | --- |
 | [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | NVIDIA only, experimental |
 | [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | NVIDIA only, experimental |
+| [EXL3 4.10 bpw, self-calibrated](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/sc_4.10bpw) by turboderp | 167.8 GB | in the setup: `--model EXL3-sc_4.10bpw` | NVIDIA only, experimental; 8-bit attention and shared experts |
 
 </details>
 
