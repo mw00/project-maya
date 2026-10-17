@@ -1766,8 +1766,53 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 sgemm_bf16(Ly.f_b, DI, HD, B.fa, HD, B.g1, DI, tn, 1.0f);
                 sgemm_bf16(Ly.g_b, DI, HD, B.ga, HD, B.g2, DI, tn, 1.0f);
                 S->mark("kda_proj", s);
-                gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta,
-                            state_ + kda_S_[(size_t) il], B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
+                // the recurrence over n_head x 4 blocks (kda_rec_split: the value columns are independent) instead of
+                // one block a head - 32 blocks for a V100's 80 SMs.  Maya-S24, 27K prompts: kda_rec 4.7 / 5.1 -> 3.5 s
+                // (8 blocks a head: 5.3 / 5.5 s); state and output within 1e-7 of the one-block kernel.
+                // STRATA_GLM_KDA_SPLIT=0 / 8: the one-block kernel / 8 a head.  STRATA_GLM_KDA_SPLIT_CHECK=1 (debug):
+                // the one-block kernel on a copy too, compared
+                static const int kda_split = [] {
+                    const char* v = getenv("STRATA_GLM_KDA_SPLIT");
+                    const int n = v ? std::atoi(v) : 4;
+                    return n == 4 || n == 8 ? n : 0;
+                }();
+                float* Sl = state_ + kda_S_[(size_t) il];
+                if (kda_split > 0) {
+                    static const bool chk = getenv("STRATA_GLM_KDA_SPLIT_CHECK") != nullptr;
+                    const size_t sn = (size_t) g.n_head * 128 * 128, on = (size_t) tn * DI;
+                    float* rs = nullptr;
+                    __half* ro = nullptr;
+                    if (chk && cudaMalloc(&rs, sn * 4) == cudaSuccess && cudaMalloc(&ro, on * 2) == cudaSuccess) {
+                        cudaMemcpyAsync(rs, Sl, sn * 4, cudaMemcpyDeviceToDevice, s);
+                        gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, rs,
+                                    B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, ro, s);
+                    }
+                    gb::kda_rec_split(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, Sl,
+                                      B.g2, Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s, kda_split);
+                    if (rs != nullptr && ro != nullptr) {
+                        std::vector<float> a1(sn), a2(sn);
+                        std::vector<__half> o1(on), o2(on);
+                        cudaStreamSynchronize(s);
+                        cudaMemcpy(a1.data(), Sl, sn * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(a2.data(), rs, sn * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(o1.data(), B.out16, on * 2, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(o2.data(), ro, on * 2, cudaMemcpyDeviceToHost);
+                        double ns = 0, ds = 0, no = 0, dd = 0;
+                        for (size_t i = 0; i < sn; ++i) { const double d = a1[i] - a2[i]; ns += d * d; ds += (double) a2[i] * a2[i]; }
+                        for (size_t i = 0; i < on; ++i) {
+                            const double x = __half2float(o1[i]), y = __half2float(o2[i]);
+                            no += (x - y) * (x - y);
+                            dd += y * y;
+                        }
+                        std::fprintf(stderr, "glm prefill kda split check: layer %d, %d tokens, state rel L2 %.3e, out %.3e\n",
+                                     il, tn, std::sqrt(ns / std::max(1e-30, ds)), std::sqrt(no / std::max(1e-30, dd)));
+                    }
+                    if (rs) cudaFree(rs);
+                    if (ro) cudaFree(ro);
+                } else {
+                    gb::kda_rec(B.conv[0], B.conv[1], B.conv[2], B.g1, Ly.dt_bias, Ly.ssm_a, g.kda_lb, B.beta, Sl, B.g2,
+                                Ly.ssm_norm, g.norm_eps, g.n_head, tn, B.out16, s);
+                }
                 S->mark("kda_rec", s);
                 if (!skip_output) hgemm_q(Ly.out, E, DI, B.out16, DI, mixer, E, tn, 0.0f);
             } else {
