@@ -14,9 +14,11 @@
 //
 // Resident: prints "READY <n_embd>", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
+//   VID <video path> <output path>   ->  "OK <n_frames> <total_tokens> <ms>"  or  "ERR <message>"
 //   QUIT
 // The output file is  int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd}  then float32 [n_tokens][n_embd],
 // row i at grid position (x = i % nx, y = i / nx).  The text model is opened vocab-only (no weights).
+// VID writes one such record per frame of the video (the frame token counts are in the record headers).
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "llama.h"
@@ -38,11 +40,15 @@ void quiet_log(ggml_log_level level, const char* text, void*) {
     if (level >= GGML_LOG_LEVEL_WARN) std::fputs(text, stderr);
 }
 
-// "ENC <image> <out>": paths may contain spaces, so the image path ends at the last " " before the output path;
-// the server always writes paths without spaces, but a user calling the tool by hand might not
-bool parse_enc(const std::string& line, std::string& img, std::string& out) {
-    if (line.rfind("ENC ", 0) != 0) return false;
-    const std::string rest = line.substr(4);
+// "ENC <image> <out>" / "VID <video> <out>": paths may contain spaces, so the media path ends at the last " "
+// before the output path; the server always writes paths without spaces, but a user calling the tool by hand
+// might not
+bool parse_cmd(const std::string& line, std::string& cmd, std::string& img, std::string& out) {
+    const size_t sp0 = line.find(' ');
+    if (sp0 == std::string::npos) return false;
+    cmd = line.substr(0, sp0);
+    if (cmd != "ENC" && cmd != "VID") return false;
+    const std::string rest = line.substr(sp0 + 1);
     const size_t sp = rest.rfind(' ');
     if (sp == std::string::npos || sp == 0) return false;
     img = rest.substr(0, sp);
@@ -171,48 +177,65 @@ int main(int argc, char** argv) {
     while (std::getline(std::cin, line)) {
         while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
         if (line == "QUIT") break;
-        std::string img, out;
-        if (!parse_enc(line, img, out)) { std::printf("ERR expected: ENC <image> <output>\n"); std::fflush(stdout); continue; }
+        std::string cmd, img, out;
+        if (!parse_cmd(line, cmd, img, out)) {
+            std::printf("ERR expected: ENC <image> <output> or VID <video> <output>\n");
+            std::fflush(stdout);
+            continue;
+        }
+        const bool vid = cmd == "VID";
         const auto t0 = std::chrono::steady_clock::now();
-        mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false,
-                                                                            mtmd_helper_init_opt_default());
-        if (!bw.bitmap) { std::printf("ERR cannot read the image %s\n", img.c_str()); std::fflush(stdout); continue; }
+        mtmd_helper_init_opt opt = mtmd_helper_init_opt_default();
+        if (vid) opt.video_params.timestamp_interval_ms = 0;   // no timestamp text between the frames (v1)
+        mtmd_helper_bitmap_wrapper bw = mtmd_helper_bitmap_init_from_file(ctx, img.c_str(), false, opt);
+        if (!bw.bitmap) {
+            std::printf("ERR cannot read the %s %s\n", vid ? "video" : "image", img.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         mtmd_input_chunks* chunks = mtmd_input_chunks_init();
         const std::string prompt = mtmd_default_marker();
         mtmd_input_text txt{prompt.c_str(), prompt.size(), false, true};
         const mtmd_bitmap* bm[1] = {bw.bitmap};
         std::string err;
-        const mtmd_input_chunk* ichunk = nullptr;
-        if (mtmd_tokenize(ctx, chunks, &txt, bm, 1) != 0) err = "the image could not be preprocessed";
-        for (size_t c = 0; err.empty() && c < mtmd_input_chunks_size(chunks); ++c) {
+        if (mtmd_tokenize(ctx, chunks, &txt, bm, 1) != 0)
+            err = vid ? "the video could not be decoded" : "the image could not be preprocessed";
+        // the image chunks in prompt order; a video's lazy bitmap expands to one chunk per frame
+        std::vector<const mtmd_input_chunk*> frames;
+        for (size_t c = 0; c < mtmd_input_chunks_size(chunks); ++c) {
             const mtmd_input_chunk* ch = mtmd_input_chunks_get(chunks, c);
-            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) ichunk = ch;
+            if (mtmd_input_chunk_get_type(ch) == MTMD_INPUT_CHUNK_TYPE_IMAGE) frames.push_back(ch);
         }
-        if (err.empty() && !ichunk) err = "no image chunk";
-        if (err.empty() && mtmd_encode_chunk(ctx, ichunk) != 0) err = "the vision encoder failed";
-        if (err.empty()) {
-            const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(ichunk);
-            const int n = (int) mtmd_input_chunk_get_n_tokens(ichunk);
+        if (!vid && frames.size() > 1) frames.erase(frames.begin(), frames.end() - 1);   // ENC: the last picture
+        if (err.empty() && frames.empty()) err = vid ? "no video frames" : "no image chunk";
+        FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;
+        if (err.empty() && !f) err = "cannot write " + out;
+        int n_frames = 0, total_tokens = 0, nx = 0, ny = 0;
+        // a text model without M-RoPE (GLM-5.3: its image tokens take no positions) has no grid: one row
+        const bool grid = mtmd_decode_use_mrope(ctx);
+        for (size_t i = 0; err.empty() && i < frames.size(); ++i) {
+            if (mtmd_encode_chunk(ctx, frames[i]) != 0) { err = "the vision encoder failed"; break; }
+            const int n = (int) mtmd_input_chunk_get_n_tokens(frames[i]);
+            if (n <= 0) { err = "the vision encoder produced no tokens"; break; }
+            const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(frames[i]);
             // the grid from the decoder positions (nx/ny getters are deprecated): x and y of the last token
             const mtmd_decoder_pos last = mtmd_image_tokens_get_decoder_pos(it, 0, (size_t) n - 1);
-            // a text model without M-RoPE (GLM-5.3: its image tokens take no positions) has no grid: one row
-            const bool grid = mtmd_decode_use_mrope(ctx);
-            const int nx = grid ? (int) last.x + 1 : n, ny = grid ? (int) last.y + 1 : 1;
-            if (nx * ny != n) err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)";
+            nx = grid ? (int) last.x + 1 : n;
+            ny = grid ? (int) last.y + 1 : 1;
+            if (nx * ny != n) { err = "the image grid is not rectangular (" + std::to_string(n) + " tokens)"; break; }
             const float* embd = mtmd_get_output_embd(ctx);
-            FILE* f = err.empty() ? std::fopen(out.c_str(), "wb") : nullptr;
-            if (err.empty() && !f) err = "cannot write " + out;
-            if (f) {
-                const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
-                const bool ok = std::fwrite(hdr, sizeof hdr, 1, f) == 1 &&
-                                std::fwrite(embd, sizeof(float) * (size_t) n_embd, (size_t) n, f) == (size_t) n;
-                std::fclose(f);
-                if (!ok) err = "short write to " + out;
-                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                if (ok) std::printf("OK %d %d %d %.0f\n", n, nx, ny, ms);
-            }
+            const int32_t hdr[5] = {0x31455653, n, nx, ny, n_embd};
+            if (std::fwrite(hdr, sizeof hdr, 1, f) != 1 ||
+                std::fwrite(embd, sizeof(float) * (size_t) n_embd, (size_t) n, f) != (size_t) n)
+                err = "short write to " + out;
+            n_frames++;
+            total_tokens += n;
         }
-        if (!err.empty()) std::printf("ERR %s\n", err.c_str());
+        if (f) std::fclose(f);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (err.empty() && vid) std::printf("OK %d %d %.0f\n", n_frames, total_tokens, ms);
+        else if (err.empty()) std::printf("OK %d %d %d %.0f\n", total_tokens, nx, ny, ms);
+        else std::printf("ERR %s\n", err.c_str());
         std::fflush(stdout);
         mtmd_input_chunks_free(chunks);
         mtmd_bitmap_free(bw.bitmap);

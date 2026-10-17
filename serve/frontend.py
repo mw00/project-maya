@@ -82,6 +82,7 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+VIDEO_PARTS = ("video_url", "input_video", "video")
 
 # Thinking levels: GLM-5.x's own - Off, Low, High and Max (its template's default, the most thorough).  Clients spell
 # them many ways and everything maps onto those four: OpenAI's "medium" (GLM has none) is High, "xhigh" is Max.
@@ -122,8 +123,9 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": "low" if n < 2048 else "high" if n < 8192 else "max"}
 
 
-def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+def _has_media(content) -> bool:
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + VIDEO_PARTS
+                                             for p in content)
 
 
 def _image_source(part: dict) -> str:
@@ -142,10 +144,25 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
+def _video_source(part: dict) -> str:
+    """A video part's source as one string, the same forms as an image's: OpenAI
+    {"type": "video_url", "video_url": {"url": ...}} (or "video_url": "..."), Responses-style
+    {"type": "input_video", "video_url": ...}; Anthropic: {"type": "video", "source": {...}}."""
+    if part.get("type") == "video":
+        src = part.get("source") or {}
+        if src.get("type") == "base64":
+            return f"data:{src.get('media_type', 'video/mp4')};base64,{src.get('data', '')}"
+        return src.get("url") or src.get("path") or ""
+    url = part.get("video_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    return url or ""
+
+
 def _parts_of(content):
-    """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
-    template's list form - text items and image items, in order - whose image items carry their source."""
-    if not _has_image(content):
+    """Message content for the template: a string when there is no media (unchanged behaviour), otherwise the
+    template's list form - text items and image / video items, in order - whose media items carry their source."""
+    if not _has_media(content):
         return _text_of(content)
     items = []
     for part in content:
@@ -153,6 +170,8 @@ def _parts_of(content):
             continue
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
+        elif part.get("type") in VIDEO_PARTS:
+            items.append({"type": "video", "source": _video_source(part)})
         elif part.get("type") in ("text", "input_text", None) and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -163,6 +182,13 @@ def images_of(messages: list[dict]) -> list[str]:
     <|vision_start|><|image_pad|><|vision_end|> per image item, message by message)."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
+
+
+def media_of(messages: list[dict]) -> list[tuple[str, str]]:
+    """The (kind, source) of the conversation's media, "image" or "video", in prompt order - the order the
+    template renders their markers in, so the order their embeddings are read in."""
+    return [(item["type"], item["source"]) for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") in ("image", "video")]
 
 
 # A special token's text written INSIDE a message is that text, not the token.  The rendered prompt is encoded with the
@@ -352,7 +378,7 @@ def anthropic_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dic
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
-        if m.get("role") == "user" and _has_image(content) and not any(
+        if m.get("role") == "user" and _has_media(content) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
