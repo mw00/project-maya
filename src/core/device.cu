@@ -57,7 +57,11 @@ std::string arch_problem(const cudaDeviceProp& p, int ordinal) {
                ", docs/AMD_MAYA.md) or choose another GPU with HIP_VISIBLE_DEVICES";
     }
     if (p.warpSize != 32) {
-        return card + " runs wave" + std::to_string(p.warpSize) + "; Maya's HIP kernels need wave32";
+        // The wave64 compat path (gfx908): the hip_compat layer maps a CUDA warp onto a logical 32-lane half of
+        // the 64-lane wavefront, so a wave64 card is fine when the engine was compiled for its exact arch.
+        if (p.warpSize != 64) {
+            return card + " runs wave" + std::to_string(p.warpSize) + "; Maya's HIP kernels need wave32 (or wave64 via the compat layer)";
+        }
     }
     return "";
 }
@@ -111,7 +115,8 @@ DeviceInfo device_info(int ordinal) {
     // fp32-FMA fallback below sm_80, the tensor-core prompt kernels refuse and fall back).  Compiling for a
     // supported arch is enforced by CMake; RUNNING on an older card is caught here, because a binary can be carried
     // to a machine with an older card and would otherwise silently take whatever path the driver chose.  The HIP
-    // backend checks the compiled architecture list and requires wave32.
+    // backend checks the compiled architecture list and requires wave32 (wave64 gfx908 runs through the
+    // hip_compat half-wavefront layer).
 #if defined(STRATA_USE_HIP)
     d.arch = base_arch(p.gcnArchName);
     if (const std::string why = arch_problem(p, ordinal); !why.empty()) throw CudaError(why, -1);

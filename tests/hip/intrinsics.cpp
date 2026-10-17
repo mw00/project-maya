@@ -112,8 +112,10 @@ int main() {
     hipDeviceProp_t properties{};
     CHECK(hipGetDeviceProperties(&properties, device));
     std::printf("HIP intrinsic device: %s (%s)\n", properties.name, properties.gcnArchName);
-    if (properties.warpSize != kLanes) {
-        std::fprintf(stderr, "expected wave32, got wave%d\n", properties.warpSize);
+    if (properties.warpSize != kLanes && properties.warpSize != 2 * kLanes) {
+        // wave64 (gfx908) is accepted: this probe launches kLanes threads, which occupy one half of a 64-lane
+        // wavefront; the compat layer's half-wavefront mapping must return the same wave32 results.
+        std::fprintf(stderr, "expected wave32 or wave64, got wave%d\n", properties.warpSize);
         return 1;
     }
 

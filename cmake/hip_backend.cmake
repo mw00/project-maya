@@ -14,6 +14,9 @@ endif()
 set(_strata_hip_validated gfx1100 gfx1201 gfx1151)   # gfx1151: Strix Halo (v1.1.10)
 set(_strata_hip_community gfx1101 gfx1200)
 set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1034 gfx1150)   # gfx1103: Radeon 780M iGPU, opt-in, portable kernels (no WMMA)
+# gfx908 (AMD Instinct MI100, CDNA1) is wave64, not wave32: it runs through the hip_compat layer's logical-32-lane
+# half-wavefront warp mapping (see hip_compat/intrinsics.hpp). Experimental; validated on a 4x MI100 box.
+set(_strata_hip_wave64 gfx908)
 # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
 # spaces, which foreach(IN LISTS) would otherwise treat as one element.
 string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
@@ -30,14 +33,25 @@ foreach(_arch IN LISTS _strata_hip_norm)
     message(STATUS "Maya HIP: ${_base} was validated by community reports (docs/AMD_MAYA.md)")
   elseif(_base IN_LIST _strata_hip_unvalidated)
     message(WARNING "Maya HIP: ${_base} builds, but it is not validated on a real card yet; please report results")
+  elseif(_base IN_LIST _strata_hip_wave64)
+    message(STATUS "Maya HIP: ${_base} is a wave64 CDNA card running through the half-wavefront compat layer (experimental)")
   else()
     message(FATAL_ERROR
-      "Maya's HIP build supports wave32 gfx1100, gfx1101, gfx1151, gfx1200 and gfx1201 (unvalidated: ${_strata_hip_unvalidated}); "
+      "Maya's HIP build supports wave32 gfx1100, gfx1101, gfx1151, gfx1200 and gfx1201 (unvalidated: ${_strata_hip_unvalidated}; "
+      "wave64: ${_strata_hip_wave64}); "
       "CMAKE_HIP_ARCHITECTURES is '${CMAKE_HIP_ARCHITECTURES}'")
   endif()
   list(APPEND STRATA_HIP_ARCH_LIST "${_base}")
 endforeach()
 list(REMOVE_DUPLICATES STRATA_HIP_ARCH_LIST)
+# wave64 CDNA cards (gfx908) run the CUDA-shaped kernels through the hip_compat layer's logical-32-lane
+# half-wavefront mapping; the headers switch to their wave64 form only when this define reaches the build.
+set(STRATA_HIP_WAVE64 OFF)
+foreach(_a IN LISTS STRATA_HIP_ARCH_LIST)
+  if(_a IN_LIST _strata_hip_wave64)
+    set(STRATA_HIP_WAVE64 ON)
+  endif()
+endforeach()
 if(NOT STRATA_HIP_ARCH_LIST)
   message(FATAL_ERROR "Maya HIP: CMAKE_HIP_ARCHITECTURES is empty")
 endif()
@@ -87,7 +101,8 @@ set(STRATA_HIP_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hi
 add_library(strata_hip_runtime INTERFACE)
 target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "${STRATA_HAS_WMMA_DEF}" "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
+target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "${STRATA_HAS_WMMA_DEF}" "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\""
+  $<$<BOOL:${STRATA_HIP_WAVE64}>:STRATA_HIP_WAVE64=1>)
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
 foreach(_language IN ITEMS CXX HIP)
   target_compile_options(strata_hip_runtime INTERFACE
