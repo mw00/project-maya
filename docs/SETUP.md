@@ -80,3 +80,22 @@ calling Maya's API unless Maya allows that page. List the pages in the config, `
 Exact addresses (scheme, host and port, no path); `["*"]` lets every page in - set an `api_key` with it, or any page
 you open could use your model. It opens `/v1/*` and nothing else: the settings and the tools stay for Maya's own page.
 Without it nothing changes. A new `--setup` writes the config again: add the line back after it.
+
+## Giving the GPU back when idle
+
+To share the PC with other GPU programs (another model server, games), let Maya unload the model after a while without
+requests. In the config, `maya-<model>.json`:
+
+```json
+"idle_unload_s": 900,
+"env": {"STRATA_GLM_SLOT_KEEP": "1"}
+```
+
+(`--idle-unload 900` on the server's command line does the same.) After that many seconds with no request running or
+waiting, the engine ends: its GPU memory and its pinned RAM tier are given back (an RTX 3090 with Maya-S24: 22.9 GB of
+VRAM and 79 GB of RAM). The dashboard and `/health` say `unloaded`, and `/v1/models` still lists the model with the
+status `unloaded`. The next request loads the model again - about a minute before its first token - and the experts
+in VRAM warm up again over the next answers. With `STRATA_GLM_SLOT_KEEP=1` the conversation in the model is written to
+the disk on the way out and read back, so the next turn of the same chat reads only its new tokens (1,630 of 1,690
+prompt tokens reused after an unload). `0` (the default): never. A new `--setup` writes the config again: add the
+lines back after it.

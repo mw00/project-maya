@@ -1615,5 +1615,75 @@ class VisionFootprint(unittest.TestCase):
         self.assertEqual(self.measure(0, ""), ((1024, 3000 + (256 << 20)), 0))   # now from the cache
 
 
+class LifecycleEngine(MockEngine):
+    """The mock engine with StrataEngine's lifecycle: alive / close (QUIT) / restart, counted."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.running, self.closes, self.restarts = True, 0, 0
+
+    def alive(self):
+        return self.running
+
+    def close(self):
+        self.closes += 1
+        self.running = False
+
+    def restart(self):
+        self.restarts += 1
+        self.running = True
+
+
+class IdleUnload(unittest.TestCase):
+    """--idle-unload / "idle_unload_s": the engine ends when nothing runs or waits, and the next request starts it."""
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = LifecycleEngine(self.tok, "</think>\n\nok", max_context=CTX)
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def get(self, path):
+        with urllib.request.urlopen(self.base + path, timeout=10) as r:
+            return json.loads(r.read())
+
+    def test_unloads_when_idle_and_the_next_request_loads_it(self):
+        self.assertEqual(self.svc.unload(), "unloaded")
+        self.assertEqual((self.engine.closes, self.engine.running, self.svc.unloaded), (1, False, True))
+        self.assertTrue(self.get("/health")["unloaded"])
+        models = self.get("/v1/models")["data"]                   # still listed, as Strata's
+        self.assertEqual([m["status"]["value"] for m in models], ["unloaded"])
+        self.assertEqual(self.svc.unload(), "not loaded")
+        out = [v for kind, v in self.svc.run(self.tok.encode("hi"), False, None, 20, {}, threading.Event())
+               if kind == "event"]
+        self.assertTrue(out)
+        self.assertEqual((self.engine.restarts, self.engine.running, self.svc.unloaded), (1, True, False))
+        self.assertFalse(self.get("/health")["unloaded"])
+        self.assertEqual([m["status"]["value"] for m in self.get("/v1/models")["data"]], ["loaded"])
+
+    def test_not_while_a_request_is_recent_or_holds_the_engine(self):
+        self.svc.last_request_at = time.time()
+        self.assertEqual(self.svc.unload(idle_for=600), "busy")
+        self.svc.fifo.acquire()                                     # a request or an encode has the engine
+        try:
+            self.assertEqual(self.svc.unload(), "busy")
+        finally:
+            self.svc.fifo.release()
+        with self.svc.status_lock:
+            self.svc.status["queued"] = 1                           # one waits for it
+        self.assertEqual(self.svc.unload(), "busy")
+        self.assertEqual(self.engine.closes, 0)
+
+    def test_an_engine_without_a_lifecycle_is_left_alone(self):
+        svc = Service(MockEngine(self.tok, "ok", max_context=CTX), self.tok,
+                      ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertEqual(svc.unload(), "unsupported")
+
+
 if __name__ == "__main__":
     unittest.main()

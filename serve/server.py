@@ -1324,6 +1324,11 @@ class Service:
         self.model_dir = None                            # the model's folder (free disk on the dashboard)
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
         self.reload = None                               # a context change: {state, from, to, started, error}
+        # "idle_unload_s" / --idle-unload (as Strata's): after this long without a request the engine ends, giving back
+        # its GPU memory and its pinned RAM tier, and the next request starts it again (0: never).  With
+        # STRATA_GLM_SLOT_KEEP=1 the conversation in the model is kept on disk across it.
+        self.idle_unload_s = 0.0
+        self.unloaded = False                            # the engine was ended by the idle unload (not by a crash)
         self.updater = Updater(MAYA_VERSION)             # About > Updates: a newer release, and updating to it
         # The ids that end an answer server-side.  A string that is not a special token in this vocabulary
         # (GLM-5.3 has no <|im_end|>) encodes to its TEXT pieces, whose ids occur inside ordinary answers -
@@ -1416,6 +1421,66 @@ class Service:
                     part.close()
             except Exception as e:  # noqa: BLE001 - ending anyway
                 print(f"[maya] stopping {type(part).__name__}: {e}", flush=True)
+
+    def ensure_engine(self):
+        """The engine running (the caller holds the FIFO): started again after an idle unload, or after it died in an
+        earlier request (issue #27) instead of failing every request."""
+        if not hasattr(self.engine, "alive") or self.engine.alive():
+            return
+        if self.unloaded:
+            print("[maya] loading the model again after an idle unload (a minute or so) ...", flush=True)
+        else:
+            code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
+            print(f"[maya] the engine had stopped (exit code {code}); starting it again "
+                  "(a minute or two) ...", flush=True)
+        self.engine.restart()
+        self.unloaded = False
+        print("[maya] the engine is running again", flush=True)
+
+    def unload(self, idle_for: float | None = None) -> str:
+        """End the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, a context
+        reload is on, or - with idle_for - one ran more recently than that) or "unsupported"."""
+        if not (hasattr(self.engine, "close") and hasattr(self.engine, "restart") and hasattr(self.engine, "alive")):
+            return "unsupported"
+        if not self.fifo.acquire(blocking=False):        # every place: nothing runs or waits for the engine
+            return "busy"
+        try:
+            if not self.engine.alive():
+                return "not loaded"
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued") or self.active:
+                    return "busy"
+                if self.reload and self.reload.get("state") in ("waiting", "running"):
+                    return "busy"
+            if idle_for is not None and time.time() - (self.last_request_at or self.started_at) < idle_for:
+                return "busy"
+            # QUIT (close: with STRATA_GLM_SLOT_KEEP the engine first writes the conversation it holds), then the GPU has
+            # its memory back.  (StrataEngine.stop is the request's STOP, not the engine's end.)
+            self.engine.close()
+            self.engine.ended = True
+            pid = getattr(getattr(self.engine, "proc", None), "pid", None)
+            if pid is not None:
+                wait_gpu_release(pid)
+            self.unloaded = True
+            print(f"[maya] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''} (GPU memory and the "
+                  "RAM tier given back); the next request loads it again", flush=True)
+            return "unloaded"
+        finally:
+            self.fifo.release()
+
+    def start_idle_unload(self):
+        if not self.idle_unload_s or not hasattr(self.engine, "close"):
+            return
+        print(f"[maya] the model unloads after {self.idle_unload_s:g} s without requests", flush=True)
+
+        def loop():
+            while True:
+                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+                try:
+                    self.unload(idle_for=self.idle_unload_s)
+                except Exception as e:  # noqa: BLE001 - tried again at the next turn; the thread keeps running
+                    print(f"[maya] idle unload: {e}", flush=True)
+        threading.Thread(target=loop, daemon=True).start()
 
     def reloading(self) -> bool:
         with self.status_lock:
@@ -1606,7 +1671,7 @@ class Service:
         elif s.get("busy"):
             state = "generating"
         else:
-            state = "idle"
+            state = "unloaded" if self.unloaded else "idle"
         live = {"state": state, "queued": s.get("queued", 0), "active": active,   # (answering at once: --parallel)
                 "phase": s.get("phase") if s.get("busy") else None,
                 "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
@@ -1764,8 +1829,10 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self.fifo, self.vision.active():
-                encoded = [self.vision.encode(src) for src in images]
+            with self.fifo:
+                self.ensure_engine()                     # (the encoder borrows the engine's memory: it must run)
+                with self.vision.active():
+                    encoded = [self.vision.encode(src) for src in images]
             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
@@ -1990,13 +2057,7 @@ class Service:
                     raise ValueError("the server is stopping: send the request again once the model is back")
                 if self.vision is not None and self.vision.owed:   # memory an encode borrowed, not back yet
                     self.vision.settle()
-                if hasattr(self.engine, "alive") and not self.engine.alive():
-                    # issue #27: it died in an earlier request - start it again instead of failing every request
-                    code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-                    print(f"[maya] the engine had stopped (exit code {code}); starting it again "
-                          "(a minute or two) ...", flush=True)
-                    self.engine.restart()
-                    print("[maya] the engine is running again", flush=True)
+                self.ensure_engine()   # after an idle unload, or issue #27: it died in an earlier request
                 with self.status_lock:
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
@@ -2832,7 +2893,7 @@ def make_handler(svc: Service):
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
-                                 "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp)})
+                                 "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded})
             elif path == "/api/context":
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
@@ -2866,11 +2927,12 @@ def make_handler(svc: Service):
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
+                    model = {"id": svc.model, "object": "model",
+                             "status": {"value": "loaded" if loaded else "unloaded"},
                              "meta": {"n_ctx": svc.engine.max_context},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
-                    self._json(200, {"object": "list", "data": [model] if loaded else []})
+                    self._json(200, {"object": "list", "data": [model] if loaded or svc.unloaded else []})
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -2953,7 +3015,7 @@ def make_handler(svc: Service):
             if model != svc.model:
                 self._json(404, {"error": {"message": "model not found"}})
                 return
-            if hasattr(svc.engine, "alive") and not svc.engine.alive():
+            if hasattr(svc.engine, "alive") and not svc.engine.alive() and not svc.unloaded:
                 self._json(503, {"error": {"message": "the engine is not running"}})
                 return
             defaults = {**svc.sampling_defaults, **svc.shared}
@@ -3364,6 +3426,10 @@ def main() -> int:
     ap.add_argument("--tokenizer", default=str(ROOT / "pack/full/tokenizer"),
                     help="pack tokenizer directory (falls back to a byte tokenizer if absent)")
     ap.add_argument("--open", action="store_true", help="open the local page in the browser once the model is ready")
+    ap.add_argument("--idle-unload", type=float, default=None, metavar="SECONDS",
+                    help='unload the model after this many seconds without requests, so other programs can use the GPU '
+                         'memory and the RAM; the next request loads it again (also "idle_unload_s" in the config; '
+                         '0: never)')
     ap.add_argument("--fit-max-tokens", action="store_true",
                     help="clamp max_tokens to the remaining context instead of rejecting the request "
                          "(default: reject with 400, like llama.cpp; also \"fit_max_tokens\": true in the config)")
@@ -3476,6 +3542,7 @@ def main() -> int:
               f"{'' if effort_level(svc.default_effort) == svc.default_effort else f' (the config says {svc.default_effort})'}",
               flush=True)
     svc.think_budget = int(cfg.get("thinking_budget", 32768) or 0) if svc.think_end_id is not None else 0
+    svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     if svc.think_budget:
         print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
     svc.api_key = a.api_key or cfg.get("api_key", "")
@@ -3511,6 +3578,7 @@ def main() -> int:
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
     httpd = serve(svc, host=a.host, port=a.port)
+    svc.start_idle_unload()
     here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
