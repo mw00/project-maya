@@ -73,6 +73,7 @@ Real machines, real numbers, most of them measured with `./maya.sh --bench`. A t
 | **1x RTX 3090 24 GB** (PCIe 4.0 x16), EPYC 7702P (8-channel DDR4), 141 GB RAM (a VM) | Maya-M, 128K context | 27.0 tokens/s | 1069 tokens/s | @erikash (v1.1.4, #157) |
 | **1x Tesla V100 32 GB** (PCIe 3), 2x Xeon Gold 6138, 183 GB RAM | Maya-S24 | 26.8 tokens/s | 541 tokens/s | maintainer (v1.1.7, #171) |
 | **RTX 4080 SUPER 32 GB** (a 32 GB modded card), Threadripper 3970X, 157 GB RAM, SATA SSD | Maya-S24, 262K context | 26.7 tokens/s | 1552 tokens/s | @Micro-ATP (v1.1.11, #200) |
+| **RTX 4090 24 GB** (PCIe 4.0 x16), Threadripper PRO 5975WX, 256 GiB DDR4, Windows 11 | Maya-L, 128K capacity, RAM-resident | 26.7 tokens/s | 351 tokens/s | [@PhysicistLeon](https://github.com/PhysicistLeon) (v1.1.15, [#153](https://github.com/mw00/project-maya/pull/153)) |
 | **3x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2690 v4, 62 GB RAM | Maya-S, 128K context | 26.6 tokens/s | 497 tokens/s | @saatvik-viniak (v1.1.11, #211) |
 | **4x RTX 3080 20 GB**, 64 GB DDR4 | Maya-M, 512K context | 26.3 tokens/s (a day of use) | - | @CoolJohn-lab (#104) |
 | **1x RTX 3090 24 GB** (power-capped at 225 W), Threadripper 3970X, 128 GB RAM | Maya-S24 | 26.0 tokens/s | 913 tokens/s | @briepala (v1.1.2, #135) |
@@ -84,6 +85,8 @@ Real machines, real numbers, most of them measured with `./maya.sh --bench`. A t
 | **RTX 3090 Ti 24 GB** (PCIe 3.0 x16, a VM), EPYC 7302P, 240 GB RAM | Maya-L, 32K context | 18.2 tokens/s (tuned, #177) | 791 tokens/s | @Jw88888 (v1.1.7, #177) |
 | **RTX 4090 24 GB**, Ryzen 9 9950X3D, 192 GB DDR5, Windows 11 | Maya-L, 128K context | 16.4 tokens/s | 1371 tokens/s | @npc97 (v1.0.24, #63) |
 | **RTX 5090 Laptop 24 GB**, Core Ultra 9 275HX, 64 GB RAM, Windows 11 (a laptop) | Maya-S24 | 14.5 tokens/s | 994 tokens/s | @klvnblst (v1.0.30, #67) |
+
+The Maya-L Windows numbers above come from one standard `--bench` run on PR code `07b6a8a` (v1.1.15), not a multi-run performance comparison.
 
 Prefill is an 8K-token prompt. The speed holds as a conversation grows, and the first answers after a start are the
 slowest while the caches fill with what you use. Share yours: `--bench`, then `--report`, in a

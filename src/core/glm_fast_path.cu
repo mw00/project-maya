@@ -60,6 +60,8 @@
 #include <psapi.h>
 #if defined(STRATA_USE_HIP)
 #include <dxgi.h>
+#else
+#include <dxgi1_4.h>
 #endif
 #endif
 #ifdef __linux__
@@ -69,6 +71,46 @@
 #endif
 
 namespace gf = strata::kernels::glmf;
+
+// NON_LOCAL is the process's WDDM system-memory budget, not free VRAM.
+// Match CUDA's adapter by LUID; adapter 0 need not be the CUDA device.
+static bool glm_pin_budget(int device, uint64_t& budget, uint64_t& usage) {
+#if defined(_WIN32) && !defined(STRATA_USE_HIP)
+    cudaDeviceProp prop{};
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
+    bool found = false;
+    for (UINT i = 0; !found; ++i) {
+        IDXGIAdapter1* adapter = nullptr;
+        if (FAILED(factory->EnumAdapters1(i, &adapter))) break;
+        DXGI_ADAPTER_DESC1 desc{};
+        if (SUCCEEDED(adapter->GetDesc1(&desc)) && std::memcmp(&desc.AdapterLuid, prop.luid, sizeof prop.luid) == 0) {
+            IDXGIAdapter3* a3 = nullptr;
+            if (SUCCEEDED(adapter->QueryInterface(IID_PPV_ARGS(&a3)))) {
+                DXGI_QUERY_VIDEO_MEMORY_INFO info{};
+                if (SUCCEEDED(a3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &info))) {
+                    budget = info.Budget;
+                    usage = info.CurrentUsage;
+                    found = true;
+                }
+                a3->Release();
+            }
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return found;
+#else
+    (void) device;
+    (void) budget;
+    (void) usage;
+    return false;
+#endif
+}
 
 // Keeps the GPU out of its idle P-state for ns nanoseconds.  A consumer card at P8 drops its PCIe link (Gen1 on an
 // RTX 4070 Ti SUPER / 5070 Ti), and copies alone do not wake it, so a link timed at idle reads 3-8x slower than it
@@ -1370,6 +1412,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->left.assign((size_t) NL * g.n_expert, 0);
         std::vector<size_t> cls_stride;
         std::vector<double> cls_weight;
+        std::vector<int64_t> cls_required;
         for (int il = l0_; il < lt_; ++il) {
             if (!F->L[(size_t) il].moe) continue;
             const size_t st = (F->L[(size_t) il].blob + 4095u) & ~(size_t) 4095u;
@@ -1380,12 +1423,18 @@ bool Glm5Model::fast_setup(std::string& err) {
                 c = (int) cls_stride.size();
                 cls_stride.push_back(st);
                 cls_weight.push_back(0.0);
+                cls_required.push_back(0);
             }
             F->layer_rc[(size_t) il] = c;
             // (the experts its main slots cannot hold: the pool's lendable tail counts as not held - a prompt
             // borrows it, and the experts there go to RAM meanwhile, prefill_lend)
             cls_weight[(size_t) c] +=
                 (double) std::max(2, g.n_expert - F->lp[(size_t) il].n_main + gf::kSpares + 2 + F->ram_slack) * (double) st;
+            // Peak lending excludes the entire tail and the deferred-promotion
+            // spares. Unlike disk tiers, full residency needs no read-ahead reserve.
+            const int held = glmfast::warm_pool_slots(F->unified_memory, F->lp[(size_t) il].n_main,
+                                                       g.n_expert, gf::kSpares);
+            cls_required[(size_t) c] += std::max<int64_t>(0, (int64_t) g.n_expert - held);
         }
         double wsum = 0;
         for (double w : cls_weight) wsum += w;
@@ -1393,6 +1442,13 @@ bool Glm5Model::fast_setup(std::string& err) {
         // (a complete pool too: nothing is outside VRAM to hold - the 8065S's 32 GB of OS RAM keep ~0.6 GB more)
         const bool staging_only = glmfast::minimal_ram_tier(F->unified_memory || F->complete, nmin >= g.n_expert,
                                                            ram_budget_ >= 0 || getenv("STRATA_GLM_RAM_GB") != nullptr);
+        const char* balanced_env = getenv("STRATA_GLM_RAM_BALANCED");
+        const bool balanced_ram = glmfast::balanced_resident_ram(balanced_env && std::atoi(balanced_env) != 0,
+                                                                  F->ram_resident, staging_only);
+        if (balanced_ram && n_parts_ != 1) {
+            err = "glm fast: STRATA_GLM_RAM_BALANCED currently requires one GPU";
+            return false;
+        }
         if (staging_only) {
             // Decode misses and pool-tail lending still need landing slots. Keep
             // only the existing per-class floor; do not duplicate the expert cache.
@@ -1486,6 +1542,39 @@ bool Glm5Model::fast_setup(std::string& err) {
             cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
+        if (balanced_ram) {
+            // Preserve the existing 512 MiB upload guard and leave room for the
+            // update tables, disk staging, and a small allocation overhead. DXGI
+            // is an upper bound only: successful driver pinning is still required.
+            uint64_t wddm_budget = 0, wddm_usage = 0;
+            const uint64_t fixed = FastState::kMaxUpd * (sizeof(int) + sizeof(unsigned long long)) + (4ull << 20);
+            if (g.n_exp_used <= 0 || !sstride ||
+                (uint64_t) g.n_exp_used > (std::numeric_limits<uint64_t>::max() - fixed) / sstride) {
+                err = "glm fast: invalid balanced RAM staging size";
+                return false;
+            }
+            const uint64_t future = (uint64_t) g.n_exp_used * sstride + fixed;
+            const uint64_t guard = 512ull << 20;
+            if (glm_pin_budget(dev_, wddm_budget, wddm_usage)) {
+                const uint64_t free = wddm_budget > wddm_usage ? wddm_budget - wddm_usage : 0;
+                const uint64_t after_future = free > future ? free - future : 0;
+                const uint64_t usable = after_future > guard ? after_future - guard : 0;
+                budget = (int64_t) std::min<uint64_t>((uint64_t) std::max<int64_t>(0, budget), usable);
+                std::fprintf(stderr, "glm pin budget: Budget=%llu CurrentUsage=%llu future=%llu guard=%llu usable=%lld\n",
+                             (unsigned long long) wddm_budget, (unsigned long long) wddm_usage,
+                             (unsigned long long) future, (unsigned long long) guard, (long long) budget);
+            }
+            for (size_t c = 0; c < cls_stride.size(); ++c) {
+                cls_required[c] = std::max<int64_t>(1, cls_required[c]);  // a landing slot even with a full pool
+                std::fprintf(stderr, "glm RAM plan: class %zu stride=%zu mandatory=%lld preferred=%lld\n", c,
+                             cls_stride[c], (long long) cls_required[c], (long long) cls_cap[c]);
+            }
+            if (!glmfast::ram_class_plan((uint64_t) std::max<int64_t>(0, budget), cls_stride, cls_required, cls_cap, cls_n)) {
+                err = "glm fast: --glm-ram-resident: balanced RAM mandatory class capacity exceeds available pinned budget "
+                      "(including lending and spares)";
+                return false;
+            }
+        }
         // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
         // have planned (a later part's measurement then sees no tier half pinned)
         if (split_load_ != nullptr) {
@@ -1535,8 +1624,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             R.stride = cls_stride[c];
             int64_t n = cls_n[c];
             const int64_t cap = cls_cap[c];
-            const int64_t least = std::min<int64_t>(16, cap);   // the floor, or the whole cap when that is smaller
-            if (pin_left >= 0) n = std::max(least, std::min(n, share(c)));
+            // Do not retry below mandatory lending/spare capacity in balanced resident mode.
+            const int64_t least = balanced_ram ? cls_required[c] : std::min<int64_t>(16, cap);
+            if (!balanced_ram && pin_left >= 0) n = std::max(least, std::min(n, share(c)));
             void* p = nullptr;
             // a refusal near a pinning cap: the size measured (above), and should that be refused too, 1/32 less a
             // try for the first four (a tier just over a cap loses ~3%, not the 12% of a 7/8 step), then 1/8 less
@@ -1563,12 +1653,15 @@ bool Glm5Model::fast_setup(std::string& err) {
                     int64_t planned = 0;
                     for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
                     pin_left = pin_room(planned + (int64_t) kPinRoom);
-                    const int64_t fit = share(c);
-                    std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin, the RAM tier sized to it\n",
-                                 dev_, (double) pin_left / 1073741824.0);
-                    if (fit < n) {
-                        n = std::max(least, fit);
-                        continue;
+                    std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin, %s\n",
+                                 dev_, (double) pin_left / 1073741824.0,
+                                 balanced_ram ? "mandatory RAM slots retained" : "the RAM tier sized to it");
+                    if (!balanced_ram) {
+                        const int64_t fit = share(c);
+                        if (fit < n) {
+                            n = std::max(least, fit);
+                            continue;
+                        }
                     }
                 }
                 const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
@@ -1579,15 +1672,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                 err = "glm fast: the pinned RAM tier did not allocate";
                 return false;
             }
+            R.base = (uint8_t*) p;
+            R.n = (int) n;  // track ownership before a strict-capacity failure, so cleanup can free it
+            if (balanced_ram) {
+                uint64_t b = 0, u = 0;
+                if (glm_pin_budget(dev_, b, u))
+                    std::fprintf(stderr, "glm pin allocated: class %zu slots=%lld Budget=%llu CurrentUsage=%llu\n", c,
+                                 (long long) n, (unsigned long long) b, (unsigned long long) u);
+            }
+            const int64_t required_cap = balanced_ram ? cls_required[c] : cap;
             // (an APU whose pool holds every expert keeps a staging-only tier: no expert is outside VRAM to hold)
-            if (F->ram_resident && !staging_only && n < cap) {
+            if (F->ram_resident && !staging_only && n < required_cap) {
                 err = "glm fast: --glm-ram-resident: the RAM tier cannot hold every non-VRAM expert (class " +
-                      std::to_string(c) + ": " + std::to_string(n) + " of " + std::to_string(cap) +
+                      std::to_string(c) + ": " + std::to_string(n) + " of " + std::to_string(required_cap) +
                       " slots pinned; raise STRATA_GLM_RAM_GB, its headroom, or lower --max-context)";
                 return false;
             }
-            R.base = (uint8_t*) p;
-            R.n = (int) n;
             R.key.assign((size_t) n, -1);
             R.st.assign((size_t) n, FastState::kRFree);
             R.tick.assign((size_t) n, 0);
@@ -1614,9 +1714,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         for (auto& R : F->rc) ram_slots += R.n;
         std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
                      (double) F->ram_bytes / 1073741824.0, (long long) ram_slots);
-        if (F->ram_resident)
-            std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: every non-VRAM expert gets a slot (+%d slack/layer); disk evictions are OFF\n",
-                         dev_, F->ram_slack);
+        if (F->ram_resident) {
+            if (balanced_ram)
+                std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: mandatory lending/spares reserved; "
+                                     "optional slack budgeted; disk evictions are OFF\n", dev_);
+            else
+                std::fprintf(stderr, "glm fast: CUDA%d RAM-resident mode: every non-VRAM expert gets a slot (+%d slack/layer); disk evictions are OFF\n",
+                             dev_, F->ram_slack);
+        }
         // the prompt path's lend cap (Strata's, from the share of the expert bytes held pinned), now that it is known
         if (pf_ != nullptr) {
             double held = (double) F->ram_bytes, all = 0;
