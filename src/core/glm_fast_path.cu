@@ -5070,7 +5070,7 @@ int glmfast::trunk_skip_from(int il) {
     return v;
 }
 
-bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
+bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wait) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -5099,8 +5099,11 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err) {
     }
     if (!gf::mv(j, nj, s)) { err = "glm fast: router / shared expert"; return false; }
     if (F->prof_on) F->mark("router_shexp_mv");
-    return fast_moe_experts(il, {F->x, F->xq, F->rlog, F->sh_g, F->sh_u, F->ffn}, pred, n_ah, ah_bias, pf_pending,
-                            err);
+    moe_defer_wait_ = !cpu_wait;
+    const bool ok = fast_moe_experts(il, {F->x, F->xq, F->rlog, F->sh_g, F->sh_u, F->ffn}, pred, n_ah, ah_bias,
+                                     pf_pending, err);
+    moe_defer_wait_ = false;
+    return ok;
 }
 
 bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias,
@@ -5206,7 +5209,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     if (F->prof_on) F->mark("moe_down");
     }
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked (none: all in VRAM)
-    if (lane && !F->all_resident) {
+    if (lane && !F->all_resident && !moe_defer_wait_) {
         gf::moe_cpu_wait(md, g.n_embd, io.ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }
@@ -5232,6 +5235,16 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
                         mtp_il_ < 0 && !F->prof_on && !dumps && F->max_pf == 0 && F->n_ahead == 0 &&
                         getenv("GLM_DUMP_H") == nullptr && cap_d_ == nullptr;
     F->kda_graph_on = graphs;
+    // STRATA_GLM_DEFER_CPU=1 (LOSSY, after lighttransport/Strata glm53f's expert deferral): a MoE layer's CPU-lane
+    // experts are added after the NEXT layer's mixer instead of before its read - the CPU's work overlaps that layer's
+    // attention; that attention misses them (the streams get them before its FFN-side read; the last layer waits)
+    static const bool defer_env = getenv("STRATA_GLM_DEFER_CPU") != nullptr && std::atoi(getenv("STRATA_GLM_DEFER_CPU")) != 0;
+    const bool defer = defer_env && !graphs && !hop_in && F->cpu_plan != 0ull && !F->all_resident;
+    if (defer && F->defer_post == nullptr && cudaMalloc(&F->defer_post, 8 * sizeof(float)) != cudaSuccess) {
+        err = "glm fast: the deferred post weights did not allocate";
+        return false;
+    }
+    bool deferred = false;   // the previous layer's CPU answer is still out
     if (F->prof_on) F->mark("start");
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -5323,6 +5336,11 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             if (!fast_dsa(il, p, err)) return false;
         }
 
+        if (deferred) {   // the previous layer's CPU experts, into the streams before they are read again
+            gf::moe_cpu_wait_streams(F->md, g.n_embd, F->defer_post, Rc, g.hc, s);
+            deferred = false;
+            if (F->prof_on) F->mark("moe_cpu_wait");
+        }
         // ---- the FFN-side read (fused with the mixer's write)
         h.block_out = F->mixer;
         h.R_old = Rc;
@@ -5354,7 +5372,12 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
             if (F->prof_on) F->mark("dense_down_mv");
         } else {
-            if (!fast_moe(il, pf_pending, err)) return false;
+            const bool def = defer && il + 1 < l1_ && F->cpu_fmt[(size_t) il].n_ff > 0;
+            if (!fast_moe(il, pf_pending, err, !def)) return false;
+            if (def) {   // this layer's FFN-side post weights (the next read overwrites them)
+                cudaMemcpyAsync(F->defer_post, F->post, 8 * sizeof(float), cudaMemcpyDeviceToDevice, s);
+                deferred = true;
+            }
         }
         if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
         return true;

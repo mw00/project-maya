@@ -333,6 +333,8 @@ inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to
 /// `out` (the layer's FFN output, which moe_down wrote first - its work runs while the CPU computes).
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s);
+/// ... a layer's late answer into the streams: R[j] += post[j] * part, j < hc (STRATA_GLM_DEFER_CPU)
+void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s);
 /// The side stream's copy of the prefetch list (pf_src -> pf_dst, pf_n entries of blob_bytes each).
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.

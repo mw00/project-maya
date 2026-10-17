@@ -3250,6 +3250,8 @@ struct RouteArgs {
                                 // weights is below this (0: none)
     float miss_skip_w;          // STRATA_GLM_MISS_SKIP_W (prototype): experts not in VRAM whose share of the route's
                                 // weights is below this are left out like skip_from's, at any rank (0: none)
+    float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
+                                // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_constant__ RouteArgs a) {
@@ -3282,6 +3284,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const __grid_c
         const float p = 1.0f / (1.0f + expf(-a.logits[e]));
         s_p[e] = p;
         s_sel[e] = a.bias ? p + a.bias[e] : p;
+        if (a.affinity > 0.0f && a.d.tab != nullptr && a.d.tab[(size_t) a.layer * E + e] != 0ull) s_sel[e] += a.affinity;
         if (!isfinite(a.logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 1);
     }
     __shared__ float s_bv[32];
@@ -3672,6 +3675,31 @@ __global__ void moe_cpu_wait_kernel(MoeDev d, int n_embd, float* out) {
     }
     __syncthreads();
     for (int e = tid; e < n_embd; e += blockDim.x) out[e] += ((volatile const CpuAnswer*) r)->part[e];
+}
+
+// the deferred form (STRATA_GLM_DEFER_CPU): the answer of a layer whose FFN write already went out without it, added to
+// the streams it would have reached - R[j] += post[j] * part (the layer's FFN-side post weights)
+__global__ void moe_cpu_wait_streams_kernel(MoeDev d, int n_embd, const float* post, float* R, int hc) {
+    __shared__ unsigned int s_need;
+    __shared__ float s_post[8];
+    const int tid = threadIdx.x;
+    if (tid == 0) s_need = *d.cpu_seq;
+    if (tid < hc) s_post[tid] = post[tid];
+    __syncthreads();
+    if (s_need == 0) return;
+    const CpuAnswer* r = (const CpuAnswer*) d.cpu_ans;
+    if (tid == 0) {
+        const long long t0 = clock64();
+        while (r->seq != s_need) {
+            if (clock64() - t0 > (1ll << 36)) break;
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    for (int e = tid; e < n_embd; e += blockDim.x) {
+        const float v = ((volatile const CpuAnswer*) r)->part[e];
+        for (int j = 0; j < hc; ++j) R[(size_t) j * n_embd + e] += s_post[j] * v;
+    }
 }
 
 __global__ void __launch_bounds__(256) moe_prefetch_kernel(MoeDev d, size_t n16) {
@@ -5098,6 +5126,11 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
                 pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), win, scr_used,
                 g_skip, win_n, disk_skip_from, disk_skip_w, miss_skip_w};
+    static const float affinity = [] {
+        const char* v = getenv("STRATA_GLM_ROUTE_AFFINITY");
+        return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
+    }();
+    a.affinity = affinity;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
@@ -5110,6 +5143,12 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s) {
     moe_wait_kernel<<<1, 256, 0, s>>>(d, n_embd);
     launch_check("moe_wait");
+}
+
+void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s) {
+    if (d.cpu_seq == nullptr) return;
+    moe_cpu_wait_streams_kernel<<<1, 1024, 0, s>>>(d, n_embd, post, R, hc);
+    launch_check("moe_cpu_wait_streams");
 }
 
 void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s) {

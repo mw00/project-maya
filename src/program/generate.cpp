@@ -1055,6 +1055,46 @@ static int glm_pack_generate(const Options& o) {
 
     const std::vector<int64_t> glm_eos = {154820, 154827, 154829};
     const std::vector<int64_t>& eos = o.eos_given ? o.eos_ids : glm_eos;
+    // STRATA_GLM_KL_DUMP=<file>,<n> (a test of the K/V cache formats): --tokens-file's tokens teacher-forced - all but
+    // the last n through the prompt path, those n one at a time through the decode - and the logits after each of the
+    // n into file (n x n_vocab F32: row i predicts token size - n + i + 1)
+    if (const char* kd = std::getenv("STRATA_GLM_KL_DUMP")) {
+        const std::string spec(kd);
+        const size_t c = spec.rfind(',');
+        const std::string path = spec.substr(0, c);
+        const int64_t n = c == std::string::npos ? 64 : std::atoll(spec.c_str() + c + 1);
+        const auto& t = o.tokens;
+        if (n <= 0 || (int64_t) t.size() <= n) {
+            std::fprintf(stderr, "maya generate: STRATA_GLM_KL_DUMP needs more than %lld tokens\n", (long long) n);
+            return 2;
+        }
+        model.set_host_logits(true);
+        std::string err;
+        std::vector<float> lg;
+        const std::vector<int32_t> head(t.begin(), t.end() - n);
+        const bool pok = model.fast() && model.prefill(head, err, (int32_t) t[t.size() - (size_t) n]);
+        if (!pok && (!err.empty() || !model.forward(head, lg, err))) {
+            std::fprintf(stderr, "maya generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::FILE* f = std::fopen(path.c_str(), "wb");
+        if (f == nullptr) {
+            std::fprintf(stderr, "maya generate: cannot write %s\n", path.c_str());
+            return 1;
+        }
+        for (size_t i = t.size() - (size_t) n; i < t.size(); ++i) {
+            if (!model.forward({(int32_t) t[i]}, lg, err) || (int64_t) lg.size() < n_vocab) {
+                std::fprintf(stderr, "maya generate: %s\n", err.empty() ? "no logits" : err.c_str());
+                std::fclose(f);
+                return 1;
+            }
+            std::fwrite(lg.data(), sizeof(float), (size_t) n_vocab, f);
+        }
+        std::fclose(f);
+        std::fprintf(stderr, "maya generate: %lld positions' logits in %s\n", (long long) n, path.c_str());
+        return 0;
+    }
+
     const bool stop_on_eos = o.eos_given || o.stop_eos || o.serve;
 
     // ---- stdin on its own thread (the qwen serve's pattern): a STOP line must reach a request that is
