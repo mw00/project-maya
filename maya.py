@@ -666,8 +666,8 @@ def check_hip_pc(a, installed=False) -> dict:
             want = [int(x) for x in str(a.gpus).split(",") if x.strip()]
         except ValueError:
             fail(f"--gpus takes two GPU numbers as --check shows them, e.g. --gpus 0,1, not {a.gpus!r}")
-        if len(want) != 2 or want[0] == want[1]:
-            fail("Maya's HIP port runs on one GPU or splits the model across two: --gpu 0, or --gpus 0,1")
+        if not 1 <= len(want) <= MAX_GPUS or len(set(want)) != len(want):
+            fail(f"Maya's HIP port runs on one GPU or splits the model across up to {MAX_GPUS}: --gpu 0, or --gpus 0,1[,2,3]")
         picked = [next((g for g in usable if g["index"] == i), None) for i in want]
         for i, g in zip(want, picked):
             if g is None:
