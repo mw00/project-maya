@@ -26,7 +26,12 @@ installer accepts `gfx1100`, `gfx1201` and `gfx1151` and compiles one binary for
 `gfx1100;gfx1201;gfx1151`.
 
 RDNA 2 (`gfx1030`: RX 6800 / 6800 XT / 6900 XT / 6950 XT, Radeon PRO V620 / W6800) is accepted too, as experimental:
-Maya has not been validated on such a card yet, so please report how it goes in an issue. These cards have no matrix cores (WMMA), so the engine uses
+Validated on a Radeon PRO V620 (30 GB, gfx1030), Threadripper PRO 3975WX, 208 GB RAM,
+Maya-L (156.3 GB) fully resident (VRAM + 129.5 GB pinned RAM, zero disk reads): decode 13.0 tok/s, prefill 216-224
+tokens/s (`maya.py --bench`, context 131072). ROCm 7 no longer ships rocWMMA, and the RDNA 2 build does not need it:
+the installer compiles only the detected archs (this PR).
+
+These cards have no matrix cores (WMMA), so the engine uses
 its portable kernels there (the prompt attention on the F32 kernel), and the binary also gets `gfx1030` only when such
 a card is chosen. The ROCm installation needs its library kernels (hipBLAS) for `gfx1030`.
 

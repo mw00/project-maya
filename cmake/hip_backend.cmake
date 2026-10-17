@@ -46,6 +46,21 @@ set(CMAKE_HIP_ARCHITECTURES "${_strata_hip_norm}" CACHE STRING "Strata HIP targe
 # The compiled architectures reach the runtime device check (src/core/device.cu) as "gfx1100,gfx1201": a binary
 # carried to a card it has no code for stops at startup with a clear message instead of "invalid device function".
 string(REPLACE ";" "," STRATA_HIP_ARCHS "${STRATA_HIP_ARCH_LIST}")
+# rocWMMA headers are only needed when the build targets WMMA-capable archs (see glm_batch.cu's f16q prompt
+# attention); RDNA 2-only builds skip the include - ROCm 7 no longer ships rocWMMA and a WMMA-less GPU never
+# takes that path anyway.
+set(_strata_hip_wmma OFF)
+foreach(_arch IN LISTS STRATA_HIP_ARCH_LIST)
+  if(_arch MATCHES "^(gfx1100|gfx1101|gfx1102|gfx1150|gfx1151|gfx1200|gfx1201)$")
+    set(_strata_hip_wmma ON)
+    break()
+  endif()
+endforeach()
+if(_strata_hip_wmma)
+  set(STRATA_HAS_WMMA_DEF "STRATA_HAS_WMMA=1")
+else()
+  set(STRATA_HAS_WMMA_DEF "STRATA_HAS_WMMA=0")
+endif()
 
 enable_language(HIP)
 find_package(hip CONFIG REQUIRED)
@@ -72,7 +87,7 @@ set(STRATA_HIP_COMPAT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include/strata/hi
 add_library(strata_hip_runtime INTERFACE)
 target_include_directories(strata_hip_runtime BEFORE INTERFACE
   "${STRATA_HIP_COMPAT_INCLUDE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/include")
-target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
+target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "${STRATA_HAS_WMMA_DEF}" "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\"")
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
 foreach(_language IN ITEMS CXX HIP)
   target_compile_options(strata_hip_runtime INTERFACE

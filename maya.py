@@ -738,7 +738,7 @@ def check_hip_pc(a, installed=False) -> dict:
              "not been validated on such a card yet - please report how it goes in an issue "
              "(https://github.com/mw00/project-maya/issues)")
     select_build_backend("hip")
-    return {"backend": "hip", "gpus": chosen, "archs": list(HIP_ARCHS) + unvalidated, "rocm": str(root),
+    return {"backend": "hip", "gpus": chosen, "archs": sorted({g["arch"] for g in chosen}), "rocm": str(root),
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 

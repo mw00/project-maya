@@ -7,9 +7,12 @@
 #if defined(STRATA_USE_HIP)
 // rocWMMA (the f16q prompt attention) knows gfx11 and gfx12 only: its config.hpp stops a device pass for any other
 // architecture (RDNA 2, gfx1030) with a static_assert, so that pass leaves it out and compiles the f16q kernel empty -
-// a GPU without WMMA never takes f16q (glm_prefill.cu's mla_attn_path).  The host pass reads it as before.
-#if !(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) || defined(__gfx1100__) || defined(__gfx1101__) || \
-    defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
+// a GPU without WMMA never takes f16q (glm_prefill.cu's mla_attn_path).  The host pass reads it only when the build
+// targets WMMA-capable archs (hip_backend.cmake's STRATA_HAS_WMMA) - an RDNA 2-only build skips the include entirely,
+// so it links without the rocWMMA headers (ROCm 7 no longer ships them).
+#if (!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && STRATA_HAS_WMMA) || \
+    ((defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)))
 #define STRATA_ROCWMMA 1
 #else
 #define STRATA_ROCWMMA 0
