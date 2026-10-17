@@ -24,8 +24,8 @@ What the first run does (each step is skipped when it is already done):
      gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
-     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits, experimental
-     and NVIDIA only)
+     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits or the
+     self-calibrated one at 4.10, experimental and NVIDIA only)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/strata`, or `build-hip/strata`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
@@ -381,6 +381,105 @@ MODELS = {
                 "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
             "quantization_config.json":
                 "d18c35bf6184a67a3b612b15c216bdfdf9e81505c0e02b646152925b13fafef3",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # turboderp's self-calibrated quant at 4.10 bits (exllamav3 1.6): 4-bit routed experts (5-bit in the first MoE
+    # layer), 8-bit attention and shared experts, 6-bit dense layers and output; the MTP block is in its shards (layer
+    # 45 of the index, no mtp.safetensors)
+    "EXL3-sc_4.10bpw": {
+        "about": "turboderp's self-calibrated EXL3 quant at 4.10 bits per weight (exllamav3's trellis format, which the "
+                 "engine reads in place from its safetensors): 4-bit routed experts like EXL3-4.05bpw, 8-bit "
+                 "attention and shared experts, with the MTP draft block - experimental, NVIDIA GPUs only",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "sc_4.10bpw",
+        "revision": "c6b8ac3f6069173343e253e1cba90536ed2c72dc", "folder": "", "download_gb": 167.8,
+        "files": {
+            "config.json": 7866, "LICENSE": 1070, "README.md": 8033, "chat_template.jinja": 10950,
+            "generation_config.json": 194, "model-00001-of-00023.safetensors": 6756990246,
+            "model-00002-of-00023.safetensors": 7614064514, "model-00003-of-00023.safetensors": 7615704591,
+            "model-00004-of-00023.safetensors": 7614064514, "model-00005-of-00023.safetensors": 7615711593,
+            "model-00006-of-00023.safetensors": 7614071504, "model-00007-of-00023.safetensors": 7615711593,
+            "model-00008-of-00023.safetensors": 7614071504, "model-00009-of-00023.safetensors": 7615711593,
+            "model-00010-of-00023.safetensors": 7614071504, "model-00011-of-00023.safetensors": 7615711593,
+            "model-00012-of-00023.safetensors": 7614071504, "model-00013-of-00023.safetensors": 7615711593,
+            "model-00014-of-00023.safetensors": 7614071504, "model-00015-of-00023.safetensors": 7615711593,
+            "model-00016-of-00023.safetensors": 7614071504, "model-00017-of-00023.safetensors": 7615711593,
+            "model-00018-of-00023.safetensors": 7614071504, "model-00019-of-00023.safetensors": 7615711593,
+            "model-00020-of-00023.safetensors": 7614071504, "model-00021-of-00023.safetensors": 7615711593,
+            "model-00022-of-00023.safetensors": 8567785824, "model-00023-of-00023.safetensors": 107056658,
+            "model.safetensors.index.json": 16343098, "processor_config.json": 909,
+            "quantization_config.json": 47833416, "tokenizer.json": 20217442, "tokenizer_config.json": 761},
+        "sha256": {
+            "config.json":
+                "8e27397f93723062062d2a379d9c2a30e338906f5ad838183459ad44242a35aa",
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "5c48ce1a84c5901ab96d602333e9201fa385a73e9c298fab3467183b8b95a549",
+            "chat_template.jinja":
+                "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "model-00001-of-00023.safetensors":
+                "d53ec79f27568969924ae5675e47da913f15d2641f5713a5a1821855951b5508",
+            "model-00002-of-00023.safetensors":
+                "41bec1004e051021fe70b169ebbcca54d2cddb4cb74a256f8fcc4100e7c4e5ac",
+            "model-00003-of-00023.safetensors":
+                "bb608460adf5844fc022fd26611d6a349875a1a12d57fa215fc4eb105b065e8b",
+            "model-00004-of-00023.safetensors":
+                "a96a54b70bb9e12212435c1a546927b2fb6499a8681c7f9f8f3801bc2851addb",
+            "model-00005-of-00023.safetensors":
+                "4d237d5f8fb96662948c863b4887221f8fa84cd313431b0094fd51f78b3a04d2",
+            "model-00006-of-00023.safetensors":
+                "d2c9f343e5e085c28ec46e8e41362d3944cd6359ec203c2f27eb217e0aac2867",
+            "model-00007-of-00023.safetensors":
+                "340bf0d4c5947397eb4486bcbcf37c36519d3da9ac6448145aaae78b6f54046f",
+            "model-00008-of-00023.safetensors":
+                "fc74dfd79a539ec720f046c76858ab76a0e53f5600f5d9313b095e06935e67cd",
+            "model-00009-of-00023.safetensors":
+                "caf28ef4a95c8bdf4e6ad7d06c570ab729837f635cb2734d55bf51a92627003c",
+            "model-00010-of-00023.safetensors":
+                "2e0e1e6bd27c54d53115e70e9eb84d396538db4b645cc14b53cc5ace1809707d",
+            "model-00011-of-00023.safetensors":
+                "19f264dbf6da1876a0b9eea32a1d468e9e938130af6c69a0f2e076ab9736c09d",
+            "model-00012-of-00023.safetensors":
+                "1306d044b597fed6ea88146c7d08e5b0da55ec736cbd2b4311d319cca9a78dcb",
+            "model-00013-of-00023.safetensors":
+                "cfda30da128c7f1787a3cf7c60abda6bab15a1d3c693698d4a8fd59f7f1a3966",
+            "model-00014-of-00023.safetensors":
+                "2fe60640bdf58982d1f39a0e7bfc93a37c54cf8249f31b9feb39098aa99bddb1",
+            "model-00015-of-00023.safetensors":
+                "eeb92d7822dd2bdd66b8541251d060b10b1c8c26b98455ab727a208f7dfccb76",
+            "model-00016-of-00023.safetensors":
+                "7ef771a0105c0e33df8335f75336a21f7b5836ab88c068153b5ec8eff38ae105",
+            "model-00017-of-00023.safetensors":
+                "bcddb8f5ba687ccec306153884a3201b6c15ba01e0a077e797adf3d8dd0e67f3",
+            "model-00018-of-00023.safetensors":
+                "1df5395e73a10e2bf93427c7bb5c726e2c3a81bc611b0a6c61ef2d9b25d51090",
+            "model-00019-of-00023.safetensors":
+                "e151f871e76e03ec729f11d41d56f56e85b6308f590853047b1871c7a480ca70",
+            "model-00020-of-00023.safetensors":
+                "eee4dcc5b46b2ecc206d1836a3b881ad1649dd8f3772451df90f0e4552d73566",
+            "model-00021-of-00023.safetensors":
+                "7fa6316ec90aa7ce3273fd48a4e7f0826af3b8b28643079cce1239db88a3fdbf",
+            "model-00022-of-00023.safetensors":
+                "0cd44a37d30d7651ab95474ff97c9b7368b61ff349041b42dc61edddd2608d14",
+            "model-00023-of-00023.safetensors":
+                "7cce8ab6fd899ccbe40db8cf9952647fe8e50fcdaab2787cac0a5f9cbeaf0d58",
+            "model.safetensors.index.json":
+                "aaae0dd2761dc33c3d56ddc54a5943877096b25739a963fb2ab83cc931a09f13",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "82dc427917ec37c3aebb25950f1a16378d7a2a7175fb37b5cf464a4add1e1b1e",
             "tokenizer.json":
                 "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
             "tokenizer_config.json":
