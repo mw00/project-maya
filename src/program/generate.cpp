@@ -2935,6 +2935,35 @@ static int glm_pack_generate(const Options& o) {
         return rc;
     }
 
+    // STRATA_GLM_WARM_PROMPT=<n> (default 0 = off; 32 or more): one synthetic prompt through the whole part chain
+    // before the server is told READY, so the session's first request does not pay what only a session's first
+    // prompt pays (issue #8: it read 95-133 ms/token against 23-44 warm - the first chunk carries the one-time work:
+    // every kernel's first launch, the prompt path's own allocations, the tiers' first reads).  It costs about one
+    // chunk of the smallest part's size (~15 s on a four-way split, beside the tiers' own 90-151 s warm-up), its ids
+    // are spread over the vocabulary so the routes are not one expert's, and the state is zeroed right after it: no
+    // conversation can see it (a request with no slot in use resets anyway, before its own prompt).
+    if (const char* wv = getenv("STRATA_GLM_WARM_PROMPT")) {
+        const int wn = std::atoi(wv);
+        if (wn > 0 && model.prefill_chunk() > 0) {
+            const int wtn = std::max(32, wn);
+            std::vector<int32_t> wids((size_t) wtn);
+            for (int i = 0; i < wtn; ++i) wids[(size_t) i] = (int32_t) (100 + (i * 131) % 20000);
+            std::fprintf(stderr, "glm fast: warming the prompt path with a %d-token prompt before READY "
+                                 "(STRATA_GLM_WARM_PROMPT)\n", wtn);
+            const auto wt0 = std::chrono::steady_clock::now();
+            std::string werr;
+            const bool wok = model.prefill(wids, werr);
+            const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - wt0).count();
+            model.reset();
+            if (wok) {
+                std::fprintf(stderr, "glm fast: the prompt path is warm (%d tokens in %.0f ms, %.1f ms/token)\n", wtn,
+                             wms, wms / (double) wtn);
+            } else {
+                std::fprintf(stderr, "glm fast: the prompt warm-up did not run%s%s - the first prompt pays it\n",
+                             werr.empty() ? "" : ": ", werr.c_str());
+            }
+        }
+    }
     // issue #40: a prompt that stopped moving (the GPU idle, a host thread spinning on a flag) waited forever - the
     // server's own stall check counts a spinning thread as work.  A prompt layer or a token is the heartbeat; a big
     // chunk's layer on a slow PC takes seconds, so three minutes of none is a hang.
