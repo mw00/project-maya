@@ -1176,11 +1176,14 @@ static int glm_pack_generate(const Options& o) {
     // it does continue (slot_load) - chats, and an agent's side requests, that interleave no longer re-read each
     // other's prompts.  STRATA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of STRATA_GLM_SLOT_MIN tokens
     // or more (1024), in STRATA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most STRATA_GLM_SLOT_GB on
-    // disk (16) and never below 8 GB free.  Text only: a conversation with pictures is not set aside.
+    // disk (16) and never below 8 GB free.  Text only: a conversation with pictures is not set aside.  Or the slots
+    // live in RAM and nothing reaches the disk: STRATA_GLM_SLOT_RAM_GB (0, off) caps their bytes there - the states
+    // are host buffers that die with the run, so SLOT_DIR, SLOT_GB (1) and the disk-space guard do not apply.
     struct Slot {
         std::vector<int32_t> tokens;
-        std::string path;
+        std::string path;                       // empty when the slot is a RAM buffer (slot_ram)
         uint64_t bytes = 0, used = 0;
+        std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         // a paused request's prompt (PAUSE keep): the next turn of that chat continues it, not the written answer
         // (its history drops the reasoning), so its own continuations do not supersede it until it is taken back
         bool anchor = false;
@@ -1198,6 +1201,12 @@ static int glm_pack_generate(const Options& o) {
     int slot_max = model.fast() && getenv("STRATA_GLM_NO_REUSE") == nullptr ? (int) env_num("STRATA_GLM_SLOTS", 4) : 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_GLM_SLOT_MIN", 1024));
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_GLM_SLOT_GB", 16) * 1073741824.0);
+    // slots in RAM: the conversation's state is parked in a host buffer instead of a file.  The cap moves to RAM too
+    // (slot_cap below); the states die with the run, so SLOT_KEEP, SLOT_DAYS, SLOT_DIR and the 8 GB-free disk guard
+    // are theirs no longer.  Nothing on the disk is touched: in RAM mode the slots folder is neither used nor wiped.
+    const bool slot_ram = env_num("STRATA_GLM_SLOT_RAM_GB", 0) > 0;
+    const uint64_t slot_cap =
+        slot_ram ? (uint64_t) (env_num("STRATA_GLM_SLOT_RAM_GB", 16) * 1073741824.0) : slot_budget;
     // STRATA_GLM_SLOT_KEEP=1: the slots outlive the engine - the folder is not emptied at start (its files are indexed
     // and kept when they belong to this model), the conversation in the model is set aside when the engine ends
     // (QUIT or end of input), and a file not used for STRATA_GLM_SLOT_DAYS days (7) is removed.  Every slot then has a
@@ -1273,7 +1282,9 @@ static int glm_pack_generate(const Options& o) {
         std::snprintf(s, sizeof s, "%.2f GB", (double) b / 1e9);
         return std::string(s);
     };
-    if (slot_max > 0) {
+    if (slot_max > 0 && slot_ram)
+        note("slots parked in RAM (" + gb(slot_cap) + " max) - nothing is written to disk, the states die with the run");
+    if (slot_max > 0 && !slot_ram) {
         slot_dir = getenv("STRATA_GLM_SLOT_DIR") ? std::filesystem::path(getenv("STRATA_GLM_SLOT_DIR"))
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
@@ -1329,9 +1340,13 @@ static int glm_pack_generate(const Options& o) {
         }
     }
     const auto slot_drop = [&](size_t i) {
-        std::error_code ec;
-        std::filesystem::remove(slots[i].path, ec);
-        std::filesystem::remove(meta_of(slots[i].path), ec);
+        if (slots[i].data)                       // a RAM slot: its buffer simply dies
+            slots[i].data.reset();
+        else {
+            std::error_code ec;
+            std::filesystem::remove(slots[i].path, ec);
+            std::filesystem::remove(meta_of(slots[i].path), ec);
+        }
         slots.erase(slots.begin() + (long) i);
     };
     const auto slot_lru = [&](size_t keep) {   // the least recently used slot other than `keep`
@@ -1348,6 +1363,37 @@ static int glm_pack_generate(const Options& o) {
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
+        if (slot_ram) {   // the conversation is parked in a host buffer; nothing touches the disk
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string e;
+            auto buf = std::make_shared<std::vector<uint8_t>>();
+            buf->reserve(1 << 20);
+            const uint64_t bytes = model.slot_save(*buf, e);
+            if (bytes == 0) {
+                note("setting the conversation aside in RAM failed (" + (e.empty() ? std::string("it did not copy") : e) +
+                     ") - it is not parked and will be read from token 0 when it comes back");
+                return;
+            }
+            slots.push_back({snap_tokens, "", bytes, ++slot_clock});
+            slots.back().data = buf;
+            snap_in_slot = true;
+            uint64_t total = 0;
+            for (const auto& s : slots) total += s.bytes;
+            size_t evicted = 0;
+            while (slots.size() > 1 && total > slot_cap) {
+                const size_t i = slot_lru(slots.size() - 1);
+                total -= slots[i].bytes;
+                slot_drop(i);
+                ++evicted;
+            }
+            char m[288];
+            std::snprintf(m, sizeof m, "saved a %zu-token conversation%s (%s in RAM in %.1f s); %zu kept, %s%s",
+                          snap_tokens.size(), why, gb(bytes).c_str(),
+                          std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), slots.size(),
+                          gb(total).c_str(), evicted ? ", least recently used dropped to stay under the RAM cap" : "");
+            note(m);
+            return;
+        }
         std::error_code ec;
         const auto space = std::filesystem::space(slot_dir, ec);
         if (!ec && space.available < (uint64_t) 8 << 30) {
@@ -1375,7 +1421,7 @@ static int glm_pack_generate(const Options& o) {
         uint64_t total = 0;
         for (const auto& s : slots) total += s.bytes;
         size_t evicted = 0;
-        while (slots.size() > 1 && total > slot_budget) {
+        while (slots.size() > 1 && total > slot_cap) {
             const size_t i = slot_lru(slots.size() - 1);
             total -= slots[i].bytes;
             slot_drop(i);
@@ -1402,7 +1448,10 @@ static int glm_pack_generate(const Options& o) {
         if (best == SIZE_MAX) return 0;
         const auto t0 = std::chrono::steady_clock::now();
         std::string e;
-        if (!model.slot_load(slots[best].path, (int64_t) len, e)) {
+        const bool back = slots[best].data
+                              ? model.slot_load(*slots[best].data, (int64_t) len, e)
+                              : model.slot_load(slots[best].path, (int64_t) len, e);
+        if (!back) {
             note("taking a conversation back failed (" + e + ") - reading its prompt again");
             slot_drop(best);
             snap_tokens.clear();
@@ -1413,12 +1462,13 @@ static int glm_pack_generate(const Options& o) {
         snap_in_slot = true;
         slots[best].used = ++slot_clock;
         slots[best].anchor = false;
-        if (slot_keep) {   // its age counts from its last use
+        if (slot_keep && !slots[best].data) {   // its age counts from its last use (a file slot's only)
             std::error_code ec;
             fs::last_write_time(meta_of(slots[best].path), fs::file_time_type::clock::now(), ec);
         }
         char m[160];
-        std::snprintf(m, sizeof m, "took back a %zu-token conversation from disk (%.1f s); %zu new tokens to read", len,
+        std::snprintf(m, sizeof m, "took back a %zu-token conversation from %s (%.1f s); %zu new tokens to read", len,
+                      slots[best].data ? "RAM" : "disk",
                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                       prompt.size() - len);
         note(m);
@@ -3284,14 +3334,14 @@ static int glm_pack_generate(const Options& o) {
                 gen_finish(*gp);
             }
         gen_sweep();
-        if (slot_keep)
+        if (slot_keep && !slot_ram)
             for (int c = 0; c < (int) ctxs.size(); ++c) {
                 bind_ctx(c);
                 slot_put(" on shutdown");
             }
         return 0;
     }
-    if (slot_keep) slot_put(" on shutdown");
+    if (slot_keep && !slot_ram) slot_put(" on shutdown");
     save_profile("quit");   // #477
     strata::core::Glm5Model::set_routing_dump("", err);   // --dump-routing: the trace closed whole
     return 0;

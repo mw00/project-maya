@@ -6754,6 +6754,200 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
     return true;
 }
 
+// The RAM version of the two above: the same byte stream (header, per half, payload), but between
+// caller-held vector<uint8_t> and the state directly - no file, no bounce buffer.  slot_save sizes the
+// buffer exactly first (slot_dsa_runs is read-only, so the layout can be taken before any byte moves),
+// and any allocation failure is caught (the caller falls back to the disk path).
+uint64_t Glm5Model::slot_save(std::vector<uint8_t>& data, std::string& err) {
+    std::vector<Glm5Model*> halves;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_) {
+            err = "no snapshot to save";
+            return 0;
+        }
+        halves.push_back(m);
+    }
+    const int64_t n = snap_pos_;
+    // the layout of every half first: run sizes and the payload's exact total
+    struct Half {
+        Glm5Model* m;
+        const Glm5Geometry* g;
+        int64_t run = 0, pool_rows = 0;
+        int32_t n_rec = 0;
+        std::vector<std::pair<float*, int64_t>> runs;
+    };
+    std::vector<Half> hs;
+    uint64_t total = 8 + 4 + 8;
+    for (Glm5Model* m : halves) {
+        const Glm5Geometry& g = m->g_;
+        Half h;
+        h.m = m;
+        h.g = &g;
+        h.run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
+        for (int il = m->l0_; il < m->l1_; ++il) h.n_rec += g.is_recr(il);
+        h.runs = slot_dsa_runs(g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->state_,
+                               m->kv_ != nullptr ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_,
+                               m->dsa_ig_, m->dsa_pool_, n);
+        h.pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
+        int64_t payload = (int64_t) h.n_rec * h.run + (h.pool_rows > 0 ? h.pool_rows : 0);
+        for (const auto& r : h.runs) payload += r.second;
+        total += 16 + 8 + 8 * (uint64_t) h.runs.size() + (uint64_t) payload * sizeof(float);
+        hs.push_back(std::move(h));
+    }
+    if (data.size() < total) {
+        try {
+            data.resize(total);
+        } catch (const std::bad_alloc&) {
+            char m[160];
+            std::snprintf(m, sizeof m, "the RAM slot does not fit (%.1f GB free for it)", (double) total / 1e9);
+            err = m;
+            return 0;
+        }
+    }
+    double t_sync = 0, t_copy = 0;
+    size_t pos = 0;
+    const auto put = [&](const void* p, size_t bytes) {
+        std::memcpy(data.data() + pos, p, bytes);
+        pos += bytes;
+    };
+    const uint32_t nh = (uint32_t) halves.size();
+    put(&kSlotMagic, 8);
+    put(&nh, 4);
+    put(&n, 8);
+    for (const Half& h : hs) {
+        const Glm5Model* m = h.m;
+        const Glm5Geometry& g = *h.g;
+        cudaSetDevice(m->dev_);
+        auto tq = std::chrono::steady_clock::now();
+        cudaStreamSynchronize(m->fast_->cs);
+        t_sync += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tq).count();
+        const int32_t hdr[4] = {m->l0_, m->l1_, h.n_rec, (int32_t) h.runs.size()};
+        put(hdr, sizeof(hdr));
+        put(&h.run, 8);
+        for (const auto& r : h.runs) put(&r.second, 8);
+        std::vector<std::pair<const float*, int64_t>> src;
+        if (h.n_rec > 0) src.push_back({m->snap_, (int64_t) h.n_rec * h.run});
+        if (h.pool_rows > 0) src.push_back({m->snap_pool_, h.pool_rows});
+        for (const auto& r : h.runs) src.push_back({r.first, r.second});
+        constexpr int64_t kChunk = (int64_t) 16 << 20;   // floats
+        for (const auto& s : src)
+            for (int64_t at = 0; at < s.second; at += kChunk) {
+                const int64_t c = std::min(kChunk, s.second - at);
+                const auto tc = std::chrono::steady_clock::now();
+                if (cudaMemcpy(data.data() + pos, s.first + at, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
+                    cudaSuccess) {
+                    cudaGetLastError();
+                    cudaSetDevice(dev_);
+                    err = "the state did not copy back";
+                    return 0;
+                }
+                t_copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
+                pos += (size_t) c * sizeof(float);
+            }
+    }
+    cudaSetDevice(dev_);
+    if (getenv("STRATA_GLM_SLOT_TIMING"))
+        std::fprintf(stderr, "glm slots: save %lld positions to RAM - sync %.0f ms, copy %.0f ms\n",
+                     (long long) n, t_sync, t_copy);
+    return total;
+}
+
+bool Glm5Model::slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err) {
+    dflash_reset();   // another conversation's state: the drafter's cached positions are not its
+    size_t pos = 0;
+    const auto get = [&](void* p, size_t bytes) {
+        if (pos + bytes > data.size()) return false;
+        std::memcpy(p, data.data() + pos, bytes);
+        pos += bytes;
+        return true;
+    };
+    uint64_t magic = 0;
+    uint32_t nh = 0;
+    int64_t n = 0;
+    std::vector<Glm5Model*> halves;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) halves.push_back(m);
+    if (!get(&magic, 8) || !get(&nh, 4) || !get(&n, 8) || magic != kSlotMagic || nh != halves.size() || n != n_pos ||
+        n <= 0 || n > max_ctx_) {
+        err = "not a slot of this model";
+        return false;
+    }
+    for (Glm5Model* m : halves) {
+        if (m->fast_ == nullptr) {
+            err = "no fast path";
+            return false;
+        }
+        const Glm5Geometry& g = m->g_;
+        const int64_t run = (int64_t) g.d_inner() * g.kda_head_dim + (int64_t) 3 * g.d_inner() * (g.d_conv - 1);
+        int32_t n_rec = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
+        const auto runs = slot_dsa_runs(g, m->fast_mode_, m->lat_q8_, m->l0_, m->l1_, m->mtp_il_, m->state_,
+                                        m->kv_ != nullptr ? &m->kv_->host : nullptr, m->dsa_lat_, m->dsa_ik_,
+                                        m->dsa_ig_, m->dsa_pool_, n_pos);
+        int32_t hdr[4] = {};
+        int64_t frun = 0;
+        if (!get(hdr, sizeof(hdr)) || !get(&frun, 8) || hdr[0] != m->l0_ || hdr[1] != m->l1_ || hdr[2] != n_rec ||
+            hdr[3] != (int32_t) runs.size() || frun != run) {
+            err = "the slot's layout differs from this model's";
+            return false;
+        }
+        for (const auto& r : runs) {
+            int64_t fl = 0;
+            if (!get(&fl, 8) || fl != r.second) {
+                err = "the slot's layout differs from this model's";
+                return false;
+            }
+        }
+        cudaSetDevice(m->dev_);
+        cudaStreamSynchronize(m->fast_->cs);
+        if (m->snap_ == nullptr && n_rec > 0 &&
+            cudaMalloc(&m->snap_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
+            cudaGetLastError();
+            m->snap_ = nullptr;
+            cudaSetDevice(dev_);
+            err = "the snapshot did not allocate";
+            return false;
+        }
+        std::vector<std::pair<float*, int64_t>> dst;
+        if (n_rec > 0) dst.push_back({m->snap_, (int64_t) n_rec * run});
+        const int64_t pool_rows = (int64_t) m->dsa_layers().size() * 2 * (g.idx_kpool - 1) * g.idx_key;
+        if (pool_rows > 0) {
+            if (m->snap_pool_ == nullptr && cudaMalloc(&m->snap_pool_, (size_t) pool_rows * sizeof(float)) != cudaSuccess) {
+                cudaGetLastError();
+                m->snap_pool_ = nullptr;
+                cudaSetDevice(dev_);
+                err = "the snapshot did not allocate";
+                return false;
+            }
+            dst.push_back({m->snap_pool_, pool_rows});
+        }
+        for (const auto& r : runs) dst.push_back({r.first, r.second});
+        for (const auto& d : dst) {
+            constexpr int64_t kChunk = (int64_t) 16 << 20;
+            for (int64_t at = 0; at < d.second; at += kChunk) {
+                const int64_t c = std::min(kChunk, d.second - at);
+                if ((uint64_t) pos + (uint64_t) c * sizeof(float) > data.size() ||
+                    cudaMemcpy(d.first + at, data.data() + pos, (size_t) c * sizeof(float), cudaMemcpyDefault) !=
+                        cudaSuccess) {
+                    cudaGetLastError();
+                    cudaSetDevice(dev_);
+                    err = "the slot did not read back";
+                    return false;
+                }
+                pos += (size_t) c * sizeof(float);
+            }
+        }
+        m->kv_stream_reset_maps();   // KV streaming: the slots held the other conversation's blocks
+        m->snap_pos_ = n;
+    }
+    cudaSetDevice(dev_);
+    // the KDA states go from the snapshot into the live state, as snapshot_restore does (it also sets the position)
+    if (!snapshot_restore()) {
+        err = "the snapshot did not restore";
+        return false;
+    }
+    return true;
+}
+
 bool Glm5Model::forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err) {
     FastState* F = fast_;
     for (int32_t t : tokens) {

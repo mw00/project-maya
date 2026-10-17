@@ -219,6 +219,12 @@ public:
     /// while others ran continues where it was.  The bytes written, or 0 + err.
     uint64_t slot_save(const std::string& path, std::string& err);
     bool slot_load(const std::string& path, int64_t n_pos, std::string& err);
+    /// The same, in host RAM: the exact bytes the file version writes, in a caller-held buffer whose
+    /// lifetime is the conversation's (engine-side: the run's).  Nothing reaches the disk.  The bytes
+    /// written, or 0 + err (out of RAM, no snapshot).  slot_load takes the buffer back as the live
+    /// state and the snapshot; false + err on a mismatch or a truncated buffer.
+    uint64_t slot_save(std::vector<uint8_t>& data, std::string& err);
+    bool slot_load(const std::vector<uint8_t>& data, int64_t n_pos, std::string& err);
     /// Runs the engine's sampler on the last forward's logits and returns the picked token id
     /// (-1 + err on failure).  Handles the device bookkeeping: with a split the logits (and the
     /// sampler buffer) live on the tail half's device, where peer reads are not available.
