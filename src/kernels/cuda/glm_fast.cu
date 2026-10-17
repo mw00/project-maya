@@ -862,7 +862,6 @@ template<> __device__ __forceinline__ float dw<29>(const uint8_t* row, int kbx, 
 // a four-bit sign nibble by 0x10204080 puts its bits at each byte's high bit;
 // after masking/shifting, these are the +1 corrections and *255 gives the masks.
 // The integer scale divisions and floating-point accumulation order stay intact.
-#if defined(STRATA_USE_HIP)
 __device__ __forceinline__ uint4 direct_signs(unsigned b, bool parity) {
     b &= parity ? 127u : 255u;
     if (parity) b |= (__popc(b) & 1) << 7;
@@ -875,7 +874,7 @@ __device__ __forceinline__ uint2 quant_load8(const void* p) {
     __builtin_memcpy(&words, p, sizeof(words)); // GGUF super-blocks are only 2-byte aligned.
     return words;
 }
-template<int T> constexpr int sign_count = T == 22 ? 256 : 128;
+template<int T> constexpr int sign_count = T == 22 ? 256 : (T == 16 || T == 18 ? 128 : 1);
 template<int T>
 __device__ __forceinline__ void load_signs(uint4* signs) {
     for (int i = threadIdx.x; i < sign_count<T>; i += blockDim.x) {
@@ -974,7 +973,6 @@ __device__ __forceinline__ void rows_dot_rdna(const uint8_t* const* rows, const 
 #pragma unroll
     for (int r = 0; r < NR; ++r) s[r] = warp_sum(acc[r]);
 }
-#endif
 
 // their F entries (the dense GEMV and row_dot read the codebook from global memory; the call's q8_1 block is
 // iqs / step of the super-block's)
@@ -1234,6 +1232,42 @@ __global__ void __launch_bounds__(256) mv_kernel_t(const __grid_constant__ MvBat
     const float s = row_dot<T>((const uint8_t*) J.w + (size_t) row * rbytes<T>(J.n_in), (const block_q8_1*) J.xq,
                                J.n_in, lane);
     if (lane == 0) J.y[row] = mv_out(J.alpha, s, J.bias ? J.bias[row] : 0.0f);
+}
+template<int T, int R = 4>
+__global__ void __launch_bounds__(256) mv_kernel_t_r(const __grid_constant__ MvBatch b) {
+    if (b.skip != nullptr && *b.skip) return;
+    using Fm = F<T>;
+    using D = DecW<T>;
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    const int row0 = ((bid - blk0) * MV_ROWS + (threadIdx.x >> 5)) * R;
+    const int lane = threadIdx.x & 31;
+    if (row0 >= J.n_out) return;
+    const size_t rb = rbytes<T>(J.n_in);
+    const uint8_t* w[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) w[r] = (const uint8_t*) J.w + (size_t) min(row0 + r, J.n_out - 1) * rb;
+    const block_q8_1* xq = (const block_q8_1*) J.xq;
+    float s[R] = {};
+    const int nk = (J.n_in / Fm::qk) * Fm::ipb;
+    for (int k = lane; k < nk; k += 32) {
+        const int kbx = k / Fm::ipb, iqs = Fm::step * (k % Fm::ipb);
+        D dw[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) dw[r].load(w[r], kbx, iqs);
+        const typename D::X xv = D::load_x(xq + kbx * (Fm::qk / 32), iqs);
+#pragma unroll
+        for (int r = 0; r < R; ++r) s[r] += dw[r].dot(xv);
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float v = warp_sum(s[r]);
+        if (lane == 0 && row0 + r < J.n_out)
+            J.y[row0 + r] = mv_out(J.alpha, v, J.bias ? J.bias[row0 + r] : 0.0f);
+    }
 }
 template<int T>
 __global__ void __launch_bounds__(256) mv_kernel_t_cols(const __grid_constant__ MvBatch b) {
@@ -3757,8 +3791,13 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TG> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TG>(s_sign);
     if constexpr (!GLOBAL)
-#endif
     load_tab<TG>(s_tab);
+#else
+    constexpr bool use_rdna = (TG == 16 || TG == 18 || TG == 22);
+    __shared__ uint4 s_sign[use_rdna ? sign_count<TG> : 1];
+    if constexpr (use_rdna) load_signs<TG>(s_sign);
+    load_tab<TG>(s_tab);
+#endif
     __syncthreads();
     const size_t rb = rbytes<TG>(n_embd);
     const uint8_t* blob = (const uint8_t*) ptr;
@@ -3779,8 +3818,14 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if constexpr (LUT) {
         rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
     } else
-#endif
     rows_dot<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s);
+#else
+    if constexpr (use_rdna) {
+        rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, s_tab, s_sign, s, false, true);
+    } else {
+        rows_dot<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s);
+    }
+#endif
     if (lane == 0) {
 #pragma unroll
         for (int j = 0; j < RPW; ++j) {
@@ -3837,8 +3882,13 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TD> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TD>(s_sign);
     if constexpr (!GLOBAL)
-#endif
     load_tab<TD>(s_tab);
+#else
+    constexpr bool use_rdna = (TD == 16 || TD == 18 || TD == 22);
+    __shared__ uint4 s_sign[use_rdna ? sign_count<TD> : 1];
+    if constexpr (use_rdna) load_signs<TD>(s_sign);
+    load_tab<TD>(s_tab);
+#endif
     if (threadIdx.x < 8) {
         s_ptr[threadIdx.x] = (int) threadIdx.x < k ? d.plan_ptr[threadIdx.x] : 0ull;
         s_w[threadIdx.x] = (int) threadIdx.x < k ? d.plan_w[threadIdx.x] : 0.0f;
@@ -3860,8 +3910,14 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
             if constexpr (LUT) {
                 rows_dot_rdna<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s_sign, s, DIRECT, WIDE);
             } else
-#endif
             rows_dot<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s);
+#else
+            if constexpr (use_rdna) {
+                rows_dot_rdna<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, s_tab, s_sign, s, false, true);
+            } else {
+                rows_dot<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s);
+            }
+#endif
         } else {
 #pragma unroll
             for (int j = 0; j < NR; ++j) s[j] = 0.0f;
@@ -4694,10 +4750,12 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             MvBatch b{};
             b.skip = g_skip;
             int acc = 0, m = 0;
+            const int r_per_warp = (T == 8 ? 4 : 1);
+            const int r_per_blk = MV_ROWS * r_per_warp;
             for (int i = 0; i < n; ++i)
                 if (!done[i] && jobs[i].type == T) {
                     b.j[m] = jobs[i];
-                    acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
+                    acc += (jobs[i].n_out + r_per_blk - 1) / r_per_blk;
                     b.blk_end[m++] = acc;
                     done[i] = true;
                 }
@@ -4705,7 +4763,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             b.n = m;
             switch (T) {
                 case 14: mv_kernel_t<14><<<acc, 256, 0, s>>>(b); break;
-                case 8: mv_kernel_t<8><<<acc, 256, 0, s>>>(b); break;
+                case 8: mv_kernel_t_r<8, 4><<<acc, 256, 0, s>>>(b); break;
                 case 12: mv_kernel_t<12><<<acc, 256, 0, s>>>(b); break;
                 case 13: mv_kernel_t<13><<<acc, 256, 0, s>>>(b); break;
             }

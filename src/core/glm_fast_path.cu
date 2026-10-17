@@ -21,6 +21,8 @@
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 
@@ -1384,8 +1386,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->layer_rc[(size_t) il] = c;
             // (the experts its main slots cannot hold: the pool's lendable tail counts as not held - a prompt
             // borrows it, and the experts there go to RAM meanwhile, prefill_lend)
-            cls_weight[(size_t) c] +=
-                (double) std::max(2, g.n_expert - F->lp[(size_t) il].n_main + gf::kSpares + 2 + F->ram_slack) * (double) st;
+            const int need_sl = F->ram_resident
+                                    ? std::max(2, g.n_expert - F->lp[(size_t) il].n + 4)
+                                    : std::max(2, g.n_expert - F->lp[(size_t) il].n_main + gf::kSpares + 2 + F->ram_slack);
+            cls_weight[(size_t) c] += (double) need_sl * (double) st;
         }
         double wsum = 0;
         for (double w : cls_weight) wsum += w;
@@ -1462,9 +1466,21 @@ bool Glm5Model::fast_setup(std::string& err) {
                 remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
             }
             // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
-            budget = l1_ >= g.n_layers ? remaining
-                                       : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
-                                                                                 (double) std::max(1, remaining_layers)));
+            if (l1_ >= g.n_layers) {
+                budget = remaining;
+            } else {
+                const int64_t needed_this = (int64_t) std::ceil(wsum + 32.0 * (cls_stride.empty() ? 0.0 : (double) cls_stride[0]));
+                const int later_layers = std::max(0, remaining_layers - n_moe);
+                const int64_t later_min_needed = (int64_t) later_layers * (int64_t) std::max(0, g.n_expert - 140) *
+                                                 (int64_t) (cls_stride.empty() ? 7000000 : cls_stride[0]);
+                const int64_t can_take = std::max<int64_t>(0, remaining - later_min_needed);
+                const int64_t proportional = (int64_t) ((double) remaining * (double) n_moe / (double) std::max(1, remaining_layers));
+                if (F->ram_resident) {
+                    budget = std::min<int64_t>(remaining, needed_this);
+                } else {
+                    budget = std::min<int64_t>(remaining, std::max<int64_t>(proportional, std::min<int64_t>(needed_this, can_take)));
+                }
+            }
             // a later part: no more than is free now, less what is still to come and half the headroom (a parallel
             // load: and less the earlier parts' tiers, planned but not pinned yet)
             if (part_ > 0 && !fixed_ram) {
@@ -1476,14 +1492,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
         std::vector<int64_t> cls_n(cls_stride.size(), 0), cls_cap(cls_stride.size(), 0);
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
-            int64_t n = (int64_t) ((double) budget * cls_weight[c] / wsum / (double) cls_stride[c]);
-            n = std::max<int64_t>(n, 16);   // a floor so a miss always has somewhere to land
-            // never more than the experts of the class that the VRAM pool does not hold, plus the free slots
-            // fast_boundary keeps per class for disk reads and reads ahead.  When the pool holds every expert (a big
-            // card: 288 of 288 slots a layer, or a split across many GPUs) that is a few spares' worth - below the floor
-            // for a class of one layer (the NextN block), which then never allocated and stopped the start ("did not
-            // allocate")
             cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
+            int64_t n = F->ram_resident ? cls_cap[c]
+                                        : (int64_t) ((double) budget * cls_weight[c] / wsum / (double) cls_stride[c]);
+            n = std::max<int64_t>(n, 16);   // a floor so a miss always has somewhere to land
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
         // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
@@ -2117,19 +2129,23 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
     const int threads = pool.active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
     kc::native_quant_act(nf, x, act);
+    std::atomic<int> exp_done[8];
+    for (int i = 0; i < ne; ++i) exp_done[i].store(0, std::memory_order_relaxed);
     const int gu_tot = ne * n_ff;
     pool.run(T, [&](int job) {
         const void* a[1] = {act};
         const int q1 = (int) ((int64_t) gu_tot * (job + 1) / T);
         for (int q = (int) ((int64_t) gu_tot * job / T); q < q1;) {
             const int i = q / n_ff, r0 = q % n_ff, r1 = std::min(n_ff, r0 + (q1 - q));
-            float* o[1] = {ff + (size_t) i * n_ff};
+            float* fi = ff + (size_t) i * n_ff;
+            float* o[1] = {fi};
             kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
-            q += r1 - r0;
+            const int n = r1 - r0;
+            if (exp_done[i].fetch_add(n, std::memory_order_acq_rel) + n == n_ff)
+                kc::native_quant_h(nf, fi, hq + (size_t) i * kc::kNativeHBytes);
+            q += n;
         }
     });
-    for (int i = 0; i < ne; ++i)
-        kc::native_quant_h(nf, ff + (size_t) i * n_ff, hq + (size_t) i * kc::kNativeHBytes);
     const int dn_tot = ne * n_embd;
     pool.run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
@@ -2141,11 +2157,7 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             q += r1 - r0;
         }
     });
-    for (int r = 0; r < n_embd; ++r) {
-        float m = 0.0f;
-        for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
-        out[r] = m;
-    }
+    kc::native_accum_out(n_embd, ne, w, dn, out);
 }
 
 // A verify window's CPU lane (FastState::win_lane): the routes the service thread hands it, each run on the lane's pool
@@ -2509,31 +2521,49 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
     }
 }
 
-// The CPU lane's pool a split's parts share (fast_cpu_lane_setup): made by the first part, found by the later ones -
+// The CPU lane's pool a split's parts share (fast_cpu_lane_setup): keyed by pool_id (e.g. NUMA node or group) -
 // one model a process; a reload, or another count, makes a new one.  Concurrent (Workers): the parts' routes run at
 // once, a later part's jobs first (STRATA_GLM_CPU_CONCURRENT=0: one route at a time - A/B)
-static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
+static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int pool_id, int threads, const std::vector<int>& pin_cpus = {}) {
     static std::mutex mu;
-    static std::weak_ptr<glmfast::Workers> held;
+    static std::unordered_map<int, std::weak_ptr<glmfast::Workers>> held;
     static const bool concurrent = [] {
         const char* v = getenv("STRATA_GLM_CPU_CONCURRENT");
         return v == nullptr || std::atoi(v) != 0;
     }();
     std::lock_guard<std::mutex> lk(mu);
-    std::shared_ptr<glmfast::Workers> p = held.lock();
+    std::shared_ptr<glmfast::Workers> p = held[pool_id].lock();
     if (p == nullptr || p->size() != threads) {
-        p = std::make_shared<glmfast::Workers>(threads - 1, 20000, std::vector<int>{}, concurrent);
-        held = p;
+        p = std::make_shared<glmfast::Workers>(threads - 1, 20000, pin_cpus, concurrent);
+        held[pool_id] = p;
     }
     return p;
 }
 
-// This process's physical cores (distinct package/core pairs among the CPUs it may run on); 0 when unknown.
-static int physical_cores() {
+// One logical CPU per distinct physical core (package, core_id) in this process's affinity mask.
+// Pinning the pool to this set prevents the OS scheduler from placing two AVX2 worker threads on SMT
+// hyperthread siblings of the same physical core while still allowing threads to float freely across all physical cores.
+static std::vector<int> physical_cpu_list(int only_node = -1) {
+    std::vector<int> out;
 #ifdef __linux__
     cpu_set_t set;
     CPU_ZERO(&set);
-    if (sched_getaffinity(0, sizeof set, &set) != 0) return 0;
+    if (sched_getaffinity(0, sizeof set, &set) != 0) return out;
+    if (only_node >= 0) {
+        cpu_set_t nset;
+        CPU_ZERO(&nset);
+        std::string list;
+        std::ifstream("/sys/devices/system/node/node" + std::to_string(only_node) + "/cpulist") >> list;
+        std::stringstream ss(list);
+        std::string r;
+        while (std::getline(ss, r, ',')) {
+            const size_t d = r.find('-');
+            const int a = std::atoi(r.c_str()), b = d == std::string::npos ? a : std::atoi(r.c_str() + d + 1);
+            for (int c = a; c <= b && c < CPU_SETSIZE; ++c)
+                if (CPU_ISSET(c, &set)) CPU_SET(c, &nset);
+        }
+        set = nset;
+    }
     std::vector<std::pair<int, int>> seen;
     for (int c = 0; c < CPU_SETSIZE; ++c) {
         if (!CPU_ISSET(c, &set)) continue;
@@ -2541,10 +2571,22 @@ static int physical_cores() {
         int pk = -1, co = -1;
         std::ifstream(b + "physical_package_id") >> pk;
         std::ifstream(b + "core_id") >> co;
-        if (co < 0) return 0;
-        if (std::find(seen.begin(), seen.end(), std::make_pair(pk, co)) == seen.end()) seen.push_back({pk, co});
+        if (co < 0) return {};
+        if (std::find(seen.begin(), seen.end(), std::make_pair(pk, co)) == seen.end()) {
+            seen.push_back({pk, co});
+            out.push_back(c);
+        }
     }
-    return (int) seen.size();
+#else
+    (void) only_node;
+#endif
+    return out;
+}
+
+// This process's physical cores (distinct package/core pairs among the CPUs it may run on); 0 when unknown.
+static int physical_cores() {
+#ifdef __linux__
+    return (int) physical_cpu_list(-1).size();
 #elif defined(_WIN32)
     // Windows: the processor cores (each one entry, whatever its SMT threads)
     DWORD len = 0;
@@ -2637,6 +2679,14 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const char* shv = getenv("STRATA_GLM_CPU_SHARED");
     const bool shared = n_parts_ >= 2 && !own_count &&
                         (shv != nullptr && shv[0] != '\0' ? std::atoi(shv) != 0 : n_parts_ >= 3);
+    const char* spv = getenv("STRATA_GLM_CPU_SPLIT_POOLS");
+    const bool split_pools = shared && spv != nullptr && std::atoi(spv) != 0;
+    const int spec_h = std::max(1, std::min(n_parts_ - 1, getenv("STRATA_GLM_SPEC_HEAD") ? std::atoi(getenv("STRATA_GLM_SPEC_HEAD")) : n_parts_ / 2));
+    const int pool_id = split_pools ? (part_ < spec_h ? 0 : 1) : 0;
+    std::vector<int> pin_cpus;
+    int pin_node = -1;
+    const char* pin_env = getenv("STRATA_GLM_CPU_PIN");
+    const bool pin = pin_env != nullptr && pin_env[0] ? std::atoi(pin_env) != 0 : numa_nodes().size() >= 2;
     int threads = 0;
     if (lv != nullptr) {
         threads = std::max(0, std::min(64, std::atoi(lv)));
@@ -2655,26 +2705,29 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         // CPUs left free keep the main thread's event wait, the service and warm-up threads off the spinning ones
         // (2-socket Xeon, 88 vCPUs, Q3_K experts: 88 threads 531 us an expert, 44 216 us, 44 with the RAM tier
         // interleaved 152 us - ~85 of the ~105 GB/s this host reads; a pool per socket, tried, did not add to that)
-        if (n_parts_ == 1 || shared)
-            if (const int node = numa_node_cpus(); node > 0 && threads > node - 4) threads = node - 4;
+        if (n_parts_ == 1 || shared) {
+            if (numa_nodes().size() <= 1) {
+                if (const int node = numa_node_cpus(); node > 0 && threads > node - 4) threads = node - 4;
+            } else {
+                threads = std::min(threads, cores - 4);
+            }
+        }
         if (shared)
-            threads = std::min(threads, cores - (n_parts_ - 1));   // a core for each other part's service thread
+            threads = std::min(threads, cores - 4);
         else
             threads /= std::max(1, n_parts_);   // a two-part split's parts can run at once: one pool each
         if (threads < 2) threads = 0;   // one core is the service thread's
     }
-    // a split whose parts have a pool each (two GPUs, or STRATA_GLM_CPU_SHARED=0): each part's pool on CPUs of its own
-    // (part_cpus: whole NUMA nodes while there are enough, runs of whole cores of a shared one otherwise), at most those
-    // CPUs less the part's share of the 4 a node keeps free, like one GPU's - the shared pool is one GPU's, unpinned.  Unpinned, the parts' pools (half the vCPUs each) shared the cores: a part works while the other's idle
-    // workers spin, and the 2-socket Xeon's 3090 + 5060 Ti split took 0.28 ms an expert where one GPU's pool took 0.15
-    // (and with MTP drafting both parts run at once).  The RAM tier stays interleaved (one socket reading only its own
-    // memory: 54 GB/s, interleaved 77).  By default only on a host with two NUMA nodes or more, where it measured
-    // faster; on one node the unpinned pools sharing every core were (two V100s, one 14-core Xeon: 25.8 tok/s against
-    // 24.7 pinned).  STRATA_GLM_CPU_PIN=1 / 0 pins / unpins on any host.
-    std::vector<int> pin_cpus;
-    int pin_node = -1;
-    const char* pin_env = getenv("STRATA_GLM_CPU_PIN");
-    const bool pin = pin_env != nullptr && pin_env[0] ? std::atoi(pin_env) != 0 : numa_nodes().size() >= 2;
+    if (shared && threads > 0 && pin) {
+        if (split_pools && numa_nodes().size() >= 2) {
+            const auto nodes = numa_nodes();
+            pin_node = nodes[(size_t) pool_id % nodes.size()];
+            pin_cpus = physical_cpu_list(pin_node);
+            if (!pin_cpus.empty()) threads = std::min(threads, std::max(2, (int) pin_cpus.size() - 1));
+        } else {
+            pin_cpus = physical_cpu_list(-1);
+        }
+    }
     if (n_parts_ >= 2 && !shared && threads > 0 && pin) {
         std::vector<int> gpu_node;
         for (int d : split_devs_) gpu_node.push_back(gpu_numa_node(d));
@@ -2776,7 +2829,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         F->cpu_x3.assign(8 * X3Rows::floats(g.n_embd, g.n_ff_exp), 0.0f);
     // the service thread is the pool's last worker; idle workers spin 20 ms (a decode's routes come ~1 ms apart)
     if (shared) {
-        F->cpu_pool = shared_cpu_pool(threads);
+        F->cpu_pool = shared_cpu_pool(pool_id, threads, pin_cpus);
+        F->cpu_node = pin_node;
+        F->cpu_pin = pin_cpus;
     } else {
         F->cpu_pool.reset(new glmfast::Workers(threads - 1, 20000, pin_cpus));
         F->cpu_node = pin_node;
@@ -2944,9 +2999,10 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     const char* sv = getenv("STRATA_GLM_PCIE_SHARE");
     const double share = sv != nullptr ? std::max(0.0, std::min(1.0, std::atof(sv))) : -1.0;
     if (pv == nullptr && share < 0.0) {
-        plan = lane_plan(c_ms, p_ms, &tab);
-        F->cpu_retime = true;   // a split the timing chose: decode may time it again (lane_retime)
-        F->rt_c_ms = c_ms;
+        const double plan_c_ms = shared ? c_ms * 1.15 : c_ms;
+        plan = lane_plan(plan_c_ms, p_ms, &tab);
+        F->cpu_retime = !shared;   // shared pool across pipeline stages includes mutex wait in cpu_us
+        F->rt_c_ms = plan_c_ms;
     } else {
         for (int f = 0; f <= 8; ++f) {
             const int k = pv != nullptr ? (f < (int) std::strlen(pv) ? std::max(0, std::min(f, pv[f] - '0')) : 0)
@@ -2981,7 +3037,8 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
     }
     std::fprintf(stderr, "glm fast: CUDA%d CPU lane: %d threads%s, an expert %.3f ms on the CPU vs %.3f ms over PCIe -> "
                          "of 0..8 RAM-tier experts the CPU takes%s\n", dev_, threads,
-                 shared ? " (one pool, shared by the split's GPUs)"
+                 shared ? (split_pools ? (" (pool " + std::to_string(pool_id) + ", " + (part_ < spec_h ? "head group" : "tail group") + ")").c_str()
+                                       : " (one pool, shared by the split's GPUs)")
                  : pin_cpus.empty() ? ""
                  : (" on " + std::to_string(pin_cpus.size()) + " CPUs of its own" +
                     (pin_node >= 0 ? " (NUMA node " + std::to_string(pin_node) + ")" : std::string())).c_str(),
@@ -3680,7 +3737,8 @@ void Glm5Model::lane_retime() {
             F->rt_e0 = e, F->rt_us0 = us, F->rt_r0 = r;
             continue;
         }
-        if (e - F->rt_e0 < 2000) continue;
+        const uint64_t win_e = std::max<uint64_t>(400, 2000 / (uint64_t) std::max(1, m->n_parts_));
+        if (e - F->rt_e0 < win_e) continue;
         const double ms = ((double) (us - F->rt_us0) / 1000.0 - kLaneOverMs * (double) (r - F->rt_r0)) /
                           (double) (e - F->rt_e0);
         F->rt_e0 = e, F->rt_us0 = us, F->rt_r0 = r;
@@ -3864,9 +3922,9 @@ void Glm5Model::fast_service() {
         const char* v = getenv("STRATA_GLM_WIN_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
-    const gf::MoeRequest* w_rq[kWinMax];
-    gf::CpuAnswer* w_ans[kWinMax];
-    unsigned int w_seq[kWinMax];
+    const gf::MoeRequest* w_rq[kWinMax] = {};
+    gf::CpuAnswer* w_ans[kWinMax] = {};
+    unsigned int w_seq[kWinMax] = {};
     int w_n = 0, w_held = 0;   // the held routes with CPU-lane experts; all the held routes
     const auto win_flush = [&] {
         if (w_n > 0) win_cpu_merged(w_rq[0]->layer, w_n, w_rq, w_ans, w_seq);
@@ -5228,8 +5286,8 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     float* Rc = state_;
     float* Ro = state_ + (int64_t) g.hc * g.n_embd;
     const char* graph_opt = getenv("STRATA_GLM_KDA_GRAPH");
-    const bool graphs = graph_opt && std::atoi(graph_opt) != 0 && n_parts_ == 1 && !hop_in &&
-                        mtp_il_ < 0 && !F->prof_on && !dumps && F->max_pf == 0 && F->n_ahead == 0 &&
+    const bool graphs = graph_opt && std::atoi(graph_opt) != 0 && !F->spec_gate && F->win.pipe_t < 0 &&
+                        !F->prof_on && !dumps && F->max_pf == 0 && F->n_ahead == 0 &&
                         getenv("GLM_DUMP_H") == nullptr && cap_d_ == nullptr;
     F->kda_graph_on = graphs;
     if (F->prof_on) F->mark("start");
@@ -5882,7 +5940,7 @@ Glm5Model* Glm5Model::spec_tail_last() {
     return m;
 }
 
-bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err) {
+bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err, bool cancellable) {
     const size_t hop = (size_t) g_.hc * g_.n_embd * sizeof(float);
     FastState* FA = fast_;
     FastState* FB = B->fast_;
@@ -5893,7 +5951,16 @@ bool Glm5Model::hop_to_next(Glm5Model* B, int64_t p, std::string& err) {
     B->pos_ = p + 1;
     cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
     cudaMemcpyAsync(B->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
-    return B->fast_layers(p, true, err);
+    if (cancellable && FB->spec_skip_d != nullptr) {
+        FB->spec_gate = true;
+        gf::set_skip(FB->spec_skip_d);
+    }
+    const bool ok = B->fast_layers(p, true, err);
+    if (cancellable) {
+        FB->spec_gate = false;
+        gf::set_skip(nullptr);
+    }
+    return ok;
 }
 
 // the head's KDA states (S + conv history of every recurrent layer here: one contiguous run each) <-> kda_bak_
@@ -5945,11 +6012,15 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err)) return false;
     // STRATA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
     // set now, with the stream idle, so no earlier pass reads it any more.  Other passes (a redo, the confirmed token's)
-    // have no gates and never skip.  A head group of one GPU only (decode_spec checks)
-    const bool cancellable = F->spec_cancellable && hl == this && F->spec_live_h != nullptr && F->spec_skip_d != nullptr;
+    // have no gates and never skip.
+    const bool cancellable = F->spec_cancellable && F->spec_live_h != nullptr && F->spec_skip_d != nullptr;
     F->spec_cancellable = false;
     if (cancellable) {
-        *(volatile int*) F->spec_live_h = 1;
+        for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
+            if (m->fast_->spec_live_h != nullptr) {
+                *(volatile int*) m->fast_->spec_live_h = 1;
+            }
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
     }
     lap(0);
@@ -5992,7 +6063,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
     }
     if (!layers_ok) return false;
     for (Glm5Model* m = this; m != hl; m = m->split_next_.get())
-        if (!m->hop_to_next(m->split_next_.get(), p, err)) return false;
+        if (!m->hop_to_next(m->split_next_.get(), p, err, cancellable)) return false;
     lap(3);
     ++spec_n_;
     const int sl = (int) (p & 1);
@@ -6117,42 +6188,46 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     }
     // STRATA_GLM_SPEC_CANCEL=1 (opt-in): a wrong draft stops the head's speculative pass at its next layer (spec_head
     // arms a skip_gate before each of its layers) and the redo is enqueued at once, before the next draft - instead of
-    // after the rest of a pass already known to be thrown away.  Only a head group of one GPU (two-GPU splits).
+    // after the rest of a pass already known to be thrown away.
     static const bool cancel_env = [] {
         const char* v = getenv("STRATA_GLM_SPEC_CANCEL");
         return v != nullptr && std::atoi(v) != 0;
     }();
-    bool cancel = cancel_env && hl == this;
-    if (cancel && (fast_->spec_live_h == nullptr || fast_->spec_skip_d == nullptr)) {
-        cudaSetDevice(dev_);
-        if (fast_->spec_live_h == nullptr) {
-            int* h = nullptr;
-            if (cudaHostAlloc((void**) &h, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
-                h[0] = 1;
-                fast_->spec_live_h = h;
-            } else {
-                cudaGetLastError();
+    bool cancel = cancel_env;
+    for (Glm5Model* m = this; cancel && m != hl->split_next_.get(); m = m->split_next_.get()) {
+        FastState* Fm = m->fast_;
+        if (Fm->spec_live_h == nullptr || Fm->spec_skip_d == nullptr) {
+            cudaSetDevice(m->dev_);
+            if (Fm->spec_live_h == nullptr) {
+                int* h = nullptr;
+                if (cudaHostAlloc((void**) &h, 64, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess) {
+                    h[0] = 1;
+                    Fm->spec_live_h = h;
+                } else {
+                    cudaGetLastError();
+                }
             }
-        }
-        if (fast_->spec_skip_d == nullptr) {
-            if (cudaMalloc((void**) &fast_->spec_skip_d, sizeof(int)) == cudaSuccess) {
-                cudaMemsetAsync(fast_->spec_skip_d, 0, sizeof(int), fast_->cs);
-            } else {
-                cudaGetLastError();
-                fast_->spec_skip_d = nullptr;
+            if (Fm->spec_skip_d == nullptr) {
+                if (cudaMalloc((void**) &Fm->spec_skip_d, sizeof(int)) == cudaSuccess) {
+                    cudaMemsetAsync(Fm->spec_skip_d, 0, sizeof(int), Fm->cs);
+                } else {
+                    cudaGetLastError();
+                    Fm->spec_skip_d = nullptr;
+                }
             }
-        }
-        if (fast_->spec_live_h == nullptr || fast_->spec_skip_d == nullptr) {
-            std::fprintf(stderr, "glm spec: STRATA_GLM_SPEC_CANCEL - its buffers did not allocate; decoding without it\n");
-            cancel = false;
+            if (Fm->spec_live_h == nullptr || Fm->spec_skip_d == nullptr) {
+                std::fprintf(stderr, "glm spec: STRATA_GLM_SPEC_CANCEL - buffers did not allocate on CUDA%d; decoding without it\n", m->dev_);
+                cancel = false;
+            }
         }
     }
+    cudaSetDevice(dev_);
     static bool cancel_said = false;
     if (cancel_env && !cancel_said) {
         cancel_said = true;
         std::fprintf(stderr, "glm spec: %s\n", cancel ? "a wrong draft cancels the head's speculative pass at its next layer "
                                                         "(STRATA_GLM_SPEC_CANCEL)"
-                                                      : "STRATA_GLM_SPEC_CANCEL needs a head group of one GPU - not used");
+                                                      : "STRATA_GLM_SPEC_CANCEL setup failed - decoding without it");
     }
     // the head group's recurrent-state backups (each part on its own device and stream)
     const auto kda_all = [&](bool restore) -> bool {
@@ -6286,7 +6361,11 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         // (STRATA_GLM_SPEC_CANCEL) a wrong draft: the head's speculative pass for q+2 stops at its next layer, its
         // states are restored behind it and the redo goes in now - the head redoes q+2 while the tail drafts
         if (cancel && wrong) {
-            *(volatile int*) fast_->spec_live_h = 0;
+            for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
+                if (m->fast_->spec_live_h != nullptr) {
+                    *(volatile int*) m->fast_->spec_live_h = 0;
+                }
+            }
             std::atomic_thread_fence(std::memory_order_seq_cst);
             kda_all(true);
             if (!spec_head(q + 2, y2, err)) { ok = false; break; }

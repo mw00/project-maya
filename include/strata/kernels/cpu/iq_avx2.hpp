@@ -27,9 +27,16 @@ bool iq256_rows1_supported(int ggml_type) noexcept;
 void iq256_rows1(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                  float* const* out, int r0, int r1);
 
+bool iq256_gu_rows1_supported(int ggml_type) noexcept;
+void iq256_gu_rows1(int ggml_type, const uint8_t* gate, const uint8_t* up, size_t gu_row, int n, const void* act,
+                    float* ff, int r0, int r1, float swiglu_limit);
+
 /// out[t][r] = w_r . h[t] for IQ4_NL (type 20) rows against Q8_0 activations (ggml's block_q8_0).
 /// IQ4_NL is a 32-value-block format, so this does not go through iq256_rows (QK_K blocks, Q8_K acts).
 void iq4nl256_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                         float* const* out, int r0, int r1);
+
+/// AVX-2 vectorized expert reduction: out[r] = sum_i(w[i] * dn[i * n_embd + r])
+void native_accum_out(int n_embd, int ne, const float* w, const float* dn, float* out);
 
 }  // namespace strata::kernels::cpu
