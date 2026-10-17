@@ -291,10 +291,10 @@ bool Glm5Model::win_reserve(std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (!win_alloc(kWinMax, err)) return false;
-    const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
-    int n_rec = 0;
+    const size_t kda_bytes = spec_kda_bytes();   // the same run per recurrent layer that spec_kda_copy saves
+    int n_rec = 0;                               // (the repeated layers: the commit's replay buffer below)
     for (int il = l0_; il < l1_; ++il) n_rec += g.is_recr(il);
-    if (n_rec > 0 && kda_bak_ == nullptr && cudaMalloc(&kda_bak_, (size_t) n_rec * run * sizeof(float)) != cudaSuccess) {
+    if (kda_bytes > 0 && kda_bak_ == nullptr && cudaMalloc(&kda_bak_, kda_bytes) != cudaSuccess) {
         cudaGetLastError();
         kda_bak_ = nullptr;
         err = "glm window: the recurrent-state backup did not allocate";
