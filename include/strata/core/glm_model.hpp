@@ -214,6 +214,11 @@ public:
     /// position; false (+ err) when that slot holds none.  ~150 MB a checkpoint for GLM-5.3-Flash's 34 KDA layers.
     bool ckpt_save(int slot, std::string& err);
     bool ckpt_restore(int slot, std::string& err);
+    /// The snapshot (the previous prompt's state, before its last token) copied into checkpoint `slot` on a side
+    /// thread, while the next prompt runs: the snapshot stays intact until that prompt's snapshot_save, which waits
+    /// for the copy (as every checkpoint call does).  A turn that starts within 512 tokens of the snapshot gets no
+    /// ckpt_save at its own start; this one costs the prompt nothing.  False (+ err) when it cannot start.
+    bool ckpt_save_snapshot(int slot, std::string& err);
     /// Conversation slots: the snapshot (its KDA states) and every DSA cache's rows up to its position, every half,
     /// written to a file; slot_load puts them back as the live state and the snapshot, so a conversation set aside
     /// while others ran continues where it was.  The bytes written, or 0 + err.
@@ -558,6 +563,8 @@ public:
     std::vector<std::vector<float>> ckpt_buf_;             // ckpt_save's checkpoints (this half): KDA runs, pool rows
     std::vector<int64_t> ckpt_pos_;                        // ... their positions (-1: none)
     void ckpt_pool_copy(int64_t pos, float* host, bool restore);   // the open pool's rows at pos <-> host
+    std::thread ckpt_th_;                                  // ckpt_save_snapshot's copy (every half's, on this one)
+    void ckpt_join() { if (ckpt_th_.joinable()) ckpt_th_.join(); }
     std::string pack_dir_;
     std::string profile_path_;                             // --expert-profile (empty: the pack's own files)
     std::vector<std::pair<int32_t, int32_t>> profile_;     // its ranked (layer, expert) pairs, read by fast_setup

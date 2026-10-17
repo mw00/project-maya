@@ -20,6 +20,7 @@
 namespace strata::core {
 
 void Glm5Model::seq_bind(int s) {
+    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     if (seq_.empty() || s == cur_seq_ || s < 0 || s >= (int) seq_.size()) return;
     SeqCtx& o = seq_[(size_t) cur_seq_];
     o.state = state_;

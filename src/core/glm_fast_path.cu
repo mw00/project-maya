@@ -3462,6 +3462,7 @@ bool Glm5Model::fast_warm(std::string& err) {
 }
 
 void Glm5Model::fast_destroy() {
+    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     FastState* F = fast_;
     if (F == nullptr) return;
     cudaSetDevice(dev_);
@@ -6389,6 +6390,7 @@ void Glm5Model::snap_pool_copy(bool restore) {
 }
 
 bool Glm5Model::snapshot_save() {
+    ckpt_join();   // (ckpt_save_snapshot may still be copying the snapshot this overwrites)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;
         const Glm5Geometry& g = m->g_;
@@ -6464,7 +6466,77 @@ void Glm5Model::ckpt_pool_copy(int64_t pos, float* host, bool restore) {
     }
 }
 
+bool Glm5Model::ckpt_save_snapshot(int slot, std::string& err) {
+    ckpt_join();
+    if (slot < 0) {
+        err = "checkpoint: no slot";
+        return false;
+    }
+    std::vector<Glm5Model*> ms;
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->fast_ == nullptr || m->snap_pos_ < 0 || m->snap_pos_ != snap_pos_ ||
+            (m->snap_ == nullptr && m->snap_pool_ == nullptr)) {
+            err = "checkpoint: no snapshot to copy";
+            return false;
+        }
+        ms.push_back(m);
+    }
+    // the host buffers here (an allocation failure is reported now); the copies on the thread
+    for (Glm5Model* m : ms) {
+        const Glm5Geometry& g = m->g_;
+        const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
+        int n_rec = 0;
+        for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
+        const size_t pool = m->dsa_layers().size() * 2 * (size_t) (g.idx_kpool - 1) * (size_t) g.idx_key;
+        if ((int) m->ckpt_buf_.size() <= slot) {
+            m->ckpt_buf_.resize((size_t) slot + 1);
+            m->ckpt_pos_.resize((size_t) slot + 1, -1);
+        }
+        m->ckpt_pos_[(size_t) slot] = -1;
+        try {
+            m->ckpt_buf_[(size_t) slot].resize((size_t) n_rec * run + pool);
+        } catch (const std::bad_alloc&) {
+            m->ckpt_buf_[(size_t) slot].clear();
+            m->ckpt_buf_[(size_t) slot].shrink_to_fit();
+            err = "checkpoint: no RAM for it";
+            return false;
+        }
+    }
+    ckpt_th_ = std::thread([ms, slot] {
+        bool ok = true;
+        for (Glm5Model* m : ms) {
+            const Glm5Geometry& g = m->g_;
+            const size_t run = (size_t) g.d_inner() * g.kda_head_dim + (size_t) 3 * g.d_inner() * (g.d_conv - 1);
+            int n_rec = 0;
+            for (int il = m->l0_; il < m->l1_; ++il) n_rec += g.is_recr(il);
+            const size_t pool = m->dsa_layers().size() * 2 * (size_t) (g.idx_kpool - 1) * (size_t) g.idx_key;
+            std::vector<float>& b = m->ckpt_buf_[(size_t) slot];
+            cudaSetDevice(m->dev_);
+            cudaStream_t st = nullptr;
+            ok = ok && cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking) == cudaSuccess;
+            // the snapshot's layout is the checkpoint's: the KDA runs in layer order, then snap_pool_copy's rows
+            if (ok && n_rec > 0)
+                ok = cudaMemcpyAsync(b.data(), m->snap_, (size_t) n_rec * run * sizeof(float), cudaMemcpyDeviceToHost,
+                                     st) == cudaSuccess;
+            if (ok && pool > 0)
+                ok = cudaMemcpyAsync(b.data() + (size_t) n_rec * run, m->snap_pool_, pool * sizeof(float),
+                                     cudaMemcpyDeviceToHost, st) == cudaSuccess;
+            if (st) {
+                ok = cudaStreamSynchronize(st) == cudaSuccess && ok;
+                cudaStreamDestroy(st);
+            }
+            if (!ok) {
+                cudaGetLastError();
+                break;
+            }
+        }
+        for (Glm5Model* m : ms) m->ckpt_pos_[(size_t) slot] = ok ? m->snap_pos_ : -1;
+    });
+    return true;
+}
+
 bool Glm5Model::ckpt_save(int slot, std::string& err) {
+    ckpt_join();
     if (slot < 0) {
         err = "checkpoint: no slot";
         return false;
@@ -6513,6 +6585,7 @@ bool Glm5Model::ckpt_save(int slot, std::string& err) {
 }
 
 bool Glm5Model::ckpt_restore(int slot, std::string& err) {
+    ckpt_join();
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
         if (m->fast_ == nullptr || slot < 0 || (int) m->ckpt_pos_.size() <= slot || m->ckpt_pos_[(size_t) slot] < 0 ||
             m->ckpt_pos_[(size_t) slot] != ckpt_pos_[(size_t) slot]) {
@@ -6659,6 +6732,7 @@ uint64_t Glm5Model::slot_save(const std::string& path, std::string& err) {
 }
 
 bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& err) {
+    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     dflash_reset();   // another conversation's state: the drafter's cached positions are not its
     std::ifstream f(path, std::ios::binary);
     if (!f) {

@@ -1509,7 +1509,7 @@ static int glm_pack_generate(const Options& o) {
         if (snap_in_slot && !slots.empty() && slots.back().tokens.size() == p) slots.back().prefix = true;
     };
     // the state now (after prompt[0, p)) into a free or the least recently used checkpoint
-    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p) {
+    const auto ckpt_keep = [&](const std::vector<int32_t>& prompt, size_t p, bool from_snapshot = false) {
         if ((int) ckpts.size() < ckpt_max) ckpts.emplace_back();
         size_t c = 0;
         for (size_t i = 0; i < ckpts.size(); ++i) {
@@ -1518,7 +1518,7 @@ static int glm_pack_generate(const Options& o) {
         }
         std::string e;
         ckpts[c].tokens.clear();
-        if (!model.ckpt_save((int) c, e)) {
+        if (!(from_snapshot ? model.ckpt_save_snapshot((int) c, e) : model.ckpt_save((int) c, e))) {
             std::fprintf(stderr, "glm checkpoints: not kept at %zu (%s)\n", p, e.c_str());
             return;
         }
@@ -1583,6 +1583,23 @@ static int glm_pack_generate(const Options& o) {
                 std::fprintf(stderr, "glm checkpoints: %s\n", ce.c_str());
                 ckpts[(size_t) ck].tokens.clear();
             }
+        }
+        // THE TURN'S START: a prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
+        // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
+        // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
+        // token, a few tokens before the turn) is kept as a checkpoint instead: copied to host RAM on a side thread
+        // while this prompt runs, so it costs the prompt nothing.  STRATA_GLM_CKPT_TURN=0: off.
+        if (reuse > 0 && !from_ckpt && reuse == snap_tokens.size() && reuse >= 512 && ckpt_max > 0 &&
+            cur_img_pos.empty()) {
+            static const bool turn_on = [] { const char* v = getenv("STRATA_GLM_CKPT_TURN"); return !v || atoi(v) != 0; }();
+            constexpr int32_t kUserTok = 154827, kObsTok = 154829;   // <|user|>, <|observation|>
+            size_t last = 0;
+            for (size_t i = prompt.size() - 1; i-- > reuse;)
+                if (prompt[i] == kUserTok || prompt[i] == kObsTok) { last = i; break; }
+            bool have = false;
+            for (const auto& c : ckpts)
+                have = have || (c.tokens.size() == reuse && std::equal(c.tokens.begin(), c.tokens.end(), prompt.begin()));
+            if (turn_on && last >= reuse && last < reuse + 512 && !have) ckpt_keep(prompt, reuse, true);
         }
         if (reuse == 0 && slot_max > 0) {
             slot_put("");              // the conversation in the model, before this prompt overwrites it
