@@ -114,8 +114,12 @@ int main() {
     std::printf("GLM prefill attention: max absolute error %.3e (tolerance 5e-5)\n", worst);
     if (worst > 5e-5) return 5;
 
-    // The rocWMMA kernel (FP16 Q) against the F32 kernel on the same FP16-rounded Q: random data, many cells
-    {
+    // The rocWMMA kernel (FP16 Q) against the F32 kernel on the same FP16-rounded Q: random data, many cells.
+    // Same guard as glm_prefill.cu's mla_attn_path(): on a card without WMMA (gfx908, gfx1030) the f16q device
+    // pass compiles to a trap - the engine never takes that path, so there is nothing to compare here.
+    if (!strata::kernels::glmb::mla_wmma2_supported()) {
+        std::puts("GLM prefill WMMA attention: skipped (unsupported architecture)");
+    } else {
         constexpr int T2 = 48, H2 = 32, rows2 = 2048, stride2 = 700;
         std::vector<float> q2((size_t) T2 * H2 * KV), lat2((size_t) rows2 * KV), a(q2.size()), b(q2.size());
         std::vector<uint16_t> lat16(lat2.size()), q16(q2.size());

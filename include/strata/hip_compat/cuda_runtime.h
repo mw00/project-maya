@@ -1,5 +1,13 @@
 #pragma once
 // Included only by STRATA_ENABLE_HIP builds. CUDA builds use NVIDIA headers.
+#ifdef STRATA_HIP_WAVE64
+// On wave64 cards (gfx908) HIP's own warp-sync builtins would run across the whole 64-lane wavefront and break
+// every kernel's reduction order; disable them and let intrinsics.hpp supply the logical-32-lane-half mapping.
+// Must come before hip_runtime.h. Wave32 builds leave HIP's builtins alone: they compile exactly as before.
+#ifndef HIP_DISABLE_WARP_SYNC_BUILTINS
+#define HIP_DISABLE_WARP_SYNC_BUILTINS 1
+#endif
+#endif  // STRATA_HIP_WAVE64
 #include <hip/hip_runtime.h>
 // CUDA's annotation avoids per-thread copies of const kernel parameters. HIP
 // passes the same const values without this CUDA-only optimization annotation.
@@ -47,6 +55,23 @@
 #define cudaEvent_t hipEvent_t
 #define cudaFree hipFree
 #define cudaFreeHost hipFreeHost
+#ifdef STRATA_HIP_WAVE64
+// Mapped host memory is how the GPU and the CPU talk inside a running graph (the doorbells, the staging buffers):
+// a kernel spins on a word the CPU writes and the CPU on a word the kernel writes. On AMD that needs
+// FINE-GRAINED (coherent) memory — coarse-grained host memory may sit in the GPU's L2 for the whole kernel and
+// the spin never sees the other side. Wave64 builds make every mapped allocation coherent; wave32 builds keep
+// the plain hipHostMalloc of old (the Strix Halo / RDNA and APU paths depend on that behaviour).
+inline hipError_t cudaHostAlloc(void** p, size_t bytes, unsigned int flags) {
+    if (flags & hipHostMallocMapped) flags |= hipHostMallocCoherent;
+    return hipHostMalloc(p, bytes, flags);
+}
+template <typename T>
+inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
+    return cudaHostAlloc(reinterpret_cast<void**>(p), bytes, flags);
+}
+#else
+#define cudaHostAlloc hipHostMalloc
+#endif  // STRATA_HIP_WAVE64
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
 #define cudaGetDevice hipGetDevice
 #define cudaGetDeviceCount hipGetDeviceCount
@@ -60,7 +85,6 @@
 #define cudaGraphLaunch hipGraphLaunch
 #define cudaGraphUpload hipGraphUpload
 #define cudaGraph_t hipGraph_t
-#define cudaHostAlloc hipHostMalloc
 #define cudaHostAllocDefault hipHostAllocDefault
 #define cudaHostAllocMapped hipHostAllocMapped
 #define cudaHostAllocPortable hipHostAllocPortable

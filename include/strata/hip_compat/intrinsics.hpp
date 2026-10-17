@@ -25,7 +25,10 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
     return __builtin_amdgcn_sudot4(true, a, true, b, c, false);
 #elif (defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)) && __has_builtin(__builtin_amdgcn_sdot4)
     // RDNA2 has no sudot4 (that is gfx11+), but it has the plain signed v_dot4_i32_i8 (dot1-insts): the same
-    // signed x signed byte products accumulated modulo 2^32, no clamp.
+    // signed x signed byte products accumulated modulo 2^32, no clamp. CDNA1 gfx908 (MI100) has the same builtin.
+    return __builtin_amdgcn_sdot4(a, b, c, false);
+#elif defined(__gfx908__) && __has_builtin(__builtin_amdgcn_sdot4)
+    // CDNA1 (MI100): v_dot4_i32_i8, the same signed dot4 the wave64 compat layer relies on.
     return __builtin_amdgcn_sdot4(a, b, c, false);
 #elif defined(__gfx1012__) && !defined(STRATA_GFX1012_PORTABLE_DOT)
     // RDNA1 has no native signed dot4. SDWA selects and sign-extends byte
@@ -97,10 +100,24 @@ __device__ __forceinline__ int vcmpne4(int a, int b) {
 
 // CUDA's mask argument describes participating lanes. The current kernel set uses full
 // wave32 masks; reject future partial-mask use instead of silently dropping its semantics.
+// On wave64 (gfx908) the kernels still pass the CUDA wave32 mask 0xffffffff; the half-wavefront mapping below
+// interprets it per 32-lane half, so the check is unchanged.
 __device__ __forceinline__ void require_full_wave_mask(uint32_t mask) {
     if (mask != 0xffffffffu) __builtin_trap();
 }
 
+#ifdef STRATA_HIP_WAVE64
+// __syncwarp: a wave barrier alone does not order memory. Release/acquire fences cover the shared-memory exchange
+// used by attention. Wavefront scope (not workgroup): on wave64 a workgroup-scope fence is heavier than needed,
+// and the barrier is the whole wavefront either way — this matches HIP 7's own built-in form. Defined
+// unconditionally here: HIP_DISABLE_WARP_SYNC_BUILTINS (cuda_runtime.h) removes HIP's own on every HIP version.
+__device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
+    require_full_wave_mask(mask);
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+#else
 // Older HIP has no __syncwarp. A wave barrier alone does not order memory.
 // Release/acquire fences cover the shared-memory exchange used by attention.
 #if HIP_VERSION_MAJOR < 7
@@ -111,6 +128,7 @@ __device__ __forceinline__ void syncwarp(uint32_t mask = 0xffffffffu) {
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup");
 }
 #endif
+#endif  // STRATA_HIP_WAVE64
 
 template <typename T>
 __device__ __forceinline__ T shfl_xor_sync(uint32_t mask, T value, int lane_mask, int width = 32) {
@@ -138,7 +156,13 @@ __device__ __forceinline__ T shfl_sync(uint32_t mask, T value, int source_lane, 
 
 __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
     require_full_wave_mask(mask);
+#ifdef STRATA_HIP_WAVE64
+    // wave64 (gfx908): __ballot returns the full 64-lane mask; a CUDA warp here is the caller's own 32-lane
+    // half, so lanes 32..63 must see their half's bits, not the first half's. Shift the far half in.
+    return static_cast<unsigned>(__ballot(predicate) >> (__lane_id() & 32));
+#else
     return static_cast<unsigned>(__ballot(predicate));
+#endif
 }
 
 }  // namespace strata::hip_compat
@@ -153,11 +177,18 @@ __device__ __forceinline__ unsigned ballot_sync(uint32_t mask, int predicate) {
 #define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
 #define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
 #define __ballot_sync(mask, predicate) (::strata::hip_compat::ballot_sync((mask), (predicate)))
+#ifdef STRATA_HIP_WAVE64
+#define __syncwarp(...) (::strata::hip_compat::syncwarp(__VA_ARGS__))
+// AMD's sleep instruction counts ~64 clocks per unit (~40 ns at 1.7 GHz); the synchronization loops use it as a
+// backoff hint, so a spin loop only needs "back off a little" — scale the unit to the requested nanoseconds.
+#define __nanosleep(ns) __builtin_amdgcn_s_sleep((ns) >= 400u ? 8u : 1u)
+#else
 #if HIP_VERSION_MAJOR < 7
 #define __syncwarp(...) (::strata::hip_compat::syncwarp(__VA_ARGS__))
 #endif
 // AMD's sleep instruction accepts only 0..15; the synchronization loops use it as a
 // backoff hint, so use its smallest portable delay independently of CUDA cycle counts.
 #define __nanosleep(cycles) __builtin_amdgcn_s_sleep(1)
+#endif  // STRATA_HIP_WAVE64
 
 #endif  // defined(__HIPCC__)
