@@ -1245,12 +1245,23 @@ bool Glm5Model::fast_setup(std::string& err) {
                 }
             }
         }
+        // The NextN block's slots are decode-only: while a prompt runs nothing reads the draft layer's experts (the
+        // prompt path writes the block's KV and indexer caches through its dense weights - mtp_in_rows, kv_a,
+        // idx_k/idx_gate - never its MoE half), so every slot it holds goes in the lendable tail and the prompt's
+        // carve lends them first.  The trunk keeps `k_extra`: its tail is the decode cache, lent only past the
+        // draft layer's.  (per > k_extra whenever a prompt path exists - the refusal above keeps it so.)
+        // Gated on STRATA_GLM_ROOM_MIN (the prompt-room path): unset, every layer's tail is `k_extra` and the region
+        // is laid out exactly as it was.
+        static const bool room = getenv("STRATA_GLM_ROOM_MIN") != nullptr;
+        const auto tail_of = [&](int il) {
+            return room && il == mtp_il_ && pf_ != nullptr && nsl[(size_t) il] > k_extra ? nsl[(size_t) il] : k_extra;
+        };
         size_t tot = 0, xtot = 0;
         int nmin = INT32_MAX, nmax = 0;
         for (int il = l0_; il < lt_; ++il)
             if (F->L[(size_t) il].moe) {
                 tot += (size_t) nsl[(size_t) il] * slot_stride(il);
-                xtot += (size_t) k_extra * slot_stride(il);
+                xtot += (size_t) tail_of(il) * slot_stride(il);
                 nmin = std::min(nmin, nsl[(size_t) il]);
                 nmax = std::max(nmax, nsl[(size_t) il]);
             }
@@ -1267,12 +1278,12 @@ bool Glm5Model::fast_setup(std::string& err) {
             size_t layer_max = 0;
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe)
-                    layer_max = std::max(layer_max, (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il));
+                    layer_max = std::max(layer_max, (size_t) (nsl[(size_t) il] - tail_of(il)) * slot_stride(il));
             for (size_t cap = main_bytes / 2; segs.empty() && cap >= layer_max && layer_max > 0; cap /= 2) {
                 std::vector<size_t> sizes(1, 0);
                 for (int il = l0_; il < lt_; ++il) {
                     if (!F->L[(size_t) il].moe) continue;
-                    const size_t lb = (size_t) (nsl[(size_t) il] - k_extra) * slot_stride(il);
+                    const size_t lb = (size_t) (nsl[(size_t) il] - tail_of(il)) * slot_stride(il);
                     if (sizes.back() > 0 && sizes.back() + lb > cap) sizes.push_back(0);
                     sizes.back() += lb;
                     seg_of[(size_t) il] = (int) sizes.size() - 1;
@@ -1310,7 +1321,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (seg_of[(size_t) il] != cur_seg) b = segs[(size_t) (cur_seg = seg_of[(size_t) il])];
             P.stride = slot_stride(il);
             P.n = nl;
-            P.n_main = nl - k_extra;
+            P.n_main = nl - tail_of(il);
             P.base = b;
             P.key.assign((size_t) nl, -1);
             P.tick.assign((size_t) nl, 0);
@@ -1320,12 +1331,18 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         uint8_t* xregion = F->xpool;
         b = xregion;
-        for (int il = l0_; il < lt_; ++il) {
-            if (!F->L[(size_t) il].moe) continue;
-            auto& P = F->lp[(size_t) il];
-            P.xbase = b;
-            b += (size_t) k_extra * P.stride;
-        }
+        // the draft layer's block goes first: a prompt's carve lends from the front of this region, so what it lends
+        // is the block no decode step of its own ever reads (the trunk's tails - the decode cache - come after it).
+        // Without the room flag this is the one ascending pass it always was.
+        for (int pass = 0; pass < (room ? 2 : 1); ++pass)
+            for (int il = l0_; il < lt_; ++il) {
+                if (!F->L[(size_t) il].moe) continue;
+                const bool draft = mtp_il_ >= l0_ && mtp_il_ < lt_ && il == mtp_il_;
+                if (room && draft != (pass == 0)) continue;
+                auto& P = F->lp[(size_t) il];
+                P.xbase = b;
+                b += (size_t) tail_of(il) * P.stride;
+            }
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
         if (vis_lend_ok_)
             std::fprintf(stderr, "glm fast: CUDA%d the vision encoder borrows the pool's tail (%.2f GB) while it "
@@ -1334,7 +1351,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         F->usage.assign((size_t) NL * g.n_expert, 0);
         F->pred_of.assign((size_t) NL, std::array<int, 8>{-1, -1, -1, -1, -1, -1, -1, -1});
         const std::string draft_sl = mtp_il_ >= l0_ && mtp_il_ < lt_ && F->L[(size_t) mtp_il_].moe
-                                         ? ", the draft layer " + std::to_string(nsl[(size_t) mtp_il_])
+                                         ? ", the draft layer " + std::to_string(nsl[(size_t) mtp_il_]) +
+                                               (room && pf_ != nullptr ? " (all of them lendable)" : "")
                                          : std::string();
         std::fprintf(stderr, "glm fast: CUDA%d layers [%d,%d) expert pool %.2f GB, %d-%d slots/layer%s (%lld total)%s\n",
                      dev_, l0_, l1_, (double) tot / 1073741824.0, nmin, nmax, draft_sl.c_str(),
