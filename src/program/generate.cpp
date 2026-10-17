@@ -1542,6 +1542,15 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "glm nan guard: %s - this conversation's state is dropped; it is read again from token 0\n",
                      why.c_str());
     };
+    // a PAUSE, not a STOP, is what ended the prompt read in progress (the server's fair read slices keep its prefix)
+    const auto paused_read = [&]() -> bool {
+        if (pause_req.load()) return true;
+        const int rid = admitting_rid.load();
+        if (rid < 0) return false;
+        std::lock_guard<std::mutex> lk(ctl_mu);
+        const auto it = ctl.find(rid);
+        return it != ctl.end() && it->second >= 2;
+    };
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
@@ -1622,6 +1631,7 @@ static int glm_pack_generate(const Options& o) {
                             (double) done / (ms / 1000.0 + 1e-9), reuse);
                 std::fflush(stdout);
             };
+            int64_t read_ck = 0;   // the prompt path's tokens complete on every part at its last report
             const std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
             size_t sys_end = 0;  // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
             for (size_t i = 1; i < prompt.size() && sys_end == 0; ++i)
@@ -1634,6 +1644,7 @@ static int glm_pack_generate(const Options& o) {
                 const size_t base = at - reuse;
                 model.prefill_progress = [&](int64_t done, int64_t total) {
                     (void) total;
+                    read_ck = (int64_t) base + done;
                     pp_line(base + (size_t) done);
                     return !stop_req.load();
                 };
@@ -1652,9 +1663,19 @@ static int glm_pack_generate(const Options& o) {
                 i_first = prompt.size() - 1;
                 pp_line(prompt.size() - 1 - reuse);
             } else if (err == "cancelled") {
-                snap_tokens.clear();
-                model.reset();
-                ckpt_drop_past(0);
+                // a PAUSE while reading (the server's fair slices): what was read is kept, as a paused answer's state
+                // is, so the request that continues this prompt reads only the rest of it; a STOP resets as before
+                if (paused_read() && read_ck > 0 && model.position() == (int64_t) reuse + read_ck && model.snapshot_save()) {
+                    snap_tokens.assign(prompt.begin(), prompt.begin() + (long) (reuse + (size_t) read_ck));
+                    snap_img_hash = img_hash(snap_tokens.size());
+                    snap_in_slot = false;
+                    std::fprintf(stderr, "glm slots: paused while reading at %zu of %zu tokens: the state is kept there\n",
+                                 reuse + (size_t) read_ck, prompt.size());
+                } else {
+                    snap_tokens.clear();
+                    model.reset();
+                    ckpt_drop_past(0);
+                }
                 finish = "cancel";
                 i_first = prompt.size();
             } else if (!err.empty()) {
