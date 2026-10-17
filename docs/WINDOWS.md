@@ -13,7 +13,10 @@ and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built wi
      driver's capability, not proof that the toolkit (`nvcc`) is installed.
    - [Visual Studio **2022** Build Tools](https://aka.ms/vs/17/release/vs_BuildTools.exe), with
      **Desktop development with C++**, **MSVC v143 - VS 2022 C++ x64/x86 build tools** and a **Windows 10 or 11 SDK**.
-     The full Visual Studio IDE is optional. A newer Visual Studio alone does not satisfy the installer's check;
+     The full Visual Studio IDE is optional. **VS 2026 Build Tools work too with CUDA 13.2 or newer** - which
+     Visual Studio a CUDA release supports is in its installation guide ([13.2 onward list VS 2026's MSVC 195x](
+     https://docs.nvidia.com/cuda/cuda-installation-guide-microsoft-windows/index.html), 13.1 and every 12.x stop
+     at VS 2022); with a CUDA 12.x toolkit, 2026 alone does not satisfy the installer's check;
      2022 can be installed alongside it.
    - **64-bit Python 3.10+**, for example `winget install -e --id Python.Python.3.12 --scope user`.
    - [Git for Windows](https://git-scm.com/download/win) to clone and update the repository, or download and extract

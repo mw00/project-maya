@@ -24,8 +24,8 @@ its vision tower runs in the engine - a GGUF's comes from DeepSeek's own checkpo
 no tuning step - it balances its own split):
 
   1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+ (6.x, Pascal: experimental), driver, CUDA toolkit (nvcc),
-     the C++ compiler (g++; on Windows Visual Studio 2022's Build Tools), CMake, RAM, CPU; HIP checks AMD
-     gfx1100/gfx1201/gfx1151 and ROCm 7 instead
+     the C++ compiler (g++; on Windows Visual Studio's Build Tools - 2019/2022 always, 2026 with CUDA 13.2+), CMake,
+     RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
      Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits, experimental
@@ -851,12 +851,9 @@ def find_nvcc(archs, given=None) -> tuple:
     """(nvcc, version) for these GPUs: --nvcc, else the newest toolkit that can build for them (Strata's find_nvcc
     takes the newest of all, but CUDA 13 cannot build for Volta), else the newest found (reported as unfit), else
     (None, None)."""
-    def version(c):
-        v = re.search(r"release (\d+)\.(\d+)", S.out([c, "--version"]))
-        return (int(v.group(1)), int(v.group(2))) if v else None
     if given:
-        return given, version(given)
-    return pick_nvcc([(c, version(c)) for c in dict.fromkeys(c for c in nvcc_candidates() if c and Path(c).exists())],
+        return given, S.nvcc_version(given)
+    return pick_nvcc([(c, S.nvcc_version(c)) for c in dict.fromkeys(c for c in nvcc_candidates() if c and Path(c).exists())],
                      archs)
 
 
@@ -1021,11 +1018,13 @@ def check_pc(a, family: str = "glm", gguf: bool = False) -> dict:
         ok(f"NVIDIA driver {chosen[0]['driver']}")
 
     if WIN:
-        vcvars = S.find_vcvars()
+        vcvars = S.find_vcvars(nvcc=nvcc)
         if vcvars is None:
-            problems.append(("the C++ compiler (Visual Studio 2022 Build Tools, 'Desktop development with C++') is "
+            problems.append(("the C++ compiler (Visual Studio Build Tools, 'Desktop development with C++') is "
                              "not installed", "https://visualstudio.microsoft.com/visual-cpp-build-tools/ - in the "
-                             "installer tick 'Desktop development with C++' (CUDA 12 needs 2019 or 2022, not 2026)"))
+                             "installer tick 'Desktop development with C++' (CUDA 12.x needs 2019 or 2022; "
+                             + ("CUDA 12.x does not take 2026 - install 2022 alongside it, or use CUDA 13.2+"
+                                if nv and nv < (13, 2) else "2026 works with CUDA 13.2 and newer") + ")"))
         else:
             ok(f"C++ compiler: Visual Studio Build Tools ({vcvars})")
     elif a.host_compiler:
@@ -1091,7 +1090,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False) -> dict:
              f"install it and run {ME} again - this script installs nothing system-wide")
     select_build_backend("cuda")
     return {"backend": "cuda", "gpus": chosen, "archs": archs, "nvcc": nvcc,
-            "vcvars": str(S.find_vcvars()) if WIN else None}
+            "vcvars": str(vcvars) if WIN else None}
 
 
 # ------------------------------------------------------------------------------------------------ 2. choices
@@ -1311,8 +1310,8 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     stopping."""
     def stop(what):
         msg = f"the engine build stopped while {what} (the reason is above)"
-        hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12 needs Visual Studio 2019 or "
-                "2022 (its Build Tools are enough);" if WIN else
+        hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12.x needs Visual Studio 2019 or "
+                "2022 (its Build Tools are enough; only CUDA 13.2 and newer take 2026);" if WIN else
                 "common causes: 'unsupported GNU version' - install an older g++ your CUDA accepts (e.g. g++-13) and run "
                 "again (it is found by itself), or pass --host-compiler g++-13;") + (
                 "\n       'Unsupported gpu architecture compute_70' (or compute_61) - CUDA 13 cannot build for Volta "
@@ -1349,7 +1348,7 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
     if cuda_archs == "native":
         say("  (CMakeLists.txt refuses an explicit sm_70 - Maya's own floor is sm_75 - so CMake is asked for this")
         say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
-    stopped = cmake_steps(conf, build, env, "build-maya.bat")
+    stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
     # the targets compiled from this source for these GPUs (a GLM-5.3-Flash and a DeepSeek setup share build/)
@@ -1373,10 +1372,11 @@ def shell_join(cmd) -> str:
     return cmdline(cmd) if WIN else shlex.join(cmd)
 
 
-def cmake_steps(conf, build, env, bat_name: str, vcvars=None) -> str | None:
+def cmake_steps(conf, build, env, bat_name: str, vcvars=None, nvcc=None) -> str | None:
     """CMake's configure, then its build (once more when that stops: it continues where it stopped).  None when both
     worked, else what stopped.  On Windows both run in a .bat that first calls Visual Studio's vcvars64.bat - the
-    compiler's environment - the way Strata's setup.py builds there (cmake_build)."""
+    compiler's environment - the way Strata's setup.py builds there (cmake_build).  `nvcc` says which toolkit the
+    CUDA build uses: its release decides whether a VS 2026-only PC is usable (S.find_vcvars)."""
     if not WIN:
         if run(conf, env=env, check=False).returncode != 0:
             return "configuring"
@@ -1385,7 +1385,7 @@ def cmake_steps(conf, build, env, bat_name: str, vcvars=None) -> str | None:
             if run(build, env=env, check=False).returncode != 0:
                 return "compiling"
         return None
-    vcvars = vcvars or S.find_vcvars()
+    vcvars = vcvars or S.find_vcvars(nvcc=nvcc)
     if vcvars is None:
         return "looking for Visual Studio's C++ compiler (the Build Tools with 'Desktop development with C++')"
     bat = ROOT / bat_name
@@ -1417,9 +1417,6 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
     toolkits are tried."""
     import tempfile
 
-    def version(c):
-        v = re.search(r"release (\d+)\.(\d+)", S.out([c, "--version"]))
-        return (int(v.group(1)), int(v.group(2))) if v else None
     if nvcc_given:
         nvccs = [nvcc_given]
     else:
@@ -1427,19 +1424,19 @@ def toolchain_for(archs, nvcc_given: str | None, hc_given: str | None) -> tuple:
         for c in nvcc_candidates():
             if c and Path(c).exists() and os.path.realpath(c) not in seen:
                 seen.add(os.path.realpath(c))
-                found.append((c, version(c)))
+                found.append((c, S.nvcc_version(c)))
         lo, hi = nvcc_range(archs)
         nvccs = [c for c, v in sorted((f for f in found if f[1]), key=lambda f: f[1], reverse=True)
                  if v >= lo and (hi is None or v < hi)]
     hcs = [None] if WIN else [hc_given] if hc_given else [None] + sorted(
         {q.name for d in ("/usr/bin", "/usr/local/bin") for q in Path(d).glob("g++-[0-9]*")
          if re.fullmatch(r"g\+\+-\d+", q.name)}, key=lambda n: -int(n[4:]))
-    vcvars = S.find_vcvars() if WIN else None
     say("  Finding a CUDA toolkit and C++ compiler that build the engine here ...")
     with tempfile.TemporaryDirectory() as t:
         src = Path(t) / "probe.cu"
         src.write_text(PROBE_CU, encoding="utf-8")
         for nv in nvccs:
+            vcvars = S.find_vcvars(nvcc=nv) if WIN else None   # which VS a toolkit takes is in its release (S.find_vcvars)
             for c in hcs:
                 cmd = [nv, "-std=c++20", "-c", str(src), "-o", str(Path(t) / "probe.o")] + \
                       (["-ccbin", shutil.which(c) or c] if c else [])
@@ -2072,7 +2069,7 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     say("  Compiling the vision encoder (llama.cpp's image library with ggml's CUDA kernels: 10-20 minutes, once) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)], None,
-                   "build-maya-vision.bat"):
+                   "build-maya-vision.bat", nvcc=meta.get("nvcc") or pc["nvcc"]):
         return False
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
