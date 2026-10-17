@@ -76,9 +76,12 @@ Dual Xeon E5-2690 v4 (28 cores, AVX2), 64 GB RAM (pinned RAM tier).
 |---|---|---|---|
 | 2026-10-15 | baseline Maya-S-v2 IQ2_XXS (3 shards, RAM tier pinned) | 25.7 tok/s | 256 tok/s (2k), 456 tok/s (8k) |
 | 2026-10-16 | AVX2 1-token IQ2_XXS/IQ2_S decode kernels, joint gate/up loads, 2-row unrolling, NUMA pool unsharing, SM70 direct signs | **31.0 tok/s** (standard bench: 29.3, 31.8, 31.8 tok/s) | **268 tok/s** (2k), **504 tok/s** (8k), **944 tok/s** (16k), **1,345 tok/s** (32k) |
-| 2026-10-16 | 128K context depth scaling (124K prompt + 3,871-token decode) | **37.85 tok/s** (warmed VRAM hit 89.3%, CPU lane 11.4 ms/tok) | **1,305.8 tok/s** (124k prompt) |
+| 2026-10-16 | 4K sustained decode @ 128K context (124K prompt + 4,096 decode) | **29.17 tok/s** (VRAM hit 80.1%, KV VRAM hit 97.5%) | **769.8 tok/s** (124k prompt) |
+| 2026-10-16 | 8K sustained decode @ 256K context (240K prompt + 8,192 decode) | **31.15 tok/s** (VRAM hit 80.6%, spec 100%, KV VRAM hit 86.8%) | **831.3 tok/s** (240k prompt) |
+| 2026-10-16 | 12K sustained decode @ 256K context (240K prompt + 12,288 decode, 252K total envelope) | **34.93 tok/s** (VRAM hit 87.4%, CPU lane 11.1 ms/tok, spec 98.8%) | **859.0 tok/s** (240k prompt) |
+| 2026-10-16 | Concentrated/greedy decoding peak (124K prompt + 3,871 decode) | **37.85 tok/s** (warmed VRAM hit 89.3%, CPU lane 11.4 ms/tok, spec 96.9%) | **1,305.8 tok/s** (124k prompt) |
 
-Single-expert CPU lane latency drops from 0.44 ms to 0.204–0.234 ms/expert. In extended 128K generation, VRAM hit rate warms to 89.29% and off-card RAM fetches drop to 4.84/tok. Speculative draft acceptance 96.9% (3,750 of 3,869 drafts accepted). INT8 KV cache streaming hits 96.37% in VRAM across 27.2 million block reads.
+Single-expert CPU lane latency drops from 0.44 ms to 0.204–0.234 ms/expert. In extended generation, VRAM hit rate warms from ~76% up to 87.4%–89.3%, compressing CPU lane contribution to 11.1–11.4 ms/tok and off-card RAM fetches to 4.8–8.6/tok. Speculative draft acceptance reaches 96.9%–100.0%. INT8 KV cache streaming reliably processes 75.9+ million block reads at 256K context without OOM.
 
 ## Tried and measured, not kept
 - Reading predicted disk experts ahead (Mercury and Uranus): exact but slower - only ~45% of disk misses are
