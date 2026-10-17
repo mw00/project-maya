@@ -1,5 +1,7 @@
 # Maya on Windows
 
+<p align="center">English | <a href="WINDOWS.zh-cn.md">简体中文</a></p>
+
 Back to the [README](../README.md).
 
 Experimental: the same installer sets Maya up natively on Windows 10/11 (64-bit), and the engine and the image

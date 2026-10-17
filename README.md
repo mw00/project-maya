@@ -1,5 +1,7 @@
 <h1 align="center">Project Maya</h1>
 
+<p align="center">English | <a href="README.zh-cn.md">简体中文</a></p>
+
 <p align="center"><b>A 321-billion-parameter AI model on your own GPU</b><br>
 GLM-5.3-Flash, private and fast · one NVIDIA GPU or up to 16 · AMD and Windows (experimental) · chat, pictures,
 OpenAI- and Anthropic-compatible API · several requests at once</p>

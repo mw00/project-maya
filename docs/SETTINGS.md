@@ -1,5 +1,7 @@
 # Tuning and settings
 
+<p align="center">English | <a href="SETTINGS.zh-cn.md">简体中文</a></p>
+
 Everything on this page is optional: the engine sizes itself for the PC it runs on. Back to the
 [README](../README.md).
 
