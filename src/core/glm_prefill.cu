@@ -2587,6 +2587,72 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                         "gemm exl3 down");
             }
         };
+        // FP16 EXPERTS (Volta): a quantized expert routed by at least STRATA_GLM_PREFILL_BLAS rows of the chunk is
+        // dequantized to FP16 (llama.cpp's convert.cu) and multiplied by cuBLAS on the FP16 tensor cores - the
+        // 25M-weight decode once an expert, the GEMM at the FP16 rate (~53 TFLOPS from ~200 rows an expert on a V100,
+        // where MMQ has no int8 tensor cores: ~25 TOPS); lighter experts stay on MMQ.  GLM-5.3-Flash on one V100, two
+        // rounds: 27K prompt 39.7 / 39.9 -> 31.7 / 31.8 s, 8K 623 / 621 -> 764 / 764 tok/s, 2K 549 / 548 -> 581 / 568;
+        // KL against MMQ 0.015 (MMQ against itself 0), the target token's log-prob +0.025 (FP16 activations, not q8_1).
+        // Default 128 rows on sm_70 (Turing+ run MMQ on int8 tensor cores: 0 there); 0 = MMQ only.
+        static const int blas_rows = [] {
+            if (const char* v = getenv("STRATA_GLM_PREFILL_BLAS")) return std::max(0, std::atoi(v));
+#if defined(STRATA_USE_HIP)
+            return 0;   // (MMQ only: the FP16 path is measured on Volta)
+#else
+            int dev = 0, major = 0, minor = 0;
+            cudaGetDevice(&dev);
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+            return major == 7 && minor == 0 ? 128 : 0;
+#endif
+        }();
+        const bool use_blas = blas_rows > 0 && !Ly.exl3 && mmq::to_f16_supported(Ly.gu_type) &&
+                              mmq::to_f16_supported(Ly.d_type) && S->w16_elems >= (int64_t) 2 * nff * E + E;
+        const auto run_blas_q = [&](const uint8_t* blob, int a, int nrows, int r0) {
+            namespace x3 = strata::kernels::exl3;
+            const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
+            const int gu_rows = (int) std::max<int64_t>(1, (S->w16_elems - wgu) / E);
+            const int dn_rows = (int) std::max<int64_t>(1, (S->w16_elems - wdn) / nff);
+            const int o = place(r0 + a, nrows);
+            float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the expert's own OUTP rows hold its gate/up
+            mmq::to_f16(Ly.gu_type, blob, S->w16, wgu, s);
+            uint16_t* X16 = S->w16 + wgu;
+            for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+                const int n = std::min(gu_rows, nrows - c0);
+                x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
+                                     X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm q gate/up");
+            }
+            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
+            mmq::to_f16(Ly.d_type, blob + Ly.down_off, S->w16, wdn, s);
+            uint16_t* H16 = S->w16 + wdn;
+            for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
+                const int n = std::min(dn_rows, nrows - c0);
+                x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
+                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
+                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm q down");
+            }
+        };
+        // in set order: runs of lighter experts through MMQ (run_set over the run), the heavy ones alone through cuBLAS
+        const auto run_set_q = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
+                                   int r0) {
+            for (int i = 0; i < n_exp;) {
+                const int rows = hb[i + 1] - hb[i];
+                if (rows >= blas_rows) {
+                    run_blas_q(wbase + (size_t) i * stride, hb[i], rows, r0);
+                    ++i;
+                } else {
+                    int j = i + 1;
+                    while (j < n_exp && hb[j + 1] - hb[j] < blas_rows) ++j;
+                    run_set(wbase + (size_t) i * stride, j - i, stride, d_bounds + i, hb + i, r0);
+                    i = j;
+                }
+            }
+        };
         // in set order (the window takes the rows in order): runs of light experts to the tensor cores, the rest alone
         const auto run_set_x3 = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                     int r0) {
@@ -2606,6 +2672,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const auto run_any = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
             if (Ly.exl3) run_set_x3(wbase, n_exp, stride, d_bounds, hb, r0);
+            else if (use_blas) run_set_q(wbase, n_exp, stride, d_bounds, hb, r0);
             else run_set(wbase, n_exp, stride, d_bounds, hb, r0);
         };
         if (2 * nff != E) {

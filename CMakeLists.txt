@@ -941,7 +941,8 @@ if(STRATA_NATIVE_EXPERTS)
     else()
       set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
     endif()
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
+                ${_strata_mmq}/convert.cu)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
@@ -984,7 +985,8 @@ if(STRATA_NATIVE_EXPERTS)
       src/prefill/moe_mmq.cu
       src/prefill/moe_fused_rdna4.cu
       src/prefill/ggml_cuda_host.cu
-      "${_strata_mmq}/quantize.cu")
+      "${_strata_mmq}/quantize.cu"
+      "${_strata_mmq}/convert.cu")
     target_compile_definitions(strata_engine PRIVATE STRATA_HIP_PREFILL_FUSED=1)
     foreach(_t q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0 iq1_s q2_k q3_k q4_k q5_k q6_k)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")

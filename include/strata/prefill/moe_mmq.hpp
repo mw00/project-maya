@@ -83,4 +83,10 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
 
+/// llama.cpp's dequantizer to FP16 (ggml-cuda convert.cu) has `ggml_type`.
+bool to_f16_supported(int ggml_type);
+/// The `n` weights at `w` (whole blocks of `ggml_type`, row-major) as FP16 at `dst` (IEEE half bits); false when the
+/// type is not covered.
+bool to_f16(int ggml_type, const void* w, uint16_t* dst, int64_t n, void* stream);
+
 }  // namespace strata::prefill::mmq
