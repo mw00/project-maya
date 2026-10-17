@@ -171,6 +171,31 @@ static std::vector<std::pair<int, std::vector<int>>> cpu_groups() {
     return out;
 }
 
+// this process's CPUs by L3 cache (a Ryzen's CCDs on one NUMA node): {index, CPUs}, empty without the sysfs entries
+static std::vector<std::pair<int, std::vector<int>>> cpu_l3_groups() {
+    std::vector<std::pair<int, std::vector<int>>> out;
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) != 0) return out;
+    std::vector<std::string> seen;
+    for (int c = 0; c < CPU_SETSIZE; ++c) {
+        if (!CPU_ISSET(c, &set)) continue;
+        std::string list;
+        std::ifstream("/sys/devices/system/cpu/cpu" + std::to_string(c) + "/cache/index3/shared_cpu_list") >> list;
+        if (list.empty()) return {};
+        const auto it = std::find(seen.begin(), seen.end(), list);
+        if (it == seen.end()) {
+            seen.push_back(list);
+            out.push_back({(int) out.size(), {c}});
+        } else {
+            out[(size_t) (it - seen.begin())].second.push_back(c);
+        }
+    }
+#endif
+    return out;
+}
+
 // a CPU's physical core (package, core id): its SMT siblings share it
 static std::pair<int, int> cpu_core(int cpu) {
     int pkg = cpu, core = cpu;
@@ -2794,8 +2819,16 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         const char* v = getenv("STRATA_GLM_WIN_LANES");
         return v == nullptr ? 2 : std::atoi(v);
     }();
+    // one NUMA node of several L3 domains (a Ryzen's two CCDs): the lanes a domain each (STRATA_GLM_WIN_L3=0: one lane,
+    // the calibrated plan).  V100 + 7950X, Maya-S24, --spec 3: one lane 21.5 / 20.1 / 25.0 tok/s, two 24.4 / 23.9 / 28.0
+    // (plain 24.5 / 27.7 / 26.3) - the window's RAM-tier experts on the CPU instead of over PCIe
+    static const bool win_l3 = [] {
+        const char* v = getenv("STRATA_GLM_WIN_L3");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     if (!shared && n_parts_ == 1 && dflash_on_ && win_lanes != 0) {
-        const auto groups = cpu_groups();
+        auto groups = cpu_groups();
+        if (win_l3 && groups.size() < 2) groups = cpu_l3_groups();   // (the GPU's lane: the first domain)
         if (groups.size() >= 2 && groups[0].first >= 0) {
             const int gn = gpu_numa_node(dev_);
             size_t a = 0;
