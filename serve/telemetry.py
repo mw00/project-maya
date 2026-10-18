@@ -3,6 +3,9 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.
+- GPU (AMD, HIP backend): the amdgpu driver's sysfs files (Linux only, no extra library) - load, VRAM, temperature,
+  power, PCIe link; see the _Amd class. Picked explicitly by the server (its backend) or by auto-detection when
+  NVML finds no card.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -100,7 +103,8 @@ class _Nvml:
 
     def procs(self):
         """{pid: bytes it holds on this GPU (None: NVML can't say, as on Windows)} of the processes with a compute
-        context on it, or None when NVML can't list them."""
+        context on it, or None when NVML can't list them.  (The AMD sysfs reader returns None: amdgpu's fdinfo
+        could name the processes, but that is a different file layout and not read here.)"""
         for fn, st in (("nvmlDeviceGetComputeRunningProcesses_v3", self.Proc2),
                        ("nvmlDeviceGetComputeRunningProcesses_v2", self.Proc2),
                        ("nvmlDeviceGetComputeRunningProcesses", self.Proc1)):
@@ -170,6 +174,177 @@ class _Nvml:
         return out
 
 
+# ------------------------------------------------------------------------------------------------ AMD (Linux sysfs)
+SYSFS = "/sys"
+
+
+def amd_device_dir(index, sysfs=None):
+    """The amdgpu sysfs folder (/sys/class/drm/renderD<N>/device) of the AMD GPU that HIP numbers `index`, or None
+    when there is no such card (or no amdgpu).  HIP orders the cards as the KFD topology lists its GPU nodes (the
+    CPU nodes skipped) - the same order setup's amd_gpus() and HIP_VISIBLE_DEVICES use - and KFD links each node to
+    its render node by drm_render_minor, which is the bridge between the two numberings."""
+    base = os.path.join(sysfs or SYSFS, "class", "kfd", "kfd", "topology", "nodes")
+    try:
+        nodes = sorted((n for n in os.listdir(base) if n.isdigit()), key=int)
+    except OSError:
+        return None
+    gpus = []
+    for n in nodes:
+        try:
+            with open(os.path.join(base, n, "properties"), encoding="utf-8") as f:
+                props = dict(line.strip().partition(" ")[::2] for line in f if line.strip())
+            if int(props.get("gfx_target_version") or 0) == 0 or int(props.get("simd_count") or 0) == 0:
+                continue
+            gpus.append(props)
+        except (OSError, ValueError):
+            continue
+    if not 0 <= index < len(gpus) or not gpus[index].get("drm_render_minor"):
+        return None
+    dev = os.path.join(sysfs or SYSFS, "class", "drm", "renderD" + gpus[index]["drm_render_minor"].strip(), "device")
+    return dev if os.path.isdir(dev) else None
+
+
+class _Amd:
+    """An AMD card's readings from the amdgpu driver's sysfs files (Linux; no ROCm library needed), with _Nvml's
+    interface: load (gpu_busy_percent), VRAM (mem_info_vram_used / _total), and from its hwmon folder the temperature
+    (temp1_input, the edge sensor, m°C), power (power1_average or power1_input, µW) and its cap (power1_cap).
+    Every read is tolerant: a file the driver or kernel version does not have leaves its value None."""
+
+    def __init__(self, index=0, sysfs=None):
+        self.dev = amd_device_dir(index, sysfs)
+        self.hwmon = None
+        if self.dev:
+            try:
+                hw = sorted(os.listdir(os.path.join(self.dev, "hwmon")))
+                self.hwmon = os.path.join(self.dev, "hwmon", hw[0]) if hw else None
+            except OSError:
+                pass
+
+    def ok(self):
+        return self.dev is not None
+
+    @staticmethod
+    def _int(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                return int(f.read().strip())
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def name(self):
+        try:
+            with open(os.path.join(self.dev, "product_name"), encoding="utf-8") as f:
+                return f.read().strip() or "AMD Radeon"
+        except (OSError, TypeError):
+            return "AMD Radeon"
+
+    def pci(self):
+        """The PCI address from the sysfs path (e.g. '0000:03:00.0'), or None."""
+        try:
+            real = os.path.realpath(self.dev or "")
+            for part in real.split("/"):
+                if self._bdf(part):
+                    return part
+        except OSError:
+            pass
+        return None
+
+    @staticmethod
+    def _gen(text):
+        """The PCIe generation of a link-speed file's contents ("16.0 GT/s PCIe" -> 4), or None."""
+        try:
+            return {2.5: 1, 5.0: 2, 8.0: 3, 16.0: 4, 32.0: 5, 64.0: 6}[float(str(text).split()[0])]
+        except (ValueError, TypeError, IndexError, KeyError):
+            return None
+
+    @staticmethod
+    def _bdf(s):
+        """True for a sysfs pci device name ("0000:03:00.0"); nothing is imported for it."""
+        return (len(s) == 12 and s[4] == ":" and s[7] == ":" and s[10] == "." and s[11] in "01234567"
+                and all(c in "0123456789abcdef" for c in s[0:4] + s[5:7] + s[8:10]))
+
+    @staticmethod
+    def _read(d, name):
+        try:
+            with open(os.path.join(d, name), encoding="utf-8") as f:
+                return f.read().strip()
+        except (OSError, TypeError):
+            return None
+
+    def _hops(self):
+        """The PCIe devices between the root port and this card, the card last: the sysfs path names every
+        hop (a card behind a bridge chain has more than one; a directly attached card has one)."""
+        out, prefix = [], []
+        for part in os.path.realpath(self.dev or "").split("/"):
+            prefix.append(part)
+            if self._bdf(part):
+                out.append("/".join(prefix))
+        return out
+
+    def link(self):
+        """The PCIe link the card actually gets: the **narrowest/slowest hop** between the root port and the card,
+        from each hop's `max_link_speed` / `max_link_width` (the capability, so a power-saving downgrade or a Gen3
+        slot cannot make it read low).  A card that is Gen4 on its own hop but sits behind a Gen3 root port really
+        runs at Gen3, and that is the number a PCIe bandwidth budget needs.
+        `pcie_own_gen` keeps the card's own hop aside: the gap between the two is what a user has to see.
+
+        The bottleneck is only claimed when **every** hop of the path could be read; `pcie_path` reports how many
+        of them were ("4/4").  A kernel or a container that hides part of /sys/devices would otherwise drop the
+        unreadable hops in silence and report the card's own Gen4 hop as the whole path - i.e. be optimistic
+        exactly where it matters.  When the walk is incomplete the reading falls back to the card's own negotiated
+        link and pcie_path says so."""
+        hops = self._hops()
+        gens, widths, read = [], [], 0
+        for d in hops:
+            g = self._gen(_Amd._read(d, "max_link_speed"))
+            w = self._int(os.path.join(d, "max_link_width"))
+            read += 1 if (g is not None or w is not None) else 0
+            if g:
+                gens.append(g)
+            if w:
+                widths.append(w)
+        own = self.dev or ""
+        own_gen = self._gen(_Amd._read(own, "current_link_speed"))
+        whole = bool(hops) and read == len(hops)
+        gen = min(gens) if (whole and gens) else own_gen
+        width = min(widths) if (whole and widths) else self._int(os.path.join(own, "current_link_width"))
+        return {"pcie_gen": gen, "pcie_gen_max": gen, "pcie_own_gen": own_gen, "pcie_width": width,
+                "pcie_path": "%d/%d" % (read, len(hops))}
+
+    def read(self):
+        out = {"util": self._int(os.path.join(self.dev, "gpu_busy_percent")),
+               "mem_used": self._int(os.path.join(self.dev, "mem_info_vram_used")),
+               "mem_total": self._int(os.path.join(self.dev, "mem_info_vram_total"))}
+        if self.hwmon:
+            t = self._int(os.path.join(self.hwmon, "temp1_input"))
+            out["temp"] = t / 1000.0 if t is not None else None
+            p = self._int(os.path.join(self.hwmon, "power1_average"))
+            if p is None:
+                p = self._int(os.path.join(self.hwmon, "power1_input"))
+            out["power"] = p / 1e6 if p is not None else None
+            cap = self._int(os.path.join(self.hwmon, "power1_cap"))
+            out["power_limit"] = cap / 1e6 if cap is not None else None
+        out.update(self.link())
+        return out
+
+
+def gpu_reader(index=0, amd=False):
+    """The card's readings: NVML (NVIDIA), or the amdgpu sysfs files with the AMD/HIP backend (Linux sysfs)."""
+    return _Amd(index) if amd else _Nvml(index)
+
+
+def free_vram_mib(index=0, amd=False):
+    """Free VRAM of a card in MiB, or None when it cannot be read.  `amd`: an AMD card on the HIP backend, read from
+    the sysfs files (see gpu_reader)."""
+    g = gpu_reader(index, amd)
+    if not g.ok():
+        return None
+    r = g.read()
+    if r.get("mem_total") is None or r.get("mem_used") is None:
+        return None
+    return int((r["mem_total"] - r["mem_used"]) >> 20)
+
+
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.name == "nt":
@@ -236,19 +411,27 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
-        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own."""
+        PCIe traffic), mean (load) or hottest (temperature), and "gpus" has each card's own.  `amd`: the cards are
+        AMD ones read from the sysfs files (the HIP backend); when False and NVML finds no card at all, AMD is
+        tried anyway (auto-detection), so the Monitor works on a HIP setup that runs this file's older caller."""
         self.extra = extra
         self.lock = threading.Lock()
         self.now: dict = {}
         self.hist = collections.defaultdict(lambda: collections.deque(maxlen=HISTORY))
         idx = list(gpu_indices) if gpu_indices and len(gpu_indices) > 1 else [gpu_index]
-        self.gpus = [(i, _Nvml(i)) for i in idx]
+        self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
+        if not self.gpu.ok() and not amd:
+            # auto-detect: NVML found no card at all - try the amdgpu sysfs (a HIP setup that does not say so)
+            amd_gpus = [(i, _Amd(i)) for i in idx]
+            if any(g.ok() for _, g in amd_gpus):
+                self.gpus = [(i, g) for i, g in amd_gpus if g.ok()] or amd_gpus[:1]
+                self.gpu = self.gpus[0][1]
         self.cards = [(i, g.pci(), g.name()) for i, g in self.gpus] if self.gpu.ok() else []   # (the GPU map's)
         try:
             import psutil  # noqa: F401
@@ -305,7 +488,7 @@ class Telemetry:
             s.update({f"gpu_{k}": v for k, v in g.items()})
             # each card's memory and the processes holding it, for the Monitor's map of a GPU (serve/gpu_map.py)
             s["vram"] = [{"index": i, "pci": pci, "name": name, "used": r.get("mem_used"), "total": r.get("mem_total"),
-                          "procs": g.procs()} for (i, pci, name), (_, r), (_, g) in zip(self.cards, reads, self.gpus)]
+                          "procs": g.procs() if isinstance(g, _Nvml) else None} for (i, pci, name), (_, r), (_, g) in zip(self.cards, reads, self.gpus)]
         if self.ps:
             try:
                 s["cpu"] = self.ps.cpu_percent(interval=None)

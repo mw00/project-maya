@@ -1553,7 +1553,8 @@ class Service:
             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
                                                     "prefill_tok_s_mean": self._prefill_tok_s_mean()},
                                        gpu_index=int(getattr(self, "gpu_index", 0) or 0),
-                                       gpu_indices=getattr(self, "gpu_indices", None))
+                                       gpu_indices=getattr(self, "gpu_indices", None),
+                                       amd=getattr(self, "backend", None) == "hip")
             if isinstance(self.engine, StrataEngine):
                 self.engine.gpu_busy = self._gpu_busy     # the stall watchdog's third sign of work
 
@@ -3487,6 +3488,7 @@ def main() -> int:
         print("[maya] browser pages allowed to call /v1/* (CORS): " + ", ".join(svc.cors_origins), flush=True)
     svc.gpu_index = (gpu_list(cfg) or [0])[0]           # the Monitor reads the card the engine runs on (issue #51)
     svc.gpu_indices = gpu_list(cfg)                     # ... or every card of a layer split (issue #112)
+    svc.backend = cfg.get("backend")                    # the Monitor's GPU reader: sysfs on AMD/HIP, NVML otherwise
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
     args = [str(x) for x in cfg.get("args") or []]
