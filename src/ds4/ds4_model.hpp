@@ -27,7 +27,10 @@ struct Options {
     int cpu_threads = 0;              // 0: the physical cores
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
-    bool dspark = true;               // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
+    // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
+    // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
+    int mmap_experts = -1;
+    bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
@@ -35,8 +38,9 @@ struct Options {
     int tp = 2;
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
-    // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16
-    int prefill_chunk = 2048;
+    // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
+    // -1: 2048, or 8192 with the experts read in place (every chunk streams them all from the files)
+    int prefill_chunk = -1;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;

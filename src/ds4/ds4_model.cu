@@ -24,6 +24,7 @@
 #include <cuda_runtime.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 
@@ -127,6 +128,45 @@ void pin_self(int cpu) {
     CPU_SET(cpu, &set);
     sched_setaffinity(0, sizeof set, &set);
 }
+// the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
+// (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
+uint64_t ram_avail() {
+    uint64_t avail = ~uint64_t{0};
+    {
+        std::istringstream mi(read_file("/proc/meminfo"));
+        std::string k;
+        uint64_t kb = 0;
+        while (mi >> k >> kb) {
+            if (k == "MemAvailable:") avail = kb << 10;
+            mi.ignore(64, '\n');
+        }
+    }
+    std::string cg = read_file("/proc/self/cgroup");   // "0::/user.slice/..."
+    const size_t at = cg.find("0::");
+    if (at == std::string::npos) return avail;
+    cg = cg.substr(at + 3);
+    cg = cg.substr(0, cg.find('\n'));
+    for (;;) {
+        const std::string dir = "/sys/fs/cgroup" + (cg == "/" ? std::string() : cg);
+        const std::string mx = read_file(dir + "/memory.max");
+        if (!mx.empty() && mx.compare(0, 3, "max") != 0) {
+            const uint64_t lim = std::strtoull(mx.c_str(), nullptr, 10);
+            const uint64_t cur = std::strtoull(read_file(dir + "/memory.current").c_str(), nullptr, 10);
+            uint64_t file = 0;
+            std::istringstream st(read_file(dir + "/memory.stat"));
+            std::string k;
+            uint64_t v = 0;
+            while (st >> k >> v)
+                if (k == "file") file = v;
+            const uint64_t used = cur > file ? cur - file : 0;
+            avail = std::min(avail, lim > used ? lim - used : 0);
+        }
+        if (cg.empty() || cg == "/") break;
+        const size_t sl = cg.rfind('/');
+        cg = sl == 0 || sl == std::string::npos ? "/" : cg.substr(0, sl);
+    }
+    return avail;
+}
 
 float bf16_to_f32(uint16_t b) {
     uint32_t u = (uint32_t) b << 16;
@@ -173,9 +213,26 @@ struct Pack {
     std::vector<int32_t> eg_map;
     std::vector<int64_t> eg_mult, eg_primes, eg_off;
 
+    std::vector<std::pair<uint8_t*, size_t>> maps;   // file -> its read-only mapping (map(): the experts in place)
+
     ~Pack() {
+        for (auto& m : maps)
+            if (m.first != nullptr) munmap(m.first, m.second);
         for (int fd : fds)
             if (fd >= 0) ::close(fd);
+    }
+    // file i mapped whole, read-only (once; not thread-safe: called while loading)
+    const uint8_t* map(int file) {
+        if (maps.size() < fds.size()) maps.resize(fds.size(), {nullptr, 0});
+        auto& m = maps[(size_t) file];
+        if (m.first == nullptr) {
+            struct stat sb;
+            if (::fstat(fds[(size_t) file], &sb) != 0 || sb.st_size <= 0) return nullptr;
+            void* p = mmap(nullptr, (size_t) sb.st_size, PROT_READ, MAP_SHARED, fds[(size_t) file], 0);
+            if (p == MAP_FAILED) return nullptr;
+            m = {(uint8_t*) p, (size_t) sb.st_size};
+        }
+        return m.first;
     }
 
     bool load(const std::string& d, std::string& err) {
@@ -430,6 +487,12 @@ struct Chunk {
     int ring_n = 0;
     cudaStream_t cs = nullptr;
     cudaEvent_t filled[kParts] = {}, freed[kParts] = {};
+    // in place (file_experts): each streamed expert's file region read into pinned staging (ring_n slots of
+    // stage_stride bytes, a part's slots free again once its `filled` copies are done) by the readers, in parallel,
+    // and DMA'd from there - a copy from the files' pages goes through the driver's staging, one thread at ~1.3 GB/s
+    uint8_t* stage = nullptr;
+    size_t stage_stride = 0;
+    std::unique_ptr<Pool> readers;
     cublasHandle_t blas = nullptr;
     // host-mapped: a chunk's hand-off to the next group (h | pre | topk | cand), two in flight (slot = chunk % 2), each
     // with its flag, and the next group's members' acknowledgements [slot][member] (32 apart)
@@ -653,6 +716,14 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Pool>> pools;   // one per NUMA node, its workers on that node's cores
     std::vector<std::vector<int>> cores;        // each node's physical cores
     int NH = 1;                                 // the CPU lane's parts of an expert (the NUMA nodes)
+    // the CPU lane's experts read in place from the model's files (one part, the files' layout; the page cache keeps
+    // what fits) instead of copied into RAM, and how much of them the load reads ahead (the most-routed first)
+    bool file_experts = false;
+    uint64_t warm_bytes = 0;
+    static constexpr uint64_t kRamMargin = 8ull << 30;   // RAM left to the rest (the system, the page cache's churn)
+    uint8_t* file_part(const Layer& l, int e) const {
+        return pk.maps[(size_t) l.region_file[(size_t) e]].first + l.region_off[(size_t) e];
+    }
     // host side of the CPU lane, a window's rows
     float *h_x = nullptr, *h_w = nullptr, *h_part = nullptr;
     int* h_idx = nullptr;
@@ -1092,7 +1163,26 @@ struct Model::Impl {
                 devs[(size_t) groups[gi].mem[m]].grp = (int) gi;
                 devs[(size_t) groups[gi].mem[m]].mi = (int) m;
             }
-        chunk = par ? o.prefill_chunk : 0;
+        // whether the CPU lane's experts are read in place (--mmap-experts; auto: the pack's expert bytes beyond what the
+        // GPUs can take - their free memory less the other weights and the prompt path's buffers - do not fit the RAM
+        // this process can get beside kRamMargin), decided here because it sets the prompt chunk's default: in place
+        // every chunk streams every expert VRAM does not hold from the files, so the larger the chunk the fewer times
+        if (o.mmap_experts >= 0) file_experts = o.mmap_experts > 0;
+        else {
+            double exp_b = 0, other_b = 0, room = 0;
+            for (const auto& kt : pk.t) {
+                const std::string& n = kt.first;
+                if (n.find(".engram.embed.") != std::string::npos || n.rfind("vision.", 0) == 0 || n == "embed.weight" ||
+                    (!o.dspark && n.rfind("mtp.", 0) == 0))
+                    continue;
+                (n.find(".ffn.experts.") != std::string::npos ? exp_b : other_b) += (double) kt.second.bytes;
+            }
+            for (const Dev& d : devs)
+                room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - (par ? 1.5 : 0.4) * (1 << 30)) *
+                        o.vram_experts;
+            file_experts = exp_b - std::max(0.0, room - other_b) + (double) kRamMargin > (double) ram_avail();
+        }
+        chunk = par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : 2048) : 0;
         if (const char* v = std::getenv("DS4_CHUNK")) chunk = par ? std::atoi(v) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
         if (chunk > 0) {
@@ -1451,12 +1541,49 @@ struct Model::Impl {
             !halloc(h_emb, (size_t) std::max(kWin, chunk) * g.dim, err) ||
             !halloc(h_eg, (size_t) std::max(1, pk.eg_layers) * eg_cap * cols * (pk.eg_hd + pk.eg_hd / 32) + 64, err))
             return false;
-        // the CPU lane: one pool of workers per NUMA node, each expert split in NH column parts (part X on node X)
+        prof.assign((size_t) (g.nl + g.n_mtp) * g.n_exp, 0u);
+        if (!o.profile.empty()) {
+            std::FILE* f = std::fopen(o.profile.c_str(), "rb");
+            if (f != nullptr) {
+                std::vector<uint32_t> p(prof.size());
+                const size_t n = std::fread(p.data(), 4, p.size(), f);
+                if (n == p.size() || n == (size_t) g.nl * g.n_exp) std::copy(p.begin(), p.begin() + (long) n, prof.begin());
+                std::fclose(f);
+            }
+        }
+
+        // the chunked prompt path's buffers (before the experts: they take what is left)
+        if (chunk > 0 && !alloc_chunks(err)) return false;
+        // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
+        // now leaves over
+        if (file_experts) {
+            double room = 0, all = 0;   // the VRAM place_experts will find for experts; every expert's bytes
+            for (Dev& d : devs) {
+                cudaSetDevice(d.id);
+                size_t fr = 0, tot = 0;
+                CK(cudaMemGetInfo(&fr, &tot));
+                room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+            }
+            for (const Layer& l : L) all += (double) l.blob * l.n_exp;
+            const double need = std::max(0.0, all - room);
+            const uint64_t avail = ram_avail();
+            warm_bytes = avail > kRamMargin ? std::min<uint64_t>(avail - kRamMargin, (uint64_t) need) : 0;
+            if (avail == ~uint64_t{0}) warm_bytes = (uint64_t) need;
+            std::fprintf(stderr,
+                         "ds4: the experts VRAM leaves over (~%.1f GB) are read in place from the model's files%s "
+                         "(%.1f GB of RAM free to keep them: the most-routed %.1f GB read ahead; prompts in chunks of %d)\n",
+                         need / 1e9, o.mmap_experts > 0 ? " (--mmap-experts on)" : ", not copied into RAM",
+                         avail == ~uint64_t{0} ? 0.0 : avail / 1e9, warm_bytes / 1e9, chunk);
+        }
+        // the CPU lane: one pool of workers per NUMA node, each expert split in NH column parts (part X on node X); in
+        // place, one part (the files' layout) and one pool over every node's cores (the pages lie where the cache put them)
         cores = node_cores();
-        NH = (int) std::min<size_t>(2, cores.size());
+        NH = file_experts ? 1 : (int) std::min<size_t>(2, cores.size());
         if (NH > 1 && ((g.ff / NH) % 128 != 0 || (g.dim / NH) % 128 != 0)) NH = 1;
         for (int X = 0; X < (int) cores.size() && X < std::max(NH, 1); ++X) {
             std::vector<int> c = cores[(size_t) X];
+            if (file_experts)
+                for (size_t Y = 1; Y < cores.size(); ++Y) c.insert(c.end(), cores[Y].begin(), cores[Y].end());
             if (X == 0 && !c.empty()) c.erase(c.begin());   // the host thread's core (it helps node 0's pool)
             int nw = (int) c.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
@@ -1472,19 +1599,6 @@ struct Model::Impl {
             c_accd.resize((size_t) NH * S * DQ * (E / NH));
             c_yd.resize(S * E);
         }
-        prof.assign((size_t) (g.nl + g.n_mtp) * g.n_exp, 0u);
-        if (!o.profile.empty()) {
-            std::FILE* f = std::fopen(o.profile.c_str(), "rb");
-            if (f != nullptr) {
-                std::vector<uint32_t> p(prof.size());
-                const size_t n = std::fread(p.data(), 4, p.size(), f);
-                if (n == p.size() || n == (size_t) g.nl * g.n_exp) std::copy(p.begin(), p.begin() + (long) n, prof.begin());
-                std::fclose(f);
-            }
-        }
-
-        // the chunked prompt path's buffers (before the experts: they take what is left)
-        if (chunk > 0 && !alloc_chunks(err)) return false;
         // the experts: VRAM slots in what each device has left, the rest on the host
         if (!place_experts(err)) return false;
         if (!load_experts(err)) return false;
@@ -1497,6 +1611,20 @@ struct Model::Impl {
                     return false;
                 }
             if (o.verbose) std::fprintf(stderr, "ds4: CPU lane's experts pinned in %.1f s\n", (now_ms() - tr) / 1000.0);
+            if (file_experts) {   // in place: each device's staging for its ring, and its readers (DS4_READERS, 8)
+                size_t mr = 0;
+                for (const Layer& l : L)
+                    if (!l.mtp)
+                        for (uint64_t r : l.region_bytes) mr = std::max<size_t>(mr, r);
+                const char* nr = std::getenv("DS4_READERS");
+                const int n_readers = std::max(1, nr != nullptr ? std::atoi(nr) : 8);
+                for (auto& cp : chunks) {
+                    if (cp == nullptr || cp->ring == nullptr) continue;
+                    cp->stage_stride = (mr + 4095) & ~(size_t) 4095;
+                    if (!halloc(cp->stage, (size_t) cp->ring_n * cp->stage_stride, err)) return false;
+                    cp->readers = std::make_unique<Pool>(n_readers - 1, std::vector<int>{}, 50);
+                }
+            }
             for (Layer& l : L) {
                 if (l.mtp) continue;
                 if (!halloc(l.vs_pin, (size_t) l.n_exp, err)) return false;
@@ -1690,14 +1818,12 @@ struct Model::Impl {
     }
 
     // expert e of l (on the CPU lane: its NH column parts) -> member m's VRAM copy at dst, in the GPU layout (the full
-    // blob, or a group member's part), by DMA from the pinned parts on the copy stream
-    bool stream_expert(const Layer& l, int m, int e, uint8_t* dst, cudaStream_t cs, std::string& err) {
+    // blob, or a group member's part), by DMA from the pinned parts on the copy stream (in place: from `src`, its file
+    // region read into pinned staging)
+    bool stream_expert(const Layer& l, int m, int e, uint8_t* dst, cudaStream_t cs, std::string& err,
+                       const uint8_t* src = nullptr) {
         const auto& parts = l.hh[(size_t) e];
         const int D = g.dim, FF = g.ff;
-        if (NH != 2) {
-            err = "the chunked prompt path streams experts of 2 NUMA parts";
-            return false;
-        }
         auto cp2 = [&](uint8_t* d0, size_t dp, const uint8_t* s0, size_t sp, size_t w, size_t h) {
             return cudaMemcpy2DAsync(d0, dp, s0, sp, w, h, cudaMemcpyHostToDevice, cs) == cudaSuccess;
         };
@@ -1705,7 +1831,29 @@ struct Model::Impl {
             return cudaMemcpyAsync(d0, s0, n, cudaMemcpyHostToDevice, cs) == cudaSuccess;
         };
         bool ok = true;
-        if (l.nm == 1) {   // the full blob: each matrix's columns from the two parts side by side
+        if (NH == 1) {   // one part: the whole expert in exllamav3's layout, its pieces at hl's offsets
+            const uint8_t* p = src != nullptr ? src : parts[0];
+            if (l.nm == 1) {
+                for (int r = 0; r < 3; ++r)
+                    ok = ok && cp(dst + l.lay.trellis[r], p + l.hl.trellis[r], l.piece_bytes[r][0]) &&
+                         cp(dst + l.lay.suh[r], p + l.hl.suh[r], (size_t) l.hl.k[r] * 2) &&
+                         cp(dst + l.lay.svh[r], p + l.hl.svh[r], (size_t) l.hl.n[r] * 2);
+            } else {   // member m's part, cut as blob_to_half cuts a blob
+                const int ffh = FF / l.nm;
+                for (int r = 0; r < 2; ++r) {
+                    const size_t tile = (size_t) 32 * l.lay.K[r], nt = (size_t) FF / 16, nth = (size_t) ffh / 16;
+                    ok = ok && cp2(dst + l.hlay.trellis[r], nth * tile, p + l.hl.trellis[r] + (size_t) m * nth * tile,
+                                   nt * tile, nth * tile, (size_t) D / 16) &&
+                         cp(dst + l.hlay.suh[r], p + l.hl.suh[r], (size_t) D * 2) &&
+                         cp(dst + l.hlay.svh[r], p + l.hl.svh[r] + (size_t) m * ffh * 2, (size_t) ffh * 2);
+                }
+                const size_t row = (size_t) (D / 16) * 32 * l.lay.K[2];
+                ok = ok && cp(dst + l.hlay.trellis[2], p + l.hl.trellis[2] + (size_t) m * (ffh / 16) * row,
+                              (size_t) (ffh / 16) * row) &&
+                     cp(dst + l.hlay.suh[2], p + l.hl.suh[2] + (size_t) m * ffh * 2, (size_t) ffh * 2) &&
+                     cp(dst + l.hlay.svh[2], p + l.hl.svh[2], (size_t) D * 2);
+            }
+        } else if (l.nm == 1) {   // the full blob: each matrix's columns from the two parts side by side
             for (int r = 0; r < 3; ++r) {
                 const size_t tile = (size_t) 32 * l.lay.K[r];
                 const int k = l.hl.k[r], nh = l.hl.n[r];   // part: k x nh
@@ -1746,7 +1894,40 @@ struct Model::Impl {
     struct Streamer {
         std::vector<Batch> b;
         size_t cp = 0, kp = 0;        // the next batch to copy, to compute
+        std::atomic<size_t> done{0};  // cp, for read_ahead's thread
     };
+    // in place (file_experts): the batches' file regions read ahead of their copies - POSIX_FADV_WILLNEED, the kernel
+    // reading them in the background in large requests, where the copies alone fault the pages in a few at a time -
+    // at most DS4_READAHEAD_MB (2048) beyond the batch being copied; each region by its layer's first member alone
+    void read_ahead(const Streamer& S, int di, const std::atomic<bool>& stop) const {
+        static const double cap = (std::getenv("DS4_READAHEAD_MB") ? std::atof(std::getenv("DS4_READAHEAD_MB")) : 2048.0) *
+                                  1048576.0;
+        std::deque<std::pair<size_t, double>> issued;   // (batch, bytes) not yet copied
+        double ahead = 0;
+        for (size_t q = 0; q < S.b.size() && !stop.load(std::memory_order_relaxed);) {
+            const size_t done = S.done.load(std::memory_order_relaxed);
+            while (!issued.empty() && issued.front().first < done) {
+                ahead -= issued.front().second;
+                issued.pop_front();
+            }
+            if (ahead > cap) {
+                std::this_thread::sleep_for(std::chrono::microseconds(500));
+                continue;
+            }
+            const Batch& bt = S.b[q];
+            const Layer& l0 = L[(size_t) bt.il];
+            double nb = 0;
+            if (l0.dev == di)
+                for (int i = 0; i < bt.n; ++i) {
+                    const int e = l0.host_list[(size_t) (bt.j0 + i)];
+                    posix_fadvise(pk.fds[(size_t) l0.region_file[(size_t) e]], (off_t) l0.region_off[(size_t) e],
+                                  (off_t) l0.region_bytes[(size_t) e], POSIX_FADV_WILLNEED);
+                    nb += (double) l0.region_bytes[(size_t) e];
+                }
+            issued.push_back({q++, nb});
+            ahead += nb;
+        }
+    }
     bool copy_ahead(Dev& d, Chunk& c, Streamer& S, int di, std::string& err) {
         const int P = Chunk::kParts;
         while (S.cp < S.b.size() && S.cp < S.kp + P) {
@@ -1757,13 +1938,32 @@ struct Model::Impl {
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di) mi = m;
             if (S.cp >= (size_t) P) CK(cudaStreamWaitEvent(c.cs, c.freed[half], 0));
+            uint8_t* sb = nullptr;   // in place: the batch's regions in the part's staging slots
+            if (c.stage != nullptr) {
+                if (S.cp >= (size_t) P) CK(cudaEventSynchronize(c.filled[half]));   // (its last batch's copies out)
+                sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
+                std::atomic<bool> bad{false};
+                c.readers->run(bt.n, [&](int i) {
+                    const int e = l0.host_list[(size_t) (bt.j0 + i)];
+                    if (!pk.read_at(l0.region_file[(size_t) e], l0.region_off[(size_t) e], l0.region_bytes[(size_t) e],
+                                    sb + (size_t) i * c.stage_stride))
+                        bad.store(true);
+                });
+                if (bad.load()) {
+                    err = "reading layer " + std::to_string(l0.il) + "'s experts from the model's files failed";
+                    return false;
+                }
+            }
             for (int i = 0; i < bt.n; ++i) {
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
-                if (!stream_expert(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], dst, c.cs, err)) return false;
+                if (!stream_expert(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], dst, c.cs, err,
+                                   sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr))
+                    return false;
                 c.stream_bytes += (double) unit(l0);
             }
             CK(cudaEventRecord(c.filled[half], c.cs));
             ++S.cp;
+            S.done.store(S.cp, std::memory_order_relaxed);
         }
         return true;
     }
@@ -2065,23 +2265,34 @@ struct Model::Impl {
                 for (int e = 0; e < l.n_exp; ++e) l.heat[(size_t) e] = (float) (p[e] * sc);
             }
             const int n_host = l.n_exp - l.n_vram;
-            {   // the CPU lane's parts of an expert
+            {   // the CPU lane's parts of an expert (in place: the whole expert, its pieces where the file has them)
                 size_t off = 0;
                 for (int r = 0; r < 3; ++r) {
                     const int k = r < 2 ? g.dim : g.ff, nf = r < 2 ? g.ff : g.dim, n = nf / NH;
                     l.hl.k[r] = k;
                     l.hl.n[r] = n;
-                    l.hl.trellis[r] = off;
+                    l.hl.trellis[r] = file_experts ? l.piece_src[r][0] : off;
                     off += align256((size_t) (k / 16) * (n / 16) * 32 * l.lay.K[r]);
-                    l.hl.suh[r] = off;
+                    l.hl.suh[r] = file_experts ? l.piece_src[r][1] : off;
                     off += align256((size_t) k * 2);
-                    l.hl.svh[r] = off;
+                    l.hl.svh[r] = file_experts ? l.piece_src[r][2] : off;
                     off += align256((size_t) n * 2);
                 }
                 l.hl.bytes = off;
             }
             l.hh.assign((size_t) l.n_exp, {nullptr, nullptr, nullptr, nullptr});
-            if (n_host > 0) {
+            if (file_experts) {   // every expert's file mapped (the cache's swaps hand VRAM experts back to the files)
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (pk.map(l.region_file[(size_t) e]) == nullptr) {
+                        err = "mapping " + pk.files[(size_t) l.region_file[(size_t) e]] + " failed";
+                        return false;
+                    }
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0) {
+                        l.hh[(size_t) e][0] = file_part(l, e);
+                        l.host[(size_t) e] = l.hh[(size_t) e][0];
+                    }
+            } else if (n_host > 0) {
                 const int n_parts = n_host + (l.spare_vram >= 0 ? 1 : 0);   // (+ the cache's spare)
                 const size_t bytes = (size_t) n_parts * l.hl.bytes;
                 for (int X = 0; X < NH; ++X) {
@@ -2119,13 +2330,35 @@ struct Model::Impl {
     }
 
     bool load_experts(std::string& err) {
-        // every expert's region, in file order, by a few threads; VRAM ones through a pinned staging blob
+        // every expert's region, in file order, by a few threads; VRAM ones through a pinned staging blob.  In place
+        // (file_experts) the CPU lane's experts are not copied: the most-routed of them (the profile's share of their
+        // layer) are read once, up to warm_bytes, so the page cache starts with them, and the VRAM ones' pages are
+        // dropped from it again
         struct Job {
             int layer, e;
         };
         std::vector<Job> jobs;
         for (const Layer& l : L)
-            for (int e = 0; e < l.n_exp; ++e) jobs.push_back({l.il, e});
+            for (int e = 0; e < l.n_exp; ++e)
+                if (!file_experts || l.slot[(size_t) e] >= 0) jobs.push_back({l.il, e});
+        uint64_t warm = 0;
+        if (file_experts) {
+            std::vector<std::pair<double, Job>> cand;
+            for (const Layer& l : L) {
+                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                double sum = 0;
+                for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0) cand.push_back({sum > 0 ? p[e] / sum : 0.0, Job{l.il, e}});
+            }
+            std::stable_sort(cand.begin(), cand.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (const auto& c : cand) {
+                const uint64_t b = L[(size_t) c.second.layer].region_bytes[(size_t) c.second.e];
+                if (warm + b > warm_bytes) break;
+                warm += b;
+                jobs.push_back(c.second);
+            }
+        }
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
             if (la.region_file[(size_t) a.e] != lb.region_file[(size_t) b.e])
@@ -2184,7 +2417,10 @@ struct Model::Impl {
                             failed.store(true);
                             break;
                         }
-                    } else {
+                        if (file_experts)
+                            posix_fadvise(pk.fds[(size_t) l.region_file[(size_t) e]], (off_t) l.region_off[(size_t) e],
+                                          (off_t) l.region_bytes[(size_t) e], POSIX_FADV_DONTNEED);
+                    } else if (!file_experts) {
                         for (int X = 0; X < NH; ++X) repack_part(l, region.data(), X, l.hh[(size_t) e][(size_t) X]);
                     }
                     const int64_t db = done_bytes.fetch_add((int64_t) l.region_bytes[(size_t) e]) +
@@ -2201,6 +2437,9 @@ struct Model::Impl {
             err = ferr;
             return false;
         }
+        if (file_experts)
+            std::fprintf(stderr, "ds4: experts loaded in %.1f s (%.1f GB of the CPU lane's read ahead)\n",
+                         (now_ms() - t0) / 1000.0, warm / 1e9);
         return true;
     }
 
@@ -2238,8 +2477,13 @@ struct Model::Impl {
             hb_ += (size_t) (l.n_exp - l.n_vram) * l.blob;
         }
         char line[200];
-        std::snprintf(line, sizeof line, "ds4: %d routed experts on the CPU lane (%.1f GB of RAM, %d NUMA parts), %d threads\n", nh,
-                      hb_ / 1e9, NH, cpu_threads());
+        if (file_experts)
+            std::snprintf(line, sizeof line,
+                          "ds4: %d routed experts on the CPU lane (%.1f GB, in place in the model's files), %d threads\n",
+                          nh, hb_ / 1e9, cpu_threads());
+        else
+            std::snprintf(line, sizeof line, "ds4: %d routed experts on the CPU lane (%.1f GB of RAM, %d NUMA parts), %d threads\n", nh,
+                          hb_ / 1e9, NH, cpu_threads());
         s << line;
         return s.str();
     }
@@ -2627,7 +2871,8 @@ struct Model::Impl {
     // ---- the expert cache.  A swap moves a CPU-lane expert (`in`) into the layer's spare VRAM slot and the VRAM expert it
     // replaces (`out`) into the spare host parts - both copies of weights that do not change, made while the model runs
     // (the copy stream, the host's repacking) - and cache_tick switches the tables between windows, so the device's
-    // table and the host's view of a layer always agree within a window.
+    // table and the host's view of a layer always agree within a window.  In place (file_experts) `out` needs no copy:
+    // the CPU lane reads it from the file again.
     void cache_loop() {
         for (;;) {
             Swap sw;
@@ -2645,8 +2890,9 @@ struct Model::Impl {
                 cudaSetDevice(d.id);
                 cudaStream_t cs = copy_st[(size_t) l.dev];
                 cudaMemcpyAsync(l.vram_base + (size_t) l.spare_vram * l.blob, sw_a, l.blob, cudaMemcpyHostToDevice, cs);
-                cudaMemcpyAsync(sw_b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob,
-                                cudaMemcpyDeviceToHost, cs);
+                if (!file_experts)
+                    cudaMemcpyAsync(sw_b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob,
+                                    cudaMemcpyDeviceToHost, cs);
                 cudaStreamSynchronize(cs);
             } else {   // a group: each member's part in, each member's part out
                 for (int m = 0; m < l.nm; ++m) {
@@ -2656,17 +2902,19 @@ struct Model::Impl {
                     blob_to_half(l, sw_a, m, sw_h);
                     cudaMemcpyAsync(x.vram_base + (size_t) l.spare_vram * l.hblob, sw_h, l.hblob, cudaMemcpyHostToDevice, cs);
                     cudaStreamSynchronize(cs);
+                    if (file_experts) continue;
                     cudaMemcpyAsync(sw_h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * l.hblob, l.hblob,
                                     cudaMemcpyDeviceToHost, cs);
                     cudaStreamSynchronize(cs);
                     half_to_blob(l, sw_h, m, sw_b);
                 }
             }
-            for (int X = 0; X < NH; ++X) blob_to_part(l, sw_b, X, l.spare_host[(size_t) X]);
+            if (!file_experts)
+                for (int X = 0; X < NH; ++X) blob_to_part(l, sw_b, X, l.spare_host[(size_t) X]);
             if (check_swaps) {   // DS4_CHECK_SWAPS: both moves against the model file, byte for byte
                 std::vector<uint8_t> reg, blob(l.blob), part(l.hl.bytes);
                 bool ok = true;
-                for (int pass = 0; pass < 2; ++pass) {
+                for (int pass = 0; pass < (file_experts ? 1 : 2); ++pass) {   // (in place: no host copy of `out`)
                     const int e = pass == 0 ? sw.in : sw.out;
                     reg.resize(l.region_bytes[(size_t) e]);
                     pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], reg.size(), reg.data());
@@ -2723,10 +2971,15 @@ struct Model::Impl {
             l.hh[(size_t) sw.in] = {nullptr, nullptr, nullptr, nullptr};
             l.host[(size_t) sw.in] = nullptr;
             l.slot[(size_t) sw.out] = -1;
-            l.hh[(size_t) sw.out] = l.spare_host;
-            l.host[(size_t) sw.out] = l.spare_host[0];
+            if (file_experts) {   // (back to its pages in the file)
+                l.hh[(size_t) sw.out] = {file_part(l, sw.out), nullptr, nullptr, nullptr};
+                l.host[(size_t) sw.out] = l.hh[(size_t) sw.out][0];
+            } else {
+                l.hh[(size_t) sw.out] = l.spare_host;
+                l.host[(size_t) sw.out] = l.spare_host[0];
+                l.spare_host = old_parts;
+            }
             l.spare_vram = old_slot;
-            l.spare_host = old_parts;
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 const Dev& dm = devs[(size_t) x.dev];
@@ -3459,6 +3712,17 @@ struct Model::Impl {
             err = "no slots to stream experts into on CUDA" + std::to_string(d.id);
             return false;
         }
+        std::atomic<bool> ra_stop{false};
+        std::thread ra;
+        if (file_experts && !S.b.empty()) ra = std::thread([this, &S, di, &ra_stop] { read_ahead(S, di, ra_stop); });
+        struct Join {   // (every way out of the run: the read-ahead ends before S does)
+            std::atomic<bool>& stop;
+            std::thread& th;
+            ~Join() {
+                stop.store(true);
+                if (th.joinable()) th.join();
+            }
+        } ra_join{ra_stop, ra};
         if (!copy_ahead(d, c, S, di, err)) return false;
         // this device's Engram layers: chunk k's rows read on a helper thread while chunk k - 1 runs (slot k % 2, once
         // chunk k - 2's copy of it is done)
