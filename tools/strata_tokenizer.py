@@ -84,6 +84,43 @@ GLM_PATTERN = (
 )
 
 
+# The `deepseek3` pre-tokenizer (DeepSeek-V3 .. V4.1's tokenizer.json, llama.cpp's LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM):
+# THREE Split stages with behavior "Isolated", each applied to every piece the one before produced - digit runs of at
+# most 3, then runs of CJK ideographs / kana, then the word pattern - and the text between a stage's matches stays a
+# piece of its own (a digit run passes the word pattern untouched that way).  Then the byte-level mapping; merges by
+# rank as usual (no ignore_merges).
+DEEPSEEK3_PATTERNS = (
+    r"\p{N}{1,3}",
+    r"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
+
+class _IsolatedSplits:
+    """findall() over a sequence of "Isolated" splits (see DEEPSEEK3_PATTERNS)."""
+
+    def __init__(self, patterns):
+        self.stages = [regex.compile(p) for p in patterns]
+
+    def findall(self, text: str) -> list[str]:
+        pieces = [text]
+        for pat in self.stages:
+            out = []
+            for piece in pieces:
+                pos = 0
+                for m in pat.finditer(piece):
+                    if m.start() > pos:
+                        out.append(piece[pos:m.start()])
+                    if m.end() > m.start():
+                        out.append(m.group(0))
+                    pos = m.end()
+                if pos < len(piece):
+                    out.append(piece[pos:])
+            pieces = out
+        return pieces
+
+
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
                  pre: str = "qwen35", special_ids: dict[str, int] | None = None):
@@ -91,8 +128,8 @@ class Tokenizer:
         self.pre = pre
         # Each supported scheme names a transcription of the vendored llama.cpp reference; an
         # unknown scheme is REFUSED rather than silently tokenized with the wrong splits.
-        if pre not in ("qwen35", "glm4", "glm5"):
-            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5" % pre)
+        if pre not in ("qwen35", "glm4", "glm5", "deepseek3"):
+            raise ValueError("the %r pre-tokenizer is not transcribed; known: qwen35, glm4, glm5, deepseek3" % pre)
         # glm4/glm5 set ignore_merges: an exact vocab hit emits the whole pre-token piece
         self.ignore_merges = pre in ("glm4", "glm5")
         self.token_types = token_types
@@ -112,7 +149,8 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN)
+        self._re = (_IsolatedSplits(DEEPSEEK3_PATTERNS) if pre == "deepseek3" else
+                    regex.compile(GLM_PATTERN if self.ignore_merges else QWEN35_PATTERN))
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -304,6 +342,11 @@ class Tokenizer:
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            if self.token_types and self.token_types[i] in (3, 4):
+                # a control / user-defined token is its text as is (llama.cpp's token_to_piece): GLM's are ASCII,
+                # where the byte alphabet is the identity, DeepSeek's (<｜User｜>, ｜DSML｜) are not
+                b = cache[i] = self.tokens[i].encode("utf-8")
+                return b
             raw = bytearray()
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)

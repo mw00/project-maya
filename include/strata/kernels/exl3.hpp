@@ -107,7 +107,8 @@ struct WinArgs {
     const int *grp_start = nullptr, *grp_ent = nullptr, *n_groups = nullptr;
     const unsigned long long* plan_ptr = nullptr;   // [T][8]
     const float* plan_w = nullptr;                  // [T][8]
-    const float* cpu_part = nullptr;                // [T][n_embd]
+    const float* cpu_part = nullptr;                // [T][n_embd] (rows cpu_stride apart when given)
+    size_t cpu_stride = 0;
     const int* cpu_flag = nullptr;                  // [T]
     const float* x = nullptr;
     size_t x_stride = 0;
@@ -119,6 +120,10 @@ struct WinArgs {
     ExpertLayout lay;
     int T = 0, k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
+    // (given) the combine first waits on the device until *wait_ptr == wait_val (the host's answer to the CPU lane's
+    // part arrives while the device computes the experts); cpu_flag may be null (no CPU part)
+    const unsigned* wait_ptr = nullptr;
+    unsigned wait_val = 0;
 };
 bool win_experts(const WinArgs& a, cudaStream_t s);
 /// Whether the current device runs the several-activation kernels (win_experts; mv's ncol > 1): every device does

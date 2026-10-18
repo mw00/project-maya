@@ -10,7 +10,8 @@ ask for them with `"strata_mcp": true` - the web app does; other clients see exa
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
 data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
-converted to PNG first with Pillow.
+converted to PNG first with Pillow.  DeepSeek-V4.1 (strata-ds4, `INFO vision=ds4`) runs its vision tower in the engine:
+the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`.
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
@@ -48,7 +49,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import gpu_map  # noqa: E402
+from serve import ds4_vision, gpu_map  # noqa: E402
 from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             effort_kwargs, effort_level, images_of, literal_tags, mark_literals,
                             openai_to_messages, unmark_literals)
@@ -1334,10 +1335,13 @@ class Service:
         # GLM ends an assistant turn with the next role's token (<|user|> / <|observation|>): the engine stops on it,
         # and it must not reach the answer's text either
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
-                            _special_ids("<|observation|>"))
+                            _special_ids("<|observation|>") +
+                            # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
+                            _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
-        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>") if _special_ids(s)]
+        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>")
+                           if _special_ids(s)]
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
@@ -1743,14 +1747,24 @@ class Service:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
         prefill = ""
         if force is not None and tools:
-            # GLM's form opens with the tool's name, Qwen's with <function=NAME>
+            # GLM's form opens with the tool's name, Qwen's with <function=NAME>, DeepSeek's DSML with its calls block
             glm_calls = "<arg_key>" in self.template.source
-            prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
+            if getattr(self.template, "deepseek", False):
+                prefill = "\n\n<｜DSML｜ calls>\n" + (f'<｜DSML｜ invoke name="{force}">\n' if force else "")
+            else:
+                prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
         ids = self.render_ids(messages, tools, kwargs, prefill)
         self.embeddings.path = None
         images = images_of(messages)
-        if images:
+        if images and isinstance(self.vision, ds4_vision.Vision):
+            # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
+            # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
+            pics = [self.vision.picture(src) for src in images]
+            ids, starts = self.vision.expand(ids, pics)
+            self.embeddings.path = self.vision.write(self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.dsi", pics,
+                                                     starts)
+        elif images:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -1811,9 +1825,16 @@ class Service:
             tools = (tools or []) + self.mcp.template_tools(exclude=own) or None
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **effort_kwargs(self.default_effort)}
-        images = len(images_of(messages))
-        return {"tokens": len(self.render_ids(messages, tools, kw)), "images": images,
-                "approximate": images > 0, "max_context": self.engine.max_context}
+        sources = images_of(messages)
+        n, approximate = len(self.render_ids(messages, tools, kw)), len(sources) > 0
+        if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
+            try:
+                n += sum(self.vision.picture(src).tokens - 1 for src in sources)
+                approximate = False
+            except (ValueError, OSError):
+                pass
+        return {"tokens": n, "images": len(sources), "approximate": approximate,
+                "max_context": self.engine.max_context}
 
     def _note(self, n, evs):
         with self.status_lock:
@@ -1963,7 +1984,8 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
-        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+        parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
+                              dsml=getattr(self.template, "deepseek", False))
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []
         detok, n, finish = Detokenizer(self.tok), 0, "length"
@@ -3432,6 +3454,12 @@ def main() -> int:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
         warn_tight_ram(engine.info.get("arena_mib"))
+        if vision is None and not vcfg and engine.info.get("vision") == "ds4":
+            # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
+            vision = ds4_vision.Vision(ds4_vision.Geometry.from_info(engine.info),
+                                       Path(tempfile.mkdtemp(prefix="strata-ds4-pictures-")), Vision.load)
+            print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}, "
+                  f"{engine.info.get('vision_mib')} MiB), up to {vision.g.max_tokens} tokens a picture", flush=True)
         if on_demand:
             lent = int(engine.info.get("vision_lend") or 0)
             if lent > 0:

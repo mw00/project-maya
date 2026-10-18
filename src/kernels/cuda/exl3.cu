@@ -53,6 +53,9 @@ namespace {
 constexpr int kThreads = 256, kWarps = 8;
 constexpr int kCols = 128;                // outputs per block: 8 tiles, one rotation block
 constexpr int kMaxKR = 4096;              // inputs per block at most (mv's split)
+// a routed expert's widths at most (moe_* / win_*: a block streams its inputs through block_gemv's two 128-value chunk
+// buffers, so the shared memory does not grow with them; DeepSeek-V4.1's n_embd is 5120)
+constexpr int kMaxMoeK = 8192;
 constexpr float kHad = 0.088388347648f;   // 1 / sqrt(128)
 
 struct Q81 {   // the engine's q8_1 block (ggml block_q8_1): d, sum, 32 int8
@@ -664,6 +667,7 @@ struct KWin {
     const unsigned long long* plan_ptr;
     const float* plan_w;
     const float* cpu_part;
+    size_t cpu_stride;
     const int* cpu_flag;
     const float* x;
     size_t x_stride;
@@ -741,8 +745,19 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
         p[i] = a.plan_ptr[e] != 0ull ? a.part[(size_t) e * a.n_embd + r] : 0.0f;
     }
     a.out[(size_t) t * a.out_stride + r] =
-        combine(a.plan_w + t * 8, p, a.k, a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.n_embd + r : nullptr,
+        combine(a.plan_w + t * 8, p, a.k,
+                a.cpu_flag != nullptr && a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
+}
+
+__global__ void win_wait_kernel(const unsigned* p, unsigned v) {
+    if (threadIdx.x != 0) return;
+    while (*(volatile const unsigned*) p != v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+        __nanosleep(200);
+#endif
+    }
+    __threadfence_system();
 }
 
 // ---------------------------------------------------------------- reconstruction
@@ -1208,9 +1223,17 @@ std::map<std::pair<int, cudaStream_t>, Scratch> g_scratch;
 Scratch* scratch(cudaStream_t s) {
     int dev = 0;
     cudaGetDevice(&dev);
+    // (the last stream this thread used: an engine thread per device launches without the lock)
+    thread_local int t_dev = -1;
+    thread_local cudaStream_t t_s = nullptr;
+    thread_local Scratch* t_sc = nullptr;
+    if (t_sc != nullptr && t_dev == dev && t_s == s) return t_sc;
     std::lock_guard<std::mutex> lk(g_mu);
     auto it = g_scratch.find({dev, s});
-    if (it != g_scratch.end()) return &it->second;
+    if (it != g_scratch.end()) {
+        t_dev = dev, t_s = s, t_sc = &it->second;
+        return &it->second;
+    }
     cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
     if (cudaStreamIsCapturing(s, &cs) == cudaSuccess && cs != cudaStreamCaptureStatusNone) {
         std::fprintf(stderr, "exl3: scratch for a stream first seen inside a graph capture (call exl3::prepare)\n");
@@ -1448,8 +1471,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
 static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
-    if (a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
-        a.n_ff > kMaxKR || (size_t) a.k * a.n_ff > kHFloats || (size_t) a.k * a.n_embd > kPartFloats ||
+    if (a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
+        a.n_ff > kMaxMoeK || (size_t) a.k * a.n_ff > kHFloats || (size_t) a.k * a.n_embd > kPartFloats ||
         (size_t) (a.n_embd / kCols) > kCntGU || kCntGU + (size_t) a.k * (a.n_ff / kCols) > kCounters) {
         std::fprintf(stderr, "exl3 moe: geometry not covered (k %d n_embd %d n_ff %d)\n", a.k, a.n_embd, a.n_ff);
         return false;
@@ -1504,8 +1527,8 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
 
 bool win_experts(const WinArgs& a, cudaStream_t s) {
     EXL3_LEGACY(win_experts(a, s));
-    if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxKR ||
-        a.n_ff > kMaxKR || a.lay.K[0] != a.lay.K[1] || a.h == nullptr || a.part == nullptr || a.out == nullptr) {
+    if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
+        a.n_ff > kMaxMoeK || a.lay.K[0] != a.lay.K[1] || a.h == nullptr || a.part == nullptr || a.out == nullptr) {
         std::fprintf(stderr, "exl3 win_experts: not covered (T %d k %d n_embd %d n_ff %d, gate K %d up K %d)\n", a.T,
                      a.k, a.n_embd, a.n_ff, a.lay.K[0], a.lay.K[1]);
         return false;
@@ -1525,6 +1548,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.plan_ptr = a.plan_ptr;
     w.plan_w = a.plan_w;
     w.cpu_part = a.cpu_part;
+    w.cpu_stride = a.cpu_stride != 0 ? a.cpu_stride : (size_t) a.n_embd;
     w.cpu_flag = a.cpu_flag;
     w.x = a.x;
     w.x_stride = a.x_stride;
@@ -1547,6 +1571,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     if (!dispatch<RunWin>(a.lay.K[0], a.lay.cb, w, groups, s) ||
         !dispatch<RunWinDown>(a.lay.K[2], a.lay.cb, w, groups, s))
         return false;
+    if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);
     launch_check("win_experts");
     return true;

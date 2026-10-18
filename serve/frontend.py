@@ -49,6 +49,9 @@ class ChatTemplate:
         # GLM's own (low / high / max, or thinking off: the think block closed the way the template writes a turn
         # without reasoning).  Another model's template gets them in its own words (Qwen: low / medium / xhigh).
         self.glm_effort = "reasoning_effort in ['low', 'high']" in self.source
+        # DeepSeek-V4.1 (tools/ds4/chat_template.jinja): the levels by their own names (its budgets 50 / 75 / 100), tool
+        # calls in DSML (OutputParser(dsml=True) reads them)
+        self.deepseek = "｜DSML｜" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -57,7 +60,7 @@ class ChatTemplate:
             off = kwargs.pop("enable_thinking", True) is False
             level = kwargs.pop("reasoning_effort", None)
             kwargs["reasoning_effort"] = "low" if off else level if level in ("low", "high") else "max"
-        elif kwargs.get("reasoning_effort") in QWEN_EFFORT:
+        elif kwargs.get("reasoning_effort") in QWEN_EFFORT and not self.deepseek:
             kwargs["reasoning_effort"] = QWEN_EFFORT[kwargs["reasoning_effort"]]
         if add_generation_prompt and not self.glm_effort:
             # The parser treats a generated turn as reasoning unless explicitly disabled. Pass
@@ -494,12 +497,76 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     return ToolCall(name=name, arguments=args)
 
 
+DSML = "｜DSML｜"
+_DSML_ATTR = re.compile(r'(\w+)="([^"]*)"')
+
+
+class DsmlRewriter:
+    """DeepSeek-V4.1's tool calls (DSML: `<｜DSML｜ calls>` around `<｜DSML｜ invoke name="N">` blocks of
+    `<｜DSML｜ parameter name="K" string="true|false">V</｜DSML｜ parameter>`) rewritten, as they stream, into GLM's form
+    (`<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>`) for OutputParser.  A tag split across
+    deltas is held until it is whole; the whitespace between the tags of a calls block is dropped.  A value is passed
+    as written - a string="false" one is JSON, which the parser decodes by the tool's schema."""
+
+    def __init__(self):
+        self.buf = ""
+        self.in_calls = self.in_param = False
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            i = self.buf.find("<")
+            if i < 0:
+                out.append(self._plain(self.buf))
+                self.buf = ""
+                break
+            if i > 0:
+                out.append(self._plain(self.buf[:i]))
+                self.buf = self.buf[i:]
+            opener = next((o for o in ("<" + DSML, "</" + DSML) if self.buf.startswith(o)), None)
+            if opener is None:
+                if any(o.startswith(self.buf) for o in ("<" + DSML, "</" + DSML)):
+                    break                                   # could still become a tag: hold it
+                out.append(self._plain("<"))
+                self.buf = self.buf[1:]
+                continue
+            j = self.buf.find(">")
+            if j < 0:
+                break                                       # the tag is not whole yet
+            tag, self.buf = self.buf[:j + 1], self.buf[j + 1:]
+            out.append(self._tag(tag, opener.startswith("</"), tag[len(opener):-1]))
+        return "".join(out)
+
+    def finish(self) -> str:
+        rest, self.buf = self.buf, ""
+        return self._plain(rest)
+
+    def _plain(self, s: str) -> str:
+        return "" if self.in_calls and not self.in_param and not s.strip() else s
+
+    def _tag(self, tag: str, closing: bool, body: str) -> str:
+        kind = body.split(None, 1)[0] if body.strip() else ""
+        attrs = dict(_DSML_ATTR.findall(body))
+        if kind == "calls":
+            self.in_calls = not closing
+            return ""
+        if kind == "invoke":
+            return "</tool_call>" if closing else CALL_START + attrs.get("name", "")
+        if kind == "parameter":
+            self.in_param = not closing
+            return ARG_VAL_END if closing else ARG_KEY + attrs.get("name", "") + ARG_KEY_END + ARG_VAL
+        return tag
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 dsml: bool = False):
         self.state = "reasoning" if thinking else "content"
+        self.dsml = DsmlRewriter() if dsml else None      # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter)
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
@@ -695,6 +762,11 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        if self.dsml is not None:
+            delta = self.dsml.feed(delta)
+        return self._feed(delta)
+
+    def _feed(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
         while True:
@@ -767,7 +839,7 @@ class OutputParser:
 
     def finish(self) -> list[Event]:
         """End of generation: flush whatever is held (an unterminated tool call is returned as content)."""
-        out = []
+        out = self._feed(self.dsml.finish()) if self.dsml is not None else []
         if self.state == "call" and self.stream_tools and self.scall is not None:
             out += self._scan()                 # the output ended inside a call that was already announced
             out += self._close_scan()

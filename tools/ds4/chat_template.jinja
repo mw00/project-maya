@@ -1,0 +1,93 @@
+{#- DeepSeek-V4.1's prompt format (the model repo's encoding/encoding.py), as a chat template for Maya's server.
+    Turns: <｜User｜> ... <｜Assistant｜> (reasoning</think>)answer<｜end▁of▁sentence｜>.  Thinking mode ends the prompt
+    with <think> and starts with a reasoning-effort line (low 50, high 75, max 100); chat mode ends it with </think>.
+    Tool results (role "tool") are <tool_result> blocks of a user turn, merged with the user messages around them;
+    tool calls are DSML blocks; the tools are listed in the system turn.  Earlier turns keep their reasoning only when
+    tools are given (encoding.py's drop_thinking).  A picture in a message's content list is its placeholder
+    <｜deepseek_image｜>, a block of its own between the text blocks (the server expands it into the picture's span). -#}
+{%- set thinking = enable_thinking is not defined or enable_thinking -%}
+{%- set efforts = {'low': 50, 'medium': 75, 'high': 75, 'xhigh': 100, 'max': 100} -%}
+{%- if reasoning_effort is defined and reasoning_effort is number -%}
+{%- set budget = reasoning_effort -%}
+{%- elif reasoning_effort is defined and reasoning_effort in efforts -%}
+{%- set budget = efforts[reasoning_effort] -%}
+{%- else -%}
+{%- set budget = 75 -%}
+{%- endif -%}
+{%- set has_tools = tools is defined and tools is not none and tools | length > 0 -%}
+{%- set keep = has_tools -%}
+{%- set ns = namespace(last_user=-1, schemas='') -%}
+{%- if has_tools -%}{%- for t in tools -%}{%- set ns.schemas = ns.schemas ~ (t | tojson) ~ ('' if loop.last else '\n') -%}{%- endfor -%}{%- endif -%}
+{%- for m in messages -%}{%- if m.role == 'user' -%}{%- set ns.last_user = loop.index0 -%}{%- endif -%}{%- endfor -%}
+{%- macro text(c) -%}
+{%- if c is string -%}{{ c }}{%- elif c is iterable -%}
+{%- for p in c if p.type in ['text', 'image'] -%}{%- if not loop.first -%}{{ '\n\n' }}{%- endif -%}{{ p.text if p.type == 'text' else '<｜deepseek_image｜>' }}{%- endfor -%}
+{%- endif -%}
+{%- endmacro -%}
+{%- macro tools_block() -%}
+## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a "<｜DSML｜ calls>" block like the following:
+
+<｜DSML｜ calls>
+<｜DSML｜ invoke name="$TOOL_NAME">
+<｜DSML｜ parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜ parameter>
+...
+</｜DSML｜ invoke>
+<｜DSML｜ invoke name="$TOOL_NAME2">
+...
+</｜DSML｜ invoke>
+</｜DSML｜ calls>
+
+String parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.
+
+If thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.
+
+Otherwise, output directly after </think> with tool calls or final response.
+
+### Available Tool Schemas
+
+{{ ns.schemas }}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+{% endmacro -%}
+{{- '<｜begin▁of▁sentence｜>' -}}
+{%- set effort_line = ('Reasoning Effort: ' ~ budget ~ ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n') if thinking else '' -%}
+{%- if messages and messages[0].role == 'system' -%}
+{{- '<｜System｜>' ~ effort_line ~ text(messages[0].content) -}}
+{%- if has_tools -%}{{- '\n\n' ~ tools_block() -}}{%- endif -%}
+{%- elif has_tools -%}
+{{- '<｜System｜>' ~ effort_line ~ '\n\n' ~ tools_block() -}}
+{%- elif thinking -%}
+{{- '<｜System｜>' ~ effort_line -}}
+{%- endif -%}
+{%- for m in messages -%}
+{%- set i = loop.index0 -%}
+{%- set prev = messages[i - 1].role if i > 0 else '' -%}
+{%- set next = messages[i + 1].role if i + 1 < messages | length else '' -%}
+{%- if m.role == 'system' and i == 0 -%}
+{%- elif m.role in ['user', 'tool', 'system'] -%}
+{%- if prev in ['user', 'tool'] or (prev == 'system' and i - 1 > 0) -%}{{- '\n\n' -}}{%- else -%}{{- '<｜User｜>' -}}{%- endif -%}
+{%- if m.role == 'tool' -%}{{- '<tool_result>' ~ text(m.content) ~ '</tool_result>' -}}{%- else -%}{{- text(m.content) -}}{%- endif -%}
+{%- if next not in ['user', 'tool', 'system'] -%}
+{%- if thinking and (keep or i >= ns.last_user) -%}{{- '<｜Assistant｜><think>' -}}{%- else -%}{{- '<｜Assistant｜></think>' -}}{%- endif -%}
+{%- endif -%}
+{%- elif m.role == 'assistant' -%}
+{%- if thinking and (keep or i > ns.last_user) -%}{{- (m.reasoning_content or '') ~ '</think>' -}}{%- endif -%}
+{{- text(m.content) -}}
+{%- if m.tool_calls -%}
+{{- '\n\n<｜DSML｜ calls>\n' -}}
+{%- for c in m.tool_calls -%}
+{%- set f = c.function if c.function is defined else c -%}
+{{- '<｜DSML｜ invoke name="' ~ f.name ~ '">\n' -}}
+{%- for k, v in (f.arguments or {}).items() -%}
+{{- '<｜DSML｜ parameter name="' ~ k ~ '" string="' ~ ('true' if v is string else 'false') ~ '">' ~ (v if v is string else v | tojson) ~ '</｜DSML｜ parameter>' -}}
+{%- if not loop.last -%}{{- '\n' -}}{%- endif -%}
+{%- endfor -%}
+{{- '\n</｜DSML｜ invoke>' -}}{%- if not loop.last -%}{{- '\n' -}}{%- endif -%}
+{%- endfor -%}
+{{- '\n</｜DSML｜ calls>' -}}
+{%- endif -%}
+{{- '<｜end▁of▁sentence｜>' -}}
+{%- endif -%}
+{%- endfor -%}
