@@ -1926,6 +1926,25 @@ __global__ void __launch_bounds__(256) mv_q6_p100_kernel(const STRATA_GRID_CONST
     }
 }
 #endif
+// moe_gate_up on cc 6.0 stages the layer input in shared memory (STRATA_GLM_GU_STAGE=0: it reads it from global)
+bool sm60_gu_stage() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static int cache[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    if (cache[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const char* v = getenv("STRATA_GLM_GU_STAGE");
+        cache[dev] = major == 6 && minor == 0 && (v == nullptr || std::atoi(v) != 0) ? 1 : 2;
+    }
+    return cache[dev] == 1;
+#endif
+}
 int p100_mv_mode() {
 #if defined(STRATA_USE_HIP)
     return 0;
@@ -4066,9 +4085,22 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if (ptr == 0ull) return;
     __shared__ float sg[GU_ROWS], su[GU_ROWS];
     __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+    const block_q8_1* xg = xq;
 #if GLMF_SM60
     __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TG> ? sm60_sign_n<TG> * sm60_sign_w<TG> : 1];
     if constexpr (sm60_sign_on<TG>) sm60_load_signs<TG>(s_sg);
+    // the layer input staged in shared memory when the launch gives it the room (moe_gate_up on cc 6.0: every block
+    // reads the same 4.6 KB, the calls' activation loads then hit shared memory - IQ2_S 274 -> 256 us on a PH402 die)
+    {
+        extern __shared__ int s_gx[];
+        uint32_t dyn;
+        asm("mov.u32 %0, %%dynamic_smem_size;" : "=r"(dyn));
+        const int nxw = (n_embd / 32) * (int) (sizeof(block_q8_1) / 4);
+        if (dyn >= (uint32_t) nxw * 4u) {
+            for (int i = threadIdx.x; i < nxw; i += blockDim.x) s_gx[i] = ((const int*) xq)[i];
+            xg = (const block_q8_1*) s_gx;
+        }
+    }
 #endif
 #if defined(STRATA_USE_HIP)
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TG> : 1];
@@ -4098,9 +4130,9 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     } else
 #endif
 #if GLMF_SM60
-    if constexpr (sm60_sign_on<TG>) rows_dot<TG, 2 * RPW, true>(rows, xq, n_embd, lane, tab, s, s_sg); else
+    if constexpr (sm60_sign_on<TG>) rows_dot<TG, 2 * RPW, true>(rows, xg, n_embd, lane, tab, s, s_sg); else
 #endif
-    rows_dot<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s);
+    rows_dot<TG, 2 * RPW>(rows, xg, n_embd, lane, tab, s);
     if (lane == 0) {
 #pragma unroll
         for (int j = 0; j < RPW; ++j) {
@@ -5609,10 +5641,12 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     const auto* SD = (const uint8_t*) sh_down;
     const auto* SH = (const block_q8_1*) sh_hq;
     const int kk = sh ? k : k + 1;   // no shared expert: no block has blockIdx.y == kk
+    // cc 6.0: the room to stage the layer input in shared memory (moe_gate_up_kernel takes it when given)
+    const size_t gx = sm60_gu_stage() && n_embd <= 4 * 4096 ? (size_t) (n_embd / 32) * sizeof(block_q8_1) : 0;
     switch (gu_type) {
 #define GLMF_GU(T) \
-        case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, 0, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
-                                                                     n_ff_sh, sh_out); break;
+        case T: moe_gate_up_kernel<T><<<grid, GU_WARPS * 32, gx, s>>>(d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, \
+                                                                      n_ff_sh, sh_out); break;
         GLMF_GU(16) GLMF_GU(18) GLMF_GU(19) GLMF_GU(23) GLMF_GU(10) GLMF_GU(11) GLMF_GU(17) GLMF_GU(22) GLMF_GU(21) GLMF_GU(29)
         GLMF_GU(12) GLMF_GU(13) GLMF_GU(14) GLMF_GU(8)
 #undef GLMF_GU
