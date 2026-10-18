@@ -265,6 +265,7 @@ struct Options {
     /// the exactness test); `spec_corrupt` N > 0 replaces every Nth draft with a wrong token.
     int spec = 0;
     std::string spec_oracle;
+    std::string spec_follow, spec_follow_save;   // --glm-pack: STRATA_GLM_SPEC_FOLLOW / _SAVE (glm_pack_generate)
     int spec_corrupt = 0;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
@@ -342,6 +343,12 @@ void usage() {
                  "                       least one draft, up to 4 while the confidences' product stays at 0.9 -\n"
                  "                       MAYA_GLM_DFLASH_MIN / _CUM).  The model's\n"
                  "                       MTP block is not loaded with it.  Env: MAYA_GLM_DFLASH\n"
+                 "  --spec-follow PATH   (--glm-pack) speed A/B: every request decodes this continuation (token ids,\n"
+                 "                       as --tokens-file takes them) instead of its own picks and ends with it; the\n"
+                 "                       drafting decodes keep exactly the drafts that match it, so two builds or\n"
+                 "                       settings process the same text.  Env: MAYA_GLM_SPEC_FOLLOW\n"
+                 "  --spec-follow-save PATH  (--glm-pack) write each request's decoded token ids there (for the above).\n"
+                 "                       Env: MAYA_GLM_SPEC_FOLLOW_SAVE\n"
                  "  --expert-cache auto|N  (--glm-pack) the expert pool in VRAM: auto (the default) takes the free\n"
                  "                       VRAM less the reserve and checks it again once written; N caps the first\n"
                  "                       GPU's at N of its largest experts.  Env: MAYA_GLM_EXPERT_CACHE\n"
@@ -1010,6 +1017,9 @@ static int glm_pack_generate(const Options& o) {
     if (!o.prefill_arg.empty()) set_env("STRATA_GLM_PREFILL", o.prefill_arg.c_str());
     // the DFlash2 drafter (--dflash, else STRATA_GLM_DFLASH): loaded with the model, on the device of its head
     if (!o.dflash.empty()) set_env("STRATA_GLM_DFLASH", o.dflash.c_str());
+    // --spec-follow / --spec-follow-save (else STRATA_GLM_SPEC_FOLLOW / _SAVE): read below, once the vocabulary is known
+    if (!o.spec_follow.empty()) set_env("STRATA_GLM_SPEC_FOLLOW", o.spec_follow.c_str());
+    if (!o.spec_follow_save.empty()) set_env("STRATA_GLM_SPEC_FOLLOW_SAVE", o.spec_follow_save.c_str());
     // the expert profile (Strata's profile.bin: setup passes data/expert-profile-glm.bin) and the routing trace
     // (--dump-routing: tools/make_profile.py's input), before the load reads the one and the first prompt the other
     if (!o.expert_profile.empty()) model.set_expert_profile(o.expert_profile);
@@ -1850,6 +1860,31 @@ static int glm_pack_generate(const Options& o) {
             }
         }
     };
+    // STRATA_GLM_SPEC_FOLLOW=<file> (--spec-follow): every request decodes this continuation instead of its own picks
+    // and ends with it (Glm5Model::set_follow) - a speed A/B on one text.  STRATA_GLM_SPEC_FOLLOW_SAVE=<file>
+    // (--spec-follow-save): each request's decoded ids are written there, the next run's continuation.  A text made by
+    // another model, or by the same model with other settings, favours the drafts that made it: compare a change on
+    // the same model and its own text.
+    std::vector<int32_t> follow_ids;
+    const char* follow_save = getenv("STRATA_GLM_SPEC_FOLLOW_SAVE");
+    if (follow_save != nullptr && follow_save[0] == '\0') follow_save = nullptr;
+    if (const char* fp = getenv("STRATA_GLM_SPEC_FOLLOW"); fp != nullptr && fp[0] != '\0') {
+        std::ifstream input(fp);
+        std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        std::vector<int64_t> v;
+        std::string e;
+        if (!input && !input.eof()) e = "cannot read it";
+        else if (!parse_i64_list(text.c_str(), v, e)) e = "not a list of token ids: " + e;
+        for (const int64_t t : v)
+            if (e.empty() && t >= n_vocab) e = "token " + std::to_string(t) + " is past the vocabulary";
+        if (!e.empty()) {
+            std::fprintf(stderr, "maya generate: MAYA_GLM_SPEC_FOLLOW %s: %s\n", fp, e.c_str());
+            return 2;
+        }
+        follow_ids.assign(v.begin(), v.end());
+        std::fprintf(stderr, "glm follow: every request decodes the %zu tokens of %s (MAYA_GLM_SPEC_FOLLOW)\n",
+                     follow_ids.size(), fp);
+    }
     const auto run_request = [&](const std::vector<int64_t>& ids, int64_t max_new,
                                  const strata::kernels::SamplerParams& rq_in) -> int {
         strata::kernels::SamplerParams sp = rq_in;   // per request (the server sends sampling keys per GEN)
@@ -1857,6 +1892,8 @@ static int glm_pack_generate(const Options& o) {
         pause_req.store(false);
         pause_keep.store(false);
         model.force_next(-1);
+        model.set_follow(follow_ids);   // STRATA_GLM_SPEC_FOLLOW: this request's tokens (empty: its own picks)
+        if (!follow_ids.empty()) max_new = std::min<int64_t>(max_new, (int64_t) follow_ids.size());
         bool in_think = req_think_budget > 0 && req_think_end >= 0;
         std::vector<int32_t> prompt;
         prompt.reserve(ids.size());
@@ -2095,6 +2132,9 @@ static int glm_pack_generate(const Options& o) {
                              (unsigned long long) (model.spec_hits_ - hits0),
                              (unsigned long long) (model.spec_steps_ - spec0),
                              100.0 * (double) (model.spec_hits_ - hits0) / (double) (model.spec_steps_ - spec0));
+            if (!follow_ids.empty())
+                std::fprintf(stderr, "glm follow: %zu tokens of the continuation decoded, %zu of them differ from the "
+                                     "model's own pick\n", model.follow_used(), model.follow_differ());
             if (model.kv_resident() > 0) {
                 // KV streaming, cumulative over the process: the blocks the decode's selections named, and those
                 // read from RAM (every part summed)
@@ -2105,6 +2145,23 @@ static int glm_pack_generate(const Options& o) {
                              (double) kv.misses * kv.block_bytes / 1048576.0,
                              kv.overflow ? " - OVERFLOW (too few resident positions)" : "");
             }
+        }
+        model.set_follow({});
+        // STRATA_GLM_SPEC_FOLLOW_SAVE: this request's decoded ids, the continuation another run can follow
+        if (follow_save != nullptr && !emitted.empty()) {
+            const std::string tmp = std::string(follow_save) + ".tmp";
+            {
+                std::ofstream f(tmp, std::ios::trunc);
+                for (size_t i = 0; i < emitted.size(); ++i) f << (i ? "," : "") << emitted[i];
+                f << "\n";
+            }
+            std::error_code ec;
+            std::filesystem::rename(tmp, follow_save, ec);
+            if (ec)
+                std::fprintf(stderr, "glm follow: could not write %s: %s\n", follow_save, ec.message().c_str());
+            else
+                std::fprintf(stderr, "glm follow: %zu decoded ids written to %s (MAYA_GLM_SPEC_FOLLOW_SAVE)\n",
+                             emitted.size(), follow_save);
         }
         return 0;
     };
@@ -2117,6 +2174,11 @@ static int glm_pack_generate(const Options& o) {
     // request alone decodes through the speculative path (the fastest for one); as soon as a second one comes, both go
     // through the pipelined decode (Glm5Model::multi_issue), each card of the split on a different conversation.
     const bool multi = o.serve && model.fast() && model.seq_count() > 1;
+    if (multi && !follow_ids.empty()) {
+        std::fprintf(stderr, "glm follow: not used with MAYA_GLM_SEQS=%d - one conversation at a time only\n",
+                     model.seq_count());
+        follow_ids.clear();
+    }
     if (multi && model.dflash_ready())
         std::fprintf(stderr, "glm dflash: not used with MAYA_GLM_SEQS=%d - the several-conversation scheduler decodes "
                              "without it (and without the MTP block, which --dflash leaves unloaded)\n",
@@ -3618,6 +3680,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
+        else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
+        else if (a == "--spec-follow-save") o.spec_follow_save = next("--spec-follow-save");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));

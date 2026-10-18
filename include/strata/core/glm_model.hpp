@@ -274,10 +274,27 @@ public:
     bool vision_reclaim(std::string& err);
     size_t vision_lend_bytes() const;
     int32_t forced(int32_t sampled) {
-        const int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
+        int32_t t = force_tok_ >= 0 ? force_tok_ : sampled;
         force_tok_ = -1;
+        if (follow_at_ < follow_.size()) {   // --spec-follow: the continuation's token, whatever was picked
+            const int32_t f = follow_[follow_at_++];
+            follow_differ_ += f != t;
+            t = f;
+        }
         return t;
     }
+    /// --spec-follow (STRATA_GLM_SPEC_FOLLOW): the next decoded tokens are `ids`, one a position, instead of the picked
+    /// ones - every decode path takes them through forced(), so the speculative ones keep exactly the drafts that match
+    /// them.  Two builds or settings then decode the same text (the same windows, drafts and routes), which a speed
+    /// A/B needs: a near-tie flip otherwise changes the text and with it the draft acceptance.  Empty: off.
+    void set_follow(std::vector<int32_t> ids) {
+        follow_ = std::move(ids);
+        follow_at_ = 0;
+        follow_differ_ = 0;
+    }
+    /// The continuation's tokens decoded so far, and how many of them differ from the model's own pick.
+    size_t follow_used() const { return follow_at_; }
+    size_t follow_differ() const { return follow_differ_; }
 
 private:
     bool step(int32_t token, std::string& err);   // one token through all layers
@@ -295,6 +312,8 @@ private:
     int64_t pos_ = 0;
     int64_t max_ctx_ = 0;
     bool loaded_ = false;
+    std::vector<int32_t> follow_;                 // set_follow: the continuation; follow_at_ its next token
+    size_t follow_at_ = 0, follow_differ_ = 0;
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
