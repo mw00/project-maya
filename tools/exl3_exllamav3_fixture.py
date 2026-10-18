@@ -11,9 +11,10 @@ checked against what exllamav3 writes, bit for bit, by tests/exl3_test.cu (--exl
 tools/test_exl3_exllamav3.py - not only against each other.
 
 Random tiles (default): for each bitrate and codebook, random 16-bit trellis states packed by exllamav3's own packer
-(pack_trellis), then its unpacker's windows (unpack_trellis: the state of each of a tile's 256 steps) and its
-reconstruct's W' (the decoded matrix in the rotated basis, fp16).  exllamav3's pack(unpack(words)) == words is checked
-first.  The bitrate is given as k2 = 2 K, exllamav3's own unit; codebooks 0 3inst, 1 mcg, 2 mul1 (exl3.hpp).  Each
+(pack_trellis; pack_trellis_frac with KA = k2 / 2 and MASK 0xAAAA for a half-integer K), then its unpacker's windows
+(unpack_trellis(_frac): the state of each of a tile's 256 steps) and its reconstruct's W' (the decoded matrix in the
+rotated basis, fp16).  exllamav3's pack(unpack(words)) == words is checked first.  The bitrate is given as k2 = 2 K,
+exllamav3's own unit (odd k2: the half-integer K 1.5 / 2.5 / 3.5, mul1 only); codebooks 0 3inst, 1 mcg, 2 mul1.  Each
 <out>/exl3_k2_<k2>_cb<cb>.bin is
     "EXH1", int32 k2, ki, nj, cb, words (16 K uint16 a tile)
     int16   trellis [ki][nj][words]       the tiles as a model file stores them (exllamav3's packed int16)
@@ -40,25 +41,33 @@ import exllamav3_ext as ext       # noqa: E402
 
 MAGIC = b"EXH1"
 CODEBOOKS = {0: "3inst", 1: "mcg", 2: "mul1"}
-DEFAULT_SETS = [(2 * K, 2) for K in range(1, 9)] + [(6, 0), (6, 1)]   # K 1..8 mul1; K 3 3inst and mcg
+MASK = 0xAAAA                     # the one half-integer pattern exllamav3 instantiates: odd steps carry the extra bit
+DEFAULT_SETS = ([(2 * K, 2) for K in range(1, 9)] + [(6, 0), (6, 1)]   # K 1..8 mul1; K 3 3inst and mcg
+                + [(3, 2), (5, 2), (7, 2)])                            # K 1.5 / 2.5 / 3.5 (mul1 only)
 
 
 def bitrate_ok(k2: int, cb: int) -> bool:
-    """The bitrates exllamav3 1.6 writes: K 1..8 with any codebook (k2 even)."""
-    return 2 <= k2 <= 16 and k2 % 2 == 0 and cb in CODEBOOKS
+    """The bitrates exllamav3 1.6 writes: K 1..8 with any codebook (k2 even), K 1.5 / 2.5 / 3.5 with mul1."""
+    return (2 <= k2 <= 16 and k2 % 2 == 0 and cb in CODEBOOKS) or (k2 in (3, 5, 7) and cb == 2)
 
 
 def pack(idx: torch.Tensor, k2: int) -> torch.Tensor:
     ki, nj, _ = idx.shape
     packed = torch.zeros((ki, nj, 8 * k2), dtype=torch.int16, device=idx.device)
-    ext.pack_trellis(packed, idx.contiguous(), k2 // 2)
+    if k2 % 2:
+        ext.pack_trellis_frac(packed, idx.contiguous(), k2 // 2, MASK)
+    else:
+        ext.pack_trellis(packed, idx.contiguous(), k2 // 2)
     return packed
 
 
 def unpack(packed: torch.Tensor, k2: int) -> torch.Tensor:
     ki, nj, _ = packed.shape
     st = torch.zeros((ki, nj, 256), dtype=torch.int16, device=packed.device)
-    ext.unpack_trellis(st, packed.contiguous(), k2 // 2)
+    if k2 % 2:
+        ext.unpack_trellis_frac(st, packed.contiguous(), k2 // 2, MASK)
+    else:
+        ext.unpack_trellis(st, packed.contiguous(), k2 // 2)
     return st
 
 
@@ -146,7 +155,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--out", required=True, help="the fixture directory (made if missing)")
     ap.add_argument("--set", nargs="*", default=None, metavar="K2:CB",
-                    help="random-tile sets, k2 = 2 K and the codebook (default: K 1..8 mul1, K 3 3inst and mcg)")
+                    help="random-tile sets, k2 = 2 K and the codebook (default: K 1..8 mul1, K 3 3inst and mcg, "
+                         "K 1.5 / 2.5 / 3.5 mul1)")
     ap.add_argument("--seed", type=int, default=20261018)
     ap.add_argument("--ki", type=int, default=2, help="tile rows (16 inputs each)")
     ap.add_argument("--nj", type=int, default=8, help="tile columns (16 outputs each; a multiple of 8)")

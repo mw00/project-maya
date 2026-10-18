@@ -24,10 +24,14 @@ float exl3_decode(uint32_t state, int cb) {
     return f32_from_f16(f16_from_f32(f32_from_f16((uint16_t) (x & 0xffffu)) + f32_from_f16((uint16_t) (x >> 16))));
 }
 
-void exl3_tile_states(const uint32_t* t, int K, uint16_t* st) {
-    const int W = 8 * K;
+bool exl3_k2_valid(int k2, int cb) {
+    return (k2 >= 2 && k2 <= 16 && (k2 & 1) == 0 && cb >= 0 && cb <= 2) || ((k2 == 3 || k2 == 5 || k2 == 7) && cb == 2);
+}
+
+void exl3_tile_states_k2(const uint32_t* t, int k2, uint16_t* st) {
+    const int W = 4 * k2;
     for (int p = 0; p < 256; ++p) {
-        const int b1 = (p + 1 + 256) * K;   // one ring on: the window's first bit is never below 0
+        const int b1 = ((p + 1) * k2) / 2 + 128 * k2;   // one ring on: the window's first bit is never below 0
         const int i1 = (b1 - 1) >> 5, i0 = (b1 - 16) >> 5;
         const int sh = ((i1 + 1) << 5) - b1;
         const uint64_t m = ((uint64_t) t[i0 % W] << 32) | (uint64_t) t[i1 % W];
@@ -35,12 +39,12 @@ void exl3_tile_states(const uint32_t* t, int K, uint16_t* st) {
     }
 }
 
-void exl3_inner(const uint32_t* trellis, int ld, int k, int n, int K, int cb, float* w) {
-    const int W = 8 * K;
+void exl3_inner_k2(const uint32_t* trellis, int ld, int k, int n, int k2, int cb, float* w) {
+    const int W = 4 * k2;
     uint16_t st[256];
     for (int ks = 0; ks < k / 16; ++ks)
         for (int tc = 0; tc < n / 16; ++tc) {
-            exl3_tile_states(trellis + ((size_t) ks * ld + tc) * W, K, st);
+            exl3_tile_states_k2(trellis + ((size_t) ks * ld + tc) * W, k2, st);
             for (int p = 0; p < 256; ++p) {
                 const int lane = p >> 3, j = p & 7;
                 const int r = ks * 16 + (lane & 3) * 2 + (j & 1) + 8 * ((j >> 1) & 1);

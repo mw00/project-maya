@@ -442,7 +442,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
         m.svh = (const uint16_t*) (blob + L.lay->svh[r]);
         m.k = r < 2 ? E : nff;
         m.n = r < 2 ? nff : E;
-        m.K = L.lay->K[r];
+        m.k2 = L.lay->k2[r];
         m.cb = L.lay->cb;
         return m;
     };
@@ -2853,7 +2853,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 p.svh = (const uint16_t*) (blob + Ly.xl.svh[m]);
                 p.k = m < 2 ? E : nff;
                 p.n = m < 2 ? nff : E;
-                p.K = Ly.xl.K[m];
+                p.k2 = Ly.xl.k2[m];
                 return p;
             };
             // (jobs of an expert's rows: one a row and band were ~175K claims of one counter a layer)

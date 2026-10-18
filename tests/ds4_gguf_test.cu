@@ -639,7 +639,7 @@ void test_mv_q(int type, cudaStream_t s) {
         uint8_t* dw = dev(wq);
         x3::Mat m;
         m.fmt = gg::kFmtGG;
-        m.K = type;
+        m.gg_type = type;
         m.raw = dw;
         m.k = k;
         m.n = n;
@@ -685,15 +685,15 @@ QExperts make_q(int D, int F, int n_exp, int tg, int td) {
     size_t off = 0;
     for (int r = 0; r < 3; ++r) {
         E.lay.trellis[r] = off;
-        E.lay.K[r] = r < 2 ? tg : td;
-        off += ((r < 2 ? F : D) * gg::type_row_bytes(E.lay.K[r], r < 2 ? D : F) + 255) / 256 * 256;
+        E.lay.gg_type[r] = r < 2 ? tg : td;
+        off += ((r < 2 ? F : D) * gg::type_row_bytes(E.lay.gg_type[r], r < 2 ? D : F) + 255) / 256 * 256;
     }
     E.lay.fmt = gg::kFmtMXFP4;
     E.blob = off;
     E.host.assign(E.blob * n_exp, 0);
     for (int e = 0; e < n_exp; ++e)
         for (int r = 0; r < 3; ++r) {
-            const std::vector<uint8_t> m = q_rand(E.lay.K[r], r < 2 ? F : D, r < 2 ? D : F);
+            const std::vector<uint8_t> m = q_rand(E.lay.gg_type[r], r < 2 ? F : D, r < 2 ? D : F);
             std::memcpy(E.host.data() + e * E.blob + E.lay.trellis[r], m.data(), m.size());
         }
     E.dev = dev(E.host);

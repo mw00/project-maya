@@ -1,6 +1,7 @@
 """tools/exl3_pack.py's EXL3 decoder (the --check reference) against exllamav3 itself: the fixtures in
 data/exl3-exllamav3 (tools/exl3_exllamav3_fixture.py) hold random tiles packed by exllamav3's packer, the state of each
-step as its unpacker reads it and W' as its reconstruct decodes it - every state and every weight must be the same bits.
+step as its unpacker reads it and W' as its reconstruct decodes it - every state and every weight must be the same bits,
+exllamav3 1.6's half-integer K (1.5 / 2.5 / 3.5) included.  Also the packer's bitrate rules for exl3.txt.
 Run: .venv/bin/python -m unittest discover -s tools -p test_exl3_exllamav3.py"""
 from pathlib import Path
 import struct
@@ -36,7 +37,7 @@ def read_fixture(path: Path) -> dict:
 def decode_w_hat(f: dict) -> np.ndarray:
     """W' [16 ki][16 nj] as FP16 bits through exl3_pack's decoder, its tile layout included."""
     ki, nj = f["ki"], f["nj"]
-    st = exl3_pack.exl3_states(np.ascontiguousarray(f["trellis"]).view(np.uint32), f["k2"] // 2)
+    st = exl3_pack.exl3_states(np.ascontiguousarray(f["trellis"]).view(np.uint32), f["k2"])
     vals = exl3_pack.exl3_values(st, f["cb"])
     tile = np.empty(vals.shape, dtype=np.float32)
     tile[..., exl3_pack._ROW * 16 + exl3_pack._COL] = vals
@@ -54,7 +55,7 @@ class Exllamav3FixtureTests(unittest.TestCase):
         for path in self.fixtures():
             f = read_fixture(path)
             with self.subTest(fixture=path.name):
-                got = exl3_pack.exl3_states(np.ascontiguousarray(f["trellis"]).view(np.uint32), f["k2"] // 2)
+                got = exl3_pack.exl3_states(np.ascontiguousarray(f["trellis"]).view(np.uint32), f["k2"])
                 diff = int(np.count_nonzero(got.astype(np.uint16) != f["states"]))
                 self.assertEqual(diff, 0, "%d of %d states differ from exllamav3's unpack_trellis" % (diff, got.size))
 
@@ -68,8 +69,27 @@ class Exllamav3FixtureTests(unittest.TestCase):
 
     def test_every_bitrate_and_codebook_covered(self):
         have = {(read_fixture(p)["k2"], read_fixture(p)["cb"]) for p in self.fixtures()}
-        want = {(2 * K, 2) for K in range(1, 9)} | {(6, 0), (6, 1)}
+        want = {(2 * K, 2) for K in range(1, 9)} | {(6, 0), (6, 1)} | {(3, 2), (5, 2), (7, 2)}
         self.assertTrue(want <= have, "fixtures missing for (k2, cb) %s" % sorted(want - have))
+
+
+class PackBitrateTests(unittest.TestCase):
+    """exl3_pack's words a tile -> k2, and exl3.txt's bits field (what the engine's exl3_k2_field reads back)."""
+
+    def test_integer_and_half_integer_widths(self):
+        for K in range(1, 9):
+            self.assertEqual(exl3_pack.tile_k2(16 * K, 0, "x"), 2 * K)
+            self.assertEqual(exl3_pack.k_text(2 * K), str(K))
+        for words, k2, text in ((24, 3, "1.5"), (40, 5, "2.5"), (56, 7, "3.5")):
+            self.assertEqual(exl3_pack.tile_k2(words, 2, "x"), k2)
+            self.assertEqual(exl3_pack.k_text(k2), text)
+
+    def test_refused_widths(self):
+        with self.assertRaisesRegex(SystemExit, "mul1"):
+            exl3_pack.tile_k2(56, 1, "a mcg K 3.5")   # exllamav3 writes a half-integer K with mul1 only
+        for words in (8, 20, 72, 144):
+            with self.assertRaisesRegex(SystemExit, "no EXL3 bitrate"):
+                exl3_pack.tile_k2(words, 2, "x")
 
 
 if __name__ == "__main__":

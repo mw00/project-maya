@@ -792,7 +792,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                     Ly.xl.trellis[r] = base;
                     Ly.xl.suh[r] = base + nl.x_piece(r, 0);
                     Ly.xl.svh[r] = base + nl.x_piece(r, 0) + nl.x_piece(r, 1);
-                    Ly.xl.K[r] = nl.x_K[r];
+                    Ly.xl.k2[r] = nl.x_k2[r];
                 }
             } else {
                 Ly.gu_type = nl.fmt.gu_type;
@@ -1947,7 +1947,7 @@ strata::kernels::cpu::Exl3Part x3_part(const uint8_t* blob, const strata::kernel
     p.svh = (const uint16_t*) (blob + xl.svh[r]);
     p.k = r < 2 ? E : FF;
     p.n = r < 2 ? FF : E;
-    p.K = xl.K[r];
+    p.k2 = xl.k2[r];
     return p;
 }
 
@@ -3080,7 +3080,7 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
         const auto ref_mv = [&](int r, const float* in, float* o) {
             const int k = r < 2 ? E : FFE, n = r < 2 ? FFE : E;
             std::vector<float> wt((size_t) k * n);
-            kc::exl3_inner((const uint32_t*) (cal + Ly.xl.trellis[r]), n / 16, k, n, Ly.xl.K[r], Ly.xl.cb, wt.data());
+            kc::exl3_inner_k2((const uint32_t*) (cal + Ly.xl.trellis[r]), n / 16, k, n, Ly.xl.k2[r], Ly.xl.cb, wt.data());
             kc::exl3_mv(wt.data(), (const uint16_t*) (cal + Ly.xl.suh[r]), (const uint16_t*) (cal + Ly.xl.svh[r]), k, n,
                         in, o);
         };
@@ -3100,9 +3100,9 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             ec += (double) (oc[(size_t) r] - orf[(size_t) r]) * (oc[(size_t) r] - orf[(size_t) r]);
             egc += (double) (og[(size_t) r] - oc[(size_t) r]) * (og[(size_t) r] - oc[(size_t) r]);
         }
-        std::fprintf(stderr, "glm fast: CPU lane check (layer %d, EXL3 K %d/%d/%d): relative L2 error vs the reference: "
-                             "device %.5f, CPU lane %.5f; device vs CPU lane %.5f\n", il_cal, Ly.xl.K[0], Ly.xl.K[1],
-                     Ly.xl.K[2], std::sqrt(eg / nr), std::sqrt(ec / nr), std::sqrt(egc / nr));
+        std::fprintf(stderr, "glm fast: CPU lane check (layer %d, EXL3 K %g/%g/%g): relative L2 error vs the reference: "
+                             "device %.5f, CPU lane %.5f; device vs CPU lane %.5f\n", il_cal, Ly.xl.k2[0] / 2.0,
+                     Ly.xl.k2[1] / 2.0, Ly.xl.k2[2] / 2.0, std::sqrt(eg / nr), std::sqrt(ec / nr), std::sqrt(egc / nr));
         cudaFree(dx);
         cudaFree(dout);
     } else if (getenv("STRATA_GLM_CPU_LANE_CHECK") != nullptr) {

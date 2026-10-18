@@ -1075,7 +1075,7 @@ size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, 
     if (m.ld > 0) return (size_t) m.ld;
     return m.fmt == kFmtMXFP4 ? mx_row_bytes(m.k)
            : m.fmt == kFmtQ8_0 ? q8_row_bytes(m.k)
-           : m.fmt == kFmtGG   ? type_row_bytes(m.K, m.k)
+           : m.fmt == kFmtGG   ? type_row_bytes(m.gg_type, m.k)
                                : (size_t) m.k;
 }
 // a layer's low-bit experts as ds4_iq's arguments (false: its types not covered - printed)
@@ -1144,8 +1144,9 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         if (m.fmt == kFmtGG) {   // the activations rounded to int8 (job i's rows of the scratch), then ds4_iq's GEMV
             Scratch* sc = scratch(s);
             if (sc == nullptr || m.raw == nullptr || q.xf == nullptr || q.y == nullptr || q.ncol < 1 ||
-                q.ncol > x3::kMaxMvCols || m.k > kMaxQK || type_row_bytes(m.K, m.k) == 0) {
-                std::fprintf(stderr, "ds4 gguf mv: job %d unsupported (type %s k %d n %d)\n", i, type_name(m.K), m.k, m.n);
+                q.ncol > x3::kMaxMvCols || m.k > kMaxQK || type_row_bytes(m.gg_type, m.k) == 0) {
+                std::fprintf(stderr, "ds4 gguf mv: job %d unsupported (type %s k %d n %d)\n", i, type_name(m.gg_type), m.k,
+                             m.n);
                 g_errors.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
@@ -1156,7 +1157,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
-            b.type = m.K;
+            b.type = m.gg_type;
             b.k = m.k;
             b.n = m.n;
             b.ncol = q.ncol;

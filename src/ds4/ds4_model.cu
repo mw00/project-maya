@@ -1494,7 +1494,7 @@ struct Model::Impl {
         }
         m.k = (int) tr->shape[0] * 16;
         m.n = (int) tr->shape[1] * 16;
-        m.K = (int) tr->shape[2] / 16;
+        m.k2 = (int) tr->shape[2] / 8;
         m.cb = 2;
         m.ld = 0;
         if (np > 1) {
@@ -1552,8 +1552,8 @@ struct Model::Impl {
         m.suh = ds;
         m.svh = dv;
         if (!x3::supported(m)) {
-            err = pre + ": k " + std::to_string(m.k) + " n " + std::to_string(m.n) + " K " + std::to_string(m.K) +
-                  " not covered by the EXL3 kernels";
+            err = pre + ": k " + std::to_string(m.k) + " n " + std::to_string(m.n) + " K " + std::to_string(m.k2 / 2) +
+                  (m.k2 & 1 ? ".5" : "") + " not covered by the EXL3 kernels";
             return false;
         }
         return true;
@@ -1643,7 +1643,8 @@ struct Model::Impl {
     // ---- expert regions and blob layout
     // a GGUF's MXFP4 experts: the blob is gate | up | down ([out][in / 32] blocks each, as the file holds them), every
     // expert's matrix r at the same stride from expert 0's in one file (the GGUF's [n_exp][out][in] tensor)
-    // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.K[r] is role r's ggml type)
+    // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.gg_type[r] is role r's ggml
+    // type)
     static int gg_type_of(const std::string& dtype) {
         for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 21, 22, 23})
             if (dtype == gg::type_name(t)) return t;
@@ -1677,15 +1678,16 @@ struct Model::Impl {
             }
             l.lay.trellis[r] = off;
             l.lay.suh[r] = l.lay.svh[r] = off;
-            l.lay.K[r] = ty;
+            l.lay.gg_type[r] = ty;
             off += align256(bytes);
         }
         l.lay.fmt = gg::kFmtMXFP4;
         if (!gg::mx_experts(l.lay) && (gg::expert_type(l.lay, 0) != gg::expert_type(l.lay, 1) ||
                                        gg::expert_type(l.lay, 0) == gg::kTypeMXFP4 ||
                                        gg::expert_type(l.lay, 2) == gg::kTypeMXFP4)) {
-            err = P + ": gate / up / down of types " + gg::type_name(l.lay.K[0]) + " / " + gg::type_name(l.lay.K[1]) +
-                  " / " + gg::type_name(l.lay.K[2]) + " (gate and up must match; MXFP4 does not mix with the others)";
+            err = P + ": gate / up / down of types " + gg::type_name(l.lay.gg_type[0]) + " / " +
+                  gg::type_name(l.lay.gg_type[1]) + " / " + gg::type_name(l.lay.gg_type[2]) +
+                  " (gate and up must match; MXFP4 does not mix with the others)";
             return false;
         }
         l.blob = off;
@@ -1779,7 +1781,12 @@ struct Model::Impl {
                 err = P + "0." + parts[r] + ": not an EXL3 (mul1) matrix";
                 return false;
             }
-            l.lay.K[r] = (int) tr->shape[2] / 16;
+            if (tr->shape[2] % 8 != 0 || !x3::k2_supported((int) tr->shape[2] / 8, 2)) {
+                err = P + "0." + parts[r] + ": " + std::to_string(tr->shape[2]) +
+                      " int16 a tile - the kernels take K 1..8 and 1.5 / 2.5 / 3.5 (mul1)";
+                return false;
+            }
+            l.lay.k2[r] = (int) tr->shape[2] / 8;
             l.lay.trellis[r] = off;
             off += align256(tr->bytes);
             l.lay.suh[r] = off;
@@ -1839,7 +1846,7 @@ struct Model::Impl {
     // the region of expert e -> its CPU-lane part X (columns [X n / NH, (X + 1) n / NH) of each matrix)
     void repack_part(const Layer& l, const uint8_t* region, int X, uint8_t* dst) const {
         for (int r = 0; r < 3; ++r) {
-            const size_t tile = (size_t) 32 * l.lay.K[r];
+            const size_t tile = (size_t) 16 * l.lay.k2[r];
             const int k = l.hl.k[r], nt = l.hl.n[r] * NH / 16, nth = l.hl.n[r] / 16;
             const uint8_t* tr = region + l.piece_src[r][0];
             for (int sl = 0; sl < k / 16; ++sl)
@@ -2189,7 +2196,8 @@ struct Model::Impl {
                 size_t off = 0;
                 for (int r = 0; r < 3; ++r) {
                     const int k = r < 2 ? g.dim : x.ffn, n = r < 2 ? x.ffn : g.dim;
-                    x.hlay.K[r] = l.lay.K[r];
+                    x.hlay.k2[r] = l.lay.k2[r];
+                    x.hlay.gg_type[r] = l.lay.gg_type[r];
                     x.hlay.trellis[r] = off;
                     if (gguf_x) {   // gate / up rows, down inputs: [n][k / block] blocks
                         const int ty = gg::expert_type(l.lay, r);
@@ -2202,7 +2210,7 @@ struct Model::Impl {
                         off += align256((size_t) n * gg::type_row_bytes(ty, k));
                         continue;
                     }
-                    off += align256(x3::trellis_bytes(k, n, l.lay.K[r]));
+                    off += align256(x3::trellis_bytes_k2(k, n, l.lay.k2[r]));
                     x.hlay.suh[r] = off;
                     off += align256((size_t) k * 2);
                     x.hlay.svh[r] = off;
@@ -2912,13 +2920,13 @@ struct Model::Impl {
                 const Layer& x = member(l, m);
                 const int f0 = x.ff0, fn = x.ffn;
                 for (int r = 0; r < 2; ++r) {
-                    const size_t tile = (size_t) 32 * l.lay.K[r], nt = (size_t) FF / 16, nth = (size_t) fn / 16;
+                    const size_t tile = (size_t) 16 * l.lay.k2[r], nt = (size_t) FF / 16, nth = (size_t) fn / 16;
                     ok = ok && cp2(dst + x.hlay.trellis[r], nth * tile, p + l.hl.trellis[r] + (size_t) (f0 / 16) * tile,
                                    nt * tile, nth * tile, (size_t) D / 16) &&
                          cp(dst + x.hlay.suh[r], p + l.hl.suh[r], (size_t) D * 2) &&
                          cp(dst + x.hlay.svh[r], p + l.hl.svh[r] + (size_t) f0 * 2, (size_t) fn * 2);
                 }
-                const size_t row = (size_t) (D / 16) * 32 * l.lay.K[2];
+                const size_t row = (size_t) (D / 16) * 16 * l.lay.k2[2];
                 ok = ok && cp(dst + x.hlay.trellis[2], p + l.hl.trellis[2] + (size_t) (f0 / 16) * row,
                               (size_t) (fn / 16) * row) &&
                      cp(dst + x.hlay.suh[2], p + l.hl.suh[2] + (size_t) f0 * 2, (size_t) fn * 2) &&
@@ -2926,7 +2934,7 @@ struct Model::Impl {
             }
         } else if (l.nm == 1) {   // the full blob: each matrix's columns from the two parts side by side
             for (int r = 0; r < 3; ++r) {
-                const size_t tile = (size_t) 32 * l.lay.K[r];
+                const size_t tile = (size_t) 16 * l.lay.k2[r];
                 const int k = l.hl.k[r], nh = l.hl.n[r];   // part: k x nh
                 for (int X = 0; X < 2; ++X) {
                     ok = ok && cp2(dst + l.lay.trellis[r] + (size_t) X * (nh / 16) * tile, (size_t) (2 * nh / 16) * tile,
@@ -2941,7 +2949,7 @@ struct Model::Impl {
             const Layer& x = member(l, m);
             const int f0 = x.ff0, fn = x.ffn;
             for (int r = 0; r < 2; ++r) {
-                const size_t tile = (size_t) 32 * l.lay.K[r];
+                const size_t tile = (size_t) 16 * l.lay.k2[r];
                 const int hn = l.hl.n[r];   // part X: columns [X hn, (X + 1) hn)
                 for (int X = 0; X < 2; ++X) {
                     const int a = std::max(f0, X * hn), b = std::min(f0 + fn, (X + 1) * hn);
@@ -2954,7 +2962,7 @@ struct Model::Impl {
                 }
                 ok = ok && cp(dst + x.hlay.suh[r], parts[0] + l.hl.suh[r], (size_t) D * 2);
             }
-            const size_t tile = (size_t) 32 * l.lay.K[2];
+            const size_t tile = (size_t) 16 * l.lay.k2[2];
             const int nh = D / 2;
             for (int X = 0; X < 2; ++X) {
                 ok = ok && cp2(dst + x.hlay.trellis[2] + (size_t) X * (nh / 16) * tile, (size_t) (D / 16) * tile,
@@ -3599,8 +3607,8 @@ struct Model::Impl {
             for (int r = 0; r < 3; ++r) {
                 x3::Mat& m = l.vm[(size_t) e][(size_t) r];
                 m = x3::Mat{};
-                m.K = gg::expert_type(l.lay, r);   // (a low-bit type: its GEMV, ds4_iq's)
-                m.fmt = m.K == gg::kTypeMXFP4 ? gg::kFmtMXFP4 : gg::kFmtGG;
+                m.gg_type = gg::expert_type(l.lay, r);   // (a low-bit type: its GEMV, ds4_iq's)
+                m.fmt = m.gg_type == gg::kTypeMXFP4 ? gg::kFmtMXFP4 : gg::kFmtGG;
                 m.raw = b + l.lay.trellis[r];
                 m.k = r < 2 ? g.dim : g.ff;
                 m.n = r < 2 ? g.ff : g.dim;
@@ -3614,7 +3622,7 @@ struct Model::Impl {
             m.svh = (const uint16_t*) (b + l.lay.svh[r]);
             m.k = r < 2 ? g.dim : g.ff;
             m.n = r < 2 ? g.ff : g.dim;
-            m.K = l.lay.K[r];
+            m.k2 = l.lay.k2[r];
             m.cb = 2;
             m.ld = 0;
         }
@@ -3622,7 +3630,7 @@ struct Model::Impl {
     // an expert's VRAM blob -> its CPU-lane part X, and its NH parts -> the blob (the cache's swaps)
     void blob_to_part(const Layer& l, const uint8_t* blob, int X, uint8_t* dst) const {
         for (int r = 0; r < 3; ++r) {
-            const size_t tile = (size_t) 32 * l.lay.K[r];
+            const size_t tile = (size_t) 16 * l.lay.k2[r];
             const int k = l.hl.k[r], nt = l.hl.n[r] * NH / 16, nth = l.hl.n[r] / 16;
             const uint8_t* tr = blob + l.lay.trellis[r];
             for (int sl = 0; sl < k / 16; ++sl)
@@ -3634,7 +3642,7 @@ struct Model::Impl {
     }
     void parts_to_blob(const Layer& l, const std::array<uint8_t*, 4>& parts, uint8_t* blob) const {
         for (int r = 0; r < 3; ++r) {
-            const size_t tile = (size_t) 32 * l.lay.K[r];
+            const size_t tile = (size_t) 16 * l.lay.k2[r];
             const int k = l.hl.k[r], nt = l.hl.n[r] * NH / 16, nth = l.hl.n[r] / 16;
             uint8_t* tr = blob + l.lay.trellis[r];
             for (int X = 0; X < NH; ++X)
@@ -3654,14 +3662,14 @@ struct Model::Impl {
         const Layer& x = member(l, m);
         const int f0 = x.ff0, fn = x.ffn;
         for (int r = 0; r < 2; ++r) {
-            const size_t tile = (size_t) 32 * l.lay.K[r], nt = (size_t) g.ff / 16, nth = (size_t) fn / 16;
+            const size_t tile = (size_t) 16 * l.lay.k2[r], nt = (size_t) g.ff / 16, nth = (size_t) fn / 16;
             for (size_t sl = 0; sl < (size_t) g.dim / 16; ++sl)
                 std::memcpy(dst + x.hlay.trellis[r] + sl * nth * tile,
                             blob + l.lay.trellis[r] + (sl * nt + (size_t) f0 / 16) * tile, nth * tile);
             std::memcpy(dst + x.hlay.suh[r], blob + l.lay.suh[r], (size_t) g.dim * 2);
             std::memcpy(dst + x.hlay.svh[r], blob + l.lay.svh[r] + (size_t) f0 * 2, (size_t) fn * 2);
         }
-        const size_t row = (size_t) (g.dim / 16) * 32 * l.lay.K[2];
+        const size_t row = (size_t) (g.dim / 16) * 16 * l.lay.k2[2];
         std::memcpy(dst + x.hlay.trellis[2], blob + l.lay.trellis[2] + (size_t) (f0 / 16) * row, (size_t) (fn / 16) * row);
         std::memcpy(dst + x.hlay.suh[2], blob + l.lay.suh[2] + (size_t) f0 * 2, (size_t) fn * 2);
         std::memcpy(dst + x.hlay.svh[2], blob + l.lay.svh[2], (size_t) g.dim * 2);
@@ -3671,14 +3679,14 @@ struct Model::Impl {
         const Layer& x = member(l, m);
         const int f0 = x.ff0, fn = x.ffn;
         for (int r = 0; r < 2; ++r) {
-            const size_t tile = (size_t) 32 * l.lay.K[r], nt = (size_t) g.ff / 16, nth = (size_t) fn / 16;
+            const size_t tile = (size_t) 16 * l.lay.k2[r], nt = (size_t) g.ff / 16, nth = (size_t) fn / 16;
             for (size_t sl = 0; sl < (size_t) g.dim / 16; ++sl)
                 std::memcpy(blob + l.lay.trellis[r] + (sl * nt + (size_t) f0 / 16) * tile,
                             src + x.hlay.trellis[r] + sl * nth * tile, nth * tile);
             if (m == 0) std::memcpy(blob + l.lay.suh[r], src + x.hlay.suh[r], (size_t) g.dim * 2);
             std::memcpy(blob + l.lay.svh[r] + (size_t) f0 * 2, src + x.hlay.svh[r], (size_t) fn * 2);
         }
-        const size_t row = (size_t) (g.dim / 16) * 32 * l.lay.K[2];
+        const size_t row = (size_t) (g.dim / 16) * 16 * l.lay.k2[2];
         std::memcpy(blob + l.lay.trellis[2] + (size_t) (f0 / 16) * row, src + x.hlay.trellis[2], (size_t) (fn / 16) * row);
         std::memcpy(blob + l.lay.suh[2] + (size_t) f0 * 2, src + x.hlay.suh[2], (size_t) fn * 2);
         if (m == 0) std::memcpy(blob + l.lay.svh[2], src + x.hlay.svh[2], (size_t) g.dim * 2);
@@ -3883,7 +3891,7 @@ struct Model::Impl {
                     l.hl.k[r] = k;
                     l.hl.n[r] = n;
                     l.hl.trellis[r] = file_experts ? l.piece_src[r][0] : off;
-                    off += align256((size_t) (k / 16) * (n / 16) * 32 * l.lay.K[r]);
+                    off += align256((size_t) (k / 16) * (n / 16) * 16 * l.lay.k2[r]);
                     l.hl.suh[r] = file_experts ? l.piece_src[r][1] : off;
                     off += align256((size_t) k * 2);
                     l.hl.svh[r] = file_experts ? l.piece_src[r][2] : off;
@@ -5139,7 +5147,7 @@ struct Model::Impl {
             p.svh = (const uint16_t*) (b + l.hl.svh[r]);
             p.k = l.hl.k[r];
             p.n = l.hl.n[r];
-            p.K = l.lay.K[r];
+            p.k2 = l.lay.k2[r];
             return p;
         };
         auto xh = [&](int X, int sl, int r) { return c_xh.data() + ((size_t) (X * kSlots + sl) * 2 + r) * E; };
@@ -5337,7 +5345,7 @@ struct Model::Impl {
                         for (int X = 0; X < NH; ++X) {
                             repack_part(l, reg.data(), X, part.data());
                             for (int r = 0; r < 3; ++r) {
-                                const size_t tb = (size_t) (l.hl.k[r] / 16) * (l.hl.n[r] / 16) * 32 * l.lay.K[r];
+                                const size_t tb = (size_t) (l.hl.k[r] / 16) * (l.hl.n[r] / 16) * 16 * l.lay.k2[r];
                                 ok = ok && std::memcmp(part.data() + l.hl.trellis[r], l.spare_host[(size_t) X] + l.hl.trellis[r], tb) == 0 &&
                                      std::memcmp(part.data() + l.hl.suh[r], l.spare_host[(size_t) X] + l.hl.suh[r], (size_t) l.hl.k[r] * 2) == 0 &&
                                      std::memcmp(part.data() + l.hl.svh[r], l.spare_host[(size_t) X] + l.hl.svh[r], (size_t) l.hl.n[r] * 2) == 0;

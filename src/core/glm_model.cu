@@ -101,29 +101,51 @@ static bool pack_shard_names(const std::string& pack_dir, std::vector<std::strin
 }
 
 // tools/exl3_pack.py's exl3.txt (an EXL3 pack; absent for a GGUF pack): the safetensors files, the EXL3 matrices
-// (index rows of kind x) and every routed expert's nine pieces.  false + empty err: no such file.
+// (index rows of kind x) and every routed expert's nine pieces.  false + empty err: no such file.  Each matrix's and
+// part's bitrate is K bits a weight, written "3", or "3.5" for exllamav3 1.6's half-integer K (1.5 / 2.5 / 3.5, mul1);
+// carried as k2 = 2 K (strata::kernels::exl3::Mat::k2).  An engine from before half-integer K refuses such a line.
 namespace {
 struct Exl3Table {
     std::vector<std::string> files;
     struct Mat {
         int file = 0;
         uint64_t tr = 0, suh = 0, svh = 0;
-        int k = 0, n = 0, K = 0, cb = 2;
+        int k = 0, n = 0, k2 = 0, cb = 2;
+        uint64_t tr_bytes() const { return (uint64_t) k * n * k2 / 16; }
         uint64_t vram() const {   // as load_pack uploads it: each piece 256-aligned
             const auto up = [](uint64_t b) { return (b + 255u) & ~(uint64_t) 255u; };
-            return up((uint64_t) k * n * K / 8) + up(2 * (uint64_t) k) + up(2 * (uint64_t) n);
+            return up(tr_bytes()) + up(2 * (uint64_t) k) + up(2 * (uint64_t) n);
         }
     };
     std::map<std::string, Mat> mats;
     struct Layer {
-        int cb = -1, K[3] = {0, 0, 0}, k[3] = {0, 0, 0}, n[3] = {0, 0, 0};
+        int cb = -1, k2[3] = {0, 0, 0}, k[3] = {0, 0, 0}, n[3] = {0, 0, 0};
         std::vector<int> file;        // [9 e + 3 r + j]
         std::vector<uint64_t> off;
-        uint64_t part(int r) const { return (uint64_t) k[r] * n[r] * K[r] / 8 + 2 * (uint64_t) k[r] + 2 * (uint64_t) n[r]; }
+        uint64_t part(int r) const {
+            return (uint64_t) k[r] * n[r] * k2[r] / 16 + 2 * (uint64_t) k[r] + 2 * (uint64_t) n[r];
+        }
         uint64_t blob() const { return 2 * part(0) + part(2); }
     };
     std::map<int, Layer> layers;
 };
+
+// an exl3.txt bitrate field as k2 = 2 K: "1".."8", or a half "1.5".."7.5" (the kernels take 1.5 / 2.5 / 3.5) - read
+// by hand, so no locale's decimal point gets in the way
+bool exl3_k2_field(const std::string& tok, int& k2) {
+    if (tok.empty() || tok[0] < '1' || tok[0] > '8') return false;
+    const int K = tok[0] - '0';
+    if (tok.size() == 1) {
+        k2 = 2 * K;
+        return true;
+    }
+    if (tok.size() == 3 && tok[1] == '.' && tok[2] == '5' && K < 8) {
+        k2 = 2 * K + 1;
+        return true;
+    }
+    return false;
+}
+std::string exl3_k_name(int k2) { return (k2 & 1) ? std::to_string(k2 / 2) + ".5" : std::to_string(k2 / 2); }
 }  // namespace
 
 static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& err, int n_expert = 0) {
@@ -145,11 +167,16 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
             }
             t.files.push_back(nm);
         } else if (what == "mat") {
-            std::string nm;
+            std::string nm, kt;
             Exl3Table::Mat m;
-            if (!(ss >> nm >> m.file >> m.tr >> m.suh >> m.svh >> m.k >> m.n >> m.K >> m.cb) || m.file < 0 ||
-                m.file >= (int) t.files.size()) {
+            if (!(ss >> nm >> m.file >> m.tr >> m.suh >> m.svh >> m.k >> m.n >> kt >> m.cb) || m.file < 0 ||
+                m.file >= (int) t.files.size() || !exl3_k2_field(kt, m.k2)) {
                 err = "exl3.txt: bad mat line: " + line;
+                return false;
+            }
+            if (!strata::kernels::exl3::k2_supported(m.k2, m.cb)) {
+                err = "exl3.txt: " + nm + ": K " + kt + " with codebook " + std::to_string(m.cb) +
+                      " - the kernels take K 1..8 with any codebook and 1.5 / 2.5 / 3.5 with mul1 (2)";
                 return false;
             }
             t.mats[nm] = m;
@@ -157,10 +184,23 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
             int il = -1;
             Exl3Table::Layer L;
             uint64_t gu = 0, dn = 0;
-            if (!(ss >> il >> L.cb >> L.K[0] >> L.K[1] >> L.K[2] >> L.k[0] >> L.n[0] >> L.k[2] >> L.n[2] >> gu >> dn)) {
+            std::string kt[3];
+            if (!(ss >> il >> L.cb >> kt[0] >> kt[1] >> kt[2] >> L.k[0] >> L.n[0] >> L.k[2] >> L.n[2] >> gu >> dn) ||
+                !exl3_k2_field(kt[0], L.k2[0]) || !exl3_k2_field(kt[1], L.k2[1]) || !exl3_k2_field(kt[2], L.k2[2])) {
                 err = "exl3.txt: bad layer line: " + line;
                 return false;
             }
+            if (L.k2[0] != L.k2[1]) {   // the blob's layout (an expert's up after its gate, down after both) needs them alike
+                err = "exl3.txt: layer " + std::to_string(il) + ": gate K " + kt[0] + " and up K " + kt[1] + " differ";
+                return false;
+            }
+            for (int r = 0; r < 3; ++r)
+                if (!strata::kernels::exl3::k2_supported(L.k2[r], L.cb)) {
+                    err = "exl3.txt: layer " + std::to_string(il) + " " + (r == 0 ? "gate" : r == 1 ? "up" : "down") +
+                          ": K " + kt[r] + " with codebook " + std::to_string(L.cb) +
+                          " - the kernels take K 1..8 with any codebook and 1.5 / 2.5 / 3.5 with mul1 (2)";
+                    return false;
+                }
             L.k[1] = L.k[0];
             L.n[1] = L.n[0];
             if (L.part(0) != gu || L.part(2) != dn) {
@@ -2927,7 +2967,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 nl.fmt.gu_type = nl.fmt.d_type = x3::kTypeEXL3;
                 nl.x_cb = X.cb;
                 for (int r = 0; r < 3; ++r) {
-                    nl.x_K[r] = X.K[r];
+                    nl.x_k2[r] = X.k2[r];
                     nl.x_k[r] = X.k[r];
                     nl.x_n[r] = X.n[r];
                 }
@@ -3050,7 +3090,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         const Exl3Table::Mat& hm = xt.mats.at("output.weight");
         head_c0_ = hm.n / 2 / 128 * 128;
         const uint64_t nc = (uint64_t) (hm.n - head_c0_);
-        bytes += al((uint64_t) hm.k * nc * hm.K / 8) + al(2 * (uint64_t) hm.k) + al(2 * nc) +
+        bytes += al((uint64_t) hm.k * nc * hm.k2 / 16) + al(2 * (uint64_t) hm.k) + al(2 * nc) +
                  al((uint64_t) kPipeSlots * g_.n_embd * 4) + al((uint64_t) kPipeSlots * nc * 4) + al(kPipeSlots * 8) +
                  // a draft's head rows (GlmDflash::split_head)
                  al((uint64_t) kWinMax * g_.n_embd * 4) + al((uint64_t) kWinMax * nc * 4) + al(kHdCandBytes) + al(4);
@@ -3071,7 +3111,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             // the trellis, suh and svh straight from the safetensors mapping, each 256-aligned in the arena
             const Exl3Table::Mat& m = xt.mats.at(r.name);
             const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
-            const uint64_t nb[3] = {(uint64_t) m.k * m.n * m.K / 8, 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
+            const uint64_t nb[3] = {m.tr_bytes(), 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
             const uint64_t src[3] = {m.tr, m.suh, m.svh};
             uint8_t* dst[3] = {nullptr, nullptr, nullptr};
             for (int j = 0; j < 3; ++j) {
@@ -3089,11 +3129,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             M.svh = (const uint16_t*) dst[2];
             M.k = m.k;
             M.n = m.n;
-            M.K = m.K;
+            M.k2 = m.k2;
             M.cb = m.cb;
             if (!x3::supported(M)) {
                 err = "pack: EXL3 " + r.name + " (k " + std::to_string(m.k) + " n " + std::to_string(m.n) + " K " +
-                      std::to_string(m.K) + " cb " + std::to_string(m.cb) + ") is not covered by the kernels";
+                      exl3_k_name(m.k2) + " cb " + std::to_string(m.cb) + ") is not covered by the kernels";
                 return false;
             }
             const x3::Mat& slot = exl3_mats_[r.name] = M;
@@ -3220,7 +3260,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         const Exl3Table::Mat& m = xt.mats.at("output.weight");
         const int c0 = head_c0_, nc = m.n - c0;
         const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
-        const size_t tile_b = (size_t) 32 * m.K, slice_b = (size_t) (m.n / 16) * tile_b, run_b = (size_t) (nc / 16) * tile_b;
+        const size_t tile_b = (size_t) 16 * m.k2, slice_b = (size_t) (m.n / 16) * tile_b, run_b = (size_t) (nc / 16) * tile_b;
         if (m.tr + slice_b * (m.k / 16) > sh.size || m.svh + 2 * (uint64_t) m.n > sh.size) {
             err = "pack: the head lies past the end of its file";
             return false;
@@ -3260,7 +3300,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         M.svh = (const uint16_t*) svh;
         M.k = m.k;
         M.n = nc;
-        M.K = m.K;
+        M.k2 = m.k2;
         M.cb = m.cb;
         const x3::Mat& slot = exl3_mats_["output.weight.hi"] = M;
         ws_map_["output.weight.hi"] = strata::core::WSlot{nullptr, x3::kTypeEXL3, &slot, m.k, nc};
@@ -3665,7 +3705,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     const auto up_x3 = [&](const std::string& n) -> bool {
         const Exl3Table::Mat& m = xt.mats.at(n);
         const Shard& sh = pack_shards_[(size_t) (exl3_shard0_ + m.file)];
-        const uint64_t nb[3] = {(uint64_t) m.k * m.n * m.K / 8, 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
+        const uint64_t nb[3] = {m.tr_bytes(), 2 * (uint64_t) m.k, 2 * (uint64_t) m.n};
         const uint64_t src[3] = {m.tr, m.suh, m.svh};
         uint8_t* dst[3] = {nullptr, nullptr, nullptr};
         for (int j = 0; j < 3; ++j) {
@@ -3683,7 +3723,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         M.svh = (const uint16_t*) dst[2];
         M.k = m.k;
         M.n = m.n;
-        M.K = m.K;
+        M.k2 = m.k2;
         M.cb = m.cb;
         if (!strata::kernels::exl3::supported(M)) { err = "mtp: EXL3 " + n + " is not covered by the kernels"; return false; }
         const strata::kernels::exl3::Mat& slot = exl3_mats_[n] = M;
@@ -3746,7 +3786,7 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         nl.fmt.gu_type = nl.fmt.d_type = strata::kernels::exl3::kTypeEXL3;
         nl.x_cb = X.cb;
         for (int r = 0; r < 3; ++r) {
-            nl.x_K[r] = X.K[r];
+            nl.x_k2[r] = X.k2[r];
             nl.x_k[r] = X.k[r];
             nl.x_n[r] = X.n[r];
         }
@@ -3769,8 +3809,9 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             pack_emb_type_ = (int) te->type;
         }
         mtp_il_ = il;
-        std::fprintf(stderr, "glm mtp: CUDA%d the NextN block (blk.%d) loaded: %.0f MB dense, EXL3 experts K %d/%d/%d\n",
-                     dev_, il, (double) bytes / 1048576.0, X.K[0], X.K[1], X.K[2]);
+        std::fprintf(stderr, "glm mtp: CUDA%d the NextN block (blk.%d) loaded: %.0f MB dense, EXL3 experts K %s/%s/%s\n",
+                     dev_, il, (double) bytes / 1048576.0, exl3_k_name(X.k2[0]).c_str(), exl3_k_name(X.k2[1]).c_str(),
+                     exl3_k_name(X.k2[2]).c_str());
         return true;
     }
     int sg = -1, su = -1, sd = -1;

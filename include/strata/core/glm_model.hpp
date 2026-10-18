@@ -434,11 +434,11 @@ public:
         // EXL3 experts (exl3.txt, x_cb >= 0): expert e's part r (gate, up, down) piece j (trellis, suh, svh) lies at
         // x_off[9 e + 3 r + j] of shard x_shard[...]; the blob is [gate | up | down], a part [trellis | suh | svh]
         int x_cb = -1;
-        int x_K[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};
+        int x_k2[3] = {0, 0, 0}, x_k[3] = {0, 0, 0}, x_n[3] = {0, 0, 0};   // x_k2: each part's bitrate as 2 K
         std::vector<int> x_shard;
         std::vector<uint64_t> x_off;
         size_t x_piece(int r, int j) const {
-            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_K[r] / 8
+            return j == 0 ? (size_t) x_k[r] * (size_t) x_n[r] * (size_t) x_k2[r] / 16
                           : 2 * (size_t) (j == 1 ? x_k[r] : x_n[r]);
         }
         size_t x_part(int r) const { return x_piece(r, 0) + x_piece(r, 1) + x_piece(r, 2); }

@@ -14,13 +14,16 @@
 
 namespace strata::kernels::cpu {
 
-/// One EXL3 matrix (mul1 codebook): k inputs, n outputs, K bits (1..8), tiles in exllamav3's natural layout.
+/// One EXL3 matrix (mul1 codebook): k inputs, n outputs, tiles in exllamav3's natural layout, the bitrate as k2 = 2 K:
+/// 2..16 even (K 1..8) or 3 / 5 / 7 (exllamav3 1.6's half-integer K 1.5 / 2.5 / 3.5; exl3.hpp has the format).
 struct Exl3Part {
-    const uint32_t* trellis = nullptr;
-    const uint16_t* suh = nullptr;   // FP16 bits [k]
-    const uint16_t* svh = nullptr;   // FP16 bits [n]
-    int k = 0, n = 0, K = 0;
+    const uint32_t* trellis = nullptr;   // [k/16][n/16][4 k2] words
+    const uint16_t* suh = nullptr;       // FP16 bits [k]
+    const uint16_t* svh = nullptr;       // FP16 bits [n]
+    int k = 0, n = 0, k2 = 0;
 };
+/// Whether the CPU lane takes this bitrate (k2 2..16 even, or 3 / 5 / 7).
+inline bool exl3_cpu_k2_ok(int k2) { return (k2 >= 2 && k2 <= 16 && (k2 & 1) == 0) || k2 == 3 || k2 == 5 || k2 == 7; }
 /// Whether a vector kernel runs here (AVX-512F/BW or AVX2 + FMA); the scalar one otherwise.
 bool exl3_cpu_vector();
 /// The kernel the functions below run here: 2 AVX-512 (F, BW), 1 AVX2 + FMA (+ F16C), 0 scalar.  STRATA_FORCE_AVX2=1

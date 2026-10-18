@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
     p0.svh = svh.data();
     p0.k = E;
     p0.n = FF;
-    p0.K = K;
+    p0.k2 = 2 * K;
     kc::exl3_cpu_prepare(p0, x.data(), xh.data());
     const int GQ = E / 256;   // rows mode: pieces of 256 inputs over every column
     std::vector<float> accp((size_t) per_call * GQ * FF);

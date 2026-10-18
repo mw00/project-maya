@@ -4,7 +4,11 @@
 // The format (exllamav3, MIT, turboderp).  A weight with k inputs and n outputs (y = x W) is stored as
 //   trellis  int16 [k/16][n/16][16 K]: each 16x16 tile is a tail-biting trellis of 256 K-bit steps read MSB-first
 //            from its 8 K uint32 words (little-endian pairs of the int16s).  Step p's state is the 16-bit window that
-//            ends at bit (p + 1) K, modulo the tile's 256 K bits; the codebook turns the state into a value:
+//            ends at bit S(p) = (p + 1) K, modulo the tile's 256 K bits.  exllamav3 1.6 also writes the half-integer
+//            K = KA + 0.5 (1.5 / 2.5 / 3.5: 24 / 40 / 56 int16 a tile, mul1 only): its steps alternate KA bits (even p)
+//            and KA + 1 (odd p), so S(p) = floor((p + 1) k2 / 2) with k2 = 2 K - which is (p + 1) K for an integer K
+//            too.  The engine carries every bitrate as k2 (2..16 even, or 3 / 5 / 7).  The codebook turns the state
+//            into a value:
 //              mul1 (cb 2):  fp16(1024 + bytesum(state * 0x83DCD12D)) * fp16(0x1eee) + fp16(0xc931), one FP16 FMA
 //              mcg (cb 1):   x = state * 0xCBAC1FED, 3inst (cb 0): x = state * 89226354 + 64248484; then
 //                            x = (x & 0x8fff8fff) ^ 0x3b603b60 and the value is the FP16 sum of x's two halves.
@@ -33,20 +37,26 @@ struct Mat {
     const uint16_t* suh = nullptr;       // device FP16 bits [k]
     const uint16_t* svh = nullptr;       // device FP16 bits [n]
     int k = 0, n = 0;
-    int K = 0;                           // bits per weight, 1..8
-    int cb = 2;                          // codebook: 0 3inst, 1 mcg, 2 mul1
+    int k2 = 0;                          // twice the bits per weight: 2..16 even (K 1..8), 3 / 5 / 7 (K 1.5 / 2.5 / 3.5)
+    int cb = 2;                          // codebook: 0 3inst, 1 mcg, 2 mul1 (the only one with a half-integer K)
     int ld = 0;                          // tiles per 16-row slice in memory (the full matrix's n / 16); 0: n / 16
     // a GGUF's plain matrix instead (DeepSeek-V4.1's maya-ds4: fmt 1 BF16): raw = [n][ld] (row r = output r, ld
     // values a row; 0: k), the EXL3 fields unused - the engine sends it to its own kernels, never to these
     int fmt = 0;
     const void* raw = nullptr;
+    int gg_type = 0;   // fmt 4 (maya-ds4's kFmtGG): the ggml block type
 };
 
-/// Trellis bytes of a k x n matrix at K bits.
-inline size_t trellis_bytes(int64_t k, int64_t n, int K) { return (size_t) (k / 16) * (size_t) (n / 16) * 32u * K; }
+/// Trellis bytes of a k x n matrix at k2 / 2 bits: 16 k2 bytes a 16x16 tile.
+inline size_t trellis_bytes_k2(int64_t k, int64_t n, int k2) {
+    return (size_t) (k / 16) * (size_t) (n / 16) * 16u * (size_t) k2;
+}
 /// The columns [c0, c0 + nc) of m (c0 and nc multiples of 128: the output rotation's blocks stay whole).
 Mat view(const Mat& m, int c0, int nc);
-/// Whether the kernels take this matrix (k, n multiples of 128, K 1..8, cb 0..2).
+/// Whether the kernels take this bitrate and codebook: K 1..8 (k2 2..16 even) with any codebook, K 1.5 / 2.5 / 3.5
+/// (k2 3 / 5 / 7) with mul1.
+bool k2_supported(int k2, int cb);
+/// Whether the kernels take this matrix (k, n multiples of 128, k2_supported).
 bool supported(const Mat& m);
 
 /// y[r] = alpha * (x W)[r] + (bias ? bias[r] : 0).  x: xf (F32) when given, else xq (q8_1 blocks of k values).
@@ -85,9 +95,10 @@ bool prepare(cudaStream_t s);
 /// suh, the FP16 svh and the trellis of that matrix.
 struct ExpertLayout {
     size_t suh[3] = {0, 0, 0}, svh[3] = {0, 0, 0}, trellis[3] = {0, 0, 0};
-    int K[3] = {0, 0, 0};
+    int k2[3] = {0, 0, 0};   // each part's bitrate as twice its K (Mat::k2); gate and up alike
     int cb = 2;
     int fmt = 0;   // 2: a GGUF's MXFP4 expert (maya-ds4's own kernels): trellis[r] = matrix r's offset, [out][in / 32]
+    int gg_type[3] = {0, 0, 0};   // fmt 2: each role's ggml type (0: MXFP4; maya-ds4's expert_type)
 };
 /// The routed experts of one token (the engine's device plan: plan_ptr[i] = the blob in VRAM, 0 = not on the device;
 /// plan_w[i] its weight).  gate/up over x (n_embd F32) -> clamped swiglu -> h (F32 [k][n_ff], scratch the caller

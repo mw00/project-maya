@@ -15,7 +15,9 @@ packer leaves those where they are and writes:
   pack/dense.bin           the float rows (BF16 where the engine reads BF16, else F32)
   pack/exl3.txt            the EXL3 matrices (file, trellis / suh / svh offsets, k, n, bits, codebook) and every
                            routed expert's three parts (gate, up, down: [suh | svh | codebook word | trellis] each),
-                           read in place by the engine
+                           read in place by the engine; the bits a weight are K ("3"), or "3.5" for exllamav3 1.6's
+                           half-integer K (1.5 / 2.5 / 3.5: 24 / 40 / 56 words a tile, mul1 only), which an engine
+                           from before half-integer K refuses instead of misreading
   pack/native_experts.txt  the header naming maya-exl3.gguf (no rows: the experts are in exl3.txt)
   pack/tokenizer/          from the model's tokenizer.json, typed as llama.cpp's converter types it, with Maya's
                            GLM-5.3 chat template (tools/glm_chat_template.jinja: the one Maya's own GGUFs carry - images,
@@ -129,10 +131,30 @@ _ROW = (_P >> 3 & 3) * 2 + (_P & 1) + 8 * (_P >> 1 & 1)
 _COL = (_P >> 5) + 8 * (_P >> 2 & 1)
 
 
-def exl3_states(words: np.ndarray, K: int) -> np.ndarray:
-    """(..., 8 K) uint32 tile words -> (..., 256) 16-bit states (MSB-first stream, tail-biting)."""
-    W = 8 * K
-    b1 = (_P + 1 + 256) * K
+def tile_k2(words: int, cb: int, what: str) -> int:
+    """A trellis tile's int16 words -> its bitrate as k2 = 2 K: 16 K words for K 1..8, and 24 / 40 / 56 for exllamav3
+    1.6's half-integer K 1.5 / 2.5 / 3.5 (steps of KA and KA + 1 bits alternating; the mul1 codebook only)."""
+    if words % 16 == 0 and 1 <= words // 16 <= 8:
+        return words // 8
+    if words in (24, 40, 56):
+        if cb != 2:
+            raise SystemExit("%s: half-integer bitrate K %g without the mul1 codebook (exllamav3 writes none)"
+                             % (what, words / 16))
+        return words // 8
+    raise SystemExit("%s: %d words a tile is no EXL3 bitrate (16 K for K 1..8; 24 / 40 / 56 for K 1.5 / 2.5 / 3.5)"
+                     % (what, words))
+
+
+def k_text(k2: int) -> str:
+    """exl3.txt's bits field: "3", or "3.5" for a half-integer K."""
+    return "%d.5" % (k2 // 2) if k2 % 2 else "%d" % (k2 // 2)
+
+
+def exl3_states(words: np.ndarray, k2: int) -> np.ndarray:
+    """(..., 4 k2) uint32 tile words -> (..., 256) 16-bit states (MSB-first stream, tail-biting): step p's window ends
+    at bit floor((p + 1) k2 / 2) - (p + 1) K for an integer K, KA- and KA+1-bit steps alternating for a half one."""
+    W = 4 * k2
+    b1 = ((_P + 1) * k2) // 2 + 128 * k2
     i1, i0 = (b1 - 1) >> 5, (b1 - 16) >> 5
     sh = ((i1 + 1) << 5) - b1
     m = (words[..., i0 % W].astype(np.uint64) << np.uint64(32)) | words[..., i1 % W].astype(np.uint64)
@@ -155,13 +177,13 @@ def exl3_values(st: np.ndarray, cb: int) -> np.ndarray:
     return (lo + hi).astype(np.float16).astype(np.float32)
 
 
-def exl3_rows(trellis: np.ndarray, suh: np.ndarray, svh: np.ndarray, K: int, cb: int, c0: int = 0,
+def exl3_rows(trellis: np.ndarray, suh: np.ndarray, svh: np.ndarray, k2: int, cb: int, c0: int = 0,
               nc: int | None = None) -> np.ndarray:
-    """The full weight's rows (n x k, the GGUF layout) of output columns [c0, c0 + nc)."""
+    """The full weight's rows (n x k, the GGUF layout) of output columns [c0, c0 + nc); k2 = 2 K."""
     kt, nt, _ = trellis.shape
     nc = nt * 16 if nc is None else nc
     w = np.ascontiguousarray(trellis[:, c0 // 16:(c0 + nc) // 16, :]).view(np.uint32)
-    st = exl3_states(w, K)
+    st = exl3_states(w, k2)
     vals = exl3_values(st, cb)                                       # (kt, nt', 256) in step order
     tile = np.empty(vals.shape, dtype=np.float32)
     tile[..., _ROW * 16 + _COL] = vals
@@ -178,7 +200,7 @@ class Plan:
     def __init__(self, st: SafeTensors, cfg: dict):
         self.st, self.cfg = st, cfg
         self.floats: list[tuple] = []     # (gguf name, gguf shape, "F32" | "BF16" | "BF16RAW", producer)
-        self.mats: list[tuple] = []       # (gguf name, hf prefix, k, n, K, cb)
+        self.mats: list[tuple] = []       # (gguf name, hf prefix, k, n, k2 = 2 K, cb)
         self.layers: list[dict] = []      # per MoE layer: the expert parts
         self.notes: list[str] = []
 
@@ -201,13 +223,11 @@ class Plan:
         if not st.has(hf + ".suh") or not st.has(hf + ".svh"):
             raise SystemExit("%s: EXL3 without suh/svh (an old packed-sign checkpoint); not supported" % hf)
         kt, nt, w = st.t[hf + ".trellis"][2]
-        if w % 16:
-            raise SystemExit("%s: half-integer bitrate (%d words a tile); not supported yet" % (hf, w))
-        K = w // 16
         cb = 2 if st.has(hf + ".mul1") else 1 if st.has(hf + ".mcg") else 0
+        k2 = tile_k2(w, cb, hf)
         if st.t[hf + ".suh"][1] != "F16" or st.t[hf + ".svh"][1] != "F16":
             raise SystemExit("%s: suh/svh are not F16" % hf)
-        self.mats.append((gname, hf, kt * 16, nt * 16, K, cb))
+        self.mats.append((gname, hf, kt * 16, nt * 16, k2, cb))
 
     def build(self, mtp: bool):
         st, t = self.st, self.cfg
@@ -307,12 +327,10 @@ class Plan:
                     if not st.has(p + x):
                         raise SystemExit("layer %d expert %d: no %s%s" % (il, e, p, x))
                 kt, nt, w = st.t[p + "trellis"][2]
-                if w % 16:
-                    raise SystemExit("layer %d expert %d %s: half-integer bitrate; not supported yet" % (il, e, r))
                 if st.t[p + "suh"][1] != "F16" or st.t[p + "svh"][1] != "F16":
                     raise SystemExit("layer %d expert %d %s: suh / svh are not F16" % (il, e, r))
                 cb = 2 if st.has(p + "mul1") else 1 if st.has(p + "mcg") else 0
-                shape.append((kt * 16, nt * 16, w // 16, cb))
+                shape.append((kt * 16, nt * 16, tile_k2(w, cb, "layer %d expert %d %s" % (il, e, r)), cb))
                 parts.append((self.st.files.index(st.t[p + "trellis"][0]), st.t[p + "trellis"][3],
                               self.st.files.index(st.t[p + "suh"][0]), st.t[p + "suh"][3],
                               self.st.files.index(st.t[p + "svh"][0]), st.t[p + "svh"][3]))
@@ -322,12 +340,12 @@ class Plan:
             elif shape != lay:
                 raise SystemExit("layer %d expert %d: shapes / bits differ from expert 0's" % (il, e))
             rows.append((e, parts))
-        (gk, gn, gK, gcb), (uk, un, uK, ucb), (dk, dn, dK, dcb) = lay
-        if (gk, gn) != (uk, un) or gK != uK or not (gcb == ucb == dcb):
+        (gk, gn, gK2, gcb), (uk, un, uK2, ucb), (dk, dn, dK2, dcb) = lay
+        if (gk, gn) != (uk, un) or gK2 != uK2 or not (gcb == ucb == dcb):
             raise SystemExit("layer %d: gate and up differ, or the codebooks do" % il)
-        part = lambda k, n, K: k * n * K // 8 + 2 * k + 2 * n  # noqa: E731
-        return {"layer": il, "cb": gcb, "K": (gK, uK, dK), "shape": (gk, gn, dk, dn),
-                "gu_bytes": part(gk, gn, gK), "dn_bytes": part(dk, dn, dK), "rows": rows}
+        part = lambda k, n, k2: k * n * k2 // 16 + 2 * k + 2 * n  # noqa: E731  (16 k2 bytes a 16x16 tile)
+        return {"layer": il, "cb": gcb, "k2": (gK2, uK2, dK2), "shape": (gk, gn, dk, dn),
+                "gu_bytes": part(gk, gn, gK2), "dn_bytes": part(dk, dn, dK2), "rows": rows}
 
 
 # ------------------------------------------------------------------ the tokenizer, as llama.cpp's converter types it
@@ -521,7 +539,7 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
     if lost_total:
         plan.notes.append("BF16: %d values rounded (F32 sources such as hc_*_fn; F16 sources convert exactly when "
                           "they came from BF16)" % lost_total)
-    for name, hf, k, n, K, cb in plan.mats:
+    for name, hf, k, n, k2, cb in plan.mats:
         if name.startswith("blk.") and int(name.split(".")[1]) >= n_layers:
             continue   # the NextN block: load_mtp takes it from exl3.txt
         rows.append([name, "0", KIND_EXL3, "0", "0", "0", "0", str(k), str(n), "0", "0", "0"] + ["0"] * 7)
@@ -578,18 +596,20 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
     with replace_atomic(out / "exl3.txt") as fb, io.TextIOWrapper(fb, encoding="utf-8", newline="\n") as f:
         f.write("# maya exl3 pack v1 -- generated by tools/exl3_pack.py from %s\n" % d.name)
         f.write("# file <i> <name>  |  mat <name> <file> <trellis_off> <suh_off> <svh_off> <k> <n> <K> <cb>  |\n")
+        if any(m[4] % 2 for m in plan.mats) or any(x % 2 for L in plan.layers for x in L["k2"]):
+            f.write("# K: bits a weight; 3.5 = exllamav3 1.6's half-integer K (an engine without it refuses the line)\n")
         f.write("# layer <l> <cb> <K_gate> <K_up> <K_down> <k_gate> <n_gate> <k_down> <n_down> <gu_bytes> <dn_bytes>"
                 "  |  e <l> <expert> then per part (gate, up, down): <file> <trellis_off> <file> <suh_off> <file> "
                 "<svh_off>  (absolute; the blob is [gate | up | down], a part [trellis | suh | svh])\n")
         for i, fn in enumerate(st.files):
             f.write("file %d %s\n" % (i, fn))
-        for name, hf, k, n, K, cb in plan.mats:
+        for name, hf, k, n, k2, cb in plan.mats:
             tf = st.t[hf + ".trellis"]
-            f.write("mat %s %d %d %d %d %d %d %d %d\n" % (name, st.files.index(tf[0]), tf[3], st.t[hf + ".suh"][3],
-                                                          st.t[hf + ".svh"][3], k, n, K, cb))
+            f.write("mat %s %d %d %d %d %d %d %s %d\n" % (name, st.files.index(tf[0]), tf[3], st.t[hf + ".suh"][3],
+                                                          st.t[hf + ".svh"][3], k, n, k_text(k2), cb))
         for L in plan.layers:
-            f.write("layer %d %d %d %d %d %d %d %d %d %d %d\n" % (
-                L["layer"], L["cb"], *L["K"], *L["shape"], L["gu_bytes"], L["dn_bytes"]))
+            f.write("layer %d %d %s %s %s %d %d %d %d %d %d\n" % (
+                L["layer"], L["cb"], *(k_text(x) for x in L["k2"]), *L["shape"], L["gu_bytes"], L["dn_bytes"]))
             for e, parts in L["rows"]:
                 f.write("e %d %d %s\n" % (L["layer"], e, " ".join("%d %d %d %d %d %d" % p for p in parts)))
     n_exp = sum(len(L["rows"]) for L in plan.layers)
@@ -654,7 +674,7 @@ def check(plan: Plan, d: pathlib.Path, ref: pathlib.Path, n_cols: int) -> int:
     print("EXL3 matrices (decoded vs the GGUF's quant, first %d rows):" % n_cols)
     st = plan.st
     picks = [x for x in plan.mats if re.match(r"(blk\.(0|3|20|44|45)\.|output)", x[0])]
-    for name, hf, k, n, K, cb in picks:
+    for name, hf, k, n, k2, cb in picks:
         nc = min(max(128, n_cols // 128 * 128), n)   # whole output rotation blocks
         tr = st.raw(hf + ".trellis").view(np.int16).reshape(st.t[hf + ".trellis"][2])
         suh = st.f32(hf + ".suh")
@@ -667,11 +687,11 @@ def check(plan: Plan, d: pathlib.Path, ref: pathlib.Path, n_cols: int) -> int:
             if rname not in R:
                 print("  %-40s not in the GGUF" % rname)
                 continue
-            got = exl3_rows(tr, suh, svh, K, cb, c0, nc)
+            got = exl3_rows(tr, suh, svh, k2, cb, c0, nc)
             want = ref_rows(rname, 0, nc)
             cos = float((got * want).sum() / math.sqrt((got * got).sum() * (want * want).sum()))
             ok = cos > 0.9
-            print("  %-40s K%d cos %.4f  %s (GGUF %s)" % (rname, K, cos, "ok" if ok else "FAIL",
+            print("  %-40s K%s cos %.4f  %s (GGUF %s)" % (rname, k_text(k2), cos, "ok" if ok else "FAIL",
                                                      R[rname].tensor_type.name))
             bad += not ok
     for L in plan.layers:
@@ -681,12 +701,12 @@ def check(plan: Plan, d: pathlib.Path, ref: pathlib.Path, n_cols: int) -> int:
         for ri, r in enumerate(ROLES):
             p = "model.language_model.layers.%d.mlp.experts.%d.%s_proj." % (il, e, r)
             tr = st.raw(p + "trellis").view(np.int16).reshape(st.t[p + "trellis"][2])
-            got = exl3_rows(tr, st.f32(p + "suh"), st.f32(p + "svh"), L["K"][ri], L["cb"])
+            got = exl3_rows(tr, st.f32(p + "suh"), st.f32(p + "svh"), L["k2"][ri], L["cb"])
             tt = R["blk.%d.ffn_%s_exps.weight" % (il, r)]
             want = dequantize(tt.data[e], tt.tensor_type).astype(np.float32)
             cos = float((got * want).sum() / math.sqrt((got * got).sum() * (want * want).sum()))
             ok = cos > 0.85
-            print("  blk.%d expert %d %-5s K%d cos %.4f  %s (GGUF %s)" % (il, e, r, L["K"][ri], cos,
+            print("  blk.%d expert %d %-5s K%s cos %.4f  %s (GGUF %s)" % (il, e, r, k_text(L["k2"][ri]), cos,
                                                                     "ok" if ok else "FAIL", tt.tensor_type.name))
             bad += not ok
     print("check: %s" % ("PASS" if bad == 0 else "%d FAILED" % bad))

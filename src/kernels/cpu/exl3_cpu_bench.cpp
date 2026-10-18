@@ -3,6 +3,7 @@
 //   exl3_cpu_bench [--K 3,4] [--threads 1,6,12,24] [--tokens 1,2,4,8] [--tiers 0,1,2] [--mb 640] [--per-call 4]
 //                  [--pin] [--hot-only | --cold-only]
 //
+// --K takes exllamav3 1.6's half-integer bitrates too (1.5, 2.5, 3.5).
 // Random trellis words (any bit pattern is a valid encoding), experts of 4096 -> 2048 -> 4096 (gate, up, down), each
 // tier this CPU runs (0 scalar, 1 AVX2 + FMA, 2 AVX-512) through exl3_cpu_band_acc_on:
 //  HOT   one band of a gate matrix (every slice: 196 KB at K 3, in L2) again and again on one thread - the kernel's
@@ -122,14 +123,14 @@ std::vector<uint16_t> scales(int n) {   // FP16 magnitudes in [0.5, 1), random s
 struct Expert {
     std::vector<uint32_t> tr[3];   // gate, up, down
     std::vector<uint16_t> suh[3], svh[3];
-    kc::Exl3Part part(int r, int K) const {
+    kc::Exl3Part part(int r, int k2) const {
         kc::Exl3Part p;
         p.trellis = tr[r].data();
         p.suh = suh[r].data();
         p.svh = svh[r].data();
         p.k = r < 2 ? E : FF;
         p.n = r < 2 ? FF : E;
-        p.K = K;
+        p.k2 = k2;
         return p;
     }
 };
@@ -156,20 +157,32 @@ std::vector<int> int_list(const char* s) {
     while (std::getline(ss, t, ',')) v.push_back(std::atoi(t.c_str()));
     return v;
 }
+// "3,3.5,4" -> the bitrates as k2 = 2 K (6, 7, 8); -1 for an entry that is no K or K + 0.5
+std::vector<int> k2_list(const char* s) {
+    std::vector<int> v;
+    std::stringstream ss(s);
+    std::string t;
+    while (std::getline(ss, t, ',')) {
+        const bool half = t.size() == 3 && t[1] == '.' && t[2] == '5';
+        const bool whole = t.size() == 1;
+        v.push_back((half || whole) && t[0] >= '1' && t[0] <= '8' ? 2 * (t[0] - '0') + (half ? 1 : 0) : -1);
+    }
+    return v;
+}
 
 const char* tier_name(int t) { return t == 2 ? "avx512" : t == 1 ? "avx2" : "scalar"; }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::vector<int> Ks = {3, 4}, threads = {1, 6, 12, 24}, tokens = {1, 2, 4, 8}, tiers = {0, 1, 2};
+    std::vector<int> K2s = {6, 8}, threads = {1, 6, 12, 24}, tokens = {1, 2, 4, 8}, tiers = {0, 1, 2};
     double mb = 640.0;
     int per = 4;
     bool pin = false, hot = true, cold = true;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         const char* v = i + 1 < argc ? argv[i + 1] : nullptr;
-        if (a == "--K" && v) Ks = int_list(v), ++i;
+        if (a == "--K" && v) K2s = k2_list(v), ++i;
         else if (a == "--threads" && v) threads = int_list(v), ++i;
         else if (a == "--tokens" && v) tokens = int_list(v), ++i;
         else if (a == "--tiers" && v) tiers = int_list(v), ++i;
@@ -184,9 +197,9 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    for (int K : Ks)
-        if (K < 1 || K > 8) {
-            std::fprintf(stderr, "ERROR: K must be 1..8\n");
+    for (int k2 : K2s)
+        if (!kc::exl3_cpu_k2_ok(k2)) {
+            std::fprintf(stderr, "ERROR: K must be 1..8, 1.5, 2.5 or 3.5\n");
             return 2;
         }
     if (per < 1 || per > 8) {
@@ -203,16 +216,16 @@ int main(int argc, char** argv) {
     std::vector<float> xin((size_t) 64 * E);
     for (auto& v : xin) v = (float) ((int) (rnd() % 2001) - 1000) / 400.0f;
 
-    for (int K : Ks) {
-        const double expert_mb = 3.0 * E * FF * K / 8.0 / 1e6;
+    for (int k2 : K2s) {
+        const double K = k2 / 2.0, expert_mb = 3.0 * E * FF * K / 8.0 / 1e6;
         // ---- HOT: band 0 of one gate matrix, all its slices, one thread
         if (hot) {
             Expert ex;
-            ex.tr[0].resize((size_t) (E / 16) * (FF / 16) * 8 * K);
+            ex.tr[0].resize((size_t) (E / 16) * (FF / 16) * 4 * k2);
             for (auto& w : ex.tr[0]) w = rnd();
             ex.suh[0] = scales(E);
             ex.svh[0] = scales(FF);
-            const kc::Exl3Part p = ex.part(0, K);
+            const kc::Exl3Part p = ex.part(0, k2);
             std::vector<std::vector<float>> xh(64, std::vector<float>(E)), acc(64, std::vector<float>(128));
             for (int i = 0; i < 64; ++i) kc::exl3_cpu_prepare(p, xin.data() + (size_t) i * E, xh[(size_t) i].data());
             for (int tier : tiers)
@@ -229,7 +242,7 @@ int main(int argc, char** argv) {
                         best = std::min(best, secs(t0, clk::now()) / reps);
                     }
                     const double w = 128.0 * E;   // weights of the band
-                    std::printf("HOT  K%d %-6s %2d token%s 1 thread: %8.1f M weights/s (%7.1f M weight-tokens/s), "
+                    std::printf("HOT  K%g %-6s %2d token%s 1 thread: %8.1f M weights/s (%7.1f M weight-tokens/s), "
                                 "%.3f ms an expert-token\n", K, tier_name(tier), n, n > 1 ? "s" : " ", w / best / 1e6,
                                 w * n / best / 1e6, best / n * (3.0 * E * FF / w) * 1e3);
                 }
@@ -240,12 +253,12 @@ int main(int argc, char** argv) {
             std::vector<Expert> xs((size_t) ne);
             for (auto& ex : xs)
                 for (int r = 0; r < 3; ++r) {
-                    ex.tr[r].resize((size_t) (E / 16) * (FF / 16) * 8 * K);
+                    ex.tr[r].resize((size_t) (E / 16) * (FF / 16) * 4 * k2);
                     for (auto& w : ex.tr[r]) w = rnd();
                     ex.suh[r] = scales(r < 2 ? E : FF);
                     ex.svh[r] = scales(r < 2 ? FF : E);
                 }
-            std::printf("COLD K%d: %d experts of %.2f MB (%.0f MB), %d a call\n", K, ne, expert_mb, ne * expert_mb, per);
+            std::printf("COLD K%g: %d experts of %.2f MB (%.0f MB), %d a call\n", K, ne, expert_mb, ne * expert_mb, per);
             const int maxn = *std::max_element(tokens.begin(), tokens.end());
             std::vector<Rows> rows((size_t) 8 * maxn);
             for (int T : threads) {
@@ -257,7 +270,7 @@ int main(int argc, char** argv) {
                             const auto R = [&](int e, int i) -> Rows& { return rows[(size_t) (e * n + i)]; };
                             pool.run(per * 2 * n, [&](int j) {
                                 const int e = j / (2 * n), r = j / n % 2, i = j % n;
-                                R(e, i).xs[r] = kc::exl3_cpu_prepare(xs[(size_t) (e0 + e)].part(r, K),
+                                R(e, i).xs[r] = kc::exl3_cpu_prepare(xs[(size_t) (e0 + e)].part(r, k2),
                                                                       xin.data() + (size_t) i * E, R(e, i).x[r].data());
                             });
                             pool.run(per * 2 * GB * 2, [&](int j) {
@@ -268,7 +281,7 @@ int main(int argc, char** argv) {
                                     xp[i] = R(e, i).x[r].data();
                                     ap[i] = R(e, i).acc[r].data() + ((size_t) b * 2 + h) * 128;
                                 }
-                                if (!kc::exl3_cpu_band_acc_on(tier, xs[(size_t) (e0 + e)].part(r, K), xp, n, b * 128,
+                                if (!kc::exl3_cpu_band_acc_on(tier, xs[(size_t) (e0 + e)].part(r, k2), xp, n, b * 128,
                                                               h * KH, (h + 1) * KH, ap))
                                     runs = false;
                             });
@@ -279,7 +292,7 @@ int main(int argc, char** argv) {
                                 for (int r = 0; r < 2; ++r) {
                                     const float* a0 = R(e, i).acc[r].data() + ((size_t) b * 2) * 128;
                                     for (int c = 0; c < 128; ++c) a[c] = a0[c] + a0[128 + c];
-                                    kc::exl3_cpu_band_out(ex.part(r, K), a, R(e, i).xs[r], b * 128, y[r]);
+                                    kc::exl3_cpu_band_out(ex.part(r, k2), a, R(e, i).xs[r], b * 128, y[r]);
                                 }
                                 for (int c = 0; c < 128; ++c) hb[c] = y[0][c] / (1.0f + std::exp(-y[0][c])) * y[1][c];
                                 R(e, i).xds[(size_t) b] = kc::exl3_cpu_prepare_block(ex.suh[2].data() + b * 128, hb,
@@ -287,7 +300,7 @@ int main(int argc, char** argv) {
                             });
                             pool.run(per * DB, [&](int j) {
                                 const int e = j / DB, b = j % DB;
-                                const kc::Exl3Part pd = xs[(size_t) (e0 + e)].part(2, K);
+                                const kc::Exl3Part pd = xs[(size_t) (e0 + e)].part(2, k2);
                                 const float* xp[64];
                                 float a[64][128];
                                 float* ap[64];
@@ -311,7 +324,7 @@ int main(int argc, char** argv) {
                             best = std::min(best, secs(t0, clk::now()));
                         }
                         const int done = (tier == 0 ? std::min(ne, 16) : ne) / per * per;
-                        std::printf("COLD K%d %-6s T%2d %d token%s: %7.1f experts/s, %.3f ms an expert (%.3f an "
+                        std::printf("COLD K%g %-6s T%2d %d token%s: %7.1f experts/s, %.3f ms an expert (%.3f an "
                                     "expert-token), trellis %.1f GB/s\n", K, tier_name(tier), T, n, n > 1 ? "s" : " ",
                                     done / best, best / done * 1e3, best / done / n * 1e3,
                                     done * expert_mb / 1e3 / best);

@@ -25,7 +25,8 @@ namespace x3 = strata::kernels::exl3;
 constexpr int kFmtBF16 = 1;    // x3::Mat::fmt
 constexpr int kFmtMXFP4 = 2;   // x3::ExpertLayout::fmt (and an expert's matrix as an x3::Mat)
 constexpr int kFmtQ8_0 = 3;    // x3::Mat::fmt: ggml's Q8_0, an FP16 scale and 32 int8 in 34 bytes (UD-Q4_K_XL's dense)
-constexpr int kFmtGG = 4;      // x3::Mat::fmt: ggml's low-bit block type m.K (ds4_iq.cuh's: IQ2_XXS .. Q4_K), [n][k / 256]
+constexpr int kFmtGG = 4;      // x3::Mat::fmt: ggml's low-bit block type m.gg_type (ds4_iq.cuh's: IQ2_XXS ..
+                               // Q4_K), [n][k / 256]
 constexpr int kMxBlock = 32, kMxBytes = 17, kQ8Bytes = 34;
 constexpr int kTypeMXFP4 = 39;   // ggml's type id
 
@@ -35,9 +36,10 @@ __host__ __device__ inline size_t mx_bytes(int64_t n, int64_t k) { return (size_
 __host__ __device__ inline size_t q8_row_bytes(int64_t k) { return (size_t) (k / 32) * kQ8Bytes; }
 
 /// A GGUF expert layer (x3::ExpertLayout::fmt kFmtMXFP4: block-quantized experts read in place) keeps each role's ggml
-/// type in lay.K[r] (r: gate, up, down; 0 = MXFP4): MXFP4 takes these kernels, the low-bit types ds4_iq.cuh's (gate
-/// and up of one type).  Roles of one layer may differ (down of another type); MXFP4 and a low-bit type do not mix.
-inline int expert_type(const x3::ExpertLayout& l, int r) { return l.K[r] == 0 ? kTypeMXFP4 : l.K[r]; }
+/// type in lay.gg_type[r] (r: gate, up, down; 0 = MXFP4): MXFP4 takes these kernels, the low-bit types ds4_iq.cuh's
+/// (gate and up of one type).  Roles of one layer may differ (down of another type); MXFP4 and a low-bit type do not
+/// mix.
+inline int expert_type(const x3::ExpertLayout& l, int r) { return l.gg_type[r] == 0 ? kTypeMXFP4 : l.gg_type[r]; }
 inline bool mx_experts(const x3::ExpertLayout& l) {
     return expert_type(l, 0) == kTypeMXFP4 && expert_type(l, 1) == kTypeMXFP4 && expert_type(l, 2) == kTypeMXFP4;
 }
@@ -62,7 +64,7 @@ x3::Mat view(const x3::Mat& m, int c0, int nc);
 void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 
 /// x3::moe_gate_up / moe_down / win_experts / set_gate_up / set_down for a GGUF's experts (lay.fmt == kFmtMXFP4; the
-/// roles' types in lay.K, see expert_type).
+/// roles' types in lay.gg_type, see expert_type).
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
