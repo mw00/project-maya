@@ -1360,6 +1360,17 @@ int mv_splits(const Mat& m) {
     return S;
 }
 
+int mv_cols(const Mat& m) {
+    if (!supported(m)) return 0;
+#if !defined(STRATA_USE_HIP)
+    if (use_legacy()) return 4;   // (v1.1.8's kernels: the runs of four their callers have always used)
+#endif
+    const int S = mv_splits(m);
+    if (S <= 0) return 0;
+    if (S == 1) return kTok;
+    return (int) std::max<size_t>(1, std::min<size_t>(kTok, kPartFloats / ((size_t) S * m.n)));
+}
+
 int launch_errors() {
 #if !defined(STRATA_USE_HIP)
     return g_launch_errors.load(std::memory_order_relaxed) + legacy::launch_errors();

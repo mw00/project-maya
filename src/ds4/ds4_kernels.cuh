@@ -56,6 +56,10 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 
 /// y[t][r] = alpha * sum_k W[r][k] x[t][k], W F16 bits [n][k] (the router's and the indexer's weights_proj).
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
+/// The same for T activations x[t] = x + t ldx into y + t ldy, each weight read once for all of them; each output is
+/// gemv_f16's bit for bit.
+void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
+                   cudaStream_t s);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -123,6 +127,14 @@ void ext_to_ring(const uint16_t* ext, uint16_t* ring, int64_t p0, int n, int T, 
                  uint16_t* backup = nullptr);
 /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
 void ring_restore(uint16_t* ring, const uint16_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
+/// The same for up to kMaxRingBatch layers' rings at once (one launch).
+constexpr int kMaxRingBatch = 64;
+struct RingBatch {
+    uint16_t* ring[kMaxRingBatch] = {};
+    const uint16_t* bak[kMaxRingBatch] = {};
+    int n = 0;
+};
+void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
 
 /// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s);
@@ -193,6 +205,14 @@ void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_s
 void iota_rows(int* out, int T, int n, int stride, cudaStream_t s);
 /// The DSpark markov head: logits[v] += E[*tok] . H[v] for v < V (E BF16 [V][R], H F16 [V][R]).
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s);
+/// The markov bias over a head group: a member's rows [v0, v0 + vn) of it added to its share of a logits row (erow:
+/// the previous token's E row, BF16, on the device) - markov_add's sums; the share's argmax (the greedy sampler's rule)
+/// into a host-mapped slot {value, index, seq}; every member's slot of the step -> the global argmax into *tok and its
+/// E row (E host-mapped) into erow.
+void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s);
+void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s);
+void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
+                 cudaStream_t s);
 /// The DSpark confidence: out[t] = sigmoid(w . [x[t] | E[tok[t]]]) (x rows dim floats, w F32 [dim + R]).
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s);
@@ -223,7 +243,12 @@ struct ArGroup {
     unsigned* flags = nullptr;
     size_t stride = 0;
     int nm = 1, slots = 4;
+    // three members or more: a reduce-scatter + all-gather (each member sums its chunk of every block's range, in
+    // member order, then reads the others' sums) - [slots][stride] sums, [2][nm][slots][kArBlocks][8] flags
+    float* sums = nullptr;
+    unsigned* bflags = nullptr;
 };
+constexpr int kArBlocks = 64;
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
 
 }  // namespace strata::ds4

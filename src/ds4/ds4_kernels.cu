@@ -307,6 +307,50 @@ __global__ void __launch_bounds__(kThreads) gemv_f16_kernel(const uint16_t* __re
     acc = warp_sum(acc);
     if (lane == 0) y[(size_t) t * n + row] = alpha * acc;
 }
+// ... for T activations (rows ldx apart, 16-byte aligned; outputs ldy apart), kRowsT of them a block (grid y): each
+// weight row read once for the block's activations, theirs in float4s - each activation's sum gemv_f16_kernel's (the
+// same products in the same order), so its bits too.  (A block for all of them, 16 at most, was slower than a launch
+// a token: its accumulators and guards kept the loop from unrolling - 66 against 29 us at 5 tokens on an RTX 5060 Ti,
+// this 9)
+constexpr int kRowsT = 2;
+__global__ void __launch_bounds__(kThreads) gemv_f16_rows_kernel(const uint16_t* __restrict__ W,
+                                                                 const float* __restrict__ x, size_t ldx, int n, int k,
+                                                                 int T, float alpha, float* __restrict__ y, size_t ldy) {
+    const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int t0 = blockIdx.y * kRowsT, nt = min(kRowsT, T - t0);
+    if (row >= n) return;
+    const uint16_t* w = W + (size_t) row * k;
+    float acc[kRowsT];
+#pragma unroll
+    for (int t = 0; t < kRowsT; ++t) acc[t] = 0.0f;
+    for (int c = lane * 8; c < k; c += 32 * 8) {
+        const uint4 q = *(const uint4*) (w + c);
+        const __half2* hp = (const __half2*) &q;
+        float xv[kRowsT][8];
+#pragma unroll
+        for (int t = 0; t < kRowsT; ++t)
+            if (t < nt) {
+                const float* xp = x + (size_t) (t0 + t) * ldx + c;
+                const float4 a = *(const float4*) xp, b = *(const float4*) (xp + 4);
+                xv[t][0] = a.x, xv[t][1] = a.y, xv[t][2] = a.z, xv[t][3] = a.w;
+                xv[t][4] = b.x, xv[t][5] = b.y, xv[t][6] = b.z, xv[t][7] = b.w;
+            }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __half22float2(hp[i]);
+#pragma unroll
+            for (int t = 0; t < kRowsT; ++t)
+                if (t < nt) acc[t] += f.x * xv[t][2 * i] + f.y * xv[t][2 * i + 1];
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < kRowsT; ++t)
+        if (t < nt) {
+            const float a = warp_sum(acc[t]);
+            if (lane == 0) y[(size_t) (t0 + t) * ldy + row] = alpha * a;
+        }
+}
 
 // ---------------------------------------------------------------- the router
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
@@ -694,6 +738,12 @@ __global__ void ring_restore_kernel(uint16_t* __restrict__ ring, const uint16_t*
     uint16_t* row = ring + (size_t) ((p0 + t) % n) * d;
     for (int e = threadIdx.x; e < d; e += blockDim.x) row[e] = backup[(size_t) t * d + e];
 }
+__global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n, int keep, int d) {
+    const int t = keep + blockIdx.x, li = blockIdx.y;
+    uint16_t* row = b.ring[li] + (size_t) ((p0 + t) % n) * d;
+    const uint16_t* src = b.bak[li] + (size_t) t * d;
+    for (int e = threadIdx.x; e < d; e += blockDim.x) row[e] = src[e];
+}
 
 __global__ void hc_mean_kernel(const float* __restrict__ h, int hc, int dim, float* __restrict__ out,
                                long long out_stride) {
@@ -733,6 +783,86 @@ __global__ void __launch_bounds__(kThreads) markov_kernel(float* __restrict__ lo
     }
     a = warp_sum(a);
     if (lane == 0) logits[v] += a;
+}
+
+// ---------------------------------------------------------------- the markov bias over a head group (markov_share)
+// a member's rows [v0, v0 + vn) of the bias (markov_kernel's sums, the prev token's E row already on the device, BF16)
+__global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restrict__ logits,
+                                                                const uint16_t* __restrict__ H,
+                                                                const uint16_t* __restrict__ erow, int vn, int R) {
+    extern __shared__ float er[];
+    for (int i = threadIdx.x; i < R; i += blockDim.x) er[i] = bf16f(erow[i]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    if (v >= vn) return;
+    const uint16_t* hr = H + (size_t) v * R;
+    float a = 0.0f;
+    for (int c = lane * 8; c < R; c += 32 * 8) {
+        const uint4 q = *(const uint4*) (hr + c);
+        const __half2* hp = (const __half2*) &q;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __half22float2(hp[i]);
+            a += f.x * er[c + 2 * i] + f.y * er[c + 2 * i + 1];
+        }
+    }
+    a = warp_sum(a);
+    if (lane == 0) logits[v] += a;
+}
+// the share's argmax (the greedy sampler's rule: the larger value, on a tie the lower index) -> slot {value, v0 + i,
+// seq}, the seq last
+__global__ void __launch_bounds__(1024) argmax_share_kernel(const float* __restrict__ row, int vn, int v0,
+                                                           unsigned* slot, unsigned seq) {
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    float bv = __int_as_float(0xff800000);
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < vn; i += blockDim.x) {
+        const float x = row[i];
+        if (x > bv) bv = x, bi = i;   // (ascending: the lowest index of a tie stays)
+    }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ov > bv || (ov == bv && oi < bi)) bv = ov, bi = oi;
+    }
+    if ((threadIdx.x & 31) == 0) sv[threadIdx.x >> 5] = bv, si[threadIdx.x >> 5] = bi;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int w = 1; w < (int) (blockDim.x >> 5); ++w)
+            if (sv[w] > bv || (sv[w] == bv && si[w] < bi)) bv = sv[w], bi = si[w];
+        slot[0] = __float_as_uint(bv);
+        slot[1] = (unsigned) (v0 + (bi == 0x7fffffff ? 0 : bi));
+        __threadfence_system();
+        *(volatile unsigned*) (slot + 2) = seq;
+    }
+}
+// every member's share argmax of this step (slots nm apart) -> the global one into *tok, and its E row (host-mapped
+// BF16 [V][R]) into erow for the next step's bias
+__global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E,
+                                   uint16_t* erow, int R) {
+    __shared__ int pick;
+    if ((int) threadIdx.x < nm)
+        while ((int) (*(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 2) - seq) < 0) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(32);
+#endif
+        }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float bv = __int_as_float(0xff800000);
+        int bi = 0x7fffffff;
+        for (int m = 0; m < nm; ++m) {   // (members in vocabulary order: a tie keeps the lower index)
+            const float v = __uint_as_float(*(volatile const unsigned*) (slots + (size_t) m * 4));
+            const int i = (int) *(volatile const unsigned*) (slots + (size_t) m * 4 + 1);
+            if (v > bv || (v == bv && i < bi)) bv = v, bi = i;
+        }
+        pick = bi;
+        *tok = bi;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < R; i += blockDim.x) erow[i] = __ldcv(E + (size_t) pick * R + i);
 }
 
 __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restrict__ x, const uint16_t* __restrict__ E,
@@ -837,11 +967,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     __shared__ float bv[32];
     __shared__ int bi[32];
     __shared__ int pick[16];
+    __shared__ int on_cpu;
     const int t = blockIdx.x;
     logits += (size_t) t * 1024;
     if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
-    if (req != nullptr)
-        for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         const float l = logits[i];
         const float sp = l > 20.0f ? l : log1pf(expf(l));
@@ -875,17 +1004,25 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
     if (threadIdx.x == 0) {
         float s = 0.0f;
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
+        int cpu = 0;
         for (int r = 0; r < k; ++r) {
             const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
             plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
+            cpu |= vram[pick[r]] == 0ull;
             if (req != nullptr) {
                 req->ids[t][r] = pick[r];
                 req->w[t][r] = wv;
             }
         }
+        on_cpu = cpu;
     }
+    // the token's FFN input to the host only where the CPU lane reads it (a pick of its on the CPU lane): each row
+    // 20 KB over PCIe, where most windows have none
+    __syncthreads();
+    if (req != nullptr && on_cpu)
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
 }
 
 __global__ void publish_kernel(Req* req, int T, unsigned seq) {
@@ -959,6 +1096,120 @@ __global__ void wait_flags_kernel(const unsigned* flags, int n, int stride, unsi
 __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
     __threadfence_system();
     *(volatile unsigned*) flag = v;
+}
+
+// three members or more: a reduce-scatter and an all-gather in one launch, a block a contiguous range of the row cut
+// in nm chunks.  The block puts its range of this member's partial out and flags it; once every member's flag of the
+// range is up it sums chunk mi of the range in member order (ar_sum_kernel's sums, bit for bit), puts that out and
+// flags it; once every member's sum flag is up it reads the other chunks' sums.  Each member reads about two rows over
+// PCIe whatever nm is, where every member reading every other row grows with nm
+__global__ void __launch_bounds__(kThreads) ar_rs_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
+                                                        unsigned* bflags, int nm, int mi, int slot, int slots,
+                                                        unsigned seq) {
+    float4* x4 = (float4*) x;
+    const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
+    const int lo = blockIdx.x * per, hi = min(n4, lo + per), cs = (hi - lo + nm - 1) / nm;
+    auto rflag = [&](int m) { return bflags + (((size_t) m * slots + slot) * kArBlocks + blockIdx.x) * 8; };
+    auto sflag = [&](int m) {
+        return bflags + ((((size_t) nm + m) * slots + slot) * kArBlocks + blockIdx.x) * 8;
+    };
+    auto row = [&](int m) { return (float4*) (rows + ((size_t) m * slots + slot) * stride); };
+    float4* sum = (float4*) (sums + (size_t) slot * stride);
+    if (lo < hi) {
+        float4* mine = row(mi);
+        for (int q = lo + threadIdx.x; q < hi; q += blockDim.x) mine[q] = x4[q];
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned*) rflag(mi) = seq;
+    if ((int) threadIdx.x < nm && (int) threadIdx.x != mi) wait_at_least(rflag(threadIdx.x), seq);
+    __syncthreads();
+    const int c0 = min(hi, lo + mi * cs), c1 = min(hi, c0 + cs);
+    for (int q = c0 + threadIdx.x; q < c1; q += blockDim.x) {
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int m = 0; m < nm; ++m) {
+            const float4 p = m == mi ? x4[q] : __ldcv(row(m) + q);
+            if (m == 0) v = p;
+            else {
+                v.x = __fadd_rn(v.x, p.x);
+                v.y = __fadd_rn(v.y, p.y);
+                v.z = __fadd_rn(v.z, p.z);
+                v.w = __fadd_rn(v.w, p.w);
+            }
+        }
+        sum[q] = v;
+        x4[q] = v;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned*) sflag(mi) = seq;
+    if ((int) threadIdx.x < nm && (int) threadIdx.x != mi) wait_at_least(sflag(threadIdx.x), seq);
+    __syncthreads();
+    for (int q = lo + threadIdx.x; q < hi; q += blockDim.x)
+        if (q < c0 || q >= c1) x4[q] = __ldcv(sum + q);
+}
+
+// ar_rs_kernel with the rows and the sums in FP16 (DS4_AR_F16): half the bytes over PCIe.  Every member's partial is
+// rounded to FP16 (the owner's too), summed in F32 in member order, the sum rounded to FP16 - and every member, the
+// owner too, takes that rounded sum, so the members' copies of the stream stay the same
+__device__ __forceinline__ uint2 to_h4(float4 v) {
+    const __half2 a = __floats2half2_rn(v.x, v.y), b = __floats2half2_rn(v.z, v.w);
+    return make_uint2(*(const unsigned*) &a, *(const unsigned*) &b);
+}
+__device__ __forceinline__ float4 from_h4(uint2 u) {
+    const float2 a = __half22float2(*(const __half2*) &u.x), b = __half22float2(*(const __half2*) &u.y);
+    return make_float4(a.x, a.y, b.x, b.y);
+}
+__device__ __forceinline__ float4 sat4(float4 v) {   // (FP16's range: a partial past it saturates instead of inf)
+    const float m = 65504.0f;
+    return make_float4(fminf(fmaxf(v.x, -m), m), fminf(fmaxf(v.y, -m), m), fminf(fmaxf(v.z, -m), m), fminf(fmaxf(v.w, -m), m));
+}
+__global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
+                                                          unsigned* bflags, int nm, int mi, int slot, int slots,
+                                                          unsigned seq) {
+    float4* x4 = (float4*) x;
+    const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
+    const int lo = blockIdx.x * per, hi = min(n4, lo + per), cs = (hi - lo + nm - 1) / nm;
+    auto rflag = [&](int m) { return bflags + (((size_t) m * slots + slot) * kArBlocks + blockIdx.x) * 8; };
+    auto sflag = [&](int m) {
+        return bflags + ((((size_t) nm + m) * slots + slot) * kArBlocks + blockIdx.x) * 8;
+    };
+    auto row = [&](int m) { return (uint2*) (rows + ((size_t) m * slots + slot) * stride); };   // (FP16: half a row)
+    uint2* sum = (uint2*) (sums + (size_t) slot * stride);
+    if (lo < hi) {
+        uint2* mine = row(mi);
+        for (int q = lo + threadIdx.x; q < hi; q += blockDim.x) mine[q] = to_h4(sat4(x4[q]));
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned*) rflag(mi) = seq;
+    if ((int) threadIdx.x < nm && (int) threadIdx.x != mi) wait_at_least(rflag(threadIdx.x), seq);
+    __syncthreads();
+    const int c0 = min(hi, lo + mi * cs), c1 = min(hi, c0 + cs);
+    for (int q = c0 + threadIdx.x; q < c1; q += blockDim.x) {
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int m = 0; m < nm; ++m) {
+            const uint2 u = m == mi ? to_h4(sat4(x4[q])) : __ldcv(row(m) + q);
+            const float4 p = from_h4(u);
+            if (m == 0) v = p;
+            else {
+                v.x = __fadd_rn(v.x, p.x);
+                v.y = __fadd_rn(v.y, p.y);
+                v.z = __fadd_rn(v.z, p.z);
+                v.w = __fadd_rn(v.w, p.w);
+            }
+        }
+        const uint2 s16 = to_h4(sat4(v));
+        sum[q] = s16;
+        x4[q] = from_h4(s16);
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) *(volatile unsigned*) sflag(mi) = seq;
+    if ((int) threadIdx.x < nm && (int) threadIdx.x != mi) wait_at_least(sflag(threadIdx.x), seq);
+    __syncthreads();
+    for (int q = lo + threadIdx.x; q < hi; q += blockDim.x)
+        if (q < c0 || q >= c1) x4[q] = from_h4(__ldcv(sum + q));
 }
 
 // x[i] = the members' partials summed in member order (this member's from x, the others' from their host rows)
@@ -1156,6 +1407,12 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s) {
     gemv_f16_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, alpha, y);
 }
+void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
+                   cudaStream_t s) {
+    if (T > 0)
+        gemv_f16_rows_kernel<<<dim3(cdiv(n, kThreads / 32), cdiv(T, kRowsT)), kThreads, 0, s>>>(W, x, ldx, n, k, T, alpha,
+                                                                                               y, ldy);
+}
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl, const VlBits* vl) {
@@ -1230,12 +1487,26 @@ void ext_to_ring(const uint16_t* ext, uint16_t* ring, int64_t p0, int n, int T, 
 void ring_restore(uint16_t* ring, const uint16_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
     if (T > keep) ring_restore_kernel<<<T - keep, kThreads, 0, s>>>(ring, backup, (long long) p0, n, keep, d);
 }
+void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
+    if (T > keep && b.n > 0)
+        ring_restore_batch_kernel<<<dim3(T - keep, b.n), kThreads, 0, s>>>(b, (long long) p0, n, keep, d);
+}
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
     hc_mean_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(h, hc, dim, out, out_stride);
 }
 void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { iota_rows_kernel<<<T, 64, 0, s>>>(out, n, stride); }
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
     markov_kernel<<<cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, E, H, tok, V, R);
+}
+void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
+    markov_share_kernel<<<cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, H, erow, vn, R);
+}
+void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s) {
+    argmax_share_kernel<<<1, 1024, 0, s>>>(row, vn, v0, slot, seq);
+}
+void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
+                 cudaStream_t s) {
+    markov_pick_kernel<<<1, 256, 0, s>>>(slots, nm, seq, tok, E, erow, R);
 }
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s) {
@@ -1280,6 +1551,19 @@ void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStre
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
+    if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
+        static const bool f16 = [] {
+            const char* e = std::getenv("DS4_AR_F16");
+            return e == nullptr || std::atoi(e) != 0;   // (on unless DS4_AR_F16=0)
+        }();
+        const int n4 = n / 4;
+        const int blocks = std::max(1, std::min(kArBlocks, cdiv(n4, kThreads)));
+        if (f16)
+            ar_rs16_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
+        else
+            ar_rs_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
+        return;
+    }
     Xfer xp;
     xp.n = 1;
     xp.src[0] = x;

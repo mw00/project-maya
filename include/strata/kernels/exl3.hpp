@@ -69,6 +69,9 @@ void set_skip(const int* flag);
 /// How many pieces mv cuts m's inputs into on the current device (0: not covered) - one piece, and every column's
 /// sum is the same whatever columns the job holds (a view's, or the whole matrix's).
 int mv_splits(const Mat& m);
+/// How many activations a lone job of m can take with its weights read once on the current device (the input split's
+/// partials of them in the scratch; 0: not covered) - a caller with more cuts them in runs of this many.
+int mv_cols(const Mat& m);
 
 /// Allocates the per-stream scratch of mv / moe / win_experts on the current device (call once per stream before a
 /// graph capture; the first use does it otherwise).
