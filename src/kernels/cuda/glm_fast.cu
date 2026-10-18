@@ -1801,6 +1801,119 @@ bool mma_ok() {
 #endif
 }
 
+// cc 6.0 (Tesla P100 / PH402, GP100 - no dp4a, the VMAD emulation): the one-column Q6_K GEMV (the KDA / DSA
+// projections, the shared experts' gate/up, the dense FFN, the head - ~2/3 of a decode token's bytes) runs at
+// 135-150 GB/s of the 732 in mv_kernel_t, bound by its loads: a lane's call reads its weights in seven 8- and 16-bit
+// pieces (the 210-byte blocks are only 2-aligned), the instructions' arithmetic does not matter (an exact rewrite of
+// the integer work, 66 -> 52 SASS a row and call, changed nothing).  mv_q6_p100_kernel: a warp takes R rows, reads
+// each row's block as 53 aligned words (two coalesced loads a lane) and hands every lane its call's fields with six
+// shuffles; the activation is staged in shared memory once per block.  Each lane then makes dot_q6_K's calls in
+// row_dot's order with the same ints and floats (DecW<14>), so every row's sum is mv_kernel_t's bit for bit.  On a
+// PH402 die, us (mv_kernel_t -> this): the KDA q/k/v 24576 x 4096 561 -> 389, attn_output 4096 x 16384 406 -> 279,
+// q_b 16384 x 1536 142 -> 105, the shared expert's gate/up 4096 x 4096 106 -> 79, q_a + kv_a 2048 x 4096 59 -> 48
+// (R = 2), the FFN 12288 x 4096 287 -> 204, the head 154880 x 4096 3466 -> 2362.
+// p100_mv_mode: 0 off (mv_kernel_t; STRATA_GLM_MV_P100=0), else R by the launch's rows (STRATA_GLM_MV_P100_R=2 / 4
+// forces one), asked once per device
+#if !defined(STRATA_USE_HIP)
+// a Q6_K block's 53 words, two a lane: w0 = word lane, w1 = word 32 + lane (lanes 0-20) of the words starting sh = the
+// block's address mod 4 (0 or 2) bytes before it; its first / last half word read as a half, so nothing outside the
+// block is read
+__device__ __forceinline__ void q6_words(const uint8_t* s, int lane, uint32_t& w0, uint32_t& w1, int& sh) {
+    sh = (int) ((uintptr_t) s & 3);
+    const uint32_t* a = (const uint32_t*) (s - sh);
+    w0 = (lane == 0 && sh) ? (uint32_t) (*(const uint16_t*) s) << 16 : a[lane];
+    w1 = lane > 20 ? 0u : (lane == 20 && !sh) ? (uint32_t) * (const uint16_t*) (s + 208) : a[32 + lane];
+}
+// DecW<14>::load's fields for iqs = lane from the block's words (q6_words; the whole warp, the same block)
+__device__ __forceinline__ void q6_fields(DecW<14>& D, uint32_t w0, uint32_t w1, int sh, int lane) {
+    const int f = 8 * sh;
+    const uint32_t nx = __shfl_sync(0xffffffffu, lane == 0 ? w1 : w0, (lane + 1) & 31);
+    const int vl = (int) __funnelshift_r(w0, nx, f);   // ql int lane
+    const int qi = 8 * (lane / 16) + lane % 8;          // qh int qi
+    const uint32_t h0 = __shfl_sync(0xffffffffu, w1, qi), h1 = __shfl_sync(0xffffffffu, w1, qi + 1);
+    const int vh = (int) __funnelshift_r(h0, h1, f) >> (2 * ((lane % 16) / 8));
+    const int sb = 8 * (lane / 16) + (lane % 16) / 4 + sh;   // scales[so] and [so + 4] (bytes 192 +)
+    const uint32_t s0 = __shfl_sync(0xffffffffu, w1, 16 + (sb >> 2)), s1 = __shfl_sync(0xffffffffu, w1, 17 + (sb >> 2));
+    D.sc[0] = (int) (int8_t) (s0 >> (8 * (sb & 3)));
+    D.sc[1] = (int) (int8_t) (s1 >> (8 * (sb & 3)));
+    const uint32_t dw = __shfl_sync(0xffffffffu, w1, 20);   // d (bytes 208-209)
+    D.d = __half2float(__ushort_as_half((unsigned short) (dw >> f)));
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        D.vi[i] = __vsubss4(vil | vih, 0x20202020);
+    }
+}
+// R rows a warp (MV_ROWS warps a block); dynamic shared memory: the largest job's n_in / 32 q8_1 blocks
+template<int R>
+__global__ void __launch_bounds__(256) mv_q6_p100_kernel(const STRATA_GRID_CONSTANT MvBatch b) {
+    if (b.skip != nullptr && *b.skip) return;
+    extern __shared__ int mvq6_xs[];
+    const int bid = blockIdx.x;
+    int ji = 0;
+    while (ji < b.n - 1 && bid >= b.blk_end[ji]) ++ji;
+    const MvJob& J = b.j[ji];
+    const int blk0 = ji ? b.blk_end[ji - 1] : 0;
+    {
+        const int nw = (J.n_in / 32) * (int) (sizeof(block_q8_1) / 4);
+        for (int i = threadIdx.x; i < nw; i += blockDim.x) mvq6_xs[i] = ((const int*) J.xq)[i];
+        __syncthreads();
+    }
+    const block_q8_1* xq = (const block_q8_1*) mvq6_xs;
+    const int row0 = ((bid - blk0) * MV_ROWS + (threadIdx.x >> 5)) * R;
+    const int lane = threadIdx.x & 31;
+    if (row0 >= J.n_out) return;
+    const size_t rb = rbytes<14>(J.n_in);
+    const uint8_t* w[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) w[r] = (const uint8_t*) J.w + (size_t) min(row0 + r, J.n_out - 1) * rb;
+    float s[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) s[r] = 0.0f;
+    const int nk = (J.n_in / 256) * 32;   // (a multiple of 32: every lane makes the same trips, the shuffles' warp whole)
+    for (int k = lane; k < nk; k += 32) {
+        const int kbx = k / 32, iqs = k % 32;
+        uint32_t w0[R], w1[R];
+        int sh[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) q6_words(w[r] + (size_t) kbx * sizeof(block_q6_K), lane, w0[r], w1[r], sh[r]);
+        DecW<14> dw[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) q6_fields(dw[r], w0[r], w1[r], sh[r], lane);
+        const DecW<14>::X xv = DecW<14>::load_x(xq + kbx * 8, iqs);
+#pragma unroll
+        for (int r = 0; r < R; ++r) s[r] += dw[r].dot(xv);
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const float v = warp_sum(s[r]);
+        if (lane == 0 && row0 + r < J.n_out) J.y[row0 + r] = mv_out(J.alpha, v, J.bias ? J.bias[row0 + r] : 0.0f);
+    }
+}
+#endif
+int p100_mv_mode() {
+#if defined(STRATA_USE_HIP)
+    return 0;
+#else
+    static int cache[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return 0;
+    if (cache[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        const char* v = getenv("STRATA_GLM_MV_P100");
+        const char* rv = getenv("STRATA_GLM_MV_P100_R");
+        const int r = rv != nullptr ? std::atoi(rv) : 0;
+        const bool on = major == 6 && minor == 0 && (v == nullptr || std::atoi(v) != 0);
+        cache[dev] = on ? (r == 2 || r == 4 ? r : 1) : -1;   // 1: by the rows
+    }
+    return cache[dev] > 0 ? cache[dev] : 0;
+#endif
+}
+
 // ... BF16 weights against float activations (the routers, the indexer's projections): the same staging, in floats
 constexpr int MVC_FTILE = 512;   // floats of every column per tile
 
@@ -4891,15 +5004,41 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             MvBatch b{};
             b.skip = g_skip;
             int acc = 0, m = 0;
+            // cc 6.0: Q6_K through mv_q6_p100_kernel - R = 2 rows a warp below 4096 rows in the launch, else 4 (a
+            // launch of fewer than 1024 rows, and an activation over 48 KB, keep mv_kernel_t)
+            int pr = 0;
+            size_t xs_bytes = 0;
+#if !defined(STRATA_USE_HIP)
+            if (T == 14) {
+                if (const int mode = p100_mv_mode(); mode > 0) {
+                    int rows = 0, max_in = 0;
+                    for (int i = 0; i < n; ++i)
+                        if (!done[i] && jobs[i].type == T) {
+                            rows += jobs[i].n_out;
+                            max_in = std::max(max_in, jobs[i].n_in);
+                        }
+                    xs_bytes = (size_t) (max_in / 32) * sizeof(block_q8_1);
+                    if (rows >= 1024 && xs_bytes <= 48 * 1024) pr = mode > 1 ? mode : rows < 4096 ? 2 : 4;
+                }
+            }
+#endif
+            const int per = MV_ROWS * (pr > 0 ? pr : 1);
             for (int i = 0; i < n; ++i)
                 if (!done[i] && jobs[i].type == T) {
                     b.j[m] = jobs[i];
-                    acc += (jobs[i].n_out + MV_ROWS - 1) / MV_ROWS;
+                    acc += (jobs[i].n_out + per - 1) / per;
                     b.blk_end[m++] = acc;
                     done[i] = true;
                 }
             if (m == 0) continue;
             b.n = m;
+#if !defined(STRATA_USE_HIP)
+            if (pr > 0) {
+                if (pr == 2) mv_q6_p100_kernel<2><<<acc, 256, xs_bytes, s>>>(b);
+                else mv_q6_p100_kernel<4><<<acc, 256, xs_bytes, s>>>(b);
+                continue;
+            }
+#endif
             switch (T) {
                 case 14: mv_kernel_t<14><<<acc, 256, 0, s>>>(b); break;
                 case 8: mv_kernel_t<8><<<acc, 256, 0, s>>>(b); break;
