@@ -11,6 +11,7 @@
 #define CUDA_R_16BF HIP_R_16BF
 #define CUDA_R_16F HIP_R_16F
 #define CUDA_R_32F HIP_R_32F
+#define cudaDataType hipDataType
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
 #define cublasGemmEx hipblasGemmEx
