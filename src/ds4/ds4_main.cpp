@@ -12,6 +12,8 @@
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
 #include "ds4_model.hpp"
 
+#include <cuda_profiler_api.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -543,6 +545,18 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    if (!ids_s.empty() && ids_s[0] == '@') {   // --ids @FILE: the ids from a file (a long prompt passes no argv limit)
+        std::FILE* f = std::fopen(ids_s.c_str() + 1, "rb");
+        if (f == nullptr) {
+            std::fprintf(stderr, "strata-ds4: cannot open %s\n", ids_s.c_str() + 1);
+            return 1;
+        }
+        std::string all;
+        char buf[1 << 16];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) all.append(buf, n);
+        std::fclose(f);
+        ids_s = all;
+    }
     const std::vector<int> ids = parse_ids(ids_s);
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
         std::vector<Pic> pics;
@@ -564,6 +578,14 @@ int main(int argc, char** argv) {
         }
         m.set_images(std::move(imgs));
     }
+    // DS4_BENCH_REPEAT=N: the prompt and the decode N times, the state reset between them and the expert cache kept
+    // (the later passes measure a warmed cache, as a server's requests run)
+    const int reps = std::max(1, std::getenv("DS4_BENCH_REPEAT") ? std::atoi(std::getenv("DS4_BENCH_REPEAT")) : 1);
+    for (int rep = 0; rep < reps; ++rep) {
+    if (rep > 0) {
+        m.reset();
+        std::fprintf(stderr, "pass %d of %d\n", rep + 1, reps);
+    }
     std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
     std::vector<float> lg;
     const double t0 = now_ms();
@@ -582,6 +604,8 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "prompt: %zu tokens in %.0f ms (%.2f tok/s, windows of %d)\n", ids.size(), t1 - t0,
                  1000.0 * (double) ids.size() / (t1 - t0), window);
     const strata::ds4::Stats s0 = m.stats();
+    const bool prof = std::getenv("DS4_PROFILE") != nullptr;   // (nsys --capture-range=cudaProfilerApi: the decode alone)
+    if (prof && rep == reps - 1) cudaProfilerStart();   // (the last pass)
     std::vector<int> out;
     unsigned long long counter = 0;
     long long d_off = 0, d_acc = 0, rounds = 0;
@@ -614,6 +638,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
     }
+    if (prof && rep == reps - 1) cudaProfilerStop();
     if (spec && rounds > 0) {
         const auto& s1 = m.stats();
         const double nv = (double) std::max<int64_t>(1, s1.drafts_rounds - s0.drafts_rounds);
@@ -635,6 +660,7 @@ int main(int argc, char** argv) {
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
     if (df != nullptr) std::fclose(df);
+    }
     m.save_profile();
     return 0;
 }
