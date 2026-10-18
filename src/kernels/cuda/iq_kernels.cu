@@ -8,6 +8,7 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA

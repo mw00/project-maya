@@ -296,6 +296,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME glm_lat8_test COMMAND glm_lat8_test)
     set_tests_properties(glm_lat8_test PROPERTIES TIMEOUT 60)
   endif()
+  # __dp4a as the kernels see it (sm_60: kernels/dp4a.hpp's vmad fallback) against the byte-wise form (GPU, no model)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(dp4a_sm60_test tests/dp4a_sm60_test.cu)
+    target_link_libraries(dp4a_sm60_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME dp4a_sm60_test COMMAND dp4a_sm60_test)
+    set_tests_properties(dp4a_sm60_test PROPERTIES TIMEOUT 60)
+  endif()
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
   # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON
   if(STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN)
