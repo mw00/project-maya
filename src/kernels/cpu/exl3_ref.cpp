@@ -24,21 +24,28 @@ float exl3_decode(uint32_t state, int cb) {
     return f32_from_f16(f16_from_f32(f32_from_f16((uint16_t) (x & 0xffffu)) + f32_from_f16((uint16_t) (x >> 16))));
 }
 
+void exl3_tile_states(const uint32_t* t, int K, uint16_t* st) {
+    const int W = 8 * K;
+    for (int p = 0; p < 256; ++p) {
+        const int b1 = (p + 1 + 256) * K;   // one ring on: the window's first bit is never below 0
+        const int i1 = (b1 - 1) >> 5, i0 = (b1 - 16) >> 5;
+        const int sh = ((i1 + 1) << 5) - b1;
+        const uint64_t m = ((uint64_t) t[i0 % W] << 32) | (uint64_t) t[i1 % W];
+        st[p] = (uint16_t) ((m >> sh) & 0xffffu);
+    }
+}
+
 void exl3_inner(const uint32_t* trellis, int ld, int k, int n, int K, int cb, float* w) {
     const int W = 8 * K;
+    uint16_t st[256];
     for (int ks = 0; ks < k / 16; ++ks)
         for (int tc = 0; tc < n / 16; ++tc) {
-            const uint32_t* t = trellis + ((size_t) ks * ld + tc) * W;
+            exl3_tile_states(trellis + ((size_t) ks * ld + tc) * W, K, st);
             for (int p = 0; p < 256; ++p) {
-                const int b1 = (p + 1 + 256) * K;
-                const int i1 = (b1 - 1) >> 5, i0 = (b1 - 16) >> 5;
-                const int sh = ((i1 + 1) << 5) - b1;
-                const uint64_t m = ((uint64_t) t[i0 % W] << 32) | (uint64_t) t[i1 % W];
-                const uint32_t st = (uint32_t) (m >> sh) & 0xffffu;
                 const int lane = p >> 3, j = p & 7;
                 const int r = ks * 16 + (lane & 3) * 2 + (j & 1) + 8 * ((j >> 1) & 1);
                 const int c = tc * 16 + (lane >> 2) + 8 * (j >> 2);
-                w[(size_t) r * n + c] = exl3_decode(st, cb);
+                w[(size_t) r * n + c] = exl3_decode(st[p], cb);
             }
         }
 }

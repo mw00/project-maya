@@ -3,7 +3,10 @@
 // split (k > 4096 and the occupancy split), column views, q8_1 input, the routed experts with a skipped plan entry,
 // the CPU lane's part and the shared expert, and the full reconstruction.
 //
-//   exl3_test            run everything, exit 0 when every case is within tolerance
+//   exl3_test                     run everything, exit 0 when every case is within tolerance
+//   exl3_test --exllamav3 <dir>   the decoders against exllamav3 itself: tools/exl3_exllamav3_fixture.py's random
+//                                 tiles (data/exl3-exllamav3) - the same states and W' bit for bit
+//   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -15,7 +18,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <numeric>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -911,6 +918,16 @@ const char* cpu_tier_name(int tier) { return tier == 2 ? "avx512" : tier == 1 ? 
 // bit (p + 1 + 256) K of the tile's MSB-first bit ring (p: the tile's step at (r, c) - row (p/8 % 4) 2 + (p & 1) +
 // 8 (p/2 & 1), column p/32 + 8 (p/4 & 1)), read bit by bit; its mul1 byte sum s; and one fma(s, xh, acc) a weight in
 // (slice, row) order
+// step p's state, read bit by bit from the tile's MSB-first bit ring (the window that ends at bit (p + 1 + 256) K)
+uint32_t model_state(const uint32_t* tile, int K, int p) {
+    const int bits = 256 * K, end = (p + 1 + 256) * K;
+    uint32_t st = 0;
+    for (int q = end - 16; q < end; ++q) {
+        const int b = q % bits;
+        st = (st << 1) | ((tile[b >> 5] >> (31 - (b & 31))) & 1u);
+    }
+    return st;
+}
 float exact_band_col(const cpu::Exl3Part& m, const float* xh, int col, int ks0, int ks1) {
     static int step[16][16];
     static bool init = false;
@@ -918,17 +935,12 @@ float exact_band_col(const cpu::Exl3Part& m, const float* xh, int col, int ks0, 
         for (int p = 0; p < 256; ++p) step[(p / 8 % 4) * 2 + (p & 1) + 8 * (p / 2 & 1)][p / 32 + 8 * (p / 4 & 1)] = p;
         init = true;
     }
-    const int bits = 256 * m.K, t = col / 16, c = col % 16;
+    const int t = col / 16, c = col % 16;
     float a = 0.0f;
     for (int ks = ks0; ks < ks1; ++ks) {
         const uint32_t* tile = m.trellis + ((size_t) ks * (m.n / 16) + t) * 8 * m.K;
         for (int r = 0; r < 16; ++r) {
-            const int end = (step[r][c] + 1 + 256) * m.K;
-            uint32_t st = 0;
-            for (int q = end - 16; q < end; ++q) {
-                const int b = q % bits;
-                st = (st << 1) | ((tile[b >> 5] >> (31 - (b & 31))) & 1u);
-            }
+            const uint32_t st = model_state(tile, m.K, step[r][c]);
             const uint32_t x = st * 0x83DCD12Du;
             const int s = (int) ((x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + (x >> 24));
             a = std::fma((float) s, xh[ks * 16 + r], a);
@@ -1012,14 +1024,384 @@ void test_cpu(int k, int n, int K) {
            std::to_string(n) + " K" + std::to_string(K)).c_str(), got, ref, 2e-3);
 }
 
+
+// ---------------------------------------------------------------- against exllamav3 itself
+// tools/exl3_exllamav3_fixture.py writes what exllamav3 makes of EXL3 tiles - random states packed by its packer, each
+// step's state as its unpacker reads it, W' as its reconstruct decodes it (data/exl3-exllamav3) - and of a model's
+// matrices (--model).  Every decoder here is held to the same bits: the CPU reference (states, W'), the exact model
+// the CPU tiers are tested against (its bit-by-bit window), the CPU lane (bit for bit that model on exllamav3's
+// tiles), the device's W' in both layouts.
+
+bool read_bytes(const std::string& path, std::vector<uint8_t>& b) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return false;
+    b.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    return !f.bad();
+}
+
+void report(const std::string& what, size_t bad, size_t n) {
+    std::printf("  %-44s %zu of %zu differ  %s\n", what.c_str(), bad, n, bad || n == 0 ? "FAIL" : "ok");
+    if (bad || n == 0) ++g_fail;
+}
+
+struct Fixture {
+    int k2 = 0, ki = 0, nj = 0, cb = 0, words = 0;
+    std::vector<uint32_t> tr;   // [ki][nj][words / 2]: the stored int16 pairs as the engine reads them
+    std::vector<uint16_t> st;   // [ki][nj][256]
+    std::vector<uint16_t> wh;   // [16 ki][16 nj] FP16 bits
+};
+
+bool read_fixture(const std::string& path, Fixture& f, std::string& err) {
+    std::vector<uint8_t> b;
+    if (!read_bytes(path, b)) {
+        err = "cannot read it";
+        return false;
+    }
+    if (b.size() < 24 || std::memcmp(b.data(), "EXH1", 4) != 0) {
+        err = "not an EXH1 fixture";
+        return false;
+    }
+    int32_t h[5];
+    std::memcpy(h, b.data() + 4, sizeof(h));
+    f.k2 = h[0], f.ki = h[1], f.nj = h[2], f.cb = h[3], f.words = h[4];
+    if (f.k2 < 2 || f.k2 > 16 || f.words != 8 * f.k2 || f.ki < 1 || f.nj < 1 || f.nj % 8 != 0 || f.cb < 0 || f.cb > 2) {
+        err = "bad header (k2 " + std::to_string(f.k2) + ", " + std::to_string(f.ki) + " x " + std::to_string(f.nj) +
+              " tiles, cb " + std::to_string(f.cb) + ", " + std::to_string(f.words) + " words a tile)";
+        return false;
+    }
+    const size_t tiles = (size_t) f.ki * f.nj, n_tr = tiles * (size_t) f.words * 2, n_st = tiles * 512;
+    if (b.size() != 24 + n_tr + 2 * n_st) {
+        err = std::to_string(b.size()) + " bytes, want " + std::to_string(24 + n_tr + 2 * n_st);
+        return false;
+    }
+    f.tr.resize(n_tr / 4);
+    f.st.resize(tiles * 256);
+    f.wh.resize(tiles * 256);
+    std::memcpy(f.tr.data(), b.data() + 24, n_tr);
+    std::memcpy(f.st.data(), b.data() + 24 + n_tr, n_st);
+    std::memcpy(f.wh.data(), b.data() + 24 + n_tr + n_st, n_st);
+    return true;
+}
+
+// W' of m on the device in both layouts against want ([k][n] FP16 bits): reconstruct_inner (row-major) and
+// reconstruct_inner_rows (dst[c][r])
+void device_w_hat(const ex::Mat& m, const std::vector<uint16_t>& want, const std::string& tag) {
+    const size_t kn = (size_t) m.k * m.n;
+    uint16_t* d = nullptr;
+    CK(cudaMalloc(&d, kn * 2));
+    ex::reconstruct_inner(m, d, 0);
+    CK(cudaDeviceSynchronize());
+    std::vector<uint16_t> got = host_copy(d, kn);
+    size_t bad = 0;
+    for (size_t i = 0; i < kn; ++i) bad += got[i] != want[i];
+    report("device W' (inner) " + tag, bad, kn);
+    ex::reconstruct_inner_rows(m, d, 0);
+    CK(cudaDeviceSynchronize());
+    got = host_copy(d, kn);
+    bad = 0;
+    for (int r = 0; r < m.k; ++r)
+        for (int c = 0; c < m.n; ++c) bad += got[(size_t) c * m.k + r] != want[(size_t) r * m.n + c];
+    report("device W' (inner rows) " + tag, bad, kn);
+    CK(cudaFree(d));
+}
+
+// the CPU tiers this CPU runs against the exact model on bands [c0, c0 + 128) of m, 1 and 3 activations at once
+void lane_vs_model(const cpu::Exl3Part& m, const std::vector<int>& bands, const std::string& tag) {
+    constexpr int NT = 3;
+    std::vector<std::vector<float>> xh;
+    const float* xp[NT];
+    for (int i = 0; i < NT; ++i) xh.push_back(rand_x(m.k));
+    for (int i = 0; i < NT; ++i) xp[i] = xh[(size_t) i].data();
+    std::vector<float> want((size_t) NT * 128), got((size_t) NT * 128);
+    float* gp[NT];
+    for (int i = 0; i < NT; ++i) gp[i] = got.data() + (size_t) i * 128;
+    for (int tier = 1; tier <= 2; ++tier) {
+        size_t bad = 0, cmp = 0;
+        for (int c0 : bands) {
+            for (int i = 0; i < NT; ++i)
+                for (int j = 0; j < 128; ++j) want[(size_t) i * 128 + j] = exact_band_col(m, xp[i], c0 + j, 0, m.k / 16);
+            for (int nt : {1, NT}) {
+                if (!cpu::exl3_cpu_band_acc_on(tier, m, xp, nt, c0, 0, m.k / 16, gp)) break;
+                for (size_t i = 0; i < (size_t) nt * 128; ++i, ++cmp) bad += std::memcmp(&got[i], &want[i], 4) != 0;
+            }
+        }
+        if (cmp) report(std::string("cpu ") + cpu_tier_name(tier) + " vs the model " + tag, bad, cmp);
+    }
+}
+
+void test_exllamav3_fixture(const std::string& path) {
+    Fixture f;
+    std::string err;
+    const std::string name = std::filesystem::path(path).filename().string();
+    if (!read_fixture(path, f, err)) {
+        std::printf("  %-44s %s  FAIL\n", name.c_str(), err.c_str());
+        ++g_fail;
+        return;
+    }
+    if (f.k2 % 2 != 0) {
+        std::printf("  %-44s K %d.5: a bitrate this engine does not decode  FAIL\n", name.c_str(), f.k2 / 2);
+        ++g_fail;
+        return;
+    }
+    const int K = f.k2 / 2, W = 8 * K, k = 16 * f.ki, n = 16 * f.nj;
+    const std::string tag = "K" + std::to_string(K) + " cb" + std::to_string(f.cb);
+    // the states: the CPU reference's and the exact model's
+    size_t bad_ref = 0, bad_model = 0;
+    uint16_t st[256];
+    for (size_t t = 0; t < (size_t) f.ki * f.nj; ++t) {
+        cpu::exl3_tile_states(f.tr.data() + t * W, K, st);
+        for (int p = 0; p < 256; ++p) {
+            bad_ref += st[p] != f.st[t * 256 + p];
+            bad_model += model_state(f.tr.data() + t * W, K, p) != f.st[t * 256 + p];
+        }
+    }
+    report("exllamav3 states: CPU reference " + tag, bad_ref, f.st.size());
+    report("exllamav3 states: the CPU tiers' model " + tag, bad_model, f.st.size());
+    // the CPU reference's W'
+    std::vector<float> w((size_t) k * n);
+    cpu::exl3_inner(f.tr.data(), f.nj, k, n, K, f.cb, w.data());
+    size_t bad = 0;
+    for (size_t i = 0; i < w.size(); ++i) bad += f16_from_f32(w[i]) != f.wh[i];
+    report("exllamav3 W': CPU reference " + tag, bad, w.size());
+    // the device and the CPU lane take k a multiple of 128: the tile rows repeated
+    const int reps = 128 / std::gcd(k, 128), kk = reps * k;
+    std::vector<uint32_t> big;
+    std::vector<uint16_t> want;
+    for (int r = 0; r < reps; ++r) {
+        big.insert(big.end(), f.tr.begin(), f.tr.end());
+        want.insert(want.end(), f.wh.begin(), f.wh.end());
+    }
+    const std::vector<uint16_t> one_k((size_t) kk, (uint16_t) 0x3c00), one_n((size_t) n, (uint16_t) 0x3c00);
+    ex::Mat m;
+    m.trellis = dev_copy(big);
+    m.suh = dev_copy(one_k);
+    m.svh = dev_copy(one_n);
+    m.k = kk;
+    m.n = n;
+    m.K = K;
+    m.cb = f.cb;
+    device_w_hat(m, want, tag + " k" + std::to_string(kk));
+    if (f.cb == 2) {   // the CPU lane decodes mul1
+        cpu::Exl3Part c;
+        c.trellis = big.data();
+        c.suh = one_k.data();
+        c.svh = one_n.data();
+        c.k = kk;
+        c.n = n;
+        c.K = K;
+        std::vector<int> bands;
+        for (int c0 = 0; c0 < n; c0 += 128) bands.push_back(c0);
+        lane_vs_model(c, bands, tag + " k" + std::to_string(kk));
+    }
+}
+
+void test_exllamav3(const std::string& dir) {
+    std::vector<std::string> files;
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+        const std::string fn = e.path().filename().string();
+        if (fn.rfind("exl3_k2_", 0) == 0 && e.path().extension() == ".bin") files.push_back(e.path().string());
+    }
+    const auto key = [](const std::string& path) {   // exl3_k2_<k2>_cb<cb>.bin: by bitrate, then codebook
+        int k2 = 0, cb = 0;
+        std::sscanf(std::filesystem::path(path).filename().string().c_str(), "exl3_k2_%d_cb%d", &k2, &cb);
+        return std::make_pair(k2, cb);
+    };
+    std::sort(files.begin(), files.end(), [&](const std::string& a, const std::string& b) { return key(a) < key(b); });
+    std::printf("exllamav3 fixtures in %s: %zu\n", dir.c_str(), files.size());
+    if (files.empty()) {
+        std::printf("  no exl3_k2_*.bin fixtures there (tools/exl3_exllamav3_fixture.py writes them)  FAIL\n");
+        ++g_fail;
+    }
+    for (const auto& f : files) test_exllamav3_fixture(f);
+}
+
+// a model's matrices against exllamav3's decode (the fixture tool's --model files: <base>.trellis.i16 / .suh.f16 /
+// .svh.f16 / .what.f16 / .w.f16, manifest lines "<base> <k2> <cb> <k> <n>"): W' bit for bit from the CPU reference and
+// the device (both layouts); the full weight against exllamav3's reconstruct_had_slice (its fused kernel rounds
+// otherwise, so within FP16 rounding); the CPU lane against the reference's product and bit for bit its model
+template <typename T>
+bool read_raw(const std::string& path, size_t n, std::vector<T>& v) {
+    std::vector<uint8_t> b;
+    if (!read_bytes(path, b) || b.size() != n * sizeof(T)) {
+        std::printf("  %-44s missing or %zu bytes, want %zu  FAIL\n", path.c_str(), b.size(), n * sizeof(T));
+        ++g_fail;
+        return false;
+    }
+    v.resize(n);
+    std::memcpy(v.data(), b.data(), b.size());
+    return true;
+}
+
+// W = diag(suh) H W' H diag(svh) [k][n] in F64 (H: the 128-point blocks over sqrt(128) along each axis)
+std::vector<double> full_weight_f64(const std::vector<float>& w, const std::vector<uint16_t>& suh,
+                                    const std::vector<uint16_t>& svh, int k, int n) {
+    std::vector<double> t(w.begin(), w.end());
+    const double s = 1.0 / std::sqrt(128.0);
+    auto had = [s](double* v, size_t stride) {   // one 128-value block, values stride apart
+        for (int h = 1; h < 128; h <<= 1)
+            for (int i = 0; i < 128; i += 2 * h)
+                for (int j = i; j < i + h; ++j) {
+                    const double a = v[(size_t) j * stride], c = v[(size_t) (j + h) * stride];
+                    v[(size_t) j * stride] = a + c;
+                    v[(size_t) (j + h) * stride] = a - c;
+                }
+        for (int i = 0; i < 128; ++i) v[(size_t) i * stride] *= s;
+    };
+    for (int r = 0; r < k; ++r)
+        for (int c0 = 0; c0 < n; c0 += 128) had(t.data() + (size_t) r * n + c0, 1);
+    for (int r0 = 0; r0 < k; r0 += 128)
+        for (int c = 0; c < n; ++c) had(t.data() + (size_t) r0 * n + c, (size_t) n);
+    for (int r = 0; r < k; ++r)
+        for (int c = 0; c < n; ++c)
+            t[(size_t) r * n + c] *= (double) f32_from_f16(suh[(size_t) r]) * (double) f32_from_f16(svh[(size_t) c]);
+    return t;
+}
+
+// FP16 values against an exact reference: the relative RMS error, and the worst error over the reference's largest
+// magnitude (what FP16 rounding of the values and of intermediates of their size is bounded by: 2^-11 of it each)
+struct ErrStats {
+    double rel = 0.0, worst = 0.0;
+};
+ErrStats err_stats(const std::vector<uint16_t>& got, const std::vector<double>& ref) {
+    ErrStats u;
+    double se = 0.0, sr = 0.0, mx = 0.0, amax = 0.0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        const double g = (double) f32_from_f16(got[i]), e = std::isfinite(g) ? std::fabs(g - ref[i]) : 1e300;
+        mx = std::max(mx, e);
+        amax = std::max(amax, std::fabs(ref[i]));
+        se += e * e;
+        sr += ref[i] * ref[i];
+    }
+    u.rel = std::sqrt(se / std::max(sr, 1e-300));
+    u.worst = mx / std::max(amax, 1e-300);
+    return u;
+}
+
+void test_expect_one(const std::string& dir, const std::string& base, int k2, int cb, int k, int n) {
+    const std::string tag = base + " K" + std::to_string(k2 / 2) + (k2 % 2 ? ".5" : "") + " cb" + std::to_string(cb);
+    if (k2 % 2 != 0 || k2 < 2 || k2 > 16 || k % 128 || n % 128 || cb < 0 || cb > 2) {
+        std::printf("  %-44s not a matrix these kernels take  FAIL\n", tag.c_str());
+        ++g_fail;
+        return;
+    }
+    const int K = k2 / 2;
+    const size_t kn = (size_t) k * n;
+    std::vector<uint32_t> tr;
+    std::vector<uint16_t> suh, svh, what, wfull;
+    const std::string p = dir + "/" + base;
+    if (!read_raw(p + ".trellis.i16", kn * (size_t) K / 32, tr) || !read_raw(p + ".suh.f16", (size_t) k, suh) ||
+        !read_raw(p + ".svh.f16", (size_t) n, svh) || !read_raw(p + ".what.f16", kn, what) ||
+        !read_raw(p + ".w.f16", kn, wfull))
+        return;
+    std::printf("%s (%d x %d)\n", tag.c_str(), k, n);
+    std::vector<float> w(kn);
+    cpu::exl3_inner(tr.data(), n / 16, k, n, K, cb, w.data());
+    size_t bad = 0;
+    for (size_t i = 0; i < kn; ++i) bad += f16_from_f32(w[i]) != what[i];
+    report("W': CPU reference vs exllamav3", bad, kn);
+    ex::Mat m;
+    m.trellis = dev_copy(tr);
+    m.suh = dev_copy(suh);
+    m.svh = dev_copy(svh);
+    m.k = k;
+    m.n = n;
+    m.K = K;
+    m.cb = cb;
+    device_w_hat(m, what, "vs exllamav3");
+    // the full weight W = diag(suh) H W' H diag(svh): exactly (F64) from W' - exllamav3's own, above - then the
+    // device's rows (W^T, F16; one FP16 rounding of the tile between the two transforms and one of the result) and
+    // exllamav3's reconstruct_had_slice (its fused kernel rounds its FP16 intermediates) against it: both rounding
+    // noise, ~3e-4 and ~1e-3 relative - a wrong scale, sign or layout would be ~1
+    const std::vector<double> exact = full_weight_f64(w, suh, svh, k, n);
+    uint16_t* d = nullptr;
+    CK(cudaMalloc(&d, kn * 2));
+    ex::reconstruct_rows(m, d, false, 0);
+    CK(cudaDeviceSynchronize());
+    const std::vector<uint16_t> rows = host_copy(d, kn);
+    CK(cudaFree(d));
+    std::vector<uint16_t> ours(kn);
+    for (int r = 0; r < k; ++r)
+        for (int c = 0; c < n; ++c) ours[(size_t) r * n + c] = rows[(size_t) c * k + r];
+    const ErrStats a = err_stats(ours, exact), b = err_stats(wfull, exact);
+    const bool ok_a = a.rel < 5e-4 && a.worst < 2e-3, ok_b = b.rel < 3e-3 && b.worst < 1e-2;
+    std::printf("  %-44s rel %.2e  worst/max %.2e  %s\n", "W: device rows vs the exact W", a.rel, a.worst,
+                ok_a ? "ok" : "FAIL");
+    std::printf("  %-44s rel %.2e  worst/max %.2e  %s\n", "W: exllamav3's had reconstruct vs the exact W", b.rel,
+                b.worst, ok_b ? "ok" : "FAIL");
+    if (!ok_a) ++g_fail;
+    if (!ok_b) ++g_fail;
+    if (cb == 2) {
+        cpu::Exl3Part c;
+        c.trellis = tr.data();
+        c.suh = suh.data();
+        c.svh = svh.data();
+        c.k = k;
+        c.n = n;
+        c.K = K;
+        std::vector<float> x = rand_x(k), xh((size_t) k), y((size_t) n), yref((size_t) n);
+        cpu::exl3_mv(w.data(), suh.data(), svh.data(), k, n, x.data(), yref.data());
+        const float xs = cpu::exl3_cpu_prepare(c, x.data(), xh.data());
+        for (int c0 = 0; c0 < n; c0 += 128) cpu::exl3_cpu_band(c, xh.data(), xs, c0, y.data() + c0);
+        close((std::string("cpu ") + cpu_tier_name(cpu::exl3_cpu_tier()) + " x W vs the reference").c_str(), y, yref,
+              2e-3);
+        lane_vs_model(c, {0, n - 128}, "(first and last band)");
+    }
+}
+
+void test_expect(const std::string& dir) {
+    std::ifstream f(dir + "/manifest.txt");
+    if (!f) {
+        std::printf("  %s/manifest.txt: missing (tools/exl3_exllamav3_fixture.py --model writes it)  FAIL\n", dir.c_str());
+        ++g_fail;
+        return;
+    }
+    std::string line;
+    int n_mat = 0;
+    while (std::getline(f, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ss(line);
+        std::string base;
+        int k2 = 0, cb = 0, k = 0, n = 0;
+        if (!(ss >> base >> k2 >> cb >> k >> n)) {
+            std::printf("  manifest line \"%s\": not <base> <k2> <cb> <k> <n>  FAIL\n", line.c_str());
+            ++g_fail;
+            continue;
+        }
+        test_expect_one(dir, base, k2, cb, k, n);
+        ++n_mat;
+    }
+    std::printf("expect: %d matrices from %s\n", n_mat, dir.c_str());
+    if (n_mat == 0) ++g_fail;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     int dev = 0;
     cudaDeviceProp p{};
     CK(cudaGetDevice(&dev));
     CK(cudaGetDeviceProperties(&p, dev));
     std::printf("exl3_test on %s (%.1f GB)\n", p.name, (double) p.totalGlobalMem / 1e9);
+    std::string fx_dir, expect_dir;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--exllamav3" && i + 1 < argc) {
+            fx_dir = argv[++i];
+        } else if (a == "--expect" && i + 1 < argc) {
+            expect_dir = argv[++i];
+        } else {
+            std::fprintf(stderr, "usage: exl3_test [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
+            return 2;
+        }
+    }
+    if (!fx_dir.empty() || !expect_dir.empty()) {
+        if (!fx_dir.empty()) test_exllamav3(fx_dir);
+        if (!expect_dir.empty()) test_expect(expect_dir);
+        std::printf("exl3_test: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok", g_fail,
+                    ex::launch_errors());
+        return g_fail || ex::launch_errors() ? 1 : 0;
+    }
     test_decode_table();
     for (int K = 1; K <= 8; ++K)
         for (int cb = 0; cb <= 2; ++cb) test_mv(256, 256, K, cb, false);

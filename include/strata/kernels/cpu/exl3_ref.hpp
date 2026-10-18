@@ -9,6 +9,9 @@ namespace strata::kernels::cpu {
 
 /// The codebook value of one 16-bit trellis state (exactly the device's FP16 result, as F32).
 float exl3_decode(uint32_t state, int cb);
+/// The 16-bit states of one tile's 256 steps in step order (exllamav3's unpack_trellis): step p's state is the window
+/// that ends at bit (p + 1) K of the tile's 8 K words read MSB-first, around the tile.
+void exl3_tile_states(const uint32_t* tile, int K, uint16_t* st);
 /// W'[r][c] (row-major k x n, F32) of the k x n matrix whose first tile is `trellis` (ld tiles per 16-row slice).
 void exl3_inner(const uint32_t* trellis, int ld, int k, int n, int K, int cb, float* w);
 /// The blockwise 128-point Sylvester transform over sqrt(128), in place (n % 128 == 0).
