@@ -295,6 +295,9 @@ public:
     /// The continuation's tokens decoded so far, and how many of them differ from the model's own pick.
     size_t follow_used() const { return follow_at_; }
     size_t follow_differ() const { return follow_differ_; }
+    /// The continuation's token k places after the one forced() returns next (-1: past its end, or no continuation) -
+    /// a decode that checks a whole window of drafts before it emits any (DFlash2) compares them with these.
+    int32_t follow_peek(size_t k) const { return follow_at_ + k < follow_.size() ? follow_[follow_at_ + k] : -1; }
 
 private:
     bool step(int32_t token, std::string& err);   // one token through all layers

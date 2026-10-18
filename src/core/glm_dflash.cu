@@ -1909,6 +1909,12 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         out.assign((size_t) T, 0);
         tok[0] = y;
         for (int i = 1; i < T; ++i) tok[(size_t) i] = d[(size_t) i - 1];
+        // row t's token as it will go out: the window's pick, or --spec-follow's continuation there (forced() takes
+        // one a token as they are emitted below; a draft stands while it is the token that goes out)
+        const auto goes_out = [&](int t) {
+            const int32_t f = follow_peek((size_t) t);   // (forced() returns it whatever else is forced)
+            return f >= 0 ? f : out[(size_t) t];
+        };
         if (pipe) {
             const auto hq0 = std::chrono::steady_clock::now();
             for (int i = 1; i < T; ++i)
@@ -1923,7 +1929,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
                 if (!win_pipe_pick(t, out[(size_t) t], err)) return false;
                 if (tl != nullptr) tl_pick.push_back(ms_since(t_anchor));
                 if (t + 1 >= T) break;
-                if (tok[(size_t) t + 1] != out[(size_t) t]) {
+                if (tok[(size_t) t + 1] != goes_out(t)) {
                     win_pipe_cancel_from(t + 1);   // the drafts after it: their work still queued is skipped
                     break;
                 }
@@ -1949,7 +1955,7 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         // the longest right prefix of the drafts; each kept token goes out in turn (a forced next token - the
         // reasoning closed by the caller - ends the run there, like a wrong draft)
         int acc = 0;
-        while (acc < T - 1 && tok[(size_t) acc + 1] == out[(size_t) acc]) ++acc;
+        while (acc < T - 1 && tok[(size_t) acc + 1] == goes_out(acc)) ++acc;
         if (stats != nullptr) {
             const auto t_win = std::chrono::steady_clock::now();
             const auto lm = lane_of();
@@ -1970,7 +1976,9 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
         for (; kept < acc; ++kept) {
             sp.counter += 1;
             ++produced;
-            more = emit(tok[(size_t) kept + 1]) && produced < max_new;
+            // (the kept draft, through forced() as every emitted token: --spec-follow's continuation moves on and
+            //  counts the model's own pick here)
+            more = emit(forced(out[(size_t) kept])) && produced < max_new;
             if (!more || force_tok_ >= 0) {
                 ++kept;
                 break;
