@@ -417,7 +417,8 @@ DS4_DEFAULT_CONTEXT = 65536
 DS4_MODEL_NAME = "deepseek-v4.1-flash"
 DS4_SAMPLING = {"temperature": 1.0, "top_p": 1.0}   # DeepSeek's own
 DS4_EFFORT = "high"                                 # (encoding.py's default: a reasoning effort of 75)
-DS4_MEMORY_GB = 230                                 # VRAM + RAM it takes: its 211 GB of weights, the pinned tables
+DS4_MEMORY_GB = 230                                 # VRAM + RAM that hold it all (211 GB of weights, the pinned
+                                                    # tables); with less the engine reads experts from the SSD
 FAMILIES = ("glm", "deepseek")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
@@ -972,12 +973,12 @@ def check_pc(a, family: str = "glm") -> dict:
 
     total, avail = mem_gb()
     msg = f"RAM: {total:.0f} GB, {avail:.0f} GB available now"
-    if ds4:   # (its experts live in VRAM or RAM: none are read from the SSD)
+    if ds4:   # (below DS4_MEMORY_GB the engine reads the experts RAM cannot hold from the SSD: --mmap-experts auto)
         if vram + total < DS4_MEMORY_GB:
-            problems.append((f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: {DS4} needs about {DS4_MEMORY_GB} GB of "
-                             "the two together (its 211 GB of weights live in VRAM or RAM)",
-                             "use more GPUs (--gpus) or a PC with more RAM - or set up GLM-5.3-Flash, which also "
-                             "reads experts from the SSD"))
+            warn(f"{msg}; with {vram:.0f} GB of VRAM that is below the ~{DS4_MEMORY_GB} GB that hold all of {DS4}'s "
+                 "211 GB of weights, so the experts that do not fit are read from the model's files on the SSD, "
+                 "much slower (one RTX 3090 and 64 GB measured: prompts ~50 tokens/s, answers ~4-5 tokens/s). "
+                 "More GPUs (--gpus) or RAM make it faster")
         else:
             ok(msg + f"; with {vram:.0f} GB of VRAM that holds {DS4}")
         if len(chosen) % 2 or len({round(g["vram_gb"]) for g in chosen}) > 1:
@@ -1126,8 +1127,9 @@ def choose_family(a, prev: dict) -> str:
             (DS4, "experimental",
              "DeepSeek's DeepSeek-V4.1-Flash-1017 in LibertAIDAI's EXL3 quant at 2.9 bits (211 GB) and its two Engram "
              "tables (203 GB, from DeepSeek's repo) - 414 GB to download. Its own engine: Linux, NVIDIA RTX 30 / "
-             f"A100 or newer, about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}; tensor parallel across pairs "
-             "of equal GPUs, DSpark drafting, a 256K context, pictures with its own vision tower.")]
+             f"A100 or newer; fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the "
+             "experts that do not fit are read from the SSD (much slower); tensor parallel across pairs of equal "
+             "GPUs, DSpark drafting, a 256K context, pictures with its own vision tower.")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 

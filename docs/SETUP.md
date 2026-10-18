@@ -10,8 +10,11 @@ It first asks which model to set up:
 - **GLM-5.3-Flash** - Project Maya's GGUF quants (or turboderp's EXL3 quants), from one GPU up; the steps below;
 - **DeepSeek-V4.1-Flash-1017** (experimental) - [LibertAIDAI's EXL3 quant at 2.9 bits](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw)
   (211 GB) and its two Engram tables from [DeepSeek's repo](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-  (203 GB), on its own engine (`build/strata-ds4`): Linux, NVIDIA RTX 30 / A100 or newer, about 230 GB of VRAM and
-  RAM together. The same steps with these differences: the contexts are 32K-256K (64K recommended); step 5 shows both
+  (203 GB), on its own engine (`build/strata-ds4`): Linux, NVIDIA RTX 30 / A100 or newer. It is fast with about 230 GB
+  of VRAM and RAM together; with less, the setup warns and the engine reads the experts that do not fit from the
+  model's files on the SSD (`--mmap-experts auto`), much slower - one RTX 3090 with 64 GB of RAM: prompts about 50
+  tokens/s, answers 4-5 tokens/s (faster with `--dspark none`). The same steps with these differences: the
+  contexts are 32K-256K (64K recommended); step 5 shows both
   sources and checks every file against its pinned size (and, once downloaded, its sha256: `tools/ds4/download.json`);
   `--model-dir DIR` uses files you already have; the pack is `DIR/maya-ds4/` (`tools/ds4/pack.py`, about a minute);
   pictures need nothing more - the model's own vision tower runs in the engine; the config is `maya-ds4.json`, with
