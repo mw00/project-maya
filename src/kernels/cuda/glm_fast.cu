@@ -218,6 +218,23 @@ __device__ __forceinline__ float dot_q5_K(const void* vbq, const block_q8_1* bq8
     return dm5f.x * sumf_d - dm5f.y * sumf_m;
 }
 
+// sm_60: Q6_K's integer steps as exact rewrites (the float expressions and their order untouched, so every sum is the
+// generic form's bit for bit) - worth ~9% of the Q6_K GEMV once its loads stopped being the limit (mv_q6_p100_kernel):
+//   q - 32 per byte, q in [0, 63]: (q + 0x60) ^ 0x80 never carries out of its byte - __vsubss4(q, 0x20202020) (which
+//     never saturates there) in 2 instructions instead of its SIMD-in-word emulation;
+//   dp4a * scale: |dp4a| <= 4 * 32 * 128 and |scale| <= 128 fit 16 bits - one mul.wide.s16 for the 32-bit multiply;
+//   the product to float: |p| <= 2^21 < 2^22, so 0x4B400000 + p is the float 1.5 * 2^23 + p exactly and subtracting
+//     1.5 * 2^23 is exact - an add and an FADD for the conversion (the same float as (float) p).
+#if GLMF_SM60
+__device__ __forceinline__ int q6_m32(int q) { return (q + 0x60606060) ^ (int) 0x80808080; }
+__device__ __forceinline__ int mul_s16(int a, int b) {
+    int r;
+    asm("mul.wide.s16 %0, %1, %2;" : "=r"(r) : "h"((short) a), "h"((short) b));
+    return r;
+}
+__device__ __forceinline__ float i2f_s22(int p) { return __int_as_float(p + 0x4B400000) - 12582912.0f; }
+#endif
+
 __device__ __forceinline__ float dot_q6_K(const void* vbq, const block_q8_1* bq8_1, const int& kbx, const int& iqs) {
     const block_q6_K* w = (const block_q6_K*) vbq + kbx;
     const int bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
@@ -234,8 +251,12 @@ __device__ __forceinline__ float dot_q6_K(const void* vbq, const block_q8_1* bq8
         const int sc = scales[4 * i];
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+#if GLMF_SM60
+        sumf += d8 * i2f_s22(mul_s16(__dp4a(q6_m32(vil | vih), u, 0), sc));
+#else
         const int vi = __vsubss4(vil | vih, 0x20202020);
         sumf += d8 * (__dp4a(vi, u, 0) * sc);
+#endif
     }
     return __half2float(w->d) * sumf;
 }
@@ -361,7 +382,11 @@ template<> struct DecW<14> {
             sc[i] = scales[4 * i];
             const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
             const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+#if GLMF_SM60
+            vi[i] = q6_m32(vil | vih);   // (dot_q6_K's sm_60 rewrites)
+#else
             vi[i] = __vsubss4(vil | vih, 0x20202020);
+#endif
         }
         d = __half2float(w->d);
     }
@@ -378,7 +403,12 @@ template<> struct DecW<14> {
     __device__ __forceinline__ float dot(const X& x) const {
         float sumf = 0.0f;
 #pragma unroll
-        for (int i = 0; i < 2; ++i) sumf += x.d8[i] * (__dp4a(vi[i], x.u[i], 0) * sc[i]);
+        for (int i = 0; i < 2; ++i)
+#if GLMF_SM60
+            sumf += x.d8[i] * i2f_s22(mul_s16(__dp4a(vi[i], x.u[i], 0), sc[i]));
+#else
+            sumf += x.d8[i] * (__dp4a(vi[i], x.u[i], 0) * sc[i]);
+#endif
         return d * sumf;
     }
 };
@@ -1842,7 +1872,11 @@ __device__ __forceinline__ void q6_fields(DecW<14>& D, uint32_t w0, uint32_t w1,
     for (int i = 0; i < 2; ++i) {
         const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
         const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+#if GLMF_SM60
+        D.vi[i] = q6_m32(vil | vih);   // (as DecW<14>::load)
+#else
         D.vi[i] = __vsubss4(vil | vih, 0x20202020);
+#endif
     }
 }
 // R rows a warp (MV_ROWS warps a block); dynamic shared memory: the largest job's n_in / 32 q8_1 blocks
