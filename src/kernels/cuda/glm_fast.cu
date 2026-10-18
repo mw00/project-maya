@@ -47,6 +47,12 @@ __device__ __forceinline__ float __ldcg(const float* p) {
 #else
 #define STRATA_GRID_CONSTANT
 #endif
+// the device pass for cc 6.0 (Tesla P100 / PH402, GP100: no dp4a, the SIMD-in-word intrinsics emulated)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 610 && !defined(STRATA_USE_HIP)
+#define GLMF_SM60 1
+#else
+#define GLMF_SM60 0
+#endif
 
 namespace strata::kernels::glmf {
 namespace {
@@ -867,6 +873,118 @@ template<> __device__ __forceinline__ float dw<29>(const uint8_t* row, int kbx, 
     const int sc1 = 2 * ((tmp >> 3) & 0x07) + 1;
     return d * ((sumi[0] + sumf[0]) * sc0 + (sumi[1] + sumf[1]) * sc1);
 }
+// sm_60: the routed experts' i-quant sign decode through a table in shared memory (moe_gate_up_kernel /
+// moe_down_kernel).  dw<T> spreads a sign byte's bits over the four bytes with __vcmpne4 and negates with __vsub4 -
+// two SIMD-in-word ops that sm_60 emulates in ~10 instructions each.  The table holds each sign byte's byte masks
+// for its low and high four bits (0xff where the value is negated); (g ^ m) + (m & 0x01010101) is __vsub4(g ^ m, m)
+// because every IQ2_S / IQ3_XXS / IQ3_S grid byte is nonzero (negating a nonzero byte never carries into the next) -
+// the same bytes, so the same sums.  IQ3_XXS: 7 sign bits + their parity (unpack_ksigns), 128 entries; IQ2_S /
+// IQ3_S: the sign byte, 256.  On a PH402 die (8 experts, the decode shapes): IQ2_S gate/up 312 -> 273 us, IQ3_XXS
+// down 167 -> 156, IQ3_S down 195 -> 185; IQ2_S keeps the two masks (the +1s by an AND: less shared-memory traffic,
+// faster for it), IQ3_* the masks with their +1s.
+template<int T> constexpr bool sm60_sign_on = GLMF_SM60 && (T == 18 || T == 21 || T == 22);
+template<int T> constexpr int sm60_sign_n = T == 18 ? 128 : 256;
+template<int T> constexpr int sm60_sign_w = T == 22 ? 2 : 4;   // u32 words an entry
+#if GLMF_SM60
+template<int T>
+__device__ __forceinline__ void sm60_load_signs(uint32_t* t) {
+    for (int i = threadIdx.x; i < sm60_sign_n<T>; i += blockDim.x) {
+        unsigned b = i;
+        if constexpr (T == 18) b |= (__popc(b) & 1) << 7;
+        unsigned lo = 0, hi = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            lo |= (0u - ((b >> j) & 1u)) & (255u << (8 * j));
+            hi |= (0u - ((b >> (j + 4)) & 1u)) & (255u << (8 * j));
+        }
+        if constexpr (sm60_sign_w<T> == 4) ((uint4*) t)[i] = make_uint4(lo, lo & 0x01010101u, hi, hi & 0x01010101u);
+        else ((uint2*) t)[i] = make_uint2(lo, hi);
+    }
+}
+struct Sm60Sign {
+    uint32_t lm, lp, hm, hp;   // the low / high four values' masks and +1s
+};
+template<int T>
+__device__ __forceinline__ Sm60Sign sm60_sign(const uint32_t* t, uint32_t idx) {
+    Sm60Sign r;
+    if constexpr (sm60_sign_w<T> == 4) {
+        const uint4 v = ((const uint4*) t)[idx];
+        r.lm = v.x, r.lp = v.y, r.hm = v.z, r.hp = v.w;
+    } else {
+        const uint2 v = ((const uint2*) t)[idx];
+        r.lm = v.x, r.lp = v.x & 0x01010101u, r.hm = v.y, r.hp = v.y & 0x01010101u;
+    }
+    return r;
+}
+// dw<T> with the table's signs (st: sm60_load_signs<T>'s table)
+template<int T> __device__ __forceinline__ float dws(const uint8_t* row, int kbx, int iqs, const XV& x,
+                                                     const uint32_t* tab, const uint32_t* st);
+template<> __device__ __forceinline__ float dws<18>(const uint8_t* row, int kbx, int iqs, const XV& x,
+                                                    const uint32_t* tab, const uint32_t* st) {
+    const block_iq3_xxs* bq3 = (const block_iq3_xxs*) row + kbx;
+    const int2 q3_packed = make_int2(get_int_b2(bq3->qs, iqs), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t* q3 = (const uint8_t*) &q3_packed;
+    const uint32_t aux32 = get_int_b2(bq3->qs, QK_K / 16 + iqs / 2);
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
+        const Sm60Sign sg = sm60_sign<18>(st, (aux32 >> (7 * l0 / 2)) & 127);
+        sumi = __dp4a((int) ((grid_pos.x ^ sg.lm) + sg.lp), x.u[l0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sg.hm) + sg.hp), x.u[l0 + 1], sumi);
+    }
+    const int ls = aux32 >> 28;
+    sumi = (ls * sumi + sumi / 2) / 2;
+    return __half2float(bq3->d) * x.d * sumi;
+}
+template<> __device__ __forceinline__ float dws<22>(const uint8_t* row, int kbx, int iqs, const XV& x,
+                                                    const uint32_t* tab, const uint32_t* st) {
+    const block_iq2_s* bq2 = (const block_iq2_s*) row + kbx;
+    const int qs_packed = get_int_b2(bq2->qs, iqs / 2);
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq2->qh[iqs / 2];
+    const int signs_packed_32 = get_int_b2(bq2->qs, QK_K / 32 + iqs / 2);
+    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+    const int ls0 = bq2->scales[iqs / 2] & 0x0F;
+    const int ls1 = bq2->scales[iqs / 2] >> 4;
+    int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+        const Sm60Sign sg = sm60_sign<22>(st, signs_packed_8[l0 / 2]);
+        const int grid_l = (int) ((grid_pos.x ^ sg.lm) + sg.lp);
+        const int grid_h = (int) ((grid_pos.y ^ sg.hm) + sg.hp);
+        if (l0 < 4) {
+            sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
+            sumi0 = __dp4a(grid_h, x.u[l0 + 1], sumi0);
+        } else {
+            sumi1 = __dp4a(grid_l, x.u[l0 + 0], sumi1);
+            sumi1 = __dp4a(grid_h, x.u[l0 + 1], sumi1);
+        }
+    }
+    const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+    return __half2float(bq2->d) * x.d * sumi;
+}
+template<> __device__ __forceinline__ float dws<21>(const uint8_t* row, int kbx, int iqs, const XV& x,
+                                                    const uint32_t* tab, const uint32_t* st) {
+    const block_iq3_s* bq3 = (const block_iq3_s*) row + kbx;
+    const int2 qs_packed = make_int2(get_int_b2(bq3->qs, iqs + 0), get_int_b2(bq3->qs, iqs + 1));
+    const uint8_t* qs = (const uint8_t*) &qs_packed;
+    const int qh = bq3->qh[iqs / 2];
+    const int signs_packed_32 = get_int_b2(bq3->signs, iqs / 2);
+    const uint8_t* signs_packed_8 = (const uint8_t*) &signs_packed_32;
+    int sumi = 0;
+#pragma unroll
+    for (int l0 = 0; l0 < 8; l0 += 2) {
+        const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)], tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+        const Sm60Sign sg = sm60_sign<21>(st, signs_packed_8[l0 / 2]);
+        sumi = __dp4a((int) ((grid_pos.x ^ sg.lm) + sg.lp), x.u[l0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sg.hm) + sg.hp), x.u[l0 + 1], sumi);
+    }
+    sumi *= 1 + 2 * ((bq3->scales[iqs / 4] >> ((iqs << 1) & 0x04)) & 0x0F);
+    return __half2float(bq3->d) * x.d * sumi;
+}
+#endif
 // HIP sign decode adapted from Strata src/prefill/moe_fused_iq.cu (MIT).
 // Every IQ2/IQ3 grid byte is nonzero and <= 62, so two's-complement negation
 // can use a whole-word add without carries across byte boundaries. Multiplying
@@ -1050,9 +1168,10 @@ template<> __device__ __forceinline__ float dwk<11>(const uint8_t* row, int kbx,
     }
     return __half2float(b->d) * sumf;
 }
-template<int T, int NR>
+// (SG: sm_60's sign table st - sm60_sign_on<T> types only)
+template<int T, int NR, bool SG = false>
 __device__ __forceinline__ void rows_dot(const uint8_t* const* rows, const block_q8_1* x, int n_in, int lane,
-                                         const uint32_t* tab, float* s) {
+                                         const uint32_t* tab, float* s, const uint32_t* st = nullptr) {
     using Fm = F<T>;
     const int nb = n_in / Fm::qk;
     float acc[NR];
@@ -1077,6 +1196,14 @@ __device__ __forceinline__ void rows_dot(const uint8_t* const* rows, const block
         for (int k = lane; k < nb * Fm::ipb; k += 32) {
             const int kbx = k / Fm::ipb, ki = k % Fm::ipb, iqs = Fm::step * ki;
             const XV xv = load_xv(x + kbx * (Fm::qk / 32) + ki);
+#if GLMF_SM60
+            if constexpr (SG && sm60_sign_on<T>) {
+#pragma unroll
+                for (int r = 0; r < NR; ++r) acc[r] += dws<T>(rows[r], kbx, iqs, xv, tab, st);
+                continue;
+            }
+#endif
+            (void) st;
 #pragma unroll
             for (int r = 0; r < NR; ++r) acc[r] += dw<T>(rows[r], kbx, iqs, xv, tab);
         }
@@ -3792,6 +3919,10 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if (ptr == 0ull) return;
     __shared__ float sg[GU_ROWS], su[GU_ROWS];
     __shared__ uint32_t s_tab[TabWords<TG>::n > 0 ? TabWords<TG>::n : 1];
+#if GLMF_SM60
+    __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TG> ? sm60_sign_n<TG> * sm60_sign_w<TG> : 1];
+    if constexpr (sm60_sign_on<TG>) sm60_load_signs<TG>(s_sg);
+#endif
 #if defined(STRATA_USE_HIP)
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TG> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TG>(s_sign);
@@ -3818,6 +3949,9 @@ moe_gate_up_kernel(MoeDev d, int k, int n_embd, int n_ff, float limit,
     if constexpr (LUT) {
         rows_dot_rdna<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s_sign, s, DIRECT, WIDE);
     } else
+#endif
+#if GLMF_SM60
+    if constexpr (sm60_sign_on<TG>) rows_dot<TG, 2 * RPW, true>(rows, xq, n_embd, lane, tab, s, s_sg); else
 #endif
     rows_dot<TG, 2 * RPW>(rows, xq, n_embd, lane, tab, s);
     if (lane == 0) {
@@ -3872,6 +4006,10 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
     __shared__ float s_w[8];
     __shared__ float s_part[8][NR];
     __shared__ uint32_t s_tab[TabWords<TD>::n > 0 ? TabWords<TD>::n : 1];
+#if GLMF_SM60
+    __shared__ __align__(16) uint32_t s_sg[sm60_sign_on<TD> ? sm60_sign_n<TD> * sm60_sign_w<TD> : 1];
+    if constexpr (sm60_sign_on<TD>) sm60_load_signs<TD>(s_sg);
+#endif
 #if defined(STRATA_USE_HIP)
     __shared__ uint4 s_sign[LUT && !DIRECT ? sign_count<TD> : 1];
     if constexpr (LUT && !DIRECT) load_signs<TD>(s_sign);
@@ -3899,6 +4037,9 @@ __global__ void __launch_bounds__(256) moe_down_kernel(MoeDev d, int k, int n_em
             if constexpr (LUT) {
                 rows_dot_rdna<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s_sign, s, DIRECT, WIDE);
             } else
+#endif
+#if GLMF_SM60
+            if constexpr (sm60_sign_on<TD>) rows_dot<TD, NR, true>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s, s_sg); else
 #endif
             rows_dot<TD, NR>(rows, hq + (size_t) warp * (n_ff / 32), n_ff, lane, tab, s);
         } else {
