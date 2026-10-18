@@ -369,6 +369,168 @@ void blas_ck(cublasStatus_t st, const char* what) {
     if (st != CUBLAS_STATUS_SUCCESS) std::fprintf(stderr, "glm prefill: %s: cuBLAS status %d\n", what, (int) st);
 }
 
+// EXL3 experts (MMQ does not read their trellis), each by its row count: a lightly routed one through the tensor-core
+// kernels (sm_80+; they decode the trellis once a 32-row block - cheaper than reconstructing 50 MB of FP16 for a few
+// rows), the rest reconstructed to FP16 and multiplied by cuBLAS (the decode once, the GEMM at the tensor cores' FP16
+// rate).  Both write the window's OUTP rows; w16 is their scratch.  The lane is one GPU's: the working part's prompt
+// path, and the waiting part computing its share of that part's experts (STRATA_GLM_PREFILL_CALC).
+struct X3Lane {
+    cudaStream_t s = nullptr;
+    cublasHandle_t blas = nullptr;
+    uint16_t* w16 = nullptr;          // the weight scratch, w16_elems FP16 values
+    int64_t w16_elems = 0;
+    const float* x = nullptr;         // the chunk's FFN inputs (n_embd floats a token)
+    const int* row_tok = nullptr;     // sorted row -> its token
+    float* OUTP = nullptr;            // the output window, W rows
+    int W = 0;
+    std::function<int(int, int)> place;   // sorted rows [a, a + n) -> the window row of a (it adds what it holds first)
+    const strata::kernels::exl3::ExpertLayout* lay = nullptr;
+    int E = 0, nff = 0;
+    float limit = 0.0f;               // the experts' swiglu clamp
+};
+// experts [i0, i1) of a set through the tensor-core kernels, in parts whose rows fit the window and w16's h
+void x3_run_mma(const X3Lane& L, const uint8_t* wbase, size_t stride, const int* d_bounds, const int* hb, int r0, int i0,
+                int i1) {
+    namespace x3 = strata::kernels::exl3;
+    const int E = L.E, nff = L.nff;
+    const int cap = std::min(L.W, (int) std::max<int64_t>(1, L.w16_elems / nff));
+    while (i0 < i1) {
+        int j = i0 + 1;
+        while (j < i1 && hb[j + 1] - hb[i0] <= cap) ++j;
+        const int a = hb[i0], nrows = hb[j] - a;
+        int max_rows = 0;
+        for (int i = i0; i < j; ++i) max_rows = std::max(max_rows, hb[i + 1] - hb[i]);
+        if (nrows > 0) {
+            x3::SetArgs sa;
+            sa.wbase = wbase + (size_t) i0 * stride;
+            sa.stride = stride;
+            sa.lay = *L.lay;
+            sa.n_exp = j - i0;
+            sa.bounds = d_bounds + i0;
+            sa.row0 = a;
+            sa.max_rows = max_rows;
+            sa.n_embd = E;
+            sa.n_ff = nff;
+            sa.limit = L.limit;
+            const int o = L.place(r0 + a, nrows);
+            x3::set_gate_up(sa, L.x, E, L.row_tok + r0 + a, L.w16, nff, L.s);
+            x3::set_down(sa, L.w16, nff, L.OUTP + (size_t) o * E, E, L.s);
+        }
+        i0 = j;
+    }
+}
+// one expert through reconstruct + cuBLAS.  By default the expert's rows are rotated instead of its weights
+// (x W = H(H(x * suh) W') * svh): the decoded W' alone goes to FP16 - a plain decode, not two 128-point
+// transforms of every weight - and the inputs and outputs of its few hundred rows take the rotations, as in
+// decode.  STRATA_GLM_EXL3_ROT=0: the weights rotated (reconstruct_rows), as before
+void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0) {
+    namespace x3 = strata::kernels::exl3;
+    static const bool rot_rows = [] {
+        const char* v = getenv("STRATA_GLM_EXL3_ROT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    const float one = 1.0f, zero = 0.0f;
+    const int E = L.E, nff = L.nff;
+    const cudaStream_t s = L.s;
+    const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
+    const int gu_rows = (int) std::max<int64_t>(1, (L.w16_elems - wgu) / (rot_rows ? 2 * E : E));
+    const int dn_rows = (int) std::max<int64_t>(1, (L.w16_elems - wdn) / nff);
+    const auto mat = [&](int r) {
+        x3::Mat m;
+        m.trellis = (const uint32_t*) (blob + L.lay->trellis[r]);
+        m.suh = (const uint16_t*) (blob + L.lay->suh[r]);
+        m.svh = (const uint16_t*) (blob + L.lay->svh[r]);
+        m.k = r < 2 ? E : nff;
+        m.n = r < 2 ? nff : E;
+        m.K = L.lay->K[r];
+        m.cb = L.lay->cb;
+        return m;
+    };
+    const int o = L.place(r0 + a, nrows);
+    float* GU = L.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the expert's own OUTP rows hold its gate/up
+    if (rot_rows) {
+        // gate and up: W' of each, the rows rotated by each one's suh, the outputs by its svh
+        for (int r = 0; r < 2; ++r) x3::reconstruct_inner_rows(mat(r), L.w16 + (size_t) r * nff * E, s);
+        uint16_t* X16 = L.w16 + wgu;
+        for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+            const int n = std::min(gu_rows, nrows - c0);
+            for (int r = 0; r < 2; ++r) {
+                uint16_t* Xr = X16 + (size_t) r * gu_rows * E;
+                x3::rows_rot_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, mat(r).suh, Xr, s);
+                blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, nff, n, E, &one,
+                                     L.w16 + (size_t) r * nff * E, CUDA_R_16F, E, Xr, CUDA_R_16F, E, &zero,
+                                     GU + (size_t) c0 * E + (size_t) r * nff, CUDA_R_32F, E,
+                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                        "gemm exl3 gate/up");
+            }
+        }
+        for (int r = 0; r < 2; ++r) x3::rows_rot_out(GU + (size_t) r * nff, E, nrows, nff, mat(r).svh, s);
+        gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
+        x3::reconstruct_inner_rows(mat(2), L.w16, s);
+        uint16_t* H16 = L.w16 + wdn;
+        for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
+            const int n = std::min(dn_rows, nrows - c0);
+            x3::rows_rot_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, mat(2).suh, H16, s);
+            blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff,
+                                 H16, CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E,
+                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "gemm exl3 down");
+        }
+        x3::rows_rot_out(GU, E, nrows, E, mat(2).svh, s);
+        return;
+    }
+    x3::reconstruct_rows(mat(0), L.w16, false, s);
+    x3::reconstruct_rows(mat(1), L.w16 + (size_t) nff * E, false, s);
+    uint16_t* X16 = L.w16 + wgu;
+    for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
+        const int n = std::min(gu_rows, nrows - c0);
+        x3::rows_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
+        blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, L.w16, CUDA_R_16F, E,
+                             X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "gemm exl3 gate/up");
+    }
+    gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
+    x3::reconstruct_rows(mat(2), L.w16, false, s);
+    uint16_t* H16 = L.w16 + wdn;
+    for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
+        const int n = std::min(dn_rows, nrows - c0);
+        x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
+        blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff, H16,
+                             CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
+                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                "gemm exl3 down");
+    }
+}
+// one set's experts in set order (the window takes the rows in order): runs of light experts to the tensor cores, the
+// rest alone.  STRATA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none)
+void x3_run_set(const X3Lane& L, const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
+                int r0) {
+    static const int mma_rows = [] {
+        const char* v = getenv("STRATA_GLM_EXL3_MMA_ROWS");
+        return v ? std::max(0, std::atoi(v)) : 64;
+    }();
+    const bool use_mma = mma_rows > 0 && strata::kernels::exl3::mma_supported();
+    for (int i = 0; i < n_exp;) {
+        const int rows = hb[i + 1] - hb[i];
+        if (use_mma && rows <= mma_rows) {
+            int j = i + 1;
+            while (j < n_exp && hb[j + 1] - hb[j] <= mma_rows) ++j;
+            x3_run_mma(L, wbase, stride, d_bounds, hb, r0, i, j);
+            i = j;
+        } else {
+            if (rows > 0) x3_run_blas(L, wbase + (size_t) i * stride, hb[i], rows, r0);
+            ++i;
+        }
+    }
+}
+
+// y[i] += a[i] (the waiting part's weighted sum into the working part's ffn rows)
+__global__ void add_f32_kernel(float* __restrict__ y, const float* __restrict__ a, int64_t n) {
+    for (int64_t i = blockIdx.x * (int64_t) blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] += a[i];
+}
+
 }  // namespace
 
 struct Glm5Model::PrefillState {
@@ -440,6 +602,99 @@ struct Glm5Model::PrefillState {
     cudaEvent_t ev_hready[NG] = {};
     uint64_t staged_help = 0;
     cudaEvent_t ev_hidle = nullptr;   // (on this GPU) its compute stream's queued work, before it helps the other
+    // THE WAITING PART COMPUTES (STRATA_GLM_PREFILL_CALC=1, Glm5Model::calc_prefill_ready: two parts whose halves run
+    // one after the other, no peer access): while this half runs a MoE layer of EXL3 experts, the other GPU (calc)
+    // computes a share of its RAM-tier experts - their weights over ITS PCIe link from this part's pinned RAM tier, the
+    // chunk's x and routes over the host to it, the weighted sum of its rows back over the host - so both links
+    // stream.  calc: that part while this half runs (prefill_run sets it).  calc_share: the RAM-tier experts left after
+    // the CPU's share that it takes, learned per layer from both lanes' times (STRATA_GLM_PREFILL_CALC_SHARE fixes it)
+    Glm5Model* calc = nullptr;
+    double calc_share = 0.5;
+    bool calc_fixed = false;
+    int sms = 0;                     // this GPU's multiprocessors (the slower GPU of the two takes the lighter experts)
+    // ... as the WORKING part (pinned portable host memory, events on this GPU): the routes (mapped - a kernel writes
+    // them), the other part's sum; x down (x_h, made portable), the sum up, this lane's last staged copy (timed)
+    int* cid_h = nullptr;
+    float* crw_h = nullptr;
+    float* cpart_h = nullptr;
+    size_t c_n = 0;                  // tokens those hold
+    cudaEvent_t ev_xh = nullptr, ev_cpart = nullptr, ev_ca0 = nullptr, ev_a1 = nullptr;
+    // the last helped layer's lane times are still to be read (the balance): its layer, chunk, and the bytes this
+    // GPU's link staged
+    bool calc_measure = false;
+    int calc_il = -1, calc_T = 0;
+    double calc_bytes_a = 0.0;
+    uint64_t calc_experts = 0, calc_rows = 0;   // stats: experts and rows the other part computed
+    // ... as the CALCULATING part: its buffers for the working part's layers, carved from this part's prompt carve
+    // (idle until its own half - calc_carve), its plan (base, bounds: pinned portable), and events on this GPU: x and
+    // the plan landed, a ring group landed / read, the sum's pieces down (timed: the lane's end), the lane's start
+    static constexpr int kCalcPieces = 4;
+    struct CalcBufs {
+        float *x = nullptr, *part = nullptr, *rw = nullptr, *win = nullptr;
+        int *ids = nullptr, *rank = nullptr, *pos = nullptr, *row_tok = nullptr, *counts = nullptr, *base = nullptr,
+            *bounds = nullptr;
+        uint8_t* ring = nullptr;
+        size_t stride = 0;           // the ring's slot (the working part's largest expert stride)
+        int W = 0, ng = 0;           // window rows; ring groups of GE slots
+        int T = 0;                   // the chunk it is carved for (0: none) ...
+        size_t space = 0;            // ... in an arena of this size
+    } cb;
+    bool cb_used = false;            // this part computed a share since its own half: its iota is to be set up again
+    int* cplan_h = nullptr;          // 4096 base + 4096 bounds
+    cudaEvent_t cev_plan = nullptr, cev_t0 = nullptr, cev_ready[NG] = {}, cev_free[NG] = {}, cev_done[kCalcPieces] = {};
+    cudaEvent_t ev_turn = nullptr;   // (prefill_run) a half's start: this part's other streams wait for its compute stream
+    // the calculating part's buffers for chunks of T tokens and ring slots of `stride`, in this part's carve: the
+    // arena (rows + layer scratch) and, when the ring fits there, gbuf - what is idle until this part's own half.
+    // false (why says it) when they do not fit
+    bool calc_carve(int Tn, size_t stride, int E, int K, int NE, std::string& why) {
+        if (arena == nullptr || w16 == nullptr) {
+            cb = CalcBufs{};
+            why = "no prompt carve";
+            return false;
+        }
+        const size_t space = (size_t) ((uint8_t*) w16 - arena);
+        if (cb.T == Tn && cb.stride == stride && cb.space == space) return true;
+        cb = CalcBufs{};
+        const size_t ring_one = (size_t) GE * stride;
+        const bool ring_in_gbuf = gbuf != nullptr && gbuf_bytes >= (size_t) NG * ring_one;
+        const auto lay = [&](uint8_t* base, int W, int ng) {
+            Carve c{base};
+            CalcBufs b;
+            b.x = c.take<float>((size_t) Tn * E);
+            b.part = c.take<float>((size_t) Tn * E);
+            b.ids = c.take<int>((size_t) Tn * K);
+            b.rw = c.take<float>((size_t) Tn * K);
+            b.rank = c.take<int>((size_t) Tn * K);
+            b.pos = c.take<int>((size_t) Tn * K);
+            b.row_tok = c.take<int>((size_t) Tn * K);
+            b.counts = c.take<int>((size_t) NE);
+            b.base = c.take<int>((size_t) NE);
+            b.bounds = c.take<int>(4096);
+            b.win = c.take<float>((size_t) W * E);
+            if (!ring_in_gbuf) b.ring = c.take<uint8_t>((size_t) ng * ring_one);
+            b.W = W;
+            b.ng = ng;
+            return std::make_pair(b, c.off);
+        };
+        // the window: every row the share could have (T x K), at least the chunk's T (one expert's most), as space allows;
+        // the ring: NG groups, else 2
+        for (int ng = NG; ng >= 2; --ng) {
+            const auto fixed = lay(nullptr, 0, ng).second;
+            if (fixed + (size_t) Tn * E * sizeof(float) > space) continue;
+            const size_t rows = (space - fixed) / ((size_t) E * sizeof(float));
+            const int W = (int) std::min<size_t>((size_t) Tn * K, rows);
+            auto b = lay(arena, W, ng);
+            cb = b.first;
+            if (ring_in_gbuf) cb.ring = gbuf;
+            cb.stride = stride;
+            cb.T = Tn;
+            cb.space = space;
+            return true;
+        }
+        why = "its prompt carve (" + std::to_string(space >> 20) + " MB) cannot hold the buffers for " +
+              std::to_string(Tn) + " tokens";
+        return false;
+    }
     std::vector<cudaEvent_t> ev_land;    // a landing slot's copy to the device ran: the reader may refill it
     // pinned host staging
     float* emb_h = nullptr;          // T x n_embd
@@ -521,11 +776,136 @@ struct Glm5Model::PrefillState {
         cudaEvent_t start = nullptr, plan = nullptr, pre = nullptr, c1 = nullptr, end = nullptr;
         int pre_n = 0, pre_left = 0, grp = 0, ncpu = 0, crows = 0;
         double dl = 0, dcpu = 0;
+        int calc_n = 0, calc_rows = 0;   // STRATA_GLM_PREFILL_CALC: the other part's share, and both lanes' ends (ms
+        double calc_a = 0, calc_b = 0;   // from the plan: this link's last copy, the other's sum here)
         bool on = false;
     };
     bool trace = false;
     std::vector<Tr> tr;
 };
+
+// STRATA_GLM_PREFILL_CALC: one MoE layer's share for the waiting part - what the working part's plan gave it
+struct Glm5Model::CalcJob {
+    Glm5Model* owner = nullptr;      // the working part (its pinned routes, x and sum buffers)
+    int T = 0;
+    const strata::kernels::exl3::ExpertLayout* lay = nullptr;   // the layer's experts' layout ...
+    size_t blob = 0;                 // ... and bytes
+    std::vector<const uint8_t*> ram;   // the share's experts in the working part's pinned RAM tier
+    std::vector<int> e, cnt;           // ... their ids and rows
+};
+
+// The waiting part's share of a working part's MoE layer, enqueued on THIS GPU (from the working part's thread for
+// it, this device current): the routes and the plan up, the share's weights from the working part's RAM tier over
+// this GPU's link into a ring of groups while the groups before compute (x3_run_set, as the working part would), the
+// rows' weighted sum (route order) into a zeroed T x n_embd sum, down to the working part's pinned memory in
+// kCalcPieces pieces - cev_done[k] each.  x came up already (the working part queued it on this copy stream).
+bool Glm5Model::prefill_calc(const CalcJob& J, std::string& err) {
+    PrefillState* S = pf_;
+    PrefillState* O = J.owner->pf_;
+    auto& cb = S->cb;
+    const cudaStream_t s = fast_->cs, cp = fast_->copy;
+    const int T = J.T, E = g_.n_embd, K = g_.n_exp_used, NE = g_.n_expert, nff = g_.n_ff_exp;
+    const int n = (int) J.e.size();
+    constexpr int GE = PrefillState::GE;
+    if (cb.T != T || cb.ring == nullptr || J.blob > cb.stride || NE > 4096) {
+        err = "glm prefill: CUDA" + std::to_string(dev_) + " has no buffers for the other GPU's share";
+        return false;
+    }
+    // the plan: the share's experts first, GE a group (their rows [0, nh) in this GPU's order); every other routed
+    // expert's rows at nh and on (never computed here, never in a window - the scatter only needs them in range)
+    int* hbase = S->cplan_h;
+    int* hb = S->cplan_h + 4096;
+    int nh = 0;
+    for (int j = 0; j < n; ++j) nh += J.cnt[(size_t) j];
+    for (int e = 0; e < NE; ++e) hbase[e] = nh;
+    struct Grp {
+        int first, n, r0, b_off;
+    };
+    std::vector<Grp> grp;
+    int nb = 0;
+    for (int i = 0, r = 0; i < n; i += GE) {
+        Grp gr{i, std::min(GE, n - i), r, nb};
+        hb[nb++] = 0;
+        int nr = 0;
+        for (int j = 0; j < gr.n; ++j) {
+            hbase[J.e[(size_t) (i + j)]] = r + nr;
+            nr += J.cnt[(size_t) (i + j)];
+            hb[nb++] = nr;
+        }
+        r += nr;
+        grp.push_back(gr);
+    }
+    if (nb > 4096) {
+        err = "glm prefill: the other GPU's share overflowed its bounds";
+        return false;
+    }
+    S->cb_used = true;
+    cudaEventRecord(S->cev_t0, s);   // the lane's start (this compute stream is idle: the last layer's sum was added)
+    cudaMemcpyAsync(cb.ids, O->cid_h, (size_t) T * K * sizeof(int), cudaMemcpyHostToDevice, cp);
+    cudaMemcpyAsync(cb.rw, O->crw_h, (size_t) T * K * sizeof(float), cudaMemcpyHostToDevice, cp);
+    cudaMemcpyAsync(cb.base, hbase, (size_t) NE * sizeof(int), cudaMemcpyHostToDevice, cp);
+    cudaMemcpyAsync(cb.bounds, hb, (size_t) nb * sizeof(int), cudaMemcpyHostToDevice, cp);
+    cudaEventRecord(S->cev_plan, cp);   // (x, queued before them on this stream, landed too)
+    cudaStreamWaitEvent(s, S->cev_plan, 0);
+    cudaMemsetAsync(cb.part, 0, (size_t) T * E * sizeof(float), s);
+    gb::expert_count(cb.ids, T * K, NE, cb.counts, cb.rank, s);
+    gb::expert_scatter(cb.ids, cb.rank, cb.base, T * K, K, cb.row_tok, cb.pos, s);
+    // the window over the share's rows, added into the sum as it fills (as the working part's into its ffn)
+    int wb = 0, w_lo = 0, w_hi = 0;
+    const auto flush = [&]() {
+        if (w_hi > w_lo) gb::moe_combine_add(cb.win, wb, w_lo, w_hi, cb.pos, cb.rw, T, K, E, cb.part, s);
+        w_lo = w_hi = 0;
+    };
+    X3Lane L;
+    L.s = s;
+    L.blas = S->blas;
+    L.w16 = S->w16;
+    L.w16_elems = S->w16_elems;
+    L.x = cb.x;
+    L.row_tok = cb.row_tok;
+    L.OUTP = cb.win;
+    L.W = cb.W;
+    L.place = [&](int a, int nr) {
+        if (!(w_hi > w_lo && a == w_hi && a + nr <= wb + cb.W)) {
+            flush();
+            wb = a;
+            w_lo = a;
+        }
+        w_hi = a + nr;
+        return a - wb;
+    };
+    L.lay = J.lay;
+    L.E = E;
+    L.nff = nff;
+    L.limit = g_.swiglu_exp;
+    for (size_t gi = 0; gi < grp.size(); ++gi) {
+        const Grp& gr = grp[gi];
+        const int b = (int) (gi % (size_t) cb.ng);
+        uint8_t* slot = cb.ring + (size_t) b * GE * cb.stride;
+        cudaStreamWaitEvent(cp, S->cev_free[b], 0);
+        for (int j = 0; j < gr.n; ++j)
+            cudaMemcpyAsync(slot + (size_t) j * cb.stride, J.ram[(size_t) (gr.first + j)], J.blob, cudaMemcpyHostToDevice,
+                            cp);
+        cudaEventRecord(S->cev_ready[b], cp);
+        cudaStreamWaitEvent(s, S->cev_ready[b], 0);
+        x3_run_set(L, slot, gr.n, cb.stride, cb.bounds + gr.b_off, hb + gr.b_off, gr.r0);
+        cudaEventRecord(S->cev_free[b], s);
+    }
+    flush();
+    for (int k = 0; k < PrefillState::kCalcPieces; ++k) {
+        const int t0 = T * k / PrefillState::kCalcPieces, t1 = T * (k + 1) / PrefillState::kCalcPieces;
+        if (t1 > t0)
+            cudaMemcpyAsync(O->cpart_h + (size_t) t0 * E, cb.part + (size_t) t0 * E, (size_t) (t1 - t0) * E * sizeof(float),
+                            cudaMemcpyDeviceToHost, s);
+        cudaEventRecord(S->cev_done[k], s);
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        err = std::string("glm prefill: the other GPU's share: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
 
 int Glm5Model::prefill_chunk() const { return pf_ ? pf_->T : 0; }
 
@@ -1377,6 +1757,17 @@ void Glm5Model::prefill_destroy() {
         if (S->ev_hready[b]) cudaEventDestroy(S->ev_hready[b]);
     }
     if (S->ev_hidle) cudaEventDestroy(S->ev_hidle);
+    // (STRATA_GLM_PREFILL_CALC's: every event of this part's lives on this GPU)
+    for (cudaEvent_t e : {S->ev_xh, S->ev_cpart, S->ev_ca0, S->ev_a1, S->cev_plan, S->cev_t0, S->ev_turn})
+        if (e) cudaEventDestroy(e);
+    for (int b = 0; b < PrefillState::NG; ++b) {
+        if (S->cev_ready[b]) cudaEventDestroy(S->cev_ready[b]);
+        if (S->cev_free[b]) cudaEventDestroy(S->cev_free[b]);
+    }
+    for (cudaEvent_t e : S->cev_done)
+        if (e) cudaEventDestroy(e);
+    for (void* p : {(void*) S->cid_h, (void*) S->crw_h, (void*) S->cpart_h, (void*) S->cplan_h})
+        if (p) cudaFreeHost(p);
     for (auto e : S->ev_land)
         if (e) cudaEventDestroy(e);
     if (S->ev_hop) cudaEventDestroy(S->ev_hop);
@@ -1741,7 +2132,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         if (ok && S->x_h_n < (size_t) T * E) {
             if (S->x_h) cudaFreeHost(S->x_h);
             S->x_h_n = (size_t) T * E;
-            ok = cudaHostAlloc((void**) &S->x_h, S->x_h_n * sizeof(float), cudaHostAllocDefault) == cudaSuccess;
+            // (portable when the other part may compute a share: its copy stream reads x from here)
+            ok = cudaHostAlloc((void**) &S->x_h, S->x_h_n * sizeof(float),
+                               S->ev_xh != nullptr ? cudaHostAllocPortable : cudaHostAllocDefault) == cudaSuccess;
         }
         if (ok && S->rows_h_n < (size_t) cpu_nrows) {
             if (S->rt_h) cudaFreeHost(S->rt_h);
@@ -1774,6 +2167,47 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             return false;
         S->kv_next = il;
         return true;
+    };
+    // STRATA_GLM_PREFILL_CALC: the other part computes a share of this half's EXL3 MoE layers - its buffers in its
+    // own prompt carve, laid out for this chunk (idle until its half: prefill_run's turn() keeps the streams apart)
+    Glm5Model* const C = S->calc;
+    bool calc_half = false;
+    if (C != nullptr) {
+        std::string why;
+        if ((size_t) T > S->c_n)
+            why = "the pinned buffers hold " + std::to_string(S->c_n) + " tokens";
+        else if (C->pf_->calc_carve(T, S->gstride, E, K, g.n_expert, why))
+            calc_half = true;
+        if (!calc_half)
+            std::fprintf(stderr, "glm prefill: CUDA%d computes no share of CUDA%d's experts in this chunk (%s)\n",
+                         C->dev_, dev_, why.c_str());
+    }
+    // ... and its balance, from a helped layer's two lanes (both from its plan): this GPU's staged copies against the
+    // other GPU's sum on the host plus its way up here (at this link's measured rate) - the share is nudged until they
+    // end together (STRATA_GLM_PREFILL_CALC_SHARE: fixed)
+    const auto calc_balance = [&]() {
+        S->calc_measure = false;
+        if (C == nullptr) return;
+        float ta = 0.0f, tb = 0.0f;
+        bool ok = cudaEventElapsedTime(&ta, S->ev_ca0, S->ev_a1) == cudaSuccess;
+        cudaSetDevice(C->dev_);   // (the other lane's events are on its GPU)
+        ok = ok && cudaEventElapsedTime(&tb, C->pf_->cev_t0, C->pf_->cev_done[PrefillState::kCalcPieces - 1]) == cudaSuccess;
+        cudaSetDevice(dev_);
+        if (!ok) {
+            const cudaError_t e = cudaGetLastError();
+            std::fprintf(stderr, "glm prefill: CUDA%d the waiting GPU's lane times did not read (%s) - its share stays %.2f\n",
+                         dev_, cudaGetErrorString(e), S->calc_share);
+            return;
+        }
+        const double rate = S->calc_bytes_a > 0.0 && ta > 0.5f ? S->calc_bytes_a / ta : 0.0;   // bytes a ms
+        const double up = rate > 0.0 ? (double) S->calc_T * E * sizeof(float) / rate : 0.0;
+        if (S->trace && S->calc_il >= 0) {
+            S->tr[(size_t) S->calc_il].calc_a = ta;
+            S->tr[(size_t) S->calc_il].calc_b = tb + up;
+        }
+        if (S->calc_fixed || tb <= 0.5f) return;
+        const double want = std::max(1.0, (double) ta - up);
+        S->calc_share = std::min(0.9, std::max(0.05, S->calc_share * std::min(1.25, std::max(0.8, std::sqrt(want / tb)))));
     };
     S->mark("start", s);
     if (!kv_prefetch(kv_dsa_from(l0_))) return false;   // (the layers before the first DSA layer run meanwhile)
@@ -2037,7 +2471,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         // the CPU lane's x (this layer's FFN input) goes down now, under the shared expert and the routing - not
         // after the plan, where the host's experts waited for it (~40 ms of a 16K chunk's 260 MB)
         bool x_down = false;
-        if (Ly.moe && cpu_lane(il)) {
+        // (and the other part's, when it computes a share of this layer: there x goes on up, over its link, while this
+        // GPU runs the shared expert and the router)
+        const bool calc_on = calc_half && Ly.moe && Ly.exl3;
+        if (Ly.moe && (cpu_lane(il) || calc_on)) {
             if (!cpu_bufs(0)) {
                 err = "glm prefill: the CPU experts' host buffers did not allocate";
                 return false;
@@ -2046,6 +2483,13 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaStreamWaitEvent(S->xs, S->ev_x, 0);
             cudaMemcpyAsync(S->x_h, S->x, (size_t) T * E * sizeof(float), cudaMemcpyDeviceToHost, S->xs);
             x_down = true;
+        }
+        if (calc_on) {
+            cudaEventRecord(S->ev_xh, S->xs);
+            cudaSetDevice(C->dev_);
+            cudaStreamWaitEvent(C->fast_->copy, S->ev_xh, 0);
+            cudaMemcpyAsync(C->pf_->cb.x, S->x_h, (size_t) T * E * sizeof(float), cudaMemcpyHostToDevice, C->fast_->copy);
+            cudaSetDevice(dev_);
         }
 
         if (!Ly.moe) {
@@ -2081,6 +2525,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         gb::route(M.logits, Ly.router_bias, NE, K, g.w_scale, g.norm_w != 0, T, M.ids, M.rw, s);
         gb::expert_count(M.ids, T * K, NE, M.counts, M.rank, s);
         gb::copy_i32(M.counts, S->h_counts, NE, s);   // (not a copy: the engine may be busy with x, x_down)
+        if (calc_on) {   // the routes for the other part, the same way (landed by the sync below)
+            gb::copy_i32(M.ids, S->cid_h, T * K, s);
+            gb::copy_i32((const int*) M.rw, (int*) S->crw_h, T * K, s);
+        }
         S->mark("route", s);
         if (!glmfast::cuda_ok(cudaStreamSynchronize(s), "glm prompt route/count sync", err)) return false;
         int counted = 0;
@@ -2105,6 +2553,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaEventCreate(&S->ev_c1);
         }
         cudaEventRecord(S->ev_c0, s);
+        if (calc_on) {
+            if (S->calc_measure) calc_balance();   // (the last helped layer's events are done: its sum was added)
+            cudaEventRecord(S->ev_ca0, s);
+        }
         if (S->trace) {
             auto& t = S->tr[(size_t) il];
             cudaEventRecord(t.plan, s);
@@ -2256,8 +2708,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 std::sort(ram_i.begin(), ram_i.end(), [&](size_t a, size_t b) {
                     return S->h_counts[staged[a].e] < S->h_counts[staged[b].e];
                 });
-                // (the streaming rate: the prestage copies', else the calibration's)
-                const double p_ms = S->copy_ms > 0.0 ? S->copy_ms : F->cpu_ps_ms > 0.0 ? F->cpu_ps_ms : F->cpu_p_ms;
+                // (the streaming rate: the prestage copies', else the calibration's; with the other part computing
+                // its share, this link moves only the rest - the PCIe side's time shrinks by that share)
+                const double p_ms = (S->copy_ms > 0.0 ? S->copy_ms : F->cpu_ps_ms > 0.0 ? F->cpu_ps_ms : F->cpu_p_ms) *
+                                    (calc_on ? 1.0 - S->calc_share : 1.0);
                 // the prestage copies the copy stream still owes (a mixer shorter than the buffer's copies): the
                 // staged groups queue behind them
                 int pre_left = 0;
@@ -2271,7 +2725,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
                 double t_cpu = 0.0, t_pcie = (double) (n_pcie + pre_left) * p_ms;
                 std::vector<char> take(staged.size(), 0);
-                const int cpu_cap = moe_window_rows((size_t) T, g);   // (the device rows their outputs go up into)
+                // (the device rows their outputs go up into; the other part's sum takes the last T of them)
+                const int cpu_cap = moe_window_rows((size_t) T, g) - (calc_on ? T : 0);
                 int cpu_rows_taken = 0;
                 for (size_t i : ram_i) {
                     // (an expert's fixed cost is about twice the lane's one-token expert: its weights, and the
@@ -2288,6 +2743,27 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 for (size_t i = 0; i < staged.size(); ++i) (take[i] ? cpu_set : rest).push_back(staged[i]);
                 staged.swap(rest);
             }
+        }
+        // THE OTHER PART'S SHARE (STRATA_GLM_PREFILL_CALC): calc_share of the RAM-tier experts left go to the waiting
+        // GPU - the lightest ones when it has fewer multiprocessors than this one (the slower at computing), else the
+        // most routed; this GPU keeps the rest, the VRAM-tail and the disk ones.  Their rows go last in the sorted
+        // order, never computed here: the other part's weighted sum of them is added into ffn after the combine
+        std::vector<Staged> calc_set;
+        if (calc_on) {
+            std::vector<size_t> ri;
+            for (size_t i = 0; i < staged.size(); ++i)
+                if (staged[i].ram != nullptr && !staged[i].dev) ri.push_back(i);
+            const bool light = C->pf_->sms <= S->sms;
+            std::stable_sort(ri.begin(), ri.end(), [&](size_t a, size_t b) {
+                return light ? S->h_counts[staged[a].e] < S->h_counts[staged[b].e]
+                             : S->h_counts[staged[a].e] > S->h_counts[staged[b].e];
+            });
+            const size_t nc = std::min(ri.size(), (size_t) std::lround(S->calc_share * (double) ri.size()));
+            std::vector<char> give(staged.size(), 0);
+            for (size_t k = 0; k < nc; ++k) give[ri[k]] = 1;
+            std::vector<Staged> rest;
+            for (size_t i = 0; i < staged.size(); ++i) (give[i] ? calc_set : rest).push_back(staged[i]);
+            staged.swap(rest);
         }
         int rows = rows_res + rows_pre;
         struct Group {
@@ -2314,6 +2790,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             rows += S->h_counts[cx.e];
         }
         const int cpu_nrows = rows - cpu_r0;
+        const int calc_r0 = rows;
+        for (const auto& cx : calc_set) {
+            S->h_base[cx.e] = rows;
+            rows += S->h_counts[cx.e];
+        }
+        const int calc_nrows = rows - calc_r0;
         if (rows != T * K) {
             err = "glm prefill: layer " + std::to_string(il) + " planned " + std::to_string(rows) + " of " +
                   std::to_string(T * K) + " routed rows";
@@ -2470,6 +2952,31 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 if (x3_ok) x3_cpu();
                 x3_t1 = std::chrono::steady_clock::now();
             });
+        // the other part's share (STRATA_GLM_PREFILL_CALC): its work goes onto its GPU from a thread of its own (this
+        // thread's launches block once this GPU's queue is full), joined before the sum's way up is queued here
+        const bool calc_run = calc_on && !calc_set.empty();
+        CalcJob calc_job;
+        bool calc_ok = true;
+        std::string calc_err;
+        std::thread calc_th;
+        Join calc_join{calc_th};
+        if (calc_run) {
+            calc_job.owner = this;
+            calc_job.T = T;
+            calc_job.lay = &Ly.xl;
+            calc_job.blob = Ly.blob;
+            for (const auto& cx : calc_set) {
+                calc_job.ram.push_back(cx.ram);
+                calc_job.e.push_back(cx.e);
+                calc_job.cnt.push_back(S->h_counts[cx.e]);
+            }
+            S->calc_experts += calc_set.size();
+            S->calc_rows += (uint64_t) calc_nrows;
+            calc_th = std::thread([&] {
+                cudaSetDevice(C->dev_);
+                calc_ok = C->prefill_calc(calc_job, calc_err);
+            });
+        }
 
         // ---- the OUTPUT WINDOW: OUTP row 0 is sorted row wb; rows [w_lo, w_hi) are computed and not yet added into ffn.
         //      A set's rows go in contiguous with what it holds, else the window is added into ffn first (moe_combine_add)
@@ -2608,126 +3115,21 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 i0 = i1;
             }
         };
-        // EXL3 experts (MMQ does not read their trellis), each by its row count: a lightly routed one through the
-        // tensor-core kernels (sm_80+; they decode the trellis once a 32-row block - cheaper than reconstructing 50 MB
-        // of FP16 for a few rows), the rest reconstructed to FP16 and multiplied by cuBLAS (the decode once, the GEMM
-        // at the tensor cores' FP16 rate).  Both write the window's OUTP rows as run_set's; w16 is their scratch.
-        // STRATA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none)
-        static const int mma_rows = [] {
-            const char* v = getenv("STRATA_GLM_EXL3_MMA_ROWS");
-            return v ? std::max(0, std::atoi(v)) : 64;
-        }();
-        const bool use_mma = mma_rows > 0 && strata::kernels::exl3::mma_supported();
-        // experts [i0, i1) of the set through the tensor-core kernels, in parts whose rows fit the window and w16's h
-        const auto run_mma = [&](const uint8_t* wbase, size_t stride, const int* d_bounds, const int* hb, int r0, int i0,
-                                 int i1) {
-            namespace x3 = strata::kernels::exl3;
-            const int cap = std::min(W, (int) std::max<int64_t>(1, S->w16_elems / nff));
-            while (i0 < i1) {
-                int j = i0 + 1;
-                while (j < i1 && hb[j + 1] - hb[i0] <= cap) ++j;
-                const int a = hb[i0], nrows = hb[j] - a;
-                int max_rows = 0;
-                for (int i = i0; i < j; ++i) max_rows = std::max(max_rows, hb[i + 1] - hb[i]);
-                if (nrows > 0) {
-                    x3::SetArgs sa;
-                    sa.wbase = wbase + (size_t) i0 * stride;
-                    sa.stride = stride;
-                    sa.lay = Ly.xl;
-                    sa.n_exp = j - i0;
-                    sa.bounds = d_bounds + i0;
-                    sa.row0 = a;
-                    sa.max_rows = max_rows;
-                    sa.n_embd = E;
-                    sa.n_ff = nff;
-                    sa.limit = g.swiglu_exp;
-                    const int o = place(r0 + a, nrows);
-                    x3::set_gate_up(sa, S->x, E, M.row_tok + r0 + a, S->w16, nff, s);
-                    x3::set_down(sa, S->w16, nff, M.OUTP + (size_t) o * E, E, s);
-                }
-                i0 = j;
-            }
-        };
-        // one expert through reconstruct + cuBLAS.  By default the expert's rows are rotated instead of its weights
-        // (x W = H(H(x * suh) W') * svh): the decoded W' alone goes to FP16 - a plain decode, not two 128-point
-        // transforms of every weight - and the inputs and outputs of its few hundred rows take the rotations, as in
-        // decode.  STRATA_GLM_EXL3_ROT=0: the weights rotated (reconstruct_rows), as before
-        static const bool rot_rows = [] {
-            const char* v = getenv("STRATA_GLM_EXL3_ROT");
-            return v == nullptr || std::atoi(v) != 0;
-        }();
-        const auto run_blas = [&](const uint8_t* blob, int a, int nrows, int r0) {
-            namespace x3 = strata::kernels::exl3;
-            const int64_t wgu = (int64_t) 2 * nff * E, wdn = (int64_t) E * nff;
-            const int gu_rows = (int) std::max<int64_t>(1, (S->w16_elems - wgu) / (rot_rows ? 2 * E : E));
-            const int dn_rows = (int) std::max<int64_t>(1, (S->w16_elems - wdn) / nff);
-            const auto mat = [&](int r) {
-                x3::Mat m;
-                m.trellis = (const uint32_t*) (blob + Ly.xl.trellis[r]);
-                m.suh = (const uint16_t*) (blob + Ly.xl.suh[r]);
-                m.svh = (const uint16_t*) (blob + Ly.xl.svh[r]);
-                m.k = r < 2 ? E : nff;
-                m.n = r < 2 ? nff : E;
-                m.K = Ly.xl.K[r];
-                m.cb = Ly.xl.cb;
-                return m;
-            };
-            const int o = place(r0 + a, nrows);
-            float* GU = M.OUTP + (size_t) o * E;   // 2 * n_ff == n_embd: the expert's own OUTP rows hold its gate/up
-            if (rot_rows) {
-                // gate and up: W' of each, the rows rotated by each one's suh, the outputs by its svh
-                for (int r = 0; r < 2; ++r) x3::reconstruct_inner_rows(mat(r), S->w16 + (size_t) r * nff * E, s);
-                uint16_t* X16 = S->w16 + wgu;
-                for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
-                    const int n = std::min(gu_rows, nrows - c0);
-                    for (int r = 0; r < 2; ++r) {
-                        uint16_t* Xr = X16 + (size_t) r * gu_rows * E;
-                        x3::rows_rot_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, mat(r).suh, Xr, s);
-                        blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, nff, n, E, &one,
-                                             S->w16 + (size_t) r * nff * E, CUDA_R_16F, E, Xr, CUDA_R_16F, E, &zero,
-                                             GU + (size_t) c0 * E + (size_t) r * nff, CUDA_R_32F, E,
-                                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                                "gemm exl3 gate/up");
-                    }
-                }
-                for (int r = 0; r < 2; ++r) x3::rows_rot_out(GU + (size_t) r * nff, E, nrows, nff, mat(r).svh, s);
-                gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
-                x3::reconstruct_inner_rows(mat(2), S->w16, s);
-                uint16_t* H16 = S->w16 + wdn;
-                for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
-                    const int n = std::min(dn_rows, nrows - c0);
-                    x3::rows_rot_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, mat(2).suh, H16, s);
-                    blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff,
-                                         H16, CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E,
-                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                            "gemm exl3 down");
-                }
-                x3::rows_rot_out(GU, E, nrows, E, mat(2).svh, s);
-                return;
-            }
-            x3::reconstruct_rows(mat(0), S->w16, false, s);
-            x3::reconstruct_rows(mat(1), S->w16 + (size_t) nff * E, false, s);
-            uint16_t* X16 = S->w16 + wgu;
-            for (int c0 = 0; c0 < nrows; c0 += gu_rows) {
-                const int n = std::min(gu_rows, nrows - c0);
-                x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
-                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
-                                     X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                        "gemm exl3 gate/up");
-            }
-            gb::swiglu_rows(GU, GU, nrows, nff, g.swiglu_exp, s, 2 * nff);
-            x3::reconstruct_rows(mat(2), S->w16, false, s);
-            uint16_t* H16 = S->w16 + wdn;
-            for (int c0 = 0; c0 < nrows; c0 += dn_rows) {
-                const int n = std::min(dn_rows, nrows - c0);
-                x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
-                blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
-                                     CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                        "gemm exl3 down");
-            }
-        };
+        // EXL3 experts: this GPU's lane (x3_run_set) over the window
+        X3Lane x3l;
+        x3l.s = s;
+        x3l.blas = S->blas;
+        x3l.w16 = S->w16;
+        x3l.w16_elems = S->w16_elems;
+        x3l.x = S->x;
+        x3l.row_tok = M.row_tok;
+        x3l.OUTP = M.OUTP;
+        x3l.W = W;
+        x3l.place = place;
+        x3l.lay = &Ly.xl;
+        x3l.E = E;
+        x3l.nff = nff;
+        x3l.limit = g.swiglu_exp;
         // FP16 EXPERTS (Volta): a quantized expert routed by at least STRATA_GLM_PREFILL_BLAS rows of the chunk is
         // dequantized to FP16 (llama.cpp's convert.cu) and multiplied by cuBLAS on the FP16 tensor cores - the
         // 25M-weight decode once an expert, the GEMM at the FP16 rate (~53 TFLOPS from ~200 rows an expert on a V100,
@@ -2805,22 +3207,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             }
         };
-        // in set order (the window takes the rows in order): runs of light experts to the tensor cores, the rest alone
         const auto run_set_x3 = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
-                                    int r0) {
-            for (int i = 0; i < n_exp;) {
-                const int rows = hb[i + 1] - hb[i];
-                if (use_mma && rows <= mma_rows) {
-                    int j = i + 1;
-                    while (j < n_exp && hb[j + 1] - hb[j] <= mma_rows) ++j;
-                    run_mma(wbase, stride, d_bounds, hb, r0, i, j);
-                    i = j;
-                } else {
-                    if (rows > 0) run_blas(wbase + (size_t) i * stride, hb[i], rows, r0);
-                    ++i;
-                }
-            }
-        };
+                                    int r0) { x3_run_set(x3l, wbase, n_exp, stride, d_bounds, hb, r0); };
         const auto run_any = [&](const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                                  int r0) {
             if (Ly.exl3) run_set_x3(wbase, n_exp, stride, d_bounds, hb, r0);
@@ -2995,8 +3383,20 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         dq.copied.store(std::max(dq.copied.load(), seg_end), std::memory_order_release);   // predicted, never routed
         S->staged_disk += dlist.size();
         if (cpu_nrows > 0) cudaEventRecord(S->ev_c1, F->copy);
+        if (calc_run) {   // this link's lane ends here (the balance reads it at the next helped layer)
+            cudaEventRecord(S->ev_a1, F->copy);
+            int na = 0;
+            for (const auto& st : staged) na += st.ram != nullptr && !st.dev;
+            S->calc_measure = true;
+            S->calc_il = il;
+            S->calc_T = T;
+            S->calc_bytes_a = (double) na * (double) Ly.blob;
+        }
         if (S->trace) {
             auto& t = S->tr[(size_t) il];
+            t.calc_n = (int) calc_set.size();
+            t.calc_rows = calc_nrows;
+            t.calc_a = t.calc_b = 0.0;
             cudaEventRecord(t.c1, F->copy);
             t.grp = n_staged_pcie;
             t.ncpu = (int) cpu_set.size();
@@ -3207,11 +3607,93 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 }
             }
         }
+        // the other part's sum: its pieces up into the last T rows of OUTPc as each lands (after the CPU rows' upload on
+        // this copy stream), added below after the combine
+        float* const calc_sum = M.OUTPc + (size_t) (W - T) * E;
+        if (calc_run) {
+            calc_th.join();
+            if (!calc_ok) {
+                err = calc_err.empty() ? "glm prefill: the other GPU's share failed" : calc_err;
+                return false;
+            }
+            for (int k = 0; k < PrefillState::kCalcPieces; ++k) {
+                const int t0 = T * k / PrefillState::kCalcPieces, t1 = T * (k + 1) / PrefillState::kCalcPieces;
+                cudaStreamWaitEvent(F->copy, C->pf_->cev_done[k], 0);
+                if (t1 > t0)
+                    cudaMemcpyAsync(calc_sum + (size_t) t0 * E, S->cpart_h + (size_t) t0 * E,
+                                    (size_t) (t1 - t0) * E * sizeof(float), cudaMemcpyHostToDevice, F->copy);
+            }
+            cudaEventRecord(S->ev_cpart, F->copy);
+        }
         S->mark("moe_staged", s);
         dump_row("pf_shexp-" + std::to_string(il), S->ffn, E);
         flush();
-        if (cpu_nrows > 0) gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, rows, M.pos, M.rw, T, K, E, S->ffn, s);
+        if (cpu_nrows > 0)
+            gb::moe_combine_add(M.OUTPc, cpu_r0, cpu_r0, cpu_r0 + cpu_nrows, M.pos, M.rw, T, K, E, S->ffn, s);
         S->mark("combine", s);
+        if (calc_run) {
+            cudaStreamWaitEvent(s, S->ev_cpart, 0);
+            // STRATA_GLM_PREFILL_CALC_CHECK=1 (debug, synchronous): this GPU computes the other part's share as well -
+            // its experts staged here, the same x3_run_set, the window added into a sum of its own (the last T rows of
+            // OUTP; OUTP is free after the combine) - and compares that with the sum that came back
+            static const bool calc_check = getenv("STRATA_GLM_PREFILL_CALC_CHECK") != nullptr;
+            if (calc_check) {
+                float* const chk = M.OUTP + (size_t) (W - T) * E;
+                cudaMemsetAsync(chk, 0, (size_t) T * E * sizeof(float), s);
+                X3Lane xc = x3l;
+                xc.W = W - T;
+                int cwb = 0, cw_lo = 0, cw_hi = 0;
+                const auto cflush = [&]() {
+                    if (cw_hi > cw_lo) gb::moe_combine_add(M.OUTP, cwb, cw_lo, cw_hi, M.pos, M.rw, T, K, E, chk, s);
+                    cw_lo = cw_hi = 0;
+                };
+                xc.place = [&](int a, int nr) {
+                    if (!(cw_hi > cw_lo && a == cw_hi && a + nr <= cwb + xc.W)) {
+                        cflush();
+                        cwb = a;
+                        cw_lo = a;
+                    }
+                    cw_hi = a + nr;
+                    return a - cwb;
+                };
+                constexpr int GE = PrefillState::GE;
+                for (size_t i = 0, k = 0; i < calc_set.size(); i += GE, ++k) {
+                    const int gn = (int) std::min<size_t>(GE, calc_set.size() - i);
+                    const int off = nb + (int) k * (GE + 1);   // (bounds past the plan's, below the light ones')
+                    if (off + GE + 1 > kLightOff) break;
+                    int* hb = S->h_bounds + off;
+                    hb[0] = 0;
+                    for (int j = 0; j < gn; ++j) hb[j + 1] = hb[j] + S->h_counts[calc_set[i + (size_t) j].e];
+                    cudaMemcpyAsync(M.bounds + off, hb, (size_t) (gn + 1) * sizeof(int), cudaMemcpyHostToDevice, s);
+                    for (int j = 0; j < gn; ++j)
+                        cudaMemcpyAsync(S->gbuf + (size_t) j * P.stride, calc_set[i + (size_t) j].ram, Ly.blob,
+                                        cudaMemcpyHostToDevice, s);
+                    x3_run_set(xc, S->gbuf, gn, P.stride, M.bounds + off, hb, S->h_base[calc_set[i].e]);
+                    cudaStreamSynchronize(s);   // (gbuf and the host bounds again for the next group)
+                }
+                cflush();
+                std::vector<float> a((size_t) T * E), b((size_t) T * E);
+                cudaStreamSynchronize(s);
+                cudaMemcpy(a.data(), chk, a.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                cudaMemcpy(b.data(), calc_sum, b.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                double num = 0, den = 0, worst = 0;
+                size_t same = 0;
+                for (size_t i = 0; i < a.size(); ++i) {
+                    const double d = (double) a[i] - b[i];
+                    num += d * d;
+                    den += (double) a[i] * a[i];
+                    worst = std::max(worst, std::fabs(d));
+                    same += a[i] == b[i];
+                }
+                std::fprintf(stderr, "glm prefill calc check CUDA%d layer %d: %zu experts, %d rows on CUDA%d - its sum against "
+                                     "this GPU's: rel L2 %.3e, worst |diff| %.3e, %.4f%% of the values identical\n",
+                             dev_, il, calc_set.size(), calc_nrows, C->dev_, std::sqrt(num / std::max(1e-30, den)), worst,
+                             100.0 * (double) same / (double) std::max<size_t>(1, a.size()));
+            }
+            const int64_t n = (int64_t) T * E;
+            add_f32_kernel<<<(unsigned) std::min<int64_t>(4096, (n + 255) / 256), 256, 0, s>>>(S->ffn, calc_sum, n);
+            S->mark("moe_calc", s);
+        }
         if (S->trace) cudaEventRecord(S->tr[(size_t) il].end, s);
         dump_row("ffn_out-" + std::to_string(il), S->ffn, E);
         if (glmfast::prefill_submit()) glmfast::submit_queued(s);   // (Windows HIP: the experts start now)
@@ -3306,6 +3788,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
     if (S->trace) {
         cudaStreamSynchronize(s);
         cudaStreamSynchronize(F->copy);
+        if (S->calc_measure) calc_balance();   // (the last helped layer's: its sum was added - its events are done)
         const auto el = [](cudaEvent_t a, cudaEvent_t b) {
             float v = 0.0f;
             return cudaEventElapsedTime(&v, a, b) == cudaSuccess ? (double) v : -1.0;
@@ -3315,11 +3798,15 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         for (int il = l0_; il < l1_; ++il) {
             const auto& t = S->tr[(size_t) il];
             if (!t.on) continue;
+            char calc[96] = "";
+            if (t.calc_n > 0)
+                std::snprintf(calc, sizeof calc, " | other GPU %3d experts %5d rows, lanes end plan+%6.1f / +%6.1f",
+                              t.calc_n, t.calc_rows, t.calc_a, t.calc_b);
             std::fprintf(stderr, "  layer %2d: start->plan %6.1f | prestage %3d, %3d left at plan, landed plan%+7.1f | copies "
                                  "%3d end plan+%6.1f | cpu %3d experts %5d rows end plan+%6.1f (compute %6.1f) | layer "
-                                 "end plan+%6.1f\n",
+                                 "end plan+%6.1f%s\n",
                          il, el(t.start, t.plan), t.pre_n, t.pre_left, t.pre_n > 0 ? el(t.plan, t.pre) : 0.0, t.grp,
-                         el(t.plan, t.c1), t.ncpu, t.crows, t.dl, t.dcpu, el(t.plan, t.end));
+                         el(t.plan, t.c1), t.ncpu, t.crows, t.dl, t.dcpu, el(t.plan, t.end), calc);
         }
     }
     const cudaError_t e = cudaGetLastError();
@@ -3504,6 +3991,77 @@ bool Glm5Model::dual_prefill_ready() {
     return true;
 }
 
+// THE WAITING PART COMPUTES setup, once: STRATA_GLM_PREFILL_CALC=1, two parts with the prompt path (with peer access the
+// dual-link prompt is the one, STRATA_GLM_DUAL_PREFILL): each part's events on its own GPU and its pinned portable
+// buffers for chunks of its T (the routes - mapped, a kernel writes them -, the other part's sum, the other part's
+// plan; x_h, the CPU lane's, made portable).  STRATA_GLM_PREFILL_CALC_SHARE=<0..0.9> fixes the share (no balance).
+// false: the prompt stages as before.
+bool Glm5Model::calc_prefill_ready() {
+    static const bool want = getenv("STRATA_GLM_PREFILL_CALC") != nullptr && std::atoi(getenv("STRATA_GLM_PREFILL_CALC")) != 0;
+    Glm5Model* B = split_next_.get();
+    if (!want || B == nullptr || B->split_next_ != nullptr || pf_ == nullptr || B->pf_ == nullptr || !pf_->has_moe ||
+        !B->pf_->has_moe)
+        return false;
+    if (calc_pf_state_ != 0) return calc_pf_state_ > 0;
+    calc_pf_state_ = -1;
+    const char* share_env = getenv("STRATA_GLM_PREFILL_CALC_SHARE");
+    bool ok = true;
+    for (Glm5Model* m : {this, B}) {
+        PrefillState* S = m->pf_;
+        const size_t T = (size_t) S->T, E = (size_t) g_.n_embd, K = (size_t) g_.n_exp_used;
+        cudaSetDevice(m->dev_);
+        cudaDeviceGetAttribute(&S->sms, cudaDevAttrMultiProcessorCount, m->dev_);
+        const auto ev = [&](cudaEvent_t& e, unsigned flags) {
+            if (ok && cudaEventCreateWithFlags(&e, flags) != cudaSuccess) {
+                e = nullptr;
+                ok = false;
+            }
+        };
+        ev(S->ev_xh, cudaEventDisableTiming);
+        ev(S->ev_cpart, cudaEventDisableTiming);
+        ev(S->ev_ca0, 0);   // (timed: the balance)
+        ev(S->ev_a1, 0);
+        ev(S->cev_plan, cudaEventDisableTiming);
+        ev(S->cev_t0, 0);
+        ev(S->ev_turn, cudaEventDisableTiming);
+        for (int b = 0; b < PrefillState::NG; ++b) {
+            ev(S->cev_ready[b], cudaEventDisableTiming);
+            ev(S->cev_free[b], cudaEventDisableTiming);
+        }
+        for (auto& e : S->cev_done) ev(e, 0);
+        ok = ok &&
+             cudaHostAlloc((void**) &S->cid_h, T * K * sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &S->crw_h, T * K * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &S->cpart_h, T * E * sizeof(float), cudaHostAllocPortable) == cudaSuccess &&
+             cudaHostAlloc((void**) &S->cplan_h, 8192 * sizeof(int), cudaHostAllocPortable) == cudaSuccess;
+        if (!ok) break;
+        S->c_n = T;
+        if (S->x_h != nullptr) {   // (allocated before: not portable - prefill_half allocates it again, portable)
+            cudaFreeHost(S->x_h);
+            S->x_h = nullptr;
+            S->x_h_n = 0;
+        }
+        if (share_env != nullptr) {
+            S->calc_share = std::min(0.9, std::max(0.0, std::atof(share_env)));
+            S->calc_fixed = true;
+        }
+    }
+    cudaSetDevice(dev_);
+    if (!ok) {
+        cudaGetLastError();
+        std::fprintf(stderr, "glm prefill: the waiting GPU's share (MAYA_GLM_PREFILL_CALC) stays off: its events or pinned "
+                             "buffers did not allocate\n");
+        return false;
+    }
+    calc_pf_state_ = 1;
+    std::fprintf(stderr, "glm prefill: the waiting GPU computes a share of the working one's staged experts - their weights "
+                         "over its own PCIe link, x and the routes there and the weighted sum back over the host (share %s; "
+                         "%.0f MB more pinned a part)\n",
+                 share_env != nullptr ? share_env : "learned, from 0.5",
+                 ((double) pf_->T * (double) g_.n_embd * 4.0 + (double) pf_->T * g_.n_exp_used * 8.0) / 1048576.0);
+    return true;
+}
+
 bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err) {
     const Glm5Geometry& g = g_;
     const int64_t n = (int64_t) tokens.size();
@@ -3564,13 +4122,44 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     // other waits - in the pipeline both GPUs' links are busy with their own chunks
     Glm5Model* const other = split_next_.get();
     const bool dual = !pipelined && np == 2 && dual_prefill_ready();
+    // THE WAITING PART COMPUTES (STRATA_GLM_PREFILL_CALC=1; see PrefillState::calc): there, too, only one half after
+    // the other - and not with the dual-link prompt
+    const bool calc = !pipelined && np == 2 && !dual && calc_prefill_ready();
     const std::shared_ptr<void> help_reset(nullptr, [&](void*) {   // every way out of here: no helper set
-        for (Glm5Model* m : parts) m->pf_->help = nullptr;
+        for (Glm5Model* m : parts) {
+            m->pf_->help = nullptr;
+            m->pf_->calc = nullptr;
+        }
     });
     if (dual) {
         pf_->help = other;
         other->pf_->help = this;
     }
+    if (calc) {
+        pf_->calc = other;
+        other->pf_->calc = this;
+    }
+    // a half's start with the waiting part computing: every part's copy, KV and x streams wait for what its compute
+    // stream holds - the waiting part's copies never land in a carve its own half still uses, and a part's own half
+    // never starts its copies while its share of the other half still reads that carve
+    // (and the half's part, when its share overwrote its carve: the one buffer its prompt path reads before writing -
+    // the MMQ row ids prefill_lend set up - again)
+    const auto turn = [&](Glm5Model* owner) {
+        if (!calc) return;
+        for (Glm5Model* m : parts) {
+            PrefillState* S = m->pf_;
+            cudaSetDevice(m->dev_);
+            if (m == owner && S->cb_used) {
+                mmq::iota(S->iota, (int64_t) S->T_bound * g.n_exp_used, m->fast_->cs);
+                S->cb_used = false;
+            }
+            cudaEventRecord(S->ev_turn, m->fast_->cs);
+            cudaStreamWaitEvent(m->fast_->copy, S->ev_turn, 0);
+            if (S->kv_ss != nullptr) cudaStreamWaitEvent(S->kv_ss, S->ev_turn, 0);
+            if (S->xs != nullptr) cudaStreamWaitEvent(S->xs, S->ev_turn, 0);
+        }
+        cudaSetDevice(owner->dev_);
+    };
     // the helper's gbuf is free once its own half (all its queued work) has run: its copy stream waits for that
     const auto help_idle = [&](Glm5Model* owner) {
         if (!dual) return;
@@ -3591,6 +4180,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             std::vector<const float*> im0;
             if (mtp_il_ >= 0) next_of(c, nx0, im0);   // a single device carries the draft block itself
             help_idle(this);
+            turn(this);
             if (!prefill_half(p0, T, err, nx0.empty() ? nullptr : nx0.data(), im0.empty() ? nullptr : im0.data()))
                 return false;
             Glm5Model* prev = this;
@@ -3608,6 +4198,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 std::vector<const float*> im;
                 if (m->mtp_il_ >= 0) next_of(c, nx, im);
                 help_idle(m);
+                turn(m);
                 if (!m->prefill_half(p0, T, err, nx.empty() ? nullptr : nx.data(), im.empty() ? nullptr : im.data()))
                     return false;
                 prev = m;
@@ -3783,6 +4374,19 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                      (unsigned long long) sr, (unsigned long long) sd, (unsigned long long) ce, (unsigned long long) cr, mc, pf_->kappa,
                      pf_->row_ms, (unsigned long long) pi, (unsigned long long) ph, (unsigned long long) pr,
                      100.0 * (double) rr / (double) std::max<uint64_t>(1, rr + rs), plan);
+        if (calc_pf_state_ > 0) {   // (STRATA_GLM_PREFILL_CALC: the RAM-tier experts the waiting GPU computed)
+            std::string sh;
+            uint64_t xe = 0, xr = 0;
+            for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+                xe += m->pf_->calc_experts;
+                xr += m->pf_->calc_rows;
+                char b[64];
+                std::snprintf(b, sizeof b, "%sCUDA%d's layers %.2f", sh.empty() ? "" : ", ", m->dev_, m->pf_->calc_share);
+                sh += b;
+            }
+            std::fprintf(stderr, "glm prefill: the waiting GPU computed %llu staged experts (%llu rows) | share now: %s "
+                                 "(cumulative)\n", (unsigned long long) xe, (unsigned long long) xr, sh.c_str());
+        }
     }
     return true;
 }

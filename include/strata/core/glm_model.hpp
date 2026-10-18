@@ -537,6 +537,8 @@ public:
     bool fast_setup_finish(std::string& err);
     bool dual_prefill_ready();   // STRATA_GLM_DUAL_PREFILL (glm_prefill.cu)
     int dual_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
+    bool calc_prefill_ready();   // STRATA_GLM_PREFILL_CALC (glm_prefill.cu)
+    int calc_pf_state_ = 0;      // 0 not tried, 1 on, -1 off
     void ram_left_check() const;
     void fast_destroy();
     bool forward_fast(const std::vector<int32_t>& tokens, std::vector<float>& logits_out, std::string& err);
@@ -881,6 +883,9 @@ public:
     // ---- the batched prompt path (src/core/glm_prefill.cu)
     struct PrefillState;
     PrefillState* pf_ = nullptr;
+    // STRATA_GLM_PREFILL_CALC: this (waiting) part's share of another part's MoE layer, enqueued on this GPU
+    struct CalcJob;
+    bool prefill_calc(const CalcJob& job, std::string& err);
     bool prefill_setup(std::string& err);                  // in fast_setup: sizes, host buffers (no device memory)
     size_t prefill_borrow_bytes() const;                   // device bytes the prompt path borrows from the pool's tail
     size_t prefill_trim_prestage(size_t max_borrow);       // ... at most this many: a smaller prestage buffer (the new bytes)
