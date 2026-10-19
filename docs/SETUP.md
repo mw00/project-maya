@@ -22,8 +22,9 @@ It first asks which model to set up:
   pictures need nothing more - the model's own vision tower runs in the engine; the config is `maya-ds4.json`, with
   tensor parallel across pairs of equal GPUs (`--tp 2`). The engine balances its own layer split; `./maya.sh --calibrate`
   (not offered by the setup) measures each `--tp` that groups your GPUs differently and fewer CPU threads, an engine
-  start each (half an hour or so on 9 GPUs), and keeps the fastest answers whose long prompts still read at 60% of
-  `--tp 2`'s speed (`tools/calibrate_ds4.py`; the result goes into `maya-ds4.json` and a setup again keeps it).
+  start each (about an hour on 9 GPUs), and keeps the fastest answers whose long prompts still read at 60% of the
+  config's own `--tp`'s speed; a setting the engine does not start with is left out (`tools/calibrate_ds4.py`; the
+  result goes into `maya-ds4.json` and a setup again keeps it).
 
 GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 

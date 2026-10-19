@@ -195,12 +195,27 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
         tps = [own_tp] + tps
     tps = [own_tp] + [t for t in tps if t != own_tp]   # (the config's own first: the baseline)
     with_ = lambda tp, w: apply(args0, {"--tp": tp, "--cpu-threads": w})   # noqa: E731
+    failed: dict[str, str] = {}
+
+    def attempt(what: str, args: list) -> dict | None:
+        """start_measure, or None when the engine does not start or stops with `args` (a --tp the model's heads do not
+        split in, too little memory for it, ...): that setting is left out, the others still measured."""
+        try:
+            return start_measure(cfg, args, short, long_ids, start_engine, fresh)
+        except Exception as e:
+            failed[what] = str(e)
+            say(f"    {what}: the engine did not run ({e}): left out")
+            return None
     say(f"  {len(tps)} tensor parallel setting(s) to try ({', '.join(f'--tp {t}' for t in tps)}), each a start of "
         "the model of its own ...")
     by_tp: dict[int, dict] = {}
     for tp in tps:
         say(f"    --tp {tp}: loading the model ...")
-        r = by_tp[tp] = start_measure(cfg, with_(tp, own_threads), short, long_ids, start_engine, fresh)
+        if tp == own_tp:                              # (the baseline: the config's own must run)
+            r = start_measure(cfg, with_(tp, own_threads), short, long_ids, start_engine, fresh)
+        elif (r := attempt(f"--tp {tp}", with_(tp, own_threads))) is None:
+            continue
+        by_tp[tp] = r
         say(f"    --tp {tp}: {med(r):.1f} tok/s answering, {r['prompt']:.0f} tok/s reading a "
             f"{len(long_ids)}-token prompt")
     own = by_tp[own_tp]
@@ -215,7 +230,9 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
     if best != own_tp and med(own) * (1 + MIN_GAIN) < med(by_tp[best]) < med(own) * (1 + CONFIRM_BELOW):
         say(f"    confirming --tp {best} against --tp {own_tp} (one more start each) ...")
         for t in (own_tp, best):
-            again = start_measure(cfg, with_(t, own_threads), short, long_ids, start_engine, fresh)
+            if (again := attempt(f"--tp {t} again", with_(t, own_threads))) is None:
+                best = own_tp                         # (a setting that did not run twice is not kept)
+                break
             by_tp[t] = {**by_tp[t], "decode": by_tp[t]["decode"] + again["decode"]}
             confirm[t] = again["decode"]
     chosen_tp = best if med(by_tp[best]) > med(by_tp[own_tp]) * (1 + MIN_GAIN) else own_tp
@@ -227,7 +244,9 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
         best_rate = med(by_tp[chosen_tp])
         for w in thread_candidates(d_threads):
             say(f"    --tp {chosen_tp}, {w} CPU threads (the engine's own: {d_threads}): loading the model ...")
-            r = by_w[w] = start_measure(cfg, with_(chosen_tp, w), short, long_ids, start_engine, fresh)
+            if (r := attempt(f"{w} CPU threads", with_(chosen_tp, w))) is None:
+                break
+            by_w[w] = r
             say(f"    {w} CPU threads: {med(r):.1f} tok/s answering")
             if med(r) <= best_rate * (1 + MIN_GAIN):
                 break                                 # (fewer only wait longer for the experts from there)
@@ -240,7 +259,7 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
               "tp_sweep": {str(t): {"decode": [round(x, 1) for x in r["decode"]], "prompt": round(r["prompt"])}
                            for t, r in by_tp.items()},
               "thread_sweep": {str(w): [round(x, 1) for x in r["decode"]] for w, r in by_w.items()},
-              "confirm": {str(t): [round(x, 1) for x in v] for t, v in confirm.items()},
+              "confirm": {str(t): [round(x, 1) for x in v] for t, v in confirm.items()}, "failed": failed,
               "tok_s": round(med(final), 1), "own_tok_s": round(med(by_tp[own_tp]), 1),
               "prompt_tok_s": round(final.get("prompt") or by_tp[chosen_tp]["prompt"]),
               "long_prompt_tokens": len(long_ids), "seconds": round(time.time() - t0)}

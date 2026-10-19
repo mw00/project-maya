@@ -2340,7 +2340,7 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
     say()
     say(f"  Tuning {DS4} for this PC: the output speed with each tensor parallel grouping of the GPUs that differs")
     say(f"  ({n_tp} here) and with fewer CPU threads. Every setting is a start of the model of its own, so it takes")
-    say(f"  about {4 * (n_tp + 2)}-{7 * (n_tp + 2)} minutes; the PC is busy meanwhile.")
+    say(f"  about {6 * (n_tp + 1)}-{10 * (n_tp + 3)} minutes; the PC is busy meanwhile.")   # (9 GPUs: 7-8 starts, 6-12 min each)
     log = cfg.get("log")
     since = os.path.getsize(log) if log and os.path.isfile(log) else 0
     try:

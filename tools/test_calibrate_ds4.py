@@ -45,10 +45,13 @@ class FakeEngine:
 class Run:
     """measure() over FakeEngines: the starts it made, and its result."""
 
-    def __init__(self, speed, read=lambda tp: 900.0, vram=NINE, args=None, **kw):
+    def __init__(self, speed, read=lambda tp: 900.0, vram=NINE, args=None, fail=lambda tp, n: False, **kw):
         self.starts = []
 
         def start(cfg):
+            tp = int(C4.arg(cfg["args"], "--tp") or 1)
+            if fail(tp, sum(s[0] == tp for s in self.starts)):    # (n: that --tp's starts so far)
+                raise RuntimeError("the engine exited before it was ready")
             e = FakeEngine(cfg, speed, read, **kw)
             self.starts.append((e.tp, C4.arg(cfg["args"], "--cpu-threads")))
             return e
@@ -127,6 +130,27 @@ class Measure(unittest.TestCase):
         r = Run(lambda tp, w: 5.0 * (1.2 if w == 33 else 1.0), vram=[24.0], args=["--pack", "/p", "--tp", "2"])
         self.assertEqual([s[0] for s in r.starts], [2, 2, 2])
         self.assertEqual(r.res["args"], {"--tp": 2, "--cpu-threads": 33})
+
+    def test_a_setting_that_does_not_start_is_left_out(self):
+        r = Run(lambda tp, w: {2: 103.0, 4: 139.0, 7: 200.0}[tp], vram=[24.0] * 7, fail=lambda tp, n: tp == 7)
+        self.assertEqual([s[0] for s in r.starts[:2]], [2, 4])
+        self.assertEqual(r.res["args"]["--tp"], 4)
+        self.assertEqual(set(r.res["report"]["tp_sweep"]), {"2", "4"})
+        self.assertIn("--tp 7", r.res["report"]["failed"])
+
+    def test_the_baseline_must_start(self):
+        with self.assertRaises(RuntimeError):
+            Run(lambda tp, w: DECODE[tp], fail=lambda tp, n: tp == 2)
+
+    def test_a_winner_that_does_not_start_again_is_not_kept(self):
+        r = Run(lambda tp, w: 103.0 * (1.10 if tp == 4 else 1.0), fail=lambda tp, n: tp == 4 and n == 1)
+        self.assertEqual(r.res["args"]["--tp"], 2)
+        self.assertIn("--tp 4 again", r.res["report"]["failed"])
+
+    def test_threads_that_do_not_start_stop_the_sweep(self):
+        r = Run(lambda tp, w: DECODE[tp] * (1.10 if w == 33 else 1.0), fail=lambda tp, n: tp == 8 and n == 1)
+        self.assertEqual(r.res["args"], {"--tp": 8, "--cpu-threads": None})
+        self.assertIn("33 CPU threads", r.res["report"]["failed"])
 
     def test_the_configs_own_threads_are_the_baseline(self):
         r = Run(lambda tp, w: DECODE[tp], args=["--pack", "/p", "--tp", "2", "--cpu-threads", "40"])

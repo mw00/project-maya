@@ -539,8 +539,9 @@ struct Layer {
     x3::ExpertLayout hlay;
     size_t hblob = 0;
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
-    // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group the
-    // heads do not split in (a mixed group of 9 over 64 heads), member 0 none: its attention adds nothing to the sum
+    // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group of more
+    // members than the heads split among evenly (head_members: 9, 7 or 6 over 64 heads), the first ones none: their
+    // attention adds nothing to the sum
     int ah0 = 0, ahn = 0, og0 = 0, ogn = 0;
     // the chunked prompt path: each expert's virtual slot (its VRAM slot, or n_slots + its place among the CPU lane's
     // experts, which a chunk streams in that order) - pinned on member 0, a device copy on each member
@@ -894,8 +895,13 @@ struct Model::Impl {
     static const Layer& member(const Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // bytes of a VRAM slot of l's experts (a member's part of each, in a group)
     static size_t unit(const Layer& l) { return l.nm > 1 ? l.hblob : l.blob; }
-    // the members of a group of nm that take heads: all of them, or (the heads do not split in nm) all but member 0
-    int head_members(int nm) const { return g.heads % nm == 0 && g.o_groups % nm == 0 ? nm : nm - 1; }
+    // the members of a group of nm that take heads: the most the heads and the wo_a groups split among evenly (64
+    // heads and 8 groups: 9 -> 8, 7 or 6 -> 4, 5 -> 4, 3 -> 2); the first members the rest, only their FFN share
+    int head_members(int nm) const {
+        int na = nm;
+        while (na > 1 && (g.heads % na != 0 || g.o_groups % na != 0)) --na;
+        return na;
+    }
     // a packed row's bytes: the compressed KV's (FP4, an E4M3 scale a 16) and the index keys' (FP4, a power of two a 32)
     size_t kv_row() const { return fp4_row_bytes(g.hd, 2); }
     size_t ik_row() const { return fp4_row_bytes(g.ix_hd, 3); }
