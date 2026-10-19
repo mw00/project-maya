@@ -1162,17 +1162,37 @@ __global__ void init_pre_kernel(float* pre, int T) {
 }
 
 
-// the hand-offs through host-mapped memory: a grid-stride copy of the segments (16 bytes a thread), then (put, flag
+// a segment's copy unit: 16 bytes where its ends and its size allow, else 4, else 1 (the packed FP4 index keys' rows
+// are 68 bytes: a window's rows start and end off the 16)
+__host__ __device__ __forceinline__ size_t xfer_unit(const Xfer& x, int i) {
+    const size_t a = (size_t) x.src[i] | (size_t) x.dst[i] | x.bytes[i];
+    return (a & 15) == 0 ? 16 : (a & 3) == 0 ? 4 : 1;
+}
+__host__ __device__ __forceinline__ size_t xfer_units(const Xfer& x) {
+    size_t total = 0;
+    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / xfer_unit(x, i);
+    return total;
+}
+
+// the hand-offs through host-mapped memory: a grid-stride copy of the segments (a unit a thread), then (put, flag
 // given) the last block to finish sets the flag after a system fence; a get first waits for the flag
 __device__ __forceinline__ void xfer_copy(const Xfer& x, bool from_host) {
-    size_t total = 0;
-    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    const size_t total = xfer_units(x);
     for (size_t q = (size_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (size_t) gridDim.x * blockDim.x) {
         size_t r = q;
         int i = 0;
-        while (r >= x.bytes[i] / 16) r -= x.bytes[i++] / 16;
-        const uint4* src = (const uint4*) x.src[i] + r;
-        ((uint4*) x.dst[i])[r] = from_host ? __ldcv(src) : *src;
+        while (r >= x.bytes[i] / xfer_unit(x, i)) r -= x.bytes[i] / xfer_unit(x, i), ++i;
+        const size_t u = xfer_unit(x, i);
+        if (u == 16) {
+            const uint4* src = (const uint4*) x.src[i] + r;
+            ((uint4*) x.dst[i])[r] = from_host ? __ldcv(src) : *src;
+        } else if (u == 4) {
+            const unsigned* src = (const unsigned*) x.src[i] + r;
+            ((unsigned*) x.dst[i])[r] = from_host ? __ldcv(src) : *src;
+        } else {
+            const unsigned char* src = (const unsigned char*) x.src[i] + r;
+            ((unsigned char*) x.dst[i])[r] = from_host ? __ldcv(src) : *src;
+        }
     }
 }
 
@@ -1649,14 +1669,12 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
 }
 
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s) {
-    size_t total = 0;
-    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    const size_t total = xfer_units(x);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     xfer_put_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq, cnt);
 }
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
-    size_t total = 0;
-    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    const size_t total = xfer_units(x);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     xfer_get_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq);
 }

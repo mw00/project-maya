@@ -230,7 +230,8 @@ void confidence(const float* x, const uint16_t* E, const int* tok, const float* 
 void draft_probs(const float* logits, const int* draft, int n, int V, float temp, float* p, cudaStream_t s);
 
 /// The pipeline's hand-offs and tensor parallelism, through host-mapped memory (these cards copy peer to peer only
-/// through the driver's staging).  xfer_put copies up to 4 segments (16-byte multiples, 16-byte aligned) device ->
+/// through the driver's staging).  xfer_put copies up to 4 segments (any size and alignment: each in 16-byte units
+/// where its ends and size are 16-byte multiples, else in 4-byte or single-byte units) device ->
 /// host-mapped, then (flag given) sets *flag = seq after a system fence (cnt: a device counter of the stream, 0
 /// between uses); xfer_get waits on the device until *flag >= seq, then copies host-mapped -> device.
 struct Xfer {

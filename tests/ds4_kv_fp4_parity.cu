@@ -216,6 +216,52 @@ int main() {
         }
         fails += !same;
     }
+    // the hand-offs of a window's new rows to the other devices (xfer_put to host-mapped memory, xfer_get back): the
+    // compressed KV's 288-byte rows and the index keys' 68-byte ones from row g_first, ng of them - every byte there,
+    // none past them (the rows used to go in 16-byte units: a misaligned address off the 16, the last bytes left out)
+    {
+        const size_t kv = fp4_row_bytes(512, 2), ik = fp4_row_bytes(128, 3), cap = 64, pad = 64;
+        std::vector<uint8_t> h0(cap * kv + cap * ik);
+        for (uint8_t& b : h0) b = (uint8_t) rng();
+        uint8_t *src, *dst, *mapped_h, *mapped;
+        unsigned *flag_h, *flag;
+        CK(cudaMalloc(&src, h0.size()));
+        CK(cudaMalloc(&dst, h0.size() + pad));
+        CK(cudaHostAlloc(&mapped_h, h0.size() + pad, cudaHostAllocMapped));
+        CK(cudaHostGetDevicePointer((void**) &mapped, mapped_h, 0));
+        CK(cudaHostAlloc(&flag_h, 4, cudaHostAllocMapped));
+        CK(cudaHostGetDevicePointer((void**) &flag, flag_h, 0));
+        *flag_h = 0u;
+        CK(cudaMemcpy(src, h0.data(), h0.size(), cudaMemcpyHostToDevice));
+        int bad = 0, cases = 0;
+        for (size_t g_first : {0, 1, 2, 3, 5, 7, 13})
+            for (size_t ng : {1, 2, 3, 4, 5, 16}) {
+                Xfer x;
+                x.src[0] = src + g_first * kv, x.dst[0] = mapped + g_first * kv, x.bytes[0] = ng * kv;
+                x.src[1] = src + cap * kv + g_first * ik, x.dst[1] = mapped + cap * kv + g_first * ik;
+                x.bytes[1] = ng * ik;
+                x.n = 2;
+                Xfer y = x;
+                for (int i = 0; i < 2; ++i) y.src[i] = x.dst[i], y.dst[i] = dst + ((uint8_t*) x.dst[i] - mapped);
+                std::memset(mapped_h, 0xA5, h0.size() + pad);
+                CK(cudaMemset(dst, 0x5A, h0.size() + pad));
+                xfer_put(x, nullptr, 0u, nullptr, nullptr);
+                xfer_get(y, flag, 0u, nullptr);
+                CK(cudaDeviceSynchronize());
+                std::vector<uint8_t> got(h0.size() + pad);
+                CK(cudaMemcpy(got.data(), dst, got.size(), cudaMemcpyDeviceToHost));
+                bool ok = true;
+                for (size_t b = 0; b < got.size(); ++b) {
+                    const bool in = (b >= g_first * kv && b < (g_first + ng) * kv) ||
+                                    (b >= cap * kv + g_first * ik && b < cap * kv + (g_first + ng) * ik);
+                    ok = ok && got[b] == (in ? h0[b] : (uint8_t) 0x5A) && (b >= h0.size() || !in || mapped_h[b] == h0[b]);
+                }
+                bad += !ok, ++cases;
+            }
+        std::printf("xfer_put / xfer_get, packed rows from rows 0..13, 1..16 of them: %d of %d cases %s\n", bad, cases,
+                    bad == 0 ? "wrong (every byte there, none past them)" : "WRONG");
+        fails += bad != 0;
+    }
     std::printf("%s\n", fails == 0 ? "PASS" : "FAIL");
     return fails == 0 ? 0 : 1;
 }
