@@ -135,11 +135,21 @@ class Quant35(unittest.TestCase):
         self.assertEqual(json.loads((d / maya.VERIFIED).read_text()), book)
 
 
+GPUS3 = [{"index": i, "name": "RTX 5060 Ti", "vram_gb": 15.9} for i in range(3)]
+
+
+def fake_pc(root: Path) -> list:
+    """The patches of a PC with GPUS3 and a calibration store of its own (root / calibration.json)."""
+    return [patch.object(maya.S, "gpus", return_value=GPUS3), patch.object(maya.S, "cpu_info", return_value=("Xeon",)),
+            patch.object(maya.S, "ram_gb", return_value=183.0), patch.object(maya, "CAL_STORE", root / "cal.json")]
+
+
 class Config(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.patches = [patch.object(maya, "ROOT", self.root), patch.object(maya, "say", lambda *a: None),
-                        patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None)]
+                        patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None)] + \
+            fake_pc(self.root)
         for p in self.patches:
             p.start()
 
@@ -189,6 +199,71 @@ class Config(unittest.TestCase):
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"], c["api_key"]),
                          ("max", {"temperature": 0.6}, "0.0.0.0", "k"))
         self.assertEqual(c["env"], {"DS4_RING_MB": "800", "DS4_CHUNK_MIN": "256"})
+
+    def tuned(self, tp=8, threads=33):
+        key = maya.hardware_key({"gpu": [0, 1, 2], "args": ["--max-context", "131072"], "installer": {"quant": maya.DS4}})
+        maya.CAL_STORE.write_text(json.dumps({key: {"args": {"--tp": tp, "--cpu-threads": threads},
+                                                    "date": "2026-10-19"}}))
+
+    def test_tuned_before_is_used(self):
+        self.tuned()
+        _, c = self.write(args())
+        self.assertEqual(c["args"][-4:], ["--tp", "8", "--cpu-threads", "33"])
+        self.tuned(threads=None)                       # (the engine's own threads: no flag)
+        (self.root / "maya-ds4.json").unlink()         # (a fresh setup: no config before)
+        _, c = self.write(args())
+        self.assertNotIn("--cpu-threads", c["args"])
+
+    def test_the_config_befores_own_wins(self):
+        self.tuned()
+        _, c = self.write(args(), {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "4"]})
+        a = c["args"]
+        self.assertEqual((a[a.index("--tp") + 1], a[a.index("--cpu-threads") + 1]), ("4", "33"))
+
+
+class Calibrate(unittest.TestCase):
+    """./maya.sh --calibrate on a DeepSeek config: tools/calibrate_ds4.py's result into the config and the store."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.cfg = self.root / "maya-ds4.json"
+        self.cfg.write_text(json.dumps({"exe": str(maya.DS4_EXE), "gpu": [0, 1, 2], "installer": {"family": "deepseek",
+                                        "quant": maya.DS4}, "args": ["--pack", "/m/maya-ds4", "--max-context",
+                                                                     "65536", "--tp", "2", "--cpu-threads", "40"]}))
+        self.patches = [patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None),
+                        patch.object(maya, "warn", lambda *a: None)] + fake_pc(self.root)
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+
+    def test_result_saved(self):
+        res = {"args": {"--tp": 8, "--cpu-threads": None},
+               "report": {"tok_s": 151.0, "own_tok_s": 103.0, "prompt_tok_s": 607}}
+        with patch.object(maya, "busy_gpus", return_value=[]), \
+                patch.object(maya.CAL4, "run", return_value=res) as run:
+            self.assertTrue(maya.calibrate_config(self.cfg))   # (a DeepSeek config: calibrate_ds4's tuning)
+        self.assertEqual(run.call_args.args[1], [15.9, 15.9, 15.9])   # (the config's GPUs' memory)
+        c = json.loads(self.cfg.read_text())
+        self.assertEqual(c["args"], ["--pack", "/m/maya-ds4", "--max-context", "65536", "--tp", "8"])
+        self.assertEqual(c["installer"]["calibration"]["tok_s"], 151.0)
+        store = json.loads(maya.CAL_STORE.read_text())
+        self.assertEqual(store[maya.hardware_key(c)]["args"], {"--tp": 8, "--cpu-threads": None})
+
+    def test_busy_gpus(self):
+        with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), patch.object(maya.CAL4, "run") as run:
+            self.assertFalse(maya.calibrate_config(self.cfg))
+        run.assert_not_called()
+
+    def test_failed_keeps_the_config(self):
+        before = self.cfg.read_text()
+        with patch.object(maya, "busy_gpus", return_value=[]), \
+                patch.object(maya.CAL4, "run", side_effect=RuntimeError("engine exited")):
+            self.assertFalse(maya.calibrate_config(self.cfg))
+        self.assertEqual(self.cfg.read_text(), before)
+        self.assertFalse(maya.CAL_STORE.exists())
 
 
 class Start(unittest.TestCase):

@@ -20,7 +20,10 @@ It first asks which model to set up:
   sources and checks every file against its pinned size (and, once downloaded, its sha256: `tools/ds4/download.json`, `download-3.5bpw.json`);
   `--model-dir DIR` uses files you already have; the pack is `DIR/maya-ds4/` (`tools/ds4/pack.py`, about a minute);
   pictures need nothing more - the model's own vision tower runs in the engine; the config is `maya-ds4.json`, with
-  tensor parallel across pairs of equal GPUs (`--tp 2`); there is no tuning step (the engine balances its own split).
+  tensor parallel across pairs of equal GPUs (`--tp 2`). The engine balances its own layer split; `./maya.sh --calibrate`
+  (not offered by the setup) measures each `--tp` that groups your GPUs differently and fewer CPU threads, an engine
+  start each (half an hour or so on 9 GPUs), and keeps the fastest answers whose long prompts still read at 60% of
+  `--tp 2`'s speed (`tools/calibrate_ds4.py`; the result goes into `maya-ds4.json` and a setup again keeps it).
 
 GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 
@@ -80,7 +83,7 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--env KEY=VALUE` | an engine setting kept in the config (see [Tuning](SETTINGS.md)) |
 | `--host-compiler g++-12` | when your g++ is newer than your CUDA accepts ("unsupported GNU version") |
 | `--rebuild`, `--repack` | compile the engine / build the pack again |
-| `--calibrate` | tune the engine's CPU lane for this PC (see [Tuning](SETTINGS.md)), then start; with `--no-start` only tune |
+| `--calibrate` | tune the engine's CPU lane for this PC (see [Tuning](SETTINGS.md)), then start; with `--no-start` only tune. DeepSeek-V4.1-Flash-1017: its `--tp` and CPU threads, an engine start each (see above) |
 | `--speed-calibration` | measure again whether DFlash2 or the MTP block decodes faster on this PC ([how](SETTINGS.md#the-speed-calibration); 5-20 minutes, with Maya stopped) and keep the faster, then start; with `--no-start` only measure |
 | `--no-speed-calibration` | with `--draft dflash2`: keep DFlash2 without the speed calibration |
 | `--yes` | the recommended answers (the model download still needs `--download-model`) |

@@ -5024,9 +5024,10 @@ struct Model::Impl {
         const Tiers t = tiers();
         char b[512];
         std::snprintf(b, sizeof b, "INFO context=%lld kv=fp4 kv_resident=%lld expert_slots=%lld engine_kind=ds4 "
-                                   "cpu_experts=%lld experts=%d ram_slots=%lld vram_gb=%.1f ram_gb=%.1f mtp=%d engine=ds4-0.1",
+                                   "cpu_experts=%lld experts=%d ram_slots=%lld vram_gb=%.1f ram_gb=%.1f mtp=%d cpu_threads=%d "
+                                   "engine=ds4-0.1",
                       (long long) o.max_context, (long long) o.max_context, (long long) t.slots, (long long) t.cpu,
-                      g.nl * g.n_exp, (long long) t.cpu, t.vram_gb, t.cpu_gb, g.n_mtp > 0 ? 1 : 0);
+                      g.nl * g.n_exp, (long long) t.cpu, t.vram_gb, t.cpu_gb, g.n_mtp > 0 ? 1 : 0, cpu_threads());
         v.push_back(b);
         // the Monitor's map of each GPU (serve/gpu_map.py, the GLM engine's VRAM lines): what each part holds on the
         // card, in bytes - the dense weights (the drafter's blocks apart), the KV caches, the window's buffers, the

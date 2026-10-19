@@ -45,7 +45,10 @@ experts between the CPU and the PCIe link, with fewer CPU threads, and - when pa
 with smaller disk reads, in one engine run (~10-15 minutes, the model loads first); a setting is kept when it is more
 than 3% faster than the engine's own choice.  The result goes into the config's "env" (STRATA_GLM_PCIE_SHARE,
 STRATA_GLM_CPU_LANE, STRATA_GLM_READ_CHUNKS) and into ~/.config/project-maya/calibration.json for this PC, model and
-context, so a setup again keeps it.
+context, so a setup again keeps it.  DeepSeek-V4.1-Flash-1017's (tools/calibrate_ds4.py, ./maya.sh --calibrate only):
+decode speed with each --tp that groups the GPUs differently and with fewer CPU threads, an engine start each (~25-40
+minutes on 9 GPUs); a setting is kept when it is more than 5% faster and still reads a long prompt at 60% of the
+config's own speed.  The result goes into the config's args (--tp, --cpu-threads) and into calibration.json.
 
 Nothing is installed system-wide: a missing tool is reported with the command that installs it.
 """
@@ -69,6 +72,7 @@ sys.path.insert(0, str(HERE / "tools"))
 import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, downloads (nothing runs on import)
 from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
 import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./maya.sh --calibrate)
+import calibrate_ds4 as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU threads (./maya.sh --calibrate)
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 
 WIN = S.WIN
@@ -406,7 +410,8 @@ DRAFTS = ("mtp", "dflash2")                        # the setup's drafting choice
 # DeepSeek-V4.1-Flash-1017: its own engine (src/ds4, build/strata-ds4) reads LibertAIDAI's EXL3 quant at 2.9 bits in
 # place from its safetensors; its two Engram tables come from DeepSeek's base repo.  Every file is pinned and checked
 # (tools/ds4/download.json).  Linux and NVIDIA RTX 30 / A100 or newer only: its vision tower's BF16 GEMMs, the CPU
-# lane's NUMA memory.  Tensor parallel across pairs of equal GPUs (--tp 2), the rest of the experts in RAM.
+# lane's NUMA memory.  Tensor parallel across pairs of equal GPUs (--tp 2; ./maya.sh --calibrate measures the others),
+# the rest of the experts in RAM.
 DS4 = "DeepSeek-V4.1-Flash-1017"
 DS4_EXE = BUILD / "strata-ds4"
 DS4_MANIFEST = ROOT / "tools" / "ds4" / "download.json"
@@ -2268,6 +2273,8 @@ def calibrate_config(cfg_path: Path) -> bool:
     """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
     CAL_STORE for this PC, model and context (a setup again applies it)."""
     cfg = read_json(cfg_path)
+    if config_family(cfg) == "deepseek":
+        return calibrate_ds4_config(cfg_path)
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
         return False
@@ -2309,6 +2316,55 @@ def calibrate_config(cfg_path: Path) -> bool:
         ok("tuned for this PC: " + ", ".join(f"{k}={v}" for k, v in res["settings"].items()) + speed)
     else:
         ok("tuned for this PC: the engine's own settings are already the fastest here" + speed)
+    return True
+
+
+def ds4_tuned(chosen: dict) -> str:
+    """A DeepSeek calibration's settings as the engine arguments they are ("--tp 8, the engine's own CPU threads")."""
+    return ", ".join(f"{k} {v}" if v is not None else f"the engine's own {k[2:].replace('-', ' ')}"
+                     for k, v in chosen.items())
+
+
+def calibrate_ds4_config(cfg_path: Path) -> bool:
+    """Tune strata-ds4 on this PC (tools/calibrate_ds4.py): --tp and --cpu-threads go into the config's args and
+    into CAL_STORE for this PC, quant and context (a setup again applies them where the config before had none)."""
+    cfg = read_json(cfg_path)
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
+             " (a model server still running?) - stop it, then run ./maya.sh --calibrate")
+        return False
+    found = {g["index"]: g for g in S.gpus() or []}
+    vram = [found[i]["vram_gb"] for i in cfg.get("gpu") or [] if i in found]
+    n_tp = len(CAL4.tp_candidates(vram)) or 1
+    say()
+    say(f"  Tuning {DS4} for this PC: the output speed with each tensor parallel grouping of the GPUs that differs")
+    say(f"  ({n_tp} here) and with fewer CPU threads. Every setting is a start of the model of its own, so it takes")
+    say(f"  about {4 * (n_tp + 2)}-{7 * (n_tp + 2)} minutes; the PC is busy meanwhile.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    try:
+        res = CAL4.run(cfg, vram, say=say)
+    except Exception as e:                             # the config stays as it was
+        warn(f"the tuning did not finish ({e}): the config's settings stay")
+        why = CAL.engine_error(log, since)
+        if why:
+            say(f"       the engine said: {why}")
+        return False
+    cfg["args"] = CAL4.apply(cfg.get("args") or [], res["args"])
+    cfg.setdefault("installer", {})["calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"), **res["report"]}
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    store = load_calibrations()
+    store[hardware_key(cfg)] = {"args": res["args"], "tok_s": res["report"].get("tok_s"),
+                                "prompt_tok_s": res["report"].get("prompt_tok_s"), "date": time.strftime("%Y-%m-%d")}
+    try:
+        CAL_STORE.parent.mkdir(parents=True, exist_ok=True)
+        CAL_STORE.write_text(json.dumps(store, indent=1), encoding="utf-8")
+    except OSError as e:
+        warn(f"could not save {CAL_STORE} ({e}): {cfg_path.name} has the settings, a setup again does not")
+    r = res["report"]
+    speed = f" ({r['tok_s']} tok/s answering, the config's own {r['own_tok_s']})" if r.get("tok_s") else ""
+    ok(f"tuned for this PC: {ds4_tuned(res['args'])}{speed}")
     return True
 
 
@@ -3100,6 +3156,16 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     cfg["installer"] = {"family": "deepseek", "models_dir": str(models), "quant": quant, "model_dir": str(d),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this quant (and context) before
+    if cal is not None and isinstance(cal.get("args"), dict):
+        had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1]]   # (the config before's own values win)
+        new = {k: v for k, v in cal["args"].items() if k not in had}
+        if new:
+            cfg["args"] = CAL4.apply(cfg["args"], new)
+            ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else "") +
+               f": {ds4_tuned(new)}")
+            if cal.get("context"):
+                ok(f"(tuned at context {cal['context']}: {ME} --calibrate tunes this context too)")
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
@@ -3108,7 +3174,9 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
 
 def set_up_ds4(a, prev: dict) -> Path | None:
     """DeepSeek-V4.1-Flash-1017's steps 1-8: the PC (Linux, RTX 30 / A100 or newer, the memory), the context, its
-    engine (build/strata-ds4), the files, the pack, the config.  No tuning: the engine balances its own split."""
+    engine (build/strata-ds4), the files, the pack, the config.  The engine balances its own layer split; the tuning of
+    --tp and the CPU threads (calibrate_ds4_config) is ./maya.sh --calibrate's, not offered here (an engine start a
+    setting: half an hour on 9 GPUs)."""
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -3135,7 +3203,11 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     else:
         ok("the model's own vision tower runs in the engine, on the first GPU (about 320 MB of its memory, the "
            "weights streamed from RAM); the server resizes the pictures")
-    return write_config_ds4(a, pc, meta, pack, ctx, models, d, quant)   # 8
+    cfg_path = write_config_ds4(a, pc, meta, pack, ctx, models, d, quant)   # 8
+    if saved_calibration(read_json(cfg_path), any_context=True) is None:
+        say(f"  {ME} --calibrate measures the CPU threads (and with several GPUs the tensor parallel groupings, --tp)")
+        say("  on this PC and keeps the fastest: an engine start each, half an hour or so on 9 GPUs.")
+    return cfg_path
 
 
 def set_up_and_serve(a, prev: dict) -> tuple | None:
@@ -3213,8 +3285,9 @@ def main() -> int:
                                                          "minutes, with Maya stopped): decode on three questions and "
                                                          "prefill at 2k / 8k tokens; writes maya-bench.txt")
     ap.add_argument("--calibrate", action="store_true",
-                    help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes), "
-                         "then start the model (with --no-start: only tune)")
+                    help="tune the engine's CPU lane for this PC (the PCIe share and the CPU threads, ~10-15 minutes; "
+                         f"{DS4}: the tensor parallel groups and the CPU threads, an engine start each, ~25-40 "
+                         "minutes on 9 GPUs), then start the model (with --no-start: only tune)")
     ap.add_argument("--speed-calibration", action="store_true",
                     help="measure on this PC whether the DFlash2 drafter decodes faster than the MTP block (sustained "
                          "speed, ~5-20 minutes, the model loaded twice) and keep the faster; then start the model "
@@ -3267,10 +3340,11 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
-        if (a.calibrate or a.speed_calibration) and config_family(read_json(pick)) == "deepseek":
-            ok(f"{DS4}'s engine balances its own split and drafts with its DSpark block: nothing to tune")
-            a.calibrate = a.speed_calibration = False
-            if a.no_start:
+        if a.speed_calibration and config_family(read_json(pick)) == "deepseek":
+            ok(f"{DS4} drafts with its DSpark block: there is no drafter to compare (--calibrate tunes its --tp and "
+               "CPU threads)")
+            a.speed_calibration = False
+            if a.no_start and not a.calibrate:
                 return 0
         if a.calibrate:
             refresh_engine(read_json(pick))            # (the engine the tuning measures is the current one)
