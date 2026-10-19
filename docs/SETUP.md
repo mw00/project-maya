@@ -1,5 +1,7 @@
 # Setting up Maya
 
+<p align="center">English | <a href="SETUP.zh-cn.md">简体中文</a></p>
+
 The setup in detail: what its first run does, starting again and updating, and its options. Back to the
 [README](../README.md).
 

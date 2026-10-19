@@ -1,5 +1,7 @@
 # Running GLM-5.3-Flash on Strata - the study
 
+<p align="center">English | <a href="GLM5-FLASH.zh-cn.md">简体中文</a></p>
+
 What it would take for [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) to run on this
 engine, component by component, with every number the decision needs. Written 2026-09-29 against engine
 0.1.27 (`main`); all `file:line` references are to that tree.

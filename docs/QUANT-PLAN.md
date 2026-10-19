@@ -1,5 +1,7 @@
 # Project Maya quants of GLM-5.3-Flash - the plan
 
+<p align="center">English | <a href="QUANT-PLAN.zh-cn.md">简体中文</a></p>
+
 Two quants of our own, made from the official weights with error-feedback rounding and scale refinement sized to what we can run:
 
 | | Maya-S (first) | Maya-L (later) |
