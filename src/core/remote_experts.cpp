@@ -1,6 +1,7 @@
 #include "strata/core/remote_experts.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
@@ -238,6 +239,49 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
     gf::quantize_q8_1(x_, xq_, n_embd_, stream_);
     gf::moe_gate_up(gu_type, plan_, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
     gf::moe_down(d_type, plan_, ne, n_embd_, n_ff_, down_off, hq_, nullptr, out_, stream_);
+    return check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+                 "helper result", err, device_) &&
+           check(cudaStreamSynchronize(stream_), "helper finish", err, device_);
+}
+
+// The trellis branch: EXL3 expert blobs compute on this GPU with the primary's own
+// exl3 kernels (same decode, bit-identical by construction). The gate/up rotate the
+// F32 x themselves (no q8 quantization), so the helper's q8 scratch is unused here.
+bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                              const int* keys, const float* weights, const float* x,
+                              const strata::kernels::exl3::ExpertLayout* xl, float* out, std::string& err) {
+    namespace x3 = strata::kernels::exl3;
+    (void) gu_type; (void) d_type; (void) down_off;
+    if (device_ < 0 || ne < 1 || ne > 8 || xl == nullptr ||
+        !(gu_type == x3::kTypeEXL3 || d_type == x3::kTypeEXL3)) {
+        err = "GLM expert helper: unsupported expert types or route width";
+        return false;
+    }
+    unsigned long long ptr[8] = {};
+    for (int i = 0; i < ne; ++i) {
+        if (keys[i] < 0 || (size_t) keys[i] >= slots_.size() || !owns(keys[i])) {
+            err = "GLM expert helper: expert not owned by helper"; return false;
+        }
+        ptr[i] = (unsigned long long) slots_[(size_t) keys[i]].device;
+    }
+    DeviceScope scope(device_);
+    if (!scope.ok) { err = scope.error(device_); return false; }
+    if (!check(cudaMemcpyAsync(x_, x, (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice, stream_),
+               "helper input", err, device_) ||
+        !check(cudaMemcpyAsync(plan_.plan_ptr, ptr, (size_t) ne * sizeof(ptr[0]), cudaMemcpyHostToDevice, stream_),
+               "helper pointers", err, device_) ||
+        !check(cudaMemcpyAsync(plan_.plan_w, weights, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
+               "helper weights", err, device_)) return false;
+    x3::MoeArgs xa;
+    xa.plan_ptr = plan_.plan_ptr;
+    xa.plan_w = plan_.plan_w;
+    xa.lay = *xl;
+    xa.k = ne;
+    xa.n_embd = n_embd_;
+    xa.n_ff = n_ff_;
+    xa.limit = limit;
+    x3::moe_gate_up(xa, x_, nullptr, stream_);
+    x3::moe_down(xa, nullptr, nullptr, out_, stream_);
     return check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
                  "helper result", err, device_) &&
            check(cudaStreamSynchronize(stream_), "helper finish", err, device_);

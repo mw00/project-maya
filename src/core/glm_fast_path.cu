@@ -1755,8 +1755,8 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
 // ---------------------------------------------------------------- the CPU lane
 bool Glm5Model::fast_helper_setup(std::string& err) {
     FastState* F = fast_;
-    if (n_parts_ != 1 || exl3_ || g_.n_embd > 4096 || g_.n_exp_used > 8) {
-        err = "GLM expert helper: use one trunk GPU and native GGUF experts (up to 8 per route)";
+    if (n_parts_ != 1 || g_.n_embd > 4096 || g_.n_exp_used > 8) {
+        err = "GLM expert helper: use one trunk GPU (up to 8 experts per route)";
         return false;
     }
     std::vector<std::pair<void*, size_t>> regions;
@@ -1767,7 +1767,9 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     size_t requested = 0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& ly = F->L[(size_t) il];
-        if (!ly.moe || !gf::moe_supported(ly.gu_type) || !gf::moe_supported(ly.d_type)) continue;
+        // EXL3 layers: the helper computes trellis blobs; GGUF layers: gf::moe_supported types.
+        const bool ok_types = ly.exl3 || (gf::moe_supported(ly.gu_type) && gf::moe_supported(ly.d_type));
+        if (!ly.moe || !ok_types) continue;
         const int c = F->layer_rc[(size_t) il];
         if (c < 0) continue;
         const auto& R = F->rc[(size_t) c];
@@ -1789,7 +1791,10 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         if (R.stride > F->helper.available()) continue;
         const int rs = F->ram_of[(size_t) key];
         const uint8_t* host = rs >= 0 ? R.base + (size_t) rs * R.stride : F->stage[0];
-        if (rs < 0) for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
+        if (rs < 0) {
+            if (F->L[(size_t) il].exl3) fast_read_expert_x3(il, e, F->stage[0]);   // the nine-piece trellis reader
+            else for (int role = 0; role < 3; ++role) fast_read_part(il, e, role, F->stage[0], 0, 1);
+        }
         if (!F->helper.insert(key, host, F->L[(size_t) il].blob, R.stride, err)) return false;
         if (F->helper.integrated()) R.st[(size_t) rs] = FastState::kRHelper;
         ++resident;
@@ -1815,7 +1820,7 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     if (F->cpu_fmt.size() != F->L.size()) F->cpu_fmt.assign(F->L.size(), strata::kernels::cpu::NativeFmt{});
     for (int il = l0_; il < lt_; ++il) {
         const auto& ly = F->L[(size_t) il];
-        if (ly.moe && gf::moe_supported(ly.gu_type) && gf::moe_supported(ly.d_type)) {
+        if (ly.moe && gf::moe_supported(ly.gu_type) && gf::moe_supported(ly.d_type) && !ly.exl3) {
             if (!strata::kernels::cpu::native_fmt(ly.gu_type, ly.d_type, g_.n_embd, g_.n_ff_exp,
                                                  F->cpu_fmt[(size_t) il], err)) return false;
         }
@@ -4217,9 +4222,16 @@ void Glm5Model::fast_service() {
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);
-                if (F->helper_failed.load(std::memory_order_acquire) || (hn > 0 &&
-                    !F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys, helper_w,
-                                       rq->x, ans->part, F->helper_error))) {
+                // EXL3 (trellis) blobs take the layout overload; GGUF blobs the old one. Nothing to
+                // compute when hn == 0: this route's host experts are all CPU-lane ones.
+                bool hok = true;
+                if (hn > 0)
+                    hok = ly.exl3
+                        ? F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys,
+                                            helper_w, rq->x, &ly.xl, ans->part, F->helper_error)
+                        : F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys,
+                                            helper_w, rq->x, ans->part, F->helper_error);
+                if (F->helper_failed.load(std::memory_order_acquire) || !hok) {
                     // Retire the request so the main GPU can finish and report the error, not spin forever.
                     std::fill_n(ans->part, g.n_embd, 0.0f);
                     F->helper_failed.store(true, std::memory_order_release);
@@ -5210,8 +5222,10 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
                  Ly.sh_down.q != nullptr ? F->sh_out : nullptr, io.ffn, s);
     if (F->prof_on) F->mark("moe_down");
     }
-    // the CPU lane's experts last: the device's own down rows ran while the CPU worked (none: all in VRAM)
-    if (lane && !F->all_resident) {
+    // the host lane's experts last: the device's own down rows ran while the host worked (none: all in VRAM).
+    // EXL3 layers have no CPU lane, but helper-owned experts still answer through the pinned part:
+    // the wait fires whenever a helper is on (it is a no-op when cpu_seq is 0 for this route).
+    if ((lane || F->helper.device() >= 0) && !F->all_resident) {
         gf::moe_cpu_wait(md, g.n_embd, io.ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }

@@ -1310,9 +1310,12 @@ class Service:
         # pages on OTHER origins allowed to call /v1/* from a browser (CORS; the config's "cors_origins"): exact origins
         # like "http://127.0.0.1:8090", or "*" for every page.  Empty = no CORS headers at all.
         self.cors_origins: list[str] = []
-        self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.status = {"busy": False, "queued": 0}      # GET /status: the most recently updated active request
         self.active = 0                                 # requests with the engine now (several: READY multi=<n>)
-        self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
+        self.live_requests = {}                         # id -> live request; the Monitor must not mix concurrent counters
+        self._live_ids = itertools.count(1)
+        self._live_generated_total = 0                  # monotonic total for the aggregate decode-rate window
+        self.rate = collections.deque(maxlen=32)        # (time, aggregate generated) samples for the live tok/s window
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
@@ -1569,26 +1572,26 @@ class Service:
         return any(isinstance(u, (int, float)) and u > STALL_GPU_BUSY for u in utils)
 
     def _tok_s(self):
-        """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating."""
+        """Combined tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is decoding."""
         with self.status_lock:
-            s = dict(self.status)
             rate = list(self.rate)
-        if not s.get("busy") or not s.get("first_token"):
+            decoding = [r for r in self.live_requests.values() if r.get("in_engine") and r.get("first_token")]
+        if not decoding:
             return 0.0
         now = time.time()
         newest = rate[-1] if rate else None
         oldest = next(((t, g) for t, g in rate if now - t <= RATE_WINDOW_S), None)
         if newest and oldest and newest[0] - oldest[0] >= RATE_MIN_SPAN_S:
             return max(0.0, (newest[1] - oldest[1]) / (newest[0] - oldest[0]))
-        return s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
+        return sum(r["generated"] for r in decoding) / max(RATE_MIN_SPAN_S, now - min(r["first_token"] for r in decoding))
 
     def _tok_s_mean(self):
-        """The whole-request mean since the first token (the old formula), kept so the two can be compared."""
+        """The active set's whole-period combined mean, kept so the windowed live rate can be compared."""
         with self.status_lock:
-            s = dict(self.status)
-        if not s.get("busy") or not s.get("first_token"):
+            decoding = [r for r in self.live_requests.values() if r.get("in_engine") and r.get("first_token")]
+        if not decoding:
             return 0.0
-        return s["generated"] / max(1e-6, time.time() - s["first_token"])
+        return sum(r["generated"] for r in decoding) / max(1e-6, time.time() - min(r["first_token"] for r in decoding))
 
     def _prefill_tok_s_mean(self):
         """Engine-reported mean over newly read tokens, excluding the cached prefix."""
@@ -1604,22 +1607,29 @@ class Service:
             hist = list(self.history)
             totals = dict(self.totals)
             active = self.active
+            current = [dict(r) for r in self.live_requests.values() if r.get("in_engine")]
         now = time.time()
         progress = getattr(self.engine, "progress", None)
-        if s.get("busy") and s.get("first_token") is None:
-            state = "reading"
-        elif s.get("busy"):
+        decoding = [r for r in current if r.get("first_token")]
+        primary = max(current, key=lambda r: r.get("updated", r["started"])) if current else None
+        if decoding:
             state = "generating"
+        elif current:
+            state = "reading"
         else:
             state = "idle"
+        aggregate_rate = self._tok_s() if state == "generating" else None
         live = {"state": state, "queued": s.get("queued", 0), "active": active,   # (answering at once: --parallel)
-                "phase": s.get("phase") if s.get("busy") else None,
-                "prompt_tokens": s.get("prompt_tokens") if s.get("busy") else None,
-                "prompt_read": None, "prompt_total": None, "generated": s.get("generated") if s.get("busy") else None,
-                "max_tokens": s.get("max_tokens") if s.get("busy") else None,
-                "elapsed_s": round(now - s["started"], 1) if s.get("busy") and s.get("started") else None,
+                "generating": len(decoding), "reading": len(current) - len(decoding),
+                "phase": primary.get("phase") if primary else None,
+                "prompt_tokens": primary.get("prompt_tokens") if primary else None,
+                "prompt_read": None, "prompt_total": None,
+                "generated": sum(r["generated"] for r in current) if current else None,
+                "max_tokens": primary.get("max_tokens") if primary else None,
+                "elapsed_s": round(now - primary["started"], 1) if primary else None,
                 "tok_s": round(self._tok_s(), 1) if state == "generating" else None,
                 "tok_s_mean": round(self._tok_s_mean(), 1) if state == "generating" else None,
+                "tok_s_per_request": round(aggregate_rate / len(decoding), 1) if aggregate_rate is not None and decoding else None,
                 "prefill_tok_s_mean": getattr(self.engine, "prefill_tok_s_mean", None) if s.get("busy") else None,
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
@@ -1848,13 +1858,21 @@ class Service:
         return {"tokens": n, "images": len(sources), "approximate": approximate,
                 "max_context": self.engine.max_context}
 
-    def _note(self, n, evs):
+    def _note(self, live_id, n, evs):
         with self.status_lock:
             s = self.status
+            now = time.time()
+            live = self.live_requests.get(live_id)
+            if live is not None:
+                previous = live["generated"]
+                live.update(generated=n, updated=now)
+                if live["first_token"] is None:
+                    live["first_token"] = now
+                self._live_generated_total += max(0, n - previous)
+                self.rate.append((now, self._live_generated_total))
             s["generated"] = n
             if s.get("first_token") is None:
-                s["first_token"] = time.time()
-            self.rate.append((time.time(), n))          # the live rate's window over the last RATE_WINDOW_S
+                s["first_token"] = now
             for ev in evs:
                 if ev.kind == "reasoning":
                     s["phase"] = "thinking"
@@ -1865,6 +1883,8 @@ class Service:
                 elif ev.kind == "tool_call":
                     s["phase"] = "tool call complete"
                 s["tail"] = (s["tail"] + (ev.text or ""))[-600:]
+            if live is not None:
+                live["phase"] = s["phase"]
 
     def _progress(self, last_print, every=1.0):
         """A progress line in the server window every `every` seconds while a request runs."""
@@ -1896,7 +1916,7 @@ class Service:
                 hold[0] = False
                 self.fifo.release(units=1)
 
-    def _sliced(self, ids, max_new, sampling, cancel, emb, hold) -> Iterator[int | None]:
+    def _sliced(self, ids, max_new, sampling, cancel, emb, hold, live_id) -> Iterator[int | None]:
         """engine.generate(), in fair slices (STRATA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
         queues behind it.  Back in turn, it goes on with prompt + what it already wrote as the new prompt: the
@@ -1946,6 +1966,8 @@ class Service:
                 hold[1] = False
                 self.status["busy"] = self.active > 0
                 self.status["queued"] += 1
+                if live_id in self.live_requests:
+                    self.live_requests[live_id]["in_engine"] = False
             waiting = self.fifo.waiting()
             place = self.fifo.enqueue(units=1)          # in line before letting go: behind whoever waits now
             hold[0] = False
@@ -1967,7 +1989,8 @@ class Service:
                 self.status.update({k: mine[k] for k in ("busy", "phase", "prompt_tokens", "started", "first_token",
                                                          "tool", "tail", "max_tokens") if k in mine},
                                    generated=len(produced))
-                self.rate.clear()
+                if live_id in self.live_requests:
+                    self.live_requests[live_id]["in_engine"] = True
             if self.stopping or cancel.is_set():
                 break
             if hasattr(self.engine, "alive") and not self.engine.alive():   # it died in the request in between
@@ -2013,6 +2036,7 @@ class Service:
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
         engine_last0 = getattr(self.engine, "last", None)
         counted, my_started, my_first = False, time.time(), None
+        live_id = next(self._live_ids)
         with self.status_lock:
             self.status["queued"] += 1
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
@@ -2032,13 +2056,17 @@ class Service:
                     self.engine.restart()
                     print("[maya] the engine is running again", flush=True)
                 with self.status_lock:
+                    if self.active == 0:
+                        self.rate.clear()               # an old idle burst must not affect the next live rate
                     self.status.update(busy=True, phase="reading the prompt", prompt_tokens=len(ids), generated=0,
                                        started=time.time(), first_token=None, tool=None, tail="", max_tokens=max_new)
                     self.active += 1
                     counted = hold[1] = True
                     my_started = self.status["started"]
+                    self.live_requests[live_id] = {"started": my_started, "updated": my_started, "in_engine": True,
+                                                   "prompt_tokens": len(ids), "max_tokens": max_new, "generated": 0,
+                                                   "first_token": None, "phase": "reading the prompt"}
                     self.last_request_at = time.time()
-                    self.rate.clear()               # the previous request's samples must not leak into this one
                 before = getattr(self.engine, "last", None)
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
@@ -2059,7 +2087,7 @@ class Service:
                     engine's ERR says "non-finite") before the first token, the engine has dropped that conversation's
                     state and the request runs once more, its prompt read from token 0."""
                     for again in (False, True):
-                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold), 0
+                        sliced, got = self._sliced(ids, max_new, sampling, cancel, emb, hold, live_id), 0
                         try:
                             for t in sliced:
                                 got += t is not None
@@ -2110,7 +2138,7 @@ class Service:
                                          if held.endswith(s[:j])), default=0)
                                 text, held = held[:len(held) - k], held[len(held) - k:]
                         evs = parser.feed(text)
-                        self._note(n, evs)
+                        self._note(live_id, n, evs)
                         last_print = self._progress(last_print)
                         for ev in evs:
                             yield "event", ev
@@ -2200,6 +2228,7 @@ class Service:
                 if hold[1]:
                     hold[1] = False
                     self.active -= 1
+                self.live_requests.pop(live_id, None)
                 self.status["busy"] = self.active > 0
         for ev in parser.finish():
             yield "event", ev

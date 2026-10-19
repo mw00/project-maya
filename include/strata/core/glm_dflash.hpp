@@ -15,6 +15,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,6 +88,16 @@ public:
     /// Forget every cached position at or past `from` (0: a new sequence, or a state loaded from elsewhere; else the
     /// sequence went back to `from` and the positions after it will hold other tokens).
     void reset(int64_t from = 0);
+    /// Per-conversation drafter state (one GPU, several conversations): the K/V ring's contents, the ring's position
+    /// records and the trunk staging's records are keyed by the conversation.  ctx_swap(key) stores the live state
+    /// under its key and restores (or clears) the one for `key`; ctx_drop(key) forgets a conversation's state.  A
+    /// context switch without a swap leaves the other conversation's stale K/V under the same position numbers - the
+    /// drafts then fail the verify window (the tokens stay correct, the speed does not).  false: a CUDA error.
+    bool ctx_swap(uint64_t key, std::string& err);
+    bool ctx_owned(uint64_t key) const;
+    void ctx_drop(uint64_t key);
+    /// The key of the conversation whose state is in the ring now (-1: nobody swapped, single-conversation use).
+    int conv_live_key() const;
     /// The last draft's mask rows (tests): their final normed hidden states (n x hidden), their candidates and logits
     /// (n x top_k), the walk's picks and confidences (n).
     bool last_rows(int n, std::vector<float>& hidden, std::vector<int>& cand, std::vector<float>& logit,

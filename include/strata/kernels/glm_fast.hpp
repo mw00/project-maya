@@ -45,10 +45,10 @@ constexpr int kMaxMvCols = 16;   // a verify window's tokens, a draft block's
 constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
-/// The most activations mv_nt() takes at once (the conversations of one batched decode step).
-constexpr int kMaxMvNt = 8;
+/// The maximum activations mv_nt() takes at once. DFMULTI can flatten four depth-eight request windows into 32 rows.
+constexpr int kMaxMvNt = 32;
 /// mv() for nt activations at once (nt <= kMaxMvNt; 1 = mv()), the jobs' ncol 1: each job's xq / xf hold nt activations
-/// one after another (n_in values each) and its y nt outputs (n_out each).  Output t is bit for bit what mv() gives
+/// one after another (n_in values each) and its y nt outputs (n_out each). Output t is bit for bit what mv() gives
 /// for activation t alone, and each weight row is read from memory once for all of them.
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s);
 /// Whether mv() serves this weight type.
@@ -140,6 +140,22 @@ struct KdaRecArgs {
     const float *g2 = nullptr, *norm_w = nullptr;
 };
 void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps, cudaStream_t s);
+/// The rows path's fused per-row KDA staging gather: the six projection outputs (q/k/v proj,
+/// f_a, g_a, beta) into one contiguous staging record per (row, layer) - exactly the layout
+/// the six per-row cudaMemcpyAsync calls produced, in one launch. src[p] is piece p's base
+/// for row 0 with n_in-strided rows (use rows(S->proj[p], w, 0) pointers; the kernel strides).
+struct KdaGatherArgs {
+    const float* src[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};   // piece bases (row 0)
+    float* row_kin = nullptr;      // the staging arena (row * n_kda + kin_layer) * kin_layer_floats
+    int n_rows = 0;                // rows this step (1..kMaxMvNt)
+    int n_kda = 0;                 // KDA layers per model
+    int kin_layer = 0;             // this layer's index in the staging arena
+    int kin_layer_floats = 0;      // one (row, layer) record's floats
+    int di = 0;                    // d_inner (pieces 0..2's width)
+    int hd = 0;                    // kda_head_dim (pieces 3..4's width)
+    int nh = 0;                    // n_head (piece 5's width)
+};
+void kda_gather(const KdaGatherArgs& a, cudaStream_t s);
 
 /// DSA, after the first projections: q_a norm (-> qr f32 + q8_1), kv_a norm into the latent cache
 /// at position p, the indexer key's layer norm into its cache, the compressor gate into its cache,

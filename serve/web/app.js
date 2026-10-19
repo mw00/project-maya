@@ -666,8 +666,13 @@ function renderHero(live, h, last, eng, tiers, totals) {
   const gen = live.state === "generating";
   const speed = gen ? live.tok_s : last ? last.decode_tok_s : null;
   $("hero-speed").textContent = speed == null ? "–" : fmt(speed, 1);
-  $("hero-speed-sub").textContent = "decode · " + (gen ? "writing now" : live.state === "reading" ? "reading the prompt"
+  const decoding = live.generating || 0;
+  const perRequest = gen ? live.tok_s_per_request : null;
+  $("hero-speed-sub").textContent = "total decode · " + (gen ? (decoding > 1 ? `${fmt(decoding)} requests` : "one request")
+                                    : live.state === "reading" ? "reading the prompt"
                                     : last ? "last request" : "waiting for a request");
+  $("hero-per-request").textContent = perRequest == null ? "–" : fmt(perRequest, 1);
+  $("hero-per-request-sub").textContent = gen ? `per active request · avg of ${fmt(decoding)}` : "per active request";
   // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
                 : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
@@ -681,7 +686,7 @@ function renderHero(live, h, last, eng, tiers, totals) {
   $("hero-spark-wrap").classList.toggle("is-empty", !a && !b);
   const tn = tiers && tiers.now;
   const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
-  const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
+  const ms = gen ? (perRequest ? 1000 / perRequest : null) : speed ? 1000 / speed : null;
   $("hero-ms").innerHTML = ms == null ? "–" : `${fmt(ms, 1)}<small>ms</small>`;
   $("hero-hit").innerHTML = fresh && tn.vram_hit != null ? `${fmt(100 * tn.vram_hit, 1)}<small>%</small>`
                           : last && last.hit_rate != null ? `${fmt(100 * last.hit_rate, 1)}<small>%</small>` : "–";
@@ -729,7 +734,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEa
     state = "generating";
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens${took(live.elapsed_s)}`;
+    detail = live.generating > 1 ? `${fmt(live.generated)} tokens across ${fmt(live.generating)} active requests${took(live.elapsed_s)}`
+                                  : `${fmt(live.generated)} tokens${took(live.elapsed_s)}`;
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last answer: ${fmt(last.output_tokens)} tokens${took(last.duration_s)}`;

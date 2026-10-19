@@ -1,13 +1,14 @@
 // tests/glm_mv_nt_test.cu - the dense GEMV for several activations at once (mv_nt) against the one-activation GEMV
-// (mv), bit for bit: every weight type the decode reads, 2 to 8 activations, a launch of mixed types (the typed and
-// the generic kernels), a scale and a bias.  Synthetic weights from ggml's own quantizers; no model needed.
+// (mv), bit for bit: every weight type the decode reads, 2 to 32 activations, a launch of mixed types (the typed and
+// the generic kernels), a scale and a bias. Synthetic weights from ggml's own quantizers; no model needed.
 //
 //   glm_mv_nt_test           the parity checks (ctest; with STRATA_GLM_MV_GENERIC=1 too: the generic kernel only)
-//   glm_mv_nt_test --bench   the time of one Q6_K 4096 x 12288 GEMV (the dense FFN's gate) for 1..8 activations
+//   glm_mv_nt_test --bench   the time of one Q6_K 4096 x 12288 GEMV (the dense FFN's gate) for 1..32 activations
 #include "strata/kernels/glm_fast.hpp"
 
 #include "ggml.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -76,13 +77,14 @@ struct Acts {
 };
 Acts make_acts(int n, std::mt19937& rng, cudaStream_t s) {
     std::normal_distribution<float> nd(0.f, 1.f);
-    std::vector<float> h((size_t) n * gf::kMaxMvCols);
+    const int ncols = std::max(gf::kMaxMvCols, gf::kMaxMvNt);
+    std::vector<float> h((size_t) n * ncols);
     for (auto& v : h) v = nd(rng);
     Acts a;
     check(cudaMalloc(&a.xf, h.size() * sizeof(float)), "activations");
-    check(cudaMalloc(&a.xq, (size_t) n / 32 * kQ8 * gf::kMaxMvCols), "activations q8_1");
+    check(cudaMalloc(&a.xq, (size_t) n / 32 * kQ8 * ncols), "activations q8_1");
     check(cudaMemcpy(a.xf, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice), "activations upload");
-    for (int t = 0; t < gf::kMaxMvCols; ++t)
+    for (int t = 0; t < ncols; ++t)
         gf::quantize_q8_1(a.xf + (size_t) t * n, a.xq + (size_t) t * (n / 32) * kQ8, n, s);
     check(cudaStreamSynchronize(s), "quantize");
     return a;
@@ -137,7 +139,7 @@ bool run_case(const char* name, const std::vector<Job>& jobs, int nt, cudaStream
         std::fprintf(stderr, "%s: mv_nt refused %d jobs x %d activations\n", name, n, nt);
         return false;
     }
-    if (!gf::mv(cols.data(), n, s)) {
+    if (nt <= gf::kMaxMvCols && !gf::mv(cols.data(), n, s)) {
         std::fprintf(stderr, "%s: mv refused %d jobs of %d columns\n", name, n, nt);
         return false;
     }
@@ -158,7 +160,7 @@ bool run_case(const char* name, const std::vector<Job>& jobs, int nt, cudaStream
         std::vector<float> b((size_t) nt * j.w.n_out);
         check(cudaMemcpy(b.data(), y_one[(size_t) i], b.size() * sizeof(float), cudaMemcpyDeviceToHost), "read back");
         for (const int form : {0, 1}) {
-            if (form == 0 && !with_nt) continue;
+            if ((form == 0 && !with_nt) || (form == 1 && nt > gf::kMaxMvCols)) continue;
             std::vector<float> a(b.size());
             check(cudaMemcpy(a.data(), form == 0 ? y_nt[(size_t) i] : y_col[(size_t) i], a.size() * sizeof(float),
                              cudaMemcpyDeviceToHost), "read back");

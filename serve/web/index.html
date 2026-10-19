@@ -138,11 +138,15 @@
       <div class="st-card hero">
         <div class="hero__top">
           <div class="hero__speed">
-            <span class="hero__label">Throughput</span>
+            <span class="hero__label">Decode throughput</span>
             <div class="hero__speeds">
-              <div class="hero__rate">
+              <div class="hero__rate" title="All answer tokens written by the server per second, across every request currently decoding">
                 <span class="hero__value"><span id="hero-speed">&ndash;</span><small>tok/s</small></span>
-                <span class="muted hero__speed-sub" id="hero-speed-sub">decode &middot; waiting for a request</span>
+                <span class="muted hero__speed-sub" id="hero-speed-sub">total decode &middot; waiting for a request</span>
+              </div>
+              <div class="hero__rate hero__rate--per-request" title="The combined decode rate divided by the number of requests currently decoding. This is the average rate a single active request receives.">
+                <span class="hero__value"><span id="hero-per-request">&ndash;</span><small>tok/s</small></span>
+                <span class="muted hero__speed-sub" id="hero-per-request-sub">per active request</span>
               </div>
               <div class="hero__rate hero__rate--prefill" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
                 <span class="hero__value"><span id="hero-prefill">&ndash;</span><small>tok/s</small></span>

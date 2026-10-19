@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
@@ -37,6 +38,12 @@ public:
     bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                  const int* keys, const float* weights, const float* x,
                  float* out, std::string& err);
+    /// EXL3 (trellis) blobs: the layer's ExpertLayout rides along (blob-relative offsets of each
+    /// part's suh/svh/trellis and its K bits); x is n_embd F32, out n_embd F32 (the gate/up rotate
+    /// it themselves). Everything else is the GGUF call's contract.
+    bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                 const int* keys, const float* weights, const float* x,
+                 const strata::kernels::exl3::ExpertLayout* xl, float* out, std::string& err);
     void close();
     int device() const { return device_; }
 
