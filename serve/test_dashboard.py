@@ -223,6 +223,18 @@ class GpuMap(unittest.TestCase):
         self.assertEqual((g["parts"]["pool"], g["parts"]["vision"]), (r["pool"] - r["tail"], enc))
         self.assertEqual(g["parts"]["other"], 0)
 
+    def test_a_vision_tower_in_the_engines_process(self):
+        # (strata-ds4: the tower on the first GPU inside the engine - vision_own, not a pool tail lent to another process)
+        r = dict(self.r, vision_own=318 * 2**20)
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own = engine + r["vision_own"] + 400 * 2**20
+        (g,) = self.gm.view([r], [self.card(own, {100: own})], engine_pid=100)
+        self.assertEqual((g["parts"]["vision"], g["vision_own"]), (r["vision_own"], r["vision_own"]))
+        self.assertEqual((g["parts"]["rest"], g["parts"]["other"]), (400 * 2**20, 0))   # the CUDA context, not vision
+        (s,) = self.gm.view([r], [], engine_pid=100)             # (no NVML: the start's measurement)
+        self.assertEqual(s["parts"]["vision"], r["vision_own"])
+        self.assertEqual(sum(s["parts"].values()) + s["free"], s["total"])
+
     def test_never_more_than_the_card(self):
         (g,) = self.gm.view([self.r], [self.card(26 * GB, {100: 25 * GB, 200: 2 * GB})], engine_pid=100)
         self.assertLessEqual(sum(g["parts"].values()), g["total"])

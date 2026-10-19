@@ -275,6 +275,8 @@ $("tiers").innerHTML = TIERS.map((m) => `
       stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke"/></svg>
   </div></div>`).join("");
 const TIER_SUB = {ram_fetch: "experts pulled over PCIe from RAM", disk: "experts read from the SSD", promo: "experts moved into VRAM"};
+// (strata-ds4: the experts VRAM does not hold are computed by the CPU, in RAM - nothing crosses PCIe for them)
+const TIER_SUB_DS4 = {ram_fetch: "experts the CPU computes, in RAM"};
 function renderTiers(t, eng) {
   const card = $("tiers-card");
   if (!t || !t.now) { card.hidden = true; return; }
@@ -287,7 +289,8 @@ function renderTiers(t, eng) {
     const v = n[m.key];
     const shown = v == null ? null : fmt(v, m.digits);
     $(`tv-${m.key}`).innerHTML = shown == null ? "–" : `${esc(shown)}<small>${esc(m.unit)}</small>`;
-    $(`ts-${m.key}`).textContent = (stale ? "last answer: " : "") + (TIER_SUB[m.key] || "");
+    const sub = (eng && eng.engine_kind === "ds4" && TIER_SUB_DS4[m.key]) || TIER_SUB[m.key] || "";
+    $(`ts-${m.key}`).textContent = (stale ? "last answer: " : "") + sub;
     spark(`tp-${m.key}`, (h[m.key] || []).map((x) => (x == null ? 0 : x)), m.max);
   }
   const vu = n.vram_used || 0, ru = n.ram_used || 0;
@@ -367,7 +370,8 @@ function gpuDetail(g, segs, m) {
       .filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
       .filter(Boolean).join(" · "),
-    vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
+    vision: g.vision_lent ? "the pool's tail, while it encodes" : g.vision_own ? "the vision tower, in the engine's process"
+                                                                                : "its own process",
     rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
     free: (g.free || 0) < 1.5 * GIB ? "kept free for the driver and the sampler" : "unused",

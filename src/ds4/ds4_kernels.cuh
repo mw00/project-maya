@@ -23,7 +23,10 @@ void embed(const uint16_t* rows_bf16, int T, float* h, int dim, int hc, cudaStre
 ///         pos_v = pos + (v / vpp) * pos_step
 ///   quant 0 none, 1 FP8 E4M3 with a power-of-two scale per 32, 2 FP4 E2M1 with an E4M3 scale per 16, 3 FP4 with a
 ///         power-of-two scale per 32 (the reference kernels' act_quant / fp4_act_quant, inplace)
-/// and written back to x, or as BF16 to dst + v * dst_stride when dst is given.
+/// and written back to x, or as BF16 to dst + v * dst_stride when dst is given - or, quant 2 / 3 with pdst, packed at
+/// pdst + v * pdst_stride (fp4_row_bytes): the FP4 codes two a byte (the even value's in the low nibble), then each
+/// group's scale a byte (quant 2: its E4M3 bits; quant 3: its power of two's exponent bits) - the same values, a quarter of
+/// BF16's bytes and a little (read back by index_score / sparse_attn's packed rows, bit for bit the BF16 ones).
 struct Finish {
     const float* w = nullptr;
     float eps = 1e-20f;
@@ -32,7 +35,11 @@ struct Finish {
     int quant = 0;
     uint16_t* dst = nullptr;
     long long dst_stride = 0;
+    uint8_t* pdst = nullptr;
+    long long pdst_stride = 0;
 };
+/// a packed FP4 row's bytes (Finish::pdst): len / 2 of codes, a scale byte a group (quant 2: 16 values, quant 3: 32)
+constexpr size_t fp4_row_bytes(int len, int quant) { return (size_t) len / 2 + (size_t) len / (quant == 2 ? 16 : 32); }
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s);
 
 /// Hyper-Connections, row t of each [T][..] array: mixes[t][m] = (h_flat . fn[m]) * rsqrt(mean(h_flat^2) + eps), then
@@ -96,11 +103,13 @@ struct Rows {
 /// The indexer's scores, row t: out[t][i] = sum_h relu(q[t][h] . k[p]) w[t][h] for i < n (the widest query's), p = i, or
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride.
-void index_score(const float* q, const float* w, const uint16_t* k_bf16, int heads, int hd, int T, int n,
-                 const int* cand, int cand_stride, int blk, const Rows& lim, float* out, long long out_stride,
-                 cudaStream_t s);
-/// The top r.k[t] of vals[t][0, r.n[t]) (row t at vals + t * stride): their positions (unordered; with candidates
-/// cand[t][i / blk] * blk + i % blk) into out[t][0, k).  r.k[t] >= r.n[t] takes them all.
+/// (keys as BF16 rows of hd, or - k_packed - packed FP4 rows, quant 3, fp4_row_bytes(hd, 3) apart)
+void index_score(const float* q, const float* w, const uint16_t* k_bf16, const uint8_t* k_packed, int heads, int hd,
+                 int T, int n, const int* cand, int cand_stride, int blk, const Rows& lim, float* out,
+                 long long out_stride, cudaStream_t s);
+/// The top r.k[t] of vals[t][0, r.n[t]) (row t at vals + t * stride): their positions (with candidates
+/// cand[t][i / blk] * blk + i % blk) into out[t][0, k) - those above the k-th value, then of the values equal to it the
+/// first, each run in position order (the same every run).  r.k[t] >= r.n[t] takes them all.
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
           int* out, int out_stride, cudaStream_t s);
 /// Level one of the candidate pre-filter, row t: block b's score = the max over its blk positions of the r.n[t] the
@@ -109,7 +118,8 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
                  int* out, int out_stride, cudaStream_t s);
 
 /// Sparse attention, query t: heads x d values of q[t] against win rows win0[t] .. win0[t] + nwin[t] - 1 of the window
-/// buffer (d BF16 each) and the nsel[t] compressed rows ckv[sel[t][i]]; K = V, a learned sink logit per head.
+/// buffer (d BF16 each) and the nsel[t] compressed rows ckv[sel[t][i]] (BF16, or - ckv_packed - packed FP4 rows, quant
+/// 2, fp4_row_bytes(d, 2) apart); K = V, a learned sink logit per head.
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,
@@ -117,8 +127,8 @@ struct AttnRows {
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0;
 };
-void sparse_attn(const float* q, const uint16_t* win, const uint16_t* ckv, const int* sel, int sel_stride,
-                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
+void sparse_attn(const float* q, const uint16_t* win, const uint16_t* ckv, const uint8_t* ckv_packed, const int* sel,
+                 int sel_stride, const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
                  cudaStream_t s);
 /// The window buffer: ext[r] = ring[(p0 - n + r) % n] for the n rows before p0 (zeros before position 0); afterwards
 /// ring[(p0 + t) % n] = ext[n + t] for t < T.

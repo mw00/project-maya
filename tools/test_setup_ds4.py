@@ -1,5 +1,6 @@
-"""tools/test_setup_ds4.py - the setup's two models: GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 (maya.py) - which one the
-options pick, the DeepSeek download's manifest and URLs, its config (what a setup again keeps) and its start command.
+"""tools/test_setup_ds4.py - the setup's two models: GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 (maya.py; DeepSeek at 2.9 or
+3.5 bits) - which one the options pick, the DeepSeek downloads' manifests and URLs, the Engram tables shared between the
+quants, its config (what a setup again keeps) and its start command.
 No GPU, no network.
 
     python -m unittest tools.test_setup_ds4 -v
@@ -71,6 +72,69 @@ class Manifest(unittest.TestCase):
         self.assertTrue(u.endswith("/model-00047-of-00048.safetensors"))
 
 
+class Quant35(unittest.TestCase):
+    """The 3.5-bit quant: picked by --model or the menu, its own pinned manifest, its own folder, the Engram tables
+    linked from the 2.9-bit folder rather than downloaded again."""
+
+    def test_picked(self):
+        self.assertEqual(maya.choose_family(args(model=maya.DS4_35), {}), "deepseek")
+        a = args()
+        with patch.object(maya.S, "gpus", return_value=[]), patch.object(maya, "say", lambda *x: None):
+            self.assertEqual(maya.choose_family(a, {"installer": {"family": "deepseek", "quant": maya.DS4_35}}),
+                             "deepseek")
+        self.assertEqual(a.model, maya.DS4_35)                 # (the setup before: the default row)
+        self.assertEqual(maya.ds4_quant(args(), {"installer": {"quant": maya.DS4_35}}), maya.DS4_35)
+        self.assertEqual(maya.ds4_quant(args(), {}), maya.DS4)
+
+    def test_every_file_pinned(self):
+        m = maya.ds4_model(maya.DS4_35)
+        for n in ["config.json", "model.safetensors.index.json", "tokenizer.json"] + \
+                 [f"model-{i:05d}-of-00044.safetensors" for i in range(1, 45)] + \
+                 ["model-00047-of-00048.safetensors", "model-00048-of-00048.safetensors"]:
+            self.assertIn(n, m["files"])
+        for n, size in m["files"].items():
+            self.assertNotIn("/", n)
+            self.assertGreater(size, 0)
+            self.assertRegex(m["sha256"][n], r"^[0-9a-f]{64}$")
+        self.assertAlmostEqual(m["download_gb"], 460.7, delta=0.5)
+        self.assertIn("3.5 bits", m["about"])
+        rev = re.compile(r"/resolve/[0-9a-f]{40}/")
+        u = maya.file_url(m, "model-00001-of-00044.safetensors")
+        self.assertTrue(u.startswith("https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw/"))
+        self.assertRegex(u, rev)
+        u = maya.file_url(m, "model-00048-of-00048.safetensors")
+        self.assertTrue(u.startswith("https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/"))
+
+    def test_own_folder(self):
+        models = Path(tempfile.mkdtemp())
+        old = models / "old"
+        old.mkdir()
+        (old / "config.json").write_text("{}")
+        prev = {"args": ["--pack", str(old / "maya-ds4")], "installer": {"quant": maya.DS4}}
+        self.assertEqual(maya.ds4_dir(args(), models, prev, maya.DS4), old)          # (the same quant: its folder)
+        self.assertEqual(maya.ds4_dir(args(), models, prev, maya.DS4_35), models / maya.DS4_35)
+
+    def test_engram_linked(self):
+        models = Path(tempfile.mkdtemp())
+        m = maya.ds4_model(maya.DS4_35)
+        have = models / maya.DS4
+        have.mkdir()
+        book = {}
+        for n in m["sources"]:
+            with open(have / n, "wb") as f:
+                f.truncate(m["files"][n])                  # (sparse: the size without the bytes)
+            st = (have / n).stat()
+            book[n] = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+        (have / maya.VERIFIED).write_text(json.dumps(book))
+        d = models / maya.DS4_35
+        with patch.object(maya, "ok", lambda *x: None), patch.object(maya, "configs", return_value=[]):
+            maya.ds4_link_engram(d, m, models, {})
+        for n in m["sources"]:
+            self.assertEqual((d / n).stat().st_ino, (have / n).stat().st_ino)    # (a hard link, not a copy)
+            self.assertIsNone(maya.file_incomplete(m, d / n))
+        self.assertEqual(json.loads((d / maya.VERIFIED).read_text()), book)
+
+
 class Config(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -102,6 +166,14 @@ class Config(unittest.TestCase):
         self.assertEqual(c["installer"]["family"], "deepseek")
         self.assertEqual(maya.config_family(c), "deepseek")
         self.assertIn("maya.py", (self.root / "run-maya-ds4.sh").read_text())
+
+    def test_quant_recorded(self):
+        pc = {"gpus": [{"index": 0}]}
+        p = maya.write_config_ds4(args(), pc, {}, Path("/m/D35/maya-ds4"), 65536, Path("/models"), Path("/m/D35"),
+                                  maya.DS4_35)
+        c = json.loads(p.read_text())
+        self.assertEqual(c["installer"]["quant"], maya.DS4_35)
+        self.assertEqual(maya.ds4_quant(args(), c), maya.DS4_35)
 
     def test_again_keeps_what_it_does_not_ask(self):
         old = {"args": ["--pack", "/old/maya-ds4", "--max-context", "262144", "--tp", "1", "--prefill-chunk", "4096"],

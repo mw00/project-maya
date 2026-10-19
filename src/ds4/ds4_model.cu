@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <queue>
 #include <array>
 #include <condition_variable>
 #include <deque>
@@ -439,6 +440,10 @@ struct Dev {
     int id = 0;
     cudaStream_t st = nullptr;
     cudaEvent_t ev = nullptr;
+    // a window's hc_mix + hc_split beside the layer (their results are read only at its hc_post; the pre norm takes the
+    // lagged pre): their stream, the stream's go (st -> st2) and its done (st2 -> st)
+    cudaStream_t st2 = nullptr;
+    cudaEvent_t hc_go = nullptr, hc_done = nullptr;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
@@ -534,6 +539,9 @@ struct Layer {
     x3::ExpertLayout hlay;
     size_t hblob = 0;
     int ff0 = 0, ffn = 0;     // this member's FFN columns [ff0, ff0 + ffn) (split128 of n_ff; the whole one alone)
+    // this member's heads [ah0, ah0 + ahn) and wo_a groups [og0, og0 + ogn) - all of them alone; in a group the
+    // heads do not split in (a mixed group of 9 over 64 heads), member 0 none: its attention adds nothing to the sum
+    int ah0 = 0, ahn = 0, og0 = 0, ogn = 0;
     // the chunked prompt path: each expert's virtual slot (its VRAM slot, or n_slots + its place among the CPU lane's
     // experts, which a chunk streams in that order) - pinned on member 0, a device copy on each member
     int* vs_pin = nullptr;
@@ -593,8 +601,10 @@ struct Layer {
 struct Src {
     int layer = 0, ratio = 1;
     int64_t cap = 0;
-    std::vector<uint16_t*> ckv, ik;   // per device (nullptr where no layer reads it)
-    uint16_t *h_ckv = nullptr, *h_ik = nullptr;   // pinned: a window's new rows, on their way to the other devices
+    // per device (nullptr where no layer reads it): the compressed KV and the index keys as the packed FP4 rows they
+    // are (Finish::pdst; kv_row() / ik_row() bytes a row: a quarter of BF16's and a little)
+    std::vector<uint8_t*> ckv, ik;
+    uint8_t *h_ckv = nullptr, *h_ik = nullptr;   // pinned: a window's new rows, on their way to the other devices
     cudaEvent_t ev_ckv = nullptr, ev_ik = nullptr;
     // threads: whether devices outside the source's group read it, and the host-mapped hand-off of a window's new rows
     // (ckv rows, then ik rows at kWin * hd) and its flag
@@ -782,20 +792,30 @@ struct Model::Impl {
     // before the wait for the CPU lane - the same bits, no faster)
     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
-    // the expert cache: swaps prepared on a thread of their own (copy streams), switched between windows
+    // the expert cache: swaps prepared on threads of their own (DS4_CACHE_THREADS, 4: each its staging buffers and
+    // copy streams), switched between windows
     struct Swap {
         int layer = 0, in = -1, out = -1;
     };
     static constexpr int kMaxSwaps = 8;
+    // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
+    // every 256 tokens; at most `inflight` swaps under way (DS4_CACHE_MARGIN / _BONUS / _DECAY / _INFLIGHT)
+    static float env_f(const char* k, float d) { return std::getenv(k) ? (float) std::atof(std::getenv(k)) : d; }
+    const float c_margin = env_f("DS4_CACHE_MARGIN", 1.25f), c_bonus = env_f("DS4_CACHE_BONUS", 1.0f),
+                c_decay = env_f("DS4_CACHE_DECAY", 0.9f);
+    const int c_inflight = std::max(1, (int) env_f("DS4_CACHE_INFLIGHT", (float) kMaxSwaps));
     std::mutex sw_mu;
     std::condition_variable sw_cv;
     std::deque<Swap> sw_queue;
     std::vector<Swap> sw_ready;
-    std::thread cache_th;
+    struct SwapBufs {
+        uint8_t *a = nullptr, *b = nullptr, *h = nullptr;
+        std::vector<cudaStream_t> st;   // a copy stream a device
+    };
+    std::vector<SwapBufs> sw_bufs;
+    std::vector<std::thread> cache_ths;
     int sw_inflight = 0;
     int64_t decay_tokens = 0;
-    std::vector<cudaStream_t> copy_st;
-    uint8_t *sw_a = nullptr, *sw_b = nullptr, *sw_h = nullptr;
     bool check_swaps = std::getenv("DS4_CHECK_SWAPS") != nullptr;
     std::vector<float> host_logits;
     std::vector<void*> host_allocs;
@@ -829,7 +849,8 @@ struct Model::Impl {
             std::lock_guard<std::mutex> lk(sw_mu);
         }
         sw_cv.notify_all();
-        if (cache_th.joinable()) cache_th.join();
+        for (std::thread& t : cache_ths)
+            if (t.joinable()) t.join();
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
@@ -858,7 +879,11 @@ struct Model::Impl {
             err = "cudaMalloc " + std::to_string(b >> 20) + " MiB on CUDA" + std::to_string(d.id) + " failed";
             return false;
         }
+        // zeroed before it is handed out: d.st does not order with the default stream, and the weights' uploads into
+        // these buffers are cudaMemcpy - a zeroing still queued could land on them afterwards (a load's weights, some of
+        // them zeros, other ones each start)
         cudaMemsetAsync(v, 0, b, d.st);
+        cudaStreamSynchronize(d.st);
         d.allocs.push_back(v);
         if (acct) *acct += b;
         else d.scratch += b;
@@ -869,6 +894,11 @@ struct Model::Impl {
     static const Layer& member(const Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // bytes of a VRAM slot of l's experts (a member's part of each, in a group)
     static size_t unit(const Layer& l) { return l.nm > 1 ? l.hblob : l.blob; }
+    // the members of a group of nm that take heads: all of them, or (the heads do not split in nm) all but member 0
+    int head_members(int nm) const { return g.heads % nm == 0 && g.o_groups % nm == 0 ? nm : nm - 1; }
+    // a packed row's bytes: the compressed KV's (FP4, an E4M3 scale a 16) and the index keys' (FP4, a power of two a 32)
+    size_t kv_row() const { return fp4_row_bytes(g.hd, 2); }
+    size_t ik_row() const { return fp4_row_bytes(g.ix_hd, 3); }
     // host-mapped memory (the same address on the host and every device), zeroed
     template <class T>
     bool hmap(T*& p, size_t n, std::string& err) {
@@ -1163,19 +1193,25 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
+            CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&d.hc_go, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&d.hc_done, cudaEventDisableTiming));
             if (!x3::prepare(d.st)) {
                 err = "exl3 scratch on CUDA" + std::to_string(d.id);
                 return false;
             }
             CK(cudaMemGetInfo(&d.free0, &d.total));
         }
-        // the groups: runs of o.tp devices of one kind (their memory), a device unlike the next alone
+        // the groups: runs of o.tp devices of one kind (their memory), a device unlike the next alone - or, o.tp the
+        // number of GPUs, one group of all of them whatever their kind (its tightest member sets the experts' room)
         par = o.threads || o.tp > 1;
+        const bool tp_all = o.tp > 1 && o.tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
             G.mem.push_back((int) i);
             size_t j = i + 1;
-            while ((int) G.mem.size() < o.tp && j < devs.size() && devs[j].total == devs[i].total) G.mem.push_back((int) j++);
+            while ((int) G.mem.size() < o.tp && j < devs.size() && (tp_all || devs[j].total == devs[i].total))
+                G.mem.push_back((int) j++);
             if ((int) G.mem.size() < o.tp && G.mem.size() > 1) {   // a short run at the end: devices of their own
                 for (int m : G.mem) {
                     Group one;
@@ -1386,8 +1422,12 @@ struct Model::Impl {
         for (Layer& l : L) {
             l.ff0 = 0;
             l.ffn = g.ff;
+            l.ah0 = l.og0 = 0;
+            l.ahn = g.heads;
+            l.ogn = g.o_groups;
             if (l.nm == 1) continue;
-            if (g.heads % l.nm != 0 || g.o_groups % l.nm != 0 || g.ff % 128 != 0 || g.ff / 128 < l.nm) {
+            const int na = head_members(l.nm);
+            if (g.heads % na != 0 || g.o_groups % na != 0 || g.ff % 128 != 0 || g.ff / 128 < l.nm) {
                 err = "tensor parallel " + std::to_string(l.nm) + ": the heads, output groups or FFN do not split";
                 return false;
             }
@@ -1401,6 +1441,11 @@ struct Model::Impl {
             // each member's FFN columns (split128: as even as the 128-blocks go) and its part of an expert's layout
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
+                const int ha = m - (l.nm - na);   // (its place among the members with heads)
+                x.ahn = ha < 0 ? 0 : g.heads / na;
+                x.ah0 = ha < 0 ? 0 : ha * x.ahn;
+                x.ogn = ha < 0 ? 0 : g.o_groups / na;
+                x.og0 = ha < 0 ? 0 : ha * x.ogn;
                 split128(g.ff, l.nm, m, x.ff0, x.ffn, l.il % l.nm);   // (rot: the odd blocks go round the members)
                 size_t off = 0;
                 for (int r = 0; r < 3; ++r) {
@@ -1426,11 +1471,11 @@ struct Model::Impl {
             for (int m = 0; m < l0.nm; ++m) {
                 const Layer& l = member(l0, m);
                 if (l.src >= 0) {
-                    srcs[(size_t) l.src].ckv[(size_t) l.dev] = (uint16_t*) 1;
+                    srcs[(size_t) l.src].ckv[(size_t) l.dev] = (uint8_t*) 1;
                     if (l0.grp != L[(size_t) srcs[(size_t) l.src].layer].grp) srcs[(size_t) l.src].remote = true;
                 }
                 if (l.ix_src && l.ik_src >= 0) {
-                    srcs[(size_t) l.ik_src].ik[(size_t) l.dev] = (uint16_t*) 1;
+                    srcs[(size_t) l.ik_src].ik[(size_t) l.dev] = (uint8_t*) 1;
                     if (l0.grp != L[(size_t) srcs[(size_t) l.ik_src].layer].grp) srcs[(size_t) l.ik_src].remote = true;
                 }
             }
@@ -1485,15 +1530,15 @@ struct Model::Impl {
             CK(cudaMemcpy(d.freqs_comp, freqs_comp.data(), freqs_comp.size() * 4, cudaMemcpyHostToDevice));
             for (Src& s : srcs) {
                 if (s.h_ckv == nullptr) {   // (its events belong to the source layer's device: it records them)
-                    if (!halloc(s.h_ckv, (size_t) kWin * g.hd, err) || !halloc(s.h_ik, (size_t) kWin * g.ix_hd, err))
+                    if (!halloc(s.h_ckv, (size_t) kWin * kv_row(), err) || !halloc(s.h_ik, (size_t) kWin * ik_row(), err))
                         return false;
                     CK(cudaSetDevice(devs[(size_t) L[(size_t) s.layer].dev].id));
                     CK(cudaEventCreateWithFlags(&s.ev_ckv, cudaEventDisableTiming));
                     CK(cudaEventCreateWithFlags(&s.ev_ik, cudaEventDisableTiming));
                     CK(cudaSetDevice(d.id));
                 }
-                if (s.ckv[di] != nullptr && !dalloc(d, s.ckv[di], (size_t) s.cap * g.hd, err, &d.caches)) return false;
-                if (s.ik[di] != nullptr && !dalloc(d, s.ik[di], (size_t) s.cap * g.ix_hd, err, &d.caches))
+                if (s.ckv[di] != nullptr && !dalloc(d, s.ckv[di], (size_t) s.cap * kv_row(), err, &d.caches)) return false;
+                if (s.ik[di] != nullptr && !dalloc(d, s.ik[di], (size_t) s.cap * ik_row(), err, &d.caches))
                     return false;
             }
         }
@@ -1715,14 +1760,18 @@ struct Model::Impl {
         if (o.expert_cache) {
             size_t maxb = 0;
             for (const Layer& l : L) maxb = std::max(maxb, l.blob);
-            if (!halloc(sw_a, maxb, err) || !halloc(sw_b, maxb, err) || !halloc(sw_h, maxb, err)) return false;
-            for (Dev& d : devs) {
-                cudaSetDevice(d.id);
-                cudaStream_t cs = nullptr;
-                CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
-                copy_st.push_back(cs);
+            const int nt = std::max(1, std::min(c_inflight, std::getenv("DS4_CACHE_THREADS") ? std::atoi(std::getenv("DS4_CACHE_THREADS")) : 4));
+            sw_bufs.resize((size_t) nt);
+            for (SwapBufs& B : sw_bufs) {
+                if (!halloc(B.a, maxb, err) || !halloc(B.b, maxb, err) || !halloc(B.h, maxb, err)) return false;
+                for (Dev& d : devs) {
+                    cudaSetDevice(d.id);
+                    cudaStream_t cs = nullptr;
+                    CK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
+                    B.st.push_back(cs);
+                }
             }
-            cache_th = std::thread([this] { cache_loop(); });
+            for (SwapBufs& B : sw_bufs) cache_ths.emplace_back([this, &B] { cache_loop(B); });
         }
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
@@ -1755,7 +1804,7 @@ struct Model::Impl {
             chunks[di] = std::make_unique<Chunk>();
             Chunk& c = *chunks[di];
             const int nm = (int) groups[(size_t) d.grp].mem.size();
-            const int NHL = g.heads / nm, HQ = NHL * HD, OG = g.o_groups / nm;
+            const int NHL = g.heads / head_members(nm), HQ = NHL * HD, OG = g.o_groups / head_members(nm);
             int FF = 0, ff0_ = 0;
             split128(g.ff, nm, 0, ff0_, FF);   // (the widest member's share: member 0 takes the odd blocks)
             const size_t C = (size_t) chunk;
@@ -2080,11 +2129,13 @@ struct Model::Impl {
             if (l.dev != di) continue;
             // (a group's member: its share of the heads (wq_b columns, the sinks), of wo_a's groups and wo_b's rows,
             // of the shared expert's FFN; the rest whole)
-            const int nm = l0.nm;
+            const int nm = l0.nm, na = g.heads / std::max(1, l.ahn), ha = l.ah0 / std::max(1, l.ahn);
             const std::string& P = l.name;
             const std::string A = P + "attn.";
-            bool ok = mat(d, A + "wq_a", l.wq_a, err, acct) && mat(d, A + "wq_b", l.wq_b, err, acct, mi, nm, true) &&
-                      mat(d, A + "wkv", l.wkv, err, acct) && mat(d, A + "wo_b", l.wo_b, err, acct, mi, nm, false) &&
+            bool ok = mat(d, A + "wq_a", l.wq_a, err, acct) &&
+                      (l.ahn == 0 || mat(d, A + "wq_b", l.wq_b, err, acct, ha, na, true)) &&
+                      mat(d, A + "wkv", l.wkv, err, acct) &&
+                      (l.ahn == 0 || mat(d, A + "wo_b", l.wo_b, err, acct, ha, na, false)) &&
                       f32(d, A + "q_norm.weight", l.q_norm, err, acct, (size_t) g.q_lora) &&
                       f32(d, A + "kv_norm.weight", l.kv_norm, err, acct, (size_t) g.hd) &&
                       f32(d, A + "attn_sink", l.sink, err, acct, (size_t) g.heads) &&
@@ -2102,10 +2153,9 @@ struct Model::Impl {
                       mat(d, P + "ffn.shared_experts.w2", l.s2, err, acct, mi, nm, false, l.il % nm) &&
                       mat(d, P + "ffn.shared_experts.w3", l.s3, err, acct, mi, nm, true, l.il % nm);
             if (!ok) return false;
-            l.sink += (size_t) mi * (g.heads / nm);
-            for (int gi = 0; gi < g.o_groups / nm; ++gi)
-                if (!mat(d, A + "wo_a.slice." + std::to_string(mi * (g.o_groups / nm) + gi), l.wo_a[gi], err, acct))
-                    return false;
+            l.sink += (size_t) l.ah0;
+            for (int gi = 0; gi < l.ogn; ++gi)
+                if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, acct)) return false;
             if (l.kv_src) {
                 const std::string C = A + "compressor.";
                 if (!mat(d, C + "wkv", l.c_wkv, err, acct) || !f32(d, C + "norm.weight", l.c_norm, err, acct)) return false;
@@ -2282,40 +2332,123 @@ struct Model::Impl {
             return s / l.nm;
         };
         for (size_t gi = 0; gi < groups.size(); ++gi) {
-            double budget = 1e300;
+            std::vector<double> room;   // each member's
             for (int m : groups[gi].mem) {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
-                budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) *
-                                              o.vram_experts);
+                room.push_back(std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) * o.vram_experts);
             }
-            double budget_t = budget;   // the drafter's experts first, all of them (every draft uses its blocks)
-            for (Layer& l : L)
-                if (l.grp == (int) gi && l.mtp) {
-                    l.n_vram = std::min(l.n_exp, (int) std::floor(budget_t / (double) ucount(l)));
-                    budget_t -= (double) l.n_vram * ucount(l);
-                }
-            double want = 0;
+            // the drafter's experts first (every draft uses its blocks) - its blocks are the lead's alone, so they take
+            // the lead's room; the trunk's layers then what the tightest member has left
+            double others = -1;   // the room of the group's tightest member but the lead (-1: the lead is alone)
+            for (size_t m = 1; m < room.size(); ++m) others = others < 0 ? room[m] : std::min(others, room[m]);
+            bool dseen = false;
             for (const Layer& l : L)
-                if (l.grp == (int) gi && !l.mtp) want += (double) ucount(l) * l.n_exp;
-            const double frac = want > 0 ? std::min(1.0, std::max(0.0, budget_t) / want) : 0.0;
-            for (Layer& l : L) {
-                if (l.grp != (int) gi || l.mtp) continue;
-                l.n_vram = std::min(l.n_exp, (int) std::floor(frac * l.n_exp));
-                // never more than fits: the floor of each layer's share can still round up the total
-                while (l.n_vram > 0 && (double) ucount(l) * l.n_vram > budget) --l.n_vram;
-            }
-            double used = 0;
-            for (Layer& l : L)
-                if (l.grp == (int) gi) used += (double) ucount(l) * l.n_vram;
-            // what the floors left: whole experts, layer by layer
-            for (Layer& l : L) {
-                if (l.grp != (int) gi) continue;
-                while (l.n_vram < l.n_exp && used + (double) ucount(l) <= budget) {
-                    ++l.n_vram;
-                    used += (double) ucount(l);
+                if (l.grp == (int) gi && l.mtp)
+                    for (int e = 0; e < l.n_exp; ++e) dseen = dseen || prof[(size_t) l.il * g.n_exp + e] > 0;
+            if (others < 0 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {   // all of them, as room goes
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && l.mtp) {
+                        l.n_vram = std::min(l.n_exp, (int) std::floor(room[0] / (double) ucount(l)));
+                        room[0] -= (double) l.n_vram * ucount(l);
+                    }
+            } else {
+                // by the profile: each block's experts that take 99% of its routes always, the others only while the
+                // lead keeps the room of the next tightest member (past it, each drafter expert's bytes on the lead
+                // are as many trunk experts lost on every member: a trunk expert in VRAM takes its part on each)
+                std::vector<std::vector<double>> sh(L.size());
+                using Top = std::pair<double, int>;   // (the next expert's share a byte, layer)
+                std::priority_queue<Top> pq;
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || !l.mtp) continue;
+                    const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                    double sum = 0;
+                    for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                    std::vector<double>& s = sh[(size_t) l.il];
+                    for (int e = 0; e < l.n_exp; ++e) s.push_back(sum > 0 ? p[e] / sum : 1.0 / l.n_exp);
+                    std::sort(s.begin(), s.end(), std::greater<double>());
+                    int keep = 0;
+                    for (double c = 0; keep < l.n_exp && c < 0.99; ++keep) c += s[(size_t) keep];
+                    l.n_vram = std::min(keep, (int) std::floor(room[0] / (double) ucount(l)));
+                    room[0] -= (double) l.n_vram * ucount(l);
+                    if (l.n_vram < l.n_exp) pq.push({s[(size_t) l.n_vram] / ucount(l), l.il});
                 }
+                while (!pq.empty()) {
+                    const int il = pq.top().second;
+                    pq.pop();
+                    Layer& l = L[(size_t) il];
+                    if (room[0] - ucount(l) < others) continue;
+                    room[0] -= ucount(l);
+                    if (++l.n_vram < l.n_exp) pq.push({sh[(size_t) il][(size_t) l.n_vram] / ucount(l), il});
+                }
+            }
+            const double budget = *std::min_element(room.begin(), room.end());
+            double want = 0, seen = 0;
+            for (const Layer& l : L)
+                if (l.grp == (int) gi && !l.mtp) {
+                    want += (double) ucount(l) * l.n_exp;
+                    for (int e = 0; e < l.n_exp; ++e) seen += prof[(size_t) l.il * g.n_exp + e];
+                }
+            if (seen > 0 && std::getenv("DS4_PLACE_UNIFORM") == nullptr) {
+                // by the profile: the room to the experts that take the largest share of their layer's routes a byte
+                // (every layer routes as often; one whose routes spread wider gets more of the room) - each layer's
+                // shares smoothed a tenth toward even, so a layer the profile barely saw is not left without
+                std::vector<std::vector<double>> sh(L.size());
+                using Top = std::pair<double, int>;   // (the next expert's share a byte, layer)
+                std::priority_queue<Top> pq;
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || l.mtp) continue;
+                    l.n_vram = 0;
+                    const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                    double sum = 0;
+                    for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                    std::vector<double>& s = sh[(size_t) l.il];
+                    for (int e = 0; e < l.n_exp; ++e)
+                        s.push_back(0.9 * (sum > 0 ? p[e] / sum : 1.0 / l.n_exp) + 0.1 / l.n_exp);
+                    std::sort(s.begin(), s.end(), std::greater<double>());
+                    pq.push({s[0] / ucount(l), l.il});
+                }
+                double used = 0;
+                while (!pq.empty()) {
+                    const int il = pq.top().second;
+                    pq.pop();
+                    Layer& l = L[(size_t) il];
+                    if (used + ucount(l) > budget) continue;   // (this layer's experts no longer fit; smaller ones may)
+                    used += ucount(l);
+                    if (++l.n_vram < l.n_exp) pq.push({sh[(size_t) il][(size_t) l.n_vram] / ucount(l), il});
+                }
+            } else {   // as even as the room goes: each layer the same share of its experts
+                const double frac = want > 0 ? std::min(1.0, budget / want) : 0.0;
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || l.mtp) continue;
+                    l.n_vram = std::min(l.n_exp, (int) std::floor(frac * l.n_exp));
+                    // never more than fits: the floor of each layer's share can still round up the total
+                    while (l.n_vram > 0 && (double) ucount(l) * l.n_vram > budget) --l.n_vram;
+                }
+                double used = 0;
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && !l.mtp) used += (double) ucount(l) * l.n_vram;
+                // what the floors left: whole experts, layer by layer
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || l.mtp) continue;
+                    while (l.n_vram < l.n_exp && used + (double) ucount(l) <= budget) {
+                        ++l.n_vram;
+                        used += (double) ucount(l);
+                    }
+                }
+            }
+            if (o.verbose) {
+                int nv = 0, ne = 0;
+                for (const Layer& l : L)
+                    if (l.grp == (int) gi) nv += l.n_vram, ne += l.n_exp;
+                std::fprintf(stderr, "ds4: group %zu (%zu GPUs): %.2f GB a member for experts, %d of %d in VRAM\n", gi,
+                             groups[gi].mem.size(), budget / 1e9, nv, ne);
+                for (const Layer& l : L)
+                    if (l.grp == (int) gi && std::getenv("DS4_PLACE_DEBUG"))
+                        std::fprintf(stderr, "  layer %d%s: blob %.2f MB, mean unit %.2f MB, member 0 %.2f MB, %d of %d\n",
+                                     l.il, l.mtp ? " (mtp)" : "", l.blob / 1e6, ucount(l) / 1e6, unit(member(l, 0)) / 1e6,
+                                     l.n_vram, l.n_exp);
             }
         }
         for (Layer& l : L) {
@@ -2966,7 +3099,7 @@ struct Model::Impl {
     // (the copy stream, the host's repacking) - and cache_tick switches the tables between windows, so the device's
     // table and the host's view of a layer always agree within a window.  In place (file_experts) `out` needs no copy:
     // the CPU lane reads it from the file again.
-    void cache_loop() {
+    void cache_loop(SwapBufs& B) {
         for (;;) {
             Swap sw;
             {
@@ -2977,33 +3110,33 @@ struct Model::Impl {
                 sw_queue.pop_front();
             }
             Layer& l = L[(size_t) sw.layer];
-            parts_to_blob(l, l.hh[(size_t) sw.in], sw_a);
+            parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
             if (l.nm == 1) {
                 const Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
-                cudaStream_t cs = copy_st[(size_t) l.dev];
-                cudaMemcpyAsync(l.vram_base + (size_t) l.spare_vram * l.blob, sw_a, l.blob, cudaMemcpyHostToDevice, cs);
+                cudaStream_t cs = B.st[(size_t) l.dev];
+                cudaMemcpyAsync(l.vram_base + (size_t) l.spare_vram * l.blob, B.a, l.blob, cudaMemcpyHostToDevice, cs);
                 if (!file_experts)
-                    cudaMemcpyAsync(sw_b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob,
+                    cudaMemcpyAsync(B.b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob,
                                     cudaMemcpyDeviceToHost, cs);
                 cudaStreamSynchronize(cs);
             } else {   // a group: each member's part in, each member's part out
                 for (int m = 0; m < l.nm; ++m) {
                     const Layer& x = member(l, m);
                     cudaSetDevice(devs[(size_t) x.dev].id);
-                    cudaStream_t cs = copy_st[(size_t) x.dev];
-                    blob_to_half(l, sw_a, m, sw_h);
-                    cudaMemcpyAsync(x.vram_base + (size_t) l.spare_vram * x.hblob, sw_h, x.hblob, cudaMemcpyHostToDevice, cs);
+                    cudaStream_t cs = B.st[(size_t) x.dev];
+                    blob_to_half(l, B.a, m, B.h);
+                    cudaMemcpyAsync(x.vram_base + (size_t) l.spare_vram * x.hblob, B.h, x.hblob, cudaMemcpyHostToDevice, cs);
                     cudaStreamSynchronize(cs);
                     if (file_experts) continue;
-                    cudaMemcpyAsync(sw_h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * x.hblob, x.hblob,
+                    cudaMemcpyAsync(B.h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * x.hblob, x.hblob,
                                     cudaMemcpyDeviceToHost, cs);
                     cudaStreamSynchronize(cs);
-                    half_to_blob(l, sw_h, m, sw_b);
+                    half_to_blob(l, B.h, m, B.b);
                 }
             }
             if (!file_experts)
-                for (int X = 0; X < NH; ++X) blob_to_part(l, sw_b, X, l.spare_host[(size_t) X]);
+                for (int X = 0; X < NH; ++X) blob_to_part(l, B.b, X, l.spare_host[(size_t) X]);
             if (check_swaps) {   // DS4_CHECK_SWAPS: both moves against the model file, byte for byte
                 std::vector<uint8_t> reg, blob(l.blob), part(l.hl.bytes);
                 bool ok = true;
@@ -3049,7 +3182,7 @@ struct Model::Impl {
     }
 
     void cache_tick(int T) {
-        if (!o.expert_cache || !cache_th.joinable()) return;
+        if (!o.expert_cache || cache_ths.empty()) return;
         std::vector<Swap> ready;
         {
             std::lock_guard<std::mutex> lk(sw_mu);
@@ -3090,7 +3223,7 @@ struct Model::Impl {
         if (decay_tokens >= 256) {   // older use counts less: x0.9 every 256 tokens
             decay_tokens = 0;
             for (Layer& l : L)
-                for (float& h : l.heat) h *= 0.9f;
+                for (float& h : l.heat) h *= c_decay;
         }
         bool queued = false;
         for (Layer& l : L) {
@@ -3099,18 +3232,18 @@ struct Model::Impl {
             for (int e : l.cpu_hits)
                 if (l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
             l.cpu_hits.clear();
-            if (best < 0 || l.spare_vram < 0 || l.swap_pending || sw_inflight >= kMaxSwaps) continue;
+            if (best < 0 || l.spare_vram < 0 || l.swap_pending || sw_inflight >= c_inflight) continue;
             int cold = -1;
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.slot[(size_t) e] >= 0 && (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold])) cold = e;
-            if (cold < 0 || !(l.heat[(size_t) best] > l.heat[(size_t) cold] * 1.25f + 1.0f)) continue;
+            if (cold < 0 || !(l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus)) continue;
             l.swap_pending = true;
             ++sw_inflight;
             std::lock_guard<std::mutex> lk(sw_mu);
             sw_queue.push_back({l.il, best, cold});
             queued = true;
         }
-        if (queued) sw_cv.notify_one();
+        if (queued) sw_cv.notify_all();
     }
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
@@ -3312,9 +3445,13 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         hc_pre_norm(d.h, d.pre, nullptr, D, H, T, g.eps, d.x, d.st);   // (the confidence head reads it before the norm)
         Dev& hd = devs[(size_t) head_dev];
-        if (d_dev != head_dev) {
+        // (through the host to the head's device, and to the head group's other members - the drafter's device can be
+        // the head group's lead itself, a group of every GPU)
+        if (d_dev != head_dev || groups[(size_t) hd.grp].mem.size() > 1) {
             CK(cudaMemcpyAsync(d.bounce, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, d.st));
             CK(cudaEventRecord(d.ev_out, d.st));
+        }
+        if (d_dev != head_dev) {
             cudaSetDevice(hd.id);
             CK(cudaStreamWaitEvent(hd.st, d.ev_out, 0));
             CK(cudaMemcpyAsync(hd.x, d.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, hd.st));
@@ -3325,13 +3462,8 @@ struct Model::Impl {
             Dev& e = devs[(size_t) hg[(size_t) m]];
             cudaSetDevice(e.id);
             if (m > 0) {
-                if (d_dev != head_dev) {
-                    CK(cudaStreamWaitEvent(e.st, d.ev_out, 0));
-                    CK(cudaMemcpyAsync(e.ao, d.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, e.st));
-                } else {
-                    err = "a split head beside the drafter's device";
-                    return false;
-                }
+                CK(cudaStreamWaitEvent(e.st, d.ev_out, 0));
+                CK(cudaMemcpyAsync(e.ao, d.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, e.st));
             } else
                 CK(cudaMemcpyAsync(e.ao, e.x, (size_t) T * D * 4, cudaMemcpyDeviceToDevice, e.st));
             Finish fn;
@@ -3527,7 +3659,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int nm = L0.nm;
-        const int D = g.dim, H = g.hc, HD = g.hd, NHL = g.heads / nm, HQ = NHL * HD, OG = g.o_groups / nm, FF = l.ffn;
+        const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ab = groups[(size_t) L0.grp].arb;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
         // Engram, in slabs of 256 tokens
@@ -3574,7 +3706,7 @@ struct Model::Impl {
         fk.dst_stride = HD;
         finish(c.kvr, T, HD, HD, fk, s);
         ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
-        const uint16_t* ckv = nullptr;
+        const uint8_t* ckv = nullptr;   // (the source's packed rows)
         const long long ss = (long long) o.max_context + 64;
         if (l.ratio > 0) {
             Src& sr = srcs[(size_t) l.src];
@@ -3606,8 +3738,8 @@ struct Model::Impl {
                     fi.pos_step = R;
                     fi.freqs = freqs;
                     fi.quant = 3;
-                    fi.dst = ks.ik[(size_t) l.dev] + (size_t) g_first * g.ix_hd;
-                    fi.dst_stride = g.ix_hd;
+                    fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_row();
+                    fi.pdst_stride = (long long) ik_row();
                     finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
                 }
                 if (clen_max > 0) {
@@ -3642,13 +3774,13 @@ struct Model::Impl {
                         if (l.uses_cand && (nlast + g.cand_blk - 1) / g.cand_blk > g.cand_topk) {
                             Rows cl = lim;
                             cl.gen = 2;
-                            index_score(c.iq, iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, na, g.cand_topk * g.cand_blk,
+                            index_score(c.iq, iw, nullptr, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, na, g.cand_topk * g.cand_blk,
                                         cd, (int) cand_stride(), g.cand_blk, cl, c.scores, ss, s);
                             Rows tr = lim;
                             tr.gen = 3;
                             topk(c.scores, ss, na, tr, cd, (int) cand_stride(), g.cand_blk, tk, (int) topk_stride(), s);
                         } else {
-                            index_score(c.iq, iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, na, nlast, nullptr, 0, 1,
+                            index_score(c.iq, iw, nullptr, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, na, nlast, nullptr, 0, 1,
                                         lim, c.scores, ss, s);
                             if (l.cand_src) {
                                 Rows cr = lim;
@@ -3668,22 +3800,22 @@ struct Model::Impl {
                 fc.pos_step = R;
                 fc.freqs = freqs;
                 fc.quant = 2;
-                fc.dst = sr.ckv[(size_t) l.dev] + (size_t) g_first * HD;
-                fc.dst_stride = HD;
+                fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * kv_row();
+                fc.pdst_stride = (long long) kv_row();
                 finish(const_cast<float*>(latent), ng, HD, HD, fc, s);
                 if (mi == 0 && sr.remote) {   // the new rows for the other groups' readers (slot k % 2, once
                     const int slot = wp.k % 2;  // they took the chunk before last's)
                     if (wp.k >= 2)
                         for (int r : sr.readers) wait_flags(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, 1, 32, wp.win - 2, s);
                     Xfer x;
-                    x.src[0] = fc.dst;
+                    x.src[0] = fc.pdst;
                     x.dst[0] = sr.stage(slot);
-                    x.bytes[0] = (size_t) ng * HD * 2;
+                    x.bytes[0] = (size_t) ng * kv_row();
                     x.n = 1;
                     if (l.owns_k && srcs[(size_t) l.ik_src].ik[(size_t) l.dev] != nullptr) {
-                        x.src[1] = srcs[(size_t) l.ik_src].ik[(size_t) l.dev] + (size_t) g_first * g.ix_hd;
+                        x.src[1] = srcs[(size_t) l.ik_src].ik[(size_t) l.dev] + (size_t) g_first * ik_row();
                         x.dst[1] = sr.stage(slot) + x_cap() * HD * 2;
-                        x.bytes[1] = (size_t) ng * g.ix_hd * 2;
+                        x.bytes[1] = (size_t) ng * ik_row();
                         x.n = 2;
                     }
                     xfer_put(x, sr.flag(slot), wp.win, d.xcnt, s);
@@ -3692,7 +3824,8 @@ struct Model::Impl {
             ckv = sr.ckv[(size_t) l.dev];
         }
         // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
-        for (int a0 = 0; a0 < T; a0 += c.A) {
+        if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
+        for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
             const int na = std::min(c.A, T - a0);
             if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
             Finish fr;
@@ -3708,7 +3841,7 @@ struct Model::Impl {
             ar.win = g.win;
             ar.R = l.ratio;
             ar.kcap = g.ix_topk;
-            sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
+            sparse_attn(c.q, c.ext, nullptr, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
                         na, 1.0f / std::sqrt((float) HD), c.o, s);
             Finish fo;
             fo.rd = g.rd;
@@ -3924,13 +4057,13 @@ struct Model::Impl {
                     Xfer x;
                     if (ng > 0 && sr.ckv[(size_t) di] != nullptr) {
                         x.src[x.n] = sr.stage(slot);
-                        x.dst[x.n] = sr.ckv[(size_t) di] + (size_t) g_first * g.hd;
-                        x.bytes[x.n++] = (size_t) ng * g.hd * 2;
+                        x.dst[x.n] = sr.ckv[(size_t) di] + (size_t) g_first * kv_row();
+                        x.bytes[x.n++] = (size_t) ng * kv_row();
                     }
                     if (ng > 0 && sr.ik[(size_t) di] != nullptr) {
                         x.src[x.n] = sr.stage(slot) + x_cap() * g.hd * 2;
-                        x.dst[x.n] = sr.ik[(size_t) di] + (size_t) g_first * g.ix_hd;
-                        x.bytes[x.n++] = (size_t) ng * g.ix_hd * 2;
+                        x.dst[x.n] = sr.ik[(size_t) di] + (size_t) g_first * ik_row();
+                        x.bytes[x.n++] = (size_t) ng * ik_row();
                     }
                     if (x.n > 0) xfer_get(x, sr.flag(slot), wp.win, s);
                     set_flag(sr.x_ack + ((size_t) slot * devs.size() + di) * 32, wp.win, s);   // (taken, or none)
@@ -4342,13 +4475,13 @@ struct Model::Impl {
                 Xfer x;
                 if (sr.ckv[(size_t) di] != nullptr) {
                     x.src[x.n] = sr.x_stage;
-                    x.dst[x.n] = sr.ckv[(size_t) di] + (size_t) g_first * g.hd;
-                    x.bytes[x.n++] = (size_t) ng * g.hd * 2;
+                    x.dst[x.n] = sr.ckv[(size_t) di] + (size_t) g_first * kv_row();
+                    x.bytes[x.n++] = (size_t) ng * kv_row();
                 }
                 if (sr.ik[(size_t) di] != nullptr) {
                     x.src[x.n] = sr.x_stage + x_cap() * g.hd * 2;
-                    x.dst[x.n] = sr.ik[(size_t) di] + (size_t) g_first * g.ix_hd;
-                    x.bytes[x.n++] = (size_t) ng * g.ix_hd * 2;
+                    x.dst[x.n] = sr.ik[(size_t) di] + (size_t) g_first * ik_row();
+                    x.bytes[x.n++] = (size_t) ng * ik_row();
                 }
                 if (x.n > 0) xfer_get(x, sr.x_flag, wp.win, s);
             }
@@ -4364,8 +4497,8 @@ struct Model::Impl {
 
     // a source's new cache rows (src on device `from`, bytes of them) to the same place of its other devices' copies,
     // through pinned memory: the copy out on the source's stream, each copy in on its device's stream after it
-    bool replicate(std::vector<uint16_t*>& copies, uint16_t* stage, cudaEvent_t ev, const uint16_t* src, size_t at,
-                   size_t bytes, int from, std::string& err) {
+    bool replicate(std::vector<uint8_t*>& copies, uint8_t* stage, cudaEvent_t ev, const uint8_t* src, size_t at,
+                   size_t bytes, int from, std::string& err) {   // (at: bytes into each copy)
         bool any = false;
         for (size_t od = 0; od < devs.size(); ++od) any = any || (copies[od] != nullptr && (int) od != from);
         if (!any) return true;
@@ -4391,7 +4524,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int nm = L0.nm;
-        const int D = g.dim, H = g.hc, HD = g.hd, NHL = g.heads / nm, HQ = NHL * HD, OG = g.o_groups / nm, FF = l.ffn;
+        const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
         // Engram
@@ -4411,8 +4544,13 @@ struct Model::Impl {
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }
         // attention
-        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
+        // (hc_mix + hc_split on st2 beside the attention: the pre norm takes the lagged pre, a_post / a_comb / a_pre are
+        // read from the attention's hc_post on - st waits for them there)
+        CK(cudaEventRecord(d.hc_go, s));
+        CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
+        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.st2);
+        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, d.st2);
+        CK(cudaEventRecord(d.hc_done, d.st2));
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         {
             x3::MvJob j[4];
@@ -4427,13 +4565,15 @@ struct Model::Impl {
         fq.w = l.q_norm;
         fq.eps = g.eps;
         finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
-        if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
-        Finish fr;
-        fr.rd = g.rd;
-        fr.pos = (int) p0;
-        fr.vpp = NHL;
-        fr.freqs = freqs;
-        finish(d.q, T * NHL, HD, HD, fr, s);
+        if (NHL > 0) {
+            if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
+            Finish fr;
+            fr.rd = g.rd;
+            fr.pos = (int) p0;
+            fr.vpp = NHL;
+            fr.freqs = freqs;
+            finish(d.q, T * NHL, HD, HD, fr, s);
+        }
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
         // that ring and to the whole block, and leaves the ring as it was
@@ -4463,7 +4603,8 @@ struct Model::Impl {
             ar.nwin[t] = g.win + t - first + 1;
             ar.nsel[t] = 0;
         }
-        const uint16_t* ckv = nullptr;
+        const uint16_t* ckv = nullptr;   // (a DSpark block: its BF16 rows in ext)
+        const uint8_t* ckvp = nullptr;   // (a trunk layer: the source's packed rows)
         if (l.ratio > 0) {
             Src& sr = srcs[(size_t) l.src];
             const int R = l.ratio;
@@ -4508,11 +4649,11 @@ struct Model::Impl {
                     fi.pos_step = R;
                     fi.freqs = freqs;
                     fi.quant = 3;
-                    fi.dst = ks.ik[(size_t) l.dev] + (size_t) g_first * g.ix_hd;
-                    fi.dst_stride = g.ix_hd;
+                    fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_row();
+                    fi.pdst_stride = (long long) ik_row();
                     finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
-                    if (!wp.par && !replicate(ks.ik, ks.h_ik, ks.ev_ik, fi.dst, (size_t) g_first * g.ix_hd,
-                                              (size_t) ng * g.ix_hd * 2, l.dev, err))
+                    if (!wp.par && !replicate(ks.ik, ks.h_ik, ks.ev_ik, fi.pdst, (size_t) g_first * ik_row(),
+                                              (size_t) ng * ik_row(), l.dev, err))
                         return false;
                 }
                 if (clen_max > 0) {
@@ -4539,7 +4680,7 @@ struct Model::Impl {
                             cl.k[t] = wp.cand[l.il][t];
                             nmax = std::max(nmax, wp.cand[l.il][t] * g.cand_blk);
                         }
-                        index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, nmax, d.cand,
+                        index_score(d.iq, d.iw, nullptr, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, nmax, d.cand,
                                     (int) cand_stride(), g.cand_blk, cl, d.scores, ss, s);
                         Rows tr;
                         for (int t = 0; t < T; ++t) {
@@ -4548,7 +4689,7 @@ struct Model::Impl {
                         }
                         topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s);
                     } else {
-                        index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1,
+                        index_score(d.iq, d.iw, nullptr, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1,
                                     lim, d.scores, ss, s);
                         if (l.cand_src) {
                             Rows cr;
@@ -4570,58 +4711,64 @@ struct Model::Impl {
                 fc.pos_step = R;
                 fc.freqs = freqs;
                 fc.quant = 2;
-                fc.dst = sr.ckv[(size_t) l.dev] + (size_t) g_first * HD;
-                fc.dst_stride = HD;
+                fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * kv_row();
+                fc.pdst_stride = (long long) kv_row();
                 finish(d.latent, ng, HD, HD, fc, s);
                 if (!wp.par &&
-                    !replicate(sr.ckv, sr.h_ckv, sr.ev_ckv, fc.dst, (size_t) g_first * HD, (size_t) ng * HD * 2, l.dev, err))
+                    !replicate(sr.ckv, sr.h_ckv, sr.ev_ckv, fc.pdst, (size_t) g_first * kv_row(), (size_t) ng * kv_row(), l.dev,
+                               err))
                     return false;
                 if (wp.par && mi == 0 && sr.remote) {   // the new rows for the other groups' readers
                     Xfer x;
-                    x.src[0] = fc.dst;
+                    x.src[0] = fc.pdst;
                     x.dst[0] = sr.x_stage;
-                    x.bytes[0] = (size_t) ng * HD * 2;
+                    x.bytes[0] = (size_t) ng * kv_row();
                     x.n = 1;
                     if (l.owns_k && srcs[(size_t) l.ik_src].ik[(size_t) l.dev] != nullptr) {
-                        x.src[1] = srcs[(size_t) l.ik_src].ik[(size_t) l.dev] + (size_t) g_first * g.ix_hd;
+                        x.src[1] = srcs[(size_t) l.ik_src].ik[(size_t) l.dev] + (size_t) g_first * ik_row();
                         x.dst[1] = sr.x_stage + x_cap() * HD * 2;
-                        x.bytes[1] = (size_t) ng * g.ix_hd * 2;
+                        x.bytes[1] = (size_t) ng * ik_row();
                         x.n = 2;
                     }
                     xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
                 }
             }
             for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
-            ckv = sr.ckv[(size_t) l.dev];
+            ckvp = sr.ckv[(size_t) l.dev];
         }
         if (l.mtp) {   // the block's rows, after the ring's in ext, as every query's selection
             ckv = d.ext + (size_t) g.win * HD;
             iota_rows(d.topk, T, T, (int) topk_stride(), s);
         }
-        sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
-                    1.0f / std::sqrt((float) HD), d.o, s);
-        Finish fo;
-        fo.rd = g.rd;
-        fo.pos = (int) p0;
-        fo.vpp = NHL;
-        fo.freqs = freqs;
-        fo.inverse = 1;
-        fo.quant = 1;
-        finish(d.o, T * NHL, HD, HD, fo, s);
-        {
+        if (NHL > 0) {
+            sparse_attn(d.q, d.ext, ckv, ckvp, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
+                        1.0f / std::sqrt((float) HD), d.o, s);
+            Finish fo;
+            fo.rd = g.rd;
+            fo.pos = (int) p0;
+            fo.vpp = NHL;
+            fo.freqs = freqs;
+            fo.inverse = 1;
+            fo.quant = 1;
+            finish(d.o, T * NHL, HD, HD, fo, s);
             x3::MvJob j[16];
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
                 j[gi] = job(l.wo_a[gi], d.o + (size_t) gi * per, d.oa + (size_t) gi * g.o_lora, T, HQ, (size_t) OG * g.o_lora);
             if (!mv_n(d, j, OG, err)) return false;
-        }
-        if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
+            if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
+        } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         // the MoE
-        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, s);
+        // (the same beside the MoE: f_post / f_comb / f_pre are read from its hc_post on)
+        CK(cudaEventRecord(d.hc_go, s));
+        CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
+        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.st2);
+        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, d.st2);
+        CK(cudaEventRecord(d.hc_done, d.st2));
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
@@ -4693,6 +4840,7 @@ struct Model::Impl {
             }
             if (lead) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -4810,6 +4958,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
+        CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -4857,15 +5006,64 @@ struct Model::Impl {
         if (ok) std::rename(tmp.c_str(), o.profile.c_str());
     }
 
+    Tiers tiers() const {
+        Tiers t;
+        for (const Layer& l : L) {
+            if (l.mtp) continue;
+            t.vram += l.n_vram;
+            t.slots += l.n_slots;
+            t.cpu += l.n_exp - l.n_vram;
+            t.vram_gb += (double) l.n_vram * l.blob / 1e9;
+            t.cpu_gb += (double) (l.n_exp - l.n_vram) * l.blob / 1e9;
+        }
+        return t;
+    }
+
     std::vector<std::string> info_lines() const {
         std::vector<std::string> v;
-        int nh = 0;
-        for (const Layer& l : L) nh += l.n_exp - l.n_vram;
+        const Tiers t = tiers();
         char b[512];
-        std::snprintf(b, sizeof b, "INFO context=%lld kv=bf16 kv_resident=%lld expert_slots=%d engine_kind=ds4 "
-                                   "cpu_experts=%d engine=ds4-0.1",
-                      (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh);
+        std::snprintf(b, sizeof b, "INFO context=%lld kv=fp4 kv_resident=%lld expert_slots=%lld engine_kind=ds4 "
+                                   "cpu_experts=%lld experts=%d ram_slots=%lld vram_gb=%.1f ram_gb=%.1f mtp=%d engine=ds4-0.1",
+                      (long long) o.max_context, (long long) o.max_context, (long long) t.slots, (long long) t.cpu,
+                      g.nl * g.n_exp, (long long) t.cpu, t.vram_gb, t.cpu_gb, g.n_mtp > 0 ? 1 : 0);
         v.push_back(b);
+        // the Monitor's map of each GPU (serve/gpu_map.py, the GLM engine's VRAM lines): what each part holds on the
+        // card, in bytes - the dense weights (the drafter's blocks apart), the KV caches, the window's buffers, the
+        // drafter's blocks (their weights, a share estimated, and experts), the routed experts' slots, the vision
+        // tower (in this process: vision_own)
+        for (const Dev& d : devs) {
+            size_t fr = 0, tot = 0;
+            cudaSetDevice(d.id);
+            cudaMemGetInfo(&fr, &tot);
+            int a = -1, z = -1;
+            long long slots = 0;
+            size_t mtp_exp = 0, mtp_dense = 0;
+            for (const Layer& l : L)
+                for (int m = 0; m < l.nm; ++m) {
+                    const Layer& x = member(l, m);
+                    if (x.dev != (int) (&d - devs.data())) continue;
+                    if (l.mtp) {
+                        mtp_exp += (size_t) l.n_slots * unit(x);
+                        mtp_dense += l.dense_bytes;
+                        continue;
+                    }
+                    if (a < 0) a = l.il;
+                    z = l.il;
+                    slots += l.n_slots;
+                }
+            mtp_dense = std::min(mtp_dense, d.weights);
+            mtp_exp = std::min(mtp_exp, d.experts);
+            const size_t vis = img_tok >= 0 && vt.device() == d.id ? vt.device_bytes() : 0;
+            char pci[32] = "-";
+            if (cudaDeviceGetPCIBusId(pci, sizeof pci, d.id) != cudaSuccess) std::snprintf(pci, sizeof pci, "-");
+            std::snprintf(b, sizeof b,
+                          "VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu kv_ram=0 act=%zu drafter=%zu window=0 "
+                          "pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu slots=%lld ctx=%lld layers=%d-%d",
+                          d.id, pci, tot, fr, d.weights - mtp_dense, d.caches, d.scratch, mtp_dense + mtp_exp,
+                          d.experts - mtp_exp, vis, slots, (long long) o.max_context, a, z);
+            v.push_back(b);
+        }
         if (img_tok >= 0) {   // the server's image resize (DeepSeek's image_processor.py)
             std::snprintf(b, sizeof b,
                           "INFO vision=ds4 vision_patch=%d vision_merge=%d vision_min_pixels=%lld vision_max_tokens=%d "
@@ -4924,6 +5122,7 @@ bool Model::restore(int64_t limit) { return p_->restore(limit); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const { return p_->st; }
+Tiers Model::tiers() const { return p_->tiers(); }
 std::string Model::describe() const { return p_->describe(); }
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
 

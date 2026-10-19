@@ -5,8 +5,10 @@ CUDA context and the small buffers (the conversation snapshots, the KV streaming
 driver keeps outside every process (its reserve), that is "CUDA and the rest"."""
 from __future__ import annotations
 
-# the VRAM line's byte counts (Glm5Model::VramReport, src/program/generate.cpp)
-BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision")
+# the VRAM line's byte counts (Glm5Model::VramReport, src/program/generate.cpp; strata-ds4's info_lines, whose vision
+# tower runs in the engine's own process: vision_own)
+BYTES = ("total", "free", "weights", "kv", "kv_ram", "act", "drafter", "window", "pool", "tail", "borrow", "vision",
+         "vision_own")
 
 
 def parse(line: str) -> dict | None:
@@ -78,7 +80,9 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
                  "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool}
         engine = sum(parts.values())
         own, enc = procs.get(engine_pid), procs.get(vision_pid) if vision_pid else None
-        vision = enc if enc is not None else r.get("tail", 0) if lent else 0
+        inside = r.get("vision_own", 0) if enc is None else 0   # (a vision tower in the engine's own process)
+        engine += inside
+        vision = enc if enc is not None else r.get("tail", 0) if lent else inside
         start = r.get("total", 0) - r.get("free", 0)     # what the card held once the engine had loaded
         if used is None:                                 # (no NVML: that measurement - a lent tail moved, not added)
             used = start
@@ -90,7 +94,7 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
             rest = max(0, used - engine - (enc or 0) - other)
         else:                                            # (it can't: what the parts did not explain at the start -
             rest = max(0, start - engine - (vision if lent else 0))   # other programs then among it)
-            other = max(0, used - engine - rest - vision)
+            other = max(0, used - engine - rest - (vision - inside))
         parts.update(vision=vision, rest=rest, other=other)
         over = sum(parts.values()) - total               # (never wider than the card: what NVML rounds, trimmed)
         for key in ("other", "rest"):
@@ -101,6 +105,7 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
                     "total": total, "free": max(0, total - sum(parts.values())), "parts": parts,
                     "window": r.get("window", 0), "drafter": r.get("drafter", 0), "tail": r.get("tail", 0),
                     "borrow": r.get("borrow", 0), "lendable": r.get("vision", 0), "vision_lent": lent,
+                    "vision_own": inside,
                     "slots": r.get("slots", 0), "layers": r.get("layers"), "ctx": r.get("ctx", 0),
                     "kv_ram": r.get("kv_ram", 0), "measured": "nvml" if own is not None else "start"})
     return out

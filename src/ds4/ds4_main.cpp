@@ -6,7 +6,9 @@
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
-// <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `QUIT` the engine.  A prompt that
+// <decode ms> <stop|length|cancel> <accepted> <offered> <reused> <hits> <lookups>` (the drafts; the decode's routed
+// experts in VRAM / all), with `STAT ...` lines (the live expert tiers) every 8 tokens before it, and `INFO` / `VRAM` lines
+// (per GPU: what each part holds) before READY; `STOP` ends a request early, `QUIT` the engine.  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
@@ -16,6 +18,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
+#include <fstream>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -54,7 +58,7 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
-                 "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
+                 "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
 
@@ -257,6 +261,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         const double t0 = now_ms();
+        const strata::ds4::Stats s0 = m.stats();   // (the request's own CPU lane share)
         std::vector<Pic> pics;
         {
             std::string e;
@@ -373,7 +378,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         held = std::move(pics);
         m.checkpoint(0);
         const double t1 = now_ms();
-        long long produced = 0;
+        const strata::ds4::Stats sd = m.stats();   // (the decode's own counters: STAT lines, DONE's hit fields)
+        long long produced = 0, next_stat = 8;
         const char* finish = "length";
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
         long long d_off = 0, d_acc = 0;
@@ -386,8 +392,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             std::printf("T %d\n", tok);
-            std::fflush(stdout);
             ++produced;
+            if (produced >= next_stat) {   // the Monitor's live expert tiers (serve/server.py), every 8 tokens
+                next_stat = produced + 8;
+                const strata::ds4::Stats& sn = m.stats();
+                const strata::ds4::Tiers ti = m.tiers();
+                const double el = std::max(1e-9, (now_ms() - t1) / 1000.0), n = (double) produced;
+                const long long ex = sn.experts - sd.experts, cx = sn.cpu_experts - sd.cpu_experts;
+                // (ram_fetch: the CPU lane's experts a token - computed there, not pulled over PCIe; promo: the
+                //  cache's moves into VRAM a token)
+                std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f ram_fetch=%.3f disk=0.000 promo=%.3f "
+                            "vram_used=%lld vram_slots=%lld ram_used=%lld ram_slots=%lld ram_gb=%.1f vram_gb=%.1f\n",
+                            n / el, 1000.0 * el / n, ex > 0 ? 1.0 - (double) cx / (double) ex : 1.0, (double) cx / n,
+                            (double) (sn.swaps - sd.swaps) / n, (long long) ti.vram, (long long) ti.slots,
+                            (long long) ti.cpu, (long long) ti.cpu, ti.cpu_gb, ti.vram_gb);
+            }
+            std::fflush(stdout);
             bool end = false;
             for (int e : eos) end = end || tok == e;
             if (end) {
@@ -417,8 +437,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
         //  the checkpoint at this prompt's end)
         const double t2 = now_ms();
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
-                    d_acc, d_off, from);
+        const strata::ds4::Stats& se = m.stats();   // (hits / lookups: the decode's routed experts in VRAM / all)
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
+                    finish, d_acc, d_off, from, (long long) ((se.experts - sd.experts) - (se.cpu_experts - sd.cpu_experts)),
+                    (long long) (se.experts - sd.experts));
         std::fflush(stdout);
         const auto& s = m.stats();
         std::fprintf(stderr,
@@ -427,7 +449,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      r.ids.size(), from, r.ids.size() - from, t1 - t0,
                      t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
-                     s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
+                     s.experts > s0.experts ? 100.0 * (double) (s.cpu_experts - s0.cpu_experts) / (double) (s.experts - s0.experts)
+                                            : 0.0);
         m.save_profile();
     }
     m.save_profile();
@@ -437,8 +460,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 }  // namespace
 
 int main(int argc, char** argv) {
+    // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
+    // reproducibility): the chunked prompt path's GEMMs run beside the copy and hc streams, and without this each
+    // process could pick other kernels - a long prompt's logits differing from one start to the next.  Before any
+    // cuBLAS handle; a setting the caller made stays
+    setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
     strata::ds4::Options o;
-    std::string ids_s, dump, eos = "1";
+    std::string ids_s, dump, eos = "1", ppl;
     int n = 0, window = 16;
     bool spec = true;
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
@@ -492,6 +520,7 @@ int main(int argc, char** argv) {
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
+        else if (a == "--ppl") ppl = val("--ppl");
         else if (a == "--serve") serve_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
@@ -503,7 +532,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty())) {
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty())) {
         usage();
         return 2;
     }
@@ -518,6 +547,40 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
+        std::ifstream in(ppl);
+        std::string line;
+        double nll = 0.0;
+        long long scored = 0;
+        int k = 0;
+        std::vector<float> lg;
+        const int V = m.vocab();
+        while (std::getline(in, line)) {
+            const std::vector<int> seq = parse_ids(line);
+            if (seq.size() < 2) continue;
+            m.reset();
+            if (!m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) || !m.logits(lg) ||
+                lg.size() < (seq.size() - 1) * (size_t) V) {
+                std::fprintf(stderr, "strata-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
+                return 1;
+            }
+            double s_nll = 0.0;
+            for (size_t i = 0; i + 1 < seq.size(); ++i) {   // row i: the next token's log-probability
+                const float* r = lg.data() + i * (size_t) V;
+                float mx = r[0];
+                for (int v = 1; v < V; ++v) mx = std::max(mx, r[v]);
+                double z = 0.0;
+                for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
+                s_nll += (double) mx + std::log(z) - (double) r[seq[i + 1]];
+            }
+            nll += s_nll;
+            scored += (long long) seq.size() - 1;
+            std::fprintf(stderr, "ppl: sequence %d, %zu tokens: %.4f\n", k++, seq.size(), std::exp(s_nll / (double) (seq.size() - 1)));
+        }
+        std::printf("perplexity %.4f over %lld tokens of %d sequences\n", scored ? std::exp(nll / (double) scored) : 0.0,
+                    scored, k);
+        return 0;
+    }
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
         std::vector<uint8_t> px((size_t) std::max(0, enc_w) * std::max(0, enc_h) * 3);
@@ -586,7 +649,9 @@ int main(int argc, char** argv) {
         m.reset();
         std::fprintf(stderr, "pass %d of %d\n", rep + 1, reps);
     }
-    std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
+    // (repeated: each pass's logits to a file of its own, <dump>.<pass> - a run's determinism, one load)
+    const std::string dpath = reps > 1 ? dump + "." + std::to_string(rep) : dump;
+    std::FILE* df = dump.empty() ? nullptr : std::fopen(dpath.c_str(), "wb");
     std::vector<float> lg;
     const double t0 = now_ms();
     for (size_t a = 0; a < ids.size();) {

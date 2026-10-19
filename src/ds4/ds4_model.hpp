@@ -62,6 +62,13 @@ struct Stats {
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
 };
 
+/// the routed experts' tiers now (the server's Monitor): in VRAM and the VRAM slots for them, on the CPU lane - the
+/// trunk's layers (the drafter's blocks apart); GB as whole experts
+struct Tiers {
+    int64_t vram = 0, slots = 0, cpu = 0;
+    double vram_gb = 0.0, cpu_gb = 0.0;
+};
+
 class Model {
 public:
     Model();
@@ -116,6 +123,7 @@ public:
 
     void save_profile() const;
     const Stats& stats() const;
+    Tiers tiers() const;
     std::string describe() const;
     /// INFO / VRAM lines for the server's Monitor.
     std::vector<std::string> info_lines() const;
