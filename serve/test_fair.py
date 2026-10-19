@@ -220,5 +220,112 @@ class FairSlices(unittest.TestCase):
         self.assertEqual(self.svc.status["queued"], 0)
 
 
+class ReadingEngine(PausingEngine):
+    """As the real engine with a long prompt: the prompt is read first, in chunks (a PP heartbeat each, no token); a
+    PAUSE while reading stops at the next chunk and keeps what was read (a prompt that extends it reads only the
+    rest); then the answer comes as before."""
+    CHUNK = 64
+
+    def __init__(self, *a, read_delay_s: float = 0.003, **kw):
+        super().__init__(*a, **kw)
+        self.read_delay = read_delay_s
+        self.read_done: dict[tuple, int] = {}      # a conversation's first tokens -> prompt tokens read so far
+        self.reads: list[tuple[int, int]] = []     # one per call: (tokens read in it, the prompt's length)
+        self.reading_now = False
+        self._tls = threading.local()
+
+    def reading(self):
+        return getattr(self._tls, "pp", None)
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self._tls.pp = None
+        self.paused = False
+        key = tuple(ids[:32])
+        start = pos = min(self.read_done.get(key, 0), len(ids))
+        while pos < len(ids):
+            if cancel.is_set():
+                return
+            time.sleep(self.read_delay)
+            pos = min(len(ids), pos + self.CHUNK)
+            self._tls.pp = (pos, len(ids))
+            self.reading_now = True
+            yield None
+            if self.paused and pos < len(ids):
+                self.read_done[key] = pos
+                self.reads.append((pos - start, len(ids)))
+                self.reading_now = False
+                self.last = {"finish": "cancel", "generated": 0, "prompt_ms": 0.0, "decode_ms": 0.0}
+                return
+        self.read_done[key] = len(ids)
+        self.reads.append((len(ids) - start, len(ids)))
+        self.reading_now = False
+        self._tls.pp = None
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class FairReads(unittest.TestCase):
+    """STRATA_FAIR_READ_S: a long prompt read gives way to a waiting request and continues from where it was."""
+    LONG_PROMPT = "p" * 2400
+    ANSWER = "A" * 40
+    SHORT = "s" * 20
+
+    def setUp(self):
+        self.tok = ByteTokenizer()
+        self.engine = ReadingEngine(self.tok, {"pppp": self.ANSWER, "short": self.SHORT})
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.env = {k: os.environ.get(k) for k in ("STRATA_FAIR_READ_S", "STRATA_FAIR_SLICE_S")}
+        os.environ.pop("STRATA_FAIR_SLICE_S", None)
+
+    def tearDown(self):
+        for k, v in self.env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def race(self):
+        out = {}
+        a = threading.Thread(target=collect, args=(self.svc, self.LONG_PROMPT, 4096, out))
+        a.start()
+        while not self.engine.reading_now:
+            time.sleep(0.001)
+        b = threading.Thread(target=collect, args=(self.svc, "short one", 4096, out))
+        b.start()
+        a.join(30)
+        b.join(30)
+        return out
+
+    def test_off_by_default_the_short_one_waits_for_the_read(self):
+        os.environ.pop("STRATA_FAIR_READ_S", None)
+        out = self.race()
+        self.assertEqual(out[self.LONG_PROMPT][0], self.ANSWER)
+        self.assertEqual(out["short one"][0], self.SHORT)
+        self.assertLess(out[self.LONG_PROMPT][1], out["short one"][1])
+        self.assertEqual(self.engine.pauses, 0)
+        self.assertEqual(len(self.engine.reads), 2)
+
+    def test_the_short_one_goes_first_and_the_read_continues(self):
+        os.environ["STRATA_FAIR_READ_S"] = "0.02"
+        out = self.race()
+        self.assertEqual(out["short one"][0], self.SHORT)
+        self.assertEqual(out[self.LONG_PROMPT][0], self.ANSWER)
+        self.assertLess(out["short one"][1], out[self.LONG_PROMPT][1])
+        self.assertGreaterEqual(self.engine.pauses, 1)
+        long_reads = [r for r in self.engine.reads if r[1] > 1000]
+        self.assertGreaterEqual(len(long_reads), 2)                          # paused at least once ...
+        self.assertEqual(sum(r[0] for r in long_reads), long_reads[0][1])    # ... and nothing read twice
+        self.assertFalse(self.svc.fifo.locked())
+        self.assertEqual(self.svc.status["queued"], 0)
+        self.assertFalse(self.svc.status["busy"])
+
+    def test_alone_a_read_is_never_paused(self):
+        os.environ["STRATA_FAIR_READ_S"] = "0.001"
+        out = {}
+        collect(self.svc, self.LONG_PROMPT, 4096, out)
+        self.assertEqual(out[self.LONG_PROMPT][0], self.ANSWER)
+        self.assertEqual(self.engine.pauses, 0)
+        self.assertEqual(len(self.engine.reads), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

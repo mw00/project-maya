@@ -3407,6 +3407,10 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         // produced[k]: chunks part k has put in its slots; consumed[k]: chunks part k + 1 has copied out of them
         std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
         bool stop = false;
+        // a cancel from the progress callback (the serve's PAUSE) lands at a chunk boundary of the WHOLE split: the
+        // head starts no further chunk and the parts finish the ones in flight, so every part ends at the same
+        // position and the caller can keep that prefix; the tail keeps reporting each drained chunk
+        bool pausing = false, head_done = false;
         std::string stage_err;
         const size_t slot = (size_t) Tc * 4 * E;
         const auto fail = [&](std::string e) {
@@ -3446,8 +3450,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 for (int c = 0; c < nc; ++c) {
                     {
                         std::unique_lock<std::mutex> lk(mu);
-                        cv.wait(lk, [&] { return produced[(size_t) k - 1] > c || stop; });
+                        cv.wait(lk, [&] { return produced[(size_t) k - 1] > c || stop || (head_done && produced[0] <= c); });
                         if (stop) return;
+                        if (produced[(size_t) k - 1] <= c) return;   // paused: the head started no chunk c
                     }
                     const int T = chunk_len(c);
                     const int64_t p0 = pos_start + (int64_t) c * Tc;
@@ -3480,9 +3485,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         return;
                     }
                     if (prefill_progress && c + 1 < nc &&
-                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n)) {
-                        fail("cancelled");
-                        return;
+                        !prefill_progress(std::min<int64_t>(n, (int64_t) (c + 1) * Tc), n) && !pausing) {
+                        std::lock_guard<std::mutex> lk(mu);
+                        pausing = true;   // (the chunks in flight drain; the head reads this before its next one)
                     }
                 }
             });
@@ -3490,7 +3495,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         for (int c = 0; c < nc; ++c) {
             {
                 std::lock_guard<std::mutex> lk(mu);
-                if (stop) break;
+                if (stop || pausing) break;
             }
             const int T = chunk_len(c);
             const int64_t p0 = pos_start + (int64_t) c * Tc;
@@ -3503,19 +3508,34 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             if (!hand_on(0, c, T)) break;
             ++pf_->chunks;
         }
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            head_done = true;
+        }
+        cv.notify_all();
         for (auto& t : later) t.join();
         if (stop) {
-            if (stage_err == "cancelled") {
-                cancelled = true;
-            } else {
-                err = stage_err;
-                return false;
-            }
+            err = stage_err;
+            return false;
         }
-        pos_ = pos_start + n;
+        if (pausing && produced[0] < nc) {
+            // paused with chunks left: every part has read exactly the head's chunks, and that is the position kept
+            cancelled = true;
+            pos_ = pos_start + std::min<int64_t>(n, (int64_t) produced[0] * Tc);
+        } else {
+            pos_ = pos_start + n;   // (a pause that landed after the last chunk went out: the prompt is read)
+        }
         for (Glm5Model* m : parts) m->pos_ = pos_;
     }
     if (cancelled) {
+        // the parts' streams first: the prefix the caller may keep must be complete on every card
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            std::string sync_err;
+            glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm prefill compute", sync_err);
+            glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->copy), "glm prefill copies", sync_err);
+        }
+        cudaSetDevice(dev_);
         err = "cancelled";
         return false;
     }
