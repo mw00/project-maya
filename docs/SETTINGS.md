@@ -49,6 +49,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `STRATA_GLM_NUMA` | on with 2+ NUMA nodes | `0` = allocate the RAM tier without spreading it page by page over the sockets' memory |
 | `STRATA_GLM_READ_CHUNKS` | 8 | the experts read from the SSD while it answers (and a prompt's): each part of one in this many pieces at once, 1-16. The best size depends on the drive, its driver and the CPU - 8 on a Linux NVMe, 4 on a Windows laptop's Intel RST RAID (decode +15%) - and the tuning measures 4 and 2 against 8 when part of the model lives on the SSD |
 | `STRATA_GLM_PREFILL_CHUNK` | unset | `--prefill N` from the environment (the older setting; it wins over the config's `--prefill`) |
+| `STRATA_GLM_PREFILL_SHORT` | off | a layer split: `1` cuts a prompt shorter than one chunk per part into one chunk per part, so the cards overlap instead of taking turns. Chunks stay at or above `STRATA_GLM_PREFILL_MIN_CHUNK` tokens (512; raise it, for example to 100000, to keep the full chunks). Longer prompts keep their full chunks, and one GPU is unchanged. Maya-L on 7x RTX 3090: a 2K tool turn on a cached 36K chat, 6.04 -> 4.07 s. Where a chunk's time is mostly experts read from RAM the extra chunks cost more than the overlap saves (RTX 3090 + 3060, most experts in RAM: 1.09-1.18x slower from 589 to 4880 tokens), so it stays off unless set. The cut moves a short prompt's chunk boundaries the way another `--prefill` does (two chunks of 1,200 against one: KL 0.0313, and `--prefill 1216` 0.0305) |
 | `STRATA_PREFILL_LEND_PCT`, `STRATA_GLM_PREFILL_MB` | 90 or 85, unset | `--prefill auto`: the share of each card's expert-pool slots a prompt may borrow for its buffers: 90 when at least 90% of the experts' bytes are held pinned (in VRAM or the RAM tier), else 85 - or a fixed budget in MB |
 | `STRATA_GLM_PREFILL_TAIL_SKIP` | on | single-device prompts without a loaded NextN/MTP block: skip the last layer's attention output projection and FFN after updating all its caches; `0` restores the full computation. Splits and `GLM_CB_DIR` seam dumps keep the full path |
 | `STRATA_GLM_PREFILL_WINDOW` | the chunk's tokens | prompts: the expert output rows kept on the GPU at once - each expert set's rows are added into the layer's output as the window fills, instead of every routed row waiting for one combine (~40 KB a token instead of ~185, so a chunk holds ~2x the tokens); `0` = every row (the old layout) |
@@ -161,6 +162,7 @@ what you changed there):
 
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
+`STRATA_GLM_PREFILL_SHORT=1` cuts such a prompt into one chunk per part so the cards overlap (off by default).
 
 ## The expert pool's size
 
