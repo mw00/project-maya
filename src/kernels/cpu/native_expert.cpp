@@ -158,7 +158,11 @@ RowsFn exact_rows1(int type) {
 }
 
 // the exact rows for nt tokens of a weight type (nt >= 1), nullptr: ggml-cpu's dot
-RowsFn exact_rows_nt(int type, int nt) { return nt >= 2 ? exact_rows(type) : exact_rows1(type); }
+RowsFn exact_rows_nt(int type, int nt) {
+    if (nt >= 2) return exact_rows(type);
+    if (RowsFn fn1 = exact_rows1(type)) return fn1;
+    return exact_rows(type);
+}
 
 }  // namespace
 
@@ -217,6 +221,12 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
     traits(f.d_act)->from_float(h, dst, f.n_ff);
 }
 
+void native_quant_h_slice(const NativeFmt& f, const float* h, void* dst, int r0, int r1) {
+    if (r1 <= r0) return;
+    uint8_t* d = (uint8_t*) dst + (size_t) r0 * f.h_bytes / (size_t) f.n_ff;
+    traits(f.d_act)->from_float(h + r0, d, r1 - r0);
+}
+
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
                     int r0, int r1) {
     // the multi-token kernels decode the weights once for all tokens: 2.0-2.4x ggml-cpu at three tokens, no faster
@@ -256,6 +266,18 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
     const int n = (int) f.n_embd;
     const bool clamp = swiglu_limit != std::numeric_limits<float>::infinity();
     if (r1 > r0) {
+        if (iq256_gu_rows1_supported(f.gu_type) && exact_rows1(f.gu_type) != nullptr) {
+            int t = 0;
+            for (; t + 1 < nt; t += 2) {
+                iq256_gu_rows2(f.gu_type, gate_base + (size_t) r0 * f.gu_row, up_base + (size_t) r0 * f.gu_row,
+                               f.gu_row, n, act[t], act[t + 1], ff[t] + r0, ff[t + 1] + r0, 0, r1 - r0, swiglu_limit);
+            }
+            if (t < nt) {
+                iq256_gu_rows1(f.gu_type, gate_base + (size_t) r0 * f.gu_row, up_base + (size_t) r0 * f.gu_row,
+                               f.gu_row, n, act[t], ff[t] + r0, 0, r1 - r0, swiglu_limit);
+            }
+            return;
+        }
         if (const RowsFn fn = exact_rows_nt(f.gu_type, nt)) {
             // every gate row of the range for all tokens (each row decoded once per group of tokens), then every up
             // row, then the same epilogue as below on the same values
@@ -301,10 +323,30 @@ void native_gu_rows_split(const NativeFmt& f, const uint8_t* gate_base, const ui
     }
 }
 
+void native_gu_rows1_fused_quant(const NativeFmt& f, const uint8_t* gate_base, const uint8_t* up_base,
+                                 const void* act, void* hq, int r0, int r1, float swiglu_limit) {
+    constexpr int QK_K = 256;
+    alignas(32) float h_blk[QK_K];
+    const void* a[1] = {act};
+    for (int r = r0; r < r1; r += QK_K) {
+        // Compute 256 rows of Gate + Up + AVX2 SwiGLU directly into stack L1D buffer h_blk[0..255]
+        float* o[1] = {h_blk - r};
+        native_gu_rows_split(f, gate_base, up_base, a, 1, o, r, r + QK_K, swiglu_limit);
+        // Immediately quantize hot L1D h_blk[0..255] into the target block_q8_K / block_q8_0 slot in hq
+        native_quant_h_slice(f, h_blk - r, hq, r, r + QK_K);
+    }
+}
+
 void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const void* const* hq,
                             int nt, float* const* out, int r0, int r1) {
     if (r1 > r0) {
         if (const RowsFn fn = exact_rows_nt(f.d_type, nt)) {
+            if (nt <= 8) {
+                float* o_stack[8];
+                for (int t = 0; t < nt; ++t) o_stack[t] = out[t] + r0;
+                fn(f.d_type, down_base + (size_t) r0 * f.d_row, f.d_row, (int) f.n_ff, hq, nt, o_stack, 0, r1 - r0);
+                return;
+            }
             thread_local std::vector<float*> o;
             o.resize((size_t) nt);
             for (int t = 0; t < nt; ++t) o[(size_t) t] = out[t] + r0;

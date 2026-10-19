@@ -53,3 +53,15 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+# benchmark and tournament runtime artifacts
+diag-*.txt
+maya-bench.txt
+vision-memory.json
+tournament.pid
+*TOURNAMENT_RESULTS.md
+*tournament_results.json
+sustained_bench_results.json
+bench_sustained_suite.py
+run_256k*.sh
+/scripts/
+bench/results/2026-10-16-v100-128k-bench/

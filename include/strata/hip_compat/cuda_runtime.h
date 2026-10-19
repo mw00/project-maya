@@ -73,6 +73,8 @@ inline hipError_t cudaHostAlloc(T** p, size_t bytes, unsigned int flags) {
 #define cudaHostAlloc hipHostMalloc
 #endif  // STRATA_HIP_WAVE64
 #define cudaFuncAttributeMaxDynamicSharedMemorySize hipFuncAttributeMaxDynamicSharedMemorySize
+#define cudaFuncAttributePreferredSharedMemoryCarveout ((hipFuncAttribute) 0)
+#define cudaSharedmemCarveoutMaxL1 0
 #define cudaGetDevice hipGetDevice
 #define cudaGetDeviceCount hipGetDeviceCount
 #define cudaGetDeviceProperties hipGetDeviceProperties

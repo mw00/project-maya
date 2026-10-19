@@ -725,9 +725,11 @@ public:
     Glm5Model* spec_head_last();
     Glm5Model* spec_tail_last();
     // this part's residual into the next part B (one host hop through this part's pinned hop_h), then B's layers at p
-    bool hop_to_next(Glm5Model* B, int64_t p, std::string& err);
+    bool hop_to_next(Glm5Model* B, int64_t p, std::string& err, bool cancellable = false);
     bool spec_head(int64_t p, int32_t token, std::string& err);
     bool spec_tail(Glm5Model* head, int64_t p, std::string& err);
+    bool spec_tail_start(Glm5Model* head, int64_t p, std::string& err);
+    bool spec_tail_finish(Glm5Model* head, int64_t p, std::string& err);
     /// The one-GPU MTP decode (src/core/glm_mtp.cu): each round the NextN block drafts up to n tokens in a chain (its
     /// own hidden state feeding the next step), one verify window (window()) checks [last token, drafts...], the
     /// target's samples accept the drafts while they match (window_commit keeps them), and the NextN block's cache takes

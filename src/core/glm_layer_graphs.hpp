@@ -17,9 +17,10 @@ public:
         const float* residual = nullptr;
         const float* other = nullptr;
         bool all_resident = false;   // fast_moe leaves its wait / fetch launches out then: another graph
+        bool spec_gate = false;      // true when g_skip == F->spec_skip_d (cancellable spec_head pass)
         bool operator==(const Key& b) const {
             return cpu_plan == b.cpu_plan && residual == b.residual && other == b.other &&
-                   all_resident == b.all_resident;
+                   all_resident == b.all_resident && spec_gate == b.spec_gate;
         }
     };
 
@@ -28,7 +29,8 @@ public:
     bool enqueue(int layer, Key key, cudaStream_t stream, uint64_t& expected, uint64_t requests,
                  const std::function<bool()>& body, bool& replayed, std::string& err) {
         replayed = false;
-        auto it = entries_.find(layer);
+        const int slot_key = (layer << 1) | (key.spec_gate ? 1 : 0);
+        auto it = entries_.find(slot_key);
         if (it != entries_.end() && !(it->second.key == key)) {
             entries_.erase(it);   // caller changes plans only at a completed token boundary
             it = entries_.end();
@@ -62,7 +64,7 @@ public:
             expected = before;
             return false;
         }
-        entries_.emplace(layer, std::move(entry));
+        entries_.emplace(slot_key, std::move(entry));
         ++captures;
         return true;
     }
