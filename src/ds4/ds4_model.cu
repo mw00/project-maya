@@ -1687,7 +1687,12 @@ struct Model::Impl {
             chunk = std::min(kMaxChunk, std::max(256, chunk / 16 * 16));
             eg_cap = (size_t) chunk;
             tap_cap = std::max(kWin, 128);
-        }
+        } else
+            std::fprintf(stderr,
+                         "ds4: prompts run in windows of %d tokens (--threads off, tensor parallel 1): long prompts\n"
+                         "     prefill far slower than chunked (a 7-GPU RTX 3090 rig, the experts read in place:\n"
+                         "     ~10x) - pass --threads on for %d-token chunks\n",
+                         kWin, kVlRows);
         // the vision tower on the first GPU, before the split: the layers get what it leaves
         if (o.vision && !load_vision(err)) {   // (a tower that cannot load leaves the model reading text: said loudly,
             if (o.vision_only) return false;   // and the server is told pictures are off - info_lines)

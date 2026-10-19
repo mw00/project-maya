@@ -26,7 +26,11 @@ It first asks which model to set up:
   `tools/ds4/pack_gguf.py`'s), from NVIDIA Volta (V100) on: the most-used experts in VRAM, the others read from the
   GGUF through the OS page cache - from RAM where they fit, from the SSD otherwise - so it runs whatever the memory
   (more VRAM and RAM is faster; keep the files on an NVMe SSD; `--mmap-experts off` copies as many of them into RAM as
-  fit instead, on huge pages split across the CPU sockets' memory - measured no faster than the page cache). The GGUFs have no DSpark drafter and no vision tower.
+  fit instead, on huge pages split across the CPU sockets' memory - measured no faster than the page cache). A split
+  whose tensor parallel collapses (the log says `tensor parallel 2 -> 1`) leaves prompts in windows of 16 tokens, an
+  order of magnitude slower on long prompts - the engine warns at start; `--threads on` in `maya-ds4.json`'s `args`
+  brings the 8192-token prompt chunks back (a 7-GPU RTX 3090 rig, Maya-S read in place: a 32K-token prompt 99 ->
+  1010 tokens/s). The GGUFs have no DSpark drafter and no vision tower.
 
 GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 
