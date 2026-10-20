@@ -35,6 +35,7 @@ td.log
 /strata-*.json
 /strata-*.log
 /maya-*.json
+/vision-memory.json
 /run-maya-*.sh
 /run-maya-*.bat
 /maya-report.txt
