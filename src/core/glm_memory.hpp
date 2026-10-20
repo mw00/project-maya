@@ -27,6 +27,14 @@ inline bool off_by_default_on_amd(const char* env) {
     return true;
 #endif
 }
+// STRATA_GLM_GROUP_EXPERTS=1: the batched rows' routed experts each run once for all the rows of a group (glm_rows.cu)
+inline bool group_experts_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GLM_GROUP_EXPERTS");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
 // STRATA_GLM_SKIP_EMPTY=1: the batched rows leave out the launches their routes have no work for (glm_rows.cu)
 inline bool skip_empty_on() {
     static const bool on = [] {

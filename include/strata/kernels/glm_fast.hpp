@@ -275,6 +275,8 @@ struct MoeRequest {
     short near_ids[16];          // STRATA_GLM_ROUTE_LOG only: the route's next ranks after the top k (-1: none)
     int win;                     // ... and the answer slot they go to: a verify window's token (0: the lone answer)
     int win_n;                   // a batched verify window's tokens (0: not one): their CPU lanes may run at once
+    int win_rows;                // ... a batched rows step's group instead (STRATA_GLM_GROUP_EXPERTS): win the row,
+    int pad_;                    //     win_n the rows; their CPU lanes merged on this part's own pool
     float x[4096];               // the FFN input, written only when cpu_mask != 0
 };
 /// The host's answer to a request with misses.
@@ -297,7 +299,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                const float* const* ahead_bias = nullptr, int n_ahead = 0, int skip_from = 8,
                unsigned long long cpu_plan = 0, int promote_min = 0, int pf_rank = 0, int near_n = 0, int win = 0,
                unsigned int* scr_used = nullptr, int win_n = 0, int disk_skip_from = 8, float disk_skip_w = 0.0f,
-               float miss_skip_w = 0.0f);
+               float miss_skip_w = 0.0f, int win_rows = 0);
 /// A verify window's MoE layer with each distinct expert computed ONCE: the T tokens were routed one after another into
 /// their own plan arrays (moe_route with win = t and a scr_used word, so no two of them land in one scratch slot - the
 /// word's bit 31 says one did), then moe_win_experts groups the entries by expert slot, reads each expert's gate/up and

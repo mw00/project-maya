@@ -2253,8 +2253,7 @@ static int glm_pack_generate(const Options& o) {
     static const int64_t multi_room = (int64_t) env_num("STRATA_GLM_MULTI_ROOM", 16384);
     static const int multi_boundary_every = (int) env_num("STRATA_GLM_MULTI_BOUNDARY", 32);
     static const bool multi_spec = env_num("STRATA_GLM_MULTI_SPEC", 1) != 0;
-    static const int split_rows = std::clamp((int) env_num("STRATA_GLM_SPLIT_ROWS", 0), 0,
-                                             strata::core::Glm5Model::rows_max());
+    static const int split_rows = strata::core::Glm5Model::split_rows_setting();
     // Reuse split-row scheduler buffers; allocating vectors for each decode group defeats part of the batching gain.
     std::vector<Gen*> split_group;
     std::vector<int> split_seqs;

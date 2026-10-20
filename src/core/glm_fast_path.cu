@@ -622,6 +622,10 @@ static void* fa_take_b(uint8_t*& at, size_t bytes) {
     return p;
 }
 
+namespace {
+void cpu_win_alloc(Glm5Model::FastState* F, const Glm5Geometry& g, bool exl3);   // (after X3Rows)
+}  // namespace
+
 bool Glm5Model::fast_setup(std::string& err) {
     cudaSetDevice(dev_);
     auto* F = new FastState();
@@ -999,6 +1003,40 @@ bool Glm5Model::fast_setup(std::string& err) {
             unsigned long long sp[8];
             for (int i = 0; i < 8; ++i) sp[i] = (unsigned long long) (F->scratch + (size_t) i * sstride);
             cudaMemcpy(F->md.scratch, sp, sizeof sp, cudaMemcpyHostToDevice);
+        }
+        // STRATA_GLM_GROUP_EXPERTS (the batched rows' experts, each once for its group: glm_rows.cu): every row of a
+        // group routes before the group's experts run, so a row's fetched experts cannot share the 8 slots above (the
+        // verify window redoes itself token by token when its tokens take one twice; a batched step cannot) - row i
+        // has slots [8 i, 8 i + 8) of rows_scr, row 0 the ones above.  The rows' route state (plans, the CPU lane's
+        // answer slots, the grouping) is the verify window's, its rows a window's tokens (win_alloc).  Both before the
+        // pool takes the card.
+        if (glmfast::group_experts_on() && rows_ != nullptr) {
+            const int R = std::min(rows_max(), n_parts_ > 1 ? split_rows_setting() : seq_count());
+            if (R >= 2) {
+                const size_t extra = (size_t) (R - 1) * 8 * sstride;
+                std::vector<unsigned long long> sp((size_t) R * 8);
+                if (cudaMalloc(&F->rows_scratch, extra) != cudaSuccess ||
+                    cudaMalloc((void**) &F->rows_scr, sp.size() * sizeof(unsigned long long)) != cudaSuccess) {
+                    cudaGetLastError();
+                    err = "glm fast: the grouped rows' scratch slots (" + std::to_string(extra >> 20) +
+                          " MB) did not allocate";
+                    return false;
+                }
+                for (size_t i = 0; i < sp.size(); ++i)
+                    sp[i] = (unsigned long long) (i < 8 ? F->scratch + i * sstride : F->rows_scratch + (i - 8) * sstride);
+                cudaMemcpy(F->rows_scr, sp.data(), sp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice);
+                F->scratch_bytes += extra;
+                size_t f0 = 0, f1 = 0, tot = 0;
+                cudaMemGetInfo(&f0, &tot);
+                if (!win_alloc(kWinMax, err)) return false;
+                cudaMemGetInfo(&f1, &tot);
+                F->win_bytes += f0 > f1 ? f0 - f1 : 0;
+                cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
+                F->rows_group = R;
+                std::fprintf(stderr, "glm fast: CUDA%d grouped rows' experts (STRATA_GLM_GROUP_EXPERTS): up to %d rows, "
+                             "%.0f MB of scratch slots and %.0f MB of route state\n", dev_, R, (double) extra / 1e6,
+                             (double) (f0 > f1 ? f0 - f1 : 0) / 1e6);
+            }
         }
         // a parallel split load: the parts pin their prompt paths, size their pools and plan their RAM tiers one at a
         // time, in part order - the first part's RAM measurement then sees none of the later parts' prompt staging, as
@@ -1938,6 +1976,20 @@ struct X3Rows {
     float* xds() const { return xsb(2); }
 };
 
+// a merged layer's CPU-lane rows (win_cpu_merged): each token's activation quant, each entry's h quant and rows - the
+// window lanes' (win_lanes_make) and the grouped batched rows' (STRATA_GLM_GROUP_EXPERTS, fast_setup)
+void cpu_win_alloc(Glm5Model::FastState* F, const Glm5Geometry& g, bool exl3) {
+    namespace kc = strata::kernels::cpu;
+    constexpr int kWinMax = Glm5Model::kWinMax;
+    auto& C = F->cpu_win;
+    if (!C.dn.empty()) return;
+    C.act.assign((size_t) kWinMax * kc::kNativeActBytes, 0);
+    C.hq.assign((size_t) kWinMax * 8 * kc::kNativeHBytes, 0);
+    C.ff.assign((size_t) kWinMax * 8 * g.n_ff_exp, 0.0f);
+    C.dn.assign((size_t) kWinMax * 8 * g.n_embd, 0.0f);
+    if (exl3) C.x3.assign((size_t) kWinMax * 8 * X3Rows::floats(g.n_embd, g.n_ff_exp), 0.0f);
+}
+
 // matrix r (0 gate, 1 up, 2 down) of an EXL3 expert blob
 strata::kernels::cpu::Exl3Part x3_part(const uint8_t* blob, const strata::kernels::exl3::ExpertLayout& xl, int r,
                                        int E, int FF) {
@@ -2297,8 +2349,10 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
         const char* v = getenv("STRATA_GLM_WIN_X3_POOLS");
         return v != nullptr && std::atoi(v) == 1 ? 1 : 2;
     }();
+    // a batched rows group (win_rows): every expert on this part's own pool - the other part's pool computes its group
+    const bool own = rq[0]->win_rows != 0;
     for (int k = 0; k < nu; ++k) {
-        const int h = (Ly.exl3 && x3_pools == 1) || load[0] <= load[1] ? 0 : 1;
+        const int h = own || (Ly.exl3 && x3_pools == 1) || load[0] <= load[1] ? 0 : 1;
         half[h][nh[h]++] = order[k];
         load[h] += cost(order[k]);
     }
@@ -2392,18 +2446,23 @@ void Glm5Model::win_cpu_merged(int il, int nb, const gf::MoeRequest* const* rq, 
         });
     };
     // half 1 on the second lane, half 0 here on the first lane's pool (its thread is idle: no window token is queued)
-    std::atomic<int> done{0};
-    const std::function<void(glmfast::Workers&)> fn1 = [&](glmfast::Workers& pool) {
-        if (Ly.exl3) run_half_x3(1, pool);
-        else run_half(1, pool);
-    };
-    FastState::WinLane::Job j1;
-    j1.fn = &fn1;
-    j1.done = &done;
-    F->win_lane[1]->push(j1);
-    if (Ly.exl3) run_half_x3(0, *F->win_lane[0]->pool);
-    else run_half(0, *F->win_lane[0]->pool);
-    while (done.load(std::memory_order_acquire) == 0) cpu_relax();
+    if (own) {
+        if (Ly.exl3) run_half_x3(0, *F->cpu_pool);
+        else run_half(0, *F->cpu_pool);
+    } else {
+        std::atomic<int> done{0};
+        const std::function<void(glmfast::Workers&)> fn1 = [&](glmfast::Workers& pool) {
+            if (Ly.exl3) run_half_x3(1, pool);
+            else run_half(1, pool);
+        };
+        FastState::WinLane::Job j1;
+        j1.fn = &fn1;
+        j1.done = &done;
+        F->win_lane[1]->push(j1);
+        if (Ly.exl3) run_half_x3(0, *F->win_lane[0]->pool);
+        else run_half(0, *F->win_lane[0]->pool);
+        while (done.load(std::memory_order_acquire) == 0) cpu_relax();
+    }
     for (int j = 0; j < nb; ++j) {
         float* out = ans[j]->part;
         const float* dn[8];
@@ -2482,11 +2541,7 @@ void Glm5Model::win_lanes_make(std::shared_ptr<glmfast::Workers> p0, std::shared
         glmfast::pin_thread(L->th.native_handle(), k == 0 ? c0 : c1);
         F->win_lane[k] = L;
     }
-    F->cpu_win.act.assign((size_t) kWinMax * kc::kNativeActBytes, 0);
-    F->cpu_win.hq.assign((size_t) kWinMax * 8 * kc::kNativeHBytes, 0);
-    F->cpu_win.ff.assign((size_t) kWinMax * 8 * g.n_ff_exp, 0.0f);
-    F->cpu_win.dn.assign((size_t) kWinMax * 8 * g.n_embd, 0.0f);
-    if (exl3_) F->cpu_win.x3.assign((size_t) kWinMax * 8 * X3Rows::floats(g.n_embd, g.n_ff_exp), 0.0f);
+    cpu_win_alloc(F, g, exl3_);
 }
 
 void Glm5Model::win_lanes_stop() {
@@ -3650,6 +3705,8 @@ void Glm5Model::fast_destroy() {
     if (F->hop_h) cudaFreeHost(F->hop_h);
     if (F->tok_h) cudaFreeHost(F->tok_h);
     if (F->scratch) cudaFree(F->scratch);
+    if (F->rows_scratch) cudaFree(F->rows_scratch);
+    if (F->rows_scr) cudaFree(F->rows_scr);
     if (F->mtp_h) cudaFree(F->mtp_h);
     if (F->mtp_catq) cudaFree(F->mtp_catq);
     if (F->mtp_logits) cudaFree(F->mtp_logits);
@@ -3988,8 +4045,12 @@ void Glm5Model::fast_service() {
         }
         std::atomic_thread_fence(std::memory_order_acquire);
         // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's merged rows with them)
-        const bool held = win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && F->win_lane[0] != nullptr &&
-                          F->win_lane[1] != nullptr && (!exl3_ || !F->cpu_win.x3.empty());
+        // A batched rows step's group (STRATA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
+        // own pool - the other part works on its own group meanwhile; not with a helper GPU (it answers per route)
+        const bool held = win_merge && rq->win_n > 0 && F->cpu_ans_h != nullptr && !F->cpu_win.dn.empty() &&
+                          (!exl3_ || !F->cpu_win.x3.empty()) &&
+                          (rq->win_rows != 0 ? F->cpu_pool != nullptr && F->helper.device() < 0
+                                             : F->win_lane[0] != nullptr && F->win_lane[1] != nullptr);
         if (rq->error != 0) {
             if (held) {   // a window token's invalid route: nothing to compute, but it may be the layer's last
                 ++w_held;
@@ -5163,6 +5224,37 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wa
     return ok;
 }
 
+void Glm5Model::fast_moe_route(int il, const MoeIo& io, const gf::MoeDev& md, void* sh_hq, bool pred, int n_ah,
+                               const float* const* ah_bias, bool lane, int win, int win_n, int win_rows) {
+    FastState* F = fast_;
+    const Glm5Geometry& g = g_;
+    const auto& Ly = F->L[(size_t) il];
+    const int FFs = g.n_ff_exp * g.n_shared;
+    // STRATA_GLM_PROMOTE_MIN=<n>: a fetched expert is kept in VRAM only when its aged route count clears n.
+    // Unset or <= 1: the old rule (keep it whenever a spare is free).
+    static const int promote_min = [] {
+        const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
+        return v ? std::max(0, std::atoi(v)) : 0;
+    }();
+    // STRATA_GLM_PREFETCH_RANK=<n>: prefetch only the prediction's first n ranks (unset: any of its top k)
+    static const int pf_rank = [] {
+        const char* v = getenv("STRATA_GLM_PREFETCH_RANK");
+        return v != nullptr ? std::max(1, std::atoi(v)) : 0;
+    }();
+    static const int near_n = getenv("STRATA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
+    gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
+                  g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, sh_hq, F->cs,
+                  pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
+                  pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
+                  il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
+                  pf_rank, near_n, win, nullptr, win_n, il == mtp_il_ ? 8 : F->disk_skip_from,
+                  il == mtp_il_ ? 0.0f : F->disk_skip_w, il == mtp_il_ ? 0.0f : [&] {
+                      const float w = F->miss_w_req >= 0.0f ? F->miss_w_req : F->miss_w;
+                      const int from = F->miss_from_req >= 0 ? F->miss_from_req : F->miss_from;
+                      return il >= from ? w : 0.0f;
+                  }(), win_rows);
+}
+
 bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias,
                                  bool& pf_pending, std::string& err, bool rows) {
     FastState* F = fast_;
@@ -5178,29 +5270,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     md.pf_n = F->pf_n_buf[il & 1];
     // the CPU lane splits this layer's RAM-tier experts when the CPU has a dot product for its types
     const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
-    // STRATA_GLM_PROMOTE_MIN=<n>: a fetched expert is kept in VRAM only when its aged route count clears n.
-    // Unset or <= 1: the old rule (keep it whenever a spare is free).
-    static const int promote_min = [] {
-        const char* v = getenv("STRATA_GLM_PROMOTE_MIN");
-        return v ? std::max(0, std::atoi(v)) : 0;
-    }();
-    // STRATA_GLM_PREFETCH_RANK=<n>: prefetch only the prediction's first n ranks (unset: any of its top k)
-    static const int pf_rank = [] {
-        const char* v = getenv("STRATA_GLM_PREFETCH_RANK");
-        return v != nullptr ? std::max(1, std::atoi(v)) : 0;
-    }();
-    static const int near_n = getenv("STRATA_GLM_ROUTE_LOG") != nullptr ? 16 : 0;   // the route log's near misses
-    gf::moe_route(io.rlog, Ly.router_bias, g.n_expert, g.n_exp_used, g.w_scale, g.norm_w != 0, il, io.x,
-                  g.n_embd, md, io.sh_g, io.sh_u, g.swiglu_shexp, FFs, F->sh_hq, s,
-                  pred ? F->plog : nullptr, pred ? F->L[(size_t) il + 1].router_bias : nullptr,
-                  pred ? F->max_pf : 0, n_ah > 0 ? F->alog : nullptr, ah_bias, n_ah,
-                  il == mtp_il_ ? mtp_skip_from() : glmfast::trunk_skip_from(il), lane ? F->cpu_plan : 0ull, promote_min,
-                  pf_rank, near_n, 0, nullptr, 0, il == mtp_il_ ? 8 : F->disk_skip_from,
-                  il == mtp_il_ ? 0.0f : F->disk_skip_w, il == mtp_il_ ? 0.0f : [&] {
-                      const float w = F->miss_w_req >= 0.0f ? F->miss_w_req : F->miss_w;
-                      const int from = F->miss_from_req >= 0 ? F->miss_from_req : F->miss_from;
-                      return il >= from ? w : 0.0f;
-                  }());
+    fast_moe_route(il, io, md, F->sh_hq, pred, n_ah, ah_bias, lane);
     if (F->prof_on) F->mark("moe_route");
     ++F->expected;
     // the side stream copies the next layer's predicted experts while this layer computes.  STRATA_GLM_PREFETCH_AT:

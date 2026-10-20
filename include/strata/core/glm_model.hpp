@@ -42,6 +42,7 @@
 namespace strata::kernels::glmf {
 struct MoeRequest;
 struct CpuAnswer;
+struct MoeDev;
 }  // namespace strata::kernels::glmf
 
 namespace strata::core {
@@ -581,6 +582,13 @@ public:
     };
     bool fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias, bool& pf_pending,
                           std::string& err, bool rows = false);   // rows: a batched step's row (STRATA_GLM_SKIP_EMPTY)
+    // ... its route (moe_route with the token path's settings) into md's plan, the shared expert's h to sh_hq; win /
+    // win_n / win_rows: a grouped batched step's row and rows (glm_rows.cu)
+    void fast_moe_route(int il, const MoeIo& io, const strata::kernels::glmf::MoeDev& md, void* sh_hq, bool pred,
+                        int n_ah, const float* const* ah_bias, bool lane, int win = 0, int win_n = 0, int win_rows = 0);
+    // STRATA_GLM_GROUP_EXPERTS: the routed experts of a batched step's n rows, each distinct one once for its rows
+    // (glm_rows.cu); false with err empty: not here (the rows go one by one)
+    bool rows_moe_grouped(int il, int n, std::string& err);
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);
@@ -810,6 +818,8 @@ public:
     /// sequence's position advances by one.  n <= rows_max().
     bool rows_ok() const { return rows_ != nullptr && n_parts_ == 1 && split_next_ == nullptr && fast_ != nullptr; }
     static int rows_max();
+    /// STRATA_GLM_SPLIT_ROWS as the scheduler and the parts' setup both take it: 0 (off) .. rows_max()
+    static int split_rows_setting();
     bool multi_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                     int* tokens_out, std::string& err);
     /// LAYER SPLIT (glm_rows.cu): one token of each of n sequences through every part as one batched step per part,

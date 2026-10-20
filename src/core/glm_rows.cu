@@ -8,18 +8,22 @@
 // (mHC), the KDA recurrence, the DSA indexer and attention against that conversation's caches, and the routed
 // experts (the tiers serve the n routes one after another, as they serve the layers of a token).  So each row's
 // token is the one the token path gives that conversation alone - as long as the tiers hold the same experts
-// (greedy with the CPU lane off: the multi bench compares them).
+// (greedy with the CPU lane off: the multi bench compares them).  STRATA_GLM_GROUP_EXPERTS=1 instead routes every row of
+// the step first and runs each distinct routed expert once for all the rows that chose it (rows_moe_grouped, the verify
+// window's batched MoE) - each row's output bit for bit the per-row kernels' for it.
 //
 // Each part's row activations live in its own arena (rows_alloc, at load, before the expert pool takes the rest of the
 // card); the per-row scratch the token path's kernels use in between (the conv outputs, the gates, the DSA scores and
 // cells, the experts' h) is the token path's own, used by one row after the other on that part's stream.
 #include "glm_fast_state.hpp"
 
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include "ggml.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -73,6 +77,11 @@ struct Glm5Model::RowSeq {
 };
 
 int Glm5Model::rows_max() { return gf::kMaxMvNt; }
+
+int Glm5Model::split_rows_setting() {
+    const char* v = getenv("STRATA_GLM_SPLIT_ROWS");
+    return v != nullptr ? std::clamp((int) std::atof(v), 0, rows_max()) : 0;
+}
 
 bool Glm5Model::rows_alloc(std::string& err) {
     if (rows_ != nullptr) return true;
@@ -418,7 +427,11 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             j[1] = {Ly.sh_gate.q, S->xq, S->x, S->sh_g, nullptr, 1.0f, Ly.sh_gate.type, E, FFs};
             j[2] = {Ly.sh_up.q, S->xq, S->x, S->sh_u, nullptr, 1.0f, Ly.sh_up.type, E, FFs};
             if (!mv(j, 3, "router / shared expert")) return false;
-            for (int i = 0; i < n; ++i) {
+            // (its own error string: `err` is the scheduler's, and may still hold a cancelled or failed prompt's text)
+            std::string gerr;
+            const bool grouped = glmfast::group_experts_on() && rows_moe_grouped(il, n, gerr);
+            if (!gerr.empty()) { err = gerr; return false; }
+            for (int i = 0; !grouped && i < n; ++i) {
                 const MoeIo io = {rows(S->x, E, i), rows_q(S->xq, E, i), rows(S->rlog, g.n_expert, i),
                                   rows(S->sh_g, FFs, i), rows(S->sh_u, FFs, i), rows(S->ffn, E, i)};
                 if (!fast_moe_experts(il, io, false, 0, no_bias, pf_pending, err, true)) return false;
@@ -430,6 +443,158 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
         gf::hc_post(rows(S->ffn, E, i), rw[i].Rc, rows(S->post, 8, i), rows(S->comb, 16, i), E, rw[i].Ro, s);
         if (rw[i].Ro != rw[i].state)
             cudaMemcpyAsync(rw[i].state, rw[i].Ro, (size_t) g.hc * E * sizeof(float), cudaMemcpyDeviceToDevice, s);
+    }
+    return true;
+}
+
+// STRATA_GLM_GROUP_EXPERTS=1: the n rows' routed experts as the verify window's batched MoE takes a window's tokens
+// (fast_moe_window).  Every row is routed first - into its own plan, fetch sources, disk answer, CPU-lane answer slot
+// (the window's route state, its rows the window's tokens) and its own 8 scratch slots (rows_scr), each row's wait and
+// fetch before the next row's route (the host's answer to a disk miss is one buffer) - then each distinct expert runs
+// once for all the rows that routed it (gf::moe_win_experts, exl3::win_experts: each row's output is moe_gate_up +
+// moe_down's for it alone, bit for bit), then the rows' CPU-lane answers in one launch.  An expert two rows route is
+// read once instead of twice, and fast_service holds the group's routes and answers their CPU-lane experts as one
+// merged request (win_cpu_merged on this part's pool: each RAM-tier expert read once for the group).  The shared
+// expert's down rows of all n rows are one mv_nt (mv's bits for each row - the per-row path's fused down's too).
+// Its route is the same per row: the spares a row's fetch takes are resident for the rows after it, as they are for
+// the next row's route on the per-row path.  False with err empty: not here (the rows run one by one).
+bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
+    namespace x3 = strata::kernels::exl3;
+    FastState* F = fast_;
+    RowsState* S = rows_;
+    auto& W = F->win;
+    const Glm5Geometry& g = g_;
+    const auto& Ly = F->L[(size_t) il];
+    const int E = g.n_embd, FFs = g.n_ff_exp * g.n_shared, K = g.n_exp_used;
+    if (n < 2) return false;
+    if (n > F->rows_group || F->rows_scr == nullptr || W.mplan_ptr == nullptr || W.tmax < n ||
+        (Ly.exl3 && (W.wh == nullptr || !x3::several_ok()))) {
+        static std::atomic<bool> told{false};   // (a run with the setting on that never groups should say so; both
+        if (!told.exchange(true)) {            //  parts' threads get here)
+            std::fprintf(stderr, "glm rows: CUDA%d a group of %d rows runs its experts row by row (grouping set up for "
+                                 "%d rows%s) - said once\n", dev_, n, F->rows_group,
+                         Ly.exl3 && W.wh == nullptr ? ", no EXL3 rows" : "");
+        }
+        return false;
+    }
+    cudaStream_t s = F->cs;
+    const bool lane = (F->cpu_plan != 0ull || F->helper.device() >= 0) && F->cpu_fmt[(size_t) il].n_ff > 0;
+    const bool skip_empty = glmfast::skip_empty_on();
+    const bool empty = F->all_resident || (skip_empty && F->layer_resident(il));
+    gf::MoeDev md = F->md;
+    md.pf_src = F->pf_buf[il & 1];
+    md.pf_dst = F->pf_buf[il & 1] + 8;
+    md.pf_n = F->pf_n_buf[il & 1];
+    const auto row_dev = [&](int i) {   // (fast_moe_window's tok_dev, and the row's own scratch slots)
+        gf::MoeDev m = md;
+        m.plan_ptr = W.mplan_ptr + 8 * i;
+        m.plan_w = W.mplan_w + 8 * i;
+        m.plan_id = W.mplan_id + 8 * i;
+        m.fetch_src = W.mfetch + 8 * i;
+        m.cpu_part = W.mcpu_part + (size_t) E * i;
+        m.cpu_flag = W.mcpu_flag + i;
+        m.scratch = F->rows_scr + 8 * i;
+        if (i > 0 && md.cpu_seq != nullptr) {
+            m.cpu_seq = W.cpu_seq_w + 16 * i;
+            m.cpu_ans = W.ans_d[i];
+        }
+        return m;
+    };
+    const float* no_bias[gf::kAhead] = {nullptr, nullptr, nullptr, nullptr};
+    for (int i = 0; i < n; ++i) {
+        const gf::MoeDev m = row_dev(i);
+        const MoeIo io = {row_at(S->x, E, i), rowq_at(S->xq, E, i), row_at(S->rlog, g.n_expert, i),
+                          row_at(S->sh_g, FFs, i), row_at(S->sh_u, FFs, i), row_at(S->ffn, E, i)};
+        fast_moe_route(il, io, m, (uint8_t*) W.sh_hq + (size_t) i * W.sh_hq_s, false, 0, no_bias, lane, i, n, 1);
+        ++F->expected;
+        if (empty) continue;
+        if (skip_empty) {
+            gf::moe_wait_fetch(m, E, K, Ly.blob, s);
+        } else {
+            gf::moe_wait(m, E, s);
+            gf::moe_fetch(m, K, Ly.blob, s);
+        }
+    }
+    const float* sh_out = nullptr;
+    if (Ly.sh_down.q != nullptr) {
+        gf::MvJob sd = {Ly.sh_down.q, W.sh_hq, nullptr, W.sh_out, nullptr, 1.0f, Ly.sh_down.type, FFs, E};
+        if (!gf::mv_nt(&sd, 1, n, s)) {
+            err = "glm rows: the grouped shared expert's down";
+            return false;
+        }
+        sh_out = W.sh_out;
+    }
+    gf::MoeWin mw;
+    mw.plan_ptr = W.mplan_ptr;
+    mw.plan_w = W.mplan_w;
+    mw.cpu_part = W.mcpu_part;
+    mw.cpu_flag = W.mcpu_flag;
+    mw.grp_ptr = W.grp_ptr;
+    mw.grp_start = W.grp_start;
+    mw.grp_ent = W.grp_ent;
+    mw.n_groups = W.n_groups;
+    mw.T = n;
+    mw.k = K;
+    mw.n_embd = E;
+    mw.n_ff = g.n_ff_exp;
+    mw.limit = g.swiglu_exp;
+    if (Ly.exl3) {
+        gf::moe_win_group(mw, s);
+        x3::WinArgs xa;
+        xa.grp_ptr = W.grp_ptr;
+        xa.grp_start = W.grp_start;
+        xa.grp_ent = W.grp_ent;
+        xa.n_groups = W.n_groups;
+        xa.plan_ptr = W.mplan_ptr;
+        xa.plan_w = W.mplan_w;
+        xa.cpu_part = W.mcpu_part;
+        xa.cpu_flag = W.mcpu_flag;
+        xa.x = S->x;
+        xa.x_stride = (size_t) E;
+        xa.h = W.wh;
+        xa.part = W.wpart;
+        xa.sh_out = sh_out;
+        xa.out = S->ffn;
+        xa.out_stride = (size_t) E;
+        xa.lay = Ly.xl;
+        xa.T = n;
+        xa.k = K;
+        xa.n_embd = E;
+        xa.n_ff = g.n_ff_exp;
+        xa.limit = g.swiglu_exp;
+        if (!x3::win_experts(xa, s)) {
+            err = "glm rows: the grouped EXL3 experts";
+            return false;
+        }
+    } else {
+        mw.xq = S->xq;
+        mw.xq_stride = (size_t) (E / 32) * kQ8;
+        mw.hq = W.whq;
+        mw.part = W.wpart;
+        mw.sh_out = sh_out;
+        mw.out = S->ffn;
+        mw.out_stride = (size_t) E;
+        mw.down_off = Ly.down_off;
+        if (!gf::moe_win_experts(Ly.gu_type, Ly.d_type, mw, s)) {
+            err = "glm rows: the grouped experts (types " + std::to_string(Ly.gu_type) + " / " +
+                  std::to_string(Ly.d_type) + ")";
+            return false;
+        }
+    }
+    // the CPU lane's answers last: the device's experts ran while the host computed the group's merged request
+    if (lane && !empty && md.cpu_seq != nullptr) {
+        if (n > gf::kMaxMvNt) {   // (rows_group keeps n at 8 or fewer; never leave the rows' CPU answers out quietly)
+            err = "glm rows: " + std::to_string(n) + " rows are more than the CPU-lane wait takes";
+            return false;
+        }
+        gf::CpuWaitRows cw;
+        for (int i = 0; i < n; ++i) {
+            const gf::MoeDev m = row_dev(i);
+            cw.seq[i] = m.cpu_seq;
+            cw.ans[i] = m.cpu_ans;
+            cw.out[i] = row_at(S->ffn, E, i);
+        }
+        gf::moe_cpu_wait_rows(cw, n, E, s);
     }
     return true;
 }

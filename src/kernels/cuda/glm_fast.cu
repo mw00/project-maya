@@ -3554,6 +3554,7 @@ struct RouteArgs {
                                 // weights is below this (0: none)
     float miss_skip_w;          // STRATA_GLM_MISS_SKIP_W (prototype): experts not in VRAM whose share of the route's
                                 // weights is below this are left out like skip_from's, at any rank (0: none)
+    int win_rows;               // win / win_n are a batched rows step's row and rows (STRATA_GLM_GROUP_EXPERTS)
     float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
 };
@@ -3699,6 +3700,7 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             rq->error = bad;
             rq->win = a.win;
             rq->win_n = a.win_n;
+            rq->win_rows = a.win_rows;
             __threadfence_system();
             rq->seq = seq;
             __threadfence_system();
@@ -3901,6 +3903,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         q->cpu_mask = s_cpu;
         q->win = a.win;
         q->win_n = a.win_n;
+        q->win_rows = a.win_rows;
+        q->pad_ = 0;
         q->skip_mask = s_skip;
         for (int i = 0; i < 8; ++i) {
             const bool on = i < a.k;   // (the entries past k as the host never reads them: zero)
@@ -5575,12 +5579,13 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int n_ff_sh, void* sh_hq, cudaStream_t s, const float* pred_logits, const float* pred_bias,
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
                int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int near_n, int win,
-               unsigned int* scr_used, int win_n, int disk_skip_from, float disk_skip_w, float miss_skip_w) {
+               unsigned int* scr_used, int win_n, int disk_skip_from, float disk_skip_w, float miss_skip_w,
+               int win_rows) {
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
                 pf_rank > 0 ? pf_rank : k, std::max(0, std::min(near_n, std::min(16, n_expert - k))), win, scr_used,
-                g_skip, win_n, disk_skip_from, disk_skip_w, miss_skip_w};
+                g_skip, win_n, disk_skip_from, disk_skip_w, miss_skip_w, win_rows};
     static const float affinity = [] {
         const char* v = getenv("STRATA_GLM_ROUTE_AFFINITY");
         return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
