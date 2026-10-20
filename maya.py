@@ -3668,7 +3668,15 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     hip = pc.get("backend") == "hip"
     cfg_path = ROOT / ("maya-ds4-hip.json" if hip else "maya-ds4.json")
     old = read_json(cfg_path)
-    args = ["--pack", str(pack), "--max-context", str(ctx), "--tp", "2"]
+    # --tp is the tensor-parallel group: two equal GPUs per group (a GPU without an equal neighbour runs
+    # its layers alone).  On one GPU that group must be the GPU itself: with --tp 2 the prompt path falls
+    # back to 16-token windows, and the chunked path (--threads on there) is what makes prompts fast.
+    # Measured on an RTX 4000 Ada 20 GB, one GPU: --tp 1 --threads on reads a 2.7K-token prompt at
+    # 205 tok/s against 103 with --tp 2, and a 63.8K one at 595 against 571 (decode 10.8 against 8.5).
+    gpus = len(pc["gpus"])
+    args = ["--pack", str(pack), "--max-context", str(ctx), "--tp", str(min(2, gpus))]
+    if gpus <= 1 and "--threads" not in args[:-1]:
+        args += ["--threads", "on"]
     kept = keep_args(old.get("args") or [], args, ("--tp", "--prefill-chunk", "--reserve-mib", "--vram-experts",
                                                     "--cpu-threads", "--threads", "--dspark", "--dspark-conf",
                                                     "--expert-profile"))
