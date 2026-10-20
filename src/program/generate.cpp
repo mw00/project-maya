@@ -47,6 +47,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/core/split_groups.hpp"
+#include "strata/core/prefill_pieces.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -76,6 +77,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <charconv>
@@ -1136,6 +1138,13 @@ static int glm_pack_generate(const Options& o) {
     std::mutex ctl_mu;
     std::map<int, int> ctl;   // rid -> 1 STOP, 2 PAUSE, 3 PAUSE keep
     std::atomic<int> admitting_rid{-1};
+    // STRATA_GLM_PREFILL_INTERLEAVE (strata/core/prefill_pieces.hpp): the other requests decode between the pieces of
+    // a prompt being read, so a STOP / PAUSE for the request being admitted stops its read alone (admit_stop) - not
+    // stop_req, which every decoding request reads as its own.  Off: stop_req as before (nothing decodes meanwhile)
+    static const strata::core::PrefillInterleave interleave =
+        strata::core::prefill_interleave_parse(std::getenv("STRATA_GLM_PREFILL_INTERLEAVE"));
+    std::atomic<bool> admit_stop{false};
+    const auto read_stopped = [&] { return stop_req.load() || admit_stop.load(); };
     std::mutex in_mu;
     std::condition_variable in_cv;
     std::deque<std::string> in_lines;
@@ -1183,7 +1192,10 @@ static int glm_pack_generate(const Options& o) {
                         std::lock_guard<std::mutex> lk(ctl_mu);
                         ctl[rid] = c0 == "STOP" ? 1 : kw == "keep" ? 3 : 2;
                     }
-                    if (rid == admitting_rid.load()) stop_req.store(true);
+                    if (rid == admitting_rid.load()) {
+                        admit_stop.store(true);
+                        if (interleave.tokens == 0) stop_req.store(true);
+                    }
                     continue;
                 }
                 if (l == "PAUSE" || l == "PAUSE keep") {   // keep: the prompt's state is set aside first
@@ -1661,6 +1673,12 @@ static int glm_pack_generate(const Options& o) {
         std::fprintf(stderr, "glm nan guard: %s - this conversation's state is dropped; it is read again from token 0\n",
                      why.c_str());
     };
+    // set by the several-conversation scheduler while it admits a request (STRATA_GLM_PREFILL_INTERLEAVE): the piece the
+    // prompt path reads next (0: the rest of the segment, as before) and what runs between two pieces - 0 go on,
+    // 1 stopped (the request's STOP), 2 failed (prompt_between_err says why; every request ended, the state reset)
+    std::function<size_t()> prompt_piece;
+    std::function<int()> prompt_between;
+    std::string prompt_between_err;
     const auto prep_prompt = [&](const std::vector<int32_t>& prompt, size_t& reuse, const char*& finish,
                                  std::chrono::steady_clock::time_point& t0) -> int {
         // CONVERSATION REUSE (the fast path): the previous prompt's state, saved just before its last token, is
@@ -1763,23 +1781,63 @@ static int glm_pack_generate(const Options& o) {
             for (size_t i = 1; i < prompt.size() && sys_end == 0; ++i)
                 if (prompt[i] == 154827) sys_end = i;   // <|user|>
             size_t at = reuse;   // the next token the prompt path reads
-            bool pok = true;
-            for (size_t si = 0; si <= marks.size() && pok; ++si) {
-                const size_t end = si < marks.size() ? marks[si] : prompt.size() - 1;
+            bool pok = true, between_failed = false;
+            // one call to the next checkpoint mark (or the prompt's last token) - with STRATA_GLM_PREFILL_INTERLEAVE and
+            // requests decoding, a piece of it, and their decode steps between two pieces (prompt_between)
+            size_t mi = 0, seg_start = at;
+            int seg_chunk = 0;   // (exact pieces: the chunk the segment's uncut read takes, from its first piece on)
+            while (pok && at < prompt.size() - 1) {
+                const size_t seg_end = mi < marks.size() ? marks[mi] : prompt.size() - 1;
+                size_t piece = prompt_piece ? prompt_piece() : 0;
+                if (piece > 0 && interleave.exact) {
+                    // whole chunks of the uncut read, each call cut in them: the same arithmetic, the same answer
+                    if (at == seg_start || seg_chunk == 0) seg_chunk = model.prefill_chunk_for((int64_t) (seg_end - seg_start));
+                    piece = strata::core::prefill_aligned_piece(piece, (size_t) seg_chunk);
+                }
+                const size_t end = strata::core::prefill_piece_end(at, seg_end, piece);
+                // (an interleaved piece cut freely (,cut): both GPUs of a split at work - two chunks, or ~4096-token ones
+                // for a larger piece: a call fills and drains the split's pipeline, a GPU idle for a chunk each way)
+                model.prefill_min_chunks = piece > 0 && !interleave.exact ? std::max<int>(2, (int) (piece / 4096)) : 1;
+                model.prefill_force_chunk = seg_chunk > 0 && interleave.exact ? seg_chunk : 0;
                 const std::vector<int32_t> part(prompt.begin() + (long) at, prompt.begin() + (long) end);
                 const size_t base = at - reuse;
                 model.prefill_progress = [&](int64_t done, int64_t total) {
                     (void) total;
                     pp_line(base + (size_t) done);
-                    return !stop_req.load();
+                    return !read_stopped();
                 };
                 pok = model.prefill(part, err, prompt[end]);   // (the NextN block's caches read the next token)
                 model.prefill_progress = nullptr;
+                model.prefill_min_chunks = 1;
+                model.prefill_force_chunk = 0;
                 if (pok) {
                     at = end;
-                    if (si < marks.size()) ckpt_keep(prompt, end);
-                    if (si < marks.size() && end == sys_end) slot_prefix(prompt, end);
+                    if (end == seg_end && mi < marks.size()) {
+                        ckpt_keep(prompt, end);
+                        if (end == sys_end) slot_prefix(prompt, end);
+                        ++mi;
+                        seg_start = end;
+                        seg_chunk = 0;
+                    }
+                    // more to read: the decoding requests' turn (none after the last piece - its last token's logits
+                    // must still be on the tail when the first sample reads them)
+                    if (at < prompt.size() - 1 && prompt_between) {
+                        pp_line(at - reuse);
+                        const int r = prompt_between();
+                        if (r == 1) {
+                            pok = false;
+                            err = "cancelled";
+                        } else if (r == 2) {
+                            pok = false;
+                            between_failed = true;
+                        }
+                    }
                 }
+            }
+            if (between_failed) {   // every context was reset (multi_fail): nothing of this prompt is left to keep
+                drop_if_poisoned(prompt, prompt_between_err);   // (a non-finite error: its slots too, as below)
+                std::printf("ERR %s%s\n", tag.c_str(), prompt_between_err.c_str());
+                return 1;
             }
             // a call the prompt path did not take (fewer tokens than STRATA_GLM_PREFILL_MIN: false, no error) leaves the
             // rest to the token path below - from where the prompt path stopped, not from `reuse`
@@ -1829,7 +1887,7 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("PP %s%zu %zu %.1f %.1f %zu\n", tag.c_str(), i, prompt.size(), ms,
                             (double) (i - reuse) / (ms / 1000.0 + 1e-9), reuse);
             }
-            if (stop_req.load()) { finish = "cancel"; break; }
+            if (read_stopped()) { finish = "cancel"; break; }
         }
         return 0;
     };
@@ -2422,6 +2480,8 @@ static int glm_pack_generate(const Options& o) {
         gens.erase(std::remove_if(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->done; }),
                    gens.end());
         if (gens.empty()) {
+            // (a prompt being read between decode steps keeps a STOP for all: its read ends too)
+            if (admitting_rid.load() >= 0 && stop_req.load()) admit_stop.store(true);
             stop_req.store(false);
             if (model.fast()) model.save_usage();   // this machine's expert usage, for the next start's warm-up
         }
@@ -2463,7 +2523,11 @@ static int glm_pack_generate(const Options& o) {
         return true;
     };
     // an engine error in the middle: every running request gets it, the sequences are reset
+    uint64_t multi_fails = 0;      // (a prompt read between decode steps sees one happen: STRATA_GLM_PREFILL_INTERLEAVE)
+    std::string multi_fail_why;
     const auto multi_fail = [&](const std::string& why) {
+        ++multi_fails;
+        multi_fail_why = why;
         for (auto& gp : gens) {
             if (gp->done) continue;
             if (why.find("non-finite") != std::string::npos)   // the slots it may have come from (drop_if_poisoned)
@@ -2485,6 +2549,9 @@ static int glm_pack_generate(const Options& o) {
         }
         gen_sweep();
     };
+    // the decode steps between two pieces of a prompt being read in context read_ctx (STRATA_GLM_PREFILL_INTERLEAVE;
+    // set below, after multi_step): prompt_between's 0 / 1 / 2
+    std::function<int(int)> interleave_round;
     const auto gen_admit = [&](int rid, const std::vector<int64_t>& ids, int64_t max_new,
                                const strata::kernels::SamplerParams& rq) {
         if (!multi_drain() || !resolve_ready()) {
@@ -2566,17 +2633,39 @@ static int glm_pack_generate(const Options& o) {
         ctxs[(size_t) best].busy = true;
         g->ctx = best;
         tag = std::to_string(rid) + " ";
+        // STRATA_GLM_PREFILL_INTERLEAVE: while other requests decode, the prompt in pieces with their steps between
+        // (text prompts only: a prompt's image rows are the driver's globals while it is read)
+        if (interleave.tokens > 0 && !cur_img_pos.empty() && !gens.empty())
+            std::fprintf(stderr, "glm multi: request %d's prompt has images: read whole, not in pieces "
+                                 "(MAYA_GLM_PREFILL_INTERLEAVE is for text prompts)\n", rid);
+        if (interleave.tokens > 0 && cur_img_pos.empty()) {
+            // (STRATA_GLM_PREFILL_INTERLEAVE_ALWAYS=1, a test: the pieces with nothing decoding too - to compare with
+            // the prompt read whole, the decode alone)
+            static const bool always = env_num("STRATA_GLM_PREFILL_INTERLEAVE_ALWAYS", 0) != 0;
+            prompt_piece = [&]() -> size_t {
+                for (const auto& gp : gens)
+                    if (!gp->done) return interleave.tokens;
+                return always ? interleave.tokens : 0;   // nothing decodes (any more): the rest in one call, as before
+            };
+            prompt_between = [&, best]() { return interleave_round(best); };
+        }
+        admit_stop.store(false);
         admitting_rid.store(rid);
         const int rc = prep_prompt(g->prompt, g->reuse, g->finish, g->t0);
         admitting_rid.store(-1);
+        prompt_piece = nullptr;
+        prompt_between = nullptr;
         tag.clear();
         if (rc != 0) {
             ctxs[(size_t) best].busy = false;
+            admit_stop.store(false);
             std::lock_guard<std::mutex> lk(ctl_mu);   // (a STOP for it that came during its prompt: nothing to stop now)
             ctl.erase(rid);
             return;
         }
-        if (stop_req.exchange(false)) g->finish = "cancel";   // a STOP <rid> during its prompt
+        // a STOP <rid> during its prompt (with interleave: admit_stop alone)
+        const bool stopped_all = stop_req.exchange(false), stopped_this = admit_stop.exchange(false);
+        if (stopped_all || stopped_this) g->finish = "cancel";
         g->t1 = std::chrono::steady_clock::now();
         g->st1 = model.fast_stats();
         g->spec_steps0 = model.spec_steps_;
@@ -2635,10 +2724,11 @@ static int glm_pack_generate(const Options& o) {
     };
     // one step of the scheduler: a stint of the speculative path for a request alone, else one token back from the
     // pipelined decode (and every request with a token to feed issued first).  Errors end the running requests.
+    bool step_no_spec = false;   // (between a prompt's pieces: the speculative stint runs until input comes - not there)
     const auto multi_step = [&] {
         std::vector<float> lg;
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
-        if (only != nullptr && !only->inflight && multi_spec && model.spec_ready()) {
+        if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready()) {
             Gen& g = *only;
             bind_ctx(g.ctx);
             if (g.pending >= 0) {   // its last token through the token path: the next one's logits on the tail
@@ -2812,6 +2902,51 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         gen_sweep();
+    };
+
+    // Between two pieces of a prompt being read (STRATA_GLM_PREFILL_INTERLEAVE): `rounds` rounds of the scheduler's own
+    // steps - each until every request running at its start has a token more (or ended) - then every issued token back
+    // (the prompt path needs the GPUs to itself) and the reading context bound again.  The steps are multi_step's, so
+    // a request that ends meanwhile ends as it would (DONE, its pause snapshot), and a STOP for one ends it; an engine
+    // error fails them all (multi_fail resets every context, the one being read too).  The new prompt's own STOP is
+    // admit_stop.  0: go on, 1: the read was stopped, 2: failed (prompt_between_err).
+    interleave_round = [&](int read_ctx) -> int {
+        if (read_stopped()) return 1;
+        if (gens.empty()) return 0;   // (nothing decodes: no sweep either - an empty one clears stop_req)
+        const uint64_t fails0 = multi_fails;
+        const auto failed = [&] {
+            prompt_between_err = "the engine failed while other requests decoded between this prompt's pieces: " +
+                                 multi_fail_why;
+            return 2;
+        };
+        step_no_spec = true;
+        for (int r = 0; r < interleave.rounds && !gens.empty(); ++r) {
+            std::map<int, int64_t> want;   // rid -> the produced count that ends this round for it
+            for (const auto& gp : gens)
+                if (!gp->done) want[gp->rid] = gp->produced + 1;
+            // (bounded: a step takes one token back at least while any request runs)
+            for (int it = 0; it < 4 * (int) want.size() + 8 && !want.empty(); ++it) {
+                multi_step();
+                if (multi_fails != fails0) {
+                    step_no_spec = false;
+                    return failed();
+                }
+                for (auto w = want.begin(); w != want.end();) {
+                    const Gen* g = nullptr;
+                    for (const auto& gp : gens)
+                        if (gp->rid == w->first) g = gp.get();
+                    w = g == nullptr || g->done || g->produced >= w->second ? want.erase(w) : std::next(w);
+                }
+            }
+        }
+        step_no_spec = false;
+        if (!multi_drain()) {
+            multi_fail(err);
+            return failed();
+        }
+        if (std::any_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->done; })) gen_sweep();
+        bind_ctx(read_ctx);
+        return read_stopped() ? 1 : 0;
     };
 
     // STRATA_GLM_MULTI_BENCH=<n>,<prompt>,<gen>[,<boundary rounds>] (needs STRATA_GLM_SEQS >= n): n synthetic

@@ -979,6 +979,16 @@ public:
     /// Called (from any thread) when a chunk has gone through every layer: (positions done, total); false cancels
     /// the prompt (prefill then returns false with err "cancelled" and the sequence must be reset).
     std::function<bool(int64_t, int64_t)> prefill_progress;
+    /// The fewest chunks a split cuts a prompt-path call into (1: as many as the largest chunk needs).  The scheduler's
+    /// interleaved pieces (STRATA_GLM_PREFILL_INTERLEAVE) set 2: a piece no longer than one chunk would run on one GPU
+    /// after the other, two pipeline across the split.
+    int prefill_min_chunks = 1;
+    /// A chunk length to cut a prompt-path call in instead (0: the call's own choice) - with prefill_chunk_for, the
+    /// interleaved pieces keep the chunk boundaries an uncut read takes (the experts' residency per chunk can still
+    /// differ: strata/core/prefill_pieces.hpp)
+    int prefill_force_chunk = 0;
+    /// The chunk length a prompt-path call of n tokens takes (0: no prompt path)
+    int prefill_chunk_for(int64_t n) const;
     /// Debug: every half's sequence state (KDA states + conv histories, DSA caches) to <path>.<half>.bin, with the
     /// per-layer offsets in <path>.<half>.txt - two runs that should agree are compared per layer and component.
     bool dump_state(const std::string& path);

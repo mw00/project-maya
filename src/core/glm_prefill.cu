@@ -4153,6 +4153,18 @@ bool Glm5Model::dump_state(const std::string& path) {
 }
 
 // ---------------------------------------------------------------- the prompt
+int Glm5Model::prefill_chunk_for(int64_t nn) const {   // (prefill's own choice below, prefill_min_chunks 1)
+    if (pf_ == nullptr || nn <= 0) return 0;
+    int Tmax = pf_->T;
+    for (const Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
+        if (m->pf_ == nullptr) return 0;
+        Tmax = std::min(Tmax, m->pf_->T);
+    }
+    const int64_t nchunks = (nn + Tmax - 1) / Tmax;
+    return split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
+                                  : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+}
+
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
     err.clear();
     prefill_next_ = next_token;
@@ -4170,11 +4182,16 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // longer than the largest chunk is cut into EQUAL chunks (the parts of a split pipeline chunks)
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
-    const int64_t nn = (int64_t) tokens.size(), nchunks = (nn + Tmax - 1) / Tmax;
+    const int64_t nn = (int64_t) tokens.size();
+    // (prefill_min_chunks on a split: so many chunks at least, none under 256 tokens)
+    const int64_t nchunks = std::max<int64_t>((nn + Tmax - 1) / Tmax,
+                                              split_next_ == nullptr ? 1
+                                                                     : std::min<int64_t>(prefill_min_chunks, nn / 256));
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
-    const int Trun = split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                            : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    const int Trun = prefill_force_chunk > 0 ? std::min(Tmax, prefill_force_chunk)
+                     : split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
+                                              : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
