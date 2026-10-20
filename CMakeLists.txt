@@ -401,8 +401,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
-  # (a version other than 1 is refused by its number): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test)
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)
