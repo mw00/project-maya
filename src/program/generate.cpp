@@ -3026,6 +3026,20 @@ static int glm_pack_generate(const Options& o) {
         std::printf("  solo :");
         for (int i = 0; i < 12 && i < (int) solo.size(); ++i) std::printf(" %d", solo[(size_t) i]);
         std::printf("\n");
+        // STRATA_GLM_MULTI_DUMP=<file>: every sequence's tokens, a line each (then the solo run's) - two builds' or
+        // settings' runs compared whole, not by their first 12
+        if (const char* dump = getenv("STRATA_GLM_MULTI_DUMP")) {
+            if (std::FILE* f = std::fopen(dump, "w")) {
+                for (int s = 0; s <= n; ++s) {
+                    const std::vector<int>& v = s < n ? out[(size_t) s] : solo;
+                    if (s < n) std::fprintf(f, "seq %d:", s);
+                    else std::fputs("solo:", f);
+                    for (const int t : v) std::fprintf(f, " %d", t);
+                    std::fputc('\n', f);
+                }
+                std::fclose(f);
+            }
+        }
         std::fflush(stdout);
         return 0;
     }
