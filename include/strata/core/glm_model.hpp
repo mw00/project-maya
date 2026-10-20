@@ -164,7 +164,8 @@ public:
     /// on the CPU - 0: the CPU takes every one, 1: none (of f such experts in a route, f - round(share f) go to the
     /// CPU).  pcie_share(): the split in use, as a share; set_pcie_share(s): this split from the next token on, s < 0
     /// the one the engine started with (STRATA_GLM_PCIE_SHARE, else measured at start).  cpu_lane_threads(): the
-    /// threads taking its jobs; set_cpu_lane_threads(n): at most n of the pool's, n <= 0 all of them.  Both are for
+    /// threads taking its jobs; cpu_lane_threads_max(): the pool's size (STRATA_GLM_CPU_LANE_MAX can make it more than
+    /// the lane's own count); set_cpu_lane_threads(n): at most n of the pool's, n <= 0 the lane's own.  These are for
     /// setup's calibration (per request, no restart); false when this engine has no CPU lane.
     double pcie_share() const;
     /// STRATA_GLM_CPU_CAL: once a request (2000+ lane experts a window), drop a calibration decode stays >15% from
@@ -174,6 +175,7 @@ public:
     void lane_retime();
     bool set_pcie_share(double share);
     int cpu_lane_threads() const;
+    int cpu_lane_threads_max() const;
     bool set_cpu_lane_threads(int n);
     /// The decode's disk reads: each expert read from the SSD in 3 x n pieces at once (STRATA_GLM_READ_CHUNKS, 8).
     /// set_read_chunks(n): n (1-16) from the next read on, n <= 0 the engine's own - for setup's calibration (per
