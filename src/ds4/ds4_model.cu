@@ -1070,13 +1070,14 @@ struct Model::Impl {
     // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it
     bool prof_on = std::getenv("DS4_PROF") != nullptr;
     struct ProfMark {
-        const Dev* d;
+        int dev;
         cudaEvent_t ev;
         int stage;
     };
     std::mutex prof_mu;
     std::vector<ProfMark> prof_marks;
-    std::vector<cudaEvent_t> prof_pool;
+    std::vector<std::vector<cudaEvent_t>> prof_pool;   // CUDA events belong to the device that created them
+    bool prof_failed = false;
     bool prof_window = false;   // (decode windows only: T == 1)
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
@@ -1085,33 +1086,108 @@ struct Model::Impl {
     void prof_mark(const Dev& d, int stage) {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
-        cudaEvent_t e = nullptr;
-        if (prof_pool.empty()) cudaEventCreate(&e);
-        else {
-            e = prof_pool.back();
-            prof_pool.pop_back();
+        if (prof_failed) return;
+        if (d.id < 0 || (size_t) d.id >= prof_pool.size()) {
+            std::fprintf(stderr, "ds4: profiling disabled: CUDA device %d is outside the event pool\n", d.id);
+            prof_failed = true;
+            return;
         }
-        cudaEventRecord(e, d.st);
-        prof_marks.push_back({&d, e, stage});
+        cudaError_t ce = cudaSetDevice(d.id);
+        if (ce != cudaSuccess) {
+            std::fprintf(stderr, "ds4: profiling disabled: cudaSetDevice(%d): %s\n", d.id, cudaGetErrorString(ce));
+            prof_failed = true;
+            return;
+        }
+        auto& pool = prof_pool[(size_t) d.id];
+        cudaEvent_t e = nullptr;
+        if (pool.empty()) {
+            ce = cudaEventCreate(&e);
+            if (ce != cudaSuccess) {
+                std::fprintf(stderr, "ds4: profiling disabled: cudaEventCreate on CUDA%d: %s\n", d.id,
+                             cudaGetErrorString(ce));
+                prof_failed = true;
+                return;
+            }
+        } else {
+            e = pool.back();
+            pool.pop_back();
+        }
+        ce = cudaEventRecord(e, d.st);
+        if (ce != cudaSuccess) {
+            std::fprintf(stderr, "ds4: profiling disabled: cudaEventRecord on CUDA%d: %s\n", d.id,
+                         cudaGetErrorString(ce));
+            (void) cudaEventDestroy(e);
+            prof_failed = true;
+            return;
+        }
+        prof_marks.push_back({d.id, e, stage});
     }
     void prof_collect() {
         if (!prof_window && !prof_chunk) return;
         std::lock_guard<std::mutex> lk(prof_mu);
-        std::vector<std::pair<const Dev*, cudaEvent_t>> last;
-        for (const ProfMark& m : prof_marks) {
-            auto it = std::find_if(last.begin(), last.end(), [&](const auto& x) { return x.first == m.d; });
-            if (it != last.end()) {
-                float ms = 0.0f;
-                if (cudaEventElapsedTime(&ms, it->second, m.ev) == cudaSuccess)
-                    (prof_chunk ? cprof_ms : st.prof_ms)[m.stage] += ms;
-                it->second = m.ev;
-            } else {
-                last.push_back({m.d, m.ev});
+        const bool chunk_sample = prof_chunk;
+        bool sample_ok = !prof_failed;
+        double sample_ms[6] = {};
+        std::vector<std::pair<int, cudaEvent_t>> last;
+        int current_dev = -1;
+        if (sample_ok) {
+            for (const ProfMark& m : prof_marks) {
+                if (m.dev < 0 || (size_t) m.dev >= prof_pool.size()) {
+                    std::fprintf(stderr, "ds4: profiling disabled: CUDA device %d is outside the event pool\n", m.dev);
+                    sample_ok = false;
+                    break;
+                }
+                if (current_dev != m.dev) {
+                    const cudaError_t ce = cudaSetDevice(m.dev);
+                    if (ce != cudaSuccess) {
+                        std::fprintf(stderr, "ds4: profiling disabled: cudaSetDevice(%d): %s\n", m.dev,
+                                     cudaGetErrorString(ce));
+                        sample_ok = false;
+                        break;
+                    }
+                    current_dev = m.dev;
+                }
+                auto it = std::find_if(last.begin(), last.end(), [&](const auto& x) { return x.first == m.dev; });
+                if (it != last.end()) {
+                    float ms = 0.0f;
+                    const cudaError_t ce = cudaEventElapsedTime(&ms, it->second, m.ev);
+                    if (ce != cudaSuccess) {
+                        std::fprintf(stderr, "ds4: profiling disabled: cudaEventElapsedTime on CUDA%d: %s\n", m.dev,
+                                     cudaGetErrorString(ce));
+                        sample_ok = false;
+                        break;
+                    }
+                    sample_ms[m.stage] += ms;
+                    it->second = m.ev;
+                } else {
+                    last.push_back({m.dev, m.ev});
+                }
             }
         }
-        for (const ProfMark& m : prof_marks) prof_pool.push_back(m.ev);
-        prof_marks.clear();
-        if (!prof_chunk) ++st.prof_tokens;
+        if (sample_ok) {
+            double* total = chunk_sample ? cprof_ms : st.prof_ms;
+            const int stages = chunk_sample ? 4 : 6;
+            for (int i = 0; i < stages; ++i) total[i] += sample_ms[i];
+            for (const ProfMark& m : prof_marks) prof_pool[(size_t) m.dev].push_back(m.ev);
+            prof_marks.clear();
+            if (!chunk_sample) ++st.prof_tokens;
+            return;
+        }
+        prof_failed = true;
+        std::vector<ProfMark> retry;
+        current_dev = -1;
+        for (const ProfMark& m : prof_marks) {
+            if (m.dev < 0 || (size_t) m.dev >= prof_pool.size()) continue;
+            if (current_dev != m.dev) {
+                if (cudaSetDevice(m.dev) != cudaSuccess) {
+                    retry.push_back(m);
+                    continue;
+                }
+                current_dev = m.dev;
+            }
+            (void) cudaEventDestroy(m.ev);
+        }
+        prof_marks = std::move(retry);
     }
     void dump_layer(Dev& d, const float* h, int il, int64_t p0, int T) {
         std::vector<float> v((size_t) T * g.hc * g.dim);
@@ -1149,6 +1225,14 @@ struct Model::Impl {
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
         for (size_t i = 0; i < ram_chunks.size(); ++i) os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
+        for (size_t di = 0; di < prof_pool.size(); ++di) {
+            if (cudaSetDevice((int) di) != cudaSuccess) continue;
+            for (cudaEvent_t e : prof_pool[di]) (void) cudaEventDestroy(e);
+        }
+        for (const ProfMark& m : prof_marks) {
+            if (m.dev < 0 || (size_t) m.dev >= prof_pool.size()) continue;
+            if (cudaSetDevice(m.dev) == cudaSuccess) (void) cudaEventDestroy(m.ev);
+        }
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
@@ -1703,6 +1787,7 @@ struct Model::Impl {
         if (ids.empty())
             for (int i = 0; i < ndev; ++i) ids.push_back(i);
         devs.resize(ids.size());
+        if (prof_on) prof_pool.resize((size_t) ndev);
         for (size_t i = 0; i < ids.size(); ++i) {
             Dev& d = devs[i];
             d.id = ids[i];
