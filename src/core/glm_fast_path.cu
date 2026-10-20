@@ -3742,7 +3742,8 @@ void Glm5Model::lane_retime() {
         const unsigned long long plan = lane_plan(c_ms, F->cpu_p_ms, &tab);
         const double was = F->rt_c_ms;
         F->rt_c_ms = c_ms;
-        if (plan == 0ull || plan == F->cpu_plan_start) continue;   // (a lane that would stop stays: the CPU may recover)
+        if (plan == F->cpu_plan_start) continue;
+        // Zero sends every miss over PCIe. Keep the pool alive for explicit per-request tuning.
         F->cpu_plan = F->cpu_plan_start = plan;   // (the next route reads it; set_pcie_share(-1) restores this one)
         ++F->rt_changes;
         std::fprintf(stderr, "glm fast: CUDA%d CPU lane timed again in decode: an expert %.3f ms (planned with %.3f) "
