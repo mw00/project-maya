@@ -1173,7 +1173,11 @@ static int glm_pack_generate(const Options& o) {
                     std::istringstream ls(l);
                     std::string c0, kw;
                     int rid = -1;
-                    ls >> c0 >> rid >> kw;
+                    ls >> c0 >> rid;
+                    // (no request id there: nothing to stop - a negative one would match admitting_rid's idle -1 and
+                    // set the global stop, which every running request reads as its own)
+                    if (ls.fail() || rid < 0) continue;
+                    ls >> kw;
                     {
                         std::lock_guard<std::mutex> lk(ctl_mu);
                         ctl[rid] = c0 == "STOP" ? 1 : kw == "keep" ? 3 : 2;
@@ -2481,7 +2485,9 @@ static int glm_pack_generate(const Options& o) {
     const auto gen_admit = [&](int rid, const std::vector<int64_t>& ids, int64_t max_new,
                                const strata::kernels::SamplerParams& rq) {
         if (!multi_drain() || !resolve_ready()) {
-            multi_fail(err);
+            const std::string why = err;
+            multi_fail(why);
+            std::printf("ERR %d %s\n", rid, why.c_str());   // (this request too: its client would wait forever)
             return;
         }
         auto g = std::make_unique<Gen>();
@@ -2563,6 +2569,8 @@ static int glm_pack_generate(const Options& o) {
         tag.clear();
         if (rc != 0) {
             ctxs[(size_t) best].busy = false;
+            std::lock_guard<std::mutex> lk(ctl_mu);   // (a STOP for it that came during its prompt: nothing to stop now)
+            ctl.erase(rid);
             return;
         }
         if (stop_req.exchange(false)) g->finish = "cancel";   // a STOP <rid> during its prompt
