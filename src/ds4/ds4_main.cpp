@@ -26,6 +26,12 @@
 #include <string>
 #include <thread>
 #include <vector>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#include <cerrno>
+#endif
 
 namespace {
 
@@ -74,7 +80,8 @@ void usage() {
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
 
-// stdin lines on a thread, so a request can see STOP while it decodes
+// stdin lines on a thread, so a request can see STOP while it decodes.  read(2), not std::cin - glibc's exit()
+// flushes stdio and waits on stdin's lock, which getline holds while it waits for input (the GLM serve's pattern)
 struct Lines {
     std::mutex mu;
     std::condition_variable cv;
@@ -83,8 +90,32 @@ struct Lines {
     std::atomic<bool> stop{false};
     void start() {
         std::thread([this] {
-            std::string l;
-            while (std::getline(std::cin, l)) {
+            std::string l, buf;
+            char chunk[4096];
+            auto getline_fd = [&](std::string& out) -> bool {
+                for (;;) {
+                    const size_t nlpos = buf.find('\n');
+                    if (nlpos != std::string::npos) {
+                        out.assign(buf, 0, nlpos);
+                        buf.erase(0, nlpos + 1);
+                        return true;
+                    }
+#if defined(_WIN32)
+                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
+                    const ssize_t n = ::read(0, chunk, sizeof chunk);
+                    if (n < 0 && errno == EINTR) continue;
+#endif
+                    if (n <= 0) {
+                        if (buf.empty()) return false;
+                        out.swap(buf);
+                        buf.clear();
+                        return true;
+                    }
+                    buf.append(chunk, (size_t) n);
+                }
+            };
+            while (getline_fd(l)) {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
