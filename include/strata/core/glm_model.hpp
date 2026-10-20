@@ -987,6 +987,14 @@ public:
     /// interleaved pieces keep the chunk boundaries an uncut read takes (the experts' residency per chunk can still
     /// differ: strata/core/prefill_pieces.hpp)
     int prefill_force_chunk = 0;
+    /// STRATA_GLM_PREFILL_GAPS (strata/core/prefill_gaps.hpp; set by the several-conversation scheduler while it reads
+    /// a prompt with other requests decoding): a split's read calls prefill_gap at a chunk boundary, from the thread
+    /// that called prefill(), with every part idle (each part's stream synchronized, no part started on its next
+    /// chunk) and the pool's tail still lent - when prefill_gap_wanted() says there is something to decode.  The
+    /// other sequences' batched rows run there (never the bound sequence, never a tier boundary).  0: go on, 1: stop
+    /// the read (err "cancelled"), 2: fail it (err "the decode between the prompt's chunks failed").  Null: no gaps.
+    std::function<bool()> prefill_gap_wanted;
+    std::function<int()> prefill_gap;
     /// The chunk length a prompt-path call of n tokens takes (0: no prompt path)
     int prefill_chunk_for(int64_t n) const;
     /// Debug: every half's sequence state (KDA states + conv histories, DSA caches) to <path>.<half>.bin, with the

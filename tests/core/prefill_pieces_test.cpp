@@ -1,8 +1,15 @@
-// prefill_pieces (STRATA_GLM_PREFILL_INTERLEAVE): the pieces a prompt is read in - every token once, in order, no piece
-// but a whole segment shorter than the minimum.  CPU only.
+// prefill_pieces (STRATA_GLM_PREFILL_INTERLEAVE) and prefill_gaps (STRATA_GLM_PREFILL_GAPS): the pieces a prompt is
+// read in - every token once, in order, no piece but a whole segment shorter than the minimum - and the decode gaps of
+// a pipelined read - every part idle in a gap, every chunk read once in order by every part, no deadlock.  CPU only.
+#include "strata/core/prefill_gaps.hpp"
 #include "strata/core/prefill_pieces.hpp"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -24,6 +31,76 @@ std::vector<size_t> walk(size_t from, size_t end, const std::vector<size_t>& mar
         at = e;
     }
     return out;
+}
+// a pipelined read of nc chunks over np parts with prefill_run's protocol (hand-off through two slots, the gaps'
+// gate): true when every part read every chunk in order and no part was at work during a gap; gaps: the boundaries
+// that get one (a bit per boundary, all when -1)
+bool pipeline(int np, int nc, long long gaps, int* n_gaps) {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<int> produced((size_t) np, 0), consumed((size_t) np, 0);
+    strata::core::PipelineGaps G(np, nc);
+    std::atomic<int> busy{0};
+    std::atomic<bool> bad{false};
+    std::vector<std::vector<int>> order((size_t) np);
+    const auto work = [&](int k, int c) {
+        busy.fetch_add(1);
+        std::this_thread::sleep_for(std::chrono::microseconds(200 + 150 * ((k + c) % 3)));
+        order[(size_t) k].push_back(c);
+        busy.fetch_sub(1);
+    };
+    const auto hand_on = [&](int k, int c) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&] { return consumed[(size_t) k] >= c - 1; });
+        produced[(size_t) k] = c + 1;
+        cv.notify_all();
+    };
+    std::vector<std::thread> later;
+    for (int k = 1; k < np; ++k)
+        later.emplace_back([&, k] {
+            for (int c = 0; c < nc; ++c) {
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return produced[(size_t) k - 1] > c && G.may_start(k, c); });
+                    consumed[(size_t) k - 1] = c + 1;
+                    cv.notify_all();
+                }
+                work(k, c);
+                if (k + 1 < np) hand_on(k, c);
+                std::lock_guard<std::mutex> lk(mu);
+                G.finished[(size_t) k] = c + 1;
+                cv.notify_all();
+            }
+        });
+    *n_gaps = 0;
+    for (int c = 0; c < nc; ++c) {
+        work(0, c);
+        hand_on(0, c);
+        if (c + 1 < nc) {
+            if (gaps < 0 || ((gaps >> c) & 1)) {
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return G.all_idle(c); });
+                }
+                // the gap: nobody at work, and nobody starts meanwhile
+                for (int i = 0; i < 3; ++i) {
+                    if (busy.load() != 0) bad = true;
+                    std::this_thread::sleep_for(std::chrono::microseconds(300));
+                }
+                ++*n_gaps;
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            G.released = c;
+            cv.notify_all();
+        }
+    }
+    for (auto& t : later) t.join();
+    bool ok = !bad.load();
+    for (int k = 0; k < np; ++k) {
+        ok = ok && (int) order[(size_t) k].size() == nc;
+        for (int c = 0; ok && c < nc; ++c) ok = order[(size_t) k][(size_t) c] == c;
+    }
+    return ok;
 }
 }  // namespace
 
@@ -69,6 +146,37 @@ int main() {
     expect(prefill_aligned_piece(2048, 8128) == 8128, "exact: one whole chunk at least");
     expect(prefill_aligned_piece(16384, 8128) == 16256, "exact: two chunks");
     expect(prefill_aligned_piece(2048, 0) == 2048, "no chunk: as asked");
+    // the decode gaps' setting
+    using strata::core::prefill_gaps_parse;
+    expect(prefill_gaps_parse(nullptr).percent == 0 && prefill_gaps_parse("0").percent == 0, "gaps unset / 0: off");
+    expect(prefill_gaps_parse("25").percent == 25 && prefill_gaps_parse("25").max_ms == 4000.0, "gaps 25");
+    expect(prefill_gaps_parse("95").percent == 90, "gaps: 90% at most");
+    expect(prefill_gaps_parse("20,1500").max_ms == 1500.0, "gaps: the longest gap");
+    using strata::core::prefill_gap_budget_ms;
+    expect(prefill_gap_budget_ms(prefill_gaps_parse("20"), 2800.0) == 700.0, "a 20% gap after a 2.8 s stage: 0.7 s");
+    expect(prefill_gap_budget_ms(prefill_gaps_parse("50,1000"), 2800.0) == 1000.0, "the cap");
+    expect(prefill_gap_budget_ms(prefill_gaps_parse("0"), 2800.0) == 0.0, "off: none");
+    // the gaps' gate: part k starts chunk c after boundary c + k - 1, none past the last
+    {
+        strata::core::PipelineGaps G(2, 4);
+        expect(G.may_start(1, 0) == false && G.all_idle(0), "boundary 0: part 1 waits, nothing to wait for");
+        G.released = 0;
+        expect(G.may_start(1, 0) && !G.may_start(1, 1) && !G.all_idle(1), "after boundary 0: chunk 0 only");
+        G.finished[1] = 1;
+        expect(G.all_idle(1), "boundary 1: part 1 has read chunk 0");
+        expect(G.may_start(1, 3), "the last chunk: no boundary after part 0's last");
+    }
+    {
+        int n = 0;
+        bool ok = true;
+        for (int np = 2; np <= 3; ++np)
+            for (int nc = 1; nc <= 7; ++nc) {
+                ok = ok && pipeline(np, nc, -1, &n) && n == (nc > 0 ? nc - 1 : 0);
+                ok = ok && pipeline(np, nc, 0, &n) && n == 0;
+                ok = ok && pipeline(np, nc, 0x5, &n);
+            }
+        expect(ok, "pipelined reads with gaps: every chunk in order, every part idle in a gap");
+    }
     if (fails == 0) std::printf("prefill_pieces_test: all passed\n");
     return fails == 0 ? 0 : 1;
 }
