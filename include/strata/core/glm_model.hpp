@@ -580,7 +580,7 @@ public:
         float* ffn;
     };
     bool fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias, bool& pf_pending,
-                          std::string& err);
+                          std::string& err, bool rows = false);   // rows: a batched step's row (STRATA_GLM_SKIP_EMPTY)
     void fast_service();
     // gate / up / down of one expert from the shards (or its chunk-th of n_chunks pieces)
     void fast_read_part(int il, int e, int role, uint8_t* blob, int chunk = 0, int n_chunks = 1);

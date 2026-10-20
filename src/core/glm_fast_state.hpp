@@ -533,8 +533,23 @@ struct Glm5Model::FastState {
     // (a promotion only adds), so it is set there (check_resident) and holds until the next one.
     // STRATA_GLM_RESIDENT_SKIP=0 launches them anyway (A/B); on by default on AMD only (glmfast::on_by_default_on_amd).
     bool all_resident = false;
+    // STRATA_GLM_SKIP_EMPTY=1: the same per layer for the batched rows (glm_rows.cu; the token path keeps the rule
+    // above, its layers' launches are in its graphs' key) - layer_res[il]: every expert of layer il in VRAM as of the
+    // last boundary, so its routes leave out the wait, the fetch and the CPU lane's wait.  Off: empty.
+    std::vector<uint8_t> layer_res;
+    bool layer_resident(int il) const { return (size_t) il < layer_res.size() && layer_res[(size_t) il] != 0; }
     void check_resident(int l0, int lt, int n_expert) {
         static const bool on = glmfast::on_by_default_on_amd("STRATA_GLM_RESIDENT_SKIP");
+        if (glmfast::skip_empty_on()) {
+            layer_res.assign(L.size(), 0);
+            for (int il = l0; il < lt; ++il) {
+                if (!L[(size_t) il].moe) continue;
+                const int* so = slot_of.data() + (size_t) il * n_expert;
+                bool all = true;
+                for (int e = 0; e < n_expert && all; ++e) all = so[e] >= 0;
+                layer_res[(size_t) il] = all ? 1 : 0;
+            }
+        }
         bool all = on;
         for (int il = l0; il < lt && all; ++il) {
             if (!L[(size_t) il].moe) continue;

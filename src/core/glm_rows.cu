@@ -421,7 +421,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             for (int i = 0; i < n; ++i) {
                 const MoeIo io = {rows(S->x, E, i), rows_q(S->xq, E, i), rows(S->rlog, g.n_expert, i),
                                   rows(S->sh_g, FFs, i), rows(S->sh_u, FFs, i), rows(S->ffn, E, i)};
-                if (!fast_moe_experts(il, io, false, 0, no_bias, pf_pending, err)) return false;
+                if (!fast_moe_experts(il, io, false, 0, no_bias, pf_pending, err, true)) return false;
             }
         }
     }

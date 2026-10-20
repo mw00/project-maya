@@ -4028,6 +4028,86 @@ __global__ void __launch_bounds__(256) moe_fetch_kernel(MoeDev d, int k, size_t 
     }
 }
 
+// moe_wait + moe_fetch in one launch (STRATA_GLM_SKIP_EMPTY, the batched rows): block 0 waits for the host's answer to
+// the route's disk misses (when it had any) and applies it as moe_wait does, then hands the misses' sources to the
+// other blocks through fetch_src and a reset wait_seq (device memory: they spin on L2, not on the host over PCIe); every
+// block then copies its share of each entry with a source, as moe_fetch does.  A route with neither (most of them)
+// costs one near-empty launch instead of two launches and the gap between them.
+__global__ void __launch_bounds__(256) moe_wait_fetch_kernel(MoeDev d, int n_embd, int k, size_t n16) {
+    __shared__ unsigned int s_need;
+    __shared__ unsigned long long s_src[8];
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        s_need = *(volatile unsigned int*) d.wait_seq;
+        __threadfence();   // (0 read after block 0's reset: its fetch_src writes are seen below)
+    }
+    __syncthreads();
+    if (s_need != 0u) {
+        if (blockIdx.x == 0) {
+            const MoeResponse* r = (const MoeResponse*) d.resp;
+            if (tid == 0) {
+                const long long t0 = clock64();   // bounded like moe_wait (~60 s)
+                while (((volatile const MoeResponse*) r)->seq != s_need) {
+                    if (clock64() - t0 > (1ll << 36)) break;
+                }
+                __threadfence_system();
+            }
+            __syncthreads();
+            const unsigned int pm = ((volatile const MoeResponse*) r)->ptr_mask;
+            if (tid < 8 && (pm >> tid) & 1u) d.fetch_src[tid] = ((volatile const MoeResponse*) r)->ptr[tid];
+            const int nu = ((volatile const MoeResponse*) r)->n_upd;
+            for (int u = tid; u < nu && u < 64; u += blockDim.x)
+                d.tab[((volatile const MoeResponse*) r)->upd_key[u]] = ((volatile const MoeResponse*) r)->upd_val[u];
+            if (((volatile const MoeResponse*) r)->cpu) {
+                for (int e = tid; e < n_embd; e += blockDim.x)
+                    d.cpu_part[e] = ((volatile const MoeResponse*) r)->cpu_part[e];
+                if (tid == 0) *d.cpu_flag = 1;
+            }
+            __threadfence();
+            __syncthreads();
+            if (tid == 0) *(volatile unsigned int*) d.wait_seq = 0u;   // (the next route sets it again)
+        } else if (tid == 0) {
+            // the grid is one block an SM, all resident at once: block 0 runs while the others spin
+            const long long t0 = clock64();
+            while (*(volatile unsigned int*) d.wait_seq == s_need) {
+                if (clock64() - t0 > (1ll << 36)) break;
+            }
+            __threadfence();
+        }
+        __syncthreads();
+    }
+    if (tid < 8) s_src[tid] = tid < k ? ((volatile const unsigned long long*) d.fetch_src)[tid] : 0ull;
+    __syncthreads();
+    for (int i = 0; i < k; ++i) {
+        const unsigned long long src = s_src[i];
+        if (src == 0ull) continue;
+        const uint4* s = (const uint4*) src;
+        uint4* t = (uint4*) d.plan_ptr[i];
+        for (size_t j = blockIdx.x * (size_t) blockDim.x + threadIdx.x; j < n16; j += (size_t) gridDim.x * blockDim.x)
+            t[j] = s[j];
+    }
+}
+
+// a batched step's CPU-lane answers, one block a row (moe_cpu_wait_kernel's, n launches in one)
+__global__ void moe_cpu_wait_rows_kernel(CpuWaitRows w, int n_embd) {
+    __shared__ unsigned int s_need;
+    const int r = blockIdx.x, tid = threadIdx.x;
+    if (tid == 0) s_need = *w.seq[r];
+    __syncthreads();
+    if (s_need == 0) return;
+    const CpuAnswer* a = (const CpuAnswer*) w.ans[r];
+    if (tid == 0) {
+        const long long t0 = clock64();   // bounded like moe_wait (~60 s)
+        while (a->seq != s_need) {
+            if (clock64() - t0 > (1ll << 36)) break;
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    float* out = w.out[r];
+    for (int e = tid; e < n_embd; e += blockDim.x) out[e] += ((volatile const CpuAnswer*) a)->part[e];
+}
+
 constexpr int GU_ROWS = 32;   // h values (gate rows = up rows) per block: one q8_1 block of h
 constexpr int GU_WARPS = 16;  // ... 2 gate + 2 up rows per warp (8 per warp measured 90 vs 65 us a layer: occupancy)
 
@@ -5560,6 +5640,24 @@ void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
     }
     moe_fetch_kernel<<<sms, 256, 0, s>>>(d, k, (blob_bytes + 15) / 16);
     launch_check("moe_fetch");
+}
+
+void moe_wait_fetch(const MoeDev& d, int n_embd, int k, size_t blob_bytes, cudaStream_t s) {
+    static int sms = 0;
+    if (sms == 0) {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+        if (sms <= 0) sms = 80;
+    }
+    moe_wait_fetch_kernel<<<sms, 256, 0, s>>>(d, n_embd, k, (blob_bytes + 15) / 16);
+    launch_check("moe_wait_fetch");
+}
+
+void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) {
+    if (n < 1 || n > kMaxMvNt) return;
+    moe_cpu_wait_rows_kernel<<<n, 256, 0, s>>>(w, n_embd);
+    launch_check("moe_cpu_wait_rows");
 }
 
 #if defined(STRATA_USE_HIP)

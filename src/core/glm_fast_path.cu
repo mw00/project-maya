@@ -5164,7 +5164,7 @@ bool Glm5Model::fast_moe(int il, bool& pf_pending, std::string& err, bool cpu_wa
 }
 
 bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, const float* const* ah_bias,
-                                 bool& pf_pending, std::string& err) {
+                                 bool& pf_pending, std::string& err, bool rows) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -5224,7 +5224,14 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     // in VRAM is then pulled over PCIe into its slot, and all 8 run from VRAM.  With every expert in VRAM
     // (all_resident) neither can happen and both launches are left out: an empty launch and its gap were
     // ~2.5 ms of a 54 ms Maya-S token on the 8065S (moe_wait 1.8 + moe_fetch 0.7 in STRATA_GLM_PROF)
-    if (!F->all_resident) {
+    // STRATA_GLM_SKIP_EMPTY=1, a batched step's row (glm_rows.cu - the token path's launches are its graphs'): the
+    // same per layer (FastState::layer_res: a layer whose every expert is in VRAM), and elsewhere the wait and the
+    // fetch as one launch (gf::moe_wait_fetch): a batched step makes these launches once a row and layer, mostly empty
+    const bool skip_empty = rows && glmfast::skip_empty_on();
+    const bool empty = F->all_resident || (skip_empty && F->layer_resident(il));
+    if (!empty && skip_empty) {
+        gf::moe_wait_fetch(md, g.n_embd, g.n_exp_used, Ly.blob, s);
+    } else if (!empty) {
         gf::moe_wait(md, g.n_embd, s);
         if (F->prof_on) F->mark("moe_wait");
         gf::moe_fetch(md, g.n_exp_used, Ly.blob, s);
@@ -5266,7 +5273,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     if (F->prof_on) F->mark("moe_down");
     }
     // the CPU lane's experts last: the device's own down rows ran while the CPU worked (none: all in VRAM)
-    if (lane && !F->all_resident && !moe_defer_wait_) {
+    if (lane && !empty && !moe_defer_wait_) {
         gf::moe_cpu_wait(md, g.n_embd, io.ffn, s);
         if (F->prof_on) F->mark("moe_cpu_wait");
     }
