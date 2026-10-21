@@ -3,9 +3,12 @@
 //  - hc_rows over n rows (each its own args, partials and counter) against hc() for each row alone: R_new, pre, post,
 //    comb, x and xq, with and without a previous block's output to fold in;
 //  - kda_layers over n rows of one layer (each its own conv state, recurrent state, scratch and gated output) against
-//    kda_prep + kda_rec for each row alone: the conv outputs, g1 / g2, both states and the q8_1 output.
+//    kda_prep + kda_rec for each row alone: the conv outputs, g1 / g2, both states and the q8_1 output;
+//  - mv_nt for 2 .. kMaxMvNt activations (past 8: in groups of 8) against mv() for each activation alone, BF16 and
+//    Q8_0 weights.
 #include "strata/kernels/glm_fast.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -243,6 +246,53 @@ void test_kda(int n) {
     }
 }
 
+// ---- mv_nt == mv per activation
+std::vector<uint8_t> q8_0_rows(int rows, int n_in) {   // random Q8_0 rows (FP16 scale + 32 int8 a block)
+    std::vector<uint8_t> v((size_t) rows * (size_t) (n_in / 32) * 34);
+    std::uniform_real_distribution<float> sc(0.001f, 0.02f);
+    std::uniform_int_distribution<int> q(-127, 127);
+    for (size_t b = 0; b < v.size(); b += 34) {
+        const __half h = __float2half(sc(g_rng));
+        std::memcpy(&v[b], &h, 2);
+        for (int i = 0; i < 32; ++i) v[b + 2 + (size_t) i] = (uint8_t) (int8_t) q(g_rng);
+    }
+    return v;
+}
+void test_mv_nt(int nt) {
+    constexpr int N_IN = 4096, N_OUT = 1024, Q8_0 = 8;
+    const size_t xq_row = (size_t) (N_IN / 32) * 36;
+    float* xf = fdev(rnd((size_t) nt * N_IN, -1.0f, 1.0f));
+    uint8_t* xq = dev<uint8_t>((size_t) nt * xq_row);
+    gf::quantize_q8_1(xf, xq, nt * N_IN, nullptr);   // (each activation's blocks follow the one before)
+    const void* w[2] = {fdev(rnd_bf16((size_t) N_OUT * N_IN, 0.05f)), fdev(q8_0_rows(N_OUT, N_IN))};
+    const int type[2] = {gf::kTypeBF16, Q8_0};
+    float* y_ref[2] = {dev<float>((size_t) nt * N_OUT), dev<float>((size_t) nt * N_OUT)};
+    float* y_nt[2] = {dev<float>((size_t) nt * N_OUT), dev<float>((size_t) nt * N_OUT)};
+    gf::MvJob jobs[2];
+    for (int k = 0; k < 2; ++k) {
+        jobs[k] = {w[k], xq, xf, y_nt[k], nullptr, 1.0f, type[k], N_IN, N_OUT};
+        for (int t = 0; t < nt; ++t) {
+            gf::MvJob one = {w[k], xq + (size_t) t * xq_row, xf + (size_t) t * N_IN, y_ref[k] + (size_t) t * N_OUT,
+                             nullptr, 1.0f, type[k], N_IN, N_OUT};
+            if (!gf::mv(&one, 1, nullptr)) {
+                std::fprintf(stderr, "FAIL: mv refused type %d\n", type[k]);
+                ++g_fail;
+                return;
+            }
+        }
+    }
+    if (!gf::mv_nt(jobs, 2, nt, nullptr)) {
+        std::fprintf(stderr, "FAIL: mv_nt refused %d activations\n", nt);
+        ++g_fail;
+        return;
+    }
+    CK(cudaDeviceSynchronize());
+    for (int k = 0; k < 2; ++k)
+        for (int t = 0; t < nt; ++t)
+            same(k == 0 ? "mv_nt (BF16)" : "mv_nt (Q8_0)", nt, t, back(y_ref[k] + (size_t) t * N_OUT, N_OUT).data(),
+                 back(y_nt[k] + (size_t) t * N_OUT, N_OUT).data(), (size_t) N_OUT * 4);
+}
+
 }  // namespace
 
 int main() {
@@ -256,6 +306,9 @@ int main() {
         test_hc(rows, true);
         test_kda(rows);
     }
-    if (g_fail == 0) std::printf("glm_rows_kernels_test: ok (hc_rows, kda_layers; 2, 3 and %d rows)\n", gf::kMaxMvNt);
+    for (int nt = 2; nt <= gf::kMaxMvNt; ++nt) test_mv_nt(nt);
+    if (g_fail == 0)
+        std::printf("glm_rows_kernels_test: ok (hc_rows, kda_layers: 2, 3 and %d rows; mv_nt: 2 .. %d activations)\n",
+                    gf::kMaxMvNt, gf::kMaxMvNt);
     return g_fail == 0 ? 0 : 1;
 }

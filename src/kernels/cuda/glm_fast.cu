@@ -5278,6 +5278,49 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
     if (!exl3_jobs(jobs, n, nt, done, s)) return false;   // (EXL3: one EXL3 job an activation)
+    if (nt > 8) {
+        // more activations than the kernels take (a verify window's rows, STRATA_GLM_MULTI_MTP): the rest in groups of
+        // 8 - each activation's output is mv()'s for it alone either way (the EXL3 jobs above took all nt at once)
+        for (int base = 0; base < nt; base += 8) {
+            const int w = std::min(8, nt - base);
+            MvJob part[kMaxMvJobs];
+            bool pd[kMaxMvJobs] = {};
+            int m = 0;
+            for (int i = 0; i < n; ++i) {
+                part[i] = jobs[i];
+                pd[i] = done[i];
+                if (done[i]) continue;
+                ++m;
+                if (part[i].xq != nullptr)
+                    part[i].xq = (const uint8_t*) jobs[i].xq + (size_t) base * (jobs[i].n_in / 32) * sizeof(block_q8_1);
+                if (part[i].xf != nullptr) part[i].xf = jobs[i].xf + (size_t) base * jobs[i].n_in;
+                part[i].y = jobs[i].y + (size_t) base * jobs[i].n_out;
+            }
+            if (m == 0) break;
+            if (w == 1) {
+                MvJob one[kMaxMvJobs];
+                int k = 0;
+                for (int i = 0; i < n; ++i)
+                    if (!pd[i]) one[k++] = part[i];
+                if (!mv(one, k, s)) return false;
+                continue;
+            }
+#if defined(STRATA_USE_HIP)
+            if (typed) mv_rdna(part, n, w, pd, s);
+#endif
+            switch (w) {
+                case 2: mv_nt_launch<2>(part, n, typed, pd, s); break;
+                case 3: mv_nt_launch<3>(part, n, typed, pd, s); break;
+                case 4: mv_nt_launch<4>(part, n, typed, pd, s); break;
+                case 5: mv_nt_launch<5>(part, n, typed, pd, s); break;
+                case 6: mv_nt_launch<6>(part, n, typed, pd, s); break;
+                case 7: mv_nt_launch<7>(part, n, typed, pd, s); break;
+                default: mv_nt_launch<8>(part, n, typed, pd, s); break;
+            }
+        }
+        launch_check("mv_nt");
+        return true;
+    }
 #if defined(STRATA_USE_HIP)
     if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
 #endif
@@ -5422,6 +5465,32 @@ void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps
     kda_prep_layers_kernel<<<dim3(prep[0].n_head, 11, n), 128, 0, s>>>(pb);
     kda_rec_layers_kernel<<<dim3(prep[0].n_head, n), 256, 0, s>>>(rb);
     launch_check("kda_layers");
+}
+
+__global__ void __launch_bounds__(256) kda_gather_kernel(const STRATA_GRID_CONSTANT KdaGatherArgs a) {
+    const int i = blockIdx.x;
+    float* d = a.dst[i];
+    if (d == nullptr) return;
+    const size_t T = (size_t) a.tmax, t = (size_t) a.t[i], DI = (size_t) a.di, HD = (size_t) a.hd;
+    // (the layout of glm_window.cu's kda_in)
+    float* to[6] = {d + t * DI, d + (T + t) * DI, d + (2 * T + t) * DI, d + 3 * T * DI + t * HD,
+                    d + 3 * T * DI + (T + t) * HD, d + 3 * T * DI + 2 * T * HD + t * (size_t) a.nh};
+    const int w[6] = {a.di, a.di, a.di, a.hd, a.hd, a.nh};
+#pragma unroll
+    for (int p = 0; p < 6; ++p) {
+        const float* from = a.src[p] + (size_t) i * (size_t) w[p];
+        for (int e = threadIdx.x; e < w[p]; e += blockDim.x) to[p][e] = from[e];
+    }
+}
+
+void kda_gather(const KdaGatherArgs& a, cudaStream_t s) {
+    if (a.n_rows <= 0) return;
+    if (a.n_rows > kMaxMvNt) {
+        std::fprintf(stderr, "glm_fast kda_gather: %d rows (at most %d)\n", a.n_rows, kMaxMvNt);
+        return;
+    }
+    kda_gather_kernel<<<a.n_rows, 256, 0, s>>>(a);
+    launch_check("kda_gather");
 }
 
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {

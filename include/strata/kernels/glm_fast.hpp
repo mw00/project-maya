@@ -49,7 +49,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 constexpr int kMaxMvNt = 8;
 /// mv() for nt activations at once (nt <= kMaxMvNt; 1 = mv()), the jobs' ncol 1: each job's xq / xf hold nt activations
 /// one after another (n_in values each) and its y nt outputs (n_out each).  Output t is bit for bit what mv() gives
-/// for activation t alone, and each weight row is read from memory once for all of them.
+/// for activation t alone, and each weight row is read from memory once for all of them (more than 8 activations: once
+/// for each group of 8, EXL3 weights once for all).
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s);
 /// Whether mv() serves this weight type.
 bool mv_supported(int type);
@@ -149,6 +150,17 @@ struct KdaRecArgs {
     void* out = nullptr;   // the gated output (q8_1, kda_rec's out_q8_1); null: the state only (a commit's replay)
 };
 void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps, cudaStream_t s);
+/// The batched rows' KDA inputs kept for a verify window's commit (STRATA_GLM_MULTI_MTP): row i's q | k | v projections
+/// (d_inner each), f_a, g_a (head_dim each) and beta (n_head) - read from src[0..5] at row i (rows di / hd / nh apart) -
+/// into its conversation's record at dst[i] in the verify window's layout (glm_window.cu's kda_in: each piece tmax
+/// rows, row t[i] of it).  dst[i] null: row i is not kept.  One launch for every row of a layer.
+struct KdaGatherArgs {
+    const float* src[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    float* dst[kMaxMvNt] = {};
+    int t[kMaxMvNt] = {};
+    int n_rows = 0, tmax = 0, di = 0, hd = 0, nh = 0;
+};
+void kda_gather(const KdaGatherArgs& a, cudaStream_t s);
 
 /// DSA, after the first projections: q_a norm (-> qr f32 + q8_1), kv_a norm into the latent cache
 /// at position p, the indexer key's layer norm into its cache, the compressor gate into its cache,

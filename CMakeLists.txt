@@ -299,7 +299,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME glm_moe_rows_test COMMAND glm_moe_rows_test)
     set_tests_properties(glm_moe_rows_test PROPERTIES TIMEOUT 60)
   endif()
-  # the batched rows' one-launch kernels (hc_rows, kda_layers over the rows) against the per-row kernels, bitwise
+  # the batched rows' one-launch kernels (hc_rows, kda_layers over the rows, mv_nt) against the per-row kernels, bitwise
   # (random inputs, no model)
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
     add_executable(glm_rows_kernels_test tests/glm_rows_kernels_test.cu)
