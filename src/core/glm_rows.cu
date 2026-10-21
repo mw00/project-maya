@@ -15,6 +15,11 @@
 // Each part's row activations live in its own arena (rows_alloc, at load, before the expert pool takes the rest of the
 // card); the per-row scratch the token path's kernels use in between (the conv outputs, the gates, the DSA scores and
 // cells, the experts' h) is the token path's own, used by one row after the other on that part's stream.
+//
+// STRATA_GLM_ROWS_BATCH=1: the residual mixing (mHC) and the KDA recurrence of all the rows in one launch each instead
+// of one a row (gf::hc_rows, gf::kda_layers over the rows) - each row with its own scratch (rows_alloc) and the same
+// device functions as the per-row kernels, so its arithmetic is meant to be theirs (glm_rows_kernels_test compares
+// them bitwise).
 #include "glm_fast_state.hpp"
 
 #include "strata/kernels/exl3.hpp"
@@ -33,6 +38,13 @@ namespace strata::core {
 namespace {
 constexpr int kQ8 = 36;   // bytes per q8_1 block
 size_t up256(size_t b) { return (b + 255u) & ~(size_t) 255u; }
+bool rows_batch_on() {   // STRATA_GLM_ROWS_BATCH=1 (off by default)
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_ROWS_BATCH");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
 const float* image_row_in(const std::vector<int64_t>& pos, const std::vector<float>& rows, int64_t p, int n_embd) {
     const auto it = std::lower_bound(pos.begin(), pos.end(), p);
     if (it == pos.end() || *it != p) return nullptr;
@@ -60,6 +72,12 @@ struct Glm5Model::RowsState {
     uint8_t* head_xq = nullptr;
     float* logits = nullptr;
     int* tok = nullptr;
+    // STRATA_GLM_ROWS_BATCH: each row's own copies of the token path's KDA scratch (F->conv, F->g1, F->g2) and hc
+    // partials / barrier counter (F->part, F->counter)
+    float* kconv[3] = {nullptr, nullptr, nullptr};
+    float *kg1 = nullptr, *kg2 = nullptr, *hc_part = nullptr;
+    uint8_t* hc_ctr = nullptr;
+    int64_t hc_part_n = 0;
     int* tok_h = nullptr;   // pinned
     cudaEvent_t ev_done = nullptr;
 };
@@ -131,6 +149,14 @@ bool Glm5Model::rows_alloc(std::string& err) {
         S->head_xq = q8(E);
         S->logits = f32(g.n_vocab);
         S->tok = (int*) take(sizeof(int));
+        if (rows_batch_on()) {   // (STRATA_GLM_ROWS_BATCH's own per-row scratch: none with the setting off)
+            for (auto& p : S->kconv) p = f32(DI);
+            S->kg1 = f32(DI);
+            S->kg2 = f32(DI);
+            S->hc_part_n = (4 * E / 512) * 26 + 64;   // (as the token path's F->part)
+            S->hc_part = f32(S->hc_part_n);
+            S->hc_ctr = take(64);
+        }
     };
     carve();   // the sizes
     cudaSetDevice(dev_);
@@ -263,6 +289,10 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
     };
     const float* no_bias[gf::kAhead] = {nullptr, nullptr, nullptr, nullptr};
     bool pf_pending = false;   // (no prefetch in a batched step)
+    const bool batch = rows_batch_on() && n > 1;
+    // (kda_layers is built for head_dim 128, as the window commit's replay: else the KDA one row at a time)
+    const bool kda_batch = batch && g.kda_head_dim == 128;
+    gf::HcArgs hb[gf::kMaxMvNt];
     for (int il = l0_; il < l1_; ++il) {
         const auto& Ly = F->L[(size_t) il];
         gf::HcArgs h;
@@ -283,7 +313,13 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             h.comb = rows(S->comb, 16, i);
             h.x = rows(S->x, E, i);
             h.xq = rows_q(S->xq, E, i);
-            gf::hc(h, s);
+            if (!batch) {
+                gf::hc(h, s);
+                return;
+            }
+            hb[i] = h;   // (launched for all the rows at once: hc_rows)
+            hb[i].part = rows(S->hc_part, S->hc_part_n, i);
+            hb[i].counter = (unsigned int*) (S->hc_ctr + (size_t) i * 64);   // (take(64): 64 bytes a row)
         };
         // ---- the attention-side read (fused with the previous FFN's write), per row
         h.w_fn = Ly.hc_attn_fn;
@@ -294,6 +330,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             hc_row(i, il == l0_ ? nullptr : rows(S->ffn, E, i));
             if (il != l0_) std::swap(rw[i].Rc, rw[i].Ro);
         }
+        if (batch) gf::hc_rows(hb, n, s);
 
         if (Ly.recr) {
             gf::MvJob j[6];
@@ -304,12 +341,14 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             j[4] = {Ly.g_a, nullptr, S->x, S->ga, nullptr, 1.0f, gf::kTypeBF16, E, g.kda_head_dim};
             j[5] = {Ly.beta, nullptr, S->x, S->beta, nullptr, 1.0f, gf::kTypeBF16, E, g.n_head};
             if (!mv(j, 6, "kda projections")) return false;
+            gf::KdaPrepArgs kp[gf::kMaxMvNt];
+            gf::KdaRecArgs kr[gf::kMaxMvNt];
             for (int i = 0; i < n; ++i) {
                 gf::KdaPrepArgs k;
                 for (int c = 0; c < 3; ++c) {
                     k.proj[c] = rows(S->proj[c], DI, i);
                     k.conv_w[c] = Ly.conv[c];
-                    k.out[c] = F->conv[c];
+                    k.out[c] = kda_batch ? rows(S->kconv[c], DI, i) : F->conv[c];
                 }
                 k.conv_state = rw[i].state + (*rw[i].kda_conv)[(size_t) il];
                 k.fa = rows(S->fa, g.kda_head_dim, i);
@@ -319,16 +358,30 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
                 k.dt_bias = Ly.dt_bias;
                 k.ssm_a = Ly.ssm_a;
                 k.lower_bound = g.kda_lb;
-                k.g1 = F->g1;
-                k.g2 = F->g2;
+                k.g1 = kda_batch ? rows(S->kg1, DI, i) : F->g1;
+                k.g2 = kda_batch ? rows(S->kg2, DI, i) : F->g2;
                 k.n_head = g.n_head;
                 k.head_dim = g.kda_head_dim;
                 k.d_conv = g.d_conv;
+                if (kda_batch) {   // (both kernels for all the rows below: kda_layers)
+                    kp[i] = k;
+                    kr[i].q = k.out[0];
+                    kr[i].k = k.out[1];
+                    kr[i].v = k.out[2];
+                    kr[i].g1 = k.g1;
+                    kr[i].beta_raw = rows(S->beta, g.n_head, i);
+                    kr[i].state = rw[i].state + (*rw[i].kda_S)[(size_t) il];
+                    kr[i].g2 = k.g2;
+                    kr[i].norm_w = Ly.ssm_norm;
+                    kr[i].out = rows_q(S->gated_q, DI, i);
+                    continue;
+                }
                 gf::kda_prep(k, s);
                 gf::kda_rec(F->conv[0], F->conv[1], F->conv[2], F->g1, rows(S->beta, g.n_head, i),
                             rw[i].state + (*rw[i].kda_S)[(size_t) il], F->g2, Ly.ssm_norm, g.norm_eps, g.n_head,
                             g.kda_head_dim, rows_q(S->gated_q, DI, i), s);
             }
+            if (kda_batch) gf::kda_layers(kp, kr, n, g.norm_eps, s);
             gf::MvJob o = {Ly.out.q, S->gated_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, DI, E};
             if (!mv(&o, 1, "kda output")) return false;
         } else {
@@ -407,6 +460,7 @@ bool Glm5Model::rows_layers(RowSeq* rw, int n, std::string& err) {
             hc_row(i, rows(S->mixer, E, i));
             std::swap(rw[i].Rc, rw[i].Ro);
         }
+        if (batch) gf::hc_rows(hb, n, s);
 
         if (!Ly.moe) {
             gf::MvJob j[2];

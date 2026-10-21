@@ -2454,11 +2454,11 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const STRATA_GRID_CONST
 // (8 bf16 per lane per stream segment, uint4) BEFORE it computes its R values, the partial sums are reduced by whole
 // warps (lane = block) instead of one thread walking 32 of them, and the second barrier's total likewise.
 // 32 blocks of 128 embedding values; n_embd == 4096 only.
-__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+// (block b of nb; the kernel's body, one row's or - hc3_rows_kernel - each row's own blocks: grid y is the row)
+__device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb, const int b) {
     const int hc = 4;
     const int n_embd = a.n_embd;
-    const unsigned int nb = gridDim.x;   // 32
-    const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int e0 = b * HC2_EB;
     unsigned long long* ctr = (unsigned long long*) a.counter;
     __shared__ float sR[4][HC2_EB];
@@ -2572,6 +2572,18 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONST
         a.x[e] = xv;
         q8_1_store_warp(xv, (block_q8_1*) a.xq + e / 32, lane);
     }
+}
+__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+    hc3_block(a, gridDim.x, blockIdx.x);   // 32 blocks
+}
+// STRATA_GLM_ROWS_BATCH: the rows of a batched decode step in one launch - row y's blocks are hc3_kernel's for its
+// args (its own partials and barrier counter): the same block function, so each row's arithmetic is meant to be the
+// one-row kernel's (glm_rows_kernels_test compares them bitwise)
+struct HcBatch {
+    HcArgs a[kMaxMvNt];
+};
+__global__ void __launch_bounds__(HC_THREADS) hc3_rows_kernel(const STRATA_GRID_CONSTANT HcBatch rb) {
+    hc3_block(rb.a[blockIdx.y], gridDim.x, blockIdx.x);
 }
 
 __global__ void hc_post_kernel(const float* __restrict__ block_out, const float* __restrict__ R_old,
@@ -2746,7 +2758,7 @@ struct KdaRecBatch {
 };
 __global__ void __launch_bounds__(256) kda_rec_layers_kernel(const STRATA_GRID_CONSTANT KdaRecBatch b) {
     const KdaRecArgs& r = b.a[blockIdx.y];
-    kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, nullptr, blockIdx.x);
+    kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, (block_q8_1*) r.out, blockIdx.x);
 }
 
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
@@ -5287,13 +5299,19 @@ void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
     launch_check("quantize");
 }
 
-void hc(const HcArgs& a, cudaStream_t s) {
-    // the grid-barrier kernel needs every block resident at once; checked once per process (and per device count
-    // of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).
+// hc's kernel: the grid-barrier kernel needs every block resident at once; checked once per process (and per device
+// count of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).  cap_rows: how many
+// hc3_rows_kernel blocks the CURRENT device can hold resident at once - its own occupancy, not hc3_kernel's (a different
+// parameter block, so its registers can differ), since hc_rows' rows must all be resident for their grid barriers;
+// kept per device (a split's GPUs can differ)
+constexpr int kHcDevs = 64;
+static int hc_mode(const HcArgs& a, int* cap_rows = nullptr) {
     static int mode = -1;
+    static std::atomic<int> caps[kHcDevs];   // per device: its cap + 1 (0: not asked yet)
+    int dev = 0;
+    if (mode < 0 || cap_rows != nullptr) cudaGetDevice(&dev);
     if (mode < 0) {
-        int dev = 0, sms = 0, per = 0, per3 = 0;
-        cudaGetDevice(&dev);
+        int sms = 0, per = 0, per3 = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
@@ -5301,6 +5319,44 @@ void hc(const HcArgs& a, cudaStream_t s) {
         if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && a.n_embd == 4096 && per3 * sms >= a.n_embd / HC2_EB)
             mode = 3;
     }
+    if (cap_rows != nullptr) {
+        int c1 = dev >= 0 && dev < kHcDevs ? caps[dev].load(std::memory_order_relaxed) : 1;   // (past 64: one a row)
+        if (c1 == 0) {
+            int sms = 0, per3r = 0;
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3r, hc3_rows_kernel, HC_THREADS, 0) != cudaSuccess) {
+                cudaGetLastError();
+                per3r = 0;   // (unknown: one launch a row)
+            }
+            c1 = per3r * sms + 1;
+            caps[dev].store(c1, std::memory_order_relaxed);
+        }
+        *cap_rows = c1 - 1;
+    }
+    return mode;
+}
+
+void hc_rows(const HcArgs* a, int n, cudaStream_t s) {
+    if (n <= 0) return;
+    int cap = 0;
+    const int mode = hc_mode(a[0], &cap);
+    const bool one = n > 1 && n <= kMaxMvNt && mode == 3 && a[0].n_embd == 4096 && cap >= n * (a[0].n_embd / HC2_EB);
+    static std::atomic<bool> said[2] = {false, false};   // (each way said once: which one a run takes)
+    if (n > 1 && !said[one ? 1 : 0].exchange(true))
+        std::fprintf(stderr, "glm rows: hc of %d rows %s (hc mode %d, %d blocks resident at most, %d needed) - said once\n",
+                     n, one ? "in one launch" : "one launch a row", mode, cap, n * (a[0].n_embd / HC2_EB));
+    if (one) {
+        HcBatch b;
+        for (int i = 0; i < n; ++i) b.a[i] = a[i];
+        hc3_rows_kernel<<<dim3(a[0].n_embd / HC2_EB, n), HC_THREADS, 0, s>>>(b);
+        launch_check("hc3_rows");
+        return;
+    }
+    for (int i = 0; i < n; ++i) hc(a[i], s);
+}
+
+void hc(const HcArgs& a, cudaStream_t s) {
+    const int mode = hc_mode(a);
     if (mode == 3) {
         hc3_kernel<<<a.n_embd / HC2_EB, HC_THREADS, 0, s>>>(a);
         launch_check("hc3");

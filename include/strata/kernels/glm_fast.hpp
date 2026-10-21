@@ -95,9 +95,15 @@ struct HcArgs {
     float* x = nullptr;               // n_embd f32
     void* xq = nullptr;               // n_embd / 32 q8_1 blocks
     float* part = nullptr;            // scratch: (hc*n_embd / 512) * 25 floats
-    unsigned int* counter = nullptr;  // zero-initialised; the kernel leaves it zero
+    unsigned int* counter = nullptr;  // zero-initialised once: the single-tail kernel leaves it zero; the grid-
+                                      // barrier kernels (hc2 / hc3) only count it up - each barrier waits for the
+                                      // next multiple of the block count, so it needs no reset
 };
 void hc(const HcArgs& a, cudaStream_t s);
+/// n rows' hc (each its own args, partials and counter) in one launch where the grid-barrier kernel can hold them all
+/// resident (n <= kMaxMvNt), else one launch a row; each row runs hc3's block function on its own args, so its
+/// result is meant to be hc()'s (glm_rows_kernels_test compares them bitwise)
+void hc_rows(const HcArgs* a, int n, cudaStream_t s);
 /// The write half alone (the split boundary / the head): R_new = post (x) block_out + comb . R_old.
 void hc_post(const float* block_out, const float* R_old, const float* post, const float* comb, int n_embd,
              float* R_new, cudaStream_t s);
@@ -131,13 +137,16 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
              float* state, const float* g2, const float* norm_w, float eps, int n_head, int head_dim,
              void* out_q8_1, cudaStream_t s);
 /// kda_prep then kda_rec of one token through n <= kKdaLayers recurrent layers at once (two launches; each layer's
-/// arithmetic the one-layer kernels' bit for bit), the states only - no gated output (a window commit's replay).
+/// arithmetic the one-layer kernels' bit for bit), the states only unless rec[i].out (a window commit's replay) - or of
+/// n rows' tokens through one layer (the batched rows, each row its own scratch and output; the same block
+/// functions as kda_prep / kda_rec - glm_rows_kernels_test compares them bitwise).
 /// rec[i]'s q / k / v / g1 / g2: prep[i]'s out[0..2] / g1 / g2
 constexpr int kKdaLayers = 8;
 struct KdaRecArgs {
     const float *q = nullptr, *k = nullptr, *v = nullptr, *g1 = nullptr, *beta_raw = nullptr;
     float* state = nullptr;
     const float *g2 = nullptr, *norm_w = nullptr;
+    void* out = nullptr;   // the gated output (q8_1, kda_rec's out_q8_1); null: the state only (a commit's replay)
 };
 void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps, cudaStream_t s);
 
