@@ -65,6 +65,9 @@ struct Stats {
     int64_t helper_fallback = 0;            // its picks the CPU lane computed instead (after a helper failure)
     int helper_held = 0, helper_dead = 0;   // experts in its pool; 1: it failed (or answered late), the CPU lane took over
     double helper_ms = 0.0;                 // the service thread's waits for the helper's answers, after its own part
+    int64_t hr_hits = 0;                    // DS4_HELPER_RECENT: picks its recent slots served; fills mapped, slots'
+    int64_t hr_maps = 0, hr_evicts = 0;     //   experts let go, fills that failed, fills left unmapped (VRAM took the
+    int64_t hr_fails = 0, hr_abandoned = 0; //   expert meanwhile)
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
