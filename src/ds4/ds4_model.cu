@@ -10013,8 +10013,10 @@ struct Model::Impl {
 
     // (the helper's thread) the recent slots' table updates the last tick made: each changed layer's whole table from
     // its pinned mirror, on the helper's stream - before the next window's takes, which hq queues after this job - then
-    // hr_tab_ev, which the next tick queries before it changes a mirror again.  A failed copy: helper_dead (the CPU
-    // lane computes all its picks from then on, the host's and the helper's tables no longer matter)
+    // hr_tab_ev, waited for here (bounded: a few KB, the helper's stream idle at a window's end) before this thread
+    // enqueues those takes.  A copy not enqueued, or one that did not end cleanly: helper_dead before any of them and
+    // before the tick may look (the host already switched its l.helper - the CPU lane computes all the helper's picks
+    // from then on, so the host's and the device's tables never disagree on a sum)
     void helper_tables() {
         std::vector<int> ls;
         {
@@ -10030,13 +10032,21 @@ struct Model::Impl {
                                        helper_st) == cudaSuccess;
         }
         ok = ok && cudaEventRecord(hr_tab_ev, helper_st) == cudaSuccess;
+        if (ok) {
+            const double t0 = now_ms();
+            cudaError_t q;
+            while ((q = cudaEventQuery(hr_tab_ev)) == cudaErrorNotReady && now_ms() - t0 < kHelperWaitMs) cpu_relax();
+            ok = q == cudaSuccess;
+        }
+        if (!ok) {
+            (void) cudaGetLastError();
+            st.helper_dead = 1;
+            if (!helper_dead.exchange(true))
+                std::fprintf(stderr, "ds4: helper CUDA%d: a launch failed - the CPU lane takes its picks from now on\n",
+                             helper_id);
+        }
         hr_tab_rec.store(true, std::memory_order_release);
         cudaSetDevice(cur);
-        if (ok) return;
-        st.helper_dead = 1;
-        if (!helper_dead.exchange(true))
-            std::fprintf(stderr, "ds4: helper CUDA%d: a launch failed - the CPU lane takes its picks from now on\n",
-                         helper_id);
     }
     // (DS4_HELPER_RECENT, once its pool is in) the fills' stream and events on the helper, the pinned stage (the
     // largest blob of a layer with recent slots), the fill thread
@@ -10155,16 +10165,27 @@ struct Model::Impl {
     // helper's thread.  Every ownership change of an expert - VRAM's (cache_switch, cache_queue, DS4_RECENT's
     // rc_tick), the helper's - happens on this thread, here and in cache_tick around it, so none races another.  A
     // mirror changes only once the last 'tables' job's copies are done (hr_tab_ev): else nothing is mapped or let go
-    // this tick
+    // this tick - or, the query an error, ever
     void hr_tick(int T) {
         if (hr_want <= 0 || helper_n <= 0 || T > kWin || helper_dead.load(std::memory_order_relaxed)) return;
         ++hr_clock;
         bool free_mirrors = hr_tab_rec.load(std::memory_order_acquire);
-        if (free_mirrors) {
+        if (free_mirrors) {   // (not yet done: wait a tick; an error - the device, the copy, the event - helper_dead)
             int cur = 0;
             cudaGetDevice(&cur);
-            free_mirrors = cudaSetDevice(helper_id) == cudaSuccess && cudaEventQuery(hr_tab_ev) == cudaSuccess;
+            cudaError_t q = cudaSetDevice(helper_id);
+            if (q == cudaSuccess) q = cudaEventQuery(hr_tab_ev);
             cudaSetDevice(cur);
+            free_mirrors = q == cudaSuccess;
+            if (!free_mirrors && q != cudaErrorNotReady) {
+                (void) cudaGetLastError();
+                st.helper_dead = 1;
+                if (!helper_dead.exchange(true))
+                    std::fprintf(stderr, "ds4: helper CUDA%d: a launch failed - the CPU lane takes its picks from now "
+                                         "on\n",
+                                 helper_id);
+                return;
+            }
         }
         std::vector<HrFill> done;
         {
