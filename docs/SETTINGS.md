@@ -437,6 +437,16 @@ on are used (`taskset`, a container's cpuset).
 | `--cpu-threads N` (the config's engine `args`) | a thread per core | at most N threads, a thread per core; nothing is measured |
 | `MAYA_DS4_CPU_LANE` | measured | `cores`, `pcores`, `node` or `smt` (a thread per logical CPU): that way, nothing is measured |
 
+## DeepSeek: where the measured hipBLASLt picks are kept (AMD)
+
+On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
+picks in `<pack>/lt-picks.txt`, so later starts reuse them. A pack whose files must not change (one shared between
+installs, or checked by hash before each start) can keep them elsewhere.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LT_STORE` | `<pack>/lt-picks.txt` | the picks in this file instead; empty: none kept, each start measures its own |
+
 ## DeepSeek: the starting expert profile
 
 The engine keeps how often each expert was routed in `<pack>/expert-profile.bin`: at a start the most-routed experts

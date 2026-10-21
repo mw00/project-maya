@@ -2274,7 +2274,11 @@ struct Model::Impl {
         o = opt;
         const double t0 = now_ms();
         if (!pk.load(o.pack, err)) return false;
-        lt::set_store((o.pack + "/lt-picks.txt").c_str());   // (AMD: the prompt GEMMs' measured kernels)
+        // (AMD: the prompt GEMMs' measured kernels) the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's file - empty: none,
+        // each start measures its own and keeps them to itself (a pack that must not change: a run's own store instead)
+        const char* lt_store = std::getenv("STRATA_DS4_LT_STORE");
+        if (lt_store == nullptr) lt_store = std::getenv("DS4_LT_STORE");
+        lt::set_store(lt_store != nullptr ? lt_store : (o.pack + "/lt-picks.txt").c_str());
         g.from(pk);
         if (g.dim == 0 || g.nl == 0 || (int) g.ratios.size() < g.nl) {
             err = o.pack + "/ds4.txt: incomplete geometry";

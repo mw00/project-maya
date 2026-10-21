@@ -15,9 +15,9 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
 
 constexpr int kMinRows = 64;   // (fewer: the BLAS's own GEMV-like kernels)
 
-/// The file the picks are kept in (the pack's lt-picks.txt): each line a GPU kind and hipBLASLt version's kernel for
-/// one shape, read at the first product on a device and taken where it still runs the shape; a new pick is added.
-/// Unset: measured each start.
+/// The file the picks are kept in (the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's): each line a GPU kind and hipBLASLt
+/// version's kernel for one shape, read at the first product on a device and taken where it still runs the shape; a
+/// new pick is added. Unset or empty: measured each start.
 void set_store(const char* path);
 
 }  // namespace strata::ds4::lt
