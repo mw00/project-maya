@@ -47,6 +47,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/core/split_groups.hpp"
+#include "strata/core/prefix_cut.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -1394,6 +1395,9 @@ static int glm_pack_generate(const Options& o) {
         for (auto& fd : found) {
             total += fd.bytes;
             slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock});
+            // a system prompt's state (slot_prefix) goes only as the least recently used, after a restart too: the
+            // .meta has no flag for it, its tokens tell (no user turn)
+            slots.back().prefix = strata::core::is_system_prefix(slots.back().tokens, 154827);
         }
         if (slot_keep) {
             std::ostringstream m;
@@ -1758,10 +1762,17 @@ static int glm_pack_generate(const Options& o) {
                             (double) done / (ms / 1000.0 + 1e-9), reuse);
                 std::fflush(stdout);
             };
-            const std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
-            size_t sys_end = 0;  // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
-            for (size_t i = 1; i < prompt.size() && sys_end == 0; ++i)
-                if (prompt[i] == 154827) sys_end = i;   // <|user|>
+            std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
+            // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
+            const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
+            // without checkpoints (STRATA_GLM_CKPTS=0, the several-conversation scheduler) the read still ends a call
+            // there with the slots on, for slot_prefix: another conversation with this system prompt (a new conversation
+            // of the same client, another request of the same kind) restores it instead of reading it again.
+            // STRATA_GLM_PREFIX_CUT=0: off
+            static const bool prefix_cut_on = env_num("STRATA_GLM_PREFIX_CUT", 1) != 0;
+            if (ckpt_max <= 0 && slot_max > 0 && prefix_cut_on && cur_img_pos.empty())
+                strata::core::add_mark(marks, strata::core::prefix_cut(prompt.data(), prompt.size(), reuse, slot_min,
+                                                                        154827), reuse);
             size_t at = reuse;   // the next token the prompt path reads
             bool pok = true;
             for (size_t si = 0; si <= marks.size() && pok; ++si) {
@@ -1777,7 +1788,8 @@ static int glm_pack_generate(const Options& o) {
                 model.prefill_progress = nullptr;
                 if (pok) {
                     at = end;
-                    if (si < marks.size()) ckpt_keep(prompt, end);
+                    // (no checkpoints: the mark is a prefix cut's only)
+                    if (si < marks.size() && ckpt_max > 0) ckpt_keep(prompt, end);
                     if (si < marks.size() && end == sys_end) slot_prefix(prompt, end);
                 }
             }
