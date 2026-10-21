@@ -9328,6 +9328,13 @@ struct Model::Impl {
         return v != nullptr ? v : std::getenv(name);
     }
     static bool helper_owned(const Layer& l, int e) { return !l.helper.empty() && l.helper[(size_t) e] != nullptr; }
+    // a layer whose CPU-lane picks the helper may take: a GGUF's trunk layer of one GPU - or, with DS4_TP_GGUF_UNEVEN,
+    // of a tensor-parallel group.  A group's helper state (its pool's experts, the table) is member 0's, the Layer the
+    // routing is published from and the service thread answers; its whole-expert sums join the lead's CPU part, added
+    // once before the MoE all-reduce, and never in any member's vram_tab
+    bool helper_layer(const Layer& l) const {
+        return !l.mtp && (l.nm == 1 || tp_uneven) && l.lay.fmt == gg::kFmtMXFP4;
+    }
     // DS4_HELPER_FAIL=flags|pool (tests): that allocation fails as a real one would - the load's error and the teardown
     // of what was made before it
     static bool helper_fail(const char* what) {
@@ -9440,8 +9447,9 @@ struct Model::Impl {
     }
 
     // the pool's experts: the most-routed of those the layer devices left without a VRAM slot (the profile's share of
-    // their layer, as the read-ahead ranks them) on a trunk layer of one device, a GGUF's blob each, until it is full;
-    // each layer's table of them on the helper (load_experts_mx copies them in)
+    // their layer, as the read-ahead ranks them) on a trunk layer of one device - or a group's, with DS4_TP_GGUF_UNEVEN
+    // (helper_layer) - a GGUF's blob each, until it is full; each layer's table of them on the helper (load_experts_mx
+    // copies them in)
     bool helper_select(std::string& err) {
         struct Cand {
             int layer, e;
@@ -9449,7 +9457,7 @@ struct Model::Impl {
         };
         std::vector<Cand> c;
         for (const Layer& l : L) {
-            if (l.mtp || l.nm != 1 || l.lay.fmt != gg::kFmtMXFP4) continue;
+            if (!helper_layer(l)) continue;
             const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
             double sum = 0;
             for (int e = 0; e < l.n_exp; ++e) sum += p[e];
@@ -9500,7 +9508,27 @@ struct Model::Impl {
                   std::to_string(helper_id);
             return false;
         }
+        int tp_layers = 0, tp_experts = 0;
+        for (const Layer& l : L) {
+            for (int m = 1; m < l.nm; ++m) {   // (a group's members other than 0: none of the helper's state)
+                const Layer& x = member(l, m);
+                if (!x.helper.empty() || x.helper_tab != nullptr) {
+                    err = "DS4_HELPER: layer " + std::to_string(l.il) + " member " + std::to_string(m) +
+                          " holds helper state (only member 0 may)";
+                    return false;
+                }
+            }
+            if (l.nm > 1 && !l.helper.empty()) {
+                ++tp_layers;
+                for (int e = 0; e < l.n_exp; ++e) tp_experts += l.helper[(size_t) e] != nullptr;
+            }
+        }
         st.helper_held = helper_n;
+        if (tp_uneven)
+            std::fprintf(stderr,
+                         "ds4: helper CUDA%d: %d of its layers tensor-parallel, %d of its experts theirs - each pick's "
+                         "whole expert added once, on the group's lead before the all-reduce (DS4_TP_GGUF_UNEVEN)\n",
+                         helper_id, tp_layers, tp_experts);
         std::fprintf(stderr,
                      "ds4: helper CUDA%d holds %d experts (%.1f of %.1f GB): %.1f%% of the routing the layer devices' "
                      "VRAM leaves over, by the profile (each layer's share)\n",
@@ -9698,6 +9726,7 @@ struct Model::Impl {
             if (l.helper_tab == nullptr) continue;
             std::string fmt;
             for (int r = 0; r < 3; ++r) fmt += std::string(r ? "/" : "") + gg::type_name(gg::expert_type(l.lay, r));
+            if (l.nm > 1) fmt += " (a group's)";   // (DS4_TP_GGUF_UNEVEN: its lead's, checked apart from one GPU's)
             if (std::find(seen.begin(), seen.end(), fmt) != seen.end()) continue;
             seen.push_back(fmt);
             std::vector<int> own, other;   // (experts it holds; one it does not)
