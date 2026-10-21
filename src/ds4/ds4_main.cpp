@@ -152,6 +152,21 @@ struct Lines {
     }
 };
 
+// DS4_PROF: the GPU's time a decoded token by stage between two snapshots - the CLI's run, or a serve request's
+// decode (one line a request whose decode was profiled, so a caller can count them)
+void prof_line(const strata::ds4::Stats& s0, const strata::ds4::Stats& s) {
+    if (s.prof_tokens <= s0.prof_tokens) return;
+    const double pt = (double) (s.prof_tokens - s0.prof_tokens);
+    double sum = 0;
+    for (int i = 0; i < 6; ++i) sum += (s.prof_ms[i] - s0.prof_ms[i]) / pt;
+    std::fprintf(stderr, "GPU per token (DS4_PROF): %.2f ms - between layers %.2f, attention %.2f, routing + shared "
+                         "expert %.2f, experts gate/up %.2f, waiting for the CPU lane %.2f, down + post %.2f; %lld tokens\n",
+                 sum, (s.prof_ms[0] - s0.prof_ms[0]) / pt, (s.prof_ms[1] - s0.prof_ms[1]) / pt,
+                 (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
+                 (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt,
+                 (long long) (s.prof_tokens - s0.prof_tokens));
+}
+
 // The drafts between two stats: each draft position (1st, 2nd, ..) - how often it was verified with every draft
 // before it kept, and how often it was kept then
 std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats& s1) {
@@ -634,6 +649,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                             : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)
         m.save_profile();
     }
     m.save_profile();
@@ -985,16 +1001,7 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "%s\n", rk.c_str());
     }
-    if (s.prof_tokens > s0.prof_tokens) {   // DS4_PROF
-        const double pt = (double) (s.prof_tokens - s0.prof_tokens);
-        double sum = 0;
-        for (int i = 0; i < 6; ++i) sum += (s.prof_ms[i] - s0.prof_ms[i]) / pt;
-        std::fprintf(stderr, "GPU per token (DS4_PROF): %.2f ms - between layers %.2f, attention %.2f, routing + shared "
-                             "expert %.2f, experts gate/up %.2f, waiting for the CPU lane %.2f, down + post %.2f\n", sum,
-                     (s.prof_ms[0] - s0.prof_ms[0]) / pt, (s.prof_ms[1] - s0.prof_ms[1]) / pt,
-                     (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
-                     (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt);
-    }
+    prof_line(s0, s);   // DS4_PROF
     if (df != nullptr) std::fclose(df);
     }
     m.save_profile();
