@@ -2127,18 +2127,28 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
     archs = meta.get("archs") or pc["archs"]
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
-             f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
-             "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
-             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
-             *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
-    if meta.get("host_compiler"):
-        conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
+             f"-DLLAMA_DIR={llama}"]
+    if pc.get("backend") == "hip":
+        conf += ["-DSTRATA_VISION_HIP=ON",
+                 "-DSTRATA_VISION_HIP_TARGETS=" + ";".join(str(x) for x in archs),
+                 "-DAMDGPU_TARGETS=" + ";".join(str(x) for x in archs),
+                 "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(str(x) for x in archs),
+                 "-DCMAKE_EXE_LINKER_FLAGS=-no-pie"]
+    else:
+        conf += ["-DSTRATA_VISION_CUDA=ON",
+                 "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
+                 f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
+                 *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
+        if meta.get("host_compiler"):
+            conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
-    say("  Compiling the vision encoder (llama.cpp's image library with ggml's CUDA kernels: 10-20 minutes, once) ...")
+    say("  Compiling the vision encoder (llama.cpp's image library with ggml's GPU kernels: 10-20 minutes, once) ...")
     if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)], None,
-                   "build-maya-vision.bat", nvcc=meta.get("nvcc") or pc["nvcc"]):
+                   "build-maya-vision.bat",
+                   nvcc=(None if pc.get("backend") == "hip" else (meta.get("nvcc") or pc.get("nvcc")))):
         return False
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
+                                  "backend": pc.get("backend"),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
     return VEXE.exists()
 
@@ -2148,9 +2158,6 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
     first start how much that is on this GPU (serve/server.py, vision_footprint)."""
     step(7, "images (the vision encoder)")
-    if pc.get("backend") == "hip":
-        ok("HIP port: text only; vision is not enabled")
-        return None
     # a GGUF of your own reads pictures with the same files: the vision tower and the tokenizer are the same in
     # every GLM-5.3-Flash quant
     spec = MODELS.get(quant) or MODELS[next(iter(MODELS))]
