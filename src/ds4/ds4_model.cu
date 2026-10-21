@@ -4889,9 +4889,19 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Pool>> pools_for(const LaneCfg& c) const {
         std::vector<std::unique_ptr<Pool>> out;
         const int svc = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
+        // cores of the first part left free beside the service thread's, for the thread that launches the decode's
+        // kernels (and waits on the device) and whatever else the PC runs.  With every other core a worker spinning
+        // between a token's layers - 19 on a 20-core Core Ultra 7 265K, Windows 11 - that thread waited for a core:
+        // decode 28.3 tok/s, the device waiting 21.4 ms a token for the lane; 18 workers 47.2, 17 workers 55.5.
+        // MAYA_DS4_LANE_FREE: the cores left free (2 by default, 0: as before)
+        static const int lane_free = [] {
+            const char* v = std::getenv("MAYA_DS4_LANE_FREE");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 2;
+        }();
         for (size_t X = 0; X < c.cpus.size(); ++X) {
             std::vector<int> v = c.cpus[X];
             if (X == 0) v.erase(std::remove(v.begin(), v.end(), svc), v.end());   // (the service thread's)
+            if (X == 0 && o.cpu_threads <= 0 && (int) v.size() > lane_free + 1) v.resize(v.size() - (size_t) lane_free);
             int nw = (int) v.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
             out.push_back(std::make_unique<Pool>(nw, v, 20000));   // spin through a token's layers (20 ms)
