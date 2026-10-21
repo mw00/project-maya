@@ -7802,6 +7802,16 @@ struct Model::Impl {
         x3::rows_f16(c.sg, FF, nullptr, T, FF, c.sh16, s);
         if (!gemm(d, c, l.s2, c.sh16, FF, T, c.acc, D, 0.0f, err)) return false;
         prof_mark(d, 2);
+        // the expert stream's copies keep going while the device runs this layer's attention, routing and shared
+        // expert: the next items (this layer's likely experts, queued when the layer before routed) go out as they
+        // are ready and ring slots free, not only once the bounds are back (DS4_FLOW_PUMP_WAIT=0: wait as before)
+        static const bool pump_wait = std::getenv("DS4_FLOW_PUMP_WAIT") == nullptr ||
+                                      std::atoi(std::getenv("DS4_FLOW_PUMP_WAIT")) != 0;
+        if (c.flow && pump_wait)
+            while (cudaStreamQuery(s) == cudaErrorNotReady) {
+                if (!flow_pump(c, err)) return false;
+                std::this_thread::yield();
+            }
         CK(cudaStreamSynchronize(s));
         std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
         if (dump_r != nullptr && mi == 0) {
