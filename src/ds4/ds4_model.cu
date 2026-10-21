@@ -9335,6 +9335,8 @@ struct Model::Impl {
     bool helper_layer(const Layer& l) const {
         return !l.mtp && (l.nm == 1 || tp_uneven) && l.lay.fmt == gg::kFmtMXFP4;
     }
+    // any of the helper's state on a Layer (a group's members other than 0 must hold none)
+    static bool helper_state(const Layer& x) { return !x.helper.empty() || x.helper_tab != nullptr; }
     // DS4_HELPER_FAIL=flags|pool (tests): that allocation fails as a real one would - the load's error and the teardown
     // of what was made before it
     static bool helper_fail(const char* what) {
@@ -9511,8 +9513,7 @@ struct Model::Impl {
         int tp_layers = 0, tp_experts = 0;
         for (const Layer& l : L) {
             for (int m = 1; m < l.nm; ++m) {   // (a group's members other than 0: none of the helper's state)
-                const Layer& x = member(l, m);
-                if (!x.helper.empty() || x.helper_tab != nullptr) {
+                if (helper_state(member(l, m))) {
                     err = "DS4_HELPER: layer " + std::to_string(l.il) + " member " + std::to_string(m) +
                           " holds helper state (only member 0 may)";
                     return false;
