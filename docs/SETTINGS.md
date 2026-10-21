@@ -592,7 +592,7 @@ member's parts as decode runs them, summed on the host and compared with the who
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form |
+| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form; with `MAYA_DS4_HELPER`, the helper takes the group's layers too (on its lead) |
 | `MAYA_DS4_TP_CHECK` | off | `1`: each member's parts checked against the whole expert at load |
 
 A group of two sums its members' partial rows (the attention output's and the MoE's, every layer) by writing its whole
@@ -633,6 +633,11 @@ the picks back to the CPU lane. An expert is summed on the helper instead of the
 the last bits. The DeepSeek counterpart of GLM's `MAYA_GLM_EXPERT_HELPER` (#201). **Linux only (tested); Windows +
 AMD untested** - there AMD's driver starts queued GPU work only when the host waits, so the helper is likely to
 stay silent past the 10 s limit and hand its picks back to the CPU lane.
+
+A tensor-parallel group's layers stay off the helper (their picks on the CPU lane), unless
+`MAYA_DS4_TP_GGUF_UNEVEN=1`: then the helper takes them too, on the group's lead - its pool holds whole experts, the
+lead's requests take them and each pick's sum joins the lead's CPU part once, before the group's all-reduce.
+`MAYA_DS4_HELPER_CHECK` checks such a layer apart from a one-GPU layer of the same format.
 
 | Setting | Default | |
 | --- | --- | --- |
