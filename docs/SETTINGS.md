@@ -623,9 +623,16 @@ tightest member's room), so the tightest member has more left for the trunk. Eac
 itself; between two blocks on different GPUs their rows go through pinned host memory, as a layer split's groups
 hand theirs. The load line names the blocks a GPU holds (`+ blocks 0`).
 
+How many of a block's experts VRAM keeps: on one GPU, all of them as the room goes; on a group of several, once the
+expert profile has seen the drafter, those that take 99% of the block's routes, and more only while its member keeps
+the room of the group's next tightest member - the rest on the CPU lane. `MAYA_DS4_DRAFT_VRAM` sets it instead: each
+block keeps up to that many, the profile's hottest, as the room goes; the rest on the CPU lane, so the trunk keeps the
+room. A request's log then says how many of the drafter's picks took the CPU lane.
+
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_DRAFT_DEV` | off (every block on the lead) | the member each DSpark block runs on: one number for every block, or one a block (`1,0,0`: block 0 on member 1, the others on the lead); 0 is the lead |
+| `MAYA_DS4_DRAFT_VRAM` | off (placed as above) | the most VRAM experts each DSpark block keeps, its profile's hottest: one number for every block, or one a block (`96,48,32`); 0 .. a block's experts (128) |
 
 ## DeepSeek: a helper GPU for the experts VRAM leaves over
 
