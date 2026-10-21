@@ -60,6 +60,7 @@ struct Image {
 struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
+    int64_t draft_experts = 0, draft_cpu = 0;   // ... of them the DSpark blocks', and theirs on the CPU lane
     int64_t stream_experts = 0;             // ... and how many of the others streamed to the GPU (the PCIe lane)
     int64_t helper_experts = 0;             // ... and how many of the others the helper GPU computed (DS4_HELPER)
     int64_t helper_fallback = 0;            // its picks the CPU lane computed instead (after a helper failure)

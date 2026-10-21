@@ -1057,6 +1057,7 @@ struct Model::Impl {
     unsigned mk_seq = 0;
     int d_dev = 0;                    // the drafter's first block's device
     std::vector<int> draft_dev;       // DS4_DRAFT_DEV: each block's member of the drafter's group (draft_devs; empty: the lead)
+    std::vector<int> draft_vram;      // DS4_DRAFT_VRAM: each block's VRAM experts at most (draft_caps; empty: all)
     // DS4_FLOW_HELPER=1: the prompt's streamed experts the helper holds in its pool (not its recent slots', which
     // their fills rewrite) copied into staging out of the helper's memory instead of read from the model's files - the
     // same bytes, so the same results; the decode is not touched.  DS4_FLOW_HELPER_CHECK=N: the load's first N prompt
@@ -5226,6 +5227,50 @@ struct Model::Impl {
         return true;
     }
 
+    // the most VRAM experts layer l keeps: a DSpark block DS4_DRAFT_VRAM's (draft_caps), every other layer all
+    int vram_cap(const Layer& l) const {
+        return l.mtp && !draft_vram.empty() ? std::min(l.n_exp, draft_vram[(size_t) (l.il - g.nl)]) : l.n_exp;
+    }
+    // MAYA_DS4_DRAFT_VRAM=n, or n0,n1,.. a block (read as STRATA_DS4_DRAFT_VRAM, or DS4_DRAFT_VRAM): the most VRAM
+    // experts each DSpark block keeps - its profile's hottest (place_experts' order), the rest on the CPU lane - so the
+    // trunk takes the room; one value: every block.  Unset: placed as before.  Not whole numbers 0 .. the block's
+    // experts, a count of values neither 1 nor the blocks', or no blocks (--dspark none): the load fails
+    bool draft_caps(std::string& err) {
+        draft_vram.clear();
+        const char* v = ds4_env("DS4_DRAFT_VRAM");
+        if (v == nullptr) return true;
+        std::vector<long> n;
+        bool ok = *v != '\0';
+        long cur = -1;
+        for (const char* q = v; ok; ++q) {
+            if (*q >= '0' && *q <= '9') {
+                cur = (cur < 0 ? 0 : cur * 10) + (*q - '0');
+                ok = cur <= 1000000;
+            } else if ((*q == ',' || *q == '\0') && cur >= 0) {
+                n.push_back(cur);
+                cur = -1;
+                if (*q == '\0') break;
+            } else {
+                ok = false;
+            }
+        }
+        ok = ok && g.n_mtp > 0 && (n.size() == 1 || n.size() == (size_t) g.n_mtp);
+        for (int i = 0; ok && i < g.n_mtp; ++i) {
+            const long c = n[n.size() == 1 ? 0 : (size_t) i];
+            ok = c <= L[(size_t) (g.nl + i)].n_exp;
+            if (ok) draft_vram.push_back((int) c);
+        }
+        if (!ok) {
+            draft_vram.clear();
+            err = std::string("DS4_DRAFT_VRAM=") + v + ": " +
+                  (g.n_mtp == 0 ? std::string("no DSpark blocks loaded (--dspark none)")
+                                : "not one whole number, or one a block (" + std::to_string(g.n_mtp) + "), each 0 .. " +
+                                      std::to_string(g.d_n_exp));
+            return false;
+        }
+        return true;
+    }
+
     bool place_experts(std::string& err) {
         // a mixed-precision quant (layers with experts in several layouts): every expert of those layers
         // in VRAM, in its class's arena - one GPU, no lending of the experts' room (the prompt path keeps its own)
@@ -5295,6 +5340,7 @@ struct Model::Impl {
         for (const Dev& d : devs)
             if (commit_charged(d)) room = commit_room();
         const double room0 = room;
+        if (!draft_caps(err)) return false;   // (DS4_DRAFT_VRAM: the blocks' caps, before any is placed)
         // per group: what its tightest member has left (each member holds its part of every VRAM expert of the
         // group's layers, its unit bytes a slot - counted at the members' mean: an uneven split's odd blocks go round
         // the members layer by layer, so each member's total comes to about the mean's)
@@ -5360,11 +5406,12 @@ struct Model::Impl {
             for (const Layer& l : L)
                 if (l.grp == (int) gi && l.mtp && l.n_cls == 1)
                     for (int e = 0; e < l.n_exp; ++e) dseen = dseen || prof[(size_t) l.il * g.n_exp + e] > 0;
-            if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {   // all of them, as room goes
-                for (Layer& l : L)
+            // (DS4_DRAFT_VRAM: each block's hottest up to its cap, as room goes - the profile's rule below not asked)
+            if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr || !draft_vram.empty()) {
+                for (Layer& l : L)   // all of them, as room goes (DS4_DRAFT_VRAM: up to vram_cap)
                     if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
                         double& r = mroom[bm(l)];
-                        l.n_vram = std::min(l.n_exp, (int) std::floor(r / (double) ucount(l)));
+                        l.n_vram = std::min(vram_cap(l), (int) std::floor(r / (double) ucount(l)));
                         r -= (double) l.n_vram * ucount(l);
                     }
             } else {
@@ -5788,6 +5835,11 @@ struct Model::Impl {
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
         }
+        for (const Layer& l : L)   // (DS4_DRAFT_VRAM: what each block kept - its slots, the cache's spare among them)
+            if (l.mtp && !draft_vram.empty())
+                std::fprintf(stderr, "ds4: DSpark block %d: %d of its %d experts' slots in VRAM, at most %d "
+                                     "(DS4_DRAFT_VRAM), the profile's hottest; the rest on the CPU lane\n",
+                             l.il - g.nl, l.n_slots, l.n_exp, vram_cap(l));
         return true;
     }
 
@@ -10853,6 +10905,7 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
+                    if (l.mtp) st.draft_cpu += nslots;
                 }
                 if (lc >= 0) lane_answer(ln_cls[(size_t) lc], lt);
                 if (hon) {
@@ -15345,6 +15398,7 @@ struct Model::Impl {
                 }
             }
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
+            if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
@@ -15436,6 +15490,7 @@ struct Model::Impl {
         }
         st.experts += (int64_t) T * l.k_exp;
         st.cpu_experts += nslots;
+        if (l.mtp) st.draft_experts += (int64_t) T * l.k_exp, st.draft_cpu += nslots;
         if (nrows > 0) {
             gather_rows(d.x, ga, nrows, D, d.xe, s);
             x3::MvJob j[2 * kWin * kPicks];
