@@ -15,6 +15,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -127,8 +128,10 @@ struct EgBatch {
 class EgReader {
 public:
     ~EgReader() { stop(); }
-    void start(const std::vector<std::string>& paths, int threads) {
+    /// direct[i]: file i read unbuffered (Windows, a file nothing maps: os::open_unbuffered), else buffered
+    void start(const std::vector<std::string>& paths, int threads, std::vector<char> direct = {}) {
         paths_ = paths;
+        direct_ = std::move(direct);
         for (int i = 0; i < threads; ++i) th_.emplace_back([this] { loop(); });
     }
     void stop() {
@@ -139,6 +142,9 @@ public:
         cv_.notify_all();
         for (auto& t : th_) t.join();
         th_.clear();
+        if (check_n_.load() > 0)
+            std::fprintf(stderr, "ds4 Engram check (DS4_EG_CHECK): %lld rows read unbuffered, %lld differed from a buffered read\n",
+                         (long long) check_n_.load(), (long long) check_bad_.load());
     }
     int threads() const { return (int) th_.size(); }
     void submit(EgBatch& b) {
@@ -171,7 +177,9 @@ public:
 private:
     void loop() {
         std::vector<os::fd_t> fds(paths_.size(), os::kBadFd);   // this thread's own handles, opened on first use
-        std::vector<uint8_t> buf;
+        std::vector<os::fd_t> ufds(paths_.size(), os::kBadFd);  // (and its unbuffered ones)
+        std::vector<uint8_t> buf, abuf(3 * os::kDirectAlign);
+        uint8_t* al = abuf.data() + (os::kDirectAlign - (uintptr_t) abuf.data() % os::kDirectAlign) % os::kDirectAlign;
         for (;;) {
             Job job;
             {
@@ -182,7 +190,7 @@ private:
                 q_.pop_front();
             }
             EgBatch& b = *job.b;
-            for (int i = job.i0; i < job.i1; ++i) b.ok[(size_t) i] = read(fds, b.reads[(size_t) i], buf) ? 1 : 0;
+            for (int i = job.i0; i < job.i1; ++i) b.ok[(size_t) i] = read(fds, ufds, al, b.reads[(size_t) i], buf) ? 1 : 0;
             const int64_t t = now_ns();
             for (int64_t prev = b.t1.load(); t > prev && !b.t1.compare_exchange_weak(prev, t);) {
             }
@@ -192,8 +200,32 @@ private:
             }
         }
         for (os::fd_t f : fds) os::close_fd(f);
+        for (os::fd_t f : ufds) os::close_fd(f);
     }
-    bool read(std::vector<os::fd_t>& fds, const EgRead& r, std::vector<uint8_t>& buf) {
+    bool read(std::vector<os::fd_t>& fds, std::vector<os::fd_t>& ufds, uint8_t* al, const EgRead& r,
+              std::vector<uint8_t>& buf) {
+        if (r.mx8 && r.file >= 0 && (size_t) r.file < direct_.size() && direct_[(size_t) r.file] &&
+            os::direct_span(r.off, r.n) <= 2 * os::kDirectAlign) {
+            os::fd_t& u = ufds[(size_t) r.file];
+            if (u == os::kBadFd) u = os::open_unbuffered(paths_[(size_t) r.file]);
+            if (u != os::kBadFd && os::pread_unbuffered(u, al, r.n, r.off)) {
+                const uint8_t* src = al + r.off % os::kDirectAlign;
+                static const bool check = std::getenv("DS4_EG_CHECK") != nullptr;   // (each row read buffered too)
+                if (check) {
+                    std::vector<uint8_t> ref(r.n);
+                    os::fd_t& f2 = fds[(size_t) r.file];
+                    if (f2 == os::kBadFd) f2 = os::open_ro(paths_[(size_t) r.file]);
+                    const bool ok = f2 != os::kBadFd && os::pread_full(f2, ref.data(), r.n, r.off);
+                    if (!ok || std::memcmp(ref.data(), src, r.n) != 0) ++check_bad_;
+                    ++check_n_;
+                }
+                for (uint32_t k = 0; k < r.n / 33; ++k) {   // [scale, 32 codes] -> codes | scales
+                    r.scales[k] = src[(size_t) k * 33];
+                    std::memcpy(r.dst + (size_t) k * 32, src + (size_t) k * 33 + 1, 32);
+                }
+                return true;
+            }   // (else buffered, below)
+        }
         auto fd = [&](int file) {
             if (file < 0 || file >= (int) fds.size()) return os::kBadFd;
             if (fds[(size_t) file] == os::kBadFd) fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
@@ -217,6 +249,10 @@ private:
     }
 
     std::vector<std::string> paths_;
+    std::vector<char> direct_;
+
+public:
+    std::atomic<int64_t> check_n_{0}, check_bad_{0};   // (DS4_EG_CHECK: rows compared, rows that differed)
     std::vector<std::thread> th_;
     std::mutex mu_;
     std::condition_variable cv_;

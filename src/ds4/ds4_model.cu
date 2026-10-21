@@ -2716,7 +2716,28 @@ struct Model::Impl {
             eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);
-            eg_io.start(paths, nth);
+            // Windows: the Engram tables' files that hold nothing else are unmapped and read unbuffered - an SSD's
+            // queue kept by the reader threads instead of the page cache's (whose reads of one file from many threads
+            // went ~255K rows a second here); unbuffered reads of a mapped file take a slow path, so only unmapped
+            // ones (DS4_EG_DIRECT=0: buffered, mapped, as before)
+            std::vector<char> eg_direct(pk.files.size(), 0);
+#if defined(_WIN32)
+            if (pk.gguf && (std::getenv("DS4_EG_DIRECT") == nullptr || std::atoi(std::getenv("DS4_EG_DIRECT")) != 0)) {
+                std::vector<char> eg_file(pk.files.size(), 0), other(pk.files.size(), 0);
+                for (const auto& kt : pk.t)
+                    if (kt.second.file >= 0 && (size_t) kt.second.file < pk.files.size())
+                        (kt.first.find(".engram.embed.") != std::string::npos ? eg_file : other)[(size_t) kt.second.file] = 1;
+                for (size_t i = 0; i < pk.files.size(); ++i)
+                    if (eg_file[i] && !other[i] && i < pk.maps.size() && pk.maps[i].first != nullptr) {
+                        os::unmap(pk.maps[i].first, pk.maps[i].second);
+                        pk.maps[i] = {nullptr, 0};
+                        eg_direct[i] = 1;
+                        if (o.verbose) std::fprintf(stderr, "ds4: %s unmapped, its Engram rows read unbuffered\n",
+                                                    pk.files[i].c_str());
+                    }
+            }
+#endif
+            eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
