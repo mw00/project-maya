@@ -76,6 +76,20 @@ struct SetArgs {
     int tg = 0, td = 0;
     int skip_le = 0;   // (the tiles) the experts of at most this many rows are left out: the light kernels took them
 };
+#if defined(STRATA_USE_HIP)
+// Host metadata for a prompt set, valid only within this scope; nested calls restore their caller's metadata.
+// Keeping it here leaves the shared EXL3/GGUF SetArgs ABI unchanged.
+class MmqRowsScope {
+public:
+    MmqRowsScope(int total_rows, const int* host_bounds);
+    ~MmqRowsScope();
+    MmqRowsScope(const MmqRowsScope&) = delete;
+    MmqRowsScope& operator=(const MmqRowsScope&) = delete;
+private:
+    int previous_rows_;
+    const int* previous_bounds_;
+};
+#endif
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);
 /// The light form alone (the set's experts of at most 16 rows; the others untouched), for any of these types and MXFP4

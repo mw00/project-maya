@@ -444,3 +444,13 @@ pack has no counts yet, so the setup copies `data/expert-profile-ds4.bin` into i
 chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`). Its counts weigh as much as about
 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
 an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
+
+## DeepSeek: routed prompt experts on AMD
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_EXPERT_MMQ` | unset (off) | `1`: use the existing GLM q8_1/int8 MMQ path for supported DeepSeek IQ expert prompt sets of at least 32 rows; other sets keep the existing path. HIP only. |
+
+The switch quantizes both the prompt activations and the FP16 SwiGLU intermediate to q8_1.
+This approximate prompt path can change answers; it is off by default. It uses a separate workspace for each
+host thread, device and stream, and keeps the existing path during graph capture.

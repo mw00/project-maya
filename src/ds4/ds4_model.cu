@@ -14,6 +14,9 @@
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
+#if defined(STRATA_USE_HIP)
+#include "ds4_iq.cuh"
+#endif
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_kernels.cuh"
 #include "ds4_os.hpp"
@@ -3606,6 +3609,9 @@ struct Model::Impl {
             for (int i = i0; i < j; ++i) max_rows = std::max(max_rows, b[i + 1] - b[i]);
             if (nrows > 0) {
                 x3::SetArgs sa;
+#if defined(STRATA_USE_HIP)
+                gg::iq::MmqRowsScope mmq_rows(nrows, b + i0);
+#endif
                 sa.wbase = wbase + (size_t) (i0 - wb0) * stride;   // (wbase: set member wb0's blob)
                 sa.stride = stride;
                 sa.lay = l.nm > 1 ? l.hlay : l.lay;
