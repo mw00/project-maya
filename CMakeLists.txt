@@ -398,7 +398,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -423,7 +423,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test)
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test mtp_rows_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)

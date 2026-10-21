@@ -45,8 +45,9 @@ constexpr int kMaxMvCols = 16;   // a verify window's tokens, a draft block's
 constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
-/// The most activations mv_nt() takes at once (the conversations of one batched decode step).
-constexpr int kMaxMvNt = 8;
+/// The most activations mv_nt() takes at once (the rows of one batched decode step: one a conversation, or a
+/// conversation's verify window of several with STRATA_GLM_MULTI_MTP).
+constexpr int kMaxMvNt = 16;
 /// mv() for nt activations at once (nt <= kMaxMvNt; 1 = mv()), the jobs' ncol 1: each job's xq / xf hold nt activations
 /// one after another (n_in values each) and its y nt outputs (n_out each).  Output t is bit for bit what mv() gives
 /// for activation t alone, and each weight row is read from memory once for all of them (more than 8 activations: once

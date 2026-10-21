@@ -654,8 +654,12 @@ public:
     uint64_t mtp_arena_bytes_ = 0;                         // (the VRAM report)
     bool load_mtp(const std::vector<std::unique_ptr<strata::GgufFile>>& gfs, std::string& err);
     // the draft block at position p -> mtp_tok[step] (see glm_fast_path.cu: the chained drafts and the draft head)
-    bool fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step = 0, bool sub = false, bool read_back = true);
-    void mtp_draft_setup();                                // fast_setup: the draft head's rows, the chain's embeddings
+    // emb_staged: the token's embedding row already dequantized by the caller into pinned memory it keeps until the
+    // step ran (several conversations' steps queued together, glm_mtp_rows.cu) - copied in, no wait for the stream
+    // head = false: the block up to the head's input (head_x / head_xq), no head and no pick
+    bool fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step = 0, bool sub = false, bool read_back = true,
+                  const float* emb_staged = nullptr, bool head = true);
+    void mtp_draft_setup(bool chain = true);               // fast_setup: the draft head's rows, the chain's embeddings
     // the draft vocabulary (load_pack, from the GGUF's tokenizer - see glm_mtp.cu): ids [0, mtp_vlead_) and
     // mtp_vextra_; mtp_vin_[id] != 0 for each (empty: the whole head)
     int mtp_vlead_ = 0;
@@ -763,7 +767,10 @@ private:
     void mtp_cache_free();
     // the NextN block's cache-writing half for n entries from p0: entry p0 + i from h + i * n_embd (device, this part)
     // and the token next[i] - eh_proj, the attention norm, kv_a and the indexer's key/gate, no query, no FFN
-    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync = true);
+    // emb_rows_h: pinned rows of the caller's (n x n_embd) for the tokens' embeddings instead of the shared ones (kept
+    // by the caller until the rows were written: several conversations' entries queued together)
+    bool mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync = true,
+                        float* emb_rows_h = nullptr);
 public:
     // ---- several conversations at once (src/core/glm_multi.cu, STRATA_GLM_SEQS=<n>): each part keeps n sequence
     // states (the state arena: residual, KDA states, DSA caches; the position, the snapshot) and binds one at a time -
@@ -803,6 +810,9 @@ public:
     int64_t seq_max_ctx(int s) const {                     // a sequence's context (the bound one's is max_ctx_)
         return seq_.empty() || s == cur_seq_ ? max_ctx_ : seq_[(size_t) s].max_ctx;
     }
+    int64_t seq_pos(int s) const {                         // a sequence's next position (the bound one's is pos_)
+        return seq_.empty() || s == cur_seq_ ? pos_ : seq_[(size_t) s].pos;
+    }
     bool seq_pipe_ready(std::string& err);                 // the pipeline buffers (once)
     /// The pipelined decode: `token` of sequence s at its next position through every part and the head, sampled with
     /// `sp` (greedy when sp.greedy) on the tail's stream - nothing is waited for.  multi_take(s) waits for that token.
@@ -827,11 +837,57 @@ public:
     bool split_rows_ok() const;
     bool multi_issue_rows(const int* seqs, const int32_t* tokens, const strata::kernels::SamplerParams* sps, int n,
                           std::string& err);
+    // ---- several conversations drafting with the NextN block at once (src/core/glm_mtp_rows.cu,
+    // STRATA_GLM_MULTI_MTP=<drafts>, off by default).  A conversation's WINDOW - its last written token and its drafts
+    // - goes through the split's batched rows as consecutive rows of one group; the last part's head picks every
+    // row; the host keeps the rows up to the first wrong draft (strata/core/mtp_rows.hpp) and commits them (the
+    // recurrent states restored and the kept rows replayed where a draft missed, the positions set); the NextN block
+    // then writes its cache for the kept rows and drafts the next window from the last kept row's hidden state.
+    // Calls for one group, in this order: mtpw_front, mtpw_back, mtpw_picks, mtpw_commit, mtpw_draft_queue,
+    // mtpw_draft_take; several groups may be between their front and their commit at once (each conversation in one).
+    static int multi_mtp_setting();                       // the drafts a window carries at most (0: off)
+    static int multi_mtp_cap();                           // a group's rows at most (STRATA_GLM_MULTI_MTP_ROWS)
+    struct MtpRows;
+    MtpRows* mtpw_ = nullptr;
+    bool mtpw_alloc(std::string& err);                    // load, every part: before the pool
+    bool mtpw_setup(std::string& err);                    // fast_setup, every part: before the pool
+    void mtpw_destroy();
+    bool mtpw_ok() const;                                 // set up on every part, the NextN block on the last
+    /// The group's rows through every part but the last (nothing waited for).  tokens: every conversation's window
+    /// one after another (counts[i] rows each); positions advance by counts[i] there.
+    bool mtpw_front(const int* seqs, const int* counts, int n, const int32_t* tokens, std::string& err);
+    /// ... and through the last part and the head: every row's pick (row t of a window with sps[i].counter + t).
+    bool mtpw_back(const int* seqs, const int* counts, int n, const int32_t* tokens,
+                   const strata::kernels::SamplerParams* sps, std::string& err);
+    /// The group's picks (waits for them): one a row, as the tokens.
+    bool mtpw_picks(const int* seqs, const int* counts, int n, int32_t* picks, std::string& err);
+    /// keep[i] rows of conversation i stand (1 .. counts[i]): every part's recurrent states and positions set to them.
+    bool mtpw_commit(const int* seqs, const int* counts, const int* keep, int n, std::string& err);
+    /// The NextN block (last part, binds each conversation there): its cache entries for the kept rows (written[i]:
+    /// conversation i's kept tokens after the first, keep[i] - 1 of them, one after another), then up to drafts[i]
+    /// drafts from the last kept row's hidden state and last[i] (its last written token).  Every draft step but the
+    /// last is waited for (the host feeds the next one its token); mtpw_draft_take waits for the last.
+    bool mtpw_draft_queue(const int* seqs, const int* keep, int n, const int32_t* written, const int32_t* last,
+                          const int* drafts, std::string& err);
+    bool mtpw_draft_take(int32_t* out, std::string& err);   // the drafts, conversation after conversation
+    uint64_t mtpw_steps_ = 0, mtpw_rows_ = 0;              // (statistics: verify steps and rows, every group)
 private:
     struct RowSeq;
+    bool rows_bind_win(const int* seqs, const int* counts, int n, RowSeq* rw, std::string& err);
+    bool mtpw_part(const int* seqs, const int* counts, int n, const int32_t* tokens,
+                   const strata::kernels::SamplerParams* sps, Glm5Model* prev, bool last, std::string& err);
+    int mtpw_window() const;                              // a window's rows at most (1: off)
+    void mtpw_bind(int sq, RowSeq& r) const;
+    bool mtpw_cache_rows(const RowSeq& rb, int64_t p0, int n, const float* h, const int32_t* next, float* emb_h,
+                         std::string& err);
+    bool mtpw_draft_rows(RowSeq* rr, const int* slot, int nr, std::string& err);
+    size_t mtpw_kin_offset(int il) const;                 // a layer's record in a conversation's KDA inputs
+    bool mtpw_commit_part(const int* seqs, const int* counts, const int* keep, int n, std::string& err);
     bool rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err);
     bool rows_embed(const RowSeq* rw, const int32_t* tokens, int n, std::string& err);
     bool rows_layers(RowSeq* rw, int n, std::string& err);
+    bool rows_dsa(int il, RowSeq* rw, int n, std::string& err);   // (rows_layers' parts: a DSA mixer, a MoE FFN)
+    bool rows_moe(int il, RowSeq* rw, int n, std::string& err);
     bool rows_head(const RowSeq* rw, const strata::kernels::SamplerParams* sps, int n, std::string& err);
 public:
     struct RowsState;

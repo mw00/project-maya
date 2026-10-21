@@ -4848,6 +4848,8 @@ namespace {
 // projections 52.5 -> 46.1 us, the router + shared expert 82.2 -> 77.7); K = 12288 / 16384 ran slower with it (the
 // 24-48 KB of LDS per block cost occupancy).
 std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
+// the most activations the RDNA kernels take at once (mv_rdna_launch<1..8>); more go to the other kernels
+constexpr int kMaxRdnaNt = 8;
 // The device the launch runs on: by default the RDNA 3.5 APUs (gfx115x - measured on a Radeon 8065S), whose LPDDR5X
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
 // STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
@@ -4902,9 +4904,10 @@ void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds
         }
     }
 }
-// The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device.
+// The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device, or more than
+// kMaxRdnaNt activations (its kernels take 8 at most - the rest go to the other kernels).
 bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
-    if (!mv_rdna_device()) return false;
+    if (nt > kMaxRdnaNt || !mv_rdna_device()) return false;
     int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
     const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
     if (r < 0) { r = 1; u = 2; }
@@ -5040,7 +5043,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         int idx[kMaxMvJobs], m = 0, nc = 0;
         for (int i = 0; i < n; ++i) {
             const MvJob& J = jobs[i];
-            const bool packed = J.ncol >= 2 && J.ncol <= kMaxMvNt && (J.type == kTypeBF16 || J.type == 14) &&
+            const bool packed = J.ncol >= 2 && J.ncol <= kMaxRdnaNt && (J.type == kTypeBF16 || J.type == 14) &&
                                 (J.xq == nullptr || J.xq_cstride == (int64_t) (J.n_in / 32) * (int64_t) sizeof(block_q8_1)) &&
                                 (J.xf == nullptr || J.xf_cstride == J.n_in) && J.y_cstride == J.n_out;
             if (!done[i] && packed && (nc == 0 || J.ncol == nc)) {
