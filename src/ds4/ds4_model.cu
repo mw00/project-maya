@@ -5234,7 +5234,9 @@ struct Model::Impl {
     // MAYA_DS4_DRAFT_VRAM=n, or n0,n1,.. a block (read as STRATA_DS4_DRAFT_VRAM, or DS4_DRAFT_VRAM): the most VRAM
     // experts each DSpark block keeps - its profile's hottest (place_experts' order), the rest on the CPU lane - so the
     // trunk takes the room; one value: every block.  Unset: placed as before.  Not whole numbers 0 .. the block's
-    // experts, a count of values neither 1 nor the blocks', or no blocks (--dspark none): the load fails
+    // experts, a count of values neither 1 nor the blocks', or no blocks (--dspark none): the load fails - and so does
+    // a cap under a block's experts on a mixed-precision block (n_cls > 1), which place_experts keeps whole in VRAM,
+    // its experts in no other tier
     bool draft_caps(std::string& err) {
         draft_vram.clear();
         const char* v = ds4_env("DS4_DRAFT_VRAM");
@@ -5267,6 +5269,16 @@ struct Model::Impl {
                                 : "not one whole number, or one a block (" + std::to_string(g.n_mtp) + "), each 0 .. " +
                                       std::to_string(g.d_n_exp));
             return false;
+        }
+        for (int i = 0; i < g.n_mtp; ++i) {
+            const Layer& l = L[(size_t) (g.nl + i)];
+            if (l.n_cls > 1 && draft_vram[(size_t) i] < l.n_exp) {
+                err = std::string("DS4_DRAFT_VRAM=") + v + ": DSpark block " + std::to_string(i) +
+                      " is a mixed-precision quant (" + std::to_string(l.n_cls) +
+                      " expert layouts), whose experts stay whole in VRAM - no cap";
+                draft_vram.clear();
+                return false;
+            }
         }
         return true;
     }
