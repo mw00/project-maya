@@ -39,6 +39,7 @@
 #include <chrono>
 #include <climits>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,6 +47,7 @@
 #include <functional>
 #include <future>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <sstream>
@@ -54,6 +56,220 @@
 
 #if defined(_MSC_VER)
 #define strtok_r strtok_s
+#endif
+
+
+#if defined(STRATA_USE_HIP) && defined(STRATA_HIPBLASLT_AVAILABLE)
+#pragma push_macro("__shfl_sync")
+#undef __shfl_sync
+#pragma push_macro("__shfl_down_sync")
+#undef __shfl_down_sync
+#pragma push_macro("__shfl_up_sync")
+#undef __shfl_up_sync
+#pragma push_macro("__shfl_xor_sync")
+#undef __shfl_xor_sync
+#include <hipblaslt/hipblaslt.h>
+#pragma pop_macro("__shfl_sync")
+#pragma pop_macro("__shfl_down_sync")
+#pragma pop_macro("__shfl_up_sync")
+#pragma pop_macro("__shfl_xor_sync")
+#include <tuple>
+
+// DeepSeek's dense prompt GEMMs: a table of hipBLASLt solutions, each timed on its first real shape/stride.
+// The table is built on first use (a few seconds on a long prompt) and never changes a vendor file.
+//
+// Ownership: one handle and workspace per (device, stream). Calls on one state are serialized on the host,
+// and every submission uses that state's stream, so a final asynchronous matmul is ordered before any later
+// call that reuses the workspace. Different devices and streams never share a workspace. The state lives for
+// the process, as the table does; a failed setup or timing publishes no entry, so the next call can retry.
+namespace {
+using DenseLtKey = std::array<int, 8>;   // n, k, rows, ldx, ldy, a/b/y alignment
+
+struct DenseLtEntry {
+    hipblasLtMatmulDesc_t op{};
+    hipblasLtMatrixLayout_t a{}, b{}, c{};
+    hipblasLtMatmulAlgo_t algo{};
+    bool valid = false;
+};
+
+struct DenseLtState {
+    hipblasLtHandle_t lt{};
+    void* ws{};
+    std::mutex mu;
+    std::map<DenseLtKey, DenseLtEntry> table;
+};
+
+void dense_lt_warn(const char* why) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) std::fprintf(stderr, "ds4 dense lt: %s; using the existing BLAS path\n", why);
+}
+
+bool ds4_dense_lt(int n, int k, int rows, int ldx, int ldy, const void* a, const void* b, void* y, float beta,
+                  hipStream_t stream, float alpha = 1.0f) {
+    const char* flag = std::getenv("STRATA_DS4_DENSE_LT");   // MAYA_DS4_DENSE_LT is the documented alias
+    if (flag == nullptr || std::strcmp(flag, "1") != 0 || beta != 0 || rows < 32 || ldy <= 0) return false;
+
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        dense_lt_warn("hipGetDevice failed");
+        return false;
+    }
+
+    static std::mutex states_mu;
+    static std::map<std::pair<int, uintptr_t>, std::unique_ptr<DenseLtState>> states;
+    DenseLtState* state = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(states_mu);
+        auto& slot = states[{dev, reinterpret_cast<uintptr_t>(stream)}];
+        if (!slot) slot = std::make_unique<DenseLtState>();
+        state = slot.get();
+    }
+
+    // The lock is held until the call is submitted. Since every use of this state goes to the same stream,
+    // the previous asynchronous matmul has already been ordered before anything this call enqueues.
+    std::lock_guard<std::mutex> lock(state->mu);
+
+    const float one = alpha, zero = 0.0f;
+    const size_t wsz = 32ull << 20;   // the largest candidate workspace this path accepts
+    const DenseLtKey key{n, k, rows, ldx, ldy, (int) ((uintptr_t) a % 256),
+                         (int) ((uintptr_t) b % 256), (int) ((uintptr_t) y % 256)};
+    auto it = state->table.find(key);
+    if (it == state->table.end()) {
+        if (state->table.size() >= 1024) {
+            dense_lt_warn("solution table is full");
+            return false;
+        }
+        // A local entry is filled and committed only when every operation succeeded.
+        DenseLtEntry e;
+        auto cleanup = [&] {
+            if (e.op) hipblasLtMatmulDescDestroy(e.op);
+            if (e.a) hipblasLtMatrixLayoutDestroy(e.a);
+            if (e.b) hipblasLtMatrixLayoutDestroy(e.b);
+            if (e.c) hipblasLtMatrixLayoutDestroy(e.c);
+            e = DenseLtEntry{};
+        };
+
+        if (state->lt == nullptr && hipblasLtCreate(&state->lt) != HIPBLAS_STATUS_SUCCESS) {
+            state->lt = nullptr;
+            dense_lt_warn("hipblasLtCreate failed");
+            return false;
+        }
+        if (state->ws == nullptr && hipMalloc(&state->ws, wsz) != hipSuccess) {
+            state->ws = nullptr;
+            dense_lt_warn("workspace allocation failed");
+            return false;
+        }
+
+        hipblasOperation_t trans = HIPBLAS_OP_T;
+        if (hipblasLtMatmulDescCreate(&e.op, HIPBLAS_COMPUTE_32F, HIP_R_32F) != HIPBLAS_STATUS_SUCCESS) {
+            cleanup();
+            dense_lt_warn("matmul descriptor creation failed");
+            return false;
+        }
+        if (hipblasLtMatmulDescSetAttribute(e.op, HIPBLASLT_MATMUL_DESC_TRANSA, &trans, sizeof(trans)) !=
+                HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatrixLayoutCreate(&e.a, HIP_R_16F, k, n, k) != HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatrixLayoutCreate(&e.b, HIP_R_16F, k, rows, ldx) != HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatrixLayoutCreate(&e.c, HIP_R_32F, n, rows, ldy) != HIPBLAS_STATUS_SUCCESS) {
+            cleanup();
+            dense_lt_warn("matrix layout creation failed");
+            return false;
+        }
+
+        hipblasLtMatmulPreference_t pref{};
+        bool pref_ok = hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS;
+        const uint64_t limit = wsz;
+        if (pref_ok)
+            pref_ok = hipblasLtMatmulPreferenceSetAttribute(
+                          pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &limit, sizeof(limit)) ==
+                      HIPBLAS_STATUS_SUCCESS;
+        hipblasLtMatmulHeuristicResult_t candidates[8]{};
+        int count = 0;
+        if (pref_ok)
+            pref_ok = hipblasLtMatmulAlgoGetHeuristic(state->lt, e.op, e.a, e.b, e.c, e.c, pref, 8, candidates,
+                                                      &count) == HIPBLAS_STATUS_SUCCESS &&
+                      count > 0;
+        if (pref) hipblasLtMatmulPreferenceDestroy(pref);
+        if (!pref_ok) {
+            cleanup();
+            dense_lt_warn("heuristic candidate query failed");
+            return false;
+        }
+
+        // A separate output scratch keeps the live slab and its beta semantics out of the timing. Offset it so
+        // its alignment matches the real output slab, which is part of the dispatch contract.
+        const size_t bytes = (size_t) ldy * (size_t) rows * sizeof(float);
+        if (rows <= 0 || bytes / (size_t) rows / sizeof(float) != (size_t) ldy) {
+            cleanup();
+            dense_lt_warn("output scratch size overflow");
+            return false;
+        }
+        void* scratch_base = nullptr;
+        if (hipMalloc(&scratch_base, bytes + 256) != hipSuccess) {
+            cleanup();
+            dense_lt_warn("output scratch allocation failed");
+            return false;
+        }
+        float* scratch = (float*) ((uintptr_t) scratch_base +
+                                   (((uintptr_t) y % 256) + 256 - ((uintptr_t) scratch_base % 256)) % 256);
+        hipEvent_t start{}, stop{};
+        bool events_ok = hipEventCreate(&start) == hipSuccess;
+        if (events_ok) events_ok = hipEventCreate(&stop) == hipSuccess;
+        if (!events_ok) {
+            if (start) hipEventDestroy(start);
+            if (stop) hipEventDestroy(stop);
+            hipFree(scratch_base);
+            cleanup();
+            dense_lt_warn("timing event creation failed");
+            return false;
+        }
+
+        float best = 1e30f;
+        bool timing_failed = false;
+        for (int i = 0; i < count && !timing_failed; ++i) {
+            const auto& h = candidates[i];
+            if (h.state != HIPBLAS_STATUS_SUCCESS || h.workspaceSize > wsz) continue;
+            auto run = [&] {
+                return hipblasLtMatmul(state->lt, e.op, &one, a, e.a, b, e.b, &zero, scratch, e.c, scratch, e.c,
+                                       &h.algo, state->ws, wsz, stream);
+            };
+            if (run() != HIPBLAS_STATUS_SUCCESS) continue;   // unsupported candidate, try the next one
+            if (hipEventRecord(start, stream) != hipSuccess) { timing_failed = true; break; }
+            bool ok = true;
+            for (int j = 0; j < 5; ++j)
+                if (run() != HIPBLAS_STATUS_SUCCESS) { ok = false; timing_failed = true; break; }
+            if (ok && hipEventRecord(stop, stream) != hipSuccess) ok = false;
+            if (ok && hipEventSynchronize(stop) != hipSuccess) ok = false;   // a kernel error surfaces here
+            float ms = 0;
+            if (ok && hipEventElapsedTime(&ms, start, stop) != hipSuccess) ok = false;
+            if (ok && (!std::isfinite(ms) || ms <= 0)) ok = false;
+            if (ok && ms / 5 < best) {
+                best = ms / 5;
+                e.algo = h.algo;
+                e.valid = true;
+            }
+        }
+        hipEventDestroy(start);
+        hipEventDestroy(stop);
+        hipFree(scratch_base);
+        if (!e.valid) {
+            cleanup();
+            dense_lt_warn(timing_failed ? "timing a candidate failed" : "no candidate timed successfully");
+            return false;
+        }
+        it = state->table.emplace(key, e).first;
+    }
+
+    const DenseLtEntry& e = it->second;
+    if (!e.valid) return false;
+    if (hipblasLtMatmul(state->lt, e.op, &one, a, e.a, b, e.b, &zero, y, e.c, y, e.c, &e.algo, state->ws, wsz,
+                        stream) != HIPBLAS_STATUS_SUCCESS) {
+        dense_lt_warn("hipblasLtMatmul submission failed");
+        return false;
+    }
+    return true;
+}
+}  // namespace
 #endif
 
 namespace strata::ds4 {
@@ -2998,9 +3214,18 @@ struct Model::Impl {
             if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
             else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
             const float one = 1.0f;
+#if defined(STRATA_USE_HIP) && defined(STRATA_HIPBLASLT_AVAILABLE)
+            const cublasStatus_t st =
+                ds4_dense_lt(nc, m.k, rows, ldx, ldy, c.w16, x16, y + c0, beta, d.st)
+                    ? CUBLAS_STATUS_SUCCESS
+                    : cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
+                                   m.k, x16, CUDA_R_16F, ldx, &beta, y + c0, CUDA_R_32F, ldy,
+                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#else
             const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
                                                    m.k, x16, CUDA_R_16F, ldx, &beta, y + c0, CUDA_R_32F, ldy,
                                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#endif
             if (st != CUBLAS_STATUS_SUCCESS) {
                 err = "cublasGemmEx: status " + std::to_string((int) st);
                 return false;
@@ -3012,9 +3237,21 @@ struct Model::Impl {
     bool gemm_f16w(Chunk& c, const uint16_t* W, int n, int k, const uint16_t* x16, int ldx, int rows, float alpha,
                    float* y, int ldy, std::string& err) {
         const float zero = 0.0f;
+#if defined(STRATA_USE_HIP) && defined(STRATA_HIPBLASLT_AVAILABLE)
+        hipStream_t lt_stream{};
+        const char* lt_flag = std::getenv("STRATA_DS4_DENSE_LT");
+        const bool lt_ready = lt_flag != nullptr && std::strcmp(lt_flag, "1") == 0 && rows >= 32 &&
+                              hipblasGetStream(c.blas, &lt_stream) == HIPBLAS_STATUS_SUCCESS;
+        const cublasStatus_t st = lt_ready && ds4_dense_lt(n, k, rows, ldx, ldy, W, x16, y, 0.0f, lt_stream, alpha)
+                                      ? CUBLAS_STATUS_SUCCESS
+                                      : cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k, &alpha, W,
+                                                     CUDA_R_16F, k, x16, CUDA_R_16F, ldx, &zero, y, CUDA_R_32F, ldy,
+                                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#else
         const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, n, rows, k, &alpha, W, CUDA_R_16F, k,
                                                x16, CUDA_R_16F, ldx, &zero, y, CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F,
                                                CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+#endif
         if (st != CUBLAS_STATUS_SUCCESS) {
             err = "cublasGemmEx (F16 weights): status " + std::to_string((int) st);
             return false;

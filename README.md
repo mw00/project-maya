@@ -195,6 +195,11 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).
+- **DeepSeek dense prompt GEMMs (AMD):** `MAYA_DS4_DENSE_LT=1` lets the dense FP16 prompt GEMMs pick a hipBLASLt
+  solution per real shape and stride on first use (a few seconds at 8K, then reused); a Strix Halo measured +12.0% at
+  8K (recheck after the ownership/error-handling fix) and +13.9% at 32K prompts with the prompt skip on (throughput;
+  A/A floors 1.64% and 1.39%). Off by default; NVIDIA and AMD builds without hipBLASLt keep the existing path
+  ([how](docs/SETTINGS.md#deepseek-dense-prompt-gemms-on-amd)).
 - **Several requests at once** (GLM-5.3-Flash): `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
   it in the config, and the dashboard shows how many answers are being written. Each extra request keeps its own
   context in VRAM, so a few fewer experts fit there ([how](docs/SETTINGS.md#several-requests-at-once)).

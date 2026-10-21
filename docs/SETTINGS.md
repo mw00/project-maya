@@ -386,6 +386,23 @@ file keeps that verdict. It applies while answering (one token at a time), not w
 The engine's decode summary (`streamed to the GPU: N`) and the `pcie=` key of its STAT lines (experts a token
 streamed) show it at work; the start's log prints each format's times and how many of a token's experts it streams.
 
+## DeepSeek: dense prompt GEMMs on AMD
+
+DeepSeek-V4.1-Flash's prompt path reconstructs its dense weights to FP16 and multiplies them with the vendor BLAS.
+On AMD with hipBLASLt, the engine can instead ask hipBLASLt for its candidate solutions and time them on each real
+shape and stride the first time it meets one, then reuse the fastest for the rest of the process. The first use
+costs a few seconds (about 3.7 s on an 8K prompt in an earlier Strix Halo experiment) and is included in that prompt's
+time; later prompts reuse the table. It is off by default: this branch has been measured on one Strix Halo
+(gfx1151), one Q8 dense pack and one ROCm/hipBLASLt build. That measurement gave +12.0% throughput at 8K (recheck
+after the ownership/error-handling fix) and +13.9% at 32K with the prompt skip on (same-config A/A floors 1.64% and
+1.39%). The workspace and handle are per device and stream; every setup and timing call is checked, and a failure
+logs one line and uses the existing BLAS call. NVIDIA and AMD builds without hipBLASLt keep the existing path
+unchanged.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_DENSE_LT` | off | `1`: time hipBLASLt's candidates on each real dense prompt GEMM shape/stride at first use and reuse the fastest. Only the prompt's dense GEMMs are affected (the switch needs at least 32 rows); decode and the routed experts are unchanged. The chosen algorithm may sum in a different order, so the last bits of an answer can differ |
+
 ## DeepSeek: long prompts read without the second half's work
 
 DeepSeek-V4.1-Flash's layers 20-39 see the earlier tokens of a prompt only through what layer 20 keeps of them (its
