@@ -231,6 +231,8 @@ struct Gather {
     int src[kWin * kPicks];
 };
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s);
+// bytes [col0, col0 + width) of each of `rows` rows of a matrix `pitch` bytes a row, side by side into out
+void gather_cols(const uint8_t* src, size_t pitch, size_t col0, size_t width, int rows, uint8_t* out, cudaStream_t s);
 /// The MoE's sum, token t: out[t] = sum_j w[t][j] ed[row[t][j]] (its VRAM experts, in pick order) + cpu[t] (when its
 /// cpu flag is set) + sh[t].
 struct Combine {

@@ -2214,6 +2214,15 @@ __global__ void gather_kernel(const float* __restrict__ x, Gather g, int cols, f
     if (c < cols) out[(size_t) r * cols + c] = x[(size_t) g.src[r] * cols + c];
 }
 
+// bytes [col0, col0 + width) of each row of a matrix `pitch` bytes a row, side by side into out (`width` bytes a row) -
+// a byte at a time: any alignment (a GGUF type's blocks of 110 or 98 bytes)
+__global__ void gather_cols_kernel(const uint8_t* __restrict__ src, size_t pitch, size_t col0, size_t width,
+                                   uint8_t* __restrict__ out) {
+    const size_t r = blockIdx.y;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < width; i += (size_t) gridDim.x * blockDim.x)
+        out[r * width + i] = src[r * pitch + col0 + i];
+}
+
 __global__ void combine_kernel(const float* __restrict__ ed, const float* __restrict__ cpu,
                                const float* __restrict__ sh, Combine cm, int dim, float* __restrict__ out) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -3150,6 +3159,11 @@ void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int
 
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s) {
     if (n > 0) gather_kernel<<<dim3(cdiv(cols, kThreads), n), kThreads, 0, s>>>(x, g, cols, out);
+}
+void gather_cols(const uint8_t* src, size_t pitch, size_t col0, size_t width, int rows, uint8_t* out, cudaStream_t s) {
+    if (rows <= 0 || width == 0) return;
+    const unsigned bx = (unsigned) std::min(4, cdiv((int) width, kThreads));
+    gather_cols_kernel<<<dim3(bx, (unsigned) rows), kThreads, 0, s>>>(src, pitch, col0, width, out);
 }
 
 void combine(const float* ed, const float* cpu, const float* sh, const Combine& c, int T, int dim, float* out,

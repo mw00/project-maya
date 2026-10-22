@@ -504,7 +504,9 @@ type: Maya's quants use 256-value blocks, n_ff 2304 = 9 blocks, so `--tp 2` (or 
 "tensor parallel 2 -> 1". `MAYA_DS4_TP_GGUF_UNEVEN=1` lets a member take whole blocks as even as they go, 5 + 4 for
 two GPUs, with the odd block going round the members layer by layer, as EXL3's split128 does. Each member loads,
 streams and swaps its own range, the shared expert is split at the same range, and each member's exact expert bytes
-are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). Not yet with `DS4_FLOW_TP`.
+are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). With `DS4_FLOW_TP=1` its members take
+the prompt flow too, each streaming its own rows, the down gathered on the GPU (on a disk-streaming box the group's
+prompts are much slower off the flow).
 `MAYA_DS4_TP_CHECK=1` checks every expert format and rotation at load, before any request: one token through each
 member's parts as decode runs them, summed on the host and compared with the whole expert and shared expert (more than
 1e-3 of the largest output fails the start).
