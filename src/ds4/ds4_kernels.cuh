@@ -148,7 +148,8 @@ struct AttnScratch {
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
 // heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3 (gfx11) 16 heads a block on the matrix cores - the
 // products in BF16 (the query and the probabilities as a high and a low part: within rounding of the FP32 kernels,
-// not their bits); elsewhere, or DS4_ATTN_WMMA=0, as 0
+// not their bits); on Ampere and newer (sm_80+) the same on the tensor cores (mma.sync, BF16; DS4_ATTN_MMA=0 for
+// the FP32 kernel); elsewhere, or DS4_ATTN_WMMA=0, as 0
 constexpr int kAttnWmma = 16;
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
