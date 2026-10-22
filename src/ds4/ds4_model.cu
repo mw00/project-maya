@@ -128,17 +128,19 @@ cudaError_t mem_info(size_t* free_b, size_t* total_b) {
     return e;
 }
 
-// part p of np of `whole` (a multiple of 128) in 128-blocks, as even as they go (whole / 128 % np parts a block more:
-// those from part rot on, cyclically - so a group's layers, each its own rot, even out what each member holds):
-// tensor parallel's columns of an FFN or of the head - an even split is what whole / np gave before
-void split128(int whole, int np, int p, int& off, int& n, int rot = 0) {
-    const int b = whole / 128, q = b / np, r = b % np;
+// part p of np of `whole` (a multiple of blk) in blk-blocks, as even as they go (whole / blk % np parts a block more:
+// those from part rot on, cyclically - so a group's layers, each its own rot, even out what each member holds)
+void splitb(int whole, int blk, int np, int p, int& off, int& n, int rot = 0) {
+    const int b = whole / blk, q = b / np, r = b % np;
     auto blocks = [&](int i) { return q + (((i - rot) % np + np) % np < r ? 1 : 0); };
     int at = 0;
     for (int i = 0; i < p; ++i) at += blocks(i);
-    off = 128 * at;
-    n = 128 * blocks(p);
+    off = blk * at;
+    n = blk * blocks(p);
 }
+// splitb in 128-blocks: tensor parallel's columns of an EXL3 FFN or of the head - an even split is what whole / np gave
+// before
+void split128(int whole, int np, int p, int& off, int& n, int rot = 0) { splitb(whole, 128, np, p, off, n, rot); }
 
 std::string read_file(const std::string& p) {
     std::ifstream f(p);
@@ -1086,6 +1088,10 @@ struct Model::Impl {
     // what fits) instead of copied into RAM, and how much of them the load reads ahead (the most-routed first)
     bool file_experts = false;
     uint64_t warm_bytes = 0;
+    // DS4_TP_GGUF_UNEVEN=1: a GGUF group's members take its experts' FFN in whole blocks of tp_blk values, as even as
+    // they go (splitb, the odd blocks going round the members layer by layer) instead of only even shares
+    bool tp_uneven = false;
+    int tp_blk = 0;
     static constexpr uint64_t kRamMargin = 8ull << 30;   // RAM left to the rest (the system, the page cache's churn)
     uint8_t* file_part(const Layer& l, int e) const {
         return pk.maps[(size_t) l.region_file[(size_t) e]].first + l.region_off[(size_t) e];
@@ -1738,9 +1744,10 @@ struct Model::Impl {
     }
     // a GGUF's BF16 or Q8_0 matrix ([out][in]) onto the device, as mat() takes an EXL3 one: whole, or part `part` of its
     // columns (outputs: a range of its rows) or of its rows (inputs: a range of each row, whole Q8_0 blocks) - a
-    // standalone [n][k] matrix
+    // standalone [n][k] matrix; r0 >= 0: the range [r0, r0 + rn) instead of an even part (DS4_TP_GGUF_UNEVEN's shared
+    // expert: its member's FFN range)
     bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
-                  int np, bool cols) {
+                  int np, bool cols, int r0 = -1, int rn = 0) {
         const bool q8 = t.dtype == "Q8_0";
         if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0)) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
@@ -1755,22 +1762,24 @@ struct Model::Impl {
             return false;
         }
         if (np > 1) {
-            const int whole = cols ? n : k, wd = whole / np;
-            if (whole % np != 0 || wd % (q8 ? 32 : 8) != 0) {
+            const int whole = cols ? n : k, wd = r0 >= 0 ? rn : whole / np, w0 = r0 >= 0 ? r0 : part * wd;
+            const int q = q8 ? 32 : 8;
+            if ((r0 < 0 && whole % np != 0) || wd % q != 0 || w0 % q != 0 || w0 + wd > whole || wd <= 0) {
                 err = pre + ": " + std::to_string(whole) + (cols ? " outputs" : " inputs") + " do not split in " +
-                      std::to_string(np) + " parts";
+                      (r0 >= 0 ? "[" + std::to_string(w0) + ", " + std::to_string(w0 + wd) + ")"
+                               : std::to_string(np) + " parts");
                 return false;
             }
             const size_t rb = bytes_of((size_t) k);
             std::vector<uint8_t> p;
             if (cols) {
-                p.assign(w.begin() + (long) ((size_t) part * wd * rb), w.begin() + (long) ((size_t) (part + 1) * wd * rb));
+                p.assign(w.begin() + (long) ((size_t) w0 * rb), w.begin() + (long) ((size_t) (w0 + wd) * rb));
                 n = wd;
             } else {
                 const size_t pb = bytes_of((size_t) wd);
                 p.resize((size_t) n * pb);
                 for (size_t r = 0; r < (size_t) n; ++r)
-                    std::memcpy(p.data() + r * pb, w.data() + r * rb + bytes_of((size_t) part * wd), pb);
+                    std::memcpy(p.data() + r * pb, w.data() + r * rb + bytes_of((size_t) w0), pb);
                 k = wd;
             }
             w.swap(p);
@@ -1802,9 +1811,13 @@ struct Model::Impl {
     // (rot: split128's - an EXL3 matrix's uneven 128-block shares going round the members; a GGUF's BF16 / Q8_0 matrix
     // splits evenly, its groups only as wide as that goes)
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
-             bool cols = true, int rot = 0) {
+             bool cols = true, int rot = 0, int r0 = -1, int rn = 0) {
         if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0"))
-            return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols);
+            return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols, r0, rn);
+        if (r0 >= 0) {   // (an explicit range: a BF16 / Q8_0 matrix's only - an EXL3 one splits by split128's rot)
+            err = pre + ": an explicit range of a matrix that is not BF16 or Q8_0";
+            return false;
+        }
         const Tensor* tr = pk.get(pre + ".trellis");
         const Tensor* su = pk.get(pre + ".suh");
         const Tensor* sv = pk.get(pre + ".svh");
@@ -2068,25 +2081,31 @@ struct Model::Impl {
                 return false;
         return true;
     }
+    // (l the group's first member: member m's own range [ff0, ff0 + ffn) and its own layout - whole blocks of the
+    //  down's inputs, even or not)
     void mx_blob_to_half(const Layer& l, const uint8_t* blob, int m, uint8_t* dst) const {
-        const int ffh = g.ff / l.nm;
-        const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim),
-                     dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), ffh);
-        for (int r = 0; r < 2; ++r)
-            std::memcpy(dst + l.hlay.trellis[r], blob + l.lay.trellis[r] + (size_t) m * ffh * gr, (size_t) ffh * gr);
+        const Layer& x = member(l, m);
+        const size_t dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
+                     d0 = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ff0),
+                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ffn);
+        for (int r = 0; r < 2; ++r) {
+            const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim);
+            std::memcpy(dst + x.hlay.trellis[r], blob + l.lay.trellis[r] + (size_t) x.ff0 * gr, (size_t) x.ffn * gr);
+        }
         for (size_t row = 0; row < (size_t) g.dim; ++row)
-            std::memcpy(dst + l.hlay.trellis[2] + row * dh, blob + l.lay.trellis[2] + row * dr + (size_t) m * dh, dh);
+            std::memcpy(dst + x.hlay.trellis[2] + row * dh, blob + l.lay.trellis[2] + row * dr + d0, dh);
     }
     void mx_half_to_blob(const Layer& l, const uint8_t* src, int m, uint8_t* blob) const {
-        const int ffh = g.ff / l.nm;
-        const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim),
-                     dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), ffh);
-        for (int r = 0; r < 2; ++r)
-            std::memcpy(blob + l.lay.trellis[r] + (size_t) m * ffh * gr, src + l.hlay.trellis[r], (size_t) ffh * gr);
+        const Layer& x = member(l, m);
+        const size_t dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
+                     d0 = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ff0),
+                     dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ffn);
+        for (int r = 0; r < 2; ++r) {
+            const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim);
+            std::memcpy(blob + l.lay.trellis[r] + (size_t) x.ff0 * gr, src + x.hlay.trellis[r], (size_t) x.ffn * gr);
+        }
         for (size_t row = 0; row < (size_t) g.dim; ++row)
-            std::memcpy(blob + l.lay.trellis[2] + row * dr + (size_t) m * dh, src + l.hlay.trellis[2] + row * dh, dh);
+            std::memcpy(blob + l.lay.trellis[2] + row * dr + d0, src + x.hlay.trellis[2] + row * dh, dh);
     }
 
     bool expert_layout(Layer& l, std::string& err) {
@@ -2329,6 +2348,21 @@ struct Model::Impl {
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
         int tp = o.tp;
+        // MAYA_DS4_TP_GGUF_UNEVEN=1 (read as STRATA_DS4_TP_GGUF_UNEVEN, or DS4_TP_GGUF_UNEVEN): a GGUF's experts split
+        // in whole blocks, as even as they go (no flow on its groups yet)
+        const char* tpu = std::getenv("STRATA_DS4_TP_GGUF_UNEVEN");
+        if (tpu == nullptr) tpu = std::getenv("DS4_TP_GGUF_UNEVEN");
+        if (const char* v = tpu) {
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_TP_GGUF_UNEVEN=") + v + ": 1 or 0";
+                return false;
+            }
+            tp_uneven = std::strcmp(v, "1") == 0;
+            if (tp_uneven && std::getenv("DS4_FLOW_TP") != nullptr && std::atoi(std::getenv("DS4_FLOW_TP")) != 0) {
+                err = "DS4_TP_GGUF_UNEVEN: not with DS4_FLOW_TP (the flow takes even shares)";
+                return false;
+            }
+        }
         if (pk.gguf && tp > 1) {
             int blk = 32;
             for (const auto& kv : pk.t) {
@@ -2339,13 +2373,26 @@ struct Model::Impl {
                 const int ty = gg_type_of(kv.second.dtype);
                 if (ty >= 0) blk = std::max(blk, gg::type_block(ty));
             }
-            while (tp > 1 && (g.ff % tp != 0 || (g.ff / tp) % blk != 0 || (g.ff / tp) % 128 != 0 || g.heads % tp != 0 ||
-                              g.o_groups % tp != 0))
+            // (DS4_TP_GGUF_UNEVEN: whole blocks, as many as members at least - n_ff 2304 in 256s: 5 + 4)
+            const bool uneven = tp_uneven && g.ff % blk == 0;
+            while (tp > 1 && ((uneven ? g.ff / blk < tp : (g.ff % tp != 0 || (g.ff / tp) % blk != 0 || (g.ff / tp) % 128 != 0)) ||
+                              g.heads % tp != 0 || g.o_groups % tp != 0))
                 --tp;
             if (tp != o.tp)
                 std::fprintf(stderr, "ds4: tensor parallel %d -> %d: the experts' %d-value blocks split n_ff %d no other way "
                                      "(each GPU its own layers)\n", o.tp, tp, blk, g.ff);
-        }
+            if (uneven && tp > 1) {
+                tp_blk = blk;
+                int f0 = 0, fa = 0, fb = 0;
+                splitb(g.ff, blk, tp, 0, f0, fa, 0);
+                splitb(g.ff, blk, tp, tp - 1, f0, fb, 0);
+                std::fprintf(stderr, "ds4: tensor parallel %d: the experts' n_ff %d in %d-value blocks, %d to %d a member "
+                                     "(the odd blocks going round the members layer by layer) (DS4_TP_GGUF_UNEVEN)\n",
+                             tp, g.ff, blk, fa, fb);
+            } else
+                tp_uneven = false;
+        } else
+            tp_uneven = false;
         // the groups: runs of tp devices of one kind (their memory), a device unlike the next alone
         // - or, tp the number of GPUs, one group of all of them whatever their kind (its tightest member sets the
         // experts' room); threads mode for the windows (decode) where a group is 2 wide or more or --threads on, the
@@ -2623,7 +2670,9 @@ struct Model::Impl {
                 x.ah0 = ha < 0 ? 0 : ha * x.ahn;
                 x.ogn = ha < 0 ? 0 : g.o_groups / na;
                 x.og0 = ha < 0 ? 0 : ha * x.ogn;
-                if (gguf_x) {
+                if (gguf_x && tp_uneven)   // (DS4_TP_GGUF_UNEVEN: whole blocks, the odd ones round the members)
+                    splitb(g.ff, tp_blk, l.nm, m, x.ff0, x.ffn, l.il % l.nm);
+                else if (gguf_x) {
                     x.ffn = g.ff / l.nm;
                     x.ff0 = m * x.ffn;
                 } else
@@ -3115,6 +3164,9 @@ struct Model::Impl {
             ahead_fl.assign(L.size() * 1024, 0);
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
+            if (tp_uneven && (std::getenv("STRATA_DS4_TP_CHECK") != nullptr || std::getenv("DS4_TP_CHECK") != nullptr) &&
+                !tp_check(err))
+                return false;   // (MAYA_DS4_TP_CHECK=1: at load, no request yet)
             const int core = !cores.empty() && !cores[0].empty() ? cores[0][0] : -1;
             service = std::thread([this, core] {
                 if (core >= 0) pin_self(core);
@@ -3260,7 +3312,8 @@ struct Model::Impl {
     void chunk_dims(Chunk& c, int nm, size_t mem = 0) const {
         const int NHL = g.heads / head_members(nm), HQ = NHL * g.hd, OG = g.o_groups / head_members(nm);
         int FF = 0, ff0_ = 0;
-        split128(g.ff, nm, 0, ff0_, FF);
+        if (tp_uneven) splitb(g.ff, tp_blk, nm, 0, ff0_, FF);   // (rot 0: member 0 takes the odd block - the widest)
+        else split128(g.ff, nm, 0, ff0_, FF);
         c.HQ = HQ, c.OG = OG, c.FF = FF;
         // The attention slab (its q in millions of values: the rows of q, the sparse attention and the output
         // projections at a time) and the dense weights' FP16 scratch (MB): 8 / 16, or on a device with much memory
@@ -3425,15 +3478,17 @@ struct Model::Impl {
                     for (int r = 0; r < 3; ++r)
                         ok = ok && cudaMemcpyAsync(dst + l.lay.trellis[r], mat_r(r), mx_part_bytes(l, r),
                                                    cudaMemcpyHostToDevice, cs) == cudaSuccess;
-            } else {
-                const int ffh = g.ff / l.nm;
-                const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, 0), g.dim),
-                             dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                             dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), ffh);
-                for (int r = 0; r < 2; ++r)
-                    ok = ok && cudaMemcpyAsync(dst + l.hlay.trellis[r], mat_r(r) + (size_t) m * ffh * gr,
-                                               (size_t) ffh * gr, cudaMemcpyHostToDevice, cs) == cudaSuccess;
-                ok = ok && cudaMemcpy2DAsync(dst + l.hlay.trellis[2], dh, mat_r(2) + (size_t) m * dh, dr, dh,
+            } else {   // (member m's own range and layout)
+                const Layer& x = member(l, m);
+                const size_t dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
+                             d0 = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ff0),
+                             dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ffn);
+                for (int r = 0; r < 2; ++r) {
+                    const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim);
+                    ok = ok && cudaMemcpyAsync(dst + x.hlay.trellis[r], mat_r(r) + (size_t) x.ff0 * gr,
+                                               (size_t) x.ffn * gr, cudaMemcpyHostToDevice, cs) == cudaSuccess;
+                }
+                ok = ok && cudaMemcpy2DAsync(dst + x.hlay.trellis[2], dh, mat_r(2) + d0, dr, dh,
                                              (size_t) g.dim, cudaMemcpyHostToDevice, cs) == cudaSuccess;
             }
             if (!ok) err = "streaming layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
@@ -4052,6 +4107,17 @@ struct Model::Impl {
             // of the shared expert's FFN; the rest whole)
             const int nm = l0.nm, na = g.heads / std::max(1, l.ahn), ha = l.ah0 / std::max(1, l.ahn);
             const std::string& P = l.name;
+            // (DS4_TP_GGUF_UNEVEN: the shared expert split at the member's own FFN range, as the routed experts -
+            //  which needs it as wide as theirs)
+            const int sr0 = nm > 1 && tp_uneven && l0.lay.fmt == gg::kFmtMXFP4 ? l.ff0 : -1;
+            if (sr0 >= 0) {
+                const Tensor* sw = pk.get(P + "ffn.shared_experts.w1.weight");
+                if (sw == nullptr || sw->shape.size() != 2 || (int) sw->shape[0] != g.ff) {
+                    err = "layer " + std::to_string(l.il) + ": DS4_TP_GGUF_UNEVEN needs the shared expert as wide as "
+                          "the routed ones (" + std::to_string(g.ff) + ")";
+                    return false;
+                }
+            }
             const std::string A = P + "attn.";
             // (the member's shares in sp; what d.weights gains besides them every member holds whole: tp_w)
             const size_t w0 = d.weights;
@@ -4073,10 +4139,16 @@ struct Model::Impl {
                       f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
-                      mat(d, P + "ffn.shared_experts.w1", l.s1, err, &sp, mi, nm, true, l.il % nm) &&
-                      mat(d, P + "ffn.shared_experts.w2", l.s2, err, &sp, mi, nm, false, l.il % nm) &&
-                      mat(d, P + "ffn.shared_experts.w3", l.s3, err, &sp, mi, nm, true, l.il % nm);
+                      mat(d, P + "ffn.shared_experts.w1", l.s1, err, &sp, mi, nm, true, l.il % nm, sr0, l.ffn) &&
+                      mat(d, P + "ffn.shared_experts.w2", l.s2, err, &sp, mi, nm, false, l.il % nm, sr0, l.ffn) &&
+                      mat(d, P + "ffn.shared_experts.w3", l.s3, err, &sp, mi, nm, true, l.il % nm, sr0, l.ffn);
             if (!ok) return false;
+            // (decode's shared expert runs with the routed experts' FF as its rows' stride: the same width a member)
+            if (nm > 1 && tp_uneven && (l.s1.n != l.ffn || l.s3.n != l.ffn || l.s2.k != l.ffn)) {
+                err = "layer " + std::to_string(l.il) + ": the shared expert's part (" + std::to_string(l.s1.n) +
+                      ") is not the member's FFN range (" + std::to_string(l.ffn) + ")";
+                return false;
+            }
             l.sink += (size_t) l.ah0;
             for (int gi = 0; gi < l.ogn; ++gi)
                 if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, &sp)) return false;
@@ -4269,6 +4341,46 @@ struct Model::Impl {
         if (m == 0) std::memcpy(blob + l.lay.svh[2], src + x.hlay.svh[2], (size_t) g.dim * 2);
     }
 
+    // a group's members' exact expert bytes against each one's own room: a member holds its own part (unit(member)) of
+    // each slot of the group's split layers and the whole slots of the group's one-device layers it holds (the
+    // drafter's); trimmed a slot at a time - a split layer's, the one with the most; the drafter's when none is left -
+    // until each fits; false (err) when one cannot
+    bool trim_to_fit(int gi, const std::vector<double>& own, std::string& err) {
+        const size_t nm = groups[(size_t) gi].mem.size();
+        for (size_t mi = 0; mi < nm; ++mi) {
+            const int dv = groups[(size_t) gi].mem[mi];
+            auto bytes_of = [&](const Layer& l) -> double {   // (this member's bytes a slot of l: 0 if it holds none)
+                if (l.grp != gi) return 0.0;
+                if ((size_t) l.nm == nm) return (double) unit(member(l, (int) mi));
+                return l.nm == 1 && l.dev == dv ? (double) l.blob : 0.0;
+            };
+            double b = 0;
+            for (const Layer& l : L) b += bytes_of(l) * l.n_vram;
+            int trimmed = 0;
+            while (b > own[mi]) {
+                Layer* pick = nullptr;
+                for (Layer& l : L)
+                    if (bytes_of(l) > 0 && l.n_vram > 0 &&
+                        (pick == nullptr || ((size_t) pick->nm != nm && (size_t) l.nm == nm) ||
+                         (((size_t) pick->nm == nm) == ((size_t) l.nm == nm) && l.n_vram > pick->n_vram)))
+                        pick = &l;
+                if (pick == nullptr) {
+                    err = "the experts' VRAM: member " + std::to_string(mi) + " of group " + std::to_string(gi) +
+                          " (CUDA" + std::to_string(devs[(size_t) dv].id) + ") has no room for its parts";
+                    return false;
+                }
+                --pick->n_vram;   // (every member gives up its part of that slot: the ones before only fit better)
+                b -= bytes_of(*pick);
+                ++trimmed;
+            }
+            if (trimmed > 0)
+                std::fprintf(stderr, "ds4: CUDA%d: %d expert slots fewer, its own parts' bytes (%.2f GB) in its room "
+                                     "(%.2f GB) (DS4_TP_GGUF_UNEVEN)\n", devs[(size_t) dv].id, trimmed, b / 1e9,
+                             own[mi] / 1e9);
+        }
+        return true;
+    }
+
     bool place_experts(std::string& err) {
         // a mixed-precision quant (layers with experts in several layouts): every expert of those layers
         // in VRAM, in its class's arena - one GPU, no lending of the experts' room (the prompt path keeps its own)
@@ -4314,11 +4426,13 @@ struct Model::Impl {
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             std::vector<double> mroom;   // each member's
             bool charged = false;
+            std::vector<double> own;   // (each member's own room, this snapshot: its dense, scratch and head already in)
             for (int m : groups[gi].mem) {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(mem_info(&fr, &tot));
                 mroom.push_back(std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) * o.vram_experts);
+                own.push_back(mroom.back());
                 charged = charged || commit_charged(devs[(size_t) m]);
             }
             if (charged && room < 1e300) {   // (each member's slots charged: the group's share of the room)
@@ -4330,6 +4444,7 @@ struct Model::Impl {
                 kept += std::max(0.0, std::min(budget, all) - std::min(capped, all)) * nm;
                 for (double& r : mroom) r = std::min(r, capped);
                 room = std::max(0.0, room - std::min(capped, all) * nm);
+                for (double& v : own) v = std::min(v, capped);   // (DS4_TP_GGUF_UNEVEN's fit: the commit's share too)
             }
             // a mixed-precision layer's experts first, every one of them (its kernels find each in its class's arena;
             // such a quant runs on one GPU, so the group's one member)
@@ -4457,6 +4572,10 @@ struct Model::Impl {
                                      l.il, l.mtp ? " (mtp)" : "", l.blob / 1e6, ucount(l) / 1e6, unit(member(l, 0)) / 1e6,
                                      l.n_vram, l.n_exp);
             }
+            // (DS4_TP_GGUF_UNEVEN: the mean above only proposed - each member's exact bytes, its own part of every slot,
+            //  against its own room from the same snapshot; over it, a slot less in its group's layer with the most
+            //  (the drafter's last), one at a time, till every member fits - no slot left to take: the load refused)
+            if (tp_uneven && groups[gi].mem.size() > 1 && !trim_to_fit((int) gi, own, err)) return false;
         }
         if (kept > 0) {   // the commit kept experts off the GPU: say so, and the page file that keeps them on it
             const os::Commit c = os::commit();
@@ -4741,8 +4860,8 @@ struct Model::Impl {
                         const Layer& x = member(l, m);
                         cudaSetDevice(devs[(size_t) x.dev].id);
                         if (l.nm > 1) blob_to_half(l, stage, m, stage2);
-                        ok = cudaMemcpy(sat(l, x, l.slot[(size_t) e], unit(l)), l.nm > 1 ? stage2 : stage,
-                                        unit(l), cudaMemcpyHostToDevice) == cudaSuccess;
+                        ok = cudaMemcpy(sat(l, x, l.slot[(size_t) e], unit(x)), l.nm > 1 ? stage2 : stage,
+                                        unit(x), cudaMemcpyHostToDevice) == cudaSuccess;
                     }
                     if (!ok) {
                         std::lock_guard<std::mutex> lk(emu);
@@ -6395,7 +6514,7 @@ struct Model::Impl {
             cudaSetDevice(devs[(size_t) x.dev].id);
             cudaStream_t cs = copy_st[(size_t) x.dev];
             if (l.nm > 1) blob_to_half(l, sw_a, m, sw_h);
-            ok = cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(l)), l.nm > 1 ? sw_h : sw_a, unit(l),
+            ok = cudaMemcpyAsync(sat(l, x, l.spare_vram, unit(x)), l.nm > 1 ? sw_h : sw_a, unit(x),
                                  cudaMemcpyHostToDevice, cs) == cudaSuccess &&
                  cudaStreamSynchronize(cs) == cudaSuccess;
         }
@@ -6405,8 +6524,8 @@ struct Model::Impl {
                 const Layer& x = member(l, m);
                 cudaSetDevice(devs[(size_t) x.dev].id);
                 cudaStream_t cs = copy_st[(size_t) x.dev];
-                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(l)),
-                                      unit(l), cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)),
+                                      unit(x), cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
                       cudaStreamSynchronize(cs) == cudaSuccess;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
             }
@@ -6414,11 +6533,11 @@ struct Model::Impl {
             else sw.ram = -1;   // (back to the file's pages then)
         }
         if (check_swaps) {   // DS4_CHECK_SWAPS: the slot (and `out`'s RAM copy) against the model file, byte for byte
-            std::vector<uint8_t> dev(l.blob), h(unit(l)), file(l.blob);
+            std::vector<uint8_t> dev(l.blob), h(l.blob), file(l.blob);   // (h: the widest member's part fits)
             for (int m = 0; m < l.nm && ok; ++m) {
                 const Layer& x = member(l, m);
                 cudaSetDevice(devs[(size_t) x.dev].id);
-                cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, l.spare_vram, unit(l)), unit(l),
+                cudaMemcpy(l.nm > 1 ? h.data() : dev.data(), sat(l, x, l.spare_vram, unit(x)), unit(x),
                            cudaMemcpyDeviceToHost);
                 if (l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
             }
@@ -6678,6 +6797,281 @@ struct Model::Impl {
             pf_q.insert(pf_q.end(), pf_want.begin(), pf_want.end());
         }
         pf_cv.notify_one();
+    }
+
+    // DS4_TP_CHECK: the largest difference allowed against the whole, a fraction of the largest output; how long a
+    // member's kernels may take to end
+    static constexpr double kTpCheckTol = 1e-3, kTpCheckWaitMs = 10000.0;
+    // the shared expert of layer l whole, on the host, as the GPUs' GEMVs round it: Q8_0 - the input rounded to int8 a
+    // 32-block at a time (q8_quant's rule), each block's integer dot times its two scales; BF16 - in F32 (no rounding)
+    bool shared_host(const Layer& l, const std::vector<float>& x, std::vector<float>& y, std::string& err) const {
+        auto gemv = [&](const std::string& name, const std::vector<float>& in, std::vector<float>& out) {
+            const Tensor* t = pk.get(l.name + name + ".weight");
+            if (t == nullptr || t->shape.size() != 2 || (int) t->shape[1] != (int) in.size() ||
+                (t->dtype != "Q8_0" && t->dtype != "BF16")) {
+                err = l.name + name + ": not a BF16 / Q8_0 matrix of " + std::to_string(in.size()) + " inputs";
+                return false;
+            }
+            const int n = (int) t->shape[0], k = (int) t->shape[1];
+            std::vector<uint8_t> w(t->bytes);
+            if (!pk.read(*t, w.data())) {
+                err = l.name + name + ": read failed";
+                return false;
+            }
+            out.assign((size_t) n, 0.0f);
+            if (t->dtype == "BF16") {
+                for (int r = 0; r < n; ++r) {
+                    double acc = 0;
+                    for (int c = 0; c < k; ++c)
+                        acc += (double) bf16_to_f32(((const uint16_t*) w.data())[(size_t) r * k + c]) * in[(size_t) c];
+                    out[(size_t) r] = (float) acc;
+                }
+                return true;
+            }
+            const int nb = k / 32;
+            std::vector<int8_t> xq((size_t) k);
+            std::vector<float> xd((size_t) nb);
+            for (int b = 0; b < nb; ++b) {
+                float am = 0.0f;
+                for (int j = 0; j < 32; ++j) am = std::max(am, std::fabs(in[(size_t) b * 32 + j]));
+                const float sc = am / 127.0f;
+                xd[(size_t) b] = sc;
+                for (int j = 0; j < 32; ++j)
+                    xq[(size_t) b * 32 + j] = (int8_t) (am > 0.0f ? (int) std::nearbyint(in[(size_t) b * 32 + j] / sc) : 0);
+            }
+            const size_t rb = (size_t) nb * gg::kQ8Bytes;
+            for (int r = 0; r < n; ++r) {
+                double acc = 0;
+                for (int b = 0; b < nb; ++b) {
+                    const uint8_t* q = w.data() + (size_t) r * rb + (size_t) b * gg::kQ8Bytes;
+                    int sum = 0;
+                    for (int j = 0; j < 32; ++j) sum += (int) (int8_t) q[2 + j] * (int) xq[(size_t) b * 32 + j];
+                    acc += (double) (f16_to_f32((uint16_t) (q[0] | q[1] << 8)) * xd[(size_t) b]) * (double) sum;
+                }
+                out[(size_t) r] = (float) acc;
+            }
+            return true;
+        };
+        std::vector<float> sg, su;
+        if (!gemv("ffn.shared_experts.w1", x, sg) || !gemv("ffn.shared_experts.w3", x, su)) return false;
+        std::vector<float> sh(sg.size());
+        for (size_t i = 0; i < sg.size(); ++i) {   // (swiglu_kernel's)
+            float gv = sg[i], uv = su[i];
+            if (g.lim > 0.0f) {
+                gv = std::min(gv, g.lim);
+                uv = std::min(std::max(uv, -g.lim), g.lim);
+            }
+            sh[i] = gv / (1.0f + std::exp(-gv)) * uv;
+        }
+        return gemv("ffn.shared_experts.w2", sh, y);
+    }
+    // member m of layer l's group: one token x through its parts as decode runs them - its VRAM part of the experts
+    // `held` (weights w) by moe_gate_up / moe_down with its own layout and FF, its part of the shared expert by mv /
+    // swiglu / mv - all on its stream: uploaded from the check's own host copies (not the caller's, not this frame's),
+    // both outputs read back on that stream into pinned memory before the end's event, the end waited for
+    // (kTpCheckWaitMs).  Only a clean end frees anything; an error before it then fails the load as any other.  No
+    // clean end - an error at the end, or none in time: the kernels may still read the model's memory (the layer's
+    // weights, its expert slots, the stream), which the failed load's teardown would free under them - tp_unknown
+    bool tp_check_member(const Layer& l, int m, const std::vector<float>& x, const std::vector<int>& held,
+                         const float* w, std::vector<float>& routed, std::vector<float>& shared, std::string& err) {
+        const Layer& xm = member(l, m);
+        Dev& d = devs[(size_t) xm.dev];
+        const int D = g.dim, FF = xm.ffn;
+        if (cudaSetDevice(d.id) != cudaSuccess) {   // (before anything is made or enqueued: an ordinary failure)
+            (void) cudaGetLastError();
+            err = "TP check: CUDA" + std::to_string(d.id) + " (layer " + std::to_string(l.il) + " member " +
+                  std::to_string(m) + "): cudaSetDevice failed";
+            return false;
+        }
+        struct In {   // (the uploads' sources, freed after a clean end only)
+            std::vector<float> x;
+            unsigned long long p[kPicks] = {};
+            float w[kPicks] = {};
+        };
+        In* in = new In;
+        in->x = x;
+        for (size_t i = 0; i < held.size() && i < (size_t) kPicks; ++i) {
+            in->p[i] = (unsigned long long) (uintptr_t) sat(l, xm, l.slot[(size_t) held[i]], unit(xm));
+            in->w[i] = w[i];
+        }
+        float *dx = nullptr, *dh = nullptr, *dout = nullptr, *dsg = nullptr, *dsu = nullptr, *dsh = nullptr,
+              *dsho = nullptr, *dw = nullptr, *back = nullptr;   // (back: pinned - dout's D, then dsho's)
+        unsigned long long* dp = nullptr;
+        std::vector<void*> bufs;
+        auto take = [&](auto*& p, size_t n) {
+            void* v = nullptr;
+            const bool ok = cudaMalloc(&v, n) == cudaSuccess;
+            if (ok) bufs.push_back(v);
+            p = (std::remove_reference_t<decltype(p)>) v;
+            return ok;
+        };
+        cudaEvent_t ev = nullptr;
+        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) ev = nullptr;
+        bool ok = ev != nullptr && take(dx, (size_t) D * 4) && take(dh, (size_t) kPicks * FF * 4) &&
+                  take(dout, (size_t) D * 4) && take(dsg, (size_t) FF * 4) && take(dsu, (size_t) FF * 4) &&
+                  take(dsh, (size_t) FF * 4) && take(dsho, (size_t) D * 4) && take(dw, (size_t) kPicks * 4) &&
+                  take(dp, (size_t) kPicks * 8);
+        if (ok && cudaMallocHost((void**) &back, (size_t) 2 * D * 4) != cudaSuccess) {
+            back = nullptr;
+            ok = false;
+        }
+        const int e0 = gg::launch_errors();
+        bool submitted = false;   // (anything on the stream: its end waited for before any free)
+        if (ok) {
+            submitted = true;
+            ok = cudaMemcpyAsync(dx, in->x.data(), (size_t) D * 4, cudaMemcpyHostToDevice, d.st) == cudaSuccess &&
+                 cudaMemcpyAsync(dp, in->p, sizeof in->p, cudaMemcpyHostToDevice, d.st) == cudaSuccess &&
+                 cudaMemcpyAsync(dw, in->w, sizeof in->w, cudaMemcpyHostToDevice, d.st) == cudaSuccess;
+            if (ok) {
+                x3::MoeArgs ma;
+                ma.plan_ptr = dp;
+                ma.plan_w = dw;
+                ma.lay = xm.hlay;
+                ma.k = l.k_exp;
+                ma.n_embd = D;
+                ma.n_ff = FF;
+                ma.limit = g.lim;
+                gg::moe_gate_up(ma, dx, dh, d.st);
+                gg::moe_down(ma, dh, nullptr, dout, d.st);
+                ok = mv(d, {job(xm.s1, dx, dsg, 1, D, FF), job(xm.s3, dx, dsu, 1, D, FF)}, err);
+                if (ok) swiglu(dsg, dsu, FF, g.lim, dsh, d.st);
+                ok = ok && mv(d, {job(xm.s2, dsh, dsho, 1, FF, D)}, err);
+            }
+            ok = ok && cudaGetLastError() == cudaSuccess && gg::launch_errors() == e0 &&   // (the readback: before the end)
+                 cudaMemcpyAsync(back, dout, (size_t) D * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess &&
+                 cudaMemcpyAsync(back + D, dsho, (size_t) D * 4, cudaMemcpyDeviceToHost, d.st) == cudaSuccess;
+        }
+        if (submitted) {   // (its event, else - not recorded - the stream itself; only a clean end goes on)
+            const bool rec = cudaEventRecord(ev, d.st) == cudaSuccess;
+            const double t0 = now_ms();
+            cudaError_t q;
+            while ((q = rec ? cudaEventQuery(ev) : cudaStreamQuery(d.st)) == cudaErrorNotReady &&
+                   now_ms() - t0 < kTpCheckWaitMs)
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            if (q != cudaSuccess) tp_unknown(d.id, l.il, m, q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+            ok = ok && rec;
+        }
+        if (ok) {
+            routed.assign(back, back + D);
+            shared.assign(back + D, back + 2 * D);
+        } else
+            (void) cudaGetLastError();
+        for (void* v : bufs) cudaFree(v);
+        if (back != nullptr) cudaFreeHost(back);
+        if (ev != nullptr) cudaEventDestroy(ev);
+        delete in;
+        if (!ok && err.empty())
+            err = "TP check: CUDA" + std::to_string(d.id) + " (layer " + std::to_string(l.il) + " member " +
+                  std::to_string(m) + "): a CUDA error";
+        return ok;
+    }
+    // a TP check's work without a clean end: what it may still read is the model's - the layer's weights, the expert
+    // slots, the device's stream - and a failed load's teardown frees all of it, so there is none: the line, then the
+    // process ends at once (exit 3: the device's state unknown - whoever runs the engine loads nothing more on these
+    // GPUs and retries nothing until a clean device check)
+    static constexpr int kExitUnknown = 3;
+    [[noreturn]] static void tp_unknown(int dev, int il, int m, const char* why) {
+        std::fprintf(stderr, "ds4: TP check: CUDA%d (layer %d, member %d): %s - the device's state unknown; the process "
+                             "ends without teardown (exit %d)\n", dev, il, m, why, kExitUnknown);
+        std::fflush(stderr);
+        std::fflush(stdout);
+        std::_Exit(kExitUnknown);
+    }
+    // DS4_TP_CHECK=1 (DS4_TP_GGUF_UNEVEN, at load, before any request): for each expert format and each rotation of the
+    // split layers (which member takes the odd block) - every one they have - one token through every member's parts
+    // (tp_check_member: three experts the layer holds in VRAM, weights 0.5 / 0.3 / 0.2, and the shared expert), the
+    // parts summed on the host in member order, against the whole: the CPU lane's sums of the same experts
+    // (cpu_experts) and the shared expert from the pack's whole matrices (shared_host). Off by more than kTpCheckTol of
+    // the largest output, not finite, a CUDA error, or a format and rotation with no split layer holding three of its
+    // experts in VRAM (not checked - so no pass): the load fails
+    bool tp_check(std::string& err) {
+        const int D = g.dim;
+        const float w[3] = {0.5f, 0.3f, 0.2f};
+        auto split = [&](const Layer& l) { return !l.mtp && l.nm > 1 && l.lay.fmt == gg::kFmtMXFP4; };
+        auto format = [&](const Layer& l) {
+            std::string fmt;
+            for (int r = 0; r < 3; ++r) fmt += std::string(r ? "/" : "") + gg::type_name(gg::expert_type(l.lay, r));
+            return fmt;
+        };
+        std::vector<std::string> want, seen;   // (format + " " + rotation)
+        for (const Layer& l : L)
+            if (split(l)) {
+                const std::string key = format(l) + " " + std::to_string(l.il % l.nm);
+                if (std::find(want.begin(), want.end(), key) == want.end()) want.push_back(key);
+            }
+        for (const Layer& l : L) {
+            if (!split(l)) continue;
+            const std::string fmt = format(l);
+            const std::string key = fmt + " " + std::to_string(l.il % l.nm);
+            if (std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+            std::vector<int> held;
+            for (int e = 0; e < l.n_exp && held.size() < 3; ++e)
+                if (l.slot[(size_t) e] >= 0) held.push_back(e);
+            if (held.size() < 3) continue;
+            seen.push_back(key);
+            std::vector<float> x((size_t) D);
+            double ss = 0;
+            for (int i = 0; i < D; ++i) {
+                x[(size_t) i] = std::sin(0.37f * (float) i + 0.11f * (float) l.il) + ((i % 89) == 0 ? 5.0f : 0.0f);
+                ss += (double) x[(size_t) i] * x[(size_t) i];
+            }
+            for (float& v : x) v = (float) (v / std::sqrt(ss / D));
+            std::vector<float> got_r((size_t) D, 0.0f), got_s((size_t) D, 0.0f), r, sh;
+            for (int m = 0; m < l.nm; ++m) {   // (member order: the all-reduce's)
+                if (!tp_check_member(l, m, x, held, w, r, sh, err)) return false;
+                for (int j = 0; j < D; ++j) {
+                    got_r[(size_t) j] += r[(size_t) j];
+                    got_s[(size_t) j] += sh[(size_t) j];
+                }
+            }
+            std::vector<float> want_r((size_t) D, 0.0f), want_s;
+            for (int i = 0; i < 3; ++i) {
+                std::vector<Ent> ents(1);
+                ents[0].e = held[(size_t) i];
+                ents[0].n = 1;
+                ents[0].tok[0] = 0;
+                cpu_experts(l, x.data(), ents, (size_t) D);
+                for (int j = 0; j < D; ++j) want_r[(size_t) j] += w[i] * c_yd[(size_t) j];
+            }
+            if (!shared_host(l, x, want_s, err)) return false;
+            auto compare = [&](const std::vector<float>& want, const std::vector<float>& got, double& worst_rel) {
+                double mx = 0, worst = 0;
+                bool finite = true;   // (both sides: a reference's NaN or Inf would pass any std::max bound unseen)
+                for (int j = 0; j < D; ++j) mx = std::max(mx, (double) std::fabs(want[(size_t) j]));
+                for (int j = 0; j < D; ++j) {
+                    finite = finite && std::isfinite(got[(size_t) j]) && std::isfinite(want[(size_t) j]);
+                    worst = std::max(worst, std::fabs((double) want[(size_t) j] - (double) got[(size_t) j]));
+                }
+                worst_rel = mx > 0 ? worst / mx : worst;
+                return finite && worst_rel <= kTpCheckTol;
+            };
+            double rr = 0, rs = 0;
+            const bool ok_r = compare(want_r, got_r, rr), ok_s = compare(want_s, got_s, rs);
+            int f0 = 0, wide = 0;
+            for (int m = 0; m < l.nm; ++m)
+                if (member(l, m).ffn > wide) wide = member(l, m).ffn, f0 = m;
+            std::fprintf(stderr, "ds4: TP check: %s (layer %d, member %d takes %d of %d): %d members' parts summed against "
+                                 "the whole - routed (3 experts) %s%.3g of the largest, shared %s%.3g\n",
+                         fmt.c_str(), l.il, f0, wide, g.ff, l.nm, ok_r ? "" : "TOO FAR - ", rr, ok_s ? "" : "TOO FAR - ",
+                         rs);
+            if (!ok_r || !ok_s) {
+                err = "TP check FAILED: " + fmt + " (layer " + std::to_string(l.il) + ")";
+                return false;
+            }
+        }
+        for (const std::string& key : want)
+            if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+                err = "TP check: " + key.substr(0, key.rfind(' ')) + ", rotation " + key.substr(key.rfind(' ') + 1) +
+                      ": no split layer holds three of its experts in VRAM - not checked";
+                return false;
+            }
+        if (want.empty()) {
+            err = "TP check: no split layer to check";
+            return false;
+        }
+        std::fprintf(stderr, "ds4: TP check passed (%zu expert formats and rotations, all the split layers have) "
+                             "(DS4_TP_CHECK)\n", seen.size());
+        return true;
     }
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's

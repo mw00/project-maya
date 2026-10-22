@@ -497,6 +497,23 @@ against the per-job one on every GPU at load (any difference fails the start).
 | `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: tensor parallel 2 on Maya's own quants
+
+`--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their
+type: Maya's quants use 256-value blocks, n_ff 2304 = 9 blocks, so `--tp 2` (or 4 or 8) falls back to 1 with
+"tensor parallel 2 -> 1". `MAYA_DS4_TP_GGUF_UNEVEN=1` lets a member take whole blocks as even as they go, 5 + 4 for
+two GPUs, with the odd block going round the members layer by layer, as EXL3's split128 does. Each member loads,
+streams and swaps its own range, the shared expert is split at the same range, and each member's exact expert bytes
+are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). Not yet with `DS4_FLOW_TP`.
+`MAYA_DS4_TP_CHECK=1` checks every expert format and rotation at load, before any request: one token through each
+member's parts as decode runs them, summed on the host and compared with the whole expert and shared expert (more than
+1e-3 of the largest output fails the start).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form |
+| `MAYA_DS4_TP_CHECK` | off | `1`: each member's parts checked against the whole expert at load |
+
 ## DeepSeek: where the measured hipBLASLt picks are kept (AMD)
 
 On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
