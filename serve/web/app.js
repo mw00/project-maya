@@ -2127,7 +2127,8 @@ function outputsCtx() {
   }
   $("ctx-est").textContent = text;
   const warns = [];
-  if (v > 262144) warns.push("Beyond 256K is untested on this engine.");
+  const tested = ctxInfo.tested || 262144;   // (the largest context run end to end on this engine)
+  if (v > tested) warns.push(`Beyond ${ctxfmt(tested)} is untested on this engine.`);
   if (e && e.vram && e.gb > e.vram * 0.6) warns.push("That leaves little GPU memory for experts: answers get much slower, and it may not start (the current size then comes back).");
   if (v !== now) warns.push("Saving reloads the model (1-3 minutes).");
   $("ctx-warn").hidden = !warns.length;

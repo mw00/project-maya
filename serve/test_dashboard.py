@@ -18,7 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, Service, StrataEngine, serve  # noqa: E402
+from serve.server import (CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, Service, StrataEngine, serve,  # noqa: E402
+                          trained_context_ds4)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -73,6 +74,29 @@ class Dashboard(unittest.TestCase):
         j = json.loads(b)
         self.assertEqual((s, j["context"], j["min"]), (200, 32768, CONTEXT_MIN))
         self.assertGreaterEqual(j["max"], 32768)
+        self.assertEqual(j["tested"], 262144)                   # (the GLM engine's: the dashboard warns past it)
+
+    def test_deepseek_context_range(self):
+        """A DeepSeek pack: the context its ds4.txt says the model was trained for is the top (V4.1-Flash: 1M), and its
+        engine is tested up to it."""
+        pack = Path(self.tmp.name) / "maya-ds4"
+        pack.mkdir()
+        (pack / "ds4.txt").write_text("hidden_size 4096\nmax_position_embeddings 1048576\nsliding_window 128\n")
+        self.assertEqual(trained_context_ds4(pack), 1048576)
+        self.assertIsNone(trained_context_ds4(Path(self.tmp.name) / "nowhere"))
+        (Path(self.tmp.name) / "bad").mkdir()
+        (Path(self.tmp.name) / "bad" / "ds4.txt").write_text("max_position_embeddings many\n")
+        self.assertIsNone(trained_context_ds4(Path(self.tmp.name) / "bad"))
+        self.svc.trained_context = trained_context_ds4(pack)
+        self.engine.info = dict(self.engine.info, engine_kind="ds4")
+        s, _, b = self.req("GET", "/api/context")
+        j = json.loads(b)
+        self.assertEqual((j["max"], j["tested"]), (1048576, 1048576))
+        s, _, _ = self.req("POST", "/api/context", {"max_context": 1048576})
+        self.assertEqual(s, 202)
+        self.assertEqual((self.wait_reload()["context"]), 1048576)
+        s, _, _ = self.req("POST", "/api/context", {"max_context": 2097152})   # (past what it was trained for)
+        self.assertEqual(s, 400)
 
     def test_reload_changes_the_context_and_saves_it(self):
         s, _, b = self.req("POST", "/api/context", {"max_context": 65536})
