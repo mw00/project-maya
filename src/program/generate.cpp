@@ -2050,6 +2050,15 @@ static int glm_pack_generate(const Options& o) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
+            // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
+            // running the NextN block's draft (same tokens as the loop below)
+            int64_t n_spec = 0;
+            if (!model.decode_spec(sp, max_new, on_token, n_spec, err)) {
+                drop_if_poisoned(prompt, err);
+                std::printf("ERR %s\n", err.c_str());
+                return 1;
+            }
         } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.mtp_ready() && req_spec != 1) {
             // the one-GPU MTP decode (glm_mtp.cu; by default on the Strix / Gorgon Halo APUs): the NextN block drafts,
             // one verify window checks the drafts (same tokens as the loop below for the same samples)
@@ -2070,15 +2079,6 @@ static int glm_pack_generate(const Options& o) {
                 std::fprintf(stderr, "glm mtp: %llu rounds, %.2f tokens a round | rounds by draft length%s\n",
                              (unsigned long long) (model.mtp_rounds_ - rounds0),
                              (double) n_spec / (double) (model.mtp_rounds_ - rounds0), lens.c_str());
-            }
-        } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
-            // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
-            // running the NextN block's draft (same tokens as the loop below)
-            int64_t n_spec = 0;
-            if (!model.decode_spec(sp, max_new, on_token, n_spec, err)) {
-                drop_if_poisoned(prompt, err);
-                std::printf("ERR %s\n", err.c_str());
-                return 1;
             }
         } else {
             for (;;) {

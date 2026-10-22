@@ -1285,6 +1285,7 @@ bool Glm5Model::prefill_setup(std::string& err) {
         // On an APU these pinned pages compete with the expert pool. A small
         // landing ring suffices for disk reads while the prompt borrows its tail.
         if (F->unified_memory || complete) want = kMinLand;
+        else if (F->ram_resident) want = std::min(want, 2 * kMinLand);
         if (const char* v = getenv("STRATA_GLM_PREFILL_LAND")) want = std::max(kMinLand, std::atoi(v));
         int n = want;
         while (cudaHostAlloc((void**) &S->gpin, (size_t) n * gstride, cudaHostAllocDefault) != cudaSuccess) {
@@ -1597,6 +1598,12 @@ bool Glm5Model::prefill_lend(std::string& err) {
 // The on-demand vision encoder (serve VLEND): the whole tail is emptied the same way and its memory freed, so the
 // encoder's process can allocate it; the prompt path waits (token by token) until vision_reclaim gives it back.
 bool Glm5Model::vision_lend(size_t& bytes, std::string& err) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->vis_lend_ok_ || m->vis_lent_) {
+            if (m != this) return m->vision_lend(bytes, err);
+            break;
+        }
+    }
     FastState* F = fast_;
     bytes = 0;
     if (F == nullptr || !vis_lend_ok_) {
@@ -1610,6 +1617,7 @@ bool Glm5Model::vision_lend(size_t& bytes, std::string& err) {
     cudaSetDevice(dev_);
     uint64_t moved = 0, dropped = 0;
     if (!lend_tail(F->xpool_bytes, moved, dropped, err)) return false;
+    F->lent_parked.clear();   // vision_reclaim frees and re-allocates xpool
     cudaFree(F->xpool);
     F->xpool = nullptr;
     for (auto& P : F->lp) P.xbase = nullptr;
@@ -1621,11 +1629,21 @@ bool Glm5Model::vision_lend(size_t& bytes, std::string& err) {
     return true;
 }
 
-size_t Glm5Model::vision_lend_bytes() const { return fast_ != nullptr && vis_lend_ok_ ? fast_->xpool_bytes : 0; }
+size_t Glm5Model::vision_lend_bytes() const {
+    for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+        if (m->fast_ != nullptr && m->vis_lend_ok_) return m->fast_->xpool_bytes;
+    return 0;
+}
 
 // ... and back once the encoder has ended: the tail is allocated again (false while the memory is still taken) and
 // its slots are free - the decode's misses refill them
 bool Glm5Model::vision_reclaim(std::string& err) {
+    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+        if (m->vis_lent_) {
+            if (m != this) return m->vision_reclaim(err);
+            break;
+        }
+    }
     FastState* F = fast_;
     if (F == nullptr || !vis_lent_) return true;
     cudaSetDevice(dev_);
@@ -1706,8 +1724,9 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         // an expert that leaves VRAM here goes to the RAM tier when it has room (a free slot, else a colder entry):
         // the decode after the prompt then finds it in RAM, not on disk (with the experts all in VRAM - a split
         // across many GPUs - the RAM tier holds little else, and every lent expert was a ~20 ms disk read back)
+        F->lent_parked.clear();
         std::vector<char> parked;   // (keys parked by this lending: never its victims - one table edit per key)
-        const auto park = [&](int il, int s, int key) -> bool {
+        const auto park = [&](int il, int s, int key, int restore_vram_slot) -> bool {
             if (lend_drop || F->layer_rc[(size_t) il] < 0) return false;
             if (parked.empty()) parked.assign(F->cnt.size(), 0);
             auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
@@ -1715,10 +1734,11 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                 if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
             if (rs < 0) {
+                // In ram_resident mode or when cnt[key] == 0, still allow evicting any non-parked kRHold slot with <= count
                 uint32_t bc = F->cnt[(size_t) key];
                 for (int s2 = 0; s2 < R.n; ++s2)
                     if (R.st[(size_t) s2] == FastState::kRHold && !parked[(size_t) R.key[(size_t) s2]] &&
-                        F->cnt[(size_t) R.key[(size_t) s2]] < bc) {
+                        F->cnt[(size_t) R.key[(size_t) s2]] <= bc) {
                         bc = F->cnt[(size_t) R.key[(size_t) s2]];
                         rs = s2;
                     }
@@ -1741,6 +1761,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             F->ram_of[(size_t) key] = rs;
             parked[(size_t) key] = 1;
             upd(F->rtab_key((size_t) key), (unsigned long long) (R.base + (size_t) rs * R.stride));
+            if (restore_vram_slot >= 0) F->lent_parked.push_back({il, restore_vram_slot, key, rs});
             ++F->diag_lend_park;
             return true;
         };
@@ -1772,7 +1793,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                     if (ci < cold.size() && cold[ci].first < (uint64_t) F->cnt[(size_t) key]) {
                         const int v = cold[ci++].second;   // the coldest: it goes, this expert takes its slot
                         const int vkey = il * NE + P.key[(size_t) v];
-                        const bool parked = park(il, v, vkey);   // (read before the copy below overwrites the slot)
+                        const bool parked = park(il, v, vkey, s);   // (read before the copy below overwrites the slot)
                         if (!ok || !glmfast::cuda_ok(cudaMemcpyAsync(P.slot_ptr(v), P.slot_ptr(s),
                                                                      F->L[(size_t) il].blob, cudaMemcpyDeviceToDevice,
                                                                      F->cs), "glm lending relocation", err))
@@ -1788,7 +1809,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                     } else {
                         upd(F->tab_key((size_t) key), 0ull);
                         F->slot_of[(size_t) key] = -1;
-                        if (!park(il, s, key)) F->left[(size_t) key] = 3;
+                        if (!park(il, s, key, s)) F->left[(size_t) key] = 3;
                         if (!ok) return false;
                     }
                     ++dropped;
@@ -1829,8 +1850,75 @@ bool Glm5Model::prefill_return(std::string& err) {
         for (int s = P.n_main; s < P.n; ++s)
             if (P.st[(size_t) s] == FastState::kLent) P.st[(size_t) s] = FastState::kFree;
     }
+    // Restore parked tail experts from pinned RAM back to their VRAM tail slots so decode starts with 100% warm VRAM
+    static const bool restore_tail = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_RESTORE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    bool ok = true;
+    int nu = 0;
+    const auto flush = [&]() {
+        if (nu == 0 || !ok) return;
+        ok = glmfast::cuda_ok(cudaMemcpyAsync(F->upd_key_d, F->upd_key_h, (size_t) nu * sizeof(int),
+                                              cudaMemcpyHostToDevice, F->cs), "glm return keys", err) &&
+             glmfast::cuda_ok(cudaMemcpyAsync(F->upd_val_d, F->upd_val_h,
+                                              (size_t) nu * sizeof(unsigned long long), cudaMemcpyHostToDevice,
+                                              F->cs), "glm return values", err);
+        if (ok) {
+            gf::tab_update(F->tab, F->upd_key_d, F->upd_val_d, nu, F->cs);
+            ok = glmfast::cuda_ok(cudaGetLastError(), "glm return table update", err);
+        }
+        const cudaError_t e = cudaStreamSynchronize(F->cs);
+        if (ok) ok = glmfast::cuda_ok(e, "glm return table sync", err);
+        nu = 0;
+    };
+    const auto upd = [&](size_t k, unsigned long long v) {
+        if (!ok) return;
+        if (nu == FastState::kMaxUpd) flush();
+        if (!ok) return;
+        F->upd_key_h[nu] = (int) k;
+        F->upd_val_h[nu] = v;
+        ++nu;
+    };
+    if (restore_tail && !F->lent_parked.empty()) {
+        const int NE = g_.n_expert;
+        for (const auto& lp : F->lent_parked) {
+            if (!ok) break;
+            if (lp.il < l0_ || lp.il >= lt_ || lp.key < 0) continue;
+            auto& P = F->lp[(size_t) lp.il];
+            if (lp.vram_slot < P.n_main || lp.vram_slot >= P.n || P.st[(size_t) lp.vram_slot] != FastState::kFree)
+                continue;
+            if (F->slot_of[(size_t) lp.key] >= 0) continue;
+            const int rc_idx = F->layer_rc[(size_t) lp.il];
+            if (rc_idx < 0) continue;
+            auto& R = F->rc[(size_t) rc_idx];
+            const int rs = F->ram_of[(size_t) lp.key];
+            if (rs < 0 || rs >= R.n || R.st[(size_t) rs] != FastState::kRHold || R.key[(size_t) rs] != lp.key)
+                continue;
+            if (!glmfast::cuda_ok(cudaMemcpyAsync(P.slot_ptr(lp.vram_slot), R.base + (size_t) rs * R.stride,
+                                                  F->L[(size_t) lp.il].blob, cudaMemcpyHostToDevice, F->cs),
+                                  "glm return restore", err)) {
+                ok = false;
+                break;
+            }
+            // Free the temporary RAM parking slot and mark the VRAM tail slot kResident again
+            upd(F->rtab_key((size_t) lp.key), 0ull);
+            F->ram_of[(size_t) lp.key] = -1;
+            R.key[(size_t) rs] = -1;
+            R.st[(size_t) rs] = FastState::kRFree;
+            P.st[(size_t) lp.vram_slot] = FastState::kResident;
+            P.key[(size_t) lp.vram_slot] = lp.key % NE;
+            P.tick[(size_t) lp.vram_slot] = F->clock;
+            F->slot_of[(size_t) lp.key] = lp.vram_slot;
+            F->left[(size_t) lp.key] = 0;
+            upd(F->tab_key((size_t) lp.key), (unsigned long long) P.slot_ptr(lp.vram_slot));
+        }
+        flush();
+        F->check_resident(l0_, lt_, NE);
+    }
+    F->lent_parked.clear();
     S->lent = false;
-    return true;
+    return ok;
 }
 
 void Glm5Model::prefill_destroy() {
@@ -2293,11 +2381,14 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         S->pre_issued += (uint64_t) n;
     };
 
-    // whether layer il's plan may give experts to the CPU (STRATA_GLM_PREFILL_CPU=0: never)
-    static const bool pf_cpu = [] {
+    // whether layer il's plan may give experts to the CPU (STRATA_GLM_PREFILL_CPU=0: never; without AVX-512 multi-row
+    // packing or when RAM-resident mode already pinned host memory, off by default unless STRATA_GLM_PREFILL_CPU=1)
+    static const int pf_cpu_env = [] {
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
-        return v == nullptr || std::atoi(v) != 0;
+        return v == nullptr ? -1 : std::atoi(v);
     }();
+    const bool pf_cpu = pf_cpu_env >= 0 ? (pf_cpu_env != 0)
+                                        : (strata::kernels::cpu::kq_avx512_ok() && !F->ram_resident);
     const auto cpu_lane = [&](int il) {
         return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
@@ -2884,7 +2975,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             static const char* row_env = getenv("STRATA_GLM_PREFILL_CPU_ROW_MS");
             // the planning cost of a row: the env's, else learned from the layers before (their host time less an
             // expert's weights each, over their rows; one 3090 beside 2x Xeon 6152: ~0.056 ms)
-            const double row_ms = row_env != nullptr ? std::atof(row_env) : S->row_ms;
+            const double default_row_ms = strata::kernels::cpu::kq_avx512_ok() ? 0.05 : std::max(0.05, 0.5 * F->cpu_c_ms);
+            const double row_ms = row_env != nullptr ? std::atof(row_env) : (S->row_ms > 0.0 ? S->row_ms : default_row_ms);
             if (cpu_lane(il)) {
                 std::vector<size_t> ram_i;
                 int n_pcie = 0;

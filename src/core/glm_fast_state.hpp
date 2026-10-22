@@ -128,9 +128,15 @@ public:
     // (empty: any)
     explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false)
         : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent) {
+        static const bool one_to_one = getenv("STRATA_GLM_CPU_PIN_1TO1") != nullptr &&
+                                       std::atoi(getenv("STRATA_GLM_CPU_PIN_1TO1")) != 0;
         for (int i = 0; i < n; ++i) {
             th_.emplace_back([this, i] { concurrent_ ? loop_c(i) : loop(i); });
-            pin_thread(th_.back().native_handle(), cpus);
+            if (one_to_one && cpus.size() >= (size_t) n) {
+                pin_thread(th_.back().native_handle(), {cpus[(size_t) i]});
+            } else {
+                pin_thread(th_.back().native_handle(), cpus);
+            }
         }
     }
     ~Workers() {
@@ -181,15 +187,17 @@ private:
         return p;
     }
     void work(uint64_t g) {
+        int my_done = 0;
         for (;;) {
             uint64_t t = ticket_.load(std::memory_order_acquire);
-            if ((t >> 32) != g) return;
+            if ((t >> 32) != g) break;
             const int n = total_.load(std::memory_order_acquire);
-            if ((int) (t & 0xffffffffu) >= n) return;
+            if ((int) (t & 0xffffffffu) >= n) break;
             if (!ticket_.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
             (*fn_)((int) (t & 0xffffffffu));
-            done_.fetch_add(1, std::memory_order_acq_rel);
+            ++my_done;
         }
+        if (my_done > 0) done_.fetch_add(my_done, std::memory_order_acq_rel);
     }
     void loop(int id) {
         uint64_t seen = gen_.load();
@@ -311,10 +319,12 @@ private:
     std::vector<std::thread> th_;
     std::mutex mu_, run_mu_;
     std::condition_variable cv_;
-    const std::function<void(int)>* volatile fn_ = nullptr;
-    std::atomic<int> total_{0}, done_{0}, sleeping_{0}, active_;
-    std::atomic<uint64_t> ticket_{0}, gen_{0};
+    alignas(64) const std::function<void(int)>* volatile fn_ = nullptr;
+    std::atomic<int> total_{0}, sleeping_{0}, active_;
     std::atomic<bool> quit_{false};
+    alignas(64) std::atomic<uint64_t> gen_{0};
+    alignas(64) std::atomic<uint64_t> ticket_{0};
+    alignas(64) std::atomic<int> done_{0};
     const bool concurrent_;
     Slot slots_[kSlots];
     std::atomic<uint64_t> epoch_{0};
@@ -364,7 +374,10 @@ namespace gf = strata::kernels::glmf;
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
+    cudaStream_t sh_stream = nullptr;                          // Step 02: dedicated auxiliary stream for async shared expert down
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
+    cudaEvent_t ev_sh_ready = nullptr, ev_sh_done = nullptr;   // Step 02: synchronization events for async shared down
+    gf::ArgmaxCandidate* scratch_argmax = nullptr;             // Step 04: scratch for fused GEMV + argmax (80 candidates)
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
     unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
@@ -538,8 +551,14 @@ struct Glm5Model::FastState {
     // last boundary, so its routes leave out the wait, the fetch and the CPU lane's wait.  Off: empty.
     std::vector<uint8_t> layer_res;
     bool layer_resident(int il) const { return (size_t) il < layer_res.size() && layer_res[(size_t) il] != 0; }
+    bool no_disk_misses = false;
     void check_resident(int l0, int lt, int n_expert) {
         static const bool on = glmfast::on_by_default_on_amd("STRATA_GLM_RESIDENT_SKIP");
+        static const bool skip_wait_on = [] {
+            const char* v = getenv("STRATA_GLM_SKIP_MOE_WAIT");
+            if (v) return std::atoi(v) != 0;
+            return gf::is_volta_device();
+        }();
         if (glmfast::skip_empty_on()) {
             layer_res.assign(L.size(), 0);
             for (int il = l0; il < lt; ++il) {
@@ -551,16 +570,23 @@ struct Glm5Model::FastState {
             }
         }
         bool all = on;
-        for (int il = l0; il < lt && all; ++il) {
+        bool no_disk = skip_wait_on && (helper.device() < 0);
+        for (int il = l0; il < lt && (all || no_disk); ++il) {
             if (!L[(size_t) il].moe) continue;
             const int* so = slot_of.data() + (size_t) il * n_expert;
-            for (int e = 0; e < n_expert; ++e)
+            const int* ro = ram_of.data() + (size_t) il * n_expert;
+            for (int e = 0; e < n_expert; ++e) {
                 if (so[e] < 0) {
                     all = false;
-                    break;
+                    if (ro[e] < 0) {
+                        no_disk = false;
+                        break;
+                    }
                 }
+            }
         }
         all_resident = all;
+        no_disk_misses = no_disk;
     }
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
@@ -579,6 +605,13 @@ struct Glm5Model::FastState {
     // how far the prompt's lending (lend_tail) freed xpool: the first tail slot it kept, so [xpool + the prompt's
     // need, lend_end) is a loan the layout did not use - where the prompt path's MMQ scratch lives (mmq::pool_slab)
     size_t lend_end = 0;
+    struct LentPark {
+        int il = -1;
+        int vram_slot = -1;
+        int key = -1;
+        int ram_slot = -1;
+    };
+    std::vector<LentPark> lent_parked;   // experts parked in RAM by lend_tail(), restored by prefill_return()
     // ---- the RAM tier: pinned host slots per blob size class, holding experts that are NOT in VRAM
     //      (exclusive tiers).  rtab (on the device) points at HOLDING slots only.
     // kRPin: still the expert's live copy, being promoted (never a victim until the copy landed)

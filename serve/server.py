@@ -4008,23 +4008,29 @@ def main() -> int:
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
-        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") != "hip":
-            venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
+        vis_gpus = gpu_list(cfg)
+        vis_idx = int(env.get("STRATA_GLM_VISION_GPU", (vcfg or {}).get("gpu_index", 0))) if vis_gpus else 0
+        if vis_idx < 0 or vis_idx >= len(vis_gpus):
+            vis_idx = 0
+        vis_phys_gpu = vis_gpus[vis_idx] if vis_gpus else 0
+        if vcfg and vcfg.get("gpu") and vis_gpus and cfg.get("backend") != "hip":
+            venv["CUDA_VISIBLE_DEVICES"] = str(vis_phys_gpu)   # run the encoder on the chosen GPU (e.g. CUDA1)
         # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
         # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
         on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident")
         engine_env = env
         if on_demand:
             fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
-                                  (gpu_list(cfg) or [0])[0])
+                                  vis_phys_gpu)
             if fp is None:
                 print("[maya] images: the vision encoder could not be measured on the GPU - it runs on the CPU",
                       flush=True)
                 vcfg, on_demand = dict(vcfg, gpu=False), False
             else:
                 vcfg = dict(vcfg, max_tokens=fp[0])
-                engine_env = dict(env, STRATA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1))
-                print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on this GPU at up to {fp[0]} "
+                engine_env = dict(env, STRATA_GLM_VISION_LEND_MB=str((fp[1] >> 20) + 1),
+                                  STRATA_GLM_VISION_GPU=str(vis_idx))
+                print(f"[maya] images: the vision encoder needs {fp[1] / 2**30:.2f} GB on GPU {vis_phys_gpu} (part {vis_idx}) at up to {fp[0]} "
                       "image tokens", flush=True)
         if vcfg and not on_demand:
             print("loading the vision encoder ...", flush=True)

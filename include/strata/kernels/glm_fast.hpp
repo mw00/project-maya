@@ -401,4 +401,19 @@ void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
 /// whole row, ties to the lower index.
 void argmax_join(const int* a, const int* b, int c0, int* out, cudaStream_t s);
 
+/// Part 5: True Q6_K + Q8_0 Fused GEMV + in-register warp argmax candidate (supporting sub-vocab)
+struct ArgmaxCandidate {
+    float val;
+    int idx;
+};
+void mv_argmax(const void* w0, int type, const void* xq, const float* x, int n_embd, int n0,
+               int* out_tok, cudaStream_t s, const void* w1 = nullptr, int n1 = 0,
+               const int* dx_ids = nullptr, ArgmaxCandidate* scratch = nullptr);
+
+/// Part 5 Opt 11: Single-row compressed Q6_K / Q8_0 embedding dequantization + 4-stream broadcast
+void embed_row_streams(const void* row_q, int type, int n_embd, float* R, cudaStream_t s);
+
+/// Returns true if the active CUDA device is Volta architecture (compute capability 7.0)
+bool is_volta_device();
+
 }  // namespace strata::kernels::glmf
