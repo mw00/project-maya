@@ -1245,9 +1245,13 @@ static int glm_pack_generate(const Options& o) {
     // it does continue (slot_load) - chats, and an agent's side requests, that interleave no longer re-read each
     // other's prompts.  STRATA_GLM_SLOTS=<n> files (default 4, 0 off), for conversations of STRATA_GLM_SLOT_MIN tokens
     // or more (1024), in STRATA_GLM_SLOT_DIR (default <pack>/slots, emptied at start), at most STRATA_GLM_SLOT_GB on
-    // disk (16) and never below 8 GB free.  Text only: a conversation with pictures is not set aside.  Or the slots
+    // disk (16) and never below 8 GB free.  A conversation with pictures is set aside too: its slot keeps img_hash() of
+    // them and is taken back only by a prompt with the same pictures at the same places.  Or the slots
     // live in RAM and nothing reaches the disk: STRATA_GLM_SLOT_RAM_GB (0, off) caps their bytes there - the states
     // are host buffers that die with the run, so SLOT_DIR, SLOT_GB (1) and the disk-space guard do not apply.
+    // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
+    // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
+    static constexpr uint64_t kNoImages = 1469598103934665603ull;   // img_hash() of a prefix without pictures
     struct Slot {
         std::vector<int32_t> tokens;
         std::string path;                       // empty when the slot is a RAM buffer (slot_ram)
@@ -1259,10 +1263,8 @@ static int glm_pack_generate(const Options& o) {
         // the end of a system prompt (slot_prefix): other chats start with it, so its conversation's later states
         // never supersede it - it goes only as the least recently used (#179)
         bool prefix = false;
+        uint64_t img = kNoImages;               // img_hash() of the pictures in `tokens`
     };
-    // (static: the multi path's Ctx, a local struct, uses it as a default member value - MSVC accepts that of a static
-    // only, and a local constant left Ctx without a default constructor: "std::construct_at: no matching function")
-    static constexpr uint64_t kNoImages = 1469598103934665603ull;   // img_hash() of a prefix without pictures
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
     bool snap_in_slot = false;   // the model's snapshot is one of the slots, unchanged since
@@ -1289,7 +1291,7 @@ static int glm_pack_generate(const Options& o) {
     // sizes) and whether the draft block is loaded.  The split itself is checked by slot_load (each part's layers).
     const std::string slot_identity = [&] {
         std::ostringstream id;
-        id << "maya-session-1 engine=" << STRATA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
+        id << "maya-session-2 engine=" << STRATA_VERSION << " mtp=" << (model.has_mtp() ? 1 : 0);
         std::error_code ec;
         for (const char* f : {"index.txt", "dense.bin", "native_experts.txt"})
             id << " " << f << ":" << (unsigned long long) fs::file_size(fs::path(o.glm_pack) / f, ec);
@@ -1303,7 +1305,8 @@ static int glm_pack_generate(const Options& o) {
     }();
     constexpr uint64_t kMetaMagic = 0x3153534559414d47ull;   // "GMAYESS1"
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
-    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes) -> bool {
+    const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
+                                 uint64_t img) -> bool {
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
@@ -1314,6 +1317,7 @@ static int glm_pack_generate(const Options& o) {
             f.write((const char*) &bytes, 8);
             f.write((const char*) &nt, 8);
             f.write((const char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t)));
+            f.write((const char*) &img, 8);
             f.write((const char*) &kMetaMagic, 8);
             f.flush();
             if (!f) return false;
@@ -1322,8 +1326,10 @@ static int glm_pack_generate(const Options& o) {
         fs::rename(tmp, path, ec);
         return !ec;
     };
-    // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
-    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes) -> bool {
+    // a .meta of this model -> its tokens, the slot's size and its pictures' hash (false: foreign, damaged or not
+    // this model's)
+    const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
+                               uint64_t& img) -> bool {
         std::ifstream f(path, std::ios::binary);
         uint64_t m0 = 0, il = 0, nt = 0, m1 = 0;
         if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
@@ -1332,8 +1338,8 @@ static int glm_pack_generate(const Options& o) {
         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) o.max_context) return false;
         toks.resize(nt);
-        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &m1, 8) &&
-               m1 == kMetaMagic;
+        return (bool) f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) && f.read((char*) &img, 8) &&
+               f.read((char*) &m1, 8) && m1 == kMetaMagic;
     };
     const auto slot_age_days = [](const std::string& p) {
         std::error_code ec;
@@ -1358,7 +1364,7 @@ static int glm_pack_generate(const Options& o) {
                                                  : std::filesystem::path(o.glm_pack) / "slots";
         std::error_code ec;
         std::filesystem::create_directories(slot_dir, ec);
-        struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; };
+        struct Found { std::string bin; std::vector<int32_t> toks; uint64_t bytes; fs::file_time_type t; uint64_t img; };
         std::vector<Found> found;
         size_t refused = 0;
         for (const auto& de : std::filesystem::directory_iterator(slot_dir, ec)) {   // a previous run's slots
@@ -1372,9 +1378,9 @@ static int glm_pack_generate(const Options& o) {
             }
             if (!is_meta) continue;                      // a .bin is judged by its .meta
             const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-            Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec)};
+            Found fd{bin, {}, 0, fs::last_write_time(de.path(), ec), kNoImages};
             const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-            if (meta_read(p, fd.toks, fd.bytes) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
+            if (meta_read(p, fd.toks, fd.bytes, fd.img) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days) {
                 found.push_back(std::move(fd));
             } else {
                 ++refused;
@@ -1394,6 +1400,7 @@ static int glm_pack_generate(const Options& o) {
         for (auto& fd : found) {
             total += fd.bytes;
             slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock});
+            slots.back().img = fd.img;
         }
         if (slot_keep) {
             std::ostringstream m;
@@ -1426,9 +1433,12 @@ static int glm_pack_generate(const Options& o) {
     };
     // the conversation in the model (its snapshot, snap_tokens) into a slot
     const auto slot_put = [&](const char* why) {
-        if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min || snap_img_hash != kNoImages) return;
-        for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
-            if (!slots[i].anchor && !slots[i].prefix && slots[i].tokens.size() <= snap_tokens.size() &&
+        if (slot_max <= 0 || snap_in_slot || snap_tokens.size() < slot_min) return;
+        // an earlier state of this conversation is superseded (the same pictures: the same tokens with other
+        // pictures are another conversation)
+        for (size_t i = slots.size(); i-- > 0;)
+            if (!slots[i].anchor && !slots[i].prefix && slots[i].img == snap_img_hash &&
+                slots[i].tokens.size() <= snap_tokens.size() &&
                 std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), snap_tokens.begin()))
                 slot_drop(i);
         while (!slots.empty() && slots.size() >= (size_t) slot_max) slot_drop(slot_lru(SIZE_MAX));
@@ -1445,6 +1455,7 @@ static int glm_pack_generate(const Options& o) {
             }
             slots.push_back({snap_tokens, "", bytes, ++slot_clock});
             slots.back().data = buf;
+            slots.back().img = snap_img_hash;
             snap_in_slot = true;
             uint64_t total = 0;
             for (const auto& s : slots) total += s.bytes;
@@ -1478,7 +1489,7 @@ static int glm_pack_generate(const Options& o) {
         std::string e;
         const uint64_t bytes = model.slot_save(path + ".tmp", e);
         if (bytes == 0 || (std::filesystem::rename(path + ".tmp", path, ec), ec) ||
-            !meta_write(meta_of(path), snap_tokens, bytes)) {
+            !meta_write(meta_of(path), snap_tokens, bytes, snap_img_hash)) {
             std::filesystem::remove(path + ".tmp", ec);
             std::filesystem::remove(path, ec);
             std::fprintf(stderr, "glm slots: setting the conversation aside failed (%s)\n",
@@ -1486,6 +1497,7 @@ static int glm_pack_generate(const Options& o) {
             return;
         }
         slots.push_back({snap_tokens, path, bytes, ++slot_clock});
+        slots.back().img = snap_img_hash;
         snap_in_slot = true;
         uint64_t total = 0;
         for (const auto& s : slots) total += s.bytes;
@@ -1505,11 +1517,12 @@ static int glm_pack_generate(const Options& o) {
     };
     // the longest slot this prompt continues, back in the model: the tokens it covers (0: none)
     const auto slot_take = [&](const std::vector<int32_t>& prompt) -> size_t {
-        if (slot_max <= 0 || !cur_img_pos.empty()) return 0;
+        if (slot_max <= 0) return 0;
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
-            if (t.size() > len && t.size() < prompt.size() && std::equal(t.begin(), t.end(), prompt.begin())) {
+            if (t.size() > len && t.size() < prompt.size() && std::equal(t.begin(), t.end(), prompt.begin()) &&
+                img_hash(t.size()) == slots[i].img) {
                 best = i;
                 len = t.size();
             }
@@ -1527,7 +1540,7 @@ static int glm_pack_generate(const Options& o) {
             return 0;
         }
         snap_tokens = slots[best].tokens;
-        snap_img_hash = kNoImages;
+        snap_img_hash = slots[best].img;
         snap_in_slot = true;
         slots[best].used = ++slot_clock;
         slots[best].anchor = false;
@@ -1614,7 +1627,7 @@ static int glm_pack_generate(const Options& o) {
     // checkpoints live with the model's state, so an unrelated conversation in between drops them, and another chat
     // with this system prompt read it all again (#179); the slot outlives that.  Once per system prompt.
     const auto slot_prefix = [&](const std::vector<int32_t>& prompt, size_t p) {
-        if (slot_max <= 0 || p < slot_min || !cur_img_pos.empty()) return;
+        if (slot_max <= 0 || p < slot_min) return;
         for (auto& sl : slots)
             if (sl.prefix && sl.tokens.size() == p && std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin())) {
                 sl.used = ++slot_clock;
