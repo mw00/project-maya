@@ -20,6 +20,13 @@
 // of one a row (gf::hc_rows, gf::kda_layers over the rows) - each row with its own scratch (rows_alloc) and the same
 // device functions as the per-row kernels, so its arithmetic is meant to be theirs (glm_rows_kernels_test compares
 // them bitwise).
+//
+// STRATA_GLM_ROWS_ATTN=1: a DSA layer's absorbed attention of all the rows in one launch instead of one a row: wk_b . q
+// for every row at once (gf::mla_q_abs), each row's selection (and, streamed, its slot cells) into its own buffers, the
+// split attention of all the rows over their own caches in one launch (gf::mla_attend_rows: a row's blocks on
+// blockIdx.z, so its 64 blocks no longer leave half the card idle), then wv_b . ctx for every row at once
+// (gf::mla_out) - the verify window's batched MLA, for rows of different conversations.  Each row's output is mla()'s
+// bit for bit (glm_rows_attn_test compares them).
 #include "glm_rows_state.hpp"
 
 #include "strata/core/mtp_rows.hpp"
@@ -49,6 +56,13 @@ bool rows_batch_on() {   // STRATA_GLM_ROWS_BATCH=1 (off by default)
     }();
     return on;
 }
+bool rows_attn_on() {   // STRATA_GLM_ROWS_ATTN=1 (off by default)
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_ROWS_ATTN");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
 }  // namespace
 
 // 8 rows (one a conversation); with STRATA_GLM_MULTI_MTP a group's verify windows, multi_mtp_cap() rows
@@ -72,6 +86,14 @@ bool Glm5Model::rows_alloc(std::string& err) {
         at += up256(row_bytes * R);
         return base == nullptr ? nullptr : base + off;
     };
+    const auto take_all = [&](size_t bytes) -> uint8_t* {   // once, not a row
+        const size_t off = at;
+        at += up256(bytes);
+        return base == nullptr ? nullptr : base + off;
+    };
+    cudaSetDevice(dev_);   // (mla_rows_ok asks the current device)
+    const bool attn = rows_attn_on() && gf::mla_rows_ok(g.kv_lora);
+    const int attn_tokens = (int) std::min<size_t>(R, (size_t) gf::kMlaTokMax);
     const auto f32 = [&](int64_t n) { return (float*) take((size_t) n * sizeof(float)); };
     const auto q8 = [&](int64_t n) { return take((size_t) n / 32 * kQ8); };
     const auto carve = [&] {
@@ -115,6 +137,14 @@ bool Glm5Model::rows_alloc(std::string& err) {
             S->hc_part = f32(S->hc_part_n);
             S->hc_ctr = take(64);
         }
+        if (attn) {   // (STRATA_GLM_ROWS_ATTN's buffers: none with the setting off)
+            S->aq = f32((int64_t) g.n_head * g.kv_lora);
+            S->actx = f32((int64_t) g.n_head * g.kv_lora);
+            S->acells = (int*) take((size_t) g.n_sel_max() * sizeof(int));
+            S->aslot = (int*) take((size_t) g.n_sel_max() * sizeof(int));
+            S->apart = (float*) take_all(gf::mla_rows_part_floats(g.n_head, g.kv_lora) * attn_tokens * sizeof(float));
+            S->apart_tokens = attn_tokens;
+        }
     };
     carve();   // the sizes
     cudaSetDevice(dev_);
@@ -130,6 +160,12 @@ bool Glm5Model::rows_alloc(std::string& err) {
     S->bytes = at;
     at = 0;
     carve();   // the pointers
+    if (attn)
+        std::fprintf(stderr, "glm rows: CUDA%d the DSA attention of up to %d rows a launch (MAYA_GLM_ROWS_ATTN), %zu MB of "
+                             "the rows' %zu MB\n", dev_, attn_tokens,
+                     (size_t) ((2 * R * g.n_head * g.kv_lora * sizeof(float) + 2 * R * g.n_sel_max() * sizeof(int) +
+                                gf::mla_rows_part_floats(g.n_head, g.kv_lora) * attn_tokens * sizeof(float)) >> 20),
+                     at >> 20);
     if (cudaHostAlloc((void**) &S->tok_h, R * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
         cudaEventCreateWithFlags(&S->ev_done, cudaEventDisableTiming) != cudaSuccess) {
         cudaGetLastError();
@@ -470,6 +506,23 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                 : gf::MvJob{Ly.idx_q_b, nullptr, S->qr, S->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
     if (!mv(j2, 2, "dsa q")) return false;
+    // STRATA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  Not
+    // for two rows of one conversation (a verify window) on a streamed layer: their resolves share its slot pool, so
+    // the second could evict a block the first one's attention still reads
+    const int64_t qd = (int64_t) g.n_head * g.qk_nope, ad = (int64_t) g.n_head * g.kv_lora, nsm = g.n_sel_max();
+    bool attn = rows_attn_on() && n > 1 && S->apart != nullptr && g.v_head % 32 == 0 && gf::mla_rows_ok(g.kv_lora);
+    if (attn) {
+        bool dup = false, streamed = false;
+        for (int i = 0; i < n; ++i) {
+            streamed = streamed || kv_streamed(rw[i].kv, il);
+            for (int k = 0; k < i && !dup; ++k) dup = rw[k].seq == rw[i].seq;
+        }
+        attn = !(dup && streamed);
+    }
+    const uint16_t* a_lat[gf::kMaxMvNt];
+    const int* a_cells[gf::kMaxMvNt];
+    int a_nsel[gf::kMaxMvNt];
+    if (attn) gf::mla_q_abs(S->q, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, n, S->aq, ad, s);
     for (int i = 0; i < n; ++i) {
         const int64_t p = rw[i].p;
         const int pool_done = (int) ((p + 1) / g.idx_kpool);
@@ -480,13 +533,29 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                           rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, F->score, s);
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
-        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, F->cells, s);
-        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
+        int* const sel = attn ? S->acells + (size_t) i * nsm : F->cells;
+        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
+        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
         uint16_t* const lat = (uint16_t*) (rw[i].state + (*rw[i].dsa_lat)[(size_t) il]);
+        if (attn) {
+            a_lat[i] = lat;
+            a_cells[i] = kv_attend_cells(rw[i].kv, il, lat, sel, n_sel, S->aslot + (size_t) i * nsm, s);
+            a_nsel[i] = n_sel;
+            continue;
+        }
         const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
-        gf::mla(rows(S->q, (int64_t) g.n_head * g.qk_nope, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
+        gf::mla(rows(S->q, qd, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
                 g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i), s,
                 lat_q8_);
+    }
+    if (attn) {
+        if (!gf::mla_attend_rows(S->aq, ad, a_lat, a_cells, a_nsel, n, g.n_head, g.qk_nope, g.kv_lora, S->actx, ad,
+                                 S->apart, S->apart_tokens, s, lat_q8_)) {
+            err = "glm rows: the rows' attention is not available here";   // (mla_rows_ok said it was)
+            return false;
+        }
+        gf::mla_out(S->actx, ad, Ly.v_b, g.n_head, g.kv_lora, g.v_head, n, S->attn_q,
+                    (int64_t) ((int64_t) g.n_head * g.v_head / 32) * kQ8, s);
     }
     gf::MvJob o = {Ly.out.q, S->attn_q, nullptr, S->mixer, nullptr, 1.0f, Ly.out.type, g.n_head * g.v_head,
                    E};

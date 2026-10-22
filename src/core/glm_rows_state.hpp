@@ -45,6 +45,11 @@ struct Glm5Model::RowsState {
     float *kg1 = nullptr, *kg2 = nullptr, *hc_part = nullptr;
     uint8_t* hc_ctr = nullptr;
     int64_t hc_part_n = 0;
+    // STRATA_GLM_ROWS_ATTN: the DSA attention of all the rows in one launch (gf::mla_attend_rows) - each row's q_abs and
+    // ctx (n_head x kv_lora), its own selection and streamed slot cells (n_sel_max), and the launch's partials
+    float *aq = nullptr, *actx = nullptr, *apart = nullptr;
+    int *acells = nullptr, *aslot = nullptr;
+    int apart_tokens = 0;
     int* tok_h = nullptr;   // pinned
     cudaEvent_t ev_done = nullptr;
 };

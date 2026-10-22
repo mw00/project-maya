@@ -3198,9 +3198,12 @@ constexpr int MLA_NC = 16;
 __host__ __device__ __forceinline__ int mla_cblk(int n_sel) {
     return max(MLA_CHUNK, ((n_sel + MLA_NC - 1) / MLA_NC + MLA_CHUNK - 1) / MLA_CHUNK * MLA_CHUNK);
 }
-// the tokens of one launch (blockIdx.z): each one's selected cell count
+// the tokens of one launch (blockIdx.z): each one's selected cell count; mla_attend_rows: each one's own latents and
+// cells too (tokens of different sequences: lat[tk] set), else the launch's lat and cells + tk * c_stride
 struct MlaToks {
     int n_sel[kMlaTokMax];
+    const uint16_t* lat[kMlaTokMax];
+    const int* cells[kMlaTokMax];
 };
 // a block: 16 heads of one token over its cells [blockIdx.x * cblk, + cblk), MLA_CHUNK at a time with a running max
 // and sum per head (the context rows rescaled when the max grows), so a block's partial covers cblk cells
@@ -3220,7 +3223,12 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
     if (c_begin >= n_sel) return;
     const int c_end = min(n_sel, c_begin + cblk);
     q_abs += tk * q_stride;
-    cells += tk * c_stride;
+    if (nt.lat[tk] != nullptr) {
+        lat = nt.lat[tk];
+        cells = nt.cells[tk];
+    } else {
+        cells += tk * c_stride;
+    }
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int h0 = blockIdx.y * 16, nh = min(16, n_head - h0);
     float* pm = part + (((size_t) tk * MLA_NC + blockIdx.x) * n_head + h0) * (MLA_KV + 2);
@@ -5625,6 +5633,36 @@ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat,
                                                                                          ctx + t0 * ctx_stride, ctx_stride);
     }
     launch_check("mla_attend_batch");
+    return true;
+}
+
+size_t mla_rows_part_floats(int n_head, int kv_lora) { return (size_t) MLA_NC * n_head * (kv_lora + 2); }
+
+bool mla_rows_ok(int kv_lora) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    return dev < 16 && kv_lora == MLA_KV && getenv("STRATA_GLM_MLA1") == nullptr && mla_mma_on(dev);
+}
+
+bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
+                     const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+                     float* part, int part_tokens, cudaStream_t s, bool lat_q8) {
+    if (T < 1 || part == nullptr || part_tokens < 1 || !mla_rows_ok(kv_lora)) return false;
+    const int G = std::min(part_tokens, kMlaTokMax);
+    for (int t0 = 0; t0 < T; t0 += G) {
+        const int nt = std::min(G, T - t0);
+        MlaToks tk{};
+        for (int i = 0; i < nt; ++i) {
+            tk.n_sel[i] = n_sel[t0 + i];
+            tk.lat[i] = lat[t0 + i];
+            tk.cells[i] = cells[t0 + i];
+        }
+        mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
+            q_abs + t0 * q_stride, q_stride, lat[t0], cells[t0], 0, tk, n_head, qk_nope, part, lat_q8);
+        mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
+                                                                                         ctx + t0 * ctx_stride, ctx_stride);
+    }
+    launch_check("mla_attend_rows");
     return true;
 }
 
