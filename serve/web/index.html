@@ -170,9 +170,15 @@
         <div class="hero__stats">
           <div class="kv"><span class="kv__k">Time per token</span><span class="kv__v" id="hero-ms">&ndash;</span></div>
           <div class="kv"><span class="kv__k">VRAM hit</span><span class="kv__v" id="hero-hit">&ndash;</span></div>
-          <div class="kv" title="Prompt and answer tokens of the request running now, else of the last one - against the model's context size"><span class="kv__k" id="hero-ctx-k">Context of the last request</span><span class="kv__v" id="hero-ctx">&ndash;</span></div>
+          <div class="kv" title="Prompt and answer tokens of every conversation running now, together"><span class="kv__k" id="hero-ctx-k">Context in use</span><span class="kv__v" id="hero-ctx">&ndash;</span></div>
           <div class="kv"><span class="kv__k">Requests served</span><span class="kv__v" id="hero-req">&ndash;</span></div>
         </div>
+      </div>
+
+      <!-- the conversations at once (READY multi=<n>): one row each -->
+      <div class="st-card convs" id="convs-card" hidden>
+        <div class="card-head"><span class="card-title">Conversations</span><span class="muted small" id="convs-sub"></span></div>
+        <div class="convs__list" id="convs-list" role="list"></div>
       </div>
 
       <!-- the expert tiers (the engine's STAT lines): shown only when the engine reports them -->

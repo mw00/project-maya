@@ -117,7 +117,7 @@ main { min-height: 0; min-width: 0; display: flex; }
 .state-card__row { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-4);
                    font-size: var(--st-fs-sm); font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
 .state-card__row #state-detail { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.state-badge { flex: none; }
+.state-badge { flex: 0 1 auto; min-width: 0; height: auto; min-height: 24px; padding-block: 2px; white-space: normal; line-height: 1.35; }
 .state-badge[data-s="reading"] { background: var(--st-info-tint); color: var(--st-info-text); border-color: transparent; }
 .state-badge[data-s="generating"] { background: var(--st-accent-tint); color: var(--st-accent-text); border-color: transparent; }
 .state-badge[data-s="generating"]::before { animation: pulse 1.6s var(--st-ease) infinite; }
@@ -232,6 +232,30 @@ button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline
 .req-card { display: flex; flex-direction: column; gap: var(--st-s-3); min-width: 0; }
 .table-wrap { overflow-x: auto; }
 .table-wrap.all { max-height: 420px; overflow-y: auto; }
+/* the conversations at once: one row each - who, what it does, how far, how fast, how deep */
+.convs { display: flex; flex-direction: column; gap: var(--st-s-3); }
+.convs__list { display: flex; flex-direction: column; }
+.conv { display: grid; grid-template-columns: minmax(150px, 220px) minmax(0, 1fr) 96px 120px; gap: var(--st-s-4); align-items: center;
+        padding: var(--st-s-3) 0; border-top: 1px solid var(--st-line); font-variant-numeric: tabular-nums; }
+.conv:first-child { border-top: 0; }
+.conv__who { display: flex; align-items: center; gap: var(--st-s-2); min-width: 0; }
+.conv__id { font-size: var(--st-fs-xs); color: var(--st-ink-muted); flex: none; }
+.conv__who .st-badge { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; line-height: 22px; }
+.conv__who .st-badge[data-s="reading"] { background: var(--st-info-tint); color: var(--st-info-text); border-color: transparent; }
+.conv__who .st-badge[data-s="generating"] { background: var(--st-accent-tint); color: var(--st-accent-text); border-color: transparent; }
+.conv__who .st-badge[data-s="waiting"] { color: var(--st-ink-muted); }
+.conv--done { opacity: .62; }
+.conv--done .st-progress__bar { background: var(--st-ink-muted); }
+.conv__prog { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.conv__prog .muted { font-size: var(--st-fs-xs); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv__num { display: flex; flex-direction: column; align-items: flex-end; gap: 0; }
+.conv__num b { font-size: var(--st-fs-lg); font-weight: var(--st-fw-black); letter-spacing: -.02em; }
+.conv__num span { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.convs__empty { margin: 0; font-size: var(--st-fs-sm); }
+@media (max-width: 720px) {
+  .conv { grid-template-columns: minmax(0, 1fr) auto auto; gap: var(--st-s-2) var(--st-s-4); }
+  .conv__prog { grid-column: 1 / -1; grid-row: 2; }
+}
 .req-totals { margin: 0; font-size: var(--st-fs-sm); }
 .req-totals:empty { display: none; }
 .mcp-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
