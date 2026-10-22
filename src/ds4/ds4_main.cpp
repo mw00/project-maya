@@ -6,12 +6,15 @@
 //
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
-// <decode ms> <stop|length|cancel> 0 0 <reused> 0 0`; `STOP` ends a request early, `QUIT` the engine.  A prompt that
+// <decode ms> <stop|length|cancel> <accepted> <offered> <reused> <hits> <lookups>` (the drafts; the decode's routed
+// experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.
 #include "ds4_model.hpp"
 #include "strata/platform/env_alias.hpp"
+
+#include <cuda_profiler_api.h>
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -78,7 +82,7 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
-                 "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --serve\n"
+                 "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
 
@@ -362,6 +366,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
         const double t0 = now_ms();
+        const strata::ds4::Stats s0 = m.stats();   // (the request's own CPU lane share)
         std::vector<Pic> pics;
         {
             std::string e;
@@ -507,6 +512,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         held = std::move(pics);
         m.checkpoint(0);
         const double t1 = now_ms();
+        const strata::ds4::Stats sd = m.stats();   // (the decode's own counters: STAT lines, DONE's hit fields)
         long long produced = 0;
         const char* finish = "length";
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
@@ -608,8 +614,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
-        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
-                    d_acc, d_off, from);
+        const strata::ds4::Stats& se = m.stats();   // (hits / lookups: the decode's routed experts in VRAM / all)
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
+                    finish, d_acc, d_off, from, (long long) ((se.experts - sd.experts) - (se.cpu_experts - sd.cpu_experts)),
+                    (long long) (se.experts - sd.experts));
         std::fflush(stdout);
         const auto& s = m.stats();
         std::fprintf(stderr,
@@ -618,7 +626,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      r.ids.size(), from, r.ids.size() - from, t1 - t0,
                      t1 > t0 ? 1000.0 * (double) (r.ids.size() - from) / (t1 - t0) : 0.0, produced, t2 - t1,
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
-                     s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
+                     s.experts > s0.experts ? 100.0 * (double) (s.cpu_experts - s0.cpu_experts) / (double) (s.experts - s0.experts)
+                                            : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
         m.save_profile();
@@ -631,8 +640,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+    // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
+    // reproducibility): the chunked prompt path's GEMMs run beside the copy and hc streams, and without this each
+    // process could pick other kernels - a long prompt's logits differing from one start to the next.  Before any
+    // cuBLAS handle; a setting the caller made stays
+    if (std::getenv("CUBLAS_WORKSPACE_CONFIG") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
+#else
+        setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 0);
+#endif
+    }
     strata::ds4::Options o;
-    std::string ids_s, dump, eos = "1";
+    std::string ids_s, dump, eos = "1", ppl;
     int n = 0, window = 16;
     bool spec = true;
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
@@ -686,6 +706,7 @@ int main(int argc, char** argv) {
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
+        else if (a == "--ppl") ppl = val("--ppl");
         else if (a == "--serve") serve_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
@@ -697,7 +718,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty())) {
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty())) {
         usage();
         return 2;
     }
@@ -712,6 +733,40 @@ int main(int argc, char** argv) {
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf);
+    if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
+        std::ifstream in(ppl);
+        std::string line;
+        double nll = 0.0;
+        long long scored = 0;
+        int k = 0;
+        std::vector<float> lg;
+        const int V = m.vocab();
+        while (std::getline(in, line)) {
+            const std::vector<int> seq = parse_ids(line);
+            if (seq.size() < 2) continue;
+            m.reset();
+            if (!m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) || !m.logits(lg) ||
+                lg.size() < (seq.size() - 1) * (size_t) V) {
+                std::fprintf(stderr, "maya-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
+                return 1;
+            }
+            double s_nll = 0.0;
+            for (size_t i = 0; i + 1 < seq.size(); ++i) {   // row i: the next token's log-probability
+                const float* r = lg.data() + i * (size_t) V;
+                float mx = r[0];
+                for (int v = 1; v < V; ++v) mx = std::max(mx, r[v]);
+                double z = 0.0;
+                for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
+                s_nll += (double) mx + std::log(z) - (double) r[seq[i + 1]];
+            }
+            nll += s_nll;
+            scored += (long long) seq.size() - 1;
+            std::fprintf(stderr, "ppl: sequence %d, %zu tokens: %.4f\n", k++, seq.size(), std::exp(s_nll / (double) (seq.size() - 1)));
+        }
+        std::printf("perplexity %.4f over %lld tokens of %d sequences\n", scored ? std::exp(nll / (double) scored) : 0.0,
+                    scored, k);
+        return 0;
+    }
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
         std::vector<uint8_t> px((size_t) std::max(0, enc_w) * std::max(0, enc_h) * 3);
@@ -739,6 +794,18 @@ int main(int argc, char** argv) {
         }
         return 0;
     }
+    if (!ids_s.empty() && ids_s[0] == '@') {   // --ids @FILE: the ids from a file (a long prompt passes no argv limit)
+        std::FILE* f = std::fopen(ids_s.c_str() + 1, "rb");
+        if (f == nullptr) {
+            std::fprintf(stderr, "maya-ds4: cannot open %s\n", ids_s.c_str() + 1);
+            return 1;
+        }
+        std::string all;
+        char buf[1 << 16];
+        for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) all.append(buf, n);
+        std::fclose(f);
+        ids_s = all;
+    }
     const std::vector<int> ids = parse_ids(ids_s);
     if (!images.empty()) {   // --images: a GENI file's pictures, for the prompt's spans
         std::vector<Pic> pics;
@@ -760,9 +827,23 @@ int main(int argc, char** argv) {
         }
         m.set_images(std::move(imgs));
     }
-    std::FILE* df = dump.empty() ? nullptr : std::fopen(dump.c_str(), "wb");
+    // DS4_BENCH_REPEAT=N: the prompt and the decode N times, the state reset between them and the expert cache kept
+    // (the later passes measure a warmed cache, as a server's requests run)
+    const int reps = std::max(1, std::getenv("DS4_BENCH_REPEAT") ? std::atoi(std::getenv("DS4_BENCH_REPEAT")) : 1);
+    for (int rep = 0; rep < reps; ++rep) {
+    if (rep > 0) {
+        m.reset();
+        std::fprintf(stderr, "pass %d of %d\n", rep + 1, reps);
+    }
+    // (repeated: each pass's logits to a file of its own, <dump>.<pass> - a run's determinism, one load)
+    const std::string dpath = reps > 1 ? dump + "." + std::to_string(rep) : dump;
+    std::FILE* df = dump.empty() ? nullptr : std::fopen(dpath.c_str(), "wb");
     std::vector<float> lg;
     m.begin_request();
+    // DS4_PROFILE_PROMPT: the prompt alone in the capture (nsys --capture-range=cudaProfilerApi), the last pass
+    const bool prof_prompt = std::getenv("DS4_PROFILE_PROMPT") != nullptr && rep == reps - 1;
+    const strata::ds4::Stats sp = m.stats();
+    if (prof_prompt) cudaProfilerStart();
     const double t0 = now_ms();
     for (size_t a = 0; a < ids.size();) {
         const int T = (int) std::min<size_t>((size_t) window, ids.size() - a);
@@ -776,13 +857,27 @@ int main(int argc, char** argv) {
     }
     m.set_images({});
     const double t1 = now_ms();
+    if (prof_prompt) cudaProfilerStop();
     std::fprintf(stderr, "prompt: %zu tokens in %.0f ms (%.2f tok/s, windows of %d)\n", ids.size(), t1 - t0,
                  1000.0 * (double) ids.size() / (t1 - t0), window);
+    if (const char* dl = std::getenv("DS4_DUMP_LAST")) {   // the prompt's last row of logits, <file>.<pass>
+        std::vector<float> ll;
+        std::FILE* f = m.logits(ll) ? std::fopen((std::string(dl) + "." + std::to_string(rep)).c_str(), "wb") : nullptr;
+        if (f != nullptr) {
+            const size_t V = (size_t) m.vocab();
+            std::fwrite(ll.data() + ll.size() - V, 4, V, f);
+            std::fclose(f);
+        }
+    }
     const strata::ds4::Stats s0 = m.stats();
     if (s0.eg_rows > 0)
         std::fprintf(stderr, "prompt's Engram rows: %lld, %.1f%% without a read (repeats and the row cache), %lld read\n",
                      (long long) s0.eg_rows, 100.0 * (double) s0.eg_hits / (double) s0.eg_rows, (long long) s0.eg_reads);
     const long long io0 = io_read_bytes();
+    std::fprintf(stderr, "prompt's host time: layers %.0f ms, head wait %.0f, Engram waits %.0f, CPU lane %.0f\n",
+                 s0.layer_ms - sp.layer_ms, s0.head_ms - sp.head_ms, s0.engram_ms - sp.engram_ms, s0.cpu_ms - sp.cpu_ms);
+    const bool prof = std::getenv("DS4_PROFILE") != nullptr;   // (nsys --capture-range=cudaProfilerApi: the decode alone)
+    if (prof && rep == reps - 1) cudaProfilerStart();   // (the last pass)
     std::vector<int> out;
     unsigned long long counter = 0;
     long long d_off = 0, d_acc = 0, rounds = 0;
@@ -815,6 +910,7 @@ int main(int argc, char** argv) {
         std::printf("\n");
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
     }
+    if (prof && rep == reps - 1) cudaProfilerStop();
     if (spec && rounds > 0) {
         const auto& s1 = m.stats();
         const double nv = (double) std::max<int64_t>(1, s1.drafts_rounds - s0.drafts_rounds);
@@ -886,6 +982,7 @@ int main(int argc, char** argv) {
                      (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt);
     }
     if (df != nullptr) std::fclose(df);
+    }
     m.save_profile();
     return 0;
 }

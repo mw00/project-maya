@@ -5935,15 +5935,18 @@ constexpr int kWinEnt = kMaxWinTokens * 8;
 // (the tables in shared memory: as locals they were a 2.6 KB stack a thread, which the driver reserves for every thread
 // the device can hold - ~420 MB on a V100 - and a launch failed "out of memory" once the expert pool had the rest)
 __global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
-    __shared__ unsigned long long gp[kWinEnt];
+    __shared__ unsigned long long gp[kWinEnt], pp[kWinEnt];
     __shared__ int cnt[kWinEnt], gof[kWinEnt], fill[kWinEnt + 1];
+    // the plan read by every thread at once (one thread's loads, one after another, took most of the kernel's time)
+    for (int e = threadIdx.x; e < w.T * 8; e += blockDim.x) pp[e] = (e & 7) < w.k ? w.plan_ptr[e] : 0ull;
+    __syncthreads();
     if (threadIdx.x != 0) return;
     int ng = 0;
     for (int t = 0; t < w.T; ++t)
         for (int i = 0; i < 8; ++i) {
             const int e = t * 8 + i;
             gof[e] = -1;
-            const unsigned long long p = i < w.k ? w.plan_ptr[e] : 0ull;
+            const unsigned long long p = pp[e];
             if (p == 0ull) continue;
             int g = 0;
             while (g < ng && gp[g] != p) ++g;

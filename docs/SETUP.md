@@ -20,7 +20,11 @@ It first asks which model to set up:
   sources and checks every file against its pinned size (and, once downloaded, its sha256: `tools/ds4/download.json`, `download-3.5bpw.json`);
   `--model-dir DIR` uses files you already have; the pack is `DIR/maya-ds4/` (`tools/ds4/pack.py`, about a minute);
   pictures need nothing more - the model's own vision tower runs in the engine; the config is `maya-ds4.json`, with
-  tensor parallel across pairs of equal GPUs (`--tp 2`); there is no tuning step (the engine balances its own split).
+  tensor parallel across pairs of equal GPUs (`--tp 2`). The engine balances its own layer split; `./maya.sh --calibrate`
+  (not offered by the setup) measures each `--tp` that groups your GPUs differently and fewer CPU threads, an engine
+  start each (about an hour on 9 GPUs), and keeps the fastest answers whose long prompts still read at 60% of the
+  config's own `--tp`'s speed; a setting the engine does not start with is left out (`tools/calibrate_ds4_tp.py`; the
+  result goes into `maya-ds4.json` and a setup again keeps it).
 
   Or from [unsloth's GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant`; the setup asks):
   **UD-Q8_K_XL** (508 GB, the default: dense weights BF16, routed experts MXFP4, the Engram tables FP8 - DeepSeek's own

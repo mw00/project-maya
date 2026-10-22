@@ -362,6 +362,7 @@ function renderTiers(t, eng) {
 // one GPU: its row, opened (the hardware cards have its readings)
 const GPU_PARTS = [
   {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
+  {key: "prompt", label: "Prompt buffers"}, {key: "tp", label: "Tensor parallel"},
   {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
   {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
 ];
@@ -407,11 +408,15 @@ function gpuDetail(g, segs, m) {
                          : `${ctxfmt(ctx)} positions`) + (inUse ? ` · ${kfmt(inUse)} in use` : "") +
         (g.kv_ram ? ` · ${gb(g.kv_ram)} GB pinned in RAM` : ""),
     act: "one token's working buffers",
+    prompt: "a long prompt's chunks: their working buffers and the ring the CPU lane's experts stream through",
+    tp: g.tp_n > 1 ? `the copies a group of ${g.tp_n} GPUs needs: the tensors each of them holds whole, and its layers' KV cache`
+                   : "",
     drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""]
       .filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
       .filter(Boolean).join(" · "),
-    vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
+    vision: g.vision_lent ? "the pool's tail, while it encodes" : g.vision_own ? "the vision tower, in the engine's process"
+                                                                                : "its own process",
     rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
     free: (g.free || 0) < 1.5 * GIB ? "kept free for the driver and the sampler" : "unused",

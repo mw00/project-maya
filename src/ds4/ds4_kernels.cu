@@ -3,7 +3,9 @@
 #include "ds4_kernels.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
+#include "ds4_pool.hpp"
 
+#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -11,7 +13,24 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <cstring>
+#include <cctype>
+#include <vector>
+#include <chrono>
+#include <memory>
+#include <thread>
+#include <mutex>
+#include <deque>
+#include <condition_variable>
+#if !defined(_WIN32)   // (the host all-reduce's rows on a NUMA node)
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 namespace strata::ds4 {
 namespace {
@@ -73,6 +92,14 @@ __device__ __forceinline__ T ld_fresh(const T* p) {
 #pragma unroll
     for (int i = 0; i < (int) (sizeof(T) / 4); ++i) d[i] = s[i];
     return v;
+#else
+    return __ldcv(p);
+#endif
+}
+// (a byte: HIP's volatile load of it)
+__device__ __forceinline__ unsigned char ld_fresh_byte(const unsigned char* p) {
+#if defined(STRATA_USE_HIP)
+    return *(const volatile unsigned char*) p;
 #else
     return __ldcv(p);
 #endif
@@ -612,6 +639,177 @@ __device__ __forceinline__ void rows_at(const Rows& r, int t, int& n, int& k) {
 }
 
 // ---------------------------------------------------------------- the indexer
+// the same scores on the tensor cores (packed FP4 keys, hd 128, at most 32 heads), in integers: a key's 32 values are
+// E2M1 codes times a power of two, and so are a query head's (quant 3) - twice each code an integer of at most 12, so a
+// 32-value block's dot is an exact integer (mma.sync m16n8k32, int8 in, int32 out) times the two powers of two; the
+// four blocks' sums in FP32 (index_score_kernel's FP32 sum of 128 products rounds more than this).  A tile of 128 key
+// slots at a time, QT queries' 32 heads each (the shared rows: 1-6 queries a block; with candidates 1, each query its
+// own rows), relu and the head weights' sum by lanes; a block loops over tiles (the queries converted once)
+template <int QT>
+__global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __restrict__ q, const float* __restrict__ w,
+                                                             const uint8_t* __restrict__ kp, int heads, int n, int T,
+                                                             const int* __restrict__ cand, int cand_stride, int blk,
+                                                             Rows lim, float* __restrict__ out, long long out_stride,
+                                                             int ntiles) {
+    constexpr int HD = 128, KT = 128, LD = HD + 16, NQ = QT * 32, NB = HD / 32;
+    constexpr size_t RB = kv_row_bytes(kKvFp4p, HD);   // (a packed key row: its codes, its scales, padded to 16)
+    extern __shared__ __align__(16) int8_t tc_smem[];   // Ks [KT][LD], Qs [NQ][LD] (int8), ek [KT][NB], eq [NQ][NB]
+    int8_t* Ks = tc_smem;
+    int8_t* Qs = Ks + KT * LD;
+    int* ek = (int*) (Qs + NQ * LD);
+    int* eq = ek + KT * NB;
+    __shared__ float ws[NQ];
+    __shared__ int ln_s[QT], lk_s[QT];
+    const int t0 = blockIdx.y * QT;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, tg = lane & 3;
+    // the queries to integers: a warp 4 heads of a query at a time, a lane 4 values of each (its loads all at once),
+    // a block's 32 values on 8 lanes (their largest by shuffles: a = m 2^e, m in [0.5, 1) - the block's values times
+    // 2^(4 - e) are integers of at most 12)
+    for (int r0 = warp * 4; r0 < NQ; r0 += (blockDim.x >> 5) * 4) {
+        float4 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int r = r0 + u, t = t0 + r / 32, h = r % 32;
+            v[u] = t < T && h < heads ? *(const float4*) (q + ((size_t) t * heads + h) * HD + lane * 4)
+                                      : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            float a = fmaxf(fmaxf(fabsf(v[u].x), fabsf(v[u].y)), fmaxf(fabsf(v[u].z), fabsf(v[u].w)));
+            for (int o = 4; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+            // (a = m 2^e, m in [0.5, 1): e from its exponent bits; 0 for none - and its powers of two exactly)
+            const int e = a > 0.0f ? (int) ((__float_as_uint(a) >> 23) & 0xffu) - 126 : 0;
+            const float sc = __int_as_float((127 + 4 - e) << 23);
+            const uint32_t b0 = (uint8_t) (int8_t) __float2int_rn(v[u].x * sc), b1 = (uint8_t) (int8_t) __float2int_rn(v[u].y * sc),
+                           b2 = (uint8_t) (int8_t) __float2int_rn(v[u].z * sc), b3 = (uint8_t) (int8_t) __float2int_rn(v[u].w * sc);
+            *(uint32_t*) (Qs + (r0 + u) * LD + lane * 4) = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            if ((lane & 7) == 0) eq[(r0 + u) * NB + lane / 8] = e - 4;
+        }
+    }
+    for (int i = threadIdx.x; i < NQ; i += blockDim.x) {
+        const int t = t0 + i / 32, h = i % 32;
+        ws[i] = t < T && h < heads ? w[(size_t) t * 64 + h] : 0.0f;
+    }
+    if ((int) threadIdx.x < QT) {
+        int a = 0, b = 0;
+        if (t0 + (int) threadIdx.x < T) rows_at(lim, t0 + (int) threadIdx.x, a, b);
+        ln_s[threadIdx.x] = a, lk_s[threadIdx.x] = b;
+    }
+    __syncthreads();
+    const int* cd = cand != nullptr ? cand + (size_t) t0 * cand_stride : nullptr;   // (QT 1 with candidates)
+    // slot i's key position for query tq, or -1 (none: -inf)
+    auto pos_of = [&](int i, int tq) -> int {
+        if (i >= n) return -1;
+        int p = i;
+        if (cd != nullptr) {
+            if (i >= lk_s[tq] * blk) return -1;
+            p = cd[i / blk] * blk + i % blk;
+        }
+        return p < ln_s[tq] ? p : -1;
+    };
+    // a tile's rows: a thread 8 words of 8 codes (and their blocks' scale bytes) - fetched a tile ahead, into registers
+    // while the tile before computes, then made integers in Ks (twice the E2M1 values: 0 1 2 3 4 6 8 12, signed)
+    constexpr int NW = KT * (HD / 8) / 256;
+    uint32_t rw[NW], sb[NW];
+    auto fetch = [&](int tile) {
+#pragma unroll
+        for (int u = 0; u < NW; ++u) {
+            const int x = threadIdx.x + u * 256, j = x / (HD / 8), c = (x % (HD / 8)) * 8, i = tile * KT + j;
+            const int p = cd != nullptr ? pos_of(i, 0) : i < n ? i : -1;   // (shared rows: every slot below n)
+            if (p >= 0) {
+                const uint8_t* kr = kp + (size_t) p * RB;
+                rw[u] = *(const uint32_t*) (kr + c / 2);
+                sb[u] = (c & 31) == 0 ? kr[HD / 2 + c / 32] : 0u;
+            } else
+                rw[u] = 0u, sb[u] = 128u;   // (no row: zeros, its blocks' scale 2^0)
+        }
+    };
+    auto stage = [&]() {
+#pragma unroll
+        for (int u = 0; u < NW; ++u) {
+            const int x = threadIdx.x + u * 256, j = x / (HD / 8), c = (x % (HD / 8)) * 8;
+            uint32_t lo = 0u, hi = 0u;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                const uint32_t cc = (rw[u] >> (4 * e)) & 15u;
+                const uint32_t v = (uint32_t) (0x0C08060403020100ull >> (8 * (cc & 7u))) & 0xffu;
+                const uint32_t byte = (cc & 8u ? 0u - v : v) & 0xffu;
+                if (e < 4) lo |= byte << (8 * e);
+                else hi |= byte << (8 * (e - 4));
+            }
+            *(uint2*) (Ks + j * LD + c) = make_uint2(lo, hi);
+            if ((c & 31) == 0) ek[j * NB + c / 32] = (int) sb[u] - 128;
+        }
+    };
+    if (blockIdx.x < ntiles) fetch(blockIdx.x);
+    for (int tile = blockIdx.x; tile < ntiles; tile += gridDim.x) {
+        const int i0 = tile * KT;
+        stage();
+        __syncthreads();
+        if (tile + (int) gridDim.x < ntiles) fetch(tile + gridDim.x);   // (in flight beside the MMAs below)
+        float acc[QT * 4][4];
+#pragma unroll
+        for (int nt = 0; nt < QT * 4; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+        const int ra = warp * 16 + g;   // (this thread's rows: ra and ra + 8)
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const int8_t* kr0 = Ks + ra * LD + b * 32 + tg * 4;
+            const uint32_t a0 = *(const uint32_t*) kr0, a1 = *(const uint32_t*) (kr0 + 8 * LD),
+                           a2 = *(const uint32_t*) (kr0 + 16), a3 = *(const uint32_t*) (kr0 + 8 * LD + 16);
+            const int ea = ek[ra * NB + b], eb = ek[(ra + 8) * NB + b];
+#pragma unroll
+            for (int nt = 0; nt < QT * 4; ++nt) {
+                const int col = nt * 8 + tg * 2;
+                const int8_t* qr = Qs + (nt * 8 + g) * LD + b * 32 + tg * 4;
+                const uint32_t b0 = *(const uint32_t*) qr, b1 = *(const uint32_t*) (qr + 16);
+                int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                             "{%0,%1,%2,%3};\n"
+                             : "+r"(c0), "+r"(c1), "+r"(c2), "+r"(c3)
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+                const int q0 = eq[col * NB + b], q1 = eq[(col + 1) * NB + b];
+                acc[nt][0] += (float) c0 * __int_as_float((127 + ea + q0) << 23);
+                acc[nt][1] += (float) c1 * __int_as_float((127 + ea + q1) << 23);
+                acc[nt][2] += (float) c2 * __int_as_float((127 + eb + q0) << 23);
+                acc[nt][3] += (float) c3 * __int_as_float((127 + eb + q1) << 23);
+            }
+        }
+        // rows ra (c0, c1) and ra + 8 (c2, c3); columns nt*8 + tg*2 + {0, 1}: query nt / 4, head (nt % 4)*8 + ..
+#pragma unroll
+        for (int tq = 0; tq < QT; ++tq) {
+            float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const float* wh = ws + tq * 32 + u * 8 + tg * 2;
+                const float* av = acc[tq * 4 + u];
+                s0 += fmaxf(av[0], 0.0f) * wh[0] + fmaxf(av[1], 0.0f) * wh[1];
+                s1 += fmaxf(av[2], 0.0f) * wh[0] + fmaxf(av[3], 0.0f) * wh[1];
+            }
+            s0 += __shfl_xor_sync(0xffffffffu, s0, 1);
+            s0 += __shfl_xor_sync(0xffffffffu, s0, 2);
+            s1 += __shfl_xor_sync(0xffffffffu, s1, 1);
+            s1 += __shfl_xor_sync(0xffffffffu, s1, 2);
+            const int t = t0 + tq;
+            if (tg == 0 && t < T) {
+                float* o = out + (long long) t * out_stride;
+                const int ia = i0 + ra, ib = ia + 8;
+                if (ia < n) o[ia] = pos_of(ia, tq) >= 0 ? s0 : -INFINITY;
+                if (ib < n) o[ib] = pos_of(ib, tq) >= 0 ? s1 : -INFINITY;
+            }
+        }
+        __syncthreads();   // (the next tile's rows over these)
+    }
+}
+template <int QT>
+constexpr size_t index_tc_smem() { return (size_t) (128 + QT * 32) * (128 + 16) + (size_t) (128 + QT * 32) * 4 * 4; }
+template <int QT>
+void index_tc_launch(int gx, int gy, cudaStream_t s, const float* q, const float* w, const uint8_t* kp, int heads, int n,
+                     int T, const int* cand, int cand_stride, int blk, const Rows& lim, float* out, long long out_stride,
+                     int ntiles) {
+    index_score_tc_kernel<QT><<<dim3(gx, gy), 256, index_tc_smem<QT>(), s>>>(q, w, kp, heads, n, T, cand, cand_stride, blk,
+                                                                             lim, out, out_stride, ntiles);
+}
+
 // a thread a position: its key row (KF: kKvFp4p packed, or BF16) against every head's query (shared memory), relu,
 // weighted sum
 template <int HD, int KF>
@@ -682,31 +880,25 @@ __device__ __forceinline__ uint32_t ord_key(float f) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
-// a block a row: the k-th largest key by four 8-bit radix passes, then everything above it and enough of its ties
-__global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ vals, long long stride, Rows r,
-                                                    const int* __restrict__ cand, int cand_stride, int blk,
-                                                    int* __restrict__ out, int out_stride) {
+// a block's selection over a sequence of n keys (key(i)): the k-th largest by four 8-bit radix passes, then everything
+// above it and the first of its ties - placed by a block-wide scan in sequence order (not by atomics: the same rows, in
+// the same order, run after run - the sparse attention sums them in that order).  emit(slot, i) takes pick i to its
+// slot: LAYOUT 0 (the indexer's) the ones above the k-th in order, then its ties in order; LAYOUT 1 the picks as one run
+// in sequence order (a row segment's candidates for topk_merge).  k < n; returns the k-th key
+template <int LAYOUT, class Key, class Emit>
+__device__ __forceinline__ uint32_t topk_block(int n, int k, Key key, Emit emit) {
     __shared__ unsigned hist[256];
     __shared__ uint32_t prefix_s, mask_s;
     __shared__ int remaining_s;
-    __shared__ int cnt_gt, cnt_eq;
-    const int t = blockIdx.x;
-    int n, k;
-    rows_at(r, t, n, k);
-    vals += (long long) t * stride;
-    out += (size_t) t * out_stride;
-    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
-    if (n <= 0) return;
-    if (k >= n) {
-        for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
-        return;
-    }
+    __shared__ int warp_gt[32], warp_eq[32], warp_sel[32];
+    __shared__ int base_gt, base_eq, base_sel;
     if (threadIdx.x == 0) {
         prefix_s = 0u;
         mask_s = 0u;
         remaining_s = k;
-        cnt_gt = 0;
-        cnt_eq = 0;
+        base_gt = 0;
+        base_eq = 0;
+        base_sel = 0;
     }
     __syncthreads();
     for (int shift = 24; shift >= 0; shift -= 8) {
@@ -714,7 +906,7 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
         __syncthreads();
         const uint32_t prefix = prefix_s, mask = mask_s;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
-            const uint32_t u = ord_key(vals[i]);
+            const uint32_t u = key(i);
             if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 0xffu], 1u);
         }
         __syncthreads();
@@ -737,51 +929,186 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
     const uint32_t thr = prefix_s;
     const int remaining = remaining_s;
     const int n_gt = k - remaining;
-    // the picks in index order (a scan a pass of 1024 values), so the attention sums them in the same order every run
-    // and the ties kept are the lowest positions
-    __shared__ int wgt[32], weq[32];
-    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
-    const unsigned below = (1u << lane) - 1u;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = (int) blockDim.x >> 5;
     for (int i0 = 0; i0 < n; i0 += blockDim.x) {
         const int i = i0 + threadIdx.x;
-        const uint32_t u = i < n ? ord_key(vals[i]) : 0u;
+        const uint32_t u = i < n ? key(i) : 0u;
         const bool gt = i < n && u > thr, eq = i < n && u == thr;
-        const unsigned bg = __ballot_sync(0xffffffffu, gt), be = __ballot_sync(0xffffffffu, eq);
+        const unsigned mg = __ballot_sync(0xffffffffu, gt), me = __ballot_sync(0xffffffffu, eq);
         if (lane == 0) {
-            wgt[wid] = __popc(bg);
-            weq[wid] = __popc(be);
+            warp_gt[wp] = __popc(mg);
+            warp_eq[wp] = __popc(me);
         }
         __syncthreads();
-        if (wid == 0) {
-            const int g0 = lane < nw ? wgt[lane] : 0, e0 = lane < nw ? weq[lane] : 0;
-            int gs = g0, es = e0;
-            for (int o = 1; o < 32; o <<= 1) {
-                const int a = __shfl_up_sync(0xffffffffu, gs, o), b = __shfl_up_sync(0xffffffffu, es, o);
-                if (lane >= o) {
-                    gs += a;
-                    es += b;
-                }
+        int bg = base_gt, be = base_eq, tg = 0, te = 0;
+        for (int w = 0; w < nw; ++w) {
+            if (w < wp) {
+                bg += warp_gt[w];
+                be += warp_eq[w];
             }
-            if (lane < nw) {
-                wgt[lane] = cnt_gt + gs - g0;
-                weq[lane] = cnt_eq + es - e0;
-            }
-            __syncwarp();
-            if (lane == 31) {
-                cnt_gt += gs;
-                cnt_eq += es;
-            }
+            tg += warp_gt[w];
+            te += warp_eq[w];
         }
-        __syncthreads();
-        int slot = -1;
-        if (gt) slot = wgt[wid] + __popc(bg & below);
-        else if (eq) {
-            const int e = weq[wid] + __popc(be & below);
-            if (e < remaining) slot = n_gt + e;
+        const unsigned below = (1u << lane) - 1u;
+        const int e = be + __popc(me & below);   // (this one's place among the ties)
+        if constexpr (LAYOUT == 0) {
+            int slot = -1;
+            if (gt) slot = bg + __popc(mg & below);
+            else if (eq && e < remaining) slot = n_gt + e;
+            if (slot >= 0) emit(slot, i);
+            __syncthreads();
+        } else {
+            const bool sel = gt || (eq && e < remaining);
+            const unsigned ms = __ballot_sync(0xffffffffu, sel);
+            if (lane == 0) warp_sel[wp] = __popc(ms);
+            __syncthreads();
+            int bs = base_sel, ts = 0;
+            for (int w = 0; w < nw; ++w) {
+                if (w < wp) bs += warp_sel[w];
+                ts += warp_sel[w];
+            }
+            if (sel) emit(bs + __popc(ms & below), i);
+            __syncthreads();
+            if (threadIdx.x == 0) base_sel += ts;
         }
-        if (slot >= 0) out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        if (threadIdx.x == 0) {
+            base_gt += tg;
+            base_eq += te;
+        }
         __syncthreads();
     }
+    return thr;
+}
+
+// a block a row: topk_block over the row
+__global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ vals, long long stride, Rows r,
+                                                    const int* __restrict__ cand, int cand_stride, int blk,
+                                                    int* __restrict__ out, int out_stride) {
+    const int t = blockIdx.x;
+    int n, k;
+    rows_at(r, t, n, k);
+    vals += (long long) t * stride;
+    out += (size_t) t * out_stride;
+    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
+    if (n <= 0) return;
+    if (k >= n) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        return;
+    }
+    topk_block<0>(n, k, [&](int i) { return ord_key(vals[i]); },
+                  [&](int slot, int i) { out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i; });
+}
+
+// a few rows of many positions (a decode window's): each row in P segments, a block each - its own top k, in position
+// order (every one of the row's picks in it is among them: fewer than k of the row's lie above the row's k-th value,
+// and its ties there are the segment's first) - then a block a row over the segments' runs, in position order too: the
+// picks and the order topk_kernel gives, a row's passes spread over P blocks instead of one
+__global__ void __launch_bounds__(1024) topk_seg_kernel(const float* __restrict__ vals, long long stride, Rows r, int P,
+                                                        int K, float* __restrict__ sv, int* __restrict__ si,
+                                                        int* __restrict__ sn, uint32_t* __restrict__ sk) {
+    const int p = blockIdx.x, t = blockIdx.y;
+    int n, k;
+    rows_at(r, t, n, k);
+    if (n <= 0 || k >= n) return;   // (the merge takes the whole row)
+    vals += (long long) t * stride;
+    const int S = (n + P - 1) / P, lo = p * S, ns = max(0, min(n, lo + S) - lo);
+    float* cv = sv + ((size_t) t * P + p) * K;
+    int* ci = si + ((size_t) t * P + p) * K;
+    if (ns <= k) {   // (all of it: no floor)
+        for (int i = threadIdx.x; i < ns; i += blockDim.x) cv[i] = vals[lo + i], ci[i] = lo + i;
+        if (threadIdx.x == 0) sn[t * P + p] = ns, sk[t * P + p] = 0u;
+        return;
+    }
+    const uint32_t kth = topk_block<1>(ns, k, [&](int i) { return ord_key(vals[lo + i]); },
+                                       [&](int slot, int i) { cv[slot] = vals[lo + i], ci[slot] = lo + i; });
+    if (threadIdx.x == 0) sn[t * P + p] = k, sk[t * P + p] = kth;   // (the row's k-th is at least the segment's)
+}
+// the merge: only the segments' picks at or above the largest segment's k-th (the row's k-th is at least that) - into
+// shared memory in position order, then topk_block over them (all of the candidates when more than kMergeCap pass: with
+// 16K-position segments ~3% of a row pass, 8192 of them past 256K positions)
+constexpr int kMergeCap = 8192;
+__global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, const float* __restrict__ sv,
+                                                          const int* __restrict__ si, const int* __restrict__ sn,
+                                                          const uint32_t* __restrict__ sk, const int* __restrict__ cand,
+                                                          int cand_stride, int blk, int* __restrict__ out,
+                                                          int out_stride) {
+    __shared__ int off[kTopkSegMax + 1];
+    __shared__ uint32_t floor_s;
+    extern __shared__ __align__(16) uint8_t merge_smem[];   // [kMergeCap] values, then [kMergeCap] positions
+    float* mv = (float*) merge_smem;
+    int* mi = (int*) (merge_smem + (size_t) kMergeCap * 4);
+    __shared__ int warp_n[32], base_n;
+    const int t = blockIdx.x;
+    int n, k;
+    rows_at(r, t, n, k);
+    out += (size_t) t * out_stride;
+    const int* cd = cand != nullptr ? cand + (size_t) t * cand_stride : nullptr;
+    if (n <= 0) return;
+    if (k >= n) {
+        for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        return;
+    }
+    if (threadIdx.x == 0) {
+        off[0] = 0;
+        uint32_t f = 0u;
+        for (int p = 0; p < P; ++p) {
+            off[p + 1] = off[p] + sn[t * P + p];
+            f = max(f, sk[t * P + p]);
+        }
+        floor_s = f;
+        base_n = 0;
+    }
+    __syncthreads();
+    const float* cv = sv + (size_t) t * P * K;
+    const int* ci = si + (size_t) t * P * K;
+    const uint32_t fl = floor_s;
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, nw = (int) blockDim.x >> 5;
+    bool fits = true;
+    for (int p = 0; p < P && fits; ++p) {   // (each segment's run in order, the passing ones packed in order)
+        const int c = off[p + 1] - off[p];
+        for (int j0 = 0; j0 < c; j0 += blockDim.x) {
+            const int j = j0 + threadIdx.x;
+            const float x = j < c ? cv[(size_t) p * K + j] : 0.0f;
+            const bool keep = j < c && ord_key(x) >= fl;
+            const unsigned m = __ballot_sync(0xffffffffu, keep);
+            if (lane == 0) warp_n[wp] = __popc(m);
+            __syncthreads();
+            int b = base_n, tot = 0;
+            for (int w = 0; w < nw; ++w) {
+                if (w < wp) b += warp_n[w];
+                tot += warp_n[w];
+            }
+            const int at = b + __popc(m & ((1u << lane) - 1u));
+            if (keep && at < kMergeCap) mv[at] = x, mi[at] = ci[(size_t) p * K + j];
+            __syncthreads();
+            if (threadIdx.x == 0) base_n += tot;
+            __syncthreads();
+            if (base_n > kMergeCap) {
+                fits = false;
+                break;
+            }
+        }
+    }
+    if (fits) {
+        topk_block<0>(base_n, k, [&](int i) { return ord_key(mv[i]); }, [&](int slot, int i) {
+            const int x = mi[i];
+            out[slot] = cd != nullptr ? cd[x / blk] * blk + x % blk : x;
+        });
+        return;
+    }
+    auto at = [&](int i) {   // (all of them: candidate i in segment p's run, from off[p])
+        int lo = 0, hi = P;
+        while (hi - lo > 1) {
+            const int mid = (lo + hi) >> 1;
+            if (off[mid] <= i) lo = mid;
+            else hi = mid;
+        }
+        return (size_t) lo * K + (i - off[lo]);
+    };
+    topk_block<0>(off[P], k, [&](int i) { return ord_key(cv[at(i)]); }, [&](int slot, int i) {
+        const int x = ci[at(i)];
+        out[slot] = cd != nullptr ? cd[x / blk] * blk + x % blk : x;
+    });
 }
 
 __global__ void block_max_kernel(const float* __restrict__ score, long long stride, Rows r, int blk,
@@ -1336,6 +1663,21 @@ __global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n
     for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = src[i];
 }
 
+__global__ void comp_restore_batch_kernel(const CompBatch b, long long p0, int keep, int d) {
+    const int li = blockIdx.x, R = b.ratio[li];
+    for (int i = threadIdx.x; i < R * d; i += blockDim.x) {
+        const int slot = i / d, e = i % d;
+        float kv = b.snap[li][i], sc = b.snap[li][(size_t) R * d + i];   // (the last kept row at the slot, else the snapshot)
+        for (int t = 0; t < keep; ++t)
+            if ((int) ((p0 + t) % R) == slot) {
+                kv = b.kv[li][(size_t) t * d + e];
+                sc = b.score[li][(size_t) t * d + e];
+            }
+        b.kv_state[li][i] = kv;
+        b.score_state[li][i] = sc;
+    }
+}
+
 __global__ void hc_mean_kernel(const float* __restrict__ h, int hc, int dim, float* __restrict__ out,
                                long long out_stride) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -1434,19 +1776,24 @@ __global__ void __launch_bounds__(1024) argmax_share_kernel(const float* __restr
 __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E,
                                    uint16_t* erow, int R) {
     __shared__ int pick;
-    if ((int) threadIdx.x < nm)
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    if ((int) threadIdx.x < nm) {   // (each member's slot read by a thread of its own: host memory, a PCIe round trip each)
         while ((int) (*(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 2) - seq) < 0) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
             __nanosleep(32);
 #endif
         }
+        sv[threadIdx.x] = __uint_as_float(*(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4));
+        si[threadIdx.x] = (int) *(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 1);
+    }
     __syncthreads();
     if (threadIdx.x == 0) {
         float bv = __int_as_float(0xff800000);
         int bi = 0x7fffffff;
         for (int m = 0; m < nm; ++m) {   // (members in vocabulary order: a tie keeps the lower index)
-            const float v = __uint_as_float(*(volatile const unsigned*) (slots + (size_t) m * 4));
-            const int i = (int) *(volatile const unsigned*) (slots + (size_t) m * 4 + 1);
+            const float v = sv[m];
+            const int i = si[m];
             if (v > bv || (v == bv && i < bi)) bv = v, bi = i;
         }
         pick = bi;
@@ -1665,17 +2012,37 @@ __global__ void init_pre_kernel(float* pre, int T) {
 }
 
 
-// the hand-offs through host-mapped memory: a grid-stride copy of the segments (16 bytes a thread), then (put, flag
+// a segment's copy unit: 16 bytes where its ends and its size allow, else 4, else 1 (the packed FP4 index keys' rows
+// are 68 bytes: a window's rows start and end off the 16)
+__host__ __device__ __forceinline__ size_t xfer_unit(const Xfer& x, int i) {
+    const size_t a = (size_t) x.src[i] | (size_t) x.dst[i] | x.bytes[i];
+    return (a & 15) == 0 ? 16 : (a & 3) == 0 ? 4 : 1;
+}
+__host__ __device__ __forceinline__ size_t xfer_units(const Xfer& x) {
+    size_t total = 0;
+    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / xfer_unit(x, i);
+    return total;
+}
+
+// the hand-offs through host-mapped memory: a grid-stride copy of the segments (a unit a thread), then (put, flag
 // given) the last block to finish sets the flag after a system fence; a get first waits for the flag
 __device__ __forceinline__ void xfer_copy(const Xfer& x, bool from_host) {
-    size_t total = 0;
-    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    const size_t total = xfer_units(x);
     for (size_t q = (size_t) blockIdx.x * blockDim.x + threadIdx.x; q < total; q += (size_t) gridDim.x * blockDim.x) {
         size_t r = q;
         int i = 0;
-        while (r >= x.bytes[i] / 16) r -= x.bytes[i++] / 16;
-        const uint4* src = (const uint4*) x.src[i] + r;
-        ((uint4*) x.dst[i])[r] = from_host ? ld_fresh(src) : *src;
+        while (r >= x.bytes[i] / xfer_unit(x, i)) r -= x.bytes[i] / xfer_unit(x, i), ++i;
+        const size_t u = xfer_unit(x, i);
+        if (u == 16) {
+            const uint4* src = (const uint4*) x.src[i] + r;
+            ((uint4*) x.dst[i])[r] = from_host ? ld_fresh(src) : *src;
+        } else if (u == 4) {
+            const unsigned* src = (const unsigned*) x.src[i] + r;
+            ((unsigned*) x.dst[i])[r] = from_host ? ld_fresh(src) : *src;
+        } else {
+            const unsigned char* src = (const unsigned char*) x.src[i] + r;
+            ((unsigned char*) x.dst[i])[r] = from_host ? ld_fresh_byte(src) : *src;
+        }
     }
 }
 
@@ -1709,6 +2076,11 @@ __global__ void wait_flags_kernel(const unsigned* flags, int n, int stride, unsi
     if (threadIdx.x != 0) return;
     for (int i = 0; i < n; ++i) wait_at_least(flags + (size_t) i * stride, seq);
     __threadfence_system();
+}
+// a batch of table entries: *pairs[2i] = pairs[2i + 1] (the expert cache's recent slots, between windows)
+__global__ void tab_set_kernel(const unsigned long long* __restrict__ pairs, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) *(unsigned long long*) pairs[2 * i] = pairs[2 * i + 1];
 }
 __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
     __threadfence_system();
@@ -1827,6 +2199,66 @@ __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, flo
     __syncthreads();
     for (int q = lo + threadIdx.x; q < hi; q += blockDim.x)
         if (q < c0 || q >= c1) x4[q] = from_h4(ld_fresh(sum + q));
+}
+
+// allreduce_dma's pieces: this member's partial as FP16 (ar_rs16's rounding), its slice's sum from the members' FP16
+// partials in member order, and the other slices' sums back to F32
+__global__ void ar_to16_kernel(const float4* __restrict__ x, int n4, uint2* __restrict__ h) {
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x) h[q] = to_h4(sat4(x[q]));
+}
+__global__ void ar_sum16_kernel(float4* x, uint2* own, const uint2* __restrict__ peers, size_t pstride, int nm, int mi,
+                                int q0, int q1) {
+    for (int q = q0 + blockIdx.x * blockDim.x + threadIdx.x; q < q1; q += gridDim.x * blockDim.x) {
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        for (int m = 0; m < nm; ++m) {
+            const float4 p = from_h4(m == mi ? own[q] : peers[(size_t) m * pstride + (q - q0)]);
+            if (m == 0) v = p;
+            else {
+                v.x = __fadd_rn(v.x, p.x);
+                v.y = __fadd_rn(v.y, p.y);
+                v.z = __fadd_rn(v.z, p.z);
+                v.w = __fadd_rn(v.w, p.w);
+            }
+        }
+        const uint2 s16 = to_h4(sat4(v));
+        own[q] = s16;
+        x[q] = from_h4(s16);
+    }
+}
+// (the H2D side by the SMs' loads from host memory, the copy engine left to the experts' streaming: a set's sums do
+// not queue behind its batches) - the others' partials of slice [q0, q1) read in place, every member's at once
+__global__ void ar_sum16_zc_kernel(float4* x, uint2* own, const uint2* rows, size_t rstride, int nm, int mi, int q0,
+                                   int q1) {
+    for (int q = q0 + blockIdx.x * blockDim.x + threadIdx.x; q < q1; q += gridDim.x * blockDim.x) {
+        uint2 u[8];
+#pragma unroll
+        for (int m = 0; m < 8; ++m)
+            if (m < nm) u[m] = m == mi ? own[q] : ld_fresh(rows + (size_t) m * rstride + q);
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            if (m >= nm) break;
+            const float4 p = from_h4(u[m]);
+            if (m == 0) v = p;
+            else {
+                v.x = __fadd_rn(v.x, p.x);
+                v.y = __fadd_rn(v.y, p.y);
+                v.z = __fadd_rn(v.z, p.z);
+                v.w = __fadd_rn(v.w, p.w);
+            }
+        }
+        const uint2 s16 = to_h4(sat4(v));
+        own[q] = s16;
+        x[q] = from_h4(s16);
+    }
+}
+__global__ void ar_from16_zc_kernel(float4* x, const uint2* hsum, int n4, int q0, int q1, int r0 = 0) {
+    for (int q = r0 + blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
+        if (q < q0 || q >= q1) x[q] = from_h4(ld_fresh(hsum + q));
+}
+__global__ void ar_from16_kernel(float4* x, const uint2* __restrict__ h, int n4, int q0, int q1) {
+    for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
+        if (q < q0 || q >= q1) x[q] = from_h4(h[q]);
 }
 
 // x[i] = the members' partials summed in member order (this member's from x, the others' from their host rows)
@@ -1950,15 +2382,19 @@ __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, cons
                                    const float* __restrict__ w, int k, int r0, int r1, int dim) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
+    bool any = false;   // (a token without rows here leaves acc unread: a chunk's set covers a few of its tokens)
+    for (int i = 0; i < k; ++i) {
+        const int r = pos[(size_t) t * kPicks + i];
+        any = any || (r >= r0 && r < r1);
+    }
+    if (!any) return;
     float a = acc[(size_t) t * dim + e];
-    bool any = false;
     for (int i = 0; i < k; ++i) {
         const int r = pos[(size_t) t * kPicks + i];
         if (r < r0 || r >= r1) continue;
         a = __fmaf_rn(w[(size_t) t * kPicks + i], y[(size_t) (r - r0) * dim + e], a);
-        any = true;
     }
-    if (any) acc[(size_t) t * dim + e] = a;
+    acc[(size_t) t * dim + e] = a;
 }
 
 int cdiv(int a, int b) { return (a + b - 1) / b; }
@@ -2072,12 +2508,44 @@ void compress_win(const float* kv, const float* score, float* kv_state, float* s
 
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
-                 int kfmt) {
+                 int kfmt, bool tc) {
     if (hd != 128 || heads > 32 || (kfmt != kKvFp4p && kfmt != kKvBf16)) {
         std::fprintf(stderr, "ds4 index_score: %d heads of %d (keys %d) not covered\n", heads, hd, kfmt);
         return;
     }
     if (n <= 0) return;
+    // (opt-in, DS4_INDEX_TC=1: its sums differ from the CUDA cores' in the last bits - perplexity the same, 7.5366 on
+    // 4 x 1024 tokens, but a long greedy run's tokens part after a while)
+    static const bool tc_ok = std::getenv("DS4_INDEX_TC") != nullptr && std::atoi(std::getenv("DS4_INDEX_TC")) != 0;
+    if (tc && tc_ok && kfmt == kKvFp4p) {   // (the tensor cores: a block a tile, looping, ~2 blocks an SM)
+        static std::atomic<uint64_t> opted{0};
+        static int sms[64] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (!(opted.load(std::memory_order_relaxed) >> dev & 1u)) {
+            cudaFuncSetAttribute(index_score_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<1>());
+            cudaFuncSetAttribute(index_score_tc_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<2>());
+            cudaFuncSetAttribute(index_score_tc_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<3>());
+            cudaFuncSetAttribute(index_score_tc_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<4>());
+            cudaFuncSetAttribute(index_score_tc_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<5>());
+            cudaFuncSetAttribute(index_score_tc_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<6>());
+            cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);
+            opted.fetch_or(1ull << dev);
+        }
+        // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
+        const int qt = cand != nullptr ? 1 : T <= 6 ? T : 4, qg = (T + qt - 1) / qt, ntiles = (n + 127) / 128;
+        const int gx = std::max(1, std::min(ntiles, 2 * sms[dev & 63] / qg));
+        const uint8_t* kp = (const uint8_t*) k;
+        switch (qt) {
+        case 1: index_tc_launch<1>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 2: index_tc_launch<2>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 3: index_tc_launch<3>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 5: index_tc_launch<5>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        case 6: index_tc_launch<6>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        default: index_tc_launch<4>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        }
+        return;
+    }
     const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     const dim3 grid(cdiv(n, kThreads), T);
     if (kfmt == kKvFp4p)
@@ -2089,7 +2557,38 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
 }
 
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
-          int* out, int out_stride, cudaStream_t s) {
+          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc) {
+    if (sc != nullptr && T <= sc->T) {   // (a few long rows: spread over segments)
+        int nmax = 0, kmax = 0;
+        for (int t = 0; t < T; ++t) {
+            int n = 0, k = 0;
+            if (r.gen == 0) n = r.n[t], k = r.k[t];
+            else {
+                const int nn = (int) ((r.p0 + t + 1) / r.R), cb = std::min(r.ccap, (nn + r.blk - 1) / r.blk);
+                switch (r.gen) {
+                case 1: n = nn, k = std::min(r.kcap, nn); break;
+                case 2: n = nn, k = cb; break;
+                case 3: n = cb * r.blk, k = std::min(r.kcap, nn); break;
+                default: n = (nn + r.blk - 1) / r.blk, k = r.kcap; break;
+                }
+            }
+            nmax = std::max(nmax, n), kmax = std::max(kmax, k);
+        }
+        if (nmax >= kTopkSegMin && kmax <= sc->K) {
+            const int P = std::min(sc->P, std::max(2, (nmax + kTopkSeg - 1) / kTopkSeg));
+            topk_seg_kernel<<<dim3(P, T), 1024, 0, s>>>(vals, stride, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth);
+            static std::atomic<uint64_t> big_smem{0};   // (the devices the merge's shared memory was opted in on)
+            int dev = 0;
+            cudaGetDevice(&dev);
+            if (!(big_smem.load(std::memory_order_relaxed) >> dev & 1u)) {
+                cudaFuncSetAttribute(topk_merge_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMergeCap * 8);
+                big_smem.fetch_or(1ull << dev);
+            }
+            topk_merge_kernel<<<T, 1024, (size_t) kMergeCap * 8, s>>>(r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
+                                                                      cand_stride, blk, out, out_stride);
+            return;
+        }
+    }
     topk_kernel<<<T, 1024, 0, s>>>(vals, stride, r, cand, cand_stride, blk, out, out_stride);
 }
 
@@ -2214,6 +2713,9 @@ void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, 
         ring_restore_batch_kernel<<<dim3(T - keep, b.n), kThreads, 0, s>>>(b, (long long) p0, n, keep,
                                                                              kv_row_bytes(kKvFp8, d));
 }
+void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s) {
+    if (b.n > 0) comp_restore_batch_kernel<<<b.n, kThreads, 0, s>>>(b, (long long) p0, keep, d);
+}
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
     hc_mean_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(h, hc, dim, out, out_stride);
 }
@@ -2254,14 +2756,12 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
 }
 
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s) {
-    size_t total = 0;
-    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    const size_t total = xfer_units(x);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     xfer_put_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq, cnt);
 }
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
-    size_t total = 0;
-    for (int i = 0; i < x.n; ++i) total += x.bytes[i] / 16;
+    const size_t total = xfer_units(x);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     xfer_get_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq);
 }
@@ -2269,6 +2769,9 @@ void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStre
     if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
 }
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
+void tab_set(const unsigned long long* pairs, int n, cudaStream_t s) {
+    if (n > 0) tab_set_kernel<<<cdiv(n, 128), 128, 0, s>>>(pairs, n);
+}
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
@@ -2295,4 +2798,296 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     ar_sum_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
+void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
+                   const ArAux* aux) {
+    const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm;
+    const int n4 = n / 4, cq = (n4 + nm - 1) / nm;
+    const int c0 = std::min(n4, mi * cq), c1 = std::min(n4, (mi + 1) * cq);
+    uint2* own = (uint2*) scratch;   // this member's FP16 partial (a uint2 a float4), then the sums
+    uint2* peers = own + n4;         // [nm][cq]: the members' partials of slice mi
+    auto hrow = [&](int m) { return (uint2*) (a.data + ((size_t) m * a.slots + slot) * a.stride); };
+    uint2* hsum = (uint2*) (a.sums + (size_t) slot * a.stride);
+    // (ar_rs16_kernel's first block's flags: member m's partial out at rf + m * fs, its sums at sf + m * fs)
+    unsigned* rf = a.bflags + (size_t) slot * kArBlocks * 8;
+    unsigned* sf = a.bflags + ((size_t) nm * a.slots + slot) * kArBlocks * 8;
+    const int fs = a.slots * kArBlocks * 8;
+    const int blocks = std::max(1, std::min(1024, cdiv(n4, kThreads)));
+    ar_to16_kernel<<<blocks, kThreads, 0, s>>>((const float4*) x, n4, own);
+    // the H2D side by the SMs up to 4 members (16K-token prompt on 9 GPUs, --tp 4: 743 -> 785 tok/s), the copy
+    // engine past that (--tp 8: 719 by the copy engine, 676 by the SMs); DS4_AR_ZC=0 / 1 / 2.. sets the most members
+    static const int zc_max = [] {
+        const char* e = std::getenv("DS4_AR_ZC");
+        return e != nullptr ? std::atoi(e) : 4;
+    }();
+    if (nm <= std::min(8, zc_max) && aux != nullptr && aux->s2 != nullptr) {
+        // in kArPieces pieces, each cut in nm slices: the copies out on s2 (the D2H engine) beside the sums' and the
+        // gather's reads on s (the SMs, H2D) - piece p + 1 goes out while piece p is summed; ar_rs16's flags, a
+        // block's slot a piece.  (The first flags wait for every member's partial of the piece; s's last gather waits
+        // for this member's own copies too, so c.y is free again past it.)
+        const int P4 = cdiv(n4, kArPieces);
+        auto piece = [&](int p, int& p0, int& p1, int& q0, int& q1) {
+            p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+            const int cqp = cdiv(std::max(1, p1 - p0), nm);
+            q0 = std::min(p1, p0 + mi * cqp), q1 = std::min(p1, q0 + cqp);
+        };
+        auto rfp = [&](int p) { return a.bflags + ((size_t) slot * kArBlocks + p) * 8; };
+        auto sfp = [&](int p) { return a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8; };
+        cudaEventRecord(aux->ev[0], s);
+        cudaStreamWaitEvent(aux->s2, aux->ev[0], 0);
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            if (q0 > p0) cudaMemcpyAsync(hrow(mi) + p0, own + p0, (size_t) (q0 - p0) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            if (p1 > q1) cudaMemcpyAsync(hrow(mi) + q1, own + q1, (size_t) (p1 - q1) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            set_flag_kernel<<<1, 1, 0, aux->s2>>>(rfp(p) + (size_t) mi * fs, seq);
+        }
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            wait_flags_kernel<<<1, 32, 0, s>>>(rfp(p), nm, fs, seq);
+            if (q1 > q0)
+                ar_sum16_zc_kernel<<<std::max(1, std::min(1024, cdiv(q1 - q0, kThreads))), kThreads, 0, s>>>(
+                    (float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, q0, q1);
+            cudaEventRecord(aux->ev[1 + p], s);
+        }
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            cudaStreamWaitEvent(aux->s2, aux->ev[1 + p], 0);
+            if (q1 > q0) cudaMemcpyAsync(hsum + q0, own + q0, (size_t) (q1 - q0) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            set_flag_kernel<<<1, 1, 0, aux->s2>>>(sfp(p) + (size_t) mi * fs, seq);
+        }
+        for (int p = 0; p < kArPieces; ++p) {
+            int p0, p1, q0, q1;
+            piece(p, p0, p1, q0, q1);
+            wait_flags_kernel<<<1, 32, 0, s>>>(sfp(p), nm, fs, seq);
+            if (p1 > p0)
+                ar_from16_zc_kernel<<<std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s>>>(
+                    (float4*) x, hsum, p1, q0, q1, p0);
+        }
+        return;
+    }
+    if (c0 > 0) cudaMemcpyAsync(hrow(mi), own, (size_t) c0 * 8, cudaMemcpyDeviceToHost, s);   // (the others' slices)
+    if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDeviceToHost, s);
+    set_flag_kernel<<<1, 1, 0, s>>>(rf + (size_t) mi * fs, seq);
+    wait_flags_kernel<<<1, 32, 0, s>>>(rf, nm, fs, seq);
+    if (nm <= std::min(8, zc_max)) {
+        const int nb = std::max(1, std::min(1024, cdiv(c1 - c0, kThreads)));
+        if (c1 > c0) {
+            ar_sum16_zc_kernel<<<nb, kThreads, 0, s>>>((float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, c0, c1);
+            cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
+        }
+        set_flag_kernel<<<1, 1, 0, s>>>(sf + (size_t) mi * fs, seq);
+        wait_flags_kernel<<<1, 32, 0, s>>>(sf, nm, fs, seq);
+        ar_from16_zc_kernel<<<blocks, kThreads, 0, s>>>((float4*) x, hsum, n4, c0, c1);
+        return;
+    }
+    if (c1 > c0) {
+        for (int m = 0; m < nm; ++m)
+            if (m != mi)
+                cudaMemcpyAsync(peers + (size_t) m * cq, hrow(m) + c0, (size_t) (c1 - c0) * 8, cudaMemcpyHostToDevice, s);
+        ar_sum16_kernel<<<std::max(1, std::min(1024, cdiv(c1 - c0, kThreads))), kThreads, 0, s>>>(
+            (float4*) x, own, peers, (size_t) cq, nm, mi, c0, c1);
+        cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
+    }
+    set_flag_kernel<<<1, 1, 0, s>>>(sf + (size_t) mi * fs, seq);
+    wait_flags_kernel<<<1, 32, 0, s>>>(sf, nm, fs, seq);
+    if (c0 > 0) cudaMemcpyAsync(own, hsum, (size_t) c0 * 8, cudaMemcpyHostToDevice, s);
+    if (c1 < n4) cudaMemcpyAsync(own + c1, hsum + c1, (size_t) (n4 - c1) * 8, cudaMemcpyHostToDevice, s);
+    ar_from16_kernel<<<blocks, kThreads, 0, s>>>((float4*) x, own, n4, c0, c1);
+}
+
+// ---------------------------------------------------------------- the host-summed all-reduce
+int ar_host_pieces() {
+    static const int n = [] {
+        const char* e = std::getenv("DS4_AR_HOST_PIECES");
+        return std::max(1, std::min(kArBlocks, e != nullptr ? std::atoi(e) : 4));
+    }();
+    return n;
+}
+namespace {
+int cuda_numa_node(int dev) {   // (-1: unknown)
+    char bus[32] = {};
+    if (cudaDeviceGetPCIBusId(bus, sizeof bus, dev) != cudaSuccess) return -1;
+    std::string id(bus);
+    for (char& c : id) c = (char) std::tolower((unsigned char) c);
+    std::FILE* f = std::fopen(("/sys/bus/pci/devices/" + id + "/numa_node").c_str(), "r");
+    if (f == nullptr) return -1;
+    int node = -1;
+    if (std::fscanf(f, "%d", &node) != 1) node = -1;
+    std::fclose(f);
+    return node;
+}
+// pinned host memory on NUMA node `node` (-1: anywhere), mapped for every device (Windows: anywhere)
+void* numa_pinned(size_t bytes, int node) {
+#if defined(_WIN32)
+    (void) node;
+    void* p = nullptr;
+    if (cudaHostAlloc(&p, bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess) return nullptr;
+    std::memset(p, 0, bytes);
+    return p;
+#else
+    void* p = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    if (node >= 0) {
+        unsigned long mask[4] = {0, 0, 0, 0};
+        mask[node / 64] = 1ul << (node % 64);
+        syscall(SYS_mbind, p, bytes, 2 /* MPOL_BIND */, mask, 256, 0);
+    }
+    std::memset(p, 0, bytes);
+    if (cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        munmap(p, bytes);
+        return nullptr;
+    }
+    return p;
+#endif
+}
+void numa_free(void* p, size_t bytes) {
+#if defined(_WIN32)
+    (void) bytes;
+    cudaFreeHost(p);
+#else
+    cudaHostUnregister(p);
+    munmap(p, bytes);
+#endif
+}
+inline void spin_pause() {
+#if defined(__x86_64__) || defined(_M_X64)
+    _mm_pause();
+#endif
+}
+}  // namespace
+
+struct HostReducer::Impl {
+    ArGroup a;
+    size_t max_n = 0, bytes = 0;
+    std::vector<uint16_t*> rows;   // [member]: slots x max_n
+    uint16_t* sums = nullptr;      // slots x max_n
+    std::unique_ptr<Pool> pool;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::deque<std::pair<unsigned, int>> q;
+    bool quit = false;
+    std::thread th;
+    double t_wait = 0, t_sum = 0;   // (DS4_AR_HOST_STATS: printed at the end)
+    long n_sums = 0;
+    void loop() {
+        for (;;) {
+            std::pair<unsigned, int> job;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return quit || !q.empty(); });
+                if (q.empty()) return;
+                job = q.front();
+                q.pop_front();
+            }
+            const unsigned seq = job.first;
+            const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm, n4 = job.second / 4;
+            const int NP = ar_host_pieces(), P4 = (n4 + NP - 1) / NP, fs = a.slots * kArBlocks * 8;
+            const uint16_t* rp[16];
+            for (int m = 0; m < nm && m < 16; ++m) rp[m] = rows[(size_t) m] + (size_t) slot * max_n;
+            uint16_t* out = sums + (size_t) slot * max_n;
+            for (int p = 0; p < NP; ++p) {
+                const size_t h0 = (size_t) std::min(n4, p * P4) * 4, h1 = (size_t) std::min(n4, (p + 1) * P4) * 4;
+                const unsigned* rf = a.bflags + ((size_t) slot * kArBlocks + p) * 8;
+                const auto tw = std::chrono::steady_clock::now();
+                for (int m = 0; m < nm; ++m) {   // (every member's piece out: its flag, after its copy)
+                    int spins = 0;
+                    while ((int) (*(volatile const unsigned*) (rf + (size_t) m * fs) - seq) < 0) {
+                        if (++spins > 2000) std::this_thread::sleep_for(std::chrono::microseconds(20));
+                        else spin_pause();
+                    }
+                }
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const auto ts = std::chrono::steady_clock::now();
+                t_wait += std::chrono::duration<double, std::milli>(ts - tw).count();
+                const int T = pool->size();
+                pool->run(T, [&](int t) {
+                    const size_t a0 = h0 + (h1 - h0) * (size_t) t / (size_t) T / 8 * 8,
+                                 a1 = t + 1 == T ? h1 : h0 + (h1 - h0) * (size_t) (t + 1) / (size_t) T / 8 * 8;
+                    if (a1 > a0) ar_host_sum(rp, nm, out, a0, a1);
+                });
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile unsigned*) (a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8) = seq;
+                t_sum += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts).count();
+                ++n_sums;
+            }
+        }
+    }
+};
+HostReducer::HostReducer(const ArGroup& a, const std::vector<int>& devs, size_t max_n, int threads) : p_(new Impl) {
+    p_->a = a;
+    p_->max_n = (max_n + 63) / 64 * 64;
+    p_->bytes = (size_t) a.slots * p_->max_n * 2;
+    std::vector<int> nodes;
+    for (int dv : devs) nodes.push_back(cuda_numa_node(dv));
+    int sum_node = -1, best = 0;
+    for (int nd : nodes) {
+        const int c = (int) std::count(nodes.begin(), nodes.end(), nd);
+        if (nd >= 0 && c > best) best = c, sum_node = nd;
+    }
+    for (size_t m = 0; m < devs.size(); ++m) p_->rows.push_back((uint16_t*) numa_pinned(p_->bytes, nodes[m]));
+    p_->sums = (uint16_t*) numa_pinned(p_->bytes, sum_node);
+    std::vector<int> cpus;   // (DS4_AR_HOST_PIN=1: pinned to the physical cores, both nodes interleaved)
+    if (const char* pe = std::getenv("DS4_AR_HOST_PIN"); pe != nullptr && std::atoi(pe) != 0)
+        for (int c = 0; c < (int) std::thread::hardware_concurrency() / 2; ++c) cpus.push_back(c);
+    p_->pool = std::make_unique<Pool>(std::max(0, threads - 1), cpus, 2000);
+    p_->th = std::thread([this] { p_->loop(); });
+}
+bool HostReducer::ok() const {
+    if (p_->sums == nullptr) return false;
+    for (uint16_t* r : p_->rows)
+        if (r == nullptr) return false;
+    return true;
+}
+uint16_t* HostReducer::row(int m, int slot) const { return p_->rows[(size_t) m] + (size_t) slot * p_->max_n; }
+uint16_t* HostReducer::sum(int slot) const { return p_->sums + (size_t) slot * p_->max_n; }
+HostReducer::~HostReducer() {
+    {
+        std::lock_guard<std::mutex> lk(p_->mu);
+        p_->quit = true;
+    }
+    p_->cv.notify_all();
+    if (p_->th.joinable()) p_->th.join();
+    if (std::getenv("DS4_AR_HOST_STATS") != nullptr)
+        std::fprintf(stderr, "host all-reduce: %ld pieces summed, waiting %.1f ms, summing %.1f ms\n", p_->n_sums,
+                     p_->t_wait, p_->t_sum);
+    for (uint16_t* r : p_->rows)
+        if (r != nullptr) numa_free(r, p_->bytes);
+    if (p_->sums != nullptr) numa_free(p_->sums, p_->bytes);
+    delete p_;
+}
+void HostReducer::submit(unsigned seq, int n) {
+    {
+        std::lock_guard<std::mutex> lk(p_->mu);
+        p_->q.push_back({seq, n});
+    }
+    p_->cv.notify_one();
+}
+
+void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
+                    cudaStream_t s, const ArAux& aux) {
+    const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm, n4 = n / 4, NP = ar_host_pieces(), P4 = cdiv(n4, NP);
+    const int fs = a.slots * kArBlocks * 8;
+    uint2* own = (uint2*) scratch;
+    uint2* hrow = (uint2*) hr.row(mi, slot);
+    const uint2* hsum = (const uint2*) hr.sum(slot);
+    ar_to16_kernel<<<std::max(1, std::min(1024, cdiv(n4, kThreads))), kThreads, 0, s>>>((const float4*) x, n4, own);
+    cudaEventRecord(aux.ev[0], s);
+    cudaStreamWaitEvent(aux.s2, aux.ev[0], 0);
+    for (int p = 0; p < NP; ++p) {
+        const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+        if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDeviceToHost, aux.s2);
+        set_flag_kernel<<<1, 1, 0, aux.s2>>>(a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
+    }
+    for (int p = 0; p < NP; ++p) {
+        const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+        wait_flags_kernel<<<1, 32, 0, s>>>(a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8, 1, 0, seq);
+        if (p1 > p0)
+            ar_from16_zc_kernel<<<std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s>>>(
+                (float4*) x, hsum, p1, p1, p1, p0);
+    }
+}
+
 }  // namespace strata::ds4
+
