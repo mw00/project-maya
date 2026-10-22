@@ -364,6 +364,11 @@ namespace gf = strata::kernels::glmf;
 struct Glm5Model::FastState {
     bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
+    // a prompt read beside the decode (prefill_begin's background): its stream, and the lock its plans hold until
+    // their work is queued - fast_boundary takes it and waits for that stream before it moves an expert
+    cudaStream_t pf_cs = nullptr;
+    std::mutex plan_mu;
+    std::atomic<bool> pf_bg{false};
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};

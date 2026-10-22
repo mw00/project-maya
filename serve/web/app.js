@@ -632,6 +632,7 @@ function render(m) {
     renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, gpuEach);
     renderTiers(m.tiers, eng);
     renderHero(live, h, last, eng, m.tiers, m.totals);
+    renderConvs(live, eng);
   }
   if (tab === "about") renderAbout(eng, hw, st, m.storage);
 }
@@ -659,20 +660,24 @@ function renderBanners(m) {
 // the Monitor's hero: the speed (now, else the last request), its sparkline and four headline numbers
 function renderHero(live, h, last, eng, tiers, totals) {
   const gen = live.state === "generating";
-  const speed = gen ? live.tok_s : last ? last.decode_tok_s : null;
-  $("hero-speed").textContent = speed == null ? "–" : fmt(speed, 1);
-  $("hero-speed-sub").textContent = "decode · " + (gen ? "writing now" : live.state === "reading" ? "reading the prompt"
-                                    : last ? "last request" : "waiting for a request");
-  // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
-                : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
+  const speed = gen ? live.tok_s || 0 : 0;   // what is written now: nothing written, 0 (not the last request's rate)
+  $("hero-speed").textContent = speed ? fmt(speed, 1) : "0";
+  const writing = (live.requests || []).filter((r) => r.tok_s != null).length;
+  $("hero-speed-sub").textContent = "decode · " + (gen ? (writing > 1 ? `${writing} answers at once` : "writing now")
+                                    : live.state === "reading" ? "reading the prompt"
+                                    : last && last.decode_tok_s ? `idle · last request ${fmt(last.decode_tok_s, 1)} tok/s` : "waiting for a request");
+  // prefill: every prompt being read now, together (the tokens read, not the reused prefix); 0 when none is read -
+  // the last request's rate goes in the subtitle
+  const readingNow = live.state === "reading" || (live.requests || []).some((r) => r.tok_s == null);
+  const prefill = live.state !== "idle" && readingNow ? (live.prefill_tok_s ?? live.prefill_tok_s_mean ?? 0) : 0;
+  const lastPre = last ? (last.prefill_tok_s != null ? last.prefill_tok_s
                           : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
                 : null;
-  $("hero-prefill").textContent = prefill == null ? "–" : fmt(prefill);
-  $("hero-prefill-sub").textContent = "prefill · " + (live.state === "reading" ? "reading now" : gen ? "this request"
-                                      : last ? "last request" : "waiting");
+  $("hero-prefill").textContent = fmt(prefill);
+  $("hero-prefill-sub").textContent = "prefill · " + (readingNow ? "reading now"
+                                      : lastPre ? `${gen ? "none reading" : "idle"} · last prompt ${fmt(lastPre)} tok/s` : "nothing to read");
   const a = spark("hero-spark", h.tok_s);
-  const b = spark("hero-spark-prefill", h.prefill_tok_s_mean);
+  const b = spark("hero-spark-prefill", h.prefill_tok_s || h.prefill_tok_s_mean);
   $("hero-spark-wrap").classList.toggle("is-empty", !a && !b);
   const tn = tiers && tiers.now;
   const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
@@ -680,13 +685,94 @@ function renderHero(live, h, last, eng, tiers, totals) {
   $("hero-ms").innerHTML = ms == null ? "–" : `${fmt(ms, 1)}<small>ms</small>`;
   $("hero-hit").innerHTML = fresh && tn.vram_hit != null ? `${fmt(100 * tn.vram_hit, 1)}<small>%</small>`
                           : last && last.hit_rate != null ? `${fmt(100 * last.hit_rate, 1)}<small>%</small>` : "–";
+  // the context every running conversation holds, together
   const ctx = eng.max_context || 0;
-  let used = 0;
-  if (live.state !== "idle") used = (live.prompt_tokens || 0) + (live.generated || 0);
-  else if (last) used = (last.prompt_tokens || 0) + (last.output_tokens || 0);
-  $("hero-ctx-k").textContent = live.state !== "idle" ? "Context of this request" : "Context of the last request";
-  $("hero-ctx").innerHTML = ctx ? `${kfmt(used)}<small>/ ${ctxfmt(ctx)}</small>` : "–";
+  const reqs = live.requests || [];
+  const used = live.state === "idle" ? 0 : live.context_in_use ?? reqs.reduce((a, r) => a + (r.prompt_tokens || 0) + (r.generated || 0), 0);
+  $("hero-ctx-k").textContent = "Context in use";
+  $("hero-ctx").innerHTML = live.state === "idle" ? `0<small>idle</small>`
+                          : reqs.length > 1 ? `${kfmt(used)}<small>in ${reqs.length} conversations</small>`
+                          : `${kfmt(used)}<small>${ctx ? `/ ${ctxfmt(ctx)}` : ""}</small>`;
   $("hero-req").textContent = totals && totals.requests != null ? fmt(totals.requests) : "–";
+}
+
+// a live request's state for the Conversations card: what it does (kind), its badge tone and label
+function convState(r) {
+  const p = r.phase || "";
+  if (r.tok_s == null) return {kind: "reading", tone: "reading", label: "Reading"};
+  const kind = p.startsWith("thinking") ? "thinking" : p.includes("tool") ? "tool" : "answering";
+  const tool = p.match(/tool call: (.+)$/);
+  const label = kind === "tool" ? (tool ? `Tool call: ${tool[1]}` : "Tool call") : kind === "thinking" ? "Thinking" : "Answering";
+  return {kind, tone: r.tok_s > 0 ? "generating" : "waiting", label};
+}
+
+// the conversations: every running one, and under them the last ones this page saw end (as last seen), so the card
+// always has at least CONV_KEEP rows - a finished one rolls off as newer ones end
+const CONV_KEEP = 3;
+const convSeen = new Map();   // id -> its last live row
+let convDone = [];            // ended ones, newest first: {r, ended}
+function renderConvs(live, eng) {
+  const places = live.places || 1, reqs = live.requests || [];
+  const card = $("convs-card");
+  card.hidden = places < 2 && reqs.length < 2;
+  if (card.hidden) return;
+  const took = (s) => (s == null ? "" : s < 90 ? `${fmt(s)} s` : `${fmt(Math.floor(s / 60))} min ${fmt(Math.round(s % 60))} s`);
+  $("convs-sub").textContent = `${reqs.length} of ${places} places busy` + (live.queued ? ` · ${live.queued} queued` : "");
+  const live_ids = new Set(reqs.map((r) => r.id));
+  for (const [id, r] of convSeen)
+    if (!live_ids.has(id)) {
+      convSeen.delete(id);
+      convDone.unshift({r, ended: Date.now() / 1000});
+    }
+  for (const r of reqs) convSeen.set(r.id, r);
+  convDone = convDone.slice(0, CONV_KEEP);
+  const done = convDone.slice(0, Math.max(0, CONV_KEEP - reqs.length));
+  if (!reqs.length && !done.length) {
+    $("convs-list").innerHTML = `<p class="muted convs__empty">No conversation yet. Up to ${places} answer at once; more wait their turn.</p>`;
+    return;
+  }
+  const ctx = eng.max_context || 0;
+  const ended = (r) => {
+    const a = r.ended ? Date.now() / 1000 - r.ended : null;
+    return a == null ? "" : a < 60 ? `ended ${fmt(Math.max(0, a))} s ago` : a < 3600 ? `ended ${fmt(Math.floor(a / 60))} min ago`
+         : `ended ${fmt(Math.floor(a / 3600))} h ago`;
+  };
+  const doneRows = done.map(({r, ended: at}) => {
+    const used = (r.prompt_tokens || 0) + (r.generated || 0);
+    const pct = r.tok_s == null && !r.generated ? (r.prompt_total ? (100 * (r.prompt_read || 0)) / r.prompt_total : 0)
+              : r.max_tokens ? Math.min(100, (100 * (r.generated || 0)) / r.max_tokens) : 100;
+    const wrote = r.tok_s != null || r.generated;   // (else it ended while its prompt was read)
+    const line = (wrote ? `${fmt(r.generated || 0)} tokens` + (r.max_tokens ? ` of ${kfmt(r.max_tokens)}` : "")
+                        : `${fmt(r.prompt_read || 0)} / ${fmt(r.prompt_total || r.prompt_tokens || 0)} prompt tokens read`) +
+                 ` · ${took(r.elapsed_s)} · ${ended({ended: at})}`;
+    return `<div class="conv conv--done" role="listitem">
+      <div class="conv__who"><span class="conv__id">#${esc(r.id)}</span><span class="st-badge" data-s="done">Ended</span></div>
+      <div class="conv__prog"><div class="st-progress"><div class="st-progress__bar" style="width:${pct.toFixed(1)}%"></div></div><span class="muted">${esc(line)}</span></div>
+      <div class="conv__num"><b>${r.tok_s_mean == null ? "–" : fmt(r.tok_s_mean, 1)}</b><span>tok/s avg</span></div>
+      <div class="conv__num"><b>${kfmt(used)}</b><span>${ctx ? `of ${ctxfmt(ctx)} context` : "context"}</span></div>
+    </div>`;
+  });
+  $("convs-list").innerHTML = reqs.map((r) => {
+    const st = convState(r);
+    let pct = 0, line, tone = "";
+    if (st.kind === "reading") {
+      tone = ` data-tone="info"`;
+      if (r.prompt_total) {
+        pct = (100 * (r.prompt_read || 0)) / r.prompt_total;
+        line = `${fmt(r.prompt_read || 0)} / ${fmt(r.prompt_total)} prompt tokens` + (r.prefill_tok_s ? ` · ${fmt(r.prefill_tok_s)} tok/s` : "");
+      } else line = `${fmt(r.prompt_tokens)} prompt tokens · waiting to read`;
+    } else {
+      pct = r.max_tokens ? Math.min(100, (100 * (r.generated || 0)) / r.max_tokens) : 0;
+      line = `${fmt(r.generated || 0)} tokens` + (r.max_tokens ? ` of ${kfmt(r.max_tokens)}` : "") + ` · ${took(r.elapsed_s)}`;
+    }
+    const used = (r.prompt_tokens || 0) + (r.generated || 0);
+    return `<div class="conv" role="listitem">
+      <div class="conv__who"><span class="conv__id">#${esc(r.id)}</span><span class="st-badge" data-s="${st.tone}" title="${esc(st.label)}">${esc(st.label)}</span></div>
+      <div class="conv__prog"><div class="st-progress"${tone}><div class="st-progress__bar" style="width:${pct.toFixed(1)}%"></div></div><span class="muted">${esc(line)}</span></div>
+      <div class="conv__num"><b>${r.tok_s == null ? "–" : fmt(r.tok_s, 1)}</b><span>tok/s now</span></div>
+      <div class="conv__num"><b>${kfmt(used)}</b><span>${ctx ? `of ${ctxfmt(ctx)} context` : "context"}</span></div>
+    </div>`;
+  }).concat(doneRows).join("");
 }
 
 function renderTotals(t) {
@@ -720,18 +806,31 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, gpuEa
       detail = `${fmt(live.prompt_tokens)} prompt tokens`;
     }
   } else if (live.state === "generating") {
-    label = live.phase ? live.phase[0].toUpperCase() + live.phase.slice(1) : "Writing";
+    const cap = (p) => (p ? p[0].toUpperCase() + p.slice(1) : "Writing");
+    const reqs = live.requests || [];
     state = "generating";
     delete prog.dataset.tone;
-    pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
-    detail = `${fmt(live.generated)} tokens${took(live.elapsed_s)}`;
+    if (reqs.length > 1) {   // several at once: how many do what (the Conversations card has each one)
+      const n = {reading: 0, thinking: 0, answering: 0, tool: 0};
+      for (const r of reqs) n[convState(r).kind] += 1;
+      label = [[n.answering, "answering"], [n.thinking, "thinking"], [n.tool, "tool call"], [n.reading, "reading"]]
+        .filter(([k]) => k).map(([k, w]) => `${k} ${w}`).join(" · ");
+      label = label[0].toUpperCase() + label.slice(1);
+      detail = `${reqs.length} conversations · ${fmt(live.generated)} tokens`;
+    } else {
+      label = cap(live.phase);
+      pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
+      detail = `${fmt(live.generated)} tokens${took(live.elapsed_s)}`;
+    }
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last answer: ${fmt(last.output_tokens)} tokens${took(last.duration_s)}`;
   }
-  if (live.active > 1) label = `${label} · ${live.active} answers at once`;
+  if (live.active > 1 && !(live.state === "generating" && (live.requests || []).length > 1))
+    label = `${label} · ${live.active} at once`;
   if (live.queued > 0) label = `${label} · ${live.queued} queued`;
   badge.textContent = label;
+  prog.hidden = live.state === "generating" && (live.requests || []).length > 1;   // (each row has its own)
   badge.dataset.s = state;
   $("state-detail").textContent = detail;
   $("state-bar").style.width = `${pct}%`;

@@ -663,7 +663,12 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->ram_resident = getenv("STRATA_GLM_RAM_RESIDENT") != nullptr && std::atoi(getenv("STRATA_GLM_RAM_RESIDENT")) != 0;
     if (const char* rs = getenv("STRATA_GLM_RAM_SLACK")) F->ram_slack = std::max(0, std::atoi(rs));
     else if (F->ram_resident) F->ram_slack = 16;
-    if (cudaStreamCreateWithFlags(&F->cs, cudaStreamNonBlocking) != cudaSuccess ||
+    // several conversations at once: the decode's stream before the prompt's (which a prompt beside it reads on)
+    int pr_least = 0, pr_greatest = 0;
+    cudaDeviceGetStreamPriorityRange(&pr_least, &pr_greatest);
+    const char* seqs_env = getenv("STRATA_GLM_SEQS");
+    const int cs_prio = seqs_env != nullptr && std::atoi(seqs_env) > 1 ? pr_greatest : pr_least;
+    if (cudaStreamCreateWithPriority(&F->cs, cudaStreamNonBlocking, cs_prio) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->copy, cudaStreamNonBlocking) != cudaSuccess ||
         cudaStreamCreateWithFlags(&F->ps, cudaStreamNonBlocking) != cudaSuccess ||
         cudaEventCreateWithFlags(&F->ev_hop, cudaEventDisableTiming) != cudaSuccess ||
@@ -1073,7 +1078,9 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
         // the budget: the free VRAM less the reserve (--vram-reserve-mib), or --expert-cache N's (pool_budget)
-        pool_b_ = part_budget(free_b, total_b, floor_b, stride_max);
+        // (elastic contexts: their caches' budget stays free)
+        const size_t el_keep = el_budget_ - std::min(el_budget_, el_backed_);
+        pool_b_ = part_budget(free_b > el_keep ? free_b - el_keep : 0, total_b, floor_b, stride_max);
         const size_t reserve = pool_b_.reserve;
         size_t avail = pool_b_.avail;
         if (pool_b_.adapted)
@@ -1351,7 +1358,19 @@ bool Glm5Model::fast_setup(std::string& err) {
         std::vector<uint8_t*> segs;
         std::vector<int> seg_of((size_t) NL, 0);
         const size_t main_bytes = tot - xtot;
-        if (uint8_t* one = nullptr; cudaMalloc(&one, main_bytes) == cudaSuccess) {
+        // elastic contexts: the main slots in a reservation backed granule by granule (glm_multi.cu, ElPool)
+        std::vector<size_t> el_off;
+        const char* elp_env = getenv("STRATA_GLM_ELASTIC_POOL");
+        if (!el_.empty() && (elp_env == nullptr || std::atoi(elp_env) != 0)) {
+            std::vector<std::array<size_t, 3>> lys;
+            for (int il = l0_; il < lt_; ++il)
+                if (F->L[(size_t) il].moe) lys.push_back({(size_t) il, (size_t) (nsl[(size_t) il] - k_extra), slot_stride(il)});
+            std::string pe;
+            if (uint8_t* eb = el_pool_alloc(lys, el_off, pe)) segs.push_back(eb);
+            else std::fprintf(stderr, "%s - the expert pool is fixed\n", pe.empty() ? "glm elastic pool: unavailable" : pe.c_str());
+        }
+        if (!segs.empty()) {
+        } else if (uint8_t* one = nullptr; cudaMalloc(&one, main_bytes) == cudaSuccess) {
             segs.push_back(one);
         } else {
             cudaGetLastError();
@@ -1384,7 +1403,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "%zu\n", dev_, (double) main_bytes / 1073741824.0, segs.size());
         }
         if (segs.empty() || (xtot > 0 && cudaMalloc(&F->xpool, xtot) != cudaSuccess)) {
-            for (uint8_t* q : segs) cudaFree(q);
+            if (elp_ != nullptr) el_pool_free();
+            else for (uint8_t* q : segs) cudaFree(q);
             err = "glm fast: the expert pool (" + std::to_string(tot >> 20) + " MB) did not allocate";
             return false;
         }
@@ -1402,7 +1422,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             P.stride = slot_stride(il);
             P.n = nl;
             P.n_main = nl - k_extra;
-            P.base = b;
+            P.base = elp_ != nullptr ? segs[0] + el_off[(size_t) il] : b;
             P.key.assign((size_t) nl, -1);
             P.tick.assign((size_t) nl, 0);
             P.st.assign((size_t) nl, FastState::kFree);
@@ -1475,8 +1495,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->layer_rc[(size_t) il] = c;
             // (the experts its main slots cannot hold: the pool's lendable tail counts as not held - a prompt
             // borrows it, and the experts there go to RAM meanwhile, prefill_lend)
+            // (the elastic pool: its main slots can go to contexts - room for every expert, within the RAM budget, so the
+            // ones they give way never fall to the disk)
+            const int held = elp_ != nullptr ? 0 : F->lp[(size_t) il].n_main;
             cls_weight[(size_t) c] +=
-                (double) std::max(2, g.n_expert - F->lp[(size_t) il].n_main + gf::kSpares + 2 + F->ram_slack) * (double) st;
+                (double) std::max(2, g.n_expert - held + gf::kSpares + 2 + F->ram_slack) * (double) st;
         }
         double wsum = 0;
         for (double w : cls_weight) wsum += w;
@@ -3669,12 +3692,12 @@ void Glm5Model::fast_destroy() {
                          100.0 * e.first / tot);
     }
     for (auto e : F->pev) cudaEventDestroy(e);
-    if (snap_pool_) {
-        cudaFree(snap_pool_);
+    if (snap_pool_) {   // (elastic: in the state's reservation, freed with it)
+        if (el_.empty()) cudaFree(snap_pool_);
         snap_pool_ = nullptr;
     }
     if (snap_) {
-        cudaFree(snap_);
+        if (el_.empty()) cudaFree(snap_);
         snap_ = nullptr;
     }
     if (kda_bak_) {
@@ -3732,7 +3755,8 @@ void Glm5Model::fast_destroy() {
     if (F->mtp_dx_ids) cudaFree(F->mtp_dx_ids);
     if (F->mtp_emb_h) cudaFreeHost(F->mtp_emb_h);
     if (F->ev_mtp_emb) cudaEventDestroy(F->ev_mtp_emb);
-    if (F->pool) cudaFree(F->pool);
+    if (elp_ != nullptr) el_pool_free();
+    else if (F->pool) cudaFree(F->pool);
     for (uint8_t* p : F->pool_more) cudaFree(p);
     if (F->xpool) cudaFree(F->xpool);
     if (F->arena) cudaFree(F->arena);
@@ -4586,6 +4610,14 @@ bool Glm5Model::fast_boundary(std::string& err) {
     // Also catches an asynchronous failure before waiting for routes that may never have been published.
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm boundary compute", err) || !F->route_ok(err))
         return false;
+    // a prompt beside the decode: no plan of its between choosing experts and queuing their work, and that work done
+    std::unique_lock<std::mutex> plan_lk(F->plan_mu, std::defer_lock);
+    if (F->pf_bg.load(std::memory_order_acquire)) {
+        plan_lk.lock();
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(F->pf_cs), "glm boundary prompt", err) ||
+            !glmfast::cuda_ok(cudaStreamSynchronize(F->copy), "glm boundary prompt copies", err))
+            return false;
+    }
     const Glm5Geometry& g = g_;
     while (F->processed.load(std::memory_order_acquire) < F->expected) cpu_relax();
     std::lock_guard<std::mutex> lk(F->mu);
@@ -5371,6 +5403,7 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
 
 bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     (void) hop_in;
+    if (!el_.empty() && !seq_grow(seq_index(), p + 1, err)) return false;   // elastic: position p backed
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -5687,6 +5720,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
 //     round trip.  Else the host dequantizes the token's row: through mtp_emb_h where the chain is set up (its last
 //     copy out waited for alone), else through emb_h after a sync of the stream (it may still feed an earlier copy).
 bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step, bool sub, bool read_back) {
+    if (!el_.empty() && !seq_grow(seq_index(), p + 1, err)) return false;
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -7005,6 +7039,8 @@ bool Glm5Model::slot_load(const std::string& path, int64_t n_pos, std::string& e
         err = "not a slot of this model";
         return false;
     }
+    for (Glm5Model* m : halves)   // elastic: the slot's positions backed first
+        if (!m->seq_grow(m->seq_index(), n, err)) return false;
     std::vector<float> buf;
     for (Glm5Model* m : halves) {
         if (m->fast_ == nullptr) {
