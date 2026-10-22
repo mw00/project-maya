@@ -10,8 +10,9 @@
 // every pool, to ~60K), resident and streamed caches mixed, some rows later positions of the row before's conversation
 // (a verify window's rows; streamed: one resolve over the run's cells, as the engine), FP16 rows and INT8 records, and launches of fewer tokens than rows (part_tokens).  And the
 // rows' selections in one launch (gf::dsa_select_rows) against dsa_select a row, cell for cell; and STRATA_GLM_ROWS_SMALL's
-// pieces: the rows' scores (dsa_score_rows), KV resolves (glm_kv_resolve_rows: maps, slots, counters) and the experts'
-// grouping with a thread an entry, against the one-a-row / one-thread kernels.
+// pieces: the rows' scores (dsa_score_rows), KV resolves (glm_kv_resolve_rows: each selected cell reads its position's
+// bytes, as glm_kv_resolve's) and the experts' grouping with a thread an entry, against the one-a-row / one-thread
+// kernels.
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
 
@@ -373,9 +374,12 @@ void run_score(int n, uint32_t seed, cudaStream_t s) {
     for (float* b : bufs) cudaFree(b);
 }
 
-// STRATA_GLM_ROWS_SMALL: n sequences' resolves in one launch (gf::glm_kv_resolve_rows) against glm_kv_resolve a row,
-// on twin copies of every sequence's map and slots, over several steps (so slots get evicted): each row's slot cells,
-// page table, slot owners, slot contents and counters
+// STRATA_GLM_ROWS_SMALL: n sequences' resolves in one launch (gf::glm_kv_resolve_rows) against glm_kv_resolve a row, on
+// twin copies of every sequence's map and slots, over several steps (so slots get evicted).  A resolve places its misses
+// in the order its threads claim them (atomics), so which slot a block lands in - and from there the clock's later
+// victims - differs from run to run with either kernel; what the attention reads may not: for every selected cell, the
+// slot row named in its slot cell holds that position's host bytes, padding stays padding, and no call overflows (the
+// streaming parity test's rule, glm_kv_stream_parity) - checked for both twins
 void run_resolve(int n, bool q8, uint32_t seed, cudaStream_t s) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> u01(0.0, 1.0);
@@ -415,13 +419,14 @@ void run_resolve(int n, bool q8, uint32_t seed, cudaStream_t s) {
     }
     for (int step = 0; step < 6; ++step) {
         gf::KvResolveRows a;
+        std::vector<std::vector<int>> sel((size_t) n);
         std::vector<int> ns((size_t) n);
         for (int i = 0; i < n; ++i) {
             Twin& t = tw[(size_t) i];
             const int n_vis = t.ctx / kPage;
             const int top = std::min(kTopPools, n_vis);
             std::set<int> seen;
-            std::vector<int> c;
+            std::vector<int>& c = sel[(size_t) i];
             std::uniform_int_distribution<int> any(0, n_vis - 1);
             while ((int) seen.size() < top) {
                 const int pi = any(rng);
@@ -429,6 +434,7 @@ void run_resolve(int n, bool q8, uint32_t seed, cudaStream_t s) {
                     for (int j = 0; j < kPage; ++j) c.push_back(pi * kPage + j);
             }
             if (step % 3 == 2) c.resize(c.size() / 3);   // (and a short one now and then)
+            c.push_back(-1);                             // (and padding)
             ns[(size_t) i] = step == 5 && i == 0 ? 0 : (int) c.size();   // (a row that resolves nothing)
             ck(cudaMemcpy(t.cells, c.data(), c.size() * 4, cudaMemcpyHostToDevice), "cells");
             if (ns[(size_t) i] > 0)
@@ -444,21 +450,36 @@ void run_resolve(int n, bool q8, uint32_t seed, cudaStream_t s) {
         ck(cudaStreamSynchronize(s), "resolve");
         for (int i = 0; i < n; ++i) {
             Twin& t = tw[(size_t) i];
-            const auto cmp = [&](const char* what, const void* x, const void* y, size_t bytes) {
-                std::vector<uint8_t> hx(bytes), hy(bytes);
-                ck(cudaMemcpy(hx.data(), x, bytes, cudaMemcpyDeviceToHost), "x");
-                ck(cudaMemcpy(hy.data(), y, bytes, cudaMemcpyDeviceToHost), "y");
-                if (hx != hy) {
-                    std::fprintf(stderr, "FAIL: resolve rows, %d rows, step %d, row %d: %s differ\n", n, step, i, what);
+            ++g_checks;
+            for (int c = 0; c < 2; ++c) {
+                const char* who = c == 0 ? "glm_kv_resolve" : "glm_kv_resolve_rows";
+                int ctl[k::kKvCtlInts];
+                ck(cudaMemcpy(ctl, t.m[c].ctl, sizeof ctl, cudaMemcpyDeviceToHost), "ctl");
+                if (ctl[3] != 0) {
+                    std::fprintf(stderr, "FAIL: %s, %d rows, step %d, row %d: overflowed\n", who, n, step, i);
                     ++g_fail;
                 }
-            };
-            ++g_checks;
-            if (ns[(size_t) i] > 0) cmp("slot cells", t.sc[0], t.sc[1], (size_t) ns[(size_t) i] * 4);
-            cmp("page table", t.m[0].page_table, t.m[1].page_table, (size_t) t.n_blocks * 4);
-            cmp("slot owners", t.m[0].slot_block, t.m[1].slot_block, (size_t) kSl * 4);
-            cmp("counters", t.m[0].ctl, t.m[1].ctl, (size_t) k::kKvCtlInts * 4);
-            cmp("slots", t.slots[0], t.slots[1], (size_t) kSl * kPage * row);
+                if (ns[(size_t) i] <= 0) continue;
+                std::vector<int> sc((size_t) ns[(size_t) i]);
+                ck(cudaMemcpy(sc.data(), t.sc[c], sc.size() * 4, cudaMemcpyDeviceToHost), "slot cells");
+                std::vector<uint8_t> sl((size_t) kSl * kPage * row);
+                ck(cudaMemcpy(sl.data(), t.slots[c], sl.size(), cudaMemcpyDeviceToHost), "slots");
+                int bad = 0;
+                for (int j = 0; j < ns[(size_t) i]; ++j) {
+                    const int cell = sel[(size_t) i][(size_t) j], slc = sc[(size_t) j];
+                    if (cell < 0 || slc < 0) {
+                        bad += (cell < 0) != (slc < 0);
+                        continue;
+                    }
+                    bad += slc >= kSl * kPage ||
+                           std::memcmp(sl.data() + (size_t) slc * row, t.host_h + (size_t) cell * row, (size_t) row) != 0;
+                }
+                if (bad) {
+                    std::fprintf(stderr, "FAIL: %s, %d rows, step %d, row %d: %d of %d cells do not read their "
+                                         "position's bytes\n", who, n, step, i, bad, ns[(size_t) i]);
+                    ++g_fail;
+                }
+            }
         }
     }
     for (Twin& t : tw) {
@@ -562,20 +583,26 @@ int main() {
         run(q8, 8, 8, 1.0, 0.6, seed++, s, wk_b, wv_b);    // verify windows on streamed layers
         run(q8, 16, 8, 1.0, 0.5, seed++, s, wk_b, wv_b);
     }
+    int f0 = 0;   // (the attention runs above came first)
+    const auto verdict = [&](const char* what) {
+        std::printf("  %s: %s\n", what, g_fail == f0 ? "same" : "FAILED");
+        f0 = g_fail;
+    };
+    verdict("the attention of 2..16 rows in one launch");
     for (const int n : {1, 2, 4, 7, 8, 16}) run_select(n, 900 + (uint32_t) n, s);
-    std::printf("  selections of 1..16 rows in one launch: %s\n", g_fail ? "(failures so far)" : "same");
+    verdict("selections of 1..16 rows in one launch");
     for (const int n : {1, 2, 4, 7, 16}) run_score(n, 1200 + (uint32_t) n, s);
-    std::printf("  scores of 1..16 rows in one launch: %s\n", g_fail ? "(failures so far)" : "same");
+    verdict("scores of 1..16 rows in one launch");
     for (const bool q8 : {false, true})
         for (const int n : {1, 3, 8, 16}) run_resolve(n, q8, 1300 + (uint32_t) n, s);
-    std::printf("  KV resolves of 1..16 rows in one launch (6 steps, evicting): %s\n", g_fail ? "(failures so far)" : "same");
+    verdict("KV resolves of 1..16 rows in one launch (6 steps, evicting: every cell reads its position's bytes)");
     for (int T = 1; T <= 16; ++T)
         for (int r = 0; r < 4; ++r) run_group(T, 1400 + (uint32_t) (T * 4 + r), s);
-    std::printf("  experts' grouping, a thread an entry, 1..16 tokens: %s\n", g_fail ? "(failures so far)" : "same");
+    verdict("experts' grouping, a thread an entry, 1..16 tokens");
     cudaFree(wk_b);
     cudaFree(wv_b);
     if (g_fail) {
-        std::printf("glm_rows_attn_test: %d of %d rows FAILED\n", g_fail, g_checks);
+        std::printf("glm_rows_attn_test: FAILED (%d failed checks, %d cases)\n", g_fail, g_checks);
         return 1;
     }
     std::printf("glm_rows_attn_test: OK (%d rows, each mla()'s bytes)\n", g_checks);
