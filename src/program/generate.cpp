@@ -2632,6 +2632,10 @@ static int glm_pack_generate(const Options& o) {
     std::function<int()> read_gap;
     uint64_t gap_count = 0, gap_tok = 0;
     double gap_ms = 0.0;
+    // the last gap's decode round (ms; 0: none yet) - a boundary's gap is due once its budget is half of one
+    // (prefill_gap_due; STRATA_GLM_PREFILL_GAP_CREDIT=0: every boundary, as before)
+    double gap_round_ms = 0.0;
+    static const bool gap_credit = env_num("STRATA_GLM_PREFILL_GAP_CREDIT", 1) != 0;
     const auto gen_admit = [&](int rid, const std::vector<int64_t>& ids, int64_t max_new,
                                const strata::kernels::SamplerParams& rq) {
         if (!multi_drain() || !resolve_ready()) {
@@ -2732,8 +2736,13 @@ static int glm_pack_generate(const Options& o) {
         gaps_over = false;
         if (use_gaps) {
             model.prefill_gap_wanted = [&] {
-                return !gaps_over &&
-                       std::any_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return !p->done; });
+                if (gaps_over ||
+                    !std::any_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return !p->done; }))
+                    return false;
+                if (!gap_credit) return true;
+                const double stage_ms =
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - gap_mark).count();
+                return strata::core::prefill_gap_due(read_gaps, stage_ms, gap_round_ms);
             };
             model.prefill_gap = [&] { return read_gap(); };
             prompt_between = [&] { return read_gap(); };
@@ -3091,10 +3100,12 @@ static int glm_pack_generate(const Options& o) {
         const uint64_t fails0 = multi_fails, n0 = multi_n;
         in_read_gap = true;
         step_no_spec = true;
+        int rounds = 0;
         for (bool first = true; !gens.empty() && multi_fails == fails0; first = false) {
             if (!first && std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_in).count() >=
                               budget)
                 break;
+            ++rounds;
             std::map<int, int64_t> want;   // rid -> the produced count that ends this round for it
             for (const auto& gp : gens)
                 if (!gp->done) want[gp->rid] = gp->produced + 1;
@@ -3117,6 +3128,7 @@ static int glm_pack_generate(const Options& o) {
         gap_tok += multi_n - n0;
         const double this_ms = std::chrono::duration<double, std::milli>(gap_mark - t_in).count();
         gap_ms += this_ms;
+        if (rounds > 0) gap_round_ms = this_ms / rounds;   // (the drain's share too: a gap costs it once)
         if (this_ms > read_gaps.max_ms && !gaps_over) {
             // (a round is one token for every running request, whatever the budget: where their experts stream from
             // RAM or disk inside the loan it can take far longer than the stage - the rest of this read has no gaps)

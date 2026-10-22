@@ -981,7 +981,8 @@ public:
     std::function<bool(int64_t, int64_t)> prefill_progress;
     /// The fewest chunks a split cuts a prompt-path call into (1: as many as the largest chunk needs).  The scheduler's
     /// interleaved pieces (STRATA_GLM_PREFILL_INTERLEAVE) set 2: a piece no longer than one chunk would run on one GPU
-    /// after the other, two pipeline across the split.
+    /// after the other, two pipeline across the split.  STRATA_GLM_PREFILL_MIN_CHUNKS sets a floor for every call
+    /// (prefill_floor: the larger of the two).
     int prefill_min_chunks = 1;
     /// A chunk length to cut a prompt-path call in instead (0: the call's own choice) - with prefill_chunk_for, the
     /// interleaved pieces keep the chunk boundaries an uncut read takes (the experts' residency per chunk can still
@@ -997,6 +998,8 @@ public:
     std::function<int()> prefill_gap;
     /// The chunk length a prompt-path call of n tokens takes (0: no prompt path)
     int prefill_chunk_for(int64_t n) const;
+    /// The fewest chunks a call of n tokens is cut into (STRATA_GLM_PREFILL_MIN_CHUNKS or call_min; 1 on one GPU)
+    int64_t prefill_floor(int64_t n, int call_min) const;
     /// Debug: every half's sequence state (KDA states + conv histories, DSA caches) to <path>.<half>.bin, with the
     /// per-layer offsets in <path>.<half>.txt - two runs that should agree are compared per layer and component.
     bool dump_state(const std::string& path);

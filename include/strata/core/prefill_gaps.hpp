@@ -42,6 +42,15 @@ inline double prefill_gap_budget_ms(const PrefillGaps& g, double stage_ms) {
     return b < g.max_ms ? b : g.max_ms;
 }
 
+/// Is a gap at this chunk boundary due: the budget the read earned since the last gap (prefill_gap_budget_ms of the
+/// stage since then) is half a decode round (round_ms: the last gap's round; 0, not known yet: due) or more.  A gap is
+/// one round at least, so with short chunks (STRATA_GLM_PREFILL_MIN_CHUNKS) a gap at every boundary would take more
+/// than the share; a boundary that is not due adds its stage to the next one's.
+inline bool prefill_gap_due(const PrefillGaps& g, double stage_ms, double round_ms) {
+    if (g.percent <= 0) return false;
+    return round_ms <= 0 || prefill_gap_budget_ms(g, stage_ms) >= 0.5 * round_ms;
+}
+
 /// The pipeline's gap bookkeeping (prefill_run holds its own mutex around every call): np parts, nc chunks.
 struct PipelineGaps {
     int np = 0, nc = 0;

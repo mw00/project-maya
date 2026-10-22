@@ -18,6 +18,7 @@
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
 
+#include "strata/core/prefill_chunks.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -4161,9 +4162,23 @@ int Glm5Model::prefill_chunk_for(int64_t nn) const {   // (prefill's own choice 
         if (m->pf_ == nullptr) return 0;
         Tmax = std::min(Tmax, m->pf_->T);
     }
-    const int64_t nchunks = (nn + Tmax - 1) / Tmax;
-    return split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                  : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    return strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr, prefill_floor(nn, 1));
+}
+
+// The fewest chunks a split cuts a call of nn tokens into: the call's own floor (prefill_min_chunks, none under 256
+// tokens) or STRATA_GLM_PREFILL_MIN_CHUNKS's (strata/core/prefill_chunks.hpp), whichever is more; one GPU: 1
+int64_t Glm5Model::prefill_floor(int64_t nn, int call_min) const {
+    static const strata::core::PrefillMinChunks set = [] {
+        const strata::core::PrefillMinChunks s =
+            strata::core::prefill_min_chunks_parse(getenv("STRATA_GLM_PREFILL_MIN_CHUNKS"));
+        if (s.n > 1)
+            std::fprintf(stderr, "glm prefill: on a split a prompt-path call is cut into %d chunks at least, none under "
+                                 "%d tokens (MAYA_GLM_PREFILL_MIN_CHUNKS), so the parts pipeline it\n", s.n, s.min_tokens);
+        return s;
+    }();
+    if (split_next_ == nullptr) return 1;
+    return std::max(strata::core::prefill_floor_chunks(nn, call_min, 256),
+                    strata::core::prefill_floor_chunks(nn, set.n, set.min_tokens));
 }
 
 bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, int32_t next_token) {
@@ -4184,15 +4199,13 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     int Tmax = pf_->T;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tmax = std::min(Tmax, m->pf_->T);
     const int64_t nn = (int64_t) tokens.size();
-    // (prefill_min_chunks on a split: so many chunks at least, none under 256 tokens)
-    const int64_t nchunks = std::max<int64_t>((nn + Tmax - 1) / Tmax,
-                                              split_next_ == nullptr ? 1
-                                                                     : std::min<int64_t>(prefill_min_chunks, nn / 256));
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
-    // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s)
-    const int Trun = prefill_force_chunk > 0 ? std::min(Tmax, prefill_force_chunk)
-                     : split_next_ == nullptr ? (int) std::min<int64_t>(Tmax, (nn + 63) / 64 * 64)
-                                              : (int) std::min<int64_t>(Tmax, ((nn + nchunks - 1) / nchunks + 63) / 64 * 64);
+    // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s).
+    // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, STRATA_GLM_PREFILL_MIN_CHUNKS)
+    const int Trun = prefill_force_chunk > 0
+                         ? std::min(Tmax, prefill_force_chunk)
+                         : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                                                           prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {

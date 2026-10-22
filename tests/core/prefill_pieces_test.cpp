@@ -1,9 +1,13 @@
 // prefill_pieces (STRATA_GLM_PREFILL_INTERLEAVE) and prefill_gaps (STRATA_GLM_PREFILL_GAPS): the pieces a prompt is
 // read in - every token once, in order, no piece but a whole segment shorter than the minimum - and the decode gaps of
-// a pipelined read - every part idle in a gap, every chunk read once in order by every part, no deadlock.  CPU only.
+// a pipelined read - every part idle in a gap, every chunk read once in order by every part, no deadlock; prefill_chunks
+// (STRATA_GLM_PREFILL_MIN_CHUNKS): the chunks a call is cut into - as before when off, the floor's count when on.  CPU
+// only.
+#include "strata/core/prefill_chunks.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/prefill_pieces.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -176,6 +180,60 @@ int main() {
                 ok = ok && pipeline(np, nc, 0x5, &n);
             }
         expect(ok, "pipelined reads with gaps: every chunk in order, every part idle in a gap");
+    }
+    // the chunks a call is cut into (STRATA_GLM_PREFILL_MIN_CHUNKS)
+    {
+        using namespace strata::core;
+        expect(prefill_min_chunks_parse(nullptr).n == 1 && prefill_min_chunks_parse("1").n == 1 &&
+                   prefill_min_chunks_parse("0").n == 1,
+               "min chunks unset / 0 / 1: off");
+        expect(prefill_min_chunks_parse("2").n == 2 && prefill_min_chunks_parse("2").min_tokens == 512, "2: 512 at least");
+        expect(prefill_min_chunks_parse("3,1024").n == 3 && prefill_min_chunks_parse("3,1024").min_tokens == 1024,
+               "3,1024");
+        expect(prefill_min_chunks_parse("40,10").n == 8 && prefill_min_chunks_parse("40,10").min_tokens == 256,
+               "min chunks: 8 at most, 256 tokens at least");
+        // off: what prefill() took before (one GPU: full chunks; a split: equal ones, prefill_min_chunks of 256+)
+        const auto before = [](int64_t nn, int tmax, bool split, int call_min) {
+            const int64_t k = std::max<int64_t>((nn + tmax - 1) / tmax,
+                                                split ? std::min<int64_t>(call_min, nn / 256) : 1);
+            return !split ? (int) std::min<int64_t>(tmax, (nn + 63) / 64 * 64)
+                          : (int) std::min<int64_t>(tmax, ((nn + k - 1) / k + 63) / 64 * 64);
+        };
+        bool same = true, exact = true, sane = true;
+        for (const int tmax : {8192, 7616, 4096})
+            for (int64_t nn = 1; nn < 40000; nn += 13) {
+                for (const bool split : {false, true})
+                    for (const int cm : {1, 2, 3})
+                        same = same && prefill_chunk_len(nn, tmax, split, split ? prefill_floor_chunks(nn, cm, 256) : 1) ==
+                                           before(nn, tmax, split, cm);
+                for (const int n : {2, 3, 4, 6, 8})
+                    for (const int mt : {256, 512, 1024, 2048}) {
+                        const int64_t fl = prefill_floor_chunks(nn, n, mt);
+                        const int len = prefill_chunk_len(nn, tmax, true, fl);
+                        const int64_t c = prefill_chunk_count(nn, len), want = std::max<int64_t>((nn + tmax - 1) / tmax, fl);
+                        sane = sane && len > 0 && len % 64 == 0 && len <= tmax && c >= 1 && c <= want &&
+                               (fl == 1 || (nn - (c - 1) * (int64_t) len) > 0) && (fl <= 1 || nn / fl >= mt);
+                        if (n <= 4) exact = exact && c == want;
+                    }
+            }
+        expect(same, "min chunks off: the chunks as before");
+        expect(exact, "min chunks 2..4: exactly that many chunks (or what the largest chunk needs)");
+        expect(sane, "min chunks: 64-token multiples, no chunk past the largest, none under the minimum");
+        // the cases the setting is for: a turn on a restored conversation, one chunk before
+        const auto cut = [](int64_t nn, int n, int mt) {
+            const int len = prefill_chunk_len(nn, 8192, true, prefill_floor_chunks(nn, n, mt));
+            return prefill_chunk_count(nn, len);
+        };
+        expect(cut(1000, 2, 512) == 1 && cut(1024, 2, 512) == 2 && cut(4000, 4, 512) == 4 && cut(8000, 3, 512) == 3,
+               "min chunks: 1000 tokens stay whole at 512, 1024 in two, 4000 in four, 8000 in three");
+        expect(cut(20000, 2, 512) == 3 && cut(20000, 4, 512) == 4, "min chunks: a long read keeps its own count");
+        expect(cut(1500, 4, 512) == 2 && cut(1500, 4, 256) == 4, "min chunks: as many as the minimum lets");
+        // a boundary's gap is due once its budget is half a round
+        const PrefillGaps g = prefill_gaps_parse("20");
+        expect(prefill_gap_due(g, 100.0, 0.0), "gap due: no round known yet");
+        expect(prefill_gap_due(g, 400.0, 200.0) && !prefill_gap_due(g, 300.0, 200.0),
+               "gap due: a 20% budget of a 400 ms stage is half a 200 ms round, 300 ms is not");
+        expect(!prefill_gap_due(prefill_gaps_parse("0"), 1e6, 0.0), "gap due: never with gaps off");
     }
     if (fails == 0) std::printf("prefill_pieces_test: all passed\n");
     return fails == 0 ? 0 : 1;
