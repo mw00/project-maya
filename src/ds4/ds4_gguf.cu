@@ -1273,6 +1273,15 @@ bool q8_batch_check(int dev, std::string& err) {
 
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
+void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s) {
+    if (q8_batch()) {
+        Q8Jobs J;
+        J.j[0] = {x, (size_t) k, q, d, k, 1};
+        q8_quant_jobs(J, 1, s);
+    } else
+        q8_quant(x, (size_t) k, 1, k, q, d, s);
+}
+
 size_t type_row_bytes(int type, int64_t k) {
     if (type == kTypeMXFP4) return k % kMxBlock == 0 ? mx_row_bytes(k) : 0;
     return iq::supported(type) && k % 256 == 0 ? iq::row_bytes(type, k) : 0;
@@ -1341,7 +1350,9 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
     return v;
 }
 
-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) { return mv(jobs, n, s, nullptr); }
+
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
@@ -1410,7 +1421,11 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         max_n[f] = std::max(max_n[f], m.n);
         max_c[f] = std::max(max_c[f], q.ncol);
         const bool xa = ((uintptr_t) b.x & 15u) == 0 && (q.ncol == 1 || b.xcs % 4 == 0);
-        if (f == 2) {   // the activations rounded to int8 first (each job its own rows of the scratch)
+        if (f == 2 && pre != nullptr && q.xf == pre->x && m.k == pre->k && q.ncol == 1) {
+            b.xq = pre->q;   // (DS4_HC_FUSE: x rounded where it was made, q8_quant_block's bits)
+            b.xd = pre->d;
+            vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
+        } else if (f == 2) {   // the activations rounded to int8 first (each job its own rows of the scratch)
             Scratch* sc = scratch(s);
             if (sc == nullptr || m.k > kMaxQK) {
                 fail("mv: Q8_0 inputs past the scratch");

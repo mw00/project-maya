@@ -390,6 +390,76 @@ __global__ void hc_post_kernel(const float* __restrict__ y, const float* __restr
     out[(size_t) t * hc * dim + i] = a;
 }
 
+// (DS4_HC_FUSE) hc_split_pre_norm: block 0 is hc_pre_norm_kernel's block 0, its code and its 1024 threads as they
+// are, then (q set) each warp rounds the 32-blocks of x it stored as gguf's q8_quant_block does (warp w holds x[1024 n
+// + 32 w + lane]: whole blocks, every lane of a warp in or past dim together); block 1 is hc_split_kernel's warp for
+// hc 4, its other warps returning at once (no barrier there).  The old kernels stay as they are: hc_fuse_check
+// (ds4_model.cu) compares the two paths byte for byte
+__global__ void __launch_bounds__(1024) hc_split_pre_norm_kernel(const HcFuse a) {
+    if (blockIdx.x == 0) {
+        const int dim = a.dim, hc = a.hc;
+        float r[8];
+        float ss = 0.0f;
+        int n = 0;
+        for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) {
+            float v = 0.0f;
+            for (int s = 0; s < hc; ++s) v += a.mix[s] * a.h[(size_t) s * dim + e];
+            r[n] = v;
+            ss += v * v;
+        }
+        const float inv = rsqrtf(block_sum(ss) / (float) dim + a.eps);
+        n = 0;
+        for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) {
+            const float v = a.w != nullptr ? r[n] * inv * a.w[e] : r[n];
+            a.x[e] = v;
+            if (a.q == nullptr) continue;
+            float am = fabsf(v);   // (q8_quant_block's ops on the value stored, from the warp's own registers)
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            const float sc = am / 127.0f;
+            a.q[e] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+            if ((threadIdx.x & 31) == 0) a.qd[e / 32] = sc;
+        }
+        return;
+    }
+    if (threadIdx.x >= 32) return;
+    const int lane = threadIdx.x, hc = a.hc;
+    const float* mx = a.mixes;
+    const float eps = a.hc_eps;
+    float pv = 0.0f;
+    if (lane < hc) {
+        pv = 1.0f / (1.0f + expf(-(mx[lane] * a.scale[0] + a.base[lane]))) + eps;
+        a.pre[lane] = pv;
+        a.post[lane] = 2.0f / (1.0f + expf(-(mx[hc + lane] * a.scale[1] + a.base[hc + lane])));
+    }
+    if (a.pre_copy != nullptr && lane < 8) {   // (the layer's copy of the 8 slots: the rest are pre's own bits)
+        if (lane < hc) a.pre_copy[lane] = pv;
+        else ((uint32_t*) a.pre_copy)[lane] = ((const uint32_t*) a.pre)[lane];
+    }
+    // rows are the 4-lane groups (j = lane / 4), columns the lanes 4 apart (k = lane % 4)
+    const bool on = lane < 16;
+    float c = on ? mx[8 + lane] * a.scale[2] + a.base[8 + lane] : -FLT_MAX;
+    auto row_sum = [&](float v) {
+        v += __shfl_xor_sync(0xffffffffu, v, 1);
+        return v + __shfl_xor_sync(0xffffffffu, v, 2);
+    };
+    auto col_sum = [&](float v) {
+        v += __shfl_xor_sync(0xffffffffu, v, 4);
+        return v + __shfl_xor_sync(0xffffffffu, v, 8);
+    };
+    float m = fmaxf(c, __shfl_xor_sync(0xffffffffu, c, 1));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+    c = on ? expf(c - m) : 0.0f;
+    c = c / row_sum(c) + eps;                       // softmax over each row, + eps
+    c = on ? c : 0.0f;
+    c = c / (col_sum(c) + eps);                     // each destination column over its sources
+    for (int it = 1; it < a.iters; ++it) {
+        c = c / (row_sum(c) + eps);
+        c = c / (col_sum(c) + eps);
+    }
+    if (on) a.comb[lane] = c;
+}
+
 // ---------------------------------------------------------------- gemv over F16 weights, a warp a row
 __global__ void __launch_bounds__(kThreads) gemv_f16_kernel(const uint16_t* __restrict__ W, const float* __restrict__ x,
                                                             int n, int k, float alpha, float* __restrict__ y) {
@@ -2863,6 +2933,7 @@ void hc_post_inplace(const float* y, float* h, const float* post, const float* c
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
 }
+void hc_split_pre_norm(const HcFuse& a, cudaStream_t s) { hc_split_pre_norm_kernel<<<2, 1024, 0, s>>>(a); }
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int fmt) {
     if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, fmt);
 }

@@ -78,6 +78,24 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
+/// (DS4_HC_FUSE) a decoded token's hc_split and hc_pre_norm (T 1, hc 4) in one launch - they share nothing, the norm
+/// reading the lagged mix (the split before this one's) - each block its old kernel's code: the split of mixes into
+/// pre / post / comb (pre_copy set: the 8 pre slots there too, the values for k < hc and pre's own bits for the rest,
+/// as the layer's copy of them did), and x = rmsnorm(sum_s mix[s] h[s]) * w (q set: x's int8 rounding too, gguf mv's
+/// for a Q8_0 job's input - q [dim], qd [dim / 32]).  dim % 32 == 0, dim <= 8192; pre_copy not mix.
+struct HcFuse {
+    const float *mixes = nullptr, *scale = nullptr, *base = nullptr;
+    int hc = 4, iters = 1;
+    float hc_eps = 0.0f;
+    float *pre = nullptr, *post = nullptr, *comb = nullptr, *pre_copy = nullptr;
+    const float *h = nullptr, *mix = nullptr, *w = nullptr;
+    int dim = 0;
+    float eps = 0.0f;
+    float* x = nullptr;
+    int8_t* q = nullptr;
+    float* qd = nullptr;
+};
+void hc_split_pre_norm(const HcFuse& a, cudaStream_t s);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
