@@ -282,3 +282,9 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
 - The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`).
 - Maya is open source under the [MIT License](LICENSE); the notices of Strata, ggml, exllamav3 and beellama.cpp stay
   with every copy.
+
+### Experimental HIP DeepSeek prefill tuning
+
+| Environment variable | Default | Effect |
+| --- | --- | --- |
+| `DS4_SKIP_UNPICKED` | `0` | HIP only: skip zero-row expert transfers after routing; stage only each TP member's required RAM-copy gate/up rows. [Validation and limitations](docs/ds4-skip-unpicked.md). |

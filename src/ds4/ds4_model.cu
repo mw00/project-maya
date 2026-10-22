@@ -21,6 +21,7 @@
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_ram_slice.hpp"
 #include "ds4_vision.cuh"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -2060,6 +2061,26 @@ struct Model::Impl {
         }
         return read_mx_file(l, e, blob);
     }
+    // Keep the full-blob offsets expected by stream_expert, but stage only the
+    // rows this TP member consumes. Down retains its full rows for strided DMA.
+    bool read_mx_member(const Layer& l, int e, int mi, uint8_t* blob) const {
+        if (!copy_mode || l.nm == 1 || l.ram[(size_t) e] < 0) return read_mx(l, e, blob);
+        for (int r = 0; r < 3; ++r) {
+            const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+            const size_t off = mx_read_off(l, mi, r);
+            std::array<RamSlice, 2> spans;
+            const int ns = ram_slices(nb, NH, off, mx_read_len(l, r), spans);
+            if (ns < 0) return false;
+            for (int i = 0; i < ns; ++i) {
+                const RamSlice& span = spans[(size_t) i];
+                std::memcpy(blob + l.lay.trellis[r] + off + span.destination,
+                            ram_part[(size_t) l.ram[(size_t) e]][(size_t) span.part] +
+                                cp_lay[(size_t) l.il][(size_t) r] + span.source,
+                            span.bytes);
+            }
+        }
+        return true;
+    }
     bool read_mx_file(const Layer& l, int e, uint8_t* blob) const {   // (the movers: never a slot that may change)
         for (int r = 0; r < 3; ++r)
             if (!pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r], mx_part_bytes(l, r),
@@ -3464,6 +3485,9 @@ struct Model::Impl {
         std::vector<Batch> b;
         size_t cp = 0, kp = 0;        // the next batch to copy, to compute
         std::atomic<size_t> done{0};  // cp, for read_ahead's thread
+        int routed_layer = -1, routed_chunk = -1;
+        std::vector<int> routed_bounds;
+        size_t skipped = 0, copied = 0;
     };
     // in place (file_experts): the batches' file regions read ahead of their copies - POSIX_FADV_WILLNEED, the kernel
     // reading them in the background in large requests, where the copies alone fault the pages in a few at a time -
@@ -3505,10 +3529,25 @@ struct Model::Impl {
     }
     bool copy_ahead(Dev& d, Chunk& c, Streamer& S, int di, std::string& err) {
         const int P = Chunk::kParts;
+#if defined(STRATA_USE_HIP)
+        static const bool skip_unpicked = std::getenv("DS4_SKIP_UNPICKED") != nullptr &&
+                                          std::atoi(std::getenv("DS4_SKIP_UNPICKED")) != 0;
+#else
+        constexpr bool skip_unpicked = false;
+#endif
         while (S.cp < S.b.size() && S.cp < S.kp + P) {
             const Batch& bt = S.b[S.cp];
+            // Wait for this layer's routing rather than staging every expert
+            // speculatively. Copies still overlap compute within the layer.
+            if (skip_unpicked && (bt.il != S.routed_layer || bt.k != S.routed_chunk)) break;
             const int half = (int) (S.cp % P);
             const Layer& l0 = L[(size_t) bt.il];
+            // Preserve the original virtual slots, batches and accumulation order.
+            const auto picked = [&](int i) {
+                if (!skip_unpicked || bt.il != S.routed_layer || bt.k != S.routed_chunk) return true;
+                const size_t v = (size_t) l0.n_slots + bt.j0 + i;
+                return S.routed_bounds[v + 1] > S.routed_bounds[v];
+            };
             int mi = 0;
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di) mi = m;
@@ -3519,8 +3558,11 @@ struct Model::Impl {
                 sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
                 std::atomic<bool> bad{false};
                 c.readers->run(bt.n, [&](int i) {
+                    if (!picked(i)) return;
                     const int e = l0.host_list[(size_t) (bt.j0 + i)];
-                    if (l0.lay.fmt == gg::kFmtMXFP4 ? !read_mx(l0, e, sb + (size_t) i * c.stage_stride)
+                    uint8_t* dest = sb + (size_t) i * c.stage_stride;
+                    if (l0.lay.fmt == gg::kFmtMXFP4 ? !(skip_unpicked ? read_mx_member(l0, e, mi, dest)
+                                                                   : read_mx(l0, e, dest))
                                                     : !pk.read_at(l0.region_file[(size_t) e], l0.region_off[(size_t) e],
                                                                   l0.region_bytes[(size_t) e],
                                                                   sb + (size_t) i * c.stage_stride))
@@ -3532,6 +3574,8 @@ struct Model::Impl {
                 }
             }
             for (int i = 0; i < bt.n; ++i) {
+                if (!picked(i)) { ++S.skipped; continue; }
+                if (skip_unpicked) ++S.copied;
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
                 if (!stream_expert(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], dst, c.cs, err,
                                    sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr))
@@ -8516,6 +8560,14 @@ struct Model::Impl {
         // the streamed experts as their batches arrive (each batch's slots freed for the copies at once), the VRAM ones
         // in shares between them (the device works while the copies run)
         const int di = l.dev, P = Chunk::kParts;
+#if defined(STRATA_USE_HIP)
+        if (std::getenv("DS4_SKIP_UNPICKED") != nullptr && std::atoi(std::getenv("DS4_SKIP_UNPICKED")) != 0) {
+            S.routed_layer = L0.il;
+            S.routed_chunk = wp.k;
+            S.routed_bounds = b;
+            if (!copy_ahead(d, c, S, di, err)) return false;
+        }
+#endif
         int nb = 0;
         for (size_t q = S.kp; q < S.b.size() && S.b[q].il == L0.il && S.b[q].k == wp.k; ++q) ++nb;
         int v_done = 0;
@@ -8961,6 +9013,9 @@ struct Model::Impl {
                 }
             }
         }
+        if (!c.flow && S.copied + S.skipped > 0 && std::getenv("DS4_FLOW_STATS") != nullptr)
+            std::fprintf(stderr, "ds4 prompt batches, CUDA%d: %zu experts copied, %zu unpicked experts skipped\n",
+                         devs[(size_t) di].id, S.copied, S.skipped);
         return true;
     }
 
