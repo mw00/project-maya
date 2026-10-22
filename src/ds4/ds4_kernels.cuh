@@ -110,6 +110,10 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+/// (DS4_ROUTE_FUSE) gemv_f32 for one token (T 1) of two matrices on the same x in one launch: y0 = x W0 (n0 rows), y1 =
+/// x W1 (n1 rows), each row gemv_f32's bits.  k a multiple of 4; false (nothing launched) otherwise.
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
+                   cudaStream_t s);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -292,6 +296,29 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// (DS4_ROUTE_FUSE) a decoded token's (T 1) route_publish and route_ahead in one launch of two blocks, each its old
+/// kernel's code (disjoint request fields), then publish_kernel as route_publish launches it (na0 / na1, T 1, seq).
+/// The caller passes bias_vl only when vl != 0, as route_publish does.  false (nothing launched): no request, n or
+/// a_n not 1 .. 1024, k not 1 .. kPicks, m < 1 or off + m past kAhead, dim not 1 .. kMaxDim.
+struct RoutePair {
+    const float *logits = nullptr, *bias = nullptr;   // route_publish's
+    int n = 0, k = 0;
+    float route_scale = 1.0f;
+    const unsigned long long* vram = nullptr;
+    const float* x = nullptr;
+    int dim = 0;
+    int* idx = nullptr;
+    float* w = nullptr;
+    unsigned long long* plan_ptr = nullptr;
+    Req* req = nullptr;
+    const float* bias_vl = nullptr;
+    unsigned vl = 0;
+    unsigned seq = 0;
+    int na0 = 0, na1 = 0;
+    const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
+    int a_n = 0, m = 0, off = 0;
+};
+bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
 /// The helper GPU's share of request seq (DS4_HELPER): waits on the device until req holds it - or a later one, or

@@ -1121,6 +1121,10 @@ struct Model::Impl {
     // DS4_HC_FUSE=1: a decoded token's (T 1) hc_split and hc_pre_norm in one launch (hc_split_pre_norm), the attention
     // input's int8 rounding there, the layer's copy of the pre slots by its FFN split - checked at load (hc_fuse_check)
     bool hc_fuse = false;
+    // DS4_ROUTE_FUSE=1: a decoded token's (T 1) router stage on a group's lead with one layer of lookahead (DS4_AHEAD
+    // 1) and a next layer to guess - its gate and the next layer's in one launch (gemv_f32_pair), the routing and the
+    // guesses in another (route_pair), publish as before - checked at load (route_fuse_check)
+    bool route_fuse = false;
     static constexpr uint64_t kRamMargin = 8ull << 30;   // RAM left to the rest (the system, the page cache's churn)
     static constexpr uint64_t kAutoCopyRoom = 8ull << 30;   // --mmap-experts auto copies only with this much more spare
                                                             // (the Engram rows' page cache, other programs)
@@ -2510,6 +2514,26 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch, its attention input "
                                      "rounded to int8 there, the layer's pre copy by its FFN split (DS4_HC_FUSE)\n");
         }
+        if (const char* v = ds4_env("DS4_ROUTE_FUSE")) {   // (MAYA_DS4_ROUTE_FUSE)
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_ROUTE_FUSE=") + v + ": 1 or 0";
+                return false;
+            }
+            route_fuse = std::strcmp(v, "1") == 0;
+#ifdef STRATA_HIP_WAVE64
+            if (route_fuse) {   // (its warp reductions are a 32-lane warp's)
+                err = "DS4_ROUTE_FUSE=1 on a wave64 build";
+                return false;
+            }
+#endif
+            if (route_fuse && ahead_mode != 1) {   // (no other lookahead mode changes under it)
+                err = "DS4_ROUTE_FUSE=1 takes one layer of lookahead (DS4_AHEAD 1), not " + std::to_string(ahead_mode);
+                return false;
+            }
+            if (route_fuse)
+                std::fprintf(stderr, "ds4: a decoded token's router stage on the lead in two launches: its gate and "
+                                     "the next layer's, then the routing and the guesses (DS4_ROUTE_FUSE)\n");
+        }
         if (helper_id >= 0 && !helper_open(err)) return false;
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -3371,6 +3395,7 @@ struct Model::Impl {
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
             if (hc_fuse && !hc_fuse_check(err)) return false;   // (no request yet)
+            if (route_fuse && !route_fuse_check(err)) return false;   // (no request yet)
             if (tp_uneven && (std::getenv("STRATA_DS4_TP_CHECK") != nullptr || std::getenv("DS4_TP_CHECK") != nullptr) &&
                 !tp_check(err))
                 return false;   // (MAYA_DS4_TP_CHECK=1: at load, no request yet)
@@ -8407,6 +8432,284 @@ struct Model::Impl {
         return true;
     }
 
+    // DS4_ROUTE_FUSE=1 (at load, before any request), on every device with layers: gemv_f32_pair and route_pair (with
+    // its publish) against what they replace - two gemv_f32 launches; route_ahead, then route_publish with its publish.
+    // The GEMVs: the device's first and last pair of a layer and its next (and the first layer with an image-token
+    // bias), their real gates on a random and an edge x (zeros, negative zeros, tiny and large magnitudes), plus rows
+    // not a whole block (300 and 13 of the first gate's).  The routing: the real logits, real gates' biases and VRAM
+    // table; tied logits, logits past the softplus's 20 and negative, the request's x copied (a pick on the CPU lane)
+    // and not (every pick in VRAM), no image bias / its bit on / its pointer given and its bit off, n 257 (not a whole
+    // block), m 1, k and 16.  Every output (both logits, idx / w / plan_ptr, the whole request) starts 0xA5 between
+    // guards; both paths' bytes must be equal - every value, untouched byte and guard - and the weights finite.  On
+    // d.st, each run's end waited for (10 s): a mismatch or an error after a clean end fails the load (everything
+    // freed); no clean end ends the process at once (route_unknown)
+    [[noreturn]] static void route_unknown(int dev, int il, const char* what, const char* why) {
+        std::fprintf(stderr, "ds4: route fuse check: CUDA%d (layer %d, %s): %s - the device's state unknown; the "
+                             "process ends without teardown (exit %d)\n",
+                     dev, il, what, why, kExitUnknown);
+        std::fflush(stderr);
+        std::fflush(stdout);
+        std::_Exit(kExitUnknown);
+    }
+    bool route_fuse_check(std::string& err) {
+        const int D = g.dim;
+        constexpr size_t kGuard = 64;
+        // one set of outputs: [guard | region]... | guard, in bytes
+        enum { kLog, kLogA, kIdx, kW, kPlan, kReq, kRegions };
+        const size_t rb[kRegions] = {1024 * 4, 1024 * 4, kPicks * 4, kPicks * 4, kPicks * 8, sizeof(Req)};
+        size_t at[kRegions], set_bytes = 0;
+        for (int r = 0; r < kRegions; ++r) {
+            at[r] = set_bytes + kGuard;
+            set_bytes = (at[r] + rb[r] + 255) / 256 * 256;
+        }
+        set_bytes += kGuard;
+        // inputs: x | synthetic logits, the guesses' logits | biases (routing, image, guesses) | a VRAM table
+        const size_t n_in = (size_t) D + 1024 * 5;
+        uint32_t st = 0x7f4a7c15u;
+        auto rnd = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return (float) (int) (st % 2001u - 1000u) / 250.0f;   // -4 .. 4
+        };
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[(size_t) di];
+            // (a layer, its next layer: both this device's member of the trunk's consecutive layers)
+            std::vector<std::pair<const Layer*, const Layer*>> pairs, all;
+            for (size_t j = 0; j + 1 < L.size(); ++j) {
+                const Layer &a0 = L[j], &b0 = L[j + 1];
+                if (a0.mtp || b0.mtp) continue;
+                for (int m = 0; m < a0.nm && m < b0.nm; ++m)
+                    if (member(a0, m).dev == (int) di && member(b0, m).dev == (int) di &&
+                        member(a0, m).gate_w != nullptr && member(b0, m).gate_w != nullptr &&
+                        member(a0, m).n_exp <= 1024 && member(b0, m).n_exp <= 1024)
+                        all.push_back({&member(a0, m), &member(b0, m)});
+            }
+            if (all.empty()) continue;
+            pairs.push_back(all.front());
+            if (all.size() > 1) pairs.push_back(all.back());
+            for (const auto& p : all)
+                if (p.first->gate_bias_vl != nullptr) {
+                    if (std::find(pairs.begin(), pairs.end(), p) == pairs.end()) pairs.push_back(p);
+                    break;
+                }
+            auto fail_at = [&](const std::string& why) {
+                err = "route fuse check on CUDA" + std::to_string(d.id) + ": " + why;
+                std::fprintf(stderr, "ds4: CUDA%d route fuse check FAILED: %s\n", d.id, why.c_str());
+                return false;
+            };
+            if (cudaSetDevice(d.id) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return fail_at("cudaSetDevice failed");
+            }
+            const cudaStream_t s = d.st;
+            float* in = nullptr;
+            uint8_t *out = nullptr, *back = nullptr;
+            cudaEvent_t ev = nullptr;
+            if (cudaMalloc((void**) &in, n_in * 4) != cudaSuccess ||
+                cudaMalloc((void**) &out, 2 * set_bytes) != cudaSuccess ||
+                cudaMallocHost((void**) &back, 2 * set_bytes) != cudaSuccess ||
+                cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (in != nullptr) cudaFree(in);
+                if (out != nullptr) cudaFree(out);
+                if (back != nullptr) cudaFreeHost(back);
+                if (ev != nullptr) cudaEventDestroy(ev);
+                return fail_at("its buffers");
+            }
+            float *x = in, *lg = in + D, *lga = lg + 1024, *bias = lga + 1024, *bias_vl = bias + 1024;
+            unsigned long long* vram = (unsigned long long*) (bias_vl + 1024);   // (1024 floats: 512 entries)
+            std::vector<float> hin(n_in);   // (the host's inputs: written again only after the run before has ended)
+            uint8_t* set[2] = {out, out + set_bytes};   // the old path's, the fused one's
+            auto F = [&](int b, int r) { return (float*) (set[b] + at[r]); };
+            int runs = 0;
+            std::string bad;
+            // one run: the inputs up, both sets filled, the old path (b 0) then the fused one (b 1), the readback, its
+            // end; then every byte compared
+            auto run = [&](const char* what, int il, auto&& old_path, auto&& new_path, size_t n_log, size_t n_loga,
+                           int k) {
+                bool ok = cudaMemcpyAsync(in, hin.data(), n_in * 4, cudaMemcpyHostToDevice, s) == cudaSuccess &&
+                          cudaMemsetAsync(out, 0xA5, 2 * set_bytes, s) == cudaSuccess;
+                ok = ok && old_path() && new_path();
+                ok = ok && cudaGetLastError() == cudaSuccess &&
+                     cudaMemcpyAsync(back, out, 2 * set_bytes, cudaMemcpyDeviceToHost, s) == cudaSuccess;
+                const bool recorded = ok && cudaEventRecord(ev, s) == cudaSuccess;
+                const auto t0 = std::chrono::steady_clock::now();
+                cudaError_t q;
+                while ((q = recorded ? cudaEventQuery(ev) : cudaStreamQuery(s)) == cudaErrorNotReady &&
+                       std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                if (q != cudaSuccess)
+                    route_unknown(d.id, il, what, q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+                if (!recorded) {   // (a CUDA error or a refused launch before the end, which was clean)
+                    (void) cudaGetLastError();
+                    bad = std::string(what) + ", layer " + std::to_string(il) + ": a launch refused or a CUDA error";
+                    return;
+                }
+                ++runs;
+                const uint8_t *A = back, *B = back + set_bytes;
+                for (size_t o = 0; o < set_bytes && bad.empty(); ++o)
+                    if (A[o] != B[o])
+                        bad = std::string(what) + ", layer " + std::to_string(il) + ": an output byte " +
+                              std::to_string(o);
+                size_t prev = 0;   // (A == B now: A's guards and values)
+                for (int r = 0; r < kRegions && bad.empty(); ++r) {
+                    for (size_t o = prev; o < at[r] && bad.empty(); ++o)
+                        if (A[o] != 0xA5) bad = std::string(what) + ": a guard byte " + std::to_string(o);
+                    prev = at[r] + rb[r];
+                }
+                for (size_t o = prev; o < set_bytes && bad.empty(); ++o)
+                    if (A[o] != 0xA5) bad = std::string(what) + ": the last guard byte " + std::to_string(o);
+                const size_t nf[3] = {n_log, n_loga, (size_t) k};   // (the logits written, then the weights)
+                const int rf[3] = {kLog, kLogA, kW};
+                for (int q2 = 0; q2 < 3 && bad.empty(); ++q2)
+                    for (size_t i = 0; i < nf[q2] && bad.empty(); ++i) {
+                        float v;
+                        std::memcpy(&v, A + at[rf[q2]] + 4 * i, 4);
+                        if (!std::isfinite(v)) bad = std::string(what) + ": a value not finite";
+                    }
+            };
+            for (const auto& pr : pairs) {
+                const Layer &l = *pr.first, &nx = *pr.second;
+                for (int kind = 0; kind < 2 && bad.empty(); ++kind) {   // the GEMVs: random, edges
+                    for (int e = 0; e < D; ++e) {
+                        float v = rnd();
+                        if (kind == 1)
+                            switch ((e / 32) % 6) {
+                                case 0: v = 0.0f; break;
+                                case 1: v = -0.0f; break;
+                                case 2: v *= 1e-20f; break;
+                                case 3: v *= 1e15f; break;
+                                default: break;
+                            }
+                        hin[(size_t) e] = v;
+                    }
+                    run(kind ? "the gates, edges" : "the gates, random", l.il,
+                        [&] {
+                            gemv_f32(l.gate_w, x, l.n_exp, D, 1, F(0, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, nx.n_exp, D, 1, F(0, kLogA), 1024, s);
+                            return true;
+                        },
+                        [&] {
+                            return gemv_f32_pair(l.gate_w, l.n_exp, F(1, kLog), nx.gate_w, nx.n_exp, F(1, kLogA), x, D,
+                                                 s);
+                        },
+                        (size_t) l.n_exp, (size_t) nx.n_exp, 0);
+                }
+            }
+            const Layer &l = *pairs.front().first, &nx = *pairs.front().second;
+            if (bad.empty())   // (rows not a whole block: 300 and 13 of the first gate's)
+                run("the gates, 300 and 13 rows", l.il,
+                    [&] {
+                        gemv_f32(l.gate_w, x, std::min(300, l.n_exp), D, 1, F(0, kLog), 1024, s);
+                        gemv_f32(nx.gate_w, x, std::min(13, nx.n_exp), D, 1, F(0, kLogA), 1024, s);
+                        return true;
+                    },
+                    [&] {
+                        return gemv_f32_pair(l.gate_w, std::min(300, l.n_exp), F(1, kLog), nx.gate_w,
+                                             std::min(13, nx.n_exp), F(1, kLogA), x, D, s);
+                    },
+                    (size_t) std::min(300, l.n_exp), (size_t) std::min(13, nx.n_exp), 0);
+            // the routing: logits kind (0 real - the first gates' on a random x, 1 ties, 2 past 20 and negative, 3
+            // random), VRAM (0 the layer's, 1 every pick in VRAM, 2 none, 3 mixed), image bias (0 none, 1 its bit on,
+            // 2 its pointer and its bit off), n (0 the layer's, 1 257), m
+            struct Case {
+                int logits, vram, vl, n257, m;
+            };
+            const Case cases[] = {{0, 0, 0, 0, l.k_exp}, {1, 1, 0, 0, kAhead1}, {1, 2, 1, 0, 1}, {2, 3, 2, 0, l.k_exp},
+                                  {3, 3, 0, 1, kAhead1}, {0, 2, l.gate_bias_vl != nullptr ? 1 : 0, 0, l.k_exp}};
+            for (const Case& c : cases) {
+                if (!bad.empty()) break;
+                const int n = c.n257 ? std::min(257, l.n_exp) : l.n_exp;
+                const int an = c.n257 ? std::min(257, nx.n_exp) : nx.n_exp;
+                for (int e = 0; e < D; ++e) hin[(size_t) e] = rnd();
+                float *hl = hin.data() + D, *hla = hl + 1024, *hb = hla + 1024, *hbv = hb + 1024;
+                for (int i = 0; i < 1024; ++i) {
+                    float v = rnd(), va = rnd();
+                    if (c.logits == 1) v = (float) (i % 5) * 0.5f, va = (float) (i % 3);          // ties
+                    if (c.logits == 2) v = i % 2 ? 20.0f + (float) (i % 7) : -v * 10.0f, va = -va * 5.0f;
+                    hl[i] = v;
+                    hla[i] = va;
+                    hb[i] = c.logits == 1 ? 0.0f : 0.05f * rnd();
+                    hbv[i] = 0.05f * rnd();
+                }
+                unsigned long long* hv = (unsigned long long*) (hbv + 1024);
+                for (int i = 0; i < 512; ++i)   // (every pick in VRAM, none, or two in three)
+                    hv[i] = c.vram == 1   ? 0x1000ull + (unsigned long long) i * 64
+                            : c.vram == 2 ? 0ull
+                                          : (i % 3 ? 0x2000ull + (unsigned long long) i : 0ull);
+                const unsigned vl = c.vl == 1 ? 1u : c.vl == 2 ? 2u : 0u;
+                const float* bv = c.vl == 0                                    ? nullptr
+                                  : c.logits == 0 && l.gate_bias_vl != nullptr ? l.gate_bias_vl
+                                                                               : bias_vl;
+                const float* rb0 = c.logits == 0 ? l.gate_bias : bias;
+                const float* rba = c.logits == 0 ? nx.gate_bias : bias;
+                const unsigned long long* vt = c.vram == 0 ? l.vram_tab : vram;
+                if (c.vram == 0 && vt == nullptr) continue;   // (no VRAM table on this member: nothing to compare)
+                if (c.vram != 0 && n > 512) continue;
+                const unsigned seq = 0x51u + (unsigned) runs;
+                run("the routing", l.il,
+                    [&] {
+                        if (c.logits == 0) {   // (the logits: the first gates' on this x, the same in both sets)
+                            gemv_f32(l.gate_w, x, n, D, 1, F(0, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, an, D, 1, F(0, kLogA), 1024, s);
+                            gemv_f32(l.gate_w, x, n, D, 1, F(1, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, an, D, 1, F(1, kLogA), 1024, s);
+                        } else {
+                            for (int b = 0; b < 2; ++b)
+                                if (cudaMemcpyAsync(F(b, kLog), lg, 1024 * 4, cudaMemcpyDeviceToDevice, s) !=
+                                        cudaSuccess ||
+                                    cudaMemcpyAsync(F(b, kLogA), lga, 1024 * 4, cudaMemcpyDeviceToDevice, s) !=
+                                        cudaSuccess)
+                                    return false;
+                        }
+                        Req* rq = (Req*) (set[0] + at[kReq]);
+                        route_ahead(F(0, kLogA), rba, an, c.m, 1, rq, 0, s);
+                        route_publish(F(0, kLog), rb0, n, l.k_exp, 1, g.route_scale, vt, x, D, (int*) F(0, kIdx),
+                                      F(0, kW), (unsigned long long*) F(0, kPlan), rq, seq, s, bv, vl, c.m, 0);
+                        return true;
+                    },
+                    [&] {
+                        RoutePair a;
+                        a.logits = F(1, kLog);
+                        a.bias = rb0;
+                        a.n = n;
+                        a.k = l.k_exp;
+                        a.route_scale = g.route_scale;
+                        a.vram = vt;
+                        a.x = x;
+                        a.dim = D;
+                        a.idx = (int*) F(1, kIdx);
+                        a.w = F(1, kW);
+                        a.plan_ptr = (unsigned long long*) F(1, kPlan);
+                        a.req = (Req*) (set[1] + at[kReq]);
+                        a.vl = vl;
+                        a.bias_vl = vl != 0 ? bv : nullptr;
+                        a.seq = seq;
+                        a.na0 = c.m;
+                        a.a_logits = F(1, kLogA);
+                        a.a_bias = rba;
+                        a.a_n = an;
+                        a.m = c.m;
+                        return route_pair(a, s);
+                    },
+                    c.logits == 0 ? (size_t) n : 1024, c.logits == 0 ? (size_t) an : 1024, l.k_exp);
+            }
+            cudaFree(in);   // (every run ended cleanly)
+            cudaFree(out);
+            cudaFreeHost(back);
+            cudaEventDestroy(ev);
+            if (!bad.empty()) return fail_at(bad);
+            std::string ids;
+            for (const auto& p : pairs) ids += (ids.empty() ? "" : " ") + std::to_string(p.first->il);
+            std::fprintf(stderr,
+                         "ds4: CUDA%d route fuse check: %d runs (gates of layers %s and their next; the routing: "
+                         "real, tied, past 20 and negative logits, the request's x copied and not, the image bias off "
+                         "/ on / given and off, n 257, m 1 .. 16): both logits, the picks, weights, plan and the whole "
+                         "request the old launches' bit for bit, all finite, every guard intact (DS4_ROUTE_FUSE)\n",
+                         d.id, runs, ids.c_str());
+        }
+        return true;
+    }
+
     // DS4_TP_CHECK=1 (DS4_TP_GGUF_UNEVEN, at load, before any request): for each expert format and each rotation of the
     // split layers (which member takes the odd block) - every one they have - one token through every member's parts
     // (tp_check_member: three experts the layer holds in VRAM, weights 0.5 / 0.3 / 0.2, and the shared expert), the
@@ -13253,24 +13556,61 @@ struct Model::Impl {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0 && sq != 0;   // (sq 0: a host-free layer - no mailbox, no wait)
-            int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
-            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
-                const Layer* nx = ahead_layer(L0, a);
-                if (nx == nullptr) break;
-                const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
-                float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
-                                                                         // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
-                na[a - 1] = m;
+            // (DS4_ROUTE_FUSE: a decoded token's lead with one layer of lookahead and a next layer to guess - the two
+            //  gates in one launch, the routing and the guesses in another; every other case as before)
+            const Layer* nx1 = route_fuse && T == 1 && !l.mtp && lead && ahead_mode == 1 ? ahead_layer(L0, 1) : nullptr;
+            const int m1 = nx1 != nullptr ? std::max(1, std::min(kAhead1, nx1->k_exp + ahead_extra)) : 0;
+            RoutePair rp;
+            if (nx1 != nullptr) {
+                rp.logits = d.glog;
+                rp.bias = l.gate_bias;
+                rp.n = l.n_exp;
+                rp.k = l.k_exp;
+                rp.route_scale = g.route_scale;
+                rp.vram = l.vram_tab;
+                rp.x = d.x;
+                rp.dim = D;
+                rp.idx = d.ridx;
+                rp.w = d.rw;
+                rp.plan_ptr = d.plan_ptr;
+                rp.req = reqs + slot;
+                rp.vl = wp.vl;
+                rp.bias_vl = rp.vl != 0 ? l.gate_bias_vl : nullptr;
+                rp.seq = sq;
+                rp.na0 = m1;
+                rp.a_logits = d.glog_a;
+                rp.a_bias = nx1->gate_bias;
+                rp.a_n = nx1->n_exp;
+                rp.m = m1;
             }
-            route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
-                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
+            if (nx1 != nullptr && l.n_exp <= 1024 && l.k_exp <= kPicks && D % 4 == 0 && D <= kMaxDim) {
+                if (!gemv_f32_pair(l.gate_w, l.n_exp, d.glog, nx1->gate_w, nx1->n_exp, d.glog_a, d.x, D, s) ||
+                    !route_pair(rp, s)) {
+                    err = "the fused router stage refused its shapes";
+                    return false;
+                }
+            } else {
+                gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+                // lookahead: the next layers' guesses (their gate on this FFN input), published below
+                int na[2] = {0, 0};
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    const Layer* nx = ahead_layer(L0, a);
+                    if (nx == nullptr) break;
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra))
+                                         : std::min(kPicks, nx->k_exp);
+                    float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                                                                             // weights instead: the same hit rate)
+                    route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    na[a - 1] = m;
+                }
+                route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                              d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
+                              na[0], na[1]);
+            }
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
