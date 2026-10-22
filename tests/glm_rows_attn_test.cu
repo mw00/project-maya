@@ -1,5 +1,5 @@
-// tests/glm_rows_attn_test.cu - the batched rows' DSA attention (glm_rows.cu, STRATA_GLM_ROWS_ATTN) against the per-row
-// path the rows take without it, on random inputs (needs an NVIDIA GPU of compute capability 8.0+, no model), compared
+// tests/glm_rows_attn_test.cu - the batched rows' DSA attention and selection (glm_rows.cu, STRATA_GLM_ROWS_ATTN) against
+// the per-row path the rows take without it, on random inputs (needs an NVIDIA GPU of compute capability 8.0+, no model), compared
 // bitwise:
 //   per row (the reference): gf::mla(q_i, ...) over that row's own latent cache - resident, or a streamed layer's slot
 //     rows after glm_kv_resolve - into its q8_1 output;
@@ -8,7 +8,8 @@
 //     row at once.
 // 2..16 rows, each its own conversation with its own context length (from a few positions, where the selection is
 // every pool, to ~60K), resident and streamed caches mixed, some rows two positions of one resident conversation (a
-// verify window's rows), FP16 rows and INT8 records, and launches of fewer tokens than rows (part_tokens).
+// verify window's rows), FP16 rows and INT8 records, and launches of fewer tokens than rows (part_tokens).  And the
+// rows' selections in one launch (gf::dsa_select_rows) against dsa_select a row, cell for cell.
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
 
@@ -268,6 +269,56 @@ void run(bool q8, int n, int part_tokens, double p_streamed, double p_dup, uint3
     for (Seq& sq : seqs) free_seq(sq);
 }
 
+// the rows' selection in one launch (gf::dsa_select_rows) against dsa_select a row: n rows of random scores (ties
+// included), each its own pool count (none, fewer than the top pools, many) and position
+void run_select(int n, uint32_t seed, cudaStream_t s) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    gf::DsaSelectRows a;
+    std::vector<float*> score((size_t) n);
+    std::vector<int*> ref((size_t) n), bat((size_t) n);
+    for (int i = 0; i < n; ++i) {
+        const double r = u01(rng);
+        const int n_vis = r < 0.1 ? 0 : r < 0.25 ? 1 + (int) (u01(rng) * 600) : 600 + (int) (u01(rng) * 30000);
+        const int top = std::min(kTopPools, n_vis);
+        const int pos = n_vis * kPage + (int) (u01(rng) * kPage);
+        std::vector<float> h((size_t) std::max(1, n_vis));
+        for (auto& x : h) x = u01(rng) < 0.05 ? 0.5f : (float) u01(rng) * 8.0f - 4.0f;   // (some ties)
+        score[(size_t) i] = dalloc<float>(h.size());
+        ck(cudaMemcpy(score[(size_t) i], h.data(), h.size() * 4, cudaMemcpyHostToDevice), "score");
+        ref[(size_t) i] = dalloc<int>(kNSelMax);
+        bat[(size_t) i] = dalloc<int>(kNSelMax);
+        const int n_sel = top * kPage + kPage - 1;
+        gf::dsa_select(score[(size_t) i], n_vis, kPage, top, n_sel, pos, ref[(size_t) i], s);
+        a.score[i] = score[(size_t) i];
+        a.cells[i] = bat[(size_t) i];
+        a.n_vis[i] = n_vis;
+        a.top_pools[i] = top;
+        a.n_sel[i] = n_sel;
+        a.pos[i] = pos;
+    }
+    gf::dsa_select_rows(a, n, kPage, s);
+    ck(cudaStreamSynchronize(s), "select");
+    for (int i = 0; i < n; ++i) {
+        const std::vector<int> x = [&] {
+            std::vector<int> v(kNSelMax);
+            ck(cudaMemcpy(v.data(), ref[(size_t) i], v.size() * 4, cudaMemcpyDeviceToHost), "ref");
+            return v;
+        }();
+        std::vector<int> y(kNSelMax);
+        ck(cudaMemcpy(y.data(), bat[(size_t) i], y.size() * 4, cudaMemcpyDeviceToHost), "bat");
+        ++g_checks;
+        if (std::memcmp(x.data(), y.data(), (size_t) a.n_sel[i] * 4) != 0) {
+            std::fprintf(stderr, "FAIL: selection, %d rows: row %d (%d pools) differs from dsa_select's\n", n, i,
+                         a.n_vis[i]);
+            ++g_fail;
+        }
+        cudaFree(score[(size_t) i]);
+        cudaFree(ref[(size_t) i]);
+        cudaFree(bat[(size_t) i]);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -306,6 +357,8 @@ int main() {
         run(q8, 8, 8, 1.0, 0.0, seed++, s, wk_b, wv_b);
         run(q8, 16, 8, 0.0, 0.6, seed++, s, wk_b, wv_b);
     }
+    for (const int n : {1, 2, 4, 7, 8, 16}) run_select(n, 900 + (uint32_t) n, s);
+    std::printf("  selections of 1..16 rows in one launch: %s\n", g_fail ? "(failures so far)" : "same");
     cudaFree(wk_b);
     cudaFree(wv_b);
     if (g_fail) {

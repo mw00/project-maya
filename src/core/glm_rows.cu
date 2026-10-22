@@ -94,6 +94,9 @@ bool Glm5Model::rows_alloc(std::string& err) {
     cudaSetDevice(dev_);   // (mla_rows_ok asks the current device)
     const bool attn = rows_attn_on() && gf::mla_rows_ok(g.kv_lora);
     const int attn_tokens = (int) std::min<size_t>(R, (size_t) gf::kMlaTokMax);
+    int64_t attn_ctx = max_ctx_;   // (the longest context a sequence has: its completed pools' scores)
+    for (const SeqCtx& c : seq_) attn_ctx = std::max(attn_ctx, c.max_ctx);
+    const int64_t attn_pools = attn_ctx / g.idx_kpool + 1;
     const auto f32 = [&](int64_t n) { return (float*) take((size_t) n * sizeof(float)); };
     const auto q8 = [&](int64_t n) { return take((size_t) n / 32 * kQ8); };
     const auto carve = [&] {
@@ -144,6 +147,8 @@ bool Glm5Model::rows_alloc(std::string& err) {
             S->aslot = (int*) take((size_t) g.n_sel_max() * sizeof(int));
             S->apart = (float*) take_all(gf::mla_rows_part_floats(g.n_head, g.kv_lora) * attn_tokens * sizeof(float));
             S->apart_tokens = attn_tokens;
+            S->ascore_n = attn_pools;
+            S->ascore = f32(attn_pools);
         }
     };
     carve();   // the sizes
@@ -164,7 +169,8 @@ bool Glm5Model::rows_alloc(std::string& err) {
         std::fprintf(stderr, "glm rows: CUDA%d the DSA attention of up to %d rows a launch (MAYA_GLM_ROWS_ATTN), %zu MB of "
                              "the rows' %zu MB\n", dev_, attn_tokens,
                      (size_t) ((2 * R * g.n_head * g.kv_lora * sizeof(float) + 2 * R * g.n_sel_max() * sizeof(int) +
-                                gf::mla_rows_part_floats(g.n_head, g.kv_lora) * attn_tokens * sizeof(float)) >> 20),
+                                gf::mla_rows_part_floats(g.n_head, g.kv_lora) * attn_tokens * sizeof(float) +
+                                R * attn_pools * sizeof(float)) >> 20),
                      at >> 20);
     if (cudaHostAlloc((void**) &S->tok_h, R * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
         cudaEventCreateWithFlags(&S->ev_done, cudaEventDisableTiming) != cudaSuccess) {
@@ -523,32 +529,49 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     const int* a_cells[gf::kMaxMvNt];
     int a_nsel[gf::kMaxMvNt];
     if (attn) gf::mla_q_abs(S->q, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, n, S->aq, ad, s);
+    gf::DsaSelectRows sr;   // (with the rows' attention: the rows' selections in one launch, then each one resolved)
+    int n_sr = 0;
     for (int i = 0; i < n; ++i) {
         const int64_t p = rw[i].p;
         const int pool_done = (int) ((p + 1) / g.idx_kpool);
         const float* pooled = rw[i].state + (*rw[i].dsa_pool)[(size_t) il];
         const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
+        float* const score = attn ? S->ascore + (size_t) i * S->ascore_n : F->score;
         if (pool_done > 0 && !all)
             gf::dsa_score(rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i), pooled,
-                          rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, F->score, s);
+                          rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, score, s);
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
         int* const sel = attn ? S->acells + (size_t) i * nsm : F->cells;
-        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
-        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
         uint16_t* const lat = (uint16_t*) (rw[i].state + (*rw[i].dsa_lat)[(size_t) il]);
         if (attn) {
+            if (all) {
+                gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
+            } else {
+                sr.score[n_sr] = score;
+                sr.cells[n_sr] = sel;
+                sr.n_vis[n_sr] = pool_done;
+                sr.top_pools[n_sr] = top_pools;
+                sr.n_sel[n_sr] = n_sel;
+                sr.pos[n_sr] = (int) p;
+                ++n_sr;
+            }
             a_lat[i] = lat;
-            a_cells[i] = kv_attend_cells(rw[i].kv, il, lat, sel, n_sel, S->aslot + (size_t) i * nsm, s);
             a_nsel[i] = n_sel;
             continue;
         }
+        if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
+        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
         const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
         gf::mla(rows(S->q, qd, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
                 g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i), s,
                 lat_q8_);
     }
     if (attn) {
+        gf::dsa_select_rows(sr, n_sr, g.idx_kpool, s);
+        for (int i = 0; i < n; ++i)   // (KV streaming: each row's blocks resident, its selection in its slot rows)
+            a_cells[i] = kv_attend_cells(rw[i].kv, il, const_cast<uint16_t*>(a_lat[i]), S->acells + (size_t) i * nsm,
+                                         a_nsel[i], S->aslot + (size_t) i * nsm, s);
         if (!gf::mla_attend_rows(S->aq, ad, a_lat, a_cells, a_nsel, n, g.n_head, g.qk_nope, g.kv_lora, S->actx, ad,
                                  S->apart, S->apart_tokens, s, lat_q8_)) {
             err = "glm rows: the rows' attention is not available here";   // (mla_rows_ok said it was)

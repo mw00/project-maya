@@ -50,6 +50,8 @@ struct Glm5Model::RowsState {
     float *aq = nullptr, *actx = nullptr, *apart = nullptr;
     int *acells = nullptr, *aslot = nullptr;
     int apart_tokens = 0;
+    float* ascore = nullptr;   // ... and each row's indexer scores (ascore_n a row), the rows' selection in one launch
+    int64_t ascore_n = 0;
     int* tok_h = nullptr;   // pinned
     cudaEvent_t ev_done = nullptr;
 };

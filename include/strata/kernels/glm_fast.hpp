@@ -190,6 +190,14 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s);
+/// dsa_select of up to kMaxMvNt rows of different sequences (the batched rows) in one launch, a block a row: row r's
+/// scores, pools and cells as dsa_select's arguments - each row's cells dsa_select's
+struct DsaSelectRows {
+    const float* score[kMaxMvNt];
+    int* cells[kMaxMvNt];
+    int n_vis[kMaxMvNt], top_pools[kMaxMvNt], n_sel[kMaxMvNt], pos[kMaxMvNt];
+};
+void dsa_select_rows(const DsaSelectRows& a, int n, int kpool, cudaStream_t s);
 /// While a token's every pool is in its selection (n_vis <= the top pools, a context of at most idx_top_k positions):
 /// dsa_select's cells in position order - no scores needed (the indexer's query and dsa_score are left out).  The
 /// decode's paths all take it alike (dsa_select_all_on; STRATA_GLM_DSA_ALL=0: off), so a window's token is the

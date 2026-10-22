@@ -2886,8 +2886,19 @@ __global__ void __launch_bounds__(256) dsa_score_kernel(const float* __restrict_
     if (lane == 0) score[p] = acc;
 }
 
+__device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
+                                                 int n_sel, int pos, int* __restrict__ cells);
 __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restrict__ score, int n_vis, int kpool,
                                                           int top_pools, int n_sel, int pos, int* __restrict__ cells) {
+    dsa_select_block(score, n_vis, kpool, top_pools, n_sel, pos, cells);
+}
+// dsa_select of several rows (different sequences) in one launch: a block a row, each dsa_select_kernel's own code
+__global__ void __launch_bounds__(1024) dsa_select_rows_kernel(DsaSelectRows a, int kpool) {
+    const int r = blockIdx.x;
+    dsa_select_block(a.score[r], a.n_vis[r], kpool, a.top_pools[r], a.n_sel[r], a.pos[r], a.cells[r]);
+}
+__device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
+                                                 int n_sel, int pos, int* __restrict__ cells) {
     for (int i = threadIdx.x; i < n_sel; i += blockDim.x) cells[i] = -1;
     __syncthreads();
     // the top pools in rank order (score descending, ties by the lower index), O(n_vis) - src/kernels/cuda/dsa_topk.cuh
@@ -5537,6 +5548,12 @@ bool dsa_select_all_on() {
         return v == nullptr || std::atoi(v) != 0;
     }();
     return on;
+}
+
+void dsa_select_rows(const DsaSelectRows& a, int n, int kpool, cudaStream_t s) {
+    if (n < 1) return;
+    dsa_select_rows_kernel<<<n, 1024, 0, s>>>(a, kpool);
+    launch_check("dsa_select_rows");
 }
 
 void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s) {
