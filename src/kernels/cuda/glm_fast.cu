@@ -2864,9 +2864,24 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTAN
     }
 }
 
+__device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                const float* __restrict__ iw, int key_dim, int idx_heads, int n_pools,
+                                                float* __restrict__ score);
 __global__ void __launch_bounds__(256) dsa_score_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
                                                         const float* __restrict__ iw, int key_dim, int idx_heads,
                                                         int n_pools, float* __restrict__ score) {
+    dsa_score_block(iq, pooled, iw, key_dim, idx_heads, n_pools, score);
+}
+// dsa_score of several rows (different sequences) in one launch: blockIdx.y the row, its blocks dsa_score_kernel's (a
+// row's blocks past its own (n_pools + 7) / 8 return at once)
+__global__ void __launch_bounds__(256) dsa_score_rows_kernel(DsaScoreRows a, int key_dim, int idx_heads) {
+    const int r = blockIdx.y;
+    if ((int) blockIdx.x * (int) (blockDim.x >> 5) >= a.n_pools[r]) return;
+    dsa_score_block(a.iq[r], a.pooled[r], a.iw[r], key_dim, idx_heads, a.n_pools[r], a.score[r]);
+}
+__device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                const float* __restrict__ iw, int key_dim, int idx_heads, int n_pools,
+                                                float* __restrict__ score) {
     extern __shared__ float s_iq[];   // idx_heads * key_dim, then idx_heads weights
     float* s_iw = s_iq + idx_heads * key_dim;
     for (int i = threadIdx.x; i < idx_heads * key_dim; i += blockDim.x) s_iq[i] = iq[i];
@@ -5528,6 +5543,15 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
     launch_check("dsa_score");
 }
 
+void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cudaStream_t s) {
+    int most = 0;
+    for (int r = 0; r < n; ++r) most = std::max(most, a.n_pools[r]);
+    if (n < 1 || most < 1) return;
+    const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
+    dsa_score_rows_kernel<<<dim3((unsigned) ((most + 7) / 8), (unsigned) n), 256, smem, s>>>(a, key_dim, idx_heads);
+    launch_check("dsa_score_rows");
+}
+
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s) {
     dsa_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, kpool, top_pools, n_sel, pos, cells);
@@ -6152,6 +6176,50 @@ __global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     *w.n_groups = ng;
 }
 
+// moe_win_group_kernel's grouping with a thread an entry (STRATA_GLM_ROWS_SMALL): the same groups in the same order (by
+// each plan's first entry), the same members in entry order - every array it writes, value for value
+__global__ void __launch_bounds__(kWinEnt) moe_win_group_par_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+    __shared__ unsigned long long sp[kWinEnt];
+    __shared__ int first[kWinEnt];
+    const int e = threadIdx.x, ne = w.T * 8;
+    unsigned long long p = 0ull;
+    if (e < ne && (e & 7) < w.k) p = w.plan_ptr[e];
+    sp[e] = p;
+    __syncthreads();
+    int f = -1;   // the entry's group: its plan's first entry
+    if (p != 0ull) {
+        f = e;
+        for (int j = 0; j < e; ++j)
+            if (sp[j] == p) {
+                f = j;
+                break;
+            }
+    }
+    first[e] = f;
+    __syncthreads();
+    if (f >= 0) {
+        int start = 0, pos = 0;   // the entries of the groups before this one; this one's members before it
+        for (int j = 0; j < ne; ++j) start += first[j] >= 0 && first[j] < f;
+        for (int j = 0; j < e; ++j) pos += first[j] == f;
+        w.grp_ent[start + pos] = e;
+        if (f == e) {
+            int g = 0;
+            for (int j = 0; j < e; ++j) g += first[j] == j;
+            w.grp_ptr[g] = p;
+            w.grp_start[g] = start;
+        }
+    }
+    if (e == 0) {
+        int ng = 0, tot = 0;
+        for (int j = 0; j < ne; ++j) {
+            ng += first[j] == j;
+            tot += first[j] >= 0;
+        }
+        w.grp_start[ng] = tot;
+        *w.n_groups = ng;
+    }
+}
+
 // grid (n_ff / GU_ROWS, groups): a group's expert's gate / up rows of this chunk against each member's FFN input, the
 // clamped swiglu into the member's h (moe_gate_up_kernel's rows, arithmetic and layout per member)
 template<int TG>
@@ -6241,9 +6309,10 @@ __global__ void moe_win_combine_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
 
 }  // namespace
 
-bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
+bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, bool par_group) {
     if (w.T < 1 || w.T > kMaxWinTokens || w.k > 8 || w.n_ff % GU_ROWS != 0 || w.n_embd % DOWN_ROWS != 0) return false;
-    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+    if (par_group) moe_win_group_par_kernel<<<1, kWinEnt, 0, s>>>(w);
+    else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
     const int G = w.T * w.k;   // groups at most (the blocks past the real count return at once)
     const dim3 ggu((unsigned) (w.n_ff / GU_ROWS), (unsigned) G), gdn((unsigned) (w.n_embd / DOWN_ROWS), (unsigned) G);
     switch (gu_type) {
@@ -6265,8 +6334,9 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
     return true;
 }
 
-void moe_win_group(const MoeWin& w, cudaStream_t s) {
-    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+void moe_win_group(const MoeWin& w, cudaStream_t s, bool par) {
+    if (par) moe_win_group_par_kernel<<<1, kWinEnt, 0, s>>>(w);
+    else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
     launch_check("moe_win_group");
 }
 

@@ -9,7 +9,9 @@
 // 2..16 rows, each its own conversation with its own context length (from a few positions, where the selection is
 // every pool, to ~60K), resident and streamed caches mixed, some rows later positions of the row before's conversation
 // (a verify window's rows; streamed: one resolve over the run's cells, as the engine), FP16 rows and INT8 records, and launches of fewer tokens than rows (part_tokens).  And the
-// rows' selections in one launch (gf::dsa_select_rows) against dsa_select a row, cell for cell.
+// rows' selections in one launch (gf::dsa_select_rows) against dsa_select a row, cell for cell; and STRATA_GLM_ROWS_SMALL's
+// pieces: the rows' scores (dsa_score_rows), KV resolves (glm_kv_resolve_rows: maps, slots, counters) and the experts'
+// grouping with a thread an entry, against the one-a-row / one-thread kernels.
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
 
@@ -326,6 +328,200 @@ void run_select(int n, uint32_t seed, cudaStream_t s) {
     }
 }
 
+// STRATA_GLM_ROWS_SMALL: the rows' scores in one launch (gf::dsa_score_rows) against dsa_score a row
+void run_score(int n, uint32_t seed, cudaStream_t s) {
+    constexpr int kKey = 128, kIdxHeads = 32;
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    gf::DsaScoreRows a;
+    std::vector<float*> ref((size_t) n), bufs;
+    for (int i = 0; i < n; ++i) {
+        const double r = u01(rng);
+        const int np = r < 0.2 ? 1 + (int) (u01(rng) * 20) : r < 0.4 ? 20 + (int) (u01(rng) * 2000)
+                                                              : 2000 + (int) (u01(rng) * 30000);
+        const auto up = [&](size_t cnt, float sc) {
+            std::vector<float> h(cnt);
+            for (auto& x : h) x = nd(rng) * sc;
+            float* d = dalloc<float>(cnt);
+            ck(cudaMemcpy(d, h.data(), cnt * 4, cudaMemcpyHostToDevice), "up");
+            bufs.push_back(d);
+            return d;
+        };
+        a.iq[i] = up((size_t) kIdxHeads * kKey, 1.0f);
+        a.pooled[i] = up((size_t) np * kKey, 1.0f);
+        a.iw[i] = up(kIdxHeads, 0.2f);
+        a.score[i] = dalloc<float>((size_t) np);
+        bufs.push_back(a.score[i]);
+        ref[(size_t) i] = dalloc<float>((size_t) np);
+        bufs.push_back(ref[(size_t) i]);
+        a.n_pools[i] = np;
+        gf::dsa_score(a.iq[i], a.pooled[i], a.iw[i], kKey, kIdxHeads, np, ref[(size_t) i], s);
+    }
+    gf::dsa_score_rows(a, n, kKey, kIdxHeads, s);
+    ck(cudaStreamSynchronize(s), "score");
+    for (int i = 0; i < n; ++i) {
+        std::vector<float> x((size_t) a.n_pools[i]), y((size_t) a.n_pools[i]);
+        ck(cudaMemcpy(x.data(), ref[(size_t) i], x.size() * 4, cudaMemcpyDeviceToHost), "ref");
+        ck(cudaMemcpy(y.data(), a.score[i], y.size() * 4, cudaMemcpyDeviceToHost), "bat");
+        ++g_checks;
+        if (std::memcmp(x.data(), y.data(), x.size() * 4) != 0) {
+            std::fprintf(stderr, "FAIL: scores, %d rows: row %d (%d pools) differs from dsa_score's\n", n, i, a.n_pools[i]);
+            ++g_fail;
+        }
+    }
+    for (float* b : bufs) cudaFree(b);
+}
+
+// STRATA_GLM_ROWS_SMALL: n sequences' resolves in one launch (gf::glm_kv_resolve_rows) against glm_kv_resolve a row,
+// on twin copies of every sequence's map and slots, over several steps (so slots get evicted): each row's slot cells,
+// page table, slot owners, slot contents and counters
+void run_resolve(int n, bool q8, uint32_t seed, cudaStream_t s) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    const int row = q8 ? gf::lat8_rec_bytes(kLora) : kLora * 2;
+    constexpr int kSl = 1024;   // slots: small, so the steps evict
+    struct Twin {
+        int ctx = 0;
+        int64_t n_blocks = 0;
+        uint8_t *host_h = nullptr, *host = nullptr, *slots[2] = {nullptr, nullptr};
+        k::KvStreamMap m[2];
+        int *cells = nullptr, *sc[2] = {nullptr, nullptr};
+    };
+    std::vector<Twin> tw((size_t) n);
+    for (Twin& t : tw) {
+        t.ctx = 4000 + (int) (u01(rng) * 60000);
+        t.n_blocks = (t.ctx + kPage - 1) / kPage;
+        const size_t bytes = (size_t) t.n_blocks * kPage * row;
+        ck(cudaHostAlloc((void**) &t.host_h, bytes, cudaHostAllocMapped | cudaHostAllocPortable), "host");
+        ck(cudaHostGetDevicePointer((void**) &t.host, t.host_h, 0), "host ptr");
+        for (size_t b = 0; b < bytes; ++b) t.host_h[b] = (uint8_t) (rng() & 0xff);
+        for (int c = 0; c < 2; ++c) {
+            t.slots[c] = dalloc<uint8_t>((size_t) kSl * kPage * row);
+            k::KvStreamMap& m = t.m[c];
+            m.page_table = dalloc<int32_t>((size_t) t.n_blocks);
+            m.slot_block = dalloc<int32_t>(kSl);
+            m.slot_stamp = dalloc<int32_t>(kSl);
+            m.slot_ref = dalloc<int32_t>(kSl);
+            m.miss_block = dalloc<int32_t>(kSl);
+            m.miss_slot = dalloc<int32_t>(kSl);
+            m.ctl = dalloc<int32_t>(k::kKvCtlInts);
+            m.n_blocks = t.n_blocks;
+            m.n_slots = kSl;
+            k::kv_stream_reset(m, s);
+            t.sc[c] = dalloc<int>(kNSelMax);
+        }
+        t.cells = dalloc<int>(kNSelMax);
+    }
+    for (int step = 0; step < 6; ++step) {
+        gf::KvResolveRows a;
+        std::vector<int> ns((size_t) n);
+        for (int i = 0; i < n; ++i) {
+            Twin& t = tw[(size_t) i];
+            const int n_vis = t.ctx / kPage;
+            const int top = std::min(kTopPools, n_vis);
+            std::set<int> seen;
+            std::vector<int> c;
+            std::uniform_int_distribution<int> any(0, n_vis - 1);
+            while ((int) seen.size() < top) {
+                const int pi = any(rng);
+                if (seen.insert(pi).second)
+                    for (int j = 0; j < kPage; ++j) c.push_back(pi * kPage + j);
+            }
+            if (step % 3 == 2) c.resize(c.size() / 3);   // (and a short one now and then)
+            ns[(size_t) i] = step == 5 && i == 0 ? 0 : (int) c.size();   // (a row that resolves nothing)
+            ck(cudaMemcpy(t.cells, c.data(), c.size() * 4, cudaMemcpyHostToDevice), "cells");
+            if (ns[(size_t) i] > 0)
+                gf::glm_kv_resolve(t.m[0], t.host, t.slots[0], row, kPage, t.cells, ns[(size_t) i], t.sc[0], s);
+            a.m[i] = t.m[1];
+            a.host[i] = t.host;
+            a.slots[i] = t.slots[1];
+            a.cells[i] = t.cells;
+            a.slot_cells[i] = t.sc[1];
+            a.n_sel[i] = ns[(size_t) i];
+        }
+        gf::glm_kv_resolve_rows(a, n, row, kPage, s);
+        ck(cudaStreamSynchronize(s), "resolve");
+        for (int i = 0; i < n; ++i) {
+            Twin& t = tw[(size_t) i];
+            const auto cmp = [&](const char* what, const void* x, const void* y, size_t bytes) {
+                std::vector<uint8_t> hx(bytes), hy(bytes);
+                ck(cudaMemcpy(hx.data(), x, bytes, cudaMemcpyDeviceToHost), "x");
+                ck(cudaMemcpy(hy.data(), y, bytes, cudaMemcpyDeviceToHost), "y");
+                if (hx != hy) {
+                    std::fprintf(stderr, "FAIL: resolve rows, %d rows, step %d, row %d: %s differ\n", n, step, i, what);
+                    ++g_fail;
+                }
+            };
+            ++g_checks;
+            if (ns[(size_t) i] > 0) cmp("slot cells", t.sc[0], t.sc[1], (size_t) ns[(size_t) i] * 4);
+            cmp("page table", t.m[0].page_table, t.m[1].page_table, (size_t) t.n_blocks * 4);
+            cmp("slot owners", t.m[0].slot_block, t.m[1].slot_block, (size_t) kSl * 4);
+            cmp("counters", t.m[0].ctl, t.m[1].ctl, (size_t) k::kKvCtlInts * 4);
+            cmp("slots", t.slots[0], t.slots[1], (size_t) kSl * kPage * row);
+        }
+    }
+    for (Twin& t : tw) {
+        cudaFreeHost(t.host_h);
+        cudaFree(t.cells);
+        for (int c = 0; c < 2; ++c) {
+            cudaFree(t.slots[c]);
+            cudaFree(t.sc[c]);
+            for (int32_t* p : {t.m[c].page_table, t.m[c].slot_block, t.m[c].slot_stamp, t.m[c].slot_ref,
+                               t.m[c].miss_block, t.m[c].miss_slot, t.m[c].ctl})
+                cudaFree(p);
+        }
+    }
+}
+
+// STRATA_GLM_ROWS_SMALL: the experts' grouping with a thread an entry against the one-thread kernel, value for value
+void run_group(int T, uint32_t seed, cudaStream_t s) {
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<int> pick(0, 3 * T + 4);
+    std::uniform_real_distribution<double> u01(0.0, 1.0);
+    const int ne = T * 8;
+    std::vector<unsigned long long> plan((size_t) ne);
+    for (auto& p : plan) p = u01(rng) < 0.1 ? 0ull : 0x10000ull + 0x1000ull * (unsigned long long) pick(rng);
+    unsigned long long* d_plan = dalloc<unsigned long long>((size_t) ne);
+    ck(cudaMemcpy(d_plan, plan.data(), plan.size() * 8, cudaMemcpyHostToDevice), "plan");
+    gf::MoeWin w[2];
+    for (int c = 0; c < 2; ++c) {
+        w[c].plan_ptr = d_plan;
+        w[c].grp_ptr = dalloc<unsigned long long>(128);
+        w[c].grp_start = dalloc<int>(129);
+        w[c].grp_ent = dalloc<int>(128);
+        w[c].n_groups = dalloc<int>(1);
+        w[c].T = T;
+        w[c].k = 8;
+        gf::moe_win_group(w[c], s, c == 1);
+    }
+    ck(cudaStreamSynchronize(s), "group");
+    int ng[2];
+    for (int c = 0; c < 2; ++c) ck(cudaMemcpy(&ng[c], w[c].n_groups, 4, cudaMemcpyDeviceToHost), "ng");
+    ++g_checks;
+    const auto same_bytes = [&](const void* x, const void* y, size_t bytes) {
+        std::vector<uint8_t> hx(bytes), hy(bytes);
+        ck(cudaMemcpy(hx.data(), x, bytes, cudaMemcpyDeviceToHost), "x");
+        ck(cudaMemcpy(hy.data(), y, bytes, cudaMemcpyDeviceToHost), "y");
+        return hx == hy;
+    };
+    int tot = 0;
+    if (ng[0] == ng[1]) ck(cudaMemcpy(&tot, w[0].grp_start + ng[0], 4, cudaMemcpyDeviceToHost), "tot");
+    if (ng[0] != ng[1] || !same_bytes(w[0].grp_ptr, w[1].grp_ptr, (size_t) ng[0] * 8) ||
+        !same_bytes(w[0].grp_start, w[1].grp_start, (size_t) (ng[0] + 1) * 4) ||
+        !same_bytes(w[0].grp_ent, w[1].grp_ent, (size_t) tot * 4)) {
+        std::fprintf(stderr, "FAIL: grouping, %d tokens: %d / %d groups, arrays differ\n", T, ng[0], ng[1]);
+        ++g_fail;
+    }
+    cudaFree(d_plan);
+    for (int c = 0; c < 2; ++c) {
+        cudaFree(w[c].grp_ptr);
+        cudaFree(w[c].grp_start);
+        cudaFree(w[c].grp_ent);
+        cudaFree(w[c].n_groups);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -368,6 +564,14 @@ int main() {
     }
     for (const int n : {1, 2, 4, 7, 8, 16}) run_select(n, 900 + (uint32_t) n, s);
     std::printf("  selections of 1..16 rows in one launch: %s\n", g_fail ? "(failures so far)" : "same");
+    for (const int n : {1, 2, 4, 7, 16}) run_score(n, 1200 + (uint32_t) n, s);
+    std::printf("  scores of 1..16 rows in one launch: %s\n", g_fail ? "(failures so far)" : "same");
+    for (const bool q8 : {false, true})
+        for (const int n : {1, 3, 8, 16}) run_resolve(n, q8, 1300 + (uint32_t) n, s);
+    std::printf("  KV resolves of 1..16 rows in one launch (6 steps, evicting): %s\n", g_fail ? "(failures so far)" : "same");
+    for (int T = 1; T <= 16; ++T)
+        for (int r = 0; r < 4; ++r) run_group(T, 1400 + (uint32_t) (T * 4 + r), s);
+    std::printf("  experts' grouping, a thread an entry, 1..16 tokens: %s\n", g_fail ? "(failures so far)" : "same");
     cudaFree(wk_b);
     cudaFree(wv_b);
     if (g_fail) {

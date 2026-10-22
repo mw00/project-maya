@@ -56,6 +56,13 @@ bool rows_batch_on() {   // STRATA_GLM_ROWS_BATCH=1 (off by default)
     }();
     return on;
 }
+bool rows_small_on() {   // STRATA_GLM_ROWS_SMALL=1 (off by default)
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_ROWS_SMALL");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
 bool rows_attn_on() {   // STRATA_GLM_ROWS_ATTN=1 (off by default)
     static const bool on = [] {
         const char* v = getenv("STRATA_GLM_ROWS_ATTN");
@@ -537,15 +544,25 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     if (attn) gf::mla_q_abs(S->q, qd, Ly.k_b, g.n_head, g.qk_nope, g.kv_lora, n, S->aq, ad, s);
     gf::DsaSelectRows sr;   // (with the rows' attention: the rows' selections in one launch, then each one resolved)
     int n_sr = 0;
+    const bool small = attn && rows_small_on();   // (STRATA_GLM_ROWS_SMALL: the rows' scores in one launch too)
+    gf::DsaScoreRows sc;
+    int n_sc = 0;
     for (int i = 0; i < n; ++i) {
         const int64_t p = rw[i].p;
         const int pool_done = (int) ((p + 1) / g.idx_kpool);
         const float* pooled = rw[i].state + (*rw[i].dsa_pool)[(size_t) il];
         const bool all = pool_done <= g.top_pools_max() && gf::dsa_select_all_on();   // (as fast_dsa)
         float* const score = attn ? S->ascore + (size_t) i * S->ascore_n : F->score;
-        if (pool_done > 0 && !all)
+        if (pool_done > 0 && !all && small) {
+            sc.iq[n_sc] = rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i);
+            sc.pooled[n_sc] = pooled;
+            sc.iw[n_sc] = rows(S->iw, g.idx_heads, i);
+            sc.score[n_sc] = score;
+            sc.n_pools[n_sc++] = pool_done;
+        } else if (pool_done > 0 && !all) {
             gf::dsa_score(rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i), pooled,
                           rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, score, s);
+        }
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
         int* const sel = attn ? S->acells + (size_t) i * nsm : F->cells;
@@ -574,17 +591,37 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                 lat_q8_);
     }
     if (attn) {
+        if (n_sc > 0) gf::dsa_score_rows(sc, n_sc, g.idx_key, g.idx_heads, s);
         gf::dsa_select_rows(sr, n_sr, g.idx_kpool, s);
-        // KV streaming: each run's blocks resident, its rows' selections in slot rows (resident: the cells themselves)
+        // KV streaming: each run's blocks resident, its rows' selections in slot rows (resident: the cells themselves);
+        // STRATA_GLM_ROWS_SMALL: the runs' resolves in one launch (each run its own sequence's map)
+        gf::KvResolveRows kr;
+        int n_kr = 0, kr_row = 0, kr_page = 0;
         for (int i = 0; i < n;) {
             int len = 1;
             while (i + len < n && run0[i + len] == i) ++len;
-            const int* c = kv_attend_cells(rw[i].kv, il, const_cast<uint16_t*>(a_lat[i]), S->acells + (size_t) i * nsm,
-                                           (int) ((len - 1) * nsm) + a_nsel[i + len - 1], S->aslot + (size_t) i * nsm,
-                                           s);
-            for (int k = 0; k < len; ++k) a_cells[i + k] = c + (size_t) k * nsm;
+            const int cnt = (int) ((len - 1) * nsm) + a_nsel[i + len - 1];
+            const KvStream* K = rw[i].kv;
+            const bool batch_it = small && kv_streamed(K, il) && n_kr < gf::kKvResolveRowsMax &&
+                                  (n_kr == 0 || (K->row_bytes == kr_row && K->page == kr_page));
+            if (batch_it) {
+                kr.m[n_kr] = K->map[(size_t) il];
+                kr.host[n_kr] = K->host[(size_t) il];
+                kr.slots[n_kr] = (uint8_t*) a_lat[i];
+                kr.cells[n_kr] = S->acells + (size_t) i * nsm;
+                kr.slot_cells[n_kr] = S->aslot + (size_t) i * nsm;
+                kr.n_sel[n_kr++] = cnt;
+                kr_row = K->row_bytes;
+                kr_page = K->page;
+                for (int k = 0; k < len; ++k) a_cells[i + k] = S->aslot + (size_t) (i + k) * nsm;
+            } else {
+                const int* c = kv_attend_cells(K, il, const_cast<uint16_t*>(a_lat[i]), S->acells + (size_t) i * nsm, cnt,
+                                               S->aslot + (size_t) i * nsm, s);
+                for (int k = 0; k < len; ++k) a_cells[i + k] = c + (size_t) k * nsm;
+            }
             i += len;
         }
+        if (n_kr > 0) gf::glm_kv_resolve_rows(kr, n_kr, kr_row, kr_page, s);
         if (!gf::mla_attend_rows(S->aq, ad, a_lat, a_cells, a_nsel, n, g.n_head, g.qk_nope, g.kv_lora, S->actx, ad,
                                  S->apart, S->apart_tokens, s, lat_q8_)) {
             err = "glm rows: the rows' attention is not available here";   // (mla_rows_ok said it was)
@@ -731,7 +768,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
     mw.n_ff = g.n_ff_exp;
     mw.limit = g.swiglu_exp;
     if (Ly.exl3) {
-        gf::moe_win_group(mw, s);
+        gf::moe_win_group(mw, s, rows_small_on());
         x3::WinArgs xa;
         xa.grp_ptr = W.grp_ptr;
         xa.grp_start = W.grp_start;
@@ -767,7 +804,7 @@ bool Glm5Model::rows_moe_grouped(int il, int n, std::string& err) {
         mw.out = S->ffn;
         mw.out_stride = (size_t) E;
         mw.down_off = Ly.down_off;
-        if (!gf::moe_win_experts(Ly.gu_type, Ly.d_type, mw, s)) {
+        if (!gf::moe_win_experts(Ly.gu_type, Ly.d_type, mw, s, rows_small_on())) {
             err = "glm rows: the grouped experts (types " + std::to_string(Ly.gu_type) + " / " +
                   std::to_string(Ly.d_type) + ")";
             return false;

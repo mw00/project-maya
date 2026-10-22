@@ -40,4 +40,18 @@ inline constexpr int kKvResolveBlock = 1024;
 void glm_kv_resolve(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
                     const int* cells, int n_sel, int* slot_cells, cudaStream_t s);
 
+/// glm_kv_resolve of several rows in one launch (STRATA_GLM_ROWS_SMALL), each row its own sequence's map, host copy,
+/// slots, selection and slot cells - no two rows may share a map; a row of n_sel <= 0 does nothing.  Each row's map,
+/// slots and slot cells come out as its own glm_kv_resolve leaves them
+inline constexpr int kKvResolveRowsMax = 16;
+struct KvResolveRows {
+    KvStreamMap m[kKvResolveRowsMax];
+    const uint8_t* host[kKvResolveRowsMax];
+    uint8_t* slots[kKvResolveRowsMax];
+    const int* cells[kKvResolveRowsMax];
+    int* slot_cells[kKvResolveRowsMax];
+    int n_sel[kKvResolveRowsMax];
+};
+void glm_kv_resolve_rows(const KvResolveRows& a, int n, int row_bytes, int page, cudaStream_t s);
+
 }  // namespace strata::kernels::glmf

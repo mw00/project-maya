@@ -190,6 +190,16 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s);
+/// dsa_score of up to kMaxMvNt rows of different sequences (the batched rows) in one launch: row r's query, pools,
+/// weights, scores and pool count as dsa_score's arguments - each row's scores dsa_score's
+struct DsaScoreRows {
+    const float* iq[kMaxMvNt];
+    const float* pooled[kMaxMvNt];
+    const float* iw[kMaxMvNt];
+    float* score[kMaxMvNt];
+    int n_pools[kMaxMvNt];
+};
+void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cudaStream_t s);
 /// dsa_select of up to kMaxMvNt rows of different sequences (the batched rows) in one launch, a block a row: row r's
 /// scores, pools and cells as dsa_select's arguments - each row's cells dsa_select's
 struct DsaSelectRows {
@@ -366,10 +376,12 @@ struct MoeWin {
     size_t down_off = 0;
 };
 constexpr int kMaxWinTokens = kMaxMvCols;   // the window's tokens moe_win_experts groups (16 x 8 entries)
-bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s);
+/// par_group: the grouping with a thread an entry (moe_win_group's par), the same arrays
+bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, bool par_group = false);
 /// moe_win_experts' grouping alone (w's plan_ptr, T, k -> grp_ptr / grp_start / grp_ent / n_groups), for kernels of
 /// other formats (EXL3: exl3::win_experts)
-void moe_win_group(const MoeWin& w, cudaStream_t s);
+/// par: a thread an entry instead of one thread for all (the same groups, order and members, value for value)
+void moe_win_group(const MoeWin& w, cudaStream_t s, bool par = false);
 /// The CPU LANE's split: of f RAM-tier experts in a route, cpu_take(plan, f) go to the host (4 bits per f, f = 0..8).
 inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 * f)) & 15ull); }
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to

@@ -35,8 +35,22 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
+__device__ __forceinline__ void resolve_block(const KvStreamMap& m, const int* __restrict__ cells, int n_sel, int page,
+                                              int* __restrict__ slot_cells);
+__device__ __forceinline__ void copy_block(const KvStreamMap& m, const uint8_t* __restrict__ host,
+                                           uint8_t* __restrict__ slots, int len, int bx, int nbx);
 __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int* __restrict__ cells, int n_sel, int page,
                                                      int* __restrict__ slot_cells) {
+    resolve_block(m, cells, n_sel, page, slot_cells);
+}
+// several rows' resolves (each its own sequence's map) in one launch: a block a row, resolve_kernel's own code
+__global__ void __launch_bounds__(RT) resolve_rows_kernel(const KvResolveRows a, int page) {
+    const int r = blockIdx.x;
+    if (a.n_sel[r] <= 0) return;
+    resolve_block(a.m[r], a.cells[r], a.n_sel[r], page, a.slot_cells[r]);
+}
+__device__ __forceinline__ void resolve_block(const KvStreamMap& m, const int* __restrict__ cells, int n_sel, int page,
+                                              int* __restrict__ slot_cells) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
@@ -120,8 +134,18 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int* _
 
 // One block per missed block (grid-stride): its rows from the host copy into its slot, 16 B per thread.
 __global__ void copy_kernel(KvStreamMap m, const uint8_t* __restrict__ host, uint8_t* __restrict__ slots, int len) {
+    copy_block(m, host, slots, len, blockIdx.x, gridDim.x);
+}
+// the rows' copies in one launch: blockIdx.y the row (its copy_kernel's blocks; none for a row that resolved nothing)
+__global__ void copy_rows_kernel(const KvResolveRows a, int len) {
+    const int r = blockIdx.y;
+    if (a.n_sel[r] <= 0) return;
+    copy_block(a.m[r], a.host[r], a.slots[r], len, blockIdx.x, gridDim.x);
+}
+__device__ __forceinline__ void copy_block(const KvStreamMap& m, const uint8_t* __restrict__ host,
+                                           uint8_t* __restrict__ slots, int len, int bx, int nbx) {
     const int need = m.ctl[2];
-    for (int k = blockIdx.x; k < need; k += gridDim.x) {
+    for (int k = bx; k < need; k += nbx) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
         const uint4* src = reinterpret_cast<const uint4*>(host + b * len);
         uint4* dst = reinterpret_cast<uint4*>(slots + sl * len);
@@ -130,6 +154,14 @@ __global__ void copy_kernel(KvStreamMap m, const uint8_t* __restrict__ host, uin
 }
 
 }  // namespace
+
+void glm_kv_resolve_rows(const KvResolveRows& a, int n, int row_bytes, int page, cudaStream_t s) {
+    if (n < 1) return;
+    resolve_rows_kernel<<<n, RT, 0, s>>>(a, page);
+    copy_rows_kernel<<<dim3(96, (unsigned) n), 128, 0, s>>>(a, page * row_bytes);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) std::fprintf(stderr, "glm kv stream: resolve rows: %s\n", cudaGetErrorString(e));
+}
 
 void glm_kv_resolve(const KvStreamMap& m, const uint8_t* host, uint8_t* slots, int row_bytes, int page,
                     const int* cells, int n_sel, int* slot_cells, cudaStream_t s) {
