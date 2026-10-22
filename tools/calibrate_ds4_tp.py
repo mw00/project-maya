@@ -188,7 +188,7 @@ def run(cfg: dict, vram: list[float], say=print, start_engine=None) -> dict:
 def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=print, fresh=None) -> dict:
     t0 = time.time()
     args0 = list(cfg.get("args") or [])
-    own_tp = int(arg(args0, "--tp") or 1)
+    own_tp = int(arg(args0, "--tp") or 2)   # (the engine's default)
     own_threads = arg(args0, "--cpu-threads")
     tps = tp_candidates(vram)
     if own_tp not in tps:

@@ -23,7 +23,7 @@ class FakeEngine:
 
     def __init__(self, cfg, speed, read, cpu_experts=100, threads=44):
         a = cfg["args"]
-        self.tp = int(C4.arg(a, "--tp") or 1)
+        self.tp = int(C4.arg(a, "--tp") or 2)   # (the engine's default)
         w = C4.arg(a, "--cpu-threads")
         self.threads = int(w) if w else threads
         self.args = list(a)
@@ -49,7 +49,7 @@ class Run:
         self.starts = []
 
         def start(cfg):
-            tp = int(C4.arg(cfg["args"], "--tp") or 1)
+            tp = int(C4.arg(cfg["args"], "--tp") or 2)
             if fail(tp, sum(s[0] == tp for s in self.starts)):    # (n: that --tp's starts so far)
                 raise RuntimeError("the engine exited before it was ready")
             e = FakeEngine(cfg, speed, read, **kw)
@@ -137,6 +137,12 @@ class Measure(unittest.TestCase):
         self.assertEqual(r.res["args"]["--tp"], 4)
         self.assertEqual(set(r.res["report"]["tp_sweep"]), {"2", "4"})
         self.assertIn("--tp 7", r.res["report"]["failed"])
+
+    def test_a_config_without_tp_is_the_engines_default(self):
+        # (no --tp: the engine's 2 is the baseline - not a --tp 1 start, which reads prompts in windows of 16)
+        r = Run(lambda tp, w: DECODE[tp], cpu_experts=0, args=["--pack", "/p"])
+        self.assertEqual([s[0] for s in r.starts], [2, 4, 8, 9])
+        self.assertEqual(r.res["report"]["own"]["--tp"], 2)
 
     def test_the_baseline_must_start(self):
         with self.assertRaises(RuntimeError):

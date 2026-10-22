@@ -1137,6 +1137,18 @@ struct Model::Impl {
     // for, so no mailbox seq and no wait - each wait is a round trip through the host (on Windows HIP, ~1 ms a
     // layer).  DS4_HOST_FREE=0: every layer through the host as before (the same tokens either way)
     bool host_free_on = std::getenv("DS4_HOST_FREE") == nullptr || std::atoi(std::getenv("DS4_HOST_FREE")) != 0;
+    // a window's hc_mix + hc_split on the device's second stream (st2) beside the attention and the MoE - CUDA's: a
+    // layer on one GPU each verify round 66.6 vs 68.8 ms on its stream (every layer on one GPU, 9 GPUs, 3.5 bits, the same
+    // tokens), a group's beside its all-reduces.  HIP keeps them on the layer's stream: its two cross-stream waits a layer
+    // may each cost a round trip through the host on Windows (~1 ms a layer: DS4_HOST_FREE's note).  DS4_HC_STREAM=0 /
+    // 1: never / always
+#if defined(STRATA_USE_HIP)
+    static constexpr bool kHcStream = false;
+#else
+    static constexpr bool kHcStream = true;
+#endif
+    int hc_stream = std::getenv("DS4_HC_STREAM") ? std::atoi(std::getenv("DS4_HC_STREAM")) : -1;
+    bool hc_side() const { return hc_stream < 0 ? kHcStream : hc_stream != 0; }
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -2325,9 +2337,10 @@ struct Model::Impl {
         // - or, tp the number of GPUs, one group of all of them whatever their kind (its tightest member sets the
         // experts' room); threads mode for the windows (decode) where a group is 2 wide or more or --threads on, the
         // prompt path (its own thread a GPU) as asked for - also where the experts' blocks took the groups' width down
-        // to 1 (a 256-value type's: Maya's quants), which left every prompt in windows of 16
+        // to 1 (a 256-value type's: Maya's quants), which left every prompt in windows of 16 - and at --tp 1, each GPU
+        // its own layers (--prefill-chunk 0: windows of 16)
         par = o.threads || tp > 1;
-        prompt_par = par || o.tp > 1;
+        prompt_par = true;
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -10164,6 +10177,8 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int nm = L0.nm;
+        const bool hs = hc_side();   // (the mixes on st2)
+        cudaStream_t hcs = hs ? d.st2 : s;
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
@@ -10186,13 +10201,15 @@ struct Model::Impl {
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }
         // attention
-        // (hc_mix + hc_split on st2 beside the attention: the pre norm takes the lagged pre, a_post / a_comb / a_pre are
-        // read from the attention's hc_post on - st waits for them there)
-        CK(cudaEventRecord(d.hc_go, s));
-        CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
-        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.st2);
-        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, d.st2);
-        CK(cudaEventRecord(d.hc_done, d.st2));
+        // (hc_side: hc_mix + hc_split on st2 beside the attention - the pre norm takes the lagged pre, a_post / a_comb /
+        // a_pre are read from the attention's hc_post on, where st waits for them)
+        if (hs) {
+            CK(cudaEventRecord(d.hc_go, s));
+            CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
+        }
+        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
+        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, hcs);
+        if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         {
             x3::MvJob j[4];
@@ -10422,18 +10439,20 @@ struct Model::Impl {
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
-        CK(cudaStreamWaitEvent(s, d.hc_done, 0));
+        if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         prof_mark(d, 1);
         // the MoE
         // (the same beside the MoE: f_post / f_comb / f_pre are read from its hc_post on)
-        CK(cudaEventRecord(d.hc_go, s));
-        CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
-        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.st2);
-        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, d.st2);
-        CK(cudaEventRecord(d.hc_done, d.st2));
+        if (hs) {
+            CK(cudaEventRecord(d.hc_go, s));
+            CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
+        }
+        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
+        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
+        if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
@@ -10537,7 +10556,7 @@ struct Model::Impl {
             }
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
-            CK(cudaStreamWaitEvent(s, d.hc_done, 0));
+            if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -10656,7 +10675,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
-        CK(cudaStreamWaitEvent(s, d.hc_done, 0));
+        if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));

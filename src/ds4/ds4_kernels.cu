@@ -5,7 +5,6 @@
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 
-#include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
@@ -27,9 +26,6 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
-#endif
-#if defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
 #endif
 
 namespace strata::ds4 {
@@ -651,6 +647,7 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
                                                              const int* __restrict__ cand, int cand_stride, int blk,
                                                              Rows lim, float* __restrict__ out, long long out_stride,
                                                              int ntiles) {
+#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)   // (mma.sync's int8 shape)
     constexpr int HD = 128, KT = 128, LD = HD + 16, NQ = QT * 32, NB = HD / 32;
     constexpr size_t RB = kv_row_bytes(kKvFp4p, HD);   // (a packed key row: its codes, its scales, padded to 16)
     extern __shared__ __align__(16) int8_t tc_smem[];   // Ks [KT][LD], Qs [NQ][LD] (int8), ek [KT][NB], eq [NQ][NB]
@@ -799,6 +796,11 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
         }
         __syncthreads();   // (the next tile's rows over these)
     }
+#elif defined(STRATA_USE_HIP)
+    __builtin_trap();   // (index_score takes it on CUDA devices of compute capability 8.0 and up alone)
+#else
+    __trap();
+#endif
 }
 template <int QT>
 constexpr size_t index_tc_smem() { return (size_t) (128 + QT * 32) * (128 + 16) + (size_t) (128 + QT * 32) * 4 * 4; }
@@ -980,10 +982,14 @@ __device__ __forceinline__ uint32_t topk_block(int n, int k, Key key, Emit emit)
     return thr;
 }
 
-// a block a row: topk_block over the row
+// a block a row: the k-th largest key by four 8-bit radix passes, then everything above it and enough of its ties
 __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ vals, long long stride, Rows r,
                                                     const int* __restrict__ cand, int cand_stride, int blk,
                                                     int* __restrict__ out, int out_stride) {
+    __shared__ unsigned hist[256];
+    __shared__ uint32_t prefix_s, mask_s;
+    __shared__ int remaining_s;
+    __shared__ int cnt_gt, cnt_eq;
     const int t = blockIdx.x;
     int n, k;
     rows_at(r, t, n, k);
@@ -995,8 +1001,87 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
         for (int i = threadIdx.x; i < n; i += blockDim.x) out[i] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
         return;
     }
-    topk_block<0>(n, k, [&](int i) { return ord_key(vals[i]); },
-                  [&](int slot, int i) { out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i; });
+    if (threadIdx.x == 0) {
+        prefix_s = 0u;
+        mask_s = 0u;
+        remaining_s = k;
+        cnt_gt = 0;
+        cnt_eq = 0;
+    }
+    __syncthreads();
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0u;
+        __syncthreads();
+        const uint32_t prefix = prefix_s, mask = mask_s;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const uint32_t u = ord_key(vals[i]);
+            if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 0xffu], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const int rem = remaining_s;
+            int cum = 0;
+            for (int d = 255; d >= 0; --d) {
+                const int h = (int) hist[d];
+                if (cum + h >= rem) {
+                    prefix_s = prefix | ((uint32_t) d << shift);
+                    mask_s = mask | (0xffu << shift);
+                    remaining_s = rem - cum;
+                    break;
+                }
+                cum += h;
+            }
+        }
+        __syncthreads();
+    }
+    const uint32_t thr = prefix_s;
+    const int remaining = remaining_s;
+    const int n_gt = k - remaining;
+    // the picks in index order (a scan a pass of 1024 values), so the attention sums them in the same order every run
+    // and the ties kept are the lowest positions
+    __shared__ int wgt[32], weq[32];
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5, nw = blockDim.x >> 5;
+    const unsigned below = (1u << lane) - 1u;
+    for (int i0 = 0; i0 < n; i0 += blockDim.x) {
+        const int i = i0 + threadIdx.x;
+        const uint32_t u = i < n ? ord_key(vals[i]) : 0u;
+        const bool gt = i < n && u > thr, eq = i < n && u == thr;
+        const unsigned bg = __ballot_sync(0xffffffffu, gt), be = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) {
+            wgt[wid] = __popc(bg);
+            weq[wid] = __popc(be);
+        }
+        __syncthreads();
+        if (wid == 0) {
+            const int g0 = lane < nw ? wgt[lane] : 0, e0 = lane < nw ? weq[lane] : 0;
+            int gs = g0, es = e0;
+            for (int o = 1; o < 32; o <<= 1) {
+                const int a = __shfl_up_sync(0xffffffffu, gs, o), b = __shfl_up_sync(0xffffffffu, es, o);
+                if (lane >= o) {
+                    gs += a;
+                    es += b;
+                }
+            }
+            if (lane < nw) {
+                wgt[lane] = cnt_gt + gs - g0;
+                weq[lane] = cnt_eq + es - e0;
+            }
+            __syncwarp();
+            if (lane == 31) {
+                cnt_gt += gs;
+                cnt_eq += es;
+            }
+        }
+        __syncthreads();
+        int slot = -1;
+        if (gt) slot = wgt[wid] + __popc(bg & below);
+        else if (eq) {
+            const int e = weq[wid] + __popc(be & below);
+            if (e < remaining) slot = n_gt + e;
+        }
+        if (slot >= 0) out[slot] = cd != nullptr ? cd[i / blk] * blk + i % blk : i;
+        __syncthreads();
+    }
 }
 
 // a few rows of many positions (a decode window's): each row in P segments, a block each - its own top k, in position
@@ -2518,33 +2603,44 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     // 4 x 1024 tokens, but a long greedy run's tokens part after a while)
     static const bool tc_ok = std::getenv("DS4_INDEX_TC") != nullptr && std::atoi(std::getenv("DS4_INDEX_TC")) != 0;
     if (tc && tc_ok && kfmt == kKvFp4p) {   // (the tensor cores: a block a tile, looping, ~2 blocks an SM)
-        static std::atomic<uint64_t> opted{0};
+        static std::atomic<uint64_t> opted{0}, capable{0};   // (capable: compute capability 8.0+, CUDA - mma's int8)
         static int sms[64] = {};
         int dev = 0;
         cudaGetDevice(&dev);
         if (!(opted.load(std::memory_order_relaxed) >> dev & 1u)) {
-            cudaFuncSetAttribute(index_score_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<1>());
-            cudaFuncSetAttribute(index_score_tc_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<2>());
-            cudaFuncSetAttribute(index_score_tc_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<3>());
-            cudaFuncSetAttribute(index_score_tc_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<4>());
-            cudaFuncSetAttribute(index_score_tc_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<5>());
-            cudaFuncSetAttribute(index_score_tc_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<6>());
+            int major = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+#if !defined(STRATA_USE_HIP)
+            if (major >= 8) {
+                cudaFuncSetAttribute(index_score_tc_kernel<1>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<1>());
+                cudaFuncSetAttribute(index_score_tc_kernel<2>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<2>());
+                cudaFuncSetAttribute(index_score_tc_kernel<3>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<3>());
+                cudaFuncSetAttribute(index_score_tc_kernel<4>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<4>());
+                cudaFuncSetAttribute(index_score_tc_kernel<5>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<5>());
+                cudaFuncSetAttribute(index_score_tc_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) index_tc_smem<6>());
+                capable.fetch_or(1ull << dev);
+            }
+#else
+            (void) major;
+#endif
             cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);
             opted.fetch_or(1ull << dev);
         }
-        // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
-        const int qt = cand != nullptr ? 1 : T <= 6 ? T : 4, qg = (T + qt - 1) / qt, ntiles = (n + 127) / 128;
-        const int gx = std::max(1, std::min(ntiles, 2 * sms[dev & 63] / qg));
-        const uint8_t* kp = (const uint8_t*) k;
-        switch (qt) {
-        case 1: index_tc_launch<1>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
-        case 2: index_tc_launch<2>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
-        case 3: index_tc_launch<3>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
-        case 5: index_tc_launch<5>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
-        case 6: index_tc_launch<6>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
-        default: index_tc_launch<4>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+        if (capable.load(std::memory_order_relaxed) >> dev & 1u) {   // (else the CUDA cores' kernel below)
+            // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
+            const int qt = cand != nullptr ? 1 : T <= 6 ? T : 4, qg = (T + qt - 1) / qt, ntiles = (n + 127) / 128;
+            const int gx = std::max(1, std::min(ntiles, 2 * sms[dev & 63] / qg));
+            const uint8_t* kp = (const uint8_t*) k;
+            switch (qt) {
+            case 1: index_tc_launch<1>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+            case 2: index_tc_launch<2>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+            case 3: index_tc_launch<3>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+            case 5: index_tc_launch<5>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+            case 6: index_tc_launch<6>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+            default: index_tc_launch<4>(gx, qg, s, q, w, kp, heads, n, T, cand, cand_stride, blk, lim, out, out_stride, ntiles); break;
+            }
+            return;
         }
-        return;
     }
     const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     const dim3 grid(cdiv(n, kThreads), T);
@@ -2951,11 +3047,6 @@ void numa_free(void* p, size_t bytes) {
     munmap(p, bytes);
 #endif
 }
-inline void spin_pause() {
-#if defined(__x86_64__) || defined(_M_X64)
-    _mm_pause();
-#endif
-}
 }  // namespace
 
 struct HostReducer::Impl {
@@ -2995,7 +3086,7 @@ struct HostReducer::Impl {
                     int spins = 0;
                     while ((int) (*(volatile const unsigned*) (rf + (size_t) m * fs) - seq) < 0) {
                         if (++spins > 2000) std::this_thread::sleep_for(std::chrono::microseconds(20));
-                        else spin_pause();
+                        else cpu_relax();
                     }
                 }
                 std::atomic_thread_fence(std::memory_order_acquire);
