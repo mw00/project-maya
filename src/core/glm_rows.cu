@@ -512,19 +512,25 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
                 : gf::MvJob{Ly.idx_q_b, nullptr, S->qr, S->iq, nullptr, 1.0f, gf::kTypeBF16, g.q_lora,
                             g.idx_heads * g.idx_key};
     if (!mv(j2, 2, "dsa q")) return false;
-    // STRATA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  Not
-    // for two rows of one conversation (a verify window) on a streamed layer: their resolves share its slot pool, so
-    // the second could evict a block the first one's attention still reads
+    // STRATA_GLM_ROWS_ATTN: the attention of every row in one launch (each row's selection into its own buffers).  A
+    // verify window's rows of one conversation (consecutive rows) on a streamed layer share its slot pool: one resolve
+    // over all their selections then (a resolve never evicts a block it names), not one a row - a row's resolve could
+    // evict a block the row before it still has to read.  Rows of one conversation that are not consecutive: one by one
     const int64_t qd = (int64_t) g.n_head * g.qk_nope, ad = (int64_t) g.n_head * g.kv_lora, nsm = g.n_sel_max();
     bool attn = rows_attn_on() && n > 1 && S->apart != nullptr && g.v_head % 32 == 0 && gf::mla_rows_ok(g.kv_lora);
-    if (attn) {
-        bool dup = false, streamed = false;
-        for (int i = 0; i < n; ++i) {
-            streamed = streamed || kv_streamed(rw[i].kv, il);
-            for (int k = 0; k < i && !dup; ++k) dup = rw[k].seq == rw[i].seq;
-        }
-        attn = !(dup && streamed);
+    int run0[gf::kMaxMvNt];   // the first row of each row's run of consecutive rows of its conversation
+    for (int i = 0; i < n; ++i) {
+        run0[i] = i > 0 && rw[i - 1].seq == rw[i].seq ? run0[i - 1] : i;
+        for (int k = 0; k < run0[i] && attn; ++k)
+            if (rw[k].seq == rw[i].seq) attn = false;
     }
+    if (attn)   // (a run's selections are resolved as one list: the cells past a row's own count must read as padding)
+        for (int i = 0; i < n; ++i)
+            if (run0[i] == i && i + 1 < n && run0[i + 1] == i && kv_streamed(rw[i].kv, il)) {
+                int len = 1;
+                while (i + len < n && run0[i + len] == i) ++len;
+                cudaMemsetAsync(S->acells + (size_t) i * nsm, 0xff, (size_t) len * nsm * sizeof(int), s);
+            }
     const uint16_t* a_lat[gf::kMaxMvNt];
     const int* a_cells[gf::kMaxMvNt];
     int a_nsel[gf::kMaxMvNt];
@@ -569,9 +575,16 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
     }
     if (attn) {
         gf::dsa_select_rows(sr, n_sr, g.idx_kpool, s);
-        for (int i = 0; i < n; ++i)   // (KV streaming: each row's blocks resident, its selection in its slot rows)
-            a_cells[i] = kv_attend_cells(rw[i].kv, il, const_cast<uint16_t*>(a_lat[i]), S->acells + (size_t) i * nsm,
-                                         a_nsel[i], S->aslot + (size_t) i * nsm, s);
+        // KV streaming: each run's blocks resident, its rows' selections in slot rows (resident: the cells themselves)
+        for (int i = 0; i < n;) {
+            int len = 1;
+            while (i + len < n && run0[i + len] == i) ++len;
+            const int* c = kv_attend_cells(rw[i].kv, il, const_cast<uint16_t*>(a_lat[i]), S->acells + (size_t) i * nsm,
+                                           (int) ((len - 1) * nsm) + a_nsel[i + len - 1], S->aslot + (size_t) i * nsm,
+                                           s);
+            for (int k = 0; k < len; ++k) a_cells[i + k] = c + (size_t) k * nsm;
+            i += len;
+        }
         if (!gf::mla_attend_rows(S->aq, ad, a_lat, a_cells, a_nsel, n, g.n_head, g.qk_nope, g.kv_lora, S->actx, ad,
                                  S->apart, S->apart_tokens, s, lat_q8_)) {
             err = "glm rows: the rows' attention is not available here";   // (mla_rows_ok said it was)

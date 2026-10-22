@@ -7,8 +7,8 @@
 //     cache is streamed, gf::mla_attend_rows over all the rows (each its own cache and cells), gf::mla_out for every
 //     row at once.
 // 2..16 rows, each its own conversation with its own context length (from a few positions, where the selection is
-// every pool, to ~60K), resident and streamed caches mixed, some rows two positions of one resident conversation (a
-// verify window's rows), FP16 rows and INT8 records, and launches of fewer tokens than rows (part_tokens).  And the
+// every pool, to ~60K), resident and streamed caches mixed, some rows later positions of the row before's conversation
+// (a verify window's rows; streamed: one resolve over the run's cells, as the engine), FP16 rows and INT8 records, and launches of fewer tokens than rows (part_tokens).  And the
 // rows' selections in one launch (gf::dsa_select_rows) against dsa_select a row, cell for cell.
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
@@ -66,7 +66,9 @@ uint16_t f16(float f) {   // round to nearest of the FP16 bits (normal range onl
 // the model's geometry (GLM-5.x: 64 heads, qk_nope 256, kv_lora 512, v_head 256; 512 pools of 4 cells selected)
 constexpr int kHead = 64, kNope = 256, kLora = 512, kVHead = 256, kPage = 4, kTopPools = 512;
 constexpr int kNSelMax = kTopPools * kPage + kPage - 1;
-constexpr int kSlots = 1024;   // a streamed layer's VRAM pages: 4,096 positions, so long contexts evict
+// a streamed layer's VRAM pages: 36,864 positions, so long contexts evict, and a run of 16 rows' selections (one
+// resolve, up to 16 x 515 blocks) still fits, as a run of a verify window's rows fits the engine's (>= 5,120 pages)
+constexpr int kSlots = 9216;
 
 struct Seq {
     int ctx = 0;
@@ -97,7 +99,7 @@ void run(bool q8, int n, int part_tokens, double p_streamed, double p_dup, uint3
     std::vector<Seq> seqs;
     std::vector<int> row_seq((size_t) n), row_pos((size_t) n);
     for (int i = 0; i < n; ++i) {
-        if (i > 0 && !seqs[(size_t) row_seq[(size_t) i - 1]].streamed && u01(rng) < p_dup) {
+        if (i > 0 && u01(rng) < p_dup) {
             row_seq[(size_t) i] = row_seq[(size_t) i - 1];
             continue;
         }
@@ -156,6 +158,12 @@ void run(bool q8, int n, int part_tokens, double p_streamed, double p_dup, uint3
         row_pos[(size_t) i] = std::min(row_pos[(size_t) i], q.ctx - 1);
     }
     // each row's selection shaped like the indexer's: up to 512 whole pools (half recent, half anywhere), the tail
+    // (one list of n rows of kNSelMax cells, -1 past each row's own count, as the engine's S->acells: a run of one
+    // conversation's rows on a streamed layer is resolved as one list)
+    int* cells_all = dalloc<int>((size_t) n * kNSelMax);
+    int* slot_ref_all = dalloc<int>((size_t) n * kNSelMax);
+    int* slot_bat_all = dalloc<int>((size_t) n * kNSelMax);
+    ck(cudaMemset(cells_all, 0xff, (size_t) n * kNSelMax * sizeof(int)), "padding");
     std::vector<int*> cells((size_t) n), slot_ref((size_t) n), slot_bat((size_t) n);
     std::vector<int> n_sel((size_t) n);
     for (int i = 0; i < n; ++i) {
@@ -180,9 +188,9 @@ void run(bool q8, int n, int part_tokens, double p_streamed, double p_dup, uint3
             for (int j = 0; j < kPage; ++j) c[(size_t) a * kPage + j] = pools[(size_t) a] * kPage + j;
         for (int j = 0; j < kPage - 1; ++j)
             if (n_vis * kPage + j <= p) c[(size_t) top * kPage + j] = n_vis * kPage + j;
-        cells[(size_t) i] = dalloc<int>(kNSelMax);
-        slot_ref[(size_t) i] = dalloc<int>(kNSelMax);
-        slot_bat[(size_t) i] = dalloc<int>(kNSelMax);
+        cells[(size_t) i] = cells_all + (size_t) i * kNSelMax;
+        slot_ref[(size_t) i] = slot_ref_all + (size_t) i * kNSelMax;
+        slot_bat[(size_t) i] = slot_bat_all + (size_t) i * kNSelMax;
         ck(cudaMemcpy(cells[(size_t) i], c.data(), c.size() * 4, cudaMemcpyHostToDevice), "cells");
         n_sel[(size_t) i] = ns;
     }
@@ -218,15 +226,18 @@ void run(bool q8, int n, int part_tokens, double p_streamed, double p_dup, uint3
     gf::mla_q_abs(q, qd, wk_b, kHead, kNope, kLora, n, aq, ad, s);
     std::vector<const uint16_t*> lats((size_t) n);
     std::vector<const int*> cl((size_t) n);
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n;) {   // (a run of one conversation's rows: one resolve over their cells, as the engine)
+        int len = 1;
+        while (i + len < n && row_seq[(size_t) (i + len)] == row_seq[(size_t) i]) ++len;
         Seq& sq = seqs[(size_t) row_seq[(size_t) i]];
-        lats[(size_t) i] = (const uint16_t*) (sq.streamed ? sq.slots : sq.full);
-        cl[(size_t) i] = cells[(size_t) i];
-        if (sq.streamed) {
-            gf::glm_kv_resolve(sq.m, sq.host, sq.slots, row, kPage, cells[(size_t) i], n_sel[(size_t) i],
-                               slot_bat[(size_t) i], s);
-            cl[(size_t) i] = slot_bat[(size_t) i];
+        if (sq.streamed)
+            gf::glm_kv_resolve(sq.m, sq.host, sq.slots, row, kPage, cells[(size_t) i],
+                               (len - 1) * kNSelMax + n_sel[(size_t) (i + len - 1)], slot_bat[(size_t) i], s);
+        for (int k2 = 0; k2 < len; ++k2) {
+            lats[(size_t) (i + k2)] = (const uint16_t*) (sq.streamed ? sq.slots : sq.full);
+            cl[(size_t) (i + k2)] = sq.streamed ? slot_bat[(size_t) (i + k2)] : cells[(size_t) (i + k2)];
         }
+        i += len;
     }
     if (!gf::mla_attend_rows(aq, ad, lats.data(), cl.data(), n_sel.data(), n, kHead, kNope, kLora, actx, ad, part,
                              part_tokens, s, q8)) {
@@ -241,10 +252,11 @@ void run(bool q8, int n, int part_tokens, double p_streamed, double p_dup, uint3
     std::vector<uint8_t> a((size_t) n * out_row), b((size_t) n * out_row);
     ck(cudaMemcpy(a.data(), out_ref, a.size(), cudaMemcpyDeviceToHost), "out ref");
     ck(cudaMemcpy(b.data(), out_bat, b.size(), cudaMemcpyDeviceToHost), "out bat");
-    int streamed_rows = 0, dup_rows = 0;
+    int streamed_rows = 0, dup_rows = 0, streamed_dup = 0;
     for (int i = 0; i < n; ++i) {
         streamed_rows += seqs[(size_t) row_seq[(size_t) i]].streamed;
         dup_rows += i > 0 && row_seq[(size_t) i] == row_seq[(size_t) i - 1];
+        streamed_dup += i > 0 && row_seq[(size_t) i] == row_seq[(size_t) i - 1] && seqs[(size_t) row_seq[(size_t) i]].streamed;
         ++g_checks;
         if (std::memcmp(a.data() + (size_t) i * out_row, b.data() + (size_t) i * out_row, out_row) != 0) {
             size_t at = 0;
@@ -257,15 +269,10 @@ void run(bool q8, int n, int part_tokens, double p_streamed, double p_dup, uint3
             ++g_fail;
         }
     }
-    std::printf("  %s %2d rows, %d a launch: %d streamed, %d window rows, cells %d..%d - %s\n", q8 ? "int8" : "fp16", n,
-                part_tokens, streamed_rows, dup_rows, *std::min_element(n_sel.begin(), n_sel.end()),
+    std::printf("  %s %2d rows, %d a launch: %d streamed, %d window rows (%d streamed), cells %d..%d - %s\n",
+                q8 ? "int8" : "fp16", n, part_tokens, streamed_rows, dup_rows, streamed_dup, *std::min_element(n_sel.begin(), n_sel.end()),
                 *std::max_element(n_sel.begin(), n_sel.end()), g_fail ? "(failures so far)" : "same");
-    for (int i = 0; i < n; ++i) {
-        cudaFree(cells[(size_t) i]);
-        cudaFree(slot_ref[(size_t) i]);
-        cudaFree(slot_bat[(size_t) i]);
-    }
-    for (void* p : {(void*) q, (void*) out_ref, (void*) out_bat, (void*) aq, (void*) actx, (void*) part}) cudaFree(p);
+    for (void* p : {(void*) cells_all, (void*) slot_ref_all, (void*) slot_bat_all, (void*) q, (void*) out_ref, (void*) out_bat, (void*) aq, (void*) actx, (void*) part}) cudaFree(p);
     for (Seq& sq : seqs) free_seq(sq);
 }
 
@@ -356,6 +363,8 @@ int main() {
         run(q8, 8, 8, 0.0, 0.0, seed++, s, wk_b, wv_b);
         run(q8, 8, 8, 1.0, 0.0, seed++, s, wk_b, wv_b);
         run(q8, 16, 8, 0.0, 0.6, seed++, s, wk_b, wv_b);
+        run(q8, 8, 8, 1.0, 0.6, seed++, s, wk_b, wv_b);    // verify windows on streamed layers
+        run(q8, 16, 8, 1.0, 0.5, seed++, s, wk_b, wv_b);
     }
     for (const int n : {1, 2, 4, 7, 8, 16}) run_select(n, 900 + (uint32_t) n, s);
     std::printf("  selections of 1..16 rows in one launch: %s\n", g_fail ? "(failures so far)" : "same");
