@@ -13,6 +13,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <cstdio>
+#include <limits>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -126,7 +129,51 @@ struct EgBatch {
 /// The reader's threads: each read on whichever is free, in submission order, with that thread's own file handles.
 class EgReader {
 public:
-    ~EgReader() { stop(); }
+    ~EgReader() {
+        stop();
+#if !defined(_WIN32)
+        for (auto& r : ram_) { ::munlock(r.base, r.mapped); os::unmap(r.base, r.mapped); }
+#endif
+    }
+    // A successful preload is fully resident and locked. In RAM mode a missing range is an error.
+    bool pin_range(const std::string& path, int file, uint64_t off, uint64_t n, std::string& err) {
+#if defined(_WIN32)
+        err = "Engram RAM mode requires Linux"; return false;
+#else
+        const long page_size = ::sysconf(_SC_PAGESIZE);
+        if (file < 0 || n == 0 || page_size <= 0) { err = "Engram RAM: invalid file or range"; return false; }
+        const uint64_t page = (uint64_t) page_size, begin = off - off % page;
+        if (n > std::numeric_limits<size_t>::max() - (off - begin) ||
+            begin > (uint64_t) std::numeric_limits<off_t>::max()) {
+            err = "Engram RAM: range is too large"; return false;
+        }
+        const size_t length = (size_t) (off - begin + n);
+        const os::fd_t fd = os::open_ro(path);
+        if (fd == os::kBadFd) { err = "Engram RAM: cannot open " + path; return false; }
+        const uint64_t bytes = os::file_size(fd);
+        if (off > bytes || n > bytes - off) {
+            os::close_fd(fd); err = "Engram RAM: range exceeds the file"; return false;
+        }
+        void* raw = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, (int) fd, (off_t) begin);
+        os::close_fd(fd);
+        if (raw == MAP_FAILED) { err = "Engram RAM: mmap failed"; return false; }
+        uint8_t* base = (uint8_t*) raw;
+        const size_t chunk = 256ull << 20;
+        for (size_t pos = 0; pos < length; pos += chunk) {
+            if (::mlock(base + pos, std::min(chunk, length - pos)) != 0) {
+                err = "Engram RAM: mlock failed: " + std::string(std::strerror(errno)) +
+                      "; check available RAM and RLIMIT_MEMLOCK (ulimit -l)";
+                ::munlock(base, length); ::munmap(base, length); return false;
+            }
+            if ((pos / chunk) % 32 == 0 || pos + chunk >= length)
+                std::fprintf(stderr, "ds4: Engram RAM file %d locked %.2f / %.2f GB\n", file,
+                             (double) std::min(pos + chunk, length) / 1e9, (double) length / 1e9);
+        }
+        ram_.push_back({file, off, n, base, length, (size_t) (off - begin)});
+        return true;
+#endif
+    }
+    void require_ram() { ram_only_ = true; }
     void start(const std::vector<std::string>& paths, int threads) {
         paths_ = paths;
         for (int i = 0; i < threads; ++i) th_.emplace_back([this] { loop(); });
@@ -169,6 +216,15 @@ public:
     }
 
 private:
+    struct RamRange { int file; uint64_t off, n; uint8_t* base; size_t mapped, delta; };
+    std::vector<RamRange> ram_;
+    bool ram_only_ = false;
+    bool copy_ram(int file, uint64_t off, uint64_t n, void* dst) const {
+        for (const auto& r : ram_) if (r.file == file && off >= r.off && n <= r.n && off - r.off <= r.n - n) {
+            std::memcpy(dst, r.base + r.delta + (size_t) (off - r.off), (size_t) n); return true;
+        }
+        return false;
+    }
     void loop() {
         std::vector<os::fd_t> fds(paths_.size(), os::kBadFd);   // this thread's own handles, opened on first use
         std::vector<uint8_t> buf;
@@ -194,6 +250,19 @@ private:
         for (os::fd_t f : fds) os::close_fd(f);
     }
     bool read(std::vector<os::fd_t>& fds, const EgRead& r, std::vector<uint8_t>& buf) {
+        if (ram_only_) {
+            if (!r.mx8) {
+                return copy_ram(r.file, r.off, r.n, r.dst) &&
+                       (r.n2 == 0 || copy_ram(r.file2, r.off2, r.n2, r.scales));
+            }
+            buf.resize(r.n);
+            if (!copy_ram(r.file, r.off, r.n, buf.data())) return false;
+            for (uint32_t k = 0; k < r.n / 33; ++k) {
+                r.scales[k] = buf[(size_t) k * 33];
+                std::memcpy(r.dst + (size_t) k * 32, buf.data() + (size_t) k * 33 + 1, 32);
+            }
+            return true;
+        }
         auto fd = [&](int file) {
             if (file < 0 || file >= (int) fds.size()) return os::kBadFd;
             if (fds[(size_t) file] == os::kBadFd) fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
