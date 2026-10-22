@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <string>
 
 namespace strata::ds4::gguf {
 
@@ -52,6 +53,11 @@ const char* type_name(int type);
 
 /// The per-stream scratch of the MXFP4 experts on the current device (once per stream, as x3::prepare).
 bool prepare(cudaStream_t s);
+/// DS4_Q8_BATCH=1: mv()'s int8 inputs a launch a call (its line the first time it is asked: the load asks it).
+bool q8_batch();
+/// DS4_Q8_CHECK=1: the batched rounding against the per-job one on device dev (load time) - false and err when any byte
+/// differs, a guard is written, or a CUDA call fails or does not end.
+bool q8_batch_check(int dev, std::string& err);
 
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -

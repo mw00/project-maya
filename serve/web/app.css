@@ -146,11 +146,12 @@ main { min-height: 0; min-width: 0; display: flex; }
 /* one hue a part, in the bar's order (each next to the next told apart under the three colour blindnesses, on both
    themes); the expert pool keeps the experts card's VRAM colour, the CUDA context a neutral grey, free the bare track */
 .gpumap-card { position: relative; display: flex; flex-direction: column; gap: var(--st-s-4);
-               --gm-weights: #2a78d6; --gm-kv: #1baf7a; --gm-act: #eda100; --gm-drafter: #e87ba4; --gm-pool: var(--st-accent);
+               --gm-weights: #2a78d6; --gm-kv: #1baf7a; --gm-act: #eda100; --gm-prompt: #0b8fa8; --gm-tp: #3c4bb4;
+               --gm-drafter: #e87ba4; --gm-pool: var(--st-accent);
                --gm-vision: #008300; --gm-rest: color-mix(in srgb, var(--st-ink-muted) 60%, var(--st-surface-3)); --gm-other: #eb6834;
                --gm-used: var(--st-accent); }
-[data-theme="dark"] .gpumap-card { --gm-weights: #3987e5; --gm-kv: #199e70; --gm-act: #c98500; --gm-drafter: #d55181;
-                                   --gm-other: #d95926; }
+[data-theme="dark"] .gpumap-card { --gm-weights: #3987e5; --gm-kv: #199e70; --gm-act: #c98500; --gm-prompt: #1aa3be;
+                                   --gm-tp: #5566d0; --gm-drafter: #d55181; --gm-other: #d95926; }
 /* the key (several GPUs): a part's colour and its GB over all of them; pointing at one picks it out in every bar */
 .gpukey { display: flex; flex-wrap: wrap; gap: var(--st-s-2) var(--st-s-5); font-size: var(--st-fs-sm); }
 .gpukey__item { display: inline-flex; align-items: center; gap: 7px; color: var(--st-ink-muted); white-space: nowrap; }
@@ -194,6 +195,7 @@ button.gpurow__line:focus-visible { outline: 2px solid var(--st-accent); outline
 .gpurows[data-focus] .gpubar__seg { opacity: .3; }
 .gpurows[data-focus="weights"] .gpubar__seg[data-k="weights"], .gpurows[data-focus="kv"] .gpubar__seg[data-k="kv"],
 .gpurows[data-focus="act"] .gpubar__seg[data-k="act"], .gpurows[data-focus="drafter"] .gpubar__seg[data-k="drafter"],
+.gpurows[data-focus="prompt"] .gpubar__seg[data-k="prompt"], .gpurows[data-focus="tp"] .gpubar__seg[data-k="tp"],
 .gpurows[data-focus="pool"] .gpubar__seg[data-k="pool"], .gpurows[data-focus="vision"] .gpubar__seg[data-k="vision"],
 .gpurows[data-focus="rest"] .gpubar__seg[data-k="rest"], .gpurows[data-focus="other"] .gpubar__seg[data-k="other"] { opacity: 1; }
 .gpubar-tip { position: absolute; transform: translate(-50%, calc(-100% - 8px)); padding: 6px 10px; white-space: nowrap;

@@ -272,10 +272,34 @@ class GpuMap(unittest.TestCase):
         self.assertEqual((g["parts"]["pool"], g["parts"]["vision"]), (r["pool"] - r["tail"], enc))
         self.assertEqual(g["parts"]["other"], 0)
 
+    def test_a_vision_tower_in_the_engines_process(self):
+        # (strata-ds4: the tower on the first GPU inside the engine - vision_own, not a pool tail lent to another process)
+        r = dict(self.r, vision_own=318 * 2**20)
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own = engine + r["vision_own"] + 400 * 2**20
+        (g,) = self.gm.view([r], [self.card(own, {100: own})], engine_pid=100)
+        self.assertEqual((g["parts"]["vision"], g["vision_own"]), (r["vision_own"], r["vision_own"]))
+        self.assertEqual((g["parts"]["rest"], g["parts"]["other"]), (400 * 2**20, 0))   # the CUDA context, not vision
+        (s,) = self.gm.view([r], [], engine_pid=100)             # (no NVML: the start's measurement)
+        self.assertEqual(s["parts"]["vision"], r["vision_own"])
+        self.assertEqual(sum(s["parts"].values()) + s["free"], s["total"])
+
     def test_never_more_than_the_card(self):
         (g,) = self.gm.view([self.r], [self.card(26 * GB, {100: 25 * GB, 200: 2 * GB})], engine_pid=100)
         self.assertLessEqual(sum(g["parts"].values()), g["total"])
         self.assertEqual(g["free"], 0)
+
+    def test_strata_ds4s_prompt_buffers_and_tensor_parallel(self):
+        # (strata-ds4 at --tp 8: a 5060 Ti of the group of 8 - its prompt chunks' buffers and tensor parallel's copies
+        # told apart, the GLM engine's lines without them)
+        r = self.gm.parse("VRAM dev=3 pci=0000:05:00.0 total=16610951168 free=301989888 weights=268435456 kv=33554432 "
+                          "kv_ram=0 act=134217728 drafter=0 window=0 pool=13421772800 tail=0 borrow=0 vision=0 "
+                          "vision_own=0 prompt=1610612736 tp=805306368 tp_n=8 slots=3343 ctx=262144 layers=3-39")
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual((g["parts"]["prompt"], g["parts"]["tp"], g["tp_n"]), (1610612736, 805306368, 8))
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        (h,) = self.gm.view([self.r], [], engine_pid=100)
+        self.assertEqual((h["parts"]["prompt"], h["parts"]["tp"], h["tp_n"]), (0, 0, 0))
 
     def test_two_parts_on_one_card_add_up(self):
         a = dict(self.r, layers=[0, 20], slots=500)

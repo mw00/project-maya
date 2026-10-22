@@ -77,7 +77,8 @@ def fp4_to_mxfp4(w: np.ndarray, s: np.ndarray, rows: int, k: int) -> np.ndarray:
 
 QTYPES = {"Q8_0": (8, 32, 34), "Q2_K": (10, 256, 84), "Q3_K": (11, 256, 110), "Q4_K": (12, 256, 144),
           "Q5_K": (13, 256, 176), "Q6_K": (14, 256, 210), "IQ2_XXS": (16, 256, 66), "IQ3_XXS": (18, 256, 98),
-          "IQ3_S": (21, 256, 110), "IQ2_S": (22, 256, 82), "IQ4_XS": (23, 256, 136)}
+          "IQ3_S": (21, 256, 110), "IQ2_S": (22, 256, 82), "IQ4_XS": (23, 256, 136), "IQ1_S": (19, 256, 50),
+          "IQ1_M": (29, 256, 56)}
 DENSE_KEEP = ("markov_head", "confidence_head", "norm", "hc_", "ffn.gate.", "attn_sink")
 E2M1 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
 

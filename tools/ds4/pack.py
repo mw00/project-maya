@@ -10,7 +10,12 @@ writes <model>/maya-ds4/:
   engram.bin    the Engram hash tables (tools/ds4/engram_hash.py): int32 magic 'DSE1', vocab, layers, max_ngram,
                 heads, head_dim, pad (compressed); int32 token_map[vocab]; int64 mult[layers][max_ngram];
                 int64 primes[layers][cols]; int64 offsets[layers][cols]   (cols = (max_ngram - 1) * heads)
-  tokenizer/    the server's tokenizer (tools/strata_tokenizer.py's layout, pre "deepseek3") and chat template
+  tokenizer/    the server's tokenizer (tools/strata_tokenizer.py's layout, pre "deepseek3") and the model repo's own
+                chat_template.jinja (a port of DeepSeek's encoding/encoding.py, byte for byte its prompts) - this
+                directory's chat_template.jinja only for a repo without one
+
+A repo's exl3_k_map.json (each tensor group's EXL3 bits and the codebook) is checked against the tensors: the engine
+reads every matrix's K from its trellis shape, so the map is a cross-check, not an input.
 
 The compressed token map needs the `tokenizers` package (it normalizes every token as DeepSeek's training did).
 """
@@ -29,7 +34,8 @@ sys.path.insert(0, str(HERE))
 import engram_hash as EH  # noqa: E402
 from st import SafeTensors  # noqa: E402
 
-TEMPLATE = HERE / "chat_template.jinja"
+TEMPLATE = HERE / "chat_template.jinja"   # (a model repo without its own chat_template.jinja)
+MUL1 = 0x83DCD12D                          # the engine's mul1 codebook multiplier
 
 
 def need(st: SafeTensors, t: dict) -> list[str]:
@@ -96,8 +102,56 @@ def write_tokenizer(out: pathlib.Path, model: pathlib.Path):
     (out / "token_type.json").write_text(json.dumps(types))
     (out / "tokenizer.json").write_text(json.dumps({"pre": "deepseek3", "special_ids": {
         "bos": 0, "eos": 1, "pad": 2}}, indent=1))
-    if TEMPLATE.exists():
-        (out / "chat_template.jinja").write_text(TEMPLATE.read_text(encoding="utf-8"), encoding="utf-8")
+    tpl = model / "chat_template.jinja"
+    tpl = tpl if tpl.exists() else TEMPLATE
+    if tpl.exists():
+        (out / "chat_template.jinja").write_text(tpl.read_text(encoding="utf-8"), encoding="utf-8")
+    return tpl
+
+
+def check_k_map(model: pathlib.Path, st: SafeTensors) -> int | None:
+    """exl3_k_map.json (if the repo has one) against every EXL3 matrix: its K (the trellis's last dim / 16) and the
+    codebook; a mismatch stops the pack.  -> the matrices checked, None without a map."""
+    path = model / "exl3_k_map.json"
+    if not path.exists():
+        return None
+    km = json.loads(path.read_text())
+    if km.get("codebook", "mul1") != "mul1" or int(km.get("mul1_multiplier", MUL1)) != MUL1:
+        raise SystemExit("%s: codebook %r, multiplier %r - the engine decodes mul1 (0x%X) alone" %
+                         (path, km.get("codebook"), km.get("mul1_multiplier"), MUL1))
+
+    def want(name: str):
+        if name.startswith("mtp."):
+            return km.get("mtp_bits")
+        if name.startswith("head."):
+            return km.get("head_bits")
+        parts = name.split(".")
+        if parts[0] != "layers" or len(parts) < 4:
+            return None
+        L, rest = parts[1], ".".join(parts[2:-1])
+        if rest.startswith("ffn.experts."):
+            return km["routed"].get(L)
+        if rest.startswith("ffn.shared_experts."):
+            return (km.get("shared_overrides") or {}).get(L, km["shared"].get(L))
+        if rest.startswith("engram."):
+            return (km.get("engram") or {}).get(L)
+        if rest == "attn.indexer.wk":
+            return km.get("indexer_wk_bits", km.get("attn_default"))
+        return km.get("attn_default")
+
+    bad, n = [], 0
+    for name, (_, _, shape, _, _) in st.t.items():
+        if not name.endswith(".trellis"):
+            continue
+        w = want(name)
+        if w is None:
+            continue
+        n += 1
+        if shape[-1] // 16 != int(w):
+            bad.append("%s: K %d, the map %d" % (name, shape[-1] // 16, int(w)))
+    if bad:
+        raise SystemExit("%s disagrees with the tensors:\n  %s" % (path, "\n  ".join(bad[:20])))
+    return n
 
 
 def main() -> int:
@@ -155,10 +209,14 @@ def main() -> int:
             f.write("file %d %s\n" % (i, fn))
         for name, (fn, dt, shape, off, nb) in st.t.items():
             f.write("t %s %s %d %d %d %s\n" % (name, dt, st.files.index(fn), off, nb, " ".join(map(str, shape))))
+    nk = check_k_map(model, st)
     nl, cols = write_engram(out / "engram.bin", model, t)
-    write_tokenizer(out / "tokenizer", model)
+    tpl = write_tokenizer(out / "tokenizer", model)
     print("%s: %d tensors in %d files, Engram %d layers x %d hash columns -> %s" %
           (model.name, len(st.t), len(st.files), nl, cols, out))
+    print("  chat template: %s%s" % (tpl, "" if tpl.parent == model else " (the repo has none)"))
+    if nk is not None:
+        print("  exl3_k_map.json: every one of %d EXL3 matrices' K agrees" % nk)
     return 0
 
 

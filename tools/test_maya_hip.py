@@ -287,6 +287,17 @@ class HipSetupTests(unittest.TestCase):
         self.assertNotIn("--layer-split", call.args[0])
         self.assertIn("GPUs: RX 7900 XT 20 GB;", text)
 
+    def test_bench_uses_ds4_build_on_hip(self):
+        # #350: bench() hardcoded the GLM binary for every HIP config, so a DeepSeek setup's --bench crashed with
+        # FileNotFoundError (build-hip/maya was never built there - build-hip/maya-ds4 was).
+        path = self.installed_config(gpu=[1, 0])
+        cfg = maya.read_json(path)
+        cfg["exe"] = str(self.root / "build-hip/maya-ds4")            # what write_config_ds4 actually writes
+        cfg["args"] = ["--pack", str(self.root / "model/maya-ds4")] + cfg["args"]
+        path.write_text(json.dumps(cfg))
+        call, _ = self.run_bench(path)
+        self.assertEqual(call.args[0][:2], [str(self.root / "build-hip/maya-ds4"), "--serve"])
+
     def run_report(self, outputs=None, tools=(), backend=None, cfg_path=None):
         outputs = outputs or {}
 

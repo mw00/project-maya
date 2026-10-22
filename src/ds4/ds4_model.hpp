@@ -41,7 +41,8 @@ struct Options {
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
-    // -1: 2048, or 8192 with the experts read in place (every chunk streams them all from the files)
+    // -1: 2048 on one GPU, 4096 on several, or 8192 with the experts read in place (every chunk streams them all from
+    // the files)
     int prefill_chunk = -1;
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else

@@ -20,7 +20,8 @@ The recipe (JSON):
   source's shards there as that set.
 
 The output has one shard a source shard (the same tensors in the same order, the metadata copied; split.tensors.count
-updated), tensors at the source's alignment.  Workers (processes) read the source with O_DIRECT, so the page cache that
+updated), tensors at the source's alignment; with --shards only the matching shards are written, the others linked.
+A source's low-bit types (a Maya quant's experts) are read through ggml's own dequantize_row_* (the same library).  Workers (processes) read the source with O_DIRECT, so the page cache that
 running engines rely on is neither evicted nor filled, and drop what they wrote from it; they run at SCHED_IDLE.
 
 IQ2_XXS / IQ2_XS / IQ1_* need an importance matrix: --imatrix (llama.cpp's legacy .dat) or all ones.
@@ -263,6 +264,13 @@ def to_f32(typ: int, raw: memoryview, n: int) -> np.ndarray:
         v[:, :16] = E2M1[q & 15]
         v[:, 16:] = E2M1[q >> 4]
         return (v * d[:, None]).reshape(-1)
+    if typ in GT and GT[typ][1] == 256:   # a low-bit source (a Maya quant's experts): ggml's own dequantize_row_*
+        name = GT[typ][0]
+        fn = getattr(_lib, "dequantize_row_" + (name[:-1].lower() + "K" if name.endswith("_K") else name.lower()))
+        x = np.empty(n, dtype=np.float32)
+        src = np.frombuffer(raw, dtype=np.uint8)
+        fn(ctypes.c_void_p(src.ctypes.data), ctypes.c_void_p(x.ctypes.data), ctypes.c_int64(n))
+        return x
     raise ValueError("source type %d" % typ)
 
 
@@ -336,6 +344,8 @@ def main() -> int:
     ap.add_argument("--first", help="regex: the matching tensors' pieces first (e.g. a few layers for a quick test)")
     ap.add_argument("--resume", action="store_true",
                     help="keep the output files of an earlier run (same plan) and skip the pieces already written")
+    ap.add_argument("--shards", help="regex: rewrite only the matching source shards; the others are linked into --out "
+                                     "as they are (the recipe must leave their tensors alone: a few layers' test set)")
     a = ap.parse_args()
 
     src = pathlib.Path(a.src).expanduser().resolve()
@@ -346,8 +356,15 @@ def main() -> int:
         raise SystemExit("%s: no .gguf files" % src)
     ss = [Shard(p) for p in shards]
 
-    jobs, plan_sizes, outs = [], {}, []
+    jobs, plan_sizes, outs, links = [], {}, [], []
     for si, sh in enumerate(ss):
+        if a.shards and not re.search(a.shards, sh.path.name):
+            changed = [t[0] for t in sh.tensors if plan_type(recipe, t[0], t[1], t[2]) is not None]
+            if changed:
+                raise SystemExit("%s: not in --shards, but the recipe changes %d of its tensors (%s ...)"
+                                 % (sh.path.name, len(changed), changed[0]))
+            links.append(sh.path)
+            continue
         kept = []
         for name, typ, dims, off in sh.tensors:
             q = plan_type(recipe, name, typ, dims)
@@ -394,11 +411,19 @@ def main() -> int:
                 jobs.append(dict(base, q=q, typ=typ, ne0=ne0, r0=r0, r1=min(rows, r0 + step), rows_per_expert=rpe,
                                  iname=iname, n=0))
     total = sum(o[2] for o in outs)
-    print("plan: %d shards, %.1f GB (%s), %d jobs" % (len(outs), total / 1e9,
-          ", ".join("%s %.1f GB" % (k, v / 1e9) for k, v in sorted(plan_sizes.items())), len(jobs)), flush=True)
+    print("plan: %d shards, %.1f GB (%s), %d jobs%s" % (len(outs), total / 1e9,
+          ", ".join("%s %.1f GB" % (k, v / 1e9) for k, v in sorted(plan_sizes.items())), len(jobs),
+          "; %d shards linked as they are" % len(links) if links else ""), flush=True)
     if a.dry_run:
         return 0
     out.mkdir(parents=True, exist_ok=True)
+    for p in links:   # (--shards: the shards the recipe leaves alone, as they are)
+        link = out / p.name
+        if link.is_symlink() or link.exists():
+            if link.resolve() != p.resolve():
+                raise SystemExit("%s: exists and is not a link to %s" % (link, p))
+            continue
+        link.symlink_to(p)
     for opath, head, size in outs:
         if a.resume and opath.is_file() and opath.stat().st_size == size:
             with open(opath, "r+b") as f:

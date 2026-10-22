@@ -1715,18 +1715,37 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             for (int s2 = 0; s2 < R.n && rs < 0; ++s2)
                 if (R.st[(size_t) s2] == FastState::kRFree) rs = s2;
             if (rs < 0) {
-                uint32_t bc = F->cnt[(size_t) key];
-                for (int s2 = 0; s2 < R.n; ++s2)
-                    if (R.st[(size_t) s2] == FastState::kRHold && !parked[(size_t) R.key[(size_t) s2]] &&
-                        F->cnt[(size_t) R.key[(size_t) s2]] < bc) {
-                        bc = F->cnt[(size_t) R.key[(size_t) s2]];
+                // the victim: a RAM-tier expert of a lower LFU count - and on EQUAL counts the one a route used less
+                // recently (STRATA_GLM_LEND_PARK_LRU=0: strictly lower only, as before).  The counts age (all halve every
+                // 32768 routing events), so most sit at the same small value, often 0, and the strict rule picked badly:
+                // Maya-S24, one V100, 512 tokens after a fresh 24K prompt (the run's second lend), two rounds each, disk
+                // reads 520-578 -> 309-317, of them the lend's RAM victims 392-465 -> 208-213; decode 31.6-32.5 ->
+                // 33.1-33.3 tok/s, VRAM hits 72.2-74.0 -> 73.7-74.5 %
+                static const bool lru_ties = getenv("STRATA_GLM_LEND_PARK_LRU") == nullptr ||
+                                             std::atoi(getenv("STRATA_GLM_LEND_PARK_LRU")) != 0;
+                // ... and on equal recency too (the first prompt after a load: every count and tick alike, 30 of 450 lent
+                // experts parked) the one of the lower long-term usage (the profile the warm-up placed them by)
+                const auto use = [&](int k) { return F->usage.empty() ? 0u : F->usage[(size_t) k]; };
+                uint32_t bc = F->cnt[(size_t) key], bu = use(key);
+                uint64_t bt = F->lp[(size_t) il].tick[(size_t) s];
+                for (int s2 = 0; s2 < R.n; ++s2) {
+                    if (R.st[(size_t) s2] != FastState::kRHold || parked[(size_t) R.key[(size_t) s2]]) continue;
+                    const int k2 = R.key[(size_t) s2];
+                    const uint32_t c = F->cnt[(size_t) k2], u = use(k2);
+                    const uint64_t t = R.tick[(size_t) s2];
+                    if (c < bc || (lru_ties && c == bc && (t < bt || (t == bt && u < bu)))) {
+                        bc = c;
+                        bt = t;
+                        bu = u;
                         rs = s2;
                     }
+                }
                 if (rs < 0) return false;
                 const int old = R.key[(size_t) rs];
                 upd(F->rtab_key((size_t) old), 0ull);
                 F->ram_of[(size_t) old] = -1;
-                F->left[(size_t) old] = 2;
+                F->left[(size_t) old] = 4;
+                ++F->diag_lend_evict;
             }
             // on the compute stream: the prompt's work behind it cannot overwrite the slot before the copy read it
             if (!glmfast::cuda_ok(cudaMemcpyAsync(R.base + (size_t) rs * R.stride,
@@ -1769,7 +1788,12 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 char& st = P.st[(size_t) s];
                 if (st == FastState::kResident && P.key[(size_t) s] >= 0) {
                     const int key = il * NE + P.key[(size_t) s];
-                    if (ci < cold.size() && cold[ci].first < (uint64_t) F->cnt[(size_t) key]) {
+                    static const bool lru_ties = getenv("STRATA_GLM_LEND_PARK_LRU") == nullptr ||
+                                                 std::atoi(getenv("STRATA_GLM_LEND_PARK_LRU")) != 0;
+                    if (ci < cold.size() &&
+                        (cold[ci].first < (uint64_t) F->cnt[(size_t) key] ||
+                         (lru_ties && cold[ci].first == (uint64_t) F->cnt[(size_t) key] &&
+                          P.tick[(size_t) cold[ci].second] < P.tick[(size_t) s]))) {
                         const int v = cold[ci++].second;   // the coldest: it goes, this expert takes its slot
                         const int vkey = il * NE + P.key[(size_t) v];
                         const bool parked = park(il, v, vkey);   // (read before the copy below overwrites the slot)

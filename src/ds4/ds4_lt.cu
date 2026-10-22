@@ -41,6 +41,7 @@ struct Pick {
     hipblasLtMatmulAlgo_t algo{};
 };
 struct Dev {
+    std::mutex mu;                 // this device's handle, workspace and picks
     bool tried = false, live = false;
     hipblasLtHandle_t h = nullptr;
     void* ws = nullptr;
@@ -48,7 +49,7 @@ struct Dev {
     std::map<Key, Pick> picks;
     std::map<Key, int> saved;        // the store's solution ids for this tag
 };
-std::mutex g_mu;
+std::mutex g_mu;                   // store path and file appends only; never held while waiting on a GPU
 Dev g_dev[64];
 std::string g_store;                 // set_store's file ("": the picks this process makes only)
 
@@ -84,9 +85,9 @@ bool off() {
 }
 
 // the store's lines for this device's tag: "<arch> <version> n k ldx ldy rows solution"
-void load_saved(Dev& d) {
-    if (g_store.empty()) return;
-    std::ifstream f(g_store);
+void load_saved(Dev& d, const std::string& store) {
+    if (store.empty()) return;
+    std::ifstream f(store);
     std::string line;
     while (std::getline(f, line)) {
         std::istringstream is(line);
@@ -109,8 +110,15 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
     if (off() || t < kMinRows || n <= 0 || k <= 0 || ldx < k || ldy < n) return false;
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) return false;
-    std::lock_guard<std::mutex> lk(g_mu);
     Dev& d = g_dev[dev];
+    // Another GPU's stream may wait for this device's layer hand-off while its first Lt shape is timed.
+    // A process-wide lock across hipEventSynchronize would prevent this device from submitting that work.
+    std::lock_guard<std::mutex> lk(d.mu);
+    std::string store;
+    {
+        std::lock_guard<std::mutex> store_lk(g_mu);
+        store = g_store;
+    }
     if (!d.tried) {
         d.tried = true;
         d.live = hipblasLtCreate(&d.h) == HIPBLAS_STATUS_SUCCESS && hipMalloc(&d.ws, kWorkspace) == hipSuccess;
@@ -123,7 +131,7 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
             const size_t colon = arch.find(':');
             if (colon != std::string::npos) arch.resize(colon);
             d.tag = arch + " " + std::to_string(ver);
-            load_saved(d);
+            load_saved(d, store);
         }
     }
     if (!d.live) return false;
@@ -196,8 +204,9 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
             if (verbose)
                 std::fprintf(stderr, "ds4 gemm: hipBLASLt n %d k %d ldx %d ldy %d rows <= %d: %d candidates, %s %.3f ms\n",
                              n, k, ldx, ldy, key.tb, got, pick.ok ? "the fastest" : "none ran", pick.ok ? best / 2 : 0.0f);
-            if (pick.ok && !g_store.empty() && !d.tag.empty()) {   // (kept for the next start on this GPU kind)
-                std::ofstream f(g_store, std::ios::app);
+            if (pick.ok && !store.empty() && !d.tag.empty()) {   // (kept for the next start on this GPU kind)
+                std::lock_guard<std::mutex> store_lk(g_mu);
+                std::ofstream f(store, std::ios::app);
                 f << d.tag << ' ' << n << ' ' << k << ' ' << ldx << ' ' << ldy << ' ' << key.tb << ' '
                   << hipblaslt_ext::getIndexFromAlgo(pick.algo) << '\n';
             }

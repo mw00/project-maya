@@ -4292,7 +4292,7 @@ void Glm5Model::fast_service() {
                 const uint64_t us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                         std::chrono::steady_clock::now() - t0).count();
                 F->disk_reads.fetch_add((uint64_t) nr, std::memory_order_relaxed);   // read here (not ahead)
-                for (int r2 = 0; r2 < nr; ++r2) ++F->diag_disk[F->left[(size_t) il * g.n_expert + ids[mi[rd[r2]]]] & 3];
+                for (int r2 = 0; r2 < nr; ++r2) ++F->diag_disk[F->left[(size_t) il * g.n_expert + ids[mi[rd[r2]]]] & 7];
                 F->disk_us.fetch_add(us, std::memory_order_relaxed);
                 F->miss_us.fetch_add(us, std::memory_order_relaxed);
                 F->miss_layers.fetch_add(1, std::memory_order_relaxed);
@@ -5034,15 +5034,18 @@ bool Glm5Model::fast_boundary(std::string& err) {
     if (ok && !fast_helper_adapt(err)) return false;
     F->check_resident(l0_, lt_, g.n_expert);   // (the tables as the next token's routes find them)
     static const bool diag = getenv("STRATA_GLM_TIER_DIAG") != nullptr;
-    if (diag && ++F->diag_b % 64 == 0)
-        std::fprintf(stderr, "glm tier diag CUDA%d (%llu boundaries): VRAM drops %llu, RAM evictions %llu, lend drops %llu (to RAM %llu), background promotions %llu / demotions %llu, resident skips %llu | "
-                             "disk reads of: never held %llu, dropped from VRAM %llu, evicted from RAM %llu, lend-dropped %llu\n",
+    static const int diag_every = getenv("STRATA_GLM_TIER_DIAG_EVERY") ? std::max(1, std::atoi(getenv("STRATA_GLM_TIER_DIAG_EVERY"))) : 64;
+    if (diag && ++F->diag_b % diag_every == 0)
+        std::fprintf(stderr, "glm tier diag CUDA%d (%llu boundaries): VRAM drops %llu, RAM evictions %llu, lend drops %llu (to RAM %llu, evicting %llu), background promotions %llu / demotions %llu, resident skips %llu | "
+                             "disk reads of: never held %llu, dropped from VRAM %llu, evicted from RAM %llu, lend-dropped %llu, lend-evicted %llu\n",
                      dev_, (unsigned long long) F->diag_b, (unsigned long long) F->diag_drop,
                      (unsigned long long) F->diag_ram_evict, (unsigned long long) F->diag_lend,
-                     (unsigned long long) F->diag_lend_park, (unsigned long long) F->bg_up,
+                     (unsigned long long) F->diag_lend_park, (unsigned long long) F->diag_lend_evict,
+                     (unsigned long long) F->bg_up,
                      (unsigned long long) F->bg_down, (unsigned long long) F->diag_resident_skip,
                      (unsigned long long) F->diag_disk[0], (unsigned long long) F->diag_disk[1],
-                     (unsigned long long) F->diag_disk[2], (unsigned long long) F->diag_disk[3]);
+                     (unsigned long long) F->diag_disk[2], (unsigned long long) F->diag_disk[3],
+                     (unsigned long long) F->diag_disk[4]);
     if (diag && F->diag_b % 64 == 0) {
         // per RAM class: slots, held, free, and how many of its layers' experts are in no tier at all
         for (size_t c = 0; c < F->rc.size(); ++c) {

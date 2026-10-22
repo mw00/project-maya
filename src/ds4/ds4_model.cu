@@ -21,6 +21,7 @@
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
 #include "ds4_pool.hpp"
+#include "ds4_prefill_stats.hpp"
 #include "ds4_vision.cuh"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -33,6 +34,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <queue>
 #include <array>
 #include <condition_variable>
 #include <deque>
@@ -519,7 +521,14 @@ struct Dev {
     int id = 0;
     cudaStream_t st = nullptr;
     cudaEvent_t ev = nullptr;
+    // a window's hc_mix + hc_split beside the layer (their results are read only at its hc_post; the pre norm takes the
+    // lagged pre): their stream, the stream's go (st -> st2) and its done (st2 -> st)
+    cudaStream_t st2 = nullptr;
+    cudaEvent_t hc_go = nullptr, hc_done = nullptr;
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
+    // (the Monitor's map: the prompt chunks' buffers, out of scratch; of the weights, the copies a group's members
+    // each hold of the tensors they do not split - what tensor parallel costs beyond one copy, its members' share)
+    size_t prompt = 0, tp_w = 0;
     std::vector<void*> allocs;
     // a window's scratch, rows of up to kWin tokens (the routed experts' rows: kWin * kPicks)
     float *h = nullptr, *h2 = nullptr, *x = nullptr, *qr = nullptr, *q = nullptr, *kvr = nullptr, *ckr = nullptr,
@@ -532,6 +541,7 @@ struct Dev {
           *ed = nullptr;
     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
+    TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
@@ -571,6 +581,7 @@ struct Dev {
 
 // the chunked prompt path's buffers on a device: a chunk of C tokens through a layer at once (the attention in slabs of
 // A queries, the indexer in slabs of AI), its GEMMs through FP16 reconstructions of the weights and cuBLAS
+
 struct Chunk {
     int C = 0, A = 0, AI = 0;
     int HQ = 0, OG = 0, FF = 0;              // (lay_chunk: this device's heads' width, wo_a groups, FFN share)
@@ -611,10 +622,19 @@ struct Chunk {
     unsigned* hand_flag[2] = {nullptr, nullptr};
     unsigned* hand_ack = nullptr;
     unsigned arb_seq = 0;        // the group's chunk all-reduces
+    ArAux ar_aux;                // (allreduce_dma's pieces: its copies out on a stream of their own)
+    // the attention's sums slab by slab beside the next slab's compute: a stream of their own (its own ArAux), and
+    // the main stream waits for the last before the residual (DS4_AR_OVERLAP=0: on the main stream, whole)
+    cudaStream_t ar_s = nullptr;
+    ArAux ar_aux2;
+    cudaEvent_t ar_go = nullptr, ar_done = nullptr;
     // pinned, two chunks in flight: the embedding rows (the first layer's device), the Engram rows (an Engram layer's)
     uint16_t* emb_host[2] = {nullptr, nullptr};
     uint8_t* eg_host[2] = {nullptr, nullptr};
     cudaEvent_t emb_ev[2] = {nullptr, nullptr}, eg_ev[2] = {nullptr, nullptr};
+    // (a group's Engram rows read once, Impl::eg_src_dev: the seq of the chunk last read into each slot - the reader's
+    //  - and of the chunk whose copies out of the slot this device last issued)
+    std::atomic<unsigned> eg_read_seq[2] = {}, eg_copied_seq[2] = {};
     double stream_bytes = 0;     // the experts streamed in, in all
     // the flow (a GGUF's in-place experts, every layer of the device on it alone; DS4_FLOW=0: the batches above): a
     // (chunk, layer)'s streamed experts are those it routes to - its likely ones (the profile's chance of a pick by the
@@ -750,7 +770,17 @@ struct Layer {
     std::vector<float> heat;
     std::vector<int> cpu_hits;                  // CPU-lane experts used since the cache last looked
     bool swap_pending = false;
+    int sw_in = -1;                             // the expert a pending swap brings in (the recent slots leave it be)
     unsigned long long* tab_pin = nullptr;      // pinned: the table entries a swap writes
+    // the recent slots (DS4_RECENT): rc_n VRAM slots from rc_base, each a copy of a CPU-lane expert the layer used
+    // lately - its RAM parts stay where they are, so one goes out by its table entry alone; least recently used out
+    int rc_base = -1, rc_n = 0, rc_off = 0;     // (rc_off: the layer's slots in Impl::rc_done)
+    std::vector<int> rc_exp, rc_fill;           // a slot's expert (-1: none), the expert its copy is bringing (-1: none)
+    std::vector<unsigned> rc_gen;               // a filling slot's fill (the gen rc_done says when done)
+    std::deque<std::vector<int>> rc_hist;       // the CPU-lane experts of the layer's last ticks (a fill's rule)
+    std::vector<unsigned> rc_stamp;             // the tick that last used it
+    std::vector<cudaEvent_t> rc_ev;             // [slot][member]: the fill's copies done
+    unsigned long long* rc_pin = nullptr;       // pinned: [slot][member] the slot's address, then a 0
     // a speculative window's backups (trunk layers): the ring rows it replaced, and a compressor's state before it and
     // the window's raw rows (kv, then score) to replay the accepted ones
     uint8_t* ring_bak = nullptr;
@@ -851,6 +881,7 @@ struct Group {
     // lead's acknowledgements (host-mapped)
     float* lg_stage = nullptr;
     unsigned *lg_flag = nullptr, *lg_ack = nullptr;
+    std::shared_ptr<HostReducer> hred;   // a chunk's all-reduces summed on the host (5 members or more)
 };
 
 constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window plan covers
@@ -884,6 +915,7 @@ struct Model::Impl {
     bool par = false;                 // threads mode (the windows: decode)
     bool prompt_par = false;          // the prompt path's chunks (a thread a GPU), as --tp / --threads asked
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
+    std::atomic<unsigned> win_now{0};   // (the last decode window's win_seq, for the copy threads)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = 512;
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
@@ -1002,6 +1034,45 @@ struct Model::Impl {
     std::FILE* dump_d = std::getenv("DS4_DSPARK_DUMP") ? std::fopen(std::getenv("DS4_DSPARK_DUMP"), "wb") : nullptr;
     float* h_dump = nullptr;          // (the dump's pinned copies: each block's stream, each block's ring)
     uint16_t* h_dump_ring = nullptr;
+    // DS4_TOPK_CHECK=1: each window's indexer top k (the segmented one, TopkScratch) again a block a row, the two
+    // compared - the calls and the rows that differed, every 256 calls
+    bool topk_check = std::getenv("DS4_TOPK_CHECK") != nullptr;
+    std::atomic<long long> tkc_calls{0}, tkc_bad{0};
+    // DS4_INDEX_CHECK=1: each window's indexer scores (the tensor cores' kernel) again on the CUDA cores, into the score
+    // rows past the window's - the -inf the same, and the largest difference of the row's largest, every 256 calls
+    bool index_check = std::getenv("DS4_INDEX_CHECK") != nullptr;
+    std::atomic<long long> ixc_calls{0}, ixc_bad{0};
+    std::atomic<uint32_t> ixc_worst{0};   // (a float's bits)
+    void index_check_rows(Dev& d, int il, const float* q, const float* w, const uint8_t* kp, int T, int n, const int* cand,
+                          int blk, const Rows& lim, long long ss, cudaStream_t s) {
+        if (2 * T > kWin || n <= 0) return;
+        float* ref = d.scores + (size_t) T * ss;
+        index_score(q, w, kp, g.ix_heads, g.ix_hd, T, n, cand, (int) cand_stride(), blk, lim, ref, ss, s, kKvFp4p, false);
+        std::vector<float> a((size_t) T * n), b((size_t) T * n);
+        cudaMemcpy2DAsync(a.data(), (size_t) n * 4, d.scores, (size_t) ss * 4, (size_t) n * 4, (size_t) T,
+                          cudaMemcpyDeviceToHost, s);
+        cudaMemcpy2DAsync(b.data(), (size_t) n * 4, ref, (size_t) ss * 4, (size_t) n * 4, (size_t) T, cudaMemcpyDeviceToHost, s);
+        cudaStreamSynchronize(s);
+        bool bad = false;
+        float worst = 0.0f;
+        for (int t = 0; t < T; ++t) {
+            float mx = 0.0f;
+            for (int i = 0; i < n; ++i)
+                if (std::isfinite(b[(size_t) t * n + i])) mx = std::max(mx, std::fabs(b[(size_t) t * n + i]));
+            for (int i = 0; i < n; ++i) {
+                const float x = a[(size_t) t * n + i], y = b[(size_t) t * n + i];
+                if (std::isfinite(x) != std::isfinite(y)) bad = true;
+                else if (std::isfinite(x) && mx > 0.0f) worst = std::max(worst, std::fabs(x - y) / mx);
+            }
+        }
+        if (bad || worst > 1e-5f) ++ixc_bad;
+        uint32_t cur = ixc_worst.load();
+        while (worst > __builtin_bit_cast(float, cur) && !ixc_worst.compare_exchange_weak(cur, __builtin_bit_cast(uint32_t, worst))) {}
+        const long long nc = ++ixc_calls;
+        if (nc % 256 == 0 || bad)
+            std::fprintf(stderr, "index check: %lld calls, %lld off (layer %d, n %d), worst %.2e of a row's largest\n", nc,
+                         ixc_bad.load(), il, n, __builtin_bit_cast(float, ixc_worst.load()));
+    }
 
     uint16_t* embed_pinned = nullptr;
     std::vector<float> freqs_win, freqs_comp;
@@ -1067,6 +1138,18 @@ struct Model::Impl {
     // for, so no mailbox seq and no wait - each wait is a round trip through the host (on Windows HIP, ~1 ms a
     // layer).  DS4_HOST_FREE=0: every layer through the host as before (the same tokens either way)
     bool host_free_on = std::getenv("DS4_HOST_FREE") == nullptr || std::atoi(std::getenv("DS4_HOST_FREE")) != 0;
+    // a window's hc_mix + hc_split on the device's second stream (st2) beside the attention and the MoE - CUDA's: a
+    // layer on one GPU each verify round 66.6 vs 68.8 ms on its stream (every layer on one GPU, 9 GPUs, 3.5 bits, the same
+    // tokens), a group's beside its all-reduces.  HIP keeps them on the layer's stream: its two cross-stream waits a layer
+    // may each cost a round trip through the host on Windows (~1 ms a layer: DS4_HOST_FREE's note).  DS4_HC_STREAM=0 /
+    // 1: never / always
+#if defined(STRATA_USE_HIP)
+    static constexpr bool kHcStream = false;
+#else
+    static constexpr bool kHcStream = true;
+#endif
+    int hc_stream = std::getenv("DS4_HC_STREAM") ? std::atoi(std::getenv("DS4_HC_STREAM")) : -1;
+    bool hc_side() const { return hc_stream < 0 ? kHcStream : hc_stream != 0; }
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -1085,12 +1168,13 @@ struct Model::Impl {
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     std::vector<std::pair<const void*, size_t>> pf_q;
-    // the expert cache: swaps prepared on threads of their own (DS4_CACHE_THREADS, 1 by default - 4 measured no faster
-    // on one V100 - more for a PC to try: each its staging buffers and
-    // copy streams), switched between windows
+    // the expert cache: swaps prepared on threads of their own (DS4_CACHE_THREADS: 1 on one GPU - 4 measured no
+    // faster on one V100 - and 4 on several, a group's members' copies each: each its staging buffers and copy
+    // streams), switched between windows
     struct Swap {
         int layer = 0, in = -1, out = -1;
         int ram = -1;   // (copy_mode, `in` held in RAM) the spare slot `out` is copied into from VRAM
+        unsigned win = 0;   // (win_now at the tick that queued it)
     };
     static constexpr int kMaxSwaps = 8;
     // the swap rule: a CPU-lane expert in when its heat passes the coldest VRAM one's x margin + bonus; heat x decay
@@ -1281,6 +1365,51 @@ struct Model::Impl {
     std::vector<std::array<uint8_t*, 2>> ram_part;   // slot -> its parts
     std::vector<std::array<size_t, 4>> cp_lay;       // layer -> part offsets of gate, up, down rows; a part's bytes
     std::vector<int> copy_spare;                      // layer -> its spare slot (-1: none)
+    // the recent slots: DS4_RECENT a trunk layer (0: none; 32 where the prompts stream the experts by DMA - the serve
+    // protocol at 3.5 bits, 8 / 16 / 24 / 32 of them: 59.0 / 61.5 / 62.2 / 62.9 tok/s, a routing trace's VRAM-neutral
+    // optimum ~32), at most DS4_RECENT_FILLS (2) new ones a layer a tick
+    int recent_n = 0;
+    const int recent_fills = std::max(1, (int) env_f("DS4_RECENT_FILLS", 2.0f));
+    // a fill once the expert was on the CPU lane DS4_RECENT_NEED (2) times in the layer's last DS4_RECENT_WIN (8)
+    // ticks: a one-off pick stays out (a routing trace of 12 answers, 16 slots: 8.9% of picks on the CPU lane for
+    // 0.29 fills a layer and tick, against 7.7% for 0.95 filling every one)
+    const int recent_need = std::max(1, (int) env_f("DS4_RECENT_NEED", 2.0f));
+    const int recent_win = std::max(1, (int) env_f("DS4_RECENT_WIN", 8.0f));
+    std::vector<cudaStream_t> rc_cs;            // a device's copy stream for the fills
+    std::vector<cudaEvent_t> rc_go;             // (the fills after the main stream's work so far)
+    // the fills off the windows' way: a thread of their own issues each fill's copies (on rc_cs, after rc_go) and
+    // marks it done (rc_done[layer's rc_off + slot] = the fill's gen) once its copies are; a tick's table entries go
+    // in one launch a device (tab_set, from rc_upd: pinned, [2 x kRcUpd])
+    struct RcJob {
+        int layer = 0, slot = 0, expert = 0;
+        unsigned gen = 0, win = 0;
+    };
+    // the expert cache's copies on a device (the swaps', the fills') off its group's turn in the windows: over the
+    // GPU's PCIe link beside a window's all-reduces they slowed each ~6x (a decode capture's 1405 all-reduces: ~190 us
+    // after the last member's arrival with a copy under way on a member, ~29 without).  A device's turn over: its
+    // last layer of a window (idle_ev, idle_win the window).  The head's group is idle from the tick on (the next
+    // window starts with the first group), so its copies go at once; another group's once its part of a window after
+    // the tick is done.  DS4_COPY_IDLE=0: every copy at once
+    std::vector<cudaEvent_t> idle_ev;
+    std::unique_ptr<std::atomic<unsigned>[]> idle_win;
+    bool copy_open(int di, unsigned w) const {
+        if (idle_ev.empty() || devs[(size_t) di].grp == devs[(size_t) head_dev].grp) return true;
+        const unsigned iw = idle_win[(size_t) di].load(std::memory_order_acquire);
+        return (int) (iw - w) > 0 && (int) (iw - win_now.load(std::memory_order_acquire)) >= 0;
+    }
+    void copy_after_idle(int di, cudaStream_t cs) {   // (di's device current)
+        if (!idle_ev.empty()) cudaStreamWaitEvent(cs, idle_ev[(size_t) di], 0);
+    }
+    static constexpr int kRcUpd = 8192;
+    std::mutex rc_mu;
+    std::condition_variable rc_cv;
+    std::deque<RcJob> rc_q;
+    std::thread rc_th;
+    std::unique_ptr<std::atomic<unsigned>[]> rc_done;
+    std::vector<unsigned long long*> rc_upd;
+    std::atomic<unsigned> rc_clock{1};
+    int64_t rc_fills_done = 0, rc_fills_started = 0, rc_ticks = 0;
+    double rc_tick_ms = 0;
     std::mutex sw_mu;
     std::condition_variable sw_cv;
     std::deque<Swap> sw_queue;
@@ -1502,6 +1631,11 @@ struct Model::Impl {
             if (m.dev < 0 || (size_t) m.dev >= prof_pool.size()) continue;
             if (cudaSetDevice(m.dev) == cudaSuccess) (void) cudaEventDestroy(m.ev);
         }
+        {
+            std::lock_guard<std::mutex> lk(rc_mu);
+        }
+        rc_cv.notify_all();
+        if (rc_th.joinable()) rc_th.join();
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
@@ -1836,7 +1970,7 @@ struct Model::Impl {
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.gg_type[r] is role r's ggml
     // type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 21, 22, 23})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 19, 21, 22, 23, 29})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }
@@ -2140,7 +2274,11 @@ struct Model::Impl {
         o = opt;
         const double t0 = now_ms();
         if (!pk.load(o.pack, err)) return false;
-        lt::set_store((o.pack + "/lt-picks.txt").c_str());   // (AMD: the prompt GEMMs' measured kernels)
+        // (AMD: the prompt GEMMs' measured kernels) the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's file - empty: none,
+        // each start measures its own and keeps them to itself (a pack that must not change: a run's own store instead)
+        const char* lt_store = std::getenv("STRATA_DS4_LT_STORE");
+        if (lt_store == nullptr) lt_store = std::getenv("DS4_LT_STORE");
+        lt::set_store(lt_store != nullptr ? lt_store : (o.pack + "/lt-picks.txt").c_str());
         g.from(pk);
         if (g.dim == 0 || g.nl == 0 || (int) g.ratios.size() < g.nl) {
             err = o.pack + "/ds4.txt: incomplete geometry";
@@ -2171,11 +2309,22 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
+            CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+            CK(cudaEventCreateWithFlags(&d.hc_go, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&d.hc_done, cudaEventDisableTiming));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
                 err = "exl3 scratch on CUDA" + std::to_string(d.id);
                 return false;
             }
             CK(mem_info(&d.free0, &d.total));
+        }
+        // (MAYA_DS4_Q8_BATCH: its line now, at load; MAYA_DS4_Q8_CHECK=1: the batched rounding checked on every device first)
+        if (pk.gguf) {
+            gg::q8_batch();
+            if (std::getenv("STRATA_DS4_Q8_CHECK") != nullptr || std::getenv("DS4_Q8_CHECK") != nullptr) {
+                for (int id : ids)
+                    if (!gg::q8_batch_check(id, err)) return false;
+            }
         }
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -2201,9 +2350,10 @@ struct Model::Impl {
         // - or, tp the number of GPUs, one group of all of them whatever their kind (its tightest member sets the
         // experts' room); threads mode for the windows (decode) where a group is 2 wide or more or --threads on, the
         // prompt path (its own thread a GPU) as asked for - also where the experts' blocks took the groups' width down
-        // to 1 (a 256-value type's: Maya's quants), which left every prompt in windows of 16
+        // to 1 (a 256-value type's: Maya's quants), which left every prompt in windows of 16 - and at --tp 1, each GPU
+        // its own layers (--prefill-chunk 0: windows of 16)
         par = o.threads || tp > 1;
-        prompt_par = par || o.tp > 1;
+        prompt_par = true;
         const bool tp_all = tp > 1 && tp == (int) devs.size();
         for (size_t i = 0; i < devs.size();) {
             Group G;
@@ -2247,11 +2397,16 @@ struct Model::Impl {
                         o.vram_experts;
             file_experts = exp_b - std::max(0.0, room - other_b) + (double) kRamMargin > (double) ram_avail();
         }
-        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : 2048) : 0;
+        // (4096 in RAM on several GPUs: at --tp 9 a 16K prompt 896 -> 1336 tok/s and a 64K one 1132 -> 1651, its
+        // buffers ~240 experts a GPU out of VRAM - decode 54.4 -> 52.3 tok/s at 3.5 bits; 8192 leaves the CPU lane more
+        // than the RAM)
+        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : file_experts ? kVlRows : devs.size() > 1 ? 4096 : 2048)
+                           : 0;
         const char* dc = std::getenv("DS4_CHUNK");   // (tests: down to 16, a short prompt in several chunks)
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         else if (chunk > 0 && o.prefill_chunk < 0) chunk = chunk_default(chunk);
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
+        recent_n = std::max(0, (int) env_f("DS4_RECENT", chunk > 0 && !file_experts ? 32.0f : 0.0f));
         if (chunk > 0) {
             chunk = std::min(kMaxChunk, std::max(dc != nullptr ? 16 : 256, chunk / 16 * 16));
             eg_cap = (size_t) chunk;
@@ -2530,6 +2685,9 @@ struct Model::Impl {
                       dalloc(d, d.cgr, W * g.hd, err) && dalloc(d, d.latent, W * g.hd, err) &&
                       dalloc(d, d.ikr, W * g.ix_hd, err) && dalloc(d, d.iq, W * g.ix_heads * g.ix_hd, err) &&
                       dalloc(d, d.iw, W * 64, err) && dalloc(d, d.scores, W * cap, err) &&
+                      dalloc(d, d.tks.val, kTksRows * tks_p() * g.ix_topk, err) &&
+                      dalloc(d, d.tks.idx, kTksRows * tks_p() * g.ix_topk, err) &&
+                      dalloc(d, d.tks.cnt, kTksRows * tks_p(), err) && dalloc(d, d.tks.kth, kTksRows * tks_p(), err) &&
                       dalloc(d, d.bm, W * bm_stride(), err) && dalloc(d, d.o, W * g.heads * g.hd, err) &&
                       dalloc(d, d.oa, W * g.o_groups * g.o_lora, err) && dalloc(d, d.ao, W * D, err) &&
                       dalloc(d, d.mix, W * 32, err) && dalloc(d, d.a_pre, W * 8, err) && dalloc(d, d.a_post, W * 8, err) &&
@@ -2550,6 +2708,7 @@ struct Model::Impl {
             d.attn_scr.max_t = kAttnScratchT;
             d.attn_scr.cap = (int) topk_stride();
             if (!dalloc(d, d.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
+            d.tks.T = (int) kTksRows, d.tks.P = (int) tks_p(), d.tks.K = g.ix_topk;
             if (!g.eg_layers.empty()) {
                 const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
                 ok = dalloc(d, d.eg_rows, W * cols * (pk.eg_hd + pk.eg_hd / 32), err) &&
@@ -2621,6 +2780,17 @@ struct Model::Impl {
                 (!hmap(G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err) ||
                  !hmap(G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err)))
                 return false;
+            // 5 members or more: a chunk's sums by the host (DS4_AR_HOST: the members from which, 0 off; threads
+            // DS4_AR_HOST_THREADS, 32)
+            const char* hm = std::getenv("DS4_AR_HOST");
+            const int host_from = hm != nullptr ? std::atoi(hm) : 5;
+            if (chunk > 0 && host_from > 0 && G.arb.nm >= host_from && G.arb.nm <= 16 && G.arb.sums != nullptr) {
+                const char* ht = std::getenv("DS4_AR_HOST_THREADS");
+                std::vector<int> ids;
+                for (int m : G.mem) ids.push_back(devs[(size_t) m].id);
+                G.hred = std::make_shared<HostReducer>(G.arb, ids, G.arb.stride, ht != nullptr ? std::max(1, std::atoi(ht)) : 32);
+                if (!G.hred->ok()) G.hred.reset();   // (the sums by the copy engines then)
+            }
         }
         if (g.n_mtp > 0) {
             if (!halloc(h_taps, (size_t) tap_cap * g.d_targets.size() * g.dim, err)) return false;
@@ -2707,8 +2877,14 @@ struct Model::Impl {
             // the Engram rows' reader: threads enough to keep an SSD's queue busy (reads from the page cache need few);
             // the row cache a small share of the RAM free (DS4_ENGRAM_CACHE_MB: its size, 0 off; DS4_ENGRAM_THREADS)
             const size_t row = (size_t) pk.eg_hd + pk.eg_hd / 32;
+#if defined(_WIN32)
+            // (Windows: each thread's ReadFile is synchronous, so the threads are the queue depth - a 28K-token prompt
+            //  in one chunk, 1.36M rows before layer 1: 10 threads 17.1 s, 32 14.1 s, 64 13.4 s on a 20-core PC)
+            int nth = 64;
+#else
             const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
             int nth = (int) std::min(16u, std::max(4u, hw / 2));
+#endif
             if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
             const uint64_t avail = ram_avail();
             uint64_t mb = avail == ~uint64_t{0} ? 64 : std::min<uint64_t>(256, std::max<uint64_t>(16, (avail >> 20) / 64));
@@ -2716,6 +2892,27 @@ struct Model::Impl {
             eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);
+            // Windows: the Engram tables' files that hold nothing else are unmapped and read unbuffered - an SSD's
+            // queue kept by the reader threads instead of the page cache's (whose reads of one file from many threads
+            // went ~255K rows a second here); unbuffered reads of a mapped file take a slow path, so only unmapped
+            // ones (DS4_EG_DIRECT=0: buffered, mapped, as before)
+            std::vector<char> eg_direct(pk.files.size(), 0);
+#if defined(_WIN32)
+            if (pk.gguf && (std::getenv("DS4_EG_DIRECT") == nullptr || std::atoi(std::getenv("DS4_EG_DIRECT")) != 0)) {
+                std::vector<char> eg_file(pk.files.size(), 0), other(pk.files.size(), 0);
+                for (const auto& kt : pk.t)
+                    if (kt.second.file >= 0 && (size_t) kt.second.file < pk.files.size())
+                        (kt.first.find(".engram.embed.") != std::string::npos ? eg_file : other)[(size_t) kt.second.file] = 1;
+                for (size_t i = 0; i < pk.files.size(); ++i)
+                    if (eg_file[i] && !other[i] && i < pk.maps.size() && pk.maps[i].first != nullptr) {
+                        os::unmap(pk.maps[i].first, pk.maps[i].second);
+                        pk.maps[i] = {nullptr, 0};
+                        eg_direct[i] = 1;
+                        if (o.verbose) std::fprintf(stderr, "ds4: %s unmapped, its Engram rows read unbuffered\n",
+                                                    pk.files[i].c_str());
+                    }
+            }
+#endif
             if (const char* mode = std::getenv("DS4_ENGRAM_RAM"); mode && std::atoi(mode) != 0) {
                 uint64_t total = 0;
                 for (int li = 0; li < pk.eg_layers; ++li) {
@@ -2736,7 +2933,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/FP8), %.3f GB locked; reads use memcpy\n",
                              pk.eg_layers, (double) total / 1e9);
             }
-            eg_io.start(paths, nth);
+            eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
@@ -2925,10 +3122,20 @@ struct Model::Impl {
             });
             if (ahead_mode > 0) pf_th = std::thread([this] { prefetch_loop(); });
         }
+        if (par && (!std::getenv("DS4_COPY_IDLE") || std::atoi(std::getenv("DS4_COPY_IDLE")) != 0)) {
+            idle_ev.assign(devs.size(), nullptr);
+            idle_win.reset(new std::atomic<unsigned>[devs.size()]);
+            for (size_t di = 0; di < devs.size(); ++di) {
+                cudaSetDevice(devs[di].id);
+                CK(cudaEventCreateWithFlags(&idle_ev[di], cudaEventDisableTiming));
+                idle_win[di].store(0u);
+            }
+        }
         if (o.expert_cache) {
             size_t maxb = 0;
             for (const Layer& l : L) maxb = std::max(maxb, l.blob);
-            const int nt = std::max(1, std::min(c_inflight, std::getenv("DS4_CACHE_THREADS") ? std::atoi(std::getenv("DS4_CACHE_THREADS")) : 1));
+            const int nt = std::max(1, std::min(c_inflight, std::getenv("DS4_CACHE_THREADS") ? std::atoi(std::getenv("DS4_CACHE_THREADS"))
+                                                                                            : devs.size() > 1 ? 4 : 1));
             sw_bufs.resize((size_t) nt);
             for (SwapBufs& B : sw_bufs) {
                 if (!halloc(B.a, maxb, err) || !halloc(B.b, maxb, err) || !halloc(B.h, maxb, err)) return false;
@@ -3000,7 +3207,7 @@ struct Model::Impl {
             put(c.a_comb, Z * 64), put(c.f_pre, Z * 8), put(c.f_post, Z * 8), put(c.f_comb, Z * 64), put(c.pre, Z * 8);
             put(c.glog, Z * 1024), put(c.ridx, Z * kPicks), put(c.rw, Z * kPicks), put(c.row_tok, Z * kPicks);
             put(c.pos, Z * kPicks), put(c.sg, Z * FF), put(c.su, Z * FF), put(c.sh16, Z * FF), put(c.h16, Z * FF);
-            put(c.y, Z * D);
+            put(c.y, Z * D + 32);   // (+32: allreduce_dma's FP16 pieces in it)
             if (c.has_first) put(c.emb, Z * D);
             if (c.has_eg) put(c.eg_rows, Z * cols * (ehd + ehd / 32));
         }
@@ -3090,6 +3297,7 @@ struct Model::Impl {
         for (size_t di = 0; di < devs.size(); ++di) {
             Dev& d = devs[di];
             cudaSetDevice(d.id);
+            const size_t s0 = d.scratch;   // (this device's chunk buffers: d.prompt, not d.scratch)
             chunks[di] = std::make_unique<Chunk>();
             Chunk& c = *chunks[di];
             chunk_dims(c, (int) groups[(size_t) d.grp].mem.size(), d.free0);
@@ -3141,6 +3349,15 @@ struct Model::Impl {
                 CK(cudaEventCreateWithFlags(&c.eg_ev[sl], cudaEventDisableTiming));
             }
             if (hands && !hmap(c.hand_ack, (size_t) 2 * 8 * 32, err)) return false;
+            CK(cudaStreamCreateWithFlags(&c.ar_aux.s2, cudaStreamNonBlocking));
+            for (cudaEvent_t& e : c.ar_aux.ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            CK(cudaStreamCreateWithFlags(&c.ar_s, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithFlags(&c.ar_aux2.s2, cudaStreamNonBlocking));
+            for (cudaEvent_t& e : c.ar_aux2.ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&c.ar_go, cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&c.ar_done, cudaEventDisableTiming));
+            d.prompt += d.scratch - s0;
+            d.scratch = s0;
         }
         return true;
     }
@@ -3307,6 +3524,17 @@ struct Model::Impl {
         std::vector<Batch> b;
         size_t cp = 0, kp = 0;        // the next batch to copy, to compute
         std::atomic<size_t> done{0};  // cp, for read_ahead's thread
+        const bool collect_prefill = std::getenv("DS4_PREFILL_STATS") != nullptr &&
+                                     std::atoi(std::getenv("DS4_PREFILL_STATS")) != 0;
+        PrefillCounts prefill;
+        void report_prefill(int gpu, int tokens, int chunk, double streamed_bytes) const {
+            if (!collect_prefill) return;
+            std::fprintf(stderr, "DS4_PREFILL gpu=%d tokens=%d chunk=%d expert_row_picks=%llu vram_row_picks=%llu "
+                         "unique_expert_uses=%llu vram_unique_expert_uses=%llu streamed_weight_bytes=%llu\n",
+                         gpu, tokens, chunk, (unsigned long long) prefill.picks,
+                         (unsigned long long) prefill.vram_picks, (unsigned long long) prefill.unique_uses,
+                         (unsigned long long) prefill.vram_unique_uses, (unsigned long long) streamed_bytes);
+        }
     };
     // in place (file_experts): the batches' file regions read ahead of their copies - POSIX_FADV_WILLNEED, the kernel
     // reading them in the background in large requests, where the copies alone fault the pages in a few at a time -
@@ -3613,16 +3841,24 @@ struct Model::Impl {
                 const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;   // (a copy's slot)
                 int nj = 0;
                 for (int r = 0; r < 3; ++r) {
-                    if (cs >= 0) {   // a copy: each matrix's NH parts of rows, side by side into staging
-                        const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                    if (cs >= 0) {   // a copy: the rows the member reads (as from the file: mx_read_off / _len - a
+                        // group's member its gate / up rows [ff0, ff0 + ffn), the down whole), from the NH parts that
+                        // hold them, side by side into staging
+                        const size_t rb = mx_row_b(l, r);
+                        const int per = mx_n(r) / NH;
+                        const int lo0 = (int) (mx_read_off(l, it.mi, r) / rb);
+                        const int hi0 = lo0 + (int) (mx_read_len(l, r) / rb);
                         for (int X = 0; X < NH; ++X) {
+                            const int lo = std::max(X * per, lo0), hi = std::min((X + 1) * per, hi0);
+                            if (lo >= hi) continue;
                             IoQueue::Job& j = jobs[nj++];
                             j = IoQueue::Job{};
-                            j.len = nb;
-                            j.dst = sb + (size_t) X * nb;
+                            j.len = (size_t) (hi - lo) * rb;
+                            j.dst = sb + (size_t) (lo - lo0) * rb;
                             j.left = &it.left;
                             j.bad = &it.bad;
-                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
+                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r] +
+                                    (size_t) (lo - X * per) * rb;
                         }
                         sb += flow_region(r);
                         continue;
@@ -3641,6 +3877,7 @@ struct Model::Impl {
                     j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
                     sb += flow_region(r);
                 }
+                if (cs >= 0) it.left.store(nj, std::memory_order_relaxed);   // (a member's rows: maybe fewer parts)
                 c.io->push(jobs, nj);
             }
             ++c.n_read;
@@ -3822,10 +4059,13 @@ struct Model::Impl {
             const int nm = l0.nm, na = g.heads / std::max(1, l.ahn), ha = l.ah0 / std::max(1, l.ahn);
             const std::string& P = l.name;
             const std::string A = P + "attn.";
+            // (the member's shares in sp; what d.weights gains besides them every member holds whole: tp_w)
+            const size_t w0 = d.weights;
+            size_t sp = 0;
             bool ok = mat(d, A + "wq_a", l.wq_a, err, acct) &&
-                      (l.ahn == 0 || mat(d, A + "wq_b", l.wq_b, err, acct, ha, na, true)) &&
+                      (l.ahn == 0 || mat(d, A + "wq_b", l.wq_b, err, &sp, ha, na, true)) &&
                       mat(d, A + "wkv", l.wkv, err, acct) &&
-                      (l.ahn == 0 || mat(d, A + "wo_b", l.wo_b, err, acct, ha, na, false)) &&
+                      (l.ahn == 0 || mat(d, A + "wo_b", l.wo_b, err, &sp, ha, na, false)) &&
                       f32(d, A + "q_norm.weight", l.q_norm, err, acct, (size_t) g.q_lora) &&
                       f32(d, A + "kv_norm.weight", l.kv_norm, err, acct, (size_t) g.hd) &&
                       f32(d, A + "attn_sink", l.sink, err, acct, (size_t) g.heads) &&
@@ -3839,13 +4079,13 @@ struct Model::Impl {
                       f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
-                      mat(d, P + "ffn.shared_experts.w1", l.s1, err, acct, mi, nm, true, l.il % nm) &&
-                      mat(d, P + "ffn.shared_experts.w2", l.s2, err, acct, mi, nm, false, l.il % nm) &&
-                      mat(d, P + "ffn.shared_experts.w3", l.s3, err, acct, mi, nm, true, l.il % nm);
+                      mat(d, P + "ffn.shared_experts.w1", l.s1, err, &sp, mi, nm, true, l.il % nm) &&
+                      mat(d, P + "ffn.shared_experts.w2", l.s2, err, &sp, mi, nm, false, l.il % nm) &&
+                      mat(d, P + "ffn.shared_experts.w3", l.s3, err, &sp, mi, nm, true, l.il % nm);
             if (!ok) return false;
             l.sink += (size_t) l.ah0;
             for (int gi = 0; gi < l.ogn; ++gi)
-                if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, acct)) return false;
+                if (!mat(d, A + "wo_a.slice." + std::to_string(l.og0 + gi), l.wo_a[gi], err, &sp)) return false;
             if (l.kv_src) {
                 const std::string C = A + "compressor.";
                 if (!mat(d, C + "wkv", l.c_wkv, err, acct) || !f32(d, C + "norm.weight", l.c_norm, err, acct)) return false;
@@ -3885,6 +4125,8 @@ struct Model::Impl {
                     return false;
             }
             if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
+            if (nm > 1) d.tp_w += (d.weights - w0) / (size_t) nm * (size_t) (nm - 1);
+            d.weights += sp;
           }
         if (d.grp == devs[(size_t) head_dev].grp) {   // the head: each member of its group a share of the columns
             const int hn = head_nm();
@@ -4076,65 +4318,150 @@ struct Model::Impl {
             return s / l.nm;
         };
         for (size_t gi = 0; gi < groups.size(); ++gi) {
-            double budget = 1e300;
+            std::vector<double> mroom;   // each member's
             bool charged = false;
             for (int m : groups[gi].mem) {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(mem_info(&fr, &tot));
-                budget = std::min(budget, std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) *
-                                              o.vram_experts);
+                mroom.push_back(std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) * o.vram_experts);
                 charged = charged || commit_charged(devs[(size_t) m]);
             }
             if (charged && room < 1e300) {   // (each member's slots charged: the group's share of the room)
+                const double budget = *std::min_element(mroom.begin(), mroom.end());
                 double all = 0;
                 for (const Layer& l : L)
                     if (l.grp == (int) gi) all += (double) unit(l) * l.n_exp;
                 const double nm = (double) groups[gi].mem.size(), capped = std::min(budget, room / nm);
                 kept += std::max(0.0, std::min(budget, all) - std::min(capped, all)) * nm;
-                budget = capped;
-                room = std::max(0.0, room - std::min(budget, all) * nm);
+                for (double& r : mroom) r = std::min(r, capped);
+                room = std::max(0.0, room - std::min(capped, all) * nm);
             }
-            // a mixed-precision layer's experts first, every one of them (its kernels find each in its class's arena)
+            // a mixed-precision layer's experts first, every one of them (its kernels find each in its class's arena;
+            // such a quant runs on one GPU, so the group's one member)
             for (Layer& l : L)
                 if (l.grp == (int) gi && l.n_cls > 1) {
                     double b = 0;
                     for (int e = 0; e < l.n_exp; ++e) b += (double) align256(l.cblob[l.cls[(size_t) e]]);
-                    if (b > budget) {
+                    if (b > mroom[0]) {
                         err = "layer " + std::to_string(l.il) + "'s experts (" + std::to_string(b / 1e9) +
-                              " GB) do not fit the GPU's room left (" + std::to_string(budget / 1e9) +
+                              " GB) do not fit the GPU's room left (" + std::to_string(mroom[0] / 1e9) +
                               " GB): a mixed-precision quant keeps every expert in VRAM";
                         return false;
                     }
-                    budget -= b;
+                    mroom[0] -= b;
                     l.n_vram = l.n_exp;
                 }
-            double budget_t = budget;   // the drafter's experts first, all of them (every draft uses its blocks)
-            for (Layer& l : L)
-                if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
-                    l.n_vram = std::min(l.n_exp, (int) std::floor(budget_t / (double) ucount(l)));
-                    budget_t -= (double) l.n_vram * ucount(l);
-                }
-            double want = 0;
+            // the drafter's experts first (every draft uses its blocks) - its blocks are the lead's alone, so they take
+            // the lead's room; the trunk's layers then what the tightest member has left
+            double others = -1;   // the room of the group's tightest member but the lead (-1: the lead is alone)
+            for (size_t m = 1; m < mroom.size(); ++m) others = others < 0 ? mroom[m] : std::min(others, mroom[m]);
+            bool dseen = false;
             for (const Layer& l : L)
-                if (l.grp == (int) gi && !l.mtp && l.n_cls == 1) want += (double) ucount(l) * l.n_exp;
-            const double frac = want > 0 ? std::min(1.0, std::max(0.0, budget_t) / want) : 0.0;
-            for (Layer& l : L) {
-                if (l.grp != (int) gi || l.mtp || l.n_cls > 1) continue;
-                l.n_vram = std::min(l.n_exp, (int) std::floor(frac * l.n_exp));
-                // never more than fits: the floor of each layer's share can still round up the total
-                while (l.n_vram > 0 && (double) ucount(l) * l.n_vram > budget) --l.n_vram;
-            }
-            double used = 0;
-            for (Layer& l : L)
-                if (l.grp == (int) gi && l.n_cls == 1) used += (double) ucount(l) * l.n_vram;
-            // what the floors left: whole experts, layer by layer
-            for (Layer& l : L) {
-                if (l.grp != (int) gi || l.n_cls > 1) continue;
-                while (l.n_vram < l.n_exp && used + (double) ucount(l) <= budget) {
-                    ++l.n_vram;
-                    used += (double) ucount(l);
+                if (l.grp == (int) gi && l.mtp && l.n_cls == 1)
+                    for (int e = 0; e < l.n_exp; ++e) dseen = dseen || prof[(size_t) l.il * g.n_exp + e] > 0;
+            if (others < 0 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {   // all of them, as room goes
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
+                        l.n_vram = std::min(l.n_exp, (int) std::floor(mroom[0] / (double) ucount(l)));
+                        mroom[0] -= (double) l.n_vram * ucount(l);
+                    }
+            } else {
+                // by the profile: each block's experts that take 99% of its routes always, the others only while the
+                // lead keeps the room of the next tightest member (past it, each drafter expert's bytes on the lead
+                // are as many trunk experts lost on every member: a trunk expert in VRAM takes its part on each)
+                std::vector<std::vector<double>> sh(L.size());
+                using Top = std::pair<double, int>;   // (the next expert's share a byte, layer)
+                std::priority_queue<Top> pq;
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || !l.mtp || l.n_cls > 1) continue;
+                    const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                    double sum = 0;
+                    for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                    std::vector<double>& s = sh[(size_t) l.il];
+                    for (int e = 0; e < l.n_exp; ++e) s.push_back(sum > 0 ? p[e] / sum : 1.0 / l.n_exp);
+                    std::sort(s.begin(), s.end(), std::greater<double>());
+                    int keep = 0;
+                    for (double c = 0; keep < l.n_exp && c < 0.99; ++keep) c += s[(size_t) keep];
+                    l.n_vram = std::min(keep, (int) std::floor(mroom[0] / (double) ucount(l)));
+                    mroom[0] -= (double) l.n_vram * ucount(l);
+                    if (l.n_vram < l.n_exp) pq.push({s[(size_t) l.n_vram] / ucount(l), l.il});
                 }
+                while (!pq.empty()) {
+                    const int il = pq.top().second;
+                    pq.pop();
+                    Layer& l = L[(size_t) il];
+                    if (mroom[0] - ucount(l) < others) continue;
+                    mroom[0] -= ucount(l);
+                    if (++l.n_vram < l.n_exp) pq.push({sh[(size_t) il][(size_t) l.n_vram] / ucount(l), il});
+                }
+            }
+            const double budget = *std::min_element(mroom.begin(), mroom.end());
+            double want = 0, seen = 0;
+            for (const Layer& l : L)
+                if (l.grp == (int) gi && !l.mtp && l.n_cls == 1) {
+                    want += (double) ucount(l) * l.n_exp;
+                    for (int e = 0; e < l.n_exp; ++e) seen += prof[(size_t) l.il * g.n_exp + e];
+                }
+            if (seen > 0 && std::getenv("DS4_PLACE_UNIFORM") == nullptr) {
+                // by the profile: the room to the experts that take the largest share of their layer's routes a byte
+                // (every layer routes as often; one whose routes spread wider gets more of the room) - each layer's
+                // shares smoothed a tenth toward even, so a layer the profile barely saw is not left without
+                std::vector<std::vector<double>> sh(L.size());
+                using Top = std::pair<double, int>;   // (the next expert's share a byte, layer)
+                std::priority_queue<Top> pq;
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || l.mtp || l.n_cls > 1) continue;
+                    l.n_vram = 0;
+                    const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                    double sum = 0;
+                    for (int e = 0; e < l.n_exp; ++e) sum += p[e];
+                    std::vector<double>& s = sh[(size_t) l.il];
+                    for (int e = 0; e < l.n_exp; ++e)
+                        s.push_back(0.9 * (sum > 0 ? p[e] / sum : 1.0 / l.n_exp) + 0.1 / l.n_exp);
+                    std::sort(s.begin(), s.end(), std::greater<double>());
+                    pq.push({s[0] / ucount(l), l.il});
+                }
+                double used = 0;
+                while (!pq.empty()) {
+                    const int il = pq.top().second;
+                    pq.pop();
+                    Layer& l = L[(size_t) il];
+                    if (used + ucount(l) > budget) continue;   // (this layer's experts no longer fit; smaller ones may)
+                    used += ucount(l);
+                    if (++l.n_vram < l.n_exp) pq.push({sh[(size_t) il][(size_t) l.n_vram] / ucount(l), il});
+                }
+            } else {   // as even as the room goes: each layer the same share of its experts
+                const double frac = want > 0 ? std::min(1.0, budget / want) : 0.0;
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || l.mtp || l.n_cls > 1) continue;
+                    l.n_vram = std::min(l.n_exp, (int) std::floor(frac * l.n_exp));
+                    // never more than fits: the floor of each layer's share can still round up the total
+                    while (l.n_vram > 0 && (double) ucount(l) * l.n_vram > budget) --l.n_vram;
+                }
+                double used = 0;
+                for (Layer& l : L)
+                    if (l.grp == (int) gi && !l.mtp && l.n_cls == 1) used += (double) ucount(l) * l.n_vram;
+                // what the floors left: whole experts, layer by layer
+                for (Layer& l : L) {
+                    if (l.grp != (int) gi || l.mtp || l.n_cls > 1) continue;
+                    while (l.n_vram < l.n_exp && used + (double) ucount(l) <= budget) {
+                        ++l.n_vram;
+                        used += (double) ucount(l);
+                    }
+                }
+            }
+            if (o.verbose) {
+                int nv = 0, ne = 0;
+                for (const Layer& l : L)
+                    if (l.grp == (int) gi) nv += l.n_vram, ne += l.n_exp;
+                std::fprintf(stderr, "ds4: group %zu (%zu GPUs): %.2f GB a member for experts, %d of %d in VRAM\n", gi,
+                             groups[gi].mem.size(), budget / 1e9, nv, ne);
+                for (const Layer& l : L)
+                    if (l.grp == (int) gi && std::getenv("DS4_PLACE_DEBUG"))
+                        std::fprintf(stderr, "  layer %d%s: blob %.2f MB, mean unit %.2f MB, member 0 %.2f MB, %d of %d\n",
+                                     l.il, l.mtp ? " (mtp)" : "", l.blob / 1e6, ucount(l) / 1e6, unit(member(l, 0)) / 1e6,
+                                     l.n_vram, l.n_exp);
             }
         }
         if (kept > 0) {   // the commit kept experts off the GPU: say so, and the page file that keeps them on it
@@ -4262,8 +4589,11 @@ struct Model::Impl {
             // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
             l.n_slots = std::min(l.n_vram, l.n_exp);
             if (o.expert_cache && l.n_slots >= 2 && l.n_slots < l.n_exp) {   // (every expert fits: nothing to swap)
-                l.n_vram = l.n_slots - 1;
+                const int r = recent_n > 0 && !l.mtp && !file_experts && l.n_slots - 1 - recent_n >= 1 ? recent_n : 0;
+                l.n_vram = l.n_slots - 1 - r;   // (the recent slots: [n_vram, n_vram + r), from the profile's coldest)
                 l.spare_vram = l.n_slots - 1;
+                l.rc_base = l.n_vram;
+                l.rc_n = r;
             } else {
                 l.n_vram = l.n_slots;
                 l.spare_vram = -1;
@@ -4348,6 +4678,22 @@ struct Model::Impl {
                 for (int e = 0; e < l.n_exp; ++e)
                     if (l.slot[(size_t) e] >= 0) set_vm(l, e, l.slot[(size_t) e]);
             if (!halloc(l.tab_pin, (size_t) 2 * l.nm, err)) return false;
+            if (l.rc_n > 0) {
+                l.rc_exp.assign((size_t) l.rc_n, -1);
+                l.rc_fill.assign((size_t) l.rc_n, -1);
+                l.rc_gen.assign((size_t) l.rc_n, 0u);
+                l.rc_stamp.assign((size_t) l.rc_n, 0u);
+                if (!halloc(l.rc_pin, (size_t) l.rc_n * l.nm + 1, err)) return false;
+                l.rc_ev.assign((size_t) l.rc_n * l.nm, nullptr);
+                for (int i = 0; i < l.rc_n; ++i)
+                    for (int m = 0; m < l.nm; ++m) {
+                        Layer& x = member(l, m);
+                        l.rc_pin[(size_t) i * l.nm + m] = (unsigned long long) (x.vram_base + (size_t) (l.rc_base + i) * unit(x));
+                        CK(cudaSetDevice(devs[(size_t) x.dev].id));
+                        CK(cudaEventCreateWithFlags(&l.rc_ev[(size_t) i * l.nm + m], cudaEventDisableTiming));
+                    }
+                l.rc_pin[(size_t) l.rc_n * l.nm] = 0ull;
+            }
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 std::vector<unsigned long long> tab((size_t) l.n_exp, 0ull);
@@ -5375,7 +5721,24 @@ struct Model::Impl {
         int e = 0, n = 0, slot0 = 0;
         int tok[kc::kExl3CpuMaxN] = {};
     };
-    void run_nodes(int n, const std::function<void(int)>* f) {
+    void run_nodes(int n, const std::function<void(int)>* f, int ph = -1) {
+        static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
+        if (stats && ph >= 0) {   // (each job's own time, summed: the phase's work beside its wall time)
+            std::function<void(int)> g[4];
+            for (int X = 0; X < NH; ++X)
+                g[X] = [this, &f, X, ph](int j) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    f[X](j);
+                    cpu_job_ns[ph].fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now() - t0).count(),
+                                             std::memory_order_relaxed);
+                    cpu_job_n[ph].fetch_add(1, std::memory_order_relaxed);
+                };
+            for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, g[X]);
+            pools[0]->help();
+            for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
+            return;
+        }
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->start(n, f[X]);
         pools[0]->help();
         for (int X = 0; X < NH; ++X) pools[(size_t) X]->wait();
@@ -5552,9 +5915,26 @@ struct Model::Impl {
         run_nodes(ne * DB, f);
     }
 
+    // DS4_CPU_STATS: the CPU lane's calls, entries, rows and each phase's time, printed with the profile's save
+    double cpu_ph_ms[4] = {};
+    long cpu_calls = 0, cpu_ents = 0, cpu_rows = 0;
+    std::atomic<uint64_t> cpu_job_ns[4] = {}, cpu_job_n[4] = {};
     void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
                      const int* ord = nullptr) {
         if (ldx == 0) ldx = (size_t) g.dim;
+        static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
+        double tph = stats ? now_ms() : 0.0;
+        auto phase = [&](int i) {
+            if (!stats) return;
+            const double t = now_ms();
+            cpu_ph_ms[i] += t - tph;
+            tph = t;
+        };
+        if (stats) {
+            ++cpu_calls;
+            cpu_ents += (long) ents.size();
+            for (const Ent& en : ents) cpu_rows += en.n;
+        }
         if (l.lay.fmt == gg::kFmtMXFP4) return cpu_experts_mx(l, x, ents, ldx, ord);
         const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
         const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
@@ -5598,7 +5978,8 @@ struct Model::Impl {
                 if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 16, (q + 1) * 16, ap[0]);
                 else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 16, (q + 1) * 16, ap);
             };
-        run_nodes(ne * 2 * GQ, f);
+        run_nodes(ne * 2 * GQ, f, 0);
+        phase(0);
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (j / GB)];
@@ -5629,7 +6010,8 @@ struct Model::Impl {
                     xsd(sl)[gb] = kc::exl3_cpu_prepare_block(pd.suh + gb * 128, hb, xhd(sl) + gb * 128);
                 }
             };
-        run_nodes(ne * GB, f);
+        run_nodes(ne * GB, f, 1);
+        phase(1);
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (j / DQ)];
@@ -5644,7 +6026,8 @@ struct Model::Impl {
                 if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 8, (q + 1) * 8, ap[0]);
                 else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 8, (q + 1) * 8, ap);
             };
-        run_nodes(ne * DQ, f);
+        run_nodes(ne * DQ, f, 2);
+        phase(2);
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (j / DB)];
@@ -5663,7 +6046,8 @@ struct Model::Impl {
                     kc::exl3_cpu_band_out(pd, a, (float) xs, b * 128, c_yd.data() + (size_t) sl * E + (size_t) X * Eh + b * 128);
                 }
             };
-        run_nodes(ne * DB, f);
+        run_nodes(ne * DB, f, 3);
+        phase(3);
     }
 
     // ---- the expert cache.  A swap moves a CPU-lane expert (`in`) into the layer's spare VRAM slot and the VRAM expert it
@@ -5712,10 +6096,19 @@ struct Model::Impl {
                 continue;
             }
             parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
+            auto off_turn = [&](int di, cudaStream_t cs) {   // (false: quitting)
+                while (!copy_open(di, sw.win)) {
+                    if (quit.load()) return false;
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                }
+                copy_after_idle(di, cs);
+                return true;
+            };
             if (l.nm == 1) {
                 const Dev& d = devs[(size_t) l.dev];
                 cudaSetDevice(d.id);
                 cudaStream_t cs = B.st[(size_t) l.dev];
+                if (!off_turn(l.dev, cs)) return;
                 cudaMemcpyAsync(sat(l, l, l.spare_vram, l.blob), B.a, l.blob, cudaMemcpyHostToDevice, cs);
                 if (!file_experts)
                     cudaMemcpyAsync(B.b, sat(l, l, l.slot[(size_t) sw.out], l.blob), l.blob,
@@ -5727,9 +6120,11 @@ struct Model::Impl {
                     cudaSetDevice(devs[(size_t) x.dev].id);
                     cudaStream_t cs = B.st[(size_t) x.dev];
                     blob_to_half(l, B.a, m, B.h);
+                    if (!off_turn(x.dev, cs)) return;
                     cudaMemcpyAsync(sat(l, x, l.spare_vram, x.hblob), B.h, x.hblob, cudaMemcpyHostToDevice, cs);
                     cudaStreamSynchronize(cs);
                     if (file_experts) continue;
+                    if (!off_turn(x.dev, cs)) return;
                     cudaMemcpyAsync(B.h, sat(l, x, l.slot[(size_t) sw.out], x.hblob), x.hblob,
                                     cudaMemcpyDeviceToHost, cs);
                     cudaStreamSynchronize(cs);
@@ -5779,6 +6174,217 @@ struct Model::Impl {
             }
             std::lock_guard<std::mutex> lk(sw_mu);
             sw_ready.push_back(sw);
+        }
+    }
+
+    void rc_loop() {
+        std::vector<RcJob> fly;     // issued, not yet done
+        std::deque<RcJob> held;     // waiting for their group's turn to end (copy_open)
+        std::string err;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(rc_mu);
+                if (fly.empty() && held.empty()) rc_cv.wait(lk, [&] { return quit.load() || !rc_q.empty(); });
+                if (quit.load()) return;
+                for (const RcJob& j : rc_q) held.push_back(j);
+                rc_q.clear();
+            }
+            for (size_t i = 0; i < held.size();) {
+                const RcJob j = held[i];
+                Layer& l = L[(size_t) j.layer];
+                bool open = true;   // (a layer's members are one group's)
+                for (int m = 0; m < l.nm && open; ++m) open = copy_open(member(l, m).dev, j.win);
+                if (!open) {
+                    ++i;
+                    continue;
+                }
+                for (int m = 0; m < l.nm; ++m) {
+                    Layer& x = member(l, m);
+                    const int di = x.dev;
+                    cudaSetDevice(devs[(size_t) di].id);
+                    cudaStreamWaitEvent(rc_cs[(size_t) di], rc_go[(size_t) di], 0);   // (after the tick's tables)
+                    copy_after_idle(di, rc_cs[(size_t) di]);
+                    stream_expert(l, m, j.expert, x.vram_base + (size_t) (l.rc_base + j.slot) * unit(x), rc_cs[(size_t) di], err);
+                    cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
+                }
+                fly.push_back(j);
+                held.erase(held.begin() + (std::ptrdiff_t) i);
+            }
+            for (size_t i = 0; i < fly.size();) {   // the ones whose copies are all done: marked
+                const RcJob& j = fly[i];
+                Layer& l = L[(size_t) j.layer];
+                bool done = true;
+                for (int m = 0; m < l.nm && done; ++m) {
+                    cudaSetDevice(devs[(size_t) member(l, m).dev].id);
+                    done = cudaEventQuery(l.rc_ev[(size_t) j.slot * l.nm + m]) == cudaSuccess;
+                }
+                if (done) {
+                    rc_done[(size_t) (l.rc_off + j.slot)].store(j.gen, std::memory_order_release);
+                    fly[i] = fly.back();
+                    fly.pop_back();
+                } else
+                    ++i;
+            }
+            if (!fly.empty() || !held.empty()) std::this_thread::sleep_for(std::chrono::microseconds(held.empty() ? 200 : 50));
+        }
+    }
+
+    void rc_tick() {
+        if (recent_n <= 0) return;
+        const double t_tick = now_ms();
+        struct Tm {
+            Model::Impl* m;
+            double t;
+            ~Tm() {
+                m->rc_tick_ms += now_ms() - t;
+                ++m->rc_ticks;
+            }
+        } tm{this, t_tick};
+        if (rc_cs.empty()) {
+            if (!tab_bufs()) return;
+            rc_cs.assign(devs.size(), nullptr);
+            for (size_t di = 0; di < devs.size(); ++di) {
+                cudaSetDevice(devs[di].id);
+                cudaStreamCreateWithFlags(&rc_cs[di], cudaStreamNonBlocking);
+            }
+            int off = 0;
+            for (Layer& l : L) {
+                l.rc_off = off;
+                off += l.rc_n;
+            }
+            rc_done.reset(new std::atomic<unsigned>[(size_t) std::max(1, off)]);
+            for (int i = 0; i < off; ++i) rc_done[(size_t) i].store(0u);
+            rc_th = std::thread([this] { rc_loop(); });
+        }
+        const unsigned now = rc_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::vector<std::vector<unsigned long long>>& upd = tick_upd;
+        std::vector<RcJob>& jobs = tick_jobs;
+        for (Layer& l : L) {
+            if (l.rc_n == 0) continue;
+            const int nm = l.nm;
+            auto set_tab = [&](int e, int i) {   // (i < 0: out of VRAM)
+                for (int m = 0; m < nm; ++m) {
+                    Layer& x = member(l, m);
+                    upd[(size_t) x.dev].push_back((unsigned long long) (x.vram_tab + e));
+                    upd[(size_t) x.dev].push_back(i < 0 ? 0ull : l.rc_pin[(size_t) i * nm + m]);
+                }
+            };
+            for (int i = 0; i < l.rc_n; ++i) {   // the fills done: mapped (unless a swap took the expert in meanwhile)
+                const int e = l.rc_fill[(size_t) i];
+                if (e < 0 || rc_done[(size_t) (l.rc_off + i)].load(std::memory_order_acquire) != l.rc_gen[(size_t) i]) continue;
+                l.rc_fill[(size_t) i] = -1;
+                if (l.slot[(size_t) e] >= 0) continue;
+                l.slot[(size_t) e] = l.rc_base + i;
+                l.rc_exp[(size_t) i] = e;
+                l.rc_stamp[(size_t) i] = now;
+                if (nm == 1) set_vm(l, e, l.rc_base + i);
+                set_tab(e, i);
+                ++rc_fills_done;
+                if (check_swaps) {   // DS4_CHECK_SWAPS: the slot against the model file, byte for byte
+                    std::vector<uint8_t> reg(l.region_bytes[(size_t) e]), want(l.blob), dev(l.blob);
+                    pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], reg.size(), reg.data());
+                    repack(l, e, reg.data(), want.data());
+                    if (nm == 1) {
+                        cudaSetDevice(devs[(size_t) l.dev].id);
+                        cudaMemcpy(dev.data(), l.vram_base + (size_t) (l.rc_base + i) * l.blob, l.blob, cudaMemcpyDeviceToHost);
+                    } else
+                        for (int m = 0; m < nm; ++m) {
+                            std::vector<uint8_t> h(member(l, m).hblob);
+                            cudaSetDevice(devs[(size_t) member(l, m).dev].id);
+                            cudaMemcpy(h.data(), member(l, m).vram_base + (size_t) (l.rc_base + i) * member(l, m).hblob,
+                                       member(l, m).hblob, cudaMemcpyDeviceToHost);
+                            half_to_blob(l, h.data(), m, dev.data());
+                        }
+                    bool ok = true;
+                    for (int r = 0; r < 3; ++r)
+                        ok = ok && std::memcmp(dev.data() + l.lay.trellis[r], want.data() + l.lay.trellis[r], l.piece_bytes[r][0]) == 0 &&
+                             std::memcmp(dev.data() + l.lay.suh[r], want.data() + l.lay.suh[r], l.piece_bytes[r][1]) == 0 &&
+                             std::memcmp(dev.data() + l.lay.svh[r], want.data() + l.lay.svh[r], l.piece_bytes[r][2]) == 0;
+                    std::fprintf(stderr, "ds4 recent: layer %d expert %d in slot %d: %s\n", l.il, e, l.rc_base + i,
+                                 ok ? "matches the model file" : "MISMATCH");
+                }
+            }
+            {   // this tick's CPU-lane experts into the history
+                std::vector<int> cur(l.cpu_hits.begin(), l.cpu_hits.end());
+                std::sort(cur.begin(), cur.end());
+                cur.erase(std::unique(cur.begin(), cur.end()), cur.end());
+                l.rc_hist.push_back(std::move(cur));
+                while ((int) l.rc_hist.size() > recent_win) l.rc_hist.pop_front();
+            }
+            int started = 0;
+            for (size_t h = l.cpu_hits.size(); h-- > 0 && started < recent_fills;) {   // (the latest first)
+                const int e = l.cpu_hits[h];
+                if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0 || e == l.sw_in) continue;
+                int uses = 0;
+                for (const std::vector<int>& hv : l.rc_hist) uses += std::binary_search(hv.begin(), hv.end(), e) ? 1 : 0;
+                if (uses < recent_need) continue;
+                bool filling = false;
+                for (int i = 0; i < l.rc_n; ++i) filling = filling || l.rc_fill[(size_t) i] == e;
+                if (filling) continue;
+                int v = -1;   // an empty slot, else the least recently used one not filling
+                for (int i = 0; i < l.rc_n && v < 0; ++i)
+                    if (l.rc_fill[(size_t) i] < 0 && l.rc_exp[(size_t) i] < 0) v = i;
+                if (v < 0)
+                    for (int i = 0; i < l.rc_n; ++i)
+                        if (l.rc_fill[(size_t) i] < 0 && (v < 0 || l.rc_stamp[(size_t) i] < l.rc_stamp[(size_t) v])) v = i;
+                if (v < 0) break;
+                if (l.rc_exp[(size_t) v] >= 0) {   // (out: its table entry, before the next window)
+                    const int old = l.rc_exp[(size_t) v];
+                    l.slot[(size_t) old] = -1;
+                    set_tab(old, -1);
+                    l.rc_exp[(size_t) v] = -1;
+                }
+                l.rc_fill[(size_t) v] = e;
+                l.rc_gen[(size_t) v] = now;
+                jobs.push_back({l.il, v, e, now, win_now.load(std::memory_order_relaxed)});
+                ++started;
+                ++rc_fills_started;
+            }
+        }
+    }
+
+    // a tick's table entries (the recent slots', the swaps'): one launch a device, before the next window; then rc_go
+    // there (the fills after it).  (A copy of each entry on its own was ~10 us of the host's, 48 of them 0.5 ms between
+    // two windows)
+    std::vector<std::vector<unsigned long long>> tick_upd;   // [device]: (entry, value) pairs
+    std::vector<RcJob> tick_jobs;
+    bool tab_bufs() {
+        if (!rc_upd.empty()) return true;
+        std::string e0;
+        rc_go.assign(devs.size(), nullptr);
+        rc_upd.assign(devs.size(), nullptr);
+        for (size_t di = 0; di < devs.size(); ++di) {
+            cudaSetDevice(devs[di].id);
+            cudaEventCreateWithFlags(&rc_go[di], cudaEventDisableTiming);
+            if (!hmap(rc_upd[di], (size_t) 2 * kRcUpd, e0)) {
+                rc_upd.clear();
+                return false;
+            }
+        }
+        return true;
+    }
+    void tick_flush() {
+        const std::vector<RcJob>& jobs = tick_jobs;
+        bool any = !jobs.empty();
+        for (const auto& u : tick_upd) any = any || !u.empty();
+        if (!any || !tab_bufs()) return;
+        for (size_t di = 0; di < devs.size(); ++di) {
+            const std::vector<unsigned long long>& u = tick_upd[di];
+            if (u.empty() && jobs.empty()) continue;
+            cudaSetDevice(devs[di].id);
+            const int n = (int) std::min<size_t>(u.size() / 2, (size_t) kRcUpd);
+            if (n > 0) {
+                std::memcpy(rc_upd[di], u.data(), (size_t) n * 16);
+                tab_set(rc_upd[di], n, devs[di].st);
+            }
+            cudaEventRecord(rc_go[di], devs[di].st);
+        }
+        if (!jobs.empty()) {
+            {
+                std::lock_guard<std::mutex> lk(rc_mu);
+                for (const RcJob& j : jobs) rc_q.push_back(j);
+            }
+            rc_cv.notify_one();
         }
     }
 
@@ -5839,7 +6445,19 @@ struct Model::Impl {
         }
     }
 
+    // a tick's table entries start empty, and go to the devices in tick_flush (the recent slots' and the swaps')
+    void tick_begin() {
+        tick_upd.resize(devs.size());
+        for (auto& u : tick_upd) u.clear();
+        tick_jobs.clear();
+    }
     void cache_tick(int T) {
+        tick_begin();
+        rc_tick();
+        swap_tick(T);
+        tick_flush();
+    }
+    void swap_tick(int T) {
         if (!o.expert_cache || cache_ths.empty()) return;
         cache_switch();
         decay_tokens += T;
@@ -5861,7 +6479,9 @@ struct Model::Impl {
             }
             std::this_thread::sleep_for(std::chrono::microseconds(200));
         }
+        tick_begin();
         cache_switch();
+        tick_flush();
     }
     // the moves that landed, switched in (between windows: nothing reads the tables or the tier meanwhile)
     void cache_switch() {
@@ -5920,16 +6540,16 @@ struct Model::Impl {
                 l.spare_host = old_parts;
             }
             l.spare_vram = old_slot;
-            for (int m = 0; m < l.nm; ++m) {
+            for (int m = 0; m < l.nm; ++m) {   // (tick_flush: stream order, before the next window)
                 Layer& x = member(l, m);
-                const Dev& dm = devs[(size_t) x.dev];
-                l.tab_pin[2 * m] = (unsigned long long) sat(l, x, l.slot[(size_t) sw.in], unit(x));
-                l.tab_pin[2 * m + 1] = 0ull;
-                cudaSetDevice(dm.id);   // (stream order: before the next window)
-                cudaMemcpyAsync(x.vram_tab + sw.in, &l.tab_pin[2 * m], 8, cudaMemcpyHostToDevice, dm.st);
-                cudaMemcpyAsync(x.vram_tab + sw.out, &l.tab_pin[2 * m + 1], 8, cudaMemcpyHostToDevice, dm.st);
+                std::vector<unsigned long long>& u = tick_upd[(size_t) x.dev];
+                u.push_back((unsigned long long) (x.vram_tab + sw.in));
+                u.push_back((unsigned long long) sat(l, x, l.slot[(size_t) sw.in], unit(x)));
+                u.push_back((unsigned long long) (x.vram_tab + sw.out));
+                u.push_back(0ull);
             }
             l.swap_pending = false;
+            l.sw_in = -1;
             --sw_inflight;
             ++st.swaps;
         }
@@ -5943,17 +6563,26 @@ struct Model::Impl {
             std::vector<int> hits;
             hits.swap(l.cpu_hits);
             int best = -1, vin = -1;
-            for (int e : hits)
-                if (l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
+            for (int e : hits) {
+                bool filling = false;   // (a recent slot's fill brings it: the swaps leave it be)
+                for (int i = 0; i < l.rc_n; ++i) filling = filling || l.rc_fill[(size_t) i] == e;
+                if (!filling && l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
+            }
             if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
-                int cold = -1;
-                for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] >= 0 && (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold])) cold = e;
+                int cold = -1;   // (of the layer's own slots: a recent slot's expert stays)
+                for (int e = 0; e < l.n_exp; ++e) {
+                    const int sl = l.slot[(size_t) e];
+                    if (sl >= 0 && !(l.rc_n > 0 && sl >= l.rc_base && sl < l.rc_base + l.rc_n) &&
+                        (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold]))
+                        cold = e;
+                }
                 if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
                     l.swap_pending = true;
+                    l.sw_in = best;
                     ++sw_inflight;
                     vin = best;
                     Swap sw{l.il, best, cold};
+                    sw.win = win_now.load(std::memory_order_relaxed);
                     if (copy_mode && l.ram[(size_t) best] >= 0) sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
@@ -6059,8 +6688,28 @@ struct Model::Impl {
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
+    // DS4_ROUTE_TRACE=FILE: the CPU lane's requests (a window's routing, layer by layer) for offline cache studies -
+    // first each trunk layer's experts in VRAM ('P' layer n e..), then a record a request ('R' layer T k, T x k picks,
+    // T x k in-VRAM flags), all int32 / uint8, little-endian
+    std::FILE* rtrace = nullptr;
+    void rtrace_open() {
+        const char* f = std::getenv("DS4_ROUTE_TRACE");
+        if (f == nullptr || rtrace != nullptr) return;
+        rtrace = std::fopen(f, "wb");
+        if (rtrace == nullptr) return;
+        for (const Layer& l : L) {
+            if (l.mtp) continue;
+            std::vector<int32_t> v;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.slot[(size_t) e] >= 0) v.push_back(e);
+            const int32_t hdr[3] = {'P', l.il, (int32_t) v.size()};
+            std::fwrite(hdr, 4, 3, rtrace);
+            std::fwrite(v.data(), 4, v.size(), rtrace);
+        }
+    }
     void serve_lane() {
         unsigned next = 1;
+        rtrace_open();
         auto last = std::chrono::steady_clock::now();
         std::vector<Ent> ents;
         while (!quit.load(std::memory_order_relaxed)) {
@@ -6128,8 +6777,23 @@ struct Model::Impl {
                                 st.ahead_cold_hit += (fl[e] >> 3) & 1;
                             }
                             picks.push_back({e, t * kPicks + i});
-                        }
+                        } else if (l.rc_n > 0 && l.slot[(size_t) e] >= l.rc_base && l.slot[(size_t) e] < l.rc_base + l.rc_n)
+                            l.rc_stamp[(size_t) (l.slot[(size_t) e] - l.rc_base)] = rc_clock.load(std::memory_order_relaxed);
                     }
+                }
+                if (rtrace != nullptr) {
+                    const int32_t hdr[4] = {'R', li, T, l.k_exp};
+                    std::fwrite(hdr, 4, 4, rtrace);
+                    std::vector<int32_t> ids;
+                    std::vector<uint8_t> in;
+                    for (int t = 0; t < T; ++t)
+                        for (int i = 0; i < l.k_exp; ++i) {
+                            const int e = r.ids[t][i];
+                            ids.push_back(e);
+                            in.push_back(e >= 0 && e < l.n_exp && l.slot[(size_t) e] >= 0 ? 1 : 0);
+                        }
+                    std::fwrite(ids.data(), 4, ids.size(), rtrace);
+                    std::fwrite(in.data(), 1, in.size(), rtrace);
                 }
                 if (aon) skip_auto_tick(li, T, heavy, cold, heavy_cpu);
                 if (disk_skip_auto && dsk_rule && !picks.empty()) {   // (the experts this answer leaves in RAM)
@@ -7533,18 +8197,35 @@ struct Model::Impl {
                 cudaSetDevice(devs[di].id);
                 ring_restore_batch(rb[di], p0, g.win, keep, T, g.hd, devs[di].st);
             }
+        // the compressors' state: the same, one launch a device (two copies and a launch a layer and member were
+        // ~0.3 ms of the host's before the next draft)
+        std::vector<CompBatch> cb(devs.size());
         for (int il = 0; il < g.nl; ++il)
             for (int m = 0; m < L[(size_t) il].nm; ++m) {
                 Layer& l = member(L[(size_t) il], m);
                 Dev& d = devs[(size_t) l.dev];
-                if (l.c_snap != nullptr) {
+                if (l.c_snap == nullptr) continue;
+                CompBatch& b = cb[(size_t) l.dev];
+                if (b.n == kMaxRingBatch) {   // (more than a batch takes: this one alone)
                     cudaSetDevice(d.id);
                     const size_t ns = (size_t) l.ratio * g.hd * 4;
                     cudaMemcpyAsync(l.c_kv, l.c_snap, ns, cudaMemcpyDeviceToDevice, d.st);
                     cudaMemcpyAsync(l.c_score, l.c_snap + (size_t) l.ratio * g.hd, ns, cudaMemcpyDeviceToDevice, d.st);
                     compress_win(l.c_rows, l.c_rows + (size_t) kWin * g.hd, l.c_kv, l.c_score, l.ratio, (int) p0, keep,
                                  g.hd, l.c_norm, g.eps, d.latent, d.st);
+                    continue;
                 }
+                b.kv_state[b.n] = l.c_kv;
+                b.score_state[b.n] = l.c_score;
+                b.snap[b.n] = l.c_snap;
+                b.kv[b.n] = l.c_rows;
+                b.score[b.n] = l.c_rows + (size_t) kWin * g.hd;
+                b.ratio[b.n++] = l.ratio;
+            }
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (cb[di].n > 0) {
+                cudaSetDevice(devs[di].id);
+                comp_restore_batch(cb[di], p0, keep, g.hd, devs[di].st);
             }
         pos = p0 + keep;
         toks.resize((size_t) pos);
@@ -7554,6 +8235,28 @@ struct Model::Impl {
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
     bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
 
+
+    // a chunk's sum over its group: three members or more through the copy engines (allreduce_dma, c.y its scratch:
+    // free between the MoE's sets), or (Group::hred) summed on the host; unless DS4_AR_DMA=0
+    void chunk_allreduce(Dev& d, Chunk& c, const ArGroup& ab, int mi, int n, cudaStream_t s) {
+        chunk_allreduce_on(d, c, ab, mi, c.acc, n, s, c.ar_aux);
+    }
+    void chunk_allreduce_on(Dev& d, Chunk& c, const ArGroup& ab, int mi, float* buf, int n, cudaStream_t s,
+                            ArAux& aux) {
+        static const bool dma = [] {
+            const char* e = std::getenv("DS4_AR_DMA");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        HostReducer* hr = groups[(size_t) d.grp].hred.get();
+        if (dma && hr != nullptr) {   // (the lead submits the sum before its members' copies come)
+            const unsigned seq = ++c.arb_seq;
+            if (mi == 0) hr->submit(seq, n);
+            allreduce_host(buf, n, ab, *hr, mi, seq, c.y, s, aux);
+            return;
+        }
+        if (dma && ab.nm > 2 && ab.sums != nullptr && ab.bflags != nullptr) allreduce_dma(buf, n, ab, mi, ++c.arb_seq, c.y, s, &aux);
+        else allreduce(buf, n, ab, mi, ++c.arb_seq, d.xcnt, s);
+    }
 
     // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
     // projections as GEMMs, the attention and the indexer in slabs, the routed experts as sorted rows: the VRAM ones in
@@ -7576,7 +8279,7 @@ struct Model::Impl {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             const int slot = wp.eg_slot >= 0 ? wp.eg_slot : wp.k % 2;   // (read ahead by the run: two in flight)
-            uint8_t* host = c.eg_host[slot] + (size_t) l.eg * c.C * per;
+            uint8_t* host = chunks[(size_t) eg_src_dev(l.dev)]->eg_host[slot] + (size_t) l.eg * c.C * per;
             CK(cudaMemcpyAsync(c.eg_rows, host, (size_t) T * per, cudaMemcpyHostToDevice, s));
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
@@ -7757,10 +8460,24 @@ struct Model::Impl {
             prof_mark(d, 1);
             return true;
         }
-        // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
-        if (NHL == 0) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
-        for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
+        // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc; with three
+        // members or more each slab's sum on ar_s while the next slab computes (every member the same slabs: c.A
+        // is the group's, a member without heads its zeros)
+        static const bool overlap = [] {
+            const char* e = std::getenv("DS4_AR_OVERLAP");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        const bool slab_ar = overlap && nm > 2 && c.ar_s != nullptr;
+        if (NHL == 0 && !slab_ar) CK(cudaMemsetAsync(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
+        for (int a0 = 0; a0 < T && (NHL > 0 || slab_ar); a0 += c.A) {
             const int na = std::min(c.A, T - a0);
+            if (NHL == 0) {
+                CK(cudaMemsetAsync(c.acc + (size_t) a0 * D, 0, (size_t) na * D * sizeof(*c.acc), s));
+                CK(cudaEventRecord(c.ar_go, s));
+                CK(cudaStreamWaitEvent(c.ar_s, c.ar_go, 0));
+                chunk_allreduce_on(d, c, ab, mi, c.acc + (size_t) a0 * D, na * D, c.ar_s, c.ar_aux2);
+                continue;
+            }
             if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
             Finish fr;
             fr.rd = g.rd;
@@ -7799,8 +8516,17 @@ struct Model::Impl {
             x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
             prof_mark(d, 1);
+            if (slab_ar) {
+                CK(cudaEventRecord(c.ar_go, s));
+                CK(cudaStreamWaitEvent(c.ar_s, c.ar_go, 0));
+                chunk_allreduce_on(d, c, ab, mi, c.acc + (size_t) a0 * D, na * D, c.ar_s, c.ar_aux2);
+            }
         }
-        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (slab_ar) {   // (the residual and the MoE after every slab's sum)
+            CK(cudaEventRecord(c.ar_done, c.ar_s));
+            CK(cudaStreamWaitEvent(s, c.ar_done, 0));
+        } else if (nm > 1)
+            chunk_allreduce(d, c, ab, mi, T * D, s);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         prof_mark(d, 1);
         kick(s);   // (the attention submitted while the host queues the routing)
@@ -7830,6 +8556,11 @@ struct Model::Impl {
         prof_mark(d, 2);
         CK(cudaStreamSynchronize(s));
         std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
+        // pv_n is this run's resident prefix: slots lent to buffers are streamed, not hits.
+        if (S.collect_prefill && !S.prefill.add_bounds(b.data(), (size_t) n_vs, (size_t) L0.pv_n)) {
+            err = "invalid prefill routing bounds for statistics";
+            return false;
+        }
         if (dump_r != nullptr && mi == 0) {
             const size_t nk = (size_t) T * l.k_exp, np = (size_t) T * kPicks;
             std::vector<int> ri(np), rt(nk);
@@ -7895,7 +8626,7 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
-        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         prof_mark(d, 3);
@@ -7953,6 +8684,12 @@ struct Model::Impl {
         bool kv_only(int k, int il) const { return yoco >= 0 && k < cut_k && il == yoco; }
         int r0(int k, int il) const { return yoco >= 0 && k == cut_k && il >= yoco ? cut_r : 0; }   // the first row
     };
+    // topk's segments (TopkScratch): for a verify window's rows (a drafter's block and its token: 6; wider windows, a
+    // prompt's 16, take topk_kernel), as many a row as the longest row needs - 0.5 MB a device at 256K
+    static constexpr size_t kTksRows = 8;
+    size_t tks_p() const {
+        return (size_t) std::max(2, std::min(kTopkSegMax, (int) ((o.max_context + kTopkSeg - 1) / kTopkSeg)));
+    }
     // layer L0 over chunk k per a long prompt's skip (Run): its kv_only, or its rows from Run::r0 on - the chunk's
     // buffers seen from that row (the yoco layer: its kv_only over the rows before it first)
     bool run_layer(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
@@ -7982,7 +8719,7 @@ struct Model::Impl {
     // layer after layer, each through all the chunks in order - a chunk's state to host memory after each of its
     // layers and back before the next - so a layer's experts are read from the files once for the whole run (the
     // layer cache keeps what a chunk read for the chunks after it), where chunk after chunk reads them once a chunk
-    bool run_dev_layers(int di, const Run& run, std::string& err) {
+    bool run_dev_layers(int di, const Run& run, std::string& err, double stream_start) {
         Dev& d = devs[(size_t) di];
         Chunk& c = *chunks[(size_t) di];
         cudaSetDevice(d.id);
@@ -8087,6 +8824,7 @@ struct Model::Impl {
             }
             lm_layers.store((int) li + 1, std::memory_order_release);
         }
+        S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
         return true;
     }
     bool run_dev_chunks(int di, const Run& run, std::string& err) {
@@ -8096,6 +8834,7 @@ struct Model::Impl {
         cudaStream_t s = d.st;
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
         Streamer S;
+        const double stream_start = c.stream_bytes;
         const int B = std::max(1, c.ring_n / Chunk::kParts);
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
             CK(cudaStreamSynchronize(s));
@@ -8133,7 +8872,7 @@ struct Model::Impl {
                 flow_spec(c, 0, c.fl_layers[0], run.T[0]);
                 if (!flow_pump(c, err)) return false;
             }
-            if (c.lm) return run_dev_layers(di, run, err);
+            if (c.lm) return run_dev_layers(di, run, err, stream_start);
         }
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
@@ -8168,13 +8907,33 @@ struct Model::Impl {
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back(l0.eg);
         const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
-        auto read_eg = [this, &c, &run, &egs, eg_per](int k) {
-            if (k >= 2) cudaEventSynchronize(c.eg_ev[k % 2]);
+        // (a group's: its first member reads them for every member - slot k % 2 once each member's copies of chunk
+        //  k - 2 out of it are done - and the others wait for its slots)
+        const int eg_src = egs.empty() ? di : eg_src_dev(di);
+        std::vector<int> eg_mates;   // the devices whose copies read this one's slots (this one too)
+        for (size_t j = 0; j < devs.size() && eg_src == di; ++j)
+            if (chunks[j] != nullptr && devs[j].grp == d.grp && eg_src_dev((int) j) == di) eg_mates.push_back((int) j);
+        auto eg_wait_seq = [this](const std::atomic<unsigned>& a, unsigned seq) {   // (false: the run ends)
+            while ((int) (a.load(std::memory_order_acquire) - seq) < 0) {
+                if (eg_abort.load(std::memory_order_acquire) || halt.load(std::memory_order_acquire)) return false;
+                std::this_thread::sleep_for(std::chrono::microseconds(50));
+            }
+            return true;
+        };
+        auto read_eg = [this, &c, &run, &egs, eg_per, &eg_mates, &eg_wait_seq](int k) {
+            const int sl = k % 2;
+            if (k >= 2)
+                for (int j : eg_mates) {
+                    Chunk& m = *chunks[(size_t) j];
+                    if (!eg_wait_seq(m.eg_copied_seq[sl], run.seq[(size_t) k - 2])) return;
+                    cudaEventSynchronize(m.eg_ev[sl]);
+                }
             for (int li : egs)
-                engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[k % 2] + (size_t) li * c.C * eg_per);
+                engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[sl] + (size_t) li * c.C * eg_per);
+            c.eg_read_seq[sl].store(run.seq[(size_t) k], std::memory_order_release);
         };
         std::future<void> eg_next;
-        if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
+        if (!egs.empty() && eg_src == di) eg_next = std::async(std::launch::async, read_eg, 0);
         for (int k = 0; k < nk; ++k) {
             if (!chunk_go(k)) return halt_end(di, err);   // (a Stop: the chunks every device reaches are done)
             const int64_t p0 = run.p0[(size_t) k];
@@ -8182,9 +8941,15 @@ struct Model::Impl {
             const bool last_k = k + 1 == nk;
             if (!egs.empty()) {   // chunk k's rows ready, chunk k + 1's on their way
                 const double te = now_ms();
-                eg_next.get();
+                if (eg_src == di) {
+                    eg_next.get();
+                    if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
+                } else if (!eg_wait_seq(chunks[(size_t) eg_src]->eg_read_seq[slot], run.seq[(size_t) k])) {
+                    if (halt.load(std::memory_order_acquire)) return halt_end(di, err);
+                    err = "the Engram rows' reader stopped";
+                    return false;
+                }
                 if (d.mi == 0) st.engram_ms += now_ms() - te;
-                if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
             }
             WinPlan wp;
             wp.par = true;
@@ -8194,14 +8959,14 @@ struct Model::Impl {
             wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
             bool started = false;
             std::vector<char> got(srcs.size(), 0);
-            for (int il = 0; il < g.nl && run.runs(k, il); ++il) {
+            for (int il = 0; il < g.nl; ++il) {
                 if (halt_now()) return halt_end(di, err);   // (one GPU: after the layer it is on)
                 Layer& L0 = L[(size_t) il];
                 int mi = -1;
                 for (int m = 0; m < L0.nm; ++m)
                     if (member(L0, m).dev == di) mi = m;
                 if (mi < 0) continue;
-                if (!started) {   // the chunk's input: its embedding rows, or the previous group's hand-off
+                if (!started && run.runs(k, il)) {   // the chunk's input: its embedding rows, or the previous group's hand-off
                     started = true;
                     if (il == 0) {
                         if (k >= 2) CK(cudaEventSynchronize(c.emb_ev[slot]));
@@ -8250,15 +9015,22 @@ struct Model::Impl {
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
                 }
+                // (a chunk before the cut, past the yoco layer: its sources' rows taken above, for the chunks after it)
+                if (!run.runs(k, il)) continue;
                 if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
-                if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
+                // the hand-off, once the next group took the chunk before last (the chunks it takes: past the yoco
+                // layer, those from the cut on)
+                if (last && mi == 0 && il + 1 < g.nl && run.runs(k, il + 1)) {
                     const int nnext = L[(size_t) il + 1].nm;
-                    if (k >= 2) wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
+                    if (k >= 2 && run.runs(k - 2, il + 1))
+                        wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
             }
+            // (chunk k's copies out of its Engram slot issued, their event recorded: the reader may refill it)
+            if (!egs.empty()) c.eg_copied_seq[slot].store(wp.win, std::memory_order_release);
             if (di == head_dev && (size_t) k < chunk_done.size()) {
                 CK(cudaEventRecord(chunk_done[(size_t) k], s));
                 chunk_rec[(size_t) k].store(1, std::memory_order_release);
@@ -8282,6 +9054,7 @@ struct Model::Impl {
                 }
             }
         }
+        S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
         return true;
     }
 
@@ -8828,8 +9601,9 @@ struct Model::Impl {
     }
 
     // the first layer of a long prompt's second half (forward_chunks' two passes), or -1: the first with compress ratio 1
-    // (V4.1: 20), every one after it ratio 1 too and owning no compressed KV or index keys of its own (they read its),
-    // every trunk layer on one GPU.  The settings' MAYA_DS4_PROMPT_SKIP (STRATA_DS4_PROMPT_SKIP; DS4_YOCO for tests):
+    // (V4.1: 20), every one after it ratio 1 too and owning no compressed KV or index keys of its own (they read its);
+    // on one GPU, or on several (tensor parallel, groups) where no device streams its layers on the flow and no Engram
+    // layer comes from it on (the cut then at a chunk's start: forward_chunks).  The settings' MAYA_DS4_PROMPT_SKIP (STRATA_DS4_PROMPT_SKIP; DS4_YOCO for tests):
     // 1 (the default) the exact skip, 2 DeepSeek's own serving's (the last 128 rows only: faster, the answers shift a
     // little), 0 off
     static int yoco_mode() {
@@ -8840,16 +9614,39 @@ struct Model::Impl {
         }();
         return m;
     }
+    // the device whose Engram slots device di's copies read: a tensor-parallel group's rows read once, by its first
+    // member, the others copying from its slots (each member read them itself: the same rows 8 times at --tp 8); its
+    // own on the flow or alone (DS4_EG_SHARE=0: every device its own)
+    int eg_src_dev(int di) const {
+        static const bool share = std::getenv("DS4_EG_SHARE") == nullptr || std::atoi(std::getenv("DS4_EG_SHARE")) != 0;
+        const Group& G = groups[(size_t) devs[(size_t) di].grp];
+        if (!share || G.mem.size() < 2) return di;
+        for (int m : G.mem)
+            if (chunks[(size_t) m] == nullptr || chunks[(size_t) m]->flow || chunks[(size_t) m]->eg_host[0] == nullptr)
+                return di;
+        return G.mem[0];
+    }
+    std::atomic<bool> eg_abort{false};   // (a device's run failed: the Engram waits end)
+    // every trunk layer on one GPU: the cut anywhere in a chunk (Run::cut_r); else at a chunk's start (the sources'
+    // rows and the hand-offs between groups go chunk by chunk)
+    bool yoco_one_gpu() const {
+        for (int il = 0; il < g.nl; ++il)
+            if (L[(size_t) il].nm != 1 || L[(size_t) il].dev != L[0].dev) return false;
+        return true;
+    }
     int yoco_layer() const {
         if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
         int yl = -1;
         for (int il = 0; il < g.nl && yl < 0; ++il)
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
+        const bool one = yoco_one_gpu();
+        for (const auto& c : chunks)
+            if (!one && c != nullptr && c->flow) return -1;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
-            if (l.nm != 1 || l.dev != L[0].dev) return -1;
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
+            if (!one && il >= yl && l.eg >= 0) return -1;
         }
         return yl;
     }
@@ -8874,7 +9671,9 @@ struct Model::Impl {
         // order).  The chunks stay as they are: the ones before the cut go through the layers before yoco and its
         // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
         // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
-        // skip.  One GPU (DS4_YOCO=1; 0: off); not with every row's logits (tests)
+        // skip.  On several GPUs the rows before the cut and the rows from it on are chunked apart (the cut a chunk's
+        // start: chunk cut_k's rows go to the other groups whole).  DS4_YOCO=1 (0: off); not with every row's logits
+        // (tests)
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
         // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
         //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
@@ -8883,17 +9682,32 @@ struct Model::Impl {
                          : keep_env > 0 ? std::max(keep_env, g.win)
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
         const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
-        const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
+        const bool cut_rows = a > 0 && yoco_one_gpu();
         Run run;
-        for (int x = 0; x < n; x += per) {
-            run.p0.push_back(pos + x);
-            run.T.push_back(std::min(per, n - x));
-            run.seq.push_back(++win_seq);
-        }
-        if (a > 0) {
+        int per = 0;   // (the widest chunk)
+        auto part = [&](int a0, int a1) {   // rows [a0, a1) in equal chunks of at most `chunk`
+            if (a1 <= a0) return;
+            const int nc = (a1 - a0 + chunk - 1) / chunk, w = (a1 - a0 + nc - 1) / nc;
+            for (int x = a0; x < a1; x += w) {
+                run.p0.push_back(pos + x);
+                run.T.push_back(std::min(w, a1 - x));
+                run.seq.push_back(++win_seq);
+            }
+            per = std::max(per, w);
+        };
+        if (a > 0 && !cut_rows) {
+            part(0, a);
             run.yoco = yl;
-            run.cut_k = a / per;
-            run.cut_r = a - run.cut_k * per;
+            run.cut_k = (int) run.T.size();
+            run.cut_r = 0;
+            part(a, n);
+        } else {
+            part(0, n);
+            if (a > 0) {
+                run.yoco = yl;
+                run.cut_k = a / per;
+                run.cut_r = a - run.cut_k * per;
+            }
         }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
@@ -8951,10 +9765,14 @@ struct Model::Impl {
             halt_seen = -1;
         }
         bool halting = false;
+        eg_abort.store(false);
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
-                if (!run_dev_chunks((int) di, run, e)) errs[di] = e.empty() ? "a device's thread failed" : e;
+                if (!run_dev_chunks((int) di, run, e)) {
+                    errs[di] = e.empty() ? "a device's thread failed" : e;
+                    eg_abort.store(true, std::memory_order_release);
+                }
             });
         size_t reported = 0;
         for (;;) {
@@ -9331,6 +10149,7 @@ struct Model::Impl {
     // devices waiting on each other through host-mapped flags (the window's seq)
     bool forward_par(int64_t p0, int T, std::string& err) {
         wplan.win = ++win_seq;
+        win_now.store(wplan.win, std::memory_order_release);
         std::vector<std::string> errs(devs.size());
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, p0, T, &errs] {
@@ -9415,7 +10234,11 @@ struct Model::Impl {
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
             if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
-        if (d.grp == devs[(size_t) head_dev].grp) return head_rows_dev(di, T, err);
+        if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
+        if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
+            CK(cudaEventRecord(idle_ev[(size_t) di], s));
+            idle_win[(size_t) di].store(wp.win, std::memory_order_release);
+        }
         return true;
     }
 
@@ -9448,6 +10271,8 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int nm = L0.nm;
+        const bool hs = hc_side();   // (the mixes on st2)
+        cudaStream_t hcs = hs ? d.st2 : s;
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
@@ -9470,8 +10295,15 @@ struct Model::Impl {
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }
         // attention
-        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
+        // (hc_side: hc_mix + hc_split on st2 beside the attention - the pre norm takes the lagged pre, a_post / a_comb /
+        // a_pre are read from the attention's hc_post on, where st waits for them)
+        if (hs) {
+            CK(cudaEventRecord(d.hc_go, s));
+            CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
+        }
+        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
+        hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, hcs);
+        if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
         hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         {
             x3::MvJob j[4];
@@ -9602,15 +10434,20 @@ struct Model::Impl {
                         }
                         index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, nmax, d.cand,
                                     (int) cand_stride(), g.cand_blk, cl, d.scores, ss, s);
+                        if (index_check)
+                            index_check_rows(d, l.il, d.iq, d.iw, ks.ik[(size_t) l.dev], T, nmax, d.cand, g.cand_blk, cl, ss, s);
                         Rows tr;
                         for (int t = 0; t < T; ++t) {
                             tr.n[t] = wp.cand[l.il][t] * g.cand_blk;
                             tr.k[t] = lim.k[t];
                         }
-                        topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s);
+                        topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s,
+                             &d.tks);
                     } else {
                         index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1,
                                     lim, d.scores, ss, s);
+                        if (index_check)
+                            index_check_rows(d, l.il, d.iq, d.iw, ks.ik[(size_t) l.dev], T, clen_max, nullptr, 1, lim, ss, s);
                         if (l.cand_src) {
                             Rows cr;
                             for (int t = 0; t < T; ++t) {
@@ -9620,7 +10457,24 @@ struct Model::Impl {
                             cand_blocks(d.scores, ss, T, cr, g.cand_blk, d.bm, (long long) bm_stride(), d.cand,
                                         (int) cand_stride(), s);
                         }
-                        topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                        topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s, &d.tks);
+                        if (topk_check) {   // (into d.cand's rows past the window's: scratch here)
+                            const size_t nw = (size_t) T * topk_stride();
+                            std::vector<int> tkc_a(nw), tkc_b(nw);
+                            CK(cudaMemcpyAsync(tkc_a.data(), d.topk, nw * 4, cudaMemcpyDeviceToHost, s));
+                            topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                            CK(cudaMemcpyAsync(tkc_b.data(), d.topk, nw * 4, cudaMemcpyDeviceToHost, s));
+                            CK(cudaStreamSynchronize(s));
+                            bool bad = false;
+                            for (int t = 0; t < T; ++t)
+                                bad = bad || std::memcmp(tkc_a.data() + (size_t) t * topk_stride(),
+                                                         tkc_b.data() + (size_t) t * topk_stride(), (size_t) lim.k[t] * 4) != 0;
+                            if (bad) ++tkc_bad;
+                            const long long nc = ++tkc_calls;
+                            if (nc % 256 == 0 || bad)
+                                std::fprintf(stderr, "topk check: %lld calls, %lld differed (layer %d, n %d)\n", nc,
+                                             tkc_bad.load(), l.il, lim.n[0]);
+                        }
                     }
                 }
             }
@@ -9679,13 +10533,20 @@ struct Model::Impl {
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         prof_mark(d, 1);
         // the MoE
-        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
-        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, s);
+        // (the same beside the MoE: f_post / f_comb / f_pre are read from its hc_post on)
+        if (hs) {
+            CK(cudaEventRecord(d.hc_go, s));
+            CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
+        }
+        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
+        hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
+        if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
@@ -9789,6 +10650,7 @@ struct Model::Impl {
             }
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -9907,6 +10769,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(d.cpu_part, h_part, (size_t) T * D * 4, cudaMemcpyHostToDevice, s));
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
+        if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -9947,6 +10810,23 @@ struct Model::Impl {
     }
 
     void save_profile() const {
+        if (std::getenv("DS4_CPU_STATS") != nullptr && cpu_calls > 0)
+            std::fprintf(stderr, "CPU lane: %ld calls, %.2f experts and %.2f rows a call; per call: gate/up %.3f ms, "
+                                 "bands %.3f, down %.3f, down bands %.3f\n", cpu_calls, (double) cpu_ents / cpu_calls,
+                         (double) cpu_rows / cpu_calls, cpu_ph_ms[0] / cpu_calls, cpu_ph_ms[1] / cpu_calls,
+                         cpu_ph_ms[2] / cpu_calls, cpu_ph_ms[3] / cpu_calls);
+        if (std::getenv("DS4_CPU_STATS") != nullptr && rc_ticks > 0)
+            std::fprintf(stderr, "recent slots: %lld ticks, %.3f ms a tick, %.2f fills started and %.2f mapped a tick\n",
+                         (long long) rc_ticks, rc_tick_ms / rc_ticks, (double) rc_fills_started / rc_ticks,
+                         (double) rc_fills_done / rc_ticks);
+        if (std::getenv("DS4_CPU_STATS") != nullptr && cpu_calls > 0) {
+            const int thr = pools.empty() ? 1 : (int) (pools[0]->size() + (pools.size() > 1 ? pools[1]->size() : 0));
+            for (int i = 0; i < 4; ++i)
+                std::fprintf(stderr, "  phase %d: %.1f jobs a call, %.1f us a job; the jobs' time %.0f%% of %d threads x the "
+                                     "phase's wall\n", i, (double) cpu_job_n[i] / cpu_calls,
+                             cpu_job_n[i] ? cpu_job_ns[i] / 1e3 / cpu_job_n[i] : 0.0,
+                             100.0 * cpu_job_ns[i] / 1e6 / (cpu_ph_ms[i] * thr), thr);
+        }
         if (o.profile.empty()) return;
         const std::string tmp = o.profile + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
@@ -9968,6 +10848,48 @@ struct Model::Impl {
                                    "cpu_experts=%d ram_experts=%d engine=ds4-0.1",
                       (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held);
         v.push_back(b);
+        // the Monitor's map of each GPU (serve/gpu_map.py, the GLM engine's VRAM lines): what each part holds on the
+        // card, in bytes - the dense weights (the drafter's blocks apart), the KV caches, the window's buffers, the
+        // drafter's blocks (their weights, a share estimated, and experts), the routed experts' slots, the vision
+        // tower (in this process: vision_own); the prompt chunks' buffers (prompt); and tensor parallel's copies (tp,
+        // out of weights and kv): of a group of tp_n, each member's (tp_n - 1) / tp_n of the tensors every member holds
+        // whole and of its KV caches (every member has its layers' whole KV) - the drafter's few caches on the first
+        // GPU at --tp 9 counted with them
+        for (const Dev& d : devs) {
+            size_t fr = 0, tot = 0;
+            cudaSetDevice(d.id);
+            mem_info(&fr, &tot);
+            int a = -1, z = -1;
+            long long slots = 0;
+            size_t mtp_exp = 0, mtp_dense = 0;
+            for (const Layer& l : L)
+                for (int m = 0; m < l.nm; ++m) {
+                    const Layer& x = member(l, m);
+                    if (x.dev != (int) (&d - devs.data())) continue;
+                    if (l.mtp) {
+                        mtp_exp += (size_t) l.n_slots * unit(x);
+                        mtp_dense += l.dense_bytes;
+                        continue;
+                    }
+                    if (a < 0) a = l.il;
+                    z = l.il;
+                    slots += l.n_slots;
+                }
+            mtp_dense = std::min(mtp_dense, d.weights);
+            mtp_exp = std::min(mtp_exp, d.experts);
+            const size_t tn = groups[(size_t) d.grp].mem.size();
+            const size_t tp_w = std::min(d.tp_w, d.weights - mtp_dense), tp_kv = tn > 1 ? d.caches / tn * (tn - 1) : 0;
+            const size_t vis = img_tok >= 0 && vt.device() == d.id ? vt.device_bytes() : 0;
+            char pci[32] = "-";
+            if (cudaDeviceGetPCIBusId(pci, sizeof pci, d.id) != cudaSuccess) std::snprintf(pci, sizeof pci, "-");
+            std::snprintf(b, sizeof b,
+                          "VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu kv_ram=0 act=%zu drafter=%zu window=0 "
+                          "pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu prompt=%zu tp=%zu tp_n=%zu slots=%lld ctx=%lld "
+                          "layers=%d-%d",
+                          d.id, pci, tot, fr, d.weights - mtp_dense - tp_w, d.caches - tp_kv, d.scratch, mtp_dense + mtp_exp,
+                          d.experts - mtp_exp, vis, d.prompt, tp_w + tp_kv, tn, slots, (long long) o.max_context, a, z);
+            v.push_back(b);
+        }
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
             std::snprintf(b, sizeof b,
                           "NOTE experts: %.0f GB stay off the GPU - Windows' page file is too small to hold them there; "

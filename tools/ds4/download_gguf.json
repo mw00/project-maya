@@ -187,7 +187,7 @@
  "maya": {
   "_": "Maya's quants of DeepSeek-V4.1-Flash-1017 (tools/maya_quant: per-expert statistics from the model itself, error-feedback rounding of the experts), each one GGUF split with everything in it - the Engram tables too, in Q6_K (made from DeepSeek's released weights). The files are listed here once they are uploaded, with the commit they were uploaded at.",
   "repo": "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF",
-  "revision": "276e0badcfb4a6d8f6c2b9d4da1b468cd339c221",
+  "revision": "c273fcbdda76a1db074c2f414cb70edbfca2f2ef",
   "quants": {
    "Maya-S": {
     "about": "experts IQ2_XXS / IQ3_XXS, the first and last four layers IQ2_S / IQ3_S, dense weights Q8_0, the Engram tables Q6_K",
@@ -263,6 +263,45 @@
    "Maya-M": {
     "about": "experts IQ3_S, dense weights Q8_0",
     "files": {}
+   },
+   "Maya-XS": {
+    "about": "every routed expert IQ1_S (error-feedback rounding, calibrated layer by layer on the quantized model itself), dense weights Q8_0, the Engram tables Q6_K; with its own 2-bit DSpark drafter",
+    "files": {
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00001-of-00005.gguf": [
+      47781530400,
+      "a0cb7966afd68bc35c46f78018d1fa1d2e4bcbe3c3baf39f60cd1733ed9ad7e5"
+     ],
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00002-of-00005.gguf": [
+      47775748128,
+      "ba5afb43adfc667436ebcfbd82d25411fa2843ee7e1d877290611cd60f93cca1"
+     ],
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00003-of-00005.gguf": [
+      19784230848,
+      "1482443bb4957c8d2f005ded365445f98558ff05c50674f9ee9a96ddabc122a4"
+     ],
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00004-of-00005.gguf": [
+      80641295472,
+      "0d93315942c523d82f6dbc0a6e0e1751548e309f3963f96b82f92e8f9bc52e36"
+     ],
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00005-of-00005.gguf": [
+      80643503412,
+      "39bbc8cde8b17604fed9a7ba7fc6bc9c5e72e34733657943ac049b4b9ca2d340"
+     ]
+    },
+    "drafter": {
+     "about": "DeepSeek's drafter, its experts in IQ2_XXS, its dense weights Q8_0",
+     "json": "dspark-xs2.json",
+     "files": {
+      "dspark/dspark-xs2.bin": [
+       4251725568,
+       "8dfe21082a6cb320f334fddb454630c241c6d44e0463eef4f8b0b07334511779"
+      ],
+      "dspark/dspark-xs2.json": [
+       99146,
+       "56d47ad12d6548a8d3d50a79be96451411f18d5b77064de7b8544bb2da22988f"
+      ]
+     }
+    }
    }
   },
   "drafter": {

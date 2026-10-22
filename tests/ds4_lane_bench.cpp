@@ -5,11 +5,14 @@
 // (the faster of 5 rounds, each the median of 4 calls).  Then the stream lane's read into pinned memory (a memcpy of an
 // expert, 1 and 2 threads), and for a GPU on a link of --link GB/s the split the lane would plan (ds4_pcie.hpp: of n
 // picks in RAM, how many it streams) - for a PC whose GPU cannot run the engine, what its CPU side would give.
+// --check instead: each low-bit format's expert on the CPU lane against a double reference (no GPU needed).
 //
-//   ds4_lane_bench [--threads N] [--formats mxfp4,iq2_xxs,iq2_s] [--experts 24] [--link 12] [--gpu-ms 0.03]
+//   ds4_lane_bench [--threads N] [--formats mxfp4,iq2_xxs,iq2_s] (also iq3_xxs, iq3_s, iq1_s, iq1_m) [--experts 24] [--link 12] [--gpu-ms 0.03]
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_pcie.hpp"
 #include "../src/ds4/ds4_pool.hpp"
+
+#include "ggml.h"   // (--check: ggml's dequantize_row_* for the reference)
 
 #include <algorithm>
 #include <chrono>
@@ -75,11 +78,18 @@ void fill(Experts& X, uint64_t seed) {
             const int t = r < 2 ? X.f.tg : X.f.td;
             if (t == 0) {   // MXFP4: an E8M0 scale a 17-byte block
                 for (size_t b = 0; b + 17 <= (size_t) rows * rb; b += 17) m[b] = (uint8_t) (114 + rng() % 9);
-            } else {        // the i-quants: an F16 d first in each 256-value block
+            } else {        // the i-quants: an F16 d first in each 256-value block (IQ1_M: in its 4 scale words' top nibbles)
                 const size_t bb = rb / (size_t) (k / 256);
                 for (size_t b = 0; b + bb <= (size_t) rows * rb; b += bb) {
                     const uint16_t h = f2h(0.001f + 0.002f * (float) (rng() % 1000) / 1000.0f);
-                    std::memcpy(m + b, &h, 2);
+                    if (t == 29)
+                        for (int i = 0; i < 4; ++i) {
+                            uint16_t sw;
+                            std::memcpy(&sw, m + b + 48 + 2 * i, 2);
+                            sw = (uint16_t) ((sw & 0x0FFFu) | (((h >> (4 * i)) & 0xFu) << 12));
+                            std::memcpy(m + b + 48 + 2 * i, &sw, 2);
+                        }
+                    else std::memcpy(m + b, &h, 2);
                 }
             }
         }
@@ -146,6 +156,51 @@ struct Lane {
     }
 };
 
+// --check: a low-bit format's expert on the CPU lane (one token, gate / up then down, the pool's jobs) against a double
+// reference on the Q8_K values the lane took (block_q8_K: F32 d, int8 qs[256], int16 bsums[16]) and ggml's own
+// dequantize_row_* weights - the largest difference relative to the largest output; a CPU-only test (no GPU)
+bool check_fmt(Lane& ln, const Experts& X, const float* x) {
+    ln.call(X, 0, 1, x);
+    auto q8k = [](const uint8_t* q, int k) {
+        std::vector<double> v((size_t) k);
+        for (int b = 0; b < k / 256; ++b) {
+            float d;
+            std::memcpy(&d, q + (size_t) b * 292, 4);
+            for (int j = 0; j < 256; ++j) v[(size_t) b * 256 + j] = (double) d * (int8_t) q[(size_t) b * 292 + 4 + j];
+        }
+        return v;
+    };
+    auto dot = [](int type, const uint8_t* row, int k, const std::vector<double>& a) {
+        static thread_local std::vector<float> w;
+        w.resize((size_t) k);
+        ggml_get_type_traits((ggml_type) type)->to_float(row, w.data(), k);
+        double s = 0;
+        for (int i = 0; i < k; ++i) s += (double) w[(size_t) i] * a[(size_t) i];
+        return s;
+    };
+    const std::vector<double> xa = q8k(ln.xq.data(), E), ha = q8k(ln.hq.data(), FF);
+    double hm = 1e-30, he = 0, ym = 1e-30, ye = 0;
+    std::vector<double> hr((size_t) FF), yr((size_t) E);
+    for (int f = 0; f < FF; ++f) {
+        double g = dot(X.f.tg, X.mat(0, 0) + (size_t) f * X.f.gr, E, xa), u = dot(X.f.tg, X.mat(0, 1) + (size_t) f * X.f.gr, E, xa);
+        g = std::min(g, (double) kLim);
+        u = std::min(std::max(u, -(double) kLim), (double) kLim);
+        hr[(size_t) f] = g / (1.0 + std::exp(-g)) * u;
+        hm = std::max(hm, std::fabs(hr[(size_t) f]));
+    }
+    for (int d = 0; d < E; ++d) {
+        yr[(size_t) d] = dot(X.f.td, X.mat(0, 2) + (size_t) d * X.f.dr, FF, ha);
+        ym = std::max(ym, std::fabs(yr[(size_t) d]));
+    }
+    for (int f = 0; f < FF; ++f) he = std::max(he, std::fabs(ln.h[(size_t) f] - hr[(size_t) f]) / hm);
+    for (int d = 0; d < E; ++d) ye = std::max(ye, std::fabs(ln.y[(size_t) d] - yr[(size_t) d]) / ym);
+    const bool ok = he <= 1e-4 && ye <= 1e-4;
+    std::printf("check %s (%s / %s): CPU lane vs the double reference: gate/up %.2e, down %.2e of the largest  %s\n",
+                X.f.name.c_str(), ggml_type_name((ggml_type) X.f.tg), ggml_type_name((ggml_type) X.f.td), he, ye,
+                ok ? "ok" : "FAIL");
+    return ok;
+}
+
 // the logical CPUs, the first of each core first (Linux; elsewhere 0..n-1)
 std::vector<int> core_cpus() {
     std::vector<int> first;
@@ -170,8 +225,17 @@ int main(int argc, char** argv) {
     int threads = 0, n_exp = 24;
     double link = 12.0, gpu_ms = 0.03;
     std::string formats = "mxfp4,iq2_xxs,iq2_s";
-    for (int i = 1; i + 1 < argc; i += 2) {
-        const std::string a = argv[i], v = argv[i + 1];
+    bool check = false;
+    int failed = 0;
+    for (int i = 1; i < argc; i += 2) {
+        const std::string a = argv[i];
+        if (a == "--check") {   // (a flag: no value)
+            check = true;
+            --i;
+            continue;
+        }
+        if (i + 1 >= argc) break;
+        const std::string v = argv[i + 1];
         if (a == "--threads") threads = std::atoi(v.c_str());
         else if (a == "--formats") formats = v;
         else if (a == "--experts") n_exp = std::max(4, std::atoi(v.c_str()));
@@ -200,8 +264,10 @@ int main(int argc, char** argv) {
             X.f.gr = (size_t) E / 32 * 17;
             X.f.dr = (size_t) FF / 32 * 17;
         } else {
-            const int tg = fn == "iq2_xxs" ? 16 : fn == "iq2_s" ? 22 : fn == "iq3_xxs" ? 18 : fn == "iq3_s" ? 21 : -1;
-            const int td = fn == "iq2_xxs" ? 18 : fn == "iq2_s" ? 21 : fn == "iq3_xxs" ? 21 : fn == "iq3_s" ? 21 : -1;
+            const int tg = fn == "iq2_xxs" ? 16 : fn == "iq2_s" ? 22 : fn == "iq3_xxs" ? 18 : fn == "iq3_s" ? 21
+                           : fn == "iq1_s" ? 19 : fn == "iq1_m" ? 29 : -1;
+            const int td = fn == "iq2_xxs" ? 18 : fn == "iq2_s" ? 21 : fn == "iq3_xxs" ? 21 : fn == "iq3_s" ? 21
+                           : fn == "iq1_s" ? 29 : fn == "iq1_m" ? 29 : -1;   // (IQ1: an IQ1_M down)
             std::string err;
             if (tg < 0 || !gg::iq_cpu_fmt(tg, td, E, FF, X.f.iq, err)) {
                 std::printf("%s: not run (%s)\n", fn.c_str(), tg < 0 ? "unknown format" : err.c_str());
@@ -216,6 +282,10 @@ int main(int argc, char** argv) {
         fill(X, 1234);
         Lane ln;
         ln.pool = &pool;
+        if (check) {
+            if (X.f.tg != 0 && !check_fmt(ln, X, x.data())) ++failed;
+            continue;
+        }
         int e0 = 0;
         auto timed = [&](int n, int reps) {
             std::vector<double> t;
@@ -264,5 +334,6 @@ int main(int argc, char** argv) {
                     fn.c_str(), X.f.blob / 1e6, k.c, X.f.blob / k.c / 1e6, k.oc, r1, r2, link, k.p,
                     pcie::table(k, 8).c_str());
     }
-    return 0;
+    if (check) std::printf("check: %s (%d failed)\n", failed ? "FAILED" : "ALL OK", failed);
+    return failed ? 1 : 0;
 }

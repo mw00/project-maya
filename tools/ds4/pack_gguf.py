@@ -38,7 +38,8 @@ TYPES = {0: ("F32", 1, 4), 1: ("F16", 1, 2), 8: ("Q8_0", 32, 34), 30: ("BF16", 1
          # the low-bit expert types (the Maya quants' experts; the engine's ds4_iq kernels)
          10: ("Q2_K", 256, 84), 11: ("Q3_K", 256, 110), 12: ("Q4_K", 256, 144), 13: ("Q5_K", 256, 176),
          14: ("Q6_K", 256, 210), 16: ("IQ2_XXS", 256, 66), 17: ("IQ2_XS", 256, 74), 18: ("IQ3_XXS", 256, 98),
-         20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136)}
+         19: ("IQ1_S", 256, 50), 20: ("IQ4_NL", 32, 18), 21: ("IQ3_S", 256, 110), 22: ("IQ2_S", 256, 82),
+         23: ("IQ4_XS", 256, 136), 29: ("IQ1_M", 256, 56)}
 # the Engram set a quant without the tables takes them from by default, beside it (or inside its folder): unsloth's
 # MXFP8 shard of them, where setups before v1.1.17 put it for Maya-S (--engram: any other)
 ENGRAM_SETS = ("Engram",)

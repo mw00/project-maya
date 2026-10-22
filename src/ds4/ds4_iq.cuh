@@ -1,13 +1,15 @@
 // src/ds4/ds4_iq.cuh - a GGUF's routed experts in ggml's low-bit block types on the device for maya-ds4: the i-quants
-// IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and the K-quants Q2_K, Q3_K, Q4_K (256 values a block, ggml's layouts:
-// ggml-common.h, llama.cpp MIT).  ds4_gguf.cu sends an expert layer here when its experts are not MXFP4
+// IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and the K-quants Q2_K, Q3_K, Q4_K (256 values a block, ggml's
+// layouts: ggml-common.h, llama.cpp MIT).  ds4_gguf.cu sends an expert layer here when its experts are not MXFP4
 // (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role r's ggml type; K[r] == kTypeMXFP4: ds4_gguf.cu's own kernels).
 //
 // Every weight is decoded exactly (ggml's dequantize_row_*: a block scale times an integer scale times a grid or code
 // value) and every product takes the activations rounded to int8 per 32 values with an F32 scale (ds4_gguf.cu's
 // q8_quant): a 32-value sub-block's sum is an exact integer dot (dp4a) times its scales in F32 - no integer division as
 // llama.cpp's vecdotq takes (its sums truncate), so these are the double reference's sums to F32 rounding.  A window's
-// entry gets the token path's bits (the same kernel, the same order).
+// entry gets the token path's bits (the same kernel, the same order).  IQ1_S / IQ1_M's +-1/8 shift of each grid value
+// (IQ1S_DELTA, a sign a sub-block or a group of 8) rides in the integer dot: the codes are 8 g +- 1 (g in {-1, 0, 1}),
+// the scale d / 8 - so the dot carries the int8 activations' group sums exactly.
 #pragma once
 
 #include <cstddef>
@@ -17,8 +19,8 @@
 namespace strata::ds4::gguf::iq {
 
 // ggml type ids
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ3_S = 21, kIQ2_S = 22,
-              kIQ4_XS = 23;
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
+              kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
 
 /// Whether the device kernels take this ggml type.
 bool supported(int type);
@@ -99,5 +101,10 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+
+/// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
+/// the token / window / light kernels' codes times their scales (d s q - m), tile = the prompt tiles' loader (F32,
+/// before their F16) - both ggml's dequantize_row_* values to the bit.  false: a type not covered.
+bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* tile, cudaStream_t s);
 
 }  // namespace strata::ds4::gguf::iq
