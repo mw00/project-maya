@@ -1121,10 +1121,18 @@ struct Model::Impl {
     // DS4_HC_FUSE=1: a decoded token's (T 1) hc_split and hc_pre_norm in one launch (hc_split_pre_norm), the attention
     // input's int8 rounding there, the layer's copy of the pre slots by its FFN split - checked at load (hc_fuse_check)
     bool hc_fuse = false;
-    // DS4_ROUTE_FUSE=1: a decoded token's (T 1) router stage on a group's lead with one layer of lookahead (DS4_AHEAD
-    // 1) and a next layer to guess - its gate and the next layer's in one launch (gemv_f32_pair), the routing and the
-    // guesses in another (route_pair), publish as before - checked at load (route_fuse_check)
+    // DS4_ROUTE_FUSE=1: a decoded token's (T 1) router stage on a group's lead with a next layer to guess
+    // (route_fusable) - its gate and the next layer's in one launch (gemv_f32_pair), the routing and the guesses in
+    // another (route_pair), publish as before - checked at load (route_fuse_check).  The load refuses it with
+    // DS4_AHEAD other than 1; every other case (no guess, the other members, windows, the drafter) keeps the old path
     bool route_fuse = false;
+    // (DS4_ROUTE_FUSE) whether a decoded token's router stage on this lead fuses: every bound gemv_f32_pair and
+    // route_pair refuse, checked before anything is enqueued - an incompatible layer or next layer takes the old path
+    static bool route_fusable(const Layer& l, const Layer* nx, int m, int D) {
+        return nx != nullptr && l.gate_w != nullptr && nx->gate_w != nullptr && l.n_exp >= 1 && l.n_exp <= 1024 &&
+               nx->n_exp >= 1 && nx->n_exp <= 1024 && l.k_exp >= 1 && l.k_exp <= kPicks && m >= 1 && m <= kAhead &&
+               D >= 4 && D % 4 == 0 && D <= kMaxDim;
+    }
     static constexpr uint64_t kRamMargin = 8ull << 30;   // RAM left to the rest (the system, the page cache's churn)
     static constexpr uint64_t kAutoCopyRoom = 8ull << 30;   // --mmap-experts auto copies only with this much more spare
                                                             // (the Engram rows' page cache, other programs)
@@ -13586,10 +13594,10 @@ struct Model::Impl {
                 rp.a_n = nx1->n_exp;
                 rp.m = m1;
             }
-            if (nx1 != nullptr && l.n_exp <= 1024 && l.k_exp <= kPicks && D % 4 == 0 && D <= kMaxDim) {
+            if (route_fusable(l, nx1, m1, D)) {   // (a GEMV not gone in reaches no routing; a routing, no publish)
                 if (!gemv_f32_pair(l.gate_w, l.n_exp, d.glog, nx1->gate_w, nx1->n_exp, d.glog_a, d.x, D, s) ||
                     !route_pair(rp, s)) {
-                    err = "the fused router stage refused its shapes";
+                    err = "the fused router stage: a launch did not go in";
                     return false;
                 }
             } else {

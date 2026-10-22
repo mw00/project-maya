@@ -3021,8 +3021,9 @@ bool route_pair(const RoutePair& a, cudaStream_t s) {
         a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim)
         return false;
     route_pair_kernel<<<2, 512, 0, s>>>(a);
+    if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
     publish_kernel<<<1, 1, 0, s>>>(a.req, 1, a.seq, a.na0, a.na1);
-    return true;
+    return cudaGetLastError() == cudaSuccess;
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
 void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
@@ -3105,7 +3106,7 @@ bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, 
     if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0) return false;
     const int b0 = (int) cdiv(n0, kThreads / 32), b1 = (int) cdiv(n1, kThreads / 32);
     gemv_f32_pair_kernel<<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
-    return true;
+    return cudaGetLastError() == cudaSuccess;
 }
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     if (T == 1 || (T > 0 && std::getenv("DS4_ROUTER_ROWS") != nullptr && std::atoi(std::getenv("DS4_ROUTER_ROWS")) == 0))

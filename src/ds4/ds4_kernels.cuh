@@ -111,7 +111,8 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
 /// (DS4_ROUTE_FUSE) gemv_f32 for one token (T 1) of two matrices on the same x in one launch: y0 = x W0 (n0 rows), y1 =
-/// x W1 (n1 rows), each row gemv_f32's bits.  k a multiple of 4; false (nothing launched) otherwise.
+/// x W1 (n1 rows), each row gemv_f32's bits.  k a multiple of 4, else false and nothing launched; false too when the
+/// launch did not go in.
 bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
                    cudaStream_t s);
 
@@ -298,8 +299,9 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
 /// (DS4_ROUTE_FUSE) a decoded token's (T 1) route_publish and route_ahead in one launch of two blocks, each its old
 /// kernel's code (disjoint request fields), then publish_kernel as route_publish launches it (na0 / na1, T 1, seq).
-/// The caller passes bias_vl only when vl != 0, as route_publish does.  false (nothing launched): no request, n or
-/// a_n not 1 .. 1024, k not 1 .. kPicks, m < 1 or off + m past kAhead, dim not 1 .. kMaxDim.
+/// The caller passes bias_vl only when vl != 0, as route_publish does.  false, nothing launched: no request, n or a_n
+/// not 1 .. 1024, k not 1 .. kPicks, m < 1 or off + m past kAhead, dim not 1 .. kMaxDim; false, nothing published: the
+/// routing's launch did not go in; false: the publish's launch did not go in.
 struct RoutePair {
     const float *logits = nullptr, *bias = nullptr;   // route_publish's
     int n = 0, k = 0;
