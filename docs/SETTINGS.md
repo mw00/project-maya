@@ -30,6 +30,16 @@ goes into the config's `"env"` (`MAYA_GLM_PCIE_SHARE`, `MAYA_GLM_CPU_LANE`, `MAY
 `~/.config/project-maya/calibration.json` for this PC, model and context, so setting up again keeps it. Stop a
 running server first: the tuning needs the GPU(s).
 
+**The CPUs the engine runs on.** The CPU lane's threads share the engine's CPUs with the thread that issues every
+decode step and with the expert tiers' service threads (one a GPU), which are busy most of the time while experts sit in
+RAM; the lane's idle workers also spin for a while after each batch. The default thread count leaves a third of the
+cores to them only when the engine may use every CPU of a PC whose cores have no SMT siblings. Confined to fewer CPUs
+(`taskset`, a container's cpuset), the lane takes a thread for every core it may use, and a decode step then waits for
+a time slice as well as for its experts. So give the engine all the CPUs you can, on a hybrid CPU the efficiency cores
+as well as the performance cores, or, where it has to stay confined, set `MAYA_GLM_CPU_LANE` (`MAYA_GLM_CPU_LANE<n>`)
+lower so a few of its cores stay free. The start log says how many threads each GPU's lane has and what an expert
+costs there (`glm fast: CUDA0 CPU lane: 8 threads, an expert ... ms on the CPU vs ... ms over PCIe`).
+
 These settings change what the engine chooses (put them in the config with `--env`, or into its `"env"` block):
 
 | Setting | Default | |
