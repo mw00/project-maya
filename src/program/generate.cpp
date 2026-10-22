@@ -1721,8 +1721,8 @@ static int glm_pack_generate(const Options& o) {
         ckpt_drop_past(reuse);   // this prompt writes the state from `reuse` on (all of it after a reset)
         // THE TURN'S START: after restoring either the live snapshot or a conversation slot,
         // and invalidating checkpoints belonging to the overwritten conversation, keep the restored
-        // snapshot before prefill replaces it. A prompt that goes on from the snapshot and opens its last turn (<|user|> / <|observation|>)
-        // within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
+        // snapshot before prefill replaces it. A prompt that goes on from the snapshot and opens its last turn
+        // (<|user|> / <|observation|>) within 512 tokens of it gets no checkpoint there from ckpt_marks - so an edit of that turn's message read the
         // whole conversation again (13.5K tokens: 20.8 s).  The snapshot itself (the previous prompt but its last
         // token, a few tokens before the turn) is kept as a checkpoint instead: copied to host RAM on a side thread
         // while this prompt runs, so it costs the prompt nothing.  STRATA_GLM_CKPT_TURN=0: off.
