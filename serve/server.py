@@ -89,6 +89,22 @@ def wait_gpu_release(pid: int, timeout: float = 60.0):
     print(f"[maya] the GPUs still list the old engine after {timeout:.0f} s; starting anyway", flush=True)
 
 
+def nvml_pids(pid: int | None, listed: set) -> set:
+    """The pids NVML may list a process the server started under (the GPU map): its own - or, when NVML lists
+    processes but not that one, also those of every process it started in turn: an engine run through a launcher (a
+    script that does not exec it, `nsys launch`, a debugger) holds its GPU memory in a child of the process the server
+    started.  psutil finds them (setup installs it); without it, the pid alone."""
+    if pid is None:
+        return set()
+    if pid in listed or not listed:
+        return {pid}
+    try:
+        import psutil
+        return {pid} | {c.pid for c in psutil.Process(pid).children(recursive=True)}
+    except Exception:  # noqa: BLE001 - no psutil, or the process has just ended: the pid alone
+        return {pid}
+
+
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
@@ -1844,8 +1860,9 @@ class Service:
         v = self.vision
         vproc = getattr(v, "proc", None) if v is not None else None
         lent = v is not None and getattr(v, "lend", None) is not None and (vproc is not None or getattr(v, "owed", False))
-        return gpu_map.view(report, cards, proc.pid if proc is not None else None,
-                            vproc.pid if vproc is not None else None, lent)
+        listed = {pid for c in cards or [] for pid in c.get("procs") or {}}
+        return gpu_map.view(report, cards, nvml_pids(proc.pid if proc is not None else None, listed),
+                            nvml_pids(vproc.pid if vproc is not None else None, listed), lent)
 
     # the GLM engine's live STAT values (StrataEngine._parse_stat) exported as gauges: key -> help
     PROM_STAT = {"tok_s": "Decode rate over the running request, tokens/s",
