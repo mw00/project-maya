@@ -553,6 +553,12 @@ struct Dev {
     uint8_t* bounce = nullptr;
     cudaEvent_t ev_out = nullptr;
     float* tap = nullptr;   // a window's stream means before a DSpark target layer
+    // (DS4_DRAFT_DEV) a device that holds DSpark blocks: the drafter's main_proj / main_norm (each block device seeds
+    // its own blocks' rings from the taps), and the event its last read of h_taps recorded (the next taps wait for
+    // every block device's: wait_seed)
+    x3::Mat d_proj;
+    float* d_proj_norm = nullptr;
+    cudaEvent_t ev_seed = nullptr;
     // threads / tensor parallelism: its group and its index in it, the group's all-reduces it took part in, xfer_put's
     // block counter, the hand-off to the next group (host-mapped: h | pre | topk | cand, then its flag), the window
     // MoE's grouping scratch
@@ -990,10 +996,9 @@ struct Model::Impl {
     int head_dev = 0;
     x3::Mat head;
     float* norm_w = nullptr;          // on the head device
-    // the drafter: main_proj / main_norm (on its first block's device), its final norm, the markov head and the
-    // confidence head (on the head device: the drafts' logits come from the trunk's head)
-    x3::Mat d_main_proj;
-    float *d_main_norm = nullptr, *d_norm = nullptr, *d_conf = nullptr;
+    // the drafter: its final norm, the markov head and the confidence head (on the head device: the drafts' logits
+    // come from the trunk's head); main_proj / main_norm on every device that holds a block (Dev::d_proj)
+    float *d_norm = nullptr, *d_conf = nullptr;
     uint16_t *d_mk_embed = nullptr, *d_mk_head = nullptr;   // BF16 [vocab][rank], F16 [vocab][rank]
     // a head group of two or more: the markov steps over its members (each its rows of the bias and an argmax of its
     // share, the global one through host-mapped slots [step][member] {value, index, seq}) in place of the lead's whole
@@ -1003,9 +1008,10 @@ struct Model::Impl {
     unsigned* mk_slots = nullptr;
     unsigned mk_seq = 0;
     int d_dev = 0;                    // the drafter's first block's device
+    std::vector<int> draft_dev;       // DS4_DRAFT_DEV: each block's member of the drafter's group (draft_devs; empty: the lead)
     bool spec_win = false;            // the window being run is a draft's verification (layer() keeps backups)
-    float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps
-    cudaEvent_t ev_seed = nullptr;    // the drafter's seeding read h_taps: the next window's taps wait for it
+    float* h_taps = nullptr;          // pinned [kWin][targets][dim]: the last window's taps (each block device's seeding
+                                      // read it: Dev::ev_seed; the next window's taps wait for every one, wait_seed)
     float* d_confv = nullptr;         // on the head device
     int* d_ints = nullptr;            // on the head device: drafts in, picks out
     float conf_threshold = std::getenv("DS4_DSPARK_CONF") ? (float) std::atof(std::getenv("DS4_DSPARK_CONF")) : 0.5f;
@@ -2632,7 +2638,12 @@ struct Model::Impl {
             }
             for (Layer& l : L) {
                 l.dev = groups[(size_t) l.grp].mem[0];
-                l.nm = l.mtp ? 1 : (int) groups[(size_t) l.grp].mem.size();   // (the drafter's blocks: on the lead alone)
+                l.nm = l.mtp ? 1 : (int) groups[(size_t) l.grp].mem.size();   // (the drafter's blocks: whole, on the lead
+            }                                                                  //  unless DS4_DRAFT_DEV names their members)
+            if (!draft_devs(err)) return false;
+            for (size_t i = 0; i < draft_dev.size(); ++i) {
+                Layer& l = L[(size_t) g.nl + i];
+                l.dev = groups[(size_t) l.grp].mem[(size_t) draft_dev[i]];
             }
             head_dev = L[(size_t) g.nl - 1].dev;
             d_dev = g.n_mtp > 0 ? L[(size_t) g.nl].dev : 0;
@@ -2841,9 +2852,13 @@ struct Model::Impl {
         }
         if (g.n_mtp > 0) {
             if (!halloc(h_taps, (size_t) tap_cap * g.d_targets.size() * g.dim, err)) return false;
-            CK(cudaSetDevice(devs[(size_t) d_dev].id));
-            CK(cudaEventCreateWithFlags(&ev_seed, cudaEventDisableTiming));
-            CK(cudaEventRecord(ev_seed, devs[(size_t) d_dev].st));
+            for (size_t di = 0; di < devs.size(); ++di) {   // (each block device: its seeding's event, recorded once)
+                if (!block_dev((int) di)) continue;
+                Dev& d = devs[di];
+                CK(cudaSetDevice(d.id));
+                CK(cudaEventCreateWithFlags(&d.ev_seed, cudaEventDisableTiming));
+                CK(cudaEventRecord(d.ev_seed, d.st));
+            }
         }
         // the dense weights, each device's layers by a thread of its own
         {
@@ -4289,9 +4304,9 @@ struct Model::Impl {
                     return false;
             }
         }
-        if (g.n_mtp > 0 && di == d_dev) {
-            if (!mat(d, "mtp.0.main_proj", d_main_proj, err, acct) ||
-                !f32(d, "mtp.0.main_norm.weight", d_main_norm, err, acct, (size_t) g.dim))
+        if (g.n_mtp > 0 && block_dev(di)) {   // (every device with a block seeds its own: DS4_DRAFT_DEV)
+            if (!mat(d, "mtp.0.main_proj", d.d_proj, err, acct) ||
+                !f32(d, "mtp.0.main_norm.weight", d.d_proj_norm, err, acct, (size_t) g.dim))
                 return false;
         }
         return true;
@@ -4429,6 +4444,70 @@ struct Model::Impl {
         return true;
     }
 
+    // (DS4_DRAFT_DEV) whether device di holds a DSpark block
+    bool block_dev(int di) const {
+        for (int i = 0; i < g.n_mtp; ++i)
+            if (L[(size_t) (g.nl + i)].dev == di) return true;
+        return false;
+    }
+    // the drafter's seeding read h_taps on every block device: a stream about to write the taps waits for each
+    bool wait_seed(cudaStream_t s, std::string& err) {
+        for (Dev& e : devs)
+            if (e.ev_seed != nullptr) CK(cudaStreamWaitEvent(s, e.ev_seed, 0));
+        return true;
+    }
+    // MAYA_DS4_DRAFT_DEV=m, or m0,m1,.. a block (read as STRATA_DS4_DRAFT_DEV, or DS4_DRAFT_DEV): the member of the
+    // drafter's group each DSpark block runs on (0: the lead, as before).  place_experts gives a block's VRAM experts out
+    // of its own member's room: a tensor-parallel group's members hold the same trunk slots, so every drafter byte on the
+    // lead leaves as many idle on the others - with the blocks spread, the tightest member has more left for the trunk.
+    // A block on another member than the one before it: its rows go through pinned host memory, as a layer split's
+    // groups hand theirs.  Not whole numbers 0 .. the members less one, a count of values neither 1 nor the blocks', no
+    // blocks (--dspark none): the load fails.  Unset: every block on the lead, placed as before.
+    bool draft_devs(std::string& err) {
+        draft_dev.clear();
+        const char* v = std::getenv("STRATA_DS4_DRAFT_DEV");
+        if (v == nullptr) v = std::getenv("DS4_DRAFT_DEV");
+        if (v == nullptr) return true;
+        if (g.n_mtp == 0) {
+            err = std::string("DS4_DRAFT_DEV=") + v + ": no DSpark blocks loaded (--dspark none)";
+            return false;
+        }
+        const Group& G = groups[(size_t) L[(size_t) g.nl].grp];
+        const int nm = (int) G.mem.size();
+        std::vector<long> n;
+        bool ok = *v != '\0';
+        long cur = -1;
+        for (const char* q = v; ok; ++q) {
+            if (*q >= '0' && *q <= '9') {
+                cur = (cur < 0 ? 0 : cur * 10) + (*q - '0');
+                ok = cur <= 1000000;
+            } else if ((*q == ',' || *q == '\0') && cur >= 0) {
+                n.push_back(cur);
+                cur = -1;
+                if (*q == '\0') break;
+            } else {
+                ok = false;
+            }
+        }
+        ok = ok && (n.size() == 1 || n.size() == (size_t) g.n_mtp);
+        for (const long m : n) ok = ok && m < nm;
+        if (!ok) {
+            err = std::string("DS4_DRAFT_DEV=") + v + ": not one whole number, or one a block (" + std::to_string(g.n_mtp) +
+                  "), each 0 .. " + std::to_string(nm - 1) + " (the drafter's group's members)";
+            return false;
+        }
+        if (n.size() == 1) n.assign((size_t) g.n_mtp, n[0]);   // (one value: every block)
+        for (const long m : n) draft_dev.push_back((int) m);
+        std::string where;
+        for (int i = 0; i < g.n_mtp; ++i)
+            where += std::string(i ? ", " : "") + std::to_string(i) + " on CUDA" +
+                     std::to_string(devs[(size_t) G.mem[(size_t) draft_dev[(size_t) i]]].id) + " (member " +
+                     std::to_string(draft_dev[(size_t) i]) + ")";
+        std::fprintf(stderr, "ds4: DS4_DRAFT_DEV %s: DSpark block %s - each block's experts out of its own member's room\n",
+                     v, where.c_str());
+        return true;
+    }
+
     bool place_experts(std::string& err) {
         // a mixed-precision quant (layers with experts in several layouts): every expert of those layers
         // in VRAM, in its class's arena - one GPU, no lending of the experts' room (the prompt path keeps its own)
@@ -4509,24 +4588,36 @@ struct Model::Impl {
                     mroom[0] -= b;
                     l.n_vram = l.n_exp;
                 }
-            // the drafter's experts first (every draft uses its blocks) - its blocks are the lead's alone, so they take
-            // the lead's room; the trunk's layers then what the tightest member has left
-            double others = -1;   // the room of the group's tightest member but the lead (-1: the lead is alone)
-            for (size_t m = 1; m < mroom.size(); ++m) others = others < 0 ? mroom[m] : std::min(others, mroom[m]);
+            // the drafter's experts first (every draft uses its blocks) - a block is its member's alone (the lead's,
+            // unless DS4_DRAFT_DEV names another), so it takes that member's room; the trunk's layers then what the
+            // tightest member has left
+            const std::vector<int>& gm = groups[gi].mem;
+            auto bm = [&](const Layer& l) -> size_t {   // (the member a block runs on)
+                for (size_t m = 0; m < gm.size(); ++m)
+                    if (gm[m] == l.dev) return m;
+                return 0;
+            };
+            auto others = [&](size_t m) -> double {   // (the room of the group's tightest member but m)
+                double r = 1e300;
+                for (size_t k = 0; k < mroom.size(); ++k)
+                    if (k != m) r = std::min(r, mroom[k]);
+                return r;
+            };
             bool dseen = false;
             for (const Layer& l : L)
                 if (l.grp == (int) gi && l.mtp && l.n_cls == 1)
                     for (int e = 0; e < l.n_exp; ++e) dseen = dseen || prof[(size_t) l.il * g.n_exp + e] > 0;
-            if (others < 0 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {   // all of them, as room goes
+            if (mroom.size() == 1 || !dseen || std::getenv("DS4_PLACE_UNIFORM") != nullptr) {   // all of them, as room goes
                 for (Layer& l : L)
                     if (l.grp == (int) gi && l.mtp && l.n_cls == 1) {
-                        l.n_vram = std::min(l.n_exp, (int) std::floor(mroom[0] / (double) ucount(l)));
-                        mroom[0] -= (double) l.n_vram * ucount(l);
+                        double& r = mroom[bm(l)];
+                        l.n_vram = std::min(l.n_exp, (int) std::floor(r / (double) ucount(l)));
+                        r -= (double) l.n_vram * ucount(l);
                     }
             } else {
-                // by the profile: each block's experts that take 99% of its routes always, the others only while the
-                // lead keeps the room of the next tightest member (past it, each drafter expert's bytes on the lead
-                // are as many trunk experts lost on every member: a trunk expert in VRAM takes its part on each)
+                // by the profile: each block's experts that take 99% of its routes always, the others only while its
+                // member keeps the room of the next tightest member (past it, each drafter expert's bytes on that
+                // member are as many trunk experts lost on every member: a trunk expert in VRAM takes its part on each)
                 std::vector<std::vector<double>> sh(L.size());
                 using Top = std::pair<double, int>;   // (the next expert's share a byte, layer)
                 std::priority_queue<Top> pq;
@@ -4540,16 +4631,18 @@ struct Model::Impl {
                     std::sort(s.begin(), s.end(), std::greater<double>());
                     int keep = 0;
                     for (double c = 0; keep < l.n_exp && c < 0.99; ++keep) c += s[(size_t) keep];
-                    l.n_vram = std::min(keep, (int) std::floor(mroom[0] / (double) ucount(l)));
-                    mroom[0] -= (double) l.n_vram * ucount(l);
+                    double& r = mroom[bm(l)];
+                    l.n_vram = std::min(keep, (int) std::floor(r / (double) ucount(l)));
+                    r -= (double) l.n_vram * ucount(l);
                     if (l.n_vram < l.n_exp) pq.push({s[(size_t) l.n_vram] / ucount(l), l.il});
                 }
                 while (!pq.empty()) {
                     const int il = pq.top().second;
                     pq.pop();
                     Layer& l = L[(size_t) il];
-                    if (mroom[0] - ucount(l) < others) continue;
-                    mroom[0] -= ucount(l);
+                    const size_t m = bm(l);
+                    if (mroom[m] - ucount(l) < others(m)) continue;
+                    mroom[m] -= ucount(l);
                     if (++l.n_vram < l.n_exp) pq.push({sh[(size_t) il][(size_t) l.n_vram] / ucount(l), il});
                 }
             }
@@ -5319,11 +5412,15 @@ struct Model::Impl {
             const size_t gsz = groups.empty() ? 1 : groups[(size_t) d.grp].mem.size();
             char tp[64] = "";
             if (gsz > 1) std::snprintf(tp, sizeof tp, " (tensor parallel %zu, part %d)", gsz, d.mi);
+            char dr[48] = "";   // (DS4_DRAFT_DEV: the DSpark blocks this device holds)
+            for (int i = 0; i < g.n_mtp && !draft_dev.empty(); ++i)
+                if (L[(size_t) (g.nl + i)].dev == (int) di)
+                    std::snprintf(dr + std::strlen(dr), sizeof dr - std::strlen(dr), "%s%d", *dr ? "," : " + blocks ", i);
             char line[384];
             std::snprintf(line, sizeof line,
-                          "ds4: CUDA%d layers [%d, %d]%s%s: weights %.2f GB, experts %.2f GB (%d of %d in VRAM), caches "
+                          "ds4: CUDA%d layers [%d, %d]%s%s%s: weights %.2f GB, experts %.2f GB (%d of %d in VRAM), caches "
                           "%.2f GB, %.0f MiB free\n",
-                          d.id, a, b, tp, (int) di == head_dev ? " + head" : "", d.weights / 1e9, d.experts / 1e9, ev, et,
+                          d.id, a, b, tp, (int) di == head_dev ? " + head" : "", dr, d.weights / 1e9, d.experts / 1e9, ev, et,
                           d.caches / 1e9, fr / 1048576.0);
             s << line;
         }
@@ -8362,36 +8459,41 @@ struct Model::Impl {
             err = "seeding the drafter with " + std::to_string(n) + " rows";
             return false;
         }
-        Dev& d = devs[(size_t) d_dev];
-        cudaSetDevice(d.id);
         const int nt = (int) g.d_targets.size(), D = g.dim, HD = g.hd;
         if (dump_d != nullptr) {   // DS4_DSPARK_DUMP: 'S', the first position, the rows, then the taps
             for (Dev& e : devs) {
                 cudaSetDevice(e.id);
                 CK(cudaStreamSynchronize(e.st));
             }
-            cudaSetDevice(d.id);
             const int64_t hdr[4] = {'S', p0, n, (int64_t) nt * D};
             std::fwrite(hdr, 8, 4, dump_d);
             std::fwrite(h_taps + (size_t) row0 * nt * D, 4, (size_t) n * nt * D, dump_d);
             std::fflush(dump_d);
         }
-        for (int a = 0; a < n; a += kWin) {   // (a chunk's last 128 rows: 16 a GEMV)
-            const int na = std::min(kWin, n - a);
-            CK(cudaMemcpyAsync(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
-                               cudaMemcpyHostToDevice, d.st));
-            if (!mv(d, {job(d_main_proj, d.xe, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
-        }
-        CK(cudaEventRecord(ev_seed, d.st));
-        Finish fm;
-        fm.w = d_main_norm;
-        fm.eps = g.eps;
-        finish(d.ed, n, D, D, fm, d.st);
+        // each block device (DS4_DRAFT_DEV: more than one) projects the taps itself - main_proj / main_norm are on every
+        // one - then seeds its own blocks' rings, in block order; no row crosses the cards
+        std::vector<char> projected(devs.size(), 0);
         for (int i = 0; i < g.n_mtp; ++i) {
             Layer& l = L[(size_t) (g.nl + i)];
-            if (l.dev != d_dev) {
-                err = "the DSpark blocks are split across devices";
-                return false;
+            Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            if (!projected[(size_t) l.dev]) {
+                if (d.d_proj_norm == nullptr) {
+                    err = "CUDA" + std::to_string(d.id) + " holds DSpark block " + std::to_string(i) + " but not main_proj";
+                    return false;
+                }
+                for (int a = 0; a < n; a += kWin) {   // (a chunk's last 128 rows: 16 a GEMV)
+                    const int na = std::min(kWin, n - a);
+                    CK(cudaMemcpyAsync(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4,
+                                       cudaMemcpyHostToDevice, d.st));
+                    if (!mv(d, {job(d.d_proj, d.xe, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
+                }
+                CK(cudaEventRecord(d.ev_seed, d.st));
+                Finish fm;
+                fm.w = d.d_proj_norm;
+                fm.eps = g.eps;
+                finish(d.ed, n, D, D, fm, d.st);
+                projected[(size_t) l.dev] = 1;
             }
             for (int a = 0; a < n; a += kWin) {
                 const int na = std::min(kWin, n - a);
@@ -8461,31 +8563,49 @@ struct Model::Impl {
         if (dump_d != nullptr && h_dump == nullptr &&
             (!halloc(h_dump, (size_t) g.n_mtp * kWin * H * D, err) || !halloc(h_dump_ring, (size_t) g.n_mtp * rs, err)))
             return false;
+        int cur = d_dev;   // the device the block's rows are on
         for (int i = 0; i < g.n_mtp; ++i) {
             Layer& l = L[(size_t) (g.nl + i)];
+            if (l.dev != cur) {   // (DS4_DRAFT_DEV: the next block on another card - its rows through pinned host memory,
+                Dev& a = devs[(size_t) cur];   //  as a layer split's groups hand theirs: h, then pre)
+                Dev& b = devs[(size_t) l.dev];
+                const size_t nh = (size_t) T * H * D * 4, np = (size_t) T * 8 * 4;
+                cudaSetDevice(a.id);
+                CK(cudaMemcpyAsync(a.bounce, a.h, nh, cudaMemcpyDeviceToHost, a.st));
+                CK(cudaMemcpyAsync(a.bounce + nh, a.pre, np, cudaMemcpyDeviceToHost, a.st));
+                CK(cudaEventRecord(a.ev_out, a.st));
+                cudaSetDevice(b.id);
+                CK(cudaStreamWaitEvent(b.st, a.ev_out, 0));
+                CK(cudaMemcpyAsync(b.h, a.bounce, nh, cudaMemcpyHostToDevice, b.st));
+                CK(cudaMemcpyAsync(b.pre, a.bounce + nh, np, cudaMemcpyHostToDevice, b.st));
+                cur = l.dev;
+            }
+            Dev& db = devs[(size_t) cur];
             if (dump_d != nullptr) {   // (stream order: the ring the block reads - as BF16 rows - the stream it leaves)
-                ring_to_ext(l.win, d.ext, g.win, g.win, g.hd, d.st);
-                CK(cudaMemcpyAsync(h_dump_ring + (size_t) i * rs, d.ext, rs * 2, cudaMemcpyDeviceToHost, d.st));
+                cudaSetDevice(db.id);
+                ring_to_ext(l.win, db.ext, g.win, g.win, g.hd, db.st);
+                CK(cudaMemcpyAsync(h_dump_ring + (size_t) i * rs, db.ext, rs * 2, cudaMemcpyDeviceToHost, db.st));
             }
             if (!layer(l, 0, p0, T, dp, err)) return false;
             if (dump_d != nullptr) {
-                cudaSetDevice(d.id);
-                CK(cudaMemcpyAsync(h_dump + (size_t) i * hs, d.h, hs * 4, cudaMemcpyDeviceToHost, d.st));
+                cudaSetDevice(db.id);
+                CK(cudaMemcpyAsync(h_dump + (size_t) i * hs, db.h, hs * 4, cudaMemcpyDeviceToHost, db.st));
             }
         }
-        cudaSetDevice(d.id);
-        hc_pre_norm(d.h, d.pre, nullptr, D, H, T, g.eps, d.x, d.st);   // (the confidence head reads it before the norm)
+        Dev& dl = devs[(size_t) cur];   // the last block's device: the drafts' rows
+        cudaSetDevice(dl.id);
+        hc_pre_norm(dl.h, dl.pre, nullptr, D, H, T, g.eps, dl.x, dl.st);   // (the confidence head reads it before the norm)
         Dev& hd = devs[(size_t) head_dev];
-        // (through the host to the head's device, and to the head group's other members - the drafter's device can be
-        // the head group's lead itself, a group of every GPU)
-        if (d_dev != head_dev || groups[(size_t) hd.grp].mem.size() > 1) {
-            CK(cudaMemcpyAsync(d.bounce, d.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, d.st));
-            CK(cudaEventRecord(d.ev_out, d.st));
+        // (through the host to the head's device, and to the head group's other members - the last block's device can
+        // be the head group's lead itself, a group of every GPU, or one of its other members)
+        if (cur != head_dev || groups[(size_t) hd.grp].mem.size() > 1) {
+            CK(cudaMemcpyAsync(dl.bounce, dl.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, dl.st));
+            CK(cudaEventRecord(dl.ev_out, dl.st));
         }
-        if (d_dev != head_dev) {
+        if (cur != head_dev) {
             cudaSetDevice(hd.id);
-            CK(cudaStreamWaitEvent(hd.st, d.ev_out, 0));
-            CK(cudaMemcpyAsync(hd.x, d.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, hd.st));
+            CK(cudaStreamWaitEvent(hd.st, dl.ev_out, 0));
+            CK(cudaMemcpyAsync(hd.x, dl.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, hd.st));
         }
         // the drafter's final norm and the trunk's head, on every member of the head group (the others' shares first)
         const std::vector<int>& hg = groups[(size_t) hd.grp].mem;
@@ -8493,11 +8613,11 @@ struct Model::Impl {
         for (int m = (int) hg.size() - 1; m >= 0; --m) {
             Dev& e = devs[(size_t) hg[(size_t) m]];
             cudaSetDevice(e.id);
-            if (m > 0) {
-                CK(cudaStreamWaitEvent(e.st, d.ev_out, 0));
-                CK(cudaMemcpyAsync(e.ao, d.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, e.st));
-            } else
-                CK(cudaMemcpyAsync(e.ao, e.x, (size_t) T * D * 4, cudaMemcpyDeviceToDevice, e.st));
+            if (m > 0 && &e != &dl) {
+                CK(cudaStreamWaitEvent(e.st, dl.ev_out, 0));
+                CK(cudaMemcpyAsync(e.ao, dl.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, e.st));
+            } else   // (the lead's x came from the last block's device above; a member that is that device: its own)
+                CK(cudaMemcpyAsync(e.ao, m > 0 ? dl.x : e.x, (size_t) T * D * 4, cudaMemcpyDeviceToDevice, e.st));
             Finish fn;
             fn.w = e.d_norm;
             fn.eps = g.eps;
@@ -8561,8 +8681,11 @@ struct Model::Impl {
         if (dump_d != nullptr) {   // 'D', the block's position, y, T, then the drafts, their confidences, the hidden
             std::vector<float> xs((size_t) T * D);   // rows before the final norm; then each block's ring and stream
             CK(cudaMemcpy(xs.data(), hd.x, xs.size() * 4, cudaMemcpyDeviceToHost));
-            cudaSetDevice(d.id);
-            CK(cudaStreamSynchronize(d.st));
+            for (Dev& e : devs)   // (every block device's dump copies)
+                if (block_dev((int) (&e - &devs[0]))) {
+                    cudaSetDevice(e.id);
+                    CK(cudaStreamSynchronize(e.st));
+                }
             const int64_t hdr[4] = {'D', p0, y, T};
             std::fwrite(hdr, 8, 4, dump_d);
             std::fwrite(tok + 1, 4, (size_t) T, dump_d);
@@ -9332,7 +9455,7 @@ struct Model::Impl {
                         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
                         const int nr = std::min(T, tap_cap);
                         hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, d.tap, D, s);
-                        CK(cudaStreamWaitEvent(s, ev_seed, 0));
+                        if (!wait_seed(s, err)) return false;
                         CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4,
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
@@ -9556,7 +9679,7 @@ struct Model::Impl {
                         const size_t j = (size_t) (it - g.d_targets.begin()), nt = g.d_targets.size();
                         const int nr = std::min(T, tap_cap);
                         hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, d.tap, D, s);
-                        CK(cudaStreamWaitEvent(s, ev_seed, 0));
+                        if (!wait_seed(s, err)) return false;
                         CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4,
                                              (size_t) nr, cudaMemcpyDeviceToHost, s));
                     }
@@ -10572,7 +10695,7 @@ struct Model::Impl {
         const int D = g.dim;
         cudaSetDevice(d.id);
         hc_mean(d.h, T, g.hc, D, d.tap, D, d.st);
-        CK(cudaStreamWaitEvent(d.st, ev_seed, 0));
+        if (!wait_seed(d.st, err)) return false;
         CK(cudaMemcpy2DAsync(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) T,
                              cudaMemcpyDeviceToHost, d.st));
         return true;
