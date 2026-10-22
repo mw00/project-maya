@@ -58,6 +58,16 @@ cmake -S . -B build-gfx906 \
 cmake --build build-gfx906 --target maya --parallel 8
 ```
 
+To reconstruct the matched control from the frozen implementation/corpus snapshot, retain the architecture registration but restore the intrinsic implementation and tests to the upstream base:
+
+```sh
+git worktree add --detach ../maya-mi50-control 72e7d76d677da8c46ad46bb8241cda5b20b1c3d5
+git -C ../maya-mi50-control restore --source=c9683e31192c35a8e93469d4134a290eefb57eca -- \
+  include/strata/hip_compat/intrinsics.hpp tests/hip/intrinsics.cpp
+```
+
+Build the control separately with the same recipe and use identical model/configuration inputs. Do not share build directories between arms.
+
 With serving stopped and exclusive access to the four GPUs, build and run the selected checks from the checkout root. Configure your compatible ROCm library paths first, including `ROCBLAS_TENSILE_LIBPATH` if required:
 
 ```sh
@@ -96,7 +106,7 @@ This is a selected GLM/HIP suite, not a blanket CTest or all-model qualification
 | Same applicable parity set on the Radeon AI PRO R9700 regression build | 16 checks passed |
 | Service restoration after validation windows | Pass |
 
-A fused-prefill check printed `SKIP` on the R9700 run because that target is compiled only for `gfx1100`/`gfx1151`; it is excluded from the MI50 check count. This check does not establish fused-prefill support on `gfx906`.
+A fused-prefill check printed `SKIP` on the R9700 run because that target is compiled only for `gfx1100`/`gfx1151`; it is not included in either applicable-suite count. This check does not establish fused-prefill support on `gfx906`.
 
 ## Model packs and run settings
 
@@ -132,6 +142,20 @@ validation requests override: temperature 0, reasoning effort none, max_tokens 3
 
 Processes were pinned to CPU 0-31,64-95 and NUMA memory node 0. Libraries resolved through `/opt/rocm/lib` and `/opt/rocm-7.2.0/lib`. Path-specific values for model files, executable, slot directory, logs, and tokenizer are intentionally omitted. Those paths do not affect the documented settings and are machine-local.
 
+Recorded SHA-256 identifiers (metadata hashes identify the existing packs; full expert shards were not rehashed):
+
+```text
+control gfx906 executable: 845afab37550eeff7d1ca23552564e7fa39d11ca31ee2462360a671fba3f22e1
+patch gfx906 executable: 19ded2f457293c23fd753217fe0afdc9abc4d137b329a90edcf3149ff1c87532
+Maya-M index.txt: 73706db6223e225025b034fae6c69dd0f3188c14c0f83bf4dce9d5fa2d2882e1
+Maya-M native_experts.txt: a53732d7d32ad3cb8f7b3174dfe01034f81238b3f482a54d34721e483efcd6d1
+Maya-M compat-bf16.json: 7b2780dea25fbd3c12f4f34249ff95a3a8631db6c6f58ed1785730759899d0ac
+Maya-L index.txt: 5d5690818008a6ed3cb265c94fad5dacacedca785c4a1a1c4a08721e18c160a7
+Maya-L native_experts.txt: 348a9cec64bf30691d48b6df5a767b4cda174182c166d8d059bd1f1c344d6024
+Maya-L compat-bf16.json: cc1593f841dc434b572709cbb0a10e926ffa8d55738126c45e82981567447b9e
+expert-profile-glm.bin: 53b03a13482b6fedc599d149be2d69f88c38d9edc4611a740da46314ab1dc5a7
+```
+
 ## Upstream benchmark protocol and results
 
 Use Maya's standard benchmark while the server is stopped, then capture a report:
@@ -142,7 +166,7 @@ python maya.py --backend hip --config /path/to/mi50-config.json --bench
 python maya.py --backend hip --config /path/to/mi50-config.json --report
 ```
 
-The standard comparison uses greedy decoding, thinking off, three 256-token answers, and a short warm-up; prefill is measured at 2,048 and 8,192 prompt tokens. The table below uses matched control/candidate runs. The benchmark used the document corpus committed at `72e7d76d677da8c46ad46bb8241cda5b20b1c3d5`; this results page was filled in afterward. Check out that snapshot to reproduce the measured corpus. Its SHA-256 was `66b02705575a889091f4accf20b8650568a015557c0d6ec9cfc1618ba445d3e0`.
+The standard comparison uses greedy decoding, thinking off, three answers capped at 256 tokens, and a short warm-up; prefill is measured at 2,048 and 8,192 prompt tokens. The table below uses matched control/candidate runs. The benchmark used the document corpus committed at `72e7d76d677da8c46ad46bb8241cda5b20b1c3d5`; this results page was filled in afterward. Check out that snapshot to reproduce the measured corpus. Its SHA-256 was `66b02705575a889091f4accf20b8650568a015557c0d6ec9cfc1618ba445d3e0`.
 
 | Model | Arm/order | 2K prefill (tok/s) | 8K prefill (tok/s) | Mean decode (tok/s) | Run status |
 |---|---|---:|---:|---:|---|
