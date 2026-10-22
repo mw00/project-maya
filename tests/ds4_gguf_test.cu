@@ -143,6 +143,14 @@ double swiglu(double g, double u, double lim) {
 }
 
 void expect(const char* what, const float* got, const double* want, size_t n, double rtol) {
+    // every value finite first, on both sides: a NaN would drop out of the max below (and the next finite error take
+    // its place), an Inf in want would make the scale infinite
+    for (size_t i = 0; i < n; ++i)
+        if (!std::isfinite(got[i]) || !std::isfinite(want[i])) {
+            ++g_fail;
+            std::printf("%-44s FAIL  not finite (at %zu: %.6g vs %.6g)\n", what, i, (double) got[i], want[i]);
+            return;
+        }
     double worst = 0, scale = 1e-30;
     for (size_t i = 0; i < n; ++i) scale = std::max(scale, std::fabs(want[i]));
     size_t at = 0;
