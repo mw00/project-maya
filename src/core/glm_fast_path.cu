@@ -18,6 +18,7 @@
 #include "glm_fast_state.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/tier_policy.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -1433,7 +1434,15 @@ bool Glm5Model::fast_setup(std::string& err) {
                      F->complete ? (" - complete: every expert, " + std::to_string(gf::kSpares) + " spares and " +
                                     std::to_string(k_extra) + " lendable slots a layer").c_str()
                                  : "");
-        if (getenv("STRATA_GLM_TIMING") != nullptr) {
+        {   // the tier rules in use (tier_policy.hpp), when any is not the default
+            const strata::core::TierPolicy& tp = strata::core::tier_policy();
+            if (tp.half != 32768 || tp.prompt_w != 1.0)
+                std::fprintf(stderr, "glm fast: CUDA%d tier counts halved every %llu events (MAYA_GLM_COUNT_HALF), a "
+                                     "prompt's routing counted x%.2f (MAYA_GLM_PROMPT_COUNTS)\n",
+                             dev_, (unsigned long long) tp.half, tp.prompt_w);
+        }
+        // (a route log's replay needs each layer's slots: printed with it too)
+        if (getenv("STRATA_GLM_TIMING") != nullptr || getenv("STRATA_GLM_ROUTE_LOG") != nullptr) {
             std::string sl;
             for (int il = l0_; il < lt_; ++il)
                 if (F->L[(size_t) il].moe) sl += std::to_string(il) + ":" + std::to_string(nsl[(size_t) il]) + " ";
@@ -4134,7 +4143,7 @@ void Glm5Model::fast_service() {
                 }
             }
             F->cnt_events += (uint64_t) K;
-            if (F->cnt_events >= 32768) {
+            if (F->cnt_events >= strata::core::tier_policy().half) {   // (STRATA_GLM_COUNT_HALF; 32768 as before)
                 F->cnt_events = 0;
                 for (auto& c : F->cnt) c >>= 1;
             }

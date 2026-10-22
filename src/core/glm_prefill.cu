@@ -19,6 +19,7 @@
 #include "glm_fast_state.hpp"
 
 #include "strata/core/progress.hpp"
+#include "strata/core/tier_policy.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -2873,24 +2874,25 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     src = RC.base + (size_t) rs * RC.stride;
                 staged.push_back(Staged{e, src, dev});
             }
-            // the prompt's routing feeds the LFU counts the decode's tiers evict by
+            // the prompt's routing feeds the LFU counts the decode's tiers evict by (STRATA_GLM_PROMPT_COUNTS: with
+            // a weight, 0 = not at all; tier_policy.hpp)
+            const strata::core::TierPolicy& tp = strata::core::tier_policy();
             uint64_t ev = 0;
             for (int e = 0; e < NE; ++e) {
                 const int cnt = std::abs(S->h_counts[e]);
                 if (cnt == 0) continue;
+                const uint64_t wc = strata::core::tier_prompt_count((uint64_t) cnt, tp.prompt_w);
                 uint32_t& cc = F->cnt[(size_t) il * NE + e];
-                cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + (uint64_t) cnt, 1u << 24);
-                ev += (uint64_t) cnt;
+                cc = (uint32_t) std::min<uint64_t>((uint64_t) cc + wc, 1u << 24);
+                ev += wc;
                 uint32_t& uu = F->usage[(size_t) il * NE + e];
                 uu = (uint32_t) std::min<uint64_t>((uint64_t) uu + (uint64_t) cnt, 1u << 30);
                 if (uu >= (1u << 30))
                     for (auto& u : F->usage) u >>= 1;
             }
-            F->cnt_events += ev;
-            while (F->cnt_events >= 32768) {
-                F->cnt_events -= 32768;
-                for (auto& cc : F->cnt) cc >>= 1;
-            }
+            const int nh = strata::core::tier_halvings(F->cnt_events, ev, tp.half);
+            if (nh > 0)
+                for (auto& cc : F->cnt) cc = strata::core::tier_halved(cc, nh);
             auto& lc = S->last_cnt[(size_t) il];
             lc.resize((size_t) NE);
             for (int e = 0; e < NE; ++e) lc[(size_t) e] = std::abs(S->h_counts[e]);
