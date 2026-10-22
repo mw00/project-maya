@@ -27,8 +27,8 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
     // RDNA2 has no sudot4 (that is gfx11+), but it has the plain signed v_dot4_i32_i8 (dot1-insts): the same
     // signed x signed byte products accumulated modulo 2^32, no clamp. CDNA1 gfx908 (MI100) has the same builtin.
     return __builtin_amdgcn_sdot4(a, b, c, false);
-#elif defined(__gfx908__) && __has_builtin(__builtin_amdgcn_sdot4)
-    // CDNA1 (MI100): v_dot4_i32_i8, the same signed dot4 the wave64 compat layer relies on.
+#elif (defined(__gfx906__) || defined(__gfx908__)) && __has_builtin(__builtin_amdgcn_sdot4)
+    // Vega20 (MI50) / CDNA1 (MI100): v_dot4_i32_i8, the same signed dot4 the wave64 compat layer relies on.
     return __builtin_amdgcn_sdot4(a, b, c, false);
 #elif defined(__gfx1012__) && !defined(STRATA_GFX1012_PORTABLE_DOT)
     // RDNA1 has no native signed dot4. SDWA selects and sign-extends byte

@@ -49,6 +49,13 @@ Available RAM, rather than installed RAM, determines how much can be cached.
 The engine reduces its RAM-tier allocation if ROCm cannot pin the requested
 amount.
 
+## Experimental MI50 source builds
+
+Vega20 MI50 (`gfx906`) can be selected explicitly in a source build using the
+existing logical-32-lane wave64 compatibility layer. This does not add MI50
+to the installer device list. See [MI50 build and validation](MI50_VALIDATION.md)
+for the tested Maya-M / Maya-L configurations and Maya-S limitations.
+
 ## CPU image encoder on Linux
 
 HIP setup skips the image encoder, but the server can use the existing CPU-only
