@@ -1760,8 +1760,13 @@ struct Model::Impl {
             return false;
         }
         if (np > 1) {
-            const int whole = cols ? n : k, wd = whole / np;
-            if (whole % np != 0 || wd % (q8 ? 32 : 8) != 0) {
+            const int whole = cols ? n : k;
+            int wd = whole / np, c0 = part * wd;
+            // outputs that do not split evenly (a 129280-column head over 3): split128's shares, as head_cols takes them
+            const bool uneven = cols && whole % np != 0 && whole % 128 == 0 && whole / 128 >= np;
+            if (uneven)
+                split128(whole, np, part, c0, wd);
+            else if (whole % np != 0 || wd % (q8 ? 32 : 8) != 0) {
                 err = pre + ": " + std::to_string(whole) + (cols ? " outputs" : " inputs") + " do not split in " +
                       std::to_string(np) + " parts";
                 return false;
@@ -1769,7 +1774,7 @@ struct Model::Impl {
             const size_t rb = bytes_of((size_t) k);
             std::vector<uint8_t> p;
             if (cols) {
-                p.assign(w.begin() + (long) ((size_t) part * wd * rb), w.begin() + (long) ((size_t) (part + 1) * wd * rb));
+                p.assign(w.begin() + (long) ((size_t) c0 * rb), w.begin() + (long) ((size_t) (c0 + wd) * rb));
                 n = wd;
             } else {
                 const size_t pb = bytes_of((size_t) wd);
@@ -2344,8 +2349,14 @@ struct Model::Impl {
                 const int ty = gg_type_of(kv.second.dtype);
                 if (ty >= 0) blk = std::max(blk, gg::type_block(ty));
             }
-            while (tp > 1 && (g.ff % tp != 0 || (g.ff / tp) % blk != 0 || (g.ff / tp) % 128 != 0 || g.heads % tp != 0 ||
-                              g.o_groups % tp != 0))
+            // DS4_TP_UNEVEN_HEADS=1 (experimental): keep a width the heads do not split in evenly - the layers' own
+            // check takes the heads over head_members(tp) of the members, as a non-GGUF pack's do (64 heads, tp 3: 2)
+            static const bool uneven_heads = [] {
+                const char* e = std::getenv("DS4_TP_UNEVEN_HEADS");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            while (tp > 1 && (g.ff % tp != 0 || (g.ff / tp) % blk != 0 || (g.ff / tp) % 128 != 0 ||
+                              (!uneven_heads && (g.heads % tp != 0 || g.o_groups % tp != 0))))
                 --tp;
             if (tp != o.tp)
                 std::fprintf(stderr, "ds4: tensor parallel %d -> %d: the experts' %d-value blocks split n_ff %d no other way "
@@ -10405,10 +10416,11 @@ struct Model::Impl {
     bool host_free(const Layer& l) const { return host_free_on && l.nm == 1 && l.n_exp > 0 && l.n_vram >= l.n_exp; }
     int head_nm() const { return (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size(); }
     // the head's columns on member mi of its group of nm: an EXL3 head's split128 of the vocabulary (mat's), a GGUF's
-    // BF16 / Q8_0 head's even shares (mat_bf16's) - head_share's, its gather's and the markov steps' rows
+    // BF16 / Q8_0 head's even shares, or split128's where the vocabulary does not split evenly (mat_bf16's) - head_share's,
+    // its gather's and the markov steps' rows
     void head_cols(int nm, int mi, int& v0, int& vn) const {
         const Tensor* tw = pk.get("head.weight");
-        if (tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0")) {
+        if (tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0") && g.vocab % nm == 0) {
             vn = g.vocab / nm;
             v0 = mi * vn;
         } else
