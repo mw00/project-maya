@@ -2352,6 +2352,47 @@ __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
     __threadfence_system();
 }
 
+__global__ void __launch_bounds__(256) helper_take_kernel(const Req* req, unsigned seq, int k, int dim,
+                                                          const unsigned long long* __restrict__ tab, int n,
+                                                          unsigned long long* plan, float* w, float* x, unsigned* ack,
+                                                          const unsigned* quit) {
+    __shared__ int live;
+    if (threadIdx.x == 0) {   // (the request in host-mapped memory: read as the host's answers are, volatile)
+        unsigned v;
+        while ((int) ((v = *(volatile const unsigned*) &req->seq) - seq) < 0 && *(volatile const unsigned*) quit == 0u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(200);
+#endif
+        }
+        __threadfence_system();
+        live = v == seq;
+    }
+    __syncthreads();
+    const volatile Req* r = req;
+    const int T = live ? min(max(r->T, 1), kWin) : 0;
+    for (int j = threadIdx.x; j < kWin * kPicks; j += blockDim.x) {
+        const int t = j / kPicks, i = j % kPicks;
+        unsigned long long p = 0ull;
+        if (t < T && i < k) {
+            const int e = r->ids[t][i];
+            if (e >= 0 && e < n) p = tab[e];
+        }
+        plan[j] = p;
+        w[j] = p != 0ull ? r->w[t][i] : 0.0f;
+    }
+    for (int j = threadIdx.x; j < T * dim; j += blockDim.x) x[j] = r->x[j / dim][j % dim];
+    __syncthreads();
+    if (threadIdx.x == 0 && live) {
+        __threadfence_system();
+        *(volatile unsigned*) ack = seq;
+    }
+}
+
+__global__ void signal_seq_kernel(unsigned* flag, unsigned seq) {
+    __threadfence_system();
+    *(volatile unsigned*) flag = seq;
+}
+
 __global__ void init_pre_kernel(float* pre, int T) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < T * 8) pre[i] = (i % 8) == 0 ? 1.0f : 0.0f;
@@ -2760,6 +2801,11 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
         route_ahead_kernel<<<T, 512, 0, s>>>(logits, bias, n, m, req, off);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
+void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s) {
+    helper_take_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit);
+}
+void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s) { signal_seq_kernel<<<1, 1, 0, s>>>(flag, seq); }
 void init_pre(float* pre, int T, cudaStream_t s) { init_pre_kernel<<<cdiv(T * 8, 128), 128, 0, s>>>(pre, T); }
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
