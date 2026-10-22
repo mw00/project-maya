@@ -625,6 +625,35 @@ namespace {
 void cpu_win_alloc(Glm5Model::FastState* F, const Glm5Geometry& g, bool exl3);   // (after X3Rows)
 }  // namespace
 
+// The tail slots' addresses (FastState::LayerPool::xbase / xstep): layer-major as before, or slot-major across the
+// layers with STRATA_GLM_LEND_SPREAD (tier_policy.hpp).  fast_setup and vision_reclaim lay the region out with it.
+void Glm5Model::tail_layout(uint8_t* region) {
+    FastState* F = fast_;
+    std::vector<size_t> strides;
+    std::vector<int> tails, ils;
+    for (int il = l0_; il < lt_; ++il) {
+        if (!F->L[(size_t) il].moe) continue;
+        const auto& P = F->lp[(size_t) il];
+        strides.push_back(P.stride);
+        tails.push_back(P.n - P.n_main);
+        ils.push_back(il);
+    }
+    const strata::core::TailLayout lay =
+        strata::core::tier_tail_layout(strides, tails, strata::core::tier_policy().lend_spread);
+    for (size_t k = 0; k < ils.size(); ++k) {
+        auto& P = F->lp[(size_t) ils[k]];
+        P.xbase = region + lay.off[k];
+        P.xstep = lay.step;
+    }
+    static bool said[16] = {};
+    if (lay.spread && dev_ >= 0 && dev_ < 16 && !said[dev_]) {
+        said[dev_] = true;
+        std::fprintf(stderr, "glm fast: CUDA%d the pool's tail laid out slot by slot across %zu layers (MAYA_GLM_LEND_SPREAD): "
+                             "a prompt borrows a slot or two of every layer, not the first layers' whole tails\n",
+                     dev_, ils.size());
+    }
+}
+
 bool Glm5Model::fast_setup(std::string& err) {
     cudaSetDevice(dev_);
     auto* F = new FastState();
@@ -1411,13 +1440,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->pool_slots += nl;
         }
         uint8_t* xregion = F->xpool;
-        b = xregion;
-        for (int il = l0_; il < lt_; ++il) {
-            if (!F->L[(size_t) il].moe) continue;
-            auto& P = F->lp[(size_t) il];
-            P.xbase = b;
-            b += (size_t) k_extra * P.stride;
-        }
+        tail_layout(xregion);   // (STRATA_GLM_LEND_SPREAD: slot-major across the layers)
         if (pf_ != nullptr && !prefill_bind(xregion, xtot, err)) return false;
         if (vis_lend_ok_)
             std::fprintf(stderr, "glm fast: CUDA%d the vision encoder borrows the pool's tail (%.2f GB) while it "

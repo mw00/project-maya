@@ -1,9 +1,12 @@
-// tier_policy (STRATA_GLM_COUNT_HALF, STRATA_GLM_PROMPT_COUNTS): the parse, the defaults that keep the rule as
-// before, the prompt's weighted counts and the aging both paths share.  CPU only.
+// tier_policy (STRATA_GLM_COUNT_HALF, STRATA_GLM_PROMPT_COUNTS, STRATA_GLM_LEND_SPREAD): the parse, the defaults
+// that keep the rule as before, the prompt's weighted counts, the aging both paths share, and the tail layouts
+// (both tile the region; spread, a loan takes every layer's slots evenly).  CPU only.
 #include "strata/core/tier_policy.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -71,6 +74,46 @@ int main() {
         int nh = 0;
         for (int r = 0; r < 4096 * 3; ++r) nh += tier_halvings(d, 8, 32768);
         expect(nh == 3 && d == 0, "4096 routes a halving");
+    }
+    // the tail layout: both layouts tile the region exactly; spread, a prefix of X bytes holds whole columns
+    {
+        const std::vector<size_t> strides = {12976128, 12976128, 12976128, 12976128, 11665408, 11665408, 11665408};
+        const std::vector<int> tails(strides.size(), 10);
+        size_t total = 0;
+        for (size_t k = 0; k < strides.size(); ++k) total += (size_t) tails[k] * strides[k];
+        for (bool spread : {false, true}) {
+            const TailLayout L = tier_tail_layout(strides, tails, spread);
+            expect(L.spread == spread, "spread when asked and the tails are equal");
+            // every slot's byte range, sorted: they tile [0, total) with no gap and no overlap
+            std::vector<std::pair<size_t, size_t>> iv;
+            for (size_t k = 0; k < strides.size(); ++k)
+                for (int t = 0; t < tails[k]; ++t) {
+                    const size_t a = L.off[k] + (size_t) t * (L.step ? L.step : strides[k]);
+                    iv.push_back({a, a + strides[k]});
+                }
+            std::sort(iv.begin(), iv.end());
+            bool tiled = iv.front().first == 0 && iv.back().second == total;
+            for (size_t i = 1; i < iv.size(); ++i) tiled = tiled && iv[i].first == iv[i - 1].second;
+            expect(tiled, spread ? "spread: the slots tile the region" : "layer-major: the slots tile the region");
+            // a loan of X bytes from the front: how many slots each layer loses
+            for (size_t X : {(size_t) 415 << 20, (size_t) 1 << 30, total / 2, total}) {
+                std::vector<int> lost(strides.size(), 0);
+                for (size_t k = 0; k < strides.size(); ++k)
+                    for (int t = 0; t < tails[k]; ++t)
+                        if (L.off[k] + (size_t) t * (L.step ? L.step : strides[k]) < X) ++lost[k];
+                const int mx = *std::max_element(lost.begin(), lost.end());
+                const int mn = *std::min_element(lost.begin(), lost.end());
+                if (spread)
+                    expect(mx - mn <= 1, "spread: every layer loses the same slots, give or take one");
+                else if (X < total)
+                    expect(lost.front() == 10 && lost.back() < 10, "layer-major: the first layers lose their whole tail");
+            }
+        }
+        const std::vector<int> uneven = {10, 9, 10};
+        const TailLayout U = tier_tail_layout({1, 1, 1}, uneven, true);
+        expect(!U.spread && U.step == 0 && U.off[1] == 10 && U.off[2] == 19, "uneven tails: layer-major");
+        const TailLayout E = tier_tail_layout({}, {}, true);
+        expect(!E.spread && E.off.empty(), "no layers");
     }
     if (fails == 0) std::printf("tier_policy_test: all passed\n");
     return fails == 0 ? 0 : 1;

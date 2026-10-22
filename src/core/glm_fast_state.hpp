@@ -501,19 +501,25 @@ struct Glm5Model::FastState {
     // A layer's slots [0, n_main) are at base, [n_main, n) at xbase: every layer's tail lies in ONE region (xpool),
     // which the prompt path borrows for its buffers while a prompt runs (those slots are kLent then) - and an
     // on-demand vision encoder while it encodes (the region is freed; xbase is null until it comes back).
+    // STRATA_GLM_LEND_SPREAD=1 lays the tail out slot by slot across the layers instead (tail slot t of every layer,
+    // then t + 1 ...: xstep = one slot of every layer), so a prompt that borrows the region's front takes a slot or two
+    // from every layer rather than the whole tails of the first layers (tier_policy.hpp, tier_tail_layout).
     struct LayerPool {
         uint8_t* base = nullptr;
         uint8_t* xbase = nullptr;
         size_t stride = 0;
+        size_t xstep = 0;   // a tail slot to the next (0: stride, the layer's tail contiguous)
         int n = 0, n_main = 0;
+        size_t tail_step() const { return xstep != 0 ? xstep : stride; }
         uint8_t* slot_ptr(int s) const {
-            return s < n_main ? base + (size_t) s * stride : xbase + (size_t) (s - n_main) * stride;
+            return s < n_main ? base + (size_t) s * stride : xbase + (size_t) (s - n_main) * tail_step();
         }
         int slot_index(unsigned long long p) const {
             const unsigned long long b0 = (unsigned long long) base, x0 = (unsigned long long) xbase;
             if (p >= b0 && p < b0 + (unsigned long long) n_main * stride) return (int) ((p - b0) / stride);
-            if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n - n_main) * stride)
-                return n_main + (int) ((p - x0) / stride);
+            const unsigned long long xs = (unsigned long long) tail_step();
+            if (xbase != nullptr && p >= x0 && p < x0 + (unsigned long long) (n - n_main) * xs && (p - x0) % xs == 0)
+                return n_main + (int) ((p - x0) / xs);
             return -1;
         }
         std::vector<int> key;        // slot -> expert, -1 none

@@ -963,6 +963,8 @@ public:
     // (Strata's floor); STRATA_GLM_PREFILL_KEEP lowers it, never below route + spares
     static int pool_keep(int n_exp_used);
     bool lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std::string& err);
+    // the tail slots' addresses in the pool's tail region (xbase / xstep of each layer; STRATA_GLM_LEND_SPREAD)
+    void tail_layout(uint8_t* region);
     bool vis_lend_ok_ = false;                             // this half's tail can go to the vision encoder
     bool vis_lent_ = false;                                // ... and is with it now (freed)
     // this half's layers over a chunk (rows in pf_->R); next_ids / next_img: the NextN block's next tokens and, where
