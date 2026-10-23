@@ -1566,17 +1566,40 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
     }
 }
 
-// ---------------------------------------------------------------- sparse attention on RDNA 3's matrix cores
+// ---------------------------------------------------------------- sparse attention on RDNA 3 / 4's matrix cores
 // kAttnWmma: 16 heads of one query a block; each tile of 16 selected rows staged once as BF16 (as the packed kernel),
 // the dots and the weighted sums as v_wmma_f32_16x16x16_bf16 with the query and the probabilities each a BF16 high
 // and low part (two products: ~16 bits of mantissa), the rows exact.  Warp w: the dots over dimensions w * 64 .. + 64
 // (the warps' parts summed in shared memory, in warp order), the online softmax a thread a (head, row), then output
 // dimensions w * 64 .. + 64 (A: lane m and m + 16 hold head m's 16 values; B: lane n and n + 16 column n's; D's
-// element i: head 2i + lane / 16, column lane % 16).
-#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+// element i: head 2i + lane / 16 on gfx11, 8 * (lane / 16) + i on gfx12; column lane % 16). gfx12 takes only
+// dimensions 8 * (lane / 16) .. + 7 of each operand, rather than gfx11's duplicated 16-value operands.
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
 #define DS4_ATTN_WMMA 1
 typedef short ds4_s16 __attribute__((ext_vector_type(16)));
 typedef float ds4_f8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ ds4_f8 attn_wmma(ds4_s16 a, ds4_s16 b, ds4_f8 c) {
+#if defined(__GFX12__)
+    using s8 = short __attribute__((ext_vector_type(8)));
+    const int k0 = (threadIdx.x & 31) / 16 * 8;
+    s8 aa, bb;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        aa[i] = a[k0 + i];
+        bb[i] = b[k0 + i];
+    }
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(aa, bb, c);
+#else
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+#endif
+}
+__device__ __forceinline__ int attn_wmma_row(int i, int hi) {
+#if defined(__GFX12__)
+    return 8 * hi + i;
+#else
+    return 2 * i + hi;
+#endif
+}
 #endif
 __device__ __forceinline__ uint16_t f2bf_rn(float x) {   // (round to nearest even; no NaN in these values)
     uint32_t u = __float_as_uint(x);
@@ -1667,11 +1690,11 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
                 kb[2 * e] = (short) (w[e] & 0xffffu);
                 kb[2 * e + 1] = (short) (w[e] >> 16);
             }
-            s = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qa[kk], kb, s);
-            s = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qb[kk], kb, s);
+            s = attn_wmma(qa[kk], kb, s);
+            s = attn_wmma(qb[kk], kb, s);
         }
 #pragma unroll
-        for (int i = 0; i < 8; ++i) sp[wp][(2 * i + hi) * R + m16] = s[i];
+        for (int i = 0; i < 8; ++i) sp[wp][attn_wmma_row(i, hi) * R + m16] = s[i];
         __syncthreads();
         {   // thread (head e / 16, row e % 16): the tile's score, the head's running max and denominator
             const int e = threadIdx.x, h = e >> 4, r = e & 15;
@@ -1707,13 +1730,13 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
 #pragma unroll
         for (int nt = 0; nt < 4; ++nt) {   // B: output dimension wp * 64 + nt * 16 + m16 of the tile's rows
 #pragma unroll
-            for (int i = 0; i < 8; ++i) acc[nt][i] *= tsc[2 * i + hi];
+            for (int i = 0; i < 8; ++i) acc[nt][i] *= tsc[attn_wmma_row(i, hi)];
             const uint16_t* vc = tile + wp * 64 + nt * 16 + m16;
             ds4_s16 vb;
 #pragma unroll
             for (int r = 0; r < R; ++r) vb[r] = (short) vc[r * d];
-            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pa, vb, acc[nt]);
-            acc[nt] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pb, vb, acc[nt]);
+            acc[nt] = attn_wmma(pa, vb, acc[nt]);
+            acc[nt] = attn_wmma(pb, vb, acc[nt]);
         }
         __syncthreads();
     }
@@ -1721,12 +1744,220 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
     for (int nt = 0; nt < 4; ++nt)
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            const int h = 2 * i + hi;
+            const int h = attn_wmma_row(i, hi);
             const float dn = den[h] + expf(sink[hb + h] - m_run[h]);
             out[((size_t) t * heads + hb + h) * d + wp * 64 + nt * 16 + m16] = acc[nt][i] / dn;
         }
 #endif
 }
+
+// ---------------------------------------------------------------- sparse attention on Ampere's tensor cores
+// The RDNA 3 kernel's twin for sm_80 and newer (mma.sync m16n8k16: BF16 in, F32 out).  The same tiles of 16 rows
+// staged once as BF16 (the row stride padded to 520 values: ldmatrix's eight rows on distinct banks), the same split
+// of the query and the probabilities into a BF16 high and a low part (two products: ~16 bits of mantissa, the rows
+// exact), warp w's dots over dimensions w * 64 .. + 64 summed in shared memory in warp order, the online softmax a
+// thread a (head, row), then warp w's output dimensions w * 64 .. + 64.  Fragments (g = lane / 4, c = lane % 4):
+// A rows are heads g and g + 8, columns 2c, 2c + 1 (+ 8, + 9); B by ldmatrix from the tile - as it lies for the
+// dots' K (a tile row is a column of B), transposed for the weighted sums' V; D's four values: heads g and g + 8 at
+// columns 2c, 2c + 1.  Within rounding of the FP32 kernels and of the RDNA 3 kernel (the same arithmetic, the
+// products and sums in a different order).
+#if !defined(STRATA_USE_HIP)
+__device__ __forceinline__ void mma_ldsm_x4(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(a));
+#else
+    (void) p;
+    r0 = r1 = r2 = r3 = 0u;
+#endif
+}
+__device__ __forceinline__ void mma_ldsm_x4_t(uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3, const void* p) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned a = (unsigned) __cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
+                 : "r"(a));
+#else
+    (void) p;
+    r0 = r1 = r2 = r3 = 0u;
+#endif
+}
+// d += A (16 x 16 BF16, row) * B (16 x 8 BF16, col), F32 accumulation
+__device__ __forceinline__ void mma_bf16(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#else
+    (void) d;
+    (void) a;
+    (void) b0;
+    (void) b1;
+#endif
+}
+// two F32 values as a BF16 pair's high parts and low parts (the lower-indexed value in the low half)
+__device__ __forceinline__ void split_bf16x2(float2 v, uint32_t& hi, uint32_t& lo) {
+    const uint16_t h0 = f2bf_rn(v.x), h1 = f2bf_rn(v.y);
+    hi = (uint32_t) h0 | ((uint32_t) h1 << 16);
+    lo = (uint32_t) f2bf_rn(v.x - bf16f(h0)) | ((uint32_t) f2bf_rn(v.y - bf16f(h1)) << 16);
+}
+__global__ void __launch_bounds__(kThreads) sparse_attn_mma_kernel(const float* __restrict__ q,
+                                                                   const uint16_t* __restrict__ win,
+                                                                   const uint8_t* __restrict__ ckv,
+                                                                   const int* __restrict__ sel, int sel_stride,
+                                                                   AttnRows ar, const float* __restrict__ sink,
+                                                                   int heads, float scale, float* __restrict__ out) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    constexpr int d = 512, R = 16, dp = d + 8;   // (the tile's row stride: 1040 bytes)
+    const int hb = blockIdx.x * R, t = blockIdx.y;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * d;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, d);
+    __shared__ __align__(16) uint16_t tile[R * dp];
+    __shared__ float sp[kThreads / 32][R * R];
+    __shared__ __align__(16) float pr[R * R];
+    __shared__ const uint8_t* rows[R];
+    __shared__ float m_run[R], den[R], tsc[R];
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5, g = lane >> 2, c2 = (lane & 3) * 2;
+    uint32_t qa[4][4], qb[4][4];   // A of the dots, k-step kk: heads hb + g, + 8; dimensions wp * 64 + kk * 16 + c2 ..
+    {
+        const float* q0 = q + ((size_t) t * heads + hb + g) * d + wp * 64 + c2;
+        const float* q1 = q0 + (size_t) 8 * d;
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            split_bf16x2(*(const float2*) (q0 + kk * 16), qa[kk][0], qb[kk][0]);
+            split_bf16x2(*(const float2*) (q1 + kk * 16), qa[kk][1], qb[kk][1]);
+            split_bf16x2(*(const float2*) (q0 + kk * 16 + 8), qa[kk][2], qb[kk][2]);
+            split_bf16x2(*(const float2*) (q1 + kk * 16 + 8), qa[kk][3], qb[kk][3]);
+        }
+    }
+    if (threadIdx.x < R) {
+        m_run[threadIdx.x] = -1e30f;
+        den[threadIdx.x] = 0.0f;
+    }
+    __syncthreads();
+    float acc[8][4];   // the weighted sums: n-tile nt = dimensions wp * 64 + nt * 8 + c2, + 1 of heads hb + g, + 8
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
+    const int sr = threadIdx.x >> 4, part = threadIdx.x & 15;   // the staging: a thread's row and 32 values
+    // ldmatrix row addresses: the dots' K - matrices (rows 0-7, dims + 0), (rows 0-7, + 8), (rows 8-15, + 0),
+    // (rows 8-15, + 8) of a k-step; the sums' V (transposed) - (rows 0-7, dims + 0), (rows 8-15, + 0),
+    // (rows 0-7, + 8), (rows 8-15, + 8) of a pair of n-tiles
+    const uint16_t* kb = tile + ((lane & 7) + ((lane >> 4) << 3)) * dp + wp * 64 + ((lane >> 3) & 1) * 8;
+    const uint16_t* vb = tile + (lane & 15) * dp + wp * 64 + (lane >> 4) * 8;
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += R) {
+        const int n = min(R, total - t0);
+        if (threadIdx.x < n) {
+            const int j = t0 + threadIdx.x;
+            rows[threadIdx.x] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * d) : ckv + (size_t) sl[j - n_win] * crow;
+        }
+        __syncthreads();
+        {
+            uint4* dst = (uint4*) (tile + sr * dp + part * 32);
+            if (sr >= n) {
+                dst[0] = dst[1] = dst[2] = dst[3] = make_uint4(0u, 0u, 0u, 0u);
+            } else if (t0 + sr < n_win) {
+                const uint4* src = (const uint4*) (rows[sr] + part * 64);
+                dst[0] = src[0];
+                dst[1] = src[1];
+                dst[2] = src[2];
+                dst[3] = src[3];
+            } else {
+                unpack32(rows[sr], part, dst);
+            }
+        }
+        __syncthreads();
+        float s[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};   // n-tile (rows 0-7, 8-15)
+#pragma unroll
+        for (int kk = 0; kk < 4; ++kk) {
+            uint32_t b0, b1, b2, b3;
+            mma_ldsm_x4(b0, b1, b2, b3, kb + kk * 16);
+            mma_bf16(s[0], qa[kk], b0, b1);
+            mma_bf16(s[0], qb[kk], b0, b1);
+            mma_bf16(s[1], qa[kk], b2, b3);
+            mma_bf16(s[1], qb[kk], b2, b3);
+        }
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+            const int r0 = nt * 8 + c2;
+            sp[wp][g * R + r0] = s[nt][0];
+            sp[wp][g * R + r0 + 1] = s[nt][1];
+            sp[wp][(g + 8) * R + r0] = s[nt][2];
+            sp[wp][(g + 8) * R + r0 + 1] = s[nt][3];
+        }
+        __syncthreads();
+        {   // thread (head e / 16, row e % 16): the tile's score, the head's running max and denominator
+            const int e = threadIdx.x, h = e >> 4, r = e & 15;
+            float v = 0.0f;
+#pragma unroll
+            for (int w = 0; w < kThreads / 32; ++w) v += sp[w][e];
+            v = r < n ? v * scale : -INFINITY;
+            float mx = v;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, k));
+            const float m_old = m_run[h], m_new = fmaxf(m_old, mx);
+            const float p = r < n ? expf(v - m_new) : 0.0f;
+            float sum = p;
+#pragma unroll
+            for (int k = 8; k >= 1; k >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, k);
+            pr[e] = p;
+            if (r == 0) {   // (the head's 16 lanes read m_run above, in this same instruction stream)
+                const float ts = expf(m_old - m_new);
+                tsc[h] = ts;
+                den[h] = den[h] * ts + sum;
+                m_run[h] = m_new;
+            }
+        }
+        __syncthreads();
+        uint32_t pa[4], pb[4];   // A of the weighted sums: heads g, g + 8's probabilities of rows c2, + 1, + 8, + 9
+        split_bf16x2(*(const float2*) (pr + g * R + c2), pa[0], pb[0]);
+        split_bf16x2(*(const float2*) (pr + (g + 8) * R + c2), pa[1], pb[1]);
+        split_bf16x2(*(const float2*) (pr + g * R + c2 + 8), pa[2], pb[2]);
+        split_bf16x2(*(const float2*) (pr + (g + 8) * R + c2 + 8), pa[3], pb[3]);
+        const float ts0 = tsc[g], ts1 = tsc[g + 8];
+#pragma unroll
+        for (int np = 0; np < 4; ++np) {   // n-tiles 2 np, 2 np + 1
+            uint32_t b0, b1, b2, b3;
+            mma_ldsm_x4_t(b0, b1, b2, b3, vb + np * 16);
+            float* a0 = acc[2 * np];
+            float* a1 = acc[2 * np + 1];
+            a0[0] *= ts0, a0[1] *= ts0, a0[2] *= ts1, a0[3] *= ts1;
+            a1[0] *= ts0, a1[1] *= ts0, a1[2] *= ts1, a1[3] *= ts1;
+            mma_bf16(a0, pa, b0, b1);
+            mma_bf16(a0, pb, b0, b1);
+            mma_bf16(a1, pa, b2, b3);
+            mma_bf16(a1, pb, b2, b3);
+        }
+        __syncthreads();
+    }
+    const float dn0 = den[g] + expf(sink[hb + g] - m_run[g]);
+    const float dn1 = den[g + 8] + expf(sink[hb + g + 8] - m_run[g + 8]);
+    float* o0 = out + ((size_t) t * heads + hb + g) * d + wp * 64 + c2;
+    float* o1 = o0 + (size_t) 8 * d;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+        *(float2*) (o0 + nt * 8) = make_float2(acc[nt][0] / dn0, acc[nt][1] / dn0);
+        *(float2*) (o1 + nt * 8) = make_float2(acc[nt][2] / dn1, acc[nt][3] / dn1);
+    }
+#else
+    (void) q, (void) win, (void) ckv, (void) sel, (void) sel_stride, (void) ar, (void) sink, (void) heads, (void) scale, (void) out;
+#endif
+}
+#endif   // !STRATA_USE_HIP
 
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
 __global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
@@ -2753,7 +2984,7 @@ static int sm_count() {
     return v;
 }
 
-// sparse_attn_wmma_kernel's device: an RDNA 3 GPU (gfx11), unless DS4_ATTN_WMMA=0 (cached a device)
+// sparse_attn_wmma_kernel's device: an RDNA 3 / 4 GPU (gfx11 / gfx12), unless DS4_ATTN_WMMA=0 (cached a device)
 static bool attn_wmma_now() {
 #if defined(STRATA_USE_HIP)
     static const bool off = std::getenv("DS4_ATTN_WMMA") != nullptr && std::atoi(std::getenv("DS4_ATTN_WMMA")) == 0;
@@ -2763,7 +2994,31 @@ static bool attn_wmma_now() {
     int v = known[dev].load(std::memory_order_relaxed);
     if (v == 0) {
         cudaDeviceProp p{};
-        v = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ? 2 : 1;
+        v = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                    (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0)
+                ? 2 : 1;
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
+#else
+    return false;
+#endif
+}
+
+
+// sparse_attn_mma_kernel's device: an Ampere or newer GPU (sm_80+), unless DS4_ATTN_MMA=0 (cached a device; the
+// first yes a line on stderr)
+static bool attn_mma_now() {
+#if !defined(STRATA_USE_HIP)
+    static const bool off = std::getenv("DS4_ATTN_MMA") != nullptr && std::atoi(std::getenv("DS4_ATTN_MMA")) == 0;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        cudaDeviceProp p{};
+        v = cudaGetDeviceProperties(&p, dev) == cudaSuccess && p.major >= 8 ? 2 : 1;
+        if (v == 2) std::fprintf(stderr, "ds4: CUDA%d prompt attention on the tensor cores (sm_%d%d)\n", dev, p.major, p.minor);
         known[dev].store(v, std::memory_order_relaxed);
     }
     return v == 2;
@@ -2791,6 +3046,13 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                                                                            sel_stride, a, sink, heads, scale, out);
             return;
         }
+#if !defined(STRATA_USE_HIP)
+        if (attn_mma_now() && heads % 16 == 0) {
+            sparse_attn_mma_kernel<<<dim3(heads / 16, T), kThreads, 0, s>>>(q, win, (const uint8_t*) ckv, sel,
+                                                                          sel_stride, a, sink, heads, scale, out);
+            return;
+        }
+#endif
         heads_per_block = 0;
     }
     // a few queries (a decode step, a short window): their selected rows decoded once a query into the scratch, then
@@ -2899,6 +3161,23 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaSt
     const size_t total = xfer_units(x);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
     xfer_put_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq, cnt);
+    // (another GPU, or the host, waits for this flag: on Windows the put must not sit in the queue - #303: two RTX 3080s
+    //  hung at the first hand-off, the receiver spinning on a flag whose writer had never been submitted)
+    win_submit(s);
+}
+void win_submit(cudaStream_t s) {
+#if defined(_WIN32)
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_WIN_SUBMIT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (on) {
+        (void) cudaStreamQuery(s);
+        (void) cudaGetLastError();
+    }
+#else
+    (void) s;
+#endif
 }
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
     const size_t total = xfer_units(x);
@@ -2908,7 +3187,10 @@ void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s)
 void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStream_t s) {
     if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
 }
-void set_flag(unsigned* flag, unsigned v, cudaStream_t s) { set_flag_kernel<<<1, 1, 0, s>>>(flag, v); }
+void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
+    set_flag_kernel<<<1, 1, 0, s>>>(flag, v);
+    win_submit(s);   // (the writer on another GPU waits for this acknowledgement before its next put - #384)
+}
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s) {
     if (n > 0) tab_set_kernel<<<cdiv(n, 128), 128, 0, s>>>(pairs, n);
 }

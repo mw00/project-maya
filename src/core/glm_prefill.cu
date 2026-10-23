@@ -18,6 +18,7 @@
 // experts.  STRATA_GLM_NO_PREFILL=1 keeps the token-at-a-time prompt (A/B).
 #include "glm_fast_state.hpp"
 
+#include "strata/core/exl3_mma_rows.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
@@ -392,6 +393,7 @@ struct X3Lane {
     const strata::kernels::exl3::ExpertLayout* lay = nullptr;
     int E = 0, nff = 0;
     float limit = 0.0f;               // the experts' swiglu clamp
+    int T = 0;                        // the chunk's tokens (STRATA_GLM_EXL3_MMA_ROWS_SHORT; 0: unknown)
 };
 // experts [i0, i1) of a set through the tensor-core kernels, in parts whose rows fit the window and w16's h
 void x3_run_mma(const X3Lane& L, const uint8_t* wbase, size_t stride, const int* d_bounds, const int* hb, int r0, int i0,
@@ -508,13 +510,25 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
     }
 }
 // one set's experts in set order (the window takes the rows in order): runs of light experts to the tensor cores, the
-// rest alone.  STRATA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none)
+// rest alone.  STRATA_GLM_EXL3_MMA_ROWS=<rows>: the largest expert the tensor-core kernels take (0: none);
+// STRATA_GLM_EXL3_MMA_ROWS_SHORT=<rows>[,<max chunk tokens>]: that in a chunk of up to <max chunk tokens> (4096)
+// tokens instead (strata/core/exl3_mma_rows.hpp)
 void x3_run_set(const X3Lane& L, const uint8_t* wbase, int n_exp, size_t stride, const int* d_bounds, const int* hb,
                 int r0) {
-    static const int mma_rows = [] {
+    static const int mma_base = [] {
         const char* v = getenv("STRATA_GLM_EXL3_MMA_ROWS");
         return v ? std::max(0, std::atoi(v)) : 64;
     }();
+    static const strata::core::MmaRowsShort mma_short = [] {
+        const strata::core::MmaRowsShort r =
+            strata::core::mma_rows_short_parse(getenv("STRATA_GLM_EXL3_MMA_ROWS_SHORT"));
+        if (r.rows > 0)
+            std::fprintf(stderr, "glm prefill: EXL3 experts with up to %d rows through the tensor-core kernels in chunks "
+                                 "of up to %d tokens (MAYA_GLM_EXL3_MMA_ROWS_SHORT), %d in longer ones\n",
+                         r.rows, r.max_tokens, mma_base);
+        return r;
+    }();
+    const int mma_rows = strata::core::mma_rows_for(L.T, mma_base, mma_short);
     const bool use_mma = mma_rows > 0 && strata::kernels::exl3::mma_supported();
     for (int i = 0; i < n_exp;) {
         const int rows = hb[i + 1] - hb[i];
@@ -910,6 +924,7 @@ bool Glm5Model::prefill_calc(const CalcJob& J, std::string& err) {
     L.row_tok = cb.row_tok;
     L.OUTP = cb.win;
     L.W = cb.W;
+    L.T = T;
     L.place = [&](int a, int nr) {
         if (!(w_hi > w_lo && a == w_hi && a + nr <= wb + cb.W)) {
             flush();
@@ -3339,6 +3354,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         x3l.row_tok = M.row_tok;
         x3l.OUTP = M.OUTP;
         x3l.W = W;
+        x3l.T = T;
         x3l.place = place;
         x3l.lay = &Ly.xl;
         x3l.E = E;

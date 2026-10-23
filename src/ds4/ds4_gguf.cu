@@ -16,6 +16,10 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
+#include <thread>
+#include <string>
+#include <chrono>
 
 namespace strata::ds4::gguf {
 namespace {
@@ -182,9 +186,9 @@ __device__ __forceinline__ void q8_block(const uint8_t* __restrict__ p, float* w
 
 // ---- int8 activations (llama.cpp's MMVQ: its q8_1 blocks' rounding)
 // rows of k F32 values (row r at x + r ldx; k % 32 == 0) -> q[r][k] int8 and d[r][k / 32] = max|x| / 127 per 32
-__global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restrict__ x, size_t ldx, int k,
-                                                            int8_t* __restrict__ q, float* __restrict__ d) {
-    const int r = blockIdx.y, b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+// (a warp a 32-block: row r's block b)
+__device__ __forceinline__ void q8_quant_block(const float* __restrict__ x, size_t ldx, int k, int8_t* __restrict__ q,
+                                               float* __restrict__ d, int r, int b, int lane) {
     if (b * 32 >= k) return;
     const float v = x[(size_t) r * ldx + (size_t) b * 32 + lane];
     float am = fabsf(v);
@@ -194,9 +198,38 @@ __global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restr
     q[(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
     if (lane == 0) d[(size_t) r * (k / 32) + b] = sc;
 }
+__global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restrict__ x, size_t ldx, int k,
+                                                            int8_t* __restrict__ q, float* __restrict__ d) {
+    q8_quant_block(x, ldx, k, q, d, blockIdx.y, blockIdx.x * kWarps + (threadIdx.x >> 5), threadIdx.x & 31);
+}
 void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
     q8_quant_kernel<<<grid, kThreads, 0, s>>>(x, ldx, k, q, d);
+}
+// (DS4_Q8_BATCH) a mv call's int8 inputs in one launch: job z's rows as q8_quant_kernel rounds them, bit for bit -
+// the same warp a 32-block; a job's blocks past its k and rows past its rows end at once
+struct Q8Job {
+    const float* x;
+    size_t ldx;
+    int8_t* q;
+    float* d;
+    int k, rows;
+};
+struct Q8Jobs {
+    Q8Job j[x3::kMaxMvJobs];
+};
+__global__ void __launch_bounds__(kThreads) q8_quant_jobs_kernel(const Q8Jobs J) {
+    const Q8Job& a = J.j[blockIdx.z];
+    if ((int) blockIdx.y >= a.rows) return;
+    q8_quant_block(a.x, a.ldx, a.k, a.q, a.d, blockIdx.y, blockIdx.x * kWarps + (threadIdx.x >> 5), threadIdx.x & 31);
+}
+void q8_quant_jobs(const Q8Jobs& J, int n, cudaStream_t s) {
+    int bx = 1, by = 1;
+    for (int i = 0; i < n; ++i) {
+        bx = std::max(bx, (J.j[i].k / 32 + kWarps - 1) / kWarps);
+        by = std::max(by, J.j[i].rows);
+    }
+    q8_quant_jobs_kernel<<<dim3((unsigned) bx, (unsigned) by, (unsigned) n), kThreads, 0, s>>>(J);
 }
 
 // ---- the low-bit experts' activations as the CPU lane rounds them (ggml's Q8_K, quantize_row_q8_K_ref, ggml-cpu's
@@ -1061,6 +1094,183 @@ bool mx_geometry(const char* who, int k, int n_embd, int n_ff) {
 // ---------------------------------------------------------------- entry points
 bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
 
+bool q8_batch() {   // DS4_Q8_BATCH=1: a mv call's int8 inputs in one launch (unset: a launch a job, as before)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DS4_Q8_BATCH");
+        if (v == nullptr) v = std::getenv("DS4_Q8_BATCH");
+        const bool b = v != nullptr && std::atoi(v) != 0;
+        if (b) std::fprintf(stderr, "ds4: a GEMV call's int8 inputs rounded in one launch (DS4_Q8_BATCH)\n");
+        return b;
+    }();
+    return on;
+}
+
+// DS4_Q8_CHECK=1 (at load, before any request): eight jobs - k 5120 / 2304 / 256 / 32, rows 1 / 4 / 16, strided rows,
+// two jobs reading one input, values with zero blocks, negative zeros, halves at the rounding, tiny and large
+// magnitudes - rounded by the per-job launches into a set of outputs filled 0xA5, then by the batched launch into a
+// second set filled 0xA5 and a third filled 0x5A, each job's int8 rows and scales between 256 guard bytes.  The first
+// two must be the same byte for byte (every int8, every scale's bits, every guard), the third the same as the first in
+// every row and scale byte (each written) and 0x5A in every guard (none touched past a job's rows or k).  The uploads,
+// the fills and the launches on one stream of its own, their end waited for, bounded; a CUDA error, a mismatch or no
+// clean end in time fails the load (without a clean end everything is kept).  No tolerance: the batched kernel runs
+// the per-job one's code
+bool q8_batch_check(int dev, std::string& err) {
+    struct Spec {
+        int k, rows, ldx, input;
+    };
+    static const Spec spec[x3::kMaxMvJobs] = {{5120, 1, 5120, 0}, {2304, 4, 2368, 1}, {256, 16, 288, 2},
+                                              {32, 1, 32, 3},     {5120, 4, 5248, 4}, {2304, 1, 5120, 0},
+                                              {32, 16, 64, 5},    {256, 4, 256, 6}};
+    constexpr int kInputs = 7;
+    constexpr size_t kGuard = 256;
+    const char* where = "";
+    auto fail_at = [&](const std::string& why) {
+        err = "Q8 batch check on CUDA" + std::to_string(dev) + ": " + why;
+        std::fprintf(stderr, "ds4: CUDA%d Q8 batch check FAILED: %s\n", dev, why.c_str());
+        return false;
+    };
+    // the inputs (host): a fixed generator; block kinds by the block's index
+    std::vector<std::vector<float>> in((size_t) kInputs);
+    for (int i = 0; i < x3::kMaxMvJobs; ++i) {
+        const Spec& p = spec[i];
+        std::vector<float>& v = in[(size_t) p.input];
+        v.resize(std::max(v.size(), (size_t) p.rows * (size_t) p.ldx), 0.0f);
+    }
+    uint32_t st = 0x9e3779b9u;
+    auto rnd = [&]() { st = st * 1664525u + 1013904223u; return st; };
+    for (auto& v : in)
+        for (size_t c = 0; c < v.size(); ++c) {
+            const size_t blk = c / 32;
+            const int lane = (int) (c % 32);
+            const float u = (float) (int) (rnd() % 2001u - 1000u) / 250.0f;   // -4 .. 4
+            switch (blk % 8) {
+                case 0: v[c] = 0.0f; break;                                     // a block of zeros (scale 0)
+                case 1: v[c] = lane == 0 ? -127.0f : (float) (lane - 16) + 0.5f; break;   // halves at scale 1
+                case 2: v[c] = lane % 3 == 0 ? -0.0f : u * 1e-30f; break;       // tiny, negative zeros
+                case 3: v[c] = u * 1e30f; break;                                // large
+                case 4: v[c] = lane == 5 ? 127.0f * 3.0f : u; break;            // a lone maximum
+                default: v[c] = u * (float) (1 + blk % 5); break;
+            }
+        }
+    int cur = 0;
+    cudaGetDevice(&cur);
+    if (cudaSetDevice(dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return fail_at("cudaSetDevice");
+    }
+    // the outputs: each job's int8 rows then its scales, each between guards; three sets in one allocation
+    size_t qat[x3::kMaxMvJobs], dat[x3::kMaxMvJobs], set_bytes = 0, payload_q = 0, payload_d = 0;
+    for (int i = 0; i < x3::kMaxMvJobs; ++i) {
+        const size_t qn = (size_t) spec[i].rows * (size_t) spec[i].k, dn = qn / 32 * sizeof(float);
+        qat[i] = set_bytes + kGuard;
+        set_bytes = qat[i] + qn + kGuard;
+        dat[i] = set_bytes + kGuard;
+        set_bytes = dat[i] + dn + kGuard;
+        payload_q += qn;
+        payload_d += dn / sizeof(float);
+    }
+    // the inputs held until their uploads are known to have ended: uploaded on the check's own stream, before its
+    // kernels on that stream (no default-stream ordering relied on)
+    auto* held = new std::vector<std::vector<float>>(std::move(in));
+    std::vector<float*> dx((size_t) kInputs, nullptr);
+    uint8_t *out = nullptr, *back = nullptr;   // (back: the three sets read back, pinned, on the same stream)
+    cudaStream_t s = nullptr;
+    cudaEvent_t ev = nullptr;
+    bool ok = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess &&
+              cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess &&
+              cudaMalloc((void**) &out, 3 * set_bytes) == cudaSuccess &&
+              cudaMallocHost((void**) &back, 3 * set_bytes) == cudaSuccess;
+    bool submitted = false;   // (anything enqueued on s: waited for before any free)
+    for (int j = 0; ok && j < kInputs; ++j) {
+        const std::vector<float>& v = (*held)[(size_t) j];
+        ok = cudaMalloc((void**) &dx[(size_t) j], v.size() * sizeof(float)) == cudaSuccess;
+        if (ok) {
+            submitted = true;
+            ok = cudaMemcpyAsync(dx[(size_t) j], v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice, s) ==
+                 cudaSuccess;
+        }
+    }
+    where = "setup";
+    if (ok) {
+        uint8_t* set[3] = {out, out + set_bytes, out + 2 * set_bytes};
+        ok = cudaMemsetAsync(set[0], 0xA5, set_bytes, s) == cudaSuccess &&
+             cudaMemsetAsync(set[1], 0xA5, set_bytes, s) == cudaSuccess &&
+             cudaMemsetAsync(set[2], 0x5A, set_bytes, s) == cudaSuccess;
+        for (int i = 0; ok && i < x3::kMaxMvJobs; ++i)
+            q8_quant(dx[(size_t) spec[i].input], (size_t) spec[i].ldx, spec[i].rows, spec[i].k,
+                     (int8_t*) (set[0] + qat[i]), (float*) (set[0] + dat[i]), s);
+        for (int b = 1; ok && b < 3; ++b) {
+            Q8Jobs J;
+            for (int i = 0; i < x3::kMaxMvJobs; ++i)
+                J.j[i] = {dx[(size_t) spec[i].input], (size_t) spec[i].ldx, (int8_t*) (set[b] + qat[i]),
+                          (float*) (set[b] + dat[i]), spec[i].k, spec[i].rows};
+            q8_quant_jobs(J, x3::kMaxMvJobs, s);
+        }
+        const bool launched = cudaGetLastError() == cudaSuccess;
+        ok = ok && launched &&
+             cudaMemcpyAsync(back, out, 3 * set_bytes, cudaMemcpyDeviceToHost, s) == cudaSuccess;   // (before the event)
+        where = launched ? "completion" : "launch";
+    }
+    // the end of whatever went in (the uploads, the fills, the launches, the readback): its event, else the stream
+    // itself, bounded; only a clean end frees anything (an error or no end in time: everything kept - the inputs, the
+    // device outputs, the pinned readback, the stream - and the load fails)
+    bool done = !submitted;
+    if (submitted) {
+        const bool recorded = cudaEventRecord(ev, s) == cudaSuccess;
+        ok = ok && recorded;
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaError_t q;
+        while ((q = recorded ? cudaEventQuery(ev) : cudaStreamQuery(s)) == cudaErrorNotReady &&
+               std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        done = q == cudaSuccess;
+        if (q == cudaErrorNotReady) where = "no end in 10 s";
+        else if (!done) where = "an error at the end";
+        ok = ok && done;
+    }
+    std::vector<uint8_t> h;
+    if (ok) h.assign(back, back + 3 * set_bytes);
+    else (void) cudaGetLastError();
+    if (done) {
+        for (float* p : dx)
+            if (p != nullptr) cudaFree(p);
+        if (out != nullptr) cudaFree(out);
+        if (back != nullptr) cudaFreeHost(back);
+        if (ev != nullptr) cudaEventDestroy(ev);
+        if (s != nullptr) cudaStreamDestroy(s);
+        delete held;
+    }
+    cudaSetDevice(cur);
+    if (!ok) return fail_at(std::string("a CUDA error or no end (") + where + ")");
+    const uint8_t *a = h.data(), *b = a + set_bytes, *c = b + set_bytes;
+    for (int i = 0; i < x3::kMaxMvJobs; ++i) {
+        const size_t qn = (size_t) spec[i].rows * (size_t) spec[i].k, dn = qn / 32 * sizeof(float);
+        const size_t lo[4] = {qat[i] - kGuard, qat[i] + qn, dat[i] - kGuard, dat[i] + dn};   // the guards
+        for (size_t g : lo)
+            for (size_t o = g; o < g + kGuard; ++o)
+                if (a[o] != 0xA5 || b[o] != 0xA5 || c[o] != 0x5A) {
+                    char m[160];
+                    std::snprintf(m, sizeof m, "job %d: a guard byte at %zu written (per-job 0x%02x, batched 0x%02x / 0x%02x)",
+                                  i, o, a[o], b[o], c[o]);
+                    return fail_at(m);
+                }
+        const size_t body[2][2] = {{qat[i], qat[i] + qn}, {dat[i], dat[i] + dn}};
+        for (int r = 0; r < 2; ++r)
+            for (size_t o = body[r][0]; o < body[r][1]; ++o)
+                if (a[o] != b[o] || a[o] != c[o]) {
+                    char m[160];
+                    std::snprintf(m, sizeof m, "job %d: %s byte %zu (per-job 0x%02x, batched 0x%02x / 0x%02x)", i,
+                                  r == 0 ? "an int8" : "a scale", o - body[r][0], a[o], b[o], c[o]);
+                    return fail_at(m);
+                }
+    }
+    std::fprintf(stderr,
+                 "ds4: CUDA%d Q8 batch check: 8 jobs (k 32 .. 5120, rows 1 .. 16, strided, one input shared): %zu int8 "
+                 "and %zu scales the per-job launches' bit for bit, every guard intact (DS4_Q8_CHECK)\n",
+                 dev, payload_q, payload_d);
+    return true;
+}
+
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
 size_t type_row_bytes(int type, int64_t k) {
@@ -1138,6 +1348,13 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     bool vec[3] = {true, true, true};
     iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
+    Q8Jobs QJ;   // (DS4_Q8_BATCH: the jobs' int8 inputs, one launch before the GEMVs; else each at its job)
+    int nq = 0;
+    const bool batch = q8_batch();
+    auto quant = [&](const float* x, size_t ldx, int rows, int k, int8_t* q, float* d) {
+        if (batch) QJ.j[nq++] = {x, ldx, q, d, k, rows};
+        else q8_quant(x, ldx, rows, k, q, d, s);
+    };
     for (int i = 0; i < n; ++i) {
         const x3::MvJob& q = jobs[i];
         const x3::Mat& m = *q.m;
@@ -1153,7 +1370,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
             // (per 32: a dense matrix - the CPU lane computes only experts, so Q8_K's rounding, a scale per 256, would only
             //  lose precision here)
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32);
             iq::MvJob& b = IJ[nij++];
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
@@ -1202,12 +1419,13 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
             b.xq = sc->mq + at;
             b.xd = sc->md + at / 32;
-            q8_quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, s);
+            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32);
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
+    if (nq > 0) q8_quant_jobs(QJ, nq, s);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");

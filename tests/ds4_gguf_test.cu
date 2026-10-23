@@ -143,6 +143,14 @@ double swiglu(double g, double u, double lim) {
 }
 
 void expect(const char* what, const float* got, const double* want, size_t n, double rtol) {
+    // every value finite first, on both sides: a NaN would drop out of the max below (and the next finite error take
+    // its place), an Inf in want would make the scale infinite
+    for (size_t i = 0; i < n; ++i)
+        if (!std::isfinite(got[i]) || !std::isfinite(want[i])) {
+            ++g_fail;
+            std::printf("%-44s FAIL  not finite (at %zu: %.6g vs %.6g)\n", what, i, (double) got[i], want[i]);
+            return;
+        }
     double worst = 0, scale = 1e-30;
     for (size_t i = 0; i < n; ++i) scale = std::max(scale, std::fabs(want[i]));
     size_t at = 0;
@@ -1627,14 +1635,16 @@ void test_kv_pack(cudaStream_t s) {
                 CU(cudaEventElapsedTime(&ms, e0, e1));
                 us[w] = ms * 1000.0f / sh.iters;
             }
-            if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3; elsewhere the packed kernel - then the same bits)
+            if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3/4; elsewhere the packed kernel)
                 CU(cudaMemset(o2, 0xff, n * 4));
                 dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, NH, HD, T, scale, o2, s, dk::kKvFp4, dk::kAttnWmma,
                                 &scr);
                 CU(cudaStreamSynchronize(s));
                 const std::vector<float> got = host(o2, n);
                 double e2 = 0, r2 = 0, worst = 0;
+                bool finite = true;
                 for (size_t i = 0; i < n; ++i) {
+                    finite = finite && std::isfinite(got[i]) && std::isfinite(want[i]);
                     const double dv = (double) got[i] - want[i];
                     e2 += dv * dv;
                     r2 += (double) want[i] * want[i];
@@ -1649,10 +1659,11 @@ void test_kv_pack(cudaStream_t s) {
                 CU(cudaEventSynchronize(e1));
                 float ms = 0.0f;
                 CU(cudaEventElapsedTime(&ms, e0, e1));
-                const bool ok = rel < 2e-3 && worst < 2e-2 * std::max(rms, 1e-6) * 10;
+                const bool ok = finite && rel < 2e-3 && worst < 2e-2 * std::max(rms, 1e-6) * 10;
                 if (!ok) ++g_fail;
-                std::printf("kv pack: sparse attention, %-22s %s  matrix cores: rel %.2e, worst/rms %.2e, %.1f us a call\n",
-                            sh.what, ok ? "ok  " : "FAIL", rel, worst / std::max(rms, 1e-30), ms * 1000.0f / sh.iters);
+                std::printf("kv pack: sparse attention, %-22s %s  matrix cores: finite %d, max_abs %.2e, rel %.2e, "
+                            "worst/rms %.2e, %.1f us a call\n", sh.what, ok ? "ok  " : "FAIL", (int) finite, worst,
+                            rel, worst / std::max(rms, 1e-30), ms * 1000.0f / sh.iters);
             }
             if (!same) ++g_fail;
             char what[96];
@@ -1661,6 +1672,94 @@ void test_kv_pack(cudaStream_t s) {
                         "staged %.1f)\n",
                         what, same ? "ok  " : "FAIL", same ? "identical" : "DIFFER", us[0], us[1], us[2], us[3]);
         }
+        // Keep the broad-range quantization fixture above; the extra shapes below use bounded KV values.
+        // Its 2^20 spikes can make tiny dot-product differences flip a saturated softmax's winning row.
+        // DS4_ATTN_TEST_EXTREME=1 reproduces that numerical stress with the same queries and error limits.
+        const bool extreme = std::getenv("DS4_ATTN_TEST_EXTREME") != nullptr;
+        if (!extreme) {
+            for (float& v : xc) v = std::ldexp(v, -20);
+            for (float& v : xw) v = std::ldexp(v, -20);
+            CU(cudaMemcpy(d_xc, xc.data(), xc.size() * 4, cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(d_xw, xw.data(), xw.size() * 4, cudaMemcpyHostToDevice));
+            kv_finish(d_xc, NC, HD, dk::kKvFp4, c16, c4, s);
+            kv_finish(d_xw, WIN + TM, HD, dk::kKvFp8, ext, pk, s);
+        }
+        // The same gfx11 error limits on layout/tile edges and the model's real prompt slab dimensions.
+        // Exercise each 16-head group with distinct data, including zero/tiny/large queries and sink domination.
+        const auto wmma_case = [&](const char* what, int T, int heads, const dk::AttnRows& ar) {
+            const size_t n = (size_t) T * heads * HD;
+            for (int t = 0; t < T; ++t)
+                for (int h = 0; h < heads; ++h) {
+                    const float mag = h % 16 == 0 ? 0.0f : h % 16 == 1 ? 1e-6f : h % 16 == 2 ? 1e3f : 0.2f;
+                    for (int k = 0; k < HD; ++k) q[((size_t) t * heads + h) * HD + k] = frand(mag);
+                }
+            for (int h = 0; h < heads; ++h) sink[h] = h % 16 == 3 ? 1e6f : h % 16 == 4 ? -1e6f : frand();
+            CU(cudaMemcpy(d_q, q.data(), n * 4, cudaMemcpyHostToDevice));
+            CU(cudaMemcpy(d_sink, sink.data(), heads * 4, cudaMemcpyHostToDevice));
+            CU(cudaMemset(o1, 0xff, n * 4));
+            CU(cudaMemset(o2, 0xff, n * 4));
+            dk::sparse_attn(d_q, ext, c16, d_sel, SEL, ar, d_sink, heads, HD, T, scale, o1, s, dk::kKvBf16);
+            dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, heads, HD, T, scale, o2, s, dk::kKvFp4,
+                            dk::kAttnWmma, &scr);
+            CU(cudaStreamSynchronize(s));
+            const auto want = host(o1, n), got = host(o2, n);
+            double e2 = 0, r2 = 0, worst = 0;
+            size_t worst_i = 0;
+            std::vector<double> head_e2(heads, 0.0), head_r2(heads, 0.0), head_worst(heads, 0.0);
+            bool finite = true;
+            for (size_t i = 0; i < n; ++i) {
+                finite = finite && std::isfinite(got[i]) && std::isfinite(want[i]);
+                const double dv = (double) got[i] - want[i];
+                e2 += dv * dv;
+                r2 += (double) want[i] * want[i];
+                if (std::fabs(dv) > worst) worst_i = i;
+                worst = std::max(worst, std::fabs(dv));
+                const int h = (int) ((i / HD) % heads);
+                head_e2[h] += dv * dv;
+                head_r2[h] += (double) want[i] * want[i];
+                head_worst[h] = std::max(head_worst[h], std::fabs(dv));
+            }
+            const double rel = std::sqrt(e2 / std::max(r2, 1e-30)), rms = std::sqrt(r2 / (double) n);
+            const bool ok = finite && rel < 2e-3 && worst < 2e-2 * std::max(rms, 1e-6) * 10;
+            if (!ok) ++g_fail;
+            std::printf("kv pack: WMMA %-24s T=%d H=%d %s finite %d max_abs %.2e rel %.2e worst/rms %.2e\n",
+                        what, T, heads, ok ? "ok  " : "FAIL", (int) finite, worst, rel, worst / std::max(rms, 1e-30));
+            const int worst_t = (int) (worst_i / ((size_t) heads * HD));
+            const int worst_h = (int) ((worst_i / HD) % heads), worst_d = (int) (worst_i % HD);
+            const float qmag = worst_h % 16 == 0 ? 0.0f : worst_h % 16 == 1 ? 1e-6f : worst_h % 16 == 2 ? 1e3f : 0.2f;
+            std::printf("  WMMA worst index %zu token %d head %d dim %d query_mag %.6g ref %.9g got %.9g\n",
+                        worst_i, worst_t, worst_h, worst_d, qmag, want[worst_i], got[worst_i]);
+            if (!ok)
+                for (int h = 0; h < heads; ++h) {
+                    const double hrms = std::sqrt(head_r2[h] / ((double) T * HD));
+                    std::printf("  WMMA head %d rel %.6e max_abs %.6e worst/rms %.6e\n", h,
+                                std::sqrt(head_e2[h] / std::max(head_r2[h], 1e-30)), head_worst[h],
+                                head_worst[h] / std::max(hrms, 1e-30));
+                }
+        };
+        dk::AttnRows edges{};
+        const int nwin[] = {0, 1, 15, 16, 17, 31, 32, 33, 127, 128, 0, 1, 15, 16, 17, 128};
+        const int nsel[] = {0, 0, 0, 0, 0, 1, 15, 16, 17, 31, 32, 33, 511, 512, 1, 512};
+        for (int t = 0; t < 16; ++t) {
+            edges.win0[t] = t + 1;
+            edges.nwin[t] = nwin[t];
+            edges.nsel[t] = nsel[t];
+        }
+        for (int heads : {16, 32, 64}) wmma_case("partial tiles / empty rows", 16, heads, edges);
+        // Window-only and R=1/2 (this Maya-S pack), plus R=4/128: 256-row slabs at the causal start and
+        // 8K/32K/64K/120K depth. Keep the original stress cohort's order/data for reproducibility.
+        // A nonzero t0 also checks slabs taken from the middle of a chunk's extended window buffer.
+        for (long long p0 : {0LL, 8192LL, 32768LL, 65536LL, 122880LL})
+            for (int ratio : (extreme ? std::vector<int>{4, 128} : std::vector<int>{0, 1, 2, 4, 128})) {
+                dk::AttnRows ar{};
+                ar.gen = 1; ar.p0 = p0; ar.win = WIN; ar.R = ratio; ar.kcap = SEL;
+                char what[64];
+                std::snprintf(what, sizeof what, "position %lld ratio %d", p0, ratio);
+                wmma_case(what, TM, NH, ar);
+            }
+        dk::AttnRows offset{};
+        offset.gen = 1; offset.p0 = 7; offset.t0 = 7; offset.win = WIN; offset.R = 4; offset.kcap = SEL;
+        wmma_case("offset slab / partial rows", 17, NH, offset);
         CU(cudaEventDestroy(e0));
         CU(cudaEventDestroy(e1));
         CU(cudaFree(d_q));
