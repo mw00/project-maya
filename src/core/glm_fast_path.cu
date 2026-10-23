@@ -1991,20 +1991,29 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     return true;
 }
 
-// STRATA_GLM_HELPER_CHECK=<n> (a load-time self-check, off by default): of each MoE layer the expert helper serves for
-// this part ([l0_, lt_)), up to n of the experts it owns (spread over them, n <= 8) - their RAM-tier bytes against the
-// pack's own, then their weighted sum on a fixed input by the helper and by this part's GPU with the same kernels from
-// the pack's bytes.  It proves the helper's keys and mapping (a layer split gives each part its own helper over its own
-// layers; the split checks every part once all of them are open): a byte that differs, or a sum beyond 1e-5 relative,
-// fails the load.  Nothing it touches is read by the decode afterwards.
+// STRATA_GLM_HELPER_CHECK=<n> (a load-time self-check, off by default): a SAMPLE of the expert helper's work for this
+// part - of each MoE layer it serves ([l0_, lt_)), up to n of the experts it owns (spread over them, n <= 8; not every
+// owned expert): their RAM-tier bytes against the pack's own, then their weighted sum on a fixed input by the helper
+// and by this part's GPU with the same kernels from the pack's bytes.  It tests the helper's keys and mapping (a layer
+// split gives each part its own helper over its own layers; the split checks every part once all of them are open): a
+// byte that differs, or a sum beyond 1e-5 relative, fails the load.  Nothing is vacuous: a part without a helper (no
+// MoE layer of its own) or whose helper owns nothing says so in its line, and the line counts the MoE layers, those
+// holding helper experts and those checked (always equal).  The decode reads nothing the check touches.
 bool Glm5Model::fast_helper_check(std::string& err) {
     FastState* F = fast_;
     const char* hc = getenv("STRATA_GLM_HELPER_CHECK");
-    if (F == nullptr || hc == nullptr || F->helper.device() < 0) return true;
+    if (F == nullptr || hc == nullptr) return true;
     const int per_layer = std::max(0, std::min(8, std::atoi(hc)));
     if (per_layer == 0) return true;
     const Glm5Geometry& g = g_;
-    cudaSetDevice(dev_);
+    int moe_layers = 0;
+    for (int il = l0_; il < lt_; ++il) moe_layers += F->L[(size_t) il].moe && !F->L[(size_t) il].exl3;
+    if (F->helper.device() < 0) {
+        std::fprintf(stderr, "glm helper check: CUDA%d part %d layers [%d, %d): NO helper (%d MoE layers) - nothing checked\n",
+                     dev_, part_, l0_, lt_, moe_layers);
+        return true;
+    }
+    if (!glmfast::cuda_ok(cudaSetDevice(dev_), "GLM helper check device", err)) return false;
     size_t max_blob = 0;
     for (int il = l0_; il < lt_; ++il)
         if (F->L[(size_t) il].moe && !F->L[(size_t) il].exl3) max_blob = std::max(max_blob, F->L[(size_t) il].blob);
@@ -2016,9 +2025,15 @@ bool Glm5Model::fast_helper_check(std::string& err) {
     void *xq = nullptr, *hq = nullptr;
     float *x_d = nullptr, *out_d = nullptr;
     gf::MoeDev plan;
-    const auto release = [&] {
+    const auto release = [&] {   // on this part's device, whatever the helper's call left current
+        cudaSetDevice(dev_);
         cudaFree(blobs); cudaFree(xq); cudaFree(hq); cudaFree(x_d); cudaFree(out_d);
         cudaFree(plan.plan_ptr); cudaFree(plan.plan_w); cudaFree(plan.cpu_flag);
+    };
+    const auto fail = [&](const std::string& what) {
+        if (!what.empty()) err = what;
+        release();
+        return false;
     };
     if (!glmfast::cuda_ok(cudaMalloc((void**) &blobs, (size_t) per_layer * max_blob), "GLM helper check blobs", err) ||
         !glmfast::cuda_ok(cudaMalloc(&xq, (size_t) g.n_embd / 32 * 36), "GLM helper check input", err) ||
@@ -2028,10 +2043,8 @@ bool Glm5Model::fast_helper_check(std::string& err) {
         !glmfast::cuda_ok(cudaMalloc((void**) &plan.plan_ptr, 8 * sizeof(unsigned long long)), "GLM helper check plan", err) ||
         !glmfast::cuda_ok(cudaMalloc((void**) &plan.plan_w, 8 * sizeof(float)), "GLM helper check weights", err) ||
         !glmfast::cuda_ok(cudaMalloc((void**) &plan.cpu_flag, sizeof(int)), "GLM helper check flag", err) ||
-        !glmfast::cuda_ok(cudaMemset(plan.cpu_flag, 0, sizeof(int)), "GLM helper check flag", err)) {
-        release();
-        return false;
-    }
+        !glmfast::cuda_ok(cudaMemset(plan.cpu_flag, 0, sizeof(int)), "GLM helper check flag", err))
+        return fail("");
     // a fixed input (tests/hip/glm_expert_helper.cpp's kind of values), quantized once
     std::vector<float> x((size_t) g.n_embd), ref((size_t) g.n_embd), got((size_t) g.n_embd);
     uint32_t r = 47u;
@@ -2040,9 +2053,13 @@ bool Glm5Model::fast_helper_check(std::string& err) {
         v = (float) ((int) ((r >> 8) % 101u) - 50) * 0.01f;
     }
     cudaStream_t s = F->cs;
-    cudaMemcpy(x_d, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+    // (the input and the plans go on this part's stream, ordered with its kernels; the blobs come from pinned staging,
+    // which cudaMemcpy finishes before it returns)
+    if (!glmfast::cuda_ok(cudaMemcpyAsync(x_d, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice, s),
+                          "GLM helper check x", err))
+        return fail("");
     gf::quantize_q8_1(x_d, xq, g.n_embd, s);
-    int layers = 0, experts = 0;
+    int held = 0, layers = 0, experts = 0;
     double worst = 0.0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
@@ -2050,7 +2067,8 @@ bool Glm5Model::fast_helper_check(std::string& err) {
         std::vector<int> owned;
         for (int e = 0; e < g.n_expert; ++e)
             if (F->helper.owns(il * g.n_expert + e)) owned.push_back(e);
-        if (owned.empty()) continue;
+        if (owned.empty()) continue;   // (counted: held vs moe_layers in the line)
+        ++held;
         const int n = std::min(per_layer, (int) owned.size());
         int keys[8];
         float w[8];
@@ -2063,35 +2081,29 @@ bool Glm5Model::fast_helper_check(std::string& err) {
             const int rs = F->ram_of[(size_t) keys[i]];
             if (rs >= 0) {
                 const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-                if (std::memcmp(R.base + (size_t) rs * R.stride, F->stage[0], Ly.blob) != 0) {
-                    err = "GLM helper check: CUDA" + std::to_string(dev_) + "'s RAM tier holds other bytes than the pack for "
-                          "layer " + std::to_string(il) + " expert " + std::to_string(e);
-                    release();
-                    return false;
-                }
+                if (std::memcmp(R.base + (size_t) rs * R.stride, F->stage[0], Ly.blob) != 0)
+                    return fail("GLM helper check: CUDA" + std::to_string(dev_) + "'s RAM tier holds other bytes than the "
+                                "pack for layer " + std::to_string(il) + " expert " + std::to_string(e));
             }
             ptr[i] = (unsigned long long) (blobs + (size_t) i * max_blob);
             if (!glmfast::cuda_ok(cudaMemcpy(blobs + (size_t) i * max_blob, F->stage[0], Ly.blob, cudaMemcpyHostToDevice),
-                                  "GLM helper check upload", err)) {
-                release();
-                return false;
-            }
+                                  "GLM helper check upload", err))
+                return fail("");
         }
-        cudaMemcpy(plan.plan_ptr, ptr, (size_t) n * sizeof(ptr[0]), cudaMemcpyHostToDevice);
-        cudaMemcpy(plan.plan_w, w, (size_t) n * sizeof(float), cudaMemcpyHostToDevice);
+        if (!glmfast::cuda_ok(cudaMemcpyAsync(plan.plan_ptr, ptr, (size_t) n * sizeof(ptr[0]), cudaMemcpyHostToDevice, s),
+                              "GLM helper check plan", err) ||
+            !glmfast::cuda_ok(cudaMemcpyAsync(plan.plan_w, w, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, s),
+                              "GLM helper check weights", err))
+            return fail("");
         gf::moe_gate_up(Ly.gu_type, plan, n, g.n_embd, g.n_ff_exp, g.swiglu_exp, xq, hq, nullptr, 0, nullptr, 0, nullptr, s);
         gf::moe_down(Ly.d_type, plan, n, g.n_embd, g.n_ff_exp, Ly.down_off, hq, nullptr, out_d, s);
         if (!glmfast::cuda_ok(cudaMemcpyAsync(ref.data(), out_d, ref.size() * sizeof(float), cudaMemcpyDeviceToHost, s),
                               "GLM helper check result", err) ||
-            !glmfast::cuda_ok(cudaStreamSynchronize(s), "GLM helper check", err)) {
-            release();
-            return false;
-        }
-        if (!F->helper.compute(Ly.gu_type, Ly.d_type, Ly.down_off, g.swiglu_exp, n, keys, w, x.data(), got.data(), err)) {
-            release();
-            return false;
-        }
-        cudaSetDevice(dev_);
+            !glmfast::cuda_ok(cudaStreamSynchronize(s), "GLM helper check", err))
+            return fail("");
+        if (!F->helper.compute(Ly.gu_type, Ly.d_type, Ly.down_off, g.swiglu_exp, n, keys, w, x.data(), got.data(), err))
+            return fail("");
+        if (!glmfast::cuda_ok(cudaSetDevice(dev_), "GLM helper check device", err)) return fail("");
         double d2 = 0.0, r2 = 0.0;
         bool finite = true;
         for (int j = 0; j < g.n_embd; ++j) {
@@ -2101,21 +2113,23 @@ bool Glm5Model::fast_helper_check(std::string& err) {
             r2 += (double) ref[(size_t) j] * (double) ref[(size_t) j];
         }
         const double rel = r2 > 0.0 ? std::sqrt(d2 / r2) : (d2 > 0.0 ? INFINITY : 0.0);
-        if (!finite || !(rel <= 1e-5)) {
-            err = "GLM helper check: layer " + std::to_string(il) + "'s " + std::to_string(n) + " experts on CUDA" +
-                  std::to_string(F->helper.device()) + " differ from CUDA" + std::to_string(dev_) + "'s own sum (rel_L2 " +
-                  std::to_string(rel) + ", limit 1e-5)";
-            release();
-            return false;
-        }
+        if (!finite || !(rel <= 1e-5))
+            return fail("GLM helper check: layer " + std::to_string(il) + "'s " + std::to_string(n) + " experts on CUDA" +
+                        std::to_string(F->helper.device()) + " differ from CUDA" + std::to_string(dev_) + "'s own sum (rel_L2 " +
+                        std::to_string(rel) + ", limit 1e-5)");
         worst = std::max(worst, rel);
         ++layers;
         experts += n;
     }
     release();
-    std::fprintf(stderr, "glm helper check: CUDA%d part %d layers [%d, %d): %d experts in %d layers equal the pack's bytes; "
-                         "the helper's sums vs CUDA%d's own kernels max rel_L2 %.3g (limit 1e-5)\n",
-                 F->helper.device(), part_, l0_, lt_, experts, layers, dev_, worst);
+    if (layers == 0)
+        std::fprintf(stderr, "glm helper check: CUDA%d part %d layers [%d, %d): the helper on CUDA%d owns NO expert (%d MoE "
+                             "layers) - nothing checked\n", dev_, part_, l0_, lt_, F->helper.device(), moe_layers);
+    else
+        std::fprintf(stderr, "glm helper check: CUDA%d part %d layers [%d, %d): %d of %d MoE layers hold helper experts, %d "
+                             "checked, a sample of %d experts (up to %d a layer): the pack's bytes, and the helper on CUDA%d "
+                             "vs CUDA%d's own kernels max rel_L2 %.3g (limit 1e-5)\n",
+                     dev_, part_, l0_, lt_, held, moe_layers, layers, experts, per_layer, F->helper.device(), dev_, worst);
     return true;
 }
 
