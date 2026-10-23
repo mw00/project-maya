@@ -214,7 +214,10 @@ static int memory_probe(int device) {
         CHECK(hipEventSynchronize(b));
         float ms = 0.0f;
         CHECK(hipEventElapsedTime(&ms, a, b));
-        std::printf("GLM helper memory: CUDA%d %-26s read %.1f GB/s\n", device, k.name, 5.0 * (double) bytes / (ms * 1e6));
+        if (std::isfinite(ms) && ms > 0.0f)
+            std::printf("GLM helper memory: CUDA%d %-26s read %.1f GB/s\n", device, k.name, 5.0 * (double) bytes / (ms * 1e6));
+        else
+            std::printf("GLM helper memory: CUDA%d %-26s no timing (elapsed %g ms)\n", device, k.name, (double) ms);
         if (k.how == 0) CHECK(hipFree(p));
         else CHECK(hipHostFree(p));
     }
