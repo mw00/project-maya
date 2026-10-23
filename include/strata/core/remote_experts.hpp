@@ -68,7 +68,7 @@ private:
     bool prof_ = false;
     cudaEvent_t ev_[6] = {};
     unsigned long long calls_ = 0, experts_ = 0, bytes_ = 0;
-    double enqueue_ms_ = 0, wait_ms_ = 0, stage_ms_[5] = {};
+    double enqueue_ms_ = 0, wait_ms_ = 0, out_ms_ = 0, stage_ms_[5] = {};   // (out: the zero-copy result's host copy)
 };
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
