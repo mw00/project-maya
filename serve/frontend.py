@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import copy
+import os
 import re
 import threading
 import uuid
@@ -70,7 +71,8 @@ class ChatTemplate:
             options = deepseek_effort_kwargs(kwargs.get("reasoning_effort"))
             thinking = kwargs.get("enable_thinking") is not False and options.get("enable_thinking") is not False
             prompt = encode_messages(history, thinking_mode="thinking" if thinking else "chat",
-                                     reasoning_effort=options.get("reasoning_effort"))
+                                     reasoning_effort=options.get("reasoning_effort"),
+                                     drop_thinking=not deepseek_keep_thinking())
             # The reference encoder always opens a generation turn after a user,
             # tool result or late system message. Expose Jinja's opt-out without
             # changing the pinned encoder or removing explicit task tokens.
@@ -152,6 +154,13 @@ def deepseek_effort_kwargs(value) -> dict:
     if value is not None and value is not False and not isinstance(value, str):
         raise ValueError("DeepSeek reasoning_effort must be an integer in [1, 100] or a named effort")
     return effort_kwargs(value)
+
+
+def deepseek_keep_thinking() -> bool:
+    """MAYA_DS4_KEEP_THINKING=1: an earlier turn's reasoning stays in the prompt for the turns after it, where
+    DeepSeek's own serving drops it at the next user turn - so a tool-less chat's next turn starts with the prompt the
+    model already holds (with MAYA_DS4_SLOT_KEEP, with its state), instead of one that differs at every assistant turn."""
+    return os.environ.get("STRATA_DS4_KEEP_THINKING", "0") not in ("", "0")
 
 
 def budget_effort(tokens) -> dict:

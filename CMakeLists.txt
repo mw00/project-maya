@@ -299,6 +299,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME glm_moe_rows_test COMMAND glm_moe_rows_test)
     set_tests_properties(glm_moe_rows_test PROPERTIES TIMEOUT 60)
   endif()
+  # the batched rows' one-launch kernels (hc_rows, kda_layers over the rows, mv_nt) against the per-row kernels, bitwise
+  # (random inputs, no model)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(glm_rows_kernels_test tests/glm_rows_kernels_test.cu)
+    target_link_libraries(glm_rows_kernels_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_rows_kernels_test COMMAND glm_rows_kernels_test)
+    set_tests_properties(glm_rows_kernels_test PROPERTIES TIMEOUT 120)
+    # the rows' DSA attention in one launch (STRATA_GLM_ROWS_ATTN) against mla() a row, resident and streamed caches
+    add_executable(glm_rows_attn_test tests/glm_rows_attn_test.cu)
+    target_link_libraries(glm_rows_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_rows_attn_test COMMAND glm_rows_attn_test)
+    set_tests_properties(glm_rows_attn_test PROPERTIES TIMEOUT 300)
+  endif()
   # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
   if(STRATA_BUILD_TESTS)
     add_executable(glm_lat8_test tests/glm_lat8_test.cu)
@@ -390,7 +403,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -414,9 +427,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the EXL3 prompt
+  # experts' tensor-core switch by chunk length (exl3_mma_rows): CPU only
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups); where a read cuts to
+  # keep its system prompt's state (prefix_cut): CPU only
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the pieces a prompt is
   # read in between decode steps (prefill_pieces): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test prefill_pieces_test)
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test exl3_mma_rows_test prefix_cut_test mtp_rows_test prefill_pieces_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)

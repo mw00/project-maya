@@ -4,6 +4,26 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.24 - 2026-10-22
+
+A fix for DeepSeek on two NVIDIA GPUs under Windows, faster DeepSeek prompts on NVIDIA RTX 30 and newer and on RDNA 4,
+and new options for large-RAM servers.
+
+- **DeepSeek on two or more NVIDIA GPUs on Windows** no longer hangs on the first prompt (#384, #303): one GPU waited
+  for a hand-off the other GPU's queued work had not yet sent. `DS4_WIN_SUBMIT=0` restores the old behaviour for
+  comparison. Linux and one-GPU setups are unchanged.
+- **Monitor: DeepSeek's "Where the experts live" card** shows VRAM, RAM and SSD apart again, each with its experts and
+  GB, and the experts a token from RAM, from the SSD and promoted to VRAM - as GLM's - with the n-gram memory beside
+  them (from the SSD: measured on Linux).
+- **Prompt attention on NVIDIA tensor cores** (RTX 30 and newer, sm_80+; #369, @jinsoojinsoo) and **on RDNA 4's
+  matrix cores** (#370, @Gazelle221B), like RDNA 3's since v1.1.21. `DS4_ATTN_MMA=0` / `DS4_ATTN_WMMA=0` turn them off.
+- **Tensor parallel:** a GPU group member reads only its own expert rows from the RAM copy (#377, @NenadSteric).
+- **Large-RAM Linux servers:** opt-in locked Engram tables (`DS4_ENGRAM_RAM=1`) and every CPU-lane expert held in RAM
+  with no fallback to the SSD (`DS4_REQUIRE_ALL_RAM=1`) (#368, @tctiger). [docs/SETTINGS.md](docs/SETTINGS.md).
+- **Options** (@pepuscz): `MAYA_DS4_Q8_BATCH=1` rounds a GEMV call's inputs in one launch, with the same bits (#382);
+  `MAYA_DS4_LT_STORE` keeps AMD's measured hipBLASLt picks outside the pack (#381); `DS4_PROF` prints its line for each
+  served request (#380); the kernel test fails on a NaN or Inf (#379).
+
 ## v1.1.23 - 2026-10-22
 
 A fix for DeepSeek conversations past 32,768 tokens on AMD GPUs and NVIDIA RTX 20 cards.

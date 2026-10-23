@@ -46,7 +46,9 @@
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
+#include "strata/core/mtp_rows.hpp"
 #include "strata/core/split_groups.hpp"
+#include "strata/core/prefix_cut.hpp"
 #include "strata/core/prefill_pieces.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -1412,6 +1414,9 @@ static int glm_pack_generate(const Options& o) {
         for (auto& fd : found) {
             total += fd.bytes;
             slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock});
+            // a system prompt's state (slot_prefix) goes only as the least recently used, after a restart too: the
+            // .meta has no flag for it, its tokens tell (no user turn)
+            slots.back().prefix = strata::core::is_system_prefix(slots.back().tokens, 154827);
         }
         if (slot_keep) {
             std::ostringstream m;
@@ -1799,10 +1804,17 @@ static int glm_pack_generate(const Options& o) {
                             (double) done / (ms / 1000.0 + 1e-9), reuse);
                 std::fflush(stdout);
             };
-            const std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
-            size_t sys_end = 0;  // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
-            for (size_t i = 1; i < prompt.size() && sys_end == 0; ++i)
-                if (prompt[i] == 154827) sys_end = i;   // <|user|>
+            std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
+            // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
+            const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
+            // without checkpoints (STRATA_GLM_CKPTS=0, the several-conversation scheduler) the read still ends a call
+            // there with the slots on, for slot_prefix: another conversation with this system prompt (a new conversation
+            // of the same client, another request of the same kind) restores it instead of reading it again.
+            // STRATA_GLM_PREFIX_CUT=0: off
+            static const bool prefix_cut_on = env_num("STRATA_GLM_PREFIX_CUT", 1) != 0;
+            if (ckpt_max <= 0 && slot_max > 0 && prefix_cut_on && cur_img_pos.empty())
+                strata::core::add_mark(marks, strata::core::prefix_cut(prompt.data(), prompt.size(), reuse, slot_min,
+                                                                        154827), reuse);
             size_t at = reuse;   // the next token the prompt path reads
             bool pok = true, between_failed = false;
             // one call to the next checkpoint mark (or the prompt's last token) - with STRATA_GLM_PREFILL_INTERLEAVE and
@@ -1849,7 +1861,7 @@ static int glm_pack_generate(const Options& o) {
                 if (pok) {
                     at = end;
                     if (end == seg_end && mi < marks.size()) {
-                        ckpt_keep(prompt, end);
+                        if (ckpt_max > 0) ckpt_keep(prompt, end);   // (no checkpoints: the mark is a prefix cut's only)
                         if (end == sys_end) slot_prefix(prompt, end);
                         ++mi;
                         seg_start = end;
@@ -2280,6 +2292,16 @@ static int glm_pack_generate(const Options& o) {
                      model.seq_count());
         follow_ids.clear();
     }
+    // STRATA_GLM_MULTI_MTP=<drafts>: the running requests' batched steps carry verify windows - each one's last token
+    // and the NextN block's drafts after it (Glm5Model::mtpw_*, strata/core/mtp_rows.hpp)
+    const bool mtp_rows = multi && model.mtpw_ok();
+    if (multi && strata::core::Glm5Model::multi_mtp_setting() > 0 && !mtp_rows)
+        std::fprintf(stderr, "glm multi mtp: MAYA_GLM_MULTI_MTP is set but not used here - it needs MAYA_GLM_SPLIT_ROWS "
+                             "on a split (or one GPU), the NextN block loaded (no MAYA_GLM_NO_MTP) and no --dflash\n");
+    if (mtp_rows)
+        std::fprintf(stderr, "glm multi mtp: the running requests verify up to %d drafts each in their batched steps "
+                             "(%d rows a group)\n", strata::core::Glm5Model::multi_mtp_setting(),
+                     strata::core::Glm5Model::rows_max());
     if (multi && model.dflash_ready())
         std::fprintf(stderr, "glm dflash: not used with MAYA_GLM_SEQS=%d - the several-conversation scheduler decodes "
                              "without it (and without the MTP block, which --dflash leaves unloaded)\n",
@@ -2330,6 +2352,12 @@ static int glm_pack_generate(const Options& o) {
         std::chrono::steady_clock::time_point t0, t1;
         uint64_t spec_steps0 = 0, spec_hits0 = 0;
         strata::core::Glm5Model::FastStats st1;
+        // STRATA_GLM_MULTI_MTP: the NextN block's drafts for the positions after `pending` (made at position
+        // draft_at after draft_tok: stale once either moved), and this request's verify statistics
+        std::vector<int32_t> drafts;
+        int64_t draft_at = -1;
+        int32_t draft_tok = -1;
+        uint64_t mtp_steps = 0, mtp_drafts = 0, mtp_acc = 0;
     };
     std::vector<std::unique_ptr<Gen>> gens;
     std::deque<Gen*> flight;     // issued, oldest first
@@ -2504,9 +2532,16 @@ static int glm_pack_generate(const Options& o) {
         const uint64_t d_hits = st2.hits - g.st1.hits, d_miss = st2.misses - g.st1.misses;
         std::printf("DONE %d %lld %lld %.1f %.1f %s %llu %llu %zu %llu %llu\n", g.rid, (long long) g.produced,
                     (long long) g.prompt.size(), prompt_ms, decode_ms, g.finish,
-                    (unsigned long long) (model.spec_hits_ - g.spec_hits0),
-                    (unsigned long long) (model.spec_steps_ - g.spec_steps0), g.reuse, (unsigned long long) d_hits,
-                    (unsigned long long) (d_hits + d_miss));
+                    (unsigned long long) (model.spec_hits_ - g.spec_hits0 + g.mtp_acc),
+                    (unsigned long long) (model.spec_steps_ - g.spec_steps0 + g.mtp_drafts), g.reuse,
+                    (unsigned long long) d_hits, (unsigned long long) (d_hits + d_miss));
+        if (mtp_rows && g.mtp_steps > 0)
+            std::fprintf(stderr, "glm multi mtp: request %d: %llu of %llu drafts accepted (%.1f%%) in %llu verify steps, "
+                                 "%.2f tokens a step\n", g.rid, (unsigned long long) g.mtp_acc,
+                         (unsigned long long) g.mtp_drafts,
+                         100.0 * (double) g.mtp_acc / (double) std::max<uint64_t>(1, g.mtp_drafts),
+                         (unsigned long long) g.mtp_steps,
+                         (double) (g.mtp_steps + g.mtp_acc) / (double) g.mtp_steps);
         bool deferred = false;
         if (g.pause && std::strcmp(g.finish, "cancel") == 0) {
             if (in_read_gap) {   // (another context's prompt is being read and stays bound: the snapshot after it)
@@ -2550,8 +2585,102 @@ static int glm_pack_generate(const Options& o) {
         if (!gen_token(g, tok)) gen_finish(g);
         else g.pending = tok;
     };
+    // STRATA_GLM_MULTI_MTP: the groups of verify windows in flight, oldest first - each past its front (every part but
+    // the last), `back` once its last part and head are queued too
+    struct WinGroup {
+        std::vector<Gen*> g;
+        std::vector<int> seqs, counts;
+        std::vector<int32_t> toks;
+        std::vector<strata::kernels::SamplerParams> sps;
+        bool back = false;
+    };
+    std::deque<WinGroup> wflight;
+    const auto win_back = [&](WinGroup& w) -> bool {
+        if (w.back) return true;
+        w.back = true;
+        return model.mtpw_back(w.seqs.data(), w.counts.data(), (int) w.seqs.size(), w.toks.data(), w.sps.data(), err);
+    };
+    // the oldest group back: its picks; each window's rows written up to the first draft that differs from what was
+    // written before it (T lines, the stop conditions, a forced token - gen_took's rules); the commit; then the next
+    // windows' drafts - the next group's last part is queued between the drafts and their wait, so the last GPU goes
+    // on with it; the requests that ended, ended
+    const auto win_take = [&]() -> bool {
+        WinGroup w = std::move(wflight.front());
+        wflight.pop_front();
+        const int n = (int) w.seqs.size();
+        int rows = 0;
+        for (const int c : w.counts) rows += c;
+        std::vector<int32_t> picks((size_t) rows);
+        if (!win_back(w) || !model.mtpw_picks(w.seqs.data(), w.counts.data(), n, picks.data(), err)) return false;
+        std::vector<int> keep((size_t) n, 1), nd((size_t) n, 0);
+        std::vector<int32_t> written, last((size_t) n, -1);
+        std::vector<char> ended((size_t) n, 0);
+        const int D = strata::core::Glm5Model::multi_mtp_setting();
+        for (int i = 0, row = 0; i < n; row += w.counts[(size_t) i], ++i) {
+            Gen& g = *w.g[(size_t) i];
+            g.inflight = false;
+            std::vector<int32_t> wr;
+            keep[(size_t) i] = strata::core::mtp_accept(
+                w.toks.data() + row, picks.data() + row, w.counts[(size_t) i],
+                [&](int, int32_t pick, int32_t& out) {
+                    int32_t tok = pick;
+                    if (g.force >= 0) {   // (gen_took's: the forced token instead of the pick)
+                        tok = g.force;
+                        g.force = -1;
+                    }
+                    out = tok;
+                    wr.push_back(tok);
+                    g.sp.counter += 1;
+                    if (!gen_token(g, tok)) {
+                        ended[(size_t) i] = 1;
+                        return strata::core::MtpTake::stop;
+                    }
+                    return g.force >= 0 ? strata::core::MtpTake::forced : strata::core::MtpTake::more;
+                });
+            const int k = keep[(size_t) i];
+            g.mtp_steps += 1;
+            g.mtp_drafts += (uint64_t) (w.counts[(size_t) i] - 1);
+            g.mtp_acc += (uint64_t) (k - 1);
+            for (int t = 0; t + 1 < k; ++t) written.push_back(wr[(size_t) t]);   // (the tokens at p0 + 1 .. p0 + k - 1)
+            last[(size_t) i] = wr[(size_t) k - 1];
+            g.drafts.clear();
+            g.draft_at = -1;
+            if (!ended[(size_t) i]) {
+                g.pending = last[(size_t) i];
+                // the next window's drafts: no more than its tokens left after the pending one and its context's
+                // room (draft j's NextN cache entry is at the window's start + j - 1; the position is still this
+                // window's start + its rows until the commit below)
+                nd[(size_t) i] = (int) std::max<int64_t>(
+                    0, std::min<int64_t>({(int64_t) D, g.max_new - g.produced - 1,
+                                          model.seq_max_ctx(g.ctx) - 2 -
+                                              (model.seq_pos(g.ctx) - w.counts[(size_t) i] + k)}));
+            }
+        }
+        if (!model.mtpw_commit(w.seqs.data(), w.counts.data(), keep.data(), n, err)) return false;
+        if (!model.mtpw_draft_queue(w.seqs.data(), keep.data(), n, written.data(), last.data(), nd.data(), err))
+            return false;
+        if (!wflight.empty() && !win_back(wflight.front())) return false;
+        {
+            std::vector<int32_t> out((size_t) n * (size_t) std::max(1, D), -1);
+            if (!model.mtpw_draft_take(out.data(), err)) return false;
+            for (int i = 0; i < n; ++i) {
+                Gen& g = *w.g[(size_t) i];
+                if (ended[(size_t) i]) continue;
+                for (int j = 0; j < D && out[(size_t) i * D + (size_t) j] >= 0; ++j)
+                    g.drafts.push_back(out[(size_t) i * D + (size_t) j]);
+                g.draft_at = model.seq_pos(g.ctx);
+                g.draft_tok = g.pending;
+            }
+        }
+        for (int i = 0; i < n; ++i)
+            if (ended[(size_t) i]) gen_finish(*w.g[(size_t) i]);
+        since_boundary += n;
+        return true;
+    };
     // every issued token back (before a prompt, a boundary or the speculative path)
     const auto multi_drain = [&]() -> bool {
+        while (!wflight.empty())
+            if (!win_take()) return false;
         while (!flight.empty()) {
             Gen& g = *flight.front();
             flight.pop_front();
@@ -2597,6 +2726,7 @@ static int glm_pack_generate(const Options& o) {
         }
         flight.clear();
         flight_groups.clear();
+        wflight.clear();
         if (in_read_gap) {   // (a prompt is being read: its call ends first, then gap_reset resets them all)
             gap_failed = true;
             prompt_between_err = "the engine failed while other requests decoded during this prompt's read: " + why;
@@ -2906,6 +3036,80 @@ static int glm_pack_generate(const Options& o) {
         // a request admitted alone that the speculative path does not take: its first token, from its prompt's logits
         if (!resolve_ready()) {
             multi_fail(err);
+            return;
+        }
+        // STRATA_GLM_MULTI_MTP: the ready requests' windows (their last token and the drafts made for the positions
+        // after it) in groups as the split's batched rows take them, each group through every part but the last;
+        // then the oldest group back (win_take) - its last part queued now if it was not
+        // (STRATA_GLM_MULTI_MTP_MAX, 4: the windows only while that many requests or fewer run - with more, every
+        // GPU is already busy and a window's rows cost about what the tokens they save cost; 0: always. Switching
+        // drains what the other way has in flight)
+        static const int mtp_max = (int) env_num("STRATA_GLM_MULTI_MTP_MAX", 4);
+        int n_run = 0;
+        for (auto& gp : gens) n_run += !gp->done;
+        const bool use_win = mtp_rows && (mtp_max <= 0 || n_run <= mtp_max);
+        if ((use_win && !flight.empty()) || (!use_win && !wflight.empty())) {
+            if (!multi_drain()) {
+                multi_fail(err);
+                return;
+            }
+            gen_sweep();
+            return;
+        }
+        if (use_win) {
+            int ready = 0, active = 0;
+            for (auto& gp : gens) {
+                if (gp->done) continue;
+                ready += !gp->inflight && gp->pending >= 0;
+                active += gp->inflight || gp->pending >= 0;
+            }
+            const int k = std::max(1, split_rows > 0 ? split_rows : model.seq_count());
+            const std::vector<int> sizes = strata::core::split_groups(ready, active, k, even_groups);
+            std::vector<Gen*> rdy;
+            for (auto& gp : gens)
+                if (!gp->done && !gp->inflight && gp->pending >= 0) rdy.push_back(gp.get());
+            size_t at = 0;
+            for (const int gs : sizes) {
+                WinGroup w;
+                for (int j = 0; j < gs && at < rdy.size(); ++j) w.g.push_back(rdy[at++]);
+                for (Gen* gp : w.g) {
+                    const int64_t pos = model.seq_pos(gp->ctx);
+                    const int d = gp->draft_at == pos && gp->draft_tok == gp->pending ? (int) gp->drafts.size() : 0;
+                    w.seqs.push_back(gp->ctx);
+                    w.counts.push_back(strata::core::mtp_rows_count(d, gp->max_new - gp->produced,
+                                                                    model.seq_max_ctx(gp->ctx) - 1 - pos));
+                    w.sps.push_back(gp->sp);
+                }
+                strata::core::mtp_rows_fit(w.counts, strata::core::Glm5Model::rows_max());
+                for (size_t j = 0; j < w.g.size(); ++j) {
+                    w.toks.push_back(w.g[j]->pending);
+                    for (int t = 1; t < w.counts[j]; ++t) w.toks.push_back(w.g[j]->drafts[(size_t) t - 1]);
+                }
+                if (w.g.empty()) continue;
+                if (!model.mtpw_front(w.seqs.data(), w.counts.data(), (int) w.seqs.size(), w.toks.data(), err)) {
+                    multi_fail(err);
+                    return;
+                }
+                for (Gen* gp : w.g) gp->inflight = true;
+                wflight.push_back(std::move(w));
+            }
+            if (wflight.empty()) {
+                gen_sweep();
+                return;
+            }
+            if (!win_take()) {
+                multi_fail(err);
+                return;
+            }
+            if (multi_boundary_every > 0 &&
+                since_boundary >= multi_boundary_every * (int) std::max<size_t>(1, gens.size())) {
+                since_boundary = 0;
+                if (!multi_drain() || !model.multi_boundary(err)) {
+                    multi_fail(err);
+                    return;
+                }
+            }
+            gen_sweep();
             return;
         }
         // ONE GPU: every request with a token to feed goes through one step together, each weight read once for all
@@ -3224,9 +3428,121 @@ static int glm_pack_generate(const Options& o) {
         st_a = model.fast_stats();
         const auto t0 = now();
         int since = 0, boundaries = 0;
-        const bool rows = model.rows_ok();   // one GPU: all n together, one step per token of each
-        const bool srows = !rows && split_rows > 0 && model.split_rows_ok();
-        const char* path = rows ? "together" : srows ? "split-rows" : "pipelined";
+        // STRATA_GLM_MULTI_MTP: every sequence's verify windows through the batched rows (the server's order of calls)
+        const bool wrows = model.mtpw_ok() && (model.rows_ok() || (split_rows > 0 && model.split_rows_ok()));
+        const bool rows = model.rows_ok() && !wrows;   // one GPU: all n together, one step per token of each
+        const bool srows = !rows && !wrows && split_rows > 0 && model.split_rows_ok();
+        const char* path = wrows ? "mtp-windows" : rows ? "together" : srows ? "split-rows" : "pipelined";
+        uint64_t w_steps = 0, w_drafts = 0, w_acc = 0;
+        if (wrows) {
+            const int D = strata::core::Glm5Model::multi_mtp_setting();
+            std::vector<std::vector<int32_t>> drafts((size_t) n);
+            struct BG {
+                std::vector<int> seqs, counts;
+                std::vector<int32_t> toks;
+                bool back = false;
+            };
+            const auto back = [&](BG& b) -> bool {
+                if (b.back) return true;
+                b.back = true;
+                const std::vector<strata::kernels::SamplerParams> sps(b.seqs.size(), g0);
+                return model.mtpw_back(b.seqs.data(), b.counts.data(), (int) b.seqs.size(), b.toks.data(), sps.data(),
+                                       err);
+            };
+            for (;;) {
+                std::vector<int> act;
+                for (int s = 0; s < n; ++s)
+                    if ((int) out[(size_t) s].size() < G) act.push_back(s);
+                if (act.empty()) break;
+                std::vector<BG> gs;
+                size_t first = 0;
+                for (const int k : strata::core::split_groups((int) act.size(), (int) act.size(),
+                                                              std::max(1, split_rows > 0 ? split_rows : n), even_groups)) {
+                    BG b;
+                    for (int j = 0; j < k; ++j) {
+                        const int s = act[first + (size_t) j];
+                        b.seqs.push_back(s);
+                        b.counts.push_back(strata::core::mtp_rows_count(
+                            (int) drafts[(size_t) s].size(), G - (int64_t) out[(size_t) s].size(),
+                            model.seq_max_ctx(s) - 1 - model.seq_pos(s)));
+                    }
+                    first += (size_t) k;
+                    strata::core::mtp_rows_fit(b.counts, strata::core::Glm5Model::rows_max());
+                    for (size_t j = 0; j < b.seqs.size(); ++j) {
+                        const int s = b.seqs[j];
+                        b.toks.push_back((int32_t) out[(size_t) s].back());
+                        for (int t = 1; t < b.counts[j]; ++t) b.toks.push_back(drafts[(size_t) s][(size_t) t - 1]);
+                    }
+                    if (!model.mtpw_front(b.seqs.data(), b.counts.data(), (int) b.seqs.size(), b.toks.data(), err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return 1;
+                    }
+                    gs.push_back(std::move(b));
+                }
+                for (size_t gi = 0; gi < gs.size(); ++gi) {
+                    BG& b = gs[gi];
+                    const int m = (int) b.seqs.size();
+                    int rows_n = 0;
+                    for (const int c : b.counts) rows_n += c;
+                    std::vector<int32_t> picks((size_t) rows_n), written, last((size_t) m);
+                    std::vector<int> keep((size_t) m), nd((size_t) m, D);
+                    if (!back(b) || !model.mtpw_picks(b.seqs.data(), b.counts.data(), m, picks.data(), err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (int i = 0, row = 0; i < m; row += b.counts[(size_t) i], ++i) {
+                        const int s = b.seqs[(size_t) i];
+                        std::vector<int32_t> wr;
+                        keep[(size_t) i] = strata::core::mtp_accept(
+                            b.toks.data() + row, picks.data() + row, b.counts[(size_t) i],
+                            [&](int, int32_t pick, int32_t&) {
+                                wr.push_back(pick);
+                                out[(size_t) s].push_back(pick);
+                                return (int) out[(size_t) s].size() < G ? strata::core::MtpTake::more
+                                                                        : strata::core::MtpTake::stop;
+                            });
+                        const int k = keep[(size_t) i];
+                        ++w_steps;
+                        w_drafts += (uint64_t) (b.counts[(size_t) i] - 1);
+                        w_acc += (uint64_t) (k - 1);
+                        for (int t = 0; t + 1 < k; ++t) written.push_back(wr[(size_t) t]);
+                        last[(size_t) i] = wr[(size_t) k - 1];
+                        // (no more drafts than the tokens left after the pending one, nor past the context)
+                        nd[(size_t) i] = (int) std::max<int64_t>(
+                            0, std::min<int64_t>({(int64_t) D, (int64_t) G - (int64_t) out[(size_t) s].size() - 1,
+                                                  model.seq_max_ctx(s) - 2 -
+                                                      (model.seq_pos(s) - b.counts[(size_t) i] + k)}));
+                    }
+                    std::vector<int32_t> dr((size_t) m * (size_t) std::max(1, D), -1);
+                    if (!model.mtpw_commit(b.seqs.data(), b.counts.data(), keep.data(), m, err) ||
+                        !model.mtpw_draft_queue(b.seqs.data(), keep.data(), m, written.data(), last.data(), nd.data(),
+                                                err) ||
+                        (gi + 1 < gs.size() && !back(gs[gi + 1])) || !model.mtpw_draft_take(dr.data(), err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (int i = 0; i < m; ++i) {
+                        auto& d = drafts[(size_t) b.seqs[(size_t) i]];
+                        d.clear();
+                        for (int j = 0; j < D && dr[(size_t) i * D + (size_t) j] >= 0; ++j)
+                            d.push_back(dr[(size_t) i * D + (size_t) j]);
+                    }
+                    since += m;
+                }
+                if (K > 0 && since >= K * n) {
+                    if (!model.multi_boundary(err)) {
+                        std::fprintf(stderr, "multi bench: %s\n", err.c_str());
+                        return 1;
+                    }
+                    ++boundaries;
+                    since = 0;
+                }
+            }
+            std::printf("  mtp windows: %llu of %llu drafts accepted (%.1f%%), %.2f tokens a window\n",
+                        (unsigned long long) w_acc, (unsigned long long) w_drafts,
+                        100.0 * (double) w_acc / (double) std::max<uint64_t>(1, w_drafts),
+                        (double) (w_steps + w_acc) / (double) std::max<uint64_t>(1, w_steps));
+        }
         if (rows) {
             std::vector<int> seqs((size_t) n), next((size_t) n);
             std::vector<int32_t> toks((size_t) n);
@@ -3239,7 +3555,7 @@ static int glm_pack_generate(const Options& o) {
                 ++boundaries;   // (one before every step, in the step itself)
             }
         }
-        for (int s = 0; s < n && !rows && !srows; ++s) {
+        for (int s = 0; s < n && !rows && !srows && !wrows; ++s) {
             if (!model.multi_issue(s, out[(size_t) s].back(), g0, err)) { std::fprintf(stderr, "multi bench: %s\n", err.c_str()); return 1; }
             q.push_back(s);
         }

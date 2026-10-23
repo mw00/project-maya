@@ -967,6 +967,17 @@ bool Glm5Model::fast_setup(std::string& err) {
             std::fprintf(stderr, "glm mtp: CUDA%d %s - decoding token by token\n", dev_, werr.c_str());
         }
     }
+    // several conversations drafting with the NextN block (STRATA_GLM_MULTI_MTP, glm_mtp_rows.cu): the commit's replay
+    // scratch on every part; on the part with the block, its cache rows' buffers and the draft head's rows - the
+    // drafts are fed from the host (no token_embd on the device) - before the pool too
+    if (multi_mtp_setting() > 0 && !dflash_on_) {
+        if (!mtpw_setup(err)) return false;
+        if (mtp_il_ >= 0 && !mtp_dec_) {
+            if (!mtp_cache_setup(err)) return false;
+            // the draft vocabulary's rows are gathered from a GGUF-typed head; an EXL3 head drafts over all of it
+            if (ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) mtp_draft_setup(false);
+        }
+    }
     {
         size_t f1 = 0, t1 = 0;
         cudaMemGetInfo(&f1, &t1);
@@ -1009,10 +1020,14 @@ bool Glm5Model::fast_setup(std::string& err) {
         // answer slots, the grouping) is the verify window's, its rows a window's tokens (win_alloc).  Both before the
         // pool takes the card.
         if (glmfast::group_experts_on() && rows_ != nullptr) {
-            const int R = std::min(rows_max(), n_parts_ > 1 ? split_rows_setting() : seq_count());
+            // (STRATA_GLM_MULTI_MTP: a group's verify windows take more rows than it has conversations - the rows past
+            // the conversations' own name earlier rows' slots, and group only while every expert is in VRAM)
+            const int mm = multi_mtp_setting() > 0 ? multi_mtp_cap() : 0;
+            const int R = std::min(mm > 0 ? 8 : rows_max(), n_parts_ > 1 ? split_rows_setting() : seq_count());
+            const int RT = std::max(R, mm);
             if (R >= 2) {
                 const size_t extra = (size_t) (R - 1) * 8 * sstride;
-                std::vector<unsigned long long> sp((size_t) R * 8);
+                std::vector<unsigned long long> sp((size_t) RT * 8);
                 if (cudaMalloc(&F->rows_scratch, extra) != cudaSuccess ||
                     cudaMalloc((void**) &F->rows_scr, sp.size() * sizeof(unsigned long long)) != cudaSuccess) {
                     cudaGetLastError();
@@ -1020,8 +1035,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                           " MB) did not allocate";
                     return false;
                 }
-                for (size_t i = 0; i < sp.size(); ++i)
-                    sp[i] = (unsigned long long) (i < 8 ? F->scratch + i * sstride : F->rows_scratch + (i - 8) * sstride);
+                for (size_t i = 0; i < sp.size(); ++i) {
+                    const size_t j = i % ((size_t) R * 8);
+                    sp[i] = (unsigned long long) (j < 8 ? F->scratch + j * sstride : F->rows_scratch + (j - 8) * sstride);
+                }
                 cudaMemcpy(F->rows_scr, sp.data(), sp.size() * sizeof(unsigned long long), cudaMemcpyHostToDevice);
                 F->scratch_bytes += extra;
                 size_t f0 = 0, f1 = 0, tot = 0;
@@ -1031,6 +1048,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 F->win_bytes += f0 > f1 ? f0 - f1 : 0;
                 cpu_win_alloc(F, g, exl3_);   // the merged CPU lane's rows (win_cpu_merged)
                 F->rows_group = R;
+                F->rows_scr_rows = RT;
                 std::fprintf(stderr, "glm fast: CUDA%d grouped rows' experts (STRATA_GLM_GROUP_EXPERTS): up to %d rows, "
                              "%.0f MB of scratch slots and %.0f MB of route state\n", dev_, R, (double) extra / 1e6,
                              (double) (f0 > f1 ? f0 - f1 : 0) / 1e6);
@@ -5686,7 +5704,8 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
 //     from token_embd there (embed_tok: the host's floats) and the step queues behind the one before it with no host
 //     round trip.  Else the host dequantizes the token's row: through mtp_emb_h where the chain is set up (its last
 //     copy out waited for alone), else through emb_h after a sync of the stream (it may still feed an earlier copy).
-bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step, bool sub, bool read_back) {
+bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step, bool sub, bool read_back,
+                         const float* emb_staged, bool head) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     cudaStream_t s = F->cs;
@@ -5705,6 +5724,8 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
             return false;
         }
         gf::embed_tok(F->mtp_emb, F->mtp_emb_type, (int) g.n_vocab, F->mtp_tok + step - 1, E, F->emb, s);
+    } else if (emb_staged != nullptr) {   // (the caller's pinned row, kept until this step ran)
+        cudaMemcpyAsync(F->emb, emb_staged, (size_t) E * sizeof(float), cudaMemcpyHostToDevice, s);
     } else {
         const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
         if (tt == nullptr || tt->to_float == nullptr || pack_emb_src_ == nullptr) {
@@ -5739,6 +5760,7 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     bool pf_pending = false;
     if (!fast_moe(il, pf_pending, err)) return false;
     gf::rms_q8(F->mtp_h, F->ffn, Ly.shnorm, g.norm_eps, E, F->head_x, F->head_xq, s);
+    if (!head) return true;   // (the caller runs the head: several conversations' steps through it at once)
     const WSlot& ow = ws_map_.at("output.weight");
     gf::MvJob o[2];
     o[0] = {ow.q, F->head_xq, F->head_x, F->mtp_logits, nullptr, 1.0f, ow.type, E, g.n_vocab};

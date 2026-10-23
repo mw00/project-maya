@@ -2454,11 +2454,11 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const STRATA_GRID_CONST
 // (8 bf16 per lane per stream segment, uint4) BEFORE it computes its R values, the partial sums are reduced by whole
 // warps (lane = block) instead of one thread walking 32 of them, and the second barrier's total likewise.
 // 32 blocks of 128 embedding values; n_embd == 4096 only.
-__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+// (block b of nb; the kernel's body, one row's or - hc3_rows_kernel - each row's own blocks: grid y is the row)
+__device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb, const int b) {
     const int hc = 4;
     const int n_embd = a.n_embd;
-    const unsigned int nb = gridDim.x;   // 32
-    const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int e0 = b * HC2_EB;
     unsigned long long* ctr = (unsigned long long*) a.counter;
     __shared__ float sR[4][HC2_EB];
@@ -2572,6 +2572,18 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONST
         a.x[e] = xv;
         q8_1_store_warp(xv, (block_q8_1*) a.xq + e / 32, lane);
     }
+}
+__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+    hc3_block(a, gridDim.x, blockIdx.x);   // 32 blocks
+}
+// STRATA_GLM_ROWS_BATCH: the rows of a batched decode step in one launch - row y's blocks are hc3_kernel's for its
+// args (its own partials and barrier counter): the same block function, so each row's arithmetic is meant to be the
+// one-row kernel's (glm_rows_kernels_test compares them bitwise)
+struct HcBatch {
+    HcArgs a[kMaxMvNt];
+};
+__global__ void __launch_bounds__(HC_THREADS) hc3_rows_kernel(const STRATA_GRID_CONSTANT HcBatch rb) {
+    hc3_block(rb.a[blockIdx.y], gridDim.x, blockIdx.x);
 }
 
 __global__ void hc_post_kernel(const float* __restrict__ block_out, const float* __restrict__ R_old,
@@ -2746,7 +2758,7 @@ struct KdaRecBatch {
 };
 __global__ void __launch_bounds__(256) kda_rec_layers_kernel(const STRATA_GRID_CONSTANT KdaRecBatch b) {
     const KdaRecArgs& r = b.a[blockIdx.y];
-    kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, nullptr, blockIdx.x);
+    kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, (block_q8_1*) r.out, blockIdx.x);
 }
 
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
@@ -2852,9 +2864,24 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTAN
     }
 }
 
+__device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                const float* __restrict__ iw, int key_dim, int idx_heads, int n_pools,
+                                                float* __restrict__ score);
 __global__ void __launch_bounds__(256) dsa_score_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
                                                         const float* __restrict__ iw, int key_dim, int idx_heads,
                                                         int n_pools, float* __restrict__ score) {
+    dsa_score_block(iq, pooled, iw, key_dim, idx_heads, n_pools, score);
+}
+// dsa_score of several rows (different sequences) in one launch: blockIdx.y the row, its blocks dsa_score_kernel's (a
+// row's blocks past its own (n_pools + 7) / 8 return at once)
+__global__ void __launch_bounds__(256) dsa_score_rows_kernel(DsaScoreRows a, int key_dim, int idx_heads) {
+    const int r = blockIdx.y;
+    if ((int) blockIdx.x * (int) (blockDim.x >> 5) >= a.n_pools[r]) return;
+    dsa_score_block(a.iq[r], a.pooled[r], a.iw[r], key_dim, idx_heads, a.n_pools[r], a.score[r]);
+}
+__device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                const float* __restrict__ iw, int key_dim, int idx_heads, int n_pools,
+                                                float* __restrict__ score) {
     extern __shared__ float s_iq[];   // idx_heads * key_dim, then idx_heads weights
     float* s_iw = s_iq + idx_heads * key_dim;
     for (int i = threadIdx.x; i < idx_heads * key_dim; i += blockDim.x) s_iq[i] = iq[i];
@@ -2874,8 +2901,19 @@ __global__ void __launch_bounds__(256) dsa_score_kernel(const float* __restrict_
     if (lane == 0) score[p] = acc;
 }
 
+__device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
+                                                 int n_sel, int pos, int* __restrict__ cells);
 __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restrict__ score, int n_vis, int kpool,
                                                           int top_pools, int n_sel, int pos, int* __restrict__ cells) {
+    dsa_select_block(score, n_vis, kpool, top_pools, n_sel, pos, cells);
+}
+// dsa_select of several rows (different sequences) in one launch: a block a row, each dsa_select_kernel's own code
+__global__ void __launch_bounds__(1024) dsa_select_rows_kernel(DsaSelectRows a, int kpool) {
+    const int r = blockIdx.x;
+    dsa_select_block(a.score[r], a.n_vis[r], kpool, a.top_pools[r], a.n_sel[r], a.pos[r], a.cells[r]);
+}
+__device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
+                                                 int n_sel, int pos, int* __restrict__ cells) {
     for (int i = threadIdx.x; i < n_sel; i += blockDim.x) cells[i] = -1;
     __syncthreads();
     // the top pools in rank order (score descending, ties by the lower index), O(n_vis) - src/kernels/cuda/dsa_topk.cuh
@@ -3186,9 +3224,12 @@ constexpr int MLA_NC = 16;
 __host__ __device__ __forceinline__ int mla_cblk(int n_sel) {
     return max(MLA_CHUNK, ((n_sel + MLA_NC - 1) / MLA_NC + MLA_CHUNK - 1) / MLA_CHUNK * MLA_CHUNK);
 }
-// the tokens of one launch (blockIdx.z): each one's selected cell count
+// the tokens of one launch (blockIdx.z): each one's selected cell count; mla_attend_rows: each one's own latents and
+// cells too (tokens of different sequences: lat[tk] set), else the launch's lat and cells + tk * c_stride
 struct MlaToks {
     int n_sel[kMlaTokMax];
+    const uint16_t* lat[kMlaTokMax];
+    const int* cells[kMlaTokMax];
 };
 // a block: 16 heads of one token over its cells [blockIdx.x * cblk, + cblk), MLA_CHUNK at a time with a running max
 // and sum per head (the context rows rescaled when the max grows), so a block's partial covers cblk cells
@@ -3208,7 +3249,12 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
     if (c_begin >= n_sel) return;
     const int c_end = min(n_sel, c_begin + cblk);
     q_abs += tk * q_stride;
-    cells += tk * c_stride;
+    if (nt.lat[tk] != nullptr) {
+        lat = nt.lat[tk];
+        cells = nt.cells[tk];
+    } else {
+        cells += tk * c_stride;
+    }
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int h0 = blockIdx.y * 16, nh = min(16, n_head - h0);
     float* pm = part + (((size_t) tk * MLA_NC + blockIdx.x) * n_head + h0) * (MLA_KV + 2);
@@ -4836,6 +4882,8 @@ namespace {
 // projections 52.5 -> 46.1 us, the router + shared expert 82.2 -> 77.7); K = 12288 / 16384 ran slower with it (the
 // 24-48 KB of LDS per block cost occupancy).
 std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
+// the most activations the RDNA kernels take at once (mv_rdna_launch<1..8>); more go to the other kernels
+constexpr int kMaxRdnaNt = 8;
 // The device the launch runs on: by default the RDNA 3.5 APUs (gfx115x - measured on a Radeon 8065S), whose LPDDR5X
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
 // STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
@@ -4890,9 +4938,10 @@ void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds
         }
     }
 }
-// The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device.
+// The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device, or more than
+// kMaxRdnaNt activations (its kernels take 8 at most - the rest go to the other kernels).
 bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
-    if (!mv_rdna_device()) return false;
+    if (nt > kMaxRdnaNt || !mv_rdna_device()) return false;
     int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
     const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
     if (r < 0) { r = 1; u = 2; }
@@ -5028,7 +5077,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         int idx[kMaxMvJobs], m = 0, nc = 0;
         for (int i = 0; i < n; ++i) {
             const MvJob& J = jobs[i];
-            const bool packed = J.ncol >= 2 && J.ncol <= kMaxMvNt && (J.type == kTypeBF16 || J.type == 14) &&
+            const bool packed = J.ncol >= 2 && J.ncol <= kMaxRdnaNt && (J.type == kTypeBF16 || J.type == 14) &&
                                 (J.xq == nullptr || J.xq_cstride == (int64_t) (J.n_in / 32) * (int64_t) sizeof(block_q8_1)) &&
                                 (J.xf == nullptr || J.xf_cstride == J.n_in) && J.y_cstride == J.n_out;
             if (!done[i] && packed && (nc == 0 || J.ncol == nc)) {
@@ -5266,6 +5315,49 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
     if (!exl3_jobs(jobs, n, nt, done, s)) return false;   // (EXL3: one EXL3 job an activation)
+    if (nt > 8) {
+        // more activations than the kernels take (a verify window's rows, STRATA_GLM_MULTI_MTP): the rest in groups of
+        // 8 - each activation's output is mv()'s for it alone either way (the EXL3 jobs above took all nt at once)
+        for (int base = 0; base < nt; base += 8) {
+            const int w = std::min(8, nt - base);
+            MvJob part[kMaxMvJobs];
+            bool pd[kMaxMvJobs] = {};
+            int m = 0;
+            for (int i = 0; i < n; ++i) {
+                part[i] = jobs[i];
+                pd[i] = done[i];
+                if (done[i]) continue;
+                ++m;
+                if (part[i].xq != nullptr)
+                    part[i].xq = (const uint8_t*) jobs[i].xq + (size_t) base * (jobs[i].n_in / 32) * sizeof(block_q8_1);
+                if (part[i].xf != nullptr) part[i].xf = jobs[i].xf + (size_t) base * jobs[i].n_in;
+                part[i].y = jobs[i].y + (size_t) base * jobs[i].n_out;
+            }
+            if (m == 0) break;
+            if (w == 1) {
+                MvJob one[kMaxMvJobs];
+                int k = 0;
+                for (int i = 0; i < n; ++i)
+                    if (!pd[i]) one[k++] = part[i];
+                if (!mv(one, k, s)) return false;
+                continue;
+            }
+#if defined(STRATA_USE_HIP)
+            if (typed) mv_rdna(part, n, w, pd, s);
+#endif
+            switch (w) {
+                case 2: mv_nt_launch<2>(part, n, typed, pd, s); break;
+                case 3: mv_nt_launch<3>(part, n, typed, pd, s); break;
+                case 4: mv_nt_launch<4>(part, n, typed, pd, s); break;
+                case 5: mv_nt_launch<5>(part, n, typed, pd, s); break;
+                case 6: mv_nt_launch<6>(part, n, typed, pd, s); break;
+                case 7: mv_nt_launch<7>(part, n, typed, pd, s); break;
+                default: mv_nt_launch<8>(part, n, typed, pd, s); break;
+            }
+        }
+        launch_check("mv_nt");
+        return true;
+    }
 #if defined(STRATA_USE_HIP)
     if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
 #endif
@@ -5287,13 +5379,19 @@ void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
     launch_check("quantize");
 }
 
-void hc(const HcArgs& a, cudaStream_t s) {
-    // the grid-barrier kernel needs every block resident at once; checked once per process (and per device count
-    // of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).
+// hc's kernel: the grid-barrier kernel needs every block resident at once; checked once per process (and per device
+// count of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).  cap_rows: how many
+// hc3_rows_kernel blocks the CURRENT device can hold resident at once - its own occupancy, not hc3_kernel's (a different
+// parameter block, so its registers can differ), since hc_rows' rows must all be resident for their grid barriers;
+// kept per device (a split's GPUs can differ)
+constexpr int kHcDevs = 64;
+static int hc_mode(const HcArgs& a, int* cap_rows = nullptr) {
     static int mode = -1;
+    static std::atomic<int> caps[kHcDevs];   // per device: its cap + 1 (0: not asked yet)
+    int dev = 0;
+    if (mode < 0 || cap_rows != nullptr) cudaGetDevice(&dev);
     if (mode < 0) {
-        int dev = 0, sms = 0, per = 0, per3 = 0;
-        cudaGetDevice(&dev);
+        int sms = 0, per = 0, per3 = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
@@ -5301,6 +5399,44 @@ void hc(const HcArgs& a, cudaStream_t s) {
         if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && a.n_embd == 4096 && per3 * sms >= a.n_embd / HC2_EB)
             mode = 3;
     }
+    if (cap_rows != nullptr) {
+        int c1 = dev >= 0 && dev < kHcDevs ? caps[dev].load(std::memory_order_relaxed) : 1;   // (past 64: one a row)
+        if (c1 == 0) {
+            int sms = 0, per3r = 0;
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3r, hc3_rows_kernel, HC_THREADS, 0) != cudaSuccess) {
+                cudaGetLastError();
+                per3r = 0;   // (unknown: one launch a row)
+            }
+            c1 = per3r * sms + 1;
+            caps[dev].store(c1, std::memory_order_relaxed);
+        }
+        *cap_rows = c1 - 1;
+    }
+    return mode;
+}
+
+void hc_rows(const HcArgs* a, int n, cudaStream_t s) {
+    if (n <= 0) return;
+    int cap = 0;
+    const int mode = hc_mode(a[0], &cap);
+    const bool one = n > 1 && n <= kMaxMvNt && mode == 3 && a[0].n_embd == 4096 && cap >= n * (a[0].n_embd / HC2_EB);
+    static std::atomic<bool> said[2] = {false, false};   // (each way said once: which one a run takes)
+    if (n > 1 && !said[one ? 1 : 0].exchange(true))
+        std::fprintf(stderr, "glm rows: hc of %d rows %s (hc mode %d, %d blocks resident at most, %d needed) - said once\n",
+                     n, one ? "in one launch" : "one launch a row", mode, cap, n * (a[0].n_embd / HC2_EB));
+    if (one) {
+        HcBatch b;
+        for (int i = 0; i < n; ++i) b.a[i] = a[i];
+        hc3_rows_kernel<<<dim3(a[0].n_embd / HC2_EB, n), HC_THREADS, 0, s>>>(b);
+        launch_check("hc3_rows");
+        return;
+    }
+    for (int i = 0; i < n; ++i) hc(a[i], s);
+}
+
+void hc(const HcArgs& a, cudaStream_t s) {
+    const int mode = hc_mode(a);
     if (mode == 3) {
         hc3_kernel<<<a.n_embd / HC2_EB, HC_THREADS, 0, s>>>(a);
         launch_check("hc3");
@@ -5368,6 +5504,32 @@ void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps
     launch_check("kda_layers");
 }
 
+__global__ void __launch_bounds__(256) kda_gather_kernel(const STRATA_GRID_CONSTANT KdaGatherArgs a) {
+    const int i = blockIdx.x;
+    float* d = a.dst[i];
+    if (d == nullptr) return;
+    const size_t T = (size_t) a.tmax, t = (size_t) a.t[i], DI = (size_t) a.di, HD = (size_t) a.hd;
+    // (the layout of glm_window.cu's kda_in)
+    float* to[6] = {d + t * DI, d + (T + t) * DI, d + (2 * T + t) * DI, d + 3 * T * DI + t * HD,
+                    d + 3 * T * DI + (T + t) * HD, d + 3 * T * DI + 2 * T * HD + t * (size_t) a.nh};
+    const int w[6] = {a.di, a.di, a.di, a.hd, a.hd, a.nh};
+#pragma unroll
+    for (int p = 0; p < 6; ++p) {
+        const float* from = a.src[p] + (size_t) i * (size_t) w[p];
+        for (int e = threadIdx.x; e < w[p]; e += blockDim.x) to[p][e] = from[e];
+    }
+}
+
+void kda_gather(const KdaGatherArgs& a, cudaStream_t s) {
+    if (a.n_rows <= 0) return;
+    if (a.n_rows > kMaxMvNt) {
+        std::fprintf(stderr, "glm_fast kda_gather: %d rows (at most %d)\n", a.n_rows, kMaxMvNt);
+        return;
+    }
+    kda_gather_kernel<<<a.n_rows, 256, 0, s>>>(a);
+    launch_check("kda_gather");
+}
+
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
     dsa_prep_kernel<<<3, 512, 0, s>>>(a);
     launch_check("dsa_prep");
@@ -5379,6 +5541,15 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
     const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
     dsa_score_kernel<<<(n_pools + 7) / 8, 256, smem, s>>>(iq, pooled, iw, key_dim, idx_heads, n_pools, score);
     launch_check("dsa_score");
+}
+
+void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cudaStream_t s) {
+    int most = 0;
+    for (int r = 0; r < n; ++r) most = std::max(most, a.n_pools[r]);
+    if (n < 1 || most < 1) return;
+    const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
+    dsa_score_rows_kernel<<<dim3((unsigned) ((most + 7) / 8), (unsigned) n), 256, smem, s>>>(a, key_dim, idx_heads);
+    launch_check("dsa_score_rows");
 }
 
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
@@ -5401,6 +5572,12 @@ bool dsa_select_all_on() {
         return v == nullptr || std::atoi(v) != 0;
     }();
     return on;
+}
+
+void dsa_select_rows(const DsaSelectRows& a, int n, int kpool, cudaStream_t s) {
+    if (n < 1) return;
+    dsa_select_rows_kernel<<<n, 1024, 0, s>>>(a, kpool);
+    launch_check("dsa_select_rows");
 }
 
 void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s) {
@@ -5497,6 +5674,36 @@ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat,
                                                                                          ctx + t0 * ctx_stride, ctx_stride);
     }
     launch_check("mla_attend_batch");
+    return true;
+}
+
+size_t mla_rows_part_floats(int n_head, int kv_lora) { return (size_t) MLA_NC * n_head * (kv_lora + 2); }
+
+bool mla_rows_ok(int kv_lora) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    return dev < 16 && kv_lora == MLA_KV && getenv("STRATA_GLM_MLA1") == nullptr && mla_mma_on(dev);
+}
+
+bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
+                     const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+                     float* part, int part_tokens, cudaStream_t s, bool lat_q8) {
+    if (T < 1 || part == nullptr || part_tokens < 1 || !mla_rows_ok(kv_lora)) return false;
+    const int G = std::min(part_tokens, kMlaTokMax);
+    for (int t0 = 0; t0 < T; t0 += G) {
+        const int nt = std::min(G, T - t0);
+        MlaToks tk{};
+        for (int i = 0; i < nt; ++i) {
+            tk.n_sel[i] = n_sel[t0 + i];
+            tk.lat[i] = lat[t0 + i];
+            tk.cells[i] = cells[t0 + i];
+        }
+        mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
+            q_abs + t0 * q_stride, q_stride, lat[t0], cells[t0], 0, tk, n_head, qk_nope, part, lat_q8);
+        mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
+                                                                                         ctx + t0 * ctx_stride, ctx_stride);
+    }
+    launch_check("mla_attend_rows");
     return true;
 }
 
@@ -5969,6 +6176,50 @@ __global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     *w.n_groups = ng;
 }
 
+// moe_win_group_kernel's grouping with a thread an entry (STRATA_GLM_ROWS_SMALL): the same groups in the same order (by
+// each plan's first entry), the same members in entry order - every array it writes, value for value
+__global__ void __launch_bounds__(kWinEnt) moe_win_group_par_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+    __shared__ unsigned long long sp[kWinEnt];
+    __shared__ int first[kWinEnt];
+    const int e = threadIdx.x, ne = w.T * 8;
+    unsigned long long p = 0ull;
+    if (e < ne && (e & 7) < w.k) p = w.plan_ptr[e];
+    sp[e] = p;
+    __syncthreads();
+    int f = -1;   // the entry's group: its plan's first entry
+    if (p != 0ull) {
+        f = e;
+        for (int j = 0; j < e; ++j)
+            if (sp[j] == p) {
+                f = j;
+                break;
+            }
+    }
+    first[e] = f;
+    __syncthreads();
+    if (f >= 0) {
+        int start = 0, pos = 0;   // the entries of the groups before this one; this one's members before it
+        for (int j = 0; j < ne; ++j) start += first[j] >= 0 && first[j] < f;
+        for (int j = 0; j < e; ++j) pos += first[j] == f;
+        w.grp_ent[start + pos] = e;
+        if (f == e) {
+            int g = 0;
+            for (int j = 0; j < e; ++j) g += first[j] == j;
+            w.grp_ptr[g] = p;
+            w.grp_start[g] = start;
+        }
+    }
+    if (e == 0) {
+        int ng = 0, tot = 0;
+        for (int j = 0; j < ne; ++j) {
+            ng += first[j] == j;
+            tot += first[j] >= 0;
+        }
+        w.grp_start[ng] = tot;
+        *w.n_groups = ng;
+    }
+}
+
 // grid (n_ff / GU_ROWS, groups): a group's expert's gate / up rows of this chunk against each member's FFN input, the
 // clamped swiglu into the member's h (moe_gate_up_kernel's rows, arithmetic and layout per member)
 template<int TG>
@@ -6058,9 +6309,10 @@ __global__ void moe_win_combine_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
 
 }  // namespace
 
-bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
+bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, bool par_group) {
     if (w.T < 1 || w.T > kMaxWinTokens || w.k > 8 || w.n_ff % GU_ROWS != 0 || w.n_embd % DOWN_ROWS != 0) return false;
-    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+    if (par_group) moe_win_group_par_kernel<<<1, kWinEnt, 0, s>>>(w);
+    else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
     const int G = w.T * w.k;   // groups at most (the blocks past the real count return at once)
     const dim3 ggu((unsigned) (w.n_ff / GU_ROWS), (unsigned) G), gdn((unsigned) (w.n_embd / DOWN_ROWS), (unsigned) G);
     switch (gu_type) {
@@ -6082,8 +6334,9 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
     return true;
 }
 
-void moe_win_group(const MoeWin& w, cudaStream_t s) {
-    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+void moe_win_group(const MoeWin& w, cudaStream_t s, bool par) {
+    if (par) moe_win_group_par_kernel<<<1, kWinEnt, 0, s>>>(w);
+    else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
     launch_check("moe_win_group");
 }
 

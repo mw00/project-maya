@@ -167,9 +167,10 @@ struct AttnScratch {
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
 };
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
-// heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3 (gfx11) 16 heads a block on the matrix cores - the
+// heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3/4 (gfx11/gfx12), 16 heads a block on matrix cores - the
 // products in BF16 (the query and the probabilities as a high and a low part: within rounding of the FP32 kernels,
-// not their bits); elsewhere, or DS4_ATTN_WMMA=0, as 0
+// not their bits); on Ampere and newer (sm_80+) the same on the tensor cores (mma.sync, BF16; DS4_ATTN_MMA=0 for
+// the FP32 kernel); elsewhere, or DS4_ATTN_WMMA=0, as 0
 constexpr int kAttnWmma = 16;
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
@@ -314,6 +315,9 @@ struct Xfer {
     int n = 0;
 };
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s);
+// Windows (WDDM, CUDA and HIP alike) holds launches back until the host waits or queries the stream: the work queued on
+// `s` submitted now (cudaStreamQuery, which does not wait).  Elsewhere nothing.  DS4_WIN_SUBMIT=0: off (A/B tests)
+void win_submit(cudaStream_t s);
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s);
 /// Waits (one thread) until flags[i * stride] >= seq for i < n (a pipelined chunk's readers have taken a buffer);
 /// set_flag: *flag = v after a system fence (a reader's acknowledgement).

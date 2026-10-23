@@ -203,7 +203,7 @@ void Glm5Model::mtp_vocab_scan(const std::vector<std::unique_ptr<strata::GgufFil
 }
 
 // fast_setup, the part with the NextN block: the draft head's gathered rows, and the chain's token_embd
-void Glm5Model::mtp_draft_setup() {
+void Glm5Model::mtp_draft_setup(bool chain) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const WSlot& ow = ws_map_.at("output.weight");
@@ -236,7 +236,7 @@ void Glm5Model::mtp_draft_setup() {
     }
     // the chain: token_embd as stored, where the device has the room (or STRATA_GLM_MTP_CHAIN=1 says so)
     const char* ce = getenv("STRATA_GLM_MTP_CHAIN");
-    const bool want = mtp_chain_wanted(), forced = ce != nullptr && std::atoi(ce) != 0;
+    const bool want = chain && mtp_chain_wanted(), forced = chain && ce != nullptr && std::atoi(ce) != 0;
     const size_t rb = ggml_row_size((ggml_type) pack_emb_type_, g.n_embd);
     const size_t tb = (size_t) g.n_vocab * rb;
     bool room = forced;
@@ -351,7 +351,8 @@ void Glm5Model::mtp_cache_free() {
 // and the token next[i] (the one at p0 + i + 1; an image row there stands in for it) - the cache-writing half of the
 // block (glm_prefill.cu's for a prompt): eh_proj, the attention norm, kv_a and the indexer's key and gate, written
 // through KV streaming's hook where the block's cache is streamed.  This part carries the block.
-bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync) {
+bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t* next, std::string& err, bool sync,
+                               float* emb_rows_h) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     if (F == nullptr || mtp_il_ < 0 || n <= 0) return true;
@@ -373,12 +374,13 @@ bool Glm5Model::mtp_cache_rows(int64_t p0, int n, const float* h, const int32_t*
     // MTP decode's round, after the verify it waited for)
     if (sync && !glmfast::cuda_ok(cudaStreamSynchronize(s), "glm mtp cache sync", err)) return false;
     const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, g.n_embd);
+    float* const emb_h = emb_rows_h != nullptr ? emb_rows_h : C.emb_h;
     for (int i = 0; i < n; ++i) {
-        float* row = C.emb_h + (size_t) i * E;
+        float* row = emb_h + (size_t) i * E;
         if (const float* img = image_row(p0 + i + 1)) std::memcpy(row, img, (size_t) E * sizeof(float));
         else tt->to_float(pack_emb_src_ + (size_t) next[i] * row_b, row, g.n_embd);
     }
-    cudaMemcpyAsync(C.emb, C.emb_h, (size_t) n * E * sizeof(float), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(C.emb, emb_h, (size_t) n * E * sizeof(float), cudaMemcpyHostToDevice, s);
     for (int i = 0; i < n; ++i)
         gf::mtp_in(C.emb + (size_t) i * E, h + (size_t) i * E, Ly.enorm, Ly.hnorm, g.norm_eps, g.n_embd,
                    (uint8_t*) C.catq + (size_t) i * q8_bytes(2 * E), s);

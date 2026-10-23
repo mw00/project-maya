@@ -177,6 +177,8 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     std::fprintf(stderr, "glm multi: CUDA%d %d sequence states: the first for %lld tokens (%.2f GB), %d more for %lld "
                  "(%.2f GB in all, with every sequence's snapshot)\n", dev_, n, (long long) max_ctx_,
                  (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9);
+    // several conversations drafting at once (STRATA_GLM_MULTI_MTP): their windows' buffers, before the pool too
+    if (multi_mtp_setting() > 0 && !mtpw_alloc(err)) return false;
     // one GPU decodes the sequences together; opt-in split rows need the same activations on every part, before its pool
     if (n_parts_ == 1 || split_rows_setting() > 0) return rows_alloc(err);
     return true;

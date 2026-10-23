@@ -45,11 +45,13 @@ constexpr int kMaxMvCols = 16;   // a verify window's tokens, a draft block's
 constexpr int kMaxMvJobs = 8;
 /// One launch for up to kMaxMvJobs independent GEMVs (they share nothing but the launch).
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
-/// The most activations mv_nt() takes at once (the conversations of one batched decode step).
-constexpr int kMaxMvNt = 8;
+/// The most activations mv_nt() takes at once (the rows of one batched decode step: one a conversation, or a
+/// conversation's verify window of several with STRATA_GLM_MULTI_MTP).
+constexpr int kMaxMvNt = 16;
 /// mv() for nt activations at once (nt <= kMaxMvNt; 1 = mv()), the jobs' ncol 1: each job's xq / xf hold nt activations
 /// one after another (n_in values each) and its y nt outputs (n_out each).  Output t is bit for bit what mv() gives
-/// for activation t alone, and each weight row is read from memory once for all of them.
+/// for activation t alone, and each weight row is read from memory once for all of them (more than 8 activations: once
+/// for each group of 8, EXL3 weights once for all).
 bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s);
 /// Whether mv() serves this weight type.
 bool mv_supported(int type);
@@ -95,9 +97,15 @@ struct HcArgs {
     float* x = nullptr;               // n_embd f32
     void* xq = nullptr;               // n_embd / 32 q8_1 blocks
     float* part = nullptr;            // scratch: (hc*n_embd / 512) * 25 floats
-    unsigned int* counter = nullptr;  // zero-initialised; the kernel leaves it zero
+    unsigned int* counter = nullptr;  // zero-initialised once: the single-tail kernel leaves it zero; the grid-
+                                      // barrier kernels (hc2 / hc3) only count it up - each barrier waits for the
+                                      // next multiple of the block count, so it needs no reset
 };
 void hc(const HcArgs& a, cudaStream_t s);
+/// n rows' hc (each its own args, partials and counter) in one launch where the grid-barrier kernel can hold them all
+/// resident (n <= kMaxMvNt), else one launch a row; each row runs hc3's block function on its own args, so its
+/// result is meant to be hc()'s (glm_rows_kernels_test compares them bitwise)
+void hc_rows(const HcArgs* a, int n, cudaStream_t s);
 /// The write half alone (the split boundary / the head): R_new = post (x) block_out + comb . R_old.
 void hc_post(const float* block_out, const float* R_old, const float* post, const float* comb, int n_embd,
              float* R_new, cudaStream_t s);
@@ -131,15 +139,29 @@ void kda_rec(const float* q, const float* k, const float* v, const float* g1, co
              float* state, const float* g2, const float* norm_w, float eps, int n_head, int head_dim,
              void* out_q8_1, cudaStream_t s);
 /// kda_prep then kda_rec of one token through n <= kKdaLayers recurrent layers at once (two launches; each layer's
-/// arithmetic the one-layer kernels' bit for bit), the states only - no gated output (a window commit's replay).
+/// arithmetic the one-layer kernels' bit for bit), the states only unless rec[i].out (a window commit's replay) - or of
+/// n rows' tokens through one layer (the batched rows, each row its own scratch and output; the same block
+/// functions as kda_prep / kda_rec - glm_rows_kernels_test compares them bitwise).
 /// rec[i]'s q / k / v / g1 / g2: prep[i]'s out[0..2] / g1 / g2
 constexpr int kKdaLayers = 8;
 struct KdaRecArgs {
     const float *q = nullptr, *k = nullptr, *v = nullptr, *g1 = nullptr, *beta_raw = nullptr;
     float* state = nullptr;
     const float *g2 = nullptr, *norm_w = nullptr;
+    void* out = nullptr;   // the gated output (q8_1, kda_rec's out_q8_1); null: the state only (a commit's replay)
 };
 void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps, cudaStream_t s);
+/// The batched rows' KDA inputs kept for a verify window's commit (STRATA_GLM_MULTI_MTP): row i's q | k | v projections
+/// (d_inner each), f_a, g_a (head_dim each) and beta (n_head) - read from src[0..5] at row i (rows di / hd / nh apart) -
+/// into its conversation's record at dst[i] in the verify window's layout (glm_window.cu's kda_in: each piece tmax
+/// rows, row t[i] of it).  dst[i] null: row i is not kept.  One launch for every row of a layer.
+struct KdaGatherArgs {
+    const float* src[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+    float* dst[kMaxMvNt] = {};
+    int t[kMaxMvNt] = {};
+    int n_rows = 0, tmax = 0, di = 0, hd = 0, nh = 0;
+};
+void kda_gather(const KdaGatherArgs& a, cudaStream_t s);
 
 /// DSA, after the first projections: q_a norm (-> qr f32 + q8_1), kv_a norm into the latent cache
 /// at position p, the indexer key's layer norm into its cache, the compressor gate into its cache,
@@ -168,6 +190,24 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s);
+/// dsa_score of up to kMaxMvNt rows of different sequences (the batched rows) in one launch: row r's query, pools,
+/// weights, scores and pool count as dsa_score's arguments - each row's scores dsa_score's
+struct DsaScoreRows {
+    const float* iq[kMaxMvNt];
+    const float* pooled[kMaxMvNt];
+    const float* iw[kMaxMvNt];
+    float* score[kMaxMvNt];
+    int n_pools[kMaxMvNt];
+};
+void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cudaStream_t s);
+/// dsa_select of up to kMaxMvNt rows of different sequences (the batched rows) in one launch, a block a row: row r's
+/// scores, pools and cells as dsa_select's arguments - each row's cells dsa_select's
+struct DsaSelectRows {
+    const float* score[kMaxMvNt];
+    int* cells[kMaxMvNt];
+    int n_vis[kMaxMvNt], top_pools[kMaxMvNt], n_sel[kMaxMvNt], pos[kMaxMvNt];
+};
+void dsa_select_rows(const DsaSelectRows& a, int n, int kpool, cudaStream_t s);
 /// While a token's every pool is in its selection (n_vis <= the top pools, a context of at most idx_top_k positions):
 /// dsa_select's cells in position order - no scores needed (the indexer's query and dsa_score are left out).  The
 /// decode's paths all take it alike (dsa_select_all_on; STRATA_GLM_DSA_ALL=0: off), so a window's token is the
@@ -195,6 +235,16 @@ constexpr int kMlaTokMax = 8;
 bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat, const int* cells, int64_t c_stride,
                       const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
                       cudaStream_t s, bool lat_q8);
+/// mla_attend_batch for tokens of DIFFERENT sequences (the batched rows of several conversations): token t's latents at
+/// lat[t] and its n_sel[t] cells at cells[t] (each its own cache: the resident rows, or a streamed layer's slot rows),
+/// the partials in the caller's `part` (mla_rows_part_floats() a token, room for part_tokens tokens: launches of
+/// min(part_tokens, kMlaTokMax) tokens) - each token's sums mla_attend's bit for bit.  false: not available here
+/// (mla_rows_ok), nothing launched
+size_t mla_rows_part_floats(int n_head, int kv_lora);
+bool mla_rows_ok(int kv_lora);
+bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
+                     const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+                     float* part, int part_tokens, cudaStream_t s, bool lat_q8);
 void mla_out(const float* ctx, int64_t ctx_stride, const uint16_t* wv_b, int n_head, int kv_lora, int v_head, int ncol,
              void* out_q8_1, int64_t out_stride_bytes, cudaStream_t s);
 /// The INT8 latent cache (STRATA_GLM_KV_INT8): per position kv_lora int8 codes, then one FP16 scale per 32 values
@@ -326,10 +376,12 @@ struct MoeWin {
     size_t down_off = 0;
 };
 constexpr int kMaxWinTokens = kMaxMvCols;   // the window's tokens moe_win_experts groups (16 x 8 entries)
-bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s);
+/// par_group: the grouping with a thread an entry (moe_win_group's par), the same arrays
+bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, bool par_group = false);
 /// moe_win_experts' grouping alone (w's plan_ptr, T, k -> grp_ptr / grp_start / grp_ent / n_groups), for kernels of
 /// other formats (EXL3: exl3::win_experts)
-void moe_win_group(const MoeWin& w, cudaStream_t s);
+/// par: a thread an entry instead of one thread for all (the same groups, order and members, value for value)
+void moe_win_group(const MoeWin& w, cudaStream_t s, bool par = false);
 /// The CPU LANE's split: of f RAM-tier experts in a route, cpu_take(plan, f) go to the host (4 bits per f, f = 0..8).
 inline int cpu_take(unsigned long long plan, int f) { return (int) ((plan >> (4 * f)) & 15ull); }
 /// Waits (on the device) for the host's CPU-lane answer of the last route when it had CPU experts, then adds it to
