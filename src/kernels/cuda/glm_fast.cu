@@ -5906,6 +5906,17 @@ bool gu22_tuned() {
     }();
     return on;
 }
+// Which kernel IQ2_S gate/up ran, once per device and call path (0 the token path, 1 the window's multi-token launch):
+// the engine's own record that MAYA_GLM_GU22_TUNED reached the dispatch - or did not
+void note_gu22(bool tuned, int path) {
+    static std::atomic<unsigned> seen{0};
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return;
+    const unsigned bit = 1u << (dev * 2 + path);
+    if (seen.fetch_or(bit) & bit) return;
+    std::fprintf(stderr, "glm experts: CUDA%d IQ2_S gate/up on the %s kernel (%s)\n", dev, tuned ? "tuned RDNA" : "original",
+                 path ? "multi-token launch" : "token path");
+}
 // Splitting shared down removes its dynamic type switch from routed gate/up's
 // register budget. The routed grid keeps exactly the original dot/reduction order.
 __global__ void __launch_bounds__(256) rdna_shared_down_kernel(const uint8_t* weights, int type,
@@ -5946,7 +5957,9 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    if ((gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device();
+    if (gu_type == 22) note_gu22(tuned, 0);
+    if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
         if (gu_type == 16)
             launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
@@ -6101,7 +6114,9 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     const auto* SH = (const block_q8_1*) sh_hq;
     // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
     const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
-    if ((gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device();
+    if (gu_type == 22) note_gu22(tuned, 1);
+    if (tuned) {
         if (gu_type == 16)
             moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
                 d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
