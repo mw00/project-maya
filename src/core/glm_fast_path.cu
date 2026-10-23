@@ -1904,15 +1904,19 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
 // ---------------------------------------------------------------- the CPU lane
 bool Glm5Model::fast_helper_setup(std::string& err) {
     FastState* F = fast_;
-    if (n_parts_ != 1 || exl3_ || g_.n_embd > 4096 || g_.n_exp_used > 8) {
-        err = "GLM expert helper: use one trunk GPU and native GGUF experts (up to 8 per route)";
+    // the helper's device is its own: not this part's, nor any part's of a layer split (each part opens its own
+    // helper there - an integrated one aliases this part's RAM tier - over its own layers [l0_, lt_))
+    const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
+    const bool a_part = device == dev_ || std::find(split_devs_.begin(), split_devs_.end(), device) != split_devs_.end();
+    if (a_part || exl3_ || g_.n_embd > 4096 || g_.n_exp_used > 8) {
+        err = "GLM expert helper: a device of its own (not a trunk GPU or a part of the split) and native GGUF experts "
+              "(up to 8 per route)";
         return false;
     }
     std::vector<std::pair<void*, size_t>> regions;
     for (const auto& r : F->rc)
         for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
-    const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
-    if (device == dev_ || !F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
+    if (!F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
     std::vector<int> ranked;
     size_t requested = 0;
     for (int il = l0_; il < lt_; ++il) {
@@ -1972,10 +1976,17 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     }
     F->cpu_retime = false;
     F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helper's lane
-    std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s; "
-                         "CUDA%d keeps all trunk layers and MTP; prefill unchanged\n",
-                 device, resident, (double) F->helper.used() / 1073741824.0,
-                 F->helper.integrated() ? "mapped RAM (no extra weight copy)" : "VRAM (auto, 512 MiB headroom)", dev_);
+    if (n_parts_ > 1)
+        std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s for part %d's layers "
+                             "[%d, %d); CUDA%d keeps that part's trunk layers; prefill unchanged\n",
+                     device, resident, (double) F->helper.used() / 1073741824.0,
+                     F->helper.integrated() ? "mapped RAM (no extra weight copy)" : "VRAM (auto, 512 MiB headroom)",
+                     part_, l0_, lt_, dev_);
+    else
+        std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s; "
+                             "CUDA%d keeps all trunk layers and MTP; prefill unchanged\n",
+                     device, resident, (double) F->helper.used() / 1073741824.0,
+                     F->helper.integrated() ? "mapped RAM (no extra weight copy)" : "VRAM (auto, 512 MiB headroom)", dev_);
     return true;
 }
 

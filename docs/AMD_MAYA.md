@@ -150,9 +150,19 @@ Native GGUF experts only; EXL3 is not supported.
 
 For physical device 0 = 8060S and 1 = R9700, run the engine with `HIP_VISIBLE_DEVICES=1,0`,
 `MAYA_GLM_EXPERT_HELPER=1` and `MAYA_GLM_SPLIT=0`. The indices are process-local; the system order is unchanged.
-Keep the normal pack, context, headroom and MTP settings. Do not combine the helper with `--layer-split` or a
-nonzero `MAYA_GLM_SPLIT`. Unset `MAYA_GLM_EXPERT_HELPER` to restore the existing behavior. This experimental
-path does not claim general multi-GPU support or a speedup; measure it on the target hardware.
+Keep the normal pack, context, headroom and MTP settings. Unset `MAYA_GLM_EXPERT_HELPER` to restore the existing
+behavior. This experimental path does not claim general multi-GPU support or a speedup; measure it on the target
+hardware.
+
+#### The helper beside a layer split (two cards and the APU)
+
+With `MAYA_GLM_SPLIT=auto` (or pinned boundaries) the helper's device is left out of the split and every part of the
+split opens its own helper there over its own layers: a part's misses go to the APU, which computes them inside that
+part's pinned RAM tier at the APU's memory speed instead of the part's CPU lane. For physical device 0 = 8060S and
+1, 2 = two discrete cards, run the engine with `HIP_VISIBLE_DEVICES=1,2,0`, `MAYA_GLM_EXPERT_HELPER=2` and
+`MAYA_GLM_SPLIT=auto` (the split's devices are then 0 and 1; `MAYA_GLM_DEVS=0,1` says so explicitly). The helper's
+device may not be one of the split's. The engine logs one `glm helper:` line per part. Measured on this layout: see the
+speed table; the CPU lane still takes the misses the helper does not own.
 
 ## Strix Halo
 
