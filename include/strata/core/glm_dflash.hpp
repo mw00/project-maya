@@ -87,6 +87,16 @@ public:
     /// Forget every cached position at or past `from` (0: a new sequence, or a state loaded from elsewhere; else the
     /// sequence went back to `from` and the positions after it will hold other tokens).
     void reset(int64_t from = 0);
+    /// The decode-only device memory - the weights and the block's buffers - leaves the device for the length of a
+    /// prompt and comes back: its bytes are what a long prompt's borrow can have (the trunk's prompt path never reads
+    /// them).  The copies live in pinned host memory, taken once (unload_bytes() of them, ~0.7 GB), so reload() is a
+    /// DMA and not the GGUF read again.  The K/V ring, the pinned staging and the position vectors stay - the prompt
+    /// writes the staging and the ring keeps the positions the decode put there.  resident() is false in between:
+    /// nothing on the device may run (decode_dflash refuses).
+    bool unload(std::string& err);
+    bool reload(std::string& err);
+    size_t unload_bytes() const;                   // what unload() gives the prompt path
+    bool resident() const;                         // false between unload() and reload()
     /// The last draft's mask rows (tests): their final normed hidden states (n x hidden), their candidates and logits
     /// (n x top_k), the walk's picks and confidences (n).
     bool last_rows(int n, std::vector<float>& hidden, std::vector<int>& cand, std::vector<float>& logit,

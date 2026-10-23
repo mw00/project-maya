@@ -634,6 +634,12 @@ struct GlmDflash::Impl {
     int sel_type = 0;
     void* arena = nullptr;
     size_t arena_bytes = 0;
+    // unload/reload: the arena in a pinned host copy, and every pointer into it (the region's base moves, so each
+    // pointer is recorded as its offset).  The buffers need no list: layout_buffers() re-lays them out from the base.
+    void* arena_host = nullptr;
+    void* buf_host = nullptr;
+    bool unloaded = false;
+    std::vector<std::pair<const void**, size_t>> arefs;
     // the K/V ring: per layer ring x (n_kv x 128) FP16 keys and values; kv_pos[slot]: the position held (-1 none)
     __half *Kr = nullptr, *Vr = nullptr;
     long long* kv_pos = nullptr;
@@ -704,6 +710,8 @@ GlmDflash::~GlmDflash() {
     cudaSetDevice(d_->dev);
     if (d_->arena) cudaFree(d_->arena);
     if (d_->buf) cudaFree(d_->buf);
+    if (d_->arena_host) cudaFreeHost(d_->arena_host);
+    if (d_->buf_host) cudaFreeHost(d_->buf_host);
     if (d_->Kr) cudaFree(d_->Kr);
     if (d_->Vr) cudaFree(d_->Vr);
     if (d_->kv_pos) cudaFree(d_->kv_pos);
@@ -766,6 +774,9 @@ std::string GlmDflash::describe() const {
                   (double) bytes() / 1048576.0, m.dev);
     return b;
 }
+
+static void collect_refs(GlmDflash::Impl& m);
+static bool layout_buffers(GlmDflash::Impl& m, std::string& err);
 
 bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
     Impl& m = *d_;
@@ -945,13 +956,36 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
             return false;
     }
     // ---- the ring
+    const int B = m.block, KE = m.K * m.E;
+    const size_t f4 = sizeof(float);
     const size_t ring_b = (size_t) m.n_layer * m.ring * kvd * sizeof(__half);
     if (!ck(cudaMalloc((void**) &m.Kr, ring_b), "the K ring", err) || !ck(cudaMalloc((void**) &m.Vr, ring_b), "the V ring", err) ||
         !ck(cudaMalloc((void**) &m.kv_pos, (size_t) m.ring * sizeof(long long)), "the ring's positions", err))
         return false;
     // ---- the buffers (the block's rows: up to block; the injection's: kInjRows)
+    if (!layout_buffers(m, err)) return false;
+    if (!ck(cudaHostAlloc((void**) &m.stage, (size_t) m.ring * KE * f4, cudaHostAllocPortable), "the staging", err) ||
+        !ck(cudaHostAlloc((void**) &m.tok_h, (size_t) B * sizeof(int), cudaHostAllocPortable), "pinned", err) ||
+        !ck(cudaHostAlloc((void**) &m.conf_h, (size_t) B * f4, cudaHostAllocPortable), "pinned", err) ||
+        !ck(cudaHostAlloc((void**) &m.emb_h, (size_t) B * m.E * f4, cudaHostAllocPortable), "pinned", err))
+        return false;
+    m.kv_pos_h.assign((size_t) m.ring, -1);
+    m.st_pos.assign((size_t) m.ring, -1);
+    m.st_mask.assign((size_t) m.ring, 0u);
+    if (!ck(cudaMemset(m.kv_pos, 0xff, (size_t) m.ring * sizeof(long long)), "ring reset", err)) return false;
+    collect_refs(m);
+    return true;
+}
+
+// The block's buffers: one allocation and the typed pointers into it, laid out by offset.  A function of the geometry
+// alone - nothing here reads the device or the file - so reload() calls it again after the allocator hands the region
+// back at another address, and a buffer added to the layout is re-pointed without anyone having to remember it.
+// (The arena's pointers come out of the GGUF walk, so those are recorded instead: collect_refs.)
+static bool layout_buffers(GlmDflash::Impl& m, std::string& err) {
     const int B = m.block, R = kInjRows, KE = m.K * m.E;
     const size_t f4 = sizeof(float);
+    const int qd = m.n_head * kHeadDim, kvd = m.n_kv * kHeadDim, cdyn = m.cdyn;
+    const auto al = [](size_t b) { return (b + 255u) & ~(size_t) 255u; };
     const size_t need = al((size_t) R * KE * f4) + al((size_t) R * m.q8(KE)) + 2 * al((size_t) R * m.E * f4) +
                         al((size_t) R * m.q8(m.E)) + 2 * al((size_t) R * kvd * f4) +
                         4 * al((size_t) B * m.E * f4) + al((size_t) B * cdyn * f4) + al((size_t) B * qd * f4) +
@@ -962,8 +996,13 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
                         al((size_t) B * m.top_k * sizeof(int)) + al((size_t) B * kTopKSlices * m.top_k * f4) +
                         al((size_t) B * kTopKSlices * m.top_k * sizeof(int)) + al((size_t) B * sizeof(int)) + al((size_t) B * f4) +
                         al((size_t) kAttnSplits * m.n_kv * kAttnQ * kAttnPart * f4);
-    if (!ck(cudaMalloc(&m.buf, need), "buffers", err)) return false;
-    m.buf_bytes = need;
+    if (m.buf == nullptr) {
+        if (!ck(cudaMalloc(&m.buf, need), "buffers", err)) return false;
+        m.buf_bytes = need;
+    } else if (m.buf_bytes != need) {
+        err = "glm dflash: the buffers' size changed under a live drafter";
+        return false;
+    }
     uint8_t* p = (uint8_t*) m.buf;
     const auto tf = [&](size_t n) {
         float* r = (float*) p;
@@ -1010,16 +1049,115 @@ bool GlmDflash::load(const std::string& path, int dev, std::string& err) {
         err = "glm dflash: the buffers overflowed their estimate";
         return false;
     }
-    if (!ck(cudaHostAlloc((void**) &m.stage, (size_t) m.ring * KE * f4, cudaHostAllocPortable), "the staging", err) ||
-        !ck(cudaHostAlloc((void**) &m.tok_h, (size_t) B * sizeof(int), cudaHostAllocPortable), "pinned", err) ||
-        !ck(cudaHostAlloc((void**) &m.conf_h, (size_t) B * f4, cudaHostAllocPortable), "pinned", err) ||
-        !ck(cudaHostAlloc((void**) &m.emb_h, (size_t) B * m.E * f4, cudaHostAllocPortable), "pinned", err))
-        return false;
-    m.kv_pos_h.assign((size_t) m.ring, -1);
-    m.st_pos.assign((size_t) m.ring, -1);
-    m.st_mask.assign((size_t) m.ring, 0u);
-    if (!ck(cudaMemset(m.kv_pos, 0xff, (size_t) m.ring * sizeof(long long)), "ring reset", err)) return false;
     return true;
+}
+
+// Every pointer the arena hands out, as (the pointer, its offset in the region): unload() takes the region away and
+// reload() puts it back where the allocator chooses, so the offsets are what survives.  A pointer outside the region
+// (null, or not set) is skipped - it stays what it is.
+static void collect_refs(GlmDflash::Impl& m) {
+    m.arefs.clear();
+    const auto add = [](std::vector<std::pair<const void**, size_t>>& v, const void** p, const void* base,
+                        size_t bytes) {
+        const auto* q = (const uint8_t*) *p;
+        if (q == nullptr || q < (const uint8_t*) base || q >= (const uint8_t*) base + bytes) return;
+        v.push_back({p, (size_t) (q - (const uint8_t*) base)});
+    };
+    const auto a = [&](const void** p) { add(m.arefs, p, m.arena, m.arena_bytes); };
+    a((const void**) &m.fc.w);
+    a((const void**) &m.sel_hidden.w);
+    a((const void**) &m.enc_norm);
+    a((const void**) &m.out_norm);
+    a((const void**) &m.sel_prev);
+    a((const void**) &m.sel_next);
+    for (auto& Ly : m.L) {
+        a((const void**) &Ly.attn_norm);
+        a((const void**) &Ly.ffn_norm);
+        a((const void**) &Ly.q_norm);
+        a((const void**) &Ly.k_norm);
+        a((const void**) &Ly.attn_base);
+        a((const void**) &Ly.ffn_base);
+        a((const void**) &Ly.q.w);
+        a((const void**) &Ly.k.w);
+        a((const void**) &Ly.v.w);
+        a((const void**) &Ly.o.w);
+        a((const void**) &Ly.attn_conv.w);
+        a((const void**) &Ly.ffn_conv.w);
+        a((const void**) &Ly.gate.w);
+        a((const void**) &Ly.up.w);
+        a((const void**) &Ly.down.w);
+    }
+}
+
+size_t GlmDflash::unload_bytes() const { return d_->arena_bytes + d_->buf_bytes; }
+
+bool GlmDflash::resident() const { return !d_->unloaded; }
+
+// The weights and the block's buffers -> pinned host copies, their device memory freed.  The copies are taken once
+// and kept (they are the size of the drafter's decode-only half, ~0.7 GB): a later unload is two DMAs.
+bool GlmDflash::unload(std::string& err) {
+    Impl& m = *d_;
+    if (m.unloaded || (m.arena == nullptr && m.buf == nullptr)) return true;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    cudaSetDevice(m.dev);
+    bool ok = true;
+    if (m.arena_host == nullptr && m.arena_bytes > 0)
+        ok = ck(cudaMallocHost(&m.arena_host, m.arena_bytes), "the weights' host copy", err);
+    if (ok && m.buf_host == nullptr && m.buf_bytes > 0)
+        ok = ck(cudaMallocHost(&m.buf_host, m.buf_bytes), "the buffers' host copy", err);
+    if (ok && m.arena_bytes > 0)
+        ok = ck(cudaMemcpy(m.arena_host, m.arena, m.arena_bytes, cudaMemcpyDeviceToHost), "the weights out", err);
+    if (ok && m.buf_bytes > 0)
+        ok = ck(cudaMemcpy(m.buf_host, m.buf, m.buf_bytes, cudaMemcpyDeviceToHost), "the buffers out", err);
+    if (ok) {
+        if (m.arena != nullptr) cudaFree(m.arena);
+        if (m.buf != nullptr) cudaFree(m.buf);
+        m.arena = nullptr;
+        m.buf = nullptr;
+        m.unloaded = true;
+    }
+    cudaSetDevice(cur);
+    if (ok)
+        std::fprintf(stderr, "glm dflash: CUDA%d the drafter's %.0f MB (weights and buffers) are lent while a prompt "
+                             "runs\n", m.dev, (double) (m.arena_bytes + m.buf_bytes) / 1048576.0);
+    return ok;
+}
+
+bool GlmDflash::reload(std::string& err) {
+    Impl& m = *d_;
+    if (!m.unloaded) return true;
+    if (m.arena_host == nullptr || m.buf_host == nullptr) {
+        err = "glm dflash: the drafter's host copies are gone";
+        return false;
+    }
+    int cur = 0;
+    cudaGetDevice(&cur);
+    cudaSetDevice(m.dev);
+    bool ok = ck(cudaMalloc(&m.arena, m.arena_bytes), "the weights", err) &&
+              ck(cudaMalloc(&m.buf, m.buf_bytes), "the buffers", err) &&
+              ck(cudaMemcpy(m.arena, m.arena_host, m.arena_bytes, cudaMemcpyHostToDevice), "the weights back", err) &&
+              ck(cudaMemcpy(m.buf, m.buf_host, m.buf_bytes, cudaMemcpyHostToDevice), "the buffers back", err);
+    if (ok) {
+        for (const auto& r : m.arefs) *(r.first) = (const uint8_t*) m.arena + r.second;
+        ok = layout_buffers(m, err);   // the buffers point into the region the allocator just chose
+    }
+    if (ok) {
+        m.unloaded = false;
+    } else if (m.arena != nullptr || m.buf != nullptr) {
+        // half a drafter is no drafter: nothing may run against it (resident() stays false)
+        if (m.arena != nullptr) cudaFree(m.arena);
+        if (m.buf != nullptr) cudaFree(m.buf);
+        m.arena = nullptr;
+        m.buf = nullptr;
+    }
+    cudaSetDevice(cur);
+    if (ok)
+        std::fprintf(stderr, "glm dflash: CUDA%d the drafter's %.0f MB are back\n", m.dev,
+                     (double) (m.arena_bytes + m.buf_bytes) / 1048576.0);
+    else
+        std::fprintf(stderr, "glm dflash: CUDA%d the drafter did not come back: %s\n", m.dev, err.c_str());
+    return ok;
 }
 
 bool GlmDflash::bind(int target_embd, int target_vocab, int target_layers, std::string& err) {
@@ -1703,6 +1841,10 @@ bool Glm5Model::decode_dflash(strata::kernels::SamplerParams& sp, int64_t max_ne
     produced = 0;
     if (!dflash_ready()) {
         err = "glm dflash: no draft loaded";
+        return false;
+    }
+    if (!cap_d_->resident()) {   // a prompt lends the drafter: prefill_room_close gives it back before the decode
+        err = "glm dflash: the drafter's weights and buffers are lent to a prompt";
         return false;
     }
     Glm5Model* tail = this;
