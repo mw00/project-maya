@@ -9,6 +9,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -148,7 +149,8 @@ static int two_helpers(int helper_device) {
                 std::fprintf(stderr, "%s\n", err.c_str()); return 32;
             }
             const double own = rel_l2(actual, reference), cross = rel_l2(other, reference);
-            std::printf("GLM two helpers: part %d's keys from its own region rel_L2 %.3g, from the other part's %.3g\n", p, own, cross);
+            std::printf("GLM two helpers (zero-copy setting %s): part %d's keys from its own region rel_L2 %.3g, from the other "
+                        "part's %.3g\n", std::getenv("STRATA_GLM_HELPER_ZEROCOPY"), p, own, cross);
             if (!(own <= 1e-6)) return 33;
             if (!(cross > 1e-3)) return 34;
             int current = -1;
@@ -175,7 +177,12 @@ int main() {
     }
     CHECK(hipSetDevice(0));
     if (int status = helper_routing()) return status;
-    if (int status = two_helpers(helper_device)) return status;
+    // both helper paths: zero-copy (an integrated helper's default) and the copies (STRATA_GLM_HELPER_ZEROCOPY=0)
+    for (const char* zc : {"1", "0"}) {
+        setenv("STRATA_GLM_HELPER_ZEROCOPY", zc, 1);
+        if (int status = two_helpers(helper_device)) return status;
+    }
+    unsetenv("STRATA_GLM_HELPER_ZEROCOPY");
     std::mt19937 rng(47);
     std::vector<float> x(E), reference(E), actual(E);
     float weights[K];
