@@ -542,6 +542,62 @@ chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`)
 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
 an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
 
+## DeepSeek: loading the experts
+
+The engine reads the pack's expert regions into VRAM and RAM at start: 15,744 experts, 73 GB into VRAM and 147 GB
+into RAM here. The load is disk-bound, and the pack's files are read one after another, so a single file's regions
+are read in sequence. Three settings change how it reads them: the first is on, the other two keep today's behaviour
+by default.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LOAD_DROP_CACHE` | on | drop each region's pages from the file cache once its bytes are copied; `0` keeps them |
+| `MAYA_DS4_LOAD_THREADS` | 12 | the threads that read the experts' regions (an EXL3 or other region pack; a GGUF pack's copies keep their own count): more threads load faster on a machine with the cores |
+| `MAYA_DS4_LOAD_INTERLEAVE` | off | `1`: the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both); `0`: file by file, as before |
+
+### The pages are dropped as the bytes are copied
+
+A buffered read leaves the expert's bytes in the file cache as well as in VRAM or RAM - the same 223 GB twice, on
+a machine with 251 GB. Past the first ~77 GB every new page is then allocated by reclaiming in the thread that
+copies: 0.79-0.91 GB/s measured, with 124-140 GB of page cache, memory PSI full at 69.7% and `pgsteal_direct`
+growing at the very rate of the copy. The load now calls `posix_fadvise(DONTNEED)` on each expert's region once its
+bytes are copied (`copy_experts` for a GGUF's experts into RAM, `load_experts` for an EXL3 pack's): the page cache
+stays at a few MB and the copy runs at the disk's speed. In place, where the CPU lane's experts *are* the file cache,
+only the VRAM experts' pages are dropped, as they already were.
+
+The drop is not free: walking 203 GB of pages costs about 20 us a MB, 4 s in all - and on a pack whose RAM tier
+leaves the cache room, the reclaim that the drop saves costs less than that. It is on by default because the pack
+that does not fit pays minutes, not seconds, and `MAYA_DS4_LOAD_DROP_CACHE=0` is the better setting where the drop
+costs more than it saves.
+
+Measured cold (the container stopped, `echo 3 > /proc/sys/vm/drop_caches`, then started; the engine's own
+`ds4: loaded in` line):
+
+UD-Q4_K_XL, GGUF, 11 files over two NVMe drives (65 GB of experts into VRAM, 223 GB copied into RAM):
+
+- before: 0.79-0.91 GB/s, page cache 124-140 GB, ~6 min to `/health` 200
+- after: 5.6-6.0 GB/s, page cache 4 MB, **56.7-58.6 s** to `/health` 200
+
+EXL3 2.9bpw, 203 GB (14.7k experts into 146.7 GB of RAM, `--mmap-experts off`):
+
+- today (12 threads, file by file, no drop): 41.4 and 42.1 s, page cache peaking at 140-143 GB
+- pages dropped (12 threads, file by file): 45.2 and 48.5 s, page cache 11 GB
+- pages dropped, 24 threads, interleaved: 27.1 and 27.0 s, page cache 12 GB, 11.4 GB/s
+
+The second line is the cost above: the RAM tier leaves the cache room, so the drop alone is a little slower. What
+takes 203 GB to 27 s is the order and the threads.
+
+### If the load stalls part-way: huge pages
+
+The RAM tier is allocated with `MADV_HUGEPAGE`. On a machine where the 2 MB blocks run out (here: at 190 GB of the
+223), every further 2 MB fault does a synchronous direct compaction, and when that keeps failing the fault stalls
+and retries: 77 MB/s measured, `/proc/buddyinfo` with no order-9 blocks left, `compact_stall` 108 a second and
+`compact_success` 0. `echo defer > /sys/kernel/mm/transparent_hugepage/defrag` makes a fault that cannot have a
+huge page fall back to 4 KB at once and leaves `kcompactd` to refill in the background: 77 MB/s -> 760 MB/s, and
+no stalls. That is the machine's setting, not the engine's - a `tmpfiles.d` line keeps it:
+
+    w /sys/kernel/mm/transparent_hugepage/defrag - - - - defer
+
 ## DeepSeek: conversations kept (an agent's parent and workers on one model)
 
 The engine holds one conversation: a prompt that continues it reuses its state, anything else starts over. An agent

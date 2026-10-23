@@ -244,6 +244,22 @@ the folder. Off by default; the config sets them under the same `MAYA_DS4_*` nam
 | `STRATA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
 | `STRATA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete |
 
+### DeepSeek: loading the experts
+
+The engine reads the pack's expert regions into VRAM and RAM at start. Once a region's bytes are copied, the load
+drops its pages from the file cache (`posix_fadvise`), so the same bytes are not held twice: a pack whose copies and
+their cache do not fit otherwise reclaims in the copying thread and loads at 0.8 GB/s. Three settings change how it
+reads them: the first is on, the other two keep today's behaviour by default.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LOAD_DROP_CACHE` | on | drop each region's pages from the file cache once its bytes are copied; `0` keeps them (a restart then starts warm, and a pack that fits loads a few seconds faster without the calls) |
+| `MAYA_DS4_LOAD_THREADS` | 12 | the threads that read the experts' regions (an EXL3 or other region pack; a GGUF pack's copies keep their own count): more threads load faster on a machine with the cores |
+| `MAYA_DS4_LOAD_INTERLEAVE` | off | `1`: the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both); `0`: file by file, as before |
+
+`docs/SETTINGS.md` has the numbers for both a GGUF and an EXL3 pack, and the huge-page note for a load that stalls
+part-way.
+
 ## Something went wrong?
 
 Run **`./maya.sh --report`** (Windows: `START-MAYA.bat --report`) right after a slow answer or an error, and attach the

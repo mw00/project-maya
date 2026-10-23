@@ -4871,6 +4871,14 @@ struct Model::Impl {
     // hottest n GB (the static hybrid, for tests).  Each copy in NH parts on the NUMA nodes (DS4_COPY_NUMA=1: one), read from the files in file
     // order by a few threads, anonymous memory on huge pages (Windows: plain), not pinned (only the CPU reads it; what
     // goes to a GPU passes the pinned staging) - a layer that cannot get its memory keeps its experts in place
+    // STRATA_DS4_LOAD_DROP_CACHE (1): once an expert's bytes are copied into VRAM or RAM, drop their pages from the
+    // file cache (posix_fadvise DONTNEED) instead of holding the same bytes twice: without it a pack whose copies and
+    // their cache do not fit reclaims in the copying thread (0.8 GB/s measured).  0 keeps every region's pages - a
+    // restart then starts warm, and a pack that does fit loads a few seconds faster without the calls.
+    static bool load_drop_cache() {
+        const char* v = std::getenv("STRATA_DS4_LOAD_DROP_CACHE");
+        return v == nullptr || std::atoi(v) != 0;
+    }
     bool copy_experts(const std::vector<std::pair<int, int>>& hot, std::string& err) {
         const char* require_ram = std::getenv("DS4_REQUIRE_ALL_RAM");
         const bool strict_ram = require_ram && std::atoi(require_ram) != 0;
@@ -4984,6 +4992,7 @@ struct Model::Impl {
         std::atomic<size_t> ji{0};
         std::atomic<bool> bad{false};
         std::atomic<int64_t> done_b{0};
+        const bool drop_cache = load_drop_cache();
         std::vector<std::thread> th;
         for (int t = 0; t < 12 && !jobs.empty(); ++t)
             th.emplace_back([&] {
@@ -4996,6 +5005,12 @@ struct Model::Impl {
                             if (!pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb, nb,
                                             ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r]))
                                 bad.store(true);
+                        // the bytes are in RAM now: their pages in the file cache are the same bytes again - the
+                        // pack's 223 GB copied and 223 GB cached, on a machine with 251 GB, and every page after
+                        // that allocated by reclaiming here, at 0.8 GB/s instead of the disk's 5.6
+                        if (drop_cache && !bad.load())
+                            os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r],
+                                       (uint64_t) NH * nb, false);
                     }
                     const int64_t db = done_b.fetch_add((int64_t) l.blob) + (int64_t) l.blob;
                     if (o.verbose && i % 2048 == 0)
@@ -5021,6 +5036,7 @@ struct Model::Impl {
 
     bool load_experts(std::string& err) {
         if (!L.empty() && L[0].lay.fmt == gg::kFmtMXFP4) return load_experts_mx(err);
+        const bool drop_cache = load_drop_cache();
         // every expert's region, in file order, by a few threads; VRAM ones through a pinned staging blob.  In place
         // (file_experts) the CPU lane's experts are not copied: the most-routed of them (the profile's share of their
         // layer) are read once, up to warm_bytes, so the page cache starts with them, and the VRAM ones' pages are
@@ -5056,11 +5072,36 @@ struct Model::Impl {
                 return la.region_file[(size_t) a.e] < lb.region_file[(size_t) b.e];
             return la.region_off[(size_t) a.e] < lb.region_off[(size_t) b.e];
         });
+        // STRATA_DS4_LOAD_INTERLEAVE (0): 1 = the files round-robin - the first expert of each file, then the second,
+        // ... - so the threads read several files at once (a pack split over two drives streams both).  0: file by
+        // file, as before.
+        if (const char* iv = std::getenv("STRATA_DS4_LOAD_INTERLEAVE"); iv != nullptr && std::atoi(iv) != 0) {
+            std::vector<int> rank(jobs.size());
+            int cur = -1, r = 0;
+            for (size_t i = 0; i < jobs.size(); ++i) {
+                const int f = L[(size_t) jobs[i].layer].region_file[(size_t) jobs[i].e];
+                if (f != cur) { cur = f; r = 0; }
+                rank[i] = r++;
+            }
+            std::vector<size_t> idx(jobs.size());
+            for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                if (rank[a] != rank[b]) return rank[a] < rank[b];
+                return L[(size_t) jobs[a].layer].region_file[(size_t) jobs[a].e] <
+                       L[(size_t) jobs[b].layer].region_file[(size_t) jobs[b].e];
+            });
+            std::vector<Job> sorted;
+            sorted.reserve(jobs.size());
+            for (size_t i : idx) sorted.push_back(jobs[i]);
+            jobs.swap(sorted);
+        }
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::mutex emu;
         std::string ferr;
-        const int nth = 12;
+        // STRATA_DS4_LOAD_THREADS (12): the threads that read the experts' regions.
+        const char* ntv = std::getenv("STRATA_DS4_LOAD_THREADS");
+        const int nth = std::max(1, ntv != nullptr ? std::atoi(ntv) : 12);
         size_t maxr = 0, maxb = 0;
         for (const Layer& l : L) {
             maxb = std::max(maxb, l.blob);
@@ -5113,10 +5154,15 @@ struct Model::Impl {
                             failed.store(true);
                             break;
                         }
-                        if (file_experts)
+                        if (drop_cache)
                             os::advise(pk.fds[(size_t) l.region_file[(size_t) e]], l.region_off[(size_t) e], l.region_bytes[(size_t) e], false);
                     } else if (!file_experts) {
                         for (int X = 0; X < NH; ++X) repack_part(l, region.data(), X, l.hh[(size_t) e][(size_t) X]);
+                        // copied into RAM: the pages are dead.  In place (file_experts) the CPU lane's experts *are*
+                        // the cache, and only the VRAM ones' pages go, as they already did.
+                        if (drop_cache && (e >= (int) l.esplit.size() || !l.esplit[(size_t) e]))
+                            os::advise(pk.fds[(size_t) l.region_file[(size_t) e]], l.region_off[(size_t) e],
+                                       l.region_bytes[(size_t) e], false);
                     }
                     const int64_t db = done_bytes.fetch_add((int64_t) l.region_bytes[(size_t) e]) +
                                        (int64_t) l.region_bytes[(size_t) e];
