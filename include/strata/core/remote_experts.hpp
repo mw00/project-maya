@@ -32,6 +32,8 @@ public:
     const std::vector<uint8_t>& owners() const { return owned_; }
     bool owns(int key) const { return !owned_.empty() && owned_[(size_t) key] != 0; }
     bool integrated() const { return integrated_; }
+    bool zero_copy() const { return zero_copy_; }   // the selected call path (an integrated helper's default)
+    bool profiling() const { return prof_; }         // STRATA_GLM_PROF read at open
     size_t available() const { return capacity_ - used_; }
     size_t used() const { return used_; }
     bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
