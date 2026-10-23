@@ -170,6 +170,61 @@ static int two_helpers(int helper_device) {
     return 0;
 }
 
+// The helper device's read bandwidth from each memory a GLM helper may read its experts from - print only, judged by
+// nothing: device memory, and pinned host memory as the RAM tier allocates it (cudaHostAlloc Portable), coherent and
+// non-coherent (whether the ~140 GB/s an integrated helper's kernels reach is theirs or the memory's)
+__global__ void read_probe(const uint4* p, size_t n, unsigned long long* out) {
+    unsigned long long acc = 0;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const uint4 v = p[i];
+        acc += (unsigned long long) v.x ^ v.y ^ v.z ^ v.w;
+    }
+    if (acc == 0x1234567ull) *out = acc;   // (keeps the loads; never true for these fills)
+}
+
+static int memory_probe(int device) {
+    constexpr size_t bytes = size_t(512) << 20;
+    CHECK(hipSetDevice(device));
+    unsigned long long* out = nullptr;
+    CHECK(hipMalloc((void**) &out, sizeof(*out)));
+    hipEvent_t a, b;
+    CHECK(hipEventCreate(&a));
+    CHECK(hipEventCreate(&b));
+    struct Kind { const char* name; int how; unsigned flags; };
+    const Kind kinds[] = {{"device memory", 0, 0}, {"pinned host (tier flags)", 1, hipHostMallocPortable},
+                          {"pinned host coherent", 1, hipHostMallocPortable | hipHostMallocCoherent},
+                          {"pinned host non-coherent", 1, hipHostMallocPortable | hipHostMallocNonCoherent}};
+    for (const auto& k : kinds) {
+        void* p = nullptr;
+        const hipError_t e = k.how == 0 ? hipMalloc(&p, bytes) : hipHostMalloc(&p, bytes, k.flags);
+        if (e != hipSuccess) {
+            std::printf("GLM helper memory: CUDA%d %-26s not allocated (%s)\n", device, k.name, hipGetErrorString(e));
+            continue;
+        }
+        if (k.how == 0) CHECK(hipMemset(p, 1, bytes));
+        else std::memset(p, 1, bytes);
+        void* dp = p;
+        if (k.how == 1) CHECK(hipHostGetDevicePointer(&dp, p, 0));
+        const size_t n = bytes / sizeof(uint4);
+        read_probe<<<1024, 256>>>((const uint4*) dp, n, out);   // (a warm pass)
+        CHECK(hipDeviceSynchronize());
+        CHECK(hipEventRecord(a));
+        for (int r = 0; r < 5; ++r) read_probe<<<1024, 256>>>((const uint4*) dp, n, out);
+        CHECK(hipEventRecord(b));
+        CHECK(hipEventSynchronize(b));
+        float ms = 0.0f;
+        CHECK(hipEventElapsedTime(&ms, a, b));
+        std::printf("GLM helper memory: CUDA%d %-26s read %.1f GB/s\n", device, k.name, 5.0 * (double) bytes / (ms * 1e6));
+        if (k.how == 0) CHECK(hipFree(p));
+        else CHECK(hipHostFree(p));
+    }
+    CHECK(hipEventDestroy(a));
+    CHECK(hipEventDestroy(b));
+    CHECK(hipFree(out));
+    CHECK(hipSetDevice(0));
+    return 0;
+}
+
 int main() {
     namespace gf = strata::kernels::glmf;
     constexpr int E = 4096, FF = 2048, K = 8;
@@ -333,5 +388,6 @@ int main() {
     }
     }
     unsetenv("STRATA_GLM_HELPER_ZEROCOPY");
+    if (int status = memory_probe(helper_device)) return status;   // (print only)
     std::puts("GLM expert helper ownership, adaptation and parity passed (both call paths)");
 }
