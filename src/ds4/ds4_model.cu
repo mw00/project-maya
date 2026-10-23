@@ -5056,11 +5056,36 @@ struct Model::Impl {
                 return la.region_file[(size_t) a.e] < lb.region_file[(size_t) b.e];
             return la.region_off[(size_t) a.e] < lb.region_off[(size_t) b.e];
         });
+        // STRATA_DS4_LOAD_INTERLEAVE (0): 1 = the files round-robin - the first expert of each file, then the second,
+        // ... - so the threads read several files at once (a pack split over two drives streams both).  0: file by
+        // file, as before.
+        if (const char* iv = std::getenv("STRATA_DS4_LOAD_INTERLEAVE"); iv != nullptr && std::atoi(iv) != 0) {
+            std::vector<int> rank(jobs.size());
+            int cur = -1, r = 0;
+            for (size_t i = 0; i < jobs.size(); ++i) {
+                const int f = L[(size_t) jobs[i].layer].region_file[(size_t) jobs[i].e];
+                if (f != cur) { cur = f; r = 0; }
+                rank[i] = r++;
+            }
+            std::vector<size_t> idx(jobs.size());
+            for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+            std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+                if (rank[a] != rank[b]) return rank[a] < rank[b];
+                return L[(size_t) jobs[a].layer].region_file[(size_t) jobs[a].e] <
+                       L[(size_t) jobs[b].layer].region_file[(size_t) jobs[b].e];
+            });
+            std::vector<Job> sorted;
+            sorted.reserve(jobs.size());
+            for (size_t i : idx) sorted.push_back(jobs[i]);
+            jobs.swap(sorted);
+        }
         std::atomic<size_t> next{0};
         std::atomic<bool> failed{false};
         std::mutex emu;
         std::string ferr;
-        const int nth = 12;
+        // STRATA_DS4_LOAD_THREADS (12): the threads that read the experts' regions.
+        const char* ntv = std::getenv("STRATA_DS4_LOAD_THREADS");
+        const int nth = std::max(1, ntv != nullptr ? std::atoi(ntv) : 12);
         size_t maxr = 0, maxb = 0;
         for (const Layer& l : L) {
             maxb = std::max(maxb, l.blob);

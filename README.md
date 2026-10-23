@@ -244,6 +244,17 @@ the folder. Off by default; the config sets them under the same `MAYA_DS4_*` nam
 | `STRATA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |
 | `STRATA_DS4_SLOT_DAYS` | 7 | a slot not used for this many days is removed at start; so is any file not this model's, another engine's, or incomplete |
 
+### DeepSeek: loading the experts
+
+The engine reads the pack's expert regions into VRAM and RAM at start. Two settings change how it reads them; both
+are off at today's behaviour by default:
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LOAD_THREADS` | 12 | the threads that read the experts' regions: more threads load faster on a machine with the cores (24 here: 81.3 s -> 69.3 s, cold) |
+| `MAYA_DS4_LOAD_INTERLEAVE` | off | `1`: the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both); `0`: file by file, as before (24 threads: 69.3 s -> 60.9 s, cold) |
+
+
 ## Something went wrong?
 
 Run **`./maya.sh --report`** (Windows: `START-MAYA.bat --report`) right after a slow answer or an error, and attach the

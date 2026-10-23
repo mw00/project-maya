@@ -542,6 +542,21 @@ chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`)
 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
 an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
 
+## DeepSeek: loading the experts
+
+The engine reads the pack's expert regions into VRAM and RAM at start: 15,744 experts, 73 GB into VRAM and 147 GB
+into RAM here. The load is disk-bound, and the pack's files are read one after another, so a single file's regions
+are read in sequence. Two settings change how it reads them; both are off at today's behaviour by default.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LOAD_THREADS` | 12 | the threads that read the experts' regions: more threads load faster on a machine with the cores (24 here: 81.3 s -> 69.3 s, cold) |
+| `MAYA_DS4_LOAD_INTERLEAVE` | off | `1`: the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both); `0`: file by file, as before (24 threads: 69.3 s -> 60.9 s, cold) |
+
+Measured cold: the container stopped, `echo 3 > /proc/sys/vm/drop_caches`, then started; the engine's own
+`ds4: loaded in` line, median of three runs each, in both orders (81.3 / 69.3 / 60.9 s; the spread was 79.8-91.3,
+46.1-70.4 and 59.3-62.3 s).
+
 ## DeepSeek: conversations kept (an agent's parent and workers on one model)
 
 The engine holds one conversation: a prompt that continues it reuses its state, anything else starts over. An agent
