@@ -33,6 +33,10 @@ jobs:
           "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil 'jsonschema>=4.18,<5'
       - name: The AMD build's CUDA names all mapped (include/strata/hip_compat)
         run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
+      - name: GLM memory policy and RAM planner (CPU only)
+        run: |
+          c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/glm_memory_test.cpp -o "$RUNNER_TEMP/glm_memory_test"
+          "$RUNNER_TEMP/glm_memory_test"
       - name: Server tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
