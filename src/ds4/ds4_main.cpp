@@ -10,7 +10,8 @@
 // experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
-// (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
+// (the file: see read_pics); the state is shared only where the same picture sits at the same place, and a kept
+// conversation is taken back only where its pictures do.  With
 // MAYA_DS4_SLOT_KEEP=1 the conversations are kept when another one takes the model (a slot each: the state, the
 // compressed KV included), and across runs in MAYA_DS4_SLOT_DIR - so a request that does not continue the state but
 // does continue a kept conversation reads only its new tokens.
@@ -393,8 +394,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // reads on from them.  MAYA_DS4_SLOT_GB (16) caps the folder's .bin files: at start, and after every write, the
     // folder's least recently used conversation is removed while they are over it (never the one just written, so a
     // conversation bigger than the cap stays).  MAYA_DS4_SLOT_MIN (1024) is the shortest conversation set aside (a
-    // shorter one is read again in about the time its slot would take).  Text only: a conversation that holds pictures
-    // is not set aside, and a prompt with pictures takes none back.
+    // shorter one is read again in about the time its slot would take).  A conversation that holds pictures is set
+    // aside too: the slot keeps each picture's start, hash and span, and a prompt takes it back only where its own
+    // pictures sit at the same places with the same pixels.
     const auto env_num = [](const char* k, double d) { const char* v = std::getenv(k); return v ? std::atof(v) : d; };
     const bool slot_keep =
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
@@ -410,11 +412,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         uint64_t bytes = 0, used = 0;
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
         std::vector<int64_t> cks;                     // the positions short of its end it can be taken back at
+        std::vector<Pic> pics;                        // the pictures the state holds (start, hash, span)
     };
     std::vector<Slot> slots;
     uint64_t slot_clock = 0, slot_seq = 0;
     const std::string slot_identity = m.slot_identity();
-    constexpr uint64_t kMetaMagic = 0x324154454d345344ull;   // "DS4META2" (little endian)
+    constexpr uint64_t kMetaMagic = 0x324154454d345344ull;   // "DS4META2" (little endian): text only
+    constexpr uint64_t kMetaMagic3 = 0x334154454d345344ull;  // "DS4META3": the pictures the state holds
     const auto note = [&](const std::string& msg) {
         std::fprintf(stderr, "ds4 slots: %s\n", msg.c_str());
         std::printf("NOTE sessions: %s\n", msg.c_str());
@@ -427,12 +431,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     const auto meta_of = [](const std::string& bin) { return bin.substr(0, bin.size() - 4) + ".meta"; };
     const auto meta_write = [&](const std::string& path, const std::vector<int32_t>& toks, uint64_t bytes,
-                                const std::vector<int64_t>& cks) -> bool {
+                                const std::vector<int64_t>& cks, const std::vector<Pic>& pics) -> bool {
         const std::string tmp = path + ".tmp";
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
             const uint64_t il = slot_identity.size(), nt = toks.size();
-            f.write((const char*) &kMetaMagic, 8);
+            f.write((const char*) &kMetaMagic3, 8);
             f.write((const char*) &il, 8);
             f.write(slot_identity.data(), (std::streamsize) il);
             f.write((const char*) &bytes, 8);
@@ -441,7 +445,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const uint64_t nc = cks.size();
             f.write((const char*) &nc, 8);
             f.write((const char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t)));
-            f.write((const char*) &kMetaMagic, 8);
+            const uint64_t np = pics.size();
+            f.write((const char*) &np, 8);
+            for (const Pic& q : pics) {
+                const uint64_t len = q.len;
+                f.write((const char*) &q.start, 8);
+                f.write((const char*) &q.hash, 8);
+                f.write((const char*) &len, 8);
+            }
+            f.write((const char*) &kMetaMagic3, 8);
             f.flush();
             if (!f) return false;
         }
@@ -451,10 +463,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     // a .meta of this model -> its tokens and the slot's size (false: foreign, damaged or not this model's)
     const auto meta_read = [&](const std::string& path, std::vector<int32_t>& toks, uint64_t& bytes,
-                               std::vector<int64_t>& cks) -> bool {
+                               std::vector<int64_t>& cks, std::vector<Pic>& pics) -> bool {
         std::ifstream f(path, std::ios::binary);
-        uint64_t m0 = 0, il = 0, nt = 0, nc = 0, m1 = 0;
-        if (!f.read((char*) &m0, 8) || m0 != kMetaMagic || !f.read((char*) &il, 8) || il != slot_identity.size())
+        uint64_t m0 = 0, il = 0, nt = 0, nc = 0, np = 0, m1 = 0;
+        if (!f.read((char*) &m0, 8) || (m0 != kMetaMagic && m0 != kMetaMagic3) || !f.read((char*) &il, 8) ||
+            il != slot_identity.size())
             return false;
         std::string id(il, '\0');
         if (!f.read(id.data(), (std::streamsize) il) || id != slot_identity) return false;
@@ -464,9 +477,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 3)
             return false;
         cks.resize(nc);
-        if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t))) || !f.read((char*) &m1, 8) ||
-            m1 != kMetaMagic)
-            return false;
+        if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t)))) return false;
+        if (m0 == kMetaMagic3) {   // (a DS4META2 slot is text only: no pictures to read)
+            if (!f.read((char*) &np, 8) || np > 4096) return false;
+            pics.resize(np);
+            for (Pic& q : pics) {
+                uint64_t len = 0;
+                if (!f.read((char*) &q.start, 8) || !f.read((char*) &q.hash, 8) || !f.read((char*) &len, 8))
+                    return false;
+                if (q.start < 0 || (uint64_t) q.start >= nt || len > nt) return false;
+                q.len = (size_t) len;
+            }
+        }
+        if (!f.read((char*) &m1, 8) || m1 != m0) return false;
         for (int64_t c : cks)
             if (c <= 0 || (uint64_t) c > nt) return false;
         return true;
@@ -550,7 +573,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
         }
         fs::rename(path + ".tmp", path, ec);
-        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks)) {
+        if (ec || !meta_write(meta_of(path), s.tokens, s.data->size(), s.cks, s.pics)) {
             std::filesystem::remove(path + ".tmp", ec);
             std::filesystem::remove(path, ec);
             std::fprintf(stderr, "ds4 slots: writing %s failed\n", path.c_str());
@@ -580,7 +603,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
+        std::vector<Pic> slot_pics;   // (the slot keeps where each picture sits, its hash and its span - not its pixels)
+        slot_pics.reserve(held.size());
+        for (const Pic& q : held) {
+            Pic p;
+            p.start = q.start;
+            p.hash = q.hash;
+            p.len = q.len;
+            slot_pics.push_back(std::move(p));
+        }
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions(), std::move(slot_pics)});
         slots.back().data = buf;
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
@@ -606,9 +638,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // whole (`whole`); one it leaves part way - a retried prompt, a history the client renders again without the
     // earlier reasoning - comes back at its latest checkpoint the prompt still agrees with (the end of a prompt, the
     // position before it, the anchor where its run of continued prompts began).
-    const auto slot_take = [&](const std::vector<int>& prompt, size_t floor, bool& whole) -> size_t {
+    const auto slot_take = [&](const std::vector<int>& prompt, size_t floor, bool& whole,
+                               const std::vector<Pic>& pics, std::vector<Pic>& taken) -> size_t {
         whole = false;
+        taken.clear();
         if (slot_max <= 0 || prompt.size() < 2) return 0;
+        const auto has_pic = [](const std::vector<Pic>& v, int64_t start, uint64_t hash) {
+            for (const Pic& x : v)
+                if (x.start == start && x.hash == hash) return true;
+            return false;
+        };
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
@@ -619,6 +658,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (u == 0)
                 for (int64_t k : slots[i].cks)
                     if ((size_t) k <= c && (size_t) k > u) u = (size_t) k;
+            // the pictures the state holds up to `u` must be the prompt's own, and the prompt's up to `u` the state's
+            if (u > 0) {
+                for (const Pic& q : slots[i].pics)
+                    if ((size_t) q.start < u && !has_pic(pics, q.start, q.hash)) { u = 0; break; }
+                if (u > 0)
+                    for (const Pic& q : pics)
+                        if ((size_t) q.start < u && !has_pic(slots[i].pics, q.start, q.hash)) { u = 0; break; }
+            }
             if (u > len && u > floor) {
                 best = i;
                 len = u;
@@ -658,6 +705,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             return 0;
         }
         whole = len == whole_len;
+        for (const Pic& q : slots[best].pics)   // (the state that comes back holds these)
+            if ((size_t) q.start < len) taken.push_back(q);
         slots[best].used = ++slot_clock;
         if (!ram) {   // its age counts from its last use (a file slot's only)
             std::error_code ec;
@@ -688,6 +737,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::vector<int32_t> toks;
                 uint64_t bytes;
                 std::vector<int64_t> cks;
+                std::vector<Pic> pics;
                 fs::file_time_type t;
             };
             std::vector<Found> found;
@@ -703,9 +753,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
                 if (!is_meta) continue;      // a .bin is judged by its .meta
                 const std::string bin = p.substr(0, p.size() - 5) + ".bin";
-                Found fd{bin, {}, 0, {}, fs::last_write_time(de.path(), ec)};
+                Found fd{bin, {}, 0, {}, {}, fs::last_write_time(de.path(), ec)};
                 const uint64_t have = fs::exists(bin, ec) ? (uint64_t) fs::file_size(bin, ec) : 0;
-                if (meta_read(p, fd.toks, fd.bytes, fd.cks) && have == fd.bytes && fd.bytes > 0 && slot_age_days(p) <= slot_days)
+                if (meta_read(p, fd.toks, fd.bytes, fd.cks, fd.pics) && have == fd.bytes && fd.bytes > 0 &&
+                    slot_age_days(p) <= slot_days)
                     found.push_back(std::move(fd));
                 else {
                     ++refused;
@@ -723,7 +774,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             uint64_t total = 0;
             for (auto& fd : found) {
                 total += fd.bytes;
-                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks)});
+                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks),
+                                 std::move(fd.pics)});
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
@@ -791,6 +843,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if ((size_t) q.start < c && !same(pics, q)) c = (size_t) q.start;
         size_t from = 0;
         bool took = false, continued = false;   // (continued: the conversation goes on - its anchor stays)
+        std::vector<Pic> taken_pics;            // (the pictures the taken-back state holds)
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
         // (the start of a run, so every restart) holds 0 tokens, and every prompt "continues" that to token 0; taken
         // as a continuation, the take below would never run for the folder's conversations, the case they are for
@@ -802,11 +855,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // CONVERSATION SLOTS: this prompt does not continue the conversation in the model - that one is set aside
             // first (another one takes the model, and its state is lost otherwise), then the kept conversation this
             // prompt does continue is taken back - if it goes further back than the checkpoints the state itself holds
-            if (held.empty()) slot_put("");
+            slot_put("");
             const int64_t limit = (int64_t) std::min(c, r.ids.size() - 1);
             const int64_t rs = m.restorable(limit);
             bool whole = false;
-            const size_t back = pics.empty() ? slot_take(r.ids, rs > 0 ? (size_t) rs : 0, whole) : 0;
+            const size_t back = slot_take(r.ids, rs > 0 ? (size_t) rs : 0, whole, pics, taken_pics);
             if (back > 0) {
                 from = back;
                 took = true;
@@ -815,7 +868,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 from = (size_t) m.pos();
             else m.reset();
         }
-        if (took || from == 0) held.clear();   // (a slot is text only: the state that comes back holds no pictures)
+        if (took) held = std::move(taken_pics);   // (the state that comes back holds the slot's pictures)
+        else if (from == 0) held.clear();
         if ((int64_t) r.ids.size() + std::max(0LL, r.max_new) > m.max_context()) {
             std::printf("ERR the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", r.ids.size(),
                         r.max_new, (long long) m.max_context());
@@ -1069,7 +1123,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
     if (slot_max > 0) {
-        if (held.empty()) slot_put(" as the engine ended");
+        slot_put(" as the engine ended");
         size_t written = 0;
         while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
             size_t i = SIZE_MAX;

@@ -551,8 +551,9 @@ tokens read at ~930 tok/s: a 70k-token prompt takes ~75 s, a 185k one ~200 s). W
 model is set aside when another one takes its place - its whole state: the position, every layer's 128-token window
 ring, the compressors' partial groups and the four KV sources' compressed KV and index keys up to it - and a request
 that continues a kept conversation takes it back, reading only its new tokens (a 12k-token conversation back in ~0.1 s
-instead of ~12 s). Text only: a conversation that holds pictures is not set aside, and a prompt with pictures takes
-none back. Off by default, so the engine is unchanged unless asked.
+instead of ~12 s). A conversation that holds pictures is set aside too: the slot keeps each picture's start, hash
+and span, and a prompt takes it back only where its own pictures sit at the same places with the same pixels. Off by
+default, so the engine is unchanged unless asked.
 
 | Setting | Default | |
 | --- | --- | --- |
