@@ -61,13 +61,28 @@ def merge(lines: list[dict]) -> list[dict]:
     return [by[k] for k in sorted(by)]
 
 
-def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, vision_pid: int | None = None,
+def as_pids(p) -> set:
+    """A pid, a collection of pids or None, as a set."""
+    return set() if p is None else {p} if isinstance(p, int) else set(p)
+
+
+def held_by(procs: dict, pids: set) -> int | None:
+    """What the processes `pids` hold on a card, as NVML lists them; None when it lists none of them (or can't say)."""
+    b = [procs[p] for p in pids if p in procs]
+    return None if not b or None in b else sum(b)
+
+
+def view(report: list[dict], cards: list[dict] | None, engine_pid, vision_pid=None,
          vision_lent: bool = False) -> list[dict]:
     """Each GPU the engine reports, as the Monitor draws it: its NVML number and name, the total, and the bytes of each
     part - the engine's (weights, kv, act, prompt, tp, drafter + window, pool), the vision encoder's, the CUDA context
     and the rest, other programs, free.  `cards`: the telemetry's per-card readings ([] without NVML: the start's
-    measurement only); `vision_lent`: the on-demand encoder has the first GPU's pool tail now (the engine freed it)."""
+    measurement only); `engine_pid`, `vision_pid`: the pid - or the pids: a launcher and what it started - NVML may
+    list the engine's and the encoder's process under; `vision_lent`: the on-demand encoder has the first GPU's pool
+    tail now (the engine freed it).  A card that lists none of the engine's pids (NVML can't list processes, or names
+    them in a pid namespace the server does not share) is drawn from the start's measurement."""
     cards = cards or []
+    mine, enc_pids = as_pids(engine_pid), as_pids(vision_pid)
     by_pci = {c.get("pci"): c for c in cards if c.get("pci")}
     out = []
     for k, r in enumerate(merge(report)):
@@ -81,7 +96,7 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
                  "prompt": r.get("prompt", 0), "tp": r.get("tp", 0),
                  "drafter": r.get("drafter", 0) + r.get("window", 0), "pool": pool}
         engine = sum(parts.values())
-        own, enc = procs.get(engine_pid), procs.get(vision_pid) if vision_pid else None
+        own, enc = held_by(procs, mine), held_by(procs, enc_pids)
         inside = r.get("vision_own", 0) if enc is None else 0   # (a vision tower in the engine's own process)
         engine += inside
         vision = enc if enc is not None else r.get("tail", 0) if lent else inside
@@ -91,7 +106,7 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid: int | None, v
         if own is not None:                              # (NVML says what the engine's process holds here)
             # other programs: what other processes hold, as NVML lists them - the card's used memory beyond every
             # process (the driver's reserve, ~0.45 GB a card; what it keeps outside them) is the rest's, not theirs
-            held = [b for pid, b in procs.items() if pid not in (engine_pid, vision_pid)]
+            held = [b for pid, b in procs.items() if pid not in mine and pid not in enc_pids]
             other = sum(held) if None not in held else max(0, used - own - (enc or 0))
             rest = max(0, used - engine - (enc or 0) - other)
         else:                                            # (it can't: what the parts did not explain at the start -

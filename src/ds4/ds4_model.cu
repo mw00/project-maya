@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -1113,6 +1114,7 @@ struct Model::Impl {
         std::vector<std::vector<float>> comp;
     };
     Check ck[2];                      // the end of the last prompt, and the position before it
+    bool slot_held = false;           // slot_save took this state and nothing has changed it since
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     // ... as loaded (--no-expert-cache: what the flow's early reads go by, so a prompt is streamed and summed in the
     // same order whatever this process answered before)
@@ -2274,7 +2276,11 @@ struct Model::Impl {
         o = opt;
         const double t0 = now_ms();
         if (!pk.load(o.pack, err)) return false;
-        lt::set_store((o.pack + "/lt-picks.txt").c_str());   // (AMD: the prompt GEMMs' measured kernels)
+        // (AMD: the prompt GEMMs' measured kernels) the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's file - empty: none,
+        // each start measures its own and keeps them to itself (a pack that must not change: a run's own store instead)
+        const char* lt_store = std::getenv("STRATA_DS4_LT_STORE");
+        if (lt_store == nullptr) lt_store = std::getenv("DS4_LT_STORE");
+        lt::set_store(lt_store != nullptr ? lt_store : (o.pack + "/lt-picks.txt").c_str());
         g.from(pk);
         if (g.dim == 0 || g.nl == 0 || (int) g.ratios.size() < g.nl) {
             err = o.pack + "/ds4.txt: incomplete geometry";
@@ -2313,6 +2319,14 @@ struct Model::Impl {
                 return false;
             }
             CK(mem_info(&d.free0, &d.total));
+        }
+        // (MAYA_DS4_Q8_BATCH: its line now, at load; MAYA_DS4_Q8_CHECK=1: the batched rounding checked on every device first)
+        if (pk.gguf) {
+            gg::q8_batch();
+            if (std::getenv("STRATA_DS4_Q8_CHECK") != nullptr || std::getenv("DS4_Q8_CHECK") != nullptr) {
+                for (int id : ids)
+                    if (!gg::q8_batch_check(id, err)) return false;
+            }
         }
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -2901,6 +2915,26 @@ struct Model::Impl {
                     }
             }
 #endif
+            if (const char* mode = std::getenv("DS4_ENGRAM_RAM"); mode && std::atoi(mode) != 0) {
+                uint64_t total = 0;
+                for (int li = 0; li < pk.eg_layers; ++li) {
+                    const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
+                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3")) {
+                        err = "Engram RAM: unsupported table type"; return false;
+                    }
+                    if (!eg_io.pin_range(paths[(size_t) tw->file], tw->file, tw->off, tw->bytes, err)) return false;
+                    total += tw->bytes;
+                    if (tw->dtype == "F8_E4M3") {
+                        const Tensor* ts = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.scale");
+                        if (ts == nullptr || ts->dtype != "F8_E8M0") { err = "Engram RAM: missing FP8 scales"; return false; }
+                        if (!eg_io.pin_range(paths[(size_t) ts->file], ts->file, ts->off, ts->bytes, err)) return false;
+                        total += ts->bytes;
+                    }
+                }
+                eg_io.require_ram();
+                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/FP8), %.3f GB locked; reads use memcpy\n",
+                             pk.eg_layers, (double) total / 1e9);
+            }
             eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
@@ -3585,16 +3619,10 @@ struct Model::Impl {
     }
 
     // ---- the flow (see Chunk)
-    // Windows' HIP runtime submits queued work only when the host waits on the GPU: the flow's copies and the compute
-    // it queued between its waits are submitted at once (cudaStreamQuery does that without waiting); elsewhere nothing
-    static void kick(cudaStream_t s) {
-#if defined(_WIN32) && defined(STRATA_USE_HIP)
-        (void) cudaStreamQuery(s);
-        (void) cudaGetLastError();
-#else
-        (void) s;
-#endif
-    }
+    // Windows (WDDM: HIP's runtime and CUDA's driver alike) submits queued work only when the host waits on the GPU:
+    // the flow's copies and the compute it queued between its waits are submitted at once (win_submit); elsewhere
+    // nothing.  (CUDA too since #303: two RTX 3080s hung before the first layer, one GPU spinning on the other's flow)
+    static void kick(cudaStream_t s) { win_submit(s); }
     size_t flow_region(int r) const {   // a part's room in a staging slot (read from its offset rounded down)
         return ((flow_part[r] + os::kDirectAlign - 1) & ~(size_t) (os::kDirectAlign - 1)) + os::kDirectAlign;
     }
@@ -3809,16 +3837,24 @@ struct Model::Impl {
                 const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;   // (a copy's slot)
                 int nj = 0;
                 for (int r = 0; r < 3; ++r) {
-                    if (cs >= 0) {   // a copy: each matrix's NH parts of rows, side by side into staging
-                        const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                    if (cs >= 0) {   // a copy: the rows the member reads (as from the file: mx_read_off / _len - a
+                        // group's member its gate / up rows [ff0, ff0 + ffn), the down whole), from the NH parts that
+                        // hold them, side by side into staging
+                        const size_t rb = mx_row_b(l, r);
+                        const int per = mx_n(r) / NH;
+                        const int lo0 = (int) (mx_read_off(l, it.mi, r) / rb);
+                        const int hi0 = lo0 + (int) (mx_read_len(l, r) / rb);
                         for (int X = 0; X < NH; ++X) {
+                            const int lo = std::max(X * per, lo0), hi = std::min((X + 1) * per, hi0);
+                            if (lo >= hi) continue;
                             IoQueue::Job& j = jobs[nj++];
                             j = IoQueue::Job{};
-                            j.len = nb;
-                            j.dst = sb + (size_t) X * nb;
+                            j.len = (size_t) (hi - lo) * rb;
+                            j.dst = sb + (size_t) (lo - lo0) * rb;
                             j.left = &it.left;
                             j.bad = &it.bad;
-                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
+                            j.mem = ram_part[(size_t) cs][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r] +
+                                    (size_t) (lo - X * per) * rb;
                         }
                         sb += flow_region(r);
                         continue;
@@ -3837,6 +3873,7 @@ struct Model::Impl {
                     j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
                     sb += flow_region(r);
                 }
+                if (cs >= 0) it.left.store(nj, std::memory_order_relaxed);   // (a member's rows: maybe fewer parts)
                 c.io->push(jobs, nj);
             }
             ++c.n_read;
@@ -4832,6 +4869,9 @@ struct Model::Impl {
     // order by a few threads, anonymous memory on huge pages (Windows: plain), not pinned (only the CPU reads it; what
     // goes to a GPU passes the pinned staging) - a layer that cannot get its memory keeps its experts in place
     bool copy_experts(const std::vector<std::pair<int, int>>& hot, std::string& err) {
+        const char* require_ram = std::getenv("DS4_REQUIRE_ALL_RAM");
+        const bool strict_ram = require_ram && std::atoi(require_ram) != 0;
+        if (strict_ram && o.mmap_experts != 0) { err = "strict RAM requires --mmap-experts off"; return false; }
         if (o.mmap_experts > 0 || hot.empty()) return true;
         const double t0 = now_ms();
         auto spare_of = [&](const Layer& l) { return o.expert_cache && l.spare_vram >= 0 ? 1 : 0; };
@@ -4850,9 +4890,9 @@ struct Model::Impl {
         // (auto: none - copies that all fit were measured no faster than the page cache: the CPU lane's rows are
         // compute-bound, ~46 GB/s from either on 2 Xeon sockets, NUMA parts included; a part copied cost decode speed
         // on 64 GB and on 32 GB of RAM)
-        double budget = o.mmap_experts == 0 ? std::min(all, can) : 0.0;
-        if (const char* v = std::getenv("DS4_COPY_GB")) budget = std::atof(v) * 1e9;
-        if (o.mmap_experts == 0 && all > can)
+        double budget = strict_ram ? all : (o.mmap_experts == 0 ? std::min(all, can) : 0.0);
+        if (!strict_ram) if (const char* v = std::getenv("DS4_COPY_GB")) budget = std::atof(v) * 1e9;
+        if (!strict_ram && o.mmap_experts == 0 && all > can)
             std::fprintf(stderr, "ds4: --mmap-experts off: the CPU lane's experts (%.1f GB) do not all fit the RAM this "
                                  "process can get (%.1f GB beside %.0f GB for the rest) - the most-routed copied, the "
                                  "others read in place\n", all / 1e9, can / 1e9, kRamMargin / 1e9);
@@ -4908,6 +4948,7 @@ struct Model::Impl {
                 }
             }
             if (!ok) {
+                if (strict_ram) { err = "strict RAM: cannot allocate every CPU expert; refusing disk fallback"; return false; }
                 std::fprintf(stderr, "ds4: no RAM for layer %d's %d copied experts (%.1f GB): they stay in place\n", l.il,
                              ns, (double) bytes * NH / 1e9);
                 n_copy[(size_t) l.il] = 0;
@@ -4930,6 +4971,8 @@ struct Model::Impl {
                 jobs.push_back({il, hot[i].second, next[(size_t) il]++});
             }
         }
+        if (strict_ram && jobs.size() != hot.size()) { err = "strict RAM: incomplete CPU expert allocation"; return false; }
+        if (strict_ram) std::fprintf(stderr, "ds4: strict RAM: all %zu CPU experts selected, no disk fallback\n", jobs.size());
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {   // (file order: the disk reads ahead)
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
             if (la.mx_file[0] != lb.mx_file[0]) return la.mx_file[0] < lb.mx_file[0];
@@ -5339,6 +5382,7 @@ struct Model::Impl {
         pos = 0;
         toks.clear();
         ctoks.clear();
+        slot_held = false;
         ck[0].pos = ck[1].pos = -1;
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
@@ -5417,9 +5461,292 @@ struct Model::Impl {
         pos = c.pos;
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
+        slot_held = false;
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
         return true;
+    }
+
+    // ---- the kept conversations (a slot): the state out of the model and back, through a file or a host buffer.
+    // A prompt that continues the state is reused in place (checkpoint / restore, the compressed KV left where it is);
+    // a conversation that leaves the model for another one is a slot - the whole state: the position, its tokens,
+    // every window ring (the DSpark blocks' included), the compressors' partial groups and each KV source's compressed
+    // KV and index keys up to it (rows 0 .. pos / ratio, the groups its position completed; one the prompt has not
+    // completed yet lives in the compressor's partial group).  A tensor parallel group's members hold the same state,
+    // so one member's ring is saved and written back into all of them.  Text only: a conversation that holds pictures
+    // is not a slot (the Engram history's rows are the tokens' again, no -1 among them).
+    static constexpr uint64_t kSlotMagic = 0x31544f4c53345344ull;   // "DS4SLOT1" (little endian)
+
+    int64_t src_rows(const Src& s) const { return pos / std::max(1, s.ratio); }
+
+    // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
+    size_t slot_bytes() const {
+        size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
+        for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
+        for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
+        return n + 8;
+    }
+
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
+        if (slot_held) {
+            err = "it is already set aside";
+            return 0;
+        }
+        if (pos <= 0) {
+            err = "there is no conversation";
+            return 0;
+        }
+        if ((int64_t) toks.size() != pos) {
+            err = "the state's tokens do not match its position";
+            return 0;
+        }
+        if (!imgs.empty()) {
+            err = "it holds pictures";
+            return 0;
+        }
+        const std::string id = slot_identity();
+        out.assign(slot_bytes(), 0);
+        uint8_t* p = out.data();
+        size_t off = 0;
+        const auto put = [&](const void* s, size_t b) {
+            std::memcpy(p + off, s, b);
+            off += b;
+        };
+        const uint64_t il = id.size(), n = (uint64_t) pos;
+        put(&kSlotMagic, 8);
+        put(&il, 8);
+        put(id.data(), (size_t) il);
+        put(&n, 8);
+        put(toks.data(), (size_t) n * 4);
+        for (Dev& d : devs) {   // (the devices' work ends before their state is read)
+            cudaSetDevice(d.id);
+            cudaStreamSynchronize(d.st);
+        }
+        for (size_t i = 0; i < L.size(); ++i) {
+            const Layer& l = L[i];
+            const Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            const uint64_t wb = (uint64_t) g.win * win_rb();
+            put(&wb, 8);
+            if (cudaMemcpy(p + off, l.win, (size_t) wb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                return 0;
+            }
+            off += (size_t) wb;
+            const uint64_t cn = l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0;
+            put(&cn, 8);
+            if (cn > 0) {
+                const size_t cb = (size_t) cn * 4;
+                if (cudaMemcpy(p + off, l.c_kv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                    cudaMemcpy(p + off + cb, l.c_score, cb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
+                    return 0;
+                }
+                off += 2 * cb;
+            }
+        }
+        for (const Src& s : srcs) {
+            const uint64_t rows = (uint64_t) src_rows(s);
+            put(&rows, 8);
+            if (rows == 0) continue;
+            const int di = L[(size_t) s.layer].dev;
+            const uint8_t* ckv = s.ckv[(size_t) di];
+            const uint8_t* ik = s.ik[(size_t) di];   // (a pack whose sources are not index sources: none, zeros)
+            if (ckv == nullptr) {
+                err = "source layer " + std::to_string(s.layer) + "'s rows are not on its device";
+                return 0;
+            }
+            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
+            cudaSetDevice(devs[(size_t) di].id);
+            if (cudaMemcpy(p + off, ckv, cb, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                (ik != nullptr && cudaMemcpy(p + off + cb, ik, ib, cudaMemcpyDeviceToHost) != cudaSuccess)) {
+                err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
+                return 0;
+            }
+            off += cb + ib;
+        }
+        if (off + 8 != out.size()) {
+            err = "the state's size does not add up";
+            return 0;
+        }
+        put(&kSlotMagic, 8);
+        slot_held = true;
+        return (uint64_t) off;
+    }
+
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+        size_t off = 0;
+        bool wrote = false, ok = false;
+        // a load that stops after some of another conversation's state went into the layers leaves a state no
+        // checkpoint can repair: it is reset (the prompt is read from token 0), never served from the mix
+        struct FailClosed {
+            Impl& p;
+            const bool& wrote;
+            const bool& ok;
+            ~FailClosed() {
+                if (!ok && wrote) p.reset();
+            }
+        } guard{*this, wrote, ok};
+        const auto room = [&](size_t b) { return b <= bytes && off <= bytes - b; };
+        uint64_t magic = 0, il = 0, n = 0;
+        if (!room(16)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        std::memcpy(&magic, data + off, 8);
+        std::memcpy(&il, data + off + 8, 8);
+        off += 16;
+        if (magic != kSlotMagic || il == 0 || il > (1u << 20)) {
+            err = "not a saved conversation";
+            return false;
+        }
+        if (!room((size_t) il + 8)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        {
+            std::string id((size_t) il, '\0');
+            std::memcpy(id.data(), data + off, (size_t) il);
+            off += (size_t) il;
+            std::memcpy(&n, data + off, 8);
+            off += 8;
+            if (id != slot_identity()) {
+                err = "another model's, or another engine version's, conversation";
+                return false;
+            }
+        }
+        if (n != (uint64_t) n_pos || n_pos <= 0 || n_pos > o.max_context || !room((size_t) n * 4)) {
+            err = "the conversation's position is not this prompt's";
+            return false;
+        }
+        std::vector<int32_t> toks_in((size_t) n);
+        std::memcpy(toks_in.data(), data + off, (size_t) n * 4);
+        off += (size_t) n * 4;
+        for (Dev& d : devs) {   // (their work ends before the state is written over)
+            cudaSetDevice(d.id);
+            cudaStreamSynchronize(d.st);
+        }
+        for (size_t i = 0; i < L.size(); ++i) {
+            Layer& l = L[i];
+            const Dev& d = devs[(size_t) l.dev];
+            cudaSetDevice(d.id);
+            uint64_t wb = 0, cn = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&wb, data + off, 8);
+            off += 8;
+            if (wb != (uint64_t) g.win * win_rb() || !room((size_t) wb + 8)) {
+                err = l.name + "window ring of another size";
+                return false;
+            }
+            wrote = true;
+            for (int m = 0; m < l.nm; ++m) {
+                Layer& lm = member(l, m);
+                if (cudaMemcpy(lm.win, data + off, (size_t) wb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            off += (size_t) wb;
+            std::memcpy(&cn, data + off, 8);
+            off += 8;
+            if (cn != (l.c_kv ? (uint64_t) l.ratio * (uint64_t) g.hd : 0)) {
+                err = l.name + "compressor's group of another size";
+                return false;
+            }
+            if (cn > 0) {
+                const size_t cb = (size_t) cn * 4;
+                if (!room(2 * cb)) {
+                    err = "the slot is cut short";
+                    return false;
+                }
+                for (int m = 0; m < l.nm; ++m) {
+                    Layer& lm = member(l, m);
+                    if (cudaMemcpy(lm.c_kv, data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess ||
+                        cudaMemcpy(lm.c_score, data + off + cb, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = l.name + "compressor's group: " + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                }
+                off += 2 * cb;
+            }
+        }
+        for (const Src& s : srcs) {
+            uint64_t rows = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&rows, data + off, 8);
+            off += 8;
+            if (rows != (uint64_t) (n_pos / std::max(1, s.ratio))) {
+                err = "source layer " + std::to_string(s.layer) + "'s rows are not this conversation's";
+                return false;
+            }
+            if (rows == 0) continue;
+            const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
+            if (!room(cb + ib)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            for (size_t di = 0; di < devs.size(); ++di) {
+                if (s.ckv[di] == nullptr && s.ik[di] == nullptr) continue;
+                cudaSetDevice(devs[di].id);
+                if (s.ckv[di] != nullptr && cudaMemcpy(s.ckv[di], data + off, cb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                if (s.ik[di] != nullptr &&
+                    cudaMemcpy(s.ik[di], data + off + cb, ib, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = "source layer " + std::to_string(s.layer) + "'s index keys: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+            off += cb + ib;
+        }
+        uint64_t end = 0;
+        if (!room(8)) {
+            err = "the slot is cut short";
+            return false;
+        }
+        std::memcpy(&end, data + off, 8);
+        off += 8;
+        if (end != kSlotMagic) {
+            err = "the slot does not end where it should";
+            return false;
+        }
+        pos = n_pos;
+        toks.swap(toks_in);
+        ctoks.resize((size_t) pos);
+        for (size_t i = 0; i < (size_t) pos; ++i)
+            ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
+        ck[0].pos = ck[1].pos = -1;   // (the checkpoints hold the state this one replaced)
+        slot_held = false;
+        ok = true;
+        return true;
+    }
+
+    std::string slot_identity() const {
+        const auto size_of = [](const std::string& p) {
+            std::error_code ec;
+            const auto s = std::filesystem::file_size(p, ec);
+            return ec ? 0ull : (unsigned long long) s;
+        };
+        std::ostringstream id;
+        id << "maya-ds4-session-1 engine=" << STRATA_VERSION << " mtp=" << g.n_mtp << " dim=" << g.dim << " hd=" << g.hd
+           << " win=" << g.win << " ratios=";
+        for (int r : g.ratios) id << r << ",";
+        id << " kv=";
+        for (int v : g.kv_src) id << v << ",";
+        id << " ix=";
+        for (int v : g.ix_src) id << v << ",";
+        id << " ds4.txt:" << size_of(pk.dir + "/ds4.txt") << " engram.bin:" << size_of(pk.dir + "/engram.bin")
+           << " tensors.txt:" << size_of(pk.dir + "/tensors.txt");
+        for (size_t i = 0; i < pk.files.size(); ++i)
+            id << " " << pk.files[i] << ":" << os::file_size(pk.fds[i]);
+        return id.str();
     }
 
     size_t bounce_bytes() const {
@@ -8183,6 +8510,7 @@ struct Model::Impl {
         pos = p0 + keep;
         toks.resize((size_t) pos);
         ctoks.resize((size_t) pos);
+        slot_held = false;
     }
 
     // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
@@ -10000,6 +10328,7 @@ struct Model::Impl {
                 return false;
             }
         const int64_t p0 = pos;
+        slot_held = false;   // (the state grows now: what slot_save took is no longer the conversation)
         for (int t = 0; t < T; ++t) {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
@@ -10952,9 +11281,34 @@ void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
+uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
+bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+    return p_->slot_load(data, bytes, n_pos, err);
+}
+std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const { return p_->st; }
 std::string Model::describe() const { return p_->describe(); }
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
+Model::Tiers Model::tiers() const {
+    const Impl& m = *p_;
+    Tiers t;
+    double cb = 0;
+    for (const Layer& l : m.L) {
+        if (l.mtp) continue;
+        t.vram += l.n_vram;
+        t.vram_gb += (double) l.n_vram * (double) l.blob / 1e9;
+        t.cpu += l.n_exp - l.n_vram;
+        cb += (double) (l.n_exp - l.n_vram) * (double) l.blob;
+    }
+    t.cpu_blob = t.cpu > 0 ? cb / t.cpu : 0;
+    // in RAM: the copies (copy_experts / the RAM tier); in place, the read-ahead's share of the page cache; not in
+    // place (the experts copied whole into RAM): every CPU-lane expert
+    if (m.ram_held > 0) t.ram = m.ram_held;
+    else if (m.file_experts) t.ram = t.cpu_blob > 0 ? (int) std::min<double>(t.cpu, (double) m.warm_bytes / t.cpu_blob) : 0;
+    else t.ram = t.cpu;
+    t.ram_gb = t.ram * t.cpu_blob / 1e9;
+    return t;
+}
 
 }  // namespace strata::ds4

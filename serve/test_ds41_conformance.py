@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import threading
 import unittest
@@ -60,6 +61,18 @@ class Rendering(unittest.TestCase):
         result = self.template.render(msgs, tools=schemas, **kwargs)
         self.assertEqual(request, original, "rendering must not mutate the client's history")
         return result
+
+    def render_with_setting(self, setting, messages, **options):
+        """A render with MAYA_DS4_KEEP_THINKING as a shell or the config's env sets it (`None`: unset)."""
+        saved = os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+        try:
+            if setting is not None:
+                os.environ["STRATA_DS4_KEEP_THINKING"] = setting
+            return self.render(messages, **options)
+        finally:
+            os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+            if saved is not None:
+                os.environ["STRATA_DS4_KEEP_THINKING"] = saved
 
     def test_official_golden_fixtures_byte_for_byte(self):
         for number in range(1, 6):
@@ -192,6 +205,23 @@ class Rendering(unittest.TestCase):
                                        "content": "Old answer"}, {"role": "user", "content": "Next"}])
         self.assertNotIn("Obsolete reasoning", rendered)
         self.assertIn("Old answer", rendered)
+
+    def test_keep_thinking_setting_leaves_old_reasoning_in_the_prompt(self):
+        rendered = self.render_with_setting("1", BASE + [{"role": "assistant", "reasoning_content": "Kept reasoning",
+                                                          "content": "Old answer"},
+                                                         {"role": "user", "content": "Next"}])
+        self.assertIn("Kept reasoning", rendered)
+        self.assertIn("Old answer", rendered)
+
+    def test_keep_thinking_setting_lets_a_tool_less_turn_continue_the_last_prompt(self):
+        # (the state a slot keeps is the prompt that was read, so the next turn must start with it - not the case
+        #  while the earlier turn's reasoning is dropped: DeepSeek's own serving, the default)
+        first = [{"role": "user", "content": "Question"}]
+        second = first + [{"role": "assistant", "reasoning_content": "Because.", "content": "Answer"},
+                          {"role": "user", "content": "Next one"}]
+        self.assertTrue(self.render_with_setting("1", second).startswith(self.render_with_setting("1", first)))
+        self.assertFalse(self.render_with_setting(None, second).startswith(self.render_with_setting(None, first)))
+        self.assertFalse(self.render_with_setting("0", second).startswith(self.render_with_setting("0", first)))
 
     def test_namespaced_schema_and_call_are_qualified_once(self):
         schema = copy.deepcopy(TOOL)

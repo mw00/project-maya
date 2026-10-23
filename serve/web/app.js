@@ -272,11 +272,10 @@ const TIER_SETS = {
     {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
   ],
-  ds4: [
-    {key: "cpu", label: "On the CPU", icon: "cpu", unit: "/tok", digits: 1, tone: "info",
+  ds4: [   // (GLM's three - the CPU lane computes the experts that are not in VRAM - and the n-gram memory)
+    {key: "ram_fetch", label: "From RAM", icon: "link", unit: "/tok", digits: 2, tone: "info",
      sub: "experts the CPU computed from RAM"},
-    {key: "disk_mb", label: "Disk reads", icon: "disk", unit: " MB/tok", digits: 1, tone: "warn",
-     sub: "read from the SSD a token"},
+    {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
     {key: "engram_ms", label: "N-gram memory", icon: "layers", unit: " ms/tok", digits: 2, sub: "n-gram lookups"},
   ],
@@ -312,30 +311,21 @@ function renderTiers(t, eng) {
     $(`tv-${m.key}`).innerHTML = shown == null ? "–" : `${esc(shown)}<small>${esc(m.unit)}</small>`;
     let sub = m.sub;
     if (m.key === "engram_ms" && eng && eng.engram_lookups) sub = `${fmt(+eng.engram_lookups)} n-gram lookups a token`;
-    if (m.key === "disk_mb" && v == null) sub = "not measured on this system";
-    if (m.key === "cpu" && n.ram != null) sub = `${fmt(n.ram, 1)} of them from RAM, the rest from the SSD`;
+    if ((m.key === "disk" || m.key === "ram_fetch") && v == null && ds4) sub = "not measured on this system";
     $(`ts-${m.key}`).textContent = (stale ? "last answer: " : "") + sub;
     spark(`tp-${m.key}`, (h[m.key] || []).map((x) => (x == null ? 0 : x)), m.max);
   }
-  let vu, ru, disk, total;
-  const ds4Tier = ds4 && (+eng.ram_experts || 0) > 0;
-  if (ds4) {   // DeepSeek: the VRAM slots, the RAM tier's (when on), and the rest read in place from the model's files
-    vu = +eng.expert_slots || 0;
-    ru = ds4Tier ? +eng.ram_experts : +eng.cpu_experts || 0;
-    disk = ds4Tier ? Math.max(0, (+eng.cpu_experts || 0) - ru) : 0;
-    total = Math.max(1, vu + ru + disk);
-  } else {
-    vu = n.vram_used || 0; ru = n.ram_used || 0;
-    total = (eng && eng.experts) || Math.max(1, vu + ru);
-    disk = Math.max(0, total - vu - ru);
-  }
+  // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
+  const vu = n.vram_used || 0, ru = n.ram_used || 0;
+  const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng && eng.experts) || Math.max(1, vu + ru);
+  const disk = Math.max(0, total - vu - ru);
   $("tierbar-vram").style.width = `${(100 * vu) / total}%`;
   $("tierbar-ram").style.width = `${(100 * ru) / total}%`;
   $("tierbar-disk").style.width = `${(100 * disk) / total}%`;
-  $("tier-ram-label").textContent = ds4 && !ds4Tier ? "RAM cache / SSD (in place)" : "Pinned RAM";
-  $("tier-disk-item").hidden = ds4 && !ds4Tier;
-  $("tier-vram-text").textContent = ds4 ? `${fmt(vu)} experts` : `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
-  $("tier-ram-text").textContent = ds4 ? `${fmt(ru)} experts` : `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
+  $("tier-ram-label").textContent = ds4 ? "RAM" : "Pinned RAM";
+  $("tier-disk-item").hidden = false;
+  $("tier-vram-text").textContent = `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
+  $("tier-ram-text").textContent = `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
   $("tier-disk-text").textContent = `${fmt(disk)} experts`;
   $("tiers-sub").textContent = age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer`
                                                         : `live · ${fmt(total)} routed experts`;
