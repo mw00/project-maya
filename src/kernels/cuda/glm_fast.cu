@@ -5896,6 +5896,16 @@ bool rdna3_expert_device(bool allow_gfx1151 = true) {
     }
     return gfx1100 || (allow_gfx1151 && gfx1151);
 }
+// IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (STRATA_GLM_GU22_TUNED=1) until it is measured end
+// to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel on gfx1100 and
+// gfx1151 and 1.34-1.43x (gfx1100, device memory) / 1.12x (gfx1151, pinned host memory) faster at 4-8 experts a call
+bool gu22_tuned() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GLM_GU22_TUNED");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
 // Splitting shared down removes its dynamic type switch from routed gate/up's
 // register budget. The routed grid keeps exactly the original dot/reduction order.
 __global__ void __launch_bounds__(256) rdna_shared_down_kernel(const uint8_t* weights, int type,
@@ -5936,10 +5946,14 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    if (gu_type == 16 && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
+    if ((gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
-        launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
-            xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+        if (gu_type == 16)
+            launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+                xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+        else
+            launch_expert_gu<22, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+                xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
         launch_check("moe_gate_up RDNA3");
         return;
     }
@@ -6087,9 +6101,13 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     const auto* SH = (const block_q8_1*) sh_hq;
     // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
     const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
-    if (gu_type == 16 && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
-        moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
-            d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+    if ((gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
+        if (gu_type == 16)
+            moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+        else
+            moe_gate_up_kernel<22, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
     } else {
         switch (gu_type) {
 #define GLMF_GUM(TT) \
