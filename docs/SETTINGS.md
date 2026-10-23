@@ -523,6 +523,39 @@ against the per-job one on every GPU at load (any difference fails the start).
 | `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: tensor parallel 2 on Maya's own quants
+
+`--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their
+type: Maya's quants use 256-value blocks, n_ff 2304 = 9 blocks, so `--tp 2` (or 4 or 8) falls back to 1 with
+"tensor parallel 2 -> 1". `MAYA_DS4_TP_GGUF_UNEVEN=1` lets a member take whole blocks as even as they go, 5 + 4 for
+two GPUs, with the odd block going round the members layer by layer, as EXL3's split128 does. Each member loads,
+streams and swaps its own range, the shared expert is split at the same range, and each member's exact expert bytes
+are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). With `DS4_FLOW_TP=1` its members take
+the prompt flow too, each streaming its own rows, the down gathered on the GPU (on a disk-streaming box the group's
+prompts are much slower off the flow).
+`MAYA_DS4_TP_CHECK=1` checks every expert format and rotation at load, before any request: one token through each
+member's parts as decode runs them, summed on the host and compared with the whole expert and shared expert (more than
+1e-3 of the largest output fails the start).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form |
+| `MAYA_DS4_TP_CHECK` | off | `1`: each member's parts checked against the whole expert at load |
+
+## DeepSeek: the DSpark drafter's blocks on a group's members
+
+The drafter's blocks run whole on the drafter's group's lead, and their VRAM experts come out of the lead's room. A
+tensor-parallel group's members hold the same trunk slots, so every drafter byte on the lead leaves as many idle on
+the other members. `MAYA_DS4_DRAFT_DEV` puts each block on a member of its own: its weights, ring and VRAM experts on
+that GPU, out of that member's room (the 99% rule as before, the extra experts only while the member keeps the next
+tightest member's room), so the tightest member has more left for the trunk. Each block's GPU projects the taps
+itself; between two blocks on different GPUs their rows go through pinned host memory, as a layer split's groups
+hand theirs. The load line names the blocks a GPU holds (`+ blocks 0`).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_DRAFT_DEV` | off (every block on the lead) | the member each DSpark block runs on: one number for every block, or one a block (`1,0,0`: block 0 on member 1, the others on the lead); 0 is the lead |
+
 ## DeepSeek: where the measured hipBLASLt picks are kept (AMD)
 
 On AMD the engine measures hipBLASLt's kernels for each prompt GEMM shape at its first use on a GPU and keeps the
