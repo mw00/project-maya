@@ -305,6 +305,19 @@ class Calibrate(unittest.TestCase):
         store = json.loads(maya.CAL_STORE.read_text())
         self.assertEqual(store[maya.hardware_key(c)]["args"], {"--tp": 8, "--cpu-threads": None})
 
+    def test_fallback_grouping_saved_and_shown_in_summary(self):
+        res = {"args": {"--tp": 2, "--cpu-threads": None},
+               "report": {"tok_s": 15.1, "own_tok_s": 15.1, "prompt_tok_s": 502,
+                          "effective_tp": [1, 1, 1], "tp_groups": {"2": [1, 1, 1], "3": [1, 1, 1]},
+                          "tp_skipped": {"3": "same effective grouping as --tp 2: not compared"}}}
+        with patch.object(maya, "busy_gpus", return_value=[]), \
+                patch.object(maya.CAL4, "run", return_value=res), patch.object(maya, "ok") as output:
+            self.assertTrue(maya.calibrate_config(self.cfg))
+        saved = json.loads(self.cfg.read_text())["installer"]["calibration"]
+        self.assertEqual(saved["effective_tp"], [1, 1, 1])
+        self.assertEqual(saved["tp_skipped"], res["report"]["tp_skipped"])
+        self.assertIn("effective TP per GPU: 1/1/1", output.call_args.args[0])
+
     def test_busy_gpus(self):
         with patch.object(maya, "busy_gpus", return_value=[(0, 15000)]), patch.object(maya.CAL4, "run") as run:
             self.assertFalse(maya.calibrate_config(self.cfg))

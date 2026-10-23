@@ -2593,7 +2593,9 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
         warn(f"could not save {CAL_STORE} ({e}): {cfg_path.name} has the settings, a setup again does not")
     r = res["report"]
     speed = f" ({r['tok_s']} tok/s answering, the config's own {r['own_tok_s']})" if r.get("tok_s") else ""
-    ok(f"tuned for this PC: {ds4_tuned(res['args'])}{speed}")
+    groups = r.get("effective_tp")
+    effective = "/".join(map(str, groups)) if groups is not None else "unknown"
+    ok(f"tuned for this PC: {ds4_tuned(res['args'])}; effective TP per GPU: {effective}{speed}")
     return True
 
 
