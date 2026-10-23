@@ -635,6 +635,7 @@ public:
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
     bool fast_helper_setup(std::string& err);              // STRATA_GLM_EXPERT_HELPER: complementary GPU cache
     bool fast_helper_adapt(std::string& err);              // helper-only, at an idle boundary
+    bool fast_helper_check(std::string& err);              // STRATA_GLM_HELPER_CHECK: the helper vs this GPU
     void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);
     // the same on `pool` with the rows act / hq / ff / dn, or x3 for an EXL3 pack (a verify window's CPU lanes:
     // FastState::win_lane, each with its own rows)

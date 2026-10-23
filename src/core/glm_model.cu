@@ -1353,6 +1353,12 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             }
         for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get()) p->prefill_cap(tmin, "the split's smallest");
     }
+    // STRATA_GLM_HELPER_CHECK: each part's expert helper against its own GPU, once every part's helper is open
+    for (Glm5Model* p = this; p != nullptr; p = p->split_next_.get())
+        if (!p->fast_helper_check(err)) {
+            split_next_.reset();
+            return false;
+        }
     cudaSetDevice(dev_);
     std::fprintf(stderr, "glm split: layers %s (one 64 KB host hop per boundary per token)\n", where.c_str());
     return true;

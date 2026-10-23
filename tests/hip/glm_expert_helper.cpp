@@ -70,6 +70,99 @@ static int helper_routing() {
     return 0;
 }
 
+// A layer split's two parts each open their own helper on the same device over their own RAM tier: the same key
+// numbers, different bytes.  Each must answer from its own region (interleaved calls, against the primary GPU's sum
+// of that region's experts), and its answer must not be the other region's.
+static int two_helpers(int helper_device) {
+    namespace gf = strata::kernels::glmf;
+    constexpr int E = 4096, FF = 2048, K = 4, gu_type = 16, d_type = 22;
+    const size_t gu_block = sizeof(block_iq2_xxs), d_block = sizeof(block_iq2_s);
+    const size_t gu_bytes = size_t(2) * FF * E / 256 * gu_block, down_bytes = size_t(E) * FF / 256 * d_block;
+    const size_t blob_bytes = gu_bytes + down_bytes;
+    std::mt19937 rng(91);
+    uint8_t* host[2] = {nullptr, nullptr};
+    CHECK(hipSetDevice(0));
+    for (auto& h : host) {
+        CHECK(hipHostMalloc((void**) &h, K * blob_bytes, hipHostMallocMapped | hipHostMallocPortable));
+        for (int i = 0; i < K; ++i)
+            for (int role = 0; role < 2; ++role) {
+                const size_t block = role ? d_block : gu_block, bytes = role ? down_bytes : gu_bytes;
+                uint8_t* q = h + size_t(i) * blob_bytes + (role ? gu_bytes : 0);
+                for (size_t b = 0; b < bytes; b += block) {
+                    for (size_t j = 0; j < block; ++j) q[b + j] = rng() & 255;
+                    const uint16_t scale = std::bit_cast<uint16_t>(__float2half(0.0001f * float(1 + rng() % 4)));
+                    std::memcpy(q + b, &scale, 2);
+                }
+            }
+    }
+    std::vector<float> x(E), reference(E), actual(E), other(E);
+    for (int i = 0; i < E; ++i) x[i] = float(int(rng() % 101) - 50) * 0.01f;
+    const float weights[K] = {0.1f, 0.2f, 0.3f, 0.4f};
+    const int keys[K] = {3, 1, 0, 2};
+    std::string err;
+    strata::core::GlmExpertHelper part[2];
+    for (int p = 0; p < 2; ++p) {
+        if (!part[p].open(helper_device, E, FF, {{host[p], K * blob_bytes}}, err) || !part[p].reserve(2 * K, K * blob_bytes, err)) {
+            std::fprintf(stderr, "%s\n", err.c_str()); return 30;
+        }
+        for (int i = 0; i < K; ++i)
+            if (!part[p].insert(i, host[p] + size_t(i) * blob_bytes, blob_bytes, blob_bytes, err)) return 31;
+    }
+    void *dev_blobs[2] = {nullptr, nullptr}, *dxq = nullptr, *dhq = nullptr;
+    float *dx = nullptr, *dout = nullptr;
+    gf::MoeDev plan;
+    for (int p = 0; p < 2; ++p) {
+        CHECK(hipMalloc(&dev_blobs[p], K * blob_bytes));
+        CHECK(hipMemcpy(dev_blobs[p], host[p], K * blob_bytes, hipMemcpyHostToDevice));
+    }
+    CHECK(hipMalloc((void**) &dx, E * 4));
+    CHECK(hipMalloc((void**) &dout, E * 4));
+    CHECK(hipMalloc(&dxq, E / 32 * sizeof(block_q8_1)));
+    CHECK(hipMalloc(&dhq, K * FF / 32 * sizeof(block_q8_1)));
+    CHECK(hipMalloc((void**) &plan.plan_ptr, K * 8));
+    CHECK(hipMalloc((void**) &plan.plan_w, K * 4));
+    CHECK(hipMalloc((void**) &plan.cpu_flag, 4));
+    CHECK(hipMemset(plan.cpu_flag, 0, 4));
+    CHECK(hipMemcpy(dx, x.data(), E * 4, hipMemcpyHostToDevice));
+    CHECK(hipMemcpy(plan.plan_w, weights, K * 4, hipMemcpyHostToDevice));
+    gf::quantize_q8_1(dx, dxq, E, nullptr);
+    const auto rel_l2 = [&](const std::vector<float>& a, const std::vector<float>& b) {
+        double d2 = 0, r2 = 0;
+        for (int i = 0; i < E; ++i) {
+            if (!std::isfinite(a[i]) || !std::isfinite(b[i])) return (double) INFINITY;
+            d2 += (double(a[i]) - b[i]) * (double(a[i]) - b[i]);
+            r2 += double(b[i]) * b[i];
+        }
+        return std::sqrt(d2 / std::max(r2, 1e-30));
+    };
+    for (int round = 0; round < 2; ++round)
+        for (int p : {1, 0}) {
+            unsigned long long pointers[K];
+            for (int i = 0; i < K; ++i) pointers[i] = (unsigned long long) ((uint8_t*) dev_blobs[p] + size_t(keys[i]) * blob_bytes);
+            CHECK(hipMemcpy(plan.plan_ptr, pointers, K * 8, hipMemcpyHostToDevice));
+            gf::moe_gate_up(gu_type, plan, K, E, FF, 8.0f, dxq, dhq, nullptr, 0, nullptr, 0, nullptr, nullptr);
+            gf::moe_down(d_type, plan, K, E, FF, gu_bytes, dhq, nullptr, dout, nullptr);
+            CHECK(hipMemcpy(reference.data(), dout, E * 4, hipMemcpyDeviceToHost));
+            if (!part[p].compute(gu_type, d_type, gu_bytes, 8.0f, K, keys, weights, x.data(), actual.data(), err) ||
+                !part[1 - p].compute(gu_type, d_type, gu_bytes, 8.0f, K, keys, weights, x.data(), other.data(), err)) {
+                std::fprintf(stderr, "%s\n", err.c_str()); return 32;
+            }
+            const double own = rel_l2(actual, reference), cross = rel_l2(other, reference);
+            std::printf("GLM two helpers: part %d's keys from its own region rel_L2 %.3g, from the other part's %.3g\n", p, own, cross);
+            if (!(own <= 1e-6)) return 33;
+            if (!(cross > 1e-3)) return 34;
+            int current = -1;
+            CHECK(hipGetDevice(&current));
+            if (current != 0) return 35;
+        }
+    for (auto& h : part) h.close();
+    CHECK(hipFree(plan.cpu_flag)); CHECK(hipFree(plan.plan_w)); CHECK(hipFree(plan.plan_ptr));
+    CHECK(hipFree(dhq)); CHECK(hipFree(dxq)); CHECK(hipFree(dout)); CHECK(hipFree(dx));
+    for (int p = 0; p < 2; ++p) { CHECK(hipFree(dev_blobs[p])); CHECK(hipHostFree(host[p])); }
+    std::puts("GLM two helpers on one device: each answers from its own RAM region");
+    return 0;
+}
+
 int main() {
     namespace gf = strata::kernels::glmf;
     constexpr int E = 4096, FF = 2048, K = 8;
@@ -82,6 +175,7 @@ int main() {
     }
     CHECK(hipSetDevice(0));
     if (int status = helper_routing()) return status;
+    if (int status = two_helpers(helper_device)) return status;
     std::mt19937 rng(47);
     std::vector<float> x(E), reference(E), actual(E);
     float weights[K];
