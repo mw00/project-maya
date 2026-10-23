@@ -143,6 +143,11 @@ public:
         const uint8_t* mem = nullptr;   // non-null: a copy of len bytes from memory to dst instead of a read
         const void* map = nullptr;      // the range in the file's mapping: all in the page cache, it is read buffered
         uint8_t* keep = nullptr;        // non-null (a read): the len bytes read copied here as well
+        // non-null: a copy of len bytes out of device ddev's memory to dst by dcopy (the caller's, so this header
+        // needs no GPU runtime) instead of a read - DS4_FLOW_HELPER's experts out of the helper's pool
+        const void* dmem = nullptr;
+        int ddev = -1;
+        bool (*dcopy)(int dev, void* dst, const void* src, size_t n) = nullptr;
     };
     explicit IoQueue(int n) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -171,6 +176,7 @@ public:
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }
+    uint64_t device_bytes() const { return device_.load(std::memory_order_relaxed); }
 
 private:
     void loop() {
@@ -186,7 +192,10 @@ private:
             const auto t0 = std::chrono::steady_clock::now();
             const uint64_t lead = j.off % os::kDirectAlign;
             bool ok = false;
-            if (j.mem != nullptr) {
+            if (j.dmem != nullptr) {
+                ok = j.dcopy != nullptr && j.dcopy(j.ddev, j.dst, j.dmem, (size_t) j.len);
+                if (ok) device_.fetch_add(j.len, std::memory_order_relaxed);
+            } else if (j.mem != nullptr) {
                 std::memcpy(j.dst, j.mem, (size_t) j.len);
                 ok = true;
             } else if (j.dfd != os::kBadFd && !(j.map != nullptr && os::resident(j.map, (size_t) j.len)) &&
@@ -197,7 +206,8 @@ private:
                 ok = true;
                 buffered_.fetch_add(j.len, std::memory_order_relaxed);
             }
-            if (ok && j.keep != nullptr && j.mem == nullptr) std::memcpy(j.keep, j.dst + lead, (size_t) j.len);
+            if (ok && j.keep != nullptr && j.mem == nullptr && j.dmem == nullptr)
+                std::memcpy(j.keep, j.dst + lead, (size_t) j.len);
             busy_us_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t0).count(),
                                std::memory_order_relaxed);
@@ -216,7 +226,7 @@ private:
     std::deque<Job> q_;
     uint64_t done_ = 0;
     bool quit_ = false;
-    std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
+    std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0}, device_{0};
 };
 
 }  // namespace strata::ds4
