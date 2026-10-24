@@ -1725,6 +1725,10 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
         // across many GPUs - the RAM tier holds little else, and every lent expert was a ~20 ms disk read back)
         std::vector<char> parked;   // (keys parked by this lending: never its victims - one table edit per key)
         const auto park = [&](int il, int s, int key) -> bool {
+            if (F->ram_inclusive && F->ram_of[(size_t) key] >= 0) {   // inclusive: its RAM copy is already held
+                ++F->diag_lend_park;
+                return true;
+            }
             if (lend_drop || F->layer_rc[(size_t) il] < 0) return false;
             if (parked.empty()) parked.assign(F->cnt.size(), 0);
             auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
