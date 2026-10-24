@@ -104,8 +104,9 @@ HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix 
 HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
                                                    # validated on a card; no matrix cores, the portable kernels; compiled
                                                    # only when such a GPU is chosen
-HIP_ARCHS_WAVE64 = ("gfx908", "gfx906")                      # CDNA 1 (AMD Instinct MI100): wave64, runs through the hip_compat
-                                                   # layer's logical-32-lane half-wavefront warp mapping; experimental
+HIP_ARCHS_WAVE64 = ("gfx908", "gfx906", "gfx942")  # CDNA 1 (MI100), Vega 20 (gfx906) and CDNA 3 (MI300X / MI325X): wave64,
+                                                   # run through the hip_compat layer's logical-32-lane half-wavefront warp
+                                                   # mapping; experimental
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768

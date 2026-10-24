@@ -200,6 +200,30 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 3K- and 8K-token prompts, against 18.4-19.7 without it; 3K- and 8K-token prompts read at 271 and 278 tokens/s
 (the fused prompt experts and the `wmma2` attention, both on by default on `gfx1151`).
 
+## Instinct MI300X / MI325X
+
+AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental. Like the MI100 (`gfx908`) it is a wave64
+card: the CUDA-shaped kernels run through the hip_compat layer's logical-32-lane half-wavefront mapping, with the
+signed dot4 (`v_dot4_i32_i8`). Two things differ from the MI100. gfx942 has packed FP32 instructions
+(`v_pk_fma_f32`), so a gfx942 build compiles HIP with `-ffp-contract=on`: with clang's default `fast` contraction the
+multi-activation GEMV fused its columns' multiply-adds differently from the one-activation GEMV and stopped matching it
+bit for bit. And its F32 product keeps the sign of a zero, so the INT8 latent reads skip the RDNA signed-zero fix.
+
+The ROCm installation needs its development packages for the card (on ROCm 7.14's packaging,
+`amdrocm-core-dev7.14-gfx942` and `amdrocm-blas-dev7.14`). Then the setup above, without the `MAYA_GLM_RAM_GB`
+override:
+
+```sh
+./maya.sh --backend hip --gpu 0 --context 32768 --no-vision --yes --model Maya-S-v2-IQ2_XXS \
+  --download-model --no-start --port 8099
+```
+
+Run on one MI325X (256 GB HBM3E), EPYC 9575F, 157 GB RAM, ROCm 7.14, Maya-S-v2-IQ2_XXS, 32K context, the config setup
+writes (no hipBLASLt table for gfx942 yet): every expert sits in the GPU pool (85.2 GB, 306 slots a layer) with 166 GB
+of VRAM still free; 256-token answers at ~74.5 tok/s (100% VRAM hits), a 10K-token prompt at ~1520 tok/s. 72 of the
+76 CTest checks pass, and HC1 / HC2 too; the other four need model fixtures (`ple_parity`, `expert_parity`,
+`pool_test`) or fail to link on every architecture (`hip_expert_cache_staging`). Single GPU only so far.
+
 ## Windows
 
 `START-MAYA.bat --backend hip` sets Maya up natively on Windows 10/11 for the same GPUs, Strix Halo and Gorgon Halo
