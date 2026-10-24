@@ -11,10 +11,11 @@
 // The points are the 090 fixtures' native prompt counts: 28,517 (32K), 114,093 (114K), 130,397 (nf128k).
 // Timing scope: in the engine a layer's pooled keys and selected latent rows come from VRAM (a whole token's weights
 // pass between two calls of a layer), its query, weights and partials straight from the kernels before.  So every
-// timed call reads pooled keys / latent rows last touched >= 256 MB of reads earlier - past the RX 7900's 96 MB
-// Infinity Cache: the indexer rotates over >= 256 MB of pooled copies, MLA over 128 cell sets drawn from a 512 MB
-// latent pool, each round all of them, the rotation never restarting (warm-up and rounds continue it); the query, the
-// head weights and the partials stay hot as in the engine.  The copies and sets are bounded (<= 128, <= 512 MB).
+// timed call reads pooled keys / latent rows last read >= 256 MiB of such reads earlier - past the RX 7900's 96 MB
+// Infinity Cache: the indexer rotates over >= 256 MiB of distinct pooled copies; MLA over 128 DISJOINT cell sets (one
+// shuffled permutation of a 512 MiB latent pool's rows, cut into sets: no row in two sets), each round all of them, the
+// rotation never restarting (warm-up and rounds continue it); the query, the head weights and the partials stay hot
+// as in the engine.  The copies and sets are bounded (<= 128, <= 512 MiB); the bench prints the bytes each round reads.
 #include "strata/kernels/glm_expert_bench.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include <hip/hip_runtime.h>
@@ -236,22 +237,15 @@ void dsa_timing(DsaPoint& P, const std::vector<std::string>& shapes, const std::
 struct MlaInputs {
     float *q_abs, *ctx, *ref;
     uint16_t* lat;
-    std::vector<int*> cells;   // sets (timing cycles them; parity reads set 0)
+    std::vector<int*> cells;   // disjoint sets (timing cycles them; parity reads set 0)
+    size_t touched;            // the latent bytes one pass over every set reads (masked cells read nothing)
 };
 uint16_t half_bits(float f) { return std::bit_cast<uint16_t>(__float2half(f)); }
 // pattern: "all" every cell a row; "tail" the select's last 3 positions masked (-1, a context that ends mid-pool);
 // "chunk" also a whole 32-cell chunk masked (its max -inf, its weights 0, the merge skipping it)
-std::vector<int> cell_set(std::mt19937& rng, const char* pattern, int n_rows) {
-    std::vector<int> c;
-    std::vector<char> taken(n_rows, 0);
-    std::uniform_int_distribution<int> row(0, n_rows - 1);
-    while ((int) c.size() < kSel) {   // distinct rows, uniformly drawn
-        const int r = row(rng);
-        if (!taken[r]) {
-            taken[r] = 1;
-            c.push_back(r);
-        }
-    }
+// set k of a pool's rows: the k-th kSel rows of one shuffled permutation (the sets are disjoint)
+std::vector<int> cell_set(const std::vector<int>& perm, int k, const char* pattern) {
+    std::vector<int> c(perm.begin() + (size_t) k * kSel, perm.begin() + (size_t) (k + 1) * kSel);
     if (std::strcmp(pattern, "all") != 0)
         for (int m = 0; m < kTail; ++m) c[kSel - 1 - m] = -1;
     if (std::strcmp(pattern, "chunk") == 0)
@@ -268,7 +262,19 @@ MlaInputs mla_inputs(const char* pattern, int sets, uint32_t seed, int n_rows) {
     for (uint16_t& h : lat) h = half_bits(nd(rng));
     M.q_abs = dev_copy(q);
     M.lat = dev_copy(lat);
-    for (int k = 0; k < sets; ++k) M.cells.push_back(dev_copy(cell_set(rng, pattern, n_rows)));
+    if ((size_t) sets * kSel > (size_t) n_rows) {
+        std::fprintf(stderr, "%d disjoint sets of %d rows need more than %d rows\n", sets, kSel, n_rows);
+        std::exit(2);
+    }
+    std::vector<int> perm(n_rows);
+    for (int i = 0; i < n_rows; ++i) perm[i] = i;
+    std::shuffle(perm.begin(), perm.end(), rng);
+    M.touched = 0;
+    for (int k = 0; k < sets; ++k) {
+        const std::vector<int> c = cell_set(perm, k, pattern);
+        for (int x : c) M.touched += x >= 0 ? (size_t) kLora * sizeof(uint16_t) : 0;
+        M.cells.push_back(dev_copy(c));
+    }
     check(hipMalloc(&M.ctx, (size_t) kHeads * kLora * 4), "hipMalloc");
     check(hipMalloc(&M.ref, (size_t) kHeads * kLora * 4), "hipMalloc");
     return M;
@@ -366,7 +372,7 @@ int main(int argc, char** argv) {
             dsa_free(P);
         }
         MlaInputs M = mla_inputs("tail", 128, 0x77aau, kRowsCold);
-        std::printf("rotation mla_attend sets=128 rows=%d bytes=%zu\n", kRowsCold, (size_t) kRowsCold * kLora * 2);
+        std::printf("rotation mla_attend sets=128 rows=%d touched=%zu\n", kRowsCold, M.touched);
         mla_timing(M, ms, m_exact, s);
         mla_free(M);
     }
