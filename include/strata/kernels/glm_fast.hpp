@@ -217,8 +217,15 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
 /// Absorbed MLA for one token, per head: q_abs = wk_b_h . q_h, scores over the selected latents,
 /// softmax, ctx, out_h = wv_b_h . ctx; writes the q8_1 of the n_head * v_head output.
 /// lat_q8: the cache holds INT8 latent records (see lat8_rec_bytes), else FP16 rows of kv_lora.
+/// marks (the stage profiler, MAYA_GLM_PROF): called after each step it launched with that step's name -
+/// "mla_q_abs", "mla_attend", "mla_out", or "mla" for the one-kernel form; nullptr: none.  Launches unchanged.
+struct MlaMarks {
+    void (*fn)(void* ctx, const char* name);
+    void* ctx;
+};
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false);
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
+         const MlaMarks* marks = nullptr);
 /// The same absorbed MLA in three steps for a verify window (each step mla()'s arithmetic, bit for bit): the head-wise
 /// q_abs = wk_b . q of `ncol` tokens at once (q rows q_stride floats apart, q_abs rows qa_stride), one token's attention
 /// over its selected cells into ctx (n_head x kv_lora; false: not available here - use mla()), and the head-wise
