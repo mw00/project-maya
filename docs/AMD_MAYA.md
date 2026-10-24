@@ -192,30 +192,20 @@ text (`MAYA_GLM_MTP_DECODE`, on by default on `gfx115x` only). On the Gorgon Hal
 
 ## Instinct MI300X / MI325X
 
-AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental. Like the MI100 (`gfx908`) it is a wave64
-card: the CUDA-shaped kernels run through the hip_compat layer's logical-32-lane half-wavefront mapping, with the
-signed dot4 (`v_dot4_i32_i8`). Two things differ from the MI100. gfx942 has packed FP32 instructions
-(`v_pk_fma_f32`), so a gfx942 build compiles HIP with `-ffp-contract=on`: with clang's default `fast` contraction the
-multi-activation GEMV fused its columns' multiply-adds differently from the one-activation GEMV and stopped matching it
-bit for bit. And its F32 product keeps the sign of a zero, so the INT8 latent reads skip the RDNA signed-zero fix.
+AMD Instinct MI300X / MI325X (`gfx942`, CDNA3) is accepted as experimental, on one GPU. Like the MI100 it is a wave64
+card and runs through the hip_compat half-wavefront layer.
 
-The ROCm installation needs its development packages for the card (on ROCm 7.14's packaging,
-`amdrocm-core-dev7.14-gfx942` and `amdrocm-blas-dev7.14`). Then the setup above, without the `MAYA_GLM_RAM_GB`
-override:
+Install ROCm's development packages for the card first (ROCm 7.14: `amdrocm-core-dev7.14-gfx942` and
+`amdrocm-blas-dev7.14`), then run the setup above without the `MAYA_GLM_RAM_GB` override. On an MI325X (256 GB) every
+expert of Maya-L fits in HBM next to a 1M-token context; with that much room, `"--kv-streaming", "off"` in the config's
+`"args"` keeps the whole latent cache on the card too.
 
 ```sh
-./maya.sh --backend hip --gpu 0 --context 32768 --no-vision --yes --model Maya-S-v2-IQ2_XXS \
-  --download-model --no-start --port 8099
+./maya.sh --backend hip --gpu 0 --context 1048576 --no-vision --yes --model Maya-L --download-model
 ```
 
-Run on one MI325X (256 GB HBM3E), EPYC 9575F, 157 GB RAM, ROCm 7.14, Maya-S-v2-IQ2_XXS, 32K context, the config setup
-writes: every expert sits in the GPU pool (85.2 GB, 306 slots a layer) with 166 GB of VRAM still free; 256-token
-answers at ~74.5 tok/s (100% VRAM hits), 3K- and 16K-token prompts at ~1525 tok/s. The hipBLASLt table
-(`tools/hip/gfx942-glm-hipblaslt-100401.txt`, ROCm 7.14's hipBLASLt 1.4.1; the twelve GLM projection shapes at
-T = 64-8192) beats plain hipBLAS on every row, 1.1-1.4x at T = 8192 and up to 27x at T = 64, but the projections are
-a small share of a prompt here: without it the same prompts read at 1432 and 1468 tok/s. 72 of the
-76 CTest checks pass, and HC1 / HC2 too; the other four need model fixtures (`ple_parity`, `expert_parity`,
-`pool_test`) or fail to link on every architecture (`hip_expert_cache_staging`). Single GPU only so far.
+`./maya.sh --bench` on one MI325X (v1.1.27, Maya-L, 1M context, `--kv-streaming off`): answers at 84.0 tokens/s,
+prompts at 1307 tokens/s (2K tokens) and 1663 tokens/s (8K tokens). Not tried yet: the MI300X itself, more than one GPU.
 
 ## Windows
 
