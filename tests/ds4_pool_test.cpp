@@ -1,7 +1,8 @@
 // ds4_pool_test: IoQueue's device-copy jobs (DS4_FLOW_HELPER's copies out of the helper's pool), CPU only - a fake
-// copy function stands in for the GPU runtime; and DS4_FLOW_DOWN_PART's compact_rows - in place against a naive
-// gather, alone and on IoQueue's three kinds of job.
+// copy function stands in for the GPU runtime; DS4_FLOW_DOWN_PART's compact_rows - in place against a naive gather,
+// alone and on IoQueue's three kinds of job; and DS4_TP_BORROW's tail arithmetic (ds4_borrow.hpp).
 // Build: g++ -std=c++17 -O2 -pthread -I src/ds4 tests/ds4_pool_test.cpp
+#include "ds4_borrow.hpp"
 #include "ds4_pool.hpp"
 
 #include <cstdio>
@@ -139,6 +140,39 @@ void many_device_copies() {   // (an item's three parts, many items, several thr
     EXPECT(same && !any_bad);
     EXPECT(copies.load() == items * 3);
     EXPECT(q.device_bytes() == total);
+}
+
+// DS4_TP_BORROW: a group's k is the most any member needs (its buffers + 256 over its parts of a slot), capped by the
+// group's fewest slots a layer less one; every member's buffers then fit its own tail; a layer keeps the slots wholly
+// before a member's buffers, and the group the fewest of its members'
+void tp_borrow_arithmetic() {
+    using strata::ds4::tail_keep;
+    using strata::ds4::tp_tail_fits;
+    using strata::ds4::tp_tail_k;
+    // (two members of an uneven group: 1280- and 1024-wide parts, so the wider one's step is larger)
+    const std::vector<size_t> need = {100, 90}, step = {50, 40};
+    EXPECT(tp_tail_k(need, step, 10) == 9);   // (356 / 50 -> 8, 346 / 40 -> 9)
+    EXPECT(tp_tail_fits(need, step, 9));
+    EXPECT(!tp_tail_fits(need, step, 8));    // (the second member: 8 x 40 < 346)
+    EXPECT(tp_tail_k(need, step, 5) == 5);   // (capped: the group's fewest slots a layer less one)
+    EXPECT(!tp_tail_fits(need, step, 5));    // (then the chunk shrinks, or the group keeps its own room)
+    EXPECT(tp_tail_k(need, step, 0) == 0);
+    EXPECT(tp_tail_k({100}, {0}, 10) == -1);   // (a member without layers)
+    EXPECT(tp_tail_k({100, 90}, {50}, 10) == -1);
+    EXPECT(tp_tail_k({}, {}, 10) == -1);
+    // the 092i shape: 32K-row buffers of ~5.9 GB a member over parts of ~0.24 GB a slot (40 layers x ~6 MB)
+    const std::vector<size_t> n32 = {5900000000ull, 5700000000ull}, s32 = {241000000ull, 236000000ull};
+    const int k32 = tp_tail_k(n32, s32, 2000);
+    // (5,900,000,256 / 241,000,000 -> 25; 5,700,000,256 / 236e6 -> 25)
+    EXPECT(k32 == 25 && tp_tail_fits(n32, s32, k32));
+    // the slots wholly before the buffers at b0: parts of 40 B, 100 apart from offset 0
+    EXPECT(tail_keep(0, 40, 100, 250, 5) == 3);   // (0-40, 100-140, 200-240 before 250; 300-340 not)
+    EXPECT(tail_keep(0, 40, 100, 250, 2) == 2);   // (at most the layer's tail slots)
+    EXPECT(tail_keep(60, 40, 100, 250, 5) == 2);  // (60-100, 160-200; 260-300 not)
+    EXPECT(tail_keep(0, 40, 100, 30, 5) == 0);
+    // the group keeps the fewest of its members' (pv_n = n_main + min): here the second member's 2
+    const int keep = std::min(tail_keep(0, 40, 100, 250, 5), tail_keep(60, 40, 100, 250, 5));
+    EXPECT(keep == 2);
 }
 
 // DS4_FLOW_DOWN_PART: compact_rows(base, rows, pitch, off, len) leaves row r's bytes [off, off + len) at r len, rows
@@ -289,6 +323,7 @@ int main() {
     device_copy_fails();
     memory_copy_unchanged();
     many_device_copies();
+    tp_borrow_arithmetic();
     compact_rows_shapes();
     compact_rows_jobs();
     if (failures) {
