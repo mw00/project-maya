@@ -9,6 +9,12 @@
 // Geometry (docs/GLM5-FLASH.md): the indexer's 32 heads x 128, pools of 4 positions, the top 512 pools (index_topk
 // 2048) and the 3-position tail; MLA's 64 heads, kv_lora 512, qk_nope 256, FP16 latents (the engine's default cache).
 // The points are the 090 fixtures' native prompt counts: 28,517 (32K), 114,093 (114K), 130,397 (nf128k).
+// Timing scope: in the engine a layer's pooled keys and selected latent rows come from VRAM (a whole token's weights
+// pass between two calls of a layer), its query, weights and partials straight from the kernels before.  So every
+// timed call reads pooled keys / latent rows last touched >= 256 MB of reads earlier - past the RX 7900's 96 MB
+// Infinity Cache: the indexer rotates over >= 256 MB of pooled copies, MLA over 128 cell sets drawn from a 512 MB
+// latent pool, each round all of them, the rotation never restarting (warm-up and rounds continue it); the query, the
+// head weights and the partials stay hot as in the engine.  The copies and sets are bounded (<= 128, <= 512 MB).
 #include "strata/kernels/glm_expert_bench.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include <hip/hip_runtime.h>
@@ -21,7 +27,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
-#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
@@ -30,7 +35,8 @@ namespace gf = strata::kernels::glmf;
 namespace hb = strata::kernels::glmf::hip_expert_bench;
 namespace {
 constexpr int kH = 32, kK = 128, kPool = 4, kTop = 512, kTail = kPool - 1;
-constexpr int kHeads = 64, kLora = 512, kNope = 256, kSel = kTop * kPool + kTail, kRows = 32768;
+constexpr int kHeads = 64, kLora = 512, kNope = 256, kSel = kTop * kPool + kTail;
+constexpr int kRows = 32768, kRowsCold = 524288;   // parity's latent rows; timing's (512 MB of FP16 rows)
 constexpr int kPoints[] = {28517, 114093, 130397};
 
 void check(hipError_t e, const char* what) {
@@ -63,16 +69,19 @@ Diff compare(const std::vector<float>& a, const std::vector<float>& b) {
     return d;
 }
 
+// the median of 7 rounds of `calls` launches; launch(seq) gets one running sequence number over the warm-up and every
+// round (a rotation by seq % n never restarts, so a round of n calls reads all n copies)
 double time_us(hipStream_t s, int calls, const std::function<void(int)>& launch) {
     hipEvent_t a, b;
     check(hipEventCreate(&a), "event");
     check(hipEventCreate(&b), "event");
-    for (int i = 0; i < 4; ++i) launch(i);
+    int seq = 0;
+    for (int i = 0; i < calls; ++i) launch(seq++);
     check(hipStreamSynchronize(s), "warmup");
     std::vector<double> v;
     for (int rnd = 0; rnd < 7; ++rnd) {
         check(hipEventRecord(a, s), "record");
-        for (int i = 0; i < calls; ++i) launch(i);
+        for (int i = 0; i < calls; ++i) launch(seq++);
         check(hipEventRecord(b, s), "record");
         check(hipEventSynchronize(b), "sync");
         float ms = 0;
@@ -204,17 +213,17 @@ bool dsa_parity(DsaPoint& P, const std::vector<std::string>& shapes, uint32_t se
 void dsa_timing(DsaPoint& P, const std::vector<std::string>& shapes, const std::vector<bool>& exact, hipStream_t s) {
     const int copies = (int) P.pooled.size();
     hb::dsa_score_config("original");
-    const double t_ref = time_us(s, 20, [&](int i) { dsa_run(P, i % copies, P.ref, nullptr, s); });
+    const double t_ref = time_us(s, copies, [&](int i) { dsa_run(P, i % copies, P.ref, nullptr, s); });
     const double bytes = (double) P.n_vis * kK * 4;
     for (size_t k = 0; k < shapes.size(); ++k) {
         hb::dsa_score_config(shapes[k].c_str());
-        const double t = time_us(s, 20, [&](int i) { dsa_run(P, i % copies, P.score, nullptr, s); });
+        const double t = time_us(s, copies, [&](int i) { dsa_run(P, i % copies, P.score, nullptr, s); });
         std::printf("bench dsa_score ctx=%d n_vis=%d %-7s %8.1f us %6.1f GB/s | original %8.1f us %6.1f GB/s | %.3fx %s\n",
                     P.ctx, P.n_vis, shapes[k].c_str(), t, bytes / t / 1000.0, t_ref, bytes / t_ref / 1000.0, t_ref / t,
                     exact[k] ? "bit-exact" : "DIFFERS");
     }
     hb::dsa_score_config("original");
-    const double t_sel = time_us(s, 20, [&](int i) {
+    const double t_sel = time_us(s, copies, [&](int i) {
         (void) i;
         gf::dsa_select(P.ref, P.n_vis, kPool, P.top, P.n_sel, P.ctx, P.ref_cells, s);
     });
@@ -231,28 +240,34 @@ struct MlaInputs {
 uint16_t half_bits(float f) { return std::bit_cast<uint16_t>(__float2half(f)); }
 // pattern: "all" every cell a row; "tail" the select's last 3 positions masked (-1, a context that ends mid-pool);
 // "chunk" also a whole 32-cell chunk masked (its max -inf, its weights 0, the merge skipping it)
-std::vector<int> cell_set(std::mt19937& rng, const char* pattern) {
-    std::vector<int> rows(kRows);
-    std::iota(rows.begin(), rows.end(), 0);
-    std::shuffle(rows.begin(), rows.end(), rng);
-    std::vector<int> c(rows.begin(), rows.begin() + kSel);
+std::vector<int> cell_set(std::mt19937& rng, const char* pattern, int n_rows) {
+    std::vector<int> c;
+    std::vector<char> taken(n_rows, 0);
+    std::uniform_int_distribution<int> row(0, n_rows - 1);
+    while ((int) c.size() < kSel) {   // distinct rows, uniformly drawn
+        const int r = row(rng);
+        if (!taken[r]) {
+            taken[r] = 1;
+            c.push_back(r);
+        }
+    }
     if (std::strcmp(pattern, "all") != 0)
         for (int m = 0; m < kTail; ++m) c[kSel - 1 - m] = -1;
     if (std::strcmp(pattern, "chunk") == 0)
         for (int i = 32 * 5; i < 32 * 6; ++i) c[i] = -1;
     return c;
 }
-MlaInputs mla_inputs(const char* pattern, int sets, uint32_t seed) {
+MlaInputs mla_inputs(const char* pattern, int sets, uint32_t seed, int n_rows) {
     MlaInputs M;
     std::mt19937 rng(seed);
     std::normal_distribution<float> nd(0.f, 1.f);
     std::vector<float> q((size_t) kHeads * kLora);
     for (float& f : q) f = nd(rng);
-    std::vector<uint16_t> lat((size_t) kRows * kLora);
+    std::vector<uint16_t> lat((size_t) n_rows * kLora);
     for (uint16_t& h : lat) h = half_bits(nd(rng));
     M.q_abs = dev_copy(q);
     M.lat = dev_copy(lat);
-    for (int k = 0; k < sets; ++k) M.cells.push_back(dev_copy(cell_set(rng, pattern)));
+    for (int k = 0; k < sets; ++k) M.cells.push_back(dev_copy(cell_set(rng, pattern, n_rows)));
     check(hipMalloc(&M.ctx, (size_t) kHeads * kLora * 4), "hipMalloc");
     check(hipMalloc(&M.ref, (size_t) kHeads * kLora * 4), "hipMalloc");
     return M;
@@ -289,10 +304,10 @@ bool mla_parity(MlaInputs& M, const char* pattern, const std::vector<std::string
 void mla_timing(MlaInputs& M, const std::vector<std::string>& shapes, const std::vector<bool>& exact, hipStream_t s) {
     const int sets = (int) M.cells.size();
     hb::mla_attn_config("original");
-    const double t_ref = time_us(s, 20, [&](int i) { mla_run(M, i % sets, M.ref, s); });
+    const double t_ref = time_us(s, sets, [&](int i) { mla_run(M, i % sets, M.ref, s); });
     for (size_t k = 0; k < shapes.size(); ++k) {
         hb::mla_attn_config(shapes[k].c_str());
-        const double t = time_us(s, 20, [&](int i) { mla_run(M, i % sets, M.ctx, s); });
+        const double t = time_us(s, sets, [&](int i) { mla_run(M, i % sets, M.ctx, s); });
         std::printf("bench mla_attend n_sel=%d %-7s %8.1f us | original %8.1f us | %.3fx %s\n", kSel, shapes[k].c_str(), t,
                     t_ref, t_ref / t, exact[k] ? "bit-exact" : "DIFFERS");
     }
@@ -335,7 +350,7 @@ int main(int argc, char** argv) {
         dsa_free(P);
     }
     for (const char* pattern : {"all", "tail", "chunk"}) {
-        MlaInputs M = mla_inputs(pattern, 1, 0x3a11u + (uint32_t) std::strlen(pattern));
+        MlaInputs M = mla_inputs(pattern, 1, 0x3a11u + (uint32_t) std::strlen(pattern), kRows);
         ok &= mla_parity(M, pattern, ms, m_exact, s);
         mla_free(M);
     }
@@ -343,12 +358,14 @@ int main(int argc, char** argv) {
         // timed after every parity row; a shape with any differing or non-finite row is printed DIFFERS (and the run FAILs)
         for (int ctx : kPoints) {
             const size_t bytes = (size_t) ((ctx + 1) / kPool) * kK * 4;
-            const int copies = (int) std::max<size_t>(1, std::min<size_t>(16, (256u << 20) / bytes + 1));   // past the 96 MB cache
+            const int copies = (int) std::min<size_t>(128, ((size_t) 256 << 20) / bytes + 1);   // >= 256 MB a round (header)
             DsaPoint P = dsa_point(ctx, 0, 0xc0ffeeu + (uint32_t) ctx, copies);
+            std::printf("rotation dsa_score ctx=%d copies=%d bytes=%zu\n", ctx, copies, (size_t) copies * bytes);
             dsa_timing(P, ds, d_exact, s);
             dsa_free(P);
         }
-        MlaInputs M = mla_inputs("tail", 8, 0x77aau);
+        MlaInputs M = mla_inputs("tail", 128, 0x77aau, kRowsCold);
+        std::printf("rotation mla_attend sets=128 rows=%d bytes=%zu\n", kRowsCold, (size_t) kRowsCold * kLora * 2);
         mla_timing(M, ms, m_exact, s);
         mla_free(M);
     }
