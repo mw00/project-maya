@@ -108,6 +108,10 @@ def nvml_pids(pid: int | None, listed: set) -> set:
 
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
 CONTEXT_FALLBACK_MAX = 262144   # ... and the largest when the model file does not say what it was trained for
+# the largest context the dashboard offers without an "untested" warning, by engine: maya-ds4 its model's own 1M; the
+# GLM engine's 256K
+CONTEXT_TESTED = {"ds4": 1048576}
+CONTEXT_TESTED_DEFAULT = 262144
 # the engine log's lines a report carries (maya.py's --report reads the same ones)
 REPORT_LINES = re.compile(r"glm fast:|glm prefill: (?:CUDA|HIP)|glm split|glm stat|glm slots|glm prefill: \d|ERR|error|"
                           r"failed|out of memory|WARNING", re.I)
@@ -1466,6 +1470,22 @@ def trained_context(model_dir) -> int | None:
         return None
 
 
+def trained_context_ds4(pack) -> int | None:
+    """DeepSeek's: the context its pack says the model was trained for (ds4.txt's max_position_embeddings, from the
+    model's config.json or a GGUF's context_length; V4.1-Flash: 1,048,576, its native reach), the top of the dashboard's
+    Context size.  None when the pack does not say."""
+    try:
+        with open(Path(pack) / "ds4.txt", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                k, _, v = line.strip().partition(" ")
+                if k == "max_position_embeddings":
+                    n = int(v.split()[0])
+                    return n if n > 0 else None
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def gpu_list(cfg: dict) -> list[int]:
     """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
     numbers them; [] when it names none."""
@@ -1771,7 +1791,9 @@ class Service:
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         return {"context": self.engine.max_context, "min": CONTEXT_MIN, "max": max(top, self.engine.max_context),
-                "trained": self.trained_context, "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
+                "trained": self.trained_context,
+                "tested": CONTEXT_TESTED.get(str(info.get("engine_kind") or ""), CONTEXT_TESTED_DEFAULT),
+                "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
                 "kv_resident": info.get("kv_resident") or 0,
                 "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload}
 
@@ -4488,6 +4510,8 @@ def main() -> int:
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
+    elif "--pack" in args[:-1]:                         # DeepSeek's pack: its ds4.txt
+        svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

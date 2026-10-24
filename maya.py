@@ -439,7 +439,10 @@ DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-
 DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
 DS4_DEFAULT_QUANT = "gguf-q8"
 DS4_GGUF_MIN_CC = 70
-DS4_CONTEXTS = [32768, 65536, 131072, 262144]
+# (the model's own reach, natively: 1M positions - its config's max_position_embeddings, nothing scaled; 512K and 1M
+# cost VRAM from the expert cache, about 1.1 KB a position on each GPU of a tensor-parallel group, and a full prompt
+# there reads slowly: the indexer's work grows with the square of its length)
+DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]
 DS4_DEFAULT_CONTEXT = 65536
 DS4_MODEL_NAME = "deepseek-v4.1-flash"
 DS4_SAMPLING = {"temperature": 1.0, "top_p": 1.0}   # DeepSeek's own
@@ -1139,13 +1142,18 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
 
 
 # ------------------------------------------------------------------------------------------------ 2. choices
+def context_label(n: int) -> str:
+    """A context size as the menus show it: 32768 -> "32K", 1048576 -> "1M"."""
+    return f"{n // 1048576}M" if n % 1048576 == 0 else f"{n // 1024}K"
+
+
 def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT) -> int:
     if a.context:
         return a.context
     default = prev_ctx if prev_ctx in contexts else recommended
     pick = choose("Context?", ["Context length = how much text the model sees at once (the chat, files, tool output). "
                                "A longer one takes", "VRAM from the expert cache, so answers get a little slower:"],
-                  [(f"{c // 1024}K tokens", "recommended" if c == recommended else None, None) for c in contexts],
+                  [(f"{context_label(c)} tokens", "recommended" if c == recommended else None, None) for c in contexts],
                   contexts.index(default), a.yes)
     return contexts[pick]
 
