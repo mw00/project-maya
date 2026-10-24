@@ -1385,6 +1385,37 @@ struct Model::Impl {
     std::vector<std::array<uint8_t*, 2>> ram_part;   // slot -> its parts
     std::vector<std::array<size_t, 4>> cp_lay;       // layer -> part offsets of gate, up, down rows; a part's bytes
     std::vector<int> copy_spare;                      // layer -> its spare slot (-1: none)
+    // MAYA_DS4_COPY_SWAP=1 (copy mode, opt-in; read as STRATA_DS4_COPY_SWAP, DS4_COPY_SWAP too): the copies follow the routes, as the RAM tier's do. DISK_SKIP_W never computes
+    // an expert it leaves out, so its pages never come off the SSD and it is left out wherever it is picked light, all
+    // through a conversation; but its heat counts those picks too. A layer's hottest expert read from the files takes
+    // the place of its coldest copy when it beats it by MAYA_DS4_COPY_SWAP_MARGIN x + 1 (1.25): read by a thread of its own
+    // into the layer's free slot, switched between windows, the coldest's slot then the free one. One move at a time,
+    // at most one every MAYA_DS4_COPY_SWAP_EVERY tokens (8). The copies keep their RAM (a slot a layer more), so nothing else
+    // leaves the page cache for them. (The idea: Abyss's RAM fill for its disk tail skip - zephel01/Abyss v1.3.46,
+    // issue #8 there.)
+    static const char* cs_env(const char* name) {   // STRATA_DS4_<name> (the MAYA_ name's), else DS4_<name>
+        const char* v = std::getenv((std::string("STRATA_DS4_") + name).c_str());
+        return v != nullptr ? v : std::getenv((std::string("DS4_") + name).c_str());
+    }
+    bool copy_swap = [] {
+        const char* v = cs_env("COPY_SWAP");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    float cs_margin = 1.25f;
+    int cs_every = 8, cs_since = 0, cs_inflight = 0;
+    struct CSwap {
+        int layer = 0, in = -1, out = -1, slot = -1;
+        bool ok = false;
+    };
+    std::vector<int> cs_free;   // layer -> its free slot for a move in (-1: none)
+    std::deque<CSwap> cs_q;
+    std::vector<CSwap> cs_ready;
+    std::mutex cs_mu;
+    std::condition_variable cs_cv;
+    std::thread cs_th;
+    bool cs_quit = false;
+    long long cs_done = 0;
+    long long sk_tok = 0, sk_last = 0, cs_last = 0;   // (the DISK_SKIP_W line every 512 decoded tokens)
     // the recent slots: DS4_RECENT a trunk layer (0: none; 32 where the prompts stream the experts by DMA - the serve
     // protocol at 3.5 bits, 8 / 16 / 24 / 32 of them: 59.0 / 61.5 / 62.2 / 62.9 tok/s, a routing trace's VRAM-neutral
     // optimum ~32), at most DS4_RECENT_FILLS (2) new ones a layer a tick
@@ -1619,6 +1650,12 @@ struct Model::Impl {
     }
 
     ~Impl() {
+        {
+            std::lock_guard<std::mutex> lk(cs_mu);
+            cs_quit = true;
+        }
+        cs_cv.notify_all();
+        if (cs_th.joinable()) cs_th.join();
         warm_end();
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
@@ -3070,6 +3107,15 @@ struct Model::Impl {
         if (!lane_alloc(err)) return false;
         if (!place_experts(err)) return false;
         if (!load_experts(err)) return false;
+        if (copy_swap && copy_mode) {   // (DS4_COPY_SWAP: after the copies)
+            if (const char* v = cs_env("COPY_SWAP_MARGIN")) cs_margin = (float) std::atof(v);
+            if (const char* v = cs_env("COPY_SWAP_EVERY")) cs_every = std::max(1, std::atoi(v));
+            cs_th = std::thread([this] { cs_loop(); });
+            int nfree = 0;
+            for (int f : cs_free) nfree += f >= 0;
+            std::fprintf(stderr, "ds4: copy swaps: %d layers with a free slot, margin %.2f, every %d tokens\n", nfree,
+                         cs_margin, cs_every);
+        }
         if (pk.gguf) make_pools();
         if (chunk > 0) {
             // the CPU lane's parts pinned (the chunks stream them to the GPUs by DMA), each layer's virtual slots
@@ -5198,7 +5244,7 @@ struct Model::Impl {
         size_t take = 0;
         for (; take < hot.size(); ++take) {
             const Layer& l = L[(size_t) hot[take].first];
-            const double add = (double) l.blob * (1 + (n_copy[(size_t) l.il] == 0 ? spare_of(l) : 0));
+            const double add = (double) l.blob * (1 + (n_copy[(size_t) l.il] == 0 ? spare_of(l) + (copy_swap ? 1 : 0) : 0));
             if (used + add > budget) break;
             used += add;
             ++n_copy[(size_t) l.il];
@@ -5206,9 +5252,10 @@ struct Model::Impl {
         // each layer's slots: one block per node of (copies + spare) parts
         std::vector<int> first(L.size(), -1);
         copy_spare.assign(L.size(), -1);
+        cs_free.assign(L.size(), -1);
         for (Layer& l : L) {
             l.ram.assign((size_t) l.n_exp, -1);
-            const int ns = n_copy[(size_t) l.il] + (n_copy[(size_t) l.il] > 0 ? spare_of(l) : 0);
+            const int ns = n_copy[(size_t) l.il] + (n_copy[(size_t) l.il] > 0 ? spare_of(l) + (copy_swap ? 1 : 0) : 0);
             if (ns == 0) continue;
             const size_t part = cp_lay[(size_t) l.il][3], bytes = (size_t) ns * part;
             std::array<uint8_t*, 2> base = {nullptr, nullptr};
@@ -5231,7 +5278,8 @@ struct Model::Impl {
             first[(size_t) l.il] = (int) ram_part.size();
             for (int i = 0; i < ns; ++i)
                 ram_part.push_back({base[0] + (size_t) i * part, NH > 1 ? base[1] + (size_t) i * part : nullptr});
-            if (spare_of(l)) copy_spare[(size_t) l.il] = first[(size_t) l.il] + ns - 1;
+            if (spare_of(l)) copy_spare[(size_t) l.il] = first[(size_t) l.il] + n_copy[(size_t) l.il];
+            if (copy_swap) cs_free[(size_t) l.il] = first[(size_t) l.il] + n_copy[(size_t) l.il] + spare_of(l);
         }
         struct Job {
             int layer, e, slot;
@@ -7131,7 +7179,62 @@ struct Model::Impl {
         swap_tick(T);
         tick_flush();
     }
+    // (DS4_COPY_SWAP) the moves read in, switched while nothing reads the copies (between windows)
+    void cs_switch() {
+        std::vector<CSwap> rd;
+        {
+            std::lock_guard<std::mutex> lk(cs_mu);
+            rd.swap(cs_ready);
+        }
+        for (const CSwap& c : rd) {
+            Layer& l = L[(size_t) c.layer];
+            --cs_inflight;
+            if (!c.ok || l.ram[(size_t) c.in] >= 0 || l.slot[(size_t) c.in] >= 0 || l.ram[(size_t) c.out] < 0 ||
+                l.slot[(size_t) c.out] >= 0 || l.swap_pending) {
+                cs_free[(size_t) c.layer] = c.slot;   // (things moved meanwhile: the slot back, nothing switched)
+                continue;
+            }
+            l.ram[(size_t) c.in] = c.slot;
+            cs_free[(size_t) c.layer] = l.ram[(size_t) c.out];
+            l.ram[(size_t) c.out] = -1;
+            ++cs_done;
+        }
+    }
+    void cs_loop() {
+        for (;;) {
+            CSwap c;
+            {
+                std::unique_lock<std::mutex> lk(cs_mu);
+                cs_cv.wait(lk, [&] { return cs_quit || !cs_q.empty(); });
+                if (cs_quit) return;
+                c = cs_q.front();
+                cs_q.pop_front();
+            }
+            const Layer& l = L[(size_t) c.layer];
+            bool ok = true;
+            for (int r = 0; r < 3 && ok; ++r) {
+                const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                for (int X = 0; X < NH && ok; ++X)
+                    ok = pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) c.in * l.mx_stride[r] + (uint64_t) X * nb, nb,
+                                    ram_part[(size_t) c.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r]);
+            }
+            c.ok = ok;
+            std::lock_guard<std::mutex> lk(cs_mu);
+            cs_ready.push_back(c);
+        }
+    }
     void swap_tick(int T) {
+        if (copy_swap && copy_mode) {
+            cs_switch();
+            cs_since += T;
+        }
+        // (DISK_SKIP_W: every 512 decoded tokens the log gets the experts a token left out, and the copy swaps)
+        if (T == 1 && disk_skip_w > 0.0f && ++sk_tok % 512 == 0) {
+            std::fprintf(stderr, "ds4: DISK_SKIP: %.2f experts a token left out over the last 512 tokens, %lld copy swaps\n",
+                         (double) (st.skipped - sk_last) / 512.0, cs_done - cs_last);
+            sk_last = st.skipped;
+            cs_last = cs_done;
+        }
         if (!o.expert_cache || cache_ths.empty()) return;
         cache_switch();
         decay_tokens += T;
@@ -7261,6 +7364,35 @@ struct Model::Impl {
                     std::lock_guard<std::mutex> lk(sw_mu);
                     sw_queue.push_back(sw);
                     queued = true;
+                }
+            }
+            if (copy_mode && copy_swap && cs_inflight == 0 && cs_since >= cs_every && !l.swap_pending &&
+                cs_free[(size_t) l.il] >= 0 && !l.ram.empty()) {   // (DS4_COPY_SWAP) a copy: the hottest from the files in
+                int rb = -1;
+                for (int e : hits)
+                    if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 &&
+                        (rb < 0 || l.heat[(size_t) e] > l.heat[(size_t) rb]))
+                        rb = e;
+                int rc = -1;
+                if (rb >= 0)
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.ram[(size_t) e] >= 0 && l.slot[(size_t) e] < 0 &&
+                            (rc < 0 || l.heat[(size_t) e] < l.heat[(size_t) rc]))
+                            rc = e;
+                if (rb >= 0 && rc >= 0 && l.heat[(size_t) rb] > l.heat[(size_t) rc] * cs_margin + 1.0f) {
+                    CSwap cs;
+                    cs.layer = l.il;
+                    cs.in = rb;
+                    cs.out = rc;
+                    cs.slot = cs_free[(size_t) l.il];
+                    cs_free[(size_t) l.il] = -1;
+                    ++cs_inflight;
+                    cs_since = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(cs_mu);
+                        cs_q.push_back(cs);
+                    }
+                    cs_cv.notify_one();
                 }
             }
             if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;

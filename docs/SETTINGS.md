@@ -447,6 +447,27 @@ RAM cannot hold the experts a conversation uses, it keeps skipping on later answ
 (`decode left out ...`, `DISK_SKIP auto: ...`) and the `skipped=` / `skip_on=` keys of its STAT lines show what it
 did.
 
+An expert it leaves out is never computed, so its pages never come off the SSD: where the RAM copies
+(`--mmap-experts off`) do not hold every expert, one that is picked light again and again is left out all through a
+conversation. `MAYA_DS4_COPY_SWAP=1` lets the copies follow the routes, as the RAM tier's do: between answers' tokens a
+layer's hottest expert read from the files (its heat counts the left-out picks too) takes the place of its coldest
+copy, read by a thread of its own into a free slot the layer keeps (one expert a layer more RAM, ~0.44 GB on Maya-S).
+The copies keep their RAM, so nothing else leaves the page cache for them. The same answers' arithmetic: it changes only
+where experts sit, and so fewer are left out. An RTX 3090 with 128 GB of RAM, Maya-S, `DS4_COPY_GB=96`,
+`MAYA_DS4_DISK_SKIP_W=0.20`, 8,192-token answers: 15.0 / 15.8 -> 15.8 / 15.9 tok/s, 5.0-5.8 -> 3.5-4.5 experts a token
+left out in the second half; after a 4,096-token answer, 6 prompts' KL against no skipping 0.0184 -> 0.0149 (no skip:
+0.0171, all within the noise). The idea is Abyss's RAM fill for its disk tail skip
+([zephel01/Abyss](https://github.com/zephel01/Abyss) v1.3.46, issue #8 there).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_COPY_SWAP` | off (0) | `1` (copy mode: `--mmap-experts off`): a layer's hottest expert read from the files takes the place of its coldest copy; nothing to do where the copies hold every expert |
+| `MAYA_DS4_COPY_SWAP_MARGIN` | 1.25 | a move when the hot one's heat is above the cold one's x this + 1 |
+| `MAYA_DS4_COPY_SWAP_EVERY` | 8 | at most one move every this many tokens (one at a time); 4 or 2 left out no fewer on the PC above and were slower |
+
+With `MAYA_DS4_DISK_SKIP_W` set, the engine log gets a line every 512 decoded tokens: the experts a token left out and
+the copy swaps (`ds4: DISK_SKIP: ...`).
+
 ## DeepSeek: explicit RAM residency
 
 These independent settings are off by default. They are for Linux hosts with enough physical RAM to hold the
