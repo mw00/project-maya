@@ -2938,7 +2938,7 @@ __device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, co
     if (lane == 0) score[p] = acc;
 }
 
-// The indexer's scores, take two (STRATA_GLM_DSA_SCORE, glm_attn_bench), idx_heads 32 x key_dim 128 only: each pool's
+// The indexer's scores, take two (STRATA_GLM_DSA_SCORE2, glm_attn_bench), idx_heads 32 x key_dim 128 only: each pool's
 // arithmetic is dsa_score_block's - every head's dot from the lane's four products in key order, the butterfly,
 // fmaxf(dot, 0) * w summed over the heads in order - so the same bits.  What changes is around it: dsa_score_kernel
 // fills 16 KB of query into LDS for every 8 pools; here a grid of a few blocks a CU fills it once a block (or each lane
@@ -5757,7 +5757,7 @@ namespace {
 //                                          shuffles, pools a warp at a time, blocks a multiprocessor (rl2b4, sx1b8, ...)
 //   mla_split2  h<16|32|64>[l|x][v|e][c|o] heads a block, lanes or shuffles, 16-byte or element staging, the one-pass
 //                                          merge or the original one (h64lvc, h16xeo, ...)
-// The engine takes them from STRATA_GLM_DSA_SCORE / STRATA_GLM_MLA_ATTN2 (unset or 0: the original kernels, which stay
+// The engine takes them from STRATA_GLM_DSA_SCORE2 / STRATA_GLM_MLA_ATTN2 (unset or 0: the original kernels, which stay
 // the default; a value that is no label stops the process - a typo must never run the originals under a variant's
 // name); the bench sets them through hip_expert_bench.  The labels are exactly the ones glm_attn_bench --sweep checks.
 struct DsaScore2 {
@@ -5825,7 +5825,7 @@ std::atomic<int> g_dsa2_set{0}, g_mla2_set{0};
 DsaScore2 g_dsa2_bench;
 MlaAttn2 g_mla2_bench;
 DsaScore2 dsa2_shape() {
-    static const DsaScore2 env = env_shape<DsaScore2, parse_dsa2>("STRATA_GLM_DSA_SCORE");
+    static const DsaScore2 env = env_shape<DsaScore2, parse_dsa2>("STRATA_GLM_DSA_SCORE2");   // (not STRATA_GLM_DSA_SCORE: the prompt's numeric switch, glm_batch.cu)
     return g_dsa2_set.load(std::memory_order_acquire) ? g_dsa2_bench : env;
 }
 MlaAttn2 mla2_shape() {
