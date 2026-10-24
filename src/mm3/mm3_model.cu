@@ -842,7 +842,9 @@ struct Model::Impl {
         CK(cudaMemcpyAsync(d.plan_h, d.top, (size_t) g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
         CK(cudaMemcpyAsync(d.plan_h + 4, d.w, (size_t) g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
         if (lane) CK(cudaMemcpyAsync(d.xh_h, d.xn, (size_t) g.dim * 4, cudaMemcpyDeviceToHost, d.s));
+        const double ts = now();
         CK(cudaStreamSynchronize(d.s));
+        st.t_sync += now() - ts;
         std::memcpy(top, d.plan_h, (size_t) g.k_exp * 4);
         std::memcpy(w, d.plan_h + 4, (size_t) g.k_exp * 4);
         const size_t li = (size_t) (&l - L.data());
@@ -875,7 +877,9 @@ struct Model::Impl {
             float* part = d.xh_h + g.dim;
             int flag = 0;
             if (!cpu.empty()) {
+                const double tl = now();
                 lane->run(cpu, d.xh_h, part);
+                st.t_lane += now() - tl;
                 flag = 1;
                 st.cpu_experts += (long) cpu.size();
             }
@@ -1055,6 +1059,13 @@ struct Model::Impl {
     }
 
     bool chunk(const int* ids, int T, int pos0, int want, float* logits, std::string& err) {
+        const double tc = now();
+        const bool ok = chunk_(ids, T, pos0, want, logits, err);
+        if (T == 1) st.t_token += now() - tc;
+        return ok;
+    }
+
+    bool chunk_(const int* ids, int T, int pos0, int want, float* logits, std::string& err) {
         ++fwd;
         cur_pos = pos0 + T - 1;
         if (pos0 + T > o.max_ctx) {

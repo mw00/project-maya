@@ -51,9 +51,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map  # noqa: E402
-from serve.frontend import (CALL_START, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
-                            deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level, literal_tags,
-                            mark_literals, media_of, openai_to_messages, unmark_literals)
+from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
+                            anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level,
+                            literal_tags, mark_literals, media_of, openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -1607,15 +1607,19 @@ class Service:
         self.stop_ids = set(_special_ids(IM_END) + _special_ids("<|endoftext|>") + _special_ids("<|user|>") +
                             _special_ids("<|observation|>") +
                             # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
-                            _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>"))
+                            _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
+                            # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
+                            _special_ids("[e~[") + _special_ids("]~b]"))
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
-        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>")
+        self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
+                                       "[e~[", "]~b]")
                            if _special_ids(s)]
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
         self.think_budget = 0
-        end = _special_ids("</think>")
+        # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
+        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the special literals that stay text inside a message (frontend.mark_literals): every one the vocabulary has
         self.literals = literal_tags(getattr(tokenizer, "special_tokens", None))
@@ -2215,6 +2219,8 @@ class Service:
             glm_calls = "<arg_key>" in self.template.source
             if getattr(self.template, "deepseek", False):
                 prefill = "\n\n<｜DSML｜ calls>\n" + (f'<｜DSML｜ invoke name="{force}">\n' if force else "")
+            elif getattr(self.template, "minimax", False):
+                prefill = MINIMAX_NS + "<tool_call>\n" + (MINIMAX_NS + f'<invoke name="{force}">' if force else "")
             else:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
@@ -2516,6 +2522,7 @@ class Service:
         single_tool = responses and (sampling or {}).get("parallel_tool_calls") is False
         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True,
                               dsml=getattr(self.template, "deepseek", False),
+                              minimax=getattr(self.template, "minimax", False),
                               strict_tools=responses, single_tool=single_tool)
         prefill = (sampling or {}).get("_prefill") or ""   # the call's opening, already in the prompt (prepare)
         pre_events = parser.feed(prefill) if prefill else []

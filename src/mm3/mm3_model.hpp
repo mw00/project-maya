@@ -36,6 +36,7 @@ struct Stats {
     double pinned_gb = 0;         // the pinned pool of the experts not in VRAM
     long profiled = 0;            // routings counted (save_profile writes them)
     long cpu_experts = 0;         // routed experts the CPU lane computed
+    double t_sync = 0, t_lane = 0, t_token = 0;   // decode: waiting on the routing, the CPU lane, all (seconds)
 };
 
 class Model {

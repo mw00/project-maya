@@ -54,6 +54,9 @@ class ChatTemplate:
         # DeepSeek-V4.1 (tools/ds4/chat_template.jinja): the levels by their own names (its budgets 50 / 75 / 100), tool
         # calls in DSML (OutputParser(dsml=True) reads them)
         self.deepseek = "｜DSML｜" in self.source
+        # MiniMax-M3.1 (its own chat_template.jinja): thinking_mode enabled / disabled / adaptive and reasoning_effort
+        # low .. max; <mm:think> reasoning and ]<]minimax[>[-tagged tool calls (OutputParser(minimax=True) reads them)
+        self.minimax = MINIMAX_NS in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -84,6 +87,23 @@ class ChatTemplate:
                 if opens_turn and last.get("task") is None and prompt.endswith(header):
                     prompt = prompt[:-len(header)]
             return prompt
+        if self.minimax:
+            # Maya's levels: off -> thinking disabled (the turn opens with </mm:think>); low -> adaptive (the model
+            # decides) at effort low; high / max -> thinking enabled (the turn opens with <mm:think>) at that effort;
+            # none named -> the template's default, adaptive
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            if off:
+                kwargs["thinking_mode"] = "disabled"
+            elif level in ("low", "medium", "high", "xhigh", "max"):
+                kwargs["reasoning_effort"] = level
+                kwargs["thinking_mode"] = "adaptive" if level == "low" else "enabled"
+            else:
+                kwargs["thinking_mode"] = "adaptive"
+            # (its template reads tool.function: the server's flat tools go back into OpenAI's form)
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools or []] or None
+            return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
         off = False
         if self.glm_effort:
             off = kwargs.pop("enable_thinking", True) is False
@@ -767,17 +787,192 @@ class DsmlRewriter:
         return tag
 
 
+MINIMAX_NS = "]<]minimax[>["
+MM_THINK, MM_THINK_END = "<mm:think>", "</mm:think>"
+
+
+class MinimaxRewriter:
+    """MiniMax-M3.1's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
+    form with JSON values).  `<mm:think>` opens reasoning (the parser is already in it) and goes; `</mm:think>` is
+    </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
+    ]<]minimax[>[), a value that holds `NS<k>` elements being an object (or, all `item`, an array) - become
+    `<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` with V JSON: a string parameter (the
+    tool's schema says so) JSON-quoted piece by piece as it streams, any other value whole at its end (a nested one as
+    the object / array it spells, a plain one as JSON when it parses - a number, a boolean - else as a string).  A tag
+    split across deltas is held until it is whole."""
+
+    MARKS = (MINIMAX_NS, MM_THINK, MM_THINK_END)
+
+    def __init__(self, tools: list[dict] | None = None):
+        self.types = {}
+        for t in tools or []:
+            f = t.get("function", t)
+            props = ((f.get("parameters") or {}).get("properties")) or {}
+            self.types[f.get("name")] = {k: (v or {}).get("type") for k, v in props.items()}
+        self.buf = ""
+        self.in_calls = False
+        self.call = None             # the invoke's tool name
+        self.key = None              # the parameter whose value is being read
+        self.depth = 0
+        self.vtext = ""
+        self.vstring = self.vnested = False
+
+    @staticmethod
+    def _esc(s: str) -> str:
+        return json.dumps(s, ensure_ascii=False)[1:-1].replace("<", "\\u003c")
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while self.buf:
+            hits = [i for i in (self.buf.find(m) for m in self.MARKS) if i >= 0]
+            if not hits:
+                keep = max((n for m in self.MARKS for n in range(1, len(m)) if self.buf.endswith(m[:n])), default=0)
+                out.append(self._plain(self.buf[:len(self.buf) - keep]))
+                self.buf = self.buf[len(self.buf) - keep:]
+                break
+            i = min(hits)
+            if i:
+                out.append(self._plain(self.buf[:i]))
+                self.buf = self.buf[i:]
+            if self.buf.startswith(MM_THINK) or self.buf.startswith(MM_THINK_END):
+                end = self.buf.startswith(MM_THINK_END)
+                tag = MM_THINK_END if end else MM_THINK
+                self.buf = self.buf[len(tag):]
+                out.append(self._plain(tag) if self.key is not None else ("</think>" if end else ""))
+                continue
+            rest = self.buf[len(MINIMAX_NS):]
+            if not rest:
+                break                                   # what follows the namespace token: not here yet
+            if not rest.startswith("<"):
+                out.append(self._plain(MINIMAX_NS))
+                self.buf = rest
+                continue
+            j = rest.find(">")
+            if j < 0:
+                break                                   # the tag is not whole yet
+            tag, self.buf = rest[:j + 1], rest[j + 1:]
+            out.append(self._tag(tag))
+        return "".join(out)
+
+    def finish(self) -> str:
+        rest, self.buf = self.buf, ""
+        out = self._plain(rest)
+        if self.key is not None:
+            out += self._close_value()
+        if self.call is not None:
+            out += "</tool_call>"
+            self.call = None
+        return out
+
+    def _plain(self, s: str) -> str:
+        if not s:
+            return ""
+        if self.key is not None:
+            if self.vstring and not self.vnested:
+                return self._esc(s)
+            self.vtext += s
+            return ""
+        if self.in_calls:
+            return ""                                   # (between the calls' tags: whitespace)
+        return s
+
+    def _tag(self, tag: str) -> str:
+        closing = tag.startswith("</")
+        body = tag[2:-1] if closing else tag[1:-1]
+        name = body.split(None, 1)[0] if body.strip() else ""
+        if self.key is not None:                         # inside a value: only its own closing tag ends it
+            if closing and name == self.key and self.depth == 0:
+                return self._close_value()
+            if self.vstring:
+                return self._esc(MINIMAX_NS + tag)       # (a string: the tags are its text)
+            self.depth += -1 if closing else 1
+            self.vnested = True
+            self.vtext += MINIMAX_NS + tag
+            return ""
+        if name == "tool_call":
+            self.in_calls = not closing
+            return ""
+        if name == "invoke":
+            if closing:
+                self.call = None
+                return "</tool_call>"
+            m = re.search(r'name="([^"]*)"', body)
+            self.call = m.group(1) if m else ""
+            return "<tool_call>" + self.call
+        if self.call is not None and not closing:
+            self.key, self.depth, self.vtext, self.vnested = name, 0, "", False
+            self.vstring = (self.types.get(self.call) or {}).get(name) == "string"
+            return "<arg_key>" + name + "</arg_key><arg_value>" + ('"' if self.vstring else "")
+        return self._plain(MINIMAX_NS + tag)
+
+    def _close_value(self) -> str:
+        if self.vstring:
+            v = '"'
+        elif self.vnested:
+            v = json.dumps(self._parse(self.vtext), ensure_ascii=False).replace("<", "\\u003c")
+        else:
+            v = json.dumps(self._scalar(self.vtext), ensure_ascii=False).replace("<", "\\u003c")
+        self.key = None
+        return v + "</arg_value>"
+
+    @staticmethod
+    def _scalar(text: str):
+        t = text.strip()
+        if t in ("true", "false", "null") or re.fullmatch(r"-?\d+(\.\d+)?([eE][-+]?\d+)?", t):
+            return json.loads(t)
+        return text
+
+    def _parse(self, text: str):
+        """The XML a nested value spells (NS<k>..NS</k> elements) -> an object, or an array when every one is `item`;
+        text without elements -> a scalar."""
+        items, pos, open_tag = [], 0, MINIMAX_NS + "<"
+        while True:
+            a = text.find(open_tag, pos)
+            if a < 0:
+                break
+            b = text.find(">", a + len(open_tag))        # (past the namespace token's own '>')
+            if b < 0:
+                break
+            name = text[a + len(open_tag):b]
+            if name.startswith("/"):
+                pos = b + 1
+                continue
+            # its matching close, past nested elements of the same name
+            depth, k, close, opener = 1, b + 1, MINIMAX_NS + "</" + name + ">", MINIMAX_NS + "<" + name + ">"
+            while depth:
+                c, o = text.find(close, k), text.find(opener, k)
+                if c < 0:
+                    c = len(text)
+                    depth = 0
+                    break
+                if 0 <= o < c:
+                    depth, k = depth + 1, o + len(opener)
+                else:
+                    depth, k = depth - 1, c + len(close)
+            inner = text[b + 1:c]
+            items.append((name, self._parse(inner)))
+            pos = c + len(close)
+        if not items:
+            return self._scalar(text)
+        if all(n == "item" for n, _ in items):
+            return [v for _, v in items]
+        return {n: v for n, v in items}
+
+
 class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False):
+                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False):
         self.state = "reasoning" if thinking else "content"
-        self.dsml = DsmlRewriter() if dsml else None      # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter)
+        # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
+        # both send JSON values, so the parser takes them without the tools' schemas
+        self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
         self.buf = ""
         self.lead = False
-        self.schemas = {} if dsml else {t.get("name"): t for t in tools or []}
+        self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
