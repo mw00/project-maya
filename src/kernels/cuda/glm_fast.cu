@@ -4887,6 +4887,15 @@ constexpr int kMaxRdnaNt = 8;
 // The device the launch runs on: by default the RDNA 3.5 APUs (gfx115x - measured on a Radeon 8065S), whose LPDDR5X
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
 // STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
+// Which dense GEMV kernels a device's decode runs, once per device: the engine's own record that MAYA_GLM_MV_RDNA reached
+// the dispatch - or did not
+void note_mv(int device, bool on) {
+    static std::atomic<unsigned> seen{0};
+    if (device < 0 || device >= 32) return;
+    const unsigned bit = 1u << device;
+    if (seen.fetch_or(bit) & bit) return;
+    std::fprintf(stderr, "glm mv: CUDA%d dense GEMVs on the %s\n", device, on ? "RDNA3 kernel" : "original kernels");
+}
 bool mv_rdna_device() {
     static const int mode = [] {   // -1: default, 0: off, 1: every gfx11
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
@@ -4902,6 +4911,7 @@ bool mv_rdna_device() {
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
         on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0;
         cached_device = device;
+        note_mv(device, on);
     }
     return on;
 }
