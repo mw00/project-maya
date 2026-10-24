@@ -2,8 +2,8 @@
 // RTX 20): #180's decode kernels run the tiles on the tensor cores from sm_80 on, and their CUDA-core fallback was
 // slower here than these (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  exl3.cu's mv / moe_gate_up / moe_down
 // / win_experts / prepare / several_ok call these on such a GPU (STRATA_GLM_EXL3_DECODE=legacy|new picks one on any
-// GPU); the prompt path is exl3.cu's on every GPU.  The code below is v1.1.8's as it was, the prompt path's kernels
-// left out.
+// GPU); the prompt path is exl3.cu's on every GPU.  The code below is v1.1.8's, the prompt path's kernels left out
+// and decode8's trellis windows cut eight at a time (as exl3.cu's frag8) - the same values.
 //
 // The codebooks and the trellis window arithmetic follow exllamav3 (MIT, turboderp - exllamav3_ext/quant/
 // codebook.cuh, exl3_dq.cuh, hadamard_inner.cuh); the kernels around them are shaped for this engine's decode:
@@ -86,27 +86,89 @@ __device__ __forceinline__ float2 decode2(uint32_t s0, uint32_t s1) {
     return __half22float2(decode2h<cb>(s0, s1));
 }
 
-// step p's state: the 16-bit window ending at bit S(p) = floor((p + 1) K2 / 2) of the tile's MSB-first bit stream (w:
-// its 4 K2 words, K2 = 2 K) - (p + 1) K for an integer K, KA- and KA+1-bit steps alternating for exllamav3 1.6's
-// half-integer K = KA + 0.5 - wrapping around the tile (the + 128 K2 keeps the start non-negative)
-template <int K2>
-__device__ __forceinline__ uint32_t state_at(const uint32_t* w, int p) {
-    constexpr int W = 4 * K2;
-    const int b1 = ((p + 1) * K2) / 2 + 128 * K2;
-    const int i1 = (b1 - 1) >> 5, i0 = (b1 - 16) >> 5;
-    const int sh = ((i1 + 1) << 5) - b1;
-    const uint64_t m = ((uint64_t) w[i0 % W] << 32) | (uint64_t) w[i1 % W];
-    return (uint32_t) (m >> sh) & 0xffffu;
+// The lane's 8 steps (lane * 8 + j): v[j] sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column
+// (lane >> 2) + 8 (j >> 2).  Step p's state is the 16-bit window ending at bit S(p) = floor((p + 1) K2 / 2) of the
+// tile's MSB-first bit stream (w: its 4 K2 words), wrapping around the tile.  v1.1.8 cut every step's window on its
+// own (two shared-memory words and a 64-bit shift a step); the lane's 8 windows are cut together here, from one or two
+// words with funnel shifts, as exl3.cu's frag8 (exllamav3's grouping per K, exl3_dq.cuh) - the same states, so the
+// same values bit for bit (v1.1.8's per-step windows were most of the ~10 instructions a weight here; a V100 with
+// EXL3-2.05bpw: the routed gate/up 237 -> 179 us, down 85 -> 68 us)
+__device__ __forceinline__ uint32_t fsh(uint32_t lo, uint32_t hi, int s) {
+    return (uint32_t) ((((uint64_t) hi << 32) | (uint64_t) lo) >> s);
 }
-
-// lane's 8 steps (lane * 8 + j): v[j] sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column
-// (lane >> 2) + 8 (j >> 2)
+__device__ __forceinline__ void states4(uint32_t a, uint32_t b, uint32_t (&s)[8]) {
+    const uint32_t x = fsh(b, a, 20);
+    s[0] = x >> 8;
+    s[1] = x >> 4;
+    s[2] = x;
+    s[3] = b >> 16;
+    s[4] = b >> 12;
+    s[5] = b >> 8;
+    s[6] = b >> 4;
+    s[7] = b;
+}
+template <int K, int G>
+__device__ __forceinline__ void states_group(const uint32_t* w, int p, uint32_t* s) {
+    constexpr int NW = 8 * K;
+    const int b0 = (p + 257) * K - 16, b2 = b0 + (G - 1) * K + 16;
+    const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
+    const uint32_t a = w[i0 % NW], b = w[i2 % NW];
+#pragma unroll
+    for (int j = 0; j < G; ++j) s[G - 1 - j] = fsh(b, a, s2 + j * K);
+}
+template <int K>
+__device__ __forceinline__ void states8_int(const uint32_t* w, int lane, uint32_t (&s)[8]) {
+    const int p = lane * 8;
+    if constexpr (K == 4) {
+        states4(w[(lane + 31) & 31], w[lane], s);
+    } else if constexpr (K == 1 || K == 2) {
+        constexpr int NW = 8 * K, per = 32 / (8 * K);
+        const int i1 = lane / per, i0 = (i1 + NW - 1) % NW;
+        const uint32_t b = fsh(w[i1], w[i0], (per - 1 - lane % per) * 8 * K);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * K);
+    } else if constexpr (K == 3) {
+        constexpr int NW = 24;
+        const int b1 = (p + 257) * 3, b0 = b1 - 16, b2 = b1 + 21;
+        const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, s2 = ((i2 + 1) << 5) - b2;
+        const uint32_t a = w[i0 % NW], b = w[i2 % NW];
+        const uint32_t hi = fsh(b, a, s2), lo = fsh(b, a, s2 + 12);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            s[7 - j] = hi >> (3 * j);
+            s[3 - j] = lo >> (3 * j);
+        }
+    } else if constexpr (K == 7) {
+#pragma unroll
+        for (int g = 0; g < 4; ++g) states_group<K, 2>(w, p + 2 * g, s + 2 * g);
+    } else {   // 5, 6, 8
+        states_group<K, 4>(w, p, s);
+        states_group<K, 4>(w, p + 4, s + 4);
+    }
+}
+template <int K2>
+__device__ __forceinline__ void states8_half(const uint32_t* w, int lane, uint32_t (&s)[8]) {
+    constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
+    const int e7 = (lane * 4 + 4) * K2 + 128 * K2;
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        const int e = e7 - (1 - g) * 2 * K2;
+        const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
+        const uint32_t x = fsh(w[hi % NW], w[lo % NW], sh);
+        s[4 * g + 3] = x;
+        s[4 * g + 2] = x >> (KA + 1);
+        s[4 * g + 1] = x >> (2 * KA + 1);
+        s[4 * g + 0] = x >> (3 * KA + 2);
+    }
+}
 template <int K2, int cb>
 __device__ __forceinline__ void decode8(const uint32_t* w, int lane, float* v) {
-    const int p0 = lane * 8;
+    uint32_t s[8];
+    if constexpr ((K2 & 1) != 0) states8_half<K2>(w, lane, s);
+    else states8_int<K2 / 2>(w, lane, s);
 #pragma unroll
     for (int j = 0; j < 8; j += 2) {
-        const float2 d = decode2<cb>(state_at<K2>(w, p0 + j), state_at<K2>(w, p0 + j + 1));
+        const float2 d = decode2<cb>(s[j] & 0xffffu, s[j + 1] & 0xffffu);
         v[j] = d.x;
         v[j + 1] = d.y;
     }
