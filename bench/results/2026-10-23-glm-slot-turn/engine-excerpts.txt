@@ -1,0 +1,20 @@
+base
+Selected consecutive diagnostics around the slot restore and edited turn; chunk-detail lines omitted.
+glm slots: took back a 248595-token conversation from disk (5.1 s); 69 new tokens to read
+glm prefill: 68 tokens in 2068.4 ms (30.42 ms/token, 33 tok/s), 1 chunk of 128 tokens | CUDA0 2066 ms
+glm slots: saved a 248663-token conversation (3.30 GB in 2.2 s); 2 kept, 5.10 GB
+glm prefill: 212992 tokens in 202097.1 ms (0.95 ms/token, 1054 tok/s), 7 chunks of 32768 tokens | CUDA0 201114 ms
+glm prefill: 16384 tokens in 18062.6 ms (1.10 ms/token, 907 tok/s), 1 chunk of 16384 tokens | CUDA0 17991 ms
+glm prefill: 16384 tokens in 18325.4 ms (1.12 ms/token, 894 tok/s), 1 chunk of 16384 tokens | CUDA0 18254 ms
+glm prefill: 2875 tokens in 5229.0 ms (1.82 ms/token, 550 tok/s), 1 chunk of 2880 tokens | CUDA0 5215 ms
+glm prefill: 36 tokens in 1731.6 ms (48.10 ms/token, 21 tok/s), 1 chunk of 64 tokens | CUDA0 1730 ms
+glm slots: saved a 248671-token conversation (3.30 GB in 2.5 s); 3 kept, 8.40 GB
+
+fixed
+Selected consecutive diagnostics around the slot restore and edited turn; chunk-detail lines omitted.
+glm slots: took back a 248595-token conversation from disk (5.1 s); 69 new tokens to read
+glm prefill: 68 tokens in 1995.3 ms (29.34 ms/token, 34 tok/s), 1 chunk of 128 tokens | CUDA0 1983 ms
+glm slots: saved a 248663-token conversation (3.30 GB in 2.2 s); 2 kept, 5.10 GB
+glm checkpoints: 248595 of the prompt's 248672 tokens from a checkpoint
+glm prefill: 76 tokens in 2290.2 ms (30.13 ms/token, 33 tok/s), 1 chunk of 128 tokens | CUDA0 2288 ms
+glm slots: saved a 248671-token conversation (3.30 GB in 2.0 s); 3 kept, 8.40 GB
