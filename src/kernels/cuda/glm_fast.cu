@@ -5753,13 +5753,13 @@ void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
 
 namespace {
 // The take-two kernels' shapes, by label (glm_attn_bench prints the same labels):
-//   dsa_score2  [r|s][l|x][1|2]b<n>       the query in registers or LDS, the butterfly across the lanes or through the
+//   dsa_score2  [r|s][l|x][1|2]b<2|4|8|16> the query in registers or LDS, the butterfly across the lanes or through the
 //                                          shuffles, pools a warp at a time, blocks a multiprocessor (rl2b4, sx1b8, ...)
 //   mla_split2  h<16|32|64>[l|x][v|e][c|o] heads a block, lanes or shuffles, 16-byte or element staging, the one-pass
 //                                          merge or the original one (h64lvc, h16xeo, ...)
 // The engine takes them from STRATA_GLM_DSA_SCORE / STRATA_GLM_MLA_ATTN2 (unset or 0: the original kernels, which stay
 // the default; a value that is no label stops the process - a typo must never run the originals under a variant's
-// name); the bench sets them through hip_expert_bench.
+// name); the bench sets them through hip_expert_bench.  The labels are exactly the ones glm_attn_bench --sweep checks.
 struct DsaScore2 {
     bool on = false, qr = false, lanes = false;
     int p = 1, bpc = 4;
@@ -5780,7 +5780,7 @@ bool parse_dsa2(const char* v, DsaScore2& t) {
         if (l[i] < '0' || l[i] > '9' || n > 1000) return false;
         n = n * 10 + (l[i] - '0');
     }
-    if (n < 1 || n > 64) return false;
+    if (n != 2 && n != 4 && n != 8 && n != 16) return false;
     t.on = true;
     t.qr = l[0] == 'r';
     t.lanes = l[1] == 'l';
