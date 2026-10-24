@@ -13393,6 +13393,19 @@ struct Model::Impl {
         return G.mem[0];
     }
     std::atomic<bool> eg_abort{false};   // (a device's run failed: the Engram waits end)
+    // DS4_YOCO_TP=1: the skip on the flow too for one tensor-parallel group that holds every trunk layer, the cut
+    // anywhere in a chunk as on one GPU.  Each member computes the yoco layer's compressed KV and index keys over the
+    // chunk's rows itself (its own copy: no member hands them to another within the group), every all-reduce is one
+    // (chunk, layer)'s and runs on every member alike, and the skip leaves out the same (chunk, layer)s and the same
+    // cut chunk's rows on each - so the members' all-reduces stay paired, and the flow plans nothing for a skipped
+    // (chunk, layer) (flow_next, fl_rows) as on one GPU.  Off: a group on the flow never skips, as before
+    static bool yoco_tp() {
+        static const bool on = [] {
+            const char* e = ds4_env("DS4_YOCO_TP");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        return on;
+    }
     // every trunk layer on one GPU: the cut anywhere in a chunk (Run::cut_r); else at a chunk's start (the sources'
     // rows and the hand-offs between groups go chunk by chunk)
     bool yoco_one_gpu() const {
@@ -13407,6 +13420,15 @@ struct Model::Impl {
             if (L[(size_t) il].nm != 1 || (il >= yl && L[(size_t) il].dev != L[(size_t) yl].dev)) return false;
         return true;
     }
+    // one tensor-parallel group that holds every trunk layer, under DS4_YOCO_TP (yoco_tp): the skip on the flow too
+    bool yoco_tp_group() const {
+        if (!yoco_tp() || L[0].nm < 2) return false;
+        for (int il = 0; il < g.nl; ++il) {
+            const Layer& l = L[(size_t) il];
+            if (l.nm != L[0].nm || l.grp != L[0].grp || l.dev != L[0].dev) return false;
+        }
+        return true;
+    }
     int yoco_layer() const {
         if (yoco_mode() == 0 || chunk <= 0 || g.nl < 2 || (int) g.ratios.size() < g.nl) return -1;
         int yl = -1;
@@ -13414,8 +13436,9 @@ struct Model::Impl {
             if (g.ratios[(size_t) il] == 1) yl = il;
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
         const bool one = yoco_one_gpu(), suffix = !one && yoco_suffix_gpu(yl);
+        const bool tp = !one && !suffix && yoco_tp_group();   // (DS4_YOCO_TP: the flow too)
         for (const auto& c : chunks)
-            if (!one && !suffix && c != nullptr && c->flow) return -1;
+            if (!one && !suffix && !tp && c != nullptr && c->flow) return -1;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
@@ -13445,8 +13468,9 @@ struct Model::Impl {
         // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
         // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
         // skip.  On several GPUs the rows before the cut and the rows from it on are chunked apart (the cut a chunk's
-        // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, as on one
-        // GPU.  DS4_YOCO=1 (0: off); not with every row's logits (tests)
+        // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, or one
+        // tensor-parallel group under DS4_YOCO_TP (yoco_tp_group), as on one GPU.  DS4_YOCO=1 (0: off); not with every
+        // row's logits (tests)
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
         // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
         //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
@@ -13455,7 +13479,15 @@ struct Model::Impl {
                          : keep_env > 0 ? std::max(keep_env, g.win)
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
         const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
-        const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl));
+        const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl) || yoco_tp_group());
+        if (a > 0 && yoco_tp_group()) {   // (DS4_YOCO_TP: once)
+            static bool said = false;
+            if (!said)
+                std::fprintf(stderr, "ds4: a long prompt's skip on the tensor-parallel group of %d (lead CUDA%d): "
+                                     "layers %d-%d (DS4_YOCO_TP)\n",
+                             L[0].nm, devs[(size_t) L[0].dev].id, yl, g.nl - 1);
+            said = true;
+        }
         Run run;
         int per = 0;   // (the widest chunk)
         auto part = [&](int a0, int a1) {   // rows [a0, a1) in equal chunks of at most `chunk`
