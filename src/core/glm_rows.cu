@@ -561,7 +561,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
             sc.n_pools[n_sc++] = pool_done;
         } else if (pool_done > 0 && !all) {
             gf::dsa_score(rows(S->iq, (int64_t) g.idx_heads * g.idx_key, i), pooled,
-                          rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, score, s);
+                          rows(S->iw, g.idx_heads, i), g.idx_key, g.idx_heads, pool_done, score, s, true);   // (a decode row)
         }
         const int top_pools = std::min(g.top_pools_max(), pool_done);
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
@@ -588,7 +588,7 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
         gf::mla(rows(S->q, qd, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
                 g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i), s,
-                lat_q8_);
+                lat_q8_, nullptr, true);   // (a decode row: the token path's kernels)
     }
     if (attn) {
         if (n_sc > 0) gf::dsa_score_rows(sc, n_sc, g.idx_key, g.idx_heads, s);
