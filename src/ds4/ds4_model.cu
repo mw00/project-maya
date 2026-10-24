@@ -5795,22 +5795,27 @@ struct Model::Impl {
     // every window ring (the DSpark blocks' included), the compressors' partial groups and each KV source's compressed
     // KV and index keys up to it (rows 0 .. pos / ratio, the groups its position completed; one the prompt has not
     // completed yet lives in the compressor's partial group).  A tensor parallel group's members hold the same state,
-    // so one member's ring is saved and written back into all of them.  Text only: a conversation that holds pictures
-    // is not a slot (the Engram history's rows are the tokens' again, no -1 among them).
-    static constexpr uint64_t kSlotMagic = 0x31544f4c53345344ull;   // "DS4SLOT1" (little endian)
+    // so one member's ring is saved and written back into all of them.  Pictures: a slot keeps each picture's mark
+    // (where its span starts, its pixels' fingerprint, its span's length), not the pixels and not the rows - the rows'
+    // work is in the KV, and a prompt reads a span's rows only while it feeds the span itself.  A slot is taken back
+    // only for a prompt whose pictures are the same at the same places (the caller compares the marks against its
+    // prompt; the marks travel with the slot so it can).
+    static constexpr uint64_t kSlotMagic = 0x32544f4c53345344ull;   // "DS4SLOT2" (little endian)
 
     int64_t src_rows(const Src& s) const { return pos / std::max(1, s.ratio); }
 
-    // the slot's bytes: the header, the tokens, every layer's ring and partial group, every source's rows, the end
-    size_t slot_bytes() const {
+    // the slot's bytes: the header, the tokens, the pictures' marks, every layer's ring and partial group, every
+    // source's rows, the end
+    size_t slot_bytes(size_t n_pics) const {
         size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
+        n += 8 + n_pics * 24;   // (a picture: start, hash, len)
         for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
         for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
         n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
         return n + 8;
     }
 
-    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, const std::vector<PicMark>& pics) {
         if (slot_held) {
             err = "it is already set aside";
             return 0;
@@ -5823,12 +5828,17 @@ struct Model::Impl {
             err = "the state's tokens do not match its position";
             return 0;
         }
-        if (!imgs.empty()) {
-            err = "it holds pictures";
-            return 0;
+        for (size_t i = 0; i < pics.size(); ++i) {   // (the caller's marks: its state's pictures, in prompt order)
+            const PicMark& k = pics[i];
+            if (k.start < 0 || k.len == 0 || k.start + (int64_t) k.len > pos ||
+                (i > 0 && k.start <= pics[i - 1].start)) {
+                err = "a picture's mark (span " + std::to_string(k.start) + " + " + std::to_string(k.len) +
+                      ") is not in the state, or the marks are out of order";
+                return 0;
+            }
         }
         const std::string id = slot_identity();
-        out.assign(slot_bytes(), 0);
+        out.assign(slot_bytes(pics.size()), 0);
         uint8_t* p = out.data();
         size_t off = 0;
         const auto put = [&](const void* s, size_t b) {
@@ -5841,6 +5851,15 @@ struct Model::Impl {
         put(id.data(), (size_t) il);
         put(&n, 8);
         put(toks.data(), (size_t) n * 4);
+        {
+            const uint64_t np = pics.size();
+            put(&np, 8);
+            for (const PicMark& k : pics) {
+                put(&k.start, 8);
+                put(&k.hash, 8);
+                put(&k.len, 8);
+            }
+        }
         for (Dev& d : devs) {   // (the devices' work ends before their state is read)
             cudaSetDevice(d.id);
             cudaStreamSynchronize(d.st);
@@ -5915,7 +5934,7 @@ struct Model::Impl {
         return (uint64_t) off;
     }
 
-    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err, std::vector<PicMark>* pics) {
         size_t off = 0;
         bool wrote = false, ok = false;
         // a load that stops after some of another conversation's state went into the layers leaves a state no
@@ -5963,6 +5982,37 @@ struct Model::Impl {
         std::vector<int32_t> toks_in((size_t) n);
         std::memcpy(toks_in.data(), data + off, (size_t) n * 4);
         off += (size_t) n * 4;
+        std::vector<PicMark> marks;
+        {
+            uint64_t np = 0;
+            if (!room(8)) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&np, data + off, 8);
+            off += 8;
+            if (np > 4096 || !room((size_t) np * 24)) {
+                err = "the slot's pictures are damaged";
+                return false;
+            }
+            if (np > 0 && pics == nullptr) {   // (a caller that cannot check the pictures must not serve the state)
+                err = "the slot holds pictures";
+                return false;
+            }
+            marks.resize((size_t) np);
+            for (uint64_t k = 0; k < np; ++k) {
+                PicMark& m = marks[(size_t) k];
+                std::memcpy(&m.start, data + off, 8);
+                std::memcpy(&m.hash, data + off + 8, 8);
+                std::memcpy(&m.len, data + off + 16, 8);
+                off += 24;
+                if (m.start < 0 || m.len == 0 || m.start + (int64_t) m.len > n_pos ||
+                    (k > 0 && m.start <= marks[(size_t) k - 1].start)) {
+                    err = "the slot's pictures are damaged";
+                    return false;
+                }
+            }
+        }
         for (Dev& d : devs) {   // (their work ends before the state is written over)
             cudaSetDevice(d.id);
             cudaStreamSynchronize(d.st);
@@ -6110,7 +6160,12 @@ struct Model::Impl {
         toks.swap(toks_in);
         ctoks.resize((size_t) pos);
         for (size_t i = 0; i < (size_t) pos; ++i)
-            ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
+            // (a picture's token: no Engram rows, its look-back stops at it - as ctok() says it while the span is fed)
+            ctoks[i] = img_tok >= 0 && toks[i] == img_tok
+                           ? -1
+                           : (toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0);
+        imgs.clear();   // (the slot holds no rows: a span the prompt feeds again is encoded again)
+        if (pics != nullptr) *pics = std::move(marks);
         for (int k = 0; k < 3; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
         slot_held = false;
@@ -12165,9 +12220,11 @@ bool Model::restore(int64_t limit) { return p_->restore(limit); }
 void Model::pin() { p_->pin(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
-uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
-bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {
-    return p_->slot_load(data, bytes, n_pos, err);
+uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err, const std::vector<PicMark>& pics) {
+    return p_->slot_save(out, err, pics);
+}
+bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err, std::vector<PicMark>* pics) {
+    return p_->slot_load(data, bytes, n_pos, err, pics);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::save_profile() const { p_->save_profile(); }

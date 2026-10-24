@@ -58,7 +58,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import maya_names  # noqa: E402  (tools/) a model config's settings under the names the engine reads
 
 CORPUS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tokenizer_corpus.txt")
-META_MAGIC = 0x324154454d345344   # "DS4META2" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
+META_MAGIC = 0x334154454d345344   # "DS4META3" (little endian): a slot's .meta, as src/ds4/ds4_main.cpp writes it
 DS4_ENV = ("DS4_", "STRATA_DS4_")   # (the engine's own names: it aliases MAYA_DS4_* to STRATA_DS4_* at start)
 
 
@@ -77,8 +77,8 @@ def text_tokens(tok, salt: str, n: int) -> list[int]:
 
 def meta_tokens(path: str) -> list[int] | None:
     """A slot's .meta, as the engine writes it: the magic, its identity (length, bytes), the state's size, its tokens,
-    its checkpoints (count, positions - DS4META2, #394), the magic again.  False: not one of the engine's .meta files,
-    or damaged."""
+    its checkpoints (count, positions), its pictures (count, (start, hash) each - DS4META3), the magic again.  None:
+    not one of the engine's .meta files, or damaged."""
     try:
         with open(path, "rb") as f:
             data = f.read()
@@ -88,7 +88,10 @@ def meta_tokens(path: str) -> list[int] | None:
         size, nt = struct.unpack_from("<QQ", data, 16 + il)
         toks = list(struct.unpack_from("<%di" % nt, data, 32 + il))
         (nc,) = struct.unpack_from("<Q", data, 32 + il + 4 * nt)
-        (m1,) = struct.unpack_from("<Q", data, 40 + il + 4 * nt + 8 * nc)
+        off = 40 + il + 4 * nt + 8 * nc
+        (np,) = struct.unpack_from("<Q", data, off)
+        off += 8 + 16 * np
+        (m1,) = struct.unpack_from("<Q", data, off)
     except (OSError, struct.error):
         return None
     return toks if m1 == META_MAGIC else None
