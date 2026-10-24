@@ -5745,7 +5745,11 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
 }
 
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8) {
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8,
+         const MlaMarks* marks) {
+    const auto mark = [marks](const char* nm) {
+        if (marks) marks->fn(marks->ctx, nm);
+    };
     // scratch for q_abs and ctx (n_head * kv_lora each), per device
     static float* scratch[16] = {};
     int dev = 0;
@@ -5755,6 +5759,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
                                              (block_q8_1*) out_q8_1, lat_q8);
         launch_check("mla");
+        mark("mla");
         return;
     }
     if (scratch[dev] == nullptr && cudaMalloc(&scratch[dev], (size_t) 2 * n_head * kv_lora * sizeof(float)) != cudaSuccess) {
@@ -5764,16 +5769,20 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
                                              (block_q8_1*) out_q8_1, lat_q8);
         launch_check("mla");
+        mark("mla");
         return;
     }
     float* q_abs = scratch[dev];
     float* ctx = q_abs + (size_t) n_head * kv_lora;
     headwise_gemv_kernel<<<n_head * kv_lora / 32, 256, 0, s>>>(wk_b, q, kv_lora, qk_nope, q_abs, nullptr);
+    mark("mla_q_abs");
     // the split attention: chunks of MLA_CHUNK cells, partials per (chunk, head), then the merge (mla_split_attend)
     mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8);
+    mark("mla_attend");
     headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
                                                               (block_q8_1*) out_q8_1);
     launch_check("mla2");
+    mark("mla_out");
 }
 
 void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s) {
