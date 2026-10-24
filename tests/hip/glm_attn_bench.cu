@@ -323,6 +323,9 @@ void mla_timing(MlaInputs& M, const std::vector<std::string>& shapes, const std:
 }  // namespace
 
 int main(int argc, char** argv) {
+    // whole lines: the engine's records go to stderr (unbuffered) while these rows go to stdout - block-buffered into a
+    // file, a record landed inside a row (0400Z raw line 354); line-buffered, each row is one write between them
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     bool parity_only = false, sweep = false;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
