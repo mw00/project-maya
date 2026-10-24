@@ -168,6 +168,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+  # --ablate's direction loader: what it takes and what it refuses (synthetic GGUFs: no model, no GPU)
+  add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
+  target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
+  add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------

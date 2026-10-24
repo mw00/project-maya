@@ -49,9 +49,9 @@ struct Options {
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
-    // abliteration (ds4_ablate.hpp): a refusal direction projected out of every residual write - the rank-1 LoRA's
-    // arithmetic, applied at run time.  The direction file (a llama-cvector-generator GGUF, or a lora_from_dir.py
-    // adapter GGUF), which of its directions (1-based; 0: the adapter's own), the scale (0: the adapter's own, else 1)
+    // abliteration (ds4_ablate.hpp): a refusal direction projected out of every residual write.  The direction file
+    // (a llama-cvector-generator GGUF, or a rank-1 abliteration adapter GGUF), which of its directions (1-based; 0: the
+    // adapter's own), the scale (0: the adapter's own, else 1)
     std::string ablate;
     int ablate_layer = 0;
     float ablate_scale = 0.0f;

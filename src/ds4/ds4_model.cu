@@ -2365,7 +2365,7 @@ struct Model::Impl {
         // abliteration: the direction read once, a copy on every device (projected out at each hc_post: ablate())
         if (!o.ablate.empty() && !o.vision_only) {
             abl_scale = o.ablate_scale;
-            if (!ablate::load_direction(o.ablate, o.ablate_layer, abl_scale, abl_dir, abl_what, err)) return false;
+            if (!ablate::load_direction(o.ablate, o.ablate_layer, g.nl, abl_scale, abl_dir, abl_what, err)) return false;
             if ((int) abl_dir.size() != g.dim) {
                 err = o.ablate + ": direction of " + std::to_string(abl_dir.size()) + " values, the model's dim is " +
                       std::to_string(g.dim);

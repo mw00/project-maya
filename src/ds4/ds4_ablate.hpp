@@ -1,246 +1,187 @@
-// src/ds4/ds4_ablate.hpp - abliteration on Maya: a refusal direction r (unit, [dim]) that the layers project out of
+// src/ds4/ds4_ablate.hpp - direction projection on Maya: a unit direction r ([dim]) that the layers project out of
 // every residual write - y <- y - scale * r (r . y) on the attention output and on the MoE output, right before each
-// hc_post (ds4_model.cu's ablate()).  That is exactly what the rank-1 LoRA lora_from_dir.py builds for llama.cpp does
-// (B A = -r (s r^T W) on attn_output_b, ffn_down_shexp and ffn_down_exps, which together ARE those two writes), so the
-// two engines run the same abliterated model; here nothing of the pack changes and nothing is re-quantized.
+// hc_post (ds4_model.cu's ablate()).  The use it is written for is abliteration, r a refusal direction.
 //
 // The direction comes from one of two GGUF files:
 //   a llama-cvector-generator file   direction.<layer> F32 [dim]            (--ablate FILE --ablate-layer N)
-//   a lora_from_dir.py adapter       blk.0.attn_output_b.weight.lora_b = -r (--ablate FILE; layer / scale from its
-//                                    abliterate.* metadata)
-// Only what those two need of GGUF is read here: the header, the key / values, the tensor infos, one F32 tensor.
+//   a rank-1 abliteration adapter    general.type "adapter"; blk.N.{attn_output_b,ffn_down_shexp,ffn_down_exps}.weight
+//                                    .lora_a = s r^T W, .lora_b = -r on every block (--ablate FILE; layer / scale from
+//                                    its abliterate.direction_layer / abliterate.scale)
+// Of an adapter only r and the scale are taken, not its A halves (s r^T W of the weights it was computed against).
+// On those weights the two agree: (W - s r r^T W) x = y - s r (r . y) for each writer, and the MoE output is the sum
+// of the shared and routed writers.  On other weights they differ by s r r^T (W - W_source) x, so this is the model
+// llama.cpp --lora runs only on the adapter's own source weights.  An adapter that does not carry the same -r on all
+// three writers of every block (one made for some blocks only, or without the routed experts, or any other LoRA) is
+// refused: projecting every write is not what it does.
 #pragma once
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
-#include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "strata/artifact/gguf_reader.hpp"
+
 namespace strata::ds4::ablate {
 
-struct TensorInfo {
-    std::vector<uint64_t> ne;
-    uint32_t type = 0;   // GGML type (0 = F32)
-    uint64_t off = 0;    // from the data section's start
-};
-
-struct Gguf {
-    std::map<std::string, std::string> str_kv;
-    std::map<std::string, double> num_kv;   // scalars (bool as 0 / 1)
-    std::map<std::string, TensorInfo> tensors;
-    uint64_t data = 0;   // the data section's start in the file
-};
-
-class Reader {
-public:
-    explicit Reader(const std::string& path) : f_(path, std::ios::binary) {}
-    bool ok() const { return f_.good(); }
-    template <class T>
-    bool rd(T& v) {
-        f_.read(reinterpret_cast<char*>(&v), sizeof(T));
-        return f_.good();
+// the integer `key` of g, in [lo, hi]; absent -> true with `out` untouched
+inline bool meta_int(const GgufFile& g, const std::string& path, const char* key, long long lo, long long hi,
+                     long long& out, std::string& err) {
+    const MetaValue* v = g.get(key);
+    if (v == nullptr) return true;
+    long long x = 0;
+    switch (v->type) {
+        case MetaType::U8: case MetaType::U16: case MetaType::U32: case MetaType::U64:
+            if (v->u > (uint64_t) hi) { err = path + ": " + key + " out of range"; return false; }
+            x = (long long) v->u;
+            break;
+        case MetaType::I8: case MetaType::I16: case MetaType::I32: case MetaType::I64:
+            x = (long long) (int64_t) v->u;   // (the reader sign-extends into u)
+            break;
+        default:
+            err = path + ": " + key + " is not an integer";
+            return false;
     }
-    bool rd_str(std::string& s) {
-        uint64_t n = 0;
-        if (!rd(n) || n > (1ull << 30)) return false;
-        s.resize((size_t) n);
-        if (n > 0) f_.read(&s[0], (std::streamsize) n);
-        return f_.good();
-    }
-    uint64_t tell() { return (uint64_t) f_.tellg(); }
-    bool seek(uint64_t p) {
-        f_.seekg((std::streamoff) p, std::ios::beg);
-        return f_.good();
-    }
-    bool rd_f32(float* out, size_t n) {
-        f_.read(reinterpret_cast<char*>(out), (std::streamsize) (n * 4));
-        return f_.good();
-    }
-
-private:
-    std::ifstream f_;
-};
-
-// a scalar value of GGUF type t (0 u8, 1 i8, 2 u16, 3 i16, 4 u32, 5 i32, 6 f32, 7 bool, 10 u64, 11 i64, 12 f64)
-inline bool rd_scalar(Reader& r, uint32_t t, double& v) {
-    switch (t) {
-        case 0: { uint8_t x; if (!r.rd(x)) return false; v = x; return true; }
-        case 1: { int8_t x; if (!r.rd(x)) return false; v = x; return true; }
-        case 2: { uint16_t x; if (!r.rd(x)) return false; v = x; return true; }
-        case 3: { int16_t x; if (!r.rd(x)) return false; v = x; return true; }
-        case 4: { uint32_t x; if (!r.rd(x)) return false; v = x; return true; }
-        case 5: { int32_t x; if (!r.rd(x)) return false; v = x; return true; }
-        case 6: { float x; if (!r.rd(x)) return false; v = x; return true; }
-        case 7: { uint8_t x; if (!r.rd(x)) return false; v = x != 0; return true; }
-        case 10: { uint64_t x; if (!r.rd(x)) return false; v = (double) x; return true; }
-        case 11: { int64_t x; if (!r.rd(x)) return false; v = (double) x; return true; }
-        case 12: { double x; if (!r.rd(x)) return false; v = x; return true; }
-        default: return false;
-    }
+    if (x < lo || x > hi) { err = path + ": " + key + " out of range"; return false; }
+    out = x;
+    return true;
 }
 
-inline bool read_gguf(const std::string& path, Gguf& g, std::string& err) {
-    Reader r(path);
-    if (!r.ok()) {
-        err = path + ": cannot open";
+// the positive finite number `key` of g; absent -> true with `out` untouched
+inline bool meta_pos(const GgufFile& g, const std::string& path, const char* key, double& out, std::string& err) {
+    const MetaValue* v = g.get(key);
+    if (v == nullptr) return true;
+    const double x = v->is_num() ? v->num() : NAN;
+    if (!std::isfinite(x) || !(x > 0.0) || x > 1e6) {
+        err = path + ": " + key + " is not a positive finite number";
         return false;
     }
-    uint32_t magic = 0, version = 0;
-    uint64_t n_tensors = 0, n_kv = 0;
-    if (!r.rd(magic) || magic != 0x46554747u) {   // "GGUF"
-        err = path + ": not a GGUF file";
+    out = x;
+    return true;
+}
+
+// the F32 tensor `name` (its first `want` values; 0: all, up to 2^20), every byte of it inside the file
+inline bool read_f32(const GgufFile& g, const std::string& path, const std::string& name, uint64_t want,
+                     std::vector<float>& out, std::string& err) {
+    const strata::TensorInfo* t = g.find(name);
+    if (t == nullptr) { err = path + ": no " + name; return false; }
+    if (t->type != 0) { err = path + ": " + name + " is not F32"; return false; }
+    const uint64_t cap = want != 0 ? (1ull << 32) : (1ull << 20);   // (a routed lora_b is [1, dim, n_exp]: 2M at 384)
+    uint64_t n = 1;
+    for (uint64_t d : t->shape) {   // bound each dim and the running product first
+        if (d == 0 || d > cap || n > cap / d) { err = path + ": " + name + " has an odd size"; return false; }
+        n *= d;
+    }
+    if (want != 0) {
+        if (n < want) { err = path + ": " + name + " has an odd size"; return false; }
+        n = want;
+    }
+    const uint64_t size = g.file_size(), data = g.data_start(), bytes = n * 4;
+    if (data > size || t->offset > size - data || bytes > size - data - t->offset) {   // (no sum that can wrap)
+        err = path + ": " + name + " lies outside the file";
         return false;
     }
-    if (!r.rd(version) || version < 2 || version > 3 || !r.rd(n_tensors) || !r.rd(n_kv)) {
-        err = path + ": GGUF header not understood";
-        return false;
-    }
-    for (uint64_t i = 0; i < n_kv; ++i) {
-        std::string key;
-        uint32_t t = 0;
-        if (!r.rd_str(key) || !r.rd(t)) {
-            err = path + ": key/value " + std::to_string(i) + " truncated";
-            return false;
-        }
-        if (t == 8) {
-            std::string s;
-            if (!r.rd_str(s)) { err = path + ": " + key + " truncated"; return false; }
-            g.str_kv[key] = s;
-        } else if (t == 9) {   // array: element type, count, values (read past them; the direction files need none)
-            uint32_t et = 0;
-            uint64_t n = 0;
-            if (!r.rd(et) || !r.rd(n)) { err = path + ": " + key + " truncated"; return false; }
-            for (uint64_t k = 0; k < n; ++k) {
-                if (et == 8) {
-                    std::string s;
-                    if (!r.rd_str(s)) { err = path + ": " + key + " truncated"; return false; }
-                } else {
-                    double v;
-                    if (!rd_scalar(r, et, v)) { err = path + ": " + key + ": array type " + std::to_string(et); return false; }
-                }
-            }
-        } else {
-            double v = 0.0;
-            if (!rd_scalar(r, t, v)) { err = path + ": " + key + ": value type " + std::to_string(t); return false; }
-            g.num_kv[key] = v;
-        }
-    }
-    for (uint64_t i = 0; i < n_tensors; ++i) {
-        std::string name;
-        uint32_t nd = 0;
-        TensorInfo ti;
-        if (!r.rd_str(name) || !r.rd(nd) || nd > 4) { err = path + ": tensor info " + std::to_string(i) + " truncated"; return false; }
-        ti.ne.resize(nd);
-        for (uint32_t d = 0; d < nd; ++d)
-            if (!r.rd(ti.ne[d])) { err = path + ": tensor " + name + " truncated"; return false; }
-        if (!r.rd(ti.type) || !r.rd(ti.off)) { err = path + ": tensor " + name + " truncated"; return false; }
-        g.tensors[name] = ti;
-    }
-    uint64_t align = 32;
-    auto a = g.num_kv.find("general.alignment");
-    if (a != g.num_kv.end() && a->second >= 1) align = (uint64_t) a->second;
-    const uint64_t pos = r.tell();
-    g.data = (pos + align - 1) / align * align;
+    out.resize((size_t) n);
+    std::memcpy(out.data(), g.tensor_data(*t), (size_t) bytes);
     return true;
 }
 
 /// The direction of `path` (see the file comment): r unit length; `scale` 0 takes the file's (an adapter's
-/// abliterate.scale, else 1); `layer` 0 takes an adapter's own, or a one-layer control vector's.  `what` describes the
-/// pick for the start-up log.
-inline bool load_direction(const std::string& path, int layer, float& scale, std::vector<float>& r, std::string& what,
-                           std::string& err) {
-    Gguf g;
-    if (!read_gguf(path, g, err)) return false;
-    Reader rd(path);
-    std::string tname;
-    bool adapter = false;
-    auto type = g.str_kv.find("general.type");
-    if (type != g.str_kv.end() && type->second == "adapter") {
-        adapter = true;
-        tname = "blk.0.attn_output_b.weight.lora_b";
-        auto t = g.tensors.find(tname);
-        if (t == g.tensors.end()) {
-            err = path + ": an adapter without " + tname + " (not a lora_from_dir.py abliteration adapter)";
-            return false;
-        }
-        if (t->second.ne.size() != 2 || t->second.ne[0] != 1) {
-            err = path + ": " + tname + " is not rank 1";
-            return false;
-        }
-        auto l = g.num_kv.find("abliterate.direction_layer");
-        if (l != g.num_kv.end()) layer = (int) l->second;
-        if (scale == 0.0f) {
-            auto s = g.num_kv.find("abliterate.scale");
-            scale = s != g.num_kv.end() ? (float) s->second : 1.0f;
-        }
-    } else {
-        auto lc = g.num_kv.find("controlvector.layer_count");
-        const int n_layers = lc != g.num_kv.end() ? (int) lc->second : 0;
-        if (layer <= 0) {
-            if (n_layers == 1) layer = 1;
-            else {
-                err = path + ": a control vector with " + std::to_string(n_layers) +
-                      " directions: say which with --ablate-layer N (1-based)";
+/// abliterate.scale x adapter.lora.alpha, else 1); `layer` 0 takes an adapter's own, or a one-layer control vector's.
+/// An adapter must cover the model's `n_layer` blocks exactly.  `what` describes the pick for the start-up log.
+inline bool load_direction(const std::string& path, int layer, int n_layer, float& scale, std::vector<float>& r,
+                           std::string& what, std::string& err) {
+    try {
+        GgufFile g(path);
+        const MetaValue* type = g.get("general.type");
+        const bool adapter = type != nullptr && type->s == "adapter";
+        if (adapter) {
+            const std::string b0 = "blk.0.attn_output_b.weight.lora_b";
+            if (!read_f32(g, path, b0, 0, r, err)) {
+                err += " (not a rank-1 abliteration adapter)";
                 return false;
             }
+            const strata::TensorInfo* t0 = g.find(b0);
+            if (t0->shape.size() != 2 || t0->shape[0] != 1) { err = path + ": " + b0 + " is not rank 1"; return false; }
+            // the same -r on every writer of every block, or this is not a whole-model projection
+            std::vector<float> b;
+            for (int il = 0; il < n_layer; ++il)
+                for (const char* w : {"attn_output_b", "ffn_down_shexp", "ffn_down_exps"}) {
+                    const std::string base = "blk." + std::to_string(il) + "." + w + ".weight";
+                    if (g.find(base + ".lora_a") == nullptr || g.find(base + ".lora_b") == nullptr) {
+                        err = path + ": no " + base + " pair - only an adapter on every writer of every block is a "
+                              "projection of every write";
+                        return false;
+                    }
+                    if (!read_f32(g, path, base + ".lora_b", r.size(), b, err)) return false;
+                    if (std::memcmp(b.data(), r.data(), r.size() * sizeof(float)) != 0) {
+                        err = path + ": " + base + ".lora_b is not " + b0 + " - not a one-direction adapter";
+                        return false;
+                    }
+                }
+            if (g.find("blk." + std::to_string(n_layer) + ".attn_output_b.weight.lora_b") != nullptr) {
+                err = path + ": an adapter for more than this model's " + std::to_string(n_layer) + " blocks";
+                return false;
+            }
+            long long dl = layer;
+            if (!meta_int(g, path, "abliterate.direction_layer", 1, 4096, dl, err)) return false;
+            layer = (int) dl;
+            if (scale == 0.0f) {
+                double s = 1.0, alpha = 1.0;   // llama.cpp applies B A * alpha / rank, and the rank is 1
+                if (!meta_pos(g, path, "abliterate.scale", s, err) || !meta_pos(g, path, "adapter.lora.alpha", alpha, err))
+                    return false;
+                scale = (float) (s * alpha);
+            }
+        } else {
+            long long n_dirs = 0;
+            if (!meta_int(g, path, "controlvector.layer_count", 0, 4096, n_dirs, err)) return false;
+            if (layer <= 0) {
+                if (n_dirs == 1) layer = 1;
+                else {
+                    err = path + ": a control vector with " + std::to_string(n_dirs) +
+                          " directions: say which with --ablate-layer N (1-based)";
+                    return false;
+                }
+            }
+            const std::string tname = "direction." + std::to_string(layer);
+            if (g.find(tname) == nullptr) {
+                err = path + ": no " + tname + (n_dirs > 0 ? " (layers 1.." + std::to_string(n_dirs) + ")" : "");
+                return false;
+            }
+            if (!read_f32(g, path, tname, 0, r, err)) return false;
+            if (scale == 0.0f) scale = 1.0f;
         }
-        tname = "direction." + std::to_string(layer);
-        if (g.tensors.find(tname) == g.tensors.end()) {
-            err = path + ": no " + tname + (n_layers > 0 ? " (layers 1.." + std::to_string(n_layers) + ")" : "");
+        if (!std::isfinite(scale) || !(scale > 0.0f)) {   // must not reach the GPU
+            err = path + ": ablation scale is not a positive finite number";
             return false;
         }
-        if (scale == 0.0f) scale = 1.0f;
-    }
-    if (!std::isfinite(scale) || scale <= 0.0f) {   // a junk --ablate-scale (atof -> 0/nan/inf) must not reach the GPU
-        err = path + ": ablation scale is not a positive finite number";
-        return false;
-    }
-    const TensorInfo& ti = g.tensors[tname];
-    if (ti.type != 0) {
-        err = path + ": " + tname + " is not F32";
-        return false;
-    }
-    uint64_t n = 1;
-    for (uint64_t d : ti.ne) {
-        if (d == 0 || d > (1u << 20) || n > (1u << 20) / d) {   // bound each dim and the running product first
-            err = path + ": " + tname + " has an odd size";
+        double ss = 0.0;
+        for (float v : r) ss += (double) v * v;
+        if (!(ss > 0.0) || !std::isfinite(ss)) {
+            err = path + ": the direction is zero or not finite";
             return false;
         }
-        n *= d;
-    }
-    if (n == 0 || n > (1u << 20)) {
-        err = path + ": " + tname + " has an odd size";
+        const double inv = 1.0 / std::sqrt(ss);
+        if (!std::isfinite(inv)) {   // a tiny-but-finite norm would overflow a float reciprocal; normalize in double
+            err = path + ": the direction cannot be normalized (norm too small)";
+            return false;
+        }
+        // an adapter's lora_b is -r; the projection r (r . y) does not care about the sign, r is kept as the direction
+        for (float& v : r) v = (float) (adapter ? -(double) v * inv : (double) v * inv);
+        char buf[200];
+        if (adapter)
+            std::snprintf(buf, sizeof buf, "adapter (direction layer %d), scale %.3g", layer, scale);
+        else
+            std::snprintf(buf, sizeof buf, "direction.%d, scale %.3g", layer, scale);
+        what = "ds4: abliteration: " + path + " " + buf + ", projected out of every layer's attention and MoE writes";
+        return true;
+    } catch (const std::exception& e) {   // GgufFile refuses a malformed header by throwing
+        err = path + ": " + e.what();
         return false;
     }
-    r.assign((size_t) n, 0.0f);
-    if (!rd.seek(g.data + ti.off) || !rd.rd_f32(r.data(), (size_t) n)) {
-        err = path + ": " + tname + ": read failed";
-        return false;
-    }
-    double ss = 0.0;
-    for (float v : r) ss += (double) v * v;
-    if (!(ss > 0.0) || !std::isfinite(ss)) {
-        err = path + ": " + tname + " is zero or not finite";
-        return false;
-    }
-    const double inv = 1.0 / std::sqrt(ss);
-    if (!std::isfinite(inv)) {   // a tiny-but-finite norm would overflow a float reciprocal; normalize in double
-        err = path + ": " + tname + " cannot be normalized (norm too small)";
-        return false;
-    }
-    // an adapter's lora_b is -r; the projection r (r . y) does not care about the sign, r is kept as the direction
-    for (float& v : r) v = (float) (adapter ? -(double) v * inv : (double) v * inv);
-    char buf[200];
-    if (adapter)
-        std::snprintf(buf, sizeof buf, "adapter (direction layer %d), scale %.3g", layer, scale);
-    else
-        std::snprintf(buf, sizeof buf, "%s, scale %.3g", tname.c_str(), scale);
-    what = "ds4: abliteration: " + path + " " + buf + ", projected out of every layer's attention and MoE writes";
-    return true;
 }
 
 }  // namespace strata::ds4::ablate

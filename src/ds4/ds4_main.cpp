@@ -1139,14 +1139,15 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
-        // a number that really is one: atof("abc") is 0, and 0 means "the file's own scale" - a typo must not
-        // quietly become a default-strength run
-        auto num = [&](const char* what) -> double {
+        // a number that really is one, in [lo, hi]: atof("abc") is 0, and 0 means "the file's own scale" - a typo (or
+        // a 1e-50 that rounds to float 0) must not quietly become a default-strength run
+        auto num = [&](const char* what, double lo, double hi, bool whole) -> double {
             const std::string v = val(what);
             char* end = nullptr;
             const double d = std::strtod(v.c_str(), &end);
-            if (v.empty() || end == v.c_str() || *end != '\0' || !std::isfinite(d)) {
-                std::fprintf(stderr, "%s needs a number, not \"%s\"\n", what, v.c_str());
+            if (v.empty() || end == v.c_str() || *end != '\0' || !(d >= lo && d <= hi) || (whole && std::trunc(d) != d)) {
+                std::fprintf(stderr, "%s needs a %s from %g to %g, not \"%s\"\n", what, whole ? "whole number" : "number",
+                             lo, hi, v.c_str());
                 std::exit(2);
             }
             return d;
@@ -1190,15 +1191,8 @@ int main(int argc, char** argv) {
         else if (a == "--dump-logits") dump = val("--dump-logits");
         else if (a == "--ppl") ppl = val("--ppl");
         else if (a == "--ablate") o.ablate = val("--ablate");
-        else if (a == "--ablate-layer") {
-            const double d = num("--ablate-layer");
-            if (d < 0.0 || d != (double) (long long) d) {
-                std::fprintf(stderr, "--ablate-layer needs a whole number >= 0\n");
-                return 2;
-            }
-            o.ablate_layer = (int) d;
-        }
-        else if (a == "--ablate-scale") o.ablate_scale = (float) num("--ablate-scale");
+        else if (a == "--ablate-layer") o.ablate_layer = (int) num("--ablate-layer", 1, 4096, true);
+        else if (a == "--ablate-scale") o.ablate_scale = (float) num("--ablate-scale", 1e-6, 1e6, false);
         else if (a == "--serve") serve_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {

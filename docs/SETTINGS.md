@@ -523,6 +523,26 @@ against the per-job one on every GPU at load (any difference fails the start).
 | `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: projecting a direction out (`--ablate`)
+
+`--ablate FILE` removes one direction r from every residual write: each layer's attention output and MoE output
+become y - s r (r . y) right before `hc_post`. The use it is written for is abliteration (r a refusal direction), and
+the pack is not changed. The direction comes from a `llama-cvector-generator` file (`direction.N`, pick N with
+`--ablate-layer`) or from a rank-1 abliteration LoRA GGUF (`lora_a` = s r^T W, `lora_b` = -r, the
+`abliterate.direction_layer` and `abliterate.scale` keys), whose direction, layer and scale it reads. An adapter is
+applied only as a projection: it must carry the same direction on all three writers of every block (`attn_output_b`,
+`ffn_down_shexp`, `ffn_down_exps`); one for some blocks only, without the routed experts, or for another depth is
+refused. Its A halves are not used; on the weights it was computed against the result is the
+adapter's, on other weights it is the exact projection rather than the adapter. Without `--ablate` nothing runs.
+Measured with drafting off, 4x RTX 3090, four restart pairs alternating the two: decode 1.5-3.8% slower (about 3%),
+no consistent prompt-speed difference.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `--ablate FILE` (the config's engine `args`) | off | a control vector or a whole-model abliteration adapter (GGUF) |
+| `--ablate-layer N` | the adapter's, or a one-direction file's | which `direction.N` of a control vector (1-4096) |
+| `--ablate-scale F` | the adapter's `abliterate.scale` (x `adapter.lora.alpha`), else 1 | s, 1e-6 to 1e6; 1 removes the component along r, above 1 over-projects |
+
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 
 `--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their
