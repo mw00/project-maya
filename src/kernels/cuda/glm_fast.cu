@@ -3561,6 +3561,51 @@ __device__ void topk_warp(float* sel, int E, int k, int* out) {
     __syncthreads();
 }
 
+// topk_warp's picks by rank instead of k rounds (STRATA_GLM_ROUTE_RANK, on by default; =0: topk_warp): thread e counts
+// the scores that beat its own - larger, or equal at a lower id - and the experts of rank < k write their id at their
+// rank, those of rank k .. k + n2 - 1 theirs in out2 (the near misses).  The same order as topk_warp's k rounds (the
+// largest first, ties to the lower id), every thread at once - topk_warp's one warp of serial rounds was 6.5 us of a
+// V100 route, this 2.3.  A warp's 32 ids [wb, wb + 32) are one span: a score at an id below it beats e when it is >=
+// e's, above it when it is >, and only the span's own 32 need the id compare.  For E % 32 == 0, E <= blockDim.x and
+// finite scores (a route with a non-finite one is refused - its picks unused; the slots no rank fills stay -1).  sel
+// is left as it was (topk_warp leaves its picks at -inf: nothing reads them)
+__device__ void topk_rank(const float* sel, int E, int k, int* out, int n2 = 0, int* out2 = nullptr) {
+    const int e = threadIdx.x, wb = e & ~31;
+    if (e < k) out[e] = -1;
+    if (e < n2) out2[e] = -1;
+    __syncthreads();
+    if (e < E) {
+        const float v = sel[e];
+        int r0 = 0, r1 = 0, r2 = 0, r3 = 0;
+        const float4* s4 = (const float4*) sel;
+#pragma unroll 4
+        for (int q = 0; q < wb / 4; ++q) {
+            const float4 o = s4[q];
+            r0 += o.x >= v;
+            r1 += o.y >= v;
+            r2 += o.z >= v;
+            r3 += o.w >= v;
+        }
+#pragma unroll
+        for (int j = wb; j < wb + 32; ++j) {
+            const float o = sel[j];
+            r0 += (o > v) | ((o == v) & (j < e));
+        }
+#pragma unroll 4
+        for (int q = (wb + 32) / 4; q < E / 4; ++q) {
+            const float4 o = s4[q];
+            r0 += o.x > v;
+            r1 += o.y > v;
+            r2 += o.z > v;
+            r3 += o.w > v;
+        }
+        const int r = r0 + r1 + r2 + r3;
+        if (r < k) out[r] = e;
+        else if (r - k < n2) out2[r - k] = e;
+    }
+    __syncthreads();
+}
+
 struct RouteArgs {
     const float* logits;
     const float* bias;
@@ -3603,6 +3648,7 @@ struct RouteArgs {
     int win_rows;               // win / win_n are a batched rows step's row and rows (STRATA_GLM_GROUP_EXPERTS)
     float affinity;             // STRATA_GLM_ROUTE_AFFINITY: added to a VRAM-resident expert's selection score (its
                                 // weight stays its own probability) - LOSSY, it changes which experts run (0: off)
+    int rank_sel;               // the selections by topk_rank (STRATA_GLM_ROUTE_RANK; the host checks E fits it)
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
@@ -3621,7 +3667,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         return;
     }
     const int E = a.n_expert;
-    __shared__ float s_p[512], s_sel[512];
+    __shared__ float s_p[512];
+    __shared__ __align__(16) float s_sel[512];   // (topk_rank reads it as float4)
     __shared__ int s_ids[8];
     __shared__ float s_w[8];
     __shared__ unsigned int s_mask, s_seq;
@@ -3641,15 +3688,17 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
     __shared__ float s_bv[32];
     __shared__ int s_bi[32];
     __syncthreads();
-    if (E <= 512) topk_warp(s_sel, E, a.k, s_ids);
+    // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
+    // topk_rank has them with the top k; else the top k are -inf in s_sel after the selection, so it simply goes on
+    // (s_sel is rewritten for the prediction below)
+    __shared__ int s_near[16];
+    if (a.rank_sel) topk_rank(s_sel, E, a.k, s_ids, a.near_n, s_near);
+    else if (E <= 512) topk_warp(s_sel, E, a.k, s_ids);
     else topk_argmax(s_sel, E, a.k, s_ids, s_bv, s_bi);
     if (tid == 0)
         for (int i = 0; i < a.k; ++i)
             if (s_ids[i] < 0 || s_ids[i] >= E) atomicMax(&bad, 1);
-    // the NEAR MISSES (STRATA_GLM_ROUTE_LOG only, cache studies): ranks k+1 .. k+near_n by the same selection score -
-    // the top k are -inf in s_sel now, so the selection simply goes on (s_sel is rewritten for the prediction below)
-    __shared__ int s_near[16];
-    if (a.near_n > 0) {
+    if (a.near_n > 0 && !a.rank_sel) {
         if (E <= 512) topk_warp(s_sel, E, a.near_n, s_near);
         else topk_argmax(s_sel, E, a.near_n, s_near, s_bv, s_bi);
     }
@@ -3664,7 +3713,8 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             if (!isfinite(a.pred_logits[e]) || !isfinite(s_sel[e])) atomicMax(&bad, 2);
         }
         __syncthreads();
-        if (E <= 512) topk_warp(s_sel, E, a.k, s_pred);
+        if (a.rank_sel) topk_rank(s_sel, E, a.k, s_pred);
+        else if (E <= 512) topk_warp(s_sel, E, a.k, s_pred);
         else topk_argmax(s_sel, E, a.k, s_pred, s_bv, s_bi);
         if (tid == 0)
             for (int i = 0; i < a.k; ++i)
@@ -5798,6 +5848,13 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
     a.affinity = affinity;
+    // STRATA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
+    // experts that one block's threads cover and at most 8 picks
+    static const bool rank_on = [] {
+        const char* v = getenv("STRATA_GLM_ROUTE_RANK");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    a.rank_sel = rank_on && n_expert % 32 == 0 && n_expert <= ROUTE_THREADS && k <= 8 ? 1 : 0;
     if (ahead_logits != nullptr && ahead_bias != nullptr && n_expert <= 512) {
         a.n_ahead = std::min(n_ahead, kAhead);
         for (int i = 0; i < a.n_ahead; ++i) a.ahead_bias[i] = ahead_bias[i];
