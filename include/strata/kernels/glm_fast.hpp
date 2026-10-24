@@ -185,7 +185,7 @@ struct DsaPrepArgs {
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 /// score[p] = sum_h relu(iq_h . pooled_p) * iw_h for the n_pools completed pools.
-/// token: the decode's token path (fast_dsa) - only it takes the take-two kernel STRATA_GLM_DSA_SCORE names (a
+/// token: a decode token (fast_dsa, a decode row) - only it takes the take-two kernel STRATA_GLM_DSA_SCORE names (a
 /// prompt's windows keep the original: their per-token calls run beside the expert copies; glm_attn_bench's override
 /// applies anywhere); the scores are the same bits either way.
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
