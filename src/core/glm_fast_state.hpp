@@ -841,7 +841,11 @@ struct Glm5Model::FastState {
     bool timing = false;
     bool ram_resident = false;   // STRATA_GLM_RAM_RESIDENT=1 / --glm-ram-resident: the RAM tier holds EVERY expert
                                  // VRAM does not, nothing ever drops to disk; the start fails if the tier is small
-    int ram_slack = 0;           // extra RAM-tier slots per MoE layer (STRATA_GLM_RAM_SLACK; default 16 resident)
+    // STRATA_GLM_RAM_INCLUSIVE=1 (implies RAM-resident): INCLUSIVE tiers - the RAM tier holds a copy of EVERY expert,
+    // VRAM is a cache over it. A promotion keeps the RAM slot; an eviction only forgets the VRAM copy (no D2H).
+    bool ram_inclusive = false;
+    uint64_t incl_evict = 0, incl_bg_down = 0;   // inclusive evictions (spare refills / background) - no copy
+    int ram_slack = 0;           // extra RAM-tier slots per MoE layer (STRATA_GLM_RAM_SLACK; default 16 resident, 0 inclusive)
     int read_chunks = 0;         // set_read_chunks: a disk read's pieces (0: STRATA_GLM_READ_CHUNKS, else 8)
     // ---- STRATA_GLM_PROF=1: a cudaEvent after every launch, the gaps summed per kernel name (debug only)
     bool prof_on = false;
