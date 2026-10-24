@@ -2,11 +2,14 @@
 //
 //   maya-mm3 --pack <model>/maya-mm3 --ids @prompt.txt [--gen N] [--dump-logits out.bin --last N]
 //            [--gpus 0,1,...] [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]
+//            [--profile FILE] [--profile-out FILE] [--no-pin-pool] [--no-fast-decode]
 //
 // --ids: comma- or whitespace-separated token ids, or @FILE holding them.  --gen: greedy tokens after the prompt
 // (their ids printed).  --dump-logits: the logits of the prompt's last --last positions (default 1), as
 //   "MM3L" int32 rows, int32 vocab, int32 n_ids, int32 ids[n_ids], int32 pos[rows], float logits[rows][vocab]
 // (tools/mm3/compare.py reads it beside tools/mm3/ref.py's dump).
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -60,8 +63,8 @@ int usage() {
 
 int main(int argc, char** argv) {
     mm3::Options o;
-    std::string ids_arg, dump;
-    int gen = 0, last = 1;
+    std::string ids_arg, dump, profile_out, batch;
+    int gen = 0, last = 1, ppl = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -82,11 +85,18 @@ int main(int argc, char** argv) {
         else if (a == "--staging") o.staging = std::atoi(val().c_str());
         else if (a == "--resident-cap") o.resident_cap = std::atoi(val().c_str());
         else if (a == "--reserve-gb") o.reserve_gb = std::atof(val().c_str());
+        else if (a == "--profile") o.profile = val();
+        else if (a == "--profile-out") profile_out = val();
+        else if (a == "--no-pin-pool") o.pin_pool = false;
+        else if (a == "--no-fast-decode") o.fast_decode = false;
+        else if (a == "--ppl") ppl = std::atoi(val().c_str());
+        else if (a == "--batch") batch = val();
+        else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
         else if (a == "--verbose") o.verbose = true;
         else return usage();
     }
-    if (o.pack.empty() || ids_arg.empty()) return usage();
-    std::vector<int> ids = parse_ids(ids_arg);
+    if (o.pack.empty() || (ids_arg.empty() && batch.empty())) return usage();
+    std::vector<int> ids = ids_arg.empty() ? std::vector<int>{0} : parse_ids(ids_arg);
     if (ids.empty()) {
         std::fprintf(stderr, "no token ids\n");
         return 2;
@@ -98,10 +108,70 @@ int main(int argc, char** argv) {
         return 1;
     }
     const auto& st = m.stats();
-    std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM\n", st.load_s, st.resident,
-                 st.experts);
+    std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st.load_s,
+                 st.resident, st.experts, st.pinned_gb);
     for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
+    if (!batch.empty()) {   // one prompt a line (ids), each from position 0: the expert profile's corpus
+        std::ifstream bf(batch);
+        int k = 0;
+        long tok = 0;
+        const double b0 = now();
+        for (std::string line; std::getline(bf, line);) {
+            std::vector<int> b = parse_ids(line);
+            if (b.empty()) continue;
+            if ((int) b.size() > m.max_ctx()) b.resize((size_t) m.max_ctx());
+            if (!m.forward(b.data(), (int) b.size(), 0, 0, nullptr, err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            tok += (long) b.size();
+            std::fprintf(stderr, "batch %d: %zu tokens\n", ++k, b.size());
+        }
+        std::fprintf(stderr, "batch: %d prompts, %ld tokens in %.1f s\n", k, tok, now() - b0);
+        if (!profile_out.empty()) {
+            if (!m.save_profile(profile_out, err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "wrote the expert profile %s (%ld routings)\n", profile_out.c_str(),
+                         m.stats().profiled);
+        }
+        if (ids_arg.empty()) return 0;
+    }
     const int n = (int) ids.size();
+    if (ppl > 0) {   // the next-token NLL of every position, by buckets of `ppl` positions
+        const int C = o.chunk;
+        std::vector<float> lg((size_t) C * m.vocab());
+        double sum = 0, bsum = 0;
+        int bn = 0, cnt = 0;
+        for (int a0 = 0; a0 < n - 1; a0 += C) {
+            const int T = std::min(C, n - a0);
+            if (!m.forward(ids.data() + a0, T, a0, T, lg.data(), err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            for (int t = 0; t < T && a0 + t + 1 < n; ++t) {
+                const float* r = lg.data() + (size_t) t * m.vocab();
+                double mx = r[0];
+                for (int i = 1; i < m.vocab(); ++i) mx = std::max(mx, (double) r[i]);
+                double se = 0;
+                for (int i = 0; i < m.vocab(); ++i) se += std::exp((double) r[i] - mx);
+                const double nll = mx + std::log(se) - r[ids[(size_t) a0 + t + 1]];
+                sum += nll;
+                bsum += nll;
+                ++cnt;
+                if (++bn == ppl) {
+                    std::printf("positions %6d-%6d: NLL %.4f  ppl %.3f\n", a0 + t + 1 - ppl, a0 + t, bsum / bn,
+                                std::exp(bsum / bn));
+                    bsum = 0;
+                    bn = 0;
+                }
+            }
+        }
+        if (bn) std::printf("positions %6d-%6d: NLL %.4f  ppl %.3f\n", n - 1 - bn, n - 2, bsum / bn, std::exp(bsum / bn));
+        std::printf("all %d positions: NLL %.4f  ppl %.3f\n", cnt, sum / cnt, std::exp(sum / cnt));
+        return 0;
+    }
     last = std::max(1, std::min(last, n));
     std::vector<float> logits((size_t) last * m.vocab());
     double t0 = now();
@@ -142,7 +212,7 @@ int main(int argc, char** argv) {
         std::vector<float> lg((size_t) m.vocab());
         std::string out;
         t0 = now();
-        int pos = n;
+        int pos = n, done = 0;
         for (int g = 0; g < gen; ++g) {
             std::printf("%d%s", next, g + 1 < gen ? " " : "\n");
             std::fflush(stdout);
@@ -154,11 +224,19 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
                 return 1;
             }
+            ++done;
             next = argmax(lg.data());
         }
         t1 = now();
-        std::fprintf(stderr, "decode: %d tokens in %.2f s (%.2f tok/s), %ld experts staged in all\n", gen, t1 - t0,
-                     gen / (t1 - t0), m.stats().staged);
+        std::fprintf(stderr, "decode: %d tokens in %.2f s (%.2f tok/s), %ld experts staged in all, %ld on the CPU\n",
+                     done, t1 - t0, done / (t1 - t0), m.stats().staged, m.stats().cpu_experts);
+    }
+    if (!profile_out.empty()) {
+        if (!m.save_profile(profile_out, err)) {
+            std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "wrote the expert profile %s (%ld routings)\n", profile_out.c_str(), m.stats().profiled);
     }
     return 0;
 }

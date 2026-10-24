@@ -498,12 +498,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
   endif()
 
-  # MiniMax-M3.1-Flash (EXL3, tools/mm3/pack.py): its own engine (src/mm3), with its own copy of the EXL3 kernels
-  # (swigluoai) - it links none of the other engines' libraries.  CUDA on Linux.
+  # MiniMax-M3.1-Flash (EXL3, tools/mm3/pack.py): its own engine (src/mm3), with its own copy of the EXL3 device kernels
+  # (swigluoai) - none of the other engines' code.  CUDA on Linux.
   if(STRATA_ENABLE_CUDA AND NOT WIN32)
-    add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_exl3.cu)
+    add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_exl3.cu
+                            src/mm3/mm3_cpu.cpp)
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3)
-    target_link_libraries(maya-mm3 PRIVATE ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
+    # (the CPU lane: the shared CPU EXL3 kernels, used as they are)
+    target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})
   endif()
 
   if(STRATA_ENABLE_HIP)

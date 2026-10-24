@@ -327,7 +327,7 @@ def layer(ref: Ref | None, g: Geo, i: int, w: dict, h: torch.Tensor, pos: torch.
 
 
 def forward(ref: Ref, ids: list[int], hs_at: torch.Tensor | None = None, blocks_at: list[int] | None = None,
-            log=print) -> tuple[torch.Tensor, list, list]:
+            log=print, n_layers: int | None = None) -> tuple[torch.Tensor, list, list]:
     """Logits at every position [T, vocab] (F32), the residual stream after each layer at positions hs_at, and the
     kept blocks [H, len(blocks_at), topk] of every layer."""
     g, dev = ref.g, ref.dev
@@ -337,7 +337,7 @@ def forward(ref: Ref, ids: list[int], hs_at: torch.Tensor | None = None, blocks_
     h = torch.from_numpy(rows.astype(np.int32) << 16).view(torch.float32).to(dev)    # BF16 -> F32, exact
     pos = torch.arange(T, device=dev)
     hs, blocks = [], []
-    for i in range(g.n_layers):
+    for i in range(g.n_layers if n_layers is None else n_layers):
         t0 = time.time()
         w = ref.layer_weights(i)
         kept: list = []
@@ -350,6 +350,8 @@ def forward(ref: Ref, ids: list[int], hs_at: torch.Tensor | None = None, blocks_
         del w
         torch.cuda.empty_cache()
         log(f"layer {i:2d} {time.time() - t0:5.1f}s  |h| {h.norm(dim=-1).mean().item():.1f}")
+    if n_layers is not None and n_layers < g.n_layers:
+        return torch.zeros(T, 1, device=dev), hs, blocks
     h = gemma_rms(h, ref.T(PFX + "norm.weight"), g.eps)
     head = ref.W(LM + "lm_head")
     logits = torch.cat([lin(h[a:a + 1024], head) for a in range(0, T, 1024)])
@@ -498,6 +500,7 @@ def main() -> int:
     ap.add_argument("--check-hf", type=int, help="layer N of the pack against transformers' layer")
     ap.add_argument("--T", type=int, default=2600, help="positions for --selftest / --check-hf (> 2048 is sparse)")
     ap.add_argument("--dev", default="cuda:0")
+    ap.add_argument("--layers", type=int, help="run only the first N layers (for --dump-blocks / the streams)")
     ap.add_argument("--emulate", action="store_true", help="maya-mm3's roundings: FP16 inputs to the EXL3 products, "
                     "BF16 KV and index caches, FP16 expert activations")
     ap.add_argument("--check-dev", help="the device --check-hf runs both forwards on (default --dev; cpu for MoE)")
@@ -520,7 +523,10 @@ def main() -> int:
         hs_at = torch.arange(T - last, T, device=a.dev)
         blocks_at = [int(x) for x in a.dump_blocks.split(",") if x] or None
         with torch.no_grad():
-            logits, hs, blocks = forward(ref, ids, hs_at if a.dump and not a.no_hs else None, blocks_at)
+            logits, hs, blocks = forward(ref, ids, hs_at if a.dump and not a.no_hs else None, blocks_at,
+                                         n_layers=a.layers)
+        if a.layers is not None and a.layers < ref.g.n_layers:
+            break
         nxt = int(logits[-1].argmax())
         print(f"T={T} next {nxt} top5 {logits[-1].topk(5).indices.tolist()}")
         if step < a.gen:

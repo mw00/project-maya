@@ -22,6 +22,10 @@ struct Options {
     int staging = 48;             // expert staging slots a GPU (each one expert's blob)
     double reserve_gb = 1.0;      // VRAM a GPU keeps free beyond the plan
     int resident_cap = -1;        // routed experts kept in VRAM a layer at most (-1: as many as fit)
+    std::string profile;          // an expert profile (uint32 [layers][experts] routings): the most used stay in VRAM
+    bool pin_pool = true;         // the experts not in VRAM assembled once in pinned host memory (a miss: one DMA)
+    bool fast_decode = true;      // one token: the decode GEMVs and the token's fused experts (else the prompt path)
+    int cpu_threads = 43;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged)
     bool verbose = false;
 };
 
@@ -29,6 +33,9 @@ struct Stats {
     double load_s = 0;
     long staged = 0;              // expert blobs copied into staging slots
     long resident = 0, experts = 0;
+    double pinned_gb = 0;         // the pinned pool of the experts not in VRAM
+    long profiled = 0;            // routings counted (save_profile writes them)
+    long cpu_experts = 0;         // routed experts the CPU lane computed
 };
 
 class Model {
@@ -49,6 +56,8 @@ public:
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
+    /// The routings counted so far (with the loaded profile's, if any) as a profile file.
+    bool save_profile(const std::string& path, std::string& err) const;
 
 private:
     struct Impl;
