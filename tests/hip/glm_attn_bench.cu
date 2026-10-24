@@ -135,9 +135,10 @@ bool reduce_parity(hipStream_t s) {
     check(hipStreamSynchronize(s), "reduce");
     const auto sa = host_copy(a, n), sb = host_copy(b, n), ma = host_copy(c, n), mb = host_copy(d, n);
     const Diff ds = compare(sa, sb), dm = compare(ma, mb);
-    const bool ok = ds.differ == 0 && dm.differ == 0;
-    std::printf("parity reduce warps=%d outputs=%d sum_differ=%zu max_differ=%zu %s\n", warps, n, ds.differ, dm.differ,
-                ok ? "PASS" : "FAIL");
+    // (finite inputs: a non-finite sum or max fails the row even where both butterflies agree on it)
+    const bool ok = ds.differ == 0 && dm.differ == 0 && ds.nonfinite == 0 && dm.nonfinite == 0;
+    std::printf("parity reduce warps=%d outputs=%d sum_differ=%zu max_differ=%zu nonfinite=%zu %s\n", warps, n, ds.differ,
+                dm.differ, ds.nonfinite + dm.nonfinite, ok ? "PASS" : "FAIL");
     for (float* p : {d_in, a, b, c, d}) check(hipFree(p), "free");
     return ok;
 }
