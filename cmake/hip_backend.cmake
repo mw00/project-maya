@@ -16,7 +16,8 @@ set(_strata_hip_community gfx1101 gfx1200)
 set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1034 gfx1150)   # gfx1103: Radeon 780M iGPU, opt-in, portable kernels (no WMMA)
 # gfx908 (AMD Instinct MI100, CDNA1) is wave64, not wave32: it runs through the hip_compat layer's logical-32-lane
 # half-wavefront warp mapping (see hip_compat/intrinsics.hpp). Experimental; validated on a 4x MI100 box.
-set(_strata_hip_wave64 gfx908)
+# gfx942 (AMD Instinct MI300X / MI325X, CDNA3) is wave64 too and takes the same path; experimental, run on one MI325X.
+set(_strata_hip_wave64 gfx908 gfx942)
 # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
 # spaces, which foreach(IN LISTS) would otherwise treat as one element.
 string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
@@ -55,6 +56,16 @@ endforeach()
 if(NOT STRATA_HIP_ARCH_LIST)
   message(FATAL_ERROR "Maya HIP: CMAKE_HIP_ARCHITECTURES is empty")
 endif()
+# gfx942 has packed FP32 instructions (v_pk_fma_f32, v_pk_mul_f32): with clang's default -ffp-contract=fast the SLP
+# vectorizer pairs a multi-activation GEMV's columns and fuses their multiply-adds differently from the one-activation
+# kernel, so the columns stop being its bit-for-bit copies (tests/glm_mv_nt_test.cu). Contracting only within a source
+# expression keeps the fusion the source's own on every kernel, packed or not.
+set(STRATA_HIP_FP_CONTRACT_ON OFF)
+foreach(_a IN LISTS STRATA_HIP_ARCH_LIST)
+  if(_a STREQUAL "gfx942")
+    set(STRATA_HIP_FP_CONTRACT_ON ON)
+  endif()
+endforeach()
 # Normalize the actual compiler list as well as the validation list.
 set(CMAKE_HIP_ARCHITECTURES "${_strata_hip_norm}" CACHE STRING "Maya HIP target architecture(s)" FORCE)
 # The compiled architectures reach the runtime device check (src/core/device.cu) as "gfx1100,gfx1201": a binary
@@ -104,6 +115,9 @@ target_include_directories(strata_hip_runtime BEFORE INTERFACE
 target_compile_definitions(strata_hip_runtime INTERFACE STRATA_USE_HIP=1 "${STRATA_HAS_WMMA_DEF}" "STRATA_HIP_ARCHS=\"${STRATA_HIP_ARCHS}\""
   $<$<BOOL:${STRATA_HIP_WAVE64}>:STRATA_HIP_WAVE64=1>)
 target_link_libraries(strata_hip_runtime INTERFACE hip::host)
+if(STRATA_HIP_FP_CONTRACT_ON)
+  target_compile_options(strata_hip_runtime INTERFACE "$<$<COMPILE_LANGUAGE:HIP>:-ffp-contract=on>")
+endif()
 foreach(_language IN ITEMS CXX HIP)
   target_compile_options(strata_hip_runtime INTERFACE
     "$<$<COMPILE_LANGUAGE:${_language}>:-include>"
