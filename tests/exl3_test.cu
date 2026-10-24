@@ -4,6 +4,7 @@
 // the CPU lane's part and the shared expert, and the full reconstruction.
 //
 //   exl3_test                     run everything, exit 0 when every case is within tolerance
+//   exl3_test --prefill-only      grouped experts only; environment selects WMMA/FMA and tile width
 //   exl3_test --exllamav3 <dir>   the decoders against exllamav3 itself: tools/exl3_exllamav3_fixture.py's random
 //                                 tiles (data/exl3-exllamav3) - the same states and W' bit for bit
 //   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
@@ -485,11 +486,11 @@ void test_gemm_rows(int k, int n, int k2, int cb, int rows) {   // (every GPU: b
 }
 
 // the prompt path's expert set: 3 experts (rows 37, 0, 70) through set_gate_up and set_down against the reference
-void test_set(int k2, int cb, int kd = 0) {
+void test_set(int k2, int cb, int kd = 0, int row0 = 0, int tail = 70) {
     if (kd <= 0) kd = k2;   // (every GPU: before sm_80 the portable kernels)
     const int E = 512, F = 256, T = 64;
     const float limit = 1.5f;
-    const int counts[3] = {37, 0, 70};
+    const int counts[3] = {37, 0, tail};
     // the set's blobs back to back at a fixed stride, each [gate | up | down], a part [trellis | suh | svh]
     HostMat parts[3][3];
     ex::ExpertLayout lay;
@@ -517,28 +518,29 @@ void test_set(int k2, int cb, int kd = 0) {
         }
     std::vector<float> x = rand_x(T * E);
     // the sorted rows: expert e's rows are tokens (e * 7 + j) % T
-    std::vector<int> bounds = {0}, row_tok;
+    std::vector<int> bounds = {row0}, row_tok;
     for (int e = 0; e < 3; ++e) {
         for (int j = 0; j < counts[e]; ++j) row_tok.push_back((e * 7 + j) % T);
-        bounds.push_back((int) row_tok.size());
+        bounds.push_back(row0 + (int) row_tok.size());
     }
     const int rows = (int) row_tok.size();
     uint8_t* d_blob = dev_copy(blobs);
     float* d_x = dev_copy(x);
     int* d_bounds = dev_copy(bounds);
     int* d_rows = dev_copy(row_tok);
-    uint16_t* d_h = nullptr;
-    float* d_out = nullptr;
-    CK(cudaMalloc(&d_h, (size_t) rows * F * 2));
-    CK(cudaMalloc(&d_out, (size_t) rows * E * 4));
+    constexpr int guard = 64;
+    uint16_t* h_base = dev_copy(std::vector<uint16_t>((size_t) rows * F + 2 * guard, 0x5a5a));
+    float* out_base = dev_copy(std::vector<float>((size_t) rows * E + 2 * guard, 12345.0f));
+    uint16_t* d_h = h_base + guard;
+    float* d_out = out_base + guard;
     ex::SetArgs sa;
     sa.wbase = d_blob;
     sa.stride = stride;
     sa.lay = lay;
     sa.n_exp = 3;
     sa.bounds = d_bounds;
-    sa.row0 = 0;
-    sa.max_rows = 70;
+    sa.row0 = row0;
+    sa.max_rows = std::max(37, tail);
     sa.n_embd = E;
     sa.n_ff = F;
     sa.limit = limit;
@@ -564,8 +566,17 @@ void test_set(int k2, int cb, int kd = 0) {
                          ref.data() + (size_t) r * E);
         }
     }
-    close(("set K" + kname3(k2, kd) + " cb" + std::to_string(cb) + " (3 experts, 107 rows)").c_str(),
+    close(("set K" + kname3(k2, kd) + " cb" + std::to_string(cb) + " (3 experts, " + std::to_string(rows) + " rows, row0=" + std::to_string(row0) + ")").c_str(),
           host_copy(d_out, ref.size()), ref, 3e-3);
+    const auto hg = host_copy(h_base, (size_t) rows * F + 2 * guard);
+    const auto yg = host_copy(out_base, (size_t) rows * E + 2 * guard);
+    bool guards_ok = true;
+    for (int i = 0; i < guard; ++i)
+        guards_ok &= hg[i] == 0x5a5a && hg[guard + (size_t) rows * F + i] == 0x5a5a &&
+                     yg[i] == 12345.0f && yg[guard + (size_t) rows * E + i] == 12345.0f;
+    if (!guards_ok) { std::puts("set output guards FAIL"); ++g_fail; }
+    cudaFree(d_blob); cudaFree(d_x); cudaFree(d_bounds); cudaFree(d_rows);
+    cudaFree(h_base); cudaFree(out_base);
 }
 
 // a mixed-precision layer: 3 experts each at its own K for gate / up / down, each in its own allocation
@@ -1659,6 +1670,17 @@ int main(int argc, char** argv) {
     CK(cudaGetDevice(&dev));
     CK(cudaGetDeviceProperties(&p, dev));
     std::printf("exl3_test on %s (%.1f GB)\n", p.name, (double) p.totalGlobalMem / 1e9);
+    if (argc == 2 && std::string(argv[1]) == "--prefill-only") {
+        for (int k2 = 2; k2 <= 16; k2 += 2)
+            for (int cb = 0; cb <= 2; ++cb) test_set(k2, cb);
+        for (int k2 : {3, 5, 7}) test_set(k2, 2);
+        test_set(7, 2, 10); test_set(5, 2, 8);
+        for (int tail : {1, 15, 16, 17, 31, 32, 33}) test_set(6, 2, 8, 19, tail);
+        for (int cb : {0, 1, 2}) test_mixed(cb);
+        std::printf("prefill-only: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok",
+                    g_fail, ex::launch_errors());
+        return g_fail || ex::launch_errors() ? 1 : 0;
+    }
     std::string fx_dir, expect_dir;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1667,7 +1689,7 @@ int main(int argc, char** argv) {
         } else if (a == "--expect" && i + 1 < argc) {
             expect_dir = argv[++i];
         } else {
-            std::fprintf(stderr, "usage: exl3_test [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
+            std::fprintf(stderr, "usage: exl3_test [--prefill-only] [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
             return 2;
         }
     }

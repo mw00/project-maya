@@ -1477,12 +1477,13 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(SetArgs a, KMix mx, c
     }
 }
 
-// ---------------------------------------------------------------- the prompt path on RDNA 3's matrix cores
+// ---------------------------------------------------------------- the prompt path on RDNA matrix cores
 // gfx11's v_wmma_f32_16x16x16_f16: hip_set_kernel's work with NR (16 or 32) routed rows a block - each weight tile
 // decoded once for all of them - and the products on the matrix cores.  A warp's decoded tile goes through LDS into
 // A's layout (lane m and m + 16: output m's 16 inputs); each 16 activations of the slice are a B (lane n and n + 16:
 // activation n's 16 inputs); D's element i is output 2i + lane / 16 of the tile for activation lane % 16.  The host
-// takes it on gfx11 only (wmma_now; EXL3_WMMA_ROWS 16 or 32, by default 16); the decode and verify kernels keep
+// uses this layout on gfx11; the opt-in gfx12 implementation follows below. Both use EXL3_WMMA_ROWS 16 or 32
+// (by default 16). The decode and verify kernels keep
 // block_gemv (their bits are the token path's).
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
 template <int K2, int NR>
@@ -1499,12 +1500,98 @@ typedef float exl3_f8 __attribute__((ext_vector_type(8)));
 typedef uint32_t exl3_u8 __attribute__((ext_vector_type(8)));
 #endif
 
+// RDNA4's WMMA has eight FP16 inputs per lane and a different accumulator layout.
+// Keep compressed weight words in registers; decode only the tile being consumed.
+// Padded activation rows retain 8-byte alignment for two exact 64-bit LDS loads.
+#if defined(STRATA_USE_HIP) && defined(__GFX12__)
+#define EXL3_WMMA_RDNA4 1
+typedef _Float16 rdna4_h8 __attribute__((ext_vector_type(8)));
+typedef float rdna4_f8 __attribute__((ext_vector_type(8)));
+constexpr int kRdna4Stride = kCols + 4;
+template <int NR> struct Rdna4Smem {
+    __half xb[NR * kRdna4Stride];
+    float out[NR * kCols];
+};
+__device__ __forceinline__ rdna4_h8 rdna4_load_operand(const __half* p, bool valid) {
+    if (!valid) return rdna4_h8{};
+    const uint2 lo = *reinterpret_cast<const uint2*>(p);
+    const uint2 hi = *reinterpret_cast<const uint2*>(p + 4);
+    return __builtin_bit_cast(rdna4_h8, make_uint4(lo.x, lo.y, hi.x, hi.y));
+}
+template <int K2>
+__device__ __forceinline__ uint32_t rdna4_tile_word(const uint32_t (&w)[Words<K2>::R], int index) {
+    index %= Words<K2>::W;
+    const uint32_t lo = __shfl_sync(0xffffffffu, w[0], index & 31);
+    if constexpr (Words<K2>::R > 1) {
+        const uint32_t hi = __shfl_sync(0xffffffffu, w[1], index & 31);
+        return index < 32 ? lo : hi;
+    }
+    return lo;
+}
+template <int K2, int cb, int Rows, class Input>
+__device__ void rdna4_block_wmma(const uint32_t* tr, int ld, int tc0, int k0, int k1, const Input (&x)[Rows / kWarps],
+                              const uint16_t* suh, int nc, Rdna4Smem<Rows>& sm) {
+    constexpr int W = Words<K2>::W, R = Words<K2>::R;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, col = lane & 15;
+    const int kh = (lane >> 4) * 8;
+    const size_t stride = (size_t) ld * W;
+    rdna4_f8 acc[Rows / 16] = {};
+    for (int q = k0; q < k1; q += kCols) {
+#pragma unroll
+        for (int j = 0; j < Rows / kWarps; ++j) {
+            const int row = warp + j * kWarps;
+            if (row < nc) {
+                float v[4], scales[4];
+                chunk_load(x[j], suh, q, lane, v, scales);
+                chunk_store(v, scales, lane, sm.xb + row * kRdna4Stride);
+            }
+        }
+        __syncthreads();
+        uint32_t words[8][R];
+        load_tiles<K2>(tr + ((size_t) (q / 16) * ld + tc0 + warp) * W, stride, lane, words);
+#pragma unroll
+        for (int step = 0; step < 8; ++step) {
+            rdna4_h8 av, bv;
+#pragma unroll
+            for (int pair = 0; pair < 4; ++pair) {
+                const int row = kh + pair * 2;
+                const int p = (col & 7) * 32 + (col & 8) / 2 + (row & 6) * 4 + (row & 8) / 4;
+                // K2 = twice the bitrate, including half-integer codes.
+                const int b0 = (p + 257) * K2 / 2 - 16, b2 = (p + 258) * K2 / 2;
+                const int i0 = b0 >> 5, i2 = (b2 - 1) >> 5, shift = (i2 + 1) * 32 - b2;
+                const uint32_t lo = rdna4_tile_word<K2>(words[step], i0), hi = rdna4_tile_word<K2>(words[step], i2);
+                const uint32_t bits = h2u(decode2h<cb>(fsh(hi, lo, shift + (K2 + 1) / 2) & 0xffffu, fsh(hi, lo, shift) & 0xffffu));
+                bv[2 * pair] = __builtin_bit_cast(_Float16, (uint16_t) bits);
+                bv[2 * pair + 1] = __builtin_bit_cast(_Float16, (uint16_t) (bits >> 16));
+            }
+#pragma unroll
+            for (int m = 0; m < Rows / 16; ++m) {
+                av = rdna4_load_operand(sm.xb + (m * 16 + col) * kRdna4Stride + step * 16 + kh, m * 16 + col < nc);
+                acc[m] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(av, bv, acc[m]);
+            }
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = 8 * (lane >> 4) + i;
+#pragma unroll
+        for (int m = 0; m < Rows / 16; ++m)
+            if (m * 16 + row < nc) sm.out[(m * 16 + row) * kCols + warp * 16 + col] = acc[m][i];
+    }
+    __syncthreads();
+}
+
+#endif
+
 // block_gemv for nc <= NR activations (warp w loads activations w, w + 8, ..: in[j] the one at w + 8 j):
 // sm.out[n * kCols + o]
-template <int K2, int cb, int KS, int NR, class Input>
+template <int K2, int cb, int KS, int NR, class Input, class Smem>
 __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&in)[NR / 8],
-                             const uint16_t* __restrict__ suh, int nc, WmmaSmem<KS, NR>& sm) {
-#if defined(EXL3_WMMA)
+                             const uint16_t* __restrict__ suh, int nc, Smem& sm) {
+#if defined(EXL3_WMMA_RDNA4)
+    rdna4_block_wmma<K2, cb, NR>(tr, ld, tc0, k0, k1, in, suh, nc, sm);
+#elif defined(EXL3_WMMA)
     static_assert(K2 <= KS, "the shared memory's stage holds K2 words a lane");
     constexpr int W = Words<K2>::W, R = Words<K2>::R, NJ = NR / 8, NB = NR / 16;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3, m = lane & 15;
@@ -1613,7 +1700,11 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
 template <int K2, int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
                                                          uint16_t* h, int ldh, float* y, int ldy) {
+#if defined(EXL3_WMMA_RDNA4)
+    __shared__ __align__(16) Rdna4Smem<NR> sm;
+#else
     __shared__ __align__(16) WmmaSmem<K2, NR> sm;
+#endif
     __shared__ float gate[NR * kCols];
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
@@ -1635,7 +1726,11 @@ template <int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix mx, const float* x, int ldx,
                                                              const int* idx, uint16_t* h, int ldh, float* y,
                                                              int ldy) {
+#if defined(EXL3_WMMA_RDNA4)
+    __shared__ __align__(16) Rdna4Smem<NR> sm;
+#else
     __shared__ __align__(16) WmmaSmem<8, NR> sm;
+#endif
     __shared__ float gate[NR * kCols];
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
@@ -2243,7 +2338,8 @@ bool mma_now() {
 #endif
 }
 
-// the prompt path on the matrix cores (wmma_set_kernel): an RDNA 3 GPU (gfx11), unless EXL3_WMMA=0 - cached a device
+// Matrix prompt path: gfx11 by default, gfx12 only with EXL3_WMMA_GFX12=1.
+// EXL3_WMMA=0 disables both. Decode and verify retain their existing arithmetic.
 static bool wmma_now() {
 #if defined(STRATA_USE_HIP)
     static const bool off = std::getenv("EXL3_WMMA") != nullptr && std::atoi(std::getenv("EXL3_WMMA")) == 0;
@@ -2253,8 +2349,11 @@ static bool wmma_now() {
     if (off || dev < 0 || dev >= 64) return false;
     if (known[dev] == 0) {
         cudaDeviceProp p{};
-        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0
-                         ? 2 : 1;
+        const char* v = std::getenv("EXL3_WMMA_GFX12");
+        const bool rdna4 = v != nullptr && std::atoi(v) != 0;
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                     (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ||
+                      (rdna4 && std::strncmp(p.gcnArchName, "gfx12", 5) == 0)) ? 2 : 1;
     }
     return known[dev] == 2;
 #else
