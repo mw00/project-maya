@@ -41,6 +41,21 @@
 
 namespace strata::ds4::gguf {
 
+bool gguf_row_to_bf16(int type, const void* packed, int k, uint16_t* out) {
+#if defined(STRATA_NATIVE_EXPERTS)
+    if (type < 0 || type >= GGML_TYPE_COUNT || k <= 0 || packed == nullptr || out == nullptr) return false;
+    const auto* traits = ggml_get_type_traits((ggml_type) type);
+    if (traits->blck_size <= 0 || traits->to_float == nullptr || k % traits->blck_size != 0) return false;
+    std::vector<float> values((size_t) k);
+    traits->to_float(packed, values.data(), k);
+    for (int i = 0; i < k; ++i) out[i] = ggml_fp32_to_bf16(values[(size_t) i]).bits;
+    return true;
+#else
+    (void) type; (void) packed; (void) k; (void) out;
+    return false;
+#endif
+}
+
 #if defined(STRATA_NATIVE_EXPERTS)
 namespace kc = strata::kernels::cpu;
 namespace {

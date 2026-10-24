@@ -1,5 +1,5 @@
 // src/ds4/ds4_iq.cuh - a GGUF's routed experts in ggml's low-bit block types on the device for maya-ds4: the i-quants
-// IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and the K-quants Q2_K, Q3_K, Q4_K (256 values a block, ggml's
+// IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and Q2_K, Q3_K, Q4_K, Q5_K (256 values a block, ggml's
 // layouts: ggml-common.h, llama.cpp MIT).  ds4_gguf.cu sends an expert layer here when its experts are not MXFP4
 // (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role r's ggml type; K[r] == kTypeMXFP4: ds4_gguf.cu's own kernels).
 //
@@ -19,7 +19,7 @@
 namespace strata::ds4::gguf::iq {
 
 // ggml type ids
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
               kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
 
 /// Whether the device kernels take this ggml type.
@@ -86,6 +86,8 @@ bool set_down(const SetArgs& a, cudaStream_t s);
 /// apart - as FP16 rows (ldd apart), the values the tensor-core tiles multiply (their loader's, rounded to FP16 the same
 /// way), for the caller's GEMM: the tiles decode an expert's weights again for every 64 of its rows.
 bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, cudaStream_t s);
+/// Dense low-bit matrix rows, with ld source bytes per row, converted to BF16 or F16.
+bool dequant_rows(int type, const void* w, size_t ld, int k, int n, uint16_t* dst, bool bf16, cudaStream_t s);
 /// dst[r] = x[idx[r]] for r < n (FP16 rows of k values; x ldx apart, dst k apart)
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s);
 /// h[r][c] = FP16 of the tiles' clamped SwiGLU of gu[r][c] (gate) and gu[r][ff + c] (up), F32 rows ld apart

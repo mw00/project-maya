@@ -42,6 +42,12 @@ int main() {
     check(two.ok[0] && !std::memcmp(a, z, 32) && scale == data[1025], "split FP8 RAM read differs");
     EgBatch mx; q.off = 256; q.n = 33; q.n2 = 0; q.mx8 = true; mx.reads.push_back(q); ram.submit(mx); ram.wait(mx);
     check(mx.ok[0] && scale == data[256] && !std::memcmp(z, data.data() + 257, 32), "MXFP8 decode differs");
+    // IQ4_NL is read as packed bytes into the existing padded row, without split FP8 scales.
+    EgBatch iq4; uint8_t iq4_row[96] = {}; q.mx8 = false; q.off = 320; q.n = 72; q.dst = iq4_row;
+    iq4.reads.push_back(q); ram.submit(iq4); ram.wait(iq4);
+    check(iq4.ok[0] && !std::memcmp(iq4_row, data.data() + 320, 72) && iq4_row[72] == 0,
+          "IQ4_NL packed RAM row or padding differs");
+    q.dst = z;
     // Recreate the path: a disk fallback would succeed here and must still be rejected.
     { std::ofstream f(name, std::ios::binary); f.write((char*) data.data(), data.size()); }
     EgBatch missing; q.mx8 = false; q.off = 2048; q.n = 32; missing.reads.push_back(q);

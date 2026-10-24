@@ -2170,9 +2170,17 @@ __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restric
 
 // ---------------------------------------------------------------- engram
 __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const uint8_t* __restrict__ scales, int hd,
-                                      float* __restrict__ out, bool q6k) {
+                                      float* __restrict__ out, EngramFormat format) {
     const int r = blockIdx.x;
-    if (q6k) {   // (ggml Q6_K superblocks at the row's start)
+    if (format == EngramFormat::Iq4Nl) {
+        for (int e = threadIdx.x; e < hd; e += blockDim.x) {
+            const uint8_t* block = rows + (size_t) r * hd + (size_t) (e / 32) * 18;
+            const float scale = __half2float(__ushort_as_half(*(const uint16_t*) block));
+            out[(size_t) r * hd + e] = engram_iq4nl_value(block, e % 32, scale);
+        }
+        return;
+    }
+    if (format == EngramFormat::Q6K) {   // (ggml Q6_K superblocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = q6k_value(rows + (size_t) r * hd + (size_t) (e / 256) * kQ6kBytes, e % 256);
         return;
@@ -2676,11 +2684,19 @@ __global__ void __launch_bounds__(kThreads) hc_mix_scale_kernel(const float* __r
 }
 
 __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_t per, int cols, int hd,
-                                          float* __restrict__ out, bool q6k) {
+                                          float* __restrict__ out, EngramFormat format) {
     const int r = blockIdx.x, t = r / cols, c = r - t * cols;
     const uint8_t* rows = src + (size_t) t * per + (size_t) c * hd;
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
-    if (q6k) {   // (ggml Q6_K superblocks at the row's start)
+    if (format == EngramFormat::Iq4Nl) {
+        for (int e = threadIdx.x; e < hd; e += blockDim.x) {
+            const uint8_t* block = rows + (size_t) (e / 32) * 18;
+            const float scale = __half2float(__ushort_as_half(*(const uint16_t*) block));
+            out[(size_t) r * hd + e] = engram_iq4nl_value(block, e % 32, scale);
+        }
+        return;
+    }
+    if (format == EngramFormat::Q6K) {   // (ggml Q6_K superblocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
             out[(size_t) r * hd + e] = q6k_value(rows + (size_t) (e / 256) * kQ6kBytes, e % 256);
         return;
@@ -2817,8 +2833,9 @@ void hc_post_inplace(const float* y, float* h, const float* post, const float* c
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
 }
-void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, bool q6k) {
-    if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, q6k);
+void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s,
+                        EngramFormat format) {
+    if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, format);
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s) {
@@ -3426,8 +3443,9 @@ void confidence(const float* x, const uint16_t* E, const int* tok, const float* 
     confidence_kernel<<<T, 1024, 0, s>>>(x, E, tok, w, dim, R, out);
 }
 
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, bool q6k) {
-    engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out, q6k);
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s,
+                    EngramFormat format) {
+    engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out, format);
 }
 
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s) {

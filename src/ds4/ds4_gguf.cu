@@ -1436,6 +1436,12 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
 }
 
 void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+    if (m.fmt == kFmtGG) {
+        if (!iq::dequant_rows(m.gg_type, m.raw, row_stride(m), m.k, m.n, dst, bf16, s))
+            fail("rows: unsupported low-bit matrix or invalid row layout");
+        check("rows");
+        return;
+    }
     if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0) || m.raw == nullptr) {
         fail("rows: not a BF16 or Q8_0 matrix");
         return;

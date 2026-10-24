@@ -632,7 +632,8 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
     for (size_t o = 0; o < w.size(); o += bb) {
         const float d = 0.001f + 0.002f * std::fabs(frand());
         switch (type) {
-            case gg::iq::kQ4_K: put(o, d), put(o + 2, 0.5f * d); break;
+            case gg::iq::kQ4_K:
+            case gg::iq::kQ5_K: put(o, d), put(o + 2, 0.5f * d); break;
             case gg::iq::kQ2_K: put(o + 80, d), put(o + 82, 0.5f * d); break;
             case gg::iq::kQ3_K: put(o + 108, d); break;
             case gg::iq::kIQ1_M: {   // (d: an F16 in the top nibbles of the 4 scale words, bytes 48..55)
@@ -663,7 +664,8 @@ double q_dot(int type, const uint8_t* row, int k, const float* x) {
 }
 const char* tn(int t) { return gg::type_name(t); }
 const int kQTypes[] = {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS,
-                       gg::iq::kQ2_K,    gg::iq::kQ3_K, gg::iq::kQ4_K,    gg::iq::kIQ1_S, gg::iq::kIQ1_M};
+                       gg::iq::kQ2_K,    gg::iq::kQ3_K, gg::iq::kQ4_K,    gg::iq::kIQ1_S, gg::iq::kIQ1_M,
+                       gg::iq::kIQ2_XS, gg::iq::kQ5_K};
 
 // every low-bit type's decode against ggml's own dequantize_row_* on random blocks: the token / window / light
 // kernels' codes times their scales, and the prompt tiles' loader - each value equal to ggml's (a zero's sign aside)
@@ -1048,7 +1050,8 @@ const std::pair<int, int> kQPairs[] = {
     {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_S, gg::iq::kIQ3_S},  {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},
     {gg::iq::kIQ4_XS, gg::iq::kQ4_K},     {gg::iq::kQ2_K, gg::iq::kQ3_K},    {gg::iq::kQ4_K, gg::iq::kIQ4_XS},
     {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S},
-    {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},   {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS}};
+    {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},   {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS},
+    {gg::iq::kIQ2_XS, gg::iq::kIQ1_M},    {gg::iq::kIQ1_M, gg::iq::kIQ2_XS}, {gg::iq::kQ5_K, gg::iq::kQ5_K}};
 constexpr int kQPairIQ1 = 9;   // (the first IQ1 pair)
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read (only: the token experts of the first pair - the
@@ -2057,6 +2060,68 @@ void test_engram_q6k(cudaStream_t s) {
     cudaFree(d_rows), cudaFree(d_out);
 }
 
+// Both Engram entry points must honor IQ4_NL's compact blocks inside padded cached rows.
+void test_engram_iq4nl(cudaStream_t s) {
+    const int T = 3, cols = 4, n = T * cols, hd = 1280;
+    const size_t rb = (size_t) hd / 32 * 18, per = (size_t) cols * (hd + hd / 32);
+    std::vector<uint8_t> packed((size_t) n * rb);
+    for (auto& v : packed) v = (uint8_t) rng();
+    for (size_t b = 0; b < packed.size(); b += 18) {
+        const ggml_fp16_t scale = ggml_fp32_to_fp16(frand(0.01f));
+        std::memcpy(packed.data() + b, &scale, 2);
+    }
+    std::vector<float> want((size_t) n * hd);
+    ggml_get_type_traits(GGML_TYPE_IQ4_NL)->to_float(packed.data(), want.data(), (int64_t) n * hd);
+    std::vector<uint8_t> rows((size_t) n * hd, 0xa5), token_rows((size_t) T * per, 0xa5);
+    for (int r = 0; r < n; ++r) {
+        std::memcpy(rows.data() + (size_t) r * hd, packed.data() + (size_t) r * rb, rb);
+        std::memcpy(token_rows.data() + (size_t) (r / cols) * per + (size_t) (r % cols) * hd,
+                    packed.data() + (size_t) r * rb, rb);
+    }
+    uint8_t* d_rows = dev(rows);
+    uint8_t* d_token = dev(token_rows);
+    float* d_out = dev(std::vector<float>(want.size(), -1));
+    for (bool token : {false, true}) {
+        if (token)
+            strata::ds4::engram_dequant_tok(d_token, per, cols, T, hd, d_out, s, strata::ds4::EngramFormat::Iq4Nl);
+        else
+            strata::ds4::engram_dequant(d_rows, nullptr, n, hd, d_out, s, strata::ds4::EngramFormat::Iq4Nl);
+        CU(cudaStreamSynchronize(s));
+        const auto got = host(d_out, want.size());
+        const bool same = std::memcmp(got.data(), want.data(), want.size() * sizeof(float)) == 0;
+        if (!same) ++g_fail;
+        std::printf("Engram IQ4_NL %s rows = ggml: %s\n", token ? "token" : "window", same ? "ok" : "FAIL");
+    }
+    cudaFree(d_rows), cudaFree(d_token), cudaFree(d_out);
+}
+
+void test_dense_lowbit_rows(cudaStream_t s) {
+    const int k = 512, n = 11;
+    for (int type : {gg::iq::kQ5_K, gg::iq::kIQ2_XS}) {
+        const auto packed = q_rand(type, n, k);
+        const size_t rb = gg::type_row_bytes(type, k), ld = rb + 16;
+        std::vector<uint8_t> rows((size_t) n * ld, 0xa5);
+        for (int r = 0; r < n; ++r) std::memcpy(rows.data() + (size_t) r * ld, packed.data() + (size_t) r * rb, rb);
+        std::vector<float> want((size_t) n * k);
+        ggml_get_type_traits((ggml_type) type)->to_float(packed.data(), want.data(), (int64_t) n * k);
+        x3::Mat m{};
+        m.fmt = gg::kFmtGG; m.gg_type = type; m.k = k; m.n = n; m.ld = (int) ld;
+        uint8_t* d_rows = dev(rows); m.raw = d_rows;
+        uint16_t* d_out = dev(std::vector<uint16_t>(want.size(), 0xdead));
+        for (bool bf16 : {false, true}) {
+            gg::rows(m, d_out, bf16, s);
+            CU(cudaStreamSynchronize(s));
+            const auto got = host(d_out, want.size());
+            bool same = true;
+            for (size_t i = 0; i < want.size(); ++i)
+                same = same && got[i] == (bf16 ? ggml_fp32_to_bf16(want[i]).bits : ggml_fp32_to_fp16(want[i]));
+            if (!same) ++g_fail;
+            std::printf("%s padded dense rows as %s: %s\n", tn(type), bf16 ? "BF16" : "FP16", same ? "ok" : "FAIL");
+        }
+        cudaFree(d_rows), cudaFree(d_out);
+    }
+}
+
 int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreate(&s));
@@ -2093,6 +2158,8 @@ int main(int argc, char** argv) {
     test_router_rows(s);
     test_mv(s);
     test_engram_q6k(s);
+    test_engram_iq4nl(s);
+    test_dense_lowbit_rows(s);
     test_experts(512, 256, s);
     test_decode_values(s);
     for (int t : kQTypes) test_mv_q(t, s);

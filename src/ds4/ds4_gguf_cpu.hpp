@@ -9,6 +9,9 @@
 
 namespace strata::ds4::gguf {
 
+/// Decode a ggml quantized row to BF16; false for unsupported types or partial blocks.
+bool gguf_row_to_bf16(int type, const void* packed, int k, uint16_t* out);
+
 constexpr int kMxCpuMaxN = 8;   // activations a call
 
 /// y[i][r - r0] = (row r of W) . x[i] for r0 <= r < r1 and i < n (n <= kMxCpuMaxN): W's rows hold k values

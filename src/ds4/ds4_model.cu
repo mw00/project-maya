@@ -1116,7 +1116,7 @@ struct Model::Impl {
     EgRowCache eg_cache;
     std::mutex eg_cache_mu;
     std::vector<std::unique_ptr<EgBatch>> eg_win;
-    std::vector<uint8_t> eg_q6k;   // Engram layer li's table in ggml Q6_K (a row one superblock a 256 values), else FP8
+    std::vector<EngramFormat> eg_formats;   // layout of each Engram table's packed rows
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
@@ -1756,20 +1756,29 @@ struct Model::Impl {
         CK(cudaMemcpy(dst, tmp.data(), t.bytes, cudaMemcpyHostToDevice));
         return true;
     }
-    // a GGUF's BF16 or Q8_0 matrix ([out][in]) onto the device, as mat() takes an EXL3 one: whole, or part `part` of its
+    static int gg_dense_type(const std::string& dtype) {
+        const int type = gg_type_of(dtype);
+        return gg::iq::supported(type) ? type : 0;
+    }
+    static bool gg_dense_dtype(const std::string& dtype) {
+        return dtype == "BF16" || dtype == "Q8_0" || gg_dense_type(dtype) != 0;
+    }
+    // A packed GGUF matrix ([out][in]) onto the device, as mat() takes an EXL3 one: whole, or part `part` of its
     // columns (outputs: a range of its rows) or of its rows (inputs: a range of each row, whole Q8_0 blocks) - a
     // standalone [n][k] matrix; r0 >= 0: the range [r0, r0 + rn) instead of an even part (DS4_TP_GGUF_UNEVEN's shared
     // expert: its member's FFN range)
-    bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
+    bool load_gguf_matrix(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
                   int np, bool cols, int r0 = -1, int rn = 0) {
         const bool q8 = t.dtype == "Q8_0";
-        if (t.shape.size() != 2 || (q8 && t.shape[1] % 32 != 0)) {
+        const int low = gg_dense_type(t.dtype);
+        const int block = low ? 256 : q8 ? 32 : 1;
+        if (t.shape.size() != 2 || t.shape[0] <= 0 || t.shape[1] <= 0 || t.shape[1] % block != 0) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
             return false;
         }
         int n = (int) t.shape[0], k = (int) t.shape[1];
-        // a row's bytes, and the bytes of v of its values (BF16: 2 each; Q8_0: 34 every 32)
-        auto bytes_of = [&](size_t v) { return q8 ? v / 32 * gg::kQ8Bytes : v * 2; };
+        // Keep packed bytes intact, including whole 256-value blocks when splitting inputs.
+        auto bytes_of = [&](size_t v) { return low ? gg::iq::row_bytes(low, v) : q8 ? v / 32 * gg::kQ8Bytes : v * 2; };
         std::vector<uint8_t> w((size_t) n * bytes_of((size_t) k));
         if (t.bytes != w.size() || !pk.read(t, w.data())) {
             err = pre + ": read failed";
@@ -1777,7 +1786,7 @@ struct Model::Impl {
         }
         if (np > 1) {
             const int whole = cols ? n : k, wd = r0 >= 0 ? rn : whole / np, w0 = r0 >= 0 ? r0 : part * wd;
-            const int q = q8 ? 32 : 8;
+            const int q = low && !cols ? 256 : q8 ? 32 : 8;
             if ((r0 < 0 && whole % np != 0) || wd % q != 0 || w0 % q != 0 || w0 + wd > whole || wd <= 0) {
                 err = pre + ": " + std::to_string(whole) + (cols ? " outputs" : " inputs") + " do not split in " +
                       (r0 >= 0 ? "[" + std::to_string(w0) + ", " + std::to_string(w0 + wd) + ")"
@@ -1803,11 +1812,12 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         CK(cudaMemcpy(dp, w.data(), w.size(), cudaMemcpyHostToDevice));
         m = x3::Mat{};
-        m.fmt = q8 ? gg::kFmtQ8_0 : gg::kFmtBF16;
+        m.fmt = low ? gg::kFmtGG : q8 ? gg::kFmtQ8_0 : gg::kFmtBF16;
+        m.gg_type = low;
         m.raw = dp;
         m.k = k;
         m.n = n;
-        m.ld = q8 ? (int) bytes_of((size_t) k) : k;
+        m.ld = low || q8 ? (int) bytes_of((size_t) k) : k;
         return true;
     }
     // a Q8_0 tensor's values as F32 (host)
@@ -1826,10 +1836,10 @@ struct Model::Impl {
     // splits evenly, its groups only as wide as that goes)
     bool mat(Dev& d, const std::string& pre, x3::Mat& m, std::string& err, size_t* acct, int part = 0, int np = 1,
              bool cols = true, int rot = 0, int r0 = -1, int rn = 0) {
-        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0"))
-            return mat_bf16(d, pre, *tw, m, err, acct, part, np, cols, r0, rn);
+        if (const Tensor* tw = pk.get(pre + ".weight"); tw != nullptr && gg_dense_dtype(tw->dtype))
+            return load_gguf_matrix(d, pre, *tw, m, err, acct, part, np, cols, r0, rn);
         if (r0 >= 0) {   // (an explicit range: a BF16 / Q8_0 matrix's only - an EXL3 one splits by split128's rot)
-            err = pre + ": an explicit range of a matrix that is not BF16 or Q8_0";
+            err = pre + ": an explicit range requires a supported packed GGUF matrix";
             return false;
         }
         const Tensor* tr = pk.get(pre + ".trellis");
@@ -1997,7 +2007,7 @@ struct Model::Impl {
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.gg_type[r] is role r's ggml
     // type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 16, 18, 19, 21, 22, 23, 29})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 16, 17, 18, 19, 21, 22, 23, 29})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }
@@ -2900,17 +2910,27 @@ struct Model::Impl {
             const Tensor* t = pk.get("embed.weight");
             const size_t nv = (size_t) g.vocab * g.dim;
             const bool q8 = t != nullptr && t->dtype == "Q8_0" && t->bytes == nv / 32 * gg::kQ8Bytes;
-            if (t == nullptr || (!q8 && (t->dtype != "BF16" || t->bytes != nv * 2))) {
-                err = "embed.weight: not a BF16 (or Q8_0) [vocab][dim] table";
+            const int low = t != nullptr ? gg_dense_type(t->dtype) : 0;
+            const bool quant = low != 0 && g.dim % 256 == 0 &&
+                               t->bytes == (size_t) g.vocab * gg::iq::row_bytes(low, g.dim);
+            if (t == nullptr || (!q8 && !quant && (t->dtype != "BF16" || t->bytes != nv * 2))) {
+                err = "embed.weight: unsupported format or invalid [vocab][dim] table size";
                 return false;
             }
             if (!halloc(embed_pinned, nv, err)) return false;
-            if (q8) {   // (a GGUF's: each value rounded to BF16, a row at a time)
-                std::vector<uint8_t> row((size_t) g.dim / 32 * gg::kQ8Bytes);
+            if (q8 || quant) {   // a GGUF's values rounded to BF16, a row at a time
+                std::vector<uint8_t> row(quant ? gg::iq::row_bytes(low, g.dim) : (size_t) g.dim / 32 * gg::kQ8Bytes);
                 for (size_t r = 0; r < (size_t) g.vocab; ++r) {
                     if (!pk.read_at(t->file, t->off + r * row.size(), row.size(), row.data())) {
                         err = "embed.weight: read failed";
                         return false;
+                    }
+                    if (quant) {
+                        if (!gg::gguf_row_to_bf16(low, row.data(), g.dim, embed_pinned + r * g.dim)) {
+                            err = "embed.weight: low-bit row conversion unsupported in this build";
+                            return false;
+                        }
+                        continue;
                     }
                     const std::vector<float> v = q8_values(row.data(), (size_t) g.dim);
                     for (size_t c = 0; c < (size_t) g.dim; ++c) {
@@ -2976,7 +2996,8 @@ struct Model::Impl {
                 uint64_t total = 0;
                 for (int li = 0; li < pk.eg_layers; ++li) {
                     const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3")) {
+                    if (tw == nullptr || (tw->dtype != "Q6_K" && tw->dtype != "IQ4_NL" &&
+                                          tw->dtype != "MXFP8" && tw->dtype != "F8_E4M3")) {
                         err = "Engram RAM: unsupported table type"; return false;
                     }
                     if (!eg_io.pin_range(paths[(size_t) tw->file], tw->file, tw->off, tw->bytes, err)) return false;
@@ -2989,20 +3010,22 @@ struct Model::Impl {
                     }
                 }
                 eg_io.require_ram();
-                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/FP8), %.3f GB locked; reads use memcpy\n",
+                std::fprintf(stderr, "ds4: Engram RAM ONLY: %d complete tables (Q6_K/IQ4_NL/FP8), %.3f GB locked; reads use memcpy\n",
                              pk.eg_layers, (double) total / 1e9);
             }
             eg_io.start(paths, nth, eg_direct);
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
                 const Tensor* tw = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.weight");
-                const bool q6k = tw != nullptr && tw->dtype == "Q6_K";
-                if (q6k && pk.eg_hd % 256 != 0) {
-                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) + ": Q6_K rows of " +
-                          std::to_string(pk.eg_hd) + " values (not whole superblocks of 256)";
+                const Tensor* ts = pk.get("layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.scale");
+                EngramFormat format;
+                if (tw == nullptr || !engram_row_format(tw->dtype, ts != nullptr && ts->dtype == "F8_E8M0",
+                                                       pk.eg_hd, format)) {
+                    err = "Engram layer " + std::to_string(g.eg_layers[(size_t) li]) +
+                          ": unsupported table format, row width, or missing FP8 scales";
                     return false;
                 }
-                eg_q6k.push_back(q6k ? 1 : 0);
+                eg_formats.push_back(format);
             }
             if (o.verbose)
                 std::fprintf(stderr, "ds4: Engram rows read on %d threads, issued with the tokens, collected before "
@@ -6259,8 +6282,9 @@ struct Model::Impl {
         const std::string P = "layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.";
         const Tensor* tw = pk.get(P + "weight");
         const Tensor* ts = pk.get(P + "scale");
-        const bool mx8 = tw->dtype == "MXFP8";   // (a GGUF: the scales between the codes, one per 32)
-        const bool q6k = eg_q6k[(size_t) li] != 0;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
+        const EngramFormat format = eg_formats[(size_t) li];
+        const bool mx8 = format == EngramFormat::Fp8;
+        const bool packed = format == EngramFormat::Q6K || format == EngramFormat::Iq4Nl;
         std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
         int64_t hits = 0;
         {
@@ -6310,8 +6334,8 @@ struct Model::Impl {
                             r.mx8 = true;
                             r.n = (uint32_t) (hd / 32 * 33);
                             r.off = tw->off + (uint64_t) id * r.n;
-                        } else if (q6k) {   // (into the row's code bytes; its scale bytes unused)
-                            r.n = (uint32_t) (hd / 256 * 210);
+                        } else if (packed) {   // packed blocks at the row's start; scale staging bytes unused
+                            r.n = (uint32_t) engram_source_row_bytes(format, hd);
                             r.off = tw->off + (uint64_t) id * r.n;
                         } else {
                             r.n = (uint32_t) hd;
@@ -9423,7 +9447,7 @@ struct Model::Impl {
             CK(cudaEventRecord(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += 256) {
                 const int ns = std::min(256, T - s0);
-                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, eg_q6k[(size_t) l.eg] != 0);
+                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, eg_formats[(size_t) l.eg]);
                 x3::rows_f16(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s);
                 if (!gemm(d, c, l.eg_wkv, c.eg_x16, cols * ehd, ns, c.eg_kv, (H + 1) * D, 0.0f, err)) return false;
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
@@ -11110,10 +11134,10 @@ struct Model::Impl {
     bool host_free(const Layer& l) const { return host_free_on && l.nm == 1 && l.n_exp > 0 && l.n_vram >= l.n_exp; }
     int head_nm() const { return (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size(); }
     // the head's columns on member mi of its group of nm: an EXL3 head's split128 of the vocabulary (mat's), a GGUF's
-    // BF16 / Q8_0 head's even shares (mat_bf16's) - head_share's, its gather's and the markov steps' rows
+    // packed GGUF head's even shares (load_gguf_matrix's), used by head_share and the markov steps
     void head_cols(int nm, int mi, int& v0, int& vn) const {
         const Tensor* tw = pk.get("head.weight");
-        if (tw != nullptr && (tw->dtype == "BF16" || tw->dtype == "Q8_0")) {
+        if (tw != nullptr && gg_dense_dtype(tw->dtype)) {
             vn = g.vocab / nm;
             v0 = mi * vn;
         } else
@@ -11454,7 +11478,7 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t)
                 CK(cudaMemcpyAsync(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd,
                                    (size_t) cols * (ehd / 32), cudaMemcpyHostToDevice, s));
-            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, eg_q6k[(size_t) l.eg] != 0);
+            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, eg_formats[(size_t) l.eg]);
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
         }

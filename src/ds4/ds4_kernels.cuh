@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "strata/kernels/sampler.hpp"
+#include "ds4_engram_format.hpp"
 
 #include <vector>
 
@@ -214,14 +215,14 @@ struct CompBatch {
 };
 void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s);
 
-/// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  q6k: the rows are
-/// ggml Q6_K superblocks instead (hd / 256 of them, 210 bytes each, at the start of each row's hd bytes; no scales),
-/// decoded as ggml's dequantize_row_q6_K.
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, bool q6k = false);
+/// Engram rows padded to hd bytes, decoded as F32 [n * hd]. FP8 uses n x (hd / 32) E8M0 scales; Q6_K and
+/// IQ4_NL keep their scales inside packed blocks at each row's start and do not read the scales argument.
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s,
+                    EngramFormat format = EngramFormat::Fp8);
 /// The same over the host's per-token layout (a chunk): token t's cols rows, then their scales, `per` bytes a token;
 /// T tokens -> out F32 [T * cols][hd].
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s,
-                        bool q6k = false);
+                        EngramFormat format = EngramFormat::Fp8);
 /// h[t][k] += gate[t][k] * value[t] with the gate from the normalized dot of h[t][k] * w[k] * key[t][k]
 /// (kv[t] = [key hc x dim | value dim]).
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s);

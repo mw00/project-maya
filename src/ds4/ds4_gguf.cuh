@@ -27,7 +27,7 @@ constexpr int kFmtBF16 = 1;    // x3::Mat::fmt
 constexpr int kFmtMXFP4 = 2;   // x3::ExpertLayout::fmt (and an expert's matrix as an x3::Mat)
 constexpr int kFmtQ8_0 = 3;    // x3::Mat::fmt: ggml's Q8_0, an FP16 scale and 32 int8 in 34 bytes (UD-Q4_K_XL's dense)
 constexpr int kFmtGG = 4;      // x3::Mat::fmt: ggml's low-bit block type m.gg_type (ds4_iq.cuh's: IQ2_XXS ..
-                               // Q4_K), [n][k / 256]
+                               // Q5_K), [n][k / 256]
 constexpr int kMxBlock = 32, kMxBytes = 17, kQ8Bytes = 34;
 constexpr int kTypeMXFP4 = 39;   // ggml's type id
 
@@ -61,12 +61,12 @@ bool q8_batch_check(int dev, std::string& err);
 
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
-/// or kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)).
+/// kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)), or kFmtGG (m.gg_type,
+/// packed rows with ld bytes a row).
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s);
 /// The columns [c0, c0 + nc) of such a matrix: its rows c0 .. c0 + nc - 1, a contiguous range.
 x3::Mat view(const x3::Mat& m, int c0, int nc);
-/// x3::reconstruct_rows' layout from a BF16 or Q8_0 matrix: dst[r][c] = W[c][r] (n rows of k values), F16 or BF16
-/// bits (a Q8_0 weight rounded to them).
+/// Reconstruct BF16, Q8_0 or supported kFmtGG packed rows as F16 or BF16 bits, dst[n][k].
 void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 
 /// x3::moe_gate_up / moe_down / win_experts / set_gate_up / set_down for a GGUF's experts (lay.fmt == kFmtMXFP4; the
