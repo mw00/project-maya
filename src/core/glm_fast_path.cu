@@ -5208,7 +5208,7 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     }
     if (pool_done > 0 && !all) {
         gf::dsa_score(F->iq, state_ + dsa_pool_[(size_t) il], F->iw, g.idx_key, g.idx_heads, pool_done,
-                      F->score, s);
+                      F->score, s, true);
         if (F->prof_on) F->mark("dsa_score");
     }
     const int top_pools = std::min(g.top_pools_max(), pool_done);
@@ -5222,7 +5222,7 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     // (with the profiler on, mla() marks its own steps)
     const gf::MlaMarks mla_marks = {[](void* f, const char* nm) { static_cast<FastState*>(f)->mark(nm); }, F};
     gf::mla(F->q, Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head, g.qk_nope, g.kv_lora, g.v_head, F->attn_q, s, lat_q8_,
-            F->prof_on ? &mla_marks : nullptr);
+            F->prof_on ? &mla_marks : nullptr, true);
     gf::MvJob o = {Ly.out.q, F->attn_q, nullptr, F->mixer, nullptr, 1.0f, Ly.out.type,
                    g.n_head * g.v_head, g.n_embd};
     if (!gf::mv(&o, 1, s)) { err = "glm fast: dsa output"; return false; }

@@ -5863,13 +5863,16 @@ void dsa_score2_launch(int p, int blocks, const float* iq, const float* pooled, 
 }  // namespace
 
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
-               float* score, cudaStream_t s) {
+               float* score, cudaStream_t s, bool token) {
     if (n_pools <= 0) return;
-    const DsaScore2 t = dsa2_shape();
+    // the take-two kernel on the decode's token path only (and under the bench's override); the record is the token
+    // path's - a prompt's windows, which keep the original, never write it
+    const bool path = token || g_dsa2_set.load(std::memory_order_acquire);
+    const DsaScore2 t = path ? dsa2_shape() : DsaScore2{};
     const bool two = t.on && idx_heads == kDsaH && key_dim == kDsaK;
     int dev = 0;
     cudaGetDevice(&dev);
-    note_kernel(g_dsa2_seen, dev, "dsa scores", two ? dsa2_label(t) : std::string("original"));
+    if (path) note_kernel(g_dsa2_seen, dev, "dsa scores", two ? dsa2_label(t) : std::string("original"));
     if (two) {
         const int blocks = std::max(1, std::min(t.bpc * multiprocessors(dev), (n_pools + 8 * t.p - 1) / (8 * t.p)));
         if (t.qr) {
@@ -5932,7 +5935,7 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
 // the split attention of one token: q_abs (n_head x kv_lora) over its selected cells -> ctx; false when the split
 // kernels are not available on this device (mla() then runs its one-kernel form)
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
-                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8);
+                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token = false);
 
 #if defined(STRATA_USE_HIP)
 namespace {
@@ -6109,7 +6112,7 @@ bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const
 }
 
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
-                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8) {
+                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token) {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev >= 16) return false;
@@ -6133,8 +6136,10 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     float* part = split_ok[dev] && kv_lora <= 512 && n_head <= 128 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr
                       ? mla_part(dev, n_head, kv_lora, n_chunks, &cap)
                       : nullptr;
-    const MlaAttn2 t2 = mla2_shape();
-    if (part != nullptr && cap >= n_chunks) note_kernel(g_mla2_seen, dev, "mla split attention", mla2_label(t2));
+    // the take-two kernels on the decode's token path only (and under the bench's override), as dsa_score
+    const bool path = token || g_mla2_set.load(std::memory_order_acquire);
+    const MlaAttn2 t2 = path ? mla2_shape() : MlaAttn2{};
+    if (path && part != nullptr && cap >= n_chunks) note_kernel(g_mla2_seen, dev, "mla split attention", mla2_label(t2));
     if (part != nullptr && cap >= n_chunks && t2.on) {
         const size_t smem2 = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) t2.hpb * MLA_CHUNK * sizeof(float);
         const dim3 grid(n_chunks, (n_head + t2.hpb - 1) / t2.hpb);
@@ -6164,7 +6169,7 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
 
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
          int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8,
-         const MlaMarks* marks) {
+         const MlaMarks* marks, bool token) {
     const auto mark = [marks](const char* nm) {
         if (marks) marks->fn(marks->ctx, nm);
     };
@@ -6195,7 +6200,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
     headwise_gemv_kernel<<<n_head * kv_lora / 32, 256, 0, s>>>(wk_b, q, kv_lora, qk_nope, q_abs, nullptr);
     mark("mla_q_abs");
     // the split attention: chunks of MLA_CHUNK cells, partials per (chunk, head), then the merge (mla_split_attend)
-    mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8);
+    mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8, token);
     mark("mla_attend");
     headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
                                                               (block_q8_1*) out_q8_1);

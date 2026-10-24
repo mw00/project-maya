@@ -185,8 +185,11 @@ struct DsaPrepArgs {
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 /// score[p] = sum_h relu(iq_h . pooled_p) * iw_h for the n_pools completed pools.
+/// token: the decode's token path (fast_dsa) - only it takes the take-two kernel STRATA_GLM_DSA_SCORE names (a
+/// prompt's windows keep the original: their per-token calls run beside the expert copies; glm_attn_bench's override
+/// applies anywhere); the scores are the same bits either way.
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
-               float* score, cudaStream_t s);
+               float* score, cudaStream_t s, bool token = false);
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
                 cudaStream_t s);
@@ -223,9 +226,10 @@ struct MlaMarks {
     void (*fn)(void* ctx, const char* name);
     void* ctx;
 };
+/// token: the decode's token path - only it takes the take-two split attention STRATA_GLM_MLA_ATTN2 names (as dsa_score).
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
          int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8 = false,
-         const MlaMarks* marks = nullptr);
+         const MlaMarks* marks = nullptr, bool token = false);
 /// The same absorbed MLA in three steps for a verify window (each step mla()'s arithmetic, bit for bit): the head-wise
 /// q_abs = wk_b . q of `ncol` tokens at once (q rows q_stride floats apart, q_abs rows qa_stride), one token's attention
 /// over its selected cells into ctx (n_head x kv_lora; false: not available here - use mla()), and the head-wise
