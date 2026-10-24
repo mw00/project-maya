@@ -3,6 +3,7 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 
 #include <cmath>
 #include <cstdio>
@@ -79,20 +80,21 @@ __device__ float norm_rope(float x, const float* w1, int pos, int n_rot, const f
 
 __global__ void qk_kernel(float* q, const float* k, const float* v, const float* qn1, const float* kn1,
                           const int* pos, int Hq, int Hkv, int n_rot, const float* inv, float eps, uint16_t* kc,
-                          uint16_t* vc) {
+                          uint16_t* vc, int ring) {
     __shared__ float red[33], sh[128];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x, hd = blockDim.x;
     const int p = pos[t];
+    const int row = ring > 0 ? p % ring : p;
     if (h < Hq) {
         float* x = q + ((size_t) t * Hq + h) * hd;
         x[d] = norm_rope(x[d], qn1, p, n_rot, inv, eps, sh, red);
     } else if (h < Hq + Hkv) {
         const int kh = h - Hq;
         const float o = norm_rope(k[((size_t) t * Hkv + kh) * hd + d], kn1, p, n_rot, inv, eps, sh, red);
-        kc[((size_t) p * Hkv + kh) * hd + d] = f2bf(o);
+        kc[((size_t) row * Hkv + kh) * hd + d] = f2bf(o);
     } else {
         const int vh = h - Hq - Hkv;
-        vc[((size_t) p * Hkv + vh) * hd + d] = f2bf(v[((size_t) t * Hkv + vh) * hd + d]);
+        vc[((size_t) row * Hkv + vh) * hd + d] = f2bf(v[((size_t) t * Hkv + vh) * hd + d]);
     }
 }
 
@@ -389,6 +391,187 @@ __global__ void add_kernel(float* x, const float* a, size_t n) {
 
 unsigned grid_for(size_t n) { return (unsigned) std::min<size_t>(4096, (n + 255) / 256); }
 
+__global__ void rows_dot_kernel(const float* W, int N, int K, const float* X, float* Y) {
+    const int n = blockIdx.x * 8 + (threadIdx.x >> 5), t = blockIdx.y, lane = threadIdx.x & 31;
+    if (n >= N) return;
+    const float* w = W + (size_t) n * K;
+    const float* x = X + (size_t) t * K;
+    float acc = 0.0f;
+    for (int i = lane; i < K; i += 32) acc = fmaf(w[i], x[i], acc);
+    acc = warp_sum(acc);
+    if (lane == 0) Y[(size_t) t * N + n] = acc;
+}
+
+// ------------------------------------------------------------------ the DSpark draft's
+__global__ void mxfp8_kernel(const uint8_t* w, const uint8_t* sc, int K, uint16_t* out) {
+    const size_t n = blockIdx.y;
+    for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < K; k += gridDim.x * blockDim.x) {
+        const uint8_t e = sc[n * (size_t) (K / 32) + (size_t) (k / 32)];
+        __nv_fp8_e4m3 f;
+        f.__x = w[n * (size_t) K + k];
+        const float v = ldexpf((float) f, (int) e - 127);   // (exact: E4M3's 3 mantissa bits fit BF16's 7)
+        out[n * (size_t) K + k] = f2bf(v);
+    }
+}
+
+__global__ void to_bf16_kernel(const float* x, int cols, int ld, uint16_t* y, int ldo) {
+    for (int i = threadIdx.x; i < cols; i += blockDim.x)
+        y[(size_t) blockIdx.x * ldo + i] = f2bf(x[(size_t) blockIdx.x * ld + i]);
+}
+
+// window attention: sparse_attn_kernel's tiles over a range of key positions instead of kept blocks, not causal
+__global__ void __launch_bounds__(128) window_attn_kernel(const float* q, const uint16_t* kc, const uint16_t* vc,
+                                                          int ring, const int* lo, int hi, int Hq, int Hkv,
+                                                          float scale, float* out) {
+    __shared__ float qs[kG][128];
+    __shared__ __align__(4) uint16_t ks[kTile][kRow], vs[kTile][kRow];
+    __shared__ float sc[kG][kTile + 1];
+    __shared__ float mrow[kG], lrow[kG], arow[kG];
+    const int t = blockIdx.x, g = blockIdx.y, tid = threadIdx.x;
+    const int k_lo = lo[t];
+    for (int i = tid; i < kG * 128; i += 128) {
+        const int h = i / 128, d = i % 128;
+        qs[h][d] = q[((size_t) t * Hq + g * kG + h) * 128 + d] * scale;
+    }
+    if (tid < kG) {
+        mrow[tid] = -INFINITY;
+        lrow[tid] = 0.0f;
+    }
+    float acc[kG];
+#pragma unroll
+    for (int h = 0; h < kG; ++h) acc[h] = 0.0f;
+    for (int k0 = k_lo; k0 <= hi; k0 += kTile) {
+        __syncthreads();
+        for (int i = tid; i < kTile * 64; i += 128) {
+            const int j = i >> 6, c = i & 63;
+            const int kp = k0 + j;
+            uint32_t kw = 0, vw = 0;
+            if (kp <= hi) {
+                const size_t row = (size_t) (kp % ring);
+                kw = *(const uint32_t*) (kc + (row * Hkv + g) * 128 + c * 2);
+                vw = *(const uint32_t*) (vc + (row * Hkv + g) * 128 + c * 2);
+            }
+            *(uint32_t*) &ks[j][c * 2] = kw;
+            *(uint32_t*) &vs[j][c * 2] = vw;
+        }
+        __syncthreads();
+        {
+            const int j = tid & 63, h0 = (tid >> 6) * 8;
+            const bool ok = k0 + j <= hi;
+            float s8[8];
+#pragma unroll
+            for (int h = 0; h < 8; ++h) s8[h] = 0.0f;
+            if (ok) {
+#pragma unroll 4
+                for (int d = 0; d < 128; ++d) {
+                    const float kv = bf2f(ks[j][d]);
+#pragma unroll
+                    for (int h = 0; h < 8; ++h) s8[h] = fmaf(qs[h0 + h][d], kv, s8[h]);
+                }
+            }
+#pragma unroll
+            for (int h = 0; h < 8; ++h) sc[h0 + h][j] = ok ? s8[h] : -INFINITY;
+        }
+        __syncthreads();
+        if (tid < kG) {
+            const int h = tid;
+            float m = mrow[h];
+            for (int j = 0; j < kTile; ++j) m = fmaxf(m, sc[h][j]);
+            const float a = mrow[h] == -INFINITY ? 0.0f : expf(mrow[h] - m);
+            float l = lrow[h] * a;
+            for (int j = 0; j < kTile; ++j) {
+                const float e = sc[h][j] == -INFINITY ? 0.0f : expf(sc[h][j] - m);
+                sc[h][j] = e;
+                l += e;
+            }
+            mrow[h] = m;
+            lrow[h] = l;
+            arow[h] = a;
+        }
+        __syncthreads();
+        {
+            const int d = tid;
+#pragma unroll
+            for (int h = 0; h < kG; ++h) {
+                float s = acc[h] * arow[h];
+                for (int j = 0; j < kTile; ++j) s = fmaf(sc[h][j], bf2f(vs[j][d]), s);
+                acc[h] = s;
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int h = 0; h < kG; ++h)
+        out[((size_t) t * Hq + g * kG + h) * 128 + tid] = lrow[h] > 0.0f ? acc[h] / lrow[h] : 0.0f;
+}
+
+__global__ void gather_row_kernel(const uint16_t* table, int R, const int* prev, uint16_t* emb, float* embf) {
+    const uint16_t* r = table + (size_t) *prev * R;
+    for (int i = threadIdx.x; i < R; i += blockDim.x) {
+        emb[i] = r[i];
+        embf[i] = bf2f(r[i]);
+    }
+}
+
+// one block of 1024: the biased logits' argmax (ties to the lower id), then the confidence
+__global__ void __launch_bounds__(1024) markov_pick_kernel(const float* logits, const float* bias, int V, int* prev,
+                                                           int* out, float* biased, const float* w, const float* b,
+                                                           const float* hidden, int D, const float* embf, int R,
+                                                           float* conf) {
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    __shared__ float red[33];
+    float best = -INFINITY;
+    int bid = 0x7fffffff;
+    for (int i = threadIdx.x; i < V; i += blockDim.x) {
+        const float v = logits[i] + bias[i];
+        if (biased) biased[i] = v;
+        if (v > best || (v == best && i < bid)) {
+            best = v;
+            bid = i;
+        }
+    }
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bid, o);
+        if (ov > best || (ov == best && oi < bid)) {
+            best = ov;
+            bid = oi;
+        }
+    }
+    const int lane = threadIdx.x & 31, wid = threadIdx.x >> 5;
+    if (lane == 0) {
+        bv[wid] = best;
+        bi[wid] = bid;
+    }
+    __syncthreads();
+    if (wid == 0) {
+        best = lane < (int) (blockDim.x >> 5) ? bv[lane] : -INFINITY;
+        bid = lane < (int) (blockDim.x >> 5) ? bi[lane] : 0x7fffffff;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bid, o);
+            if (ov > best || (ov == best && oi < bid)) {
+                best = ov;
+                bid = oi;
+            }
+        }
+    }
+    // (every thread has read *prev's row before: gather_row ran earlier on the stream)
+    if (conf != nullptr) {
+        float acc = 0.0f;
+        for (int i = threadIdx.x; i < D + R; i += blockDim.x) acc = fmaf(w[i], i < D ? hidden[i] : embf[i - D], acc);
+        const float s = block_sum(acc, red);
+        if (threadIdx.x == 0) *conf = 1.0f / (1.0f + expf(-(s + *b)));
+    }
+    if (threadIdx.x == 0) {
+        *prev = bid;
+        *out = bid;
+    }
+}
+
 }  // namespace
 
 void rms(const float* x, const float* w1, int rows, int D, float eps, float* y, uint16_t* y16, cudaStream_t s) {
@@ -404,9 +587,9 @@ void rope_inv_freq(float theta, int n_rot, float* inv) {
 
 void qk_norm_rope(float* q, const float* k, const float* v, const float* qn1, const float* kn1, const int* pos, int T,
                   int Hq, int Hkv, int hd, int n_rot, const float* inv, float eps, uint16_t* kc, uint16_t* vc,
-                  cudaStream_t s) {
+                  cudaStream_t s, int ring) {
     if (T <= 0) return;
-    qk_kernel<<<dim3(T, Hq + 2 * Hkv), hd, 0, s>>>(q, k, v, qn1, kn1, pos, Hq, Hkv, n_rot, inv, eps, kc, vc);
+    qk_kernel<<<dim3(T, Hq + 2 * Hkv), hd, 0, s>>>(q, k, v, qn1, kn1, pos, Hq, Hkv, n_rot, inv, eps, kc, vc, ring);
     check("qk_norm_rope");
 }
 
@@ -475,6 +658,42 @@ void add(float* x, const float* a, size_t n, cudaStream_t s) {
     if (n == 0) return;
     add_kernel<<<grid_for(n), 256, 0, s>>>(x, a, n);
     check("add");
+}
+
+void rows_dot(const float* W, int N, int K, const float* X, int T, float* Y, cudaStream_t s) {
+    if (T <= 0 || N <= 0) return;
+    rows_dot_kernel<<<dim3((unsigned) ((N + 7) / 8), (unsigned) T), 256, 0, s>>>(W, N, K, X, Y);
+    check("rows_dot");
+}
+
+void mxfp8_to_bf16(const uint8_t* w, const uint8_t* scale, int N, int K, uint16_t* out, cudaStream_t s) {
+    if (N <= 0 || K <= 0) return;
+    mxfp8_kernel<<<dim3((unsigned) std::min(64, (K + 255) / 256), (unsigned) N), 256, 0, s>>>(w, scale, K, out);
+    check("mxfp8_to_bf16");
+}
+
+void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, cudaStream_t s) {
+    if (rows <= 0) return;
+    to_bf16_kernel<<<rows, 256, 0, s>>>(x, cols, ld, y, ldo);
+    check("to_bf16");
+}
+
+void window_attn(const float* q, const uint16_t* kc, const uint16_t* vc, int ring, const int* lo, int hi, int T,
+                 int Hq, int Hkv, float scale, float* out, cudaStream_t s) {
+    if (T <= 0) return;
+    window_attn_kernel<<<dim3(T, Hkv), 128, 0, s>>>(q, kc, vc, ring, lo, hi, Hq, Hkv, scale, out);
+    check("window_attn");
+}
+
+void gather_row(const uint16_t* table, int R, const int* prev, uint16_t* emb, float* embf, cudaStream_t s) {
+    gather_row_kernel<<<1, 256, 0, s>>>(table, R, prev, emb, embf);
+    check("gather_row");
+}
+
+void markov_pick(const float* logits, const float* bias, int V, int* prev, int* out, float* biased, const float* w,
+                 const float* b, const float* hidden, int D, const float* embf, int R, float* conf, cudaStream_t s) {
+    markov_pick_kernel<<<1, 1024, 0, s>>>(logits, bias, V, prev, out, biased, w, b, hidden, D, embf, R, conf);
+    check("markov_pick");
 }
 
 }  // namespace mm3::k

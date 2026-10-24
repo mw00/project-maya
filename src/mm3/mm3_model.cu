@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "mm3_cpu.hpp"
+#include "mm3_dspark.hpp"
 #include "mm3_exl3.hpp"
 #include "mm3_kernels.cuh"
 
@@ -54,6 +55,7 @@ namespace {
 
 constexpr size_t kAlign = 256;
 constexpr int kHeadRows = 32;   // the output head's rows a GEMM (its F32 logits buffer)
+constexpr int kWin = 16;        // a window's tokens at most (the token path's kernels: mv's columns, win_experts)
 size_t up(size_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
 double now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -155,6 +157,15 @@ struct Dev {
     unsigned long long* plan_d = nullptr;
     float* xh_h = nullptr;               // pinned: the token's normed input (the CPU lane's x), then its part + flag
     float* cpu_d = nullptr;              // the CPU lane's part [dim] and its flag (an int after it)
+    // a window (2 .. kWin tokens: a DSpark verify): the readback (routes, weights, normed inputs), the plan for
+    // win_experts (pinned, then on the device), the CPU lane's parts and flags in mapped memory with the flag the
+    // device waits on, and the experts' scratch
+    uint8_t* win_rb = nullptr;           // pinned: top [kWin][8] int, w [kWin][8] float, x [kWin][dim] float
+    uint8_t* win_plan_h = nullptr;       // pinned: plan_ptr [kWin][8], plan_w [kWin][8], grp_ptr [kWin 8], grp_start
+    uint8_t* win_plan_d = nullptr;       //   [kWin 8 + 1], grp_ent [kWin 8], n_groups
+    float* win_cpu = nullptr;            // mapped: the CPU parts [kWin][dim], then the flags [kWin] int, the wait word
+    unsigned win_wait = 0;
+    float *win_h = nullptr, *win_part = nullptr;
     // scratch (chunk rows)
     float *h = nullptr, *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *iq = nullptr, *ik = nullptr;
     float *bs = nullptr, *att = nullptr, *ao = nullptr, *g = nullptr, *u = nullptr, *logit = nullptr, *w = nullptr;
@@ -273,6 +284,9 @@ struct Model::Impl {
     std::vector<uint32_t> prof;      // routings [layer][expert]: the loaded profile's plus this run's
     uint8_t* pool = nullptr;         // the pinned pool
     std::unique_ptr<CpuLane> lane;
+    std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
+    float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
+    std::vector<int> tap_of;         // layer -> its tap (-1: none)
 
     ~Impl() {
         for (size_t i = 0; i < owned.size(); ++i) {
@@ -284,6 +298,9 @@ struct Model::Impl {
             cudaSetDevice(d.id);
             if (d.plan_h) cudaFreeHost(d.plan_h);
             if (d.xh_h) cudaFreeHost(d.xh_h);
+            if (d.win_rb) cudaFreeHost(d.win_rb);
+            if (d.win_plan_h) cudaFreeHost(d.win_plan_h);
+            if (d.win_cpu) cudaFreeHost(d.win_cpu);
             if (d.pin) cudaFreeHost(d.pin);
             if (d.blas) cublasDestroy(d.blas);
             if (d.s) cudaStreamDestroy(d.s);
@@ -505,6 +522,33 @@ struct Model::Impl {
             if (!A(d.plan_d, 16)) return false;
             CK(cudaMallocHost(&d.xh_h, (size_t) (2 * g.dim + 4) * sizeof(float)));
             if (!A(d.cpu_d, (size_t) g.dim + 4)) return false;
+            CK(cudaMallocHost(&d.win_rb, win_rb_bytes()));
+            CK(cudaMallocHost(&d.win_plan_h, win_plan_bytes()));
+            if (!A(d.win_plan_d, win_plan_bytes())) return false;
+            CK(cudaHostAlloc(&d.win_cpu, ((size_t) kWin * g.dim + kWin + 4) * 4, cudaHostAllocMapped | cudaHostAllocPortable));
+            if (!A(d.win_h, (size_t) kWin * 8 * g.ff) || !A(d.win_part, (size_t) kWin * 8 * g.dim)) return false;
+        }
+        // the DSpark draft on the head's GPU, before the experts take the memory
+        tap_of.assign((size_t) g.n_layers, -1);
+        if (o.dspark) {
+            Dev& hd = D[(size_t) head_dev];
+            CK(cudaSetDevice(hd.id));
+            draftm = std::make_unique<Draft>();
+            const Tensor* et = pk.get(P + "embed_tokens.weight");
+            if (!draftm->load(pk, hd.id, hd.s, hd.blas, &head, (const uint16_t*) pk.data(*et), o.chunk, err))
+                return false;
+            const auto& tl = draftm->geo().taps;
+            for (size_t j = 0; j < tl.size(); ++j) {
+                if (tl[j] < 0 || tl[j] >= g.n_layers) {
+                    err = "dspark: a tap at layer " + std::to_string(tl[j]);
+                    return false;
+                }
+                tap_of[(size_t) tl[j]] = (int) j;
+            }
+            if (!dalloc(hd.id, taps, tl.size() * (size_t) o.chunk * g.dim, err)) return false;
+            info.push_back("DSpark draft: " + std::to_string(draftm->bytes() >> 20) + " MB on CUDA" +
+                           std::to_string(hd.id) + ", block " + std::to_string(draftm->geo().block) + ", taps " +
+                           std::to_string(tl.size()));
         }
         // the profile: routings [layer][expert] (a wrong size is ignored)
         prof.assign((size_t) g.n_layers * g.n_exp, 0);
@@ -740,6 +784,196 @@ struct Model::Impl {
         return true;
     }
 
+    size_t win_rb_bytes() const { return (size_t) kWin * 8 * 8 + (size_t) kWin * g.dim * 4; }
+    size_t win_plan_bytes() const { return (size_t) kWin * 8 * 8 * 2 + (size_t) kWin * 8 * 4 * 3 + 64; }
+
+    // a window of T tokens' layer on the token path's kernels: the dense matrices on mv (T columns, each weight
+    // decoded once for them all), the routed experts on win_experts (each distinct expert read once for every token that
+    // picked it), the ones neither in VRAM nor staged on the CPU lane meanwhile (its parts in mapped memory, the device
+    // waits for them before the combine)
+    bool layer_window(Layer& l, Dev& d, int di, int T, std::string& err) {
+        const auto job = [&](const x3::Mat& m, const float* x, int ldx, float* y, int ldy) {
+            x3::MvJob j;
+            j.m = &m;
+            j.xf = x;
+            j.y = y;
+            j.ncol = T;
+            j.xf_cs = (size_t) ldx;
+            j.y_cs = (size_t) ldy;
+            return j;
+        };
+        const int Q = g.n_head * g.hd, KV = g.n_kv * g.hd;
+        k::rms(d.h, l.in1, T, g.dim, g.eps, d.xn, nullptr, d.s);
+        const x3::MvJob qkv[3] = {job(l.q, d.xn, g.dim, d.q, Q), job(l.k, d.xn, g.dim, d.k, KV),
+                                  job(l.v, d.xn, g.dim, d.v, KV)};
+        if (!x3::mv(qkv, 3, d.s)) {
+            err = "mv q/k/v (window)";
+            return false;
+        }
+        k::qk_norm_rope(d.q, d.k, d.v, l.qn1, l.kn1, d.pos, T, g.n_head, g.n_kv, g.hd, g.n_rot, inv_dev[(size_t) di],
+                        g.eps, l.kc, l.vc, d.s);
+        const int nq = g.ix_heads * g.ix_dim;
+        k::rows_dot(l.wiq, nq, g.dim, d.xn, T, d.iq, d.s);
+        k::rows_dot(l.wik, g.ix_dim, g.dim, d.xn, T, d.ik, d.s);
+        k::index_norm_rope(d.iq, d.ik, l.iqn1, l.ikn1, d.pos, T, g.ix_heads, g.ix_dim, g.n_rot, inv_dev[(size_t) di],
+                           g.eps, l.ic, d.s);
+        const int nblk = cur_pos / g.blk + 1;
+        k::block_scores(d.iq, l.ic, d.pos, T, g.ix_heads, nblk, g.blk, d.bs, d.s);
+        k::select_blocks(d.bs, d.pos, T, g.ix_heads, nblk, g.blk, g.topk, d.kept, d.s);
+        k::sparse_attn(d.q, l.kc, l.vc, d.kept, d.pos, T, g.n_head, g.n_kv, g.topk, g.blk, 1.0f / std::sqrt((float) g.hd),
+                       d.att, d.s);
+        const x3::MvJob oj = job(l.o, d.att, Q, d.ao, g.dim);
+        if (!x3::mv(&oj, 1, d.s)) {
+            err = "mv o (window)";
+            return false;
+        }
+        k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
+        k::rms(d.h, l.post1, T, g.dim, g.eps, d.xn, nullptr, d.s);
+        if (!l.moe) {
+            const x3::MvJob gu[2] = {job(l.mg, d.xn, g.dim, d.g, g.ff_dense), job(l.mu, d.xn, g.dim, d.u, g.ff_dense)};
+            if (!x3::mv(gu, 2, d.s)) {
+                err = "mv dense gate/up (window)";
+                return false;
+            }
+            k::swigluoai(d.g, d.u, (size_t) T * g.ff_dense, g.alpha, g.limit, d.g, nullptr, d.s);
+            const x3::MvJob dj = job(l.md, d.g, g.ff_dense, d.ao, g.dim);
+            if (!x3::mv(&dj, 1, d.s)) {
+                err = "mv dense down (window)";
+                return false;
+            }
+            k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
+            return true;
+        }
+        k::rows_dot(l.gate, g.n_exp, g.dim, d.xn, T, d.logit, d.s);
+        k::route(d.logit, l.bias, T, g.n_exp, g.k_exp, d.top, d.w, d.s);
+        const x3::MvJob sgu[2] = {job(l.sg, d.xn, g.dim, d.g, g.ff_shared), job(l.su, d.xn, g.dim, d.u, g.ff_shared)};
+        if (!x3::mv(sgu, 2, d.s)) {
+            err = "mv shared gate/up (window)";
+            return false;
+        }
+        k::swigluoai(d.g, d.u, (size_t) T * g.ff_shared, g.alpha, g.limit, d.g, nullptr, d.s);
+        const x3::MvJob sdj = job(l.sd, d.g, g.ff_shared, d.sh, g.dim);
+        if (!x3::mv(&sdj, 1, d.s)) {
+            err = "mv shared down (window)";
+            return false;
+        }
+        int* rtop = (int*) d.win_rb;
+        float* rw = (float*) (d.win_rb + (size_t) kWin * 8 * 4);
+        float* rx = (float*) (d.win_rb + (size_t) kWin * 8 * 8);
+        CK(cudaMemcpyAsync(rtop, d.top, (size_t) T * g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
+        CK(cudaMemcpyAsync(rw, d.w, (size_t) T * g.k_exp * 4, cudaMemcpyDeviceToHost, d.s));
+        if (lane) CK(cudaMemcpyAsync(rx, d.xn, (size_t) T * g.dim * 4, cudaMemcpyDeviceToHost, d.s));
+        const double ts = now();
+        CK(cudaStreamSynchronize(d.s));
+        st.t_sync += now() - ts;
+        const size_t li = (size_t) (&l - L.data());
+        // the plan: each token's experts (its 8 slots, k used), their pointers (0: the CPU lane's), the groups
+        unsigned long long* pp = (unsigned long long*) d.win_plan_h;
+        float* pw = (float*) (pp + (size_t) kWin * 8);
+        unsigned long long* gp = (unsigned long long*) (pw + (size_t) kWin * 8);
+        int* gs = (int*) (gp + (size_t) kWin * 8);
+        int* ge = gs + kWin * 8 + 1;
+        int* ng = ge + kWin * 8;
+        std::vector<char> busy((size_t) d.n_slots, 0);
+        std::vector<CpuExpert> cpu;
+        std::vector<std::vector<std::pair<int, float>>> users;
+        std::vector<std::pair<int, int>> order;   // the CPU entries (expert, its user) token by token, slot by slot
+        std::vector<int> cpu_of((size_t) g.n_exp, -1);
+        std::vector<std::vector<int>> by_ptr_ent;
+        std::vector<unsigned long long> by_ptr;
+        for (int t = 0; t < T; ++t)
+            for (int i = 0; i < 8; ++i) {
+                const int e = t * 8 + i;
+                pp[e] = 0;
+                pw[e] = 0.0f;
+                if (i >= g.k_exp) continue;
+                const int x = rtop[t * g.k_exp + i];
+                const float wt = rw[t * g.k_exp + i] * g.scale;
+                pw[e] = wt;
+                ++prof[li * g.n_exp + x];
+                if (lane && on_cpu(l, d, x)) {
+                    if (cpu_of[(size_t) x] < 0) {
+                        cpu_of[(size_t) x] = (int) cpu.size();
+                        cpu.push_back(cpu_expert(l, x, 1.0f));
+                        users.emplace_back();
+                    }
+                    users[(size_t) cpu_of[(size_t) x]].push_back({t, wt});
+                    order.push_back({cpu_of[(size_t) x], (int) users[(size_t) cpu_of[(size_t) x]].size() - 1});
+                    continue;
+                }
+                if (!locate(l, d, x, busy, pp[e], err)) return false;
+                size_t gi = 0;
+                while (gi < by_ptr.size() && by_ptr[gi] != pp[e]) ++gi;
+                if (gi == by_ptr.size()) {
+                    by_ptr.push_back(pp[e]);
+                    by_ptr_ent.emplace_back();
+                }
+                by_ptr_ent[gi].push_back(e);
+            }
+        st.profiled += (long) T * g.k_exp;
+        int ne = 0;
+        for (size_t gi = 0; gi < by_ptr.size(); ++gi) {
+            gp[gi] = by_ptr[gi];
+            gs[gi] = ne;
+            for (int e : by_ptr_ent[gi]) ge[ne++] = e;
+        }
+        gs[by_ptr.size()] = ne;
+        *ng = (int) by_ptr.size();
+        CK(cudaMemcpyAsync(d.win_plan_d, d.win_plan_h, win_plan_bytes(), cudaMemcpyHostToDevice, d.s));
+        const size_t off_w = (size_t) kWin * 8 * 8, off_gp = off_w + (size_t) kWin * 8 * 4,
+                     off_gs = off_gp + (size_t) kWin * 8 * 8, off_ge = off_gs + ((size_t) kWin * 8 + 1) * 4,
+                     off_ng = off_ge + (size_t) kWin * 8 * 4;
+        float* cpu_rows = d.win_cpu;
+        int* cpu_flags = (int*) (d.win_cpu + (size_t) kWin * g.dim);
+        unsigned* wait_word = (unsigned*) (cpu_flags + kWin);
+        x3::WinArgs a;
+        a.grp_ptr = (const unsigned long long*) (d.win_plan_d + off_gp);
+        a.grp_start = (const int*) (d.win_plan_d + off_gs);
+        a.grp_ent = (const int*) (d.win_plan_d + off_ge);
+        a.n_groups = (const int*) (d.win_plan_d + off_ng);
+        a.plan_ptr = (const unsigned long long*) d.win_plan_d;
+        a.plan_w = (const float*) (d.win_plan_d + off_w);
+        a.x = d.xn;
+        a.x_stride = (size_t) g.dim;
+        a.h = d.win_h;
+        a.part = d.win_part;
+        a.sh_out = d.sh;
+        a.out = d.out;
+        a.out_stride = (size_t) g.dim;
+        a.lay = l.lay;
+        a.T = T;
+        a.k = g.k_exp;
+        a.n_embd = g.dim;
+        a.n_ff = g.ff;
+        a.limit = g.limit;
+        const bool with_cpu = !cpu.empty();
+        if (with_cpu) {
+            a.cpu_part = cpu_rows;
+            a.cpu_stride = (size_t) g.dim;
+            a.cpu_flag = cpu_flags;
+            a.wait_ptr = wait_word;
+            a.wait_val = ++d.win_wait;
+        }
+        if (!x3::win_experts(a, d.s)) {
+            if (with_cpu) *(volatile unsigned*) wait_word = d.win_wait;   // (never leave the device waiting)
+            err = "win_experts";
+            return false;
+        }
+        if (with_cpu) {   // the CPU lane's parts while the device runs the others; then the word it waits on
+            const double tl = now();
+            lane->run_multi(cpu, users, rx, T, cpu_rows, &order);
+            for (int t = 0; t < T; ++t) cpu_flags[t] = 0;
+            for (const auto& u : users)
+                for (const auto& tu : u) cpu_flags[tu.first] = 1;
+            st.t_lane += now() - tl;
+            st.cpu_experts += (long) cpu.size();
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            *(volatile unsigned*) wait_word = d.win_wait;
+        }
+        k::add(d.h, d.out, (size_t) T * g.dim, d.s);
+        return true;
+    }
+
     // whether expert e of layer l is the CPU lane's this token: neither in VRAM nor in one of d's staging slots
     bool on_cpu(const Layer& l, const Dev& d, int e) const {
         if (l.res_slot[(size_t) e] >= 0) return false;
@@ -792,8 +1026,8 @@ struct Model::Impl {
                         g.eps, l.kc, l.vc, d.s);
         const float one = 1.0f, zero = 0.0f;
         const int nq = g.ix_heads * g.ix_dim;
-        CB(cublasSgemv(d.blas, CUBLAS_OP_T, g.dim, nq, &one, l.wiq, g.dim, d.xn, 1, &zero, d.iq, 1));
-        CB(cublasSgemv(d.blas, CUBLAS_OP_T, g.dim, g.ix_dim, &one, l.wik, g.dim, d.xn, 1, &zero, d.ik, 1));
+        k::rows_dot(l.wiq, nq, g.dim, d.xn, 1, d.iq, d.s);
+        k::rows_dot(l.wik, g.ix_dim, g.dim, d.xn, 1, d.ik, d.s);
         k::index_norm_rope(d.iq, d.ik, l.iqn1, l.ikn1, d.pos, 1, g.ix_heads, g.ix_dim, g.n_rot, inv_dev[(size_t) di],
                            g.eps, l.ic, d.s);
         const int nblk = cur_pos / g.blk + 1;
@@ -823,7 +1057,7 @@ struct Model::Impl {
             k::add(d.h, d.ao, (size_t) g.dim, d.s);
             return true;
         }
-        CB(cublasSgemv(d.blas, CUBLAS_OP_T, g.dim, g.n_exp, &one, l.gate, g.dim, d.xn, 1, &zero, d.logit, 1));
+        k::rows_dot(l.gate, g.n_exp, g.dim, d.xn, 1, d.logit, d.s);
         k::route(d.logit, l.bias, 1, g.n_exp, g.k_exp, d.top, d.w, d.s);
         // the shared expert into sh (while the router's answer comes back)
         const x3::MvJob sgu[2] = {job(l.sg, d.xn, d.g), job(l.su, d.xn, d.u)};
@@ -998,6 +1232,7 @@ struct Model::Impl {
         Dev& d = D[(size_t) l.dev];
         const int di = l.dev;
         if (T == 1 && o.fast_decode) return layer_token(l, d, di, err);
+        if (T <= kWin && o.fast_decode) return layer_window(l, d, di, T, err);
         // attention
         k::rms(d.h, l.in1, T, g.dim, g.eps, d.xn, d.xn16, d.s);
         x3::gemm_rows(l.q, d.xn16, g.dim, T, d.q, g.n_head * g.hd, 0.0f, d.s);
@@ -1108,6 +1343,15 @@ struct Model::Impl {
             }
             CK(cudaSetDevice(D[(size_t) dv].id));
             if (!layer(li, T, pos0 + T - 1, err)) return false;
+            if (draftm && tap_of[(size_t) li] >= 0) {   // (the draft's context: this layer's output rows)
+                Dev& a = D[(size_t) dv];
+                Dev& hd = D[(size_t) head_dev];
+                float* dst = taps + (size_t) tap_of[(size_t) li] * T * g.dim;
+                if (dv == head_dev)
+                    CK(cudaMemcpyAsync(dst, a.h, (size_t) T * g.dim * 4, cudaMemcpyDeviceToDevice, a.s));
+                else
+                    CK(cudaMemcpyPeerAsync(dst, hd.id, a.h, a.id, (size_t) T * g.dim * 4, a.s));
+            }
             if (const char* dp = std::getenv("MM3_DUMP_HS")) {   // (debugging: every layer's residual stream, F32 rows)
                 std::vector<float> hh((size_t) T * g.dim);
                 CK(cudaMemcpyAsync(hh.data(), D[(size_t) dv].h, hh.size() * 4, cudaMemcpyDeviceToHost, D[(size_t) dv].s));
@@ -1136,16 +1380,22 @@ struct Model::Impl {
                 CK(cudaMemcpyPeerAsync(hd.h, hd.id, a.h, a.id, (size_t) T * g.dim * 4, hd.s));
             const float* last = hd.h + (size_t) (T - want) * g.dim;
             k::rms(last, norm1, want, g.dim, g.eps, hd.xn, hd.xn16, hd.s);
-            if (want == 1 && o.fast_decode) {
-                x3::MvJob j;
-                j.m = &head;
-                j.xf = hd.xn;
-                j.y = hd.lg;
-                if (!x3::mv(&j, 1, hd.s)) {
-                    err = "mv head";
-                    return false;
+            if (want <= kWin && o.fast_decode) {   // (a token's and a window's rows: mv, the same bits for each row)
+                const int cols = std::max(1, x3::mv_cols(head));   // (the split partials' scratch: ~5 rows a pass)
+                for (int c0 = 0; c0 < want; c0 += cols) {
+                    x3::MvJob j;
+                    j.m = &head;
+                    j.xf = hd.xn + (size_t) c0 * g.dim;
+                    j.y = hd.lg + (size_t) c0 * g.vocab;
+                    j.ncol = std::min(cols, want - c0);
+                    j.xf_cs = (size_t) g.dim;
+                    j.y_cs = (size_t) g.vocab;
+                    if (!x3::mv(&j, 1, hd.s)) {
+                        err = "mv head";
+                        return false;
+                    }
                 }
-                CK(cudaMemcpyAsync(logits, hd.lg, (size_t) g.vocab * 4, cudaMemcpyDeviceToHost, hd.s));
+                CK(cudaMemcpyAsync(logits, hd.lg, (size_t) want * g.vocab * 4, cudaMemcpyDeviceToHost, hd.s));
                 CK(cudaStreamSynchronize(hd.s));
                 want = 0;
             }
@@ -1167,6 +1417,10 @@ struct Model::Impl {
             err = "EXL3 launch errors: " + std::to_string(e);
             return false;
         }
+        if (draftm) {
+            CK(cudaSetDevice(D[(size_t) head_dev].id));
+            if (!draftm->context(taps, T, pos0, err)) return false;
+        }
         return true;
     }
 };
@@ -1180,6 +1434,17 @@ int Model::bos() const { return p->g.bos; }
 int Model::eos() const { return p->g.eos; }
 const Stats& Model::stats() const { return p->st; }
 std::vector<std::string> Model::info_lines() const { return p->info; }
+
+int Model::draft_block() const { return p->draftm ? p->draftm->geo().block : 0; }
+
+bool Model::draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err) {
+    if (!p->draftm) {
+        err = "no DSpark draft loaded (--dspark)";
+        return false;
+    }
+    cudaSetDevice(p->D[(size_t) p->head_dev].id);
+    return p->draftm->propose(anchor, pos, n, drafts, conf, nullptr, err);
+}
 
 bool Model::save_profile(const std::string& path, std::string& err) const {
     std::FILE* f = std::fopen(path.c_str(), "wb");

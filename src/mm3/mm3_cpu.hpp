@@ -24,6 +24,14 @@ public:
     CpuLane& operator=(const CpuLane&) = delete;
     /// out [dim] = sum over ex of w * down(swigluoai(gate(x), up(x))), x [dim] (F32).  At most 8 experts.
     void run(const std::vector<CpuExpert>& ex, const float* x, float* out);
+    /// A window's: expert i of ex for the tokens users[i] ((token, weight) pairs), x rows [T][dim] -> out rows
+    /// [T][dim] = each token's weighted sum of its experts here (0 for a token with none).  Each expert's weights are
+    /// decoded once for up to 8 of its tokens.  At most kMaxEntries (expert, token) pairs.
+    static constexpr int kMaxEntries = 64;
+    /// order (if given): the (expert, user) pairs in the order each token's sum takes them (the token path's: its
+    /// slots'), so a token's sum is run()'s bits; else expert by expert.
+    void run_multi(const std::vector<CpuExpert>& ex, const std::vector<std::vector<std::pair<int, float>>>& users,
+                   const float* x, int T, float* out, const std::vector<std::pair<int, int>>* order = nullptr);
     int threads() const;
 
 private:

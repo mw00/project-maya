@@ -26,6 +26,7 @@ struct Options {
     bool pin_pool = true;         // the experts not in VRAM assembled once in pinned host memory (a miss: one DMA)
     bool fast_decode = true;      // one token: the decode GEMVs and the token's fused experts (else the prompt path)
     int cpu_threads = 43;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged)
+    bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
     bool verbose = false;
 };
 
@@ -59,6 +60,11 @@ public:
     std::vector<std::string> info_lines() const;
     /// The routings counted so far (with the loaded profile's, if any) as a profile file.
     bool save_profile(const std::string& path, std::string& err) const;
+    /// The DSpark draft (Options::dspark): its block (the most tokens a proposal has; 0 without the draft), and up to
+    /// n tokens proposed after `anchor` at position pos (the cache holds the positions before it) with their
+    /// confidences.
+    int draft_block() const;
+    bool draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
 
 private:
     struct Impl;

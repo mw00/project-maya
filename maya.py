@@ -4080,7 +4080,11 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     if MM3_PROFILE.exists():
         args += ["--profile", str(MM3_PROFILE)]
     kept = keep_args(old.get("args") or [], args, ("--chunk", "--staging", "--cpu-threads", "--reserve-gb",
-                                                    "--resident-cap"))
+                                                    "--resident-cap", "--dspark", "--dspark-conf"))
+    # DSpark (the draft in the pack: tools/mm3/pack.py indexes dspark/): drafts verified by the model, the same tokens
+    # it would answer alone - about 1.6x the decode on the 3090 + 8x 5060 Ti it was measured on
+    if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
+        args += ["--dspark", "on"]
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": old.get("sampling") or dict(MM3_SAMPLING),

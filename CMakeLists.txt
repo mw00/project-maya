@@ -502,7 +502,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # (swigluoai) - none of the other engines' code.  CUDA on Linux.
   if(STRATA_ENABLE_CUDA AND NOT WIN32)
     add_executable(maya-mm3 src/mm3/mm3_main.cpp src/mm3/mm3_model.cu src/mm3/mm3_kernels.cu src/mm3/mm3_exl3.cu
-                            src/mm3/mm3_cpu.cpp)
+                            src/mm3/mm3_cpu.cpp src/mm3/mm3_dspark.cu)
     target_include_directories(maya-mm3 PRIVATE ${_strata_gpu_include_directories} include src/mm3)
     # (the CPU lane: the shared CPU EXL3 kernels, used as they are)
     target_link_libraries(maya-mm3 PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target} ${_strata_gpu_blas_target})

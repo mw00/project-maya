@@ -124,6 +124,8 @@ struct Req {
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
     long long think_budget = 0;
     int think_end = -1;
+    int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
+    float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
     std::vector<int> ids;
 };
 
@@ -148,15 +150,18 @@ bool parse_gen(const std::string& line, Req& r) {
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
-        // (keys this engine does not use - spec, dspark_conf, ... - are taken and ignored)
+        else if (k == "spec") r.spec = std::atoi(v.c_str()) != 0;
+        else if (k == "dspark_conf" || k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);
+        // (keys this engine does not use are taken and ignored)
     }
     return !r.ids.empty();
 }
 
-// the next token from one row of logits: penalties over the history's last pen_n tokens (llama.cpp's), then greedy
-// (temperature <= 0) or temperature, top_k, top_p, min_p and a draw
-int sample(std::vector<float>& lg, const Req& r, const std::vector<int>& hist, std::mt19937_64& rng) {
-    const int V = (int) lg.size();
+// the next token's distribution from one row of logits: penalties over the history's last pen_n tokens (llama.cpp's),
+// then greedy (temperature <= 0: the argmax alone) or temperature, top_k, top_p, min_p - (token, probability) pairs,
+// the most likely first, summing to 1
+std::vector<std::pair<int, double>> dist(const float* row, int V, const Req& r, const std::vector<int>& hist) {
+    std::vector<float> lg(row, row + V);
     if (r.pen_n != 0 && (r.pen_repeat != 1.0f || r.pen_freq != 0.0f || r.pen_present != 0.0f)) {
         std::unordered_map<int, int> cnt;
         const size_t n = r.pen_n < 0 ? hist.size() : std::min(hist.size(), (size_t) r.pen_n);
@@ -172,7 +177,7 @@ int sample(std::vector<float>& lg, const Req& r, const std::vector<int>& hist, s
         int b = 0;
         for (int i = 1; i < V; ++i)
             if (lg[(size_t) i] > lg[(size_t) b]) b = i;
-        return b;
+        return {{b, 1.0}};
     }
     std::vector<std::pair<float, int>> c;
     c.reserve((size_t) V);
@@ -198,18 +203,37 @@ int sample(std::vector<float>& lg, const Req& r, const std::vector<int>& hist, s
     }
     double s2 = 0;
     for (size_t i = 0; i < keep; ++i) s2 += p[i];
-    double u = std::uniform_real_distribution<double>(0.0, s2)(rng);
-    for (size_t i = 0; i < keep; ++i) {
-        u -= p[i];
-        if (u <= 0) return c[i].second;
-    }
-    return c[keep - 1].second;
+    std::vector<std::pair<int, double>> out(keep);
+    for (size_t i = 0; i < keep; ++i) out[i] = {c[i].second, p[i] / s2};
+    return out;
 }
 
-int serve(mm3::Model& m, const std::vector<int>& eos, int chunk) {
+// a draw from d, without `skip` (renormalised; -1: none)
+int draw(const std::vector<std::pair<int, double>>& d, std::mt19937_64& rng, int skip = -1) {
+    double tot = 0;
+    for (const auto& [t, q] : d)
+        if (t != skip) tot += q;
+    if (!(tot > 0)) return d[0].first;
+    double u = std::uniform_real_distribution<double>(0.0, tot)(rng);
+    int last = d[0].first;
+    for (const auto& [t, q] : d) {
+        if (t == skip) continue;
+        last = t;
+        u -= q;
+        if (u <= 0) return t;
+    }
+    return last;
+}
+
+int sample(std::vector<float>& lg, const Req& r, const std::vector<int>& hist, std::mt19937_64& rng) {
+    return draw(dist(lg.data(), (int) lg.size(), r, hist), rng);
+}
+
+int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
-    std::printf("INFO engine=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld\n", st0.resident, st0.experts);
+    std::printf("INFO engine=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld dspark=%d\n", st0.resident,
+                st0.experts, m.draft_block() > 0 && spec_on ? 1 : 0);
     std::printf("READY %d stop\n", m.max_ctx());
     std::fflush(stdout);
     std::fprintf(stderr, "maya mm3 serve: GEN <max_new> [keys] <ids>; STOP, QUIT\n");
@@ -292,38 +316,110 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk) {
                         ms > 0 ? 1000.0 * (double) produced / ms : 0.0, produced > 0 ? ms / (double) produced : 0.0,
                         ex > 0 ? 1.0 - cx / ex : 1.0, produced > 0 ? cx / (double) produced : 0.0);
         };
+        // DSpark: a round drafts after the token, verifies the token and its drafts in one forward and keeps the drafts
+        // the target agrees with - greedy: its argmax; sampling: a draft d kept with the target's probability of d (the
+        // drafts are the draft's argmax), else the token drawn from the target's distribution without d - so every
+        // token comes from the target's own distribution; then the target's next token after the last kept one
+        const int B = m.draft_block();
+        const bool spec = B > 0 && (r.spec < 0 ? spec_on : r.spec != 0);
+        const float floor = r.conf >= 0.0f ? r.conf : conf_floor;
+        std::vector<float> lgw(spec ? (size_t) (B + 1) * m.vocab() : 0);
+        std::vector<int> drafts;
+        std::vector<float> confs;
+        long long d_off = 0, d_acc = 0;
+        // one token out: false when the answer ends with it (an end token, max_new, the context)
+        auto emit = [&](int t) -> bool {
+            std::printf("T %d\n", t);
+            ++produced;
+            if (in_think && t == r.think_end) in_think = false;
+            if (produced % 8 == 0) stat_line();
+            std::fflush(stdout);
+            for (int e : eos)
+                if (t == e) {
+                    finish = "stop";
+                    return false;
+                }
+            return produced < r.max_new && (int) state.size() < m.max_ctx();
+        };
         for (;;) {
             if (in.stop.load()) {
                 finish = "cancel";
                 break;
             }
             if (in_think && produced >= r.think_budget && tok != r.think_end) tok = r.think_end;   // (the budget)
-            std::printf("T %d\n", tok);
-            ++produced;
-            if (in_think && tok == r.think_end) in_think = false;
-            if (produced % 8 == 0) stat_line();
-            std::fflush(stdout);
-            bool end = false;
-            for (int e : eos) end = end || tok == e;
-            if (end) {
-                finish = "stop";
-                break;
+            if (!emit(tok)) break;
+            const int pos = (int) state.size();
+            int k = 0;
+            if (spec) {   // (the drafts that can still be answer tokens: max_new, the context, the thinking budget)
+                long long room = std::min<long long>(r.max_new - produced, (long long) m.max_ctx() - pos - 1);
+                if (in_think) room = std::min<long long>(room, r.think_budget - produced);
+                if (room > 0) {
+                    if (!m.draft(tok, pos, B, drafts, confs, err)) {
+                        std::fprintf(stderr, "mm3: %s\n", err.c_str());
+                        finish = "cancel";
+                        break;
+                    }
+                    while (k < (int) drafts.size() && k < room && confs[(size_t) k] >= floor) ++k;
+                }
             }
-            if (produced >= r.max_new || (int) state.size() >= m.max_ctx()) break;
-            if (!m.forward(&tok, 1, (int) state.size(), 1, lg.data(), err)) {
+            if (k == 0) {
+                if (!m.forward(&tok, 1, pos, 1, lgw.empty() ? lg.data() : lgw.data(), err)) {
+                    std::fprintf(stderr, "mm3: %s\n", err.c_str());
+                    finish = "cancel";
+                    break;
+                }
+                state.push_back(tok);
+                const float* row = lgw.empty() ? lg.data() : lgw.data();
+                tok = draw(dist(row, m.vocab(), r, state), rng);
+                continue;
+            }
+            std::vector<int> win(1, tok);
+            win.insert(win.end(), drafts.begin(), drafts.begin() + k);
+            if (!m.forward(win.data(), k + 1, pos, k + 1, lgw.data(), err)) {
                 std::fprintf(stderr, "mm3: %s\n", err.c_str());
                 finish = "cancel";
                 break;
             }
             state.push_back(tok);
-            tok = sample(lg, r, state, rng);
+            d_off += k;
+            bool more = true;
+            int next = -1;
+            for (int i = 0; i <= k && more; ++i) {
+                const auto d = dist(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r, state);
+                if (i == k) {   // every draft kept: the target's token after them
+                    next = draw(d, rng);
+                    break;
+                }
+                const int x = drafts[(size_t) i];
+                double px = 0;
+                for (const auto& [t, q] : d)
+                    if (t == x) px = q;
+                const bool keep = r.temperature > 0.0f ? std::uniform_real_distribution<double>(0.0, 1.0)(rng) < px
+                                                       : d[0].first == x;
+                if (!keep) {
+                    next = r.temperature > 0.0f ? draw(d, rng, x) : d[0].first;
+                    break;
+                }
+                ++d_acc;
+                if (in.stop.load()) {
+                    finish = "cancel";
+                    more = false;
+                    break;
+                }
+                more = emit(x);
+                state.push_back(x);
+            }
+            if (!more) break;
+            tok = next;
         }
+        if (spec && d_off > 0)
+            std::fprintf(stderr, "maya mm3 serve: DSpark kept %lld of %lld drafts\n", d_acc, d_off);
         stat_line();
         const double t2 = now() * 1e3;
         const auto& se = m.stats();
         const long long look = se.profiled - s_dec.profiled, cpu = se.cpu_experts - s_dec.cpu_experts;
-        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
-                    from, look - cpu, look);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
+                    finish, d_acc, d_off, from, look - cpu, look);
         std::fflush(stdout);
         std::fprintf(stderr,
                      "maya mm3 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
@@ -351,6 +447,7 @@ int main(int argc, char** argv) {
     std::string ids_arg, dump, profile_out, batch, eos_arg;
     bool serve_mode = false;
     int gen = 0, last = 1, ppl = 0;
+    float dspark_conf = 0.5f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -378,6 +475,8 @@ int main(int argc, char** argv) {
         else if (a == "--ppl") ppl = std::atoi(val().c_str());
         else if (a == "--batch") batch = val();
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
+        else if (a == "--dspark") o.dspark = val() != "off";
+        else if (a == "--dspark-conf") dspark_conf = (float) std::atof(val().c_str());
         else if (a == "--serve") serve_mode = true;
         else if (a == "--eos") eos_arg = val();
         else if (a == "--verbose") o.verbose = true;
@@ -397,7 +496,7 @@ int main(int argc, char** argv) {
     }
     if (serve_mode) {
         std::vector<int> eos = eos_arg.empty() ? std::vector<int>{m.eos()} : parse_list(eos_arg);
-        return serve(m, eos, o.chunk);
+        return serve(m, eos, o.chunk, o.dspark, dspark_conf);
     }
     const auto& st = m.stats();
     std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st.load_s,
@@ -500,6 +599,67 @@ int main(int argc, char** argv) {
     };
     int next = argmax(logits.data() + (size_t) (last - 1) * m.vocab());
     std::printf("next %d\n", next);
+    if (gen > 0 && m.draft_block() > 0) {   // greedy decode in DSpark rounds: draft, verify in one forward, keep
+        const int B = m.draft_block();
+        std::vector<float> lg((size_t) (B + 1) * m.vocab());
+        std::vector<int> out, drafts;
+        std::vector<float> conf;
+        t0 = now();
+        int pos = n, rounds = 0, offered = 0, accepted = 0;
+        double t_draft = 0, t_verify = 0;
+        const auto s0 = m.stats();
+        while ((int) out.size() < gen) {
+            out.push_back(next);
+            if (next == m.eos()) break;
+            const double td = now();
+            if (!m.draft(next, pos, B, drafts, conf, err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            t_draft += now() - td;
+            int k = 0;
+            while (k < (int) drafts.size() && conf[(size_t) k] >= dspark_conf) ++k;
+            if (std::getenv("MM3_CONF")) {   // (debugging: each round's confidences)
+                std::fprintf(stderr, "conf");
+                for (float c : conf) std::fprintf(stderr, " %.3f", c);
+                std::fprintf(stderr, " -> %d\n", k);
+            }
+            std::vector<int> win(1, next);
+            win.insert(win.end(), drafts.begin(), drafts.begin() + k);
+            const double tv = now();
+            if (!m.forward(win.data(), (int) win.size(), pos, (int) win.size(), lg.data(), err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            t_verify += now() - tv;
+            int j = 0;
+            for (; j < k; ++j) {
+                if (drafts[(size_t) j] != argmax(lg.data() + (size_t) j * m.vocab())) break;
+                out.push_back(drafts[(size_t) j]);
+                if (drafts[(size_t) j] == m.eos()) break;
+            }
+            ++rounds;
+            offered += k;
+            accepted += j;
+            if (j < k && drafts[(size_t) j] == m.eos()) break;
+            if (j > 0 && out.back() == m.eos()) break;
+            next = argmax(lg.data() + (size_t) j * m.vocab());
+            pos += j + 1;
+        }
+        t1 = now();
+        for (size_t i = 0; i < out.size(); ++i) std::printf("%d%s", out[i], i + 1 < out.size() ? " " : "\n");
+        std::fprintf(stderr, "decode (DSpark): %zu tokens in %.2f s (%.2f tok/s), %d rounds, %d of %d drafts kept "
+                     "(%.2f a round), drafting %.1f ms a round\n", out.size(), t1 - t0, out.size() / (t1 - t0), rounds,
+                     accepted, offered, rounds ? (double) accepted / rounds : 0.0, rounds ? 1e3 * t_draft / rounds : 0.0);
+        if (rounds) {
+            const auto& s1 = m.stats();
+            std::fprintf(stderr, "  a round: verify %.1f ms (routing waits %.1f, CPU lane %.1f, %.1f experts on the CPU, "
+                         "%.1f staged)\n", 1e3 * t_verify / rounds, 1e3 * (s1.t_sync - s0.t_sync) / rounds,
+                         1e3 * (s1.t_lane - s0.t_lane) / rounds, (double) (s1.cpu_experts - s0.cpu_experts) / rounds,
+                         (double) (s1.staged - s0.staged) / rounds);
+        }
+        gen = 0;
+    }
     if (gen > 0) {
         std::vector<float> lg((size_t) m.vocab());
         std::string out;

@@ -25,7 +25,9 @@ void rope_inv_freq(float theta, int n_rot, float* inv /*[n_rot / 2]*/);
 /// BF16.  inv [n_rot / 2] on the device.
 void qk_norm_rope(float* q, const float* k, const float* v, const float* qn1, const float* kn1, const int* pos, int T,
                   int Hq, int Hkv, int hd, int n_rot, const float* inv, float eps, uint16_t* kc, uint16_t* vc,
-                  cudaStream_t s);
+                  cudaStream_t s, int ring = 0);
+/// (ring > 0: the caches are rings of that many rows, position p at row p % ring - the DSpark draft's window.  Hq 0:
+///  K and V alone)
 
 /// The indexer's queries iq [T][Hi][D] in place (norm, RoPE, rounded through BF16 as the model dtype keeps them) and
 /// its key ik [T][D] (norm, RoPE) into the index cache ic at row pos[t] (BF16).
@@ -67,5 +69,25 @@ void moe_combine(const float* res, const float* y, const int* inv, const float* 
 
 /// x += a (n floats).
 void add(float* x, const float* a, size_t n, cudaStream_t s);
+/// Y [T][N] = X [T][K] . W [N][K]^T in F32, one warp an output in a fixed order: a token's row is the same bits
+/// whatever T (the token path's and a window's router and indexer agree).
+void rows_dot(const float* W, int N, int K, const float* X, int T, float* Y, cudaStream_t s);
+
+// ---- the DSpark draft's
+
+/// out [N][K] BF16 = an MXFP8 matrix: w (E4M3 bytes [N][K]) times 2^(scale - 127), scale (E8M0 bytes [N][K / 32]).
+void mxfp8_to_bf16(const uint8_t* w, const uint8_t* scale, int N, int K, uint16_t* out, cudaStream_t s);
+/// BF16 copies of rows (ld floats a row in, ldo out).
+void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, cudaStream_t s);
+/// out [T][Hq][hd]: each query head over its KV group's keys at the positions lo[t] .. hi (rings of `ring` rows,
+/// position p at row p % ring), not causal - softmax(q . k * scale) . v in F32.  hd = 128, Hq / Hkv = 16.
+void window_attn(const float* q, const uint16_t* kc, const uint16_t* vc, int ring, const int* lo, int hi, int T,
+                 int Hq, int Hkv, float scale, float* out, cudaStream_t s);
+/// One Markov step: emb (BF16 [R], for the GEMV) and embf (F32 [R]) = table row *prev.
+void gather_row(const uint16_t* table, int R, const int* prev, uint16_t* emb, float* embf, cudaStream_t s);
+/// ... then: the next token = argmax(logits + bias) (ties: the lower id) -> *prev and *out; biased (if given) = logits +
+/// bias; conf (if given) = sigmoid(w . [hidden ; embf] + b) with w [D + R] F32, b F32.
+void markov_pick(const float* logits, const float* bias, int V, int* prev, int* out, float* biased, const float* w,
+                 const float* b, const float* hidden, int D, const float* embf, int R, float* conf, cudaStream_t s);
 
 }  // namespace mm3::k
