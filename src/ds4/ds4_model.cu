@@ -1382,7 +1382,8 @@ struct Model::Impl {
 #endif
     }
     bool copy_mode = false;
-    std::vector<std::array<uint8_t*, 2>> ram_part;   // slot -> its parts
+    static constexpr int kMaxNH = 4;               // (DS4_COPY_NUMA: up to a part per node of a 4-socket host)
+    std::vector<std::array<uint8_t*, kMaxNH>> ram_part;   // slot -> its parts
     std::vector<std::array<size_t, 4>> cp_lay;       // layer -> part offsets of gate, up, down rows; a part's bytes
     std::vector<int> copy_spare;                      // layer -> its spare slot (-1: none)
     // the recent slots: DS4_RECENT a trunk layer (0: none; 32 where the prompts stream the experts by DMA - the serve
@@ -3997,7 +3998,7 @@ struct Model::Impl {
     // into its ring slot once that slot's last use is queued: the copy stream waits for it) as far as they can go now
     bool flow_pump(Chunk& c, std::string& err) {
         const size_t end = c.base + c.items.size();
-        IoQueue::Job jobs[6];
+        IoQueue::Job jobs[3 * kMaxNH];   // (3 matrices, each from up to kMaxNH copy parts)
         while (c.n_read < end) {
             Chunk::Item& it = fit(c, c.n_read);
             if (it.after >= 0) {   // layer-major: a slot's expert copied out of it once its reader is done; a slot
@@ -5179,8 +5180,8 @@ struct Model::Impl {
         }
         // NUMA parts: whole rows of each matrix, so any row count the nodes divide
         int nh = (int) std::min<size_t>(2, std::max<size_t>(1, cores.size()));
-        if (const char* v = std::getenv("DS4_COPY_NUMA"))   // (0 / 1: one part; 2: two, even on one node - a test)
-            nh = std::atoi(v) >= 2 ? 2 : 1;
+        if (const char* v = std::getenv("DS4_COPY_NUMA"))   // (0 / 1: one part; 2-4: that many, a node each; more
+            nh = std::max(1, std::min(kMaxNH, std::atoi(v)));   // than the host's nodes: a test on fewer)
         if (g.ff % nh != 0 || g.dim % nh != 0) nh = 1;
         NH = nh;
         cp_lay.assign(L.size(), {0, 0, 0, 0});
@@ -5211,7 +5212,7 @@ struct Model::Impl {
             const int ns = n_copy[(size_t) l.il] + (n_copy[(size_t) l.il] > 0 ? spare_of(l) : 0);
             if (ns == 0) continue;
             const size_t part = cp_lay[(size_t) l.il][3], bytes = (size_t) ns * part;
-            std::array<uint8_t*, 2> base = {nullptr, nullptr};
+            std::array<uint8_t*, kMaxNH> base{};
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
                 base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
@@ -5229,8 +5230,11 @@ struct Model::Impl {
                 continue;
             }
             first[(size_t) l.il] = (int) ram_part.size();
-            for (int i = 0; i < ns; ++i)
-                ram_part.push_back({base[0] + (size_t) i * part, NH > 1 ? base[1] + (size_t) i * part : nullptr});
+            for (int i = 0; i < ns; ++i) {
+                std::array<uint8_t*, kMaxNH> slot{};
+                for (int X = 0; X < NH; ++X) slot[(size_t) X] = base[(size_t) X] + (size_t) i * part;
+                ram_part.push_back(slot);
+            }
             if (spare_of(l)) copy_spare[(size_t) l.il] = first[(size_t) l.il] + ns - 1;
         }
         struct Job {
