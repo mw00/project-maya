@@ -219,8 +219,11 @@ override:
 ```
 
 Run on one MI325X (256 GB HBM3E), EPYC 9575F, 157 GB RAM, ROCm 7.14, Maya-S-v2-IQ2_XXS, 32K context, the config setup
-writes (no hipBLASLt table for gfx942 yet): every expert sits in the GPU pool (85.2 GB, 306 slots a layer) with 166 GB
-of VRAM still free; 256-token answers at ~74.5 tok/s (100% VRAM hits), a 10K-token prompt at ~1520 tok/s. 72 of the
+writes: every expert sits in the GPU pool (85.2 GB, 306 slots a layer) with 166 GB of VRAM still free; 256-token
+answers at ~74.5 tok/s (100% VRAM hits), 3K- and 16K-token prompts at ~1525 tok/s. The hipBLASLt table
+(`tools/hip/gfx942-glm-hipblaslt-100401.txt`, ROCm 7.14's hipBLASLt 1.4.1; the twelve GLM projection shapes at
+T = 64-8192) beats plain hipBLAS on every row, 1.1-1.4x at T = 8192 and up to 27x at T = 64, but the projections are
+a small share of a prompt here: without it the same prompts read at 1432 and 1468 tok/s. 72 of the
 76 CTest checks pass, and HC1 / HC2 too; the other four need model fixtures (`ple_parity`, `expert_parity`,
 `pool_test`) or fail to link on every architecture (`hip_expert_cache_staging`). Single GPU only so far.
 
