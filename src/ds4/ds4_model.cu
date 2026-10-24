@@ -621,10 +621,11 @@ struct Chunk {
     std::unique_ptr<Pool> readers;
     cublasHandle_t blas = nullptr;
     // the busy experts' path (run_set, DS4_FAT_ROWS): one expert's weights as FP16 (gate and up, then down), the rows
-    // gathered for its GEMM, the GEMM's gate | up output - fat_r rows a piece; allocated at the first use
+    // gathered for its GEMM, the GEMM's gate | up output - fat_r rows a piece, fat_ff FFN columns at most (the widest
+    // the device's layers give it: an uneven split's members change width layer by layer); allocated at the first use
     uint16_t *fat_w = nullptr, *fat_x = nullptr;
     float* fat_gu = nullptr;
-    int fat_r = 0;
+    int fat_r = 0, fat_ff = 0;
     bool fat_off = false;
     // host-mapped: a chunk's hand-off to the next group (h | pre | topk | cand), two in flight (slot = chunk % 2), each
     // with its flag, and the next group's members' acknowledgements [slot][member] (32 apart)
@@ -3474,7 +3475,13 @@ struct Model::Impl {
         return false;
 #else
         if (fat_rows() <= 0 || c.fat_off) return false;
-        if (c.fat_w != nullptr) return true;
+        if (c.fat_w != nullptr) return FF <= c.fat_ff;   // (wider than allocated: the tiles take it)
+        // (sized for the widest FFN this device's layers give it, not the first one's: with DS4_TP_GGUF_UNEVEN the odd
+        //  block goes round the members layer by layer, so a member's width differs between its layers)
+        const int di = (int) (&d - devs.data());   // (c.dev: the flow's chunks only)
+        for (const Layer& l0 : L)
+            for (int m = 0; m < l0.nm; ++m)
+                if (member(l0, m).dev == di) FF = std::max(FF, member(l0, m).ffn);
         static const int R = std::getenv("DS4_FAT_PIECE") ? std::max(64, std::atoi(std::getenv("DS4_FAT_PIECE"))) : 1024;
         if (cudaSetDevice(d.id) != cudaSuccess || cudaMalloc(&c.fat_w, (size_t) 2 * FF * D * 2) != cudaSuccess ||
             cudaMalloc(&c.fat_x, (size_t) R * D * 2) != cudaSuccess ||
@@ -3486,8 +3493,10 @@ struct Model::Impl {
             return false;
         }
         c.fat_r = R;
-        std::fprintf(stderr, "ds4: CUDA%d busy experts (%d rows or more) as FP16 GEMMs, %d rows a piece (%.0f MB)\n", d.id,
-                     fat_rows(), R, ((double) 2 * FF * D * 2 + (double) R * D * 2 + (double) R * 2 * FF * 4) / 1e6);
+        c.fat_ff = FF;
+        std::fprintf(stderr, "ds4: CUDA%d busy experts (%d rows or more) as FP16 GEMMs, %d rows a piece, FFN up to %d "
+                     "(%.0f MB)\n", d.id, fat_rows(), R, FF,
+                     ((double) 2 * FF * D * 2 + (double) R * D * 2 + (double) R * 2 * FF * 4) / 1e6);
         return true;
 #endif
     }
