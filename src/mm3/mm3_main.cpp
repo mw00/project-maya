@@ -447,7 +447,7 @@ int main(int argc, char** argv) {
     std::string ids_arg, dump, profile_out, batch, eos_arg;
     bool serve_mode = false;
     int gen = 0, last = 1, ppl = 0;
-    float dspark_conf = 0.5f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
+    float dspark_conf = 0.7f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -605,21 +605,22 @@ int main(int argc, char** argv) {
         std::vector<int> out, drafts;
         std::vector<float> conf;
         t0 = now();
-        int pos = n, rounds = 0, offered = 0, accepted = 0;
+        int pos = n, rounds = 0, offered = 0, accepted = 0, drafted = 0;
         double t_draft = 0, t_verify = 0;
         const auto s0 = m.stats();
         while ((int) out.size() < gen) {
             out.push_back(next);
             if (next == m.eos()) break;
             const double td = now();
+            int k = 0;
             if (!m.draft(next, pos, B, drafts, conf, err)) {
                 std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
                 return 1;
             }
-            t_draft += now() - td;
-            int k = 0;
             while (k < (int) drafts.size() && conf[(size_t) k] >= dspark_conf) ++k;
-            if (std::getenv("MM3_CONF")) {   // (debugging: each round's confidences)
+            ++drafted;
+            t_draft += now() - td;
+            if (std::getenv("MM3_CONF") && k > 0) {   // (debugging: each round's confidences)
                 std::fprintf(stderr, "conf");
                 for (float c : conf) std::fprintf(stderr, " %.3f", c);
                 std::fprintf(stderr, " -> %d\n", k);
@@ -649,8 +650,9 @@ int main(int argc, char** argv) {
         t1 = now();
         for (size_t i = 0; i < out.size(); ++i) std::printf("%d%s", out[i], i + 1 < out.size() ? " " : "\n");
         std::fprintf(stderr, "decode (DSpark): %zu tokens in %.2f s (%.2f tok/s), %d rounds, %d of %d drafts kept "
-                     "(%.2f a round), drafting %.1f ms a round\n", out.size(), t1 - t0, out.size() / (t1 - t0), rounds,
-                     accepted, offered, rounds ? (double) accepted / rounds : 0.0, rounds ? 1e3 * t_draft / rounds : 0.0);
+                     "(%.2f a round), drafting %.1f ms a draft (%d drafts)\n", out.size(), t1 - t0, out.size() / (t1 - t0),
+                     rounds, accepted, offered, rounds ? (double) accepted / rounds : 0.0,
+                     drafted ? 1e3 * t_draft / drafted : 0.0, drafted);
         if (rounds) {
             const auto& s1 = m.stats();
             std::fprintf(stderr, "  a round: verify %.1f ms (routing waits %.1f, CPU lane %.1f, %.1f experts on the CPU, "
