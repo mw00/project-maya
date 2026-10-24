@@ -2149,7 +2149,12 @@ int main(int argc, char** argv) {
         const size_t rb = t == GGML_TYPE_IQ4_NL ? (size_t) k / 32 * 18 : gg::type_row_bytes(t, k);   // (IQ4_NL: Engram only)
         std::vector<uint8_t> w(rb * (size_t) n);
         std::FILE* f = std::fopen(argv[4], "rb");
-        if (f == nullptr || fseeko(f, (off_t) std::atoll(argv[5]), SEEK_SET) != 0 || std::fread(w.data(), 1, w.size(), f) != w.size())
+#ifdef _WIN32
+        const bool seek_ok = f != nullptr && _fseeki64(f, std::atoll(argv[5]), SEEK_SET) == 0;
+#else
+        const bool seek_ok = f != nullptr && fseeko(f, (off_t) std::atoll(argv[5]), SEEK_SET) == 0;
+#endif
+        if (!seek_ok || std::fread(w.data(), 1, w.size(), f) != w.size())
             return 3;
         std::fclose(f);
         if (t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_Q5_K && argc >= 8 && std::strstr(argv[7], "embd")) {   // (host / Engram decoders)
