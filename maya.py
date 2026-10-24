@@ -453,14 +453,30 @@ DS4_35 = DS4 + "-3.5bpw"                            # the same model in LibertAI
 DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211, "memory_gb": DS4_MEMORY_GB, "dir": DS4},
             "exl3-3.5": {"bits": "3.5", "manifest": ROOT / "tools" / "ds4" / "download-3.5bpw.json", "weights_gb": 258,
                          "memory_gb": 280, "dir": DS4_35}}
-FAMILIES = ("glm", "deepseek")
+# MiniMax-M3.1-Flash: its own engine (src/mm3, build/maya-mm3) reads Mia-AiLab's EXL3 quant at 3.5 bits (EAQ v1) in place
+# from its safetensors; every file is pinned and checked (tools/mm3/download.json, its DSpark draft a download of its
+# own).  Linux and NVIDIA RTX 30 / A100 or newer: the layers split across the GPUs, the most-routed experts in VRAM
+# (data/expert-profile-mm3.bin), the others computed on the CPU from RAM.
+MM3 = "MiniMax-M3.1-Flash"
+MM3_EXE = BUILD / "maya-mm3"
+MM3_MANIFEST = ROOT / "tools" / "mm3" / "download.json"
+MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenizer.py")
+MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
+MM3_MIN_CC = 80                                    # (validated on RTX 30 and RTX 50: sm_86, sm_120)
+MM3_CONTEXTS = [32768, 65536, 131072, 262144]
+MM3_DEFAULT_CONTEXT = 65536
+MM3_MODEL_NAME = "minimax-m3.1-flash"
+MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}   # MiniMax's recommendation
+MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weights, the experts not in VRAM pinned
+MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
+FAMILIES = ("glm", "deepseek", "minimax")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
 def exe_for_target(target: str) -> Path:
     """The engine binary for a build target name ("maya" or "maya-ds4"; EXE's and DS4_EXE's own stems) - resolved
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
-    return {"maya": EXE, "maya-ds4": DS4_EXE}[target]
+    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 # the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
 # its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
@@ -1000,6 +1016,10 @@ def choose_gpus(a, found, min_cc: int = MIN_CC) -> list:
 def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3") -> dict:
     step(1, "checking this PC")
     ds4 = family == "deepseek"
+    mm3 = family == "minimax"
+    if mm3 and (a.backend == "hip" or not sys.platform.startswith("linux")):
+        fail(f"{MM3}'s engine (maya-mm3) runs on NVIDIA GPUs under Linux only for now",
+             "set it up on a Linux PC with an RTX 30 / A100 or newer")
     if a.backend == "hip":
         if ds4 and not gguf:
             fail(f"{DS4}'s EXL3 quant runs on NVIDIA GPUs only (its prompt kernels have no HIP port)",
@@ -1007,7 +1027,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         return check_hip_pc(a)
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
-    min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else MIN_CC
+    min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else MM3_MIN_CC if mm3 else MIN_CC
     if WIN:
         warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
@@ -1028,7 +1048,7 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        (f": the model's layers are split across the {len(chosen)}" if len(chosen) > 1 else ""))
-    if vram < 23 and not ds4:
+    if vram < 23 and not ds4 and not mm3:
         say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
             "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
     if min(archs) < VALIDATED_CC:
@@ -1224,8 +1244,11 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
 
 
 def config_family(cfg: dict) -> str:
-    """"deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's --pack), else "glm"."""
+    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's
+    --pack), else "glm"."""
     args = cfg.get("args") or []
+    if (cfg.get("installer") or {}).get("family") == "minimax" or Path(cfg.get("exe", "")).name.startswith("maya-mm3"):
+        return "minimax"
     return "deepseek" if (cfg.get("installer") or {}).get("family") == "deepseek" or "--pack" in args[:-1] or \
         Path(cfg.get("exe", "")).name.startswith(("maya-ds4", "strata-ds4")) else "glm"   # (before v1.1.16's names)
 
@@ -1234,7 +1257,7 @@ def choose_family(a, prev: dict) -> str:
     """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
     is the default."""
     if a.model:
-        return "deepseek" if a.model == DS4 else "glm"
+        return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "glm"
     if a.gguf_dir or a.draft:
         return "glm"
     if a.model_dir:
@@ -1255,7 +1278,12 @@ def choose_family(a, prev: dict) -> str:
              "3.5 bits with DeepSeek's two Engram tables (414 / 461 GB; NVIDIA V100 or newer, DSpark drafting, "
              "pictures from RTX 30 / A100 on); "
              f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
-             "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context.")]
+             "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context."),
+            (MM3, "experimental",
+             "MiniMax's MiniMax-M3.1-Flash (428B, 23B active per token) on its own engine: Mia-AiLab's EXL3 quant at "
+             f"3.5 bits (197 GB); NVIDIA RTX 30 / A100 or newer on Linux; about {MM3_MEMORY_GB} GB of VRAM and RAM "
+             f"together{here}; the layers split across the GPUs, the experts that do not fit computed on the CPU; "
+             "tool calls and thinking levels, text only for now.")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -1621,8 +1649,8 @@ def refresh_engine(cfg: dict) -> None:
     """At a start: the engine's source changed since it was compiled (a git pull) - compile what changed."""
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
-    target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya"
-    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve()):
+    target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else "maya"
+    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src:
@@ -3350,6 +3378,8 @@ def set_up(a, prev: dict) -> Path | None:
                      c.get("backend", "cuda") == a.backend), {})
     if family == "deepseek":
         return set_up_ds4(a, prev)
+    if family == "minimax":
+        return set_up_mm3(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -3960,6 +3990,155 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     return cfg_path
 
 
+# ------------------------------------------------------------------------------------------------ MiniMax-M3.1-Flash
+def mm3_models() -> tuple:
+    """The MiniMax download as MODELS entries (offer_download's form): the model's files, and its DSpark draft's (in
+    the repo's dspark/ folder, so a folder of its own beside them)."""
+    man = read_json(MM3_MANIFEST)
+    if not man.get("files") or not (man.get("dspark") or {}).get("files"):
+        fail(f"{MM3_MANIFEST} is missing or damaged", "restore it (git checkout tools/mm3/download.json)")
+
+    def entry(files: dict, folder: str, about: str) -> dict:
+        return {"about": about, "format": "mm3", "repo": man["repo"], "revision": man["revision"], "folder": folder,
+                "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+                "download_gb": sum(v[0] for v in files.values()) / 1e9}
+    return (entry(man["files"], "", f"{MM3} in Mia-AiLab's EXL3 quant at 3.5 bits per weight (EAQ v1), with its "
+                                    "vision tower"),
+            entry(man["dspark"]["files"], man["dspark"]["folder"], f"{MM3}'s DSpark draft (speculative decoding)"))
+
+
+def mm3_dir(a, models: Path, prev: dict) -> Path:
+    """The model's folder: --model-dir, else the folder of the MiniMax setup before (its pack is inside it), else
+    <models folder>/MiniMax-M3.1-Flash-EXL3-3.5bpw."""
+    if a.model_dir:
+        return Path(a.model_dir).expanduser().resolve()
+    args = prev.get("args") or []
+    if "--pack" in args[:-1] and (Path(args[args.index("--pack") + 1]).parent / "config.json").exists():
+        return Path(args[args.index("--pack") + 1]).parent
+    return models / MM3_DIR
+
+
+def mm3_model_step(a, d: Path) -> list | None:
+    """The model's files in d and its draft's in d/dspark (downloaded when they are not there): the model's files, or
+    None when nothing was downloaded."""
+    step(5, f"the model ({MM3})")
+    m, dm = mm3_models()
+    files = [d / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, MM3, d, files, m):
+        return None
+    dd = d / dm["folder"]
+    dfiles = [dd / n for n in dm["files"]]
+    if any(file_incomplete(dm, f) for f in dfiles) and not offer_download(a, MM3 + " DSpark", dd, dfiles, dm):
+        return None
+    conf = read_json(d / "config.json")
+    method = (conf.get("quantization_config") or {}).get("quant_method")
+    if conf.get("model_type") != "minimax_m3_vl" or method != "exl3":
+        fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not {MM3} in EXL3 "
+             "(minimax_m3_vl, exl3)")
+    ok(f"{MM3}: {len(files) + len(dfiles)} files, {sum(f.stat().st_size for f in files + dfiles) / 1e9:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: loading reads all {m['download_gb']:.0f} GB from it - use an NVMe SSD "
+             "(--models-dir)")
+    return files + dfiles
+
+
+def mm3_pack_step(a, d: Path, files: list) -> Path:
+    """tools/mm3/pack.py's pack in <model>/maya-mm3: the geometry, where every tensor sits in the safetensors (read in
+    place) and the tokenizer - built again when its tools or the model's files changed."""
+    step(6, "the pack (the engine's index of the model files)")
+    pack = d / "maya-mm3"
+    tools = S.source_hash(MM3_PACK_TOOLS)
+    need = ("mm3.txt", "tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
+    shards = [f for f in files if f.suffix == ".safetensors"]
+    if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
+            all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack is written inside the model's folder")
+    say("  Indexing every tensor of the safetensors (the weights stay where they are) and the tokenizer ...")
+    run([sys.executable, str(ROOT / "tools" / "mm3" / "pack.py"), "--model", str(d), "--out", str(pack)])
+    missing = [f for f in need if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    stamp_pack(pack, shards)
+    rec = read_json(pack / PACK_SOURCES)
+    rec["tools"] = tools
+    (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
+    ok(f"pack: {pack}")
+    return pack
+
+
+def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path) -> Path:
+    """maya-mm3.json and run-maya-mm3.sh.  A setup again keeps what the config before says that this one does not
+    ask: the engine settings below, the thinking level and sampling, where the server listens and its key."""
+    step(8, "the configuration and the start script")
+    port = a.port or 8080
+    cfg_path = ROOT / "maya-mm3.json"
+    old = read_json(cfg_path)
+    args = ["--pack", str(pack), "--max-context", str(ctx)]
+    if MM3_PROFILE.exists():
+        args += ["--profile", str(MM3_PROFILE)]
+    kept = keep_args(old.get("args") or [], args, ("--chunk", "--staging", "--cpu-threads", "--reserve-gb",
+                                                    "--resident-cap"))
+    cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "sampling": old.get("sampling") or dict(MM3_SAMPLING),
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+    for k in ("reasoning_effort", "host", "api_key", "cors_origins", "mcp_servers"):
+        if old.get(k) is not None:
+            cfg[k] = old[k]
+            kept.append(k)
+    env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if env:
+        cfg["env"] = env
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    cfg["installer"] = {"family": "minimax", "models_dir": str(models), "quant": MM3, "model_dir": str(d),
+                        "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, port)}")
+    if MM3_PROFILE.exists():
+        ok("expert profile: the most-routed experts (data/expert-profile-mm3.bin) are placed in VRAM")
+    return cfg_path
+
+
+def set_up_mm3(a, prev: dict) -> Path | None:
+    """MiniMax-M3.1-Flash's steps 1-8: the PC (Linux, RTX 30 / A100 or newer, the memory), the context, its engine
+    (build/maya-mm3), the files, the pack, the config."""
+    inst = prev.get("installer") or {}
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    pc = check_pc(a, "minimax")                        # 1
+    total, _ = mem_gb()
+    vram = sum(g["vram_gb"] for g in pc["gpus"])
+    if vram + total < MM3_MEMORY_GB:
+        warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{MM3_MEMORY_GB} GB that hold all of {MM3} "
+             "(the engine reads what does not fit from the SSD as the page cache allows - slower)")
+    step(2, "your choices")                            # 2
+    ctx = choose_context(a, prev_ctx, MM3_CONTEXTS, MM3_DEFAULT_CONTEXT)
+    ok(f"context: {ctx} tokens")
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    d = mm3_dir(a, models, prev)
+    ok(f"model folder: {d}")
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama, "maya-mm3")        # 4
+    files = mm3_model_step(a, d)                       # 5
+    if files is None:
+        return None
+    pack = mm3_pack_step(a, d, files)                  # 6
+    step(7, "images (the vision tower)")
+    ok("not yet: maya-mm3 reads text (the vision tower is in the download for later)")
+    return write_config_mm3(a, pc, meta, pack, ctx, models, d)   # 8
+
+
 def set_up_and_serve(a, prev: dict) -> tuple | None:
     """On the setup's screen: the setup, then Maya running on the same screen - its server's output there, Ctrl+C
     stops it.  (The config, the server's exit code or None when it was not started), or None when the model was not
@@ -3989,7 +4168,7 @@ def main() -> int:
                     help="the setup in plain text, the answers typed (not on the setup's own screen)")
     ap.add_argument("--download-model", action="store_true",
                     help="download the model without asking (the commands and the size are still printed)")
-    ap.add_argument("--model", choices=list(MODELS) + [DS4],
+    ap.add_argument("--model", choices=list(MODELS) + [DS4, MM3],
                     help=f"which model (default: asked): {DS4}, or a GLM-5.3-Flash download ({next(iter(MODELS))} "
                          "recommended)")
     ap.add_argument("--model-dir", help=f"use {DS4}'s files you already have: their folder (a GGUF's shards, or the "
