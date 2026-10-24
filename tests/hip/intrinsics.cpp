@@ -38,6 +38,25 @@ __global__ void packed_probe(uint32_t* results) {
     results[i * 4 + 3] = __byte_perm(a, b, selector(i));
 }
 
+// Distinct predicates in both logical warps catch accidental truncation of a
+// wave64 ballot. Also exercise width-32 shuffles and shared-memory visibility.
+__global__ void logical_warp_probe(uint32_t* results) {
+    __shared__ unsigned values[64];
+    const unsigned lane = threadIdx.x;
+    const unsigned base = lane & ~31u;
+    const unsigned local = lane & 31u;
+    values[lane] = lane * 7u;
+#if HIP_VERSION_MAJOR >= 7 && !defined(STRATA_HIP_WAVE64)
+    __syncwarp(static_cast<uint64_t>(0xffffffffu));  // HIP 7's native wave32 form requires a 64-bit mask.
+#else
+    __syncwarp(0xffffffffu);
+#endif
+    results[lane * 4 + 0] = __ballot_sync(0xffffffffu, (lane & 1u) == (base ? 1u : 0u));
+    results[lane * 4 + 1] = __shfl_sync(0xffffffffu, lane, 0, 32);
+    results[lane * 4 + 2] = __shfl_down_sync(0xffffffffu, lane, 1, 32);
+    results[lane * 4 + 3] = values[base + (local ^ 1u)];
+}
+
 __global__ void intrinsic_probe(int* integer_results, float* float_shuffle, double* double_shuffle,
                                 unsigned* ballot, const uint32_t* dot_inputs) {
     const int lane = static_cast<int>(threadIdx.x);
@@ -113,7 +132,7 @@ int main() {
     CHECK(hipGetDeviceProperties(&properties, device));
     std::printf("HIP intrinsic device: %s (%s)\n", properties.name, properties.gcnArchName);
     if (properties.warpSize != kLanes && properties.warpSize != 2 * kLanes) {
-        // wave64 (gfx908) is accepted: this probe launches kLanes threads, which occupy one half of a 64-lane
+        // wave64 (gfx906 / gfx908) is accepted: this probe launches kLanes threads, which occupy one half of a 64-lane
         // wavefront; the compat layer's half-wavefront mapping must return the same wave32 results.
         std::fprintf(stderr, "expected wave32 or wave64, got wave%d\n", properties.warpSize);
         return 1;
@@ -203,6 +222,20 @@ int main() {
         }
     }
     delete[] host;
+    uint32_t* logical = nullptr;
+    uint32_t logical_host[64 * 4]{};
+    CHECK(hipMalloc(reinterpret_cast<void**>(&logical), sizeof(logical_host)));
+    hipLaunchKernelGGL(logical_warp_probe, dim3(1), dim3(64), 0, 0, logical);
+    CHECK(hipDeviceSynchronize());
+    CHECK(hipMemcpy(logical_host, logical, sizeof(logical_host), hipMemcpyDeviceToHost));
+    for (unsigned lane = 0; lane < 64; ++lane) {
+        const unsigned base = lane & ~31u, local = lane & 31u;
+        ok = ok && logical_host[lane * 4 + 0] == (base ? 0xaaaaaaaau : 0x55555555u);
+        ok = ok && logical_host[lane * 4 + 1] == base;
+        ok = ok && logical_host[lane * 4 + 2] == (local == 31 ? lane : lane + 1);
+        ok = ok && logical_host[lane * 4 + 3] == (base + (local ^ 1u)) * 7u;
+    }
+    CHECK(hipFree(logical));
     if (!ok) {
         std::fprintf(stderr, "HIP intrinsic parity failed (ballot 0x%08x)\n", ballot);
         return 1;

@@ -14,9 +14,9 @@ endif()
 set(_strata_hip_validated gfx1100 gfx1201 gfx1151)   # gfx1151: Strix Halo (v1.1.10)
 set(_strata_hip_community gfx1101 gfx1200)
 set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1031 gfx1034 gfx1150)   # gfx1103: Radeon 780M iGPU, opt-in, portable kernels (no WMMA)
-# gfx908 (AMD Instinct MI100, CDNA1) is wave64, not wave32: it runs through the hip_compat layer's logical-32-lane
-# half-wavefront warp mapping (see hip_compat/intrinsics.hpp). Experimental; validated on a 4x MI100 box.
-set(_strata_hip_wave64 gfx908)
+# gfx906 (Vega20, MI50) and gfx908 (CDNA1, MI100) are wave64, not wave32. They use
+# the logical-32-lane half-wavefront mapping in hip_compat/intrinsics.hpp; experimental.
+set(_strata_hip_wave64 gfx906 gfx908)
 # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
 # spaces, which foreach(IN LISTS) would otherwise treat as one element.
 string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
@@ -34,7 +34,7 @@ foreach(_arch IN LISTS _strata_hip_norm)
   elseif(_base IN_LIST _strata_hip_unvalidated)
     message(WARNING "Maya HIP: ${_base} builds, but it is not validated on a real card yet; please report results")
   elseif(_base IN_LIST _strata_hip_wave64)
-    message(STATUS "Maya HIP: ${_base} is a wave64 CDNA card running through the half-wavefront compat layer (experimental)")
+    message(STATUS "Maya HIP: ${_base} is a wave64 card running through the half-wavefront compat layer (experimental)")
   else()
     message(FATAL_ERROR
       "Maya's HIP build supports wave32 gfx1100, gfx1101, gfx1151, gfx1200 and gfx1201 (unvalidated: ${_strata_hip_unvalidated}; "
@@ -44,7 +44,7 @@ foreach(_arch IN LISTS _strata_hip_norm)
   list(APPEND STRATA_HIP_ARCH_LIST "${_base}")
 endforeach()
 list(REMOVE_DUPLICATES STRATA_HIP_ARCH_LIST)
-# wave64 CDNA cards (gfx908) run the CUDA-shaped kernels through the hip_compat layer's logical-32-lane
+# wave64 cards (gfx906 / gfx908) run the CUDA-shaped kernels through the hip_compat layer's logical-32-lane
 # half-wavefront mapping; the headers switch to their wave64 form only when this define reaches the build.
 set(STRATA_HIP_WAVE64 OFF)
 foreach(_a IN LISTS STRATA_HIP_ARCH_LIST)
