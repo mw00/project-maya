@@ -592,3 +592,35 @@ The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the
 `[maya] sessions: ...`). A slot's identity is the engine's version, the model's geometry and files and whether the
 DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
 refused rather than read.
+
+
+### DeepSeek expert-copy I/O
+
+These Linux options apply only to GGUF CPU experts selected for copying into anonymous RAM
+(`--mmap-experts off` or an explicit copy budget). They do not change routing, tensor bytes, Engram reads,
+CPU/GPU placement, or inference arithmetic. Both default to `0`; the normal buffered read path remains the default.
+
+| Environment variable | Default | Effect |
+|---|---|---|
+| `DS4_COPY_DROP_CACHE` | `0` | `1`: after all three matrices and both NUMA parts of an expert have copied successfully, advise the filesystem to release whole source pages with `POSIX_FADV_DONTNEED`. Partial boundary pages are retained. Eviction is advisory, and mapped, locked or busy pages can remain cached. |
+| `DS4_COPY_DIRECT` | `0` | `1`: copy expert data through the existing Linux direct-I/O descriptor and a reusable per-worker 4 KiB-aligned staging buffer. The exact bytes are then copied to the NUMA destination. Unsupported or failed direct reads fall back to buffered reads; startup reports direct and fallback byte counts. |
+
+Put the variables in a model config's `env`, for example:
+
+```json
+{"DS4_COPY_DROP_CACHE": "1", "DS4_COPY_DIRECT": "0"}
+```
+
+For direct reads instead, use `DS4_COPY_DROP_CACHE=0`, `DS4_COPY_DIRECT=1`. They can also be combined so that
+buffered fallbacks receive release hints. A hint may affect another process reading the same expert file, so use
+it when startup cache pressure matters more than retaining that file's cache. Other tensor ranges are not explicitly
+advised; OS eviction remains advisory and is page/folio-granular. Windows ignores both controls. Direct reads are not
+necessarily faster than buffered reads with source-page release.
+
+The controls do not clear global caches, compact memory, change ZFS limits, lock CPU expert RAM, or guarantee zero
+swap. They also do not eliminate page cache created by other startup readers. Check the existing Engram residency
+and strict-expert RAM settings separately.
+
+CPU-only checks: `python tools/test_ds4_copy_cache.py`. On filesystems that refuse direct I/O the test still checks
+buffered fallback; its output says whether direct reads were exercised. `DS4_TEST_FILE_DIR=/path/on/nvme` selects a
+filesystem for the fixture. Cache residency is diagnostic because DONTNEED does not promise immediate eviction.

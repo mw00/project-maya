@@ -5195,6 +5195,15 @@ struct Model::Impl {
         const bool strict_ram = require_ram && std::atoi(require_ram) != 0;
         if (strict_ram && o.mmap_experts != 0) { err = "strict RAM requires --mmap-experts off"; return false; }
         if (o.mmap_experts > 0 || hot.empty()) return true;
+#if defined(_WIN32)
+        const bool drop_copy_cache = false, direct_copy = false;
+#else
+        const char* direct_copy_env = std::getenv("DS4_COPY_DIRECT");
+        const bool direct_copy = direct_copy_env && std::atoi(direct_copy_env) != 0;
+        const char* drop_cache_env = std::getenv("DS4_COPY_DROP_CACHE");
+        const bool drop_copy_cache = drop_cache_env && std::atoi(drop_cache_env) != 0;
+#endif
+        std::atomic<uint64_t> cache_hint_bytes{0}, direct_copy_bytes{0}, buffered_fallback_bytes{0};
         const double t0 = now_ms();
         auto spare_of = [&](const Layer& l) { return o.expert_cache && l.spare_vram >= 0 ? 1 : 0; };
         double all = 0;
@@ -5310,15 +5319,34 @@ struct Model::Impl {
         std::vector<std::thread> th;
         for (int t = 0; t < 12 && !jobs.empty(); ++t)
             th.emplace_back([&] {
+                std::vector<uint8_t> direct_staging;   // thread-local scratch; never aliases NUMA model storage
                 for (size_t i; (i = ji.fetch_add(1)) < jobs.size() && !bad.load();) {
                     const Job& j = jobs[i];
                     const Layer& l = L[(size_t) j.layer];
                     for (int r = 0; r < 3; ++r) {
                         const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
-                        for (int X = 0; X < NH; ++X)
-                            if (!pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb, nb,
-                                            ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r]))
-                                bad.store(true);
+                        for (int X = 0; X < NH; ++X) {
+                            const uint64_t off = l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb;
+                            auto* dst = ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
+                            const os::fd_t dfd = (size_t) l.mx_file[r] < pk.dfds.size() ? pk.dfds[(size_t) l.mx_file[r]] : os::kBadFd;
+                            if (direct_copy && os::copy_direct(dfd, off, nb, dst, direct_staging)) {
+                                direct_copy_bytes.fetch_add(nb, std::memory_order_relaxed);
+                            } else {
+                                if (direct_copy) buffered_fallback_bytes.fetch_add(nb, std::memory_order_relaxed);
+                                if (!pk.read_at(l.mx_file[r], off, nb, dst)) bad.store(true);
+                            }
+                        }
+                    }
+                    // Both NUMA halves of all three matrices must be copied before releasing any source pages.
+                    // Partial edge pages are retained, so adjacent experts/tensors are never discarded by this hint.
+                    if (drop_copy_cache && !bad.load()) {
+                        uint64_t hinted = 0;
+                        for (int r = 0; r < 3; ++r) {
+                            const uint64_t nb = (uint64_t) (mx_n(r) / NH) * mx_row_b(l, r) * NH;
+                            hinted += os::release_copied_cache(pk.fds[(size_t) l.mx_file[r]],
+                                                              l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r], nb);
+                        }
+                        cache_hint_bytes.fetch_add(hinted, std::memory_order_relaxed);
                     }
                     const int64_t db = done_b.fetch_add((int64_t) l.blob) + (int64_t) l.blob;
                     if (o.verbose && i % 2048 == 0)
@@ -5332,6 +5360,12 @@ struct Model::Impl {
             return false;
         }
         for (const Job& j : jobs) L[(size_t) j.layer].ram[(size_t) j.e] = j.slot;
+        if (direct_copy)
+            std::fprintf(stderr, "ds4: expert copy I/O: %.3f GB direct, %.3f GB buffered fallback\n",
+                         (double) direct_copy_bytes.load() / 1e9, (double) buffered_fallback_bytes.load() / 1e9);
+        if (drop_copy_cache)
+            std::fprintf(stderr, "ds4: copied expert cache: DONTNEED hints accepted for %.3f GB of whole source pages (eviction is advisory)\n",
+                         (double) cache_hint_bytes.load() / 1e9);
         copy_mode = true;
         ram_held = (int) jobs.size();
         double cb = 0;

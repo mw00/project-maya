@@ -213,6 +213,7 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).
 - **DeepSeek on large-RAM Linux hosts:** optional [locked Engram tables and strict CPU-expert RAM placement](docs/SETTINGS.md#deepseek-explicit-ram-residency). Both are off by default; they need enough physical RAM.
+- **DeepSeek GGUF expert-copy startup on Linux:** optional [source-page release and direct reads](docs/SETTINGS.md#deepseek-expert-copy-io) reduce duplicate file-cache pressure while copying CPU experts to RAM. Both are off by default.
 - **Several requests at once** (GLM-5.3-Flash): `./maya.sh --parallel 4` (Windows: `START-MAYA.bat --parallel 4`; up to 8) keeps
   it in the config, and the dashboard shows how many answers are being written. Each extra request keeps its own
   context in VRAM, so a few fewer experts fit there ([how](docs/SETTINGS.md#several-requests-at-once)).
@@ -317,3 +318,15 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
 - The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`).
 - Maya is open source under the [MIT License](LICENSE); the notices of Strata, ggml, exllamav3 and beellama.cpp stay
   with every copy.
+
+
+### Optional DeepSeek expert-copy I/O
+
+These settings affect GGUF experts being copied to CPU RAM on Linux; both default off.
+
+| Setting | Default | Startup behavior |
+|---|---|---|
+| `DS4_COPY_DROP_CACHE` | `0` | `1`: release whole source-file pages after an expert is copied to RAM (advisory). |
+| `DS4_COPY_DIRECT` | `0` | `1`: copy through direct I/O, with a counted buffered fallback if unavailable. |
+
+See [settings and limitations](docs/SETTINGS.md#deepseek-expert-copy-io). Neither is a general inference-speed switch.
