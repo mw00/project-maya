@@ -78,6 +78,8 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
+/// Abliteration: y[t] -= scale * r (r . y[t]) for each of the T rows (r unit length, [dim]).
+void project_out(float* y, const float* r, float scale, int dim, int T, cudaStream_t s);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);

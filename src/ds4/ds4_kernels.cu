@@ -378,6 +378,16 @@ __global__ void __launch_bounds__(1024) hc_pre_norm_kernel(const float* __restri
     for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) x[e] = w != nullptr ? r[n] * inv * w[e] : r[n];
 }
 
+// abliteration (ds4_ablate.hpp): row t of y loses its component along r, y -= scale * r (r . y); a block a row
+__global__ void __launch_bounds__(1024) project_out_kernel(float* __restrict__ y, const float* __restrict__ r,
+                                                           float scale, int dim) {
+    y += (size_t) blockIdx.x * dim;
+    float dot = 0.0f;
+    for (int e = threadIdx.x; e < dim; e += blockDim.x) dot += r[e] * y[e];
+    const float a = scale * block_sum(dot);
+    for (int e = threadIdx.x; e < dim; e += blockDim.x) y[e] -= a * r[e];
+}
+
 __global__ void hc_post_kernel(const float* __restrict__ y, const float* __restrict__ res,
                                const float* __restrict__ post, const float* __restrict__ comb, int dim, int hc,
                                float* __restrict__ out) {
@@ -2813,6 +2823,9 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s) {
     hc_post_inplace_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(y, h, post, comb, dim, hc);
+}
+void project_out(float* y, const float* r, float scale, int dim, int T, cudaStream_t s) {
+    if (T > 0) project_out_kernel<<<T, 1024, 0, s>>>(y, r, scale, dim);
 }
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
     hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);

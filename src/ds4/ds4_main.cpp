@@ -92,6 +92,7 @@ void usage() {
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
+                 "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
 }
@@ -1138,6 +1139,18 @@ int main(int argc, char** argv) {
             }
             return argv[++i];
         };
+        // a number that really is one: atof("abc") is 0, and 0 means "the file's own scale" - a typo must not
+        // quietly become a default-strength run
+        auto num = [&](const char* what) -> double {
+            const std::string v = val(what);
+            char* end = nullptr;
+            const double d = std::strtod(v.c_str(), &end);
+            if (v.empty() || end == v.c_str() || *end != '\0' || !std::isfinite(d)) {
+                std::fprintf(stderr, "%s needs a number, not \"%s\"\n", what, v.c_str());
+                std::exit(2);
+            }
+            return d;
+        };
         if (a == "--pack") o.pack = val("--pack");
         else if (a == "--gpus") {
             for (int g : parse_ids(val("--gpus"))) o.gpus.push_back(g);
@@ -1176,6 +1189,16 @@ int main(int argc, char** argv) {
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
         else if (a == "--ppl") ppl = val("--ppl");
+        else if (a == "--ablate") o.ablate = val("--ablate");
+        else if (a == "--ablate-layer") {
+            const double d = num("--ablate-layer");
+            if (d < 0.0 || d != (double) (long long) d) {
+                std::fprintf(stderr, "--ablate-layer needs a whole number >= 0\n");
+                return 2;
+            }
+            o.ablate_layer = (int) d;
+        }
+        else if (a == "--ablate-scale") o.ablate_scale = (float) num("--ablate-scale");
         else if (a == "--serve") serve_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
