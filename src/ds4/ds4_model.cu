@@ -2661,6 +2661,23 @@ struct Model::Impl {
                     for (int j = 0; j < n[gi] && il < g.nl; ++j) L[(size_t) il++].grp = (int) gi;
                 for (; il < g.nl; ++il) L[(size_t) il].grp = (int) groups.size() - 1;
             }
+            // Experimental placement override: keep the trunk's explicit split unchanged.
+            // A drafter on a TP lead consumes room that its mate cannot use for paired slots.
+            if (g.n_mtp > 0) {
+                if (const char* value = std::getenv("DS4_DSPARK_GROUP")) {
+                    char* end = nullptr;
+                    const long group = std::strtol(value, &end, 10);
+                    if (end == value || *end != '\0' || group < 0 || group >= (long) groups.size() ||
+                        std::getenv("DS4_SPLIT") == nullptr) {
+                        err = "DS4_DSPARK_GROUP requires a valid group and an explicit DS4_SPLIT";
+                        return false;
+                    }
+                    for (Layer& l : L)
+                        if (l.mtp) l.grp = (int) group;
+                    std::fprintf(stderr, "ds4: experimental DSpark group %ld, lead CUDA%d\n", group,
+                                 devs[(size_t) groups[(size_t) group].mem[0]].id);
+                }
+            }
             for (Layer& l : L) {
                 l.dev = groups[(size_t) l.grp].mem[0];
                 l.nm = l.mtp ? 1 : (int) groups[(size_t) l.grp].mem.size();   // (the drafter's blocks: on the lead alone)

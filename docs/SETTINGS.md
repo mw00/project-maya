@@ -430,6 +430,23 @@ that. It applies to prompts of ~3,700 new tokens or more, on one GPU (several GP
 | `MAYA_DS4_PROMPT_SKIP` | on (1) | `0`: every layer on every token of a prompt, as before; `2`: DeepSeek's own (the last 128 tokens only) |
 | `MAYA_DS4_DSPARK_CUM` | 0.5 | DSpark drafting: a draft is verified only while the chance that it and every draft before it are kept (the product of their confidences) stays at least this, so a window whose later drafts would likely be lost is not verified whole. The same tokens; a Radeon 8065S with Maya-S decoded 12.04 -> 12.82 tok/s (+6.5%). `0` = off (only each draft's own floor, `--dspark-conf`); a request's `strata_tune` `spec_cum` sets it for that request |
 
+## DeepSeek: choosing the drafter GPU group (experimental)
+
+With several GPU groups, the DSpark drafter normally occupies the first group's lead GPU. Set
+`DS4_DSPARK_GROUP` to a zero-based group index to place its three blocks and experts on another group's lead.
+This can free space on a tensor-parallel pair by moving the drafter to a separate GPU. It moves memory pressure
+to the chosen GPU, whose main-model expert cache may shrink; it does not split the drafter across the group.
+
+Use an explicit `DS4_SPLIT` so the trunk layout stays under your control. For example, with three GPUs and
+`--tp 2`, `DS4_SPLIT=36,4 DS4_DSPARK_GROUP=1` puts the first 36 trunk layers on the two-GPU group, the last four
+on the singleton group, and the drafter on that singleton GPU. Group indices refer to the engine's groups,
+not physical GPU indices. The startup message identifies the selected group's lead device.
+
+The setting requires DSpark to be loaded and a multi-GPU layout. Invalid group values or a missing explicit
+split fail loading. Unset it to restore the first-group placement; it changes no default. Moving weights between
+execution devices or changing expert residency can change floating-point results, so this is not a bit-exactness
+or universal speedup claim. Measure your workload with drafting enabled and disabled.
+
 ## DeepSeek: skipping light experts the SSD would read (experimental)
 
 When DeepSeek-V4.1-Flash's experts do not fit in VRAM and RAM, a token waits for the SSD to read the experts it was
