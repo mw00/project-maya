@@ -78,7 +78,7 @@ def requests(cfg: dict) -> tuple[list[int], list[list[int]], int]:
     """(the warm-up's ids, one list of ids per question, the document's tokens): chats as the server renders them -
     the model's template at the config's thinking level - each a document made of Maya's own docs, then a question
     about it.  Every request opens with the same document, so the engine reads it once and keeps it."""
-    import strata_tokenizer as ST
+    import maya_tokenizer as ST
     from serve.frontend import ChatTemplate, effort_kwargs
     tpath = Path(cfg["tokenizer"])
     tok = ST.Tokenizer.from_dir(tpath)

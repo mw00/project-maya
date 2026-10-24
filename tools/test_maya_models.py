@@ -15,7 +15,7 @@ import maya  # noqa: E402
 
 class ModelChoice(unittest.TestCase):
     def choose(self, inst, vram_gb=32.0):
-        args = SimpleNamespace(gguf_dir=None, model=None, yes=True)
+        args = SimpleNamespace(gguf_dir=None, model=None, yes=True, backend="cuda")
         lines = []
         with tempfile.TemporaryDirectory() as d, \
                 patch.object(maya.S, "gpus", return_value=[{"vram_gb": vram_gb}]), \

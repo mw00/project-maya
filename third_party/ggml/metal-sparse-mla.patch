@@ -1,0 +1,393 @@
+diff --git a/include/ggml.h b/include/ggml.h
+index 224bdef..5dfd89a 100644
+--- a/include/ggml.h
++++ b/include/ggml.h
+@@ -585,6 +585,7 @@ extern "C" {
+         GGML_OP_DSV4_HC_COMB,
+         GGML_OP_DSV4_HC_PRE,
+         GGML_OP_DSV4_HC_POST,
++        GGML_OP_SPARSE_MLA,
+ 
+         GGML_OP_UNARY,
+ 
+@@ -2726,6 +2727,20 @@ extern "C" {
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // sparse MQA attention over gathered cache rows (DSA / nope-MLA): each token reads its own n_sel rows of k
++    //   q    [d, n_head, n_tok] f32     the (absorbed) queries
++    //   k    [d, n_rows]        f16|f32 the cache; a row is both key and value
++    //   idx  [n_sel, n_tok]     i32     the rows each token attends
++    //   mask [n_sel, n_tok]     f32     0 or -inf per selected row
++    //   -> [d, n_head, n_tok] f32:  softmax(scale * q.k + mask) . k   (no backend but Metal implements it)
++    GGML_API struct ggml_tensor * ggml_sparse_mla(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * idx,
++            struct ggml_tensor  * mask,
++            float                 scale);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/src/ggml-backend-meta.cpp b/src/ggml-backend-meta.cpp
+index 3ec40fb..a8f5fc7 100644
+--- a/src/ggml-backend-meta.cpp
++++ b/src/ggml-backend-meta.cpp
+@@ -1037,7 +1037,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             } break;
+             case GGML_OP_DSV4_HC_COMB:
+             case GGML_OP_DSV4_HC_PRE:
+-            case GGML_OP_DSV4_HC_POST: {
++            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_SPARSE_MLA: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_UNARY: {
+diff --git a/src/ggml-cpu/ggml-cpu.cpp b/src/ggml-cpu/ggml-cpu.cpp
+index 1df0f2b..bfcb19f 100644
+--- a/src/ggml-cpu/ggml-cpu.cpp
++++ b/src/ggml-cpu/ggml-cpu.cpp
+@@ -440,6 +440,8 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
+     }
+ 
+     switch (op->op) {
++        case GGML_OP_SPARSE_MLA:
++            return false;   // Metal only
+         case GGML_OP_CPY:
+         case GGML_OP_SET_ROWS:
+             return
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 9657e7e..c9fe29b 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -496,6 +496,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sparse_mla(ggml_metal_library_t lib, const ggml_tensor * op) {
++    char name[64];
++    snprintf(name, sizeof(name), "kernel_sparse_mla_%s_d%d", ggml_type_name(op->src[1]->type), (int) op->src[0]->ne[0]);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, const ggml_tensor * op) {
+     const char * name = nullptr;
+ 
+diff --git a/src/ggml-metal/ggml-metal-device.h b/src/ggml-metal/ggml-metal-device.h
+index 1bdaecc..166f483 100644
+--- a/src/ggml-metal/ggml-metal-device.h
++++ b/src/ggml-metal/ggml-metal-device.h
+@@ -126,6 +126,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cumsum_ad
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri               (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_sparse_mla(ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
+index 9650de2..2362ae4 100644
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -1790,6 +1790,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+                 default:
+                     return false;
+             }
++        case GGML_OP_SPARSE_MLA:
++            return has_simdgroup_reduction &&
++                (op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_F32) &&
++                (op->src[0]->ne[0] == 64 || op->src[0]->ne[0] == 128 || op->src[0]->ne[0] == 256 ||
++                 op->src[0]->ne[0] == 512) &&
++                ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
++                ggml_is_contiguous_rows(op->src[2]) && ggml_is_contiguous_rows(op->src[3]);
+         case GGML_OP_DSV4_HC_COMB:
+             return has_simdgroup_reduction &&
+                 op->src[0]->type == GGML_TYPE_F32 &&
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index eaa4278..f119dc8 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -1291,6 +1291,19 @@ typedef struct {
+     float    eps;
+ } ggml_metal_kargs_dsv4_hc_comb;
+ 
++typedef struct {
++    int32_t  n_head;
++    int32_t  n_sel;
++    uint64_t nb_q1;
++    uint64_t nb_q2;
++    uint64_t nb_k1;
++    uint64_t nb_i1;
++    uint64_t nb_m1;
++    uint64_t nb_d1;
++    uint64_t nb_d2;
++    float    scale;
++} ggml_metal_kargs_sparse_mla;
++
+ typedef struct {
+     int32_t  n_embd;
+     int32_t  n_tokens;
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index 0323dc3..494426d 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -347,6 +347,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             {
+                 n_fuse = ggml_metal_op_dsv4_hc(ctx, idx);
+             } break;
++        case GGML_OP_SPARSE_MLA:
++            {
++                n_fuse = ggml_metal_op_sparse_mla(ctx, idx);
++            } break;
+         case GGML_OP_SOFT_MAX:
+             {
+                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
+@@ -1410,6 +1414,46 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++int ggml_metal_op_sparse_mla(ggml_metal_op_t ctx, int idx) {
++    ggml_tensor * op = ctx->node(idx);
++
++    ggml_metal_encoder_t enc = ctx->enc;
++    auto pipeline = ggml_metal_library_get_pipeline_sparse_mla(ctx->lib, op);
++
++    const ggml_tensor * q    = op->src[0];
++    const ggml_tensor * k    = op->src[1];
++    const ggml_tensor * ids  = op->src[2];
++    const ggml_tensor * mask = op->src[3];
++
++    ggml_metal_kargs_sparse_mla args = {
++        /*.n_head =*/ (int32_t) q->ne[1],
++        /*.n_sel  =*/ (int32_t) ids->ne[0],
++        /*.nb_q1  =*/ q->nb[1],
++        /*.nb_q2  =*/ q->nb[2],
++        /*.nb_k1  =*/ k->nb[1],
++        /*.nb_i1  =*/ ids->nb[1],
++        /*.nb_m1  =*/ mask->nb[1],
++        /*.nb_d1  =*/ op->nb[1],
++        /*.nb_d2  =*/ op->nb[2],
++        /*.scale  =*/ ggml_get_op_params_f32(op, 0),
++    };
++
++    // one simdgroup a head, up to 8 heads a threadgroup sharing each staged block of 16 rows (OP_SPARSE_MLA_NC)
++    const int nsg = (int) std::min<int64_t>(8, q->ne[1]);
++
++    ggml_metal_encoder_set_pipeline(enc, pipeline);
++    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),    1);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),    2);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ids),  3);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask), 4);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   5);
++    ggml_metal_encoder_set_threadgroup_memory_size(enc, 16*q->ne[0]*ggml_type_size(k->type), 0);
++    ggml_metal_encoder_dispatch_threadgroups(enc, (q->ne[1] + nsg - 1)/nsg, q->ne[2], 1, 32, nsg, 1);
++
++    return 1;
++}
++
+ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+diff --git a/src/ggml-metal/ggml-metal-ops.h b/src/ggml-metal/ggml-metal-ops.h
+index 583d115..ebab0ad 100644
+--- a/src/ggml-metal/ggml-metal-ops.h
++++ b/src/ggml-metal/ggml-metal-ops.h
+@@ -60,6 +60,7 @@ int ggml_metal_op_set_rows          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_diag              (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_lightning_indexer (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_dsv4_hc           (ggml_metal_op_t ctx, int idx);
++int ggml_metal_op_sparse_mla        (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_soft_max          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_ssm_conv          (ggml_metal_op_t ctx, int idx);
+ int ggml_metal_op_ssm_scan          (ggml_metal_op_t ctx, int idx);
+diff --git a/src/ggml-metal/kernels/misc.metal b/src/ggml-metal/kernels/misc.metal
+index 877ccf2..d3e42e4 100644
+--- a/src/ggml-metal/kernels/misc.metal
++++ b/src/ggml-metal/kernels/misc.metal
+@@ -665,3 +665,104 @@ kernel void kernel_dsv4_hc_post_f32(
+         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
+     }
+ }
++
++// sparse MQA attention (ggml_sparse_mla): a threadgroup per (token, group of up to 8 heads), a simdgroup per head.
++// The token's selected rows are staged 16 at a time in threadgroup memory and read by every head of the group; each
++// lane keeps D/32 elements of its head's query and output, with an online softmax over the blocks.  T: the cache's
++// element type (half, or float: 32 KB of staged rows at D = 512, the threadgroup memory limit).
++template <typename T, typename T4, int D>
++kernel void kernel_sparse_mla(
++        constant ggml_metal_kargs_sparse_mla & args,
++        device const char * q,
++        device const char * k,
++        device const char * ids,
++        device const char * mask,
++        device       char * dst,
++        threadgroup     T * shk [[threadgroup(0)]],
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort  tiitg[[thread_index_in_threadgroup]],
++        ushort  tiisg[[thread_index_in_simdgroup]],
++        ushort  sgitg[[simdgroup_index_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    constexpr int NE = D/32;   // elements a lane holds
++    constexpr int NC = 16;     // rows a staged block holds
++    constexpr int D4 = D/4;
++
++    const int t = tgpig.y;
++    const int h = tgpig.x*ntg.y + sgitg;
++    const bool active = h < args.n_head;
++    const int nthr = ntg.x*ntg.y;
++
++    float qv[NE];
++    float ov[NE];
++    device const float * qp = (device const float *) (q + (active ? h : 0)*args.nb_q1 + t*args.nb_q2);
++    for (int e = 0; e < NE; ++e) {
++        qv[e] = qp[tiisg + 32*e]*args.scale;
++        ov[e] = 0.0f;
++    }
++    float M = -FLT_MAX/2;
++    float S = 0.0f;
++
++    device const int32_t * ip = (device const int32_t *) (ids  + t*args.nb_i1);
++    device const float   * mp = (device const float   *) (mask + t*args.nb_m1);
++    threadgroup T4 * shk4 = (threadgroup T4 *) shk;
++
++    for (int c0 = 0; c0 < args.n_sel; c0 += NC) {
++        const int nc = min(NC, args.n_sel - c0);
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        for (int i = tiitg; i < nc*D4; i += nthr) {
++            const int c = i/D4;
++            shk4[i] = ((device const T4 *) (k + (int64_t) ip[c0 + c]*args.nb_k1))[i - c*D4];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++
++        float s[NC];
++        float bm = M;
++        for (int c = 0; c < NC; ++c) {
++            if (c < nc) {
++                float d = 0.0f;
++                for (int e = 0; e < NE; ++e) {
++                    d += qv[e]*(float) shk[c*D + tiisg + 32*e];
++                }
++                s[c] = simd_sum(d) + mp[c0 + c];
++                bm = max(bm, s[c]);
++            }
++        }
++        const float r = exp(M - bm);
++        S *= r;
++        for (int e = 0; e < NE; ++e) {
++            ov[e] *= r;
++        }
++        for (int c = 0; c < NC; ++c) {
++            if (c < nc) {
++                const float p = exp(s[c] - bm);
++                S += p;
++                for (int e = 0; e < NE; ++e) {
++                    ov[e] += p*(float) shk[c*D + tiisg + 32*e];
++                }
++            }
++        }
++        M = bm;
++    }
++
++    if (!active) {
++        return;
++    }
++    device float * op = (device float *) (dst + h*args.nb_d1 + t*args.nb_d2);
++    const float inv = S == 0.0f ? 0.0f : 1.0f/S;
++    for (int e = 0; e < NE; ++e) {
++        op[tiisg + 32*e] = ov[e]*inv;
++    }
++}
++
++typedef decltype(kernel_sparse_mla<half, half4, 64>)   kernel_sparse_mla_f16_t;
++typedef decltype(kernel_sparse_mla<float, float4, 64>) kernel_sparse_mla_f32_t;
++
++template [[host_name("kernel_sparse_mla_f16_d64")]]  kernel kernel_sparse_mla_f16_t kernel_sparse_mla<half, half4, 64>;
++template [[host_name("kernel_sparse_mla_f16_d128")]] kernel kernel_sparse_mla_f16_t kernel_sparse_mla<half, half4, 128>;
++template [[host_name("kernel_sparse_mla_f16_d256")]] kernel kernel_sparse_mla_f16_t kernel_sparse_mla<half, half4, 256>;
++template [[host_name("kernel_sparse_mla_f16_d512")]] kernel kernel_sparse_mla_f16_t kernel_sparse_mla<half, half4, 512>;
++template [[host_name("kernel_sparse_mla_f32_d64")]]  kernel kernel_sparse_mla_f32_t kernel_sparse_mla<float, float4, 64>;
++template [[host_name("kernel_sparse_mla_f32_d128")]] kernel kernel_sparse_mla_f32_t kernel_sparse_mla<float, float4, 128>;
++template [[host_name("kernel_sparse_mla_f32_d256")]] kernel kernel_sparse_mla_f32_t kernel_sparse_mla<float, float4, 256>;
++template [[host_name("kernel_sparse_mla_f32_d512")]] kernel kernel_sparse_mla_f32_t kernel_sparse_mla<float, float4, 512>;
+diff --git a/src/ggml.c b/src/ggml.c
+index 1752814..5df6fe9 100644
+--- a/src/ggml.c
++++ b/src/ggml.c
+@@ -1084,6 +1084,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "DSV4_HC_COMB",
+     "DSV4_HC_PRE",
+     "DSV4_HC_POST",
++    "SPARSE_MLA",
+ 
+     "UNARY",
+ 
+@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "dsv4_hc_comb(mixes, scale, base)",
+     "dsv4_hc_pre(x, weights)",
+     "dsv4_hc_post(x, residual, post, comb)",
++    "sparse_mla(q, k, idx, mask)",
+ 
+     "unary(x)",
+ 
+@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
++static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6608,6 +6610,34 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+     return result;
+ }
+ 
++// ggml_sparse_mla
++
++struct ggml_tensor * ggml_sparse_mla(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * idx,
++        struct ggml_tensor  * mask,
++        float                 scale) {
++    GGML_ASSERT(q->type == GGML_TYPE_F32 && (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32));
++    GGML_ASSERT(idx->type == GGML_TYPE_I32 && mask->type == GGML_TYPE_F32);
++    GGML_ASSERT(q->ne[0] == k->ne[0] && q->ne[3] == 1 && k->ne[2] == 1 && k->ne[3] == 1);
++    GGML_ASSERT(idx->ne[1] == q->ne[2] && idx->ne[2] == 1 && idx->ne[3] == 1);
++    GGML_ASSERT(ggml_are_same_shape(idx, mask));
++
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], q->ne[2]);
++
++    ggml_set_op_params_f32(result, 0, scale);
++
++    result->op     = GGML_OP_SPARSE_MLA;
++    result->src[0] = q;
++    result->src[1] = k;
++    result->src[2] = idx;
++    result->src[3] = mask;
++
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {

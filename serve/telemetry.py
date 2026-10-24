@@ -645,6 +645,12 @@ def _cpu_name():
             return winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
         except OSError:
             pass
+    elif sys.platform == "darwin":
+        try:
+            return subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True,
+                                  timeout=5).stdout.strip() or None
+        except (OSError, subprocess.SubprocessError):
+            pass
     elif os.path.exists("/proc/cpuinfo"):
         for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
             if line.startswith("model name"):

@@ -376,7 +376,7 @@ conv einsum was repaired - four independent reviews converged on this diagnosis)
 streaming continuation at positions 8-11. **8/8 suites green on Mercury in 2.1 s of GPU.** The
 packer (`iq_pack.py`) recognizes `glm5-next` and carries the per-architecture BF16-preserve list
 (the mHC fn/base/scale names, the glm5 indexer set, the router + noaux_tc bias, the KDA gates)
-with 3-D tensors packing byte-exactly as (ne0*ne1, ne2) views; `strata_tokenizer` implements the
+with 3-D tensors packing byte-exactly as (ne0*ne1, ne2) views; `maya_tokenizer` implements the
 glm4/glm5 pre-tokenizer scheme (a verbatim CHATGLM4 transcription from llama-vocab.cpp: digit runs
 in groups of at most 3, no `\p{M}` in the letter/punct classes, `ignore_merges` whole-vocab-hit
 emission) and still refuses schemes it has not transcribed; the pack export ships the per-scheme
@@ -421,7 +421,7 @@ path runs through the MLA attention kernels and their parity harness.
   `glm_layer_parity` (the full layer composition) and the binary fixtures under `data/`.
 * Phase 3: the `Glm5Model` streaming runner (`src/core/glm_model.{hpp,cu}`, held to the oracle by
   `glm_model_test`); `iq_pack.py`'s glm5-next support (`tools/test_iq_pack_glm.py`) and the
-  glm4/glm5 pre-tokenizer in `strata_tokenizer` (`tools/test_tokenizer_glm.py`).
+  glm4/glm5 pre-tokenizer in `maya_tokenizer` (`tools/test_tokenizer_glm.py`).
 
 A note on running the kernel parity tests on a 2x V100 machine (Mercury): its GPUs are V100s (sm_70), BELOW
 the engine's sm_75 minimum, so the prebuilt archs produce binaries the V100 cannot launch ("no kernel
@@ -513,7 +513,7 @@ The real GLM-5.3-Flash tokenizer.json (154,856 BPE tokens + 36 specials, 321,649
 CHATGLM4 pre-regex appears verbatim, `(?i:'s|'t|...)` included) is now an accepted fixture:
 `tools/vocab_gguf.py` writes it as a vocab-only GGUF (written with llama.cpp's own gguf-py
 GGUFWriter - my hand-rolled writer desyncs llama's reader on large string arrays), and
-`tools/tokenizer_diff.py` compares `llama-tokenize` against `strata_tokenizer` id for id.
+`tools/tokenizer_diff.py` compares `llama-tokenize` against `maya_tokenizer` id for id.
 
 One real bug: the ignore_merges whole-vocab lookup ran on the RAW pre-token piece instead of the
 byte-MAPPED one - identity for ASCII (every earlier test passed), wrong for any non-ASCII

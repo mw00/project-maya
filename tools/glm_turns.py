@@ -7,7 +7,7 @@ The engine's environment (STRATA_GLM_*) is passed through, e.g. STRATA_GLM_PREFI
 threshold."""
 import os, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import strata_tokenizer as T
+import maya_tokenizer as T
 pack = sys.argv[1]
 binary = sys.argv[2] if len(sys.argv) > 2 else "build/maya"
 tk = T.Tokenizer.from_dir(os.path.join(pack, "tokenizer"))

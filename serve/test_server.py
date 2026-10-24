@@ -1242,6 +1242,28 @@ class CorsOptIn(unittest.TestCase):
         code, h, _ = self.call("GET", "/", {"Origin": self.PAGE})
         self.assertIsNone(h.get("Access-Control-Allow-Origin"))
 
+    def test_another_page_cannot_post_without_a_preflight(self):
+        # CSRF: fetch(..., {mode: "no-cors", body: "..."}) sends text/plain and no preflight; its Origin gives it away
+        for origin in ("http://evil.example", "null"):
+            r = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(self.CHAT).encode(),
+                                       headers={"Content-Type": "text/plain", "Origin": origin}, method="POST")
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                urllib.request.urlopen(r, timeout=30)
+            with cm.exception as e:
+                self.assertEqual(e.code, 403, origin)
+        code, _, _ = self.call("POST", "/v1/chat/completions", None, self.CHAT)   # curl, the SDKs: no Origin
+        self.assertEqual(code, 200)
+        code, _, _ = self.call("DELETE", "/v1/responses/resp_x", {"Origin": "http://evil.example"})
+        self.assertEqual(code, 403)
+
+    def test_a_rebound_name_is_refused_without_an_api_key(self):
+        # DNS rebinding: the page's own name, now resolving to 127.0.0.1, arrives as the Host
+        code, _, _ = self.call("GET", "/v1/models", {"Host": "evil.example:8095"})
+        self.assertEqual(code, 403)
+        for host in ("localhost:8095", "127.0.0.1", "[::1]:8095", "192.168.1.20:8095"):
+            code, _, _ = self.call("GET", "/v1/models", {"Host": host})
+            self.assertEqual(code, 200, host)
+
     def test_the_config_value(self):
         self.assertEqual(parse_cors_origins(None), [])
         self.assertEqual(parse_cors_origins([]), [])
@@ -1585,7 +1607,7 @@ class RequestBodies(unittest.TestCase):
     def raw(self, headers: str, body: bytes = b"") -> tuple[int, dict]:
         """One POST written by hand (headers urllib would not send) -> (status, JSON answer)."""
         import socket
-        head = ("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n" + headers +
+        head = ("POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n" + headers +
                 "\r\n").encode()
         with socket.create_connection(("127.0.0.1", self.port), timeout=30) as s:
             s.sendall(head + body)
@@ -1814,7 +1836,7 @@ class GoneClients(unittest.TestCase):
         body = json.dumps({"model": "m", "max_tokens": 8, "stream": stream,
                            "messages": [{"role": "user", "content": "hi"}]}).encode()
         s = socket.create_connection(("127.0.0.1", self.port))
-        s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        s.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                   b"Content-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
         return s
 

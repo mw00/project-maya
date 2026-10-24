@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -196,6 +197,8 @@ def _memory_status():
 def ram_gb():
     if WIN:
         return _memory_status().ullTotalPhys / 2**30
+    if sys.platform == "darwin":
+        return int(out(["sysctl", "-n", "hw.memsize"]).strip() or 0) / 2**30
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
@@ -222,6 +225,8 @@ def cpu_info():
         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
         name = n or name
         avx512 = bool(pf(41)) and _cpuid_avx512_full()
+    elif sys.platform == "darwin":
+        name = out(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or name
     else:
         try:
             txt = open("/proc/cpuinfo").read()
@@ -407,6 +412,8 @@ def download(url, dst: Path, what=None):
         return
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
+        if total and have >= total:                    # killed between the last byte and the rename: no 416 loop
+            break
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "maya-setup", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
@@ -429,7 +436,7 @@ def download(url, dst: Path, what=None):
             progress()
             if not total or have >= total:
                 break
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:     # IncompleteRead: the connection cut mid-body
             progress()
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
@@ -467,12 +474,20 @@ def get_llama_cpp():
     llama = ROOT / "third_party" / "llama.cpp"
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
+    if (llama / ".git").exists():                       # someone's own checkout: never deleted
+        fail(f"{llama} is a git checkout without ggml/CMakeLists.txt or gguf-py",
+             f"check out llama.cpp {LLAMA_CPP_COMMIT[:7]} there, or move the folder away")
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
+    try:
+        with zipfile.ZipFile(z) as f:
+            f.extractall(tmp)
+    except zipfile.BadZipFile:                          # cut short with no Content-Length: never mark it done
+        z.unlink(missing_ok=True)
+        z.with_name(z.name + ".done").unlink(missing_ok=True)
+        fail(f"{z.name} is damaged (the download was cut short)", "run the setup again: it downloads it anew")
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
     # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
@@ -496,7 +511,10 @@ def get_llama_cpp():
 def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else []
+    try:
+        have = json.loads(stamp.read_text()) if stamp.exists() else []
+    except ValueError:                                  # half written (power loss): install again
+        have = []
     need = [p for p in packages if p not in have]
     if not need:
         ok(f"{what} already installed")

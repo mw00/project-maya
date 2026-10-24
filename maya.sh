@@ -1,6 +1,6 @@
 #!/bin/sh
-# Project Maya for Linux: the first run checks the PC, compiles the engine, asks before it downloads the model, builds
-# the pack and starts the dashboard; later runs just start it.  ./maya.sh --help lists the options.
+# Project Maya for Linux and macOS: the first run checks the PC, compiles the engine, asks before it downloads the
+# model, builds the pack and starts the dashboard; later runs just start it.  ./maya.sh --help lists the options.
 # Nothing is installed system-wide: a missing Python is reported with the command that installs it.
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate
@@ -22,6 +22,7 @@ if [ ! -x .venv/bin/python ]; then
     echo "  Ubuntu/Debian: sudo apt-get install -y python3 python3-venv python3-pip"
     echo "  Fedora:        sudo dnf install -y python3 python3-pip"
     echo "  Arch:          sudo pacman -S python python-pip"
+    echo "  macOS:         brew install python  (or python.org's installer)"
     exit 1
   fi
   # a private environment inside this folder (system Python stays untouched; newer distros refuse global pip)

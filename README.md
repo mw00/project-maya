@@ -187,6 +187,7 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 
 - **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
 - **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
+- **Mac with Apple Silicon (experimental, GLM-5.3-Flash):** `./maya.sh --backend metal` - see [docs/METAL.md](docs/METAL.md).
 - **Updating:** the dashboard's **About > Update**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
 - **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
 

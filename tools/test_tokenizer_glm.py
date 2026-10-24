@@ -24,7 +24,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
-from strata_tokenizer import BYTE_TO_UNICODE, GLM_PATTERN, QWEN35_PATTERN, Tokenizer  # noqa: E402
+from maya_tokenizer import BYTE_TO_UNICODE, GLM_PATTERN, QWEN35_PATTERN, Tokenizer  # noqa: E402
 
 
 def tiny_vocab() -> tuple[list[str], list[str]]:
