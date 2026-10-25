@@ -2366,9 +2366,18 @@ struct Model::Impl {
             Dev& d = devs[i];
             d.id = ids[i];
             CK(cudaSetDevice(d.id));
-            CK(cudaStreamCreateWithFlags(&d.st, cudaStreamNonBlocking));
+            // the layers' streams at the device's greatest priority: the expert cache's and the prompt path's other
+            // streams (the least, the default) never hold a multiprocessor a layer's kernel could take.
+            // DS4_STREAM_PRIO=0: the default priority
+            static const bool prio_on = std::getenv("DS4_STREAM_PRIO") == nullptr || std::atoi(std::getenv("DS4_STREAM_PRIO")) != 0;
+            int least = 0, greatest = 0;
+            if (!prio_on || cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
+                cudaGetLastError();
+                greatest = 0;
+            }
+            CK(cudaStreamCreateWithPriority(&d.st, cudaStreamNonBlocking, greatest));
             CK(cudaEventCreateWithFlags(&d.ev, cudaEventDisableTiming));
-            CK(cudaStreamCreateWithFlags(&d.st2, cudaStreamNonBlocking));
+            CK(cudaStreamCreateWithPriority(&d.st2, cudaStreamNonBlocking, greatest));
             CK(cudaEventCreateWithFlags(&d.hc_go, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&d.hc_done, cudaEventDisableTiming));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
