@@ -231,10 +231,19 @@ async function loadHealth() {
     setTimeout(loadHealth, 2000);
   }
 }
+// the model family's logo beside its name in the sidebar (web/logo-*.svg: lobe-icons' marks, MIT); none for another
+// (GLM: Z.ai's one-colour mark - black, inverted on the dark theme: side__logo--mono)
+const MODEL_LOGOS = [[/glm/i, "glm", true], [/deepseek/i, "deepseek"], [/minimax/i, "minimax"], [/qwen/i, "qwen"]];
+function modelLogo(name) {
+  const m = MODEL_LOGOS.find(([re]) => re.test(name || ""));
+  return m ? `<span class="side__logo${m[2] ? " side__logo--mono" : ""}"><img src="web/logo-${m[1]}.svg" alt="" ` +
+             `width="20" height="20"></span>` : "";
+}
 function renderModelLine() {
   const ctx = health.max_context ? `${ctxfmt(health.max_context)} context` : "";
   const ver = health.version ? `v${health.version}` : "";
-  $("side-model").innerHTML = `<b>${esc(health.model)}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}`;
+  $("side-model").innerHTML = `${modelLogo(health.model)}<span class="side__model-text"><b>${esc(health.model)}</b>` +
+                              `${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
   $("chat-empty-model").textContent = [health.model, ctx, ver ? `Project Maya ${ver}` : ""].filter(Boolean).join(" · ");
 }
 
