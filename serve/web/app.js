@@ -5,7 +5,8 @@ import {html, render, useEffect} from "./preact.js";
 import {isPhone} from "./lib.js";
 import {S, applyTheme, closeDialog, emit, useStore} from "./state.js";
 import {loadHealth, loadMcp, loadUpdate, poll, whenHealth} from "./server.js";
-import {cancelEdit, chatView, loadChats, newChat, newChatObj, openChat, resumePending, send, stopAnswer, updateCtxMeter} from "./chats.js";
+import {cancelEdit, chatView, focusInput, loadChats, newChat, newChatObj, openChat, resumePending, send, stopAnswer,
+        updateCtxMeter} from "./chats.js";
 import {DialogHost, Toasts, trapTab} from "./ui.js";
 import {SearchDialog, Sidebar, openSettings, setSide, showView} from "./sidebar.js";
 import {ChatPage} from "./chat-view.js";
@@ -72,7 +73,7 @@ S.current = newChatObj();
 render(html`<${App}/>`, document.getElementById("app"));
 route();
 whenHealth(() => updateCtxMeter());
-loadChats().then(() => loadHealth()).then(loadMcp).then(() => {
+loadChats().then(() => { if (S.view === "chat" && !S.settings) focusInput(); return loadHealth(); }).then(loadMcp).then(() => {
   loadUpdate();                                    // (Settings' dot when a new version is out)
   resumePending();
   if (startQuestion) {

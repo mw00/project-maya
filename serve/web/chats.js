@@ -15,7 +15,7 @@ export const titleOf = (msgs) => {
 };
 export const chatTitle = (c) => c.title || (c.messages.length ? titleOf(c.messages) : "New chat");
 export function newChatObj() {
-  return {id: uid(), title: "", created: Date.now(), updated: Date.now(), messages: [], system: defaultSystem()};
+  return {id: uid(), title: "", created: Date.now(), updated: Date.now(), messages: [], system: defaultSystem(), thinking: P.thinking};
 }
 // the thinking level this chat asks for: its own (the box's speedometer), else the Settings default
 export const thinkingOf = (c = S.current) => (c && c.thinking) || P.thinking;
@@ -69,14 +69,14 @@ export async function loadChats() {
   chats.sort((a, b) => b.updated - a.updated);
   S.chats = chats;
   const want = store.get("current-chat", null);
-  S.current = chats.find((c) => c.id === want) || newChatObj();
+  S.current = chats.find((c) => c.id === want) || chats[0] || newChatObj();
   emit();
 }
 export const chatById = (id) => S.chats.find((c) => c.id === id);
 
 // an answer being written goes on in its own chat while another one is open (and shows again when its chat is)
 export function openChat(c) {
-  if (S.current === c && S.view === "chat") { S.drawer = false; emit(); return; }
+  if (S.current === c) { S.view = "chat"; S.drawer = false; emit(); focusInput(); return; }
   S.current = c;
   store.set("current-chat", c.id);
   if (c.folder && !S.folderOpen[c.folder]) { S.folderOpen = {...S.folderOpen, [c.folder]: true}; saveFolders(); }
@@ -101,8 +101,11 @@ export async function deleteChat(c) {
   if (S.busy && S.busy.chat === c) { toast("warn", "Still writing", "Stop the answer first."); return; }
   S.chats = S.chats.filter((x) => x !== c);
   try { if (!dbBroken) await db.del(c.id); } catch (e) { /* ignore */ }
-  if (dbBroken) persist(S.chats[0]);
-  if (S.current === c) openChat(newChatObj());
+  if (dbBroken) {
+    try { localStorage.setItem("maya.chats-fallback", JSON.stringify(S.chats.slice(0, 30).map(slim))); } catch (e) { /* ignore */ }
+  }
+  if (S.current === c) openChat(S.chats[0] || newChatObj());
+  focusInput();
   emit();
   toast("info", "Chat deleted", chatTitle(c), 6000, {label: "Undo", run: () => {
     S.chats.push(c);
@@ -351,7 +354,7 @@ export async function answer(resumeJob = null) {
     messages.push(m);
   }
   const controller = new AbortController();
-  S.busy = {controller, msg: m, chat};
+  S.busy = {controller, msg: m, chat, job: resumeJob || undefined};
   emit();
   scrollDown(true);
 
@@ -520,6 +523,7 @@ export async function send() {
   S.view = "chat";
   saveChat(c);
   store.set("current-chat", c.id);
+  focusInput();
   await answer();
 }
 export function regenerate() {

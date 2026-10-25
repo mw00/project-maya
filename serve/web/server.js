@@ -49,7 +49,7 @@ export async function poll() {
     if (++fails >= 3) S.conn = "down";
   }
   if (!document.hidden) emit();
-  if (S.view === "monitor" && ++mcpTick % 10 === 0) loadMcp();   // server states change rarely: every 10 s
+  if ((S.view === "monitor" || S.settings === "tools") && ++mcpTick % 10 === 0) loadMcp();   // (they change rarely: every 10 s)
   setTimeout(poll, document.hidden ? 5000 : 1000);               // a hidden tab looks five times less often
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) emit(); });

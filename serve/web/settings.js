@@ -7,7 +7,7 @@ import {DEFAULTS, LEVELS, P, PRESETS, S, THINK_TITLES, copyText, emit, prefsKey,
         toast} from "./state.js";
 import {confirmContext, confirmPort, ctxEstimate, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
-import {chatInstructions, clearBrowser, estimateTokens} from "./chats.js";
+import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
 import {Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
@@ -122,7 +122,10 @@ function ChatDefaults() {
                  {id: "balanced", label: "Balanced", title: "Temperature 0.6, top-p 0.95, top-k 20"},
                  {id: "creative", label: "Creative", title: "Temperature 1.0, top-p 0.95, min-p 0.05"}]}/><//>
     <${Row} label="Thinking" sub="The level a new chat starts with. A chat changes its own with the speedometer in the message box.">
-      <${Seg} label="Thinking" value=${P.thinking} onChange=${(id) => set({thinking: id})}
+      <${Seg} label="Thinking" value=${P.thinking} onChange=${(id) => {
+        set({thinking: id});
+        if (S.current && !S.current.messages.length) S.current.thinking = id;   // (the new chat on screen starts there too)
+      }}
         options=${LEVELS.map((l) => ({id: l.id, label: l.name, title: titles[l.id]}))}/><//>
     ${sliders.map((r) => html`<div class="set-slider">
       <label for=${`set-${r.k}`}><span>${r.label}</span><span class="set-row__sub">${r.hint}</span></label>
@@ -153,7 +156,10 @@ function Instructions() {
     <label for="set-instr" class="set-row__text"><span class="set-row__label">For new chats</span>
       <span class="set-row__sub">The model reads them before your first message. A chat can change its own from its ⋯ menu.</span></label>
     <textarea id="set-instr" class="input input--area" rows="8" placeholder="e.g. Answer briefly. Write code in TypeScript."
-      value=${P.sys_default ? P.system : ""} onInput=${(e) => savePrefs({system: e.target.value, sys_default: !!e.target.value.trim()})}></textarea>
+      value=${P.sys_default ? P.system : ""} onInput=${(e) => {
+        savePrefs({system: e.target.value, sys_default: true});
+        if (S.current && !S.current.messages.length) { S.current.system = e.target.value; updateCtxMeter(); }   // (the new chat on screen)
+      }}></textarea>
     ${c && c.messages.length ? html`<div class="set-row">
       <span class="set-row__text"><span class="set-row__label">This chat</span>
         <span class="set-row__sub">${c.system && c.system.trim() ? `“${c.system.trim().slice(0, 90)}${c.system.trim().length > 90 ? "…" : ""}”` : "No instructions of its own."}</span></span>
@@ -203,7 +209,8 @@ function Connect() {
       <button type="button" class="icon-btn icon-btn--sm" aria-label=${`Copy the ${k}`} title="Copy" onClick=${() => copyText(v)}><${Icon} name="copy" sm/></button></div>`)}
     <${Row} label="API key" htmlFor="set-key" sub=${key ? "This server needs one. It is kept in this browser only." : "Only if the server was started with one. Kept in this browser only."}>
       <input id="set-key" class="input input--key" type="password" autocomplete="off" placeholder="Not needed" value=${apikey}
-        onInput=${(e) => setKey(e.target.value)} onChange=${(e) => { store.set("apikey", e.target.value.trim()); toast("success", "API key saved", "Kept in this browser only."); }}/><//>
+        onInput=${(e) => { setKey(e.target.value); store.set("apikey", e.target.value.trim()); }}
+        onChange=${() => toast("success", "API key saved", "Kept in this browser only.")}/><//>
     <div class="set-block">
       <div class="tabs" role="tablist" aria-label="Examples">${Object.entries(examples).map(([id, [label]]) => html`
         <button type="button" role="tab" aria-selected=${String(tab === id)} class="tabs__tab" onClick=${() => setTab(id)}>${label}</button>`)}</div>

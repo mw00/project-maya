@@ -69,7 +69,7 @@ function Header() {
         <button type="button" ref=${oBtn} class="icon-btn" aria-label="Chat options" title="Chat options" aria-haspopup="menu"
           aria-expanded=${String(opts)} onClick=${() => setOpts(!opts)}><${Icon} name="ellipsis"/></button>
         <${Menu} open=${opts} onClose=${() => setOpts(false)} anchor=${oBtn} label="Chat options" width=${250}>
-          <${ChatMenuItems} c=${S.current} close=${() => setOpts(false)}/>
+          <${ChatMenuItems} c=${S.current} close=${() => { setOpts(false); if (oBtn.current) oBtn.current.focus(); }}/>
         <//>
       </span>
     </div>
@@ -310,7 +310,7 @@ function Composer({center}) {
     if (need !== tall) { setTall(need); return; }
     t.style.height = "auto";
     t.style.height = `${Math.min(t.scrollHeight, Math.round(innerHeight * 0.4))}px`;
-  });
+  }, [text, S.attachments.length, tall]);   // (not on every repaint: the chat below must not jump while it streams)
   const keydown = (e) => {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !coarse()) { e.preventDefault(); send(); }
   };
@@ -375,8 +375,8 @@ function Greeting({phone}) {
     <h1>What are we building today?</h1>
     ${phone ? null : html`<${Composer} center/>`}
     <div class="ideas" role="list" aria-label="Ideas to start with">
-      ${IDEAS.map((it) => html`<button type="button" role="listitem" class="idea" onClick=${() => useIdea(it.q)}>
-        <${Icon} name=${it.icon}/><span>${it.label}</span></button>`)}
+      ${IDEAS.map((it) => html`<div role="listitem"><button type="button" class="idea" onClick=${() => useIdea(it.q)}>
+        <${Icon} name=${it.icon}/><span>${it.label}</span></button></div>`)}
     </div>
   </div>`;
 }

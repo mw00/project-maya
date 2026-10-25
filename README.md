@@ -213,7 +213,7 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 
 - **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
 - **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
-- **Updating:** the dashboard's **About > Update**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
+- **Updating:** the page's **Settings › About and updates**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
 - **Every option** (GPUs, context, a model folder you already have, remote access, ...): [docs/SETUP.md](docs/SETUP.md).
 
 > **The start takes a few minutes:** the engine pins most of the free RAM (all but about 6 GB) for its expert tier,
@@ -221,9 +221,9 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 
 ## Using it
 
-- **In the browser:** chat (kept in your browser, per-chat instructions, edit and regenerate, HTML previews), a live
-  **Monitor** of the model and your hardware (down to what fills each GPU's memory), and a context size and port you
-  can change in Settings.
+- **In the browser:** chat (kept in your browser, with search, pins and folders, per-chat instructions and thinking
+  level, edit and regenerate, HTML previews), a live **Monitor** of the model and your hardware (down to what fills
+  each GPU's memory), and a context size and port you can change in Settings.
 - **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
   `http://127.0.0.1:8080/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`). Tool calls are
   streamed as the model writes them, and a long prompt's reading progress too when a request asks for it
@@ -340,6 +340,8 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw)). The optional DFlash2 drafter
   ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF) by Anbeeld) is CC BY-NC-ND
   4.0, non-commercial use only, and is downloaded only when you choose it.
-- The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`).
+- The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`); its icons:
+  [Lucide](https://lucide.dev) (ISC License); its UI library: [Preact](https://preactjs.com) (MIT License) with
+  [htm](https://github.com/developit/htm) (Apache License 2.0), bundled in `serve/web/preact.js` with their notices.
 - Maya is open source under the [MIT License](LICENSE); the notices of Strata, ggml, exllamav3 and beellama.cpp stay
   with every copy.

@@ -56,9 +56,10 @@ export function ChatMenuItems({c, close}) {
 function ChatRow({c, indent}) {
   const [open, setOpen] = useState(false);
   const btn = useRef(null);
+  const close = () => { setOpen(false); if (btn.current) btn.current.focus(); };   // (a dialog then returns here)
   const cur = c === S.current && S.view === "chat";
   const writing = S.busy && S.busy.chat === c;
-  return html`<div class=${`row${cur ? " is-current" : ""}${open ? " is-menu" : ""}`} role="listitem">
+  return html`<div class=${`row${cur ? " is-current" : ""}${open ? " is-menu" : ""}`}>
     <button type="button" class=${`row__open${indent ? " row__open--in" : ""}`} title=${chatTitle(c)} aria-current=${cur ? "page" : undefined}
       onClick=${() => openChat(c)}>${chatTitle(c)}</button>
     ${writing ? html`<span class="row__live" title="An answer is being written" aria-label="Writing"></span>`
@@ -66,7 +67,7 @@ function ChatRow({c, indent}) {
     <button type="button" ref=${btn} class="row__more" aria-label=${`Options for ${chatTitle(c)}`} aria-haspopup="menu"
       aria-expanded=${String(open)} onClick=${() => setOpen(!open)}><${Icon} name="ellipsis" sm/></button>
     <${Menu} open=${open} onClose=${() => setOpen(false)} anchor=${btn} label="Chat options" width=${240}>
-      <${ChatMenuItems} c=${c} close=${() => setOpen(false)}/>
+      <${ChatMenuItems} c=${c} close=${close}/>
     <//>
   </div>`;
 }
@@ -82,8 +83,8 @@ function FolderRow({f, n}) {
     <button type="button" ref=${btn} class="row__more" aria-label=${`Options for the folder ${f.name}`} aria-haspopup="menu"
       aria-expanded=${String(open)} onClick=${() => setOpen(!open)}><${Icon} name="ellipsis" sm/></button>
     <${Menu} open=${open} onClose=${() => setOpen(false)} anchor=${btn} label="Folder options" width=${220}>
-      <${MenuItem} icon="edit" label="Rename" onClick=${() => { setOpen(false); renameFolder(f); }}/>
-      <${MenuItem} icon="trash" label="Delete folder" danger onClick=${() => { setOpen(false); deleteFolder(f); }}/>
+      <${MenuItem} icon="edit" label="Rename" onClick=${() => { setOpen(false); btn.current.focus(); renameFolder(f); }}/>
+      <${MenuItem} icon="trash" label="Delete folder" danger onClick=${() => { setOpen(false); btn.current.focus(); deleteFolder(f); }}/>
     <//>
   </div>`;
 }
@@ -101,7 +102,7 @@ function ChatList() {
     if (!groups.length || groups[groups.length - 1].label !== g) groups.push({label: g, chats: []});
     groups[groups.length - 1].chats.push(c);
   }
-  return html`<div class="side__list" role="list" aria-label="Chats">
+  return html`<div class="side__list" aria-label="Chats">
     ${pinned.length ? html`<div class="side__label">Pinned</div>${pinned.map((c) => html`<${ChatRow} key=${c.id} c=${c}/>`)}` : null}
     <div class="side__label side__label--row"><span>Folders</span>
       <button type="button" class="icon-btn icon-btn--sm" aria-label="New folder" title="New folder" onClick=${() => newFolder()}>
@@ -131,8 +132,17 @@ function StatusCard() {
 
 export function Sidebar({drawer}) {
   const newer = S.update && S.update.newer && !S.updateWatch;
-  return html`<nav class=${`side${drawer ? " side--drawer" : ""}`} aria-label="Maya">
-    <div class="side__head">
+  const head = useRef(null);
+  useEffect(() => {   // the phone's drawer: the keyboard goes into it, and back to the Chats button when it closes
+    if (!drawer) return;
+    const ret = document.activeElement;
+    const b = head.current && head.current.querySelector("button");
+    if (b) b.focus();
+    return () => { if (ret && ret.focus && document.contains(ret)) ret.focus(); };
+  }, [drawer]);
+  return html`<nav class=${`side${drawer ? " side--drawer" : ""}`} aria-label="Maya" role=${drawer ? "dialog" : undefined}
+    aria-modal=${drawer ? "true" : undefined}>
+    <div class="side__head" ref=${head}>
       <span class="side__brand"><${MayaMark}/><span>Maya</span></span>
       ${drawer
         ? html`<button type="button" class="icon-btn" aria-label="Close the chats" onClick=${() => { S.drawer = false; emit(); }}><${Icon} name="close"/></button>`

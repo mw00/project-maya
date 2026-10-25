@@ -1,7 +1,7 @@
 # Changelog
 
 Every release is on GitHub (Releases) with these notes; every published change moves the last number. Update: the
-dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
+page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
 ## v1.1.29 - 2026-10-26

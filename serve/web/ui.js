@@ -111,14 +111,16 @@ export function Seg({options, value, onChange, label, cls = ""}) {
   const keys = (e) => {
     if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;
     e.preventDefault();
+    const root = e.currentTarget;
     const i = options.findIndex((o) => o.id === value), d = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : -1;
-    const n = options[(i + d + options.length) % options.length];
+    const n = options[i < 0 ? 0 : (i + d + options.length) % options.length];
     onChange(n.id);
-    setTimeout(() => { const b = e.currentTarget && e.currentTarget.querySelector('[aria-checked="true"]'); if (b) b.focus(); }, 0);
+    setTimeout(() => { const b = root.querySelector('[aria-checked="true"]'); if (b) b.focus(); }, 0);
   };
+  const none = !options.some((o) => o.id === value);   // (custom values: the first choice takes the Tab stop)
   return html`<div class=${`seg ${cls}`} role="radiogroup" aria-label=${label} onKeyDown=${keys}>
     ${options.map((o) => html`<button type="button" role="radio" aria-checked=${String(o.id === value)} title=${o.title}
-      tabIndex=${o.id === value ? 0 : -1} onClick=${() => onChange(o.id)}>${o.label}</button>`)}</div>`;
+      tabIndex=${o.id === value || (none && o === options[0]) ? 0 : -1} onClick=${() => onChange(o.id)}>${o.label}</button>`)}</div>`;
 }
 
 // ------------------------------------------------------------------ the dialog (confirmations, a text to type, the preview)
@@ -143,7 +145,10 @@ export function DialogHost() {
     if (d.node && nodeHost.current) { nodeHost.current.innerHTML = ""; nodeHost.current.appendChild(d.node); }
     setTimeout(() => {
       if (input.current) { input.current.focus(); input.current.select && input.current.select(); return; }
-      const b = box.current && (box.current.querySelector(".btn--primary, .btn--danger") || box.current.querySelector(".dialog__close"));
+      // a confirmation that destroys something starts on Cancel (a stray Enter must not confirm it)
+      const danger = (d.actions || []).some((a) => a.danger);
+      const b = box.current && (danger ? box.current.querySelector(".dialog__actions .btn--secondary")
+                                       : box.current.querySelector(".btn--primary") || box.current.querySelector(".dialog__close"));
       if (b) b.focus();
     }, 0);
   }, [d]);
