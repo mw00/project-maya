@@ -4,6 +4,33 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+The engine builds and runs on aarch64, and an allocation failure in the prompt path ends the request instead of the
+process.
+
+- **NVIDIA DGX Spark (GB10) and Grace on CUDA (aarch64)** (@xcpatr9231975): the x86-only expert kernels are left out of the build and
+  the native packs go through ggml-cpu's own NEON paths; the spin-wait hints and the store fence are the ARM ones
+  (`yield`, `dmb oshst` - the outer-shareable store barrier is what makes the host's stores visible to a coherent
+  device before the doorbell it polls); and a device whose memory is the system's gets the AMD APUs'
+  unified-memory policy, so its expert pool is sized from `/proc/meminfo`'s `MemAvailable` (the runtime's free
+  figure counts the model's page cache as used - on a GB10 it read ~2 GB free with the 90 GB pack cached, so the
+  pool came out at 5 slots a layer and the start failed). A DGX Spark (121 GB shared with the GPU) holds Maya-S at
+  a 128K context and answers at 15-17 tokens/s without a drafter, every expert resident. The setup refuses the
+  DeepSeek EXL3 quants on an ARM CPU (their expert kernels are x86-only) and offers the GGUF instead.
+- **An allocation failure no longer ends the engine** (@xcpatr9231975). The prompt path's own checks (its kernel launches, the MMQ
+  kernels, the prefill GEMMs) and the MMQ scratch pool's allocation used to end the process - `std::exit(1)` and
+  `std::abort()` - so an out-of-memory moment took the engine down, the client got a 503 and the next request
+  waited for it to load again. A failure is now thrown and caught at the request: the request ends with an error,
+  the engine lives, the next request runs. Where the failure is a layout that does not fit, the prompt is read
+  again with a smaller chunk (down to 256 tokens) and stays that small for the requests that follow; a failure in
+  the middle of a chunk (the scratch pool, a verify window's first use) ends the request and the next one reads
+  its prompt again. Only a broken CUDA context still ends the engine. `STRATA_PREALLOC_FAIL=<tokens>` and
+  `STRATA_MMQ_POOL_FAIL=<n>` make the two failures happen on purpose; `tools/test_alloc_recovery.py` runs them and
+  checks that the engine answers the next request.
+- The bring-up is in [docs/DGX_SPARK.md](docs/DGX_SPARK.md), and what it changed, where each component comes from
+  and what other people contributed are in [docs/DGX_SPARK_BUILD.md](docs/DGX_SPARK_BUILD.md).
+
 ## v1.1.27 - 2026-10-24
 
 DeepSeek decodes up to twice as fast on PCs whose RAM holds its experts, GLM reads whole videos, and fixes for a
