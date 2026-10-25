@@ -679,6 +679,8 @@ struct Chunk {
         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
         const uint8_t* hsrc = nullptr;                 // (DS4_FLOW_HELPER) its blob in the helper's pool, copied into
                                                        // staging out of the helper's memory instead of read
+        bool dpart = false;                            // (DS4_FLOW_DOWN_PART) its down's read compacted to the member's
+                                                       // columns where it landed, DMA'd as one run (flow_copy)
         int64_t after = -1;                            // (layer-major) the items up to this one read first
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
@@ -3516,6 +3518,16 @@ struct Model::Impl {
                                     : "ds4: DS4_FLOW_DOWN_SHARE: no tensor-parallel members on the prompt path's "
                                       "flow - not used\n");
                 }
+                if (down_part_env()) {   // (DS4_FLOW_DOWN_PART: an uneven split's members on the flow)
+                    bool on = tp_uneven && flow_tp;
+                    for (const auto& cp : chunks) on = on && (cp == nullptr || cp->ring == nullptr || cp->flow);
+                    down_part = on;
+                    std::fprintf(stderr, "%s", on ? "ds4: DS4_FLOW_DOWN_PART: an uneven split's members DMA only their "
+                                                    "columns of each streamed expert's down, compacted where it was "
+                                                    "read\n"
+                                                  : "ds4: DS4_FLOW_DOWN_PART: no uneven split's members on the prompt "
+                                                    "path's flow - not used\n");
+                }
                 if (tp_uneven && flow_tp) {   // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN: the members that stream their parts)
                     std::string on;
                     for (size_t di = 0; di < chunks.size(); ++di)
@@ -4190,7 +4202,14 @@ struct Model::Impl {
                 return false;
             }
             if (r == 0 && flow_helper_fail == "check" && flow_fail_armed.exchange(false)) f[0] ^= 1;   // (the test's)
-            if (std::memcmp(f.data(), it.src[r], n) != 0) {
+            size_t nc = n;
+            if (r == 2 && it.dpart) {   // (DS4_FLOW_DOWN_PART: staging holds the member's columns, compacted)
+                size_t dr = 0, d0 = 0, dh = 0;
+                down_cut(l, it.mi, dr, d0, dh);
+                compact_rows(f.data(), (size_t) g.dim, dr, d0, dh);
+                nc = (size_t) g.dim * dh;
+            }
+            if (std::memcmp(f.data(), it.src[r], nc) != 0) {
                 err = "DS4_FLOW_HELPER_CHECK: layer " + std::to_string(l.il) + " expert " + std::to_string(it.e) +
                       " member " + std::to_string(it.mi) + " matrix " + std::to_string(r) +
                       ": the helper's pool differs from the model's files";
@@ -4213,6 +4232,28 @@ struct Model::Impl {
     }
     std::unique_ptr<std::atomic<uint8_t>[]> down_reads;   // (DS4_FLOW_DOWN_SHARE) [layer][expert]: members' reads
     size_t down_stride = 0;
+    // DS4_FLOW_DOWN_PART=1 (unset: as before): an uneven split's member (DS4_TP_GGUF_UNEVEN with DS4_FLOW_TP) DMAs the
+    // whole down of each streamed expert into its scratch and gathers its columns there (flow_copy) - a third of the
+    // expert over the link that the member never uses.  On: the read or the helper's copy into staging is compacted to
+    // the member's blocks of each row where it landed (IoQueue's compact_rows, on the reader's thread), and that part
+    // alone is DMA'd, in one run - the slot's bytes the same (tp_flow_member checks it at load), ~25 % less over the
+    // link a streamed expert.  A RAM-tier expert DMA'd from where it lies, or a copy's NH parts: as before
+    static bool down_part_env() {
+        static const bool on = [] {
+            const char* e = ds4_env("DS4_FLOW_DOWN_PART");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        return on;
+    }
+    bool down_part = false;   // (DS4_FLOW_DOWN_PART on and the members on the flow: set where the flow is set up)
+    // member mi of split layer l's down: a whole row's bytes, the member's blocks' offset in it and their bytes
+    void down_cut(const Layer& l, int mi, size_t& dr, size_t& d0, size_t& dh) const {
+        const Layer& x = member(l, mi);
+        const int t2 = gg::expert_type(l.lay, 2);
+        dr = gg::type_row_bytes(t2, g.ff);
+        d0 = gg::type_row_bytes(t2, x.ff0);
+        dh = gg::type_row_bytes(t2, x.ffn);
+    }
     // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN) the down scratch device di's flow copies a member's part through: the whole
     // down of its largest split layer.  0 - no scratch - for one GPU's layers, a load without the flow for its groups,
     // or an even split's members (DS4_FLOW_TP without the knob), whose down part keeps its 2D copy (flow_copy)
@@ -4233,10 +4274,11 @@ struct Model::Impl {
     // copy of the rows instead costs ~35 ms an expert against ~0.7 (192300Z: per-row transfers).  No scratch (an even
     // split's members: flow_down_bytes): the member's rows of the down as a 2D copy, as before - but an uneven split's
     // member without one (a scratch flow_down_bytes did not give it) fails, nothing enqueued.  Alone (nm 1): each
-    // matrix whole, as staged
+    // matrix whole, as staged.  dpart (DS4_FLOW_DOWN_PART): staging holds the member's columns of the down already,
+    // compacted - one run into the slot, no scratch
     bool flow_copy(const Layer& l, int mi, const uint8_t* const* src, bool whole, uint8_t* dst, uint8_t* down,
-                   cudaStream_t s) const {
-        if (l.nm > 1 && tp_uneven && down == nullptr) return false;
+                   cudaStream_t s, bool dpart = false) const {
+        if (l.nm > 1 && tp_uneven && down == nullptr && !dpart) return false;
         const Layer& x = member(l, mi);
         const x3::ExpertLayout& lay = l.nm > 1 ? x.hlay : l.lay;
         for (int p = 0; p < 2; ++p)
@@ -4247,6 +4289,9 @@ struct Model::Impl {
             const int t2 = gg::expert_type(l.lay, 2);
             const size_t dr = gg::type_row_bytes(t2, g.ff), dh = gg::type_row_bytes(t2, x.ffn),
                          d0 = gg::type_row_bytes(t2, x.ff0);
+            if (dpart)   // (DS4_FLOW_DOWN_PART: staging holds the member's columns already, compacted: one run)
+                return cudaMemcpyAsync(dst + lay.trellis[2], src[2], (size_t) g.dim * dh, cudaMemcpyHostToDevice, s) ==
+                       cudaSuccess;
             if (down == nullptr)
                 return cudaMemcpy2DAsync(dst + lay.trellis[2], dh, src[2] + d0, dr, dh, (size_t) g.dim,
                                          cudaMemcpyHostToDevice, s) == cudaSuccess;
@@ -4279,6 +4324,7 @@ struct Model::Impl {
         }
         if (in_ram)   // (copied into staging by io, then DMA'd; copy_mode: from its NH parts, flow_pump)
             it.ram = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
+        it.dpart = down_part && l.nm > 1 && !(in_ram && copy_mode);   // (DS4_FLOW_DOWN_PART: through staging)
         // (DS4_FLOW_HELPER) one in the helper's pool: copied into staging out of it by io, then DMA'd as a read's
         const bool from_helper =
             !in_ram && flow_helper && helper_owned(l, e) && !helper_dead.load(std::memory_order_relaxed);
@@ -4490,6 +4536,10 @@ struct Model::Impl {
                         j.bad = &it.bad;
                         j.dmem = it.hsrc + l.lay.trellis[r] + mx_read_off(l, it.mi, r);
                         j.ddev = helper_id;
+                        if (r == 2 && it.dpart) {   // (DS4_FLOW_DOWN_PART: the member's columns, where copied)
+                            down_cut(l, it.mi, j.cpitch, j.coff, j.clen);
+                            j.crows = (size_t) g.dim;
+                        }
                         j.dcopy = flow_helper_fail == "copy" && flow_fail_armed.exchange(false)
                                       ? &Model::Impl::helper_copy_fail
                                       : &Model::Impl::helper_copy;
@@ -4515,6 +4565,10 @@ struct Model::Impl {
                     }
                     j.map = pk.at(l.mx_file[r], j.off);
                     j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
+                    if (r == 2 && it.dpart) {   // (DS4_FLOW_DOWN_PART: the member's columns, where the read left them)
+                        down_cut(l, it.mi, j.cpitch, j.coff, j.clen);
+                        j.crows = (size_t) g.dim;
+                    }
                     sb += flow_region(r);
                 }
                 if (cs >= 0) it.left.store(nj, std::memory_order_relaxed);   // (a member's rows: maybe fewer parts)
@@ -4546,7 +4600,7 @@ struct Model::Impl {
                 ++c.chk_n;
             }
             // (staging holds the member's gate / up rows only - a read's and, since #377, a copy's)
-            if (!flow_copy(l, it.mi, it.src, false, c.ring + r * c.ring_stride, c.down, c.cs)) {
+            if (!flow_copy(l, it.mi, it.src, false, c.ring + r * c.ring_stride, c.down, c.cs, it.dpart)) {
                 const cudaError_t e = cudaGetLastError();   // (none: the uneven split's member without its down scratch)
                 err = "the flow's copy of layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) + ": " +
                       (e != cudaSuccess ? cudaGetErrorString(e) : "no down scratch for the uneven split's member");
@@ -8339,8 +8393,10 @@ struct Model::Impl {
     // the host twice as the flow stages it - the member's read (its gate / up rows, the down whole) and a copy's (each
     // matrix whole) - each through flow_copy into a device buffer between guard bytes, read back: both must be
     // blob_to_half's part for the member byte for byte, every guard untouched - the down through a scratch of its own
-    // where the flow gives the device one (flow_down_bytes), else as the flow copies it without.  On one stream, the
-    // readback before the end's event, its own host and device buffers kept until a clean end (none: tp_unknown)
+    // where the flow gives the device one (flow_down_bytes), else as the flow copies it without; with
+    // DS4_FLOW_DOWN_PART the read's down compacted on the host (compact_rows) and DMA'd as one run, as the flow does.
+    // On one stream, the readback before the end's event, its own host and device buffers kept until a clean end (none:
+    // tp_unknown)
     bool tp_flow_member(const Layer& l, int m, std::string& err) {
         const Layer& x = member(l, m);
         Dev& d = devs[(size_t) x.dev];
@@ -8378,12 +8434,17 @@ struct Model::Impl {
             }
             std::memcpy(stage + part_b, whole.data(), blob);
             for (int r = 0; r < 3; ++r) ws[r] = stage + part_b + l.lay.trellis[r];
+            if (down_part) {   // (DS4_FLOW_DOWN_PART: the read's down compacted to the member's columns, as io does)
+                size_t dr = 0, d0 = 0, dh = 0;
+                down_cut(l, m, dr, d0, dh);
+                compact_rows(stage + (ps[2] - stage), (size_t) g.dim, dr, d0, dh);   // (ps[2]: in stage)
+            }
         }
         bool submitted = false;   // (anything on the stream: its end waited for before any free)
         if (ok) {
             submitted = true;
             ok = cudaMemsetAsync(dv, 0xA5, dev_bytes, d.st) == cudaSuccess &&
-                 flow_copy(l, m, ps, false, dv + kGuard, down_b > 0 ? dv + dev_bytes : nullptr, d.st) &&
+                 flow_copy(l, m, ps, false, dv + kGuard, down_b > 0 ? dv + dev_bytes : nullptr, d.st, down_part) &&
                  flow_copy(l, m, ws, true, dv + u + 3 * kGuard, down_b > 0 ? dv + dev_bytes : nullptr, d.st) &&
                  cudaMemcpyAsync(back, dv, dev_bytes, cudaMemcpyDeviceToHost, d.st) == cudaSuccess;   // (before the end)
         }

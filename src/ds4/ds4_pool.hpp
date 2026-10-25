@@ -127,6 +127,13 @@ private:
     std::condition_variable cv_;
 };
 
+/// (DS4_FLOW_DOWN_PART) rows [0, rows) of a matrix `pitch` bytes a row: each row's bytes [off, off + len) moved to the
+/// front of the same buffer, side by side (row r to r len).  In place: row r's target ends at (r + 1) len, never past
+/// row r + 1's bytes ((r + 1) pitch + off, len <= pitch), and memmove takes a row's overlap with itself
+inline void compact_rows(uint8_t* base, size_t rows, size_t pitch, size_t off, size_t len) {
+    for (size_t r = 0; r < rows; ++r) std::memmove(base + r * len, base + r * pitch + off, len);
+}
+
 /// File reads on threads of their own, in the order they were pushed, the pusher never waiting: the prompt path's
 /// streamed experts (each part of an expert a job), unbuffered where the job has a direct descriptor and its range is
 /// not all in the page cache already (the disk straight into dst, the cache neither used nor disturbed), buffered
@@ -152,6 +159,10 @@ public:
         // share_n-th count drops the range from the page cache (fd, off, len) and starts the count again
         std::atomic<uint8_t>* share = nullptr;
         int share_n = 0;
+        // nonzero (DS4_FLOW_DOWN_PART): once read (or copied), the bytes are crows rows cpitch apart, of which each
+        // row's [coff, coff + clen) is kept - compacted to the front of where they landed (compact_rows), before `left`
+        // counts
+        size_t crows = 0, cpitch = 0, coff = 0, clen = 0;
     };
     explicit IoQueue(int n) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -212,6 +223,9 @@ private:
             }
             if (ok && j.keep != nullptr && j.mem == nullptr && j.dmem == nullptr)
                 std::memcpy(j.keep, j.dst + lead, (size_t) j.len);
+            if (ok && j.crows > 0)   // (a copy's bytes land at dst, a read's at dst + lead)
+                compact_rows(j.dst + (j.mem != nullptr || j.dmem != nullptr ? 0 : lead), j.crows, j.cpitch, j.coff,
+                             j.clen);
             if (j.share != nullptr && (int) j.share->fetch_add(1, std::memory_order_acq_rel) + 1 >= j.share_n) {
                 j.share->store(0, std::memory_order_release);
                 if (j.fd != os::kBadFd) os::advise(j.fd, j.off, j.len, false);
