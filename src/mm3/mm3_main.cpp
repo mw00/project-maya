@@ -631,6 +631,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
         else if (a == "--dspark") o.dspark = val() != "off";
         else if (a == "--vision") o.vision = val() != "off";
+        else if (a == "--tp") o.tp = std::atoi(val().c_str());
         else if (a == "--layer-split") {   // (serve/server.py's: "auto", or the first layer of each later GPU's share)
             const std::string v = val();
             o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);

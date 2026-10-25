@@ -24,7 +24,7 @@ namespace kc = strata::kernels::cpu;
 namespace mm3 {
 
 struct CpuLane::Impl {
-    int dim, ff;
+    int dim, ff, ffmax;   // (ff: the current width, set_width's; the buffers are ffmax's)
     float alpha, limit;
     std::vector<std::thread> th;
     // a phase's jobs in one word: `ticket` holds its generation (high 32 bits), its job count (16) and the next job (low
@@ -42,6 +42,7 @@ struct CpuLane::Impl {
     std::atomic<int> sleepers{0};
     // scratch, for up to 8 experts
     static constexpr int kMaxE = 8;
+    int max_entries = 64;
     int GQ, GB, DQ, DB, EB, FB;   // gate / up K jobs and bands, down K jobs and bands, x blocks, h blocks
     std::vector<float> xh, xsb, acc, xhd, xsd, accd, yd;
     std::vector<float> mxh, mxsb, macc, mxhd, mxsd, maccd, myd;   // (run_multi's, by entry: allocated on first use)
@@ -103,9 +104,11 @@ struct CpuLane::Impl {
     }
 };
 
-CpuLane::CpuLane(int threads, int dim, int ff, float alpha, float limit) : p(new Impl) {
+CpuLane::CpuLane(int threads, int dim, int ff, float alpha, float limit, int max_entries) : p(new Impl) {
+    p->max_entries = max_entries;
     p->dim = dim;
     p->ff = ff;
+    p->ffmax = ff;
     p->alpha = alpha;
     p->limit = limit;
     p->GQ = dim / 256;    // gate / up: jobs of 16 slices (256 inputs)
@@ -133,6 +136,15 @@ CpuLane::~CpuLane() {
 }
 
 int CpuLane::threads() const { return (int) p->th.size() + 1; }
+
+void CpuLane::parallel_for(int n, const std::function<void(int)>& f) { p->parallel(n, f); }
+
+bool CpuLane::set_width(int ff) {
+    if (ff <= 0 || ff > p->ffmax || ff % 128) return false;
+    p->ff = ff;
+    p->GB = p->DQ = p->FB = ff / 128;
+    return true;
+}
 
 void CpuLane::run(const std::vector<CpuExpert>& ex, const float* x, float* out) {
     Impl& I = *p;
@@ -235,18 +247,18 @@ void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std:
         }
     const int N = (int) ent.size();
     if (N == 0) return;
-    if (N > kMaxEntries) {   // (not for a verify window: 16 tokens x 4 experts)
-        std::fprintf(stderr, "mm3 cpu lane: %d entries, more than %d - the rest skipped\n", N, kMaxEntries);
+    if (N > I.max_entries) {   // (not for a verify window: 16 tokens x 4 experts)
+        std::fprintf(stderr, "mm3 cpu lane: %d entries, more than %d - the rest skipped\n", N, I.max_entries);
         return;
     }
     if (I.macc.empty()) {
-        const size_t E = kMaxEntries;
+        const size_t E = (size_t) I.max_entries;
         I.mxh.resize(E * 2 * dim);
         I.mxsb.resize(E * 2 * I.EB);
-        I.macc.resize(E * 2 * I.GQ * ff);
-        I.mxhd.resize(E * ff);
-        I.mxsd.resize(E * I.FB);
-        I.maccd.resize(E * I.DQ * dim);
+        I.macc.resize(E * 2 * I.GQ * I.ffmax);
+        I.mxhd.resize(E * I.ffmax);
+        I.mxsd.resize(E * (I.ffmax / 128));
+        I.maccd.resize(E * (I.ffmax / 128) * dim);
         I.myd.resize(E * dim);
     }
     auto xh = [&](int j, int r) { return I.mxh.data() + ((size_t) j * 2 + r) * dim; };

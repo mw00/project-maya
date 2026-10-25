@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -17,8 +18,9 @@ struct CpuExpert {
 
 class CpuLane {
 public:
-    /// threads: workers besides the caller (0: none, the caller alone).
-    CpuLane(int threads, int dim, int ff, float alpha, float limit);
+    /// threads: workers besides the caller (0: none, the caller alone); max_entries: run_multi's (expert, token)
+    /// pairs at most.
+    CpuLane(int threads, int dim, int ff, float alpha, float limit, int max_entries = 64);
     ~CpuLane();
     CpuLane(const CpuLane&) = delete;
     CpuLane& operator=(const CpuLane&) = delete;
@@ -26,13 +28,16 @@ public:
     void run(const std::vector<CpuExpert>& ex, const float* x, float* out);
     /// A window's: expert i of ex for the tokens users[i] ((token, weight) pairs), x rows [T][dim] -> out rows
     /// [T][dim] = each token's weighted sum of its experts here (0 for a token with none).  Each expert's weights are
-    /// decoded once for up to 8 of its tokens.  At most kMaxEntries (expert, token) pairs.
-    static constexpr int kMaxEntries = 64;
+    /// decoded once for up to 8 of its tokens.  At most max_entries (expert, token) pairs.
     /// order (if given): the (expert, user) pairs in the order each token's sum takes them (the token path's: its
     /// slots'), so a token's sum is run()'s bits; else expert by expert.
     void run_multi(const std::vector<CpuExpert>& ex, const std::vector<std::vector<std::pair<int, float>>>& users,
                    const float* x, int T, float* out, const std::vector<std::pair<int, int>>* order = nullptr);
     int threads() const;
+    /// f(0 .. n - 1) on the lane's threads (the caller one of them), back when all are done.
+    void parallel_for(int n, const std::function<void(int)>& f);
+    /// The experts' FFN width from here on (a multiple of 128, at most the constructor's): sub-experts' slices.
+    bool set_width(int ff);
 
 private:
     struct Impl;

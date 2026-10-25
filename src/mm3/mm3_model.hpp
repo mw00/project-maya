@@ -15,6 +15,7 @@
 namespace mm3 {
 
 struct VisionGeo;
+class TpEngine;
 
 struct Options {
     std::string pack;
@@ -36,6 +37,7 @@ struct Options {
                                   // (from the pinned pool, on a copy stream of its own) while the model runs
     int promote_lag = 2;          // a promoted expert's slot is its own this many forwards after its copy began, the
                                   // copy waited for then (1: the next forward - plain decode then waits ~5 ms a token)
+    int tp = 0;                   // > 0: the tensor-parallel path (mm3_tp.hpp) in groups of tp GPUs (1, 2 or 4)
     bool verbose = false;
 };
 
@@ -90,6 +92,7 @@ public:
 private:
     struct Impl;
     Impl* p;
+    TpEngine* tpe = nullptr;   // (Options::tp > 0: every call goes to it)
 };
 
 }  // namespace mm3

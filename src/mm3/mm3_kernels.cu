@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -652,6 +653,41 @@ void moe_combine(const float* res, const float* y, const int* inv, const float* 
     if (T <= 0) return;
     combine_kernel<<<T, 256, 0, s>>>(res, y, inv, w, sh, K, D, scale, out);
     check("moe_combine");
+}
+
+__global__ void wait_flag_kernel(const unsigned* flag, unsigned v) {
+    if (threadIdx.x != 0) return;
+    while ((int) (*(volatile const unsigned*) flag - v) < 0) __nanosleep(100);
+    __threadfence_system();
+}
+
+void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s) {
+    wait_flag_kernel<<<1, 32, 0, s>>>(flag, v);
+    check("wait_flag");
+}
+
+__global__ void publish_kernel(const float4* src, float4* dst, size_t n4, unsigned* counter, unsigned* flag,
+                               unsigned v) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+    __threadfence_system();
+    __syncthreads();
+    __shared__ bool last;
+    if (threadIdx.x == 0) last = atomicAdd(counter, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (last && threadIdx.x == 0) {
+        *counter = 0u;
+        __threadfence_system();
+        *(volatile unsigned*) flag = v;
+        __threadfence_system();
+    }
+}
+
+void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned* flag, unsigned v, cudaStream_t s) {
+    const size_t n4 = n / 4;
+    const int blocks = (int) std::max<size_t>(1, std::min<size_t>(48, (n4 + 255) / 256));
+    publish_kernel<<<blocks, 256, 0, s>>>((const float4*) src, (float4*) dst, n4, counter, flag, v);
+    check("publish");
 }
 
 void add(float* x, const float* a, size_t n, cudaStream_t s) {

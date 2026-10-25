@@ -29,7 +29,9 @@
 #include "mm3_cpu.hpp"
 #include "mm3_dspark.hpp"
 #include "mm3_exl3.hpp"
+#include "mm3_geo.hpp"
 #include "mm3_kernels.cuh"
+#include "mm3_tp.hpp"
 #include "mm3_vision.hpp"
 
 namespace mm3 {
@@ -63,62 +65,6 @@ double now() {
 }
 
 const std::string P = "language_model.model.";
-
-struct Geo {
-    int dim, n_layers, n_head, n_kv, hd, n_rot, vocab, n_exp, k_exp, ff, ff_dense, ff_shared;
-    float theta, eps, alpha, limit, scale;
-    std::vector<int> moe, sparse;
-    int ix_heads, ix_dim, blk, topk, local;
-    int bos, eos;
-    int topk_override = 0;   // (experiments: MM3_TOPK keeps that many blocks instead of the model's)
-
-    bool read(const Pack& p, std::string& err) {
-        dim = (int) p.num("hidden_size");
-        topk_override = std::getenv("MM3_TOPK") ? std::atoi(std::getenv("MM3_TOPK")) : 0;
-        n_layers = (int) p.num("num_hidden_layers");
-        n_head = (int) p.num("num_attention_heads");
-        n_kv = (int) p.num("num_key_value_heads");
-        hd = (int) p.num("head_dim");
-        n_rot = (int) p.num("rotary_dim", hd * p.num("partial_rotary_factor", 1.0));
-        vocab = (int) p.num("vocab_size");
-        n_exp = (int) p.num("num_local_experts");
-        k_exp = (int) p.num("num_experts_per_tok");
-        ff = (int) p.num("intermediate_size");
-        ff_dense = (int) p.num("dense_intermediate_size");
-        ff_shared = (int) p.num("shared_intermediate_size");
-        theta = (float) p.num("rope_theta");
-        eps = (float) p.num("rms_norm_eps");
-        alpha = (float) p.num("swiglu_alpha");
-        limit = (float) p.num("swiglu_limit");
-        scale = (float) p.num("routed_scaling_factor");
-        moe = p.ints("moe_layer_freq");
-        sparse = p.ints("sparse_attention_config.sparse_attention_freq");
-        ix_heads = (int) p.num("sparse_attention_config.sparse_num_index_heads");
-        ix_dim = (int) p.num("sparse_attention_config.sparse_index_dim");
-        blk = (int) p.num("sparse_attention_config.sparse_block_size");
-        topk = (int) p.num("sparse_attention_config.sparse_topk_blocks");
-        local = (int) p.num("sparse_attention_config.sparse_local_block");
-        bos = (int) p.num("bos_token_id");
-        eos = (int) p.num("eos_token_id");
-        const auto no = [&](const std::string& what) {
-            err = "geometry not covered: " + what;
-            return false;
-        };
-        if (hd != 128 || n_rot % 2 || n_rot > hd) return no("head_dim " + std::to_string(hd));
-        if (n_head != 16 * n_kv) return no("query heads per KV head " + std::to_string(n_head / std::max(1, n_kv)));
-        if (ix_heads != n_kv || ix_dim != 128 || ix_heads != 4) return no("indexer heads / dim");
-        if (topk_override > 0) topk = topk_override;
-        if (blk != 128 || local != 1 || topk < 1 || topk > 64) return no("sparse blocks (block 128, local 1)");
-        if (p.num("sparse_attention_config.sparse_init_block", 0) != 0) return no("init blocks");
-        if ((int) moe.size() != n_layers || (int) sparse.size() != n_layers) return no("per-layer lists");
-        for (int s : sparse)
-            if (!s) return no("a full-attention layer (every layer of M3.1 is sparse)");
-        if (std::fabs(alpha - x3::kSwigluAlpha) > 1e-6f) return no("swiglu_alpha " + std::to_string(alpha));
-        if (k_exp > 8 || n_exp > 256) return no("experts");
-        if (dim % 128 || ff % 128 || ff_dense % 128 || ff_shared % 128) return no("matrix sides");
-        return true;
-    }
-};
 
 struct Src {   // an expert's nine pieces in the mapped files: (w1, w3, w2) x (trellis, suh, svh)
     const uint8_t* p[9];
@@ -1593,20 +1539,36 @@ struct Model::Impl {
 };
 
 Model::Model() : p(new Impl) {}
-Model::~Model() { delete p; }
-bool Model::load(const Options& o, std::string& err) { return p->load(o, err); }
-int Model::vocab() const { return p->g.vocab; }
-int Model::max_ctx() const { return p->o.max_ctx; }
-int Model::bos() const { return p->g.bos; }
-int Model::eos() const { return p->g.eos; }
-const Stats& Model::stats() const { return p->st; }
-std::vector<std::string> Model::info_lines() const { return p->info; }
+Model::~Model() {
+    delete tpe;
+    delete p;
+}
+bool Model::load(const Options& o, std::string& err) {
+    if (o.tp > 0) {
+        tpe = new TpEngine;
+        return tpe->load(o, err);
+    }
+    return p->load(o, err);
+}
+int Model::vocab() const { return tpe ? tpe->vocab() : p->g.vocab; }
+int Model::max_ctx() const { return tpe ? tpe->max_ctx() : p->o.max_ctx; }
+int Model::bos() const { return tpe ? tpe->bos() : p->g.bos; }
+int Model::eos() const { return tpe ? tpe->eos() : p->g.eos; }
+const Stats& Model::stats() const { return tpe ? tpe->stats() : p->st; }
+std::vector<std::string> Model::info_lines() const { return tpe ? tpe->info_lines() : p->info; }
 
-int Model::draft_block() const { return p->draftm ? p->draftm->geo().block : 0; }
+int Model::draft_block() const {
+    if (tpe) return tpe->draft_block();
+    return p->draftm ? p->draftm->geo().block : 0;
+}
 
-const VisionGeo* Model::vision() const { return p->vis ? &p->vis->geo() : nullptr; }
+const VisionGeo* Model::vision() const {
+    if (tpe) return tpe->vision();
+    return p->vis ? &p->vis->geo() : nullptr;
+}
 
 bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err) {
+    if (tpe) return tpe->encode_image(rgb, width, height, rows, err);
     if (!p->vis) {
         err = "no vision tower loaded (--vision on)";
         return false;
@@ -1614,9 +1576,13 @@ bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<
     return p->vis->encode(rgb, width, height, rows, err);
 }
 
-void Model::set_images(std::vector<Image> images) { p->imgs = std::move(images); }
+void Model::set_images(std::vector<Image> images) {
+    if (tpe) tpe->set_images(std::move(images));
+    else p->imgs = std::move(images);
+}
 
 bool Model::draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err) {
+    if (tpe) return tpe->draft(anchor, pos, n, drafts, conf, err);
     if (!p->draftm) {
         err = "no DSpark draft loaded (--dspark)";
         return false;
@@ -1626,6 +1592,7 @@ bool Model::draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vec
 }
 
 bool Model::save_profile(const std::string& path, std::string& err) const {
+    if (tpe) return tpe->save_profile(path, err);
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f || std::fwrite(p->prof.data(), 4, p->prof.size(), f) != p->prof.size()) {
         if (f) std::fclose(f);
@@ -1637,6 +1604,7 @@ bool Model::save_profile(const std::string& path, std::string& err) const {
 }
 
 bool Model::forward(const int* ids, int n, int pos0, int want, float* logits_out, std::string& err) {
+    if (tpe) return tpe->forward(ids, n, pos0, want, logits_out, err);
     want = std::min(want, n);
     for (int a = 0; a < n; a += p->o.chunk) {
         const int T = std::min(p->o.chunk, n - a);

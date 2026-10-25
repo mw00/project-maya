@@ -69,6 +69,12 @@ void moe_combine(const float* res, const float* y, const int* inv, const float* 
 
 /// x += a (n floats).
 void add(float* x, const float* a, size_t n, cudaStream_t s);
+/// (the tensor-parallel path) one thread spins until *flag (mapped host memory, a counter) reaches v, wrap-safe.
+void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s);
+/// (the tensor-parallel path) n floats (a multiple of 4) from src (device) to dst (mapped host memory), then *flag = v
+/// once every block's writes are the system's: each block fences, the last to count (counter: a device word, 0
+/// between calls - it is left 0) raises the flag.
+void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned* flag, unsigned v, cudaStream_t s);
 /// Y [T][N] = X [T][K] . W [N][K]^T in F32, one warp an output in a fixed order: a token's row is the same bits
 /// whatever T (the token path's and a window's router and indexer agree).
 void rows_dot(const float* W, int N, int K, const float* X, int T, float* Y, cudaStream_t s);
