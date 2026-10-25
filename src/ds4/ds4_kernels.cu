@@ -263,6 +263,22 @@ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, lon
         if (d != nullptr) d[e] = f.dst_f16 ? __half_as_ushort(__float2half_rn(r[j])) : f2bf16(r[j]);
         else if (!kPack) v[e] = r[j];
     }
+    if (!kPack && f.q8 != nullptr) {   // (DS4_DECODE_TRIM 2) the stored values' int8 rounding: q8_quant_block's ops
+        int8_t* q = f.q8 + (long long) blockIdx.x * len;   // (a warp's lanes are a 32-block: e = lane + 32 w + 256 j)
+        float* qd = f.q8d + (long long) blockIdx.x * (len / 32);
+#pragma unroll
+        for (int j = 0; j < kFinMax; ++j) {
+            if (j >= nj) break;
+            const int e = threadIdx.x + j * kThreads;
+            float am = e < len ? fabsf(r[j]) : 0.0f;   // (len % 32 == 0: a warp all in or all past len)
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            if (e >= len) continue;
+            const float sc = am / 127.0f;
+            q[e] = (int8_t) (am > 0.0f ? __float2int_rn(r[j] / sc) : 0);
+            if ((threadIdx.x & 31) == 0) qd[e / 32] = sc;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- hyper-connections
@@ -739,6 +755,36 @@ __global__ void swiglu_kernel(const float* __restrict__ g, const float* __restri
         uv = fminf(fmaxf(uv, -lim), lim);
     }
     h[i] = gv / (1.0f + expf(-gv)) * uv;
+}
+// (DS4_DECODE_TRIM 1) swiglu_kernel's value, then q8_quant_block's ops on it: a warp's lanes are a 32-block of the flat
+// array (blocks of kThreads from 0, n % 32 == 0: a warp all in or all past n).  The old kernel stays as it is:
+// decode_trim_check (ds4_model.cu) compares the two
+__global__ void swiglu_q8_kernel(const float* __restrict__ g, const float* __restrict__ u, int n, float lim,
+                                 float* __restrict__ h, int8_t* __restrict__ q, float* __restrict__ qd) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gv = g[i], uv = u[i];
+    if (lim > 0.0f) {
+        gv = fminf(gv, lim);
+        uv = fminf(fmaxf(uv, -lim), lim);
+    }
+    const float v = gv / (1.0f + expf(-gv)) * uv;
+    h[i] = v;
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;
+    q[i] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if ((threadIdx.x & 31) == 0) qd[i / 32] = sc;
+}
+// (DS4_DECODE_TRIM 4) region blockIdx.y's 4-byte words, the grid's x blocks striding over them
+__global__ void copy_regions_kernel(const CopyRegions r) {
+    const int k = blockIdx.y;
+    uint32_t* d = (uint32_t*) r.dst[k];
+    const uint32_t* sr = (const uint32_t*) r.src[k];
+    const size_t n = r.bytes[k] / 4;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        d[i] = sr[i];
 }
 
 // ---------------------------------------------------------------- the compressor (ratio > 1), a window in order
@@ -3104,6 +3150,11 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cud
         return;
     }
     if (n_vec <= 0) return;
+    if (f.q8 != nullptr &&
+        (f.q8d == nullptr || len % 32 != 0 || stride != len || f.dst != nullptr || f.pdst != nullptr)) {
+        std::fprintf(stderr, "ds4 finish: int8 rows of %d values (stride %lld) not covered\n", len, stride);
+        return;
+    }
     if (f.pdst != nullptr) {
         if (f.quant < kKvFp8 || f.quant > kKvFp4p || len % 32 != 0) {
             std::fprintf(stderr, "ds4 finish: packed rows of quant %d, %d values not covered\n", f.quant, len);
@@ -3191,6 +3242,22 @@ void route(const float* logits, const float* bias, int n, int k, int T, float ro
 
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
     if (n > 0) swiglu_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h);
+}
+bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, cudaStream_t s) {
+    if (n % 32 != 0 || q == nullptr || qd == nullptr) return false;
+    if (n > 0) swiglu_q8_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h, q, qd);
+    return true;
+}
+bool copy_regions(const CopyRegions& r, cudaStream_t s) {
+    if (r.n < 1 || r.n > 4) return false;
+    size_t most = 0;
+    for (int k = 0; k < r.n; ++k) {
+        if (r.bytes[k] % 4 != 0 || (uintptr_t) r.dst[k] % 4 != 0 || (uintptr_t) r.src[k] % 4 != 0) return false;
+        most = std::max(most, r.bytes[k] / 4);
+    }
+    const unsigned bx = (unsigned) std::max<size_t>(1, std::min<size_t>(64, (most + kThreads - 1) / kThreads));
+    copy_regions_kernel<<<dim3(bx, (unsigned) r.n), kThreads, 0, s>>>(r);
+    return true;
 }
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,

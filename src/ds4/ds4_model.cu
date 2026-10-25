@@ -553,6 +553,14 @@ struct Dev {
     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
     int8_t* xq8 = nullptr;   // (DS4_HC_FUSE: a decoded token's attention input rounded to int8, its scales)
     float* xd8 = nullptr;
+    // (DS4_DECODE_TRIM 1 / 2) the shared expert's swiglu output and q's low-rank norm rounded to int8 where they are
+    // made, for the s2 / wq_b GEMVs (a window's rows)
+    int8_t *shq8 = nullptr, *qrq8 = nullptr;
+    float *shd8 = nullptr, *qrd8 = nullptr;
+    // (DS4_DECODE_TRIM 8) the drafter's hand-offs out of this device: host-mapped rows (a block's h | pre, then the
+    // last block's x: dhand_x) and their flag
+    uint8_t* dhand = nullptr;
+    unsigned* dhand_flag = nullptr;
     // the hand-off to the next device through pinned host memory (these cards copy peer to peer only through the
     // driver's staging, ~1.7 ms a copy): h | pre | topk | cand
     uint8_t* bounce = nullptr;
@@ -1121,6 +1129,16 @@ struct Model::Impl {
     // DS4_HC_FUSE=1: a decoded token's (T 1) hc_split and hc_pre_norm in one launch (hc_split_pre_norm), the attention
     // input's int8 rounding there, the layer's copy of the pre slots by its FFN split - checked at load (hc_fuse_check)
     bool hc_fuse = false;
+    // DS4_DECODE_TRIM=<bits> (unset / 0: as before) - the decode's last small trims, each exact, checked at load
+    // (trim_q8_check, trim_copy_check): 1 the shared expert's swiglu rounds its output to int8 for s2 (swiglu_q8,
+    // PreQ8); 2 q's low-rank norm rounds it for wq_b (Finish::q8); 4 a verify window's compressor snapshot (4 copies)
+    // and a ratio-1 layer's latent copy each one kernel (copy_regions); 8 the drafter's hand-offs between its devices
+    // by xfer_put / xfer_get (host-mapped rows and a flag, as the pipeline's groups hand theirs) instead of copies
+    // through pinned memory and events
+    int decode_trim = 0;
+    unsigned d_xseq = 0;   // (DS4_DECODE_TRIM 8) the drafter's hand-off sequence (its flags only ever rise)
+    size_t dhand_x() const { return (size_t) kWin * ((size_t) g.hc * g.dim * 4 + 8 * 4); }   // (the x rows' offset)
+    size_t dhand_bytes() const { return dhand_x() + (size_t) kWin * g.dim * 4; }
     // DS4_HC_FUSE=2: the same for a decode window's rows too (T up to kWin: a DSpark verify window's), the attention
     // input's rows rounded there for its GEMVs (PreQ8::rows); and the FFN's split rounds its input too, for the shared
     // expert's w1 / w3 - checked at load on 1 and kWin rows (hc_fuse_check's T, ffn_q8)
@@ -2534,6 +2552,34 @@ struct Model::Impl {
                                            "(DS4_HC_FUSE=2)"
                                          : "");
         }
+        if (const char* v = ds4_env("DS4_DECODE_TRIM")) {   // (MAYA_DS4_DECODE_TRIM)
+            char* end = nullptr;
+            const long b = std::strtol(v, &end, 10);
+            if (*v == 0 || end == nullptr || *end != 0 || b < 0 || b > 15) {
+                err = std::string("DS4_DECODE_TRIM=") + v +
+                      ": bits 0 .. 15 (1 s2's int8, 2 wq_b's int8, 4 the snapshot copies, 8 the drafter's hand-offs)";
+                return false;
+            }
+            decode_trim = (int) b;
+#ifdef STRATA_HIP_WAVE64
+            if (decode_trim & 3) {   // (the int8 roundings are a 32-lane warp's)
+                err = std::string("DS4_DECODE_TRIM=") + v + ": bits 1 / 2 on a wave64 build";
+                return false;
+            }
+#endif
+            if (((decode_trim & 1) && (!pk.gguf || g.ff % 32 != 0)) ||
+                ((decode_trim & 2) && (!pk.gguf || g.q_lora % 32 != 0))) {
+                err = std::string("DS4_DECODE_TRIM=") + v +
+                      ": not this model's shapes (a GGUF, ff and q_lora multiples of 32)";
+                return false;
+            }
+            if (decode_trim != 0)
+                std::fprintf(stderr, "ds4: DS4_DECODE_TRIM=%d:%s%s%s%s\n", decode_trim,
+                             decode_trim & 1 ? " the shared expert's swiglu rounds s2's int8 input;" : "",
+                             decode_trim & 2 ? " q's norm rounds wq_b's int8 input;" : "",
+                             decode_trim & 4 ? " the snapshot / latent copies one kernel each;" : "",
+                             decode_trim & 8 ? " the drafter's hand-offs by xfer;" : "");
+        }
         if (const char* v = ds4_env("DS4_ROUTE_FUSE")) {   // (MAYA_DS4_ROUTE_FUSE)
             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
                 err = std::string("DS4_ROUTE_FUSE=") + v + ": 2, 1 or 0";
@@ -2974,6 +3020,14 @@ struct Model::Impl {
             d.attn_scr.cap = (int) topk_stride();
             if (!dalloc(d, d.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
             d.tks.T = (int) kTksRows, d.tks.P = (int) tks_p(), d.tks.K = g.ix_topk;
+            if ((decode_trim & 1) && !(dalloc(d, d.shq8, (size_t) kWin * g.ff, err) &&
+                                       dalloc(d, d.shd8, (size_t) kWin * g.ff / 32, err)))
+                return false;
+            if ((decode_trim & 2) && !(dalloc(d, d.qrq8, (size_t) kWin * g.q_lora, err) &&
+                                       dalloc(d, d.qrd8, (size_t) kWin * g.q_lora / 32, err)))
+                return false;
+            if ((decode_trim & 8) && g.n_mtp > 0 && !(hmap(d.dhand, dhand_bytes(), err) && hmap(d.dhand_flag, 8, err)))
+                return false;   // (hmap zeroes them: the flag starts below every sequence)
             if (hc_fuse && !(dalloc(d, d.xq8, (size_t) (hc_fuse_win ? kWin : 1) * D, err) &&   // (=2: a window's rows)
                              dalloc(d, d.xd8, (size_t) (hc_fuse_win ? kWin : 1) * D / 32, err)))
                 return false;
@@ -3423,6 +3477,8 @@ struct Model::Impl {
             if (hc_fuse_win && !(hc_fuse_check(err, 1, true) && hc_fuse_check(err, kWin, true)))   // (=2: a window too)
                 return false;
             if (route_fuse && !route_fuse_check(err)) return false;   // (no request yet)
+            if ((decode_trim & 3) && !trim_q8_check(err)) return false;   // (DS4_DECODE_TRIM: no request yet)
+            if ((decode_trim & 12) && !trim_copy_check(err)) return false;
             if (route_fuse_win && !(route_fuse_check(err, 3) && route_fuse_check(err, kWin)))   // (=2: windows too)
                 return false;
             if (tp_uneven && (std::getenv("STRATA_DS4_TP_CHECK") != nullptr || std::getenv("DS4_TP_CHECK") != nullptr) &&
@@ -8496,6 +8552,327 @@ struct Model::Impl {
         return true;
     }
 
+    // DS4_DECODE_TRIM's checks (at load, before any request).  trim_run: one run on device d's stream - the inputs up,
+    // both output sets 0xA5, enqueue() (the old path into set 0, the new one into set 1), the readback, its end waited
+    // for (10 s) - then the two sets' bytes compared and the bytes outside `regions` checked untouched.  false (why
+    // set): a difference, a guard touched, a launch refused or a CUDA error before a clean end; no clean end ends the
+    // process (trim_unknown: what the run may still touch is the model's)
+    [[noreturn]] static void trim_unknown(int dev, const char* what, const char* why) {
+        std::fprintf(stderr, "ds4: DS4_DECODE_TRIM check: CUDA%d (%s): %s - the device's state unknown; the process "
+                             "ends without teardown (exit %d)\n",
+                     dev, what, why, kExitUnknown);
+        std::fflush(stderr);
+        std::fflush(stdout);
+        std::_Exit(kExitUnknown);
+    }
+    template <class F>
+    bool trim_run(Dev& d, const std::string& what, const std::vector<float>& hin, size_t set_bytes,
+                  const std::vector<std::pair<size_t, size_t>>& regions, F&& enqueue, std::string& why) {
+        float* in = nullptr;
+        uint8_t *out = nullptr, *back = nullptr;
+        cudaEvent_t ev = nullptr;
+        if (cudaMalloc((void**) &in, std::max<size_t>(1, hin.size()) * 4) != cudaSuccess ||
+            cudaMalloc((void**) &out, 2 * set_bytes) != cudaSuccess ||
+            cudaMallocHost((void**) &back, 2 * set_bytes) != cudaSuccess ||
+            cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (in != nullptr) cudaFree(in);
+            if (out != nullptr) cudaFree(out);
+            if (back != nullptr) cudaFreeHost(back);
+            if (ev != nullptr) cudaEventDestroy(ev);
+            why = what + ": its buffers";
+            return false;
+        }
+        bool ok = cudaMemcpyAsync(in, hin.data(), hin.size() * 4, cudaMemcpyHostToDevice, d.st) == cudaSuccess &&
+                  cudaMemsetAsync(out, 0xA5, 2 * set_bytes, d.st) == cudaSuccess;
+        ok = ok && enqueue(in, out, out + set_bytes);
+        ok = ok && cudaGetLastError() == cudaSuccess &&
+             cudaMemcpyAsync(back, out, 2 * set_bytes, cudaMemcpyDeviceToHost, d.st) == cudaSuccess;
+        const bool recorded = ok && cudaEventRecord(ev, d.st) == cudaSuccess;
+        const auto t0 = std::chrono::steady_clock::now();
+        cudaError_t q;
+        while ((q = recorded ? cudaEventQuery(ev) : cudaStreamQuery(d.st)) == cudaErrorNotReady &&
+               std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        if (q != cudaSuccess)
+            trim_unknown(d.id, what.c_str(), q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+        if (!recorded) {
+            (void) cudaGetLastError();
+            why = what + ": a launch refused or a CUDA error";
+        } else {
+            const uint8_t *A = back, *B = back + set_bytes;
+            for (size_t o = 0; o < set_bytes && why.empty(); ++o)
+                if (A[o] != B[o]) why = what + ": byte " + std::to_string(o) + " differs";
+            size_t prev = 0;   // (A == B now: A's bytes outside the regions)
+            for (const auto& r : regions) {
+                for (size_t o = prev; o < r.first && why.empty(); ++o)
+                    if (A[o] != 0xA5) why = what + ": guard byte " + std::to_string(o);
+                prev = r.first + r.second;
+            }
+            for (size_t o = prev; o < set_bytes && why.empty(); ++o)
+                if (A[o] != 0xA5) why = what + ": the last guard byte " + std::to_string(o);
+        }
+        cudaFree(in);   // (the run ended cleanly)
+        cudaFree(out);
+        cudaFreeHost(back);
+        cudaEventDestroy(ev);
+        return recorded && why.empty();
+    }
+    // DS4_DECODE_TRIM 1 / 2, on every device with layers: for its first and last layer (its member), on 1 and kWin
+    // rows of random inputs and of edges (zeros, negative zeros, tiny, and large past the clamp, 32-blocks of each):
+    // 1 swiglu_q8 against swiglu, 2 q's norm finish with its int8 rounding against the finish, each then q8_round (the
+    // rounding gguf mv gives the old path) and the layer's s2 / wq_b through mv - the old path's rounding its own, the
+    // new one's given (PreQ8): the activations, the int8 rows and scales and the GEMV's rows equal byte for byte
+    bool trim_q8_check(std::string& err) {
+        constexpr size_t kGuard = 64;
+        uint32_t st = 0x51ed2701u;
+        auto rnd = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return (float) (int) (st % 2001u - 1000u) / 250.0f;   // -4 .. 4
+        };
+        for (size_t di = 0; di < devs.size(); ++di) {
+            Dev& d = devs[di];
+            std::vector<const Layer*> ls;
+            for (const Layer& l0 : L)
+                if (!l0.mtp)
+                    for (int mm = 0; mm < l0.nm; ++mm)
+                        if (member(l0, mm).dev == (int) di) ls.push_back(&member(l0, mm));
+            if (ls.empty()) continue;
+            if (ls.size() > 2) ls = {ls.front(), ls.back()};
+            if (cudaSetDevice(d.id) != cudaSuccess) {
+                (void) cudaGetLastError();
+                err = "DS4_DECODE_TRIM check on CUDA" + std::to_string(d.id) + ": cudaSetDevice failed";
+                return false;
+            }
+            int runs = 0;
+            for (const Layer* lp : ls)
+                for (int part = 1; part <= 2; ++part) {
+                    if (!(decode_trim & part)) continue;
+                    const Layer& l = *lp;
+                    const x3::Mat& m = part == 1 ? l.s2 : l.wq_b;
+                    if (m.raw == nullptr || m.n <= 0 || m.k <= 0) continue;
+                    const int K = m.k, N = m.n;   // (s2: the member's ff part in; wq_b: q_lora in, its heads out)
+                    if (K % 32 != 0 || (part == 2 && K != g.q_lora)) {
+                        err = "DS4_DECODE_TRIM check on CUDA" + std::to_string(d.id) + ": layer " +
+                              std::to_string(l.il) + (part == 1 ? "'s s2" : "'s wq_b") + " takes " + std::to_string(K) +
+                              " values";
+                        return false;
+                    }
+                    for (int T : {1, kWin})
+                        for (int kind = 0; kind < 2; ++kind) {
+                            const size_t n = (size_t) T * K;
+                            const size_t rb[4] = {n * 4, n, n / 32 * 4, (size_t) T * N * 4};   // act | q | qd | y
+                            size_t at[4], set_bytes = 0;
+                            std::vector<std::pair<size_t, size_t>> regions;
+                            for (int r = 0; r < 4; ++r) {
+                                at[r] = set_bytes + kGuard;
+                                set_bytes = (at[r] + rb[r] + 255) / 256 * 256;
+                                regions.push_back({at[r], rb[r]});
+                            }
+                            set_bytes += kGuard;
+                            std::vector<float> hin(part == 1 ? 2 * n : n);
+                            for (size_t i = 0; i < hin.size(); ++i) {
+                                float v = rnd();
+                                if (kind == 1)
+                                    switch ((i / 32) % 6) {
+                                        case 0: v = 0.0f; break;
+                                        case 1: v = -0.0f; break;
+                                        case 2: v *= 1e-20f; break;
+                                        case 3: v *= 1e6f; break;   // (past swiglu's clamp)
+                                        default: break;
+                                    }
+                                hin[i] = v;
+                            }
+                            auto enqueue = [&](float* in, uint8_t* s0, uint8_t* s1) {
+                                uint8_t* set[2] = {s0, s1};
+                                auto A = [&](int b) { return (float*) (set[b] + at[0]); };
+                                auto Q = [&](int b) { return (int8_t*) (set[b] + at[1]); };
+                                auto Qd = [&](int b) { return (float*) (set[b] + at[2]); };
+                                auto Y = [&](int b) { return (float*) (set[b] + at[3]); };
+                                bool ok = true;
+                                if (part == 1) {
+                                    swiglu(in, in + n, (int) n, g.lim, A(0), d.st);
+                                    ok = swiglu_q8(in, in + n, (int) n, g.lim, A(1), Q(1), Qd(1), d.st);
+                                } else {
+                                    Finish f0;
+                                    f0.w = l.q_norm;
+                                    f0.eps = g.eps;
+                                    Finish f1 = f0;
+                                    f1.q8 = Q(1);
+                                    f1.q8d = Qd(1);
+                                    ok = cudaMemcpyAsync(A(0), in, n * 4, cudaMemcpyDeviceToDevice, d.st) ==
+                                             cudaSuccess &&
+                                         cudaMemcpyAsync(A(1), in, n * 4, cudaMemcpyDeviceToDevice, d.st) ==
+                                             cudaSuccess;
+                                    finish(A(0), T, K, K, f0, d.st);
+                                    finish(A(1), T, K, K, f1, d.st);
+                                }
+                                for (int t = 0; t < T; ++t)   // (the old path's rounding, as mv gives it)
+                                    gg::q8_round(A(0) + (size_t) t * K, K, Q(0) + (size_t) t * K,
+                                                 Qd(0) + (size_t) t * (K / 32), d.st);
+                                x3::MvJob j0 = job(m, A(0), Y(0), T, K, N), j1 = job(m, A(1), Y(1), T, K, N);
+                                gg::PreQ8 pq;
+                                pq.x = A(1);
+                                pq.q = Q(1);
+                                pq.d = Qd(1);
+                                pq.k = K;
+                                pq.rows = T;
+                                return ok && mv_any(&j0, 1, d.st) && mv_any(&j1, 1, d.st, &pq);
+                            };
+                            std::string why;
+                            const std::string what =
+                                std::string(part == 1 ? "s2's int8 from swiglu" : "wq_b's int8 from q's norm") +
+                                ", layer " + std::to_string(l.il) + ", " + std::to_string(T) +
+                                (kind ? " rows, edges" : " rows, random");
+                            if (!trim_run(d, what, hin, set_bytes, regions, enqueue, why)) {
+                                err = "DS4_DECODE_TRIM check on CUDA" + std::to_string(d.id) + ": " + why;
+                                std::fprintf(stderr, "ds4: CUDA%d DS4_DECODE_TRIM check FAILED: %s\n", d.id,
+                                             why.c_str());
+                                return false;
+                            }
+                            ++runs;
+                        }
+                }
+            std::fprintf(stderr, "ds4: CUDA%d DS4_DECODE_TRIM check: %d runs (the first and last layers; 1 and %d "
+                                 "rows; random / edges):%s%s the activations, int8 rows and scales and the GEMVs the "
+                                 "old path's bit for bit, every guard intact\n",
+                         d.id, runs, kWin, decode_trim & 1 ? " swiglu_q8 + s2;" : "",
+                         decode_trim & 2 ? " q's norm + wq_b;" : "");
+        }
+        return true;
+    }
+    // DS4_DECODE_TRIM 4 / 8: 4 copy_regions against four runtime copies (odd lengths, every device); 8 the drafter's
+    // hand-off path - xfer_put of random rows into a device's host-mapped dhand (both regions: a block's h | pre and
+    // the x rows) and xfer_get on every other device - against the rows put, for every ordered pair of devices
+    bool trim_copy_check(std::string& err) {
+        constexpr size_t kGuard = 64;
+        uint32_t st = 0x2b7e1516u;
+        auto rnd = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return (float) (int) (st % 2001u - 1000u) / 250.0f;
+        };
+        if (decode_trim & 4)
+            for (Dev& d : devs) {
+                if (cudaSetDevice(d.id) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    err = "DS4_DECODE_TRIM check on CUDA" + std::to_string(d.id) + ": cudaSetDevice failed";
+                    return false;
+                }
+                const size_t nf[4] = {1, 37, 1024, 4099};   // (floats a region)
+                size_t at[4], set_bytes = 0, src_at[4], n_in = 0;
+                std::vector<std::pair<size_t, size_t>> regions;
+                for (int r = 0; r < 4; ++r) {
+                    at[r] = set_bytes + kGuard;
+                    set_bytes = (at[r] + nf[r] * 4 + 255) / 256 * 256;
+                    regions.push_back({at[r], nf[r] * 4});
+                    src_at[r] = n_in;
+                    n_in += nf[r];
+                }
+                set_bytes += kGuard;
+                std::vector<float> hin(n_in);
+                for (float& v : hin) v = rnd();
+                auto enqueue = [&](float* in, uint8_t* s0, uint8_t* s1) {
+                    CopyRegions cr;
+                    bool ok = true;
+                    for (int r = 0; r < 4; ++r) {
+                        ok = ok && cudaMemcpyAsync(s0 + at[r], in + src_at[r], nf[r] * 4, cudaMemcpyDeviceToDevice,
+                                                   d.st) == cudaSuccess;
+                        cr.dst[r] = s1 + at[r];
+                        cr.src[r] = in + src_at[r];
+                        cr.bytes[r] = nf[r] * 4;
+                    }
+                    cr.n = 4;
+                    return ok && copy_regions(cr, d.st);
+                };
+                std::string why;
+                if (!trim_run(d, "copy_regions", hin, set_bytes, regions, enqueue, why)) {
+                    err = "DS4_DECODE_TRIM check on CUDA" + std::to_string(d.id) + ": " + why;
+                    std::fprintf(stderr, "ds4: CUDA%d DS4_DECODE_TRIM check FAILED: %s\n", d.id, why.c_str());
+                    return false;
+                }
+                std::fprintf(stderr, "ds4: CUDA%d DS4_DECODE_TRIM check: copy_regions (4 regions, 1 .. 4099 floats) "
+                                     "the runtime copies' bytes, every guard intact\n",
+                             d.id);
+            }
+        if (!(decode_trim & 8) || g.n_mtp == 0) return true;
+        int pairs = 0;
+        for (Dev& a : devs)
+            for (Dev& b : devs) {
+                if (&a == &b || a.dhand == nullptr || b.dhand == nullptr) continue;
+                const size_t r0 = dhand_x(), r1 = (size_t) kWin * g.dim * 4;   // (the two regions' bytes)
+                std::vector<float> hin((r0 + r1) / 4);
+                for (float& v : hin) v = rnd();
+                float *src = nullptr, *dst = nullptr, *back = nullptr;
+                cudaEvent_t ea = nullptr, eb = nullptr;
+                bool ok = cudaSetDevice(a.id) == cudaSuccess && cudaMalloc((void**) &src, r0 + r1) == cudaSuccess &&
+                          cudaEventCreateWithFlags(&ea, cudaEventDisableTiming) == cudaSuccess &&
+                          cudaSetDevice(b.id) == cudaSuccess && cudaMalloc((void**) &dst, r0 + r1) == cudaSuccess &&
+                          cudaMallocHost((void**) &back, r0 + r1) == cudaSuccess &&
+                          cudaEventCreateWithFlags(&eb, cudaEventDisableTiming) == cudaSuccess;
+                const unsigned sq = ++d_xseq;
+                bool recorded = false;
+                if (ok) {
+                    Xfer px, gx;
+                    px.n = gx.n = 2;
+                    px.src[0] = src;
+                    px.dst[0] = a.dhand;
+                    px.src[1] = (const uint8_t*) src + r0;
+                    px.dst[1] = a.dhand + r0;
+                    gx.src[0] = a.dhand;
+                    gx.dst[0] = dst;
+                    gx.src[1] = a.dhand + r0;
+                    gx.dst[1] = (uint8_t*) dst + r0;
+                    px.bytes[0] = gx.bytes[0] = r0;
+                    px.bytes[1] = gx.bytes[1] = r1;
+                    cudaSetDevice(a.id);
+                    ok = cudaMemcpyAsync(src, hin.data(), r0 + r1, cudaMemcpyHostToDevice, a.st) == cudaSuccess;
+                    if (ok) xfer_put(px, a.dhand_flag, sq, a.xcnt, a.st);
+                    ok = ok && cudaGetLastError() == cudaSuccess && cudaEventRecord(ea, a.st) == cudaSuccess;
+                    cudaSetDevice(b.id);
+                    if (ok) xfer_get(gx, a.dhand_flag, sq, b.st);
+                    ok = ok && cudaGetLastError() == cudaSuccess &&
+                         cudaMemcpyAsync(back, dst, r0 + r1, cudaMemcpyDeviceToHost, b.st) == cudaSuccess;
+                    recorded = ok && cudaEventRecord(eb, b.st) == cudaSuccess;
+                }
+                const auto t0 = std::chrono::steady_clock::now();
+                for (Dev* e : {&a, &b}) {   // (each device's end: its event, else its stream)
+                    cudaSetDevice(e->id);
+                    cudaEvent_t ev = e == &a ? ea : eb;
+                    cudaError_t q;
+                    while ((q = recorded ? cudaEventQuery(ev) : cudaStreamQuery(e->st)) == cudaErrorNotReady &&
+                           std::chrono::steady_clock::now() - t0 < std::chrono::seconds(10))
+                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    if (q != cudaSuccess)
+                        trim_unknown(e->id, "the drafter's hand-off",
+                                     q == cudaErrorNotReady ? "no end in time" : "an error at its end");
+                }
+                std::string why;
+                if (!recorded) {
+                    (void) cudaGetLastError();
+                    why = "a launch refused or a CUDA error";
+                } else if (std::memcmp(back, hin.data(), r0 + r1) != 0)
+                    why = "the rows differ";
+                cudaSetDevice(a.id);
+                if (src != nullptr) cudaFree(src);
+                if (ea != nullptr) cudaEventDestroy(ea);
+                cudaSetDevice(b.id);
+                if (dst != nullptr) cudaFree(dst);
+                if (back != nullptr) cudaFreeHost(back);
+                if (eb != nullptr) cudaEventDestroy(eb);
+                if (!why.empty()) {
+                    err = "DS4_DECODE_TRIM check: the drafter's hand-off CUDA" + std::to_string(a.id) + " -> CUDA" +
+                          std::to_string(b.id) + ": " + why;
+                    std::fprintf(stderr, "ds4: DS4_DECODE_TRIM check FAILED: %s\n", err.c_str());
+                    return false;
+                }
+                ++pairs;
+            }
+        std::fprintf(stderr, "ds4: DS4_DECODE_TRIM check: the drafter's hand-offs by xfer, %d device pairs (both "
+                             "regions, %zu + %zu bytes): every row as put\n",
+                     pairs, dhand_x(), (size_t) kWin * g.dim * 4);
+        return true;
+    }
+
     // DS4_ROUTE_FUSE=1 (at load, before any request), on every device with layers: gemv_f32_pair and route_pair (with
     // its publish) against what they replace - two gemv_f32 launches; route_ahead, then route_publish with its publish.
     // The GEMVs: the device's first and last pair of a layer and its next (and the first layer with an image-token
@@ -10787,6 +11164,26 @@ struct Model::Impl {
         if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, x, cgr, T, D, HD);
         return nj;
     }
+    // the shared expert's swiglu on d.sg / d.su (rows of FF) and its down GEMV into d.sh_out: DS4_DECODE_TRIM 1 rounds
+    // the swiglu's output to int8 where it is made, for the GEMV (swiglu_q8, PreQ8); else as before
+    bool shared_down(Dev& d, const Layer& l, int T, int FF, std::string& err) {
+        const bool q8 = (decode_trim & 1) && FF % 32 == 0 && T <= kWin && d.shq8 != nullptr;
+        gg::PreQ8 pq;
+        if (q8) {
+            if (!swiglu_q8(d.sg, d.su, T * FF, g.lim, d.sh, d.shq8, d.shd8, d.st)) {
+                err = "DS4_DECODE_TRIM: swiglu_q8 refused";
+                return false;
+            }
+            pq.x = d.sh;
+            pq.q = d.shq8;
+            pq.d = d.shd8;
+            pq.k = FF;
+            pq.rows = T;
+        } else
+            swiglu(d.sg, d.su, T * FF, g.lim, d.sh, d.st);
+        x3::MvJob j = job(l.s2, d.sh, d.sh_out, T, FF, g.dim);
+        return mv_n(d, &j, 1, err, q8 ? &pq : nullptr);
+    }
     // (DS4_HC_FUSE) hc_split_pre_norm's arguments for layer l's attention (ffn false) or FFN: its split weights and
     // norm, the model's constants, these buffers (a decoded token's)
     HcFuse hc_args(const Layer& l, bool ffn, const float* mixes, const float* h, const float* mix, float* x, int8_t* q,
@@ -10929,8 +11326,35 @@ struct Model::Impl {
             (!halloc(h_dump, (size_t) g.n_mtp * kWin * H * D, err) || !halloc(h_dump_ring, (size_t) g.n_mtp * rs, err)))
             return false;
         int cur = d_dev;   // the device the block's rows are on
+        std::vector<char> handed(devs.size(), 0);   // (DS4_DECODE_TRIM 8: a device's one block hand-off region)
         for (int i = 0; i < g.n_mtp; ++i) {
             Layer& l = L[(size_t) (g.nl + i)];
+            if (l.dev != cur && (decode_trim & 8) && !handed[(size_t) cur] && devs[(size_t) cur].dhand != nullptr) {
+                // (DS4_DECODE_TRIM 8: h, then pre, through the device's host-mapped rows and its flag - xfer_put on
+                //  the block's card, xfer_get on the next's, no runtime copy or event)
+                Dev& a = devs[(size_t) cur];
+                Dev& b = devs[(size_t) l.dev];
+                const size_t nh = (size_t) T * H * D * 4, np = (size_t) T * 8 * 4;
+                const unsigned sq = ++d_xseq;
+                Xfer px, gx;
+                px.n = gx.n = 2;
+                px.src[0] = a.h;
+                px.dst[0] = a.dhand;
+                px.bytes[0] = gx.bytes[0] = nh;
+                px.src[1] = a.pre;
+                px.dst[1] = a.dhand + nh;
+                px.bytes[1] = gx.bytes[1] = np;
+                gx.src[0] = a.dhand;
+                gx.dst[0] = b.h;
+                gx.src[1] = a.dhand + nh;
+                gx.dst[1] = b.pre;
+                cudaSetDevice(a.id);
+                xfer_put(px, a.dhand_flag, sq, a.xcnt, a.st);
+                cudaSetDevice(b.id);
+                xfer_get(gx, a.dhand_flag, sq, b.st);
+                handed[(size_t) cur] = 1;
+                cur = l.dev;
+            }
             if (l.dev != cur) {   // (DS4_DRAFT_DEV: the next block on another card - its rows through pinned host memory,
                 Dev& a = devs[(size_t) cur];   //  as a layer split's groups hand theirs: h, then pre)
                 Dev& b = devs[(size_t) l.dev];
@@ -10962,15 +11386,39 @@ struct Model::Impl {
         hc_pre_norm(dl.h, dl.pre, nullptr, D, H, T, g.eps, dl.x, dl.st);   // (the confidence head reads it before the norm)
         Dev& hd = devs[(size_t) head_dev];
         // (through the host to the head's device, and to the head group's other members - the last block's device can
-        // be the head group's lead itself, a group of every GPU, or one of its other members)
+        // be the head group's lead itself, a group of every GPU, or one of its other members; DS4_DECODE_TRIM 8: by
+        // xfer, through dl's host-mapped x rows and its flag)
+        const bool xh = (decode_trim & 8) && dl.dhand != nullptr;
+        unsigned xsq = 0;
+        auto get_x = [&](Dev& e, float* dst) {   // (on e's stream: waits for dl's flag, then the rows)
+            Xfer gx;
+            gx.n = 1;
+            gx.src[0] = dl.dhand + dhand_x();
+            gx.dst[0] = dst;
+            gx.bytes[0] = (size_t) T * D * 4;
+            xfer_get(gx, dl.dhand_flag, xsq, e.st);
+        };
         if (cur != head_dev || groups[(size_t) hd.grp].mem.size() > 1) {
-            CK(cudaMemcpyAsync(dl.bounce, dl.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, dl.st));
-            CK(cudaEventRecord(dl.ev_out, dl.st));
+            if (xh) {
+                xsq = ++d_xseq;
+                Xfer px;
+                px.n = 1;
+                px.src[0] = dl.x;
+                px.dst[0] = dl.dhand + dhand_x();
+                px.bytes[0] = (size_t) T * D * 4;
+                xfer_put(px, dl.dhand_flag, xsq, dl.xcnt, dl.st);
+            } else {
+                CK(cudaMemcpyAsync(dl.bounce, dl.x, (size_t) T * D * 4, cudaMemcpyDeviceToHost, dl.st));
+                CK(cudaEventRecord(dl.ev_out, dl.st));
+            }
         }
         if (cur != head_dev) {
             cudaSetDevice(hd.id);
-            CK(cudaStreamWaitEvent(hd.st, dl.ev_out, 0));
-            CK(cudaMemcpyAsync(hd.x, dl.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, hd.st));
+            if (xh) get_x(hd, hd.x);
+            else {
+                CK(cudaStreamWaitEvent(hd.st, dl.ev_out, 0));
+                CK(cudaMemcpyAsync(hd.x, dl.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, hd.st));
+            }
         }
         // the drafter's final norm and the trunk's head, on every member of the head group (the others' shares first)
         const std::vector<int>& hg = groups[(size_t) hd.grp].mem;
@@ -10978,7 +11426,8 @@ struct Model::Impl {
         for (int m = (int) hg.size() - 1; m >= 0; --m) {
             Dev& e = devs[(size_t) hg[(size_t) m]];
             cudaSetDevice(e.id);
-            if (m > 0 && &e != &dl) {
+            if (m > 0 && &e != &dl && xh) get_x(e, e.ao);
+            else if (m > 0 && &e != &dl) {
                 CK(cudaStreamWaitEvent(e.st, dl.ev_out, 0));
                 CK(cudaMemcpyAsync(e.ao, dl.bounce, (size_t) T * D * 4, cudaMemcpyHostToDevice, e.st));
             } else   // (the lead's x came from the last block's device above; a member that is that device: its own)
@@ -13394,9 +13843,21 @@ struct Model::Impl {
         Finish fq;
         fq.w = l.q_norm;
         fq.eps = g.eps;
+        const bool qr8 = (decode_trim & 2) && T <= kWin;   // (DS4_DECODE_TRIM 2: q's norm rounds it to int8 for wq_b)
+        gg::PreQ8 qrp;
+        if (qr8) {
+            fq.q8 = d.qrq8;
+            fq.q8d = d.qrd8;
+            qrp.x = d.qr;
+            qrp.q = d.qrq8;
+            qrp.d = d.qrd8;
+            qrp.k = g.q_lora;
+            qrp.rows = T;
+        }
         finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
         if (NHL > 0) {
-            if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
+            x3::MvJob jb = job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ);
+            if (!mv_n(d, &jb, 1, err, qr8 ? &qrp : nullptr)) return false;
             Finish fr;
             fr.rd = g.rd;
             fr.pos = (int) p0;
@@ -13447,14 +13908,46 @@ struct Model::Impl {
                     fc.w = l.c_norm;
                     fc.eps = g.eps;
                     finish(d.ckr, T, HD, HD, fc, s);
-                    CK(cudaMemcpyAsync(d.latent, d.ckr, (size_t) T * HD * 4, cudaMemcpyDeviceToDevice, s));
+                    if (decode_trim & 4) {   // (DS4_DECODE_TRIM 4: one kernel, no runtime copy)
+                        CopyRegions cr;
+                        cr.dst[0] = d.latent;
+                        cr.src[0] = d.ckr;
+                        cr.bytes[0] = (size_t) T * HD * 4;
+                        cr.n = 1;
+                        if (!copy_regions(cr, s)) {
+                            err = "DS4_DECODE_TRIM: the latent copy refused";
+                            return false;
+                        }
+                    } else
+                        CK(cudaMemcpyAsync(d.latent, d.ckr, (size_t) T * HD * 4, cudaMemcpyDeviceToDevice, s));
                 } else {
                     if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected
                         const size_t ns = (size_t) R * HD * 4, nr = (size_t) T * HD * 4;
-                        CK(cudaMemcpyAsync(l.c_snap, l.c_kv, ns, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_snap + (size_t) R * HD, l.c_score, ns, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_rows, d.ckr, nr, cudaMemcpyDeviceToDevice, s));
-                        CK(cudaMemcpyAsync(l.c_rows + (size_t) kWin * HD, d.cgr, nr, cudaMemcpyDeviceToDevice, s));
+                        if (decode_trim & 4) {   // (DS4_DECODE_TRIM 4: the four in one kernel)
+                            CopyRegions cr;
+                            cr.dst[0] = l.c_snap;
+                            cr.src[0] = l.c_kv;
+                            cr.bytes[0] = ns;
+                            cr.dst[1] = l.c_snap + (size_t) R * HD;
+                            cr.src[1] = l.c_score;
+                            cr.bytes[1] = ns;
+                            cr.dst[2] = l.c_rows;
+                            cr.src[2] = d.ckr;
+                            cr.bytes[2] = nr;
+                            cr.dst[3] = l.c_rows + (size_t) kWin * HD;
+                            cr.src[3] = d.cgr;
+                            cr.bytes[3] = nr;
+                            cr.n = 4;
+                            if (!copy_regions(cr, s)) {
+                                err = "DS4_DECODE_TRIM: the snapshot copies refused";
+                                return false;
+                            }
+                        } else {
+                            CK(cudaMemcpyAsync(l.c_snap, l.c_kv, ns, cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(l.c_snap + (size_t) R * HD, l.c_score, ns, cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(l.c_rows, d.ckr, nr, cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(l.c_rows + (size_t) kWin * HD, d.cgr, nr, cudaMemcpyDeviceToDevice, s));
+                        }
                     }
                     compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
                 }
@@ -13700,8 +14193,7 @@ struct Model::Impl {
                 x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)};
                 if (!mv_n(d, js, 2, err, ffn_q8)) return false;
             }
-            swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
-            if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
+            if (!shared_down(d, l, T, FF, err)) return false;
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
             if (T == 1 && moe_token_path) {
@@ -13813,8 +14305,7 @@ struct Model::Impl {
             x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)};
             if (!mv_n(d, js, 2, err, ffn_q8)) return false;
         }
-        swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
-        if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
+        if (!shared_down(d, l, T, g.ff, err)) return false;
         const double tw = now_ms();
         CK(cudaEventSynchronize(d.ev));
         st.gpu_wait_ms += now_ms() - tw;

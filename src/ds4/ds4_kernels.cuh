@@ -58,6 +58,11 @@ struct Finish {
     int dst_f16 = 0;
     uint8_t* pdst = nullptr;
     long long pdst_stride = 0;
+    // (DS4_DECODE_TRIM 2) non-null: the values written to x also rounded to int8 as gguf mv rounds a Q8_0 job's input
+    // (q8_quant_block's ops on the stored value) - q8 [n_vec][len], q8d [n_vec][len / 32]; len % 32 == 0, stride len,
+    // no dst / pdst (finish refuses otherwise, nothing launched)
+    int8_t* q8 = nullptr;
+    float* q8d = nullptr;
 };
 /// a packed FP4 row's bytes (Finish::pdst): len / 2 of codes, a scale byte a group (quant 2: 16 values, quant 3: 32)
 constexpr size_t fp4_row_bytes(int len, int quant) { return (size_t) len / 2 + (size_t) len / (quant == 2 ? 16 : 32); }
@@ -130,6 +135,19 @@ void route(const float* logits, const float* bias, int n, int k, int T, float ro
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
+/// (DS4_DECODE_TRIM 1) swiglu, its stored values also rounded to int8 as gguf mv rounds a Q8_0 job's input: q [n],
+/// qd [n / 32], 32-blocks of the flat array (rows of k values, k % 32 == 0, are rows of q k apart).  n % 32 == 0
+/// (false, nothing launched, otherwise)
+bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, cudaStream_t s);
+/// (DS4_DECODE_TRIM 4) up to 4 copies of 4-byte multiples between 4-aligned device ranges in one launch (false,
+/// nothing launched: a range not so)
+struct CopyRegions {
+    void* dst[4] = {nullptr, nullptr, nullptr, nullptr};
+    const void* src[4] = {nullptr, nullptr, nullptr, nullptr};
+    size_t bytes[4] = {0, 0, 0, 0};
+    int n = 0;
+};
+bool copy_regions(const CopyRegions& r, cudaStream_t s);
 
 /// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % r of the state; each token that
 /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
