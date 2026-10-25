@@ -204,6 +204,20 @@ def main() -> int:
             f.write("special.%s %d\n" % (k, v))
         for li, b in bits.items():
             f.write("exl3.%d %d,%d,%d\n" % (li, b["w1"], b["w3"], b["w2"]))
+        vc = cfg.get("vision_config")
+        if vc and "vision_tower.vision_model.pre_layrnorm.weight" in st.t:
+            # the vision tower's geometry, its preprocessor's and the image span's tokens (image_processor.py's
+            # smart_resize: sides multiples of patch x merge, max_pixels 672 x 672 and min_pixels 4 x 28 x 28 are its
+            # class defaults - preprocessor_config.json does not set them)
+            pp = json.loads((model / "preprocessor_config.json").read_text())
+            added = {a["content"]: a["id"] for a in json.loads((model / "tokenizer.json").read_text(
+                encoding="utf-8"))["added_tokens"]}
+            flat(f, "vision.", vc)
+            flat(f, "vision.", vc.get("img_token_compression_config") or {})
+            flat(f, "vision.", {"image_mean": pp["image_mean"], "image_std": pp["image_std"],
+                                "projector_hidden_size": cfg["projector_hidden_size"], "max_pixels": 672 * 672,
+                                "min_pixels": 4 * 28 * 28, "image_start": added["]<]start of image[>["],
+                                "image_end": added["]<]end of image[>["], "image_token": added["]<]image[>["]})
         if dcfg is not None:
             flat(f, "dspark.", {k: v for k, v in dcfg.items() if k not in ("text_config", "vision_config")})
             flat(f, "dspark.dflash.", dcfg.get("dflash_config") or {})

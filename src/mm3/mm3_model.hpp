@@ -14,9 +14,12 @@
 
 namespace mm3 {
 
+struct VisionGeo;
+
 struct Options {
     std::string pack;
     std::vector<int> gpus;        // empty: every visible GPU
+    std::vector<int> layer_split; // the first layer of each GPU's share after the first (empty: by their free memory)
     int max_ctx = 32768;
     int chunk = 1024;             // prompt tokens a forward takes at most
     int staging = 48;             // expert staging slots a GPU (each one expert's blob)
@@ -27,6 +30,8 @@ struct Options {
     bool fast_decode = true;      // one token: the decode GEMVs and the token's fused experts (else the prompt path)
     int cpu_threads = 43;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged)
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
+    bool vision = false;          // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
+    int vision_gpu = 0;
     bool promote = true;          // the staging slots a cache: an expert the CPU lane keeps computing copied into one
                                   // (from the pinned pool, on a copy stream of its own) while the model runs
     int promote_lag = 2;          // a promoted expert's slot is its own this many forwards after its copy began, the
@@ -71,6 +76,16 @@ public:
     /// confidences.
     int draft_block() const;
     bool draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
+    /// The vision tower (Options::vision): its geometry (null without it), a picture's rows (rgb height x width x 3,
+    /// sides multiples of 28 -> F32 [tokens][hidden]), and the pictures the next forwards' image tokens take their
+    /// rows from (position start .. start + rows / hidden - 1; set_images({}) after the prompt).
+    struct Image {
+        int start = 0;
+        std::vector<float> rows;
+    };
+    const VisionGeo* vision() const;
+    bool encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err);
+    void set_images(std::vector<Image> images);
 
 private:
     struct Impl;

@@ -2845,7 +2845,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
     ds4 = config_family(cfg) == "deepseek"
-    flag = "--pack" if ds4 else "--glm-pack"
+    flag = "--glm-pack" if config_family(cfg) == "glm" else "--pack"   # (maya-ds4 and maya-mm3: --pack)
     pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None
     for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
@@ -4080,11 +4080,15 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     if MM3_PROFILE.exists():
         args += ["--profile", str(MM3_PROFILE)]
     kept = keep_args(old.get("args") or [], args, ("--chunk", "--staging", "--cpu-threads", "--reserve-gb",
-                                                    "--resident-cap", "--dspark", "--dspark-conf"))
+                                                    "--resident-cap", "--dspark", "--dspark-conf", "--vision",
+                                                    "--vision-gpu"))
     # DSpark (the draft in the pack: tools/mm3/pack.py indexes dspark/): drafts verified by the model, the same tokens
     # it would answer alone - about 1.6x the decode on the 3090 + 8x 5060 Ti it was measured on
     if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
         args += ["--dspark", "on"]
+    # pictures: the pack's vision tower in the engine (~1.9 GB on the first GPU; --vision off frees it for experts)
+    if "--vision" not in args[:-1] and "vision.hidden_size" in (pack / "mm3.txt").read_text(encoding="utf-8"):
+        args += ["--vision", "on"]
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": old.get("sampling") or dict(MM3_SAMPLING),

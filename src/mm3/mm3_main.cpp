@@ -9,6 +9,12 @@
 // request early, `QUIT` the engine.  A prompt that shares a start with the state (the last conversation) reads only
 // the rest.  Keys: temperature, top_p, top_k, min_p, seed, penalty_last_n / _repeat / _freq / _present,
 // think_budget + think_end (a reasoning block still open after that many tokens is closed with think_end).
+// With --vision on, `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures (the file: see read_pics; each
+// picture's image tokens take its rows); the state is shared only where the same picture sits at the same place.
+//
+//   maya-mm3 --pack <model>/maya-mm3 --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]
+//
+// The vision tower alone (no experts loaded): a picture's rows, F32 [tokens][hidden] (tools/mm3/vision_ref.py's).
 //
 //   maya-mm3 --pack <model>/maya-mm3 --ids @prompt.txt [--gen N] [--dump-logits out.bin --last N]
 //            [--gpus 0,1,...] [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]
@@ -40,6 +46,8 @@
 #include <unistd.h>
 
 #include "mm3_model.hpp"
+#include "mm3_pack.hpp"
+#include "mm3_vision.hpp"
 
 namespace {
 
@@ -69,6 +77,102 @@ std::vector<int> parse_list(const std::string& a) {
 
 double now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// GENI's file (serve/mm3_vision.py): int32 'MMI1', int32 count, then per picture int64 start (the position of its
+// first image token), int32 width, int32 height, height x width x 3 RGB bytes
+struct Pic {
+    long long start = 0;
+    int width = 0, height = 0;
+    std::vector<uint8_t> rgb;
+    uint64_t hash = 0;   // (FNV-1a over its size and pixels: the state's pictures told apart)
+};
+
+bool read_pics(const std::string& path, std::vector<Pic>& v, std::string& err) {
+    v.clear();
+    std::ifstream f(path, std::ios::binary);
+    char magic[4];
+    int32_t n = 0;
+    if (!f.read(magic, 4) || std::memcmp(magic, "MMI1", 4) != 0 || !f.read((char*) &n, 4) || n < 0 || n > 4096) {
+        err = path + ": not a pictures file (MMI1)";
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        Pic q;
+        int64_t st = 0;
+        int32_t wh[2] = {0, 0};
+        if (!f.read((char*) &st, 8) || !f.read((char*) wh, 8) || wh[0] <= 0 || wh[1] <= 0 ||
+            (long long) wh[0] * wh[1] > (1LL << 26)) {
+            err = path + ": picture " + std::to_string(i) + " is cut short";
+            return false;
+        }
+        q.start = st;
+        q.width = wh[0];
+        q.height = wh[1];
+        q.rgb.resize((size_t) wh[0] * wh[1] * 3);
+        if (!f.read((char*) q.rgb.data(), (std::streamsize) q.rgb.size())) {
+            err = path + ": picture " + std::to_string(i) + " is cut short";
+            return false;
+        }
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](const uint8_t* b, size_t k) {
+            for (size_t j = 0; j < k; ++j) h = (h ^ b[j]) * 1099511628211ull;
+        };
+        mix((const uint8_t*) wh, 8);
+        mix(q.rgb.data(), q.rgb.size());
+        q.hash = h;
+        v.push_back(std::move(q));
+    }
+    return true;
+}
+
+// the pictures' spans in ids: ]<]start of image[>[, its image tokens, ]<]end of image[>[ - and no image token outside
+// one; their rows for those that end at or after position `from` (the others' positions are the state's already)
+bool picture_rows(mm3::Model& m, const std::vector<Pic>& pics, const std::vector<int>& ids, size_t from,
+                  std::vector<mm3::Model::Image>& out, std::string& err) {
+    out.clear();
+    const mm3::VisionGeo* vg = m.vision();
+    if (!vg) {
+        err = "this engine has no vision tower (start it with --vision on), so it cannot read pictures";
+        return false;
+    }
+    std::vector<char> covered(ids.size(), 0);
+    for (size_t i = 0; i < pics.size(); ++i) {
+        const Pic& q = pics[i];
+        const int f = vg->factor();
+        const long long n = q.width % f || q.height % f ? 0 : (long long) (q.height / f) * (q.width / f);
+        if (n == 0 || (long long) q.width * q.height > vg->max_pixels) {
+            err = "picture " + std::to_string(i) + ": " + std::to_string(q.width) + " x " + std::to_string(q.height) +
+                  " pixels (sides multiples of " + std::to_string(f) + ", at most " + std::to_string(vg->max_pixels) +
+                  " pixels)";
+            return false;
+        }
+        if (q.start < 1 || q.start + n >= (long long) ids.size() || ids[(size_t) q.start - 1] != vg->image_start ||
+            ids[(size_t) (q.start + n)] != vg->image_end) {
+            err = "picture " + std::to_string(i) + "'s span (" + std::to_string(n) + " image tokens at " +
+                  std::to_string(q.start) + ") is not between the prompt's start and end of image tokens";
+            return false;
+        }
+        for (long long k = q.start; k < q.start + n; ++k) {
+            if (ids[(size_t) k] != vg->image_token || covered[(size_t) k]) {
+                err = "picture " + std::to_string(i) + "'s span is not a run of image tokens of its own";
+                return false;
+            }
+            covered[(size_t) k] = 1;
+        }
+        if (q.start + n > (long long) from) {
+            mm3::Model::Image im;
+            im.start = (int) q.start;
+            if (!m.encode_image(q.rgb.data(), q.width, q.height, im.rows, err)) return false;
+            out.push_back(std::move(im));
+        }
+    }
+    for (size_t k = 0; k < ids.size(); ++k)
+        if (ids[k] == vg->image_token && !covered[k]) {
+            err = "an image token at " + std::to_string(k) + " without its picture";
+            return false;
+        }
+    return true;
 }
 
 // stdin's lines on a thread of their own: STOP is seen while a request runs
@@ -126,15 +230,21 @@ struct Req {
     int think_end = -1;
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
+    std::string file;       // GENI: the pictures
     std::vector<int> ids;
 };
 
 bool parse_gen(const std::string& line, Req& r) {
-    std::istringstream is(line.substr(4));
+    const bool geni = line.rfind("GENI ", 0) == 0;
+    std::istringstream is(line.substr(geni ? 5 : 4));
     if (!(is >> r.max_new)) return false;
     for (std::string tok; is >> tok;) {
         const size_t eq = tok.find('=');
         if (eq == std::string::npos) {
+            if (geni && r.file.empty()) {
+                r.file = tok;
+                continue;
+            }
             r.ids = parse_ids(tok);
             break;
         }
@@ -234,27 +344,44 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
     const auto& st0 = m.stats();
     std::printf("INFO engine=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld dspark=%d\n", st0.resident,
                 st0.experts, m.draft_block() > 0 && spec_on ? 1 : 0);
+    if (const mm3::VisionGeo* vg = m.vision())   // (serve/mm3_vision.py's Geometry.from_info)
+        std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
+                    "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
+                    vg->patch, vg->merge, vg->max_pixels, vg->min_pixels);
     std::printf("READY %d stop\n", m.max_ctx());
     std::fflush(stdout);
-    std::fprintf(stderr, "maya mm3 serve: GEN <max_new> [keys] <ids>; STOP, QUIT\n");
+    std::fprintf(stderr, "maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT\n");
     std::signal(SIGPIPE, SIG_IGN);
     Lines in;
     in.start();
     std::vector<int> state;   // the tokens in the cache, positions 0 ..
+    struct Held {
+        long long start;
+        uint64_t hash;
+    };
+    std::vector<Held> held;   // the pictures in the cache (their first image token's position, their pixels' hash)
     std::vector<float> lg((size_t) m.vocab());
     unsigned long long counter = 0;
     std::string line, err;
     while (in.next(line)) {
         if (line == "QUIT") break;
-        if (line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+        if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
+            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n",
+                        line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
         in.stop.store(false);
         Req r;
-        if (!parse_gen(line, r)) {
-            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...>\n");
+        if (!parse_gen(line, r) || (line.rfind("GENI ", 0) == 0 && r.file.empty())) {
+            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> (GENI: the pictures' file before the ids)\n");
+            std::fflush(stdout);
+            continue;
+        }
+        std::vector<Pic> pics;
+        if (!r.file.empty() && !read_pics(r.file, pics, err)) {
+            std::printf("ERR %s\n", err.c_str());
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
             continue;
         }
@@ -268,7 +395,28 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         // the state's shared start (the last token is always read again: its logits are this request's first)
         size_t from = 0;
         while (from < state.size() && from + 1 < r.ids.size() && state[from] == r.ids[from]) ++from;
+        // (a picture before `from` in either the state or the request must be in both, at the same place)
+        for (const Held& q : held)
+            if (q.start < (long long) from &&
+                std::none_of(pics.begin(), pics.end(), [&](const Pic& x) { return x.start == q.start && x.hash == q.hash; }))
+                from = (size_t) q.start;
+        for (const Pic& x : pics)
+            if (x.start < (long long) from &&
+                std::none_of(held.begin(), held.end(), [&](const Held& q) { return x.start == q.start && x.hash == q.hash; }))
+                from = (size_t) x.start;
         state.resize(from);
+        held.clear();
+        std::vector<mm3::Model::Image> rows;
+        if (!(pics.empty() && std::find(r.ids.begin(), r.ids.end(), m.vision() ? m.vision()->image_token : -1) ==
+                                  r.ids.end()) &&
+            !picture_rows(m, pics, r.ids, from, rows, err)) {
+            std::printf("ERR %s\n", err.c_str());
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
+            std::fflush(stdout);
+            continue;
+        }
+        for (const Pic& x : pics) held.push_back({x.start, x.hash});
+        m.set_images(std::move(rows));
         const auto s_pre = m.stats();
         bool ok = true, cancel = false;
         for (size_t a = from; a < r.ids.size();) {
@@ -290,11 +438,13 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             }
         }
         const double t1 = now() * 1e3;
+        m.set_images({});
         if (!ok) {
             std::printf("ERR %s\n", err.c_str());
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
             state.clear();
+            held.clear();
             continue;
         }
         if (cancel) {
@@ -436,7 +586,9 @@ int usage() {
     std::fprintf(stderr,
                  "usage: maya-mm3 --pack DIR --ids IDS|@FILE [--gen N] [--dump-logits FILE --last N] [--gpus LIST]\n"
                  "                [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]\n"
-                 "                [--verbose]\n");
+                 "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
+                 "                [--verbose]\n"
+                 "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
 
@@ -444,7 +596,7 @@ int usage() {
 
 int main(int argc, char** argv) {
     mm3::Options o;
-    std::string ids_arg, dump, profile_out, batch, eos_arg;
+    std::string ids_arg, dump, profile_out, batch, eos_arg, images, enc_rgb, enc_size, enc_out;
     bool serve_mode = false;
     int gen = 0, last = 1, ppl = 0;
     float dspark_conf = 0.7f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
@@ -478,13 +630,59 @@ int main(int argc, char** argv) {
         else if (a == "--batch") batch = val();
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
         else if (a == "--dspark") o.dspark = val() != "off";
+        else if (a == "--vision") o.vision = val() != "off";
+        else if (a == "--layer-split") {   // (serve/server.py's: "auto", or the first layer of each later GPU's share)
+            const std::string v = val();
+            o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
+        }
+        else if (a == "--vision-gpu") o.vision_gpu = std::atoi(val().c_str());
+        else if (a == "--images") images = val();
+        else if (a == "--encode-image") enc_rgb = val();
+        else if (a == "--size") enc_size = val();
+        else if (a == "--dump-image") enc_out = val();
         else if (a == "--dspark-conf") dspark_conf = (float) std::atof(val().c_str());
         else if (a == "--serve") serve_mode = true;
         else if (a == "--eos") eos_arg = val();
         else if (a == "--verbose") o.verbose = true;
         else return usage();
     }
+    if (!enc_rgb.empty()) {   // the vision tower alone: a picture's rows into --dump-image
+        int w = 0, h = 0;
+        if (o.pack.empty() || enc_out.empty() || std::sscanf(enc_size.c_str(), "%dx%d", &w, &h) != 2) return usage();
+        mm3::Pack pk;
+        mm3::Vision v;
+        std::string err;
+        std::ifstream f(enc_rgb, std::ios::binary);
+        std::vector<uint8_t> px((size_t) w * h * 3);
+        if (!f.read((char*) px.data(), (std::streamsize) px.size())) {
+            std::fprintf(stderr, "%s: not %d x %d x 3 bytes\n", enc_rgb.c_str(), w, h);
+            return 1;
+        }
+        if (!pk.load(o.pack, err) || !mm3::Vision::in_pack(pk) || !v.load(pk, o.gpus.empty() ? 0 : o.gpus[0], err)) {
+            std::fprintf(stderr, "maya-mm3: %s\n", err.empty() ? "the pack has no vision tower" : err.c_str());
+            return 1;
+        }
+        std::vector<float> rows;
+        for (int rep = 0; rep < 2; ++rep) {   // (the second one timed)
+            const double t0 = now();
+            if (!v.encode(px.data(), w, h, rows, err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            if (rep == 1)
+                std::fprintf(stderr, "vision: %d x %d pixels -> %zu rows in %.0f ms (%zu MB on CUDA%d)\n", w, h,
+                             rows.size() / (size_t) v.geo().out_dim, 1e3 * (now() - t0), v.bytes() >> 20, v.device());
+        }
+        std::FILE* fo = std::fopen(enc_out.c_str(), "wb");
+        if (!fo || std::fwrite(rows.data(), 4, rows.size(), fo) != rows.size()) {
+            std::fprintf(stderr, "%s: cannot write\n", enc_out.c_str());
+            return 1;
+        }
+        std::fclose(fo);
+        return 0;
+    }
     if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode)) return usage();
+    if (!images.empty()) o.vision = true;
     std::vector<int> ids = ids_arg.empty() ? std::vector<int>{0} : parse_ids(ids_arg);
     if (ids.empty()) {
         std::fprintf(stderr, "no token ids\n");
@@ -565,6 +763,17 @@ int main(int argc, char** argv) {
         std::printf("all %d positions: NLL %.4f  ppl %.3f\n", cnt, sum / cnt, std::exp(sum / cnt));
         return 0;
     }
+    if (!images.empty()) {   // --images: an MMI1 file's pictures, for the prompt's spans
+        std::vector<Pic> pics;
+        std::vector<mm3::Model::Image> rows;
+        const double t0 = now();
+        if (!read_pics(images, pics, err) || !picture_rows(m, pics, ids, 0, rows, err)) {
+            std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "pictures: %zu encoded in %.0f ms\n", pics.size(), 1e3 * (now() - t0));
+        m.set_images(std::move(rows));
+    }
     last = std::max(1, std::min(last, n));
     std::vector<float> logits((size_t) last * m.vocab());
     double t0 = now();
@@ -573,6 +782,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     double t1 = now();
+    m.set_images({});
     std::fprintf(stderr, "prompt: %d tokens in %.2f s (%.1f tok/s), %ld experts staged\n", n, t1 - t0,
                  n / (t1 - t0), m.stats().staged);
     if (!dump.empty()) {

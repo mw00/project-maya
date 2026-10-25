@@ -30,6 +30,7 @@
 #include "mm3_dspark.hpp"
 #include "mm3_exl3.hpp"
 #include "mm3_kernels.cuh"
+#include "mm3_vision.hpp"
 
 namespace mm3 {
 namespace x3 = strata::mm3::exl3;
@@ -305,6 +306,8 @@ struct Model::Impl {
     uint8_t* pool = nullptr;         // the pinned pool
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
+    std::unique_ptr<Vision> vis;     // the vision tower (Options::vision)
+    std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
     std::vector<int> tap_of;         // layer -> its tap (-1: none)
 
@@ -448,9 +451,20 @@ struct Model::Impl {
             double acc = 0;
             size_t di = 0;
             L.assign((size_t) g.n_layers, {});
+            const auto& sp = o.layer_split;
+            if (!sp.empty() && (sp.size() + 1 != D.size() || !std::is_sorted(sp.begin(), sp.end()) || sp.front() < 1 ||
+                                sp.back() >= g.n_layers || std::adjacent_find(sp.begin(), sp.end()) != sp.end())) {
+                err = "--layer-split: " + std::to_string(D.size() - 1) + " increasing first layers in 1 .. " +
+                      std::to_string(g.n_layers - 1) + " (one for each GPU after the first)";
+                return false;
+            }
             for (int li = 0; li < g.n_layers; ++li) {
-                const double mid = (li + 0.5) / g.n_layers * total;
-                while (di + 1 < D.size() && acc + (double) D[di].free0 < mid) acc += (double) D[di++].free0;
+                if (sp.empty()) {
+                    const double mid = (li + 0.5) / g.n_layers * total;
+                    while (di + 1 < D.size() && acc + (double) D[di].free0 < mid) acc += (double) D[di++].free0;
+                } else {
+                    while (di < sp.size() && li >= sp[di]) ++di;
+                }
                 L[(size_t) li].dev = (int) di;
                 D[di].layers.push_back(li);
             }
@@ -587,6 +601,23 @@ struct Model::Impl {
             info.push_back("DSpark draft: " + std::to_string(draftm->bytes() >> 20) + " MB on CUDA" +
                            std::to_string(hd.id) + ", block " + std::to_string(draftm->geo().block) + ", taps " +
                            std::to_string(tl.size()));
+        }
+        // the vision tower, also before the experts take the memory
+        if (o.vision) {
+            if (!Vision::in_pack(pk)) {
+                err = "--vision: the pack has no vision tower (pack it again with tools/mm3/pack.py)";
+                return false;
+            }
+            if (o.vision_gpu < 0 || o.vision_gpu >= (int) D.size()) {
+                err = "--vision-gpu " + std::to_string(o.vision_gpu) + ": not one of the " + std::to_string(D.size()) +
+                      " GPUs";
+                return false;
+            }
+            vis = std::make_unique<Vision>();
+            if (!vis->load(pk, D[(size_t) o.vision_gpu].id, err)) return false;
+            info.push_back("vision tower: " + std::to_string(vis->bytes() >> 20) + " MB on CUDA" +
+                           std::to_string(vis->device()) + ", up to " + std::to_string(vis->geo().max_pixels) +
+                           " pixels a picture");
         }
         // the profile: routings [layer][expert] (a wrong size is ignored)
         prof.assign((size_t) g.n_layers * g.n_exp, 0);
@@ -1447,6 +1478,12 @@ struct Model::Impl {
                 std::memcpy(&h[(size_t) t * g.dim + i], &u, 4);
             }
         }
+        for (const Model::Image& im : imgs) {   // (a picture's image tokens: its rows)
+            const int n = (int) (im.rows.size() / (size_t) g.dim);
+            for (int q = std::max(im.start, pos0); q < std::min(im.start + n, pos0 + T); ++q)
+                std::memcpy(&h[(size_t) (q - pos0) * g.dim], im.rows.data() + (size_t) (q - im.start) * g.dim,
+                            (size_t) g.dim * 4);
+        }
         std::vector<int> pos((size_t) T);
         for (int t = 0; t < T; ++t) pos[(size_t) t] = pos0 + t;
         for (Dev& d : D) {
@@ -1566,6 +1603,18 @@ const Stats& Model::stats() const { return p->st; }
 std::vector<std::string> Model::info_lines() const { return p->info; }
 
 int Model::draft_block() const { return p->draftm ? p->draftm->geo().block : 0; }
+
+const VisionGeo* Model::vision() const { return p->vis ? &p->vis->geo() : nullptr; }
+
+bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err) {
+    if (!p->vis) {
+        err = "no vision tower loaded (--vision on)";
+        return false;
+    }
+    return p->vis->encode(rgb, width, height, rows, err);
+}
+
+void Model::set_images(std::vector<Image> images) { p->imgs = std::move(images); }
 
 bool Model::draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err) {
     if (!p->draftm) {

@@ -11,7 +11,8 @@ Images (optional, when the config has a "vision" entry): OpenAI image_url parts 
 data, http(s) URLs or local file paths) go through `maya-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.  DeepSeek-V4.1 (maya-ds4, `INFO vision=ds4`) runs its vision tower in the engine:
-the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`.
+the server only resizes the pictures (serve/ds4_vision.py) and sends their pixels with `GENI`; so does
+MiniMax-M3.1-Flash (maya-mm3 with --vision on, `INFO vision=mm3`, serve/mm3_vision.py).
 Requests whose prompt plus max tokens exceed the engine's context are REJECTED with 400, never truncated.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
@@ -50,7 +51,9 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map  # noqa: E402
+from serve import ds4_vision, gpu_map, mm3_vision  # noqa: E402
+
+ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level,
                             literal_tags, mark_literals, media_of, openai_to_messages, unmark_literals)
@@ -2229,7 +2232,9 @@ class Service:
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
-        if images and isinstance(self.vision, ds4_vision.Vision):
+        if isinstance(self.vision, mm3_vision.Vision) and any(kind == "video" for kind, _ in media):
+            raise ValueError("MiniMax-M3.1 reads pictures, not videos")
+        if images and isinstance(self.vision, ENGINE_VISION):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
             # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
             pics = []
@@ -2341,10 +2346,12 @@ class Service:
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
                                   else effort_kwargs(self.default_effort))}
-        if getattr(self.template, "deepseek", False):
-            sources = deepseek_images(messages)
+        if getattr(self.template, "deepseek", False) or isinstance(self.vision, mm3_vision.Vision):
+            # (DeepSeek, MiniMax: the engine's own vision tower - a picture's span is its resize's)
+            sources = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
+                       else [src for kind, src in media_of(messages) if kind == "image"])
             n, approximate = len(self.render_ids(messages, tools, kw)), bool(sources)
-            if sources and isinstance(self.vision, ds4_vision.Vision):   # (DeepSeek: a picture's span is its resize's)
+            if sources and isinstance(self.vision, ENGINE_VISION):
                 try:
                     n += sum(self.vision.picture(src).tokens - 1 for src in sources)
                     approximate = False
@@ -4424,6 +4431,12 @@ def main() -> int:
                                        Path(tempfile.mkdtemp(prefix="maya-ds4-pictures-")), Vision.load)
             print(f"[maya] images: the model's vision tower runs in the engine (GPU {engine.info.get('vision_gpu')}, "
                   f"{engine.info.get('vision_mib')} MiB), up to {vision.g.max_tokens} tokens a picture", flush=True)
+        elif vision is None and not vcfg and engine.info.get("vision") == "mm3":
+            # MiniMax-M3.1-Flash: the engine's own vision tower; the server resizes the pictures
+            vision = mm3_vision.Vision(mm3_vision.Geometry.from_info(engine.info),
+                                       Path(tempfile.mkdtemp(prefix="maya-mm3-pictures-")), Vision.load)
+            print(f"[maya] images: the model's vision tower runs in the engine, up to {vision.g.max_pixels} pixels "
+                  f"({vision.g.max_tokens} tokens) a picture", flush=True)
         elif vision is None and not vcfg and engine.info.get("vision") == "off":
             # (DeepSeek-V4.1: its tower did not load - the engine's NOTE line above says why; no pictures offered)
             print("[maya] images: OFF - pictures are refused until the vision tower loads (see the line above)",
