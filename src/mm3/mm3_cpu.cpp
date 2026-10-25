@@ -27,12 +27,14 @@ struct CpuLane::Impl {
     int dim, ff;
     float alpha, limit;
     std::vector<std::thread> th;
-    // a phase's jobs: `ticket` holds its generation (high 32 bits) and the next job (low 32); a worker takes a job only
-    // by a compare-and-swap of a ticket of the generation it woke for, so one late from the phase before can neither
-    // run a job with the new phase's function nor use one up
+    // a phase's jobs in one word: `ticket` holds its generation (high 32 bits), its job count (16) and the next job (low
+    // 16); a worker takes job j only by a compare-and-swap of the word it read, j below the count in that same word - so
+    // one late from the phase before can neither take a job of the new phase (nor run it with the new function) nor
+    // count one there (a count of its own, read apart from the word, let a late worker take job n of the old phase as
+    // one of the new phase's before its word was stored: a job run twice, the phase over one job early)
     std::atomic<uint64_t> gen{0}, ticket{0};
     std::atomic<int> done{0};
-    std::atomic<int> n_jobs{0};
+    static constexpr int kMaxJobs = 0xffff;
     std::atomic<const std::function<void(int)>*> fn{nullptr};
     std::atomic<bool> stop{false};
     std::mutex mu;
@@ -72,8 +74,8 @@ struct CpuLane::Impl {
     }
     void work(uint64_t g) {
         for (uint64_t t = ticket.load(); (t >> 32) == (g & 0xffffffffull);) {
-            const uint32_t j = (uint32_t) t;
-            if ((int) j >= n_jobs.load()) return;
+            const uint32_t j = (uint32_t) (t & 0xffffu), n = (uint32_t) ((t >> 16) & 0xffffu);
+            if (j >= n) return;
             if (!ticket.compare_exchange_weak(t, t + 1)) continue;   // (t now holds the current ticket)
             (*fn.load())((int) j);
             done.fetch_add(1, std::memory_order_release);
@@ -81,11 +83,19 @@ struct CpuLane::Impl {
         }
     }
     void parallel(int n, const std::function<void(int)>& f) {
+        if (n > kMaxJobs) {   // (the word's count: more in parts)
+            for (int b = 0; b < n; b += kMaxJobs) {
+                const std::function<void(int)> fp = [&](int j) { f(b + j); };
+                parallel(std::min(kMaxJobs, n - b), fp);
+            }
+            return;
+        }
+        if (n <= 0) return;
         const uint64_t g = gen.load() + 1;
         fn.store(&f);
-        n_jobs.store(n);
         done.store(0);
-        ticket.store((g & 0xffffffffull) << 32);   // (after the function and the count: a worker that sees it sees them)
+        ticket.store(((g & 0xffffffffull) << 32) | ((uint64_t) n << 16));   // (after the function: a worker that sees
+                                                                            //  the word sees it)
         gen.store(g, std::memory_order_release);
         if (sleepers.load()) cv.notify_all();
         work(g);
