@@ -34,6 +34,7 @@ public:
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
+    std::vector<std::string> vram_lines() const;
     bool save_profile(const std::string& path, std::string& err) const;
     int draft_block() const;
     bool draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err);

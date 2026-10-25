@@ -50,12 +50,18 @@ __device__ float block_absmax(float v, float* red) {
     return m;
 }
 
-// an INT8 cache row: v (this thread's of the block's 128) as round(v / s), s = the row's max |v| / 127 (0: a zero row)
-__device__ void put_i8(float v, int8_t* row, float* scale, float* red) {
+// an INT8 cache row: v (this thread's of the block's 128) as round(v / s), s = the row's max |v| / 127 (0: a zero row);
+// host (KV streaming): the same row in host memory too
+__device__ void put_i8(float v, int8_t* row, float* scale, float* red, int8_t* hrow = nullptr, float* hscale = nullptr) {
     const float am = block_absmax(v, red);
     const float s = am / 127.0f;
-    row[threadIdx.x] = s > 0.0f ? (int8_t) fminf(fmaxf(rintf(v / s), -127.0f), 127.0f) : (int8_t) 0;
+    const int8_t q = s > 0.0f ? (int8_t) fminf(fmaxf(rintf(v / s), -127.0f), 127.0f) : (int8_t) 0;
+    row[threadIdx.x] = q;
     if (threadIdx.x == 0) *scale = s;
+    if (hrow) {
+        hrow[threadIdx.x] = q;
+        if (threadIdx.x == 0) *hscale = s;
+    }
 }
 
 void check(const char* what) {
@@ -101,27 +107,42 @@ __device__ float norm_rope(float x, const float* w1, int pos, int n_rot, const f
     return o;
 }
 
-// (kc8: the INT8 caches instead - K / V rows of int8 and a scale each, kc / vc unused)
+// (kc8: the INT8 caches instead - K / V rows of int8 and a scale each, kc / vc unused.  hs.ring: KV streaming - the
+//  VRAM rows a ring, row p % hs.ring tagged p, and position p's row in host memory as well)
 __global__ void qk_kernel(float* q, const float* k, const float* v, const float* qn1, const float* kn1,
                           const int* pos, int Hq, int Hkv, int n_rot, const float* inv, float eps, uint16_t* kc,
-                          uint16_t* vc, int ring, int8_t* kc8, int8_t* vc8, float* ks, float* vs) {
+                          uint16_t* vc, int ring, int8_t* kc8, int8_t* vc8, float* ks, float* vs, KvHost hs) {
     __shared__ float red[33], sh[128];
     const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x, hd = blockDim.x;
     const int p = pos[t];
-    const int row = ring > 0 ? p % ring : p;
+    const int row = ring > 0 ? p % ring : hs.ring > 0 ? p % hs.ring : p;
+    const bool host = hs.ring > 0;
     if (h < Hq) {
         float* x = q + ((size_t) t * Hq + h) * hd;
         x[d] = norm_rope(x[d], qn1, p, n_rot, inv, eps, sh, red);
     } else if (h < Hq + Hkv) {
         const int kh = h - Hq;
         const float o = norm_rope(k[((size_t) t * Hkv + kh) * hd + d], kn1, p, n_rot, inv, eps, sh, red);
-        if (kc8) put_i8(o, kc8 + ((size_t) row * Hkv + kh) * hd, ks + (size_t) row * Hkv + kh, red);
-        else kc[((size_t) row * Hkv + kh) * hd + d] = f2bf(o);
+        const size_t at = (size_t) row * Hkv + kh, ah = (size_t) p * Hkv + kh;
+        if (kc8) {
+            put_i8(o, kc8 + at * hd, ks + at, red, host ? hs.i8.kc + ah * hd : nullptr, host ? hs.i8.ks + ah : nullptr);
+        } else {
+            const uint16_t b = f2bf(o);
+            kc[at * hd + d] = b;
+            if (host) hs.kc[ah * hd + d] = b;
+        }
+        if (host && kh == 0 && d == 0) hs.tag[row] = p;
     } else {
         const int vh = h - Hq - Hkv;
         const float o = v[((size_t) t * Hkv + vh) * hd + d];
-        if (vc8) put_i8(o, vc8 + ((size_t) row * Hkv + vh) * hd, vs + (size_t) row * Hkv + vh, red);
-        else vc[((size_t) row * Hkv + vh) * hd + d] = f2bf(o);
+        const size_t at = (size_t) row * Hkv + vh, ah = (size_t) p * Hkv + vh;
+        if (vc8) {
+            put_i8(o, vc8 + at * hd, vs + at, red, host ? hs.i8.vc + ah * hd : nullptr, host ? hs.i8.vs + ah : nullptr);
+        } else {
+            const uint16_t b = f2bf(o);
+            vc[at * hd + d] = b;
+            if (host) hs.vc[ah * hd + d] = b;
+        }
     }
 }
 
@@ -234,6 +255,14 @@ __global__ void select_kernel(const float* bs, const int* pos, int T, int Hi, in
 // one block of 128 threads per (query, KV group): its 16 query heads over 64-key tiles of the kept blocks, online
 // softmax in F32
 constexpr int kG = 16, kTile = 64, kRow = 130;   // (K / V rows padded to 130 halves)
+// key kp's row: its VRAM row (with KV streaming its ring row, when the ring holds kp), else (host) its host row
+__device__ __forceinline__ size_t kv_row(const KvHost& hs, int kp, bool& host) {
+    if (hs.ring <= 0) return (size_t) kp;
+    const int r = kp % hs.ring;
+    host = hs.tag[r] != kp;
+    return host ? (size_t) kp : (size_t) r;
+}
+
 // I8: the INT8 caches (kc8 / vc8 rows, ks8 / vs8 their scales): a key's dot product over its int8 values times its
 // scale, a value's scale folded into its probability
 template <bool I8>
@@ -241,7 +270,7 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
                                                           const int* kept, const int* pos, int T, int Hq, int Hkv,
                                                           int topk, int blk, float scale, float* out,
                                                           const int8_t* kc8, const int8_t* vc8, const float* ks8,
-                                                          const float* vs8) {
+                                                          const float* vs8, KvHost hs) {
     __shared__ float qs[kG][128];
     __shared__ __align__(4) uint16_t ks[kTile][kRow], vs[kTile][kRow];
     __shared__ float ksc[kTile], vsc[kTile];
@@ -270,22 +299,32 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
             const int k0 = b * blk + sub * kTile;
             if (k0 > p) break;
             __syncthreads();
+            // (KV streaming: a key from its VRAM ring row when that row holds it, else from host memory)
             if constexpr (I8) {
                 for (int i = tid; i < kTile * 32; i += 128) {   // 64 keys x 32 words of 4 int8, K and V
                     const int j = i >> 5, c = i & 31;
                     const int kp = k0 + j;
                     uint32_t kw = 0, vw = 0;
                     if (kp <= p) {
-                        kw = *(const uint32_t*) (kc8 + ((size_t) kp * Hkv + g) * 128 + c * 4);
-                        vw = *(const uint32_t*) (vc8 + ((size_t) kp * Hkv + g) * 128 + c * 4);
+                        bool fh = false;
+                        const size_t r = kv_row(hs, kp, fh);
+                        kw = *(const uint32_t*) ((fh ? hs.i8.kc : kc8) + (r * Hkv + g) * 128 + c * 4);
+                        vw = *(const uint32_t*) ((fh ? hs.i8.vc : vc8) + (r * Hkv + g) * 128 + c * 4);
                     }
                     *(uint32_t*) &k8[j][c * 4] = kw;
                     *(uint32_t*) &v8[j][c * 4] = vw;
                 }
                 if (tid < kTile) {
                     const int kp = k0 + tid;
-                    ksc[tid] = kp <= p ? ks8[(size_t) kp * Hkv + g] : 0.0f;
-                    vsc[tid] = kp <= p ? vs8[(size_t) kp * Hkv + g] : 0.0f;
+                    float ka = 0.0f, va = 0.0f;
+                    if (kp <= p) {
+                        bool fh = false;
+                        const size_t r = kv_row(hs, kp, fh);
+                        ka = (fh ? hs.i8.ks : ks8)[r * Hkv + g];
+                        va = (fh ? hs.i8.vs : vs8)[r * Hkv + g];
+                    }
+                    ksc[tid] = ka;
+                    vsc[tid] = va;
                 }
             } else {
                 for (int i = tid; i < kTile * 64; i += 128) {   // 64 keys x 64 pairs of halves, K and V
@@ -293,8 +332,10 @@ __global__ void __launch_bounds__(128) sparse_attn_kernel(const float* q, const 
                     const int kp = k0 + j;
                     uint32_t kw = 0, vw = 0;
                     if (kp <= p) {
-                        kw = *(const uint32_t*) (kc + ((size_t) kp * Hkv + g) * 128 + c * 2);
-                        vw = *(const uint32_t*) (vc + ((size_t) kp * Hkv + g) * 128 + c * 2);
+                        bool fh = false;
+                        const size_t r = kv_row(hs, kp, fh);
+                        kw = *(const uint32_t*) ((fh ? hs.kc : kc) + (r * Hkv + g) * 128 + c * 2);
+                        vw = *(const uint32_t*) ((fh ? hs.vc : vc) + (r * Hkv + g) * 128 + c * 2);
                     }
                     *(uint32_t*) &ks[j][c * 2] = kw;
                     *(uint32_t*) &vs[j][c * 2] = vw;
@@ -745,10 +786,10 @@ void rope_inv_freq(float theta, int n_rot, float* inv) {
 
 void qk_norm_rope(float* q, const float* k, const float* v, const float* qn1, const float* kn1, const int* pos, int T,
                   int Hq, int Hkv, int hd, int n_rot, const float* inv, float eps, uint16_t* kc, uint16_t* vc,
-                  cudaStream_t s, int ring, const KvI8& i8) {
+                  cudaStream_t s, int ring, const KvI8& i8, const KvHost& hs) {
     if (T <= 0) return;
     qk_kernel<<<dim3(T, Hq + 2 * Hkv), hd, 0, s>>>(q, k, v, qn1, kn1, pos, Hq, Hkv, n_rot, inv, eps, kc, vc, ring, i8.kc,
-                                                   i8.vc, i8.ks, i8.vs);
+                                                   i8.vc, i8.ks, i8.vs, hs);
     check("qk_norm_rope");
 }
 
@@ -775,14 +816,15 @@ void select_blocks(const float* bs, const int* pos, int T, int Hi, int nblk, int
 }
 
 void sparse_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* kept, const int* pos, int T,
-                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8) {
+                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8,
+                 const KvHost& hs) {
     if (T <= 0) return;
     if (i8.kc)
         sparse_attn_kernel<true><<<dim3(T, Hkv), 128, 0, s>>>(q, kc, vc, kept, pos, T, Hq, Hkv, topk, blk, scale, out,
-                                                              i8.kc, i8.vc, i8.ks, i8.vs);
+                                                              i8.kc, i8.vc, i8.ks, i8.vs, hs);
     else
         sparse_attn_kernel<false><<<dim3(T, Hkv), 128, 0, s>>>(q, kc, vc, kept, pos, T, Hq, Hkv, topk, blk, scale, out,
-                                                               nullptr, nullptr, nullptr, nullptr);
+                                                               nullptr, nullptr, nullptr, nullptr, hs);
     check("sparse_attn");
 }
 

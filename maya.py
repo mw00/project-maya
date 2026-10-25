@@ -4082,7 +4082,13 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--profile", str(MM3_PROFILE)]
     kept = keep_args(old.get("args") or [], args, ("--chunk", "--staging", "--cpu-threads", "--reserve-gb",
                                                     "--resident-cap", "--dspark", "--dspark-conf", "--vision",
-                                                    "--vision-gpu", "--tp", "--cache-gb", "--kv-cache"))
+                                                    "--vision-gpu", "--tp", "--cache-gb", "--kv-cache",
+                                                    "--kv-streaming", "--kv-resident"))
+    # KV streaming (maya-mm3 --kv-streaming on), as the GLM engine's: 32768 positions of each layer's K / V in VRAM
+    # (--kv-resident N sets another window), all of them in pinned RAM - a longer context leaves the VRAM to experts;
+    # 80 KB of RAM a context token in INT8, 160 KB in BF16 (10 / 20 GB at 128K)
+    if "--kv-streaming" not in args[:-1]:
+        args += ["--kv-streaming", "on"]
     # tensor parallel (maya-mm3 --tp): the GPUs in groups of 4 (or 2), the first alone when the others make whole
     # groups - each layer's work spread over a group's GPUs; on 3090 + 8 x 5060 Ti decode 27.7 -> 38 tok/s (code),
     # ~19 -> 32 (prose), prompts 35-70 -> ~100 tok/s

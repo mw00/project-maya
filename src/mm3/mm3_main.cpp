@@ -341,12 +341,15 @@ int sample(std::vector<float>& lg, const Req& r, const std::vector<int>& hist, s
     return draw(dist(lg.data(), (int) lg.size(), r, hist), rng);
 }
 
-int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor) {
+int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, bool kv_int8) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
+    for (const std::string& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the Monitor's GPU map)
     const auto& st0 = m.stats();
     std::printf("INFO engine=mm3 engine_kind=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld "
-                "expert_slots=%ld ram_slots=%ld dspark=%d\n", st0.resident, st0.experts, st0.resident, st0.pooled,
-                m.draft_block() > 0 && spec_on ? 1 : 0);
+                "expert_slots=%ld ram_slots=%ld dspark=%d kv=%s", st0.resident, st0.experts, st0.resident, st0.pooled,
+                m.draft_block() > 0 && spec_on ? 1 : 0, kv_int8 ? "int8" : "bf16");
+    if (st0.kv_ring > 0) std::printf(" kv_resident=%d", st0.kv_ring);   // (KV streaming: a layer's positions in VRAM)
+    std::printf("\n");
     if (const mm3::VisionGeo* vg = m.vision())   // (serve/mm3_vision.py's Geometry.from_info)
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
@@ -596,7 +599,8 @@ int usage() {
                  "usage: maya-mm3 --pack DIR --ids IDS|@FILE [--gen N] [--dump-logits FILE --last N] [--gpus LIST]\n"
                  "                [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]\n"
                  "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
-                 "                [--tp 1|2|4] [--cache-gb X] [--kv-cache bf16|int8] [--verbose]\n"
+                 "                [--tp 1|2|4] [--cache-gb X] [--kv-cache bf16|int8] [--kv-streaming on|off]\n"
+                 "                [--kv-resident N] [--verbose]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
@@ -607,6 +611,7 @@ int main(int argc, char** argv) {
     mm3::Options o;
     std::string ids_arg, dump, profile_out, batch, eos_arg, images, enc_rgb, enc_size, enc_out;
     bool serve_mode = false;
+    int kv_stream = -1;   // (--kv-streaming: -1 not given)
     int gen = 0, last = 1, ppl = 0;
     float dspark_conf = 0.7f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
     for (int i = 1; i < argc; ++i) {
@@ -642,6 +647,11 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = val() != "off";
         else if (a == "--tp") o.tp = std::atoi(val().c_str());
         else if (a == "--cache-gb") o.cache_gb = std::atof(val().c_str());
+        else if (a == "--kv-streaming") {   // (on: --kv-resident 32768 unless that is given; the context above it)
+            const std::string v = val();
+            if (v != "on" && v != "off") return usage();
+            kv_stream = v == "on" ? 1 : 0;
+        } else if (a == "--kv-resident") o.kv_resident = std::max(0, std::atoi(val().c_str()));
         else if (a == "--kv-cache") {
             const std::string v = val();
             if (v != "int8" && v != "bf16") return usage();
@@ -698,6 +708,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode)) return usage();
+    if (kv_stream == 0) o.kv_resident = 0;
+    else if (kv_stream == 1 && o.kv_resident == 0) o.kv_resident = 32768;
     if (!images.empty()) o.vision = true;
     std::vector<int> ids = ids_arg.empty() ? std::vector<int>{0} : parse_ids(ids_arg);
     if (ids.empty()) {
@@ -712,7 +724,7 @@ int main(int argc, char** argv) {
     }
     if (serve_mode) {
         std::vector<int> eos = eos_arg.empty() ? std::vector<int>{m.eos()} : parse_list(eos_arg);
-        return serve(m, eos, o.chunk, o.dspark, dspark_conf);
+        return serve(m, eos, o.chunk, o.dspark, dspark_conf, o.kv_int8);
     }
     const auto& st = m.stats();
     std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st.load_s,

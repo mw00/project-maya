@@ -40,6 +40,8 @@ struct Options {
                                   // copy waited for then (1: the next forward - plain decode then waits ~5 ms a token)
     int tp = 0;                   // > 0: the tensor-parallel path (mm3_tp.hpp) in groups of tp GPUs (1, 2 or 4)
     double cache_gb = 1.5;        // (tp) each GPU's expert cache (promote's slots), taken from its experts in VRAM
+    int kv_resident = 0;          // KV streaming (--kv-streaming on: 32768): the positions of each layer's K / V kept in
+                                  // VRAM (a ring), all of them in pinned host memory (0, or the context or less: off)
     bool kv_int8 = false;         // the K / V caches in INT8 (a scale a row of 128: half the memory, not exact - the
                                   // default BF16 is; the index-key cache stays BF16)
     bool verbose = false;
@@ -52,6 +54,8 @@ struct Stats {
     double vram_gb = 0;           // the resident experts' bytes (every member's slice)
     long pooled = 0;              // experts in the pinned pool (0: no pool - the misses read from the mapped files)
     double pinned_gb = 0;         // the pinned pool of the experts not in VRAM
+    int kv_ring = 0;              // KV streaming: the positions a layer's VRAM cache holds (0: all - off)
+    double kv_host_gb = 0;        // ... and the host memory holding every position
     long profiled = 0;            // routings counted (save_profile writes them)
     long cpu_experts = 0;         // routed experts the CPU lane computed
     long promoted = 0;            // experts copied into a staging slot because they kept coming back
@@ -77,6 +81,8 @@ public:
     int eos() const;
     const Stats& stats() const;
     std::vector<std::string> info_lines() const;
+    /// The Monitor's map of each GPU (serve/gpu_map.py's VRAM lines): what each part holds there, measured at the load.
+    std::vector<std::string> vram_lines() const;
     /// The routings counted so far (with the loaded profile's, if any) as a profile file.
     bool save_profile(const std::string& path, std::string& err) const;
     /// The DSpark draft (Options::dspark): its block (the most tokens a proposal has; 0 without the draft), and up to

@@ -27,12 +27,23 @@ struct KvI8 {
     float *ks = nullptr, *vs = nullptr;
 };
 
+/// KV streaming (--kv-streaming): the VRAM K / V caches a ring of `ring` rows - position p at row p % ring, tag[row] the
+/// position the row holds (-1: none) - and every position in host memory as well (pinned and mapped: rows [max_ctx]
+/// [Hkv][128] in the VRAM caches' format, kc / vc BF16 or i8 INT8).  Attention reads a key from VRAM when the ring holds
+/// it, else from the host over PCIe.  ring 0: off (the VRAM caches a row a position).
+struct KvHost {
+    int ring = 0;
+    int* tag = nullptr;
+    uint16_t *kc = nullptr, *vc = nullptr;
+    KvI8 i8;
+};
+
 /// q [T][Hq][hd] in place: the per-head RMSNorm (one [hd] weight w1 = 1 + w for every head) then NeoX RoPE on the
 /// first n_rot dims at pos[t]; k [T][Hkv][hd] the same and v as it is, both written to the caches at row pos[t] as
 /// BF16.  inv [n_rot / 2] on the device.
 void qk_norm_rope(float* q, const float* k, const float* v, const float* qn1, const float* kn1, const int* pos, int T,
                   int Hq, int Hkv, int hd, int n_rot, const float* inv, float eps, uint16_t* kc, uint16_t* vc,
-                  cudaStream_t s, int ring = 0, const KvI8& i8 = KvI8{});
+                  cudaStream_t s, int ring = 0, const KvI8& i8 = KvI8{}, const KvHost& hs = KvHost{});
 /// (ring > 0: the caches are rings of that many rows, position p at row p % ring - the DSpark draft's window.  Hq 0:
 ///  K and V alone)
 
@@ -54,7 +65,8 @@ void select_blocks(const float* bs, const int* pos, int T, int Hi, int nblk, int
 /// out [T][Hq][hd] (F32): each query head over its KV group's kept blocks (kept [Hkv][T][topk], -1 unused), the keys
 /// j <= pos[t] of them, softmax(q . k * scale) . v - exact (online softmax in F32).  hd = 128, Hq / Hkv = 16.
 void sparse_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* kept, const int* pos, int T,
-                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8 = KvI8{});
+                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8 = KvI8{},
+                 const KvHost& hs = KvHost{});
 
 /// The router over logits [T][E] (F32): s = sigmoid, chosen by s + bias (the K largest, ties to the lower expert),
 /// weights s / sum over the chosen -> top [T][K], w [T][K].

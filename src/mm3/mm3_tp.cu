@@ -251,6 +251,7 @@ struct TpEngine::Impl {
     Geo g;
     Stats st;
     std::vector<std::string> info;
+    std::vector<std::string> vram;           // the Monitor's VRAM lines (serve/gpu_map.py), measured at the load's end
 
     struct Member {
         int id = 0;
@@ -304,6 +305,7 @@ struct TpEngine::Impl {
         float *qn1 = nullptr, *kn1 = nullptr, *iqn1 = nullptr, *ikn1 = nullptr, *wiq = nullptr, *wik = nullptr;
         uint16_t *kc = nullptr, *vc = nullptr, *ic = nullptr;
         k::KvI8 i8;   // (--kv-cache int8: the K / V caches instead of kc / vc)
+        k::KvHost kvh;   // (--kv-streaming: the caches above a ring, every position in host memory too)
         uint8_t* res_base = nullptr;
         float* gate = nullptr;   // (member 0: the router, F32 [n_exp][dim])
     };
@@ -328,6 +330,11 @@ struct TpEngine::Impl {
     std::vector<void*> owned;
     std::vector<int> owned_dev;
     std::vector<void*> hosted;               // cudaHostAlloc'd
+    // the Monitor's map of each GPU (vram_lines): dalloc's bytes by what they hold, a device id's
+    enum { kAW, kAKV, kAAct, kAPrompt, kAPool, kADraft, kAN };
+    int acat = kAAct;
+    std::map<int, std::array<size_t, kAN>> acct;
+    std::map<int, size_t> acct_ic, acct_kvh;   // (the index-key caches, every member's whole; the host KV bytes)
     uint8_t* pool = nullptr;
     size_t plan_bytes = 0;
     std::vector<float> inv_freq;
@@ -413,6 +420,7 @@ struct TpEngine::Impl {
         }
         owned.push_back(v);
         owned_dev.push_back(dev);
+        acct[dev][(size_t) acat] += std::max<size_t>(n * sizeof(T), 16);
         p = (T*) v;
         return true;
     }
@@ -542,9 +550,11 @@ struct TpEngine::Impl {
             TK(cudaSetDevice(hm.id));
             if (!host_f32(pk, P + "norm.weight", 1.0f, norm1, err)) return false;
             Ex3 x;
+            acat = kAW;
             if (!ex3(pk, "language_model.lm_head", x, err) ||
                 !upload_slice(hm.id, "language_model.lm_head", 'n', 0, x.N, head, err))
                 return false;
+            acat = kAAct;
             if (!dalloc(hm.id, lg, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(lgh, (size_t) kWin * g.vocab, cudaHostAllocPortable, err)) return false;
             if (!halloc(xf, (size_t) kWin * g.dim, cudaHostAllocMapped | cudaHostAllocPortable, err) ||
@@ -567,7 +577,10 @@ struct TpEngine::Impl {
                     }
                     tap_of[(size_t) tl[j]] = (int) j;
                 }
-                if (!dalloc(hm.id, taps_d, tl.size() * (size_t) kChunk * g.dim, err) ||
+                acat = kADraft;
+                const bool tok = dalloc(hm.id, taps_d, tl.size() * (size_t) kChunk * g.dim, err);
+                acat = kAAct;
+                if (!tok ||
                     !halloc(taps_h, tl.size() * (size_t) kChunk * g.dim, cudaHostAllocMapped | cudaHostAllocPortable, err) ||
                     !halloc(ftap, kLine, cudaHostAllocMapped | cudaHostAllocPortable, err))
                     return false;
@@ -635,6 +648,13 @@ struct TpEngine::Impl {
         k::rope_inv_freq(g.theta, g.n_rot, inv_freq.data());
         plan_bytes = (size_t) kWin * 8 * 8 * 2 + (size_t) kWin * 8 * 4 * 3 + 64;
         const size_t nblk = (size_t) (o.max_ctx + g.blk - 1) / g.blk;
+        // KV streaming (--kv-resident): the VRAM caches a ring of the last kv_ring positions (whole blocks, 4096 at
+        // least - more than a prompt chunk), the rest of the context read from host memory; 0: all in VRAM
+        int kv_ring = 0;
+        if (o.kv_resident > 0) {
+            kv_ring = std::max(4096, (o.kv_resident + g.blk - 1) / g.blk * g.blk);
+            if (kv_ring >= o.max_ctx) kv_ring = 0;
+        }
         // the members' scratch, the groups' mapped buffers
         for (Group& gr : G) {
             const int t = (int) gr.mem.size();
@@ -657,6 +677,7 @@ struct TpEngine::Impl {
                     !A(m.rlog_d, (size_t) kWin * g.n_exp))
                     return false;
                 TK(cudaMemset(m.counter, 0, 64));
+                acat = kAPrompt;
                 {   // the prompt path's scratch
                     const size_t C = kChunk, rows = C * g.k_exp;
                     const int ffd = std::max(mfd, mfss);
@@ -671,6 +692,7 @@ struct TpEngine::Impl {
                         return false;
                     TK(cudaMemset(m.p_zero, 0, C * g.dim * 4));
                 }
+                acat = kAAct;
                 TK(cudaMemcpy(m.inv, inv_freq.data(), inv_freq.size() * 4, cudaMemcpyHostToDevice));
                 if (!halloc(m.pos_h, (size_t) kChunk, cudaHostAllocPortable, err)) return false;
                 if (!x3::prepare(m.s)) {
@@ -691,6 +713,7 @@ struct TpEngine::Impl {
             gr.seq_out.assign((size_t) t, 0);
         }
         // the layers' slices, member by member
+        acat = kAW;
         for (int li = 0; li < g.n_layers; ++li) {
             Layer& l = L[(size_t) li];
             Group& gr = G[(size_t) l.group];
@@ -776,13 +799,62 @@ struct TpEngine::Impl {
                         !upload_slice(dv, N + "mlp.down_proj", 'k', j * mfd, (j + 1) * mfd, S.md, err))
                         return false;
                 }
-                const size_t cache = (size_t) o.max_ctx * mkv * g.hd;
+                // (KV streaming: the VRAM caches a ring of kv_ring rows, tagged - the host's below)
+                acat = kAKV;
+                const size_t cache = (size_t) (kv_ring > 0 ? kv_ring : o.max_ctx) * mkv * g.hd;
                 if (o.kv_int8 ? !dalloc(dv, S.i8.kc, cache, err) || !dalloc(dv, S.i8.vc, cache, err) ||
                                     !dalloc(dv, S.i8.ks, cache / g.hd, err) || !dalloc(dv, S.i8.vs, cache / g.hd, err)
                               : !dalloc(dv, S.kc, cache, err) || !dalloc(dv, S.vc, cache, err))
                     return false;
                 if (!dalloc(dv, S.ic, (size_t) o.max_ctx * g.ix_dim, err)) return false;
+                acct_ic[dv] += (size_t) o.max_ctx * g.ix_dim * 2;
+                if (kv_ring > 0) {
+                    S.kvh.ring = kv_ring;
+                    if (!dalloc(dv, S.kvh.tag, (size_t) kv_ring, err)) return false;
+                    TK(cudaMemset(S.kvh.tag, 0xff, (size_t) kv_ring * 4));
+                }
+                acat = kAW;
             }
+        }
+        acat = kAAct;
+        // KV streaming: every slice's whole cache in host memory (one pinned, mapped allocation, carved), written as
+        // the VRAM ring is and read where the ring no longer holds a key
+        if (kv_ring > 0) {
+            const size_t eb = o.kv_int8 ? 1 : 2;
+            auto bytes_of = [&](int mkv) {
+                const size_t rows = (size_t) o.max_ctx * mkv;
+                return 2 * rows * g.hd * eb + (o.kv_int8 ? 2 * rows * 4 : 0);
+            };
+            size_t total = 0;
+            for (const Layer& l : L) {
+                const Group& gr = G[(size_t) l.group];
+                total += gr.mem.size() * bytes_of(g.n_kv / (int) gr.mem.size());
+            }
+            uint8_t* kvp = nullptr;
+            if (!halloc(kvp, total, cudaHostAllocMapped | cudaHostAllocPortable, err)) return false;
+            size_t off = 0;
+            for (Layer& l : L) {
+                const Group& gr = G[(size_t) l.group];
+                const int mkv = g.n_kv / (int) gr.mem.size();
+                const size_t rows = (size_t) o.max_ctx * mkv, nb = bytes_of(mkv);
+                for (size_t j = 0; j < gr.mem.size(); ++j) {
+                    k::KvHost& h = l.sl[j].kvh;
+                    uint8_t* b = kvp + off;
+                    if (o.kv_int8) {
+                        h.i8.kc = (int8_t*) b;
+                        h.i8.vc = (int8_t*) (b + rows * g.hd);
+                        h.i8.ks = (float*) (b + 2 * rows * g.hd);
+                        h.i8.vs = h.i8.ks + rows;
+                    } else {
+                        h.kc = (uint16_t*) b;
+                        h.vc = h.kc + rows * g.hd;
+                    }
+                    off += nb;
+                    acct_kvh[M[(size_t) gr.mem[j]].id] += nb;
+                }
+            }
+            st.kv_ring = kv_ring;
+            st.kv_host_gb = (double) total / (1u << 30);
         }
         // the profile: routings [layer][expert]
         prof.assign((size_t) g.n_layers * g.n_exp, 0);
@@ -798,6 +870,7 @@ struct TpEngine::Impl {
             }
             if (!have_prof) std::fill(prof.begin(), prof.end(), 0u);
         }
+        acat = kAPool;
         // the routed experts in VRAM, group by group: the most routed of its layers first while its tightest member
         // keeps reserve_gb free (each member holds its slice of every one)
         for (size_t gi = 0; gi < G.size(); ++gi) {
@@ -917,6 +990,7 @@ struct TpEngine::Impl {
             gr.slot_base.assign((size_t) t, nullptr);
             gr.cs.assign((size_t) t, nullptr);
             gr.slot_ev.assign((size_t) t, {});
+            acat = kAPool;
             for (int j = 0; j < t; ++j) {
                 Member& m = M[(size_t) gr.mem[(size_t) j]];
                 if (!dalloc(m.id, gr.slot_base[(size_t) j], (size_t) gr.n_slots * gr.slot_bytes, err)) return false;
@@ -927,6 +1001,7 @@ struct TpEngine::Impl {
             gr.slot_owner.assign((size_t) gr.n_slots, -1);
             gr.slot_pend.assign((size_t) gr.n_slots, -1);
             gr.slot_iss.assign((size_t) gr.n_slots, 0);
+            acat = kAAct;
             gr.slot_used.assign((size_t) gr.n_slots, -1);
         }
         for (Layer& l : L)
@@ -1006,7 +1081,45 @@ struct TpEngine::Impl {
             info.push_back("CUDA" + std::to_string(m.id) + ": " + std::to_string(fr >> 20) + " MB free");
         }
         info.push_back("CPU lane: " + std::to_string(lane->threads()) + " threads");
-        if (o.kv_int8) info.push_back("KV cache: INT8 (a scale a row of 128)");
+        {
+            std::string kv = std::string("KV cache: ") + (o.kv_int8 ? "INT8 (a scale a row of 128)" : "BF16");
+            if (kv_ring > 0)
+                kv += ", streamed: " + std::to_string(kv_ring) + " positions a layer in VRAM, all " +
+                      std::to_string(o.max_ctx) + " in host memory (" + std::to_string((int) (st.kv_host_gb + 0.5)) +
+                      " GB pinned)";
+            info.push_back(kv);
+        }
+        // the Monitor's map of each GPU: what each part holds there - the dense weights, the KV caches (less tp's
+        // copies), the scratch, the DSpark draft, the routed experts' slots (resident and the cache), the vision tower,
+        // the prompt path's buffers; tp: what every member of a group holds whole (the index-key caches), less one
+        for (const Group& gr : G)
+            for (int mi : gr.mem) {
+                const Member& m = M[(size_t) mi];
+                cudaSetDevice(m.id);
+                size_t fr = 0, tot = 0;
+                cudaMemGetInfo(&fr, &tot);
+                std::array<size_t, kAN> a{};
+                if (auto it = acct.find(m.id); it != acct.end()) a = it->second;
+                const size_t tn = gr.mem.size();
+                const size_t ic = acct_ic.count(m.id) ? acct_ic.at(m.id) : 0;
+                const size_t tpb = tn > 1 ? ic / tn * (tn - 1) : 0;
+                const bool head = mi == head_m;
+                const size_t drafter = a[kADraft] + (head && draftm ? draftm->bytes() : 0);
+                const size_t vision = vis && vis->device() == m.id ? vis->bytes() : 0;
+                long long slots = gr.n_slots;
+                for (int li = gr.l0; li < gr.l1; ++li) slots += (long long) L[(size_t) li].res_ids.size();
+                char pci[32] = "-";
+                if (cudaDeviceGetPCIBusId(pci, sizeof pci, m.id) != cudaSuccess) std::snprintf(pci, sizeof pci, "-");
+                char b[512];
+                std::snprintf(b, sizeof b,
+                              "VRAM dev=%d pci=%s total=%zu free=%zu weights=%zu kv=%zu kv_ram=%zu act=%zu drafter=%zu "
+                              "window=0 pool=%zu tail=0 borrow=0 vision=0 vision_own=%zu prompt=%zu tp=%zu tp_n=%zu "
+                              "slots=%lld ctx=%d layers=%d-%d",
+                              m.id, pci, tot, fr, a[kAW], a[kAKV] - std::min(a[kAKV], tpb),
+                              acct_kvh.count(m.id) ? acct_kvh.at(m.id) : 0, a[kAAct], drafter, a[kAPool], vision,
+                              a[kAPrompt], tpb, tn, slots, o.max_ctx, gr.l0, gr.l1 - 1);
+                vram.push_back(b);
+            }
         st.load_s = now() - t0;
         return true;
     }
@@ -1174,7 +1287,7 @@ struct TpEngine::Impl {
             x3::gemm_rows(S.k, m.p_xn16, g.dim, T, m.p_k, mkv * g.hd, 0.0f, m.s);
             x3::gemm_rows(S.v, m.p_xn16, g.dim, T, m.p_v, mkv * g.hd, 0.0f, m.s);
             k::qk_norm_rope(m.p_q, m.p_k, m.p_v, S.qn1, S.kn1, m.p_pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps, S.kc,
-                            S.vc, m.s, 0, S.i8);
+                            S.vc, m.s, 0, S.i8, S.kvh);
             if (cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, mix * g.ix_dim, T, g.dim, &one, S.wiq, g.dim, m.p_xn,
                             g.dim, &zero, m.p_iq, mix * g.ix_dim) != CUBLAS_STATUS_SUCCESS ||
                 cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, g.ix_dim, T, g.dim, &one, S.wik, g.dim, m.p_xn, g.dim,
@@ -1186,7 +1299,7 @@ struct TpEngine::Impl {
                                m.s);
             k::block_scores(m.p_iq, S.ic, m.p_pos, T, mix, nblk, g.blk, m.p_bs, m.s);
             k::select_blocks(m.p_bs, m.p_pos, T, mix, nblk, g.blk, g.topk, m.p_kept, m.s);
-            k::sparse_attn(m.p_q, S.kc, S.vc, m.p_kept, m.p_pos, T, mh, mkv, g.topk, g.blk, scale, m.p_att, m.s, S.i8);
+            k::sparse_attn(m.p_q, S.kc, S.vc, m.p_kept, m.p_pos, T, mh, mkv, g.topk, g.blk, scale, m.p_att, m.s, S.i8, S.kvh);
             k::to_f16(m.p_att, T, mh * g.hd, mh * g.hd, m.p_att16, mh * g.hd, m.s);
             x3::gemm_rows(S.o, m.p_att16, mh * g.hd, T, m.p_out, g.dim, 0.0f, m.s);
             k::publish(m.p_out, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
@@ -1499,13 +1612,13 @@ struct TpEngine::Impl {
                 return false;
             }
             k::qk_norm_rope(m.q, m.k, m.v, S.qn1, S.kn1, m.pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps, S.kc, S.vc, m.s, 0,
-                            S.i8);
+                            S.i8, S.kvh);
             k::rows_dot(S.wiq, mix * g.ix_dim, g.dim, m.xn, T, m.iq, m.s);
             k::rows_dot(S.wik, g.ix_dim, g.dim, m.xn, T, m.ik, m.s);
             k::index_norm_rope(m.iq, m.ik, S.iqn1, S.ikn1, m.pos, T, mix, g.ix_dim, g.n_rot, m.inv, g.eps, S.ic, m.s);
             k::block_scores(m.iq, S.ic, m.pos, T, mix, nblk, g.blk, m.bs, m.s);
             k::select_blocks(m.bs, m.pos, T, mix, nblk, g.blk, g.topk, m.kept, m.s);
-            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s, S.i8);
+            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s, S.i8, S.kvh);
             const x3::MvJob oj = job(S.o, m.att, mh * g.hd, m.out, g.dim);
             if (!x3::mv(&oj, 1, m.s)) {
                 err = "tp: mv o";
@@ -2029,6 +2142,7 @@ int TpEngine::bos() const { return p->g.bos; }
 int TpEngine::eos() const { return p->g.eos; }
 const Stats& TpEngine::stats() const { return p->st; }
 std::vector<std::string> TpEngine::info_lines() const { return p->info; }
+std::vector<std::string> TpEngine::vram_lines() const { return p->vram; }
 bool TpEngine::save_profile(const std::string& path, std::string& err) const {
     std::FILE* f = std::fopen(path.c_str(), "wb");
     if (!f || std::fwrite(p->prof.data(), 4, p->prof.size(), f) != p->prof.size()) {
