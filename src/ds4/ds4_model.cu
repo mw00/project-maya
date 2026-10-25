@@ -211,21 +211,44 @@ std::vector<std::vector<os::Core>> node_threads() {
 // anonymous memory on one NUMA node (node < 0: wherever the first touch puts it), transparent huge pages
 void* node_map(size_t bytes, int node, int n_nodes) { return os::anon_alloc(bytes, node, n_nodes); }
 void pin_self(int cpu) { os::pin_self(cpu); }
+// ZFS's reclaimable ARC is omitted from Linux MemAvailable (as in Maya's GLM path).
+// Count only bytes above its floor; the cgroup limits below still cap the result.
+uint64_t zfs_arc_reclaimable() {
+    std::istringstream stats(read_file("/proc/spl/kstat/zfs/arcstats"));
+    uint64_t size = 0, floor = 0;
+    bool have_size = false, have_floor = false;
+    std::string line;
+    while (std::getline(stats, line)) {
+        std::istringstream row(line);
+        std::string key;
+        unsigned type = 0;
+        uint64_t value = 0;
+        if (!(row >> key >> type >> value)) continue;
+        if (key == "size") { size = value; have_size = true; }
+        else if (key == "c_min") { floor = value; have_floor = true; }
+    }
+    return have_size && have_floor && size > floor ? size - floor : 0;
+}
 // the RAM this process can still get: MemAvailable, and below it the tightest cgroup v2 limit on the way to the root
 // (its limit less what is charged, the page cache counted as free: the kernel takes it back); ~0: not known
 uint64_t ram_avail() {
 #if defined(_WIN32)
     return os::ram_avail();
 #endif
-    uint64_t avail = ~uint64_t{0};
+    uint64_t avail = ~uint64_t{0}, total = 0;
     {
         std::istringstream mi(read_file("/proc/meminfo"));
         std::string k;
         uint64_t kb = 0;
         while (mi >> k >> kb) {
             if (k == "MemAvailable:") avail = kb << 10;
+            else if (k == "MemTotal:") total = kb << 10;
             mi.ignore(64, '\n');
         }
+    }
+    if (avail != ~uint64_t{0}) {
+        const uint64_t ceiling = total != 0 ? total : ~uint64_t{0};
+        avail += std::min(zfs_arc_reclaimable(), ceiling > avail ? ceiling - avail : 0);
     }
     std::string cg = read_file("/proc/self/cgroup");   // "0::/user.slice/..."
     const size_t at = cg.find("0::");
