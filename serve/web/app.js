@@ -239,11 +239,23 @@ function modelLogo(name) {
   return m ? `<span class="side__logo${m[2] ? " side__logo--mono" : ""}"><img src="web/logo-${m[1]}.svg" alt="" ` +
              `width="20" height="20"></span>` : "";
 }
+// a model id as people write the model's name, for the sidebar: "glm-5.3-flash" -> "GLM 5.3 Flash",
+// "deepseek-v4.1-flash" -> "DeepSeek V4.1 Flash", "qwen3.8-flash-next" -> "Qwen3.8 Flash Next" (the id itself on hover)
+const NAME_WORDS = {glm: "GLM", deepseek: "DeepSeek", minimax: "MiniMax", qwen: "Qwen"};
+function modelDisplayName(id) {
+  return String(id || "").split(/[-_\s]+/).filter(Boolean).map((w) => {
+    const lw = w.toLowerCase(), m = lw.match(/^([a-z]+)(\d.*)$/);
+    if (NAME_WORDS[lw]) return NAME_WORDS[lw];
+    if (m && NAME_WORDS[m[1]]) return NAME_WORDS[m[1]] + m[2];   // (a brand with its version: qwen3.8)
+    if (/^[a-z]\d/.test(lw)) return lw.toUpperCase();             // (a version: v4.1, m3.1)
+    return lw.charAt(0).toUpperCase() + lw.slice(1);
+  }).join(" ");
+}
 function renderModelLine() {
   const ctx = health.max_context ? `${ctxfmt(health.max_context)} context` : "";
   const ver = health.version ? `v${health.version}` : "";
-  $("side-model").innerHTML = `${modelLogo(health.model)}<span class="side__model-text"><b>${esc(health.model)}</b>` +
-                              `${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
+  $("side-model").innerHTML = `${modelLogo(health.model)}<span class="side__model-text" title="${esc(health.model)}">` +
+                              `<b>${esc(modelDisplayName(health.model))}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
   $("chat-empty-model").textContent = [health.model, ctx, ver ? `Project Maya ${ver}` : ""].filter(Boolean).join(" · ");
 }
 
