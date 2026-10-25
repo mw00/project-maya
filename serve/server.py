@@ -56,7 +56,7 @@ from serve import ds4_vision, gpu_map, mm3_vision  # noqa: E402
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             anthropic_to_messages, deepseek_effort_kwargs, deepseek_images, effort_kwargs, effort_level,
-                            literal_tags, mark_literals, media_of, openai_to_messages, unmark_literals)
+                            effort_name, literal_tags, mark_literals, media_of, openai_to_messages, unmark_literals)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.responses import (ResponseStore, input_items, input_page, normalize_request,  # noqa: E402
                              new_response, response_collect, response_events)
@@ -3547,8 +3547,9 @@ def make_handler(svc: Service):
             elif path == "/health":
                 # the run config's recommended settings: the web app's Chat defaults until its user picks their own
                 rec = {k: v for k, v in svc.sampling_defaults.items() if k in ("temperature", "top_p", "top_k")}
-                if svc.default_effort:
-                    rec["reasoning_effort"] = effort_level(svc.default_effort) or svc.default_effort
+                if svc.default_effort:   # (MiniMax's by its own five names)
+                    rec["reasoning_effort"] = (effort_name if getattr(svc.template, "minimax", False) else effort_level)(
+                        svc.default_effort) or svc.default_effort
                 self._json(200, {"status": "updating" if svc.updater.busy() else
                                            "reloading" if svc.reloading() else "ok",
                                  "max_context": svc.engine.max_context, "model": svc.model,
@@ -4115,10 +4116,10 @@ def clean_shared_defaults(d) -> dict:
         if value is None or value == "":
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if key == "reasoning_effort":
+        if key == "reasoning_effort":   # (kept by its own name: medium / xhigh are MiniMax's, GLM's High / Max else)
             if effort_level(value) is None:
-                raise ValueError("reasoning_effort: none, low, high or max")
-            value = effort_level(value)
+                raise ValueError("reasoning_effort: none, low, medium, high, xhigh or max")
+            value = effort_name(value)
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")
@@ -4482,7 +4483,8 @@ def main() -> int:
             raise SystemExit(f"[maya] config reasoning_effort: {e}")
         svc.default_effort = cfg["reasoning_effort"]
         # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
-        level = effort_level(svc.default_effort) or (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
+        level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
+            (f"{svc.default_effort} of 100" if type(svc.default_effort) is int
                                                      else "none")
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",

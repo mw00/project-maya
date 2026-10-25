@@ -210,12 +210,16 @@ async function loadHealth() {
     // the server's recommended settings for this model (its run config) replace the built-in Chat defaults, and
     // are what the Chat uses until its user applies settings of their own
     const d = health.defaults || {};
+    // each model keeps its own Chat settings (DeepSeek's are not GLM's), and its own thinking levels' meaning -
+    // MiniMax six of them, Max the default
+    thinkFamily = /deepseek/i.test(health.model || "") ? "deepseek" : /minimax/i.test(health.model || "") ? "minimax" : "glm";
+    THINKING = THINK_LEVELS[thinkFamily];
+    if (thinkFamily === "minimax") DEFAULTS.thinking = "max";
     if (THINKING.includes(d.reasoning_effort)) DEFAULTS.thinking = d.reasoning_effort;   // the server sends GLM's names
     if (d.temperature !== undefined) DEFAULTS.temperature = d.temperature;
     if (d.top_p !== undefined) DEFAULTS.top_p = d.top_p;
     if (d.temperature !== undefined || d.top_k !== undefined) DEFAULTS.top_k = d.top_k !== undefined ? d.top_k : 0;
-    // each model keeps its own Chat settings (DeepSeek's are not GLM's), and its own thinking levels' meaning
-    samplingKey = /deepseek/i.test(health.model || "") ? "sampling_deepseek" : "sampling";
+    samplingKey = {deepseek: "sampling_deepseek", minimax: "sampling_minimax"}[thinkFamily] || "sampling";
     settings = {...DEFAULTS, ...store.get(samplingKey, {})};
     if (!THINKING.includes(settings.thinking)) settings.thinking = DEFAULTS.thinking;
     thinkingTitles();
@@ -1291,9 +1295,13 @@ function previewHtml(code) {
 // "Medium" was GLM's High and its "High" GLM's Max: they are translated once (thinking_v 2)
 const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0, max: "", seed: "", show: true,
                   mcp: true, system: "", sys_default: false, thinking_v: 2};
-const THINKING = ["none", "low", "high", "max"];
+// (MiniMax-M3.1: its template's five - low adaptive, the rest thinking on at that effort - and Off)
+const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
+                      minimax: ["none", "low", "medium", "high", "xhigh", "max"]};
+let thinkFamily = "glm";
+let THINKING = THINK_LEVELS.glm;
 const glmLevel = (v, v2) => (v2 ? v : {medium: "high", high: "max", xhigh: "max"}[v] || v);
-let samplingKey = "sampling";        // the running model's saved settings (loadHealth: DeepSeek's own key)
+let samplingKey = "sampling";        // the running model's saved settings (loadHealth: DeepSeek's, MiniMax's own key)
 let settings = {...DEFAULTS, ...store.get(samplingKey, {})};
 // the thinking buttons say what each level is for the running model
 const THINK_TITLES = {
@@ -1301,10 +1309,19 @@ const THINK_TITLES = {
         max: "GLM's Max: the most thorough, and the longest"},
   deepseek: {none: "No thinking: it answers right away", low: "DeepSeek's Low: reasoning effort 50",
              high: "DeepSeek's High: reasoning effort 75", max: "DeepSeek's Max: reasoning effort 100, the most thorough"},
+  minimax: {none: "No thinking: it answers right away", low: "MiniMax's Low: it decides whether to think, low effort",
+            medium: "MiniMax's Medium: thinks, medium effort", high: "MiniMax's High: thinks it through",
+            xhigh: "MiniMax's XHigh: thinks hard, extra-high effort", max: "MiniMax's Max: the most thorough, and the longest"},
 };
+const THINK_SAYS = {none: "answers right away", low: "a short think", medium: "a moderate think", high: "thinks it through",
+                    xhigh: "thinks hard", max: "the most thorough, the longest"};
 function thinkingTitles() {
-  const t = THINK_TITLES[samplingKey === "sampling_deepseek" ? "deepseek" : "glm"];
-  for (const b of $("s-thinking").children) if (t[b.dataset.v]) b.title = t[b.dataset.v];
+  const t = THINK_TITLES[thinkFamily];
+  for (const b of $("s-thinking").children) {
+    if (t[b.dataset.v]) b.title = t[b.dataset.v];
+    b.hidden = !THINKING.includes(b.dataset.v);
+  }
+  $("s-thinking").classList.toggle("seg--6", THINKING.length === 6);
 }
 if (settings.thinking_v !== 2) { settings.thinking = glmLevel(settings.thinking, false); settings.thinking_v = 2; }
 if (!THINKING.includes(settings.thinking)) settings.thinking = "high";
@@ -2365,8 +2382,8 @@ function outputs() {
   $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "a short think", high: "thinks it through",
-                                       max: "the most thorough, the longest"}[sel.dataset.v] +
+  $("o-thinking").textContent = sel ? (thinkFamily === "minimax" && sel.dataset.v === "low" ? "it decides whether to think"
+                                       : THINK_SAYS[sel.dataset.v]) +
     (sel.dataset.v === DEFAULTS.thinking ? " (default)" : "") : "";
   $("o-topk").textContent = +$("s-topk").value > 0 ? $("s-topk").value : "off";
   $("o-minp").textContent = +$("s-minp").value > 0 ? (+$("s-minp").value).toFixed(2) : "off";
@@ -2395,7 +2412,7 @@ for (const b of $("s-thinking").children) b.onclick = () => selectThinking(b);
 $("s-thinking").addEventListener("keydown", (e) => {
   if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;
   e.preventDefault();
-  const items = [...$("s-thinking").children];
+  const items = [...$("s-thinking").children].filter((x) => !x.hidden);
   const i = items.findIndex((x) => x.getAttribute("aria-checked") === "true");
   const next = items[(i + (e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : items.length - 1)) % items.length];
   selectThinking(next);

@@ -435,6 +435,8 @@ body:not([data-tab="chat"]) .chats__search, body:not([data-tab="chat"]) .chats__
 .drawer-section:not(:first-child) { padding-top: var(--st-s-2); border-top: 1px solid var(--st-line-soft); }
 .st-textarea { height: auto; min-height: 76px; padding: 10px 14px; resize: vertical; font: 400 var(--st-fs-md)/1.45 var(--st-font); }
 .seg--3 { grid-template-columns: repeat(3, 1fr); }
+.seg--6 { grid-template-columns: repeat(6, 1fr); }   /* (MiniMax's six thinking levels) */
+.seg--6 button { font-size: 12px; }
 .seg button[aria-pressed="true"] { background: var(--st-surface-3); color: var(--st-ink); font-weight: 650; }
 .ctx-warn { color: var(--st-warn-text); }
 .dirty-bar { position: sticky; bottom: 0; display: flex; align-items: center; gap: var(--st-s-2); flex-wrap: wrap; padding: 10px 12px;

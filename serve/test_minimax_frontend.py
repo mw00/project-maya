@@ -14,7 +14,7 @@ import random
 import unittest
 from pathlib import Path
 
-from serve.frontend import ChatTemplate, MINIMAX_NS, OutputParser
+from serve.frontend import ChatTemplate, MINIMAX_NS, OutputParser, effort_kwargs
 
 NS = MINIMAX_NS
 TEMPLATE = Path(os.environ.get("MAYA_MM3_TEMPLATE",
@@ -109,6 +109,31 @@ class Template(unittest.TestCase):
         self.assertTrue(off.endswith("]~b]ai\n</mm:think>"))
         on = tpl.render(CONVERSATION, tools=TOOLS, add_generation_prompt=True, reasoning_effort="high")
         self.assertTrue(on.endswith("]~b]ai\n<mm:think>"))
+
+
+
+class EffortNames(unittest.TestCase):
+    def test_kwargs(self):   # (GLM's four for every template, MiniMax's own word beside them)
+        self.assertEqual(effort_kwargs("high"), {"reasoning_effort": "high"})
+        self.assertEqual(effort_kwargs("medium"), {"reasoning_effort": "high", "effort_name": "medium"})
+        self.assertEqual(effort_kwargs("XHigh"), {"reasoning_effort": "max", "effort_name": "xhigh"})
+        self.assertEqual(effort_kwargs("maximum"), {"reasoning_effort": "max"})
+        self.assertEqual(effort_kwargs("none"), {"enable_thinking": False})
+
+
+@unittest.skipUnless(TEMPLATE.exists(), f"no MiniMax chat template at {TEMPLATE}")
+class Effort(unittest.TestCase):
+    def test_five_levels(self):
+        tpl = ChatTemplate(TEMPLATE)
+        msgs = [{"role": "user", "content": "Hi"}]
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            out = tpl.render(msgs, None, **effort_kwargs(level))
+            self.assertIn(f"<effort>{level}</effort>", out, level)
+            self.assertNotIn("effort_name", out)
+            self.assertEqual(out.endswith("<mm:think>"), level != "low", level)   # (low: adaptive, no prefix)
+        off = tpl.render(msgs, None, **effort_kwargs("none"))
+        self.assertTrue(off.endswith("</mm:think>"))
+        self.assertNotIn("<effort>", off)
 
 
 if __name__ == "__main__":

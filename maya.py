@@ -467,6 +467,7 @@ MM3_CONTEXTS = [32768, 65536, 131072, 262144]
 MM3_DEFAULT_CONTEXT = 65536
 MM3_MODEL_NAME = "minimax-m3.1-flash"
 MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}   # MiniMax's recommendation
+MM3_EFFORT = "max"                                 # thinking level for requests that name none (its five: low .. max)
 MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weights, the experts not in VRAM pinned
 MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
 FAMILIES = ("glm", "deepseek", "minimax")
@@ -4100,7 +4101,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--vision", "on"]
     cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": old.get("sampling") or dict(MM3_SAMPLING),
+           "sampling": old.get("sampling") or dict(MM3_SAMPLING), "reasoning_effort": MM3_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
     for k in ("reasoning_effort", "host", "api_key", "cors_origins", "mcp_servers"):
         if old.get(k) is not None:

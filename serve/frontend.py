@@ -60,6 +60,7 @@ class ChatTemplate:
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
+        name = kwargs.pop("effort_name", None)   # (effort_kwargs: the client's level where it is not GLM's - MiniMax's)
         if self.deepseek:
             # Pinned, reviewed upstream encoder: keep its roles, tool ordering,
             # namespace semantics, tasks and thinking policy in one implementation.
@@ -88,11 +89,12 @@ class ChatTemplate:
                     prompt = prompt[:-len(header)]
             return prompt
         if self.minimax:
-            # Maya's levels: off -> thinking disabled (the turn opens with </mm:think>); low -> adaptive (the model
-            # decides) at effort low; high / max -> thinking enabled (the turn opens with <mm:think>) at that effort;
-            # none named -> the template's default, adaptive
+            # its own five levels: off -> thinking disabled (the turn opens with </mm:think>); low -> adaptive (the
+            # model decides) at effort low; medium / high / xhigh / max -> thinking enabled (the turn opens with
+            # <mm:think>) at that effort; none named -> the template's default, adaptive
             off = kwargs.pop("enable_thinking", None) is False
             level = kwargs.pop("reasoning_effort", None)
+            level = name or level
             if off:
                 kwargs["thinking_mode"] = "disabled"
             elif level in ("low", "medium", "high", "xhigh", "max"):
@@ -141,6 +143,9 @@ VIDEO_PARTS = ("video_url", "input_video", "video")
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
           "low": "low", "medium": "high", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
 QWEN_EFFORT = {"low": "low", "high": "medium", "max": "xhigh"}   # the same levels in a Qwen3.x template's words
+# MiniMax-M3.1's template has five (low, medium, high, xhigh, max): the client's own word among them reaches it
+# (effort_kwargs' "effort_name"), the other templates get the four above
+EFFORT_NAMES = ("low", "medium", "high", "xhigh", "max")
 
 
 def effort_level(value) -> str | None:
@@ -153,6 +158,16 @@ def effort_level(value) -> str | None:
     return (EFFORT[key] or "none") if key in EFFORT else None
 
 
+def effort_name(value) -> str | None:
+    """A client's spelling -> MiniMax's level name (none / low / medium / high / xhigh / max); None when none is given
+    or it is unknown."""
+    level = effort_level(value)
+    if level is None or level == "none":
+        return level
+    key = str(value).strip().lower()
+    return key if key in EFFORT_NAMES else level
+
+
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
     if value is None or value == "":
@@ -161,9 +176,12 @@ def effort_kwargs(value) -> dict:
         return {"enable_thinking": False}
     key = str(value).strip().lower()
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, high or max")
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, xhigh or max")
     level = EFFORT[key]
-    return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
+    if level is None:
+        return {"enable_thinking": False}
+    name = effort_name(value)
+    return {"reasoning_effort": level} if name == level else {"reasoning_effort": level, "effort_name": name}
 
 
 def deepseek_effort_kwargs(value) -> dict:
