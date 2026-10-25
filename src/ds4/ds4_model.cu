@@ -3499,6 +3499,23 @@ struct Model::Impl {
                 bool all_flow = true;
                 for (const auto& cp : chunks) all_flow = all_flow && (cp == nullptr || cp->ring == nullptr || cp->flow);
                 if (all_flow && std::getenv("DS4_CHUNK_MIN") == nullptr) chunk_min = kFlowChunkMin;
+                if (down_share()) {   // (DS4_FLOW_DOWN_SHARE: a count a (layer, expert) - the members' flows share it)
+                    bool on = tp_uneven && flow_tp;
+                    for (const auto& cp : chunks) on = on && (cp == nullptr || cp->ring == nullptr || cp->flow);
+                    if (on) {
+                        int ne = 0;
+                        for (const Layer& l : L) ne = std::max(ne, l.n_exp);
+                        down_stride = (size_t) ne;
+                        down_reads.reset(new std::atomic<uint8_t>[L.size() * down_stride]);
+                        for (size_t i = 0; i < L.size() * down_stride; ++i) down_reads[i].store(0);
+                    }
+                    std::fprintf(stderr, "%s",
+                                 on ? "ds4: DS4_FLOW_DOWN_SHARE: a tensor-parallel group's members read each streamed "
+                                      "expert's down from the files once, through the page cache (dropped once every "
+                                      "member read it)\n"
+                                    : "ds4: DS4_FLOW_DOWN_SHARE: no tensor-parallel members on the prompt path's "
+                                      "flow - not used\n");
+                }
                 if (tp_uneven && flow_tp) {   // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN: the members that stream their parts)
                     std::string on;
                     for (size_t di = 0; di < chunks.size(); ++di)
@@ -4182,6 +4199,20 @@ struct Model::Impl {
         }
         return true;
     }
+    // DS4_FLOW_DOWN_SHARE=1 (unset: as before): a tensor-parallel group's members each read the whole down of every
+    // expert the flow streams from the files (mx_read_off: r 2 is never cut) - unbuffered, so both from the disk, ~30 %
+    // of the bytes (2x RX 7900 XTX, a prof load: the files' 35 GB at 32K, 168 GB at 130K for the pair, ~3 GB/s).  On:
+    // that read goes through the page cache (the second member's finds it there, or waits on the first's pages) and the
+    // range leaves the cache once every member counted it (down_reads, IoQueue::Job::share).  The bytes are the same
+    static bool down_share() {
+        static const bool on = [] {
+            const char* e = ds4_env("DS4_FLOW_DOWN_SHARE");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        return on;
+    }
+    std::unique_ptr<std::atomic<uint8_t>[]> down_reads;   // (DS4_FLOW_DOWN_SHARE) [layer][expert]: members' reads
+    size_t down_stride = 0;
     // (DS4_FLOW_TP with DS4_TP_GGUF_UNEVEN) the down scratch device di's flow copies a member's part through: the whole
     // down of its largest split layer.  0 - no scratch - for one GPU's layers, a load without the flow for its groups,
     // or an even split's members (DS4_FLOW_TP without the knob), whose down part keeps its 2D copy (flow_copy)
@@ -4476,6 +4507,12 @@ struct Model::Impl {
                     j.left = &it.left;
                     j.bad = &it.bad;
                     j.mem = it.ram != nullptr ? it.ram + l.lay.trellis[r] + mx_read_off(l, it.mi, r) : nullptr;
+                    if (r == 2 && l.nm > 1 && down_reads != nullptr && it.ram == nullptr && it.keep == nullptr &&
+                        (size_t) it.e < down_stride) {   // (DS4_FLOW_DOWN_SHARE: the members' one read of the down)
+                        j.dfd = os::kBadFd;
+                        j.share = &down_reads[(size_t) it.il * down_stride + (size_t) it.e];
+                        j.share_n = l.nm;
+                    }
                     j.map = pk.at(l.mx_file[r], j.off);
                     j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
                     sb += flow_region(r);

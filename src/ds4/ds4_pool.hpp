@@ -148,6 +148,10 @@ public:
         const void* dmem = nullptr;
         int ddev = -1;
         bool (*dcopy)(int dev, void* dst, const void* src, size_t n) = nullptr;
+        // non-null (a buffered read several readers share - DS4_FLOW_DOWN_SHARE): counted once read (or failed); the
+        // share_n-th count drops the range from the page cache (fd, off, len) and starts the count again
+        std::atomic<uint8_t>* share = nullptr;
+        int share_n = 0;
     };
     explicit IoQueue(int n) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -208,6 +212,10 @@ private:
             }
             if (ok && j.keep != nullptr && j.mem == nullptr && j.dmem == nullptr)
                 std::memcpy(j.keep, j.dst + lead, (size_t) j.len);
+            if (j.share != nullptr && (int) j.share->fetch_add(1, std::memory_order_acq_rel) + 1 >= j.share_n) {
+                j.share->store(0, std::memory_order_release);
+                if (j.fd != os::kBadFd) os::advise(j.fd, j.off, j.len, false);
+            }
             busy_us_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t0).count(),
                                std::memory_order_relaxed);
