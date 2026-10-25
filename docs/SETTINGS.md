@@ -549,6 +549,23 @@ against the per-job one on every GPU at load (any difference fails the start).
 | `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: a decoded token's small launches fused
+
+A decoded token runs a few launches a layer that do almost nothing: the HC split (one warp) and its pre-norm (one
+block), the attention input's int8 rounding and the layer's copy of the pre slots; and on a group's lead the router
+stage - the layer's gate, the next layer's gate (the lookahead's guesses), the routing and the guesses, four launches.
+`MAYA_DS4_HC_FUSE=1` runs the split and the norm in one launch and rounds the attention's input there (three launches
+fewer a layer); `MAYA_DS4_ROUTE_FUSE=1` runs the two gates in one launch and the routing and the guesses in another.
+`2` does the same for a DSpark verify window's rows too (`MAYA_DS4_HC_FUSE=2` also rounds the FFN's input for the
+shared expert). The old kernels stay; at load, before any request, every GPU runs both paths on its first and last
+layers (random, edge and tie inputs) and compares every byte - a difference fails the start, so the answers are the
+same. Not on a wave64 build (gfx908).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HC_FUSE` | off (0) | `1`: a decoded token's HC split and norm in one launch, the attention input rounded to int8 there; `2`: a verify window's rows too, and the FFN input rounded for the shared expert (the same bits, checked at load) |
+| `MAYA_DS4_ROUTE_FUSE` | off (0) | `1`: a decoded token's router stage on a group's lead in two launches instead of four; `2`: a verify window's rows too (the same bits, checked at load; one layer of lookahead, `DS4_AHEAD` 1, the default) |
+
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 
 `--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their
