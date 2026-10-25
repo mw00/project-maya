@@ -152,6 +152,12 @@ struct Dev {
     int n_slots = 0;
     std::vector<long long> slot_owner;   // layer * 1024 + expert, -1
     std::vector<long long> slot_used;    // the forward counter at its last use
+    // the promotions (Options::promote): a slot being filled on the copy stream (pending: its key, its event) is no
+    // one's until the copy is done
+    cudaStream_t cs = nullptr;
+    std::vector<cudaEvent_t> slot_ev;
+    std::vector<long long> slot_pend;    // the key a pending slot will hold (-1: none)
+    int n_pending = 0;
     uint8_t* pin = nullptr;              // a pinned blob for the copies
     unsigned long long* plan_h = nullptr;   // pinned: the token's plan (8 pointers, then 8 weights)
     unsigned long long* plan_d = nullptr;
@@ -282,6 +288,13 @@ struct Model::Impl {
     int cur_pos = 0;                 // the last position of the chunk running
     std::vector<std::string> info;
     std::vector<uint32_t> prof;      // routings [layer][expert]: the loaded profile's plus this run's
+    std::vector<uint32_t> cpu_seen;  // (MM3_MISS_STATS: the CPU lane's computations [layer][expert] this run)
+    // the promotions' scores: an expert not in VRAM, each use (on the CPU lane, or from a slot) adds 1, decayed by
+    // kDecay a forward; at kPromote it is copied into the slot whose expert scores least
+    std::vector<float> use_score;
+    std::vector<long long> use_last;
+    static constexpr float kDecay = 0.95f, kPromote = 1.8f;
+    static constexpr int kMaxPending = 4;
     uint8_t* pool = nullptr;         // the pinned pool
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
@@ -289,6 +302,16 @@ struct Model::Impl {
     std::vector<int> tap_of;         // layer -> its tap (-1: none)
 
     ~Impl() {
+        if (std::getenv("MM3_MISS_STATS") && !cpu_seen.empty()) {
+            long tot = 0, distinct = 0, twice = 0;
+            for (uint32_t c : cpu_seen) {
+                tot += c;
+                distinct += c > 0;
+                twice += c > 1 ? c - 1 : 0;
+            }
+            std::fprintf(stderr, "CPU lane: %ld expert computations, %ld distinct experts, %ld repeats (%.0f%%)\n", tot,
+                         distinct, twice, tot ? 100.0 * twice / tot : 0.0);
+        }
         for (size_t i = 0; i < owned.size(); ++i) {
             cudaSetDevice(owned_dev[i]);
             cudaFree(owned[i]);
@@ -296,6 +319,9 @@ struct Model::Impl {
         if (pool) cudaFreeHost(pool);
         for (auto& d : D) {
             cudaSetDevice(d.id);
+            if (d.cs) cudaStreamSynchronize(d.cs);
+            for (cudaEvent_t e : d.slot_ev) cudaEventDestroy(e);
+            if (d.cs) cudaStreamDestroy(d.cs);
             if (d.plan_h) cudaFreeHost(d.plan_h);
             if (d.xh_h) cudaFreeHost(d.xh_h);
             if (d.win_rb) cudaFreeHost(d.win_rb);
@@ -516,6 +542,10 @@ struct Model::Impl {
                 if (!A(d.stg, (size_t) d.n_slots * d.slot_bytes)) return false;
                 d.slot_owner.assign((size_t) d.n_slots, -1);
                 d.slot_used.assign((size_t) d.n_slots, -1);
+                d.slot_pend.assign((size_t) d.n_slots, -1);
+                CK(cudaStreamCreateWithFlags(&d.cs, cudaStreamNonBlocking));
+                d.slot_ev.resize((size_t) d.n_slots);
+                for (auto& e : d.slot_ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
                 CK(cudaMallocHost(&d.pin, d.slot_bytes));
             }
             CK(cudaMallocHost(&d.plan_h, 16 * sizeof(unsigned long long)));
@@ -768,9 +798,12 @@ struct Model::Impl {
         int at = -1;
         for (int s = 0; s < d.n_slots; ++s)
             if (d.slot_owner[(size_t) s] == key) at = s;
+        if (at >= 0) score(key, true);   // (a promoted expert's use keeps it)
         if (at < 0) {
             for (int s = 0; s < d.n_slots; ++s)
-                if (!busy[(size_t) s] && (at < 0 || d.slot_used[(size_t) s] < d.slot_used[(size_t) at])) at = s;
+                if (!busy[(size_t) s] && d.slot_pend[(size_t) s] < 0 &&
+                    (at < 0 || d.slot_used[(size_t) s] < d.slot_used[(size_t) at]))
+                    at = s;
             if (at < 0) {
                 err = "no free staging slot";
                 return false;
@@ -892,6 +925,9 @@ struct Model::Impl {
                 pw[e] = wt;
                 ++prof[li * g.n_exp + x];
                 if (lane && on_cpu(l, d, x)) {
+                    if (cpu_seen.empty()) cpu_seen.assign((size_t) g.n_layers * g.n_exp, 0);
+                    if (cpu_of[(size_t) x] < 0) ++cpu_seen[li * g.n_exp + x];
+                    if (cpu_of[(size_t) x] < 0) consider_promotion(l, d, x);
                     if (cpu_of[(size_t) x] < 0) {
                         cpu_of[(size_t) x] = (int) cpu.size();
                         cpu.push_back(cpu_expert(l, x, 1.0f));
@@ -972,6 +1008,62 @@ struct Model::Impl {
         }
         k::add(d.h, d.out, (size_t) T * g.dim, d.s);
         return true;
+    }
+
+    // a non-resident expert's use: its decayed score, now
+    float score(long long key, bool add) {
+        if (use_score.empty()) {
+            use_score.assign((size_t) g.n_layers * 1024, 0.0f);
+            use_last.assign(use_score.size(), 0);
+        }
+        float& sc = use_score[(size_t) key];
+        sc *= std::pow(kDecay, (float) (fwd - use_last[(size_t) key]));
+        use_last[(size_t) key] = fwd;
+        if (add) sc += 1.0f;
+        return sc;
+    }
+
+    // the pending slots become their expert's - at a forward's start only, their copies waited for: which experts a
+    // forward finds in VRAM follows from the tokens before it, not from when a copy happened to end (the GPU's and the
+    // CPU lane's sums of an expert differ in their last bits: the answer is the same from run to run this way)
+    void refresh_slots(Dev& d) {
+        if (d.n_pending == 0) return;
+        for (int s = 0; s < d.n_slots; ++s)
+            if (d.slot_pend[(size_t) s] >= 0 && cudaEventSynchronize(d.slot_ev[(size_t) s]) == cudaSuccess) {
+                d.slot_owner[(size_t) s] = d.slot_pend[(size_t) s];
+                d.slot_pend[(size_t) s] = -1;
+                d.slot_used[(size_t) s] = fwd;
+                --d.n_pending;
+            }
+    }
+
+    // expert e of layer l ran on the CPU lane: when it keeps coming back, copied into a staging slot meanwhile (the
+    // slot whose expert scores least, not used in this forward nor pending)
+    void consider_promotion(const Layer& l, Dev& d, int e) {
+        const long long key = (long long) (&l - L.data()) * 1024 + e;
+        const float sc = score(key, true);
+        if (!o.promote || l.host_blob.empty() || l.host_blob[(size_t) e] == nullptr || sc < kPromote ||
+            d.n_pending >= kMaxPending || d.n_slots == 0)
+            return;
+        int best = -1;
+        float bs = sc;
+        for (int s = 0; s < d.n_slots; ++s) {
+            if (d.slot_pend[(size_t) s] >= 0 || d.slot_used[(size_t) s] == fwd) continue;
+            const long long ok = d.slot_owner[(size_t) s];
+            const float os = ok < 0 ? -1.0f : score(ok, false);
+            if (os < bs) {
+                bs = os;
+                best = s;
+            }
+        }
+        if (best < 0) return;
+        d.slot_owner[(size_t) best] = -1;
+        d.slot_pend[(size_t) best] = key;
+        ++d.n_pending;
+        cudaMemcpyAsync(d.stg + (size_t) best * d.slot_bytes, l.host_blob[(size_t) e], l.blob, cudaMemcpyHostToDevice,
+                        d.cs);
+        cudaEventRecord(d.slot_ev[(size_t) best], d.cs);
+        ++st.promoted;
     }
 
     // whether expert e of layer l is the CPU lane's this token: neither in VRAM nor in one of d's staging slots
@@ -1091,6 +1183,9 @@ struct Model::Impl {
         for (int i = 0; i < g.k_exp; ++i) {
             pw[i] = w[i] * g.scale;
             if (lane && on_cpu(l, d, top[i])) {   // (not in VRAM nor in a staging slot: the CPU lane's)
+                if (cpu_seen.empty()) cpu_seen.assign((size_t) g.n_layers * g.n_exp, 0);
+                ++cpu_seen[li * g.n_exp + top[i]];
+                consider_promotion(l, d, top[i]);
                 ph[i] = 0;
                 cpu.push_back(cpu_expert(l, top[i], pw[i]));
                 continue;
@@ -1161,12 +1256,17 @@ struct Model::Impl {
                 if (at >= 0 && se[(size_t) at] < 0) se[(size_t) at] = e;
                 else fresh.push_back(e);
             }
-            for (int e : fresh) {
+            for (size_t fi = 0; fi < fresh.size(); ++fi) {
                 int best = -1;
                 for (int s = 0; s < d.n_slots; ++s)
-                    if (se[(size_t) s] < 0 && (best < 0 || d.slot_used[(size_t) s] < d.slot_used[(size_t) best]))
+                    if (se[(size_t) s] < 0 && d.slot_pend[(size_t) s] < 0 &&
+                        (best < 0 || d.slot_used[(size_t) s] < d.slot_used[(size_t) best]))
                         best = s;
-                se[(size_t) best] = e;
+                if (best < 0) {   // (every free slot pending: the rest first in the next batch)
+                    staged.insert(staged.begin() + (long) si, fresh.begin() + (long) fi, fresh.end());
+                    break;
+                }
+                se[(size_t) best] = fresh[fi];
             }
             Pass p{d.stg, d.slot_bytes, std::move(se)};
             p.staged = true;
@@ -1302,6 +1402,10 @@ struct Model::Impl {
 
     bool chunk_(const int* ids, int T, int pos0, int want, float* logits, std::string& err) {
         ++fwd;
+        for (Dev& d : D) {
+            CK(cudaSetDevice(d.id));
+            refresh_slots(d);
+        }
         cur_pos = pos0 + T - 1;
         if (pos0 + T > o.max_ctx) {
             err = "the context is full (" + std::to_string(o.max_ctx) + ")";

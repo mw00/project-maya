@@ -27,6 +27,8 @@ struct Options {
     bool fast_decode = true;      // one token: the decode GEMVs and the token's fused experts (else the prompt path)
     int cpu_threads = 43;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged)
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
+    bool promote = true;          // the staging slots a cache: an expert the CPU lane keeps computing copied into one
+                                  // (from the pinned pool, on a copy stream of its own) while the model runs
     bool verbose = false;
 };
 
@@ -37,6 +39,7 @@ struct Stats {
     double pinned_gb = 0;         // the pinned pool of the experts not in VRAM
     long profiled = 0;            // routings counted (save_profile writes them)
     long cpu_experts = 0;         // routed experts the CPU lane computed
+    long promoted = 0;            // experts copied into a staging slot because they kept coming back
     double t_sync = 0, t_lane = 0, t_token = 0;   // decode: waiting on the routing, the CPU lane, all (seconds)
 };
 

@@ -472,6 +472,7 @@ int main(int argc, char** argv) {
         else if (a == "--profile-out") profile_out = val();
         else if (a == "--no-pin-pool") o.pin_pool = false;
         else if (a == "--no-fast-decode") o.fast_decode = false;
+        else if (a == "--no-promote") o.promote = false;
         else if (a == "--ppl") ppl = std::atoi(val().c_str());
         else if (a == "--batch") batch = val();
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
@@ -599,6 +600,43 @@ int main(int argc, char** argv) {
     };
     int next = argmax(logits.data() + (size_t) (last - 1) * m.vocab());
     std::printf("next %d\n", next);
+    // (debugging, MM3_STRESS=N [MM3_STRESS_T=T]: one verify window's forward N more times - its logits may not change)
+    if (const char* sv = std::getenv("MM3_STRESS"); sv && m.draft_block() > 0) {
+        const int iters = std::atoi(sv);
+        const int tw = std::getenv("MM3_STRESS_T") ? std::atoi(std::getenv("MM3_STRESS_T")) : 4;
+        std::vector<int> drafts;
+        std::vector<float> conf;
+        if (!m.draft(next, n, m.draft_block(), drafts, conf, err)) return 1;
+        std::vector<int> win(1, next);
+        for (int i = 0; i + 1 < tw && i < (int) drafts.size(); ++i) win.push_back(drafts[(size_t) i]);
+        const size_t W = win.size() * (size_t) m.vocab();
+        std::vector<float> ref(W), cur(W);
+        int bad = 0;
+        for (int it = 0; it <= iters; ++it) {
+            if (!m.forward(win.data(), (int) win.size(), n, (int) win.size(), it == 0 ? ref.data() : cur.data(), err)) {
+                std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+                return 1;
+            }
+            if (it == 0) continue;
+            if (std::memcmp(ref.data(), cur.data(), W * 4) != 0) {
+                ++bad;
+                double mx = 0;
+                std::string rows;
+                for (size_t r = 0; r < win.size(); ++r) {
+                    bool d = false;
+                    for (int v = 0; v < m.vocab(); ++v) {
+                        const double e = std::fabs((double) ref[r * m.vocab() + v] - cur[r * m.vocab() + v]);
+                        if (e > 0) d = true;
+                        mx = std::max(mx, e);
+                    }
+                    if (d) rows += " " + std::to_string(r);
+                }
+                std::fprintf(stderr, "STRESS iteration %d differs: rows%s, max |diff| %.3g\n", it, rows.c_str(), mx);
+            }
+        }
+        std::fprintf(stderr, "STRESS %d forwards of %zu tokens at %d: %d differ\n", iters, win.size(), n, bad);
+        return 0;
+    }
     if (gen > 0 && m.draft_block() > 0) {   // greedy decode in DSpark rounds: draft, verify in one forward, keep
         const int B = m.draft_block();
         std::vector<float> lg((size_t) (B + 1) * m.vocab());
@@ -655,6 +693,7 @@ int main(int argc, char** argv) {
                      drafted ? 1e3 * t_draft / drafted : 0.0, drafted);
         if (rounds) {
             const auto& s1 = m.stats();
+            std::fprintf(stderr, "  experts promoted into staging slots: %ld\n", s1.promoted - s0.promoted);
             std::fprintf(stderr, "  a round: verify %.1f ms (routing waits %.1f, CPU lane %.1f, %.1f experts on the CPU, "
                          "%.1f staged)\n", 1e3 * t_verify / rounds, 1e3 * (s1.t_sync - s0.t_sync) / rounds,
                          1e3 * (s1.t_lane - s0.t_lane) / rounds, (double) (s1.cpu_experts - s0.cpu_experts) / rounds,
