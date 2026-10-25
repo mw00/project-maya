@@ -690,6 +690,16 @@ bool Prefill::carve(size_t T, void* alloc) {
 
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
     Impl& m = *impl_;
+    // A test hook: STRATA_PREALLOC_FAIL=<tokens> makes the layout of a chunk bigger than that fail, so the
+    // recovery (the request is read again with a smaller chunk) can be checked.
+    static const int64_t fail_above = [] {
+        const char* v = std::getenv("STRATA_PREALLOC_FAIL");
+        return v ? std::atoll(v) : 0;
+    }();
+    if (fail_above > 0 && chunk > fail_above) {
+        err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit";
+        return false;
+    }
     if (!m.borrowed || borrow == nullptr || chunk <= 0 || chunk > m.T_max) {
         err = "prefill: relayout needs borrowed buffers and a chunk of at most " + std::to_string(m.T_max);
         return false;

@@ -44,6 +44,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/failure.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/glm_model.hpp"
 #include "strata/core/mtp_rows.hpp"
@@ -87,6 +88,7 @@
 #include <climits>
 #include <cmath>
 #include <limits>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1005,6 +1007,31 @@ static void set_env(const char* k, const char* v) {
 #endif
 }
 
+// A failure in the request's own work - an allocation, a launch - is thrown (strata/prefill/failure.hpp) and
+// caught here: it ends this request with an error, not the process.  The engine lives and the next request runs.
+template <typename F>
+static bool guarded(F&& f, std::string& err) {
+    try {
+        return f();
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+// Whether the CUDA context itself is broken (a sticky error): nothing else can run, so the engine has to end -
+// the server starts a new one.  Every other failure is the request's.
+static bool cuda_context_broken(const std::string& why) {
+    static const char* kSticky[] = {"illegal memory access", "device-side assert", "unspecified launch failure",
+                                    "device uninitialized", "cuda context is broken"};
+    std::string low;
+    low.reserve(why.size());
+    for (char c : why) low.push_back((char) std::tolower((unsigned char) c));
+    for (const char* p : kSticky)
+        if (low.find(p) != std::string::npos) return true;
+    return false;
+}
+
 static int glm_pack_generate(const Options& o) {
 #if !defined(_WIN32)
     // serving: the server ends the engine with QUIT (or by closing its input), and the engine then sets the conversation
@@ -1853,7 +1880,7 @@ static int glm_pack_generate(const Options& o) {
                     pp_line(base + (size_t) done);
                     return !read_stopped();
                 };
-                pok = model.prefill(part, err, prompt[end]);   // (the NextN block's caches read the next token)
+                pok = guarded([&] { return model.prefill(part, err, prompt[end]); }, err);   // (the NextN block's caches read the next token)
                 model.prefill_progress = nullptr;
                 model.prefill_min_chunks = 1;
                 model.prefill_force_chunk = 0;
@@ -6989,6 +7016,10 @@ int main(int argc, char** argv) {
         bool mrope_identity = true;
         std::vector<float> img_rows;
         std::vector<const float*> row_ptr;
+        // The prompt path's chunk, for the requests that follow: an allocation failure lowers it (the memory is
+        // not there any more), so the engine finds a chunk that fits instead of failing every prompt.
+        int64_t chunk_cap = o.prefill_chunk;
+        constexpr int64_t kMinPromptChunk = 256;   // the layout's floor: a chunk smaller than this is not read
         while (next_line(line)) {
             if (line == "QUIT") break;
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
@@ -7338,7 +7369,7 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow
             auto lend = [&](int64_t tokens, std::string& e) -> bool {
                 if (lend_first < 0) return true;                       // its own buffers: nothing to lend
-                const int64_t want = request_chunk(tokens, o.prefill_chunk);
+                int64_t want = request_chunk(tokens, chunk_cap);
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
@@ -7347,15 +7378,35 @@ int main(int argc, char** argv) {
                     if (want <= lent_chunk) return true;
                     if (!refill(e)) return false;
                 }
-                const int64_t slots = lend_slots(want);
+                int64_t slots = lend_slots(want);
                 if (slots <= 0 || slots > xcache.slots() - lend_first) {
                     e = "prefill: request-sized buffers exceed the configured lend region";
                     return false;
                 }
-                const int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - slots));
-                if (want != sp.chunk() || first != lend_first_now) {
-                    if (!sp.relayout(want, xcache.device_slot(first), lend_bytes(first), e)) return false;
-                    lend_first_now = first;
+                int32_t first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - slots));
+                // The layout of the chunk: a chunk whose buffers do not fit the lent slots is read again with a
+                // smaller one (nothing has been computed yet, so this is safe).
+                for (;;) {
+                    if (want == sp.chunk() && first == lend_first_now) break;
+                    std::string rerr;
+                    if (sp.relayout(want, xcache.device_slot(first), lend_bytes(first), rerr)) {
+                        lend_first_now = first;
+                        break;
+                    }
+                    if (!strata::prefill::is_allocation_failure(rerr) || want <= kMinPromptChunk) {
+                        e = rerr;
+                        return false;
+                    }
+                    want = std::max<int64_t>(kMinPromptChunk, want / 2);
+                    chunk_cap = std::min(chunk_cap, want);
+                    slots = lend_slots(want);
+                    if (slots <= 0 || slots > xcache.slots() - lend_first) {
+                        e = "prefill: request-sized buffers exceed the configured lend region";
+                        return false;
+                    }
+                    first = std::max<int32_t>(lend_first, (int32_t) (xcache.slots() - slots));
+                    std::fprintf(stderr, "maya serve: the prompt path's buffers do not fit (%s): the chunk is %lld "
+                                         "tokens now\n", rerr.c_str(), (long long) want);
                 }
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
@@ -7413,19 +7464,36 @@ int main(int argc, char** argv) {
                         break;
                     }
             int64_t at = read_from;
+            bool read_failed = false;
             for (const int64_t to : {reread_to, root_at, turn_at, n - 1}) {
                 if (to <= at) continue;
                 const bool win = windows_ok(at, to);
+                // A failure here ends this request, not the engine (unless the CUDA context itself is broken):
+                // the next request finds the expert cache as it was and reads its prompt with a smaller chunk.
                 if (win && !refill(err)) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                    return 1;
+                    std::fflush(stdout);
+                    if (cuda_context_broken(err)) return 1;
+                    read_failed = true;
+                    break;
                 }
                 if (!win && !lend(to - at, err)) {
                     std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
-                    return 1;
+                    std::fflush(stdout);
+                    if (cuda_context_broken(err)) return 1;
+                    if (strata::prefill::is_allocation_failure(err)) {
+                        chunk_cap = std::max<int64_t>(kMinPromptChunk, chunk_cap / 2);
+                        std::fprintf(stderr, "maya serve: the prompt path's buffers did not fit: the chunk is %lld "
+                                             "tokens for the requests that follow\n", (long long) chunk_cap);
+                    }
+                    read_failed = true;
+                    break;
                 }
                 const auto tsp = Clock::now();
-                const bool sp_ok = win ? read_windows(at, to, err) : sp.run(ids.data() + at, to - at, at, err);
+                // A failure in the prompt path (an allocation, a launch) is thrown, not fatal: it ends this
+                // request, and the engine lives for the next one.
+                const bool sp_ok = win ? read_windows(at, to, err)
+                                      : guarded([&] { return sp.run(ids.data() + at, to - at, at, err); }, err);
                 if (trace) {
                     std::fprintf(stderr, "maya trace: read %lld tokens (%s) in %.1f ms\n", (long long) (to - at),
                                  win ? "windows" : "batched",
@@ -7436,7 +7504,10 @@ int main(int argc, char** argv) {
                     if (!stop_req.load()) {
                         std::fprintf(stderr, "maya serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
-                        return 1;
+                        std::fflush(stdout);
+                        if (cuda_context_broken(err)) return 1;
+                        read_failed = true;
+                        break;
                     }
                     cancelled = true;   // stopped while reading the prompt: refill the lent slots below, then DONE cancel
                     break;
@@ -7444,12 +7515,27 @@ int main(int argc, char** argv) {
                 at = to;
                 if ((to == turn_at || to == root_at) && !checkpoint_at(to)) {
                     std::printf("ERR saving a conversation checkpoint failed\n");
-                    return 1;
+                    std::fflush(stdout);
+                    continue;   // the conversation is fine, only its checkpoint is lost: the next request runs
                 }
+            }
+            if (read_failed) {
+                // The expert cache is whole again (the lent slots hold their experts), and the next request reads
+                // its prompt with a smaller chunk: the memory this request wanted is not there.
+                std::string rerr;
+                if (!refill(rerr)) std::fprintf(stderr, "maya serve: the lent slots could not be refilled: %s\n", rerr.c_str());
+                if (strata::prefill::is_allocation_failure(err)) {
+                    chunk_cap = std::max<int64_t>(kMinPromptChunk, chunk_cap / 2);
+                    std::fprintf(stderr, "maya serve: the prompt path ran out of memory: the chunk is %lld tokens for "
+                                         "the requests that follow\n", (long long) chunk_cap);
+                }
+                continue;   // the engine lives: the next request runs
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                return 1;
+                std::fflush(stdout);
+                if (cuda_context_broken(err)) return 1;
+                continue;   // the experts are read again on demand: the next request runs
             }
             tr("prompt done (slots refilled)");
             const double prompt_ms = std::chrono::duration<double, std::milli>(Clock::now() - r0).count();
@@ -7490,6 +7576,7 @@ int main(int argc, char** argv) {
             int64_t dec_windows = 0, dec_T = 0;
             const int64_t decode_hits0 = drive.d.cache_hits;
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
+            bool window_failed = false;   // a window failed: the request ends here, the engine lives
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -7532,9 +7619,17 @@ int main(int argc, char** argv) {
                 }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
-                    std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
-                    return 1;
+                // A failure in the window (the graph's first use allocates, and the memory may be gone) ends this
+                // request, not the engine: the next request reads its prompt again and runs.
+                const bool win_ok = guarded([&] { return ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err); }, err);
+                if (!win_ok || drive.d.failed) {
+                    const std::string why = drive.d.failed && drive.d.fail ? drive.d.fail : err;
+                    std::printf("ERR %s\n", why.c_str());
+                    std::fflush(stdout);
+                    if (cuda_context_broken(why)) return 1;
+                    window_failed = true;
+                    cancelled = true;   // the session is between two windows: the next request reads it again
+                    break;
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
@@ -7547,7 +7642,11 @@ int main(int argc, char** argv) {
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
-                    return 1;
+                    std::fflush(stdout);
+                    if (cuda_context_broken(err)) return 1;
+                    window_failed = true;
+                    cancelled = true;   // the session is between two windows: the next request reads it again
+                    break;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
@@ -7613,6 +7712,7 @@ int main(int argc, char** argv) {
                 live_imgs = imgs_below(req_imgs, (int64_t) live.size());
                 live_ok = o.prompt_cache > 0;
             }
+            if (window_failed) continue;   // the ERR was reported: the engine lives, the next request runs
             static const bool state_hash = std::getenv("STRATA_STATE_HASH") != nullptr;
             if (state_hash && live_ok) {
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and

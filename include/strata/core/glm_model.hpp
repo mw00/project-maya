@@ -982,7 +982,9 @@ public:
     bool prefill_bind(uint8_t* region, size_t bytes, std::string& err);   // its buffers inside the borrowed region
     // ... laid out for chunks of T (the bytes it uses); end: the prompt's last position + 1, which the KV streaming stage
     // must hold (-1: the whole context)
-    size_t prefill_carve(int T, int64_t end = -1);
+    /// The prompt path's device buffers for a chunk of T tokens, laid out in the lendable region.  False when the
+    /// layout does not fit it: the prompt is then read in smaller chunks (nothing has been computed yet).
+    bool prefill_carve(int T, int64_t end = -1);
     bool prefill_lend(std::string& err);                    // the tail slots -> the prompt path (drops their experts)
     bool prefill_return(std::string& err);                  // ... and back to the expert pool
     void prefill_destroy();

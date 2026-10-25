@@ -2,6 +2,7 @@
 // from the pinned llama.cpp checkout the build already takes ggml from; src/prefill/ggml_cuda_host.cu supplies the
 // few host symbols of ggml-cuda.cu it references.
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/failure.hpp"
 
 #include "common.cuh"
 #include "convert.cuh"
@@ -14,10 +15,12 @@
 namespace strata::prefill::mmq {
 namespace {
 
+// A failed launch (an allocation, most of the time) ends this request, not the process: the reason is thrown and
+// the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill mmq: %s: %s\n", what, cudaGetErrorString(e));
-        std::exit(1);
+        strata::prefill::fail(std::string("prefill mmq: ") + what + ": " + cudaGetErrorString(e));
     }
 }
 
