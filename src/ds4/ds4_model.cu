@@ -1454,6 +1454,7 @@ struct Model::Impl {
     std::vector<unsigned long long*> rc_upd;
     std::atomic<unsigned> rc_clock{1};
     int64_t rc_fills_done = 0, rc_fills_started = 0, rc_ticks = 0, rc_lands = 0;
+    std::atomic<int> rc_pending{0};   // the fills queued and not yet done (rc_drain waits for none)
     double rc_tick_ms = 0;
     std::mutex sw_mu;
     std::condition_variable sw_cv;
@@ -7112,6 +7113,7 @@ struct Model::Impl {
                 }
                 if (done) {
                     rc_done[(size_t) (l.rc_off + j.slot)].store(j.gen, std::memory_order_release);
+                    rc_pending.fetch_sub(1);
                     fly[i] = fly.back();
                     fly.pop_back();
                 } else
@@ -7121,7 +7123,17 @@ struct Model::Impl {
         }
     }
 
-    void rc_tick() {
+    // before a run of chunks borrows the tail (borrow_begin): the recent slots lie in it, so no fill may still be
+    // writing there - every one waited for, then the fills done and the window's landings mapped (no new fills): the
+    // run's buffers then cover only mapped experts, which borrow_end reads back like any other VRAM one
+    void rc_drain() {
+        if (recent_n <= 0 || rc_cs.empty()) return;
+        while (rc_pending.load() > 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+        tick_begin();
+        rc_tick(false);
+        tick_flush();
+    }
+    void rc_tick(bool start_fills = true) {
         if (recent_n <= 0) return;
         const double t_tick = now_ms();
         struct Tm {
@@ -7247,7 +7259,7 @@ struct Model::Impl {
                 while ((int) l.rc_hist.size() > recent_win) l.rc_hist.pop_front();
             }
             int started = 0;
-            for (size_t h = l.cpu_hits.size(); h-- > 0 && started < recent_fills;) {   // (the latest first)
+            for (size_t h = l.cpu_hits.size(); start_fills && h-- > 0 && started < recent_fills;) {   // (latest first)
                 const int e = l.cpu_hits[h];
                 if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0 || e == l.sw_in) continue;
                 int uses = 0;
@@ -7321,6 +7333,7 @@ struct Model::Impl {
                 std::lock_guard<std::mutex> lk(rc_mu);
                 for (const RcJob& j : jobs) rc_q.push_back(j);
             }
+            rc_pending.fetch_add((int) jobs.size());
             rc_cv.notify_one();
         }
     }
@@ -10973,6 +10986,7 @@ struct Model::Impl {
         for (const auto& cp : chunks) any = any || (cp != nullptr && cp->borrow);
         if (!any) return true;
         cache_drain();
+        rc_drain();
         for (size_t di = 0; di < chunks.size(); ++di) {
             if (chunks[di] == nullptr || !chunks[di]->borrow) continue;
             Dev& d = devs[di];
