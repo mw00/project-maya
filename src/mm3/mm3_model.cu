@@ -642,6 +642,7 @@ struct Model::Impl {
                     l.res_ids.push_back(e);
                 }
                 st.resident += nres[i];
+                st.vram_gb += (double) ((size_t) nres[i] * l.blob) / (1u << 30);
             }
         }
         st.experts = 0;
@@ -736,6 +737,7 @@ struct Model::Impl {
                         });
                     for (auto& t : th) t.join();
                     st.pinned_gb = (double) total / (1u << 30);
+                    st.pooled = (long) todo.size();
                 }
             } else if (total > 0) {
                 info.push_back("pinned pool: " + std::to_string(total >> 30) + " GB does not fit the free RAM");

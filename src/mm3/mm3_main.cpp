@@ -344,8 +344,9 @@ int sample(std::vector<float>& lg, const Req& r, const std::vector<int>& hist, s
 int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     const auto& st0 = m.stats();
-    std::printf("INFO engine=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld dspark=%d\n", st0.resident,
-                st0.experts, m.draft_block() > 0 && spec_on ? 1 : 0);
+    std::printf("INFO engine=mm3 engine_kind=mm3 model=MiniMax-M3.1-Flash experts_vram=%ld experts=%ld "
+                "expert_slots=%ld ram_slots=%ld dspark=%d\n", st0.resident, st0.experts, st0.resident, st0.pooled,
+                m.draft_block() > 0 && spec_on ? 1 : 0);
     if (const mm3::VisionGeo* vg = m.vision())   // (serve/mm3_vision.py's Geometry.from_info)
         std::printf("INFO vision=mm3 image_token=%d image_start=%d image_end=%d vision_patch=%d vision_merge=%d "
                     "vision_max_pixels=%d vision_min_pixels=%d\n", vg->image_token, vg->image_start, vg->image_end,
@@ -460,13 +461,19 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         const char* finish = "length";
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
         int tok = sample(lg, r, state, rng);
+        // (the Monitor's tier keys too: the experts in VRAM, in the pinned pool - the CPU lane computes those from it -
+        //  and a token the CPU lane's experts and the promotions; without a pool the misses come from the mapped files)
         auto stat_line = [&]() {
             const auto& s = m.stats();
             const double ms = now() * 1e3 - t1;
             const double ex = (double) ((s.profiled - s_dec.profiled)), cx = (double) (s.cpu_experts - s_dec.cpu_experts);
-            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f\n",
+            const double per = produced > 0 ? 1.0 / (double) produced : 0.0;
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f vram_used=%ld ram_used=%ld vram_gb=%.2f "
+                        "ram_gb=%.2f %s=%.3f %s=0 promo=%.3f\n",
                         ms > 0 ? 1000.0 * (double) produced / ms : 0.0, produced > 0 ? ms / (double) produced : 0.0,
-                        ex > 0 ? 1.0 - cx / ex : 1.0, produced > 0 ? cx / (double) produced : 0.0);
+                        ex > 0 ? 1.0 - cx / ex : 1.0, cx * per, s.resident, s.pooled, s.vram_gb, s.pinned_gb,
+                        s.pooled ? "ram_fetch" : "disk", cx * per, s.pooled ? "disk" : "ram_fetch",
+                        (double) (s.promoted - s_dec.promoted) * per);
         };
         // DSpark: a round drafts after the token, verifies the token and its drafts in one forward and keeps the drafts
         // the target agrees with - greedy: its argmax; sampling: a draft d kept with the target's probability of d (the

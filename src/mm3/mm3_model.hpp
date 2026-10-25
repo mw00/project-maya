@@ -49,6 +49,8 @@ struct Stats {
     double load_s = 0;
     long staged = 0;              // expert blobs copied into staging slots
     long resident = 0, experts = 0;
+    double vram_gb = 0;           // the resident experts' bytes (every member's slice)
+    long pooled = 0;              // experts in the pinned pool (0: no pool - the misses read from the mapped files)
     double pinned_gb = 0;         // the pinned pool of the experts not in VRAM
     long profiled = 0;            // routings counted (save_profile writes them)
     long cpu_experts = 0;         // routed experts the CPU lane computed

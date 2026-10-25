@@ -279,6 +279,12 @@ const TIER_SETS = {
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
     {key: "engram_ms", label: "N-gram memory", icon: "layers", unit: " ms/tok", digits: 2, sub: "n-gram lookups"},
   ],
+  mm3: [   // (MiniMax, maya-mm3: the CPU lane computes the experts not in VRAM from the pinned pool)
+    {key: "ram_fetch", label: "From RAM", icon: "link", unit: "/tok", digits: 2, tone: "info",
+     sub: "experts the CPU computed from pinned RAM"},
+    {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
+    {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts copied into the VRAM cache"},
+  ],
 };
 let tiersShown = null;   // the set the cards are built for
 function tierCards(kind) {
@@ -305,7 +311,8 @@ function renderTiers(t, eng) {
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   card.classList.toggle("is-stale", stale);
-  for (const m of tierCards(ds4 ? "ds4" : "glm")) {
+  const mm3 = !!(eng && eng.engine_kind === "mm3");
+  for (const m of tierCards(ds4 ? "ds4" : mm3 ? "mm3" : "glm")) {
     const v = n[m.key];
     const shown = v == null ? null : fmt(v, m.digits);
     $(`tv-${m.key}`).innerHTML = shown == null ? "–" : `${esc(shown)}<small>${esc(m.unit)}</small>`;
@@ -852,12 +859,14 @@ function renderAbout(eng, hw, st, storage) {
   facts($("facts-engine"), [
     ["Version", ver ? `Project Maya v${ver}${eng.version ? ` · engine ${eng.version}` : ""}` : null],
     ["Model", eng.model],
-    ["Engine", eng.engine_kind ? ({"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)"}[eng.engine_kind] || eng.engine_kind) : null],
+    ["Engine", eng.engine_kind ? ({"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)",
+                                   mm3: "MiniMax-M3.1 (maya-mm3)"}[eng.engine_kind] || eng.engine_kind) : null],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens (Settings changes it)` : null],
     ["Trained for", eng.trained_context ? `up to ${fmt(eng.trained_context)} tokens` : null],
     ["KV cache", kv],
     ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
-                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
+                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}` +
+                 `${+eng.expert_slots + (+eng.ram_slots || 0) >= +eng.experts ? "" : ", the rest read from the SSD"}` : null],
     ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
                   : "off (one GPU, or no draft block in this model file)"],
     ["Images", eng.images ? "on" : "off"],

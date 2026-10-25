@@ -853,6 +853,7 @@ struct TpEngine::Impl {
                 l.res_ids = v;
                 for (size_t s = 0; s < v.size(); ++s) l.res_slot[(size_t) v[s]] = (int) s;
                 st.resident += (long) v.size();
+                st.vram_gb += (double) (v.size() * l.blob * gr.mem.size()) / (1u << 30);
                 for (size_t j = 0; j < gr.mem.size(); ++j) {
                     Member& m = M[(size_t) gr.mem[j]];
                     if (!v.empty() && !dalloc(m.id, l.sl[j].res_base, v.size() * l.blob, err)) return false;
@@ -970,6 +971,7 @@ struct TpEngine::Impl {
                     });
                 for (auto& x : th) x.join();
                 st.pinned_gb = (double) total / (1u << 30);
+                st.pooled = (long) todo.size();
             }
         }
         // the CPU lane: sub-experts of a group's width (a member's slice; whole experts in a group of one GPU)
