@@ -157,7 +157,14 @@ struct Dev {
     cudaStream_t cs = nullptr;
     std::vector<cudaEvent_t> slot_ev;
     std::vector<long long> slot_pend;    // the key a pending slot will hold (-1: none)
+    std::vector<long long> slot_iss;     // the forward at whose end its copy began
     int n_pending = 0;
+    struct Promo {
+        int slot;
+        const uint8_t* src;
+        size_t bytes;
+    };
+    std::vector<Promo> promo_q;          // the promotions a forward chose, copied at its end (its own copies done)
     uint8_t* pin = nullptr;              // a pinned blob for the copies
     unsigned long long* plan_h = nullptr;   // pinned: the token's plan (8 pointers, then 8 weights)
     unsigned long long* plan_d = nullptr;
@@ -543,6 +550,7 @@ struct Model::Impl {
                 d.slot_owner.assign((size_t) d.n_slots, -1);
                 d.slot_used.assign((size_t) d.n_slots, -1);
                 d.slot_pend.assign((size_t) d.n_slots, -1);
+                d.slot_iss.assign((size_t) d.n_slots, 0);
                 CK(cudaStreamCreateWithFlags(&d.cs, cudaStreamNonBlocking));
                 d.slot_ev.resize((size_t) d.n_slots);
                 for (auto& e : d.slot_ev) CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
@@ -1023,18 +1031,33 @@ struct Model::Impl {
         return sc;
     }
 
+    // the promotions' copies on the copy stream - at a forward's end: during it, each 20+ MB copy would hold up the
+    // forward's own small copies behind it on the GPU's one host -> device engine (its plans, the CPU lane's parts)
+    void issue_promotions(Dev& d) {
+        for (const Dev::Promo& q : d.promo_q) {
+            cudaMemcpyAsync(d.stg + (size_t) q.slot * d.slot_bytes, q.src, q.bytes, cudaMemcpyHostToDevice, d.cs);
+            cudaEventRecord(d.slot_ev[(size_t) q.slot], d.cs);
+            d.slot_iss[(size_t) q.slot] = fwd;
+        }
+        d.promo_q.clear();
+    }
+
     // the pending slots become their expert's - at a forward's start only, their copies waited for: which experts a
     // forward finds in VRAM follows from the tokens before it, not from when a copy happened to end (the GPU's and the
     // CPU lane's sums of an expert differ in their last bits: the answer is the same from run to run this way)
     void refresh_slots(Dev& d) {
+        issue_promotions(d);   // (a forward that failed before its end)
         if (d.n_pending == 0) return;
+        const double tw = now();
         for (int s = 0; s < d.n_slots; ++s)
-            if (d.slot_pend[(size_t) s] >= 0 && cudaEventSynchronize(d.slot_ev[(size_t) s]) == cudaSuccess) {
+            if (d.slot_pend[(size_t) s] >= 0 && fwd - d.slot_iss[(size_t) s] >= o.promote_lag &&
+                cudaEventSynchronize(d.slot_ev[(size_t) s]) == cudaSuccess) {
                 d.slot_owner[(size_t) s] = d.slot_pend[(size_t) s];
                 d.slot_pend[(size_t) s] = -1;
                 d.slot_used[(size_t) s] = fwd;
                 --d.n_pending;
             }
+        st.t_promo += now() - tw;
     }
 
     // expert e of layer l ran on the CPU lane: when it keeps coming back, copied into a staging slot meanwhile (the
@@ -1060,9 +1083,7 @@ struct Model::Impl {
         d.slot_owner[(size_t) best] = -1;
         d.slot_pend[(size_t) best] = key;
         ++d.n_pending;
-        cudaMemcpyAsync(d.stg + (size_t) best * d.slot_bytes, l.host_blob[(size_t) e], l.blob, cudaMemcpyHostToDevice,
-                        d.cs);
-        cudaEventRecord(d.slot_ev[(size_t) best], d.cs);
+        d.promo_q.push_back({best, l.host_blob[(size_t) e], l.blob});
         ++st.promoted;
     }
 
@@ -1521,6 +1542,11 @@ struct Model::Impl {
             err = "EXL3 launch errors: " + std::to_string(e);
             return false;
         }
+        for (Dev& d : D)
+            if (!d.promo_q.empty()) {
+                CK(cudaSetDevice(d.id));
+                issue_promotions(d);
+            }
         if (draftm) {
             CK(cudaSetDevice(D[(size_t) head_dev].id));
             if (!draftm->context(taps, T, pos0, err)) return false;

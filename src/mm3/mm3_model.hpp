@@ -29,6 +29,8 @@ struct Options {
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
     bool promote = true;          // the staging slots a cache: an expert the CPU lane keeps computing copied into one
                                   // (from the pinned pool, on a copy stream of its own) while the model runs
+    int promote_lag = 2;          // a promoted expert's slot is its own this many forwards after its copy began, the
+                                  // copy waited for then (1: the next forward - plain decode then waits ~5 ms a token)
     bool verbose = false;
 };
 
@@ -40,6 +42,7 @@ struct Stats {
     long profiled = 0;            // routings counted (save_profile writes them)
     long cpu_experts = 0;         // routed experts the CPU lane computed
     long promoted = 0;            // experts copied into a staging slot because they kept coming back
+    double t_promo = 0;           // a forward's start waiting for those copies
     double t_sync = 0, t_lane = 0, t_token = 0;   // decode: waiting on the routing, the CPU lane, all (seconds)
 };
 

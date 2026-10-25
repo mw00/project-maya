@@ -473,6 +473,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-pin-pool") o.pin_pool = false;
         else if (a == "--no-fast-decode") o.fast_decode = false;
         else if (a == "--no-promote") o.promote = false;
+        else if (a == "--promote-lag") o.promote_lag = std::max(1, std::atoi(val().c_str()));
         else if (a == "--ppl") ppl = std::atoi(val().c_str());
         else if (a == "--batch") batch = val();
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val().c_str());
@@ -693,7 +694,8 @@ int main(int argc, char** argv) {
                      drafted ? 1e3 * t_draft / drafted : 0.0, drafted);
         if (rounds) {
             const auto& s1 = m.stats();
-            std::fprintf(stderr, "  experts promoted into staging slots: %ld\n", s1.promoted - s0.promoted);
+            std::fprintf(stderr, "  experts promoted into staging slots: %ld (their copies waited for %.1f ms a round)\n",
+                         s1.promoted - s0.promoted, 1e3 * (s1.t_promo - s0.t_promo) / rounds);
             std::fprintf(stderr, "  a round: verify %.1f ms (routing waits %.1f, CPU lane %.1f, %.1f experts on the CPU, "
                          "%.1f staged)\n", 1e3 * t_verify / rounds, 1e3 * (s1.t_sync - s0.t_sync) / rounds,
                          1e3 * (s1.t_lane - s0.t_lane) / rounds, (double) (s1.cpu_experts - s0.cpu_experts) / rounds,
@@ -725,8 +727,9 @@ int main(int argc, char** argv) {
                      done, t1 - t0, done / (t1 - t0), m.stats().staged, m.stats().cpu_experts);
         if (std::getenv("MM3_TIMING") && done > 0) {
             const auto& s2 = m.stats();
-            std::fprintf(stderr, "  a token: %.1f ms - routing waits %.1f ms, CPU lane %.1f ms\n", 1e3 * s2.t_token / done,
-                         1e3 * s2.t_sync / done, 1e3 * s2.t_lane / done);
+            std::fprintf(stderr, "  a token: %.1f ms - routing waits %.1f ms, CPU lane %.1f ms, promotions' copies %.1f ms "
+                         "(%ld promoted)\n", 1e3 * s2.t_token / done, 1e3 * s2.t_sync / done, 1e3 * s2.t_lane / done,
+                         1e3 * s2.t_promo / done, s2.promoted);
         }
     }
     if (!profile_out.empty()) {
