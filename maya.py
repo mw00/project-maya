@@ -4081,7 +4081,16 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--profile", str(MM3_PROFILE)]
     kept = keep_args(old.get("args") or [], args, ("--chunk", "--staging", "--cpu-threads", "--reserve-gb",
                                                     "--resident-cap", "--dspark", "--dspark-conf", "--vision",
-                                                    "--vision-gpu"))
+                                                    "--vision-gpu", "--tp", "--cache-gb"))
+    # tensor parallel (maya-mm3 --tp): the GPUs in groups of 4 (or 2), the first alone when the others make whole
+    # groups - each layer's work spread over a group's GPUs; on 3090 + 8 x 5060 Ti decode 27.7 -> 38 tok/s (code),
+    # ~19 -> 32 (prose), prompts 35-70 -> ~100 tok/s
+    n = len(pc["gpus"])
+    if "--tp" not in args[:-1]:
+        for tp in (4, 2):
+            if n > tp and ((n - 1) % tp == 0 or n % tp == 0):
+                args += ["--tp", str(tp)]
+                break
     # DSpark (the draft in the pack: tools/mm3/pack.py indexes dspark/): drafts verified by the model, the same tokens
     # it would answer alone - about 1.6x the decode on the 3090 + 8x 5060 Ti it was measured on
     if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
