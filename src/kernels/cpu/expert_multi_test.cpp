@@ -32,6 +32,11 @@ double now_ms() {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (!c::cpu_features().usable()) {
+        // the kernel is x86-only (AVX512-VNNI/VBMI): nothing to check here
+        std::printf("expert_multi_test: skipped (%s)\n", c::cpu_features().reason());
+        return 0;
+    }
     c::cpu_require_expert_support();
     std::mt19937 rng(9);
     const bool bench = argc > 1 && std::strcmp(argv[1], "--bench") == 0;

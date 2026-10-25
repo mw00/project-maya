@@ -11,10 +11,21 @@
 #include <windows.h>
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
+#elif defined(__linux__)
+#include <sys/resource.h>
 #endif
 
 int main() {
     const uint64_t bytes = 256ull << 20;
+#if defined(__linux__)
+    // the test locks the whole region, so it needs the lock limit to cover it: a container's default is 8 MB
+    struct rlimit rl{};
+    if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY && rl.rlim_cur < bytes) {
+        std::printf("platform_memory_test: skipped (RLIMIT_MEMLOCK is %llu MiB, under the %llu MiB the test locks)\n",
+                    (unsigned long long) (rl.rlim_cur >> 20), (unsigned long long) (bytes >> 20));
+        return 0;
+    }
+#endif
     void* p = std::malloc(bytes);
     if (p == nullptr) return 2;
     std::memset(p, 1, bytes);

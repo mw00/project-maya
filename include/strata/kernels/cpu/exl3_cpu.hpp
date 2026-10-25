@@ -26,6 +26,9 @@ struct Exl3Part {
 inline bool exl3_cpu_k2_ok(int k2) { return (k2 >= 2 && k2 <= 16 && (k2 & 1) == 0) || k2 == 3 || k2 == 5 || k2 == 7; }
 /// Whether a vector kernel runs here (AVX-512F/BW or AVX2 + FMA); the scalar one otherwise.
 bool exl3_cpu_vector();
+/// Whether the CPU lane's kernels exist here at all.  They are x86-only (the portable build has no version):
+/// false means the GPU computes every EXL3 expert, so the CPU lane must stay off.
+bool exl3_cpu_available();
 /// The kernel the functions below run here: 2 AVX-512 (F, BW), 1 AVX2 + FMA (+ F16C), 0 scalar.  STRATA_FORCE_AVX2=1
 /// keeps an AVX-512 CPU on AVX2 (to compare the two; they give the same bits).
 int exl3_cpu_tier();

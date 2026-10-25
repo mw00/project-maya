@@ -1697,9 +1697,14 @@ int main(int argc, char** argv) {
     test_gemm_rows(4096, 256, 6, 1, 100);
     test_gemm_rows(1024, 128, 8, 0, 7);
     for (int k2 : {4, 6, 8}) test_set(k2, 2);
-    for (int k2 = 2; k2 <= 16; k2 += 2) test_cpu(512, 256, k2);
-    test_cpu(4096, 2048, 6);
-    test_cpu(2048, 4096, 6);
+    // the CPU lane's kernels are x86-only: on another architecture the GPU computes every expert
+    const bool cpu_lane = cpu::exl3_cpu_available();
+    if (!cpu_lane) std::printf("  the CPU lane's kernels are not built here: its tests are skipped\n");
+    if (cpu_lane) {
+        for (int k2 = 2; k2 <= 16; k2 += 2) test_cpu(512, 256, k2);
+        test_cpu(4096, 2048, 6);
+        test_cpu(2048, 4096, 6);
+    }
     // several activations at once (a verify window): the same bits as one at a time
     for (int k2 = 2; k2 <= 16; k2 += 2) test_mv_n(512, 256, k2, 2, false, 3);
     for (int cb = 0; cb <= 1; ++cb) test_mv_n(256, 384, 8, cb, false, 5);
@@ -1709,14 +1714,16 @@ int main(int argc, char** argv) {
     for (int k2 : {4, 6, 8, 16}) test_win(k2, 2, 7);
     test_win(6, 1, 2);
     test_win(6, 2, 16);
-    for (int k2 : {2, 6, 12, 16}) test_cpu_n(512, 256, k2);
-    for (int k2 : {4, 6, 8, 10, 16}) test_cpu_rows(512, 384, k2);
-    for (int k2 : {6, 8, 12}) test_cpu_gemm(768, 256, k2);
-    test_cpu_had();
-    // the CPU tiers against an exact model of their arithmetic (odd slice counts too: 37 slices)
-    for (int k2 = 2; k2 <= 16; k2 += 2) test_cpu_exact(512, 256, k2);
-    test_cpu_exact(592, 384, 6);
-    test_cpu_exact(592, 256, 8);
+    if (cpu_lane) {
+        for (int k2 : {2, 6, 12, 16}) test_cpu_n(512, 256, k2);
+        for (int k2 : {4, 6, 8, 10, 16}) test_cpu_rows(512, 384, k2);
+        for (int k2 : {6, 8, 12}) test_cpu_gemm(768, 256, k2);
+        test_cpu_had();
+        // the CPU tiers against an exact model of their arithmetic (odd slice counts too: 37 slices)
+        for (int k2 = 2; k2 <= 16; k2 += 2) test_cpu_exact(512, 256, k2);
+        test_cpu_exact(592, 384, 6);
+        test_cpu_exact(592, 256, 8);
+    }
     // exllamav3 1.6's half-integer K 1.5 / 2.5 / 3.5 (k2 3, 5, 7; mul1 only) through every path, and an SC model's
     // layers (gate / up 3.5 with down 5, 1.5 with 3, 2.5 with 4)
     for (int k2 : {3, 5, 7}) test_mv(256, 256, k2, 2, false);
@@ -1736,21 +1743,25 @@ int main(int argc, char** argv) {
     for (int cb : {0, 2}) test_mixed(cb);   // (a mixed-precision layer)
     for (int T : {2, 7, 16}) test_win(4, 2, T, 0, true);   // (a mixed layer's window: the token path's bits too)
     test_win(4, 0, 7, 0, true);
-    for (int k2 : {3, 5, 7}) test_cpu(512, 256, k2);
-    test_cpu(4096, 2048, 7);
-    test_cpu(2048, 4096, 7);
+    if (cpu_lane) {
+        for (int k2 : {3, 5, 7}) test_cpu(512, 256, k2);
+        test_cpu(4096, 2048, 7);
+        test_cpu(2048, 4096, 7);
+    }
     for (int k2 : {3, 5, 7}) test_mv_n(512, 256, k2, 2, false, 3);
     for (int nc : {2, 7, 16}) test_mv_n(4096, 512, 7, 2, false, nc);
     test_mv_n(2048, 4096, 5, 2, true, 8);
     for (int k2 : {3, 5, 7}) test_win(k2, 2, 7);
     test_win(7, 2, 16, 10);
     test_win(3, 2, 7, 6);
-    for (int k2 : {3, 5, 7}) test_cpu_n(512, 256, k2);
-    for (int k2 : {3, 5, 7}) test_cpu_rows(512, 384, k2);
-    for (int k2 : {3, 5, 7}) test_cpu_gemm(768, 256, k2);
-    for (int k2 : {3, 5, 7}) test_cpu_exact(512, 256, k2);
-    test_cpu_exact(592, 384, 7);
-    test_cpu_exact(592, 256, 5);
+    if (cpu_lane) {
+        for (int k2 : {3, 5, 7}) test_cpu_n(512, 256, k2);
+        for (int k2 : {3, 5, 7}) test_cpu_rows(512, 384, k2);
+        for (int k2 : {3, 5, 7}) test_cpu_gemm(768, 256, k2);
+        for (int k2 : {3, 5, 7}) test_cpu_exact(512, 256, k2);
+        test_cpu_exact(592, 384, 7);
+        test_cpu_exact(592, 256, 5);
+    }
     // a half-integer K with another codebook is no bitrate exllamav3 writes: refused, nothing launched
     test_refuse_half_non_mul1();
     std::printf("exl3_test: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok", g_fail,

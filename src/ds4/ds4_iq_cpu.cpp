@@ -573,6 +573,7 @@ bool own_check(int type) {
     return true;
 }
 
+#if defined(IQ_X86)
 // the time (us, best of 5 rounds) of 32 rows of 16 blocks of the type against one token: ours with the IQ3 grids as
 // broadcasts + blends (variant 1) or by vpgatherdd (2), or the native lane's rows (0: the GLM lane's / ggml-cpu's)
 double time_variant(int type, int variant) {
@@ -615,6 +616,7 @@ double time_variant(int type, int variant) {
     if (gflag != nullptr) *gflag = keep;
     return best;
 }
+#endif  // IQ_X86
 
 // our rows for this type, here: IQ3_XXS / IQ3_S on AVX2 or AVX-512 VBMI, IQ2_XXS / IQ2_S on AVX2 - checked once
 // against ggml-cpu's dot (each variant), then the fastest of ours and the native lane's measured on this CPU (they

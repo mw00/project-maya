@@ -36,6 +36,18 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# x86 gets the AVX-512/AVX2 expert kernels; other architectures (aarch64: DGX Spark / Grace) take the
+# portable fallbacks and ggml-cpu's own NEON dot products for the native packs.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64|i.86")
+  set(STRATA_CPU_X86 ON)
+else()
+  set(STRATA_CPU_X86 OFF)
+endif()
+if(NOT STRATA_CPU_X86 AND NOT MSVC)
+  # ggml-cpu's reference sums must not be re-associated by the compiler (parity with the x86 kernels' order).
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
+endif()
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
@@ -873,18 +885,29 @@ if(STRATA_BUILD_TESTS)
   add_executable(conv_cache_test src/program/conv_cache_test.cpp)
   target_include_directories(conv_cache_test PRIVATE include)
   add_test(NAME conv_cache_test COMMAND conv_cache_test)
+  # the allocation failures the recovery recognizes: a prompt-path failure ends the request, not the process
+  # (header-only, no library to link)
+  add_executable(prefill_failure_test src/prefill/failure_test.cpp)
+  target_include_directories(prefill_failure_test PRIVATE include)
+  add_test(NAME prefill_failure_test COMMAND prefill_failure_test)
 endif()
 
-add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/exl3_ref.cpp
-            src/kernels/cpu/exl3_cpu.cpp)
+set(_strata_cpu_sources src/kernels/cpu/pool.cpp src/kernels/cpu/expert_layout.cpp
+                        src/kernels/cpu/exl3_ref.cpp)
+if(STRATA_CPU_X86)
+  list(APPEND _strata_cpu_sources src/kernels/cpu/expert.cpp src/kernels/cpu/q2_avx2.cpp
+       src/kernels/cpu/exl3_cpu.cpp)
+else()
+  list(APPEND _strata_cpu_sources src/kernels/cpu/portable.cpp)
+endif()
+add_library(strata_kernels_cpu STATIC ${_strata_cpu_sources})
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
-if(MSVC)
+if(STRATA_CPU_X86 AND MSVC)
   set_source_files_properties(src/kernels/cpu/expert.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
   set_source_files_properties(src/kernels/cpu/q2_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
-else()
+elseif(STRATA_CPU_X86)
   # GCC/Clang spell it differently, and `-mavx512vnni` alone is not enough: VBMI is a separate feature bit.
   set_source_files_properties(src/kernels/cpu/expert.cpp
                               PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx512vbmi;-mf16c;-mfma")
@@ -912,7 +935,12 @@ if(STRATA_NATIVE_EXPERTS)
   set(GGML_BACKEND_DL OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_TESTS OFF CACHE BOOL "" FORCE)
   set(GGML_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-  if(STRATA_PORTABLE)
+  if(NOT STRATA_CPU_X86)
+    set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
+    if(NOT GGML_CPU_ARM_ARCH)
+      set(GGML_CPU_ARM_ARCH "armv8.6-a+dotprod+i8mm+fp16" CACHE STRING "ggml-cpu ARM arch flags" FORCE)
+    endif()
+  elseif(STRATA_PORTABLE)
     set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
     foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
       set(${_f} ON CACHE BOOL "" FORCE)
@@ -936,16 +964,20 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp
-                                           src/kernels/cpu/iq_avx512_one.cpp)
+  if(STRATA_CPU_X86)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
+                                             src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx512.cpp
+                                             src/kernels/cpu/iq_avx512_one.cpp)
+  else()
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
-  if(MSVC)
+  if(STRATA_CPU_X86 AND MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/kq_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     set_source_files_properties(src/kernels/cpu/iq_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
     set_source_files_properties(src/kernels/cpu/iq_avx512_one.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
-  else()
+  elseif(STRATA_CPU_X86)
     # (no VNNI / VBMI needed - cpu_avx512bw_ok() is enough to run them; no FP contraction: their sums must take
     # ggml-cpu's float steps exactly, see iq_avx512.cpp)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp PROPERTIES COMPILE_OPTIONS
@@ -967,9 +999,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME native_split_test COMMAND native_split_test)
     # the multi-token expert rows (iq_avx512 / iq_avx2) bit for bit against ggml-cpu's dot, and GLM's split rows for a
     # window of tokens against the same tokens one at a time
-    add_executable(native_rows_exact_test src/kernels/cpu/native_rows_exact_test.cpp)
-    target_link_libraries(native_rows_exact_test PRIVATE strata_kernels_cpu)
-    add_test(NAME native_rows_exact_test COMMAND native_rows_exact_test)
+    if(STRATA_CPU_X86)
+      add_executable(native_rows_exact_test src/kernels/cpu/native_rows_exact_test.cpp)
+      target_link_libraries(native_rows_exact_test PRIVATE strata_kernels_cpu)
+      add_test(NAME native_rows_exact_test COMMAND native_rows_exact_test)
+    endif()
   endif()
   if(STRATA_BUILD_TESTS AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     # the dense GEMV for several conversations at once (mv_nt) against the one-conversation GEMV, bit for bit; the
@@ -1160,8 +1194,10 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME pool_stress COMMAND pool_stress 20)
   # the EXL3 CPU lane's tiers on random experts: a band's compute speed, and an expert's time on T threads from DRAM
   # in the engine's jobs (what the start-up timing compares with a copy over PCIe) - a benchmark, not a test
-  add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
-  target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
+  if(STRATA_CPU_X86)
+    add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
+    target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
+  endif()
 
   if(UNIX AND NOT APPLE)
     add_executable(direct_file_async_test tests/platform/direct_file_async.cpp src/platform/direct_file.cpp)
