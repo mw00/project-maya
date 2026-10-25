@@ -566,6 +566,16 @@ same. Not on a wave64 build (gfx908).
 | `MAYA_DS4_HC_FUSE` | off (0) | `1`: a decoded token's HC split and norm in one launch, the attention input rounded to int8 there; `2`: a verify window's rows too, and the FFN input rounded for the shared expert (the same bits, checked at load) |
 | `MAYA_DS4_ROUTE_FUSE` | off (0) | `1`: a decoded token's router stage on a group's lead in two launches instead of four; `2`: a verify window's rows too (the same bits, checked at load; one layer of lookahead, `DS4_AHEAD` 1, the default) |
 
+`MAYA_DS4_DECODE_TRIM=<bits>` takes four more small steps out of a decoded window, each checked at load the same way:
+`1` the shared expert's swiglu rounds its output to int8 for its down GEMV, `2` q's norm rounds its output for wq_b,
+`4` a verify window's compressor snapshot (four copies) and a ratio-1 layer's latent copy one kernel each, `8` the
+DSpark drafter's hand-offs between its GPUs (`MAYA_DS4_DRAFT_DEV`) through host-mapped rows and a flag, as a layer
+split's groups hand theirs, instead of copies through pinned memory and events. The bits add up (`15`: all four).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_DECODE_TRIM` | 0 | bits: `1` s2's int8 input from the swiglu, `2` wq_b's from q's norm, `4` the snapshot and latent copies one kernel each, `8` the drafter's hand-offs by host-mapped rows (the same bits, checked at load) |
+
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 
 `--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their
