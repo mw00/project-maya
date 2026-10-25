@@ -214,15 +214,31 @@ float dot(const float* a, const float* b, int n) {
     return s;
 }
 
-// y [rows][D] = RMSNorm(x) . w (F32)
+// y [rows][D] = RMSNorm(x) . w (F32; the sum of squares in dot's order; D a multiple of 8)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2,fma")))
+#endif
 void rms_rows(const float* x, const float* w, int rows, int D, float eps, float* y) {
     for (int r = 0; r < rows; ++r) {
         const float* xr = x + (size_t) r * D;
-        double ss = 0.0;
-        for (int i = 0; i < D; ++i) ss += (double) xr[i] * xr[i];
-        const float k = 1.0f / std::sqrt((float) (ss / D) + eps);
+        const float k = 1.0f / std::sqrt(dot(xr, xr, D) / (float) D + eps);
+        const __m256 kk = _mm256_set1_ps(k);
         float* yr = y + (size_t) r * D;
-        for (int i = 0; i < D; ++i) yr[i] = xr[i] * k * w[i];
+        for (int i = 0; i < D; i += 8)
+            _mm256_storeu_ps(yr + i, _mm256_mul_ps(_mm256_mul_ps(_mm256_loadu_ps(xr + i), kk), _mm256_loadu_ps(w + i)));
+    }
+}
+
+// h [n] += (p[0] + p[1] + ... + p[np - 1]) (+ extra) - the parts added in member order (n a multiple of 8)
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+void sum_into(float* h, const float* const* p, int np, const float* extra, size_t n) {
+    for (size_t i = 0; i < n; i += 8) {
+        __m256 s = _mm256_loadu_ps(p[0] + i);
+        for (int j = 1; j < np; ++j) s = _mm256_add_ps(s, _mm256_loadu_ps(p[j] + i));
+        if (extra) s = _mm256_add_ps(s, _mm256_loadu_ps(extra + i));
+        _mm256_storeu_ps(h + i, _mm256_add_ps(_mm256_loadu_ps(h + i), s));
     }
 }
 
@@ -242,7 +258,7 @@ struct TpEngine::Impl {
         size_t free0 = 0;
         float *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *iq = nullptr, *ik = nullptr, *bs = nullptr;
         float *att = nullptr, *gg = nullptr, *uu = nullptr, *sh = nullptr, *out = nullptr, *win_h = nullptr;
-        float *win_part = nullptr, *inv = nullptr;
+        float *win_part = nullptr, *inv = nullptr, *rlog_d = nullptr;
         int *pos = nullptr, *kept = nullptr, *pos_h = nullptr;
         uint8_t* plan_d = nullptr;
         unsigned* counter = nullptr;
@@ -257,12 +273,27 @@ struct TpEngine::Impl {
         unsigned *fin = nullptr, *fout = nullptr;              // the host's counter, the members' (kLine apart)
         unsigned seq_in = 0;
         std::vector<unsigned> seq_out;
+        float* rlog = nullptr;        // mapped: member 0's router logits [kWin][n_exp]
+        unsigned* frout = nullptr;    // its counter
+        unsigned seq_rout = 0;
+        // the expert cache (Options::promote): n_slots slice blobs on every member - the same expert in slot s on all -
+        // filled from the pinned pool on each member's copy stream after a window, its own a fixed number of windows
+        // after (promote_lag): which experts a window finds in VRAM follows from the tokens alone
+        int n_slots = 0;
+        size_t slot_bytes = 0;
+        std::vector<uint8_t*> slot_base;                  // [member]
+        std::vector<cudaStream_t> cs;                     // [member]
+        std::vector<std::vector<cudaEvent_t>> slot_ev;    // [member][slot]
+        std::vector<long long> slot_owner, slot_pend, slot_iss, slot_used;
+        int n_pending = 0;
+        std::vector<std::pair<int, long long>> promo_q;   // (slot, key) to copy after the window
     };
     struct Slice {   // a layer on one member
         x3::Mat q, k, v, o, mg, mu, md, sg, su, sd;
         float *qn1 = nullptr, *kn1 = nullptr, *iqn1 = nullptr, *ikn1 = nullptr, *wiq = nullptr, *wik = nullptr;
         uint16_t *kc = nullptr, *vc = nullptr, *ic = nullptr;
         uint8_t* res_base = nullptr;
+        float* gate = nullptr;   // (member 0: the router, F32 [n_exp][dim])
     };
     struct Layer {
         int group = 0;
@@ -274,6 +305,7 @@ struct TpEngine::Impl {
         std::vector<std::array<Ex3, 3>> ex;       // the experts' w1, w3, w2 in the files
         std::vector<int> res_slot, res_ids;
         std::vector<const uint8_t*> host;         // expert -> its tp slices in the pinned pool (blob apart)
+        std::vector<int> slot_of;                 // expert -> its slot in the group's cache (-1: none)
     };
 
     std::vector<Member> M;
@@ -305,8 +337,20 @@ struct TpEngine::Impl {
     std::unique_ptr<Vision> vis;
     std::vector<Model::Image> imgs;
     std::atomic<bool> abort_{false};
+    // (MM3_TP_PROF: where a window's host time goes, printed at the end)
+    const bool prof_on = std::getenv("MM3_TP_PROF") != nullptr;
+    double tp_norm = 0, tp_sum = 0, tp_route = 0, tp_plan = 0, tp_lane = 0, tp_wait = 0, tp_head = 0, tp_end = 0,
+           tp_draft = 0, tp_start = 0;
+    long tp_windows = 0;
 
     ~Impl() {
+        if (prof_on && tp_windows)
+            std::fprintf(stderr, "tp host, ms a window (%ld): start %.2f norms %.2f sums %.2f routing %.2f plans %.2f "
+                         "lane %.2f waits %.2f head %.2f end %.2f draft ctx %.2f\n", tp_windows,
+                         1e3 * tp_start / tp_windows, 1e3 * tp_norm / tp_windows, 1e3 * tp_sum / tp_windows,
+                         1e3 * tp_route / tp_windows, 1e3 * tp_plan / tp_windows, 1e3 * tp_lane / tp_windows,
+                         1e3 * tp_wait / tp_windows, 1e3 * tp_head / tp_windows, 1e3 * tp_end / tp_windows,
+                         1e3 * tp_draft / tp_windows);
         abort_.store(true);
         release_all();
         for (Member& m : M) m.w->stop();
@@ -321,6 +365,13 @@ struct TpEngine::Impl {
             cudaFree(owned[i]);
         }
         if (head_ev) cudaEventDestroy(head_ev);
+        for (Group& gr : G)
+            for (size_t j = 0; j < gr.cs.size(); ++j) {
+                cudaSetDevice(M[(size_t) gr.mem[j]].id);
+                if (gr.cs[j]) cudaStreamSynchronize(gr.cs[j]);
+                for (cudaEvent_t e : gr.slot_ev[j]) cudaEventDestroy(e);
+                if (gr.cs[j]) cudaStreamDestroy(gr.cs[j]);
+            }
         for (void* x : hosted) cudaFreeHost(x);
         if (pool) cudaFreeHost(pool);
         for (Member& m : M) {
@@ -415,6 +466,8 @@ struct TpEngine::Impl {
         o = o_;
         const double t0 = now();
         if (!pk.load(o.pack, err) || !g.read(pk, err)) return false;
+        if (const char* pr = std::getenv("MM3_PROMOTE"))
+            std::sscanf(pr, "%f,%d,%f", &kPromote, &kMaxPending, &kDecay);
         tp = o.tp;
         if (tp != 1 && tp != 2 && tp != 4) {
             err = "--tp " + std::to_string(tp) + ": 1, 2 or 4 (a member: 16 query heads a KV head)";
@@ -573,7 +626,8 @@ struct TpEngine::Impl {
                     !A(m.gg, (size_t) kWin * ffmax) || !A(m.uu, (size_t) kWin * ffmax) || !A(m.sh, (size_t) kWin * g.dim) ||
                     !A(m.out, (size_t) kWin * g.dim) || !A(m.win_h, (size_t) kWin * 8 * mfs) ||
                     !A(m.win_part, (size_t) kWin * 8 * g.dim) || !A(m.inv, inv_freq.size()) || !A(m.pos, (size_t) kWin) ||
-                    !A(m.kept, (size_t) mix * kWin * g.topk) || !A(m.plan_d, plan_bytes) || !A(m.counter, (size_t) 16))
+                    !A(m.kept, (size_t) mix * kWin * g.topk) || !A(m.plan_d, plan_bytes) || !A(m.counter, (size_t) 16) ||
+                    !A(m.rlog_d, (size_t) kWin * g.n_exp))
                     return false;
                 TK(cudaMemset(m.counter, 0, 64));
                 TK(cudaMemcpy(m.inv, inv_freq.data(), inv_freq.size() * 4, cudaMemcpyHostToDevice));
@@ -586,7 +640,8 @@ struct TpEngine::Impl {
             const unsigned mapped = cudaHostAllocMapped | cudaHostAllocPortable;
             if (!halloc(gr.xa, (size_t) kWin * g.dim, mapped, err) || !halloc(gr.xb, (size_t) kWin * g.dim, mapped, err) ||
                 !halloc(gr.part, (size_t) t * kWin * g.dim, mapped, err) || !halloc(gr.plans, (size_t) t * plan_bytes, mapped, err) ||
-                !halloc(gr.fin, kLine, mapped, err) || !halloc(gr.fout, (size_t) t * kLine, mapped, err))
+                !halloc(gr.fin, kLine, mapped, err) || !halloc(gr.fout, (size_t) t * kLine, mapped, err) ||
+                !halloc(gr.rlog, (size_t) kWin * g.n_exp, mapped, err) || !halloc(gr.frout, kLine, mapped, err))
                 return false;
             gr.seq_out.assign((size_t) t, 0);
         }
@@ -665,6 +720,7 @@ struct TpEngine::Impl {
                     !upload_f32(dv, wq, S.wiq, err) || !upload_f32(dv, wik, S.wik, err))
                     return false;
                 if (l.moe) {
+                    if (j == 0 && !upload_f32(dv, l.gate, S.gate, err)) return false;
                     if (!upload_slice(dv, N + "block_sparse_moe.shared_experts.gate_proj", 'n', j * mfss, (j + 1) * mfss, S.sg, err) ||
                         !upload_slice(dv, N + "block_sparse_moe.shared_experts.up_proj", 'n', j * mfss, (j + 1) * mfss, S.su, err) ||
                         !upload_slice(dv, N + "block_sparse_moe.shared_experts.down_proj", 'k', j * mfss, (j + 1) * mfss, S.sd, err))
@@ -704,7 +760,8 @@ struct TpEngine::Impl {
                 TK(cudaSetDevice(M[(size_t) mi].id));
                 size_t fr = 0, tot = 0;
                 TK(cudaMemGetInfo(&fr, &tot));
-                const size_t reserve = (size_t) (o.reserve_gb * (1u << 30));
+                const size_t reserve =
+                    (size_t) (((o.reserve_gb < 0 ? 0.3 : o.reserve_gb) + (o.promote ? o.cache_gb : 0.0)) * (1u << 30));
                 budget = std::min(budget, fr > reserve ? fr - reserve : 0);
             }
             std::vector<int> ml;
@@ -799,6 +856,30 @@ struct TpEngine::Impl {
                 return false;
             }
         }
+        // the expert cache's slots, group by group (cache_gb a member)
+        for (Group& gr : G) {
+            const int t = (int) gr.mem.size();
+            if (!o.promote || o.cache_gb <= 0) break;
+            for (int li = gr.l0; li < gr.l1; ++li) gr.slot_bytes = std::max(gr.slot_bytes, L[(size_t) li].blob);
+            if (gr.slot_bytes == 0) continue;
+            gr.n_slots = (int) ((size_t) (o.cache_gb * (1u << 30)) / gr.slot_bytes);
+            gr.slot_base.assign((size_t) t, nullptr);
+            gr.cs.assign((size_t) t, nullptr);
+            gr.slot_ev.assign((size_t) t, {});
+            for (int j = 0; j < t; ++j) {
+                Member& m = M[(size_t) gr.mem[(size_t) j]];
+                if (!dalloc(m.id, gr.slot_base[(size_t) j], (size_t) gr.n_slots * gr.slot_bytes, err)) return false;
+                TK(cudaStreamCreateWithFlags(&gr.cs[(size_t) j], cudaStreamNonBlocking));
+                gr.slot_ev[(size_t) j].resize((size_t) gr.n_slots);
+                for (auto& e : gr.slot_ev[(size_t) j]) TK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+            }
+            gr.slot_owner.assign((size_t) gr.n_slots, -1);
+            gr.slot_pend.assign((size_t) gr.n_slots, -1);
+            gr.slot_iss.assign((size_t) gr.n_slots, 0);
+            gr.slot_used.assign((size_t) gr.n_slots, -1);
+        }
+        for (Layer& l : L)
+            if (l.moe) l.slot_of.assign((size_t) g.n_exp, -1);
         // the pinned pool: every expert not in VRAM, its tp slices one after another (the CPU lane's sub-experts)
         {
             size_t total = 0;
@@ -863,6 +944,7 @@ struct TpEngine::Impl {
             long nr = 0;
             for (int li = gr.l0; li < gr.l1; ++li) nr += (long) L[(size_t) li].res_ids.size();
             s += " (tp " + std::to_string(gr.mem.size()) + "), " + std::to_string(nr) + " experts in VRAM";
+            if (gr.n_slots) s += ", a cache of " + std::to_string(gr.n_slots);
             info.push_back(s);
         }
         for (const Member& m : M) {
@@ -876,6 +958,89 @@ struct TpEngine::Impl {
         return true;
     }
 
+    // ---------------------------------------------------------------- the expert cache
+    long long fwd = 0;                        // windows so far
+    std::vector<float> use_score;             // a non-resident expert's uses (decayed kDecay a window) ...
+    std::vector<long long> use_last;          // ... as of this window
+    // (MM3_PROMOTE="threshold,pending,decay": the promotion's knobs while they are tuned)
+    float kDecay = 0.95f, kPromote = 1.8f;
+    int kMaxPending = 16;   // (the copies run after the window, during the draft: 16 a group was best of 4 / 16)
+
+    float score(long long key, bool add) {
+        if (use_score.empty()) {
+            use_score.assign((size_t) g.n_layers * 1024, 0.0f);
+            use_last.assign(use_score.size(), 0);
+        }
+        float& sc = use_score[(size_t) key];
+        sc *= std::pow(kDecay, (float) (fwd - use_last[(size_t) key]));
+        use_last[(size_t) key] = fwd;
+        if (add) sc += 1.0f;
+        return sc;
+    }
+
+    // a window's start: the slots whose copies began promote_lag windows ago are their experts' (copies waited for)
+    bool refresh(Group& gr, std::string& err) {
+        if (gr.n_pending == 0) return true;
+        for (int s = 0; s < gr.n_slots; ++s) {
+            const long long key = gr.slot_pend[(size_t) s];
+            if (key < 0 || fwd - gr.slot_iss[(size_t) s] < o.promote_lag) continue;
+            for (size_t j = 0; j < gr.mem.size(); ++j) {
+                TK(cudaSetDevice(M[(size_t) gr.mem[j]].id));
+                TK(cudaEventSynchronize(gr.slot_ev[j][(size_t) s]));
+            }
+            gr.slot_owner[(size_t) s] = key;
+            gr.slot_pend[(size_t) s] = -1;
+            gr.slot_used[(size_t) s] = fwd;
+            L[(size_t) (key / 1024)].slot_of[(size_t) (key % 1024)] = s;
+            --gr.n_pending;
+        }
+        return true;
+    }
+
+    // expert e of layer li ran on the CPU lane: when it keeps coming back, a slot (the one whose expert scores least,
+    // not used in this window) is its, its copy after the window
+    void consider(Group& gr, int li, int e) {
+        const long long key = (long long) li * 1024 + e;
+        const float sc = score(key, true);
+        if (!o.promote || gr.n_slots == 0 || sc < kPromote || gr.n_pending >= kMaxPending) return;
+        int best = -1;
+        float bs = sc;
+        for (int s = 0; s < gr.n_slots; ++s) {
+            if (gr.slot_pend[(size_t) s] >= 0 || gr.slot_used[(size_t) s] == fwd) continue;
+            const long long ok = gr.slot_owner[(size_t) s];
+            const float os = ok < 0 ? -1.0f : score(ok, false);
+            if (os < bs) {
+                bs = os;
+                best = s;
+            }
+        }
+        if (best < 0) return;
+        const long long old = gr.slot_owner[(size_t) best];
+        if (old >= 0) L[(size_t) (old / 1024)].slot_of[(size_t) (old % 1024)] = -1;
+        gr.slot_owner[(size_t) best] = -1;
+        gr.slot_pend[(size_t) best] = key;
+        ++gr.n_pending;
+        gr.promo_q.push_back({best, key});
+        ++st.promoted;
+    }
+
+    // after a window (its GPU work done): the promotions' copies, each member its slice
+    bool issue(Group& gr, std::string& err) {
+        for (const auto& [s, key] : gr.promo_q) {
+            const Layer& l = L[(size_t) (key / 1024)];
+            const uint8_t* src = l.host[(size_t) (key % 1024)];
+            for (size_t j = 0; j < gr.mem.size(); ++j) {
+                TK(cudaSetDevice(M[(size_t) gr.mem[j]].id));
+                TK(cudaMemcpyAsync(gr.slot_base[j] + (size_t) s * gr.slot_bytes, src + j * l.blob, l.blob,
+                                   cudaMemcpyHostToDevice, gr.cs[j]));
+                TK(cudaEventRecord(gr.slot_ev[j][(size_t) s], gr.cs[j]));
+            }
+            gr.slot_iss[(size_t) s] = fwd;
+        }
+        gr.promo_q.clear();
+        return true;
+    }
+
     CpuLane& lane_for(const Group& gr) {
         lane->set_width(g.ff / (int) gr.mem.size());
         return *lane;
@@ -883,7 +1048,7 @@ struct TpEngine::Impl {
 
     // ---------------------------------------------------------------- a forward of one window
     // member j of group gi's work for T tokens: every layer of the group, each step waiting on the host's counter
-    bool enqueue(int gi, int j, int T, int nblk, unsigned in0, unsigned out0, std::string& err) {
+    bool enqueue(int gi, int j, int T, int nblk, unsigned in0, unsigned out0, unsigned rout0, std::string& err) {
         Group& gr = G[(size_t) gi];
         Member& m = M[(size_t) gr.mem[(size_t) j]];
         const int t = (int) gr.mem.size();
@@ -904,7 +1069,7 @@ struct TpEngine::Impl {
             return jb;
         };
         const float scale = 1.0f / std::sqrt((float) g.hd);
-        unsigned vin = in0, vout = out0;
+        unsigned vin = in0, vout = out0, vrout = rout0;
         for (int li = gr.l0; li < gr.l1; ++li) {
             const Layer& l = L[(size_t) li];
             const Slice& S = l.sl[(size_t) j];
@@ -930,11 +1095,15 @@ struct TpEngine::Impl {
                 return false;
             }
             k::publish(m.out, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
-            // the FFN
+            // the FFN: member 0 the router's logits first (the host routes from them); every member its slice of the
+            // shared expert meanwhile, then the plans
             k::wait_flag(gr.fin, ++vin, m.s);
             TK(cudaMemcpyAsync(m.xn, gr.xb, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, m.s));
             if (l.moe) {
-                TK(cudaMemcpyAsync(m.plan_d, gr.plans + (size_t) j * plan_bytes, plan_bytes, cudaMemcpyHostToDevice, m.s));
+                if (j == 0) {
+                    k::rows_dot(S.gate, g.n_exp, g.dim, m.xn, T, m.rlog_d, m.s);
+                    k::publish(m.rlog_d, gr.rlog, (size_t) T * g.n_exp, m.counter, gr.frout, ++vrout, m.s);
+                }
                 const int ws = g.ff_shared / t;
                 const x3::MvJob gu[2] = {job(S.sg, m.xn, g.dim, m.gg, ws), job(S.su, m.xn, g.dim, m.uu, ws)};
                 if (!x3::mv(gu, 2, m.s)) {
@@ -947,6 +1116,8 @@ struct TpEngine::Impl {
                     err = "tp: mv shared down";
                     return false;
                 }
+                k::wait_flag(gr.fin, ++vin, m.s);
+                TK(cudaMemcpyAsync(m.plan_d, gr.plans + (size_t) j * plan_bytes, plan_bytes, cudaMemcpyHostToDevice, m.s));
                 const size_t off_w = (size_t) kWin * 8 * 8, off_gp = off_w + (size_t) kWin * 8 * 4,
                              off_gs = off_gp + (size_t) kWin * 8 * 8, off_ge = off_gs + ((size_t) kWin * 8 + 1) * 4,
                              off_ng = off_ge + (size_t) kWin * 8 * 4;
@@ -1045,6 +1216,29 @@ struct TpEngine::Impl {
         return true;
     }
 
+    bool wait_rout(Group& gr, std::string& err) {
+        const double t0 = now();
+        const unsigned want = gr.seq_rout + 1;
+        const volatile unsigned* f = gr.frout;
+        for (long spin = 0; (int) (*f - want) < 0; ++spin) {
+            _mm_pause();
+            if ((spin & 0xfffff) == 0xfffff) {
+                if (abort_.load()) {
+                    err = "tp: a member's work failed: " + member_errors();
+                    return false;
+                }
+                if (now() - t0 > 60.0) {
+                    err = "tp: the router's logits did not come in a minute";
+                    return false;
+                }
+            }
+        }
+        gr.seq_rout = want;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        st.t_sync += now() - t0;
+        return true;
+    }
+
     std::string member_errors() const {
         std::string s;
         for (const Member& m : M)
@@ -1057,33 +1251,43 @@ struct TpEngine::Impl {
         *(volatile unsigned*) gr.fin = ++gr.seq_in;
     }
 
-    // h [T][dim] += the members' partials (member order) + extra
-    void add_parts(const Group& gr, int T, const float* extra) {
-        const size_t n = (size_t) T * g.dim;
-        const int t = (int) gr.mem.size();
-        for (size_t i = 0; i < n; ++i) {
-            float s = gr.part[i];
-            for (int j = 1; j < t; ++j) s += gr.part[(size_t) j * kWin * g.dim + i];
-            if (extra) s += extra[i];
-            h[i] += s;
-        }
+    // y [rows][dim] = RMSNorm(x) . w, a row a job on the CPU lane's threads
+    void norm(const float* x, const float* w, int rows, float* y) {
+        const std::function<void(int)> f = [&](int r) {
+            rms_rows(x + (size_t) r * g.dim, w, 1, g.dim, g.eps, y + (size_t) r * g.dim);
+        };
+        if (lane && rows > 1) lane->parallel_for(rows, f);
+        else rms_rows(x, w, rows, g.dim, g.eps, y);
     }
 
-    // routing: xb [T][dim] -> top [T][K], w [T][K] (the router in F32 on the CPU lane's threads)
-    void route(const Layer& l, CpuLane& ln, const float* xb, int T, std::vector<int>& top, std::vector<float>& w) {
-        const int E = g.n_exp, K = g.k_exp;
-        const std::function<void(int)> f = [&](int e) {
-            const float* we = l.gate.data() + (size_t) e * g.dim;
-            for (int t = 0; t < T; ++t) rl[(size_t) t * E + e] = dot(we, xb + (size_t) t * g.dim, g.dim);
+    // h [T][dim] += the members' partials (member order) + extra
+    void add_parts(const Group& gr, int T, const float* extra) {
+        const float* p[8];
+        const int t = (int) gr.mem.size();
+        for (int j = 0; j < t; ++j) p[j] = gr.part + (size_t) j * kWin * g.dim;
+        const size_t n = (size_t) T * g.dim, piece = 3072;   // (pieces of the rows, on the CPU lane's threads)
+        const int np = (int) ((n + piece - 1) / piece);
+        const std::function<void(int)> f = [&](int q) {
+            const size_t a = (size_t) q * piece, b = std::min(n, a + piece);
+            const float* pp[8];
+            for (int j = 0; j < t; ++j) pp[j] = p[j] + a;
+            sum_into(h.data() + a, pp, t, extra ? extra + a : nullptr, b - a);
         };
-        ln.parallel_for(E, f);
+        if (lane && np > 1) lane->parallel_for(np, f);
+        else f(0), (void) 0;
+        if (!lane || np <= 1) return;
+    }
+
+    // routing: member 0's router logits (rlog [T][E], published) -> top [T][K], w [T][K]
+    void route(const Layer& l, const float* rlog, int T, std::vector<int>& top, std::vector<float>& w) {
+        const int E = g.n_exp, K = g.k_exp;
         top.assign((size_t) T * K, 0);
         w.assign((size_t) T * K, 0.0f);
         std::vector<float> sg((size_t) E), ch((size_t) E);
         std::vector<int> idx((size_t) E);
         for (int t = 0; t < T; ++t) {
             for (int e = 0; e < E; ++e) {
-                sg[(size_t) e] = 1.0f / (1.0f + std::exp(-rl[(size_t) t * E + e]));
+                sg[(size_t) e] = 1.0f / (1.0f + std::exp(-rlog[(size_t) t * E + e]));
                 ch[(size_t) e] = sg[(size_t) e] + l.bias[(size_t) e];
                 idx[(size_t) e] = e;
             }
@@ -1101,6 +1305,10 @@ struct TpEngine::Impl {
 
     bool window(const int* ids, int T, int pos0, int r0, int r1, float* logits, std::string& err) {
         const int nblk = (pos0 + T - 1) / g.blk + 1;
+        const double tw0 = now();
+        ++fwd;
+        for (Group& gr : G)
+            if (!refresh(gr, err)) return false;
         if (pos0 + T > o.max_ctx) {
             err = "the context is full (" + std::to_string(o.max_ctx) + ")";
             return false;
@@ -1134,13 +1342,13 @@ struct TpEngine::Impl {
         for (size_t gi = 0; gi < G.size(); ++gi)
             for (size_t j = 0; j < G[gi].mem.size(); ++j) {
                 Member& m = M[(size_t) G[gi].mem[j]];
-                const unsigned in0 = G[gi].seq_in, out0 = G[gi].seq_out[j];
+                const unsigned in0 = G[gi].seq_in, out0 = G[gi].seq_out[j], rout0 = G[gi].seq_rout;
                 const bool head = want_head && G[gi].mem[j] == head_m;
                 const unsigned hv = seq_head + 1;
                 const int rows = r1 - r0;
-                m.w->submit([this, gi, j, T, nblk, in0, out0, head, hv, rows, &m] {
+                m.w->submit([this, gi, j, T, nblk, in0, out0, rout0, head, hv, rows, &m] {
                     std::string e;
-                    if (!enqueue((int) gi, (int) j, T, nblk, in0, out0, e) || (head && !enqueue_head(rows, hv, e))) {
+                    if (!enqueue((int) gi, (int) j, T, nblk, in0, out0, rout0, e) || (head && !enqueue_head(rows, hv, e))) {
                         m.err = e;
                         abort_.store(true);
                     }
@@ -1152,24 +1360,42 @@ struct TpEngine::Impl {
                 if (mi == head_m) head_alone = false;
         if (head_alone && !enqueue_head(r1 - r0, seq_head + 1, err)) return false;
         // the host's side: layer by layer
+        double tq = now();
+        tp_start += tq - tw0;
+        ++tp_windows;
+        auto lap = [&](double& acc) {
+            const double t2 = now();
+            acc += t2 - tq;
+            tq = t2;
+        };
         bool ok = true;
         std::vector<int> top;
         std::vector<float> w;
         for (int li = 0; li < g.n_layers && ok; ++li) {
             Layer& l = L[(size_t) li];
             Group& gr = G[(size_t) l.group];
-            rms_rows(h.data(), l.in1.data(), T, g.dim, g.eps, gr.xa);
+            norm(h.data(), l.in1.data(), T, gr.xa);
+            lap(tp_norm);
             publish_in(gr);
             if (!wait_parts(gr, err)) {
                 ok = false;
                 break;
             }
+            lap(tp_wait);
             add_parts(gr, T, nullptr);
-            rms_rows(h.data(), l.post1.data(), T, g.dim, g.eps, gr.xb);
+            lap(tp_sum);
+            norm(h.data(), l.post1.data(), T, gr.xb);
+            lap(tp_norm);
             const float* extra = nullptr;
             if (l.moe) {
                 CpuLane& ln = lane_for(gr);
-                route(l, ln, gr.xb, T, top, w);
+                publish_in(gr);   // (xb: member 0 routes, the shared expert starts)
+                if (!wait_rout(gr, err)) {
+                    ok = false;
+                    break;
+                }
+                route(l, gr.rlog, T, top, w);
+                lap(tp_route);
                 const int K = g.k_exp, tm = (int) gr.mem.size();
                 for (int i = 0; i < T * K; ++i) ++prof[(size_t) li * g.n_exp + top[(size_t) i]];
                 st.profiled += (long) T * K;
@@ -1193,8 +1419,18 @@ struct TpEngine::Impl {
                             const int x = top[(size_t) t * K + i];
                             pw[e] = w[(size_t) t * K + i] * g.scale;
                             const int s = l.res_slot[(size_t) x];
-                            if (s < 0) continue;
-                            pp[e] = (unsigned long long) (l.sl[(size_t) j].res_base + (size_t) s * l.blob);
+                            if (s >= 0) {
+                                pp[e] = (unsigned long long) (l.sl[(size_t) j].res_base + (size_t) s * l.blob);
+                            } else if (l.slot_of[(size_t) x] >= 0) {
+                                const int c = l.slot_of[(size_t) x];
+                                pp[e] = (unsigned long long) (gr.slot_base[(size_t) j] + (size_t) c * gr.slot_bytes);
+                                if (j == 0) {
+                                    gr.slot_used[(size_t) c] = fwd;
+                                    score((long long) li * 1024 + x, true);   // (a cached expert's use keeps it)
+                                }
+                            } else {
+                                continue;
+                            }
                             size_t gi2 = 0;
                             while (gi2 < by_ptr.size() && by_ptr[gi2] != pp[e]) ++gi2;
                             if (gi2 == by_ptr.size()) {
@@ -1221,9 +1457,10 @@ struct TpEngine::Impl {
                 for (int t = 0; t < T; ++t)
                     for (int i = 0; i < K; ++i) {
                         const int x = top[(size_t) t * K + i];
-                        if (l.res_slot[(size_t) x] >= 0) continue;
+                        if (l.res_slot[(size_t) x] >= 0 || l.slot_of[(size_t) x] >= 0) continue;
                         const float wt = w[(size_t) t * K + i] * g.scale;
                         if (cpu_of[(size_t) x] < 0) {
+                            consider(gr, li, x);
                             cpu_of[(size_t) x] = (int) cpu.size();
                             for (int j = 0; j < tm; ++j) {
                                 const uint8_t* b = l.host[(size_t) x] + (size_t) j * l.blob;
@@ -1248,6 +1485,7 @@ struct TpEngine::Impl {
                         }
                     }
                 publish_in(gr);
+                lap(tp_plan);
                 if (!cpu.empty()) {
                     const double tl = now();
                     ln.run_multi(cpu, users, gr.xb, T, cpu_out.data(), &order);
@@ -1255,6 +1493,7 @@ struct TpEngine::Impl {
                     st.cpu_experts += (long) cpu.size() / tm;
                     extra = cpu_out.data();
                 }
+                lap(tp_lane);
             } else {
                 publish_in(gr);
             }
@@ -1262,7 +1501,9 @@ struct TpEngine::Impl {
                 ok = false;
                 break;
             }
+            lap(tp_wait);
             add_parts(gr, T, extra);
+            lap(tp_sum);
             if (draftm && tap_of[(size_t) li] >= 0)
                 std::memcpy(taps_h.data() + (size_t) tap_of[(size_t) li] * kWin * g.dim, h.data(),
                             (size_t) T * g.dim * 4);
@@ -1279,11 +1520,13 @@ struct TpEngine::Impl {
             release_all();
             return false;
         }
+        lap(tp_end);
         if (want_head) {
             cudaSetDevice(M[(size_t) head_m].id);
             TK(cudaEventSynchronize(head_ev));
             std::memcpy(logits, lgh, (size_t) (r1 - r0) * g.vocab * 4);
         }
+        lap(tp_head);
         for (Member& m : M) {   // (every member done: the next forward may use the buffers)
             cudaSetDevice(m.id);
             TK(cudaStreamSynchronize(m.s));
@@ -1293,6 +1536,8 @@ struct TpEngine::Impl {
             err = "EXL3 launch errors: " + std::to_string(e);
             return false;
         }
+        for (Group& gr : G)
+            if (!issue(gr, err)) return false;
         if (draftm) {
             Member& hm = M[(size_t) head_m];
             TK(cudaSetDevice(hm.id));
@@ -1302,6 +1547,7 @@ struct TpEngine::Impl {
                                    (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, hm.s));
             if (!draftm->context(taps_d, T, pos0, err)) return false;
         }
+        lap(tp_draft);
         return true;
     }
 

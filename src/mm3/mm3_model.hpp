@@ -24,7 +24,8 @@ struct Options {
     int max_ctx = 32768;
     int chunk = 1024;             // prompt tokens a forward takes at most
     int staging = 48;             // expert staging slots a GPU (each one expert's blob)
-    double reserve_gb = 1.0;      // VRAM a GPU keeps free beyond the plan
+    double reserve_gb = -1;       // VRAM a GPU keeps free beyond the plan (< 0: 1.0, the tensor-parallel path 0.3 -
+                                  // it allocates all it needs at the load)
     int resident_cap = -1;        // routed experts kept in VRAM a layer at most (-1: as many as fit)
     std::string profile;          // an expert profile (uint32 [layers][experts] routings): the most used stay in VRAM
     bool pin_pool = true;         // the experts not in VRAM assembled once in pinned host memory (a miss: one DMA)
@@ -38,6 +39,7 @@ struct Options {
     int promote_lag = 2;          // a promoted expert's slot is its own this many forwards after its copy began, the
                                   // copy waited for then (1: the next forward - plain decode then waits ~5 ms a token)
     int tp = 0;                   // > 0: the tensor-parallel path (mm3_tp.hpp) in groups of tp GPUs (1, 2 or 4)
+    double cache_gb = 1.5;        // (tp) each GPU's expert cache (promote's slots), taken from its experts in VRAM
     bool verbose = false;
 };
 

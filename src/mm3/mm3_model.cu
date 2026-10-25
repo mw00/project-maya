@@ -587,7 +587,7 @@ struct Model::Impl {
             CK(cudaSetDevice(d.id));
             size_t fr = 0, tot = 0;
             CK(cudaMemGetInfo(&fr, &tot));
-            const size_t reserve = (size_t) (o.reserve_gb * (1u << 30));
+            const size_t reserve = (size_t) ((o.reserve_gb < 0 ? 1.0 : o.reserve_gb) * (1u << 30));
             size_t budget = fr > reserve ? fr - reserve : 0;
             std::vector<int> moe_layers;
             for (int li : d.layers)
