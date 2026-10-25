@@ -1421,7 +1421,8 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
         max_n[f] = std::max(max_n[f], m.n);
         max_c[f] = std::max(max_c[f], q.ncol);
         const bool xa = ((uintptr_t) b.x & 15u) == 0 && (q.ncol == 1 || b.xcs % 4 == 0);
-        if (f == 2 && pre != nullptr && q.xf == pre->x && m.k == pre->k && q.ncol == 1) {
+        if (f == 2 && pre != nullptr && q.xf == pre->x && m.k == pre->k && q.ncol == pre->rows &&
+            (q.ncol == 1 || q.xf_cs == (size_t) m.k)) {
             b.xq = pre->q;   // (DS4_HC_FUSE: x rounded where it was made, q8_quant_block's bits)
             b.xd = pre->d;
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;

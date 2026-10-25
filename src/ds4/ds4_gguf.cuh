@@ -71,6 +71,7 @@ struct PreQ8 {
     const int8_t* q = nullptr;
     const float* d = nullptr;
     int k = 0;
+    int rows = 1;   // (DS4_HC_FUSE=2: a window's rows of x, k apart; their int8 rows k apart, scales k / 32 apart)
 };
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre);
 /// The int8 rounding mv gives a kFmtQ8_0 job's one F32 input of k values (DS4_Q8_BATCH: its batched launch's, else the

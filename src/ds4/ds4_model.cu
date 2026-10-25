@@ -1121,6 +1121,9 @@ struct Model::Impl {
     // DS4_HC_FUSE=1: a decoded token's (T 1) hc_split and hc_pre_norm in one launch (hc_split_pre_norm), the attention
     // input's int8 rounding there, the layer's copy of the pre slots by its FFN split - checked at load (hc_fuse_check)
     bool hc_fuse = false;
+    // DS4_HC_FUSE=2: the same for a decode window's rows too (T up to kWin: a DSpark verify window's), the attention
+    // input's rows rounded there for its GEMVs (PreQ8::rows) - checked at load on kWin rows (hc_fuse_check's T)
+    bool hc_fuse_win = false;
     // DS4_ROUTE_FUSE=1: a decoded token's (T 1) router stage on a group's lead with a next layer to guess
     // (route_fusable) - its gate and the next layer's in one launch (gemv_f32_pair), the routing and the guesses in
     // another (route_pair), publish as before - checked at load (route_fuse_check).  The load refuses it with
@@ -2503,24 +2506,27 @@ struct Model::Impl {
             }
         }
         if (const char* v = ds4_env("DS4_HC_FUSE")) {   // (MAYA_DS4_HC_FUSE)
-            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
-                err = std::string("DS4_HC_FUSE=") + v + ": 1 or 0";
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_HC_FUSE=") + v + ": 2, 1 or 0";
                 return false;
             }
-            hc_fuse = std::strcmp(v, "1") == 0;
+            hc_fuse = std::strcmp(v, "1") == 0 || std::strcmp(v, "2") == 0;
+            hc_fuse_win = std::strcmp(v, "2") == 0;
 #ifdef STRATA_HIP_WAVE64
             if (hc_fuse) {   // (its warp roundings are a 32-lane warp's)
-                err = "DS4_HC_FUSE=1 on a wave64 build";
+                err = std::string("DS4_HC_FUSE=") + v + " on a wave64 build";
                 return false;
             }
 #endif
             if (hc_fuse && (!pk.gguf || g.hc != 4 || g.dim % 32 != 0 || g.dim > 8 * 1024 || g.sinkhorn < 1)) {
-                err = "DS4_HC_FUSE=1: not this model's shapes (a GGUF, 4 streams, dim a multiple of 32 up to 8192)";
+                err = std::string("DS4_HC_FUSE=") + v +
+                      ": not this model's shapes (a GGUF, 4 streams, dim a multiple of 32 up to 8192)";
                 return false;
             }
             if (hc_fuse)
                 std::fprintf(stderr, "ds4: a decoded token's HC split and norm in one launch, its attention input "
-                                     "rounded to int8 there, the layer's pre copy by its FFN split (DS4_HC_FUSE)\n");
+                                     "rounded to int8 there, the layer's pre copy by its FFN split (DS4_HC_FUSE)%s\n",
+                             hc_fuse_win ? "; a decode window's rows too (DS4_HC_FUSE=2)" : "");
         }
         if (const char* v = ds4_env("DS4_ROUTE_FUSE")) {   // (MAYA_DS4_ROUTE_FUSE)
             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
@@ -2959,7 +2965,9 @@ struct Model::Impl {
             d.attn_scr.cap = (int) topk_stride();
             if (!dalloc(d, d.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
             d.tks.T = (int) kTksRows, d.tks.P = (int) tks_p(), d.tks.K = g.ix_topk;
-            if (hc_fuse && !(dalloc(d, d.xq8, (size_t) D, err) && dalloc(d, d.xd8, (size_t) D / 32, err))) return false;
+            if (hc_fuse && !(dalloc(d, d.xq8, (size_t) (hc_fuse_win ? kWin : 1) * D, err) &&   // (=2: a window's rows)
+                             dalloc(d, d.xd8, (size_t) (hc_fuse_win ? kWin : 1) * D / 32, err)))
+                return false;
             if (!g.eg_layers.empty()) {
                 const int cols = (pk.eg_ngram - 1) * pk.eg_heads;
                 ok = dalloc(d, d.eg_rows, W * cols * (pk.eg_hd + pk.eg_hd / 32), err) &&
@@ -3403,6 +3411,7 @@ struct Model::Impl {
             ahead_rank.assign(L.size() * 1024, 0);
             ahead_for.assign(L.size(), 0);
             if (hc_fuse && !hc_fuse_check(err)) return false;   // (no request yet)
+            if (hc_fuse_win && !hc_fuse_check(err, kWin)) return false;   // (a window's rows)
             if (route_fuse && !route_fuse_check(err)) return false;   // (no request yet)
             if (tp_uneven && (std::getenv("STRATA_DS4_TP_CHECK") != nullptr || std::getenv("DS4_TP_CHECK") != nullptr) &&
                 !tp_check(err))
@@ -8223,7 +8232,9 @@ struct Model::Impl {
     // 4..7 a NaN payload, -0, a denormal, -123.5); both paths' bytes must be equal - every output, slot and guard, the
     // guards untouched - the written values finite and the int8 scales written (>= 0).  On d.st, each run's end waited
     // for (10 s): a CUDA error or a mismatch after a clean end fails the load (everything freed); no clean end ends the
-    // process at once (hc_unknown - what the run may still touch is the model's)
+    // process at once (hc_unknown - what the run may still touch is the model's).  T rows (DS4_HC_FUSE=2: kWin, a
+    // decode window's): every input and output T rows at the decode buffers' strides, each row its own inputs, x's int8
+    // rows by q8_round a row and the GEMVs on T columns (the fused path's PreQ8 rows T); T 1 is the check above
     [[noreturn]] static void hc_unknown(int dev, int il, bool ffn, const char* why) {
         std::fprintf(stderr, "ds4: HC fuse check: CUDA%d (layer %d, %s): %s - the device's state unknown; the process "
                              "ends without teardown (exit %d)\n",
@@ -8232,22 +8243,25 @@ struct Model::Impl {
         std::fflush(stdout);
         std::_Exit(kExitUnknown);
     }
-    bool hc_fuse_check(std::string& err) {
+    bool hc_fuse_check(std::string& err, int T = 1) {
         const int D = g.dim, HD = g.hd, QL = g.q_lora;
         constexpr size_t kGuard = 64;
         static constexpr uint32_t kSent[8] = {0x3e800000u, 0x3f000000u, 0x3f400000u, 0x3f800000u,
                                               0x7fc0beefu, 0x80000000u, 0x00000001u, 0xc2f70000u};
         // one set of outputs: [guard | region]... | guard, in bytes
         enum { kPre, kPost, kComb, kCopy, kX, kQ, kQd, kQr, kKvr, kCkr, kCgr, kRegions };
-        const size_t rb[kRegions] = {32, 32, 256, 32, (size_t) D * 4, (size_t) D, (size_t) D / 32 * 4, (size_t) QL * 4,
-                                     (size_t) HD * 4, (size_t) HD * 4, (size_t) HD * 4};
-        size_t at[kRegions], set_bytes = 0;
+        const size_t rb1[kRegions] = {32, 32, 256, 32, (size_t) D * 4, (size_t) D, (size_t) D / 32 * 4, (size_t) QL * 4,
+                                      (size_t) HD * 4, (size_t) HD * 4, (size_t) HD * 4};   // (a row's)
+        size_t rb[kRegions], at[kRegions], set_bytes = 0;
         for (int r = 0; r < kRegions; ++r) {
+            rb[r] = rb1[r] * (size_t) T;
             at[r] = set_bytes + kGuard;
             set_bytes = (at[r] + rb[r] + 255) / 256 * 256;
         }
         set_bytes += kGuard;
-        const size_t n_in = (size_t) 4 * D + 32 + 8 + (size_t) D;   // h | mixes | the lagged mix | a synthetic norm
+        // h | mixes | the lagged mix (T rows each) | a synthetic norm
+        const size_t n_in = (size_t) T * (4 * (size_t) D + 32 + 8) + (size_t) D;
+        const std::string rows = T > 1 ? " (" + std::to_string(T) + " rows)" : "";
         uint32_t st = 0x2545f491u;
         auto rnd = [&]() {
             st = st * 1664525u + 1013904223u;
@@ -8271,8 +8285,8 @@ struct Model::Impl {
             if (ls.empty()) continue;
             if (std::find(ls.begin(), ls.end(), last) == ls.end()) ls.push_back(last);
             auto fail_at = [&](const std::string& why) {
-                err = "HC fuse check on CUDA" + std::to_string(d.id) + ": " + why;
-                std::fprintf(stderr, "ds4: CUDA%d HC fuse check FAILED: %s\n", d.id, why.c_str());
+                err = "HC fuse check" + rows + " on CUDA" + std::to_string(d.id) + ": " + why;
+                std::fprintf(stderr, "ds4: CUDA%d HC fuse check%s FAILED: %s\n", d.id, rows.c_str(), why.c_str());
                 return false;
             };
             if (cudaSetDevice(d.id) != cudaSuccess) {
@@ -8294,7 +8308,7 @@ struct Model::Impl {
                 if (ev != nullptr) cudaEventDestroy(ev);
                 return fail_at("its buffers");
             }
-            float *h = in, *mixes = in + (size_t) 4 * D, *lag = mixes + 32, *wsyn = lag + 8;
+            float *h = in, *mixes = in + (size_t) T * 4 * D, *lag = mixes + 32 * T, *wsyn = lag + 8 * T;
             std::vector<float> hin(n_in);   // (the host's inputs: written again only after the run before has ended)
             int runs = 0;
             std::string bad;
@@ -8302,52 +8316,59 @@ struct Model::Impl {
                 for (int kind = 0; kind < 3 && bad.empty(); ++kind)
                     for (int ffn = 0; ffn < 2 && bad.empty(); ++ffn) {
                         const Layer& l = *lp;
-                        float *hh = hin.data(), *hm = hh + (size_t) 4 * D, *hl = hm + 32, *hw = hl + 8;
-                        for (int e = 0; e < D; ++e) {
-                            const int blk = e / 32, lane = e % 32;
-                            for (int k = 0; k < 4; ++k) {
-                                float v = rnd() * (float) (1 + k);
-                                if (kind == 1)
-                                    switch (blk % 8) {
-                                        case 0: v = 0.0f; break;
-                                        case 1: v = -0.0f; break;
-                                        case 2: v = rnd() * 1e-20f; break;
-                                        case 3: v = rnd() * 1e15f; break;
-                                        case 4: v = lane == 5 ? 1000.0f : rnd(); break;
-                                        default: break;
-                                    }
-                                if (kind == 2) v = k == 0 ? (blk % 2 ? -8.0f : 8.0f) : 7.0f;
-                                hh[(size_t) k * D + e] = v;
+                        float *hh = hin.data(), *hm = hh + (size_t) T * 4 * D, *hl = hm + 32 * T, *hw = hl + 8 * T;
+                        for (int t = 0; t < T; ++t)
+                            for (int e = 0; e < D; ++e) {
+                                const int blk = e / 32, lane = e % 32;
+                                for (int k = 0; k < 4; ++k) {
+                                    float v = rnd() * (float) (1 + k);
+                                    if (kind == 1)
+                                        switch (blk % 8) {
+                                            case 0: v = 0.0f; break;
+                                            case 1: v = -0.0f; break;
+                                            case 2: v = rnd() * 1e-20f; break;
+                                            case 3: v = rnd() * 1e15f; break;
+                                            case 4: v = lane == 5 ? 1000.0f : rnd(); break;
+                                            default: break;
+                                        }
+                                    if (kind == 2) v = k == 0 ? (blk % 2 ? -8.0f : 8.0f) : 7.0f;
+                                    hh[((size_t) t * 4 + k) * D + e] = v;
+                                }
+                                hw[e] = (lane == 0 ? 127.0f : (float) (lane - 16) + 0.5f) * (blk % 2 ? 2.0f : 1.0f);
                             }
-                            hw[e] = (lane == 0 ? 127.0f : (float) (lane - 16) + 0.5f) * (blk % 2 ? 2.0f : 1.0f);
-                        }
-                        for (int i = 0; i < 32; ++i)   // (edges: every third mix +-80, expf past its range)
-                            hm[i] = i < 24 ? rnd() * (kind == 1 && i % 3 == 0 ? 20.0f : 1.0f) : 0.0f;
+                        for (int t = 0; t < T; ++t)
+                            for (int i = 0; i < 32; ++i)   // (edges: every third mix +-80, expf past its range)
+                                hm[32 * t + i] = i < 24 ? rnd() * (kind == 1 && i % 3 == 0 ? 20.0f : 1.0f) : 0.0f;
                         const float lag_k[3][4] = {{0.4f, 0.9f, 0.6f, 1.2f}, {1.5f, 0.0f, -0.75f, 0.25f}, {1, 0, 0, 0}};
-                        for (int i = 0; i < 8; ++i) {
-                            if (i < 4) hl[i] = lag_k[kind][i];
-                            else std::memcpy(&hl[i], &kSent[i], 4);
-                        }
+                        for (int t = 0; t < T; ++t)
+                            for (int i = 0; i < 8; ++i) {
+                                if (i < 4) hl[8 * t + i] = lag_k[kind][i];
+                                else std::memcpy(&hl[8 * t + i], &kSent[i], 4);
+                            }
                         const float* w = kind == 2 ? wsyn : ffn ? l.ffn_norm : l.attn_norm;
                         uint8_t* set[2] = {out, out + set_bytes};   // the old path's, the fused one's
                         auto F = [&](int b, int r) { return (float*) (set[b] + at[r]); };
                         bool ok = cudaMemcpyAsync(in, hin.data(), n_in * 4, cudaMemcpyHostToDevice, s) == cudaSuccess &&
                                   cudaMemsetAsync(out, 0xA5, 2 * set_bytes, s) == cudaSuccess;
-                        for (int b = 0; ok && b < 2; ++b)
-                            ok = cudaMemcpyAsync(set[b] + at[kPre], kSent, 32, cudaMemcpyHostToDevice, s) ==
-                                 cudaSuccess;
+                        for (int b = 0; b < 2; ++b)
+                            for (int t = 0; ok && t < T; ++t)
+                                ok = cudaMemcpyAsync(set[b] + at[kPre] + 32 * t, kSent, 32, cudaMemcpyHostToDevice,
+                                                     s) == cudaSuccess;
                         x3::MvJob j[4];
                         int nj = 0;
                         if (ok) {   // the old path
                             hc_split(mixes, ffn ? l.hcf_scale : l.hca_scale, ffn ? l.hcf_base : l.hca_base, g.hc,
-                                     g.sinkhorn, g.hc_eps, 1, F(0, kPre), F(0, kPost), F(0, kComb), s);
-                            hc_pre_norm(h, lag, w, D, g.hc, 1, g.eps, F(0, kX), s);
+                                     g.sinkhorn, g.hc_eps, T, F(0, kPre), F(0, kPost), F(0, kComb), s);
+                            hc_pre_norm(h, lag, w, D, g.hc, T, g.eps, F(0, kX), s);
                             if (ffn)
-                                ok = cudaMemcpyAsync(F(0, kCopy), F(0, kPre), 32, cudaMemcpyDeviceToDevice, s) ==
-                                     cudaSuccess;
+                                ok = cudaMemcpyAsync(F(0, kCopy), F(0, kPre), (size_t) 32 * T, cudaMemcpyDeviceToDevice,
+                                                     s) == cudaSuccess;
                             else {
-                                gg::q8_round(F(0, kX), D, (int8_t*) (set[0] + at[kQ]), F(0, kQd), s);
-                                nj = attn_in_jobs(l, F(0, kX), F(0, kQr), F(0, kKvr), F(0, kCkr), F(0, kCgr), 1, j);
+                                for (int t = 0; t < T; ++t)
+                                    gg::q8_round(F(0, kX) + (size_t) t * D, D,
+                                                 (int8_t*) (set[0] + at[kQ]) + (size_t) t * D,
+                                                 F(0, kQd) + (size_t) t * (D / 32), s);
+                                nj = attn_in_jobs(l, F(0, kX), F(0, kQr), F(0, kKvr), F(0, kCkr), F(0, kCgr), T, j);
                                 ok = mv_any(j, nj, s);
                             }
                         }
@@ -8356,14 +8377,15 @@ struct Model::Impl {
                                                ffn ? nullptr : (int8_t*) (set[1] + at[kQ]), ffn ? nullptr : F(1, kQd),
                                                F(1, kPre), F(1, kPost), F(1, kComb), ffn ? F(1, kCopy) : nullptr);
                             a.w = w;
-                            hc_split_pre_norm(a, s);
+                            hc_split_pre_norm(a, s, T);
                             if (!ffn) {
                                 gg::PreQ8 pq;
                                 pq.x = F(1, kX);
                                 pq.q = (const int8_t*) (set[1] + at[kQ]);
                                 pq.d = F(1, kQd);
                                 pq.k = D;
-                                nj = attn_in_jobs(l, F(1, kX), F(1, kQr), F(1, kKvr), F(1, kCkr), F(1, kCgr), 1, j);
+                                pq.rows = T;
+                                nj = attn_in_jobs(l, F(1, kX), F(1, kQr), F(1, kKvr), F(1, kCkr), F(1, kCgr), T, j);
                                 ok = mv_any(j, nj, s, &pq);
                                 kind_run[nj] = true;
                             }
@@ -8408,12 +8430,14 @@ struct Model::Impl {
                             const size_t n = r == kPre || r == kPost || r == kCopy ? 4
                                              : r == kComb                          ? 16
                                              : r >= kQr                            ? (size_t) j[r - kQr].m->n
-                                                                                   : rb[r] / 4;
-                            for (size_t i = 0; i < n && bad.empty(); ++i) {
-                                float v;
-                                std::memcpy(&v, A + at[r] + 4 * i, 4);
-                                if (!std::isfinite(v) || (r == kQd && !(v >= 0.0f))) bad = where(rname[r], 4 * i);
-                            }
+                                                                                   : rb1[r] / 4;   // (a row's)
+                            for (int t = 0; t < T; ++t)
+                                for (size_t i = 0; i < n && bad.empty(); ++i) {
+                                    const size_t o = rb1[r] * t + 4 * i;
+                                    float v;
+                                    std::memcpy(&v, A + at[r] + o, 4);
+                                    if (!std::isfinite(v) || (r == kQd && !(v >= 0.0f))) bad = where(rname[r], o);
+                                }
                         }
                         for (size_t o = at[kRegions - 1] + rb[kRegions - 1]; o < set_bytes && bad.empty(); ++o)
                             if (A[o] != 0xA5) bad = where("the last guard", o);
@@ -8432,10 +8456,11 @@ struct Model::Impl {
             std::string ids;
             for (const Layer* lp : ls) ids += (ids.empty() ? "" : " ") + std::to_string(lp->il);
             std::fprintf(stderr,
-                         "ds4: CUDA%d HC fuse check: %d runs (layers %s; attention inputs of %s GEMVs; attention and "
+                         "ds4: CUDA%d HC fuse check%s: %d runs (layers %s; attention inputs of %s GEMVs; attention and "
                          "FFN; random / edges / ties): pre, post, comb, the pre copy, x, its int8 rounding and the "
-                         "attention GEMVs the old kernels' bit for bit, all finite, every guard intact (DS4_HC_FUSE)\n",
-                         d.id, runs, ids.c_str(), kinds.c_str());
+                         "attention GEMVs the old kernels' bit for bit, all finite, every guard intact "
+                         "(DS4_HC_FUSE%s)\n",
+                         d.id, rows.c_str(), runs, ids.c_str(), kinds.c_str(), T > 1 ? "=2" : "");
         }
         return true;
     }
@@ -13270,8 +13295,9 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
         const int nm = L0.nm;
-        // (DS4_HC_FUSE: a decoded token's split and norm in one launch on st, so its mixes are not beside it)
-        const bool fuse = hc_fuse && T == 1 && !l.mtp;
+        // (DS4_HC_FUSE: a decoded token's split and norm in one launch on st, so its mixes are not beside it; =2 a
+        // window's rows too)
+        const bool fuse = hc_fuse && !l.mtp && (T == 1 || (hc_fuse_win && T <= kWin));
         const bool hs = hc_side() && !fuse;   // (the mixes on st2)
         cudaStream_t hcs = hs ? d.st2 : s;
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
@@ -13306,11 +13332,12 @@ struct Model::Impl {
         gg::PreQ8 xq8;
         if (fuse) {
             hc_split_pre_norm(
-                hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8, d.a_pre, d.a_post, d.a_comb, nullptr), s);
+                hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8, d.a_pre, d.a_post, d.a_comb, nullptr), s, T);
             xq8.x = d.x;
             xq8.q = d.xq8;
             xq8.d = d.xd8;
             xq8.k = D;
+            xq8.rows = T;
         } else {
             hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, hcs);
             if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
@@ -13554,7 +13581,7 @@ struct Model::Impl {
         hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         if (fuse)   // (d.pre's copy of f_pre now: nothing here reads d.pre before the layer's end)
             hc_split_pre_norm(
-                hc_args(l, true, d.mix, d.h, d.a_pre, d.x, nullptr, nullptr, d.f_pre, d.f_post, d.f_comb, d.pre), s);
+                hc_args(l, true, d.mix, d.h, d.a_pre, d.x, nullptr, nullptr, d.f_pre, d.f_post, d.f_comb, d.pre), s, T);
         else {
             hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
             if (hs) CK(cudaEventRecord(d.hc_done, d.st2));

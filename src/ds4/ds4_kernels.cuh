@@ -95,7 +95,9 @@ struct HcFuse {
     int8_t* q = nullptr;
     float* qd = nullptr;
 };
-void hc_split_pre_norm(const HcFuse& a, cudaStream_t s);
+/// T rows (DS4_HC_FUSE=2: a decode window's): row t's at hc_split's / hc_pre_norm's / q8's strides - mixes + 32 t,
+/// pre / post / pre_copy + 8 t, comb + 64 t, h + hc dim t, mix + 8 t, x / q + dim t, qd + dim / 32 t
+void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T = 1);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
