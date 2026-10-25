@@ -627,6 +627,56 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __
             if (lane == 0) y[(size_t) (t0 + t) * ldy + row] = s;
         }
 }
+// (DS4_ROUTE_FUSE=2, a decode window: T 2 .. kWin) two gemv_f32_rows_kernel launches in one grid - its first
+// cdiv(n0, 8) blocks are W0's rows into y0, the rest W1's into y1, each block gemv_f32_rows_kernel's code for its
+// kGemvT tokens (blockIdx.y) - so each (token, row) the rows kernel's bits, the one-token kernel's.  The old kernel
+// stays as it is: route_fuse_check (ds4_model.cu) compares the two
+__global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const float* __restrict__ W0, int n0,
+                                                                      float* __restrict__ y0,
+                                                                      const float* __restrict__ W1, int n1,
+                                                                      float* __restrict__ y1,
+                                                                      const float* __restrict__ x, int k, int T,
+                                                                      int ldy) {
+    __shared__ float4 xs[kGemvT][kGemvK];
+    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
+    const bool second = (int) blockIdx.x >= b0;
+    const float* W = second ? W1 : W0;
+    const int n = second ? n1 : n0;
+    float* y = second ? y1 : y0;
+    const int row = ((int) blockIdx.x - (second ? b0 : 0)) * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
+    const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
+    float acc[kGemvT];
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
+    for (int c0 = 0; c0 < k4; c0 += kGemvK) {
+        const int nc = min(kGemvK, k4 - c0);
+        __syncthreads();
+        for (int i = (int) threadIdx.x; i < kGemvT * kGemvK; i += kThreads) {
+            const int t = i / kGemvK, c = i % kGemvK;
+            if (t < nt && c < nc) xs[t][c] = ((const float4*) (x + (size_t) (t0 + t) * k))[c0 + c];
+        }
+        __syncthreads();
+        for (int c = lane; c < nc; c += 32) {
+            const float4 a = w[c0 + c];
+#pragma unroll
+            for (int t = 0; t < kGemvT; ++t) {
+                const float4 b = xs[t][c];
+                acc[t] = fmaf(a.x, b.x, acc[t]);
+                acc[t] = fmaf(a.y, b.y, acc[t]);
+                acc[t] = fmaf(a.z, b.z, acc[t]);
+                acc[t] = fmaf(a.w, b.w, acc[t]);
+            }
+        }
+    }
+    if (row >= n) return;
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t)
+        if (t < nt) {
+            const float s = warp_sum(acc[t]);
+            if (lane == 0) y[(size_t) (t0 + t) * ldy + row] = s;
+        }
+}
 
 // ---------------------------------------------------------------- the router
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
@@ -2457,7 +2507,8 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
 // (DS4_ROUTE_FUSE, a decoded token: T 1) route_publish_kernel and route_ahead_kernel as the two blocks of one launch -
 // block 0 the first's code for token 0 (ids / w / x of the request, idx / w / plan_ptr), block 1 the second's
 // (ahead[0][off ..)): disjoint writes, read the same way; publish_kernel follows in a launch of its own, as
-// route_publish launches it.  The old kernels stay as they are: route_fuse_check (ds4_model.cu) compares the two
+// route_publish launches it.  (=2, a window's T rows: the pair a row, t = blockIdx.y, both logits rows 1024 apart as
+// the old kernels read them.)  The old kernels stay as they are: route_fuse_check (ds4_model.cu) compares the two
 __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
     if (blockIdx.x == 0) {
         __shared__ float sc[1024], bs[1024];
@@ -2465,8 +2516,8 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
         __shared__ int bi[32];
         __shared__ int pick[16];
         __shared__ int on_cpu;
-        const int t = 0, n = a.n, k = a.k;
-        const float* logits = a.logits;
+        const int t = blockIdx.y, n = a.n, k = a.k;
+        const float* logits = a.logits + (size_t) t * 1024;
         const float* bias = a.bias;
         if (a.bias_vl != nullptr && ((a.vl >> t) & 1u)) bias = a.bias_vl;
         for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -2524,8 +2575,8 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
     __shared__ float bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
-    const int t = 0, n = a.a_n, m = a.m, off = a.off;
-    const float* logits = a.a_logits;
+    const int t = blockIdx.y, n = a.a_n, m = a.m, off = a.off;
+    const float* logits = a.a_logits + (size_t) t * 1024;
     const float* bias = a.a_bias;
     Req* req = a.req;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
@@ -3028,11 +3079,11 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
 }
 bool route_pair(const RoutePair& a, cudaStream_t s) {
     if (a.req == nullptr || a.n < 1 || a.n > 1024 || a.k < 1 || a.k > kPicks || a.a_n < 1 || a.a_n > 1024 || a.m < 1 ||
-        a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim)
+        a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim || a.T < 1 || a.T > kWin)
         return false;
-    route_pair_kernel<<<2, 512, 0, s>>>(a);
+    route_pair_kernel<<<dim3(2, (unsigned) a.T), 512, 0, s>>>(a);
     if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
-    publish_kernel<<<1, 1, 0, s>>>(a.req, 1, a.seq, a.na0, a.na1);
+    publish_kernel<<<1, 1, 0, s>>>(a.req, a.T, a.seq, a.na0, a.na1);
     return cudaGetLastError() == cudaSuccess;
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
@@ -3114,10 +3165,14 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 }
 
 bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
-                   cudaStream_t s) {
-    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0) return false;
+                   cudaStream_t s, int T, int ldy) {
+    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
+        return false;
     const int b0 = (int) cdiv(n0, kThreads / 32), b1 = (int) cdiv(n1, kThreads / 32);
-    gemv_f32_pair_kernel<<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
+    if (T == 1) gemv_f32_pair_kernel<<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
+    else   // (=2, a window's rows)
+        gemv_f32_pair_rows_kernel<<<dim3(b0 + b1, cdiv(T, kGemvT)), kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, T,
+                                                                                      ldy);
     return cudaGetLastError() == cudaSuccess;
 }
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {

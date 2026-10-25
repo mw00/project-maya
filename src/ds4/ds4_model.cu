@@ -1130,6 +1130,9 @@ struct Model::Impl {
     // another (route_pair), publish as before - checked at load (route_fuse_check).  The load refuses it with
     // DS4_AHEAD other than 1; every other case (no guess, the other members, windows, the drafter) keeps the old path
     bool route_fuse = false;
+    // DS4_ROUTE_FUSE=2: the same for a decode window's rows too (T up to kWin): the two gates' rows in one launch
+    // (gemv_f32_pair's rows form), the routing and the guesses a row in another - checked at load on 1, 3 and kWin rows
+    bool route_fuse_win = false;
     // (DS4_ROUTE_FUSE) whether a decoded token's router stage on this lead fuses: every bound gemv_f32_pair and
     // route_pair refuse, checked before anything is enqueued - an incompatible layer or next layer takes the old path
     static bool route_fusable(const Layer& l, const Layer* nx, int m, int D) {
@@ -2532,24 +2535,27 @@ struct Model::Impl {
                                          : "");
         }
         if (const char* v = ds4_env("DS4_ROUTE_FUSE")) {   // (MAYA_DS4_ROUTE_FUSE)
-            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
-                err = std::string("DS4_ROUTE_FUSE=") + v + ": 1 or 0";
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_ROUTE_FUSE=") + v + ": 2, 1 or 0";
                 return false;
             }
-            route_fuse = std::strcmp(v, "1") == 0;
+            route_fuse = std::strcmp(v, "1") == 0 || std::strcmp(v, "2") == 0;
+            route_fuse_win = std::strcmp(v, "2") == 0;
 #ifdef STRATA_HIP_WAVE64
             if (route_fuse) {   // (its warp reductions are a 32-lane warp's)
-                err = "DS4_ROUTE_FUSE=1 on a wave64 build";
+                err = std::string("DS4_ROUTE_FUSE=") + v + " on a wave64 build";
                 return false;
             }
 #endif
             if (route_fuse && ahead_mode != 1) {   // (no other lookahead mode changes under it)
-                err = "DS4_ROUTE_FUSE=1 takes one layer of lookahead (DS4_AHEAD 1), not " + std::to_string(ahead_mode);
+                err = std::string("DS4_ROUTE_FUSE=") + v + " takes one layer of lookahead (DS4_AHEAD 1), not " +
+                      std::to_string(ahead_mode);
                 return false;
             }
             if (route_fuse)
                 std::fprintf(stderr, "ds4: a decoded token's router stage on the lead in two launches: its gate and "
-                                     "the next layer's, then the routing and the guesses (DS4_ROUTE_FUSE)\n");
+                                     "the next layer's, then the routing and the guesses (DS4_ROUTE_FUSE)%s\n",
+                             route_fuse_win ? "; a decode window's rows too (DS4_ROUTE_FUSE=2)" : "");
         }
         if (helper_id >= 0 && !helper_open(err)) return false;
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
@@ -3417,6 +3423,8 @@ struct Model::Impl {
             if (hc_fuse_win && !(hc_fuse_check(err, 1, true) && hc_fuse_check(err, kWin, true)))   // (=2: a window too)
                 return false;
             if (route_fuse && !route_fuse_check(err)) return false;   // (no request yet)
+            if (route_fuse_win && !(route_fuse_check(err, 3) && route_fuse_check(err, kWin)))   // (=2: windows too)
+                return false;
             if (tp_uneven && (std::getenv("STRATA_DS4_TP_CHECK") != nullptr || std::getenv("DS4_TP_CHECK") != nullptr) &&
                 !tp_check(err))
                 return false;   // (MAYA_DS4_TP_CHECK=1: at load, no request yet)
@@ -8498,7 +8506,10 @@ struct Model::Impl {
     // block), m 1, k and 16.  Every output (both logits, idx / w / plan_ptr, the whole request) starts 0xA5 between
     // guards; both paths' bytes must be equal - every value, untouched byte and guard - and the weights finite.  On
     // d.st, each run's end waited for (10 s): a mismatch or an error after a clean end fails the load (everything
-    // freed); no clean end ends the process at once (route_unknown)
+    // freed); no clean end ends the process at once (route_unknown).  T rows (DS4_ROUTE_FUSE=2: 3 and kWin, a decode
+    // window's - 3 a part of gemv_f32_rows_kernel's 8 tokens a block, kWin two whole ones): x, both logits, the picks,
+    // weights and plan T rows at the decode buffers' strides, the old path's gemv_f32 / route_ahead / route_publish
+    // on T rows, the image bit on row 0 or 1; T 1 is the check above
     [[noreturn]] static void route_unknown(int dev, int il, const char* what, const char* why) {
         std::fprintf(stderr, "ds4: route fuse check: CUDA%d (layer %d, %s): %s - the device's state unknown; the "
                              "process ends without teardown (exit %d)\n",
@@ -8507,20 +8518,23 @@ struct Model::Impl {
         std::fflush(stdout);
         std::_Exit(kExitUnknown);
     }
-    bool route_fuse_check(std::string& err) {
+    bool route_fuse_check(std::string& err, int T = 1) {
         const int D = g.dim;
         constexpr size_t kGuard = 64;
-        // one set of outputs: [guard | region]... | guard, in bytes
+        // one set of outputs: [guard | region]... | guard, in bytes (T rows each, the decode buffers' strides)
         enum { kLog, kLogA, kIdx, kW, kPlan, kReq, kRegions };
-        const size_t rb[kRegions] = {1024 * 4, 1024 * 4, kPicks * 4, kPicks * 4, kPicks * 8, sizeof(Req)};
+        const size_t rb[kRegions] = {(size_t) T * 1024 * 4,   (size_t) T * 1024 * 4,   (size_t) T * kPicks * 4,
+                                     (size_t) T * kPicks * 4, (size_t) T * kPicks * 8, sizeof(Req)};
         size_t at[kRegions], set_bytes = 0;
         for (int r = 0; r < kRegions; ++r) {
             at[r] = set_bytes + kGuard;
             set_bytes = (at[r] + rb[r] + 255) / 256 * 256;
         }
         set_bytes += kGuard;
-        // inputs: x | synthetic logits, the guesses' logits | biases (routing, image, guesses) | a VRAM table
-        const size_t n_in = (size_t) D + 1024 * 5;
+        // inputs: x | synthetic logits, the guesses' logits (T rows each) | biases (routing, image, guesses) | a VRAM
+        // table
+        const size_t n_in = (size_t) T * (D + 2 * 1024) + 1024 * 3;
+        const std::string rows = T > 1 ? " (" + std::to_string(T) + " rows)" : "";
         uint32_t st = 0x7f4a7c15u;
         auto rnd = [&]() {
             st = st * 1664525u + 1013904223u;
@@ -8548,8 +8562,8 @@ struct Model::Impl {
                     break;
                 }
             auto fail_at = [&](const std::string& why) {
-                err = "route fuse check on CUDA" + std::to_string(d.id) + ": " + why;
-                std::fprintf(stderr, "ds4: CUDA%d route fuse check FAILED: %s\n", d.id, why.c_str());
+                err = "route fuse check" + rows + " on CUDA" + std::to_string(d.id) + ": " + why;
+                std::fprintf(stderr, "ds4: CUDA%d route fuse check%s FAILED: %s\n", d.id, rows.c_str(), why.c_str());
                 return false;
             };
             if (cudaSetDevice(d.id) != cudaSuccess) {
@@ -8571,7 +8585,8 @@ struct Model::Impl {
                 if (ev != nullptr) cudaEventDestroy(ev);
                 return fail_at("its buffers");
             }
-            float *x = in, *lg = in + D, *lga = lg + 1024, *bias = lga + 1024, *bias_vl = bias + 1024;
+            float *x = in, *lg = in + (size_t) D * T, *lga = lg + 1024 * T, *bias = lga + 1024 * T,
+                  *bias_vl = bias + 1024;
             unsigned long long* vram = (unsigned long long*) (bias_vl + 1024);   // (1024 floats: 512 entries)
             std::vector<float> hin(n_in);   // (the host's inputs: written again only after the run before has ended)
             uint8_t* set[2] = {out, out + set_bytes};   // the old path's, the fused one's
@@ -8614,22 +8629,24 @@ struct Model::Impl {
                 }
                 for (size_t o = prev; o < set_bytes && bad.empty(); ++o)
                     if (A[o] != 0xA5) bad = std::string(what) + ": the last guard byte " + std::to_string(o);
-                const size_t nf[3] = {n_log, n_loga, (size_t) k};   // (the logits written, then the weights)
+                const size_t nf[3] = {n_log, n_loga, (size_t) k};   // (the logits written, then the weights: a row's)
                 const int rf[3] = {kLog, kLogA, kW};
+                const size_t rs[3] = {1024, 1024, kPicks};   // (rows apart)
                 for (int q2 = 0; q2 < 3 && bad.empty(); ++q2)
-                    for (size_t i = 0; i < nf[q2] && bad.empty(); ++i) {
-                        float v;
-                        std::memcpy(&v, A + at[rf[q2]] + 4 * i, 4);
-                        if (!std::isfinite(v)) bad = std::string(what) + ": a value not finite";
-                    }
+                    for (int t = 0; t < T; ++t)
+                        for (size_t i = 0; i < nf[q2] && bad.empty(); ++i) {
+                            float v;
+                            std::memcpy(&v, A + at[rf[q2]] + 4 * (rs[q2] * t + i), 4);
+                            if (!std::isfinite(v)) bad = std::string(what) + ": a value not finite";
+                        }
             };
             for (const auto& pr : pairs) {
                 const Layer &l = *pr.first, &nx = *pr.second;
                 for (int kind = 0; kind < 2 && bad.empty(); ++kind) {   // the GEMVs: random, edges
-                    for (int e = 0; e < D; ++e) {
+                    for (size_t e = 0; e < (size_t) D * T; ++e) {
                         float v = rnd();
                         if (kind == 1)
-                            switch ((e / 32) % 6) {
+                            switch ((e % (size_t) D / 32) % 6) {
                                 case 0: v = 0.0f; break;
                                 case 1: v = -0.0f; break;
                                 case 2: v *= 1e-20f; break;
@@ -8640,13 +8657,13 @@ struct Model::Impl {
                     }
                     run(kind ? "the gates, edges" : "the gates, random", l.il,
                         [&] {
-                            gemv_f32(l.gate_w, x, l.n_exp, D, 1, F(0, kLog), 1024, s);
-                            gemv_f32(nx.gate_w, x, nx.n_exp, D, 1, F(0, kLogA), 1024, s);
+                            gemv_f32(l.gate_w, x, l.n_exp, D, T, F(0, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, nx.n_exp, D, T, F(0, kLogA), 1024, s);
                             return true;
                         },
                         [&] {
                             return gemv_f32_pair(l.gate_w, l.n_exp, F(1, kLog), nx.gate_w, nx.n_exp, F(1, kLogA), x, D,
-                                                 s);
+                                                 s, T, 1024);
                         },
                         (size_t) l.n_exp, (size_t) nx.n_exp, 0);
                 }
@@ -8655,13 +8672,13 @@ struct Model::Impl {
             if (bad.empty())   // (rows not a whole block: 300 and 13 of the first gate's)
                 run("the gates, 300 and 13 rows", l.il,
                     [&] {
-                        gemv_f32(l.gate_w, x, std::min(300, l.n_exp), D, 1, F(0, kLog), 1024, s);
-                        gemv_f32(nx.gate_w, x, std::min(13, nx.n_exp), D, 1, F(0, kLogA), 1024, s);
+                        gemv_f32(l.gate_w, x, std::min(300, l.n_exp), D, T, F(0, kLog), 1024, s);
+                        gemv_f32(nx.gate_w, x, std::min(13, nx.n_exp), D, T, F(0, kLogA), 1024, s);
                         return true;
                     },
                     [&] {
                         return gemv_f32_pair(l.gate_w, std::min(300, l.n_exp), F(1, kLog), nx.gate_w,
-                                             std::min(13, nx.n_exp), F(1, kLogA), x, D, s);
+                                             std::min(13, nx.n_exp), F(1, kLogA), x, D, s, T, 1024);
                     },
                     (size_t) std::min(300, l.n_exp), (size_t) std::min(13, nx.n_exp), 0);
             // the routing: logits kind (0 real - the first gates' on a random x, 1 ties, 2 past 20 and negative, 3
@@ -8676,17 +8693,19 @@ struct Model::Impl {
                 if (!bad.empty()) break;
                 const int n = c.n257 ? std::min(257, l.n_exp) : l.n_exp;
                 const int an = c.n257 ? std::min(257, nx.n_exp) : nx.n_exp;
-                for (int e = 0; e < D; ++e) hin[(size_t) e] = rnd();
-                float *hl = hin.data() + D, *hla = hl + 1024, *hb = hla + 1024, *hbv = hb + 1024;
-                for (int i = 0; i < 1024; ++i) {
-                    float v = rnd(), va = rnd();
-                    if (c.logits == 1) v = (float) (i % 5) * 0.5f, va = (float) (i % 3);          // ties
-                    if (c.logits == 2) v = i % 2 ? 20.0f + (float) (i % 7) : -v * 10.0f, va = -va * 5.0f;
-                    hl[i] = v;
-                    hla[i] = va;
-                    hb[i] = c.logits == 1 ? 0.0f : 0.05f * rnd();
-                    hbv[i] = 0.05f * rnd();
-                }
+                for (size_t e = 0; e < (size_t) D * T; ++e) hin[e] = rnd();
+                float *hl = hin.data() + (size_t) D * T, *hla = hl + 1024 * T, *hb = hla + 1024 * T, *hbv = hb + 1024;
+                for (int t = 0; t < T; ++t)
+                    for (int i = 0; i < 1024; ++i) {
+                        float v = rnd(), va = rnd();
+                        if (c.logits == 1) v = (float) (i % 5) * 0.5f, va = (float) (i % 3);          // ties
+                        if (c.logits == 2) v = i % 2 ? 20.0f + (float) (i % 7) : -v * 10.0f, va = -va * 5.0f;
+                        hl[1024 * t + i] = v;
+                        hla[1024 * t + i] = va;
+                        if (t > 0) continue;   // (the biases: one set)
+                        hb[i] = c.logits == 1 ? 0.0f : 0.05f * rnd();
+                        hbv[i] = 0.05f * rnd();
+                    }
                 unsigned long long* hv = (unsigned long long*) (hbv + 1024);
                 for (int i = 0; i < 512; ++i)   // (every pick in VRAM, none, or two in three)
                     hv[i] = c.vram == 1   ? 0x1000ull + (unsigned long long) i * 64
@@ -8705,21 +8724,21 @@ struct Model::Impl {
                 run("the routing", l.il,
                     [&] {
                         if (c.logits == 0) {   // (the logits: the first gates' on this x, the same in both sets)
-                            gemv_f32(l.gate_w, x, n, D, 1, F(0, kLog), 1024, s);
-                            gemv_f32(nx.gate_w, x, an, D, 1, F(0, kLogA), 1024, s);
-                            gemv_f32(l.gate_w, x, n, D, 1, F(1, kLog), 1024, s);
-                            gemv_f32(nx.gate_w, x, an, D, 1, F(1, kLogA), 1024, s);
+                            gemv_f32(l.gate_w, x, n, D, T, F(0, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, an, D, T, F(0, kLogA), 1024, s);
+                            gemv_f32(l.gate_w, x, n, D, T, F(1, kLog), 1024, s);
+                            gemv_f32(nx.gate_w, x, an, D, T, F(1, kLogA), 1024, s);
                         } else {
                             for (int b = 0; b < 2; ++b)
-                                if (cudaMemcpyAsync(F(b, kLog), lg, 1024 * 4, cudaMemcpyDeviceToDevice, s) !=
-                                        cudaSuccess ||
-                                    cudaMemcpyAsync(F(b, kLogA), lga, 1024 * 4, cudaMemcpyDeviceToDevice, s) !=
-                                        cudaSuccess)
+                                if (cudaMemcpyAsync(F(b, kLog), lg, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
+                                                    s) != cudaSuccess ||
+                                    cudaMemcpyAsync(F(b, kLogA), lga, (size_t) T * 1024 * 4, cudaMemcpyDeviceToDevice,
+                                                    s) != cudaSuccess)
                                     return false;
                         }
                         Req* rq = (Req*) (set[0] + at[kReq]);
-                        route_ahead(F(0, kLogA), rba, an, c.m, 1, rq, 0, s);
-                        route_publish(F(0, kLog), rb0, n, l.k_exp, 1, g.route_scale, vt, x, D, (int*) F(0, kIdx),
+                        route_ahead(F(0, kLogA), rba, an, c.m, T, rq, 0, s);
+                        route_publish(F(0, kLog), rb0, n, l.k_exp, T, g.route_scale, vt, x, D, (int*) F(0, kIdx),
                                       F(0, kW), (unsigned long long*) F(0, kPlan), rq, seq, s, bv, vl, c.m, 0);
                         return true;
                     },
@@ -8745,6 +8764,7 @@ struct Model::Impl {
                         a.a_bias = rba;
                         a.a_n = an;
                         a.m = c.m;
+                        a.T = T;
                         return route_pair(a, s);
                     },
                     c.logits == 0 ? (size_t) n : 1024, c.logits == 0 ? (size_t) an : 1024, l.k_exp);
@@ -8757,11 +8777,11 @@ struct Model::Impl {
             std::string ids;
             for (const auto& p : pairs) ids += (ids.empty() ? "" : " ") + std::to_string(p.first->il);
             std::fprintf(stderr,
-                         "ds4: CUDA%d route fuse check: %d runs (gates of layers %s and their next; the routing: "
+                         "ds4: CUDA%d route fuse check%s: %d runs (gates of layers %s and their next; the routing: "
                          "real, tied, past 20 and negative logits, the request's x copied and not, the image bias off "
                          "/ on / given and off, n 257, m 1 .. 16): both logits, the picks, weights, plan and the whole "
-                         "request the old launches' bit for bit, all finite, every guard intact (DS4_ROUTE_FUSE)\n",
-                         d.id, runs, ids.c_str());
+                         "request the old launches' bit for bit, all finite, every guard intact (DS4_ROUTE_FUSE%s)\n",
+                         d.id, rows.c_str(), runs, ids.c_str(), T > 1 ? "=2" : "");
         }
         return true;
     }
@@ -13621,8 +13641,10 @@ struct Model::Impl {
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0 && sq != 0;   // (sq 0: a host-free layer - no mailbox, no wait)
             // (DS4_ROUTE_FUSE: a decoded token's lead with one layer of lookahead and a next layer to guess - the two
-            //  gates in one launch, the routing and the guesses in another; every other case as before)
-            const Layer* nx1 = route_fuse && T == 1 && !l.mtp && lead && ahead_mode == 1 ? ahead_layer(L0, 1) : nullptr;
+            //  gates in one launch, the routing and the guesses in another; =2 a window's rows too; every other case as
+            //  before)
+            const bool rf_t = T == 1 || (route_fuse_win && T <= kWin);
+            const Layer* nx1 = route_fuse && rf_t && !l.mtp && lead && ahead_mode == 1 ? ahead_layer(L0, 1) : nullptr;
             const int m1 = nx1 != nullptr ? std::max(1, std::min(kAhead1, nx1->k_exp + ahead_extra)) : 0;
             RoutePair rp;
             if (nx1 != nullptr) {
@@ -13646,9 +13668,11 @@ struct Model::Impl {
                 rp.a_bias = nx1->gate_bias;
                 rp.a_n = nx1->n_exp;
                 rp.m = m1;
+                rp.T = T;
             }
             if (route_fusable(l, nx1, m1, D)) {   // (a GEMV not gone in reaches no routing; a routing, no publish)
-                if (!gemv_f32_pair(l.gate_w, l.n_exp, d.glog, nx1->gate_w, nx1->n_exp, d.glog_a, d.x, D, s) ||
+                if (!gemv_f32_pair(l.gate_w, l.n_exp, d.glog, nx1->gate_w, nx1->n_exp, d.glog_a, d.x, D, s, T,
+                                   1024) ||
                     !route_pair(rp, s)) {
                     err = "the fused router stage: a launch did not go in";
                     return false;

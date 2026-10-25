@@ -114,9 +114,9 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
 /// (DS4_ROUTE_FUSE) gemv_f32 for one token (T 1) of two matrices on the same x in one launch: y0 = x W0 (n0 rows), y1 =
 /// x W1 (n1 rows), each row gemv_f32's bits.  k a multiple of 4, else false and nothing launched; false too when the
-/// launch did not go in.
+/// launch did not go in.  (=2) T up to kWin tokens: x's rows k apart, y0's and y1's ldy apart (ldy >= n0, n1).
 bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
-                   cudaStream_t s);
+                   cudaStream_t s, int T = 1, int ldy = 0);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -301,9 +301,10 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
 /// (DS4_ROUTE_FUSE) a decoded token's (T 1) route_publish and route_ahead in one launch of two blocks, each its old
 /// kernel's code (disjoint request fields), then publish_kernel as route_publish launches it (na0 / na1, T 1, seq).
+/// (=2) T up to kWin: the two blocks a row (both logits rows 1024 apart), the publish with T.
 /// The caller passes bias_vl only when vl != 0, as route_publish does.  false, nothing launched: no request, n or a_n
-/// not 1 .. 1024, k not 1 .. kPicks, m < 1 or off + m past kAhead, dim not 1 .. kMaxDim; false, nothing published: the
-/// routing's launch did not go in; false: the publish's launch did not go in.
+/// not 1 .. 1024, k not 1 .. kPicks, m < 1 or off + m past kAhead, dim not 1 .. kMaxDim, T not 1 .. kWin; false,
+/// nothing published: the routing's launch did not go in; false: the publish's launch did not go in.
 struct RoutePair {
     const float *logits = nullptr, *bias = nullptr;   // route_publish's
     int n = 0, k = 0;
@@ -321,6 +322,7 @@ struct RoutePair {
     int na0 = 0, na1 = 0;
     const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
     int a_n = 0, m = 0, off = 0;
+    int T = 1;   // (=2: a window's rows, 1 .. kWin)
 };
 bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
