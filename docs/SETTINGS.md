@@ -402,15 +402,31 @@ in `lane-times.txt` beside the model's pack; later starts check them in a few mi
 again under load. Both lanes share the PC's memory, SSD and cores, so while answering the first tokens it also checks
 that streaming really is faster here, taking turns with the CPU lane alone (separately for tokens whose experts are all
 in RAM and tokens that read some from the SSD); where it is not at least 3% faster, it stops streaming and the times
-file keeps that verdict. It applies while answering (one token at a time), not while reading the prompt. That check
-times each layer's lanes; a second one (v1.1.25, #329) times whole tokens - runs of 8 with streaming allowed and
-without - because the streamed experts' trips through the host memory can slow the rest of a token, which no layer's
-own timing sees; where whole tokens are not at least 3% faster with it, streaming stops (kept for the next start too).
+file keeps that verdict. It applies while answering, not while reading the prompt. That check times each layer's
+lanes; a second one (v1.1.25, #329) times whole tokens - runs of 8 with streaming allowed and without - because the
+streamed experts' trips through the host memory can slow the rest of a token, which no layer's own timing sees; where
+whole tokens are not at least 3% faster with it, streaming stops (kept for the next start too).
+
+Where the CPU lane's experts are copied into RAM (`--mmap-experts auto` when they all fit, or `off`) on one NUMA node and
+a discrete NVIDIA GPU under Linux, the copies are pinned and mapped, and the GPU pulls a streamed expert straight from
+its copy: it is no longer read into the pinned staging first, so it crosses the RAM once instead of three times and
+takes none of the CPU's cores. With DSpark, most of the answer is decoded in verify windows of several tokens; their
+experts stream too (up to 16 a layer), not only a single token's. A streamed expert then stays in VRAM: it lands in
+one of the layer's recent slots (32 a layer, taken from the profile's coldest VRAM experts) and serves the next
+windows. The stream lane's time is measured on the GPU itself. On an RTX 3090 + Ryzen 5 5600X with Maya-XS:
+`--bench` decode 12.9 -> 27.8 tokens/s; after a 128K / 256K prompt 14.0 -> 23.2 / 15.9 -> 26.1; prompts unchanged.
 
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_STREAM` | on (1) | `0`: every expert VRAM does not hold on the CPU, as before |
 | `DS4_STREAM_TOKEN_AB` | on (1) | `0`: the per-layer check alone decides, as in v1.1.24 |
+| `DS4_STREAM_ZC` | on (1) | `0`: copied experts pass the pinned staging, as before (the GPU does not pull them in place) |
+| `DS4_STREAM_WIN` | on (1) | `0`: verify windows do not stream (a single token's experts only, as before) |
+| `DS4_STREAM_SLOTS` | 16 | a verify window's streamed experts at most, a layer (1-16) |
+| `DS4_LAND` | on (1) | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
+| `DS4_RECENT` | 32 (a GGUF: with `DS4_LAND`) | the recent slots a layer (VRAM slots taken from the profile's coldest experts) |
+| `MAYA_DS4_PIN_BY_NEED` | off (0) | where the system cannot lock every expert copied into RAM for the GPU (Windows locks about half the RAM): `1` pins them a layer at a time, the layers whose copies the routing profile uses most first, until a pin fails or `MAYA_DS4_PIN_GB` is reached; the GPU pulls those in place, the rest go through the staging. Without it a pin that fails leaves every copy to the staging (an RTX 3090, Maya-XS, 101 GB of copies held to 50 GB pinned: decode 16.3 -> 20.3 tokens/s; all of them pinned: 29.0). A GPU that does not address registered memory at its host address (Windows' WDDM) takes its mapped address, with one GPU |
+| `MAYA_DS4_PIN_GB` | 0 (no cap) | with `MAYA_DS4_PIN_BY_NEED`: pin at most this many GB of the copies |
 
 The engine's decode summary (`streamed to the GPU: N`) and the `pcie=` key of its STAT lines (experts a token
 streamed) show it at work; the start's log prints each format's times and how many of a token's experts it streams.
@@ -442,8 +458,6 @@ default and is experimental. It applies while answering (and to a draft's check)
 | `MAYA_DS4_DISK_SKIP_W` | off (0) | leave out a routed expert below this share of its token's route weights when its pages are not in RAM (the page cache or the RAM tier; on Windows: sampled pages of the engine's working set). The weight it carried is lost. `0.10` changes the answers less, `0.14` leaves out more |
 | `MAYA_DS4_DISK_SKIP_FROM` | 0 | the first layer it applies to |
 | `MAYA_DS4_RAM_SKIP_W` | off (0) | the same rule for **every** routed expert VRAM does not hold, in RAM or not: a token goes without the light ones the PCIe lane or the CPU lane would read. Where the experts all sit in RAM the decode is bound by the RAM's bandwidth, and each one left out is an expert's bytes not read (an RTX 3090 + Ryzen 5 5600X, Maya-XS with DSpark, `--bench` decode 27.8 -> 33.3 tokens/s at `0.10`, 39.7 at `0.14`; 16-token windows of these docs, each sequence's perplexity against the exact build's: mean \|log ratio\| 0.117 at `0.10`, 0.153 at `0.14`, against 0.073 between two exact runs). With it `MAYA_DS4_DISK_SKIP_W` does nothing |
-| `MAYA_DS4_PIN_BY_NEED` | off (0) | where the system cannot lock every expert copied into RAM for the GPU (Windows locks about half the RAM): `1` pins them a layer at a time, the layers whose copies the routing profile uses most first, until a pin fails or `MAYA_DS4_PIN_GB` is reached. The GPU pulls those straight from RAM; the rest go through the staging copy. Without it, a pin that fails leaves every copy to the staging (an RTX 3090 + Ryzen 5 5600X, Maya-XS, 101 GB of copies held to 50 GB pinned: decode 16.3 -> 20.3 tokens/s; all of them pinned: 29.0). A GPU that does not address registered memory at its host address (Windows' WDDM) takes its mapped address, with one GPU |
-| `MAYA_DS4_PIN_GB` | 0 (no cap) | with `MAYA_DS4_PIN_BY_NEED`: pin at most this many GB of the copies |
 | `MAYA_DS4_DISK_SKIP_AUTO` | 0 | `1` (with `MAYA_DS4_DISK_SKIP_W`): skip only while the model is cold, so warm answers are the unmodified model's. It starts on after a start, and switches off - in the middle of an answer too - once the share of experts read from the SSD stops falling (a level that depends on the PC), or after `MAYA_DS4_DISK_SKIP_BUDGET` (512) tokens. It switches on again only between requests, never during an answer and never just because a conversation moves to a new topic: when most of the experts the last answer left in RAM are gone (an idle while other programs took the RAM) |
 
 It helps where answering waits on the SSD - a PC whose RAM holds only part of the experts, most on a first answer
