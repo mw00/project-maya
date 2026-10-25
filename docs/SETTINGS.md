@@ -595,6 +595,19 @@ member's parts as decode runs them, summed on the host and compared with the who
 | `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form |
 | `MAYA_DS4_TP_CHECK` | off | `1`: each member's parts checked against the whole expert at load |
 
+A group of two sums its members' partial rows (the attention output's and the MoE's, every layer) by writing its whole
+partial out to host-mapped memory and then reading the other's in, four bytes a lane - one direction of the links at a
+time. `MAYA_DS4_AR2=1` does a prompt chunk's all-reduces in one launch that writes and reads in 128 KB pieces, the
+other member's rows read 16 bytes a lane: the same sums, bit for bit. `2` also sends both partials as FP16 (half the
+bytes; both members round theirs alike, so they stay equal, but the sums are FP16's, not exact).
+`MAYA_DS4_AR2_DECODE=1` takes the decode windows' all-reduces to the same kernel, exact. A group of three or more is
+unchanged. `ds4_gguf_test --ar <GPU> <GPU>` checks both against the host's sums on two GPUs and times them.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_AR2` | off (0) | a group of two's prompt-chunk all-reduces: `1` pipelined in one launch, the same sums; `2` FP16 on the wire (half the bytes, the sums FP16's) |
+| `MAYA_DS4_AR2_DECODE` | off (0) | `1`: a group of two's decode-window all-reduces in the same kernel, exact |
+
 ## DeepSeek: the DSpark drafter's blocks on a group's members
 
 The drafter's blocks run whole on the drafter's group's lead, and their VRAM experts come out of the lead's room. A
