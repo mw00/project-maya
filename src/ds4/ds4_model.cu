@@ -1612,6 +1612,11 @@ struct Model::Impl {
     // a run of chunks borrowing the lending devices' tails (borrow_begin / borrow_end): whether one does now, the
     // pinned staging that reads the experts back after it (rf_bytes each), what that read back in all
     bool lent = false;
+    // a hand-back that could not finish (a device selection, sync, copy or table write failed): an expert table may
+    // name a slot the prompt path's buffers overwrote - no later request runs (forward / forward_chunks refuse)
+    bool lend_broken = false;
+    static constexpr const char* kLendBroken =
+        "the prompt path's room could not be handed back - the expert tables are unknown; restart the engine";
     std::vector<uint8_t*> rf_stage, rf_half;   // (rf_half: DS4_TP_BORROW's member parts, one a thread)
     size_t rf_bytes = 0;
     int64_t lent_experts = 0;
@@ -13325,6 +13330,18 @@ struct Model::Impl {
         if (ln_one || ln_land) rc_drain();   // (the one-GPU path's; elsewhere v1.1.27's: no wait)
         bool tp = false;   // (DS4_TP_BORROW: a group's layer keeps the fewest of its members' slots - from all of them)
         for (const auto& cp : chunks) tp = tp || (cp != nullptr && cp->tp_lend);
+        // (every lending device's room first, before any is touched: a refusal leaves every slot as it was)
+        for (size_t di = 0; di < chunks.size(); ++di) {
+            if (chunks[di] == nullptr || !chunks[di]->borrow) continue;
+            const Dev& d = devs[di];
+            const size_t need = lay_chunk(*chunks[di], C, nullptr, 2);
+            if (d.tail == nullptr || !chunks[di]->flow || need + 256 > d.tail_bytes) {   // (only the flow streams them)
+                err = "the prompt path's room on CUDA" + std::to_string(d.id) + ": " + std::to_string(need >> 20) +
+                      " MiB for chunks of " + std::to_string(C) + " tokens, " + std::to_string(d.tail_bytes >> 20) +
+                      " lent";
+                return false;
+            }
+        }
         if (tp)
             for (Layer& l : L) l.pv_n = l.n_slots;
         for (size_t di = 0; di < chunks.size(); ++di) {
@@ -13332,17 +13349,21 @@ struct Model::Impl {
             Dev& d = devs[di];
             Chunk& c = *chunks[di];
             const size_t need = lay_chunk(c, C, nullptr, 2);
-            if (d.tail == nullptr || !c.flow || need + 256 > d.tail_bytes) {   // (only the flow streams the lent ones)
-                err = "the prompt path's room on CUDA" + std::to_string(d.id) + ": " + std::to_string(need >> 20) +
-                      " MiB for chunks of " + std::to_string(C) + " tokens, " + std::to_string(d.tail_bytes >> 20) + " lent";
-                return false;
-            }
             const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
             lay_chunk(c, C, d.tail + b0, 2);
             c.C = C;
-            cudaSetDevice(d.id);
-            CK(cudaMemsetAsync(d.tail + b0, 0, d.tail_bytes - b0, d.st));
-            CK(cudaStreamSynchronize(d.st));
+            // (the clear writes over slots still mapped: a failure leaves them unknown - sticky, no later request runs;
+            //  a device lent before this one is handed back by the caller's guard)
+            cudaError_t e = cudaSetDevice(d.id);
+            if (e == cudaSuccess) e = cudaMemsetAsync(d.tail + b0, 0, d.tail_bytes - b0, d.st);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(d.st);
+            if (e != cudaSuccess) {
+                lend_broken = true;
+                err = std::string("the prompt path's room on CUDA") + std::to_string(d.id) + ": " +
+                      cudaGetErrorString(e) + " - " + kLendBroken;
+                std::fprintf(stderr, "ds4: %s - the device's state unknown; no further request runs\n", err.c_str());
+                return false;
+            }
             if (c.tp_lend) {   // (DS4_TP_BORROW) its parts of the slots under its buffers; the group keeps the fewest
                 for (Layer& l : L) {
                     if (l.mtp || l.n_main >= l.n_slots) continue;
@@ -13371,14 +13392,28 @@ struct Model::Impl {
     // after the run (every device done with its buffers): the experts under them read back into their slots, in file
     // order by a few threads - one that cannot be read leaves VRAM for the CPU lane (the decode finds every other one
     // where it was).  false: DS4_CHECK_LEND found a part read back different from the file - those experts went to the
-    // CPU lane too (nothing reads those slots), and the caller fails the prompt before any decode
+    // CPU lane too (nothing reads those slots), and the caller fails the prompt before any decode - or a device
+    // selection, sync, copy into a slot or table write failed: lend_broken (sticky), no later request runs
     bool borrow_end() {
         if (!lent) return true;
         lent = false;
-        for (size_t di = 0; di < devs.size(); ++di) {
-            cudaSetDevice(devs[di].id);
-            cudaStreamSynchronize(devs[di].st);
-            if (di < chunks.size() && chunks[di] != nullptr && chunks[di]->cs != nullptr) cudaStreamSynchronize(chunks[di]->cs);
+        std::atomic<bool> broken{false};   // (a runtime failure: the expert tables can no longer be vouched for)
+        std::string why;
+        for (size_t di = 0; di < devs.size() && !broken; ++di) {
+            cudaError_t e = cudaSetDevice(devs[di].id);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(devs[di].st);
+            if (e == cudaSuccess && di < chunks.size() && chunks[di] != nullptr && chunks[di]->cs != nullptr)
+                e = cudaStreamSynchronize(chunks[di]->cs);
+            if (e != cudaSuccess) {
+                broken = true;
+                why = "CUDA" + std::to_string(devs[di].id) + "'s streams: " + cudaGetErrorString(e);
+            }
+        }
+        if (broken) {   // (the devices may still use the buffers: nothing is read back over them)
+            lend_broken = true;
+            std::fprintf(stderr, "ds4: the prompt path's room was not handed back (%s) - the device's state unknown; "
+                                 "no further request runs\n", why.c_str());
+            return false;
         }
         struct Job {
             int layer, e;
@@ -13436,38 +13471,45 @@ struct Model::Impl {
                     if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
                         uint8_t* half = rf_half[(size_t) t];
                         bool ok = l.blob <= rf_bytes && read_mx_file(l, e, stage), same = true;
+                        const bool read = ok;   // (a read that fails: the CPU lane takes it - the file has it)
                         for (int m = 0; m < l.nm && ok; ++m) {
                             const Layer& x = member(l, m);
-                            cudaSetDevice(devs[(size_t) x.dev].id);
                             blob_to_half(l, stage, m, half);
-                            ok = cudaMemcpy(sat(l, x, l.slot[(size_t) e], unit(x)), half, unit(x),
+                            ok = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess &&
+                                 cudaMemcpy(sat(l, x, l.slot[(size_t) e], unit(x)), half, unit(x),
                                             cudaMemcpyHostToDevice) == cudaSuccess;
+                            if (!ok) broken = true;   // (a runtime failure, not the file's: the slot's bytes unknown)
                             if (ok) dev_bytes[(size_t) x.dev].fetch_add(unit(x));
                             if (ok && check) {
                                 back.resize(unit(x));
-                                if (cudaMemcpy(back.data(), sat(l, x, l.slot[(size_t) e], unit(x)), unit(x),
-                                               cudaMemcpyDeviceToHost) != cudaSuccess ||
-                                    std::memcmp(back.data(), half, unit(x)) != 0) {
+                                const bool got = cudaMemcpy(back.data(), sat(l, x, l.slot[(size_t) e], unit(x)),
+                                                            unit(x), cudaMemcpyDeviceToHost) == cudaSuccess;
+                                if (!got) broken = true;   // (the read back failed: a runtime failure)
+                                if (!got || std::memcmp(back.data(), half, unit(x)) != 0) {
                                     differ.fetch_add(1);
                                     same = false;
                                 }
                             }
                         }
-                        bad[i] = !ok || !same;   // (a part that differs: the expert to the CPU lane, as a failed read)
+                        bad[i] = !read || !ok || !same;   // (a part that differs: to the CPU lane, as a failed read)
                         if (ok && same)   // (one copy of it: in VRAM again)
                             for (int r = 0; r < 3; ++r)
                                 os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
                                            mx_part_bytes(l, r), false);
                         continue;
                     }
-                    cudaSetDevice(devs[(size_t) l.dev].id);
-                    bad[i] = !(l.blob <= rf_bytes && read_mx_file(l, e, stage) &&
-                               cudaMemcpy(sat(l, l, l.slot[(size_t) e], l.blob), stage, l.blob, cudaMemcpyHostToDevice) ==
-                                   cudaSuccess);
+                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage);
+                    const bool put = read && cudaSetDevice(devs[(size_t) l.dev].id) == cudaSuccess &&
+                                     cudaMemcpy(sat(l, l, l.slot[(size_t) e], l.blob), stage, l.blob,
+                                                cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (read && !put) broken = true;   // (a runtime failure, not the file's)
+                    bad[i] = !put;
                     if (check && !bad[i]) {
                         back.resize(l.blob);
-                        if (cudaMemcpy(back.data(), sat(l, l, l.slot[(size_t) e], l.blob), l.blob, cudaMemcpyDeviceToHost) !=
-                                cudaSuccess || std::memcmp(back.data(), stage, l.blob) != 0) {
+                        const bool got = cudaMemcpy(back.data(), sat(l, l, l.slot[(size_t) e], l.blob), l.blob,
+                                                    cudaMemcpyDeviceToHost) == cudaSuccess;
+                        if (!got) broken = true;   // (the read back failed: a runtime failure)
+                        if (!got || std::memcmp(back.data(), stage, l.blob) != 0) {
                             differ.fetch_add(1);
                             bad[i] = 1;   // (to the CPU lane, as a failed read)
                         }
@@ -13492,8 +13534,9 @@ struct Model::Impl {
             const unsigned long long zero = 0;
             for (int m = 0; m < l.nm; ++m) {   // (a group's: every member's table - DS4_TP_BORROW)
                 const Layer& x = member(l, m);
-                cudaSetDevice(devs[(size_t) x.dev].id);
-                cudaMemcpy(x.vram_tab + e, &zero, 8, cudaMemcpyHostToDevice);
+                if (cudaSetDevice(devs[(size_t) x.dev].id) != cudaSuccess ||
+                    cudaMemcpy(x.vram_tab + e, &zero, 8, cudaMemcpyHostToDevice) != cudaSuccess)
+                    broken = true;   // (the device's table may still name the slot)
             }
         }
         lent_experts += (int64_t) jobs.size();
@@ -13523,6 +13566,12 @@ struct Model::Impl {
                                                      : ("; MISMATCH: " + std::to_string(differ.load()) +
                                                         " differ - to the CPU lane").c_str())
                                : "");
+        }
+        if (broken) {
+            lend_broken = true;
+            std::fprintf(stderr, "ds4: the prompt path's room: a copy into a slot or a table write failed - the "
+                                 "device's state unknown; no further request runs\n");
+            return false;
         }
         return differ.load() == 0;
     }
@@ -13676,6 +13725,10 @@ struct Model::Impl {
     // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
+        if (lend_broken) {
+            err = kLendBroken;
+            return false;
+        }
         if (n < 1) return true;
         if (pos + n > o.max_context) {
             err = "the context is full";
@@ -13750,11 +13803,11 @@ struct Model::Impl {
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
         warm_end();   // (the last prompt's warm-up: this one streams what it needs)
-        if (!borrow_begin(per, err)) return false;
-        struct Lent {   // (every way out: the room handed back once the devices are done with it)
+        struct Lent {   // (every way out, a failed borrow_begin's too: the room handed back once the devices are done)
             Impl* p;
             ~Lent() { (void) p->borrow_end(); }   // (an early way out already fails the prompt)
         } lent_{this};
+        if (!borrow_begin(per, err)) return false;
         plan_streams();
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
             run.snap_pos = pos + n - 1;
@@ -13849,10 +13902,11 @@ struct Model::Impl {
                 err = "stopped while reading the prompt";
                 return false;
             }
-        // (before the cache looks at the slots again; DS4_CHECK_LEND: no decode after a mismatch)
+        // (before the cache looks at the slots again; no decode after a mismatch or a failure)
         if (!borrow_end()) {
-            err = "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file - the prompt is not "
-                  "answered (those experts went to the CPU lane)";
+            err = lend_broken ? std::string(kLendBroken)
+                              : "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file - the "
+                                "prompt is not answered (those experts went to the CPU lane)";
             return false;
         }
         st.layer_ms += now_ms() - tl;
@@ -14094,6 +14148,10 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+        if (lend_broken) {
+            err = kLendBroken;
+            return false;
+        }
         if (T < 1 || T > kWin) {
             err = "a window of " + std::to_string(T) + " tokens";
             return false;
