@@ -11,6 +11,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_model.hpp"
+#include "ds4_cpu_exl3.hpp"
 #include "ds4_engram_io.hpp"
 
 #include "ds4_gguf.cuh"
@@ -1125,6 +1126,7 @@ struct Model::Impl {
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
+    Exl3Lane lane_x;                            // (cpu_experts' view of them, ds4_cpu_exl3.hpp)
     // the state
     int64_t pos = 0;
     std::vector<int32_t> toks, ctoks;
@@ -6440,10 +6442,7 @@ struct Model::Impl {
     // in four rounds (the gate / up split-K pieces, each preparing its two input blocks of every token; each band's
     // sums / codebook / Hadamard / swiglu and that block of the down input, which both nodes then read whole; the down
     // pieces; the down bands).  yd[slot] gets each row's expert output.
-    struct Ent {
-        int e = 0, n = 0, slot0 = 0;
-        int tok[kc::kExl3CpuMaxN] = {};
-    };
+    using Ent = LaneEnt;
     void run_nodes(int n, const std::function<void(int)>* f, int ph = -1) {
         static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
         if (stats && ph >= 0) {   // (each job's own time, summed: the phase's work beside its wall time)
@@ -6663,10 +6662,21 @@ struct Model::Impl {
             for (const Ent& en : ents) cpu_rows += en.n;
         }
         if (l.lay.fmt == gg::kFmtMXFP4) return cpu_experts_mx(l, x, ents, ldx, ord);
-        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
-        const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
-        const int ne = (int) ents.size();
-        const float lim = g.lim;
+        const int E = g.dim, FF = g.ff;
+        Exl3Lane& c = lane_x;
+        c.E = E;
+        c.FF = FF;
+        c.NH = NH;
+        c.slots = kSlots;
+        c.lim = g.lim;
+        c.xh = c_xh.data();
+        c.xsb = c_xsb.data();
+        c.acc = c_acc.data();
+        c.xhd = c_xhd.data();
+        c.xsd = c_xsd.data();
+        c.accd = c_accd.data();
+        c.yd = c_yd.data();
+        if (!c.cnt) c.alloc_counters(2);
         auto part = [&](int e, int X, int r) {
             const uint8_t* b = l.hh[(size_t) e][(size_t) X];
             kc::Exl3Part p;
@@ -6678,103 +6688,25 @@ struct Model::Impl {
             p.k2 = l.lay.k2[r];
             return p;
         };
-        auto xh = [&](int X, int sl, int r) { return c_xh.data() + ((size_t) (X * kSlots + sl) * 2 + r) * E; };
-        auto xsb = [&](int X, int sl, int r) { return c_xsb.data() + ((size_t) (X * kSlots + sl) * 2 + r) * EB; };
-        auto acc = [&](int X, int sl, int r, int q) {
-            return c_acc.data() + (((size_t) (X * kSlots + sl) * 2 + r) * GQ + q) * FFh;
-        };
-        auto xhd = [&](int sl) { return c_xhd.data() + (size_t) sl * FF; };
-        auto xsd = [&](int sl) { return c_xsd.data() + (size_t) sl * FB; };
-        auto accd = [&](int X, int sl, int q) { return c_accd.data() + ((size_t) (X * kSlots + sl) * DQ + q) * Eh; };
-        std::function<void(int)> f[4];
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / (2 * GQ))];
-                const int r = (j / GQ) % 2, q = j % GQ;
-                const kc::Exl3Part p = part(en.e, X, r);
-                const float* xp[kc::kExl3CpuMaxN];
-                float* ap[kc::kExl3CpuMaxN];
-                for (int i = 0; i < en.n; ++i) {
-                    const int sl = en.slot0 + i;
-                    const float* xt = x + (size_t) en.tok[i] * ldx;
-                    for (int b = 2 * q; b < 2 * q + 2; ++b)
-                        xsb(X, sl, r)[b] = kc::exl3_cpu_prepare_block(p.suh + b * 128, xt + b * 128, xh(X, sl, r) + b * 128);
-                    xp[i] = xh(X, sl, r);
-                    ap[i] = acc(X, sl, r, q);
-                }
-                if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 16, (q + 1) * 16, ap[0]);
-                else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 16, (q + 1) * 16, ap);
-            };
-        run_nodes(ne * 2 * GQ, f, 0);
-        phase(0);
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / GB)];
-                const int b = j % GB;
-                const kc::Exl3Part pg = part(en.e, X, 0), pu = part(en.e, X, 1), pd = part(en.e, X, 2);
-                for (int i = 0; i < en.n; ++i) {
-                    const int sl = en.slot0 + i;
-                    float y[2][128], a[128], hb[128];
-                    for (int r = 0; r < 2; ++r) {
-                        for (int c = 0; c < 128; ++c) a[c] = 0.0f;
-                        for (int q = 0; q < GQ; ++q) {
-                            const float* aq = acc(X, sl, r, q) + b * 128;
-                            for (int c = 0; c < 128; ++c) a[c] += aq[c];
-                        }
-                        double xs = 0.0;
-                        for (int k = 0; k < EB; ++k) xs += xsb(X, sl, r)[k];
-                        kc::exl3_cpu_band_out(r == 0 ? pg : pu, a, (float) xs, b * 128, y[r]);
-                    }
-                    for (int c = 0; c < 128; ++c) {
-                        float gv = y[0][c], uv = y[1][c];
-                        if (lim > 0.0f) {
-                            gv = std::min(gv, lim);
-                            uv = std::min(std::max(uv, -lim), lim);
-                        }
-                        hb[c] = gv / (1.0f + std::exp(-gv)) * uv;
-                    }
-                    const int gb = X * GB + b;
-                    xsd(sl)[gb] = kc::exl3_cpu_prepare_block(pd.suh + gb * 128, hb, xhd(sl) + gb * 128);
-                }
-            };
-        run_nodes(ne * GB, f, 1);
-        phase(1);
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / DQ)];
-                const int q = j % DQ;
-                const kc::Exl3Part p = part(en.e, X, 2);
-                const float* xp[kc::kExl3CpuMaxN];
-                float* ap[kc::kExl3CpuMaxN];
-                for (int i = 0; i < en.n; ++i) {
-                    xp[i] = xhd(en.slot0 + i);
-                    ap[i] = accd(X, en.slot0 + i, q);
-                }
-                if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 8, (q + 1) * 8, ap[0]);
-                else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 8, (q + 1) * 8, ap);
-            };
-        run_nodes(ne * DQ, f, 2);
-        phase(2);
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / DB)];
-                const int b = j % DB;
-                const kc::Exl3Part pd = part(en.e, X, 2);
-                for (int i = 0; i < en.n; ++i) {
-                    const int sl = en.slot0 + i;
-                    float a[128];
-                    for (int c = 0; c < 128; ++c) a[c] = 0.0f;
-                    for (int q = 0; q < DQ; ++q) {
-                        const float* aq = accd(X, sl, q) + b * 128;
-                        for (int c = 0; c < 128; ++c) a[c] += aq[c];
-                    }
-                    double xs = 0.0;
-                    for (int k = 0; k < FB; ++k) xs += xsd(sl)[k];
-                    kc::exl3_cpu_band_out(pd, a, (float) xs, b * 128, c_yd.data() + (size_t) sl * E + (size_t) X * Eh + b * 128);
-                }
-            };
-        run_nodes(ne * DB, f, 3);
-        phase(3);
+        auto nodes = [&](int n, const std::function<void(int)>* f, int ph) { run_nodes(n, f, ph); };
+        // DS4_CPU_FLOW=0: the four steps as four batches (as before); DS4_CPU_STATS times them, so it takes them too.
+        // DS4_CPU_FLOW_CHECK=1: each call's flow outputs against the steps', bit for bit (twice the time)
+        static const bool flow_on = !stats && (std::getenv("DS4_CPU_FLOW") == nullptr || std::atoi(std::getenv("DS4_CPU_FLOW")) != 0);
+        static const bool flow_check = flow_on && std::getenv("DS4_CPU_FLOW_CHECK") != nullptr;
+        const int ne = (int) ents.size();
+        exl3_experts(c, x, ldx, ents.data(), ne, part, nodes, phase, flow_on);
+        if (flow_check && ne > 0) {
+            int rows = 0;
+            for (const Ent& en : ents) rows = std::max(rows, en.slot0 + en.n);
+            std::vector<float> fl(c_yd.begin(), c_yd.begin() + (size_t) rows * E);
+            exl3_experts(c, x, ldx, ents.data(), ne, part, nodes, phase, false);
+            const bool bad = std::memcmp(fl.data(), c_yd.data(), fl.size() * 4) != 0;
+            static std::atomic<long long> calls{0}, diffs{0};
+            if (bad) ++diffs;
+            const long long nc = ++calls;
+            if (nc % 256 == 0 || bad)
+                std::fprintf(stderr, "ds4: CPU flow check: %lld calls, %lld differed\n", nc, diffs.load());
+        }
     }
 
     // ---- the expert cache.  A swap moves a CPU-lane expert (`in`) into the layer's spare VRAM slot and the VRAM expert it
