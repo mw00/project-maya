@@ -1,9 +1,15 @@
 // ds4_pool_test: IoQueue's device-copy jobs (DS4_FLOW_HELPER's copies out of the helper's pool), CPU only - a fake
-// copy function stands in for the GPU runtime.  Build: g++ -std=c++17 -O2 -pthread -I src/ds4 tests/ds4_pool_test.cpp
+// copy function stands in for the GPU runtime; and DS4_FLOW_DOWN_PART's compact_rows - in place against a naive
+// gather, alone and on IoQueue's three kinds of job.
+// Build: g++ -std=c++17 -O2 -pthread -I src/ds4 tests/ds4_pool_test.cpp
 #include "ds4_pool.hpp"
 
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 using strata::ds4::IoQueue;
 
@@ -135,6 +141,147 @@ void many_device_copies() {   // (an item's three parts, many items, several thr
     EXPECT(q.device_bytes() == total);
 }
 
+// DS4_FLOW_DOWN_PART: compact_rows(base, rows, pitch, off, len) leaves row r's bytes [off, off + len) at r len, rows
+// side by side - in place, the bytes a naive gather into a buffer of its own gives; nothing past rows x pitch is
+// touched. A pattern that differs at every byte of a row and between rows, so a misplaced byte shows
+uint8_t pat(size_t i) { return (uint8_t) (i * 131 + (i >> 8) * 7 + 1); }
+
+bool compacts(size_t rows, size_t pitch, size_t off, size_t len) {
+    const size_t n = rows * pitch, guard = 64;
+    std::vector<uint8_t> buf(n + guard), want(rows * len);
+    for (size_t i = 0; i < n; ++i) buf[i] = pat(i);
+    for (size_t i = n; i < n + guard; ++i) buf[i] = 0xA5;
+    for (size_t r = 0; r < rows; ++r)   // (the naive gather: row r's part, from the untouched input)
+        for (size_t i = 0; i < len; ++i) want[r * len + i] = pat(r * pitch + off + i);
+    strata::ds4::compact_rows(buf.data(), rows, pitch, off, len);
+    bool ok = std::memcmp(buf.data(), want.data(), want.size()) == 0;
+    for (size_t i = n; i < n + guard; ++i) ok = ok && buf[i] == 0xA5;
+    return ok;
+}
+
+void compact_rows_shapes() {
+    // every shape of up to 5 rows of up to 12 bytes: every offset, every length that fits - off 0, len == pitch (the
+    // whole row: nothing moves) and the parts at a row's end among them
+    int shapes = 0, bad = 0;
+    for (size_t rows = 0; rows <= 5; ++rows)
+        for (size_t pitch = 1; pitch <= 12; ++pitch)
+            for (size_t off = 0; off < pitch; ++off)
+                for (size_t len = 1; off + len <= pitch; ++len, ++shapes)
+                    if (!compacts(rows, pitch, off, len)) {
+                        if (bad++ < 5)
+                            std::fprintf(stderr, "compact_rows(%zu, %zu, %zu, %zu) differs\n", rows, pitch, off, len);
+                    }
+    EXPECT(bad == 0 && shapes == 2184);   // (6 row counts x 364 (off, len) pairs)
+    // an uneven split's two members of one down, rows of a quantized row's bytes: member 0 its first blocks (off 0),
+    // member 1 the rest (off = member 0's len, to the row's end); a row of one 4-byte block; many rows
+    const size_t pitch = 594, m0 = 330;   // (e.g. 2304 columns in 18 blocks of 33 bytes: 10 blocks and 8)
+    EXPECT(compacts(4096, pitch, 0, m0));
+    EXPECT(compacts(4096, pitch, m0, pitch - m0));
+    EXPECT(compacts(4096, pitch, 0, pitch));
+    EXPECT(compacts(7, 4, 0, 4) && compacts(1, 594, 264, 330) && compacts(0, 594, 0, 330));
+    for (size_t m1 : {(size_t) 1, (size_t) 33, (size_t) 297, (size_t) 593})   // (member 1's offset, every width)
+        EXPECT(compacts(257, pitch, m1, pitch - m1) && compacts(257, pitch, 0, m1));
+}
+
+// the same through IoQueue: a copy (memory or device) compacted where it landed - dst itself, whatever its off -, a
+// read at dst + off % kDirectAlign; the bytes past the part as they landed (compact_rows leaves them), `left` counted
+// after
+void compact_rows_jobs() {
+    const size_t rows = 64, pitch = 594, off = 330, len = 264, n = rows * pitch;
+    std::vector<uint8_t> src(n);
+    for (size_t i = 0; i < n; ++i) src[i] = pat(i);
+    std::vector<uint8_t> want(rows * len);
+    for (size_t r = 0; r < rows; ++r) std::memcpy(want.data() + r * len, src.data() + r * pitch + off, len);
+    auto job = [&](IoQueue::Job& j, std::vector<uint8_t>& dst, std::atomic<int>& left, std::atomic<bool>& bad) {
+        j.len = n;
+        j.dst = dst.data();
+        j.left = &left;
+        j.bad = &bad;
+        j.crows = rows;
+        j.cpitch = pitch;
+        j.coff = off;
+        j.clen = len;
+    };
+    {   // (a memory copy: off ignored, compacted at dst)
+        IoQueue q(1);
+        std::vector<uint8_t> dst(n, 0);
+        std::atomic<int> left{1};
+        std::atomic<bool> bad{false};
+        IoQueue::Job j;
+        job(j, dst, left, bad);
+        j.off = 12345;
+        j.mem = src.data();
+        q.push(&j, 1);
+        wait_left(q, left);
+        EXPECT(left.load() == 0 && !bad.load());
+        EXPECT(std::memcmp(dst.data(), want.data(), want.size()) == 0);
+        EXPECT(std::memcmp(dst.data() + want.size(), src.data() + want.size(), n - want.size()) == 0);
+    }
+    {   // (a device copy - the helper pool's: compacted at dst, the device bytes the whole copy's)
+        IoQueue q(2);
+        std::vector<uint8_t> dst(n, 0);
+        std::atomic<int> left{1};
+        std::atomic<bool> bad{false};
+        IoQueue::Job j;
+        job(j, dst, left, bad);
+        j.off = 777;
+        j.dmem = src.data();
+        j.ddev = 2;
+        j.dcopy = &fake_copy;
+        q.push(&j, 1);
+        wait_left(q, left);
+        EXPECT(left.load() == 0 && !bad.load() && q.device_bytes() == n);
+        EXPECT(std::memcmp(dst.data(), want.data(), want.size()) == 0);
+    }
+    {   // (a failed device copy: nothing compacted, counted, bad)
+        IoQueue q(1);
+        std::vector<uint8_t> dst(n, 0);
+        std::atomic<int> left{1};
+        std::atomic<bool> bad{false};
+        IoQueue::Job j;
+        job(j, dst, left, bad);
+        j.dmem = src.data();
+        j.dcopy = &fake_fail;
+        q.push(&j, 1);
+        wait_left(q, left);
+        EXPECT(left.load() == 0 && bad.load() && dst == std::vector<uint8_t>(n, 0));
+    }
+#if !defined(_WIN32)
+    {   // (a buffered read of a file at an offset: its bytes at dst + off % kDirectAlign, compacted there; the lead
+        //  before them untouched; a keep copy the read's bytes as read, before the compaction)
+        char path[] = "/tmp/ds4_pool_test_XXXXXX";
+        const int fd = mkstemp(path);
+        EXPECT(fd >= 0);
+        if (fd < 0) return;
+        const uint64_t at = 3 * 4096 + 100, lead = at % strata::ds4::os::kDirectAlign;
+        std::vector<uint8_t> file(at + n, 0x11);
+        std::memcpy(file.data() + at, src.data(), n);
+        EXPECT(::write(fd, file.data(), file.size()) == (ssize_t) file.size());
+        ::close(fd);
+        const strata::ds4::os::fd_t f = strata::ds4::os::open_par(path);
+        EXPECT(f != strata::ds4::os::kBadFd);
+        IoQueue q(1);
+        std::vector<uint8_t> dst(lead + n, 0x5A), keep(n, 0);
+        std::atomic<int> left{1};
+        std::atomic<bool> bad{false};
+        IoQueue::Job j;
+        job(j, dst, left, bad);
+        j.fd = f;
+        j.off = at;
+        j.keep = keep.data();
+        q.push(&j, 1);
+        wait_left(q, left);
+        EXPECT(left.load() == 0 && !bad.load() && q.buffered_bytes() == n);
+        EXPECT(std::memcmp(dst.data() + lead, want.data(), want.size()) == 0);
+        bool lead_ok = true;
+        for (uint64_t i = 0; i < lead; ++i) lead_ok = lead_ok && dst[i] == 0x5A;
+        EXPECT(lead_ok && keep == src);
+        strata::ds4::os::close_fd(f);
+        std::remove(path);
+    }
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -142,6 +289,8 @@ int main() {
     device_copy_fails();
     memory_copy_unchanged();
     many_device_copies();
+    compact_rows_shapes();
+    compact_rows_jobs();
     if (failures) {
         std::fprintf(stderr, "ds4_pool_test: %d FAILED\n", failures);
         return 1;
