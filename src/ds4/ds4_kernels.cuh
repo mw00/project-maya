@@ -266,11 +266,15 @@ struct Resp {
     float part[kWin][kMaxDim];
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
-/// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
+/// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).  resp given
+/// (with cpu_any, a device int left 0, and host_done, the host's last answered seq): when no pick of the window is on
+/// the CPU lane the device writes the answer itself - every token's part empty, then seq - so the layer does not wait
+/// for the host to say so (the host answers the same later); not while the host is kRing / 2 requests behind.
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, Resp* resp = nullptr, int* cpu_any = nullptr,
+                   const unsigned* host_done = nullptr);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);

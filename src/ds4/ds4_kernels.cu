@@ -841,7 +841,7 @@ void index_tc_launch(int gx, int gy, cudaStream_t s, const float* q, const float
                      int T, const int* cand, int cand_stride, int blk, const Rows& lim, float* out, long long out_stride,
                      int ntiles) {
     pdl_launch(index_score_tc_kernel<QT>, dim3(gx, gy), 256, index_tc_smem<QT>(), s, q, w, kp, heads, n, T, cand, cand_stride, blk,
-                                                                             lim, out, out_stride, ntiles);
+               lim, out, out_stride, ntiles);
 }
 
 // a thread a position: its key row (KF: kKvFp4p packed, or BF16) against every head's query (shared memory), relu,
@@ -2325,7 +2325,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl,
+                                                            int* cpu_any) {
     pdl_wait();
     pdl_trigger();
     __shared__ float sc[1024], bs[1024];
@@ -2382,6 +2383,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             }
         }
         on_cpu = cpu;
+        if (cpu && cpu_any != nullptr) atomicOr(cpu_any, 1);
     }
     // the token's FFN input to the host only where the CPU lane reads it (a pick of its on the CPU lane): each row
     // 20 KB over PCIe, where most windows have none
@@ -2432,7 +2434,8 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
 }
 
-__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) {
+__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, Resp* resp, int* cpu_any,
+                               const unsigned* host_done) {
     pdl_wait();
     pdl_trigger();
     __threadfence_system();
@@ -2441,6 +2444,13 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) 
     req->T = T;
     __threadfence_system();
     *(volatile unsigned*) &req->seq = seq;
+    if (resp == nullptr || cpu_any == nullptr) return;
+    const int any = *(volatile int*) cpu_any;
+    *cpu_any = 0;
+    if (any || (int) (seq - *(volatile const unsigned*) host_done) >= kRing / 2) return;
+    for (int t = 0; t < T; ++t) resp->cpu[t] = 0;
+    __threadfence_system();
+    *(volatile unsigned*) &resp->seq = seq;
 }
 
 __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
@@ -2918,20 +2928,22 @@ bool pdl_on() {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1) {
+                   unsigned vl, int na0, int na1, Resp* resp, int* cpu_any, const unsigned* host_done) {
+    if (req == nullptr || host_done == nullptr) resp = nullptr;
+    if (resp == nullptr) cpu_any = nullptr;
     pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
-    if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1);
+               vl != 0 ? bias_vl : nullptr, vl, cpu_any);
+    if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, resp, cpu_any, host_done);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
         pdl_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { pdl_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq); }
-void init_pre(float* pre, int T, cudaStream_t s) { pdl_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }
-
-void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
-    pdl_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);
+                                                                                  void init_pre(float* pre, int T, cudaStream_t s) { pdl_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }
+                                                                                  
+                                                                                  void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
+                                                                                  pdl_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);
 }
 
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s) {
@@ -2994,7 +3006,7 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
                    cudaStream_t s) {
     if (T > 0)
         pdl_launch(gemv_f16_rows_kernel, dim3(cdiv(n, kThreads / 32), cdiv(T, kRowsT)), kThreads, 0, s, W, x, ldx, n, k, T, alpha,
-                                                                                               y, ldy);
+                   y, ldy);
 }
 
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
@@ -3008,7 +3020,7 @@ void route(const float* logits, const float* bias, int n, int k, int T, float ro
            cudaStream_t s, const float* bias_vl, const VlBits* vl) {
     static const VlBits none = {};
     pdl_launch(route_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
-                                   vl != nullptr ? *vl : none);
+               vl != nullptr ? *vl : none);
 }
 
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
@@ -3075,10 +3087,10 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     const dim3 grid(cdiv(n, kThreads), T);
     if (kfmt == kKvFp4p)
         pdl_launch(index_score_kernel<128, kKvFp4p>, grid, kThreads, smem, s, q, w, (const uint8_t*) k, heads, n, cand,
-                                                                       cand_stride, blk, lim, out, out_stride);
+                   cand_stride, blk, lim, out, out_stride);
     else
         pdl_launch(index_score_kernel<128, kKvBf16>, grid, kThreads, smem, s, q, w, (const uint8_t*) k, heads, n, cand,
-                                                                       cand_stride, blk, lim, out, out_stride);
+                   cand_stride, blk, lim, out, out_stride);
 }
 
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
@@ -3114,7 +3126,7 @@ void topk(const float* vals, long long stride, int T, const Rows& r, const int* 
                 merge_cap[dev & 63].store(cap, std::memory_order_relaxed);
             }
             pdl_launch(topk_merge_kernel, T, 1024, (size_t) cap * 8, s, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
-                                                                cand_stride, blk, out, out_stride, cap);
+                       cand_stride, blk, out, out_stride, cap);
             return;
         }
     }
@@ -3475,25 +3487,25 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     }
     if (ckv_fmt == kKvBf16) {
         pdl_launch(sparse_attn_kernel<false>, dim3(heads, T), kThreads, 0, s, q, win, (const uint16_t*) ckv, sel, sel_stride, a,
-                                                                       sink, heads, d, scale, out);
+                   sink, heads, d, scale, out);
         return;
     }
     if (heads_per_block == kAttnWmma) {   // (a prompt chunk: the matrix cores where there are, else as 0)
         static_assert(kThreads == 256, "the WMMA kernel's softmax: a thread a (head, row) of 16 x 16");
         if (attn_wmma_now() && heads % 16 == 0) {
             pdl_launch(sparse_attn_wmma_kernel, dim3(heads / 16, T), kThreads, 0, s, q, win, (const uint8_t*) ckv, sel,
-                                                                           sel_stride, a, sink, heads, scale, out);
+                       sel_stride, a, sink, heads, scale, out);
             return;
         }
 #if !defined(STRATA_USE_HIP)
         if (a.gen && a.kcap + a.win <= kV7Max && heads % 16 == 0 && attn_v7_now()) {
             pdl_launch(sparse_attn_v7_kernel, dim3(heads / 16, T), kV7Threads, kV7Smem, s, q, win, (const uint8_t*) ckv, sel,
-                                                                              sel_stride, a, sink, heads, scale, out);
+                       sel_stride, a, sink, heads, scale, out);
             return;
         }
         if (attn_mma_now() && heads % 16 == 0) {
             pdl_launch(sparse_attn_mma_kernel, dim3(heads / 16, T), kThreads, 0, s, q, win, (const uint8_t*) ckv, sel,
-                                                                          sel_stride, a, sink, heads, scale, out);
+                       sel_stride, a, sink, heads, scale, out);
             return;
         }
 #endif
@@ -3504,15 +3516,15 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     const bool few = heads_per_block == -1 || (heads_per_block == 0 && T <= kAttnScratchT);
     if (few && scr != nullptr && scr->rows != nullptr && T <= scr->max_t && sel_stride <= scr->cap) {
         pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
-                                                                               scr->cap, scr->rows);
+                   scr->cap, scr->rows);
 #if !defined(STRATA_USE_HIP)
         if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
             pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
-                                                                             heads, d, scale, out);
+                       heads, d, scale, out);
         else
 #endif
             pdl_launch(sparse_attn_kernel<true, 0>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
-                                                                             heads, d, scale, out);
+                       heads, d, scale, out);
         return;
     }
     // packed rows: as many heads a block as still leaves two blocks a multiprocessor (a decoded row serves them all)
@@ -3557,7 +3569,7 @@ void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int k
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
     if (T > keep && b.n > 0)
         pdl_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, n, keep,
-                                                                             kv_row_bytes(kKvFp8, d));
+                   kv_row_bytes(kKvFp8, d));
 }
 void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s) {
     if (b.n > 0) pdl_launch(comp_restore_batch_kernel, b.n, kThreads, 0, s, b, (long long) p0, keep, d);
@@ -3566,8 +3578,8 @@ void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_s
     pdl_launch(hc_mean_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, h, hc, dim, out, out_stride);
 }
 void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { pdl_launch(iota_rows_kernel, T, 64, 0, s, out, n, stride); }
-void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
-    pdl_launch(markov_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, H, tok, V, R);
+                                                                                void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
+                                                                                pdl_launch(markov_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, H, tok, V, R);
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
     pdl_launch(markov_share_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, H, erow, vn, R);

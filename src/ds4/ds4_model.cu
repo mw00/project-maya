@@ -549,6 +549,7 @@ struct Dev {
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
     TopkScratch tks;                                   // a window's indexer top k over long rows (topk's segments)
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
+    int* cpu_any = nullptr;                           // the window's routing has a CPU-lane pick (route_publish's)
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
@@ -1152,6 +1153,10 @@ struct Model::Impl {
     // answers in resps with the CPU lane's part, and the device waits for the answer only before the expert sum
     Req* reqs = nullptr;
     Resp* resps = nullptr;
+    // the last request the service thread answered (host-mapped): how far behind it is, for the device's own answers
+    // (DS4_SELF_ANSWER=0: the device always waits for the service thread's, as before)
+    unsigned* lane_done = nullptr;
+    bool self_answer = std::getenv("DS4_SELF_ANSWER") == nullptr || std::atoi(std::getenv("DS4_SELF_ANSWER")) != 0;
     unsigned seq_issued = 0;
     std::atomic<int> layer_of[kRing];
     std::thread service;
@@ -2783,8 +2788,9 @@ struct Model::Impl {
                       dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
-                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err);
+                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
             if (!ok) return false;
+            CK(cudaMemset(d.cpu_any, 0, sizeof(int)));
             d.attn_scr.max_t = kAttnScratchT;
             d.attn_scr.cap = (int) topk_stride();
             if (!dalloc(d, d.attn_scr.rows, (size_t) kAttnScratchT * topk_stride() * g.hd, err)) return false;
@@ -3213,6 +3219,7 @@ struct Model::Impl {
             }
             host_allocs.push_back(m);
             resps = (Resp*) m;
+            if (!hmap(lane_done, 32, err)) return false;
             std::memset((void*) reqs, 0, sizeof(Req) * kRing);
             std::memset((void*) resps, 0, sizeof(Resp) * kRing);
             for (auto& x : layer_of) x.store(-1);
@@ -7922,6 +7929,7 @@ struct Model::Impl {
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
+            *(volatile unsigned*) lane_done = next;
             ++next;
             last = std::chrono::steady_clock::now();
         }
@@ -11718,7 +11726,7 @@ struct Model::Impl {
             }
             route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
+                          na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any, lane_done);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
             swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
