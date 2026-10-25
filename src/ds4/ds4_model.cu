@@ -6455,9 +6455,10 @@ struct Model::Impl {
 
     // ---- the CPU lane: a window's routed experts that live on the host, as entries (an expert and up to 8 of its
     // tokens, in rows slot0 ..) computed together: each node its column part of every matrix, from memory on that node,
-    // in four rounds (the gate / up split-K pieces, each preparing its two input blocks of every token; each band's
+    // in four steps (the gate / up split-K pieces, each preparing its two input blocks of every token; each band's
     // sums / codebook / Hadamard / swiglu and that block of the down input, which both nodes then read whole; the down
-    // pieces; the down bands).  yd[slot] gets each row's expert output.
+    // pieces; the down bands) - an EXL3 layer's as one flowing batch a node (ds4_cpu_exl3.hpp).  yd[slot] gets each
+    // row's expert output.
     using Ent = LaneEnt;
     void run_nodes(int n, const std::function<void(int)>* f, int ph = -1) {
         static const bool stats = std::getenv("DS4_CPU_STATS") != nullptr;
