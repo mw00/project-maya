@@ -846,8 +846,13 @@ $("report-show").onclick = async () => {
 };
 
 function facts(el, rows) {
-  el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
+  const html = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
     `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="Copy">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
+  // (rebuilt only when it changes: About renders on every poll, and new copy buttons each second made their icons
+  //  flash and cut a copy's check mark short)
+  if (el._facts === html) return;
+  el._facts = html;
+  el.innerHTML = html;
 }
 // "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
 function gpuNames(name, count) {
