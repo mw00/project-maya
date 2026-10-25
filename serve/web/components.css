@@ -11,7 +11,7 @@ a{color:var(--st-accent-text);text-decoration:none} a:hover{text-decoration:unde
 
 /* icon */
 .st-icon{width:20px;height:20px;flex:none;color:inherit}
-.st-icon--sm{width:16px;height:16px} .st-icon--lg{width:24px;height:24px}
+.st-icon--sm{width:16px;height:16px;--st-icon-stroke:2} .st-icon--lg{width:24px;height:24px}
 
 /* the brand mark: a stepped pyramid in the brand gradient */
 .maya-mark{width:36px;height:36px;flex:none;border-radius:11px;display:grid;place-items:center;

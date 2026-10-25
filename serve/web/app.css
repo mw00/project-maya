@@ -71,7 +71,7 @@ main { min-height: 0; min-width: 0; display: flex; }
 .st-msg .st-collapse { width: 100%; }
 .st-collapse__body.thinking { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; overflow-y: auto; }
 .st-msg__meta .st-btn--icon { width: 28px; height: 28px; }
-.st-msg__meta .st-btn--icon .st-icon { width: 16px; height: 16px; }
+.st-msg__meta .st-btn--icon .st-icon { width: 16px; height: 16px; --st-icon-stroke: 2; }
 .cursor::after { content: ""; display: inline-block; width: 8px; height: 1.1em; margin-left: 2px; vertical-align: -3px;
                  border-radius: 2px; background: var(--st-accent); animation: blink 1s steps(2) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
