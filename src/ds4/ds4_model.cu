@@ -13370,9 +13370,10 @@ struct Model::Impl {
     }
     // after the run (every device done with its buffers): the experts under them read back into their slots, in file
     // order by a few threads - one that cannot be read leaves VRAM for the CPU lane (the decode finds every other one
-    // where it was)
-    void borrow_end() {
-        if (!lent) return;
+    // where it was).  false: DS4_CHECK_LEND found a part read back different from the file - those experts went to the
+    // CPU lane too (nothing reads those slots), and the caller fails the prompt before any decode
+    bool borrow_end() {
+        if (!lent) return true;
         lent = false;
         for (size_t di = 0; di < devs.size(); ++di) {
             cudaSetDevice(devs[di].id);
@@ -13389,7 +13390,7 @@ struct Model::Impl {
                     if (l.slot[(size_t) e] >= l.pv_n) jobs.push_back({l.il, e});
             l.pv_n = l.n_slots;
         }
-        if (jobs.empty()) return;
+        if (jobs.empty()) return true;
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
             if (la.mx_file[0] != lb.mx_file[0]) return la.mx_file[0] < lb.mx_file[0];
@@ -13434,7 +13435,7 @@ struct Model::Impl {
                     const int e = jobs[i].e;
                     if (l.nm > 1) {   // (DS4_TP_BORROW) each member its part
                         uint8_t* half = rf_half[(size_t) t];
-                        bool ok = l.blob <= rf_bytes && read_mx_file(l, e, stage);
+                        bool ok = l.blob <= rf_bytes && read_mx_file(l, e, stage), same = true;
                         for (int m = 0; m < l.nm && ok; ++m) {
                             const Layer& x = member(l, m);
                             cudaSetDevice(devs[(size_t) x.dev].id);
@@ -13446,12 +13447,14 @@ struct Model::Impl {
                                 back.resize(unit(x));
                                 if (cudaMemcpy(back.data(), sat(l, x, l.slot[(size_t) e], unit(x)), unit(x),
                                                cudaMemcpyDeviceToHost) != cudaSuccess ||
-                                    std::memcmp(back.data(), half, unit(x)) != 0)
+                                    std::memcmp(back.data(), half, unit(x)) != 0) {
                                     differ.fetch_add(1);
+                                    same = false;
+                                }
                             }
                         }
-                        bad[i] = !ok;
-                        if (ok)   // (one copy of it: in VRAM again)
+                        bad[i] = !ok || !same;   // (a part that differs: the expert to the CPU lane, as a failed read)
+                        if (ok && same)   // (one copy of it: in VRAM again)
                             for (int r = 0; r < 3; ++r)
                                 os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
                                            mx_part_bytes(l, r), false);
@@ -13464,8 +13467,10 @@ struct Model::Impl {
                     if (check && !bad[i]) {
                         back.resize(l.blob);
                         if (cudaMemcpy(back.data(), sat(l, l, l.slot[(size_t) e], l.blob), l.blob, cudaMemcpyDeviceToHost) !=
-                                cudaSuccess || std::memcmp(back.data(), stage, l.blob) != 0)
+                                cudaSuccess || std::memcmp(back.data(), stage, l.blob) != 0) {
                             differ.fetch_add(1);
+                            bad[i] = 1;   // (to the CPU lane, as a failed read)
+                        }
                     }
                     if (!bad[i])   // (one copy of it: in VRAM again)
                         for (int r = 0; r < 3; ++r)
@@ -13506,13 +13511,20 @@ struct Model::Impl {
                                  "their parts) read into VRAM again in %.0f ms (DS4_TP_BORROW)%s%s\n",
                          jobs.size(), bytes / 1e9, per.empty() ? "none" : per.c_str(), now_ms() - t0,
                          n_bad > 0 ? (", " + std::to_string(n_bad) + " of them not (to the CPU lane)").c_str() : "",
-                         check ? (differ.load() == 0 ? "; each part matches the model file" : "; MISMATCH") : "");
+                         check ? (differ.load() == 0 ? "; each part matches the model file"
+                                                     : ("; MISMATCH: " + std::to_string(differ.load()) +
+                                                        " parts differ - their experts to the CPU lane").c_str())
+                               : "");
         } else if (o.verbose || n_bad > 0 || check) {
             std::fprintf(stderr, "ds4: the prompt path's room handed back: %zu experts (%.2f GB) read into VRAM again in %.0f ms%s%s\n",
                          jobs.size(), bytes / 1e9, now_ms() - t0,
                          n_bad > 0 ? (", " + std::to_string(n_bad) + " of them not (to the CPU lane)").c_str() : "",
-                         check ? (differ.load() == 0 ? "; each matches the model file" : "; MISMATCH") : "");
+                         check ? (differ.load() == 0 ? "; each matches the model file"
+                                                     : ("; MISMATCH: " + std::to_string(differ.load()) +
+                                                        " differ - to the CPU lane").c_str())
+                               : "");
         }
+        return differ.load() == 0;
     }
 
     // after a prompt of n tokens on the prompt path (DS4_WARM_MIN, 512, or more): the experts its last rows picked
@@ -13741,7 +13753,7 @@ struct Model::Impl {
         if (!borrow_begin(per, err)) return false;
         struct Lent {   // (every way out: the room handed back once the devices are done with it)
             Impl* p;
-            ~Lent() { p->borrow_end(); }
+            ~Lent() { (void) p->borrow_end(); }   // (an early way out already fails the prompt)
         } lent_{this};
         plan_streams();
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
@@ -13837,7 +13849,12 @@ struct Model::Impl {
                 err = "stopped while reading the prompt";
                 return false;
             }
-        borrow_end();   // (before the cache looks at the slots again)
+        // (before the cache looks at the slots again; DS4_CHECK_LEND: no decode after a mismatch)
+        if (!borrow_end()) {
+            err = "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file - the prompt is not "
+                  "answered (those experts went to the CPU lane)";
+            return false;
+        }
         st.layer_ms += now_ms() - tl;
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
