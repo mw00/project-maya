@@ -86,6 +86,12 @@ void rows_dot(const float* W, int N, int K, const float* X, int T, float* Y, cud
 
 /// out [N][K] BF16 = an MXFP8 matrix: w (E4M3 bytes [N][K]) times 2^(scale - 127), scale (E8M0 bytes [N][K / 32]).
 void mxfp8_to_bf16(const uint8_t* w, const uint8_t* scale, int N, int K, uint16_t* out, cudaStream_t s);
+/// y [rows][ldy] = beta y + x [rows][ldx] . W^T for an MXFP8 W [N][K] (E4M3, a UE8M0 scale every 32 inputs) read as
+/// it is stored - each weight exactly mxfp8_to_bf16's value, the sums in F32 in a fixed order.  rows <= 16, N a multiple
+/// of 32, K of 512.  part (rows x N x 16 floats, or null): a split of K for an N of few blocks, its partials added in
+/// order.  (The DSpark draft's few rows: half the bytes of its BF16 weights.)
+void mx_rows(const uint8_t* w, const uint8_t* scale, int N, int K, const float* x, int rows, int ldx, float* y, int ldy,
+             float beta, float* part, cudaStream_t s);
 /// BF16 copies of rows (ld floats a row in, ldo out).
 void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, cudaStream_t s);
 /// out [T][Hq][hd]: each query head over its KV group's keys at the positions lo[t] .. hi (rings of `ring` rows,

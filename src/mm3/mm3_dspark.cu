@@ -40,8 +40,12 @@ struct Draft::Impl {
     const uint16_t* emb = nullptr;
     std::vector<void*> owned;
     size_t bytes = 0;
+    struct MX {   // an MXFP8 matrix [N][K] as stored: E4M3 weights, a UE8M0 scale every 32
+        const uint8_t *w = nullptr, *s = nullptr;
+        int N = 0, K = 0;
+    };
     struct L {
-        uint16_t *q = nullptr, *k = nullptr, *v = nullptr, *o = nullptr, *g = nullptr, *u = nullptr, *d = nullptr;
+        MX q, k, v, o, g, u, d;
         float *in1 = nullptr, *post1 = nullptr, *qn1 = nullptr, *kn1 = nullptr;
         uint16_t *kc = nullptr, *vc = nullptr;
     };
@@ -52,6 +56,7 @@ struct Draft::Impl {
     float *ctx = nullptr, *xn = nullptr, *h = nullptr, *q = nullptr, *kk = nullptr, *vv = nullptr, *att = nullptr;
     float *ao = nullptr, *gt = nullptr, *up = nullptr, *hid = nullptr, *logit = nullptr, *bias = nullptr;
     float *embf = nullptr, *conf = nullptr;
+    float* mxpart = nullptr;   // mx_rows' split partials
     uint16_t *x16 = nullptr, *hid16 = nullptr, *embb = nullptr;
     int *pos = nullptr, *lo = nullptr, *prev = nullptr, *out = nullptr;
     int* host = nullptr;   // pinned: drafts then confidences
@@ -106,8 +111,32 @@ struct Draft::Impl {
         return true;
     }
 
-    // an MXFP8 matrix [N][K] -> BF16 on the device
-    bool mx(const Pack& pk, const std::string& pre, int N, int K, uint16_t*& out, std::string& err) {
+    // an MXFP8 matrix [N][K] on the device as it is stored (mx_rows reads it)
+    bool mx(const Pack& pk, const std::string& pre, int N, int K, MX& m, std::string& err) {
+        const Tensor* w = pk.get(pre + ".weight");
+        const Tensor* sc = pk.get(pre + ".weight_scale_inv");
+        if (!w || !sc || w->dtype != "F8_E4M3" || w->bytes != (uint64_t) N * K || sc->bytes != (uint64_t) N * (K / 32) ||
+            N % 32 || K % 512) {
+            err = "dspark: " + pre + ": not the MXFP8 matrix [" + std::to_string(N) + "][" + std::to_string(K) + "]";
+            return false;
+        }
+        uint8_t *dw = nullptr, *ds = nullptr;
+        if (!alloc(dw, w->bytes, err) || !alloc(ds, sc->bytes, err)) return false;
+        DK(cudaMemcpy(dw, pk.data(*w), w->bytes, cudaMemcpyHostToDevice));
+        DK(cudaMemcpy(ds, pk.data(*sc), sc->bytes, cudaMemcpyHostToDevice));
+        m.w = dw;
+        m.s = ds;
+        m.N = N;
+        m.K = K;
+        return true;
+    }
+    // C [rows][N] F32 = X [rows][K] F32 . W^T (+ beta C), W MXFP8
+    void mxg(const MX& m, const float* X, int rows, int ldx, float* C, int ldc, float beta) {
+        k::mx_rows(m.w, m.s, m.N, m.K, X, rows, ldx, C, ldc, beta, mxpart, s);
+    }
+
+    // (the expansion to BF16, kept for reference)
+    bool mx_bf16(const Pack& pk, const std::string& pre, int N, int K, uint16_t*& out, std::string& err) {
         const Tensor* w = pk.get(pre + ".weight");
         const Tensor* sc = pk.get(pre + ".weight_scale_inv");
         if (!w || !sc || w->dtype != "F8_E4M3" || w->bytes != (uint64_t) N * K || sc->bytes != (uint64_t) N * (K / 32)) {
@@ -201,6 +230,7 @@ struct Draft::Impl {
         std::vector<float> inv_h((size_t) g.n_rot / 2);
         k::rope_inv_freq(g.theta, g.n_rot, inv_h.data());
         const int Rw = max_rows, B = g.block;
+        if (!alloc(mxpart, (size_t) 16 * 16 * std::max(D, std::max(Q, F)), err)) return false;
         if (!alloc(inv, inv_h.size(), err) || !alloc(ctx, (size_t) Rw * D, err) || !alloc(xn, (size_t) Rw * D, err) ||
             !alloc(h, (size_t) B * D, err) || !alloc(q, (size_t) B * Q, err) || !alloc(kk, (size_t) Rw * KV, err) ||
             !alloc(vv, (size_t) Rw * KV, err) || !alloc(att, (size_t) B * Q, err) || !alloc(ao, (size_t) B * D, err) ||
@@ -238,13 +268,12 @@ struct Draft::Impl {
         const int D = g.dim, KV = g.n_kv * g.hd;
         cudaSetDevice(dev);
         k::rms(ctx, hid1, n, D, g.eps, xn, nullptr, s);
-        k::to_bf16(xn, n, D, D, x16, D, s);
         std::vector<int> ph((size_t) n);
         for (int t = 0; t < n; ++t) ph[(size_t) t] = pos0 + t;
         DK(cudaMemcpyAsync(pos, ph.data(), ph.size() * 4, cudaMemcpyHostToDevice, s));
         for (auto& l : L) {
-            if (!gemm(l.k, KV, D, D, x16, n, D, kk, KV, 0.0f, err) || !gemm(l.v, KV, D, D, x16, n, D, vv, KV, 0.0f, err))
-                return false;
+            mxg(l.k, xn, n, D, kk, KV, 0.0f);
+            mxg(l.v, xn, n, D, vv, KV, 0.0f);
             k::qk_norm_rope(nullptr, kk, vv, nullptr, l.kn1, pos, n, 0, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc,
                             l.vc, s, ring);
         }
@@ -276,22 +305,18 @@ struct Draft::Impl {
         const float scale = 1.0f / std::sqrt((float) g.hd);
         for (auto& l : L) {
             k::rms(h, l.in1, B, D, g.eps, xn, nullptr, s);
-            k::to_bf16(xn, B, D, D, x16, D, s);
-            if (!gemm(l.q, Q, D, D, x16, B, D, q, Q, 0.0f, err) || !gemm(l.k, KV, D, D, x16, B, D, kk, KV, 0.0f, err) ||
-                !gemm(l.v, KV, D, D, x16, B, D, vv, KV, 0.0f, err))
-                return false;
+            mxg(l.q, xn, B, D, q, Q, 0.0f);
+            mxg(l.k, xn, B, D, kk, KV, 0.0f);
+            mxg(l.v, xn, B, D, vv, KV, 0.0f);
             k::qk_norm_rope(q, kk, vv, l.qn1, l.kn1, pos, B, g.n_head, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc, l.vc,
                             s, ring);
             k::window_attn(q, l.kc, l.vc, ring, lo, P + B - 1, B, g.n_head, g.n_kv, scale, att, s);
-            k::to_bf16(att, B, Q, Q, x16, Q, s);
-            if (!gemm(l.o, D, Q, Q, x16, B, Q, h, D, 1.0f, err)) return false;   // h += attn Wo
+            mxg(l.o, att, B, Q, h, D, 1.0f);   // h += attn Wo
             k::rms(h, l.post1, B, D, g.eps, xn, nullptr, s);
-            k::to_bf16(xn, B, D, D, x16, D, s);
-            if (!gemm(l.g, F, D, D, x16, B, D, gt, F, 0.0f, err) || !gemm(l.u, F, D, D, x16, B, D, up, F, 0.0f, err))
-                return false;
+            mxg(l.g, xn, B, D, gt, F, 0.0f);
+            mxg(l.u, xn, B, D, up, F, 0.0f);
             k::swigluoai(gt, up, (size_t) B * F, g.alpha, g.limit, gt, nullptr, s);
-            k::to_bf16(gt, B, F, F, x16, F, s);
-            if (!gemm(l.d, D, F, F, x16, B, F, h, D, 1.0f, err)) return false;   // h += mlp
+            mxg(l.d, gt, B, F, h, D, 1.0f);   // h += mlp
         }
         k::rms(h, fin1, B, D, g.eps, hid, hid16, s);
         // (the target's head on mv, F32 inputs: one pass for the block's rows - gemm_rows took ~1.8 ms on the 3090)

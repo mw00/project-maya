@@ -415,6 +415,102 @@ __global__ void mxfp8_kernel(const uint8_t* w, const uint8_t* sc, int K, uint16_
     }
 }
 
+// a block 32 outputs (8 warps x 4) over a range of the inputs (split-K: blockIdx.y), the activations 512 inputs at a
+// time in shared memory; a lane 4 weights of each output at a 128-byte stride (a warp's loads one line, its float4
+// reads of the activations free of bank conflicts) - a tile's 16 weight words and their scales loaded before any
+// use; then each output's sums over the lanes (a fixed tree) into y (one range) or the range's partials.  R: the rows.
+template <int R>
+__global__ void __launch_bounds__(256) mx_rows_kernel(const uint8_t* w, const uint8_t* sc, int N, int K, int kc,
+                                                      const float* x, int ldx, float* y, int ldy, float beta,
+                                                      float* part) {
+    __shared__ float tab[256];
+    __shared__ __align__(16) float xs[R][512];
+    {
+        __nv_fp8_e4m3 f;
+        f.__x = (uint8_t) threadIdx.x;
+        tab[threadIdx.x] = (float) f;
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int n0 = blockIdx.x * 32 + warp * 4;
+    const int ka = blockIdx.y * kc, kb = min(K, ka + kc);
+    const size_t ks = (size_t) (K / 32);
+    float acc[4][R];
+#pragma unroll
+    for (int o = 0; o < 4; ++o)
+#pragma unroll
+        for (int r = 0; r < R; ++r) acc[o][r] = 0.0f;
+    for (int k0 = ka; k0 < kb; k0 += 512) {
+        uint32_t wb[4][4];
+        uint32_t se[4][4];
+#pragma unroll
+        for (int o = 0; o < 4; ++o)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const size_t n = (size_t) (n0 + o);
+                const int kk = k0 + j * 128 + lane * 4;
+                wb[o][j] = __ldg((const unsigned int*) (w + n * K + kk));
+                se[o][j] = __ldg(sc + n * ks + (size_t) (kk / 32));
+            }
+        __syncthreads();
+        for (int i = threadIdx.x; i < R * 128; i += 256) {
+            const int r = i >> 7, c = (i & 127) * 4;
+            *(float4*) &xs[r][c] = *(const float4*) (x + (size_t) r * ldx + k0 + c);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float4 xv[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) xv[r] = *(const float4*) &xs[r][j * 128 + lane * 4];
+#pragma unroll
+            for (int o = 0; o < 4; ++o) {
+                const uint32_t b = wb[o][j];
+                // the UE8M0 scale 2^(e - 127) as a float's exponent (e 1 .. 254; 0 the subnormal 2^-127)
+                const uint32_t e = se[o][j];
+                const float scale = e ? __uint_as_float(e << 23) : __uint_as_float(0x00400000u);
+                const float w0 = tab[b & 0xffu] * scale, w1 = tab[(b >> 8) & 0xffu] * scale,
+                            w2 = tab[(b >> 16) & 0xffu] * scale, w3 = tab[b >> 24] * scale;
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    float a = acc[o][r];
+                    a = fmaf(w0, xv[r].x, a);
+                    a = fmaf(w1, xv[r].y, a);
+                    a = fmaf(w2, xv[r].z, a);
+                    a = fmaf(w3, xv[r].w, a);
+                    acc[o][r] = a;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int o = 0; o < 4; ++o)
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = acc[o][r];
+#pragma unroll
+            for (int d = 16; d > 0; d >>= 1) v += __shfl_xor_sync(0xffffffffu, v, d);
+            if (lane == 0) {
+                if (part != nullptr) {
+                    part[((size_t) blockIdx.y * R + r) * N + n0 + o] = v;
+                } else {
+                    float* yp = y + (size_t) r * ldy + n0 + o;
+                    *yp = beta != 0.0f ? beta * *yp + v : v;
+                }
+            }
+        }
+}
+
+// y = beta y + the ranges' partials, in range order
+__global__ void mx_reduce_kernel(const float* part, int ks, int rows, int N, float* y, int ldy, float beta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * N) return;
+    const int r = i / N, n = i % N;
+    float v = 0.0f;
+    for (int z = 0; z < ks; ++z) v += part[((size_t) z * rows + r) * N + n];
+    float* yp = y + (size_t) r * ldy + n;
+    *yp = beta != 0.0f ? beta * *yp + v : v;
+}
+
 __global__ void to_bf16_kernel(const float* x, int cols, int ld, uint16_t* y, int ldo) {
     for (int i = threadIdx.x; i < cols; i += blockDim.x)
         y[(size_t) blockIdx.x * ldo + i] = f2bf(x[(size_t) blockIdx.x * ld + i]);
@@ -712,6 +808,27 @@ void rows_dot(const float* W, int N, int K, const float* X, int T, float* Y, cud
     if (T <= 0 || N <= 0) return;
     rows_dot_kernel<<<dim3((unsigned) ((N + 7) / 8), (unsigned) T), 256, 0, s>>>(W, N, K, X, Y);
     check("rows_dot");
+}
+
+void mx_rows(const uint8_t* w, const uint8_t* scale, int N, int K, const float* x, int rows, int ldx, float* y, int ldy,
+             float beta, float* part, cudaStream_t s) {
+    if (rows <= 0) return;
+    // split K while the blocks are fewer than ~2 waves of an 82-SM GPU (each range a whole number of 512s)
+    const int tiles = K / 512, nb = N / 32;
+    int ks = 1;
+    while (part != nullptr && ks * 2 <= tiles && nb * ks < 160 && tiles % (ks * 2) == 0) ks *= 2;
+    const int kc = K / ks;
+    float* pp = ks > 1 ? part : nullptr;
+    const dim3 grid((unsigned) nb, (unsigned) ks);
+    switch (rows) {
+#define MX_CASE(R) case R: mx_rows_kernel<R><<<grid, 256, 0, s>>>(w, scale, N, K, kc, x, ldx, y, ldy, beta, pp); break;
+        MX_CASE(1) MX_CASE(2) MX_CASE(3) MX_CASE(4) MX_CASE(5) MX_CASE(6) MX_CASE(7) MX_CASE(8)
+        MX_CASE(9) MX_CASE(10) MX_CASE(11) MX_CASE(12) MX_CASE(13) MX_CASE(14) MX_CASE(15) MX_CASE(16)
+#undef MX_CASE
+        default: return;
+    }
+    if (ks > 1) mx_reduce_kernel<<<(rows * N + 255) / 256, 256, 0, s>>>(part, ks, rows, N, y, ldy, beta);
+    check("mx_rows");
 }
 
 void mxfp8_to_bf16(const uint8_t* w, const uint8_t* scale, int N, int K, uint16_t* out, cudaStream_t s) {
