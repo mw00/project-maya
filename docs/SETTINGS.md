@@ -525,6 +525,32 @@ against the per-job one on every GPU at load (any difference fails the start).
 | `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: the attention's dense matrices re-quantized at load (opt-in, changes the answers)
+
+A GGUF pack keeps its dense weights in Q8_0. Every decoded token reads all of them, and they take VRAM the experts
+could use. `MAYA_DS4_DENSE_REQ=q5_k` re-quantizes the largest of them (the attention's `wq_b`, `wo_a` and `wo_b`) at load
+with ggml's own quantizer. They then run as a GGUF's low-bit dense matrices do (ds4_iq's GEMV for a token, its FP16 rows
+for a prompt). The first start converts them on the CPU (about 20 s for DeepSeek-V4.1-Flash) and keeps the result in
+the pack (`<pack>/dense-req-<type>/`, about 3 GB for Q5_K). A later start reads that cache instead (about 2 s). A
+cache from another source file or type is not used; delete the folder to free the space.
+
+On an RTX 3090 (24 GB) with 128 GB RAM (Ryzen 7 9700X), DeepSeek-V4.1-Flash-1017 Maya-S, `--mmap-experts off`, `MAYA_DS4_DISK_SKIP_W=0.20`:
+
+| | dense weights | experts in VRAM | chat decode | KL (10 questions) | 16K-token NLL |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Q8_0 (off) | 8.46 GB | 1,177 | 18.6 tok/s | 0.0194 | - |
+| `q5_k` | 6.70 GB | 1,361 | 19.7 tok/s (+6%) | 0.0270 | +0.0049 |
+| `iq4_xs` | 5.97 GB | 1,407 | 20.1 tok/s (+8%) | 0.0429 | - |
+
+KL is against the unmodified model (no skip, Q8_0). `q4_k` and `iq4_xs` save a little more and change the answers two
+to three times as much, so `q5_k` is the one to try. The gain comes from the experts the freed VRAM holds, so it is
+largest where the CPU lane runs many experts, and nothing where VRAM already holds every expert.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_DENSE_REQ` | off | `q5_k`, `q4_k` or `iq4_xs`: the Q8_0 dense matrices below re-quantized to that type at load (changes the answers a little). The GPU kernels are in every build; the conversion needs the native-experts build (ggml) - without it the matrices stay Q8_0, with a log line |
+| `MAYA_DS4_DENSE_REQ_MATCH` | `attn.wq_b,attn.wo_a,attn.wo_b` | the matrices it takes: a comma-separated list, a tensor whose name contains one of them |
+
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 
 `--tp n` splits each expert's FFN between the group's GPUs, and a GGUF's experts split only in whole blocks of their

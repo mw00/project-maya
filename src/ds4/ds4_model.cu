@@ -1809,18 +1809,115 @@ struct Model::Impl {
             }
             w.swap(p);
         }
+        // MAYA_DS4_DENSE_REQ=q5_k|q4_k|iq4_xs (opt-in, CHANGES THE ANSWERS): the Q8_0 dense matrices
+        // MAYA_DS4_DENSE_REQ_MATCH names (default the attention's three largest: attn.wq_b, attn.wo_a, attn.wo_b)
+        // re-quantized at load by ggml's quantizer - fewer bytes every token reads, and VRAM the experts then take.
+        // They then run as a GGUF's low-bit dense matrix does (ds4_iq's GEMV, its FP16 rows for a prompt)
+        const int rq = q8 ? dense_req_type(pre) : -1;
+        bool req = false;
+        if (rq >= 0) {
+            std::vector<uint8_t> o;
+            std::string e2;
+            const double t0 = now_ms();
+            // the converted bytes kept in the pack (<pack>/dense-req-<type>/<name>.bin, a header with the source's size
+            // and a sampled checksum): a later start reads them instead of converting again
+            const std::string dir = this->o.pack + "/dense-req-" + dense_req_name(),
+                              file = dir + "/" + pre + (np > 1 ? "." + std::to_string(part) + "-of-" + std::to_string(np) +
+                                                                     (r0 >= 0 ? "." + std::to_string(r0) : "")
+                                                               : "") + ".bin";
+            uint64_t sum = 1469598103934665603ull;
+            for (size_t i = 0; i < w.size(); i += 4093) sum = (sum ^ w[i]) * 1099511628211ull;
+            const uint64_t hdr[4] = {0x31515244ull /* DRQ1 */, (uint64_t) w.size(), sum, (uint64_t) rq};
+            const size_t want = (size_t) n * (size_t) gg::iq::block_bytes(rq) * (size_t) (k / 256);
+            bool cached = false;
+            if (std::FILE* f = std::fopen(file.c_str(), "rb")) {
+                uint64_t h[4] = {};
+                if (std::fread(h, 8, 4, f) == 4 && std::memcmp(h, hdr, sizeof hdr) == 0) {
+                    o.resize(want);
+                    cached = std::fread(o.data(), 1, o.size(), f) == o.size();
+                }
+                std::fclose(f);
+            }
+            const bool ok = cached || (k % 256 == 0 && gg::dense_requant(w.data(), n, k, rq, o, e2) && o.size() == want);
+            if (ok && !cached) {   // (kept for the next start; a failed write only costs the conversion then)
+                std::error_code ec;
+                std::filesystem::create_directories(dir, ec);
+                const std::string tmp = file + ".tmp";
+                if (std::FILE* f = std::fopen(tmp.c_str(), "wb")) {
+                    const bool wr = std::fwrite(hdr, 8, 4, f) == 4 && std::fwrite(o.data(), 1, o.size(), f) == o.size();
+                    std::fclose(f);
+                    if (!wr || !os::replace_file(tmp, file)) std::remove(tmp.c_str());
+                }
+            }
+            if (ok) {
+                dense_req_saved += (double) w.size() - (double) o.size();
+                dense_req_ms += now_ms() - t0;
+                ++dense_req_n;
+                dense_req_cached += cached ? 1 : 0;
+                w.swap(o);
+                req = true;
+            } else {   // (a reason once: a build without ggml says it for every matrix)
+                const std::string why = e2.empty() ? "its rows do not split in 256-value blocks" : e2;
+                if (why != dense_req_why) {
+                    std::fprintf(stderr, "ds4: MAYA_DS4_DENSE_REQ: %s stays Q8_0 (%s)\n", pre.c_str(), why.c_str());
+                    dense_req_why = why;
+                }
+            }
+        }
         uint8_t* dp = nullptr;
         if (!dalloc(d, dp, w.size(), err, acct)) return false;
         cudaSetDevice(d.id);
         CK(cudaMemcpy(dp, w.data(), w.size(), cudaMemcpyHostToDevice));
         m = x3::Mat{};
-        m.fmt = q8 ? gg::kFmtQ8_0 : lb > 0 ? gg::kFmtGG : gg::kFmtBF16;
-        m.gg_type = lb > 0 ? lb : 0;
+        m.fmt = req ? gg::kFmtGG : q8 ? gg::kFmtQ8_0 : lb > 0 ? gg::kFmtGG : gg::kFmtBF16;
+        m.gg_type = req ? rq : lb > 0 ? lb : 0;
         m.raw = dp;
         m.k = k;
         m.n = n;
-        m.ld = q8 || lb > 0 ? (int) bytes_of((size_t) k) : k;
+        m.ld = req ? (int) ((size_t) gg::iq::block_bytes(rq) * (size_t) (k / 256))
+                   : q8 || lb > 0 ? (int) bytes_of((size_t) k) : k;
         return true;
+    }
+    // (MAYA_DS4_DENSE_REQ) the ggml type a dense matrix `pre` is re-quantized to, -1: kept as it is
+    double dense_req_saved = 0, dense_req_ms = 0;
+    int dense_req_n = 0, dense_req_cached = 0;
+    std::string dense_req_why;   // (the last reason a matrix stayed Q8_0, logged once)
+    // (MAYA_DS4_DENSE_REQ in a config, read as STRATA_DS4_DENSE_REQ; DS4_DENSE_REQ also taken)
+    static const char* dense_req_env(const char* name) {
+        const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+        return v != nullptr ? v : std::getenv(name);
+    }
+    static const char* dense_req_name() {
+        const char* v = dense_req_env("DS4_DENSE_REQ");
+        return v != nullptr ? v : "";
+    }
+    static int dense_req_type(const std::string& pre) {
+        static const int t = [] {
+            const char* v = dense_req_env("DS4_DENSE_REQ");
+            if (v == nullptr || *v == 0 || std::string(v) == "off") return -1;
+            const std::string s(v);
+            const int r = s == "q5_k" ? gg::iq::kQ5_K : s == "q4_k" ? gg::iq::kQ4_K : s == "iq4_xs" ? gg::iq::kIQ4_XS : -1;
+            if (r < 0) std::fprintf(stderr, "ds4: MAYA_DS4_DENSE_REQ=%s not known (q5_k, q4_k, iq4_xs): the dense matrices stay Q8_0\n",
+                                    v);
+            return r;
+        }();
+        if (t < 0) return -1;
+        static const std::vector<std::string> names = [] {
+            const char* v = dense_req_env("DS4_DENSE_REQ_MATCH");
+            std::string s = v != nullptr ? v : "attn.wq_b,attn.wo_a,attn.wo_b";
+            std::vector<std::string> out;
+            for (size_t a = 0; a <= s.size();) {
+                const size_t b = s.find(',', a);
+                const std::string x = s.substr(a, b == std::string::npos ? std::string::npos : b - a);
+                if (!x.empty()) out.push_back(x);
+                if (b == std::string::npos) break;
+                a = b + 1;
+            }
+            return out;
+        }();
+        for (const std::string& x : names)
+            if (pre.find(x) != std::string::npos) return t;
+        return -1;
     }
     // a Q5_K superblock's 256 values as F32 (host): ggml's dequantize_row_q5_K (get_scale_min_k4's scales)
     // (q5k_values: ds4_q6k.cuh's, the Q5_K token embedding's host decode)
@@ -5480,6 +5577,10 @@ struct Model::Impl {
             const size_t gsz = groups.empty() ? 1 : groups[(size_t) d.grp].mem.size();
             char tp[64] = "";
             if (gsz > 1) std::snprintf(tp, sizeof tp, " (tensor parallel %zu, part %d)", gsz, d.mi);
+            if (dense_req_n > 0 && d.id == devs[0].id)
+                std::fprintf(stderr, "ds4: MAYA_DS4_DENSE_REQ: %d dense matrices re-quantized (%d from the pack's cache), %.2f GB "
+                                     "fewer, %.1f s\n",
+                             dense_req_n, dense_req_cached, dense_req_saved / 1e9, dense_req_ms / 1000.0);
             char line[384];
             std::snprintf(line, sizeof line,
                           "ds4: CUDA%d layers [%d, %d]%s%s: weights %.2f GB, experts %.2f GB (%d of %d in VRAM), caches "
