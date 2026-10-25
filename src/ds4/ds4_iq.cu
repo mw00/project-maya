@@ -1117,10 +1117,10 @@ void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
         if (rp && ah) { pdl_launch(gate_up_kernel<T, NE, 4, true>, g4, kThreads, 0, s, a); return; }
-                                   if (rp) { pdl_launch(gate_up_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
-                                   if (ah) { pdl_launch(gate_up_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
-                                   }
-                                   pdl_launch(gate_up_kernel<T, NE>, grid, kThreads, 0, s, a);
+        if (rp) { pdl_launch(gate_up_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
+        if (ah) { pdl_launch(gate_up_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
+    }
+    pdl_launch(gate_up_kernel<T, NE>, grid, kThreads, 0, s, a);
 }
 template <int T, int NE>
 void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
@@ -1129,10 +1129,10 @@ void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
         if (rp && ah) { pdl_launch(down_kernel<T, NE, 4, true>, g4, kThreads, 0, s, a); return; }
-                                   if (rp) { pdl_launch(down_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
-                                   if (ah) { pdl_launch(down_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
-                                   }
-                                   pdl_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a);
+        if (rp) { pdl_launch(down_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
+        if (ah) { pdl_launch(down_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
+    }
+    pdl_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a);
 }
 template <int T>
 void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
@@ -1414,9 +1414,9 @@ bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, 
     if (k % 256 != 0 || n < 1 || ldd % 8 != 0 || ((uintptr_t) dst & 15) != 0) return false;
     const unsigned blocks = grid_for((long long) n * (k / 8));
 #define FR_(T) pdl_launch(f16_rows_kernel<T>, blocks, kThreads, 0, s, w, k, n, dst, ldd)
-                          DS4_IQ_SWITCH(type, FR_)
-                          #undef FR_
-                          return cudaGetLastError() == cudaSuccess;
+    DS4_IQ_SWITCH(type, FR_)
+#undef FR_
+    return cudaGetLastError() == cudaSuccess;
 }
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s) {
     pdl_launch(gather_f16_kernel, grid_for((long long) n * (k / 8)), kThreads, 0, s, x, ldx, idx, n, k, dst);
@@ -1429,9 +1429,9 @@ bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* 
     if (k % 256 != 0 || n < 1) return false;
     const unsigned blocks = (unsigned) std::min<int>(1024, (n * (k / 32) + kThreads - 1) / kThreads);
 #define DV_(T) pdl_launch(values_kernel<T>, blocks, kThreads, 0, s, w, k, n, sub, tile)
-                          DS4_IQ_SWITCH(type, DV_)
-                          #undef DV_
-                          return true;
+    DS4_IQ_SWITCH(type, DV_)
+#undef DV_
+    return true;
 }
 
 }  // namespace strata::ds4::gguf::iq

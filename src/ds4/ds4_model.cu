@@ -2369,7 +2369,8 @@ struct Model::Impl {
             // the layers' streams at the device's greatest priority: the expert cache's and the prompt path's other
             // streams (the least, the default) never hold a multiprocessor a layer's kernel could take.
             // DS4_STREAM_PRIO=0: the default priority
-            static const bool prio_on = std::getenv("DS4_STREAM_PRIO") == nullptr || std::atoi(std::getenv("DS4_STREAM_PRIO")) != 0;
+            static const bool prio_on =
+                std::getenv("DS4_STREAM_PRIO") == nullptr || std::atoi(std::getenv("DS4_STREAM_PRIO")) != 0;
             int least = 0, greatest = 0;
             if (!prio_on || cudaDeviceGetStreamPriorityRange(&least, &greatest) != cudaSuccess) {
                 cudaGetLastError();
@@ -6708,7 +6709,8 @@ struct Model::Impl {
         auto nodes = [&](int n, const std::function<void(int)>* f, int ph) { run_nodes(n, f, ph); };
         // DS4_CPU_FLOW=0: the four steps as four batches (as before); DS4_CPU_STATS times them, so it takes them too.
         // DS4_CPU_FLOW_CHECK=1: each call's flow outputs against the steps', bit for bit (twice the time)
-        static const bool flow_on = !stats && (std::getenv("DS4_CPU_FLOW") == nullptr || std::atoi(std::getenv("DS4_CPU_FLOW")) != 0);
+        static const bool flow_on =
+            !stats && (std::getenv("DS4_CPU_FLOW") == nullptr || std::atoi(std::getenv("DS4_CPU_FLOW")) != 0);
         static const bool flow_check = flow_on && std::getenv("DS4_CPU_FLOW_CHECK") != nullptr;
         const int ne = (int) ents.size();
         exl3_experts(c, x, ldx, ents.data(), ne, part, nodes, phase, flow_on);

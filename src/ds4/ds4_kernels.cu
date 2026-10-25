@@ -2937,10 +2937,10 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
         pdl_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { pdl_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq); }
-                                                                                  void init_pre(float* pre, int T, cudaStream_t s) { pdl_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }
-                                                                                  
-                                                                                  void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
-                                                                                  pdl_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);
+void init_pre(float* pre, int T, cudaStream_t s) { pdl_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }
+
+void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
+    pdl_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);
 }
 
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s) {
@@ -3575,8 +3575,8 @@ void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_s
     pdl_launch(hc_mean_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, h, hc, dim, out, out_stride);
 }
 void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { pdl_launch(iota_rows_kernel, T, 64, 0, s, out, n, stride); }
-                                                                                void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
-                                                                                pdl_launch(markov_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, H, tok, V, R);
+void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
+    pdl_launch(markov_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, H, tok, V, R);
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
     pdl_launch(markov_share_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, H, erow, vn, R);
