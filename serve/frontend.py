@@ -809,15 +809,41 @@ MINIMAX_NS = "]<]minimax[>["
 MM_THINK, MM_THINK_END = "<mm:think>", "</mm:think>"
 
 
+def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset()) -> bool:
+    """Whether a JSON schema admits a string (llama.cpp's common_chat_schema::may_be_string): "type" "string" or a
+    list holding it, an anyOf / oneOf with such an alternative, an allOf whose every constraining part admits one, a
+    string enum value or const, a "$ref" into defs (a cycle: no).  A schema without a type admits anything and is not
+    taken as a string - its value is read as JSON when it parses."""
+    if not isinstance(schema, dict):
+        return False
+    t = schema.get("type")
+    if t == "string" or (isinstance(t, list) and "string" in t):
+        return True
+    for key in ("anyOf", "oneOf"):
+        if any(may_be_string(s, defs, seen) for s in schema.get(key) or []):
+            return True
+    parts = [s for s in schema.get("allOf") or [] if isinstance(s, dict) and s]
+    if parts and all(may_be_string(s, defs, seen) for s in parts):
+        return True
+    if any(isinstance(v, str) for v in schema.get("enum") or []) or isinstance(schema.get("const"), str):
+        return True
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref not in seen:
+        name = ref.rsplit("/", 1)[-1]
+        return may_be_string((defs or {}).get(name), defs, seen | {ref})
+    return False
+
+
 class MinimaxRewriter:
     """MiniMax-M3.1's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
     form with JSON values).  `<mm:think>` opens reasoning (the parser is already in it) and goes; `</mm:think>` is
     </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
     ]<]minimax[>[), a value that holds `NS<k>` elements being an object (or, all `item`, an array) - become
     `<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` with V JSON: a string parameter (the
-    tool's schema says so) JSON-quoted piece by piece as it streams, any other value whole at its end (a nested one as
-    the object / array it spells, a plain one as JSON when it parses - a number, a boolean - else as a string).  A tag
-    split across deltas is held until it is whole."""
+    tool's schema admits a string: may_be_string, a nullable string or a union with one included) JSON-quoted piece
+    by piece as it streams, any other value whole at its end (a nested one as the object / array it spells, a plain
+    one as JSON when it parses - a number, a boolean - else as a string).  A tag split across deltas is held until it
+    is whole."""
 
     MARKS = (MINIMAX_NS, MM_THINK, MM_THINK_END)
 
@@ -825,8 +851,10 @@ class MinimaxRewriter:
         self.types = {}
         for t in tools or []:
             f = t.get("function", t)
-            props = ((f.get("parameters") or {}).get("properties")) or {}
-            self.types[f.get("name")] = {k: (v or {}).get("type") for k, v in props.items()}
+            params = f.get("parameters") or {}
+            props = params.get("properties") or {}
+            defs = {**(params.get("definitions") or {}), **(params.get("$defs") or {})}
+            self.types[f.get("name")] = {k: may_be_string(v, defs) for k, v in props.items()}
         self.buf = ""
         self.in_calls = False
         self.call = None             # the invoke's tool name
@@ -920,7 +948,7 @@ class MinimaxRewriter:
             return "<tool_call>" + self.call
         if self.call is not None and not closing:
             self.key, self.depth, self.vtext, self.vnested = name, 0, "", False
-            self.vstring = (self.types.get(self.call) or {}).get(name) == "string"
+            self.vstring = (self.types.get(self.call) or {}).get(name) is True
             return "<arg_key>" + name + "</arg_key><arg_value>" + ('"' if self.vstring else "")
         return self._plain(MINIMAX_NS + tag)
 

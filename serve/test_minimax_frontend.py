@@ -77,6 +77,21 @@ class Parser(unittest.TestCase):
         r, c, calls, _ = events("Plain answer.", thinking=False, seed=2)
         self.assertEqual((r, c.strip(), calls), ("", "Plain answer.", []))
 
+    def test_string_unions(self):   # (a schema that admits a string keeps "123" / "true" / "null" text a string)
+        props = {"a": {"type": ["string", "null"]}, "b": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                 "c": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/S"}]}, "d": {"enum": ["1", "2"]},
+                 "e": {"allOf": [{"type": "string"}, {}]}, "f": {"type": ["integer", "null"]}, "g": {}}
+        tools = [{"type": "function", "function": {"name": "t", "parameters": {
+            "type": "object", "properties": props, "$defs": {"S": {"type": "string"}}}}}]
+        vals = {"a": "123", "b": "true", "c": "null", "d": "1", "e": "2.5", "f": "7", "g": "8"}
+        call = NS + "<tool_call>\n" + NS + '<invoke name="t">' + "".join(
+            NS + f"<{k}>{v}" + NS + f"</{k}>" for k, v in vals.items()) + NS + "</invoke>\n" + NS + "</tool_call>"
+        for seed in range(10):
+            _, _, calls, streamed = events("</mm:think>" + call, tools=tools, seed=seed)
+            want = {"a": "123", "b": "true", "c": "null", "d": "1", "e": "2.5", "f": 7, "g": 8}
+            self.assertEqual(calls[0].arguments, want)
+            self.assertEqual(json.loads(streamed), want)
+
     def test_two_calls_and_no_schema(self):
         call = (NS + "<tool_call>\n" + NS + '<invoke name="a">' + NS + "<x>1" + NS + "</x>" + NS + "</invoke>\n" + NS +
                 '<invoke name="b">' + NS + "<y>hello" + NS + "</y>" + NS + "</invoke>\n" + NS + "</tool_call>")
