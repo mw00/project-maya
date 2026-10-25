@@ -705,7 +705,6 @@ __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
 
 __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
     pdl_wait();
-    pdl_trigger();
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) p != v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -713,6 +712,7 @@ __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
 #endif
     }
     __threadfence_system();
+    pdl_trigger();   // (only after the wait: ds4_pdl.cuh)
 }
 
 // ---------------------------------------------------------------- the prompt path's expert sets

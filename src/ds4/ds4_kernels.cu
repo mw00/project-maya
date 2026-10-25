@@ -2194,7 +2194,6 @@ __global__ void __launch_bounds__(1024) argmax_share_kernel(const float* __restr
 __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E,
                                    uint16_t* erow, int R) {
     pdl_wait();
-    pdl_trigger();
     __shared__ int pick;
     __shared__ float sv[256];
     __shared__ int si[256];
@@ -2208,6 +2207,7 @@ __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, 
         si[threadIdx.x] = (int) *(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 1);
     }
     __syncthreads();
+    pdl_trigger();   // (after the spin, as wait_seq_kernel's)
     if (threadIdx.x == 0) {
         float bv = __int_as_float(0xff800000);
         int bi = 0x7fffffff;
@@ -2455,7 +2455,6 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, 
 
 __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
     pdl_wait();
-    pdl_trigger();
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) seq_ptr != seq) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -2463,6 +2462,7 @@ __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
 #endif
     }
     __threadfence_system();
+    pdl_trigger();   // (only now: a kernel waiting behind a spin could hold the multiprocessors its flag's writer needs)
 }
 
 __global__ void init_pre_kernel(float* pre, int T) {
@@ -2531,18 +2531,18 @@ __device__ __forceinline__ void wait_at_least(const unsigned* flag, unsigned seq
 
 __global__ void __launch_bounds__(kThreads) xfer_get_kernel(const Xfer x, const unsigned* flag, unsigned seq) {
     pdl_wait();
-    pdl_trigger();
     if (threadIdx.x == 0) wait_at_least(flag, seq);
     __syncthreads();
+    pdl_trigger();   // (after the wait, as wait_seq_kernel's)
     xfer_copy(x, true);
 }
 
 __global__ void wait_flags_kernel(const unsigned* flags, int n, int stride, unsigned seq) {
     pdl_wait();
-    pdl_trigger();
     if (threadIdx.x != 0) return;
     for (int i = 0; i < n; ++i) wait_at_least(flags + (size_t) i * stride, seq);
     __threadfence_system();
+    pdl_trigger();   // (after the wait, as wait_seq_kernel's)
 }
 // a batch of table entries: *pairs[2i] = pairs[2i + 1] (the expert cache's recent slots, between windows)
 __global__ void tab_set_kernel(const unsigned long long* __restrict__ pairs, int n) {
@@ -2566,8 +2566,7 @@ __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
 __global__ void __launch_bounds__(kThreads) ar_rs_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
                                                         unsigned* bflags, int nm, int mi, int slot, int slots,
                                                         unsigned seq) {
-    pdl_wait();
-    pdl_trigger();
+    pdl_wait();   // (no pdl_trigger: it waits for the other members mid-kernel - wait_seq_kernel's rule)
     float4* x4 = (float4*) x;
     const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
     const int lo = blockIdx.x * per, hi = min(n4, lo + per), cs = (hi - lo + nm - 1) / nm;
@@ -2629,8 +2628,7 @@ __device__ __forceinline__ float4 sat4(float4 v) {   // (FP16's range: a partial
 __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
                                                           unsigned* bflags, int nm, int mi, int slot, int slots,
                                                           unsigned seq) {
-    pdl_wait();
-    pdl_trigger();
+    pdl_wait();   // (no pdl_trigger: it waits for the other members mid-kernel - wait_seq_kernel's rule)
     float4* x4 = (float4*) x;
     const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
     const int lo = blockIdx.x * per, hi = min(n4, lo + per), cs = (hi - lo + nm - 1) / nm;
@@ -2750,8 +2748,7 @@ __global__ void ar_from16_kernel(float4* x, const uint2* __restrict__ h, int n4,
 __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, const float* peers, size_t stride,
                                                          const unsigned* flags, int nm, int mi, int slot, int slots,
                                                          unsigned seq) {
-    pdl_wait();
-    pdl_trigger();
+    pdl_wait();   // (no pdl_trigger: it waits for the other members mid-kernel - wait_seq_kernel's rule)
     if (threadIdx.x == 0)
         for (int m = 0; m < nm; ++m)
             if (m != mi) wait_at_least(flags + ((size_t) m * slots + slot) * 32, seq);

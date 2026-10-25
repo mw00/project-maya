@@ -3,8 +3,11 @@
 // that kernel has ended and its writes are visible - so the launch's own latency hides behind the previous kernel
 // instead of sitting between the two.  Every kernel pdl_launch starts calls pdl_wait() before it touches memory a
 // kernel before it wrote or reads; pdl_trigger() (right after the wait) lets the next one be put on the device in turn.
-// One kernel at most waits behind a running one.  Elsewhere (older GPUs, HIP, DS4_PDL=0): a plain launch, and the two
-// calls do nothing.  The arithmetic is untouched: the same kernels in the same order.
+// One kernel at most waits behind a running one.  A kernel that waits for a flag another stream, device or the host
+// sets triggers only once that wait is over (or not at all): the blocks of the kernel behind it would otherwise sit on
+// the multiprocessors while it spins, and the kernel that sets its flag on another stream of the same device could
+// find none free - a deadlock (the prompt path's all-reduces).  Elsewhere (older GPUs, HIP, DS4_PDL=0): a plain
+// launch, and the two calls do nothing.  The arithmetic is untouched: the same kernels in the same order.
 #pragma once
 
 #include <cuda_runtime.h>
