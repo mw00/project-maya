@@ -1,6 +1,7 @@
 // src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
+#include "ds4_pdl.cuh"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -559,6 +560,8 @@ struct Ahead {
 // (each sub-block decoded once for them) -> h = the clamped swiglu
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int LPR = 32 / RW;
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     __shared__ int es[NE], xr[NE];
@@ -620,6 +623,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
 // part
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kDnRW>
 __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int LPR = 32 / RW;
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     __shared__ int es[NE];
@@ -677,6 +682,8 @@ static_assert((BM / TM) * (BN / TN) == kThreads, "one output tile a thread");
 // outputs.  (deq8 is the tile loader a tensor-core form takes too.)
 template <int T, bool GATE_UP, int RM = BM>
 __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int RT = RM / (kThreads / (BN / TN));
     static_assert(RT >= 1 && RT * (kThreads / (BN / TN)) == RM, "the block's rows");
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
@@ -765,6 +772,8 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
 constexpr int kLdT = 40;
 template <int T, bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
+    pdl_wait();
+    pdl_trigger();
 #if defined(STRATA_USE_HIP) && !DS4_ROCWMMA
     __builtin_trap();   // (a device pass for a card without WMMA: never launched there - tc_ok)
 #else
@@ -878,6 +887,8 @@ struct Jobs {
 };
 template <int T, int NC>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -923,6 +934,8 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
                                                            const int* __restrict__ idx, int ldx, int k,
                                                            const int* __restrict__ bounds, int row0,
                                                            int8_t* __restrict__ q, float* __restrict__ d) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.y / kLightRows, i = blockIdx.y % kLightRows;
     const int rows = bounds[e + 1] - bounds[e];
     const int b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -943,6 +956,8 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
 template <int T, int NE, bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const int8_t* __restrict__ xq,
                                                           const float* __restrict__ xd) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     const int e = blockIdx.y;
     const int lo = a.bounds[e] - a.row0, ne = a.bounds[e + 1] - a.bounds[e];
@@ -992,6 +1007,8 @@ __global__ void __launch_bounds__(kThreads) light_kernel(const SetArgs a, const 
 template <int T>
 __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restrict__ w, int k, int n, float* sub,
                                                            float* tile) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -1099,11 +1116,11 @@ void launch_gu(const Args& a, dim3 grid, cudaStream_t s) {
         const Iq1Var& v = iq1_var();
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
-        if (rp && ah) { gate_up_kernel<T, NE, 4, true><<<g4, kThreads, 0, s>>>(a); return; }
-        if (rp) { gate_up_kernel<T, NE, 4, false><<<g4, kThreads, 0, s>>>(a); return; }
-        if (ah) { gate_up_kernel<T, NE, 1, true><<<grid, kThreads, 0, s>>>(a); return; }
-    }
-    gate_up_kernel<T, NE><<<grid, kThreads, 0, s>>>(a);
+        if (rp && ah) { pdl_launch(gate_up_kernel<T, NE, 4, true>, g4, kThreads, 0, s, a); return; }
+                                   if (rp) { pdl_launch(gate_up_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
+                                   if (ah) { pdl_launch(gate_up_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
+                                   }
+                                   pdl_launch(gate_up_kernel<T, NE>, grid, kThreads, 0, s, a);
 }
 template <int T, int NE>
 void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
@@ -1111,11 +1128,11 @@ void launch_dn(const Args& a, dim3 grid, cudaStream_t s) {
         const Iq1Var& v = iq1_var();
         const bool rp = v.rp == 4 && grid.x % 4 == 0, ah = v.ah >= 0 ? v.ah != 0 : kAhead<T>;
         const dim3 g4(grid.x / 4, grid.y, grid.z);
-        if (rp && ah) { down_kernel<T, NE, 4, true><<<g4, kThreads, 0, s>>>(a); return; }
-        if (rp) { down_kernel<T, NE, 4, false><<<g4, kThreads, 0, s>>>(a); return; }
-        if (ah) { down_kernel<T, NE, 1, true><<<grid, kThreads, 0, s>>>(a); return; }
-    }
-    down_kernel<T, NE><<<grid, kThreads, 0, s>>>(a);
+        if (rp && ah) { pdl_launch(down_kernel<T, NE, 4, true>, g4, kThreads, 0, s, a); return; }
+                                   if (rp) { pdl_launch(down_kernel<T, NE, 4, false>, g4, kThreads, 0, s, a); return; }
+                                   if (ah) { pdl_launch(down_kernel<T, NE, 1, true>, grid, kThreads, 0, s, a); return; }
+                                   }
+                                   pdl_launch(down_kernel<T, NE>, grid, kThreads, 0, s, a);
 }
 template <int T>
 void gu_ne(const Args& a, dim3 grid, int ne, cudaStream_t s) {
@@ -1137,16 +1154,16 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
     if (tc_ok()) {
         SetArgs b = a;   // (gate / up: FP16 rows when the caller gave them - set_gate_up's x16)
         b.xh_vec = b.xh != nullptr && ((uintptr_t) b.xh & 15) == 0 && (b.ldx & 7) == 0 ? 1 : 0;
-        set_tc_kernel<T, GU><<<grid, kThreads, 0, s>>>(b);
+        pdl_launch(set_tc_kernel<T, GU>, grid, kThreads, 0, s, b);
         return;
     }
 #endif
     if (a.max_rows <= 16) {   // (a block of 64 rows would do 64 rows' FMAs for the few there are)
         grid.x = (unsigned) ((a.max_rows + 15) / 16);
-        set_kernel<T, GU, 16><<<grid, kThreads, 0, s>>>(a);
+        pdl_launch(set_kernel<T, GU, 16>, grid, kThreads, 0, s, a);
         return;
     }
-    set_kernel<T, GU><<<grid, kThreads, 0, s>>>(a);
+    pdl_launch(set_kernel<T, GU>, grid, kThreads, 0, s, a);
 }
 // the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
 struct LightBuf {
@@ -1182,17 +1199,17 @@ bool light_on() {   // STRATA_DS4_NO_LIGHT=1: every set through the GEMM tiles
 template <int T, bool GU>
 void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
     const dim3 grid((unsigned) (((GU ? a.n_ff : a.n_embd) + kWarps - 1) / kWarps), (unsigned) a.n_exp);
-    if (a.max_rows <= 4) light_kernel<T, 4, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else if (a.max_rows <= 8) light_kernel<T, 8, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
-    else light_kernel<T, kLightRows, GU><<<grid, kThreads, 0, s>>>(a, b.q, b.d);
+    if (a.max_rows <= 4) pdl_launch(light_kernel<T, 4, GU>, grid, kThreads, 0, s, a, b.q, b.d);
+    else if (a.max_rows <= 8) pdl_launch(light_kernel<T, 8, GU>, grid, kThreads, 0, s, a, b.q, b.d);
+    else pdl_launch(light_kernel<T, kLightRows, GU>, grid, kThreads, 0, s, a, b.q, b.d);
 }
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     const int K = gu ? a.n_embd : a.n_ff;
     LightBuf* b = light_buf(s, K);
     if (b == nullptr) return false;
     const dim3 gq((unsigned) ((K / 32 + kWarps - 1) / kWarps), (unsigned) (a.n_exp * kLightRows));
-    light_q8_kernel<<<gq, kThreads, 0, s>>>(gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
-                                            a.row0, b->q, b->d);
+    pdl_launch(light_q8_kernel, gq, kThreads, 0, s, gu ? a.xf : nullptr, gu ? nullptr : a.xh, a.idx, a.ldx, K, a.bounds,
+               a.row0, b->q, b->d);
     if (gu) {
         if (a.tg == kMXFP4) {
             launch_light<kMXFP4, true>(a, *b, s);
@@ -1216,9 +1233,9 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
-    if (max_c <= 1) mv_kernel<T, 1><<<grid, kThreads, 0, s>>>(J);
-    else if (max_c <= 4) mv_kernel<T, 4><<<grid, kThreads, 0, s>>>(J);
-    else mv_kernel<T, 16><<<grid, kThreads, 0, s>>>(J);
+    if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
+    else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
+    else pdl_launch(mv_kernel<T, 16>, grid, kThreads, 0, s, J);
 }
 
 }  // namespace
@@ -1345,6 +1362,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
 template <int T>
 __global__ void __launch_bounds__(kThreads) f16_rows_kernel(const uint8_t* __restrict__ w, int k, int n,
                                                              uint16_t* __restrict__ dst, int ldd) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     load_tab<T>(tab);
     __syncthreads();
@@ -1367,6 +1386,8 @@ __global__ void __launch_bounds__(kThreads) f16_rows_kernel(const uint8_t* __res
 __global__ void __launch_bounds__(kThreads) gather_f16_kernel(const uint16_t* __restrict__ x, int ldx,
                                                                const int* __restrict__ idx, int n, int k,
                                                                uint16_t* __restrict__ dst) {
+    pdl_wait();
+    pdl_trigger();
     const int nq = k / 8;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < (long long) n * nq;
          i += (long long) gridDim.x * blockDim.x) {
@@ -1377,6 +1398,8 @@ __global__ void __launch_bounds__(kThreads) gather_f16_kernel(const uint16_t* __
 }
 __global__ void __launch_bounds__(kThreads) swiglu_f16_kernel(const float* __restrict__ gu, int ld, int n, int ff,
                                                                float limit, uint16_t* __restrict__ h, int ldh) {
+    pdl_wait();
+    pdl_trigger();
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < (long long) n * ff;
          i += (long long) gridDim.x * blockDim.x) {
         const int r = (int) (i / ff), c = (int) (i % ff);
@@ -1390,25 +1413,25 @@ static unsigned grid_for(long long items) {
 bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, cudaStream_t s) {
     if (k % 256 != 0 || n < 1 || ldd % 8 != 0 || ((uintptr_t) dst & 15) != 0) return false;
     const unsigned blocks = grid_for((long long) n * (k / 8));
-#define FR_(T) f16_rows_kernel<T><<<blocks, kThreads, 0, s>>>(w, k, n, dst, ldd)
-    DS4_IQ_SWITCH(type, FR_)
-#undef FR_
-    return cudaGetLastError() == cudaSuccess;
+#define FR_(T) pdl_launch(f16_rows_kernel<T>, blocks, kThreads, 0, s, w, k, n, dst, ldd)
+                          DS4_IQ_SWITCH(type, FR_)
+                          #undef FR_
+                          return cudaGetLastError() == cudaSuccess;
 }
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s) {
-    gather_f16_kernel<<<grid_for((long long) n * (k / 8)), kThreads, 0, s>>>(x, ldx, idx, n, k, dst);
+    pdl_launch(gather_f16_kernel, grid_for((long long) n * (k / 8)), kThreads, 0, s, x, ldx, idx, n, k, dst);
 }
 void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, cudaStream_t s) {
-    swiglu_f16_kernel<<<grid_for((long long) n * ff), kThreads, 0, s>>>(gu, ld, n, ff, limit, h, ldh);
+    pdl_launch(swiglu_f16_kernel, grid_for((long long) n * ff), kThreads, 0, s, gu, ld, n, ff, limit, h, ldh);
 }
 
 bool decode_values(int type, const uint8_t* w, int k, int n, float* sub, float* tile, cudaStream_t s) {
     if (k % 256 != 0 || n < 1) return false;
     const unsigned blocks = (unsigned) std::min<int>(1024, (n * (k / 32) + kThreads - 1) / kThreads);
-#define DV_(T) values_kernel<T><<<blocks, kThreads, 0, s>>>(w, k, n, sub, tile)
-    DS4_IQ_SWITCH(type, DV_)
-#undef DV_
-    return true;
+#define DV_(T) pdl_launch(values_kernel<T>, blocks, kThreads, 0, s, w, k, n, sub, tile)
+                          DS4_IQ_SWITCH(type, DV_)
+                          #undef DV_
+                          return true;
 }
 
 }  // namespace strata::ds4::gguf::iq
