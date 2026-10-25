@@ -11,6 +11,7 @@
 // front (a thread a GPU), every step after the first waiting on the host's counter.
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -38,6 +39,14 @@ public:
     bool save_profile(const std::string& path, std::string& err) const;
     int draft_block() const;
     bool draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
+    bool forward_cands(const int* ids, int n, int pos0, int want, Cands& c, std::string& err);
+    void set_progress(std::function<bool(int)> f);
+    void set_ppl(bool on);
+    const std::vector<double>& ppl_nll() const;
+    int done() const;
+    bool draft_sampled(int anchor, int pos, int n, const DraftSampling& ds, const std::vector<float>& u,
+                       std::vector<int>& drafts, std::vector<float>& conf,
+                       std::vector<std::vector<std::pair<int, float>>>& q, std::string& err);
     const VisionGeo* vision() const;
     bool encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err);
     void set_images(std::vector<Model::Image> images);

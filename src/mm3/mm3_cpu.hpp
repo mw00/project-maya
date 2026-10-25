@@ -30,9 +30,12 @@ public:
     /// [T][dim] = each token's weighted sum of its experts here (0 for a token with none).  Each expert's weights are
     /// decoded once for up to 8 of its tokens.  At most max_entries (expert, token) pairs.
     /// order (if given): the (expert, user) pairs in the order each token's sum takes them (the token path's: its
-    /// slots'), so a token's sum is run()'s bits; else expert by expert.
+    /// slots'), so a token's sum is run()'s bits; else expert by expert.  accumulate: out += the sums (else out =).
     void run_multi(const std::vector<CpuExpert>& ex, const std::vector<std::vector<std::pair<int, float>>>& users,
-                   const float* x, int T, float* out, const std::vector<std::pair<int, int>>* order = nullptr);
+                   const float* x, int T, float* out, const std::vector<std::pair<int, int>>* order = nullptr,
+                   bool accumulate = false);
+    /// The most (expert, token) pairs a run_multi takes.
+    int max_entries() const;
     int threads() const;
     /// f(0 .. n - 1) on the lane's threads (the caller one of them), back when all are done.
     void parallel_for(int n, const std::function<void(int)>& f);

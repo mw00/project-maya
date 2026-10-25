@@ -19,6 +19,7 @@
 
 #include <immintrin.h>
 
+#include "mm3_cands.hpp"
 #include "mm3_cpu.hpp"
 #include "mm3_dspark.hpp"
 #include "mm3_exl3.hpp"
@@ -41,7 +42,7 @@ namespace x3 = strata::mm3::exl3;
 namespace {
 
 constexpr int kWin = 16;          // a decode window's tokens at most (the decode kernels, enqueued up front)
-constexpr int kChunk = 256;       // a prompt chunk's tokens at most (the prompt kernels, enqueued step by step)
+constexpr int kDraftRows = 256;   // the draft's context rows a call (a prompt chunk's in runs of these)
 constexpr size_t kAlign = 256;
 constexpr int kLine = 16;         // a counter's stride in the mapped words (its own 64-byte line)
 size_t up(size_t n) { return (n + kAlign - 1) / kAlign * kAlign; }
@@ -260,14 +261,14 @@ struct TpEngine::Impl {
         size_t free0 = 0;
         float *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *iq = nullptr, *ik = nullptr, *bs = nullptr;
         float *att = nullptr, *gg = nullptr, *uu = nullptr, *sh = nullptr, *out = nullptr, *win_h = nullptr;
-        float *win_part = nullptr, *inv = nullptr, *rlog_d = nullptr;
+        float *win_part = nullptr, *inv = nullptr, *rlog_d = nullptr, *attp = nullptr;
         int *pos = nullptr, *kept = nullptr, *pos_h = nullptr;
         uint8_t* plan_d = nullptr;
         unsigned* counter = nullptr;
-        // the prompt path's scratch (kChunk rows)
+        // the prompt path's scratch (chunk rows)
         float *p_xn = nullptr, *p_q = nullptr, *p_k = nullptr, *p_v = nullptr, *p_iq = nullptr, *p_ik = nullptr;
-        float *p_bs = nullptr, *p_att = nullptr, *p_out = nullptr, *p_gg = nullptr, *p_uu = nullptr, *p_sh = nullptr;
-        float *p_y = nullptr, *p_zero = nullptr, *p_w = nullptr, *p_rlog = nullptr;
+        float *p_bs = nullptr, *p_att = nullptr, *p_gg = nullptr, *p_uu = nullptr, *p_sh = nullptr;
+        float *p_y = nullptr, *p_w = nullptr, *p_rlog = nullptr;
         uint16_t *p_xn16 = nullptr, *p_att16 = nullptr, *p_h16 = nullptr;
         int *p_pos = nullptr, *p_kept = nullptr, *p_rowidx = nullptr, *p_invrow = nullptr, *p_bres = nullptr,
             *p_bstg = nullptr;
@@ -283,7 +284,7 @@ struct TpEngine::Impl {
         unsigned seq_in = 0;
         std::vector<unsigned> seq_out;
         float* rlog = nullptr;        // mapped: member 0's router logits [kWin][n_exp]
-        // the prompt path's (kChunk rows): the normed inputs, the partials, the router's logits, the MoE plan
+        // the prompt path's (chunk rows): the normed inputs, the partials, the router's logits, the MoE plan
         float *p_xa = nullptr, *p_xb = nullptr, *p_part = nullptr, *p_rlog = nullptr;
         uint8_t* p_plan = nullptr;
         unsigned* frout = nullptr;    // its counter
@@ -299,6 +300,12 @@ struct TpEngine::Impl {
         std::vector<long long> slot_owner, slot_pend, slot_iss, slot_used;
         int n_pending = 0;
         std::vector<std::pair<int, long long>> promo_q;   // (slot, key) to copy after the window
+        // the decode's promotions hold at most prom_cap slots (slot_prom): the rest stay free for a prompt's staged
+        // experts, which take no promoted slot while another is free - a prompt leaves the decode's cache as it was
+        std::vector<char> slot_prom;
+        int n_prom = 0, prom_cap = 0;
+        std::vector<cudaEvent_t> p_ev;   // [member] a prompt layer's staged copies done (on cs)
+        std::vector<float> p_cpu;        // the prompt's CPU lane sums [chunk][dim]
     };
     struct Slice {   // a layer on one member
         x3::Mat q, k, v, o, mg, mu, md, sg, su, sd;
@@ -326,6 +333,7 @@ struct TpEngine::Impl {
     std::vector<Group> G;
     std::vector<Layer> L;
     int tp = 1;
+    int chunk = 1024;                        // a prompt chunk's tokens at most (Options::tp_chunk)
     int head_m = 0;                          // the member holding the head, the draft and the vision tower
     std::vector<void*> owned;
     std::vector<int> owned_dev;
@@ -342,11 +350,16 @@ struct TpEngine::Impl {
     x3::Mat head;
     std::vector<float> norm1;
     float *xf = nullptr, *lg = nullptr, *lgh = nullptr;
+    // (forward_cands) this forward's head rows as candidates: topk_rows into cand_h (mapped), cand_ex the extra ids
+    bool cand_on = false;
+    int cand_kc = 1, cand_ne = 0;
+    k::CandRow* cand_h = nullptr;
+    int* cand_ex = nullptr;
     unsigned* fhead = nullptr;
     unsigned seq_head = 0;
     cudaEvent_t head_ev = nullptr;
     // the host's side of a forward
-    std::vector<float> h, tmp, cpu_out, rl;
+    std::vector<float> h, cpu_out, rl;
     std::vector<uint32_t> prof;
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;
@@ -358,6 +371,7 @@ struct TpEngine::Impl {
     std::unique_ptr<Vision> vis;
     std::vector<Model::Image> imgs;
     std::atomic<bool> abort_{false};
+    bool in_prompt = false;   // (the pipeline's host threads at work: the shared tallies are theirs to add after)
     // (MM3_TP_PROF: where a window's host time goes, printed at the end)
     const bool prof_on = std::getenv("MM3_TP_PROF") != nullptr;
     double tp_norm = 0, tp_sum = 0, tp_route = 0, tp_plan = 0, tp_lane = 0, tp_wait = 0, tp_head = 0, tp_end = 0,
@@ -391,6 +405,7 @@ struct TpEngine::Impl {
                 cudaSetDevice(M[(size_t) gr.mem[j]].id);
                 if (gr.cs[j]) cudaStreamSynchronize(gr.cs[j]);
                 for (cudaEvent_t e : gr.slot_ev[j]) cudaEventDestroy(e);
+                if (j < gr.p_ev.size() && gr.p_ev[j]) cudaEventDestroy(gr.p_ev[j]);
                 if (gr.cs[j]) cudaStreamDestroy(gr.cs[j]);
             }
         for (void* x : hosted) cudaFreeHost(x);
@@ -492,6 +507,10 @@ struct TpEngine::Impl {
         if (const char* pr = std::getenv("MM3_PROMOTE"))
             std::sscanf(pr, "%f,%d,%f", &kPromote, &kMaxPending, &kDecay);
         tp = o.tp;
+        chunk = std::max(kWin + 1, std::min(o.tp_chunk, 8192));
+        ffn_f = o.tp_ffn_rows > 0 ? std::max(o.tp_ffn_rows, (chunk + kMaxSlices - 1) / kMaxSlices) : chunk;
+        if (const char* sv = std::getenv("MM3_ATTN_SPLIT")) attn_splits = std::max(1, std::atoi(sv));
+        attn_splits = std::min(attn_splits, g.topk);
         if (tp != 1 && tp != 2 && tp != 4) {
             err = "--tp " + std::to_string(tp) + ": 1, 2 or 4 (a member: 16 query heads a KV head)";
             return false;
@@ -557,6 +576,9 @@ struct TpEngine::Impl {
             acat = kAAct;
             if (!dalloc(hm.id, lg, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(lgh, (size_t) kWin * g.vocab, cudaHostAllocPortable, err)) return false;
+            if (!halloc(cand_h, (size_t) kWin, cudaHostAllocMapped | cudaHostAllocPortable, err) ||
+                !halloc(cand_ex, (size_t) k::kCandExtra, cudaHostAllocMapped | cudaHostAllocPortable, err))
+                return false;
             if (!halloc(xf, (size_t) kWin * g.dim, cudaHostAllocMapped | cudaHostAllocPortable, err) ||
                 !halloc(fhead, kLine, cudaHostAllocMapped | cudaHostAllocPortable, err))
                 return false;
@@ -567,7 +589,7 @@ struct TpEngine::Impl {
                 const Tensor* et = pk.get(P + "embed_tokens.weight");
                 // (on the head member's own stream: a device's work that waits on the host goes on one stream, in
                 //  order - the draft's context steps on a second stream, parked behind a wait, held up the first)
-                if (!draftm->load(pk, hm.id, hm.s, hm.blas, &head, (const uint16_t*) pk.data(*et), kChunk, err))
+                if (!draftm->load(pk, hm.id, hm.s, hm.blas, &head, (const uint16_t*) pk.data(*et), kDraftRows, err))
                     return false;
                 const auto& tl = draftm->geo().taps;
                 for (size_t j = 0; j < tl.size(); ++j) {
@@ -578,10 +600,15 @@ struct TpEngine::Impl {
                     tap_of[(size_t) tl[j]] = (int) j;
                 }
                 acat = kADraft;
-                const bool tok = dalloc(hm.id, taps_d, tl.size() * (size_t) kChunk * g.dim, err);
+                // (taps_d / taps_h a window's; a prompt's in tap_ring, the last tap_rows positions - the draft's window
+                //  and more - read where they are by its context)
+                const bool tok = dalloc(hm.id, taps_d, tl.size() * (size_t) kWin * g.dim, err);
                 acat = kAAct;
+                tap_rows = draftm->geo().window + 64;
                 if (!tok ||
-                    !halloc(taps_h, tl.size() * (size_t) kChunk * g.dim, cudaHostAllocMapped | cudaHostAllocPortable, err) ||
+                    !halloc(taps_h, tl.size() * (size_t) kWin * g.dim, cudaHostAllocMapped | cudaHostAllocPortable, err) ||
+                    !halloc(tap_ring, tl.size() * (size_t) tap_rows * g.dim, cudaHostAllocMapped | cudaHostAllocPortable,
+                            err) ||
                     !halloc(ftap, kLine, cudaHostAllocMapped | cudaHostAllocPortable, err))
                     return false;
                 // (every window size once now: cuBLAS takes its workspace and picks its kernels here, not during a
@@ -674,36 +701,45 @@ struct TpEngine::Impl {
                     !A(m.out, (size_t) kWin * g.dim) || !A(m.win_h, (size_t) kWin * 8 * mfs) ||
                     !A(m.win_part, (size_t) kWin * 8 * g.dim) || !A(m.inv, inv_freq.size()) || !A(m.pos, (size_t) kWin) ||
                     !A(m.kept, (size_t) mix * kWin * g.topk) || !A(m.plan_d, plan_bytes) || !A(m.counter, (size_t) 16) ||
-                    !A(m.rlog_d, (size_t) kWin * g.n_exp))
+                    !A(m.rlog_d, (size_t) kWin * g.n_exp) || !A(m.attp, k::attn_part_floats(kWin, mkv, g.topk)))
                     return false;
                 TK(cudaMemset(m.counter, 0, 64));
                 acat = kAPrompt;
                 {   // the prompt path's scratch
-                    const size_t C = kChunk, rows = C * g.k_exp;
+                    // (the attention's a chunk's rows; the FFN's a slice's - F tokens, FK = F K routed rows)
+                    const size_t C = chunk, rows = C * g.k_exp, F = (size_t) ffn_rows(), FK = F * g.k_exp;
+                    const size_t ns = (size_t) n_slices_max();
                     const int ffd = std::max(mfd, mfss);
                     if (!A(m.p_xn, C * g.dim) || !A(m.p_xn16, C * g.dim) || !A(m.p_q, C * mh * g.hd) ||
                         !A(m.p_k, C * mkv * g.hd) || !A(m.p_v, C * mkv * g.hd) || !A(m.p_iq, C * mix * g.ix_dim) ||
                         !A(m.p_ik, C * g.ix_dim) || !A(m.p_bs, (size_t) mix * C * nblk) || !A(m.p_kept, (size_t) mix * C * g.topk) ||
-                        !A(m.p_att, C * mh * g.hd) || !A(m.p_att16, C * mh * g.hd) || !A(m.p_out, C * g.dim) ||
-                        !A(m.p_gg, C * ffd) || !A(m.p_uu, C * ffd) || !A(m.p_sh, C * g.dim) ||
-                        !A(m.p_h16, std::max(rows * mfs, C * ffd)) || !A(m.p_y, rows * g.dim) || !A(m.p_zero, C * g.dim) ||
+                        !A(m.p_att, C * mh * g.hd) || !A(m.p_att16, C * mh * g.hd) || !A(m.p_sh, F * g.dim) ||
+                        !A(m.p_h16, std::max(FK * mfs, F * ffd)) || !A(m.p_y, (FK + 1) * g.dim) ||
                         !A(m.p_w, rows) || !A(m.p_rlog, C * g.n_exp) || !A(m.p_pos, C) || !A(m.p_rowidx, rows) ||
-                        !A(m.p_invrow, rows) || !A(m.p_bres, (size_t) g.n_exp + 1) || !A(m.p_bstg, (size_t) 4096))
+                        !A(m.p_invrow, rows) || !A(m.p_bres, ns * ((size_t) g.n_exp + 1)) || !A(m.p_bstg, ns * 4097))
                         return false;
-                    TK(cudaMemset(m.p_zero, 0, C * g.dim * 4));
+                    // (the dense FFN's and the shared expert's gate / up rows in p_y, which the routed experts use
+                    //  only after them; the outputs into p_xn, whose readers are all before them on the stream)
+                    if (2 * F * ffd <= FK * g.dim) {
+                        m.p_gg = m.p_y;
+                        m.p_uu = m.p_y + F * ffd;
+                    } else if (!A(m.p_gg, F * ffd) || !A(m.p_uu, F * ffd)) {
+                        return false;
+                    }
+                    TK(cudaMemset(m.p_y + FK * g.dim, 0, (size_t) g.dim * 4));   // (the CPU lane's entries' row)
                 }
                 acat = kAAct;
                 TK(cudaMemcpy(m.inv, inv_freq.data(), inv_freq.size() * 4, cudaMemcpyHostToDevice));
-                if (!halloc(m.pos_h, (size_t) kChunk, cudaHostAllocPortable, err)) return false;
+                if (!halloc(m.pos_h, (size_t) chunk, cudaHostAllocPortable, err)) return false;
                 if (!x3::prepare(m.s)) {
                     err = "tp: the EXL3 scratch on CUDA" + std::to_string(m.id);
                     return false;
                 }
             }
             const unsigned mapped = cudaHostAllocMapped | cudaHostAllocPortable;
-            if (!halloc(gr.p_xa, (size_t) kChunk * g.dim, mapped, err) || !halloc(gr.p_xb, (size_t) kChunk * g.dim, mapped, err) ||
-                !halloc(gr.p_part, (size_t) t * kChunk * g.dim, mapped, err) ||
-                !halloc(gr.p_rlog, (size_t) kChunk * g.n_exp, mapped, err) || !halloc(gr.p_plan, plan_p_bytes(), mapped, err))
+            if (!halloc(gr.p_xa, (size_t) chunk * g.dim, mapped, err) || !halloc(gr.p_xb, (size_t) chunk * g.dim, mapped, err) ||
+                !halloc(gr.p_part, (size_t) t * chunk * g.dim, mapped, err) ||
+                !halloc(gr.p_rlog, (size_t) chunk * g.n_exp, mapped, err) || !halloc(gr.p_plan, plan_p_bytes(), mapped, err))
                 return false;
             if (!halloc(gr.xa, (size_t) kWin * g.dim, mapped, err) || !halloc(gr.xb, (size_t) kWin * g.dim, mapped, err) ||
                 !halloc(gr.part, (size_t) t * kWin * g.dim, mapped, err) || !halloc(gr.plans, (size_t) t * plan_bytes, mapped, err) ||
@@ -806,6 +842,7 @@ struct TpEngine::Impl {
                                     !dalloc(dv, S.i8.ks, cache / g.hd, err) || !dalloc(dv, S.i8.vs, cache / g.hd, err)
                               : !dalloc(dv, S.kc, cache, err) || !dalloc(dv, S.vc, cache, err))
                     return false;
+                S.i8.rot = o.kv_int8 && o.kv_rotate;
                 if (!dalloc(dv, S.ic, (size_t) o.max_ctx * g.ix_dim, err)) return false;
                 acct_ic[dv] += (size_t) o.max_ctx * g.ix_dim * 2;
                 if (kv_ring > 0) {
@@ -998,6 +1035,17 @@ struct TpEngine::Impl {
                 gr.slot_ev[(size_t) j].resize((size_t) gr.n_slots);
                 for (auto& e : gr.slot_ev[(size_t) j]) TK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
             }
+            gr.p_ev.assign((size_t) t, nullptr);
+            for (int j = 0; j < t; ++j) {
+                TK(cudaSetDevice(M[(size_t) gr.mem[(size_t) j]].id));
+                TK(cudaEventCreateWithFlags(&gr.p_ev[(size_t) j], cudaEventDisableTiming));
+            }
+            // (the promotions' cap: a layer's experts outside VRAM, the most of the group's, stay free for prompts)
+            int reserve = 0;
+            for (int li = gr.l0; li < gr.l1; ++li)
+                if (L[(size_t) li].moe) reserve = std::max(reserve, g.n_exp - (int) L[(size_t) li].res_ids.size());
+            gr.slot_prom.assign((size_t) gr.n_slots, 0);
+            gr.prom_cap = std::max(0, gr.n_slots - reserve);
             gr.slot_owner.assign((size_t) gr.n_slots, -1);
             gr.slot_pend.assign((size_t) gr.n_slots, -1);
             gr.slot_iss.assign((size_t) gr.n_slots, 0);
@@ -1058,8 +1106,16 @@ struct TpEngine::Impl {
             }
             lane = std::make_unique<CpuLane>(std::max(0, o.cpu_threads), g.dim, mw, g.alpha, g.limit, me);
         }
-        h.resize((size_t) kChunk * g.dim);
-        tmp.resize((size_t) kChunk * g.dim);
+        h.resize((size_t) kWin * g.dim);
+        pipe_buf.assign(G.size() + 1, std::vector<float>((size_t) chunk * g.dim));
+        for (Group& gr : G) gr.p_cpu.assign((size_t) chunk * g.dim, 0.0f);
+        use_score.assign((size_t) g.n_layers * 1024, 0.0f);   // (the pipeline's threads score their layers' keys)
+        use_last.assign(use_score.size(), 0);
+        if (const char* pc = std::getenv("MM3_PROMPT_CPU")) {
+            prompt_cpu = std::string(pc) != "off";
+            if (prompt_cpu && std::string(pc) != "on") std::sscanf(pc, "%lf,%lf,%lf", &pc_a, &pc_b, &pc_bw);
+        }
+        if (const char* pp = std::getenv("MM3_TP_PIPE")) pipe_on = std::atoi(pp) != 0;
         cpu_out.resize((size_t) kWin * g.dim);
         rl.resize((size_t) kWin * g.n_exp);
         for (Member& m : M) m.w->start();
@@ -1082,7 +1138,9 @@ struct TpEngine::Impl {
         }
         info.push_back("CPU lane: " + std::to_string(lane->threads()) + " threads");
         {
-            std::string kv = std::string("KV cache: ") + (o.kv_int8 ? "INT8 (a scale a row of 128)" : "BF16");
+            std::string kv = std::string("KV cache: ") + (o.kv_int8 ? o.kv_rotate ? "INT8 (rotated, a scale a row of 128)"
+                                                                                  : "INT8 (a scale a row of 128)"
+                                                                     : "BF16");
             if (kv_ring > 0)
                 kv += ", streamed: " + std::to_string(kv_ring) + " positions a layer in VRAM, all " +
                       std::to_string(o.max_ctx) + " in host memory (" + std::to_string((int) (st.kv_host_gb + 0.5)) +
@@ -1171,8 +1229,10 @@ struct TpEngine::Impl {
         if (!o.promote || gr.n_slots == 0 || sc < kPromote || gr.n_pending >= kMaxPending) return;
         int best = -1;
         float bs = sc;
+        const bool full = gr.n_prom >= gr.prom_cap;   // (then a promotion takes a promoted slot)
         for (int s = 0; s < gr.n_slots; ++s) {
             if (gr.slot_pend[(size_t) s] >= 0 || gr.slot_used[(size_t) s] == fwd) continue;
+            if (full && !gr.slot_prom[(size_t) s]) continue;
             const long long ok = gr.slot_owner[(size_t) s];
             const float os = ok < 0 ? -1.0f : score(ok, false);
             if (os < bs) {
@@ -1181,6 +1241,10 @@ struct TpEngine::Impl {
             }
         }
         if (best < 0) return;
+        if (!gr.slot_prom[(size_t) best]) {
+            gr.slot_prom[(size_t) best] = 1;
+            ++gr.n_prom;
+        }
         const long long old = gr.slot_owner[(size_t) best];
         if (old >= 0) L[(size_t) (old / 1024)].slot_of[(size_t) (old % 1024)] = -1;
         gr.slot_owner[(size_t) best] = -1;
@@ -1214,36 +1278,71 @@ struct TpEngine::Impl {
 
 
     // ---------------------------------------------------------------- the prompt path (more than kWin tokens)
-    // a chunk's MoE plan in mapped memory: a header (the passes' sizes, the copies), then the arrays
+    // A prompt in chunks of `chunk` tokens.  A member's steps of a chunk are enqueued one at a time as the host
+    // publishes each one's input (a worker thread a member spins on the host's counter: no device waits on the host
+    // here).  The chunks go through the groups as a pipeline (MM3_TP_PIPE=0: one chunk at a time): a host thread a
+    // group runs its layers' host steps for chunk c while the group after it runs them for chunk c - 1, each chunk's
+    // residual rows in a buffer of its own (pipe_buf, in turn).  A MoE layer's plan for a chunk: its experts in VRAM by
+    // resident slot, those in the cache's slots as they are, (prompt_cpu, opt-in) the cold ones - the fewest tokens,
+    // while the CPU lane would finish them before the copies of the rest - on the CPU lane meanwhile, the others copied
+    // into slots the decode's promotions do not hold, on each member's copy stream while it runs its experts in VRAM.
+
+    // The FFN half of a chunk's layer runs in slices of ffn_rows() tokens (Options::tp_ffn_rows): the dense FFN's, the
+    // shared expert's and the routed experts' scratch a slice's (p_y, p_sh, p_h16 - the gate / up rows in p_y), while
+    // the staged experts are still copied once a chunk.  The same bits (a row's sums are its own whatever the rows
+    // beside it); slices of 256 at the server's settings: 37 more experts in VRAM, a 53K prompt 13% slower (each slice
+    // reads its experts' weights again) - the whole chunk by default.
+    int ffn_f = 0;
+    int ffn_rows() const { return std::max(1, std::min(ffn_f, chunk)); }
+    int n_slices_max() const { return (chunk + ffn_rows() - 1) / ffn_rows(); }
+    static constexpr int kMaxSlices = 128;
+
+    // a chunk's MoE plan in mapped memory: a header (the copies, the slices), a header a slice (its passes' sizes,
+    // where its sorted rows start), then the arrays - by entry t K + i its row in its slice's p_y and its weight, by
+    // sorted row its token, each slice's set bounds, the copies
     struct PHdr {
-        int n_res, max_res, rows_res, n_stg, max_stg, n_copy;
+        int n_copy, n_slices;
+    };
+    struct PSlice {
+        int n_res, max_res, rows_res, n_stg, max_stg, base;
     };
     size_t plan_p_bytes() const {
-        const size_t rows = (size_t) kChunk * g.k_exp;
-        return 64 + rows * 4 * 3 + ((size_t) g.n_exp + 1) * 4 + 4097 * 4 + (size_t) g.n_exp * 8;
+        const size_t rows = (size_t) chunk * g.k_exp, ns = (size_t) n_slices_max();
+        return 64 + kMaxSlices * sizeof(PSlice) + rows * 4 * 3 + ns * ((size_t) g.n_exp + 1) * 4 + ns * 4097 * 4 +
+               (size_t) g.n_exp * 8;
     }
     struct PPtr {
         PHdr* hdr;
-        int *rowidx, *invrow, *bres, *bstg, *cslot, *cexp;
+        PSlice* sl;
+        int *rowidx, *invrow, *bres, *bstg, *cslot, *cexp;   // (bres / bstg: slice s's at s (n_exp + 1) / s 4097)
         float* w;
     };
     PPtr pplan(const Group& gr) const {
-        const size_t rows = (size_t) kChunk * g.k_exp;
+        const size_t rows = (size_t) chunk * g.k_exp, ns = (size_t) n_slices_max();
         PPtr p;
         uint8_t* b = gr.p_plan;
         p.hdr = (PHdr*) b;
-        p.rowidx = (int*) (b + 64);
+        p.sl = (PSlice*) (b + 64);
+        p.rowidx = (int*) (b + 64 + kMaxSlices * sizeof(PSlice));
         p.invrow = p.rowidx + rows;
         p.w = (float*) (p.invrow + rows);
         p.bres = (int*) (p.w + rows);
-        p.bstg = p.bres + g.n_exp + 1;
-        p.cslot = p.bstg + 4097;
+        p.bstg = p.bres + ns * ((size_t) g.n_exp + 1);
+        p.cslot = p.bstg + ns * 4097;
         p.cexp = p.cslot + g.n_exp;
         return p;
     }
 
-    // a worker's wait on a mapped counter (the prompt path's steps are enqueued once the host's input is there)
-    bool cpu_wait(const unsigned* f, unsigned v, std::string& err) {
+    // a prompt's chunks: [a, a + T) of the call, at positions pos0 + a
+    struct PChunk {
+        int a = 0, T = 0, nblk = 0;
+    };
+    std::atomic<int> pipe_lim{0};       // the chunks that start (group 0 lowers it at a stop)
+    std::atomic<bool> pipe_stop{false};   // (the progress callback asked for a stop)
+
+    // a worker's wait on a mapped counter (the prompt path's steps are enqueued once the host's input is there); false
+    // with no error when chunk c is past pipe_lim (the prompt stopped before it)
+    bool cpu_wait(const unsigned* f, unsigned v, std::string& err, int c = -1) {
         const double t0 = now();
         for (long spin = 0; (int) (*(const volatile unsigned*) f - v) < 0; ++spin) {
             _mm_pause();
@@ -1253,6 +1352,7 @@ struct TpEngine::Impl {
                     err = "tp: stopped";
                     return false;
                 }
+                if (c >= 0 && c >= pipe_lim.load()) return false;
                 if (now() - t0 > 120.0) {
                     err = "tp: the host gave no input in two minutes";
                     return false;
@@ -1263,147 +1363,206 @@ struct TpEngine::Impl {
         return true;
     }
 
-    // member j of group gi's part of a prompt chunk: each step enqueued once the host has published its input
-    bool prompt_member(int gi, int j, int T, int nblk, unsigned in0, unsigned out0, unsigned rout0, std::string& err) {
+    // member j of group gi's part of a prompt's chunks, one after another: each step enqueued once the host has
+    // published its input
+    bool prompt_member(int gi, int j, const std::vector<PChunk>& cks, int pos0, unsigned in0, unsigned out0,
+                       unsigned rout0, std::string& err) {
         Group& gr = G[(size_t) gi];
         Member& m = M[(size_t) gr.mem[(size_t) j]];
         const int t = (int) gr.mem.size();
         const int mh = g.n_head / t, mkv = g.n_kv / t, mix = g.ix_heads / t;
         const int mfs = g.ff / t, K = g.k_exp;
         TK(cudaSetDevice(m.id));
-        TK(cudaMemcpyAsync(m.p_pos, m.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, m.s));
-        float* part = gr.p_part + (size_t) j * kChunk * g.dim;
+        float* part = gr.p_part + (size_t) j * chunk * g.dim;
         unsigned* fo = gr.fout + (size_t) j * kLine;
         const float scale = 1.0f / std::sqrt((float) g.hd), one = 1.0f, zero = 0.0f;
         unsigned vin = in0, vout = out0, vrout = rout0;
-        for (int li = gr.l0; li < gr.l1; ++li) {
-            const Layer& l = L[(size_t) li];
-            const Slice& S = l.sl[(size_t) j];
-            // attention
-            if (!cpu_wait(gr.fin, ++vin, err)) return false;
-            TK(cudaMemcpyAsync(m.p_xn, gr.p_xa, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, m.s));
-            k::to_f16(m.p_xn, T, g.dim, g.dim, m.p_xn16, g.dim, m.s);
-            x3::gemm_rows(S.q, m.p_xn16, g.dim, T, m.p_q, mh * g.hd, 0.0f, m.s);
-            x3::gemm_rows(S.k, m.p_xn16, g.dim, T, m.p_k, mkv * g.hd, 0.0f, m.s);
-            x3::gemm_rows(S.v, m.p_xn16, g.dim, T, m.p_v, mkv * g.hd, 0.0f, m.s);
-            k::qk_norm_rope(m.p_q, m.p_k, m.p_v, S.qn1, S.kn1, m.p_pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps, S.kc,
-                            S.vc, m.s, 0, S.i8, S.kvh);
-            if (cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, mix * g.ix_dim, T, g.dim, &one, S.wiq, g.dim, m.p_xn,
-                            g.dim, &zero, m.p_iq, mix * g.ix_dim) != CUBLAS_STATUS_SUCCESS ||
-                cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, g.ix_dim, T, g.dim, &one, S.wik, g.dim, m.p_xn, g.dim,
-                            &zero, m.p_ik, g.ix_dim) != CUBLAS_STATUS_SUCCESS) {
-                err = "tp: cuBLAS (the indexer)";
-                return false;
+        for (int c = 0; c < (int) cks.size(); ++c) {
+            const int T = cks[(size_t) c].T, nblk = cks[(size_t) c].nblk;
+            bool first = true;
+            for (int li = gr.l0; li < gr.l1; ++li) {
+                const Layer& l = L[(size_t) li];
+                const Slice& S = l.sl[(size_t) j];
+                // attention
+                if (!cpu_wait(gr.fin, ++vin, err, c)) return err.empty();
+                if (first) k::iota(m.p_pos, T, pos0 + cks[(size_t) c].a, m.s);
+                first = false;
+                TK(cudaMemcpyAsync(m.p_xn, gr.p_xa, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, m.s));
+                k::to_f16(m.p_xn, T, g.dim, g.dim, m.p_xn16, g.dim, m.s);
+                x3::gemm_rows(S.q, m.p_xn16, g.dim, T, m.p_q, mh * g.hd, 0.0f, m.s);
+                x3::gemm_rows(S.k, m.p_xn16, g.dim, T, m.p_k, mkv * g.hd, 0.0f, m.s);
+                x3::gemm_rows(S.v, m.p_xn16, g.dim, T, m.p_v, mkv * g.hd, 0.0f, m.s);
+                k::qk_norm_rope(m.p_q, m.p_k, m.p_v, S.qn1, S.kn1, m.p_pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps,
+                                S.kc, S.vc, m.s, 0, S.i8, S.kvh);
+                if (cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, mix * g.ix_dim, T, g.dim, &one, S.wiq, g.dim, m.p_xn,
+                                g.dim, &zero, m.p_iq, mix * g.ix_dim) != CUBLAS_STATUS_SUCCESS ||
+                    cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, g.ix_dim, T, g.dim, &one, S.wik, g.dim, m.p_xn,
+                                g.dim, &zero, m.p_ik, g.ix_dim) != CUBLAS_STATUS_SUCCESS) {
+                    err = "tp: cuBLAS (the indexer)";
+                    return false;
+                }
+                k::index_norm_rope(m.p_iq, m.p_ik, S.iqn1, S.ikn1, m.p_pos, T, mix, g.ix_dim, g.n_rot, m.inv, g.eps,
+                                   S.ic, m.s);
+                k::block_scores(m.p_iq, S.ic, m.p_pos, T, mix, nblk, g.blk, m.p_bs, m.s);
+                k::select_blocks(m.p_bs, m.p_pos, T, mix, nblk, g.blk, g.topk, m.p_kept, m.s);
+                k::sparse_attn(m.p_q, S.kc, S.vc, m.p_kept, m.p_pos, T, mh, mkv, g.topk, g.blk, scale, m.p_att, m.s,
+                               S.i8, S.kvh);
+                k::to_f16(m.p_att, T, mh * g.hd, mh * g.hd, m.p_att16, mh * g.hd, m.s);
+                x3::gemm_rows(S.o, m.p_att16, mh * g.hd, T, m.p_xn, g.dim, 0.0f, m.s);
+                k::publish(m.p_xn, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
+                // the FFN
+                if (!cpu_wait(gr.fin, ++vin, err, c)) return err.empty();
+                TK(cudaMemcpyAsync(m.p_xn, gr.p_xb, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, m.s));
+                k::to_f16(m.p_xn, T, g.dim, g.dim, m.p_xn16, g.dim, m.s);
+                const int F = ffn_rows(), ns = (T + F - 1) / F;
+                if (!l.moe) {   // (slice by slice: gate / up in p_y, the output into p_xn's rows)
+                    const int wd = g.ff_dense / t;
+                    for (int q = 0; q < ns; ++q) {
+                        const int t0 = q * F, Tq = std::min(F, T - t0);
+                        x3::gemm_rows(S.mg, m.p_xn16 + (size_t) t0 * g.dim, g.dim, Tq, m.p_gg, wd, 0.0f, m.s);
+                        x3::gemm_rows(S.mu, m.p_xn16 + (size_t) t0 * g.dim, g.dim, Tq, m.p_uu, wd, 0.0f, m.s);
+                        k::swigluoai(m.p_gg, m.p_uu, (size_t) Tq * wd, g.alpha, g.limit, nullptr, m.p_h16, m.s);
+                        x3::gemm_rows(S.md, m.p_h16, wd, Tq, m.p_xn + (size_t) t0 * g.dim, g.dim, 0.0f, m.s);
+                    }
+                    k::publish(m.p_xn, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
+                    continue;
+                }
+                if (j == 0) {   // the router's logits for the host
+                    k::rows_dot(S.gate, g.n_exp, g.dim, m.p_xn, T, m.p_rlog, m.s);
+                    k::publish(m.p_rlog, gr.p_rlog, (size_t) T * g.n_exp, m.counter, gr.frout, ++vrout, m.s);
+                }
+                const int ws = g.ff_shared / t;
+                // a slice's shared expert (gate / up in p_y, the output p_sh): slice 0's while the host plans
+                const auto shared = [&](int q) {
+                    const int t0 = q * F, Tq = std::min(F, T - t0);
+                    x3::gemm_rows(S.sg, m.p_xn16 + (size_t) t0 * g.dim, g.dim, Tq, m.p_gg, ws, 0.0f, m.s);
+                    x3::gemm_rows(S.su, m.p_xn16 + (size_t) t0 * g.dim, g.dim, Tq, m.p_uu, ws, 0.0f, m.s);
+                    k::swigluoai(m.p_gg, m.p_uu, (size_t) Tq * ws, g.alpha, g.limit, nullptr, m.p_h16, m.s);
+                    x3::gemm_rows(S.sd, m.p_h16, ws, Tq, m.p_sh, g.dim, 0.0f, m.s);
+                };
+                shared(0);
+                // the routed experts: the host's plan; its staged experts' slices into their slots on the copy stream
+                // (the slots' last readers, the layers before, are done: the host had their parts before this plan),
+                // then slice by slice the experts in VRAM, the staged ones (their copies in by the first), the sum
+                if (!cpu_wait(gr.fin, ++vin, err, c)) return err.empty();
+                const PPtr pp = pplan(gr);
+                const PHdr hd = *pp.hdr;
+                const int rows = T * K;
+                cudaStream_t cs = gr.cs[(size_t) j];
+                for (int q = 0; q < hd.n_copy; ++q) {
+                    const int sl = pp.cslot[q], e = pp.cexp[q];
+                    TK(cudaMemcpyAsync(gr.slot_base[(size_t) j] + (size_t) sl * gr.slot_bytes,
+                                       l.host[(size_t) e] + (size_t) j * l.blob, l.blob, cudaMemcpyHostToDevice, cs));
+                }
+                if (hd.n_copy > 0) TK(cudaEventRecord(gr.p_ev[(size_t) j], cs));
+                TK(cudaMemcpyAsync(m.p_rowidx, pp.rowidx, (size_t) rows * 4, cudaMemcpyHostToDevice, m.s));
+                TK(cudaMemcpyAsync(m.p_invrow, pp.invrow, (size_t) rows * 4, cudaMemcpyHostToDevice, m.s));
+                TK(cudaMemcpyAsync(m.p_w, pp.w, (size_t) rows * 4, cudaMemcpyHostToDevice, m.s));
+                TK(cudaMemcpyAsync(m.p_bres, pp.bres, (size_t) hd.n_slices * (g.n_exp + 1) * 4, cudaMemcpyHostToDevice, m.s));
+                TK(cudaMemcpyAsync(m.p_bstg, pp.bstg, (size_t) hd.n_slices * 4097 * 4, cudaMemcpyHostToDevice, m.s));
+                x3::SetArgs sa;
+                sa.lay = l.lay;
+                sa.n_embd = g.dim;
+                sa.n_ff = mfs;
+                sa.limit = g.limit;
+                for (int q = 0; q < hd.n_slices; ++q) {
+                    const int t0 = q * F, Tq = std::min(F, T - t0);
+                    const PSlice sp = pp.sl[q];
+                    if (q > 0) shared(q);
+                    if (sp.rows_res > 0) {
+                        sa.wbase = l.sl[(size_t) j].res_base;
+                        sa.stride = l.blob;
+                        sa.n_exp = sp.n_res;
+                        sa.bounds = m.p_bres + (size_t) q * (g.n_exp + 1);
+                        sa.row0 = 0;
+                        sa.max_rows = sp.max_res;
+                        x3::set_gate_up(sa, m.p_xn, g.dim, m.p_rowidx + sp.base, m.p_h16, mfs, m.s);
+                        x3::set_down(sa, m.p_h16, mfs, m.p_y, g.dim, m.s);
+                    }
+                    if (q == 0 && hd.n_copy > 0) TK(cudaStreamWaitEvent(m.s, gr.p_ev[(size_t) j], 0));
+                    if (sp.max_stg > 0) {
+                        sa.wbase = gr.slot_base[(size_t) j];
+                        sa.stride = gr.slot_bytes;
+                        sa.n_exp = sp.n_stg;
+                        sa.bounds = m.p_bstg + (size_t) q * 4097;
+                        sa.row0 = sp.rows_res;
+                        sa.max_rows = sp.max_stg;
+                        x3::set_gate_up(sa, m.p_xn, g.dim, m.p_rowidx + sp.base + sp.rows_res, m.p_h16, mfs, m.s);
+                        x3::set_down(sa, m.p_h16, mfs, m.p_y + (size_t) sp.rows_res * g.dim, g.dim, m.s);
+                    }
+                    // (the CPU lane's entries: weight 0 on p_y's zero row, its last; the host adds their sums)
+                    k::moe_combine(nullptr, m.p_y, m.p_invrow + (size_t) t0 * K, m.p_w + (size_t) t0 * K, m.p_sh, Tq,
+                                   K, g.dim, g.scale, m.p_xn + (size_t) t0 * g.dim, m.s);
+                }
+                k::publish(m.p_xn, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
             }
-            k::index_norm_rope(m.p_iq, m.p_ik, S.iqn1, S.ikn1, m.p_pos, T, mix, g.ix_dim, g.n_rot, m.inv, g.eps, S.ic,
-                               m.s);
-            k::block_scores(m.p_iq, S.ic, m.p_pos, T, mix, nblk, g.blk, m.p_bs, m.s);
-            k::select_blocks(m.p_bs, m.p_pos, T, mix, nblk, g.blk, g.topk, m.p_kept, m.s);
-            k::sparse_attn(m.p_q, S.kc, S.vc, m.p_kept, m.p_pos, T, mh, mkv, g.topk, g.blk, scale, m.p_att, m.s, S.i8, S.kvh);
-            k::to_f16(m.p_att, T, mh * g.hd, mh * g.hd, m.p_att16, mh * g.hd, m.s);
-            x3::gemm_rows(S.o, m.p_att16, mh * g.hd, T, m.p_out, g.dim, 0.0f, m.s);
-            k::publish(m.p_out, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
-            // the FFN
-            if (!cpu_wait(gr.fin, ++vin, err)) return false;
-            TK(cudaMemcpyAsync(m.p_xn, gr.p_xb, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, m.s));
-            k::to_f16(m.p_xn, T, g.dim, g.dim, m.p_xn16, g.dim, m.s);
-            if (!l.moe) {
-                const int wd = g.ff_dense / t;
-                x3::gemm_rows(S.mg, m.p_xn16, g.dim, T, m.p_gg, wd, 0.0f, m.s);
-                x3::gemm_rows(S.mu, m.p_xn16, g.dim, T, m.p_uu, wd, 0.0f, m.s);
-                k::swigluoai(m.p_gg, m.p_uu, (size_t) T * wd, g.alpha, g.limit, nullptr, m.p_h16, m.s);
-                x3::gemm_rows(S.md, m.p_h16, wd, T, m.p_out, g.dim, 0.0f, m.s);
-                k::publish(m.p_out, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
-                continue;
-            }
-            if (j == 0) {   // the router's logits for the host
-                k::rows_dot(S.gate, g.n_exp, g.dim, m.p_xn, T, m.p_rlog, m.s);
-                k::publish(m.p_rlog, gr.p_rlog, (size_t) T * g.n_exp, m.counter, gr.frout, ++vrout, m.s);
-            }
-            const int ws = g.ff_shared / t;
-            x3::gemm_rows(S.sg, m.p_xn16, g.dim, T, m.p_gg, ws, 0.0f, m.s);
-            x3::gemm_rows(S.su, m.p_xn16, g.dim, T, m.p_uu, ws, 0.0f, m.s);
-            k::swigluoai(m.p_gg, m.p_uu, (size_t) T * ws, g.alpha, g.limit, nullptr, m.p_h16, m.s);
-            x3::gemm_rows(S.sd, m.p_h16, ws, T, m.p_sh, g.dim, 0.0f, m.s);
-            // the routed experts: the host's plan, its staged experts' slices into the cache's slots, two passes
-            if (!cpu_wait(gr.fin, ++vin, err)) return false;
-            const PPtr pp = pplan(gr);
-            const PHdr hd = *pp.hdr;
-            const int rows = T * K;
-            TK(cudaMemcpyAsync(m.p_rowidx, pp.rowidx, (size_t) rows * 4, cudaMemcpyHostToDevice, m.s));
-            TK(cudaMemcpyAsync(m.p_invrow, pp.invrow, (size_t) rows * 4, cudaMemcpyHostToDevice, m.s));
-            TK(cudaMemcpyAsync(m.p_w, pp.w, (size_t) rows * 4, cudaMemcpyHostToDevice, m.s));
-            TK(cudaMemcpyAsync(m.p_bres, pp.bres, ((size_t) hd.n_res + 1) * 4, cudaMemcpyHostToDevice, m.s));
-            TK(cudaMemcpyAsync(m.p_bstg, pp.bstg, ((size_t) hd.n_stg + 1) * 4, cudaMemcpyHostToDevice, m.s));
-            for (int c = 0; c < hd.n_copy; ++c) {
-                const int sl = pp.cslot[c], e = pp.cexp[c];
-                TK(cudaMemcpyAsync(gr.slot_base[(size_t) j] + (size_t) sl * gr.slot_bytes,
-                                   l.host[(size_t) e] + (size_t) j * l.blob, l.blob, cudaMemcpyHostToDevice, m.s));
-            }
-            x3::SetArgs sa;
-            sa.lay = l.lay;
-            sa.n_embd = g.dim;
-            sa.n_ff = mfs;
-            sa.limit = g.limit;
-            if (hd.rows_res > 0) {
-                sa.wbase = l.sl[(size_t) j].res_base;
-                sa.stride = l.blob;
-                sa.n_exp = hd.n_res;
-                sa.bounds = m.p_bres;
-                sa.row0 = 0;
-                sa.max_rows = hd.max_res;
-                x3::set_gate_up(sa, m.p_xn, g.dim, m.p_rowidx, m.p_h16, mfs, m.s);
-                x3::set_down(sa, m.p_h16, mfs, m.p_y, g.dim, m.s);
-            }
-            if (rows > hd.rows_res) {
-                sa.wbase = gr.slot_base[(size_t) j];
-                sa.stride = gr.slot_bytes;
-                sa.n_exp = hd.n_stg;
-                sa.bounds = m.p_bstg;
-                sa.row0 = hd.rows_res;
-                sa.max_rows = hd.max_stg;
-                x3::set_gate_up(sa, m.p_xn, g.dim, m.p_rowidx + hd.rows_res, m.p_h16, mfs, m.s);
-                x3::set_down(sa, m.p_h16, mfs, m.p_y + (size_t) hd.rows_res * g.dim, g.dim, m.s);
-            }
-            k::moe_combine(m.p_zero, m.p_y, m.p_invrow, m.p_w, m.p_sh, T, K, g.dim, g.scale, m.p_out, m.s);
-            k::publish(m.p_out, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
         }
         return true;
     }
 
-    // the host's plan of a prompt chunk's routed experts for group gr (T tokens, top / w [T][K]): the resident ones
-    // by resident slot, the others staged into the cache's slots (an expert already in one keeps it; a new one takes
-    // the least recently used slot that is not pending, its copies by the members) - its slots the cache's after
-    void plan_prompt(Group& gr, Layer& l, int li, int T, const std::vector<int>& top, const std::vector<float>& w) {
+    // the prompt's CPU lane for the cold experts (prompt_cpu, MM3_PROMPT_CPU=on or "a,b,bw": its costs - ms a whole
+    // expert's pass, its weights decoded for up to 8 tokens; ms a token; a link's GB/s): off by default - with the
+    // groups' pipeline the copies hide well enough that a 53K prompt read 4% faster without it
+    bool prompt_cpu = false;
+    double pc_a = 0.55, pc_b = 0.02, pc_bw = 6.0;
+    bool pipe_on = true;            // (MM3_TP_PIPE=0: a chunk through every group before the next)
+    std::mutex lane_mu;             // (the pipeline's host threads take the lane one at a time)
+
+    // a chunk's MoE plan for group gr (T tokens, top / w [T][K]): the resident experts by resident slot; the cold ones
+    // not in VRAM or the cache onto the CPU lane (cpu: those, the fewest tokens first while the lane - lane_share of it
+    // - finishes them before the copies of the rest would); the others staged into the cache's slots (an expert
+    // already in one keeps it; a new one takes the least recently used slot that is neither pending nor a promotion's,
+    // its copies by the members) - its slots the cache's after.  The CPU lane's entries: weight 0 on the zero row.
+    void plan_prompt(Group& gr, Layer& l, int li, int T, const std::vector<int>& top, const std::vector<float>& w,
+                     double lane_share, std::vector<int>& cpu, long& staged) {
         const int K = g.k_exp, rows = T * K;
         const PPtr pp = pplan(gr);
         std::vector<std::vector<int>> rows_of((size_t) g.n_exp);
         for (int i = 0; i < rows; ++i) rows_of[(size_t) top[(size_t) i]].push_back(i);
-        int pos = 0;
-        PHdr hd{};
-        hd.n_res = (int) l.res_ids.size();
-        for (int s2 = 0; s2 < hd.n_res; ++s2) {
-            pp.bres[s2] = pos;
-            const int e = l.res_ids[(size_t) s2];
-            hd.max_res = std::max(hd.max_res, (int) rows_of[(size_t) e].size());
-            for (int ent : rows_of[(size_t) e]) {
-                pp.rowidx[pos] = ent / K;
-                pp.invrow[ent] = pos++;
+        cpu.clear();
+        std::vector<char> on_cpu((size_t) g.n_exp, 0);
+        if (prompt_cpu && lane && lane->threads() > 1) {
+            std::vector<int> cold;
+            for (int e = 0; e < g.n_exp; ++e)
+                if (!rows_of[(size_t) e].empty() && l.res_slot[(size_t) e] < 0 && l.slot_of[(size_t) e] < 0)
+                    cold.push_back(e);
+            std::stable_sort(cold.begin(), cold.end(),
+                             [&](int a, int b) { return rows_of[(size_t) a].size() < rows_of[(size_t) b].size(); });
+            const double link = (double) l.blob / (pc_bw * 1e9) * 1e3;   // (ms; the members copy theirs in parallel)
+            double t_cpu = 0;
+            int n_gpu = (int) cold.size();
+            for (int e : cold) {
+                const int nt = (int) rows_of[(size_t) e].size();
+                const double c = (pc_a * ((nt + 7) / 8) + pc_b * nt) / std::max(0.05, lane_share);
+                if (t_cpu + c > (n_gpu - 1) * link) break;
+                t_cpu += c;
+                --n_gpu;
+                on_cpu[(size_t) e] = 1;
+                cpu.push_back(e);
             }
         }
-        pp.bres[hd.n_res] = pos;
-        hd.rows_res = pos;
+        PHdr hd{};
         // the staged ones' slots
         std::vector<int> slot_exp((size_t) gr.n_slots, -1);
         for (int e = 0; e < g.n_exp; ++e) {
-            if (rows_of[(size_t) e].empty() || l.res_slot[(size_t) e] >= 0) continue;
+            if (rows_of[(size_t) e].empty() || l.res_slot[(size_t) e] >= 0 || on_cpu[(size_t) e]) continue;
             const long long key = (long long) li * 1024 + e;
             int sl = l.slot_of[(size_t) e];
             if (sl < 0) {
-                for (int c = 0; c < gr.n_slots; ++c)
-                    if (gr.slot_pend[(size_t) c] < 0 && slot_exp[(size_t) c] < 0 &&
-                        (sl < 0 || gr.slot_used[(size_t) c] < gr.slot_used[(size_t) sl]))
-                        sl = c;
+                for (int pass = 0; pass < 2 && sl < 0; ++pass)   // (a promotion's slot only when no other is free)
+                    for (int c = 0; c < gr.n_slots; ++c)
+                        if (gr.slot_pend[(size_t) c] < 0 && slot_exp[(size_t) c] < 0 && (pass || !gr.slot_prom[(size_t) c]) &&
+                            (sl < 0 || gr.slot_used[(size_t) c] < gr.slot_used[(size_t) sl]))
+                            sl = c;
+                if (sl < 0) {   // (every slot this layer's or pending: the CPU lane takes it)
+                    on_cpu[(size_t) e] = 1;
+                    cpu.push_back(e);
+                    continue;
+                }
+                if (gr.slot_prom[(size_t) sl]) {
+                    gr.slot_prom[(size_t) sl] = 0;
+                    --gr.n_prom;
+                }
                 const long long old = gr.slot_owner[(size_t) sl];
                 if (old >= 0) L[(size_t) (old / 1024)].slot_of[(size_t) (old % 1024)] = -1;
                 gr.slot_owner[(size_t) sl] = key;
@@ -1411,144 +1570,231 @@ struct TpEngine::Impl {
                 pp.cslot[hd.n_copy] = sl;
                 pp.cexp[hd.n_copy] = e;
                 ++hd.n_copy;
-                ++st.staged;
+                ++staged;
             }
             slot_exp[(size_t) sl] = e;
             gr.slot_used[(size_t) sl] = fwd;
             for (size_t u = 0; u < rows_of[(size_t) e].size(); ++u) score(key, true);
         }
-        hd.n_stg = gr.n_slots;
-        for (int c = 0; c < gr.n_slots; ++c) {
-            pp.bstg[c] = pos;
-            const int e = slot_exp[(size_t) c];
-            if (e < 0) continue;
-            hd.max_stg = std::max(hd.max_stg, (int) rows_of[(size_t) e].size());
-            for (int ent : rows_of[(size_t) e]) {
-                pp.rowidx[pos] = ent / K;
-                pp.invrow[ent] = pos++;
+        // the slices (ffn_rows() tokens each): the resident experts' rows by resident slot, then the staged ones' by
+        // slot, a slice's rows numbered from 0 (its p_y's) and sorted after the slices before it (base)
+        const int F = ffn_rows(), ns = (T + F - 1) / F;
+        std::vector<size_t> at((size_t) g.n_exp, 0);   // (each expert's next entry: its entries ascend)
+        int base = 0;
+        for (int q = 0; q < ns; ++q) {
+            const int e1 = std::min(rows, (q + 1) * F * K);
+            PSlice sp{};
+            sp.n_res = (int) l.res_ids.size();
+            sp.n_stg = gr.n_slots;
+            sp.base = base;
+            int* bres = pp.bres + (size_t) q * (g.n_exp + 1);
+            int* bstg = pp.bstg + (size_t) q * 4097;
+            int pos = 0;
+            const auto take = [&](int e, int& mx) {
+                const std::vector<int>& r = rows_of[(size_t) e];
+                size_t& i = at[(size_t) e];
+                const int p0 = pos;
+                for (; i < r.size() && r[i] < e1; ++i) {
+                    pp.rowidx[base + pos] = r[i] / K;
+                    pp.invrow[r[i]] = pos++;
+                }
+                mx = std::max(mx, pos - p0);
+            };
+            for (int s2 = 0; s2 < sp.n_res; ++s2) {
+                bres[s2] = pos;
+                take(l.res_ids[(size_t) s2], sp.max_res);
             }
+            bres[sp.n_res] = pos;
+            sp.rows_res = pos;
+            for (int c = 0; c < gr.n_slots; ++c) {
+                bstg[c] = pos;
+                if (slot_exp[(size_t) c] >= 0) take(slot_exp[(size_t) c], sp.max_stg);
+            }
+            bstg[gr.n_slots] = pos;
+            base += pos;
+            pp.sl[q] = sp;
         }
-        pp.bstg[gr.n_slots] = pos;
+        hd.n_slices = ns;
         for (int i = 0; i < rows; ++i) pp.w[i] = w[(size_t) i];
+        for (int e : cpu)
+            for (int ent : rows_of[(size_t) e]) {
+                pp.invrow[ent] = F * K;   // (the slice's p_y's zero row)
+                pp.w[ent] = 0.0f;
+            }
         *pp.hdr = hd;
     }
 
-    bool prompt(const int* ids, int T, int pos0, int r0, int r1, float* logits, std::string& err) {
-        const int nblk = (pos0 + T - 1) / g.blk + 1;
-        if (pos0 + T > o.max_ctx) {
-            err = "the context is full (" + std::to_string(o.max_ctx) + ")";
-            return false;
+    // the cold experts of a chunk's layer on the CPU lane: each as tm sub-experts (the members' slices) for its tokens,
+    // in runs of the lane's entries (an expert of more tokens than one run takes in parts), into out [T][dim] (zeroed
+    // first); x the normed rows
+    void prompt_lane(const Group& gr, const Layer& l, int T, const std::vector<int>& cpu, const std::vector<int>& top,
+                     const std::vector<float>& w, const float* x, float* out) {
+        const int K = g.k_exp, tm = (int) gr.mem.size();
+        std::fill(out, out + (size_t) T * g.dim, 0.0f);
+        std::vector<CpuExpert> ex;
+        std::vector<std::vector<std::pair<int, float>>> users;
+        int ents = 0;
+        bool any = false;
+        auto run = [&]() {
+            if (ex.empty()) return;
+            lane->run_multi(ex, users, x, T, out, nullptr, any);
+            any = true;
+            ex.clear();
+            users.clear();
+            ents = 0;
+        };
+        std::vector<std::vector<std::pair<int, float>>> who((size_t) g.n_exp);
+        for (int i = 0; i < T * K; ++i) {
+            const int e = top[(size_t) i];
+            who[(size_t) e].push_back({i / K, w[(size_t) i] * g.scale});
         }
-        for (const Group& gr : G)   // (a layer's experts not in VRAM all staged at once: the cache's slots hold them)
-            for (int li = gr.l0; li < gr.l1; ++li)
-                if (L[(size_t) li].moe && g.n_exp - (int) L[(size_t) li].res_ids.size() > gr.n_slots) {
-                    err = "tp: layer " + std::to_string(li) + " has more experts outside VRAM than its group's cache "
-                          "has slots (" + std::to_string(gr.n_slots) + "): a larger --cache-gb";
-                    return false;
+        const int per = std::max(1, lane->max_entries() / tm);   // (an expert's tokens a run at most)
+        for (int e : cpu) {
+            const auto& all = who[(size_t) e];
+            for (size_t u0 = 0; u0 < all.size(); u0 += (size_t) per) {
+                const int n = (int) std::min(all.size() - u0, (size_t) per);
+                if (ents + n * tm > lane->max_entries()) run();
+                for (int j = 0; j < tm; ++j) {
+                    const uint8_t* b = l.host[(size_t) e] + (size_t) j * l.blob;
+                    CpuExpert c;
+                    for (int r = 0; r < 3; ++r) {
+                        c.p[r].trellis = (const uint32_t*) (b + l.lay.trellis[r]);
+                        c.p[r].suh = (const uint16_t*) (b + l.lay.suh[r]);
+                        c.p[r].svh = (const uint16_t*) (b + l.lay.svh[r]);
+                        c.p[r].k = r < 2 ? g.dim : g.ff / tm;
+                        c.p[r].n = r < 2 ? g.ff / tm : g.dim;
+                        c.p[r].k2 = l.lay.k2[r];
+                    }
+                    c.w = 1.0f;
+                    ex.push_back(c);
+                    users.emplace_back(all.begin() + (long) u0, all.begin() + (long) (u0 + (size_t) n));
                 }
-        ++fwd;
-        for (Group& gr : G)
-            if (!refresh(gr, err)) return false;
+                ents += n * tm;
+            }
+        }
+        run();
+    }
+
+    // a stage's tallies (the pipeline's host threads add theirs at the end)
+    struct PStat {
+        long staged = 0, profiled = 0, cpu_experts = 0;
+        double t_lane = 0, t_sync = 0;
+    };
+
+    // group gi's host steps for the prompt's chunks: its layers for chunk c (rows pipe_buf[c % NB]) once group gi - 1
+    // is done with it (ready[c] == gi); then ready[c] = gi + 1 - the last group's, the chunk done
+    bool prompt_stage(int gi, const int* ids, const std::vector<PChunk>& cks, int pos0, int n_call,
+                      std::vector<std::atomic<int>>& ready, double lane_share, PStat& ps, std::string& err) {
+        Group& gr = G[(size_t) gi];
+        const int ng = (int) G.size(), NB = (int) pipe_buf.size();
         const Tensor* emb = pk.get(P + "embed_tokens.weight");
         const uint16_t* e16 = (const uint16_t*) pk.data(*emb);
-        for (int t = 0; t < T; ++t) {
-            if (ids[t] < 0 || ids[t] >= g.vocab) {
-                err = "token id " + std::to_string(ids[t]) + " outside the vocabulary";
-                return false;
-            }
-            const uint16_t* r = e16 + (size_t) ids[t] * g.dim;
-            for (int i = 0; i < g.dim; ++i) {
-                const uint32_t u = (uint32_t) r[i] << 16;
-                std::memcpy(&h[(size_t) t * g.dim + i], &u, 4);
-            }
-        }
-        for (const Model::Image& im : imgs) {
-            const int n = (int) (im.rows.size() / (size_t) g.dim);
-            for (int q = std::max(im.start, pos0); q < std::min(im.start + n, pos0 + T); ++q)
-                std::memcpy(&h[(size_t) (q - pos0) * g.dim], im.rows.data() + (size_t) (q - im.start) * g.dim,
-                            (size_t) g.dim * 4);
-        }
-        for (Member& m : M) {
-            for (int t = 0; t < T; ++t) m.pos_h[t] = pos0 + t;
-            m.err.clear();
-        }
-        for (size_t gi = 0; gi < G.size(); ++gi)
-            for (size_t j = 0; j < G[gi].mem.size(); ++j) {
-                Member& m = M[(size_t) G[gi].mem[j]];
-                const unsigned in0 = G[gi].seq_in, out0 = G[gi].seq_out[j], rout0 = G[gi].seq_rout;
-                m.w->submit([this, gi, j, T, nblk, in0, out0, rout0, &m] {
-                    std::string e;
-                    if (!prompt_member((int) gi, (int) j, T, nblk, in0, out0, rout0, e)) {
-                        m.err = e;
-                        abort_.store(true);
-                    }
-                });
-            }
-        bool ok = true;
-        std::vector<int> top;
+        std::vector<int> top, cpu;
         std::vector<float> w;
-        const int ntaps = draftm ? (int) draftm->geo().taps.size() : 0;
-        for (int li = 0; li < g.n_layers && ok; ++li) {
-            Layer& l = L[(size_t) li];
-            Group& gr = G[(size_t) l.group];
-            norm(h.data(), l.in1.data(), T, gr.p_xa);
-            publish_in(gr);
-            if (!wait_parts(gr, err)) {
-                ok = false;
-                break;
-            }
-            add_parts(gr, T, nullptr, gr.p_part, kChunk);
-            norm(h.data(), l.post1.data(), T, gr.p_xb);
-            publish_in(gr);
-            if (l.moe) {
-                if (!wait_rout(gr, err)) {
-                    ok = false;
-                    break;
+        std::vector<float>& cpu_out = gr.p_cpu;
+        const int R = tap_rows;
+        for (int c = 0; c < (int) cks.size(); ++c) {
+            const int T = cks[(size_t) c].T, a = cks[(size_t) c].a;
+            // the chunk's turn: group gi - 1 done with it; group 0 also waits for its buffer (the chunk NB before done)
+            // or, without the pipeline, the chunk before it done
+            const double tw = now();
+            for (long spin = 0;; ++spin) {
+                const bool mine = ready[(size_t) c].load(std::memory_order_acquire) == gi;
+                const int dep = gi > 0 ? -1 : pipe_on ? c - NB : c - 1;
+                const bool free = dep < 0 || ready[(size_t) dep].load(std::memory_order_acquire) == ng;
+                if (mine && free) break;
+                if (abort_.load()) {
+                    err = "tp: stopped";
+                    return false;
                 }
-                route(l, gr.p_rlog, T, top, w);
-                for (int i = 0; i < T * g.k_exp; ++i) ++prof[(size_t) li * g.n_exp + top[(size_t) i]];
-                st.profiled += (long) T * g.k_exp;
-                plan_prompt(gr, l, li, T, top, w);
+                if (gi == 0 && mine && free && pipe_stop.load()) break;
+                if (gi > 0 && c >= pipe_lim.load()) return true;   // (group 0 stopped before this chunk)
+                _mm_pause();
+                if ((spin & 255) == 255) std::this_thread::yield();
+            }
+            ps.t_sync += now() - tw;
+            if (gi == 0 && pipe_stop.load()) {   // (the progress callback asked for a stop: no chunk starts after these)
+                pipe_lim.store(c);
+                return true;
+            }
+            float* H = pipe_buf[(size_t) (c % NB)].data();
+            if (gi == 0) {   // the embeddings (and the pictures' rows)
+                for (int t = 0; t < T; ++t) {
+                    const uint16_t* r = e16 + (size_t) ids[a + t] * g.dim;
+                    float* hr = H + (size_t) t * g.dim;
+                    for (int i = 0; i < g.dim; ++i) {
+                        const uint32_t u = (uint32_t) r[i] << 16;
+                        std::memcpy(&hr[i], &u, 4);
+                    }
+                }
+                for (const Model::Image& im : imgs) {
+                    const int n = (int) (im.rows.size() / (size_t) g.dim);
+                    for (int q = std::max(im.start, pos0 + a); q < std::min(im.start + n, pos0 + a + T); ++q)
+                        std::memcpy(H + (size_t) (q - pos0 - a) * g.dim, im.rows.data() + (size_t) (q - im.start) * g.dim,
+                                    (size_t) g.dim * 4);
+                }
+            }
+            bool normed = false;
+            for (int li = gr.l0; li < gr.l1; ++li) {
+                Layer& l = L[(size_t) li];
+                if (!normed) norm(H, l.in1.data(), T, gr.p_xa);
                 publish_in(gr);
+                if (!wait_parts(gr, err)) return false;
+                sum_norm(gr, T, nullptr, l.post1.data(), gr.p_xb, gr.p_part, chunk, H);
+                publish_in(gr);
+                const float* extra = nullptr;
+                if (l.moe) {
+                    if (!wait_rout(gr, err)) return false;
+                    route(l, gr.p_rlog, T, top, w);
+                    for (int i = 0; i < T * g.k_exp; ++i) ++prof[(size_t) li * g.n_exp + top[(size_t) i]];
+                    ps.profiled += (long) T * g.k_exp;
+                    plan_prompt(gr, l, li, T, top, w, lane_share, cpu, ps.staged);
+                    publish_in(gr);
+                    if (!cpu.empty()) {   // (the cold experts while the GPUs run the rest)
+                        const double tl = now();
+                        {
+                            std::lock_guard<std::mutex> lk(lane_mu);
+                            lane_for(gr);
+                            prompt_lane(gr, l, T, cpu, top, w, gr.p_xb, cpu_out.data());
+                        }
+                        ps.t_lane += now() - tl;
+                        ps.cpu_experts += (long) cpu.size();
+                        extra = cpu_out.data();
+                    }
+                }
+                if (!wait_parts(gr, err)) return false;
+                const bool nx = li + 1 < gr.l1;   // (the next layer's input norm with the sum, in this group)
+                sum_norm(gr, T, extra, nx ? L[(size_t) li + 1].in1.data() : nullptr, nx ? gr.p_xa : nullptr, gr.p_part,
+                         chunk, H);
+                normed = nx;
+                if (draftm && tap_of[(size_t) li] >= 0 && R > 0) {   // (the draft's taps: the last R positions kept)
+                    const int j = tap_of[(size_t) li];
+                    for (int t = std::max(0, T - R); t < T; ++t)
+                        std::memcpy(tap_ring + ((size_t) j * R + (size_t) ((pos0 + a + t) % R)) * g.dim,
+                                    H + (size_t) t * g.dim, (size_t) g.dim * 4);
+                }
             }
-            if (!wait_parts(gr, err)) {
-                ok = false;
-                break;
-            }
-            add_parts(gr, T, nullptr, gr.p_part, kChunk);
-            if (draftm && tap_of[(size_t) li] >= 0)
-                std::memcpy(taps_h + (size_t) tap_of[(size_t) li] * T * g.dim, h.data(), (size_t) T * g.dim * 4);
+            if (gi == ng - 1 && ppl_on && !ppl_chunk(ids, n_call, a, T, H, err)) return false;
+            ready[(size_t) c].store(gi + 1, std::memory_order_release);
+            if (gi == ng - 1 && progress && !progress(a + T)) pipe_stop.store(true);   // (the chunks begun finish)
         }
-        if (!ok || abort_.load()) {
-            abort_.store(true);
-            release_all();
-        }
-        for (Member& m : M) m.w->wait();
-        if (!ok || abort_.load()) {
-            if (err.empty()) err = "tp: " + member_errors();
-            return false;
-        }
-        for (Member& m : M) {
-            cudaSetDevice(m.id);
-            TK(cudaStreamSynchronize(m.s));
-        }
-        const int e = x3::launch_errors();
-        if (e) {
-            err = "EXL3 launch errors: " + std::to_string(e);
-            return false;
-        }
-        // the head (the GPUs idle now: the host may use them) and the draft's context
+        return true;
+    }
+
+    // (set_ppl: the next-token NLL of every position of a prompt, its chunks one at a time - the head on each chunk's
+    //  rows as the last group finishes it, the GPUs idle but the head's)
+    bool ppl_on = false;
+    std::vector<double> ppl_nll;   // [position]: -log p(ids[position + 1])
+
+    bool ppl_chunk(const int* ids, int n_call, int a, int T, const float* H, std::string& err) {
         Member& hm = M[(size_t) head_m];
         TK(cudaSetDevice(hm.id));
-        if (r1 > r0) {
-            const int rows = r1 - r0;
-            if (rows > kWin) {
-                err = "tp: more than " + std::to_string(kWin) + " rows of logits from a prompt";
-                return false;
-            }
-            rms_rows(h.data() + (size_t) r0 * g.dim, norm1.data(), rows, g.dim, g.eps, xf);
+        if ((int) ppl_nll.size() < n_call) ppl_nll.resize((size_t) n_call, 0.0);
+        const int cols = std::max(1, x3::mv_cols(head));
+        for (int r0 = 0; r0 < T; r0 += kWin) {
+            const int rows = std::min(kWin, T - r0);
+            rms_rows(H + (size_t) r0 * g.dim, norm1.data(), rows, g.dim, g.eps, xf);
             TK(cudaMemcpyAsync(hm.xn, xf, (size_t) rows * g.dim * 4, cudaMemcpyHostToDevice, hm.s));
-            const int cols = std::max(1, x3::mv_cols(head));
             for (int c0 = 0; c0 < rows; c0 += cols) {
                 x3::MvJob jb;
                 jb.m = &head;
@@ -1564,11 +1810,183 @@ struct TpEngine::Impl {
             }
             TK(cudaMemcpyAsync(lgh, lg, (size_t) rows * g.vocab * 4, cudaMemcpyDeviceToHost, hm.s));
             TK(cudaStreamSynchronize(hm.s));
-            std::memcpy(logits, lgh, (size_t) rows * g.vocab * 4);
+            for (int r = 0; r < rows; ++r) {
+                const int p = a + r0 + r;
+                if (p + 1 >= n_call) continue;
+                const float* row = lgh + (size_t) r * g.vocab;
+                double mx = row[0], se = 0;
+                for (int i = 1; i < g.vocab; ++i) mx = std::max(mx, (double) row[i]);
+                for (int i = 0; i < g.vocab; ++i) se += std::exp((double) row[i] - mx);
+                ppl_nll[(size_t) p] = mx + std::log(se) - row[ids[p + 1]];
+            }
         }
-        if (draftm) {
-            TK(cudaMemcpyAsync(taps_d, taps_h, (size_t) ntaps * T * g.dim * 4, cudaMemcpyHostToDevice, hm.s));
-            if (!draftm->context(taps_d, T, pos0, err)) return false;
+        return true;
+    }
+
+    std::vector<std::vector<float>> pipe_buf;   // the chunks' residual rows, a buffer a chunk in flight
+    float* tap_ring = nullptr;                  // (mapped) the prompt's taps for the draft: [taps][tap_rows][dim]
+    int tap_rows = 0;                           // (the draft's window and its slack: a position at row pos % tap_rows)
+    std::function<bool(int)> progress;          // (set_progress)
+    int last_done = 0;                          // the last forward's tokens in the cache
+
+    // a prompt (n > kWin tokens from pos0) in chunks through the groups' pipeline; logits (or the candidates) of rows
+    // [r0, r1) of the call, which fall in its last chunk
+    bool prompt(const int* ids, int n, int pos0, int r0, int r1, float* logits, std::string& err) {
+        if (pos0 + n > o.max_ctx) {
+            err = "the context is full (" + std::to_string(o.max_ctx) + ")";
+            return false;
+        }
+        for (const Group& gr : G)   // (a layer's experts not in VRAM all staged at once: slots no promotion holds)
+            for (int li = gr.l0; li < gr.l1; ++li)
+                if (L[(size_t) li].moe && g.n_exp - (int) L[(size_t) li].res_ids.size() > gr.n_slots) {
+                    err = "tp: layer " + std::to_string(li) + " has more experts outside VRAM than its group's cache "
+                          "has slots (" + std::to_string(gr.n_slots) + "): a larger --cache-gb";
+                    return false;
+                }
+        for (int t = 0; t < n; ++t)
+            if (ids[t] < 0 || ids[t] >= g.vocab) {
+                err = "token id " + std::to_string(ids[t]) + " outside the vocabulary";
+                return false;
+            }
+        // the chunks: of `chunk` tokens, the last holding every wanted row
+        std::vector<PChunk> cks;
+        for (int a = 0; a < n; a += chunk) cks.push_back({a, std::min(chunk, n - a), 0});
+        if (r1 > r0) {
+            if (r1 - r0 > kWin) {
+                err = "tp: more than " + std::to_string(kWin) + " rows of logits from a prompt";
+                return false;
+            }
+            PChunk& lc = cks.back();
+            if (r0 < lc.a && cks.size() > 1) {   // (the rows before the last chunk: it takes them from the one before)
+                const int mv = lc.a - r0;
+                cks[cks.size() - 2].T -= mv;
+                lc.a -= mv;
+                lc.T += mv;
+            }
+        }
+        for (PChunk& ck : cks) ck.nblk = (pos0 + ck.a + ck.T - 1) / g.blk + 1;
+        ++fwd;
+        for (Group& gr : G)
+            if (!refresh(gr, err)) return false;
+        const int nc = (int) cks.size(), ng = (int) G.size();
+        pipe_lim.store(nc);
+        pipe_stop.store(false);
+        in_prompt = true;
+        struct Off {
+            bool& f;
+            ~Off() { f = false; }
+        } off{in_prompt};
+        for (Member& m : M) m.err.clear();
+        for (size_t gi = 0; gi < G.size(); ++gi)
+            for (size_t j = 0; j < G[gi].mem.size(); ++j) {
+                Member& m = M[(size_t) G[gi].mem[j]];
+                const unsigned in0 = G[gi].seq_in, out0 = G[gi].seq_out[j], rout0 = G[gi].seq_rout;
+                m.w->submit([this, gi, j, &cks, pos0, in0, out0, rout0, &m] {
+                    std::string e;
+                    if (!prompt_member((int) gi, (int) j, cks, pos0, in0, out0, rout0, e)) {
+                        m.err = e;
+                        abort_.store(true);
+                    }
+                });
+            }
+        // a host thread a group (this one the last group's)
+        std::vector<std::atomic<int>> ready((size_t) nc);
+        for (auto& x : ready) x.store(0);
+        const bool pipe_was = pipe_on;
+        if (ppl_on) pipe_on = false;   // (the head's GPU the last group's alone while it takes a chunk's rows)
+        struct Back {
+            bool& f;
+            bool v;
+            ~Back() { f = v; }
+        } back{pipe_on, pipe_was};
+        const double share = pipe_on ? 1.0 / std::max(1, std::min(nc, ng)) : 1.0;
+        std::vector<PStat> ps((size_t) ng);
+        std::vector<std::string> errs((size_t) ng);
+        std::vector<std::thread> th;
+        std::atomic<bool> bad{false};
+        for (int gi = 0; gi + 1 < ng; ++gi)
+            th.emplace_back([&, gi] {
+                if (!prompt_stage(gi, ids, cks, pos0, n, ready, share, ps[(size_t) gi], errs[(size_t) gi])) {
+                    bad.store(true);
+                    abort_.store(true);
+                }
+            });
+        bool ok = prompt_stage(ng - 1, ids, cks, pos0, n, ready, share, ps[(size_t) ng - 1], errs[(size_t) ng - 1]);
+        if (!ok) abort_.store(true);
+        for (auto& x : th) x.join();
+        ok = ok && !bad.load();
+        for (int gi = 0; gi < ng; ++gi) {
+            const PStat& s = ps[(size_t) gi];
+            st.staged += s.staged;
+            st.profiled += s.profiled;
+            st.cpu_experts += s.cpu_experts;
+            st.t_lane += s.t_lane;
+            if (err.empty() && !errs[(size_t) gi].empty() && errs[(size_t) gi] != "tp: stopped") err = errs[(size_t) gi];
+        }
+        if (!ok || abort_.load()) {
+            abort_.store(true);
+            release_all();
+        }
+        for (Member& m : M) m.w->wait();
+        if (!ok || abort_.load()) {
+            if (err.empty()) err = "tp: " + member_errors();
+            return false;
+        }
+        for (Member& m : M) {
+            cudaSetDevice(m.id);
+            TK(cudaStreamSynchronize(m.s));
+        }
+        for (Group& gr : G)
+            for (size_t j = 0; j < gr.cs.size(); ++j) {
+                cudaSetDevice(M[(size_t) gr.mem[j]].id);
+                TK(cudaStreamSynchronize(gr.cs[j]));
+            }
+        const int e = x3::launch_errors();
+        if (e) {
+            err = "EXL3 launch errors: " + std::to_string(e);
+            return false;
+        }
+        const int lim = std::min(nc, pipe_lim.load());
+        last_done = lim > 0 ? cks[(size_t) lim - 1].a + cks[(size_t) lim - 1].T : 0;
+        // the head (the GPUs idle now: the host may use them) and the draft's context
+        Member& hm = M[(size_t) head_m];
+        TK(cudaSetDevice(hm.id));
+        if (r1 > r0 && last_done == n) {
+            const PChunk& lc = cks.back();
+            const float* H = pipe_buf[(size_t) ((nc - 1) % (int) pipe_buf.size())].data();
+            const int rows = r1 - r0;
+            rms_rows(H + (size_t) (r0 - lc.a) * g.dim, norm1.data(), rows, g.dim, g.eps, xf);
+            TK(cudaMemcpyAsync(hm.xn, xf, (size_t) rows * g.dim * 4, cudaMemcpyHostToDevice, hm.s));
+            const int cols = std::max(1, x3::mv_cols(head));
+            for (int c0 = 0; c0 < rows; c0 += cols) {
+                x3::MvJob jb;
+                jb.m = &head;
+                jb.xf = hm.xn + (size_t) c0 * g.dim;
+                jb.y = lg + (size_t) c0 * g.vocab;
+                jb.ncol = std::min(cols, rows - c0);
+                jb.xf_cs = (size_t) g.dim;
+                jb.y_cs = (size_t) g.vocab;
+                if (!x3::mv(&jb, 1, hm.s)) {
+                    err = "tp: mv head";
+                    return false;
+                }
+            }
+            if (cand_on) {
+                k::topk_rows(lg, rows, g.vocab, cand_kc, cand_ex, cand_ne, cand_h, hm.s);
+                TK(cudaStreamSynchronize(hm.s));
+            } else {
+                TK(cudaMemcpyAsync(lgh, lg, (size_t) rows * g.vocab * 4, cudaMemcpyDeviceToHost, hm.s));
+                TK(cudaStreamSynchronize(hm.s));
+                std::memcpy(logits, lgh, (size_t) rows * g.vocab * 4);
+            }
+        }
+        if (draftm && last_done > 0 && tap_rows > 0) {   // (the draft's context: the last tap_rows positions done)
+            const int end = pos0 + last_done, s0 = std::max(pos0, end - tap_rows);
+            for (int p = s0; p < end;) {   // (in runs that do not wrap the ring)
+                const int r = p % tap_rows, nr = std::min(end - p, tap_rows - r);
+                if (!draftm->context(tap_ring + (size_t) r * g.dim, nr, p, err, (size_t) tap_rows)) return false;
+                p += nr;
+            }
         }
         for (Group& gr : G)
             if (!issue(gr, err)) return false;
@@ -1584,7 +2002,8 @@ struct TpEngine::Impl {
         const int mh = g.n_head / t, mkv = g.n_kv / t, mix = g.ix_heads / t;
         const int mfs = g.ff / t;
         TK(cudaSetDevice(m.id));
-        TK(cudaMemcpyAsync(m.pos, m.pos_h, (size_t) T * 4, cudaMemcpyHostToDevice, m.s));
+        // (the positions made on the device: a copy would wait behind the promotions' copies, on the copy engine)
+        k::iota(m.pos, T, m.pos_h[0], m.s);
         float* part = gr.part + (size_t) j * kWin * g.dim;
         unsigned* fo = gr.fout + (size_t) j * kLine;
         const auto job = [&](const x3::Mat& w, const float* x, int ldx, float* y, int ldy) {
@@ -1603,8 +2022,7 @@ struct TpEngine::Impl {
             const Layer& l = L[(size_t) li];
             const Slice& S = l.sl[(size_t) j];
             // attention
-            k::wait_flag(gr.fin, ++vin, m.s);
-            TK(cudaMemcpyAsync(m.xn, gr.xa, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, m.s));
+            if (!pull_in(m, gr.fin, ++vin, m.xn, gr.xa, (size_t) T * g.dim, err)) return false;
             const x3::MvJob qkv[3] = {job(S.q, m.xn, g.dim, m.q, mh * g.hd), job(S.k, m.xn, g.dim, m.k, mkv * g.hd),
                                       job(S.v, m.xn, g.dim, m.v, mkv * g.hd)};
             if (!x3::mv(qkv, 3, m.s)) {
@@ -1618,19 +2036,19 @@ struct TpEngine::Impl {
             k::index_norm_rope(m.iq, m.ik, S.iqn1, S.ikn1, m.pos, T, mix, g.ix_dim, g.n_rot, m.inv, g.eps, S.ic, m.s);
             k::block_scores(m.iq, S.ic, m.pos, T, mix, nblk, g.blk, m.bs, m.s);
             k::select_blocks(m.bs, m.pos, T, mix, nblk, g.blk, g.topk, m.kept, m.s);
-            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s, S.i8, S.kvh);
+            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s, S.i8, S.kvh,
+                           attn_splits, m.attp);
             const x3::MvJob oj = job(S.o, m.att, mh * g.hd, m.out, g.dim);
             if (!x3::mv(&oj, 1, m.s)) {
                 err = "tp: mv o";
                 return false;
             }
             k::publish(m.out, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
-            // the FFN: member 0 the router's logits first (the host routes from them); every member its slice of the
-            // shared expert meanwhile, then the plans
-            k::wait_flag(gr.fin, ++vin, m.s);
-            TK(cudaMemcpyAsync(m.xn, gr.xb, (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, m.s));
+            // the FFN: every member its slice of the shared expert while the host routes (from the normed rows it
+            // published: host_router; else member 0 the router's logits first), then the plans
+            if (!pull_in(m, gr.fin, ++vin, m.xn, gr.xb, (size_t) T * g.dim, err)) return false;
             if (l.moe) {
-                if (j == 0) {
+                if (j == 0 && !host_router) {
                     k::rows_dot(S.gate, g.n_exp, g.dim, m.xn, T, m.rlog_d, m.s);
                     k::publish(m.rlog_d, gr.rlog, (size_t) T * g.n_exp, m.counter, gr.frout, ++vrout, m.s);
                 }
@@ -1646,8 +2064,9 @@ struct TpEngine::Impl {
                     err = "tp: mv shared down";
                     return false;
                 }
-                k::wait_flag(gr.fin, ++vin, m.s);
-                TK(cudaMemcpyAsync(m.plan_d, gr.plans + (size_t) j * plan_bytes, plan_bytes, cudaMemcpyHostToDevice, m.s));
+                if (!pull_in(m, gr.fin, ++vin, (float*) m.plan_d, (const float*) (gr.plans + (size_t) j * plan_bytes),
+                             plan_bytes / 4, err))
+                    return false;
                 const size_t off_w = (size_t) kWin * 8 * 8, off_gp = off_w + (size_t) kWin * 8 * 4,
                              off_gs = off_gp + (size_t) kWin * 8 * 8, off_ge = off_gs + ((size_t) kWin * 8 + 1) * 4,
                              off_ng = off_ge + (size_t) kWin * 8 * 4;
@@ -1713,9 +2132,8 @@ struct TpEngine::Impl {
     bool enqueue_head(int rows, unsigned v, std::string& err) {
         Member& m = M[(size_t) head_m];
         TK(cudaSetDevice(m.id));
-        k::wait_flag(fhead, v, m.s);
         float* x = m.xn;   // (the member's own steps are done by then: the host publishes the head's last)
-        TK(cudaMemcpyAsync(x, xf, (size_t) rows * g.dim * 4, cudaMemcpyHostToDevice, m.s));
+        if (!pull_in(m, fhead, v, x, xf, (size_t) rows * g.dim, err)) return false;
         const int cols = std::max(1, x3::mv_cols(head));
         for (int c0 = 0; c0 < rows; c0 += cols) {
             x3::MvJob j;
@@ -1730,8 +2148,29 @@ struct TpEngine::Impl {
                 return false;
             }
         }
-        TK(cudaMemcpyAsync(lgh, lg, (size_t) rows * g.vocab * 4, cudaMemcpyDeviceToHost, m.s));
+        if (cand_on) k::topk_rows(lg, rows, g.vocab, cand_kc, cand_ex, cand_ne, cand_h, m.s);
+        else TK(cudaMemcpyAsync(lgh, lg, (size_t) rows * g.vocab * 4, cudaMemcpyDeviceToHost, m.s));
         TK(cudaEventRecord(head_ev, m.s));
+        return true;
+    }
+
+    // (the knobs, MM3_TP_OLD=wait,split: the paths before, to time them against; MM3_TP_HOST_ROUTER=1: the router's
+    //  logits on the host from the normed rows - one round trip less a layer, but its rows read from memory every
+    //  window, ~6 ms of a window's host time)
+    const std::string tp_old = std::getenv("MM3_TP_OLD") ? std::getenv("MM3_TP_OLD") : "";
+    const bool old_wait = tp_old.find("wait") != std::string::npos;
+    const bool host_router = std::getenv("MM3_TP_HOST_ROUTER") != nullptr;
+    int attn_splits = tp_old.find("split") != std::string::npos ? 1 : 16;   // (load: at most topk)
+
+    // a member's wait for the host's counter f to reach v, then n floats of the host's (mapped) into dst: one kernel
+    // (wait_pull); old_wait: wait_flag, then the copy engine
+    bool pull_in(Member& m, const unsigned* f, unsigned v, float* dst, const float* src, size_t n, std::string& err) {
+        if (!old_wait) {
+            k::wait_pull(f, v, dst, src, n, m.s);
+            return true;
+        }
+        k::wait_flag(f, v, m.s);
+        TK(cudaMemcpyAsync(dst, src, n * 4, cudaMemcpyHostToDevice, m.s));
         return true;
     }
 
@@ -1757,7 +2196,7 @@ struct TpEngine::Impl {
             gr.seq_out[j] = want;
         }
         std::atomic_thread_fence(std::memory_order_acquire);
-        st.t_sync += now() - t0;
+        if (!in_prompt) st.t_sync += now() - t0;
         return true;
     }
 
@@ -1780,7 +2219,7 @@ struct TpEngine::Impl {
         }
         gr.seq_rout = want;
         std::atomic_thread_fence(std::memory_order_acquire);
-        st.t_sync += now() - t0;
+        if (!in_prompt) st.t_sync += now() - t0;
         return true;
     }
 
@@ -1801,8 +2240,52 @@ struct TpEngine::Impl {
         const std::function<void(int)> f = [&](int r) {
             rms_rows(x + (size_t) r * g.dim, w, 1, g.dim, g.eps, y + (size_t) r * g.dim);
         };
-        if (lane && rows > 1) lane->parallel_for(rows, f);
-        else rms_rows(x, w, rows, g.dim, g.eps, y);
+        if (lane && rows > 1) {
+            std::lock_guard<std::mutex> lk(lane_mu);
+            lane->parallel_for(rows, f);
+        } else {
+            rms_rows(x, w, rows, g.dim, g.eps, y);
+        }
+    }
+
+    // h [T][dim] += the members' partials (member order) + extra, then (w given) y = RMSNorm(h) . w: a row a job, the
+    // same bits as add_parts then norm
+    void sum_norm(const Group& gr, int T, const float* extra, const float* w, float* y, const float* base = nullptr,
+                  int stride = kWin, float* hh = nullptr) {
+        const int t = (int) gr.mem.size();
+        if (!base) base = gr.part;
+        if (!hh) hh = h.data();
+        const std::function<void(int)> f = [&](int r) {
+            const float* pp[8];
+            for (int j = 0; j < t; ++j) pp[j] = base + ((size_t) j * stride + r) * g.dim;
+            float* hr = hh + (size_t) r * g.dim;
+            sum_into(hr, pp, t, extra ? extra + (size_t) r * g.dim : nullptr, (size_t) g.dim);
+            if (w) rms_rows(hr, w, 1, g.dim, g.eps, y + (size_t) r * g.dim);
+        };
+        if (lane && T > 1) {
+            std::lock_guard<std::mutex> lk(lane_mu);
+            lane->parallel_for(T, f);
+        } else {
+            for (int r = 0; r < T; ++r) f(r);
+        }
+    }
+
+    // rl [T][E] = x [T][dim] . the router's F32 rows (dot's fixed order: a token's logits the same bits whatever T),
+    // eight experts a job on the lane
+    void router_logits(const Layer& l, const float* x, int T, float* rl) {
+        const int E = g.n_exp, per = 8;
+        const std::function<void(int)> f = [&](int j) {
+            for (int e = j * per; e < std::min(E, (j + 1) * per); ++e)
+                for (int r = 0; r < T; ++r)
+                    rl[(size_t) r * E + e] = dot(l.gate.data() + (size_t) e * g.dim, x + (size_t) r * g.dim, g.dim);
+        };
+        const int nj = (E + per - 1) / per;
+        if (lane) {
+            std::lock_guard<std::mutex> lk(lane_mu);
+            lane->parallel_for(nj, f);
+        } else {
+            for (int j = 0; j < nj; ++j) f(j);
+        }
     }
 
     // h [T][dim] += the members' partials (member order) + extra
@@ -1927,11 +2410,12 @@ struct TpEngine::Impl {
         bool ok = true;
         std::vector<int> top;
         std::vector<float> w;
+        bool normed = false;   // (the layer's input norm done already: the sum before it took it)
         for (int li = 0; li < g.n_layers && ok; ++li) {
             Layer& l = L[(size_t) li];
             Group& gr = G[(size_t) l.group];
             tr("layer", li);
-            norm(h.data(), l.in1.data(), T, gr.xa);
+            if (!normed) norm(h.data(), l.in1.data(), T, gr.xa);
             lap(tp_norm);
             publish_in(gr);
             if (!wait_parts(gr, err)) {
@@ -1939,19 +2423,22 @@ struct TpEngine::Impl {
                 break;
             }
             lap(tp_wait);
-            add_parts(gr, T, nullptr);
+            sum_norm(gr, T, nullptr, l.post1.data(), gr.xb);   // (h += the attention's parts, xb its norm)
             lap(tp_sum);
-            norm(h.data(), l.post1.data(), T, gr.xb);
-            lap(tp_norm);
             const float* extra = nullptr;
             if (l.moe) {
                 CpuLane& ln = lane_for(gr);
-                publish_in(gr);   // (xb: member 0 routes, the shared expert starts)
-                if (!wait_rout(gr, err)) {
-                    ok = false;
-                    break;
+                publish_in(gr);   // (xb: the shared expert starts; the host routes meanwhile)
+                if (host_router) {
+                    router_logits(l, gr.xb, T, rl.data());
+                    route(l, rl.data(), T, top, w);
+                } else {
+                    if (!wait_rout(gr, err)) {
+                        ok = false;
+                        break;
+                    }
+                    route(l, gr.rlog, T, top, w);
                 }
-                route(l, gr.rlog, T, top, w);
                 lap(tp_route);
                 const int K = g.k_exp, tm = (int) gr.mem.size();
                 for (int i = 0; i < T * K; ++i) ++prof[(size_t) li * g.n_exp + top[(size_t) i]];
@@ -2059,7 +2546,10 @@ struct TpEngine::Impl {
                 break;
             }
             lap(tp_wait);
-            add_parts(gr, T, extra);
+            // (h += the FFN's parts and the CPU lane's, the next layer's input norm with it)
+            const Layer* nx = li + 1 < g.n_layers ? &L[(size_t) li + 1] : nullptr;
+            sum_norm(gr, T, extra, nx ? nx->in1.data() : nullptr, nx ? G[(size_t) nx->group].xa : nullptr);
+            normed = nx != nullptr;
             lap(tp_sum);
             if (draftm && tap_of[(size_t) li] >= 0) {   // (the draft's context takes the tap now: its steps wait on ftap)
                 const int j = tap_of[(size_t) li];
@@ -2088,7 +2578,7 @@ struct TpEngine::Impl {
         if (want_head) {
             cudaSetDevice(M[(size_t) head_m].id);
             TK(cudaEventSynchronize(head_ev));
-            std::memcpy(logits, lgh, (size_t) (r1 - r0) * g.vocab * 4);
+            if (!cand_on) std::memcpy(logits, lgh, (size_t) (r1 - r0) * g.vocab * 4);
         }
         lap(tp_head);
         for (Member& m : M) {   // (every member done: the next forward may use the buffers)
@@ -2114,18 +2604,53 @@ struct TpEngine::Impl {
         }
         const double tc = now();
         want = std::max(0, std::min(want, n));
-        const int step = n > kWin ? kChunk : kWin;   // (a prompt in chunks on the prompt path)
-        for (int a = 0; a < n; a += step) {
-            const int T = std::min(step, n - a);
-            // the logits wanted of this window: positions n - want .. n - 1, its rows [lo, hi)
-            const int lo = std::max(n - want, a) - a, hi = std::min(n, a + T) - a;
-            const bool any = logits != nullptr && hi > lo;
-            float* out = any ? logits + (size_t) (a + lo - (n - want)) * g.vocab : nullptr;
-            if (!(step == kChunk && T > kWin ? prompt(ids + a, T, pos0 + a, any ? lo : 0, any ? hi : 0, out, err)
-                                              : window(ids + a, T, pos0 + a, any ? lo : 0, any ? hi : 0, out, err)))
-                return false;
+        const bool any = (logits != nullptr || cand_on) && want > 0;
+        last_done = 0;
+        if (n > kWin) {   // (a prompt: its chunks through the groups' pipeline)
+            if (!prompt(ids, n, pos0, any ? n - want : 0, any ? n : 0, logits, err)) return false;
+        } else {
+            if (!window(ids, n, pos0, any ? n - want : 0, any ? n : 0, logits, err)) return false;
+            last_done = n;
         }
         if (n == 1) st.t_token += now() - tc;
+        return true;
+    }
+
+    // the last `want` rows as candidates: picked on the head's GPU when they all come from the call's last piece (a
+    // window, or a prompt's last chunk) - else, and for a row with more ties than its room, from the logits on the host
+    bool forward_cands(const int* ids, int n, int pos0, int want, Cands& c, std::string& err) {
+        want = std::max(0, std::min(want, n));
+        c.top.assign((size_t) want, {});
+        c.ex.assign((size_t) want, {});
+        if (want > kWin || (int) c.extra.size() > k::kCandExtra) {
+            std::vector<float> lgv((size_t) want * g.vocab);
+            if (!forward(ids, n, pos0, want, lgv.data(), err)) return false;
+            for (int r = 0; r < want; ++r)
+                host_cands(lgv.data() + (size_t) r * g.vocab, g.vocab, c.kc, c.extra, c.top[(size_t) r], c.ex[(size_t) r]);
+            return true;
+        }
+        cand_kc = std::max(1, c.kc);
+        cand_ne = (int) c.extra.size();
+        for (int i = 0; i < cand_ne; ++i) cand_ex[i] = c.extra[(size_t) i];
+        cand_on = true;
+        const bool ok = forward(ids, n, pos0, want, nullptr, err);
+        cand_on = false;
+        if (!ok) return false;
+        std::vector<float> row;
+        for (int r = 0; r < want; ++r) {
+            const k::CandRow& cr = cand_h[r];
+            if (cr.n < 0) {   // (more ties than room: the row itself)
+                row.resize((size_t) g.vocab);
+                cudaSetDevice(M[(size_t) head_m].id);
+                TK(cudaMemcpy(row.data(), lg + (size_t) r * g.vocab, (size_t) g.vocab * 4, cudaMemcpyDeviceToHost));
+                host_cands(row.data(), g.vocab, c.kc, c.extra, c.top[(size_t) r], c.ex[(size_t) r]);
+                continue;
+            }
+            auto& t = c.top[(size_t) r];
+            t.resize((size_t) cr.n);
+            for (int i = 0; i < cr.n; ++i) t[(size_t) i] = {cr.id[i], cr.v[i]};
+            c.ex[(size_t) r].assign(cr.ex, cr.ex + cand_ne);
+        }
         return true;
     }
 };
@@ -2161,6 +2686,31 @@ bool TpEngine::draft(int anchor, int pos, int n, std::vector<int>& drafts, std::
     }
     cudaSetDevice(p->M[(size_t) p->head_m].id);
     return p->draftm->propose(anchor, pos, n, drafts, conf, nullptr, err);
+}
+void TpEngine::set_progress(std::function<bool(int)> f) { p->progress = std::move(f); }
+void TpEngine::set_ppl(bool on) {
+    p->ppl_on = on;
+    if (on) p->ppl_nll.clear();
+}
+const std::vector<double>& TpEngine::ppl_nll() const { return p->ppl_nll; }
+int TpEngine::done() const { return p->last_done; }
+bool TpEngine::forward_cands(const int* ids, int n, int pos0, int want, Cands& c, std::string& err) {
+    return p->forward_cands(ids, n, pos0, want, c, err);
+}
+bool TpEngine::draft_sampled(int anchor, int pos, int n, const DraftSampling& ds, const std::vector<float>& u,
+                             std::vector<int>& drafts, std::vector<float>& conf,
+                             std::vector<std::vector<std::pair<int, float>>>& q, std::string& err) {
+    if (!p->draftm) {
+        err = "no DSpark draft loaded (--dspark)";
+        return false;
+    }
+    k::SampleArgs sa;
+    sa.temperature = ds.temperature;
+    sa.top_p = ds.top_p;
+    sa.min_p = ds.min_p;
+    sa.top_k = ds.top_k;
+    cudaSetDevice(p->M[(size_t) p->head_m].id);
+    return p->draftm->propose_sampled(anchor, pos, n, sa, u, drafts, conf, q, err);
 }
 const VisionGeo* TpEngine::vision() const { return p->vis ? &p->vis->geo() : nullptr; }
 bool TpEngine::encode_image(const uint8_t* rgb, int width, int height, std::vector<float>& rows, std::string& err) {

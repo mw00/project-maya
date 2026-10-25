@@ -14,12 +14,14 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include "mm3_exl3.hpp"
+#include "mm3_kernels.cuh"
 #include "mm3_pack.hpp"
 
 namespace mm3 {
@@ -43,8 +45,9 @@ public:
     bool load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, const strata::mm3::exl3::Mat* head,
               const uint16_t* emb, int max_rows, std::string& err);
     const DraftGeo& geo() const;
-    /// The context of positions pos0 .. pos0 + T - 1 from the taps (device, on dev: [T][taps x dim] F32).
-    bool context(const float* taps, int T, int pos0, std::string& err);
+    /// The context of positions pos0 .. pos0 + T - 1 from the taps (device-readable, [taps][stride][dim] F32: tap j's
+    /// rows `stride` rows after tap j - 1's; 0: T).
+    bool context(const float* taps, int T, int pos0, std::string& err, size_t stride = 0);
     /// The same in steps, T <= max_rows: tap j's rows (device [T][dim] F32) into the context - the taps in order, 0
     /// first - then the rest; on the draft's stream (a forward's taps can go in as its layers pass them).
     bool context_tap(int j, const float* rows, int T, std::string& err);
@@ -54,6 +57,13 @@ public:
     /// distribution the drafts were taken from.
     bool propose(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, float* logits,
                  std::string& err);
+    /// The same with each draft drawn from the draft's own distribution at its position - the biased logits through
+    /// sa's temperature, top_k (<= k::kQMax), min_p and top_p, u[i] the draw (uniform in [0, 1)) - instead of its
+    /// argmax; q[i]: that distribution ((id, probability) pairs, the most likely first), for the target's rejection
+    /// sampling of the drafts.
+    bool propose_sampled(int anchor, int pos, int n, const k::SampleArgs& sa, const std::vector<float>& u,
+                         std::vector<int>& drafts, std::vector<float>& conf,
+                         std::vector<std::vector<std::pair<int, float>>>& q, std::string& err);
     /// Device bytes the draft holds.
     size_t bytes() const;
 

@@ -27,6 +27,7 @@
 
 #include <unistd.h>
 
+#include "mm3_cands.hpp"
 #include "mm3_cpu.hpp"
 #include "mm3_dspark.hpp"
 #include "mm3_exl3.hpp"
@@ -266,6 +267,7 @@ struct Model::Impl {
     uint8_t* pool = nullptr;         // the pinned pool
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;   // the DSpark draft (on the head's GPU)
+    int last_done = 0;               // the last forward's tokens in the cache
     std::unique_ptr<Vision> vis;     // the vision tower (Options::vision)
     std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
@@ -515,6 +517,7 @@ struct Model::Impl {
                                     !A(l.i8.vs, cache / g.hd)
                               : !A(l.kc, cache) || !A(l.vc, cache))
                     return false;
+                l.i8.rot = o.kv_int8 && o.kv_rotate;
                 if (!A(l.ic, (size_t) o.max_ctx * g.ix_dim)) return false;
                 if (kv_ring > 0) {
                     l.kvh.ring = kv_ring;
@@ -1699,6 +1702,23 @@ bool Model::draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vec
     return p->draftm->propose(anchor, pos, n, drafts, conf, nullptr, err);
 }
 
+bool Model::draft_sampled(int anchor, int pos, int n, const DraftSampling& ds, const std::vector<float>& u,
+                          std::vector<int>& drafts, std::vector<float>& conf,
+                          std::vector<std::vector<std::pair<int, float>>>& q, std::string& err) {
+    if (tpe) return tpe->draft_sampled(anchor, pos, n, ds, u, drafts, conf, q, err);
+    if (!p->draftm) {
+        err = "no DSpark draft loaded (--dspark)";
+        return false;
+    }
+    k::SampleArgs sa;
+    sa.temperature = ds.temperature;
+    sa.top_p = ds.top_p;
+    sa.min_p = ds.min_p;
+    sa.top_k = ds.top_k;
+    cudaSetDevice(p->D[(size_t) p->head_dev].id);
+    return p->draftm->propose_sampled(anchor, pos, n, sa, u, drafts, conf, q, err);
+}
+
 bool Model::save_profile(const std::string& path, std::string& err) const {
     if (tpe) return tpe->save_profile(path, err);
     std::FILE* f = std::fopen(path.c_str(), "wb");
@@ -1713,6 +1733,7 @@ bool Model::save_profile(const std::string& path, std::string& err) const {
 
 bool Model::forward(const int* ids, int n, int pos0, int want, float* logits_out, std::string& err) {
     if (tpe) return tpe->forward(ids, n, pos0, want, logits_out, err);
+    p->last_done = 0;
     want = std::min(want, n);
     for (int a = 0; a < n; a += p->o.chunk) {
         const int T = std::min(p->o.chunk, n - a);
@@ -1728,6 +1749,40 @@ bool Model::forward(const int* ids, int n, int pos0, int want, float* logits_out
                       err))
             return false;
     }
+    p->last_done = n;
+    return true;
+}
+
+void Model::set_progress(std::function<bool(int)> f) {
+    if (tpe) tpe->set_progress(std::move(f));
+}
+int Model::done() const { return tpe ? tpe->done() : p->last_done; }
+bool Model::pipelined() const { return tpe != nullptr; }
+bool Model::forward_ppl(const int* ids, int n, std::string& err) {
+    if (!tpe) {
+        err = "forward_ppl: the tensor-parallel path's (--tp); the layer-split path's --ppl takes its logits";
+        return false;
+    }
+    tpe->set_ppl(true);
+    const bool ok = tpe->forward(ids, n, 0, 0, nullptr, err);
+    tpe->set_ppl(false);
+    return ok;
+}
+const std::vector<double>& Model::ppl_nll() const {
+    static const std::vector<double> none;
+    return tpe ? tpe->ppl_nll() : none;
+}
+
+// (the layer-split path: the logits on the host, the candidates from them)
+bool Model::forward_cands(const int* ids, int n, int pos0, int want, Cands& c, std::string& err) {
+    if (tpe) return tpe->forward_cands(ids, n, pos0, want, c, err);
+    want = std::max(0, std::min(want, n));
+    std::vector<float> lg((size_t) want * vocab());
+    if (!forward(ids, n, pos0, want, lg.data(), err)) return false;
+    c.top.assign((size_t) want, {});
+    c.ex.assign((size_t) want, {});
+    for (int r = 0; r < want; ++r)
+        host_cands(lg.data() + (size_t) r * vocab(), vocab(), c.kc, c.extra, c.top[(size_t) r], c.ex[(size_t) r]);
     return true;
 }
 

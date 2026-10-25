@@ -49,9 +49,12 @@
 
 #include "mm3_model.hpp"
 #include "mm3_pack.hpp"
+#include "mm3_sample.hpp"
 #include "mm3_vision.hpp"
 
 namespace {
+
+using namespace mm3::sample;
 
 std::vector<int> parse_ids(const std::string& a) {
     std::string src = a;
@@ -221,21 +224,6 @@ struct Lines {
     }
 };
 
-struct Req {
-    long long max_new = 0;
-    float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
-    int top_k = 64;
-    unsigned long long seed = 0;
-    int pen_n = 0;
-    float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
-    long long think_budget = 0;
-    int think_end = -1;
-    int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
-    float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
-    std::string file;       // GENI: the pictures
-    std::vector<int> ids;
-};
-
 bool parse_gen(const std::string& line, Req& r) {
     const bool geni = line.rfind("GENI ", 0) == 0;
     std::istringstream is(line.substr(geni ? 5 : 4));
@@ -269,79 +257,8 @@ bool parse_gen(const std::string& line, Req& r) {
     return !r.ids.empty();
 }
 
-// the next token's distribution from one row of logits: penalties over the history's last pen_n tokens (llama.cpp's),
-// then greedy (temperature <= 0: the argmax alone) or temperature, top_k, top_p, min_p - (token, probability) pairs,
-// the most likely first, summing to 1
-std::vector<std::pair<int, double>> dist(const float* row, int V, const Req& r, const std::vector<int>& hist) {
-    std::vector<float> lg(row, row + V);
-    if (r.pen_n != 0 && (r.pen_repeat != 1.0f || r.pen_freq != 0.0f || r.pen_present != 0.0f)) {
-        std::unordered_map<int, int> cnt;
-        const size_t n = r.pen_n < 0 ? hist.size() : std::min(hist.size(), (size_t) r.pen_n);
-        for (size_t i = hist.size() - n; i < hist.size(); ++i) ++cnt[hist[i]];
-        for (const auto& [t, c] : cnt) {
-            if (t < 0 || t >= V) continue;
-            float& x = lg[(size_t) t];
-            if (r.pen_repeat > 0.0f && r.pen_repeat != 1.0f) x = x > 0 ? x / r.pen_repeat : x * r.pen_repeat;
-            x -= r.pen_freq * (float) c + r.pen_present;
-        }
-    }
-    if (!(r.temperature > 0.0f)) {
-        int b = 0;
-        for (int i = 1; i < V; ++i)
-            if (lg[(size_t) i] > lg[(size_t) b]) b = i;
-        return {{b, 1.0}};
-    }
-    std::vector<std::pair<float, int>> c;
-    c.reserve((size_t) V);
-    for (int i = 0; i < V; ++i) c.push_back({lg[(size_t) i] / r.temperature, i});
-    const size_t k = r.top_k > 0 ? std::min((size_t) r.top_k, c.size()) : c.size();
-    std::partial_sort(c.begin(), c.begin() + (long) k, c.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
-    c.resize(k);
-    double sum = 0;
-    std::vector<double> p(k);
-    for (size_t i = 0; i < k; ++i) sum += (p[i] = std::exp((double) (c[i].first - c[0].first)));
-    size_t keep = k;
-    double cum = 0;
-    for (size_t i = 0; i < k; ++i) {
-        cum += p[i] / sum;
-        if (r.min_p > 0.0f && p[i] < r.min_p * p[0]) {
-            keep = std::max<size_t>(1, i);
-            break;
-        }
-        if (r.top_p < 1.0f && cum >= r.top_p) {
-            keep = i + 1;
-            break;
-        }
-    }
-    double s2 = 0;
-    for (size_t i = 0; i < keep; ++i) s2 += p[i];
-    std::vector<std::pair<int, double>> out(keep);
-    for (size_t i = 0; i < keep; ++i) out[i] = {c[i].second, p[i] / s2};
-    return out;
-}
-
-// a draw from d, without `skip` (renormalised; -1: none)
-int draw(const std::vector<std::pair<int, double>>& d, std::mt19937_64& rng, int skip = -1) {
-    double tot = 0;
-    for (const auto& [t, q] : d)
-        if (t != skip) tot += q;
-    if (!(tot > 0)) return d[0].first;
-    double u = std::uniform_real_distribution<double>(0.0, tot)(rng);
-    int last = d[0].first;
-    for (const auto& [t, q] : d) {
-        if (t == skip) continue;
-        last = t;
-        u -= q;
-        if (u <= 0) return t;
-    }
-    return last;
-}
-
-int sample(std::vector<float>& lg, const Req& r, const std::vector<int>& hist, std::mt19937_64& rng) {
-    return draw(dist(lg.data(), (int) lg.size(), r, hist), rng);
-}
-
-int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, bool kv_int8) {
+int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, float conf_floor, float draft_cost,
+          bool kv_int8) {
     for (const std::string& l : m.info_lines()) std::printf("NOTE %s\n", l.c_str());
     for (const std::string& l : m.vram_lines()) std::printf("%s\n", l.c_str());   // (the Monitor's GPU map)
     const auto& st0 = m.stats();
@@ -425,20 +342,41 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         m.set_images(std::move(rows));
         const auto s_pre = m.stats();
         bool ok = true, cancel = false;
+        // (the sampler's rows as the head GPU's candidates unless MM3_FULL_LOGITS or the request needs whole rows)
+        const bool full_env = std::getenv("MM3_FULL_LOGITS") != nullptr;
+        mm3::Cands cd;
+        bool use_c = false;
+        // (the tensor-parallel path takes the rest of the prompt in one call - its chunks pipelined over the GPU
+        //  groups - and reports each chunk done; else calls of `chunk` tokens)
+        const bool whole = m.pipelined();
+        auto pp_line = [&](size_t done) {
+            const double ms = now() * 1e3 - t0;
+            std::printf("PP %zu %zu %.1f %.1f %zu\n", done, r.ids.size(), ms,
+                        ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
+            std::fflush(stdout);
+        };
         for (size_t a = from; a < r.ids.size();) {
-            const int T = (int) std::min<size_t>((size_t) chunk, r.ids.size() - a);
+            const int T = (int) (whole ? r.ids.size() - a : std::min<size_t>((size_t) chunk, r.ids.size() - a));
             const bool last = a + (size_t) T == r.ids.size();
-            if (!m.forward(r.ids.data() + a, T, (int) a, last ? 1 : 0, last ? lg.data() : nullptr, err)) {
+            if (last) use_c = !full_env && cands_for(r, r.ids, {}, cd);   // (the first token's history: the prompt)
+            if (whole)
+                m.set_progress([&, a](int d) {
+                    pp_line(a + (size_t) d);
+                    return !in.stop.load();
+                });
+            const bool fok = last && use_c ? m.forward_cands(r.ids.data() + a, T, (int) a, 1, cd, err)
+                                           : m.forward(r.ids.data() + a, T, (int) a, last ? 1 : 0,
+                                                       last ? lg.data() : nullptr, err);
+            if (whole) m.set_progress({});
+            if (!fok) {
                 ok = false;
                 break;
             }
-            state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
-            a += (size_t) T;
-            const double ms = now() * 1e3 - t0;
-            std::printf("PP %zu %zu %.1f %.1f %zu\n", a, r.ids.size(), ms, ms > 0 ? 1000.0 * (double) (a - from) / ms : 0.0,
-                        from);
-            std::fflush(stdout);
-            if (in.stop.load() && !last) {
+            const int done = whole ? m.done() : T;
+            state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + done);
+            a += (size_t) done;
+            if (!whole || T <= 16) pp_line(a);   // (a short call: a window, no chunks reported)
+            if (done < T || (in.stop.load() && !last)) {
                 cancel = true;
                 break;
             }
@@ -463,7 +401,8 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
         long long produced = 0;
         const char* finish = "length";
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
-        int tok = sample(lg, r, state, rng);
+        int tok = draw(use_c ? dist_c(cd.top[0], cd.extra, cd.ex[0], r, state) : dist(lg.data(), m.vocab(), r, state),
+                       rng);
         // (the Monitor's tier keys too: the experts in VRAM, in the pinned pool - the CPU lane computes those from it -
         //  and a token the CPU lane's experts and the promotions; without a pool the misses come from the mapped files)
         auto stat_line = [&]() {
@@ -479,15 +418,32 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                         (double) (s.promoted - s_dec.promoted) * per);
         };
         // DSpark: a round drafts after the token, verifies the token and its drafts in one forward and keeps the drafts
-        // the target agrees with - greedy: its argmax; sampling: a draft d kept with the target's probability of d (the
-        // drafts are the draft's argmax), else the token drawn from the target's distribution without d - so every
-        // token comes from the target's own distribution; then the target's next token after the last kept one
+        // the target agrees with - greedy: its argmax; sampling: a draft d (the draft's argmax) kept with the target's
+        // probability of d, else the token drawn from the target's distribution without d - so every token comes from
+        // the target's own distribution p (MM3_SAMPLED_DRAFTS: each draft drawn from the draft's own distribution q,
+        // kept with min(1, p(d) / q(d)), else drawn from max(0, p - q) - speculative sampling, exact too; it kept ~3%
+        // more drafts at temperature 1 but its draws cost more than that); then the target's next token after the last
+        // kept one.  A round verifies the drafts up
+        // to the first whose confidence is below the floor, or (draft_cost > 0) whose confidences' product is below
+        // draft_cost - each one's from the drafts before it alone, so the cut leaves the sampling exact.
         const int B = m.draft_block();
         const bool spec = B > 0 && (r.spec < 0 ? spec_on : r.spec != 0);
         const float floor = r.conf >= 0.0f ? r.conf : conf_floor;
+        const bool sampled = r.temperature > 0.0f && std::getenv("MM3_SAMPLED_DRAFTS") != nullptr;
+        mm3::DraftSampling ds;
+        ds.temperature = r.temperature;
+        ds.top_p = r.top_p;
+        ds.min_p = r.min_p;
+        ds.top_k = r.top_k > 0 ? std::min(r.top_k, 64) : 64;
         std::vector<float> lgw(spec ? (size_t) (B + 1) * m.vocab() : 0);
         std::vector<int> drafts;
-        std::vector<float> confs;
+        std::vector<float> confs, draws((size_t) std::max(B, 1));
+        std::vector<std::vector<std::pair<int, float>>> qd;
+        // row i's distribution of the last forward (candidates or the whole row)
+        auto row_dist = [&](int i, const std::vector<int>& hist) {
+            return use_c ? dist_c(cd.top[(size_t) i], cd.extra, cd.ex[(size_t) i], r, hist)
+                         : dist(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r, hist);
+        };
         long long d_off = 0, d_acc = 0;
         // one token out: false when the answer ends with it (an end token, max_new, the context)
         auto emit = [&](int t) -> bool {
@@ -516,28 +472,46 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
                 long long room = std::min<long long>(r.max_new - produced, (long long) m.max_ctx() - pos - 1);
                 if (in_think) room = std::min<long long>(room, r.think_budget - produced);
                 if (room > 0) {
-                    if (!m.draft(tok, pos, B, drafts, confs, err)) {
+                    if (sampled) {
+                        for (float& u : draws) u = (float) std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+                        if (!m.draft_sampled(tok, pos, B, ds, draws, drafts, confs, qd, err)) {
+                            std::fprintf(stderr, "mm3: %s\n", err.c_str());
+                            finish = "cancel";
+                            break;
+                        }
+                    } else if (!m.draft(tok, pos, B, drafts, confs, err)) {
                         std::fprintf(stderr, "mm3: %s\n", err.c_str());
                         finish = "cancel";
                         break;
                     }
-                    while (k < (int) drafts.size() && k < room && confs[(size_t) k] >= floor) ++k;
+                    double surv = 1.0;
+                    while (k < (int) drafts.size() && k < room && confs[(size_t) k] >= floor) {
+                        surv *= confs[(size_t) k];
+                        if (draft_cost > 0.0f && surv < draft_cost) break;
+                        ++k;
+                    }
                 }
             }
+            std::vector<int> win(1, tok);
+            win.insert(win.end(), drafts.begin(), drafts.begin() + k);
+            {   // (the window's candidates: the penalised ids of the history with the window's tokens)
+                std::vector<int> more(win);
+                use_c = !full_env && cands_for(r, state, more, cd);
+            }
             if (k == 0) {
-                if (!m.forward(&tok, 1, pos, 1, lgw.empty() ? lg.data() : lgw.data(), err)) {
+                if (!(use_c ? m.forward_cands(&tok, 1, pos, 1, cd, err)
+                            : m.forward(&tok, 1, pos, 1, lgw.empty() ? lg.data() : lgw.data(), err))) {
                     std::fprintf(stderr, "mm3: %s\n", err.c_str());
                     finish = "cancel";
                     break;
                 }
                 state.push_back(tok);
-                const float* row = lgw.empty() ? lg.data() : lgw.data();
-                tok = draw(dist(row, m.vocab(), r, state), rng);
+                tok = draw(use_c ? row_dist(0, state)
+                                 : dist(lgw.empty() ? lg.data() : lgw.data(), m.vocab(), r, state), rng);
                 continue;
             }
-            std::vector<int> win(1, tok);
-            win.insert(win.end(), drafts.begin(), drafts.begin() + k);
-            if (!m.forward(win.data(), k + 1, pos, k + 1, lgw.data(), err)) {
+            if (!(use_c ? m.forward_cands(win.data(), k + 1, pos, k + 1, cd, err)
+                        : m.forward(win.data(), k + 1, pos, k + 1, lgw.data(), err))) {
                 std::fprintf(stderr, "mm3: %s\n", err.c_str());
                 finish = "cancel";
                 break;
@@ -547,19 +521,24 @@ int serve(mm3::Model& m, const std::vector<int>& eos, int chunk, bool spec_on, f
             bool more = true;
             int next = -1;
             for (int i = 0; i <= k && more; ++i) {
-                const auto d = dist(lgw.data() + (size_t) i * m.vocab(), m.vocab(), r, state);
+                const auto d = row_dist(i, state);
                 if (i == k) {   // every draft kept: the target's token after them
                     next = draw(d, rng);
                     break;
                 }
                 const int x = drafts[(size_t) i];
-                double px = 0;
+                double px = 0, qx = 1;
                 for (const auto& [t, q] : d)
                     if (t == x) px = q;
-                const bool keep = r.temperature > 0.0f ? std::uniform_real_distribution<double>(0.0, 1.0)(rng) < px
-                                                       : d[0].first == x;
+                if (sampled)
+                    for (const auto& [t, q] : qd[(size_t) i])
+                        if (t == x) qx = q;
+                const bool keep = r.temperature > 0.0f
+                                      ? std::uniform_real_distribution<double>(0.0, 1.0)(rng) * qx < px
+                                      : d[0].first == x;
                 if (!keep) {
-                    next = r.temperature > 0.0f ? draw(d, rng, x) : d[0].first;
+                    next = r.temperature > 0.0f ? (sampled ? draw_residual(d, qd[(size_t) i], rng) : draw(d, rng, x))
+                                                : d[0].first;
                     break;
                 }
                 ++d_acc;
@@ -600,7 +579,9 @@ int usage() {
                  "                [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]\n"
                  "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
                  "                [--tp 1|2|4] [--cache-gb X] [--kv-cache bf16|int8] [--kv-streaming on|off]\n"
-                 "                [--kv-resident N] [--verbose]\n"
+                 "                [--kv-resident N] [--kv-rotate on|off] [--tp-chunk N] [--tp-ffn-rows N]\n"
+                 "                [--dspark-cost X]\n"
+                 "                [--verbose]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
@@ -614,6 +595,7 @@ int main(int argc, char** argv) {
     int kv_stream = -1;   // (--kv-streaming: -1 not given)
     int gen = 0, last = 1, ppl = 0;
     float dspark_conf = 0.7f;   // the drafts' confidence floor: a round verifies the drafts before the first below it
+    float dspark_cost = 0.0f;   // (> 0) ... and those before the first whose confidences' product is below it
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string {
@@ -647,11 +629,18 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = val() != "off";
         else if (a == "--tp") o.tp = std::atoi(val().c_str());
         else if (a == "--cache-gb") o.cache_gb = std::atof(val().c_str());
+        else if (a == "--tp-chunk") o.tp_chunk = std::atoi(val().c_str());
+        else if (a == "--tp-ffn-rows") o.tp_ffn_rows = std::atoi(val().c_str());
         else if (a == "--kv-streaming") {   // (on: --kv-resident 32768 unless that is given; the context above it)
             const std::string v = val();
             if (v != "on" && v != "off") return usage();
             kv_stream = v == "on" ? 1 : 0;
         } else if (a == "--kv-resident") o.kv_resident = std::max(0, std::atoi(val().c_str()));
+        else if (a == "--kv-rotate") {   // (on: the INT8 caches' rows rotated first - opt-in, measured by --ppl)
+            const std::string v = val();
+            if (v != "on" && v != "off") return usage();
+            o.kv_rotate = v == "on";
+        }
         else if (a == "--kv-cache") {
             const std::string v = val();
             if (v != "int8" && v != "bf16") return usage();
@@ -667,6 +656,7 @@ int main(int argc, char** argv) {
         else if (a == "--size") enc_size = val();
         else if (a == "--dump-image") enc_out = val();
         else if (a == "--dspark-conf") dspark_conf = (float) std::atof(val().c_str());
+        else if (a == "--dspark-cost") dspark_cost = (float) std::atof(val().c_str());
         else if (a == "--serve") serve_mode = true;
         else if (a == "--eos") eos_arg = val();
         else if (a == "--verbose") o.verbose = true;
@@ -724,7 +714,7 @@ int main(int argc, char** argv) {
     }
     if (serve_mode) {
         std::vector<int> eos = eos_arg.empty() ? std::vector<int>{m.eos()} : parse_list(eos_arg);
-        return serve(m, eos, o.chunk, o.dspark, dspark_conf, o.kv_int8);
+        return serve(m, eos, o.chunk, o.dspark, dspark_conf, dspark_cost, o.kv_int8);
     }
     const auto& st = m.stats();
     std::fprintf(stderr, "maya-mm3: loaded in %.1f s, %ld of %ld experts in VRAM, %.1f GB pinned pool\n", st.load_s,
@@ -758,6 +748,28 @@ int main(int argc, char** argv) {
         if (ids_arg.empty()) return 0;
     }
     const int n = (int) ids.size();
+    if (ppl > 0 && o.tp > 0) {   // (the tensor-parallel path: one prompt, the NLL taken chunk by chunk)
+        if (!m.forward_ppl(ids.data(), n, err)) {
+            std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
+            return 1;
+        }
+        const std::vector<double>& nl = m.ppl_nll();
+        double sum = 0, bsum = 0;
+        int bn = 0, cnt = 0;
+        for (int p = 0; p + 1 < n && p < (int) nl.size(); ++p) {
+            sum += nl[(size_t) p];
+            bsum += nl[(size_t) p];
+            ++cnt;
+            if (++bn == ppl) {
+                std::printf("positions %6d-%6d: NLL %.4f  ppl %.3f\n", p + 1 - ppl, p, bsum / bn, std::exp(bsum / bn));
+                bsum = 0;
+                bn = 0;
+            }
+        }
+        if (bn) std::printf("positions %6d-%6d: NLL %.4f  ppl %.3f\n", n - 1 - bn, n - 2, bsum / bn, std::exp(bsum / bn));
+        std::printf("all %d positions: NLL %.4f  ppl %.3f\n", cnt, sum / cnt, std::exp(sum / cnt));
+        return 0;
+    }
     if (ppl > 0) {   // the next-token NLL of every position, by buckets of `ppl` positions
         const int C = o.chunk;
         std::vector<float> lg((size_t) C * m.vocab());

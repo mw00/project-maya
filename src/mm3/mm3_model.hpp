@@ -7,7 +7,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mm3_pack.hpp"
@@ -40,10 +42,14 @@ struct Options {
                                   // copy waited for then (1: the next forward - plain decode then waits ~5 ms a token)
     int tp = 0;                   // > 0: the tensor-parallel path (mm3_tp.hpp) in groups of tp GPUs (1, 2 or 4)
     double cache_gb = 1.5;        // (tp) each GPU's expert cache (promote's slots), taken from its experts in VRAM
+    int tp_chunk = 1024;          // (tp) a prompt chunk's tokens: its experts not in VRAM are copied in once a chunk
+    int tp_ffn_rows = 0;          // (tp) ... and its FFN half run in slices of this many tokens (0: the whole chunk) -
+                                  // the same bits; 256 keeps ~37 more experts in VRAM, a prompt reads ~13% slower
     int kv_resident = 0;          // KV streaming (--kv-streaming on: 32768): the positions of each layer's K / V kept in
                                   // VRAM (a ring), all of them in pinned host memory (0, or the context or less: off)
     bool kv_int8 = false;         // the K / V caches in INT8 (a scale a row of 128: half the memory, not exact - the
                                   // default BF16 is; the index-key cache stays BF16)
+    bool kv_rotate = false;       // (with kv_int8) the rows through a 128-point Hadamard before their scale (k::KvI8)
     bool verbose = false;
 };
 
@@ -63,6 +69,23 @@ struct Stats {
     double t_sync = 0, t_lane = 0, t_token = 0;   // decode: waiting on the routing, the CPU lane, all (seconds)
 };
 
+/// A forward's logits rows as the sampler's candidates (Model::forward_cands): per row the kc largest logits and every
+/// one equal to the kc-th ((id, logit) pairs by logit desc, then id asc) and the logits of the extra ids - all a
+/// sampler with top_k <= kc - extra.size() needs of the row when its penalties touch the extra ids alone.
+struct Cands {
+    int kc = 1;                                            // in: the largest a row
+    std::vector<int> extra;                                // in: ids every row reports too (the penalised ones)
+    std::vector<std::vector<std::pair<int, float>>> top;   // out: [row]
+    std::vector<std::vector<float>> ex;                    // out: [row][extra]
+};
+
+/// A sampled DSpark proposal's distribution (Model::draft_sampled): the draft's biased logits through these, as the
+/// request samples the target.
+struct DraftSampling {
+    float temperature = 1.0f, top_p = 1.0f, min_p = 0.0f;
+    int top_k = 64;
+};
+
 class Model {
 public:
     Model();
@@ -75,6 +98,20 @@ public:
     /// Options::chunk; logits_out (if given) gets the logits of the last `want` positions of this call, [want][vocab]
     /// F32, row-major.
     bool forward(const int* ids, int n, int pos0, int want, float* logits_out, std::string& err);
+    /// The same with the last `want` rows as candidates instead of logits (the tensor-parallel path picks them on the
+    /// head's GPU: a few KB a row back instead of the vocabulary's 800).
+    bool forward_cands(const int* ids, int n, int pos0, int want, Cands& c, std::string& err);
+    /// (the tensor-parallel path, whose prompt chunks go through its GPU groups as a pipeline: a whole prompt is one
+    /// call) f(tokens of the call done) after each chunk, on the calling thread; false: no further chunk starts - the
+    /// call returns true with done() of its tokens in the cache (the logits only when all are).  set_progress({}) ends
+    /// it.  pipelined(): whether a prompt in one call gains from it (else calls of Options::chunk are as good).
+    void set_progress(std::function<bool(int)> f);
+    int done() const;
+    /// (the tensor-parallel path) ids as one prompt from position 0, the next-token NLL of every position kept
+    /// (ppl_nll()[p] = -log p(ids[p + 1])) - its chunks one at a time, the head on each one's rows.
+    bool forward_ppl(const int* ids, int n, std::string& err);
+    const std::vector<double>& ppl_nll() const;
+    bool pipelined() const;
     int vocab() const;
     int max_ctx() const;
     int bos() const;
@@ -90,6 +127,12 @@ public:
     /// confidences.
     int draft_block() const;
     bool draft(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, std::string& err);
+    /// ... each draft drawn from the draft's distribution (ds; u[i] the draw of position i, uniform in [0, 1)) instead
+    /// of its argmax, q[i] that distribution ((id, probability), the most likely first) - the target keeps a draft d
+    /// with min(1, p(d) / q(d)) and else draws from max(0, p - q), which leaves every token the target's own sample.
+    bool draft_sampled(int anchor, int pos, int n, const DraftSampling& ds, const std::vector<float>& u,
+                       std::vector<int>& drafts, std::vector<float>& conf,
+                       std::vector<std::vector<std::pair<int, float>>>& q, std::string& err);
     /// The vision tower (Options::vision): its geometry (null without it), a picture's rows (rgb height x width x 3,
     /// sides multiples of 28 -> F32 [tokens][hidden]), and the pictures the next forwards' image tokens take their
     /// rows from (position start .. start + rows / hidden - 1; set_images({}) after the prompt).

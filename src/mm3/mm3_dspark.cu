@@ -60,11 +60,16 @@ struct Draft::Impl {
     uint16_t *x16 = nullptr, *hid16 = nullptr, *embb = nullptr;
     int *pos = nullptr, *lo = nullptr, *prev = nullptr, *out = nullptr;
     int* host = nullptr;   // pinned: drafts then confidences
+    uint16_t* anc = nullptr;   // (mapped) the anchor's embedding row, BF16
+    float* maskf = nullptr;    // the mask token's embedding row, F32 (device)
+    k::QRow* qh = nullptr;   // (mapped) a sampled proposal's distributions, a row a position
 
     ~Impl() {
         cudaSetDevice(dev);
         for (void* x : owned) cudaFree(x);
         if (host) cudaFreeHost(host);
+        if (qh) cudaFreeHost(qh);
+        if (anc) cudaFreeHost(anc);
     }
 
     template <class T>
@@ -242,15 +247,30 @@ struct Draft::Impl {
             return false;
         DK(cudaMemcpy(inv, inv_h.data(), inv_h.size() * 4, cudaMemcpyHostToDevice));
         DK(cudaMallocHost(&host, (size_t) 2 * B * sizeof(int)));
+        DK(cudaHostAlloc((void**) &qh, (size_t) B * sizeof(k::QRow), cudaHostAllocMapped | cudaHostAllocPortable));
+        // (a proposal's inputs without the copy engine, which the expert cache's promotions keep busy: the anchor's
+        //  row through mapped memory, the mask token's on the device, the positions made there)
+        DK(cudaHostAlloc((void**) &anc, (size_t) D * 2, cudaHostAllocMapped | cudaHostAllocPortable));
+        {
+            std::vector<float> mf((size_t) D);
+            const uint16_t* r = emb + (size_t) g.mask_id * D;
+            for (int i = 0; i < D; ++i) {
+                const uint32_t u = (uint32_t) r[i] << 16;
+                std::memcpy(&mf[(size_t) i], &u, 4);
+            }
+            if (!alloc(maskf, (size_t) D, err)) return false;
+            DK(cudaMemcpy(maskf, mf.data(), (size_t) D * 4, cudaMemcpyHostToDevice));
+        }
         return true;
     }
 
-    bool context(const float* taps, int T, int pos0, std::string& err) {
+    bool context(const float* taps, int T, int pos0, size_t stride, std::string& err) {
         const int NT = (int) g.taps.size();
+        if (stride == 0) stride = (size_t) T;
         for (int a = 0; a < T; a += max_rows) {
             const int n = std::min(max_rows, T - a);
             for (int j = 0; j < NT; ++j)
-                if (!context_tap(j, taps + ((size_t) j * T + a) * g.dim, n, err)) return false;
+                if (!context_tap(j, taps + ((size_t) j * stride + a) * g.dim, n, err)) return false;
             if (!context_finish(n, pos0 + a, err)) return false;
         }
         return true;
@@ -268,40 +288,28 @@ struct Draft::Impl {
         const int D = g.dim, KV = g.n_kv * g.hd;
         cudaSetDevice(dev);
         k::rms(ctx, hid1, n, D, g.eps, xn, nullptr, s);
-        std::vector<int> ph((size_t) n);
-        for (int t = 0; t < n; ++t) ph[(size_t) t] = pos0 + t;
-        DK(cudaMemcpyAsync(pos, ph.data(), ph.size() * 4, cudaMemcpyHostToDevice, s));
+        k::iota(pos, n, pos0, s);   // (on the device: an upload would wait behind the promotions' copies)
         for (auto& l : L) {
             mxg(l.k, xn, n, D, kk, KV, 0.0f);
             mxg(l.v, xn, n, D, vv, KV, 0.0f);
             k::qk_norm_rope(nullptr, kk, vv, nullptr, l.kn1, pos, n, 0, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc,
                             l.vc, s, ring);
         }
-        DK(cudaStreamSynchronize(s));   // (ph is gone after this)
         return true;
     }
 
-    bool propose(int anchor, int P, int n, std::vector<int>& drafts, std::vector<float>& cf, std::string& err) {
+    // sa (given): each token drawn from the biased logits' distribution (sa, u[i] the draw of position i), qd its rows;
+    // else greedy
+    bool propose(int anchor, int P, int n, std::vector<int>& drafts, std::vector<float>& cf, const k::SampleArgs* sa,
+                 const float* u, std::vector<std::vector<std::pair<int, float>>>* qd, std::string& err) {
         const int D = g.dim, Q = g.n_head * g.hd, KV = g.n_kv * g.hd, F = g.ff, V = g.vocab, R = g.rank, B = g.block;
         n = std::max(1, std::min(n, B));
         cudaSetDevice(dev);
-        // the block's embeddings: the anchor, then the mask token (the target's table, BF16 -> F32)
-        std::vector<float> e((size_t) B * D);
-        for (int t = 0; t < B; ++t) {
-            const uint16_t* r = emb + (size_t) (t == 0 ? anchor : g.mask_id) * D;
-            for (int i = 0; i < D; ++i) {
-                const uint32_t u = (uint32_t) r[i] << 16;
-                std::memcpy(&e[(size_t) t * D + i], &u, 4);
-            }
-        }
-        std::vector<int> ph((size_t) B), lh((size_t) B);
-        for (int t = 0; t < B; ++t) {
-            ph[(size_t) t] = P + t;
-            lh[(size_t) t] = std::max(0, P + t - g.window + 1);
-        }
-        DK(cudaMemcpyAsync(h, e.data(), e.size() * 4, cudaMemcpyHostToDevice, s));
-        DK(cudaMemcpyAsync(pos, ph.data(), ph.size() * 4, cudaMemcpyHostToDevice, s));
-        DK(cudaMemcpyAsync(lo, lh.data(), lh.size() * 4, cudaMemcpyHostToDevice, s));
+        // the block's embeddings: the anchor, then the mask token (the target's table, BF16 -> F32), and the
+        // positions - made on the device (the anchor's row read where the host put it)
+        DK(cudaStreamSynchronize(s));   // (the last proposal done with anc)
+        std::memcpy(anc, emb + (size_t) anchor * D, (size_t) D * 2);
+        k::draft_block(anc, maskf, D, B, P, g.window, h, pos, lo, s);
         const float scale = 1.0f / std::sqrt((float) g.hd);
         for (auto& l : L) {
             k::rms(h, l.in1, B, D, g.eps, xn, nullptr, s);
@@ -334,14 +342,21 @@ struct Draft::Impl {
             }
             c0 += j.ncol;
         }
-        DK(cudaMemcpyAsync(prev, &anchor, 4, cudaMemcpyHostToDevice, s));
+        k::set_int(prev, anchor, s);
         for (int i = 0; i < n; ++i) {
             k::gather_row(w1, R, prev, embb, embf, s);
             const float one = 1.0f, zero = 0.0f;
             DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, V, 1, R, &one, w2, CUDA_R_16BF, R, embb, CUDA_R_16BF, R,
                             &zero, bias, CUDA_R_32F, V, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-            k::markov_pick(logit + (size_t) i * V, bias, V, prev, out + i, nullptr, cw, cb, hid + (size_t) i * D, D,
-                           embf, R, conf + i, s);
+            if (sa) {
+                k::SampleArgs a = *sa;
+                a.u = u[i];
+                k::markov_sample(logit + (size_t) i * V, bias, V, prev, out + i, cw, cb, hid + (size_t) i * D, D, embf,
+                                 R, conf + i, a, qh + i, s);
+            } else {
+                k::markov_pick(logit + (size_t) i * V, bias, V, prev, out + i, nullptr, cw, cb, hid + (size_t) i * D,
+                               D, embf, R, conf + i, s);
+            }
         }
         DK(cudaMemcpyAsync(host, out, (size_t) n * 4, cudaMemcpyDeviceToHost, s));
         DK(cudaMemcpyAsync(host + B, conf, (size_t) n * 4, cudaMemcpyDeviceToHost, s));
@@ -349,6 +364,11 @@ struct Draft::Impl {
         drafts.assign(host, host + n);
         cf.resize((size_t) n);
         std::memcpy(cf.data(), host + B, (size_t) n * 4);
+        if (sa && qd) {
+            qd->assign((size_t) n, {});
+            for (int i = 0; i < n; ++i)
+                for (int j = 0; j < qh[i].n; ++j) (*qd)[(size_t) i].push_back({qh[i].id[j], qh[i].q[j]});
+        }
         return true;
     }
 };
@@ -360,13 +380,24 @@ bool Draft::load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, c
     return p->load(pk, dev, s, blas, head, emb, max_rows, err);
 }
 const DraftGeo& Draft::geo() const { return p->g; }
-bool Draft::context(const float* taps, int T, int pos0, std::string& err) { return p->context(taps, T, pos0, err); }
+bool Draft::context(const float* taps, int T, int pos0, std::string& err, size_t stride) {
+    return p->context(taps, T, pos0, stride, err);
+}
 bool Draft::context_tap(int j, const float* rows, int T, std::string& err) { return p->context_tap(j, rows, T, err); }
 bool Draft::context_finish(int T, int pos0, std::string& err) { return p->context_finish(T, pos0, err); }
 bool Draft::propose(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, float* logits,
                     std::string& err) {
     (void) logits;
-    return p->propose(anchor, pos, n, drafts, conf, err);
+    return p->propose(anchor, pos, n, drafts, conf, nullptr, nullptr, nullptr, err);
+}
+bool Draft::propose_sampled(int anchor, int pos, int n, const k::SampleArgs& sa, const std::vector<float>& u,
+                            std::vector<int>& drafts, std::vector<float>& conf,
+                            std::vector<std::vector<std::pair<int, float>>>& q, std::string& err) {
+    if ((int) u.size() < std::max(1, std::min(n, p->g.block))) {
+        err = "dspark: fewer draws than drafts";
+        return false;
+    }
+    return p->propose(anchor, pos, n, drafts, conf, &sa, u.data(), &q, err);
 }
 size_t Draft::bytes() const { return p->bytes; }
 

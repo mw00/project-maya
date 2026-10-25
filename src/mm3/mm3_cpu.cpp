@@ -2,8 +2,10 @@
 //
 // One call: the experts' gate and up row sums in jobs of 16 slices (256 inputs, each job rotating its own two blocks
 // of x), then per 128-output band the outputs, swigluoai and the down matrix's rotated input block, then down's row
-// sums in jobs of 8 slices, then down's bands - four phases on a pool of spinning workers (a decode step is a few
-// milliseconds), the caller one of them.
+// sums in jobs of 8 slices, then down's bands - on a pool of spinning workers (a decode step is a few milliseconds),
+// the caller one of them.  run_multi's first three steps are one dispatch whose jobs start as their inputs are done (a
+// chunk's bands once its gate / up jobs are, down's jobs of slice q once band q is), the bands of the last a barrier
+// later: two barriers a call instead of four, the same arithmetic in the same order.
 #include "mm3_cpu.hpp"
 
 #include <algorithm>
@@ -47,6 +49,7 @@ struct CpuLane::Impl {
     int max_entries = 64;
     // (MM3_LANE_PROF: run_multi's time by phase, printed at the end)
     const bool prof = std::getenv("MM3_LANE_PROF") != nullptr;
+    const bool old_phases = std::getenv("MM3_LANE_OLD") != nullptr;   // (the four phases with a barrier each)
     double ph[6] = {0, 0, 0, 0, 0, 0};
     long calls = 0, subs = 0;
     int GQ, GB, DQ, DB, EB, FB;   // gate / up K jobs and bands, down K jobs and bands, x blocks, h blocks
@@ -147,6 +150,7 @@ CpuLane::~CpuLane() {
 }
 
 int CpuLane::threads() const { return (int) p->th.size() + 1; }
+int CpuLane::max_entries() const { return p->max_entries; }
 
 void CpuLane::parallel_for(int n, const std::function<void(int)>& f) { p->parallel(n, f); }
 
@@ -232,10 +236,11 @@ void CpuLane::run(const std::vector<CpuExpert>& ex, const float* x, float* out) 
 }
 
 void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std::vector<std::pair<int, float>>>& users,
-                        const float* x, int T, float* out, const std::vector<std::pair<int, int>>* order) {
+                        const float* x, int T, float* out, const std::vector<std::pair<int, int>>* order,
+                        bool accumulate) {
     Impl& I = *p;
     const int dim = I.dim, ff = I.ff;
-    std::fill(out, out + (size_t) T * dim, 0.0f);
+    if (!accumulate) std::fill(out, out + (size_t) T * dim, 0.0f);
     // the entries (expert, token, weight), and the chunks of at most 8 of one expert's
     struct Ent {
         int e, t;
@@ -310,8 +315,6 @@ void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std:
         if (c.n == 1) kc::exl3_cpu_rows_acc(m, xp[0], q * 16, (q + 1) * 16, ap[0]);
         else kc::exl3_cpu_rows_acc_n(m, xp, c.n, q * 16, (q + 1) * 16, ap);
     };
-    I.parallel(C * 2 * I.GQ, fa);
-    lap(1);
     const std::function<void(int)> fb = [&](int jb) {
         const Chunk& c = ch[(size_t) (jb / I.GB)];
         const int b = jb % I.GB;
@@ -337,8 +340,6 @@ void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std:
             xsd(j)[b] = kc::exl3_cpu_prepare_block(d.suh + b * 128, hb, xhd(j) + b * 128);
         }
     };
-    I.parallel(C * I.GB, fb);
-    lap(2);
     // (down's jobs also by a quarter of its outputs: a slice's job alone left half the threads idle for one expert)
     constexpr int kDP = 4;
     const int dcols = dim / kDP;
@@ -353,8 +354,58 @@ void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std:
         }
         kc::exl3_cpu_rows_acc_cols_n(ex[(size_t) c.e].p[2], xp, c.n, q * 8, (q + 1) * 8, p * dcols, (p + 1) * dcols, ap);
     };
-    I.parallel(C * I.DQ * kDP, fc);
-    lap(3);
+    const int na = C * 2 * I.GQ, nb = C * I.GB, ncj = C * I.DQ * kDP;
+    if (I.old_phases) {
+        I.parallel(na, fa);
+        lap(1);
+        I.parallel(nb, fb);
+        lap(2);
+        I.parallel(ncj, fc);
+        lap(3);
+    } else {
+        // one dispatch, a loop a thread: the next gate / up job (fa) while there is one, else the band jobs (fb, chunk
+        // by chunk) once their chunk's gate / up jobs are all done, down's jobs (fc, chunk by chunk, slice by slice)
+        // once their band is - each list taken in order, a job's inputs published by its writers' release counts
+        std::vector<std::atomic<int>> a_done((size_t) C), b_done((size_t) C * I.GB);
+        for (auto& x : a_done) x.store(0, std::memory_order_relaxed);
+        for (auto& x : b_done) x.store(0, std::memory_order_relaxed);
+        std::atomic<int> a_next{0}, b_next{0}, c_next{0}, c_left{ncj};
+        const int per_a = 2 * I.GQ, GB = I.GB, DQ = I.DQ;
+        const std::function<void(int)> loop = [&](int) {
+            for (int idle = 0;;) {
+                if (c_left.load(std::memory_order_acquire) == 0) return;
+                if (a_next.load(std::memory_order_relaxed) < na) {   // (gate / up first: every later job waits on it)
+                    const int ja = a_next.fetch_add(1, std::memory_order_relaxed);
+                    if (ja < na) {
+                        fa(ja);
+                        a_done[(size_t) (ja / per_a)].fetch_add(1, std::memory_order_release);
+                        idle = 0;
+                        continue;
+                    }
+                }
+                int jb = b_next.load(std::memory_order_relaxed);
+                if (jb < nb && a_done[(size_t) (jb / GB)].load(std::memory_order_acquire) == per_a &&
+                    b_next.compare_exchange_weak(jb, jb + 1)) {
+                    fb(jb);
+                    b_done[(size_t) jb].store(1, std::memory_order_release);
+                    idle = 0;
+                    continue;
+                }
+                int jc = c_next.load(std::memory_order_relaxed);
+                // (job jc: chunk jc / (DQ kDP), slice (jc / kDP) % DQ - its band (the down input's block) the same)
+                if (jc < ncj && b_done[(size_t) ((jc / (DQ * kDP)) * GB + (jc / kDP) % DQ)].load(std::memory_order_acquire) &&
+                    c_next.compare_exchange_weak(jc, jc + 1)) {
+                    fc(jc);
+                    c_left.fetch_sub(1, std::memory_order_acq_rel);
+                    idle = 0;
+                    continue;
+                }
+                for (int i = 0; i < (1 << std::min(idle++, 6)); ++i) _mm_pause();   // (nothing ready: back off)
+            }
+        };
+        I.parallel((int) I.th.size() + 1, loop);
+        lap(1);
+    }
     // down's bands and the tokens' sums, a job a band: its outputs of every entry, then added into the tokens' rows
     // in order's sequence (each value's sum in the same order as entry by entry over the whole rows)
     std::vector<int> seq;

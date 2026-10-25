@@ -21,10 +21,13 @@ void rms(const float* x, const float* w1, int rows, int D, float eps, float* y, 
 void rope_inv_freq(float theta, int n_rot, float* inv /*[n_rot / 2]*/);
 
 /// An INT8 K / V cache (--kv-cache int8): rows of 128 int8 (round(v / s)) and a scale s each (the row's max |v| / 127),
-/// [rows][Hkv][128] and [rows][Hkv]; all null: the BF16 caches.
+/// [rows][Hkv][128] and [rows][Hkv]; all null: the BF16 caches.  rot (--kv-rotate on): the rows are H k and H v (H the
+/// 128-point Hadamard / sqrt(128), after the norm and RoPE), the queries rotated alike and the attention's output
+/// rotated back - an outlier spread over its row before the row's scale (not exact either: opt-in).
 struct KvI8 {
     int8_t *kc = nullptr, *vc = nullptr;
     float *ks = nullptr, *vs = nullptr;
+    bool rot = false;
 };
 
 /// KV streaming (--kv-streaming): the VRAM K / V caches a ring of `ring` rows - position p at row p % ring, tag[row] the
@@ -64,9 +67,13 @@ void select_blocks(const float* bs, const int* pos, int T, int Hi, int nblk, int
 
 /// out [T][Hq][hd] (F32): each query head over its KV group's kept blocks (kept [Hkv][T][topk], -1 unused), the keys
 /// j <= pos[t] of them, softmax(q . k * scale) . v - exact (online softmax in F32).  hd = 128, Hq / Hkv = 16.
+/// splits > 1 (with part: T x Hkv x splits x 16 x 130 floats): each query's kept blocks in that many runs on blocks of
+/// their own (a decode window's few queries), combined in run order - a query's sums depend on splits alone, not on T.
 void sparse_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* kept, const int* pos, int T,
                  int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8 = KvI8{},
-                 const KvHost& hs = KvHost{});
+                 const KvHost& hs = KvHost{}, int splits = 1, float* part = nullptr);
+/// part's floats for sparse_attn's splits over T queries and Hkv groups.
+inline size_t attn_part_floats(int T, int Hkv, int splits) { return (size_t) T * Hkv * splits * 16 * 130; }
 
 /// The router over logits [T][E] (F32): s = sigmoid, chosen by s + bias (the K largest, ties to the lower expert),
 /// weights s / sum over the chosen -> top [T][K], w [T][K].
@@ -82,10 +89,18 @@ void swigluoai_pairs(const float* gu, int rows, int ff, float alpha, float limit
 /// FP16 copies of rows (ld floats a row in, ldo halves out).
 void to_f16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, cudaStream_t s);
 
-/// out[t] = res[t] + scale * sum over slots i of w[t][i] * y[inv[t * K + i]] + (sh ? sh[t] : 0), rows of D.
+/// out[t] = res[t] + scale * sum over slots i of w[t][i] * y[inv[t * K + i]] + (sh ? sh[t] : 0), rows of D (res null: 0).
 void moe_combine(const float* res, const float* y, const int* inv, const float* w, const float* sh, int T, int K,
                  int D, float scale, float* out, cudaStream_t s);
 
+/// p[i] = base + i, i < n (a prompt chunk's positions, without a host buffer).
+void iota(int* p, int n, int base, cudaStream_t s);
+/// *p = v (on the stream: no copy).
+void set_int(int* p, int v, cudaStream_t s);
+/// The DSpark draft's block: h row 0 = the anchor's BF16 row (anchor: device-readable, e.g. mapped), rows 1 .. B - 1 =
+/// mask (F32 [D], device); pos[t] = P + t, lo[t] = max(0, P + t - window + 1).
+void draft_block(const uint16_t* anchor, const float* mask, int D, int B, int P, int window, float* h, int* pos, int* lo,
+                 cudaStream_t s);
 /// x += a (n floats).
 void add(float* x, const float* a, size_t n, cudaStream_t s);
 /// (the tensor-parallel path) one thread spins until *flag (mapped host memory, a counter) reaches v, wrap-safe.
@@ -93,6 +108,9 @@ void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s);
 /// (the tensor-parallel path) n floats (a multiple of 4) from src (mapped host memory) into dst (device) by a kernel - no
 /// copy engine: a copy waiting behind a wait_flag on one stream holds up the device's host -> device copies of the others
 void pull(float* dst, const float* src, size_t n, cudaStream_t s);
+/// (the tensor-parallel path) wait_flag and pull in one kernel: once *flag reaches v, n floats (a multiple of 4) from
+/// src (mapped host memory) into dst - no copy engine, and no launch between the wait and the read.
+void wait_pull(const unsigned* flag, unsigned v, float* dst, const float* src, size_t n, cudaStream_t s);
 /// (the tensor-parallel path) n floats (a multiple of 4) from src (device) to dst (mapped host memory), then *flag = v
 /// once every block's writes are the system's: each block fences, the last to count (counter: a device word, 0
 /// between calls - it is left 0) raises the flag.
@@ -117,11 +135,41 @@ void to_bf16(const float* x, int rows, int cols, int ld, uint16_t* y, int ldo, c
 /// position p at row p % ring), not causal - softmax(q . k * scale) . v in F32.  hd = 128, Hq / Hkv = 16.
 void window_attn(const float* q, const uint16_t* kc, const uint16_t* vc, int ring, const int* lo, int hi, int T,
                  int Hq, int Hkv, float scale, float* out, cudaStream_t s);
+/// Candidates instead of a row of logits (the sampler's: main.cpp's dist() over them is its own over the row): the kc
+/// largest and every one equal to the kc-th - n of them (-1: more than kCandCap), by logit desc then id asc, their
+/// exact logits - and the logits of n_extra (<= kCandExtra) ids the caller names (the penalised ones).
+constexpr int kCandCap = 512, kCandExtra = 128;
+struct CandRow {
+    int n;
+    int id[kCandCap];
+    float v[kCandCap];
+    float ex[kCandExtra];
+};
+/// CandRow out[r] (mapped host memory) for each of rows rows of lg [rows][V] (device); extra: ids (device-readable).
+void topk_rows(const float* lg, int rows, int V, int kc, const int* extra, int n_extra, CandRow* out, cudaStream_t s);
+/// A sampled draft step's distribution: q[i] of id[i], n of them (the draft's kq largest biased logits, by dist()'s
+/// steps), and the token drawn from it.
+constexpr int kQMax = 64;
+struct QRow {
+    int n;
+    int id[kQMax];
+    float q[kQMax];
+};
+struct SampleArgs {
+    float temperature = 1.0f, top_p = 1.0f, min_p = 0.0f, u = 0.0f;   // u: the draw, uniform in [0, 1)
+    int top_k = kQMax;
+};
+
 /// One Markov step: emb (BF16 [R], for the GEMV) and embf (F32 [R]) = table row *prev.
 void gather_row(const uint16_t* table, int R, const int* prev, uint16_t* emb, float* embf, cudaStream_t s);
 /// ... then: the next token = argmax(logits + bias) (ties: the lower id) -> *prev and *out; biased (if given) = logits +
 /// bias; conf (if given) = sigmoid(w . [hidden ; embf] + b) with w [D + R] F32, b F32.
 void markov_pick(const float* logits, const float* bias, int V, int* prev, int* out, float* biased, const float* w,
                  const float* b, const float* hidden, int D, const float* embf, int R, float* conf, cudaStream_t s);
+/// ... or sampled: the token drawn from the biased logits' distribution as sa says it (QRow *qo, mapped host memory,
+/// gets that distribution) -> *prev and *out, the confidence as markov_pick's.
+void markov_sample(const float* logits, const float* bias, int V, int* prev, int* out, const float* w, const float* b,
+                   const float* hidden, int D, const float* embf, int R, float* conf, const SampleArgs& sa, QRow* qo,
+                   cudaStream_t s);
 
 }  // namespace mm3::k
