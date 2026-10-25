@@ -40,6 +40,8 @@ struct Options {
                                   // copy waited for then (1: the next forward - plain decode then waits ~5 ms a token)
     int tp = 0;                   // > 0: the tensor-parallel path (mm3_tp.hpp) in groups of tp GPUs (1, 2 or 4)
     double cache_gb = 1.5;        // (tp) each GPU's expert cache (promote's slots), taken from its experts in VRAM
+    bool kv_int8 = false;         // the K / V caches in INT8 (a scale a row of 128: half the memory, not exact - the
+                                  // default BF16 is; the index-key cache stays BF16)
     bool verbose = false;
 };
 

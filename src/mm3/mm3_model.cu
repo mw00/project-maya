@@ -78,6 +78,7 @@ struct Layer {
     x3::Mat q, k, v, o, mg, mu, md, sg, su, sd;
     float *wiq = nullptr, *wik = nullptr, *gate = nullptr, *bias = nullptr;
     uint16_t *kc = nullptr, *vc = nullptr, *ic = nullptr;
+    k::KvI8 i8;   // (--kv-cache int8: the K / V caches instead of kc / vc)
     x3::ExpertLayout lay;
     size_t blob = 0;
     std::vector<Src> src;
@@ -487,7 +488,11 @@ struct Model::Impl {
                     owned_dev.push_back(dv);
                 }
                 const size_t cache = (size_t) o.max_ctx * g.n_kv * g.hd;
-                if (!A(l.kc, cache) || !A(l.vc, cache) || !A(l.ic, (size_t) o.max_ctx * g.ix_dim)) return false;
+                if (o.kv_int8 ? !A(l.i8.kc, cache) || !A(l.i8.vc, cache) || !A(l.i8.ks, cache / g.hd) ||
+                                    !A(l.i8.vs, cache / g.hd)
+                              : !A(l.kc, cache) || !A(l.vc, cache))
+                    return false;
+                if (!A(l.ic, (size_t) o.max_ctx * g.ix_dim)) return false;
             }
             if (di + 1 == D.size()) {
                 head_dev = (int) di;
@@ -754,6 +759,7 @@ struct Model::Impl {
             lane = std::make_unique<CpuLane>(o.cpu_threads, g.dim, g.ff, g.alpha, g.limit);
             info.push_back("CPU lane: " + std::to_string(lane->threads()) + " threads");
         }
+        if (o.kv_int8) info.push_back("KV cache: INT8 (a scale a row of 128)");
         st.load_s = now() - t0;
         return true;
     }
@@ -829,7 +835,7 @@ struct Model::Impl {
             return false;
         }
         k::qk_norm_rope(d.q, d.k, d.v, l.qn1, l.kn1, d.pos, T, g.n_head, g.n_kv, g.hd, g.n_rot, inv_dev[(size_t) di],
-                        g.eps, l.kc, l.vc, d.s);
+                        g.eps, l.kc, l.vc, d.s, 0, l.i8);
         const int nq = g.ix_heads * g.ix_dim;
         k::rows_dot(l.wiq, nq, g.dim, d.xn, T, d.iq, d.s);
         k::rows_dot(l.wik, g.ix_dim, g.dim, d.xn, T, d.ik, d.s);
@@ -839,7 +845,7 @@ struct Model::Impl {
         k::block_scores(d.iq, l.ic, d.pos, T, g.ix_heads, nblk, g.blk, d.bs, d.s);
         k::select_blocks(d.bs, d.pos, T, g.ix_heads, nblk, g.blk, g.topk, d.kept, d.s);
         k::sparse_attn(d.q, l.kc, l.vc, d.kept, d.pos, T, g.n_head, g.n_kv, g.topk, g.blk, 1.0f / std::sqrt((float) g.hd),
-                       d.att, d.s);
+                       d.att, d.s, l.i8);
         const x3::MvJob oj = job(l.o, d.att, Q, d.ao, g.dim);
         if (!x3::mv(&oj, 1, d.s)) {
             err = "mv o (window)";
@@ -1113,7 +1119,7 @@ struct Model::Impl {
             return false;
         }
         k::qk_norm_rope(d.q, d.k, d.v, l.qn1, l.kn1, d.pos, 1, g.n_head, g.n_kv, g.hd, g.n_rot, inv_dev[(size_t) di],
-                        g.eps, l.kc, l.vc, d.s);
+                        g.eps, l.kc, l.vc, d.s, 0, l.i8);
         const float one = 1.0f, zero = 0.0f;
         const int nq = g.ix_heads * g.ix_dim;
         k::rows_dot(l.wiq, nq, g.dim, d.xn, 1, d.iq, d.s);
@@ -1124,7 +1130,7 @@ struct Model::Impl {
         k::block_scores(d.iq, l.ic, d.pos, 1, g.ix_heads, nblk, g.blk, d.bs, d.s);
         k::select_blocks(d.bs, d.pos, 1, g.ix_heads, nblk, g.blk, g.topk, d.kept, d.s);
         k::sparse_attn(d.q, l.kc, l.vc, d.kept, d.pos, 1, g.n_head, g.n_kv, g.topk, g.blk, 1.0f / std::sqrt((float) g.hd),
-                       d.att, d.s);
+                       d.att, d.s, l.i8);
         const x3::MvJob oj = job(l.o, d.att, d.ao);
         if (!x3::mv(&oj, 1, d.s)) {
             err = "mv o";
@@ -1337,7 +1343,7 @@ struct Model::Impl {
         x3::gemm_rows(l.k, d.xn16, g.dim, T, d.k, g.n_kv * g.hd, 0.0f, d.s);
         x3::gemm_rows(l.v, d.xn16, g.dim, T, d.v, g.n_kv * g.hd, 0.0f, d.s);
         k::qk_norm_rope(d.q, d.k, d.v, l.qn1, l.kn1, d.pos, T, g.n_head, g.n_kv, g.hd, g.n_rot, inv_dev[(size_t) di],
-                        g.eps, l.kc, l.vc, d.s);
+                        g.eps, l.kc, l.vc, d.s, 0, l.i8);
         const float one = 1.0f, zero = 0.0f;
         const int nq = g.ix_heads * g.ix_dim;
         CB(cublasSgemm(d.blas, CUBLAS_OP_T, CUBLAS_OP_N, nq, T, g.dim, &one, l.wiq, g.dim, d.xn, g.dim, &zero, d.iq, nq));
@@ -1360,7 +1366,7 @@ struct Model::Impl {
             }
         }
         k::sparse_attn(d.q, l.kc, l.vc, d.kept, d.pos, T, g.n_head, g.n_kv, g.topk, g.blk, 1.0f / std::sqrt((float) g.hd),
-                       d.att, d.s);
+                       d.att, d.s, l.i8);
         k::to_f16(d.att, T, g.n_head * g.hd, g.n_head * g.hd, d.att16, g.n_head * g.hd, d.s);
         x3::gemm_rows(l.o, d.att16, g.n_head * g.hd, T, d.h, g.dim, 1.0f, d.s);   // h += attn Wo
         // MLP

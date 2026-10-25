@@ -20,12 +20,19 @@ void rms(const float* x, const float* w1, int rows, int D, float eps, float* y, 
 /// The rotary's inverse frequencies theta^(-2i / n_rot), i < n_rot / 2 (host, F32 as transformers computes them).
 void rope_inv_freq(float theta, int n_rot, float* inv /*[n_rot / 2]*/);
 
+/// An INT8 K / V cache (--kv-cache int8): rows of 128 int8 (round(v / s)) and a scale s each (the row's max |v| / 127),
+/// [rows][Hkv][128] and [rows][Hkv]; all null: the BF16 caches.
+struct KvI8 {
+    int8_t *kc = nullptr, *vc = nullptr;
+    float *ks = nullptr, *vs = nullptr;
+};
+
 /// q [T][Hq][hd] in place: the per-head RMSNorm (one [hd] weight w1 = 1 + w for every head) then NeoX RoPE on the
 /// first n_rot dims at pos[t]; k [T][Hkv][hd] the same and v as it is, both written to the caches at row pos[t] as
 /// BF16.  inv [n_rot / 2] on the device.
 void qk_norm_rope(float* q, const float* k, const float* v, const float* qn1, const float* kn1, const int* pos, int T,
                   int Hq, int Hkv, int hd, int n_rot, const float* inv, float eps, uint16_t* kc, uint16_t* vc,
-                  cudaStream_t s, int ring = 0);
+                  cudaStream_t s, int ring = 0, const KvI8& i8 = KvI8{});
 /// (ring > 0: the caches are rings of that many rows, position p at row p % ring - the DSpark draft's window.  Hq 0:
 ///  K and V alone)
 
@@ -47,7 +54,7 @@ void select_blocks(const float* bs, const int* pos, int T, int Hi, int nblk, int
 /// out [T][Hq][hd] (F32): each query head over its KV group's kept blocks (kept [Hkv][T][topk], -1 unused), the keys
 /// j <= pos[t] of them, softmax(q . k * scale) . v - exact (online softmax in F32).  hd = 128, Hq / Hkv = 16.
 void sparse_attn(const float* q, const uint16_t* kc, const uint16_t* vc, const int* kept, const int* pos, int T,
-                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s);
+                 int Hq, int Hkv, int topk, int blk, float scale, float* out, cudaStream_t s, const KvI8& i8 = KvI8{});
 
 /// The router over logits [T][E] (F32): s = sigmoid, chosen by s + bias (the K largest, ties to the lower expert),
 /// weights s / sum over the chosen -> top [T][K], w [T][K].

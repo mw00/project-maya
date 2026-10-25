@@ -4081,7 +4081,7 @@ def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
         args += ["--profile", str(MM3_PROFILE)]
     kept = keep_args(old.get("args") or [], args, ("--chunk", "--staging", "--cpu-threads", "--reserve-gb",
                                                     "--resident-cap", "--dspark", "--dspark-conf", "--vision",
-                                                    "--vision-gpu", "--tp", "--cache-gb"))
+                                                    "--vision-gpu", "--tp", "--cache-gb", "--kv-cache"))
     # tensor parallel (maya-mm3 --tp): the GPUs in groups of 4 (or 2), the first alone when the others make whole
     # groups - each layer's work spread over a group's GPUs; on 3090 + 8 x 5060 Ti decode 27.7 -> 38 tok/s (code),
     # ~19 -> 32 (prose), prompts 35-70 -> ~100 tok/s

@@ -303,6 +303,7 @@ struct TpEngine::Impl {
         x3::Mat q, k, v, o, mg, mu, md, sg, su, sd;
         float *qn1 = nullptr, *kn1 = nullptr, *iqn1 = nullptr, *ikn1 = nullptr, *wiq = nullptr, *wik = nullptr;
         uint16_t *kc = nullptr, *vc = nullptr, *ic = nullptr;
+        k::KvI8 i8;   // (--kv-cache int8: the K / V caches instead of kc / vc)
         uint8_t* res_base = nullptr;
         float* gate = nullptr;   // (member 0: the router, F32 [n_exp][dim])
     };
@@ -776,9 +777,11 @@ struct TpEngine::Impl {
                         return false;
                 }
                 const size_t cache = (size_t) o.max_ctx * mkv * g.hd;
-                if (!dalloc(dv, S.kc, cache, err) || !dalloc(dv, S.vc, cache, err) ||
-                    !dalloc(dv, S.ic, (size_t) o.max_ctx * g.ix_dim, err))
+                if (o.kv_int8 ? !dalloc(dv, S.i8.kc, cache, err) || !dalloc(dv, S.i8.vc, cache, err) ||
+                                    !dalloc(dv, S.i8.ks, cache / g.hd, err) || !dalloc(dv, S.i8.vs, cache / g.hd, err)
+                              : !dalloc(dv, S.kc, cache, err) || !dalloc(dv, S.vc, cache, err))
                     return false;
+                if (!dalloc(dv, S.ic, (size_t) o.max_ctx * g.ix_dim, err)) return false;
             }
         }
         // the profile: routings [layer][expert]
@@ -1001,6 +1004,7 @@ struct TpEngine::Impl {
             info.push_back("CUDA" + std::to_string(m.id) + ": " + std::to_string(fr >> 20) + " MB free");
         }
         info.push_back("CPU lane: " + std::to_string(lane->threads()) + " threads");
+        if (o.kv_int8) info.push_back("KV cache: INT8 (a scale a row of 128)");
         st.load_s = now() - t0;
         return true;
     }
@@ -1168,7 +1172,7 @@ struct TpEngine::Impl {
             x3::gemm_rows(S.k, m.p_xn16, g.dim, T, m.p_k, mkv * g.hd, 0.0f, m.s);
             x3::gemm_rows(S.v, m.p_xn16, g.dim, T, m.p_v, mkv * g.hd, 0.0f, m.s);
             k::qk_norm_rope(m.p_q, m.p_k, m.p_v, S.qn1, S.kn1, m.p_pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps, S.kc,
-                            S.vc, m.s);
+                            S.vc, m.s, 0, S.i8);
             if (cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, mix * g.ix_dim, T, g.dim, &one, S.wiq, g.dim, m.p_xn,
                             g.dim, &zero, m.p_iq, mix * g.ix_dim) != CUBLAS_STATUS_SUCCESS ||
                 cublasSgemm(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, g.ix_dim, T, g.dim, &one, S.wik, g.dim, m.p_xn, g.dim,
@@ -1180,7 +1184,7 @@ struct TpEngine::Impl {
                                m.s);
             k::block_scores(m.p_iq, S.ic, m.p_pos, T, mix, nblk, g.blk, m.p_bs, m.s);
             k::select_blocks(m.p_bs, m.p_pos, T, mix, nblk, g.blk, g.topk, m.p_kept, m.s);
-            k::sparse_attn(m.p_q, S.kc, S.vc, m.p_kept, m.p_pos, T, mh, mkv, g.topk, g.blk, scale, m.p_att, m.s);
+            k::sparse_attn(m.p_q, S.kc, S.vc, m.p_kept, m.p_pos, T, mh, mkv, g.topk, g.blk, scale, m.p_att, m.s, S.i8);
             k::to_f16(m.p_att, T, mh * g.hd, mh * g.hd, m.p_att16, mh * g.hd, m.s);
             x3::gemm_rows(S.o, m.p_att16, mh * g.hd, T, m.p_out, g.dim, 0.0f, m.s);
             k::publish(m.p_out, part, (size_t) T * g.dim, m.counter, fo, ++vout, m.s);
@@ -1492,13 +1496,14 @@ struct TpEngine::Impl {
                 err = "tp: mv q/k/v";
                 return false;
             }
-            k::qk_norm_rope(m.q, m.k, m.v, S.qn1, S.kn1, m.pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps, S.kc, S.vc, m.s);
+            k::qk_norm_rope(m.q, m.k, m.v, S.qn1, S.kn1, m.pos, T, mh, mkv, g.hd, g.n_rot, m.inv, g.eps, S.kc, S.vc, m.s, 0,
+                            S.i8);
             k::rows_dot(S.wiq, mix * g.ix_dim, g.dim, m.xn, T, m.iq, m.s);
             k::rows_dot(S.wik, g.ix_dim, g.dim, m.xn, T, m.ik, m.s);
             k::index_norm_rope(m.iq, m.ik, S.iqn1, S.ikn1, m.pos, T, mix, g.ix_dim, g.n_rot, m.inv, g.eps, S.ic, m.s);
             k::block_scores(m.iq, S.ic, m.pos, T, mix, nblk, g.blk, m.bs, m.s);
             k::select_blocks(m.bs, m.pos, T, mix, nblk, g.blk, g.topk, m.kept, m.s);
-            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s);
+            k::sparse_attn(m.q, S.kc, S.vc, m.kept, m.pos, T, mh, mkv, g.topk, g.blk, scale, m.att, m.s, S.i8);
             const x3::MvJob oj = job(S.o, m.att, mh * g.hd, m.out, g.dim);
             if (!x3::mv(&oj, 1, m.s)) {
                 err = "tp: mv o";

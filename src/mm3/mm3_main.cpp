@@ -589,7 +589,7 @@ int usage() {
                  "usage: maya-mm3 --pack DIR --ids IDS|@FILE [--gen N] [--dump-logits FILE --last N] [--gpus LIST]\n"
                  "                [--max-context N] [--chunk N] [--staging N] [--resident-cap N] [--reserve-gb X]\n"
                  "                [--vision on|off] [--vision-gpu I] [--images FILE] [--layer-split auto|L,L,...]\n"
-                 "                [--verbose]\n"
+                 "                [--tp 1|2|4] [--cache-gb X] [--kv-cache bf16|int8] [--verbose]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
@@ -635,6 +635,11 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = val() != "off";
         else if (a == "--tp") o.tp = std::atoi(val().c_str());
         else if (a == "--cache-gb") o.cache_gb = std::atof(val().c_str());
+        else if (a == "--kv-cache") {
+            const std::string v = val();
+            if (v != "int8" && v != "bf16") return usage();
+            o.kv_int8 = v == "int8";
+        }
         else if (a == "--layer-split") {   // (serve/server.py's: "auto", or the first layer of each later GPU's share)
             const std::string v = val();
             o.layer_split = v == "auto" ? std::vector<int>{} : parse_list(v);
