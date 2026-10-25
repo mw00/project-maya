@@ -3113,6 +3113,29 @@ struct Model::Impl {
                 G.hred = std::make_shared<HostReducer>(G.arb, ids, G.arb.stride, ht != nullptr ? std::max(1, std::atoi(ht)) : 32);
                 if (!G.hred->ok()) G.hred.reset();   // (the sums by the copy engines then)
             }
+            if (chunk > 0 && G.arb.nm == 2 && ar2() > 0) {   // DS4_AR2: ar2_kernel's progress words (zeroed)
+                if (!hmap(G.arb.pflags, (size_t) G.arb.nm * G.arb.slots * kAr2Blocks * 16, err)) return false;
+                G.arb.ar2 = ar2();
+            }
+        }
+        if (ar2() < 0) {
+            err = "DS4_AR2 takes 0, 1 or 2";
+            return false;
+        }
+        if (ar2() > 0) {
+            std::string on;
+            for (const Group& G : groups)
+                if (G.arb.ar2 > 0)
+                    for (int m : G.mem) on += (on.empty() ? "CUDA" : ", CUDA") + std::to_string(devs[(size_t) m].id);
+            if (on.empty())
+                std::fprintf(stderr, "ds4: DS4_AR2=%d: no group of two takes prompt chunks - not used\n", ar2());
+            else
+                std::fprintf(stderr,
+                             "ds4: DS4_AR2=%d: the prompt chunks' all-reduces on %s pipelined (%d blocks, %d KB "
+                             "pieces), the other member's rows read 16 bytes a lane%s\n",
+                             ar2(), on.c_str(), kAr2Blocks, kAr2Piece * 16 >> 10,
+                             ar2() == 2 ? "; FP16 on the wire (both partials rounded, summed in F32 in member order)"
+                                        : "; the sums bit for bit");
         }
         if (g.n_mtp > 0) {
             if (!halloc(h_taps, (size_t) tap_cap * g.d_targets.size() * g.dim, err)) return false;
@@ -11725,6 +11748,19 @@ struct Model::Impl {
     }
 
 
+    // DS4_AR2=1 / 2 (0 / unset: off): a group of two's chunk all-reduces - the attention output's and the MoE's - in
+    // ar2_kernel: the put and the sums pipelined in pieces, the other member's rows read 16 bytes a lane.  1:
+    // ar_sum_kernel's sums bit for bit; 2: FP16 on the wire (both partials rounded, summed in F32 in member order).
+    // Decode's all-reduces (G.ar) never take it.  Another value: the load refuses (-1)
+    static int ar2() {
+        static const int v = [] {
+            const char* e = ds4_env("DS4_AR2");
+            if (e == nullptr || *e == 0) return 0;
+            const int x = std::atoi(e);
+            return (x >= 0 && x <= 2 && std::strspn(e, "0123456789") == std::strlen(e)) ? x : -1;
+        }();
+        return v;
+    }
     // a chunk's sum over its group: three members or more through the copy engines (allreduce_dma, c.y its scratch:
     // free between the MoE's sets), or (Group::hred) summed on the host; unless DS4_AR_DMA=0
     void chunk_allreduce(Dev& d, Chunk& c, const ArGroup& ab, int mi, int n, cudaStream_t s) {

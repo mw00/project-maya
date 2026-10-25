@@ -5,7 +5,8 @@
 // lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q4_K; their decode equal to ggml's dequantize_row_* on
 // random blocks); the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
-// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone)
+// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ar <device> <device> [rows]
+// (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
@@ -2139,6 +2140,120 @@ void test_q5k_host() {
     std::printf("%-52s %s\n", "Q5_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
 }
 
+// ---------------------------------------------------------------- a group of two's chunk all-reduce (ds4_kernels.cu)
+// Two GPUs, a thread and a stream each, the rows and flags host-mapped as maya-ds4's hmap leaves them (mapped,
+// portable, zeroed).  allreduce as before (xfer_put + ar_sum_kernel) and DS4_AR2 1 / 2 (ar2_kernel), interleaved on one
+// seq count, five rounds each (both slots, each written again), at up to 2048 rows x 5120, 37 rows and one (fewer
+// blocks, short pieces), a few values past FP16's range.  0 and 1 must give the host's p0 + p1 bit for bit on both
+// members, 2 the host's fp16(sat(p0)) + fp16(sat(p1)) in F32 on both.  Then each one's time at rows x 5120 (30720: a
+// 32K prompt's chunk): the slower member's, and GB/s a member each way
+void test_ar2(int da, int db, int rows) {
+    namespace sd = strata::ds4;
+    const int D = 5120, devs[2] = {da, db};
+    const size_t nmax = (size_t) rows * D;
+    auto hm = [](size_t bytes) {
+        void* v = nullptr;
+        CU(cudaHostAlloc(&v, bytes + 64, cudaHostAllocMapped | cudaHostAllocPortable));
+        std::memset(v, 0, bytes + 64);
+        return v;
+    };
+    sd::ArGroup a;
+    a.nm = 2;
+    a.slots = 2;
+    a.stride = nmax;
+    a.data = (float*) hm(2 * 2 * nmax * 4);
+    a.flags = (unsigned*) hm(2 * 2 * 32 * 4);
+    a.pflags = (unsigned*) hm((size_t) 2 * 2 * sd::kAr2Blocks * 16 * 4);
+    float* x[2];
+    unsigned* cnt[2];
+    cudaStream_t st[2];
+    for (int m = 0; m < 2; ++m) {
+        CU(cudaSetDevice(devs[m]));
+        CU(cudaMalloc(&x[m], nmax * 4));
+        CU(cudaMalloc(&cnt[m], 4));
+        CU(cudaMemset(cnt[m], 0, 4));
+        CU(cudaStreamCreate(&st[m]));
+    }
+    unsigned seq = 0;
+    // one all-reduce of p[0] / p[1] (n values each) in mode md on both members at once: out[m] member m's result,
+    // ms[m] its time from the launch
+    auto run = [&](int md, size_t n, const std::vector<float>* p, std::vector<float>* out, double* ms) {
+        sd::ArGroup g = a;
+        g.ar2 = md;
+        const unsigned sq = ++seq;
+        std::thread th[2];
+        for (int m = 0; m < 2; ++m)
+            th[m] = std::thread([&, m] {
+                CU(cudaSetDevice(devs[m]));
+                CU(cudaMemcpyAsync(x[m], p[m].data(), n * 4, cudaMemcpyHostToDevice, st[m]));
+                CU(cudaStreamSynchronize(st[m]));
+                const auto t0 = std::chrono::steady_clock::now();
+                sd::allreduce(x[m], (int) n, g, m, sq, cnt[m], st[m]);
+                CU(cudaStreamSynchronize(st[m]));
+                if (ms != nullptr)
+                    ms[m] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (out != nullptr) {
+                    out[m].resize(n);
+                    CU(cudaMemcpy(out[m].data(), x[m], n * 4, cudaMemcpyDeviceToHost));
+                }
+            });
+        for (auto& t : th) t.join();
+    };
+    auto f16 = [](float v) { return __half2float(__float2half_rn(std::fmin(std::fmax(v, -65504.0f), 65504.0f))); };
+    auto same = [](float a, float b) { return std::memcmp(&a, &b, 4) == 0; };
+    const char* name[3] = {"xfer_put + ar_sum_kernel", "DS4_AR2=1 (F32)", "DS4_AR2=2 (FP16 wire)"};
+    int bad[3] = {0, 0, 0};
+    for (size_t n : {(size_t) std::min(rows, 2048) * D, (size_t) 37 * D, (size_t) D})
+        for (int round = 0; round < 5; ++round)
+            for (int md = 0; md < 3; ++md) {
+                std::vector<float> p[2], out[2];
+                for (auto& v : p) {
+                    v.resize(n);
+                    for (float& e : v) e = frand(4.0f);
+                }
+                p[0][n / 3] = 1.0e5f;
+                p[1][n / 2] = -2.0e5f;
+                run(md, n, p, out, nullptr);
+                for (size_t i = 0; i < n; ++i) {
+                    const float want = md == 2 ? f16(p[0][i]) + f16(p[1][i]) : p[0][i] + p[1][i];
+                    if (!same(out[0][i], want) || !same(out[1][i], want)) {
+                        ++bad[md];
+                        break;
+                    }
+                }
+            }
+    for (int md = 0; md < 3; ++md) {
+        char t[96];
+        std::snprintf(t, sizeof t, "all-reduce of two, %s", name[md]);
+        if (bad[md] != 0) ++g_fail;
+        std::printf("%-56s %s\n", t, bad[md] == 0 ? "ok" : "FAIL");
+    }
+    std::vector<float> p[2];
+    for (auto& v : p) {
+        v.resize(nmax);
+        for (float& e : v) e = frand(4.0f);
+    }
+    for (int md = 0; md < 3; ++md) {
+        double best = 1e30, ms[2];
+        for (int r = 0; r < 4; ++r) {
+            run(md, nmax, p, nullptr, ms);
+            best = std::min(best, std::max(ms[0], ms[1]));
+        }
+        const double gb = (double) nmax * (md == 2 ? 2 : 4) / 1e9;
+        std::printf("all-reduce of two, %-26s %d x %d: %8.1f ms, %5.2f GB/s a member each way\n", name[md], rows, D,
+                    best, gb / (best / 1e3));
+    }
+    for (int m = 0; m < 2; ++m) {
+        CU(cudaSetDevice(devs[m]));
+        CU(cudaStreamDestroy(st[m]));
+        CU(cudaFree(x[m]));
+        CU(cudaFree(cnt[m]));
+    }
+    CU(cudaFreeHost(a.data));
+    CU(cudaFreeHost(a.flags));
+    CU(cudaFreeHost(a.pflags));
+}
+
 int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreate(&s));
@@ -2193,6 +2308,11 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::strcmp(argv[1], "--lane") == 0) {   // the PCIe lane's streamed experts alone
         test_lanes(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 4 && std::strcmp(argv[1], "--ar") == 0) {   // <device> <device> [rows]: a group of two's all-reduce
+        test_ar2(std::atoi(argv[2]), std::atoi(argv[3]), argc >= 5 ? std::atoi(argv[4]) : 30720);
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }

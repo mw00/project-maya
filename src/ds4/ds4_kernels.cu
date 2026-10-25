@@ -104,6 +104,29 @@ __device__ __forceinline__ unsigned char ld_fresh_byte(const unsigned char* p) {
 #endif
 }
 
+// ld_fresh in one 16- or 8-byte load a lane (HIP: a volatile vector load - the same cache bypass as ld_fresh's 32-bit
+// loads, which cut a lane's float4 into four reads over PCIe)
+#if defined(STRATA_USE_HIP)
+typedef unsigned int u32x4_v __attribute__((ext_vector_type(4)));
+typedef unsigned int u32x2_v __attribute__((ext_vector_type(2)));
+#endif
+__device__ __forceinline__ float4 ld_fresh_v(const float4* p) {
+#if defined(STRATA_USE_HIP)
+    const u32x4_v v = *(const volatile u32x4_v*) p;
+    return make_float4(__uint_as_float(v.x), __uint_as_float(v.y), __uint_as_float(v.z), __uint_as_float(v.w));
+#else
+    return __ldcv(p);
+#endif
+}
+__device__ __forceinline__ uint2 ld_fresh_v(const uint2* p) {
+#if defined(STRATA_USE_HIP)
+    const u32x2_v v = *(const volatile u32x2_v*) p;
+    return make_uint2(v.x, v.y);
+#else
+    return __ldcv(p);
+#endif
+}
+
 __device__ __forceinline__ float fp8_rt(float v) { return e4m3_round(v); }   // E4M3, nearest even (input clamped)
 
 __device__ __forceinline__ float e2m1_rt(float v) {   // E2M1 magnitudes 0 .5 1 1.5 2 3 4 6, nearest, ties to even
@@ -2997,6 +3020,53 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
+// two members (DS4_AR2, a chunk's all-reduces): the put and the sums pipelined.  Each block cuts its contiguous range
+// of the row in pieces of kAr2Piece float4s, puts piece k out, flags it (its progress word: seq << 12 | k + 1, after a
+// system fence) and then sums piece k - 1 - so a member's link carries its rows out while it reads the other's in,
+// where xfer_put sent the whole row out before ar_sum_kernel read any in.  The other's rows come in 16 bytes a lane
+// (ld_fresh_v).  The sums are ar_sum_kernel's: member 0's partial plus member 1's (__fadd_rn), bit for bit.  F16
+// (DS4_AR2=2): both partials rounded to FP16 (saturating) on the wire - this member's own too - and summed in F32 in
+// member order, so both members' copies stay the same; half the bytes.  A slot is written again two seqs on, after the
+// other member read it: its kernel for that seq ended before it put the next one, which this member's next waited for
+// (allreduce's argument).  np < 4096 (n4 < 2^31 over 64 blocks of kAr2Piece), so progress words never reach the next
+// seq
+template <bool F16>
+__global__ void __launch_bounds__(kThreads) ar2_kernel(float* x, int n4, float* rows, size_t stride, unsigned* pflags,
+                                                      int mi, int slot, int slots, unsigned seq) {
+    float4* x4 = (float4*) x;
+    const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
+    const int lo = min(n4, (int) blockIdx.x * per), hi = min(n4, lo + per);
+    const int np = (hi - lo + kAr2Piece - 1) / kAr2Piece;
+    auto flag = [&](int m) { return pflags + (((size_t) m * slots + slot) * kAr2Blocks + blockIdx.x) * 16; };
+    float* mine = rows + ((size_t) mi * slots + slot) * stride;
+    const float* other = rows + ((size_t) (1 - mi) * slots + slot) * stride;
+    const unsigned base = seq << 12;
+    for (int k = 0; k <= np; ++k) {
+        if (k < np) {   // put piece k
+            const int q1 = min(hi, lo + (k + 1) * kAr2Piece);
+            for (int q = lo + k * kAr2Piece + (int) threadIdx.x; q < q1; q += blockDim.x) {
+                if (F16) ((uint2*) mine)[q] = to_h4(sat4(x4[q]));
+                else ((float4*) mine)[q] = x4[q];
+            }
+            __threadfence_system();
+            __syncthreads();
+            if (threadIdx.x == 0) *(volatile unsigned*) flag(mi) = base + (unsigned) k + 1u;
+        }
+        if (k > 0) {   // sum piece k - 1, once the other member flagged it
+            if (threadIdx.x == 0) wait_at_least(flag(1 - mi), base + (unsigned) k);
+            __syncthreads();
+            const int q1 = min(hi, lo + k * kAr2Piece);
+            for (int q = lo + (k - 1) * kAr2Piece + (int) threadIdx.x; q < q1; q += blockDim.x) {
+                const float4 a = F16 ? from_h4(to_h4(sat4(x4[q]))) : x4[q];
+                const float4 b =
+                    F16 ? from_h4(ld_fresh_v((const uint2*) other + q)) : ld_fresh_v((const float4*) other + q);
+                const float4 p = mi == 0 ? a : b, r = mi == 0 ? b : a;
+                x4[q] = make_float4(__fadd_rn(p.x, r.x), __fadd_rn(p.y, r.y), __fadd_rn(p.z, r.z), __fadd_rn(p.w, r.w));
+            }
+        }
+    }
+}
+
 // a thread a (token, value): every stream's value read before any is written
 __global__ void hc_post_inplace_kernel(const float* __restrict__ y, float* h, const float* __restrict__ post,
                                        const float* __restrict__ comb, int dim, int hc) {
@@ -3888,6 +3958,15 @@ void tab_set(const unsigned long long* pairs, int n, cudaStream_t s) {
 }
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
+    if (a.nm == 2 && a.ar2 > 0 && a.pflags != nullptr) {   // (DS4_AR2: the put and the sums in one pipelined launch)
+        const int n4 = n / 4;
+        const int blocks = std::max(1, std::min(kAr2Blocks, cdiv(n4, kThreads)));
+        if (a.ar2 == 2)
+            ar2_kernel<true><<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.pflags, mi, slot, a.slots, seq);
+        else
+            ar2_kernel<false><<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.pflags, mi, slot, a.slots, seq);
+        return;
+    }
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
         static const bool f16 = [] {
             const char* e = std::getenv("DS4_AR_F16");
