@@ -1568,6 +1568,34 @@ function onTool(m, x) {
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
+// an answer's new HTML into its bubble with the fewest DOM changes (it repaints up to every frame while it streams):
+// a block that is the same stays as it is - no flash, a selection and a code block's wrap kept - and the code block
+// still being written keeps its frame, buttons and scroll box, its code alone replaced
+function patchHtml(el, html) {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const next = [...tpl.content.childNodes], cur = [...el.childNodes];
+  next.forEach((b, i) => {
+    const a = cur[i];
+    if (!a) el.appendChild(b);
+    else if (a.nodeType === 3 && b.nodeType === 3) { if (a.data !== b.data) a.data = b.data; }
+    else if (a.nodeType === 1 && b.nodeType === 1 && a.isEqualNode(b)) { /* the same */ }
+    else if (a.nodeType === 1 && b.nodeType === 1 && a.matches(".st-code") && b.matches(".st-code") &&
+             a.dataset.lang === b.dataset.lang) patchCode(a, b);
+    else el.replaceChild(b, a);
+  });
+  for (let i = cur.length - 1; i >= next.length; i--) cur[i].remove();
+}
+// a code block that grew: the new code into the block, which stays scrolled to its end while it is written (unless its
+// reader scrolled it up); the buttons swapped only when their set changes (Preview, once the block is complete)
+function patchCode(a, b) {
+  const pre = a.querySelector("pre"), code = a.querySelector("code"), nc = b.querySelector("code");
+  const atEnd = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+  if (code.innerHTML !== nc.innerHTML) code.innerHTML = nc.innerHTML;
+  if (atEnd) pre.scrollTop = pre.scrollHeight;
+  const ah = a.querySelector(".st-code__actions"), bh = b.querySelector(".st-code__actions");
+  if (ah && bh && ah.children.length !== bh.children.length) ah.replaceWith(bh);
+}
 function updateAssistant(el, m, streaming) {
   const det = el.querySelector("details.think");
   if (m.reasoning) {
@@ -1589,7 +1617,7 @@ function updateAssistant(el, m, streaming) {
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
-    bubble.innerHTML = answerHtml(m, streaming);
+    patchHtml(bubble, answerHtml(m, streaming));
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
@@ -1606,9 +1634,23 @@ function renderChat() {
   updateCtxMeter();
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; updateJump(); }
+// the chat follows a streaming answer down until its reader scrolls up - by any amount: a wheel notch (~100 px) stayed
+// within nearBottom, and the next repaint pulled it back down - and again once they are back at the bottom
+let follow = true, lastTop = 0;
+function scrollDown(force) {
+  const s = $("chat-scroll");
+  if (force) follow = true;
+  if (follow) { s.scrollTop = s.scrollHeight; lastTop = s.scrollTop; }
+  updateJump();
+}
 function updateJump() { $("jump-latest").hidden = nearBottom() || !messages.length; }
-$("chat-scroll").addEventListener("scroll", updateJump, {passive: true});
+$("chat-scroll").addEventListener("scroll", () => {
+  const s = $("chat-scroll");
+  if (s.scrollTop < lastTop - 2) follow = false;
+  if (s.scrollHeight - s.scrollTop - s.clientHeight < 32) follow = true;   // (a shrink clamps it to the bottom too)
+  lastTop = s.scrollTop;
+  updateJump();
+}, {passive: true});
 $("jump-latest").onclick = () => scrollDown(true);
 
 $("chat").addEventListener("click", (e) => {
