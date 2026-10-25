@@ -666,6 +666,18 @@ void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s) {
     check("wait_flag");
 }
 
+__global__ void pull_kernel(float4* dst, const float4* src, size_t n4) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x)
+        dst[i] = src[i];
+}
+
+void pull(float* dst, const float* src, size_t n, cudaStream_t s) {
+    const size_t n4 = n / 4;
+    const int blocks = (int) std::max<size_t>(1, std::min<size_t>(48, (n4 + 255) / 256));
+    pull_kernel<<<blocks, 256, 0, s>>>((float4*) dst, (const float4*) src, n4);
+    check("pull");
+}
+
 __global__ void publish_kernel(const float4* src, float4* dst, size_t n4, unsigned* counter, unsigned* flag,
                                unsigned v) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += (size_t) gridDim.x * blockDim.x)

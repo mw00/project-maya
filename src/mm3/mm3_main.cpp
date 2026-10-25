@@ -45,6 +45,8 @@
 
 #include <unistd.h>
 
+#include <cuda_profiler_api.h>
+
 #include "mm3_model.hpp"
 #include "mm3_pack.hpp"
 #include "mm3_vision.hpp"
@@ -862,6 +864,10 @@ int main(int argc, char** argv) {
         while ((int) out.size() < gen) {
             out.push_back(next);
             if (next == m.eos()) break;
+            if (const char* ns = std::getenv("MM3_NSYS")) {   // (profiling: rounds 20 .. 20 + N under nsys's capture)
+                if (rounds == 20) cudaProfilerStart();
+                if (rounds == 20 + std::atoi(ns)) cudaProfilerStop();
+            }
             const double td = now();
             int k = 0;
             if (!m.draft(next, pos, B, drafts, conf, err)) {

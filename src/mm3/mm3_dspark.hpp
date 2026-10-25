@@ -45,6 +45,10 @@ public:
     const DraftGeo& geo() const;
     /// The context of positions pos0 .. pos0 + T - 1 from the taps (device, on dev: [T][taps x dim] F32).
     bool context(const float* taps, int T, int pos0, std::string& err);
+    /// The same in steps, T <= max_rows: tap j's rows (device [T][dim] F32) into the context - the taps in order, 0
+    /// first - then the rest; on the draft's stream (a forward's taps can go in as its layers pass them).
+    bool context_tap(int j, const float* rows, int T, std::string& err);
+    bool context_finish(int T, int pos0, std::string& err);
     /// Proposes n (<= block) tokens after `anchor` at position pos (the context holds pos - 1 and before): drafts
     /// and their confidences (host).  logits (if given): each position's biased logits [n][vocab] (host), the
     /// distribution the drafts were taken from.

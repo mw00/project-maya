@@ -332,8 +332,10 @@ struct TpEngine::Impl {
     std::unique_ptr<CpuLane> lane;
     std::unique_ptr<Draft> draftm;
     std::vector<int> tap_of;
-    std::vector<float> taps_h;
+    float* taps_h = nullptr;            // (pinned: a window's taps as its layers pass them)
     float* taps_d = nullptr;
+    unsigned* ftap = nullptr;           // (mapped) the host's counter of taps written: the draft's steps wait on it
+    unsigned seq_tap = 0;
     std::unique_ptr<Vision> vis;
     std::vector<Model::Image> imgs;
     std::atomic<bool> abort_{false};
@@ -383,6 +385,7 @@ struct TpEngine::Impl {
 
     // (an error: every counter far ahead, so no device waits for the host for good)
     void release_all() {
+        if (ftap) *(volatile unsigned*) ftap = seq_tap + 0x40000000u;
         for (Group& gr : G)
             if (gr.fin) *(volatile unsigned*) gr.fin = gr.seq_in + 0x40000000u;
         if (fhead) *(volatile unsigned*) fhead = seq_head + 0x40000000u;
@@ -540,6 +543,8 @@ struct TpEngine::Impl {
             if (o.dspark) {
                 draftm = std::make_unique<Draft>();
                 const Tensor* et = pk.get(P + "embed_tokens.weight");
+                // (on the head member's own stream: a device's work that waits on the host goes on one stream, in
+                //  order - the draft's context steps on a second stream, parked behind a wait, held up the first)
                 if (!draftm->load(pk, hm.id, hm.s, hm.blas, &head, (const uint16_t*) pk.data(*et), kWin, err))
                     return false;
                 const auto& tl = draftm->geo().taps;
@@ -550,8 +555,18 @@ struct TpEngine::Impl {
                     }
                     tap_of[(size_t) tl[j]] = (int) j;
                 }
-                if (!dalloc(hm.id, taps_d, tl.size() * (size_t) kWin * g.dim, err)) return false;
-                taps_h.assign(tl.size() * (size_t) kWin * g.dim, 0.0f);
+                if (!dalloc(hm.id, taps_d, tl.size() * (size_t) kWin * g.dim, err) ||
+                    !halloc(taps_h, tl.size() * (size_t) kWin * g.dim, cudaHostAllocMapped | cudaHostAllocPortable, err) ||
+                    !halloc(ftap, kLine, cudaHostAllocMapped | cudaHostAllocPortable, err))
+                    return false;
+                // (every window size once now: cuBLAS takes its workspace and picks its kernels here, not during a
+                //  forward - the devices then wait on the host, which must not wait on them)
+                TK(cudaMemset(taps_d, 0, tl.size() * (size_t) kWin * g.dim * 4));
+                for (int t = 1; t <= kWin; ++t) {
+                    for (size_t j = 0; j < tl.size(); ++j)
+                        if (!draftm->context_tap((int) j, taps_d + j * kWin * g.dim, t, err)) return false;
+                    if (!draftm->context_finish(t, 0, err)) return false;
+                }
                 info.push_back("DSpark draft: " + std::to_string(draftm->bytes() >> 20) + " MB on CUDA" +
                                std::to_string(hm.id));
             }
@@ -1164,6 +1179,21 @@ struct TpEngine::Impl {
         return true;
     }
 
+    // the draft's context steps for a window, on the head member's stream after its layers: tap j once the host has
+    // written it (ftap)
+    bool enqueue_taps(int T, unsigned v0, std::string& err) {
+        Member& m = M[(size_t) head_m];
+        TK(cudaSetDevice(m.id));
+        const int nt = (int) draftm->geo().taps.size();
+        for (int j = 0; j < nt; ++j) {
+            float* ds = taps_d + (size_t) j * kWin * g.dim;
+            k::wait_flag(ftap, v0 + (unsigned) j + 1, m.s);
+            k::pull(ds, taps_h + (size_t) j * kWin * g.dim, (size_t) T * g.dim, m.s);   // (not a copy: see pull)
+            if (!draftm->context_tap(j, ds, T, err)) return false;
+        }
+        return true;
+    }
+
     // the head on its member: the host's normed rows -> logits (pinned host), head_ev after them
     bool enqueue_head(int rows, unsigned v, std::string& err) {
         Member& m = M[(size_t) head_m];
@@ -1303,6 +1333,11 @@ struct TpEngine::Impl {
         }
     }
 
+    const bool trace = std::getenv("MM3_TP_TRACE") != nullptr;
+    void tr(const char* what, int a = -1) {
+        if (trace) std::fprintf(stderr, "[tp %.3f] %s %d\n", now(), what, a);
+    }
+
     bool window(const int* ids, int T, int pos0, int r0, int r1, float* logits, std::string& err) {
         const int nblk = (pos0 + T - 1) / g.blk + 1;
         const double tw0 = now();
@@ -1346,12 +1381,17 @@ struct TpEngine::Impl {
                 const bool head = want_head && G[gi].mem[j] == head_m;
                 const unsigned hv = seq_head + 1;
                 const int rows = r1 - r0;
-                m.w->submit([this, gi, j, T, nblk, in0, out0, rout0, head, hv, rows, &m] {
+                const bool taps = draftm && G[gi].mem[j] == head_m;
+                const unsigned tv = seq_tap;
+                m.w->submit([this, gi, j, T, nblk, in0, out0, rout0, head, hv, rows, taps, tv, &m] {
                     std::string e;
-                    if (!enqueue((int) gi, (int) j, T, nblk, in0, out0, rout0, e) || (head && !enqueue_head(rows, hv, e))) {
+                    tr("worker start", (int) G[gi].mem[j]);
+                    if (!enqueue((int) gi, (int) j, T, nblk, in0, out0, rout0, e) || (taps && !enqueue_taps(T, tv, e)) ||
+                        (head && !enqueue_head(rows, hv, e))) {
                         m.err = e;
                         abort_.store(true);
                     }
+                    tr("worker done", (int) G[gi].mem[j]);
                 });
             }
         bool head_alone = want_head;   // (the head's member in no group: enqueue it apart)
@@ -1374,6 +1414,7 @@ struct TpEngine::Impl {
         for (int li = 0; li < g.n_layers && ok; ++li) {
             Layer& l = L[(size_t) li];
             Group& gr = G[(size_t) l.group];
+            tr("layer", li);
             norm(h.data(), l.in1.data(), T, gr.xa);
             lap(tp_norm);
             publish_in(gr);
@@ -1504,14 +1545,21 @@ struct TpEngine::Impl {
             lap(tp_wait);
             add_parts(gr, T, extra);
             lap(tp_sum);
-            if (draftm && tap_of[(size_t) li] >= 0)
-                std::memcpy(taps_h.data() + (size_t) tap_of[(size_t) li] * kWin * g.dim, h.data(),
-                            (size_t) T * g.dim * 4);
+            if (draftm && tap_of[(size_t) li] >= 0) {   // (the draft's context takes the tap now: its steps wait on ftap)
+                const int j = tap_of[(size_t) li];
+                std::memcpy(taps_h + (size_t) j * kWin * g.dim, h.data(), (size_t) T * g.dim * 4);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                *(volatile unsigned*) ftap = ++seq_tap;
+            }
         }
         if (ok && want_head) {
             rms_rows(h.data() + (size_t) r0 * g.dim, norm1.data(), r1 - r0, g.dim, g.eps, xf);
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile unsigned*) fhead = ++seq_head;
+        }
+        if (!ok || abort_.load()) {   // (the devices released first: a worker may be waiting on them)
+            abort_.store(true);
+            release_all();
         }
         for (Member& m : M) m.w->wait();
         if (!ok || abort_.load()) {
@@ -1538,15 +1586,7 @@ struct TpEngine::Impl {
         }
         for (Group& gr : G)
             if (!issue(gr, err)) return false;
-        if (draftm) {
-            Member& hm = M[(size_t) head_m];
-            TK(cudaSetDevice(hm.id));
-            const int nt = (int) draftm->geo().taps.size();
-            for (int j = 0; j < nt; ++j)
-                TK(cudaMemcpyAsync(taps_d + (size_t) j * T * g.dim, taps_h.data() + (size_t) j * kWin * g.dim,
-                                   (size_t) T * g.dim * 4, cudaMemcpyHostToDevice, hm.s));
-            if (!draftm->context(taps_d, T, pos0, err)) return false;
-        }
+        if (draftm && !draftm->context_finish(T, pos0, err)) return false;
         lap(tp_draft);
         return true;
     }

@@ -71,6 +71,9 @@ void moe_combine(const float* res, const float* y, const int* inv, const float* 
 void add(float* x, const float* a, size_t n, cudaStream_t s);
 /// (the tensor-parallel path) one thread spins until *flag (mapped host memory, a counter) reaches v, wrap-safe.
 void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s);
+/// (the tensor-parallel path) n floats (a multiple of 4) from src (mapped host memory) into dst (device) by a kernel - no
+/// copy engine: a copy waiting behind a wait_flag on one stream holds up the device's host -> device copies of the others
+void pull(float* dst, const float* src, size_t n, cudaStream_t s);
 /// (the tensor-parallel path) n floats (a multiple of 4) from src (device) to dst (mapped host memory), then *flag = v
 /// once every block's writes are the system's: each block fences, the last to count (counter: a device word, 0
 /// between calls - it is left 0) raises the flag.

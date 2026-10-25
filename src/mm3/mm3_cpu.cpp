@@ -13,6 +13,8 @@
 #include <condition_variable>
 #include <functional>
 #include <mutex>
+#include <chrono>
+#include <cstdlib>
 #include <thread>
 
 #include <immintrin.h>
@@ -43,6 +45,10 @@ struct CpuLane::Impl {
     // scratch, for up to 8 experts
     static constexpr int kMaxE = 8;
     int max_entries = 64;
+    // (MM3_LANE_PROF: run_multi's time by phase, printed at the end)
+    const bool prof = std::getenv("MM3_LANE_PROF") != nullptr;
+    double ph[6] = {0, 0, 0, 0, 0, 0};
+    long calls = 0, subs = 0;
     int GQ, GB, DQ, DB, EB, FB;   // gate / up K jobs and bands, down K jobs and bands, x blocks, h blocks
     std::vector<float> xh, xsb, acc, xhd, xsd, accd, yd;
     std::vector<float> mxh, mxsb, macc, mxhd, mxsd, maccd, myd;   // (run_multi's, by entry: allocated on first use)
@@ -129,6 +135,11 @@ CpuLane::CpuLane(int threads, int dim, int ff, float alpha, float limit, int max
 }
 
 CpuLane::~CpuLane() {
+    if (p->prof && p->calls)
+        std::fprintf(stderr, "cpu lane run_multi: %ld calls, %.1f experts a call; us a call: setup %.1f gate/up %.1f "
+                     "bands %.1f down %.1f down bands %.1f sums %.1f\n", p->calls, (double) p->subs / p->calls,
+                     1e6 * p->ph[0] / p->calls, 1e6 * p->ph[1] / p->calls, 1e6 * p->ph[2] / p->calls,
+                     1e6 * p->ph[3] / p->calls, 1e6 * p->ph[4] / p->calls, 1e6 * p->ph[5] / p->calls);
     p->stop = true;
     p->cv.notify_all();
     for (auto& t : p->th) t.join();
@@ -269,6 +280,19 @@ void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std:
     auto accd = [&](int j, int q) { return I.maccd.data() + ((size_t) j * I.DQ + q) * dim; };
     auto yd = [&](int j) { return I.myd.data() + (size_t) j * dim; };
     const int C = (int) ch.size();
+    using clk = std::chrono::steady_clock;
+    auto tq = clk::now();
+    auto lap = [&](int i) {
+        if (!I.prof) return;
+        const auto t2 = clk::now();
+        I.ph[i] += std::chrono::duration<double>(t2 - tq).count();
+        tq = t2;
+    };
+    if (I.prof) {
+        ++I.calls;
+        I.subs += (long) ex.size();
+    }
+    lap(0);
     const std::function<void(int)> fa = [&](int jb) {
         const Chunk& c = ch[(size_t) (jb / (2 * I.GQ))];
         const int r = (jb / I.GQ) % 2, q = jb % I.GQ;
@@ -287,6 +311,7 @@ void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std:
         else kc::exl3_cpu_rows_acc_n(m, xp, c.n, q * 16, (q + 1) * 16, ap);
     };
     I.parallel(C * 2 * I.GQ, fa);
+    lap(1);
     const std::function<void(int)> fb = [&](int jb) {
         const Chunk& c = ch[(size_t) (jb / I.GB)];
         const int b = jb % I.GB;
@@ -313,47 +338,55 @@ void CpuLane::run_multi(const std::vector<CpuExpert>& ex, const std::vector<std:
         }
     };
     I.parallel(C * I.GB, fb);
+    lap(2);
+    // (down's jobs also by a quarter of its outputs: a slice's job alone left half the threads idle for one expert)
+    constexpr int kDP = 4;
+    const int dcols = dim / kDP;
     const std::function<void(int)> fc = [&](int jb) {
-        const Chunk& c = ch[(size_t) (jb / I.DQ)];
-        const int q = jb % I.DQ;
+        const Chunk& c = ch[(size_t) (jb / (I.DQ * kDP))];
+        const int q = (jb / kDP) % I.DQ, p = jb % kDP;
         const float* xp[kc::kExl3CpuMaxN];
         float* ap[kc::kExl3CpuMaxN];
         for (int i = 0; i < c.n; ++i) {
             xp[i] = xhd(c.j0 + i);
             ap[i] = accd(c.j0 + i, q);
         }
-        if (c.n == 1) kc::exl3_cpu_rows_acc(ex[(size_t) c.e].p[2], xp[0], q * 8, (q + 1) * 8, ap[0]);
-        else kc::exl3_cpu_rows_acc_n(ex[(size_t) c.e].p[2], xp, c.n, q * 8, (q + 1) * 8, ap);
+        kc::exl3_cpu_rows_acc_cols_n(ex[(size_t) c.e].p[2], xp, c.n, q * 8, (q + 1) * 8, p * dcols, (p + 1) * dcols, ap);
     };
-    I.parallel(C * I.DQ, fc);
-    const std::function<void(int)> fd = [&](int jb) {
-        const Chunk& c = ch[(size_t) (jb / I.DB)];
-        const int b = jb % I.DB;
-        for (int i = 0; i < c.n; ++i) {
-            const int j = c.j0 + i;
-            float a[128];
-            for (int cc = 0; cc < 128; ++cc) a[cc] = 0.0f;
-            for (int q = 0; q < I.DQ; ++q) {
-                const float* aq = accd(j, q) + b * 128;
-                for (int cc = 0; cc < 128; ++cc) a[cc] += aq[cc];
+    I.parallel(C * I.DQ * kDP, fc);
+    lap(3);
+    // down's bands and the tokens' sums, a job a band: its outputs of every entry, then added into the tokens' rows
+    // in order's sequence (each value's sum in the same order as entry by entry over the whole rows)
+    std::vector<int> seq;
+    if (order != nullptr) {
+        for (const auto& [e, u] : *order) seq.push_back(ent_of[(size_t) e][(size_t) u]);
+    } else {
+        for (int j = 0; j < N; ++j) seq.push_back(j);
+    }
+    const std::function<void(int)> fd = [&](int b) {
+        for (const Chunk& c : ch)
+            for (int i = 0; i < c.n; ++i) {
+                const int j = c.j0 + i;
+                float a[128];
+                for (int cc = 0; cc < 128; ++cc) a[cc] = 0.0f;
+                for (int q = 0; q < I.DQ; ++q) {
+                    const float* aq = accd(j, q) + b * 128;
+                    for (int cc = 0; cc < 128; ++cc) a[cc] += aq[cc];
+                }
+                double xs = 0.0;
+                for (int k = 0; k < I.FB; ++k) xs += xsd(j)[k];
+                kc::exl3_cpu_band_out(ex[(size_t) c.e].p[2], a, (float) xs, b * 128, yd(j) + b * 128);
             }
-            double xs = 0.0;
-            for (int k = 0; k < I.FB; ++k) xs += xsd(j)[k];
-            kc::exl3_cpu_band_out(ex[(size_t) c.e].p[2], a, (float) xs, b * 128, yd(j) + b * 128);
+        for (int j : seq) {
+            float* o = out + (size_t) ent[(size_t) j].t * dim + b * 128;
+            const float w = ent[(size_t) j].w;
+            const float* y = yd(j) + b * 128;
+            for (int d = 0; d < 128; ++d) o[d] += w * y[d];
         }
     };
-    I.parallel(C * I.DB, fd);
-    const auto acc_entry = [&](int j) {
-        float* o = out + (size_t) ent[(size_t) j].t * dim;
-        const float w = ent[(size_t) j].w;
-        const float* y = yd(j);
-        for (int d = 0; d < dim; ++d) o[d] += w * y[d];
-    };
-    if (order != nullptr) {
-        for (const auto& [e, u] : *order) acc_entry(ent_of[(size_t) e][(size_t) u]);
-    } else {
-        for (int j = 0; j < N; ++j) acc_entry(j);
-    }
+    I.parallel(I.DB, fd);
+    lap(4);
+    lap(5);
 }
 
 }  // namespace mm3

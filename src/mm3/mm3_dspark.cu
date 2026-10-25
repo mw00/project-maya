@@ -216,29 +216,39 @@ struct Draft::Impl {
     }
 
     bool context(const float* taps, int T, int pos0, std::string& err) {
-        const int D = g.dim, KV = g.n_kv * g.hd, NT = (int) g.taps.size();
-        cudaSetDevice(dev);
+        const int NT = (int) g.taps.size();
         for (int a = 0; a < T; a += max_rows) {
             const int n = std::min(max_rows, T - a);
-            // ctx = sum over the taps j of tap_j . fc[:, j D:(j + 1) D]^T
-            for (int j = 0; j < NT; ++j) {
-                k::to_bf16(taps + ((size_t) j * T + a) * D, n, D, D, x16, D, s);
-                if (!gemm(fc + (size_t) j * D, D, D, NT * D, x16, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err))
-                    return false;
-            }
-            k::rms(ctx, hid1, n, D, g.eps, xn, nullptr, s);
-            k::to_bf16(xn, n, D, D, x16, D, s);
-            std::vector<int> ph((size_t) n);
-            for (int t = 0; t < n; ++t) ph[(size_t) t] = pos0 + a + t;
-            DK(cudaMemcpyAsync(pos, ph.data(), ph.size() * 4, cudaMemcpyHostToDevice, s));
-            for (auto& l : L) {
-                if (!gemm(l.k, KV, D, D, x16, n, D, kk, KV, 0.0f, err) || !gemm(l.v, KV, D, D, x16, n, D, vv, KV, 0.0f, err))
-                    return false;
-                k::qk_norm_rope(nullptr, kk, vv, nullptr, l.kn1, pos, n, 0, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc,
-                                l.vc, s, ring);
-            }
-            DK(cudaStreamSynchronize(s));   // (ph is gone after this chunk)
+            for (int j = 0; j < NT; ++j)
+                if (!context_tap(j, taps + ((size_t) j * T + a) * g.dim, n, err)) return false;
+            if (!context_finish(n, pos0 + a, err)) return false;
         }
+        return true;
+    }
+
+    // ctx += tap_j . fc[:, j D:(j + 1) D]^T (= for j 0)
+    bool context_tap(int j, const float* rows, int n, std::string& err) {
+        const int D = g.dim, NT = (int) g.taps.size();
+        cudaSetDevice(dev);
+        k::to_bf16(rows, n, D, D, x16, D, s);
+        return gemm(fc + (size_t) j * D, D, D, NT * D, x16, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err);
+    }
+
+    bool context_finish(int n, int pos0, std::string& err) {
+        const int D = g.dim, KV = g.n_kv * g.hd;
+        cudaSetDevice(dev);
+        k::rms(ctx, hid1, n, D, g.eps, xn, nullptr, s);
+        k::to_bf16(xn, n, D, D, x16, D, s);
+        std::vector<int> ph((size_t) n);
+        for (int t = 0; t < n; ++t) ph[(size_t) t] = pos0 + t;
+        DK(cudaMemcpyAsync(pos, ph.data(), ph.size() * 4, cudaMemcpyHostToDevice, s));
+        for (auto& l : L) {
+            if (!gemm(l.k, KV, D, D, x16, n, D, kk, KV, 0.0f, err) || !gemm(l.v, KV, D, D, x16, n, D, vv, KV, 0.0f, err))
+                return false;
+            k::qk_norm_rope(nullptr, kk, vv, nullptr, l.kn1, pos, n, 0, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc,
+                            l.vc, s, ring);
+        }
+        DK(cudaStreamSynchronize(s));   // (ph is gone after this)
         return true;
     }
 
@@ -284,7 +294,21 @@ struct Draft::Impl {
             if (!gemm(l.d, D, F, F, x16, B, F, h, D, 1.0f, err)) return false;   // h += mlp
         }
         k::rms(h, fin1, B, D, g.eps, hid, hid16, s);
-        x3::gemm_rows(*head, hid16, D, n, logit, V, 0.0f, s);
+        // (the target's head on mv, F32 inputs: one pass for the block's rows - gemm_rows took ~1.8 ms on the 3090)
+        for (int c0 = 0; c0 < n;) {
+            x3::MvJob j;
+            j.m = head;
+            j.xf = hid + (size_t) c0 * D;
+            j.y = logit + (size_t) c0 * V;
+            j.ncol = std::min(std::max(1, x3::mv_cols(*head)), n - c0);
+            j.xf_cs = (size_t) D;
+            j.y_cs = (size_t) V;
+            if (!x3::mv(&j, 1, s)) {
+                err = "dspark: mv head";
+                return false;
+            }
+            c0 += j.ncol;
+        }
         DK(cudaMemcpyAsync(prev, &anchor, 4, cudaMemcpyHostToDevice, s));
         for (int i = 0; i < n; ++i) {
             k::gather_row(w1, R, prev, embb, embf, s);
@@ -312,6 +336,8 @@ bool Draft::load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, c
 }
 const DraftGeo& Draft::geo() const { return p->g; }
 bool Draft::context(const float* taps, int T, int pos0, std::string& err) { return p->context(taps, T, pos0, err); }
+bool Draft::context_tap(int j, const float* rows, int T, std::string& err) { return p->context_tap(j, rows, T, err); }
+bool Draft::context_finish(int T, int pos0, std::string& err) { return p->context_finish(T, pos0, err); }
 bool Draft::propose(int anchor, int pos, int n, std::vector<int>& drafts, std::vector<float>& conf, float* logits,
                     std::string& err) {
     (void) logits;

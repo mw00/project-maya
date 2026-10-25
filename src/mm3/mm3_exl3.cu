@@ -1757,7 +1757,7 @@ template <int K2, int cb> struct RunInner {
 };
 
 // ---------------------------------------------------------------- per-stream scratch
-constexpr size_t kPartFloats = (size_t) 2 << 20;   // split partials: 8 MB
+constexpr size_t kPartFloats = (size_t) 4 << 20;   // split partials: 16 MB (a head of 200K outputs: 10 columns a pass)
 constexpr size_t kCounters = 16384;
 constexpr size_t kCntGU = 8192;                    // the counters from here on: the experts' gate / up pairs
 constexpr size_t kHFloats = (size_t) 8 * 8192;     // the experts' h
