@@ -111,7 +111,8 @@ SAMPLING = {"temperature": 1.0, "top_p": 0.95}     # the dashboard's and the API
 EFFORT = "high"                                    # thinking level for requests that name none (GLM's High)
 HF = "https://huggingface.co/{repo}/resolve/{revision}/{path}"
 # The models the installer can download: Project Maya's own quants, made from Z.ai's FP8 release (their model card
-# has the measurements against it).
+# has the measurements against it) - and other people's: a re-quant of the same weights (Derisked, EXL3) and, from
+# RCO-152E down, a prune with fewer experts a layer.
 # Another glm5-next GGUF can be used with --gguf-dir (experimental).  "folder": the files' folder in the repo ("" =
 # its top).  "file": the names on Hugging Face, with the quant label its file list groups (and adds up) them by -
 # one label per model; "was": the names they had there before (v1.0.18 and earlier: no label; v1.0.19: Maya-S24 as
@@ -119,7 +120,10 @@ HF = "https://huggingface.co/{repo}/resolve/{revision}/{path}"
 # Hugging Face one): every download is verified; a list holds every version published (v1.0.28: the first shards' header
 # names the architecture "glm5-next", as llama.cpp does - the data is the same, so a download of either is good).  "vision": the image encoder's files (the mmproj,
 # made from the official vision tower, and the tokenizer it reads its markers with) - from "repo" / "revision" when
-# it names them, else the model's own repo.
+# it names them, else the model's own repo.  "profile": False on a model of another expert geometry (RCO-152E's
+# prune): no shipped profile is passed or added at a restart (write_config, add_profile) - the engine refuses one
+# for another artifact.  "logit_bias": {token id: bias} written into the config's sampling defaults (RCO's card: ban
+# the "hmm" tokens at Q3_K / Q4_K_M, or its reasoning loops).
 MODELS = {
     "Maya-S-v2-IQ2_XXS": {
         "about": "Maya-S, Project Maya's compact quant: error-feedback-rounded IQ2_XXS gate/up experts, "
@@ -232,6 +236,49 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # lapadatbogdan's RCO prune of GLM-5.3-Flash for coders (152 of 288 experts a layer kept, ~170B-A17B): llama.cpp's
+    # own quants of it, text only, pinned to the commit the hashes belong to (the repo re-uploaded its files once
+    # already) - a prune is the header's "profile": False / "logit_bias" case
+    "RCO-152E-Q3_K": {
+        "about": "RCO-152E-Q3_K, lapadatbogdan's coder prune of GLM-5.3-Flash (RCO keeps 152 of 288 experts a layer, "
+                 "~170B-A17B) in llama.cpp's Q3_K quant - text only, faster than the full model",
+        "repo": "lapadatbogdan/GLM-5.3-Flash-Coder-RCO-152E-GGUF", "revision": "94613287f523a52b5a8d7843db3ff4a1bc8d58c6",
+        "folder": "", "file": "GLM-5.3-Flash-Coder-RCO-152E-Q3_K-{i:05d}-of-{n:05d}.gguf", "shards": 2,
+        "download_gb": 75.1,
+        "sha256": {
+            "GLM-5.3-Flash-Coder-RCO-152E-Q3_K-00001-of-00002.gguf":
+                "a20fc5ba55bc59212ef703af183a9e26b2e6db9fc5e0f541e5a7ea679edb5795",
+            "GLM-5.3-Flash-Coder-RCO-152E-Q3_K-00002-of-00002.gguf":
+                "bb8ff823c35d6d40a8d84cdd5a75b396161350459452df4afc4ed83d9d952811"},
+        "profile": False, "logit_bias": {"86776": -100, "79380": -100, "87459": -100}},
+    "RCO-152E-Q4_K_M": {
+        "about": "the same prune at Q4_K_M - text only",
+        "repo": "lapadatbogdan/GLM-5.3-Flash-Coder-RCO-152E-GGUF", "revision": "94613287f523a52b5a8d7843db3ff4a1bc8d58c6",
+        "folder": "", "file": "GLM-5.3-Flash-Coder-RCO-152E-Q4_K_M-{i:05d}-of-{n:05d}.gguf", "shards": 3,
+        "download_gb": 102.6,
+        "sha256": {
+            "GLM-5.3-Flash-Coder-RCO-152E-Q4_K_M-00001-of-00003.gguf":
+                "e1d3aa5fe0585ee19f45e206b589ac123dd80df33fdaf6b6ac9f415a48e39783",
+            "GLM-5.3-Flash-Coder-RCO-152E-Q4_K_M-00002-of-00003.gguf":
+                "cb21bb4b700ecf9264a4cfb3b71677f4005d14899014dd9ddd9928306e5c98f3",
+            "GLM-5.3-Flash-Coder-RCO-152E-Q4_K_M-00003-of-00003.gguf":
+                "5f4a4ff35b75a133da4345d403faf8aa574522096ffef6a96e53bd0c890ca74d"},
+        "profile": False, "logit_bias": {"86776": -100, "79380": -100, "87459": -100}},
+    "RCO-152E-Q8_0": {
+        "about": "the same prune at Q8_0, its closest to the full model - text only, and alone without the hmm ban",
+        "repo": "lapadatbogdan/GLM-5.3-Flash-Coder-RCO-152E-GGUF", "revision": "94613287f523a52b5a8d7843db3ff4a1bc8d58c6",
+        "folder": "", "file": "GLM-5.3-Flash-Coder-RCO-152E-Q8_0-{i:05d}-of-{n:05d}.gguf", "shards": 4,
+        "download_gb": 180.4,
+        "sha256": {
+            "GLM-5.3-Flash-Coder-RCO-152E-Q8_0-00001-of-00004.gguf":
+                "16b0410cd2af42264813ac209687cafb36d2ab14cc3f74c14150ce0b1ff89a82",
+            "GLM-5.3-Flash-Coder-RCO-152E-Q8_0-00002-of-00004.gguf":
+                "e5a815e3bbc62c347d452dedd88db0e48204f078ea11814158e59ac9a11f3756",
+            "GLM-5.3-Flash-Coder-RCO-152E-Q8_0-00003-of-00004.gguf":
+                "6a77d3328a9eab2c7944d4be5a66952f856ed3d9706be9d76996ce3ac675e992",
+            "GLM-5.3-Flash-Coder-RCO-152E-Q8_0-00004-of-00004.gguf":
+                "1bd0db0cf92039950cafbead6f7243bf54b6aee5439f704d58c4aac0481caba7"},
+        "profile": False},
     # turboderp's EXL3 (exllamav3) quants, read in place from their safetensors: the pack (tools/exl3_pack.py) puts a
     # small GGUF of the unquantized tensors beside them.  "files": every file of the branch with its size (what is
     # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
@@ -2345,8 +2392,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
     cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
-    if PROFILE.exists():
+    m = MODELS.get(quant) or {}
+    # a pruned model ("profile": False) gets no shipped profile: the engine refuses one of another expert geometry
+    if PROFILE.exists() and m.get("profile", True):
         cfg["args"] += ["--expert-profile", str(PROFILE)]
+    if m.get("logit_bias"):                          # a quant whose card says to ban tokens by default (RCO's "hmm")
+        cfg["sampling"]["logit_bias"] = dict(m["logit_bias"])
     if cfg_path.exists():
         old = read_json(cfg_path).get("args") or []
         kept = keep_args(old, cfg["args"],
@@ -2438,8 +2489,9 @@ def add_profile(cfg: dict) -> bool:
     """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
     would write it: an update restarts the installed config without setting up again.  True when `cfg` changed."""
     args = cfg.get("args")
-    if not isinstance(args, list) or "--glm-pack" not in args[:-1] or "--expert-profile" in args or not PROFILE.exists():
-        return False
+    if not isinstance(args, list) or "--glm-pack" not in args[:-1] or "--expert-profile" in args or not PROFILE.exists() \
+            or not MODELS.get((cfg.get("installer") or {}).get("quant") or "", {}).get("profile", True):
+        return False                                    # (a pruned model, "profile": False: another expert geometry)
     args += ["--expert-profile", str(PROFILE)]
     return True
 

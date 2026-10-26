@@ -100,6 +100,19 @@ class ProfileArgsTests(unittest.TestCase):
         self.shipped.unlink()
         self.assertFalse(maya.add_profile({"args": ["--glm-pack", "p"]}))  # no shipped profile: nothing to add
 
+    def test_a_pruned_model_gets_no_profile_and_the_cards_hmm_ban(self):
+        # RCO-152E keeps 152 of 288 experts a layer: the shipped profile ranks the unpruned model's, and the engine
+        # refuses one of another geometry - so a setup passes none, an update adds none, and the card's "hmm" ban
+        # (Q3_K / Q4_K_M, where it says the reasoning loops) goes into the config's sampling defaults
+        pc = {"gpus": [{"index": 0, "name": "GPU", "vram_gb": 24}]}
+        p = maya.write_config(self.a, pc, {}, self.model / "pack", "RCO-152E-Q3_K", 32768,
+                              self.root / "models", None, ("local", self.first))
+        cfg = json.loads(p.read_text())
+        self.assertNotIn("--expert-profile", cfg["args"])
+        self.assertEqual(cfg["sampling"], {**maya.SAMPLING,                    # otherwise unchanged
+                                          "logit_bias": {"86776": -100, "79380": -100, "87459": -100}})
+        self.assertFalse(maya.add_profile(cfg))
+
     def test_a_missing_hand_wired_profile_falls_back_to_the_shipped_one(self):
         old = ["--glm-pack", "p", "--expert-profile", str(self.root / "gone.bin")]
         new = ["--glm-pack", "p", "--expert-profile", str(self.shipped)]

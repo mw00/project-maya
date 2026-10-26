@@ -305,6 +305,37 @@ class DraftChoice(unittest.TestCase):
         self.assertEqual(len(d["sha256"]), 64)
 
 
+class RcoPruneDownload(unittest.TestCase):
+    """lapadatbogdan's RCO-152E prune of GLM-5.3-Flash (152 of 288 experts a layer, ~170B-A17B): llama.cpp's own
+    quants, pinned to the commit their hashes belong to (the repo re-uploaded its files once already); text only,
+    and - another expert geometry - the shipped profile stays off it (test_maya_profile)."""
+
+    QGB = {"RCO-152E-Q3_K": (2, 75.1), "RCO-152E-Q4_K_M": (3, 102.6), "RCO-152E-Q8_0": (4, 180.4)}
+    REV = "94613287f523a52b5a8d7843db3ff4a1bc8d58c6"
+
+    def test_three_quants_pinned_and_hashed(self):
+        for q, (n, gb) in self.QGB.items():
+            m = maya.MODELS[q]
+            self.assertEqual((m["shards"], len(m["sha256"])), (n, n))
+            self.assertAlmostEqual(m["download_gb"], gb, delta=0.05)
+            self.assertNotIn("vision", m)                     # text only: the repo publishes no vision files
+            self.assertIs(m["profile"], False)
+            self.assertEqual(m["revision"], self.REV)
+            for name in maya.shard_names(m):                  # the files download from the pinned commit
+                self.assertEqual(maya.hf_url(m["repo"], m["revision"], m["folder"], name),
+                                 f"https://huggingface.co/lapadatbogdan/GLM-5.3-Flash-Coder-RCO-152E-GGUF/"
+                                 f"resolve/{self.REV}/{name}")
+            self.assertEqual(maya.quant_of(Path(maya.shard_names(m)[0])), q)   # --gguf-dir of its files, too
+
+    def test_the_cards_hmm_ban_where_it_says_and_nowhere_else(self):
+        for q in ("RCO-152E-Q3_K", "RCO-152E-Q4_K_M"):
+            self.assertEqual(maya.MODELS[q]["logit_bias"], {"86776": -100, "79380": -100, "87459": -100})
+        self.assertNotIn("logit_bias", maya.MODELS["RCO-152E-Q8_0"])   # (their card: Q8_0 needs none)
+        for q, m in maya.MODELS.items():                              # every other model keeps the profile
+            if not q.startswith("RCO-152E-"):
+                self.assertTrue(m.get("profile", True), q)
+
+
 class Exl3Download(unittest.TestCase):
     """turboderp's EXL3 quant: every file of its branch downloaded and checked by size
     and hash, its config checked instead of a GGUF header, and its pack built by tools/exl3_pack.py."""

@@ -49,6 +49,12 @@ The setup asks which one to download and recommends one for your PC. How they're
 [MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md). On
 [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF).
 
+It also offers [lapadatbogdan's RCO-152E coder prune](https://huggingface.co/lapadatbogdan/GLM-5.3-Flash-Coder-RCO-152E-GGUF)
+(MIT license): GLM-5.3-Flash with 152 of its 288 experts a layer kept (~170B-A17B), in llama.cpp's own Q3_K (75.1 GB),
+Q4_K_M (102.6 GB) and Q8_0 (180.4 GB) - text only. Not our quants: a prune routes differently, so the engine starts
+with no shipped expert profile and learns this PC's routing, and its card's advice to ban three "hmm" tokens at
+Q3_K / Q4_K_M is written into the config's sampling defaults. Not measured by us.
+
 ### DeepSeek-V4.1-Flash-1017 (new)
 
 The setup also offers **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**

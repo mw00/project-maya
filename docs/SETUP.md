@@ -7,7 +7,10 @@ The setup in detail: what its first run does, starting again and updating, and i
 
 It first asks which model to set up:
 
-- **GLM-5.3-Flash** - Project Maya's GGUF quants (or turboderp's EXL3 quants), from one GPU up; the steps below;
+- **GLM-5.3-Flash** - Project Maya's GGUF quants (or turboderp's EXL3 quants, or
+  [lapadatbogdan's RCO-152E coder prune](https://huggingface.co/lapadatbogdan/GLM-5.3-Flash-Coder-RCO-152E-GGUF): 152 of
+  288 experts a layer, llama.cpp's Q3_K / Q4_K_M / Q8_0, text only, no shipped profile - a prune is another expert
+  geometry), from one GPU up; the steps below;
 - **DeepSeek-V4.1-Flash-1017** (experimental) - [LibertAIDAI's EXL3 quant at 2.9 bits](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw)
   (211 GB) or [at 3.5 bits](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) (258 GB, about
   280 GB of VRAM and RAM; `--ds4-quant exl3-3.5`, its own folder; a second quant hard-links the Engram tables from the
