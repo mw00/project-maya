@@ -52,6 +52,45 @@
 .status-card:hover { background: var(--st-surface-2); }
 .status-card__text { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
 .status-card__text b { font-size: var(--st-fs-md); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* Saved: what the model's own API would have charged (the line above the status card, and its breakdown) */
+.saved__line { display: flex; align-items: center; gap: 10px; width: 100%; height: 36px; padding: 0 10px; border: 0; border-radius: var(--st-r-row);
+               background: transparent; color: var(--st-ink-soft); font-size: var(--st-fs-sm); text-align: left; }
+.saved__line:hover, .saved__line[aria-expanded="true"] { background: var(--st-surface-2); }
+.saved__line > .st-icon { color: var(--st-ink-muted); flex: none; }
+.saved__icon { display: grid; place-items: center; width: 32px; flex: none; color: var(--st-ok-text); }
+.saved__text { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.saved__text b { font-weight: 600; color: var(--st-ok-text); font-variant-numeric: tabular-nums; }
+.saved__vs { flex: none; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.saved-pop { position: fixed; z-index: 70; width: 360px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px); overflow-y: auto;
+             box-sizing: border-box; display: flex; flex-direction: column; gap: 14px; padding: 16px 16px 12px; border-radius: var(--st-r-lg);
+             background: var(--st-surface); border: 1px solid var(--st-line); box-shadow: var(--st-shadow-pop); color: var(--st-ink);
+             animation: popup 140ms var(--st-ease); }
+.saved-pop__note { margin: 0; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.saved-pop__head { display: flex; flex-direction: column; gap: 2px; }
+.saved-pop__head > span { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.saved-pop__head > span:last-child { font-size: var(--st-fs-xs); line-height: 1.45; }
+.saved-pop__head b { font-size: 30px; font-weight: 600; letter-spacing: -.02em; line-height: 1.2; color: var(--st-ok-text); font-variant-numeric: tabular-nums; }
+.saved-pop__start { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-radius: var(--st-r-md);
+                    background: var(--st-ok-tint); }
+.saved-pop__start > span { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
+.saved-pop__start > span b { font-size: var(--st-fs-sm); font-weight: 500; }
+.saved-pop__start > span span { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.saved-pop__start > b { font-size: var(--st-fs-base); font-weight: 600; color: var(--st-ok-text); font-variant-numeric: tabular-nums; }
+.saved-pop__h { font-size: var(--st-fs-xs); font-weight: 600; color: var(--st-ink-muted); }
+.saved-pop__models { display: flex; flex-direction: column; gap: 10px; }
+.saved-pop__model { display: flex; align-items: center; gap: 10px; }
+.saved-pop__model .model-logo { border-radius: var(--st-r-sm); background: var(--st-surface-2); flex: none; }
+.saved-pop__model > span { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
+.saved-pop__model > span b { font-size: var(--st-fs-sm); font-weight: 500; }
+.saved-pop__model > span span { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.saved-pop__model > b { font-size: var(--st-fs-sm); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.saved-pop__prices { display: flex; flex-direction: column; gap: 6px; padding-top: 12px; border-top: 1px solid var(--st-line);
+                     font-size: var(--st-fs-xs); color: var(--st-ink-muted); line-height: 1.4; }
+.saved-pop__prices > div { display: flex; justify-content: space-between; gap: 12px; }
+.saved-pop__prices > div span:last-child { text-align: right; color: var(--st-ink-soft); font-variant-numeric: tabular-nums; }
+.saved-pop__foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.saved-pop__foot .btn { height: 30px; font-size: var(--st-fs-xs); }
 .status { display: flex; align-items: center; gap: 6px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .status__dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--st-ink-muted); }

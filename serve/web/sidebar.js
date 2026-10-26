@@ -1,11 +1,11 @@
 // serve/web/sidebar.js - the sidebar (new chat, search, Models, Monitor, Settings; the chats: pinned, in folders, then by day;
-// the model's status), a chat's ⋯ menu, and the search dialog.
-import {html, useEffect, useMemo, useRef, useState} from "./preact.js";
-import {MOD, ctxfmt, dayGroup, fmt, modelName, relTime, store} from "./lib.js";
-import {S, emit} from "./state.js";
+// the model's status and what it saved against its API), a chat's ⋯ menu, and the search dialog.
+import {html, useEffect, useLayoutEffect, useMemo, useRef, useState} from "./preact.js";
+import {MOD, api, ctxfmt, dayGroup, fmt, modelName, relTime, store} from "./lib.js";
+import {S, confirmDialog, emit, toast} from "./state.js";
 import {chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
         renameChat, renameFolder, deleteFolder, toggleFolder} from "./chats.js";
-import {Icon, Kbd, MayaMark, Menu, MenuItem, MenuLabel, MenuSep, ModelLogo, trapTab} from "./ui.js";
+import {Icon, Kbd, MayaMark, Menu, MenuItem, MenuLabel, MenuSep, ModelLogo, trapTab, useDismiss} from "./ui.js";
 
 export const showView = (v) => { S.view = v; S.drawer = false; emit(); };
 export const openSettings = (section = "general") => { S.settings = section; S.drawer = false; emit(); };
@@ -119,10 +119,78 @@ function ChatList() {
   </div>`;
 }
 
+// ------------------------------------------------------------------ Saved: what the model's own API would have charged
+// (serve/savings.py counts every request's tokens per model; /metrics carries the total, GET /api/savings the rest)
+export const usd = (v) => (v == null ? "–" : v >= 1000 ? `$${fmt(v)}` : v === 0 || v >= 0.01 ? `$${v.toFixed(2)}` : "< $0.01");
+const mtok = (n) => (n >= 1e6 ? `${fmt(n / 1e6, n < 1e7 ? 1 : 0)}M` : n >= 1e3 ? `${fmt(n / 1e3, n < 1e4 ? 1 : 0)}K` : fmt(n));
+const dollars = (v) => (v < 0.01 ? `$${String(v)}` : `$${v.toFixed(2)}`);   // (a price: $0.50, $0.003)
+function upFor(s) {
+  const m = Math.max(0, Math.round((Date.now() / 1000 - s) / 60));
+  return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
+}
+
+function SavedPop({anchor, close}) {
+  const ref = useRef(null);
+  const [r, setR] = useState(null), [pos, setPos] = useState(null);
+  const total = S.metrics && S.metrics.savings ? S.metrics.savings.usd : null;
+  useDismiss(true, close, ref, anchor);
+  useEffect(() => { api("api/savings").then(setR).catch((e) => setR({error: e.message})); }, [total]);
+  useLayoutEffect(() => {
+    const place = () => {
+      if (!anchor.current || !ref.current) return;
+      const a = anchor.current.getBoundingClientRect(), w = ref.current.offsetWidth;
+      setPos({left: Math.max(8, Math.min(a.left, innerWidth - w - 8)), bottom: innerHeight - a.top + 6});
+    };
+    place();
+    addEventListener("resize", place);
+    return () => removeEventListener("resize", place);
+  }, [!!r]);
+  const reset = async () => {
+    if (!await confirmDialog("Start over from $0?", "<p>Every model's count of tokens and what they would have cost goes back to zero. This cannot be undone.</p>", "Start over", true)) return;
+    try { setR(await api("api/savings/reset", {method: "POST", body: {}})); toast("success", "Started over", "Maya counts from $0 again."); }
+    catch (e) { toast("error", "Not reset", e.message, 6000); }
+  };
+  const apis = r && r.prices ? [...new Set(r.prices.map((p) => p.api))] : [];
+  const since = r && r.since ? new Date(r.since * 1000).toLocaleDateString([], {month: "short", day: "numeric"}) : null;
+  const style = pos ? `left:${pos.left}px;bottom:${pos.bottom}px` : "left:0;bottom:0;visibility:hidden";
+  return html`<div ref=${ref} class="saved-pop" role="dialog" aria-label="Saved, compared with the API" style=${style}>
+    ${!r ? html`<p class="saved-pop__note">Counting…</p>` : r.error ? html`<p class="saved-pop__note">${r.error}</p>` : html`
+      <div class="saved-pop__head"><span>Saved, compared with the API</span><b>${usd(r.usd)}</b>
+        <span>What ${apis.map((a) => `${a}'s`).join(" and ") || "the model's"} own API${apis.length > 1 ? "s" : ""} would have charged for the same tokens${since ? `, since ${since}` : ""}.</span></div>
+      ${r.start ? html`<div class="saved-pop__start"><span><b>This start</b><span>${modelName(r.start.model)}${r.start.quant ? ` ${r.start.quant}` : ""} · up ${upFor(r.start.started)}</span></span>
+        <b>${r.start.usd == null ? "–" : usd(r.start.usd)}</b></div>` : null}
+      ${r.models && r.models.length ? html`<div class="saved-pop__models"><span class="saved-pop__h">By model</span>
+        ${r.models.map((m) => html`<div class="saved-pop__model" key=${m.key}><${ModelLogo} model=${m.model} size=${28}/>
+          <span><b>${modelName(m.model)}${m.quant ? ` · ${m.quant}` : ""}</b>
+            <span>read ${mtok(m.tokens.input + m.tokens.cached)}${m.tokens.cached ? `, ${mtok(m.tokens.cached)} of it cached` : ""} · wrote ${mtok(m.tokens.output)}</span></span>
+          <b>${m.usd == null ? "no API price" : usd(m.usd)}</b></div>`)}</div>` : null}
+      ${r.prices && r.prices.length ? html`<div class="saved-pop__prices"><span class="saved-pop__h">The prices, per 1M tokens: input · cached input · output</span>
+        ${r.prices.map((p) => html`<div><span>${modelName(p.model)} (${p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}
+        <span>${r.prices.some((p) => p.peak) ? "DeepSeek charges twice that at its peak hours (weekdays 01–04 and 06–10 UTC), and Maya counts those tokens at that price. " : ""}The prompt Maya reads again from its own cache counts at the cached price. Electricity is not counted.</span></div>` : null}
+      <div class="saved-pop__foot"><span>Prices as of ${r.prices_as_of ? new Date(`${r.prices_as_of}-01T12:00:00`).toLocaleDateString([], {month: "short", year: "numeric"}) : "–"}</span>
+        <button type="button" class="btn btn--ghost btn--sm" onClick=${reset}>Start over from $0</button></div>`}
+  </div>`;
+}
+
+function SavedLine() {
+  const sv = S.metrics && S.metrics.savings;
+  const [open, setOpen] = useState(false);
+  const btn = useRef(null);
+  if (!sv || !sv.priced) return null;
+  return html`<div class="saved">
+    <button type="button" ref=${btn} class="saved__line" aria-haspopup="dialog" aria-expanded=${String(open)}
+      title="What the model's own API would have charged for the same tokens" onClick=${() => setOpen(!open)}>
+      <span class="saved__icon"><${Icon} name="dollar"/></span><span class="saved__text">Saved <b>${usd(sv.usd)}</b></span>
+      <span class="saved__vs">vs the API</span><${Icon} name="chevron-right" sm/></button>
+    ${open ? html`<${SavedPop} anchor=${btn} close=${() => setOpen(false)}/>` : null}
+  </div>`;
+}
+
 function StatusCard() {
   const st = status();
   const name = modelName(S.health.model);
   return html`<div class="side__foot">
+    <${SavedLine}/>
     <button type="button" class="status-card" onClick=${() => showView("monitor")} aria-label=${`${name}, ${st.text}. Open the Monitor`}>
       <${ModelLogo} model=${S.health.model}/>
       <span class="status-card__text"><b title=${S.health.model}>${name}</b>

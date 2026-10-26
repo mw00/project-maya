@@ -63,5 +63,6 @@
 <symbol id="i-swap" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="stroke-width:var(--st-icon-stroke,1.75)"><path d="m16 3 4 4-4 4"></path><path d="M20 7H4"></path><path d="m8 21-4-4 4-4"></path><path d="M4 17h16"></path></g></symbol>
 <symbol id="i-minus" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="stroke-width:var(--st-icon-stroke,1.75)"><path d="M5 12h14"></path></g></symbol>
 <symbol id="i-undo" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="stroke-width:var(--st-icon-stroke,1.75)"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"></path><path d="M3 3v5h5"></path></g></symbol>
+<symbol id="i-dollar" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" style="stroke-width:var(--st-icon-stroke,1.75)"><circle cx="12" cy="12" r="10"></circle><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"></path><path d="M12 18V6"></path></g></symbol>
 <symbol id="i-maya" viewBox="0 0 24 24"><path d="M9 4.5h6v3H9z" fill="currentColor" opacity=".95"></path><path d="M6.5 9h11v3.5h-11z" fill="currentColor" opacity=".8"></path><path d="M4 14h16v4.5H4z" fill="currentColor" opacity=".65"></path></symbol>
 </svg>

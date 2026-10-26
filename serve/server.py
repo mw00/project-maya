@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, mm3_vision, models  # noqa: E402
+from serve import ds4_vision, gpu_map, mm3_vision, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -1643,6 +1643,7 @@ class Service:
         self.status_lock = threading.Lock()
         self.mcp = None                                  # serve/mcp.py's McpHub when MCP servers are configured
         self.config_path = None                          # the run config (a context change is saved into it)
+        self.savings = None                              # serve/savings.py's Ledger: what the API would have charged
         self.model_dir = None                            # the model's folder (free disk on the dashboard)
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
         self.reload = None                               # a context change: {state, from, to, started, error}
@@ -2244,7 +2245,8 @@ class Service:
                 "requests": hist[::-1][:None if all_requests else 12],
                 "requests_kept": len(hist), "totals": totals, "hardware": hw,
                 "hardware_static":
-                tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage()}
+                tel["static"], "history": tel["history"], "time": now, "reload": reload, "storage": self.storage(),
+                "savings": self.savings.summary() if self.savings is not None else None}
 
     def _gpu_map(self, cards):
         """What fills each GPU (serve/gpu_map.py): the engine's VRAM lines and NVML's cards, with the engine's and the
@@ -2853,6 +2855,7 @@ class Service:
         finally:
             if emb:
                 Path(emb).unlink(missing_ok=True)
+            book = None                                 # (the savings' count: after the lock, it writes a file)
             with self.status_lock:
                 if counted:
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
@@ -2879,6 +2882,7 @@ class Service:
                     t["prompt_tokens"] += len(ids)
                     t["reused"] += last.get("reused") or 0
                     t["output_tokens"] += n
+                    book = (len(ids), last.get("reused") or 0, n)
                     t["prompt_ms"] += last.get("prompt_ms") or 0.0
                     t["decode_ms"] += last.get("decode_ms") or 0.0
                     fresh = getattr(self.engine, "last", None)
@@ -2901,6 +2905,8 @@ class Service:
                     hold[1] = False
                     self.active -= 1
                 self.status["busy"] = self.active > 0
+            if book is not None and self.savings is not None:
+                self.savings.add(*book)
         for ev in parser.finish():
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
@@ -3722,6 +3728,10 @@ def make_handler(svc: Service):
                 # the Models page: the configs the setup wrote, the running one, each one's engine settings
                 if self._authorized():
                     self._json(200, svc.models_info())
+            elif path == "/api/savings":
+                # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
+                if self._authorized():
+                    self._json(200, svc.savings.report() if svc.savings is not None else {"usd": None, "models": []})
             elif path == "/api/update":
                 # About > Updates: the latest release (GitHub, cached six hours; ?force=1 asks now) and whether this
                 # folder can update itself
@@ -3808,6 +3818,17 @@ def make_handler(svc: Service):
                     return
                 if path in ("/api/models/settings", "/api/models/switch"):
                     self._models(path.rsplit("/", 1)[1])
+                    return
+                if path == "/api/savings/reset":
+                    # it clears every model's count: the app's own page only
+                    self._body()
+                    if not self._own_page("the savings can be reset"):
+                        return
+                    if svc.savings is None:
+                        self._json(400, {"error": {"type": "invalid_request_error", "message": "nothing is counted here"}})
+                        return
+                    svc.savings.reset()
+                    self._json(200, svc.savings.report())
                     return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
@@ -4685,6 +4706,8 @@ def main() -> int:
     svc.backend = cfg.get("backend")                    # the Monitor's GPU reader: sysfs on AMD/HIP, NVML otherwise
     if a.config:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
+        p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
+        svc.savings = savings.Ledger(p.parent / savings.FILE, p.name, svc.model, models.quant_label(cfg, p))
     args = [str(x) for x in cfg.get("args") or []]
     if "--glm-pack" in args[:-1]:                       # the model's folder: the pack's parent holds its GGUF files
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
