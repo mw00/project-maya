@@ -712,3 +712,9 @@ def calibrate_config(cfg_path: Path) -> bool:
 def saved_calibration(cfg: dict) -> dict | None:
     """The settings an earlier calibration found for this PC and model, if any."""
     return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
+
+
+if __name__ == "__main__":
+    # ./setup.py starts the installer, as ./setup.sh and START-MAYA.bat do; maya.py hands itself to
+    # ./maya.sh (os.execve) when its Python is not the private venv, so any Python works here
+    os.execv(sys.executable, [sys.executable, str(ROOT / "maya.py"), *sys.argv[1:]])
