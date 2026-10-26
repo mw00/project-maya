@@ -217,11 +217,11 @@ void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStr
 /// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  q6k: the rows are
 /// ggml Q6_K superblocks instead (hd / 256 of them, 210 bytes each, at the start of each row's hd bytes; no scales),
 /// decoded as ggml's dequantize_row_q6_K.
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, bool q6k = false);
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int fmt = 0);
 /// The same over the host's per-token layout (a chunk): token t's cols rows, then their scales, `per` bytes a token;
 /// T tokens -> out F32 [T * cols][hd].
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s,
-                        bool q6k = false);
+                        int fmt = 0);
 /// h[t][k] += gate[t][k] * value[t] with the gate from the normalized dot of h[t][k] * w[k] * key[t][k]
 /// (kv[t] = [key hc x dim | value dim]).
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s);
@@ -231,6 +231,8 @@ struct Gather {
     int src[kWin * kPicks];
 };
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s);
+// bytes [col0, col0 + width) of each of `rows` rows of a matrix `pitch` bytes a row, side by side into out
+void gather_cols(const uint8_t* src, size_t pitch, size_t col0, size_t width, int rows, uint8_t* out, cudaStream_t s);
 /// The MoE's sum, token t: out[t] = sum_j w[t][j] ed[row[t][j]] (its VRAM experts, in pick order) + cpu[t] (when its
 /// cpu flag is set) + sh[t].
 struct Combine {
@@ -274,6 +276,14 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
+/// The helper GPU's share of request seq (DS4_HELPER): waits on the device until req holds it - or a later one, or
+/// *quit: nothing taken - then its T tokens' picks the helper holds (tab[expert] its blob, 0: not held; n experts) into
+/// plan[t][i] (rows kPicks apart, every other entry 0) with their weights w[t][i], the tokens' x (dim floats each, rows
+/// back to back) into x, and seq into *ack: it has read the slot, which the host's answer lets the device write again.
+void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s);
+/// *flag = seq after a system fence: the stream's work before it (the helper's answer) is in place.
+void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual
 /// slot vs[expert] (n_vs of them: the VRAM slots, then the experts streamed in), each slot's rows in token order:
 /// bounds[n_vs + 1], row_tok[r], pos[t][i] (the pick's sorted row, rows kPicks apart).

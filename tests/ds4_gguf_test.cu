@@ -632,7 +632,8 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
     for (size_t o = 0; o < w.size(); o += bb) {
         const float d = 0.001f + 0.002f * std::fabs(frand());
         switch (type) {
-            case gg::iq::kQ4_K: put(o, d), put(o + 2, 0.5f * d); break;
+            case gg::iq::kQ4_K:
+            case gg::iq::kQ5_K: put(o, d), put(o + 2, 0.5f * d); break;
             case gg::iq::kQ2_K: put(o + 80, d), put(o + 82, 0.5f * d); break;
             case gg::iq::kQ3_K: put(o + 108, d); break;
             case gg::iq::kIQ1_M: {   // (d: an F16 in the top nibbles of the 4 scale words, bytes 48..55)
@@ -663,7 +664,50 @@ double q_dot(int type, const uint8_t* row, int k, const float* x) {
 }
 const char* tn(int t) { return gg::type_name(t); }
 const int kQTypes[] = {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS,
-                       gg::iq::kQ2_K,    gg::iq::kQ3_K, gg::iq::kQ4_K,    gg::iq::kIQ1_S, gg::iq::kIQ1_M};
+                       gg::iq::kQ2_K,    gg::iq::kQ3_K, gg::iq::kQ4_K,    gg::iq::kIQ1_S, gg::iq::kIQ1_M,
+                       gg::iq::kIQ2_XS,  gg::iq::kQ5_K};   // (the last two: dense weights / other GGUFs' experts)
+
+// n rows of type t (k values each) through the decode kernels and the prompt path's f16_rows against ggml's own
+// dequantize_row_* values: the kernels' F32 values equal, f16_rows' halves equal to ggml's rounded to F16
+bool check_rows(int t, const std::vector<uint8_t>& w, int k, int n, const char* label, cudaStream_t s) {
+    std::vector<float> want((size_t) n * k);
+    ggml_get_type_traits((ggml_type) t)->to_float(w.data(), want.data(), (int64_t) n * k);
+    uint8_t* dw = dev(w);
+    float* dsub = dev(std::vector<float>((size_t) n * k, -1.0f));
+    float* dtile = dev(std::vector<float>((size_t) n * k, -1.0f));
+    uint16_t* dh = nullptr;
+    CU(cudaMalloc(&dh, (size_t) n * k * 2));
+    const bool ran = gg::iq::decode_values(t, dw, k, n, dsub, dtile, s);
+    const bool ran16 = gg::iq::f16_rows(t, dw, k, n, dh, k, s);
+    CU(cudaStreamSynchronize(s));
+    const std::vector<float> gs = host(dsub, (size_t) n * k), gt = host(dtile, (size_t) n * k);
+    std::vector<uint16_t> gh((size_t) n * k);
+    CU(cudaMemcpy(gh.data(), dh, gh.size() * 2, cudaMemcpyDeviceToHost));
+    size_t bs = 0, bt = 0, bh = 0;
+    for (size_t i = 0; i < want.size(); ++i) {
+        bs += !(gs[i] == want[i]);
+        bt += !(gt[i] == want[i]);
+        const __half wh = __float2half_rn(want[i]);
+        uint16_t u;
+        std::memcpy(&u, &wh, 2);
+        bh += gh[i] != u && !((gh[i] | u) == 0x8000u);   // (a zero's sign aside)
+    }
+    const bool ok = ran && ran16 && bs == 0 && bt == 0 && bh == 0;
+    if (!ok) ++g_fail;
+    std::printf("%-52s %s  %d values: kernels %zu, tiles %zu, f16_rows %zu differ%s\n", label, ok ? "ok  " : "FAIL",
+                n * k, bs, bt, bh, ran && ran16 ? "" : " (not run)");
+    cudaFree(dw), cudaFree(dsub), cudaFree(dtile), cudaFree(dh);
+    return ok;
+}
+
+// the prompt path's rows (f16_rows) for every type on random blocks
+void test_f16_rows(cudaStream_t s) {
+    for (int t : kQTypes) {
+        char what[96];
+        std::snprintf(what, sizeof what, "rows %s = ggml's (kernels, tiles, f16_rows)", tn(t));
+        check_rows(t, q_rand(t, 24, 2048), 2048, 24, what, s);
+    }
+}
 
 // every low-bit type's decode against ggml's own dequantize_row_* on random blocks: the token / window / light
 // kernels' codes times their scales, and the prompt tiles' loader - each value equal to ggml's (a zero's sign aside)
@@ -2057,10 +2101,78 @@ void test_engram_q6k(cudaStream_t s) {
     cudaFree(d_rows), cudaFree(d_out);
 }
 
+// ---------------------------------------------------------------- Engram rows in IQ4_NL, the Q5_K embedding
+__global__ void iq4nl_rows_kernel(const uint8_t* rows, int hd, float* out) {   // (engram_dequant's IQ4_NL branch)
+    const int r = blockIdx.x;
+    for (int e = threadIdx.x; e < hd; e += blockDim.x)
+        out[(size_t) r * hd + e] = strata::ds4::eg_block_value(rows + (size_t) r * hd, e, 2);
+}
+void test_engram_iq4nl(cudaStream_t s) {
+    const int n = 64, hd = 512, nb = hd / 32;   // rows hd bytes apart (as the engine keeps them), 16 blocks of 18 bytes
+    std::vector<uint8_t> rows((size_t) n * hd, 0), packed((size_t) n * nb * 18);
+    for (auto& v : packed) v = (uint8_t) (rng() & 0xff);
+    for (size_t b = 0; b < (size_t) n * nb; ++b) {
+        const __half h = __float2half(0.0005f + 0.002f * std::fabs(frand()));
+        std::memcpy(&packed[b * 18], &h, 2);
+    }
+    for (int r = 0; r < n; ++r) std::memcpy(&rows[(size_t) r * hd], &packed[(size_t) r * nb * 18], (size_t) nb * 18);
+    std::vector<float> want((size_t) n * hd);
+    ggml_get_type_traits(GGML_TYPE_IQ4_NL)->to_float(packed.data(), want.data(), (int64_t) n * hd);
+    uint8_t* d_rows = dev(rows);
+    float* d_out = dev(std::vector<float>((size_t) n * hd));
+    iq4nl_rows_kernel<<<n, 256, 0, s>>>(d_rows, hd, d_out);
+    CU(cudaStreamSynchronize(s));
+    const std::vector<float> got = host(d_out, (size_t) n * hd);
+    const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+    if (!same) ++g_fail;
+    std::printf("%-52s %s\n", "Engram IQ4_NL rows = ggml's, bit for bit", same ? "ok" : "FAIL");
+    cudaFree(d_rows), cudaFree(d_out);
+}
+void test_q5k_host() {
+    const int nb = 512;
+    std::vector<uint8_t> w = q_rand(gg::iq::kQ5_K, 1, nb * 256);
+    std::vector<float> want((size_t) nb * 256), got((size_t) nb * 256);
+    ggml_get_type_traits(GGML_TYPE_Q5_K)->to_float(w.data(), want.data(), (int64_t) nb * 256);
+    for (int b = 0; b < nb; ++b) strata::ds4::q5k_values(w.data() + (size_t) b * 176, got.data() + (size_t) b * 256);
+    const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+    if (!same) ++g_fail;
+    std::printf("%-52s %s\n", "Q5_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
+}
+
 int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreate(&s));
     if (!gg::prepare(s)) return 1;
+    if (argc >= 2 && std::strcmp(argv[1], "--real") == 0) {   // --real <ggml type> <k> <file> <offset> <rows> [label]
+        if (argc < 7) return 2;
+        const int t = std::atoi(argv[2]), k = std::atoi(argv[3]), n = std::atoi(argv[6]);
+        const size_t rb = t == GGML_TYPE_IQ4_NL ? (size_t) k / 32 * 18 : gg::type_row_bytes(t, k);   // (IQ4_NL: Engram only)
+        std::vector<uint8_t> w(rb * (size_t) n);
+        std::FILE* f = std::fopen(argv[4], "rb");
+        if (f == nullptr || fseeko(f, (off_t) std::atoll(argv[5]), SEEK_SET) != 0 || std::fread(w.data(), 1, w.size(), f) != w.size())
+            return 3;
+        std::fclose(f);
+        if (t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_Q5_K && argc >= 8 && std::strstr(argv[7], "embd")) {   // (host / Engram decoders)
+            std::vector<float> want((size_t) n * k), got((size_t) n * k);
+            ggml_get_type_traits((ggml_type) t)->to_float(w.data(), want.data(), (int64_t) n * k);
+            if (t == GGML_TYPE_Q5_K) {
+                for (size_t b = 0; b < (size_t) n * k / 256; ++b) strata::ds4::q5k_values(w.data() + b * 176, got.data() + b * 256);
+            } else {
+                std::vector<uint8_t> rows((size_t) n * k, 0);   // (each row k bytes apart, as the engine keeps them)
+                for (int r = 0; r < n; ++r) std::memcpy(&rows[(size_t) r * k], &w[(size_t) r * k / 32 * 18], (size_t) k / 32 * 18);
+                uint8_t* d_rows = dev(rows);
+                float* d_out = dev(std::vector<float>((size_t) n * k));
+                iq4nl_rows_kernel<<<n, 256, 0, s>>>(d_rows, k, d_out);
+                CU(cudaStreamSynchronize(s));
+                got = host(d_out, (size_t) n * k);
+                cudaFree(d_rows), cudaFree(d_out);
+            }
+            const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+            std::printf("%-52s %s  %d values\n", argc >= 8 ? argv[7] : "real rows", same ? "ok  " : "FAIL", n * k);
+            return same ? 0 : 1;
+        }
+        return check_rows(t, w, k, n, argc >= 8 ? argv[7] : "real rows", s) ? 0 : 1;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--bench") == 0) {
         bench(s);
         bench_q(s);
@@ -2093,8 +2205,11 @@ int main(int argc, char** argv) {
     test_router_rows(s);
     test_mv(s);
     test_engram_q6k(s);
+    test_engram_iq4nl(s);
+    test_q5k_host();
     test_experts(512, 256, s);
     test_decode_values(s);
+    test_f16_rows(s);
     for (int t : kQTypes) test_mv_q(t, s);
     for (const auto& pr : kQPairs) test_experts_q(512, 256, pr.first, pr.second, s);
     test_lanes(s);

@@ -36,7 +36,19 @@ std::vector<uint8_t> rand_rows(int type, int n, int rows, std::mt19937& rng) {
     std::uniform_real_distribution<float> ds(0.0005f, 0.02f);
     for (size_t o = 0; o < w.size(); o += bb) {
         const ggml_fp16_t d = ggml_fp32_to_fp16(ds(rng));
-        std::memcpy(&w[o], &d, sizeof d);
+        if (t == GGML_TYPE_IQ1_M) {
+            // IQ1_M stores the FP16 scale in the high nibbles of its last four words.
+            const uint16_t scales[] = {0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x2400, 0xa400, 0x7bff};
+            const uint16_t scale = scales[(o / bb) % 8];
+            for (int j = 0; j < 4; ++j) {
+                uint16_t word;
+                std::memcpy(&word, &w[o + 48 + 2 * j], sizeof word);
+                word = (word & 0x0fff) | (((scale >> (4 * j)) & 15) << 12);
+                std::memcpy(&w[o + 48 + 2 * j], &word, sizeof word);
+            }
+        } else {
+            std::memcpy(&w[o], &d, sizeof d);
+        }
         if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K) {
             const ggml_fp16_t m = ggml_fp32_to_fp16(ds(rng));
             std::memcpy(&w[o + sizeof d], &m, sizeof m);
@@ -59,9 +71,18 @@ std::vector<uint8_t> rand_acts(int n, int nt, std::mt19937& rng) {
 }
 
 // fn's rows for nt tokens vs ggml's vec_dot per (row, token): the count of results that differ in any bit
-int compare(RowsFn fn, int type, int n, int rows, int nt, std::mt19937& rng) {
+int compare(RowsFn fn, int type, int n, int rows, int nt, std::mt19937& rng, int act_shift = 0) {
     const auto w = rand_rows(type, n, rows, rng);
-    const auto a = rand_acts(n, nt, rng);
+    auto a = rand_acts(n, nt, rng);
+    // Scale after quantization: preserve valid codes and integer sums without overflowing the quantizer's inverse.
+    if (act_shift != 0) {
+        for (size_t offset = 0; offset < a.size(); offset += ggml_type_size(GGML_TYPE_Q8_K)) {
+            float scale;
+            std::memcpy(&scale, a.data() + offset, sizeof scale);
+            scale = std::ldexp(scale, act_shift);
+            std::memcpy(a.data() + offset, &scale, sizeof scale);
+        }
+    }
     const size_t rb = ggml_row_size((ggml_type) type, n), ab = ggml_row_size(GGML_TYPE_Q8_K, n);
     std::vector<const void*> ap(nt);
     std::vector<float> got((size_t) nt * rows), ref((size_t) nt * rows);
@@ -98,7 +119,9 @@ void check_kernel(const char* name, RowsFn fn, void (*set_q5k)(bool) noexcept, i
         }
     }
     int bad = 0, total = 0;
-    for (int n : {2048, 4096})
+    const std::vector<int> widths = type == GGML_TYPE_IQ1_M ? std::vector<int>{256, 512, 2048, 2304, 4096, 5120}
+                                                         : std::vector<int>{2048, 4096};
+    for (int n : widths)
         for (int nt = 1; nt <= 11; ++nt) {
             bad += compare(fn, type, n, 17, nt, rng);
             total += 17 * nt;
@@ -107,6 +130,54 @@ void check_kernel(const char* name, RowsFn fn, void (*set_q5k)(bool) noexcept, i
                 bad);
     if (bad != 0) ++failures;
     if (type == GGML_TYPE_Q5_K) set_q5k(true);
+}
+
+// Tiny Q8_K scales expose rounding of IQ1_M's final delta correction at the float subnormal boundary.
+void check_iq1m_tiny_activations() {
+    std::mt19937 rng(20261024);
+    int bad = 0, total = 0;
+    for (int n : {256, 2304, 5120})
+        for (int nt : {1, 4, 6, 11})
+            for (int shift : {-96, -112, -120, -128, -136}) {
+                bad += compare(cpu::iq256_rows, GGML_TYPE_IQ1_M, n, 17, nt, rng, shift);
+                bad += compare(cpu::iq256_rows1, GGML_TYPE_IQ1_M, n, 17, nt, rng, shift);
+                total += 2 * nt * 17;
+            }
+    std::printf("  IQ1_M tiny activations: %d results, %d differ from ggml\n", total, bad);
+    if (bad != 0) ++failures;
+}
+
+// Padded source strides and partial/empty output ranges must not touch adjacent rows.
+void check_iq1m_row_bounds(std::mt19937& rng) {
+    constexpr int rows = 7;
+    constexpr float guard = -12345.25f;
+    const auto dot = ggml_get_type_traits_cpu(GGML_TYPE_IQ1_M)->vec_dot;
+    for (int n : {256, 2304, 5120}) {
+        const size_t rb = ggml_row_size(GGML_TYPE_IQ1_M, n), stride = rb + 16;
+        const auto packed = rand_rows(GGML_TYPE_IQ1_M, n, rows, rng);
+        std::vector<uint8_t> weights(stride * rows, 0xa5);
+        for (int r = 0; r < rows; ++r)
+            std::memcpy(weights.data() + stride * r, packed.data() + rb * r, rb);
+        for (int nt : {1, 4, 6, 11}) {
+            const auto acts = rand_acts(n, nt, rng);
+            const size_t ab = ggml_row_size(GGML_TYPE_Q8_K, n);
+            std::vector<const void*> ap(nt);
+            std::vector<float*> op(nt);
+            std::vector<float> got((size_t) nt * rows, guard), expected(got);
+            for (int t = 0; t < nt; ++t) {
+                ap[t] = acts.data() + ab * t;
+                op[t] = got.data() + rows * t;
+                for (int r = 2; r < 5; ++r)
+                    dot(n, &expected[(size_t) t * rows + r], 0, weights.data() + stride * r, 0, ap[t], 0, 1);
+            }
+            cpu::iq256_rows(GGML_TYPE_IQ1_M, weights.data(), stride, n, ap.data(), nt, op.data(), 2, 5);
+            cpu::iq256_rows(GGML_TYPE_IQ1_M, weights.data(), stride, n, ap.data(), nt, op.data(), 3, 3);
+            if (std::memcmp(got.data(), expected.data(), got.size() * sizeof(float)) != 0) {
+                std::printf("  IQ1_M row bounds differ at width %d tokens %d\n", n, nt);
+                ++failures;
+            }
+        }
+    }
 }
 
 // GLM's split rows: nt tokens at once vs each token alone (the token path), bit for bit, swiglu clamp 10
@@ -154,14 +225,18 @@ int main() {
     ggml_cpu_init();
     std::mt19937 rng(20261013);
     const int types[] = {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ3_XXS,
-                         GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS};
+                         GGML_TYPE_IQ3_S, GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ1_M};
     const bool avx512 = cpu::cpu_avx512bw_ok(), avx2 = cpu::cpu_avx2_ok();
     std::printf("native_rows_exact_test: AVX-512BW %s, AVX2 %s\n", avx512 ? "yes" : "no", avx2 ? "yes" : "no");
     for (int t : types) {
-        if (avx512) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
+        if (avx512 && cpu::iq512_supported(t)) check_kernel("avx512", cpu::iq512_rows, cpu::iq512_set_q5k_fused, t, rng);
         if (avx2) check_kernel("avx2", cpu::iq256_rows, cpu::iq256_set_q5k_fused, t, rng);
         if (avx2 && cpu::iq256_rows1_supported(t)) check_kernel("avx2-1t", cpu::iq256_rows1, cpu::iq256_set_q5k_fused, t, rng);
         if (cpu::iq512_one_supported(t)) check_kernel("avx512-1t", cpu::iq512_one_rows, cpu::iq512_set_q5k_fused, t, rng);
+    }
+    if (avx2) {
+        check_iq1m_tiny_activations();
+        check_iq1m_row_bounds(rng);
     }
     for (int t : types) check_split(t, rng);
     if (failures != 0) {

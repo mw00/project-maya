@@ -5,7 +5,9 @@ scripted engine (serve/fake_multi_engine.py), and the service's FIFO with n plac
 """
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -58,6 +60,18 @@ class Engine(unittest.TestCase):
         self.assertEqual(len(out), 3)
         for k, (n, got) in out.items():
             self.assertEqual(got, n, k)
+
+    def test_a_restart_does_not_hand_out_a_number_a_request_already_has(self):
+        """restart() rebuilt the rid counter (from 1) and the routing table while the old engine's requests were still
+        unwinding: a request that came in then took an old rid, the engine's lines for it went into THAT request's
+        queue, and it waited for its own for ever - holding its place in the FIFO (the queue filled up behind it and
+        nothing ran any more: silent, no log, no expiry)."""
+        first = next(self.engine._rids)
+        self.engine.restart()
+        self.assertEqual(self.engine.multi, 3)                     # the new process is up and routing
+        self.assertGreater(next(self.engine._rids), first)          # its numbers go on, they are not handed out again
+        toks = [t for t in self.engine.generate(list(range(5)), 5, {}, threading.Event()) if t is not None]
+        self.assertEqual(toks, [1000 + i for i in range(5)])
 
     def test_a_consumer_that_stops_ends_only_its_request(self):
         out = {}
@@ -213,6 +227,75 @@ class Places(unittest.TestCase):
         a.join(5)
         b.join(5)
         self.assertEqual(order, ["all", "one"])
+
+
+# An engine that reads a request's prompt and then says nothing more about it (no T, no DONE): its request waited for
+# a line that never came - holding its place in the FIFO - while nothing said anything (four of those under --parallel
+# and no request started any more, the queue filling with requests nothing ever took).  Written as a script here so
+# StrataEngine starts it as it starts a real engine.
+SILENT_ENGINE = '''\
+#!/usr/bin/env python3
+import sys, threading, time
+quit_ = threading.Event()
+
+def out(s):
+    sys.stdout.write(s + "\\n")
+    sys.stdout.flush()
+
+def reader():
+    for line in sys.stdin:
+        f = line.split()
+        if f and f[0] == "QUIT":
+            break
+        if f and f[0] == "GEN":
+            keys = dict(x.split("=", 1) for x in f[2:-1] if "=" in x)
+            out("PP %s 1 1 1.0 1000.0" % keys.get("rid", "0"))   # the prompt read; then nothing, ever
+    quit_.set()
+
+threading.Thread(target=reader, daemon=True).start()
+out("READY 4096 stop multi=2")
+while not quit_.wait(0.05):
+    pass
+'''
+
+
+class AWedgedRequest(unittest.TestCase):
+    """A request the engine never finishes ends (with an error) instead of waiting for its place for ever, and a
+    cancelled one is drained for DRAIN_S at most: the two waits that held a FIFO place and jammed every request
+    behind it."""
+
+    def setUp(self):
+        import serve.server as srv
+        self.srv = srv
+        self.old = (srv.REQUEST_QUIET_S, srv.DRAIN_S)
+        self.path = Path(tempfile.mkdtemp()) / "silent-engine.py"
+        self.path.write_text(SILENT_ENGINE)
+        self.path.chmod(0o755)
+        self.engine = StrataEngine(str(self.path), [])
+
+    def tearDown(self):
+        self.srv.REQUEST_QUIET_S, self.srv.DRAIN_S = self.old
+        self.engine.close()
+        shutil.rmtree(self.path.parent, ignore_errors=True)
+
+    def test_a_request_the_engine_never_answers_ends(self):
+        self.srv.REQUEST_QUIET_S = 0.4
+        started = time.monotonic()
+        with self.assertRaises(ValueError) as cm:
+            list(self.engine.generate(list(range(10)), 10, {}, threading.Event()))
+        self.assertIn("never answered", str(cm.exception))
+        self.assertLess(time.monotonic() - started, 5.0)          # not the old wait-for-ever
+        self.assertEqual(self.engine._routes, {})                  # its queue is gone: the place went back
+
+    def test_a_cancelled_request_is_drained_for_a_bounded_time(self):
+        self.srv.REQUEST_QUIET_S = 0
+        self.srv.DRAIN_S = 0.3
+        gen = self.engine.generate(list(range(10)), 10, {}, threading.Event())
+        next(gen)                                                  # its PP line: it is running
+        started = time.monotonic()
+        gen.close()                                                # the client went away: STOP, then drain to DONE
+        self.assertLess(time.monotonic() - started, 5.0)           # DRAIN_S, not forever
+        self.assertEqual(self.engine._routes, {})
 
 
 if __name__ == "__main__":

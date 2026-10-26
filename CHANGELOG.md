@@ -4,6 +4,79 @@ Every release is on GitHub (Releases) with these notes; every published change m
 dashboard's About > Update (from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.28 - 2026-10-25
+
+DeepSeek decodes faster on a single NVIDIA GPU and reaches its full 1M context, the chat stays steady while it writes
+long code, and AMD and multi-GPU setups get new opt-in options.
+
+- **Faster DeepSeek decode on one NVIDIA GPU** (#476, @RubenTorney): when the PC's RAM holds the experts, the GPU now
+  gets the experts it needs much more efficiently and keeps more of them close at hand. Up to about 2x decode reported
+  on an RTX 3090, +14% on a V100 here and +35% with less VRAM free; prompts read at the same speed. It is on for Linux
+  with one NVIDIA GPU; Windows, AMD and multi-GPU setups keep the previous path, and the start's log says which runs.
+- **DeepSeek 512K and 1M contexts** (#442, @needmorevram): the setup and the dashboard now offer the model's full
+  context. A longer context takes VRAM from the experts, and a prompt that long takes a while to read.
+- **A steadier chat while it streams** (#478, @needmorevram): long code answers no longer flash or jump, scrolling up
+  stops the chat following the answer, and the sidebar shows the model's logo and name.
+- **GLM on AMD, opt-in** (#454, #455, #456, #457, @pepuscz): the expert helper now works beside a layer split, Maya-M's
+  experts can run on a tuned RDNA kernel, the profiler shows attention in more detail, and alternative decode
+  attention kernels give the same results to the bit. With these settings off nothing changes (`docs/SETTINGS.md`).
+- **DeepSeek on several GPUs, opt-in** (#412, #415, @pepuscz): the DSpark drafter can be spread over a tensor-parallel
+  group to free room on the first GPU, and a helper GPU can take the experts VRAM cannot hold (Linux). Off by default.
+
+## v1.1.27 - 2026-10-24
+
+DeepSeek decodes up to twice as fast on PCs whose RAM holds its experts, GLM reads whole videos, and fixes for a
+Windows server that froze on the first picture and for DeepSeek's calibration.
+
+- **DeepSeek decode where the RAM holds the experts:** `--mmap-experts auto` (the default) now copies a GGUF's CPU-lane
+  experts into RAM when all of them fit with room to spare, instead of reading them from the model's files at every
+  token. Reported on #339 and #441: +22% on four V100s with 504 GB, about 2x on a 20 GB card with 255 GB, +23% on four
+  RTX 3090s with 126 GB; +23% on three V100s here. With less RAM nothing changes (a part copied was measured slower);
+  `--mmap-experts on` keeps them in the files.
+- **GLM reads whole videos** (#248, @kabachuha): send a video like a picture (OpenAI `video_url`, Anthropic `video`);
+  its frames, 4 a second, go through the picture encoder. Needs ffmpeg and ffprobe on the PC (Linux: `sudo apt install
+  ffmpeg`; Windows: `winget install Gyan.FFmpeg`). Only real video files reach ffmpeg (MP4, MOV, WebM, MKV, AVI), and a
+  video longer than `MAYA_VIDEO_MAX_FRAMES` frames (240, a minute) is refused before it is decoded.
+- **Windows: the server froze on the first picture** (#444, @DikiyLifter): the thread that watches the starting program
+  held stdin's lock in a blocking read, and the first picture's `import numpy` waited on it forever. The pipe is now
+  polled. Every version since v1.1.18 was affected.
+- **GLM decode on Volta** (#459, @merbanan): the decode's sparse attention on the V100's tensor cores - its attention
+  ~4x faster, decode a few percent. `MAYA_GLM_MLA_V70=0` turns it off.
+- **DeepSeek calibration** tests the CPU-lane thread counts whenever the lane has threads, fewer than every CPU first
+  (#433, @talisp: one GPU went from 15 to 41 tok/s with fewer threads, and `--calibrate` had skipped the test).
+- **Fixes:** with `MAYA_DS4_TP_GGUF_UNEVEN` the busy experts' buffers are sized for the widest layer, so a 2-GPU tensor
+  parallel no longer fails on the first request (#446, @pepuscz; #439); the busy experts' FP16 path takes only the
+  experts already in VRAM; IQ1_M experts on the CPU lane up to 14x faster, the same results to the bit (#452, @Whamp);
+  DeepSeek GGUFs with IQ2_XS experts (from #357, @OscarSheng), Q5_K dense weights or IQ4_NL Engram tables load, and
+  an Engram table in a format the engine cannot read stops the load with a message instead of crashing.
+
+## v1.1.26 - 2026-10-23
+
+DeepSeek reads prompts up to 1.5x faster on NVIDIA V100s and faster on every NVIDIA GPU, its long tool calls stream,
+and fixes for two-GPU Windows setups and the benchmark.
+
+- **DeepSeek prompts on Volta and Turing** (V100, RTX 20): the sparse attention now runs on their FP16 tensor cores,
+  like RTX 30 and newer since v1.1.24 - twice as fast as before on a V100, as exact as the old path (the held-out
+  KL against the original model the same). `DS4_ATTN_V7=0` turns it off.
+- **DeepSeek prompts on every NVIDIA GPU:** a prompt's busiest experts are decoded to FP16 once and multiplied by the
+  library's GEMM instead of being decoded again for every 64 rows (`DS4_FAT_ROWS`, 64 rows by default; 0: off), and
+  cards of 16-32 GB get wider attention slabs (fewer FP16 decodes of the same weights). Together on three V100s:
+  2K-token prompts ~1.3x, 8K and 32K ~1.5x faster; decode the same.
+- **DeepSeek prompts, more:** the expert copies keep going while the host waits for the routing (#360, @OscarSheng);
+  prompt skip across a 2-GPU layer split (#343, @Gazelle221B); `--tp 1` on one GPU takes the chunked prompt path
+  (#320, @pietroMastro92); tensor parallel 2 on Maya's quants, opt-in `MAYA_DS4_TP_GGUF_UNEVEN` (#408, @pepuscz).
+- **DeepSeek decode:** two cores left free beside the CPU lane where it would take every logical CPU (#359,
+  @OscarSheng; with SMT only where it helps, settable with `MAYA_DS4_LANE_FREE`); the CPU lane prefetches only the
+  expert pages not already in RAM - Windows decode +6-7% (#425, @cryptedy).
+- **GLM prompts on Volta:** the prompt attention in one pass (#335, @merbanan) - long prompts ~8% faster on a V100.
+- **DeepSeek tool calls:** a long string argument (a file's content) streams as it is written, so clients with a
+  stream-idle timeout no longer give up while the model is still writing (#403).
+- **Windows, GLM on two GPUs:** the RAM tier is pinned in pieces of at most 1 GB, so the second GPU gets its share of
+  Windows' pinning budget instead of 0 GB and the start no longer fails (#417). `MAYA_GLM_PIN_PIECE_MB=0`: one block.
+- **Fixes:** the server's queue no longer stays blocked after an engine restart handed out a request number still in
+  use (#330, @jettoblack); `--bench` sends DeepSeek its own chat format and `--report` shows DeepSeek's placement and
+  speed lines and its pictures setting (#416); `--mmap-experts` is a setup option kept by later setups (#422).
+
 ## v1.1.25 - 2026-10-23
 
 Several conversations at once on GLM get faster, DeepSeek keeps conversations across switches and restarts, and a

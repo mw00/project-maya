@@ -114,6 +114,7 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
+VIDEO_PARTS = ("video_url", "input_video", "video")
 
 # Thinking levels: GLM-5.x's own - Off, Low, High and Max (its template's default, the most thorough).  Clients spell
 # them many ways and everything maps onto those four: OpenAI's "medium" (GLM has none) is High, "xhigh" is Max.
@@ -172,8 +173,9 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": "low" if n < 2048 else "high" if n < 8192 else "max"}
 
 
-def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+def _has_media(content) -> bool:
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + VIDEO_PARTS
+                                             for p in content)
 
 
 def _image_source(part: dict) -> str:
@@ -192,10 +194,25 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
+def _video_source(part: dict) -> str:
+    """A video part's source as one string, the same forms as an image's: OpenAI
+    {"type": "video_url", "video_url": {"url": ...}} (or "video_url": "..."), Responses-style
+    {"type": "input_video", "video_url": ...}; Anthropic: {"type": "video", "source": {...}}."""
+    if part.get("type") == "video":
+        src = part.get("source") or {}
+        if src.get("type") == "base64":
+            return f"data:{src.get('media_type', 'video/mp4')};base64,{src.get('data', '')}"
+        return src.get("url") or src.get("path") or ""
+    url = part.get("video_url")
+    if isinstance(url, dict):
+        url = url.get("url")
+    return url or ""
+
+
 def _parts_of(content):
-    """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
-    template's list form - text items and image items, in order - whose image items carry their source."""
-    if not _has_image(content):
+    """Message content for the template: a string when there is no media (unchanged behaviour), otherwise the
+    template's list form - text items and image / video items, in order - whose media items carry their source."""
+    if not _has_media(content):
         return _text_of(content)
     items = []
     for part in content:
@@ -203,6 +220,8 @@ def _parts_of(content):
             continue
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
+        elif part.get("type") in VIDEO_PARTS:
+            items.append({"type": "video", "source": _video_source(part)})
         elif part.get("type") in ("text", "input_text", None) and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -213,6 +232,13 @@ def images_of(messages: list[dict]) -> list[str]:
     <|vision_start|><|image_pad|><|vision_end|> per image item, message by message)."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
+
+
+def media_of(messages: list[dict]) -> list[tuple[str, str]]:
+    """The (kind, source) of the conversation's media, "image" or "video", in prompt order - the order the
+    template renders their markers in, so the order their embeddings are read in."""
+    return [(item["type"], item["source"]) for m in messages if isinstance(m.get("content"), list)
+            for item in m["content"] if item.get("type") in ("image", "video")]
 
 
 def deepseek_images(messages: list[dict]) -> list[str]:
@@ -388,7 +414,7 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         for message in messages:
             if message.get("role") == "developer":
                 message["role"] = "system"
-            if _has_image(message.get("content")):
+            if _has_media(message.get("content")):
                 message["content"] = _parts_of(message["content"])
             for call in message.get("tool_calls") or []:
                 function = call.get("function") or {}
@@ -487,7 +513,7 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
-        if m.get("role") == "user" and _has_image(content) and not any(
+        if m.get("role") == "user" and _has_media(content) and not any(
                 isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
             messages.append({"role": "user", "content": _parts_of(content)})
             continue
@@ -699,8 +725,16 @@ class DsmlRewriter:
         rest, self.buf = self.buf, ""
         return self._plain(rest)
 
+    @staticmethod
+    def _esc(s: str) -> str:
+        """s as JSON string content - character by character, so pieces of a value escape to the whole's escape
+        (issue #403) - with `<` as \\u003c (see _tag)."""
+        return json.dumps(s, ensure_ascii=False)[1:-1].replace("<", "\\u003c")
+
     def _plain(self, s: str) -> str:
         if self.in_param:
+            if self.parameter_string:    # a string value goes out as it is written (issue #403: a long file's
+                return self._esc(s)      # content held to its closing tag left clients without data for minutes)
             self.parameter_text += s
             return ""
         return "" if self.in_calls and not self.in_param and not s.strip() else s
@@ -710,8 +744,7 @@ class DsmlRewriter:
         if self.in_param and not (closing and kind == "parameter"):
             # Like the reference decoder, only the parameter's closing tag is
             # structural here. Other DSML tags can be literal argument data.
-            self.parameter_text += tag
-            return ""
+            return self._plain(tag)
         attrs = dict(_DSML_ATTR.findall(body))
         if kind == "calls":
             self.in_calls = not closing
@@ -721,16 +754,16 @@ class DsmlRewriter:
         if kind == "parameter":
             self.in_param = not closing
             if closing:
-                value = json.dumps(self.parameter_text, ensure_ascii=False) if self.parameter_string else self.parameter_text
                 # A JSON string can contain a literal legacy parser delimiter
                 # (e.g. a tool writing an XML example). JSON's Unicode escape
                 # keeps those values intact across this internal rewrite.
-                value = value.replace("<", "\\u003c")
+                # (a string value: its quotes around the pieces _plain sent as they came)
+                value = '"' if self.parameter_string else self.parameter_text.replace("<", "\\u003c")
                 self.parameter_text = ""
                 return value + ARG_VAL_END
             self.parameter_string = attrs.get("string") == "true"
             self.parameter_text = ""
-            return ARG_KEY + attrs.get("name", "") + ARG_KEY_END + ARG_VAL
+            return ARG_KEY + attrs.get("name", "") + ARG_KEY_END + ARG_VAL + ('"' if self.parameter_string else "")
         return tag
 
 
@@ -847,6 +880,8 @@ class OutputParser:
                 if self.sdeclared.get(pname) == "string":
                     args('"')
                     self.ss, self.sval_started = "str", True     # GLM's values are written as they are
+                elif self.dsml is not None:   # DeepSeek's: a string="true" value arrives JSON-quoted, piece by piece
+                    self.ss, self.sval_started = "jstr", False
                 else:
                     self.ss = "raw"
             elif self.ss == "between":
@@ -895,6 +930,25 @@ class OutputParser:
                     args(json.dumps(rest[:safe])[1:-1])
                     self.sp += safe
                 return out
+            elif self.ss == "jstr":
+                # DsmlRewriter's value: JSON string content between quotes as it is written (its closing quote comes
+                # with the end tag), or a string="false" value whole.  A value that is not complete yet is a string's:
+                # its pieces go out as they are (issue #403); one that arrives complete takes the raw path.
+                end = rest.find(self.vend)
+                if end >= 0 and self.sval_started:
+                    args(rest[:end])                 # (its last piece and the closing quote)
+                    self.sp += end + len(self.vend)
+                    self.ss = "between"
+                    continue
+                if end >= 0:
+                    self.ss = "raw"
+                    continue
+                if not rest or (not self.sval_started and rest[0] != '"'):
+                    return out                       # (a string="false" value: complete at its end tag)
+                args(rest)
+                self.sp += len(rest)
+                self.sval_started = True
+                return out
             elif self.ss == "raw":
                 end = rest.find(self.vend)
                 if end < 0:
@@ -921,9 +975,9 @@ class OutputParser:
         if self.scall is None or self.ss == "done":
             return out
         tail = ""
-        if self.ss == "str":
+        if self.ss == "str" or (self.ss == "jstr" and self.sval_started):
             tail += '"'
-        elif self.ss == "raw":
+        elif self.ss in ("raw", "jstr"):
             tail += json.dumps(self.buf[self.sp:].strip("\n"))
         tail += "}"
         out.append(Event("tool_args", tail, call=self.scall))

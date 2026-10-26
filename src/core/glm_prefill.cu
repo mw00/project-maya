@@ -1765,7 +1765,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
                 ++F->diag_lend_evict;
             }
             // on the compute stream: the prompt's work behind it cannot overwrite the slot before the copy read it
-            if (!glmfast::cuda_ok(cudaMemcpyAsync(R.base + (size_t) rs * R.stride,
+            if (!glmfast::cuda_ok(cudaMemcpyAsync(R.slot((size_t) rs),
                                                    F->lp[(size_t) il].slot_ptr(s), F->L[(size_t) il].blob,
                                                    cudaMemcpyDeviceToHost, F->cs), "glm lending park", err)) {
                 ok = false;
@@ -1776,7 +1776,7 @@ bool Glm5Model::lend_tail(size_t limit, uint64_t& moved, uint64_t& dropped, std:
             R.st[(size_t) rs] = FastState::kRHold;
             F->ram_of[(size_t) key] = rs;
             parked[(size_t) key] = 1;
-            upd(F->rtab_key((size_t) key), (unsigned long long) (R.base + (size_t) rs * R.stride));
+            upd(F->rtab_key((size_t) key), (unsigned long long) (R.slot((size_t) rs)));
             ++F->diag_lend_park;
             return true;
         };
@@ -2319,7 +2319,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         cudaStreamWaitEvent(F->copy, S->ev_pfree, 0);
         cudaEventRecord(S->ev_pstart, F->copy);
         for (int j = 0; j < n; ++j) {
-            cudaMemcpyAsync(S->pbuf + (size_t) j * P.stride, RC.base + (size_t) cand[(size_t) j].rs * RC.stride, Ly.blob,
+            cudaMemcpyAsync(S->pbuf + (size_t) j * P.stride, RC.slot((size_t) cand[(size_t) j].rs), Ly.blob,
                             cudaMemcpyHostToDevice, F->copy);
             if ((j + 1) % PrefillState::kPreEv == 0 || j + 1 == n)
                 cudaEventRecord(S->ev_pdone[(size_t) j / PrefillState::kPreEv], F->copy);
@@ -2887,7 +2887,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                                  P.key[(size_t) vs] == e;
                 if (dev) src = P.slot_ptr(vs);
                 else if (rs >= 0 && (RC.st[(size_t) rs] == FastState::kRHold || RC.st[(size_t) rs] == FastState::kRHelper))
-                    src = RC.base + (size_t) rs * RC.stride;
+                    src = RC.slot((size_t) rs);
                 staged.push_back(Staged{e, src, dev});
             }
             // the prompt's routing feeds the LFU counts the decode's tiers evict by

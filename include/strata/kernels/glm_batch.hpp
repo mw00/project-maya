@@ -108,6 +108,11 @@ void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, c
 bool mla_wmma2_supported();
 bool mla_wmma2_default();
 #endif
+/// One decode token's absorbed MLA attention on Volta's tensor cores (mla_attn_v70_kernel in cell splits, then their
+/// merge): ctx[h] = softmax(q_abs[h] . lat_c * scale) . lat_c over its n_sel cells.  part holds part_cap splits of
+/// n_head x (kv_lora + 2) floats.  False (nothing launched) off Volta, for other shapes, or with STRATA_GLM_MLA_V70=0.
+bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
+                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8 = false);
 /// Absorbed MLA attention per token and head over the token's cells: ctx[t][h] = softmax(q_abs[t][h] . lat_c *
 /// scale) . lat_c.  kv_lora 512, n_head % 16 == 0.
 void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,

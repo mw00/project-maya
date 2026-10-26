@@ -954,16 +954,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const double ms = now_ms() - t1;
             const double fed = (double) std::max<int64_t>(1, s.tokens - s_dec.tokens);
             const double ex = (double) (s.experts - s_dec.experts), cx = (double) (s.cpu_experts - s_dec.cpu_experts),
-                         sx = (double) (s.stream_experts - s_dec.stream_experts);
+                         sx = (double) (s.stream_experts - s_dec.stream_experts),
+                         hx = (double) (s.helper_experts - s_dec.helper_experts);
             std::string out = "STAT";
             char b[160];
             std::snprintf(b, sizeof b, " tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f ram=%.3f promo=%.3f engram_ms=%.3f",
                           ms > 0 ? 1000.0 * (double) produced / ms : 0.0, produced > 0 ? ms / (double) produced : 0.0,
-                          ex > 0 ? 1.0 - (cx + sx) / ex : 1.0, cx / fed, (double) (s.ram_experts - s_dec.ram_experts) / fed,
+                          ex > 0 ? 1.0 - (cx + sx + hx) / ex : 1.0, cx / fed, (double) (s.ram_experts - s_dec.ram_experts) / fed,
                           (double) (s.swaps - s_dec.swaps) / fed, (s.engram_ms - s_dec.engram_ms) / fed);
             out += b;
             if (sx > 0) {   // (the PCIe lane: experts a token streamed to the GPU)
                 std::snprintf(b, sizeof b, " pcie=%.3f", sx / fed);
+                out += b;
+            }
+            if (s.helper_held > 0) {   // (DS4_HELPER: experts a token the helper GPU computed, the CPU lane for it after
+                                       //  a failure; the service thread's wait for it, ms a token; its pool; failed)
+                std::snprintf(b, sizeof b, " helper=%.3f helper_fb=%.3f helper_ms=%.3f helper_held=%d helper_dead=%d",
+                              hx / fed, (double) (s.helper_fallback - s_dec.helper_fallback) / fed,
+                              (s.helper_ms - s_dec.helper_ms) / fed, s.helper_held, s.helper_dead);
                 out += b;
             }
             const long long io = io_read_bytes();
@@ -1402,6 +1410,12 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    if (s.helper_held > 0)   // DS4_HELPER
+        std::fprintf(stderr, "decode helper: %lld experts on the helper GPU (%d held), %lld on the CPU lane after it failed%s; "
+                             "waits for it %.2f ms a token\n",
+                     (long long) (s.helper_experts - s0.helper_experts), s.helper_held,
+                     (long long) (s.helper_fallback - s0.helper_fallback), s.helper_dead ? " (it failed)" : "",
+                     (s.helper_ms - s0.helper_ms) / nt);
     if (s.eg_rows > s0.eg_rows) {   // the Engram rows: how many the row cache served, the reads' time behind the layers
         const double rows = (double) (s.eg_rows - s0.eg_rows);
         std::fprintf(stderr, "Engram per token: %.0f rows, %.1f%% without a read (the row cache holds %lld of %lld), "

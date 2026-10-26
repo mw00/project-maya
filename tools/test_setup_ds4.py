@@ -26,6 +26,22 @@ def args(**kw):
     return SimpleNamespace(**base)
 
 
+class Contexts(unittest.TestCase):
+    def test_up_to_the_models_own(self):
+        """The setup offers DeepSeek's contexts up to the model's own 1M (its max_position_embeddings), the menu in K or M."""
+        self.assertEqual(maya.DS4_CONTEXTS, [32768, 65536, 131072, 262144, 524288, 1048576])
+        self.assertEqual([maya.context_label(c) for c in (8192, 262144, 524288, 1048576)], ["8K", "256K", "512K", "1M"])
+        rows = []
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend(o[0] for o in opts)
+            return len(opts) - 1
+        with patch.object(maya, "choose", pick):
+            self.assertEqual(maya.choose_context(args(context=None), None, maya.DS4_CONTEXTS, maya.DS4_DEFAULT_CONTEXT),
+                             1048576)
+        self.assertEqual(rows[-2:], ["512K tokens", "1M tokens"])
+        self.assertEqual(maya.choose_context(args(context=524288), None, maya.DS4_CONTEXTS), 524288)
+
+
 class Family(unittest.TestCase):
     def test_options_pick_the_model(self):
         self.assertEqual(maya.choose_family(args(model=maya.DS4), {}), "deepseek")

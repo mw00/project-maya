@@ -11,7 +11,7 @@
 // see iq_avx512.cpp).
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23), Q4_K (12), Q5_K (13).
-// IQ1_M stays on ggml-cpu.
+// IQ1_M (29) shares its grid, scale and delta decode across tokens, preserving ggml's two float accumulators.
 #include "strata/kernels/cpu/iq_avx2.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -382,9 +382,71 @@ inline void row_dot_k(const uint8_t* row, int nblocks, const block_q8_K* const* 
     }
 }
 
+// IQ1_M follows the pinned ggml AVX2 dot's integer lanes and float recurrence. Direct index extraction avoids
+// its BMI2 PDEP path; the grid/scales/delta signs are decoded once for the entire token group.
+inline __m256i iq1m_grid(const uint8_t* qs, const uint8_t* qh) {
+    return _mm256_set_epi64x((long long) iq1s_grid[qs[3] | ((qh[1] << 4) & 0x700)],
+                              (long long) iq1s_grid[qs[2] | ((qh[1] << 8) & 0x700)],
+                              (long long) iq1s_grid[qs[1] | ((qh[0] << 4) & 0x700)],
+                              (long long) iq1s_grid[qs[0] | ((qh[0] << 8) & 0x700)]);
+}
+
+inline __m256i iq1m_delta(const uint8_t* qh) {
+    constexpr long long positive = 0x0101010101010101LL;
+    return _mm256_set_epi64x(qh[1] & 0x80 ? -1LL : positive, qh[1] & 0x08 ? -1LL : positive,
+                              qh[0] & 0x80 ? -1LL : positive, qh[0] & 0x08 ? -1LL : positive);
+}
+
+template <int NT>
+inline void row_dot_iq1m(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    __m256 accf[NT], deltaf[NT];
+    const __m256i ones = _mm256_set1_epi8(1);
+    for (int t = 0; t < NT; ++t) accf[t] = deltaf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* block = row + (size_t) i * sizeof(block_iq1_m);
+        uint16_t scales[4];
+        std::memcpy(scales, block + 48, sizeof scales);
+        const uint16_t dh = (scales[0] >> 12) | ((scales[1] >> 8) & 0x00f0) |
+                            ((scales[2] >> 4) & 0x0f00) | (scales[3] & 0xf000);
+        const float dx = h2f(dh);
+        __m256i acci[NT], deltai[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = deltai[t] = _mm256_setzero_si256();
+        for (int j = 0; j < 4; ++j) {
+            const uint8_t* qs = block + 8 * j;
+            const uint8_t* qh = block + 32 + 4 * j;
+            const __m256i grid0 = iq1m_grid(qs, qh), grid1 = iq1m_grid(qs + 4, qh + 2);
+            const __m256i mag0 = _mm256_sign_epi8(grid0, grid0), mag1 = _mm256_sign_epi8(grid1, grid1);
+            const __m256i delta0 = iq1m_delta(qh), delta1 = iq1m_delta(qh + 2);
+            const int sc = scales[j];
+            const __m256i scale0 = sc16(2 * (sc & 7) + 1, 2 * ((sc >> 3) & 7) + 1);
+            const __m256i scale1 = sc16(2 * ((sc >> 6) & 7) + 1, 2 * ((sc >> 9) & 7) + 1);
+            for (int t = 0; t < NT; ++t) {
+                const __m256i a0 = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + 64 * j));
+                const __m256i a1 = _mm256_loadu_si256((const __m256i*) (y[t][i].qs + 64 * j + 32));
+                const __m256i dot0 = _mm256_maddubs_epi16(mag0, _mm256_sign_epi8(a0, grid0));
+                const __m256i dot1 = _mm256_maddubs_epi16(mag1, _mm256_sign_epi8(a1, grid1));
+                const __m256i sum0 = _mm256_maddubs_epi16(ones, _mm256_sign_epi8(a0, delta0));
+                const __m256i sum1 = _mm256_maddubs_epi16(ones, _mm256_sign_epi8(a1, delta1));
+                acci[t] = _mm256_add_epi32(acci[t], _mm256_add_epi32(_mm256_madd_epi16(dot0, scale0),
+                                                                 _mm256_madd_epi16(dot1, scale1)));
+                deltai[t] = _mm256_add_epi32(deltai[t], _mm256_add_epi32(_mm256_madd_epi16(sum0, scale0),
+                                                                     _mm256_madd_epi16(sum1, scale1)));
+            }
+        }
+        for (int t = 0; t < NT; ++t) {
+            const __m256 d = _mm256_set1_ps(dx * y[t][i].d);
+            accf[t] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(acci[t]), accf[t]);
+            deltaf[t] = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(deltai[t]), deltaf[t]);
+        }
+    }
+    // This TU disables contraction; explicit fusion preserves ggml's rounding for subnormal accumulators too.
+    for (int t = 0; t < NT; ++t) res[t] = std::fma(IQ1M_DELTA, hsum_ggml(deltaf[t]), hsum_ggml(accf[t]));
+}
+
 template <int TY, int NT>
 inline void row_dot_any(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
-    if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
+    if constexpr (TY == 29) row_dot_iq1m<NT>(row, nblocks, y, res);
+    else if constexpr (TY == 17) row_dot_iq2xs<NT>(row, nblocks, y, res);
     else if constexpr (TY == 12 || TY == 13) row_dot_k<TY, NT>(row, nblocks, y, res);
     else                    row_dot<TY, NT>(row, nblocks, y, res);
 }
@@ -567,21 +629,22 @@ void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, in
 
 }  // namespace
 
-bool iq256_rows1_supported(int type) noexcept { return type == 18 || type == 21; }
+bool iq256_rows1_supported(int type) noexcept { return type == 18 || type == 21 || type == 29; }
 
 void iq256_rows1(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
     if (type == 18) rows1<18>(w, row_bytes, n, act, nt, out, r0, r1);
     else if (type == 21) rows1<21>(w, row_bytes, n, act, nt, out, r0, r1);
+    else if (type == 29) dot_rows_nt<29>(nt, w, row_bytes, n, act, out, r0, r1);
 }
 
 bool iq256_supported(int type) noexcept {
-    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23 || type == 12 || type == 13;
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 23 || type == 29 || type == 12 || type == 13;
 }
 
 void iq256_set_q5k_fused(bool fused) noexcept { q5k_fused.store(fused); }
 
-#define IQ256_TYPES(F) F(12) F(13) F(16) F(17) F(18) F(21) F(22) F(23)
+#define IQ256_TYPES(F) F(12) F(13) F(16) F(17) F(18) F(21) F(22) F(23) F(29)
 
 void iq256_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {

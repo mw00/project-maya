@@ -23,8 +23,15 @@ main { min-height: 0; min-width: 0; display: flex; }
 .brand__name { font-weight: var(--st-fw-black); font-size: 20px; letter-spacing: -.02em; }
 .brand__sub { font-size: var(--st-fs-xs); color: var(--st-ink-muted); letter-spacing: .04em; }
 .side__spacer { flex: 1; }
-.side__model { font-size: var(--st-fs-xs); color: var(--st-ink-muted); padding: 0 var(--st-s-2); overflow-wrap: anywhere; }
+.side__model { display: flex; align-items: center; gap: var(--st-s-3); font-size: var(--st-fs-xs); color: var(--st-ink-muted);
+               padding: 0 var(--st-s-2); overflow-wrap: anywhere; }
+.side__model-text { min-width: 0; }
 .side__model b { display: block; color: var(--st-ink-soft); font-weight: 600; font-size: var(--st-fs-sm); }
+/* the model's logo on a small tile, so every mark reads on the light and the dark theme */
+.side__logo { flex: none; display: grid; place-items: center; width: 32px; height: 32px; border-radius: var(--st-r-sm);
+              background: var(--st-surface-2); border: 1px solid var(--st-line); }
+.side__logo img { display: block; width: 20px; height: 20px; }
+[data-theme="dark"] .side__logo--mono img { filter: invert(1); }
 .side__foot { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); }
 .side__foot .st-pill { flex: 1; min-width: 0; }
 #pill-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

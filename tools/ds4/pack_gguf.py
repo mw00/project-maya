@@ -129,6 +129,9 @@ LAYER = {
     "engram_embd.weight": "engram.embed.weight",
     "engram_kv.weight": "engram.wkv.weight",
     "engram_gate.weight": "engram.gate.weight",          # q_weight * k_weight, folded by the converter
+    "engram_wkv.weight": "engram.wkv.weight",            # (newer converters: the checkpoint's names,
+    "engram_q.weight": "engram.q_weight",                #  q and k apart - the engine folds them as from the
+    "engram_k.weight": "engram.k_weight",                #  checkpoint)
 }
 GLOBAL = {"token_embd.weight": "embed.weight", "output_norm.weight": "norm.weight", "output.weight": "head.weight"}
 
@@ -212,6 +215,48 @@ def ple_to_engram(kv: dict):
                  ("head_dim", g("embedding_length_per_layer_input")), ("multipliers", list(g("ple.layer_multipliers"))),
                  ("primes", sizes), ("offsets", per), ("num_embeddings", rows)):
         kv["%s.engram.%s" % (a, k)] = v
+
+
+# newer converters' spellings of the metadata -> the ones this pack reads: (theirs, ours)
+NEWER_KEYS = (("kv_source_layer_ids", "attention.kv_source_layers"),
+              ("index_source_layer_ids", "attention.indexer.source_layers"),
+              ("attention.candidate_source_layer_id", "attention.indexer.candidate_source_layer"),
+              ("attention.candidate_topk_blocks", "attention.indexer.candidate_top_k_blocks"),
+              ("attention.candidate_block_size", "attention.indexer.candidate_block_size"),
+              ("dspark_target_layer_ids", "dspark.target_layers"),
+              ("engram.layer_ids", "engram.layers"), ("engram_max_ngram_size", "engram.max_ngram_size"),
+              ("engram_n_heads", "engram.head_count"), ("engram_head_dim", "engram.head_dim"),
+              ("engram_pad_token_id", "engram.pad_token_id"))
+# its Engram hash parameters as tensors (I64 / I32) -> the engram.* lists write_engram takes (each layer's in turn)
+HASH_TENSORS = {"engram_multipliers.weight": "engram.multipliers", "engram_primes.weight": "engram.primes",
+                "engram_offsets.weight": "engram.offsets", "engram_token_map.weight": "engram.token_map"}
+INT_TYPES = {26: ("<i", 4), 27: ("<q", 8)}   # ggml I32 / I64
+
+
+def newer_keys(gs: list, kv: dict):
+    """A GGUF that spells the metadata as NEWER_KEYS's first names, with the Engram hash parameters as tensors: their
+    values under the names the rest of this pack reads (an existing key wins), the tensors read and left out."""
+    a = kv["general.architecture"]
+    for theirs, ours in NEWER_KEYS:
+        if "%s.%s" % (a, theirs) in kv:
+            kv.setdefault("%s.%s" % (a, ours), kv["%s.%s" % (a, theirs)])
+    for g in gs:
+        keep = []
+        for name, typ, dims, off in g.tensors:
+            if name not in HASH_TENSORS:
+                keep.append((name, typ, dims, off))
+                continue
+            if typ not in INT_TYPES:
+                raise SystemExit("%s: %s has ggml type %d (I32 / I64 expected)" % (g.path.name, name, typ))
+            fmt, size = INT_TYPES[typ]
+            n = 1
+            for d in dims:
+                n *= d
+            with g.path.open("rb") as f:
+                f.seek(g.data_start + off)
+                vals = list(struct.unpack(fmt[0] + "%d" % n + fmt[1], f.read(n * size)))
+            kv.setdefault("%s.%s" % (a, HASH_TENSORS[name]), vals)   # (ggml ne0 innermost: each layer's row in turn)
+        g.tensors = keep
 
 
 def split_ple(g: Gguf, kv: dict):
@@ -335,15 +380,19 @@ def main() -> int:
         raise SystemExit("%s: no .gguf files" % model if not shards else
                          "%s: not there" % next(p for p in shards if not p.is_file()))
     gs = [Gguf(p) for p in shards]
+    # (a folder of shards beside a separate Engram GGUF: its tables, read below, not a shard)
+    side = [g for g in gs if g.kv.get("general.architecture") == "deepseek41-engram"]
+    gs = [g for g in gs if g not in side]
     kv = next((g.kv for g in gs if "general.architecture" in g.kv), None)
     if kv is None or kv["general.architecture"] not in ("deepseek41",):
         raise SystemExit("%s: not a DeepSeek-V4.1 GGUF (architecture %r)" % (model, kv and kv.get("general.architecture")))
     split = int(kv.get("split.count", 1))
-    if split != len(shards):
+    if split != len(gs):
         counts = sorted({m.group(1) for m in (re.search(r"-of-(\d{5})\.gguf$", p.name) for p in shards) if m})
         raise SystemExit("%s: %d of the %d shards are here" % (model, len(shards), split) if len(counts) < 2 else
                          "%s: the shards of more than one GGUF split (-of-%s): name the model's own with --shards" %
                          (model, ", -of-".join(counts)))
+    newer_keys(gs, kv)
     ple_to_engram(kv)
     for g in gs:
         split_ple(g, kv)
@@ -355,30 +404,46 @@ def main() -> int:
     have = {t[0] for g in gs for t in g.tensors}
     arch = kv["general.architecture"]
     layers = kv.get("%s.engram.layers" % arch, [])
-    lacking = not layers or any("blk.%d.%s.weight" % (il, part) not in have
-                                for il in layers for part in ("engram_embd", "engram_kv", "engram_gate"))
-    eg_dir, egs = engram_set(model, a.engram) if lacking or a.engram else (None, [])
+    # (each Engram layer: its tables, its kv projection and its gate - folded, or its q and k apart)
+    parts = (("engram_embd",), ("engram_kv", "engram_wkv"), ("engram_gate", "engram_q"))
+    lacking = not layers or any(all("blk.%d.%s.weight" % (il, p) not in have for p in alts)
+                                for il in layers for alts in parts)
+    # the tables in a GGUF of their own beside the shards (the model's engram.file names it)
+    own = kv.get("%s.engram.file" % arch)
+    if lacking and not a.engram and (side or (own and (model / own).is_file())):
+        eg_dir, egs = model, side or [Gguf(model / own)]
+    else:
+        eg_dir, egs = engram_set(model, a.engram) if lacking or a.engram else (None, [])
     eg_from = {}
     if eg_dir is not None:
         eshards = [g.path for g in egs]
         for g in egs:
             for k, v in g.kv.items():
                 if ".engram." in k or ".ple." in k or k.endswith(".embedding_length_per_layer_input"):
-                    kv.setdefault(k, v)
+                    # (the tables' own hash parameters: a quant's that differ would read other rows - the set's win,
+                    #  e.g. Maya's Q6_K tables under another quant)
+                    if k in kv and kv[k] != v and ".engram." in k:
+                        print("Engram %s: the tables' own (%s) over the quant's" % (k.split(".engram.", 1)[1],
+                                                                                str(v)[:60]))
+                    kv[k] = v if ".engram." in k else kv.get(k, v)
         ple_to_engram(kv)
         for g in egs:
             split_ple(g, kv)
         for p, g in zip(eshards, egs):
-            picked = [t for t in g.tensors if re.match(r"blk\.\d+\.engram_", t[0]) and t[0] not in have]
+            # (what the quant's shards hold under another name stays the quant's: a set's folded kv / gate beside
+            #  a quant's own wkv / q / k would be the same tensors twice)
+            alias = {"engram_kv": "engram_wkv", "engram_gate": "engram_q"}
+            picked = [t for t in g.tensors if re.match(r"blk\.\d+\.engram_", t[0]) and t[0] not in have and
+                      not any(t[0].endswith(".%s.weight" % x) and t[0].replace(x, y) in have for x, y in alias.items())]
             if picked:
                 g.tensors = picked
                 eg_from[p] = g
     for il in kv.get("%s.engram.layers" % arch, []):
-        for part in ("engram_embd", "engram_kv", "engram_gate"):
-            nm = "blk.%d.%s.weight" % (il, part)
-            if nm not in have and not any(t[0] == nm for g in eg_from.values() for t in g.tensors):
+        for alts in parts:
+            nms = ["blk.%d.%s.weight" % (il, p) for p in alts]
+            if not any(nm in have or any(t[0] == nm for g in eg_from.values() for t in g.tensors) for nm in nms):
                 raise SystemExit("%s: missing - not in the quant's shards nor in an Engram set (--engram, or "
-                                 "<model>/../Engram/: unsloth's UD-Q8_K_XL shard of the Engram tables)" % nm)
+                                 "<model>/../Engram/: unsloth's UD-Q8_K_XL shard of the Engram tables)" % nms[0])
     rel = lambda p: os.path.relpath(p, model).replace(os.sep, "/")  # noqa: E731
     gs_all = gs + list(eg_from.values())
     names = [g.path.name for g in gs] + [rel(p) for p in eg_from]
@@ -408,6 +473,8 @@ def main() -> int:
             if ck.endswith(".attn.wo_a.slice"):
                 # [o_groups * o_lora][in] -> o_groups entries of [o_lora][in] (group g: rows g * o_lora ..)
                 n = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
+                if len(shape) == 3 and shape[0] == n:   # (newer GGUFs: [o_groups][o_lora][in], the same bytes)
+                    shape = [n * shape[1], shape[2]]
                 if len(shape) != 2 or shape[0] % n:
                     raise SystemExit("%s: %s %s does not split in %d groups" % (g.path.name, name, shape, n))
                 part = nbytes // n

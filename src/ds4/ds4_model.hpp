@@ -61,6 +61,10 @@ struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
     int64_t stream_experts = 0;             // ... and how many of the others streamed to the GPU (the PCIe lane)
+    int64_t helper_experts = 0;             // ... and how many of the others the helper GPU computed (DS4_HELPER)
+    int64_t helper_fallback = 0;            // its picks the CPU lane computed instead (after a helper failure)
+    int helper_held = 0, helper_dead = 0;   // experts in its pool; 1: it failed (or answered late), the CPU lane took over
+    double helper_ms = 0.0;                 // the service thread's waits for the helper's answers, after its own part
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files

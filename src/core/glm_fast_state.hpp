@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -588,9 +589,21 @@ struct Glm5Model::FastState {
                   kRHelper = 7 };   // helper-owned UMA weights: readable by prefill, never a RAM-tier victim
     struct RamClass {
         size_t stride = 0;
-        uint8_t* base = nullptr;
+        uint8_t* base = nullptr;   // the first piece (the only one unless per_part > 0)
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        // pinned in pieces of per_part slots (Windows: a big block takes far more of the per-process pinning budget
+        // than its size - a 2-GPU split's second part got 0 GB, #417); 0: one block from base
+        int per_part = 0;
+        std::vector<uint8_t*> parts;
+        uint8_t* slot(size_t s) const {
+            return per_part > 0 ? parts[s / (size_t) per_part] + (s % (size_t) per_part) * stride : base + s * stride;
+        }
+        size_t part_slots(size_t i) const {   // the slots of piece i
+            return per_part > 0 ? std::min((size_t) per_part, (size_t) n - i * (size_t) per_part) : (size_t) n;
+        }
+        size_t n_parts() const { return per_part > 0 ? parts.size() : (base != nullptr ? 1 : 0); }
+        uint8_t* part(size_t i) const { return per_part > 0 ? parts[i] : base; }
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
         std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /

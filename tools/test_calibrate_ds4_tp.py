@@ -15,6 +15,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 import calibrate_ds4_tp as C4  # noqa: E402
 
+C4.usable_cpus = lambda: 88   # (a host with more CPUs than the 44 threads below: the lane leaves some free)
+
 NINE = [24.0] + [16.0] * 8               # a 24 GB GPU and eight 16 GB ones, in the engine's order
 
 
@@ -78,6 +80,9 @@ class Candidates(unittest.TestCase):
         self.assertEqual(C4.thread_candidates(44), [33, 22])
         self.assertEqual(C4.thread_candidates(3), [2])
         self.assertEqual(C4.thread_candidates(2), [])
+        # a lane that takes every CPU (#433): 2 and 4 fewer first
+        self.assertEqual(C4.thread_candidates(32, every_cpu=True), [30, 28, 24, 16])
+        self.assertEqual(C4.thread_candidates(4, every_cpu=True), [3, 2])
 
     def test_apply(self):
         a = ["--pack", "/p", "--tp", "2"]
@@ -121,10 +126,21 @@ class Measure(unittest.TestCase):
         self.assertEqual(r.res["args"], {"--tp": 8, "--cpu-threads": 33})
         self.assertEqual(r.starts[4:], [(8, "33"), (8, "22")])
 
-    def test_no_cpu_lane_no_threads(self):
+    def test_no_cpu_lane_reported_threads_still_tested(self):
+        # (#433: a reported 0 skipped the test on a PC whose lane took ~60% of the experts - now one start says)
         r = Run(lambda tp, w: DECODE[tp], cpu_experts=0)
-        self.assertEqual(len(r.starts), 4)
+        self.assertEqual(r.starts[4:], [(8, "33")])
         self.assertEqual(r.res["args"]["--cpu-threads"], None)
+
+    def test_a_lane_on_every_cpu_tries_two_fewer_first(self):
+        saved = C4.usable_cpus
+        C4.usable_cpus = lambda: 44
+        try:
+            r = Run(lambda tp, w: DECODE[tp] * (1.9 if w == 42 else 1.0))
+        finally:
+            C4.usable_cpus = saved
+        self.assertEqual(r.res["args"], {"--tp": 8, "--cpu-threads": 42})
+        self.assertEqual(r.starts[4:6], [(8, "42"), (8, "40")])
 
     def test_one_gpu_only_threads(self):
         r = Run(lambda tp, w: 5.0 * (1.2 if w == 33 else 1.0), vram=[24.0], args=["--pack", "/p", "--tp", "2"])
@@ -141,7 +157,7 @@ class Measure(unittest.TestCase):
     def test_a_config_without_tp_is_the_engines_default(self):
         # (no --tp: the engine's 2 is the baseline - not a --tp 1 start, which reads prompts in windows of 16)
         r = Run(lambda tp, w: DECODE[tp], cpu_experts=0, args=["--pack", "/p"])
-        self.assertEqual([s[0] for s in r.starts], [2, 4, 8, 9])
+        self.assertEqual([s[0] for s in r.starts[:4]], [2, 4, 8, 9])
         self.assertEqual(r.res["report"]["own"]["--tp"], 2)
 
     def test_the_baseline_must_start(self):

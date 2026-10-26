@@ -20,6 +20,7 @@ rates decide together (two starts of one setting differ by a few percent: the ex
 """
 from __future__ import annotations
 
+import os
 import shutil
 import statistics
 import sys
@@ -64,13 +65,23 @@ def tp_candidates(vram: list[float]) -> list[int]:
     return out
 
 
-def thread_candidates(default: int) -> list[int]:
-    """Fewer CPU threads than the engine's own: three quarters, then a half (at least 2)."""
+def thread_candidates(default: int, every_cpu: bool = False) -> list[int]:
+    """Fewer CPU threads than the engine's own: three quarters, then a half (at least 2).  every_cpu (the lane takes
+    every CPU this process may use): first 2 and 4 fewer - such a lane leaves the engine's other threads none (#433: 28
+    of 32 vCPUs 1.9x the decode of 32)."""
     out = []
-    for w in (round(default * 3 / 4), round(default / 2)):
+    for w in ((default - 2, default - 4) if every_cpu else ()) + (round(default * 3 / 4), round(default / 2)):
         if 2 <= w < default and w not in out:
             out.append(w)
-    return out
+    return sorted(out, reverse=True)   # (the sweep stops at the first that gains nothing: the fewest last)
+
+
+def usable_cpus() -> int:
+    """The logical CPUs this process may use (its affinity: a container's or taskset's share), else the machine's."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 0
 
 
 def arg(args: list, flag: str) -> str | None:
@@ -240,9 +251,14 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
     info = by_tp[chosen_tp].get("info") or {}
     d_threads = int(own_threads or info.get("cpu_threads") or 0)
     chosen_w, by_w = own_threads, {}
-    if int(info.get("cpu_experts") or 0) > 0 and d_threads > 0:
+    # (the thread test runs whenever the lane has threads: a reported 0 CPU-lane experts skipped it on a PC whose lane
+    #  took ~60% of every token's experts, #433 - a lane that holds none simply gains nothing and stops at the first)
+    if d_threads > 0:
+        if int(info.get("cpu_experts") or 0) <= 0:
+            say(f"    the engine reports no experts on the CPU lane ({info.get('cpu_experts')!r}): its {d_threads} "
+                "threads are tested anyway")
         best_rate = med(by_tp[chosen_tp])
-        for w in thread_candidates(d_threads):
+        for w in thread_candidates(d_threads, every_cpu=d_threads >= usable_cpus() - 1):
             say(f"    --tp {chosen_tp}, {w} CPU threads (the engine's own: {d_threads}): loading the model ...")
             if (r := attempt(f"{w} CPU threads", with_(chosen_tp, w))) is None:
                 break
@@ -252,7 +268,8 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
                 break                                 # (fewer only wait longer for the experts from there)
             chosen_w, best_rate = w, med(r)
     else:
-        say("    no experts on the CPU lane here (VRAM holds them all): the CPU threads do not matter")
+        say(f"    the CPU threads are not tested: the engine reports none ({info.get('cpu_threads')!r}) and the config "
+            "sets none")
     chosen = {"--tp": chosen_tp, "--cpu-threads": None if chosen_w is None else int(chosen_w)}
     final = by_w.get(chosen_w) if chosen_w in by_w else by_tp[chosen_tp]
     report = {"own": {"--tp": own_tp, "--cpu-threads": d_threads or None},

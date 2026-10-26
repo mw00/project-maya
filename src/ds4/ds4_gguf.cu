@@ -1436,6 +1436,11 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
 }
 
 void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+    if (m.fmt == kFmtGG && m.raw != nullptr && !bf16) {   // (a low-bit dense matrix: ds4_iq's FP16 values of it)
+        if (!iq::f16_rows(m.gg_type, (const uint8_t*) m.raw, m.k, m.n, dst, m.k, s)) fail("rows: a low-bit type not covered");
+        check("rows");
+        return;
+    }
     if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0) || m.raw == nullptr) {
         fail("rows: not a BF16 or Q8_0 matrix");
         return;
@@ -1627,6 +1632,7 @@ iq::SetArgs iq_set(const x3::SetArgs& sa) {   // a set as ds4_iq's arguments (th
     q.n_embd = sa.n_embd;
     q.n_ff = sa.n_ff;
     q.limit = sa.limit;
+    q.skip_ge = sa.skip_ge;
     return q;
 }
 }  // namespace

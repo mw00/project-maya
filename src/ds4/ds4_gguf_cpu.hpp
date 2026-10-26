@@ -66,6 +66,9 @@ const char* mx_tier_name(int t);
 /// Whether the rows of `type` are ds4's own here (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI: ggml-cpu's numbers bit for
 /// bit, checked against its dot on first use; DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
+/// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
+/// the one-GPU decode path is off (Model::Impl::one_gpu_path), so those setups keep ggml's rows as before.
+void iq_cpu_iq1s_rows(bool on);
 
 /// x rounded as the device's MXFP4 kernels round their activations (q8_quant: per 32 values sc = max|x| / 127, q =
 /// round-half-even(x / sc), the same F32 operations, so the same q), into out as q sc - an expert gives the same sums

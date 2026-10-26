@@ -332,6 +332,31 @@ class Parsing(unittest.TestCase):
                         events = parse(text, thinking=thinking, stream=stream, step=step)
                         self.assertEqual("".join(e.text for e in events if e.kind == "content"), "\n\nanswer")
 
+    def test_long_string_argument_streams_before_its_closing_tag(self):
+        # issue #403: a file's content (string="true") goes out as the model writes it, not at its closing tag;
+        # the pieces join to the same JSON as the whole call, a string="false" value still arrives whole
+        content = 'line "one" <tag> \\ é\n' * 40 + '<｜DSML｜ invoke name="x">'
+        params = ('<｜DSML｜ parameter name="path" string="true">a.txt</｜DSML｜ parameter>\n'
+                  '<｜DSML｜ parameter name="content" string="true">' + content + '</｜DSML｜ parameter>\n'
+                  '<｜DSML｜ parameter name="mode" string="false">{"append": false}</｜DSML｜ parameter>')
+        text = dsml(params, "write")
+        for step in (1, 3, 17, len(text)):
+            with self.subTest(step=step):
+                parser = OutputParser(thinking=False, stream_tools=True, dsml=True)
+                events, args_before_close = [], 0
+                close = text.index("</｜DSML｜ parameter>", text.index('name="content"'))
+                for i in range(0, len(text), step):
+                    events.extend(parser.feed(text[i:i + step]))
+                    if i + step <= close:
+                        args_before_close = sum(len(e.text) for e in events if e.kind == "tool_args")
+                events += parser.finish()
+                call = next(e.call for e in events if e.kind == "tool_call")
+                self.assertEqual(call.arguments, {"path": "a.txt", "content": content, "mode": {"append": False}})
+                streamed = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(streamed), call.arguments)
+                if step < len(text):
+                    self.assertGreater(args_before_close, len(content) // 2)
+
     def test_namespace_keeps_qualified_internal_name(self):
         text = dsml('<｜DSML｜ parameter name="q" string="true">123</｜DSML｜ parameter>', "search::lookup")
         for stream in (False, True):

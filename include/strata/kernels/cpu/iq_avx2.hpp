@@ -1,9 +1,9 @@
 // include/strata/kernels/cpu/iq_avx2.hpp - AVX-2 multi-token dot products for the i-quant expert
-// formats (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) and the K-quants Q4_K / Q5_K against Q8_K activations
+// formats (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS) and the K-quants Q4_K / Q5_K against Q8_K activations
 // (ggml's block_q8_K).  Each token's result is bit-identical to ggml-cpu's AVX2 dot for that pair.
 //
-// The AVX-512 kernel's scheme on the CPUs without it (AMD Zen 2/3, Intel Core 12th-14th gen): the weights of a
-// 32-value chunk are decoded once per verify window and every token applies them with five instructions.
+// The AVX-512 kernel's scheme on CPUs without it (AMD Zen 2/3, Intel Core 12th-14th gen): decoded weights are
+// reused across activation rows. IQ1_M keeps a separate delta-correction accumulator to preserve ggml's rounding.
 #pragma once
 
 #include <cstddef>
@@ -21,8 +21,7 @@ void iq256_rows(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const 
 /// See iq512_set_q5k_fused.
 void iq256_set_q5k_fused(bool fused) noexcept;
 
-/// The one-token form (a decode step's experts) for IQ3_XXS and IQ3_S: ggml-cpu's AVX2 dot with a cheaper decode,
-/// bit-identical to it; iq256_rows' arguments, each token in turn.
+/// Decode-step rows for IQ1_M, IQ3_XXS and IQ3_S with cheaper decoding; iq256_rows' arguments and exactness.
 bool iq256_rows1_supported(int ggml_type) noexcept;
 void iq256_rows1(int ggml_type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
                  float* const* out, int r0, int r1);
