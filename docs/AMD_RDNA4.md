@@ -77,3 +77,13 @@ They serve the inherited tuning loader. Maya's GLM prompt projections can now
 use the separate `gfx1201-glm-hipblaslt-100202.txt` table through that loader;
 shapes without a tuned row continue through hipBLAS. Its quantized expert path
 still uses GGML MMQ.
+
+## v1.1.29 R9700 Validation (2026-10-26)
+
+On upstream `v1.1.29` (`8b4b39f`) on AI PRO R9700 (`gfx1201`):
+
+- **`ds4_gguf_test`**: **100% PASS (`ALL OK (0 failed)`)** across all KV pack, sparse attention, WMMA, router, `mv`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `MXFP4`, and CPU-lane tests. The 1-ULP `NE=4` vs `NE=1` discrepancy was resolved by wrapping `sub_dot`, `gate_up_kernel`, `down_kernel`, and `lanes_sum` reductions in explicit `#pragma clang fp contract(off)` helpers with `asm volatile` register barriers (`fadd_no_fma`, `fsub_no_fma`, `fmul_no_fma`, `fma_no_contract`).
+- **`glm_attn_bench`**: **PASS** (100% bit-exact parity; `dsa_score` is **3.84x faster** on `gfx1201` at 130K context: `65.0 us` vs `249.4 us` via `v_permlanex16` + `row_xmask` intra-lane butterfly reduction).
+- **`hip_expert_kernel_bench --parity-only`**: **PASS** (`bit_identical=yes` across all production quantization configurations including `gu=21/down=17` `IQ3_S/IQ2_XS` and `gu=22/down=22`).
+- **`hip_intrinsics`**: **PASS** (100% parity).
+

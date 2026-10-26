@@ -55,7 +55,9 @@ int block_bytes(int t) {
     switch (t) {
         case 14: return sizeof(block_q6_K);
         case 16: return sizeof(block_iq2_xxs);
+        case 17: return sizeof(block_iq2_xs);
         case 18: return sizeof(block_iq3_xxs);
+        case 21: return sizeof(block_iq3_s);
         case 22: return sizeof(block_iq2_s);
         default: std::abort();
     }
@@ -296,6 +298,7 @@ int main(int argc, char** argv) {
     check(hipStreamCreate(&stream), "stream create");
     bool ok = run(16, 22, parity_only, shared_mode, sweep, stream);
     ok &= run(16, 18, parity_only, shared_mode, sweep, stream);
+    ok &= run(21, 17, parity_only, shared_mode, sweep, stream);
     if (parity_only) { ok &= run(18, 16, true, shared_mode, sweep, stream); ok &= run(22, 22, true, shared_mode, sweep, stream); }
     check(hipStreamDestroy(stream), "stream destroy");
     std::printf("hip_expert_kernel_bench: %s\n", ok ? "PASS" : "FAIL");

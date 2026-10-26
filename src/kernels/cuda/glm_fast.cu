@@ -74,29 +74,46 @@ __device__ __forceinline__ float warp_max(float v) {
 // across the VALU's lanes on RDNA3 (v_permlanex16 with the identity selects for ^16: a row's lane i reads lane i of the
 // other row; DPP row_xmask for 8, 4, 2, 1) instead of through LDS (__shfl_xor_sync is a ds_bpermute on AMD): the same
 // operations on the same values in the same order, so the same bits (glm_attn_bench checks it); elsewhere the shuffles
-#if defined(STRATA_USE_HIP) && defined(__GFX11__)
-__device__ __forceinline__ float lane_xor16(float v) {
-    const int i = __builtin_bit_cast(int, v);
-    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__) || defined(__gfx906__))
+template<int Mask> __device__ __forceinline__ float lane_swizzle(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), Mask));
 }
 template<int Ctrl> __device__ __forceinline__ float lane_dpp(float v) {
     return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl, 0xf, 0xf, false));
 }
 constexpr bool kLaneSum = true;
 __device__ __forceinline__ float warp_sum_lanes(float v) {
-    v += lane_xor16(v);
-    v += lane_dpp<0x168>(v);   // row_xmask:8
-    v += lane_dpp<0x164>(v);   // row_xmask:4
-    v += lane_dpp<0x162>(v);   // row_xmask:2
-    v += lane_dpp<0x161>(v);   // row_xmask:1
+#if defined(__gfx906__)
+    v += lane_swizzle<0x401f>(v);   // xor 16
+    v += lane_swizzle<0x201f>(v);   // xor 8
+    v += lane_swizzle<0x101f>(v);   // xor 4
+    v += lane_dpp<0x4e>(v);         // quad_perm:[2,3,0,1] (xor 2)
+    v += lane_dpp<0xb1>(v);         // quad_perm:[1,0,3,2] (xor 1)
+#else
+    const int i = __builtin_bit_cast(int, v);
+    v += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    v += lane_dpp<0x168>(v);        // row_xmask:8
+    v += lane_dpp<0x164>(v);        // row_xmask:4
+    v += lane_dpp<0x162>(v);        // row_xmask:2
+    v += lane_dpp<0x161>(v);        // row_xmask:1
+#endif
     return v;
 }
 __device__ __forceinline__ float warp_max_lanes(float v) {
-    v = fmaxf(v, lane_xor16(v));
+#if defined(__gfx906__)
+    v = fmaxf(v, lane_swizzle<0x401f>(v));
+    v = fmaxf(v, lane_swizzle<0x201f>(v));
+    v = fmaxf(v, lane_swizzle<0x101f>(v));
+    v = fmaxf(v, lane_dpp<0x4e>(v));
+    v = fmaxf(v, lane_dpp<0xb1>(v));
+#else
+    const int i = __builtin_bit_cast(int, v);
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false)));
     v = fmaxf(v, lane_dpp<0x168>(v));
     v = fmaxf(v, lane_dpp<0x164>(v));
     v = fmaxf(v, lane_dpp<0x162>(v));
     v = fmaxf(v, lane_dpp<0x161>(v));
+#endif
     return v;
 }
 #else
@@ -781,6 +798,17 @@ template<> __device__ __forceinline__ float dw<19>(const uint8_t* row, int kbx, 
     const float delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f * IQ1S_DELTA / 0x8000);
     return d1q * (x.d * sumi + x.s * delta);
 }
+#if defined(STRATA_USE_HIP)
+// Fast bit-parallel sign expansion for HIP (gfx906/gfx11/gfx12) where __vcmpne4/__vsub4 are software-emulated.
+// Every IQ2/IQ3 grid byte is nonzero and <= 62, so two's-complement negation uses a whole-word add without carries.
+__device__ __forceinline__ uint4 hip_fast_signs(unsigned b, bool parity) {
+    b &= parity ? 127u : 255u;
+    if (parity) b |= (__popc(b) & 1u) << 7;
+    const unsigned lo = (((b & 15u) * 0x10204080u) & 0x80808080u) >> 7;
+    const unsigned hi = ((((b >> 4) & 15u) * 0x10204080u) & 0x80808080u) >> 7;
+    return make_uint4(lo * 255u, lo, hi * 255u, hi);
+}
+#endif
 template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
     const block_iq2_xxs* bq2 = (const block_iq2_xxs*) row + kbx;
     const int q2 = get_int_b2(bq2->qs, iqs);
@@ -790,11 +818,17 @@ template<> __device__ __forceinline__ float dw<16>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int k0 = 0; k0 < 8; k0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[aux8[k0 / 2]];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * k0 / 2), true);
+        sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[k0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[k0 + 1], sumi);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * k0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         sumi = __dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), x.u[k0 + 0], sumi);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         sumi = __dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), x.u[k0 + 1], sumi);
+#endif
     }
     const int ls = aux32 >> 27 | 1;
     sumi = sumi * ls / 8;
@@ -809,11 +843,17 @@ template<> __device__ __forceinline__ float dw<18>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[q3[l0 + 0]], tab[q3[l0 + 1]]);
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(aux32 >> (7 * l0 / 2), true);
+        sumi = __dp4a((int) ((grid_pos.x ^ sgn.x) + sgn.y), x.u[l0 + 0], sumi);
+        sumi = __dp4a((int) ((grid_pos.y ^ sgn.z) + sgn.w), x.u[l0 + 1], sumi);
+#else
         const uint32_t signs = unpack_ksigns(aux32 >> (7 * l0 / 2));
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         sumi = __dp4a((int) __vsub4(grid_pos.x ^ signs0, signs0), x.u[l0 + 0], sumi);
         sumi = __dp4a((int) __vsub4(grid_pos.y ^ signs1, signs1), x.u[l0 + 1], sumi);
+#endif
     }
     const int ls = aux32 >> 28;
     sumi = (ls * sumi + sumi / 2) / 2;
@@ -845,11 +885,17 @@ template<> __device__ __forceinline__ float dw<17>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[q2[l0 / 2] & 0x1FF];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(q2[l0 / 2] >> 9, true);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
         const uint32_t signs = unpack_ksigns(q2[l0 / 2] >> 9);
         const int signs0 = __vcmpne4(signs & 0x08040201, 0);
         const int signs1 = __vcmpne4(signs & 0x80402010, 0);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         if (l0 < 4) {
             sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
             sumi0 = __dp4a(grid_h, x.u[l0 + 1], sumi0);
@@ -874,12 +920,18 @@ template<> __device__ __forceinline__ float dw<22>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const uint2 grid_pos = ((const uint2*) tab)[qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)];
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
         const int signs0 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         if (l0 < 4) {
             sumi0 = __dp4a(grid_l, x.u[l0 + 0], sumi0);
             sumi0 = __dp4a(grid_h, x.u[l0 + 1], sumi0);
@@ -902,12 +954,18 @@ template<> __device__ __forceinline__ float dw<21>(const uint8_t* row, int kbx, 
 #pragma unroll
     for (int l0 = 0; l0 < 8; l0 += 2) {
         const int2 grid_pos = make_int2(tab[qs[l0 + 0] | ((qh << (8 - l0)) & 0x100)], tab[qs[l0 + 1] | ((qh << (7 - l0)) & 0x100)]);
+#if defined(STRATA_USE_HIP)
+        const uint4 sgn = hip_fast_signs(signs_packed_8[l0 / 2], false);
+        const int grid_l = (int) ((grid_pos.x ^ sgn.x) + sgn.y);
+        const int grid_h = (int) ((grid_pos.y ^ sgn.z) + sgn.w);
+#else
         const int signs0 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 =
             __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
         const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
         const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+#endif
         sumi = __dp4a(grid_l, x.u[l0 + 0], sumi);
         sumi = __dp4a(grid_h, x.u[l0 + 1], sumi);
     }
@@ -1156,6 +1214,14 @@ template<> __device__ __forceinline__ float dw_rdna<22>(const uint8_t* row, int 
     }
     const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
     return __half2float(bq2->d) * x.d * sumi;
+}
+template<> __device__ __forceinline__ float dw_rdna<17>(const uint8_t* row, int kbx, int iqs,
+    const XV& x, const uint32_t* tab, const uint4*, bool, bool) {
+    return dw<17>(row, kbx, iqs, x, tab);
+}
+template<> __device__ __forceinline__ float dw_rdna<21>(const uint8_t* row, int kbx, int iqs,
+    const XV& x, const uint32_t* tab, const uint4*, bool, bool) {
+    return dw<21>(row, kbx, iqs, x, tab);
 }
 template<int T, int NR>
 __device__ __forceinline__ void rows_dot_rdna(const uint8_t* const* rows, const block_q8_1* x,
@@ -5104,7 +5170,7 @@ void note_mv(int device, bool on) {
     std::fprintf(stderr, "glm mv: CUDA%d dense GEMVs on the %s\n", device, on ? "RDNA3 kernel" : "original kernels");
 }
 bool mv_rdna_device() {
-    static const int mode = [] {   // -1: default, 0: off, 1: every gfx11
+    static const int mode = [] {   // -1: default (gfx115x + gfx120x), 0: off, 1: every gfx11/gfx12
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
         return v == nullptr ? -1 : v[0] == '0' ? 0 : 1;
     }();
@@ -5116,7 +5182,8 @@ bool mv_rdna_device() {
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
-        on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0;
+        on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0 ||
+             std::strncmp(prop.gcnArchName, "gfx12", 5) == 0;
         cached_device = device;
         note_mv(device, on);
     }
@@ -6328,14 +6395,16 @@ bool rdna3_expert_device(bool allow_gfx1151 = true) {
     static thread_local int cached_device = -1;
     static thread_local bool gfx1100 = false;
     static thread_local bool gfx1151 = false;
+    static thread_local bool gfx120x = false;
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
         gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
         gfx1151 = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
+        gfx120x = std::strncmp(prop.gcnArchName, "gfx120", 6) == 0;
         cached_device = device;
     }
-    return gfx1100 || (allow_gfx1151 && gfx1151);
+    return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151);
 }
 // IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (STRATA_GLM_GU22_TUNED=1) until it is measured end
 // to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel on gfx1100 and
@@ -6398,7 +6467,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device();
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
@@ -6453,7 +6522,7 @@ void gate_up(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, 
     else if (v == Variant::waves8) launch_expert_gu<T, 8>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else if (v == Variant::global_grid) launch_expert_gu<T, 16, true>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); \
     else launch_expert_gu<T, 16>(d,k,n_embd,n_ff,limit,xq,hq,sh_down,sh_type,sh_hq,n_ff_sh,sh_out,s); break;
-    switch (type) { BENCH_GU(16) BENCH_GU(18) BENCH_GU(22)
+    switch (type) { BENCH_GU(16) BENCH_GU(17) BENCH_GU(18) BENCH_GU(21) BENCH_GU(22)
         default: std::fprintf(stderr, "expert bench: unsupported type %d\n", type); std::abort(); }
 #undef BENCH_GU
     launch_check("expert bench gate/up");
@@ -6476,7 +6545,7 @@ void down(Variant v, int type, const MoeDev& d, int k, int n_embd, int n_ff, siz
     else if (v == Variant::rows8) launch_expert_down<T, 8>(d,k,n_embd,n_ff,off,hq,sh,out,s); \
     else if (v == Variant::global_grid) launch_expert_down<T, 4, true>(d,k,n_embd,n_ff,off,hq,sh,out,s); \
     else launch_expert_down<T, 4>(d,k,n_embd,n_ff,off,hq,sh,out,s); break;
-    switch (type) { BENCH_DN(16) BENCH_DN(18) BENCH_DN(22)
+    switch (type) { BENCH_DN(16) BENCH_DN(17) BENCH_DN(18) BENCH_DN(21) BENCH_DN(22)
         default: std::fprintf(stderr, "expert bench: unsupported type %d\n", type); std::abort(); }
 #undef BENCH_DN
     launch_check("expert bench down");
@@ -6555,7 +6624,7 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     const auto* SH = (const block_q8_1*) sh_hq;
     // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
     const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device();
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
     if (gu_type == 22) note_gu22(tuned, 1);
     if (tuned) {
         if (gu_type == 16)

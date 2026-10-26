@@ -295,7 +295,7 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         const uint8_t* qs = b + 8 + 16 * ib;
 #pragma unroll
         for (int t = 0; t < 4; ++t) {
-            const int2 v = tab16(ld4(qs + 4 * t), tab);
+            const int2 v = tab16(ld2(qs + 4 * t), tab);
             s.q[t] = v.x;
             s.q[4 + t] = v.y;
         }
@@ -310,7 +310,11 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         for (int t = 0; t < 8; ++t) s.q[t] = (int) ((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu);
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
-        s.m0 = s.m1 = h2f(b + 2) * (float) m;
+        float m0 = h2f(b + 2) * (float) m;
+#if defined(__clang__)
+        asm volatile("" : "+v"(m0));
+#endif
+        s.m0 = s.m1 = m0;
     } else if constexpr (T == kQ5_K) {   // Q4_K's nibbles and scales, the 5th bit from qh (bit ib of each value's byte)
         int sc, m;
         q4k_scale(b + 4, ib, sc, m);
@@ -321,7 +325,11 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
             s.q[t] = (int) (((ld4(qs + 4 * t) >> sh) & 0x0f0f0f0fu) | (((ld4(b + 16 + 4 * t) >> ib) & 0x01010101u) << 4));
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
-        s.m0 = s.m1 = h2f(b + 2) * (float) m;
+        float m0 = h2f(b + 2) * (float) m;
+#if defined(__clang__)
+        asm volatile("" : "+v"(m0));
+#endif
+        s.m0 = s.m1 = m0;
     } else if constexpr (T == kQ2_K) {
         const int n = ib >> 2, j = ib & 3;
         const uint8_t* qs = b + 16 + 32 * n;
@@ -332,8 +340,12 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s0 = c0 & 15;
         s.s1 = c1 & 15;
         s.d = h2f(b + 80);
-        s.m0 = dmin * (float) (c0 >> 4);
-        s.m1 = dmin * (float) (c1 >> 4);
+        float m0 = dmin * (float) (c0 >> 4), m1 = dmin * (float) (c1 >> 4);
+#if defined(__clang__)
+        asm volatile("" : "+v"(m0), "+v"(m1));
+#endif
+        s.m0 = m0;
+        s.m1 = m1;
     } else if constexpr (T == kIQ1_S || T == kIQ1_M) {
         Raw1 r;
         iq1_load<T>(row, kb, r);
@@ -353,6 +365,48 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.d = h2f(b + 108);
     }
 }
+__device__ __forceinline__ float fadd_no_fma(float a, float b) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+    float r = a + b;
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return __fadd_rn(a, b);
+#endif
+}
+__device__ __forceinline__ float fsub_no_fma(float a, float b) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+    float r = a - b;
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return __fsub_rn(a, b);
+#endif
+}
+__device__ __forceinline__ float fmul_no_fma(float a, float b) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+    float r = a * b;
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return __fmul_rn(a, b);
+#endif
+}
+__device__ __forceinline__ float fma_no_contract(float a, float b, float c) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+    asm volatile("" : "+v"(a), "+v"(b), "+v"(c));
+    float r = __builtin_fmaf(a, b, c);
+    asm volatile("" : "+v"(r));
+    return r;
+#else
+    return __fmaf_rn(a, b, c);
+#endif
+}
+
 // the sub-block against 32 int8 activations (xa: values 0..15, xb: 16..31), before their scale: an exact integer dot,
 // its scales in F32 (explicit roundings: every instantiation the same bits)
 template <int T>
@@ -365,7 +419,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
     hi = __dp4a(s.q[5], xb.y, hi);
     hi = __dp4a(s.q[6], xb.z, hi);
     hi = __dp4a(s.q[7], xb.w, hi);
-    float v = __fmul_rn(s.d, (float) (s.s0 * lo + s.s1 * hi));
+    float v = fmul_no_fma(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
         int sl = __dp4a(0x01010101, xa.x, 0);
         sl = __dp4a(0x01010101, xa.y, sl);
@@ -375,7 +429,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
         sh = __dp4a(0x01010101, xb.y, sh);
         sh = __dp4a(0x01010101, xb.z, sh);
         sh = __dp4a(0x01010101, xb.w, sh);
-        v = __fsub_rn(v, __fadd_rn(__fmul_rn(s.m0, (float) sl), __fmul_rn(s.m1, (float) sh)));
+        v = fsub_no_fma(v, fadd_no_fma(fmul_no_fma(s.m0, (float) sl), fmul_no_fma(s.m1, (float) sh)));
     }
     return v;
 }
@@ -501,7 +555,7 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
@@ -509,7 +563,7 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // 
         gv = fminf(gv, limit);
         uv = fminf(fmaxf(uv, -limit), limit);
     }
-    return __fmul_rn(__fdiv_rn(gv, __fadd_rn(1.0f, expf(-gv))), uv);
+    return fmul_no_fma(__fdiv_rn(gv, fadd_no_fma(1.0f, expf(-gv))), uv);
 }
 __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& blob, int& m0, int& m1) {
     if (a.grp_ptr == nullptr) {
@@ -532,7 +586,7 @@ __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& bl
 template <int RW>
 __device__ __forceinline__ float lanes_sum(float v) {
 #pragma unroll
-    for (int o = 16 / RW; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    for (int o = 16 / RW; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
 constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10 sub-blocks a lane), down (2304: 9)
@@ -559,6 +613,9 @@ struct Ahead {
 // (each sub-block decoded once for them) -> h = the clamped swiglu
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kGuRW>
 __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     constexpr int LPR = 32 / RW;
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     __shared__ int es[NE], xr[NE];
@@ -600,8 +657,8 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
                         const int4* xp = (const int4*) (a.xq + (size_t) xr[i] * a.n_embd + (size_t) kb * 32);
                         const int4 xa = xp[0], xb = xp[1];
                         const float dx = a.xd[(size_t) xr[i] * nsb + kb];
-                        ag[i] = fmaf(dx, sub_dot<T>(sg, xa, xb), ag[i]);
-                        au[i] = fmaf(dx, sub_dot<T>(su, xa, xb), au[i]);
+                        ag[i] = fma_no_contract(dx, sub_dot<T>(sg, xa, xb), ag[i]);
+                        au[i] = fma_no_contract(dx, sub_dot<T>(su, xa, xb), au[i]);
                     }
                 pg = ng;
                 pu = nu;
@@ -620,6 +677,9 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a) {
 // part
 template <int T, int NE, int RP = 1, bool AH = false, int RW = kDnRW>
 __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
+#if defined(__clang__)
+#pragma clang fp contract(off)
+#endif
     constexpr int LPR = 32 / RW;
     __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
     __shared__ int es[NE];
@@ -655,7 +715,7 @@ __global__ void __launch_bounds__(kThreads) down_kernel(const Args a) {
                     if (i < ne) {
                         const int4* hp = (const int4*) (a.hq + (size_t) es[i] * a.n_ff + (size_t) kb * 32);
                         const int4 ha = hp[0], hb = hp[1];
-                        ad[i] = fmaf(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
+                        ad[i] = fma_no_contract(a.hd[(size_t) es[i] * nsb + kb], sub_dot<T>(sd, ha, hb), ad[i]);
                     }
             }
 #pragma unroll
