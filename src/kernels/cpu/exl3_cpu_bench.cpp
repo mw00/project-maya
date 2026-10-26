@@ -1,11 +1,11 @@
 // src/kernels/cpu/exl3_cpu_bench.cpp - how fast does this CPU run GLM-5.3-Flash's EXL3 routed experts on the CPU lane?
 //
-//   exl3_cpu_bench [--K 3,4] [--threads 1,6,12,24] [--tokens 1,2,4,8] [--tiers 0,1,2] [--mb 640] [--per-call 4]
+//   exl3_cpu_bench [--K 3,4] [--threads 1,6,12,24] [--tokens 1,2,4,8] [--tiers 0,1,2,3] [--mb 640] [--per-call 4]
 //                  [--pin] [--hot-only | --cold-only]
 //
 // --K takes exllamav3 1.6's half-integer bitrates too (1.5, 2.5, 3.5).
 // Random trellis words (any bit pattern is a valid encoding), experts of 4096 -> 2048 -> 4096 (gate, up, down), each
-// tier this CPU runs (0 scalar, 1 AVX2 + FMA, 2 AVX-512) through exl3_cpu_band_acc_on:
+// tier this CPU runs (0 scalar, 1 AVX2 + FMA, 2 AVX-512, 3 AVX-512 VNNI) through exl3_cpu_band_acc_on:
 //  HOT   one band of a gate matrix (every slice: 196 KB at K 3, in L2) again and again on one thread - the kernel's
 //        compute speed, weights a second, for 1..N tokens at once;
 //  COLD  --mb of experts read from DRAM once a pass, --per-call experts a call (the start-up timing's 4; a decode
@@ -170,12 +170,12 @@ std::vector<int> k2_list(const char* s) {
     return v;
 }
 
-const char* tier_name(int t) { return t == 2 ? "avx512" : t == 1 ? "avx2" : "scalar"; }
+const char* tier_name(int t) { return t == 3 ? "avx512vnni" : t == 2 ? "avx512" : t == 1 ? "avx2" : "scalar"; }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::vector<int> K2s = {6, 8}, threads = {1, 6, 12, 24}, tokens = {1, 2, 4, 8}, tiers = {0, 1, 2};
+    std::vector<int> K2s = {6, 8}, threads = {1, 6, 12, 24}, tokens = {1, 2, 4, 8}, tiers = {0, 1, 2, 3};
     double mb = 640.0;
     int per = 4;
     bool pin = false, hot = true, cold = true;
@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
         else if (a == "--cold-only") hot = false;
         else {
             std::fprintf(stderr, "usage: exl3_cpu_bench [--K 3,4] [--threads 1,6,12,24] [--tokens 1,2,4,8] "
-                                 "[--tiers 0,1,2] [--mb 640] [--per-call 4] [--pin] [--hot-only | --cold-only]\n");
+                                 "[--tiers 0,1,2,3] [--mb 640] [--per-call 4] [--pin] [--hot-only | --cold-only]\n");
             return 2;
         }
     }

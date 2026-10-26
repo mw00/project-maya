@@ -32,14 +32,17 @@
 
 #if defined(EXL3_X86) && (defined(__GNUC__) || defined(__clang__))
 #define EXL3_AVX512 __attribute__((target("avx512f,avx512bw,fma")))
+#define EXL3_AVX512_VNNI __attribute__((target("avx512f,avx512bw,avx512vnni,fma")))
 #define EXL3_AVX2 __attribute__((target("avx2,fma,f16c")))
 #define EXL3_AVX2_INLINE __attribute__((target("avx2,fma,f16c"), always_inline)) inline
 #elif defined(_MSC_VER)
 #define EXL3_AVX512
+#define EXL3_AVX512_VNNI
 #define EXL3_AVX2
 #define EXL3_AVX2_INLINE __forceinline
 #else
 #define EXL3_AVX512
+#define EXL3_AVX512_VNNI
 #define EXL3_AVX2
 #define EXL3_AVX2_INLINE inline
 #endif
@@ -135,287 +138,26 @@ void band_scalar(const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, 
 
 // ---------------------------------------------------------------- AVX-512
 #if defined(EXL3_X86)
-template <int K2>
-EXL3_AVX512 inline __m512i gather_words(const RowTab<K2>& T, const int32_t (&idx)[16][16], const uint16_t* hi, int r,
-                                        __m512i p0, __m512i p1, __m512i p2, __m512i p3) {
-    const __m512i ix = _mm512_loadu_si512((const void*) idx[r]);
-    __m512i v = _mm512_permutex2var_epi32(p0, ix, p1);
-    if constexpr (4 * K2 > 32) {
-        if (hi[r] != 0) v = _mm512_mask_blend_epi32((__mmask16) hi[r], v, _mm512_permutex2var_epi32(p2, ix, p3));
-    }
-    (void) T;
-    return v;
-}
-
-template <int K2>
-EXL3_AVX512 void band_avx512(const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, float* out /* 128 */) {
-    constexpr int W = 4 * K2;
-    static constexpr RowTab<K2> T = make_rowtab<K2>();
-    constexpr auto ld_mask = [](int n) -> __mmask16 {
-        return n >= 16 ? (__mmask16) 0xffffu : n <= 0 ? (__mmask16) 0 : (__mmask16) ((1u << n) - 1u);
-    };
-    constexpr __mmask16 m0 = ld_mask(W), m1 = ld_mask(W - 16), m2 = ld_mask(W - 32), m3 = ld_mask(W - 48);
-    const int ld = m.n / 16;
-    const size_t row_words = (size_t) ld * W;
-    const __m512i mult = _mm512_set1_epi32((int) kMul1);
-    const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
-    const __m512i low16 = _mm512_set1_epi32(0xffff);
-    __m512 acc[8];
-    for (int t = 0; t < 8; ++t) acc[t] = _mm512_setzero_ps();
-    const uint32_t* row = m.trellis + (size_t) ks0 * row_words + (size_t) tc0 * W;
-    for (int ks = ks0; ks < ks1; ++ks, row += row_words) {
-        // the band's 8 tiles of this slice are contiguous; the next slices' are one row of tiles on
-        const char* pf = (const char*) (row + 4 * row_words);
-        for (int l = 0; l < 8 * W * 4; l += 64) _mm_prefetch(pf + l, _MM_HINT_T0);
-        const float* xk = xh + ks * 16;
-        for (int t = 0; t < 8; ++t) {
-            const uint32_t* w = row + t * W;
-            const __m512i p0 = _mm512_maskz_loadu_epi32(m0, w);
-            const __m512i p1 = m1 ? _mm512_maskz_loadu_epi32(m1, w + 16) : _mm512_setzero_si512();
-            const __m512i p2 = m2 ? _mm512_maskz_loadu_epi32(m2, w + 32) : _mm512_setzero_si512();
-            const __m512i p3 = m3 ? _mm512_maskz_loadu_epi32(m3, w + 48) : _mm512_setzero_si512();
-            __m512 a = acc[t];
-#pragma GCC unroll 16
-            for (int r = 0; r < 16; ++r) {
-                const __m512i wa = gather_words<K2>(T, T.i0, T.hi0, r, p0, p1, p2, p3);
-                const __m512i wb = gather_words<K2>(T, T.i1, T.hi1, r, p0, p1, p2, p3);
-                const __m512i st = _mm512_and_si512(
-                    _mm512_or_si512(_mm512_srlv_epi32(wb, _mm512_loadu_si512((const void*) T.sr[r])),
-                                    _mm512_sllv_epi32(wa, _mm512_loadu_si512((const void*) T.sl[r]))),
-                    low16);
-                const __m512i bs = _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_mullo_epi32(st, mult), ones8), ones16);
-                a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(bs), _mm512_set1_ps(xk[r]), a);
-            }
-            acc[t] = a;
-        }
-    }
-    for (int t = 0; t < 8; ++t) _mm512_storeu_ps(out + t * 16, acc[t]);
-}
-
-// band_avx512 for N activations at once (xh[i] -> out[i]), as exllamav3's CPU kernel takes up to 4 token rows: each
-// tile row's 16 states are pulled out and byte-summed once, then one FMA per activation - activation i's FMAs are
-// band_avx512's for it alone, in its order, so out[i] is the same bit for bit.  An extra activation costs one FMA of
-// the row's ~12 instructions.  (The tiles' accumulators live in memory, loaded once a tile and slice as there: only
-// the N of the tile in hand take registers.)
-template <int K2, int N>
-EXL3_AVX512 void band_avx512_n(const Exl3Part& m, const float* const* xh, int tc0, int ks0, int ks1,
-                               float* const* out /* N x 128 */) {
-    constexpr int W = 4 * K2;
-    static constexpr RowTab<K2> T = make_rowtab<K2>();
-    constexpr auto ld_mask = [](int n) -> __mmask16 {
-        return n >= 16 ? (__mmask16) 0xffffu : n <= 0 ? (__mmask16) 0 : (__mmask16) ((1u << n) - 1u);
-    };
-    constexpr __mmask16 m0 = ld_mask(W), m1 = ld_mask(W - 16), m2 = ld_mask(W - 32), m3 = ld_mask(W - 48);
-    const int ld = m.n / 16;
-    const size_t row_words = (size_t) ld * W;
-    const __m512i mult = _mm512_set1_epi32((int) kMul1);
-    const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
-    const __m512i low16 = _mm512_set1_epi32(0xffff);
-    __m512 acc[8][N];
-    for (int t = 0; t < 8; ++t)
-        for (int i = 0; i < N; ++i) acc[t][i] = _mm512_setzero_ps();
-    const uint32_t* row = m.trellis + (size_t) ks0 * row_words + (size_t) tc0 * W;
-    for (int ks = ks0; ks < ks1; ++ks, row += row_words) {
-        const char* pf = (const char*) (row + 4 * row_words);
-        for (int l = 0; l < 8 * W * 4; l += 64) _mm_prefetch(pf + l, _MM_HINT_T0);
-        const float* xk[N];
-        for (int i = 0; i < N; ++i) xk[i] = xh[i] + ks * 16;
-        for (int t = 0; t < 8; ++t) {
-            const uint32_t* w = row + t * W;
-            const __m512i p0 = _mm512_maskz_loadu_epi32(m0, w);
-            const __m512i p1 = m1 ? _mm512_maskz_loadu_epi32(m1, w + 16) : _mm512_setzero_si512();
-            const __m512i p2 = m2 ? _mm512_maskz_loadu_epi32(m2, w + 32) : _mm512_setzero_si512();
-            const __m512i p3 = m3 ? _mm512_maskz_loadu_epi32(m3, w + 48) : _mm512_setzero_si512();
-            __m512 a[N];
-#pragma GCC unroll 8
-            for (int i = 0; i < N; ++i) a[i] = acc[t][i];
-#pragma GCC unroll 16
-            for (int r = 0; r < 16; ++r) {
-                const __m512i wa = gather_words<K2>(T, T.i0, T.hi0, r, p0, p1, p2, p3);
-                const __m512i wb = gather_words<K2>(T, T.i1, T.hi1, r, p0, p1, p2, p3);
-                const __m512i st = _mm512_and_si512(
-                    _mm512_or_si512(_mm512_srlv_epi32(wb, _mm512_loadu_si512((const void*) T.sr[r])),
-                                    _mm512_sllv_epi32(wa, _mm512_loadu_si512((const void*) T.sl[r]))),
-                    low16);
-                const __m512 f = _mm512_cvtepi32_ps(
-                    _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_mullo_epi32(st, mult), ones8), ones16));
-#pragma GCC unroll 8
-                for (int i = 0; i < N; ++i) a[i] = _mm512_fmadd_ps(f, _mm512_set1_ps(xk[i][r]), a[i]);
-            }
-#pragma GCC unroll 8
-            for (int i = 0; i < N; ++i) acc[t][i] = a[i];
-        }
-    }
-    for (int i = 0; i < N; ++i)
-        for (int t = 0; t < 8; ++t) _mm512_storeu_ps(out[i] + t * 16, acc[t][i]);
-}
-
-// rows_avx512_n: slices [ks0, ks1) of the tile columns [t0, t1) - a split-K piece, or a run of its columns - for N
-// activations (xh[i] -> acc[i], indexed by column; columns 16 t0 .. 16 t1 overwritten).  The tile rows are read in
-// memory order, where a band's tiles are 1 KB runs a whole tile row apart: 40 threads of a 2-socket Xeon 6152 read a K4
-// expert from DRAM in 0.14 ms in pieces, 0.21 in bands (~90 vs ~60 GB/s), the kernel the same.  A tile's 16 sums per
-// activation live in acc between slices; each row's decode and FMAs are band_avx512's, so acc[i] is the N = 1 call's
-// for xh[i] alone, bit for bit, whatever the columns' run.  The prefetch runs 16 tiles ahead in the job's own order
-// (into the next slice past the run's end, not the next job's columns)
-template <int K2, int N>
-EXL3_AVX512 void rows_avx512_n(const Exl3Part& m, const float* const* xh, int ks0, int ks1, int t0, int t1,
-                               float* const* acc) {
-    constexpr int W = 4 * K2;
-    static constexpr RowTab<K2> T = make_rowtab<K2>();
-    constexpr auto ld_mask = [](int n) -> __mmask16 {
-        return n >= 16 ? (__mmask16) 0xffffu : n <= 0 ? (__mmask16) 0 : (__mmask16) ((1u << n) - 1u);
-    };
-    constexpr __mmask16 m0 = ld_mask(W), m1 = ld_mask(W - 16), m2 = ld_mask(W - 32), m3 = ld_mask(W - 48);
-    const int ld = m.n / 16;
-    const size_t row_words = (size_t) ld * W;
-    const __m512i mult = _mm512_set1_epi32((int) kMul1);
-    const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
-    const __m512i low16 = _mm512_set1_epi32(0xffff);
-    for (int i = 0; i < N; ++i)
-        for (int c = 16 * t0; c < 16 * t1; c += 16) _mm512_storeu_ps(acc[i] + c, _mm512_setzero_ps());
-    const int span = t1 - t0;
-    const uint32_t* row = m.trellis + (size_t) ks0 * row_words;
-    for (int ks = ks0; ks < ks1; ++ks, row += row_words) {
-        float xk[N][16];
-        for (int i = 0; i < N; ++i)
-            for (int r = 0; r < 16; ++r) xk[i][r] = xh[i][ks * 16 + r];
-        for (int t = t0; t < t1; ++t) {
-            const uint32_t* w = row + (size_t) t * W;
-            const uint32_t* pf = t + 16 < t1 || span == ld ? w + 16 * W : row + row_words + (size_t) (t + 16 - span) * W;
-            for (int l = 0; l < W * 4; l += 64) _mm_prefetch((const char*) pf + l, _MM_HINT_T0);
-            const __m512i p0 = _mm512_maskz_loadu_epi32(m0, w);
-            const __m512i p1 = m1 ? _mm512_maskz_loadu_epi32(m1, w + 16) : _mm512_setzero_si512();
-            const __m512i p2 = m2 ? _mm512_maskz_loadu_epi32(m2, w + 32) : _mm512_setzero_si512();
-            const __m512i p3 = m3 ? _mm512_maskz_loadu_epi32(m3, w + 48) : _mm512_setzero_si512();
-            __m512 a[N];
-#pragma GCC unroll 8
-            for (int i = 0; i < N; ++i) a[i] = _mm512_loadu_ps(acc[i] + t * 16);
-#pragma GCC unroll 16
-            for (int r = 0; r < 16; ++r) {
-                const __m512i wa = gather_words<K2>(T, T.i0, T.hi0, r, p0, p1, p2, p3);
-                const __m512i wb = gather_words<K2>(T, T.i1, T.hi1, r, p0, p1, p2, p3);
-                const __m512i st = _mm512_and_si512(
-                    _mm512_or_si512(_mm512_srlv_epi32(wb, _mm512_loadu_si512((const void*) T.sr[r])),
-                                    _mm512_sllv_epi32(wa, _mm512_loadu_si512((const void*) T.sl[r]))),
-                    low16);
-                const __m512 f = _mm512_cvtepi32_ps(
-                    _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_mullo_epi32(st, mult), ones8), ones16));
-#pragma GCC unroll 8
-                for (int i = 0; i < N; ++i) a[i] = _mm512_fmadd_ps(f, _mm512_set1_ps(xk[i][r]), a[i]);
-            }
-#pragma GCC unroll 8
-            for (int i = 0; i < N; ++i) _mm512_storeu_ps(acc[i] + t * 16, a[i]);
-        }
-    }
-}
-
-// band_gemm: a band's byte-sum products for many activations - each chunk of kGemmK inputs decoded ONCE into F32
-// (wc, in L2), then multiplied as a GEMM: tiles of TB activations x 64 columns, the sums in registers, two FMAs a
-// load.  The prompt path's CPU rows, where an expert serves tens to hundreds of tokens: one decode (~6 instructions a
-// 16-weight row) for all of them instead of one per kExl3CpuMaxN.
 constexpr int kGemmK = 256;
 
-template <int K2>
-EXL3_AVX512 void decode_chunk(const Exl3Part& m, int tc0, int ks0, int ks1, float* wc /* (ks1 - ks0) 16 x 128 */) {
-    constexpr int W = 4 * K2;
-    static constexpr RowTab<K2> T = make_rowtab<K2>();
-    constexpr auto ld_mask = [](int n) -> __mmask16 {
-        return n >= 16 ? (__mmask16) 0xffffu : n <= 0 ? (__mmask16) 0 : (__mmask16) ((1u << n) - 1u);
-    };
-    constexpr __mmask16 m0 = ld_mask(W), m1 = ld_mask(W - 16), m2 = ld_mask(W - 32), m3 = ld_mask(W - 48);
-    const size_t row_words = (size_t) (m.n / 16) * W;
-    const __m512i mult = _mm512_set1_epi32((int) kMul1);
-    const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
-    const __m512i low16 = _mm512_set1_epi32(0xffff);
-    const uint32_t* row = m.trellis + (size_t) ks0 * row_words + (size_t) tc0 * W;
-    for (int ks = ks0; ks < ks1; ++ks, row += row_words) {
-        const char* pf = (const char*) (row + 4 * row_words);
-        for (int l = 0; l < 8 * W * 4; l += 64) _mm_prefetch(pf + l, _MM_HINT_T0);
-        float* wr = wc + (size_t) (ks - ks0) * 16 * 128;
-        for (int t = 0; t < 8; ++t) {
-            const uint32_t* w = row + t * W;
-            const __m512i p0 = _mm512_maskz_loadu_epi32(m0, w);
-            const __m512i p1 = m1 ? _mm512_maskz_loadu_epi32(m1, w + 16) : _mm512_setzero_si512();
-            const __m512i p2 = m2 ? _mm512_maskz_loadu_epi32(m2, w + 32) : _mm512_setzero_si512();
-            const __m512i p3 = m3 ? _mm512_maskz_loadu_epi32(m3, w + 48) : _mm512_setzero_si512();
-#pragma GCC unroll 16
-            for (int r = 0; r < 16; ++r) {
-                const __m512i wa = gather_words<K2>(T, T.i0, T.hi0, r, p0, p1, p2, p3);
-                const __m512i wb = gather_words<K2>(T, T.i1, T.hi1, r, p0, p1, p2, p3);
-                const __m512i st = _mm512_and_si512(
-                    _mm512_or_si512(_mm512_srlv_epi32(wb, _mm512_loadu_si512((const void*) T.sr[r])),
-                                    _mm512_sllv_epi32(wa, _mm512_loadu_si512((const void*) T.sl[r]))),
-                    low16);
-                const __m512i bs =
-                    _mm512_madd_epi16(_mm512_maddubs_epi16(_mm512_mullo_epi32(st, mult), ones8), ones16);
-                _mm512_store_ps(wr + r * 128 + t * 16, _mm512_cvtepi32_ps(bs));
-            }
-        }
-    }
-}
-
-// acc[t][0..128) += sum_{k < kr} x[t][k] wc[k][..] for TB activations
-template <int TB>
-EXL3_AVX512 void gemm_tile(const float* wc, int kr, const float* const* x, float* const* acc) {
-    for (int cb = 0; cb < 128; cb += 64) {
-        __m512 a[TB][4];
-        for (int t = 0; t < TB; ++t)
-            for (int j = 0; j < 4; ++j) a[t][j] = _mm512_loadu_ps(acc[t] + cb + j * 16);
-        const float* w = wc + cb;
-        for (int k = 0; k < kr; ++k, w += 128) {
-            const __m512 w0 = _mm512_load_ps(w), w1 = _mm512_load_ps(w + 16), w2 = _mm512_load_ps(w + 32),
-                         w3 = _mm512_load_ps(w + 48);
-#pragma GCC unroll 8
-            for (int t = 0; t < TB; ++t) {
-                const __m512 xv = _mm512_set1_ps(x[t][k]);
-                a[t][0] = _mm512_fmadd_ps(xv, w0, a[t][0]);
-                a[t][1] = _mm512_fmadd_ps(xv, w1, a[t][1]);
-                a[t][2] = _mm512_fmadd_ps(xv, w2, a[t][2]);
-                a[t][3] = _mm512_fmadd_ps(xv, w3, a[t][3]);
-            }
-        }
-        for (int t = 0; t < TB; ++t)
-            for (int j = 0; j < 4; ++j) _mm512_storeu_ps(acc[t] + cb + j * 16, a[t][j]);
-    }
-}
-
-// nb bands from tile column tc0 (acc[t]: the activation's 128 nb outputs from there): each chunk of the inputs is
-// taken for every band in turn, so the activations' chunk (n x kGemmK floats) comes from L2 for the nb bands - an
-// expert's rows are its own tokens, and with a job a band they came from DRAM again for every band (~16x the
-// expert's weights in bytes)
-template <int K2>
-EXL3_AVX512 void band_gemm_avx512(const Exl3Part& m, const float* const* xh, int n, int tc0, int nb,
-                                  float* const* acc, float* wc) {
-    constexpr int KS = kGemmK / 16;
-    constexpr int TB = 6;   // 24 sums + 4 weights + the activation: 29 of the 32 registers
-    for (int t = 0; t < n; ++t) std::memset(acc[t], 0, (size_t) nb * 128 * sizeof(float));
-    std::vector<float*> ab((size_t) n);
-    for (int ks0 = 0; ks0 < m.k / 16; ks0 += KS) {
-        const int ks1 = std::min(m.k / 16, ks0 + KS), kr = (ks1 - ks0) * 16;
-        for (int bb = 0; bb < nb; ++bb) {
-            decode_chunk<K2>(m, tc0 + 8 * bb, ks0, ks1, wc);
-            for (int t = 0; t < n; ++t) ab[(size_t) t] = acc[t] + bb * 128;
-            float* const* ap = ab.data();
-            int t = 0;
-            for (; t + TB <= n; t += TB) {
-                const float* xp[TB];
-                for (int i = 0; i < TB; ++i) xp[i] = xh[t + i] + ks0 * 16;
-                gemm_tile<TB>(wc, kr, xp, ap + t);
-            }
-            if (t < n) {   // the last 1..TB-1 activations in one pass too
-                const float* xp[TB];
-                for (int i = 0; i < n - t; ++i) xp[i] = xh[t + i] + ks0 * 16;
-                switch (n - t) {
-                    case 1: gemm_tile<1>(wc, kr, xp, ap + t); break;
-                    case 2: gemm_tile<2>(wc, kr, xp, ap + t); break;
-                    case 3: gemm_tile<3>(wc, kr, xp, ap + t); break;
-                    case 4: gemm_tile<4>(wc, kr, xp, ap + t); break;
-                    default: gemm_tile<5>(wc, kr, xp, ap + t); break;
-                }
-            }
-        }
-    }
-}
+#define EXL3_T EXL3_AVX512
+#define EXL3_BSUM_CONSTS const __m512i ones8 = _mm512_set1_epi8(1), ones16 = _mm512_set1_epi16(1);
+#define EXL3_BSUM(v) _mm512_madd_epi16(_mm512_maddubs_epi16((v), ones8), ones16)
+namespace avx512 {
+#include "exl3_cpu_avx512.inc"
+}  // namespace avx512
+#undef EXL3_T
+#undef EXL3_BSUM_CONSTS
+#undef EXL3_BSUM
+#define EXL3_T EXL3_AVX512_VNNI
+#define EXL3_BSUM_CONSTS const __m512i ones8 = _mm512_set1_epi8(1);
+#define EXL3_BSUM(v) _mm512_dpbusd_epi32(_mm512_setzero_si512(), (v), ones8)
+namespace vnni {
+#include "exl3_cpu_avx512.inc"
+}  // namespace vnni
+#undef EXL3_T
+#undef EXL3_BSUM_CONSTS
+#undef EXL3_BSUM
 
 // had128 in 8 registers: every butterfly takes the operands the scalar loop takes (a lane's partner by a permute; the
 // lower lane a + b, the upper b's lane t - r = a - b), so the result is had128's bit for bit
@@ -1146,6 +888,18 @@ bool cpu_avx512_exl3() {
     cpuid(7, 0);
     return ((r[1] >> 16) & 1u) && ((r[1] >> 30) & 1u);   // AVX-512F, AVX-512BW
 }
+// AVX-512 VNNI (on top of cpu_avx512_exl3: Ice Lake and later Xeons, Zen 4 and later; not Skylake-SP)
+bool cpu_avx512_vnni() {
+    unsigned r[4] = {0, 0, 0, 0};
+#if defined(_MSC_VER)
+    int x[4];
+    __cpuidex(x, 7, 0);
+    for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+    __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
+#endif
+    return ((r[2] >> 11) & 1u) != 0;
+}
 // F16C (the AVX2 tier's FP16 scale conversions; every AVX2 CPU has it, asked anyway)
 bool cpu_f16c() {
     unsigned r[4] = {0, 0, 0, 0};
@@ -1160,14 +914,15 @@ bool cpu_f16c() {
 }
 #endif
 
-// the tiers this CPU runs (bit t: tier t - 0 scalar, 1 AVX2 + FMA + F16C, 2 AVX-512 F/BW), and the one the lane takes:
-// the widest, but AVX2 on an AVX-512 CPU with STRATA_FORCE_AVX2=1 (to compare the two vector tiers)
+// the tiers this CPU runs (bit t: tier t - 0 scalar, 1 AVX2 + FMA + F16C, 2 AVX-512 F/BW, 3 AVX-512 VNNI), and the one
+// the lane takes: the widest, but AVX2 on an AVX-512 CPU with STRATA_FORCE_AVX2=1 (to compare the vector tiers)
 int tier_mask() {
     static const int mask = [] {
         int t = 1;
 #if defined(EXL3_X86)
         if (cpu_avx2_ok() && cpu_f16c()) t |= 2;
         if (cpu_avx512_exl3()) t |= 4;
+        if ((t & 4) && cpu_avx512_vnni()) t |= 8;
 #endif
         return t;
     }();
@@ -1176,25 +931,20 @@ int tier_mask() {
 int detect_tier() {
     const int t = tier_mask();
     const char* f = std::getenv("STRATA_FORCE_AVX2");
-    if ((t & 4) && !(f != nullptr && f[0] == '1')) return 2;
+    if ((t & 4) && !(f != nullptr && f[0] == '1')) return (t & 8) ? 3 : 2;
     return (t & 2) ? 1 : 0;
-}
-
-// A half-integer K (odd K2) runs the AVX2 kernels on an AVX-512 CPU too (tier 2 implies AVX2): the AVX-512 instances
-// of a half K could not be run where they were written (a Zen 3), and the two tiers give the same bits anyway.
-template <int K2>
-constexpr bool avx512_takes() {
-    return (K2 & 1) == 0;
 }
 
 template <int K2>
 void band_on(int tier, const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, float* acc) {
 #if defined(EXL3_X86)
-    if constexpr (avx512_takes<K2>()) {
-        if (tier == 2) {
-            band_avx512<K2>(m, xh, tc0, ks0, ks1, acc);
-            return;
-        }
+    if (tier == 3) {
+        vnni::band_avx512<K2>(m, xh, tc0, ks0, ks1, acc);
+        return;
+    }
+    if (tier == 2) {
+        avx512::band_avx512<K2>(m, xh, tc0, ks0, ks1, acc);
+        return;
     }
     if (tier >= 1) {
         band_avx2<K2>(m, xh, tc0, ks0, ks1, acc);
@@ -1209,17 +959,26 @@ template <int K2>
 void band_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int tc0, int ks0, int ks1,
                float* const* acc) {
 #if defined(EXL3_X86)
-    if constexpr (avx512_takes<K2>()) {
-        if (tier == 2 && n > 1) {
-            switch (n) {
-                case 2: band_avx512_n<K2, 2>(m, xh, tc0, ks0, ks1, acc); return;
-                case 3: band_avx512_n<K2, 3>(m, xh, tc0, ks0, ks1, acc); return;
-                case 4: band_avx512_n<K2, 4>(m, xh, tc0, ks0, ks1, acc); return;
-                case 5: band_avx512_n<K2, 5>(m, xh, tc0, ks0, ks1, acc); return;
-                case 6: band_avx512_n<K2, 6>(m, xh, tc0, ks0, ks1, acc); return;
-                case 7: band_avx512_n<K2, 7>(m, xh, tc0, ks0, ks1, acc); return;
-                default: band_avx512_n<K2, 8>(m, xh, tc0, ks0, ks1, acc); return;
-            }
+    if (tier == 3 && n > 1) {
+        switch (n) {
+            case 2: vnni::band_avx512_n<K2, 2>(m, xh, tc0, ks0, ks1, acc); return;
+            case 3: vnni::band_avx512_n<K2, 3>(m, xh, tc0, ks0, ks1, acc); return;
+            case 4: vnni::band_avx512_n<K2, 4>(m, xh, tc0, ks0, ks1, acc); return;
+            case 5: vnni::band_avx512_n<K2, 5>(m, xh, tc0, ks0, ks1, acc); return;
+            case 6: vnni::band_avx512_n<K2, 6>(m, xh, tc0, ks0, ks1, acc); return;
+            case 7: vnni::band_avx512_n<K2, 7>(m, xh, tc0, ks0, ks1, acc); return;
+            default: vnni::band_avx512_n<K2, 8>(m, xh, tc0, ks0, ks1, acc); return;
+        }
+    }
+    if (tier == 2 && n > 1) {
+        switch (n) {
+            case 2: avx512::band_avx512_n<K2, 2>(m, xh, tc0, ks0, ks1, acc); return;
+            case 3: avx512::band_avx512_n<K2, 3>(m, xh, tc0, ks0, ks1, acc); return;
+            case 4: avx512::band_avx512_n<K2, 4>(m, xh, tc0, ks0, ks1, acc); return;
+            case 5: avx512::band_avx512_n<K2, 5>(m, xh, tc0, ks0, ks1, acc); return;
+            case 6: avx512::band_avx512_n<K2, 6>(m, xh, tc0, ks0, ks1, acc); return;
+            case 7: avx512::band_avx512_n<K2, 7>(m, xh, tc0, ks0, ks1, acc); return;
+            default: avx512::band_avx512_n<K2, 8>(m, xh, tc0, ks0, ks1, acc); return;
         }
     }
     if (tier >= 1 && n > 1) {
@@ -1243,18 +1002,28 @@ template <int K2>
 void rows_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, int t0, int t1,
                float* const* acc) {
 #if defined(EXL3_X86)
-    if constexpr (avx512_takes<K2>()) {
-        if (tier == 2) {
-            switch (n) {
-                case 1: rows_avx512_n<K2, 1>(m, xh, ks0, ks1, t0, t1, acc); return;
-                case 2: rows_avx512_n<K2, 2>(m, xh, ks0, ks1, t0, t1, acc); return;
-                case 3: rows_avx512_n<K2, 3>(m, xh, ks0, ks1, t0, t1, acc); return;
-                case 4: rows_avx512_n<K2, 4>(m, xh, ks0, ks1, t0, t1, acc); return;
-                case 5: rows_avx512_n<K2, 5>(m, xh, ks0, ks1, t0, t1, acc); return;
-                case 6: rows_avx512_n<K2, 6>(m, xh, ks0, ks1, t0, t1, acc); return;
-                case 7: rows_avx512_n<K2, 7>(m, xh, ks0, ks1, t0, t1, acc); return;
-                default: rows_avx512_n<K2, 8>(m, xh, ks0, ks1, t0, t1, acc); return;
-            }
+    if (tier == 3) {
+        switch (n) {
+            case 1: vnni::rows_avx512_n<K2, 1>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 2: vnni::rows_avx512_n<K2, 2>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 3: vnni::rows_avx512_n<K2, 3>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 4: vnni::rows_avx512_n<K2, 4>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 5: vnni::rows_avx512_n<K2, 5>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 6: vnni::rows_avx512_n<K2, 6>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 7: vnni::rows_avx512_n<K2, 7>(m, xh, ks0, ks1, t0, t1, acc); return;
+            default: vnni::rows_avx512_n<K2, 8>(m, xh, ks0, ks1, t0, t1, acc); return;
+        }
+    }
+    if (tier == 2) {
+        switch (n) {
+            case 1: avx512::rows_avx512_n<K2, 1>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 2: avx512::rows_avx512_n<K2, 2>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 3: avx512::rows_avx512_n<K2, 3>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 4: avx512::rows_avx512_n<K2, 4>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 5: avx512::rows_avx512_n<K2, 5>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 6: avx512::rows_avx512_n<K2, 6>(m, xh, ks0, ks1, t0, t1, acc); return;
+            case 7: avx512::rows_avx512_n<K2, 7>(m, xh, ks0, ks1, t0, t1, acc); return;
+            default: avx512::rows_avx512_n<K2, 8>(m, xh, ks0, ks1, t0, t1, acc); return;
         }
     }
     if (tier >= 1) {
@@ -1317,7 +1086,7 @@ bool exl3_cpu_available() { return true; }
 
 float exl3_cpu_prepare_block(const uint16_t* suh, const float* x, float* xh) {
 #if defined(EXL3_X86)
-    if (exl3_cpu_tier() == 2) return prepare_block_avx512(suh, x, xh);
+    if (exl3_cpu_tier() >= 2) return prepare_block_avx512(suh, x, xh);
     if (exl3_cpu_tier() == 1) return prepare_block_avx2(suh, x, xh);
 #endif
     for (int i = 0; i < 128; ++i) xh[i] = x[i] * f32_from_f16(suh[i]);
@@ -1344,7 +1113,7 @@ void exl3_cpu_band_acc_n(const Exl3Part& m, const float* const* xh, int n, int c
 
 bool exl3_cpu_band_acc_on(int tier, const Exl3Part& m, const float* const* xh, int n, int c0, int ks0, int ks1,
                           float* const* acc) {
-    if (tier < 0 || tier > 2 || ((tier_mask() >> tier) & 1) == 0 || n < 1) return false;
+    if (tier < 0 || tier > 3 || ((tier_mask() >> tier) & 1) == 0 || n < 1) return false;
     if (n == 1) band_acc_tier(tier, m, xh[0], c0, ks0, ks1, acc[0]);
     else band_acc_n_tier(tier, m, xh, n, c0, ks0, ks1, acc);
     return true;
@@ -1376,15 +1145,23 @@ size_t exl3_cpu_gemm_scratch() { return (size_t) kGemmK * 128; }
 void exl3_cpu_band_gemm(const Exl3Part& m, const float* const* xh, int n, int c0, int nb, float* const* acc,
                         float* wc) {
 #if defined(EXL3_X86)
-    if (exl3_cpu_tier() == 2 && (m.k2 & 1) == 0) {
+    if (exl3_cpu_tier() == 3) {
         switch (m.k2) {
-#define EXL3_CASE(K2) case K2: band_gemm_avx512<K2>(m, xh, n, c0 / 16, nb, acc, wc); return;
-            EXL3_CASE(2) EXL3_CASE(4) EXL3_CASE(6) EXL3_CASE(8) EXL3_CASE(10) EXL3_CASE(12) EXL3_CASE(14) EXL3_CASE(16)
+#define EXL3_CASE(K2) case K2: vnni::band_gemm_avx512<K2>(m, xh, n, c0 / 16, nb, acc, wc); return;
+            EXL3_LANE_K2(EXL3_CASE)
 #undef EXL3_CASE
             default: break;
         }
     }
-    if (exl3_cpu_tier() >= 1) {   // a half-integer K on tier 2 too (see avx512_takes)
+    if (exl3_cpu_tier() == 2) {
+        switch (m.k2) {
+#define EXL3_CASE(K2) case K2: avx512::band_gemm_avx512<K2>(m, xh, n, c0 / 16, nb, acc, wc); return;
+            EXL3_LANE_K2(EXL3_CASE)
+#undef EXL3_CASE
+            default: break;
+        }
+    }
+    if (exl3_cpu_tier() >= 1) {
         switch (m.k2) {
 #define EXL3_CASE(K2) case K2: band_gemm_avx2<K2>(m, xh, n, c0 / 16, nb, acc, wc); return;
             EXL3_LANE_K2(EXL3_CASE)
@@ -1405,7 +1182,7 @@ void exl3_cpu_rows_acc(const Exl3Part& m, const float* xh, int ks0, int ks1, flo
 void exl3_cpu_band_out(const Exl3Part& m, const float* acc, float xsum, int c0, float* y) {
     const float ki = k_inv(), kz = k_zero() * xsum;
 #if defined(EXL3_X86)
-    if (exl3_cpu_tier() == 2) {
+    if (exl3_cpu_tier() >= 2) {
         band_out_avx512(acc, ki, kz, m.svh + c0, y);
         return;
     }

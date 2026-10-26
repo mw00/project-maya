@@ -1070,7 +1070,9 @@ void test_cpu_gemm(int k, int n, int k2) {
     if (!ok) ++g_fail;
 }
 
-const char* cpu_tier_name(int tier) { return tier == 2 ? "avx512" : tier == 1 ? "avx2" : "scalar"; }
+const char* cpu_tier_name(int tier) {
+    return tier == 3 ? "avx512vnni" : tier == 2 ? "avx512" : tier == 1 ? "avx2" : "scalar";
+}
 
 // The vector tiers' arithmetic, written out on its own: column c's state at row r is the 16-bit window that ends at
 // bit (p + 1 + 256) K of the tile's MSB-first bit ring (p: the tile's step at (r, c) - row (p/8 % 4) 2 + (p & 1) +
@@ -1130,13 +1132,13 @@ void test_cpu_exact(int k, int n, int k2) {
     for (int i = 0; i < NT; ++i) gp[i] = got.data() + (size_t) i * 128;
     const int S = k / 16;
     const int ranges[3][2] = {{0, S}, {3, S - 1}, {S / 2, S / 2 + 1}};
-    size_t diff[3] = {0, 0, 0}, cmp[3] = {0, 0, 0};
+    size_t diff[4] = {0, 0, 0, 0}, cmp[4] = {0, 0, 0, 0};
     double se = 0.0, sr = 0.0;
     for (int c0 = 0; c0 < n; c0 += 128)
         for (const auto& rg : ranges) {
             for (int i = 0; i < NT; ++i)
                 for (int j = 0; j < 128; ++j) want[(size_t) i * 128 + j] = exact_band_col(m, xp[i], c0 + j, rg[0], rg[1]);
-            for (int tier = 0; tier <= 2; ++tier)
+            for (int tier = 0; tier <= 3; ++tier)
                 for (int nt : {1, 2, 3, 5, 8, 11}) {
                     if (!cpu::exl3_cpu_band_acc_on(tier, m, xp, nt, c0, rg[0], rg[1], gp)) break;
                     for (size_t i = 0; i < (size_t) nt * 128; ++i) {
@@ -1149,7 +1151,7 @@ void test_cpu_exact(int k, int n, int k2) {
                     }
                 }
         }
-    for (int tier = 1; tier <= 2; ++tier) {
+    for (int tier = 1; tier <= 3; ++tier) {
         if (cmp[tier] == 0) continue;
         const std::string what = std::string("cpu exact ") + cpu_tier_name(tier) + " k" + std::to_string(k) + " n" +
                                  std::to_string(n) + " K" + kname(k2);

@@ -63,7 +63,7 @@ void exl3_cpu_rows_acc_cols_n(const Exl3Part& m, const float* const* xh, int n, 
 size_t exl3_cpu_gemm_scratch();
 void exl3_cpu_band_gemm(const Exl3Part& m, const float* const* xh, int n, int c0, int nb, float* const* acc,
                         float* wc);
-/// exl3_cpu_band_acc_n on a given tier (0, 1, 2 as exl3_cpu_tier) - tests and benchmarks; false (nothing computed)
+/// exl3_cpu_band_acc_n on a given tier (0, 1, 2, 3 as exl3_cpu_tier) - tests and benchmarks; false (nothing computed)
 /// where this CPU cannot run it.
 bool exl3_cpu_band_acc_on(int tier, const Exl3Part& m, const float* const* xh, int n, int c0, int ks0, int ks1,
                           float* const* acc);
