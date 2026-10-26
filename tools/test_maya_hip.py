@@ -335,7 +335,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("AMD Radeon AI PRO R9700", text)
         self.assertIn(str(32 * 2**30), text)
         self.assertIn("6.14.0-37", text)
-        self.assertIn(f"path {self.rocm}\nversion 7.2.1", text)
+        shown = str(self.rocm).replace(str(Path.home()), "~")
+        self.assertIn(f"path {shown}\nversion 7.2.1", text)
         self.assertIn('"backend": "hip"', text)
         self.assertIn("test-date", text)
         self.assertIn("the speed and memory lines (last 80 of 6)", text)
@@ -352,10 +353,19 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("amdgpu driver:", text)
         self.assertIn("kernel", text)
         self.assertIn("using KFD topology", text)
-        self.assertIn(f"path {self.rocm}", text)
+        self.assertIn("path " + str(self.rocm).replace(str(Path.home()), "~"), text)
         self.assertIn("version unknown", text)
         self.assertFalse(any(Path(c.args[0][0]).name in ("rocm-smi", "amd-smi", "hipcc")
                              for c in query.call_args_list))
+
+    def test_report_rocm_path_inside_and_outside_home(self):
+        self.installed_config()
+        for home, shown in ((self.root, str(Path("~") / "rocm")), (self.root / "other-home", str(self.rocm))):
+            with self.subTest(home=home), patch.object(Path, "home", return_value=home):
+                text, _ = self.run_report()
+                self.assertIn(f"path {shown}\n", text)
+                if home == self.root:
+                    self.assertNotIn(str(home), text)
 
     def test_report_amd_smi_after_bad_rocm_smi_json(self):
         self.installed_config()
@@ -408,7 +418,8 @@ class HipSetupTests(unittest.TestCase):
         path.write_text(json.dumps(cfg))
         path.with_suffix(".log").write_text("glm stat: decode 50.0 ms/tok | prompt 413 tok/s\n")
         text, _ = self.run_report(cfg_path=path)
-        self.assertIn(f"path {root}\nversion 7.2.2", text)
+        shown = str(root).replace(str(Path.home()), "~")
+        self.assertIn(f"path {shown}\nversion 7.2.2", text)
         self.assertIn("Setup chosen.json", text)
         self.assertIn("Engine log chosen.log: the speed and memory lines", text)
         self.assertNotIn("Setup maya-test-cuda.json", text)
