@@ -90,3 +90,18 @@
   .facts dd { margin-bottom: 8px; }
   .input--key { width: 100%; }
 }
+
+/* Savings: each model's API prices */
+.prices { display: flex; flex-direction: column; gap: 12px; margin: 12px 0 4px; }
+.price { display: flex; flex-direction: column; gap: 12px; padding: 14px 16px; border-radius: var(--st-r-md); border: 1px solid var(--st-line); }
+.price__head { display: flex; align-items: center; gap: 12px; }
+.price__head .model-logo { border-radius: var(--st-r-sm); background: var(--st-surface-2); flex: none; }
+.price__head > span:nth-child(2) { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.35; }
+.price__head b { font-size: var(--st-fs-base); font-weight: 600; }
+.price__head span span { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.price__grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+.price__in { display: flex; align-items: center; gap: 6px; }
+.price__in > span { flex: none; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.price__in .input--num { width: 100%; min-width: 0; }
+.price__foot { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.price__foot > span { flex: 1 1 200px; line-height: 1.4; }

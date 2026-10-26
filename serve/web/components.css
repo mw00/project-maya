@@ -69,6 +69,7 @@ a:hover { color: var(--st-ink); }
 .input--area { height: auto; min-height: 120px; padding: 12px 14px; border-radius: var(--st-r-md); font-size: var(--st-fs-base);
                line-height: 1.5; resize: vertical; }
 .input--num { width: 104px; font-variant-numeric: tabular-nums; }
+.input.is-bad { border-color: var(--st-danger-text); }
 .input--key { width: 240px; }
 .field { display: flex; flex-direction: column; gap: 6px; font-size: var(--st-fs-md); }
 .field__label { font-weight: 500; }

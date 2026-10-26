@@ -84,8 +84,32 @@ class Counting(unittest.TestCase):
     def test_reset(self):
         a = SV.Ledger(self.path, "maya-maya-m.json", "glm-5.3-flash")
         a.add(1_000_000, 0, 0)
+        a.set_price("glm-5.3-flash", {"input": 1, "cached": 0.1, "output": 2})
         a.reset()
-        self.assertEqual(SV.Ledger(self.path, "maya-maya-m.json", "glm-5.3-flash").summary()["usd"], 0.0)
+        b = SV.Ledger(self.path, "maya-maya-m.json", "glm-5.3-flash")
+        self.assertEqual(b.summary()["usd"], 0.0)
+        self.assertEqual(b.ref["input"], 1.0)                          # (the page's prices stay)
+
+    def test_own_prices_count_every_total_again(self):
+        a = SV.Ledger(self.path, "maya-gguf-q8.json", "deepseek-v4.1-flash")
+        a.add(1_000_000, 0, 1_000_000, now=TUE_OFF)
+        self.assertAlmostEqual(a.summary()["usd"], 0.75, places=6)
+        a.set_price("deepseek-v4.1-flash", {"input": 0.30, "cached": 0.006, "output": 1.20})
+        self.assertAlmostEqual(a.summary()["usd"], 1.50, places=6)
+        p = SV.Ledger(self.path, "maya-gguf-q8.json", "deepseek-v4.1-flash").price_list()[0]   # (kept in the file)
+        self.assertEqual((p["custom"], p["input"], p["peak"], p["default"]["input"]), (True, 0.30, 2.0, 0.15))
+        a.set_price("deepseek-v4.1-flash", None)                        # (back to the built-in ones)
+        self.assertAlmostEqual(a.summary()["usd"], 0.75, places=6)
+        # a model without a built-in price can get one; nonsense is refused with nothing changed
+        q = SV.Ledger(self.path, "maya-q.json", "qwen3.8-flash-next")
+        q.add(2_000_000, 0, 0)
+        q.set_price("qwen3.8-flash-next", {"input": 0.5, "cached": 0.05, "output": 1})
+        self.assertAlmostEqual(q.report()["start"]["usd"], 1.0, places=6)
+        for bad in ({"input": -1, "cached": 0, "output": 0}, {"input": "1", "cached": 0, "output": 0}, {"input": 1},
+                    {"input": 1, "cached": 0, "output": 0, "peak": 0.5}):
+            with self.assertRaises(ValueError, msg=bad):
+                a.set_price("deepseek-v4.1-flash", bad)
+        self.assertFalse(a.price_list()[0]["custom"])
 
 
 class Page(unittest.TestCase):
@@ -128,6 +152,19 @@ class Page(unittest.TestCase):
         s, m = self.req("GET", "/metrics")
         self.assertEqual((m["savings"]["usd"], m["savings"]["priced"]), (r["usd"], True))
         self.assertTrue(json.loads((Path(self.tmp.name) / SV.FILE).read_text())["models"]["maya-maya-m.json"])
+
+    def test_prices_from_the_page(self):
+        self.svc.savings.add(1_000_000, 0, 0)
+        s, r = self.req("POST", "/api/savings/prices", {"model": "glm-5.3-flash",
+                                                        "price": {"input": 1, "cached": 0.1, "output": 2}})
+        self.assertEqual((s, r["usd"], r["price_list"][0]["custom"]), (200, 1.0, True))
+        s, _ = self.req("POST", "/api/savings/prices", {"model": "glm-5.3-flash", "price": {"input": "x"}})
+        self.assertEqual(s, 400)
+        s, _ = self.req("POST", "/api/savings/prices", {"model": "glm-5.3-flash", "price": None},
+                        {"Origin": "http://elsewhere.example"})
+        self.assertEqual(s, 403)
+        s, r = self.req("POST", "/api/savings/prices", {"model": "glm-5.3-flash", "price": None})
+        self.assertEqual((s, r["usd"]), (200, 0.15))
 
     def test_reset_only_from_the_page(self):
         self.svc.savings.add(1_000_000, 0, 0)

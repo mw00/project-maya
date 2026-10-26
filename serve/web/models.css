@@ -72,7 +72,6 @@
 .mdl-num { display: inline-flex; align-items: center; gap: 8px; }
 .mdl-num .input--num { width: 96px; height: 34px; text-align: right; }
 .mdl-num > span { min-width: 44px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
-.input.is-bad { border-color: var(--st-danger-text); }
 .mdl-step { display: inline-flex; align-items: center; height: 34px; border: 1px solid var(--st-line-strong); border-radius: var(--st-r-row); }
 .mdl-step button { display: grid; place-items: center; width: 34px; height: 32px; padding: 0; border: 0; background: transparent; color: var(--st-ink); }
 .mdl-step button:first-child { border-radius: 9px 0 0 9px; }

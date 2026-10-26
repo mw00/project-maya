@@ -1,10 +1,11 @@
-// serve/web/settings.js - the Settings dialog: General, Model (the context size and the port: each a restart), Chat
-// defaults (sampling, thinking, shared with other apps), Instructions, Tools (MCP), Connect your tools, Data, About and
+// serve/web/settings.js - the Settings dialog: General, Model (the context size and the port: each a restart), Savings
+// (the API prices the sidebar's Saved counts with), Chat defaults (sampling, thinking, shared with other apps), Instructions, Tools (MCP), Connect your tools, Data, About and
 // updates.  A change applies at once; the two that restart the model ask first.
 import {html, useEffect, useRef, useState} from "./preact.js";
-import {MOD, ctxfmt, fmt, gb, modelName, store} from "./lib.js";
-import {DEFAULTS, LEVELS, P, PRESETS, S, THINK_TITLES, copyText, emit, prefsKey, presetOf, savePrefs, setTheme, themeChoice,
-        toast} from "./state.js";
+import {MOD, api, ctxfmt, fmt, gb, modelName, store} from "./lib.js";
+import {DEFAULTS, LEVELS, P, PRESETS, S, THINK_TITLES, confirmDialog, copyText, emit, prefsKey, presetOf, savePrefs, setTheme,
+        themeChoice, toast} from "./state.js";
+import {usd} from "./sidebar.js";
 import {confirmContext, confirmPort, ctxEstimate, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
         loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
 import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
@@ -14,6 +15,7 @@ import {Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 const SECTIONS = [
   {id: "general", label: "General", icon: "settings"},
   {id: "model", label: "Model", icon: "cpu"},
+  {id: "savings", label: "Savings", icon: "dollar"},
   {id: "chat", label: "Chat defaults", icon: "gauge"},
   {id: "instr", label: "Instructions", icon: "edit"},
   {id: "tools", label: "Tools", icon: "tool"},
@@ -227,6 +229,67 @@ function Data() {
       <button type="button" class="btn btn--danger" onClick=${clearBrowser}>Clear…</button><//>`;
 }
 
+// ------------------------------------------------------------------ Savings: the API prices the sidebar's Saved counts with
+// (serve/savings.py: built-in prices per model, or the ones set here; the file keeps tokens, so a change counts every total
+// again)
+const PRICE_FIELDS = [["input", "Input"], ["cached", "Cached input"], ["output", "Output"]];
+const priceShow = (k, v) => (v == null ? "" : k !== "peak" && Number.isInteger(Math.round(v * 1e6) / 1e4) ? v.toFixed(2) : String(v));   // ($0.50)
+const priceText = (x) => Object.fromEntries(["input", "cached", "output", "peak"].map((k) => [k, priceShow(k, x[k])]));
+const priceNum = (v) => (/^\s*(\d+\.?\d*|\.\d+)\s*$/.test(v) ? Number(v) : NaN);
+function PriceCard({p, onSaved}) {
+  const [d, setD] = useState(priceText(p));
+  useEffect(() => setD(priceText(p)), [JSON.stringify(p)]);
+  const def = p.default, peak = !!(def && def.peak);
+  const keys = PRICE_FIELDS.map(([k]) => k).concat(peak ? ["peak"] : []);
+  const bad = keys.filter((k) => Number.isNaN(priceNum(d[k])) || (k === "peak" && (priceNum(d[k]) < 1 || priceNum(d[k]) > 10)));
+  const now = priceText(p), dirty = keys.some((k) => d[k].trim() !== now[k]);
+  const save = async (price) => {
+    try {
+      onSaved(await api("api/savings/prices", {method: "POST", body: {model: p.model, price}}));
+      toast("success", "Prices saved", `${modelName(p.model)}: every total is counted again with them.`);
+    } catch (e) { toast("error", "Not saved", e.message, 6000); }
+  };
+  const id = `price-${p.model.replace(/[^a-z0-9]/gi, "-")}`;
+  return html`<section class="price" aria-label=${`${modelName(p.model)}'s prices`}>
+    <div class="price__head"><${ModelLogo} model=${p.model} size=${32}/>
+      <span><b>${modelName(p.model)}</b><span>${p.custom ? "Your prices" + (def ? ` (built in: ${def.api}'s)` : "")
+        : def ? `${def.api}'s prices, built in (Oct 2026)` : "No API price yet: give it one to count what it saves"}</span></span>
+      ${p.running ? html`<span class="pill pill--accent">Running</span>` : null}</div>
+    <div class="price__grid">
+      ${PRICE_FIELDS.map(([k, label]) => html`<label class="field" for=${`${id}-${k}`}><span class="field__label">${label}</span>
+        <span class="price__in"><span aria-hidden="true">$</span><input id=${`${id}-${k}`} class=${`input input--num${bad.includes(k) && d[k] !== "" ? " is-bad" : ""}`}
+          inputmode="decimal" value=${d[k]} placeholder=${def ? priceShow(k, def[k]) : "0.00"} onInput=${(e) => setD({...d, [k]: e.target.value})}/></span></label>`)}
+      ${peak ? html`<label class="field" for=${`${id}-peak`}><span class="field__label">Peak hours</span>
+        <span class="price__in"><span aria-hidden="true">×</span><input id=${`${id}-peak`} class=${`input input--num${bad.includes("peak") && d.peak !== "" ? " is-bad" : ""}`}
+          inputmode="decimal" value=${d.peak} placeholder=${String(def.peak)} onInput=${(e) => setD({...d, peak: e.target.value})}/></span></label>` : null}
+    </div>
+    <div class="price__foot">
+      <span>Dollars per 1M tokens${peak ? ". DeepSeek's peak hours, weekdays 01–04 and 06–10 UTC, cost this many times as much" : ""}.</span>
+      ${p.custom && def ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${() => save(null)}>Use the built-in prices</button>` : null}
+      ${dirty ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => setD(now)}>Cancel</button>` : null}
+      <button type="button" class="btn btn--primary btn--sm" disabled=${!dirty || bad.length > 0}
+        onClick=${() => save(Object.fromEntries(keys.map((k) => [k, priceNum(d[k])])))}>Save</button>
+    </div>
+  </section>`;
+}
+function Savings() {
+  const [r, setR] = useState(null), [err, setErr] = useState("");
+  useEffect(() => { api("api/savings").then(setR).catch((e) => setErr(e.message)); }, []);
+  const reset = async () => {
+    if (!await confirmDialog("Start over from $0?", "<p>Every model's count of tokens and what they would have cost goes back to zero. The prices stay. This cannot be undone.</p>", "Start over", true)) return;
+    try { setR(await api("api/savings/reset", {method: "POST", body: {}})); toast("success", "Started over", "Maya counts from $0 again."); }
+    catch (e) { toast("error", "Not reset", e.message, 6000); }
+  };
+  const since = r && r.since ? new Date(r.since * 1000).toLocaleDateString([], {month: "short", day: "numeric"}) : "";
+  return html`<h3>Savings</h3>
+    <p class="set-intro">The sidebar's Saved line: what each model's own API would have charged for the same tokens. Change a price when the API's changes, or give one to a model without it. Maya keeps the tokens, so every total is counted again with the new prices.</p>
+    ${err ? html`<p class="set-note">${err}</p>` : !r ? html`<p class="set-note">Reading the prices…</p>`
+      : !(r.price_list || []).length ? html`<p class="set-note">Nothing is counted on this server: it runs without a model config.</p>`
+      : html`<div class="prices">${r.price_list.map((p) => html`<${PriceCard} key=${p.model} p=${p} onSaved=${setR}/>`)}</div>
+        <${Row} label="Start over from $0" sub=${`Every model's count of tokens: ${usd(r.usd)} saved${since ? ` since ${since}` : ""}. The prices stay.`}>
+          <button type="button" class="btn btn--danger" onClick=${reset}>Start over…</button><//>`}`;
+}
+
 // ------------------------------------------------------------------ About and updates
 function UpdateCard() {
   const u = S.update, w = S.updateWatch;
@@ -335,7 +398,7 @@ function About() {
 }
 
 // ------------------------------------------------------------------ the dialog
-const BODIES = {general: General, model: Model, chat: ChatDefaults, instr: Instructions, tools: Tools, connect: Connect, data: Data, about: About};
+const BODIES = {general: General, model: Model, savings: Savings, chat: ChatDefaults, instr: Instructions, tools: Tools, connect: Connect, data: Data, about: About};
 export function SettingsDialog() {
   const box = useRef(null), body = useRef(null);
   const sec = BODIES[S.settings] ? S.settings : "general";

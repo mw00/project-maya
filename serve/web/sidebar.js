@@ -165,9 +165,10 @@ function SavedPop({anchor, close}) {
             <span>read ${mtok(m.tokens.input + m.tokens.cached)}${m.tokens.cached ? `, ${mtok(m.tokens.cached)} of it cached` : ""} · wrote ${mtok(m.tokens.output)}</span></span>
           <b>${m.usd == null ? "no API price" : usd(m.usd)}</b></div>`)}</div>` : null}
       ${r.prices && r.prices.length ? html`<div class="saved-pop__prices"><span class="saved-pop__h">The prices, per 1M tokens: input · cached input · output</span>
-        ${r.prices.map((p) => html`<div><span>${modelName(p.model)} (${p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}
+        ${r.prices.map((p) => html`<div><span>${modelName(p.model)} (${p.custom ? "your prices" : p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}
         <span>${r.prices.some((p) => p.peak) ? "DeepSeek charges twice that at its peak hours (weekdays 01–04 and 06–10 UTC), and Maya counts those tokens at that price. " : ""}The prompt Maya reads again from its own cache counts at the cached price. Electricity is not counted.</span></div>` : null}
-      <div class="saved-pop__foot"><span>Prices as of ${r.prices_as_of ? new Date(`${r.prices_as_of}-01T12:00:00`).toLocaleDateString([], {month: "short", year: "numeric"}) : "–"}</span>
+      <div class="saved-pop__foot">
+        <button type="button" class="btn btn--ghost btn--sm" onClick=${() => { close(); openSettings("savings"); }}>Change the prices</button>
         <button type="button" class="btn btn--ghost btn--sm" onClick=${reset}>Start over from $0</button></div>`}
   </div>`;
 }

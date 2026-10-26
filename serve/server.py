@@ -3830,6 +3830,24 @@ def make_handler(svc: Service):
                     svc.savings.reset()
                     self._json(200, svc.savings.report())
                     return
+                if path == "/api/savings/prices":
+                    # Settings > Savings: a model's API prices ({"model", "price": {input, cached, output} or null:
+                    # the built-in ones}); every total is counted again with them - the app's own page only
+                    body = self._body()
+                    if not self._own_page("the prices can be changed"):
+                        return
+                    try:
+                        req = json.loads(body or b"{}")
+                        if svc.savings is None:
+                            raise ValueError("nothing is counted here")
+                        if not isinstance(req, dict):
+                            raise ValueError("the request body must be a JSON object")
+                        svc.savings.set_price(req.get("model"), req.get("price"))
+                    except (TypeError, ValueError) as e:
+                        self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                        return
+                    self._json(200, svc.savings.report())
+                    return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("the request body must be a JSON object")

@@ -227,7 +227,8 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
   this machine, switching to another (Maya starts again with it) and each one's engine settings (context, GPUs,
   drafting, images, memory), saved into its `maya-<model>.json`. The sidebar's **Saved** line adds up what the model's
   own API (DeepSeek's or Z.ai's) would have charged for the same tokens - the prompt Maya reuses from its cache at the
-  API's cached price, DeepSeek's peak hours at its peak price - kept per model in `token-savings.json`.
+  API's cached price, DeepSeek's peak hours at its peak price - kept per model in `token-savings.json`; its prices can
+  be changed in **Settings › Savings**.
 - **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
   `http://127.0.0.1:8080/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`). Tool calls are
   streamed as the model writes them, and a long prompt's reading progress too when a request asks for it
