@@ -65,6 +65,7 @@ results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API d
 | unsloth's UD-Q4_K_XL GGUF (dense weights Q8_0: less VRAM) | 501 GB | the same |
 | LibertAIDAI's [EXL3 2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) + DeepSeek's Engram tables | 414 GB | NVIDIA RTX 30 / A100 and newer |
 | LibertAIDAI's [EXL3 3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) + the same Engram tables (`--ds4-quant exl3-3.5`: closer to the original, ~280 GB of VRAM + RAM) | 461 GB | the same |
+| orcarouter's [abliterated Mix-256G GGUF](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF) (`--ds4-quant abliterated`: the model with its refusals removed, the experts IQ2_S to MXFP4 by layer, ~236 GB of VRAM + RAM; a gated repo - accept its terms, then `HF_TOKEN` or `hf auth login`) | 346 GB, with the Engram tables (IQ4_NL) | NVIDIA from Volta (V100) on (AMD not tried yet) |
 
 - **Any amount of memory:** the most-used experts go to the GPUs, the others are read in place from the model's files -
   from RAM where they fit, from the SSD otherwise. More VRAM and RAM is faster; keep the files on an NVMe SSD.

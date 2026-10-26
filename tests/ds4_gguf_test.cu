@@ -2,8 +2,8 @@
 // double-precision reference of random BF16 matrices and MXFP4 experts: the GEMVs (BF16 / MXFP4, 1..16 activations,
 // aligned or not), the token experts (gate / up / swiglu / down / combine, experts off the device, the CPU part, the
 // shared expert), a window's grouped experts (bit for bit the token path's), the prompt path's expert sets and the CPU
-// lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q4_K; their decode equal to ggml's dequantize_row_* on
-// random blocks); the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
+// lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q6_K; their decode equal to ggml's dequantize_row_* on
+// random blocks), and layers that put MXFP4 beside a low-bit role; the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
 // ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone)
 #include "../src/ds4/ds4_gguf.cuh"
@@ -620,8 +620,10 @@ void test_experts(int D, int F, cudaStream_t s) {
 }
 
 // ---------------------------------------------------------------- the low-bit types (ds4_iq)
-// random blocks of a type: random bytes, the block scales small normal values (every grid index, sign and code)
+// random blocks of a type: random bytes, the block scales small normal values (every grid index, sign and code);
+// MXFP4: mx_rand's (a role of a layer that mixes it with the low-bit types)
 std::vector<uint8_t> q_rand(int type, int n, int k) {
+    if (type == gg::kTypeMXFP4) return mx_rand(n, k);
     const size_t rb = gg::type_row_bytes(type, k), bb = (size_t) gg::iq::block_bytes(type);
     std::vector<uint8_t> w(rb * n);
     for (auto& v : w) v = (uint8_t) (rng() & 0xff);
@@ -636,6 +638,7 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
             case gg::iq::kQ5_K: put(o, d), put(o + 2, 0.5f * d); break;
             case gg::iq::kQ2_K: put(o + 80, d), put(o + 82, 0.5f * d); break;
             case gg::iq::kQ3_K: put(o + 108, d); break;
+            case gg::iq::kQ6_K: put(o + 208, d); break;
             case gg::iq::kIQ1_M: {   // (d: an F16 in the top nibbles of the 4 scale words, bytes 48..55)
                 const __half h = __float2half(d);
                 uint16_t u;
@@ -665,7 +668,8 @@ double q_dot(int type, const uint8_t* row, int k, const float* x) {
 const char* tn(int t) { return gg::type_name(t); }
 const int kQTypes[] = {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS,
                        gg::iq::kQ2_K,    gg::iq::kQ3_K, gg::iq::kQ4_K,    gg::iq::kIQ1_S, gg::iq::kIQ1_M,
-                       gg::iq::kIQ2_XS,  gg::iq::kQ5_K};   // (the last two: dense weights / other GGUFs' experts)
+                       gg::iq::kIQ2_XS,  gg::iq::kQ5_K,  gg::iq::kQ6_K};   // (the last three: dense weights / other
+                                                                           //  GGUFs' experts)
 
 // n rows of type t (k values each) through the decode kernels and the prompt path's f16_rows against ggml's own
 // dequantize_row_* values: the kernels' F32 values equal, f16_rows' halves equal to ggml's rounded to F16
@@ -867,11 +871,15 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
     }
     // the reference: gate / up in double on the int8 x, then the down on the device's own h rounded as the kernels
     // round it (an h within F32 rounding of the double one can still round to the next int8 - a test artefact, not the
-    // kernels': the GPU's swiglu is F32), the h checked against the double one apart
+    // kernels': the GPU's swiglu is F32), the h checked against the double one apart.  Each role's input rounded as its
+    // kernels round it: an MXFP4 role's per 32 (q8_quant), a low-bit one's as act_round
+    auto role_round = [](int type, const float* v, int kk) {
+        return type == gg::kTypeMXFP4 ? q8_round(v, kk) : act_round(v, kk);
+    };
     std::vector<double> want((size_t) T * D, 0.0), hwant;
     std::vector<float> hgot;
     for (int t = 0; t < T; ++t) {
-        const std::vector<float> xr = act_round(x.data() + (size_t) t * D, D);
+        const std::vector<float> xr = role_round(tg, x.data() + (size_t) t * D, D);
         for (int i = 0; i < k; ++i) {
             if (pp[t * 8 + i] == 0ull) continue;
             const int e = pick[t * 8 + i];
@@ -880,7 +888,7 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 hwant.push_back(swiglu(E.dot(e, 0, f, xr.data()), E.dot(e, 1, f, xr.data()), lim));
                 hgot.push_back(h[f]);
             }
-            const std::vector<float> hr = act_round(h, F);
+            const std::vector<float> hr = role_round(td, h, F);
             for (int d = 0; d < D; ++d) want[(size_t) t * D + d] += pw[t * 8 + i] * E.dot(e, 2, d, hr.data());
         }
         for (int d = 0; d < D; ++d)
@@ -1019,7 +1027,9 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
         expect(sw, y.data(), ywant.data(), ywant.size(), n_light == R ? 1e-4 : 2e-3);
         cudaFree(dxs), cudaFree(dbd), cudaFree(didx), cudaFree(dh16), cudaFree(dy);
     }
-    {   // the CPU lane: 3 tokens of expert 4, gate / up rows [7, 107) then all its down rows from the CPU's own h
+    if (tg == gg::kTypeMXFP4 || td == gg::kTypeMXFP4) {   // (a mixed layer's CPU lane: each role its kind's rows)
+        std::printf("%-44s skip  (an MXFP4 role: the engine's cpu_experts_both, DS4_LANE_CHECK)\n", "  CPU lane");
+    } else {   // the CPU lane: 3 tokens of expert 4, gate / up rows [7, 107) then all its down rows from the CPU's own h
         gg::IqCpu fm;
         std::string err;
         if (!gg::iq_cpu_fmt(tg, td, D, F, fm, err)) {
@@ -1092,7 +1102,9 @@ const std::pair<int, int> kQPairs[] = {
     {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_S, gg::iq::kIQ3_S},  {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},
     {gg::iq::kIQ4_XS, gg::iq::kQ4_K},     {gg::iq::kQ2_K, gg::iq::kQ3_K},    {gg::iq::kQ4_K, gg::iq::kIQ4_XS},
     {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S},
-    {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},   {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS}};
+    {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},   {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS},
+    // (MXFP4 beside a low-bit role: orcarouter's Mix-256G - IQ3 gate / ups over MXFP4 downs, and the other way round)
+    {gg::iq::kIQ3_XXS, gg::kTypeMXFP4},   {gg::kTypeMXFP4, gg::iq::kIQ3_S},   {gg::iq::kIQ2_S, gg::kTypeMXFP4}};
 constexpr int kQPairIQ1 = 9;   // (the first IQ1 pair)
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read (only: the token experts of the first pair - the
@@ -2128,6 +2140,16 @@ void test_engram_iq4nl(cudaStream_t s) {
     std::printf("%-52s %s\n", "Engram IQ4_NL rows = ggml's, bit for bit", same ? "ok" : "FAIL");
     cudaFree(d_rows), cudaFree(d_out);
 }
+void test_q6k_host() {
+    const int nb = 512;
+    std::vector<uint8_t> w = q_rand(gg::iq::kQ6_K, 1, nb * 256);
+    std::vector<float> want((size_t) nb * 256), got((size_t) nb * 256);
+    ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(w.data(), want.data(), (int64_t) nb * 256);
+    for (int b = 0; b < nb; ++b) strata::ds4::q6k_values(w.data() + (size_t) b * 210, got.data() + (size_t) b * 256);
+    const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+    if (!same) ++g_fail;
+    std::printf("%-52s %s\n", "Q6_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
+}
 void test_q5k_host() {
     const int nb = 512;
     std::vector<uint8_t> w = q_rand(gg::iq::kQ5_K, 1, nb * 256);
@@ -2207,6 +2229,7 @@ int main(int argc, char** argv) {
     test_engram_q6k(s);
     test_engram_iq4nl(s);
     test_q5k_host();
+    test_q6k_host();
     test_experts(512, 256, s);
     test_decode_values(s);
     test_f16_rows(s);

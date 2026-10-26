@@ -57,6 +57,7 @@ template <> struct Ty<kIQ3_S> { static constexpr int B = 110, TAB = 512, MIN = 0
 template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0; };
 template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ5_K> { static constexpr int B = 176, TAB = 0, MIN = 1; };   // (a GGUF's dense weights in Q5_K)
+template <> struct Ty<kQ6_K> { static constexpr int B = 210, TAB = 0, MIN = 0; };   // (and in Q6_K)
 template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ3_K> { static constexpr int B = 110, TAB = 0, MIN = 0; };
 template <> struct Ty<kIQ1_S> { static constexpr int B = 50, TAB = 2048, MIN = 0; };   // (iq1s_grid_gpu)
@@ -69,7 +70,8 @@ template <int T> constexpr int kQK = T == kMXFP4 ? 32 : 256;   // values a block
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
                   sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
-                  sizeof(block_iq1_m) == 56 && sizeof(block_iq2_xs) == 74 && sizeof(block_q5_K) == 176,
+                  sizeof(block_iq1_m) == 56 && sizeof(block_iq2_xs) == 74 && sizeof(block_q5_K) == 176 &&
+                  sizeof(block_q6_K) == 210,
               "ggml's block sizes");
 static_assert(IQ1S_DELTA == 0.125f && IQ1M_DELTA == 0.125f, "IQ1's delta: the codes 8 g +- 1 below");
 
@@ -322,6 +324,21 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         s.s0 = s.s1 = sc;
         s.d = h2f(b);
         s.m0 = s.m1 = h2f(b + 2) * (float) m;
+    } else if constexpr (T == kQ6_K) {   // ql's nibbles, qh's 2-bit pairs (half n, quarter j), an int8 scale a 16 values
+        const int n = ib >> 2, j = ib & 3, sh = 4 * (j >> 1);
+        const uint8_t* ql = b + 64 * n + 32 * (j & 1);
+        const uint8_t* qh = b + 128 + 32 * n;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {   // (210-byte blocks: 2-byte aligned)
+            // the 6-bit codes with their top bit flipped are q - 32 in 6-bit two's complement: bit 5 copied into bits 6
+            // and 7 makes each byte the int8 q - 32 (no carry between the bytes)
+            const uint32_t x = (((ld2(ql + 4 * t) >> sh) & 0x0f0f0f0fu) |
+                                (((ld2(qh + 4 * t) >> (2 * j)) & 0x03030303u) << 4)) ^ 0x20202020u;
+            s.q[t] = (int) (x | ((x & 0x20202020u) * 6u));
+        }
+        s.s0 = (int) (int8_t) b[192 + 8 * n + 2 * j];       // values 0..15
+        s.s1 = (int) (int8_t) b[192 + 8 * n + 2 * j + 1];   // 16..31
+        s.d = h2f(b + 208);
     } else if constexpr (T == kQ2_K) {
         const int n = ib >> 2, j = ib & 3;
         const uint8_t* qs = b + 16 + 32 * n;
@@ -463,6 +480,13 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
 #pragma unroll
         for (int j = 0; j < 8; ++j)
             w[j] = d1 * (float) (((ib & 1) ? qs[j] >> 4 : qs[j] & 15) | (((qh[j] >> ib) & 1) << 4)) - m1;
+    } else if constexpr (T == kQ6_K) {   // ggml's d * scale * (q - 32), the two products in that order
+        const int n = ib >> 2, jj = ib & 3, sh = 4 * (jj >> 1);
+        const float dl = h2f(b + 208) * (float) (int8_t) b[192 + 8 * n + 2 * jj + (p >> 1)];
+        const uint8_t* ql = b + 64 * n + 32 * (jj & 1) + 8 * p;
+        const uint8_t* qh = b + 128 + 32 * n + 8 * p;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = dl * (float) ((((ql[j] >> sh) & 15) | (((qh[j] >> (2 * jj)) & 3) << 4)) - 32);
     } else if constexpr (T == kQ2_K) {
         const int n = ib >> 2, jj = ib & 3;
         const int c = b[8 * n + 2 * jj + (p >> 1)];
@@ -1056,6 +1080,7 @@ bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_
         case kIQ2_XXS: F(kIQ2_XXS); break; \
         case kIQ2_XS: F(kIQ2_XS); break;   \
         case kQ5_K: F(kQ5_K); break;       \
+        case kQ6_K: F(kQ6_K); break;       \
         case kIQ2_S: F(kIQ2_S); break;     \
         case kIQ3_XXS: F(kIQ3_XXS); break; \
         case kIQ3_S: F(kIQ3_S); break;     \
@@ -1230,6 +1255,7 @@ int block_bytes(int t) {
         case kIQ2_XXS: return Ty<kIQ2_XXS>::B;
         case kIQ2_XS: return Ty<kIQ2_XS>::B;
         case kQ5_K: return Ty<kQ5_K>::B;
+        case kQ6_K: return Ty<kQ6_K>::B;
         case kIQ2_S: return Ty<kIQ2_S>::B;
         case kIQ3_XXS: return Ty<kIQ3_XXS>::B;
         case kIQ3_S: return Ty<kIQ3_S>::B;
@@ -1248,6 +1274,7 @@ const char* name(int t) {
         case kIQ2_XXS: return "IQ2_XXS";
         case kIQ2_XS: return "IQ2_XS";
         case kQ5_K: return "Q5_K";
+        case kQ6_K: return "Q6_K";
         case kIQ2_S: return "IQ2_S";
         case kIQ3_XXS: return "IQ3_XXS";
         case kIQ3_S: return "IQ3_S";

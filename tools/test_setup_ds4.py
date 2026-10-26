@@ -426,6 +426,101 @@ class Gguf(unittest.TestCase):
         self.assertEqual(maya.ds4_dir(args(), Path("/models"), {}, "exl3"), Path("/models") / maya.DS4)
 
 
+class Abliterated(unittest.TestCase):
+    """orcarouter's abliterated model as GGUFs (--ds4-quant abliterated): Mix-256G's 7 shards pinned in
+    download_gguf.json, in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-256G, served under a name of its own;
+    its repo is gated, so the download sends the user's Hugging Face token (never on a command line)."""
+    REPO = "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF"
+    REV = "43fac7992b3d6e750b2e4a52569c1f097c67cd8f"
+
+    def test_manifest_and_urls(self):
+        m = maya.ds4_gguf_model("abliterated")
+        self.assertEqual((m["format"], m["folder"], m["repo"], m["revision"], m.get("gated")),
+                         ("ds4-gguf", "Mix-256G", self.REPO, self.REV, True))
+        self.assertEqual(sorted(m["files"]), ["DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-%05d-of-00007.gguf" % i
+                                              for i in range(1, 8)])
+        for n in m["files"]:
+            self.assertRegex(m["sha256"][n], r"^[0-9a-f]{64}$")
+        self.assertEqual(m["files"]["DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf"], 110595290592)
+        self.assertAlmostEqual(m["download_gb"], 346.38, delta=0.01)
+        self.assertEqual(maya.file_url(m, "DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00001-of-00007.gguf"),
+                         f"https://huggingface.co/{self.REPO}/resolve/{self.REV}/Mix-256G/"
+                         "DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00001-of-00007.gguf")
+        self.assertNotIn("gated", maya.ds4_gguf_model("gguf-q8"))
+
+    def test_choice_folder_and_name(self):
+        rows = []
+        def pick(title, intro, opts, default, yes, *x):
+            rows.extend(o[0] for o in opts)
+            return default
+        with patch.object(maya, "say", lambda *a: None), patch.object(maya.S, "UI", None), \
+                patch.object(maya.S, "gpus", return_value=[{"arch": 86}]), patch.object(maya, "choose", pick):
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="abliterated"), {}), "abliterated")
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {}), "maya-s")   # (offered, not the default)
+            self.assertIn("Abliterated Mix-256G (346 GB)", rows)
+            self.assertEqual(maya.choose_ds4_quant(args(ds4_quant=None), {"installer": {"ds4_quant": "abliterated"}}),
+                             "abliterated")
+        self.assertEqual(maya.ds4_dir(args(), Path("/models"), {}, "abliterated"),
+                         Path("/models") / "DeepSeek-V4.1-Flash-1017-abliterated-GGUF" / "Mix-256G")
+        root = Path(tempfile.mkdtemp())
+        with patch.object(maya, "ROOT", root), patch.object(maya, "say", lambda *a: None), \
+                patch.object(maya, "ok", lambda *a: None), patch.object(maya, "step", lambda *a: None):
+            for q, name in (("abliterated", "deepseek-v4.1-flash-abliterated"), ("gguf-q8", maya.DS4_MODEL_NAME)):
+                p = maya.write_config_ds4(args(), {"gpus": [{"index": 0}]}, {}, Path("/m/A/maya-ds4"), 65536,
+                                          Path("/models"), Path("/m/A"), q)
+                c = json.loads(p.read_text())
+                self.assertEqual((c["model_name"], c["installer"]["ds4_quant"]), (name, q))
+
+    def test_token(self):
+        home = Path(tempfile.mkdtemp())
+        clean = {k: "" for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")}
+        with patch.dict(maya.os.environ, dict(clean, HF_HOME=str(home))):
+            self.assertIsNone(maya.hf_token())
+            (home / "token").write_text("hf_saved\n")
+            self.assertEqual(maya.hf_token(), "hf_saved")
+            with patch.dict(maya.os.environ, {"HF_TOKEN": "hf_env"}):
+                self.assertEqual(maya.hf_token(), "hf_env")
+
+    def test_download_sends_the_token(self):
+        """curl gets the token as a header read from a file (-H @file) only the user can read, removed after."""
+        src, dst = Path(tempfile.mkdtemp()), Path(tempfile.mkdtemp())
+        (src / "m-00001.gguf").write_bytes(b"x" * 1000)
+        m = {"files": {"m-00001.gguf": 1000}, "download_gb": 1e-6, "gated": True}
+        s = dst / "m-00001.gguf"
+        seen = []
+        real = maya.subprocess.Popen
+        def popen(cmd, *x, **k):
+            h = cmd[cmd.index("-H") + 1]
+            self.assertTrue(h.startswith("@"))
+            f = Path(h[1:])
+            seen.append((f, f.read_text(), f.stat().st_mode & 0o777))
+            self.assertNotIn("hf_secret", " ".join(cmd))
+            return real(cmd, *x, **k)
+        with patch.object(maya, "hf_token", return_value="hf_secret"), patch.object(maya, "hf_name", lambda mm, x: x.name), \
+                patch.object(maya.subprocess, "Popen", popen):
+            maya.fetch_files(m, [s], [s], {s: (src / s.name).as_uri()})
+        self.assertEqual(s.read_bytes(), b"x" * 1000)
+        ((f, text, mode),) = seen
+        self.assertEqual(text, "Authorization: Bearer hf_secret\n")
+        if not maya.WIN:
+            self.assertEqual(mode, 0o600)
+        self.assertFalse(f.exists() or f.parent.exists())
+
+    def test_no_token_stops_before_downloading(self):
+        m = dict(maya.ds4_gguf_model("abliterated"))
+        d = Path(tempfile.mkdtemp()) / "Mix-256G"
+        shards = [d / n for n in m["files"]]
+        said = []
+        with patch.object(maya, "hf_token", return_value=None), patch.object(maya, "say", said.append), \
+                patch.object(maya, "fetch_files") as fetch, patch.object(maya.shutil, "disk_usage",
+                                                                         return_value=SimpleNamespace(free=10 ** 13)), \
+                self.assertRaises(SystemExit):
+            maya.offer_download(args(download_model=True), "abliterated", d, shards, m)
+        fetch.assert_not_called()
+        self.assertTrue(any("gated" in str(x) for x in said))
+        self.assertTrue(any("Authorization: Bearer $HF_TOKEN" in str(x) or "%HF_TOKEN%" in str(x) for x in said))
+
+
 class Vision(unittest.TestCase):
     """A GGUF's vision tower (step 7): DeepSeek's shard 1 and config.json pinned in download_gguf.json, the picture
     markers' 30 KB of shard 2 pinned row by row, and the step's paths - skipped, already there, made, failed."""

@@ -80,6 +80,22 @@ inline void q5k_values(const uint8_t* b, float* y) {
     }
 }
 
+// a Q6_K superblock's 256 values as ggml's dequantize_row_q6_K computes them, on the host (the token embedding a GGUF
+// may hold in Q6_K): q6k_value's products, d * scale first
+inline void q6k_values(const uint8_t* b, float* y) {
+    const float d = q5k_f16_host((uint16_t) (b[208] | b[209] << 8));
+    const uint8_t *ql = b, *qh = b + 128;
+    const int8_t* sc = (const int8_t*) (b + 192);
+    for (int n = 0; n < 256; n += 128, ql += 64, qh += 32, sc += 8)
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            y[n + l] = d * (float) sc[is] * (float) ((int) ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) - 32);
+            y[n + l + 32] = d * (float) sc[is + 2] * (float) ((int) ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+            y[n + l + 64] = d * (float) sc[is + 4] * (float) ((int) ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+            y[n + l + 96] = d * (float) sc[is + 6] * (float) ((int) ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+        }
+}
+
 // value e of an Engram row in format fmt (1 Q6_K, 2 IQ4_NL; the row's blocks from its start)
 __device__ __forceinline__ float eg_block_value(const uint8_t* __restrict__ row, int e, int fmt) {
     return fmt == 1 ? q6k_value(row + (size_t) (e / 256) * kQ6kBytes, e % 256)

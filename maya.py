@@ -435,8 +435,14 @@ DS4_VISION_MIN_CC = 80                             # the vision tower's BF16 GEM
 DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
 DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
-              "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw"}
+              "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated": "Mix-256G"}
 DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
+# ... and orcarouter's abliterated model (its refusals removed from the weights) as GGUFs (download_gguf.json's
+# "abliterated": Mix-256G - the experts IQ2_S to MXFP4 by layer, some layers MXFP4 downs under IQ3 gate / ups; a gated
+# repo, so its download sends the user's Hugging Face token), in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/
+# and served under a name of its own
+DS4_ABL = ("abliterated",)
+DS4_ABL_MODEL_NAME = "deepseek-v4.1-flash-abliterated"
 DS4_DEFAULT_QUANT = "gguf-q8"
 DS4_GGUF_MIN_CC = 70
 # (the model's own reach, natively: 1M positions - its config's max_position_embeddings, nothing scaled; 512K and 1M
@@ -1259,7 +1265,8 @@ def choose_family(a, prev: dict) -> str:
              "experimental); pictures with its vision encoder."),
             (DS4, "experimental",
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUFs (UD-Q8_K_XL 508 GB or "
-             "UD-Q4_K_XL 501 GB; NVIDIA from V100 on or AMD, Linux or Windows) or LibertAIDAI's EXL3 quants at 2.9 or "
+             "UD-Q4_K_XL 501 GB; NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-256G "
+             "346 GB, its refusals removed) or LibertAIDAI's EXL3 quants at 2.9 or "
              "3.5 bits with DeepSeek's two Engram tables (414 / 461 GB; NVIDIA V100 or newer, DSpark drafting, "
              "pictures from RTX 30 / A100 on); "
              f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
@@ -1820,6 +1827,20 @@ def file_url(m: dict, name: str) -> str:
     return hf_url(repo, revision, m["folder"], name)
 
 
+def hf_token() -> str | None:
+    """The user's Hugging Face token, for a gated repo's files (download_gguf.json's "gated"): HF_TOKEN (or
+    HUGGING_FACE_HUB_TOKEN), else the one `hf auth login` saved (<HF_HOME, or ~/.cache/huggingface>/token)."""
+    for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        if os.environ.get(k, "").strip():
+            return os.environ[k].strip()
+    try:
+        t = (Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "token").read_text(
+            encoding="utf-8").strip()
+    except OSError:
+        return None
+    return t or None
+
+
 # curl's part of every model download: resume a file where it stopped, and give up on a connection that stalls (under
 # 1 KB/s for a minute) so it is run again instead of hanging
 CURL_RESUME = ["-C", "-", "--speed-limit", "1024", "--speed-time", "60", "--connect-timeout", "30"]
@@ -1830,8 +1851,17 @@ DL_STUCK = 30       # runs of curl in a row that add nothing to a file before th
 def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
     """The missing files with curl, DL_JOBS at a time, each resumed where it stopped and run again whenever its
     connection drops or stalls - a download stopped half way (a dropped line, Ctrl+C, a restart) loses nothing: the
-    next run continues every file from its size on disk.  One line says how far the model is."""
+    next run continues every file from its size on disk.  One line says how far the model is.  A gated repo's ("gated"):
+    the token in an Authorization header, read by curl from a file only the user can read (not on its command line)."""
     want = {s: (m.get("files") or {}).get(hf_name(m, s)) for s in shards}
+    auth = None
+    token = hf_token() if m.get("gated") else None
+    if token:
+        import tempfile
+        auth = Path(tempfile.mkdtemp(prefix="maya-hf-")) / "header"   # (mkdtemp's folder: the user's alone)
+        fd = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(f"Authorization: Bearer {token}\n")
     total = sum(want.values()) if all(want.values()) else m.get("download_gb", 0) * 1e9
     size = lambda s: s.stat().st_size if s.exists() else 0   # noqa: E731
     queue, running = list(missing), {}
@@ -1843,7 +1873,8 @@ def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
             for s in [q for q in queue if after[q] <= now][:max(0, DL_JOBS - len(running))]:
                 queue.remove(s)
                 start_size[s] = size(s)
-                cmd = ["curl", "-sS", "-L", "--fail"] + CURL_RESUME + ["-o", str(s), urls[s]]
+                cmd = ["curl", "-sS", "-L", "--fail"] + (["-H", f"@{auth}"] if auth else []) + CURL_RESUME + \
+                    ["-o", str(s), urls[s]]
                 running[s] = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                               stderr=subprocess.PIPE)
             time.sleep(1)
@@ -1879,6 +1910,9 @@ def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
     finally:
         for p in running.values():   # (stopped half way: no curl keeps writing behind the setup's back)
             p.terminate()
+        if auth is not None:
+            auth.unlink(missing_ok=True)
+            auth.parent.rmdir()
         S.progress()
 
 
@@ -1900,6 +1934,10 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     for repo in dict.fromkeys(r for r, _ in (m.get("sources") or {}).values()):
         names = [n for n, (r, _) in m["sources"].items() if r == repo]
         say(f"  And from https://huggingface.co/{repo}: " + ", ".join(names))
+    token = hf_token() if m.get("gated") else None
+    if m.get("gated"):
+        say(f"  The repo is gated: accept its terms at https://huggingface.co/{m['repo']} with your account; the download "
+            "sends your Hugging Face token (" + ("found" if token else "none found here") + ").")
     say(f"  The model is {m['download_gb']:.1f} GB in {len(shards)} file{'s' if len(shards) != 1 else ''}; "
         f"{len(missing)} still to download, about "
         f"{remaining:.0f} GB, into")
@@ -1912,8 +1950,10 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
         warn(f"{d} is on a spinning hard disk: the engine reads experts from these files while it answers - use an "
              "NVMe SSD (--models-dir)")
     say("  The exact commands (resumable: running them again continues an interrupted download):")
-    for c in cmds:
-        say("    " + shell_join(c))
+    bearer = '-H "Authorization: Bearer %HF_TOKEN%" ' if WIN else '-H "Authorization: Bearer $HF_TOKEN" '
+    for c in cmds:   # (a gated repo's: the token as the shell expands it, never the token itself)
+        line = shell_join(c)
+        say("    " + ("curl " + bearer + line[5:] if m.get("gated") and c[0] == "curl" else line))
     if "files" in m:                                   # (--gguf-dir takes GGUF files only)
         say(f"  You can also run them yourself (or download the files any other way into that folder), then run {ME}")
         say("  again.")
@@ -1923,6 +1963,10 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     if not curl:
         warn("curl is not installed" + ("" if WIN else " (sudo apt-get install -y curl)") + ": if you say yes, the "
              "same URLs are downloaded with Python instead (also resumable)")
+    if m.get("gated") and not token and missing:
+        fail(f"{m['repo']} is gated and no Hugging Face token was found",
+             f"accept its terms at https://huggingface.co/{m['repo']}, then set HF_TOKEN (a read token from "
+             f"https://huggingface.co/settings/tokens) or run `hf auth login`, and run {ME} again")
     if not a.download_model and ask(f"  Download about {remaining:.0f} GB now with these commands? (y/n)",
                                     ["y", "n"], "n", False) != "y":
         say()
@@ -1934,7 +1978,7 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
         fetch_files(m, shards, missing, urls)
     for s in missing:
         if not curl:
-            S.download(urls[s], s)
+            S.download(urls[s], s, headers={"Authorization": f"Bearer {token}"} if token else None)
         why = file_incomplete(m, s)
         if why:
             fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
@@ -3422,10 +3466,20 @@ def ds4_maya_published(quant: str) -> bool:
 
 def ds4_gguf_model(quant: str) -> dict:
     """A GGUF of DeepSeek as a MODELS entry (offer_download's form): its shards, sizes, sha256, repo folder - unsloth's,
-    or Maya's (the Engram tables in its own shards) - and "earlier": the layouts its files had before, each in the
-    same form (ds4_earlier)."""
+    Maya's (the Engram tables in its own shards) or orcarouter's abliterated one ("gated": its download sends a token) -
+    and "earlier": the layouts its files had before, each in the same form (ds4_earlier)."""
     man = read_json(DS4_GGUF_MANIFEST)
-    if quant in DS4_MAYA:
+    gated = False
+    if quant in DS4_ABL:
+        ab = man.get("abliterated") or {}
+        q = (ab.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
+        if not q.get("files"):
+            fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+        about, repo, revision = (f"{ab.get('name', DS4 + '-abliterated')} {DS4_QUANTS[quant]}, orcarouter's abliterated "
+                                 f"model as GGUFs ({q.get('about', 'the experts in 2-4 bits')})", ab["repo"],
+                                 ab["revision"])
+        gated = bool(ab.get("gated"))
+    elif quant in DS4_MAYA:
         my = man.get("maya") or {}
         q = (my.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
@@ -3445,7 +3499,7 @@ def ds4_gguf_model(quant: str) -> dict:
         files = {Path(k).name: v for k, v in files.items()}
         return {"about": about, "format": "ds4-gguf", "repo": repo, "revision": rev, "folder": DS4_QUANTS[quant],
                 "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
-                "download_gb": sum(v[0] for v in files.values()) / 1e9}
+                "download_gb": sum(v[0] for v in files.values()) / 1e9, **({"gated": True} if gated else {})}
     m = form(q["files"], revision)
     m["earlier"] = [dict(form(e["files"], e["revision"]), engram=[form(s, e["revision"]) for s in e.get("engram") or []])
                     for e in q.get("earlier") or []]
@@ -3663,7 +3717,7 @@ def choose_ds4_quant(a, prev: dict) -> str:
     keys = maya + [k for k in DS4_QUANTS if k not in DS4_MAYA and (exl3_ok or k not in DS4_EXL3)]
     before = (prev.get("installer") or {}).get("ds4_quant")
     default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
-    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya}
+    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL if k in keys]}
     label = {"maya-s": (f"Maya-S ({gb.get('maya-s', 0):.0f} GB)", "Maya's quant: experts in 2-3 bits, the most of it in memory"),
              "maya-m": (f"Maya-M ({gb.get('maya-m', 0):.0f} GB)", "Maya's quant: experts in 3.4 bits, closer to the original"),
              "maya-xs": (f"Maya-XS ({gb.get('maya-xs', 0):.0f} GB)",
@@ -3672,7 +3726,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
              "gguf-q4": ("GGUF UD-Q4_K_XL (501 GB)", "dense weights Q8_0 (less VRAM), experts MXFP4"),
              "exl3": ("EXL3 2.9 bits (414 GB)", "with the DSpark drafter and the vision tower"),
              "exl3-3.5": (f"EXL3 3.5 bits ({ds4_model('exl3-3.5')['download_gb']:.0f} GB)",
-                          f"closer to the original, slower: ~{DS4_EXL3['exl3-3.5']['memory_gb']} GB of VRAM + RAM hold it")}
+                          f"closer to the original, slower: ~{DS4_EXL3['exl3-3.5']['memory_gb']} GB of VRAM + RAM hold it"),
+             "abliterated": (f"Abliterated Mix-256G ({gb.get('abliterated', 0):.0f} GB)",
+                             "orcarouter's model with its refusals removed: experts in 2-4 bits by layer, ~236 GB of "
+                             "VRAM + RAM hold it (a gated repo: your Hugging Face token)")}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
                                              "the SSD. The EXL3 quants need a V100 or newer and ~230 / ~280 GB of "
@@ -3714,7 +3771,9 @@ def ds4_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
         d = Path(args[args.index("--pack") + 1]).parent
         if (d / "config.json").exists() or (quant not in DS4_EXL3 and ds4_shards(d)):
             return d
-    return models / DS4_EXL3[quant]["dir"] if quant in DS4_EXL3 else models / f"{DS4}-GGUF" / DS4_QUANTS[quant]
+    if quant in DS4_EXL3:
+        return models / DS4_EXL3[quant]["dir"]
+    return models / (f"{DS4}-abliterated-GGUF" if quant in DS4_ABL else f"{DS4}-GGUF") / DS4_QUANTS[quant]
 
 
 def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
@@ -3870,7 +3929,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "engine; --vram-reserve-mib changes it)")
     cfg = {"exe": str(DS4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": DS4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "model_name": DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
+           "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": old.get("sampling") or dict(DS4_SAMPLING),
            "reasoning_effort": old.get("reasoning_effort") or DS4_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
@@ -3919,7 +3979,9 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     gguf = quant not in DS4_EXL3
     pc = check_pc(a, "deepseek", gguf, quant)          # 1
     step(2, "your choices")                            # 2
-    ok(f"files: {DS4_QUANTS[quant]}" + (" (Maya's quant)" if quant in DS4_MAYA else " (unsloth's GGUF)" if gguf else
+    ok(f"files: {DS4_QUANTS[quant]}" + (" (Maya's quant)" if quant in DS4_MAYA else
+                                        " (orcarouter's abliterated GGUF)" if quant in DS4_ABL else
+                                        " (unsloth's GGUF)" if gguf else
                                         f" (LibertAIDAI's EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
     ctx = choose_context(a, prev_ctx, DS4_CONTEXTS, DS4_DEFAULT_CONTEXT)
     ok(f"context: {ctx} tokens")
@@ -4008,7 +4070,9 @@ def main() -> int:
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
                          "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
-                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer)")
+                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer), "
+                         "abliterated = orcarouter's abliterated model (its refusals removed) as its Mix-256G GGUF "
+                         "(346 GB; a gated repo: HF_TOKEN or `hf auth login`)")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")

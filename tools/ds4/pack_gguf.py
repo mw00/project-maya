@@ -227,6 +227,12 @@ NEWER_KEYS = (("kv_source_layer_ids", "attention.kv_source_layers"),
               ("engram.layer_ids", "engram.layers"), ("engram_max_ngram_size", "engram.max_ngram_size"),
               ("engram_n_heads", "engram.head_count"), ("engram_head_dim", "engram.head_dim"),
               ("engram_pad_token_id", "engram.pad_token_id"))
+# the DSpark drafter's geometry in DeepSeek-V4.1-Flash-1017's config.json (the checkpoint drafter_pack.py takes the
+# blocks from), for a GGUF that leaves the dspark.* keys out - orcarouter's abliterated quants: their compress_ratios
+# still list the three blocks
+DS41_DSPARK = {"dspark_block_size": 5, "dspark_noise_token_id": 128799, "dspark_markov_rank": 256,
+               "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3, "dspark_target_layer_ids": [37, 38, 39]}
+DS41_LAYERS = 40
 # its Engram hash parameters as tensors (I64 / I32) -> the engram.* lists write_engram takes (each layer's in turn)
 HASH_TENSORS = {"engram_multipliers.weight": "engram.multipliers", "engram_primes.weight": "engram.primes",
                 "engram_offsets.weight": "engram.offsets", "engram_token_map.weight": "engram.token_map"}
@@ -529,6 +535,15 @@ def main() -> int:
         vision = info["config"]
     vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
     geo = geometry(kv, vocab)
+    if drafter_in and not geo["dspark_block_size"]:
+        # (without them the engine would load the drafter and never draft)
+        if geo["num_hidden_layers"] == DS41_LAYERS and len(geo["compress_ratios"]) == DS41_LAYERS + 3:
+            geo.update(DS41_DSPARK)
+            print("the GGUF has no DSpark metadata: the drafter's geometry from DeepSeek-V4.1-Flash-1017's config.json")
+        else:
+            print("%s: the GGUF has no DSpark metadata, and its %s layers / %d compress ratios are not DeepSeek-V4.1-"
+                  "Flash's (%d + the drafter's 3): the engine will not draft" %
+                  (model, geo["num_hidden_layers"], len(geo["compress_ratios"]), DS41_LAYERS), file=sys.stderr)
 
     out.mkdir(parents=True, exist_ok=True)
     with (out / "ds4.txt").open("w") as f:

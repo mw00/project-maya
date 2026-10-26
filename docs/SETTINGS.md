@@ -438,6 +438,17 @@ windows. The stream lane's time is measured on the GPU itself. On an RTX 3090 + 
 The engine's decode summary (`streamed to the GPU: N`) and the `pcie=` key of its STAT lines (experts a token
 streamed) show it at work; the start's log prints each format's times and how many of a token's experts it streams.
 
+With several GPUs, where the CPU lane's experts are copied into RAM (two NUMA parts) and prompts run in chunks, the
+copies are pinned at load as well, and the prompt path copies a GGUF's expert to the GPU straight from them: no pass
+through the CPU's staging first, which only gathers a tensor-parallel member's columns of the down. The load says
+`the copied experts pinned (N GB in S s)`; where the pin fails it says so, and the prompt path stages them as before.
+On an RTX 3090 + 8 RTX 5060 Ti (`--tp 8`, orcarouter's Mix-256G, 125 GB pinned in 50-110 s) a 16K prompt 406 -> 595
+tokens/s.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_COPY_PIN` | on (several GPUs, copies in RAM, chunked prompts) | `0`: the copies are not pinned; the prompt path stages every expert through the CPU, as before |
+
 ## DeepSeek: long prompts read without the second half's work
 
 DeepSeek-V4.1-Flash's layers 20-39 see the earlier tokens of a prompt only through what layer 20 keeps of them (its
@@ -556,12 +567,14 @@ type: Maya's quants use 256-value blocks, n_ff 2304 = 9 blocks, so `--tp 2` (or 
 "tensor parallel 2 -> 1". `MAYA_DS4_TP_GGUF_UNEVEN=1` lets a member take whole blocks as even as they go, 5 + 4 for
 two GPUs, with the odd block going round the members layer by layer, as EXL3's split128 does. Each member loads,
 streams and swaps its own range, the shared expert is split at the same range, and each member's exact expert bytes
-are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). With `DS4_FLOW_TP=1` its members take
+are fitted to its own VRAM (a slot fewer at a time when the mean overshoots). A member's prompt copies carry only its
+own part (its gate / up rows and its columns of the down), not the whole expert. With `DS4_FLOW_TP=1` its members take
 the prompt flow too, each streaming its own rows, the down gathered on the GPU (on a disk-streaming box the group's
 prompts are much slower off the flow).
 `MAYA_DS4_TP_CHECK=1` checks every expert format and rotation at load, before any request: one token through each
 member's parts as decode runs them, summed on the host and compared with the whole expert and shared expert (more than
-1e-3 of the largest output fails the start).
+1e-3 of the largest output fails the start), and each member's prompt copies on its GPU against the file's bytes, bit
+for bit.
 
 | Setting | Default | |
 | --- | --- | --- |

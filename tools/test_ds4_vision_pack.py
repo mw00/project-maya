@@ -281,13 +281,48 @@ class Shards(unittest.TestCase):
         self.assertEqual(files, ["m-00001-of-00001.gguf"])
 
 
-def gguf(path: pathlib.Path):
-    """A DeepSeek-V4.1 GGUF of one tensor (the embedding, BF16 [4][DIM]) and the metadata pack_gguf reads."""
+class Drafter(unittest.TestCase):
+    def test_a_gguf_without_the_drafters_metadata(self):
+        """orcarouter's GGUFs leave the dspark.* keys out (their compress_ratios still list the drafter's three
+        blocks): with the drafter beside the quant the pack takes DeepSeek's checkpoint's geometry for it; a model of
+        another depth drafts with none (a warning)."""
+        root = pathlib.Path(tempfile.mkdtemp())
+        d = root / "dspark"
+        d.mkdir()
+        (d / "dspark.bin").write_bytes(rnd(DIM, 9))
+        (d / "dspark.json").write_text(json.dumps({"tensors": [["mtp.0.attn.attn_sink", "F32", 0, 2 * DIM, [DIM // 2]]]}))
+        for layers, drafts in ((40, True), (39, False)):
+            q = root / ("Q%d" % layers)
+            q.mkdir()
+            meta = {"block_count": layers, "attention.output_group_count": 2,
+                    "attention.compress_ratios": [0, 0] + [2] * (layers - 2) + [0, 0, 0]}
+            gguf(q / "m-00001-of-00001.gguf", meta)
+            r = subprocess.run([sys.executable, str(HERE / "ds4" / "pack_gguf.py"), "--model", str(q)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("the DSpark drafter", r.stdout)
+            kv = dict(line.split(" ", 1) for line in (q / "maya-ds4" / "ds4.txt").read_text().splitlines())
+            got = (kv["dspark_block_size"], kv["dspark_noise_token_id"], kv["dspark_target_layer_ids"],
+                   kv["dspark_n_routed_experts"], kv["dspark_num_experts_per_tok"], kv["dspark_markov_rank"])
+            if drafts:
+                self.assertEqual(got, ("5", "128799", "37,38,39", "128", "3", "256"))
+                self.assertIn("the drafter's geometry from DeepSeek-V4.1-Flash-1017's config.json", r.stdout)
+            else:
+                self.assertEqual(got[0], "0")
+                self.assertIn("the engine will not draft", r.stderr)
+
+
+def gguf(path: pathlib.Path, meta: dict | None = None):
+    """A DeepSeek-V4.1 GGUF of one tensor (the embedding, BF16 [4][DIM]) and the metadata pack_gguf reads (meta: more
+    deepseek41.* keys, ints or lists of ints)."""
     def s(x: str) -> bytes:
         b = x.encode()
         return struct.pack("<Q", len(b)) + b
     kv = [s("general.architecture") + struct.pack("<I", 8) + s("deepseek41"),
           s("tokenizer.ggml.tokens") + struct.pack("<IIQ", 9, 8, 4) + b"".join(s(t) for t in ("a", "b", "c", "d"))]
+    for k, v in (meta or {}).items():   # (UINT32, or an ARRAY of them)
+        kv.append(s("deepseek41." + k) + (struct.pack("<IIQ", 9, 4, len(v)) + struct.pack("<%dI" % len(v), *v)
+                                          if isinstance(v, list) else struct.pack("<II", 4, v)))
     info = s("token_embd.weight") + struct.pack("<I", 2) + struct.pack("<2Q", DIM, 4) + struct.pack("<IQ", 30, 0)
     head = b"GGUF" + struct.pack("<IQQ", 3, 1, len(kv)) + b"".join(kv) + info
     head += b"\0" * ((-len(head)) % 32)

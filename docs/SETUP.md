@@ -39,6 +39,16 @@ It first asks which model to set up:
   an order of magnitude slower on long prompts (a community measurement, 7x RTX 3090, Maya-S read in place: 32K tokens
   99 tokens/s in windows, 1010 in chunks). The GGUFs have no DSpark drafter and no vision tower.
 
+  Or orcarouter's [abliterated model](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF)
+  (`--ds4-quant abliterated`: DeepSeek-V4.1-Flash-1017 with its refusal direction taken out of the weights), its
+  **Mix-256G** GGUF (346 GB, in `<models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Mix-256G`): the routed experts
+  IQ2_S, IQ3_XXS, IQ3_S or MXFP4 layer by layer (some layers MXFP4 downs under IQ3 gate / ups - each role runs on its
+  own kernels), dense weights Q5_K / Q6_K / Q8_0, the Engram tables IQ4_NL; ~236 GB of VRAM + RAM hold all but the
+  tables. Its repo is gated: accept its terms on Hugging Face, then set `HF_TOKEN` or run `hf auth login` - the download
+  sends that token (curl reads it from a file only you can read). It is served as `deepseek-v4.1-flash-abliterated`,
+  with DeepSeek's DSpark drafter and vision tower as for unsloth's GGUFs (the drafter only proposes tokens - the model
+  checks each one).
+
 GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 
 1. checks the PC (GPUs, driver, CUDA toolkit, compiler, RAM, CPU);
@@ -90,7 +100,7 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--download-model` | download the model without asking (the commands and size are still printed) |
 | `--model NAME` | which model, without asking: `DeepSeek-V4.1-Flash-1017`, or a GLM-5.3-Flash download: `Maya-S-v2-IQ2_XXS` (Maya-S), `Maya-S24`, `Maya-M`, `Maya-M-Derisked`, `Maya-L`, or `EXL3-3.05bpw` / `EXL3-4.05bpw` - an experimental EXL3 quant at 3.05 or 4.05 bits per weight ([3.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw), 125.3 GB; [4.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw), 165.2 GB; both with the MTP block) that the engine reads in place from its safetensors: NVIDIA only, 3.05bpw tested on Linux, neither measured against the FP8 model |
 | `--model-dir DIR` | use DeepSeek-V4.1-Flash-1017's files you already have: the folder with a GGUF's shards, or with the EXL3 quant's files and the Engram shards `model-00047-of-00048.safetensors` / `model-00048-of-00048.safetensors` of DeepSeek's repo (it must be writable: the pack goes inside it) |
-| `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `gguf-q8` (unsloth's UD-Q8_K_XL GGUF, the default), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits) or `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM); the EXL3 quants need NVIDIA RTX 30 / A100 or newer and are offered only there |
+| `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `gguf-q8` (unsloth's UD-Q8_K_XL GGUF, the default), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits), `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM) or `abliterated` (orcarouter's abliterated model, its Mix-256G GGUF; a gated repo: `HF_TOKEN` or `hf auth login`); the EXL3 quants need NVIDIA RTX 30 / A100 or newer and are offered only there |
 | `--no-vision` | text only: no image encoder (DeepSeek: its vision tower off) |
 | `--draft mtp` / `--draft dflash2` | how the model drafts tokens ahead: its MTP block (the default), or a DFlash2 drafter - downloaded (0.7 GB) into `DIR/GLM-5.3-Flash-DFlash2/` and passed as `--dflash` (Maya-L: +44% on nine GPUs, +12% on two, +19% on one GPU; NVIDIA RTX 30 / A100 and newer - older cards keep the MTP block unless you pass this; the drafter's license is CC BY-NC-ND 4.0, non-commercial use only). The [speed calibration](SETTINGS.md#the-speed-calibration) then keeps it only if it is faster on your PC |
 | `--gpu N` / `--gpus 0,1,2,3` | one GPU, or several (up to 16) that split the model's layers |

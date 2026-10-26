@@ -375,9 +375,10 @@ def find_vcvars(cuda=True, nvcc=None):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
-def download(url, dst: Path, what=None):
+def download(url, dst: Path, what=None, headers=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
-    A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
+    A finished file gets a <name>.done mark, so a later run skips it without asking the server.  headers: sent to
+    url's host only (a gated repo's token: not to the host it redirects to)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and done(dst):
         ok(f"{what or dst.name} already downloaded")
@@ -395,6 +396,8 @@ def download(url, dst: Path, what=None):
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "maya-setup"})
+            for k, v in (headers or {}).items():
+                req.add_unredirected_header(k, v)
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
             break
         except OSError as e:
@@ -409,6 +412,8 @@ def download(url, dst: Path, what=None):
     for attempt in range(30):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "maya-setup", "Range": f"bytes={have}-"})
+            for k, v in (headers or {}).items():
+                req.add_unredirected_header(k, v)
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
                 if have and r.status != 206:                     # the server ignored the range: start over
                     f.seek(0)
