@@ -241,7 +241,7 @@ MODELS = {
     # already) - a prune is the header's "profile": False / "logit_bias" case
     "RCO-152E-Q3_K": {
         "about": "RCO-152E-Q3_K, lapadatbogdan's coder prune of GLM-5.3-Flash (RCO keeps 152 of 288 experts a layer, "
-                 "~170B-A17B) in llama.cpp's Q3_K quant - text only, faster than the full model",
+                 "~170B-A17B) in llama.cpp's Q3_K quant - text only, faster than the full model; not our quant",
         "repo": "lapadatbogdan/GLM-5.3-Flash-Coder-RCO-152E-GGUF", "revision": "94613287f523a52b5a8d7843db3ff4a1bc8d58c6",
         "folder": "", "file": "GLM-5.3-Flash-Coder-RCO-152E-Q3_K-{i:05d}-of-{n:05d}.gguf", "shards": 2,
         "download_gb": 75.1,

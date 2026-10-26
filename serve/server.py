@@ -4217,8 +4217,9 @@ def clean_shared_defaults(d) -> dict:
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
-    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed.  The request's own fields
-    always win - an explicit temperature=0 still means greedy, a field set to null falls back to the default.
+    presence_penalty, repetition_penalty, frequency_penalty, penalty_last_n, seed, logit_bias (as {token id:
+    bias} - a model's own default, RCO-152E's "hmm" ban).  The request's own fields always win - an explicit
+    temperature=0 still means greedy, a field set to null falls back to the default.
     A bad value refuses to start the server (a typo'd config should not quietly change sampling); unknown keys
     are named at startup and ignored."""
     out = {}
@@ -4268,6 +4269,13 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
                 raise SystemExit(f"[maya] config sampling.experimental_speed_projection={value!r}: expected true or "
                                  "false (the default for requests that leave it out, when the engine has the vector)")
             out[key] = value
+        elif key == "logit_bias":
+            # {token id: bias}, a model's own default (RCO-152E's card: ban "hmm" at Q3_K / Q4_K_M) - checked as a
+            # request's is (logit_bias_of: ids, biases, not the whole vocabulary), so the engine line carries it
+            try:
+                out[key] = logit_bias_of(value)
+            except ValueError as e:
+                raise SystemExit(f"[maya] config sampling.logit_bias: {e}")
         else:
             print(f"[maya] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out

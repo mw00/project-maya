@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, Service, StrataEngine, parse_cors_origins, request_timings, sampling_defaults_from_config, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
@@ -1920,6 +1920,26 @@ for line in sys.stdin:
             self.run_gen(2)
         self.assertLess(time.monotonic() - t0, 5.0)         # (a short wait for a DONE that does not come)
         self.assertEqual(self.run_gen(3), [66, 67])
+
+
+class SamplingDefaultsFromConfig(unittest.TestCase):
+    """The run config's `sampling` block as request defaults (sampling_defaults_from_config): every supported key
+    parsed - logit_bias as {token id: bias}, a model's own default (RCO-152E's card: ban "hmm" at Q3_K / Q4_K_M)
+    - an unknown key named and ignored, a bad value refusing to start."""
+
+    def test_a_logit_bias_default_is_kept_as_the_engine_line_takes_it(self):
+        d = sampling_defaults_from_config({"sampling": {"temperature": 1.0,
+                                                       "logit_bias": {"86776": -100, "79380": -100}}})
+        self.assertEqual(d["logit_bias"], {86776: -100.0, 79380: -100.0})   # int ids, float biases
+
+    def test_a_bad_logit_bias_refuses_to_start(self):
+        for bad in ({"86776": -200}, {"x": -100}, {-1: -100}, {86776: "off"}, {86776: True}):
+            with self.assertRaises(SystemExit):
+                sampling_defaults_from_config({"sampling": {"logit_bias": bad}})
+
+    def test_an_unknown_key_is_ignored_and_the_rest_kept(self):
+        d = sampling_defaults_from_config({"sampling": {"temperature": 0.5, "nope": 1, "top_p": None}})
+        self.assertEqual(d, {"temperature": 0.5})
 
 
 if __name__ == "__main__":
