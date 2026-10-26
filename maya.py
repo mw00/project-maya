@@ -1287,6 +1287,13 @@ def config_family(cfg: dict) -> str:
         Path(cfg.get("exe", "")).name.startswith(("maya-ds4", "strata-ds4")) else "glm"   # (before v1.1.16's names)
 
 
+def check_parallel(a, family: str) -> None:
+    if getattr(a, "parallel", None) is not None and family != "glm":
+        model = DS4 if family == "deepseek" else MM3
+        fail(f"--parallel is only supported by GLM-5.3-Flash; {model} serves one request at a time",
+             "remove --parallel; saved conversations do not enable simultaneous decoding")
+
+
 def choose_family(a, prev: dict) -> str:
     """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
     is the default."""
@@ -2862,6 +2869,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     """The dashboard's server for an installed config: (its command, its environment, what the setup's screen shows of
     it).  The engine is compiled again first when its source changed (an update)."""
     cfg = read_json(cfg_path)
+    check_parallel(a, config_family(cfg))
     rename_programs()
     renamed = fix_config_names(cfg)                    # (v1.1.16's names: the programs, and the settings as MAYA_*)
     try:
@@ -3411,6 +3419,7 @@ def set_up(a, prev: dict) -> Path | None:
     config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
     Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
     family = choose_family(a, prev)
+    check_parallel(a, family)
     if config_family(prev) != family:
         prev = next((c for c in map(read_json, configs()) if config_family(c) == family and
                      c.get("backend", "cuda") == a.backend), {})
@@ -4346,7 +4355,8 @@ def main() -> int:
                                    "0,1,2,3")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
-                    help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "
+                    help="GLM-5.3-Flash only: answer up to N requests at once (1-8, default 1), kept in the config: "
+                         "on one GPU they are "
                          "decoded together, more tokens per second in all; each extra conversation keeps its own "
                          "context in VRAM, which the expert cache gives up")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
@@ -4434,6 +4444,7 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        check_parallel(a, config_family(read_json(pick)))
         if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":

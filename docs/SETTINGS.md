@@ -296,6 +296,10 @@ them.
 
 ## Several requests at once
 
+This is a **GLM-5.3-Flash** setting. DeepSeek and MiniMax currently serve one request at a time; the launcher rejects
+`--parallel` for them before changing a config or starting setup/calibration. DeepSeek's saved conversation slots
+reuse earlier state, but do not decode multiple requests at once.
+
 `--parallel N` (1-8, default 1). `./maya.sh --parallel 4` (Windows:
 `START-MAYA.bat --parallel 4`) keeps it in the config's `"args"`. Maya then answers up to N requests at the same time,
 and the ones after them wait their turn. The dashboard shows how many answers are being written, and `/v1/status`
