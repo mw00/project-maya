@@ -223,7 +223,9 @@ builds everything once (20-40 minutes plus the download) and **starts the model*
 
 - **In the browser:** chat (kept in your browser, with search, pins and folders, per-chat instructions and thinking
   level, edit and regenerate, HTML previews), a live **Monitor** of the model and your hardware (down to what fills
-  each GPU's memory), and a context size and port you can change in Settings.
+  each GPU's memory), a context size and port you can change in Settings, and **Models**: every model set up on
+  this machine, switching to another (Maya starts again with it) and each one's engine settings (context, GPUs,
+  drafting, images, memory), saved into its `maya-<model>.json`.
 - **Your apps and coding agents:** an OpenAI-compatible API at `http://127.0.0.1:8080/v1`, and Anthropic's at
   `http://127.0.0.1:8080/v1/messages` (Claude Code: `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`). Tool calls are
   streamed as the model writes them, and a long prompt's reading progress too when a request asks for it

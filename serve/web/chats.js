@@ -287,7 +287,7 @@ export function ctxMeter() {
   const pct = Math.min(100, (100 * c.tokens) / max);
   return {...c, max, pct, level: pct >= 95 ? "danger" : pct >= 80 ? "warn" : "",
           title: `${c.why}: ${fmt(c.tokens)} of the ${fmt(max)}-token context (${fmt(pct, pct < 10 ? 1 : 0)}%)` +
-                 (c.approx ? " - approximate (pictures count once they are read)" : "") +
+                 (c.approx ? " - approximate (images count once they are read)" : "") +
                  (pct >= 95 ? ". Nearly full: start a new chat, or raise the context size in Settings." : "")};
 }
 
@@ -570,14 +570,14 @@ const attached = (a) => { S.attachments = [...S.attachments, a]; emit(); updateC
 export function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
-      if (!S.health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
+      if (!S.health.images) { toast("warn", "Images are off", "This model runs without images: Models › Engine settings turns them on when it can."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
       const r = new FileReader();
       r.onload = () => attached({kind: "image", name: f.name || "pasted image", url: r.result});
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${S.health.images ? " or pictures" : ""}.`); continue; }
+    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${S.health.images ? " or images" : ""}.`); continue; }
     if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
     const r = new FileReader();
     r.onload = () => {

@@ -51,7 +51,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, mm3_vision  # noqa: E402
+from serve import ds4_vision, gpu_map, mm3_vision, models  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -1981,6 +1981,93 @@ class Service:
             except OSError as e:
                 print(f"[maya] could not change the port in {script.name}: {e}", flush=True)
 
+    # -------------------------------------------------------------- the Models page (serve/models.py)
+    def models_root(self) -> Path:
+        """Where the configs are: beside this server's own (maya.py's folder)."""
+        return Path(self.config_path).parent if self.config_path else ROOT
+
+    def models_info(self) -> dict:
+        """The configs the setup wrote, the running one marked, each with its engine settings; whether a switch or a
+        change to the running one can start Maya again at once (maya.py started this server)."""
+        out = models.listing(self.models_root(), self.config_path)
+        out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
+                   running=Path(self.config_path).name if self.config_path else None,
+                   restarting=getattr(self, "model_restart", None))
+        return out
+
+    def _model_path(self, name) -> Path:
+        name = str(name or "")
+        p = self.models_root() / name
+        if (not re.fullmatch(r"maya-[^/\\]+\.json", name) or name.endswith(".shared-settings.json")
+                or not p.is_file()):
+            raise ValueError(f"no model config named {name!r} here")
+        return p
+
+    def _is_running(self, p: Path) -> bool:
+        return bool(self.config_path) and p.resolve() == Path(self.config_path).resolve()
+
+    def _restart_busy(self):
+        if getattr(self, "model_restart", None) or getattr(self, "port_restart", None):
+            raise ValueError("Maya is already starting again")
+        if self.reloading() or self.updater.busy():
+            raise ValueError("Maya is reloading or updating; try again when it is done")
+
+    def model_settings(self, name, settings, dry_run: bool = False) -> dict:
+        """The engine settings of the config `name` (the Models page): checked, and unless dry_run saved into it.  The
+        running model's start Maya again with them (when maya.py started this server), after the request in flight;
+        another model's apply when it is switched to.  dry_run: the command they make, nothing saved."""
+        p = self._model_path(name)
+        cfg = models.read(p)
+        if not cfg:
+            raise ValueError(f"{p.name}: not a config Maya can read")
+        new = models.apply(cfg, settings)                 # (a ValueError: what is wrong, nothing saved)
+        if dry_run:
+            return {"command": models.command(new), "settings": models.settings_of(new)}
+        running = self._is_running(p)
+        if running:
+            self._restart_busy()
+        out = models.save(p, settings)
+        restarts = bool(running and out["changed"] and os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if restarts:
+            self._restart_into(p, "settings")
+        print(f"[maya] {p.name}: engine settings saved" + (": Maya starts again with them" if restarts else
+              " - they apply from its next start" if out["changed"] else " (nothing changed)"), flush=True)
+        return {**out, "running": running, "restarts": restarts}
+
+    def switch_model(self, name) -> dict:
+        """The Models page's Switch: the config `name` becomes the most recently used one (a start without --config
+        picks it), and when maya.py started this server it ends with RESTART_EXIT after the request in flight, leaving
+        maya.py a note (models.SWITCH_FILE) to start that config, on this port."""
+        p = self._model_path(name)
+        if self._is_running(p):
+            raise ValueError(f"{p.name} is the model running now")
+        cfg = models.read(p)
+        if not cfg.get("exe") or models.pack_of(cfg) is None:
+            raise ValueError(f"{p.name} is incomplete: run the setup again to repair it")
+        self._restart_busy()
+        os.utime(p)
+        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if restarts:
+            self._restart_into(p, "switch")
+        print(f"[maya] {p.name} is the model to start" + (": Maya starts again with it" if restarts else
+              " next (a start without --config picks it)"), flush=True)
+        return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": restarts}
+
+    def _restart_into(self, p: Path, why: str):
+        _, port = getattr(self, "listen", None) or ("127.0.0.1", None)
+        note = {"config": str(p.resolve()), "port": port, "why": why, "time": time.time()}
+        (self.models_root() / models.SWITCH_FILE).write_text(json.dumps(note), encoding="utf-8")
+        self.model_restart = {"to": p.name, "why": why, "started": time.time()}
+        threading.Thread(target=self._restart_for_models, args=(p.name, why), daemon=True).start()
+
+    def _restart_for_models(self, name: str, why: str):
+        time.sleep(0.5)                                  # (the answer to the page goes out first)
+        with self.fifo:                                  # the request in flight finishes first
+            print(f"[maya] starting again with {name} ..." if why == "switch" else
+                  f"[maya] starting again with {name}'s new engine settings ...", flush=True)
+            self.close_for_restart()
+            os._exit(RESTART_EXIT)
+
     def storage(self) -> dict | None:
         """The model's folder and the free space on its drive (About)."""
         if not self.model_dir:
@@ -3631,6 +3718,10 @@ def make_handler(svc: Service):
                 # the dashboard's Port: where the server listens, and whether a new one applies at once
                 if self._authorized():
                     self._json(200, svc.port_info())
+            elif path == "/api/models":
+                # the Models page: the configs the setup wrote, the running one, each one's engine settings
+                if self._authorized():
+                    self._json(200, svc.models_info())
             elif path == "/api/update":
                 # About > Updates: the latest release (GitHub, cached six hours; ?force=1 asks now) and whether this
                 # folder can update itself
@@ -3714,6 +3805,9 @@ def make_handler(svc: Service):
                     return
                 if path == "/api/update":
                     self._update()
+                    return
+                if path in ("/api/models/settings", "/api/models/switch"):
+                    self._models(path.rsplit("/", 1)[1])
                     return
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
@@ -3821,6 +3915,24 @@ def make_handler(svc: Service):
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
             self._json(202, out)
+
+        def _models(self, what: str):
+            # They change which model runs, or how, for every client: only the app's own page
+            body = self._body()
+            if not self._own_page("models can be changed"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("the request body must be a JSON object")
+                if what == "switch":
+                    out = svc.switch_model(req.get("file"))
+                else:
+                    out = svc.model_settings(req.get("file"), req.get("settings") or {}, bool(req.get("dry_run")))
+            except (TypeError, ValueError, OSError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            self._json(200 if what == "settings" and req.get("dry_run") else 202, out)
 
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page

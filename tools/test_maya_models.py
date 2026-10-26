@@ -151,6 +151,34 @@ class RestartAfterUpdate(unittest.TestCase):
         self.assertNotIn("--port", argv)               # (this start's --port 8090 would undo it: the config's applies)
         self.assertEqual(argv[argv.index("--gpus") + 1], "0,1")
 
+    def after(self, note, config=None):
+        """after_server for the Models page's restart: the server's note (serve/models.py's SWITCH_FILE) or none."""
+        import json
+        import time
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            target = d / "maya-gguf-q8-hip.json"
+            target.write_text(json.dumps({"backend": "hip", "args": []}))
+            if note is not None:
+                (d / maya.SWITCH_FILE).write_text(json.dumps({"config": str(target), "time": time.time(), **note}))
+            a = SimpleNamespace(port=8090, host=None, api_key=None, gpu=None, gpus=None, backend="cuda", config=config)
+            with patch.object(maya, "ROOT", d), patch.object(maya, "say"), patch.object(maya, "WIN", False), \
+                    patch.object(maya.os, "execv") as execv:
+                maya.after_server(maya.RESTART_EXIT, a)
+            left = (d / maya.SWITCH_FILE).exists()
+        argv = execv.call_args.args[1]
+        return {f: argv[argv.index(f) + 1] for f in ("--config", "--port", "--backend") if f in argv}, target, left
+
+    def test_a_switch_starts_the_chosen_config_on_the_same_port(self):   # (the Models page's Switch)
+        got, target, left = self.after({"why": "switch", "port": 8123}, config=Path("/x/maya-maya-m.json"))
+        self.assertEqual(got, {"--config": str(target), "--port": "8123", "--backend": "hip"})
+        self.assertFalse(left)                          # (read once: a later port change is not a switch)
+
+    def test_an_old_note_is_not_followed(self):
+        got, _, left = self.after({"why": "switch", "port": 8123, "time": 0}, config=Path("/x/maya-maya-m.json"))
+        self.assertEqual(got, {"--config": "/x/maya-maya-m.json", "--backend": "cuda"})
+        self.assertFalse(left)
+
 
 class RunScript(unittest.TestCase):
     """run-maya-<model>.sh starts its config through maya.py - on the screen in a terminal, as ./maya.sh does - not

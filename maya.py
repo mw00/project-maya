@@ -82,6 +82,7 @@ WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
 UPDATE_EXIT = 75                                   # the server's exit after the dashboard updated Maya (serve/update.py)
 RESTART_EXIT = 76                                  # ... after it saved a new port: start again on the saved one
+SWITCH_FILE = ".maya-switch.json"                  # ... or the Models page's note: the config to start (serve/models.py)
 ROOT = S.ROOT
 BUILD = ROOT / "build"
 EXE = BUILD / ("maya.exe" if WIN else "maya")
@@ -3058,13 +3059,28 @@ def after_server(rc: int, a) -> int:
     again = [sys.executable, str(HERE / "maya.py"), "--yes"]
     # (a new port from the dashboard: not this start's --port - the config's, which it saved, applies)
     port = None if rc == RESTART_EXIT else a.port
-    for flag, v in (("--backend", a.backend), ("--port", port), ("--host", a.host), ("--api-key", a.api_key),
-                    ("--gpu", a.gpu), ("--gpus", a.gpus), ("--config", getattr(a, "config", None))):
+    backend, config = a.backend, getattr(a, "config", None)
+    # the Models page: another model to start (a switch), or this one with its new engine settings - the server's
+    # note says which config, on the port it listened on (so the page finds it again)
+    note = read_json(ROOT / SWITCH_FILE) if rc == RESTART_EXIT else {}
+    try:
+        (ROOT / SWITCH_FILE).unlink()
+    except OSError:
+        pass
+    why = None
+    if note.get("config") and Path(note["config"]).is_file() and time.time() - float(note.get("time") or 0) < 600:
+        config, why = Path(note["config"]), note.get("why")
+        backend = read_json(config).get("backend", "cuda")
+        port = note.get("port") or port
+    for flag, v in (("--backend", backend), ("--port", port), ("--host", a.host), ("--api-key", a.api_key),
+                    ("--gpu", a.gpu), ("--gpus", a.gpus), ("--config", config)):
         if v is not None:
             again += [flag, str(v)]
     say()
-    say("  The port changed from the dashboard: starting Maya again on it ..." if rc == RESTART_EXIT else
-        "  Updated from the dashboard: starting the new version ...")
+    say("  Updated from the dashboard: starting the new version ..." if rc != RESTART_EXIT else
+        f"  Switching to {config.name} from the dashboard ..." if why == "switch" else
+        f"  {config.name}'s engine settings changed from the dashboard: starting Maya again with them ..."
+        if why == "settings" else "  The port changed from the dashboard: starting Maya again on it ...")
     sys.stdout.flush()
     if WIN:
         return subprocess.call(again)

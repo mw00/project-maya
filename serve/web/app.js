@@ -12,6 +12,7 @@ import {SearchDialog, Sidebar, openSettings, setSide, showView} from "./sidebar.
 import {ChatPage} from "./chat-view.js";
 import {SettingsDialog} from "./settings.js";
 import {MonitorPage} from "./monitor.js";
+import {ModelsPage} from "./models.js";
 
 applyTheme();
 
@@ -19,15 +20,15 @@ function App() {
   useStore();
   const phone = isPhone();
   useEffect(() => {
-    // the address follows the view: #monitor, #settings (an old #about opens Settings' About)
-    const want = S.view === "monitor" ? "#monitor" : S.settings ? "#settings" : "";
+    // the address follows the view: #monitor, #models, #settings (an old #about opens Settings' About)
+    const want = S.view === "monitor" ? "#monitor" : S.view === "models" ? "#models" : S.settings ? "#settings" : "";
     if (location.hash !== want) history.replaceState(null, "", want || location.pathname + location.search);
   });
   return html`<div class=${`shell${S.sideOpen && !phone ? "" : " shell--closed"}`}>
     ${phone ? null : S.sideOpen ? html`<${Sidebar}/>` : null}
     ${phone && S.drawer ? html`<div class="drawer-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) { S.drawer = false; emit(); } }}>
       <${Sidebar} drawer/></div>` : null}
-    ${S.view === "monitor" ? html`<${MonitorPage}/>` : html`<${ChatPage}/>`}
+    ${S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`}
     ${S.settings ? html`<${SettingsDialog}/>` : null}
     ${S.search ? html`<${SearchDialog}/>` : null}
     <${DialogHost}/>
@@ -57,12 +58,12 @@ document.addEventListener("keydown", (e) => {
 let wasPhone = isPhone();
 addEventListener("resize", () => { if (isPhone() !== wasPhone) { wasPhone = isPhone(); S.drawer = false; emit(); } });
 
-// the address: #monitor, #settings, #about
+// the address: #monitor, #models, #settings, #about
 function route() {
   const h = location.hash.slice(1);
-  if (h === "monitor") showView("monitor");
-  else if (h === "settings" || h === "about") { S.view = S.view === "monitor" ? "monitor" : "chat"; openSettings(h === "about" ? "about" : "general"); }
-  else if (!h && S.view === "monitor") showView("chat");
+  if (h === "monitor" || h === "models") showView(h);
+  else if (h === "settings" || h === "about") { S.view = S.view === "monitor" || S.view === "models" ? S.view : "chat"; openSettings(h === "about" ? "about" : "general"); }
+  else if (!h && (S.view === "monitor" || S.view === "models")) showView("chat");
 }
 addEventListener("hashchange", route);
 

@@ -49,6 +49,8 @@ a:hover { color: var(--st-ink); }
 .btn--secondary:hover { background: var(--st-surface-2); color: var(--st-ink); }
 .btn--danger { background: var(--st-danger-tint); color: var(--st-danger-text); }
 .btn--danger:hover { background: color-mix(in srgb, var(--st-danger) 22%, transparent); }
+.btn--ghost { background: transparent; color: var(--st-ink-soft); font-weight: 500; }
+.btn--ghost:hover, .btn--ghost.is-on { background: var(--st-surface-2); color: var(--st-ink); }
 .btn:disabled { opacity: .5; }
 
 .icon-btn { display: inline-grid; place-items: center; flex: none; width: 36px; height: 36px; padding: 0; border: 0;

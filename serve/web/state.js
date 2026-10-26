@@ -17,7 +17,7 @@ export const S = {
   shared: {on: false, now: null},   // GET /settings: these settings as every API client's defaults
 
   // the view
-  view: "chat",             // "chat" or "monitor"
+  view: "chat",             // "chat", "monitor" or "models"
   sideOpen: store.get("side-open", true),   // the sidebar on a wide screen
   drawer: false,            // the chats drawer on a phone
   settings: null,           // the Settings dialog's open section, or null

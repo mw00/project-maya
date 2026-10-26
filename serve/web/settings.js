@@ -222,7 +222,7 @@ function Connect() {
 function Data() {
   const n = S.chats.length;
   return html`<h3>Data</h3>
-    <p class="set-intro">Chats, pictures and attached files are kept in this browser only (${fmt(n)} chat${n === 1 ? "" : "s"} now). The server keeps none of them.</p>
+    <p class="set-intro">Chats, images and attached files are kept in this browser only (${fmt(n)} chat${n === 1 ? "" : "s"} now). The server keeps none of them.</p>
     <${Row} label="Clear chats and settings" sub="Every chat and folder, these settings and the API key in this browser. The model, its files and the server's own settings are not touched.">
       <button type="button" class="btn btn--danger" onClick=${clearBrowser}>Clear…</button><//>`;
 }
@@ -305,7 +305,7 @@ function facts() {
                  `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
     ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
                   : "off (one GPU, or no draft block in this model file)"],
-    ["Pictures", eng.images != null ? (eng.images ? "On" : "Off") : (S.health.images ? "On" : "Off")],
+    ["Images", eng.images != null ? (eng.images ? "On" : "Off") : (S.health.images ? "On" : "Off")],
     ["GPU", st.gpu_name ? `${gpuNames(st.gpu_name, gpus.length)}${hw.gpu_mem_total ? ` · ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],
     ["PCIe", pcie],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],

@@ -8,7 +8,8 @@ import {mcpOn} from "./server.js";
 import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newChat, painters, regenerate,
         removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
 import {markdown, onCodeClick, patchHtml, streamingMarkdown} from "./md.js";
-import {ChatMenuItems, openSettings, setSide} from "./sidebar.js";
+import {ChatMenuItems, openSettings, setSide, showView} from "./sidebar.js";
+import {MS, loadModels} from "./models.js";
 import {Gauge, Icon, Menu, MenuItem, MenuSep, ModelLogo, useDismiss} from "./ui.js";
 
 // ------------------------------------------------------------------ the header
@@ -26,6 +27,7 @@ function Meter() {
 
 function ModelMenu({open, close, anchor}) {
   const h = S.health, preset = presetOf(P), c = ctxMeter();
+  useEffect(() => { if (open && !MS.data) loadModels(); }, [open]);   // (the Models row says how many are set up)
   const go = (s) => () => { close(); openSettings(s); };
   return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Model" align="left" cls="model-menu" width=${340}>
     <div class="model-menu__card"><${ModelLogo} model=${h.model} size=${36}/>
@@ -36,6 +38,10 @@ function ModelMenu({open, close, anchor}) {
       <span class="menu__sub">${h.max_context ? ctxfmt(h.max_context) : "–"}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
     <button type="button" role="menuitem" class="menu__item" onClick=${go("chat")}><span class="menu__label">Sampling</span>
       <span class="menu__sub">${preset ? PRESET_NAMES[preset] : "Custom"}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
+    <${MenuSep}/>
+    <button type="button" role="menuitem" class="menu__item" onClick=${() => { close(); showView("models"); }}>
+      <span class="menu__label">Models</span><span class="menu__sub">${MS.data ? `${MS.data.models.length} set up` : "Switch, settings"}</span>
+      <${Icon} name="chevron" sm cls="chev is-closed"/></button>
   <//>`;
 }
 
@@ -286,7 +292,7 @@ function ThinkingPopover({open, close, anchor, below}) {
 function PlusMenu({open, close, anchor, pickFiles}) {
   const servers = (S.mcp.servers || []).length;
   return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Add" align="left" width=${270} cls="plus-menu">
-    <${MenuItem} icon="attach" label=${S.health.images ? "Add files or pictures" : "Add text files"} onClick=${() => { close(); pickFiles(); }}/>
+    <${MenuItem} icon="attach" label=${S.health.images ? "Add files or images" : "Add text files"} onClick=${() => { close(); pickFiles(); }}/>
     ${servers ? html`<${MenuSep}/>
       <button type="button" role="menuitemcheckbox" aria-checked=${String(P.mcp !== false)} class="menu__item"
         onClick=${() => savePrefs({mcp: P.mcp === false})}>
@@ -329,7 +335,7 @@ function Composer({center}) {
           <span class="chip__name">${a.name}</span>
           <button type="button" class="chip__x" aria-label=${`Remove ${a.name}`} onClick=${() => removeAttachment(i)}><${Icon} name="close" sm/></button></span>`)}</div>` : null}
       <span class="anchor composer__plus">
-        <button type="button" ref=${plusBtn} class="icon-btn icon-btn--round" aria-label="Add files, pictures and tools" title="Add files, pictures and tools"
+        <button type="button" ref=${plusBtn} class="icon-btn icon-btn--round" aria-label="Add files, images and tools" title="Add files, images and tools"
           aria-haspopup="menu" aria-expanded=${String(plus)} onClick=${() => setPlus(!plus)}><${Icon} name="plus"/></button>
         <${PlusMenu} open=${plus} close=${() => setPlus(false)} anchor=${plusBtn} pickFiles=${() => file.current.click()}/>
       </span>
@@ -414,6 +420,6 @@ export function ChatPage() {
     ${jump && !empty ? html`<button type="button" class="jump" onClick=${() => scrollDown(true)} aria-label="Scroll to the latest">
       <${Icon} name="arrow-down" sm/></button>` : null}
     ${empty && !phone ? html`<p class="composer-note composer-note--foot">${note()}</p>` : html`<div class="chat__dock"><${Composer}/></div>`}
-    ${drop ? html`<div class="drop" aria-hidden="true"><${Icon} name="attach" lg/><span>Drop files${S.health.images ? " or pictures" : ""} to attach them</span></div>` : null}
+    ${drop ? html`<div class="drop" aria-hidden="true"><${Icon} name="attach" lg/><span>Drop files${S.health.images ? " or images" : ""} to attach them</span></div>` : null}
   </main>`;
 }

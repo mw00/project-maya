@@ -1,4 +1,4 @@
-// serve/web/sidebar.js - the sidebar (new chat, search, Monitor, Settings; the chats: pinned, in folders, then by day;
+// serve/web/sidebar.js - the sidebar (new chat, search, Models, Monitor, Settings; the chats: pinned, in folders, then by day;
 // the model's status), a chat's ⋯ menu, and the search dialog.
 import {html, useEffect, useMemo, useRef, useState} from "./preact.js";
 import {MOD, ctxfmt, dayGroup, fmt, modelName, relTime, store} from "./lib.js";
@@ -152,6 +152,8 @@ export function Sidebar({drawer}) {
     <button type="button" class="nav-item" onClick=${newChat}><${Icon} name="new-chat"/><span>New chat</span><${Kbd} k=${`${MOD} ⇧ O`}/></button>
     <button type="button" class="nav-item" onClick=${() => { S.search = true; S.drawer = false; emit(); }}>
       <${Icon} name="search"/><span>Search chats</span><${Kbd} k=${`${MOD} K`}/></button>
+    <button type="button" class=${`nav-item${S.view === "models" ? " is-current" : ""}`} aria-current=${S.view === "models" ? "page" : undefined}
+      onClick=${() => showView("models")}><${Icon} name="boxes"/><span>Models</span></button>
     <button type="button" class=${`nav-item${S.view === "monitor" ? " is-current" : ""}`} aria-current=${S.view === "monitor" ? "page" : undefined}
       onClick=${() => showView("monitor")}><${Icon} name="activity"/><span>Monitor</span></button>
     <button type="button" class="nav-item" onClick=${() => openSettings(newer ? "about" : "general")}>
