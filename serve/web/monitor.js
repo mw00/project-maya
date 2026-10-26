@@ -101,23 +101,57 @@ function RightNow({m}) {
   } else if (last) {
     detail = `last answer: ${fmt(last.output_tokens)} tokens${took(last.duration_s)}`;
   }
-  const ctx = eng.max_context || 0, running = live.state !== "idle";
-  const used = running ? (live.prompt_tokens || 0) + (live.generated || 0) : last ? (last.prompt_tokens || 0) + (last.output_tokens || 0) : 0;
-  const cpct = ctx ? Math.min(100, (100 * used) / ctx) : 0;
+  const running = live.state !== "idle";
   return html`<section class="card card--side" aria-label="Right now">
     <span class="card__title">Right now</span>
     <div class="now"><${Badge} tone=${tone}>${label}<//><span class="now__detail num">${detail}</span></div>
     ${pct != null ? html`<div class="bar" data-tone=${ptone} role="progressbar" aria-valuenow=${Math.round(pct)} aria-valuemin="0" aria-valuemax="100"
       aria-label=${label}><span style=${`width:${pct}%`}></span></div>` : null}
-    ${ctx ? html`<div class="now__ctx"><span class="set-split set-split--muted"><span>Context of ${running ? "this" : "the last"} request</span>
-        <b class="num">${fmt(used)} / ${fmt(ctx)}</b></span>
-      <div class="bar" role="img" aria-label=${`${fmt(cpct, 0)}% of the context in use`}><span style=${`width:${cpct}%`}></span></div></div>` : null}
     <dl class="kv">
       ${running && live.prompt_total ? html`<dt>Prompt read</dt><dd class="num">${fmt(live.prompt_read)} of ${fmt(live.prompt_total)}</dd>`
         : last ? html`<dt>Reused from the cache</dt><dd class="num">${fmt(last.reused || 0)} tokens</dd>` : null}
       <dt>Answers at once</dt><dd class="num">${fmt(live.active || 0)}</dd>
       <dt>Waiting</dt><dd class="num">${live.queued > 0 ? fmt(live.queued) : "none"}</dd>
     </dl>
+  </section>`;
+}
+
+// ------------------------------------------------------------------ the context: what the conversation holds, of its size
+// the prompt the conversation cache already held (reused), the prompt read new and what was written - of the request being
+// answered, else of the last one; GLM's KV streaming keeps the first kv_resident positions of each layer in VRAM
+function ContextCard({m}) {
+  const live = m.live || {}, last = (m.requests || [])[0], eng = m.engine || {};
+  const max = eng.max_context || 0;
+  if (!max) return null;
+  const running = live.state === "reading" || live.state === "generating";
+  let prompt = 0, reused = null, written = 0, what = "";
+  if (running) {
+    prompt = live.prompt_tokens || 0; reused = live.prompt_reused; written = live.generated || 0;
+    what = live.active > 1 ? `the newest of ${fmt(live.active)} answers being written` : "the request being answered";
+  } else if (last) {
+    prompt = last.prompt_tokens || 0; reused = last.reused; written = last.output_tokens || 0; what = "the last request";
+  }
+  const r = reused == null ? null : Math.min(reused, prompt);
+  const segs = [...(r == null ? [] : [{k: "reused", label: "Reused from the cache", n: r}]),
+                {k: "fresh", label: r == null ? "Prompt" : "Read new", n: prompt - (r || 0)}, {k: "written", label: "Written", n: written}];
+  const used = Math.min(max, prompt + written), free = Math.max(0, max - used), pct = (100 * used) / max;
+  const win = +eng.kv_resident || 0, showWin = win > 0 && win < max;
+  const note = !running && !last ? "No conversation yet: the context fills as a chat goes on, with every message, file and tool result in it."
+    : showWin ? (used > win ? `Beyond the first ${ctxfmt(win)} positions the cache streams from RAM (KV streaming): about ${fmt((used * 12288) / 1e9, 1)} GB of RAM for this conversation.`
+                            : `Up to ${ctxfmt(win)} the whole cache stays in VRAM; beyond it, it streams from RAM (KV streaming).`)
+    : "What the model holds at once: the chat, its files and tool results. A chat longer than this is refused: start a new one, or give the model a bigger context.";
+  const aria = `${fmt(used)} of ${fmt(max)} tokens in use` + segs.map((s) => `, ${s.label.toLowerCase()} ${fmt(s.n)}`).join("");
+  return html`<section class="card" aria-label="Context">
+    <div class="card__head"><span class="card__title">Context</span><span class="card__sub">${what ? `${what} · ` : ""}${ctxfmt(max)} context</span></div>
+    <div class="ctx__nums"><span class="ctx__big num">${fmt(used)}<small>/ ${fmt(max)} tokens</small></span>
+      <span class="ctx__pct num"><b>${fmt(pct, pct > 0 && pct < 10 ? 1 : 0)}%</b> used · ${fmt(free)} left</span></div>
+    <div class=${`ctx__track${showWin ? " ctx__track--win" : ""}`}>
+      ${showWin ? html`<span class="ctx__win" style=${`left:${(100 * win) / max}%`}><span>VRAM window · ${ctxfmt(win)}</span></span>` : null}
+      <div class="ctxbar" role="img" aria-label=${aria}>${segs.filter((s) => s.n > 0).map((s) => html`<span class=${`ctxbar__${s.k}`} style=${`flex-grow:${s.n}`}></span>`)}
+        <span style=${`flex-grow:${free}`}></span></div></div>
+    <div class="legend">${segs.map((s) => html`<span><i class=${`sw sw--${s.k}`}></i>${s.label} <b class="num">${fmt(s.n)}</b></span>`)}
+      <span><i class="sw sw--free"></i>Free <b class="num">${fmt(free)}</b></span></div>
+    <p class="card__note card__note--tip">${note} The size: Settings › Model, or the model's Engine settings on the Models page.</p>
   </section>`;
 }
 
@@ -443,6 +477,7 @@ export function MonitorPage() {
       ${m ? html`
         <${Banners} m=${m}/>
         <div class="mon__top"><${Throughput} m=${m}/><${RightNow} m=${m}/></div>
+        <${ContextCard} m=${m}/>
         <${Tiers} t=${m.tiers} eng=${m.engine || {}}/>
         <${GpuMap} m=${m}/>
         <${Hardware} m=${m} gpuEach=${gpuEach}/>

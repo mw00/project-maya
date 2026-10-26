@@ -2225,6 +2225,8 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress[0], progress[1]
+        # the prompt the conversation cache already held (the Monitor's Context bar), from the engine's PP lines
+        live["prompt_reused"] = progress[2] if s.get("busy") and progress and len(progress) > 2 else None
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
                   "trained_context": self.trained_context}

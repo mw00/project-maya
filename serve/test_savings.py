@@ -151,6 +151,7 @@ class Page(unittest.TestCase):
         self.assertGreater(r["usd"], 0)
         s, m = self.req("GET", "/metrics")
         self.assertEqual((m["savings"]["usd"], m["savings"]["priced"]), (r["usd"], True))
+        self.assertIsNone(m["live"]["prompt_reused"])                     # (the Monitor's Context bar: idle now)
         self.assertTrue(json.loads((Path(self.tmp.name) / SV.FILE).read_text())["models"]["maya-maya-m.json"])
 
     def test_prices_from_the_page(self):

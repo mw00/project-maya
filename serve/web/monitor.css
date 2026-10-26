@@ -62,13 +62,29 @@
 
 .now { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .now__detail { font-size: var(--st-fs-md); color: var(--st-ink-soft); }
-.now__ctx { display: flex; flex-direction: column; gap: 8px; }
 .bar { height: 8px; border-radius: var(--st-r-pill); background: var(--st-surface-3); overflow: hidden; }
 .bar > span { display: block; height: 100%; border-radius: inherit; background: var(--st-accent); transition: width 400ms var(--st-ease); }
 .bar[data-tone="info"] > span { background: var(--st-info); }
 .kv { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px; font-size: var(--st-fs-sm); }
 .kv dt { color: var(--st-ink-muted); }
 .kv dd { margin: 0; font-weight: 600; text-align: right; }
+
+/* the context: what the conversation holds, of its size (GLM: KV streaming's VRAM window marked) */
+.ctx__nums { display: flex; align-items: baseline; gap: 6px 14px; flex-wrap: wrap; }
+.ctx__big { font-size: 30px; font-weight: 600; letter-spacing: -.02em; line-height: 1.15; }
+.ctx__big small { margin-left: 6px; font-size: var(--st-fs-base); font-weight: 500; letter-spacing: 0; color: var(--st-ink-muted); }
+.ctx__pct { font-size: var(--st-fs-md); color: var(--st-ink-soft); }
+.ctx__pct b { color: var(--st-ink); font-weight: 600; }
+.ctx__track { position: relative; }
+.ctx__track--win { padding-top: 22px; }
+.ctx__win { position: absolute; top: 16px; bottom: -4px; width: 2px; margin-left: -1px; border-radius: 1px; background: var(--st-ink-soft); z-index: 1; }
+.ctx__win > span { position: absolute; bottom: calc(100% + 2px); left: 50%; transform: translateX(-50%); font-size: 11px; font-weight: 600;
+                   color: var(--st-ink-soft); white-space: nowrap; }
+.ctxbar { display: flex; gap: 2px; height: 14px; border-radius: var(--st-r-pill); overflow: hidden; background: var(--st-surface-3); }
+.ctxbar > span { flex: 0 1 0; min-width: 0; transition: flex-grow 400ms var(--st-ease); }
+.ctxbar__reused, .sw.sw--reused { background: var(--st-accent); }
+.ctxbar__fresh, .sw.sw--fresh { background: var(--st-info); }
+.ctxbar__written, .sw.sw--written { background: var(--st-ok); }
 
 /* the experts' tiers */
 .tierbar { display: flex; gap: 2px; height: 14px; border-radius: var(--st-r-pill); overflow: hidden; background: var(--st-surface-3); }
