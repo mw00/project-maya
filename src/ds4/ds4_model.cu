@@ -14897,9 +14897,12 @@ struct Model::Impl {
         std::vector<int> eg_mates;   // the devices whose copies read this one's slots (this one too)
         for (size_t j = 0; j < devs.size() && eg_src == di; ++j)
             if (chunks[j] != nullptr && devs[j].grp == d.grp && eg_src_dev((int) j) == di) eg_mates.push_back((int) j);
-        auto eg_wait_seq = [this](const std::atomic<unsigned>& a, unsigned seq) {   // (false: the run ends)
+        // (false: a device failed. Not on a Stop: every device runs each chunk any one started - chunk_go - so the
+        //  rows and copies of a chunk being run still come, and a member leaving one early would leave its group's
+        //  other members waiting in that chunk's all-reduce for good)
+        auto eg_wait_seq = [this](const std::atomic<unsigned>& a, unsigned seq) {
             while ((int) (a.load(std::memory_order_acquire) - seq) < 0) {
-                if (eg_abort.load(std::memory_order_acquire) || halt.load(std::memory_order_acquire)) return false;
+                if (eg_abort.load(std::memory_order_acquire)) return false;
                 std::this_thread::sleep_for(std::chrono::microseconds(50));
             }
             return true;
@@ -14933,7 +14936,6 @@ struct Model::Impl {
                     eg_next.get();
                     if (k + 1 < nk) eg_next = std::async(std::launch::async, read_eg, k + 1);
                 } else if (!eg_wait_seq(chunks[(size_t) eg_src]->eg_read_seq[slot], run.seq[(size_t) k])) {
-                    if (halt.load(std::memory_order_acquire)) return halt_end(di, err);
                     err = "the Engram rows' reader stopped";
                     return false;
                 }
@@ -16042,8 +16044,12 @@ struct Model::Impl {
                 std::string e;
                 if (!run_dev_chunks((int) di, run, e)) {
                     errs[di] = e.empty() ? "a device's thread failed" : e;
-                    eg_abort.store(true, std::memory_order_release);
-                    if (eg_pf != nullptr) eg_pf->wake();
+                    // (a Stop's early end is not a failure: the devices still on the chunks it reached wait for
+                    //  their Engram rows - the first group, done first, would otherwise end them mid-chunk)
+                    if (e != kHalted) {
+                        eg_abort.store(true, std::memory_order_release);
+                        if (eg_pf != nullptr) eg_pf->wake();
+                    }
                 }
             });
         size_t reported = 0;
