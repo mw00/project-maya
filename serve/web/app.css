@@ -7,8 +7,11 @@
 
 /* ---------------------------------------------------------------- the sidebar */
 /* glass, as DeepSeek Harness's sidebar: the sidebar's own color a little see-through, blurred, a sheen at the top and a light
-   edge instead of a border; the main column keeps the hairline (on the glass an alpha border would read as a seam) */
-.side { flex: none; width: var(--maya-side); height: 100%; display: flex; flex-direction: column; gap: 2px; padding: 10px 10px 12px;
+   edge instead of a border; the main column keeps the hairline (on the glass an alpha border would read as a seam).
+   The blur makes the sidebar its own stacking layer, so its popups' z-index counts only inside it: it sits above the
+   main column (z-index 1), else the column after it paints over Saved's popover and the menus where they reach past it */
+.side { position: relative; z-index: 1;
+        flex: none; width: var(--maya-side); height: 100%; display: flex; flex-direction: column; gap: 2px; padding: 10px 10px 12px;
         background: linear-gradient(to bottom, var(--st-glass-sheen), transparent 35%), var(--st-side-glass);
         -webkit-backdrop-filter: blur(30px) saturate(170%); backdrop-filter: blur(30px) saturate(170%);
         box-shadow: inset -1px 0 0 var(--st-glass-edge); }
