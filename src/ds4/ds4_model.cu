@@ -3734,27 +3734,44 @@ struct Model::Impl {
                        const uint8_t* src = nullptr) {
         if (l.lay.fmt == gg::kFmtMXFP4) {   // the blob, or member m's rows / blocks: from `src` (the expert read into
             // pinned staging as its blob) or from the file's mapping
-            auto mat_r = [&](int r) { return src != nullptr ? src + l.lay.trellis[r] : mx_mat(l, e, r); };
+            // Copied GGUF experts hold whole matrix rows on each NUMA node. mx_mat() is only
+            // part 0 in this case; reading a full matrix from it corrupts its second half.
+            const bool copied = src == nullptr && copy_mode && !l.ram.empty() && l.ram[(size_t) e] >= 0;
+            auto copy_rows = [&](int r, uint8_t* out, size_t out_pitch, int first, int rows,
+                                 size_t col, size_t width) {
+                const size_t pitch = mx_row_b(l, r);
+                const int parts = copied ? NH : 1, per = mx_n(r) / parts;
+                for (int X = 0; X < parts; ++X) {
+                    const int lo = std::max(first, X * per), hi = std::min(first + rows, (X + 1) * per);
+                    if (lo >= hi) continue;
+                    const uint8_t* base = copied ? mx_part_ptr(l, e, r, X)
+                                                : src != nullptr ? src + l.lay.trellis[r] : mx_mat(l, e, r);
+                    const uint8_t* from = base + (size_t) (lo - X * per) * pitch + col;
+                    uint8_t* to = out + (size_t) (lo - first) * out_pitch;
+                    const cudaError_t status = width == pitch && width == out_pitch
+                        ? cudaMemcpyAsync(to, from, (size_t) (hi - lo) * width, cudaMemcpyHostToDevice, cs)
+                        : cudaMemcpy2DAsync(to, out_pitch, from, pitch, width, (size_t) (hi - lo),
+                                            cudaMemcpyHostToDevice, cs);
+                    if (status != cudaSuccess) return false;
+                }
+                return true;
+            };
             bool ok = true;
             if (l.nm == 1) {
                 if (src != nullptr)
                     ok = cudaMemcpyAsync(dst, src, l.blob, cudaMemcpyHostToDevice, cs) == cudaSuccess;
                 else
                     for (int r = 0; r < 3; ++r)
-                        ok = ok && cudaMemcpyAsync(dst + l.lay.trellis[r], mat_r(r), mx_part_bytes(l, r),
-                                                   cudaMemcpyHostToDevice, cs) == cudaSuccess;
-            } else {   // (member m's own range and layout)
+                        ok = ok && copy_rows(r, dst + l.lay.trellis[r], mx_row_b(l, r), 0, mx_n(r), 0, mx_row_b(l, r));
+            } else {   // gate/up: this member's rows; down: its columns across every NUMA row part
                 const Layer& x = member(l, m);
-                const size_t dr = gg::type_row_bytes(gg::expert_type(l.lay, 2), g.ff),
-                             d0 = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ff0),
+                const size_t d0 = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ff0),
                              dh = gg::type_row_bytes(gg::expert_type(l.lay, 2), x.ffn);
                 for (int r = 0; r < 2; ++r) {
-                    const size_t gr = gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim);
-                    ok = ok && cudaMemcpyAsync(dst + x.hlay.trellis[r], mat_r(r) + (size_t) x.ff0 * gr,
-                                               (size_t) x.ffn * gr, cudaMemcpyHostToDevice, cs) == cudaSuccess;
+                    const size_t gr = mx_row_b(l, r);
+                    ok = ok && copy_rows(r, dst + x.hlay.trellis[r], gr, x.ff0, x.ffn, 0, gr);
                 }
-                ok = ok && cudaMemcpy2DAsync(dst + x.hlay.trellis[2], dh, mat_r(2) + d0, dr, dh,
-                                             (size_t) g.dim, cudaMemcpyHostToDevice, cs) == cudaSuccess;
+                ok = ok && copy_rows(2, dst + x.hlay.trellis[2], dh, 0, g.dim, d0, dh);
             }
             if (!ok) err = "streaming layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
             return ok;
