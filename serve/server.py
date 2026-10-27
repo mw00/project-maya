@@ -860,6 +860,9 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     tune_keys += f" {k}={float(v)!r}"
+            sd = tune.get("suffix_draft")   # the DeepSeek engine's prompt lookup beside DSpark: off (0) / on (1)
+            if isinstance(sd, int) and not isinstance(sd, bool) and sd in (0, 1):
+                tune_keys += f" suffix_draft={sd}"
             ct = tune.get("cpu_threads")   # the GLM engine's CPU lane threads (fewer than it started with)
             if isinstance(ct, int) and not isinstance(ct, bool) and ct > 0:
                 tune_keys += f" cpu_threads={ct}"

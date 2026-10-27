@@ -137,6 +137,11 @@ public:
                float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
+    /// A verify window's tokens at most (y and the drafts after it); verify() takes drafts from any source - those not
+    /// the drafter's own draws as a point each (q 1)
+    int verify_max() const;
+    /// The last draft()'s drafts were drawn from the drafter's distribution (DS4_DSPARK_SAMPLE=1), not its argmax
+    bool drafts_sampled() const;
 
     /// Tokens a feed call takes at a time to use the chunked prompt path (all of a prompt: its chunks run as a
     /// pipeline; 16 without it).

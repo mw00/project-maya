@@ -18,6 +18,8 @@
 // the same places.
 #include "ds4_model.hpp"
 #include "strata/platform/env_alias.hpp"
+#include "strata/spec/draft_policy.hpp"
+#include "strata/spec/suffix_drafter.hpp"
 
 #include <cuda_profiler_api.h>
 
@@ -93,6 +95,7 @@ void usage() {
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
+                 "           [--suffix-draft N]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
@@ -202,14 +205,37 @@ float dspark_cum_default() {
     return v;
 }
 
+// Prompt lookup beside DSpark (the suffix drafter: the tokens that followed an earlier repeat of the context - code
+// edits, quoted text, a list that comes back): a round whose lookup proposal starts with DSpark's first draft verifies
+// the lookup's tokens instead where the draft policy (strata/spec/draft_policy.hpp) expects more committed tokens a
+// millisecond from them - from this PC's round times by window size and the lookup drafts' acceptance, both measured
+// as it decodes - so a lookup window may run past DSpark's block, up to verify_max().  Only which drafts are verified
+// changes: verify() keeps a draft the drafter did not draw with probability p(d) (q a point at it), so every token is
+// still the model's own draw.  Not beside DS4_DSPARK_SAMPLE=1's drawn drafts (the choice would then hang on a draw).
+// --suffix-draft N: the shortest match it proposes from (3; 0: off)
+struct Lookup {
+    strata::spec::SuffixDrafter sfx;
+    strata::spec::DraftPolicy policy;   // (over the engine's life: the round times are this PC's)
+    std::vector<int32_t> buf;
+    long long windows = 0, offered = 0, accepted = 0;   // the lookup's own rounds and drafts
+    Lookup(int min_match, int max_t, size_t cap) : sfx(min_match, 64, cap), policy(max_t), buf((size_t) max_t) {}
+    void start(const std::vector<int32_t>& ctx) {   // a request's history: what the state has consumed
+        sfx.reset();
+        sfx.append(ctx.data(), ctx.size());
+    }
+};
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
-// confidence holds (at most `room` - 1 of them), verified together; else a plain step.  `out` gets the tokens that follow
-// tok (the accepted drafts, then the trunk's next), the last of them the next round's tok.
+// confidence holds (at most `room` - 1 of them) - or the lookup's (lk, above) - verified together; else a plain step.
+// `out` gets the tokens that follow tok (the accepted drafts, then the trunk's next), the last of them the next round's
+// tok.
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err, float cum_min = -1.0f) {
+           int& accepted, std::string& err, float cum_min = -1.0f, Lookup* lk = nullptr) {
     out.clear();
     offered = accepted = 0;
+    const double t0 = now_ms();
+    int match = 0;
     if (spec && room > 1 && m.draft_block() > 0) {
         std::vector<int> drafts;
         std::vector<float> conf;
@@ -220,6 +246,19 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
                (cum *= conf[(size_t) keep]) >= cum_min)
             ++keep;
+        bool from_lk = false;
+        if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
+            const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
+            match = lk->sfx.last_match();
+            if (k > 0 && lk->buf[0] == drafts[0]) {
+                const strata::spec::DraftPolicy::Pick pk = lk->policy.choose(keep + 1, k, match);
+                if (pk.lookup) {
+                    keep = pk.t - 1;
+                    drafts.assign(lk->buf.begin(), lk->buf.begin() + keep);
+                    from_lk = true;
+                }
+            }
+        }
         if (keep > 0) {
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
@@ -229,11 +268,20 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             out.push_back(next);
             offered = keep;
             accepted = acc;
+            if (lk != nullptr) {
+                lk->policy.observe(from_lk, keep + 1, acc, match, now_ms() - t0);
+                if (from_lk) {
+                    ++lk->windows;
+                    lk->offered += keep;
+                    lk->accepted += acc;
+                }
+            }
             return true;
         }
     }
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
+    if (lk != nullptr) lk->policy.observe(false, 1, 0, match, now_ms() - t0);
     return true;
 }
 
@@ -245,6 +293,7 @@ struct Req {
     int spec = -1;          // spec=0|1: this request drafts or not (-1: as the engine was started)
     float conf = -1.0f;     // dspark_conf=F: the drafts' confidence floor for this request (-1: the engine's)
     float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
+    int lookup = -1;        // suffix_draft=0|1: this request's prompt lookup off / on (-1: as the engine was started)
     // the penalties (penalty_last_n / _repeat / _freq / _present, llama.cpp's): over the last pen_n tokens of the state
     // (-1: the whole context, which the engine caps at its window; 0: none)
     int pen_n = 0;
@@ -367,6 +416,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
         else if (k == "spec_min_p") r.conf = std::strtof(v.c_str(), nullptr);   // (the server's strata_tune names)
+        else if (k == "suffix_draft") r.lookup = std::atoi(v.c_str()) != 0;
         else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
         else if (k == "penalty_freq") r.pen_freq = std::strtof(v.c_str(), nullptr);
@@ -377,7 +427,8 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
 
-int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
+int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
+          Lookup* lk) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("READY %lld stop\n", (long long) m.max_context());
@@ -1040,6 +1091,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
+        if (lk) lk->start(m.tokens());
+        const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
         // VRAM hit, promotions a token) and DeepSeek's own - experts a token on the CPU lane, MB a token the storage
         // read (Linux), the n-gram memory's (Engram) read time a token, the drafts' acceptance
@@ -1124,6 +1177,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::printf("T %d\n", tok);
             ++produced;
+            if (lk) lk->sfx.append(tok);
             if (in_think && tok == r.think_end) in_think = false;   // (closed: by the model, or by the budget)
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
@@ -1145,7 +1199,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
-                           off, acc, err, r.cum)) {
+                           off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
@@ -1181,6 +1235,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                             : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (lk && lk->windows > lk_w0)
+            std::fprintf(stderr, "maya ds4 serve: prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the above)\n",
+                         lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
         prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)
         m.save_profile();
     }
@@ -1240,7 +1297,7 @@ int main(int argc, char** argv) {
 #endif
     strata::ds4::Options o;
     std::string ids_s, dump, eos = "1", ppl;
-    int n = 0, window = 16;
+    int n = 0, window = 16, suffix_draft = 3;
     bool spec = true;
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
@@ -1271,6 +1328,7 @@ int main(int argc, char** argv) {
             spec = v != "off";
             o.dspark = v != "none";   // none: not even loaded
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
+        else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
@@ -1319,7 +1377,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack);
+    std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark: one policy over every request of this run)
+    if (spec && suffix_draft > 0 && m.draft_block() > 0)
+        lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
+    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;
@@ -1472,16 +1533,19 @@ int main(int argc, char** argv) {
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
         std::vector<int> got;
+        if (lk) lk->start(m.tokens());
+        const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         for (;;) {
             out.push_back(tok);
             std::printf("%d,", tok);
             std::fflush(stdout);
+            if (lk) lk->sfx.append(tok);
             if (tok == 1 || (int) out.size() >= n) break;
             if (got.empty()) {
                 int off = 0, acc = 0;
                 const bool try_spec = spec && !cool;
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
-                           cli_seed, counter, got, off, acc, err)) {
+                           cli_seed, counter, got, off, acc, err, -1.0f, lk.get())) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                     return 1;
                 }
@@ -1496,6 +1560,9 @@ int main(int argc, char** argv) {
         }
         std::printf("\n");
         if (df != nullptr && m.logits(lg)) std::fwrite(lg.data(), 4, lg.size(), df);
+        if (lk && lk->windows > lk_w0)
+            std::fprintf(stderr, "prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the dspark line's)\n",
+                         lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
     }
     if (prof && rep == reps - 1) cudaProfilerStop();
     if (spec && rounds > 0) {
