@@ -112,6 +112,19 @@ class Aliases(unittest.TestCase):
         self.assertEqual(Q.shown("glm", "UD-Q2_K_XL"), "GLM-5.3 · UD-Q2_K_XL")   # (a GGUF of the user's: its name)
         self.assertEqual(Q.shown("deepseek"), "DeepSeek V4.1")
 
+    def test_istas_gguf_set_up_by_hand(self):
+        """ISTA-DASLab's GGUF has no setup id (docs/deepseek-ista-gguf.md: packed and configured by hand): the config's
+        installer record names it with ista-iq2xxs, and the dashboard shows it model first, not as the EXL3 quant a
+        DeepSeek config without a key stands for."""
+        cfg = {"exe": "/b/maya-ds4", "args": ["--pack", "/m/ISTA/maya-ds4"],
+               "installer": {"family": "deepseek", "ds4_quant": "ista-iq2xxs"}}
+        self.assertEqual(Q.config_key(cfg), "ista-iq2xxs")
+        self.assertEqual(Q.config_label(cfg), "DeepSeek V4.1 · ISTA GSQ-RCO IQ2_XXS")
+        self.assertEqual(Q.shown("deepseek", "ista-iq2xxs", 249), "DeepSeek V4.1 · ISTA GSQ-RCO IQ2_XXS (249 GB)")
+        self.assertIsNone(Q.tier("deepseek", "ista-iq2xxs"))                  # (not one of Maya's quants)
+        self.assertIsNone(Q.resolve("ista-iq2xxs"))                            # (nor a setup id)
+        self.assertEqual(Q.config_label(dict(cfg, installer={"family": "deepseek"})), "DeepSeek V4.1 · EXL3 2.9 bpw")
+
 
 class ModelOption(unittest.TestCase):
     """--model as typed -> what the setup reads: the old values as before, the new ids to the same."""
