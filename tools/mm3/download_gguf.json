@@ -1,0 +1,32 @@
+{
+ "_": "Project Maya's quants of MiniMaxAI/MiniMax-M3.1-Flash (GGUF, llama.cpp's minimax-m3 layout; tools/mm3/pack_gguf.py packs them for maya-mm3), named as every Maya quant (tools/maya_quants.py): <Model>-Maya-<Tier>-<maintype>-0000N-of-0000M.gguf, one repo for the model, a folder per tier. The sparse-attention indexers of the dense layers 0-2 are in <name>-maya-indexers.bin beside the shards (a GGUF: .gguf up to v1.1.30, when the Hub read that lone .gguf as the model; a file under that name is used as it is): maya-mm3 loads both and runs the model as MiniMax defines it, stock llama.cpp loads the shards alone. \"was\": the names the files had before (in the same order), used as they are where a folder holds them whole. \"revision\" is the commit the files were uploaded at (2026-10-27) and each file has its sha256: the setup checks every file against it. Sizes are the files' as made (2026-10-26).",
+ "name": "MiniMax-M3.1-Flash",
+ "repo": "peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF",
+ "revision": "9d256f59f1abe27216511c82e3a8bbe4bd0930d0",
+ "license": "MiniMax Community License (LICENSE.minimax-m31)",
+ "quants": {
+  "MiniMax-M3.1-Flash-Maya-XS": {
+   "about": "routed experts IQ1_S, the most sensitive IQ2_XXS (~1.6 bits); attention Q5_K / Q6_K, indexers Q8_0, the rest Q5_K, embedding Q4_K, head Q6_K",
+   "memory_gb": 100,
+   "files": {
+    "Maya-XS/MiniMax-M3.1-Flash-Maya-XS-IQ1_S-00001-of-00002.gguf": [47846435136, "a7ce35ed3a9059ea4d53e817e55d5a9516e31c82fb01e291b56e34be56c33e3c"],
+    "Maya-XS/MiniMax-M3.1-Flash-Maya-XS-IQ1_S-00002-of-00002.gguf": [45138103520, "62a7e1db00496c87a93fc75f12748251ebeb300fd90b0534a576dfa4c3daf213"],
+    "Maya-XS/MiniMax-M3.1-Flash-Maya-XS-maya-indexers.bin": [12538080, "b68c04c2970707a1cb4c43d32efb85bbb006df7688ef98417f027593610d3a18"]
+   },
+   "was": ["MiniMax-M3.1-Flash-Maya-XS-00001-of-00002.gguf", "MiniMax-M3.1-Flash-Maya-XS-00002-of-00002.gguf",
+           "MiniMax-M3.1-Flash-Maya-XS-maya-indexers.gguf"]
+  },
+  "MiniMax-M3.1-Flash-Maya-S": {
+   "about": "routed experts IQ2_XXS, the most sensitive IQ2_XS / IQ2_S / IQ3_XXS (~2.1 bits); attention and indexers Q8_0, the rest Q6_K",
+   "memory_gb": 130,
+   "files": {
+    "Maya-S/MiniMax-M3.1-Flash-Maya-S-IQ2_XXS-00001-of-00003.gguf": [47321778560, "bce9fee035af23dfeaebfb47beb7985d5888e594274e35585c4fb00109573be4"],
+    "Maya-S/MiniMax-M3.1-Flash-Maya-S-IQ2_XXS-00002-of-00003.gguf": [47413729344, "bec5a2f99c7932515537c740ccd745cf33b32f3a7580bc64ce3f1eab99b33827"],
+    "Maya-S/MiniMax-M3.1-Flash-Maya-S-IQ2_XXS-00003-of-00003.gguf": [27714297280, "6629e9152fcb3ec3a99b68438994679abbe36b4509e602c32cf74ef5923c8544"],
+    "Maya-S/MiniMax-M3.1-Flash-Maya-S-maya-indexers.bin": [12538080, "7282c4a836fd436b213249c493182bf17d027a0e28fe43617c22fd6ee0dd6b86"]
+   },
+   "was": ["MiniMax-M3.1-Flash-Maya-S-00001-of-00003.gguf", "MiniMax-M3.1-Flash-Maya-S-00002-of-00003.gguf",
+           "MiniMax-M3.1-Flash-Maya-S-00003-of-00003.gguf", "MiniMax-M3.1-Flash-Maya-S-maya-indexers.gguf"]
+  }
+ }
+}

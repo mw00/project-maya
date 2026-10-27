@@ -27,7 +27,8 @@ __device__ __forceinline__ int dp4a(int a, int b, int c) {
     // RDNA2 has no sudot4 (that is gfx11+), but it has the plain signed v_dot4_i32_i8 (dot1-insts): the same
     // signed x signed byte products accumulated modulo 2^32, no clamp. CDNA1 gfx908 (MI100) has the same builtin.
     return __builtin_amdgcn_sdot4(a, b, c, false);
-#elif (defined(__gfx908__) || defined(__gfx942__)) && __has_builtin(__builtin_amdgcn_sdot4)
+#elif (defined(__gfx908__) || defined(__gfx906__) || defined(__gfx942__)) && __has_builtin(__builtin_amdgcn_sdot4)
+    // (gfx906, Vega 20: the same v_dot4_i32_i8, dot1-insts)
     // CDNA1 (MI100) and CDNA3 (MI300X / MI325X): v_dot4_i32_i8, the same signed dot4 the wave64 compat layer relies on.
     return __builtin_amdgcn_sdot4(a, b, c, false);
 #elif defined(__gfx1012__) && !defined(STRATA_GFX1012_PORTABLE_DOT)

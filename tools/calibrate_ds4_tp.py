@@ -15,6 +15,8 @@ conversation's cache, so the answer is what they wait for - and a setting whose 
 PROMPT_FLOOR of the config's own is not taken.  A setting is kept only when it beats the config's own by more than
 MIN_GAIN; one that wins by less than CONFIRM_BELOW is started once more beside the config's own, and the two starts'
 rates decide together (two starts of one setting differ by a few percent: the expert placement and the OS).
+Effective groups come from each GPU's VRAM tp_n field, not --tp: fallback duplicates close before inference and are
+not ranked as different settings. Incomplete grouping telemetry preserves the config's TP rather than guessing.
 
     python tools/calibrate_ds4_tp.py maya-ds4.json     # measure and print; ./maya.sh --calibrate also saves it
 """
@@ -164,14 +166,38 @@ def profile_copy(args: list, tmp: Path):
     return fresh
 
 
-def start_measure(cfg: dict, args: list, short, long_ids, start_engine, fresh=None) -> dict:
-    """One engine start with `args`: {"decode": [tok/s a group], "prompt": tok/s, "info": the engine's INFO}."""
+def tp_group_widths(eng: object, cfg: dict) -> list[int] | None:
+    """Effective tensor parallel width per GPU from the engine's VRAM protocol; None if incomplete."""
+    rows = getattr(eng, "vram", None) or []
+    n = len(cfg.get("gpu") or rows)
+    if not rows or len(rows) != n:
+        return None
+    by_dev = {row.get("dev"): row.get("tp_n") for row in rows}
+    if set(by_dev) != set(range(n)):
+        return None
+    widths = [by_dev[dev] for dev in range(n)]
+    return widths if all(isinstance(w, int) and 1 <= w <= n for w in widths) else None
+
+
+def start_measure(
+    cfg: dict, args: list, short, long_ids, start_engine, fresh=None,
+    seen_groups: dict[tuple[int, ...] | None, int] | None = None,
+) -> dict:
+    """One engine start; duplicate or unknown TP groups close before inference when comparing candidates."""
     eng = start_engine({**cfg, "args": fresh(args) if fresh else args})
     try:
+        groups = tp_group_widths(eng, cfg)
+        result = {"info": dict(getattr(eng, "info", {}) or {}), "tp_groups": groups}
+        if seen_groups is not None:
+            if groups is None or None in seen_groups:
+                return {**result, "skipped": "effective TP grouping unknown: not compared"}
+            previous = seen_groups.get(tuple(groups))
+            if previous is not None:
+                return {**result, "skipped": f"same effective grouping as --tp {previous}: not compared"}
         s = CAL.Session(eng, short)
         s.warm_up()
         decode = [s.rate() for _ in range(GROUPS)]
-        return {"decode": decode, "prompt": read_rate(eng, long_ids), "info": dict(getattr(eng, "info", {}) or {})}
+        return {**result, "decode": decode, "prompt": read_rate(eng, long_ids)}
     finally:
         CAL.close(eng)
 
@@ -208,11 +234,11 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
     with_ = lambda tp, w: apply(args0, {"--tp": tp, "--cpu-threads": w})   # noqa: E731
     failed: dict[str, str] = {}
 
-    def attempt(what: str, args: list) -> dict | None:
+    def attempt(what: str, args: list, seen_groups=None) -> dict | None:
         """start_measure, or None when the engine does not start or stops with `args` (a --tp the model's heads do not
         split in, too little memory for it, ...): that setting is left out, the others still measured."""
         try:
-            return start_measure(cfg, args, short, long_ids, start_engine, fresh)
+            return start_measure(cfg, args, short, long_ids, start_engine, fresh, seen_groups)
         except Exception as e:
             failed[what] = str(e)
             say(f"    {what}: the engine did not run ({e}): left out")
@@ -220,12 +246,24 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
     say(f"  {len(tps)} tensor parallel setting(s) to try ({', '.join(f'--tp {t}' for t in tps)}), each a start of "
         "the model of its own ...")
     by_tp: dict[int, dict] = {}
+    seen_groups: dict[tuple[int, ...] | None, int] = {}
+    tp_groups: dict[str, list[int] | None] = {}
+    tp_skipped: dict[str, str] = {}
     for tp in tps:
         say(f"    --tp {tp}: loading the model ...")
         if tp == own_tp:                              # (the baseline: the config's own must run)
             r = start_measure(cfg, with_(tp, own_threads), short, long_ids, start_engine, fresh)
-        elif (r := attempt(f"--tp {tp}", with_(tp, own_threads))) is None:
+        elif (r := attempt(f"--tp {tp}", with_(tp, own_threads), seen_groups)) is None:
             continue
+        groups = r["tp_groups"]
+        tp_groups[str(tp)] = groups
+        widths = "/".join(map(str, groups)) if groups is not None else "unknown"
+        say(f"    --tp {tp} requested, effective TP per GPU: {widths}")
+        if r.get("skipped"):
+            tp_skipped[str(tp)] = r["skipped"]
+            say(f"    --tp {tp}: {r['skipped']}")
+            continue
+        seen_groups[tuple(groups) if groups is not None else None] = tp
         by_tp[tp] = r
         say(f"    --tp {tp}: {med(r):.1f} tok/s answering, {r['prompt']:.0f} tok/s reading a "
             f"{len(long_ids)}-token prompt")
@@ -249,7 +287,8 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
     chosen_tp = best if med(by_tp[best]) > med(by_tp[own_tp]) * (1 + MIN_GAIN) else own_tp
     # the CPU threads, at that --tp: fewer than the engine's own, while they help
     info = by_tp[chosen_tp].get("info") or {}
-    d_threads = int(own_threads or info.get("cpu_threads") or 0)
+    # --cpu-threads is a ceiling; the engine may have fewer cores or choose a smaller lane.
+    d_threads = int(info.get("cpu_threads") or own_threads or 0)
     chosen_w, by_w = own_threads, {}
     # (the thread test runs whenever the lane has threads: a reported 0 CPU-lane experts skipped it on a PC whose lane
     #  took ~60% of every token's experts, #433 - a lane that holds none simply gains nothing and stops at the first)
@@ -271,11 +310,12 @@ def measure(cfg: dict, vram: list[float], short, long_ids, start_engine, say=pri
         say(f"    the CPU threads are not tested: the engine reports none ({info.get('cpu_threads')!r}) and the config "
             "sets none")
     chosen = {"--tp": chosen_tp, "--cpu-threads": None if chosen_w is None else int(chosen_w)}
-    final = by_w.get(chosen_w) if chosen_w in by_w else by_tp[chosen_tp]
+    final = by_w.get(chosen_w) or by_tp[chosen_tp]
     report = {"own": {"--tp": own_tp, "--cpu-threads": d_threads or None},
               "tp_sweep": {str(t): {"decode": [round(x, 1) for x in r["decode"]], "prompt": round(r["prompt"])}
                            for t, r in by_tp.items()},
               "thread_sweep": {str(w): [round(x, 1) for x in r["decode"]] for w, r in by_w.items()},
+              "tp_groups": tp_groups, "tp_skipped": tp_skipped, "effective_tp": final["tp_groups"],
               "confirm": {str(t): [round(x, 1) for x in v] for t, v in confirm.items()}, "failed": failed,
               "tok_s": round(med(final), 1), "own_tok_s": round(med(by_tp[own_tp]), 1),
               "prompt_tok_s": round(final.get("prompt") or by_tp[chosen_tp]["prompt"]),

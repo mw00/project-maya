@@ -21,7 +21,7 @@ namespace strata::spec {
 
 class DraftPolicy {
 public:
-    static constexpr int kMaxT = 8;
+    static constexpr int kMaxT = 16;   // (maya-ds4's verify windows; the GLM paths pass 8 at most)
     static constexpr int kBuckets = 4;
 
     explicit DraftPolicy(int max_t, double margin = 0.03);

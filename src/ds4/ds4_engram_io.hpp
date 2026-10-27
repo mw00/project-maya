@@ -7,6 +7,9 @@
 // first.  A bounded row cache (clock eviction) keeps rows already fetched: a row that recurs (the same n-gram again,
 // in the prompt or later) is a copy, not a read.  The rows are the file's bytes either way, so the output is the same.
 #pragma once
+#if !defined(_WIN32)
+#include <fcntl.h>
+#endif
 
 #include "ds4_os.hpp"
 
@@ -47,6 +50,7 @@ public:
     }
     size_t capacity() const { return cap_; }
     size_t size() const { return keys_.size(); }
+    size_t row_bytes() const { return bytes_; }
     /// The row's payload, or nullptr (a hit marks it recently used).
     const uint8_t* find(uint64_t key) {
         const auto it = map_.find(key);
@@ -111,12 +115,14 @@ struct EgRead {
 struct EgBatch {
     std::vector<EgRead> reads;
     std::vector<std::pair<int, std::pair<uint8_t*, uint8_t*>>> dups;   // read i -> another (codes, scales)
-    std::vector<uint8_t> ok;                                            // per read: 1 read whole
+    std::vector<uint8_t> ok;                                            // 0 pending/failed, 1 read, 2 sorted duplicate
     std::atomic<int> left{0};                                           // reads not yet done
     std::atomic<int> post{0};                                           // 0 pending, 1 finishing, 2 finished
     int64_t t0 = 0;                                                     // submitted (now_ns())
     std::atomic<int64_t> t1{0};                                         // the last read done
     bool live = false;                                                  // submitted and not yet finished
+    int64_t lookups = 0;                                                // logical lookups before sorted dedup
+    int io_reads = 0;                                                   // canonical read attempts submitted (after dedup)
     void clear() {
         reads.clear();
         dups.clear();
@@ -124,6 +130,8 @@ struct EgBatch {
         left.store(0);
         post.store(0);
         live = false;
+        lookups = 0;
+        io_reads = 0;
     }
 };
 
@@ -194,7 +202,9 @@ public:
                          (long long) check_n_.load(), (long long) check_bad_.load());
     }
     int threads() const { return (int) th_.size(); }
+    bool ram_only() const { return ram_only_; }
     void submit(EgBatch& b) {
+        b.io_reads = (int) b.reads.size();
         b.ok.assign(b.reads.size(), 0);
         b.post.store(0);
         b.t0 = now_ns();
@@ -210,6 +220,172 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             for (int i = 0; i < n; i += step, ++jobs) q_.push_back({&b, i, std::min(n, i + step)});
         }
+        if (jobs >= (int) th_.size()) cv_.notify_all();
+        else
+            for (int i = 0; i < jobs; ++i) cv_.notify_one();
+    }
+    void submit_zones(EgBatch& b, size_t zone) {
+        constexpr uint64_t align = 512, max_zone = 64ull << 20;
+        zone = std::min<size_t>(zone, (size_t) max_zone);
+        if (ram_only_ || zone == 0 || b.reads.size() < 4096) {
+            submit(b);
+            return;
+        }
+        for (const EgRead& r : b.reads) {
+            if (r.mx8 || r.n2 != 0 || r.off > UINT64_MAX - r.n || r.off + r.n > UINT64_MAX - (align - 1)) {
+                submit(b);
+                return;
+            }
+        }
+        b.ok.assign(b.reads.size(), 0);
+        b.post.store(0);
+        b.t0 = now_ns();
+        b.t1.store(b.t0);
+        b.live = true;
+        b.left.store((int) b.reads.size(), std::memory_order_release);
+        const int64_t plan0 = now_ns();
+        const size_t n = b.reads.size();
+        std::vector<int> ids(n);
+        for (size_t i = 0; i < n; ++i) ids[i] = (int) i;
+        static const bool force_std = [] {
+            const char* s = std::getenv("DS4_EG_SORT_MODE");
+            return s && std::strcmp(s, "std") == 0;
+        }();
+        static const bool force64 = [] {
+            const char* s = std::getenv("DS4_EG_SORT_MODE");
+            return s && std::strcmp(s, "radix64") == 0;
+        }();
+        static const bool profile = std::getenv("DS4_EG_PROFILE") != nullptr;
+        static const bool dedup = [] {
+            const char* s = std::getenv("DS4_EG_DEDUP");
+            return !s || std::strcmp(s, "0") != 0;
+        }();
+        const char* sorted_by = "std";
+        bool one_file = true;
+        for (const EgRead& r : b.reads) one_file = one_file && r.file == b.reads.front().file;
+        auto radix = [](auto& a, auto& tmp, int passes, auto key) {
+            std::vector<uint32_t> count(65536);
+            for (int pass = 0; pass < passes; ++pass) {
+                std::fill(count.begin(), count.end(), 0);
+                const int shift = pass * 16;
+                for (const auto& x : a) ++count[(key(x) >> shift) & 65535];
+                uint32_t sum = 0;
+                for (uint32_t& c : count) {
+                    const uint32_t v = c;
+                    c = sum;
+                    sum += v;
+                }
+                for (const auto& x : a) tmp[count[(key(x) >> shift) & 65535]++] = x;
+                a.swap(tmp);
+            }
+        };
+        if (one_file && !force_std) {
+            const EgRead& first = b.reads.front();
+            const uint64_t id0 = first.key >> 3, row_bytes = first.n;
+            bool id32 = !force64 && row_bytes != 0 && id0 <= UINT32_MAX && first.off >= id0 * row_bytes;
+            const uint64_t origin = id32 ? first.off - id0 * row_bytes : 0;
+            if (id32) {
+                for (const EgRead& r : b.reads) {
+                    const uint64_t id = r.key >> 3;
+                    if (id > UINT32_MAX || r.n != row_bytes || id > (UINT64_MAX - origin) / row_bytes ||
+                        r.off != origin + id * row_bytes) {
+                        id32 = false;
+                        break;
+                    }
+                }
+            }
+            if (id32) {
+                struct Item { uint32_t key, id; };
+                std::vector<Item> a(n), tmp(n);
+                for (size_t i = 0; i < n; ++i) a[i] = {(uint32_t) (b.reads[i].key >> 3), (uint32_t) i};
+                radix(a, tmp, 2, [](const Item& x) { return x.key; });
+                for (size_t i = 0; i < n; ++i) ids[i] = (int) a[i].id;
+                sorted_by = "radix32";
+            } else {
+                struct Item { uint64_t key; uint32_t id, pad; };
+                std::vector<Item> a(n), tmp(n);
+                for (size_t i = 0; i < n; ++i) a[i] = {b.reads[i].off, (uint32_t) i, 0};
+                int passes = 3;   // the model files are below 2^48 bytes; use the fourth pass if that ever changes
+                for (const EgRead& r : b.reads)
+                    if ((r.off >> 48) != 0) {
+                        passes = 4;
+                        break;
+                    }
+                radix(a, tmp, passes, [](const Item& x) { return x.key; });
+                for (size_t i = 0; i < n; ++i) ids[i] = (int) a[i].id;
+                sorted_by = "radix64";
+            }
+        } else {
+            std::sort(ids.begin(), ids.end(), [&](int a, int c) {
+                const EgRead& x = b.reads[(size_t) a];
+                const EgRead& y = b.reads[(size_t) c];
+                return x.file != y.file ? x.file < y.file : x.off < y.off;
+            });
+        }
+        const int64_t plan1 = now_ns();
+        if (dedup) {
+            // Equal rows are adjacent after the offset/row-id sort. Keep the first original read as the canonical
+            // destination, turn later destinations into the ordinary post-read copies, and submit only canonical rows.
+            // State 2 keeps duplicates out of the cache-insertion loop; their destinations are filled from the canonical.
+            std::vector<int> unique;
+            unique.reserve(ids.size());
+            for (int ri : ids) {
+                const EgRead& r = b.reads[(size_t) ri];
+                if (!unique.empty()) {
+                    const int first = unique.back();
+                    const EgRead& canonical = b.reads[(size_t) first];
+                    if (canonical.key == r.key && canonical.file == r.file && canonical.off == r.off &&
+                        canonical.n == r.n) {
+                        b.dups.push_back({first, {r.dst, r.scales}});
+                        b.ok[(size_t) ri] = 2;
+                        continue;
+                    }
+                }
+                unique.push_back(ri);
+            }
+            ids.swap(unique);
+        }
+        b.io_reads = (int) ids.size();
+        b.left.store((int) ids.size(), std::memory_order_release);
+        const int64_t plan2 = now_ns();
+        int jobs = 0;
+        uint64_t planned_bytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (size_t i = 0; i < ids.size();) {
+                const EgRead& first = b.reads[(size_t) ids[i]];
+                const uint64_t base = first.off - first.off % align;
+                uint64_t end = (first.off + first.n + align - 1) / align * align;
+                uint64_t payload_end = first.off + first.n;
+                size_t j = i + 1;
+                while (j < ids.size()) {
+                    const EgRead& next = b.reads[(size_t) ids[j]];
+                    if (next.file != first.file) break;
+                    const uint64_t next_end = (next.off + next.n + align - 1) / align * align;
+                    if (std::max(end, next_end) - base > zone) break;
+                    end = std::max(end, next_end);
+                    payload_end = std::max(payload_end, next.off + next.n);
+                    ++j;
+                }
+                Job job;
+                job.b = &b;
+                job.zone = true;
+                job.off = base;
+                job.n = (uint32_t) (end - base);
+                job.need = (uint32_t) (payload_end - base);
+                job.rows.assign(ids.begin() + i, ids.begin() + j);
+                planned_bytes += job.n;
+                q_.push_back(std::move(job));
+                ++jobs;
+                i = j;
+            }
+        }
+        if (profile)
+            std::fprintf(stderr,
+                         "ds4: Engram plan: %zu lookups, %zu rows, %s %.1f ms, dedup %.1f ms, zones %.1f ms: "
+                         "%d reads, %.3f GB\n",
+                         n, ids.size(), sorted_by, (plan1 - plan0) / 1e6, (plan2 - plan1) / 1e6,
+                         (now_ns() - plan2) / 1e6, jobs, planned_bytes / 1e9);
         if (jobs >= (int) th_.size()) cv_.notify_all();
         else
             for (int i = 0; i < jobs; ++i) cv_.notify_one();
@@ -246,11 +422,18 @@ private:
                 q_.pop_front();
             }
             EgBatch& b = *job.b;
-            for (int i = job.i0; i < job.i1; ++i) b.ok[(size_t) i] = read(fds, ufds, al, b.reads[(size_t) i], buf) ? 1 : 0;
+            int done = 0;
+            if (job.zone) {
+                read_zone(fds, ufds, buf, b, job);
+                done = (int) job.rows.size();
+            } else {
+                for (int i = job.i0; i < job.i1; ++i) b.ok[(size_t) i] = read(fds, ufds, al, b.reads[(size_t) i], buf) ? 1 : 0;
+                done = job.i1 - job.i0;
+            }
             const int64_t t = now_ns();
             for (int64_t prev = b.t1.load(); t > prev && !b.t1.compare_exchange_weak(prev, t);) {
             }
-            if (b.left.fetch_sub(job.i1 - job.i0, std::memory_order_acq_rel) == job.i1 - job.i0) {   // (b is the waiter's again)
+            if (b.left.fetch_sub(done, std::memory_order_acq_rel) == done) {   // (b is the waiter's again)
                 std::lock_guard<std::mutex> lk(done_mu_);
                 done_cv_.notify_all();
             }
@@ -297,7 +480,21 @@ private:
         }
         auto fd = [&](int file) {
             if (file < 0 || file >= (int) fds.size()) return os::kBadFd;
-            if (fds[(size_t) file] == os::kBadFd) fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
+            if (fds[(size_t) file] == os::kBadFd) {
+                fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
+#if !defined(_WIN32)
+                // MAYA_DS4_EG_RANDOM=1 (opt-in; read as STRATA_DS4_EG_RANDOM, DS4_EG_RANDOM too): no readahead on this
+                // reader's descriptors.  A row is ~1-2 KB at a hashed offset, so a buffered read's readahead window is
+                // mostly waste that can push the CPU lane's experts out of the page cache (a 2x MI50 box with 62 GiB,
+                // #505); on a V100 with 61 GB it made 2K-8K prompts 3-4% slower, so it stays off unless asked for
+                static const bool eg_random = [] {
+                    const char* v = std::getenv("STRATA_DS4_EG_RANDOM");
+                    if (v == nullptr) v = std::getenv("DS4_EG_RANDOM");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                if (eg_random && fds[(size_t) file] != os::kBadFd) (void) posix_fadvise(fds[(size_t) file], 0, 0, POSIX_FADV_RANDOM);
+#endif
+            }
             return fds[(size_t) file];
         };
         const os::fd_t f = fd(r.file);
@@ -328,7 +525,49 @@ public:
     struct Job {
         EgBatch* b = nullptr;
         int i0 = 0, i1 = 0;   // reads [i0, i1)
+        bool zone = false;
+        uint64_t off = 0;
+        uint32_t n = 0;       // aligned read span
+        uint32_t need = 0;    // actual payload extent (may be shorter at the file's tail)
+        std::vector<int> rows;
     };
+    void read_zone(std::vector<os::fd_t>& fds, std::vector<os::fd_t>& ufds, std::vector<uint8_t>& buf,
+                   EgBatch& b, const Job& job) {
+        const int file = b.reads[(size_t) job.rows[0]].file;
+        const bool direct = file >= 0 && (size_t) file < direct_.size() && direct_[(size_t) file];
+        bool ok = false;
+        if (direct) {
+            os::fd_t& u = ufds[(size_t) file];
+            if (u == os::kBadFd) u = os::open_unbuffered(paths_[(size_t) file]);
+            if (u != os::kBadFd) {
+                buf.resize((size_t) job.n + os::kDirectAlign);
+                uint8_t* dst = buf.data() + (os::kDirectAlign - (uintptr_t) buf.data() % os::kDirectAlign) % os::kDirectAlign;
+                ok = os::pread_unbuffered_aligned(u, dst, job.need, job.off, 512);
+                if (ok) {
+                    for (int i : job.rows) {
+                        const EgRead& r = b.reads[(size_t) i];
+                        std::memcpy(r.dst, dst + (r.off - job.off), r.n);
+                        b.ok[(size_t) i] = 1;
+                    }
+                }
+            }
+        }
+        if (!ok) {
+            os::fd_t& f = fds[(size_t) file];
+            if (f == os::kBadFd) f = os::open_ro(paths_[(size_t) file]);
+            if (f != os::kBadFd) {
+                buf.resize(job.need);
+                ok = os::pread_full(f, buf.data(), job.need, job.off);
+                if (ok) {
+                    for (int i : job.rows) {
+                        const EgRead& r = b.reads[(size_t) i];
+                        std::memcpy(r.dst, buf.data() + (r.off - job.off), r.n);
+                        b.ok[(size_t) i] = 1;
+                    }
+                }
+            }
+        }
+    }
     std::deque<Job> q_;
     bool quit_ = false;
     std::mutex done_mu_;

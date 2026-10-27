@@ -1,4 +1,4 @@
-"""Pascal (compute capability 6.x) in Maya's setup: accepted as experimental, built with CUDA 12 through "native" like
+"""Pascal (compute capability 6.x) in Maya's setup: accepted as experimental, built with CUDA 12 for its own arch like
 Volta, and anything older still refused (#212, #214).  No GPU needed."""
 from pathlib import Path
 import sys
@@ -35,14 +35,14 @@ class PascalSetupTests(unittest.TestCase):
         self.assertEqual(maya.choose_gpus(self.a, [m40, p40]), [p40])
 
     def test_pascal_builds_like_volta(self):
-        self.assertEqual(maya.arch_setting([61]), "native")
+        self.assertEqual(maya.arch_setting([61]), "61")
         self.assertEqual(maya.nvcc_range([61]), ((12, 0), (13, 0)))
         self.assertEqual(maya.pick_nvcc([("/cuda13/nvcc", (13, 0)), ("/cuda12/nvcc", (12, 8))], [61]),
                          ("/cuda12/nvcc", (12, 8)))
         self.assertIn("Pascal", maya.toolkit_hint([61]))
 
     def test_volta_and_newer_unchanged(self):
-        self.assertEqual(maya.arch_setting([70]), "native")
+        self.assertEqual(maya.arch_setting([70]), "70")   # (by name: never "native", which takes every card)
         self.assertEqual(maya.arch_setting([86, 89]), "86;89")
         self.assertEqual(maya.nvcc_range([86]), ((12, 0), None))
         self.assertLess(maya.MIN_CC, maya.VALIDATED_CC)

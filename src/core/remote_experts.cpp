@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -108,7 +109,34 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     plan_.plan_ptr = (unsigned long long*) take(8 * sizeof(unsigned long long));
     plan_.plan_w = (float*) take(8 * sizeof(float));
     plan_.cpu_flag = (int*) take(64);
-    return check(cudaMemset(plan_.cpu_flag, 0, 64), "helper flags", err, device);
+    if (!check(cudaMemset(plan_.cpu_flag, 0, 64), "helper flags", err, device)) return false;
+    // zero-copy on an integrated helper (the Qwen helper's STRATA_REMOTE_ZEROCOPY pattern): its device reads the host's
+    // memory as its own, so the input, the plan and the result stay in one mapped pinned block
+    const char* zc = std::getenv("STRATA_GLM_HELPER_ZEROCOPY");
+    if (integrated_ && !(zc != nullptr && zc[0] == '0')) {
+        const size_t xb = (size_t) n_embd * sizeof(float);
+        void* block = nullptr;
+        if (!check(cudaHostAlloc(&block, 2 * xb + 8 * sizeof(unsigned long long) + 8 * sizeof(float),
+                                 cudaHostAllocPortable | cudaHostAllocMapped), "helper zero-copy block", err, device))
+            return false;
+        zc_host_ = (uint8_t*) block;
+        x_h_ = (float*) zc_host_;
+        out_h_ = (float*) (zc_host_ + xb);
+        plan_ptr_h_ = (unsigned long long*) (zc_host_ + 2 * xb);
+        plan_w_h_ = (float*) (zc_host_ + 2 * xb + 8 * sizeof(unsigned long long));
+        uint8_t* z = nullptr;
+        if (!check(cudaHostGetDevicePointer((void**) &z, block, 0), "helper zero-copy mapping", err, device)) return false;
+        x_z_ = (float*) z;
+        out_z_ = (float*) (z + xb);
+        zplan_ = plan_;
+        zplan_.plan_ptr = (unsigned long long*) (z + 2 * xb);
+        zplan_.plan_w = (float*) (z + 2 * xb + 8 * sizeof(unsigned long long));
+        zero_copy_ = true;
+    }
+    prof_ = std::getenv("STRATA_GLM_PROF") != nullptr;
+    for (auto& e : ev_)
+        if (prof_ && !check(cudaEventCreate(&e), "helper profile event", err, device)) return false;
+    return true;
 }
 
 bool GlmExpertHelper::reserve(int keys, size_t requested_bytes, std::string& err) {
@@ -227,31 +255,83 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
         }
         ptr[i] = (unsigned long long) slots_[(size_t) keys[i]].device;
     }
+    size_t bytes = 0;
+    for (int i = 0; i < ne; ++i) bytes += slots_[(size_t) keys[i]].bytes;
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
-    if (!check(cudaMemcpyAsync(x_, x, (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice, stream_),
-               "helper input", err, device_) ||
-        !check(cudaMemcpyAsync(plan_.plan_ptr, ptr, (size_t) ne * sizeof(ptr[0]), cudaMemcpyHostToDevice, stream_),
-               "helper pointers", err, device_) ||
-        !check(cudaMemcpyAsync(plan_.plan_w, weights, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
-               "helper weights", err, device_)) return false;
-    gf::quantize_q8_1(x_, xq_, n_embd_, stream_);
-    gf::moe_gate_up(gu_type, plan_, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
-    gf::moe_down(d_type, plan_, ne, n_embd_, n_ff_, down_off, hq_, nullptr, out_, stream_);
-    return check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
-                 "helper result", err, device_) &&
-           check(cudaStreamSynchronize(stream_), "helper finish", err, device_);
+    const auto t0 = std::chrono::steady_clock::now();
+    if (prof_ && !check(cudaEventRecord(ev_[0], stream_), "helper profile event", err, device_)) return false;
+    if (zero_copy_) {
+        std::memcpy(x_h_, x, (size_t) n_embd_ * sizeof(float));
+        std::memcpy(plan_ptr_h_, ptr, (size_t) ne * sizeof(ptr[0]));
+        std::memcpy(plan_w_h_, weights, (size_t) ne * sizeof(float));
+    } else if (!check(cudaMemcpyAsync(x_, x, (size_t) n_embd_ * sizeof(float), cudaMemcpyHostToDevice, stream_),
+                      "helper input", err, device_) ||
+               !check(cudaMemcpyAsync(plan_.plan_ptr, ptr, (size_t) ne * sizeof(ptr[0]), cudaMemcpyHostToDevice, stream_),
+                      "helper pointers", err, device_) ||
+               !check(cudaMemcpyAsync(plan_.plan_w, weights, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, stream_),
+                      "helper weights", err, device_)) return false;
+    const gf::MoeDev& plan = zero_copy_ ? zplan_ : plan_;
+    if (prof_ && !check(cudaEventRecord(ev_[1], stream_), "helper profile event", err, device_)) return false;
+    gf::quantize_q8_1(zero_copy_ ? x_z_ : x_, xq_, n_embd_, stream_);
+    if (prof_ && !check(cudaEventRecord(ev_[2], stream_), "helper profile event", err, device_)) return false;
+    gf::moe_gate_up(gu_type, plan, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
+    if (prof_ && !check(cudaEventRecord(ev_[3], stream_), "helper profile event", err, device_)) return false;
+    gf::moe_down(d_type, plan, ne, n_embd_, n_ff_, down_off, hq_, nullptr, zero_copy_ ? out_z_ : out_, stream_);
+    if (prof_ && !check(cudaEventRecord(ev_[4], stream_), "helper profile event", err, device_)) return false;
+    if (!zero_copy_ && !check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
+                              "helper result", err, device_)) return false;
+    if (prof_ && !check(cudaEventRecord(ev_[5], stream_), "helper profile event", err, device_)) return false;
+    const auto t1 = std::chrono::steady_clock::now();
+    if (!check(cudaStreamSynchronize(stream_), "helper finish", err, device_)) return false;
+    const auto t2 = std::chrono::steady_clock::now();
+    if (zero_copy_) std::memcpy(out, out_h_, (size_t) n_embd_ * sizeof(float));   // (the result's copy, on the host)
+    const auto t3 = std::chrono::steady_clock::now();
+    if (prof_) {
+        float ms[5] = {};
+        for (int k = 0; k < 5; ++k)
+            if (!check(cudaEventElapsedTime(&ms[k], ev_[k], ev_[k + 1]), "helper profile timing", err, device_)) return false;
+        for (int k = 0; k < 5; ++k) stage_ms_[k] += ms[k];
+        enqueue_ms_ += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        wait_ms_ += std::chrono::duration<double, std::milli>(t2 - t1).count();
+        out_ms_ += std::chrono::duration<double, std::milli>(t3 - t2).count();
+        ++calls_;
+        experts_ += (unsigned long long) ne;
+        bytes_ += (unsigned long long) bytes;
+    }
+    return true;
 }
 
 void GlmExpertHelper::close() {
     if (device_ < 0) return;
+    if (prof_ && calls_ > 0) {
+        const double n = (double) calls_, kernels_ms = stage_ms_[2] + stage_ms_[3];
+        std::fprintf(stderr, "glm helper prof CUDA%d: %llu calls, %.2f experts a call, zero-copy %s: host %.3f ms a call "
+                             "(enqueue %.3f, wait %.3f, result copy %.3f); GPU copy-in %.3f, quantize %.3f, gate_up %.3f, down "
+                             "%.3f, copy-out %.3f ms a call; the experts' bytes over gate_up + down at %.1f GB/s\n",
+                     device_, calls_, (double) experts_ / n, zero_copy_ ? "on" : "off", (enqueue_ms_ + wait_ms_ + out_ms_) / n,
+                     enqueue_ms_ / n, wait_ms_ / n, out_ms_ / n, stage_ms_[0] / n, stage_ms_[1] / n, stage_ms_[2] / n,
+                     stage_ms_[3] / n, stage_ms_[4] / n, kernels_ms > 0.0 ? (double) bytes_ / (kernels_ms * 1e6) : 0.0);
+    }
     DeviceScope scope(device_);
     if (scope.ok) {
         if (stream_) cudaStreamSynchronize(stream_);
         if (arena_) cudaFree(arena_);
         if (pool_) cudaFree(pool_);
         if (stream_) cudaStreamDestroy(stream_);
+        for (auto& e : ev_)
+            if (e) cudaEventDestroy(e);
+        if (zc_host_) cudaFreeHost(zc_host_);
     }
+    zero_copy_ = prof_ = false;
+    zc_host_ = nullptr;
+    x_h_ = out_h_ = x_z_ = out_z_ = plan_w_h_ = nullptr;
+    plan_ptr_h_ = nullptr;
+    zplan_ = {};
+    for (auto& e : ev_) e = nullptr;
+    calls_ = experts_ = bytes_ = 0;
+    enqueue_ms_ = wait_ms_ = out_ms_ = 0;
+    for (auto& v : stage_ms_) v = 0;
     device_ = -1;
     arena_ = nullptr;
     pool_ = nullptr;

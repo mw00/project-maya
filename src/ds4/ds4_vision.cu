@@ -190,20 +190,6 @@ bool gemm(cublasHandle_t h, const uint16_t* W, int ldw, const uint16_t* x, int l
 
 }  // namespace
 
-template <class T>
-bool VisionTower::dalloc(T*& p, size_t n, std::string& err) {
-    void* v = nullptr;
-    const size_t b = (n * sizeof(T) + 255) / 256 * 256;
-    if (cudaMalloc(&v, b) != cudaSuccess) {
-        err = "vision: cudaMalloc " + std::to_string(b >> 20) + " MiB on CUDA" + std::to_string(at_) + " failed";
-        return false;
-    }
-    dallocs_.push_back(v);
-    dev_bytes_ += b;
-    p = (T*) v;
-    return true;
-}
-
 VisionTower::~VisionTower() { release(); }
 
 void VisionTower::release() {
@@ -219,14 +205,14 @@ void VisionTower::release() {
     if (blas_) cublasDestroy((cublasHandle_t) blas_);
     if (st_) cudaStreamDestroy((cudaStream_t) st_);
     if (cs_) cudaStreamDestroy((cudaStream_t) cs_);
-    for (void* p : dallocs_) cudaFree(p);
     if (host_) cudaFreeHost(host_);
+    if (pre_host_) cudaFreeHost(pre_host_);
     cudaSetDevice(cur);
     blas_ = st_ = cs_ = nullptr;
-    dallocs_.clear();
     host_ = nullptr;
+    pre_host_ = nullptr;
     dev_ = at_ = -1;
-    dev_bytes_ = 0;
+    room_ = cur_ = host_b_ = 0;
 }
 
 bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::string& err) {
@@ -249,7 +235,7 @@ bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::
     }
     cudaSetDevice(device);
     at_ = device;
-    dev_bytes_ = 0;
+    room_ = cur_ = 0;
     // the checkpoint's tensors, checked before anything is read
     struct Want {
         std::string name;
@@ -309,41 +295,62 @@ bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::
         err = "vision: the aligner: read failed";
         return false;
     }
-    // the small ones on the device
-    auto up = [&](const std::string& name, size_t n, uint16_t*& d) -> bool {
-        std::vector<uint16_t> h(n);
+    // the room an encode is handed, laid out once: the small weights first (copied in by every encode from their
+    // pinned image here), then the work buffers - the order and sizes of the tower's own allocations before v1.1.31,
+    // each 256-byte aligned, so every buffer and GEMM is as it was
+    size_t off = 0;
+    auto put = [&](size_t bytes) {
+        const size_t o = off;
+        off += (bytes + 255) / 256 * 256;
+        return o;
+    };
+    lay_ = Lay{};
+    lay_.pe_w = put((size_t) D * 3 * P * P * 2);
+    lay_.pe_b = put((size_t) D * 2);
+    lay_.norm = put((size_t) D * 2);
+    lay_.al1_b = put((size_t) g.out * 2);
+    lay_.al2_b = put((size_t) g.out * 2);
+    for (int l = 0; l < g.layers; ++l) {
+        lay_.n1.push_back(put((size_t) D * 2));
+        lay_.n2.push_back(put((size_t) D * 2));
+        lay_.bqkv.push_back(put((size_t) 3 * D * 2));
+        lay_.bo.push_back(put((size_t) D * 2));
+    }
+    const int nf = hd / 4;   // the rotary's frequencies: theta ^ -(2i / (hd / 2)), hd / 4 of them
+    lay_.inv_freq = put((size_t) nf * 4);
+    lay_.pre = off;
+    if (cudaHostAlloc((void**) &pre_host_, lay_.pre, cudaHostAllocDefault) != cudaSuccess) {
+        pre_host_ = nullptr;
+        err = "vision: pinning " + std::to_string(lay_.pre >> 10) + " KiB of host memory failed";
+        return false;
+    }
+    std::memset(pre_host_, 0, lay_.pre);
+    auto keep = [&](const std::string& name, size_t o) -> bool {
         std::vector<int64_t> sh;
-        if (!read(name, sh, h.data())) {
+        if (!read(name, sh, pre_host_ + o)) {
             err = "vision: " + name + ": read failed";
             return false;
         }
-        if (!dalloc(d, n, err)) return false;
-        VK(cudaMemcpy(d, h.data(), n * 2, cudaMemcpyHostToDevice));
         return true;
     };
-    bool ok = up("vision.patch_embed.proj.weight", (size_t) D * 3 * P * P, pe_w_) &&
-              up("vision.patch_embed.proj.bias", D, pe_b_) && up("vision.norm.weight", D, norm_) &&
-              up("aligner.w1.bias", g.out, al1_b_) && up("aligner.w2.bias", g.out, al2_b_);
-    n1_.assign(g.layers, nullptr);
-    n2_.assign(g.layers, nullptr);
-    bqkv_.assign(g.layers, nullptr);
-    bo_.assign(g.layers, nullptr);
+    bool ok = keep("vision.patch_embed.proj.weight", lay_.pe_w) && keep("vision.patch_embed.proj.bias", lay_.pe_b) &&
+              keep("vision.norm.weight", lay_.norm) && keep("aligner.w1.bias", lay_.al1_b) &&
+              keep("aligner.w2.bias", lay_.al2_b);
     for (int l = 0; l < g.layers && ok; ++l) {
         const std::string B = "vision.blocks." + std::to_string(l) + ".";
-        ok = up(B + "norm1.weight", D, n1_[l]) && up(B + "norm2.weight", D, n2_[l]) &&
-             up(B + "attn.wqkv.bias", 3 * D, bqkv_[l]) && up(B + "attn.wo.bias", D, bo_[l]);
+        ok = keep(B + "norm1.weight", lay_.n1[l]) && keep(B + "norm2.weight", lay_.n2[l]) &&
+             keep(B + "attn.wqkv.bias", lay_.bqkv[l]) && keep(B + "attn.wo.bias", lay_.bo[l]);
     }
     if (!ok) return false;
-    {   // the rotary's frequencies: theta ^ -(2i / (hd / 2)), hd / 4 of them
-        const int nf = hd / 4;
+    {
         std::vector<float> f(nf);
         for (int i = 0; i < nf; ++i) f[i] = 1.0f / std::pow(g.theta, (float) (2 * i) / (float) (hd / 2));
-        if (!dalloc(inv_freq_, nf, err)) return false;
-        VK(cudaMemcpy(inv_freq_, f.data(), nf * 4, cudaMemcpyHostToDevice));
+        std::memcpy(pre_host_ + lay_.inv_freq, f.data(), (size_t) nf * 4);
     }
     // the work buffers: the patch grid's rows whole (the residual, its norm, q / k / v), the GEMM outputs a piece of
     // rows at a time, the attention's scores a piece of queries at a time (~48 MB)
     const int L = cells;
+    lay_.cells = cells;
     rb_ = 2048;
     qb_ = std::max(16, (int) ((48u << 20) / ((size_t) max_n_ * 4)) / 16 * 16);
     slot_n_ = std::max(block_n_, (size_t) 1 << 22);
@@ -355,16 +362,23 @@ bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::
         err = "vision: work buffer sizes";
         return false;
     }
-    ok = dalloc(x_, (size_t) max_n_ * D, err) && dalloc(xn_, (size_t) max_n_ * D, err) && dalloc(qkv_, qkv_n, err) &&
-         dalloc(y_, y_n, err) && dalloc(o_, (size_t) max_n_ * D, err) && dalloc(mid_, (size_t) rb_ * I, err) &&
-         dalloc(s_, (size_t) qb_ * max_n_, err) && dalloc(p_, (size_t) qb_ * max_n_, err) &&
-         dalloc(slot_[0], slot_n_, err) && dalloc(slot_[1], slot_n_, err) && dalloc(ws_, kWs, err);
-    if (!ok) return false;
-    patch_ = qkv_;   // (before block 0's qkv)
-    rgb_ = (uint8_t*) (qkv_ + (size_t) max_n_ * 3 * P * P);
-    un_ = qkv_;      // (after the last block's attention)
-    a16_ = un_ + (size_t) L * D * M * M;
-    outb_ = a16_ + (size_t) L * g.out;
+    lay_.x = put((size_t) max_n_ * D * 4);
+    lay_.xn = put((size_t) max_n_ * D * 2);
+    lay_.qkv = put(qkv_n * 2);
+    lay_.y = put(y_n * 4);
+    lay_.o = put((size_t) max_n_ * D * 2);
+    lay_.mid = put((size_t) rb_ * I * 2);
+    lay_.s = put((size_t) qb_ * max_n_ * 4);
+    lay_.p = put((size_t) qb_ * max_n_ * 2);
+    lay_.slot0 = put(slot_n_ * 2);
+    lay_.slot1 = put(slot_n_ * 2);
+    lay_.ws = put(kWs);
+    room_ = off;
+    host_b_ = host_n * 2 + lay_.pre;
+    n1_.assign(g.layers, nullptr);
+    n2_.assign(g.layers, nullptr);
+    bqkv_.assign(g.layers, nullptr);
+    bo_.assign(g.layers, nullptr);
     cublasHandle_t h = nullptr;
     VB(cublasCreate(&h));
     blas_ = h;
@@ -373,8 +387,7 @@ bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::
     VK(cudaStreamCreateWithFlags(&cs, cudaStreamNonBlocking));
     st_ = st;
     cs_ = cs;
-    VB(cublasSetStream(h, st));
-    VB(cublasSetWorkspace(h, ws_, kWs));
+    VB(cublasSetStream(h, st));   // (the workspace: the room's, set by each encode)
     for (int i = 0; i < 2; ++i) {
         cudaEvent_t a = nullptr, b = nullptr;
         VK(cudaEventCreateWithFlags(&a, cudaEventDisableTiming));
@@ -386,12 +399,35 @@ bool VisionTower::load(const VisionGeo& g, int device, const Reader& read, std::
     return true;
 }
 
-bool VisionTower::encode(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& rows, int& n_h, int& n_w,
-                         std::string& err) {
+bool VisionTower::encode(const uint8_t* rgb, int width, int height, uint8_t* room, std::vector<uint16_t>& rows,
+                         int& n_h, int& n_w, std::string& err) {
     if (dev_ < 0) {
         err = "vision: not loaded";
         return false;
     }
+    if (room == nullptr || ((uintptr_t) room & 255) != 0) {
+        err = "vision: no room on the GPU for the picture";
+        return false;
+    }
+    cudaSetDevice(dev_);
+    cur_ = room_;
+    const bool ok = run(rgb, width, height, room, rows, n_h, n_w, err);
+    // every copy and kernel of this encode done before the room goes back to its owner (one that failed half way too)
+    cudaStreamSynchronize((cudaStream_t) st_);
+    cudaStreamSynchronize((cudaStream_t) cs_);
+    if (!ok) cudaGetLastError();
+    cur_ = 0;
+    pe_w_ = pe_b_ = norm_ = al1_b_ = al2_b_ = nullptr;
+    rgb_ = nullptr;
+    patch_ = xn_ = qkv_ = o_ = mid_ = p_ = un_ = a16_ = outb_ = nullptr;
+    x_ = y_ = s_ = inv_freq_ = nullptr;
+    slot_[0] = slot_[1] = nullptr;
+    ws_ = nullptr;
+    return ok;
+}
+
+bool VisionTower::run(const uint8_t* rgb, int width, int height, uint8_t* room, std::vector<uint16_t>& rows, int& n_h,
+                      int& n_w, std::string& err) {
     const VisionGeo& g = g_;
     const int D = g.dim, I = g.inter, P = g.patch, M = g.merge, hd = D / g.heads, H3 = 3 * D;
     if (width <= 0 || height <= 0 || width % P != 0 || height % P != 0) {
@@ -411,6 +447,26 @@ bool VisionTower::encode(const uint8_t* rgb, int width, int height, std::vector<
     cudaSetDevice(dev_);
     cublasHandle_t h = (cublasHandle_t) blas_;
     cudaStream_t s = (cudaStream_t) st_, cs = (cudaStream_t) cs_;
+    // the room laid out (load's lay_), the small weights copied in ahead of every kernel on s, cuBLAS's workspace
+    auto at = [room](size_t o) { return room + o; };
+    pe_w_ = (uint16_t*) at(lay_.pe_w), pe_b_ = (uint16_t*) at(lay_.pe_b), norm_ = (uint16_t*) at(lay_.norm);
+    al1_b_ = (uint16_t*) at(lay_.al1_b), al2_b_ = (uint16_t*) at(lay_.al2_b);
+    for (int l = 0; l < g.layers; ++l) {
+        n1_[l] = (uint16_t*) at(lay_.n1[l]), n2_[l] = (uint16_t*) at(lay_.n2[l]);
+        bqkv_[l] = (uint16_t*) at(lay_.bqkv[l]), bo_[l] = (uint16_t*) at(lay_.bo[l]);
+    }
+    inv_freq_ = (float*) at(lay_.inv_freq);
+    x_ = (float*) at(lay_.x), xn_ = (uint16_t*) at(lay_.xn), qkv_ = (uint16_t*) at(lay_.qkv), y_ = (float*) at(lay_.y);
+    o_ = (uint16_t*) at(lay_.o), mid_ = (uint16_t*) at(lay_.mid), s_ = (float*) at(lay_.s), p_ = (uint16_t*) at(lay_.p);
+    slot_[0] = (uint16_t*) at(lay_.slot0), slot_[1] = (uint16_t*) at(lay_.slot1);
+    ws_ = at(lay_.ws);
+    patch_ = qkv_;   // (before block 0's qkv)
+    rgb_ = (uint8_t*) (qkv_ + (size_t) max_n_ * 3 * P * P);
+    un_ = qkv_;      // (after the last block's attention)
+    a16_ = un_ + (size_t) lay_.cells * D * M * M;
+    outb_ = a16_ + (size_t) lay_.cells * g.out;
+    VK(cudaMemcpyAsync(room, pre_host_, lay_.pre, cudaMemcpyHostToDevice, s));
+    VB(cublasSetWorkspace(h, ws_, kWs));
     // the weights in the order the encode takes them: the blocks, then the aligner's in pieces of a slot
     std::vector<Piece> pcs;
     for (int l = 0; l < g.layers; ++l) pcs.push_back({host_ + (size_t) l * block_n_, block_n_});

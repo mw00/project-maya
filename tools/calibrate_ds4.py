@@ -1,5 +1,6 @@
-"""The speed calibration for DeepSeek-V4.1 (maya-ds4): does the DSpark drafter make THIS PC faster?  (The setup, the
-first start of a config that has the drafter and no calibration yet, ./maya.sh --speed-calibration.)
+"""The speed calibration for DeepSeek-V4.1 (maya-ds4) and MiniMax-M3.1 (maya-mm3): does the DSpark drafter make THIS
+PC faster?  (The setup, the first start of a config that has the drafter and no calibration yet, ./maya.sh
+--speed-calibration.)
 
 DSpark drafts up to 5 tokens a round and the model checks them in one window.  Where the model's experts sit in the
 GPUs' memory that window costs about what one token does and drafting wins; where most experts are computed on the CPU
@@ -51,25 +52,36 @@ def without(args: list, name: str) -> list:
     return out
 
 
+def is_mm3(cfg: dict) -> bool:
+    """A MiniMax-M3.1-Flash config (maya-mm3): its DSpark drafter is measured the same way."""
+    return (cfg.get("installer") or {}).get("family") == "minimax" or Path(cfg.get("exe", "")).name.startswith("maya-mm3")
+
+
 def with_dspark(cfg: dict, mode: str) -> dict:
-    """The config with --dspark `mode`: "none" (the drafter not loaded) or "on"."""
+    """The config with --dspark `mode`: "none" (the drafter not loaded; maya-mm3 spells it "off") or "on"."""
     out = copy.deepcopy(cfg)
+    if mode == "none" and is_mm3(cfg):
+        mode = "off"
     out["args"] = without(out.get("args") or [], "--dspark") + ["--dspark", mode]
     return out
 
 
 def has_drafter(cfg: dict) -> bool:
-    """The config's pack holds the DSpark drafter (an EXL3 pack's, or a GGUF pack's from drafter_pack.py)."""
+    """The config's pack holds the DSpark drafter (an EXL3 pack's, or a GGUF pack's from drafter_pack.py; maya-mm3's
+    pack indexes its dspark/ folder as dspark.* tensors)."""
     pack = option(cfg.get("args") or [], "--pack")
     t = Path(pack) / "tensors.txt" if pack else None
     if t is None or not t.is_file():
         return False
+    mark = "t dspark." if is_mm3(cfg) else "t mtp."
     with t.open(encoding="utf-8", errors="replace") as f:
-        return any(line.startswith("t mtp.") for line in f)
+        return any(line.startswith(mark) for line in f)
 
 
 def profile_copy(cfg: dict, tmp: Path) -> dict:
-    """The config reading (and writing) a copy of its expert profile in `tmp`."""
+    """The config reading (and writing) a copy of its expert profile in `tmp` (maya-mm3 only reads its --profile)."""
+    if is_mm3(cfg):
+        return copy.deepcopy(cfg)
     args = cfg.get("args") or []
     src = option(args, "--expert-profile") or str(Path(option(args, "--pack") or ".") / "expert-profile.bin")
     out = copy.deepcopy(cfg)

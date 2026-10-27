@@ -1,5 +1,6 @@
 // src/ds4/ds4_gguf.cu - a GGUF's BF16 matrices and MXFP4 experts on the device (see ds4_gguf.cuh).
 #include "ds4_gguf.cuh"
+#include "ds4_pdl.cuh"
 
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
@@ -69,6 +70,8 @@ struct BfJobs {
 // 8 activations a step (VEC), or one of each (rows or activations not 16-byte aligned)
 template <int NC, bool VEC>
 __global__ void __launch_bounds__(kThreads) bf16_mv_kernel(const BfJobs J) {
+    pdl_wait();
+    pdl_trigger();
     const BfJob& b = J.j[blockIdx.y];
     const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (row >= b.n) return;
@@ -119,6 +122,8 @@ __global__ void __launch_bounds__(kThreads) bf16_mv_kernel(const BfJobs J) {
 
 __global__ void q8_rows_kernel(const uint8_t* __restrict__ w, size_t ld, int k, int n, uint16_t* __restrict__ dst,
                                bool bf16) {
+    pdl_wait();
+    pdl_trigger();
     const size_t total = (size_t) n * (size_t) k;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
         const size_t r = i / (size_t) k, c = i - r * (size_t) k;
@@ -130,6 +135,8 @@ __global__ void q8_rows_kernel(const uint8_t* __restrict__ w, size_t ld, int k, 
 
 __global__ void bf16_rows_kernel(const uint16_t* __restrict__ w, size_t ld, int k, int n, uint16_t* __restrict__ dst,
                                  bool bf16) {
+    pdl_wait();
+    pdl_trigger();
     const size_t total = (size_t) n * (size_t) k;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
         const size_t r = i / (size_t) k, c = i - r * (size_t) k;
@@ -200,11 +207,13 @@ __device__ __forceinline__ void q8_quant_block(const float* __restrict__ x, size
 }
 __global__ void __launch_bounds__(kThreads) q8_quant_kernel(const float* __restrict__ x, size_t ldx, int k,
                                                             int8_t* __restrict__ q, float* __restrict__ d) {
+    pdl_wait();
+    pdl_trigger();
     q8_quant_block(x, ldx, k, q, d, blockIdx.y, blockIdx.x * kWarps + (threadIdx.x >> 5), threadIdx.x & 31);
 }
 void q8_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     const dim3 grid((unsigned) ((k / 32 + kWarps - 1) / kWarps), (unsigned) rows);
-    q8_quant_kernel<<<grid, kThreads, 0, s>>>(x, ldx, k, q, d);
+    pdl_launch(q8_quant_kernel, grid, kThreads, 0, s, x, ldx, k, q, d);
 }
 // (DS4_Q8_BATCH) a mv call's int8 inputs in one launch: job z's rows as q8_quant_kernel rounds them, bit for bit -
 // the same warp a 32-block; a job's blocks past its k and rows past its rows end at once
@@ -219,6 +228,8 @@ struct Q8Jobs {
     Q8Job j[x3::kMaxMvJobs];
 };
 __global__ void __launch_bounds__(kThreads) q8_quant_jobs_kernel(const Q8Jobs J) {
+    pdl_wait();
+    pdl_trigger();
     const Q8Job& a = J.j[blockIdx.z];
     if ((int) blockIdx.y >= a.rows) return;
     q8_quant_block(a.x, a.ldx, a.k, a.q, a.d, blockIdx.y, blockIdx.x * kWarps + (threadIdx.x >> 5), threadIdx.x & 31);
@@ -229,7 +240,7 @@ void q8_quant_jobs(const Q8Jobs& J, int n, cudaStream_t s) {
         bx = std::max(bx, (J.j[i].k / 32 + kWarps - 1) / kWarps);
         by = std::max(by, J.j[i].rows);
     }
-    q8_quant_jobs_kernel<<<dim3((unsigned) bx, (unsigned) by, (unsigned) n), kThreads, 0, s>>>(J);
+    pdl_launch(q8_quant_jobs_kernel, dim3((unsigned) bx, (unsigned) by, (unsigned) n), kThreads, 0, s, J);
 }
 
 // ---- the low-bit experts' activations as the CPU lane rounds them (ggml's Q8_K, quantize_row_q8_K_ref, ggml-cpu's
@@ -249,6 +260,8 @@ __device__ __forceinline__ int q8k_nearest(float fval) {   // ggml's nearest_int
 }
 __global__ void __launch_bounds__(256) q8k_quant_kernel(const float* __restrict__ x, size_t ldx, int k,
                                                         int8_t* __restrict__ q, float* __restrict__ d) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float s_am[8];
     __shared__ int s_at[8];
     const int r = blockIdx.y, j = (int) threadIdx.x, lane = j & 31, w = j >> 5;
@@ -282,7 +295,7 @@ __global__ void __launch_bounds__(256) q8k_quant_kernel(const float* __restrict_
     if (lane == 0) d[(size_t) r * (k / 32) + at / 32] = dv;
 }
 void q8k_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
-    q8k_quant_kernel<<<dim3((unsigned) (k / 256), (unsigned) rows), 256, 0, s>>>(x, ldx, k, q, d);
+    pdl_launch(q8k_quant_kernel, dim3((unsigned) (k / 256), (unsigned) rows), 256, 0, s, x, ldx, k, q, d);
 }
 // the low-bit experts' activations: Q8_K's rounding (the CPU lane's; DS4_IQ_Q8K=0: q8_1's, per 32)
 bool iq_q8k() {
@@ -411,6 +424,8 @@ __device__ __forceinline__ float q8_words_g(const uint8_t* __restrict__ p, int* 
 // j at xq + c k, its scales at xd + c k / 32) - a warp a row, a lane a block a step, the blocks staged (ST) or read
 template <int NC, bool ST>
 __global__ void __launch_bounds__(kThreads) q8_mv_kernel(const BfJobs J) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ __align__(16) uint32_t stage[kWarps][32 * kQ8Bytes / 4];
     const BfJob& b = J.j[blockIdx.y];
     const int row = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
@@ -459,6 +474,8 @@ __global__ void __launch_bounds__(kThreads) q8_mv_kernel(const BfJobs J) {
 // a step, dequantised once for the job's activations
 template <int NC, bool VEC, bool Q8>
 __global__ void __launch_bounds__(kThreads) mx_mv_kernel(const BfJobs J) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float lut[16];
     lut_init(lut);
     __syncthreads();
@@ -542,6 +559,8 @@ __device__ __forceinline__ bool mx_group(const MxArgs& a, int grp, const uint8_t
 // block decoded once for them) against the entries' int8 x -> h = the clamped swiglu
 template <int NE, bool ST>
 __global__ void __launch_bounds__(kThreads) mx_gate_up_kernel(const MxArgs a) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ __align__(16) uint32_t stage[kWarps][2][32 * kMxBytes / 4];
     __shared__ int es[NE], xr[NE];
     const uint8_t* blob;
@@ -607,6 +626,8 @@ __global__ void __launch_bounds__(kThreads) mx_gate_up_kernel(const MxArgs a) {
 // grid (n_embd / 8, groups): a warp a row of the down for NE entries a pass, against their int8 h -> part
 template <int NE, bool ST>
 __global__ void __launch_bounds__(kThreads) mx_down_kernel(const MxArgs a) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ __align__(16) uint32_t stage[kWarps][32 * kMxBytes / 4];
     __shared__ int es[NE];
     const uint8_t* blob;
@@ -667,6 +688,8 @@ struct CombArgs {
 // grid (n_embd / 128, T): each token's outputs - the experts in plan order (an expert off the device adds 0), then
 // the CPU lane's part and the shared expert's (x3's combine)
 __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.y, r = blockIdx.x * 128 + threadIdx.x;
     if (r >= a.n_embd) return;
     float p[8];
@@ -681,6 +704,7 @@ __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
 }
 
 __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
+    pdl_wait();
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) p != v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -688,6 +712,7 @@ __global__ void mx_wait_kernel(const unsigned* p, unsigned v) {
 #endif
     }
     __threadfence_system();
+    pdl_trigger();   // (only after the wait: ds4_pdl.cuh)
 }
 
 // ---------------------------------------------------------------- the prompt path's expert sets
@@ -733,6 +758,8 @@ __device__ __forceinline__ void mx_tile(const uint8_t* w, size_t rb, int c0, int
 
 template <bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) mx_set_kernel(const SetK a) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float lut[16];
     __shared__ float wg[32][BN + 1];
     __shared__ float wu[GATE_UP ? 32 : 1][BN + 1];
@@ -812,6 +839,8 @@ namespace wm = nvcuda::wmma;
 constexpr int kLdT = 40;   // halves a tile row (32 + 8: WMMA wants a multiple of 8; the pad spreads the banks)
 template <bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) mx_set_tc_kernel(const SetK a) {
+    pdl_wait();
+    pdl_trigger();
     struct Tiles {
         __half x[BM][kLdT], wg[BN][kLdT], wu[GATE_UP ? BN : 1][kLdT];
     };
@@ -935,6 +964,8 @@ __device__ __forceinline__ int set_wmma_row(int i, int hi) {
 constexpr int kLdH = 40;   // halves a tile row (32 + 8: the pad spreads the banks)
 template <bool GATE_UP>
 __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
+    pdl_wait();
+    pdl_trigger();
     struct Tiles {
         _Float16 x[BM][kLdH], wg[BN][kLdH], wu[GATE_UP ? BN : 1][kLdH];
     };
@@ -1273,11 +1304,23 @@ bool q8_batch_check(int dev, std::string& err) {
 
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
 
+void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s) {
+    if (q8_batch()) {
+        Q8Jobs J;
+        J.j[0] = {x, (size_t) k, q, d, k, 1};
+        q8_quant_jobs(J, 1, s);
+    } else
+        q8_quant(x, (size_t) k, 1, k, q, d, s);
+}
+
+// (the low-bit types ds4_iq's GEMVs take: the routed experts' and the dense matrices' beside them - Q6_K, as
+//  orcarouter's mixes and maya-mm3's GGUFs hold some; a routed expert's own: expert_type_ok)
 size_t type_row_bytes(int type, int64_t k) {
     if (type == kTypeMXFP4) return k % kMxBlock == 0 ? mx_row_bytes(k) : 0;
-    return iq::supported(type) && k % 256 == 0 ? iq::row_bytes(type, k) : 0;
+    return iq::mv_supported(type) && k % iq::block_values(type) == 0 ? iq::row_bytes(type, k) : 0;
 }
-int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::supported(type) ? 256 : 0; }
+int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::mv_supported(type) ? iq::block_values(type) : 0; }
+bool expert_type_ok(int type) { return type == kTypeMXFP4 || iq::supported(type); }
 const char* type_name(int type) { return type == kTypeMXFP4 ? "MXFP4" : iq::name(type); }
 
 namespace {
@@ -1288,8 +1331,11 @@ size_t row_stride(const x3::Mat& m) {   // values (BF16) or bytes (MXFP4, Q8_0, 
            : m.fmt == kFmtGG   ? type_row_bytes(m.gg_type, m.k)
                                : (size_t) m.k;
 }
-// a layer's low-bit experts as ds4_iq's arguments (false: its types not covered - printed)
-bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who) {
+// whether a layer's gate / up (gu) or its down is MXFP4 - these kernels - or a low-bit type (ds4_iq's)
+bool mx_role(const x3::ExpertLayout& lay, bool gu) { return expert_type(lay, gu ? 0 : 2) == kTypeMXFP4; }
+// a layer's low-bit gate / up (gu) or down as ds4_iq's arguments - the other role may be MXFP4, which takes these
+// kernels (false: the role's types not covered - printed)
+bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq::Args& ia, const char* who, bool gu) {
     ia = iq::Args{};
     for (int r = 0; r < 3; ++r) ia.tr[r] = lay.trellis[r];
     ia.n_embd = n_embd;
@@ -1297,8 +1343,8 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     ia.limit = limit;
     ia.tg = expert_type(lay, 0);
     ia.td = expert_type(lay, 2);
-    if (ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || !iq::supported(ia.td) || n_embd % 256 != 0 ||
-        n_ff % 256 != 0) {
+    if (gu ? ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || n_embd % 256 != 0
+           : !iq::supported(ia.td) || n_ff % 256 != 0) {
         std::fprintf(stderr, "ds4 gguf %s: expert types %s / %s / %s (n_embd %d, n_ff %d) not covered\n", who,
                      type_name(expert_type(lay, 0)), type_name(expert_type(lay, 1)), type_name(expert_type(lay, 2)),
                      n_embd, n_ff);
@@ -1311,14 +1357,14 @@ template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (f == 1) {
-        if (vec) mx_mv_kernel<NC, true, false><<<grid, kThreads, 0, s>>>(J);
-        else mx_mv_kernel<NC, false, false><<<grid, kThreads, 0, s>>>(J);
+        if (vec) pdl_launch(mx_mv_kernel<NC, true, false>, grid, kThreads, 0, s, J);
+        else pdl_launch(mx_mv_kernel<NC, false, false>, grid, kThreads, 0, s, J);
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
-        if (vec) q8_mv_kernel<NC, true><<<grid, kThreads, 0, s>>>(J);
-        else q8_mv_kernel<NC, false><<<grid, kThreads, 0, s>>>(J);
+        if (vec) pdl_launch(q8_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
+        else pdl_launch(q8_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     } else {
-        if (vec) bf16_mv_kernel<NC, true><<<grid, kThreads, 0, s>>>(J);
-        else bf16_mv_kernel<NC, false><<<grid, kThreads, 0, s>>>(J);
+        if (vec) pdl_launch(bf16_mv_kernel<NC, true>, grid, kThreads, 0, s, J);
+        else pdl_launch(bf16_mv_kernel<NC, false>, grid, kThreads, 0, s, J);
     }
 }
 void mv_set(int f, const BfJobs& J, int nj, int max_n, int max_c, bool vec, cudaStream_t s) {
@@ -1341,7 +1387,9 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
     return v;
 }
 
-bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) { return mv(jobs, n, s, nullptr); }
+
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
     BfJobs J[3] = {};   // the BF16 jobs, the MXFP4 ones, the Q8_0 ones: a launch each
     int nj[3] = {0, 0, 0}, max_n[3] = {0, 0, 0}, max_c[3] = {1, 1, 1};
@@ -1410,7 +1458,12 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         max_n[f] = std::max(max_n[f], m.n);
         max_c[f] = std::max(max_c[f], q.ncol);
         const bool xa = ((uintptr_t) b.x & 15u) == 0 && (q.ncol == 1 || b.xcs % 4 == 0);
-        if (f == 2) {   // the activations rounded to int8 first (each job its own rows of the scratch)
+        if (f == 2 && pre != nullptr && q.xf == pre->x && m.k == pre->k && q.ncol == pre->rows &&
+            (q.ncol == 1 || q.xf_cs == (size_t) m.k)) {
+            b.xq = pre->q;   // (DS4_HC_FUSE: x rounded where it was made, q8_quant_block's bits)
+            b.xd = pre->d;
+            vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
+        } else if (f == 2) {   // the activations rounded to int8 first (each job its own rows of the scratch)
             Scratch* sc = scratch(s);
             if (sc == nullptr || m.k > kMaxQK) {
                 fail("mv: Q8_0 inputs past the scratch");
@@ -1448,8 +1501,8 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
     const size_t ld = row_stride(m);
     const size_t total = (size_t) m.n * (size_t) m.k;
     const unsigned blocks = (unsigned) std::min<size_t>((total + 255) / 256, 65535);
-    if (m.fmt == kFmtQ8_0) q8_rows_kernel<<<blocks, 256, 0, s>>>((const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
-    else bf16_rows_kernel<<<blocks, 256, 0, s>>>((const uint16_t*) m.raw, ld, m.k, m.n, dst, bf16);
+    if (m.fmt == kFmtQ8_0) pdl_launch(q8_rows_kernel, blocks, 256, 0, s, (const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
+    else pdl_launch(bf16_rows_kernel, blocks, 256, 0, s, (const uint16_t*) m.raw, ld, m.k, m.n, dst, bf16);
     check("rows");
 }
 
@@ -1458,15 +1511,15 @@ namespace {
 template <int NE>
 struct GateUpK {
     static void run(const MxArgs& m, dim3 grid, cudaStream_t s) {
-        if (mx_row_bytes(m.n_embd) % 4 == 0) mx_gate_up_kernel<NE, true><<<grid, kThreads, 0, s>>>(m);
-        else mx_gate_up_kernel<NE, false><<<grid, kThreads, 0, s>>>(m);
+        if (mx_row_bytes(m.n_embd) % 4 == 0) pdl_launch(mx_gate_up_kernel<NE, true>, grid, kThreads, 0, s, m);
+        else pdl_launch(mx_gate_up_kernel<NE, false>, grid, kThreads, 0, s, m);
     }
 };
 template <int NE>
 struct DownK {
     static void run(const MxArgs& m, dim3 grid, cudaStream_t s) {
-        if (mx_row_bytes(m.n_ff) % 4 == 0) mx_down_kernel<NE, true><<<grid, kThreads, 0, s>>>(m);
-        else mx_down_kernel<NE, false><<<grid, kThreads, 0, s>>>(m);
+        if (mx_row_bytes(m.n_ff) % 4 == 0) pdl_launch(mx_down_kernel<NE, true>, grid, kThreads, 0, s, m);
+        else pdl_launch(mx_down_kernel<NE, false>, grid, kThreads, 0, s, m);
     }
 };
 template <template <int> class Kern>
@@ -1496,9 +1549,9 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
     if (!mx_geometry("moe_gate_up", a.k, a.n_embd, a.n_ff) || h == nullptr) return;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return;
-    if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's kernels
+    if (!mx_role(a.lay, true)) {   // a low-bit gate / up: ds4_iq's kernels
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_gate_up", true)) return;
         ia.plan_ptr = a.plan_ptr;
         ia.h = h;
         ia.xq = sc->xq;
@@ -1529,10 +1582,11 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     m.part = sc->part;
     m.hq = sc->hq;
     m.hd = sc->hd;
-    (mx_experts(a.lay) ? q8_quant : iq_act_quant)(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
-    if (!mx_experts(a.lay)) {   // low-bit experts: ds4_iq's down, then the same combine
+    const bool mx = mx_role(a.lay, false);
+    (mx ? q8_quant : iq_act_quant)(h, (size_t) a.n_ff, a.k, a.n_ff, sc->hq, sc->hd, s);
+    if (!mx) {   // a low-bit down: ds4_iq's, then the same combine
         iq::Args ia;
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down")) return;
+        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "moe_down", false)) return;
         ia.plan_ptr = a.plan_ptr;
         ia.part = sc->part;
         ia.hq = sc->hq;
@@ -1553,7 +1607,7 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.out_stride = (size_t) a.n_embd;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    mx_combine_kernel<<<dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s>>>(c);
+    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), 1), 128, 0, s, c);
     check("moe_down");
 }
 
@@ -1579,10 +1633,12 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     m.hq = sc->hq;
     m.hd = sc->hd;
     const int groups = a.T * a.k;   // at most (the blocks past the real count return at once)
-    const bool mx = mx_experts(a.lay);
+    const bool mx_gu = mx_role(a.lay, true), mx_d = mx_role(a.lay, false);
     iq::Args ia;
-    if (!mx) {   // low-bit experts: ds4_iq's kernels on the same groups and scratch
-        if (!iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts")) return false;
+    if (!mx_gu || !mx_d) {   // a low-bit role: ds4_iq's kernels on the same groups and scratch
+        if ((!mx_gu && !iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts", true)) ||
+            (!mx_d && !iq_args(a.lay, a.n_embd, a.n_ff, a.limit, ia, "win_experts", false)))
+            return false;
         ia.grp_ptr = a.grp_ptr;
         ia.grp_start = a.grp_start;
         ia.grp_ent = a.grp_ent;
@@ -1594,14 +1650,14 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
         ia.hq = sc->hq;
         ia.hd = sc->hd;
     }
-    (mx_experts(a.lay) ? q8_quant : iq_act_quant)(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
-    if (mx) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
+    (mx_gu ? q8_quant : iq_act_quant)(a.x, a.x_stride, a.T, a.n_embd, sc->xq, sc->xd, s);
+    if (mx_gu) launch_groups<GateUpK>(m, a.n_ff, groups, a.T, s);
     else iq::gate_up(ia, groups, a.T, s);
     // (rows of picks not on the device: unused)
-    (mx_experts(a.lay) ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
-    if (mx) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
+    (mx_d ? q8_quant : iq_act_quant)(a.h, (size_t) a.n_ff, a.T * 8, a.n_ff, sc->hq, sc->hd, s);
+    if (mx_d) launch_groups<DownK>(m, a.n_embd, groups, a.T, s);
     else iq::down(ia, groups, a.T, s);
-    if (a.wait_ptr != nullptr) mx_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
+    if (a.wait_ptr != nullptr) pdl_launch(mx_wait_kernel, 1, 32, 0, s, a.wait_ptr, a.wait_val);
     CombArgs c{};
     c.plan_ptr = a.plan_ptr;
     c.plan_w = a.plan_w;
@@ -1614,7 +1670,7 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.out_stride = a.out_stride;
     c.k = a.k;
     c.n_embd = a.n_embd;
-    mx_combine_kernel<<<dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s>>>(c);
+    pdl_launch(mx_combine_kernel, dim3((unsigned) ((a.n_embd + 127) / 128), (unsigned) a.T), 128, 0, s, c);
     check("win_experts");
     return true;
 }
@@ -1641,9 +1697,9 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
                  cudaStream_t s, const uint16_t* x16) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mx_geometry("set_gate_up", 1, sa.n_embd, sa.n_ff)) return;
-    if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
+    if (!mx_role(sa.lay, true)) {   // a low-bit gate / up: ds4_iq's sets
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_gate_up", true)) return;
         iq::SetArgs q = iq_set(sa);
         q.xf = x;
         q.xh = x16;   // (the tensor-core tiles' FP16 rows; the light kernels keep xf)
@@ -1693,21 +1749,21 @@ void set_gate_up(const x3::SetArgs& sa, const float* x, int ldx, const int* row_
     k.xh_vec = x16 != nullptr && ((uintptr_t) x16 & 15) == 0 && (ldx & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_ff / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
-    if (tc_ok()) mx_set_tc_kernel<true><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) pdl_launch(mx_set_tc_kernel<true>, grid, kThreads, 0, s, k);
 #else
-    if (tc_ok()) mx_set_wmma_kernel<true><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) pdl_launch(mx_set_wmma_kernel<true>, grid, kThreads, 0, s, k);
 #endif
     else
-        mx_set_kernel<true><<<grid, kThreads, 0, s>>>(k);
+        pdl_launch(mx_set_kernel<true>, grid, kThreads, 0, s, k);
     check("set_gate_up");
 }
 
 void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s) {
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
     if (!mx_geometry("set_down", 1, sa.n_embd, sa.n_ff)) return;
-    if (!mx_experts(sa.lay)) {   // low-bit experts: ds4_iq's sets
+    if (!mx_role(sa.lay, false)) {   // a low-bit down: ds4_iq's sets
         iq::Args ia;
-        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down")) return;
+        if (!iq_args(sa.lay, sa.n_embd, sa.n_ff, sa.limit, ia, "set_down", false)) return;
         iq::SetArgs q = iq_set(sa);
         q.xh = h16;
         q.ldx = ldh;
@@ -1751,12 +1807,12 @@ void set_down(const x3::SetArgs& sa, const uint16_t* h16, int ldh, float* y, int
     k.xh_vec = ((uintptr_t) h16 & 15) == 0 && (ldh & 7) == 0;
     const dim3 grid((unsigned) ((sa.max_rows + BM - 1) / BM), (unsigned) (sa.n_embd / BN), (unsigned) sa.n_exp);
 #if !defined(STRATA_USE_HIP)
-    if (tc_ok()) mx_set_tc_kernel<false><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) pdl_launch(mx_set_tc_kernel<false>, grid, kThreads, 0, s, k);
 #else
-    if (tc_ok()) mx_set_wmma_kernel<false><<<grid, kThreads, 0, s>>>(k);
+    if (tc_ok()) pdl_launch(mx_set_wmma_kernel<false>, grid, kThreads, 0, s, k);
 #endif
     else
-        mx_set_kernel<false><<<grid, kThreads, 0, s>>>(k);
+        pdl_launch(mx_set_kernel<false>, grid, kThreads, 0, s, k);
     check("set_down");
 }
 

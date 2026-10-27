@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Project Maya - set up and start GLM-5.3-Flash or DeepSeek-V4.1-Flash-1017 on your own GPU(s).
+"""Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017 or MiniMax-M3.1-Flash on your own GPU(s).
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
-validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017: CUDA on Linux, RTX 30 / A100 or newer.
+validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
+and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
+The quants are named model first, then the tier by the experts' bits (XS, S, M, L): --model glm-maya-s,
+deepseek-maya-xs, minimax-maya-xs ... (tools/maya_quants.py); every name used before still works.
 
     ./maya.sh                 the first run sets everything up and starts the dashboard; later runs just start it
     ./maya.sh --setup         set up again (other GPUs, another context length, another model folder)
@@ -27,9 +30,9 @@ no tuning step - it balances its own split):
      the C++ compiler (g++; on Windows Visual Studio's Build Tools - 2019/2022 always, 2026 with CUDA 13.2+), CMake,
      RAM, CPU; HIP checks AMD gfx1100/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
-  2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (Maya-S,
-     Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits, experimental
-     and NVIDIA only)
+  2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (GLM-5.3 ·
+     Maya-S, Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits or the
+     self-calibrated one at 4.10, experimental: NVIDIA, and AMD)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
@@ -73,15 +76,18 @@ sys.path.insert(0, str(HERE / "tools"))
 import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, downloads (nothing runs on import)
 from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
 import maya_names as N  # noqa: E402  the settings' names users see (MAYA_*) and the older ones the code reads
+import maya_quants as Q  # noqa: E402  the quants' names users see (MiniMax M3.1 · Maya-XS) and the older ones as aliases
 import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./maya.sh --calibrate)
 import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU threads (./maya.sh --calibrate)
 import calibrate_draft as CD  # noqa: E402  the speed calibration: DFlash2 or the MTP block on this PC
 import calibrate_ds4 as CDS  # noqa: E402  DeepSeek's: the DSpark drafter or none, on this PC
+import calibrate_mm3_prefill as CPF  # noqa: E402  MiniMax's: how this PC reads prompts fastest (chunk, GEMMs)
 
 WIN = S.WIN
 ME = "START-MAYA.bat" if WIN else "./maya.sh"      # how this is started, for the messages
 UPDATE_EXIT = 75                                   # the server's exit after the dashboard updated Maya (serve/update.py)
 RESTART_EXIT = 76                                  # ... after it saved a new port: start again on the saved one
+SWITCH_FILE = ".maya-switch.json"                  # ... or the Models page's note: the config to start (serve/models.py)
 ROOT = S.ROOT
 BUILD = ROOT / "build"
 EXE = BUILD / ("maya.exe" if WIN else "maya")
@@ -96,9 +102,9 @@ HIP_ARCHS = ("gfx1100", "gfx1201", "gfx1151")        # Maya also supports Strix 
 HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
                                                    # validated on a card; no matrix cores, the portable kernels; compiled
                                                    # only when such a GPU is chosen
-HIP_ARCHS_WAVE64 = ("gfx908", "gfx942")            # CDNA 1 (AMD Instinct MI100) and CDNA 3 (MI300X / MI325X): wave64, run
-                                                   # through the hip_compat layer's logical-32-lane half-wavefront warp
-                                                   # mapping; experimental
+HIP_ARCHS_WAVE64 = ("gfx908", "gfx906", "gfx942")            # CDNA 1 (AMD Instinct MI100), Vega 20 (MI50 / MI60) and CDNA 3
+                                                   # (MI300X / MI325X): wave64, run through the hip_compat layer's
+                                                   # logical-32-lane half-wavefront warp mapping; experimental
 PY_PACKAGES = list(S.PY_PACKAGES)                  # (pillow: pictures in formats other than JPEG/PNG/BMP/GIF)
 CONTEXTS = [8192, 32768, 65536, 131072]
 DEFAULT_CONTEXT = 32768
@@ -238,7 +244,7 @@ MODELS = {
     # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
     "EXL3-3.05bpw": {
         "about": "turboderp's EXL3 quant at 3.05 bits per weight (exllamav3's trellis format, which the engine reads "
-                 "in place from its safetensors), with the MTP draft block - experimental, NVIDIA GPUs only",
+                 "in place from its safetensors), with the MTP draft block - experimental (NVIDIA; AMD too)",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "3.05bpw",
         "revision": "332ab457b709b7ba30dd9a448be5de03b80a7ac9", "folder": "", "download_gb": 125.3,
         "files": {
@@ -321,7 +327,7 @@ MODELS = {
     # tensors are in its shards (3.05bpw has them in kpool_aux.safetensors)
     "EXL3-4.05bpw": {
         "about": "turboderp's EXL3 quant at 4.05 bits per weight (exllamav3's trellis format, which the engine reads "
-                 "in place from its safetensors), with the MTP draft block - experimental, NVIDIA GPUs only",
+                 "in place from its safetensors), with the MTP draft block - experimental (NVIDIA; AMD too)",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "4.05bpw",
         "revision": "2a30229e67012798ba9f0cd832bb78abf4c363d5", "folder": "", "download_gb": 165.2,
         "files": {
@@ -406,6 +412,105 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    # turboderp's self-calibrated quant at 4.10 bits (exllamav3 1.6): 4-bit routed experts (5-bit in the first MoE
+    # layer), 8-bit attention and shared experts, 6-bit dense layers and output; the MTP block is in its shards (layer
+    # 45 of the index, no mtp.safetensors)
+    "EXL3-sc_4.10bpw": {
+        "about": "turboderp's self-calibrated EXL3 quant at 4.10 bits per weight (exllamav3's trellis format, which the "
+                 "engine reads in place from its safetensors): 4-bit routed experts like EXL3-4.05bpw, 8-bit "
+                 "attention and shared experts, with the MTP draft block - experimental (NVIDIA; AMD too)",
+        "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "sc_4.10bpw",
+        "revision": "c6b8ac3f6069173343e253e1cba90536ed2c72dc", "folder": "", "download_gb": 167.8,
+        "files": {
+            "config.json": 7866, "LICENSE": 1070, "README.md": 8033, "chat_template.jinja": 10950,
+            "generation_config.json": 194, "model-00001-of-00023.safetensors": 6756990246,
+            "model-00002-of-00023.safetensors": 7614064514, "model-00003-of-00023.safetensors": 7615704591,
+            "model-00004-of-00023.safetensors": 7614064514, "model-00005-of-00023.safetensors": 7615711593,
+            "model-00006-of-00023.safetensors": 7614071504, "model-00007-of-00023.safetensors": 7615711593,
+            "model-00008-of-00023.safetensors": 7614071504, "model-00009-of-00023.safetensors": 7615711593,
+            "model-00010-of-00023.safetensors": 7614071504, "model-00011-of-00023.safetensors": 7615711593,
+            "model-00012-of-00023.safetensors": 7614071504, "model-00013-of-00023.safetensors": 7615711593,
+            "model-00014-of-00023.safetensors": 7614071504, "model-00015-of-00023.safetensors": 7615711593,
+            "model-00016-of-00023.safetensors": 7614071504, "model-00017-of-00023.safetensors": 7615711593,
+            "model-00018-of-00023.safetensors": 7614071504, "model-00019-of-00023.safetensors": 7615711593,
+            "model-00020-of-00023.safetensors": 7614071504, "model-00021-of-00023.safetensors": 7615711593,
+            "model-00022-of-00023.safetensors": 8567785824, "model-00023-of-00023.safetensors": 107056658,
+            "model.safetensors.index.json": 16343098, "processor_config.json": 909,
+            "quantization_config.json": 47833416, "tokenizer.json": 20217442, "tokenizer_config.json": 761},
+        "sha256": {
+            "config.json":
+                "8e27397f93723062062d2a379d9c2a30e338906f5ad838183459ad44242a35aa",
+            "LICENSE":
+                "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1",
+            "README.md":
+                "5c48ce1a84c5901ab96d602333e9201fa385a73e9c298fab3467183b8b95a549",
+            "chat_template.jinja":
+                "0c4099f3382d6c92700dfb99725025360966fd73032f0ecf32377c0d9e6309c5",
+            "generation_config.json":
+                "230c30609ecbbb9e6583bedde8e7bdda0c6eb8fe5fad0eaeb3d1b293d751cb4f",
+            "model-00001-of-00023.safetensors":
+                "d53ec79f27568969924ae5675e47da913f15d2641f5713a5a1821855951b5508",
+            "model-00002-of-00023.safetensors":
+                "41bec1004e051021fe70b169ebbcca54d2cddb4cb74a256f8fcc4100e7c4e5ac",
+            "model-00003-of-00023.safetensors":
+                "bb608460adf5844fc022fd26611d6a349875a1a12d57fa215fc4eb105b065e8b",
+            "model-00004-of-00023.safetensors":
+                "a96a54b70bb9e12212435c1a546927b2fb6499a8681c7f9f8f3801bc2851addb",
+            "model-00005-of-00023.safetensors":
+                "4d237d5f8fb96662948c863b4887221f8fa84cd313431b0094fd51f78b3a04d2",
+            "model-00006-of-00023.safetensors":
+                "d2c9f343e5e085c28ec46e8e41362d3944cd6359ec203c2f27eb217e0aac2867",
+            "model-00007-of-00023.safetensors":
+                "340bf0d4c5947397eb4486bcbcf37c36519d3da9ac6448145aaae78b6f54046f",
+            "model-00008-of-00023.safetensors":
+                "fc74dfd79a539ec720f046c76858ab76a0e53f5600f5d9313b095e06935e67cd",
+            "model-00009-of-00023.safetensors":
+                "caf28ef4a95c8bdf4e6ad7d06c570ab729837f635cb2734d55bf51a92627003c",
+            "model-00010-of-00023.safetensors":
+                "2e0e1e6bd27c54d53115e70e9eb84d396538db4b645cc14b53cc5ace1809707d",
+            "model-00011-of-00023.safetensors":
+                "19f264dbf6da1876a0b9eea32a1d468e9e938130af6c69a0f2e076ab9736c09d",
+            "model-00012-of-00023.safetensors":
+                "1306d044b597fed6ea88146c7d08e5b0da55ec736cbd2b4311d319cca9a78dcb",
+            "model-00013-of-00023.safetensors":
+                "cfda30da128c7f1787a3cf7c60abda6bab15a1d3c693698d4a8fd59f7f1a3966",
+            "model-00014-of-00023.safetensors":
+                "2fe60640bdf58982d1f39a0e7bfc93a37c54cf8249f31b9feb39098aa99bddb1",
+            "model-00015-of-00023.safetensors":
+                "eeb92d7822dd2bdd66b8541251d060b10b1c8c26b98455ab727a208f7dfccb76",
+            "model-00016-of-00023.safetensors":
+                "7ef771a0105c0e33df8335f75336a21f7b5836ab88c068153b5ec8eff38ae105",
+            "model-00017-of-00023.safetensors":
+                "bcddb8f5ba687ccec306153884a3201b6c15ba01e0a077e797adf3d8dd0e67f3",
+            "model-00018-of-00023.safetensors":
+                "1df5395e73a10e2bf93427c7bb5c726e2c3a81bc611b0a6c61ef2d9b25d51090",
+            "model-00019-of-00023.safetensors":
+                "e151f871e76e03ec729f11d41d56f56e85b6308f590853047b1871c7a480ca70",
+            "model-00020-of-00023.safetensors":
+                "eee4dcc5b46b2ecc206d1836a3b881ad1649dd8f3772451df90f0e4552d73566",
+            "model-00021-of-00023.safetensors":
+                "7fa6316ec90aa7ce3273fd48a4e7f0826af3b8b28643079cce1239db88a3fdbf",
+            "model-00022-of-00023.safetensors":
+                "0cd44a37d30d7651ab95474ff97c9b7368b61ff349041b42dc61edddd2608d14",
+            "model-00023-of-00023.safetensors":
+                "7cce8ab6fd899ccbe40db8cf9952647fe8e50fcdaab2787cac0a5f9cbeaf0d58",
+            "model.safetensors.index.json":
+                "aaae0dd2761dc33c3d56ddc54a5943877096b25739a963fb2ab83cc931a09f13",
+            "processor_config.json":
+                "aae38374c94b08cc9b0547c6e64f05b951bd9735cea571c6988f5ed552bed3ed",
+            "quantization_config.json":
+                "82dc427917ec37c3aebb25950f1a16378d7a2a7175fb37b5cf464a4add1e1b1e",
+            "tokenizer.json":
+                "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d",
+            "tokenizer_config.json":
+                "98b1271574f41abf89427ae2dda030d94dc9478f0edc5a8bd240db213c6fd5fc"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main", "folder": "vision",
+            "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf", "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
 }
 # The DFlash2 drafter the setup offers instead of drafting with the model's MTP block (--dflash): a small block drafter
 # made for GLM-5.3-Flash (any of the quants above), pinned to the revision it was measured with and verified.
@@ -436,12 +541,29 @@ DS4_VISION_MIN_CC = 80                             # the vision tower's BF16 GEM
 DS4_GGUF_MANIFEST = ROOT / "tools" / "ds4" / "download_gguf.json"
 DS4_GGUF_PACK_TOOLS = ("tools/ds4/pack_gguf.py", "tools/ds4/chat_template.jinja")
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M", "maya-xs": "Maya-XS",
-              "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw"}
+              "exl3": "EXL3 2.9bpw", "exl3-3.5": "EXL3 3.5bpw", "abliterated-128g": "Mix-128G",
+              "abliterated-256g": "Mix-256G"}
 DS4_MAYA = ("maya-s", "maya-m", "maya-xs")
+# ... and orcarouter's abliterated model (its refusals removed from the weights) as GGUFs (download_gguf.json's
+# "abliterated": Mix-128G and Mix-256G, the experts in other low-bit types layer by layer; a gated repo, so its download
+# sends the user's Hugging Face token), in <models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/<version>, served under a
+# name of its own.  Each version's shard 2 holds only the n-gram (Engram) table - DeepSeek's own, quantized - so it is
+# left out and Maya's Q6_K tables are read instead (ds4_abl_engram_step: one copy for both versions).  --ds4-quant
+# abliterated: the version that fits this PC's VRAM + RAM (ds4_abl_recommended)
+DS4_ABL = ("abliterated-128g", "abliterated-256g")
+DS4_ABL_ALIAS = "abliterated"
+DS4_ABL_MODEL_NAME = "deepseek-v4.1-flash-abliterated"
 DS4_DEFAULT_QUANT = "gguf-q8"
 DS4_GGUF_MIN_CC = 70
-DS4_CONTEXTS = [32768, 65536, 131072, 262144]
+# (the model's own reach, natively: 1M positions - its config's max_position_embeddings, nothing scaled; 512K and 1M
+# cost VRAM from the expert cache, about 1.1 KB a position on each GPU of a tensor-parallel group, and a full prompt
+# there reads slowly: the indexer's work grows with the square of its length)
+DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]
+# the context the setup recommends: 256K where the PC's VRAM + RAM hold the model's files and the context's caches
+# (ds4_recommended_context, as MiniMax's), else - a PC that reads experts from the SSD, or RAM not readable - 64K
 DS4_DEFAULT_CONTEXT = 65536
+DS4_RECOMMENDED_CONTEXT = 262144
+DS4_KV_BYTES = 1126                                 # a position's caches on each GPU (~1.1 KB: FP4 KV, index keys)
 DS4_MODEL_NAME = "deepseek-v4.1-flash"
 DS4_SAMPLING = {"temperature": 1.0, "top_p": 1.0}   # DeepSeek's own
 DS4_EFFORT = "high"                                 # (encoding.py's default: a reasoning effort of 75)
@@ -454,14 +576,70 @@ DS4_35 = DS4 + "-3.5bpw"                            # the same model in LibertAI
 DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211, "memory_gb": DS4_MEMORY_GB, "dir": DS4},
             "exl3-3.5": {"bits": "3.5", "manifest": ROOT / "tools" / "ds4" / "download-3.5bpw.json", "weights_gb": 258,
                          "memory_gb": 280, "dir": DS4_35}}
-FAMILIES = ("glm", "deepseek")
+# MiniMax-M3.1-Flash: its own engine (src/mm3, build/maya-mm3) reads Mia-AiLab's EXL3 quant at 3.5 bits (EAQ v1) in place
+# from its safetensors; every file is pinned and checked (tools/mm3/download.json, its DSpark draft a download of its
+# own).  NVIDIA: the layers split across the GPUs, the most-routed experts in VRAM (data/expert-profile-mm3.bin), the
+# others computed on the CPU from RAM.  Its chat template is Maya's own (tools/mm3/chat_template.jinja: MiniMax's plus Off).
+MM3 = "MiniMax-M3.1-Flash"
+MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
+MM3_MANIFEST = ROOT / "tools" / "mm3" / "download.json"
+MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenizer.py", "tools/mm3/chat_template.jinja")
+MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
+# Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
+# Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
+# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD (HIP): experimental, as GLM's
+# EXL3 quants there - maya-mm3's EXL3 kernels take the shared exl3.cu's HIP paths (their tests pass on a Radeon 8065S).
+MM3_ALL_PLATFORMS = True
+MM3_MIN_CC = 70                                    # (with MM3_ALL_PLATFORMS: DeepSeek's EXL3 reach)
+MM3_MIN_CC_NOW = 80                                # (until then)
+MM3_TEST_CC_ENV = "MAYA_MM3_MIN_CC"                # (testing only: 70 lets the setup take a V100 - see mm3_min_cc)
+# Context: the model's own reach is 1M positions (config.json's max_position_embeddings).  With KV streaming (the
+# setup's default) every position's K / V sits in pinned RAM - per token, by the cache's format (maya-mm3 --kv-cache;
+# 60 layers x 4 KV heads x 128 dims x K and V, plus the scales) - and a ring of the newest 32K positions in VRAM; the
+# setup recommends the largest size whose cache fits beside the model in this PC's VRAM + RAM (mm3_recommended_context).
+MM3_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]
+MM3_DEFAULT_CONTEXT = 65536                        # (the smallest the setup recommends with the memory for it)
+MM3_TESTED_CONTEXT = 262144                        # (past it: not run end to end yet - said, as the dashboard does)
+# pinned RAM a context token, by --kv-cache format: half for K, half for V (the engine's row sizes: 60 x 4 rows of 256
+# bytes BF16, 128 + 4 INT8 / FP8, 64 + 8 FP4); "K,V" mixes add K's half and V's half
+MM3_KV_BYTES = {"bf16": 122880, "int8": 63360, "fp8": 63360, "fp4": 34560}
+MM3_KV_FORMAT = "int8"                             # the format the engine uses when the config names none
+MM3_MODEL_NAME = "minimax-m3.1-flash"
+# MiniMax's model card and generation_config.json (54e4e69): temperature 1.0, top-p 0.95 - no top-k, no min-p
+MM3_SAMPLING = {"temperature": 1.0, "top_p": 0.95}
+# thinking level for requests that name none: "auto" - the card names no default effort, so none is set and the
+# template's own default applies (adaptive: the model decides whether to think); the card's five efforts low .. max
+MM3_EFFORT = "auto"
+MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weights, the experts not in VRAM pinned
+MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
+# ... or Project Maya's own GGUF quants of it (tools/mm3/download_gguf.json, packed by tools/mm3/pack_gguf.py): the routed
+# experts in ~1.6 bits (Maya-XS, ~93 GB) or ~2.1 bits (Maya-S, ~122 GB) on maya-ds4's low-bit kernels - NVIDIA from V100
+# on and AMD (HIP), Linux and Windows; pictures and DSpark drafting from the companion files (MM3_COMPANIONS, below).
+# Listed (and offered) once published: until then --model minimax-maya-xs / minimax-maya-s (--mm3-quant gguf-xs /
+# gguf-s before) with --model-dir takes files already there.  Named as every Maya quant (tools/maya_quants.py): the
+# model first, in the repo peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF (Maya-XS/, Maya-S/), each in <models folder>/<its
+# full name> on this PC, its config maya-minimax-maya-xs.json; the manifest's "was": the names its files had before,
+# used as they are.
+MM3_GGUF_MANIFEST = ROOT / "tools" / "mm3" / "download_gguf.json"
+MM3_QUANTS = {"exl3": "EXL3 3.5 bits", "gguf-xs": "MiniMax-M3.1-Flash-Maya-XS", "gguf-s": "MiniMax-M3.1-Flash-Maya-S"}
+MM3_GGUF_PACK_TOOLS = ("tools/mm3/pack_gguf.py", "tools/ds4/pack_gguf.py", "tools/mm3/pack.py", "tools/mm3/st.py",
+                       "tools/mm3/chat_template.jinja")
+# the GGUFs' pictures and drafting: the EXL3 repo's vision tower (model-vision-00001-of-00001.safetensors, 1.7 GB, with
+# config.json / preprocessor_config.json) and DSpark draft (dspark/, 2.3 GB) - download.json's own pinned files, the same
+# for any quant - in <models folder>/MiniMax-M3.1-Flash-companions (the repo's layout; a whole EXL3 download beside the
+# GGUF serves as well), indexed by pack_gguf.py.  NVIDIA and AMD: the tower's and the draft's matrix products run on
+# cuBLAS / hipBLAS.
+MM3_COMPANIONS = "MiniMax-M3.1-Flash-companions"
+MM3_VISION_FILES = ("config.json", "preprocessor_config.json", "model-vision-00001-of-00001.safetensors")
+MM3_GGUF_MIN_CC = 70                               # (maya-ds4's GGUF kernels' reach: V100 on)
+FAMILIES = ("glm", "deepseek", "minimax")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
 def exe_for_target(target: str) -> Path:
     """The engine binary for a build target name ("maya" or "maya-ds4"; EXE's and DS4_EXE's own stems) - resolved
     fresh on every call since select_build_backend() reassigns EXE/DS4_EXE once the backend (cuda/hip) is known."""
-    return {"maya": EXE, "maya-ds4": DS4_EXE}[target]
+    return {"maya": EXE, "maya-ds4": DS4_EXE, "maya-mm3": MM3_EXE}[target]
 GLM_ARCHS = ("glm5-next", "glm5next")             # llama.cpp's spelling and unsloth's
 # the expert profile setup passes to every GLM config (tools/make_profile.py --glm):
 # its ranking of every (layer, expert) pair decides each layer's VRAM slots and which experts start there
@@ -587,6 +765,8 @@ def choose(question: str, intro: list, options: list, default: int, yes: bool, o
 def gpu_label(g) -> str:
     if g.get("vendor") == "amd":
         return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB, {g['arch']})"
+    if g.get("unified_memory"):
+        return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB shared with the system)"
     return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB)"
 
 
@@ -637,10 +817,11 @@ def fix_config_names(cfg: dict) -> bool:
 
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
-    global BUILD, EXE, STAMP, DS4_EXE
+    global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE
     BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
     EXE = BUILD / ("maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
+    MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     STAMP = BUILD / "MAYA-BUILD.json"
 
 
@@ -756,7 +937,7 @@ def install_rocm(a, chosen) -> None:
              "messages")
 
 
-def check_hip_pc(a, installed=False) -> dict:
+def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
         fail("Maya's experimental HIP backend runs on native Linux or Windows")
     if WIN and S.find_vcvars(cuda=False) is None:      # (before ROCm's download: ROCm's clang needs its headers)
@@ -844,7 +1025,8 @@ def check_hip_pc(a, installed=False) -> dict:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
     total, avail = mem_gb()
     split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
-    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}, text only")
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}" +
+       (", text only" if text_only else ""))
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if any(hip_unified_memory(g) for g in chosen) and WIN:
@@ -949,7 +1131,7 @@ def cuda_lib_dirs(nvcc: str) -> list:
 
 
 # ------------------------------------------------------------------------------------------------ 1. the PC
-def choose_gpus(a, found, min_cc: int = MIN_CC) -> list:
+def choose_gpus(a, found, min_cc: int = MIN_CC, family: str = "") -> list:
     """The GPUs the model runs on: --gpu / --gpus, else asked when several can share it (all of them recommended)."""
     byid = {g["index"]: g for g in found}
     usable = [g for g in found if int(g["arch"]) >= min_cc]
@@ -984,7 +1166,10 @@ def choose_gpus(a, found, min_cc: int = MIN_CC) -> list:
             labels.append(f"{gpu_label(gs[0])} + {gpu_label(gs[1])} together")
         else:
             labels.append(f"{gpu_label(gs[0])} only")
-    intro = (["DeepSeek-V4.1-Flash runs best on all of them: pairs of equal GPUs split each of their layers (tensor",
+    intro = (["MiniMax-M3.1-Flash runs best on all of them: the GPUs share the layers (or split them in groups where",
+              "that measures faster), and the more VRAM, the fewer experts the CPU computes."]
+             if family == "minimax" else
+             ["DeepSeek-V4.1-Flash runs best on all of them: pairs of equal GPUs split each of their layers (tensor",
               "parallel), the pairs take the layers in turn, and the more VRAM, the fewer experts the CPU computes."]
              if min_cc >= DS4_MIN_CC else
              ["Maya can run on one GPU, or split the model's layers across several: each then caches the experts "
@@ -1001,14 +1186,28 @@ def choose_gpus(a, found, min_cc: int = MIN_CC) -> list:
 def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3") -> dict:
     step(1, "checking this PC")
     ds4 = family == "deepseek"
+    mm3 = family == "minimax"
+    if mm3 and a.backend == "hip" and not gguf:   # (as GLM's EXL3 quants on AMD: experimental)
+        warn(f"{MM3}'s EXL3 quant on AMD is experimental: its kernels pass their tests on AMD GPUs, but the whole "
+             f"model has not been run on one yet - Maya's GGUF quants (--model minimax-maya-xs / minimax-maya-s) are the tested "
+             "way there")
+    if mm3 and WIN and not MM3_ALL_PLATFORMS:
+        fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
+             f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     if a.backend == "hip":
-        if ds4 and not gguf:
-            fail(f"{DS4}'s EXL3 quant runs on NVIDIA GPUs only (its prompt kernels have no HIP port)",
-                 f"set up its GGUF instead: {ME} --setup --model {DS4} --ds4-quant gguf-q8")
-        return check_hip_pc(a)
+        if ds4 and not gguf:   # (as GLM's and MiniMax's EXL3 quants on AMD: experimental)
+            warn(f"{DS4}'s EXL3 quants on AMD are experimental: their kernels pass their tests on AMD GPUs, but the "
+                 f"whole model has not been measured on one - Maya's GGUF quants (--model deepseek-maya-s / "
+                 "deepseek-maya-xs) are the tested way there")
+        return check_hip_pc(a, text_only=not mm3)
+    if ds4 and not gguf and S.ARM:
+        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): this CPU has neither
+        fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this ARM CPU does not have",
+             f"set up one of Maya's GGUF quants instead: {ME} --setup --model deepseek-maya-s (or deepseek-maya-xs)")
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
-    min_cc = (DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else MIN_CC
+    min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
+              else MIN_CC)
     if WIN:
         warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
@@ -1024,12 +1223,15 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         say(f"    {gpu_label(g)} - " + ("can be used" if int(g["arch"]) >= max(min_cc, VALIDATED_CC) else
                                        "can be used (Pascal: experimental)" if int(g["arch"]) >= min_cc else
                                        f"too old (this model needs compute capability {min_cc / 10:.1f} or newer)"))
-    chosen = choose_gpus(a, found, min_cc)
+    chosen = choose_gpus(a, found, min_cc, family)
     archs = sorted({int(g["arch"]) for g in chosen})
     vram = sum(g["vram_gb"] for g in chosen)
     ok("using " + " + ".join(gpu_label(g) for g in chosen) +
        (f": the model's layers are split across the {len(chosen)}" if len(chosen) > 1 else ""))
-    if vram < 23 and not ds4:
+    if any(g.get("unified_memory") for g in chosen):
+        say("  the GPU's memory is the system's RAM: the engine fills it with the most-used experts and leaves the "
+            "rest to the RAM tier and the SSD, so the free RAM at the start is what the pool can take")
+    if vram < 23 and not ds4 and not mm3:
         say(f"  {vram:.0f} GB of VRAM in total: the engine fills it with the most-used experts and serves the rest from "
             "RAM and the SSD - give it a try (more VRAM is faster; tell us your speed)")
     if min(archs) < VALIDATED_CC:
@@ -1121,7 +1323,9 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
              f"managed\" can stay small (8 GB on a 128 GB PC): set a custom size of {need_pf} GB or more - System > "
              "About > Advanced system settings > Performance > Advanced > Virtual memory - and restart")
     cpu, avx2, avx512 = S.cpu_info()
-    if not avx2:
+    if S.ARM:
+        ok(f"CPU: {cpu} (ARM64, {os.cpu_count()} threads; the expert kernels use ggml-cpu's NEON paths)")
+    elif not avx2:
         warn(f"the CPU ({cpu}) has no AVX2: the engine runs, its CPU expert lane on ggml's own kernels (slower; "
              "on 2x Xeon E5-2660 v2 it still added ~15% to 4-GPU decode). MAYA_GLM_CPU_LANE=0 turns it off")
     else:
@@ -1140,13 +1344,18 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
 
 
 # ------------------------------------------------------------------------------------------------ 2. choices
+def context_label(n: int) -> str:
+    """A context size as the menus show it: 32768 -> "32K", 1048576 -> "1M"."""
+    return f"{n // 1048576}M" if n % 1048576 == 0 else f"{n // 1024}K"
+
+
 def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT) -> int:
     if a.context:
         return a.context
     default = prev_ctx if prev_ctx in contexts else recommended
     pick = choose("Context?", ["Context length = how much text the model sees at once (the chat, files, tool output). "
                                "A longer one takes", "VRAM from the expert cache, so answers get a little slower:"],
-                  [(f"{c // 1024}K tokens", "recommended" if c == recommended else None, None) for c in contexts],
+                  [(f"{context_label(c)} tokens", "recommended" if c == recommended else None, None) for c in contexts],
                   contexts.index(default), a.yes)
     return contexts[pick]
 
@@ -1225,17 +1434,23 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
 
 
 def config_family(cfg: dict) -> str:
-    """"deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's --pack), else "glm"."""
-    args = cfg.get("args") or []
-    return "deepseek" if (cfg.get("installer") or {}).get("family") == "deepseek" or "--pack" in args[:-1] or \
-        Path(cfg.get("exe", "")).name.startswith(("maya-ds4", "strata-ds4")) else "glm"   # (before v1.1.16's names)
+    """"minimax" for a MiniMax-M3.1-Flash config (maya-mm3), "deepseek" for a DeepSeek-V4.1-Flash config (maya-ds4's
+    --pack), else "glm" (maya_quants.family_of: the server reads configs by it too)."""
+    return Q.family_of(cfg)
+
+
+def check_parallel(a, family: str) -> None:
+    if getattr(a, "parallel", None) is not None and family != "glm":
+        model = DS4 if family == "deepseek" else MM3
+        fail(f"--parallel is only supported by GLM-5.3-Flash; {model} serves one request at a time",
+             "remove --parallel; saved conversations do not enable simultaneous decoding")
 
 
 def choose_family(a, prev: dict) -> str:
     """"glm" or "deepseek": what the options say (--model, --gguf-dir, --draft), else asked - the model set up before
     is the default."""
     if a.model:
-        return "deepseek" if a.model == DS4 else "glm"
+        return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "glm"
     if a.gguf_dir or a.draft:
         return "glm"
     if a.model_dir:
@@ -1247,16 +1462,25 @@ def choose_family(a, prev: dict) -> str:
         have = None
     here = f" (this PC: {have:.0f} GB)" if have else ""
     rows = [("GLM-5.3-Flash", None,
-             "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (Maya-S to Maya-L, 95-156 GB) or turboderp's EXL3 "
-             "quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; NVIDIA (AMD: "
-             "experimental); pictures with its vision encoder."),
+             "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
+             "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
+             "NVIDIA (AMD: experimental); pictures with its vision encoder."),
             (DS4, "experimental",
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUFs (UD-Q8_K_XL 508 GB or "
-             "UD-Q4_K_XL 501 GB; NVIDIA from V100 on or AMD, Linux or Windows) or LibertAIDAI's EXL3 quants at 2.9 or "
+             "UD-Q4_K_XL 501 GB; NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
+             "Mix-256G, its refusals removed) or LibertAIDAI's EXL3 quants at 2.9 or "
              "3.5 bits with DeepSeek's two Engram tables (414 / 461 GB; NVIDIA V100 or newer, DSpark drafting, "
              "pictures from RTX 30 / A100 on); "
              f"fast with about {DS4_MEMORY_GB} GB of VRAM and RAM together{here}, with less the experts that do not "
-             "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context.")]
+             "fit are read from the SSD; tensor parallel across pairs of equal GPUs, a 256K context."),
+            (MM3, "new",
+             "MiniMax's MiniMax-M3.1-Flash (428B, 23B active per token) on its own engine: Mia-AiLab's EXL3 quant at "
+             f"3.5 bits (197 GB); NVIDIA {mm3_gpus()}{' on Linux and Windows (Windows: new)' if MM3_ALL_PLATFORMS else ' on Linux'}; about "
+             f"{MM3_MEMORY_GB} GB of VRAM and RAM together{here}; the layers split across the GPUs, the experts that "
+             "do not fit computed on the CPU; tool calls, MiniMax's thinking levels, pictures, DSpark drafting and "
+             "up to a 1M context" + ("; or Maya's own GGUF quants (MiniMax-M3.1-Flash-Maya-XS ~93 GB, -Maya-S ~122 "
+                                     "GB: NVIDIA from V100 on and AMD)"
+                                     if any(map(mm3_gguf_published, ("gguf-xs", "gguf-s"))) else "") + ".")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -1284,8 +1508,8 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     for q in opts:
         m, d = MODELS[q], download_dir(models, q)
         have = all(p.exists() for p in local_shards(m, d))
-        rows.append((f"{q}: " + (f"downloaded, in {d}" if have else f"download {m['download_gb']:.1f} GB from Hugging "
-                                                                     "Face"),
+        rows.append((f"{Q.shown('glm', q)}: " + (f"downloaded, in {d}" if have else
+                                                 f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else "experimental" if is_exl3(q) else None, m["about"]))
     pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
@@ -1333,12 +1557,10 @@ def cached_generator():
 
 
 def arch_setting(archs) -> str:
-    """CMAKE_CUDA_ARCHITECTURES for these GPUs.  CMakeLists.txt refuses an explicit arch below 75 (Strata's own
-    qwen4exp floor), but the GLM path is developed and measured on Volta V100s (sm_70) - so for those (and Pascal's
-    sm_6x, experimental) the build asks CMake for this machine's own GPUs ("native", which the guard leaves to
-    CMake), with CUDA_VISIBLE_DEVICES limited to the chosen cards.  RELEASE-CHECKLIST.md has the one-line CMake fix
-    that makes this unnecessary."""
-    return ";".join(str(x) for x in archs) if min(archs) >= 75 else "native"
+    """CMAKE_CUDA_ARCHITECTURES for these GPUs: the compute capabilities of the cards choose_gpus() took, by name -
+    never "native", which also builds for every other card in the PC (a Quadro P400 display card beside V100s: sm_61,
+    which maya-mm3's kernels cannot be compiled for).  CMakeLists.txt takes sm_60 and newer (Pascal experimental)."""
+    return ";".join(str(x) for x in archs)
 
 
 def toolkit_root_defs(nvcc) -> list:
@@ -1383,18 +1605,17 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
              "-DSTRATA_ENABLE_CUDA=ON", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
              "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF",
              f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}"]
+    if S.ARM and S.arm_cpu_arch():
+        conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     if host_compiler:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(host_compiler) or host_compiler}")
-    # "native" is what CMake sees: only the chosen cards, numbered as nvidia-smi numbers them
+    # (CMake's compiler checks see only the chosen cards, numbered as nvidia-smi numbers them)
     env = dict(os.environ, CUDA_DEVICE_ORDER="PCI_BUS_ID", CUDA_VISIBLE_DEVICES=",".join(str(i) for i in gpu_ids))
     # nvcc takes 2-4 GB per job on the big kernels: half the threads, and no more jobs than RAM / 4 GB
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
     build = [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)]
     say("  Compiling the engine for " + ", ".join(f"sm_{x}" for x in archs) +
         " (10-30 minutes the first time, a few minutes after an update) ...")
-    if cuda_archs == "native":
-        say("  (CMakeLists.txt refuses an explicit sm_70 - Maya's own floor is sm_75 - so CMake is asked for this")
-        say(f"  machine's GPUs instead: CMAKE_CUDA_ARCHITECTURES=native with CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']})")
     stopped = cmake_steps(conf, build, env, "build-maya.bat", nvcc=nvcc)
     if stopped:
         return stop(stopped)
@@ -1622,8 +1843,8 @@ def refresh_engine(cfg: dict) -> None:
     """At a start: the engine's source changed since it was compiled (a git pull) - compile what changed."""
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
-    target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya"
-    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve()):
+    target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else "maya"
+    if not meta or exe not in (EXE.resolve(), DS4_EXE.resolve(), MM3_EXE.resolve()):
         return
     src = S.source_hash(S.ENGINE_SOURCES)
     if meta.get("src") == src:
@@ -1813,6 +2034,20 @@ def file_url(m: dict, name: str) -> str:
     return hf_url(repo, revision, m["folder"], name)
 
 
+def hf_token() -> str | None:
+    """The user's Hugging Face token, for a gated repo's files (download_gguf.json's "gated"): HF_TOKEN (or
+    HUGGING_FACE_HUB_TOKEN), else the one `hf auth login` saved (<HF_HOME, or ~/.cache/huggingface>/token)."""
+    for k in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        if os.environ.get(k, "").strip():
+            return os.environ[k].strip()
+    try:
+        t = (Path(os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "token").read_text(
+            encoding="utf-8").strip()
+    except OSError:
+        return None
+    return t or None
+
+
 # curl's part of every model download: resume a file where it stopped, and give up on a connection that stalls (under
 # 1 KB/s for a minute) so it is run again instead of hanging
 CURL_RESUME = ["-C", "-", "--speed-limit", "1024", "--speed-time", "60", "--connect-timeout", "30"]
@@ -1820,23 +2055,44 @@ DL_JOBS = 4         # files fetched at once (Hugging Face sends several streams 
 DL_STUCK = 30       # runs of curl in a row that add nothing to a file before the setup gives up on it
 
 
+def curl_drops_auth(curl: str) -> bool:
+    """Whether this curl leaves a custom Authorization header out of a redirect to another host (7.58.0 and later -
+    a gated repo's files redirect to its CDN, which must not get the token); False when its version cannot be read."""
+    try:
+        out = subprocess.run([curl, "--version"], capture_output=True, text=True, timeout=20).stdout
+        v = tuple(int(x) for x in re.match(r"curl (\d+)\.(\d+)", out).groups())
+    except (OSError, subprocess.SubprocessError, AttributeError, ValueError):
+        return False
+    return v >= (7, 58)
+
+
 def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
     """The missing files with curl, DL_JOBS at a time, each resumed where it stopped and run again whenever its
     connection drops or stalls - a download stopped half way (a dropped line, Ctrl+C, a restart) loses nothing: the
-    next run continues every file from its size on disk.  One line says how far the model is."""
+    next run continues every file from its size on disk.  One line says how far the model is.  A gated repo's ("gated"):
+    the token in an Authorization header, read by curl from a file only the user can read (not on its command line)."""
     want = {s: (m.get("files") or {}).get(hf_name(m, s)) for s in shards}
-    total = sum(want.values()) if all(want.values()) else m.get("download_gb", 0) * 1e9
-    size = lambda s: s.stat().st_size if s.exists() else 0   # noqa: E731
+    auth = None
+    token = hf_token() if m.get("gated") else None
     queue, running = list(missing), {}
-    stuck, after, start_size = {s: 0 for s in missing}, {s: 0.0 for s in missing}, {}
-    t0, base, last = time.time(), sum(size(s) for s in shards), 0.0
-    try:
+    try:   # (from here: whatever happens, the finally removes the token's file)
+        if token:
+            import tempfile
+            auth = Path(tempfile.mkdtemp(prefix="maya-hf-")) / "header"   # (mkdtemp's folder: the user's alone)
+            fd = os.open(auth, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"Authorization: Bearer {token}\n")
+        total = sum(want.values()) if all(want.values()) else m.get("download_gb", 0) * 1e9
+        size = lambda s: s.stat().st_size if s.exists() else 0   # noqa: E731
+        stuck, after, start_size = {s: 0 for s in missing}, {s: 0.0 for s in missing}, {}
+        t0, base, last = time.time(), sum(size(s) for s in shards), 0.0
         while queue or running:
             now = time.time()
             for s in [q for q in queue if after[q] <= now][:max(0, DL_JOBS - len(running))]:
                 queue.remove(s)
                 start_size[s] = size(s)
-                cmd = ["curl", "-sS", "-L", "--fail"] + CURL_RESUME + ["-o", str(s), urls[s]]
+                cmd = ["curl", "-sS", "-L", "--fail"] + (["-H", f"@{auth}"] if auth else []) + CURL_RESUME + \
+                    ["-o", str(s), urls[s]]
                 running[s] = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                               stderr=subprocess.PIPE)
             time.sleep(1)
@@ -1872,6 +2128,12 @@ def fetch_files(m: dict, shards: list, missing: list, urls: dict) -> None:
     finally:
         for p in running.values():   # (stopped half way: no curl keeps writing behind the setup's back)
             p.terminate()
+        if auth is not None:
+            auth.unlink(missing_ok=True)
+            try:
+                auth.parent.rmdir()
+            except OSError:
+                pass
         S.progress()
 
 
@@ -1885,6 +2147,8 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     remaining = max(0.0, m["download_gb"] - on_disk)
     free = shutil.disk_usage(existing(d)).free / 1e9
     curl = shutil.which("curl")
+    if curl and m.get("gated") and not curl_drops_auth(curl):   # (an old curl would send the token on to the CDN)
+        curl = None
     cmds = [["mkdir"] + ([] if WIN else ["-p"]) + [str(d)]] + \
         [["curl", "-L", "--fail", "--retry", "5"] + CURL_RESUME + ["-o", str(s), urls[s]] for s in missing]
     say(f"  {quant}: {m['about']}.")
@@ -1893,20 +2157,30 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     for repo in dict.fromkeys(r for r, _ in (m.get("sources") or {}).values()):
         names = [n for n, (r, _) in m["sources"].items() if r == repo]
         say(f"  And from https://huggingface.co/{repo}: " + ", ".join(names))
+    token = hf_token() if m.get("gated") else None
+    if m.get("gated"):
+        say(f"  The repo is gated: accept its terms at https://huggingface.co/{m['repo']} with your account; the download "
+            "sends your Hugging Face token (" + ("found" if token else "none found here") + ").")
     say(f"  The model is {m['download_gb']:.1f} GB in {len(shards)} file{'s' if len(shards) != 1 else ''}; "
         f"{len(missing)} still to download, about "
         f"{remaining:.0f} GB, into")
     say(f"    {d}   ({free:.0f} GB free there)")
-    if free < remaining + 3:
-        fail(f"not enough free space in {d}: about {remaining + 3:.0f} GB are needed (the model + its pack)",
+    also = float(m.get("also_gb") or 0)   # (what the setup downloads after it, beside it: the space for both)
+    if also:
+        say(f"  Then {m.get('also_what', 'more files')}: {also:.0f} GB more.")
+    if free < remaining + also + 3:
+        fail(f"not enough free space in {d}: about {remaining + also + 3:.0f} GB are needed (the model" +
+             (f", {m.get('also_what', 'more files')}" if also else "") + " + its pack)",
              f"free some space, or put the model on another drive: {ME} --setup --models-dir " +
              (r"D:\Maya-models" if WIN else "/path/on/nvme"))
     if rotational(d):
         warn(f"{d} is on a spinning hard disk: the engine reads experts from these files while it answers - use an "
              "NVMe SSD (--models-dir)")
     say("  The exact commands (resumable: running them again continues an interrupted download):")
-    for c in cmds:
-        say("    " + shell_join(c))
+    bearer = '-H "Authorization: Bearer %HF_TOKEN%" ' if WIN else '-H "Authorization: Bearer $HF_TOKEN" '
+    for c in cmds:   # (a gated repo's: the token as the shell expands it, never the token itself)
+        line = shell_join(c)
+        say("    " + ("curl " + bearer + line[5:] if m.get("gated") and c[0] == "curl" else line))
     if "files" in m:                                   # (--gguf-dir takes GGUF files only)
         say(f"  You can also run them yourself (or download the files any other way into that folder), then run {ME}")
         say("  again.")
@@ -1916,6 +2190,10 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
     if not curl:
         warn("curl is not installed" + ("" if WIN else " (sudo apt-get install -y curl)") + ": if you say yes, the "
              "same URLs are downloaded with Python instead (also resumable)")
+    if m.get("gated") and not token and missing:
+        fail(f"{m['repo']} is gated and no Hugging Face token was found",
+             f"accept its terms at https://huggingface.co/{m['repo']}, then set HF_TOKEN (a read token from "
+             f"https://huggingface.co/settings/tokens) or run `hf auth login`, and run {ME} again")
     if not a.download_model and ask(f"  Download about {remaining:.0f} GB now with these commands? (y/n)",
                                     ["y", "n"], "n", False) != "y":
         say()
@@ -1927,7 +2205,7 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
         fetch_files(m, shards, missing, urls)
     for s in missing:
         if not curl:
-            S.download(urls[s], s)
+            S.download(urls[s], s, headers={"Authorization": f"Bearer {token}"} if token else None)
         why = file_incomplete(m, s)
         if why:
             fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
@@ -2143,6 +2421,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
              "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
              f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
              *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
+    if S.ARM and S.arm_cpu_arch():
+        conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
     if meta.get("host_compiler"):
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
@@ -2377,6 +2657,18 @@ def flag_value(args: list, flag: str):
     return args[args.index(flag) + 1] if flag in args[:-1] else None
 
 
+def tp_keepable(old: dict, pc: dict) -> bool:
+    """Whether the config before's --tp (tensor-parallel group size) may stay: it was written for the same GPUs as
+    chosen now (its "gpu" list), and it still fits them.  Else a setup works --tp out again from the GPUs (#436)."""
+    try:
+        now = [int(g["index"]) for g in pc.get("gpus") or []]
+        before = [int(i) for i in old.get("gpu") or []]
+        tp = int(flag_value(old.get("args") or [], "--tp") or 1)
+    except (TypeError, ValueError, KeyError):
+        return False
+    return bool(now) and before == now and 1 <= tp <= len(now)
+
+
 def add_profile(cfg: dict) -> bool:
     """A GLM config with no --expert-profile (written before setup passed one) gets the shipped profile, as a setup
     would write it: an update restarts the installed config without setting up again.  True when `cfg` changed."""
@@ -2505,6 +2797,9 @@ def calibrate_config(cfg_path: Path) -> bool:
     cfg = read_json(cfg_path)
     if config_family(cfg) == "deepseek":
         return calibrate_ds4_config(cfg_path)
+    if config_family(cfg) == "minimax":   # (maya-mm3 sizes its CPU lane by this PC's cores and its pools by its memory:
+        #  what it reads prompts with is measured - the prefill calibration)
+        return prefill_calibration(cfg_path, "asked for")
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
         return False
@@ -2594,7 +2889,9 @@ def calibrate_ds4_config(cfg_path: Path) -> bool:
         warn(f"could not save {CAL_STORE} ({e}): {cfg_path.name} has the settings, a setup again does not")
     r = res["report"]
     speed = f" ({r['tok_s']} tok/s answering, the config's own {r['own_tok_s']})" if r.get("tok_s") else ""
-    ok(f"tuned for this PC: {ds4_tuned(res['args'])}{speed}")
+    groups = r.get("effective_tp")
+    effective = "/".join(map(str, groups)) if groups is not None else "unknown"
+    ok(f"tuned for this PC: {ds4_tuned(res['args'])}; effective TP per GPU: {effective}{speed}")
     return True
 
 
@@ -2620,7 +2917,7 @@ def needs_speed_calibration(cfg: dict) -> bool:
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
     the engine then decodes without the drafter."""
     args = cfg.get("args") or []
-    if config_family(cfg) == "deepseek":               # (its DSpark drafter: measured once too)
+    if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
         return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {})
     return "--dflash" in args[:-1] and parallel_of(cfg) <= 1 and \
         "speed_calibration" not in (cfg.get("installer") or {})
@@ -2633,7 +2930,7 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     that chooses DFlash2, or --speed-calibration, measures again.  False: not measured (the reason is shown; nothing
     changed, and a failure is recorded so that a start does not try again by itself)."""
     cfg = read_json(cfg_path)
-    if config_family(cfg) == "deepseek":
+    if config_family(cfg) in ("deepseek", "minimax"):
         return speed_calibration_ds4(cfg_path, cfg, why)
     drafter = drafter_file(cfg)
     if drafter is None or not drafter.is_file():
@@ -2703,12 +3000,62 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     return True
 
 
+def needs_prefill_calibration(cfg: dict) -> bool:
+    """A MiniMax config whose prompt settings were never measured on this PC (set up before there was the prefill
+    calibration): its next start measures them once (a failed one is not tried again by itself: --calibrate)."""
+    return config_family(cfg) == "minimax" and "prefill_calibration" not in (cfg.get("installer") or {})
+
+
+def prefill_calibration(cfg_path: Path, why: str = "") -> bool:
+    """MiniMax's prefill calibration (tools/calibrate_mm3_prefill.py): the chunk a prompt is read in and the dense GEMMs'
+    backend, measured on this PC by the engine itself and kept by it for this PC (the pack's prefill-tune.txt, read at
+    every start); the result also in the config (installer.prefill_calibration).  False: not measured (the reason is
+    shown; the engine then reads prompts with its defaults)."""
+    cfg = read_json(cfg_path)
+    busy = busy_gpus(cfg)
+    if busy:
+        warn("the prefill calibration needs the GPU(s) to itself: " +
+             ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
+             f" (a model server still running?) - {ME} --calibrate measures it later")
+        return False
+    say()
+    say(f"  Prefill calibration: how this PC reads prompts fastest" + (f" ({why})" if why else ""))
+    say("  The engine reads a ~4K-token text with a few settings - the chunk of tokens a step takes, and the matrix")
+    say("  products' library - and keeps the fastest for this PC. One start of the model; a few minutes.")
+    log = cfg.get("log")
+    since = os.path.getsize(log) if log and os.path.isfile(log) else 0
+    try:
+        res = CPF.run(cfg, say=say)
+    except Exception as e:                             # never stops a setup or a start: the engine's defaults stay
+        warn(f"the prefill calibration did not finish ({e}): the engine reads prompts with its defaults; "
+             f"{ME} --calibrate tries again")
+        why_not = CAL.engine_error(log, since)
+        if why_not:
+            say(f"       the engine said: {why_not}")
+        cfg.setdefault("installer", {})["prefill_calibration"] = {"date": time.strftime("%Y-%m-%d %H:%M"),
+                                                                  "failed": str(e)[:300]}
+        cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+        return False
+    cfg.setdefault("installer", {})["prefill_calibration"] = {
+        "date": time.strftime("%Y-%m-%d %H:%M"), "version": maya_version(), "chunk": res.get("chunk"),
+        "gemm": res.get("gemm"), "tok_s": res.get("tok_s"), "default_tok_s": res.get("default_tok_s"),
+        "tokens": res.get("tokens"), "file": res.get("file")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    t, d = res.get("tok_s") or 0, res.get("default_tok_s") or 0
+    gemm = {"hipblaslt": "hipBLASLt", "blas": "the BLAS's"}.get(res.get("gemm"), res.get("gemm"))
+    gain = f" (+{(t / d - 1) * 100:.0f}% over the defaults' {d:.0f})" if d > 0 and t > d * 1.005 else \
+        " (the engine's defaults are the fastest here)"
+    ok(f"prefill calibration: chunks of {res.get('chunk')} tokens, {gemm} matrix products - {t:.0f} tokens/s "
+       f"reading a {res.get('tokens')}-token prompt{gain}; kept for this PC")
+    return True
+
+
 def speed_calibration_ds4(cfg_path: Path, cfg: dict, why: str = "") -> bool:
-    """DeepSeek's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark drafter and
-    without it (--dspark none), measured on this PC's GPUs; the config keeps the faster - the drafter only when it wins
-    by more than CDS.MIN_GAIN - and the result (installer.speed_calibration)."""
+    """DeepSeek's and MiniMax's speed calibration (tools/calibrate_ds4.py): the sustained decode speed with the DSpark
+    drafter and without it (--dspark none / off), measured on this PC's GPUs; the config keeps the faster - the drafter
+    only when it wins by more than CDS.MIN_GAIN - and the result (installer.speed_calibration)."""
     if not CDS.has_drafter(cfg):
-        warn(f"the speed calibration compares DeepSeek's DSpark drafter with no drafting, and this pack has no "
+        warn(f"the speed calibration compares the model's DSpark drafter with no drafting, and this pack has no "
              f"drafter: {ME} --setup downloads it")
         return False
     busy = busy_gpus(cfg)
@@ -2775,7 +3122,7 @@ def keep_drafting(cfg_path: Path, on: bool) -> None:
     installer.speed_calibration records the choice - so a start does not measure by itself (--speed-calibration
     measures any time)."""
     cfg = read_json(cfg_path)
-    ds4 = config_family(cfg) == "deepseek"
+    ds4 = config_family(cfg) in ("deepseek", "minimax")   # (DSpark: DeepSeek's and MiniMax's drafter)
     if ds4:
         out, kept = CDS.with_dspark(cfg, "on" if on else "none"), ("dspark" if on else "none")
     else:
@@ -2801,6 +3148,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     """The dashboard's server for an installed config: (its command, its environment, what the setup's screen shows of
     it).  The engine is compiled again first when its source changed (an update)."""
     cfg = read_json(cfg_path)
+    check_parallel(a, config_family(cfg))
     rename_programs()
     renamed = fix_config_names(cfg)                    # (v1.1.16's names: the programs, and the settings as MAYA_*)
     try:
@@ -2818,7 +3166,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
     ds4 = config_family(cfg) == "deepseek"
-    flag = "--pack" if ds4 else "--glm-pack"
+    flag = "--glm-pack" if config_family(cfg) == "glm" else "--pack"   # (maya-ds4 and maya-mm3: --pack)
     pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None
     for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
@@ -2847,8 +3195,13 @@ def server_command(cfg_path: Path, a) -> tuple:
         ok(f"{cfg_path.name}: starts from DeepSeek's shipped expert profile ({DS4_PROFILE.name}, copied into the pack)")
     cfg_path.touch()                                   # the most recently used model
     refresh_engine(cfg)
+    if needs_prefill_calibration(cfg):                 # MiniMax set up before the prefill calibration: measured once
+        prefill_calibration(cfg_path, "once, for a setup from before it")
+        cfg = read_json(cfg_path)
+        args = cfg.get("args") or []
     if needs_speed_calibration(cfg):                   # a drafter set up without its speed calibration: measured once
-        drafter = "DeepSeek's DSpark drafter" if config_family(cfg) == "deepseek" else "DFlash2"
+        drafter = {"deepseek": "DeepSeek's DSpark drafter", "minimax": "MiniMax's DSpark drafter"}.get(
+            config_family(cfg), "DFlash2")
         if speed_calibration(cfg_path, f"once, for a setup that drafts with {drafter}"):
             cfg = read_json(cfg_path)
             args = cfg.get("args") or []
@@ -2869,6 +3222,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else None
     gpus = str(a.gpus or a.gpu if a.gpus or a.gpu is not None else cfg.get("gpu", 0)).strip("[]").split(",")
     info = {"model": cfg.get("model_name", MODEL_NAME), "quant": (cfg.get("installer") or {}).get("quant"),
+            "label": Q.config_label(cfg),                # ("MiniMax M3.1 · Maya-XS": what the screen's card shows)
             "context": ctx, "dashboard": f"http://{here}:{port}/", "api": f"http://{here}:{port}/v1",
             "log": cfg.get("log"), "key": (key or "").split(",")[0],      # (its dashboard reads /metrics with it)
             "gpus": [int(g) for g in gpus if g.strip().isdigit()]}         # (its load: one part each, in this order)
@@ -2880,7 +3234,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         return cmd, env, info
     say()
     say("  " + "-" * 100)
-    say(f"  Starting {cfg.get('model_name', MODEL_NAME)} ({cfg_path.name}).")
+    say(f"  Starting {info['label'] or cfg.get('model_name', MODEL_NAME)} ({cfg_path.name}).")
     say(f"  Dashboard:        http://{here}:{port}/")
     say(f"  API (OpenAI):     http://{here}:{port}/v1        (any model name; the API key: "
         + ("the one you set)" if key else "any)"))
@@ -2888,7 +3242,10 @@ def server_command(cfg_path: Path, a) -> tuple:
     if host not in ("127.0.0.1", "localhost", "::1"):
         say("  Other devices:    the server prints this machine's addresses when it is ready" +
             ("" if key else " - WARNING: no API key, anyone on your network can use it (--api-key KEY)"))
-    if ds4:
+    if config_family(cfg) == "minimax":
+        say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used and keeps")
+        say("  the rest in pinned RAM for its CPU lane - the first answers are the slowest.")
+    elif ds4:
         say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used, copies the")
         say("  rest into RAM for its CPU lane and pins them - the first answers are the slowest.")
     else:
@@ -2993,13 +3350,28 @@ def after_server(rc: int, a) -> int:
     again = [sys.executable, str(HERE / "maya.py"), "--yes"]
     # (a new port from the dashboard: not this start's --port - the config's, which it saved, applies)
     port = None if rc == RESTART_EXIT else a.port
-    for flag, v in (("--backend", a.backend), ("--port", port), ("--host", a.host), ("--api-key", a.api_key),
-                    ("--gpu", a.gpu), ("--gpus", a.gpus), ("--config", getattr(a, "config", None))):
+    backend, config = a.backend, getattr(a, "config", None)
+    # the Models page: another model to start (a switch), or this one with its new engine settings - the server's
+    # note says which config, on the port it listened on (so the page finds it again)
+    note = read_json(ROOT / SWITCH_FILE) if rc == RESTART_EXIT else {}
+    try:
+        (ROOT / SWITCH_FILE).unlink()
+    except OSError:
+        pass
+    why = None
+    if note.get("config") and Path(note["config"]).is_file() and time.time() - float(note.get("time") or 0) < 600:
+        config, why = Path(note["config"]), note.get("why")
+        backend = read_json(config).get("backend", "cuda")
+        port = note.get("port") or port
+    for flag, v in (("--backend", backend), ("--port", port), ("--host", a.host), ("--api-key", a.api_key),
+                    ("--gpu", a.gpu), ("--gpus", a.gpus), ("--config", config)):
         if v is not None:
             again += [flag, str(v)]
     say()
-    say("  The port changed from the dashboard: starting Maya again on it ..." if rc == RESTART_EXIT else
-        "  Updated from the dashboard: starting the new version ...")
+    say("  Updated from the dashboard: starting the new version ..." if rc != RESTART_EXIT else
+        f"  Switching to {config.name} from the dashboard ..." if why == "switch" else
+        f"  {config.name}'s engine settings changed from the dashboard: starting Maya again with them ..."
+        if why == "settings" else "  The port changed from the dashboard: starting Maya again on it ...")
     sys.stdout.flush()
     if WIN:
         return subprocess.call(again)
@@ -3161,7 +3533,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
             gb = sum(p.stat().st_size for p in d.glob("*.gguf")) / 1e9
             where = (f"\nmodel folder {d}: {gb:.1f} GB of GGUF, {shutil.disk_usage(d).free / 1e9:.0f} GB free, "
                      f"{'a spinning hard disk' if rotational(d) else 'not a hard disk'}")
-        add(f"Setup {c.name}", f"model {(cfg.get('installer') or {}).get('quant', '?')}, context {ctx}, "
+        add(f"Setup {c.name}", f"model {Q.config_label(cfg) or '?'} ({Q.config_key(cfg) or '?'}), context {ctx}, "
                                f"GPUs {cfg.get('gpu')}, images {images}, "
                                f"settings {json.dumps(cfg.get('env') or {})}" + where)
         log = Path(cfg.get("log") or c.with_suffix(".log"))
@@ -3346,11 +3718,14 @@ def set_up(a, prev: dict) -> Path | None:
     config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
     Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
     family = choose_family(a, prev)
+    check_parallel(a, family)
     if config_family(prev) != family:
         prev = next((c for c in map(read_json, configs()) if config_family(c) == family and
                      c.get("backend", "cuda") == a.backend), {})
     if family == "deepseek":
         return set_up_ds4(a, prev)
+    if family == "minimax":
+        return set_up_mm3(a, prev)
     inst = prev.get("installer") or {}
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
@@ -3365,7 +3740,7 @@ def set_up(a, prev: dict) -> Path | None:
               Path(inst["data_dir"]) / "models" if inst.get("data_dir") else ROOT.parent / "Maya-data" / "models")
     choice = choose_model(a, models, inst)
     if choice[0] == "download":
-        ok(f"model: {choice[1]}, in {download_dir(models, choice[1])}")
+        ok(f"model: {Q.shown('glm', choice[1])}, in {download_dir(models, choice[1])}")
     else:
         ok(f"model: {choice[1]} (yours)")
     draft = choose_draft(a, pc, inst)
@@ -3415,10 +3790,22 @@ def ds4_maya_published(quant: str) -> bool:
 
 def ds4_gguf_model(quant: str) -> dict:
     """A GGUF of DeepSeek as a MODELS entry (offer_download's form): its shards, sizes, sha256, repo folder - unsloth's,
-    or Maya's (the Engram tables in its own shards) - and "earlier": the layouts its files had before, each in the
-    same form (ds4_earlier)."""
+    Maya's (the Engram tables in its own shards) or orcarouter's abliterated one ("gated": its download sends a token) -
+    and "earlier": the layouts its files had before, each in the same form (ds4_earlier)."""
     man = read_json(DS4_GGUF_MANIFEST)
-    if quant in DS4_MAYA:
+    gated = False
+    if quant in DS4_ABL:
+        ab = man.get("abliterated") or {}
+        q = (ab.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
+        if not q.get("files"):
+            fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+        about, repo, revision = (f"{ab.get('name', DS4 + '-abliterated')} {DS4_QUANTS[quant]}, orcarouter's abliterated "
+                                 f"model as GGUFs ({q.get('about', 'the experts in 2-4 bits')}; its shard 2, the n-gram "
+                                 "table alone, left out: Maya's Q6_K tables are read instead)", ab["repo"],
+                                 ab["revision"])
+        gated = bool(ab.get("gated"))
+        q = dict(q, files={k: v for k, v in q["files"].items() if k != q.get("table")})
+    elif quant in DS4_MAYA:
         my = man.get("maya") or {}
         q = (my.get("quants") or {}).get(DS4_QUANTS[quant]) or {}
         if not q.get("files"):
@@ -3438,8 +3825,10 @@ def ds4_gguf_model(quant: str) -> dict:
         files = {Path(k).name: v for k, v in files.items()}
         return {"about": about, "format": "ds4-gguf", "repo": repo, "revision": rev, "folder": DS4_QUANTS[quant],
                 "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
-                "download_gb": sum(v[0] for v in files.values()) / 1e9}
+                "download_gb": sum(v[0] for v in files.values()) / 1e9, **({"gated": True} if gated else {})}
     m = form(q["files"], revision)
+    if quant in DS4_ABL and q.get("table"):
+        m["table"] = Path(q["table"]).name   # (listed in the manifest, never fetched)
     m["earlier"] = [dict(form(e["files"], e["revision"]), engram=[form(s, e["revision"]) for s in e.get("engram") or []])
                     for e in q.get("earlier") or []]
     return m
@@ -3515,7 +3904,7 @@ def ds4_quant_drafter(quant: str) -> dict | None:
     if not dr.get("files") or not dr.get("json"):
         return None
     files = {Path(k).name: v for k, v in dr["files"].items()}
-    return {"about": f"{DS4_QUANTS[quant]}'s DSpark drafter ({dr.get('about', 'its own formats')})",
+    return {"about": f"{Q.shown('deepseek', quant)}'s DSpark drafter ({dr.get('about', 'its own formats')})",
             "format": "ds4-drafter", "repo": my["repo"], "revision": my["revision"], "folder": "dspark",
             "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
             "download_gb": sum(v[0] for v in files.values()) / 1e9, "json": dr["json"]}
@@ -3590,7 +3979,8 @@ def ds4_pack_has_vision(pack: Path) -> bool:
 
 def ds4_vision_blocker(pc: dict) -> str | None:
     """Why the vision tower cannot run on this PC, or None: it needs ~1 GB of RAM (its weights, streamed from there)
-    and ~350 MB of the first GPU's memory - every GPU the GGUF path runs on has the BF16 matrix products it uses."""
+    and, while a picture is read, ~320 MB of the first GPU's memory (lent, none between pictures) - every GPU the GGUF
+    path runs on has the BF16 matrix products it uses."""
     total = mem_gb()[0]
     if 0 < total < 16:
         return f"{total:.0f} GB of RAM is too little beside the model"
@@ -3612,8 +4002,8 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
         return False
     v = ds4_vision_dir(d)
     if (v / "vision.bin").is_file() and (v / "vision.json").is_file():
-        ok(f"the vision tower: {v / 'vision.bin'} (on the first GPU, about 320 MB of its memory, the weights streamed "
-           "from RAM; the server resizes the pictures)")
+        ok(f"the vision tower: {v / 'vision.bin'} (its weights in RAM; no VRAM between pictures - about 320 MB of the "
+           "first GPU's while one is read; the server resizes the pictures)")
         return True
     if not os.access(existing(v), os.W_OK):
         warn(f"{existing(v)} is not writable: no vision tower, the model reads text only")
@@ -3635,44 +4025,199 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
         return False
     for f in files:                                    # (the setup's own download, now in vision.bin)
         f.unlink(missing_ok=True)
-    ok(f"the vision tower: {v / 'vision.bin'} (on the first GPU, about 320 MB of its memory, the weights streamed from "
-       "RAM; the server resizes the pictures)")
+    ok(f"the vision tower: {v / 'vision.bin'} (its weights in RAM; no VRAM between pictures - about 320 MB of the first "
+       "GPU's while one is read; the server resizes the pictures)")
     return True
 
 
 def choose_ds4_quant(a, prev: dict) -> str:
     """--ds4-quant, else the one set up before, else asked (the GGUF at Q8 recommended)."""
     if getattr(a, "ds4_quant", None):
-        return a.ds4_quant
+        return ds4_abl_recommended(getattr(a, "backend", None) == "hip") if a.ds4_quant == DS4_ABL_ALIAS else a.ds4_quant
     hip = getattr(a, "backend", None) == "hip"
     maya = [k for k in DS4_MAYA if ds4_maya_published(k)]
-    # the EXL3 quants only where they run: NVIDIA V100 or newer (compute capability 7.0+; not AMD yet) - a PC whose
-    # GPUs are all older is not offered them (nvidia-smi silent: offered, the PC check says)
+    # the EXL3 quants where they run: NVIDIA V100 or newer (compute capability 7.0+), and AMD (experimental, as GLM's
+    # EXL3 quants there) - a PC whose NVIDIA GPUs are all older is not offered them (nvidia-smi silent: offered, the
+    # PC check says)
     try:
         ccs = [] if hip else [int(g["arch"]) for g in S.gpus()]
     except Exception:  # noqa: BLE001 - no NVIDIA tools
         ccs = []
-    exl3_ok = not hip and (not ccs or max(ccs) >= DS4_MIN_CC)
-    keys = maya + [k for k in DS4_QUANTS if k not in DS4_MAYA and (exl3_ok or k not in DS4_EXL3)]
+    exl3_ok = hip or not ccs or max(ccs) >= DS4_MIN_CC
+    keys = maya + list(DS4_ABL) + [k for k in DS4_QUANTS if k not in DS4_MAYA + DS4_ABL and (exl3_ok or k not in DS4_EXL3)]
+    abl = ds4_abl_recommended(hip)
     before = (prev.get("installer") or {}).get("ds4_quant")
     default = before if before in keys else maya[0] if maya else DS4_DEFAULT_QUANT
-    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya}
-    label = {"maya-s": (f"Maya-S ({gb.get('maya-s', 0):.0f} GB)", "Maya's quant: experts in 2-3 bits, the most of it in memory"),
-             "maya-m": (f"Maya-M ({gb.get('maya-m', 0):.0f} GB)", "Maya's quant: experts in 3.4 bits, closer to the original"),
-             "maya-xs": (f"Maya-XS ({gb.get('maya-xs', 0):.0f} GB)",
-                         "Maya's smallest quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory"),
-             "gguf-q8": ("GGUF UD-Q8_K_XL (508 GB)", "dense weights BF16, experts MXFP4 (DeepSeek's own formats)"),
-             "gguf-q4": ("GGUF UD-Q4_K_XL (501 GB)", "dense weights Q8_0 (less VRAM), experts MXFP4"),
-             "exl3": ("EXL3 2.9 bits (414 GB)", "with the DSpark drafter and the vision tower"),
-             "exl3-3.5": (f"EXL3 3.5 bits ({ds4_model('exl3-3.5')['download_gb']:.0f} GB)",
-                          f"closer to the original, slower: ~{DS4_EXL3['exl3-3.5']['memory_gb']} GB of VRAM + RAM hold it")}
+    gb = {k: ds4_gguf_model(k)["download_gb"] for k in maya + [k for k in DS4_ABL if k in keys]}
+    for k in DS4_ABL:   # (as the other entries: the whole download, Maya's n-gram tables with it)
+        gb[k] += ds4_abl_engram_gb()
+    gb.update({"gguf-q8": 508, "gguf-q4": 501, "exl3": 414})
+    if "exl3-3.5" in keys:
+        gb["exl3-3.5"] = ds4_model("exl3-3.5")["download_gb"]
+    about = {"maya-s": "Maya's quant: experts in 2-3 bits, the most of it in memory",
+             "maya-m": "Maya's quant: experts in 3.4 bits, closer to the original",
+             "maya-xs": "Maya's smallest quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory",
+             "gguf-q8": "unsloth's GGUF: dense weights BF16, experts MXFP4 (DeepSeek's own formats)",
+             "gguf-q4": "unsloth's GGUF: dense weights Q8_0 (less VRAM), experts MXFP4",
+             "exl3": "LibertAIDAI's quant, with the DSpark drafter and the vision tower",
+             "exl3-3.5": f"closer to the original, slower: ~{DS4_EXL3['exl3-3.5']['memory_gb']} GB of VRAM + RAM "
+                         "hold it",
+             "abliterated-128g": "orcarouter's model with its refusals removed: experts ~1.6 bits, ~114 GB of VRAM + "
+                                 "RAM hold it; its 161 GB of n-gram tables are Maya's, shared with Maya's DeepSeek "
+                                 "quants (downloaded once); a gated repo: your Hugging Face token",
+             "abliterated-256g": "orcarouter's model with its refusals removed: experts 2.5-4.25 bits by layer (IQ2_S / "
+                                 "IQ3_XXS / IQ3_S / MXFP4), ~236 GB of VRAM + RAM hold it; its 161 GB of n-gram tables are "
+                                 "Maya's, shared with Maya's DeepSeek quants (downloaded once); a gated repo: your "
+                                 "Hugging Face token"}
+    label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
-                                             "the SSD. The EXL3 quants need a V100 or newer and ~230 / ~280 GB of "
-                                             "VRAM + RAM:"],
-                  [(label[k][0], "recommended" if k == keys[0] else None, label[k][1]) for k in keys],
+                                             "the SSD. The EXL3 quants need a V100 or newer (AMD: experimental) and "
+                                             "~230 / ~280 GB of VRAM + RAM:"],
+                  [(label[k][0], "recommended" if k == keys[0] else
+                    "abliterated: fits this PC" if k == abl else
+                    "experimental on AMD" if hip and k in DS4_EXL3 else None, label[k][1]) for k in keys],
                   keys.index(default), a.yes or a.check)
     return keys[pick]
+
+
+def ds4_memory_gb(quant: str) -> float:
+    """The VRAM + RAM that hold DeepSeek in these files, the context aside: the EXL3 quants' (DS4_EXL3); a Maya
+    quant's "memory_gb" (download_gguf.json: its files but the Engram tables, which stay on the SSD, and its drafter);
+    else the GGUF's files (unsloth's); DS4_MEMORY_GB when the manifest lists none."""
+    if quant in DS4_EXL3:
+        return float(DS4_EXL3[quant]["memory_gb"])
+    man = read_json(DS4_GGUF_MANIFEST)
+    q = ((man.get("maya") if quant in DS4_MAYA else man.get("abliterated") if quant in DS4_ABL else man) or {}).get(
+        "quants", {}).get(DS4_QUANTS.get(quant)) or {}
+    if q.get("memory_gb"):
+        return float(q["memory_gb"])
+    return sum(v[0] for v in (q.get("files") or {}).values()) / 1e9 or float(DS4_MEMORY_GB)
+
+
+def ds4_abl_recommended(hip: bool = False) -> str:
+    """The orcarouter version this PC's VRAM + RAM hold (as MiniMax's XS / S): the larger that fits, else the smaller."""
+    total, _ = mem_gb()
+    try:
+        vram = sum(g["vram_gb"] for g in (S.amd_gpus() if hip else S.gpus()))
+    except Exception:  # noqa: BLE001 - no GPU tools
+        vram = 0.0
+    fit = [k for k in DS4_ABL if vram + total >= ds4_memory_gb(k)]
+    return max(fit, key=ds4_memory_gb) if fit else min(DS4_ABL, key=ds4_memory_gb)
+
+
+def ds4_abl_engram_gb() -> float:
+    """GB of Maya's Q6_K n-gram tables an orcarouter version reads (the pair the setup downloads when none is there)."""
+    man = read_json(DS4_GGUF_MANIFEST)
+    eg = (man.get("abliterated") or {}).get("engram") or {}
+    tier = eg.get("download", "Maya-XS")
+    files = ((man.get("maya") or {}).get("quants") or {}).get(tier, {}).get("files") or {}
+    return sum(files[n][0] for n in (eg.get("from") or {}).get(tier, []) if n in files) / 1e9
+
+
+def ds4_abl_engram_there(d: Path, models: Path) -> bool:
+    """Whether a copy of Maya's Q6_K n-gram tables is there for an orcarouter version in d - in its Engram-Q6_K folder,
+    or a Maya quant's pair in <models> on the same drive (linked, not downloaded) - by the files' sizes."""
+    man = read_json(DS4_GGUF_MANIFEST)
+    eg, my = (man.get("abliterated") or {}).get("engram") or {}, man.get("maya") or {}
+    e = d.parent / eg.get("folder", "Engram-Q6_K")
+    try:
+        dev = os.stat(existing(d)).st_dev
+    except OSError:
+        dev = None
+    for tier, names in (eg.get("from") or {}).items():
+        files = {Path(n).name: my["quants"][tier]["files"][n][0] for n in names}
+        for where in (e, models / f"{DS4}-Maya-GGUF" / tier):
+            try:
+                if all((where / f).stat().st_size == n for f, n in files.items()) and \
+                        (where == e or os.stat(where).st_dev == dev):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def ds4_abl_engram_step(a, d: Path, models: Path) -> Path | None:
+    """Maya's Q6_K Engram tables for an orcarouter version (its own shard 2, the table alone, is left out): in
+    <d's parent>/Engram-Q6_K, shared by both versions - there already (either Maya quant's pair of shards, whole and as
+    published), else hard-linked from a Maya quant set up in <models> on the same drive (no second copy), else downloaded
+    from Maya's repo (Maya-XS's pair).  The folder, or None when nothing was downloaded."""
+    man = read_json(DS4_GGUF_MANIFEST)
+    eg, my = (man.get("abliterated") or {}).get("engram") or {}, man.get("maya") or {}
+    if not eg.get("from"):
+        fail(f"{DS4_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/ds4/download_gguf.json)")
+    e = d.parent / eg.get("folder", "Engram-Q6_K")
+    pairs = {t: {Path(n).name: my["quants"][t]["files"][n] for n in names} for t, names in eg["from"].items()}
+
+    def whole(where: Path, files: dict) -> bool:
+        return all((where / f).is_file() and (where / f).stat().st_size == v[0] for f, v in files.items())
+
+    def checked(files: dict) -> bool:
+        return all(sha256_checked(e / f, v[1]) for f, v in files.items())
+
+    for tier, files in pairs.items():
+        if whole(e, files):
+            if not checked(files):
+                fail(f"{e}: the Engram tables do not match their published sha256", "delete them and run the setup again")
+            ok(f"the n-gram (Engram) tables: Maya's Q6_K, {e} ({sum(v[0] for v in files.values()) / 1e9:.1f} GB)")
+            return e
+    for tier, files in pairs.items():   # (a Maya quant of DeepSeek beside it: its own pair, linked)
+        src = models / f"{DS4}-Maya-GGUF" / tier
+        if not whole(src, files):
+            continue
+        try:
+            e.mkdir(parents=True, exist_ok=True)
+            for f in files:
+                if not (e / f).exists():
+                    os.link(src / f, e / f)
+        except OSError as x:
+            warn(f"the Engram tables of {src} could not be linked into {e} ({x}): downloaded instead")
+            break
+        book, theirs = read_json(e / VERIFIED), read_json(src / VERIFIED)   # (the same files: checked there once)
+        for f in files:
+            if f in theirs and theirs[f].get("size") == (e / f).stat().st_size:
+                book[f] = theirs[f]
+        try:
+            (e / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+        if not checked(files):
+            fail(f"{src}: the Engram tables do not match their published sha256", "delete them and run the setup again")
+        ok(f"the n-gram (Engram) tables: Maya's Q6_K, linked from {src} (no second copy) into {e}")
+        return e
+    tier = eg.get("download", "Maya-XS")
+    files = pairs[tier]
+    m = {"about": f"Maya's Q6_K n-gram (Engram) tables (DeepSeek's released ones; the two {tier} shards that hold them), "
+                  "read instead of orcarouter's own IQ4_NL table - one copy for both orcarouter versions",
+         "format": "ds4-engram", "repo": my["repo"], "revision": my["revision"], "folder": tier,
+         "files": {f: v[0] for f, v in files.items()}, "sha256": {f: v[1] for f, v in files.items()},
+         "download_gb": sum(v[0] for v in files.values()) / 1e9}
+    shards = [e / f for f in files]
+    if any(file_incomplete(m, s) for s in shards) and not offer_download(a, "the n-gram tables", e, shards, m):
+        return None
+    if not checked(files):
+        fail(f"{e}: the Engram tables do not match their published sha256", "delete them and run the setup again")
+    ok(f"the n-gram (Engram) tables: Maya's Q6_K, {e}")
+    return e
+
+
+def ds4_kv_gb(ctx: int, gpus: int = 1) -> float:
+    """GB of VRAM the context's caches take, on all the GPUs together (each holds its layers' caches, every member of
+    a tensor-parallel group the group's: counted on each GPU - the upper bound)."""
+    return ctx * DS4_KV_BYTES * max(1, gpus) / 2**30
+
+
+def ds4_recommended_context(vram: float, ram: float, need: float, gpus: int = 1) -> int:
+    """The context the setup recommends on this PC, as MiniMax's (mm3_recommended_context): the largest from
+    DS4_DEFAULT_CONTEXT up to DS4_RECOMMENDED_CONTEXT (256K) whose caches fit in what VRAM + RAM hold beyond the
+    model's files (need: ds4_memory_gb) - else DS4_DEFAULT_CONTEXT (64K), also when the RAM could not be read: a PC
+    that reads experts from the SSD reads a long prompt slowly."""
+    if ram <= 0:
+        return DS4_DEFAULT_CONTEXT
+    spare = vram + ram - need
+    fits = [c for c in DS4_CONTEXTS
+            if DS4_DEFAULT_CONTEXT <= c <= DS4_RECOMMENDED_CONTEXT and ds4_kv_gb(c, gpus) <= spare]
+    return max(fits) if fits else DS4_DEFAULT_CONTEXT
 
 
 def ds4_model(quant: str = "exl3") -> dict:
@@ -3707,7 +4252,9 @@ def ds4_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
         d = Path(args[args.index("--pack") + 1]).parent
         if (d / "config.json").exists() or (quant not in DS4_EXL3 and ds4_shards(d)):
             return d
-    return models / DS4_EXL3[quant]["dir"] if quant in DS4_EXL3 else models / f"{DS4}-GGUF" / DS4_QUANTS[quant]
+    if quant in DS4_EXL3:
+        return models / DS4_EXL3[quant]["dir"]
+    return models / (f"{DS4}-abliterated-GGUF" if quant in DS4_ABL else f"{DS4}-GGUF") / DS4_QUANTS[quant]
 
 
 def ds4_link_engram(d: Path, m: dict, models: Path, prev: dict):
@@ -3773,7 +4320,7 @@ def ds4_model_step(a, d: Path, m: dict):
 
 
 def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram: Path | None = None,
-                  files: list | None = None, drafter: Path | None = None) -> Path:
+                  files: list | None = None, drafter: Path | None = None, without: list | None = None) -> Path:
     """tools/ds4/pack.py's pack in <model>/maya-ds4: the geometry, where every tensor sits in the safetensors (read
     in place), the Engram hash tables and the tokenizer - built again when its tools or the model's files changed, or
     (a GGUF) when the drafter or the vision tower arrived after it.  announce=False: no step heading (step 7 adds the
@@ -3804,7 +4351,8 @@ def ds4_pack_step(a, d: Path, gguf: bool = False, announce: bool = True, engram:
          "--out", str(pack)] + (["--vision", str(ds4_vision_dir(d))] if gguf else []) +
         (["--engram", str(engram)] if gguf and engram is not None else []) +
         (["--drafter", str(drafter)] if gguf and drafter is not None else []) +
-        (["--shards"] + [Path(f).name for f in files] if gguf and files else []))
+        (["--shards"] + [Path(f).name for f in files] if gguf and files else []) +
+        (["--without"] + list(without) if gguf and without else []))
     missing = [f for f in need if not (pack / f).exists()]
     if missing:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
@@ -3835,9 +4383,15 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     args = ["--pack", str(pack), "--max-context", str(ctx), "--tp", str(min(2, gpus))]
     if gpus <= 1 and "--threads" not in args[:-1]:
         args += ["--threads", "on"]
-    kept = keep_args(old.get("args") or [], args, ("--tp", "--prefill-chunk", "--reserve-mib", "--vram-experts",
-                                                    "--cpu-threads", "--threads", "--dspark", "--dspark-conf",
-                                                    "--expert-profile", "--mmap-experts"))
+    # (--tp follows the GPUs chosen now: the config before's is kept only for the same GPUs - #436, two GPUs -> one
+    #  kept --tp 2 and the engine failed later)
+    same_gpus = tp_keepable(old, pc)
+    kept = keep_args(old.get("args") or [], args, (("--tp",) if same_gpus else ()) +
+                     ("--prefill-chunk", "--reserve-mib", "--vram-experts", "--cpu-threads", "--threads", "--dspark",
+                      "--dspark-conf", "--expert-profile", "--mmap-experts"))
+    if not same_gpus and flag_value(old.get("args") or [], "--tp") not in (None, flag_value(args, "--tp")):
+        ok(f"--tp {flag_value(args, '--tp')} for the GPU{'s' if gpus != 1 else ''} chosen now (the config before had "
+           f"--tp {flag_value(old['args'], '--tp')} for GPUs {old.get('gpu')})")
     if getattr(a, "mmap_experts", None):   # given now: written, and a later setup keeps it (issue #422)
         set_arg(args, "--mmap-experts", a.mmap_experts)
         ok(f"the CPU lane's experts: --mmap-experts {a.mmap_experts}")
@@ -3863,7 +4417,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
            "engine; --vram-reserve-mib changes it)")
     cfg = {"exe": str(DS4_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": DS4_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "model_name": DS4_ABL_MODEL_NAME if quant in DS4_ABL else DS4_MODEL_NAME,
+           "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": old.get("sampling") or dict(DS4_SAMPLING),
            "reasoning_effort": old.get("reasoning_effort") or DS4_EFFORT,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
@@ -3885,7 +4440,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
                         "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     cal = saved_calibration(cfg, any_context=True)     # --tp and the CPU threads tuned on this PC for this quant before
     if cal is not None and isinstance(cal.get("args"), dict):
-        had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1]]   # (the config before's own values win)
+        had = [f for f in CAL4.KEYS if f in (old.get("args") or [])[:-1] and   # (the config before's own values win,
+               (f != "--tp" or same_gpus)]                                       #  its --tp for the same GPUs only)
         new = {k: v for k, v in cal["args"].items() if k not in had}
         if new:
             cfg["args"] = CAL4.apply(cfg["args"], new)
@@ -3912,10 +4468,14 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     gguf = quant not in DS4_EXL3
     pc = check_pc(a, "deepseek", gguf, quant)          # 1
     step(2, "your choices")                            # 2
-    ok(f"files: {DS4_QUANTS[quant]}" + (" (Maya's quant)" if quant in DS4_MAYA else " (unsloth's GGUF)" if gguf else
-                                        f" (LibertAIDAI's EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
-    ctx = choose_context(a, prev_ctx, DS4_CONTEXTS, DS4_DEFAULT_CONTEXT)
-    ok(f"context: {ctx} tokens")
+    ok(f"files: {Q.shown('deepseek', quant)}" + (" (Maya's quant)" if quant in DS4_MAYA else
+                                                 " (a gated repo: your Hugging Face token)" if quant in DS4_ABL else
+                                                 " (unsloth's GGUF)" if gguf else
+                                                 f" (LibertAIDAI's EXL3 quant at {DS4_EXL3[quant]['bits']} bits)"))
+    vram = sum(g.get("vram_gb", 0) for g in pc["gpus"])
+    rec = ds4_recommended_context(vram, mem_gb()[0], ds4_memory_gb(quant), len(pc["gpus"]))
+    ctx = choose_context(a, prev_ctx, DS4_CONTEXTS, rec)
+    ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else ""))
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
     d = ds4_dir(a, models, prev, quant)
@@ -3925,6 +4485,8 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     m = ds4_gguf_model(quant) if gguf else ds4_model(quant)
     if not gguf:                                       # (the Engram tables from the other EXL3 quant's folder)
         ds4_link_engram(d, m, models, prev)
+    if quant in DS4_ABL and not ds4_abl_engram_there(d, models):   # (the tables follow: room for them too)
+        m = dict(m, also_gb=ds4_abl_engram_gb(), also_what="Maya's Q6_K n-gram tables, downloaded after it")
     old = ds4_earlier(m, d) if gguf else None          # (an earlier layout of the files, whole: used as it is)
     files = ds4_model_step(a, d, old or m)             # 5
     if files is None:
@@ -3932,14 +4494,22 @@ def set_up_ds4(a, prev: dict) -> Path | None:
     if gguf and old is None:
         ds4_unused(m, d)
     engram = old and old["engram"]                     # (v1.1.16's Maya-S: its Engram tables beside it)
+    without = [m["table"]] if quant in DS4_ABL and m.get("table") else None
+    if without:                                        # (orcarouter's: Maya's Q6_K tables, its own table shard left out)
+        if (d / m["table"]).exists():
+            warn(f"{d / m['table']}: the n-gram table orcarouter ships, not used - Maya's Q6_K tables are read instead; "
+                 f"you can delete it ({(d / m['table']).stat().st_size / 1e9:.1f} GB)")
+        engram = ds4_abl_engram_step(a, d, models)
+        if engram is None:
+            return None
     drafter = gguf and ds4_drafter_step(a, d.parent / "dspark", quant)   # (the EXL3 quant has its own)
     own = ds4_quant_drafter(quant) if gguf else None   # (Maya-XS: its own drafter beside the shared one)
     dj = d.parent / "dspark" / own["json"] if own is not None and drafter else None
-    pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj)   # 6
+    pack = ds4_pack_step(a, d, gguf, engram=engram, files=files, drafter=dj, without=without)   # 6
     if gguf:                                           # 7 (DeepSeek's checkpoint's tower, added to the pack)
         vision = ds4_vision_step(a, pc, d)
         if vision and not ds4_pack_has_vision(pack):
-            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj)
+            pack = ds4_pack_step(a, d, gguf, announce=False, engram=engram, files=files, drafter=dj, without=without)
         vision = vision and ds4_pack_has_vision(pack)
     else:
         step(7, "images (the vision tower)")
@@ -3947,11 +4517,449 @@ def set_up_ds4(a, prev: dict) -> Path | None:
         if a.no_vision:
             ok("skipped (--no-vision): the model reads text only")
         else:
-            ok("the model's own vision tower runs in the engine, on the first GPU (about 320 MB of its memory, the "
-               "weights streamed from RAM); the server resizes the pictures")
+            ok("the model's own vision tower runs in the engine: its weights in RAM, no VRAM between pictures (about "
+               "320 MB of the first GPU's while one is read); the server resizes the pictures")
     cfg_path = write_config_ds4(a, pc, meta, pack, ctx, models, d, quant, vision)   # 8
     if (drafter or not gguf) and CDS.has_drafter(read_json(cfg_path)):
         how = drafting_choice(a, "The DSpark drafter", "10-30")
+        if how != "measure":
+            keep_drafting(cfg_path, how == "on")
+        else:
+            if S.UI is not None:
+                S.UI.step(9, "speed calibration: the DSpark drafter or none")
+            speed_calibration(cfg_path)
+    return cfg_path
+
+
+# ------------------------------------------------------------------------------------------------ MiniMax-M3.1-Flash
+def mm3_min_cc() -> int:
+    """The GPUs maya-mm3's setup takes: DeepSeek's EXL3 reach (MM3_MIN_CC, V100 on) once MM3_ALL_PLATFORMS is on;
+    until then RTX 30 / A100 or newer (MM3_MIN_CC_NOW), or - for testing, opt-in - from the compute capability
+    MAYA_MM3_MIN_CC names (70: V100 on - the engine's portable kernels before sm_80)."""
+    if MM3_ALL_PLATFORMS:
+        return MM3_MIN_CC
+    v = os.environ.get(MM3_TEST_CC_ENV, "").strip()
+    if v.isdigit() and 70 <= int(v) < MM3_MIN_CC_NOW:
+        warn(f"{MM3_TEST_CC_ENV}={v}: GPUs before RTX 30 / A100 are taken for testing - {MM3}'s engine has not been "
+             "validated on them")
+        return int(v)
+    return MM3_MIN_CC_NOW
+
+
+def mm3_gpus() -> str:
+    """The NVIDIA GPUs the setup offers MiniMax on, in words."""
+    return "V100 / RTX 20 or newer" if MM3_ALL_PLATFORMS else "RTX 30 / A100 or newer"
+
+
+def mm3_kv_format(args: list) -> str:
+    """The KV cache's format a maya-mm3 config runs with: its --kv-cache, else the engine's default."""
+    return args[args.index("--kv-cache") + 1] if "--kv-cache" in args[:-1] else MM3_KV_FORMAT
+
+
+def mm3_kv_gb(ctx: int, fmt: str) -> float:
+    """GB of pinned RAM the KV cache takes at a context (KV streaming: every position in RAM)."""
+    k, _, v = fmt.partition(",")
+    half = lambda x: MM3_KV_BYTES.get(x, MM3_KV_BYTES["bf16"]) / 2
+    return ctx * (half(k) + half(v or k)) / 2**30
+
+
+def mm3_recommended_context(vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB) -> int:
+    """The context the setup recommends on this PC: the largest (up to MM3_TESTED_CONTEXT) whose KV cache fits in
+    what VRAM + RAM hold beyond the model (need: MM3_MEMORY_GB, a GGUF quant's own) - so the cache does not push experts
+    out of RAM - else the smallest; MM3_DEFAULT_CONTEXT when the RAM could not be read."""
+    if ram <= 0:
+        return MM3_DEFAULT_CONTEXT
+    spare = vram + ram - need
+    fits = [c for c in MM3_CONTEXTS if c <= MM3_TESTED_CONTEXT and mm3_kv_gb(c, fmt) <= spare]
+    return max(fits) if fits else MM3_CONTEXTS[0]
+
+
+def mm3_context_notes(ctx: int, vram: float, ram: float, fmt: str, need: float = MM3_MEMORY_GB) -> None:
+    """What a context costs here, and the warnings (as the dashboard's): past what was run end to end, a cache that
+    takes RAM the experts need."""
+    kv, spare = mm3_kv_gb(ctx, fmt), vram + ram - need
+    ok(f"the context's KV cache: about {kv:.0f} GB of pinned RAM ({fmt.upper()}), its newest 32K positions in VRAM too")
+    if ctx > MM3_TESTED_CONTEXT:
+        warn(f"past {context_label(MM3_TESTED_CONTEXT)} the engine has not been run end to end yet, and a prompt that "
+             "long reads slowly - tell us how it goes")
+    if kv > max(0.0, spare):
+        warn(f"{vram:.0f} GB of VRAM and {ram:.0f} GB of RAM: with a {context_label(ctx)} context's cache, fewer "
+             "experts stay in RAM (answers slower) and the engine may not start - "
+             f"{context_label(mm3_recommended_context(vram, ram, fmt, need))} fits this PC")
+
+
+def mm3_models() -> tuple:
+    """The MiniMax download as MODELS entries (offer_download's form): the model's files, and its DSpark draft's (in
+    the repo's dspark/ folder, so a folder of its own beside them)."""
+    man = read_json(MM3_MANIFEST)
+    if not man.get("files") or not (man.get("dspark") or {}).get("files"):
+        fail(f"{MM3_MANIFEST} is missing or damaged", "restore it (git checkout tools/mm3/download.json)")
+
+    def entry(files: dict, folder: str, about: str) -> dict:
+        return {"about": about, "format": "mm3", "repo": man["repo"], "revision": man["revision"], "folder": folder,
+                "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+                "download_gb": sum(v[0] for v in files.values()) / 1e9}
+    return (entry(man["files"], "", f"{MM3} in Mia-AiLab's EXL3 quant at 3.5 bits per weight (EAQ v1), with its "
+                                    "vision tower"),
+            entry(man["dspark"]["files"], man["dspark"]["folder"], f"{MM3}'s DSpark draft (speculative decoding)"))
+
+
+def mm3_gguf_entry(quant: str) -> dict:
+    """Maya's GGUF quant of MiniMax (download_gguf.json) as a MODELS entry (offer_download's form): its shards and the
+    dense layers' indexers file, their sizes and sha256 (empty until published), the repo's folder (the tier's:
+    Maya-XS), the VRAM + RAM that hold it (memory_gb), and "earlier_names": the names its files had before, in the same
+    order."""
+    man = read_json(MM3_GGUF_MANIFEST)
+    q = (man.get("quants") or {}).get(MM3_QUANTS[quant]) or {}
+    if not q.get("files"):
+        fail(f"{MM3_GGUF_MANIFEST} is missing or damaged", "restore it (git checkout tools/mm3/download_gguf.json)")
+    files = {Path(k).name: v for k, v in q["files"].items()}
+    folder = Path(next(iter(q["files"]))).parent.as_posix()
+    return {"about": f"Maya's quant of {MM3} ({q.get('about', 'GGUF')})", "format": "mm3-gguf",
+            "repo": man["repo"], "revision": man.get("revision") or "", "folder": "" if folder == "." else folder,
+            "files": {k: v[0] for k, v in files.items()}, "sha256": {k: v[1] for k, v in files.items()},
+            "download_gb": sum(v[0] for v in files.values()) / 1e9, "memory_gb": q.get("memory_gb", MM3_MEMORY_GB),
+            "earlier_names": list(q.get("was") or [])}   # (not "was": GLM's name patterns, old_names)
+
+
+def mm3_gguf_published(quant: str) -> bool:
+    """Whether Maya's quant has been uploaded: download_gguf.json names the commit and every file's sha256."""
+    m = mm3_gguf_entry(quant)
+    return bool(m["revision"]) and all(m["sha256"].values())
+
+
+def mm3_memory_gb(quant: str) -> float:
+    """The VRAM + RAM that hold MiniMax in these files (the KV cache aside)."""
+    return MM3_MEMORY_GB if quant == "exl3" else float(mm3_gguf_entry(quant)["memory_gb"])
+
+
+def choose_mm3_quant(a, prev: dict) -> str:
+    """--mm3-quant, else the one set up before, else asked among those this PC runs: Maya's GGUF quants once published
+    and the EXL3 quant (on AMD: experimental) - by this PC's memory the one recommended."""
+    if getattr(a, "mm3_quant", None):
+        return a.mm3_quant
+    hip = getattr(a, "backend", None) == "hip"
+    ggufs = [k for k in ("gguf-xs", "gguf-s") if mm3_gguf_published(k)]
+    keys = ["exl3"] + ggufs
+    before = (prev.get("installer") or {}).get("mm3_quant")
+    total, _ = mem_gb()
+    try:
+        vram = sum(g["vram_gb"] for g in (S.amd_gpus() if hip else S.gpus()))
+    except Exception:  # noqa: BLE001 - no NVIDIA tools
+        vram = 0.0
+    have = vram + total
+    fit = [k for k in keys if have >= mm3_memory_gb(k)]
+    rec = "exl3" if "exl3" in fit else max(fit, key=mm3_memory_gb) if fit else min(keys, key=mm3_memory_gb)
+    if len(keys) == 1:
+        return keys[0]
+    gb = {k: mm3_models()[0]["download_gb"] if k == "exl3" else mm3_gguf_entry(k)["download_gb"] for k in keys}
+    about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM" + ("; experimental on AMD" if hip else ""),
+             "gguf-xs": "Maya's quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory",
+             "gguf-s": "Maya's quant: experts in ~2.1 bits"}
+    pics = "; pictures and DSpark drafting (their files, ~4 GB, beside it)"
+    label = {k: (Q.shown("minimax", k, gb[k]), about[k] + ("" if k == "exl3" else pics)) for k in keys}
+    order = sorted(keys, key=lambda k: k != rec)
+    default = before if before in order else rec
+    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants run on NVIDIA from V100 on and on AMD; the EXL3 quant "
+                                             "on NVIDIA (on AMD: experimental):"],
+                  [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
+                  order.index(default), a.yes or a.check)
+    return order[pick]
+
+
+def mm3_dir(a, models: Path, prev: dict, quant: str = "exl3") -> Path:
+    """The model's folder: --model-dir, else the folder of the MiniMax setup before when it holds the same quant (its
+    pack is inside it), else <models folder>/MiniMax-M3.1-Flash-EXL3-3.5bpw (a GGUF: <models folder>/<its name>)."""
+    if a.model_dir:
+        return Path(a.model_dir).expanduser().resolve()
+    args = prev.get("args") or []
+    if "--pack" in args[:-1] and (prev.get("installer") or {}).get("mm3_quant", "exl3") == quant:
+        d = Path(args[args.index("--pack") + 1]).parent
+        if (d / "config.json").exists() or (quant != "exl3" and any(d.glob("*.gguf"))):
+            return d
+    return models / (MM3_DIR if quant == "exl3" else MM3_QUANTS[quant])
+
+
+def mm3_gguf_model_step(a, d: Path, quant: str) -> list | None:
+    """Maya's GGUF quant's files in d (downloaded once published, when they are not there): the files, or None when
+    nothing was downloaded.  Before it is published: the files already in d (--model-dir), by their sizes.  Files
+    under the names they had before (the manifest's "was": made before the naming scheme), whole, are used as they
+    are."""
+    name = Q.shown("minimax", quant)
+    step(5, f"the model ({name})")
+    m = mm3_gguf_entry(quant)
+    files = [d / n for n in m["files"]]
+    missing = [f for f in files if file_incomplete(m, f)]
+    old = [d / n for n in m["earlier_names"]]
+    if missing and len(old) == len(files) and all(o.is_file() and o.stat().st_size == size
+                                                  for o, size in zip(old, m["files"].values())):
+        ok(f"{name}: its files under their earlier names ({old[0].name}, ...) - used as they are")
+        files, missing = old, []
+    for f in list(missing):                 # (the indexers' file as v1.1.30 named it: .gguf, the same bytes - renamed)
+        o = f.with_suffix(".gguf")
+        if f.suffix == ".bin" and not f.exists() and o.is_file() and o.stat().st_size == m["files"][f.name]:
+            o.rename(f)
+            ok(f"{o.name} renamed {f.name} (its name from v1.1.31 on)")
+            missing.remove(f)
+    if missing and not mm3_gguf_published(quant):
+        fail(f"{name} is not published yet (and {missing[0]} is {file_incomplete(m, missing[0])})",
+             f"with its files in a folder: {ME} --setup --model {Q.setup_id('minimax', quant)} --model-dir <folder>")
+    if missing and not offer_download(a, name, d, files, m):
+        return None
+    if not mm3_gguf_published(quant):
+        warn(f"{name} is not published yet: the files in {d} are taken by their sizes (no published sha256 to check)")
+    ok(f"{name}: {len(files)} files, {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: loading reads all {m['download_gb']:.0f} GB from it - use an NVMe SSD "
+             "(--models-dir)")
+    return files
+
+
+def mm3_model_step(a, d: Path) -> list | None:
+    """The model's files in d and its draft's in d/dspark (downloaded when they are not there): the model's files, or
+    None when nothing was downloaded."""
+    step(5, f"the model ({MM3})")
+    m, dm = mm3_models()
+    files = [d / n for n in m["files"]]
+    if any(file_incomplete(m, f) for f in files) and not offer_download(a, MM3, d, files, m):
+        return None
+    dd = d / dm["folder"]
+    dfiles = [dd / n for n in dm["files"]]
+    if any(file_incomplete(dm, f) for f in dfiles) and not offer_download(a, MM3 + " DSpark", dd, dfiles, dm):
+        return None
+    conf = read_json(d / "config.json")
+    method = (conf.get("quantization_config") or {}).get("quant_method")
+    if conf.get("model_type") != "minimax_m3_vl" or method != "exl3":
+        fail(f"{d / 'config.json'}: a {conf.get('model_type')!r} model quantized as {method!r}, not {MM3} in EXL3 "
+             "(minimax_m3_vl, exl3)")
+    ok(f"{MM3}: {len(files) + len(dfiles)} files, {sum(f.stat().st_size for f in files + dfiles) / 1e9:.1f} GB in {d}")
+    if rotational(d):
+        warn(f"{d} is on a spinning hard disk: loading reads all {m['download_gb']:.0f} GB from it - use an NVMe SSD "
+             "(--models-dir)")
+    return files + dfiles
+
+
+def mm3_companions_step(a, d: Path, hip: bool) -> Path | None:
+    """A GGUF quant's pictures and drafting: the EXL3 repo's vision tower (MM3_VISION_FILES; not with --no-vision) and
+    DSpark draft (dspark/) - download.json's pinned files - in <models folder>/MiniMax-M3.1-Flash-companions, downloaded
+    when they are not there (a whole EXL3 download beside the GGUF is used as it is).  The folder pack_gguf.py takes, or
+    None: text only, no draft (the download declined).  NVIDIA and AMD alike (hip: kept for the callers)."""
+    exl3 = d.parent / MM3_DIR
+    if all((exl3 / n).exists() for n in MM3_VISION_FILES) and (exl3 / "dspark" / "config.json").exists():
+        ok(f"pictures and drafting: from the EXL3 download beside it ({exl3})")
+        return exl3
+    m, dm = mm3_models()
+    names = ["config.json"] + ([] if a.no_vision else [n for n in MM3_VISION_FILES if n != "config.json"])
+    c = d.parent / MM3_COMPANIONS
+    vm = dict(m, about=f"{MM3}'s vision tower and its configs from Mia-AiLab's EXL3 repo (pictures with any quant)",
+              files={n: m["files"][n] for n in names}, sha256={n: m["sha256"][n] for n in names})
+    vm["download_gb"] = sum(vm["files"].values()) / 1e9
+    vf, dfiles = [c / n for n in names], [c / dm["folder"] / n for n in dm["files"]]
+    if any(file_incomplete(vm, f) for f in vf) and not offer_download(a, "the vision tower", c, vf, vm):
+        warn("pictures and drafting: not downloaded - the model reads text only, without the DSpark draft")
+        return None
+    if any(file_incomplete(dm, f) for f in dfiles) and not offer_download(a, MM3 + " DSpark", c / dm["folder"], dfiles,
+                                                                           dm):
+        warn("the DSpark draft: not downloaded - no drafting")
+    ok(f"pictures{' (off: --no-vision)' if a.no_vision else ''} and drafting: the EXL3 repo's files in {c}")
+    return c
+
+
+def mm3_pack_step(a, d: Path, files: list, gguf: bool = False, companions: Path | None = None) -> Path:
+    """tools/mm3/pack.py's pack in <model>/maya-mm3 (a GGUF's: pack_gguf.py's): the geometry, where every tensor sits in
+    the safetensors / the GGUF's shards (read in place) and the tokenizer - built again when its tools or the model's
+    files changed."""
+    step(6, "the pack (the engine's index of the model files)")
+    pack = d / "maya-mm3"
+    tools = S.source_hash(MM3_GGUF_PACK_TOOLS if gguf else MM3_PACK_TOOLS)
+    need = ("mm3.txt", "tensors.txt", "tokenizer/vocab.json", "tokenizer/chat_template.jinja")
+    shards = [f for f in files if f.suffix == (".gguf" if gguf else ".safetensors")]
+    if not a.repack and read_json(pack / PACK_SOURCES).get("tools") == tools and \
+            all((pack / f).exists() for f in need) and pack_stale(pack, shards) is None:
+        ok(f"pack already built: {pack}")
+        return pack
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the pack is written inside the model's folder")
+    say(f"  Indexing every tensor of the {'GGUF' if gguf else 'safetensors'} (the weights stay where they are) and the "
+        "tokenizer ...")
+    if gguf:
+        run([sys.executable, str(ROOT / "tools" / "mm3" / "pack_gguf.py"), "--model", str(d), "--out", str(pack)] +
+            (["--companions", str(companions)] if companions else ["--text-only"]) +
+            ["--shards"] + [f.name for f in shards])
+    else:
+        run([sys.executable, str(ROOT / "tools" / "mm3" / "pack.py"), "--model", str(d), "--out", str(pack)])
+    missing = [f for f in need if not (pack / f).exists()]
+    if missing:
+        fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
+    stamp_pack(pack, shards)
+    rec = read_json(pack / PACK_SOURCES)
+    rec["tools"] = tools
+    (pack / PACK_SOURCES).write_text(json.dumps(rec, indent=1), encoding="utf-8")
+    ok(f"pack: {pack}")
+    return pack
+
+
+def write_config_mm3(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path, d: Path,
+                     quant: str = "exl3") -> Path:
+    """maya-mm3.json and run-maya-mm3.sh (a Maya GGUF quant: maya-minimax-maya-xs.json - maya_quants.config_stem).  A
+    setup again keeps what the config before says that this one does not ask: the engine settings below, the thinking
+    level and sampling, where the server listens and its key - a GGUF quant's first config takes them from the EXL3
+    one (they shared maya-mm3.json before the naming scheme; such a config of this quant is moved to its new name)."""
+    step(8, "the configuration and the start script")
+    port = a.port or 8080
+    hip = pc.get("backend") == "hip"   # (AMD: a GGUF quant - a config of its own, as DeepSeek's)
+    suffix = "-hip" if hip else ""
+    legacy = ROOT / f"maya-mm3{suffix}.json"
+    cfg_path = ROOT / f"{Q.config_stem('minimax', quant) or 'maya-mm3'}{suffix}.json"
+    old = read_json(cfg_path) if cfg_path.exists() else read_json(legacy)
+    moved = cfg_path != legacy and (old.get("installer") or {}).get("mm3_quant") == quant and not cfg_path.exists()
+    gguf = quant != "exl3"
+    args = ["--pack", str(pack), "--max-context", str(ctx)]
+    if MM3_PROFILE.exists():
+        args += ["--profile", str(MM3_PROFILE)]
+    # (a GGUF: the layer split - the EXL3 config's tensor-parallel settings not kept; pictures / drafting as its pack
+    #  has them: a kept --vision on without a tower in the pack dropped)
+    # (--tp: the config before's for the same GPUs only, else worked out again below from the GPUs chosen now - #436)
+    keep = ("--chunk", "--staging", "--cpu-threads", "--reserve-gb", "--resident-cap", "--kv-cache", "--kv-streaming",
+            "--kv-resident", "--dspark", "--dspark-conf", "--vision", "--vision-gpu") + \
+        (() if gguf else (("--tp",) if tp_keepable(old, pc) else ()) + ("--cache-gb",))
+    kept = keep_args(old.get("args") or [], args, keep)
+    if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "on" and not mm3_pack_has_vision(pack):
+        i = args.index("--vision")
+        del args[i:i + 2]
+    has_draft = "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8")
+    for k in ("--dspark", "--dspark-conf"):
+        if k in args[:-1] and not has_draft:
+            i = args.index(k)
+            del args[i:i + 2]
+    # KV streaming (maya-mm3 --kv-streaming on), as the GLM engine's: 32768 positions of each layer's K / V in VRAM
+    # (--kv-resident N sets another window), all of them in pinned RAM - a longer context leaves the VRAM to experts;
+    # MM3_KV_BYTES of RAM a context token by the cache's format (BF16: 15 GB at 128K, 120 GB at 1M)
+    if "--kv-streaming" not in args[:-1]:
+        args += ["--kv-streaming", "on"]
+    # tensor parallel (maya-mm3 --tp): the GPUs in groups of 4 (or 2), the first alone when the others make whole
+    # groups - each layer's work spread over a group's GPUs; on 3090 + 8 x 5060 Ti decode 27.7 -> 38 tok/s (code),
+    # ~19 -> 32 (prose), prompts 35-70 -> ~100 tok/s
+    n = len(pc["gpus"])
+    if "--tp" not in args[:-1] and not gguf:   # (a GGUF pack: the layer split - maya-mm3's tensor parallel is EXL3's)
+        for tp in (4, 2):
+            if n > tp and ((n - 1) % tp == 0 or n % tp == 0):
+                args += ["--tp", str(tp)]
+                break
+    # DSpark (the draft in the pack: tools/mm3/pack.py indexes dspark/): drafts verified by the model, the same tokens
+    # it would answer alone - about 1.6x the decode on the 3090 + 8x 5060 Ti it was measured on, but where most experts
+    # run on the CPU the drafts' windows cost more than they save (DeepSeek's lesson): off until this PC's speed
+    # calibration (tools/calibrate_ds4.py, as DeepSeek's) or the user's choice says it pays (set_up_mm3)
+    if "--dspark" not in args[:-1] and "dspark.num_hidden_layers" in (pack / "mm3.txt").read_text(encoding="utf-8"):
+        args += ["--dspark", "off"]
+    # pictures, ON by default: the pack's vision tower in the engine (in RAM, on a GPU only during a picture); --no-vision (or a
+    # config's --vision off, kept) frees it for experts
+    if getattr(a, "no_vision", False):
+        set_arg(args, "--vision", "off")
+    elif "--vision" not in args[:-1] and mm3_pack_has_vision(pack):
+        args += ["--vision", "on"]
+    if hip and "--reserve-gb" not in args[:-1]:   # (as DeepSeek's on AMD: the desktop's allocations beside the engine)
+        mib = hip_reserve_mib(pc["gpus"])
+        set_arg(args, "--reserve-gb", f"{mib / 1024:.1f}")
+        ok(f"VRAM kept free on each GPU: {mib / 1024:.1f} GB (the desktop and other programs on an AMD GPU allocate "
+           "beside the engine)")
+    cfg = {"exe": str(MM3_EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
+           **({"backend": "hip"} if hip else {}),
+           "model_name": MM3_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
+           "sampling": old.get("sampling") or dict(MM3_SAMPLING), "reasoning_effort": MM3_EFFORT,
+           "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port}
+    for k in ("reasoning_effort", "host", "api_key", "cors_origins", "mcp_servers"):
+        if old.get(k) is not None:
+            cfg[k] = old[k]
+            kept.append(k)
+    env = {**(old.get("env") or {}), **parse_env(a.env)}
+    if env:
+        cfg["env"] = env
+    if a.host:
+        cfg["host"] = a.host
+    if a.api_key:
+        cfg["api_key"] = a.api_key
+    if kept:
+        ok("kept from the config before: " + ", ".join(kept))
+    cfg["log"] = str(cfg_path.with_suffix(".log"))
+    cfg["installer"] = {"family": "minimax", "models_dir": str(models),
+                        "quant": MM3 if quant == "exl3" else MM3_QUANTS[quant], "mm3_quant": quant,
+                        "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
+    ok(f"config: {cfg_path}")
+    ok(f"start script: {write_run_script(cfg_path, port)}")
+    if moved:   # (this quant's config under the name before: its dashboard settings come along, the old files go)
+        shared = legacy.with_suffix(".shared-settings.json")
+        if shared.exists() and not cfg_path.with_suffix(".shared-settings.json").exists():
+            shared.replace(cfg_path.with_suffix(".shared-settings.json"))
+        for p in (legacy, ROOT / f"run-{legacy.stem}.{'bat' if WIN else 'sh'}"):
+            p.unlink(missing_ok=True)
+        ok(f"{legacy.name} (this quant's config before) is now {cfg_path.name}")
+    if MM3_PROFILE.exists():
+        ok("expert profile: the most-routed experts (data/expert-profile-mm3.bin) are placed in VRAM")
+    return cfg_path
+
+
+def mm3_pack_has_vision(pack: Path) -> bool:
+    """The pack indexes the model's vision tower (tools/mm3/pack.py's vision.* lines)."""
+    try:
+        return "vision.hidden_size" in (pack / "mm3.txt").read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def set_up_mm3(a, prev: dict) -> Path | None:
+    """MiniMax-M3.1-Flash's steps 1-8: the files (EXL3, or Maya's GGUF quants), the PC (NVIDIA - mm3_gpus(); a GGUF also
+    AMD; the memory), the context (recommended by this PC's memory), its engine (build/maya-mm3), the files, the pack,
+    pictures, the config."""
+    inst = prev.get("installer") or {}
+    prev_args = prev.get("args") or []
+    prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
+    quant = choose_mm3_quant(a, prev)
+    gguf = quant != "exl3"
+    need = mm3_memory_gb(quant)
+    pc = check_pc(a, "minimax", gguf=gguf)             # 1
+    total, _ = mem_gb()
+    vram = sum(g["vram_gb"] for g in pc["gpus"])
+    name = MM3 if not gguf else Q.shown("minimax", quant)
+    if vram + total < need:
+        warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{need:.0f} GB that hold all of {name} "
+             "(the engine reads what does not fit from the SSD as the page cache allows - slower)")
+    step(2, "your choices")                            # 2
+    ok(f"files: {name}" + (" (Maya's quant)" if gguf else " (Mia-AiLab's EXL3 quant)"))
+    fmt = mm3_kv_format(prev_args)                     # (a setup again keeps the config's --kv-cache)
+    rec = mm3_recommended_context(vram, total, fmt, need)
+    ctx = choose_context(a, prev_ctx, MM3_CONTEXTS, rec)
+    ok(f"context: {ctx} tokens" + (" (recommended for this PC's memory)" if ctx == rec else ""))
+    mm3_context_notes(ctx, vram, total, fmt, need)
+    models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
+              Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
+    d = mm3_dir(a, models, prev, quant)
+    ok(f"model folder: {d}")
+    llama = tools_step(a)                              # 3
+    meta = build_step(a, pc, llama, "maya-mm3")        # 4
+    files = mm3_gguf_model_step(a, d, quant) if gguf else mm3_model_step(a, d)   # 5
+    if files is None:
+        return None
+    companions = mm3_companions_step(a, d, a.backend == "hip") if gguf else None  # (a GGUF's pictures and draft)
+    pack = mm3_pack_step(a, d, files, gguf, companions)  # 6
+    step(7, "images (the vision tower)")
+    if a.no_vision:
+        ok("pictures: off (--no-vision): the model reads text only")
+    elif mm3_pack_has_vision(pack):
+        ok("pictures: ON - the model's own vision tower runs in the engine; it stays in RAM and comes to the GPU only "
+           "while a picture is read (no VRAM kept for it); the server resizes the pictures, the Chat's picture button "
+           "is shown")
+    elif gguf:
+        ok(f"pictures: none - no vision tower beside {name}: text only")
+    else:
+        ok("no vision tower in this pack: text only")
+    cfg_path = write_config_mm3(a, pc, meta, pack, ctx, models, d, quant)   # 8
+    if S.UI is not None:                               # 9: how this PC reads prompts fastest, measured
+        S.UI.step(9, "prefill calibration")
+    prefill_calibration(cfg_path, "once, for this setup")
+    if CDS.has_drafter(read_json(cfg_path)):           # 9: the DSpark drafter, measured on this PC (or chosen)
+        how = drafting_choice(a, "MiniMax's DSpark drafter", "10-30")
         if how != "measure":
             keep_drafting(cfg_path, how == "on")
         else:
@@ -3976,6 +4984,34 @@ def maya_version() -> str:
     return (HERE / "VERSION").read_text(encoding="utf-8").strip() if (HERE / "VERSION").exists() else "?"
 
 
+def model_option(a) -> str | None:
+    """--model as typed -> what the setup reads (in place): a.model a GLM download (a MODELS key), DS4 or MM3, and a
+    DeepSeek / MiniMax quant's files as --ds4-quant / --mm3-quant.  It takes a setup id (glm-maya-s, deepseek-maya-xs,
+    minimax-maya-xs ...), a quant's full name (MiniMax-M3.1-Flash-Maya-XS) or any name it took before (Maya-S24,
+    EXL3-3.05bpw, DeepSeek-V4.1-Flash-1017 ...; --mm3-quant gguf-xs as maya-xs).  The error for a name it does not
+    know, or for a quant --ds4-quant / --mm3-quant names otherwise; else None."""
+    if getattr(a, "mm3_quant", None):
+        a.mm3_quant = Q.MM3_QUANT_ALIASES.get(a.mm3_quant, a.mm3_quant)
+    if not a.model:
+        return None
+    hit = Q.resolve(a.model, list(MODELS))
+    if hit is None:
+        return (f"--model {a.model}: not a model Maya knows - one of " + ", ".join(i for _, _, _, i in Q.QUANTS) +
+                f", {DS4}, {MM3}, or a GLM-5.3-Flash download: " + ", ".join(MODELS))
+    family, key = hit
+    if family == "glm":
+        a.model = key
+        return None
+    a.model, flag = (DS4, "ds4_quant") if family == "deepseek" else (MM3, "mm3_quant")
+    if key is not None:
+        given = getattr(a, flag, None)
+        if given and given != key:
+            return (f"--model {Q.setup_id(family, key)} is {Q.shown(family, key)}, but --{flag.replace('_', '-')} "
+                    f"says {given}: give one of them")
+        setattr(a, flag, key)
+    return None
+
+
 def main() -> int:
     N.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engines read, for all it starts)
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
@@ -3990,18 +5026,31 @@ def main() -> int:
                     help="the setup in plain text, the answers typed (not on the setup's own screen)")
     ap.add_argument("--download-model", action="store_true",
                     help="download the model without asking (the commands and the size are still printed)")
-    ap.add_argument("--model", choices=list(MODELS) + [DS4],
-                    help=f"which model (default: asked): {DS4}, or a GLM-5.3-Flash download ({next(iter(MODELS))} "
-                         "recommended)")
+    ap.add_argument("--model", metavar="MODEL",
+                    help="which model and files (default: asked): a Maya quant - "
+                         + ", ".join(i for _, _, _, i in Q.QUANTS) +
+                         f" - or {DS4} / {MM3} (their files asked, or --ds4-quant / --mm3-quant), or a GLM-5.3-Flash "
+                         "download by its name (" + ", ".join(MODELS) + "; every name used before still works)")
     ap.add_argument("--model-dir", help=f"use {DS4}'s files you already have: their folder (a GGUF's shards, or the "
                                         "EXL3 quant's files and the Engram shards 47 / 48 of DeepSeek's repo); it "
                                         "must be writable - the pack is written inside it")
-    ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS),
+    ap.add_argument("--ds4-quant", choices=list(DS4_QUANTS) + [DS4_ABL_ALIAS],
                     help=f"{DS4}'s files: maya-s = Maya's quant (the experts in 2-3 bits; the default once "
                          "published; maya-m: 3.4 bits, once published; maya-xs: ~1.6 bits, with its own "
                          "2-bit drafter: the whole model in a 128 GB PC's memory), gguf-q8 = unsloth's UD-Q8_K_XL GGUF, gguf-q4 = its UD-Q4_K_XL "
                          "(dense weights Q8_0: less VRAM), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
-                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer)")
+                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, AMD experimental); "
+                         "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
+                         "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "
+                         "tables; a gated repo: HF_TOKEN or `hf auth login`), abliterated = the one that fits this "
+                         "PC; a Maya "
+                         "quant also as --model deepseek-maya-s / -maya-m / -maya-xs")
+    ap.add_argument("--mm3-quant", choices=list(MM3_QUANTS) + list(Q.MM3_QUANT_ALIASES),
+                    help=f"{MM3}'s files: exl3 = Mia-AiLab's EXL3 quant at 3.5 bits (NVIDIA; pictures, DSpark), "
+                         "maya-xs (or gguf-xs) = Maya's MiniMax-M3.1-Flash-Maya-XS (experts ~1.6 bits, ~93 GB: a 128 GB "
+                         "PC), maya-s (gguf-s) = MiniMax-M3.1-Flash-Maya-S (~2.1 bits, ~122 GB) - the GGUFs on NVIDIA "
+                         "from V100 on and on AMD; with --model-dir: the files you have (the same as --model "
+                         "minimax-maya-xs / minimax-maya-s)")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
@@ -4019,7 +5068,8 @@ def main() -> int:
                                    "0,1,2,3")
     ap.add_argument("--context", type=int, help=f"context length in tokens (default {DEFAULT_CONTEXT})")
     ap.add_argument("--parallel", type=int, choices=range(1, 9), metavar="N",
-                    help="answer up to N requests at once (1-8, default 1), kept in the config: on one GPU they are "
+                    help="GLM-5.3-Flash only: answer up to N requests at once (1-8, default 1), kept in the config: "
+                         "on one GPU they are "
                          "decoded together, more tokens per second in all; each extra conversation keeps its own "
                          "context in VRAM, which the expert cache gives up")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
@@ -4064,6 +5114,9 @@ def main() -> int:
     ap.add_argument("--config", type=Path, help="the installed JSON config to start (its run-maya-<model>.sh does), or "
                                               "for --bench or --report (default: most recently used)")
     a = ap.parse_args()
+    why = model_option(a)
+    if why:
+        ap.error(why)
     if a.vram_reserve_mib is not None and a.vram_reserve_mib < 0:
         ap.error("--vram-reserve-mib takes a number of MiB, 0 or more, e.g. --vram-reserve-mib 2048")
     if a.config is not None:
@@ -4078,7 +5131,7 @@ def main() -> int:
         sys.stdout.flush()
         os.execve("/bin/sh", ["/bin/sh", str(HERE / "maya.sh"), *sys.argv[1:]], dict(os.environ, MAYA_SH="1"))
     version = maya_version()
-    say(f"Project Maya v{version} - GLM-5.3-Flash or {DS4} on your own GPU(s).")
+    say(f"Project Maya v{version} - GLM-5.3-Flash, {DS4} or {MM3} on your own GPU(s).")
     if a.report:
         return report(version, a.backend, a.config)
     if a.bench:
@@ -4107,6 +5160,7 @@ def main() -> int:
             for i, c in enumerate(have, 1):
                 say(f"  {i}) {c.name}")
             pick = have[int(ask("Which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        check_parallel(a, config_family(read_json(pick)))
         if a.mmap_experts:   # (#422: given on a start too - written into a DeepSeek config, which keeps it)
             cfg = read_json(pick)
             if config_family(cfg) != "deepseek":

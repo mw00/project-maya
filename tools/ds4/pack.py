@@ -122,7 +122,7 @@ def check_k_map(model: pathlib.Path, st: SafeTensors) -> int | None:
 
     def want(name: str):
         if name.startswith("mtp."):
-            return km.get("mtp_bits")
+            return km.get("mtp_bits") if ".ffn.experts." in name else km.get("head_bits")
         if name.startswith("head."):
             return km.get("head_bits")
         parts = name.split(".")
@@ -132,11 +132,16 @@ def check_k_map(model: pathlib.Path, st: SafeTensors) -> int | None:
         if rest.startswith("ffn.experts."):
             return km["routed"].get(L)
         if rest.startswith("ffn.shared_experts."):
-            return (km.get("shared_overrides") or {}).get(L, km["shared"].get(L))
+            override = (km.get("shared_overrides") or {}).get(L)
+            if isinstance(override, dict) and "note" in override:
+                return None
+            return override if override is not None else km["shared"].get(L)
         if rest.startswith("engram."):
             return (km.get("engram") or {}).get(L)
         if rest == "attn.indexer.wk":
             return km.get("indexer_wk_bits", km.get("attn_default"))
+        if L == "0" and rest in ("attn.wq_a", "attn.wkv"):
+            return km.get("head_bits", km.get("attn_default"))
         return km.get("attn_default")
 
     bad, n = [], 0

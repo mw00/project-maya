@@ -1,0 +1,230 @@
+{
+ "_": "MiniMax-M3.1-Flash for maya-mm3 (maya.py's MiniMax setup): Mia-AiLab's EXL3 EAQ v1 quant at 3.5 bpw, every file pinned to a revision with its size and sha256 (the LFS ones checked against Hugging Face's). The DSpark draft in its dspark/ folder is a download of its own (dspark below). The README's pictures (images/) are not needed and not listed.",
+ "name": "MiniMax-M3.1-Flash",
+ "repo": "Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw",
+ "revision": "fe796c40546d8b28340c5ed85b892e181ee21dec",
+ "license": "MiniMax-M3.1-Flash's (MiniMaxAI)",
+ "files": {
+  ".gitattributes": [
+   1829,
+   "d2f7642adc9b521f6f5458f12bc2c668d3c41182d2acc4dea68d45a15e6c0d75"
+  ],
+  "README.md": [
+   9472,
+   "24869890a303b05e7aab026ac5733c03a39a834891861640ae13baa755df42dc"
+  ],
+  "added_tokens.json": [
+   1660,
+   "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e"
+  ],
+  "chat_template.jinja": [
+   13151,
+   "01a13fa194313b925b4f7b69b7aa315aa13ee68a47d4ddb4a8e73e2cf8768ff8"
+  ],
+  "config.json": [
+   5369,
+   "9e3f335dbc8a84ebf3d15ab895e70d4b5e4a01f833f2c03956972953d562d158"
+  ],
+  "configuration_minimax_m3_vl.py": [
+   4356,
+   "836c3e4aff06f88bd2891b18292424ed7a90158b508d9235d490a33d9e3cba32"
+  ],
+  "generation_config.json": [
+   150,
+   "272d19efac5060ff8c9f76c7ed67909a5da1be466284ee4f1f1bd2a810c6fad2"
+  ],
+  "image_processor.py": [
+   7856,
+   "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994"
+  ],
+  "merges.txt": [
+   2414077,
+   "ca47ea60cf5bd48832586adc264f439d0ea4254176b24a95f85eaa9750e2b5f9"
+  ],
+  "model-00001-of-00025.safetensors": [
+   6905932519,
+   "267a355196df56cb4011d2b0960b46065954391c8cd013bcb845196183fc9a17"
+  ],
+  "model-00002-of-00025.safetensors": [
+   7515914000,
+   "f8924eef4f77e9f2d7512ecd70d042f32e5946425386d2c0da320d95861807a1"
+  ],
+  "model-00003-of-00025.safetensors": [
+   7515914000,
+   "6234b7cf40d1406d2cb806dc2ebd6856e8da6ba46ecdcf7b4f03f75f0655a118"
+  ],
+  "model-00004-of-00025.safetensors": [
+   7515914000,
+   "f31e1810327ee8ba61eaa9055618b69a0e783c15b2126497de781c3fb793ed68"
+  ],
+  "model-00005-of-00025.safetensors": [
+   7515917148,
+   "1bd08f0116d90fa3cdadd497ec29397708cfe16ecab288f441bcf644b88936a8"
+  ],
+  "model-00006-of-00025.safetensors": [
+   7515917148,
+   "75bb67334d9310daca71c4e9692ed35e86687804a1b080f95bdabb36c5cf67fa"
+  ],
+  "model-00007-of-00025.safetensors": [
+   7515917148,
+   "628c004c553a4cc701cb7cd2bedf94a68567f25045c98a4e15822f83b808df68"
+  ],
+  "model-00008-of-00025.safetensors": [
+   7213927260,
+   "c80774bd0e55559a1f11f97d0377fbca6aa0019e5f8cbd7660dd87b0daa7ae00"
+  ],
+  "model-00009-of-00025.safetensors": [
+   8555966897,
+   "5c53acb87446028352f3785b806dfeb4b27514011966d71f148756461d73dff7"
+  ],
+  "model-00010-of-00025.safetensors": [
+   8555966897,
+   "0804fa96cb90503ed27a8b083bcc5c884fbfdf4c7f2bc3e84f19914d86029b30"
+  ],
+  "model-00011-of-00025.safetensors": [
+   8555966897,
+   "c020b7c60f26d35d2f9bc6f1a8d46d17824777e8e7bb085b66cab60f92efa589"
+  ],
+  "model-00012-of-00025.safetensors": [
+   8555966897,
+   "1150f539a76e4d53440b6d37a4641c692a0f6b89cc9a243109614c4b552e3de3"
+  ],
+  "model-00013-of-00025.safetensors": [
+   8555966897,
+   "8ba01acd93174d1cdd61cc684e89c4199f7790ebe21dd0bab8b2192baf54f964"
+  ],
+  "model-00014-of-00025.safetensors": [
+   8555966897,
+   "3750c5f8400c518fc053629e5d4ac94069a59e52a027ea6cfda7aa1688aad3a5"
+  ],
+  "model-00015-of-00025.safetensors": [
+   8555966897,
+   "af32bb51b01d42a8d6dbf820032e9f2c2f3ee74635525261f6ce37c395fb0a33"
+  ],
+  "model-00016-of-00025.safetensors": [
+   8555966897,
+   "3b906f9a9177d8b9754289cdfff307617f2d639a256764d825ddddb9f98430c4"
+  ],
+  "model-00017-of-00025.safetensors": [
+   8555966897,
+   "d0afed2ed4b126ff96eac70fce92d791f441d111ab3db84cc84dd701c239b42d"
+  ],
+  "model-00018-of-00025.safetensors": [
+   6609947172,
+   "79449fc0d67589e05b87fce11d3645729379ccc5a2015558f2b2d74f384fe90d"
+  ],
+  "model-00019-of-00025.safetensors": [
+   7515917148,
+   "b195bfe83e4c13f560a567c63eda8f3f5e5510db6e45461b4066194a54fe7375"
+  ],
+  "model-00020-of-00025.safetensors": [
+   7515917148,
+   "6721720a96268c9be3690fc246850aee67edaf2f1ac96d926bd0201b1e24534c"
+  ],
+  "model-00021-of-00025.safetensors": [
+   7515917148,
+   "ac7ed8746da2b02ec44deda0e10ccaf9e3ea9e26dd9d632822b58e73b7fdf3f4"
+  ],
+  "model-00022-of-00025.safetensors": [
+   7515917148,
+   "3b82090a424eb71efb97d6607cc69d46994366e510c04525b9ab1ed53611b49f"
+  ],
+  "model-00023-of-00025.safetensors": [
+   7515917148,
+   "5a0e729f5cb15957f811e3bb4691034f86e75f2d117fec4546c85ab566706648"
+  ],
+  "model-00024-of-00025.safetensors": [
+   7515917148,
+   "0c1f2cde13d6bc88f4ba518ff69aa1fd5d6faaf6e0e5747bd4208c42defa2170"
+  ],
+  "model-00025-of-00025.safetensors": [
+   4680278228,
+   "8dd19eef7ecdc01add60039d497799248084cacf1d295ce4aa3df63aecd6ab79"
+  ],
+  "model-vision-00001-of-00001.safetensors": [
+   1734216664,
+   "1872050f5b0439bfb42303bd22f8522f1788219444b0b6cb32e755f096aa2d3a"
+  ],
+  "model.safetensors.index.json": [
+   9952905,
+   "1e529ed2acaedad49dbc992ffd208f316ebaf0c7b8de18e411c8772b2e48b1a5"
+  ],
+  "preprocessor_config.json": [
+   772,
+   "36785da1dc7a00324048bd7c537c24247fca97c626884818257fd0b92287de31"
+  ],
+  "processing_minimax.py": [
+   9965,
+   "0706ae8b93b3489a3b3bc7f48a5f29fb34b1449ebebb37586250e4d5fa8f5e35"
+  ],
+  "quantization_config.json": [
+   14732160,
+   "7b704b693edb3c2b8347a3ed9e5d30c3ed4e52547ed8ce0126ffca5934713b97"
+  ],
+  "special_tokens_map.json": [
+   277,
+   "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97"
+  ],
+  "tokenizer.json": [
+   9731500,
+   "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e"
+  ],
+  "tokenizer_config.json": [
+   11288,
+   "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5"
+  ],
+  "video_processor.py": [
+   7318,
+   "ced0f8d85d73f8722fecb26033d2d91ecf4a4e5112c91ce1b1522ca7edd0943d"
+  ],
+  "vocab.json": [
+   4705413,
+   "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a"
+  ]
+ },
+ "dspark": {
+  "folder": "dspark",
+  "files": {
+   "added_tokens.json": [
+    1660,
+    "63f277741fb061e615cb604286a845d971178ba4716732a59cf42b3752c0ce4e"
+   ],
+   "chat_template.jinja": [
+    13151,
+    "01a13fa194313b925b4f7b69b7aa315aa13ee68a47d4ddb4a8e73e2cf8768ff8"
+   ],
+   "config.json": [
+    9973,
+    "d3f2ef9a308be0c5689e98b348d8cff73b90487db22ba79e9269f9b1f25cfa3a"
+   ],
+   "merges.txt": [
+    2414077,
+    "ca47ea60cf5bd48832586adc264f439d0ea4254176b24a95f85eaa9750e2b5f9"
+   ],
+   "model-dspark-00001.safetensors": [
+    2301867426,
+    "a71a16355b4e772383a433f92c8c452dc24b5bb82046142b8221576c6c5fe23c"
+   ],
+   "model.safetensors.index.json": [
+    11432,
+    "593f6315b17044d94d5a7e1d231669bcc4dbf9efb06657816d945f1f45c82a6a"
+   ],
+   "special_tokens_map.json": [
+    277,
+    "401b624ec44507183d1dc65c74f7f3387699a77971aa19fa5a0cc57a3989ba97"
+   ],
+   "tokenizer.json": [
+    9731500,
+    "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e"
+   ],
+   "tokenizer_config.json": [
+    11288,
+    "15caca9f74fbce9b86dc014e9324cbefa56703d81ccd6d56020faa1c41d2eae5"
+   ],
+   "vocab.json": [
+    4705413,
+    "b44c066b5dc34c800c4e3ecbd85f3e95ce3bfdbf8a5fe30223e005175103578a"
+   ]
+  }
+ }
+}

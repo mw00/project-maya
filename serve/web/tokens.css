@@ -1,5 +1,6 @@
-/* Project Maya UI - tokens.  Dark is the default (<html data-theme="dark">); light via data-theme="light".
-   The variable names keep the kit's --st-* prefix so every component reads them unchanged. */
+/* Project Maya UI - design tokens, v2: neutral grays with Maya's violet as the one accent.
+   Dark is the default (:root); light with <html data-theme="light">.  The page sets data-theme before its first paint
+   from the saved choice ("maya.theme": dark, light or system).  Every name keeps the --st-* prefix. */
 
 /* Outfit (SIL Open Font License 1.1, serve/web/fonts/OFL.txt): one variable font, weights 100-900 */
 @font-face{font-family:"Outfit";src:url("../fonts/outfit-latin-wght.woff2") format("woff2-variations");font-weight:100 900;font-display:swap;unicode-range:U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD}
@@ -9,93 +10,152 @@
   /* type */
   --st-font:"Outfit",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
   --st-font-mono:ui-monospace,"SF Mono","Cascadia Code",Consolas,"Liberation Mono",monospace;
-  --st-fs-xs:12px;  --st-fs-sm:13px; --st-fs-md:14px; --st-fs-base:15px;
-  --st-fs-lg:18px;  --st-fs-xl:24px; --st-fs-stat:30px; --st-fs-display:44px; --st-fs-hero:64px;
-  --st-fw-regular:400; --st-fw-medium:500; --st-fw-bold:650; --st-fw-black:800;
-  --st-lh-tight:1.05; --st-lh-body:1.55;
+  --st-fs-xs:12px; --st-fs-sm:13px; --st-fs-md:14px; --st-fs-base:15px; --st-fs-chat:16px;
+  --st-fs-lg:18px; --st-fs-xl:22px; --st-fs-stat:22px; --st-fs-display:30px; --st-fs-hero:48px;
+  --st-fw-regular:400; --st-fw-medium:500; --st-fw-bold:600; --st-fw-black:700;
+  --st-lh-tight:1.05; --st-lh-body:1.55; --st-lh-chat:1.65;
 
   /* spacing (4pt) */
   --st-s-1:4px; --st-s-2:8px; --st-s-3:12px; --st-s-4:16px; --st-s-5:20px;
   --st-s-6:24px; --st-s-8:32px; --st-s-10:40px; --st-s-12:48px; --st-s-16:64px;
 
-  /* radius */
-  --st-r-sm:8px; --st-r-md:12px; --st-r-lg:18px; --st-r-xl:24px; --st-r-pill:9999px;
+  /* shape */
+  --st-r-xs:6px; --st-r-sm:8px; --st-r-row:10px; --st-r-md:12px; --st-r-lg:16px; --st-r-xl:20px; --st-r-box:28px;
+  --st-r-pill:9999px;
 
   /* motion */
   --st-ease:cubic-bezier(.2,.7,.2,1); --st-dur:160ms;
 
   /* layout */
-  --maya-side:236px;
+  --maya-side:312px; --maya-read:768px;
 
-  /* color - light */
-  --st-bg:#f4f4fa;
-  --st-bg-glow-1:rgba(109,92,246,.10);
-  --st-bg-glow-2:rgba(14,165,233,.08);
+  /* color - dark (the default) */
+  --st-side:#111114;            /* the sidebar */
+  --st-bg:#19191d;              /* the page */
+  --st-surface:#222227;         /* the message box, cards, menus, dialogs */
+  --st-surface-2:#2a2a30;       /* a user's message, hover, chips */
+  --st-surface-3:#34343b;       /* tracks, a disabled send */
+  --st-open:rgba(255,255,255,.08);   /* the open chat's row, the open section: a wash, so it reads on the glass sidebar */
+  --st-glass-hover:rgba(255,255,255,.05);   /* hover on the glass sidebar */
+  --st-side-glass:color-mix(in srgb,#111114 88%,transparent);   /* the sidebar's glass: its own color, a little see-through */
+  --st-glass-sheen:rgba(255,255,255,.035);  /* the glass's light at the top */
+  --st-glass-edge:rgba(255,255,255,.06);    /* its right edge */
+  --st-line:#2e2e35;
+  --st-line-strong:#3d3d46;
+  --st-ink:#ececf1;
+  --st-ink-soft:#c9c9d3;
+  --st-ink-muted:#9d9daa;
+
+  --st-accent:#8b7cff;
+  --st-accent-2:#38bdf8;        /* the second stop of the logo's gradient (the logo only) */
+  --st-accent-hover:#9d90ff;
+  --st-accent-ink:#0b0c18;      /* text on the accent */
+  --st-accent-text:#b4aaff;     /* the accent as text */
+  --st-accent-tint:rgba(139,124,255,.14);
+  --st-focus:#a397ff;
+
+  --st-info:#38bdf8;   --st-info-tint:rgba(56,189,248,.13);   --st-info-text:#7dd3fc;
+  --st-ok:#34d399;     --st-ok-tint:rgba(52,211,153,.13);     --st-ok-text:#6ee7b7;
+  --st-warn:#fbbf24;   --st-warn-tint:rgba(251,191,36,.13);   --st-warn-text:#fcd34d;
+  --st-danger:#fb7185; --st-danger-tint:rgba(251,113,133,.13); --st-danger-text:#fda4af;
+
+  --st-code-bg:#0f0f12; --st-code-head:#18181c; --st-code-ink:#e4e6f8; --st-code-dim:#9aa0c8;
+
+  --st-shadow-box:none;
+  --st-shadow-pop:0 0 0 1px #3d3d46,0 12px 32px rgba(0,0,0,.45);
+  --st-shadow-sheet:0 -12px 40px rgba(0,0,0,.45);
+  --st-scrim:rgba(0,0,0,.55);
+  --st-glass-bg:rgba(48,48,56,.42); --st-glass-line:rgba(255,255,255,.14);
+  --st-glass-bar:rgba(25,25,29,.74); --st-bar-shadow:0 6px 18px rgba(0,0,0,.32);   /* the phone's top bar */
+  --st-switch-knob:#ffffff;
+
+  /* the names the earlier page used (kept so nothing reads an unset variable) */
+  --st-line-soft:var(--st-line); --st-icon:var(--st-ink-soft);
+  --st-bg-glow-1:transparent; --st-bg-glow-2:transparent;
+  --st-sh-card:none; --st-sh-bar:var(--st-shadow-pop); --st-sh-pop:var(--st-shadow-pop); --st-glow:none;
+  color-scheme:dark;
+}
+
+/* color - light */
+[data-theme="light"]{
+  --st-side:#f7f7f9;
+  --st-bg:#ffffff;
   --st-surface:#ffffff;
-  --st-surface-2:#f0f0f8;
-  --st-surface-3:#e8e8f4;
-  --st-line:#e0e1ef;
-  --st-line-soft:#ebebf5;
-  --st-ink:#14152b;
-  --st-ink-soft:#33365a;
-  --st-ink-muted:#62668a;
-  --st-icon:#33365a;
+  --st-surface-2:#f2f2f5;
+  --st-surface-3:#e8e8ed;
+  --st-open:rgba(24,24,29,.06);
+  --st-glass-hover:rgba(24,24,29,.04);
+  --st-side-glass:color-mix(in srgb,#f7f7f9 88%,transparent);
+  --st-glass-sheen:rgba(255,255,255,.6);
+  --st-glass-edge:rgba(255,255,255,.8);
+  --st-line:#e6e6eb;
+  --st-line-strong:#d4d4dc;
+  --st-ink:#18181d;
+  --st-ink-soft:#3a3a44;
+  --st-ink-muted:#676773;
 
   --st-accent:#6d5cf6;
-  --st-accent-2:#0ea5e9;          /* the second stop of the brand gradient */
+  --st-accent-2:#0ea5e9;
   --st-accent-hover:#5a48e8;
   --st-accent-ink:#ffffff;
-  --st-accent-tint:#efecff;
   --st-accent-text:#5143d9;
+  --st-accent-tint:#f0eeff;
   --st-focus:#6d5cf6;
 
-  --st-info:#0284c7;     --st-info-tint:#e0f2fe;    --st-info-text:#0369a1;
-  --st-ok:#10b981;       --st-ok-tint:#e7f8f1;      --st-ok-text:#047857;
-  --st-warn:#d97706;     --st-warn-tint:#fef3c7;    --st-warn-text:#92400e;
-  --st-danger:#e11d48;   --st-danger-tint:#ffe4e9;  --st-danger-text:#be123c;
+  --st-info:#0284c7;   --st-info-tint:#e0f2fe;   --st-info-text:#0369a1;
+  --st-ok:#10b981;     --st-ok-tint:#e7f8f1;     --st-ok-text:#047857;
+  --st-warn:#d97706;   --st-warn-tint:#fef3c7;   --st-warn-text:#92400e;
+  --st-danger:#e11d48; --st-danger-tint:#ffe4e9; --st-danger-text:#be123c;
 
-  --st-code-bg:#141629;  --st-code-ink:#e4e6f8;
+  --st-code-bg:#17171b; --st-code-head:#222228;
 
-  --st-sh-card:0 1px 2px rgba(20,21,43,.04),0 6px 18px rgba(20,21,43,.04);
-  --st-sh-bar:0 18px 40px rgba(20,21,43,.08),0 2px 6px rgba(20,21,43,.05);
-  --st-sh-pop:0 18px 48px rgba(20,21,43,.14),0 2px 6px rgba(20,21,43,.06);
-  --st-glow:0 8px 24px rgba(109,92,246,.28);
+  --st-shadow-box:0 1px 2px rgba(24,24,29,.04),0 6px 24px rgba(24,24,29,.06);
+  --st-shadow-pop:0 0 0 1px #d4d4dc,0 12px 32px rgba(24,24,29,.12);
+  --st-shadow-sheet:0 -12px 40px rgba(24,24,29,.16);
+  --st-scrim:rgba(24,24,29,.35);
+  --st-glass-bg:rgba(255,255,255,.55); --st-glass-line:rgba(24,24,29,.10);
+  --st-glass-bar:rgba(255,255,255,.76); --st-bar-shadow:0 6px 18px rgba(24,24,29,.08);
   color-scheme:light;
 }
 
-/* color - dark (the default) */
-[data-theme="dark"]{
+/* the Violet colours (Settings > General > Colours, <html data-scheme="violet">): the earlier dashboard's violet-tinted
+   surfaces and the page's two glows (violet top left, sky bottom right), in the dark theme and the light one; the glass
+   sidebar takes its tint, so the glows show through it */
+:root[data-scheme="violet"]:not([data-theme="light"]){
+  --st-side:#0c0d20;
+  --st-side-glass:color-mix(in srgb,#0c0d20 80%,transparent);
   --st-bg:#090a14;
-  --st-bg-glow-1:rgba(124,108,255,.16);
-  --st-bg-glow-2:rgba(14,165,233,.10);
   --st-surface:#11132a;
   --st-surface-2:#171a34;
   --st-surface-3:#1e2240;
   --st-line:#252a4a;
-  --st-line-soft:#1b1f3a;
+  --st-line-strong:#323865;
   --st-ink:#eceefe;
   --st-ink-soft:#c3c7e6;
   --st-ink-muted:#8a8fb4;
-  --st-icon:#c3c7e6;
-
-  --st-accent:#8b7cff;
-  --st-accent-2:#38bdf8;
-  --st-accent-hover:#a397ff;
-  --st-accent-ink:#0b0c18;
-  --st-accent-tint:rgba(139,124,255,.15);
-  --st-accent-text:#b4aaff;
-  --st-focus:#a397ff;
-
-  --st-info:#38bdf8;     --st-info-tint:rgba(56,189,248,.13);  --st-info-text:#7dd3fc;
-  --st-ok:#34d399;       --st-ok-tint:rgba(52,211,153,.13);    --st-ok-text:#6ee7b7;
-  --st-warn:#fbbf24;     --st-warn-tint:rgba(251,191,36,.13);  --st-warn-text:#fcd34d;
-  --st-danger:#fb7185;   --st-danger-tint:rgba(251,113,133,.13);--st-danger-text:#fda4af;
-
-  --st-code-bg:#07080f;  --st-code-ink:#e4e6f8;
-
-  --st-sh-card:0 1px 0 rgba(255,255,255,.03) inset,0 10px 30px rgba(0,0,0,.25);
-  --st-sh-bar:0 18px 48px rgba(0,0,0,.45),0 2px 6px rgba(0,0,0,.35);
-  --st-sh-pop:0 22px 60px rgba(0,0,0,.6),0 2px 6px rgba(0,0,0,.4);
-  --st-glow:0 8px 28px rgba(139,124,255,.35);
-  color-scheme:dark;
+  --st-code-bg:#07080f; --st-code-head:#0f1122;
+  --st-shadow-pop:0 0 0 1px #323865,0 22px 60px rgba(0,0,0,.6);
+  --st-glass-bg:rgba(30,34,64,.42); --st-glass-bar:rgba(9,10,20,.74);
+  --st-bg-glow-1:rgba(124,108,255,.16); --st-bg-glow-2:rgba(14,165,233,.10);
 }
+:root[data-scheme="violet"][data-theme="light"]{
+  --st-side:#eeeef8;
+  --st-side-glass:color-mix(in srgb,#eeeef8 80%,transparent);
+  --st-bg:#f4f4fa;
+  --st-surface:#ffffff;
+  --st-surface-2:#f0f0f8;
+  --st-surface-3:#e8e8f4;
+  --st-line:#e0e1ef;
+  --st-line-strong:#cfd1e6;
+  --st-ink:#14152b;
+  --st-ink-soft:#33365a;
+  --st-ink-muted:#62668a;
+  --st-glass-bar:rgba(244,244,250,.76);
+  --st-bg-glow-1:rgba(109,92,246,.10); --st-bg-glow-2:rgba(14,165,233,.08);
+}
+:root[data-scheme="violet"] body{
+  background:radial-gradient(900px 600px at 0% -10%,var(--st-bg-glow-1),transparent 60%),
+             radial-gradient(800px 600px at 110% 110%,var(--st-bg-glow-2),transparent 60%),var(--st-bg);
+  background-attachment:fixed;
+}
+:root[data-scheme="violet"] .shell > .chat, :root[data-scheme="violet"] .shell > .mon{ background:transparent; }

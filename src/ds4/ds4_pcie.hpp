@@ -8,10 +8,12 @@
 // memory and the copy), the GPU's time an expert after the wait, and a read from the disk for experts not in RAM.
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 namespace strata::ds4::pcie {
 
@@ -82,6 +84,19 @@ inline bool streams_any(const Costs& k, int max_s, int n_max) {
     for (int n = 1; n <= n_max && n <= 8; ++n)
         if (split(k, n, 0u, max_s) != 0u || split(k, n, (1u << n) - 1u, max_s) != 0u) return true;
     return false;
+}
+
+/// The pre-placement allocation always follows the persisted baseline decision; experimental ZC settings cannot
+/// override it and thereby change expert placement. Forced routing keeps its existing explicit override.
+inline bool baseline_lane_off(const std::string& forced, const std::string& persisted) {
+    return forced.empty() && persisted == "off";
+}
+
+/// ZC-all becomes usable only after the copies and their pinning actually exist. An empty/all-zero slot table, an
+/// explicit forced route, and the hold-for-tests mode are all inert, including for the subordinate no-wait setting.
+inline bool zc_all_usable(bool requested, bool forced, bool hold, bool zc, const std::vector<char>& pinned_slots) {
+    return requested && !forced && !hold && zc &&
+           std::any_of(pinned_slots.begin(), pinned_slots.end(), [](char v) { return v != 0; });
 }
 
 /// The times file (DS4_LANE_CAL, by default <pack>/lane-times.txt): a line a key, "key<TAB>values".  get: the values

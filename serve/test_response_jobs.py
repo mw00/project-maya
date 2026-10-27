@@ -249,7 +249,7 @@ class BackgroundResponses(ResponseCase):
         with self.request(path=f"/v1/responses/{initial['id']}?stream=true&starting_after=0") as response:
             self.assertEqual(response.status, 410)
         self.assertLessEqual(self.svc.response_jobs.stats()["event_bytes"], 4096)
-        self.script("x" * 5000)
+        self.script(" ".join(f"word{i}" for i in range(800)))   # (5000+ bytes and no loop: the loop guard ends one)
         _, initial = self.post(background=True, store=True)
         out = self.wait(initial["id"])
         self.assertEqual(out["status"], "failed")

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <sstream>
@@ -93,6 +94,19 @@ inline bool pread_direct(fd_t f, void* dst, uint64_t n, uint64_t off) {
     return got >= want;
 #endif
 }
+/// Read an arbitrarily aligned expert span through O_DIRECT into a reusable aligned staging buffer,
+/// then copy its exact bytes to the NUMA destination. A failure leaves the caller to use buffered I/O.
+inline bool copy_direct(fd_t f, uint64_t off, uint64_t n, void* dst, std::vector<uint8_t>& staging) {
+    if (f == kBadFd || n == 0 || off > UINT64_MAX - n || off + n > (uint64_t) INT64_MAX - kDirectAlign) return false;
+    const uint64_t span = direct_span(off, n);
+    if (span > SIZE_MAX - kDirectAlign) return false;
+    staging.resize((size_t) span + kDirectAlign);
+    auto* aligned = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(staging.data()) + kDirectAlign - 1) & ~(uintptr_t)(kDirectAlign - 1));
+    if (!pread_direct(f, aligned, n, off)) return false;
+    std::memcpy(dst, aligned + off % kDirectAlign, (size_t) n);
+    return true;
+}
+
 /// Windows: the file opened for unbuffered reads (FILE_FLAG_NO_BUFFERING), for a file no view of this process maps -
 /// unbuffered reads of a mapped file take a slow path there (open_direct); kBadFd elsewhere
 inline fd_t open_unbuffered(const std::string& path) {
@@ -107,18 +121,25 @@ inline fd_t open_unbuffered(const std::string& path) {
 }
 /// [off, off + n) through open_unbuffered's handle (one thread's) into buf, kDirectAlign-aligned and at least
 /// direct_span(off, n) bytes: the bytes land at buf + off % kDirectAlign
-inline bool pread_unbuffered(fd_t f, void* buf, uint64_t n, uint64_t off) {
+inline bool pread_unbuffered_aligned(fd_t f, void* buf, uint64_t n, uint64_t off, uint64_t alignment) {
 #if defined(_WIN32)
-    const uint64_t a0 = off & ~(kDirectAlign - 1), span = direct_span(off, n);
+    if (alignment == 0 || off > UINT64_MAX - n) return false;
+    const uint64_t a0 = off - off % alignment, delta = off - a0;
+    if (delta > UINT64_MAX - n || delta + n > UINT64_MAX - (alignment - 1)) return false;
+    const uint64_t span = (delta + n + alignment - 1) / alignment * alignment;
+    if (span > MAXDWORD) return false;
     OVERLAPPED ov{};
     ov.Offset = (DWORD) a0;
     ov.OffsetHigh = (DWORD) (a0 >> 32);
     DWORD got = 0;
-    return ReadFile((HANDLE) f, buf, (DWORD) span, &got, &ov) && got >= (off - a0) + n;
+    return ReadFile((HANDLE) f, buf, (DWORD) span, &got, &ov) && got >= delta + n;
 #else
-    (void) f, (void) buf, (void) n, (void) off;
+    (void) f, (void) buf, (void) n, (void) off, (void) alignment;
     return false;
 #endif
+}
+inline bool pread_unbuffered(fd_t f, void* buf, uint64_t n, uint64_t off) {
+    return pread_unbuffered_aligned(f, buf, n, off, kDirectAlign);
 }
 /// The same file opened for reads from many threads at once (Windows runs the reads of a synchronous handle one at a
 /// time, so an overlapped one; Linux: a plain descriptor, pread is concurrent anyway)
@@ -244,6 +265,27 @@ inline void advise(fd_t f, uint64_t off, uint64_t n, bool need) {
     (void) f, (void) off, (void) n, (void) need;
 #else
     posix_fadvise((int) f, (off_t) off, (off_t) n, need ? POSIX_FADV_WILLNEED : POSIX_FADV_DONTNEED);
+#endif
+}
+
+/// Release only whole source-file pages after their bytes have been copied to private RAM.
+/// Edge pages may contain another tensor or a concurrent reader's bytes: leave them cached.
+/// Advisory, not a guarantee of eviction (mapped/locked pages can remain). Returns bytes accepted as a hint.
+inline uint64_t release_copied_cache(fd_t f, uint64_t off, uint64_t n) {
+#if defined(_WIN32)
+    (void) f, (void) off, (void) n;
+    return 0;
+#else
+    const long page = sysconf(_SC_PAGESIZE);
+    if (f == kBadFd || page <= 0 || n == 0 || off > UINT64_MAX - n) return 0;
+    const uint64_t p = (uint64_t) page;
+    const uint64_t rem = off % p;
+    const uint64_t skip = rem == 0 ? 0 : p - rem;
+    if (skip >= n) return 0;
+    const uint64_t begin = off + skip, end = (off + n) / p * p;
+    if (end <= begin || end > (uint64_t) INT64_MAX) return 0;
+    return posix_fadvise((int) f, (off_t) begin, (off_t) (end - begin), POSIX_FADV_DONTNEED) == 0
+               ? end - begin : 0;
 #endif
 }
 

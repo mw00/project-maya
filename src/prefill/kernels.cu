@@ -2,6 +2,7 @@
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/router_top10.hpp"
+#include "strata/prefill/failure.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -48,9 +49,14 @@ __device__ float block_sum(float v, float* sh) {
     __syncthreads();
     return sh[0];
 }
+// A failed launch (an allocation, most of the time) ends this request, not the process: the reason is thrown and
+// the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
 void check(const char* what) {
     const cudaError_t e = cudaGetLastError();
-    if (e != cudaSuccess) { std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e)); std::exit(1); }
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "prefill %s: %s\n", what, cudaGetErrorString(e));
+        strata::prefill::fail(std::string("prefill ") + what + ": " + cudaGetErrorString(e));
+    }
 }
 unsigned blocks_for(int64_t n, int t = 256) { return (unsigned) ((n + t - 1) / t); }
 

@@ -2,10 +2,11 @@
 // double-precision reference of random BF16 matrices and MXFP4 experts: the GEMVs (BF16 / MXFP4, 1..16 activations,
 // aligned or not), the token experts (gate / up / swiglu / down / combine, experts off the device, the CPU part, the
 // shared expert), a window's grouped experts (bit for bit the token path's), the prompt path's expert sets and the CPU
-// lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q4_K; their decode equal to ggml's dequantize_row_* on
-// random blocks); the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
+// lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q6_K; their decode equal to ggml's dequantize_row_* on
+// random blocks), and layers that put MXFP4 beside a low-bit role; the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
-// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone)
+// ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ar <device> <device> [rows]
+// (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
@@ -620,8 +621,10 @@ void test_experts(int D, int F, cudaStream_t s) {
 }
 
 // ---------------------------------------------------------------- the low-bit types (ds4_iq)
-// random blocks of a type: random bytes, the block scales small normal values (every grid index, sign and code)
+// random blocks of a type: random bytes, the block scales small normal values (every grid index, sign and code);
+// MXFP4: mx_rand's (a role of a layer that mixes it with the low-bit types)
 std::vector<uint8_t> q_rand(int type, int n, int k) {
+    if (type == gg::kTypeMXFP4) return mx_rand(n, k);
     const size_t rb = gg::type_row_bytes(type, k), bb = (size_t) gg::iq::block_bytes(type);
     std::vector<uint8_t> w(rb * n);
     for (auto& v : w) v = (uint8_t) (rng() & 0xff);
@@ -636,6 +639,7 @@ std::vector<uint8_t> q_rand(int type, int n, int k) {
             case gg::iq::kQ5_K: put(o, d), put(o + 2, 0.5f * d); break;
             case gg::iq::kQ2_K: put(o + 80, d), put(o + 82, 0.5f * d); break;
             case gg::iq::kQ3_K: put(o + 108, d); break;
+            case gg::iq::kQ6_K: put(o + 208, d); break;
             case gg::iq::kIQ1_M: {   // (d: an F16 in the top nibbles of the 4 scale words, bytes 48..55)
                 const __half h = __float2half(d);
                 uint16_t u;
@@ -665,7 +669,8 @@ double q_dot(int type, const uint8_t* row, int k, const float* x) {
 const char* tn(int t) { return gg::type_name(t); }
 const int kQTypes[] = {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS,
                        gg::iq::kQ2_K,    gg::iq::kQ3_K, gg::iq::kQ4_K,    gg::iq::kIQ1_S, gg::iq::kIQ1_M,
-                       gg::iq::kIQ2_XS,  gg::iq::kQ5_K};   // (the last two: dense weights / other GGUFs' experts)
+                       gg::iq::kIQ2_XS,  gg::iq::kQ5_K,  gg::iq::kQ6_K};   // (the last three: dense weights / other
+                                                                           //  GGUFs' experts)
 
 // n rows of type t (k values each) through the decode kernels and the prompt path's f16_rows against ggml's own
 // dequantize_row_* values: the kernels' F32 values equal, f16_rows' halves equal to ggml's rounded to F16
@@ -867,11 +872,15 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
     }
     // the reference: gate / up in double on the int8 x, then the down on the device's own h rounded as the kernels
     // round it (an h within F32 rounding of the double one can still round to the next int8 - a test artefact, not the
-    // kernels': the GPU's swiglu is F32), the h checked against the double one apart
+    // kernels': the GPU's swiglu is F32), the h checked against the double one apart.  Each role's input rounded as its
+    // kernels round it: an MXFP4 role's per 32 (q8_quant), a low-bit one's as act_round
+    auto role_round = [](int type, const float* v, int kk) {
+        return type == gg::kTypeMXFP4 ? q8_round(v, kk) : act_round(v, kk);
+    };
     std::vector<double> want((size_t) T * D, 0.0), hwant;
     std::vector<float> hgot;
     for (int t = 0; t < T; ++t) {
-        const std::vector<float> xr = act_round(x.data() + (size_t) t * D, D);
+        const std::vector<float> xr = role_round(tg, x.data() + (size_t) t * D, D);
         for (int i = 0; i < k; ++i) {
             if (pp[t * 8 + i] == 0ull) continue;
             const int e = pick[t * 8 + i];
@@ -880,7 +889,7 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 hwant.push_back(swiglu(E.dot(e, 0, f, xr.data()), E.dot(e, 1, f, xr.data()), lim));
                 hgot.push_back(h[f]);
             }
-            const std::vector<float> hr = act_round(h, F);
+            const std::vector<float> hr = role_round(td, h, F);
             for (int d = 0; d < D; ++d) want[(size_t) t * D + d] += pw[t * 8 + i] * E.dot(e, 2, d, hr.data());
         }
         for (int d = 0; d < D; ++d)
@@ -1019,7 +1028,9 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
         expect(sw, y.data(), ywant.data(), ywant.size(), n_light == R ? 1e-4 : 2e-3);
         cudaFree(dxs), cudaFree(dbd), cudaFree(didx), cudaFree(dh16), cudaFree(dy);
     }
-    {   // the CPU lane: 3 tokens of expert 4, gate / up rows [7, 107) then all its down rows from the CPU's own h
+    if (tg == gg::kTypeMXFP4 || td == gg::kTypeMXFP4) {   // (a mixed layer's CPU lane: each role its kind's rows)
+        std::printf("%-44s skip  (an MXFP4 role: the engine's cpu_experts_both, DS4_LANE_CHECK)\n", "  CPU lane");
+    } else {   // the CPU lane: 3 tokens of expert 4, gate / up rows [7, 107) then all its down rows from the CPU's own h
         gg::IqCpu fm;
         std::string err;
         if (!gg::iq_cpu_fmt(tg, td, D, F, fm, err)) {
@@ -1092,7 +1103,9 @@ const std::pair<int, int> kQPairs[] = {
     {gg::iq::kIQ2_XXS, gg::iq::kIQ3_XXS}, {gg::iq::kIQ2_S, gg::iq::kIQ3_S},  {gg::iq::kIQ3_XXS, gg::iq::kIQ3_S},
     {gg::iq::kIQ4_XS, gg::iq::kQ4_K},     {gg::iq::kQ2_K, gg::iq::kQ3_K},    {gg::iq::kQ4_K, gg::iq::kIQ4_XS},
     {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S},
-    {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},   {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS}};
+    {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},   {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS},
+    // (MXFP4 beside a low-bit role: orcarouter's Mix-256G - IQ3 gate / ups over MXFP4 downs, and the other way round)
+    {gg::iq::kIQ3_XXS, gg::kTypeMXFP4},   {gg::kTypeMXFP4, gg::iq::kIQ3_S},   {gg::iq::kIQ2_S, gg::kTypeMXFP4}};
 constexpr int kQPairIQ1 = 9;   // (the first IQ1 pair)
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read (only: the token experts of the first pair - the
@@ -1628,6 +1641,17 @@ void test_kv_pack(cudaStream_t s) {
         CU(cudaEventCreate(&e0));
         CU(cudaEventCreate(&e1));
         const float scale = 1.0f / std::sqrt((float) HD);
+        // (kAttnWmma's slabs on CUDA compute capability 7.x: the FP16 tensor-core kernel, unless DS4_ATTN_V7=0)
+        bool fp16_slabs = false;
+#if !defined(STRATA_USE_HIP)
+        {
+            int dev = 0;
+            cudaDeviceProp p{};
+            const char* v7 = std::getenv("DS4_ATTN_V7");
+            fp16_slabs = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                         p.major == 7 && !(v7 != nullptr && std::atoi(v7) == 0);
+        }
+#endif
         const struct {
             int T, gen, iters;
             const char* what;
@@ -1679,7 +1703,13 @@ void test_kv_pack(cudaStream_t s) {
                 CU(cudaEventElapsedTime(&ms, e0, e1));
                 us[w] = ms * 1000.0f / sh.iters;
             }
-            if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3/4; elsewhere the packed kernel)
+            // (a V100 / RTX 20 takes kAttnWmma's prompt slabs through FP16 tensor cores, sparse_attn_v7_kernel: this
+            //  broad-range fixture's rows reach ~1e6, past the ~2e5 its 2^-4 scaling keeps inside FP16 - the model's
+            //  rows stay below that - so it is checked on the bounded rows' WMMA cases below; DS4_ATTN_V7=0: here too)
+            if (T >= 16 && fp16_slabs) {
+                std::printf("kv pack: sparse attention, %-22s skip  matrix cores: sm_7x's FP16 kernel - the bounded "
+                            "rows' WMMA cases below check it\n", sh.what);
+            } else if (T >= 16) {   // kAttnWmma: the matrix cores (RDNA 3/4; elsewhere the packed kernel)
                 CU(cudaMemset(o2, 0xff, n * 4));
                 dk::sparse_attn(d_q, ext, c4, d_sel, SEL, ar, d_sink, NH, HD, T, scale, o2, s, dk::kKvFp4, dk::kAttnWmma,
                                 &scr);
@@ -2128,6 +2158,16 @@ void test_engram_iq4nl(cudaStream_t s) {
     std::printf("%-52s %s\n", "Engram IQ4_NL rows = ggml's, bit for bit", same ? "ok" : "FAIL");
     cudaFree(d_rows), cudaFree(d_out);
 }
+void test_q6k_host() {
+    const int nb = 512;
+    std::vector<uint8_t> w = q_rand(gg::iq::kQ6_K, 1, nb * 256);
+    std::vector<float> want((size_t) nb * 256), got((size_t) nb * 256);
+    ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(w.data(), want.data(), (int64_t) nb * 256);
+    for (int b = 0; b < nb; ++b) strata::ds4::q6k_values(w.data() + (size_t) b * 210, got.data() + (size_t) b * 256);
+    const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
+    if (!same) ++g_fail;
+    std::printf("%-52s %s\n", "Q6_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
+}
 void test_q5k_host() {
     const int nb = 512;
     std::vector<uint8_t> w = q_rand(gg::iq::kQ5_K, 1, nb * 256);
@@ -2137,6 +2177,120 @@ void test_q5k_host() {
     const bool same = std::memcmp(got.data(), want.data(), got.size() * 4) == 0;
     if (!same) ++g_fail;
     std::printf("%-52s %s\n", "Q5_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
+}
+
+// ---------------------------------------------------------------- a group of two's chunk all-reduce (ds4_kernels.cu)
+// Two GPUs, a thread and a stream each, the rows and flags host-mapped as maya-ds4's hmap leaves them (mapped,
+// portable, zeroed).  allreduce as before (xfer_put + ar_sum_kernel) and DS4_AR2 1 / 2 (ar2_kernel), interleaved on one
+// seq count, five rounds each (both slots, each written again), at up to 2048 rows x 5120, 37 rows and one (fewer
+// blocks, short pieces), a few values past FP16's range.  0 and 1 must give the host's p0 + p1 bit for bit on both
+// members, 2 the host's fp16(sat(p0)) + fp16(sat(p1)) in F32 on both.  Then each one's time at rows x 5120 (30720: a
+// 32K prompt's chunk): the slower member's, and GB/s a member each way
+void test_ar2(int da, int db, int rows) {
+    namespace sd = strata::ds4;
+    const int D = 5120, devs[2] = {da, db};
+    const size_t nmax = (size_t) rows * D;
+    auto hm = [](size_t bytes) {
+        void* v = nullptr;
+        CU(cudaHostAlloc(&v, bytes + 64, cudaHostAllocMapped | cudaHostAllocPortable));
+        std::memset(v, 0, bytes + 64);
+        return v;
+    };
+    sd::ArGroup a;
+    a.nm = 2;
+    a.slots = 2;
+    a.stride = nmax;
+    a.data = (float*) hm(2 * 2 * nmax * 4);
+    a.flags = (unsigned*) hm(2 * 2 * 32 * 4);
+    a.pflags = (unsigned*) hm((size_t) 2 * 2 * sd::kAr2Blocks * 16 * 4);
+    float* x[2];
+    unsigned* cnt[2];
+    cudaStream_t st[2];
+    for (int m = 0; m < 2; ++m) {
+        CU(cudaSetDevice(devs[m]));
+        CU(cudaMalloc(&x[m], nmax * 4));
+        CU(cudaMalloc(&cnt[m], 4));
+        CU(cudaMemset(cnt[m], 0, 4));
+        CU(cudaStreamCreate(&st[m]));
+    }
+    unsigned seq = 0;
+    // one all-reduce of p[0] / p[1] (n values each) in mode md on both members at once: out[m] member m's result,
+    // ms[m] its time from the launch
+    auto run = [&](int md, size_t n, const std::vector<float>* p, std::vector<float>* out, double* ms) {
+        sd::ArGroup g = a;
+        g.ar2 = md;
+        const unsigned sq = ++seq;
+        std::thread th[2];
+        for (int m = 0; m < 2; ++m)
+            th[m] = std::thread([&, m] {
+                CU(cudaSetDevice(devs[m]));
+                CU(cudaMemcpyAsync(x[m], p[m].data(), n * 4, cudaMemcpyHostToDevice, st[m]));
+                CU(cudaStreamSynchronize(st[m]));
+                const auto t0 = std::chrono::steady_clock::now();
+                sd::allreduce(x[m], (int) n, g, m, sq, cnt[m], st[m]);
+                CU(cudaStreamSynchronize(st[m]));
+                if (ms != nullptr)
+                    ms[m] = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (out != nullptr) {
+                    out[m].resize(n);
+                    CU(cudaMemcpy(out[m].data(), x[m], n * 4, cudaMemcpyDeviceToHost));
+                }
+            });
+        for (auto& t : th) t.join();
+    };
+    auto f16 = [](float v) { return __half2float(__float2half_rn(std::fmin(std::fmax(v, -65504.0f), 65504.0f))); };
+    auto same = [](float a, float b) { return std::memcmp(&a, &b, 4) == 0; };
+    const char* name[3] = {"xfer_put + ar_sum_kernel", "DS4_AR2=1 (F32)", "DS4_AR2=2 (FP16 wire)"};
+    int bad[3] = {0, 0, 0};
+    for (size_t n : {(size_t) std::min(rows, 2048) * D, (size_t) 37 * D, (size_t) D})
+        for (int round = 0; round < 5; ++round)
+            for (int md = 0; md < 3; ++md) {
+                std::vector<float> p[2], out[2];
+                for (auto& v : p) {
+                    v.resize(n);
+                    for (float& e : v) e = frand(4.0f);
+                }
+                p[0][n / 3] = 1.0e5f;
+                p[1][n / 2] = -2.0e5f;
+                run(md, n, p, out, nullptr);
+                for (size_t i = 0; i < n; ++i) {
+                    const float want = md == 2 ? f16(p[0][i]) + f16(p[1][i]) : p[0][i] + p[1][i];
+                    if (!same(out[0][i], want) || !same(out[1][i], want)) {
+                        ++bad[md];
+                        break;
+                    }
+                }
+            }
+    for (int md = 0; md < 3; ++md) {
+        char t[96];
+        std::snprintf(t, sizeof t, "all-reduce of two, %s", name[md]);
+        if (bad[md] != 0) ++g_fail;
+        std::printf("%-56s %s\n", t, bad[md] == 0 ? "ok" : "FAIL");
+    }
+    std::vector<float> p[2];
+    for (auto& v : p) {
+        v.resize(nmax);
+        for (float& e : v) e = frand(4.0f);
+    }
+    for (int md = 0; md < 3; ++md) {
+        double best = 1e30, ms[2];
+        for (int r = 0; r < 4; ++r) {
+            run(md, nmax, p, nullptr, ms);
+            best = std::min(best, std::max(ms[0], ms[1]));
+        }
+        const double gb = (double) nmax * (md == 2 ? 2 : 4) / 1e9;
+        std::printf("all-reduce of two, %-26s %d x %d: %8.1f ms, %5.2f GB/s a member each way\n", name[md], rows, D,
+                    best, gb / (best / 1e3));
+    }
+    for (int m = 0; m < 2; ++m) {
+        CU(cudaSetDevice(devs[m]));
+        CU(cudaStreamDestroy(st[m]));
+        CU(cudaFree(x[m]));
+        CU(cudaFree(cnt[m]));
+    }
+    CU(cudaFreeHost(a.data));
+    CU(cudaFreeHost(a.flags));
+    CU(cudaFreeHost(a.pflags));
 }
 
 int main(int argc, char** argv) {
@@ -2149,7 +2303,12 @@ int main(int argc, char** argv) {
         const size_t rb = t == GGML_TYPE_IQ4_NL ? (size_t) k / 32 * 18 : gg::type_row_bytes(t, k);   // (IQ4_NL: Engram only)
         std::vector<uint8_t> w(rb * (size_t) n);
         std::FILE* f = std::fopen(argv[4], "rb");
-        if (f == nullptr || fseeko(f, (off_t) std::atoll(argv[5]), SEEK_SET) != 0 || std::fread(w.data(), 1, w.size(), f) != w.size())
+#ifdef _WIN32
+        const bool seek_ok = f != nullptr && _fseeki64(f, std::atoll(argv[5]), SEEK_SET) == 0;
+#else
+        const bool seek_ok = f != nullptr && fseeko(f, (off_t) std::atoll(argv[5]), SEEK_SET) == 0;
+#endif
+        if (!seek_ok || std::fread(w.data(), 1, w.size(), f) != w.size())
             return 3;
         std::fclose(f);
         if (t == GGML_TYPE_IQ4_NL || t == GGML_TYPE_Q5_K && argc >= 8 && std::strstr(argv[7], "embd")) {   // (host / Engram decoders)
@@ -2196,6 +2355,11 @@ int main(int argc, char** argv) {
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }
+    if (argc >= 4 && std::strcmp(argv[1], "--ar") == 0) {   // <device> <device> [rows]: a group of two's all-reduce
+        test_ar2(std::atoi(argv[2]), std::atoi(argv[3]), argc >= 5 ? std::atoi(argv[4]) : 30720);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--kv") == 0) {   // the caches' packing alone
         test_kv_pack(s);
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
@@ -2207,6 +2371,7 @@ int main(int argc, char** argv) {
     test_engram_q6k(s);
     test_engram_iq4nl(s);
     test_q5k_host();
+    test_q6k_host();
     test_experts(512, 256, s);
     test_decode_values(s);
     test_f16_rows(s);

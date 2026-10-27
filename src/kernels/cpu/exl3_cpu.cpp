@@ -1313,6 +1313,8 @@ int exl3_cpu_tier() {
 
 bool exl3_cpu_vector() { return exl3_cpu_tier() > 0; }
 
+bool exl3_cpu_available() { return true; }
+
 float exl3_cpu_prepare_block(const uint16_t* suh, const float* x, float* xh) {
 #if defined(EXL3_X86)
     if (exl3_cpu_tier() == 2) return prepare_block_avx512(suh, x, xh);

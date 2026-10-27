@@ -21,6 +21,7 @@ sys.path[:0] = [str(ROOT / "tools"), str(ROOT / "tools" / "ds4"), str(ROOT)]
 import calibrate_draft as CD  # noqa: E402
 import calibrate_ds4 as CDS  # noqa: E402
 import drafter_pack as DP  # noqa: E402
+import pack_gguf as PG  # noqa: E402
 
 E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
 
@@ -74,6 +75,63 @@ class Conversion(unittest.TestCase):
                 self.assertTrue((blocks[..., 0] == 127 + e).all())
                 lo, hi = blocks[..., 1:] & 15, blocks[..., 1:] >> 4      # value j, value j + 16
                 np.testing.assert_array_equal(np.concatenate([lo, hi], -1).reshape(2, 64), codes[(e, r)])
+
+
+class Geometry(unittest.TestCase):
+    """#500: a GGUF without the DSpark keys (ISTA's GSQ-RCO: only the target layers) packed a drafter with block size 0
+    that never drafted - pack_gguf.py fills them from the drafter's .json, else DeepSeek-V4.1-Flash's own for that
+    model's trunk, else leaves the drafter out with a warning; drafter_pack.py records the checkpoint's."""
+    FLASH = {"hidden_size": 5120, "num_hidden_layers": 40, "n_routed_experts": 384}
+
+    @staticmethod
+    def info(n_exp=128, config=None) -> dict:
+        t = [["mtp.0.ffn.experts.%d.w1.weight" % e, "MXFP4", 0, 17, [1, 32]] for e in range(n_exp)]
+        return dict({"tensors": [["mtp.0.attn_norm.weight", "BF16", 0, 8, [4]]] + t}, **({"config": config} if config else {}))
+
+    def ista(self, **kw) -> dict:
+        geo = dict(self.FLASH, **{k: 0 for k in PG.DSPARK_KEYS[:-1]}, dspark_target_layer_ids=[37, 38, 39])
+        geo.update(kw)
+        return geo
+
+    def test_flash_values_filled(self):
+        fill, src = PG.dspark_fill(self.ista(), self.info(), 129280)
+        self.assertEqual(fill, {k: v for k, v in PG.DSPARK_V41_FLASH.items() if k != "dspark_target_layer_ids"})
+        self.assertIn("DeepSeek-V4.1-Flash", src)
+        fill, _ = PG.dspark_fill(self.ista(dspark_target_layer_ids=[]), self.info(), 129280)
+        self.assertEqual(fill["dspark_target_layer_ids"], [37, 38, 39])
+
+    def test_the_ggufs_own_kept(self):
+        geo = dict(self.FLASH, **PG.DSPARK_V41_FLASH)
+        geo["dspark_block_size"] = 4
+        self.assertEqual(PG.dspark_fill(geo, self.info(), 129280), ({}, None))
+
+    def test_the_drafters_own_first(self):
+        own = {"dspark_block_size": 7, "dspark_noise_token_id": 3, "dspark_markov_rank": 16,
+               "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 2}
+        fill, src = PG.dspark_fill(self.ista(hidden_size=4096), self.info(config=own), 129280)   # (any trunk)
+        self.assertEqual((fill, src), (own, "the drafter's .json"))
+
+    def test_left_out_without_them(self):
+        fill, rest = PG.dspark_fill(self.ista(hidden_size=4096), self.info(), 129280)   # (another model's trunk)
+        self.assertIsNone(fill)
+        self.assertIn("dspark_block_size", rest)
+        self.assertIsNone(PG.dspark_fill(self.ista(), self.info(n_exp=64), 129280)[0])   # (another drafter)
+        self.assertIsNone(PG.dspark_fill(self.ista(), self.info(), 4096)[0])             # (a vocabulary too small)
+
+    def test_drafter_pack_records_the_checkpoints(self):
+        d = Path(tempfile.mkdtemp())
+        safetensors(d / DP.SHARDS[0], {"mtp.0.attn_norm.weight": ("BF16", [4], np.arange(4, dtype=np.uint16).tobytes())})
+        for name in DP.SHARDS[1:]:
+            safetensors(d / name, {})
+        with patch.object(sys, "argv", ["drafter_pack.py", "--dir", str(d)]):
+            DP.main()
+        self.assertNotIn("config", json.loads((d / "dspark.json").read_text()))   # (no config.json beside them)
+        (d / "config.json").write_text(json.dumps({"text_config": {"dspark_block_size": 5, "hidden_size": 5120,
+                                                                   "dspark_noise_token_id": 128799}}))
+        with patch.object(sys, "argv", ["drafter_pack.py", "--dir", str(d)]):
+            DP.main()
+        self.assertEqual(json.loads((d / "dspark.json").read_text())["config"],
+                         {"dspark_block_size": 5, "dspark_noise_token_id": 128799})
 
 
 class Calibration(unittest.TestCase):

@@ -185,12 +185,13 @@
   }
  },
  "maya": {
-  "_": "Maya's quants of DeepSeek-V4.1-Flash-1017 (tools/maya_quant: per-expert statistics from the model itself, error-feedback rounding of the experts), each one GGUF split with everything in it - the Engram tables too, in Q6_K (made from DeepSeek's released weights). The files are listed here once they are uploaded, with the commit they were uploaded at.",
+  "_": "Maya's quants of DeepSeek-V4.1-Flash-1017 (tools/maya_quant: per-expert statistics from the model itself, error-feedback rounding of the experts), each one GGUF split with everything in it - the Engram tables too, in Q6_K (made from DeepSeek's released weights). The files are listed here once they are uploaded, with the commit they were uploaded at. \"memory_gb\": the VRAM + RAM that hold a quant - its files but the Engram tables, which stay on the SSD, and its drafter - by which the setup recommends the context.",
   "repo": "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF",
   "revision": "c273fcbdda76a1db074c2f414cb70edbfca2f2ef",
   "quants": {
    "Maya-S": {
     "about": "experts IQ2_XXS / IQ3_XXS, the first and last four layers IQ2_S / IQ3_S, dense weights Q8_0, the Engram tables Q6_K",
+    "memory_gb": 186,
     "files": {
      "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf": [
       47887697312,
@@ -266,6 +267,7 @@
    },
    "Maya-XS": {
     "about": "every routed expert IQ1_S (error-feedback rounding, calibrated layer by layer on the quantized model itself), dense weights Q8_0, the Engram tables Q6_K; with its own 2-bit DSpark drafter",
+    "memory_gb": 121,
     "files": {
      "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00001-of-00005.gguf": [
       47781530400,
@@ -316,6 +318,95 @@
      "639c3144bca8cfe4db59057047dca40411f0cc732796e2a9321feb98fee2295f"
     ]
    }
+  }
+ },
+ "abliterated": {
+  "_": "orcarouter's abliterated DeepSeek-V4.1-Flash-1017 (orcarouter/DeepSeek-V4.1-Flash-1017-abliterated: the refusal direction orthogonalized out of every matrix that writes the residual stream - its card: harmful prompts refused 0.874 -> 0.074, MMLU 0.91 -> 0.92) as GGUFs for maya-ds4, two versions (Mix-128G, Mix-256G: the routed experts in other low-bit types layer by layer and role by role, MXFP4 downs under IQ3 gate / ups in some layers; dense weights Q5_K / Q6_K / Q8_0, the router F32), every file at one revision with its size and sha256. Each version's shard 2 holds only the Engram (n-gram) table, IQ4_NL - DeepSeek's released table quantized, not abliterated (checked 2026-10-27: 4096 rows against Maya's Q6_K of it differ as an IQ4_NL quantization of them does, in no shared direction) - so the setup leaves that shard out (\"table\": listed, never fetched) and the pack takes Maya's Q6_K tables instead (\"engram\"), one copy for both versions. Gated on Hugging Face: accept its terms there; the download sends HF_TOKEN (or the token of `hf auth login`). Neither the DSpark drafter nor the vision tower is in it: DeepSeek's (\"drafter\", \"vision\" below), as for unsloth's GGUFs - the drafter only drafts (each token checked by the model), so its answers are the model's own.",
+  "name": "DeepSeek-V4.1-Flash-1017-abliterated",
+  "repo": "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF",
+  "revision": "349470a09c1fca35862b0796e726b9fe00a947df",
+  "license": "MIT",
+  "gated": true,
+  "quants": {
+   "Mix-128G": {
+    "about": "the experts IQ1_S (IQ1_M in 4 layers, IQ2_XXS downs in 3: ~1.6-1.7 bits), dense weights Q4_K - Q6_K: about 114 GB of VRAM + RAM hold all but the Engram tables",
+    "memory_gb": 114,
+    "files": {
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00001-of-00005.gguf": [
+      548777536,
+      "0d4eedd085f38e3190c7dbd7a3d9e1467a7ccc2b8f6327fc733b18a8ea3a20fa"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00002-of-00005.gguf": [
+      110595290592,
+      "bd72eee5a1ecccb2ab188a740c5bcd3ab484330f024b5d202779863ca5e512d4"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00003-of-00005.gguf": [
+      47934927328,
+      "3c86e27595d9e45a188efbf145a1163f8df60bb606365c5ee702ef01915bd1e6"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00004-of-00005.gguf": [
+      47884362016,
+      "d7fab155dcebfea89e6c9743f5f523bb766354f560305c49cf285a5c29765a04"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00005-of-00005.gguf": [
+      17607926944,
+      "ecbf6562afd1b0559f08da31babd40d0ce1346a46a70f3213004777195698780"
+     ]
+    },
+    "table": "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00002-of-00005.gguf",
+    "bytes": 224571284416
+   },
+   "Mix-256G": {
+    "about": "the experts 2.5-4.25 bits by layer (IQ2_S / IQ3_XXS / IQ3_S / MXFP4), dense weights Q5_K - Q8_0: about 236 GB of VRAM + RAM hold all but the Engram tables",
+    "memory_gb": 236,
+    "files": {
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00001-of-00007.gguf": [
+      709084736,
+      "2cb066de483877f75b3dc79936b1fccf34aeecc60461701e5c39c98d7f922e03"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf": [
+      110595290592,
+      "342b6ee30a33f02fcef1d261ec7e700907f8b114370ebe90c228339f686a8c1b"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00003-of-00007.gguf": [
+      46798562592,
+      "b2583b9da6c3598f43d22714f3216709ab3160c618ad94e36d491a3bb20b5d2b"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00004-of-00007.gguf": [
+      47706985792,
+      "de9c5f8f3462c7df3db7bb2b79301eeab9d7874f581a9fa574ae4fffe127c602"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00005-of-00007.gguf": [
+      46565998336,
+      "1202e0ae311beb38de1b0899ab3cbba485385299a62e8e136e01fa922f0aeb13"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00006-of-00007.gguf": [
+      47857178816,
+      "dc7ce9ee6910e8f46a201e54c96e47b6b3bc9380c88b6187be3c860a0d0b1074"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00007-of-00007.gguf": [
+      46145195616,
+      "ed00667671a8ca5c48da45e022b6482fc2d88a21848a98d26fba1d1f2848b429"
+     ]
+    },
+    "table": "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf",
+    "bytes": 346378296480
+   }
+  },
+  "engram": {
+   "_": "Maya's Q6_K Engram tables (DeepSeek's released ones) for both versions: the two shards of a Maya quant that hold them (the \"maya\" entry's files and sha256), in their own folder beside the versions' (<models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Engram-Q6_K) - hard-linked from a Maya quant set up on the same drive (no second copy), else downloaded from Maya's repo (161.3 GB). Either quant's pair gives the same tables (their headers differ).",
+   "folder": "Engram-Q6_K",
+   "from": {
+    "Maya-XS": [
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00004-of-00005.gguf",
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00005-of-00005.gguf"
+    ],
+    "Maya-S": [
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00005-of-00006.gguf",
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00006-of-00006.gguf"
+    ]
+   },
+   "download": "Maya-XS"
   }
  },
  "drafter": {

@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::ds4::gguf {
 
@@ -34,6 +35,13 @@ void iq_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, cons
                     float* const* ff, int r0, int r1, float limit);
 /// out[t][r] = down_r . hq[t] for rows [r0, r1).
 void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int nt, float* const* out, int r0, int r1);
+/// One matrix's rows alone (maya-mm3: MiniMax's gate and up, of different types or not, then its own swigluoai):
+/// out[t][r] = row_r . act[t] for rows [r0, r1) of a matrix of `type` with k inputs (rb bytes a row), act[t]
+/// iq_cpu_quant(iq_cpu_act_type(type), ...)'s - the arithmetic of iq_cpu_down's rows (ggml-cpu's dot, or the own rows
+/// where they are its bits).  iq_cpu_act_type: the activations' ggml type for `type` (-1: not one ggml-cpu takes).
+int iq_cpu_act_type(int type);
+void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const* act, int nt, float* const* out, int r0,
+                 int r1);
 /// The CPU lane's MXFP4 rows in the device's arithmetic (ds4_gguf.cu's mx_dot): the activations rounded to int8 per 32
 /// values as the device rounds them (q8_round's q and scale), each block's products summed exactly in integers, then
 /// times (weight scale x activation scale) into F32 sums - the same numbers as the device up to the order of the
@@ -66,6 +74,13 @@ const char* mx_tier_name(int t);
 /// Whether the rows of `type` are ds4's own here (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI: ggml-cpu's numbers bit for
 /// bit, checked against its dot on first use; DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
 bool iq_cpu_own_rows(int type);
+/// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
+/// the one-GPU decode path is off (Model::Impl::one_gpu_path), so those setups keep ggml's rows as before.
+void iq_cpu_iq1s_rows(bool on);
+
+/// (DS4_DENSE_REQ) n rows of k Q8_0 values re-quantized to ggml type `type` (Q4_K, IQ4_XS, ...) by ggml's own
+/// quantizer, on the CPU's threads: out = n rows of ggml_row_size(type, k) bytes. False (err says why): not covered.
+bool dense_requant(const uint8_t* q8, int n, int k, int type, std::vector<uint8_t>& out, std::string& err);
 
 /// x rounded as the device's MXFP4 kernels round their activations (q8_quant: per 32 values sc = max|x| / 127, q =
 /// round-half-even(x / sc), the same F32 operations, so the same q), into out as q sc - an expert gives the same sums

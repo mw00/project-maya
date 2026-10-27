@@ -127,6 +127,13 @@ private:
     std::condition_variable cv_;
 };
 
+/// (DS4_FLOW_DOWN_PART) rows [0, rows) of a matrix `pitch` bytes a row: each row's bytes [off, off + len) moved to the
+/// front of the same buffer, side by side (row r to r len).  In place: row r's target ends at (r + 1) len, never past
+/// row r + 1's bytes ((r + 1) pitch + off, len <= pitch), and memmove takes a row's overlap with itself
+inline void compact_rows(uint8_t* base, size_t rows, size_t pitch, size_t off, size_t len) {
+    for (size_t r = 0; r < rows; ++r) std::memmove(base + r * len, base + r * pitch + off, len);
+}
+
 /// File reads on threads of their own, in the order they were pushed, the pusher never waiting: the prompt path's
 /// streamed experts (each part of an expert a job), unbuffered where the job has a direct descriptor and its range is
 /// not all in the page cache already (the disk straight into dst, the cache neither used nor disturbed), buffered
@@ -143,6 +150,19 @@ public:
         const uint8_t* mem = nullptr;   // non-null: a copy of len bytes from memory to dst instead of a read
         const void* map = nullptr;      // the range in the file's mapping: all in the page cache, it is read buffered
         uint8_t* keep = nullptr;        // non-null (a read): the len bytes read copied here as well
+        // non-null: a copy of len bytes out of device ddev's memory to dst by dcopy (the caller's, so this header
+        // needs no GPU runtime) instead of a read - DS4_FLOW_HELPER's experts out of the helper's pool
+        const void* dmem = nullptr;
+        int ddev = -1;
+        bool (*dcopy)(int dev, void* dst, const void* src, size_t n) = nullptr;
+        // non-null (a buffered read several readers share - DS4_FLOW_DOWN_SHARE): counted once read (or failed); the
+        // share_n-th count drops the range from the page cache (fd, off, len) and starts the count again
+        std::atomic<uint8_t>* share = nullptr;
+        int share_n = 0;
+        // nonzero (DS4_FLOW_DOWN_PART): once read (or copied), the bytes are crows rows cpitch apart, of which each
+        // row's [coff, coff + clen) is kept - compacted to the front of where they landed (compact_rows), before `left`
+        // counts
+        size_t crows = 0, cpitch = 0, coff = 0, clen = 0;
     };
     explicit IoQueue(int n) {
         for (int i = 0; i < n; ++i) th_.emplace_back([this] { loop(); });
@@ -171,6 +191,7 @@ public:
     double busy_ms() const { return busy_us_.load(std::memory_order_relaxed) / 1000.0; }
     uint64_t direct_bytes() const { return direct_.load(std::memory_order_relaxed); }
     uint64_t buffered_bytes() const { return buffered_.load(std::memory_order_relaxed); }
+    uint64_t device_bytes() const { return device_.load(std::memory_order_relaxed); }
 
 private:
     void loop() {
@@ -186,7 +207,10 @@ private:
             const auto t0 = std::chrono::steady_clock::now();
             const uint64_t lead = j.off % os::kDirectAlign;
             bool ok = false;
-            if (j.mem != nullptr) {
+            if (j.dmem != nullptr) {
+                ok = j.dcopy != nullptr && j.dcopy(j.ddev, j.dst, j.dmem, (size_t) j.len);
+                if (ok) device_.fetch_add(j.len, std::memory_order_relaxed);
+            } else if (j.mem != nullptr) {
                 std::memcpy(j.dst, j.mem, (size_t) j.len);
                 ok = true;
             } else if (j.dfd != os::kBadFd && !(j.map != nullptr && os::resident(j.map, (size_t) j.len)) &&
@@ -197,7 +221,15 @@ private:
                 ok = true;
                 buffered_.fetch_add(j.len, std::memory_order_relaxed);
             }
-            if (ok && j.keep != nullptr && j.mem == nullptr) std::memcpy(j.keep, j.dst + lead, (size_t) j.len);
+            if (ok && j.keep != nullptr && j.mem == nullptr && j.dmem == nullptr)
+                std::memcpy(j.keep, j.dst + lead, (size_t) j.len);
+            if (ok && j.crows > 0)   // (a copy's bytes land at dst, a read's at dst + lead)
+                compact_rows(j.dst + (j.mem != nullptr || j.dmem != nullptr ? 0 : lead), j.crows, j.cpitch, j.coff,
+                             j.clen);
+            if (j.share != nullptr && (int) j.share->fetch_add(1, std::memory_order_acq_rel) + 1 >= j.share_n) {
+                j.share->store(0, std::memory_order_release);
+                if (j.fd != os::kBadFd) os::advise(j.fd, j.off, j.len, false);
+            }
             busy_us_.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
                                    std::chrono::steady_clock::now() - t0).count(),
                                std::memory_order_relaxed);
@@ -216,7 +248,7 @@ private:
     std::deque<Job> q_;
     uint64_t done_ = 0;
     bool quit_ = false;
-    std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0};
+    std::atomic<uint64_t> busy_us_{0}, direct_{0}, buffered_{0}, device_{0};
 };
 
 }  // namespace strata::ds4

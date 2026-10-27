@@ -648,8 +648,12 @@ DeviceInfo device_info() {
     d.ready = true;
     cudaDeviceProp prop{};
     ck(cudaGetDeviceProperties(&prop, dev), "properties");
-    // Measured on gfx1151 and gfx1100; other compiled architectures retain MMQ until validated separately.
-    if (std::strncmp(prop.gcnArchName, "gfx1151", 7) && std::strncmp(prop.gcnArchName, "gfx1100", 7)) return d;
+    // Measured on gfx1151, gfx1100, and RDNA4 (gfx1200/gfx1201); other compiled architectures retain MMQ until validated separately.
+    if (std::strncmp(prop.gcnArchName, "gfx1151", 7) != 0 &&
+        std::strncmp(prop.gcnArchName, "gfx1100", 7) != 0 &&
+        std::strncmp(prop.gcnArchName, "gfx1200", 7) != 0 &&
+        std::strncmp(prop.gcnArchName, "gfx1201", 7) != 0)
+        return d;
     hipFuncAttributes fa{};
     if (hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(native_kernel<T_IQ3_XXS, true, true, NW_LB>)) != hipSuccess) {
         (void) cudaGetLastError(); return d;

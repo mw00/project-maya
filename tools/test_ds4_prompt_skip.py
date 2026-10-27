@@ -26,11 +26,12 @@ class PromptSkipTests(unittest.TestCase):
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
-struct Layer { int nm = 1, dev = 0, eg = -1; bool kv_src = false; };
+struct Layer { int nm = 1, dev = 0, eg = -1, grp = 0; bool kv_src = false; };
 struct Chunk { bool flow = false; };
 struct Model {
     struct { int nl = 40; std::vector<int> ratios; } g;
     int chunk = 4096, mode = 1;
+    bool tp_on = false;   // (DS4_YOCO_TP)
     std::vector<Layer> L;
     Chunk streamed{true};
     std::vector<Chunk*> chunks;
@@ -40,6 +41,7 @@ struct Model {
         L[20].kv_src = true;
     }
     int yoco_mode() const { return mode; }
+    bool yoco_tp() const { return tp_on; }
 METHOD
 };
 void check(const Model& m, int expected, const char* name) {
@@ -81,6 +83,34 @@ int main() {
         check(tp, 20, "tensor parallel, no flow");
         tp.chunks.push_back(&tp.streamed);
         check(tp, -1, "tensor parallel, flow");
+    }
+    // DS4_YOCO_TP: one tensor-parallel group holding every trunk layer keeps the skip on the flow too
+    {
+        Model tp;
+        for (auto& l : tp.L) l.nm = 2;
+        tp.chunks.push_back(&tp.streamed);
+        check(tp, -1, "tensor-parallel group, flow, DS4_YOCO_TP off");
+        tp.tp_on = true;
+        check(tp, 20, "tensor-parallel group, flow, DS4_YOCO_TP");
+        tp.chunks.clear();
+        check(tp, 20, "tensor-parallel group, no flow, DS4_YOCO_TP");
+        Model two;
+        two.tp_on = true;
+        for (auto& l : two.L) l.nm = 2;
+        for (int i = 30; i < 40; ++i) two.L[(size_t)i].grp = 1, two.L[(size_t)i].dev = 2;
+        two.chunks.push_back(&two.streamed);
+        check(two, -1, "two tensor-parallel groups, flow, DS4_YOCO_TP");
+        Model mixed;
+        mixed.tp_on = true;
+        mixed.L[5].nm = 2;
+        mixed.chunks.push_back(&mixed.streamed);
+        check(mixed, -1, "one layer a group's, flow, DS4_YOCO_TP");
+        Model eg;
+        eg.tp_on = true;
+        for (auto& l : eg.L) l.nm = 2;
+        eg.L[25].eg = 0;
+        eg.chunks.push_back(&eg.streamed);
+        check(eg, -1, "tensor-parallel group, Engram layer in the suffix, DS4_YOCO_TP");
     }
     Model engram_one; engram_one.L[25].eg = 0; check(engram_one, 20, "Engram layer, one GPU");
     Model engram_split; engram_split.L[25].eg = 0;

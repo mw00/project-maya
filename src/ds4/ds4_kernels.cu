@@ -1,6 +1,7 @@
 // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
 // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
 #include "ds4_kernels.cuh"
+#include "ds4_pdl.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
@@ -104,6 +105,29 @@ __device__ __forceinline__ unsigned char ld_fresh_byte(const unsigned char* p) {
 #endif
 }
 
+// ld_fresh in one 16- or 8-byte load a lane (HIP: a volatile vector load - the same cache bypass as ld_fresh's 32-bit
+// loads, which cut a lane's float4 into four reads over PCIe)
+#if defined(STRATA_USE_HIP)
+typedef unsigned int u32x4_v __attribute__((ext_vector_type(4)));
+typedef unsigned int u32x2_v __attribute__((ext_vector_type(2)));
+#endif
+__device__ __forceinline__ float4 ld_fresh_v(const float4* p) {
+#if defined(STRATA_USE_HIP)
+    const u32x4_v v = *(const volatile u32x4_v*) p;
+    return make_float4(__uint_as_float(v.x), __uint_as_float(v.y), __uint_as_float(v.z), __uint_as_float(v.w));
+#else
+    return __ldcv(p);
+#endif
+}
+__device__ __forceinline__ uint2 ld_fresh_v(const uint2* p) {
+#if defined(STRATA_USE_HIP)
+    const u32x2_v v = *(const volatile u32x2_v*) p;
+    return make_uint2(v.x, v.y);
+#else
+    return __ldcv(p);
+#endif
+}
+
 __device__ __forceinline__ float fp8_rt(float v) { return e4m3_round(v); }   // E4M3, nearest even (input clamped)
 
 __device__ __forceinline__ float e2m1_rt(float v) {   // E2M1 magnitudes 0 .5 1 1.5 2 3 4 6, nearest, ties to even
@@ -147,6 +171,8 @@ __device__ __forceinline__ float ue8m0_val(uint32_t b) { return __uint_as_float(
 
 // ---------------------------------------------------------------- embed
 __global__ void embed_kernel(const uint16_t* __restrict__ rows, float* __restrict__ h, int dim, int hc) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
     const float v = bf16f(rows[(size_t) t * dim + e]);
@@ -159,6 +185,8 @@ constexpr int kFinMax = 32;   // values a thread holds: len <= 32 * 256
 // kPack: the rounded rows packed to f.pdst (f.quant's cache format) instead of written to x or f.dst
 template <bool kPack>
 __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, long long stride, Finish f) {
+    pdl_wait();
+    pdl_trigger();
     float* v = x + (long long) blockIdx.x * stride;
     float r[kFinMax];
     const int nj = (len + kThreads - 1) / kThreads;
@@ -263,11 +291,29 @@ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, lon
         if (d != nullptr) d[e] = f.dst_f16 ? __half_as_ushort(__float2half_rn(r[j])) : f2bf16(r[j]);
         else if (!kPack) v[e] = r[j];
     }
+    if (!kPack && f.q8 != nullptr) {   // (DS4_DECODE_TRIM 2) the stored values' int8 rounding: q8_quant_block's ops
+        int8_t* q = f.q8 + (long long) blockIdx.x * len;   // (a warp's lanes are a 32-block: e = lane + 32 w + 256 j)
+        float* qd = f.q8d + (long long) blockIdx.x * (len / 32);
+#pragma unroll
+        for (int j = 0; j < kFinMax; ++j) {
+            if (j >= nj) break;
+            const int e = threadIdx.x + j * kThreads;
+            float am = e < len ? fabsf(r[j]) : 0.0f;   // (len % 32 == 0: a warp all in or all past len)
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            if (e >= len) continue;
+            const float sc = am / 127.0f;
+            q[e] = (int8_t) (am > 0.0f ? __float2int_rn(r[j] / sc) : 0);
+            if ((threadIdx.x & 31) == 0) qd[e / 32] = sc;
+        }
+    }
 }
 
 // ---------------------------------------------------------------- hyper-connections
 __global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restrict__ h, const float* __restrict__ fn,
                                                           int hcdim, float eps, float* __restrict__ mixes) {
+    pdl_wait();
+    pdl_trigger();
     const int m = blockIdx.x, t = blockIdx.y;
     const float* w = fn + (size_t) m * hcdim;
     const float* x = h + (size_t) t * hcdim;
@@ -287,6 +333,8 @@ __global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restric
 __global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
                                 const float* __restrict__ base, int hc, int iters, float eps, float* pre, float* post,
                                 float* comb) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.x, lane = threadIdx.x;
     const float* mx = mixes + (size_t) t * 32;
     pre += (size_t) t * 8;
@@ -360,6 +408,8 @@ __global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __
 __global__ void __launch_bounds__(1024) hc_pre_norm_kernel(const float* __restrict__ h, const float* __restrict__ mix,
                                                            const float* __restrict__ w, int dim, int hc, float eps,
                                                            float* __restrict__ x) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.x;
     h += (size_t) t * hc * dim;
     mix += (size_t) t * 8;
@@ -378,9 +428,21 @@ __global__ void __launch_bounds__(1024) hc_pre_norm_kernel(const float* __restri
     for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) x[e] = w != nullptr ? r[n] * inv * w[e] : r[n];
 }
 
+// abliteration (ds4_ablate.hpp): row t of y loses its component along r, y -= scale * r (r . y); a block a row
+__global__ void __launch_bounds__(1024) project_out_kernel(float* __restrict__ y, const float* __restrict__ r,
+                                                           float scale, int dim) {
+    y += (size_t) blockIdx.x * dim;
+    float dot = 0.0f;
+    for (int e = threadIdx.x; e < dim; e += blockDim.x) dot += r[e] * y[e];
+    const float a = scale * block_sum(dot);
+    for (int e = threadIdx.x; e < dim; e += blockDim.x) y[e] -= a * r[e];
+}
+
 __global__ void hc_post_kernel(const float* __restrict__ y, const float* __restrict__ res,
                                const float* __restrict__ post, const float* __restrict__ comb, int dim, int hc,
                                float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     const int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (i >= dim * hc) return;
     const int k = i / dim, e = i - k * dim;
@@ -390,9 +452,91 @@ __global__ void hc_post_kernel(const float* __restrict__ y, const float* __restr
     out[(size_t) t * hc * dim + i] = a;
 }
 
+// (DS4_HC_FUSE) hc_split_pre_norm: block 0 is hc_pre_norm_kernel's block 0, its code and its 1024 threads as they
+// are, then (q set) each warp rounds the 32-blocks of x it stored as gguf's q8_quant_block does (warp w holds x[1024 n
+// + 32 w + lane]: whole blocks, every lane of a warp in or past dim together); block 1 is hc_split_kernel's warp for
+// hc 4, its other warps returning at once (no barrier there).  The old kernels stay as they are: hc_fuse_check
+// (ds4_model.cu) compares the two paths byte for byte
+__global__ void __launch_bounds__(1024) hc_split_pre_norm_kernel(const HcFuse a) {
+    const size_t t = blockIdx.y;   // (a window's row t: the old kernels' strides; row 0 as before)
+    if (blockIdx.x == 0) {
+        const int dim = a.dim, hc = a.hc;
+        const float* mix = a.mix + 8 * t;
+        const float* h = a.h + t * (size_t) hc * dim;
+        float* x = a.x + t * (size_t) dim;
+        int8_t* q = a.q != nullptr ? a.q + t * (size_t) dim : nullptr;
+        float* qd = a.qd != nullptr ? a.qd + t * (size_t) (dim / 32) : nullptr;
+        float r[8];
+        float ss = 0.0f;
+        int n = 0;
+        for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) {
+            float v = 0.0f;
+            for (int s = 0; s < hc; ++s) v += mix[s] * h[(size_t) s * dim + e];
+            r[n] = v;
+            ss += v * v;
+        }
+        const float inv = rsqrtf(block_sum(ss) / (float) dim + a.eps);
+        n = 0;
+        for (int e = threadIdx.x; e < dim; e += blockDim.x, ++n) {
+            const float v = a.w != nullptr ? r[n] * inv * a.w[e] : r[n];
+            x[e] = v;
+            if (q == nullptr) continue;
+            float am = fabsf(v);   // (q8_quant_block's ops on the value stored, from the warp's own registers)
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+            const float sc = am / 127.0f;
+            q[e] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+            if ((threadIdx.x & 31) == 0) qd[e / 32] = sc;
+        }
+        return;
+    }
+    if (threadIdx.x >= 32) return;
+    const int lane = threadIdx.x, hc = a.hc;
+    const float* mx = a.mixes + 32 * t;
+    float* pre = a.pre + 8 * t;
+    float* post = a.post + 8 * t;
+    float* comb = a.comb + 64 * t;
+    float* pre_copy = a.pre_copy != nullptr ? a.pre_copy + 8 * t : nullptr;
+    const float eps = a.hc_eps;
+    float pv = 0.0f;
+    if (lane < hc) {
+        pv = 1.0f / (1.0f + expf(-(mx[lane] * a.scale[0] + a.base[lane]))) + eps;
+        pre[lane] = pv;
+        post[lane] = 2.0f / (1.0f + expf(-(mx[hc + lane] * a.scale[1] + a.base[hc + lane])));
+    }
+    if (pre_copy != nullptr && lane < 8) {   // (the layer's copy of the 8 slots: the rest are pre's own bits)
+        if (lane < hc) pre_copy[lane] = pv;
+        else ((uint32_t*) pre_copy)[lane] = ((const uint32_t*) pre)[lane];
+    }
+    // rows are the 4-lane groups (j = lane / 4), columns the lanes 4 apart (k = lane % 4)
+    const bool on = lane < 16;
+    float c = on ? mx[8 + lane] * a.scale[2] + a.base[8 + lane] : -FLT_MAX;
+    auto row_sum = [&](float v) {
+        v += __shfl_xor_sync(0xffffffffu, v, 1);
+        return v + __shfl_xor_sync(0xffffffffu, v, 2);
+    };
+    auto col_sum = [&](float v) {
+        v += __shfl_xor_sync(0xffffffffu, v, 4);
+        return v + __shfl_xor_sync(0xffffffffu, v, 8);
+    };
+    float m = fmaxf(c, __shfl_xor_sync(0xffffffffu, c, 1));
+    m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, 2));
+    c = on ? expf(c - m) : 0.0f;
+    c = c / row_sum(c) + eps;                       // softmax over each row, + eps
+    c = on ? c : 0.0f;
+    c = c / (col_sum(c) + eps);                     // each destination column over its sources
+    for (int it = 1; it < a.iters; ++it) {
+        c = c / (row_sum(c) + eps);
+        c = c / (col_sum(c) + eps);
+    }
+    if (on) comb[lane] = c;
+}
+
 // ---------------------------------------------------------------- gemv over F16 weights, a warp a row
 __global__ void __launch_bounds__(kThreads) gemv_f16_kernel(const uint16_t* __restrict__ W, const float* __restrict__ x,
                                                             int n, int k, float alpha, float* __restrict__ y) {
+    pdl_wait();
+    pdl_trigger();
     const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t = blockIdx.y;
     if (row >= n) return;
@@ -420,6 +564,8 @@ constexpr int kRowsT = 2;
 __global__ void __launch_bounds__(kThreads) gemv_f16_rows_kernel(const uint16_t* __restrict__ W,
                                                                  const float* __restrict__ x, size_t ldx, int n, int k,
                                                                  int T, float alpha, float* __restrict__ y, size_t ldy) {
+    pdl_wait();
+    pdl_trigger();
     const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     const int t0 = blockIdx.y * kRowsT, nt = min(kRowsT, T - t0);
@@ -459,6 +605,8 @@ __global__ void __launch_bounds__(kThreads) gemv_f16_rows_kernel(const uint16_t*
 // ---------------------------------------------------------------- gemv over F32 weights, a warp a row (the router)
 __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restrict__ W, const float* __restrict__ x,
                                                             int n, int k, float* __restrict__ y, int ldy) {
+    pdl_wait();
+    pdl_trigger();
     const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t = blockIdx.y;
     if (row >= n) return;
@@ -475,6 +623,35 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restr
     acc = warp_sum(acc);
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
+// (DS4_ROUTE_FUSE, a decoded token: T 1) two gemv_f32_kernel launches in one grid - its first cdiv(n0, 8) blocks are
+// W0's rows into y0, the rest W1's into y1 - each row gemv_f32_kernel's code (a warp a row, a lane's float4s c = lane +
+// 32 j in order, fmaf, the warp's sum), so each row's bits.  The old kernel stays as it is: route_fuse_check
+// (ds4_model.cu) compares the two
+__global__ void __launch_bounds__(kThreads) gemv_f32_pair_kernel(const float* __restrict__ W0, int n0,
+                                                                 float* __restrict__ y0, const float* __restrict__ W1,
+                                                                 int n1, float* __restrict__ y1,
+                                                                 const float* __restrict__ x, int k) {
+    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
+    const bool second = (int) blockIdx.x >= b0;
+    const float* W = second ? W1 : W0;
+    const int n = second ? n1 : n0;
+    float* y = second ? y1 : y0;
+    const int row = ((int) blockIdx.x - (second ? b0 : 0)) * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    if (row >= n) return;
+    const float4* w = (const float4*) (W + (size_t) row * k);
+    const float4* xv = (const float4*) x;
+    float acc = 0.0f;
+    for (int c = lane; c < k / 4; c += 32) {
+        const float4 a = w[c], b = xv[c];
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+        acc = fmaf(a.z, b.z, acc);
+        acc = fmaf(a.w, b.w, acc);
+    }
+    acc = warp_sum(acc);
+    if (lane == 0) y[row] = acc;
+}
 // ... a prompt's rows: a block 8 rows of W for kGemvT tokens, their inputs kGemvK float4s at a time in shared memory.
 // Each (token, row) sums as the one-token kernel does (a lane's float4s c = lane + 32 j in order, then the warp's sum),
 // so the prompt's router logits keep the token path's bits - with W read once per kGemvT tokens, not once a token (a 4K
@@ -483,8 +660,60 @@ constexpr int kGemvT = 8, kGemvK = 128;
 static_assert(kGemvK % 32 == 0, "a lane's float4s in the one-token kernel's order");
 __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __restrict__ W, const float* __restrict__ x,
                                                                  int n, int k, int T, float* __restrict__ y, int ldy) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float4 xs[kGemvT][kGemvK];
     const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
+    const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
+    float acc[kGemvT];
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
+    for (int c0 = 0; c0 < k4; c0 += kGemvK) {
+        const int nc = min(kGemvK, k4 - c0);
+        __syncthreads();
+        for (int i = (int) threadIdx.x; i < kGemvT * kGemvK; i += kThreads) {
+            const int t = i / kGemvK, c = i % kGemvK;
+            if (t < nt && c < nc) xs[t][c] = ((const float4*) (x + (size_t) (t0 + t) * k))[c0 + c];
+        }
+        __syncthreads();
+        for (int c = lane; c < nc; c += 32) {
+            const float4 a = w[c0 + c];
+#pragma unroll
+            for (int t = 0; t < kGemvT; ++t) {
+                const float4 b = xs[t][c];
+                acc[t] = fmaf(a.x, b.x, acc[t]);
+                acc[t] = fmaf(a.y, b.y, acc[t]);
+                acc[t] = fmaf(a.z, b.z, acc[t]);
+                acc[t] = fmaf(a.w, b.w, acc[t]);
+            }
+        }
+    }
+    if (row >= n) return;
+#pragma unroll
+    for (int t = 0; t < kGemvT; ++t)
+        if (t < nt) {
+            const float s = warp_sum(acc[t]);
+            if (lane == 0) y[(size_t) (t0 + t) * ldy + row] = s;
+        }
+}
+// (DS4_ROUTE_FUSE=2, a decode window: T 2 .. kWin) two gemv_f32_rows_kernel launches in one grid - its first
+// cdiv(n0, 8) blocks are W0's rows into y0, the rest W1's into y1, each block gemv_f32_rows_kernel's code for its
+// kGemvT tokens (blockIdx.y) - so each (token, row) the rows kernel's bits, the one-token kernel's.  The old kernel
+// stays as it is: route_fuse_check (ds4_model.cu) compares the two
+__global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const float* __restrict__ W0, int n0,
+                                                                      float* __restrict__ y0,
+                                                                      const float* __restrict__ W1, int n1,
+                                                                      float* __restrict__ y1,
+                                                                      const float* __restrict__ x, int k, int T,
+                                                                      int ldy) {
+    __shared__ float4 xs[kGemvT][kGemvK];
+    const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
+    const bool second = (int) blockIdx.x >= b0;
+    const float* W = second ? W1 : W0;
+    const int n = second ? n1 : n0;
+    float* y = second ? y1 : y0;
+    const int row = ((int) blockIdx.x - (second ? b0 : 0)) * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
     const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
     float acc[kGemvT];
@@ -523,6 +752,8 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __
 __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ logits, const float* __restrict__ bias,
                                                     int n, int k, float route_scale, int* idx, float* w,
                                                     const float* __restrict__ bias_vl, const VlBits vl) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -572,6 +803,8 @@ __global__ void __launch_bounds__(512) route_kernel(const float* __restrict__ lo
 
 __global__ void swiglu_kernel(const float* __restrict__ g, const float* __restrict__ u, int n, float lim,
                               float* __restrict__ h) {
+    pdl_wait();
+    pdl_trigger();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     float gv = g[i], uv = u[i];
@@ -581,12 +814,44 @@ __global__ void swiglu_kernel(const float* __restrict__ g, const float* __restri
     }
     h[i] = gv / (1.0f + expf(-gv)) * uv;
 }
+// (DS4_DECODE_TRIM 1) swiglu_kernel's value, then q8_quant_block's ops on it: a warp's lanes are a 32-block of the flat
+// array (blocks of kThreads from 0, n % 32 == 0: a warp all in or all past n).  The old kernel stays as it is:
+// decode_trim_check (ds4_model.cu) compares the two
+__global__ void swiglu_q8_kernel(const float* __restrict__ g, const float* __restrict__ u, int n, float lim,
+                                 float* __restrict__ h, int8_t* __restrict__ q, float* __restrict__ qd) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gv = g[i], uv = u[i];
+    if (lim > 0.0f) {
+        gv = fminf(gv, lim);
+        uv = fminf(fmaxf(uv, -lim), lim);
+    }
+    const float v = gv / (1.0f + expf(-gv)) * uv;
+    h[i] = v;
+    float am = fabsf(v);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float sc = am / 127.0f;
+    q[i] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
+    if ((threadIdx.x & 31) == 0) qd[i / 32] = sc;
+}
+// (DS4_DECODE_TRIM 4) region blockIdx.y's 4-byte words, the grid's x blocks striding over them
+__global__ void copy_regions_kernel(const CopyRegions r) {
+    const int k = blockIdx.y;
+    uint32_t* d = (uint32_t*) r.dst[k];
+    const uint32_t* sr = (const uint32_t*) r.src[k];
+    const size_t n = r.bytes[k] / 4;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        d[i] = sr[i];
+}
 
 // ---------------------------------------------------------------- the compressor (ratio > 1), a window in order
 __global__ void __launch_bounds__(512) compress_kernel(const float* __restrict__ kv, const float* __restrict__ score,
                                                        float* kv_state, float* score_state, int ratio, int p0, int T,
                                                        int d, const float* __restrict__ w, float eps,
                                                        float* __restrict__ latent) {
+    pdl_wait();
+    pdl_trigger();
     int g = 0;
     for (int t = 0; t < T; ++t) {
         const int slot = (p0 + t) % ratio;
@@ -650,6 +915,8 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
                                                              const int* __restrict__ cand, int cand_stride, int blk,
                                                              Rows lim, float* __restrict__ out, long long out_stride,
                                                              int ntiles) {
+    pdl_wait();
+    pdl_trigger();
 #if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)   // (mma.sync's int8 shape)
     constexpr int HD = 128, KT = 128, LD = HD + 16, NQ = QT * 32, NB = HD / 32;
     constexpr size_t RB = kv_row_bytes(kKvFp4p, HD);   // (a packed key row: its codes, its scales, padded to 16)
@@ -811,8 +1078,8 @@ template <int QT>
 void index_tc_launch(int gx, int gy, cudaStream_t s, const float* q, const float* w, const uint8_t* kp, int heads, int n,
                      int T, const int* cand, int cand_stride, int blk, const Rows& lim, float* out, long long out_stride,
                      int ntiles) {
-    index_score_tc_kernel<QT><<<dim3(gx, gy), 256, index_tc_smem<QT>(), s>>>(q, w, kp, heads, n, T, cand, cand_stride, blk,
-                                                                             lim, out, out_stride, ntiles);
+    pdl_launch(index_score_tc_kernel<QT>, dim3(gx, gy), 256, index_tc_smem<QT>(), s, q, w, kp, heads, n, T, cand, cand_stride, blk,
+               lim, out, out_stride, ntiles);
 }
 
 // a thread a position: its key row (KF: kKvFp4p packed, or BF16) against every head's query (shared memory), relu,
@@ -823,6 +1090,8 @@ __global__ void __launch_bounds__(kThreads) index_score_kernel(const float* __re
                                                                const int* __restrict__ cand, int cand_stride, int blk,
                                                                Rows lim, float* __restrict__ out,
                                                                long long out_stride) {
+    pdl_wait();
+    pdl_trigger();
     extern __shared__ float qs[];   // heads * HD, then heads weights
     const int t = blockIdx.y;
     for (int i = threadIdx.x; i < heads * HD; i += blockDim.x) qs[i] = q[(size_t) t * heads * HD + i];
@@ -989,6 +1258,8 @@ __device__ __forceinline__ uint32_t topk_block(int n, int k, Key key, Emit emit)
 __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ vals, long long stride, Rows r,
                                                     const int* __restrict__ cand, int cand_stride, int blk,
                                                     int* __restrict__ out, int out_stride) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ unsigned hist[256];
     __shared__ uint32_t prefix_s, mask_s;
     __shared__ int remaining_s;
@@ -1094,6 +1365,8 @@ __global__ void __launch_bounds__(1024) topk_kernel(const float* __restrict__ va
 __global__ void __launch_bounds__(1024) topk_seg_kernel(const float* __restrict__ vals, long long stride, Rows r, int P,
                                                         int K, float* __restrict__ sv, int* __restrict__ si,
                                                         int* __restrict__ sn, uint32_t* __restrict__ sk) {
+    pdl_wait();
+    pdl_trigger();
     const int p = blockIdx.x, t = blockIdx.y;
     int n, k;
     rows_at(r, t, n, k);
@@ -1124,6 +1397,8 @@ __global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, 
                                                           const uint32_t* __restrict__ sk, const int* __restrict__ cand,
                                                           int cand_stride, int blk, int* __restrict__ out,
                                                           int out_stride, int cap) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ int off[kTopkSegMax + 1];
     __shared__ uint32_t floor_s;
     extern __shared__ __align__(16) uint8_t merge_smem[];   // [cap] values, then [cap] positions
@@ -1205,6 +1480,8 @@ __global__ void __launch_bounds__(1024) topk_merge_kernel(Rows r, int P, int K, 
 
 __global__ void block_max_kernel(const float* __restrict__ score, long long stride, Rows r, int blk,
                                  float* __restrict__ bm, long long bm_stride) {
+    pdl_wait();
+    pdl_trigger();
     const int b = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     int n, k_;
     rows_at(r, t, n, k_);
@@ -1232,6 +1509,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_kernel(const float* __re
                                                                const int* __restrict__ sel, int sel_stride,
                                                                AttnRows ar, const float* __restrict__ sink, int heads,
                                                                int d, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     // d == 512: a thread owns 2 output values, a lane 16 of a row's dot
     const int h = blockIdx.x, t = blockIdx.y;
     int n_win, n_sel, w0;
@@ -1392,6 +1671,8 @@ __device__ __forceinline__ void unpack32(const uint8_t* rr, int part, uint4* dst
 __global__ void __launch_bounds__(kThreads) unpack_sel_kernel(const uint8_t* __restrict__ ckv,
                                                               const int* __restrict__ sel, int sel_stride, AttnRows ar,
                                                               int cap, uint16_t* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.y, i = blockIdx.x * kStage + (int) (threadIdx.x >> 4), part = threadIdx.x & 15;
     int n_sel;
     if (ar.gen) {
@@ -1424,6 +1705,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
                                                                       const int* __restrict__ sel, int sel_stride,
                                                                       AttnRows ar, const float* __restrict__ sink,
                                                                       int heads, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     constexpr int d = 512, W = 8 / G;   // (kThreads / 32 warps)
     const int hb = blockIdx.x * G, t = blockIdx.y;
     int n_win, n_sel, w0;
@@ -1615,6 +1898,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float*
                                                                     const int* __restrict__ sel, int sel_stride,
                                                                     AttnRows ar, const float* __restrict__ sink,
                                                                     int heads, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
 #if defined(DS4_ATTN_WMMA)
     constexpr int d = 512, R = 16;
     const int hb = blockIdx.x * R, t = blockIdx.y;
@@ -1813,6 +2098,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_mma_kernel(const float* 
                                                                    const int* __restrict__ sel, int sel_stride,
                                                                    AttnRows ar, const float* __restrict__ sink,
                                                                    int heads, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     constexpr int d = 512, R = 16, dp = d + 8;   // (the tile's row stride: 1040 bytes)
     const int hb = blockIdx.x * R, t = blockIdx.y;
@@ -1965,6 +2252,8 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_mma_kernel(const float* 
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
 __global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
                                    int d) {
+    pdl_wait();
+    pdl_trigger();
     const int r = blockIdx.x;
     const long long p = p0 - n + r;
     const uint8_t* row = ring + (size_t) (p >= 0 ? p % n : 0) * kv_row_bytes(kKvFp8, d);
@@ -1978,6 +2267,8 @@ __global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* _
 __global__ void __launch_bounds__(kThreads) ext_to_ring_kernel(const uint16_t* __restrict__ ext,
                                                                uint8_t* __restrict__ ring, long long p0, int n, int T,
                                                                int d, uint8_t* __restrict__ backup) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.x;
     if (T - t > n) return;   // overwritten by a later row of the window anyway
     const size_t rb = kv_row_bytes(kKvFp8, d);
@@ -2001,11 +2292,15 @@ __global__ void __launch_bounds__(kThreads) ext_to_ring_kernel(const uint16_t* _
 
 __global__ void ring_restore_kernel(uint8_t* __restrict__ ring, const uint8_t* __restrict__ backup, long long p0, int n,
                                     int keep, size_t rb) {
+    pdl_wait();
+    pdl_trigger();
     const int t = keep + blockIdx.x;
     uint8_t* row = ring + (size_t) ((p0 + t) % n) * rb;
     for (size_t i = threadIdx.x; i < rb; i += blockDim.x) row[i] = backup[(size_t) t * rb + i];
 }
 __global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n, int keep, size_t rb) {
+    pdl_wait();
+    pdl_trigger();
     const int t = keep + blockIdx.x, li = blockIdx.y;
     uint8_t* row = b.ring[li] + (size_t) ((p0 + t) % n) * rb;
     const uint8_t* src = b.bak[li] + (size_t) t * rb;
@@ -2013,6 +2308,8 @@ __global__ void ring_restore_batch_kernel(const RingBatch b, long long p0, int n
 }
 
 __global__ void comp_restore_batch_kernel(const CompBatch b, long long p0, int keep, int d) {
+    pdl_wait();
+    pdl_trigger();
     const int li = blockIdx.x, R = b.ratio[li];
     for (int i = threadIdx.x; i < R * d; i += blockDim.x) {
         const int slot = i / d, e = i % d;
@@ -2029,6 +2326,8 @@ __global__ void comp_restore_batch_kernel(const CompBatch b, long long p0, int k
 
 __global__ void hc_mean_kernel(const float* __restrict__ h, int hc, int dim, float* __restrict__ out,
                                long long out_stride) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
     float a = 0.0f;
@@ -2037,6 +2336,8 @@ __global__ void hc_mean_kernel(const float* __restrict__ h, int hc, int dim, flo
 }
 
 __global__ void iota_rows_kernel(int* out, int n, int stride) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.x;
     for (int i = threadIdx.x; i < n; i += blockDim.x) out[(size_t) t * stride + i] = i;
 }
@@ -2045,6 +2346,8 @@ __global__ void iota_rows_kernel(int* out, int n, int stride) {
 __global__ void __launch_bounds__(kThreads) markov_kernel(float* __restrict__ logits, const uint16_t* __restrict__ E,
                                                           const uint16_t* __restrict__ H, const int* __restrict__ tok,
                                                           int V, int R) {
+    pdl_wait();
+    pdl_trigger();
     extern __shared__ float er[];
     const uint16_t* erow = E + (size_t) (*tok) * R;
     for (int i = threadIdx.x; i < R; i += blockDim.x) er[i] = bf16f(erow[i]);
@@ -2072,6 +2375,8 @@ __global__ void __launch_bounds__(kThreads) markov_kernel(float* __restrict__ lo
 __global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restrict__ logits,
                                                                 const uint16_t* __restrict__ H,
                                                                 const uint16_t* __restrict__ erow, int vn, int R) {
+    pdl_wait();
+    pdl_trigger();
     extern __shared__ float er[];
     for (int i = threadIdx.x; i < R; i += blockDim.x) er[i] = bf16f(erow[i]);
     __syncthreads();
@@ -2096,6 +2401,8 @@ __global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restric
 // seq}, the seq last
 __global__ void __launch_bounds__(1024) argmax_share_kernel(const float* __restrict__ row, int vn, int v0,
                                                            unsigned* slot, unsigned seq) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float sv[32];
     __shared__ int si[32];
     float bv = __int_as_float(0xff800000);
@@ -2124,6 +2431,7 @@ __global__ void __launch_bounds__(1024) argmax_share_kernel(const float* __restr
 // BF16 [V][R]) into erow for the next step's bias
 __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E,
                                    uint16_t* erow, int R) {
+    pdl_wait();
     __shared__ int pick;
     __shared__ float sv[256];
     __shared__ int si[256];
@@ -2137,6 +2445,7 @@ __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, 
         si[threadIdx.x] = (int) *(volatile const unsigned*) (slots + (size_t) threadIdx.x * 4 + 1);
     }
     __syncthreads();
+    pdl_trigger();   // (after the spin, as wait_seq_kernel's)
     if (threadIdx.x == 0) {
         float bv = __int_as_float(0xff800000);
         int bi = 0x7fffffff;
@@ -2159,6 +2468,8 @@ __global__ void markov_pick_kernel(const unsigned* slots, int nm, unsigned seq, 
 __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restrict__ x, const uint16_t* __restrict__ E,
                                                           const int* __restrict__ tok, const float* __restrict__ w,
                                                           int dim, int R, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.x;
     const float* xt = x + (size_t) t * dim;
     const uint16_t* er = E + (size_t) tok[t] * R;
@@ -2171,6 +2482,8 @@ __global__ void __launch_bounds__(1024) confidence_kernel(const float* __restric
 // ---------------------------------------------------------------- engram
 __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const uint8_t* __restrict__ scales, int hd,
                                       float* __restrict__ out, int fmt) {
+    pdl_wait();
+    pdl_trigger();
     const int r = blockIdx.x;
     if (fmt != 0) {   // (ggml Q6_K / IQ4_NL blocks at the row's start)
         for (int e = threadIdx.x; e < hd; e += blockDim.x)
@@ -2188,6 +2501,8 @@ __global__ void engram_dequant_kernel(const uint8_t* __restrict__ rows, const ui
 
 __global__ void __launch_bounds__(1024) engram_gate_kernel(float* __restrict__ h, const float* __restrict__ kv,
                                                            const float* __restrict__ w, int hc, int dim, float eps) {
+    pdl_wait();
+    pdl_trigger();
     const int k = blockIdx.x, t = blockIdx.y;
     float* hk = h + ((size_t) t * hc + k) * dim;
     const float* kvt = kv + (size_t) t * (hc + 1) * dim;
@@ -2212,6 +2527,8 @@ __global__ void __launch_bounds__(1024) engram_gate_kernel(float* __restrict__ h
 }
 
 __global__ void gather_kernel(const float* __restrict__ x, Gather g, int cols, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     const int r = blockIdx.y;
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c < cols) out[(size_t) r * cols + c] = x[(size_t) g.src[r] * cols + c];
@@ -2221,6 +2538,8 @@ __global__ void gather_kernel(const float* __restrict__ x, Gather g, int cols, f
 // a byte at a time: any alignment (a GGUF type's blocks of 110 or 98 bytes)
 __global__ void gather_cols_kernel(const uint8_t* __restrict__ src, size_t pitch, size_t col0, size_t width,
                                    uint8_t* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     const size_t r = blockIdx.y;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < width; i += (size_t) gridDim.x * blockDim.x)
         out[r * width + i] = src[r * pitch + col0 + i];
@@ -2228,6 +2547,8 @@ __global__ void gather_cols_kernel(const uint8_t* __restrict__ src, size_t pitch
 
 __global__ void combine_kernel(const float* __restrict__ ed, const float* __restrict__ cpu,
                                const float* __restrict__ sh, Combine cm, int dim, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
     float a = 0.0f;
@@ -2242,7 +2563,10 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
-                                                            const float* __restrict__ bias_vl, unsigned vl) {
+                                                            const float* __restrict__ bias_vl, unsigned vl,
+                                                            int* cpu_any) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float sc[1024], bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -2297,6 +2621,7 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
             }
         }
         on_cpu = cpu;
+        if (cpu && cpu_any != nullptr) atomicOr(cpu_any, 1);
     }
     // the token's FFN input to the host only where the CPU lane reads it (a pick of its on the CPU lane): each row
     // 20 KB over PCIe, where most windows have none
@@ -2309,6 +2634,8 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
 __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restrict__ logits,
                                                           const float* __restrict__ bias, int n, int m, Req* req,
                                                           int off) {
+    pdl_wait();
+    pdl_trigger();
     __shared__ float bs[1024];
     __shared__ float bv[32];
     __shared__ int bi[32];
@@ -2345,16 +2672,133 @@ __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restric
     }
 }
 
-__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1) {
+// (DS4_ROUTE_FUSE, a decoded token: T 1) route_publish_kernel and route_ahead_kernel as the two blocks of one launch -
+// block 0 the first's code for token 0 (ids / w / x of the request, idx / w / plan_ptr), block 1 the second's
+// (ahead[0][off ..)): disjoint writes, read the same way; publish_kernel follows in a launch of its own, as
+// route_publish launches it.  (=2, a window's T rows: the pair a row, t = blockIdx.y, both logits rows 1024 apart as
+// the old kernels read them.)  The old kernels stay as they are: route_fuse_check (ds4_model.cu) compares the two
+__global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
+    if (blockIdx.x == 0) {
+        __shared__ float sc[1024], bs[1024];
+        __shared__ float bv[32];
+        __shared__ int bi[32];
+        __shared__ int pick[16];
+        __shared__ int on_cpu;
+        const int t = blockIdx.y, n = a.n, k = a.k;
+        const float* logits = a.logits + (size_t) t * 1024;
+        const float* bias = a.bias;
+        if (a.bias_vl != nullptr && ((a.vl >> t) & 1u)) bias = a.bias_vl;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const float l = logits[i];
+            const float sp = l > 20.0f ? l : log1pf(expf(l));
+            sc[i] = sqrtf(sp);
+            bs[i] = sc[i] + bias[i];
+        }
+        __syncthreads();
+        const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+        for (int r = 0; r < k; ++r) {
+            float best = -FLT_MAX;
+            int bix = 0x7fffffff;
+            for (int i = threadIdx.x; i < n; i += blockDim.x)
+                if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+                if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+            }
+            if (lane == 0) bv[wp] = best, bi[wp] = bix;
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                float b = -FLT_MAX;
+                int ix = 0x7fffffff;
+                for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                    if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+                pick[r] = ix;
+                bs[ix] = -FLT_MAX;
+            }
+            __syncthreads();
+        }
+        if (threadIdx.x == 0) {
+            float s = 0.0f;
+            for (int r = 0; r < k; ++r) s += sc[pick[r]];
+            int cpu = 0;
+            for (int r = 0; r < k; ++r) {
+                const float wv = sc[pick[r]] / (s + 1e-20f) * a.route_scale;
+                a.idx[(size_t) t * kPicks + r] = pick[r];
+                a.w[(size_t) t * kPicks + r] = wv;
+                a.plan_ptr[(size_t) t * kPicks + r] = a.vram[pick[r]];
+                cpu |= a.vram[pick[r]] == 0ull;
+                if (a.req != nullptr) {
+                    a.req->ids[t][r] = pick[r];
+                    a.req->w[t][r] = wv;
+                }
+            }
+            on_cpu = cpu;
+        }
+        __syncthreads();
+        if (a.req != nullptr && on_cpu)
+            for (int i = threadIdx.x; i < a.dim; i += blockDim.x) a.req->x[t][i] = a.x[(size_t) t * a.dim + i];
+        return;
+    }
+    __shared__ float bs[1024];
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    const int t = blockIdx.y, n = a.a_n, m = a.m, off = a.off;
+    const float* logits = a.a_logits + (size_t) t * 1024;
+    const float* bias = a.a_bias;
+    Req* req = a.req;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float l = logits[i];
+        const float sp = l > 20.0f ? l : log1pf(expf(l));
+        bs[i] = sqrtf(sp) + bias[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    for (int r = 0; r < m; ++r) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) bv[wp] = best, bi[wp] = bix;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = -FLT_MAX;
+            int ix = 0x7fffffff;
+            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            req->ahead[t][off + r] = ix < n ? ix : -1;
+            if (ix < n) bs[ix] = -FLT_MAX;
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, Resp* resp, int* cpu_any,
+                               const unsigned* host_done) {
+    pdl_wait();
+    pdl_trigger();
     __threadfence_system();
     req->na[0] = na0;
     req->na[1] = na1;
     req->T = T;
     __threadfence_system();
     *(volatile unsigned*) &req->seq = seq;
+    if (resp == nullptr || cpu_any == nullptr) return;
+    const int any = *(volatile int*) cpu_any;
+    *cpu_any = 0;
+    if (any || (int) (seq - *(volatile const unsigned*) host_done) >= kRing / 2) return;
+    for (int t = 0; t < T; ++t) resp->cpu[t] = 0;
+    __threadfence_system();
+    *(volatile unsigned*) &resp->seq = seq;
 }
 
 __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
+    pdl_wait();
     if (threadIdx.x != 0) return;
     while (*(volatile const unsigned*) seq_ptr != seq) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
@@ -2362,9 +2806,53 @@ __global__ void wait_seq_kernel(const unsigned* seq_ptr, unsigned seq) {
 #endif
     }
     __threadfence_system();
+    pdl_trigger();   // (only now: a kernel waiting behind a spin could hold the multiprocessors its flag's writer needs)
+}
+
+__global__ void __launch_bounds__(256) helper_take_kernel(const Req* req, unsigned seq, int k, int dim,
+                                                          const unsigned long long* __restrict__ tab, int n,
+                                                          unsigned long long* plan, float* w, float* x, unsigned* ack,
+                                                          const unsigned* quit) {
+    __shared__ int live;
+    if (threadIdx.x == 0) {   // (the request in host-mapped memory: read as the host's answers are, volatile)
+        unsigned v;
+        while ((int) ((v = *(volatile const unsigned*) &req->seq) - seq) < 0 && *(volatile const unsigned*) quit == 0u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(200);
+#endif
+        }
+        __threadfence_system();
+        live = v == seq;
+    }
+    __syncthreads();
+    const volatile Req* r = req;
+    const int T = live ? min(max(r->T, 1), kWin) : 0;
+    for (int j = threadIdx.x; j < kWin * kPicks; j += blockDim.x) {
+        const int t = j / kPicks, i = j % kPicks;
+        unsigned long long p = 0ull;
+        if (t < T && i < k) {
+            const int e = r->ids[t][i];
+            if (e >= 0 && e < n) p = tab[e];
+        }
+        plan[j] = p;
+        w[j] = p != 0ull ? r->w[t][i] : 0.0f;
+    }
+    for (int j = threadIdx.x; j < T * dim; j += blockDim.x) x[j] = r->x[j / dim][j % dim];
+    __syncthreads();
+    if (threadIdx.x == 0 && live) {
+        __threadfence_system();
+        *(volatile unsigned*) ack = seq;
+    }
+}
+
+__global__ void signal_seq_kernel(unsigned* flag, unsigned seq) {
+    __threadfence_system();
+    *(volatile unsigned*) flag = seq;
 }
 
 __global__ void init_pre_kernel(float* pre, int T) {
+    pdl_wait();
+    pdl_trigger();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < T * 8) pre[i] = (i % 8) == 0 ? 1.0f : 0.0f;
 }
@@ -2405,6 +2893,8 @@ __device__ __forceinline__ void xfer_copy(const Xfer& x, bool from_host) {
 }
 
 __global__ void __launch_bounds__(kThreads) xfer_put_kernel(const Xfer x, unsigned* flag, unsigned seq, unsigned* cnt) {
+    pdl_wait();
+    pdl_trigger();
     xfer_copy(x, false);
     if (flag == nullptr) return;
     __threadfence_system();
@@ -2425,22 +2915,30 @@ __device__ __forceinline__ void wait_at_least(const unsigned* flag, unsigned seq
 }
 
 __global__ void __launch_bounds__(kThreads) xfer_get_kernel(const Xfer x, const unsigned* flag, unsigned seq) {
+    pdl_wait();
     if (threadIdx.x == 0) wait_at_least(flag, seq);
     __syncthreads();
+    pdl_trigger();   // (after the wait, as wait_seq_kernel's)
     xfer_copy(x, true);
 }
 
 __global__ void wait_flags_kernel(const unsigned* flags, int n, int stride, unsigned seq) {
+    pdl_wait();
     if (threadIdx.x != 0) return;
     for (int i = 0; i < n; ++i) wait_at_least(flags + (size_t) i * stride, seq);
     __threadfence_system();
+    pdl_trigger();   // (after the wait, as wait_seq_kernel's)
 }
 // a batch of table entries: *pairs[2i] = pairs[2i + 1] (the expert cache's recent slots, between windows)
 __global__ void tab_set_kernel(const unsigned long long* __restrict__ pairs, int n) {
+    pdl_wait();
+    pdl_trigger();
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) *(unsigned long long*) pairs[2 * i] = pairs[2 * i + 1];
 }
 __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
+    pdl_wait();
+    pdl_trigger();
     __threadfence_system();
     *(volatile unsigned*) flag = v;
 }
@@ -2453,6 +2951,7 @@ __global__ void set_flag_kernel(unsigned* flag, unsigned v) {
 __global__ void __launch_bounds__(kThreads) ar_rs_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
                                                         unsigned* bflags, int nm, int mi, int slot, int slots,
                                                         unsigned seq) {
+    pdl_wait();   // (no pdl_trigger: it waits for the other members mid-kernel - wait_seq_kernel's rule)
     float4* x4 = (float4*) x;
     const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
     const int lo = blockIdx.x * per, hi = min(n4, lo + per), cs = (hi - lo + nm - 1) / nm;
@@ -2514,6 +3013,7 @@ __device__ __forceinline__ float4 sat4(float4 v) {   // (FP16's range: a partial
 __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, float* rows, float* sums, size_t stride,
                                                           unsigned* bflags, int nm, int mi, int slot, int slots,
                                                           unsigned seq) {
+    pdl_wait();   // (no pdl_trigger: it waits for the other members mid-kernel - wait_seq_kernel's rule)
     float4* x4 = (float4*) x;
     const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
     const int lo = blockIdx.x * per, hi = min(n4, lo + per), cs = (hi - lo + nm - 1) / nm;
@@ -2562,10 +3062,14 @@ __global__ void __launch_bounds__(kThreads) ar_rs16_kernel(float* x, int n4, flo
 // allreduce_dma's pieces: this member's partial as FP16 (ar_rs16's rounding), its slice's sum from the members' FP16
 // partials in member order, and the other slices' sums back to F32
 __global__ void ar_to16_kernel(const float4* __restrict__ x, int n4, uint2* __restrict__ h) {
+    pdl_wait();
+    pdl_trigger();
     for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x) h[q] = to_h4(sat4(x[q]));
 }
 __global__ void ar_sum16_kernel(float4* x, uint2* own, const uint2* __restrict__ peers, size_t pstride, int nm, int mi,
                                 int q0, int q1) {
+    pdl_wait();
+    pdl_trigger();
     for (int q = q0 + blockIdx.x * blockDim.x + threadIdx.x; q < q1; q += gridDim.x * blockDim.x) {
         float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         for (int m = 0; m < nm; ++m) {
@@ -2587,6 +3091,8 @@ __global__ void ar_sum16_kernel(float4* x, uint2* own, const uint2* __restrict__
 // not queue behind its batches) - the others' partials of slice [q0, q1) read in place, every member's at once
 __global__ void ar_sum16_zc_kernel(float4* x, uint2* own, const uint2* rows, size_t rstride, int nm, int mi, int q0,
                                    int q1) {
+    pdl_wait();
+    pdl_trigger();
     for (int q = q0 + blockIdx.x * blockDim.x + threadIdx.x; q < q1; q += gridDim.x * blockDim.x) {
         uint2 u[8];
 #pragma unroll
@@ -2611,10 +3117,14 @@ __global__ void ar_sum16_zc_kernel(float4* x, uint2* own, const uint2* rows, siz
     }
 }
 __global__ void ar_from16_zc_kernel(float4* x, const uint2* hsum, int n4, int q0, int q1, int r0 = 0) {
+    pdl_wait();
+    pdl_trigger();
     for (int q = r0 + blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
         if (q < q0 || q >= q1) x[q] = from_h4(ld_fresh(hsum + q));
 }
 __global__ void ar_from16_kernel(float4* x, const uint2* __restrict__ h, int n4, int q0, int q1) {
+    pdl_wait();
+    pdl_trigger();
     for (int q = blockIdx.x * blockDim.x + threadIdx.x; q < n4; q += gridDim.x * blockDim.x)
         if (q < q0 || q >= q1) x[q] = from_h4(h[q]);
 }
@@ -2623,6 +3133,7 @@ __global__ void ar_from16_kernel(float4* x, const uint2* __restrict__ h, int n4,
 __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, const float* peers, size_t stride,
                                                          const unsigned* flags, int nm, int mi, int slot, int slots,
                                                          unsigned seq) {
+    pdl_wait();   // (no pdl_trigger: it waits for the other members mid-kernel - wait_seq_kernel's rule)
     if (threadIdx.x == 0)
         for (int m = 0; m < nm; ++m)
             if (m != mi) wait_at_least(flags + ((size_t) m * slots + slot) * 32, seq);
@@ -2645,9 +3156,58 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
+// two members (DS4_AR2, a chunk's all-reduces): the put and the sums pipelined.  Each block cuts its contiguous range
+// of the row in pieces of kAr2Piece float4s, puts piece k out, flags it (its progress word: seq << 12 | k + 1, after a
+// system fence) and then sums piece k - 1 - so a member's link carries its rows out while it reads the other's in,
+// where xfer_put sent the whole row out before ar_sum_kernel read any in.  The other's rows come in 16 bytes a lane
+// (ld_fresh_v).  The sums are ar_sum_kernel's: member 0's partial plus member 1's (__fadd_rn), bit for bit.  F16
+// (DS4_AR2=2): both partials rounded to FP16 (saturating) on the wire - this member's own too - and summed in F32 in
+// member order, so both members' copies stay the same; half the bytes.  A slot is written again two seqs on, after the
+// other member read it: its kernel for that seq ended before it put the next one, which this member's next waited for
+// (allreduce's argument).  np < 4096 (n4 < 2^31 over 64 blocks of kAr2Piece), so progress words never reach the next
+// seq
+template <bool F16>
+__global__ void __launch_bounds__(kThreads) ar2_kernel(float* x, int n4, float* rows, size_t stride, unsigned* pflags,
+                                                      int mi, int slot, int slots, unsigned seq) {
+    float4* x4 = (float4*) x;
+    const int per = (n4 + (int) gridDim.x - 1) / (int) gridDim.x;
+    const int lo = min(n4, (int) blockIdx.x * per), hi = min(n4, lo + per);
+    const int np = (hi - lo + kAr2Piece - 1) / kAr2Piece;
+    auto flag = [&](int m) { return pflags + (((size_t) m * slots + slot) * kAr2Blocks + blockIdx.x) * 16; };
+    float* mine = rows + ((size_t) mi * slots + slot) * stride;
+    const float* other = rows + ((size_t) (1 - mi) * slots + slot) * stride;
+    const unsigned base = seq << 12;
+    for (int k = 0; k <= np; ++k) {
+        if (k < np) {   // put piece k
+            const int q1 = min(hi, lo + (k + 1) * kAr2Piece);
+            for (int q = lo + k * kAr2Piece + (int) threadIdx.x; q < q1; q += blockDim.x) {
+                if (F16) ((uint2*) mine)[q] = to_h4(sat4(x4[q]));
+                else ((float4*) mine)[q] = x4[q];
+            }
+            __threadfence_system();
+            __syncthreads();
+            if (threadIdx.x == 0) *(volatile unsigned*) flag(mi) = base + (unsigned) k + 1u;
+        }
+        if (k > 0) {   // sum piece k - 1, once the other member flagged it
+            if (threadIdx.x == 0) wait_at_least(flag(1 - mi), base + (unsigned) k);
+            __syncthreads();
+            const int q1 = min(hi, lo + k * kAr2Piece);
+            for (int q = lo + (k - 1) * kAr2Piece + (int) threadIdx.x; q < q1; q += blockDim.x) {
+                const float4 a = F16 ? from_h4(to_h4(sat4(x4[q]))) : x4[q];
+                const float4 b =
+                    F16 ? from_h4(ld_fresh_v((const uint2*) other + q)) : ld_fresh_v((const float4*) other + q);
+                const float4 p = mi == 0 ? a : b, r = mi == 0 ? b : a;
+                x4[q] = make_float4(__fadd_rn(p.x, r.x), __fadd_rn(p.y, r.y), __fadd_rn(p.z, r.z), __fadd_rn(p.w, r.w));
+            }
+        }
+    }
+}
+
 // a thread a (token, value): every stream's value read before any is written
 __global__ void hc_post_inplace_kernel(const float* __restrict__ y, float* h, const float* __restrict__ post,
                                        const float* __restrict__ comb, int dim, int hc) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
     float* r = h + (size_t) t * hc * dim;
@@ -2663,6 +3223,8 @@ __global__ void hc_post_inplace_kernel(const float* __restrict__ y, float* h, co
 
 __global__ void __launch_bounds__(kThreads) hc_mix_scale_kernel(const float* __restrict__ h, int hcdim, int n_mix,
                                                                 float eps, float* mixes) {
+    pdl_wait();
+    pdl_trigger();
     const int t = blockIdx.x;
     const float* x = h + (size_t) t * hcdim;
     float ss = 0.0f;
@@ -2677,6 +3239,8 @@ __global__ void __launch_bounds__(kThreads) hc_mix_scale_kernel(const float* __r
 
 __global__ void engram_dequant_tok_kernel(const uint8_t* __restrict__ src, size_t per, int cols, int hd,
                                           float* __restrict__ out, int fmt) {
+    pdl_wait();
+    pdl_trigger();
     const int r = blockIdx.x, t = r / cols, c = r - t * cols;
     const uint8_t* rows = src + (size_t) t * per + (size_t) c * hd;
     const uint8_t* scales = src + (size_t) t * per + (size_t) cols * hd + (size_t) c * (hd / 32);
@@ -2699,6 +3263,8 @@ template <bool FILL>
 __global__ void __launch_bounds__(kThreads) moe_sort_kernel(const int* __restrict__ idx, int T, int k,
                                                             const int* __restrict__ vs, int* bounds, int* row_tok,
                                                             int* pos) {
+    pdl_wait();
+    pdl_trigger();
     const int slot = blockIdx.x;
     __shared__ int warp_n[kThreads / 32];
     __shared__ int base_s;
@@ -2731,6 +3297,8 @@ __global__ void __launch_bounds__(kThreads) moe_sort_kernel(const int* __restric
 }
 
 __global__ void bounds_scan_kernel(int* bounds, int n_vs) {   // one thread: bounds[0] = 0, bounds[s + 1] += bounds[s]
+    pdl_wait();
+    pdl_trigger();
     if (threadIdx.x != 0) return;
     bounds[0] = 0;
     for (int s = 0; s < n_vs; ++s) bounds[s + 1] += bounds[s];
@@ -2738,6 +3306,8 @@ __global__ void bounds_scan_kernel(int* bounds, int n_vs) {   // one thread: bou
 
 __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, const int* __restrict__ pos,
                                    const float* __restrict__ w, int k, int r0, int r1, int dim) {
+    pdl_wait();
+    pdl_trigger();
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
     if (e >= dim) return;
     bool any = false;   // (a token without rows here leaves acc unread: a chunk's set covers a few of its tokens)
@@ -2759,23 +3329,64 @@ int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 }  // namespace
 
+bool pdl_on() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    static const bool env = [] {
+        const char* v = std::getenv("DS4_PDL");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (!env || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
+            cudaGetLastError();
+            major = 0;
+        }
+        k = major >= 9 ? 2 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k == 2;
+#endif
+}
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1) {
-    route_publish_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-                                           vl != 0 ? bias_vl : nullptr, vl);
-    if (req != nullptr) publish_kernel<<<1, 1, 0, s>>>(req, T, seq, na0, na1);
+                   unsigned vl, int na0, int na1, Resp* resp, int* cpu_any, const unsigned* host_done) {
+    if (req == nullptr || host_done == nullptr) resp = nullptr;
+    if (resp == nullptr) cpu_any = nullptr;
+    pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
+               vl != 0 ? bias_vl : nullptr, vl, cpu_any);
+    if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, resp, cpu_any, host_done);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
     if (req != nullptr && m > 0 && T > 0 && n <= 1024 && off + m <= kAhead)
-        route_ahead_kernel<<<T, 512, 0, s>>>(logits, bias, n, m, req, off);
+        pdl_launch(route_ahead_kernel, T, 512, 0, s, logits, bias, n, m, req, off);
 }
-void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { wait_seq_kernel<<<1, 32, 0, s>>>(seq_ptr, seq); }
-void init_pre(float* pre, int T, cudaStream_t s) { init_pre_kernel<<<cdiv(T * 8, 128), 128, 0, s>>>(pre, T); }
+bool route_pair(const RoutePair& a, cudaStream_t s) {
+    if (a.req == nullptr || a.n < 1 || a.n > 1024 || a.k < 1 || a.k > kPicks || a.a_n < 1 || a.a_n > 1024 || a.m < 1 ||
+        a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim || a.T < 1 || a.T > kWin)
+        return false;
+    route_pair_kernel<<<dim3(2, (unsigned) a.T), 512, 0, s>>>(a);
+    if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
+    publish_kernel<<<1, 1, 0, s>>>(a.req, a.T, a.seq, a.na0, a.na1, nullptr, nullptr, nullptr);
+    return cudaGetLastError() == cudaSuccess;
+}
+void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s) { pdl_launch(wait_seq_kernel, 1, 32, 0, s, seq_ptr, seq); }
+void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s) {
+    helper_take_kernel<<<1, 256, 0, s>>>(req, seq, k, dim, tab, n, plan, w, x, ack, quit);
+}
+void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s) { signal_seq_kernel<<<1, 1, 0, s>>>(flag, seq); }
+void init_pre(float* pre, int T, cudaStream_t s) { pdl_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T); }
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
-    embed_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(rows, h, dim, hc);
+    pdl_launch(embed_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, rows, h, dim, hc);
 }
 
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s) {
@@ -2784,84 +3395,122 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cud
         return;
     }
     if (n_vec <= 0) return;
+    if (f.q8 != nullptr &&
+        (f.q8d == nullptr || len % 32 != 0 || stride != len || f.dst != nullptr || f.pdst != nullptr)) {
+        std::fprintf(stderr, "ds4 finish: int8 rows of %d values (stride %lld) not covered\n", len, stride);
+        return;
+    }
     if (f.pdst != nullptr) {
         if (f.quant < kKvFp8 || f.quant > kKvFp4p || len % 32 != 0) {
             std::fprintf(stderr, "ds4 finish: packed rows of quant %d, %d values not covered\n", f.quant, len);
             return;
         }
-        finish_kernel<true><<<n_vec, kThreads, 0, s>>>(x, len, stride, f);
+        pdl_launch(finish_kernel<true>, n_vec, kThreads, 0, s, x, len, stride, f);
     } else
-        finish_kernel<false><<<n_vec, kThreads, 0, s>>>(x, len, stride, f);
+        pdl_launch(finish_kernel<false>, n_vec, kThreads, 0, s, x, len, stride, f);
 }
 
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
-    hc_mix_kernel<<<dim3(n_mix, T), kThreads, 0, s>>>(h, fn, hcdim, eps, mixes);
+    pdl_launch(hc_mix_kernel, dim3(n_mix, T), kThreads, 0, s, h, fn, hcdim, eps, mixes);
 }
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
               float* pre, float* post, float* comb, cudaStream_t s) {
-    hc_split_kernel<<<T, 32, 0, s>>>(mixes, scale, base, hc, iters, hc_eps, pre, post, comb);
+    pdl_launch(hc_split_kernel, T, 32, 0, s, mixes, scale, base, hc, iters, hc_eps, pre, post, comb);
 }
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  cudaStream_t s) {
-    hc_pre_norm_kernel<<<T, 1024, 0, s>>>(h, mix, w, dim, hc, eps, x);
+    pdl_launch(hc_pre_norm_kernel, T, 1024, 0, s, h, mix, w, dim, hc, eps, x);
 }
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, cudaStream_t s) {
-    hc_post_kernel<<<dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, s>>>(y, res, post, comb, dim, hc, out);
+    pdl_launch(hc_post_kernel, dim3(cdiv(dim * hc, kThreads), T), kThreads, 0, s, y, res, post, comb, dim, hc, out);
 }
 
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s) {
-    hc_post_inplace_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(y, h, post, comb, dim, hc);
+    pdl_launch(hc_post_inplace_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, y, h, post, comb, dim, hc);
+}
+void project_out(float* y, const float* r, float scale, int dim, int T, cudaStream_t s) {
+    if (T > 0) project_out_kernel<<<T, 1024, 0, s>>>(y, r, scale, dim);
 }
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s) {
-    hc_mix_scale_kernel<<<T, kThreads, 0, s>>>(h, hcdim, n_mix, eps, mixes);
+    pdl_launch(hc_mix_scale_kernel, T, kThreads, 0, s, h, hcdim, n_mix, eps, mixes);
+}
+void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T) {
+    hc_split_pre_norm_kernel<<<dim3(2, (unsigned) std::max(1, T)), 1024, 0, s>>>(a);
 }
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s, int fmt) {
-    if (T > 0) engram_dequant_tok_kernel<<<T * cols, kThreads, 0, s>>>(src, per, cols, hd, out, fmt);
+    if (T > 0) pdl_launch(engram_dequant_tok_kernel, T * cols, kThreads, 0, s, src, per, cols, hd, out, fmt);
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s) {
-    moe_sort_kernel<false><<<n_vs, kThreads, 0, s>>>(idx, T, k, vs, bounds, row_tok, pos);
-    bounds_scan_kernel<<<1, 32, 0, s>>>(bounds, n_vs);
-    moe_sort_kernel<true><<<n_vs, kThreads, 0, s>>>(idx, T, k, vs, bounds, row_tok, pos);
+    pdl_launch(moe_sort_kernel<false>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
+    pdl_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
+    pdl_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
 }
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s) {
-    if (r1 > r0 && T > 0) moe_combine_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(acc, y, pos, w, k, r0, r1, dim);
+    if (r1 > r0 && T > 0) pdl_launch(moe_combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, acc, y, pos, w, k, r0, r1, dim);
 }
 
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s) {
-    gemv_f16_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, alpha, y);
+    pdl_launch(gemv_f16_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, alpha, y);
 }
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    cudaStream_t s) {
     if (T > 0)
-        gemv_f16_rows_kernel<<<dim3(cdiv(n, kThreads / 32), cdiv(T, kRowsT)), kThreads, 0, s>>>(W, x, ldx, n, k, T, alpha,
-                                                                                               y, ldy);
+        pdl_launch(gemv_f16_rows_kernel, dim3(cdiv(n, kThreads / 32), cdiv(T, kRowsT)), kThreads, 0, s, W, x, ldx, n, k, T, alpha,
+                   y, ldy);
 }
 
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
+                   cudaStream_t s, int T, int ldy) {
+    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
+        return false;
+    const int b0 = (int) cdiv(n0, kThreads / 32), b1 = (int) cdiv(n1, kThreads / 32);
+    if (T == 1) gemv_f32_pair_kernel<<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
+    else   // (=2, a window's rows)
+        gemv_f32_pair_rows_kernel<<<dim3(b0 + b1, cdiv(T, kGemvT)), kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, T,
+                                                                                      ldy);
+    return cudaGetLastError() == cudaSuccess;
+}
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     if (T == 1 || (T > 0 && std::getenv("DS4_ROUTER_ROWS") != nullptr && std::atoi(std::getenv("DS4_ROUTER_ROWS")) == 0))
-        gemv_f32_kernel<<<dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s>>>(W, x, n, k, y, ldy);
+        pdl_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
     else if (T > 1)   // (DS4_ROUTER_ROWS=0: a launch a token, as before - the same bits)
-        gemv_f32_rows_kernel<<<dim3(cdiv(n, kThreads / 32), cdiv(T, kGemvT)), kThreads, 0, s>>>(W, x, n, k, T, y, ldy);
+        pdl_launch(gemv_f32_rows_kernel, dim3(cdiv(n, kThreads / 32), cdiv(T, kGemvT)), kThreads, 0, s, W, x, n, k, T, y, ldy);
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,
            cudaStream_t s, const float* bias_vl, const VlBits* vl) {
     static const VlBits none = {};
-    route_kernel<<<T, 512, 0, s>>>(logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
-                                   vl != nullptr ? *vl : none);
+    pdl_launch(route_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, idx, w, vl != nullptr ? bias_vl : nullptr,
+               vl != nullptr ? *vl : none);
 }
 
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s) {
-    if (n > 0) swiglu_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h);
+    if (n > 0) pdl_launch(swiglu_kernel, cdiv(n, kThreads), kThreads, 0, s, g, u, n, lim, h);
+}
+bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, cudaStream_t s) {
+    if (n % 32 != 0 || q == nullptr || qd == nullptr) return false;
+    if (n > 0) swiglu_q8_kernel<<<cdiv(n, kThreads), kThreads, 0, s>>>(g, u, n, lim, h, q, qd);
+    return true;
+}
+bool copy_regions(const CopyRegions& r, cudaStream_t s) {
+    if (r.n < 1 || r.n > 4) return false;
+    size_t most = 0;
+    for (int k = 0; k < r.n; ++k) {
+        if (r.bytes[k] % 4 != 0 || (uintptr_t) r.dst[k] % 4 != 0 || (uintptr_t) r.src[k] % 4 != 0) return false;
+        most = std::max(most, r.bytes[k] / 4);
+    }
+    const unsigned bx = (unsigned) std::max<size_t>(1, std::min<size_t>(64, (most + kThreads - 1) / kThreads));
+    copy_regions_kernel<<<dim3(bx, (unsigned) r.n), kThreads, 0, s>>>(r);
+    return true;
 }
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
                   int d, const float* w, float eps, float* latent, cudaStream_t s) {
-    compress_kernel<<<1, 512, 0, s>>>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
+    pdl_launch(compress_kernel, 1, 512, 0, s, kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent);
 }
 
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
@@ -2918,11 +3567,11 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     const size_t smem = (size_t) (heads * hd + heads) * sizeof(float);
     const dim3 grid(cdiv(n, kThreads), T);
     if (kfmt == kKvFp4p)
-        index_score_kernel<128, kKvFp4p><<<grid, kThreads, smem, s>>>(q, w, (const uint8_t*) k, heads, n, cand,
-                                                                       cand_stride, blk, lim, out, out_stride);
+        pdl_launch(index_score_kernel<128, kKvFp4p>, grid, kThreads, smem, s, q, w, (const uint8_t*) k, heads, n, cand,
+                   cand_stride, blk, lim, out, out_stride);
     else
-        index_score_kernel<128, kKvBf16><<<grid, kThreads, smem, s>>>(q, w, (const uint8_t*) k, heads, n, cand,
-                                                                       cand_stride, blk, lim, out, out_stride);
+        pdl_launch(index_score_kernel<128, kKvBf16>, grid, kThreads, smem, s, q, w, (const uint8_t*) k, heads, n, cand,
+                   cand_stride, blk, lim, out, out_stride);
 }
 
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
@@ -2945,7 +3594,7 @@ void topk(const float* vals, long long stride, int T, const Rows& r, const int* 
         }
         if (nmax >= kTopkSegMin && kmax <= sc->K) {
             const int P = std::min(sc->P, std::max(2, (nmax + kTopkSeg - 1) / kTopkSeg));
-            topk_seg_kernel<<<dim3(P, T), 1024, 0, s>>>(vals, stride, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth);
+            pdl_launch(topk_seg_kernel, dim3(P, T), 1024, 0, s, vals, stride, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth);
             static std::atomic<int> merge_cap[64];   // (each device's cap, its shared memory opted in; 0: not yet)
             int dev = 0;
             cudaGetDevice(&dev);
@@ -2957,12 +3606,12 @@ void topk(const float* vals, long long stride, int T, const Rows& r, const int* 
                 cudaFuncSetAttribute(topk_merge_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, cap * 8);
                 merge_cap[dev & 63].store(cap, std::memory_order_relaxed);
             }
-            topk_merge_kernel<<<T, 1024, (size_t) cap * 8, s>>>(r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
-                                                                cand_stride, blk, out, out_stride, cap);
+            pdl_launch(topk_merge_kernel, T, 1024, (size_t) cap * 8, s, r, P, sc->K, sc->val, sc->idx, sc->cnt, sc->kth, cand,
+                       cand_stride, blk, out, out_stride, cap);
             return;
         }
     }
-    topk_kernel<<<T, 1024, 0, s>>>(vals, stride, r, cand, cand_stride, blk, out, out_stride);
+    pdl_launch(topk_kernel, T, 1024, 0, s, vals, stride, r, cand, cand_stride, blk, out, out_stride);
 }
 
 void cand_blocks(const float* score, long long stride, int T, const Rows& r, int blk, float* bm, long long bm_stride,
@@ -2979,7 +3628,7 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
             rb.k[t] = r.k[t];
             nb_max = rb.n[t] > nb_max ? rb.n[t] : nb_max;
         }
-    block_max_kernel<<<dim3(cdiv(nb_max, kThreads), T), kThreads, 0, s>>>(score, stride, r, blk, bm, bm_stride);
+    pdl_launch(block_max_kernel, dim3(cdiv(nb_max, kThreads), T), kThreads, 0, s, score, stride, r, blk, bm, bm_stride);
     topk(bm, bm_stride, T, rb, nullptr, 0, 1, out, out_stride, s);
 }
 
@@ -3022,6 +3671,8 @@ __global__ void __launch_bounds__(kV7Threads, 1) sparse_attn_v7_kernel(const flo
                                                                        const int* __restrict__ sel, int sel_stride,
                                                                        AttnRows ar, const float* __restrict__ sink,
                                                                        int heads, float scale, float* __restrict__ out) {
+    pdl_wait();
+    pdl_trigger();
 #if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
     namespace wm = nvcuda::wmma;
     constexpr int d = 512, NW = kV7Threads / 32;
@@ -3316,26 +3967,26 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         return;
     }
     if (ckv_fmt == kKvBf16) {
-        sparse_attn_kernel<false><<<dim3(heads, T), kThreads, 0, s>>>(q, win, (const uint16_t*) ckv, sel, sel_stride, a,
-                                                                       sink, heads, d, scale, out);
+        pdl_launch(sparse_attn_kernel<false>, dim3(heads, T), kThreads, 0, s, q, win, (const uint16_t*) ckv, sel, sel_stride, a,
+                   sink, heads, d, scale, out);
         return;
     }
     if (heads_per_block == kAttnWmma) {   // (a prompt chunk: the matrix cores where there are, else as 0)
         static_assert(kThreads == 256, "the WMMA kernel's softmax: a thread a (head, row) of 16 x 16");
         if (attn_wmma_now() && heads % 16 == 0) {
-            sparse_attn_wmma_kernel<<<dim3(heads / 16, T), kThreads, 0, s>>>(q, win, (const uint8_t*) ckv, sel,
-                                                                           sel_stride, a, sink, heads, scale, out);
+            pdl_launch(sparse_attn_wmma_kernel, dim3(heads / 16, T), kThreads, 0, s, q, win, (const uint8_t*) ckv, sel,
+                       sel_stride, a, sink, heads, scale, out);
             return;
         }
 #if !defined(STRATA_USE_HIP)
         if (a.gen && a.kcap + a.win <= kV7Max && heads % 16 == 0 && attn_v7_now()) {
-            sparse_attn_v7_kernel<<<dim3(heads / 16, T), kV7Threads, kV7Smem, s>>>(q, win, (const uint8_t*) ckv, sel,
-                                                                              sel_stride, a, sink, heads, scale, out);
+            pdl_launch(sparse_attn_v7_kernel, dim3(heads / 16, T), kV7Threads, kV7Smem, s, q, win, (const uint8_t*) ckv, sel,
+                       sel_stride, a, sink, heads, scale, out);
             return;
         }
         if (attn_mma_now() && heads % 16 == 0) {
-            sparse_attn_mma_kernel<<<dim3(heads / 16, T), kThreads, 0, s>>>(q, win, (const uint8_t*) ckv, sel,
-                                                                          sel_stride, a, sink, heads, scale, out);
+            pdl_launch(sparse_attn_mma_kernel, dim3(heads / 16, T), kThreads, 0, s, q, win, (const uint8_t*) ckv, sel,
+                       sel_stride, a, sink, heads, scale, out);
             return;
         }
 #endif
@@ -3345,16 +3996,16 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     // the BF16 rows' kernel itself (heads_per_block -1: this way at any T)
     const bool few = heads_per_block == -1 || (heads_per_block == 0 && T <= kAttnScratchT);
     if (few && scr != nullptr && scr->rows != nullptr && T <= scr->max_t && sel_stride <= scr->cap) {
-        unpack_sel_kernel<<<dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s>>>((const uint8_t*) ckv, sel, sel_stride, a,
-                                                                               scr->cap, scr->rows);
+        pdl_launch(unpack_sel_kernel, dim3(cdiv(sel_stride, kStage), T), kThreads, 0, s, (const uint8_t*) ckv, sel, sel_stride, a,
+                   scr->cap, scr->rows);
 #if !defined(STRATA_USE_HIP)
         if (T == 1)   // (V100: the loads ahead pay for the decode's kernel at one query, not at more)
-            sparse_attn_kernel<true, 8><<<dim3(heads, T), kThreads, 0, s>>>(q, win, scr->rows, nullptr, scr->cap, a, sink,
-                                                                             heads, d, scale, out);
+            pdl_launch(sparse_attn_kernel<true, 8>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
+                       heads, d, scale, out);
         else
 #endif
-            sparse_attn_kernel<true, 0><<<dim3(heads, T), kThreads, 0, s>>>(q, win, scr->rows, nullptr, scr->cap, a, sink,
-                                                                             heads, d, scale, out);
+            pdl_launch(sparse_attn_kernel<true, 0>, dim3(heads, T), kThreads, 0, s, q, win, scr->rows, nullptr, scr->cap, a, sink,
+                       heads, d, scale, out);
         return;
     }
     // packed rows: as many heads a block as still leaves two blocks a multiprocessor (a decoded row serves them all)
@@ -3369,89 +4020,89 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
 #if defined(STRATA_USE_HIP)
     const char* swizzle = std::getenv("DS4_HIP_ATTN_SWIZZLE");
     if (swizzle && std::atoi(swizzle) == 1) {
-        if (G == 8) sparse_attn_packed_kernel<8, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-        else if (G == 4) sparse_attn_packed_kernel<4, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-        else if (G == 2) sparse_attn_packed_kernel<2, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-        else sparse_attn_packed_kernel<1, true><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        if (G == 8) pdl_launch(sparse_attn_packed_kernel<8, true>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else if (G == 4) pdl_launch(sparse_attn_packed_kernel<4, true>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else if (G == 2) pdl_launch(sparse_attn_packed_kernel<2, true>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+        else pdl_launch(sparse_attn_packed_kernel<1, true>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
         return;
     }
 #endif
-    if (G == 8) sparse_attn_packed_kernel<8><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 4) sparse_attn_packed_kernel<4><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else if (G == 2) sparse_attn_packed_kernel<2><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
-    else sparse_attn_packed_kernel<1><<<grid, kThreads, 0, s>>>(q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    if (G == 8) pdl_launch(sparse_attn_packed_kernel<8>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else if (G == 4) pdl_launch(sparse_attn_packed_kernel<4>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else if (G == 2) pdl_launch(sparse_attn_packed_kernel<2>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
+    else pdl_launch(sparse_attn_packed_kernel<1>, grid, kThreads, 0, s, q, win, c, sel, sel_stride, a, sink, heads, scale, out);
 }
 
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s) {
-    ring_to_ext_kernel<<<n, kThreads, 0, s>>>(ring, ext, (long long) p0, n, d);
+    pdl_launch(ring_to_ext_kernel, n, kThreads, 0, s, ring, ext, (long long) p0, n, d);
 }
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s, uint8_t* backup) {
     if (d % 32 != 0) {
         std::fprintf(stderr, "ds4 ext_to_ring: row of %d not covered\n", d);
         return;
     }
-    ext_to_ring_kernel<<<T, kThreads, 0, s>>>(ext, ring, (long long) p0, n, T, d, backup);
+    pdl_launch(ext_to_ring_kernel, T, kThreads, 0, s, ext, ring, (long long) p0, n, T, d, backup);
 }
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
     if (T > keep)
-        ring_restore_kernel<<<T - keep, kThreads, 0, s>>>(ring, backup, (long long) p0, n, keep, kv_row_bytes(kKvFp8, d));
+        pdl_launch(ring_restore_kernel, T - keep, kThreads, 0, s, ring, backup, (long long) p0, n, keep, kv_row_bytes(kKvFp8, d));
 }
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s) {
     if (T > keep && b.n > 0)
-        ring_restore_batch_kernel<<<dim3(T - keep, b.n), kThreads, 0, s>>>(b, (long long) p0, n, keep,
-                                                                             kv_row_bytes(kKvFp8, d));
+        pdl_launch(ring_restore_batch_kernel, dim3(T - keep, b.n), kThreads, 0, s, b, (long long) p0, n, keep,
+                   kv_row_bytes(kKvFp8, d));
 }
 void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s) {
-    if (b.n > 0) comp_restore_batch_kernel<<<b.n, kThreads, 0, s>>>(b, (long long) p0, keep, d);
+    if (b.n > 0) pdl_launch(comp_restore_batch_kernel, b.n, kThreads, 0, s, b, (long long) p0, keep, d);
 }
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
-    hc_mean_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(h, hc, dim, out, out_stride);
+    pdl_launch(hc_mean_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, h, hc, dim, out, out_stride);
 }
-void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { iota_rows_kernel<<<T, 64, 0, s>>>(out, n, stride); }
+void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { pdl_launch(iota_rows_kernel, T, 64, 0, s, out, n, stride); }
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
-    markov_kernel<<<cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, E, H, tok, V, R);
+    pdl_launch(markov_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, H, tok, V, R);
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
-    markov_share_kernel<<<cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, H, erow, vn, R);
+    pdl_launch(markov_share_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, H, erow, vn, R);
 }
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s) {
-    argmax_share_kernel<<<1, 1024, 0, s>>>(row, vn, v0, slot, seq);
+    pdl_launch(argmax_share_kernel, 1, 1024, 0, s, row, vn, v0, slot, seq);
 }
 void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
                  cudaStream_t s) {
-    markov_pick_kernel<<<1, 256, 0, s>>>(slots, nm, seq, tok, E, erow, R);
+    pdl_launch(markov_pick_kernel, 1, 256, 0, s, slots, nm, seq, tok, E, erow, R);
 }
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s) {
-    confidence_kernel<<<T, 1024, 0, s>>>(x, E, tok, w, dim, R, out);
+    pdl_launch(confidence_kernel, T, 1024, 0, s, x, E, tok, w, dim, R, out);
 }
 
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int fmt) {
-    engram_dequant_kernel<<<n, kThreads, 0, s>>>(rows, scales, hd, out, fmt);
+    pdl_launch(engram_dequant_kernel, n, kThreads, 0, s, rows, scales, hd, out, fmt);
 }
 
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s) {
-    engram_gate_kernel<<<dim3(hc, T), 1024, 0, s>>>(h, kv, w, hc, dim, eps);
+    pdl_launch(engram_gate_kernel, dim3(hc, T), 1024, 0, s, h, kv, w, hc, dim, eps);
 }
 
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s) {
-    if (n > 0) gather_kernel<<<dim3(cdiv(cols, kThreads), n), kThreads, 0, s>>>(x, g, cols, out);
+    if (n > 0) pdl_launch(gather_kernel, dim3(cdiv(cols, kThreads), n), kThreads, 0, s, x, g, cols, out);
 }
 void gather_cols(const uint8_t* src, size_t pitch, size_t col0, size_t width, int rows, uint8_t* out, cudaStream_t s) {
     if (rows <= 0 || width == 0) return;
     const unsigned bx = (unsigned) std::min(4, cdiv((int) width, kThreads));
-    gather_cols_kernel<<<dim3(bx, (unsigned) rows), kThreads, 0, s>>>(src, pitch, col0, width, out);
+    pdl_launch(gather_cols_kernel, dim3(bx, (unsigned) rows), kThreads, 0, s, src, pitch, col0, width, out);
 }
 
 void combine(const float* ed, const float* cpu, const float* sh, const Combine& c, int T, int dim, float* out,
              cudaStream_t s) {
-    combine_kernel<<<dim3(cdiv(dim, kThreads), T), kThreads, 0, s>>>(ed, cpu, sh, c, dim, out);
+    pdl_launch(combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, ed, cpu, sh, c, dim, out);
 }
 
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const size_t total = xfer_units(x);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
-    xfer_put_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq, cnt);
+    pdl_launch(xfer_put_kernel, blocks, kThreads, 0, s, x, flag, seq, cnt);
     // (another GPU, or the host, waits for this flag: on Windows the put must not sit in the queue - #303: two RTX 3080s
     //  hung at the first hand-off, the receiver spinning on a flag whose writer had never been submitted)
     win_submit(s);
@@ -3473,20 +4124,29 @@ void win_submit(cudaStream_t s) {
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s) {
     const size_t total = xfer_units(x);
     const int blocks = (int) std::max<size_t>(1, std::min<size_t>(64, (total + kThreads - 1) / kThreads));
-    xfer_get_kernel<<<blocks, kThreads, 0, s>>>(x, flag, seq);
+    pdl_launch(xfer_get_kernel, blocks, kThreads, 0, s, x, flag, seq);
 }
 void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, cudaStream_t s) {
-    if (n > 0) wait_flags_kernel<<<1, 32, 0, s>>>(flags, n, stride, seq);
+    if (n > 0) pdl_launch(wait_flags_kernel, 1, 32, 0, s, flags, n, stride, seq);
 }
 void set_flag(unsigned* flag, unsigned v, cudaStream_t s) {
-    set_flag_kernel<<<1, 1, 0, s>>>(flag, v);
+    pdl_launch(set_flag_kernel, 1, 1, 0, s, flag, v);
     win_submit(s);   // (the writer on another GPU waits for this acknowledgement before its next put - #384)
 }
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s) {
-    if (n > 0) tab_set_kernel<<<cdiv(n, 128), 128, 0, s>>>(pairs, n);
+    if (n > 0) pdl_launch(tab_set_kernel, cdiv(n, 128), 128, 0, s, pairs, n);
 }
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s) {
     const int slot = (int) (seq % (unsigned) a.slots);
+    if (a.nm == 2 && a.ar2 > 0 && a.pflags != nullptr) {   // (DS4_AR2: the put and the sums in one pipelined launch)
+        const int n4 = n / 4;
+        const int blocks = std::max(1, std::min(kAr2Blocks, cdiv(n4, kThreads)));
+        if (a.ar2 == 2)
+            ar2_kernel<true><<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.pflags, mi, slot, a.slots, seq);
+        else
+            ar2_kernel<false><<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.pflags, mi, slot, a.slots, seq);
+        return;
+    }
     if (a.nm > 2 && a.sums != nullptr && a.bflags != nullptr) {   // (the reduce-scatter: ar_rs_kernel)
         static const bool f16 = [] {
             const char* e = std::getenv("DS4_AR_F16");
@@ -3495,9 +4155,9 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
         const int n4 = n / 4;
         const int blocks = std::max(1, std::min(kArBlocks, cdiv(n4, kThreads)));
         if (f16)
-            ar_rs16_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
+            pdl_launch(ar_rs16_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
         else
-            ar_rs_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
+            pdl_launch(ar_rs_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.sums, a.stride, a.bflags, a.nm, mi, slot, a.slots, seq);
         return;
     }
     Xfer xp;
@@ -3508,7 +4168,7 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     xfer_put(xp, a.flags + ((size_t) mi * a.slots + slot) * 32, seq, cnt, s);
     const int n4 = n / 4;
     const int blocks = std::max(1, std::min(64, cdiv(n4, kThreads)));
-    ar_sum_kernel<<<blocks, kThreads, 0, s>>>(x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
+    pdl_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
 void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
@@ -3525,7 +4185,7 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
     unsigned* sf = a.bflags + ((size_t) nm * a.slots + slot) * kArBlocks * 8;
     const int fs = a.slots * kArBlocks * 8;
     const int blocks = std::max(1, std::min(1024, cdiv(n4, kThreads)));
-    ar_to16_kernel<<<blocks, kThreads, 0, s>>>((const float4*) x, n4, own);
+    pdl_launch(ar_to16_kernel, blocks, kThreads, 0, s, (const float4*) x, n4, own);
     // the H2D side by the SMs up to 4 members (16K-token prompt on 9 GPUs, --tp 4: 743 -> 785 tok/s), the copy
     // engine past that (--tp 8: 719 by the copy engine, 676 by the SMs); DS4_AR_ZC=0 / 1 / 2.. sets the most members
     static const int zc_max = [] {
@@ -3552,15 +4212,14 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
             piece(p, p0, p1, q0, q1);
             if (q0 > p0) cudaMemcpyAsync(hrow(mi) + p0, own + p0, (size_t) (q0 - p0) * 8, cudaMemcpyDeviceToHost, aux->s2);
             if (p1 > q1) cudaMemcpyAsync(hrow(mi) + q1, own + q1, (size_t) (p1 - q1) * 8, cudaMemcpyDeviceToHost, aux->s2);
-            set_flag_kernel<<<1, 1, 0, aux->s2>>>(rfp(p) + (size_t) mi * fs, seq);
+            pdl_launch(set_flag_kernel, 1, 1, 0, aux->s2, rfp(p) + (size_t) mi * fs, seq);
         }
         for (int p = 0; p < kArPieces; ++p) {
             int p0, p1, q0, q1;
             piece(p, p0, p1, q0, q1);
-            wait_flags_kernel<<<1, 32, 0, s>>>(rfp(p), nm, fs, seq);
+            pdl_launch(wait_flags_kernel, 1, 32, 0, s, rfp(p), nm, fs, seq);
             if (q1 > q0)
-                ar_sum16_zc_kernel<<<std::max(1, std::min(1024, cdiv(q1 - q0, kThreads))), kThreads, 0, s>>>(
-                    (float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, q0, q1);
+                pdl_launch(ar_sum16_zc_kernel, std::max(1, std::min(1024, cdiv(q1 - q0, kThreads))), kThreads, 0, s, (float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, q0, q1);
             cudaEventRecord(aux->ev[1 + p], s);
         }
         for (int p = 0; p < kArPieces; ++p) {
@@ -3568,46 +4227,44 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
             piece(p, p0, p1, q0, q1);
             cudaStreamWaitEvent(aux->s2, aux->ev[1 + p], 0);
             if (q1 > q0) cudaMemcpyAsync(hsum + q0, own + q0, (size_t) (q1 - q0) * 8, cudaMemcpyDeviceToHost, aux->s2);
-            set_flag_kernel<<<1, 1, 0, aux->s2>>>(sfp(p) + (size_t) mi * fs, seq);
+            pdl_launch(set_flag_kernel, 1, 1, 0, aux->s2, sfp(p) + (size_t) mi * fs, seq);
         }
         for (int p = 0; p < kArPieces; ++p) {
             int p0, p1, q0, q1;
             piece(p, p0, p1, q0, q1);
-            wait_flags_kernel<<<1, 32, 0, s>>>(sfp(p), nm, fs, seq);
+            pdl_launch(wait_flags_kernel, 1, 32, 0, s, sfp(p), nm, fs, seq);
             if (p1 > p0)
-                ar_from16_zc_kernel<<<std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s>>>(
-                    (float4*) x, hsum, p1, q0, q1, p0);
+                pdl_launch(ar_from16_zc_kernel, std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s, (float4*) x, hsum, p1, q0, q1, p0);
         }
         return;
     }
     if (c0 > 0) cudaMemcpyAsync(hrow(mi), own, (size_t) c0 * 8, cudaMemcpyDeviceToHost, s);   // (the others' slices)
     if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDeviceToHost, s);
-    set_flag_kernel<<<1, 1, 0, s>>>(rf + (size_t) mi * fs, seq);
-    wait_flags_kernel<<<1, 32, 0, s>>>(rf, nm, fs, seq);
+    pdl_launch(set_flag_kernel, 1, 1, 0, s, rf + (size_t) mi * fs, seq);
+    pdl_launch(wait_flags_kernel, 1, 32, 0, s, rf, nm, fs, seq);
     if (nm <= std::min(8, zc_max)) {
         const int nb = std::max(1, std::min(1024, cdiv(c1 - c0, kThreads)));
         if (c1 > c0) {
-            ar_sum16_zc_kernel<<<nb, kThreads, 0, s>>>((float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, c0, c1);
+            pdl_launch(ar_sum16_zc_kernel, nb, kThreads, 0, s, (float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, c0, c1);
             cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
         }
-        set_flag_kernel<<<1, 1, 0, s>>>(sf + (size_t) mi * fs, seq);
-        wait_flags_kernel<<<1, 32, 0, s>>>(sf, nm, fs, seq);
-        ar_from16_zc_kernel<<<blocks, kThreads, 0, s>>>((float4*) x, hsum, n4, c0, c1);
+        pdl_launch(set_flag_kernel, 1, 1, 0, s, sf + (size_t) mi * fs, seq);
+        pdl_launch(wait_flags_kernel, 1, 32, 0, s, sf, nm, fs, seq);
+        pdl_launch(ar_from16_zc_kernel, blocks, kThreads, 0, s, (float4*) x, hsum, n4, c0, c1, 0);
         return;
     }
     if (c1 > c0) {
         for (int m = 0; m < nm; ++m)
             if (m != mi)
                 cudaMemcpyAsync(peers + (size_t) m * cq, hrow(m) + c0, (size_t) (c1 - c0) * 8, cudaMemcpyHostToDevice, s);
-        ar_sum16_kernel<<<std::max(1, std::min(1024, cdiv(c1 - c0, kThreads))), kThreads, 0, s>>>(
-            (float4*) x, own, peers, (size_t) cq, nm, mi, c0, c1);
+        pdl_launch(ar_sum16_kernel, std::max(1, std::min(1024, cdiv(c1 - c0, kThreads))), kThreads, 0, s, (float4*) x, own, peers, (size_t) cq, nm, mi, c0, c1);
         cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
     }
-    set_flag_kernel<<<1, 1, 0, s>>>(sf + (size_t) mi * fs, seq);
-    wait_flags_kernel<<<1, 32, 0, s>>>(sf, nm, fs, seq);
+    pdl_launch(set_flag_kernel, 1, 1, 0, s, sf + (size_t) mi * fs, seq);
+    pdl_launch(wait_flags_kernel, 1, 32, 0, s, sf, nm, fs, seq);
     if (c0 > 0) cudaMemcpyAsync(own, hsum, (size_t) c0 * 8, cudaMemcpyHostToDevice, s);
     if (c1 < n4) cudaMemcpyAsync(own + c1, hsum + c1, (size_t) (n4 - c1) * 8, cudaMemcpyHostToDevice, s);
-    ar_from16_kernel<<<blocks, kThreads, 0, s>>>((float4*) x, own, n4, c0, c1);
+    pdl_launch(ar_from16_kernel, blocks, kThreads, 0, s, (float4*) x, own, n4, c0, c1);
 }
 
 // ---------------------------------------------------------------- the host-summed all-reduce
@@ -3780,20 +4437,19 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
     uint2* own = (uint2*) scratch;
     uint2* hrow = (uint2*) hr.row(mi, slot);
     const uint2* hsum = (const uint2*) hr.sum(slot);
-    ar_to16_kernel<<<std::max(1, std::min(1024, cdiv(n4, kThreads))), kThreads, 0, s>>>((const float4*) x, n4, own);
+    pdl_launch(ar_to16_kernel, std::max(1, std::min(1024, cdiv(n4, kThreads))), kThreads, 0, s, (const float4*) x, n4, own);
     cudaEventRecord(aux.ev[0], s);
     cudaStreamWaitEvent(aux.s2, aux.ev[0], 0);
     for (int p = 0; p < NP; ++p) {
         const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
         if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDeviceToHost, aux.s2);
-        set_flag_kernel<<<1, 1, 0, aux.s2>>>(a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
+        pdl_launch(set_flag_kernel, 1, 1, 0, aux.s2, a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
     }
     for (int p = 0; p < NP; ++p) {
         const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
-        wait_flags_kernel<<<1, 32, 0, s>>>(a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8, 1, 0, seq);
+        pdl_launch(wait_flags_kernel, 1, 32, 0, s, a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8, 1, 0, seq);
         if (p1 > p0)
-            ar_from16_zc_kernel<<<std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s>>>(
-                (float4*) x, hsum, p1, p1, p1, p0);
+            pdl_launch(ar_from16_zc_kernel, std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s, (float4*) x, hsum, p1, p1, p1, p0);
     }
 }
 

@@ -23,7 +23,7 @@ NINE = [24.0] + [16.0] * 8               # a 24 GB GPU and eight 16 GB ones, in 
 class FakeEngine:
     """Started with cfg["args"]: decode tok/s = speed(tp, threads), a long prompt's read tok/s = read(tp)."""
 
-    def __init__(self, cfg, speed, read, cpu_experts=100, threads=44):
+    def __init__(self, cfg, speed, read, cpu_experts=100, threads=44, vram=NINE):
         a = cfg["args"]
         self.tp = int(C4.arg(a, "--tp") or 2)   # (the engine's default)
         w = C4.arg(a, "--cpu-threads")
@@ -31,6 +31,16 @@ class FakeEngine:
         self.args = list(a)
         self.speed, self.read = speed, read
         self.info = {"cpu_threads": self.threads, "cpu_experts": cpu_experts}
+        # Model the existing VRAM protocol too: requested TP is not engine telemetry.
+        self.vram = []
+        i = 0
+        while i < len(vram):
+            j = i + 1
+            while j < len(vram) and j - i < self.tp and (self.tp == len(vram) or vram[j] == vram[i]):
+                j += 1
+            width = self.tp if j - i == self.tp else 1
+            self.vram.extend({"dev": dev, "tp_n": width} for dev in range(i, j))
+            i = j
         self.last = {}
 
     def generate(self, ids, max_new, sampling, cancel):
@@ -54,7 +64,7 @@ class Run:
             tp = int(C4.arg(cfg["args"], "--tp") or 2)
             if fail(tp, sum(s[0] == tp for s in self.starts)):    # (n: that --tp's starts so far)
                 raise RuntimeError("the engine exited before it was ready")
-            e = FakeEngine(cfg, speed, read, **kw)
+            e = FakeEngine(cfg, speed, read, vram=vram, **kw)
             self.starts.append((e.tp, C4.arg(cfg["args"], "--cpu-threads")))
             return e
         cfg = {"args": args or ["--pack", "/m/maya-ds4", "--max-context", "65536", "--tp", "2"]}

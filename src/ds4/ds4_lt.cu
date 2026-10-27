@@ -105,6 +105,7 @@ void set_store(const char* path) {
     std::lock_guard<std::mutex> lk(g_mu);
     g_store = path != nullptr ? path : "";
 }
+bool available() { return !off(); }
 
 bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int ldx, int t, float* y, int ldy) {
     if (off() || t < kMinRows || n <= 0 || k <= 0 || ldx < k || ldy < n) return false;
@@ -223,6 +224,7 @@ bool gemm(void* stream, const uint16_t* W, int n, int k, const uint16_t* x, int 
 }
 #else
 void set_store(const char*) {}
+bool available() { return false; }
 bool gemm(void*, const uint16_t*, int, int, const uint16_t*, int, int, float*, int) { return false; }
 #endif
 

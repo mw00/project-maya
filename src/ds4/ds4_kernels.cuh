@@ -58,6 +58,11 @@ struct Finish {
     int dst_f16 = 0;
     uint8_t* pdst = nullptr;
     long long pdst_stride = 0;
+    // (DS4_DECODE_TRIM 2) non-null: the values written to x also rounded to int8 as gguf mv rounds a Q8_0 job's input
+    // (q8_quant_block's ops on the stored value) - q8 [n_vec][len], q8d [n_vec][len / 32]; len % 32 == 0, stride len,
+    // no dst / pdst (finish refuses otherwise, nothing launched)
+    int8_t* q8 = nullptr;
+    float* q8d = nullptr;
 };
 /// a packed FP4 row's bytes (Finish::pdst): len / 2 of codes, a scale byte a group (quant 2: 16 values, quant 3: 32)
 constexpr size_t fp4_row_bytes(int len, int quant) { return (size_t) len / 2 + (size_t) len / (quant == 2 ? 16 : 32); }
@@ -78,6 +83,28 @@ void hc_post(const float* y, const float* res, const float* post, const float* c
 /// hc_post with out = res (h), the same arithmetic: a chunk keeps one copy of its streams.
 void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T,
                      cudaStream_t s);
+/// (DS4_HC_FUSE) a decoded token's hc_split and hc_pre_norm (T 1, hc 4) in one launch - they share nothing, the norm
+/// reading the lagged mix (the split before this one's) - each block its old kernel's code: the split of mixes into
+/// pre / post / comb (pre_copy set: the 8 pre slots there too, the values for k < hc and pre's own bits for the rest,
+/// as the layer's copy of them did), and x = rmsnorm(sum_s mix[s] h[s]) * w (q set: x's int8 rounding too, gguf mv's
+/// for a Q8_0 job's input - q [dim], qd [dim / 32]).  dim % 32 == 0, dim <= 8192; pre_copy not mix.
+struct HcFuse {
+    const float *mixes = nullptr, *scale = nullptr, *base = nullptr;
+    int hc = 4, iters = 1;
+    float hc_eps = 0.0f;
+    float *pre = nullptr, *post = nullptr, *comb = nullptr, *pre_copy = nullptr;
+    const float *h = nullptr, *mix = nullptr, *w = nullptr;
+    int dim = 0;
+    float eps = 0.0f;
+    float* x = nullptr;
+    int8_t* q = nullptr;
+    float* qd = nullptr;
+};
+/// T rows (DS4_HC_FUSE=2: a decode window's): row t's at hc_split's / hc_pre_norm's / q8's strides - mixes + 32 t,
+/// pre / post / pre_copy + 8 t, comb + 64 t, h + hc dim t, mix + 8 t, x / q + dim t, qd + dim / 32 t
+void hc_split_pre_norm(const HcFuse& a, cudaStream_t s, int T = 1);
+/// Abliteration: y[t] -= scale * r (r . y[t]) for each of the T rows (r unit length, [dim]).
+void project_out(float* y, const float* r, float scale, int dim, int T, cudaStream_t s);
 /// A chunk's hc_mix: the dots of each row with the n_mix weights already in mixes (a GEMM's, rows 32 apart), times
 /// rsqrt(mean(h_row^2) + eps) - hc_mix's value up to the dots' summation order.
 void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
@@ -92,6 +119,11 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+/// (DS4_ROUTE_FUSE) gemv_f32 for one token (T 1) of two matrices on the same x in one launch: y0 = x W0 (n0 rows), y1 =
+/// x W1 (n1 rows), each row gemv_f32's bits.  k a multiple of 4, else false and nothing launched; false too when the
+/// launch did not go in.  (=2) T up to kWin tokens: x's rows k apart, y0's and y1's ldy apart (ldy >= n0, n1).
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
+                   cudaStream_t s, int T = 1, int ldy = 0);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -105,6 +137,19 @@ void route(const float* logits, const float* bias, int n, int k, int T, float ro
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, cudaStream_t s);
+/// (DS4_DECODE_TRIM 1) swiglu, its stored values also rounded to int8 as gguf mv rounds a Q8_0 job's input: q [n],
+/// qd [n / 32], 32-blocks of the flat array (rows of k values, k % 32 == 0, are rows of q k apart).  n % 32 == 0
+/// (false, nothing launched, otherwise)
+bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, cudaStream_t s);
+/// (DS4_DECODE_TRIM 4) up to 4 copies of 4-byte multiples between 4-aligned device ranges in one launch (false,
+/// nothing launched: a range not so)
+struct CopyRegions {
+    void* dst[4] = {nullptr, nullptr, nullptr, nullptr};
+    const void* src[4] = {nullptr, nullptr, nullptr, nullptr};
+    size_t bytes[4] = {0, 0, 0, 0};
+    int n = 0;
+};
+bool copy_regions(const CopyRegions& r, cudaStream_t s);
 
 /// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % r of the state; each token that
 /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
@@ -266,16 +311,54 @@ struct Resp {
     float part[kWin][kMaxDim];
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
-/// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
+/// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).  resp given
+/// (with cpu_any, a device int left 0, and host_done, the host's last answered seq): when no pick of the window is on
+/// the CPU lane the device writes the answer itself - every token's part empty, then seq - so the layer does not wait
+/// for the host to say so (the host answers the same later); not while the host is kRing / 2 requests behind.
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, Resp* resp = nullptr, int* cpu_any = nullptr,
+                   const unsigned* host_done = nullptr);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
+/// (DS4_ROUTE_FUSE) a decoded token's (T 1) route_publish and route_ahead in one launch of two blocks, each its old
+/// kernel's code (disjoint request fields), then publish_kernel as route_publish launches it (na0 / na1, T 1, seq).
+/// (=2) T up to kWin: the two blocks a row (both logits rows 1024 apart), the publish with T.
+/// The caller passes bias_vl only when vl != 0, as route_publish does.  false, nothing launched: no request, n or a_n
+/// not 1 .. 1024, k not 1 .. kPicks, m < 1 or off + m past kAhead, dim not 1 .. kMaxDim, T not 1 .. kWin; false,
+/// nothing published: the routing's launch did not go in; false: the publish's launch did not go in.
+struct RoutePair {
+    const float *logits = nullptr, *bias = nullptr;   // route_publish's
+    int n = 0, k = 0;
+    float route_scale = 1.0f;
+    const unsigned long long* vram = nullptr;
+    const float* x = nullptr;
+    int dim = 0;
+    int* idx = nullptr;
+    float* w = nullptr;
+    unsigned long long* plan_ptr = nullptr;
+    Req* req = nullptr;
+    const float* bias_vl = nullptr;
+    unsigned vl = 0;
+    unsigned seq = 0;
+    int na0 = 0, na1 = 0;
+    const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
+    int a_n = 0, m = 0, off = 0;
+    int T = 1;   // (=2: a window's rows, 1 .. kWin)
+};
+bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
+/// The helper GPU's share of request seq (DS4_HELPER): waits on the device until req holds it - or a later one, or
+/// *quit: nothing taken - then its T tokens' picks the helper holds (tab[expert] its blob, 0: not held; n experts) into
+/// plan[t][i] (rows kPicks apart, every other entry 0) with their weights w[t][i], the tokens' x (dim floats each, rows
+/// back to back) into x, and seq into *ack: it has read the slot, which the host's answer lets the device write again.
+void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s);
+/// *flag = seq after a system fence: the stream's work before it (the helper's answer) is in place.
+void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual
 /// slot vs[expert] (n_vs of them: the VRAM slots, then the experts streamed in), each slot's rows in token order:
 /// bounds[n_vs + 1], row_tok[r], pos[t][i] (the pick's sorted row, rows kPicks apart).
@@ -337,10 +420,17 @@ struct ArGroup {
     // member order, then reads the others' sums) - [slots][stride] sums, [2][nm][slots][kArBlocks][8] flags
     float* sums = nullptr;
     unsigned* bflags = nullptr;
+    // two members, a chunk's all-reduces (DS4_AR2 1 / 2): ar2_kernel's progress words, [nm][slots][kAr2Blocks][16]
+    // (2: FP16 on the wire)
+    unsigned* pflags = nullptr;
+    int ar2 = 0;
 };
 constexpr int kArBlocks = 64;
+constexpr int kAr2Blocks = 64;
+constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB on an FP16 wire)
 /// *pairs[2i] = pairs[2i + 1] for i < n (pairs: host-mapped or device memory): table entries set in one launch
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
+/// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
 /// A chunk's all-reduce (three members or more) through the copy engines: allreduce's FP16 sums bit for bit (each
 /// partial rounded to FP16, each value summed in member order and rounded), the bytes moved by cudaMemcpyAsync where

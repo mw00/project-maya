@@ -36,6 +36,9 @@ TIERS = (("ram_fetch", "From RAM", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN
 # memory's (Engram) read time - each a token
 TIERS_DS4 = (("cpu", "On the CPU", INFO_TEXT, "/tok"), ("disk_mb", "Disk reads", WARN, " MB/tok"),
              ("promo", "Promoted", ACCENT, "/tok"), ("engram_ms", "N-gram memory", ACCENT, " ms/tok"))
+# MiniMax's (maya-mm3): GLM's keys, but the experts VRAM does not hold are computed on the CPU from pinned RAM
+TIERS_MM3 = (("ram_fetch", "On the CPU", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN, "/tok"),
+             ("promo", "Promoted", ACCENT, "/tok"))
 TIPS = {   # the Monitor's advice under the tiers, said shorter as the box narrows (one line: the longest that fits)
     "disk": ("Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context "
              "makes answers faster.", "Many experts come from the SSD: more RAM or a shorter context is faster.",
@@ -197,12 +200,16 @@ def tiers(m: dict, width: int):
     for color, what, k, extra in parts:
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))
-    for key, name, color, unit in TIERS_DS4 if ds4 else TIERS:
+    mm3 = eng.get("engine_kind") == "mm3"
+    for key, name, color, unit in TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
         rows.add_row(Text(name, MUTED), Text.assemble((fmt(n.get(key), 2), f"bold {INK}"), (unit, MUTED)),
                      spark(h.get(key), max(8, width - 32), color=color))
     stale = time.time() - (n.get("time") or 0) > 30
     if ds4:
         tips = () if stale else TIPS["ds4_disk"] if (n.get("disk_mb") or 0) >= 500 else \
+            TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
+    elif mm3:
+        tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \
             TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
     else:
         tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \

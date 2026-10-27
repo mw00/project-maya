@@ -23,6 +23,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
+ARM = platform.machine().lower() in ("aarch64", "arm64")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
@@ -212,10 +213,71 @@ def page_file_gb():
     return max(0.0, (m.ullTotalPageFile - m.ullTotalPhys) / 2**30)
 
 
+def arm_cpu_arch():
+    """ggml-cpu's -march value for this ARM CPU (aarch64 Linux), from the kernel's HWCAP feature list: the GB10
+    has dotprod, i8mm and bf16, which is armv8.6-a.  Empty when it cannot be read (ggml's own default is used)."""
+    if not ARM:
+        return ""
+    try:
+        txt = open("/proc/cpuinfo").read()
+        m = re.search(r"^Features\s*:\s*(.*)$", txt, re.M)
+        feats = set(m.group(1).split()) if m else set()
+        if {"asimddp", "i8mm", "bf16"} <= feats:
+            return "armv8.6-a+dotprod+i8mm+fp16"
+        if "asimddp" in feats:
+            return "armv8.2-a+dotprod+fp16"
+    except OSError:
+        pass
+    return ""
+
+
+def unified_memory_pci_ids():
+    """PCI ids (as sysfs names them) of GPUs whose memory is system RAM (Grace/GB10, Jetson): the device has no
+    memory BAR of its own (only a tiny register window), unlike a discrete card's prefetchable BAR."""
+    ids = set()
+    if WIN:
+        return ids
+    try:
+        for d in Path("/sys/bus/pci/devices").iterdir():
+            try:
+                if not (d / "class").read_text().strip().startswith("0x03"):
+                    continue
+                if (d / "vendor").read_text().strip() != "0x10de":
+                    continue
+                sizes = []
+                for line in (d / "resource").read_text().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        sizes.append(int(parts[1], 16) - int(parts[0], 16) + 1)
+                if not any(x >= 1 << 30 for x in sizes):
+                    ids.add(d.name.lower())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return ids
+
+
+def _pci_key(bus_id: str) -> str:
+    return bus_id.strip().lower()[-12:]
+
+
 def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
+    if ARM and not WIN:
+        try:
+            txt = open("/proc/cpuinfo").read()
+            m = re.search(r"^(?:model name|Hardware|Processor)\s*:\s*(.*)$", txt, re.M)
+            if m:
+                name = m.group(1).strip()
+            else:
+                part = re.search(r"^CPU part\s*:\s*(.*)$", txt, re.M)
+                name = (f"ARM (CPU part {part.group(1).strip()})" if part else (platform.machine() or name))
+        except OSError:
+            name = platform.machine() or name
+        return name, False, False
     if WIN:
         pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
         avx2 = bool(pf(40)) or _cpuid_avx2()      # PF_AVX2_INSTRUCTIONS_AVAILABLE, else the CPU itself (#159)
@@ -299,14 +361,20 @@ def _cpuid_avx2() -> bool:
 
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
-    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version,pci.bus_id",
              "--format=csv,noheader,nounits"])
+    umem = unified_memory_pci_ids()
     found = []
     for line in s.strip().splitlines():
         try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+            idx, name, mem, cc, drv, bus = [x.strip() for x in line.split(",")]
+            unified = _pci_key(bus) in umem
+            try:
+                vram = float(mem) / 1024.0
+            except ValueError:
+                vram = ram_gb() if unified else 0.0
+            found.append({"index": int(idx), "name": name, "vram_gb": vram, "arch": cc.replace(".", ""),
+                          "driver": drv, "pci": bus, "unified_memory": unified})
         except ValueError:
             continue
     return found
@@ -375,9 +443,10 @@ def find_vcvars(cuda=True, nvcc=None):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
-def download(url, dst: Path, what=None):
+def download(url, dst: Path, what=None, headers=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
-    A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
+    A finished file gets a <name>.done mark, so a later run skips it without asking the server.  headers: sent to
+    url's host only (a gated repo's token: not to the host it redirects to)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and done(dst):
         ok(f"{what or dst.name} already downloaded")
@@ -395,6 +464,8 @@ def download(url, dst: Path, what=None):
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "maya-setup"})
+            for k, v in (headers or {}).items():
+                req.add_unredirected_header(k, v)
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
             break
         except OSError as e:
@@ -409,6 +480,8 @@ def download(url, dst: Path, what=None):
     for attempt in range(30):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "maya-setup", "Range": f"bytes={have}-"})
+            for k, v in (headers or {}).items():
+                req.add_unredirected_header(k, v)
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
                 if have and r.status != 206:                     # the server ignored the range: start over
                     f.seek(0)

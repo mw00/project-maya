@@ -36,6 +36,9 @@ struct Options {
     int mmap_experts = -1;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
+    // prompt lookup (ds4_main's --suffix-draft): its verify windows run without the drafter too - their buffers (the
+    // rows and states a rejected draft undoes) are allocated with the drafter, or with this
+    bool lookup = false;
     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
     // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
@@ -49,6 +52,12 @@ struct Options {
     bool vision = true;               // the vision tower (the checkpoint's vision.* / aligner.*), when it has one
     bool vision_only = false;         // (tests) load the vision tower alone: encode_image() and nothing else
     bool verbose = false;
+    // abliteration (ds4_ablate.hpp): a refusal direction projected out of every residual write.  The direction file
+    // (a llama-cvector-generator GGUF, or a rank-1 abliteration adapter GGUF), which of its directions (1-based; 0: the
+    // adapter's own), the scale (0: the adapter's own, else 1)
+    std::string ablate;
+    int ablate_layer = 0;
+    float ablate_scale = 0.0f;
 };
 
 /// A picture in the prompt: its span's rows (every position of the span carries the image token), BF16 [span][dim]
@@ -57,15 +66,36 @@ struct Image {
     std::shared_ptr<const std::vector<uint16_t>> rows;
 };
 
+/// A picture as a slot keeps it: where its span starts, the fingerprint of its pixels, the span's length in tokens.
+/// No pixels, no rows - the rows' work is in the KV (they are read only while the span itself is fed, and a restored
+/// state with the same picture at the same place has that KV).  Two states whose pictures agree on all three are the
+/// same state; another picture, another place or another span: not.
+struct PicMark {
+    int64_t start = 0;
+    uint64_t hash = 0;
+    uint64_t len = 0;
+};
+
 struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
+    int64_t draft_experts = 0, draft_cpu = 0;   // ... of them the DSpark blocks', and theirs on the CPU lane
     int64_t stream_experts = 0;             // ... and how many of the others streamed to the GPU (the PCIe lane)
+    int64_t helper_experts = 0;             // ... and how many of the others the helper GPU computed (DS4_HELPER)
+    int64_t helper_fallback = 0;            // its picks the CPU lane computed instead (after a helper failure)
+    int helper_held = 0, helper_dead = 0;   // experts in its pool; 1: it failed (or answered late), the CPU lane took over
+    double helper_ms = 0.0;                 // the service thread's waits for the helper's answers, after its own part
+    int64_t hr_hits = 0;                    // DS4_HELPER_RECENT: picks its recent slots served; fills mapped, slots'
+    int64_t hr_maps = 0, hr_evicts = 0;     //   experts let go, fills that failed, fills left unmapped (VRAM took the
+    int64_t hr_fails = 0, hr_abandoned = 0; //   expert meanwhile)
     double cpu_ms = 0.0, gpu_wait_ms = 0.0;   // the CPU lane's time; the host's waits for the routing
     double layer_ms = 0.0, head_ms = 0.0, engram_ms = 0.0;   // the layers' host time in all; the head's wait; Engram reads
-    int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
+    int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // consumer Engram lookups: cache hits, on-demand reads
+    int64_t eg_pf_rows = 0, eg_pf_hits = 0, eg_pf_reads = 0;   // the same accounting for the prompt prefetcher
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
+    double eg_pf_io_ms = 0.0, eg_pf_wait_ms = 0.0;    // prefetch read span and worker wait, cumulative
     int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity
+    int64_t eg_cache_row_bytes = 0;                   // each cached row's payload bytes
     int64_t swaps = 0;                // experts the cache moved into VRAM
     int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
     int skip_on = -1;                 // DISK_SKIP_AUTO: 1 skipping, 0 off (warm), -1 not in use
@@ -122,6 +152,11 @@ public:
                float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
+    /// A verify window's tokens at most (y and the drafts after it); verify() takes drafts from any source - those not
+    /// the drafter's own draws as a point each (q 1)
+    int verify_max() const;
+    /// The last draft()'s drafts were drawn from the drafter's distribution (DS4_DSPARK_SAMPLE=1), not its argmax
+    bool drafts_sampled() const;
 
     /// Tokens a feed call takes at a time to use the chunked prompt path (all of a prompt: its chunks run as a
     /// pipeline; 16 without it).
@@ -153,14 +188,18 @@ public:
     /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
     std::vector<int64_t> check_positions() const;
 
-    /// The conversation in the model into `out` (slot_save): its position, its tokens, every window ring (the DSpark
-    /// blocks' included), the compressors' partial groups and each KV source's compressed KV and index keys up to it,
-    /// the pieces the state a prompt continues is made of.  0 and err: nothing was set aside (it holds pictures, there
-    /// is no conversation, or the conversation is already set aside - unchanged since).
-    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err);
+    /// The conversation in the model into `out` (slot_save): its position, its tokens, its pictures' marks (`pics`:
+    /// what the caller's state holds), every window ring (the DSpark blocks' included), the compressors' partial groups
+    /// and each KV source's compressed KV and index keys up to it, the pieces the state a prompt continues is made of.
+    /// 0 and err: nothing was set aside (there is no conversation, a picture's mark is not the state's, or the
+    /// conversation is already set aside - unchanged since).
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, const std::vector<PicMark>& pics = {});
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
-    /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
-    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
+    /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix and the
+    /// pictures agree).  The slot's pictures' marks go to `pics` (`pics` null: a slot that holds pictures is refused -
+    /// a caller that cannot check them must not serve it).
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err,
+                   std::vector<PicMark>* pics = nullptr);
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;
@@ -171,6 +210,15 @@ public:
     /// rows of its span, BF16 [n_h * (n_w + 1) + 2][dim]: image_start, n_h rows of (n_w aligner rows, image_newline),
     /// image_end.
     bool encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err);
+    /// The tower holds no GPU memory between pictures: an encode_image borrows its room (the prompt buffers, expert
+    /// slots, or free memory) and gives it back.  vision_hold(): a request's pictures share one borrowing - the room,
+    /// taken at the first encode_image, stays till vision_release() (before the prompt is fed: its buffers may be the
+    /// lender).
+    void vision_hold();
+    /// false: expert slots lent for the pictures did not come back as they were (the request must fail).
+    bool vision_release();
+    /// Called after the tower's room is taken and after it is given back (the server's Monitor follows the VRAM lines).
+    void set_vision_note(std::function<void()> note);
     /// The pictures of the prompt about to be fed ({}: none): positions inside a span read its rows (and route with
     /// the image bias, and take no part in the Engram n-grams); the rest the embedding table's.
     void set_images(std::vector<Image> images);

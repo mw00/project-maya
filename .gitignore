@@ -35,6 +35,9 @@ td.log
 /strata-*.json
 /strata-*.log
 /maya-*.json
+/maya-*.json.prev
+/.maya-switch.json
+/token-savings.json*
 /vision-memory.json
 /run-maya-*.sh
 /run-maya-*.bat

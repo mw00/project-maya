@@ -73,6 +73,34 @@ class KMap(unittest.TestCase):
     def test_no_map(self):
         self.assertIsNone(self.check(None, TENSORS))
 
+    def test_libertaidai_mixed_precision(self):
+        km = {**K_MAP, "attn_default": 5, "mtp_bits": 4,
+              "shared": {"29": 4},
+              "shared_overrides": {"29": {"note": "layer 29 shared is mixed 4/5; infer from trellis"}}}
+        ks = {"layers.0.attn.wq_a.trellis": 6, "layers.0.attn.wkv.trellis": 6,
+              "layers.0.attn.wq_b.trellis": 5, "layers.1.attn.wq_a.trellis": 5,
+              "layers.29.ffn.shared_experts.w1.trellis": 4,
+              "layers.29.ffn.shared_experts.w2.trellis": 5,
+              "layers.29.ffn.shared_experts.w3.trellis": 4}
+        for layer in (0, 1):
+            for matrix in ("ffn.experts.0.w1", "ffn.experts.0.w2", "ffn.experts.0.w3"):
+                ks[f"mtp.{layer}.{matrix}.trellis"] = 4
+            for matrix in ("ffn.shared_experts.w1", "ffn.shared_experts.w2", "attn.wq_a",
+                           "attn.wo_a.slice.0", "main_proj"):
+                ks[f"mtp.{layer}.{matrix}.trellis"] = 6
+        self.assertEqual(self.check(km, ks), len(ks) - 3)
+        for name in ("mtp.0.ffn.experts.0.w1.trellis", "mtp.1.attn.wq_a.trellis",
+                     "layers.0.attn.wkv.trellis", "layers.1.attn.wq_a.trellis"):
+            with self.subTest(name=name), self.assertRaises(SystemExit):
+                self.check(km, {**ks, name: ks[name] - 1})
+
+    def test_numeric_shared_override(self):
+        km = {**K_MAP, "shared_overrides": {"0": 5}}
+        ks = {"layers.0.ffn.shared_experts.w3.trellis": 5}
+        self.assertEqual(self.check(km, ks), 1)
+        with self.assertRaises(SystemExit):
+            self.check(km, {next(iter(ks)): 6})
+
     def test_a_wrong_k_stops(self):
         with self.assertRaises(SystemExit) as e:
             self.check(K_MAP, {**TENSORS, "layers.1.ffn.experts.0.w2.trellis": 4})

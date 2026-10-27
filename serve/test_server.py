@@ -6,27 +6,120 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import string
 import sys
 import threading
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
+from serve.server import CTX_SLACK, ByteTokenizer, carry_embeddings, EngineDied, MockEngine, RequestStat, Service, StrataEngine, parse_cors_origins, request_timings, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 CTX = 4096
-ANSWER = "x" * 2000                              # longer than the old 1024 fallback: one token per byte
+# longer than the old 1024 fallback: one token per byte - and no loop ("x" * 2000 is one: the loop guard ends it)
+ANSWER = "".join(random.Random(2000).choices(string.ascii_lowercase, k=2000))
 
 
 class RecordingEngine(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_max_new = max_new
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class ThinkingBudget(unittest.TestCase):
+    """Real HTTP adapters must leave room for reasoning and a final answer at small output limits."""
+
+    @classmethod
+    def setUpClass(cls):
+        class Tok(ByteTokenizer):
+            SPECIALS = ByteTokenizer.SPECIALS + ["<think>", "</think>"]
+
+        class Sampled(RecordingEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                self.last_sampling = dict(sampling or {})
+                yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+        tok = Tok()
+        cls.engine = Sampled(tok, "</think>8", max_context=32768)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.svc.think_budget = 32768
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        return MaxTokens.post(self, path, body)
+
+    def call(self, api, limit, effort="low"):
+        messages = [{"role": "user", "content": "What is 3 + 5?"}]
+        if api == "responses":
+            path, body = "/v1/responses", {"input": "What is 3 + 5?", "max_output_tokens": limit,
+                                           "reasoning": {"effort": effort}}
+        elif api == "anthropic":
+            path, body = "/v1/messages", {"messages": messages, "max_tokens": limit,
+                                          "thinking": {"type": "disabled"} if effort == "none" else
+                                                      {"type": "enabled", "budget_tokens": 2048}}
+        else:
+            path, body = "/v1/chat/completions", {"messages": messages, "max_tokens": limit,
+                                                  "reasoning_effort": effort}
+        status, response = self.post(path, dict(body, model="m"))
+        self.assertEqual(status, 200, response)
+        self.assertEqual(self.engine.last_max_new, limit)
+        return self.engine.last_sampling
+
+    def test_small_limits_leave_reasoning_and_answer_room(self):
+        for api in ("openai", "anthropic", "responses"):
+            for limit in (128, 512, 1024, 2048, 8192):
+                with self.subTest(api=api, limit=limit):
+                    sampling = self.call(api, limit)
+                    budget = sampling["_think_budget"]
+                    self.assertGreaterEqual(budget, limit // 2 - 1)
+                    # The forced closing marker is an output token too.
+                    self.assertLessEqual(budget + 1, limit - limit // 4)
+
+    def test_configured_budget_and_thinking_off(self):
+        old = self.svc.think_budget
+        try:
+            for api in ("openai", "anthropic", "responses"):
+                self.svc.think_budget = 64
+                self.assertEqual(self.call(api, 512)["_think_budget"], 64)
+                self.assertNotIn("_think_budget", self.call(api, 512, "none"))
+                self.svc.think_budget = 0
+                self.assertNotIn("_think_budget", self.call(api, 512))
+        finally:
+            self.svc.think_budget = old
+
+    def test_reserve_override_cannot_consume_small_limit(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "4096"}):
+            self.assertGreaterEqual(self.call("openai", 512)["_think_budget"], 255)
+        with patch.dict(os.environ, {"STRATA_GLM_THINK_RESERVE": "16"}):
+            self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
+
+    def test_tiny_limits_still_honour_total_output(self):
+        for api in ("openai", "anthropic", "responses"):
+            for limit in (1, 2, 3):
+                with self.subTest(api=api, limit=limit):
+                    sampling = self.call(api, limit)
+                    self.assertGreaterEqual(sampling["_think_budget"], 1)
+
+    def test_reserve_from_run_config_reaches_http_requests(self):
+        from unittest.mock import patch
+        from serve.server import apply_server_env
+        with patch.dict(os.environ):
+            apply_server_env({"env": {"STRATA_GLM_THINK_RESERVE": "16"}})
+            self.assertEqual(self.call("openai", 512)["_think_budget"], 383)
 
 
 class MaxTokens(unittest.TestCase):
@@ -94,6 +187,11 @@ class MaxTokens(unittest.TestCase):
                 s, b, _, _ = self.call(api, max_tokens=CTX)
                 self.assertEqual(s, 400)
                 self.assertIn("exceeds the context", b["error"]["message"])
+                # #432: the shape OpenAI-compatible clients take for a context overflow (they compact and retry)
+                self.assertEqual(b["error"]["code"], "context_length_exceeded")
+                self.assertEqual(b["error"]["type"], "invalid_request_error")
+                self.assertIn(f"maximum context length is {CTX} tokens", b["error"]["message"])
+                self.assertIn(f"max tokens ({CTX})", b["error"]["message"])   # (the counts kept)
 
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
@@ -112,6 +210,8 @@ class MaxTokens(unittest.TestCase):
                 s, b, _, _ = self.call(api, text=text)
                 self.assertEqual(s, 400, b)
                 self.assertIn("no room to answer", b["error"]["message"])
+                self.assertEqual(b["error"]["code"], "context_length_exceeded")      # (#432)
+                self.assertIn(f"maximum context length is {CTX} tokens", b["error"]["message"])
 
     def test_debug_log_shows_the_resolved_budget(self):
         import contextlib
@@ -495,6 +595,14 @@ class SamplingKeys(unittest.TestCase):
         for bad in (0, 17, True, 4.0, "6"):
             self.assertFalse([x for x in self.keys(strata_tune={"spec": bad}) if x.startswith("spec=")], bad)
 
+    def test_suffix_draft_tune_key(self):
+        # the DeepSeek engine's prompt lookup for one request (an A/B in one engine): 0 or 1, nothing else
+        self.assertIn("suffix_draft=0", self.keys(temperature=0, strata_tune={"suffix_draft": 0}))
+        self.assertIn("suffix_draft=1", self.keys(temperature=0.7, strata_tune={"suffix_draft": 1}))
+        for bad in (2, -1, True, 1.0, "1"):
+            self.assertFalse([k for k in self.keys(temperature=0, strata_tune={"suffix_draft": bad})
+                              if k.startswith("suffix_draft=")], bad)
+
     def test_read_chunks_tune_key(self):
         # setup's calibration of the disk reads' size (#67): 1-16 pieces, nothing else
         self.assertIn("read_chunks=4", self.keys(temperature=0, strata_tune={"read_chunks": 4}))
@@ -624,7 +732,9 @@ class PrometheusMetrics(unittest.TestCase):
     def test_text_and_key(self):
         tok = ByteTokenizer()
         eng = MockEngine(tok, "</think>\n\nok", max_context=CTX)
-        eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "time": 1.0}
+        eng.stat = {"tok_s": 21.5, "vram_hit": 0.95, "promo": "x", "time": 1.0,
+                    "eg_cache_rows": 10, "eg_cache_cap": 100, "eg_cache_row_bytes": 264,
+                    "eg_lookup_rows": 20, "eg_lookup_hits": 15, "eg_lookup_reads": 5}
         svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         httpd = serve(svc, port=0)
         base = f"http://127.0.0.1:{httpd.server_address[1]}"
@@ -643,6 +753,12 @@ class PrometheusMetrics(unittest.TestCase):
             self.assertEqual(lines["llamacpp:requests_deferred"], "0")
             self.assertEqual((lines["maya:engine_tok_s"], lines["maya:engine_vram_hit"]), ("21.5", "0.95"))
             self.assertNotIn("maya:engine_promo", lines)          # not a number: left out
+            self.assertEqual((lines["maya:engine_eg_cache_rows"], lines["maya:engine_eg_cache_cap"],
+                              lines["maya:engine_eg_cache_row_bytes"]), ("10", "100", "264"))
+            for key in ("eg_lookup_rows", "eg_lookup_hits", "eg_lookup_reads"):
+                self.assertIn(f"# TYPE maya:engine_{key} counter", text)
+            for key in ("eg_cache_rows", "eg_cache_cap", "eg_cache_row_bytes"):
+                self.assertIn(f"# TYPE maya:engine_{key} gauge", text)
             self.assertIn("# TYPE llamacpp:prompt_tokens_total counter", text)
             svc.api_key = "k1"
             with self.assertRaises(urllib.error.HTTPError) as cm:
@@ -910,9 +1026,12 @@ class LiveRateBursts(unittest.TestCase):
         true_rate = n / (t - 1000.0)
         reads = []
         for now in (1004.0, 1006.0, 1008.0, 1010.0, 1012.0):
-            svc.status.update(busy=True, first_token=1000.0, generated=n)
-            svc.rate.clear()
-            svc.rate.extend(s for s in samples if s[0] <= now)
+            svc.status.update(busy=True, generated=n)
+            st = RequestStat()
+            for t, k in samples:
+                if t <= now:
+                    st.note(t, k)
+            svc.current_requests = {st}
             orig = srv.time.time
             srv.time.time = lambda: now
             try:
@@ -921,6 +1040,69 @@ class LiveRateBursts(unittest.TestCase):
                 srv.time.time = orig
         for r in reads:
             self.assertLess(abs(r - true_rate) / true_rate, 0.15, (reads, true_rate))
+
+
+    def read_at(self, svc, now):
+        import serve.server as srv
+        orig = srv.time.time
+        srv.time.time = lambda: now
+        try:
+            return svc._tok_s()
+        finally:
+            srv.time.time = orig
+
+    def test_concurrent_requests_do_not_mix_their_counts(self):
+        """Two answers decoding at once (READY multi=<n>), each at 40 tok/s, one 800 tokens in and one just started:
+        the live rate is their sum (~80), not the difference of their counts over a fraction of a second (~1600)."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        import serve.server as srv
+        orig, a, b = srv.time.time, RequestStat(), RequestStat()
+        try:
+            for i in range(400):                    # 10 s, the two requests' tokens interleaved
+                t = 1000.0 + i * 0.025
+                srv.time.time = lambda t=t: t
+                svc._note(800 + i, [], a)
+                if t >= 1008.0:                     # the second one starts 8 s in
+                    svc._note(1 + int((t - 1008.0) * 40), [], b)
+        finally:
+            srv.time.time = orig
+        r = self.read_at(svc, 1010.0)
+        self.assertLess(abs(r - 80.0), 8.0, r)
+
+    def test_a_burst_after_a_quiet_stretch_is_not_read_as_its_size_over_an_instant(self):
+        """40 tok/s for 3 s, 10 s of nothing, 300 tokens at once, one more 0.3 s later: ~29 tok/s over the 10.3 s the
+        301 tokens took, not 300 / 0.3 s = 1000."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        samples = [(1000.0 + i * 0.025, i + 1) for i in range(120)]
+        samples += [(1013.0, 121 + i) for i in range(300)] + [(1013.3, 421)]
+        st = RequestStat()
+        for t, k in samples:
+            st.note(t, k)
+        svc.current_requests = {st}
+        r = self.read_at(svc, 1013.3)
+        self.assertLess(r, 40.0, r)
+        self.assertGreater(r, 20.0, r)
+
+    def test_writing_counts_only_the_requests_past_their_prompt(self):
+        """live.writing: of the active requests, those writing (the ones the decode total adds up), not one still
+        reading its prompt."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        svc.current_requests, svc.latest_request, svc.active = {RequestStat(), RequestStat()}, RequestStat(), 3
+        live = svc.metrics()["live"]
+        self.assertEqual((live["active"], live["writing"]), (3, 2))
+
+    def test_no_rate_once_a_request_has_left(self):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.status.update(busy=True)
+        svc.current_requests = set()
+        self.assertEqual(self.read_at(svc, 1001.0), 0.0)
 
 
 class LiveRate(unittest.TestCase):
@@ -966,11 +1148,14 @@ class LiveRate(unittest.TestCase):
         self.assertEqual(engine.progress, (10000, 12000, 0, 2000.0))
         self.assertEqual(engine.prefill_tok_s_mean, 1000.0)
         self.svc.engine = engine
-        self.svc.status.update(busy=True, first_token=None)
+        self.svc.status.update(busy=True)
+        self.svc.latest_request = RequestStat()     # it has the engine; no answer token yet
         self.assertEqual(self.metrics()["live"]["prefill_tok_s_mean"], 1000.0)
         self.assertNotIn("prefill_tok_s", self.metrics()["live"])
         self.assertEqual(self.svc._prefill_tok_s_mean(), 1000.0)
-        self.svc.status.update(first_token=time.time(), generated=1)
+        self.svc.latest_request.first_token = time.time()
+        self.svc.current_requests.add(self.svc.latest_request)
+        self.svc.status.update(generated=1)
         self.assertEqual(self.svc._prefill_tok_s_mean(), 0.0)
         self.assertEqual(list(gen), [])
         timings = request_timings(12000, 1, engine.last)
@@ -1015,6 +1200,7 @@ class LiveRate(unittest.TestCase):
                         f"for a {true_rate:.1f} tok/s engine")
         self.assertEqual(self.metrics()["live"]["state"], "idle")
         self.assertIsNone(self.metrics()["live"]["tok_s"])
+        self.assertEqual(self.svc.current_requests, set(), "a finished request left its live-rate samples behind")
 
     def test_a_request_without_a_done_keeps_no_engine_counters(self):
         """An engine that dies mid-answer: the previous request's `last` must not become this row's decode rate."""
@@ -1045,6 +1231,7 @@ class LiveRate(unittest.TestCase):
             self.assertEqual(row["output_tokens"], 3)
             self.assertIsNone(row["decode_tok_s"], "the previous request's counters were recorded as this one's")
             self.assertIsNone(row["engine_generated"])
+            self.assertEqual(svc.current_requests, set(), "a request the engine died in left its live-rate samples behind")
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -1285,6 +1472,22 @@ class WebApp(unittest.TestCase):
                 code, ctype, _ = self.get(path)
                 self.assertEqual(code, 200)
                 self.assertIn(want, ctype)
+
+    def test_the_model_shown_model_first(self):
+        """/health's model_label - "MiniMax M3.1 · Maya-XS", from the config's installer record (maya_quants), configs
+        of earlier releases too - is what the sidebar shows; the API's model id stays as it was."""
+        import maya_quants
+        old = {"exe": "/m/build/maya-mm3", "args": ["--pack", "/m/X/maya-mm3"], "model_name": "minimax-m3.1-flash",
+               "installer": {"family": "minimax", "quant": "MiniMax-M3.1-Flash-Maya-XS", "mm3_quant": "gguf-xs"}}
+        self.svc.model_label = maya_quants.config_label(old)
+        try:
+            health = json.loads(self.get("/health")[2])
+        finally:
+            self.svc.model_label = None
+        self.assertEqual((health["model_label"], health["model"]), ("MiniMax M3.1 · Maya-XS", self.svc.model))
+        self.assertIsNone(json.loads(self.get("/health")[2])["model_label"])   # (a hand-written config: the id)
+        side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
+        self.assertIn("S.health.model_label || modelName(S.health.model)", side)
 
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",
@@ -1843,6 +2046,70 @@ class GoneClients(unittest.TestCase):
         self.assertEqual(self.engine.calls, 1)         # (neither gone request reached the engine)
 
 
+class QueuedKeepAlives(GoneClients):
+    """#483: a streamed request waiting in the queue for its first turn sends SSE keep-alive comments (every
+    MAYA_QUEUE_PING_S) - before, nothing at all, and a client with a stream-idle timeout gave up on a turn that was
+    only waiting.  The answer after the wait is the same; the OpenAI and Anthropic streams alike."""
+
+    def setUp(self):
+        self.env = unittest.mock.patch.dict(os.environ, {"MAYA_QUEUE_PING_S": "0.1"})
+        self.env.start()
+        super().setUp()
+
+    def tearDown(self):
+        super().tearDown()
+        self.env.stop()
+
+    def send_to(self, path, body):
+        import socket
+        b = json.dumps(body).encode()
+        s = socket.create_connection(("127.0.0.1", self.port))
+        s.sendall(b"POST " + path.encode() + b" HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: " + str(len(b)).encode() + b"\r\n\r\n" + b)
+        return s
+
+    @staticmethod
+    def read_for(s, seconds, until=None):
+        got, end = b"", time.time() + seconds
+        s.settimeout(0.2)
+        while time.time() < end and not (until and until in got):
+            try:
+                c = s.recv(65536)
+            except OSError:   # (socket.timeout)
+                continue
+            if not c:
+                break
+            got += c
+        return got
+
+    def test_keep_alives_while_queued(self):
+        first = self.send(False)
+        self.assertTrue(self.engine.held.wait(5))
+        msg = [{"role": "user", "content": "hi"}]
+        for path in ("/v1/chat/completions", "/v1/messages"):
+            body = {"model": "m", "max_tokens": 8, "stream": True, "messages": msg}
+            s = self.send_to(path, body)
+            self.assertTrue(self.wait(lambda: self.queued() == 1), path)
+            waited = self.read_for(s, 1.0)
+            self.assertGreaterEqual(waited.count(b": keep-alive"), 3, (path, waited[-300:]))
+            self.assertNotIn(b"hello", waited)                         # (still queued: nothing answered yet)
+            s.close()
+            self.assertTrue(self.wait(lambda: self.queued() == 0), path)   # (gone while queued: left the line)
+        # the answer after a wait: unchanged
+        s = self.send_to("/v1/chat/completions", {"model": "m", "max_tokens": 64, "stream": True, "messages": msg})
+        self.assertTrue(self.wait(lambda: self.queued() == 1))
+        self.assertIn(b": keep-alive", self.read_for(s, 0.5))
+        self.engine.release.set()
+        rest = self.read_for(s, 10, b"data: [DONE]")
+        s.close()
+        text = "".join(json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
+                       for line in rest.decode().splitlines() if line.startswith("data: {"))
+        self.assertIn("hello", text)
+        first.settimeout(10)
+        self.assertIn(b"200 OK", first.recv(65536))
+        first.close()
+
+
 @unittest.skipIf(os.name == "nt", "a shell script stands in for the engine")
 class FailedRestartKeepsContext(unittest.TestCase):
     """#351: an engine that died and could not start again (a GPU that fell off the bus) left max_context 0, and every
@@ -1867,6 +2134,59 @@ class FailedRestartKeepsContext(unittest.TestCase):
                 eng.restart()
             self.assertEqual(eng.max_context, 4096)
             self.assertFalse(eng.alive())               # (so the next request's ensure_engine tries again)
+
+
+@unittest.skipUnless(os.name == "posix", "the fake engine is a script with a #! line")
+class StaleDoneAfterErr(unittest.TestCase):
+    """maya-ds4 and maya-mm3 end a failed request with ERR and then DONE (a picture that cannot be read, a forward that
+    failed).  The single-stream reader raised at the ERR and left the DONE queued: the next request read it as its own
+    end and answered nothing.  Now the DONE after an ERR is taken."""
+
+    ENGINE = r'''
+import sys
+n = 0
+print("READY 4096 stop", flush=True)
+for line in sys.stdin:
+    if not line.startswith("GEN"):
+        continue
+    n += 1
+    if "seed=1" in line:      # a failed request, as maya-mm3 ends it
+        print("ERR the picture file could not be read", flush=True)
+        print("DONE 0 3 0.0 0.0 cancel 0 0 0 0 0", flush=True)
+    elif "seed=2" in line:    # an ERR alone, as the GLM engine ends most errors
+        print("ERR the prompt and max_new are more than the context", flush=True)
+    else:
+        print("T 66", "T 67", "DONE 2 3 1.0 1.0 stop 0 0 0 0 0", sep="\n", flush=True)
+'''
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        exe = Path(self.tmp.name) / "engine"
+        exe.write_text(f"#!{sys.executable}\n" + self.ENGINE)
+        exe.chmod(0o755)
+        self.eng = StrataEngine(str(exe), [])
+
+    def tearDown(self):
+        self.eng.proc.kill()
+        self.eng.proc.wait()
+        self.tmp.cleanup()
+
+    def run_gen(self, seed):
+        return [t for t in self.eng.generate([1, 2, 3], 16, {"seed": seed}, threading.Event()) if t is not None]
+
+    def test_done_after_err_is_taken(self):
+        with self.assertRaises(ValueError):
+            self.run_gen(1)
+        self.assertEqual(self.run_gen(3), [66, 67])         # (it used to be [] - the ERR's DONE read as this end)
+        self.assertEqual(self.eng.last.get("finish"), "stop")
+
+    def test_err_alone(self):
+        t0 = time.monotonic()
+        with self.assertRaises(ValueError):
+            self.run_gen(2)
+        self.assertLess(time.monotonic() - t0, 5.0)         # (a short wait for a DONE that does not come)
+        self.assertEqual(self.run_gen(3), [66, 67])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/prefill/failure.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -35,10 +36,12 @@
 namespace strata::prefill {
 namespace {
 
+// A failed cuBLAS call (an allocation, most of the time) ends this request, not the process: the reason is thrown
+// and the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
-        std::exit(1);
+        strata::prefill::fail(std::string("prefill gemm: ") + what + ": cuBLAS status " + std::to_string((int) s));
     }
 }
 
@@ -273,7 +276,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
     if (beta != 0.0f) {
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
-        std::exit(1);
+        strata::prefill::fail("prefill gemm: hipBLASLt launch failed with nonzero beta");
     }
     auto* mutable_state = static_cast<HipLtState*>(opaque_state);
     uint32_t beta_bits = 0;
@@ -394,7 +397,10 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
-        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        if (rows <= 0) {
+            std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K);
+            strata::prefill::fail("prefill gemm: the scratch is too small for K=" + std::to_string((long long) K));
+        }
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;

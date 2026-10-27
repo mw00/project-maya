@@ -38,16 +38,19 @@ __host__ __device__ inline size_t q8_row_bytes(int64_t k) { return (size_t) (k /
 
 /// A GGUF expert layer (x3::ExpertLayout::fmt kFmtMXFP4: block-quantized experts read in place) keeps each role's ggml
 /// type in lay.gg_type[r] (r: gate, up, down; 0 = MXFP4): MXFP4 takes these kernels, the low-bit types ds4_iq.cuh's
-/// (gate and up of one type).  Roles of one layer may differ (down of another type); MXFP4 and a low-bit type do not
-/// mix.
+/// (gate and up of one type).  Roles of one layer may differ (down of another type, MXFP4 beside a low-bit one: each
+/// role its own kernels and its own activations' rounding).
 inline int expert_type(const x3::ExpertLayout& l, int r) { return l.gg_type[r] == 0 ? kTypeMXFP4 : l.gg_type[r]; }
 inline bool mx_experts(const x3::ExpertLayout& l) {
     return expert_type(l, 0) == kTypeMXFP4 && expert_type(l, 1) == kTypeMXFP4 && expert_type(l, 2) == kTypeMXFP4;
 }
-/// Bytes of a row of k values of an expert type (0: not one the device kernels take, or k not whole blocks).
+/// Bytes of a row of k values of a type the device kernels take - MXFP4, a routed expert's low-bit type, or a dense
+/// matrix's beside them (Q6_K) - 0: not one, or k not whole blocks.
 size_t type_row_bytes(int type, int64_t k);
-/// Values a block of an expert type (32: MXFP4, 256: the low-bit ones; 0: neither).
+/// Values a block of such a type (32: MXFP4, 256: the K and IQ types; 0: none).
 int type_block(int type);
+/// Whether a routed expert may be of this type (MXFP4, or one ds4_iq's expert kernels take).
+bool expert_type_ok(int type);
 /// The type's name (ggml's), "?" when unknown.
 const char* type_name(int type);
 
@@ -63,6 +66,20 @@ bool q8_batch_check(int dev, std::string& err);
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
 /// or kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)).
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s);
+/// (DS4_HC_FUSE) an F32 input x of k values already rounded to int8 as mv rounds a Q8_0 job's (q [k], d [k / 32]: see
+/// hc_split_pre_norm): a kFmtQ8_0 job whose xf is x, its k this k and one activation reads them instead of rounding x
+/// again; every other job (another input, format, k, or more activations) rounds its own as before.
+struct PreQ8 {
+    const float* x = nullptr;
+    const int8_t* q = nullptr;
+    const float* d = nullptr;
+    int k = 0;
+    int rows = 1;   // (DS4_HC_FUSE=2: a window's rows of x, k apart; their int8 rows k apart, scales k / 32 apart)
+};
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre);
+/// The int8 rounding mv gives a kFmtQ8_0 job's one F32 input of k values (DS4_Q8_BATCH: its batched launch's, else the
+/// per-job one's) - what the HC fuse check compares hc_split_pre_norm's against.
+void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s);
 /// The columns [c0, c0 + nc) of such a matrix: its rows c0 .. c0 + nc - 1, a contiguous range.
 x3::Mat view(const x3::Mat& m, int c0, int nc);
 /// x3::reconstruct_rows' layout from a BF16 or Q8_0 matrix: dst[r][c] = W[c][r] (n rows of k values), F16 or BF16

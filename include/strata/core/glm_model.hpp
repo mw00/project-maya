@@ -635,6 +635,7 @@ public:
     bool fast_cpu_lane_setup(std::string& err);            // STRATA_GLM_CPU_LANE: the pool, its calibration, the split
     bool fast_helper_setup(std::string& err);              // STRATA_GLM_EXPERT_HELPER: complementary GPU cache
     bool fast_helper_adapt(std::string& err);              // helper-only, at an idle boundary
+    bool fast_helper_check(std::string& err);              // STRATA_GLM_HELPER_CHECK: the helper vs this GPU
     void fast_cpu_experts(int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out);
     // the same on `pool` with the rows act / hq / ff / dn, or x3 for an EXL3 pack (a verify window's CPU lanes:
     // FastState::win_lane, each with its own rows)
@@ -982,7 +983,9 @@ public:
     bool prefill_bind(uint8_t* region, size_t bytes, std::string& err);   // its buffers inside the borrowed region
     // ... laid out for chunks of T (the bytes it uses); end: the prompt's last position + 1, which the KV streaming stage
     // must hold (-1: the whole context)
-    size_t prefill_carve(int T, int64_t end = -1);
+    /// The prompt path's device buffers for a chunk of T tokens, laid out in the lendable region.  False when the
+    /// layout does not fit it: the prompt is then read in smaller chunks (nothing has been computed yet).
+    bool prefill_carve(int T, int64_t end = -1);
     bool prefill_lend(std::string& err);                    // the tail slots -> the prompt path (drops their experts)
     bool prefill_return(std::string& err);                  // ... and back to the expert pool
     void prefill_destroy();

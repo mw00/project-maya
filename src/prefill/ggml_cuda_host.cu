@@ -1,8 +1,10 @@
 // src/prefill/ggml_cuda_host.cu - prompt-speed plan step 2b: the host-side symbols of llama.cpp's ggml-cuda that its MMQ
 // and quantize code reference, for the MMQ kernels compiled into strata_mmq without the rest of ggml-cuda.cu.
 #include "common.cuh"
+#include "strata/prefill/failure.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -142,6 +144,19 @@ struct CachingPool : ggml_cuda_pool {
     void * alloc(size_t size, size_t * actual_size) override {
         std::lock_guard<std::mutex> lk(mu);
         const size_t cls = size_class(size);
+        // A test hook: STRATA_MMQ_POOL_FAIL=<n> makes the first n allocations here fail, so the engine's recovery can be
+        // checked (the request must end with an error and the engine must live).
+        static std::atomic<int> fail_left = [] {
+            const char* v = std::getenv("STRATA_MMQ_POOL_FAIL");
+            return std::atomic<int>(v ? std::atoi(v) : 0);
+        }();
+        if (fail_left.load() > 0 && fail_left.fetch_sub(1) > 0) {
+            std::fprintf(stderr, "ggml-cuda (strata mmq): CUDA%d wanted %.1f MB of scratch and cannot have it "
+                                 "(STRATA_MMQ_POOL_FAIL)\n", dev, (double) cls / 1048576.0);
+            strata::prefill::fail("prefill mmq: the scratch pool wanted " +
+                                  std::to_string((unsigned long long) (cls >> 20)) + " MB and could not have it: "
+                                  "out of memory");
+        }
         {
             std::lock_guard<std::mutex> sl(g_slab_mu);
             Slab & s = g_slab[dev];
@@ -166,13 +181,19 @@ struct CachingPool : ggml_cuda_pool {
         void * p = nullptr;
         const cudaError_t e = cudaMalloc(&p, cls);
         if (e != cudaSuccess) {
-            // the whole reason the engine used to abort mid-prompt with "out of memory" and nothing else
+            // The whole reason the engine used to abort mid-prompt with "out of memory" and nothing else.  The
+            // request ends with an error now (the reason is thrown and the caller reports it); the engine lives and
+            // the next request runs.
             std::fprintf(stderr,
                          "ggml-cuda (strata mmq): CUDA%d wanted %.1f MB of scratch (the prompt path's pool held %.1f MB "
                          "of its %zu buffers) and only %.1f MB of %.1f MB was free: %s\n",
                          dev, (double) cls / 1048576.0, (double) held() / 1048576.0, bufs.size(),
                          (double) free_b / 1048576.0, (double) total_b / 1048576.0, cudaGetErrorString(e));
-            CUDA_CHECK(e);
+            (void) cudaGetLastError();   // the error is reported here, not left for something else to find
+            strata::prefill::fail(std::string("prefill mmq: the scratch pool wanted ") +
+                                  std::to_string((unsigned long long) (cls >> 20)) + " MB and the card had " +
+                                  std::to_string((unsigned long long) (free_b >> 20)) + " MB free: " +
+                                  cudaGetErrorString(e));
         }
         if (cls >= ((size_t) 4 << 20))
             std::fprintf(stderr, "glm prefill mmq: CUDA%d the scratch pool takes a new %.1f MB buffer (%.1f MB free of "

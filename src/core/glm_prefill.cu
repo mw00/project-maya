@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <map>
 #include <memory>
@@ -98,6 +99,7 @@ struct Carve {
 };
 
 constexpr int kSub = 256;   // the sub-batch the mixers, the dense FFN and the shared expert start from
+constexpr int kMinPrefillChunk = 256;   // the smallest chunk the prompt path is read in (the layout's floor)
 constexpr int kShSub = 2048;   // the shared expert's on CUDA (shexp_sub)
 // the loan (past a layout's need) the MMQ kernels' stream-k fixup buffers get: see prefill_lend and the pool's
 // size classes (src/prefill/ggml_cuda_host.cu) for why 16 MB bounds every product a chunk launches, at any chunk size
@@ -378,7 +380,7 @@ void blas_ck(cublasStatus_t st, const char* what) {
 }
 
 // EXL3 experts (MMQ does not read their trellis), each by its row count: a lightly routed one through the tensor-core
-// kernels (sm_80+; they decode the trellis once a 32-row block - cheaper than reconstructing 50 MB of FP16 for a few
+// kernels (sm_80+, and sm_7x's wmma ones - exl3::prompt_tc; they decode the trellis once a 32-row block - cheaper than reconstructing 50 MB of FP16 for a few
 // rows), the rest reconstructed to FP16 and multiplied by cuBLAS (the decode once, the GEMM at the tensor cores' FP16
 // rate).  Both write the window's OUTP rows; w16 is their scratch.  The lane is one GPU's: the working part's prompt
 // path, and the waiting part computing its share of that part's experts (STRATA_GLM_PREFILL_CALC).
@@ -531,7 +533,7 @@ void x3_run_set(const X3Lane& L, const uint8_t* wbase, int n_exp, size_t stride,
         return r;
     }();
     const int mma_rows = strata::core::mma_rows_for(L.T, mma_base, mma_short);
-    const bool use_mma = mma_rows > 0 && strata::kernels::exl3::mma_supported();
+    const bool use_mma = mma_rows > 0 && strata::kernels::exl3::prompt_tc();
     for (int i = 0; i < n_exp;) {
         const int rows = hb[i + 1] - hb[i];
         if (use_mma && rows <= mma_rows) {
@@ -1448,7 +1450,11 @@ bool Glm5Model::prefill_bind(uint8_t* region, size_t bytes, std::string& err) {
     }
     S->region = region;
     S->region_bytes = bytes;
-    prefill_carve(S->T);
+    if (!prefill_carve(S->T)) {
+        err = "glm prefill: the layout of a chunk of " + std::to_string(S->T) +
+              " tokens does not fit the lendable region (" + std::to_string((bytes >> 20)) + " MB)";
+        return false;
+    }
     return true;
 }
 
@@ -1520,8 +1526,9 @@ size_t glm_prefill_lend_bytes(const Glm5Geometry& g, size_t T, bool has_kda, boo
 }
 
 // the prompt path's device buffers for chunks of T tokens, carved from the start of the lendable region; returns the
-// bytes that layout uses (a short prompt borrows - and evicts - only that much of the pool's tail)
-size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
+// bytes that layout uses (a short prompt borrows - and evicts - only that much of the pool's tail), or false when the
+// layout does not fit the region (the caller reads the prompt in smaller chunks)
+bool Glm5Model::prefill_carve(int Tn, int64_t end) {
     PrefillState* S = pf_;
     const Glm5Geometry& g = g_;
     const size_t T = (size_t) Tn, E = (size_t) g.n_embd;
@@ -1558,10 +1565,24 @@ size_t Glm5Model::prefill_carve(int Tn, int64_t end) {
     blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
     S->T_bound = Tn;
     S->need = c.off;
-    if (S->region != nullptr && S->need > S->region_bytes)
+    // A test hook: STRATA_PREALLOC_FAIL=<tokens> makes the layout of a request's chunk bigger than that fail (the
+    // startup's layout is not touched), so the recovery (the prompt is read again with a smaller chunk) can be
+    // checked.
+    static const int64_t fail_above = [] {
+        const char* v = std::getenv("STRATA_PREALLOC_FAIL");
+        return v ? std::atoll(v) : 0;
+    }();
+    if (fail_above > 0 && end >= 0 && (int64_t) Tn > fail_above) {
+        std::fprintf(stderr, "glm prefill: CUDA%d the layout of %d tokens does not fit (STRATA_PREALLOC_FAIL)\n", dev_,
+                     Tn);
+        return false;
+    }
+    if (S->region != nullptr && S->need > S->region_bytes) {
         std::fprintf(stderr, "glm prefill: CUDA%d the layout needs %zu bytes of a %zu-byte loan\n", dev_, S->need,
                      S->region_bytes);
-    return c.off;
+        return false;
+    }
+    return true;
 }
 
 // The pool's tail -> the prompt path: every lendable slot's expert leaves VRAM (it is only on disk until the decode
@@ -4218,16 +4239,37 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
     // one GPU has no pipeline to balance: full chunks and the remainder last - every chunk stages nearly every expert,
     // so 8449 tokens as 8192 + 257 cost about one chunk's experts, as two equal 4225s about two (240 -> ~300 tok/s).
     // A split: equal chunks, prefill_floor of them at least (prefill_min_chunks, STRATA_GLM_PREFILL_MIN_CHUNKS)
-    const int Trun = prefill_force_chunk > 0
-                         ? std::min(Tmax, prefill_force_chunk)
-                         : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
-                                                           prefill_floor(nn, prefill_min_chunks));
+    const int Trun_max = prefill_force_chunk > 0
+                          ? std::min(Tmax, prefill_force_chunk)
+                          : strata::core::prefill_chunk_len(nn, Tmax, split_next_ != nullptr,
+                                                            prefill_floor(nn, prefill_min_chunks));
     bool ok = true;
     progress_at("the prompt: lending the expert pool's tail");   // (the serve watchdog's stages, issue #40)
-    for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
-        cudaSetDevice(m->dev_);
-        m->prefill_carve(Trun, pos_ + nn);
-        if (!m->prefill_lend(err)) { ok = false; break; }
+    // The layout of the chunk: it must fit the lendable region.  A chunk whose layout does not fit is read again
+    // with a smaller one (nothing has been computed yet, so this is safe) - and a chunk that does not fit at 256
+    // tokens is the end of the prompt path's memory: the request ends with an error, the engine lives.
+    int Trun = Trun_max;
+    for (;;) {
+        bool laid_out = true;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!m->prefill_carve(Trun, pos_ + nn)) laid_out = false;
+        }
+        if (laid_out) break;
+        if (Trun <= kMinPrefillChunk) {
+            err = "glm prefill: the layout of a chunk of " + std::to_string(Trun) +
+                  " tokens does not fit the lendable region";
+            ok = false;
+            break;
+        }
+        Trun = std::max(kMinPrefillChunk, Trun / 2);
+        std::fprintf(stderr, "glm prefill: CUDA%d the chunk is %d tokens now (its layout did not fit)\n", dev_, Trun);
+    }
+    if (ok) {
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            if (!m->prefill_lend(err)) { ok = false; break; }
+        }
     }
     // STRATA_GLM_STALL_TEST=<s> (a test of the serve watchdog): every batched prompt stops here for s seconds
     static const int stall_test = [] {
@@ -4243,7 +4285,16 @@ bool Glm5Model::prefill(const std::vector<int32_t>& tokens, std::string& err, in
         const int64_t end = pos_ + (int64_t) tokens.size() + (next_token >= 0 ? 1 : 0);
         for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->cap_floor_ = end - cap_d_->ctx();
     }
-    if (ok) ok = prefill_run(tokens, err);
+    if (ok) {
+        // A failure in the prompt path (an allocation, a launch) is thrown, not fatal: the expert pool's tail is
+        // given back below either way, and the reason is the request's error.
+        try {
+            ok = prefill_run(tokens, err);
+        } catch (const std::exception& e) {
+            err = e.what();
+            ok = false;
+        }
+    }
     progress_at("the prompt: returning the expert pool's tail");
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         m->cap_floor_ = 0;
