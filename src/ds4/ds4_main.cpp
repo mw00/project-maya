@@ -212,9 +212,7 @@ float dspark_cum_default() {
 // as it decodes - so a lookup window may run past DSpark's block, up to verify_max().  Only which drafts are verified
 // changes: verify() keeps a draft the drafter did not draw with probability p(d) (q a point at it), so every token is
 // still the model's own draw.  Not beside DS4_DSPARK_SAMPLE=1's drawn drafts (the choice would then hang on a draw).
-// A round with no drafter window (--dspark none or off, or DSpark resting after drafts below its confidence) weighs
-// the lookup's drafts against a plain step the same way.  --suffix-draft N: the shortest match it proposes from (3; 0:
-// off)
+// --suffix-draft N: the shortest match it proposes from (3; 0: off)
 struct Lookup {
     strata::spec::SuffixDrafter sfx;
     strata::spec::DraftPolicy policy;   // (over the engine's life: the round times are this PC's)
@@ -238,8 +236,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     offered = accepted = 0;
     const double t0 = now_ms();
     int match = 0;
-    const bool drafter = spec && room > 1 && m.draft_block() > 0;
-    if (drafter) {
+    if (spec && room > 1 && m.draft_block() > 0) {
         std::vector<int> drafts;
         std::vector<float> conf;
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
@@ -279,30 +276,6 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
                     lk->accepted += acc;
                 }
             }
-            return true;
-        }
-    }
-    // no drafter this round (DSpark not loaded or off, or resting after a round of drafts below its confidence): the
-    // lookup's drafts alone, where the policy expects more committed tokens a millisecond from them than from a plain
-    // step - each a point to verify(), as beside DSpark
-    if (lk != nullptr && !drafter && room > 1) {
-        const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
-        match = lk->sfx.last_match();
-        strata::spec::DraftPolicy::Pick pk;
-        if (k > 0) pk = lk->policy.choose(1, k, match);
-        if (pk.lookup && pk.t > 1) {
-            const std::vector<int> drafts(lk->buf.begin(), lk->buf.begin() + (pk.t - 1));
-            int acc = 0, next = -1;
-            if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
-            counter += (unsigned long long) acc + 1;
-            for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
-            out.push_back(next);
-            offered = (int) drafts.size();
-            accepted = acc;
-            lk->policy.observe(true, pk.t, acc, match, now_ms() - t0);
-            ++lk->windows;
-            lk->offered += offered;
-            lk->accepted += acc;
             return true;
         }
     }
@@ -1399,14 +1372,13 @@ int main(int argc, char** argv) {
     o.vision_only = !enc_rgb.empty();
     strata::ds4::Model m;
     std::string err;
-    o.lookup = suffix_draft > 0;   // (its verify windows' buffers, with no drafter too)
     if (!m.load(o, err)) {
         std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
-    std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
-    if (suffix_draft > 0)
+    std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark: one policy over every request of this run)
+    if (spec && suffix_draft > 0 && m.draft_block() > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
