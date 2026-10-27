@@ -281,6 +281,27 @@ class Shards(unittest.TestCase):
         self.assertEqual(files, ["m-00001-of-00001.gguf"])
 
 
+class Drafter(unittest.TestCase):
+    def test_left_out_without_its_geometry(self):
+        """#500: a drafter beside a GGUF with no DSpark geometry (and not DeepSeek-V4.1-Flash's trunk, whose own values
+        the pack would take): left out of the pack, loudly - it would load and never draft."""
+        root = pathlib.Path(tempfile.mkdtemp())
+        q = root / "Q"
+        q.mkdir()
+        gguf(q / "m-00001-of-00001.gguf")
+        (root / "dspark").mkdir()
+        (root / "dspark" / "dspark.bin").write_bytes(bytes(256))
+        (root / "dspark" / "dspark.json").write_text(json.dumps(
+            {"from": [], "tensors": [["mtp.0.attn_norm.weight", "BF16", 0, 8, [4]]]}))
+        r = subprocess.run([sys.executable, str(HERE / "ds4" / "pack_gguf.py"), "--model", str(q)],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("is left out of the pack", r.stderr)
+        self.assertIn("dspark_block_size", r.stderr)
+        self.assertNotIn("the DSpark drafter", r.stdout)
+        self.assertNotIn("dspark.bin", (q / "maya-ds4" / "tensors.txt").read_text())
+
+
 def gguf(path: pathlib.Path):
     """A DeepSeek-V4.1 GGUF of one tensor (the embedding, BF16 [4][DIM]) and the metadata pack_gguf reads."""
     def s(x: str) -> bytes:

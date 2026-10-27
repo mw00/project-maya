@@ -4,7 +4,7 @@ The portable HIP implementations of `exl3::set_gate_up`, `set_down`, and `gemm_r
 
 ## Current limits
 
-This is kernel bring-up, not general installer support. The setup still rejects DeepSeek EXL3 on HIP. Prepare the pack manually and use a direct engine launch or a separate server configuration. Do not remove that installer check until broader model validation is complete. Vision and DSpark were disabled in the full-model trial. NVIDIA build/runtime checks and independent full-model EXL3 parity remain outstanding.
+The setup offers DeepSeek's EXL3 quants on AMD as experimental (since v1.1.30), as it offers GLM's and MiniMax's EXL3 quants there: `--backend hip --model DeepSeek-V4.1-Flash-1017 --ds4-quant exl3` (or `exl3-3.5`) downloads, packs and configures them with a warning. The kernels pass `exl3_test` on gfx1201 and gfx1151; the whole model has had a smoke test, not a full-model parity or quality evaluation, and Vision and DSpark were disabled in that trial. Maya's GGUF quants (`--model deepseek-maya-s` / `deepseek-maya-xs`) remain the tested way on AMD. The manual steps below still work for a direct engine launch.
 
 The EXL3 3.5bpw model has integer per-matrix K (3/4 for routed experts, 6 for most dense matrices). Its average bitrate does not require half-integer matrix encodings. Keep the original 1017 Engram shards beside the EXL3 shards; packing indexes the weights without copying them.
 

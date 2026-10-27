@@ -210,10 +210,10 @@ void test_mv(int k, int n, int k2, int cb, bool q8, int view_c0 = -1, int view_n
     cudaFree(d_y);
 }
 
-void test_batch() {
+void test_batch(int k2a, int k2c) {
     // three jobs, two bit widths: the launch per (K, cb) and the per-job scratch ranges
     const int k = 8192;
-    HostMat a = make_mat(k, 512, 8, 2), b = make_mat(k, 256, 8, 2), c = make_mat(1024, 384, 6, 2);
+    HostMat a = make_mat(k, 512, k2a, 2), b = make_mat(k, 256, k2a, 2), c = make_mat(1024, 384, k2c, 2);
     HostMat* hm[3] = {&a, &b, &c};
     ex::Mat m[3];
     ex::MvJob j[3];
@@ -691,8 +691,17 @@ void test_mixed(int cb) {
         for (int e = 0, r = 0; e < 3; ++e)
             for (int j = 0; j < counts[e]; ++j, ++r)
                 expert(e, x.data() + (size_t) row_tok[(size_t) r] * E, true, ref.data() + (size_t) r * E);
-        close(("set mixed cb" + std::to_string(cb) + " (3 experts, 112 rows)").c_str(), host_copy(d_out, ref.size()),
-              ref, 3e-3);
+        const std::vector<float> got = host_copy(d_out, ref.size());
+        close(("set mixed cb" + std::to_string(cb) + " (3 experts, 112 rows)").c_str(), got, ref, 3e-3);
+        {   // (the outputs' bits, FNV-1a: a build before and after a change to set_mix_kernel compare them - #479)
+            uint64_t hb = 1469598103934665603ull;
+            const std::vector<uint16_t> h16 = host_copy(d_h, (size_t) rows * F);
+            const uint8_t* ob = (const uint8_t*) got.data();
+            const uint8_t* hbp = (const uint8_t*) h16.data();
+            for (size_t i = 0; i < got.size() * 4; ++i) hb = (hb ^ ob[i]) * 1099511628211ull;
+            for (size_t i = 0; i < h16.size() * 2; ++i) hb = (hb ^ hbp[i]) * 1099511628211ull;
+            std::printf("  set mixed cb%d bits %016llx\n", cb, (unsigned long long) hb);
+        }
         cudaFree(d_eptr);
         cudaFree(d_x);
         cudaFree(d_bounds);
@@ -1686,8 +1695,10 @@ int main(int argc, char** argv) {
     test_mv(12288, 256, 8, 2, false);       // k > 4096
     test_mv(2048, 4096, 10, 2, true);       // q8_1 input
     test_mv(4096, 1024, 4, 2, false, 384, 256);   // a column view
-    test_batch();
-    for (int k2 : {4, 6, 8}) test_moe(k2, 2);
+    test_batch(8, 6);
+    test_batch(16, 12);                     // 8-bit attention / shared experts (EXL3-sc_4.10bpw)
+    // routed experts above 4 bits: EXL3-sc_4.10bpw's first MoE layer is 5-bit
+    for (int k2 : {4, 6, 8, 10, 12, 16}) test_moe(k2, 2);
     test_moe(6, 1);
     for (int k2 : {4, 10}) test_recon(256, 384, k2, 2);
     test_recon(256, 256, 6, 0);
@@ -1696,7 +1707,7 @@ int main(int argc, char** argv) {
     for (int k2 : {4, 6, 10, 16}) test_gemm_rows(512, 384, k2, 2, 45);
     test_gemm_rows(4096, 256, 6, 1, 100);
     test_gemm_rows(1024, 128, 8, 0, 7);
-    for (int k2 : {4, 6, 8}) test_set(k2, 2);
+    for (int k2 : {4, 6, 8, 10, 16}) test_set(k2, 2);
     for (int k2 = 2; k2 <= 16; k2 += 2) test_cpu(512, 256, k2);
     test_cpu(4096, 2048, 6);
     test_cpu(2048, 4096, 6);
@@ -1706,12 +1717,12 @@ int main(int argc, char** argv) {
     for (int nc : {2, 4, 7, 16}) test_mv_n(4096, 512, 6, 2, false, nc);   // occupancy split
     test_mv_n(12288, 256, 12, 2, false, 6);                                 // k > 4096
     test_mv_n(2048, 4096, 10, 2, true, 8);                                  // q8_1 input
-    for (int k2 : {4, 6, 8, 16}) test_win(k2, 2, 7);
+    for (int k2 : {4, 6, 8, 10, 16}) test_win(k2, 2, 7);
     test_win(6, 1, 2);
     test_win(6, 2, 16);
-    for (int k2 : {2, 6, 12, 16}) test_cpu_n(512, 256, k2);
+    for (int k2 : {2, 6, 10, 12, 16}) test_cpu_n(512, 256, k2);
     for (int k2 : {4, 6, 8, 10, 16}) test_cpu_rows(512, 384, k2);
-    for (int k2 : {6, 8, 12}) test_cpu_gemm(768, 256, k2);
+    for (int k2 : {6, 8, 10, 12}) test_cpu_gemm(768, 256, k2);
     test_cpu_had();
     // the CPU tiers against an exact model of their arithmetic (odd slice counts too: 37 slices)
     for (int k2 = 2; k2 <= 16; k2 += 2) test_cpu_exact(512, 256, k2);

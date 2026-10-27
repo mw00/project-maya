@@ -185,12 +185,13 @@
   }
  },
  "maya": {
-  "_": "Maya's quants of DeepSeek-V4.1-Flash-1017 (tools/maya_quant: per-expert statistics from the model itself, error-feedback rounding of the experts), each one GGUF split with everything in it - the Engram tables too, in Q6_K (made from DeepSeek's released weights). The files are listed here once they are uploaded, with the commit they were uploaded at.",
+  "_": "Maya's quants of DeepSeek-V4.1-Flash-1017 (tools/maya_quant: per-expert statistics from the model itself, error-feedback rounding of the experts), each one GGUF split with everything in it - the Engram tables too, in Q6_K (made from DeepSeek's released weights). The files are listed here once they are uploaded, with the commit they were uploaded at. \"memory_gb\": the VRAM + RAM that hold a quant - its files but the Engram tables, which stay on the SSD, and its drafter - by which the setup recommends the context.",
   "repo": "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF",
   "revision": "c273fcbdda76a1db074c2f414cb70edbfca2f2ef",
   "quants": {
    "Maya-S": {
     "about": "experts IQ2_XXS / IQ3_XXS, the first and last four layers IQ2_S / IQ3_S, dense weights Q8_0, the Engram tables Q6_K",
+    "memory_gb": 186,
     "files": {
      "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf": [
       47887697312,
@@ -266,6 +267,7 @@
    },
    "Maya-XS": {
     "about": "every routed expert IQ1_S (error-feedback rounding, calibrated layer by layer on the quantized model itself), dense weights Q8_0, the Engram tables Q6_K; with its own 2-bit DSpark drafter",
+    "memory_gb": 121,
     "files": {
      "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00001-of-00005.gguf": [
       47781530400,

@@ -4,6 +4,72 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.30 - 2026-10-27
+
+MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
+
+- **MiniMax-M3.1-Flash-Maya-XS and -Maya-S on Maya:** `./setup.sh --model minimax-maya-xs` (or `minimax-maya-s`)
+  runs our GGUF quants on `maya-mm3`: Maya-XS (~93 GB, the experts in about 1.6 bits) fits a 128 GB
+  PC's memory, Maya-S (~122 GB, about 2.1 bits) is closer to the original. Run on Maya, both score as
+  measured for their model card (the quality table there).
+- **NVIDIA from V100 on and AMD, Linux and Windows**, with the experts VRAM cannot hold computed on the CPU from RAM,
+  the INT8 K/V cache and the context fitted to the PC's memory, as for the EXL3 quant.
+- **Pictures and DSpark drafting with the GGUFs**, on NVIDIA and AMD: the vision tower and the drafter come from the
+  EXL3 repo's own files (about 4 GB), downloaded once beside the model.
+- **MiniMax's EXL3 quant on AMD, experimental**, as GLM's EXL3 quants there: `maya-mm3` builds for AMD GPUs with its
+  EXL3 kernels, and the setup offers the quant there too.
+- **The same files work in llama.cpp:** the three dense layers' indexers are kept in a small file of their own, which
+  Maya loads to run MiniMax's sparse attention in every layer.
+- **One naming scheme for every model's quants:** the model first, then the tier by the experts' bits - XS (~1.6),
+  S (~2-2.5), M (~3-3.5), L (4+). The setup and the dashboard show "GLM-5.3 · Maya-S24", "DeepSeek V4.1 · Maya-XS",
+  "MiniMax M3.1 · Maya-XS (93 GB)", and `--model` takes setup ids: `glm-maya-s`, `deepseek-maya-xs`,
+  `minimax-maya-xs` and so on. Every name used before (`--model Maya-S24`, `--ds4-quant maya-xs`, ...) still works,
+  and installed models and their configs carry on as they are.
+- **DeepSeek: a 256K context by default** wherever the PC's VRAM and RAM hold the model; PCs with less keep 64K. A
+  setup again keeps the context you chose before.
+- **A loop guard for every model:** an answer that falls into repeating one block over and over, in the thinking or
+  the answer, is caught as it starts and steered out of it; on by default (`MAYA_LOOP_GUARD=0` turns it off).
+- **MiniMax answers faster, on NVIDIA and AMD:** a token's attention keeps the whole GPU busy, the layers are shared
+  out over the GPUs by what each one needs (more experts in VRAM), and where the experts fit in the GPU a token no
+  longer waits for the host at every layer. On three V100s Maya-XS answers about twice as fast as the EXL3 quant with
+  its drafter did in v1.1.29, and the EXL3 quant itself decodes about 13% faster.
+- **MiniMax reads prompts faster, tuned to each PC:** a prefill calibration measures the best way to read prompts on
+  this PC once (the setup, `./maya.sh --calibrate`, or the first start of an earlier setup) and the engine keeps it;
+  on the Gorgon Halo Maya-XS reads a 1K-token prompt about 1.4x and 4K-16K-token prompts about 1.75x as fast, with the
+  same quality on the reference prompts.
+- **DeepSeek's EXL3 quants on AMD, experimental:** the setup offers them there with a warning, as GLM's and
+  MiniMax's EXL3 quants.
+
+From the community, thank you:
+
+- **EXL3 faster on V100, T4 and RTX 20** (#461, #484, #485, @merbanan): decode cuts its trellis windows together and
+  splits a routed expert's gate and up, prompts use the tensor cores for the light experts - the same results.
+- **turboderp's self-calibrated GLM EXL3 quant at 4.10 bits in the setup** (#256, @needmorevram).
+- **DeepSeek kept conversations hold pictures too** (#462, @markrussi), and **can be capped in RAM**
+  (`MAYA_DS4_SLOT_RAM_GB`, the least recently used spilling to disk; #523, @handmade0octopus).
+- **DeepSeek's Engram cache in the engine stats and `/metrics`** (#522, @handmade0octopus).
+- **DeepSeek on more PCs:** the RAM budget counts ZFS's reclaimable cache (#492, @saltacc), the CPU lane uses up to
+  four NUMA parts (#463, @geoffreybyers), the IQ1_S CPU lane runs fast on AMD Zen to Zen 2 (#489, from a post by
+  @superalesha), the drafter can go on another GPU group (experimental, opt-in; #464, @LostVector), and
+  `ds4_gguf_test` builds on Windows again (#465, @OscarSheng).
+- **DeepSeek EXL3 packs** read the mixed-precision quant map as the quant made it (#481, @cgi-yf; closes #430).
+- **DSML tool calls:** a value ending in part of a closing tag no longer swallows the rest of the call (#482,
+  @catonooka).
+- **GLM's thinking budget with a small `max_tokens`** keeps room for the reasoning (#488, @Fringe210).
+- **The live decode rate is per request** in the Monitor with `--parallel` (#472, @asdacap).
+
+Fixes:
+
+- **EXL3 builds for Pascal again** (#479).
+- **DeepSeek on Windows starts even when the OS will not pin all its RAM** - the same answers, with a warning (#521).
+- **`--tp` follows the GPUs you choose now** when the setup runs again (#436).
+- **DeepSeek's one-GPU decode path only where experts actually stream from RAM** (#496).
+- **A DeepSeek GGUF drafter without its DSpark settings** gets them filled in, or is left out with a warning, instead
+  of loading and never drafting (#500).
+- **A streamed request waiting in the queue sends keep-alives**, so clients with an idle timeout wait for their turn
+  (#483).
+- **A request too long for the context gets OpenAI's context-overflow error**, so agents compact and retry (#432).
+
 ## v1.1.29 - 2026-10-26
 
 MiniMax-M3.1-Flash joins GLM and DeepSeek as Maya's third model, on an engine of its own, with MiniMax's own

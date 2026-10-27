@@ -170,7 +170,7 @@ def serving_card(s: dict, spin: str) -> Text:
         status = Text(s["state"], f"bold {DANGER}")
     else:
         status = Text.assemble((spin + " ", ACCENT), (s["state"], INK), (f" · {took}", MUTED))
-    model = " · ".join(x for x in (s["model"], s.get("quant"),
+    model = " · ".join(x for x in (s.get("label") or s["model"], None if s.get("label") else s.get("quant"),
                                    s.get("context") and f"{int(s['context']) // 1024}K context") if x)
     rows = [("Model", Text(model, INK)), ("Dashboard", Text(s["dashboard"], f"bold {INFO_TEXT}")),
             ("API", Text.assemble((s["api"], INK), (" (OpenAI) · ", MUTED), ("/v1/messages", INK),

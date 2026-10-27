@@ -50,7 +50,8 @@ function Banners({m}) {
 function Throughput({m}) {
   const live = m.live || {}, h = m.history || {}, last = (m.requests || [])[0], eng = m.engine || {}, tn = m.tiers && m.tiers.now;
   const gen = live.state === "generating";
-  const speed = gen ? live.tok_s : last ? last.decode_tok_s : null;
+  const many = live.active > 1;                  // several answers at once (--parallel): their total, the graph's newest point
+  const speed = many ? (h.tok_s || []).at(-1) : gen ? live.tok_s : last ? last.decode_tok_s : null;
   // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
     : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
@@ -67,7 +68,7 @@ function Throughput({m}) {
   const kept = +eng.dspark && tn && tn.drafts != null ? `${fmt(100 * tn.drafts)}% kept` : "";
   return html`<section class="card card--wide" aria-label="Throughput">
     <div class="speeds">
-      <div class="speed"><span class="speed__label"><i class="key key--line"></i>Decode · ${gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
+      <div class="speed"><span class="speed__label"><i class="key key--line"></i>Decode · ${many ? `${live.writing} writing` : gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
         <span class="speed__big num">${speed == null ? "–" : fmt(speed, 1)}<small>tok/s</small></span></div>
       <div class="speed" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
         <span class="speed__label"><i class="key key--dash"></i>Prefill · ${live.state === "reading" ? "reading now" : gen ? "this request" : last ? "last request" : "waiting"}</span>
@@ -437,13 +438,16 @@ function Hardware({m, gpuEach}) {
 // ------------------------------------------------------------------ recent requests
 const API_NAMES = {web: "Chat", openai: "OpenAI", anthropic: "Anthropic"};
 const FINISH = {stop: ["ok", "Done"], length: ["ok", "Max tokens"], cancel: ["warn", "Stopped"], disconnect: ["warn", "Closed"], error: ["danger", "Error"]};
-function totalsLine(t) {
+function totalsLine(t, lg = {}) {
   if (!t || !t.requests) return "";
+  // the loop guard: how many loops it broke (the request rows say where and how), or that it is off
+  const loops = lg.detected ? ` · loop guard: ${fmt(lg.detected)} loop${lg.detected === 1 ? "" : "s"} broken`
+              : lg.on === false ? " · loop guard off" : "";
   const since = new Date(t.since * 1000).toLocaleString([], {weekday: "short", hour: "2-digit", minute: "2-digit"});
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
   const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
-  return `Since ${since}: ${fmt(t.requests)} request${t.requests === 1 ? "" : "s"} · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}`;
+  return `Since ${since}: ${fmt(t.requests)} request${t.requests === 1 ? "" : "s"} · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}${loops}`;
 }
 function Requests({m}) {
   const requests = m.requests || [], kept = m.requests_kept == null ? requests.length : m.requests_kept;
@@ -462,13 +466,15 @@ function Requests({m}) {
         const pre = r.prefill_tok_s != null ? r.prefill_tok_s
           : r.prompt_ms > 0 && r.prompt_tokens > (r.reused || 0) ? (r.prompt_tokens - (r.reused || 0)) / (r.prompt_ms / 1000) : null;
         return html`<tr><td class="l">${t}</td><td class="l nowrap"><span class=${`badge badge--${tone}`}>${text}</span>
-            ${r.api ? html` <span class="muted small">${API_NAMES[r.api] || r.api}</span>` : null}</td>
+            ${r.api ? html` <span class="muted small">${API_NAMES[r.api] || r.api}</span>` : null}
+            ${r.loop_guard && r.loop_guard.length   /* (what the loop guard did in this answer: on hover) */
+              ? html` <span class="badge badge--warn" title=${r.loop_guard.join("\n")}>Loop guard</span>` : null}</td>
           <td>${fmt(r.prompt_tokens)}</td><td>${fmt(r.reused)}</td><td>${fmt(pre)}</td><td>${fmt(r.output_tokens)}</td>
           <td class="strong">${fmt(r.decode_tok_s, 1)}</td><td>${r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%`}</td>
           <td>${fmt(r.duration_s, 1)} s</td></tr>`;
       }) : html`<tr><td colspan="9" class="l muted">No requests yet</td></tr>`}</tbody>
     </table></div>
-    ${m.totals && m.totals.requests ? html`<p class="card__note">${totalsLine(m.totals)}</p>` : null}
+    ${m.totals && m.totals.requests ? html`<p class="card__note">${totalsLine(m.totals, m.loop_guard || {})}</p>` : null}
   </section>`;
 }
 

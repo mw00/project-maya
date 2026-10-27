@@ -21,13 +21,27 @@ namespace strata::ds4::gguf::iq {
 // ggml type ids
 constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
               kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
+// the dense matrices' types (a GGUF's attention, shared experts, output head - maya-mm3's MiniMax quants): the GEMVs
+// (mv), the FP16 rows (f16_rows) and decode_values only - not the routed experts' kernels
+constexpr int kQ8_0 = 8, kQ6_K = 14;
 
-/// Whether the device kernels take this ggml type.
+/// The routed experts' activation between gate / up and down (Args::act, SetArgs::act):
+///   kActSwiglu  DeepSeek's clamped SwiGLU: g = min(g, limit), u = clamp(u, -limit, limit), silu(g) u (limit 0: none)
+///   kActOai     MiniMax's swigluoai (gpt-oss's, llama.cpp's LLM_FFN_SWIGLU_OAI_MOE): the same clamps, then
+///               g sigmoid(kOaiAlpha g) (u + 1)
+constexpr int kActSwiglu = 0, kActOai = 1;
+constexpr float kOaiAlpha = 1.702f;
+
+/// Whether the routed experts' kernels take this ggml type.
 bool supported(int type);
-/// Bytes of a block (256 values) of the type (0: not one of these).
+/// Whether the GEMVs and FP16 rows take it (the experts' types and the dense ones: Q8_0, Q6_K).
+bool mv_supported(int type);
+/// Values a block of the type (32: Q8_0; 256: the others).
+inline int block_values(int type) { return type == kQ8_0 ? 32 : 256; }
+/// Bytes of a block of the type (0: not one of these).
 int block_bytes(int type);
-/// Bytes of a row of k values (k % 256 == 0).
-inline size_t row_bytes(int type, int64_t k) { return (size_t) (k / 256) * (size_t) block_bytes(type); }
+/// Bytes of a row of k values (k a multiple of the type's block).
+inline size_t row_bytes(int type, int64_t k) { return (size_t) (k / block_values(type)) * (size_t) block_bytes(type); }
 /// The type's name ("?" when unknown).
 const char* name(int type);
 
@@ -46,9 +60,12 @@ struct Args {
     const float* xd = nullptr;
     const int8_t* hq = nullptr;
     const float* hd = nullptr;
-    float* h = nullptr;      // [entries][n_ff]: the clamped swiglu
+    float* h = nullptr;      // [entries][n_ff]: the activation (act's)
     float* part = nullptr;   // [entries][n_embd]: each entry's down output
     int tg = 0, td = 0;      // gate / up's type, down's
+    int act = kActSwiglu;    // the activation (kActOai: MiniMax's)
+    int tu = 0;              // (kActOai) the up's type when it is not the gate's (0: tg): gate and up then in two passes,
+                             // the gate's sums in h first - each value the same as one pass gives
 };
 /// grid (n_ff / 8, groups): h of every entry (ne_max: a group's most entries).  false: a type not covered.
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);
@@ -79,6 +96,9 @@ struct SetArgs {
     int skip_le = 0;   // (the tiles) the experts of at most this many rows are left out: the light kernels took them
     int xh_vec = 0;    // (launch_set's: xh 16-byte aligned rows - the tensor-core tiles load 8 values at once)
     int skip_ge = 0;   // (the tiles) > 0: the experts of at least this many rows are left out - the caller's GEMMs
+    int act = kActSwiglu;      // the activation (Args::act)
+    int tu = 0;                // (kActOai) the up's type when it is not the gate's (0: tg) - two passes, as Args::tu
+    float* graw = nullptr;     // ... the gate's F32 sums between them: [local rows][n_ff] (the caller's scratch)
 };
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
 bool set_down(const SetArgs& a, cudaStream_t s);

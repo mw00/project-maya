@@ -121,6 +121,19 @@ inline size_t attn_part_floats(int T, int Hkv, int splits) { return (size_t) T *
 /// weights s / sum over the chosen -> top [T][K], w [T][K].
 void route(const float* logits, const float* bias, int T, int E, int K, int* top, float* w, cudaStream_t s);
 
+/// The routed experts' plan on the device, for a layer whose experts are all in VRAM (no round trip through the host):
+/// token t's pick i < K -> plan_ptr[t * 8 + i] = tab[top[t * K + i]] (tab: expert -> its blob's device address) and
+/// plan_w[t * 8 + i] = w[t * K + i] * scale; picks i >= K: 0 and 0.  counts (given): counts[expert] += 1 a pick (the
+/// expert profile's routings).  grp_ptr (given, T <= 16): the entries grouped by expert pointer in order of first
+/// appearance, each group's entries e = t * 8 + i in entry order (exl3::WinArgs' grp_ptr / grp_start / grp_ent /
+/// n_groups) - the host's plan and grouping value for value.  false: T * 8 > 128 or K outside 1..8 (nothing launched).
+bool plan_dev(const int* top, const float* w, int T, int K, const unsigned long long* tab, float scale,
+              unsigned long long* plan_ptr, float* plan_w, unsigned* counts, unsigned long long* grp_ptr, int* grp_start,
+              int* grp_ent, int* n_groups, cudaStream_t s);
+/// Windows + AMD submit queued GPU work only when the host waits: the stream's queued work started now, without a wait
+/// (cudaStreamQuery).  Elsewhere nothing.  MAYA_MM3_WIN_SUBMIT=0: off.
+void submit(cudaStream_t s);
+
 /// h = swigluoai(g, u) = min(g, L) * sigmoid(alpha min(g, L)) * (clamp(u, -L, L) + 1), elementwise over n values; F32
 /// into hf and / or FP16 into h16 (either may be null).
 void swigluoai(const float* g, const float* u, size_t n, float alpha, float limit, float* hf, uint16_t* h16,
@@ -163,6 +176,13 @@ void publish(const float* src, float* dst, size_t n, unsigned* counter, unsigned
 /// Y [T][N] = X [T][K] . W [N][K]^T in F32, one warp an output in a fixed order: a token's row is the same bits
 /// whatever T (the token path's and a window's router and indexer agree).
 void rows_dot(const float* W, int N, int K, const float* X, int T, float* Y, cudaStream_t s);
+/// ... W as ggml's Q8_0 rows (34-byte blocks: an F16 scale, 32 int8; K % 32 == 0) - each value scale * q in F32, the
+/// value an F32 upload of the matrix holds, so rows_dot's bits - for two matrices on the same X in one launch (Wb may be
+/// null with Nb 0): Ya [T][Na], Yb [T][Nb].
+void rows_dot_q8(const uint8_t* Wa, int Na, const uint8_t* Wb, int Nb, int K, const float* X, int T, float* Ya,
+                 float* Yb, cudaStream_t s);
+/// n values of Q8_0 blocks -> F32 (scale * q: an F32 upload's values), e.g. for a prompt's F32 GEMM.
+void q8_0_f32(const uint8_t* W, size_t n, float* out, cudaStream_t s);
 
 // ---- the DSpark draft's
 

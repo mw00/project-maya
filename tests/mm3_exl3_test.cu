@@ -1917,10 +1917,19 @@ int main(int argc, char** argv) {
     test_refuse_half_non_mul1();
     // the prompt path's FP16 GEMMs (before sm_80: cuBLAS over the decoded weights for rows >= 64, its scratch on stream
     // 0; sm_80 and later: the tensor-core tiles as above), and the busy experts of a set
+#if !defined(STRATA_USE_HIP)
     if (!ex::blas_enable(0, 8)) {   // (8 MB: the dense cases below take column pieces)
         std::printf("  %-44s FAIL\n", "blas_enable");
         ++g_fail;
     }
+#else
+    // (AMD: no cuBLAS-style FP16 GEMM path - the prompt path's HIP kernels take every row, as the shared exl3.cu's;
+    //  blas_enable says so and the engine never asks, blas_wanted() being false)
+    if (ex::blas_enable(0, 8) || ex::blas_wanted()) {
+        std::printf("  %-44s FAIL\n", "blas_enable (none on HIP)");
+        ++g_fail;
+    }
+#endif
     std::printf("  (FP16 GEMM path %s on this GPU)\n", ex::blas_wanted() ? "used" : "not used");
     for (int k2 : {4, 7, 8}) test_gemm_rows(512, 384, k2, 2, 200);
     test_gemm_rows(6144, 1024, 7, 2, 130);    // (MiniMax's widths)

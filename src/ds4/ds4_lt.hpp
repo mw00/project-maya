@@ -20,4 +20,7 @@ constexpr int kMinRows = 64;   // (fewer: the BLAS's own GEMV-like kernels)
 /// new pick is added. Unset or empty: measured each start.
 void set_store(const char* path);
 
+/// Whether this build has hipBLASLt (an AMD build with it; DS4_LT=0 counts as without).
+bool available();
+
 }  // namespace strata::ds4::lt

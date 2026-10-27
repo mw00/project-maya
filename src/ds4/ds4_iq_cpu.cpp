@@ -105,6 +105,50 @@ const IqCpuIsa& isa() {
     return c;
 }
 
+// ---- CPUs whose BMI2 pdep / pext run in microcode: AMD family 17h (Zen, Zen+, Zen 2) and Hygon's family 18h (Zen's
+// design) - one pdep there takes hundreds of cycles against one elsewhere (Intel since Haswell, Zen 3 and later).
+// ggml-cpu builds IQ1_S's grid indices by pdep wherever it is compiled with BMI2 (-march=native, or the portable
+// build's GGML_BMI2), so a Zen 2 CPU lane spent most of an IQ1_S expert there.
+bool pdep_slow_cpu() {
+#if defined(IQ_X86)
+    unsigned r[4] = {0, 0, 0, 0};
+    auto cpuid = [&](unsigned leaf) {
+#if defined(_MSC_VER)
+        int x[4];
+        __cpuidex(x, (int) leaf, 0);
+        for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+        __cpuid_count(leaf, 0, r[0], r[1], r[2], r[3]);
+#endif
+    };
+    cpuid(0);
+    char v[13];
+    std::memcpy(v, &r[1], 4);   // (the vendor: ebx, edx, ecx)
+    std::memcpy(v + 4, &r[3], 4);
+    std::memcpy(v + 8, &r[2], 4);
+    v[12] = 0;
+    const bool amd = std::strcmp(v, "AuthenticAMD") == 0, hygon = std::strcmp(v, "HygonGenuine") == 0;
+    if ((!amd && !hygon) || r[0] < 1) return false;
+    cpuid(1);
+    const unsigned base = (r[0] >> 8) & 0xfu, fam = base == 0xfu ? base + ((r[0] >> 20) & 0xffu) : base;
+    return amd ? fam == 0x17u : fam == 0x18u;
+#else
+    return false;
+#endif
+}
+// IQ1_S's rows without pdep (ours, the integer index form - ggml's non-BMI2 branch, the same bits): for every token
+// count (one token too, where ggml-cpu's dot serves elsewhere) and on every setup (the one-GPU path's switch,
+// iq_cpu_iq1s_rows, does not turn them off).  DS4_IQ1_PDEP=0 forces it on any CPU (tests: the parity of the form);
+// =1 keeps the measured choice (ggml-cpu's dot for one token, pdep where it times faster); unset: 0 on the CPUs above
+bool iq1_no_pdep() {
+    static const bool v = [] {
+        const char* e = std::getenv("DS4_IQ1_PDEP");
+        if (e != nullptr && e[0] != '\0') return std::atoi(e) == 0;
+        return pdep_slow_cpu();
+    }();
+    return v;
+}
+
 // ---- IQ3_XXS / IQ3_S rows of our own.  ggml-cpu's AVX2 dots build each 32-value chunk's grid magnitudes from eight
 // scalar table loads and inserts, and redo it for every token; here the grid comes in with one vpgatherdd from the
 // same table, the signs are built in registers (the GLM rows' sgn7_vec / sgn_vec), and every token of a call applies
@@ -714,7 +758,8 @@ double time_variant(int type, int variant, int nt = 1) {
     std::string err;
     if (variant == 0 && !kc::native_fmt(type, type, n, QK_K, nf, err)) return 1e30;
     bool* gflag = type == GGML_TYPE_IQ3_XXS ? &g_gather18 : type == GGML_TYPE_IQ3_S ? &g_gather21 :
-                  type == GGML_TYPE_IQ2_XXS ? &g_ct16 : type == GGML_TYPE_IQ1_S && isa().bmi2 ? &g_iq1_pdep : nullptr;
+                  type == GGML_TYPE_IQ2_XXS ? &g_ct16 :
+                  type == GGML_TYPE_IQ1_S && isa().bmi2 && !iq1_no_pdep() ? &g_iq1_pdep : nullptr;
     const bool keep = gflag != nullptr && *gflag;
     if (gflag != nullptr) *gflag = variant >= 2;
     double best = 1e30;
@@ -770,8 +815,9 @@ bool own(int type) {
     static std::once_flag once[5];
     static bool ok[5];
     std::call_once(once[k], [&] {
+        const bool no_pdep = k == 4 && iq1_no_pdep();
         bool* gflag = k == 0 ? &g_gather18 : k == 1 ? &g_gather21 : k == 2 ? &g_ct16 :
-                      k == 4 && isa().bmi2 ? &g_iq1_pdep : nullptr;   // (the second form)
+                      k == 4 && isa().bmi2 && !no_pdep ? &g_iq1_pdep : nullptr;   // (the second form)
         bool good = false;
         if (k == 4) {   // (IQ1_S: the float steps' form that gives ggml-cpu's bits, gcc's FMAs first)
             for (int m : {3, 0, 1, 2}) {
@@ -790,6 +836,14 @@ bool own(int type) {
         if (mode == 1) {
             if (gflag != nullptr) *gflag = force_gather && good_g;
             ok[k] = good || (force_gather && good_g);
+            return;
+        }
+        if (no_pdep) {   // (IQ1_S without pdep: ours whenever they give ggml-cpu's bits - nothing to time against a
+            ok[k] = good;   // dot that runs pdep in microcode here, or that the test asked to leave out)
+            std::fprintf(stderr, "ds4: CPU lane IQ1_S rows: %s\n",
+                         !good ? "ggml-cpu's (ours differ from its dot in this build)"
+                         : pdep_slow_cpu() ? "ours without pdep (this CPU runs pdep in microcode)"
+                                           : "ours without pdep (DS4_IQ1_PDEP=0)");
             return;
         }
         // the variants timed in turns, the best of each kept (other work on the machine - the load's read-ahead, the
@@ -818,9 +872,10 @@ bool own(int type) {
 }
 // iq_cpu_iq1s_rows: whether IQ1_S may take its own rows at all (the engine's one-GPU decode path)
 std::atomic<bool> g_iq1_on{true};
-// own(type) for a call of nt tokens: IQ1_S's rows only from 2 tokens on (one token: ggml-cpu's dot, as fast)
+// own(type) for a call of nt tokens: IQ1_S's rows only from 2 tokens on (one token: ggml-cpu's dot, as fast) - except
+// without pdep (iq1_no_pdep): then ours for every call, ggml-cpu's dot taking pdep's microcode on such a CPU
 bool own_nt(int type, int nt) {
-    if (type == GGML_TYPE_IQ1_S && (nt < 2 || !g_iq1_on.load(std::memory_order_relaxed))) return false;
+    if (type == GGML_TYPE_IQ1_S && !iq1_no_pdep() && (nt < 2 || !g_iq1_on.load(std::memory_order_relaxed))) return false;
     return own(type);
 }
 }  // namespace
@@ -889,6 +944,21 @@ void iq_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
     kc::native_down_rows_split(native(f), down, hq, nt, out, r0, r1);
 }
 
+int iq_cpu_act_type(int type) {
+    kc::NativeFmt n;
+    std::string err;
+    return kc::native_fmt(type, type, 256, 256, n, err) ? n.gu_act : -1;
+}
+
+void iq_cpu_rows(int type, const uint8_t* w, size_t rb, int k, const void* const* act, int nt, float* const* out, int r0,
+                 int r1) {
+    IqCpu f;   // (a "down" of k inputs: its rows are what iq_cpu_down reads)
+    f.td = type;
+    f.n_ff = k;
+    f.d_row = rb;
+    iq_cpu_down(f, w, act, nt, out, r0, r1);
+}
+
 bool iq_cpu_own_rows(int type) { return own(type); }
 void iq_cpu_iq1s_rows(bool on) { g_iq1_on.store(on, std::memory_order_relaxed); }
 #else
@@ -900,6 +970,8 @@ void iq_cpu_quant(int, const float*, int, void*) {}
 void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int,
                     float) {}
 void iq_cpu_down(const IqCpu&, const uint8_t*, const void* const*, int, float* const*, int, int) {}
+int iq_cpu_act_type(int) { return -1; }
+void iq_cpu_rows(int, const uint8_t*, size_t, int, const void* const*, int, float* const*, int, int) {}
 bool iq_cpu_own_rows(int) { return false; }
 void iq_cpu_iq1s_rows(bool) {}
 #endif

@@ -83,6 +83,18 @@ DENSE_KEEP = ("markov_head", "confidence_head", "norm", "hc_", "ffn.gate.", "att
 E2M1 = np.array([0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12], dtype=np.float32)
 
 
+def dspark_config(d: pathlib.Path) -> dict:
+    """The drafter's geometry (config.json's dspark_* keys: block size, noise token, Markov rank, experts) when the
+    checkpoint's config.json is beside the shards - into dspark.json's "config", which pack_gguf.py takes for a GGUF that
+    leaves them out (#500).  {} without one."""
+    try:
+        c = json.loads((d / "config.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    t = c.get("text_config", c)
+    return {k: v for k, v in t.items() if k.startswith("dspark_")}
+
+
 def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs: int, out=None) -> int:
     """dspark.bin's tensors again with the routed experts in `experts` and the dense matrices (the ones the engine reads
     as matrices) in `dense`, through ggml's quantizers (libggml-base): dspark-<name>.bin / .json beside it - a smaller
@@ -148,7 +160,8 @@ def requant(d: pathlib.Path, name: str, experts: str, dense: str, lib: str, jobs
                 prev = role
     (o / ("dspark-%s.bin.part" % name)).replace(o / ("dspark-%s.bin" % name))
     (o / ("dspark-%s.json" % name)).write_text(json.dumps({"from": "dspark.bin", "experts": experts, "dense": dense,
-                                                          "tensors": entries}))
+                                                          "tensors": entries,
+                                                          **({"config": src["config"]} if src.get("config") else {})}))
     print("dspark-%s.bin: %d tensors, %.2f GB (experts %s, dense %s)" % (name, len(entries), off / 1e9, experts, dense))
     return 0
 
@@ -208,8 +221,11 @@ def main() -> int:
                 off += pad
             del raw
     (d / "dspark.bin.part").replace(d / "dspark.bin")
-    (d / "dspark.json").write_text(json.dumps({"from": list(SHARDS), "tensors": entries}))
-    print(f"dspark.bin: {len(entries)} tensors, {off / 1e9:.2f} GB")
+    cfg = dspark_config(d)
+    (d / "dspark.json").write_text(json.dumps({"from": list(SHARDS), "tensors": entries, **({"config": cfg} if cfg else {})}))
+    print(f"dspark.bin: {len(entries)} tensors, {off / 1e9:.2f} GB" +
+          (", its geometry from config.json" if cfg else " (no config.json beside the shards: pack_gguf.py takes "
+                                                          "DeepSeek-V4.1-Flash's own DSpark geometry when the GGUF has none)"))
     return 0
 
 

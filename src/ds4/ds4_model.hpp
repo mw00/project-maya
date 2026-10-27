@@ -57,6 +57,16 @@ struct Image {
     std::shared_ptr<const std::vector<uint16_t>> rows;
 };
 
+/// A picture as a slot keeps it: where its span starts, the fingerprint of its pixels, the span's length in tokens.
+/// No pixels, no rows - the rows' work is in the KV (they are read only while the span itself is fed, and a restored
+/// state with the same picture at the same place has that KV).  Two states whose pictures agree on all three are the
+/// same state; another picture, another place or another span: not.
+struct PicMark {
+    int64_t start = 0;
+    uint64_t hash = 0;
+    uint64_t len = 0;
+};
+
 struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
@@ -70,6 +80,7 @@ struct Stats {
     int64_t eg_rows = 0, eg_hits = 0, eg_reads = 0;   // Engram rows asked for, served without a read, read from the files
     double eg_io_ms = 0.0;                            // the windows' Engram reads, issue to last done (mostly hidden)
     int64_t eg_cached = 0, eg_cache_cap = 0;          // the row cache's rows held, its capacity
+    int64_t eg_cache_row_bytes = 0;                   // each cached row's payload bytes
     int64_t swaps = 0;                // experts the cache moved into VRAM
     int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
     int skip_on = -1;                 // DISK_SKIP_AUTO: 1 skipping, 0 off (warm), -1 not in use
@@ -157,14 +168,18 @@ public:
     /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
     std::vector<int64_t> check_positions() const;
 
-    /// The conversation in the model into `out` (slot_save): its position, its tokens, every window ring (the DSpark
-    /// blocks' included), the compressors' partial groups and each KV source's compressed KV and index keys up to it,
-    /// the pieces the state a prompt continues is made of.  0 and err: nothing was set aside (it holds pictures, there
-    /// is no conversation, or the conversation is already set aside - unchanged since).
-    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err);
+    /// The conversation in the model into `out` (slot_save): its position, its tokens, its pictures' marks (`pics`:
+    /// what the caller's state holds), every window ring (the DSpark blocks' included), the compressors' partial groups
+    /// and each KV source's compressed KV and index keys up to it, the pieces the state a prompt continues is made of.
+    /// 0 and err: nothing was set aside (there is no conversation, a picture's mark is not the state's, or the
+    /// conversation is already set aside - unchanged since).
+    uint64_t slot_save(std::vector<uint8_t>& out, std::string& err, const std::vector<PicMark>& pics = {});
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
-    /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
-    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);
+    /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix and the
+    /// pictures agree).  The slot's pictures' marks go to `pics` (`pics` null: a slot that holds pictures is refused -
+    /// a caller that cannot check them must not serve it).
+    bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err,
+                   std::vector<PicMark>* pics = nullptr);
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;

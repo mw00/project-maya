@@ -366,6 +366,47 @@ class Parsing(unittest.TestCase):
             if stream:
                 self.assertEqual(next(e.call.id for e in events if e.kind == "tool_start"), call.id)
 
+    def test_streamed_string_parameter_bytes_arrive_before_the_call_ends(self):
+        """A string parameter's argument deltas must flow while it is being written, not only once its
+        closing tag arrives (pi-ai streamIdleTimeoutMs 300000 ms: a buffered 10k-token `write` was
+        byte-silent for minutes and every long tool call timed out)."""
+        big = "\n".join(f"stanza {i} about the sea" for i in range(400))   # ~8k chars
+        text = dsml(f'<｜DSML｜ parameter name="q" string="true">{big}</｜DSML｜ parameter>')
+        for step in (1, 7, 64, len(text)):
+            with self.subTest(step=step):
+                events = parse(text, stream=True, step=step)
+                args = [e for e in events if e.kind == "tool_args"]
+                self.assertTrue(args)
+                self.assertTrue(any(len(e.text) > 1 for e in args), "no argument piece moved early")
+                # a piece before the final tool_call event: bytes flowed while the call was open
+                last_call = max(i for i, e in enumerate(events) if e.kind == "tool_call")
+                self.assertLess(max(i for i, e in enumerate(events) if e.kind == "tool_args"), last_call)
+                self.assertEqual(json.loads("".join(e.text for e in args)), {"q": big})
+
+    def test_streamed_parameter_never_splits_a_closing_tag(self):
+        """Streamed value pieces must never leak a partial structural token: a closing-tag PREFIX at
+        the end of a piece stays held until it resolves as data. (A COMPLETE embedded closing tag is
+        structural in the reference decoder too - not data - so it is not tested as data here.)"""
+        for value in ("ends with a lone lt <", "ends with </\uff5cDSML\uff5c para",
+                      "ends with </\uff5cDSML\uff5c parameter", "two lines\nand < chars <", "clean text"):
+            with self.subTest(value=value):
+                text = dsml(f'<｜DSML｜ parameter name="q" string="true">{value}</｜DSML｜ parameter>')
+                events = parse(text, stream=True, step=1)
+                streamed = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(streamed), {"q": value})
+                calls = [e.call for e in events if e.kind == "tool_call"]
+                self.assertEqual(len(calls), 1)
+
+    def test_streamed_raw_parameter_stays_whole(self):
+        """string="false" values (numbers/bools/objects) keep the whole-value path: they are short and
+        must arrive as one JSON scalar, byte-identical to the unstreamed parse."""
+        text = dsml('<｜DSML｜ parameter name="q" string="false">{"nested": [true, null, 2]}</｜DSML｜ parameter>')
+        for step in (1, 7, len(text)):
+            with self.subTest(step=step):
+                events = parse(text, stream=True, step=step)
+                self.assertEqual(json.loads("".join(e.text for e in events if e.kind == "tool_args")),
+                                 {"q": {"nested": [True, None, 2]}})
+
 
 class ResponseSerialization(unittest.TestCase):
     def service(self):

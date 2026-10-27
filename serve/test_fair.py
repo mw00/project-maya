@@ -6,6 +6,8 @@ continues an answer from wherever the prompt says it got to (as the real engine 
 from __future__ import annotations
 
 import os
+import random
+import string
 import sys
 import threading
 import time
@@ -131,7 +133,7 @@ class FairLockOrder(unittest.TestCase):
 
 
 class FairSlices(unittest.TestCase):
-    LONG = "L" * 600
+    LONG = "".join(random.Random(600).choices(string.ascii_letters, k=600))   # (no loop: the loop guard stays out)
     SHORT = "s" * 20
 
     def setUp(self):
@@ -150,7 +152,7 @@ class FairSlices(unittest.TestCase):
         out = {}
         a = threading.Thread(target=collect, args=(self.svc, "long one", 4096, out), kwargs=kw)
         a.start()
-        while not self.svc.status.get("first_token"):
+        while self.svc.latest_request not in self.svc.current_requests:
             time.sleep(0.001)
         b = threading.Thread(target=collect, args=(self.svc, "short one", 4096, out))
         b.start()
@@ -202,18 +204,19 @@ class FairSlices(unittest.TestCase):
 
     def test_a_client_gone_while_queued_again_leaves_the_line(self):
         os.environ["STRATA_FAIR_SLICE_S"] = "0.02"
-        self.engine.answers["short"] = "s" * 400               # long enough to hold the engine for a while
+        short = "".join(random.Random(400).choices(string.ascii_lowercase, k=400))
+        self.engine.answers["short"] = short                    # long enough to hold the engine for a while
         out = {}
         a = threading.Thread(target=collect, args=(self.svc, "long one", 4096, out),
                              kwargs={"stop_after": 50})
         a.start()
-        while not self.svc.status.get("first_token"):
+        while self.svc.latest_request not in self.svc.current_requests:
             time.sleep(0.001)
         b = threading.Thread(target=collect, args=(self.svc, "short one", 4096, out))
         b.start()
         a.join(30)
         b.join(30)
-        self.assertEqual(out["short one"][0], "s" * 400)
+        self.assertEqual(out["short one"][0], short)
         self.assertLess(len(out["long one"][0]), len(self.LONG))
         self.assertFalse(self.svc.fifo.locked())
         self.assertEqual(self.svc.fifo.waiting(), 0)

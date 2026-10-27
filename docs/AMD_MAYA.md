@@ -218,7 +218,7 @@ pack and the dashboard are the same as on an NVIDIA PC.
 
    ```bat
    START-MAYA.bat --backend hip --gpu 0 --check
-   START-MAYA.bat --backend hip --gpu 0 --setup --model Maya-L
+   START-MAYA.bat --backend hip --gpu 0 --setup --model glm-maya-l
    ```
 
 The setup takes the ROCm it finds first: `ROCM_PATH`, TheRock's `rocm-sdk` (`ROCM_VENV`, Maya's `.venv` or PATH), AMD's

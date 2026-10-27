@@ -26,7 +26,7 @@ measures your GPUs, CPU, RAM and SSD and tunes itself to them. Nothing leaves yo
 - **Fast:** up to 124 tokens/s on two H100s, 118 on four RTX 4090s, 81 on one RTX PRO 6000, 30+ on a single RTX 5090. Real numbers from
   real users below.
 - **Close to the original:** Maya's own quants of GLM-5.3-Flash keep 97.7-99.2% of the FP8 model's zero-shot
-  accuracy; Maya-S of DeepSeek-V4.1-Flash-1017 picks the same next token as the original 92.6% of the time.
+  accuracy; DeepSeek V4.1 · Maya-S picks the same next token as the original 92.6% of the time.
 - **Plugs into your tools:** OpenAI- and Anthropic-compatible API with tool calls, ready for coding agents.
 - **Several requests at once:** up to 8 answered together - for agents that run several sessions, or several people
   on one PC.
@@ -34,18 +34,23 @@ measures your GPUs, CPU, RAM and SSD and tunes itself to them. Nothing leaves yo
 
 ## The models
 
+Every Maya quant is named after its model first, then its tier - XS, S, M or L, by how many bits its experts keep - so
+"GLM-5.3 · Maya-S" and "MiniMax M3.1 · Maya-S" never get mixed up. The setup asks which one to download; to pick one
+yourself, give its setup id: `./setup.sh --model glm-maya-s24`. The names used before (`--model Maya-S24`,
+`--ds4-quant maya-xs`, ...) keep working.
+
 Project Maya's own quants of GLM-5.3-Flash, made from Z.ai's FP8 release with statistics from the FP8 model. Each keeps
 the model's MTP block, which drafts tokens ahead.
 
-| Model | Size | Made for | Against the FP8 model |
-| --- | ---: | --- | --- |
-| **Maya-S** (default) | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
-| **Maya-S24** | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
-| **Maya-M** | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
-| **Maya-M-Derisked** | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
-| **Maya-L** | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
+| Model | Setup id | Size | Made for | Against the FP8 model |
+| --- | --- | ---: | --- | --- |
+| **GLM-5.3 · Maya-S** (default) | `glm-maya-s` | 96.5 GB | PCs with a smaller memory pool (RAM and VRAM together) | 97.9% of its zero-shot accuracy; the same next token 83% of the time |
+| **GLM-5.3 · Maya-S24** | `glm-maya-s24` | 94.7 GB | cards of 24 GB or less: 4-bit attention leaves ~1.5 GB more of the card for experts, decode +14% | 97.7%; 83% |
+| **GLM-5.3 · Maya-M** | `glm-maya-m` | 116 GB | a bigger memory pool; more bits where they count, calibrated toward tool calls and front-end code | 97.9%; 86% |
+| **GLM-5.3 · Maya-M-Derisked** | `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
+| **GLM-5.3 · Maya-L** | `glm-maya-l` | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
 
-The setup asks which one to download and recommends one for your PC. How they're made and measured: [MAYA-S](bench/results/MAYA-S.md),
+The setup recommends one for your PC. How they're made and measured: [MAYA-S](bench/results/MAYA-S.md),
 [MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md). On
 [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF).
 
@@ -60,14 +65,16 @@ results. See [the prompt format notes](docs/deepseek-prompt-format.md) for API d
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
-| **[Maya-S](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)**, Project Maya's own quant (default): the experts in 2-3 bits, 92.6% the same next token as the original | 340 GB, with the Engram tables (Q6_K) | NVIDIA from Volta (V100) on, and AMD; Linux and Windows |
+| **[DeepSeek V4.1 · Maya-S](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)** (`deepseek-maya-s`), Project Maya's own quant (default): the experts in 2-3 bits, 92.6% the same next token as the original | 340 GB, with the Engram tables (Q6_K) | NVIDIA from Volta (V100) on, and AMD; Linux and Windows |
+| **[DeepSeek V4.1 · Maya-XS](https://huggingface.co/peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF)** (`deepseek-maya-xs`): the experts in ~1.6 bits, with its own 2-bit drafter - the whole model in a 128 GB PC's memory (the Engram tables stay on the SSD) | 277 GB, with the Engram tables (Q6_K) | the same |
 | unsloth's [UD-Q8_K_XL GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (DeepSeek's own formats) | 508 GB | the same |
 | unsloth's UD-Q4_K_XL GGUF (dense weights Q8_0: less VRAM) | 501 GB | the same |
-| LibertAIDAI's [EXL3 2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) + DeepSeek's Engram tables | 414 GB | NVIDIA RTX 30 / A100 and newer |
+| LibertAIDAI's [EXL3 2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) + DeepSeek's Engram tables | 414 GB | NVIDIA from Volta (V100) on; pictures from RTX 30 / A100 on; AMD experimental |
 | LibertAIDAI's [EXL3 3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) + the same Engram tables (`--ds4-quant exl3-3.5`: closer to the original, ~280 GB of VRAM + RAM) | 461 GB | the same |
 
 - **Any amount of memory:** the most-used experts go to the GPUs, the others are read in place from the model's files -
-  from RAM where they fit, from the SSD otherwise. More VRAM and RAM is faster; keep the files on an NVMe SSD.
+  from RAM where they fit, from the SSD otherwise. More VRAM and RAM is faster; keep the files on an NVMe SSD. The
+  setup recommends a 256K context where your VRAM and RAM hold the model, 64K otherwise.
 - **The DSpark drafter:** with the GGUFs the setup also fetches the model's own drafter (8 GB from Maya's repo:
   DeepSeek's FP4 experts, its dense weights in 8-bit) and measures whether drafting makes your PC faster; it keeps it
   only where it does.
@@ -88,7 +95,12 @@ commercial use has conditions) on an engine of its own (`maya-mm3`, contributed 
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
+| **[MiniMax M3.1 · Maya-XS](https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF)** (`minimax-maya-xs`), Project Maya's own quant: the experts in ~1.6 bits - the whole model in a 128 GB PC's memory | 93 GB | NVIDIA V100 / RTX 20 and newer, and AMD; Linux and Windows |
+| **[MiniMax M3.1 · Maya-S](https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF)** (`minimax-maya-s`): the experts in ~2.1 bits, closer to the original | 122 GB | the same |
 | Mia-AiLab's [EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw), with MiniMax's DSpark drafter and vision tower | 197 GB | NVIDIA V100 / RTX 20 and newer, Linux and Windows |
+
+With Maya's quants the setup fetches the vision tower and the DSpark drafter from the EXL3 repo (about 4 GB) for
+pictures and drafting on NVIDIA; on AMD they read text.
 
 - **Set up for your PC:** the experts that do not fit in VRAM are computed on the CPU from RAM; the context (up to the
   model's 1M) is recommended by your memory; tensor parallel where the GPUs form groups; and the DSpark drafter only
@@ -104,8 +116,9 @@ commercial use has conditions) on an engine of its own (`maya-mm3`, contributed 
 
 | Model | Size | How | Notes |
 | --- | ---: | --- | --- |
-| [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | NVIDIA only, experimental |
-| [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | NVIDIA only, experimental |
+| [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | experimental; NVIDIA, and AMD |
+| [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | experimental; NVIDIA, and AMD |
+| [EXL3 4.10 bpw, self-calibrated](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/sc_4.10bpw) by turboderp | 167.8 GB | in the setup: `--model EXL3-sc_4.10bpw` | experimental; NVIDIA, and AMD; 8-bit attention and shared experts |
 
 </details>
 
@@ -195,7 +208,7 @@ VRAM holds, the more it gains ([how](docs/SETTINGS.md#several-requests-at-once))
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. Pascal (Tesla P40 / P100, GTX 10) is experimental, not validated yet. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 and Radeon PRO V620 / W6800 not validated yet; GLM-5.3-Flash reads text only there, DeepSeek-V4.1-Flash-1017 pictures too - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB runs it. More RAM keeps more experts close and is faster |
-| **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for Maya-S, ~160 GB for Maya-L, ~350 GB for DeepSeek-V4.1-Flash-1017's Maya-S, ~520 GB for unsloth's GGUF, ~200 GB for MiniMax-M3.1-Flash) and its picture encoder (1.1 GB). Not a hard disk |
+| **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for GLM-5.3 · Maya-S, ~160 GB for GLM-5.3 · Maya-L, ~350 GB for DeepSeek V4.1 · Maya-S, ~520 GB for unsloth's GGUF of it, ~95 GB for MiniMax M3.1 · Maya-XS, ~200 GB for MiniMax-M3.1-Flash's EXL3 quant) and its picture encoder (1.1 GB). Not a hard disk |
 | **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100 or Pascal), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
 
 The setup checks all of this, prints the exact command for anything missing, and installs nothing system-wide.
@@ -270,6 +283,7 @@ the folder. Off by default; the config sets them under the same `MAYA_DS4_*` nam
 | --- | --- | --- |
 | `STRATA_DS4_SLOT_KEEP` | off | `1`: conversations are set aside when another one takes the model, and kept across runs in the folder; `0`: every switch reads its prompt from token 0, as before |
 | `STRATA_DS4_SLOT_CAP` | 4 | conversations kept in RAM (tens to hundreds of MB each); past it the least recently used is written to the folder and read back from there; `0` = none |
+| `STRATA_DS4_SLOT_RAM_GB` | 0 | optional steady-state RAM byte budget for parked conversations (GB); the incoming state is serialized before eviction, so its allocation can temporarily exceed the cap, then the least recently used spills to the folder; one RAM conversation is kept even when it alone is over the cap; `0` = count-limited only |
 | `STRATA_DS4_SLOT_GB` | 16 | the folder's total size (GB, its `.bin` files): past it the folder's least recently used conversation is removed - never the one just written, so a conversation bigger than the cap stays |
 | `STRATA_DS4_SLOT_DIR` | `<pack>/slots` | the folder: a conversation is a `.bin` (its state) and a `.meta` (this model's identity, its tokens and its size) |
 | `STRATA_DS4_SLOT_MIN` | 1024 | the shortest conversation set aside (tokens): a shorter one is read again in about the time its slot would take |

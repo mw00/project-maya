@@ -47,6 +47,7 @@ public:
     }
     size_t capacity() const { return cap_; }
     size_t size() const { return keys_.size(); }
+    size_t row_bytes() const { return bytes_; }
     /// The row's payload, or nullptr (a hit marks it recently used).
     const uint8_t* find(uint64_t key) {
         const auto it = map_.find(key);

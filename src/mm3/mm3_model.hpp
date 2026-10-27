@@ -25,6 +25,13 @@ struct Options {
     std::vector<int> layer_split; // the first layer of each GPU's share after the first (empty: by their free memory)
     int max_ctx = 32768;
     int chunk = 1024;             // prompt tokens a forward takes at most
+    bool chunk_given = false;     // (--chunk: chosen - the prefill calibration's chunk is not taken)
+    // the prompt path's dense GEMMs (mm3_gguf.cuh's set_gemm): -1 the prefill calibration's for this PC (else the
+    // BLAS), 0 the BLAS, 1 hipBLASLt (AMD); and the calibration's cache (prefill_tune: its file - empty: the pack's
+    // prefill-tune.txt; tune: read it at all)
+    int prefill_gemm = -1;
+    std::string prefill_tune;
+    bool tune = true;
     int staging = 48;             // expert staging slots a GPU (each one expert's blob)
     double reserve_gb = -1;       // VRAM a GPU keeps free beyond the plan (< 0: 1.0, the tensor-parallel path 0.3 -
                                   // it allocates all it needs at the load)
@@ -127,6 +134,19 @@ public:
     std::vector<std::string> info_lines() const;
     /// The Monitor's map of each GPU (serve/gpu_map.py's VRAM lines): what each part holds there, measured at the load.
     std::vector<std::string> vram_lines() const;
+    /// The prefill calibration (maya-mm3 --calibrate-prefill): the prompt chunk a forward takes (at most the chunk the
+    /// load sized its buffers for: chunk_max) and the prompt path's GEMM backend, changed between forwards.
+    int chunk() const;
+    int chunk_max() const;
+    void set_chunk(int c);
+    void set_prefill_gemm(int backend);
+    int prefill_gemm() const;
+    bool lt_available() const;
+    /// The calibration's key of this PC (its GPUs, their architecture, the GPU runtime and driver) and the file its
+    /// results are kept in (one line a PC; the load takes the line of its own PC); write_tune keeps `settings` for it.
+    std::string tune_key() const;
+    std::string tune_file() const;
+    bool write_tune(const std::string& settings, std::string& err) const;
     /// The routings counted so far (with the loaded profile's, if any) as a profile file.
     bool save_profile(const std::string& path, std::string& err) const;
     /// The DSpark draft (Options::dspark): its block (the most tokens a proposal has; 0 without the draft), and up to

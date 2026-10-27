@@ -31,7 +31,7 @@ function ModelMenu({open, close, anchor}) {
   const go = (s) => () => { close(); openSettings(s); };
   return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Model" align="left" cls="model-menu" width=${340}>
     <div class="model-menu__card"><${ModelLogo} model=${h.model} size=${36}/>
-      <span><b>${modelName(h.model)}</b><span>${h.model} · on this machine${h.version ? ` · v${h.version}` : ""}</span></span></div>
+      <span><b>${modelName(h.model)}</b><span>${h.model_label || h.model} · on this machine${h.version ? ` · v${h.version}` : ""}</span></span></div>
     <${MenuSep}/>
     ${c && isPhone() ? html`<div class="model-menu__meter"><${MeterRing} c=${c}/><span>${c.why}: ${c.approx ? "≈" : ""}${fmt(c.tokens)} of ${fmt(c.max)} tokens</span></div>` : null}
     <button type="button" role="menuitem" class="menu__item" onClick=${go("model")}><span class="menu__label">Context size</span>

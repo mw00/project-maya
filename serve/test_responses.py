@@ -188,6 +188,7 @@ class Responses(ResponseCase):
         status, out = self.post(max_output_tokens=8192)
         self.assertEqual(status, 400)
         self.assertIn("exceeds the context", out["error"]["message"])
+        self.assertEqual(out["error"]["code"], "context_length_exceeded")   # (#432)
 
     def test_named_tool_choice_and_shared_defaults(self):
         self.script('<parameter=key>alpha</parameter>\n</function>\n</tool_call>')

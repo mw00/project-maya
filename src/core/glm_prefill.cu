@@ -378,7 +378,7 @@ void blas_ck(cublasStatus_t st, const char* what) {
 }
 
 // EXL3 experts (MMQ does not read their trellis), each by its row count: a lightly routed one through the tensor-core
-// kernels (sm_80+; they decode the trellis once a 32-row block - cheaper than reconstructing 50 MB of FP16 for a few
+// kernels (sm_80+, and sm_7x's wmma ones - exl3::prompt_tc; they decode the trellis once a 32-row block - cheaper than reconstructing 50 MB of FP16 for a few
 // rows), the rest reconstructed to FP16 and multiplied by cuBLAS (the decode once, the GEMM at the tensor cores' FP16
 // rate).  Both write the window's OUTP rows; w16 is their scratch.  The lane is one GPU's: the working part's prompt
 // path, and the waiting part computing its share of that part's experts (STRATA_GLM_PREFILL_CALC).
@@ -531,7 +531,7 @@ void x3_run_set(const X3Lane& L, const uint8_t* wbase, int n_exp, size_t stride,
         return r;
     }();
     const int mma_rows = strata::core::mma_rows_for(L.T, mma_base, mma_short);
-    const bool use_mma = mma_rows > 0 && strata::kernels::exl3::mma_supported();
+    const bool use_mma = mma_rows > 0 && strata::kernels::exl3::prompt_tc();
     for (int i = 0; i < n_exp;) {
         const int rows = hb[i + 1] - hb[i];
         if (use_mma && rows <= mma_rows) {

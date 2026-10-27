@@ -193,6 +193,46 @@ def geometry(kv: dict, vocab: int) -> dict:
     return out
 
 
+# DeepSeek-V4.1-Flash's own DSpark geometry (its checkpoint's config.json - the drafter drafter_pack.py builds is that
+# checkpoint's), for a GGUF of it that leaves the keys out: ISTA's GSQ-RCO carries only the target layers (#500), and a
+# drafter packed with block size 0 loads, VRAM and all, and never drafts.  The trunk it is for, as the GGUF gives it.
+DSPARK_KEYS = ("dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank", "dspark_n_routed_experts",
+               "dspark_num_experts_per_tok", "dspark_target_layer_ids")
+DSPARK_V41_FLASH = {"dspark_block_size": 5, "dspark_noise_token_id": 128799, "dspark_markov_rank": 256,
+                    "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3,
+                    "dspark_target_layer_ids": [37, 38, 39]}
+V41_FLASH_TRUNK = {"hidden_size": 5120, "num_hidden_layers": 40, "n_routed_experts": 384}
+
+
+def drafter_experts(info: dict):
+    """The routed experts of the drafter's first block (its .json's tensor names), or None when it names none."""
+    ids = [int(m.group(1)) for m in (re.match(r"mtp\.0\.ffn\.experts\.(\d+)\.", t[0]) for t in info.get("tensors", []))
+           if m]
+    return max(ids) + 1 if ids else None
+
+
+def dspark_fill(geo: dict, info: dict, vocab: int):
+    """The DSpark keys geo (the GGUF's) lacks or has as 0, for the drafter `info` (its .json): from that .json's own
+    "config" (drafter_pack.py writes the checkpoint's when its config.json is beside the shards), else
+    DeepSeek-V4.1-Flash's when the trunk and the drafter are that model's.  (values, where from), or (None, the keys
+    missing) when nothing gives them - the drafter would never draft."""
+    missing = [k for k in DSPARK_KEYS if not geo.get(k)]
+    if not missing:
+        return {}, None
+    own = info.get("config") or {}
+    fill = {k: own[k] for k in missing if own.get(k)}
+    src = "the drafter's .json" if fill else ""
+    rest = [k for k in missing if k not in fill]
+    flash = all(geo.get(k) == v for k, v in V41_FLASH_TRUNK.items()) and vocab > DSPARK_V41_FLASH["dspark_noise_token_id"]
+    if rest and flash and drafter_experts(info) in (None, DSPARK_V41_FLASH["dspark_n_routed_experts"]):
+        fill.update({k: DSPARK_V41_FLASH[k] for k in rest})
+        src += (" and " if src else "") + "DeepSeek-V4.1-Flash's own values"
+        rest = []
+    if rest:
+        return None, rest
+    return fill, src
+
+
 def ple_to_engram(kv: dict):
     """llama.cpp's own names for the Engram metadata (unsloth's GGUFs from 2026-10-19 on: ple.*, the hash heads' offsets
     counted across the layers' tables) -> the engram.* keys this pack reads (each layer's offsets from its own table)."""
@@ -501,10 +541,25 @@ def main() -> int:
     if a.drafter and not drafter.is_file():
         raise SystemExit("%s: no drafter there" % drafter)
     drafter_in = drafter.is_file() and drafter.with_suffix(".bin").is_file()
+    vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
+    geo = geometry(kv, vocab)
+    dinfo = json.loads(drafter.read_text()) if drafter_in else {}
+    if drafter_in:   # (its geometry: the GGUF's, else filled in - a drafter without it never drafts: left out, said so)
+        fill, src = dspark_fill(geo, dinfo, vocab)
+        if fill is None:
+            print("WARNING: the DSpark drafter %s is left out of the pack: the GGUF has no %s for it (and this is not "
+                  "DeepSeek-V4.1-Flash's trunk, whose own values the pack would take) - with them 0 the engine would "
+                  "load the drafter and never draft.  Drafting stays off; a GGUF with the dspark.* metadata drafts"
+                  % (drafter, ", ".join(src)), file=sys.stderr)
+            drafter_in = False
+        elif fill:
+            geo.update(fill)
+            print("DSpark geometry not in the GGUF, taken from %s: %s" %
+                  (src, ", ".join("%s %s" % (k, fill[k]) for k in DSPARK_KEYS if k in fill)))
     if drafter_in:
         files.append(rel(drafter.with_suffix(".bin")))
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
-        for name, dt, off, nb, shape in json.loads(drafter.read_text())["tensors"]:
+        for name, dt, off, nb, shape in dinfo["tensors"]:
             if name.endswith(".attn.wo_a.weight"):   # (one entry a group, as the trunk's)
                 for i in range(groups):
                     tensors.append(("%s.slice.%d.weight" % (name[:-len(".weight")], i), dt, len(files) - 1,
@@ -527,8 +582,6 @@ def main() -> int:
         for name, dt, off, nb, shape in info["tensors"]:
             tensors.append((name, dt, len(files) - 1, off, nb, shape))
         vision = info["config"]
-    vocab = next(t[5][0] for t in tensors if t[0] == "embed.weight")
-    geo = geometry(kv, vocab)
 
     out.mkdir(parents=True, exist_ok=True)
     with (out / "ds4.txt").open("w") as f:

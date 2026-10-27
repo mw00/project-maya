@@ -32,7 +32,7 @@ def fail(msg, hint=None):
 
 
 class Gate(unittest.TestCase):
-    """As DeepSeek's EXL3: NVIDIA only (AMD refused with a clear message); Windows and V100 once the engine runs there
+    """NVIDIA, and AMD as GLM's EXL3 quants there (experimental, said); Windows and V100 once the engine runs there
     (MM3_ALL_PLATFORMS, one switch)."""
 
     def check(self, backend="cuda", win=False, everyone=False, gpus=None):
@@ -42,10 +42,55 @@ class Gate(unittest.TestCase):
                 patch.object(maya, "warn", lambda *a: None), patch.object(maya.S, "is_wsl", return_value=False):
             maya.check_pc(args(backend=backend), "minimax")
 
-    def test_amd_refused(self):
-        for everyone in (False, True):
-            with self.assertRaisesRegex(Failed, "NVIDIA GPUs only"):
-                self.check(backend="hip", everyone=everyone)
+    def test_amd_experimental(self):
+        """AMD: the EXL3 quant goes on to the AMD PC check with an experimental warning (as GLM's EXL3 there), the
+        GGUFs without one; neither is refused, and MiniMax's HIP check does not say "text only"."""
+        for gguf in (False, True):
+            said, hip = [], []
+            with patch.object(maya, "fail", fail), patch.object(maya, "step", lambda *a: None), \
+                    patch.object(maya, "warn", said.append), \
+                    patch.object(maya, "check_hip_pc", lambda a, **kw: hip.append(kw) or {"backend": "hip"}):
+                self.assertEqual(maya.check_pc(args(backend="hip"), "minimax", gguf=gguf), {"backend": "hip"})
+            self.assertEqual(hip, [{"text_only": False}])
+            self.assertEqual(len(said), 0 if gguf else 1)
+            if not gguf:
+                self.assertIn("experimental", said[0])
+
+    def test_amd_quants_offered(self):
+        """AMD is offered the EXL3 quant and the published GGUFs, as NVIDIA is (the EXL3 one marked experimental)."""
+        seen = {}
+
+        def choose(title, intro, rows, default, auto):
+            seen["rows"] = rows
+            return default
+
+        for backend, amd in (("hip", True), ("cuda", False)):
+            with patch.object(maya, "mm3_gguf_published", return_value=True), patch.object(maya, "choose", choose), \
+                    patch.object(maya, "mem_gb", return_value=(64.0, 60.0)), \
+                    patch.object(maya.S, "gpus", return_value=[{"vram_gb": 32.0}]), \
+                    patch.object(maya.S, "amd_gpus", return_value=[{"vram_gb": 96.0}]), \
+                    patch.object(maya, "mm3_models", return_value=({"download_gb": 197.0}, {})):
+                maya.choose_mm3_quant(args(backend=backend, mm3_quant=None), {})
+            kind = lambda t: "EXL3" if "EXL3" in t else "Maya-XS" if "Maya-XS" in t else "Maya-S" if "Maya-S" in t else t  # noqa: E731
+            labels = {kind(r[0]): r for r in seen["rows"]}
+            self.assertEqual(sorted(labels), ["EXL3", "Maya-S", "Maya-XS"])
+            self.assertTrue(all(r[0].startswith("MiniMax M3.1") for r in seen["rows"]))   # (the model's name first)
+            self.assertEqual("experimental on AMD" in labels["EXL3"][2], amd)
+            self.assertTrue(all("text only" not in r[2] for r in seen["rows"]))
+            # (the recommendation counts the GPUs' memory: 64 + 96 GB on AMD holds Maya-S, 64 + 32 GB Maya-XS)
+            rec = [r[0] for r in seen["rows"] if r[1] == "recommended"]
+            want = "MiniMax M3.1 · Maya-S (122 GB)" if amd else "MiniMax M3.1 · Maya-XS (93 GB)"
+            self.assertEqual(rec, [want])
+
+    def test_amd_companions(self):
+        """A GGUF's pictures and drafting on AMD: the EXL3 repo's files, as on NVIDIA (no AMD-only text-only stop)."""
+        d = Path(tempfile.mkdtemp()) / "MiniMax-M3.1-Flash-Maya-XS"
+        exl3 = d.parent / maya.MM3_DIR
+        (exl3 / "dspark").mkdir(parents=True)
+        for n in maya.MM3_VISION_FILES + ("dspark/config.json",):
+            (exl3 / n).write_text("{}")
+        with patch.object(maya, "ok", lambda *a: None):
+            self.assertEqual(maya.mm3_companions_step(args(backend="hip"), d, True), exl3)
 
     def test_windows_waits_for_the_switch(self):
         with self.assertRaisesRegex(Failed, "Linux only for now"):
@@ -148,6 +193,18 @@ class Config(unittest.TestCase):
         self.assertEqual(a[a.index("--vision") + 1], "off")
         self.assertEqual((c["reasoning_effort"], c["sampling"], c["host"]), ("high", {"temperature": 0.7}, "0.0.0.0"))
 
+    def test_tp_follows_the_gpus_chosen_now(self):
+        """#436 (DeepSeek's, the same rule here): the config before's --tp only for the same GPUs"""
+        nine = {"args": ["--pack", "/old", "--max-context", "65536", "--tp", "4"], "gpu": list(range(9))}
+        a = self.write(args(), nine, gpus=9)["args"]
+        self.assertEqual(a[a.index("--tp") + 1], "4")                      # (the same GPUs: kept)
+        a = self.write(args(), nine, gpus=1)["args"]
+        self.assertNotIn("--tp", a)                                        # (one GPU: no tensor parallel)
+        a = self.write(args(), nine, gpus=5)["args"]
+        self.assertEqual(a[a.index("--tp") + 1], "4")                      # (5 GPUs: 1 + a group of 4, worked out)
+        a = self.write(args(), {"args": ["--tp", "4"], "gpu": [0, 1, 2, 3, 4]}, gpus=3)["args"]
+        self.assertEqual(a[a.index("--tp") + 1], "2")                      # (3 GPUs: 1 + a group of 2)
+
     def test_dspark_measured_as_deepseeks(self):
         """The DSpark drafter: off in the config until this PC's speed calibration (DeepSeek's tool) says it pays."""
         import calibrate_ds4 as CDS
@@ -164,6 +221,123 @@ class Config(unittest.TestCase):
         """A change to Maya's MiniMax template rebuilds the pack (its tokenizer folder carries the template)."""
         self.assertIn("tools/mm3/chat_template.jinja", maya.MM3_PACK_TOOLS)
         self.assertTrue((Path(maya.__file__).parent / "tools" / "mm3" / "chat_template.jinja").exists())
+
+    def test_gguf(self):
+        """A GGUF quant's config: no pictures, no DSpark, no tensor parallel - kept from an EXL3 config before neither -,
+        the quant in the installer record."""
+        (self.pack / "mm3.txt").write_text("hidden_size 6144\nmax_position_embeddings 1048576\nformat gguf\n")
+        old = {"args": ["--pack", "/old", "--max-context", "65536", "--vision", "on", "--tp", "2", "--dspark", "on",
+                        "--kv-cache", "int8"]}
+        (self.root / "maya-mm3.json").write_text(json.dumps(old))
+        pc = {"gpus": [{"index": i} for i in range(3)]}
+        p = maya.write_config_mm3(args(), pc, {"lib_dirs": []}, self.pack, 131072, Path("/models"), self.pack.parent,
+                                  "gguf-xs")
+        c = json.loads(p.read_text())
+        for k in ("--vision", "--tp", "--dspark"):
+            self.assertNotIn(k, c["args"])
+        self.assertEqual(c["args"][c["args"].index("--kv-cache") + 1], "int8")
+        self.assertEqual((c["installer"]["mm3_quant"], c["installer"]["quant"]), ("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"))
+        self.assertEqual(p.name, "maya-minimax-maya-xs.json")                # (the naming scheme's config)
+        # a GGUF pack with the companions' vision tower and draft: pictures on, the draft off until measured
+        (self.pack / "mm3.txt").write_text("format gguf\nvision.hidden_size 1280\ndspark.num_hidden_layers 5\n")
+        (self.root / "maya-mm3.json").unlink()
+        p = maya.write_config_mm3(args(), pc, {"lib_dirs": []}, self.pack, 131072, Path("/models"), self.pack.parent,
+                                  "gguf-s")
+        a = json.loads(p.read_text())["args"]
+        self.assertEqual((a[a.index("--vision") + 1], a[a.index("--dspark") + 1]), ("on", "off"))
+        self.assertNotIn("--tp", a)
+
+
+class Gguf(unittest.TestCase):
+    """Maya's GGUF quants of MiniMax: the manifest (unpublished: no revision, no sha256), the choice, AMD allowed for
+    them (and the EXL3 quant, experimental), the folder and the pack's tool."""
+
+    def test_manifest(self):
+        for q, name in (("gguf-xs", "MiniMax-M3.1-Flash-Maya-XS"), ("gguf-s", "MiniMax-M3.1-Flash-Maya-S")):
+            m = maya.mm3_gguf_entry(q)
+            self.assertEqual(m["folder"], name[len("MiniMax-M3.1-Flash-"):])     # (the repo's Maya-XS/, Maya-S/)
+            self.assertTrue(any(n.endswith("-maya-indexers.gguf") for n in m["files"]))
+            self.assertTrue(all(n.startswith(name) for n in m["files"]))
+            self.assertGreater(m["memory_gb"], m["download_gb"])
+            self.assertTrue(maya.mm3_gguf_published(q))               # (uploaded: the revision and every sha256)
+        self.assertEqual(maya.mm3_memory_gb("exl3"), maya.MM3_MEMORY_GB)
+
+    def test_choice(self):
+        with patch.object(maya, "fail", fail):
+            self.assertEqual(maya.choose_mm3_quant(args(mm3_quant="gguf-s"), {}), "gguf-s")
+            # the one recommended by the PC's VRAM + RAM: the EXL3 quant where it fits (250 GB), else the biggest GGUF
+            # that fits, else the smallest
+            for ram, vram, want in ((256, 96, "exl3"), (128, 32, "gguf-s"), (96, 24, "gguf-xs"), (32, 8, "gguf-xs")):
+                with patch.object(maya, "mem_gb", return_value=(float(ram), float(ram))), \
+                        patch.object(maya.S, "gpus", return_value=[{"vram_gb": float(vram)}]):
+                    self.assertEqual(maya.choose_mm3_quant(args(mm3_quant=None), {}), want, (ram, vram))
+            with patch.object(maya.S, "amd_gpus", return_value=[]), \
+                    patch.object(maya, "mem_gb", return_value=(128.0, 128.0)):   # (AMD too: a 128 GB Strix Halo)
+                self.assertEqual(maya.choose_mm3_quant(args(mm3_quant=None, backend="hip"), {}), "gguf-xs")
+
+    def test_amd_allowed_for_gguf(self):
+        with patch.object(maya, "fail", fail), patch.object(maya, "step", lambda *a: None), \
+                patch.object(maya, "check_hip_pc", return_value={"gpus": []}) as hip:
+            self.assertEqual(maya.check_pc(args(backend="hip"), "minimax", gguf=True), {"gpus": []})
+            hip.assert_called_once()
+            with patch.object(maya, "warn", lambda *a: None):   # (the EXL3 quant: experimental on AMD, not refused)
+                self.assertEqual(maya.check_pc(args(backend="hip"), "minimax"), {"gpus": []})
+
+    def test_folder_and_tools(self):
+        self.assertEqual(maya.mm3_dir(args(), Path("/m"), {}, "gguf-xs"), Path("/m/MiniMax-M3.1-Flash-Maya-XS"))
+        self.assertEqual(maya.mm3_dir(args(), Path("/m"), {}), Path("/m") / maya.MM3_DIR)
+        for t in maya.MM3_GGUF_PACK_TOOLS:
+            self.assertTrue((Path(maya.__file__).parent / t).exists(), t)
+
+    def test_companions(self):
+        """Pictures and drafting for a GGUF, on NVIDIA and AMD alike: a whole EXL3 download beside it as it is; else the
+        EXL3 repo's vision tower and draft in the companions folder (downloaded when not there - here already whole)."""
+        quiet = [patch.object(maya, k, lambda *a, **kw: None) for k in ("ok", "warn", "say", "step")]
+        for p in quiet:
+            p.start()
+        try:
+            with tempfile.TemporaryDirectory() as t:
+                models = Path(t)
+                d = models / "MiniMax-M3.1-Flash-Maya-XS"
+                m, dm = maya.mm3_models()
+                small = dict(m, files={n: 10 for n in maya.MM3_VISION_FILES}, sha256={n: "" for n in maya.MM3_VISION_FILES})
+                small_d = dict(dm, files={n: 10 for n in dm["files"]}, sha256={n: "" for n in dm["files"]})
+                c = models / maya.MM3_COMPANIONS
+                (c / "dspark").mkdir(parents=True)
+                for n in maya.MM3_VISION_FILES:
+                    (c / n).write_bytes(b"x" * 10)
+                for n in dm["files"]:
+                    (c / "dspark" / n).write_bytes(b"x" * 10)
+                with patch.object(maya, "mm3_models", return_value=(small, small_d)), \
+                        patch.object(maya, "offer_download", side_effect=AssertionError("nothing to download")):
+                    for hip in (False, True):
+                        self.assertEqual(maya.mm3_companions_step(args(), d, hip), c)
+                exl3 = models / maya.MM3_DIR
+                (exl3 / "dspark").mkdir(parents=True)
+                for n in maya.MM3_VISION_FILES:
+                    (exl3 / n).write_text("x")
+                (exl3 / "dspark" / "config.json").write_text("{}")
+                self.assertEqual(maya.mm3_companions_step(args(), d, False), exl3)
+        finally:
+            for p in quiet:
+                p.stop()
+
+    def test_unpublished_needs_the_files(self):
+        """Before it is published, a GGUF quant is set up only from files already there (--model-dir), by their sizes."""
+        m = maya.mm3_gguf_entry("gguf-xs")
+        m["files"] = {n: 1000 + i for i, n in enumerate(m["files"])}   # (small stand-ins for the real sizes)
+        m["revision"], m["sha256"] = "", {n: "" for n in m["files"]}   # (as before its upload)
+        with tempfile.TemporaryDirectory() as d, patch.object(maya, "fail", fail), \
+                patch.object(maya, "step", lambda *a: None), patch.object(maya, "warn", lambda *a: None), \
+                patch.object(maya, "ok", lambda *a: None), patch.object(maya, "rotational", return_value=False), \
+                patch.object(maya, "mm3_gguf_entry", return_value=m):
+            d = Path(d)
+            with self.assertRaisesRegex(Failed, "not published yet"):
+                maya.mm3_gguf_model_step(args(), d, "gguf-xs")
+            for n, size in m["files"].items():
+                with (d / n).open("wb") as f:
+                    f.truncate(size)
+            self.assertEqual(len(maya.mm3_gguf_model_step(args(), d, "gguf-xs")), 3)
 
 
 if __name__ == "__main__":

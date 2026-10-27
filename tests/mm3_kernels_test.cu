@@ -179,6 +179,38 @@ int main() {
              a8r = host(o8r, a1.size());
         auto qn = host(d_q, q.size());
         auto kb = host(kc, (size_t) ctx * 128), vb = host(vc, (size_t) ctx * 128);
+        {   // the wide kernel (T <= 16: a decode token's or window's queries) against the 128-thread one (T 17), bit
+            // for bit: the same 8 queries first among 17, BF16 / INT8 / INT8 rotated, one block and split 16
+            const int T2 = 17;
+            std::vector<int> pos2(pos), kept2(kept);
+            std::vector<float> q2(qn);
+            for (int t = T; t < T2; ++t) {
+                pos2.push_back(pos[(size_t) (t % T)]);
+                for (int i = 0; i < topk; ++i) kept2.push_back(kept[(size_t) (t % T) * topk + i]);
+                q2.insert(q2.end(), qn.begin() + (size_t) (t % T) * Hq * 128, qn.begin() + (size_t) (t % T + 1) * Hq * 128);
+            }
+            int *d_pos2 = dev(pos2), *d_kept2 = dev(kept2);
+            float* d_q2 = dev(q2);
+            float *w = nullptr, *n2 = nullptr, *part2 = nullptr;
+            cudaMalloc(&w, (size_t) T * Hq * 128 * 4);
+            cudaMalloc(&n2, (size_t) T2 * Hq * 128 * 4);
+            cudaMalloc(&part2, k::attn_part_floats(T2, Hkv, 16) * 4);
+            bool same = true;
+            const k::KvQ none{};
+            for (const k::KvQ* c : {&none, (const k::KvQ*) &i8, (const k::KvQ*) &i8r})
+                for (int sp : {1, 16}) {
+                    k::sparse_attn(d_q2, kc, vc, d_kept2, d_pos2, T, Hq, Hkv, topk, blk, scale, w, 0, *c, k::KvHost{}, sp,
+                                   part2);
+                    k::sparse_attn(d_q2, kc, vc, d_kept2, d_pos2, T2, Hq, Hkv, topk, blk, scale, n2, 0, *c, k::KvHost{},
+                                   sp, part2);
+                    cudaDeviceSynchronize();
+                    const auto hw = host(w, (size_t) T * Hq * 128), hn = host(n2, (size_t) T * Hq * 128);
+                    same = same && std::memcmp(hw.data(), hn.data(), hw.size() * 4) == 0;
+                }
+            check(same, "the wide kernel (a token's few queries): the 128-thread kernel's bits");
+            for (void* x : {(void*) d_pos2, (void*) d_kept2, (void*) d_q2, (void*) w, (void*) n2, (void*) part2})
+                cudaFree(x);
+        }
         // the F64 reference over the BF16 caches
         double e1 = 0, e16 = 0, e8 = 0, e8r = 0, mag = 0;
         for (int t = 0; t < T; ++t)
@@ -336,6 +368,103 @@ int main() {
             if (tok != want) ok = false;
         }
         check(ok, "q the host's distribution (top_k, top_p, temperature), the draw its inverse CDF at u");
+    }
+    // ---- the host-free decode's plan on the device vs the host's (mm3_model.cu's layer_token / layer_window)
+    std::printf("plan_dev (the routed experts' plan and a window's grouping)\n");
+    {
+        const int E = 128;
+        bool ok = true;
+        std::uniform_int_distribution<int> pick(0, E - 1), few(0, 11);
+        std::uniform_real_distribution<float> uw(0.01f, 1.0f);
+        std::vector<unsigned long long> tab((size_t) E);
+        for (int e = 0; e < E; ++e) tab[(size_t) e] = 0x7f0000000000ull + (unsigned long long) ((e * 37) % E) * 0x2a00000ull;
+        unsigned long long* d_tab = dev(tab);
+        for (int K : {4, 8})
+            for (int T : {1, 2, 5, 16}) {
+                // each token's K distinct picks, from a few experts often (a window's tokens share them)
+                std::vector<int> top((size_t) T * K);
+                std::vector<float> w((size_t) T * K);
+                for (int t = 0; t < T; ++t)
+                    for (int i = 0; i < K; ++i) {
+                        int x;
+                        bool dup;
+                        do {
+                            x = t % 2 ? pick(rng) : few(rng);
+                            dup = false;
+                            for (int j = 0; j < i; ++j) dup |= top[(size_t) t * K + j] == x;
+                        } while (dup);
+                        top[(size_t) t * K + i] = x;
+                        w[(size_t) t * K + i] = uw(rng);
+                    }
+                const float scale = 2.0f;
+                // the host's plan and grouping, as layer_window builds them
+                std::vector<unsigned long long> pp((size_t) T * 8), gp;
+                std::vector<float> pw((size_t) T * 8);
+                std::vector<std::vector<int>> ent;
+                std::vector<unsigned> cnt((size_t) E, 0);
+                for (int t = 0; t < T; ++t)
+                    for (int i = 0; i < 8; ++i) {
+                        const int e = t * 8 + i;
+                        pp[(size_t) e] = 0;
+                        pw[(size_t) e] = 0.0f;
+                        if (i >= K) continue;
+                        const int x = top[(size_t) t * K + i];
+                        pw[(size_t) e] = w[(size_t) t * K + i] * scale;
+                        pp[(size_t) e] = tab[(size_t) x];
+                        ++cnt[(size_t) x];
+                        size_t gi = 0;
+                        while (gi < gp.size() && gp[gi] != pp[(size_t) e]) ++gi;
+                        if (gi == gp.size()) {
+                            gp.push_back(pp[(size_t) e]);
+                            ent.emplace_back();
+                        }
+                        ent[gi].push_back(e);
+                    }
+                std::vector<int> gs, ge;
+                for (const auto& v : ent) {
+                    gs.push_back((int) ge.size());
+                    ge.insert(ge.end(), v.begin(), v.end());
+                }
+                gs.push_back((int) ge.size());
+                // the device's
+                int *d_top = dev(top), *d_gs = nullptr, *d_ge = nullptr, *d_ng = nullptr;
+                float *d_w = dev(w), *d_pw = nullptr;
+                unsigned long long *d_pp = nullptr, *d_gp = nullptr;
+                unsigned* d_cnt = nullptr;
+                cudaMalloc(&d_pp, 128 * 8);
+                cudaMalloc(&d_pw, 128 * 4);
+                cudaMalloc(&d_gp, 128 * 8);
+                cudaMalloc(&d_gs, 129 * 4);
+                cudaMalloc(&d_ge, 128 * 4);
+                cudaMalloc(&d_ng, 4);
+                cudaMalloc(&d_cnt, (size_t) E * 4);
+                cudaMemset(d_cnt, 0, (size_t) E * 4);
+                ok &= k::plan_dev(d_top, d_w, T, K, d_tab, scale, d_pp, d_pw, d_cnt, d_gp, d_gs, d_ge, d_ng, 0);
+                cudaDeviceSynchronize();
+                const auto hpp = host(d_pp, (size_t) T * 8);
+                const auto hpw = host(d_pw, (size_t) T * 8);
+                const auto hng = host(d_ng, 1);
+                const auto hcnt = host(d_cnt, (size_t) E);
+                ok &= hpp == pp && std::memcmp(hpw.data(), pw.data(), pw.size() * 4) == 0 && hcnt == cnt;
+                ok &= hng[0] == (int) gp.size();
+                if (hng[0] == (int) gp.size()) {
+                    ok &= host(d_gp, gp.size()) == gp;
+                    ok &= host(d_gs, gs.size()) == gs;
+                    ok &= host(d_ge, ge.size()) == ge;
+                }
+                // the token path's form: no grouping, no counts
+                ok &= k::plan_dev(d_top, d_w, T, K, d_tab, scale, d_pp, d_pw, nullptr, nullptr, nullptr, nullptr,
+                                  nullptr, 0);
+                cudaDeviceSynchronize();
+                ok &= host(d_pp, (size_t) T * 8) == pp;
+                for (void* p : {(void*) d_top, (void*) d_w, (void*) d_pw, (void*) d_pp, (void*) d_gp, (void*) d_gs,
+                                (void*) d_ge, (void*) d_ng, (void*) d_cnt})
+                    cudaFree(p);
+            }
+        ok &= !k::plan_dev(nullptr, nullptr, 17, 8, d_tab, 1.0f, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                           nullptr, 0);   // (more than a window's entries: refused)
+        cudaFree(d_tab);
+        check(ok, "the host's plan, weights, profile counts and window grouping, value for value");
     }
     // ---- wait_pull
     std::printf("wait_pull\n");

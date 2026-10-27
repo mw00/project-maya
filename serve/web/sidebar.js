@@ -192,7 +192,8 @@ function SavedLine() {
 
 function StatusCard() {
   const st = status();
-  const name = modelName(S.health.model);
+  // the model with its files when the setup wrote the config ("MiniMax M3.1 · Maya-XS": the server's model_label)
+  const name = S.health.model_label || modelName(S.health.model);
   return html`<div class="side__foot">
     <${SavedLine}/>
     <button type="button" class="status-card" onClick=${() => showView("monitor")} aria-label=${`${name}, ${st.text}. Open the Monitor`}>

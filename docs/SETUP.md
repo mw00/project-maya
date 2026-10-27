@@ -12,11 +12,12 @@ It first asks which model to set up:
   (211 GB) or [at 3.5 bits](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) (258 GB, about
   280 GB of VRAM and RAM; `--ds4-quant exl3-3.5`, its own folder; a second quant hard-links the Engram tables from the
   first instead of downloading them) and its two Engram tables from [DeepSeek's repo](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-  (203 GB), on its own engine (`build/maya-ds4`): Linux, NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer). It is fast with about 230 GB
+  (203 GB), on its own engine (`build/maya-ds4`): Linux, NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer); AMD experimental. It is fast with about 230 GB
   of VRAM and RAM together; with less, the setup warns and the engine reads the experts that do not fit from the
   model's files on the SSD (`--mmap-experts auto`), much slower - one RTX 3090 with 64 GB of RAM: prompts about 50
   tokens/s, answers 4-5 tokens/s (faster with `--dspark none`). The same steps with these differences: the
-  contexts are 32K-1M (64K recommended; 512K and 1M take VRAM from the expert cache, and a prompt that long reads
+  contexts are 32K-1M (256K recommended where the PC's VRAM + RAM hold the model's files, else 64K; 512K and 1M
+  take VRAM from the expert cache, and a prompt that long reads
   slowly - the indexer's work grows with the square of its length); step 5 shows both
   sources and checks every file against its pinned size (and, once downloaded, its sha256: `tools/ds4/download.json`, `download-3.5bpw.json`);
   `--model-dir DIR` uses files you already have; the pack is `DIR/maya-ds4/` (`tools/ds4/pack.py`, about a minute);
@@ -40,7 +41,10 @@ It first asks which model to set up:
   99 tokens/s in windows, 1010 in chunks). The GGUFs have no DSpark drafter and no vision tower.
 - **MiniMax-M3.1-Flash** (experimental; `--model MiniMax-M3.1-Flash`) - [Mia-AiLab's EXL3 quant at 3.5 bits](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw)
   (197 GB with MiniMax's DSpark drafter; every file pinned and checked, `tools/mm3/download.json`) on its own engine
-  (`build/maya-mm3`): Linux, NVIDIA RTX 30 / A100 or newer; AMD is refused (EXL3 has no AMD port). About 250 GB of VRAM
+  (`build/maya-mm3`): NVIDIA from V100 on, Linux and Windows; AMD experimental (as GLM's EXL3 quants there: the
+  kernels pass their tests on AMD, the whole model has not run on one yet) - on AMD, Maya's GGUF quants
+  (`--model minimax-maya-xs` / `minimax-maya-s`: [SETTINGS.md](SETTINGS.md#minimax-m31-flash)) are the tested way.
+  About 250 GB of VRAM
   and RAM hold all of it; with less the setup warns. The same steps with these differences: the contexts are 32K-1M,
   the recommended one the largest (up to 256K) whose KV cache fits beside the model in this PC's VRAM + RAM, its RAM
   said, with warnings past 256K and when the cache would take the experts' RAM; the pack is `DIR/maya-mm3/`
@@ -54,7 +58,7 @@ GLM-5.3-Flash's first run takes 20-40 minutes plus the download:
 
 1. checks the PC (GPUs, driver, CUDA toolkit, compiler, RAM, CPU);
 2. asks which GPUs to use (all of them by default, up to 16), how much context (32K recommended), which model to
-   download: Maya-S (recommended; Maya-S24 on cards of 24 GB or less), Maya-M, Maya-M-Derisked or Maya-L, and how it
+   download: GLM-5.3 · Maya-S (recommended; Maya-S24 on cards of 24 GB or less), Maya-M, Maya-M-Derisked or Maya-L, and how it
    drafts: the model's MTP block (the default) or a [DFlash2 drafter](SETTINGS.md#drafting-with-dflash2) (NVIDIA RTX
    30 / A100 and newer);
 3. installs its Python packages into `.venv` and gets llama.cpp's source at a pinned commit (it lists both and asks);
@@ -99,19 +103,20 @@ is not downloaded again, and your settings stay. By hand: `git pull`, then `./se
 | `--gguf-dir DIR` | use GLM-5.3-Flash GGUF files you already have: their folder, or the `.gguf` file (the first one of a split model) when the folder holds several models. The folder must be writable: the pack goes inside it |
 | `--models-dir DIR` | where downloaded models go, each in a folder named after it - `DIR/Maya-L/` holds that model's GGUF files (default `../Maya-data/models`); put it on the NVMe |
 | `--download-model` | download the model without asking (the commands and size are still printed) |
-| `--model NAME` | which model, without asking: `DeepSeek-V4.1-Flash-1017`, `MiniMax-M3.1-Flash`, or a GLM-5.3-Flash download: `Maya-S-v2-IQ2_XXS` (Maya-S), `Maya-S24`, `Maya-M`, `Maya-M-Derisked`, `Maya-L`, or `EXL3-3.05bpw` / `EXL3-4.05bpw` - an experimental EXL3 quant at 3.05 or 4.05 bits per weight ([3.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw), 125.3 GB; [4.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw), 165.2 GB; both with the MTP block) that the engine reads in place from its safetensors: NVIDIA only, 3.05bpw tested on Linux, neither measured against the FP8 model |
+| `--model NAME` | which model and files, without asking. Maya's quants by their setup id - the model first, then the tier (XS, S, M, L by the experts' bits): `glm-maya-s`, `glm-maya-s24`, `glm-maya-m`, `glm-maya-m-derisked`, `glm-maya-l`, `deepseek-maya-xs`, `deepseek-maya-s`, `deepseek-maya-m`, `minimax-maya-xs`, `minimax-maya-s` (or the full name, e.g. `MiniMax-M3.1-Flash-Maya-XS`). Or a model, its files asked: `DeepSeek-V4.1-Flash-1017`, `MiniMax-M3.1-Flash`. The names used before still work: `Maya-S-v2-IQ2_XXS` (GLM-5.3 · Maya-S), `Maya-S24`, `Maya-M`, `Maya-M-Derisked`, `Maya-L`, and `EXL3-3.05bpw` / `EXL3-4.05bpw` / `EXL3-sc_4.10bpw` - an experimental EXL3 quant of GLM-5.3-Flash at 3.05 or 4.05 bits per weight, or the self-calibrated one at 4.10 with 8-bit attention and shared experts ([3.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw), 125.3 GB; [4.05bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw), 165.2 GB; [sc_4.10bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/sc_4.10bpw), 167.8 GB; all with the MTP block) that the engine reads in place from its safetensors: NVIDIA, and AMD (experimental); 3.05bpw tested on Linux, none measured against the FP8 model |
 | `--model-dir DIR` | use DeepSeek-V4.1-Flash-1017's files you already have: the folder with a GGUF's shards, or with the EXL3 quant's files and the Engram shards `model-00047-of-00048.safetensors` / `model-00048-of-00048.safetensors` of DeepSeek's repo (it must be writable: the pack goes inside it) |
-| `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `gguf-q8` (unsloth's UD-Q8_K_XL GGUF, the default), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits) or `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM); the EXL3 quants need NVIDIA RTX 30 / A100 or newer and are offered only there |
+| `--ds4-quant Q` | DeepSeek-V4.1-Flash-1017's files: `maya-s`, `maya-xs` (Maya's quants, the same as `--model deepseek-maya-s` / `deepseek-maya-xs`; Maya-S the default), `gguf-q8` (unsloth's UD-Q8_K_XL GGUF), `gguf-q4` (its UD-Q4_K_XL: dense weights Q8_0), `exl3` (LibertAIDAI's EXL3 quant at 2.9 bits) or `exl3-3.5` (its 3.5-bit quant: closer to the original, about 280 GB of VRAM and RAM); the EXL3 quants need NVIDIA V100 or newer (pictures: RTX 30 / A100 or newer) and are offered only there, and on AMD as experimental (as GLM's EXL3 quants there; [docs/EXL3_HIP.md](EXL3_HIP.md)) |
+| `--mm3-quant Q` | MiniMax-M3.1-Flash's files: `exl3` (Mia-AiLab's EXL3 quant at 3.5 bits, NVIDIA), `maya-xs` or `maya-s` (Maya's GGUF quants, the same as `--model minimax-maya-xs` / `minimax-maya-s`; `gguf-xs` / `gguf-s` before) |
 | `--no-vision` | text only: no image encoder (DeepSeek, MiniMax: their vision tower off) |
 | `--draft mtp` / `--draft dflash2` | how the model drafts tokens ahead: its MTP block (the default), or a DFlash2 drafter - downloaded (0.7 GB) into `DIR/GLM-5.3-Flash-DFlash2/` and passed as `--dflash` (Maya-L: +44% on nine GPUs, +12% on two, +19% on one GPU; NVIDIA RTX 30 / A100 and newer - older cards keep the MTP block unless you pass this; the drafter's license is CC BY-NC-ND 4.0, non-commercial use only). The [speed calibration](SETTINGS.md#the-speed-calibration) then keeps it only if it is faster on your PC |
 | `--gpu N` / `--gpus 0,1,2,3` | one GPU, or several (up to 16) that split the model's layers |
-| `--context N` | context length in tokens: 8192, 32768 (default), 65536, 131072; DeepSeek: 32768, 65536 (default), 131072, 262144, 524288, 1048576; MiniMax: the same, the default by this PC's memory |
+| `--context N` | context length in tokens: 8192, 32768 (default), 65536, 131072; DeepSeek: 32768, 65536, 131072, 262144, 524288, 1048576 (the default 262144 where VRAM + RAM hold the model, else 65536); MiniMax: the same, the default by this PC's memory |
 | `--vram-reserve-mib N` | VRAM in MiB the expert pool leaves free on each GPU (default 700), kept in the config - more where the desktop or other programs on the GPU need room ([the expert pool's size](SETTINGS.md#the-expert-pools-size)) |
 | `--port N`, `--host 0.0.0.0 --api-key KEY` | another port; reachable from your network (always set a key; several: `KEY1,KEY2`) |
 | `--env KEY=VALUE` | an engine setting kept in the config (see [Tuning](SETTINGS.md)) |
 | `--host-compiler g++-12` | when your g++ is newer than your CUDA accepts ("unsupported GNU version") |
 | `--rebuild`, `--repack` | compile the engine / build the pack again |
-| `--calibrate` | tune the engine's CPU lane for this PC (see [Tuning](SETTINGS.md)), then start; with `--no-start` only tune |
+| `--calibrate` | tune the engine for this PC (see [Tuning](SETTINGS.md)): GLM's CPU lane, DeepSeek's `--tp` and CPU threads, MiniMax's [prefill calibration](SETTINGS.md#minimax-m31-flash) (the chunk and the matrix products' library a prompt is read with); then start; with `--no-start` only tune |
 | `--speed-calibration` | measure again whether the drafter (DFlash2, or DeepSeek's or MiniMax's DSpark) decodes faster on this PC ([how](SETTINGS.md#the-speed-calibration); 5-30 minutes, with Maya stopped) and keep the faster, then start; with `--no-start` only measure |
 | `--drafting measure\|on\|off` | the drafter without the question: `measure` = the speed calibration (the default with `--yes`), `on` = draft with it, `off` = no drafting - both skip the measuring |
 | `--no-speed-calibration` | the same as `--drafting on` |

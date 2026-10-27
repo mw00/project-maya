@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +45,9 @@ public:
     /// embeddings (emb: the mapped BF16 table).  max_rows: the most context rows one call takes.
     bool load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, const strata::mm3::exl3::Mat* head,
               const uint16_t* emb, int max_rows, std::string& err);
+    /// (before load) the target's token rows from f(id, dst: D BF16 values) instead of emb - a GGUF's table, in its
+    /// block type: the mask row once, each proposal's anchor row
+    void set_emb_rows(std::function<void(int, uint16_t*)> f);
     const DraftGeo& geo() const;
     /// The context of positions pos0 .. pos0 + T - 1 from the taps (device-readable, [taps][stride][dim] F32: tap j's
     /// rows `stride` rows after tap j - 1's; 0: T).

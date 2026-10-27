@@ -744,6 +744,116 @@ int score_main(mm3::Model& m, const std::string& path, const std::string& out_pa
     return 0;
 }
 
+// --calibrate-prefill OUT: the prompt path's settings measured on THIS PC - the chunk a forward takes (up to the one the
+// load sized its buffers for) and the dense GEMMs' backend (the BLAS, or hipBLASLt with each shape's kernel measured,
+// on AMD) - over a prompt of `ids` (--ids, a real text's tokens; repeated to the length) from position 0, each setting
+// twice and its faster run taken.  The GEMMs first at the largest chunk, then the chunks with the faster GEMMs; a
+// chunk above the default only where every routed expert is in VRAM at the largest one (else a larger chunk's
+// buffers would take room from the experts).  The fastest setting is kept for this PC in the pack's
+// prefill-tune.txt (the next starts take it) unless it beats the defaults by less than kKeepGain; OUT gets the
+// measurements (JSON) for the setup.
+int calibrate_prefill(mm3::Model& m, std::vector<int> ids, const std::string& out_path) {
+    constexpr double kKeepGain = 0.02;
+    constexpr int kDefChunk = 1024;
+    const double t_start = now();
+    const auto& st = m.stats();
+    const int cmax = m.chunk_max();
+    const bool all_res = st.resident >= st.experts;
+    const int N = std::max(1, std::min(m.max_ctx() - 1, std::max(4096, cmax)));
+    if (ids.empty() || (ids.size() == 1 && ids[0] == 0)) {   // (no text: a fixed pseudo-random one)
+        ids.clear();
+        unsigned x = 12345u;
+        for (int i = 0; i < N; ++i) {
+            x = x * 1664525u + 1013904223u;
+            ids.push_back(1000 + (int) ((x >> 8) % (unsigned) std::max(1, m.vocab() - 2000)));
+        }
+    }
+    for (size_t i = 0; ids.size() < (size_t) N; ++i) ids.push_back(ids[i]);
+    ids.resize((size_t) N);
+    std::vector<float> lg((size_t) m.vocab());
+    std::string err;
+    struct Trial {
+        int chunk, gemm;
+        double tok_s;
+    };
+    std::vector<Trial> trials;
+    auto measure = [&](int c, int gm) -> double {
+        for (const Trial& t : trials)
+            if (t.chunk == c && t.gemm == gm) return t.tok_s;
+        m.set_chunk(c);
+        m.set_prefill_gemm(gm);
+        double best = 0;
+        for (int r = 0; r < 2; ++r) {   // (the first also measures hipBLASLt's kernels for its shapes)
+            const double t0 = now();
+            if (!m.forward(ids.data(), N, 0, 1, lg.data(), err)) {
+                std::fprintf(stderr, "maya-mm3: calibration: %s\n", err.c_str());
+                return -1;
+            }
+            best = std::max(best, (double) N / (now() - t0));
+        }
+        trials.push_back({c, gm, best});
+        std::fprintf(stderr, "calibration: chunk %d, %s GEMMs: %.1f tok/s\n", c, gm == 1 ? "hipBLASLt" : "BLAS", best);
+        return best;
+    };
+    std::vector<int> chunks;
+    for (int c : {1024, 2048, 4096})
+        if (c <= cmax && (all_res || c <= kDefChunk)) chunks.push_back(c);
+    if (chunks.empty()) chunks.push_back(cmax);
+    const int top = chunks.back();
+    std::vector<int> gemms{0};
+    if (m.lt_available()) gemms.push_back(1);
+    int bg = 0;
+    double bt = -1;
+    for (int gm : gemms) {
+        const double r = measure(top, gm);
+        if (r < 0) return 1;
+        if (r > bt) bt = r, bg = gm;
+    }
+    int bc = top;
+    for (int c : chunks) {
+        const double r = measure(c, bg);
+        if (r < 0) return 1;
+        if (r > bt) bt = r, bc = c;
+    }
+    const int dc = std::min(kDefChunk, cmax);
+    const double def = measure(dc, 0);
+    if (def < 0) return 1;
+    if (bt < def * (1.0 + kKeepGain)) bc = dc, bg = 0, bt = def;   // (the defaults, unless the best is clearly faster)
+    char set[256];
+    std::snprintf(set, sizeof set, "chunk=%d gemm=%d tok_s=%.1f default_tok_s=%.1f tokens=%d", bc, bg, bt, def, N);
+    if (!m.write_tune(set, err)) {
+        std::fprintf(stderr, "maya-mm3: calibration: %s\n", err.c_str());
+        return 1;
+    }
+    std::string js = "{\"key\": \"" + m.tune_key() + "\", \"file\": \"";
+    for (char ch : m.tune_file()) js += ch == '\\' ? std::string("\\\\") : std::string(1, ch);
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "\", \"chunk\": %d, \"gemm\": \"%s\", \"tok_s\": %.1f, \"default_tok_s\": %.1f, "
+                  "\"tokens\": %d, \"all_resident\": %s, \"lt_available\": %s, \"seconds\": %.0f, \"trials\": [",
+                  bc, bg == 1 ? "hipblaslt" : "blas", bt, def, N, all_res ? "true" : "false",
+                  m.lt_available() ? "true" : "false", now() - t_start);
+    js += buf;
+    for (size_t i = 0; i < trials.size(); ++i) {
+        std::snprintf(buf, sizeof buf, "%s{\"chunk\": %d, \"gemm\": \"%s\", \"tok_s\": %.1f}", i ? ", " : "",
+                      trials[i].chunk, trials[i].gemm == 1 ? "hipblaslt" : "blas", trials[i].tok_s);
+        js += buf;
+    }
+    js += "]}\n";
+    std::fprintf(stderr, "calibration: chunk %d, %s GEMMs: %.1f tok/s (the defaults %.1f) - kept for this PC in %s\n", bc,
+                 bg == 1 ? "hipBLASLt" : "BLAS", bt, def, m.tune_file().c_str());
+    if (!out_path.empty() && out_path != "-") {
+        std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+        f << js;
+        if (!f) {
+            std::fprintf(stderr, "%s: cannot write\n", out_path.c_str());
+            return 1;
+        }
+    } else {
+        std::printf("%s", js.c_str());
+    }
+    return 0;
+}
+
 int usage() {
     std::fprintf(stderr,
                  "usage: maya-mm3 --pack DIR --ids IDS|@FILE [--gen N] [--dump-logits FILE --last N] [--gpus LIST]\n"
@@ -753,7 +863,8 @@ int usage() {
                  "                [--kv-rot on|off] [--kv-streaming on|off] [--expert-profile FILE]\n"
                  "                [--score REF [--write-ref OUT]] [--cpu-threads N] [--dspark on|off]\n"
                  "                [--kv-resident N] [--tp-chunk N] [--tp-ffn-rows N] [--dspark-cost X]\n"
-                 "                [--verbose]\n"
+                 "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
+                 "                [--calibrate-prefill OUT.json [--ids @prompt]] [--verbose]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
@@ -781,6 +892,7 @@ int main(int argc, char** argv) {
 #endif
     mm3::Options o;
     std::string ids_arg, dump, profile_out, batch, eos_arg, images, enc_rgb, enc_size, enc_out, score_path, ref_out, learned;
+    std::string calib_out;
     bool serve_mode = false;
     int kv_stream = -1;   // (--kv-streaming: -1 not given)
     int gen = 0, last = 1, ppl = 0;
@@ -802,7 +914,18 @@ int main(int argc, char** argv) {
         else if (a == "--last") last = std::atoi(val().c_str());
         else if (a == "--gpus") o.gpus = parse_list(val());
         else if (a == "--max-context") o.max_ctx = std::atoi(val().c_str());
-        else if (a == "--chunk") o.chunk = std::atoi(val().c_str());
+        else if (a == "--chunk") {
+            o.chunk = std::atoi(val().c_str());
+            o.chunk_given = true;
+        }
+        else if (a == "--prefill-gemm") {   // (the prefill calibration's choice by default: auto)
+            const std::string v = val();
+            o.prefill_gemm = v == "auto" ? -1 : v == "hipblaslt" || v == "lt" ? 1 : v == "blas" ? 0 : -2;
+            if (o.prefill_gemm == -2) return usage();
+        }
+        else if (a == "--prefill-tune") o.prefill_tune = val();
+        else if (a == "--no-prefill-tune") o.tune = false;
+        else if (a == "--calibrate-prefill") calib_out = val();
         else if (a == "--staging") o.staging = std::atoi(val().c_str());
         else if (a == "--resident-cap") o.resident_cap = std::atoi(val().c_str());
         else if (a == "--reserve-gb") o.reserve_gb = std::atof(val().c_str());
@@ -922,7 +1045,14 @@ int main(int argc, char** argv) {
         std::fclose(fo);
         return 0;
     }
-    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode && score_path.empty())) return usage();
+    if (o.pack.empty() || (ids_arg.empty() && batch.empty() && !serve_mode && score_path.empty() && calib_out.empty()))
+        return usage();
+    if (!calib_out.empty()) {   // (the calibration: buffers for its largest chunk, measured from scratch - no cache)
+        if (!o.chunk_given) o.chunk = 4096;
+        o.chunk_given = true;
+        o.tune = false;
+        if (o.prefill_gemm < 0) o.prefill_gemm = 0;
+    }
     if (kv_stream == 0) o.kv_resident = 0;
     else if (kv_stream == 1 && o.kv_resident == 0) o.kv_resident = 32768;
     if (!images.empty()) {
@@ -948,6 +1078,10 @@ int main(int argc, char** argv) {
     if (!m.load(o, err)) {
         std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());
         return 1;
+    }
+    if (!calib_out.empty()) {
+        for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
+        return calibrate_prefill(m, ids_arg.empty() ? std::vector<int>{} : ids, calib_out);
     }
     if (!score_path.empty()) {
         for (const auto& l : m.info_lines()) std::fprintf(stderr, "  %s\n", l.c_str());
@@ -1213,6 +1347,10 @@ int main(int argc, char** argv) {
             if (next == m.eos()) {
                 std::printf("\n");
                 break;
+            }
+            if (const char* ns = ::mm3::env("MM3_NSYS")) {   // (profiling: tokens 8 .. 8 + N under nsys's capture)
+                if (g == 8) cudaProfilerStart();
+                if (g == 8 + std::atoi(ns)) cudaProfilerStop();
             }
             if (!m.forward(&next, 1, pos++, 1, lg.data(), err)) {
                 std::fprintf(stderr, "maya-mm3: %s\n", err.c_str());

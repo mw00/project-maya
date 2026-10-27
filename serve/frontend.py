@@ -741,10 +741,37 @@ class DsmlRewriter:
         self.parameter_text = ""
         self.parameter_string = False
 
+    @staticmethod
+    def _esc(s: str) -> str:
+        """s as JSON string content - character by character, so pieces of a value escape to the whole's escape
+        (issue #403) - with `<` as \\u003c (see _tag)."""
+        return json.dumps(s, ensure_ascii=False)[1:-1].replace("<", "\\u003c")
+
+    CLOSER = "</" + DSML + " parameter>"    # the only structural token inside a value
+
     def feed(self, text: str) -> str:
         self.buf += text
         out = []
         while self.buf:
+            if self.in_param:
+                # Inside a parameter value the only structural token is the complete closing tag - the
+                # reference decoder's rule (it reads until that exact token). A "<" in the value is
+                # argument data (a literal DSML tag, or a partial closer prefix): scanning for tags here
+                # let a value ending in "</｜DSML｜ para" glue onto the real closing tag and swallow the
+                # whole rest of the call into the argument.
+                i = self.buf.find(self.CLOSER)
+                if i < 0:
+                    hold = max((n for n in range(1, min(len(self.CLOSER), len(self.buf)) + 1)
+                                if self.buf.endswith(self.CLOSER[:n])), default=0)
+                    if len(self.buf) > hold:            # a suffix that may still grow into the closer: held
+                        out.append(self._plain(self.buf[:len(self.buf) - hold]))
+                        self.buf = self.buf[len(self.buf) - hold:]
+                    break
+                if i:
+                    out.append(self._plain(self.buf[:i]))
+                self.buf = self.buf[i + len(self.CLOSER):]
+                out.append(self._close())
+                continue
             i = self.buf.find("<")
             if i < 0:
                 out.append(self._plain(self.buf))
@@ -771,11 +798,16 @@ class DsmlRewriter:
         rest, self.buf = self.buf, ""
         return self._plain(rest)
 
-    @staticmethod
-    def _esc(s: str) -> str:
-        """s as JSON string content - character by character, so pieces of a value escape to the whole's escape
-        (issue #403) - with `<` as \\u003c (see _tag)."""
-        return json.dumps(s, ensure_ascii=False)[1:-1].replace("<", "\\u003c")
+    def _close(self) -> str:
+        """The parameter's closing tag: end the value - a streamed string's closing quote (its pieces went
+        out as they were written), or a raw value whole, escaped (see _tag)."""
+        self.in_param = False
+        if self.parameter_string:
+            self.parameter_text = ""
+            return '"' + ARG_VAL_END
+        value = self.parameter_text.replace("<", "\\u003c")
+        self.parameter_text = ""
+        return value + ARG_VAL_END
 
     def _plain(self, s: str) -> str:
         if self.in_param:

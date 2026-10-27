@@ -15,16 +15,20 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
+import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
 CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's own size is offered too)
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
-DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M",
-              "maya-xs": "Maya-XS", "exl3": "EXL3 2.9 bpw", "exl3-3.5": "EXL3 3.5 bpw", "abliterated": "Mix-256G"}
+# files the setup's quant list (tools/maya_quants.py) does not name, by their config's installer key
+OTHER_QUANTS = {("deepseek", "abliterated"): "Mix-256G"}
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
@@ -69,12 +73,8 @@ def _int(v, default=None):
 
 
 def family(cfg: dict) -> str:
-    """"minimax", "deepseek" or "glm" (maya.py's config_family)."""
-    args = [str(a) for a in cfg.get("args") or []]
-    fam = (cfg.get("installer") or {}).get("family")
-    if fam == "minimax" or Path(str(cfg.get("exe") or "")).name.startswith("maya-mm3"):
-        return "minimax"
-    return "deepseek" if fam == "deepseek" or "--pack" in args[:-1] else "glm"
+    """"minimax", "deepseek" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
+    return maya_quants.family_of(cfg)
 
 
 def gpus_of(cfg: dict) -> list:
@@ -366,13 +366,11 @@ def folder_size(pack: Path | None) -> int | None:
 
 
 def quant_label(cfg: dict, path: Path) -> str:
-    inst = cfg.get("installer") or {}
-    if family(cfg) == "minimax":                       # (installer.quant names the model: its one quant)
-        return "EXL3 3.5 bpw"
-    if family(cfg) == "deepseek":
-        q = str(inst.get("ds4_quant") or inst.get("quant") or "")
-        return DS4_QUANTS.get(q.lower(), q) or path.stem.removeprefix("maya-")
-    return str(inst.get("quant") or path.stem.removeprefix("maya-").removesuffix("-hip"))
+    """The files a config runs, as shown after the model's name ("Maya-XS", "UD-Q8_K_XL", "EXL3 3.5 bpw" - the setup's
+    names, maya_quants); else its installer key, or the config's own name for one the setup did not write."""
+    fam, key = family(cfg), maya_quants.config_key(cfg)
+    what = maya_quants.tier(fam, key) or maya_quants.OTHERS.get((fam, key)) or OTHER_QUANTS.get((fam, str(key).lower()))
+    return str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
 
 
 def missing(cfg: dict) -> str | None:

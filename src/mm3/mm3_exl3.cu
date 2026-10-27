@@ -19,6 +19,7 @@
 
 #include "mm3_exl3.hpp"
 #include "mm3_env.hpp"
+#include "mm3_gguf.cuh"   // (a GGUF's matrices and experts - fmt kFmtGG: the entry points hand them to mm3_gguf.cu)
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -1019,21 +1020,43 @@ __global__ void EXL3_BOUNDS(2) win_down_mix_kernel(const KWin a, const KMix mx) 
 
 // (a host that never answers: the wait gives up after 120 s and wait_timeouts() counts it - no GPU left spinning)
 __device__ unsigned g_win_timeouts = 0;
-__global__ void win_wait_kernel(const unsigned* p, unsigned v) {
+__global__ void win_wait_kernel(const unsigned* p, unsigned v, unsigned long long limit) {
     if (threadIdx.x != 0) return;
     unsigned long long t0, t;
+#if defined(STRATA_USE_HIP)
+    t0 = wall_clock64();   // (limit: 120 s of its ticks - win_wait_limit)
+#else
     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+#endif
     while (*(volatile const unsigned*) p != v) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
         __nanosleep(200);
 #endif
+#if defined(STRATA_USE_HIP)
+        t = wall_clock64();
+#else
         asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-        if (t - t0 > 120ull * 1000000000ull) {
+#endif
+        if (t - t0 > limit) {
             atomicAdd(&g_win_timeouts, 1u);
             break;
         }
     }
     __threadfence_system();
+}
+unsigned long long win_wait_limit() {   // 120 s in win_wait_kernel's clock
+#if defined(STRATA_USE_HIP)
+    static const unsigned long long l = [] {
+        int dev = 0, khz = 0;
+        if (hipGetDevice(&dev) != hipSuccess || hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) !=
+                                                    hipSuccess || khz <= 0)
+            khz = 100000;   // (100 MHz, RDNA's usual)
+        return 120ull * 1000ull * (unsigned long long) khz;
+    }();
+    return l;
+#else
+    return 120ull * 1000000000ull;
+#endif
 }
 
 // ---------------------------------------------------------------- reconstruction
@@ -2095,6 +2118,7 @@ bool supported(const Mat& m) {
 void set_skip(const int* flag) { g_skip = flag; }
 
 int mv_splits(const Mat& m) {
+    if (m.fmt == ::mm3::gg::kFmtGG) return 1;   // (a GGUF matrix: a warp a row, every column's sum the same)
     if (!supported(m)) return 0;
     int S = 1, kr = 0;
     mv_split(m, sm_count(), mv_occ(m.k2), S, kr);
@@ -2102,6 +2126,7 @@ int mv_splits(const Mat& m) {
 }
 
 int mv_cols(const Mat& m) {
+    if (m.fmt == ::mm3::gg::kFmtGG) return kMaxMvCols;   // (mm3_gguf.cu's mv: up to 16 activations a job)
     if (!supported(m)) return 0;
     const int S = mv_splits(m);
     if (S <= 0) return 0;
@@ -2113,13 +2138,13 @@ unsigned wait_timeouts() {
     unsigned n = 0;
     if (cudaMemcpyFromSymbol(&n, g_win_timeouts, sizeof n) != cudaSuccess) {
         cudaGetLastError();
-        return 0;
+        return ::mm3::gg::wait_timeouts();
     }
-    return n;
+    return n + ::mm3::gg::wait_timeouts();
 }
 
 int launch_errors() {
-    return g_launch_errors.load(std::memory_order_relaxed);
+    return g_launch_errors.load(std::memory_order_relaxed) + ::mm3::gg::launch_errors();
 }
 
 bool prepare(cudaStream_t s) {
@@ -2135,6 +2160,15 @@ bool several_ok() {
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     EXL3_LEGACY(mv(jobs, n, s));
     if (n <= 0 || n > kMaxMvJobs) return false;
+    {   // a GGUF's matrices among them: mm3_gguf.cu's GEMVs, the EXL3 ones here
+        MvJob gj[kMaxMvJobs], ej[kMaxMvJobs];
+        int ng = 0, ne = 0;
+        for (int i = 0; i < n; ++i) {
+            if (jobs[i].m != nullptr && jobs[i].m->fmt == ::mm3::gg::kFmtGG) gj[ng++] = jobs[i];
+            else ej[ne++] = jobs[i];
+        }
+        if (ng > 0) return ::mm3::gg::mv(gj, ng, s) && (ne == 0 || mv(ej, ne, s));
+    }
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
     const int sms = sm_count();
@@ -2281,6 +2315,7 @@ static bool mixed_ok(const MixedLayouts& mx, const char* what) {
 }
 
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
+    if (a.lay.fmt == ::mm3::gg::kFmtGG) return ::mm3::gg::moe_gate_up(a, x, h, s);
     if (a.mix.n > 0) {   // (a mixed layer: the same arithmetic on every GPU, no legacy kernels)
         KMoe m;
         if (!mixed_ok(a.mix, "moe_gate_up") || !moe_args(a, m, s)) return;
@@ -2308,6 +2343,7 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
 }
 
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s) {
+    if (a.lay.fmt == ::mm3::gg::kFmtGG) return ::mm3::gg::moe_down(a, h, sh_out, out, s);
     if (a.mix.n > 0) {
         KMoe m;
         if (!mixed_ok(a.mix, "moe_down") || !moe_args(a, m, s)) return;
@@ -2333,6 +2369,7 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
 }
 
 bool win_experts(const WinArgs& a, cudaStream_t s) {
+    if (a.lay.fmt == ::mm3::gg::kFmtGG) return ::mm3::gg::win_experts(a, s);
     if (a.mix.n == 0) EXL3_LEGACY_MOE(a, win_experts(a, s));
     if (a.mix.n > 0 && !mixed_ok(a.mix, "win_experts")) return false;
     if (a.T < 1 || a.k < 1 || a.k > 8 || a.n_embd % kCols != 0 || a.n_ff % kCols != 0 || a.n_embd > kMaxMoeK ||
@@ -2387,7 +2424,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
                !dispatch<RunWinDown>(a.lay.k2[2], a.lay.cb, w, groups, s)) {
         return false;
     }
-    if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val);
+    if (a.wait_ptr != nullptr) win_wait_kernel<<<1, 32, 0, s>>>(a.wait_ptr, a.wait_val, win_wait_limit());
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);
     launch_check("win_experts");
     return true;
@@ -2626,6 +2663,7 @@ bool mma_supported() {
 
 void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
                  cudaStream_t s) {
+    if (sa.lay.fmt == ::mm3::gg::kFmtGG) return ::mm3::gg::set_gate_up(sa, x, ldx, row_idx, h16, ldh, s);
     if (sa.mix.n > 0) {   // (a mixed layer: every expert's own address and class, the portable kernels everywhere)
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_gate_up")) return;
@@ -2731,6 +2769,7 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
 }
 
 void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s) {
+    if (sa.lay.fmt == ::mm3::gg::kFmtGG) return ::mm3::gg::set_down(sa, h16, ldh, y, ldy, s);
     if (sa.mix.n > 0) {
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
         if (sa.eptr == nullptr || !mixed_ok(sa.mix, "set_down")) return;
@@ -2820,6 +2859,7 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
 }
 
 void gemm_rows(const Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta, cudaStream_t s) {
+    if (m.fmt == ::mm3::gg::kFmtGG) return ::mm3::gg::gemm_rows(m, x16, ldx, rows, y, ldy, beta, s);
 #if !defined(STRATA_USE_HIP)
     if (rows <= 0) return;
     if (!mma_now()) {   // (before sm_80: the FP16 GEMM for many rows, Volta / Turing's tiles, the portable kernels)

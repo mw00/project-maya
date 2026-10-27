@@ -26,7 +26,8 @@ class ModelChoice(unittest.TestCase):
     def test_new_setup_offers_the_maya_quants(self):
         kind, quant, text = self.choose({})
         self.assertEqual((kind, quant), ("download", "Maya-S-v2-IQ2_XXS"))
-        for q in ("Maya-S-v2-IQ2_XXS:", "Maya-S24:", "Maya-M:", "Maya-M-Derisked:", "Maya-L:"):
+        for q in ("GLM-5.3 · Maya-S:", "GLM-5.3 · Maya-S24:", "GLM-5.3 · Maya-M:", "GLM-5.3 · Maya-M-Derisked:",
+                  "GLM-5.3 · Maya-L:"):   # (the model first, the tier: maya_quants)
             self.assertIn(q, text)
 
     def test_maya_m_derisked_downloads_from_its_own_repo_with_mayas_vision_files(self):
@@ -338,6 +339,7 @@ class Exl3Download(unittest.TestCase):
     and hash, its config checked instead of a GGUF header, and its pack built by tools/exl3_pack.py."""
     Q, GB, SHARDS, REV = "EXL3-3.05bpw", 125.3, 15, "332ab457b709b7ba30dd9a448be5de03b80a7ac9"
     FILES = 27
+    MTP = "mtp.safetensors"                                                 # the MTP block's file (None: in the shards)
 
     def offered(self, backend):
         args = SimpleNamespace(gguf_dir=None, model=None, yes=True, backend=backend)
@@ -358,7 +360,10 @@ class Exl3Download(unittest.TestCase):
         m = maya.MODELS[self.Q]
         self.assertEqual(maya.shard_names(m), list(m["files"]))
         self.assertEqual(set(m["files"]), set(m["sha256"]))
-        self.assertIn("mtp.safetensors", m["files"])                       # the MTP draft block
+        if self.MTP:
+            self.assertIn(self.MTP, m["files"])                            # the MTP draft block
+        else:
+            self.assertNotIn("mtp.safetensors", m["files"])
         self.assertEqual(len([n for n in m["files"] if n.startswith("model-")]), self.SHARDS)
         self.assertAlmostEqual(sum(m["files"].values()) / 1e9, m["download_gb"], delta=0.05)
         self.assertEqual(m["revision"], self.REV)                           # the branch's commit, pinned
@@ -391,7 +396,7 @@ class Exl3Download(unittest.TestCase):
         ask.assert_called_once()
         self.assertIn(f"https://huggingface.co/turboderp/GLM-5.3-Flash-exl3 (branch {self.Q[5:]})", text)
         self.assertIn(f"{self.FILES} still to download", text)
-        self.assertIn(f"/resolve/{self.REV}/mtp.safetensors", text)
+        self.assertIn(f"/resolve/{self.REV}/{self.MTP or 'model.safetensors.index.json'}", text)
 
     def test_model_step_checks_the_config_not_a_gguf_header(self):
         with tempfile.TemporaryDirectory() as d:
@@ -444,6 +449,21 @@ class Exl3Download405(Exl3Download):
             for n in maya.shard_names(maya.MODELS["EXL3-3.05bpw"]):     # 3.05bpw straight in the models folder
                 (models / n).write_bytes(b"")
             self.assertEqual(maya.download_dir(models, "EXL3-3.05bpw"), models)
+            self.assertEqual(maya.download_dir(models, self.Q), models / self.Q)
+
+
+class Exl3DownloadSc410(Exl3Download405):
+    """turboderp's self-calibrated quant at 4.10 bits: the same steps; its MTP block is in its shards."""
+    Q, GB, SHARDS, REV = "EXL3-sc_4.10bpw", 167.8, 23, "c6b8ac3f6069173343e253e1cba90536ed2c72dc"
+    FILES = 33
+    MTP = None
+
+    def test_a_405bpw_download_is_not_taken_for_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            models = Path(d)
+            for n in maya.shard_names(maya.MODELS["EXL3-4.05bpw"]):
+                (models / n).write_bytes(b"")
+            self.assertEqual(maya.download_dir(models, "EXL3-4.05bpw"), models)
             self.assertEqual(maya.download_dir(models, self.Q), models / self.Q)
 
 

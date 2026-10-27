@@ -117,24 +117,48 @@ class Quant35(unittest.TestCase):
                              (e29["files"][n], e29["sha256"][n], e29["sources"][n]))
 
     def test_offered_only_where_exl3_runs(self):
-        """--ds4-quant exl3-3.5, or the menu's row - only on NVIDIA compute capability 7.0+ (not AMD, not a PC whose
-        GPUs are all older)."""
+        """--ds4-quant exl3-3.5, or the menu's row - on NVIDIA compute capability 7.0+ (not a PC whose GPUs are all
+        older) and on AMD, marked experimental there (as GLM's EXL3 quants)."""
         self.assertIn("exl3-3.5", maya.DS4_QUANTS)
-        def offered(gpus, backend="cuda"):
+        def offered(gpus, backend="cuda", tags=None):
             rows = []
             def pick(title, intro, opts, default, yes, *x):
-                rows.extend(o[0] for o in opts)
+                rows.extend(o for o in opts)
                 return default
             with patch.object(maya.S, "gpus", return_value=gpus), patch.object(maya, "choose", pick), \
                     patch.object(maya.S, "UI", None):
                 maya.choose_ds4_quant(args(backend=backend), {})
-            return [r for r in rows if r.startswith("EXL3")]
+            ex = [r for r in rows if r[0].startswith("DeepSeek V4.1 · EXL3")]   # (the model first: maya_quants)
+            if tags is not None:
+                tags.extend(r[1] for r in ex)
+            return [r[0] for r in ex]
         self.assertEqual(len(offered([{"arch": 86}, {"arch": 70}])), 2)
         self.assertEqual(len(offered([{"arch": 70}, {"arch": 70}])), 2)       # (Volta: since v1.1.20)
         self.assertEqual(offered([{"arch": 61}, {"arch": 61}]), [])            # (Pascal: the GGUFs only)
-        self.assertEqual(offered([], backend="hip"), [])
-        self.assertRegex(offered([{"arch": 89}])[1], r"^EXL3 3\.5 bits \(461 GB\)$")
+        nv, amd = [], []
+        offered([{"arch": 89}], tags=nv)
+        self.assertEqual(len(offered([], backend="hip", tags=amd)), 2)          # (AMD: experimental, v1.1.30)
+        self.assertEqual(amd, ["experimental on AMD"] * 2)
+        self.assertNotIn("experimental on AMD", nv)
+        self.assertRegex(offered([{"arch": 89}])[1], r"^DeepSeek V4\.1 · EXL3 3\.5 bpw \(461 GB\)$")
         self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="exl3-3.5"), {}), "exl3-3.5")
+
+    def test_exl3_on_amd_experimental(self):
+        """AMD: the EXL3 quants go on to the AMD PC check with an experimental warning (as GLM's and MiniMax's EXL3
+        there), the GGUFs without one; neither is refused."""
+        def fail(*a, **kw):
+            raise AssertionError(f"refused: {a}")
+        for gguf in (False, True):
+            said, hip = [], []
+            with patch.object(maya, "fail", fail), patch.object(maya, "step", lambda *a: None), \
+                    patch.object(maya, "warn", said.append), \
+                    patch.object(maya, "check_hip_pc", lambda a, **kw: hip.append(kw) or {"backend": "hip"}):
+                self.assertEqual(maya.check_pc(args(backend="hip"), "deepseek", gguf=gguf), {"backend": "hip"})
+            self.assertEqual(len(hip), 1)
+            self.assertEqual(len(said), 0 if gguf else 1)
+            if not gguf:
+                self.assertIn("experimental", said[0])
+                self.assertIn("deepseek-maya-s", said[0])
 
     def test_own_folder_and_config(self):
         models = Path("/models")
@@ -203,10 +227,10 @@ class Config(unittest.TestCase):
         for p in self.patches:
             p.stop()
 
-    def write(self, a, old=None):
+    def write(self, a, old=None, n_gpus=3):
         if old is not None:
             (self.root / "maya-ds4.json").write_text(json.dumps(old))
-        pc = {"gpus": [{"index": i} for i in range(3)]}
+        pc = {"gpus": [{"index": i} for i in range(n_gpus)]}
         p = maya.write_config_ds4(a, pc, {"lib_dirs": ["/cuda/lib64"]}, Path("/m/DS/maya-ds4"), 131072,
                                   Path("/models"), Path("/m/DS"))
         return p, json.loads(p.read_text())
@@ -225,7 +249,7 @@ class Config(unittest.TestCase):
 
     def test_again_keeps_what_it_does_not_ask(self):
         old = {"args": ["--pack", "/old/maya-ds4", "--max-context", "262144", "--tp", "1", "--prefill-chunk", "4096"],
-               "reasoning_effort": "max", "sampling": {"temperature": 0.6}, "host": "0.0.0.0", "api_key": "k",
+               "gpu": [0, 1, 2], "reasoning_effort": "max", "sampling": {"temperature": 0.6}, "host": "0.0.0.0", "api_key": "k",
                "env": {"DS4_RING_MB": "800"}}
         _, c = self.write(args(no_vision=True, vram_reserve_mib=900, env=["DS4_CHUNK_MIN=256"]), old)
         a = c["args"]
@@ -254,9 +278,35 @@ class Config(unittest.TestCase):
 
     def test_the_config_befores_own_wins(self):
         self.tuned()
-        _, c = self.write(args(), {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "4"]})
+        _, c = self.write(args(), {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "3"],
+                                   "gpu": [0, 1, 2]})   # (its GPUs: as chosen now)
         a = c["args"]
-        self.assertEqual((a[a.index("--tp") + 1], a[a.index("--cpu-threads") + 1]), ("4", "33"))
+        self.assertEqual((a[a.index("--tp") + 1], a[a.index("--cpu-threads") + 1]), ("3", "33"))
+
+    def test_tp_follows_the_gpus_chosen_now(self):
+        """#436: a config for two GPUs set up again for one - --tp 2 kept made the engine fail later"""
+        two = {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "2", "--prefill-chunk", "4096"],
+               "gpu": [0, 1]}
+        _, c = self.write(args(), two, n_gpus=1)
+        a = c["args"]
+        self.assertEqual((a[a.index("--tp") + 1], c["gpu"]), ("1", [0]))
+        self.assertEqual(a[a.index("--threads") + 1], "on")           # (one GPU: the chunked prompt path)
+        self.assertEqual(a[a.index("--prefill-chunk") + 1], "4096")   # (the rest kept as before)
+        one = {"args": ["--pack", "/old/maya-ds4", "--max-context", "131072", "--tp", "1", "--threads", "on"],
+               "gpu": [0]}
+        _, c = self.write(args(), one, n_gpus=3)                       # (one GPU -> three)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "2")
+        _, c = self.write(args(), {"args": ["--tp", "4"], "gpu": [0, 1]}, n_gpus=3)   # (other GPUs, even as many)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "2")
+        _, c = self.write(args(), {"args": ["--tp", "4"], "gpu": [0, 1, 2]}, n_gpus=3)   # (more than the GPUs)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "2")
+        self.assertFalse(maya.tp_keepable({"args": ["--tp", "1"]}, {"gpus": [{"index": 0}]}))   # (no GPU list)
+        self.assertTrue(maya.tp_keepable({"args": [], "gpu": [0]}, {"gpus": [{"index": 0}]}))
+
+    def test_a_tuning_for_other_gpus_does_not_hold_the_tp(self):
+        self.tuned()                                                    # (tuned for GPUs 0-2: --tp 8)
+        _, c = self.write(args(), {"args": ["--tp", "1"], "gpu": [0]})  # (the config before: one GPU)
+        self.assertEqual(c["args"][c["args"].index("--tp") + 1], "8")
 
     def test_gguf_config(self):
         pc = {"gpus": [{"index": 0}]}

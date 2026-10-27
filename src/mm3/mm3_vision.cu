@@ -11,8 +11,11 @@
 #include <sstream>
 
 #include <cublas_v2.h>
-#include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <cuda_bf16.h>
+#endif
+#include "../ds4/ds4_numerics.cuh"   // (BF16 on HIP: the same bits in plain arithmetic)
 
 #include "mm3_env.hpp"
 
@@ -37,6 +40,16 @@ namespace mm3 {
 
 namespace {
 
+// the GEMMs' BF16 inputs: CUDA's type, or on AMD (HIP) its 16 bits as they are (hip_bf16.h's own type clashes with
+// the hip_compat warp functions; hipBLAS reads HIP_R_16BF from the same bits), rounded to nearest even either way
+#if defined(STRATA_USE_HIP)
+using bf16_t = uint16_t;
+__device__ __forceinline__ bf16_t f2bf(float f) { return strata::ds4::bf16_rn(f); }
+#else
+using bf16_t = __nv_bfloat16;
+__device__ __forceinline__ bf16_t f2bf(float f) { return __float2bfloat16(f); }
+#endif
+
 constexpr int kHeadChunk = 4;   // the heads whose scores are held at once ([4][2304][2304] F32: 85 MB)
 
 __device__ __forceinline__ float gelu(float x) { return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f)); }
@@ -54,7 +67,7 @@ __device__ float block_sum(float v, float* red) {
 
 // one block a row: y16 = LayerNorm(x) (biased variance) . w + b, BF16
 __global__ void layernorm_kernel(const float* x, const float* w, const float* b, int D, float eps,
-                                 __nv_bfloat16* y16) {
+                                 bf16_t* y16) {
     __shared__ float red[32];
     const float* r = x + (size_t) blockIdx.x * D;
     float s = 0.0f;
@@ -67,7 +80,7 @@ __global__ void layernorm_kernel(const float* x, const float* w, const float* b,
     }
     const float inv = rsqrtf(block_sum(q, red) / (float) D + eps);
     for (int i = threadIdx.x; i < D; i += blockDim.x)
-        y16[(size_t) blockIdx.x * D + i] = __float2bfloat16((r[i] - mean) * inv * w[i] + b[i]);
+        y16[(size_t) blockIdx.x * D + i] = f2bf((r[i] - mean) * inv * w[i] + b[i]);
 }
 
 // x [rows][D] in place: LayerNorm (the pre-layernorm of the residual stream itself), F32
@@ -89,12 +102,12 @@ __global__ void layernorm_f32_kernel(float* x, const float* w, const float* b, i
 
 // y [n] (rows of M) += bias; then GELU (act); into F32 (yf, may be y) and / or BF16 (y16)
 __global__ void bias_act_kernel(const float* y, const float* bias, size_t n, int M, int act, float* yf,
-                                __nv_bfloat16* y16) {
+                                bf16_t* y16) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
         float v = y[i] + bias[i % (size_t) M];
         if (act) v = gelu(v);
         if (yf) yf[i] = v;
-        if (y16) y16[i] = __float2bfloat16(v);
+        if (y16) y16[i] = f2bf(v);
     }
 }
 
@@ -104,9 +117,9 @@ __global__ void residual_kernel(float* h, const float* t, const float* bias, siz
         h[i] += t[i] + bias[i % (size_t) M];
 }
 
-__global__ void to_bf16_kernel(const float* x, size_t n, __nv_bfloat16* y) {
+__global__ void to_bf16_kernel(const float* x, size_t n, bf16_t* y) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
-        y[i] = __float2bfloat16(x[i]);
+        y[i] = f2bf(x[i]);
 }
 
 // qkv [N][3 dim] += bias, then the 3D RoPE on q and k: per head, dims [0, rot / 2) and [rot / 2, rot) a rotate-half
@@ -270,7 +283,7 @@ struct Vision::Impl {
     }
 
     // C [rows][ldc] F32 (columns [0, N) of it) = X [rows][K] BF16 . W [N][K]^T BF16
-    bool gemm(const uint8_t* W, int N, int K, const __nv_bfloat16* X, int rows, float* C, int ldc, std::string& err) {
+    bool gemm(const uint8_t* W, int N, int K, const bf16_t* X, int rows, float* C, int ldc, std::string& err) {
         const float one = 1.0f, zero = 0.0f;
         VB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, CUDA_R_16BF, K, X, CUDA_R_16BF, K, &zero,
                         C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
@@ -525,7 +538,7 @@ struct Vision::Impl {
         auto fp = [&](size_t o) { return (float*) (base + o); };
         float *px = fp(y.px), *h = fp(y.h), *qkv = fp(y.qkv), *sc = fp(y.sc), *att = fp(y.att), *big = fp(y.big);
         float* out = fp(y.out);
-        __nv_bfloat16* x16 = (__nv_bfloat16*) (base + y.x16);
+        bf16_t* x16 = (bf16_t*) (base + y.x16);
         int* pos = (int*) (base + y.pos);
         float* pre = fp(y.pre);
         auto pv = [&](size_t o) { return (float*) ((uint8_t*) pre + o); };
@@ -599,7 +612,7 @@ struct Vision::Impl {
         // the projector: per patch Pj -> out_dim, then each block's M x M rows (consecutive) as one - each matrix's
         // stages of rows into their columns of C
         int k = g.layers;
-        auto mat = [&](int m, const __nv_bfloat16* X, int rws, float* C) -> bool {
+        auto mat = [&](int m, const bf16_t* X, int rws, float* C) -> bool {
             for (; k < ns && st[(size_t) k].mat == m; ++k) {
                 uint8_t* sb = nullptr;
                 if (!acquire(k, sb) ||
@@ -614,7 +627,7 @@ struct Vision::Impl {
         bias_act_kernel<<<blocks_for((size_t) N * Pj), 256, 0, s>>>(big, pv(o_pb1), (size_t) N * Pj, Pj, 1, nullptr, x16);
         if (!mat(1, x16, N, big)) return false;
         bias_act_kernel<<<blocks_for((size_t) N * O), 256, 0, s>>>(big, pv(o_pb2), (size_t) N * O, O, 0, nullptr, x16);
-        __nv_bfloat16* m16 = (__nv_bfloat16*) qkv;   // (free now: [NB][Pj] BF16)
+        bf16_t* m16 = (bf16_t*) qkv;   // (free now: [NB][Pj] BF16)
         if (!mat(2, x16, NB, big)) return false;
         bias_act_kernel<<<blocks_for((size_t) NB * Pj), 256, 0, s>>>(big, pv(o_pmb1), (size_t) NB * Pj, Pj, 1, nullptr,
                                                                    m16);

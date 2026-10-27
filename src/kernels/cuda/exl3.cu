@@ -21,6 +21,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <mma.h>
+#endif
 #include "strata/kernels/dp4a.hpp"   // sm_60: __dp4a -> the vmad fallback
 
 #include <algorithm>
@@ -1425,9 +1428,22 @@ __global__ void __launch_bounds__(kThreads) hip_set_kernel(SetArgs a, const floa
     }
 }
 
+// set_mix_kernel's share of SetArgs: the fields it reads.  The whole SetArgs (its MixedLayouts ~3.9 KB) beside KMix
+// made 5.8 KB of kernel parameters - over the 4 KB Pascal (sm_6x) allows, so a Pascal build stopped there (#479;
+// Volta and newer take 32 KB).  The same values, the same arithmetic: the same bits everywhere.
+struct KSetMix {
+    const unsigned long long* eptr;
+    const int* bounds;
+    int row0, n_embd, n_ff;
+    float limit;
+};
+static KSetMix ksetmix(const SetArgs& a) { return KSetMix{a.eptr, a.bounds, a.row0, a.n_embd, a.n_ff, a.limit}; }
+static_assert(sizeof(KSetMix) + sizeof(KMix) + 6 * sizeof(void*) + 3 * sizeof(int) <= 4096,
+              "set_mix_kernel's parameters must fit the 4 KB Pascal (sm_6x) allows");
+
 // hip_set_kernel for a mixed-precision layer: expert e's blob at a.eptr[e], each part at its class's K
 template <int cb, bool gate_up>
-__global__ void __launch_bounds__(kThreads) set_mix_kernel(SetArgs a, KMix mx, const float* x, int ldx,
+__global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix mx, const float* x, int ldx,
                                                         const int* idx, uint16_t* h, int ldh,
                                                         float* y, int ldy) {
     __shared__ __align__(16) MixSmem sm;
@@ -1484,12 +1500,23 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(SetArgs a, KMix mx, c
 // activation n's 16 inputs); D's element i is output 2i + lane / 16 of the tile for activation lane % 16.  The host
 // takes it on gfx11 only (wmma_now; EXL3_WMMA_ROWS 16 or 32, by default 16); the decode and verify kernels keep
 // block_gemv (their bits are the token path's).
+// Volta / Turing (sm_70 .. sm_75: no mma.m16n8k16, so not the tensor-core kernels below) run the same kernel on
+// nvcuda::wmma's 16x16x16 FP16 product with F32 sums: A the warp's decoded tile from wt (row-major, output by input),
+// B 16 activations' slice from xb (col-major: an activation's inputs in a row), D stored col-major into out - the same
+// operands as gfx11's, the fragments loaded by the library instead of by hand (wt's pitch 12 words: wmma's ldm is a
+// multiple of 8 halves; the 8 rows a store takes stay on distinct banks).  wmma_now(): sm_7x unless
+// STRATA_EXL3_WMMA=0 (MAYA_EXL3_WMMA=0).
 constexpr int kXS = kCols + 8;   // an activation's pitch in xb (halves: 2-way LDS reads)
+#if defined(STRATA_USE_HIP)
+constexpr int kWtP = 9;          // wt's pitch, words a decoded output row (8 + 1: banks)
+#else
+constexpr int kWtP = 12;
+#endif
 template <int K2, int NR>
 struct WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mixed kernel keeps one for all classes)
     float out[NR * kCols];
     __half xb[2 * NR * kXS];
-    uint32_t wt[kWarps * 16 * 9];   // a warp's decoded tile by output, 8 words a row + 1 (banks)
+    uint32_t wt[kWarps * 16 * kWtP];   // a warp's decoded tile by output, 8 words a row (kWtP apart)
     uint32_t stage[kWarps * 4 * K2];
 };
 #if defined(STRATA_USE_HIP) && defined(__GFX11__)
@@ -1497,6 +1524,9 @@ struct WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mix
 typedef _Float16 exl3_h16 __attribute__((ext_vector_type(16)));
 typedef float exl3_f8 __attribute__((ext_vector_type(8)));
 typedef uint32_t exl3_u8 __attribute__((ext_vector_type(8)));
+#endif
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800
+#define EXL3_WMMA_V70 1
 #endif
 
 // block_gemv for nc <= NR activations (warp w loads activations w, w + 8, ..: in[j] the one at w + 8 j):
@@ -1569,6 +1599,65 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 #pragma unroll
             for (int i = 0; i < 8; ++i) sm.out[(b * 16 + m) * kCols + warp * 16 + 2 * i + (lane >> 4)] = c[b][i];
     __syncthreads();
+#elif defined(EXL3_WMMA_V70)
+    namespace wm = nvcuda::wmma;
+    static_assert(K2 <= KS, "the shared memory's stage holds K2 words a lane");
+    constexpr int W = Words<K2>::W, R = Words<K2>::R, NJ = NR / 8, NB = NR / 16;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const size_t sstride = (size_t) ld * W;
+    const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
+    uint32_t* st = sm.stage + warp * W;
+    uint32_t* wt = sm.wt + warp * 16 * kWtP;
+    const int nq = (k1 - k0) / kCols;
+    uint32_t wc[8][R], wn[8][R];
+    float xv[NJ][4], xs[NJ][4];
+    load_tiles<K2>(tile, sstride, lane, wc);
+#pragma unroll
+    for (int j = 0; j < NJ; ++j)
+        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[j]);
+    wm::fragment<wm::accumulator, 16, 16, 16, float> c[NB];
+#pragma unroll
+    for (int b = 0; b < NB; ++b) wm::fill_fragment(c[b], 0.0f);
+    for (int q = 0; q < nq; ++q) {
+        __half* xq = sm.xb + (q & 1) * (NR * kXS);
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+            if (warp + 8 * j < nc) chunk_store(xv[j], xs[j], lane, xq + (warp + 8 * j) * kXS);
+        __syncthreads();
+        if (q + 1 < nq) {
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+#pragma unroll
+            for (int j = 0; j < NJ; ++j)
+                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[j]);
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint32_t f[4];
+            slice_frags<K2, cb>(wc[s], st, lane, f);
+            wt[g * kWtP + t] = f[0];
+            wt[g * kWtP + 4 + t] = f[1];
+            wt[(g + 8) * kWtP + t] = f[2];
+            wt[(g + 8) * kWtP + 4 + t] = f[3];
+            __syncwarp();
+            wm::fragment<wm::matrix_a, 16, 16, 16, __half, wm::row_major> a;
+            wm::load_matrix_sync(a, reinterpret_cast<const __half*>(wt), 2 * kWtP);
+#pragma unroll
+            for (int b = 0; b < NB; ++b) {   // (activations past nc: whatever xb holds - their outputs are not used)
+                wm::fragment<wm::matrix_b, 16, 16, 16, __half, wm::col_major> bx;
+                wm::load_matrix_sync(bx, xq + b * 16 * kXS + s * 16, kXS);
+                wm::mma_sync(c[b], a, bx, c[b]);
+            }
+            __syncwarp();   // (wt: the next slice's)
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
+    }
+#pragma unroll
+    for (int b = 0; b < NB; ++b)
+        wm::store_matrix_sync(sm.out + b * 16 * kCols + warp * 16, c[b], kCols, wm::mem_col_major);
+    __syncthreads();
 #endif
 }
 
@@ -1613,7 +1702,7 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
 template <int K2, int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
                                                          uint16_t* h, int ldh, float* y, int ldy) {
-    __shared__ __align__(16) WmmaSmem<K2, NR> sm;
+    __shared__ __align__(32) WmmaSmem<K2, NR> sm;   // (wmma: 256-bit aligned operands)
     __shared__ float gate[NR * kCols];
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
@@ -2258,10 +2347,20 @@ static bool wmma_now() {
     }
     return known[dev] == 2;
 #else
-    return false;
+    // sm_7x: the Volta / Turing wmma kernels (sm_80 and later take the mma.m16n8k16 ones)
+    static const bool off = std::getenv("STRATA_EXL3_WMMA") != nullptr && std::atoi(std::getenv("STRATA_EXL3_WMMA")) == 0;
+    static int known[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (off || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        known[dev] = major == 7 ? 2 : 1;
+    }
+    return known[dev] == 2;
 #endif
 }
-#if defined(STRATA_USE_HIP)
 // the matrix-core prompt kernels' rows a block: 16 (EXL3_WMMA_ROWS=32: each weight tile decoded once for 32 rows -
 // slower on a Radeon 8065S, 167 against 208 tokens/s on a 4K prompt: twice the shared memory, half the blocks a CU)
 static int wmma_rows() {
@@ -2271,8 +2370,12 @@ static int wmma_rows() {
 }
 template <class F>
 static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{}))
+#if defined(STRATA_USE_HIP)
     if (wmma_rows() == 16) f(std::integral_constant<int, 16>{});
     else f(std::integral_constant<int, 32>{});
+#else
+    f(std::integral_constant<int, 16>{});   // (sm_7x: 32 rows' gate/up block is over the 48 KB of static shared memory)
+#endif
 }
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
@@ -2292,7 +2395,14 @@ template <int K2, int cb> struct RunWmmaDown {
         });
     }
 };
+
+bool prompt_tc() {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    return mma_supported() || wmma_now();
 #endif
+}
 
 bool mma_supported() {
 #if defined(STRATA_USE_HIP)
@@ -2328,14 +2438,19 @@ void set_gate_up(const SetArgs& sa, const float* x, int ldx, const int* row_idx,
         mix_launch(sa.mix, [&](auto cb) {
             set_mix_kernel<decltype(cb)::value, true>
                 <<<dim3((sa.max_rows + kTok - 1) / kTok, sa.n_ff / kCols, sa.n_exp), kThreads, 0, s>>>(
-                    sa, k, x, ldx, row_idx, h16, ldh, nullptr, 0);
+                    ksetmix(sa), k, x, ldx, row_idx, h16, ldh, nullptr, 0);
         });
         launch_check("set_gate_up (mixed)");
         return;
     }
 #if !defined(STRATA_USE_HIP)
-    if (!mma_now()) {   // (before sm_80: the portable kernels)
+    if (!mma_now()) {   // (before sm_80: the portable kernels - on sm_7x the wmma ones)
         if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
+        if (wmma_now() && sa.lay.k2[0] == sa.lay.k2[1] &&
+            dispatch<RunWmmaGateUp>(sa.lay.k2[0], sa.lay.cb, sa, x, ldx, row_idx, h16, ldh, s)) {
+            launch_check("set_gate_up (Volta tensor cores)");
+            return;
+        }
         if (sa.lay.k2[0] != sa.lay.k2[1] || !dispatch<RunHipGateUp>(sa.lay.k2[0], sa.lay.cb, sa, x, ldx, row_idx, h16, ldh, s)) {
             std::fprintf(stderr, "exl3 set_gate_up: unsupported layout\n");
             g_launch_errors.fetch_add(1, std::memory_order_relaxed);
@@ -2411,14 +2526,18 @@ void set_down(const SetArgs& sa, const uint16_t* h16, int ldh, float* y, int ldy
         mix_launch(sa.mix, [&](auto cb) {
             set_mix_kernel<decltype(cb)::value, false>
                 <<<dim3((sa.max_rows + kTok - 1) / kTok, sa.n_embd / kCols, sa.n_exp), kThreads, 0, s>>>(
-                    sa, k, nullptr, 0, nullptr, const_cast<uint16_t*>(h16), ldh, y, ldy);
+                    ksetmix(sa), k, nullptr, 0, nullptr, const_cast<uint16_t*>(h16), ldh, y, ldy);
         });
         launch_check("set_down (mixed)");
         return;
     }
 #if !defined(STRATA_USE_HIP)
     if (sa.n_exp <= 0 || sa.max_rows <= 0) return;
-    if (!mma_now()) {   // (before sm_80: the portable kernels)
+    if (!mma_now()) {   // (before sm_80: the portable kernels - on sm_7x the wmma ones)
+        if (wmma_now() && dispatch<RunWmmaDown>(sa.lay.k2[2], sa.lay.cb, sa, h16, ldh, y, ldy, s)) {
+            launch_check("set_down (Volta tensor cores)");
+            return;
+        }
         if (!dispatch<RunHipDown>(sa.lay.k2[2], sa.lay.cb, sa, h16, ldh, y, ldy, s))
             g_launch_errors.fetch_add(1, std::memory_order_relaxed);
         else
