@@ -1812,13 +1812,29 @@ static int glm_pack_generate(const Options& o) {
         t0 = std::chrono::steady_clock::now();
         gap_mark = t0;   // (STRATA_GLM_PREFILL_GAPS: the first gap's stage starts with the read, not the restore)
         // the prompt one CHUNK at a time (PP reports per chunk: the server shows it and counts it as a heartbeat);
-        // the state is saved before the LAST prompt token, so an identical or extending prompt can reuse it
+        // the state is saved before the generation prompt (snap_at), so an identical or extending prompt can reuse it
         bool snapped = false;
+        // THE SNAPSHOT'S POSITION: before the prompt's generation prompt (its trailing <|assistant|>, then <think> or
+        // <think></think>), where it used to stand before the last token.  The next prompt of this conversation goes on
+        // from the same place whatever came of this answer - the answer itself, nothing (a cancelled answer that the
+        // client sends again with a new message after it), or the same prompt again - so it continues the snapshot
+        // instead of leaving it at the <|assistant|> it no longer has.  STRATA_GLM_SNAP_GEN=0: before the last token.
+        size_t snap_at = prompt.size() - 1;
+        {
+            static const bool snap_gen = env_num("STRATA_GLM_SNAP_GEN", 1) != 0;
+            constexpr int32_t kAsstTok = 154828;   // <|assistant|>
+            // (at `reuse` itself too: the same prompt again restores the snapshot there and keeps it there)
+            for (size_t k = 2; snap_gen && k <= 4 && k <= prompt.size(); ++k) {
+                const size_t a = prompt.size() - k;
+                if (a < reuse || a == 0) break;
+                if (prompt[a] == kAsstTok) { snap_at = a; break; }
+            }
+        }
         // the batched prompt path (glm_prefill.cu) reads all but the last prompt token in chunks, layer by layer;
         // the last one goes through the token path, which leaves the logits the first sample reads
         const int pchunk = model.fast() ? model.prefill_chunk() : 0;
         size_t i_first = reuse;
-        if (pchunk > 0 && prompt.size() - reuse > 1) {
+        if (pchunk > 0 && snap_at > reuse) {
             // one call for everything but the last token: the two halves of a split pipeline the chunks; PP lines
             // (the server's progress and heartbeat) come from the progress callback, possibly on the tail's thread.
             // A checkpoint position (ckpt_marks) ends a call: the state there is kept, and the next call goes on.
@@ -1831,7 +1847,7 @@ static int glm_pack_generate(const Options& o) {
                             (double) done / (ms / 1000.0 + 1e-9), reuse);
                 std::fflush(stdout);
             };
-            std::vector<size_t> marks = ckpt_marks(prompt, reuse, prompt.size() - 1);
+            std::vector<size_t> marks = ckpt_marks(prompt, reuse, snap_at);
             // the first user turn's marker: the end of the system prompt (ckpt_marks' `first`)
             const size_t sys_end = strata::core::system_prompt_end(prompt.data(), prompt.size(), 154827);   // <|user|>
             // without checkpoints (STRATA_GLM_CKPTS=0, the several-conversation scheduler) the read still ends a call
@@ -1849,7 +1865,7 @@ static int glm_pack_generate(const Options& o) {
             size_t mi = 0, seg_start = at;
             // STRATA_GLM_PREFILL_GAPS: a gap before the read too (a round for the running requests) - back-to-back reads
             // would otherwise stall them for the last stage of one and the first of the next
-            if (read_gap_first && prompt_between && at < prompt.size() - 1) {
+            if (read_gap_first && prompt_between && at < snap_at) {
                 const int r = prompt_between();
                 if (r == 1) {
                     pok = false;
@@ -1860,8 +1876,8 @@ static int glm_pack_generate(const Options& o) {
                 }
             }
             int seg_chunk = 0;   // (exact pieces: the chunk the segment's uncut read takes, from its first piece on)
-            while (pok && at < prompt.size() - 1) {
-                const size_t seg_end = mi < marks.size() ? marks[mi] : prompt.size() - 1;
+            while (pok && at < snap_at) {
+                const size_t seg_end = mi < marks.size() ? marks[mi] : snap_at;
                 size_t piece = prompt_piece ? prompt_piece() : 0;
                 if (piece > 0 && interleave.exact) {
                     // whole chunks of the uncut read, each call cut in them: the same arithmetic, the same answer
@@ -1896,7 +1912,7 @@ static int glm_pack_generate(const Options& o) {
                     }
                     // more to read: the decoding requests' turn (none after the last piece - its last token's logits
                     // must still be on the tail when the first sample reads them)
-                    if (at < prompt.size() - 1 && prompt_between) {
+                    if (at < snap_at && prompt_between) {
                         pp_line(at - reuse);
                         const int r = prompt_between();
                         if (r == 1) {
@@ -1919,8 +1935,8 @@ static int glm_pack_generate(const Options& o) {
             // rest to the token path below - from where the prompt path stopped, not from `reuse`
             i_first = at;
             if (pok) {
-                i_first = prompt.size() - 1;
-                pp_line(prompt.size() - 1 - reuse);
+                i_first = snap_at;
+                pp_line(snap_at - reuse);
             } else if (err == "cancelled") {
                 snap_tokens.clear();
                 model.reset();
@@ -1937,9 +1953,9 @@ static int glm_pack_generate(const Options& o) {
         for (size_t i = i_first; i < prompt.size();) {
             strata::core::progress_at("the prompt: the token path, at token", (int64_t) i);
             strata::core::progress_beat();
-            if (model.fast() && !snapped && i == prompt.size() - 1) {
+            if (model.fast() && !snapped && i == snap_at) {
                 if (model.snapshot_save()) {
-                    snap_tokens.assign(prompt.begin(), prompt.end() - 1);
+                    snap_tokens.assign(prompt.begin(), prompt.begin() + (long) snap_at);
                     snap_img_hash = img_hash(snap_tokens.size());
                     snap_in_slot = false;
                 } else {
@@ -1948,7 +1964,7 @@ static int glm_pack_generate(const Options& o) {
                 snapped = true;
             }
             size_t chunk = std::min<size_t>(8, prompt.size() - i);
-            if (model.fast() && !snapped && i + chunk > prompt.size() - 1) chunk = prompt.size() - 1 - i;
+            if (model.fast() && !snapped && i < snap_at && i + chunk > snap_at) chunk = snap_at - i;
             std::vector<int32_t> part(prompt.begin() + (long) i, prompt.begin() + (long) (i + chunk));
             const bool ok = model.forward(part, lg, err);
             if (!ok) {
