@@ -4,6 +4,46 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+- **DeepSeek, several conversations at once** (`--parallel N`, 1-8, a layer split with `--threads on`): each
+  conversation has its own state, and its answer's windows are pipelined over the split so the cards work on different
+  conversations at the same time - a request no longer waits for the whole of another's long answer. `1` (the default)
+  is the single conversation path as before, token for token: `READY` has no `multi=`, no `rid`, and pictures, `STOP`
+  and the engine-end slot work as they did. With several, a conversation that drafts answers in DSpark rounds, each
+  taking the GPUs in turn, exactly as it answers alone (a helper GPU's lane does not run; the engine refuses it then).
+  A request past the N states waits for a lane instead of an ERR. `tools/ds4/parallel_test.py` checks and measures it. [docs/SETTINGS.md](docs/SETTINGS.md).
+- **DeepSeek: several conversations scheduled on events, the prompts read a piece each in turn.** The loop runs on an
+  event queue (rig's evt, ported: `src/ds4/ds4_evt.hpp`) - requests, a token done (a callback on the GPU's stream) and
+  the choice of the next read are events in priority order, and a read, a drafting round or the expert cache's boundary
+  takes the GPUs once every issued token is back. The prompts being read take turns a piece each (a chunk a pipeline
+  stage; a prompt whole in one piece ahead of the longer reads), the answers a token each between. Rig's real traffic replayed (four conversations, 73 turns) against v1.1.28
+  one at a time with the drafter: the first token 1.9 s on the mean (9.2), 6.0 at p95 (33.7), a turn done 13.1 s on the
+  mean (14.2), the wall 509 s (496); the longest turns longer (p95 done 48.1 s, 36.3). `MAYA_DS4_READ_ORDER=ratio`
+  reads the highest response ratio next ((wait + read) / read), `arrival` first come, first served.
+  `tools/ds4/agent_bench.py` (an agent workload, or rig's `.served` log replayed) and `tools/ds4/schedule_bench.py`
+  measure it; [docs/DS4_SCHEDULING.md](docs/DS4_SCHEDULING.md) has how each rule was chosen and what did not work.
+- **DeepSeek: decode gaps while a prompt is read** (`MAYA_DS4_PREFILL_GAPS`): with `--parallel` above 1 a prompt
+  read can pause at its chunk boundaries so the running conversations keep decoding, and a request that arrives during
+  the read is admitted. By default a gap is the same rule as between reads - the answers decode while the soonest one
+  would end before the rest of the read - from measured rates and the answers' lengths so far; `<percent>[,<max gap
+  ms>]` takes a fixed share instead, `0` is off, and N=1 is unchanged. A short prompt that arrives is read in windows in
+  a gap only where that is measured quicker than its turn in chunks (a 4,000-token one took 54 s in windows).
+  `MAYA_DS4_PREFILL_MIN_CHUNKS` (off) cuts a read into chunks so that a short one has gaps too - off because a chunk
+  streams its routed experts again where they do not all fit in VRAM. Not bit-exact, so compare greedy answers with the
+  gaps off.
+  `tools/ds4/parallel_test.py` checks the reading and measures the running conversations' rate. [docs/SETTINGS.md](docs/SETTINGS.md).
+- **DeepSeek: a 512-2047-token prompt no longer goes through windows at a sixth of the speed** on a fresh engine. The
+  choice between the chunked prompt path and windows of 16 modelled a window from its experts' bytes, which left out
+  the fixed costs every window pays on every GPU and the CPU lane's real speed: on a 3-GPU split the second prompt
+  after a start went through windows (100 tokens/s, against 600 in chunks). Windows are now picked from what a full
+  prompt window really took, every one measured (short prompts' too), and the chunked path until one has run.
+- **DeepSeek: the PCIe lane's pulls numbered per GPU.** The fetch kernel's flags are its GPU's, one set for every
+  conversation, and wait for a value equal to the pull's; with several conversations each numbered its requests from 1,
+  so two on one GPU with the same number found the flags set before the experts were read (NaN rows, then an illegal
+  address a few tokens later). A pull's number is now seq * conversations + conversation - one conversation's seq
+  exactly.
+
 ## v1.1.33 - 2026-10-27
 
 A quick fix for setting up MiniMax-M3.1-Flash from our GGUFs.

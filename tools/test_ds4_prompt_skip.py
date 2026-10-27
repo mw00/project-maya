@@ -146,8 +146,8 @@ int main() {
         source = (Path(__file__).resolve().parents[1] / "src/ds4/ds4_model.cu").read_text()
         rows_start = source.index("    static int fl_rows(")
         rows_end = source.index("\n    }", rows_start) + len("\n    }")
-        start = source.index("            if (!c.fl_layers.empty()) {", source.index("    bool run_dev_chunks("))
-        end = source.index("            if (c.lm)", start)
+        start = source.index("        if (!c.fl_layers.empty()) {", source.index("    bool flow_begin("))
+        end = source.index("        return true;", start)
         fixture = r'''
 #include <cstdio>
 #include <cstdlib>

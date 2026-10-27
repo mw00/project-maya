@@ -16,6 +16,7 @@
 // does continue a kept conversation reads only its new tokens.  A kept conversation holds its pictures' marks too (a
 // span's start, its pixels' fingerprint, its length): it comes back only for a prompt whose pictures are the same at
 // the same places.
+#include "ds4_evt.hpp"
 #include "ds4_model.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -94,8 +95,8 @@ void usage() {
     std::fprintf(stderr,
                  "maya-ds4 --pack <model>/maya-ds4 [--gpus 0,1,...] [--max-context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--no-expert-cache] [--verbose]\n"
-                 "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
-                 "           [--suffix-draft N]\n"
+                 "           [--tp N] [--threads on|off] [--parallel N] [--prefill-chunk N] [--dspark on|off|none]\n"
+                 "           [--dspark-conf F] [--suffix-draft N]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
@@ -110,6 +111,7 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false;
     std::atomic<bool> stop{false};
+    bool tagged = false;   // several conversations: a STOP names its request (its rid), and is the loop's to see
     void start() {
         std::thread([this] {
             std::string l, buf;
@@ -141,6 +143,11 @@ struct Lines {
                 if (!l.empty() && l.back() == '\r') l.pop_back();
                 std::lock_guard<std::mutex> lk(mu);
                 if (l == "STOP" || l.rfind("STOP ", 0) == 0) {
+                    if (tagged && l.size() > 5) {   // (several conversations: a request's own STOP, to the loop; mu held)
+                        q.push_back(l);
+                        cv.notify_all();
+                        continue;
+                    }
                     stop.store(true);
                     continue;
                 }
@@ -157,6 +164,20 @@ struct Lines {
     bool next(std::string& l) {
         std::unique_lock<std::mutex> lk(mu);
         cv.wait(lk, [&] { return !q.empty() || eof; });
+        if (q.empty()) return false;
+        l = q.front();
+        q.pop_front();
+        return true;
+    }
+    // a line already read (the gap callback admits a request while a prompt read is paused)
+    bool pending() {
+        std::lock_guard<std::mutex> lk(mu);
+        return !q.empty();
+    }
+    // next(), waiting at most ms for a line (several conversations: the loop polls between the tokens it takes)
+    bool next_for(std::string& l, int ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        if (!cv.wait_for(lk, std::chrono::milliseconds(ms), [&] { return !q.empty() || eof; })) return false;
         if (q.empty()) return false;
         l = q.front();
         q.pop_front();
@@ -315,6 +336,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
 
 struct Req {
     long long max_new = 0;
+    int rid = -1;           // several conversations: the request's own number (the server's, tagged on every line)
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
     unsigned long long seed = 0;
@@ -435,7 +457,8 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
             break;
         }
         const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
-        if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
+        if (k == "rid") r.rid = std::atoi(v.c_str());
+        else if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
         else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
@@ -455,14 +478,19 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
 
+static bool serve_multi(int parallel) { return parallel > 1; }
+
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
-          Lookup* lk) {
+          int parallel, Lookup* lk) {
+    const bool multi = serve_multi(parallel);   // (1: the engine as before, one conversation)
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
-    std::printf("READY %lld stop\n", (long long) m.max_context());
+    if (multi) std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
+    else std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
     std::fprintf(stderr, "maya ds4 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
     Lines in;
+    in.tagged = multi;   // (several conversations: STOP <rid> is a request's own, the loop's to see)
     in.start();
     std::string line;
     unsigned long long counter = 0;
@@ -921,6 +949,922 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGPIPE, SIG_IGN);
 #endif
     }
+    // ---- several conversations at once (--parallel N): a conversation a lane of the model's (seq_bind), its prompt read
+    // in feed_unit() pieces (the same windows or chunks the one-conversation path reads, so the prompt's tokens are the
+    // same) between the other conversations' tokens, and its answer a token a window pipelined over the split's stages
+    // (multi_issue: the cards work on different conversations at once; multi_take waits only for the oldest).  A
+    // request's lines carry its rid: READY ... multi=N, T / PP / DONE / ERR <rid> ..., STOP <rid>.  A conversation that
+    // drafts (spec) answers in DSpark rounds instead, each the GPUs' alone (draft_round below).
+    if (multi) {
+        struct Job {
+            int lane = -1, rid = -1;
+            Req r;
+            bool used = false;        // a request is on it
+            bool reading = false;     // its prompt is being read, a piece a round
+            bool flying = false;      // a window of it is in flight
+            bool deferred = false;    // its next token waits for the round's end (a drain, a prompt piece)
+            bool stopping = false;    // STOP <rid>: at the next token it has
+            bool in_think = false;
+            size_t total = 0, done = 0, from = 0;
+            bool continued = false;
+            double t0 = 0, t1 = 0;
+            long long produced = 0, limit = 0;
+            std::string finish = "length";
+            int last = -1;            // the token taken from its window, not yet its window's input (a drain)
+            uint64_t cnt = 0;         // its sample chain's counter (one a request, as the one-conversation path's)
+            strata::ds4::Stats s0;
+            // the drafter (its spec, else the engine's): its answer in rounds - drafts verified in one window - each round
+            // the GPUs' alone (an owner, want_devices), in turn with the reads and the other drafting conversations
+            bool drafts = false;
+            bool round_due = false;    // a round is owed it (its next token not out yet)
+            bool round_asked = false;  // (the event that asks the GPUs for it is queued)
+            bool cool = false;         // its last round's drafts were all under the floor: the next does without
+            long long d_off = 0, d_acc = 0;
+        };
+        const int places = m.seq_count();
+        std::vector<Job> jobs((size_t) places);
+        std::vector<uint64_t> age((size_t) places, 0);   // a conversation's last use (a new prompt takes the oldest lane)
+        uint64_t clock = 0;
+        for (int s = 0; s < places; ++s) jobs[(size_t) s].lane = s;
+        int in_flight = 0;          // the lanes with a token in flight (each comes back as an event: multi_on_done)
+        std::deque<int> deferred;   // the lanes whose next token waits for the devices' owner (a read, a boundary)
+        bool issuing = true;
+        // the loop's events (ds4_evt.hpp, rig's evt): the reader's lines, then the tokens the GPUs hand back, run one at
+        // a time on this thread; the work that needs the devices (a prompt's read, the expert cache's boundary) runs
+        // once every issued token is back (want_devices).  Idle 200 ms: the Monitor's line
+        // (a line first - every request that came is admitted before a read is chosen - then the choice of the next
+        // read, then the tokens)
+        enum : int { kToken = 1, kRead = 2, kLine = 3 };
+        std::function<void()> idle_tick;
+        strata::ds4::evt::Engine eng([&] {
+            if (idle_tick) idle_tick();
+        }, 200);
+        std::atomic<int> lines_waiting{0};   // (the reader's lines not run yet: a read's gap admits them)
+        std::deque<Req> waiting;             // requests past the N states: each takes the next lane that frees
+        long long answers_n = 0, answers_tok = 0;   // the answers ended so far and their tokens (an answer's expected length)
+        double decode_round_ms = 0.0;               // a gap's round as last measured: a token for every answer running
+        std::function<void()> admit_waiting, kick_read;
+        double read_tok_ms = 0.0;   // the last read's tokens a millisecond (0: none yet) - a waiting read's own time
+        // MAYA_DS4_READ_ORDER: unset (or `pieces`) round robin in pieces of a chunk a pipeline stage (the split's
+        // stages kept busy, no read's size guessed); `ratio` the highest response ratio; `arrival` first come, first served
+        const std::string read_order = [] {
+            const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+            return std::string(v != nullptr ? v : "");
+        }();
+        const bool read_pieces = read_order != "ratio" && read_order != "arrival";
+        const size_t read_piece_tokens = m.prompt_chunk() > 0
+                                             ? (size_t) m.prompt_chunk() * (size_t) m.pipeline_stages()
+                                             : (size_t) m.feed_unit();
+        std::deque<int> read_fifo;  // (pieces: the conversations reading, in turn - a piece each, then to the back)
+        // (a prompt whole in one piece joins the line ahead of the longer reads, behind the other one-piece prompts:
+        // it is through in its turn, so a short question does not wait a round of long reads' pieces)
+        auto one_piece = [&](int lane) {
+            const Job& r = jobs[(size_t) lane];
+            return r.total - r.done <= read_piece_tokens;
+        };
+        auto join_read = [&](int lane) {
+            if (!one_piece(lane)) {
+                read_fifo.push_back(lane);
+                return;
+            }
+            auto at = read_fifo.begin();
+            while (at != read_fifo.end() && one_piece(*at)) ++at;
+            read_fifo.insert(at, lane);
+        };
+        double read_t0 = 0.0;       // when the read in progress began (a gap's estimate of what is left of it)
+        int64_t read_done = 0;      // the read in progress's tokens through every layer so far (the model's progress)
+        int active = 0, since_boundary = 0, stat_n = 0, counter = 0;
+        double stat_t0 = now_ms();
+        strata::ds4::Stats stat_s0 = m.stats();
+        // GLM's multi_boundary: every 32 windows a conversation (times the conversations running) every issued token is
+        // back and the expert cache looks at its tiers - between windows, where nothing in flight can be moved out from
+        // under it (a swap's copy and an in-flight window's expert reads must not meet)
+        int boundary_every = 32;
+        if (const char* v = std::getenv("STRATA_DS4_MULTI_BOUNDARY")) boundary_every = std::max(0, std::atoi(v));
+        std::string err;
+        bool gap_failed = false;
+        const strata::ds4::PrefillGaps pg = m.prefill_gaps();
+        static const bool gap_credit = [] {
+            const char* v = std::getenv("MAYA_DS4_PREFILL_GAP_CREDIT");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        double gap_mark = 0.0, gap_round_ms = 0.0, gap_ms = 0.0;
+        long long gap_tok = 0;
+        int gap_count = 0;
+        bool gaps_over = false;
+        Job* reading_job = nullptr;
+        std::function<int()> read_gap;
+        // the Monitor's live counters over everything decoded since the engine last had nothing to do (GLM's line)
+        auto stat_line = [&]() {
+            const double ms = now_ms() - stat_t0;
+            const strata::ds4::Stats& s = m.stats();
+            const double tok = (double) std::max(1, stat_n);
+            const double ex = (double) (s.experts - stat_s0.experts), cx = (double) (s.cpu_experts - stat_s0.cpu_experts),
+                         sx = (double) (s.stream_experts - stat_s0.stream_experts),
+                         hx = (double) (s.helper_experts - stat_s0.helper_experts);
+            char b[256];
+            std::snprintf(b, sizeof b, " tok_s=%.2f ms_tok=%.2f vram_hit=%.4f cpu=%.3f engram_ms=%.3f active=%d",
+                          ms > 0 ? 1000.0 * (double) stat_n / ms : 0.0, stat_n > 0 ? ms / (double) stat_n : 0.0,
+                          ex > 0 ? 1.0 - (cx + sx + hx) / ex : 1.0, cx / tok, (s.engram_ms - stat_s0.engram_ms) / tok,
+                          active);
+            std::printf("STAT%s\n", b);
+            std::fflush(stdout);
+            stat_t0 = now_ms();
+            stat_n = 0;
+            stat_s0 = s;
+        };
+        auto write_done = [&](Job& j) {
+            const double t2 = now_ms();
+            const strata::ds4::Stats& se = m.stats();
+            std::printf("DONE %d %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", j.rid, j.produced, j.r.ids.size(),
+                        j.t1 - j.t0, t2 - j.t1, j.finish.c_str(), j.d_acc, j.d_off, j.from,
+                        (long long) ((se.experts - j.s0.experts) - (se.cpu_experts - j.s0.cpu_experts)),
+                        (long long) (se.experts - j.s0.experts));
+            std::fflush(stdout);
+            std::fprintf(stderr, "maya ds4 serve: [%d] prompt %zu tokens = %zu reused + %zu read in %.0f ms, %lld "
+                                 "generated in %.0f ms (%.2f tok/s)\n", j.rid, j.r.ids.size(), j.from,
+                         j.r.ids.size() - j.from, j.t1 - j.t0, j.produced, t2 - j.t1,
+                         t2 > j.t1 ? 1000.0 * (double) j.produced / (t2 - j.t1) : 0.0);
+            m.save_profile();
+        };
+        idle_tick = [&] {
+            if (stat_n > 0) stat_line();
+        };
+        // a lane's request ends: its own figures, and the lane free (its conversation stays in it for its next turn,
+        // until another request takes the lane - a waiting one, next)
+        auto end_job = [&](Job& j) {
+            if (j.flying) --in_flight;
+            j.flying = j.deferred = j.reading = j.stopping = j.round_due = false;
+            j.used = false;
+            age[(size_t) j.lane] = ++clock;
+            if (active > 0) --active;
+            if (j.produced > 0) {
+                ++answers_n;
+                answers_tok += j.produced;
+            }
+            write_done(j);
+            if (!waiting.empty()) eng.add([&] { admit_waiting(); }, kLine);
+        };
+        auto issue = [&](Job& j, int tok) {
+            j.last = tok;
+            if (!issuing) {
+                j.deferred = true;
+                deferred.push_back(j.lane);
+                return;
+            }
+            if (!m.multi_issue(j.lane, tok, j.r.temperature, j.r.top_p, j.r.top_k, j.r.min_p, j.r.seed, j.cnt, err)) {
+                std::fprintf(stderr, "ds4: [%d] %s\n", j.rid, err.c_str());
+                std::printf("ERR %d %s\n", j.rid, err.c_str());
+                std::fflush(stdout);
+                j.finish = "cancel";
+                gap_failed = true;
+                m.seq_bind(j.lane);
+                m.reset();
+                end_job(j);
+                return;
+            }
+            j.flying = true;
+            ++in_flight;
+        };
+        // a token of its answer: printed, then its eos / length / STOP ends it (false), or it reads on (true)
+        auto deliver = [&](Job& j, int tok) -> bool {
+            ++j.produced;
+            m.seq_bind(j.lane);   // (its own position: the context's limit below is its lane's)
+            if (j.in_think && tok == j.r.think_end) j.in_think = false;   // (closed: by the model, or by the budget)
+            std::printf("T %d %d\n", j.rid, tok);
+            std::fflush(stdout);
+            bool end = false;
+            for (int e : eos) end = end || tok == e;
+            if (j.stopping) j.finish = "cancel";
+            else if (end) j.finish = "stop";
+            else if (j.produced >= j.limit || m.pos() >= m.seq_context(j.lane)) j.finish = "length";
+            else return true;
+            end_job(j);
+            return false;
+        };
+        // a token of its answer back from its window: delivered, then the window that reads on issued
+        auto take_lane = [&](Job& j) {
+            const int tok = m.multi_take(j.lane, err);
+            if (j.flying) --in_flight;
+            j.flying = false;
+            ++since_boundary;
+            ++stat_n;
+            if (tok < 0) {
+                std::fprintf(stderr, "ds4: [%d] %s\n", j.rid, err.c_str());
+                std::printf("ERR %d %s\n", j.rid, err.c_str());
+                std::fflush(stdout);
+                j.finish = "cancel";
+                gap_failed = true;
+                m.seq_bind(j.lane);
+                m.reset();   // (the state past a failed window is not read on from)
+                end_job(j);
+                return;
+            }
+            if (deliver(j, tok)) issue(j, tok);   // (the token just made is the next window's input)
+        };
+        // every issued token back (a prompt piece, a boundary): the prompt path, or the expert cache's look at its
+        // tiers, has the devices.  Their next windows are issued by reissue() after it (not before: nothing of the
+        // conversations is in flight while the tiers move an expert out of a slot, nor while a prompt's piece runs)
+        auto reissue = [&]() {
+            issuing = true;
+            for (int lane : deferred) {
+                Job& j = jobs[(size_t) lane];
+                if (!j.deferred || !j.used) {
+                    j.deferred = false;
+                    continue;
+                }
+                j.deferred = false;
+                issue(j, j.last);
+            }
+            deferred.clear();
+        };
+        // the work that needs the devices (a prompt's read, the boundary): the lanes' next tokens wait in deferred
+        // while the issued ones come back, then it runs (settle), then they are issued again.  Asked for inside such
+        // work (a read's gap): it runs after it
+        std::deque<std::function<void()>> owners;
+        bool owning = false, quit = false;
+        std::function<void()> settle;
+        auto want_devices = [&](std::function<void()> f) {
+            owners.push_back(std::move(f));
+            if (owning) return;
+            issuing = false;
+            settle();
+        };
+        // a prompt's STOP before its next piece (the one-conversation path checks its flag between them too): the
+        // conversation before it kept where its checkpoints reach, its DONE `cancel`, none of its answer
+        auto stop_read = [&](Job& j) {
+            const bool back = j.from > 0 && m.restore((int64_t) j.from) && (size_t) m.pos() == j.from;
+            if (!back) {
+                m.reset();
+                j.from = 0;   // (nothing kept: the DONE's reused field is 0, as the one-conversation path's is)
+            }
+            std::fprintf(stderr, "maya ds4 serve: [%d] stopped while reading its prompt of %zu tokens%s\n", j.rid, j.total,
+                         back ? "; the conversation before it is kept" : "");
+            j.finish = "cancel";
+            j.produced = 0;
+            j.t1 = now_ms();
+            end_job(j);
+        };
+        // the gaps' rule (MAYA_DS4_PREFILL_GAPS unset): shortest remaining work first, between the read and the answers
+        // running, as between the reads.  An answer's remaining tokens: the answers ended so far average (its max_new at
+        // most; none ended yet: its max_new), or as many again as it has once it is past that - at a round's measured
+        // time each; the read's: the tokens it has left at the last read's rate.  A gap while the soonest answer ends
+        // before the read does.  Not measured yet (no round, no read): a gap - its round measures one
+        const bool gaps_adaptive = std::getenv("MAYA_DS4_PREFILL_GAPS") == nullptr &&
+                                   std::getenv("STRATA_DS4_PREFILL_GAPS") == nullptr;
+        auto answer_left = [&](const Job& j) -> double {
+            const long long cap = j.limit - j.produced;
+            long long left = cap;
+            if (answers_n > 0) {
+                const long long mean = answers_tok / answers_n;
+                left = mean > j.produced ? mean - j.produced : j.produced;
+            }
+            return (double) std::max(1LL, std::min(cap, left));
+        };
+        auto soonest_answer_ms = [&]() -> double {   // (< 0: no answer running)
+            double soonest = -1.0;
+            for (const Job& k : jobs)
+                if (k.used && !k.reading) {
+                    const double t = answer_left(k) * decode_round_ms;
+                    if (soonest < 0.0 || t < soonest) soonest = t;
+                }
+            return soonest;
+        };
+        auto answers_first = [&]() -> bool {
+            if (reading_job == nullptr) return false;
+            if (decode_round_ms <= 0.0 || read_tok_ms <= 0.0) return true;
+            const double soonest = soonest_answer_ms();
+            if (soonest < 0.0) return false;
+            const double read = std::max(0.0, (double) (reading_job->total - reading_job->done) -
+                                                  read_tok_ms * (now_ms() - read_t0 - gap_ms));
+            return soonest < read / read_tok_ms;
+        };
+        // its prompt's next piece: feed_unit() tokens, as the one-conversation path's loop feeds them; PP <rid> read
+        // total ms tok/s reuse.  False: it ended there (a STOP, or an error)
+        auto read_piece = [&](Job& j) -> bool {
+            m.set_cancel([&] { return j.stopping; });
+            reading_job = &j;
+            gap_mark = now_ms();
+            gap_round_ms = gap_ms = 0.0;
+            gap_tok = 0;
+            gap_count = 0;
+            gaps_over = false;
+            gap_failed = false;
+            m.set_prefill_gap_wanted([&] {
+                if (!pg.on() || gaps_over || j.stopping) return false;
+                // (a prompt waiting that fits a chunk: a gap asks the windows rule again - once the read's rate is
+                //  known it may read it in windows instead of after the read)
+                bool any_answer = false, short_waiting = false;
+                const int ch = m.prompt_chunk();
+                for (Job& k : jobs) {
+                    if (!k.used) continue;
+                    if (!k.reading) any_answer = true;
+                    else if (&k != &j && ch > 0 && k.total - k.done <= (size_t) ch) short_waiting = true;
+                }
+                if (!any_answer && !short_waiting && lines_waiting.load() == 0) return false;
+                if (lines_waiting.load() > 0 || short_waiting) return true;
+                if (gaps_adaptive) return answers_first();
+                if (!gap_credit) return true;
+                return strata::ds4::prefill_gap_due(pg, now_ms() - gap_mark, gap_round_ms);
+            });
+            m.set_prefill_gap([&] { return read_gap(); });
+            const size_t n = std::min<size_t>(read_pieces ? read_piece_tokens : (size_t) m.feed_unit(), j.total - j.done);
+            const bool fin = j.done + n == j.total;
+            const double t_read = now_ms();
+            read_t0 = t_read;
+            read_done = 0;
+            m.set_progress([&](int64_t d) { read_done = d; });
+            static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
+            if (j.from > 0 && j.from < j.total && j.done == j.from) m.checkpoint(1);   // (a STOP goes back here)
+            std::string e;
+            bool ok;
+            if (fin && last_window) {
+                ok = (n < 2 || m.feed(j.r.ids.data() + j.done, (int) n - 1, 0, e));
+                if (ok) m.checkpoint(1);
+                ok = ok && m.feed(j.r.ids.data() + j.done + (long) n - 1, 1, 1, e);
+            } else
+                ok = fin ? m.feed_mark(j.r.ids.data() + j.done, (int) n, 1, 1, e)
+                         : m.feed(j.r.ids.data() + j.done, (int) n, 0, e);
+            m.set_cancel(nullptr);
+            m.set_progress(nullptr);
+            m.set_prefill_gap(std::function<int()>());
+            m.set_prefill_gap_wanted(std::function<bool()>());
+            reading_job = nullptr;
+            if (ok && n > 0) read_tok_ms = (double) n / std::max(1.0, now_ms() - t_read - gap_ms);   // (its gaps out)
+            j.done += n;
+            {
+                const double ms = now_ms() - j.t0;
+                std::printf("PP %d %zu %zu %.1f %.1f %zu\n", j.rid, j.done, j.total, ms,
+                            ms > 0 ? 1000.0 * (double) (j.done - j.from) / ms : 0.0, j.from);
+                std::fflush(stdout);
+            }
+            if (!ok) {
+                if (j.stopping || m.cancelled()) {
+                    stop_read(j);
+                } else {
+                    std::fprintf(stderr, "ds4: [%d] %s\n", j.rid, e.c_str());
+                    std::printf("ERR %d %s\n", j.rid, e.c_str());
+                    m.reset();
+                    j.from = 0;
+                    j.finish = "cancel";
+                    j.produced = 0;
+                    j.t1 = now_ms();
+                    end_job(j);
+                }
+                return false;
+            }
+            return true;
+        };
+        // one round of a drafting conversation's answer, the GPUs its own (an owner, or a read's gap): the one-
+        // conversation path's round on its lane - the drafter's drafts while their confidence holds, verified in one
+        // window, else a plain step - and the thinking budget as there (a round never runs past it; the round at it is a
+        // plain step whose next token becomes think_end).  Its tokens delivered; going on, the next round is owed
+        std::function<void(int)> ask_round;
+        auto draft_round = [&](Job& j) {
+            j.round_due = false;
+            if (!j.used || j.reading) return;
+            m.seq_bind(j.lane);
+            if (j.stopping) {
+                j.finish = "cancel";
+                end_job(j);
+                return;
+            }
+            int room = (int) std::min<long long>(j.limit - j.produced, m.seq_context(j.lane) - m.pos());
+            const bool close_think = j.in_think && j.produced >= j.r.think_budget;
+            if (close_think) room = 1;
+            else if (j.in_think) room = (int) std::min<long long>(room, j.r.think_budget - j.produced);
+            const bool try_spec = !j.cool;
+            std::vector<int> got;
+            int off = 0, acc = 0;
+            unsigned long long counter = j.cnt;
+            if (!round(m, j.last, room, try_spec, j.r.conf >= 0 ? j.r.conf : conf_min, j.r.temperature, j.r.top_p,
+                       j.r.top_k, j.r.min_p, j.r.seed, counter, got, off, acc, err, j.r.cum)) {
+                std::fprintf(stderr, "ds4: [%d] %s\n", j.rid, err.c_str());
+                std::printf("ERR %d %s\n", j.rid, err.c_str());
+                std::fflush(stdout);
+                j.finish = "cancel";
+                end_job(j);
+                return;
+            }
+            j.cnt = counter;
+            j.d_off += off;
+            j.d_acc += acc;
+            j.cool = try_spec && off == 0;
+            if (close_think && !got.empty()) got.back() = j.r.think_end;   // (room 1: one token, not fed yet)
+            if (got.empty()) {   // (no room left: as a length end)
+                j.finish = "length";
+                end_job(j);
+                return;
+            }
+            stat_n += (int) got.size();
+            for (int tok : got)
+                if (!deliver(j, tok)) return;
+            j.last = got.back();
+            ask_round(j.lane);
+        };
+        ask_round = [&](int lane) {
+            Job& j = jobs[(size_t) lane];
+            j.round_due = true;
+            if (j.round_asked) return;
+            j.round_asked = true;
+            eng.add([&, lane] {
+                Job& k = jobs[(size_t) lane];
+                k.round_asked = false;
+                if (!k.round_due) return;
+                want_devices([&, lane] {
+                    Job& w = jobs[(size_t) lane];
+                    if (w.round_due) draft_round(w);
+                });
+            }, kToken);
+        };
+        // its first token: the prompt's last logits with its chain (greedy or sampled, as a round's)
+        auto first_token = [&](Job& j) {
+            m.seq_bind(j.lane);
+            m.checkpoint(0);
+            if (!j.continued) m.pin();   // (a new run of prompts: where it may be rendered again from)
+            j.t1 = now_ms();
+            const int tok = m.sample(j.r.temperature, j.r.top_p, j.r.top_k, j.r.min_p, j.r.seed, j.cnt);
+            ++j.produced;
+            ++stat_n;
+            std::printf("T %d %d\n", j.rid, tok);
+            std::fflush(stdout);
+            if (j.in_think && tok == j.r.think_end) j.in_think = false;
+            bool end = false;
+            for (int e : eos) end = end || tok == e;
+            bool ended = false;
+            if (j.stopping) {
+                j.finish = "cancel";
+                ended = true;
+            } else if (end) {
+                j.finish = "stop";
+                ended = true;
+            } else if (j.produced >= j.limit || m.pos() >= m.seq_context(j.lane)) {
+                j.finish = "length";
+                ended = true;
+            }
+            if (ended) {
+                end_job(j);
+                return;
+            }
+            if (j.drafts) {
+                j.last = tok;
+                ask_round(j.lane);
+                return;
+            }
+            issue(j, tok);
+        };
+        // a free lane whose conversation this prompt continues (in place: nothing is read again), else the lane whose
+        // conversation was used longest ago (that one is set aside, and this prompt read in the lane)
+        auto pick_lane = [&](const std::vector<int>& ids) {
+            int best = -1;
+            size_t best_c = 0;
+            for (Job& j : jobs) {
+                if (j.used) continue;
+                m.seq_bind(j.lane);
+                const auto& t = m.tokens();
+                size_t c = 0;
+                while (c < t.size() && c + 1 < ids.size() && t[c] == ids[c]) ++c;
+                if (!t.empty() && c == t.size() && t.size() < ids.size() && c > best_c) {
+                    best_c = c;
+                    best = j.lane;
+                }
+            }
+            if (best >= 0) return best;
+            int lane = -1;
+            for (Job& j : jobs) {
+                if (j.used) continue;
+                if (lane < 0 || age[(size_t) j.lane] < age[(size_t) lane]) lane = j.lane;
+            }
+            return lane;
+        };
+        // a request starts: its lane, the conversation it continues (or the one set aside for it), its prompt's pieces
+        auto start_job = [&](Job& j, Req& r) {
+            j.rid = r.rid;
+            j.r = std::move(r);
+            j.used = j.reading = j.flying = j.deferred = j.stopping = false;
+            j.finish = "length";
+            j.produced = 0;
+            j.cnt = (uint64_t) ++counter;
+            j.drafts = (j.r.spec < 0 ? spec : j.r.spec != 0) && m.draft_block() > 0;
+            j.round_due = j.round_asked = j.cool = false;
+            j.d_off = j.d_acc = 0;
+            j.in_think = j.r.think_budget > 0 && j.r.think_end >= 0;
+            m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
+            j.s0 = m.stats();
+            j.t0 = now_ms();
+            if (j.r.ids.size() + (size_t) std::max(0LL, j.r.max_new) > (size_t) m.seq_context(j.lane)) {
+                std::printf("ERR %d the prompt (%zu tokens) and max_new %lld are more than the context %lld\n", j.rid,
+                            j.r.ids.size(), j.r.max_new, (long long) m.seq_context(j.lane));
+                std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", j.rid, j.r.ids.size());
+                std::fflush(stdout);
+                return;
+            }
+            // the conversation this prompt continues, or a kept one it does continue, or none
+            const auto& st = m.tokens();
+            const size_t n_state = st.size();
+            size_t c = 0;
+            while (c < n_state && c < j.r.ids.size() && st[c] == j.r.ids[c]) ++c;
+            j.from = 0;
+            j.continued = false;
+            if (n_state > 0 && c == n_state && n_state < j.r.ids.size()) {
+                j.from = n_state;
+                j.continued = true;
+            } else {
+                slot_put("");   // (this lane's conversation, set aside: another one takes the model)
+                const int64_t limit = (int64_t) std::min(c, j.r.ids.size() - 1);
+                const int64_t rs = m.restorable(limit);
+                bool whole = false;
+                const size_t back = slot_take(j.r.ids, std::vector<Pic>{}, rs > 0 ? (size_t) rs : 0, whole);
+                if (back > 0) {
+                    j.from = back;
+                    j.continued = whole;
+                } else if (rs >= 0 && m.restore(limit)) j.from = (size_t) m.pos();
+                else m.reset();
+            }
+            // its penalties for every pick of its answer (llama.cpp's; a value that is not a number: neutral)
+            m.set_penalties(j.r.pen_n < 0 ? INT_MAX : j.r.pen_n,
+                            std::isfinite(j.r.pen_repeat) && j.r.pen_repeat > 0.0f ? j.r.pen_repeat : 1.0f,
+                            std::isfinite(j.r.pen_freq) ? j.r.pen_freq : 0.0f,
+                            std::isfinite(j.r.pen_present) ? j.r.pen_present : 0.0f);
+            j.total = j.r.ids.size();
+            j.done = j.from;
+            j.limit = j.r.max_new > 0 ? j.r.max_new : m.seq_context(j.lane) - (long long) j.r.ids.size();
+            j.used = true;
+            j.reading = true;
+            if (read_pieces) join_read(j.lane);
+            ++active;
+            age[(size_t) j.lane] = ++clock;
+        };
+        // the waiting requests, oldest first, each into a free lane (its conversation's, or the oldest one's)
+        admit_waiting = [&]() {
+            while (!waiting.empty() && !quit) {
+                const int lane = pick_lane(waiting.front().ids);
+                if (lane < 0) return;
+                Req r = std::move(waiting.front());
+                waiting.pop_front();
+                m.seq_bind(lane);
+                start_job(jobs[(size_t) lane], r);
+            }
+            if (kick_read) kick_read();
+        };
+        // a line of the reader's: a request, a STOP, the end.  True: the engine ends
+        auto handle_line = [&](const std::string& line) -> bool {
+            if (line == "QUIT") return true;
+            if (line.rfind("STOP ", 0) == 0) {
+                const int rid = std::atoi(line.c_str() + 5);
+                for (Job& j : jobs)
+                    if (j.used && j.rid == rid) j.stopping = true;
+                for (auto it = waiting.begin(); it != waiting.end();)   // (a waiting one: ended before it began)
+                    if (it->rid == rid) {
+                        std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", it->rid, it->ids.size());
+                        std::fflush(stdout);
+                        it = waiting.erase(it);
+                    } else ++it;
+                return false;
+            }
+            const bool geni = line.rfind("GENI ", 0) == 0;
+            if (!geni && line.rfind("GEN ", 0) != 0) {
+                std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+                std::fflush(stdout);
+                return false;
+            }
+            Req r;
+            if (!parse_gen(line, r, geni)) {
+                std::printf("ERR expected: GEN <max_new> rid=<id> [keys] <id,id,...>\n");
+                std::fflush(stdout);
+                return false;
+            }
+            if (r.rid < 0) {
+                std::printf("ERR a request needs its rid (READY ... multi=%d): GEN <max_new> rid=<id> [keys] <ids>\n", places);
+                std::fflush(stdout);
+                return false;
+            }
+            if (geni) {   // (a conversation's state holds no pictures: the slots are text only)
+                std::printf("ERR %d pictures need --parallel 1: a conversation's state holds none\n", r.rid);
+                std::printf("DONE %d 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.rid, r.ids.size());
+                std::fflush(stdout);
+                return false;
+            }
+            waiting.push_back(std::move(r));   // (its turn: now, or when a lane frees)
+            admit_waiting();
+            return false;
+        };
+        // one decode gap of the prompt's read (MAYA_DS4_PREFILL_GAPS): a request that arrived while the read is
+        // paused is admitted and, if its prompt fits a chunk, read in its own lane in windows; the running
+        // conversations decode in rounds, at least one, for the budget the read earned since the last gap.
+        read_gap = [&]() -> int {
+            if (reading_job == nullptr) return 1;
+            if (reading_job->stopping) {
+                m.seq_bind(reading_job->lane);
+                return 1;
+            }
+            const double t_in = now_ms();
+            const double stage_ms = t_in - gap_mark;
+            while (lines_waiting.load() > 0 && eng.pump(0)) {}   // (the lines that came: run now - a line outranks a token)
+            if (quit) {
+                m.seq_bind(reading_job->lane);
+                return 1;
+            }
+            if (reading_job->stopping) {
+                m.seq_bind(reading_job->lane);
+                return 1;
+            }
+            gap_failed = false;
+            const int ch = m.prompt_chunk();
+            for (Job& j : jobs) {
+                if (!j.used || !j.reading || &j == reading_job) continue;
+                if (j.stopping) {
+                    m.seq_bind(j.lane);
+                    stop_read(j);
+                    continue;
+                }
+                size_t rem = j.total - j.done;
+                if (rem == 0) {
+                    j.reading = false;
+                    first_token(j);
+                    continue;
+                }
+                // a longer new prompt waits its turn; so does one whose windows would take longer than its turn: the
+                // paused read's rest and its own read in chunks at the read's rate (this read's so far - its progress -
+                // or the last one's), against its windows at what a window took here (not measured yet: its first
+                // window, which measures one).  Windows read a prompt several times slower than chunks: a 4,000-token
+                // prompt in a gap of a 16,000-token read, 54 s against ~4 s in chunks after it
+                if (ch <= 0 || rem > (size_t) ch) continue;
+                const double busy_ms = now_ms() - read_t0 - gap_ms;
+                const double rate = read_done > 0 && busy_ms > 0.0 ? (double) read_done / busy_ms : read_tok_ms;
+                if (rate <= 0.0) continue;   // (no chunk of it through yet, no read before: the next gap knows)
+                const size_t piece = reading_job->total - reading_job->done;
+                const double paused_left = piece > (size_t) read_done ? (double) (piece - (size_t) read_done) : 0.0;
+                const double turn_ms = (paused_left + (double) rem) / rate;
+                const int wr = m.window_rows();
+                m.seq_bind(j.lane);
+                std::string e;
+                bool ok = true;
+                if (m.window_s() <= 0.0 && rem > (size_t) wr) {
+                    ok = m.feed_windows(j.lane, j.r.ids.data() + j.done, wr, 0, e);
+                    if (ok) {
+                        j.done += (size_t) wr;
+                        rem -= (size_t) wr;
+                    }
+                }
+                if (ok && 1000.0 * m.window_s() * (double) ((rem + (size_t) wr - 1) / (size_t) wr) >= turn_ms) continue;
+                if (ok && rem > 1) ok = m.feed_windows(j.lane, j.r.ids.data() + j.done, (int) rem - 1, 0, e);
+                if (ok) m.checkpoint(1);
+                if (ok) ok = m.feed_windows(j.lane, j.r.ids.data() + j.done + (long) rem - 1, 1, 1, e);
+                if (!ok) {
+                    std::fprintf(stderr, "ds4: [%d] %s\n", j.rid, e.c_str());
+                    std::printf("ERR %d %s\n", j.rid, e.c_str());
+                    std::fflush(stdout);
+                    m.seq_bind(j.lane);
+                    m.reset();
+                    j.from = 0;
+                    j.finish = "cancel";
+                    j.produced = 0;
+                    j.t1 = now_ms();
+                    end_job(j);
+                    gap_failed = true;
+                    continue;
+                }
+                j.done = j.total;
+                {
+                    const double ms = now_ms() - j.t0;
+                    std::printf("PP %d %zu %zu %.1f %.1f %zu\n", j.rid, j.done, j.total, ms,
+                                ms > 0 ? 1000.0 * (double) (j.done - j.from) / ms : 0.0, j.from);
+                    std::fflush(stdout);
+                }
+                j.reading = false;
+                first_token(j);
+            }
+            for (Job& j : jobs)   // (a drafting conversation owed a round: one, the read paused)
+                if (j.used && !j.reading && j.drafts && j.round_due) draft_round(j);
+            m.seq_bind(reading_job->lane);
+            if (gap_failed) return 2;
+            // (the overrun bound is the decode's - a prompt read here in windows is its own, measured cheaper than its
+            //  turn - while the read's paused time, gap_ms, is all of it)
+            const double t_decode = now_ms();
+            bool any = false;
+            for (Job& j : jobs)
+                if (j.used && !j.reading) any = true;
+            if (!any) {   // (lines admitted, no answer to decode: the pause ends)
+                const double this_ms = now_ms() - t_in;
+                gap_ms += this_ms;
+                gap_mark = now_ms();
+                if (now_ms() - t_decode > pg.max_ms && !gaps_over) {
+                    gaps_over = true;
+                    std::fprintf(stderr, "ds4 multi: a decode gap took %.0f ms (more than %.0f): no more gaps in this read\n",
+                                 now_ms() - t_decode, pg.max_ms);
+                }
+                return 0;
+            }
+            const double budget = strata::ds4::prefill_gap_budget_ms(pg, stage_ms);
+            const int n0 = stat_n;
+            const double t_rounds = now_ms();
+            // the answers decode: each token back (an event) issues its next, for the budget - a round at least, every
+            // answer that was running a token more (or ended) - then every issued token back before the read goes on
+            std::vector<long long> had((size_t) places, -1);
+            for (Job& j : jobs)
+                if (j.used && !j.reading) had[(size_t) j.lane] = j.produced;
+            const auto round_done = [&] {
+                for (Job& j : jobs)
+                    if (had[(size_t) j.lane] >= 0 && j.used && !j.reading && j.produced <= had[(size_t) j.lane]) return false;
+                return true;
+            };
+            issuing = true;
+            reissue();
+            double round_ms = 0.0;
+            // (adaptive: a round at least, then on while the soonest answer still ends before the read - each round
+            //  measures them again - up to the longest gap)
+            const auto go_on = [&] {
+                if (!round_done()) return true;
+                if (gaps_adaptive) return answers_first() && now_ms() - t_decode < pg.max_ms;
+                return now_ms() - t_in < budget;
+            };
+            while (!gap_failed && !quit && in_flight > 0 && go_on()) {
+                if (!eng.pump(-1)) break;
+                if (round_ms <= 0.0 && round_done()) {
+                    round_ms = now_ms() - t_rounds;
+                    decode_round_ms = round_ms;
+                }
+            }
+            issuing = false;
+            while (in_flight > 0 && eng.pump(-1)) {}
+            if (gap_failed) {
+                m.seq_bind(reading_job->lane);
+                return 2;
+            }
+            m.seq_bind(reading_job->lane);
+            gap_tok += stat_n - n0;
+            const double this_ms = now_ms() - t_in;
+            gap_ms += this_ms;
+            if (round_ms > 0.0) gap_round_ms = round_ms;
+            gap_mark = now_ms();
+            ++gap_count;
+            if (now_ms() - t_decode > pg.max_ms && !gaps_over) {
+                gaps_over = true;
+                std::fprintf(stderr, "ds4 multi: a decode gap took %.0f ms (more than %.0f): no more gaps in this read\n",
+                             now_ms() - t_decode, pg.max_ms);
+            }
+            return 0;
+        };
+        // the prompts being read, each when every issued token is back: a piece each in turn (the default); or
+        // (MAYA_DS4_READ_ORDER=ratio) the highest response ratio next: (its wait + its read) / its read, its read the
+        // tokens it has left at the last read's rate - the shortest first while they wait alike, and a long one's ratio
+        // grows as it waits, so a stream of short ones does not starve it (no rate yet: the fewest tokens left; ties the
+        // earliest); or (=arrival) the earliest first, as before the events.  The answers running get a round - a token
+        // each - before each read (it measures a round)
+        bool read_wanted = false;
+        int round_left = 0;       // (tokens the answers are owed before the next read; 0: none owed)
+        double round_t0 = 0.0;    // (when that round began)
+        auto any_reading = [&]() {
+            for (Job& j : jobs)
+                if (j.used && j.reading) return true;
+            return false;
+        };
+        auto pick_read = [&]() -> int {   // the next read's lane (-1: none)
+            if (read_pieces) {
+                while (!read_fifo.empty() && !(jobs[(size_t) read_fifo.front()].used && jobs[(size_t) read_fifo.front()].reading))
+                    read_fifo.pop_front();
+                return read_fifo.empty() ? -1 : read_fifo.front();
+            }
+            const bool by_arrival = read_order == "arrival";
+            const double now = now_ms();
+            const auto ratio = [&](const Job& j) {   // (no rate yet: the fewest tokens left, as a ratio)
+                const double left = (double) std::max<size_t>(1, j.total - j.done);
+                if (read_tok_ms <= 0.0) return 1.0 / left;
+                const double read = left / read_tok_ms;
+                return (now - j.t0 + read) / read;
+            };
+            int reading = -1;
+            for (const Job& j : jobs) {
+                if (!j.used || !j.reading) continue;
+                if (reading < 0) {
+                    reading = j.lane;
+                    continue;
+                }
+                const Job& b = jobs[(size_t) reading];
+                const double jr = ratio(j), br = ratio(b);
+                const bool better = by_arrival ? j.t0 < b.t0 : jr != br ? jr > br : j.t0 < b.t0;
+                if (better) reading = j.lane;
+            }
+            return reading;
+        };
+        auto schedule_read = [&]() {
+            if (read_wanted || quit || round_left > 0 || !any_reading()) return;
+            read_wanted = true;
+            want_devices([&] {
+                read_wanted = false;
+                const int reading = pick_read();
+                if (reading < 0) return;
+                if (read_pieces) read_fifo.pop_front();
+                Job& j = jobs[(size_t) reading];
+                m.seq_bind(j.lane);
+                if (j.stopping) {
+                    stop_read(j);
+                } else if (read_piece(j) && j.done >= j.total) {
+                    j.reading = false;
+                    first_token(j);
+                }
+                if (read_pieces && j.used && j.reading) read_fifo.push_back(j.lane);   // (its next piece: the back)
+            });
+        };
+        kick_read = [&] { eng.add([&] { schedule_read(); }, kRead); };
+        // the devices' owners, once every issued token is back; the end, once QUIT came and they are
+        settle = [&]() {
+            if (owning || in_flight > 0) return;
+            if (quit) {
+                owners.clear();
+                eng.stop();
+                return;
+            }
+            if (owners.empty()) return;
+            owning = true;
+            while (!owners.empty()) {
+                std::function<void()> f = std::move(owners.front());
+                owners.pop_front();
+                f();
+            }
+            owning = false;
+            if (quit) {
+                settle();
+                return;
+            }
+            issuing = true;
+            int answering = 0;   // (the ones a token a window; a drafting one's rounds are owners of their own)
+            for (Job& j : jobs)
+                if (j.used && !j.reading && !j.drafts) ++answering;
+            reissue();
+            round_left = in_flight > 0 ? answering : 0;
+            round_t0 = now_ms();
+            schedule_read();
+        };
+        // a token back: taken (printed, its request ended or its next issued), then what waited for it
+        auto on_token = [&](int lane) {
+            Job& j = jobs[(size_t) lane];
+            if (!j.flying) return;
+            take_lane(j);
+            if (round_left > 0 && --round_left == 0) decode_round_ms = now_ms() - round_t0;
+            if (round_left == 0 && !read_wanted) schedule_read();   // (each token: the read's turn may have come)
+            // GLM's boundary: every 32 windows a conversation every issued token back, then the expert cache's tiers
+            if (boundary_every > 0 && since_boundary >= boundary_every * std::max(1, active)) {
+                since_boundary = 0;
+                want_devices([&] {
+                    if (!m.multi_boundary(std::max(1, stat_n), err))
+                        std::fprintf(stderr, "ds4: the boundary: %s\n", err.c_str());
+                    stat_t0 = now_ms();
+                    stat_n = 0;
+                    stat_s0 = m.stats();
+                });
+            }
+            settle();
+        };
+        auto on_line = [&](const std::string& line) {
+            if (handle_line(line)) {
+                quit = true;
+                issuing = false;
+                waiting.clear();
+                settle();
+                return;
+            }
+            eng.add([&] { schedule_read(); }, kRead);
+        };
+        m.multi_on_done([&](int lane) { eng.add([&, lane] { on_token(lane); }, kToken); });
+        std::thread reader([&] {   // (the reader's lines into the loop; the input's end is a QUIT)
+            std::string l;
+            bool quit_seen = false;
+            while (!quit_seen && in.next(l)) {
+                quit_seen = l == "QUIT";
+                ++lines_waiting;
+                eng.add([&, l] {
+                    --lines_waiting;
+                    on_line(l);
+                }, kLine);
+            }
+            if (!quit_seen) {
+                ++lines_waiting;
+                eng.add([&] {
+                    --lines_waiting;
+                    on_line("QUIT");
+                }, kLine);
+            }
+        });
+        eng.run();
+        reader.join();
+        // the engine ends: every issued token back (no kernel under the model's destruction), then each conversation in
+        // a lane set aside, as the one-conversation path sets the model's aside (the folder's writes follow, both paths')
+        for (Job& j : jobs)
+            if (j.flying) {
+                j.flying = false;
+                std::string e;
+                (void) m.multi_take(j.lane, e);
+            }
+        m.multi_on_done(nullptr);
+        if (slot_max > 0)
+            for (int s = 0; s < places; ++s) {
+                m.seq_bind(s);
+                slot_put(" as the engine ended");
+            }
+        m.save_profile();
+    } else
     while (in.next(line)) {
         if (line == "QUIT") break;
         const bool geni = line.rfind("GENI ", 0) == 0;
@@ -1304,9 +2248,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
-    // RAM is written to the folder, so the next run reads on from them
+    // RAM is written to the folder, so the next run reads on from them (several conversations: each lane's was, above)
     if (slot_max > 0) {
-        slot_put(" as the engine ended");
+        if (!multi) slot_put(" as the engine ended");
         size_t written = 0;
         while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
             size_t i = SIZE_MAX;
@@ -1364,6 +2308,7 @@ int main(int argc, char** argv) {
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
     bool serve_mode = false;
+    bool tp_given = false;     // (--tp: an explicit request; the default 2 may fall back to 1 by itself)
     std::string images, enc_rgb, enc_out;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
@@ -1404,7 +2349,11 @@ int main(int argc, char** argv) {
             o.dspark = v != "none";   // none: not even loaded
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
-        else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
+        else if (a == "--tp") {
+            o.tp = std::max(1, std::atoi(val("--tp").c_str()));
+            tp_given = true;
+        }
+        else if (a == "--parallel") o.parallel = std::atoi(val("--parallel").c_str());
         else if (a == "--prefill-chunk") o.prefill_chunk = std::max(0, std::atoi(val("--prefill-chunk").c_str()));
         else if (a == "--threads") o.threads = val("--threads") != "off";
         else if (a == "--vision") o.vision = val("--vision") != "off";
@@ -1441,6 +2390,27 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    // several conversations at once: the model's lanes (1-8), the pipelined decode over a layer split's stages.  A
+    // split with threads (a lane's state and its hand-offs are per conversation: the serial path has none of it), and
+    // no tensor parallel yet (each GPU its own layers there: --parallel and --tp 2 refuse each other).  Both are said
+    // here, before a 180 GB model loads, and load() refuses them again for any other caller.
+    if (o.parallel < 1 || o.parallel > 8) {
+        std::fprintf(stderr, "maya-ds4: --parallel %d: one to eight conversations at once (1: as before)\n", o.parallel);
+        return 2;
+    }
+    if (o.parallel > 1 && !o.threads) {
+        std::fprintf(stderr, "maya-ds4: --parallel %d needs --threads on: a conversation's window is enqueued beside the\n"
+                             "           others' only on the threaded path (a host thread a GPU, the hand-offs host-mapped)\n",
+                     o.parallel);
+        return 2;
+    }
+    if (o.parallel > 1 && tp_given && o.tp > 1) {
+        std::fprintf(stderr, "maya-ds4: --parallel %d with --tp %d: not yet - a conversation's window is a token through a\n"
+                             "           layer split, not a share of a tensor parallel group.  #115's batched step (several\n"
+                             "           conversations' tokens through one GPU's step) is what a --tp user wants; --parallel 1\n"
+                             "           is the token path meanwhile\n", o.parallel, o.tp);
+        return 2;
+    }
     if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty())) {
         usage();
         return 2;
@@ -1459,7 +2429,7 @@ int main(int argc, char** argv) {
     std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
+    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, o.parallel, lk.get());
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;

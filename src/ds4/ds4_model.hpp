@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "ds4_prefill_gaps.hpp"
+
 namespace strata::ds4 {
 
 struct Options {
@@ -44,6 +46,13 @@ struct Options {
     // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
     int tp = 2;
     bool threads = false;             // a host thread per GPU enqueues its layers (the hand-offs host-mapped)
+    // conversations at once (--parallel, 1-8): N conversation states, one bound at a time (seq_bind), their decode
+    // windows pipelined over the split's stages (multi_issue / multi_take) so a card works on one conversation while
+    // the cards after it work on another.  1: the engine as before, one conversation (nothing of this allocates);
+    // the first state for the whole context, the others for STRATA_DS4_SEQ_CTX tokens (the context, default).  A split
+    // with threads (a lane's state and its hand-offs are per conversation, so the serial path has none), and no
+    // tensor parallel: load() refuses both, and N > 1 decodes without the DSpark drafter (the log says so)
+    int parallel = 1;
     // prompts in chunks of this many tokens through each layer at once (threads): the GEMMs on the tensor cores, the
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
     // -1: 2048 on one GPU, 4096 on several, or 8192 with the experts read in place (every chunk streams them all from
@@ -131,6 +140,25 @@ public:
     /// last token then rides along in the run of chunks instead of a window of its own); the same as
     /// feed(n - 1), checkpoint(slot), feed(1)
     bool feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err);
+    /// n tokens through windows of 16, with the bound conversation's own lane buffers (`lane < 0`: the one
+    /// conversation's shared ones).  Used while a prompt's read is paused at a chunk boundary: a short prompt
+    /// admitted in the gap is read in its own lane, so it does not touch the read's staging slots or hand-offs.
+    bool feed_windows(int lane, const int* tokens, int n, int logits_rows, std::string& err);
+    /// The chunked prompt path's chunk (0: windows), for the multi loop's short-prompt read in a gap.
+    int prompt_chunk() const;
+    /// A prompt window's tokens, and what a full one took here on average (s; 0: none ran yet) - what reading a prompt
+    /// in windows costs, measured (the multi loop's gap reads a short new prompt in windows only when that is quicker
+    /// than its turn in chunks).
+    int window_rows() const;
+    /// The split's pipeline stages (its groups of GPUs, one after another): a read of that many chunks keeps them all
+    /// busy - the multi loop's read pieces (MAYA_DS4_READ_ORDER's default) are that many chunks.
+    int pipeline_stages() const;
+    double window_s() const;
+    /// The decode gaps of a prompt read (MAYA_DS4_PREFILL_GAPS), and the gap the serve loop runs at a boundary:
+    /// `wanted` says whether this boundary is due, `gap` runs it (0 go on, 1 the read was stopped, 2 failed).
+    PrefillGaps prefill_gaps() const;
+    void set_prefill_gap(std::function<int()> f);
+    void set_prefill_gap_wanted(std::function<bool()> f);
     /// The next token from the last feed's last logit row (greedy when temperature <= 0).
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
     /// The request's repetition / frequency / presence penalties (llama.cpp's) for every pick after this - sample() and
@@ -139,6 +167,32 @@ public:
     void set_penalties(int last_n, float repeat, float freq, float present);
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
+
+    // ---- several conversations at once (options.parallel, N > 1): N states, one bound at a time.  Every other call
+    // about the state (feed, step, sample, checkpoint, slot_save, tokens, penalties, set_images) is the bound one's,
+    // as before - so a conversation is read, saved and taken back exactly as it was alone.
+    int seq_count() const;
+    /// Makes conversation `s` the model's: its state, position, tokens, checkpoints, penalties and pictures.  (The
+    /// states' device memory is theirs alone: an in-flight window of another conversation is unaffected.)
+    void seq_bind(int s);
+    /// The tokens conversation `s` can reach: the context, or STRATA_DS4_SEQ_CTX for the states after the first.
+    int64_t seq_context(int s) const;
+    /// One token of conversation `s` through every layer of the split without waiting for it (threads mode): the
+    /// conversation consumes it (pos + 1), its sample follows on the head's stream with the request's chain, and the
+    /// token lands in the conversation's own slot, whose event multi_take waits for.  The conversation is bound.
+    bool multi_issue(int s, int token, float temperature, float top_p, int top_k, float min_p, uint64_t seed,
+                     uint64_t counter, std::string& err);
+    /// The token multi_issue sent for conversation `s`, waited for (its window through every layer done).  A token < 0
+    /// and err: the window failed (a kernel's error), and the conversation's state is not to be trusted past it.
+    int multi_take(int s, std::string& err);
+    /// Called with s once conversation s's issued token is ready (multi_take returns it at once): on a CUDA thread,
+    /// after the window's last work on the head's stream, so it only posts - it must not call the model.  Null: none.
+    void multi_on_done(std::function<void(int)> f);
+    /// The boundary between rounds of several conversations (GLM's multi_boundary): every device's stream finished, then
+    /// the expert cache's look at the tiers - between windows, where nothing in flight is moved out from under it.  The
+    /// engine calls it once every STRATA_DS4_MULTI_BOUNDARY windows (32, times the conversations running) of an
+    /// answer, every issued token taken back first; `tokens` is what they decoded since the last one (its decay).
+    bool multi_boundary(int tokens, std::string& err);
 
     /// The DSpark drafter (speculative decoding): its block size (0: not loaded), drafts for the positions after `y`
     /// (y: the token at pos(), not fed yet) with their confidences, and the verification of [y, drafts]: how many of the
