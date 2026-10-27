@@ -300,14 +300,16 @@
 .side--drawer { position: absolute; top: 0; left: 0; bottom: 0; width: min(86vw, 330px); border-right: 0; box-shadow: var(--st-shadow-pop);
                 animation: slidein 200ms var(--st-ease); padding-top: max(10px, env(safe-area-inset-top)); }
 @keyframes slidein { from { transform: translateX(-100%); } }
-.chat-head--float { position: absolute; z-index: 10; top: 0; left: 0; right: 0; height: 84px; align-items: flex-start; padding: 10px 10px 0;
-                    padding-top: max(10px, env(safe-area-inset-top)); pointer-events: none; background: linear-gradient(to bottom, var(--st-bg), transparent); }
-.chat-head--float > * { pointer-events: auto; }
+/* (a frosted bar the page scrolls under: the model's name and the buttons stay readable over any text) */
+.chat-head--float { position: absolute; z-index: 10; top: 0; left: 0; right: 0; height: auto; padding: 10px;
+                    padding-top: max(10px, env(safe-area-inset-top)); background: var(--st-glass-bar);
+                    border-bottom: 1px solid var(--st-glass-line); box-shadow: var(--st-bar-shadow);
+                    -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%); }
 .model-btn--phone { height: 44px; font-size: 16px; gap: 4px; }
 
 @media (max-width: 767px) {
   .nav-item .kbd { display: none; }
-  .chat__scroll { padding-top: 64px; }
+  .chat__scroll { padding-top: calc(70px + max(10px, env(safe-area-inset-top))); }   /* (clear of the top bar) */
   .thread { padding: 8px 16px 24px; gap: 22px; }
   .you { max-width: 85%; }
   .chat__dock { padding: 8px 10px 0; padding-bottom: env(safe-area-inset-bottom); }

@@ -75,16 +75,24 @@
   .dialog-scrim:has(.settings) { padding: 0; }
   .settings { width: 100%; height: 100%; border-radius: 0; }
   .settings__main { display: flex; flex-direction: column; }
-  .set-nav { flex-direction: row; flex: none; overflow-x: auto; padding: 8px 10px; border-right: 0; border-bottom: 1px solid var(--st-line); }
-  .set-nav .nav-item { width: auto; flex: none; }
-  .set-nav .nav-item > span { overflow: visible; }
+  /* (every section in view at once: the tabs in a grid of three - a long name on two lines - nothing to scroll) */
+  .set-nav { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); flex: none; gap: 6px; overflow: visible;
+             padding: 10px 12px; border-right: 0; border-bottom: 1px solid var(--st-line); }
+  .set-nav .nav-item { width: auto; height: auto; min-height: 40px; gap: 6px; padding: 5px 8px; border: 1px solid var(--st-line);
+                       font-size: 13px; line-height: 1.2; }
+  .set-nav .nav-item[aria-current="page"] { border-color: transparent; }
+  .set-nav .nav-item .st-icon { width: 15px; height: 15px; flex: none; }
+  .set-nav .nav-item > span { white-space: normal; overflow: visible; text-overflow: clip; }
   .set-body { padding: 18px 16px 32px; }
   .set-row { flex-direction: column; align-items: stretch; gap: 10px; }
   .set-row__ctl { justify-content: flex-start; flex-wrap: wrap; }
+  /* the choices (Theme, Presets, Thinking ...) across the whole width, their buttons equal */
+  .set-row__ctl > .seg { display: flex; width: 100%; }
+  .set-row__ctl > .seg button { flex: 1 1 0; min-width: 0; padding: 0 6px; }
   /* (MiniMax's seven thinking levels: Off and Auto on the first row, its five efforts on the second - no holes) */
-  .seg--many { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); width: 100%; }
-  .seg--many button { grid-column: span 2; padding: 0 2px; }
-  .seg--many button:nth-child(-n+2) { grid-column: span 5; }
+  .set-row__ctl > .seg--many { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); width: 100%; }
+  .set-row__ctl > .seg--many button { grid-column: span 2; padding: 0 2px; }
+  .set-row__ctl > .seg--many button:nth-child(-n+2) { grid-column: span 5; }
   .set-slider { grid-template-columns: minmax(0, 1fr) 56px; }
   .set-slider label { grid-column: 1 / -1; }
   .keys, .set-pair { grid-template-columns: minmax(0, 1fr); }

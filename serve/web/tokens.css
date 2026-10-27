@@ -62,6 +62,7 @@
   --st-shadow-sheet:0 -12px 40px rgba(0,0,0,.45);
   --st-scrim:rgba(0,0,0,.55);
   --st-glass-bg:rgba(48,48,56,.42); --st-glass-line:rgba(255,255,255,.14);
+  --st-glass-bar:rgba(25,25,29,.74); --st-bar-shadow:0 6px 18px rgba(0,0,0,.32);   /* the phone's top bar */
   --st-switch-knob:#ffffff;
 
   /* the names the earlier page used (kept so nothing reads an unset variable) */
@@ -105,5 +106,6 @@
   --st-shadow-sheet:0 -12px 40px rgba(24,24,29,.16);
   --st-scrim:rgba(24,24,29,.35);
   --st-glass-bg:rgba(255,255,255,.55); --st-glass-line:rgba(24,24,29,.10);
+  --st-glass-bar:rgba(255,255,255,.76); --st-bar-shadow:0 6px 18px rgba(24,24,29,.08);
   color-scheme:light;
 }
