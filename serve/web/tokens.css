@@ -35,7 +35,11 @@
   --st-surface:#222227;         /* the message box, cards, menus, dialogs */
   --st-surface-2:#2a2a30;       /* a user's message, hover, chips */
   --st-surface-3:#34343b;       /* tracks, a disabled send */
-  --st-open:#2a2a30;            /* the open chat's row, the open section */
+  --st-open:rgba(255,255,255,.08);   /* the open chat's row, the open section: a wash, so it reads on the glass sidebar */
+  --st-glass-hover:rgba(255,255,255,.05);   /* hover on the glass sidebar */
+  --st-side-glass:color-mix(in srgb,#111114 88%,transparent);   /* the sidebar's glass: its own color, a little see-through */
+  --st-glass-sheen:rgba(255,255,255,.035);  /* the glass's light at the top */
+  --st-glass-edge:rgba(255,255,255,.06);    /* its right edge */
   --st-line:#2e2e35;
   --st-line-strong:#3d3d46;
   --st-ink:#ececf1;
@@ -79,7 +83,11 @@
   --st-surface:#ffffff;
   --st-surface-2:#f2f2f5;
   --st-surface-3:#e8e8ed;
-  --st-open:#e8e8ed;
+  --st-open:rgba(24,24,29,.06);
+  --st-glass-hover:rgba(24,24,29,.04);
+  --st-side-glass:color-mix(in srgb,#f7f7f9 88%,transparent);
+  --st-glass-sheen:rgba(255,255,255,.6);
+  --st-glass-edge:rgba(255,255,255,.8);
   --st-line:#e6e6eb;
   --st-line-strong:#d4d4dc;
   --st-ink:#18181d;

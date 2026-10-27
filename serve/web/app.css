@@ -6,8 +6,18 @@
 .shell { display: flex; height: 100%; min-height: 0; }
 
 /* ---------------------------------------------------------------- the sidebar */
+/* glass, as DeepSeek Harness's sidebar: the sidebar's own color a little see-through, blurred, a sheen at the top and a light
+   edge instead of a border; the main column keeps the hairline (on the glass an alpha border would read as a seam) */
 .side { flex: none; width: var(--maya-side); height: 100%; display: flex; flex-direction: column; gap: 2px; padding: 10px 10px 12px;
-        background: var(--st-side); border-right: 1px solid var(--st-line); }
+        background: linear-gradient(to bottom, var(--st-glass-sheen), transparent 35%), var(--st-side-glass);
+        -webkit-backdrop-filter: blur(30px) saturate(170%); backdrop-filter: blur(30px) saturate(170%);
+        box-shadow: inset -1px 0 0 var(--st-glass-edge); }
+.shell > .chat, .shell > .mon { background: var(--st-bg); border-left: .5px solid var(--st-line); }
+.shell--closed > .chat, .shell--closed > .mon { border-left: 0; }
+.side .nav-item:hover, .side .row:hover, .side .row.is-menu, .side .status-card:hover, .side .saved__line:hover,
+.side .saved__line[aria-expanded="true"] { background: var(--st-glass-hover); }
+.side .row.is-current, .side .nav-item.is-current, .side .nav-item[aria-current="page"] { background: var(--st-open); }
+@media (prefers-reduced-transparency: reduce) { .side { background: var(--st-side); -webkit-backdrop-filter: none; backdrop-filter: none; } }
 .side__head { display: flex; align-items: center; justify-content: space-between; height: 44px; padding: 0 4px 0 6px; margin-bottom: 6px; flex: none; }
 .side__brand { display: flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 700; letter-spacing: -.01em; }
 .side__head .icon-btn { color: var(--st-ink-muted); }
@@ -297,7 +307,9 @@
 
 /* ---------------------------------------------------------------- the phone: a chats drawer, floating buttons */
 .drawer-scrim { position: fixed; inset: 0; z-index: 45; background: var(--st-scrim); animation: fade 140ms ease; }
-.side--drawer { position: absolute; top: 0; left: 0; bottom: 0; width: min(86vw, 330px); border-right: 0; box-shadow: var(--st-shadow-pop);
+.side--drawer { position: absolute; top: 0; left: 0; bottom: 0; width: min(86vw, 330px); border-right: 0;
+                --st-side-glass: color-mix(in srgb, var(--st-side) 84%, transparent);   /* (over the chat: more tint to read) */
+                box-shadow: inset -1px 0 0 var(--st-glass-edge), var(--st-shadow-pop);
                 animation: slidein 200ms var(--st-ease); padding-top: max(10px, env(safe-area-inset-top)); }
 @keyframes slidein { from { transform: translateX(-100%); } }
 /* (a frosted bar the page scrolls under: the model's name and the buttons stay readable over any text) */
