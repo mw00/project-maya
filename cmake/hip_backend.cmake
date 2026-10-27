@@ -17,7 +17,9 @@ set(_strata_hip_unvalidated gfx1010 gfx1011 gfx1012 gfx1102 gfx1103 gfx1030 gfx1
 # gfx908 (AMD Instinct MI100, CDNA1) is wave64, not wave32: it runs through the hip_compat layer's logical-32-lane
 # half-wavefront warp mapping (see hip_compat/intrinsics.hpp). Experimental; validated on a 4x MI100 box.
 # gfx942 (AMD Instinct MI300X / MI325X, CDNA3) is wave64 too and takes the same path; experimental, run on one MI325X.
-set(_strata_hip_wave64 gfx908 gfx906 gfx942)   # gfx906 (MI50 / MI60 / Radeon Pro VII, Vega 20): same wave64 compat path
+# gfx942 (AMD Instinct MI300X / MI325X, CDNA3) is wave64 too and takes the same path; experimental, run on one MI325X.
+# gfx950 (AMD Instinct MI350X / MI355X, CDNA4) likewise; experimental, run on one MI350X.
+set(_strata_hip_wave64 gfx908 gfx906 gfx942 gfx950)   # gfx906 (MI50 / MI60 / Radeon Pro VII, Vega 20): same wave64 compat path
 # CMake hands HIP a ';' list, but a -DCMAKE_HIP_ARCHITECTURES typed by hand (or ROCm's own Windows tooling) may use
 # spaces, which foreach(IN LISTS) would otherwise treat as one element.
 string(REPLACE " " ";" _strata_hip_norm "${CMAKE_HIP_ARCHITECTURES}")
@@ -56,13 +58,13 @@ endforeach()
 if(NOT STRATA_HIP_ARCH_LIST)
   message(FATAL_ERROR "Maya HIP: CMAKE_HIP_ARCHITECTURES is empty")
 endif()
-# gfx942 has packed FP32 instructions (v_pk_fma_f32, v_pk_mul_f32): with clang's default -ffp-contract=fast the SLP
+# gfx942 and gfx950 have packed FP32 instructions (v_pk_fma_f32, v_pk_mul_f32): with clang's default -ffp-contract=fast the SLP
 # vectorizer pairs a multi-activation GEMV's columns and fuses their multiply-adds differently from the one-activation
 # kernel, so the columns stop being its bit-for-bit copies (tests/glm_mv_nt_test.cu). Contracting only within a source
 # expression keeps the fusion the source's own on every kernel, packed or not.
 set(STRATA_HIP_FP_CONTRACT_ON OFF)
 foreach(_a IN LISTS STRATA_HIP_ARCH_LIST)
-  if(_a STREQUAL "gfx942")
+  if(_a STREQUAL "gfx942" OR _a STREQUAL "gfx950")
     set(STRATA_HIP_FP_CONTRACT_ON ON)
   endif()
 endforeach()
