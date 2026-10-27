@@ -1894,6 +1894,14 @@ static int glm_pack_generate(const Options& o) {
                         seg_start = end;
                         seg_chunk = 0;
                     }
+                    // a cancel between two calls: a call that is one chunk (a checkpoint every chunk, or a piece) never
+                    // asks the progress callback, so with one conversation the read ran to its end after the client had
+                    // gone - it stops here, at the checkpoint just kept (a cancelled read keeps it, below)
+                    if (at < prompt.size() - 1 && !prompt_between && read_stopped()) {
+                        pok = false;
+                        err = "cancelled";
+                        break;
+                    }
                     // more to read: the decoding requests' turn (none after the last piece - its last token's logits
                     // must still be on the tail when the first sample reads them)
                     if (at < prompt.size() - 1 && prompt_between) {
@@ -1922,9 +1930,42 @@ static int glm_pack_generate(const Options& o) {
                 i_first = prompt.size() - 1;
                 pp_line(prompt.size() - 1 - reuse);
             } else if (err == "cancelled") {
-                snap_tokens.clear();
-                model.reset();
-                ckpt_drop_past(0);
+                // A CANCELLED READ keeps what it read: the longest checkpoint of this prompt the read has reached (one
+                // it kept itself, or an earlier one it started from) becomes the snapshot, so the client's retry - an
+                // agent that gave up waiting and sends the same prompt again - goes on from there instead of reading
+                // it all again, and a conversation that runs in between sets it aside in a slot.  The DSA rows before
+                // the checkpoint were written by calls that ended; the cancelled call wrote only past it.
+                // STRATA_GLM_KEEP_CANCELLED=0: the state is dropped, as before.
+                static const bool keep_cancelled = env_num("STRATA_GLM_KEEP_CANCELLED", 1) != 0;
+                size_t kept = 0;
+                if (keep_cancelled && ckpt_max > 0 && cur_img_pos.empty()) {
+                    int best = -1;
+                    for (int c = 0; c < (int) ckpts.size(); ++c) {
+                        const auto& t = ckpts[(size_t) c].tokens;
+                        if (!t.empty() && t.size() <= at && (best < 0 || t.size() > ckpts[(size_t) best].tokens.size()) &&
+                            std::equal(t.begin(), t.end(), prompt.begin()))
+                            best = c;
+                    }
+                    std::string ce;
+                    if (best >= 0 && model.ckpt_restore(best, ce) && model.snapshot_save()) {
+                        kept = ckpts[(size_t) best].tokens.size();
+                        snap_tokens.assign(prompt.begin(), prompt.begin() + (long) kept);
+                        snap_img_hash = img_hash(kept);
+                        snap_in_slot = false;
+                        ckpts[(size_t) best].used = ++ckpt_clock;
+                        ckpt_drop_past(kept);
+                        std::fprintf(stderr, "glm checkpoints: the cancelled read keeps %zu of the prompt's %zu tokens\n",
+                                     kept, prompt.size());
+                    } else if (best >= 0) {
+                        std::fprintf(stderr, "glm checkpoints: the cancelled read keeps nothing (%s)\n",
+                                     ce.empty() ? "no snapshot" : ce.c_str());
+                    }
+                }
+                if (kept == 0) {
+                    snap_tokens.clear();
+                    model.reset();
+                    ckpt_drop_past(0);
+                }
                 finish = "cancel";
                 i_first = prompt.size();
             } else if (!err.empty()) {
