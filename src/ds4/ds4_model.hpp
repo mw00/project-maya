@@ -36,6 +36,9 @@ struct Options {
     int mmap_experts = -1;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
+    // prompt lookup (ds4_main's --suffix-draft): its verify windows run without the drafter too - their buffers (the
+    // rows and states a rejected draft undoes) are allocated with the drafter, or with this
+    bool lookup = false;
     // tensor parallelism: runs of tp GPUs of one kind (the same memory) take the same layers, each a share of the
     // heads, of the output projection and of every expert's FFN, summed through host-mapped memory (a GPU unlike the
     // next stays alone); tp > 1 runs with threads (--tp 1 --threads off: one host thread, layer split only)
