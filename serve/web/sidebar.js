@@ -93,7 +93,8 @@ function ChatList() {
   const chats = S.chats;
   const pinned = chats.filter((c) => c.pinned);
   const byFolder = {};
-  for (const c of chats) if (c.folder && !c.pinned) (byFolder[c.folder] = byFolder[c.folder] || []).push(c);
+  // (a folder lists all its chats - a pinned one under Pinned too, so a folder it was just moved to is not "Empty")
+  for (const c of chats) if (c.folder) (byFolder[c.folder] = byFolder[c.folder] || []).push(c);
   const known = new Set(S.folders.map((f) => f.id));
   const rest = chats.filter((c) => !c.pinned && !(c.folder && known.has(c.folder)));
   const groups = [];
@@ -151,6 +152,8 @@ function SavedPop({anchor, close}) {
     catch (e) { toast("error", "Not reset", e.message, 6000); }
   };
   const apis = r && r.prices ? [...new Set(r.prices.map((p) => p.api))] : [];
+  // (two configs of one model, e.g. two GPU layouts: each row says its config)
+  const twin = (m) => r.models.filter((x) => x.model === m.model && x.quant === m.quant).length > 1;
   const since = r && r.since ? new Date(r.since * 1000).toLocaleDateString([], {month: "short", day: "numeric"}) : null;
   const style = pos ? `left:${pos.left}px;bottom:${pos.bottom}px` : "left:0;bottom:0;visibility:hidden";
   return html`<div ref=${ref} class="saved-pop" role="dialog" aria-label="Saved, compared with the API" style=${style}>
@@ -161,8 +164,8 @@ function SavedPop({anchor, close}) {
         <b>${r.start.usd == null ? "–" : usd(r.start.usd)}</b></div>` : null}
       ${r.models && r.models.length ? html`<div class="saved-pop__models"><span class="saved-pop__h">By model</span>
         ${r.models.map((m) => html`<div class="saved-pop__model" key=${m.key}><${ModelLogo} model=${m.model} size=${28}/>
-          <span><b>${modelName(m.model)}${m.quant ? ` · ${m.quant}` : ""}</b>
-            <span>read ${mtok(m.tokens.input + m.tokens.cached)}${m.tokens.cached ? `, ${mtok(m.tokens.cached)} of it cached` : ""} · wrote ${mtok(m.tokens.output)}</span></span>
+          <span><b>${modelName(m.model)}${m.quant ? ` · ${m.quant.replace(/-/g, "‑")}` : ""}</b>
+            <span>${twin(m) ? `${m.key} · ` : ""}read ${mtok(m.tokens.input + m.tokens.cached)}${m.tokens.cached ? `, ${mtok(m.tokens.cached)} of it cached` : ""} · wrote ${mtok(m.tokens.output)}</span></span>
           <b>${m.usd == null ? "no API price" : usd(m.usd)}</b></div>`)}</div>` : null}
       ${r.prices && r.prices.length ? html`<div class="saved-pop__prices"><span class="saved-pop__h">The prices, per 1M tokens: input · cached input · output</span>
         ${r.prices.map((p) => html`<div><span>${modelName(p.model)} (${p.custom ? "your prices" : p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}

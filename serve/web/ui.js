@@ -21,7 +21,7 @@ export function ModelLogo({model, size = 32, cls = ""}) {
 }
 
 // the thinking level as a speedometer: its needle points further right the longer the model thinks
-const NEEDLE = {none: -70, low: -25, high: 25, max: 70};
+const NEEDLE = {none: -70, auto: -47, low: -25, medium: 0, high: 25, xhigh: 47, max: 70};   // (MiniMax's seven too)
 export const Gauge = ({level, cls = ""}) => html`
   <svg class=${`gauge ${cls}`} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round"
     stroke-linejoin="round" aria-hidden="true"><path d="M3.34 19a10 10 0 1 1 17.32 0"/>

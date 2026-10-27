@@ -60,7 +60,11 @@ function Throughput({m}) {
   const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   const hit = fresh && tn.vram_hit != null ? 100 * tn.vram_hit : last && last.hit_rate != null ? 100 * last.hit_rate : null;
   const a = sparkPath(h.tok_s), b = sparkPath(h.prefill_tok_s_mean);
-  const spec = eng.mtp == null ? (eng.dflash ? "DFlash2" : null) : +eng.mtp ? "MTP" : "Off";
+  // (DSpark: DeepSeek's server says whether it drafts, MiniMax's engine itself - dspark=0 / 1; the engine's STAT lines the
+  //  share of its drafts kept)
+  const spec = eng.dspark != null ? (+eng.dspark ? "DSpark" : "Off")
+    : eng.mtp == null ? (eng.dflash ? "DFlash2" : null) : +eng.mtp ? "MTP" : "Off";
+  const kept = +eng.dspark && tn && tn.drafts != null ? `${fmt(100 * tn.drafts)}% kept` : "";
   return html`<section class="card card--wide" aria-label="Throughput">
     <div class="speeds">
       <div class="speed"><span class="speed__label"><i class="key key--line"></i>Decode · ${gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
@@ -79,7 +83,8 @@ function Throughput({m}) {
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>
       <div class="stat"><span class="stat__label">VRAM hit</span><${Num} v=${hit == null ? null : fmt(hit, 1)} unit="%"/></div>
       <div class="stat"><span class="stat__label">Requests served</span><${Num} v=${m.totals && m.totals.requests != null ? fmt(m.totals.requests) : null}/></div>
-      <div class="stat"><span class="stat__label">Speculation</span><${Num} v=${spec}/></div>
+      <div class="stat" title=${kept ? "The share of the drafted tokens the model kept, in the last answer" : undefined}>
+        <span class="stat__label">Speculation</span><${Num} v=${spec} unit=${kept}/></div>
     </div>
   </section>`;
 }
@@ -144,7 +149,7 @@ function ContextCard({m}) {
   return html`<section class="card" aria-label="Context">
     <div class="card__head"><span class="card__title">Context</span><span class="card__sub">${what ? `${what} · ` : ""}${ctxfmt(max)} context</span></div>
     <div class="ctx__nums"><span class="ctx__big num">${fmt(used)}<small>/ ${fmt(max)} tokens</small></span>
-      <span class="ctx__pct num"><b>${fmt(pct, pct > 0 && pct < 10 ? 1 : 0)}%</b> used · ${fmt(free)} left</span></div>
+      <span class="ctx__pct num"><b>${pct > 0 && pct < 0.1 ? "< 0.1" : fmt(pct, pct > 0 && pct < 10 ? 1 : 0)}%</b> used · ${fmt(free)} left</span></div>
     <div class=${`ctx__track${showWin ? " ctx__track--win" : ""}`}>
       ${showWin ? html`<span class="ctx__win" style=${`left:${(100 * win) / max}%`}><span>VRAM window · ${ctxfmt(win)}</span></span>` : null}
       <div class="ctxbar" role="img" aria-label=${aria}>${segs.filter((s) => s.n > 0).map((s) => html`<span class=${`ctxbar__${s.k}`} style=${`flex-grow:${s.n}`}></span>`)}
@@ -157,7 +162,8 @@ function ContextCard({m}) {
 
 // ------------------------------------------------------------------ where the experts live (the engine's STAT lines)
 // GLM's engine: where each routed expert came from while the model writes; DeepSeek's (maya-ds4): the experts the CPU lane
-// computed, what the storage read, the cache's moves and the n-gram memory (Engram) a token
+// computed, what the storage read, the cache's moves and the n-gram memory (Engram) a token; MiniMax's (maya-mm3): the
+// experts its CPU lane computed from the pinned pool
 const TIER_SETS = {
   glm: [
     {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts pulled over PCIe from RAM"},
@@ -170,10 +176,16 @@ const TIER_SETS = {
     {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
     {key: "engram_ms", label: "N-gram memory", unit: " ms/tok", digits: 2, sub: "n-gram lookups"},
   ],
+  mm3: [
+    {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 2, tone: "info", sub: "experts the CPU computed from pinned RAM"},
+    {key: "disk", label: "From SSD", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
+    {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "experts copied into the VRAM cache"},
+  ],
 };
 function Tiers({t, eng}) {
   if (!t || !t.now) return null;
-  const ds4 = !!(eng && eng.engine_kind === "ds4");
+  const ds4 = !!(eng && eng.engine_kind === "ds4"), mm3 = !!(eng && eng.engine_kind === "mm3");
+  const set = TIER_SETS[ds4 ? "ds4" : mm3 ? "mm3" : "glm"];
   const n = t.now, h = t.history || {};
   const age = n.time ? Math.max(0, Date.now() / 1000 - n.time) : null;
   const stale = age != null && age > 30;               // a reading from the last answer, not live
@@ -187,6 +199,8 @@ function Tiers({t, eng}) {
     else if (!stale && n.vram_hit != null && n.vram_hit < 0.5) tip = "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
   } else if (!stale && n.disk != null && n.disk >= 3) {
     tip = "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
+  } else if (mm3) {   // (MiniMax: the CPU computes the experts VRAM does not hold - nothing crosses PCIe for them)
+    if (!stale && n.vram_hit != null && n.vram_hit < 0.5) tip = "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
   } else if (!stale && n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4) {
     tip = "Most misses come from RAM over PCIe: more VRAM (or a second GPU) keeps more experts on the card.";
   }
@@ -201,8 +215,8 @@ function Tiers({t, eng}) {
       <span><i class="sw sw--vram"></i>VRAM <b class="num">${fmt(vu)} · ${fmt(n.vram_gb, 1)} GB</b></span>
       <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(n.ram_gb, 1)} GB</b></span>
       <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}</b></span></div>
-    <div class=${`tiles${TIER_SETS[ds4 ? "ds4" : "glm"].length === 4 ? " tiles--4" : ""}`}>
-      ${TIER_SETS[ds4 ? "ds4" : "glm"].map((x) => {
+    <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
+      ${set.map((x) => {
         const v = n[x.key];
         let sub = x.sub;
         if (x.key === "engram_ms" && eng && eng.engram_lookups) sub = `${fmt(+eng.engram_lookups)} n-gram lookups a token`;
@@ -234,8 +248,18 @@ const gpuName = (g) => (g.name || "").replace(/^NVIDIA /, "").replace(/^GeForce 
 const gpuGb = (b) => `${gb(b, b < GIB ? 2 : 1)} GB`;
 const gpuList = (gs) => gs.length === 1 ? gpuLabel(gs[0])
   : `GPUs ${gs.slice(0, -1).map((g) => g.index ?? g.dev).join(", ")} and ${gs[gs.length - 1].index ?? gs[gs.length - 1].dev}`;
+// the layers a GPU holds: the GLM engine's VRAM lines say [first, end), DeepSeek's and MiniMax's (maya-ds4, maya-mm3)
+// [first, last]
+const dsparkEngine = (eng) => eng.engine_kind === "ds4" || eng.engine_kind === "mm3";
+function gpuLayers(g, eng) {
+  if (!g.layers) return "";
+  const [a, b] = g.layers, last = dsparkEngine(eng) ? b : b - 1;
+  return a < 0 || last < a ? "" : last > a ? `layers ${a}–${last}` : `layer ${a}`;
+}
+// the KV cache streams from RAM only beyond its VRAM window (DeepSeek's engine: a window as long as the context)
+const kvWindow = (eng, ctx) => (+eng.kv_resident > 0 && +eng.kv_resident < ctx ? +eng.kv_resident : 0);
 function gpuSegs(g, eng) {
-  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : eng.mtp ? "MTP" : "";
+  const p = g.parts || {}, draft = eng.dflash ? "DFlash2" : +eng.mtp ? "MTP" : dsparkEngine(eng) ? "DSpark" : "";
   return GPU_PARTS.filter((d) => (p[d.key] || 0) > 0 || d.key === "pool" || d.key === "kv")
     .map((d) => ({key: d.key, bytes: p[d.key] || 0, label: d.key === "drafter" && draft ? `Drafter (${draft})` : d.label}))
     .concat([{key: "free", label: "Free", bytes: g.free || 0}]);
@@ -258,7 +282,7 @@ function gpuDetail(g, segs, m) {
               : last ? (last.prompt_tokens || 0) + (last.output_tokens || 0) : 0;
   const sub = {
     weights: "attention, shared experts and the other dense tensors",
-    kv: (eng.kv_resident ? `${ctxfmt(eng.kv_resident)} of ${ctxfmt(ctx)} positions here, the rest in RAM` : `${ctxfmt(ctx)} positions`) +
+    kv: (kvWindow(eng, ctx) ? `${ctxfmt(kvWindow(eng, ctx))} of ${ctxfmt(ctx)} positions here, the rest in RAM` : `${ctxfmt(ctx)} positions`) +
         (inUse ? ` · ${kfmt(inUse)} in use` : "") + (g.kv_ram ? ` · ${gb(g.kv_ram)} GB pinned in RAM` : ""),
     act: "one token's working buffers",
     prompt: "a long prompt's chunks: their working buffers and the ring the CPU lane's experts stream through",
@@ -342,7 +366,7 @@ function GpuMap({m}) {
         const g = r.g, p = g.parts || {}, o = isOpen(r);
         const lent = reading && !g.vision_lent && g.borrow > 0 && p.pool > 0 ? Math.min(100, (100 * g.borrow) / p.pool) : 0;
         const line = html`
-          <span class="gpurow__name"><b>${gpuLabel(g)}</b><span>${[gpuName(g), g.layers && g.layers[1] > g.layers[0] ? `layers ${g.layers[0]}–${g.layers[1] - 1}` : ""].filter(Boolean).join(" · ")}</span></span>
+          <span class="gpurow__name"><b>${gpuLabel(g)}</b><span>${[gpuName(g), gpuLayers(g, eng)].filter(Boolean).join(" · ")}</span></span>
           <span class="gpurow__track"><span class="gpubar" role="img" onPointerMove=${(e) => move(e, r)}
               aria-label=${`${gpuLabel(g)}: ` + r.segs.map((s) => `${s.label} ${gpuGb(s.bytes)}`).join(", ")}>
               ${r.segs.map((s) => html`<span class="gpubar__seg" data-k=${s.key} style=${`--gm-c:var(--gm-${s.key});flex-grow:${s.bytes / (g.total || 1)}`}>
@@ -419,7 +443,7 @@ function totalsLine(t) {
   const read = t.prompt_tokens - t.reused;
   const pSpeed = t.prompt_ms > 0 && read > 0 ? ` at ${fmt(read / (t.prompt_ms / 1000))} tok/s` : "";
   const oSpeed = t.decode_ms > 0 && t.output_tokens > 0 ? ` at ${fmt(t.output_tokens / (t.decode_ms / 1000), 1)} tok/s` : "";
-  return `Since ${since}: ${fmt(t.requests)} requests · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}`;
+  return `Since ${since}: ${fmt(t.requests)} request${t.requests === 1 ? "" : "s"} · ${fmt(read)} prompt tokens read${pSpeed} (${fmt(t.reused)} reused) · ${fmt(t.output_tokens)} written${oSpeed}`;
 }
 function Requests({m}) {
   const requests = m.requests || [], kept = m.requests_kept == null ? requests.length : m.requests_kept;

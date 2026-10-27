@@ -1646,7 +1646,9 @@ class Service:
         self.savings = None                              # serve/savings.py's Ledger: what the API would have charged
         self.model_dir = None                            # the model's folder (free disk on the dashboard)
         self.trained_context = None                      # what the model was trained for (its GGUF): the slider's top
-        self.reload = None                               # a context change: {state, from, to, started, error}
+        self.dspark = None                               # DeepSeek's: drafts with its DSpark blocks (its engine's INFO
+        #                                                  does not say: the config's --dspark and the pack's drafter)
+        self.reload = None                              # a context change: {state, from, to, started, error}
         # "idle_unload_s" / --idle-unload (as Strata's): after this long without a request the engine ends, giving back
         # its GPU memory and its pinned RAM tier, and the next request starts it again (0: never).  With
         # STRATA_GLM_SLOT_KEEP=1 the conversation in the model is kept on disk across it.
@@ -1849,7 +1851,8 @@ class Service:
                 "kv_gb": info.get("kv_gb"), "kv_ctx": info.get("kv_ctx"),
                 "kv_resident": info.get("kv_resident") or 0,
                 "kv_ram_gb": round(kv_ram / 2**30, 3) if kv_ram else None, **ram,
-                "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload}
+                "vram_gb": info.get("vram_gb"), "vram_slots": info.get("vram_slots"), "reload": reload,
+                "load_s": getattr(self.engine, "load_s", None)}   # (the engine's last load: what a reload takes here)
 
     def set_context(self, n: int) -> dict:
         """Reload the engine with an n-token context (the dashboard's Context size), on a thread: after the request in
@@ -1882,8 +1885,10 @@ class Service:
                 self.reload["state"] = "running"
             print(f"[maya] reloading the model with a {n}-token context (was {old}) ...", flush=True)
             err = None
+            t0 = time.time()
             try:
                 self._restart_with(n)
+                self.engine.load_s = round(time.time() - t0, 1)
             except Exception as e:  # noqa: BLE001 - any failed start: put the old context back
                 err = f"the engine did not start with a {n}-token context ({e})"
                 print(f"[maya] {err}; starting it again with {old} ...", flush=True)
@@ -1908,6 +1913,9 @@ class Service:
         try:
             p = Path(self.config_path)
             cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+            inst = cfg.setdefault("installer", {})       # (the first change from the page: what the setup wrote first,
+            if "as_set_up" not in inst:                  #  the Models page's Reset - as models.save keeps it)
+                inst["as_set_up"] = models.settings_of(cfg)
             args = list(cfg.get("args") or [])
             if "--max-context" in args[:-1]:
                 args[args.index("--max-context") + 1] = str(int(n))
@@ -2043,8 +2051,9 @@ class Service:
         if self._is_running(p):
             raise ValueError(f"{p.name} is the model running now")
         cfg = models.read(p)
-        if not cfg.get("exe") or models.pack_of(cfg) is None:
-            raise ValueError(f"{p.name} is incomplete: run the setup again to repair it")
+        why = models.missing(cfg)                        # (maya.py would stop at it: no model would run)
+        if why:
+            raise ValueError(f"{p.name} cannot start: {why} - run the setup again to repair it")
         self._restart_busy()
         os.utime(p)
         restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
@@ -2229,7 +2238,8 @@ class Service:
         live["prompt_reused"] = progress[2] if s.get("busy") and progress and len(progress) > 2 else None
         engine = {"model": self.model, "max_context": self.engine.max_context, "images": self.vision is not None,
                   **dict(getattr(self.engine, "info", {}) or {}), "maya_version": MAYA_VERSION,
-                  "trained_context": self.trained_context}
+                  "trained_context": self.trained_context,
+                  **({"dspark": self.dspark} if self.dspark is not None else {})}
         with self.status_lock:
             reload = dict(self.reload) if self.reload else None
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
@@ -4645,7 +4655,9 @@ def main() -> int:
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
+        t0 = time.time()
         engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+        engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         warn_tight_ram(engine.info.get("arena_mib"))
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
             # DeepSeek-V4.1: the engine's own vision tower (the checkpoint's); the server resizes the pictures
@@ -4733,8 +4745,13 @@ def main() -> int:
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
-    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt)
+    elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder
         svc.trained_context = trained_context_ds4(args[args.index("--pack") + 1])
+        svc.model_dir = Path(args[args.index("--pack") + 1]).resolve().parent
+        # (DeepSeek's engine drafts unless --dspark off / none - "none" does not even load the blocks - when the pack
+        #  has them; MiniMax's says so itself, INFO dspark=)
+        if models.family(cfg) == "deepseek":
+            svc.dspark = models.flag(args, "--dspark", "on") not in ("off", "none") and models.ds4_has_drafter(cfg)
     if a.config:                                        # the Chat settings shared with other apps, from last time
         svc.shared_path = str(Path(a.config).with_suffix("")) + ".shared-settings.json"
         try:

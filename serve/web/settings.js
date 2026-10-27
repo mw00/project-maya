@@ -3,11 +3,11 @@
 // updates.  A change applies at once; the two that restart the model ask first.
 import {html, useEffect, useRef, useState} from "./preact.js";
 import {MOD, api, ctxfmt, fmt, gb, modelName, store} from "./lib.js";
-import {DEFAULTS, LEVELS, P, PRESETS, S, THINK_TITLES, confirmDialog, copyText, emit, prefsKey, presetOf, savePrefs, setTheme,
-        themeChoice, toast} from "./state.js";
+import {DEFAULTS, LEVELS, P, PRESETS, S, confirmDialog, copyText, emit, presetOf, savePrefs, setTheme, themeChoice, thinkTitles,
+        toast} from "./state.js";
 import {usd} from "./sidebar.js";
 import {confirmContext, confirmPort, ctxEstimate, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
-        loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
+        loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
 import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
 import {Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
@@ -28,6 +28,9 @@ const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`se
   <span class="set-row__text">${htmlFor ? html`<label for=${htmlFor}>${label}</label>` : html`<span class="set-row__label">${label}</span>`}
     ${sub ? html`<span class="set-row__sub">${sub}</span>` : null}</span>
   <span class="set-row__ctl">${children}</span></div>`;
+
+// the engines by their INFO engine_kind
+const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", mm3: "MiniMax-M3.1 (maya-mm3)"};
 
 // ------------------------------------------------------------------ General
 function General() {
@@ -53,6 +56,8 @@ function Model() {
   const e = c ? ctxEstimate(v) : null;
   let est = "How much text the model holds at once: the chat, files and tool output. More context takes GPU memory from the experts, so answers get a little slower.";
   if (S.reload) est = `Reloading with a ${ctxfmt(S.reload.to)} context…`;
+  else if (e && e.ram) est = `≈ ${fmt(e.gb, 1)} GB of RAM for the context (kept pinned; its newest ${ctxfmt(c.kv_resident)} positions also in VRAM)` +
+    (v === c.context ? "." : ` · ${fmt(Math.abs(e.delta), 1)} GB ${e.delta > 0 ? "more" : "less"} than now.`);
   else if (e) est = `≈ ${fmt(e.gb, 1)} GB of GPU memory for the context` + (v === c.context ? "." :
     e.experts ? ` · about ${fmt(Math.abs(e.experts))} ${e.experts > 0 ? "fewer" : "more"} experts held in VRAM than now${e.experts > 0 ? " (answers a little slower)" : ""}.` : ".");
   const warns = [];
@@ -60,11 +65,13 @@ function Model() {
     const tested = c.tested || 262144;   // (the largest context run end to end on this engine)
     if (v > tested) warns.push(`Beyond ${ctxfmt(tested)} is untested on this engine.`);
     if (e && e.vram && e.gb > e.vram * 0.6) warns.push("That leaves little GPU memory for experts: answers get much slower, and it may not start (the current size then comes back).");
-    warns.push("Reloading takes 1–3 minutes; your chats stay, and other apps are asked to try again meanwhile.");
+    // (8 GB kept for the system: the pinned cache comes out of the RAM the experts not in VRAM use)
+    if (e && e.ram && e.free != null && e.delta > e.free - 8) warns.push("That takes more RAM than is free now: fewer experts stay in RAM (answers slower), and it may not start (the current size then comes back).");
+    warns.push(`Reloading takes ${loadTime()}; your chats stay, and other apps are asked to try again meanwhile.`);
   }
   const pi = S.portInfo, pv = /^\d+$/.test(port.trim()) ? +port.trim() : null;
   const portChanged = pi && pv != null && pv !== pi.port;
-  const engine = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)"}[eng.engine_kind] || eng.engine_kind;
+  const engine = ENGINES[eng.engine_kind] || eng.engine_kind;
   const reload = async () => {
     const tokens = S.ctx.tokens != null ? S.ctx.tokens : estimateTokens(S.current.messages);
     if (await confirmContext(v, tokens)) setCtx(null);
@@ -87,7 +94,7 @@ function Model() {
         <input id="set-port" class="input input--num" inputmode="numeric" value=${port} onInput=${(ev) => setPort(ev.target.value)}/><//>
       ${portChanged ? html`<div class="callout callout--warn">
         <span>${pv < 1024 || pv > 65535 ? "Use a number from 1024 to 65535."
-          : pi.restarts ? `Maya starts again on port ${pv} (about 1–3 minutes). Apps that use the API need the new address too.`
+          : pi.restarts ? `Maya starts again on port ${pv} (${loadTime()}). Apps that use the API need the new address too.`
                         : `Saved for the next start: this server was not started by Maya's start script, so it stays on ${pi.port} until then.`}</span>
         ${pv >= 1024 && pv <= 65535 ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${() => confirmPort(pv)}>Move to ${pv}</button>` : null}
       </div>` : null}` : null}`;
@@ -96,8 +103,10 @@ function Model() {
 // ------------------------------------------------------------------ Chat defaults (sampling)
 function ChatDefaults() {
   const t = +P.temperature, greedy = t === 0, preset = presetOf(P);
-  const titles = THINK_TITLES[prefsKey() === "sampling_deepseek" ? "deepseek" : "glm"];
+  const titles = thinkTitles();
   const set = (patch) => { savePrefs(patch); syncShared(); };
+  // the running model's recommended values (its run config: the model card's) say so
+  const isDefault = (k) => !greedy && Math.abs(+P[k] - (+DEFAULTS[k] || 0)) < 1e-9;
   const sliders = [
     {k: "temperature", label: "Temperature", hint: "0 always picks the likeliest word", min: 0, max: 1.5, step: 0.05,
      shown: greedy ? "0 · exact" : t.toFixed(2)},
@@ -124,13 +133,13 @@ function ChatDefaults() {
                  {id: "balanced", label: "Balanced", title: "Temperature 0.6, top-p 0.95, top-k 20"},
                  {id: "creative", label: "Creative", title: "Temperature 1.0, top-p 0.95, min-p 0.05"}]}/><//>
     <${Row} label="Thinking" sub="The level a new chat starts with. A chat changes its own with the speedometer in the message box.">
-      <${Seg} label="Thinking" value=${P.thinking} onChange=${(id) => {
+      <${Seg} label="Thinking" value=${P.thinking} cls=${LEVELS.length > 4 ? "seg--many" : ""} onChange=${(id) => {
         set({thinking: id});
         if (S.current && !S.current.messages.length) S.current.thinking = id;   // (the new chat on screen starts there too)
       }}
         options=${LEVELS.map((l) => ({id: l.id, label: l.name, title: titles[l.id]}))}/><//>
     ${sliders.map((r) => html`<div class="set-slider">
-      <label for=${`set-${r.k}`}><span>${r.label}</span><span class="set-row__sub">${r.hint}</span></label>
+      <label for=${`set-${r.k}`}><span>${r.label}</span><span class="set-row__sub">${r.hint}${isDefault(r.k) ? " · the model's default" : ""}</span></label>
       <input id=${`set-${r.k}`} type="range" class="range" min=${r.min} max=${r.max} step=${r.step} value=${P[r.k]} disabled=${r.off}
         onInput=${(e) => set({[r.k]: +e.target.value})}/>
       <b class="num">${r.shown}</b></div>`)}
@@ -226,7 +235,7 @@ function Data() {
   return html`<h3>Data</h3>
     <p class="set-intro">Chats, images and attached files are kept in this browser only (${fmt(n)} chat${n === 1 ? "" : "s"} now). The server keeps none of them.</p>
     <${Row} label="Clear chats and settings" sub="Every chat and folder, these settings and the API key in this browser. The model, its files and the server's own settings are not touched.">
-      <button type="button" class="btn btn--danger" onClick=${clearBrowser}>Clear…</button><//>`;
+      <button type="button" class="btn btn--danger" onClick=${clearBrowser}>Clear</button><//>`;
 }
 
 // ------------------------------------------------------------------ Savings: the API prices the sidebar's Saved counts with
@@ -287,7 +296,7 @@ function Savings() {
       : !(r.price_list || []).length ? html`<p class="set-note">Nothing is counted on this server: it runs without a model config.</p>`
       : html`<div class="prices">${r.price_list.map((p) => html`<${PriceCard} key=${p.model} p=${p} onSaved=${setR}/>`)}</div>
         <${Row} label="Start over from $0" sub=${`Every model's count of tokens: ${usd(r.usd)} saved${since ? ` since ${since}` : ""}. The prices stay.`}>
-          <button type="button" class="btn btn--danger" onClick=${reset}>Start over…</button><//>`}`;
+          <button type="button" class="btn btn--danger" onClick=${reset}>Start over</button><//>`}`;
 }
 
 // ------------------------------------------------------------------ About and updates
@@ -336,7 +345,11 @@ function UpdateCard() {
 // "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
 function gpuNames(name, count) {
   const parts = String(name).split(" + ");
-  if (parts.length > 1) return parts.every((p) => p === parts[0]) ? `${parts.length} × ${parts[0]}` : parts.join(" + ");
+  if (parts.length > 1) {   // (each model once, with its count: "NVIDIA GeForce RTX 3090 + 8 × NVIDIA GeForce RTX 5060 Ti")
+    const n = new Map();
+    for (const p of parts) n.set(p, (n.get(p) || 0) + 1);
+    return [...n].map(([p, k]) => (k > 1 ? `${k} × ${p}` : p)).join(" + ");
+  }
   return count > 1 ? `${count} × ${name}` : name;
 }
 function facts() {
@@ -350,23 +363,35 @@ function facts() {
       ? `${k} attention cache, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM`
       : `${k} attention cache, in VRAM${kvPerTok ? ` (about ${fmt(kvPerTok / 1024)} KB a token, ${fmt(eng.kv_gb, 1)} GB at this size)` : ""}`;
   } else {
-    const k = {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit", bf16: "16-bit", f32: "32-bit",
-               fp4: "4-bit FP4 as DeepSeek stores it (the recent-token window FP8)"}[eng.kv] || eng.kv;
-    kv = k ? `${k}${eng.kv_resident ? `, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null;
+    const k = (eng.engine_kind === "mm3"   // (MiniMax's: maya-mm3's KV formats)
+      ? {bf16: "16-bit (BF16)", int8: "8-bit (INT8)", fp8: "8-bit (FP8)", fp4: "4-bit (FP4)", nvfp4: "4-bit (NVFP4)",
+         mxfp4: "4-bit (MXFP4)", q4: "4-bit"}
+      : {int8: "8-bit", q4_0: "4-bit (Hadamard-rotated)", fp16: "16-bit", bf16: "16-bit", f32: "32-bit",
+         fp4: "4-bit FP4 as DeepSeek stores it (the recent-token window FP8)"})[eng.kv] || eng.kv;
+    // (DeepSeek's engine says a window as long as its context: all of it in VRAM)
+    const win = +eng.kv_resident > 0 && +eng.kv_resident < (eng.max_context || Infinity) ? +eng.kv_resident : 0;
+    kv = k ? `${k}${win ? `, streamed: ${fmt(win)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null;
   }
   const gpus = hw.gpus || [];
-  const pcie = gpus.length > 1 ? gpus.map((g) => `GPU ${g.index}: Gen${g.pcie_gen_max || g.pcie_gen || "?"}${g.pcie_width ? ` x${g.pcie_width}` : ""}`).join(" · ")
+  const link = (g) => `Gen${g.pcie_gen_max || g.pcie_gen || "?"}${g.pcie_width ? ` x${g.pcie_width}` : ""}`;
+  const pcie = gpus.length > 1 ? (gpus.every((g) => link(g) === link(gpus[0])) ? `${link(gpus[0])} on all ${gpus.length} GPUs`
+                                  : gpus.map((g) => `GPU ${g.index}: ${link(g)}`).join(" · "))
              : (hw.gpu_pcie_gen_max || hw.gpu_pcie_gen) ? `Gen${hw.gpu_pcie_gen_max || hw.gpu_pcie_gen}${hw.gpu_pcie_width ? ` x${hw.gpu_pcie_width}` : ""}` : null;
   return [
     ["Version", ver ? `Project Maya v${ver}${eng.version ? ` · engine ${eng.version}` : ""}` : null],
     ["Model", eng.model || S.health.model],
-    ["Engine", eng.engine_kind ? ({"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)"}[eng.engine_kind] || eng.engine_kind) : null],
+    ["Engine", eng.engine_kind ? (ENGINES[eng.engine_kind] || eng.engine_kind) : null],
     ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
     ["Trained for", eng.trained_context ? `up to ${fmt(eng.trained_context)} tokens` : null],
     ["KV cache", kv],
     ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
-                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}, the rest read from the SSD` : null],
-    ["Speculation", eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
+                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}` +
+                 `${+eng.expert_slots + (+eng.ram_slots || 0) >= +eng.experts ? "" : ", the rest read from the SSD"}` : null],
+    ["Speculation", eng.dspark != null
+                  ? (+eng.dspark ? "DSpark: its drafter proposes a few tokens at a time, the full model checks them" +
+                                  (m.tiers && m.tiers.now && m.tiers.now.drafts != null ? ` (${fmt(100 * m.tiers.now.drafts)}% of them kept in the last answer)` : "")
+                                : "off (the config's --dspark, or no DSpark drafter in this pack)")
+                  : eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
                   : "off (one GPU, or no draft block in this model file)"],
     ["Images", eng.images != null ? (eng.images ? "On" : "Off") : (S.health.images ? "On" : "Off")],
     ["GPU", st.gpu_name ? `${gpuNames(st.gpu_name, gpus.length)}${hw.gpu_mem_total ? ` · ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],

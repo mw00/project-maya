@@ -27,7 +27,7 @@
   --st-ease:cubic-bezier(.2,.7,.2,1); --st-dur:160ms;
 
   /* layout */
-  --maya-side:260px; --maya-read:768px;
+  --maya-side:312px; --maya-read:768px;
 
   /* color - dark (the default) */
   --st-side:#111114;            /* the sidebar */

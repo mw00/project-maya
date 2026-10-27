@@ -15,9 +15,10 @@
 <link rel="stylesheet" href="web/models.css">
 <link rel="modulepreload" href="web/preact.js">
 <script>
-  // the theme before the first paint: the saved choice ("maya.ui-theme": dark, light or system), else dark (Maya's default)
+  // the theme before the first paint: the saved choice ("maya.theme": dark, light or system), else dark (Maya's default).
+  // (The dashboard before the redesign kept its own in "maya.ui-theme": not carried over, so every browser starts dark.)
   try {
-    let t = localStorage.getItem("maya.ui-theme") || "dark";
+    let t = localStorage.getItem("maya.theme") || "dark";
     if (t === "system") t = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
     document.documentElement.dataset.theme = t;
   } catch (e) {}

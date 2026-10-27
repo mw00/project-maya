@@ -3,7 +3,7 @@
 // greeting with ideas to start from.
 import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
 import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, timeStr, tokfmt} from "./lib.js";
-import {LEVELS, P, PRESET_NAMES, S, THINK_TITLES, copyText, emit, presetOf, prefsKey, savePrefs} from "./state.js";
+import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkTitles} from "./state.js";
 import {mcpOn} from "./server.js";
 import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newChat, painters, regenerate,
         removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
@@ -253,7 +253,7 @@ function textWidth(t, el) {
 
 function ThinkingPanel({close, sheet}) {
   const level = thinkingOf(), li = LEVELS.findIndex((l) => l.id === level);
-  const titles = THINK_TITLES[prefsKey() === "sampling_deepseek" ? "deepseek" : "glm"];
+  const titles = thinkTitles();
   const pick = (id) => setThinking(id);
   const keys = (e) => {
     if (!["ArrowRight", "ArrowLeft", "ArrowUp", "ArrowDown"].includes(e.key)) return;

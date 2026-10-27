@@ -81,6 +81,10 @@
   .set-body { padding: 18px 16px 32px; }
   .set-row { flex-direction: column; align-items: stretch; gap: 10px; }
   .set-row__ctl { justify-content: flex-start; flex-wrap: wrap; }
+  /* (MiniMax's seven thinking levels: Off and Auto on the first row, its five efforts on the second - no holes) */
+  .seg--many { display: grid; grid-template-columns: repeat(10, minmax(0, 1fr)); width: 100%; }
+  .seg--many button { grid-column: span 2; padding: 0 2px; }
+  .seg--many button:nth-child(-n+2) { grid-column: span 5; }
   .set-slider { grid-template-columns: minmax(0, 1fr) 56px; }
   .set-slider label { grid-column: 1 / -1; }
   .keys, .set-pair { grid-template-columns: minmax(0, 1fr); }

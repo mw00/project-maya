@@ -106,6 +106,22 @@ class Dashboard(unittest.TestCase):
         args = json.loads(self.cfg.read_text())["args"]
         self.assertEqual(args[args.index("--max-context") + 1], "65536")
         self.assertEqual(json.loads(self.cfg.read_text())["env"]["STRATA_GLM_RAM_GB"], "20")   # the rest kept
+        self.assertGreaterEqual(j["load_s"], 0.3)       # (how long that load took: the page's estimate of the next)
+        # the setup's own size is kept for the Models page's "Reset to the setup's values", through later reloads
+        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
+        self.req("POST", "/api/context", {"max_context": 16384})
+        self.wait_reload()
+        self.assertEqual(json.loads(self.cfg.read_text())["installer"]["as_set_up"]["context"], 32768)
+
+    def test_metrics_say_whether_deepseek_drafts(self):
+        # DeepSeek's engine does not say it drafts with DSpark: the server does (the Monitor's Speculation), and only
+        # for a DeepSeek config
+        s, _, b = self.req("GET", "/metrics")
+        self.assertNotIn("dspark", json.loads(b)["engine"])
+        for on in (True, False):
+            self.svc.dspark = on
+            s, _, b = self.req("GET", "/metrics")
+            self.assertIs(json.loads(b)["engine"]["dspark"], on)
 
     def test_chat_gets_503_while_reloading(self):
         os.environ["STRATA_MOCK_RELOAD_S"] = "1.5"

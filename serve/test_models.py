@@ -56,6 +56,23 @@ def ds4_cfg(d: Path, name="maya-gguf-q8.json", drafter=True, vision=False) -> Pa
     return p
 
 
+def mm3_cfg(d: Path, name="maya-mm3.json", drafter=True, vision=True) -> Path:
+    """MiniMax's config as maya.py's write_config_mm3 writes it."""
+    pack = d / "MiniMax-M3.1-Flash-EXL3-3.5bpw" / "pack"
+    pack.mkdir(parents=True, exist_ok=True)
+    (pack / "mm3.txt").write_text("hidden_size 3072\nmax_position_embeddings 1048576\n" +
+                                  ("dspark.num_hidden_layers 2\n" if drafter else "") +
+                                  ("vision.hidden_size 1280\n" if vision else ""))
+    args = ["--pack", str(pack), "--max-context", "65536", "--kv-streaming", "on", "--tp", "4",
+            "--dspark", "off", "--vision", "on"]
+    cfg = {"exe": "/b/maya-mm3", "args": args, "model_name": "minimax-m3.1-flash", "gpu": list(range(9)),
+           "reasoning_effort": "auto", "installer": {"family": "minimax", "quant": "MiniMax-M3.1-Flash",
+                                                     "written": "2026-10-27 10:00"}}
+    p = d / name
+    p.write_text(json.dumps(cfg, indent=1))
+    return p
+
+
 class Settings(unittest.TestCase):
     """A config's engine arguments as the page's settings, and back."""
 
@@ -121,6 +138,61 @@ class Settings(unittest.TestCase):
             M.apply(cfg, {"images": True})
         self.assertEqual(M.choices(M.read(ds4_cfg(self.d, "maya-x.json", drafter=False)))["draft"], ["none"])
 
+    def test_deepseek_tensor_parallel_beyond_two(self):
+        # a 9-GPU config the calibration left at --tp 8: read as it is, and its other settings still save
+        cfg = M.read(ds4_cfg(self.d))
+        cfg["gpu"] = list(range(9))
+        cfg["args"] = M.set_flag(cfg["args"], "--tp", 8)
+        self.assertEqual(M.settings_of(cfg)["tp"], 8)
+        new = M.apply(cfg, {"prefill_chunk": 2048})
+        self.assertEqual((M.flag(new["args"], "--tp"), M.flag(new["args"], "--prefill-chunk")), ("8", "2048"))
+        self.assertEqual(M.flag(M.apply(cfg, {"tp": 9})["args"], "--tp"), "9")
+        with self.assertRaisesRegex(ValueError, "Tensor parallel: from 1 to 9"):
+            M.apply(cfg, {"tp": 10})
+        with self.assertRaisesRegex(ValueError, "Tensor parallel: from 1 to 2"):
+            M.apply(cfg, {"gpus": [0, 1]})               # (fewer GPUs than its group: tp too)
+        self.assertEqual(M.flag(M.apply(cfg, {"gpus": [0], "tp": 2})["args"], "--tp"), "2")   # (one GPU: 2 as before)
+        # no --tp: the engine's own 2, which a save keeps
+        cfg["args"] = M.drop_flag(cfg["args"], "--tp")
+        self.assertEqual(M.settings_of(cfg)["tp"], 2)
+        self.assertEqual(M.flag(M.apply(cfg, {"cpu_threads": 8})["args"], "--tp"), "2")
+
+    def test_minimax_read_and_written_with_its_own_flags(self):
+        cfg = M.read(mm3_cfg(self.d))
+        self.assertEqual(M.family(cfg), "minimax")
+        self.assertEqual(M.family({"exe": "/b/maya-mm3", "args": ["--pack", "/p"]}), "minimax")   # (no installer)
+        self.assertEqual(M.settings_of(cfg), {"context": 65536, "gpus": list(range(9)), "env": {}, "images": True,
+                                              "draft": "none", "tp": 4, "kv_cache": "int8", "kv_streaming": True,
+                                              "kv_resident": None, "cpu_threads": None})
+        self.assertEqual(M.choices(cfg), {"draft": ["dspark", "none"], "images": True})
+        new = M.apply(cfg, {"context": 262144, "draft": "dspark", "images": False, "tp": 2, "kv_cache": "fp8",
+                            "kv_resident": 65536, "cpu_threads": 24})
+        a = new["args"]
+        for f, v in (("--max-context", "262144"), ("--dspark", "on"), ("--vision", "off"), ("--tp", "2"),
+                     ("--kv-cache", "fp8"), ("--kv-streaming", "on"), ("--kv-resident", "65536"),
+                     ("--cpu-threads", "24")):
+            self.assertEqual(M.flag(a, f), v, f)
+        # maya-mm3 stops at a flag it does not know: none of DeepSeek's or GLM's are written
+        for f in ("--mmap-experts", "--prefill-chunk", "--reserve-mib", "--vram-reserve-mib", "--parallel", "--prefill"):
+            self.assertNotIn(f, a)
+        with self.assertRaisesRegex(ValueError, "not a setting of this model: mmap"):
+            M.apply(cfg, {"mmap": "on"})
+        # tp 0: the layers split (no --tp); 3 is not a group the engine takes
+        self.assertNotIn("--tp", M.apply(cfg, {"tp": 0})["args"])
+        with self.assertRaisesRegex(ValueError, "1, 2 or 4"):
+            M.apply(cfg, {"tp": 3})
+        with self.assertRaisesRegex(ValueError, "KV cache"):
+            M.apply(cfg, {"kv_cache": "q4_0"})
+        # KV streaming off: the window goes with it; INT8 (the engine's default) not written where it was not
+        off = M.apply(cfg, {"kv_streaming": False, "kv_resident": 65536})["args"]
+        self.assertEqual((M.flag(off, "--kv-streaming"), "--kv-resident" in off, "--kv-cache" in off), ("off", False, False))
+        # a pack without the drafter or the tower: neither offered
+        bare = M.read(mm3_cfg(self.d, "maya-mm3-b.json", drafter=False, vision=False))
+        self.assertEqual(M.choices(bare), {"draft": ["none"], "images": False})
+        with self.assertRaisesRegex(ValueError, "no DSpark drafter"):
+            M.apply(bare, {"draft": "dspark"})
+        self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
+
     def test_listing(self):
         g, ds = glm_cfg(self.d), ds4_cfg(self.d)
         (self.d / "maya-maya-m.shared-settings.json").write_text("{}")
@@ -131,6 +203,8 @@ class Settings(unittest.TestCase):
         mm = out["models"][1]
         self.assertEqual((mm["running"], mm["quant"], mm["family"], mm["size"]), (True, "Maya-M", "glm", 1000))
         self.assertEqual(out["models"][0]["quant"], "UD-Q8_K_XL")
+        # each model's context choices are its setup's: DeepSeek's reach 1M, GLM's 128K (its own size is offered too)
+        self.assertEqual((out["models"][0]["contexts"], mm["contexts"]), (M.DS4_CONTEXTS, M.CONTEXTS))
         self.assertEqual([x["index"] for x in out["gpus"]], [0, 1])               # (GPU 1: named by a config only)
 
 
@@ -241,6 +315,21 @@ class Page(unittest.TestCase):
             self.assertEqual(s, 400, f)
         s, _ = self.req("POST", "/api/models/switch", {"file": self.other.name}, {"Origin": "http://elsewhere.example"})
         self.assertEqual(s, 403)
+
+    def test_files_gone(self):
+        # a config whose model was deleted: listed as such, and no switch to it (maya.py would stop there, no model
+        # running)
+        gone = glm_cfg(self.d, "maya-gone.json")
+        cfg = json.loads(gone.read_text())
+        cfg["args"] = M.set_flag(cfg["args"], "--glm-pack", str(self.d / "deleted" / "pack"))
+        gone.write_text(json.dumps(cfg))
+        s, b = self.req("GET", "/api/models")
+        m = next(x for x in b["models"] if x["file"] == gone.name)
+        self.assertEqual((m["ok"], m["missing"]), (False, f"its model files are not on this PC ({self.d / 'deleted'})"))
+        self.assertTrue(next(x for x in b["models"] if x["file"] == self.other.name)["ok"])
+        s, b = self.req("POST", "/api/models/switch", {"file": gone.name})
+        self.assertEqual(s, 400)
+        self.assertIn("its model files are not on this PC", json.dumps(b))
         s, _ = self.req("POST", "/api/models/settings", {"file": self.cfg.name, "settings": {"context": 8192}},
                         {"Origin": "http://elsewhere.example"})
         self.assertEqual(s, 403)

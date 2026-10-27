@@ -2,7 +2,7 @@
 // streamed (and taken back up from the server after a reload or a dropped connection), stopping, editing, regenerating,
 // attachments, the context meter and the Markdown export.
 import {SPRITE, api, coarse, ctxfmt, db, download, fmt, headers, store, uid} from "./lib.js";
-import {P, S, confirmDialog, defaultSystem, emit, promptDialog, toast} from "./state.js";
+import {P, S, THINKING, confirmDialog, defaultSystem, emit, promptDialog, toast} from "./state.js";
 import {mcpOn} from "./server.js";
 
 // ------------------------------------------------------------------ the chats' list
@@ -18,7 +18,8 @@ export function newChatObj() {
   return {id: uid(), title: "", created: Date.now(), updated: Date.now(), messages: [], system: defaultSystem(), thinking: P.thinking};
 }
 // the thinking level this chat asks for: its own (the box's speedometer), else the Settings default
-export const thinkingOf = (c = S.current) => (c && c.thinking) || P.thinking;
+// (a level the running model does not have - a chat from MiniMax's "Auto" on GLM - is the default's)
+export const thinkingOf = (c = S.current) => (c && THINKING.includes(c.thinking) && c.thinking) || P.thinking;
 export function setThinking(level) {
   const c = S.current;
   c.thinking = level;
@@ -214,7 +215,9 @@ export function apiMessages(chat, msgs = chat.messages, light = false) {
 // results (as the model read them), then the rest - so the next question can build on what the tools found.
 function assistantMessages(m) {
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
-  if (!ran.length) return m.text ? [{role: "assistant", content: m.text}] : [];
+  // (an answer stopped before its text - while the model thought - goes back empty: without it the model reads two
+  //  questions in a row and answers the one that was stopped)
+  if (!ran.length) return m.text ? [{role: "assistant", content: m.text}] : m.stopped ? [{role: "assistant", content: ""}] : [];
   const out = [];
   let pos = 0;
   for (const r of [...new Set(ran.map((t) => t.round))]) {
@@ -333,7 +336,8 @@ function answerMeta(m, n, secs) {
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) parts.push(`${ran} tool call${ran > 1 ? "s" : ""}`);
   if (m.limit) parts.push(`stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`);
-  return parts.join(" · ") || (m.stopped ? "Stopped" : "");
+  const s = parts.join(" · ");   // ("Stopped", not "stopped", when nothing comes before it: a stop has no usage)
+  return s && s[0].toUpperCase() + s.slice(1);
 }
 const sleepOrVisible = (ms) => new Promise((ok) => {
   const go = () => { document.removeEventListener("visibilitychange", go); clearTimeout(tm); ok(); };
@@ -614,7 +618,7 @@ export async function clearBrowser() {
   if (!ok) return;
   try { await db.clear(); } catch (e) { /* nothing stored there */ }
   try {
-    for (const k of Object.keys(localStorage)) if ((k.startsWith("maya.") || k.startsWith("strata.")) && k !== "maya.ui-theme") localStorage.removeItem(k);
+    for (const k of Object.keys(localStorage)) if ((k.startsWith("maya.") || k.startsWith("strata.")) && k !== "maya.theme") localStorage.removeItem(k);
   } catch (e) { /* ignore */ }
   location.reload();
 }

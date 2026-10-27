@@ -32,6 +32,12 @@ const setUpOn = (w) => {
   return d && !Number.isNaN(d.getTime()) ? `set up ${d.toLocaleDateString([], {month: "short", day: "numeric"})}` : null;
 };
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+// a GPU as the Monitor names it: "RTX 5060 Ti", not "NVIDIA GeForce RTX 5060 Ti"
+const shortGpu = (n) => (n || "").replace(/^NVIDIA /, "").replace(/^GeForce /, "").replace(/^AMD /, "").replace(/^Radeon /, "");
+// DeepSeek's --tp choices: 1, 2, the calibration's 4, 8 and 16 up to the GPUs picked, all of them as one group, and the
+// config's own (serve/models.py takes 1 up to the GPUs picked, 2 on one GPU)
+const tpChoices = (n, ...own) => [...new Set([1, 2, ...[4, 8, 16].filter((t) => t <= n), Math.max(1, n), ...own.map(Number)])]
+  .filter((t) => t >= 1).sort((a, b) => a - b);
 
 // ------------------------------------------------------------------ Maya starting again (a switch, or new settings)
 async function watchRestart(r) {
@@ -190,8 +196,8 @@ function AutoOr({label, k, d, dflt, unit, subLabel}) {
 }
 
 function fieldsOf(m, d) {
-  const s = m.settings, ch = (...ks) => ks.some((k) => !same(d[k], s[k])), glm = m.family !== "deepseek";
-  const ctxs = [...new Set([...(MS.data.contexts || []), s.context, d.context].map(Number))].sort((a, b) => a - b);
+  const s = m.settings, ch = (...ks) => ks.some((k) => !same(d[k], s[k])), glm = m.family === "glm";
+  const ctxs = [...new Set([...(m.contexts || MS.data.contexts || []), s.context, d.context].map(Number))].sort((a, b) => a - b);
   const context = html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
     hint=${glm && d.kv_streaming ? (d.context <= (Number(d.kv_resident) || 32768) ? `Up to ${ctxfmt(Number(d.kv_resident) || 32768)} the whole cache stays in VRAM.`
       : `Above ${ctxfmt(Number(d.kv_resident) || 32768)} the cache streams from RAM: about ${fmt((d.context * 12288) / 1e9, 1)} GB of RAM at ${ctxfmt(d.context)}.`)
@@ -208,12 +214,13 @@ function fieldsOf(m, d) {
       return html`<button type="button" role="checkbox" aria-checked=${String(on)} class="mdl-gpu"
         onClick=${() => { if (on && d.gpus.length === 1) return; setDraft({gpus: on ? d.gpus.filter((x) => x !== g.index) : [...d.gpus, g.index].sort((a, b) => a - b)}); }}>
         <span class="mdl-gpu__box">${on ? html`<${Icon} name="check" sm/>` : null}</span>
-        <span><b>GPU ${g.index}</b><span>${[g.name, g.vram_gb ? `${fmt(g.vram_gb)} GB` : null].filter(Boolean).join(" · ") || "on this PC"}</span></span></button>`;
+        <span><b>GPU ${g.index}</b><span>${[shortGpu(g.name), g.vram_gb ? `${fmt(g.vram_gb)} GB` : null].filter(Boolean).join(" · ") || "on this PC"}</span></span></button>`;
     })}</div>`}/>`;
   const reserve = html`<${Row} label="VRAM kept free" flag=${glm ? "--vram-reserve-mib" : "--reserve-mib"} changed=${ch("reserve_mib")}
     hint=${glm ? "For the driver, the desktop and other programs. Empty: 700 MiB." : "Per GPU, for the driver, the desktop and other programs. Empty: the engine's own."}
     warn=${whole(d.reserve_mib) ? null : "A whole number of MiB, or empty for the default."}>
     <${Num} label="VRAM kept free" value=${d.reserve_mib} ph=${glm ? "700" : "default"} unit="MiB / GPU" on=${(v) => setDraft({reserve_mib: v})}/><//>`;
+  if (m.family === "minimax") return mm3Fields(m, d, s, ch, ctxs, images, gpus);
   if (glm) {
     const ec = AutoOr({label: "Expert cache", k: "expert_cache", d, dflt: 1200, unit: "experts", subLabel: "Experts in the first GPU's pool"});
     const pf = AutoOr({label: "Prompt chunk", k: "prefill", d, dflt: 8192, unit: "tokens", subLabel: "Tokens a prompt is read in at a time"});
@@ -256,9 +263,12 @@ function fieldsOf(m, d) {
           onChange=${(v) => setDraft({draft: v})}/><//>`,
       images]},
     {label: "GPUs and memory", rows: [gpus,
-      html`<${Row} label="Tensor parallel" flag="--tp" changed=${ch("tp")} hint="Two equal GPUs share each layer. On one GPU, 1."
-        warn=${Number(d.tp) === 2 && d.gpus.length < 2 ? "With one GPU picked, 2 runs its layers alone and reads prompts slower: use 1." : null}>
-        <${Seg} label="Tensor parallel" value=${Number(d.tp)} options=${[{id: 1, label: "1"}, {id: 2, label: "2"}]} onChange=${(v) => setDraft({tp: v})}/><//>`,
+      html`<${Row} label="Tensor parallel" flag="--tp" changed=${ch("tp")}
+        hint="How many GPUs share each layer: equal GPUs, in groups of this size. On one GPU, 1. The calibration (--calibrate) picks the faster on this PC."
+        warn=${Number(d.tp) === 2 && d.gpus.length < 2 ? "With one GPU picked, 2 runs its layers alone and reads prompts slower: use 1."
+          : Number(d.tp) > Math.max(2, d.gpus.length) ? `A group of ${d.tp} needs at least ${d.tp} GPUs picked.` : null}>
+        <${Seg} label="Tensor parallel" value=${Number(d.tp)} options=${tpChoices(d.gpus.length, s.tp, d.tp).map((n) => ({id: n, label: String(n)}))}
+          onChange=${(v) => setDraft({tp: v})}/><//>`,
       reserve,
       html`<${Row} label="Experts VRAM does not hold" flag="--mmap-experts" changed=${ch("mmap")}
         hint="Auto copies them into RAM when it holds them, else reads them from the SSD in place.">
@@ -269,6 +279,52 @@ function fieldsOf(m, d) {
         warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
         <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="Set by the calibration (--calibrate) on this PC. Empty: the engine picks."
+        warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+  ];
+}
+
+// MiniMax's (maya-mm3: it stops at a flag it does not know, so only its own are offered).  Its KV cache's pinned RAM a
+// context token, by format (maya.py's MM3_KV_BYTES)
+const MM3_KV = [{id: "bf16", label: "BF16", bytes: 122880}, {id: "int8", label: "INT8", bytes: 63360},
+                {id: "fp8", label: "FP8", bytes: 63360}, {id: "fp4", label: "FP4", bytes: 34560}];
+function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
+  const dspark = m.choices.draft.includes("dspark"), win = Number(d.kv_resident) || 32768;
+  const kv = MM3_KV.find((f) => f.id === d.kv_cache);
+  const ram = kv ? `about ${fmt((d.context * kv.bytes) / 2 ** 30, 1)} GB of pinned RAM at ${ctxfmt(d.context)} (${kv.label})` : "pinned RAM";
+  const tps = [...new Set([0, 1, 2, 4].filter((t) => t <= Math.max(1, d.gpus.length)).concat([Number(s.tp), Number(d.tp)]))].sort((a, b) => a - b);
+  return [
+    {label: "Model", rows: [
+      html`<${Row} label="Context size" flag="--max-context" changed=${ch("context")}
+        hint=${d.kv_streaming ? `Every position's cache sits in RAM: ${ram}, its newest ${ctxfmt(win)} in VRAM too.${d.context > 262144 ? " Past 256K it has not been run end to end." : ""}`
+          : "The whole cache in VRAM: more context takes GPU memory from the experts."}>
+        <${Seg} label="Context size" value=${Number(d.context)} options=${ctxs.map((n) => ({id: n, label: ctxfmt(n)}))}
+          onChange=${(v) => setDraft({context: v})}/><//>`,
+      html`<${Row} label="Drafting" flag="--dspark" changed=${ch("draft")}
+        hint=${dspark ? "DSpark drafts a few tokens at a time for the model to check: the same answer. The speed calibration picks the faster on this PC."
+          : "This pack has no DSpark drafter."}>
+        <${Seg} label="Drafting" value=${d.draft} options=${[...(dspark ? [{id: "dspark", label: "DSpark"}] : []), {id: "none", label: "Off"}]}
+          onChange=${(v) => setDraft({draft: v})}/><//>`,
+      images]},
+    {label: "GPUs and memory", rows: [gpus,
+      html`<${Row} label="Tensor parallel" flag="--tp" changed=${ch("tp")}
+        hint="Off splits the layers across the GPUs. 1, 2 or 4: each layer's work shared by a group of that many GPUs; the setup picks 4 or 2 when the GPUs make whole groups."
+        warn=${Number(d.tp) > d.gpus.length ? `A group of ${d.tp} needs at least ${d.tp} GPUs picked.` : null}>
+        <${Seg} label="Tensor parallel" value=${Number(d.tp)} options=${tps.map((n) => ({id: n, label: n ? String(n) : "Off"}))}
+          onChange=${(v) => setDraft({tp: v})}/><//>`]},
+    {label: "Prompts and cache", rows: [
+      html`<${Row} label="KV cache" flag="--kv-cache" changed=${ch("kv_cache")}
+        hint="The attention cache's format: BF16 is the model's own, INT8 the engine's default, FP8 and FP4 smaller.">
+        <${Seg} label="KV cache" value=${d.kv_cache} options=${(kv ? MM3_KV : [...MM3_KV, {id: d.kv_cache, label: d.kv_cache}]).map((f) => ({id: f.id, label: f.label}))}
+          onChange=${(v) => setDraft({kv_cache: v})}/><//>`,
+      html`<${Row} label="KV streaming" flag="--kv-streaming" changed=${ch("kv_streaming", "kv_resident")}
+        hint="The attention cache lives in pinned RAM, with each layer's newest positions in VRAM. Off: all of it in VRAM."
+        below=${d.kv_streaming ? html`<div class="mdl-sub"><span>Positions each layer keeps in VRAM (--kv-resident)</span>
+          <${Num} label="Positions each layer keeps in VRAM" value=${d.kv_resident} ph="32768" unit="tokens" on=${(v) => setDraft({kv_resident: v})}/></div>` : null}
+        warn=${whole(d.kv_resident) ? null : "A whole number, or empty for 32,768."}>
+        <${Switch} label="KV streaming" on=${d.kv_streaming} onChange=${(v) => setDraft({kv_streaming: v})}/><//>`]},
+    {label: "Speed", rows: [
+      html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
         <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
   ];
@@ -286,9 +342,9 @@ function pairs(args) {
 function Command({c, saved}) {
   if (!c) return null;
   const was = new Set(pairs(saved ? saved.args : []).map((p) => p.join(" ")));
-  const envNew = saved && !same(c.env, saved.env);
+  const envWas = (saved && saved.env) || {};       // (a variable is new when the saved command has it otherwise)
   const segs = [];
-  for (const [k, v] of Object.entries(c.env || {})) segs.push({t: `${k}=${v} \\\n`, cls: envNew ? "is-new" : "c-env"});
+  for (const [k, v] of Object.entries(c.env || {})) segs.push({t: `${k}=${v} \\\n`, cls: saved && envWas[k] !== v ? "is-new" : "c-env"});
   segs.push({t: c.exe, cls: "c-exe"});
   for (const [a, v] of pairs(c.args)) {
     const isNew = saved && !was.has([a, v].join(" "));
@@ -384,10 +440,11 @@ function Card({m}) {
       ${m.running ? html`<span class=${`pill pill--${stopping ? "warn" : restarting ? "info" : "accent"}`} role="status">
           <i class=${`status__dot${stopping || restarting ? " is-pulse" : ""}`}></i>${stopping ? "Stopping…" : restarting ? "Restarting…" : "Running"}</span>`
         : loading ? html`<span class="pill pill--info" role="status"><i class="status__dot is-pulse"></i>Loading…</span>`
-        : !m.ok ? html`<span class="pill pill--warn">Incomplete</span>`
+        : !m.ok ? html`<span class="pill pill--warn" title=${m.missing || ""}>${m.missing && m.missing.startsWith("its model files") ? "Files missing" : "Incomplete"}</span>`
         : html`<button type="button" class="btn btn--secondary btn--sm" disabled=${!!r} onClick=${() => switchTo(m)}><${Icon} name="swap" sm/>Switch to this</button>`}
     </div>
     <div class="mdl-chips">${chips.map(([k, v]) => html`<span class="mdl-chip"><span>${k}</span><b>${v}</b></span>`)}</div>
+    ${m.missing && !m.running ? html`<div class="mdl-warn">It can't start: ${m.missing}. Run the setup again to repair it (<code>./maya.sh --setup</code>).</div>` : null}
     <div class="mdl-card__foot">
       <span class="mdl-card__file"><code>${m.file}</code><span>·</span><span>${m.running ? "running now" : m.used ? `last used ${relTime(m.used * 1000)}` : ""}</span></span>
       <span class="mdl-card__acts">

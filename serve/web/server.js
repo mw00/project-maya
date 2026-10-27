@@ -1,7 +1,7 @@
 // serve/web/server.js - what the page asks the server: its health (the model, its defaults), the live metrics every
 // second, the MCP servers, the context size and port (each a restart), the update, the shared settings and the report.
 import {api, ctxfmt, esc, fmt, headers} from "./lib.js";
-import {DEFAULTS, P, S, THINKING, confirmDialog, emit, loadPrefs, toast} from "./state.js";
+import {DEFAULTS, P, S, THINKING, confirmDialog, emit, loadPrefs, setFamily, toast} from "./state.js";
 
 // ------------------------------------------------------------------ health: the model and its recommended settings
 let onHealth = () => {};
@@ -13,11 +13,15 @@ export async function loadHealth() {
     // the server's recommended settings for this model (its run config) replace the built-in defaults, and are what the
     // chat uses until its user picks settings of their own
     const d = h.defaults || {};
-    if (THINKING.includes(d.reasoning_effort)) DEFAULTS.thinking = d.reasoning_effort;   // (GLM's names)
+    setFamily(h.model);                            // (its thinking levels: MiniMax's are not GLM's)
+    if (THINKING.includes(d.reasoning_effort)) DEFAULTS.thinking = d.reasoning_effort;   // (the run config's level)
     if (d.temperature !== undefined) DEFAULTS.temperature = d.temperature;
     if (d.top_p !== undefined) DEFAULTS.top_p = d.top_p;
     if (d.temperature !== undefined || d.top_k !== undefined) DEFAULTS.top_k = d.top_k !== undefined ? d.top_k : 0;
-    loadPrefs();                                   // each model keeps its own (DeepSeek's are not GLM's)
+    const was = P.thinking;                        // (the level the empty chat on screen took from the defaults)
+    loadPrefs();                                   // each model keeps its own (DeepSeek's, MiniMax's are not GLM's)
+    // ... made before the model was known: it starts at this model's default, as a change in Settings moves it
+    if (S.current && !S.current.messages.length && S.current.thinking === was) S.current.thinking = P.thinking;
     emit();
     onHealth();
     if (h.status === "reloading") watchReload();
@@ -90,22 +94,36 @@ export function ctxStops() {
 // what a context size costs here: the engine's own measurement of the current size, scaled
 export function ctxEstimate(n) {
   const c = S.ctxInfo;
-  // (a streamed cache - KV streaming - keeps a fixed window in VRAM: scaling it by the context would mislead)
+  // a streamed cache - KV streaming - keeps a fixed window in VRAM and every position in pinned RAM (maya-mm3): its RAM
+  // scales (the engine's own count at this size, kv_ram_gb), against the RAM free now
+  if (c && c.kv_resident && c.kv_ram_gb && c.context) {
+    const est = (c.kv_ram_gb / c.context) * n;
+    return {ram: true, gb: est, delta: est - c.kv_ram_gb, free: c.ram_free_gb != null ? +c.ram_free_gb : null};
+  }
+  // (... without its RAM count, scaling its fixed VRAM window by the context would mislead)
   if (!c || !c.kv_gb || !c.kv_ctx || c.kv_resident) return null;
   const perTok = c.kv_gb / c.kv_ctx;
   const est = perTok * n, now = perTok * c.context;
   const expertGb = c.vram_gb && c.vram_slots ? +c.vram_gb / c.vram_slots : null;
   return {gb: est, delta: est - now, experts: expertGb ? Math.round((est - now) / expertGb) : null, vram: +c.vram_gb || null};
 }
+// how long loading the model takes here: as long as its last load (GET /api/context's load_s), else the usual 1-3 minutes
+export function loadTime() {
+  const s = S.ctxInfo && +S.ctxInfo.load_s;
+  if (!(s > 0)) return "about 1–3 minutes";
+  const m = Math.round(s / 60);
+  return `about ${m <= 1 ? "a minute" : `${m} minutes`}, as its last load took`;
+}
 export async function confirmContext(n, chatTokens) {
   const c = S.ctxInfo, e = ctxEstimate(n);
   const parts = [`<p>The engine restarts with a <b>${esc(ctxfmt(n))}</b>-token context (now ${esc(ctxfmt(c.context))}). ` +
-                 "That takes about 1-3 minutes.</p>",
+                 `That takes ${esc(loadTime())}.</p>`,
                  "<ul><li>Your chats stay here; the next answer reads the chat again.</li>" +
                  "<li>Requests from other apps get a “try again” until the model is back.</li>" +
                  "<li>If the new size does not fit, the current one comes back by itself.</li>" +
                  (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"];
-  if (e) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of GPU memory` +
+  if (e && e.ram) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of RAM, kept pinned for the context.</p>`);
+  else if (e) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of GPU memory` +
                     (e.experts ? `, ${esc(fmt(Math.abs(e.experts)))} ${e.experts > 0 ? "fewer" : "more"} experts in VRAM than now.` : ".") + "</p>");
   if (chatTokens > n) parts.push(`<p class="warn-text">The open chat holds about ${esc(fmt(chatTokens))} tokens: more than the new size, so it will not fit. Start a new chat after the reload, or keep a larger context.</p>`);
   const ok = await confirmDialog(`Reload the model with a ${ctxfmt(n)} context?`, parts.join(""), `Reload with ${ctxfmt(n)}`);
@@ -156,7 +174,7 @@ export async function confirmPort(n) {
   if (n < 1024 || n > 65535) { toast("error", "The port did not change", "Use a number from 1024 to 65535.", 6000); return false; }
   const ok = await confirmDialog(`Move Maya to port ${n}?`,
     `<p>Maya listens on port <b>${esc(String(now))}</b> now. ` + (S.portInfo.restarts
-      ? "Saving starts it again on the new port: the model loads again, about 1-3 minutes.</p>" +
+      ? `Saving starts it again on the new port: the model loads again, ${esc(loadTime())}.</p>` +
         "<ul><li>This page moves to <b>" + esc(url) + "</b> when Maya is back.</li>" +
         "<li>Apps that use the API need the new port.</li>" + (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"
       : "The new port is saved and applies from the next start.</p>"), `Use port ${n}`);

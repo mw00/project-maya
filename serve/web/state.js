@@ -102,7 +102,8 @@ export function promptDialog({title, label = "", value = "", placeholder = "", o
 }
 
 // ------------------------------------------------------------------ the theme: dark, light, or the system's
-export function themeChoice() { try { return localStorage.getItem("maya.ui-theme") || "dark"; } catch (e) { return "dark"; } }
+// (saved as "maya.theme"; the old dashboard's "maya.ui-theme" is not read - dark is the default for everyone)
+export function themeChoice() { try { return localStorage.getItem("maya.theme") || "dark"; } catch (e) { return "dark"; } }
 export function applyTheme() {
   const c = themeChoice();
   const t = c === "system" ? (matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark") : c;
@@ -111,30 +112,52 @@ export function applyTheme() {
   if (meta) meta.content = t === "dark" ? "#19191d" : "#ffffff";
 }
 export function setTheme(c) {
-  try { localStorage.setItem("maya.ui-theme", c); } catch (e) { /* ignore */ }
+  try { localStorage.setItem("maya.theme", c); localStorage.removeItem("maya.ui-theme"); } catch (e) { /* ignore */ }
   applyTheme();
   emit();
 }
 matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => { if (themeChoice() === "system") applyTheme(); });
 
 // ------------------------------------------------------------------ the chat settings (each model keeps its own)
-// thinking: GLM's own levels - none (Off), low, high, max.  The page before v1.0.18 saved Qwen-era names, where its
+// thinking: GLM's own levels - none (Off), low, high, max - and DeepSeek's by the same names; MiniMax-M3.1's: Off, Auto
+// (no effort named: its template's default, the default here) and its card's five efforts, each in its template's
+// adaptive mode (the model decides whether to think).  The page before v1.0.18 saved Qwen-era names, where its
 // "Medium" was GLM's High and its "High" GLM's Max: they are translated once (thinking_v 2)
 export const DEFAULTS = {thinking: "high", temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0, max: "", seed: "", show: true,
                          mcp: true, system: "", sys_default: false, thinking_v: 2};
-export const THINKING = ["none", "low", "high", "max"];
-export const LEVELS = [
-  {id: "none", name: "Off", desc: "Answers right away"},
-  {id: "low", name: "Low", desc: "A short think"},
-  {id: "high", name: "High", desc: "Thinks it through"},
-  {id: "max", name: "Max", desc: "The most thorough, and the longest"},
-];
+const THINK_LEVELS = {glm: ["none", "low", "high", "max"], deepseek: ["none", "low", "high", "max"],
+                      minimax: ["none", "auto", "low", "medium", "high", "xhigh", "max"]};
+const THINK_DEFAULT = {glm: "high", deepseek: "high", minimax: "auto"};   // (the run config's level wins: loadHealth)
+const LEVEL = {none: ["Off", "Answers right away"], auto: ["Auto", "It decides whether to think"], low: ["Low", "A short think"],
+               medium: ["Medium", "A moderate think"], high: ["High", "Thinks it through"], xhigh: ["XHigh", "Thinks hard"],
+               max: ["Max", "The most thorough, and the longest"]};
+const LEVEL_MINIMAX = {low: "Effort low", medium: "Effort medium", high: "Effort high", xhigh: "Effort extra-high",
+                       max: "Effort max, the most thorough"};   // (each: it decides whether to think, at that effort)
 export const THINK_TITLES = {
   glm: {none: "No thinking: it answers right away", low: "GLM's Low: a short think", high: "GLM's High: thinks it through",
         max: "GLM's Max: the most thorough, and the longest"},
   deepseek: {none: "No thinking: it answers right away", low: "DeepSeek's Low: reasoning effort 50",
              high: "DeepSeek's High: reasoning effort 75", max: "DeepSeek's Max: reasoning effort 100, the most thorough"},
+  minimax: {none: "No thinking: it answers right away", auto: "MiniMax's default: it decides whether to think, no effort set",
+            low: "Effort low: it decides whether to think, and keeps it short", medium: "Effort medium: it decides whether to think",
+            high: "Effort high: it decides whether to think, and thinks it through",
+            xhigh: "Effort extra-high: it decides whether to think, and thinks hard",
+            max: "Effort max: it decides whether to think - the most thorough, and the longest"},
 };
+// the running model's family, its thinking levels (THINKING, LEVELS: live bindings) and their titles
+export const familyOf = (model = S.health.model) =>
+  (/deepseek/i.test(model || "") ? "deepseek" : /minimax/i.test(model || "") ? "minimax" : "glm");
+export let THINKING = THINK_LEVELS.glm;
+export let LEVELS = [];
+export function setFamily(model) {
+  const f = familyOf(model);
+  THINKING = THINK_LEVELS[f];
+  LEVELS = THINKING.map((id) => ({id, name: LEVEL[id][0], desc: (f === "minimax" && LEVEL_MINIMAX[id]) || LEVEL[id][1]}));
+  DEFAULTS.thinking = THINK_DEFAULT[f];
+  return f;
+}
+setFamily("");
+export const thinkTitles = () => THINK_TITLES[familyOf()];
 export const PRESETS = {precise: {temperature: 0}, balanced: {temperature: 0.6, top_p: 0.95, top_k: 20, min_p: 0},
                         creative: {temperature: 1.0, top_p: 0.95, top_k: 0, min_p: 0.05}};
 export const PRESET_NAMES = {precise: "Precise", balanced: "Balanced", creative: "Creative"};
@@ -147,7 +170,7 @@ export function presetOf(p) {
 }
 const glmLevel = (v) => ({medium: "high", high: "max", xhigh: "max"}[v] || v);
 
-export const prefsKey = () => (/deepseek/i.test(S.health.model || "") ? "sampling_deepseek" : "sampling");
+export const prefsKey = () => ({deepseek: "sampling_deepseek", minimax: "sampling_minimax"}[familyOf()] || "sampling");
 export let P = null;                     // the running model's chat settings
 export function loadPrefs(key = prefsKey()) {
   const p = {...DEFAULTS, ...store.get(key, {})};

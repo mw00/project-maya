@@ -5,6 +5,8 @@ A config's settings, as the page shows them (None: the engine's own default, or 
   both:      context, images, gpus, reserve_mib, env
   GLM:       parallel, draft ("mtp" | "dflash2"), expert_cache, prefill, kv_streaming, kv_resident
   DeepSeek:  draft ("dspark" | "none"), tp, mmap ("auto" | "on" | "off"), prefill_chunk, cpu_threads
+  MiniMax:   draft ("dspark" | "none"), tp (0: the layers split, no groups), kv_cache, kv_streaming, kv_resident,
+             cpu_threads (maya-mm3 stops at a flag it does not know: only its own are written)
 apply() writes them back into the config's "args", "env", "gpu" and "vision" - its other keys as they are."""
 from __future__ import annotations
 
@@ -18,12 +20,17 @@ from pathlib import Path
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
 CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's own size is offered too)
+DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
+MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
+MM3_KV = ("bf16", "int8", "fp8", "fp4")                           # maya-mm3 --kv-cache (one format for K and V)
 DS4_QUANTS = {"gguf-q8": "UD-Q8_K_XL", "gguf-q4": "UD-Q4_K_XL", "maya-s": "Maya-S", "maya-m": "Maya-M",
-              "maya-xs": "Maya-XS", "exl3": "EXL3 2.9 bpw", "exl3-3.5": "EXL3 3.5 bpw"}
+              "maya-xs": "Maya-XS", "exl3": "EXL3 2.9 bpw", "exl3-3.5": "EXL3 3.5 bpw", "abliterated": "Mix-256G"}
 ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
 DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "tp", "mmap", "prefill_chunk", "cpu_threads")
+MM3_KEYS = ("context", "images", "gpus", "env", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
+            "cpu_threads")
 
 
 # ------------------------------------------------------------------ the engine's arguments
@@ -62,8 +69,12 @@ def _int(v, default=None):
 
 
 def family(cfg: dict) -> str:
+    """"minimax", "deepseek" or "glm" (maya.py's config_family)."""
     args = [str(a) for a in cfg.get("args") or []]
-    return "deepseek" if (cfg.get("installer") or {}).get("family") == "deepseek" or "--pack" in args[:-1] else "glm"
+    fam = (cfg.get("installer") or {}).get("family")
+    if fam == "minimax" or Path(str(cfg.get("exe") or "")).name.startswith("maya-mm3"):
+        return "minimax"
+    return "deepseek" if fam == "deepseek" or "--pack" in args[:-1] else "glm"
 
 
 def gpus_of(cfg: dict) -> list:
@@ -118,8 +129,22 @@ def ds4_has_vision(cfg: dict) -> bool:
         return False
 
 
+def mm3_pack_has(cfg: dict, key: str) -> bool:
+    """MiniMax's pack indexes `key` (mm3.txt: "dspark.num_hidden_layers" its drafter, "vision.hidden_size" its vision
+    tower - maya.py's checks)."""
+    pack = pack_of(cfg)
+    try:
+        return any(line.startswith(key + " ")
+                   for line in (pack / "mm3.txt").read_text(encoding="utf-8", errors="replace").splitlines())
+    except (OSError, TypeError):
+        return False
+
+
 def choices(cfg: dict) -> dict:
     """What this config can be set to beyond what it is: a drafter and an image encoder that exist on this PC."""
+    if family(cfg) == "minimax":
+        return {"draft": ["dspark", "none"] if mm3_pack_has(cfg, "dspark.num_hidden_layers") else ["none"],
+                "images": mm3_pack_has(cfg, "vision.hidden_size")}
     if family(cfg) == "deepseek":
         return {"draft": ["dspark", "none"] if ds4_has_drafter(cfg) else ["none"],
                 "images": ds4_has_vision(cfg) or "--vision" not in (cfg.get("args") or [])}
@@ -133,12 +158,20 @@ def settings_of(cfg: dict) -> dict:
     args = cfg.get("args") or []
     env = {str(k): str(v) for k, v in (cfg.get("env") or {}).items()}
     out = {"context": _int(flag(args, "--max-context"), 32768), "gpus": gpus_of(cfg), "env": env}
+    if family(cfg) == "minimax":                       # (maya-mm3's own defaults where the config names none)
+        vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
+        out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
+                   draft="dspark" if flag(args, "--dspark", "off") not in ("off", "none") else "none",
+                   tp=_int(flag(args, "--tp"), 0), kv_cache=flag(args, "--kv-cache", "int8"),
+                   kv_streaming=kvs == "on" or (kvs is None and _int(flag(args, "--kv-resident"), 0) > 0),
+                   kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")))
+        return out
     if family(cfg) == "deepseek":
         dspark = flag(args, "--dspark")
         out.update(images=flag(args, "--vision") != "off",
                    reserve_mib=_int(flag(args, "--reserve-mib")),
                    draft="none" if dspark == "none" or (dspark is None and not ds4_has_drafter(cfg)) else "dspark",
-                   tp=_int(flag(args, "--tp"), 1), mmap=flag(args, "--mmap-experts", "auto"),
+                   tp=_int(flag(args, "--tp"), 2), mmap=flag(args, "--mmap-experts", "auto"),   # (2: the engine's own)
                    prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
         if out["mmap"] not in ("auto", "on", "off"):
             out["mmap"] = "auto"
@@ -170,8 +203,9 @@ def apply(cfg: dict, settings: dict) -> dict:
     keep the config's value."""
     if not isinstance(settings, dict):
         raise ValueError("the settings must be a JSON object")
-    ds4 = family(cfg) == "deepseek"
-    known = DS4_KEYS if ds4 else GLM_KEYS
+    fam = family(cfg)
+    ds4 = fam == "deepseek"
+    known = {"minimax": MM3_KEYS, "deepseek": DS4_KEYS}.get(fam, GLM_KEYS)
     unknown = sorted(set(settings) - set(known))
     if unknown:
         raise ValueError(f"not a setting of this model: {', '.join(unknown)}")
@@ -204,8 +238,33 @@ def apply(cfg: dict, settings: dict) -> dict:
     else:
         out.pop("env", None)
 
-    reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free")
-    if ds4:
+    reserve = _num(s, "reserve_mib", 0, 65536, "VRAM kept free") if fam != "minimax" else None
+    if fam == "minimax":
+        if s.get("draft") not in can["draft"]:
+            raise ValueError("Drafting: this pack has no DSpark drafter" if s.get("draft") == "dspark"
+                             else "Drafting: DSpark or none")
+        if s["draft"] == "dspark" or "--dspark" in args:
+            args = set_flag(args, "--dspark", "on" if s["draft"] == "dspark" else "off")
+        if s.get("images") and not can["images"]:
+            raise ValueError("Images: this pack has no vision tower")
+        args = set_flag(args, "--vision", "on" if s.get("images") else "off") \
+            if can["images"] or "--vision" in args else args
+        # (0: the layers split across the GPUs; 1, 2 or 4: the tensor-parallel path in groups of that many)
+        tp = _num(s, "tp", 0, 4, "Tensor parallel", none_ok=False)
+        if tp == 3:
+            raise ValueError("Tensor parallel: 1, 2 or 4 GPUs a group, or 0 to split the layers")
+        args = set_flag(args, "--tp", tp) if tp else drop_flag(args, "--tp")
+        kv = str(s.get("kv_cache") or "int8")
+        if kv not in MM3_KV and kv != flag(cfg.get("args") or [], "--kv-cache"):   # (a K,V mix the config has: kept)
+            raise ValueError("KV cache: " + ", ".join(f.upper() for f in MM3_KV))
+        args = set_flag(args, "--kv-cache", kv) if kv != "int8" or "--kv-cache" in args else args
+        args = set_flag(args, "--kv-streaming", "on" if s.get("kv_streaming") else "off")
+        kr = _num(s, "kv_resident", 1024, 1048576, "Positions kept in VRAM")
+        args = set_flag(args, "--kv-resident", kr) if kr is not None and s.get("kv_streaming") else \
+            drop_flag(args, "--kv-resident")
+        ct = _num(s, "cpu_threads", 1, 512, "CPU threads")
+        args = set_flag(args, "--cpu-threads", ct) if ct is not None else drop_flag(args, "--cpu-threads")
+    elif ds4:
         if s.get("draft") not in can["draft"]:
             raise ValueError("Drafting: this pack has no DSpark drafter" if s.get("draft") == "dspark"
                              else "Drafting: DSpark or none")
@@ -217,7 +276,9 @@ def apply(cfg: dict, settings: dict) -> dict:
             args = drop_flag(args, "--vision")
         else:
             args = set_flag(args, "--vision", "off")
-        tp = _num(s, "tp", 1, 2, "Tensor parallel", none_ok=False)
+        # (a group of up to every GPU picked - the calibration's 2, 4, 8, 16 or all of them; 2 on one GPU runs its
+        #  layers alone, as before)
+        tp = _num(s, "tp", 1, max(2, len(set(gpus))), "Tensor parallel", none_ok=False)
         args = set_flag(args, "--tp", tp)
         args = set_flag(args, "--reserve-mib", reserve) if reserve is not None else drop_flag(args, "--reserve-mib")
         if s.get("mmap") not in ("auto", "on", "off"):
@@ -306,15 +367,29 @@ def folder_size(pack: Path | None) -> int | None:
 
 def quant_label(cfg: dict, path: Path) -> str:
     inst = cfg.get("installer") or {}
+    if family(cfg) == "minimax":                       # (installer.quant names the model: its one quant)
+        return "EXL3 3.5 bpw"
     if family(cfg) == "deepseek":
         q = str(inst.get("ds4_quant") or inst.get("quant") or "")
         return DS4_QUANTS.get(q.lower(), q) or path.stem.removeprefix("maya-")
     return str(inst.get("quant") or path.stem.removeprefix("maya-").removesuffix("-hip"))
 
 
+def missing(cfg: dict) -> str | None:
+    """What keeps a config from starting (maya.py stops at it - a switch to it would leave no model running): None when
+    its engine and pack are named and the pack is on this PC."""
+    pack = pack_of(cfg)
+    if not cfg.get("exe") or pack is None:
+        return "its engine or pack is not set"
+    if not pack.is_dir():
+        return f"its model files are not on this PC ({pack.parent})"
+    return None
+
+
 def describe(path: Path, running: str | None) -> dict:
     cfg = read(path)
     pack = pack_of(cfg)
+    why = missing(cfg)
     inst = cfg.get("installer") or {}
     script = next((s.name for s in (path.with_name(f"run-{path.stem}.sh"), path.with_name(f"run-{path.stem}.bat"))
                    if s.is_file()), None)
@@ -327,8 +402,9 @@ def describe(path: Path, running: str | None) -> dict:
             "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
             "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
             "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
-            "size": folder_size(pack), "ok": bool(cfg.get("exe") and pack is not None),
-            "settings": cur, "setup": inst.get("as_set_up") or cur, "choices": choices(cfg), "command": command(cfg)}
+            "size": folder_size(pack), "ok": why is None, "missing": why,
+            "settings": cur, "setup": inst.get("as_set_up") or cur, "choices": choices(cfg), "command": command(cfg),
+            "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS}.get(family(cfg), CONTEXTS)}
 
 
 _gpu_cache: dict = {}

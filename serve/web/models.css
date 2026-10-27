@@ -84,8 +84,8 @@
 .mdl-sub .input { background: var(--st-bg); }
 .mdl-warn { padding: 8px 12px; border-radius: var(--st-r-row); background: var(--st-warn-tint); color: var(--st-warn-text); font-size: var(--st-fs-sm); line-height: 1.45; }
 .mdl-warn--err { margin-top: 12px; background: var(--st-danger-tint); color: var(--st-danger-text); }
-.mdl-gpus { display: flex; flex-wrap: wrap; gap: 8px; }
-.mdl-gpu { display: flex; align-items: center; gap: 10px; min-width: 180px; height: 46px; padding: 0 14px 0 12px; border: 1px solid var(--st-line-strong);
+.mdl-gpus { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
+.mdl-gpu { display: flex; align-items: center; gap: 10px; min-width: 180px; min-height: 46px; padding: 0 14px 0 12px; border: 1px solid var(--st-line-strong);
            border-radius: var(--st-r-md); background: transparent; color: var(--st-ink); text-align: left; }
 .mdl-gpu[aria-checked="true"] { border-color: color-mix(in srgb, var(--st-accent) 55%, var(--st-line)); background: var(--st-accent-tint); }
 .mdl-gpu__box { display: grid; place-items: center; width: 18px; height: 18px; flex: none; box-sizing: border-box; border-radius: 5px;
