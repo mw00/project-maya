@@ -1648,8 +1648,15 @@ void bench_moe() {
         }
         ma.mix = mix;
         const float mixed = time(ma);
-        std::printf("  bench %s: one layout %.3f ms, mixed kernels %.3f ms a layer's token\n",
-                    uniform ? "6 experts at K 1" : "6 experts at K 1-3", one, mixed);
+        const std::vector<float> o = host_copy(d_out, (size_t) E);
+        uint64_t hsh = 1469598103934665603ull;
+        for (float v : o) {
+            uint32_t u;
+            std::memcpy(&u, &v, 4);
+            hsh = (hsh ^ u) * 1099511628211ull;
+        }
+        std::printf("  bench %s: one layout %.3f ms, mixed kernels %.3f ms a layer's token  bits %016llx\n",
+                    uniform ? "6 experts at K 1" : "6 experts at K 1-3", one, mixed, (unsigned long long) hsh);
         cudaFree(d_plan);
         for (uint8_t* p : blobs) cudaFree(p);
     }
@@ -1658,7 +1665,76 @@ void bench_moe() {
     cudaFree(d_out);
 }
 
+// --bench-mv: one decode token's dense GEMVs at DeepSeek-V4.1's geometry, 6-bit (K2 12, mul1) as the 3.5 bpw pack's
+// attention and shared expert: us a call, the trellis read rate, and a checksum of the outputs' bits (equal before and
+// after a kernel change that keeps the bits)
+void bench_mv() {
+    struct Shape { const char* name; int k, n, per_tok; };
+    const Shape shapes[] = {{"wq_a", 5120, 1280, 1},   {"wq_b", 1280, 32768, 1}, {"wkv", 5120, 512, 1},
+                            {"wo_a", 4096, 1024, 8},   {"wo_b", 8192, 5120, 1},  {"sh_w1", 5120, 2304, 2},
+                            {"sh_w2", 2304, 5120, 1}};
+    const char* only = std::getenv("BENCH_MV_ONLY");
+    const int k2 = 12, cb = 2, iters = std::getenv("BENCH_MV_ITERS") ? std::atoi(std::getenv("BENCH_MV_ITERS")) : 100;
+    double tot_us = 0;
+    for (const Shape& s : shapes) {
+        if (only != nullptr && std::string(only) != s.name) continue;
+        const HostMat h = make_mat(s.k, s.n, k2, cb);
+        uint32_t* d_tr = dev_copy(h.tr);
+        uint16_t* d_suh = dev_copy(h.suh);
+        uint16_t* d_svh = dev_copy(h.svh);
+        ex::Mat m;
+        m.trellis = d_tr;
+        m.suh = d_suh;
+        m.svh = d_svh;
+        m.k = s.k;
+        m.n = s.n;
+        m.k2 = k2;
+        m.cb = cb;
+        const std::vector<float> x = rand_x(s.k, 2.0f);
+        float* d_x = dev_copy(x);
+        float* d_y = nullptr;
+        CK(cudaMalloc(&d_y, (size_t) s.n * sizeof(float)));
+        ex::MvJob j;
+        j.m = &m;
+        j.xf = d_x;
+        j.y = d_y;
+        j.alpha = 1.0f;
+        for (int i = 0; i < 5; ++i) ex::mv(&j, 1, 0);
+        cudaEvent_t a, b;
+        cudaEventCreate(&a);
+        cudaEventCreate(&b);
+        cudaEventRecord(a, 0);
+        for (int i = 0; i < iters; ++i) ex::mv(&j, 1, 0);
+        cudaEventRecord(b, 0);
+        cudaEventSynchronize(b);
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        const double us = 1000.0 * ms / iters;
+        const std::vector<float> y = host_copy(d_y, (size_t) s.n);
+        uint64_t hsh = 1469598103934665603ull;
+        for (float v : y) {
+            uint32_t u;
+            std::memcpy(&u, &v, 4);
+            hsh = (hsh ^ u) * 1099511628211ull;
+        }
+        const double bytes = (double) h.tr.size() * 4;
+        std::printf("  bench mv %-6s k%5d n%6d: %7.1f us  %6.0f GB/s  x%d a token  bits %016llx\n", s.name, s.k, s.n,
+                    us, bytes / us / 1e3, s.per_tok, (unsigned long long) hsh);
+        tot_us += us * s.per_tok;
+        cudaFree(d_tr);
+        cudaFree(d_suh);
+        cudaFree(d_svh);
+        cudaFree(d_x);
+        cudaFree(d_y);
+    }
+    std::printf("  bench mv: %.3f ms a layer's token (x40 for the model)\n", tot_us / 1000.0);
+}
+
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench-mv") {
+        bench_mv();
+        return 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--bench") {
         bench_moe();
         return 0;

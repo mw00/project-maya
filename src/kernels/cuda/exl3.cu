@@ -593,6 +593,9 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
     if (threadIdx.x < kCols)
         for (int c = 0; c < J.nc; ++c)
             J.part[((size_t) c * J.S + sp) * J.n + g * kCols + threadIdx.x] = sm.out[c * kCols + threadIdx.x];
+#if defined(STRATA_USE_HIP)
+    return;   // (mv_reduce_kernel adds them up)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&J.cnt[g], 1u) == (unsigned) (J.S - 1);
@@ -611,6 +614,35 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
         epilogue(sm.out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
     if (threadIdx.x == 0) J.cnt[g] = 0u;
 }
+
+#if defined(STRATA_USE_HIP)
+// AMD: a split launch's sums, added up by a second kernel.  mv_kernel's last-block hand-off costs a fence per block,
+// and at agent scope that is a write-back and an invalidate of the XCD's whole L2 (buffer_wbl2 / buffer_inv: on a
+// MI350X most of a 6-bit attention GEMV's time - DeepSeek-V4.1's wq_b, 512 blocks: 77.7 -> 30.1 us, wo_b 125.8 -> 40.9
+// us; its decode with DSpark 52.0 -> 74.3 tok/s); the launch boundary orders them once instead.  The same sums in split order and the same epilogue: the same bits.  Block: one output
+// block of a split job
+__global__ void __launch_bounds__(kThreads) mv_reduce_kernel(const KBatch b) {
+    __shared__ float out[kTok * kCols];
+    if (b.skip != nullptr && *b.skip) return;
+    int ji = 0, g = (int) blockIdx.x;
+    for (;; ++ji) {
+        const int groups = b.j[ji].S > 1 ? b.j[ji].n / kCols : 0;
+        if (g < groups) break;
+        g -= groups;
+    }
+    const KJob& J = b.j[ji];
+    const int warp = threadIdx.x >> 5;
+    if (threadIdx.x < kCols)
+        for (int c = 0; c < J.nc; ++c) {
+            float s = 0.0f;
+            for (int i = 0; i < J.S; ++i) s += J.part[((size_t) c * J.S + i) * J.n + g * kCols + threadIdx.x];
+            out[c * kCols + threadIdx.x] = s;
+        }
+    __syncthreads();
+    const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
+    if (warp < J.nc) epilogue(out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
+}
+#endif
 
 // ---------------------------------------------------------------- the routed experts
 struct KMoe {
@@ -653,6 +685,11 @@ __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {
 }
 // ... the second block of a (gate, up) pair to finish (its counter back at zero for the next launch) ...
 __device__ __forceinline__ bool pair_last(unsigned* cnt, int& last) {
+#if defined(STRATA_USE_HIP)
+    (void) cnt;
+    (void) last;
+    return false;   // (moe_swiglu_kernel / win_swiglu_kernel: mv_reduce_kernel's note)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(cnt, 1u) == 1u;
@@ -716,6 +753,9 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
     }
+#if defined(STRATA_USE_HIP)
+    return;   // (moe_combine_kernel)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&a.cnt[g], 1u) == (unsigned) (a.k - 1);
@@ -826,6 +866,45 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
+#if defined(STRATA_USE_HIP)
+// AMD: the pieces the last block of a pair / an output block runs elsewhere, as kernels of their own after the GEMVs
+// (mv_reduce_kernel's note: a fence a block is a write-back of the XCD's L2) - the same arithmetic, the same bits.
+// grid (n_ff / 128, k): moe_gate_up_kernel's clamped swiglu
+__global__ void __launch_bounds__(kCols) moe_swiglu_kernel(const KMoe a) {
+    const int ei = blockIdx.y;
+    if (a.plan_ptr[ei] == 0ull) return;
+    if (a.skip != nullptr && *a.skip) return;
+    const size_t row = (size_t) ei * a.n_ff + blockIdx.x * kCols + threadIdx.x;
+    a.h[row] = swiglu(a.h[row], a.u[row], a.limit);
+}
+// grid (n_embd / 128): moe_down_kernel's combine
+__global__ void __launch_bounds__(kCols) moe_combine_kernel(const KMoe a) {
+    if (a.skip != nullptr && *a.skip) return;
+    const int r = blockIdx.x * kCols + threadIdx.x;
+    float p[8];
+    for (int i = 0; i < a.k; ++i) p[i] = a.part[(size_t) i * a.n_embd + r];
+    a.out[r] = combine(a.plan_w, p, a.k, a.cpu_flag != nullptr && *a.cpu_flag ? a.cpu_part + r : nullptr,
+                       a.sh_out != nullptr ? a.sh_out[r] : 0.0f);
+}
+// grid (n_ff / 128, groups at most): win_gu_kernel's clamped swiglu, each entry of the group
+__global__ void __launch_bounds__(kCols) win_swiglu_kernel(const KWin a) {
+    const int grp = blockIdx.y;
+    if (grp >= *a.n_groups) return;
+    for (int m = a.grp_start[grp]; m < a.grp_start[grp + 1]; ++m) {
+        const size_t row = (size_t) a.grp_ent[m] * a.n_ff + blockIdx.x * kCols + threadIdx.x;
+        a.h[row] = swiglu(a.h[row], a.u[row], a.limit);
+    }
+}
+#define EXL3_MOE_SWIGLU(a, s) moe_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (a).k), kCols, 0, s>>>(a)
+#define EXL3_MOE_COMBINE(a, s) moe_combine_kernel<<<(unsigned) ((a).n_embd / kCols), kCols, 0, s>>>(a)
+#define EXL3_WIN_SWIGLU(a, groups, s) \
+    win_swiglu_kernel<<<dim3((unsigned) ((a).n_ff / kCols), (unsigned) (groups)), kCols, 0, s>>>(a)
+#else
+#define EXL3_MOE_SWIGLU(a, s) (void) 0
+#define EXL3_MOE_COMBINE(a, s) (void) 0
+#define EXL3_WIN_SWIGLU(a, groups, s) (void) 0
+#endif
+
 // ---------------------------------------------------------------- a mixed-precision layer's experts (MixedLayouts)
 // Each expert's layout by its class (the class whose VRAM range holds its blob), each part's K picked per block - the
 // same arithmetic as the one-layout kernels above for an expert of that K.  K 1-4 (K2 2, 4, 6, 8).
@@ -922,6 +1001,9 @@ __global__ void EXL3_BOUNDS(2) moe_down_mix_kernel(const KMoe a, const KMix mx) 
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
     }
+#if defined(STRATA_USE_HIP)
+    return;   // (moe_combine_kernel)
+#endif
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) last = atomicAdd(&a.cnt[g], 1u) == (unsigned) (a.k - 1);
@@ -1823,6 +1905,7 @@ template <int K2, int cb> struct RunMv {
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
         win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(a);
+        EXL3_WIN_SWIGLU(a, groups, s);
     }
 };
 template <int K2, int cb> struct RunWinDown {
@@ -1833,11 +1916,13 @@ template <int K2, int cb> struct RunWinDown {
 template <int K2, int cb> struct RunGU {
     static void run(const KMoe& a, cudaStream_t s) {
         moe_gate_up_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u), kThreads, 0, s>>>(a);
+        EXL3_MOE_SWIGLU(a, s);
     }
 };
 template <int K2, int cb> struct RunDown {
     static void run(const KMoe& a, cudaStream_t s) {
         moe_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), kThreads, 0, s>>>(a);
+        EXL3_MOE_COMBINE(a, s);
     }
 };
 template <int K2, int cb> struct RunRows {
@@ -2142,6 +2227,11 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         b.n = nb;
         b.skip = g_skip;
         if (!dispatch<RunMv>(m0.k2, m0.cb, b, blocks, s)) return false;
+#if defined(STRATA_USE_HIP)
+        int rblocks = 0;
+        for (int j = 0; j < nb; ++j) rblocks += b.j[j].S > 1 ? b.j[j].n / kCols : 0;
+        if (rblocks > 0) mv_reduce_kernel<<<rblocks, kThreads, 0, s>>>(b);
+#endif
     }
     launch_check("mv");
     return true;
@@ -2215,6 +2305,7 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
         mix_launch(a.mix, [&](auto cb) {
             moe_gate_up_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u), kThreads, 0, s>>>(m, k);
         });
+        EXL3_MOE_SWIGLU(m, s);
         launch_check("moe_gate_up (mixed)");
         return;
     }
@@ -2243,6 +2334,7 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
         mix_launch(a.mix, [&](auto cb) {
             moe_down_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), kThreads, 0, s>>>(m, k);
         });
+        EXL3_MOE_COMBINE(m, s);
         launch_check("moe_down (mixed)");
         return;
     }
@@ -2306,6 +2398,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
         const KMix k = kmix(a.mix);
         mix_launch(a.mix, [&](auto cb) {
             win_gu_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u), kThreads, 0, s>>>(w, k);
+            EXL3_WIN_SWIGLU(w, groups, s);
             win_down_mix_kernel<decltype(cb)::value><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, 0, s>>>(w, k);
         });
     } else if (!dispatch<RunWin>(a.lay.k2[0], a.lay.cb, w, groups, s) ||
