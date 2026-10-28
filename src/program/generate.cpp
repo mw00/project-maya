@@ -1050,6 +1050,13 @@ static int glm_pack_generate(const Options& o) {
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
     }
+#else
+    // Windows sends a console's Ctrl+C and Ctrl+Break to every process on it, the engine too: it would end at once and
+    // lose the conversation it holds.  The server stops on them and ends the engine with QUIT, as above.
+    if (o.serve) {
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGBREAK, SIG_IGN);
+    }
 #endif
     strata::core::Glm5Model model;
     std::string err;

@@ -983,6 +983,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGTERM, SIG_IGN);
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
+#else
+        // (Windows sends a console's Ctrl+C and Ctrl+Break to every process on it, the engine too; the server stops
+        // on them and ends the engine with QUIT)
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGBREAK, SIG_IGN);
 #endif
     }
     // STAT for the Monitor over a decode so far (from t1, the counters s_dec and the storage's io_dec then): the GLM
