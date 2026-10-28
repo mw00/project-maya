@@ -1470,12 +1470,12 @@ struct Model::Impl {
     int hc_stream = std::getenv("DS4_HC_STREAM") ? std::atoi(std::getenv("DS4_HC_STREAM")) : -1;
     bool hc_side() const { return hc_stream < 0 ? kHcStream : hc_stream != 0; }
     // DS4_HC_MIX_SPLIT: a window's hc_mix and hc_split in one launch (hc_mix_split: the block that ends a token's mixes
-    // runs its split - the same values, a launch fewer twice a layer).  1 (unset): where the two run on the layer's own
-    // stream, between its kernels (HIP's default, DS4_HC_STREAM=0); 2: on the side stream (st2) too, where they run
-    // beside the attention and the MoE, off their path - there it saves the host an enqueue and the side stream a gap,
-    // not measured yet; 0: the two launches everywhere, as before.  DS4_HC_FUSE's split (with the pre norm) keeps its
-    // own launch
-    int hc_ms = 1;
+    // runs its split - the same values, a launch fewer twice a layer).  1: where the two run on the layer's own stream,
+    // between its kernels (HIP's, DS4_HC_STREAM=0); 2: on the side stream (st2) too, where they run beside the attention
+    // and the MoE, off their path - there it saves the host an enqueue and the side stream a gap; 0 (unset): the two
+    // launches everywhere, as before - opt-in until measured (and built) on the cards it is for.  DS4_HC_FUSE's split
+    // (with the pre norm) keeps its own launch
+    int hc_ms = 0;
     // DS4_HEAD_COLS=<1..16>: a GGUF head's activations a pass (head_share; 8 by default, 4 before)
     int head_cols_gguf = 8;
     bool hc_mix_split_on(bool side, int T) const {
@@ -3057,9 +3057,9 @@ struct Model::Impl {
                 return false;
             }
             hc_ms = std::atoi(v);
-            if (hc_ms != 1)
-                std::fprintf(stderr, "ds4: a window's HC mix and split %s (DS4_HC_MIX_SPLIT=%d)\n",
-                             hc_ms == 2 ? "in one launch on the side stream too" : "in two launches", hc_ms);
+            if (hc_ms != 0)
+                std::fprintf(stderr, "ds4: a window's HC mix and split in one launch %s (DS4_HC_MIX_SPLIT=%d)\n",
+                             hc_ms == 2 ? "on the side stream too" : "where they run on the layer's stream", hc_ms);
         }
         if (const char* v = ds4_env("DS4_MARKOV_Q8")) {   // (MAYA_DS4_MARKOV_Q8)
             if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {

@@ -769,7 +769,7 @@ so there the default keeps the two launches (`2` fuses them there too; not measu
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_HC_MIX_SPLIT` | `1` | `1`: the HC mix and split in one launch where they run on the layer's own stream (AMD, `DS4_HC_STREAM=0`); `2`: on NVIDIA's side stream too; `0`: two launches everywhere, as before (the same bits every way) |
+| `MAYA_DS4_HC_MIX_SPLIT` | `0` | `1`: the HC mix and split in one launch where they run on the layer's own stream (AMD, `DS4_HC_STREAM=0`); `2`: on NVIDIA's side stream too; `0`: two launches everywhere, as before (the same bits every way; opt-in until measured) |
 
 A GGUF pack's output head now takes 8 rows a pass instead of 4. Each pass reads the whole head (129280 rows, or a
 GPU's share of them), so up to 8 rows (the drafter's block, a short verify window) read it once instead of twice, and
