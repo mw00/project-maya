@@ -63,8 +63,9 @@ All of them run on NVIDIA from the V100 / RTX 20 on, and on AMD and Windows (exp
 [What you need](#what-you-need)). DeepSeek's sizes include its Engram tables. The setup also offers unsloth's GGUF and
 LibertAIDAI's EXL3 quants of DeepSeek, orcarouter's abliterated DeepSeek, Mia-AiLab's EXL3 quant of MiniMax,
 turboderp's EXL3 quants of GLM, and Qwen-3.8-Flash-Next (CYBER-FROST) as its Q5_K_M GGUF, text only
-([its settings](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Each model's files, drafters, pictures and options:
-[docs/MODELS.md](docs/MODELS.md).**
+([its settings](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). ISTA-DASLab's GSQ-RCO IQ2_XXS GGUF of DeepSeek
+(about 140 GB of VRAM and RAM) runs too, set up by hand: [docs/deepseek-ista-gguf.md](docs/deepseek-ista-gguf.md).
+**Each model's files, drafters, pictures and options: [docs/MODELS.md](docs/MODELS.md).**
 
 ## Quality
 
@@ -279,9 +280,10 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   tower comes from DeepSeek's checkpoint, the GGUF option from
   [unsloth's GGUFs](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF), the EXL3 options are
   LibertAIDAI's ([2.9](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) and
-  [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw)). The optional DFlash2 drafter
-  ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF) by Anbeeld) is CC BY-NC-ND
-  4.0, non-commercial use only, and is downloaded only when you choose it.
+  [3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw)); the GGUF set up by hand is
+  ISTA-DASLab's [GSQ-RCO GGUF](https://huggingface.co/ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF) (MIT). The
+  optional DFlash2 drafter ([GLM-5.3-Flash-DFlash2-GGUF](https://huggingface.co/Anbeeld/GLM-5.3-Flash-DFlash2-GGUF)
+  by Anbeeld) is CC BY-NC-ND 4.0, non-commercial use only, and is downloaded only when you choose it.
 - The dashboard's font: Outfit (SIL Open Font License 1.1, `serve/web/fonts/OFL.txt`); its icons:
   [Lucide](https://lucide.dev) (ISC License, `serve/web/LICENSE.lucide.txt`); its UI library:
   [Preact](https://preactjs.com) (MIT License) with [htm](https://github.com/developit/htm) (Apache License 2.0),

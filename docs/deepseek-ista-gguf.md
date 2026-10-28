@@ -26,13 +26,26 @@ Linux with NVIDIA GPUs is what it was run on; AMD and Windows have not been trie
 
 ```sh
 hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
+  --revision 653a9874aa38c356233c5f3cc8c96b19a43b57eb \
   --include "*IQ2_XXS*.gguf" --include "*Engram*.gguf" \
   --local-dir /path/to/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF
 ```
 
-That is the four shards `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-0000N-of-00004.gguf` and
-`DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf`, in one folder (repeat `--include` for each pattern: with some versions of
-`hf`, a second pattern after one `--include` is read as a file name). The repo's `chat_template.jinja`,
+That is four shards and the Engram file, in one folder (repeat `--include` for each pattern: with some versions of
+`hf`, a second pattern after one `--include` is read as a file name). Their sizes and sha256 at that revision:
+
+| File | Bytes | sha256 |
+| --- | ---: | --- |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf` | 39075725728 | `2dfe9711eac1f7814aa59154d11e8f27739f8b96875dc1e667eac9f8c756e1fe` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf` | 39388449504 | `cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf` | 39246891616 | `9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf` | 20527837312 | `9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059` |
+| `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 110595290816 | `eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a` |
+
+The revision is pinned because the repo changed its files' layout on October 27, 2026: the current files are six
+shards in llama.cpp's own DeepSeek-V4.1 layout (b11870 and newer), with the Engram file linked as shard 6. That layout
+packs too (the Engram gate comes folded into one tensor, which the engine reads), but it has not been served with
+Maya yet; the four-shard files above are the ones that were. The repo's `chat_template.jinja`,
 `patch_chat_template.py` and `mmproj-*.gguf` are not used: the pack carries Maya's own chat template and the server
 renders prompts with DeepSeek's pinned encoder ([prompt format](deepseek-prompt-format.md)), and the pictures come
 from DeepSeek's own vision tower (step 2).
@@ -71,7 +84,7 @@ tool did not find their folders. The options:
 
 - `--drafter /path/dspark.json`, `--vision /path/to/vision-folder`: where they are, if not beside the model's folder;
 - `--engram DIR`: a folder holding the Engram file alone, if it is not in the model's folder;
-- `--shards FILE ...`: the four shard names of one build, if the folder holds more than one (IQ1_M, IQ2_XS);
+- `--shards FILE ...`: the shard names of one build, if the folder holds more than one (IQ1_M, IQ2_XS);
 - `--out DIR`: the pack's folder (default `<model>/maya-ds4`).
 
 ## 4. Config and start
