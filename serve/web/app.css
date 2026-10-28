@@ -1,6 +1,6 @@
 /* Project Maya UI - the layout: the shell, the sidebar, the chat (header, messages, the message box, a new chat's
-   greeting), search, and the phone's layout (a chats drawer, floating buttons, sheets).  Settings: settings.css;
-   the Monitor: monitor.css. */
+   greeting), search, and the phone's layout (the chats pushing the page aside, floating buttons, the thinking bar,
+   sheets).  Settings: settings.css; the Monitor: monitor.css. */
 
 #app { height: 100%; }
 .shell { display: flex; height: 100%; min-height: 0; }
@@ -323,23 +323,29 @@
 .search__item--new { font-size: var(--st-fs-md); font-weight: 500; }
 .search__none { margin: 0; padding: 18px 12px; color: var(--st-ink-muted); font-size: var(--st-fs-md); text-align: center; }
 
-/* ---------------------------------------------------------------- a sheet (the phone's thinking levels) */
+/* ---------------------------------------------------------------- a sheet (the phone's Saved) */
 .sheet-scrim { position: fixed; inset: 0; z-index: 40; display: flex; align-items: flex-end; background: var(--st-scrim); animation: fade 140ms ease; }
 .sheet { width: 100%; display: flex; flex-direction: column; gap: 6px; padding: 8px 22px calc(24px + env(safe-area-inset-bottom));
          border-radius: var(--st-r-xl) var(--st-r-xl) 0 0; background: var(--st-surface); box-shadow: var(--st-shadow-sheet); animation: slideup 200ms var(--st-ease); }
 @keyframes slideup { from { transform: translateY(100%); } }
 .sheet__grip { align-self: center; width: 36px; height: 4px; margin: 2px 0 12px; border-radius: 2px; background: var(--st-line-strong); }
-.sheet .think-panel__head { flex-direction: column; align-items: flex-start; gap: 2px; padding-bottom: 8px; }
-.sheet .think-panel__head b { font-size: 17px; }
-.sheet .think-panel__head span { text-align: left; }
-.sheet .think-slider { height: 64px; margin: 6px 26px 4px; }
-.sheet .think-slider__track, .sheet .think-slider__fill { top: 14px; }
-.sheet .think-slider__stop { width: 64px; height: 64px; margin-left: -32px; gap: 6px; }
-.sheet .think-slider__dot { margin: 10px 0; }
-.sheet .think-slider__stop.is-sel .think-slider__dot { margin: 5px 0; }
-.sheet .think-slider__name { font-size: var(--st-fs-md); }
-.think-panel__now { margin: 10px 0 0; padding: 12px 14px; border-radius: var(--st-r-md); background: var(--st-surface-2); font-size: var(--st-fs-md); color: var(--st-ink-soft); }
-.think-panel__now b { color: var(--st-ink); font-weight: 600; }
+/* the phone's thinking level: a bar hovering over the chat above the message box, the level filled in; a tap or a drag
+   along it sets another (its rail is thin, its touch area the bar's height) */
+.think-bar { position: absolute; z-index: 25; left: 2px; right: 2px; bottom: calc(100% + 10px); display: flex; align-items: center; gap: 14px;
+             height: 52px; padding: 0 20px 0 14px; border: 1px solid var(--st-glass-line); border-radius: var(--st-r-pill);
+             background: var(--st-glass-bar); box-shadow: var(--st-shadow-float);
+             -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%); animation: thinkbar 160ms var(--st-ease); }
+@keyframes thinkbar { from { opacity: 0; transform: translateY(6px); } }
+.think-bar__now { display: flex; align-items: center; gap: 7px; min-width: 84px; color: var(--st-ink); font-size: var(--st-fs-md); }
+.think-bar__now b { font-weight: 600; }
+.think-bar__track { position: relative; flex: 1; height: 100%; margin: 0 9px; cursor: pointer; touch-action: none; outline: none; }
+.think-bar__rail { position: absolute; left: 0; right: 0; top: 50%; height: 6px; margin-top: -3px; border-radius: 3px; background: var(--st-surface-3); overflow: hidden; }
+.think-bar__fill { position: absolute; left: 0; top: 0; bottom: 0; width: var(--fill); background: var(--st-accent); transition: width 160ms var(--st-ease); }
+.think-bar__tick { position: absolute; top: 50%; width: 4px; height: 4px; margin: -2px 0 0 -2px; border-radius: 50%; background: var(--st-ink-muted); }
+.think-bar__tick.is-on { background: color-mix(in srgb, var(--st-accent-ink) 70%, transparent); }
+.think-bar__knob { position: absolute; top: 50%; left: var(--fill); width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%;
+                   background: var(--st-accent); box-shadow: 0 0 0 5px var(--st-accent-tint); transition: left 160ms var(--st-ease); }
+.think-bar__track:focus-visible .think-bar__knob { outline: 2px solid var(--st-focus); outline-offset: 4px; }
 
 /* ---------------------------------------------------------------- the phone: the chats push the page over, floating buttons */
 /* (as ChatGPT's app: the chats slide in from the left beside the page, not over it, and push it to the right; its edge
