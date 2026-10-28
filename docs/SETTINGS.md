@@ -382,8 +382,9 @@ context shares the memory beside the model among the N conversations.
   between two runs of one request.
 - **A new request** takes the idle conversation its prompt continues. If none fits, it takes an empty one, else the
   least recently used, which first goes to a [kept conversation](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)
-  with `MAYA_DS4_SLOT_KEEP=1`. The others wait while its prompt is read. Its pictures are read by the engine between two
-  of their tokens: the vision tower borrows its room and gives it back before the prompt.
+  with `MAYA_DS4_SLOT_KEEP=1`. The others wait while its prompt is read (unless they decode between its chunks, below).
+  Its pictures are read by the engine between two of their tokens: the vision tower borrows its room and gives it back
+  before the prompt.
 - **Several GPUs:** the layer split and the tensor-parallel groups take the batched step as they take one token; each
   step's new compressed rows go to the other groups' GPUs in one hand-off.
 - **What it gains:** real questions through the server, against the same questions one after another (each alone,
@@ -405,7 +406,34 @@ context shares the memory beside the model among the N conversations.
   tok/s in all in one drafter pass, 19.4 with a pass each, 19.8 without drafts, 19.5 one after another alone with
   the drafter; through the server two requests at once ran at 14-19 tok/s each, about what each gets alone.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
-  longer wait in line for a whole answer - but a new prompt is read while the others wait.
+  longer wait in line for a whole answer - but a new prompt is read while the others wait, unless the settings below
+  are on.
+
+#### A long prompt beside running requests (opt-in until measured)
+
+By default a new request's prompt is read in one run while every other request waits: a 185K-token agent prompt stops
+the other conversation for as long as it takes to read. `MAYA_DS4_PROMPT_SHARE` reads it in parts of one prompt chunk
+(`--prefill-chunk`) while another request decodes, and between two parts the running requests decode for that share
+of the time the part took - the long prompt slows them down instead of stopping them, and takes longer itself.
+`MAYA_DS4_PROMPT_YIELD` lets a long read give way at a part's end to a waiting request that needs at most half the
+tokens it has left to read (counting what an idle conversation already holds of it): that request is read, writes its
+first token, and the long read goes on where it stopped (at most twice a read; a free conversation is needed, so with
+`--parallel 2` only while nothing else runs). Set both to keep the request let in decoding between the long read's
+parts. The parts are whole chunks of the plan one read in a single run would use - the same chunks and the same
+prompt skip (`MAYA_DS4_PROMPT_SKIP`) - so the prompt's arithmetic is the same: the expert cache can still move experts
+between the parts, as it does between two requests. A request alone reads as before with `MAYA_DS4_PROMPT_SHARE` (no
+part, nothing between); `MAYA_DS4_PROMPT_YIELD` reads every long prompt in parts of n chunks, also alone. Each part
+costs what a run costs at its start and end: the pipeline over a layer split fills and drains, the expert slots a
+GPU lends the prompt's buffers are read back, and one GPU that reads the experts layer by layer reads each layer's
+once a part rather than once a prompt. A prompt read in windows of 16 (`--prefill-chunk 0`) pauses between its
+windows. The engine log says how many parts a prompt was read in and how long the others ran between them;
+`maya-ds4 --parts-check --ids ...` (tests; with `--parallel 2` another conversation read and stepped between the parts)
+compares a prompt read in parts of one chunk with one read in a single run, bit for bit.
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `MAYA_DS4_PROMPT_SHARE` | 0 (off) | with `--parallel` above 1: while a prompt is read and another request decodes, the running requests decode between its chunks for this share of the time each chunk took (`0.5`: half as long; larger shortens their pauses more and lengthens the prompt's read) |
+| `MAYA_DS4_PROMPT_YIELD` | 0 (off) | `n`: a long prompt read gives way at a part's end to a waiting request that needs at most half its tokens left; the read goes in parts of `n` chunks where nothing else decodes (one chunk beside a decode with `MAYA_DS4_PROMPT_SHARE`) |
 
 ## Drafting with DFlash2
 

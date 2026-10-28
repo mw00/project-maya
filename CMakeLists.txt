@@ -196,6 +196,13 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
 endif()
+# maya-ds4 --serve --parallel: a prompt read in parts beside running requests - the parts, the time between them, when
+# a long read gives way (src/ds4/ds4_interleave.hpp; host code only, so a build without the suite builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_interleave_test.cpp")
+  add_executable(ds4_interleave_test EXCLUDE_FROM_ALL tests/ds4_interleave_test.cpp)
+  target_link_libraries(ds4_interleave_test PRIVATE strata_warnings)
+  add_test(NAME ds4_interleave_test COMMAND ds4_interleave_test)
+endif()
 
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the

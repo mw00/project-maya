@@ -19,6 +19,7 @@
 // prompt (the server's MAYA_DS4_RESTORE_POINTS: the start of the last user message, a point near the prompt's tail,
 // the end of the system prompt and tools): the read stops at each to keep the state there, and a later prompt that
 // leaves this one past one of them goes back to it (ds4_marks.hpp).
+#include "ds4_interleave.hpp"
 #include "ds4_marks.hpp"
 #include "ds4_model.hpp"
 #include "ds4_watchdog.hpp"
@@ -1097,8 +1098,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         strata::ds4::Stats s0;   // (the request's own CPU lane share)
         size_t from = 0;         // the tokens the state already held
     };
+    // --parallel: a prompt read beside the running requests (ds4_interleave.hpp; null: in one call, as before) -
+    // whether to read it in parts of whole chunks (Model::feed_plan), the next part's chunks of those left, and what
+    // runs between two parts (the part's ms, the tokens and chunks still to read; it binds this conversation again)
+    struct Pace {
+        std::function<bool()> parts;
+        std::function<int(int)> chunks;
+        std::function<void(double, int64_t, int)> between;
+    };
     const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
-                               Prompt& P) -> bool {
+                               Prompt& P, const Pace* pace) -> bool {
         const double t0 = now_ms();
         P.t0 = t0;
         P.s0 = m.stats();
@@ -1164,6 +1173,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         std::string err;
         bool ok = true;
+        std::vector<strata::ds4::Image> imgs_fed;   // (set again after each pause between two parts)
         // the pictures whose spans the prompt reads (the rest the state holds): encoded (or the cache's), checked
         if (!pics.empty()) {
             std::vector<strata::ds4::Image> imgs;
@@ -1197,6 +1207,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 err = "vision: the expert slots lent for the pictures were not read back as they were";
             }
             if (ok) {
+                imgs_fed = imgs;
                 m.set_images(std::move(imgs));
                 std::fprintf(stderr, "maya ds4 serve: %zu pictures, %d read (%.0f ms)\n", pics.size(), encoded,
                              now_ms() - te);
@@ -1228,7 +1239,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!cuts.empty() && cuts[0].pos == (int64_t) from) m.mark(cuts[next_cut++].shared);   // (the state as it is)
         size_t done = from, next_pp = from + 64;
         int64_t beat_at = -1;   // (the run's progress at the last beat)
-        m.set_progress([&](int64_t d) {   // (a run of chunks: each one through every layer)
+        // (a run of chunks: each one through every layer)
+        const std::function<void(int64_t)> progress = [&](int64_t d) {
             // (a beat only when it moved: the run calls this every 50 ms with what is done so far - a wedged chunk run
             //  repeats its last value for hours, #539, and must not look alive to the watchdog)
             if (d + (int64_t) done != beat_at) {
@@ -1239,7 +1251,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), done + (size_t) d, r.ids.size(), ms,
                         ms > 0 ? 1000.0 * (double) (done + (size_t) d - from) / ms : 0.0, from);
             std::fflush(stdout);
-        });
+        };
+        m.set_progress(progress);
         // (DS4_LAST_WINDOW=1: the last token in a window of its own after the checkpoint, as before - for A/B runs)
         static const bool last_window = std::getenv("DS4_LAST_WINDOW") != nullptr;
         // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
@@ -1248,6 +1261,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (from > 0 && from < total) m.checkpoint(1);
         m.set_cancel(stop_now);
         bool stopped = false;
+        // --parallel (pace): the prompt's run of chunks in parts - the plan of the one call it would be
+        // (Model::feed_plan), so the same chunks, the same skip and the same arithmetic - and between two parts the
+        // running requests' rounds, or a much shorter request let in first (pace->between); a prompt in windows of 16
+        // (no chunked path) pauses between its windows
+        strata::ds4::FeedPlan plan;
+        size_t plan_from = 0;   // (where the plan's run starts)
+        int plan_k = 0;         // (its next chunk)
+        int parts = 0, pauses = 0;
+        double paused_ms = 0;
         while (ok && done < total) {
             if (stop_now()) {
                 stopped = true;
@@ -1258,7 +1280,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 n = (size_t) cuts[next_cut].pos - done;                             //  stops there)
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = done + n == total;
-            if (fin && last_window) {
+            const double tp = now_ms();
+            if (pace != nullptr && plan.ends.empty() && !(fin && last_window) && pace->parts() &&
+                m.feed_plan((int) n, fin ? 1 : 0, fin ? 1 : -1, plan)) {
+                plan_from = done;
+                plan_k = 0;
+            }
+            if (!plan.ends.empty()) {   // (the plan's next chunks: the last part takes the logits and the checkpoint)
+                const int nk = (int) plan.ends.size(), a = plan_k > 0 ? plan.ends[(size_t) plan_k - 1] : 0;
+                const int k1 = plan_k + std::max(1, std::min(nk - plan_k, pace->chunks(nk - plan_k)));
+                ok = m.feed_part(plan, r.ids.data() + plan_from, plan_k, k1, err);
+                n = (size_t) (plan.ends[(size_t) k1 - 1] - a);
+                plan_k = k1;
+                if (plan_k == nk) plan = strata::ds4::FeedPlan{};
+            } else if (fin && last_window) {
                 ok = (n < 2 || m.feed(r.ids.data() + done, (int) n - 1, 0, err));
                 if (ok) m.checkpoint(1);
                 ok = ok && m.feed(r.ids.data() + done + n - 1, 1, 1, err);
@@ -1266,6 +1301,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 ok = fin ? m.feed_mark(r.ids.data() + done, (int) n, 1, 1, err)
                          : m.feed(r.ids.data() + done, (int) n, 0, err);
             done += n;
+            ++parts;
             beat();
             if (ok && next_cut < cuts.size() && done == (size_t) cuts[next_cut].pos) m.mark(cuts[next_cut++].shared);
             if (ok && (done >= next_pp || done == total)) {
@@ -1275,9 +1311,28 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::fflush(stdout);
                 next_pp = done + 64;
             }
+            if (ok && done < total && pace != nullptr && pace->parts()) {
+                // (between two parts the prompt's own callbacks and pictures are off: other conversations step and
+                //  read; then this conversation is bound again and they are back)
+                m.set_cancel(nullptr);
+                m.set_images({});
+                const double tb = now_ms();
+                const int left_chunks = !plan.ends.empty() ? (int) plan.ends.size() - plan_k
+                                                           : (int) ((total - done + 15) / 16);
+                pace->between(tb - tp, (int64_t) (total - done), left_chunks);
+                paused_ms += now_ms() - tb;
+                ++pauses;
+                m.set_images(imgs_fed);
+                m.set_progress(progress);
+                m.set_cancel(stop_now);
+            }
         }
         m.set_cancel(nullptr);
+        m.set_progress(nullptr);   // (its lambda reads this read's locals)
         m.set_images({});
+        if (pauses > 0)
+            std::fprintf(stderr, "maya ds4 serve: request%s: the prompt was read in %d parts, %.0f ms between them for "
+                                 "the others\n", tag.c_str(), parts, paused_ms);
         if (stopped || (!ok && m.cancelled())) {
             const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
             if (!back) {
@@ -1337,7 +1392,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // counter ran on across requests: a seed was not reproducible); without one the stream runs on as before
         if (r.seed != 0) counter = 0;
         Prompt P;
-        if (!prompt_in(r, geni, "", [&in] { return in.stop.load(); }, P)) continue;
+        if (!prompt_in(r, geni, "", [&in] { return in.stop.load(); }, P, nullptr)) continue;
         const double t0 = P.t0;
         const strata::ds4::Stats s0 = P.s0;
         const size_t from = P.from;
@@ -1471,12 +1526,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // holds (Model::seq_bind): the idle one whose state its prompt reuses the most, else an empty one, else the least
     // recently used (whose conversation is set aside first with MAYA_DS4_SLOT_KEEP, as one conversation's is).  A new
     // request's prompt - its pictures too: the tower borrows its room and gives it back before the prompt, with every
-    // other request between two of its tokens - is read while the others wait; then each running request writes a
-    // token a step.  A request alone decodes in its rounds as with one conversation (DSpark's drafts, the prompt
-    // lookup); two or more in rounds together - each one's DSpark drafts (its share of a window), every one's token
-    // and drafts through the model at once (Model::step_multi_spec, verify_multi), or with no drafts a token of each
-    // (Model::step_multi).  With several running, each writes all of its round's tokens at once, so every one needs
-    // the model in the same step again.
+    // other request between two of its tokens - is read while the others wait (with MAYA_DS4_PROMPT_SHARE they decode
+    // between its chunks, and with MAYA_DS4_PROMPT_YIELD a much shorter request goes first: ds4_interleave.hpp); then
+    // each running request writes a token a step.  A request alone decodes in its rounds as with one conversation
+    // (DSpark's drafts, the prompt lookup); two or more in rounds together - each one's DSpark drafts (its share of a
+    // window), every one's token and drafts through the model at once (Model::step_multi_spec, verify_multi), or with
+    // no drafts a token of each (Model::step_multi).  With several running, each writes all of its round's tokens at
+    // once, so every one needs the model in the same step again.
     if (multi) {
         struct Act {
             Req r;
@@ -1542,82 +1598,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             in.forget(a.r.rid);
             if (lk_owner == a.r.rid) lk_owner = -1;
         };
-        // a GEN line into a free conversation: its prompt read (the others wait), its first token picked
-        const auto admit = [&](const std::string& ln) {
-            const bool geni = ln.rfind("GENI ", 0) == 0;
-            auto a = std::make_unique<Act>();
-            Req& r = a->r;
-            if (!parse_gen(ln, r, geni)) {
-                std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> or GENI <max_new> [keys] <file> <id,id,...>\n");
-                std::fflush(stdout);
-                return;
-            }
-            if (r.rid < 0) {
-                std::printf("ERR this engine runs several conversations: GEN needs rid=<id>\n");
-                std::fflush(stdout);
-                return;
-            }
-            // the conversation: the idle one the prompt reuses the most of (its whole state continued, else a
-            // checkpoint it can go back to), else an empty one, else the least recently used
-            int best = -1;
-            int64_t best_u = -1;
-            for (int s = 0; s < nseq; ++s) {
-                if (seq_rid[(size_t) s] >= 0) continue;
-                bind(s);
-                const auto& st = m.tokens();
-                size_t c = 0;
-                while (c < st.size() && c < r.ids.size() && st[c] == r.ids[c]) ++c;
-                int64_t u = 0;
-                if (!st.empty() && c == st.size() && st.size() < r.ids.size()) u = (int64_t) st.size();
-                else if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, r.ids.size() - 1)));
-                const bool better = best < 0 || u > best_u ||
-                                    (u == best_u && (st.empty() != m.seq_tokens(best).empty()
-                                                         ? st.empty()
-                                                         : seq_used[(size_t) s] < seq_used[(size_t) best]));
-                if (better) best = s, best_u = u;
-            }
-            if (best < 0) {   // (the server gives each conversation one request: a request over that waits)
-                waiting.push_front(ln);
-                return;
-            }
-            bind(best);
-            seq_used[(size_t) best] = ++use_clock;
-            if (acts.empty()) m.begin_request();   // (DISK_SKIP_AUTO: between requests only - none runs now)
-            const long long rid = r.rid;
-            const std::string tag = " " + std::to_string(rid);
-            if (!prompt_in(r, geni, tag, [&in, rid] { return in.stopped(rid); }, a->P)) {
-                in.forget(rid);
-                return;
-            }
-            a->seq = best;
-            a->t1 = now_ms();
-            a->sd = m.stats();
-            a->limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
-            a->in_think = r.think_budget > 0 && r.think_end >= 0;
-            penalties(r);
-            a->tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, a->counter++);
-            seq_rid[(size_t) best] = rid;
-            if (acts.empty()) {
-                busy_t1 = now_ms();
-                busy_n = 0;
-                busy_s = m.stats();
-                busy_io = io_read_bytes();
-            }
-            acts.push_back(std::move(a));
-        };
+        // the input between steps: requests and QUIT (STOP <rid> is the reader's); a line that is not a request is
+        // answered at once
         bool quit = false;
-        for (;;) {
-            // the input between steps: requests and QUIT (STOP <rid> is the reader's); waited for only when idle
+        const auto poll_input = [&] {
             std::string ln;
             bool end = false;
-            if (acts.empty() && waiting.empty()) {
-                g_busy.store(false);   // (waiting for a request: no watchdog)
-                m.save_profile();
-                if (quit || !in.next(ln) || ln == "QUIT") break;
-                g_busy.store(true);
-                beat();
-                waiting.push_back(ln);
-            }
             while (in.poll(ln, end)) {
                 if (ln == "QUIT") quit = true;
                 else waiting.push_back(ln);
@@ -1632,14 +1618,32 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::fflush(stdout);
                 waiting.erase(waiting.begin() + (long) i);
             }
-            while (!quit && !waiting.empty() &&
-                   std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
-                const std::string g = waiting.front();
-                waiting.pop_front();
-                admit(g);
-                beat();
+        };
+        // the conversation for a prompt: the idle one it reuses the most of (its whole state continued, else a
+        // checkpoint it can go back to: u, the tokens reused), else an empty one, else the least recently used; -1:
+        // none idle.  (It binds each idle one to look.)
+        const auto pick_seq = [&](const std::vector<int>& ids, int64_t& best_u) -> int {
+            int best = -1;
+            best_u = -1;
+            for (int s = 0; s < nseq; ++s) {
+                if (seq_rid[(size_t) s] >= 0) continue;
+                bind(s);
+                const auto& st = m.tokens();
+                size_t c = 0;
+                while (c < st.size() && c < ids.size() && st[c] == ids[c]) ++c;
+                int64_t u = 0;
+                if (!st.empty() && c == st.size() && st.size() < ids.size()) u = (int64_t) st.size();
+                else if (c > 0) u = std::max<int64_t>(0, m.restorable((int64_t) std::min(c, ids.size() - 1)));
+                const bool better = best < 0 || u > best_u ||
+                                    (u == best_u && (st.empty() != m.seq_tokens(best).empty()
+                                                         ? st.empty()
+                                                         : seq_used[(size_t) s] < seq_used[(size_t) best]));
+                if (better) best = s, best_u = u;
             }
-            if (quit) in.stop_all.store(true);
+            return best;
+        };
+        // one step of the running requests (the loop's, and between two parts of a prompt read beside them)
+        const auto step_all = [&] {
             // each running request writes its next token; those whose next one the model must make go below (with
             // several running, a round's tokens all at once: every one then needs the model in the same step, so
             // their rounds go through it together)
@@ -1852,8 +1856,145 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 acts.erase(acts.begin() + (long) i);
                 finish_act(*a);
             }
+        };
+        // A prompt read beside them (ds4_interleave.hpp): MAYA_DS4_PROMPT_SHARE (STRATA_DS4_ / DS4_PROMPT_SHARE) - the
+        // running requests decode between the prompt's chunks for this share of the time each chunk took (0, the
+        // default: off - they wait for the whole prompt, as before); MAYA_DS4_PROMPT_YIELD=<n> - a long read gives way
+        // at a part's end to a waiting request that needs at most half the tokens it has left (at most twice a read),
+        // reading in parts of n chunks where nothing else decodes (0, the default: off).  The parts are whole chunks of
+        // the one call's plan (Model::feed_plan), so the prompt's arithmetic is the same.  Opt-in until measured.
+        strata::ds4::ReadPace pace_rule;
+        {
+            const auto env = [](const char* name) {
+                const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+                return v != nullptr ? v : std::getenv(name);
+            };
+            if (const char* v = env("DS4_PROMPT_SHARE")) pace_rule.share = std::max(0.0, std::atof(v));
+            if (const char* v = env("DS4_PROMPT_YIELD")) pace_rule.yield = std::max(0, std::atoi(v));
+            if (pace_rule.on())
+                std::fprintf(stderr, "maya ds4 serve: a prompt read beside running requests: they decode %.2f x a "
+                                     "part's time between its parts (MAYA_DS4_PROMPT_SHARE); a long read gives way "
+                                     "to a much shorter one: %s (MAYA_DS4_PROMPT_YIELD)\n",
+                             pace_rule.share, pace_rule.yield > 0 ? ("in parts of " + std::to_string(pace_rule.yield) +
+                                                                     " chunks").c_str() : "off");
+        }
+        int reading = 0;   // prompts being read (a read that gave way, and the one it let in)
+        std::function<void(const std::string&, bool)> admit;   // (below: a read in parts lets a request in)
+        // between two parts of request rid's prompt (conversation s): new lines taken in; a much shorter waiting
+        // request let in first - read, its first token written (MAYA_DS4_PROMPT_YIELD; not from a read that was let in
+        // itself); the running requests' steps for the share of the part's time (MAYA_DS4_PROMPT_SHARE); then s bound
+        // again for the next part
+        const auto between = [&](int s, long long rid, bool nested, int& yields, double part_ms, int64_t left,
+                                 int left_chunks) {
+            poll_input();
+            bool admitted = false;
+            if (!quit && pace_rule.yield > 0 && !nested && yields < pace_rule.yields_max && left_chunks > 1 &&
+                !in.stopped(rid) && std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end())
+                for (size_t i = 0; i < waiting.size(); ++i) {
+                    Req w;
+                    if (!parse_gen(waiting[i], w, waiting[i].rfind("GENI ", 0) == 0) || w.rid < 0) continue;
+                    int64_t u = 0;
+                    if (pick_seq(w.ids, u) < 0) break;
+                    const int64_t need = (int64_t) w.ids.size() - std::max<int64_t>(0, u);
+                    if (!pace_rule.give_way(need, left, left_chunks, yields, true, nested)) continue;
+                    const std::string g = waiting[i];
+                    waiting.erase(waiting.begin() + (long) i);
+                    ++yields;
+                    std::fprintf(stderr, "maya ds4 serve: request %lld's prompt gives way with %lld tokens to read: "
+                                         "request %lld (%lld to read) goes first (MAYA_DS4_PROMPT_YIELD)\n",
+                                 rid, (long long) left, w.rid, (long long) need);
+                    const size_t before = acts.size();
+                    admit(g, true);
+                    admitted = acts.size() > before;
+                    break;
+                }
+            const double budget = pace_rule.budget_ms(part_ms), t0 = now_ms();
+            for (int k = 0; pace_rule.decode_more(k, now_ms() - t0, budget, !acts.empty(), admitted); ++k) step_all();
+            bind(s);
+        };
+        // a GEN line into a free conversation: its prompt read (the others wait, or run between its parts), its
+        // first token picked; nested: let in between the parts of another read (it does not give way itself)
+        admit = [&](const std::string& ln, bool nested) {
+            const bool geni = ln.rfind("GENI ", 0) == 0;
+            auto a = std::make_unique<Act>();
+            Req& r = a->r;
+            if (!parse_gen(ln, r, geni)) {
+                std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> or GENI <max_new> [keys] <file> <id,id,...>\n");
+                std::fflush(stdout);
+                return;
+            }
+            if (r.rid < 0) {
+                std::printf("ERR this engine runs several conversations: GEN needs rid=<id>\n");
+                std::fflush(stdout);
+                return;
+            }
+            int64_t best_u = -1;
+            const int best = pick_seq(r.ids, best_u);
+            if (best < 0) {   // (the server gives each conversation one request: a request over that waits)
+                waiting.push_front(ln);
+                return;
+            }
+            bind(best);
+            seq_used[(size_t) best] = ++use_clock;
+            // (DISK_SKIP_AUTO: between requests only - none runs now, and no read waits between its parts)
+            if (acts.empty() && reading == 0) m.begin_request();
+            const long long rid = r.rid;
+            const std::string tag = " " + std::to_string(rid);
+            seq_rid[(size_t) best] = rid;   // (its own while the prompt is read: a request let in goes elsewhere)
+            int yields = 0;
+            Pace pc;
+            pc.parts = [&] { return pace_rule.parts(!acts.empty()); };
+            pc.chunks = [&](int left) { return pace_rule.part_chunks(left, !acts.empty()); };
+            pc.between = [&, best, rid, nested](double part_ms, int64_t left, int left_chunks) {
+                between(best, rid, nested, yields, part_ms, left, left_chunks);
+            };
+            ++reading;
+            const bool in_ok = prompt_in(r, geni, tag, [&in, rid] { return in.stopped(rid); }, a->P,
+                                         pace_rule.on() ? &pc : nullptr);
+            --reading;
+            bind(best);
+            if (!in_ok) {
+                seq_rid[(size_t) best] = -1;
+                in.forget(rid);
+                return;
+            }
+            a->seq = best;
+            a->t1 = now_ms();
+            a->sd = m.stats();
+            a->limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
+            a->in_think = r.think_budget > 0 && r.think_end >= 0;
+            penalties(r);
+            a->tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, a->counter++);
+            if (acts.empty()) {
+                busy_t1 = now_ms();
+                busy_n = 0;
+                busy_s = m.stats();
+                busy_io = io_read_bytes();
+            }
+            acts.push_back(std::move(a));
+        };
+        for (;;) {
+            // the input between steps (waited for only when idle), then the waiting requests into free conversations
+            if (acts.empty() && waiting.empty()) {
+                std::string ln;
+                g_busy.store(false);   // (waiting for a request: no watchdog)
+                m.save_profile();
+                if (quit || !in.next(ln) || ln == "QUIT") break;
+                g_busy.store(true);
+                beat();
+                waiting.push_back(ln);
+            }
+            poll_input();
+            while (!quit && !waiting.empty() &&
+                   std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
+                const std::string g = waiting.front();
+                waiting.pop_front();
+                admit(g, false);
+                beat();
+            }
+            if (quit) in.stop_all.store(true);
+            step_all();
             if (acts.empty() && quit) break;
-            (void) end;
         }
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
