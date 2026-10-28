@@ -1,7 +1,8 @@
 // serve/web/models.js - the Models page: the models set up on this machine (the run configs the setup wrote, GET
 // /api/models), the running one marked; switching to another (POST /api/models/switch: Maya starts again with it) and
 // each one's engine settings, edited in its card (POST /api/models/settings - a dry run first for the command they make);
-// and deleting one that is not running (POST /api/models/delete: off the list, and with its downloaded files if asked).
+// and deleting one (POST /api/models/delete: off the list, and with its downloaded files if asked; the running one after a
+// switch to another); and the files in the models folders no model uses (POST /api/models/leftovers deletes one).
 import {html, useEffect, useRef} from "./preact.js";
 import {api, ctxfmt, esc, fmt, isPhone, modelName, relTime} from "./lib.js";
 import {S, confirmDialog, copyText, emit, toast} from "./state.js";
@@ -17,11 +18,24 @@ export async function loadModels() {
   try {
     MS.data = await api("api/models");
     MS.err = null;
+    saidDeleted(MS.data.deleted);
   } catch (e) {
     MS.err = e.message;
   }
   emit();
   return MS.data;
+}
+
+// the model that was running, deleted by the server after the switch (said once a start, not on every visit)
+function saidDeleted(x) {
+  if (!x || !x.time) return;
+  try {
+    if (sessionStorage.getItem("maya.deleted") === String(x.time)) return;
+    sessionStorage.setItem("maya.deleted", String(x.time));
+  } catch (e) { /* (no storage: said again on the next visit) */ }
+  if (x.error) toast("error", `${x.file} was not deleted`, x.error, 12000);
+  else MS.gone = {name: x.model ? `${modelName(x.model)} ${x.quant || ""}`.trim() : x.deleted, files: x.files, freed: x.freed,
+                  folder: null, users: x.drafter_users || []};
 }
 
 const MONO = "ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
@@ -111,12 +125,13 @@ function closeEditor() {
 
 // the draft as the server takes it: "" -> the default (null), a number typed -> a number
 const NUMS = ["context", "parallel", "reserve_mib", "expert_cache", "prefill", "kv_resident", "tp", "prefill_chunk", "cpu_threads"];
+const DECS = ["reserve_gb", "cache_gb", "dspark_conf"];   // (a decimal: 0.7, 1.5)
 function toSend(d) {
   const out = {...d};
-  for (const k of NUMS) {
+  for (const k of [...NUMS, ...DECS]) {
     if (!(k in out)) continue;
     const v = out[k];
-    out[k] = v === "" || v == null ? null : /^\s*\d+\s*$/.test(String(v)) ? Number(v) : v;
+    out[k] = v === "" || v == null ? null : (DECS.includes(k) ? decimal : whole)(v) ? Number(v) : v;
   }
   out.env = Object.fromEntries((d.envRows || Object.entries(d.env || {})).filter(([k]) => String(k).trim()));
   delete out.envRows;
@@ -174,6 +189,7 @@ async function saveSettings(m) {
 }
 
 const whole = (v) => v === "" || v == null || /^\s*\d+\s*$/.test(String(v));
+const decimal = (v) => v === "" || v == null || /^\s*(\d+\.?\d*|\.\d+)\s*$/.test(String(v));
 
 function Row({label, flag, hint, changed, children, below, warn}) {
   return html`<div class="mdl-field">
@@ -190,6 +206,14 @@ function Row({label, flag, hint, changed, children, below, warn}) {
 const Num = ({label, value, ph, unit, on}) => html`<span class="mdl-num">
   <input class=${`input input--num${whole(value) ? "" : " is-bad"}`} inputmode="numeric" aria-label=${label} value=${value ?? ""}
     placeholder=${ph} onInput=${(e) => on(e.target.value)}/>${unit ? html`<span>${unit}</span>` : null}</span>`;
+const Dec = ({label, value, ph, unit, on}) => html`<span class="mdl-num">
+  <input class=${`input input--num${decimal(value) ? "" : " is-bad"}`} inputmode="decimal" aria-label=${label} value=${value ?? ""}
+    placeholder=${ph} onInput=${(e) => on(e.target.value.replace(",", "."))}/>${unit ? html`<span>${unit}</span>` : null}</span>`;
+// a drafter's confidence floor (DeepSeek's and MiniMax's --dspark-conf), shown while it drafts
+const draftConf = (d, ch, dflt) => (d.draft === "dspark" ? html`<${Row} label="Draft confidence" flag="--dspark-conf" changed=${ch("dspark_conf")}
+  hint=${`A draft is checked only while the drafter's confidence in it is at least this, from 0 to 1. Lower checks more drafts. Empty: the engine's ${dflt}.`}
+  warn=${decimal(d.dspark_conf) && !(+d.dspark_conf > 1) ? null : "A number from 0 to 1, or empty."}>
+  <${Dec} label="Draft confidence" value=${d.dspark_conf} ph=${String(dflt)} on=${(v) => setDraft({dspark_conf: v})}/><//>` : null);
 function Stepper({label, value, min, max, on}) {
   const v = Number(value) || min;
   return html`<span class="mdl-step" role="group" aria-label=${label}>
@@ -296,7 +320,11 @@ function fieldsOf(m, d) {
         <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="Set by the calibration (--calibrate) on this PC. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
-        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`,
+      html`<${Row} label="Prompt lookup" flag="--suffix-draft" changed=${ch("prompt_lookup")}
+        hint="Where the answer repeats earlier text (code edits, quotes), the words that followed it there are checked as drafts: the same answer, often much faster. Off: --suffix-draft 0.">
+        <${Switch} label="Prompt lookup" on=${d.prompt_lookup} onChange=${(v) => setDraft({prompt_lookup: v})}/><//>`,
+      draftConf(d, ch, 0.5)].filter(Boolean)},
   ];
 }
 
@@ -333,7 +361,15 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
         hint="Off splits the layers across the GPUs. 1, 2 or 4: each layer's work shared by a group of that many GPUs; the setup picks 4 or 2 when the GPUs make whole groups."
         warn=${Number(d.tp) > d.gpus.length ? `A group of ${d.tp} needs at least ${d.tp} GPUs picked.` : null}>
         <${Seg} label="Tensor parallel" value=${Number(d.tp)} options=${tps.map((n) => ({id: n, label: n ? String(n) : "Off"}))}
-          onChange=${(v) => setDraft({tp: v})}/><//>`]},
+          onChange=${(v) => setDraft({tp: v})}/><//>`,
+      html`<${Row} label="VRAM kept free" flag="--reserve-gb" changed=${ch("reserve_gb")}
+        hint="Per GPU, beyond the engine's plan: for the driver, the desktop and other programs. Empty: 1 GB, 0.3 GB with tensor parallel."
+        warn=${decimal(d.reserve_gb) ? null : "A number of GB, or empty for the default."}>
+        <${Dec} label="VRAM kept free" value=${d.reserve_gb} ph="default" unit="GB / GPU" on=${(v) => setDraft({reserve_gb: v})}/><//>`,
+      Number(d.tp) > 0 ? html`<${Row} label="Expert cache" flag="--cache-gb" changed=${ch("cache_gb")}
+        hint="With tensor parallel: each GPU's expert cache, at least this. Where memory is tight the engine makes it larger. Empty: 1.5 GB."
+        warn=${decimal(d.cache_gb) ? null : "A number of GB, or empty for the default."}>
+        <${Dec} label="Expert cache" value=${d.cache_gb} ph="1.5" unit="GB / GPU" on=${(v) => setDraft({cache_gb: v})}/><//>` : null].filter(Boolean)},
     {label: "Prompts and cache", rows: [
       html`<${Row} label="KV cache" flag="--kv-cache" changed=${ch("kv_cache")}
         hint="The attention cache's format: BF16 is the model's own, INT8 the engine's default, FP8 and FP4 smaller.">
@@ -349,7 +385,12 @@ function mm3Fields(m, d, s, ch, ctxs, images, gpus) {
     {label: "Speed", rows: [
       html`<${Row} label="CPU threads" flag="--cpu-threads" changed=${ch("cpu_threads")} hint="The CPU lane's threads, which compute the experts VRAM does not hold. Empty: the engine picks."
         warn=${whole(d.cpu_threads) ? null : "A whole number, or empty."}>
-        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`]},
+        <${Num} label="CPU threads" value=${d.cpu_threads} ph="auto" unit="threads" on=${(v) => setDraft({cpu_threads: v})}/><//>`,
+      html`<${Row} label="Prompt chunk" flag="--chunk" changed=${ch("prefill_chunk")}
+        hint="The prompt tokens one pass reads at most. Empty: the size this PC's prompt calibration picked."
+        warn=${whole(d.prefill_chunk) ? null : "A whole number, or empty."}>
+        <${Num} label="Prompt chunk" value=${d.prefill_chunk} ph="auto" unit="tokens" on=${(v) => setDraft({prefill_chunk: v})}/><//>`,
+      draftConf(d, ch, 0.7)].filter(Boolean)},
   ];
 }
 
@@ -433,7 +474,7 @@ function Editor({m}) {
   const keys = Object.keys(s);
   const changed = keys.filter((k) => !same(sent[k], s[k]));
   const envChanged = !same(sent.env, s.env);
-  const bad = Object.entries(d).some(([k, v]) => NUMS.includes(k) && !whole(v));
+  const bad = Object.entries(d).some(([k, v]) => (NUMS.includes(k) && !whole(v)) || (DECS.includes(k) && !decimal(v)));
   const canSave = changed.length > 0 && !bad && !MS.check && !MS.saving && !MS.restart;
   const restarts = m.running && MS.data.restarts;
   const tabDot = (t) => (t.adv ? envChanged : t.rows.some((r) => r && r.props && r.props.changed));
@@ -489,15 +530,18 @@ function Editor({m}) {
 }
 
 // ------------------------------------------------------------------ deleting a model (POST /api/models/delete)
-// MS.del: the dialog ({m, plan: what its files are (a dry run), files: the box ticked, busy, err, from: the button});
-// MS.gone: what was deleted, said at the top of the page
+// MS.del: the dialog ({m, plan: what its files are (a dry run), files: the box ticked, then: the model to switch to
+// when m is the one running, busy, err, from: the button}); MS.gone: what was deleted, said at the top of the page
 const bytes = (b) => (b >= 1e9 ? `${fmt(b / 1e9, b < 1e10 ? 1 : 0)} GB` : b >= 1e6 ? `${fmt(b / 1e6)} MB`
   : b >= 1e3 ? `${fmt(b / 1e3)} KB` : `${fmt(b || 0)} bytes`);
 const nameOf = (file) => { const x = MS.data && MS.data.models.find((m) => m.file === file); return x ? titleOf(x) : file; };
 const and = (xs) => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}` : xs[0] || "");
+// the models the running one can be switched to before it is deleted (the most recently used first)
+const startable = () => (MS.data ? MS.data.models.filter((x) => !x.running && x.ok) : []);
 
 async function askDelete(m) {
-  const d = {m, plan: null, files: false, busy: false, err: null, from: document.activeElement};
+  const d = {m, plan: null, files: false, then: m.running ? (startable()[0] || {}).file || null : null, busy: false,
+             err: null, from: document.activeElement};
   MS.del = d;
   emit();
   try {
@@ -523,7 +567,12 @@ async function deleteModel() {
   d.err = null;
   emit();
   try {
-    const out = await api("api/models/delete", {method: "POST", body: {file: d.m.file, files: d.files}});
+    const out = await api("api/models/delete", {method: "POST", body: {file: d.m.file, files: d.files, then: d.then}});
+    if (out.deleting) {                              // (the running one: Maya switches, the next start deletes it)
+      MS.del = null;
+      watchRestart({why: "switch", file: out.to, name: nameOf(out.to)});
+      return;
+    }
     MS.gone = {name: titleOf(d.m), files: d.files, freed: out.freed, folder: d.m.folder,
                users: (out.drafter_users || []).map(nameOf)};
     MS.del = null;
@@ -561,6 +610,7 @@ function DeleteDialog() {
   const can = !!(p && p.ok && p.items.length);
   const files = can && d.files;
   const users = (p && p.drafter_users || []).map(nameOf);
+  const to = m.running ? startable() : [];
   const keys = (e) => {
     if (e.key === "Tab") trapTab(e, box.current);
     else if (e.key === "Escape") { e.stopPropagation(); closeDelete(); }
@@ -571,6 +621,12 @@ function DeleteDialog() {
         <button type="button" class="icon-btn dialog__close" aria-label="Close" onClick=${closeDelete}><${Icon} name="close"/></button></div>
       <div class="dialog__body">
         <p>Maya takes it off this list: its config <code>${m.file}</code>${m.script ? html` and its start script <code>${m.script}</code>` : null}. Your chats stay.</p>
+        ${m.running ? html`<div class="mdl-del__to" role="radiogroup" aria-labelledby="mdl-del-to">
+          <p id="mdl-del-to">It is running now. Maya switches to another model first (a few minutes), then deletes it:</p>
+          ${to.map((x) => html`<button type="button" role="radio" aria-checked=${String(d.then === x.file)} key=${x.file} disabled=${d.busy}
+            class=${`mdl-del__box mdl-del__box--radio${d.then === x.file ? " is-on" : ""}`} onClick=${() => { d.then = x.file; emit(); }}>
+            <span class="mdl-del__check" aria-hidden="true"></span>
+            <span class="mdl-del__text"><span class="mdl-del__top"><b>${titleOf(x)}</b></span><code>${x.file}</code></span></button>`)}</div>` : null}
         ${!p ? html`<p class="mdl-del__note" role="status">Looking at its files…</p>`
           : can ? html`<button type="button" role="checkbox" aria-checked=${String(files)} class=${`mdl-del__box${files ? " is-on" : ""}`}
               disabled=${d.busy} onClick=${() => { d.files = !d.files; emit(); }}>
@@ -589,10 +645,42 @@ function DeleteDialog() {
       </div>
       <div class="dialog__actions">
         <button type="button" class="btn btn--secondary" disabled=${d.busy} onClick=${closeDelete}>Cancel</button>
-        <button type="button" class="btn btn--danger" disabled=${d.busy || !p} onClick=${deleteModel}>
-          ${d.busy ? "Deleting…" : files ? `Delete it and ${bytes(p.bytes)}` : "Delete from the list"}</button>
+        <button type="button" class="btn btn--danger" disabled=${d.busy || !p || (m.running && !d.then)} onClick=${deleteModel}>
+          ${d.busy ? (m.running ? "Switching…" : "Deleting…") : `${m.running ? "Switch, then delete " : "Delete "}${files ? `it and ${bytes(p.bytes)}` : "it from the list"}`}</button>
       </div>
     </div></div>`;
+}
+
+// ------------------------------------------------------------------ files no model uses (POST /api/models/leftovers)
+async function deleteLeftover(x) {
+  const what = [x.pack ? "a pack Maya built" : null, x.hub ? "a download from Hugging Face" : null].filter(Boolean);
+  const ok = await confirmDialog(`Delete ${x.name}?`,
+    `<p>Maya deletes ${x.folder ? "this folder and everything in it" : "this file"}: <b>${esc(bytes(x.bytes))}</b> at ` +
+    `<code>${esc(x.path)}</code>.</p><p>${what.length ? `It holds ${esc(and(what))}. ` : "Maya's setup may not have made it. "}` +
+    "No model on this list runs from it. This cannot be undone.</p>", `Delete ${bytes(x.bytes)}`, true);
+  if (!ok) return;
+  try {
+    const out = await api("api/models/leftovers", {method: "POST", body: {path: x.path}});
+    toast("success", `${x.name} is deleted`, `${bytes(out.freed)} freed on the disk.`, 6000);
+  } catch (e) {
+    toast("error", `${x.name} was not deleted`, e.message, 10000);
+  }
+  loadModels();
+}
+
+function Leftovers({L}) {
+  if (!L || !L.items || !L.items.length) return null;
+  return html`<section class="card mdl-left" aria-labelledby="mdl-left-title">
+    <div class="mdl-left__head"><b id="mdl-left-title">Files no model uses</b><b class="mdl-del__size">${bytes(L.bytes)}</b></div>
+    <span class="mdl-left__sub">In ${and(L.folders)}, and no model on this list runs from them: a model deleted by hand, or set up
+      again somewhere else. Maya may not have downloaded all of them, so look before you delete.</span>
+    <ul class="mdl-left__list">${L.items.map((x) => html`<li key=${x.path}>
+      <span class="mdl-left__text"><span class="mdl-left__name"><${Icon} name=${x.folder ? "folder" : "disk"} sm/><b>${x.name}</b>
+        ${x.pack ? html`<span class="mdl-badge">Maya pack</span>` : null}${x.hub ? html`<span class="mdl-badge">Hugging Face</span>` : null}</span>
+        <code>${x.path}</code><span>${bytes(x.bytes)} · changed ${relTime(x.modified * 1000)}</span></span>
+      <button type="button" class="btn btn--ghost btn--sm" aria-label=${`Delete ${x.name}`} disabled=${!!MS.restart}
+        onClick=${() => deleteLeftover(x)}><${Icon} name="trash" sm/>Delete</button></li>`)}</ul>
+  </section>`;
 }
 
 // ------------------------------------------------------------------ a model's card
@@ -626,8 +714,8 @@ function Card({m}) {
           onClick=${() => openEditor(m)}><${Icon} name="sliders" sm/>Engine settings</button>
         <button type="button" class="btn btn--ghost btn--sm" aria-expanded=${String(open)} onClick=${() => { MS.details[m.file] = !open; emit(); }}>
           Details<${Icon} name="chevron" sm cls=${`chev${open ? "" : " is-closed"}`}/></button>
-        ${m.running ? null : html`<button type="button" class="btn btn--ghost btn--sm" aria-haspopup="dialog" aria-label=${`Delete ${titleOf(m)}`}
-          disabled=${!!r} onClick=${() => askDelete(m)}><${Icon} name="trash" sm/>Delete</button>`}
+        ${m.running && !(MS.data.restarts && startable().length) ? null : html`<button type="button" class="btn btn--ghost btn--sm" aria-haspopup="dialog"
+          aria-label=${`Delete ${titleOf(m)}`} disabled=${!!r} onClick=${() => askDelete(m)}><${Icon} name="trash" sm/>Delete</button>`}
       </span>
     </div>
     ${open ? html`<dl class="mdl-facts">${facts.map(([k, v, mono]) => html`<dt>${k}</dt><dd style=${mono ? `font-family:${MONO}` : ""}>${v}</dd>`)}</dl>` : null}
@@ -672,6 +760,7 @@ export function ModelsPage() {
         : !D ? html`<div class="card mon__wait">Reading the models…</div>`
         : !D.models.length ? html`<div class="card mon__wait">No model is set up in this folder yet. The setup writes one: <code>./maya.sh --setup</code> (Windows: <code>START-MAYA.bat --setup</code>)</div>`
         : D.models.map((m) => html`<${Card} m=${m} key=${m.file}/>`)}
+      ${D ? html`<${Leftovers} L=${D.leftovers}/>` : null}
       ${D && D.models.length ? html`<p class="mdl-foot"><${Icon} name="info" sm/><span>${D.restarts
         ? "Switching, or saving the running model's engine settings, starts Maya again through its start script, as a port change does. Each model keeps its own chat settings."
         : "This server was not started by maya.sh or START-MAYA.bat, so it cannot start again by itself: a switch or new settings apply from Maya's next start."}</span></p>` : null}

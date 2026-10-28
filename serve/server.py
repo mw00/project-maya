@@ -2123,7 +2123,9 @@ class Service:
         out = models.listing(self.models_root(), self.config_path)
         out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
                    running=Path(self.config_path).name if self.config_path else None,
-                   restarting=getattr(self, "model_restart", None))
+                   restarting=getattr(self, "model_restart", None),
+                   deleted=getattr(self, "deleted", None),          # (the model running before, deleted at this start)
+                   leftovers=models.leftovers(self.models_root()))
         return out
 
     def _model_path(self, name) -> Path:
@@ -2187,21 +2189,78 @@ class Service:
               " next (a start without --config picks it)"), flush=True)
         return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": restarts}
 
-    def delete_model(self, name, files: bool = False, dry_run: bool = False) -> dict:
+    def delete_model(self, name, files: bool = False, dry_run: bool = False, then=None) -> dict:
         """The Models page's Delete: the config `name` off the list (models.delete), with `files` what its setup
-        downloaded for it as well.  Not the model running, nor while Maya starts again.  dry_run: what would go
-        (models.delete_plan), nothing deleted."""
+        downloaded for it as well.  Not while Maya starts again.  The model running: Maya switches to `then` first, and
+        the next server deletes it (models.DELETE_FILE) once the engine that ran from it is gone.  dry_run: what would
+        go (models.delete_plan), nothing deleted."""
         p = self._model_path(name)
-        if self._is_running(p):
-            raise ValueError(f"{p.name} is the model running now: switch to another one first")
+        running = self._is_running(p)
         if getattr(self, "model_restart", None):
             raise ValueError("Maya is starting again; try again when it is done")
         if dry_run:
-            return {"file": p.name, **models.delete_plan(self.models_root(), p)}
+            return {"file": p.name, "running": running, **models.delete_plan(self.models_root(), p)}
+        if running:
+            return self._delete_running(p, files, then)
         out = models.delete(self.models_root(), p, bool(files))
         print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if files else
               " (its files stay)") + "".join(f"; {n} drafts with MTP now (its DFlash2 drafter was deleted)"
                                              for n in out["drafter_users"]), flush=True)
+        return out
+
+    def _delete_running(self, p: Path, files: bool, then) -> dict:
+        if not then:
+            raise ValueError(f"{p.name} is the model running now: pick the model Maya switches to first")
+        if not os.environ.get("MAYA_RESTART_ON_UPDATE"):
+            raise ValueError("this server was not started by maya.sh or START-MAYA.bat, so it cannot switch to another "
+                             f"model by itself: start another model, then delete {p.name}")
+        if files:                                        # (checked now: the next server only reports)
+            plan = models.delete_plan(self.models_root(), p)
+            if not plan["ok"]:
+                raise ValueError(plan["why"])
+        cfg = models.read(p)                             # (its name, for the page once the config is gone)
+        note = self.models_root() / models.DELETE_FILE
+        note.write_text(json.dumps({"config": str(p.resolve()), "files": bool(files), "time": time.time(),
+                                    "model": cfg.get("model_name") or "", "quant": models.quant_label(cfg, p)}),
+                        encoding="utf-8")
+        try:
+            out = self.switch_model(then)                # (its checks: not this one, can start, not busy)
+        except BaseException:
+            note.unlink(missing_ok=True)
+            raise
+        print(f"[maya] {p.name} is deleted once {out['to']} runs" + (", with its files" if files else ""), flush=True)
+        return {"deleting": p.name, "to": out["to"], "files": bool(files), "restarts": True}
+
+    def finish_delete(self):
+        """The model that ran before this start, deleted now that another one runs (the Models page deleted the
+        running one: its note, models.DELETE_FILE, read once).  self.deleted says how it went, for the page."""
+        note_path = self.models_root() / models.DELETE_FILE
+        try:
+            note = json.loads(note_path.read_text(encoding="utf-8"))
+            note_path.unlink()
+        except (OSError, ValueError):
+            return
+        p = Path(str(note.get("config") or ""))
+        if time.time() - float(note.get("time") or 0) > 900 or not p.is_file() or p.parent != self.models_root():
+            return                                       # (stale, gone already, or not one of these configs)
+        if self._is_running(p):                          # (the switch did not happen: it runs again)
+            self.deleted = {"file": p.name, "error": "it is the model running now", "time": time.time()}
+            print(f"[maya] {p.name} not deleted: it is the model running now", flush=True)
+            return
+        try:
+            out = models.delete(self.models_root(), p, bool(note.get("files")))
+        except (OSError, ValueError) as e:
+            self.deleted = {"file": p.name, "error": str(e), "time": time.time()}
+            print(f"[maya] {p.name} not deleted: {e}", flush=True)
+            return
+        self.deleted = {**out, "model": note.get("model") or "", "quant": note.get("quant") or "", "time": time.time()}
+        print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if out["files"] else
+              " (its files stay)"), flush=True)
+
+    def delete_leftover(self, path) -> dict:
+        """The Models page's files no model uses: one deleted (models.delete_leftover)."""
+        out = models.delete_leftover(self.models_root(), path)
+        print(f"[maya] {out['deleted']} deleted ({out['freed'] / 2**30:.1f} GB): no model here used it", flush=True)
         return out
 
     def _restart_into(self, p: Path, why: str):
@@ -4129,7 +4188,7 @@ def make_handler(svc: Service):
                 if path == "/api/update":
                     self._update()
                     return
-                if path in ("/api/models/settings", "/api/models/switch", "/api/models/delete"):
+                if path in ("/api/models/settings", "/api/models/switch", "/api/models/delete", "/api/models/leftovers"):
                     self._models(path.rsplit("/", 1)[1])
                     return
                 if path == "/api/savings/reset":
@@ -4280,13 +4339,17 @@ def make_handler(svc: Service):
                 if what == "switch":
                     out = svc.switch_model(req.get("file"))
                 elif what == "delete":
-                    out = svc.delete_model(req.get("file"), bool(req.get("files")), bool(req.get("dry_run")))
+                    out = svc.delete_model(req.get("file"), bool(req.get("files")), bool(req.get("dry_run")),
+                                           req.get("then"))
+                elif what == "leftovers":
+                    out = svc.delete_leftover(req.get("path"))
                 else:
                     out = svc.model_settings(req.get("file"), req.get("settings") or {}, bool(req.get("dry_run")))
             except (TypeError, ValueError, OSError) as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            self._json(200 if what == "delete" or (what == "settings" and req.get("dry_run")) else 202, out)
+            self._json(200 if what in ("delete", "leftovers") and not out.get("deleting")
+                       or (what == "settings" and req.get("dry_run")) else 202, out)
 
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page
@@ -5075,6 +5138,7 @@ def main() -> int:
         svc.config_path = str(Path(a.config).resolve())  # a context change from the dashboard is saved there
         p = Path(svc.config_path)                        # the tokens it serves, and what its API would have charged
         svc.savings = savings.Ledger(p.parent / savings.FILE, p.name, svc.model, models.quant_label(cfg, p))
+        threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
     args = [str(x) for x in cfg.get("args") or []]
     if "--glm-pack" in args[:-1]:                       # the model's folder: the pack's parent holds its GGUF files
         svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent

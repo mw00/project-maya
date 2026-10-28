@@ -128,6 +128,22 @@
 .mdl-del__top b { font-weight: 600; }
 .mdl-del__size { flex: none; font-variant-numeric: tabular-nums; }
 .mdl-del__text code { font-family: var(--st-font-mono); font-size: var(--st-fs-xs); color: var(--st-ink-soft); overflow-wrap: anywhere; }
+/* ... the running one: the model Maya switches to first, a radio each */
+.mdl-del__to { display: flex; flex-direction: column; gap: 8px; }
+.mdl-del__box--radio .mdl-del__check { border-radius: 50%; }
+.mdl-del__box--radio.is-on { border-color: color-mix(in srgb, var(--st-accent) 55%, var(--st-line)); background: var(--st-accent-tint); }
+.mdl-del__box--radio.is-on .mdl-del__check { background: var(--st-accent); border-color: var(--st-accent); box-shadow: inset 0 0 0 3px var(--st-surface); }
+
+/* files no model uses */
+.mdl-left { gap: 10px; padding: 16px 18px; }
+.mdl-left__head { display: flex; justify-content: space-between; gap: 12px; }
+.mdl-left__sub { font-size: var(--st-fs-sm); color: var(--st-ink-muted); line-height: 1.5; }
+.mdl-left__list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
+.mdl-left__list li { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-top: 1px solid var(--st-line); }
+.mdl-left__text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.mdl-left__name { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; color: var(--st-ink); font-size: var(--st-fs-md); }
+.mdl-left__name b { font-weight: 600; overflow-wrap: anywhere; }
+.mdl-left__text code { font-family: var(--st-font-mono); font-size: var(--st-fs-xs); color: var(--st-ink-soft); overflow-wrap: anywhere; }
 .mdl-del__text > span:last-child { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 .mdl-del__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 .callout .icon-btn { margin: -4px -6px -4px 0; color: inherit; }

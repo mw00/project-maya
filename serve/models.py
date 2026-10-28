@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each config's family
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
+DELETE_FILE = ".maya-delete.json"           # ... and to the next server: delete this config (it was the one running)
 CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's own size is offered too)
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
@@ -45,9 +46,9 @@ ENV_LOADER = re.compile(r"^(?:LD_\w*|DYLD_\w*|PYTHON\w*|PATH|PATHEXT|BASH_ENV|EN
 GLM_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "expert_cache", "prefill",
             "kv_streaming", "kv_resident")
 DS4_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "parallel", "draft", "tp", "mmap", "prefill_chunk",
-            "cpu_threads")
+            "cpu_threads", "prompt_lookup", "dspark_conf")
 MM3_KEYS = ("context", "images", "gpus", "env", "parallel", "draft", "tp", "kv_cache", "kv_streaming", "kv_resident",
-            "cpu_threads")
+            "cpu_threads", "reserve_gb", "prefill_chunk", "cache_gb", "dspark_conf")
 QWEN_KEYS = ("context", "images", "gpus", "reserve_mib", "env", "draft", "expert_cache", "prefill", "kv", "ram_gb")
 
 
@@ -84,6 +85,14 @@ def _int(v, default=None):
         return int(str(v).strip())
     except (TypeError, ValueError):
         return default
+
+
+def _float(v, default=None):
+    try:
+        f = float(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+    return f if f == f else default                    # (not NaN)
 
 
 def family(cfg: dict) -> str:
@@ -192,7 +201,9 @@ def settings_of(cfg: dict) -> dict:
                    draft="dspark" if flag(args, "--dspark", "off") not in ("off", "none") else "none",
                    tp=_int(flag(args, "--tp"), 0), kv_cache=flag(args, "--kv-cache", "int8"),
                    kv_streaming=kvs == "on" or (kvs is None and _int(flag(args, "--kv-resident"), 0) > 0),
-                   kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")))
+                   kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")),
+                   reserve_gb=_float(flag(args, "--reserve-gb")), prefill_chunk=_int(flag(args, "--chunk")),
+                   cache_gb=_float(flag(args, "--cache-gb")), dspark_conf=_float(flag(args, "--dspark-conf")))
         return out
     if family(cfg) == "qwen":
         ec, pf = flag(args, "--expert-cache", "auto"), flag(args, "--prefill", "auto")
@@ -208,7 +219,10 @@ def settings_of(cfg: dict) -> dict:
                    reserve_mib=_int(flag(args, "--reserve-mib")), parallel=_int(flag(args, "--parallel"), 1),
                    draft="none" if dspark == "none" or (dspark is None and not ds4_has_drafter(cfg)) else "dspark",
                    tp=_int(flag(args, "--tp"), 2), mmap=flag(args, "--mmap-experts", "auto"),   # (2: the engine's own)
-                   prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")))
+                   prefill_chunk=_int(flag(args, "--prefill-chunk")), cpu_threads=_int(flag(args, "--cpu-threads")),
+                   # (--suffix-draft: the prompt lookup's shortest match, 3 by the engine; 0 off)
+                   prompt_lookup=_int(flag(args, "--suffix-draft"), 3) != 0,
+                   dspark_conf=_float(flag(args, "--dspark-conf")))
         if out["mmap"] not in ("auto", "on", "off"):
             out["mmap"] = "auto"
         return out
@@ -242,6 +256,19 @@ def _num(s: dict, key: str, lo: int, hi: int, what: str, none_ok: bool = True):
     v = _int(v)
     if not lo <= v <= hi:
         raise ValueError(f"{what}: from {lo} to {hi}")
+    return v
+
+
+def _dec(s: dict, key: str, lo: float, hi: float, what: str):
+    """A decimal setting: None where empty (the engine's own), else a number from lo to hi."""
+    v = s.get(key)
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool) or _float(v) is None:
+        raise ValueError(f"{what}: a number, please")
+    v = _float(v)
+    if not lo <= v <= hi:
+        raise ValueError(f"{what}: from {lo:g} to {hi:g}")
     return v
 
 
@@ -349,6 +376,15 @@ def apply(cfg: dict, settings: dict) -> dict:
             drop_flag(args, "--kv-resident")
         ct = _num(s, "cpu_threads", 1, 512, "CPU threads")
         args = set_flag(args, "--cpu-threads", ct) if ct is not None else drop_flag(args, "--cpu-threads")
+        # (empty: the engine's own - --reserve-gb 1.0, 0.3 with --tp; --chunk the prefill calibration's; --cache-gb 1.5,
+        #  read with --tp only; --dspark-conf 0.7)
+        for key, name, lo, hi, what in (("reserve_gb", "--reserve-gb", 0, 64, "VRAM kept free"),
+                                        ("cache_gb", "--cache-gb", 0, 256, "Expert cache"),
+                                        ("dspark_conf", "--dspark-conf", 0, 1, "Draft confidence")):
+            v = _dec(s, key, lo, hi, what)
+            args = set_flag(args, name, f"{v:g}") if v is not None else drop_flag(args, name)
+        ch = _num(s, "prefill_chunk", 16, 65536, "Prompt chunk")
+        args = set_flag(args, "--chunk", ch) if ch is not None else drop_flag(args, "--chunk")
     elif ds4:
         # (maya-ds4 --parallel: n conversations at once - each its own context's caches in VRAM; written where it changes)
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
@@ -376,6 +412,15 @@ def apply(cfg: dict, settings: dict) -> dict:
                                         ("cpu_threads", "--cpu-threads", 1, 512, "CPU threads")):
             v = _num(s, key, lo, hi, what)
             args = set_flag(args, name, v) if v is not None else drop_flag(args, name)
+        # the prompt lookup: on keeps a config's own shortest match (else the engine's 3), off is --suffix-draft 0
+        if not isinstance(s.get("prompt_lookup"), bool):
+            raise ValueError("Prompt lookup: on or off")
+        if not s["prompt_lookup"]:
+            args = set_flag(args, "--suffix-draft", 0)
+        elif not _int(flag(args, "--suffix-draft"), 0):
+            args = drop_flag(args, "--suffix-draft")
+        conf = _dec(s, "dspark_conf", 0, 1, "Draft confidence")
+        args = set_flag(args, "--dspark-conf", f"{conf:g}") if conf is not None else drop_flag(args, "--dspark-conf")
     else:
         par = _num(s, "parallel", 1, 8, "Answers at once", none_ok=False)
         args = set_flag(args, "--parallel", par) if par > 1 or "--parallel" in args else args
@@ -795,3 +840,89 @@ def delete(root: Path, path: Path, files: bool = False) -> dict:
         except FileNotFoundError:
             pass
     return {"deleted": path.name, "freed": freed, "files": bool(files), "drafter_users": users}
+
+
+# ------------------------------------------------------------------ files no model here runs from
+# What the models folders hold that no config here names: a download whose config was deleted by hand or by an older
+# version, a quant set up again into another folder.  Only what is in a folder the setup downloaded into: at its top a
+# folder or a file of 100 MB or more (a download's log is not listed), and one level down in a folder another model
+# runs from only a folder with a pack of its own (GLM's quants side by side in GLM-5.3-Flash/: DeepSeek's dspark/ and
+# vision/ beside its GGUF folder are read through the pack, so a folder without one is never taken for unused).  Never
+# a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
+# deletes one at a time.
+LEFTOVER_MIN = 10 ** 8
+PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "native_experts.txt", "index.txt")
+
+
+def models_dirs(root: Path) -> list:
+    """The folders the setup downloaded into: each config's, and the setup's own (Maya-data/models beside the project)
+    - not the home folder, nor one the project is in."""
+    project, home = _res(root), Path.home().resolve()
+    found = [_res((read(p).get("installer") or {}).get("models_dir")) for p in config_paths(root)]
+    found.append(_res(Path(root).parent / "Maya-data" / "models"))
+    out = []
+    for d in found:
+        if d is None or d in out or not d.is_dir() or _within(home, d) or (project and _within(project, d)):
+            continue
+        out.append(d)
+    return out
+
+
+def _has_pack(p: Path) -> bool:
+    """A pack Maya built is in `p` (or `p` is one), two folders deep at most."""
+    try:
+        return any(next(p.glob(pat + m), None) is not None for pat in ("", "*/", "*/*/") for m in PACK_MARKS)
+    except OSError:
+        return False
+
+
+def leftovers(root: Path) -> dict:
+    """{"folders": the models folders, "items": [{"path", "name", "bytes", "folder" (a folder, else a file), "pack" (a
+    pack Maya built is in it), "hub" (downloaded from the Hugging Face Hub), "modified"}], "bytes"}: what no model here
+    runs from, largest first."""
+    project, home = _res(root), Path.home().resolve()
+    refs = [r for p in config_paths(root) for r in runs_from(read(p))]
+    dirs, items = models_dirs(root), []
+
+    def entries(d: Path) -> list:
+        try:
+            return [e for e in d.iterdir() if not e.name.startswith(".") and not e.is_symlink()]
+        except OSError:
+            return []
+
+    def add(e: Path):
+        n = _size(e)
+        if n >= LEFTOVER_MIN:
+            items.append({"path": str(e), "name": e.name, "bytes": n, "folder": e.is_dir(),
+                          "pack": e.is_dir() and _has_pack(e), "hub": (e / ".cache" / "huggingface").is_dir(),
+                          "modified": e.stat().st_mtime})
+
+    for d in dirs:
+        for e in entries(d):
+            try:
+                if not (e.is_dir() or e.is_file()) or (project and _within(project, e)) or _within(home, e):
+                    continue
+                if not any(_within(r, e) for r in refs):
+                    add(e)
+                elif e.is_dir() and not any(_within(e, r) for r in refs):   # (another model runs from a part of it)
+                    for c in entries(e):
+                        if c.is_dir() and not any(_within(r, c) for r in refs) and _has_pack(c):
+                            add(c)
+            except OSError:
+                continue
+    items.sort(key=lambda i: -i["bytes"])
+    return {"folders": [str(d) for d in dirs], "items": items, "bytes": sum(i["bytes"] for i in items)}
+
+
+def delete_leftover(root: Path, path) -> dict:
+    """One of leftovers()'s items deleted, checked again first (a model set up since may run from it now).
+    {"deleted", "freed" (bytes)}."""
+    item = next((i for i in leftovers(root)["items"] if i["path"] == str(path or "")), None)
+    if item is None:
+        raise ValueError(f"{path} is not a file no model uses here (gone, or a model runs from it now)")
+    p = Path(item["path"])
+    if item["folder"]:
+        shutil.rmtree(p)
+    else:
+        p.unlink()
+    return {"deleted": str(p), "freed": item["bytes"]}
