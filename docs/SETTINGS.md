@@ -439,24 +439,25 @@ context shares the memory beside the model among the N conversations.
   another conversation's code is a leak (exit 1); one that misses its own is counted, and fails only with `--strict`.
   `--rounds N` repeats with new codes, `--stream` reads streamed answers.
 
-#### A step's attention in one launch (opt-in until measured)
+#### A step's attention in one launch
 
 In a step of several requests each layer runs every request's attention on its own: its window ring read into a
 window buffer, its new KV rows finished and written to the ring, the compressor, the indexer, the sparse attention and
-the output's rotation - several launches a request a layer. `MAYA_DS4_MULTI_ATTN=1` gives each request's window buffer
+the output's rotation - several launches a request a layer. `MAYA_DS4_MULTI_ATTN` (on) gives each request's window buffer
 a block of one shared buffer and runs the ring reads, the KV rows' finish, the ring writes, the sparse attention, its
 output's rotation and q's rotation once for all the step's rows: one token each, verify windows of up to 7 rows, the
 drafter's blocks. The compressor and the indexer still run a request at a time, and a verify window of 8 rows or more
 keeps its own attention launch. Each row is computed by the same kernels with the same arithmetic - only which launch
 computes it changes - so its logits are meant to be the same bits. It takes ~11 MB a GPU (the shared buffer and the
-decoded selections of 16 rows) from the experts' room, and nothing without `--parallel`. Not checked on a GPU or
-measured yet: `build/ds4_multi_attn_test` (built by name) compares the two ways' launches on random caches bit for bit
-(`--time` times them); `maya-ds4 --parallel 4 --multi-check --ids ...` with and without it must give the same logits
-and tokens; then the server with 2 and 4 requests at once.
+decoded selections of 16 rows) from the experts' room, and nothing without `--parallel`. `build/ds4_multi_attn_test`
+(built by name) compares the two ways' launches on random caches bit for bit. An RTX 3090 + eight RTX 5060 Ti (`--tp 8`,
+EXL3 3.5 bpw, `--parallel 2 --multi-check`, the expert cache off): the same logits bit for bit, and 2 x 200 tokens at
+43.9 -> 49.3 tok/s in all without drafts, 52.0 -> 56.3 with them; through the server, two requests at once were
+within the run-to-run spread.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_MULTI_ATTN` | off (0) | `1`: with `--parallel` above 1, a step's attention for all its requests' rows in one launch a step instead of one a request (the same bits; opt-in until measured) |
+| `MAYA_DS4_MULTI_ATTN` | on (1) | with `--parallel` above 1, a step's attention for all its requests' rows in one launch a step instead of one a request (the same bits); `0`: one a request, as before |
 
 #### A long prompt beside running requests (opt-in until measured)
 
@@ -1364,7 +1365,7 @@ The engine can take a conversation back to three places: the end of its last pro
 anchor where its run of continued prompts began. A prompt that leaves the conversation before those - the last user
 message edited, a new question after the same long document, an agent framework that renders its history again, another
 agent behind the same system prompt - was read again from token 0 (or, with `MAYA_DS4_SLOT_KEEP`, from one of a kept
-conversation's same three places). With this on, the server asks the engine (`marks=` and `shared=` on its GEN line) to
+conversation's same three places). Now (`MAYA_DS4_RESTORE_POINTS`, 4 by default) the server asks the engine (`marks=` and `shared=` on its GEN line) to
 keep the state at three more places of each prompt it reads:
 
 - the start of the last user turn (a tool result's turn too): an edited or retried last message reads only itself;
@@ -1381,11 +1382,13 @@ exactly the state the read kept. Each piece is read as a prompt of its own: with
 point would have skipped (as many as lie between the point and the prompt's end, when that is fewer), and the pieces'
 chunks end at the point, so that first read's answer can differ from a read without points the way another
 `--prefill-chunk` can. Each conversation `--parallel` holds has its own points, and a kept conversation keeps them and
-is taken back at them too.
+is taken back at them too. An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5 bpw, an 18K-token chat: its last message edited, the
+first token after 15.0 s without the points (every token read again), 0.2 s with them (18,041 tokens kept, 14 read);
+the first read of the chat 16.7 -> 17.7 s.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_RESTORE_POINTS` | off | `N` (1-16): the server asks for the points, and the engine keeps up to N a conversation besides its three - the least recently used gives way, the shared start last - in RAM, in every conversation it holds and in every kept conversation's slot; `0` or unset: no GEN line carries them, the engine as before |
+| `MAYA_DS4_RESTORE_POINTS` | 4 | `N` (1-16): the server asks for the points, and the engine keeps up to N a conversation besides its three - the least recently used gives way, the shared start last - in RAM, in every conversation it holds and in every kept conversation's slot; `0`: no GEN line carries them, the engine as before |
 | `MAYA_DS4_RESTORE_TAIL` | 512 | how many tokens before the prompt's end the tail point sits; `0`: no tail point |
 
 ## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)

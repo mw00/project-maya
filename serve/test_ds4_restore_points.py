@@ -141,10 +141,10 @@ class RestorePoints(unittest.TestCase):
         self.assertGreater(boundary, len(ids) - 60)
 
     def test_settings(self):
-        self.assertEqual(restore_point_settings({}), (False, 512))
+        self.assertEqual(restore_point_settings({}), (True, 512))   # (on by default: 4)
         self.assertEqual(restore_point_settings({ON: "0"}), (False, 512))
         self.assertEqual(restore_point_settings({ON: "4"}), (True, 512))
-        self.assertEqual(restore_point_settings({ON: "yes", TAIL: "x"}), (False, 512))
+        self.assertEqual(restore_point_settings({ON: "yes", TAIL: "x"}), (True, 512))   # (not a number: the default)
         self.assertEqual(restore_point_settings({ON: "8", TAIL: "0"}), (True, 0))
         self.assertEqual(restore_point_settings({ON: "8", TAIL: "2000"}), (True, 2000))
 
@@ -173,15 +173,17 @@ class RestorePoints(unittest.TestCase):
         _, sampling = self.run_request([{"role": "user", "content": DOC}], {ON: "4", TAIL: "100"})
         self.assertEqual(sampling["_restore"]["marks"], [len(self.engine.last_prompt) - 100])
 
-    def test_off_by_default_and_never_the_clients_own(self):
-        _, off = self.run_request(self.chat(), {})
+    def test_off_with_0_and_never_the_clients_own(self):
+        _, on = self.run_request(self.chat(), {})   # (on by default)
+        self.assertIn("_restore", on)
+        _, off = self.run_request(self.chat(), {ON: "0"})
         self.assertNotIn("_restore", off)
         self.assertNotIn("marks=", StrataEngine.sampling_keys(off))
         self.assertNotIn("shared=", StrataEngine.sampling_keys(off))
         # the line with the setting off is the line without this feature (the keys of the request's own sampling)
         self.assertEqual(StrataEngine.sampling_keys(off), StrataEngine.sampling_keys({}))
         # a client's own `_restore` never reaches the engine
-        _, forged = self.run_request(self.chat(), {}, _restore={"marks": [5], "shared": 7})
+        _, forged = self.run_request(self.chat(), {ON: "0"}, _restore={"marks": [5], "shared": 7})
         self.assertNotIn("_restore", forged)
         _, forged = self.run_request(self.chat(), {ON: "4"}, _restore={"marks": [5], "shared": 7})
         self.assertNotEqual(forged["_restore"].get("marks"), [5])

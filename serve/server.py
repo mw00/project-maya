@@ -594,10 +594,10 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int], window_s: flo
     return (now[0] - base[0]) <= max(0.5, STALL_CPU_SHARE * window_s) and (now[1] - base[1]) <= STALL_IO_EPS_B
 
 
-# MAYA_DS4_RESTORE_POINTS (off): the DeepSeek engine keeps restore points where a later prompt is likely to leave this
+# MAYA_DS4_RESTORE_POINTS (4): the DeepSeek engine keeps restore points where a later prompt is likely to leave this
 # one - its GEN line carries marks=<pos>,... and shared=<pos> - besides the end of the last prompt, the position before
 # it and the anchor it keeps anyway.  N (1-16) turns them on, and is also the engine's cap a conversation (it reads the
-# same setting); unset or 0: no keys, every GEN line as before.  MAYA_DS4_RESTORE_TAIL (512): how far before the
+# same setting); 0: no keys, every GEN line as before.  MAYA_DS4_RESTORE_TAIL (512): how far before the
 # prompt's end the tail point sits (0: none).
 RESTORE_LEAST = 1024        # no point before this many tokens: such a start is read again in about the time a point costs
 
@@ -611,7 +611,7 @@ def restore_point_settings(env=None) -> tuple[bool, int]:
             return max(0, int(str(env.get(maya_names.read_as(name), default)).strip()))
         except ValueError:
             return default
-    return whole("MAYA_DS4_RESTORE_POINTS", 0) > 0, whole("MAYA_DS4_RESTORE_TAIL", 512)
+    return whole("MAYA_DS4_RESTORE_POINTS", 4) > 0, whole("MAYA_DS4_RESTORE_TAIL", 512)
 
 
 def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTORE_LEAST) -> dict:

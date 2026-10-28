@@ -8089,11 +8089,13 @@ struct Model::Impl {
                      lane_name.c_str(), cpu_threads(), kPer, lane_report.c_str());
     }
 
-    // DS4_MULTI_ATTN=1 (--parallel): a multi step's attention for all its rows in one launch a step where attn_core
-    // launches it a conversation at a time (attn_multi) - the rings into the window buffers, the KV rows' finish, the
-    // rings' new rows, the sparse attention and its output's finish, and q's rotation; the compressor and the indexer
-    // still a conversation at a time.  Each row the same kernels' arithmetic; opt-in until measured
-    bool multi_attn = false;
+    // DS4_MULTI_ATTN (--parallel; on unless =0): a multi step's attention for all its rows in one launch a step where
+    // attn_core launches it a conversation at a time (attn_multi) - the rings into the window buffers, the KV rows'
+    // finish, the rings' new rows, the sparse attention and its output's finish, and q's rotation; the compressor and the
+    // indexer still a conversation at a time.  Each row the same kernels' arithmetic (an RTX 3090 + 8 RTX 5060 Ti,
+    // --parallel 2 --multi-check: the same logits bit for bit, 43.9 -> 49.3 tok/s in all without drafts, 52.0 -> 56.3
+    // with them)
+    bool multi_attn = true;
     static_assert(kMaRows == kWin, "a multi step's rows");
 
     // ---- --parallel: several conversations (Options::seqs), each its own rings, partial groups and KV
