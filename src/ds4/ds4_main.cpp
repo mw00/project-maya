@@ -16,6 +16,7 @@
 // does continue a kept conversation reads only its new tokens.  A kept conversation holds its pictures' marks too (a
 // span's start, its pixels' fingerprint, its length): it comes back only for a prompt whose pictures are the same at
 // the same places.
+#include "ds4_evt.hpp"
 #include "ds4_model.hpp"
 #include "ds4_watchdog.hpp"
 #include "strata/platform/env_alias.hpp"
@@ -123,15 +124,6 @@ struct Lines {
     void forget(long long rid) {   // (the request is over: a late STOP of it changes nothing)
         std::lock_guard<std::mutex> lk(mu);
         stop_rids.erase(std::remove(stop_rids.begin(), stop_rids.end(), rid), stop_rids.end());
-    }
-    // the next line if one is waiting (false: none now) - the several-conversation loop reads between its steps
-    bool poll(std::string& l, bool& end) {
-        std::lock_guard<std::mutex> lk(mu);
-        end = q.empty() && eof;
-        if (q.empty()) return false;
-        l = q.front();
-        q.pop_front();
-        return true;
     }
     void start() {
         std::thread([this] {
@@ -1466,6 +1458,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // read whole (the tower borrows its room and gives it back before the prompt, with every other request between
     // two of its tokens).  A request alone decodes in its rounds as with one conversation (DSpark's drafts, the prompt
     // lookup); two or more go through Model::step_multi - a token of each through the model together, no drafts.
+    // The loop runs on events (ds4_evt.hpp, rig's evt): the reader's lines, and the turns - a round of tokens or a
+    // prompt's piece - each queueing the next as it ends; a line outranks a turn, and with nothing running it waits.
     if (multi) {
         struct Act {
             Req r;
@@ -1640,50 +1634,30 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (a->reading) join_read(a.get());
             acts.push_back(std::move(a));
         };
+        // the loop's events (ds4_evt.hpp, rig's evt), run one at a time on this thread: the reader's lines, then the
+        // turns - a token of every answer running (a round), or the next prompt's piece, in turn.  A line outranks a
+        // turn, so every request that came is admitted before the next one; nothing polls: with no request running
+        // the engine waits for a line
+        enum : int { kTurn = 1, kLine = 2 };
+        strata::ds4::evt::Engine eng;
         bool quit = false;
-        for (;;) {
-            // the input between steps: requests and QUIT (STOP <rid> is the reader's); waited for only when idle
-            std::string ln;
-            bool end = false;
-            if (acts.empty() && waiting.empty()) {
-                g_busy.store(false);   // (waiting for a request: no watchdog)
-                m.save_profile();
-                if (quit || !in.next(ln) || ln == "QUIT") break;
-                g_busy.store(true);
-                beat();
-                waiting.push_back(ln);
-            }
-            while (in.poll(ln, end)) {
-                if (ln == "QUIT") quit = true;
-                else waiting.push_back(ln);
-            }
-            for (size_t i = 0; i < waiting.size();) {   // (not GEN: answered at once)
-                if (waiting[i].rfind("GEN ", 0) == 0 || waiting[i].rfind("GENI ", 0) == 0) {
-                    ++i;
-                    continue;
-                }
-                std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n",
-                            waiting[i].substr(0, waiting[i].find(' ')).c_str());
-                std::fflush(stdout);
-                waiting.erase(waiting.begin() + (long) i);
-            }
-            while (!quit && !waiting.empty() &&
-                   std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
+        bool turn_queued = false;   // (one turn in the queue at a time: each queues the next as it ends)
+        bool read_next = false;     // (a round was the last turn: a prompt's piece goes next, if one is being read)
+        const auto admit_waiting = [&] {
+            while (!quit && !waiting.empty() && std::find(seq_rid.begin(), seq_rid.end(), -1LL) != seq_rid.end()) {
                 const std::string g = waiting.front();
                 waiting.pop_front();
                 admit(g);
                 beat();
             }
-            if (quit) in.stop_all.store(true);
-            // each running request writes its next token; those whose next one the model must make go below
+        };
+        // each running request writes its next token; those whose next one the model must make go through it together
+        const auto round_turn = [&] {
             std::vector<Act*> need;
             const long long n0 = busy_n;
             for (auto& ap : acts) {
                 Act& a = *ap;
-                if (a.reading) {   // (a STOP while it waits for its turn: ended now, the conversation before it kept)
-                    if (in.stopped(a.r.rid)) read_turn(a, 0);
-                    continue;
-                }
+                if (a.reading) continue;
                 if (in.stopped(a.r.rid)) {
                     a.finish = "cancel";
                     a.done = true;
@@ -1784,13 +1758,39 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         if (closing) a.tok = a.r.think_end;
                     }
             }
-            // the next prompt in line reads a piece (its first token picked once it is all read), then goes to the back
-            if (!read_line.empty()) {
-                Act* a = read_line.front();
-                read_line.pop_front();
-                if (!a->done) read_turn(*a, read_piece);
-                if (a->reading && !a->done) read_line.push_back(a);
-            }
+        };
+        // the next prompt in line reads a piece (its first token picked once it is all read), then goes to the back
+        const auto read_turn_next = [&] {
+            Act* a = read_line.front();
+            read_line.pop_front();
+            if (!a->done) read_turn(*a, read_piece);
+            if (a->reading && !a->done) read_line.push_back(a);
+        };
+        std::function<void()> settle;
+        // the next turn: a piece after a round while a prompt is being read, else a round while an answer runs
+        const auto queue_turn = [&] {
+            if (turn_queued || acts.empty()) return;
+            turn_queued = true;
+            eng.add([&] {
+                turn_queued = false;
+                const bool answering = std::any_of(acts.begin(), acts.end(),
+                                                   [](const std::unique_ptr<Act>& a) { return !a->reading; });
+                if (!read_line.empty() && (read_next || !answering)) {
+                    read_turn_next();
+                    read_next = false;
+                } else if (answering) {
+                    round_turn();
+                    read_next = true;
+                }
+                settle();
+            }, kTurn);
+        };
+        // after every event: a STOP of a prompt waiting for its turn (ended now, the conversation before it kept), the
+        // requests ended (their conversations to the requests waiting), then the next turn - or, none running, idle
+        settle = [&] {
+            for (auto& ap : acts)
+                if (ap->reading && !ap->done && in.stopped(ap->r.rid)) read_turn(*ap, 0);
+            bool freed = false;
             for (size_t i = 0; i < acts.size();) {
                 if (!acts[i]->done) {
                     ++i;
@@ -1801,10 +1801,51 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 read_line.erase(std::remove(read_line.begin(), read_line.end(), a.get()), read_line.end());
                 if (a->ended) release(*a);   // (its DONE written as its prompt was read)
                 else finish_act(*a);
+                freed = true;
             }
-            if (acts.empty() && quit) break;
-            (void) end;
-        }
+            if (freed) admit_waiting();
+            if (!acts.empty()) {
+                queue_turn();
+                return;
+            }
+            if (quit) {
+                eng.stop();
+                return;
+            }
+            if (waiting.empty()) {
+                g_busy.store(false);   // (waiting for a request: no watchdog)
+                m.save_profile();
+            }
+        };
+        // a line: a request (admitted when a conversation is free), QUIT (every request stopped, the engine's end once
+        // they are), anything else answered at once (STOP <rid> is the reader's)
+        const auto on_line = [&](const std::string& ln) {
+            g_busy.store(true);
+            beat();
+            if (ln == "QUIT") {
+                quit = true;
+                in.stop_all.store(true);
+            } else if (ln.rfind("GEN ", 0) == 0 || ln.rfind("GENI ", 0) == 0) {
+                waiting.push_back(ln);
+                admit_waiting();
+            } else {
+                std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n",
+                            ln.substr(0, ln.find(' ')).c_str());
+                std::fflush(stdout);
+            }
+            settle();
+        };
+        std::thread reader([&] {   // (the reader's lines into the loop; the input's end is a QUIT)
+            std::string l;
+            bool quit_seen = false;
+            while (!quit_seen && in.next(l)) {
+                quit_seen = l == "QUIT";
+                eng.add([&, l] { on_line(l); }, kLine);
+            }
+            if (!quit_seen) eng.add([&] { on_line("QUIT"); }, kLine);
+        });
+        eng.run();
+        reader.join();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
