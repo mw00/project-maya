@@ -1466,6 +1466,14 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
   endif()
+  # maya-ds4's RAM expert store (--ssd-cache, src/ds4/ds4_store.hpp) over files of fake experts written in the build
+  # directory (~1 MB, removed): reads, where they land, eviction, the read queue, giving RAM back, preload, the miss
+  # split's order, put - host code only, no GPU
+  add_executable(ds4_store_test tests/ds4_store_test.cpp)
+  target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+  target_link_libraries(ds4_store_test PRIVATE strata_warnings Threads::Threads)
+  add_test(NAME ds4_store_test COMMAND ds4_store_test ${CMAKE_CURRENT_BINARY_DIR})
+  set_tests_properties(ds4_store_test PROPERTIES TIMEOUT 120)
 endif()
 
 if(STRATA_BUILD_TESTS)
