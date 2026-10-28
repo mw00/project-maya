@@ -497,6 +497,60 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int], window_s: flo
     return (now[0] - base[0]) <= max(0.5, STALL_CPU_SHARE * window_s) and (now[1] - base[1]) <= STALL_IO_EPS_B
 
 
+# MAYA_DS4_RESTORE_POINTS (off): the DeepSeek engine keeps restore points where a later prompt is likely to leave this
+# one - its GEN line carries marks=<pos>,... and shared=<pos> - besides the end of the last prompt, the position before
+# it and the anchor it keeps anyway.  N (1-16) turns them on, and is also the engine's cap a conversation (it reads the
+# same setting); unset or 0: no keys, every GEN line as before.  MAYA_DS4_RESTORE_TAIL (512): how far before the
+# prompt's end the tail point sits (0: none).
+RESTORE_LEAST = 1024        # no point before this many tokens: such a start is read again in about the time a point costs
+
+
+def restore_point_settings(env=None) -> tuple[bool, int]:
+    """(on, tail) from MAYA_DS4_RESTORE_POINTS and MAYA_DS4_RESTORE_TAIL (as the code reads them: maya_names)."""
+    env = os.environ if env is None else env
+
+    def whole(name, default):
+        try:
+            return max(0, int(str(env.get(maya_names.read_as(name), default)).strip()))
+        except ValueError:
+            return default
+    return whole("MAYA_DS4_RESTORE_POINTS", 0) > 0, whole("MAYA_DS4_RESTORE_TAIL", 512)
+
+
+def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTORE_LEAST) -> dict:
+    """Where the DeepSeek engine keeps restore points for this prompt -> {"marks": [pos, ...], "shared": pos} (either
+    may be missing; {}: none).  From the prompt's ids as the template wrote them: a turn opens with its role's special
+    token (<｜User｜>, a tool result's turn too; <｜System｜> for a system message after the first user turn), and text
+    inside a message never encodes to one (render_ids), so the positions are the template's own.
+
+    - the start of the last user turn: its last message edited, or sent again after another answer, goes back there;
+    - `tail` tokens before the end, when the last turn is longer than that: a new question after the same long document
+      in the same message;
+    - "shared": the end of the system prompt and its tools (the first user turn): another conversation behind the same
+      start goes back there, and the engine gives that point up last.
+    Positions under `least` are left out: a start that short is read again in about the time a point costs."""
+    if user_id is None or len(ids) < 2:
+        return {}
+    first = last = None
+    for i, t in enumerate(ids):
+        if t == user_id:
+            first = i if first is None else first
+            last = i
+        elif t == system_id and first is not None:
+            last = i
+    marks, out = [], {}
+    if first is not None and first >= least:
+        out["shared"] = first
+    if last is not None and last >= least and last != first:
+        marks.append(last)
+    t = len(ids) - tail
+    if tail > 0 and t >= least and (last is None or t > last):
+        marks.append(t)
+    if marks:
+        out["marks"] = sorted(marks)
+    return out
+
+
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
@@ -904,7 +958,7 @@ class StrataEngine:
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic) - but
             # the penalties do: they change the logits greedy picks from (#273: a greedy answer's loops)
             return (" temperature=0" + penalty_keys + think + tune_keys + StrataEngine.projection_key(sampling) +
-                    bias_key)
+                    bias_key + StrataEngine.restore_keys(sampling))
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -922,7 +976,7 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling) + bias_key
+        return keys + StrataEngine.projection_key(sampling) + bias_key + StrataEngine.restore_keys(sampling)
 
     @staticmethod
     def penalty_keys(sampling: dict) -> str:
@@ -955,6 +1009,19 @@ class StrataEngine:
             else:
                 keys += " penalty_last_n=64"
         return keys
+
+    @staticmethod
+    def restore_keys(sampling: dict) -> str:
+        """`marks=<pos>,...` and `shared=<pos>`: the DeepSeek engine's restore points for this prompt (Service.run puts
+        them in `_restore` with MAYA_DS4_RESTORE_POINTS; no other engine gets them).  "" without: the line as before."""
+        pts = sampling.get("_restore")
+        if not isinstance(pts, dict):
+            return ""
+        marks = [p for p in pts.get("marks") or () if isinstance(p, int) and not isinstance(p, bool) and p > 0]
+        shared = pts.get("shared")
+        return ((" marks=" + ",".join(str(p) for p in marks) if marks else "") +
+                (f" shared={shared}" if isinstance(shared, int) and not isinstance(shared, bool) and shared > 0
+                 else ""))
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1777,6 +1844,9 @@ class Service:
                             _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
                             _special_ids("[e~[") + _special_ids("]~b]"))
+        # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
+        self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
+        self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
@@ -2996,6 +3066,15 @@ class Service:
                     think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
                 if in_think:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
+                # MAYA_DS4_RESTORE_POINTS: where the DeepSeek engine keeps restore points for this prompt (never a
+                # client's own `_restore`; not with pictures, whose spans the engine reads whole)
+                if sampling and "_restore" in sampling:
+                    sampling = {k: v for k, v in sampling.items() if k != "_restore"}
+                on, tail = restore_point_settings()
+                if on and not emb and getattr(self.template, "deepseek", False):
+                    pts = deepseek_restore_points(ids, self.ds_user_id, self.ds_system_id, tail)
+                    if pts:
+                        sampling = {**(sampling or {}), "_restore": pts}
 
                 def attempts():
                     """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
@@ -4531,7 +4610,8 @@ class Server(ThreadingHTTPServer):
 
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
-              "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD") + RESPONSE_ENV_KEYS
+              "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD") + RESPONSE_ENV_KEYS + \
+    tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
 
 
 def apply_server_env(cfg: dict) -> None:

@@ -1071,6 +1071,36 @@ The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the
 DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
 refused rather than read.
 
+## DeepSeek: restore points inside a prompt (opt-in until measured)
+
+The engine can take a conversation back to three places: the end of its last prompt, the position before it, and the
+anchor where its run of continued prompts began. A prompt that leaves the conversation before those - the last user
+message edited, a new question after the same long document, an agent framework that renders its history again, another
+agent behind the same system prompt - was read again from token 0 (or, with `MAYA_DS4_SLOT_KEEP`, from one of a kept
+conversation's same three places). With this on, the server asks the engine (`marks=` and `shared=` on its GEN line) to
+keep the state at three more places of each prompt it reads:
+
+- the start of the last user turn (a tool result's turn too): an edited or retried last message reads only itself;
+- 512 tokens before the prompt's end, when the last turn is longer than that: a new question after the same document,
+  in the same message, reads those 512 tokens and itself;
+- the end of the system prompt and its tools (the first user turn), given up last: another conversation behind the same
+  start reads only its own part.
+
+None under 1,024 tokens, and none for a prompt with pictures. The read stops at each point and copies the state there to
+RAM - the window rings and the compressors' partial groups, a few MB (V4.1: its 43 layers' 128-row rings; the engine's
+log gives the size at the first one) - and a later prompt that leaves this one past a point reads on from there, from
+exactly the state the read kept. Each piece is read as a prompt of its own: with the prompt skip
+(`MAYA_DS4_PROMPT_SKIP`), layers 20-39 then also run on up to ~2,700 tokens before a point, which a read without the
+point would have skipped (as many as lie between the point and the prompt's end, when that is fewer), and the pieces'
+chunks end at the point, so that first read's answer can differ from a read without points the way another
+`--prefill-chunk` can. Each conversation `--parallel` holds has its own points, and a kept conversation keeps them and
+is taken back at them too.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_RESTORE_POINTS` | off | `N` (1-16): the server asks for the points, and the engine keeps up to N a conversation besides its three - the least recently used gives way, the shared start last - in RAM, in every conversation it holds and in every kept conversation's slot; `0` or unset: no GEN line carries them, the engine as before |
+| `MAYA_DS4_RESTORE_TAIL` | 512 | how many tokens before the prompt's end the tail point sits; `0`: no tail point |
+
 ## DeepSeek: tensor parallel groups of 3 with a GGUF pack (experimental)
 
 A GGUF pack's tensor parallel width must divide the attention heads (64) and the output groups (8), so `--tp 3`
