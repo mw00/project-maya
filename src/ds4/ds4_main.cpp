@@ -21,7 +21,10 @@
 // leaves this one past one of them goes back to it (ds4_marks.hpp).
 #include "ds4_interleave.hpp"
 #include "ds4_marks.hpp"
+#include "ds4_gguf.cuh"       // (--pack-info: the types the kernels take, asked of them)
+#include "ds4_iq.cuh"
 #include "ds4_model.hpp"
+#include "ds4_packinfo.hpp"
 #include "ds4_watchdog.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/spec/draft_policy.hpp"
@@ -109,7 +112,21 @@ void usage() {
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
-                 "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n");
+                 "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
+                 "maya-ds4 --pack <model>/maya-ds4 --pack-info [--expert-profile FILE]   the pack described: no GPU, no "
+                 "weights read\n");
+}
+
+// --pack-info: the types the kernels take, asked of them (ds4_gguf / ds4_iq: the routed experts' and the dense GEMVs'
+// ggml types; the EXL3 kernels' bitrates with the mul1 codebook)
+strata::ds4::KernelTypes kernel_types() {
+    namespace gg = strata::ds4::gguf;
+    strata::ds4::KernelTypes kt;
+    kt.name = [](int t) { return gg::type_name(t); };
+    kt.expert = [](int t) { return gg::expert_type_ok(t); };
+    kt.dense = [](int t) { return t != gg::kTypeMXFP4 && gg::iq::mv_supported(t); };
+    kt.exl3_k2 = [](int k2) { return strata::kernels::exl3::k2_supported(k2, 2); };
+    return kt;
 }
 
 // stdin lines on a thread, so a request can see STOP while it decodes.  read(2), not std::cin - glibc's exit()
@@ -2413,7 +2430,7 @@ int main(int argc, char** argv) {
     bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
-    bool serve_mode = false, multi_check = false, parts_check = false;
+    bool serve_mode = false, multi_check = false, parts_check = false, describe = false;
     std::string images, enc_rgb, enc_out;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
@@ -2485,6 +2502,7 @@ int main(int argc, char** argv) {
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
         else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
+        else if (a == "--pack-info") describe = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
             usage();
@@ -2494,6 +2512,13 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+    }
+    if (describe) {   // the pack's description alone, before anything that would touch a GPU
+        if (o.pack.empty()) {
+            usage();
+            return 2;
+        }
+        return strata::ds4::pack_info(o.pack, o.profile, kernel_types(), stdout);
     }
     if (parts_check && ids_s.empty()) {
         std::fprintf(stderr, "--parts-check needs --ids (a prompt of two chunks or more)\n");

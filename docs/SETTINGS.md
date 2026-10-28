@@ -1005,6 +1005,14 @@ chat, code, multilingual text, reasoning and tool calls (`tools/ds4/profile.py`)
 2,000 tokens of answers, so what your PC routes soon outweighs them. A pack that already has a profile keeps its own;
 an `--expert-profile` in the config's `args` (a file, or `none`) is used instead.
 
+## DeepSeek: tools for a pack, a build and the drafter
+
+`maya-ds4` runs these only when asked; serving is the same without them.
+
+| Argument | What it does |
+| --- | --- |
+| `--pack-info` (with `--pack <dir>`) | describes the pack without a GPU and without reading its weights: the routed experts' types layer by layer (gate and up / down) with an expert's and a token's bytes, where each part goes (the GPUs, pinned RAM, the files), how much of the expert profile's routing the most-routed experts take (50 / 80 / 90 / 95 / 99%: how many, how many GB - what VRAM and RAM must hold), the drafter's and the Engram's metadata, tensors of a type no kernel takes, and every file `model_dir` points at (there, and as long as its tensors need). A pack whose weights were moved or cleaned up still reads perfectly and only fails at the load: it is called a `DEAD PACK` here. Suspicious metadata is warned about, e.g. `dspark_block_size` 0 beside the drafter's tensors (the drafter is then not loaded), or an expert profile of another size (ignored at the load). Exit code 0: it can load; 1: not a pack; 2: it cannot load. `--expert-profile FILE` reads that profile instead of the pack's |
+
 ## DeepSeek: loading the experts
 
 The engine reads the pack's expert regions into VRAM and RAM at start: 15,744 experts, 73 GB into VRAM and 147 GB

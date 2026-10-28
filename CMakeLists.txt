@@ -511,7 +511,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
-                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
                           ${_strata_gpu_blas_target})
@@ -545,6 +545,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_packinfo_test.cpp")
+      # maya-ds4 --pack-info on packs written for it (healthy, dead, short, a type no kernel takes, a drafter its
+      # metadata leaves out, a profile of another size): host code only, no GPU
+      enable_testing()
+      add_executable(ds4_packinfo_test tests/ds4_packinfo_test.cpp src/ds4/ds4_packinfo.cpp)
+      add_test(NAME ds4_packinfo_test COMMAND ds4_packinfo_test)
+      set_tests_properties(ds4_packinfo_test PROPERTIES TIMEOUT 60)
     endif()
   endif()
 
