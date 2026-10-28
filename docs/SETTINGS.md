@@ -932,12 +932,20 @@ Threadripper 1000-3000) and Hygon's
 run `pdep` in microcode, hundreds of cycles each, so the CPU lane spent most of an expert there. On those CPUs the
 CPU lane now takes its own IQ1_S rows, which build the indices with plain shifts: the same numbers bit for bit
 (checked against ggml-cpu's dot at the start; if they ever differ, ggml-cpu's rows are kept). A user's report from
-an EPYC (Zen 2) with Maya-XS: an expert on the CPU 1.6 -> 0.44 ms. Zen 3 and later and Intel CPUs keep the
-measured choice as before. The log says `ds4: CPU lane IQ1_S rows: ours without pdep (...)` when it applies.
+an EPYC (Zen 2) with Maya-XS: an expert on the CPU 1.6 -> 0.44 ms. The log says
+`ds4: CPU lane IQ1_S rows: ours without pdep (...)` when it applies.
+
+Those rows decode a segment of 16 blocks at a time in vectors - the grid indices by a byte shuffle, a multiply and a
+mask, the blocks' F16 scales with F16C, the delta's integer sums as exact int32 vectors - where ggml-cpu decodes each
+block in scalar code (its one-token dot is bound by instruction issue, not memory); the float steps are ggml-cpu's, so
+the numbers stay the same bit for bit (`ds4_iq1_rows_test`; `ds4_iq1_bench` times them). On Zen 3 and later and Intel
+CPUs they are timed against ggml-cpu's dot at the start and taken where 10 % faster - a decode's single token too -
+wherever the one-GPU decode path allows IQ1_S's own rows (`DS4_IQ1S_ROWS`). Ryzen 9 5900X, an expert 4096 x 2048,
+one thread: 1 token 1.43 -> 1.14 ms, 4 tokens 3.2 -> 2.5 ms.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `DS4_IQ1_PDEP` | `0` on AMD family 17h / Hygon, else `1` | `0`: the rows without `pdep` on any CPU (tests: `ds4_iq1_rows_test` checks them against ggml-cpu); `1`: the measured choice (ggml-cpu's dot for a single token) |
+| `DS4_IQ1_PDEP` | `0` on AMD family 17h / Hygon, else `1` | `0`: the own IQ1_S rows on every call and setup, untimed (tests: `ds4_iq1_rows_test` checks them against ggml-cpu); `1`: the measured choice (the own rows, none of which take `pdep`, where they time faster than ggml-cpu's dot - one token too - while the one-GPU decode path allows them) |
 | `DS4_IQ1M_PDEP` | with BMI2: `0` on AMD before family 19h (Zen 3) / Hygon, else `1` | IQ1_M experts' own rows (one token and several): `1` builds the grid indices with `pdep`, `0` with plain table lookups; both bit for bit ggml-cpu's dot (`native_rows_exact_test` checks both; the start check tests the one in use). Only for checking the other form; without BMI2 always `0` |
 
 ## DeepSeek: IQ1_S, IQ1_M and IQ2_S experts on the GPU
