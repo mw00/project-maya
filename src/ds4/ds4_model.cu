@@ -32,6 +32,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 #include "ds4_prefill_stats.hpp"
+#include "ds4_prompt_mem.hpp"
 #include "ds4_ram_slice.hpp"
 #include "ds4_vision.cuh"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -1112,6 +1113,12 @@ struct Model::Impl {
         int last = -1;                                                 // the last pick: 1 the flow, 0 windows
         double last_pred = 0;                                          // its prediction (s, before its k)
     } pm;
+    // DS4_PROMPT_PICK=length (opt-in until measured; =length:N from N tokens): the path by the prompt's length alone -
+    // the chunked pass from kPromptFlowMin (96) tokens, windows of 16 below (ds4_prompt_mem.hpp).  The timing pick
+    // goes by this run's measured speeds, earlier prompts' times and the page cache's state, so the same prompt could
+    // take the other path in the next run - and the two round differently, its logits with them; by length it always
+    // takes the same one, and the load does not time the paths (calibrate_paths).  0: the timing pick
+    int pick_len = 0;
     static constexpr int kWarmRows = 32;     // (warm_after: the run's last rows whose picks it reads ahead)
     static constexpr int kPickMax = 2048;   // (from here on the flow: windows' work grows with every 16 tokens)
     static constexpr double kPickRes = 0.9;  // (this share of the CPU-lane experts in RAM: windows if predicted faster)
@@ -1998,6 +2005,8 @@ struct Model::Impl {
     }
 
     ~Impl() {
+        blas_skip.store(true);
+        if (blas_th.joinable()) blas_th.join();   // (it uses the cuBLAS handles destroyed below)
         {
             std::lock_guard<std::mutex> lk(cs_mu);
             cs_quit = true;
@@ -4201,11 +4210,17 @@ struct Model::Impl {
                 workers.back()->start();
             }
         tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
-        calibrate_paths();
+        pick_len = chunk > 0 ? prompt_pick_length(ds4_env("DS4_PROMPT_PICK")) : 0;
+        if (pick_len > 0)
+            std::fprintf(stderr, "ds4: a prompt's path by its length (DS4_PROMPT_PICK): the chunked pass from %d tokens, "
+                                 "windows of %d below\n", std::max(pick_len, chunk_min), kWin);
+        else
+            calibrate_paths();
         lane_setup();
         one_gpu_plan();   // (#496: the one-GPU path kept only where something streams)
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
+        blas_warm_start();
         return true;
     }
 
@@ -4215,6 +4230,77 @@ struct Model::Impl {
     size_t win_rb() const { return kv_row_bytes(kKvFp8, g.hd); }
     size_t ckv_rb() const { return kv_row_bytes(kKvFp4, g.hd); }
     size_t ik_rb() const { return kv_row_bytes(kKvFp4p, g.ix_hd); }
+
+    // ---- the prompt path's GEMMs warmed up at load (DS4_PROMPT_WARM=0: not)
+    // A process's first cuBLAS products pay the library's start - its kernels loaded into the context on first use,
+    // its heuristics set up - and the first prompt through the chunked pass paid it.  Paid here instead, once the
+    // model is loaded, on a thread of its own (a thread a GPU), while the first person still types: the pass's kinds
+    // of product (the mHC mix in F32, the FP16 projections, the indexer's FP16 weights) on zeros in the prompt
+    // buffers of a fixed size (never a borrowed tail), on the device's stream - they stay zeros, nothing else is
+    // touched, so the answers are what they were.  A prompt that comes first waits for it (blas_wait: never longer
+    // than its own first products would have taken), and so does a picture (its room may be those buffers); one that
+    // comes before it started stops it
+    std::thread blas_th;
+    std::mutex blas_mu;
+    std::atomic<bool> blas_skip{false};
+    void blas_warm_start() {
+        if (chunk <= 0 || chunks.empty() || tri_of(ds4_env("DS4_PROMPT_WARM")) == 0) return;
+        blas_th = std::thread([this] {
+            std::lock_guard<std::mutex> lk(blas_mu);
+            if (blas_skip.load()) return;
+            const double t0 = now_ms();
+            std::vector<std::thread> th;
+            for (size_t di = 0; di < chunks.size(); ++di)
+                if (chunks[di] != nullptr && chunks[di]->blas != nullptr) th.emplace_back([this, di] { blas_warm_dev(di); });
+            for (std::thread& t : th) t.join();
+            if (o.verbose)
+                std::fprintf(stderr, "ds4: the prompt path's GEMMs warmed up on %zu GPU%s in %.0f ms\n", th.size(),
+                             th.size() == 1 ? "" : "s", now_ms() - t0);
+        });
+    }
+    void blas_wait() {
+        blas_skip.store(true);
+        std::lock_guard<std::mutex> lk(blas_mu);
+    }
+    void blas_warm_dev(size_t di) {
+        Chunk& c = *chunks[di];
+        if (c.q == nullptr || c.o == nullptr || c.o16 == nullptr || c.oa == nullptr || c.w16 == nullptr) return;
+        if (cudaSetDevice(devs[di].id) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return;
+        }
+        cudaStream_t s = devs[di].st;   // (the handle's own stream: no other workspace for it)
+        const size_t D = (size_t) g.dim, hcd = (size_t) g.hc * g.dim, n_mix = (size_t) (2 + g.hc) * g.hc;
+        const size_t qn = (size_t) c.A * c.HQ, oan = (size_t) c.A * c.OG * g.o_lora;   // (q, o, o16; oa)
+        // (rows: a slab's, at most 256, as many as the buffers hold; the FP16 product's columns as gemm() cuts them)
+        const size_t R = std::min({(size_t) std::min(c.A, 256), qn / std::max(hcd, D), oan / 32});
+        const size_t nc = std::min(D, c.w16_elems / D) / 128 * 128;
+        const size_t nix = std::min((size_t) g.ix_heads, c.w16_elems / D);
+        const float one = 1.0f, zero = 0.0f;
+        bool ok = R >= 1;
+        if (ok && n_mix * hcd <= qn) {   // the mHC mix: fn (c.o) x h (c.q) -> c.oa
+            ok = cudaMemsetAsync(c.o, 0, n_mix * hcd * 4, s) == cudaSuccess &&
+                 cudaMemsetAsync(c.q, 0, R * hcd * 4, s) == cudaSuccess &&
+                 cublasSgemm(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) n_mix, (int) R, (int) hcd, &one, c.o, (int) hcd, c.q,
+                             (int) hcd, &zero, c.oa, 32) == CUBLAS_STATUS_SUCCESS;
+        }
+        if (ok && nc >= 128 && nc * R <= qn) {   // an FP16 projection: W (c.w16) x x16 (c.o16) -> c.q
+            ok = cudaMemsetAsync(c.w16, 0, nc * D * 2, s) == cudaSuccess &&
+                 cudaMemsetAsync(c.o16, 0, R * D * 2, s) == cudaSuccess &&
+                 cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) nc, (int) R, (int) D, &one, c.w16, CUDA_R_16F,
+                              (int) D, c.o16, CUDA_R_16F, (int) D, &zero, c.q, CUDA_R_32F, (int) nc, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+        }
+        if (ok && nix >= 1 && nix * R <= qn) {   // the indexer's FP16 weights (gemm_f16w's shape)
+            ok = cudaMemsetAsync(c.w16, 0, nix * D * 2, s) == cudaSuccess &&
+                 cudaMemsetAsync(c.o16, 0, R * D * 2, s) == cudaSuccess &&
+                 cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) nix, (int) R, (int) D, &one, c.w16, CUDA_R_16F,
+                              (int) D, c.o16, CUDA_R_16F, (int) D, &zero, c.q, CUDA_R_32F, (int) nix, CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+        }
+        (void) cudaStreamSynchronize(s);
+        (void) cudaGetLastError();
+    }
 
     // ---- the chunked prompt path
     size_t x_cap() const { return (size_t) std::max<int>(kWin, chunk + 2); }   // a window's / chunk's new source rows
@@ -8406,6 +8492,7 @@ struct Model::Impl {
     }
     // a picture's room on the tower's GPU (vis_mode's lender; one that cannot lend it now: free memory)
     uint8_t* take_vis_room(int& src, std::string& err) {
+        blas_wait();   // (the prompt buffers lent below are the GEMM warm-up's)
         Dev& d = devs[0];
         const size_t need = vt.room_bytes();
         cudaSetDevice(d.id);
@@ -15874,6 +15961,7 @@ struct Model::Impl {
     // same prompt would give other logits after other requests than in a fresh process
     bool pick_path(int n) {
         pm.last = -1;
+        if (pick_len > 0) return prompt_by_length(n, pick_len);   // (DS4_PROMPT_PICK=length)
         if (!pm.on || n >= kPickMax || !o.expert_cache) return true;
         double f_res = 0, f_cold = 0, w = 0;
         const int nw = n / kWin, rem = n % kWin;
@@ -16556,6 +16644,7 @@ struct Model::Impl {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
+        blas_wait();   // (the prompt path's GEMM warm-up, if it still runs: finished first)
         warm_end();   // (the last prompt's warm-up: this one streams what it needs)
         struct Lent {   // (every way out, a failed borrow_begin's too: the room handed back once the devices are done)
             Impl* p;

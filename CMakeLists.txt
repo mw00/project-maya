@@ -203,6 +203,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_interleave_test.cpp")
   target_link_libraries(ds4_interleave_test PRIVATE strata_warnings)
   add_test(NAME ds4_interleave_test COMMAND ds4_interleave_test)
 endif()
+# DeepSeek's prompt-path and memory rules (src/ds4/ds4_prompt_mem.hpp; pure functions, CPU only, so a build without
+# the suite builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_prompt_mem_test.cpp")
+  add_executable(ds4_prompt_mem_test EXCLUDE_FROM_ALL tests/ds4_prompt_mem_test.cpp)
+  target_link_libraries(ds4_prompt_mem_test PRIVATE strata_warnings)
+  add_test(NAME ds4_prompt_mem_test COMMAND ds4_prompt_mem_test)
+endif()
 
 # ---- strata_plan ----------------------------------------------------------
 # Also header-only.  A "planner" that hides state would be one whose decision is not inspectable, and the

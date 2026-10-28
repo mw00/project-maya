@@ -590,6 +590,25 @@ that. It applies to prompts of ~3,700 new tokens or more, on one GPU (several GP
 | `MAYA_DS4_DSPARK_CUM` | 0.5 | DSpark drafting: a draft is verified only while the chance that it and every draft before it are kept (the product of their confidences) stays at least this, so a window whose later drafts would likely be lost is not verified whole. The same tokens; a Radeon 8065S with Maya-S decoded 12.04 -> 12.82 tok/s (+6.5%). `0` = off (only each draft's own floor, `--dspark-conf`); a request's `strata_tune` `spec_cum` sets it for that request |
 | `--suffix-draft` (maya-ds4) | 3 (on, NVIDIA and AMD) | prompt lookup beside DSpark: where the answer repeats earlier context (code edits, quoted text), a round verifies the tokens that followed that earlier occurrence (up to 15, past DSpark's block) instead of DSpark's drafts, when its first token agrees with DSpark's and the measured round times and acceptance say it commits more tokens a millisecond. The same tokens (greedy: identical; sampled: every token still the model's own draw). 9 GPUs (RTX 3090 + 8x RTX 5060 Ti), Mix-256G, `--tp 8`: whole-file edits 84 -> 111 and 96 -> 144 tok/s, ordinary answers unchanged. Without DSpark (`--dspark none` or `off`, or a round after DSpark's drafts all fell below their confidence) the lookup's drafts are weighed against a plain step the same way: EXL3 3.5 bpw, `--tp 8`, no DSpark, a whole-file edit 48 -> 166 tok/s, a JSON list 57 -> 154, prose unchanged. The value is the shortest match it proposes from; `--suffix-draft 0` turns it off; a request's `strata_tune` `suffix_draft` (0/1) sets it for that request. On AMD its long verify windows (up to 16 tokens) do not always give the same bits as the short ones, so a greedy answer can take another word at a near-tie (the same quality); a Strix Halo with DSpark: a whole-file edit 46 -> 58 tok/s, ordinary answers unchanged |
 
+## DeepSeek: which way a prompt goes, and its buffers
+
+With every layer's experts on the flow (a GGUF's, read in place), a prompt goes through the chunked pass or through
+windows of 16 tokens by a timing prediction: this run's measured speeds, what earlier prompts took and what the page
+cache holds. The two paths round differently, so the same prompt can take the other path in another run and give other
+logits. `MAYA_DS4_PROMPT_PICK=length` decides by the prompt's length alone (the chunked pass from 96 tokens, windows
+of 16 below), so a prompt always takes the same path, and the load no longer times the paths. It is opt-in until it is
+measured.
+
+A process's first cuBLAS products pay the library's start, and the first prompt through the chunked pass paid it. The
+engine now pays it at load, on a thread of its own, while the first person still types: the pass's kinds of product on
+zeros in the prompt buffers, which stay zeros, so the answers are the same. A prompt that comes first waits for it,
+never longer than its own first products would have taken; a picture waits for it too (it may borrow those buffers).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_PROMPT_PICK` | the timing pick | `length`: the chunked pass from 96 tokens, windows of 16 below; `length:N`: from N tokens (opt-in until measured) |
+| `MAYA_DS4_PROMPT_WARM` | on | `0`: the first chunked prompt pays the GEMM library's start, as before |
+
 ## DeepSeek: choosing the drafter GPU group (experimental)
 
 With several GPU groups, the DSpark drafter normally occupies the first group's lead GPU. Set
