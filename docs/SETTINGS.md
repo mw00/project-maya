@@ -459,7 +459,7 @@ within the run-to-run spread.
 | --- | --- | --- |
 | `MAYA_DS4_MULTI_ATTN` | on (1) | with `--parallel` above 1, a step's attention for all its requests' rows in one launch a step instead of one a request (the same bits); `0`: one a request, as before |
 
-#### A long prompt beside running requests (opt-in until measured)
+#### A long prompt beside running requests (opt-in: latency for throughput)
 
 By default a new request's prompt is read in one run while every other request waits: a 185K-token agent prompt stops
 the other conversation for as long as it takes to read. `MAYA_DS4_PROMPT_SHARE` reads it in parts while another
@@ -501,6 +501,15 @@ another conversation read and stepped between the parts) compares a prompt read 
 a single run, bit for bit, and gives both reads' Engram waits; the other conversation's tokens against its own alone
 are informational (the experts kept lent run on the CPU lane between the parts, whose rounding can change the last
 bits).
+
+Measured on an RTX 3090 + eight RTX 5060 Ti (`--tp 8` over a layer split, EXL3 3.5 bpw, experts copied into RAM,
+`--prefill-chunk 4096`): a request streaming a 1,000-token answer, a 24K-token prompt joining it 3 s in. Read in one run,
+the stream stops for 18.5 s and the prompt's first token comes after 18.7 s (both answers done after 36.7 s). With
+`MAYA_DS4_PROMPT_SHARE=0.5`: parts of one chunk (`MAYA_DS4_PROMPT_GAP_MS` 2500) - the longest stop 5.9 s, the prompt's
+first token after 49.0 s, the stream done after 56.4 s; parts of up to 8 s (`8000`) - 11.9 s, 38.5 s and 49.2 s. The
+Engram read-ahead took the devices' waits for Engram rows in those reads from 15.4 s to 3.1 s (8000: from 9.4 s); what a
+part still costs is mostly the layer split's pipeline filling and draining, about 1 s a part there. So it trades the
+long prompt's time (and the two answers' total) for the other conversation's longest stop: off by default.
 
 | Setting | Default | Effect |
 | --- | --- | --- |
