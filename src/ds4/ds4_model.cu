@@ -17883,6 +17883,8 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     return ok;
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
+int Model::prompt_chunk() const { return p_->chunk; }
+int Model::pipeline_stages() const { return std::max(1, (int) p_->groups.size()); }
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
 bool Model::cancelled() const { return p_->halted; }

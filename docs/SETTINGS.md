@@ -378,8 +378,18 @@ context shares the memory beside the model among the N conversations.
   between two runs of one request.
 - **A new request** takes the idle conversation its prompt continues. If none fits, it takes an empty one, else the
   least recently used, which first goes to a [kept conversation](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)
-  with `MAYA_DS4_SLOT_KEEP=1`. The others wait while its prompt is read. Its pictures are read by the engine between two
-  of their tokens: the vision tower borrows its room and gives it back before the prompt.
+  with `MAYA_DS4_SLOT_KEEP=1`. Its pictures are read by the engine between two of the others' tokens: the vision tower
+  borrows its room and gives it back before the prompt.
+- **Prompts are read a piece at a time.** The prompts being read take turns, a piece each - a chunk per pipeline stage,
+  so a split's GPUs all stay busy - and every running request writes a token between two pieces. A long prompt no
+  longer stops the others' answers for its whole read, and a prompt that fits in one piece goes ahead of the longer
+  reads, so a short question does not wait behind them. Each piece is a whole number of the uncut read's chunks, and
+  every answer is the one it gets alone (the same checks as above, with pieces). A prompt with pictures is read whole.
+  `MAYA_DS4_READ_ORDER=arrival` reads each prompt whole as it comes, the others waiting (as v1.1.34 did). On 3 GPUs
+  (2x RTX 5090 + RTX 3090, GSQ IQ2_XXS, about half the experts in RAM), `tools/ds4/agent_bench.py` - 4 agents x 8
+  turns, 4-12K-token first prompts, tool results of 150-2,000 tokens with one in ten of 5-20K: a turn's first token
+  5.23 s on the mean and 13.5 s at p95, against 6.14 and 29.1 s whole; a turn done and the wall the same (20.0 s,
+  190.5 s). Pieces of one chunk were slower (7.13 s, the wall 212 s): each piece fills the pipeline again.
 - **Several GPUs:** the layer split and the tensor-parallel groups take the batched step as they take one token; each
   step's new compressed rows go to the other groups' GPUs in one hand-off.
 - **What it gains:** real questions through the server, against the same questions one after another (each alone,
@@ -389,8 +399,8 @@ context shares the memory beside the model among the N conversations.
   against plain steps one after another: x1.58 for two and x2.21 for four; there the drafter alone is about as fast as
   two at once (x1.10 for two against one at a time with it), as the steps of several requests carry no drafts.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
-  longer wait in line for a whole answer - but a new prompt is read while the others wait, and their batched steps
-  carry no drafts, so on one GPU a whole turn can take longer than one at a time with the drafter.
+  longer wait in line for a whole answer, nor a whole prompt read - but their batched steps carry no drafts, so on one
+  GPU a whole turn can take longer than one at a time with the drafter.
 
 ## Drafting with DFlash2
 

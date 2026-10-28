@@ -164,6 +164,10 @@ public:
     /// Tokens a feed call takes at a time to use the chunked prompt path (all of a prompt: its chunks run as a
     /// pipeline; 16 without it).
     int feed_unit() const;
+    /// The chunked prompt path's chunk (0: windows), and the split's pipeline stages (its groups of GPUs, one after
+    /// another): a read of that many chunks keeps them all busy - --parallel's prompt pieces are that many chunks.
+    int prompt_chunk() const;
+    int pipeline_stages() const;
     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
     void set_progress(std::function<void(int64_t)> f);
     /// Asked while a run of chunks goes through the layers: true (a Stop) ends it early - one GPU after the layer it is
