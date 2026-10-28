@@ -64,6 +64,7 @@ template <> struct Ty<kIQ2_S> { static constexpr int B = 82, TAB = 2048, MIN = 0
 template <> struct Ty<kIQ3_XXS> { static constexpr int B = 98, TAB = 256, MIN = 0; };
 template <> struct Ty<kIQ3_S> { static constexpr int B = 110, TAB = 512, MIN = 0; };
 template <> struct Ty<kIQ4_XS> { static constexpr int B = 136, TAB = 4, MIN = 0; };
+template <> struct Ty<kIQ4_NL> { static constexpr int B = 18, TAB = 4, MIN = 0; };   // (32 values a block: d, 16 bytes)
 template <> struct Ty<kQ4_K> { static constexpr int B = 144, TAB = 0, MIN = 1; };
 template <> struct Ty<kQ5_K> { static constexpr int B = 176, TAB = 0, MIN = 1; };   // (a GGUF's dense weights in Q5_K)
 template <> struct Ty<kQ2_K> { static constexpr int B = 84, TAB = 0, MIN = 1; };
@@ -78,22 +79,23 @@ template <> struct Ty<kQ8_0> { static constexpr int B = 34, TAB = 0, MIN = 0; };
 // sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
-template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 ? 32 : 256;   // values a block
+template <int T> constexpr int kQK = T == kMXFP4 || T == kQ8_0 || T == kIQ4_NL ? 32 : 256;   // values a block
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_s) == 82 && sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
                   sizeof(block_q2_K) == 84 && sizeof(block_q3_K) == 110 && sizeof(block_iq1_s) == 50 &&
                   sizeof(block_iq1_m) == 56 && sizeof(block_iq2_xs) == 74 && sizeof(block_q5_K) == 176 &&
-                  sizeof(block_q6_K) == 210 && sizeof(block_q8_0) == 34,
+                  sizeof(block_q6_K) == 210 && sizeof(block_q8_0) == 34 && sizeof(block_iq4_nl) == 18,
               "ggml's block sizes");
 static_assert(IQ1S_DELTA == 0.125f && IQ1M_DELTA == 0.125f, "IQ1's delta: the codes 8 g +- 1 below");
 
 template <int T>
 __host__ __device__ __forceinline__ size_t row_bytes_t(int k) { return (size_t) (k / kQK<T>) * Ty<T>::B; }
 
-// the type's codebook into shared memory (u32 words; IQ4_XS: its 16 values, from bytes - an int8 table's alignment)
+// the type's codebook into shared memory (u32 words; IQ4_XS, IQ4_NL: their 16 values, from bytes - an int8 table's
+// alignment)
 template <int T>
 __device__ __forceinline__ void load_tab(uint32_t* tab) {
-    if constexpr (T == kIQ4_XS) {
+    if constexpr (T == kIQ4_XS || T == kIQ4_NL) {
         if (threadIdx.x < 4) {
             const uint8_t* kv = (const uint8_t*) kvalues_iq4nl + 4 * threadIdx.x;
             tab[threadIdx.x] = (uint32_t) kv[0] | (uint32_t) kv[1] << 8 | (uint32_t) kv[2] << 16 | (uint32_t) kv[3] << 24;
@@ -325,6 +327,17 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
         }
         s.s0 = s.s1 = ls - 32;
         s.d = h2f(b);
+    } else if constexpr (T == kIQ4_NL) {   // a block of 32 (b: block kb): d, then value j's code in byte j's low nibble
+        const uint8_t* qs = b + 2;           // (j < 16) or byte j - 16's high one; 18-byte blocks: 2-byte aligned
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int2 v = tab16(ld2(qs + 4 * t), tab);
+            s.q[t] = v.x;
+            s.q[4 + t] = v.y;
+        }
+        s.s0 = s.s1 = 1;
+        s.d = h2f(b);
+        (void) ib;
     } else if constexpr (T == kQ4_K) {
         int sc, m;
         q4k_scale(b + 4, ib, sc, m);
@@ -485,7 +498,7 @@ __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int
 template <int T>
 __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, int p, const uint32_t* tab, float* w) {
     const int ib = kb & 7;
-    const uint8_t* b = row + (size_t) (kb >> 3) * Ty<T>::B;
+    const uint8_t* b = row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B;
     if constexpr (T == kIQ2_XXS) {
         const uint8_t* q = b + 2 + 8 * ib;
         const uint32_t a1 = ld2(q + 4);
@@ -548,6 +561,13 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
         const int8_t* kv = (const int8_t*) tab;
 #pragma unroll
         for (int j = 0; j < 8; ++j) w[j] = dl * (float) kv[p < 2 ? qs[j] & 15 : qs[j] >> 4];
+    } else if constexpr (T == kIQ4_NL) {   // (block kb: 32 values, as IQ4_XS's sub-block)
+        const float dl = h2f(b);
+        const uint8_t* qs = b + 2 + 8 * (p & 1);
+        const int8_t* kv = (const int8_t*) tab;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) w[j] = dl * (float) kv[p < 2 ? qs[j] & 15 : qs[j] >> 4];
+        (void) ib;
     } else if constexpr (T == kQ4_K) {
         int sc, m;
         q4k_scale(b + 4, ib, sc, m);
@@ -1258,6 +1278,7 @@ bool tc_ok() {
         case kQ3_K: F(kQ3_K); break;       \
         case kIQ1_S: F(kIQ1_S); break;     \
         case kIQ1_M: F(kIQ1_M); break;     \
+        case kIQ4_NL: F(kIQ4_NL); break;   \
         default: return false;       \
     }
 // ... and the dense matrices' types beside them (the GEMVs, the FP16 rows, decode_values)
@@ -1391,6 +1412,10 @@ void launch_light(const SetArgs& a, const LightBuf& b, cudaStream_t s) {
 }
 // a set's gate and up of different types (SetArgs::tu, kActOai only): two passes, the gate's sums in graw between them
 bool split_gu(const SetArgs& a) { return a.act == kActOai && a.tu != 0 && a.tu != a.tg; }
+// the gate / up's inputs (the up's own type too) and the down's in whole blocks of their types (256 values; IQ4_NL's 32)
+bool k_whole(int n_embd, int n_ff, int tg, int tu, int td) {
+    return n_embd % block_values(tg) == 0 && (tu == 0 || n_embd % block_values(tu) == 0) && n_ff % block_values(td) == 0;
+}
 bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     const int K = gu ? a.n_embd : a.n_ff;
     if (gu && a.act != kActSwiglu && (a.tg == kMXFP4 || (split_gu(a) && a.graw == nullptr))) return false;
@@ -1463,6 +1488,7 @@ int block_bytes(int t) {
         case kQ3_K: return Ty<kQ3_K>::B;
         case kIQ1_S: return Ty<kIQ1_S>::B;
         case kIQ1_M: return Ty<kIQ1_M>::B;
+        case kIQ4_NL: return Ty<kIQ4_NL>::B;
         default: return 0;
     }
 }
@@ -1483,12 +1509,13 @@ const char* name(int t) {
         case kQ3_K: return "Q3_K";
         case kIQ1_S: return "IQ1_S";
         case kIQ1_M: return "IQ1_M";
+        case kIQ4_NL: return "IQ4_NL";
         default: return "?";
     }
 }
 
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
-    if (a.n_embd % 256 != 0 || a.n_ff % (kWarps * kGuRW) != 0) return false;
+    if (!k_whole(a.n_embd, 0, a.tg, a.tu, 0) || a.n_ff % (kWarps * kGuRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_ff / (kWarps * kGuRW)), (unsigned) groups);
     if (a.act != kActSwiglu) {   // MiniMax's swigluoai: one pass, or (gate and up of different types) two
         if (a.tu == 0 || a.tu == a.tg) {
@@ -1512,7 +1539,7 @@ bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s) {
 }
 
 bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
-    if (a.n_ff % 256 != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
+    if (a.n_ff % block_values(a.td) != 0 || a.n_embd % (kWarps * kDnRW) != 0) return false;
     const dim3 grid((unsigned) (a.n_embd / (kWarps * kDnRW)), (unsigned) groups);
 #define DN_(T) dn_ne<T>(a, grid, ne_max, s)
     DS4_IQ_SWITCH(a.td, DN_)
@@ -1520,12 +1547,12 @@ bool down(const Args& a, int groups, int ne_max, cudaStream_t s) {
     return true;
 }
 
-bool light_gate_up(const SetArgs& a, cudaStream_t s) {
-    if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+bool light_gate_up(const SetArgs& a, cudaStream_t s) {   // (both roles' blocks whole, as for the down)
+    if (a.n_exp > kLightMaxExp || !light_on() || !k_whole(a.n_embd, a.n_ff, a.tg, a.tu, a.td)) return false;
     return light_set(a, true, s);
 }
 bool light_down(const SetArgs& a, cudaStream_t s) {
-    if (a.n_exp > kLightMaxExp || !light_on() || a.n_embd % 256 != 0 || a.n_ff % 256 != 0) return false;
+    if (a.n_exp > kLightMaxExp || !light_on() || !k_whole(a.n_embd, a.n_ff, a.tg, a.tu, a.td)) return false;
     return light_set(a, false, s);
 }
 
@@ -1799,7 +1826,7 @@ bool set_gate_up(const SetArgs& a, cudaStream_t s) {
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
     if (mmq_wanted(a, true) && mmq_gate_up(a, s)) return true;
 #endif
-    if (a.n_embd % 256 != 0 || a.n_ff % BN != 0) return false;
+    if (!k_whole(a.n_embd, 0, a.tg, a.tu, 0) || a.n_ff % BN != 0) return false;
     if (split_gu(a) && a.graw == nullptr) return false;
     SetArgs t = a;
     if (light_gate_up(a, s)) {   // the experts of a few rows; the tiles the others
@@ -1832,7 +1859,7 @@ bool set_down(const SetArgs& a, cudaStream_t s) {
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)
     if (mmq_wanted(a, false) && mmq_down(a, s)) return true;
 #endif
-    if (a.n_ff % 256 != 0 || a.n_embd % BN != 0) return false;
+    if (a.n_ff % block_values(a.td) != 0 || a.n_embd % BN != 0) return false;
     SetArgs t = a;
     if (light_down(a, s)) {
         if (a.max_rows <= kLightRows) return true;

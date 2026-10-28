@@ -1,6 +1,6 @@
 // src/ds4/ds4_iq.cuh - a GGUF's routed experts in ggml's low-bit block types on the device for maya-ds4: the i-quants
 // IQ1_S, IQ1_M, IQ2_XXS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS and the K-quants Q2_K, Q3_K, Q4_K (256 values a block, ggml's
-// layouts: ggml-common.h, llama.cpp MIT); Q5_K and Q6_K for a GGUF's dense matrices.  ds4_gguf.cu sends an expert
+// layouts: ggml-common.h, llama.cpp MIT), IQ4_NL (32 values a block); Q5_K and Q6_K for a GGUF's dense matrices.  ds4_gguf.cu sends an expert
 // layer's gate / up, or its down, here when that role is not MXFP4 (x3::ExpertLayout::fmt kFmtMXFP4 with K[r] = role
 // r's ggml type; K[r] == kTypeMXFP4: ds4_gguf.cu's own kernels).
 //
@@ -20,8 +20,8 @@
 namespace strata::ds4::gguf::iq {
 
 // ggml type ids
-constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19, kIQ3_S = 21,
-              kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
+constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kQ5_K = 13, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19,
+              kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
 // the dense matrices' types (a GGUF's attention, shared experts, output head - maya-mm3's MiniMax quants): the GEMVs
 // (mv), the FP16 rows (f16_rows) and decode_values only - not the routed experts' kernels
 constexpr int kQ8_0 = 8, kQ6_K = 14;
@@ -37,8 +37,8 @@ constexpr float kOaiAlpha = 1.702f;
 bool supported(int type);
 /// Whether the GEMVs and FP16 rows take it (the experts' types and the dense ones: Q8_0, Q6_K).
 bool mv_supported(int type);
-/// Values a block of the type (32: Q8_0; 256: the others).
-inline int block_values(int type) { return type == kQ8_0 ? 32 : 256; }
+/// Values a block of the type (32: Q8_0, IQ4_NL; 256: the others).
+inline int block_values(int type) { return type == kQ8_0 || type == kIQ4_NL ? 32 : 256; }
 /// Bytes of a block of the type (0: not one of these).
 int block_bytes(int type);
 /// Bytes of a row of k values (k a multiple of the type's block).

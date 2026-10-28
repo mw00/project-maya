@@ -2,8 +2,9 @@
 // double-precision reference of random BF16 matrices and MXFP4 experts: the GEMVs (BF16 / MXFP4, 1..16 activations,
 // aligned or not), the token experts (gate / up / swiglu / down / combine, experts off the device, the CPU part, the
 // shared expert), a window's grouped experts (bit for bit the token path's), the prompt path's expert sets and the CPU
-// lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q6_K; their decode equal to ggml's dequantize_row_* on
-// random blocks), and layers that put MXFP4 beside a low-bit role; the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
+// lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q6_K, IQ4_NL; their decode equal to ggml's dequantize_row_*
+// on random blocks), and layers that put MXFP4 beside a low-bit role; the PCIe lane's streamed experts (bit for bit
+// the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
 // ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ar <device> <device> [rows]
 // (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times) | --trims (the decode trims alone:
@@ -671,8 +672,9 @@ double q_dot(int type, const uint8_t* row, int k, const float* x) {
 const char* tn(int t) { return gg::type_name(t); }
 const int kQTypes[] = {gg::iq::kIQ2_XXS, gg::iq::kIQ2_S, gg::iq::kIQ3_XXS, gg::iq::kIQ3_S, gg::iq::kIQ4_XS,
                        gg::iq::kQ2_K,    gg::iq::kQ3_K, gg::iq::kQ4_K,    gg::iq::kIQ1_S, gg::iq::kIQ1_M,
-                       gg::iq::kIQ2_XS,  gg::iq::kQ5_K,  gg::iq::kQ6_K};   // (the last three: dense weights / other
-                                                                           //  GGUFs' experts)
+                       gg::iq::kIQ4_NL,  gg::iq::kIQ2_XS,  gg::iq::kQ5_K,  gg::iq::kQ6_K};   // (the last three: dense
+                                                                                             //  weights / other GGUFs'
+                                                                                             //  experts)
 
 // n rows of type t (k values each) through the decode kernels and the prompt path's f16_rows against ggml's own
 // dequantize_row_* values: the kernels' F32 values equal, f16_rows' halves equal to ggml's rounded to F16
@@ -1124,9 +1126,20 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 yp[i] = yo[i].data();
             }
             gg::iq_cpu_down(fm, E.mat(e, 2), hp, n, yp, 0, D);
-            // the reference on the Q8_K values the CPU took (block_q8_K: F32 d, int8 qs[256], int16 bsums[16])
-            auto q8k = [](const std::vector<uint8_t>& q, int kk) {
+            // the reference on the activation values the CPU took: its type's vec_dot_type - Q8_K (block_q8_K: F32 d,
+            // int8 qs[256], int16 bsums[16]) or IQ4_NL's Q8_0 (F16 d, int8 qs[32])
+            auto act_vals = [](int at, const std::vector<uint8_t>& q, int kk) {
                 std::vector<float> v(kk);
+                if (at == GGML_TYPE_Q8_0) {
+                    for (int b = 0; b < kk / 32; ++b) {
+                        const uint8_t* p = q.data() + (size_t) b * 34;
+                        __half hd;
+                        std::memcpy(&hd, p, 2);
+                        const float d = __half2float(hd);
+                        for (int j = 0; j < 32; ++j) v[b * 32 + j] = d * (float) (int8_t) p[2 + j];
+                    }
+                    return v;
+                }
                 for (int b = 0; b < kk / 256; ++b) {
                     const uint8_t* p = q.data() + (size_t) b * 292;
                     float d;
@@ -1135,11 +1148,12 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 }
                 return v;
             };
-            const bool k8 = fm.gu_act == GGML_TYPE_Q8_K && fm.d_act == GGML_TYPE_Q8_K;
+            auto known = [](int at) { return at == GGML_TYPE_Q8_K || at == GGML_TYPE_Q8_0; };
+            const bool k8 = known(fm.gu_act) && known(fm.d_act);
             std::vector<float> got_h, got_y;
             std::vector<double> want_h, want_y;
             for (int i = 0; i < n && k8; ++i) {
-                const std::vector<float> xa = q8k(aq[i], D), ha = q8k(hq[i], F);
+                const std::vector<float> xa = act_vals(fm.gu_act, aq[i], D), ha = act_vals(fm.d_act, hq[i], F);
                 for (int f = 0; f < F; ++f) {
                     got_h.push_back(ff[i][f]);
                     want_h.push_back(swiglu(E.dot(e, 0, f, xa.data()), E.dot(e, 1, f, xa.data()), lim));
@@ -1153,8 +1167,11 @@ void test_experts_q(int D, int F, int tg, int td, cudaStream_t s) {
                 std::printf("%-44s FAIL  activation types %d / %d\n", "  CPU lane", fm.gu_act, fm.d_act);
                 ++g_fail;
             } else {
-                expect("  CPU lane gate/up (Q8_K)", got_h.data(), want_h.data(), want_h.size(), 1e-4);
-                expect("  CPU lane down (Q8_K)", got_y.data(), want_y.data(), want_y.size(), 1e-4);
+                char lw[64];
+                std::snprintf(lw, sizeof lw, "  CPU lane gate/up (%s)", ggml_type_name((ggml_type) fm.gu_act));
+                expect(lw, got_h.data(), want_h.data(), want_h.size(), 1e-4);
+                std::snprintf(lw, sizeof lw, "  CPU lane down (%s)", ggml_type_name((ggml_type) fm.d_act));
+                expect(lw, got_y.data(), want_y.data(), want_y.size(), 1e-4);
             }
         }
     }
@@ -1170,7 +1187,9 @@ const std::pair<int, int> kQPairs[] = {
     {gg::iq::kQ3_K, gg::iq::kQ2_K},       {gg::iq::kIQ3_S, gg::iq::kIQ2_XXS}, {gg::iq::kIQ3_S, gg::iq::kIQ2_S},
     {gg::iq::kIQ1_S, gg::iq::kIQ1_M},     {gg::iq::kIQ1_M, gg::iq::kIQ1_S},   {gg::iq::kIQ1_M, gg::iq::kIQ2_XXS},
     // (MXFP4 beside a low-bit role: orcarouter's Mix-256G - IQ3 gate / ups over MXFP4 downs, and the other way round)
-    {gg::iq::kIQ3_XXS, gg::kTypeMXFP4},   {gg::kTypeMXFP4, gg::iq::kIQ3_S},   {gg::iq::kIQ2_S, gg::kTypeMXFP4}};
+    {gg::iq::kIQ3_XXS, gg::kTypeMXFP4},   {gg::kTypeMXFP4, gg::iq::kIQ3_S},   {gg::iq::kIQ2_S, gg::kTypeMXFP4},
+    // (IQ4_NL: blocks of 32 values - alone, and beside the 256-value types in either role)
+    {gg::iq::kIQ4_NL, gg::iq::kIQ4_NL},   {gg::iq::kIQ4_NL, gg::iq::kIQ2_S},   {gg::iq::kIQ1_M, gg::iq::kIQ4_NL}};
 constexpr int kQPairIQ1 = 9;   // (the first IQ1 pair)
 
 // ---------------------------------------------------------------- one layer's outputs, compared between runs

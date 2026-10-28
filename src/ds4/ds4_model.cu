@@ -2223,16 +2223,17 @@ struct Model::Impl {
         const bool q8 = t.dtype == "Q8_0";
         // a low-bit dense matrix (a GGUF's Q5_K, say): ds4_iq's GEMV for a token, its FP16 rows for a prompt
         const int lb = q8 || t.dtype == "BF16" ? -1 : gg_type_of(t.dtype);
-        const int per = q8 ? 32 : lb > 0 ? 256 : 1;
+        const int lbv = lb > 0 ? gg::iq::block_values(lb) : 0;   // (its block: 256 values, IQ4_NL's 32)
+        const int per = q8 ? 32 : lb > 0 ? lbv : 1;
         if (t.shape.size() != 2 || t.shape[1] % per != 0 || lb == gg::kTypeMXFP4) {
             err = pre + ": a " + t.dtype + " tensor that is not a matrix";
             return false;
         }
         int n = (int) t.shape[0], k = (int) t.shape[1];
         // a row's bytes, and the bytes of v of its values (BF16: 2 each; Q8_0: 34 every 32; a low-bit type: its block's
-        // every 256)
+        // every lbv)
         auto bytes_of = [&](size_t v) {
-            return q8 ? v / 32 * gg::kQ8Bytes : lb > 0 ? v / 256 * (size_t) gg::iq::block_bytes(lb) : v * 2;
+            return q8 ? v / 32 * gg::kQ8Bytes : lb > 0 ? v / (size_t) lbv * (size_t) gg::iq::block_bytes(lb) : v * 2;
         };
         std::vector<uint8_t> w((size_t) n * bytes_of((size_t) k));
         if (t.bytes != w.size() || !pk.read(t, w.data())) {
@@ -2242,7 +2243,7 @@ struct Model::Impl {
         if (np > 1) {
             const int whole = cols ? n : k;
             int wd = r0 >= 0 ? rn : whole / np, w0 = r0 >= 0 ? r0 : part * wd;
-            const int q = q8 ? 32 : lb > 0 && !cols ? 256 : 8;   // (a low-bit type's inputs: whole blocks)
+            const int q = q8 ? 32 : lb > 0 && !cols ? lbv : 8;   // (a low-bit type's inputs: whole blocks)
             // outputs that do not split evenly (a 129280-column head over 3): split128's shares, as head_cols takes them
             const bool uneven = r0 < 0 && cols && whole % np != 0 && whole % 128 == 0 && whole / 128 >= np;
             if (uneven)
@@ -2593,7 +2594,7 @@ struct Model::Impl {
     // (the other block types: lay.fmt stays kFmtMXFP4 - read in place as these - and lay.gg_type[r] is role r's ggml
     // type)
     static int gg_type_of(const std::string& dtype) {
-        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 17, 18, 19, 21, 22, 23, 29})
+        for (int t : {gg::kTypeMXFP4, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29})
             if (dtype == gg::type_name(t)) return t;
         return -1;
     }

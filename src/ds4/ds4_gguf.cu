@@ -1430,8 +1430,9 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     ia.limit = limit;
     ia.tg = expert_type(lay, 0);
     ia.td = expert_type(lay, 2);
-    if (gu ? ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || n_embd % 256 != 0
-           : !iq::supported(ia.td) || n_ff % 256 != 0) {
+    // (a row of the role's inputs in whole blocks: 256 values, IQ4_NL's 32)
+    if (gu ? ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || n_embd % iq::block_values(ia.tg) != 0
+           : !iq::supported(ia.td) || n_ff % iq::block_values(ia.td) != 0) {
         std::fprintf(stderr, "ds4 gguf %s: expert types %s / %s / %s (n_embd %d, n_ff %d) not covered\n", who,
                      type_name(expert_type(lay, 0)), type_name(expert_type(lay, 1)), type_name(expert_type(lay, 2)),
                      n_embd, n_ff);

@@ -757,6 +757,14 @@ measured choice as before. The log says `ds4: CPU lane IQ1_S rows: ours without 
 | --- | --- | --- |
 | `DS4_IQ1_PDEP` | `0` on AMD family 17h / Hygon, else `1` | `0`: the rows without `pdep` on any CPU (tests: `ds4_iq1_rows_test` checks them against ggml-cpu); `1`: the measured choice (ggml-cpu's dot for a single token) |
 
+## DeepSeek: IQ4_NL experts
+
+A pack whose experts are IQ4_NL (ggml type 20, blocks of 32 values) loads: the GPU kernels take them on every path
+(token, window, prompt), and the CPU lane reads them through ggml-cpu's rows. The CPU lane rounds their activations to
+Q8_0 (ggml's pairing for IQ4_NL), the GPU to Q8_K as for the other low-bit types, so such an expert's sums differ a
+little more between the two lanes than the other types' do. A dense matrix in IQ4_NL takes ds4_iq's GEMV as the other
+low-bit dense types do.
+
 ## DeepSeek: AVX-512 rows for IQ2_XS and IQ1_M experts
 
 On a CPU with AVX-512 (F, BW, VL, DQ) and BMI2 - Intel Xeons since Skylake-SP, AMD Zen 4 and later - the CPU lane has
