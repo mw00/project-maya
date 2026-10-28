@@ -3920,7 +3920,7 @@ struct Model::Impl {
         // --parallel: the other conversations' rings, partial groups and KV (before the experts: they take what is left)
         if (!alloc_seqs(err)) return false;
         // the chunked prompt path's buffers (before the experts: they take what is left)
-        if (chunk > 0 && !alloc_chunks(err)) return false;
+        if (chunk > 0) alloc_chunks_fit();
         // the CPU lane's experts read in place (decided above): how much of them the load reads ahead, from what VRAM
         // now leaves over
         if (file_experts) {
@@ -4419,6 +4419,68 @@ struct Model::Impl {
         c.w16_elems = (w16_mb != nullptr ? (size_t) std::max(1, std::atoi(w16_mb)) : 2 * auto_mb) << 19;
     }
 
+    // the chunk buffers, or a smaller chunk where they do not fit: what one try allocated given back, the chunk halved
+    // (whole 16s, down to 256 rows - chunk_fallback), then windows of 16 with a line saying so - where the load failed
+    // before (a borrowing device's own buffers are mostly of a fixed size: halving helps it little, and the tries go
+    // on down to windows).  The buffers sized by the chunk before this (the hand-offs' rows, the Engram rows' slots,
+    // the drafter's taps) stay as large as they were: a smaller chunk fits them
+    void alloc_chunks_fit() {
+        struct Mark {
+            size_t allocs, scratch, prompt;
+        };
+        std::vector<Mark> m0;
+        for (const Dev& d : devs) m0.push_back({d.allocs.size(), d.scratch, d.prompt});
+        const size_t h0 = host_allocs.size();
+        while (chunk > 0) {
+            std::string aerr;
+            if (alloc_chunks(aerr)) return;
+            for (size_t di = 0; di < devs.size(); ++di) {   // (what the try made, given back)
+                Dev& d = devs[di];
+                cudaSetDevice(d.id);
+                cudaDeviceSynchronize();
+                (void) cudaGetLastError();
+                if (di < chunks.size() && chunks[di] != nullptr) {
+                    Chunk& c = *chunks[di];
+                    if (c.blas != nullptr) cublasDestroy(c.blas);
+                    for (cudaStream_t s : {c.cs, c.ar_aux.s2, c.ar_s, c.ar_aux2.s2})
+                        if (s != nullptr) cudaStreamDestroy(s);
+                    std::vector<cudaEvent_t> evs = {c.ar_go, c.ar_done};
+                    for (int i = 0; i < Chunk::kParts; ++i) evs.push_back(c.filled[i]), evs.push_back(c.freed[i]);
+                    for (int sl = 0; sl < 2; ++sl) evs.push_back(c.emb_ev[sl]), evs.push_back(c.eg_ev[sl]);
+                    for (cudaEvent_t e : c.ar_aux.ev) evs.push_back(e);
+                    for (cudaEvent_t e : c.ar_aux2.ev) evs.push_back(e);
+                    for (cudaEvent_t e : evs)
+                        if (e != nullptr) cudaEventDestroy(e);
+                }
+                while (d.allocs.size() > m0[di].allocs) {
+                    cudaFree(d.allocs.back());
+                    d.allocs.pop_back();
+                }
+                d.scratch = m0[di].scratch;
+                d.prompt = m0[di].prompt;
+                (void) cudaGetLastError();
+            }
+            while (host_allocs.size() > h0) {
+                cudaFreeHost(host_allocs.back());
+                host_allocs.pop_back();
+            }
+            (void) cudaGetLastError();
+            chunks.clear();
+            const int was = chunk;
+            chunk = chunk_fallback(chunk);
+            if (chunk > 0) {
+                std::fprintf(stderr, "ds4: the prompt path's buffers for chunks of %d tokens do not fit (%s): chunks of %d\n",
+                             was, aerr.c_str(), chunk);
+                continue;
+            }
+            prompt_par = false;
+            recent_n = std::max(0, (int) env_f("DS4_RECENT", 0.0f));   // (as a load without chunks sets it)
+            std::fprintf(stderr, "ds4: the prompt path's buffers do not fit (%s): prompts run in windows of %d tokens "
+                                 "(slower on long prompts; more free GPU memory or a lower --reserve-mib brings the "
+                                 "chunks back)\n", aerr.c_str(), kWin);
+        }
+    }
+
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
         const int D = g.dim;
@@ -4497,7 +4559,8 @@ struct Model::Impl {
                 CK(cudaEventCreateWithFlags(&c.filled[i], cudaEventDisableTiming));
                 CK(cudaEventCreateWithFlags(&c.freed[i], cudaEventDisableTiming));
             }
-            if (cublasCreate(&c.blas) != CUBLAS_STATUS_SUCCESS || cublasSetStream(c.blas, d.st) != CUBLAS_STATUS_SUCCESS) {
+            if (cublasCreate(&c.blas) != CUBLAS_STATUS_SUCCESS) c.blas = nullptr;   // (alloc_chunks_fit destroys a made one)
+            if (c.blas == nullptr || cublasSetStream(c.blas, d.st) != CUBLAS_STATUS_SUCCESS) {
                 err = "cuBLAS on CUDA" + std::to_string(d.id);
                 return false;
             }

@@ -38,6 +38,16 @@ int main() {
             CHECK(d::prompt_by_length(8192, m));
         }
     }
+    {   // the chunk fallback: halves in whole 16s down to 256, then windows (0)
+        CHECK(d::chunk_fallback(16384) == 8192);
+        CHECK(d::chunk_fallback(4096) == 2048);
+        CHECK(d::chunk_fallback(1000) == 496);
+        CHECK(d::chunk_fallback(512) == 256);
+        CHECK(d::chunk_fallback(511) == 0 && d::chunk_fallback(256) == 0 && d::chunk_fallback(0) == 0);
+        int c = 16384, tries = 0;
+        while (c > 0) c = d::chunk_fallback(c), ++tries;
+        CHECK(tries == 7);   // 8192 4096 2048 1024 512 256 0
+    }
     if (fails == 0) std::printf("ds4 prompt / memory rules: ok\n");
     return fails == 0 ? 0 : 1;
 }

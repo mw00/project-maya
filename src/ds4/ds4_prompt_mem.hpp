@@ -30,4 +30,11 @@ inline int prompt_pick_length(const char* v) {
 }
 inline bool prompt_by_length(int tokens, int flow_min) { return tokens >= flow_min; }
 
+// ---- the chunk buffers that do not fit: the next chunk to try - half (whole 16s), and 0 (windows of 16) below 256
+constexpr int kChunkFloor = 256;
+inline int chunk_fallback(int chunk) {
+    const int h = chunk / 2 / 16 * 16;
+    return h >= kChunkFloor ? h : 0;
+}
+
 }  // namespace strata::ds4

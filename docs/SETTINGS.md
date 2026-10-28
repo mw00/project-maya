@@ -604,6 +604,9 @@ engine now pays it at load, on a thread of its own, while the first person still
 zeros in the prompt buffers, which stay zeros, so the answers are the same. A prompt that comes first waits for it,
 never longer than its own first products would have taken; a picture waits for it too (it may borrow those buffers).
 
+Where the chunk's buffers do not fit the GPUs, the load no longer fails: the chunk is halved (down to 256 tokens), and
+below that prompts run in windows of 16. The log says which.
+
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_PROMPT_PICK` | the timing pick | `length`: the chunked pass from 96 tokens, windows of 16 below; `length:N`: from N tokens (opt-in until measured) |
