@@ -761,6 +761,16 @@ same. Not on a wave64 build (gfx908).
 | `MAYA_DS4_HC_FUSE` | off (0) | `1`: a decoded token's HC split and norm in one launch, the attention input rounded to int8 there; `2`: a verify window's rows too, and the FFN input rounded for the shared expert (the same bits, checked at load) |
 | `MAYA_DS4_ROUTE_FUSE` | off (0) | `1`: a decoded token's router stage on a group's lead in two launches instead of four; `2`: a verify window's rows too (the same bits, checked at load; one layer of lookahead, `DS4_AHEAD` 1, the default) |
 
+The HC mix and split (`hc_mix`, then a one-warp `hc_split`) run twice a layer. Where they are not fused as above,
+one launch now does both: the block that finishes a token's last mix runs that token's split, with the same code, so
+the values are the same. On NVIDIA they run on a second stream beside the attention and the MoE, off the layer's path,
+so there the default keeps the two launches (`2` fuses them there too; not measured yet). On AMD, and with
+`DS4_HC_STREAM=0`, they run on the layer's own stream and take the one launch.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HC_MIX_SPLIT` | `1` | `1`: the HC mix and split in one launch where they run on the layer's own stream (AMD, `DS4_HC_STREAM=0`); `2`: on NVIDIA's side stream too; `0`: two launches everywhere, as before (the same bits every way) |
+
 `MAYA_DS4_DECODE_TRIM=<bits>` takes four more small steps out of a decoded window, each checked at load the same way:
 `1` the shared expert's swiglu rounds its output to int8 for its down GEMV, `2` q's norm rounds its output for wq_b,
 `4` a verify window's compressor snapshot (four copies) and a ratio-1 layer's latent copy one kernel each, `8` the

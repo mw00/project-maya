@@ -310,11 +310,10 @@ __global__ void __launch_bounds__(kThreads) finish_kernel(float* x, int len, lon
 }
 
 // ---------------------------------------------------------------- hyper-connections
-__global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restrict__ h, const float* __restrict__ fn,
-                                                          int hcdim, float eps, float* __restrict__ mixes) {
-    pdl_wait();
-    pdl_trigger();
-    const int m = blockIdx.x, t = blockIdx.y;
+// mix m of token t (a block of kThreads; every thread gets it): h_t . fn[m] times rsqrt(mean(h_t^2) + eps) -
+// hc_mix_kernel's and hc_mix_split_kernel's code
+__device__ __forceinline__ float hc_mix_value(const float* __restrict__ h, const float* __restrict__ fn, int hcdim,
+                                              float eps, int m, int t) {
     const float* w = fn + (size_t) m * hcdim;
     const float* x = h + (size_t) t * hcdim;
     float acc = 0.0f, ss = 0.0f;
@@ -326,20 +325,22 @@ __global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restric
     }
     acc = block_sum(acc);
     ss = block_sum(ss);
-    if (threadIdx.x == 0) mixes[(size_t) t * 32 + m] = acc * rsqrtf(ss / (float) hcdim + eps);
+    return acc * rsqrtf(ss / (float) hcdim + eps);
 }
-
-// a warp a token: lane j * hc + k holds comb[j][k] (hc <= 4: lanes 0..15; wider streams fall back to lane 0 alone)
-__global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
-                                const float* __restrict__ base, int hc, int iters, float eps, float* pre, float* post,
-                                float* comb) {
+__global__ void __launch_bounds__(kThreads) hc_mix_kernel(const float* __restrict__ h, const float* __restrict__ fn,
+                                                          int hcdim, float eps, float* __restrict__ mixes) {
     pdl_wait();
     pdl_trigger();
-    const int t = blockIdx.x, lane = threadIdx.x;
-    const float* mx = mixes + (size_t) t * 32;
-    pre += (size_t) t * 8;
-    post += (size_t) t * 8;
-    comb += (size_t) t * 64;
+    const int m = blockIdx.x, t = blockIdx.y;
+    const float v = hc_mix_value(h, fn, hcdim, eps, m, t);
+    if (threadIdx.x == 0) mixes[(size_t) t * 32 + m] = v;
+}
+
+// a warp a token: lane j * hc + k holds comb[j][k] (hc <= 4: lanes 0..15; wider streams fall back to lane 0 alone) -
+// hc_split_kernel's and hc_mix_split_kernel's code: mx the token's mixes, pre / post / comb its rows
+__device__ __forceinline__ void hc_split_row(const float* mx, const float* __restrict__ scale,
+                                             const float* __restrict__ base, int hc, int iters, float eps, float* pre,
+                                             float* post, float* comb, int lane) {
     if (lane < hc) {
         pre[lane] = 1.0f / (1.0f + expf(-(mx[lane] * scale[0] + base[lane]))) + eps;
         post[lane] = 2.0f / (1.0f + expf(-(mx[hc + lane] * scale[1] + base[hc + lane])));
@@ -403,6 +404,46 @@ __global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __
     }
     for (int j = 0; j < hc; ++j)
         for (int k = 0; k < hc; ++k) comb[j * hc + k] = c[j][k];
+}
+__global__ void hc_split_kernel(const float* __restrict__ mixes, const float* __restrict__ scale,
+                                const float* __restrict__ base, int hc, int iters, float eps, float* pre, float* post,
+                                float* comb) {
+    pdl_wait();
+    pdl_trigger();
+    const size_t t = blockIdx.x;
+    hc_split_row(mixes + t * 32, scale, base, hc, iters, eps, pre + t * 8, post + t * 8, comb + t * 64, threadIdx.x);
+}
+
+// (DS4_HC_MIX_SPLIT) hc_mix_kernel and hc_split_kernel in one launch: each block is hc_mix_kernel's (mix m of token
+// t, the same code); the token's block that finishes last (a count per token, set back to 0 by that block) then runs
+// hc_split_kernel's warp on the token's mixes as the blocks stored them - read past the L1 after a fence - so the same
+// values as the two launches, without the second launch and its gap
+__global__ void __launch_bounds__(kThreads) hc_mix_split_kernel(const float* __restrict__ h,
+                                                                const float* __restrict__ fn, int hcdim, float eps,
+                                                                float* mixes, unsigned* cnt,
+                                                                const float* __restrict__ scale,
+                                                                const float* __restrict__ base, int hc, int iters,
+                                                                float hc_eps, float* pre, float* post, float* comb) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ unsigned last;
+    __shared__ float mx[32];
+    const int m = blockIdx.x, t = blockIdx.y;
+    const float v = hc_mix_value(h, fn, hcdim, eps, m, t);
+    if (threadIdx.x == 0) {
+        mixes[(size_t) t * 32 + m] = v;
+        __threadfence();   // (the mix stored before the count says so)
+        last = atomicAdd(cnt + t, 1u) == gridDim.x - 1 ? 1u : 0u;
+    }
+    __syncthreads();
+    if (last == 0u || threadIdx.x >= 32) return;
+    __threadfence();
+    const int lane = threadIdx.x;
+    mx[lane] = lane < (int) gridDim.x ? ld_fresh(mixes + (size_t) t * 32 + lane) : 0.0f;
+    __syncwarp();
+    if (lane == 0) cnt[t] = 0u;   // (every block of the token has counted: the next launch finds 0)
+    hc_split_row(mx, scale, base, hc, iters, hc_eps, pre + (size_t) t * 8, post + (size_t) t * 8,
+                 comb + (size_t) t * 64, lane);
 }
 
 __global__ void __launch_bounds__(1024) hc_pre_norm_kernel(const float* __restrict__ h, const float* __restrict__ mix,
@@ -3416,6 +3457,12 @@ void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float 
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
               float* pre, float* post, float* comb, cudaStream_t s) {
     pdl_launch(hc_split_kernel, T, 32, 0, s, mixes, scale, base, hc, iters, hc_eps, pre, post, comb);
+}
+void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, unsigned* cnt,
+                  const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre, float* post,
+                  float* comb, cudaStream_t s) {
+    pdl_launch(hc_mix_split_kernel, dim3(n_mix, T), kThreads, 0, s, h, fn, hcdim, eps, mixes, cnt, scale, base, hc,
+               iters, hc_eps, pre, post, comb);
 }
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  cudaStream_t s) {

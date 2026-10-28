@@ -2325,8 +2325,65 @@ void test_q8_share(cudaStream_t s) {
     cudaFree(d0), cudaFree(d1);
 }
 
+// hc_mix + hc_split (two launches) against hc_mix_split (one: DS4_HC_MIX_SPLIT): 4 streams (the model's, the split's
+// warp form) and 2 (its lane-0 form), 1 / 3 / 16 tokens, 1 and 20 Sinkhorn rounds, random rows and edge rows (zeros,
+// huge and tiny values, mixes far past expf's range) - every mix, pre, post and comb slot (the unwritten ones too: both
+// sets filled alike) bit for bit, three launches in a row on the same counters, and the counters 0 at the end
+void test_hc_mix_split(cudaStream_t s) {
+    const int D = 4096;
+    const float eps = 1e-6f, hc_eps = 1e-6f;
+    for (int hc : {4, 2})
+        for (int T : {1, 3, 16})
+            for (int iters : {1, 20})
+                for (int kind = 0; kind < 2; ++kind) {
+                    const int hcdim = hc * D, n_mix = (2 + hc) * hc;
+                    std::vector<float> h((size_t) T * hcdim), fn((size_t) n_mix * hcdim), base((size_t) n_mix);
+                    const std::vector<float> sc = {0.7f, 1.3f, 2.1f};
+                    for (int t = 0; t < T; ++t)
+                        for (int e = 0; e < hcdim; ++e) {
+                            float v = frand();
+                            if (kind == 1) v = t % 3 == 0 ? 0.0f : t % 3 == 1 ? frand(1e4f) : frand(1e-6f);
+                            h[(size_t) t * hcdim + e] = v;
+                        }
+                    for (auto& v : fn) v = frand(kind == 1 ? 2.0f : 0.02f);
+                    for (auto& v : base) v = frand(kind == 1 ? 50.0f : 1.0f);
+                    float *dh = dev(h), *dfn = dev(fn), *dsc = dev(sc), *dba = dev(base);
+                    const size_t nout = (size_t) T * (32 + 8 + 8 + 64);
+                    float* o[2] = {dev(std::vector<float>(nout)), dev(std::vector<float>(nout))};
+                    unsigned* cnt = dev(std::vector<unsigned>((size_t) T, 0u));
+                    auto part = [&](int b, int r) {   // (mixes, pre, post, comb of set b)
+                        const size_t at[4] = {0, (size_t) 32 * T, (size_t) 40 * T, (size_t) 48 * T};
+                        return o[b] + at[r];
+                    };
+                    CU(cudaMemsetAsync(o[0], 0xA5, nout * 4, s));
+                    dk::hc_mix(dh, dfn, hcdim, n_mix, T, eps, part(0, 0), s);
+                    dk::hc_split(part(0, 0), dsc, dba, hc, iters, hc_eps, T, part(0, 1), part(0, 2), part(0, 3), s);
+                    CU(cudaStreamSynchronize(s));
+                    const std::vector<float> want = host(o[0], nout);
+                    bool same = true;
+                    for (int rep = 0; rep < 3; ++rep) {
+                        CU(cudaMemsetAsync(o[1], 0xA5, nout * 4, s));
+                        dk::hc_mix_split(dh, dfn, hcdim, n_mix, T, eps, part(1, 0), cnt, dsc, dba, hc, iters, hc_eps,
+                                         part(1, 1), part(1, 2), part(1, 3), s);
+                        CU(cudaStreamSynchronize(s));
+                        const std::vector<float> got = host(o[1], nout);
+                        same = same && std::memcmp(got.data(), want.data(), nout * 4) == 0;
+                    }
+                    const std::vector<unsigned> left = host(cnt, (size_t) T);
+                    const bool zero = std::all_of(left.begin(), left.end(), [](unsigned c) { return c == 0u; });
+                    if (!same || !zero) ++g_fail;
+                    char what[96];
+                    std::snprintf(what, sizeof what, "hc_mix_split = hc_mix + hc_split: hc %d, T %d, %d rounds, %s", hc,
+                                  T, iters, kind ? "edges" : "random");
+                    std::printf("%-64s %s%s\n", what, same && zero ? "ok" : "FAIL", zero ? "" : " (counters left)");
+                    cudaFree(dh), cudaFree(dfn), cudaFree(dsc), cudaFree(dba), cudaFree(o[0]), cudaFree(o[1]),
+                        cudaFree(cnt);
+                }
+}
+
 void test_decode_trims(cudaStream_t s) {
     test_q8_share(s);
+    test_hc_mix_split(s);
 }
 
 // ---------------------------------------------------------------- a group of two's chunk all-reduce (ds4_kernels.cu)

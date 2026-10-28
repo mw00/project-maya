@@ -561,6 +561,7 @@ struct Dev {
     // lagged pre): their stream, the stream's go (st -> st2) and its done (st2 -> st)
     cudaStream_t st2 = nullptr;
     cudaEvent_t hc_go = nullptr, hc_done = nullptr;
+    unsigned* hc_cnt = nullptr;   // (DS4_HC_MIX_SPLIT) hc_mix_split's counters: kWin for st, then kWin for st2
     size_t free0 = 0, total = 0, weights = 0, experts = 0, caches = 0, scratch = 0;
     // (the Monitor's map: the prompt chunks' buffers, out of scratch; of the weights, the copies a group's members
     // each hold of the tensors they do not split - what tensor parallel costs beyond one copy, its members' share)
@@ -1461,6 +1462,16 @@ struct Model::Impl {
 #endif
     int hc_stream = std::getenv("DS4_HC_STREAM") ? std::atoi(std::getenv("DS4_HC_STREAM")) : -1;
     bool hc_side() const { return hc_stream < 0 ? kHcStream : hc_stream != 0; }
+    // DS4_HC_MIX_SPLIT: a window's hc_mix and hc_split in one launch (hc_mix_split: the block that ends a token's mixes
+    // runs its split - the same values, a launch fewer twice a layer).  1 (unset): where the two run on the layer's own
+    // stream, between its kernels (HIP's default, DS4_HC_STREAM=0); 2: on the side stream (st2) too, where they run
+    // beside the attention and the MoE, off their path - there it saves the host an enqueue and the side stream a gap,
+    // not measured yet; 0: the two launches everywhere, as before.  DS4_HC_FUSE's split (with the pre norm) keeps its
+    // own launch
+    int hc_ms = 1;
+    bool hc_mix_split_on(bool side, int T) const {
+        return (hc_ms == 2 || (hc_ms == 1 && !side)) && T <= kWin && (2 + g.hc) * g.hc <= 32;
+    }
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
     // at once (a thread of its own, os::prefetch), so the SSD reads them while L computes instead of on the next
@@ -3009,6 +3020,16 @@ struct Model::Impl {
                                            "(DS4_HC_FUSE=2)"
                                          : "");
         }
+        if (const char* v = ds4_env("DS4_HC_MIX_SPLIT")) {   // (MAYA_DS4_HC_MIX_SPLIT)
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "2") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_HC_MIX_SPLIT=") + v + ": 2, 1 or 0";
+                return false;
+            }
+            hc_ms = std::atoi(v);
+            if (hc_ms != 1)
+                std::fprintf(stderr, "ds4: a window's HC mix and split %s (DS4_HC_MIX_SPLIT=%d)\n",
+                             hc_ms == 2 ? "in one launch on the side stream too" : "in two launches", hc_ms);
+        }
         if (const char* v = ds4_env("DS4_DECODE_TRIM")) {   // (MAYA_DS4_DECODE_TRIM)
             char* end = nullptr;
             const long b = std::strtol(v, &end, 10);
@@ -3520,9 +3541,9 @@ struct Model::Impl {
             }
             if ((int) di == head_dev && !dalloc(d, d.logits, (size_t) kWin * g.vocab, err)) return false;
             if (!halloc(d.bounce, bounce_bytes(), err)) return false;
-            if (!dalloc(d, d.xcnt, 4, err) || !hmap(d.hand, bounce_bytes(), err) || !hmap(d.hand_flag, 32, err) ||
-                !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) || !dalloc(d, d.grp_ent, P, err) ||
-                !dalloc(d, d.n_groups, 4, err))
+            if (!dalloc(d, d.xcnt, 4, err) || !dalloc(d, d.hc_cnt, 2 * W, err) || !hmap(d.hand, bounce_bytes(), err) ||
+                !hmap(d.hand_flag, 32, err) || !dalloc(d, d.grp_ptr, P, err) || !dalloc(d, d.grp_start, P + 1, err) ||
+                !dalloc(d, d.grp_ent, P, err) || !dalloc(d, d.n_groups, 4, err))
                 return false;
             if (g.n_mtp > 0 && !dalloc(d, d.tap, (size_t) tap_cap * D, err)) return false;
             if (g.n_mtp > 0 && (int) di == head_dev && !dalloc(d, d_confv, kWin, err)) return false;
@@ -17539,6 +17560,8 @@ struct Model::Impl {
         const bool fuse = hc_fuse && !l.mtp && (T == 1 || (hc_fuse_win && T <= kWin));
         const bool hs = hc_side() && !fuse;   // (the mixes on st2)
         cudaStream_t hcs = hs ? d.st2 : s;
+        const bool ms = !fuse && hc_mix_split_on(hs, T);   // (DS4_HC_MIX_SPLIT: hc_mix + hc_split in one launch)
+        unsigned* hcc = d.hc_cnt + (hs ? kWin : 0);         // (its counters: the stream's own)
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
@@ -17567,7 +17590,11 @@ struct Model::Impl {
             CK(cudaEventRecord(d.hc_go, s));
             CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
         }
-        hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
+        if (ms)
+            hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcc, l.hca_scale, l.hca_base, H,
+                         g.sinkhorn, g.hc_eps, d.a_pre, d.a_post, d.a_comb, hcs);
+        else
+            hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         gg::PreQ8 xq8;
         if (fuse) {
             hc_split_pre_norm(
@@ -17578,7 +17605,8 @@ struct Model::Impl {
             xq8.k = D;
             xq8.rows = T;
         } else {
-            hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, hcs);
+            if (!ms)
+                hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, hcs);
             if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
             hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         }
@@ -17650,14 +17678,19 @@ struct Model::Impl {
             CK(cudaEventRecord(d.hc_go, s));
             CK(cudaStreamWaitEvent(d.st2, d.hc_go, 0));
         }
-        hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
+        if (ms)
+            hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcc, l.hcf_scale, l.hcf_base, H,
+                         g.sinkhorn, g.hc_eps, d.f_pre, d.f_post, d.f_comb, hcs);
+        else
+            hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, hcs);
         if (fuse)   // (d.pre's copy of f_pre now: nothing here reads d.pre before the layer's end)
             hc_split_pre_norm(
                 hc_args(l, true, d.mix, d.h, d.a_pre, d.x, hc_fuse_win ? d.xq8 : nullptr, hc_fuse_win ? d.xd8 : nullptr,
                         d.f_pre, d.f_post, d.f_comb, d.pre),
                 s, T);   // (=2: x rounded for the shared expert's w1 / w3 - xq8 now the FFN's)
         else {
-            hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
+            if (!ms)
+                hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.f_pre, d.f_post, d.f_comb, hcs);
             if (hs) CK(cudaEventRecord(d.hc_done, d.st2));
             hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         }

@@ -74,6 +74,12 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cud
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, cudaStream_t s);
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float hc_eps, int T,
               float* pre, float* post, float* comb, cudaStream_t s);
+/// (DS4_HC_MIX_SPLIT) hc_mix then hc_split in one launch, the same values: the block that ends a token's mixes runs its
+/// split.  cnt: T unsigned counters on the device, 0 before and left 0 (one set per stream: launches on two streams
+/// at once may not share them); n_mix <= 32, hc <= 8.
+void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, unsigned* cnt,
+                  const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre, float* post,
+                  float* comb, cudaStream_t s);
 /// x[t][e] = sum_s mix[t][s] h[t][s][e], then x = rmsnorm(x) * w (w null: no norm).
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  cudaStream_t s);
