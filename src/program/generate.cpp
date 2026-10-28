@@ -1236,7 +1236,6 @@ static int glm_pack_generate(const Options& o) {
                     }
                     if (rid == admitting_rid.load()) {
                         admit_stop.store(true);
-                        if (interleave.tokens == 0 && read_gaps.percent == 0) stop_req.store(true);
                     }
                     continue;
                 }
@@ -2540,7 +2539,7 @@ static int glm_pack_generate(const Options& o) {
                 return false;
             }
         }
-        if (stop_req.load()) {
+        if (quit_req.load() || (stop_req.load() && gens.size() <= 1)) {
             g.finish = "cancel";
             return false;
         }
@@ -2931,6 +2930,10 @@ static int glm_pack_generate(const Options& o) {
             prompt_between = [&, best]() { return interleave_round(best); };
         }
         admit_stop.store(false);
+        {
+            std::lock_guard<std::mutex> lk(ctl_mu);
+            ctl.erase(rid);
+        }
         admitting_rid.store(rid);
         const int rc = prep_prompt(g->prompt, g->reuse, g->finish, g->t0);
         admitting_rid.store(-1);
