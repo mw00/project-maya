@@ -1093,6 +1093,24 @@ CPU-only checks: `python tools/test_ds4_copy_cache.py`. On filesystems that refu
 buffered fallback; its output says whether direct reads were exercised. `DS4_TEST_FILE_DIR=/path/on/nvme` selects a
 filesystem for the fixture. Cache residency is diagnostic because DONTNEED does not promise immediate eviction.
 
+## DeepSeek: integrated GPUs
+
+An integrated GPU's memory is the PC's RAM. `--mmap-experts auto` no longer copies the CPU lane's experts into RAM
+beside one: the GPU's own allocations (the experts it holds, and what it allocates later) come out of the same RAM,
+and every copy beside them leaves the machine too little of it. The experts stay in the files; the log says so where
+they would have fit.
+
+On Linux with an integrated NVIDIA GPU (a DGX Spark's GB10), the driver's free memory counts only MemFree, while the
+model's files just read sit in the page cache the kernel can give back; `MAYA_DS4_UMA_FREE=1` places the experts (and
+sizes the other GPU budgets) by MemAvailable less a headroom instead, so more of them are in GPU memory. It is opt-in
+until it is measured.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_COPY_ALL` | none beside an integrated GPU | `1`: `--mmap-experts auto` copies them when they fit, as on a discrete GPU; `0`: auto never copies (on any GPU) |
+| `MAYA_DS4_UMA_FREE` | off | `1`: an integrated NVIDIA GPU on Linux places by MemAvailable less `MAYA_DS4_UMA_HEADROOM_GIB` when that is larger than the driver's free memory |
+| `MAYA_DS4_UMA_HEADROOM_GIB` | 6 | with `MAYA_DS4_UMA_FREE=1`: the RAM left to the rest of the system (GiB) |
+
 ## DeepSeek: Engram prompt read-ahead
 
 On one GPU with a nonzero `DS4_ENGRAM_CACHE_MB`, `DS4_ENGRAM_PREFETCH=1` reads a prompt's Engram rows into the ordinary

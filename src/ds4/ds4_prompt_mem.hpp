@@ -43,4 +43,20 @@ inline int staging_ring_mb(double room_bytes) {
     return (int) std::min(1200.0, std::max(400.0, mb));
 }
 
+// ---- --mmap-experts auto: every CPU-lane expert copied into RAM (all bytes) when they fit what the process can get
+// (can) with `spare` more - never beside an integrated GPU, whose own allocations come out of the same RAM (force:
+// DS4_COPY_ALL, -1 unset, 0 never, 1 the fit alone decides, integrated or not)
+inline bool copy_all_auto(double all, double can, double spare, bool integrated, int force) {
+    if (force == 0 || (integrated && force < 0)) return false;
+    return all + spare <= can;
+}
+
+// ---- an integrated GPU's room (Linux, NVIDIA): the driver's free figure counts only MemFree there, while the page
+// cache (the model's files just read) is what the kernel can still give back - MemAvailable (~0: not known) less
+// headroom when that is larger, at most the device's total
+inline uint64_t uma_free(uint64_t driver_free, uint64_t total, uint64_t mem_available, uint64_t headroom) {
+    if (mem_available == ~uint64_t{0} || mem_available <= headroom) return driver_free;
+    return std::min(std::max(driver_free, mem_available - headroom), std::max(total, driver_free));
+}
+
 }  // namespace strata::ds4

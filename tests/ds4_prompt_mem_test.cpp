@@ -57,6 +57,25 @@ int main() {
         CHECK(d::staging_ring_mb(18.75 * GB) == 1200);
         CHECK(d::staging_ring_mb(80 * GB) == 1200);
     }
+    {   // --mmap-experts auto beside an integrated GPU: none, unless DS4_COPY_ALL=1 (and they fit); =0 never
+        const double GB = 1e9, spare = 8.0 * (1ull << 30);
+        CHECK(d::copy_all_auto(100 * GB, 200 * GB, spare, false, -1));
+        CHECK(!d::copy_all_auto(195 * GB, 200 * GB, spare, false, -1));   // (fits, but not with the spare)
+        CHECK(!d::copy_all_auto(100 * GB, 200 * GB, spare, true, -1));
+        CHECK(d::copy_all_auto(100 * GB, 200 * GB, spare, true, 1));
+        CHECK(!d::copy_all_auto(195 * GB, 200 * GB, spare, true, 1));
+        CHECK(!d::copy_all_auto(100 * GB, 200 * GB, spare, false, 0));
+        CHECK(!d::copy_all_auto(100 * GB, 200 * GB, spare, true, 0));
+    }
+    {   // an integrated GPU's room: MemAvailable less the headroom when larger, the driver's figure otherwise, at most
+        // the device's total
+        const uint64_t GiB = 1ull << 30, head = 6 * GiB, tot = 120 * GiB, unknown = ~uint64_t{0};
+        CHECK(d::uma_free(55 * GiB, tot, 115 * GiB, head) == 109 * GiB);
+        CHECK(d::uma_free(55 * GiB, tot, 60 * GiB, head) == 55 * GiB);
+        CHECK(d::uma_free(55 * GiB, tot, unknown, head) == 55 * GiB);      // (MemAvailable not known)
+        CHECK(d::uma_free(55 * GiB, tot, 5 * GiB, head) == 55 * GiB);      // (less than the headroom)
+        CHECK(d::uma_free(55 * GiB, 100 * GiB, 200 * GiB, head) == 100 * GiB);
+    }
     if (fails == 0) std::printf("ds4 prompt / memory rules: ok\n");
     return fails == 0 ? 0 : 1;
 }

@@ -100,8 +100,31 @@ size_t align256(size_t n) { return (n + 255) & ~(size_t) 255; }
 // HIP's 172: 2.45 tok/s - strata/platform/dedicated.hpp).  Its total is then the dedicated memory, its free what of
 // that is not in use, so every budget read from it (the experts', the prompt path's room, the split's) keeps within
 // it.  DS4_APU_DEDICATED_GB=<n>: n GB (a test: a smaller carve-out), =0: HIP's figures.
+// Linux, an integrated NVIDIA GPU (a DGX Spark's GB10: one memory with the CPU), DS4_UMA_FREE=1 (opt-in until
+// measured): the driver's free counts only MemFree there, while the model's files just read fill the page cache the
+// kernel can still give back - so the free is MemAvailable less DS4_UMA_HEADROOM_GIB (6) when that is larger, and
+// every budget read from it (the experts' placement, the vision tower's room) sees it.  A discrete GPU, HIP and
+// Windows: the driver's figures, as before
+uint64_t ram_avail();
 cudaError_t mem_info(size_t* free_b, size_t* total_b) {
     const cudaError_t e = cudaMemGetInfo(free_b, total_b);
+#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
+    const auto env = [](const char* k) {   // (MAYA_DS4_* as STRATA_DS4_*, else DS4_*)
+        const char* v = std::getenv((std::string("STRATA_") + k).c_str());
+        return v != nullptr ? v : std::getenv(k);
+    };
+    static const bool uma_on = tri_of(env("DS4_UMA_FREE")) == 1;
+    if (uma_on && e == cudaSuccess) {
+        int dev = 0, integ = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, dev) != cudaSuccess)
+            (void) cudaGetLastError();
+        else if (integ != 0) {
+            static const char* hv = env("DS4_UMA_HEADROOM_GIB");
+            static const uint64_t head = (uint64_t) (std::max(0.0, hv != nullptr ? std::atof(hv) : 6.0) * 1073741824.0);
+            *free_b = (size_t) uma_free(*free_b, *total_b, ram_avail(), head);
+        }
+    }
+#endif
 #if defined(_WIN32) && defined(STRATA_USE_HIP)
     int dev = 0;
     if (e != cudaSuccess || cudaGetDevice(&dev) != cudaSuccess) return e;
@@ -6902,12 +6925,25 @@ struct Model::Impl {
                                     commit_room());
         // (auto: all or none - a part copied cost decode speed on 64 GB and on 32 GB of RAM, but every expert in RAM
         // keeps the SSD out of the decode: #339's reports)
-        const bool auto_all = o.mmap_experts < 0 && all + (double) kAutoCopyRoom <= can;
+        // (auto beside an integrated GPU: none - its own allocations, the experts it holds and what it allocates
+        // later, come out of the same RAM, and every CPU-lane copy beside them leaves the machine too little of it;
+        // DS4_COPY_ALL=1: the fit alone decides, as on a discrete GPU; =0: auto never copies)
+        bool integ = false;
+        for (const Dev& d : devs) {
+            int v = 0;
+            if (cudaDeviceGetAttribute(&v, cudaDevAttrIntegrated, d.id) != cudaSuccess) (void) cudaGetLastError();
+            integ = integ || v != 0;
+        }
+        const int force_all = tri_of(ds4_env("DS4_COPY_ALL"));
+        const bool auto_all = o.mmap_experts < 0 && copy_all_auto(all, can, (double) kAutoCopyRoom, integ, force_all);
         double budget = strict_ram ? all : (o.mmap_experts == 0 ? std::min(all, can) : auto_all ? all : 0.0);
         if (auto_all)
             std::fprintf(stderr, "ds4: --mmap-experts auto: the CPU lane's experts (%.1f GB) fit the RAM this process can "
                                  "get (%.1f GB): copied into RAM (--mmap-experts on keeps them in the files)\n",
                          all / 1e9, can / 1e9);
+        else if (o.mmap_experts < 0 && integ && force_all < 0 && all + (double) kAutoCopyRoom <= can)
+            std::fprintf(stderr, "ds4: --mmap-experts auto: an integrated GPU shares this RAM - the CPU lane's experts "
+                                 "(%.1f GB) stay in the files (DS4_COPY_ALL=1 copies them when they fit)\n", all / 1e9);
         if (!strict_ram) if (const char* v = std::getenv("DS4_COPY_GB")) budget = std::atof(v) * 1e9;
         if (!strict_ram && warm_cap >= 0) budget = std::min(budget, warm_cap);   // (DS4_WARM_CAP_GB)
         if (!strict_ram && o.mmap_experts == 0 && all > can)
