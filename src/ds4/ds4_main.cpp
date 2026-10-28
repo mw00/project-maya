@@ -1423,7 +1423,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // request's prompt - its pictures too: the tower borrows its room and gives it back before the prompt, with every
     // other request between two of its tokens - is read while the others wait; then each running request writes a
     // token a step.  A request alone decodes in its rounds as with one conversation (DSpark's drafts, the prompt
-    // lookup); two or more go through Model::step_multi - a token of each through the model together, no drafts.
+    // lookup); two or more in rounds together - each one's DSpark drafts (its share of a window), every one's token
+    // and drafts through the model at once (Model::step_multi_spec, verify_multi), or with no drafts a token of each
+    // (Model::step_multi).  With several running, each writes all of its round's tokens at once, so every one needs
+    // the model in the same step again.
     if (multi) {
         struct Act {
             Req r;
@@ -1479,10 +1482,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             std::fprintf(stderr,
                          "maya ds4 serve: request %lld: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), "
-                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running)\n",
+                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running; drafts %lld of %lld kept)\n",
                          a.r.rid, a.r.ids.size(), a.P.from, a.r.ids.size() - a.P.from, a.t1 - a.P.t0,
                          a.t1 > a.P.t0 ? 1000.0 * (double) (a.r.ids.size() - a.P.from) / (a.t1 - a.P.t0) : 0.0,
-                         a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size());
+                         a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size(),
+                         a.d_acc, a.d_off);
             seq_rid[(size_t) a.seq] = -1;
             seq_used[(size_t) a.seq] = ++use_clock;
             in.forget(a.r.rid);
@@ -1586,39 +1590,46 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 beat();
             }
             if (quit) in.stop_all.store(true);
-            // each running request writes its next token; those whose next one the model must make go below
+            // each running request writes its next token; those whose next one the model must make go below (with
+            // several running, a round's tokens all at once: every one then needs the model in the same step, so
+            // their rounds go through it together)
             std::vector<Act*> need;
             const long long n0 = busy_n;
+            const bool several = acts.size() > 1;
             for (auto& ap : acts) {
                 Act& a = *ap;
-                if (in.stopped(a.r.rid)) {
-                    a.finish = "cancel";
-                    a.done = true;
-                    continue;
+                for (;;) {
+                    if (in.stopped(a.r.rid)) {
+                        a.finish = "cancel";
+                        a.done = true;
+                        break;
+                    }
+                    std::printf("T %lld %d\n", a.r.rid, a.tok);
+                    beat();
+                    ++a.produced;
+                    ++busy_n;
+                    if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
+                    if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
+                    bool eos_tok = false;
+                    for (int e : eos) eos_tok = eos_tok || a.tok == e;
+                    if (eos_tok) {
+                        a.finish = "stop";
+                        a.done = true;
+                        break;
+                    }
+                    if (a.produced >= a.limit || m.seq_pos(a.seq) >= m.max_context()) {
+                        a.done = true;
+                        break;
+                    }
+                    if (!a.got.empty()) {
+                        a.tok = a.got.back();
+                        a.got.pop_back();
+                        if (several) continue;
+                        break;
+                    }
+                    need.push_back(&a);
+                    break;
                 }
-                std::printf("T %lld %d\n", a.r.rid, a.tok);
-                beat();
-                ++a.produced;
-                ++busy_n;
-                if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
-                if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
-                bool eos_tok = false;
-                for (int e : eos) eos_tok = eos_tok || a.tok == e;
-                if (eos_tok) {
-                    a.finish = "stop";
-                    a.done = true;
-                    continue;
-                }
-                if (a.produced >= a.limit || m.seq_pos(a.seq) >= m.max_context()) {
-                    a.done = true;
-                    continue;
-                }
-                if (!a.got.empty()) {
-                    a.tok = a.got.back();
-                    a.got.pop_back();
-                    continue;
-                }
-                need.push_back(&a);
             }
             if (busy_n / 8 != n0 / 8) {   // the Monitor's line, every 8 tokens of all of them
                 std::string st = stat_text(busy_t1, busy_s, busy_io, busy_n, 0, 0);
@@ -1626,14 +1637,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::printf("%s\n", st.c_str());
             }
             std::fflush(stdout);
-            if (need.size() == 1 && acts.size() == 1) {   // alone: its rounds, as with one conversation
+            if (need.size() == 1) {   // alone (or the last of several still running): its rounds, as with one conversation
                 Act& a = *need[0];
                 bind(a.seq);
                 int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.pos());
                 const bool closing = close_think(a);
                 if (closing) room = 1;
                 else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
-                Lookup* L = a.r.lookup == 0 ? nullptr : lk;
+                // (the prompt lookup alone only: its history follows one request)
+                Lookup* L = a.r.lookup == 0 || acts.size() > 1 ? nullptr : lk;
                 if (L != nullptr && lk_owner != a.r.rid) {   // (its history: what it consumed, then the token written)
                     L->start(m.tokens());
                     L->sfx.append(a.tok);
@@ -1656,40 +1668,99 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     a.tok = a.got.back();
                     a.got.pop_back();
                 }
-            } else if (need.size() == 1) {   // one of several: a plain step of its conversation
-                Act& a = *need[0];
-                bind(a.seq);
-                if (!m.step(a.tok, true, err)) {
-                    std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    a.finish = "cancel";
-                    a.done = true;
-                } else {
-                    penalties(a.r);
-                    const bool closing = close_think(a);
-                    a.tok = m.sample(a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed, a.counter++);
-                    if (closing) a.tok = a.r.think_end;
-                }
-            } else if (need.size() > 1) {   // several: a token of each through the model together
-                std::vector<int> sv, tv;
-                for (Act* a : need) {
-                    sv.push_back(a->seq);
-                    tv.push_back(a->tok);
-                }
-                if (!m.step_multi(sv.data(), tv.data(), (int) sv.size(), err)) {
+            } else if (need.size() > 1) {   // several: a round of each through the model together
+                // each one's drafts (DSpark, a conversation at a time: its own drafter rings) while their confidence
+                // holds, its share of a window at most; then every one's token and drafts through the model at once
+                // (step_multi_spec) and each its verdict (verify_multi).  No drafts this round: a token of each
+                const int nn = (int) need.size(), share = m.verify_max() / nn;
+                const auto cancel_all = [&] {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     for (Act* a : need) {
                         a->finish = "cancel";
                         a->done = true;
                     }
-                } else
-                    for (size_t i = 0; i < need.size(); ++i) {
-                        Act& a = *need[i];
-                        penalties(a.r);
-                        const bool closing = close_think(a);
-                        a.tok = m.sample_multi((int) i, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
-                                               a.counter++);
-                        if (closing) a.tok = a.r.think_end;
+                };
+                std::vector<std::vector<int>> drafts((size_t) nn);
+                std::vector<char> tried((size_t) nn, 0), closing((size_t) nn, 0);
+                bool any = false, failed = false;
+                for (int i = 0; i < nn && !failed; ++i) {
+                    Act& a = *need[(size_t) i];
+                    int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
+                    closing[(size_t) i] = close_think(a);
+                    if (closing[(size_t) i]) room = 1;
+                    else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
+                    room = std::min(room, share);
+                    if (!((a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0)) continue;
+                    tried[(size_t) i] = 1;
+                    bind(a.seq);
+                    std::vector<int>& d = drafts[(size_t) i];
+                    std::vector<float> conf;
+                    if (!m.draft(a.tok, d, conf, err)) {   // (the drafter's argmax: verify_multi takes each as a point)
+                        failed = true;
+                        break;
                     }
+                    const float cmin = a.r.conf >= 0 ? a.r.conf : conf_min;
+                    const float cum_min = a.r.cum >= 0 ? a.r.cum : dspark_cum_default();
+                    int keep = 0;
+                    float cum = 1.0f;
+                    while (keep < (int) d.size() && keep < room - 1 && conf[(size_t) keep] >= cmin &&
+                           (cum *= conf[(size_t) keep]) >= cum_min)
+                        ++keep;
+                    d.resize((size_t) keep);
+                    any = any || keep > 0;
+                }
+                if (failed) cancel_all();
+                else if (!any) {
+                    std::vector<int> sv, tv;
+                    for (Act* a : need) {
+                        sv.push_back(a->seq);
+                        tv.push_back(a->tok);
+                    }
+                    if (!m.step_multi(sv.data(), tv.data(), nn, err)) cancel_all();
+                    else
+                        for (int i = 0; i < nn; ++i) {
+                            Act& a = *need[(size_t) i];
+                            penalties(a.r);
+                            a.tok = m.sample_multi(i, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
+                                                   a.counter++);
+                            if (closing[(size_t) i]) a.tok = a.r.think_end;
+                            a.cool = tried[(size_t) i] != 0;   // (its drafter tried and kept none: rests a round)
+                        }
+                } else {
+                    std::vector<std::vector<int>> rows((size_t) nn);
+                    std::vector<const int*> tp((size_t) nn);
+                    std::vector<int> sv((size_t) nn), lens((size_t) nn);
+                    for (int i = 0; i < nn; ++i) {
+                        rows[(size_t) i].push_back(need[(size_t) i]->tok);
+                        rows[(size_t) i].insert(rows[(size_t) i].end(), drafts[(size_t) i].begin(), drafts[(size_t) i].end());
+                        tp[(size_t) i] = rows[(size_t) i].data();
+                        lens[(size_t) i] = (int) rows[(size_t) i].size();
+                        sv[(size_t) i] = need[(size_t) i]->seq;
+                    }
+                    if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), nn, err)) cancel_all();
+                    else
+                        for (int i = 0; i < nn; ++i) {
+                            Act& a = *need[(size_t) i];
+                            const std::vector<int>& d = drafts[(size_t) i];
+                            penalties(a.r);
+                            int acc = 0, next = -1;
+                            if (!m.verify_multi(i, d, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
+                                                a.counter, acc, next, err)) {
+                                cancel_all();
+                                break;
+                            }
+                            a.counter += (unsigned long long) acc + 1;
+                            a.d_off += (long long) d.size();
+                            a.d_acc += acc;
+                            a.cool = tried[(size_t) i] && d.empty();
+                            a.got.assign(d.begin(), d.begin() + acc);
+                            a.got.push_back(next);
+                            if (closing[(size_t) i]) a.got.back() = a.r.think_end;
+                            std::reverse(a.got.begin(), a.got.end());
+                            a.tok = a.got.back();
+                            a.got.pop_back();
+                        }
+                }
             }
             for (size_t i = 0; i < acts.size();) {
                 if (!acts[i]->done) {
@@ -1827,7 +1898,78 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
                 N, n, same_rows, rows, max_d, tokens_same ? "yes" : "NO",
                 ms_alone > 0 ? 1000.0 * steps * N / ms_alone : 0.0, ms_together > 0 ? 1000.0 * steps * N / ms_together : 0.0,
                 ms_together > 0 ? ms_alone / ms_together : 0.0);
-    return tokens_same && same_rows == rows ? 0 : 1;
+    // ... then together with the drafter (step_multi_spec / verify_multi, as the server's rounds): each conversation's
+    // drafts - every one of them, whatever its confidence, so rejected windows are undone often - its share of a
+    // window; greedy, so the tokens alone are due again
+    bool spec_same = true;
+    if (m.draft_block() > 0) {
+        std::vector<std::vector<int>> spec_t((size_t) N);
+        for (int i = 0; i < N; ++i) {
+            if (!prompt(i)) {
+                std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                return 1;
+            }
+            spec_t[(size_t) i].push_back(m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0));
+        }
+        const int share = m.verify_max() / N;
+        long long offered = 0, kept = 0, rounds = 0;
+        const double t0 = now_ms();
+        for (;;) {
+            std::vector<int> sv;
+            for (int i = 0; i < N; ++i)
+                if ((int) spec_t[(size_t) i].size() < n) sv.push_back(i);
+            if (sv.empty()) break;
+            const int k = (int) sv.size();
+            std::vector<std::vector<int>> rws((size_t) k), drafts((size_t) k);
+            std::vector<const int*> tp((size_t) k);
+            std::vector<int> lens((size_t) k);
+            for (int j = 0; j < k; ++j) {
+                const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                const int room = std::min(share, n - (int) got.size());
+                std::vector<float> conf;
+                m.seq_bind(sv[(size_t) j]);
+                if (room > 1 && !m.draft(got.back(), drafts[(size_t) j], conf, err)) {
+                    std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                    return 1;
+                }
+                if ((int) drafts[(size_t) j].size() > room - 1) drafts[(size_t) j].resize((size_t) std::max(0, room - 1));
+                rws[(size_t) j].push_back(got.back());
+                rws[(size_t) j].insert(rws[(size_t) j].end(), drafts[(size_t) j].begin(), drafts[(size_t) j].end());
+                tp[(size_t) j] = rws[(size_t) j].data();
+                lens[(size_t) j] = (int) rws[(size_t) j].size();
+            }
+            if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), k, err)) {
+                std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                return 1;
+            }
+            for (int j = 0; j < k; ++j) {
+                int acc = 0, next = -1;
+                if (!m.verify_multi(j, drafts[(size_t) j], 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
+                    std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                    return 1;
+                }
+                std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                got.insert(got.end(), drafts[(size_t) j].begin(), drafts[(size_t) j].begin() + acc);
+                got.push_back(next);
+                offered += (long long) drafts[(size_t) j].size();
+                kept += acc;
+            }
+            ++rounds;
+        }
+        const double ms_spec = now_ms() - t0;
+        for (int i = 0; i < N; ++i) {
+            size_t d = 0;
+            while (d < alone[(size_t) i].size() && alone[(size_t) i][d] == spec_t[(size_t) i][d]) ++d;
+            const bool same = d == alone[(size_t) i].size();
+            spec_same = spec_same && same;
+            if (!same) std::printf("multi check: conversation %d with the drafter: differs from token %zu on\n", i, d);
+        }
+        std::printf("multi check: %d conversations x %d tokens together with the drafter: tokens the same: %s; %lld "
+                    "rounds, drafts %lld of %lld kept; %.2f tok/s in all (x%.2f over together without)\n",
+                    N, n, spec_same ? "yes" : "NO", rounds, kept, offered,
+                    ms_spec > 0 ? 1000.0 * steps * N / ms_spec : 0.0, ms_spec > 0 ? ms_together / ms_spec : 0.0);
+    }
+    return tokens_same && spec_same && same_rows == rows ? 0 : 1;
 }
 
 }  // namespace

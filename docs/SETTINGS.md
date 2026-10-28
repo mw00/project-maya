@@ -370,8 +370,12 @@ keys, its checkpoints. That is about 1.1 KB a position on each GPU for each of t
 taken from the experts' VRAM at the start (the log's `ds4: --parallel` line gives the size). The setup's recommended
 context shares the memory beside the model among the N conversations.
 - **A request alone** decodes as with one conversation: the DSpark drafter and the prompt lookup as configured.
-- **Two or more:** a token of each goes through the model together. The dense weights, the router and the experts
-  the requests share are read once for all of them, and each request's attention reads its own conversation's caches.
+- **Two or more:** their rounds go through the model together. Each request's DSpark drafter guesses its next tokens
+  (its share of a 16-row window: up to 7 drafts for two at once, 3 for four), and every request's token and drafts
+  are verified in one step; a request whose drafts are rejected undoes only its own rows. A round with no drafts
+  (the drafter's confidence too low, or `--dspark off`) is a token of each. The dense weights, the router and the
+  experts the requests share are read once for all of them, and each request's attention reads its own
+  conversation's caches.
   Each request gets exactly the tokens it would get alone with plain steps: greedy, with the experts where the load put
   them and the PCIe lane off, its logits are bit for bit its own (checked with 2 and 4 at once: `maya-ds4 --parallel 4
   --multi-check --ids ...`). The CPU lane's and the PCIe lane's rounding can change the last bits, as it already can
@@ -387,10 +391,15 @@ context shares the memory beside the model among the N conversations.
   of Maya-XS's experts in RAM. Each conversation brings its own experts, so where VRAM holds only part of them they
   compete for it; the more of the model VRAM holds, the more it gains. On a Strix Halo (Radeon 8065S) with Maya-XS,
   against plain steps one after another: x1.58 for two and x2.21 for four; there the drafter alone is about as fast as
-  two at once (x1.10 for two against one at a time with it), as the steps of several requests carry no drafts.
+  two at once (x1.10 for two against one at a time with it), measured before the steps of several requests carried
+  drafts.
+- **The drafter in the steps of several:** each request's rounds keep the drafts the model agrees with, as alone. One
+  RTX 3090 + eight RTX 5060 Ti (`--tp 8`, EXL3 3.5 bpw, two thirds of the experts in RAM), two requests at once,
+  greedy: two short stories 37.0 + 47.8 tok/s each (32.1 + 34.7 without drafts), two pieces of code 49.4 + 47.1 tok/s;
+  `--multi-check` with the drafter, 2 x 200 tokens of code: 83.4 tok/s in all against 57.5 without drafts (x1.45).
+  The drafts of several are made one request after another (a drafter pass each), then verified together.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
-  longer wait in line for a whole answer - but a new prompt is read while the others wait, and their batched steps
-  carry no drafts, so on one GPU a whole turn can take longer than one at a time with the drafter.
+  longer wait in line for a whole answer - but a new prompt is read while the others wait.
 
 ## Drafting with DFlash2
 
