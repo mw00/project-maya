@@ -1,16 +1,17 @@
 // serve/web/models.js - the Models page: the models set up on this machine (the run configs the setup wrote, GET
 // /api/models), the running one marked; switching to another (POST /api/models/switch: Maya starts again with it) and
-// each one's engine settings, edited in its card (POST /api/models/settings - a dry run first for the command they make).
+// each one's engine settings, edited in its card (POST /api/models/settings - a dry run first for the command they make);
+// and deleting one that is not running (POST /api/models/delete: off the list, and with its downloaded files if asked).
 import {html, useEffect, useRef} from "./preact.js";
 import {api, ctxfmt, esc, fmt, isPhone, modelName, relTime} from "./lib.js";
 import {S, confirmDialog, copyText, emit, toast} from "./state.js";
 import {newChat} from "./chats.js";
 import {setSide, showView} from "./sidebar.js";
-import {Icon, ModelLogo, Seg, Switch} from "./ui.js";
+import {Icon, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 // the page's own state (beside S: nothing else reads it but the model menu's count)
 export const MS = {data: null, err: null, add: false, details: {}, edit: null, draft: null, tab: 0, preview: null,
-                   check: "", saving: false, restart: null};
+                   check: "", saving: false, restart: null, del: null, gone: null};
 
 export async function loadModels() {
   try {
@@ -487,6 +488,113 @@ function Editor({m}) {
   </div>`;
 }
 
+// ------------------------------------------------------------------ deleting a model (POST /api/models/delete)
+// MS.del: the dialog ({m, plan: what its files are (a dry run), files: the box ticked, busy, err, from: the button});
+// MS.gone: what was deleted, said at the top of the page
+const bytes = (b) => (b >= 1e9 ? `${fmt(b / 1e9, b < 1e10 ? 1 : 0)} GB` : b >= 1e6 ? `${fmt(b / 1e6)} MB`
+  : b >= 1e3 ? `${fmt(b / 1e3)} KB` : `${fmt(b || 0)} bytes`);
+const nameOf = (file) => { const x = MS.data && MS.data.models.find((m) => m.file === file); return x ? titleOf(x) : file; };
+const and = (xs) => (xs.length > 1 ? `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}` : xs[0] || "");
+
+async function askDelete(m) {
+  const d = {m, plan: null, files: false, busy: false, err: null, from: document.activeElement};
+  MS.del = d;
+  emit();
+  try {
+    d.plan = await api("api/models/delete", {method: "POST", body: {file: m.file, files: true, dry_run: true}});
+  } catch (e) {
+    d.plan = {ok: false, why: e.message, items: []};
+  }
+  if (MS.del === d) emit();
+}
+
+function closeDelete() {
+  const d = MS.del;
+  if (!d || d.busy) return;
+  MS.del = null;
+  emit();
+  if (d.from && d.from.focus && document.contains(d.from)) d.from.focus();
+}
+
+async function deleteModel() {
+  const d = MS.del;
+  if (!d || d.busy || !d.plan) return;
+  d.busy = true;
+  d.err = null;
+  emit();
+  try {
+    const out = await api("api/models/delete", {method: "POST", body: {file: d.m.file, files: d.files}});
+    MS.gone = {name: titleOf(d.m), files: d.files, freed: out.freed, folder: d.m.folder,
+               users: (out.drafter_users || []).map(nameOf)};
+    MS.del = null;
+    if (MS.edit === d.m.file) closeEditor();
+    delete MS.details[d.m.file];
+    await loadModels();
+    const h = document.querySelector(".mdl__page h1");
+    if (h) { h.tabIndex = -1; h.focus(); }         // (its card is gone: the keyboard goes to the page's top)
+  } catch (e) {
+    d.busy = false;
+    d.err = `It was not deleted: ${e.message}`;
+    emit();
+  }
+}
+
+// its files, said: "Its 3 GGUF files, the pack Maya built from them, its image encoder and its DFlash2 drafter (0.7 GB)."
+function filesSaid(p) {
+  const parts = [];
+  if (p.gguf) parts.push(p.gguf === 1 ? "its GGUF file" : `its ${p.gguf} GGUF files`);
+  if (p.pack) parts.push(p.gguf ? "the pack Maya built from them" : "the pack Maya built");
+  if (p.vision) parts.push("its image encoder");
+  if (p.drafter != null) parts.push(`its DFlash2 drafter (${bytes(p.drafter)})`);
+  const s = and(parts);
+  return s ? `${s[0].toUpperCase()}${s.slice(1)}.` : "";
+}
+
+function DeleteDialog() {
+  const box = useRef(null);
+  useEffect(() => {   // (it destroys something: the keyboard starts on Cancel, so a stray Enter does not confirm it)
+    setTimeout(() => { const b = box.current && box.current.querySelector(".dialog__actions .btn--secondary"); if (b) b.focus(); }, 0);
+  }, []);
+  const d = MS.del;
+  if (!d) return null;
+  const m = d.m, p = d.plan;
+  const can = !!(p && p.ok && p.items.length);
+  const files = can && d.files;
+  const users = (p && p.drafter_users || []).map(nameOf);
+  const keys = (e) => {
+    if (e.key === "Tab") trapTab(e, box.current);
+    else if (e.key === "Escape") { e.stopPropagation(); closeDelete(); }
+  };
+  return html`<div class="dialog-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) closeDelete(); }}>
+    <div ref=${box} class="dialog mdl-del" role="dialog" aria-modal="true" aria-labelledby="mdl-del-title" onKeyDown=${keys}>
+      <div class="dialog__head"><h2 id="mdl-del-title">Delete ${titleOf(m)}?</h2>
+        <button type="button" class="icon-btn dialog__close" aria-label="Close" onClick=${closeDelete}><${Icon} name="close"/></button></div>
+      <div class="dialog__body">
+        <p>Maya takes it off this list: its config <code>${m.file}</code>${m.script ? html` and its start script <code>${m.script}</code>` : null}. Your chats stay.</p>
+        ${!p ? html`<p class="mdl-del__note" role="status">Looking at its files…</p>`
+          : can ? html`<button type="button" role="checkbox" aria-checked=${String(files)} class=${`mdl-del__box${files ? " is-on" : ""}`}
+              disabled=${d.busy} onClick=${() => { d.files = !d.files; emit(); }}>
+              <span class="mdl-del__check" aria-hidden="true">${files ? html`<${Icon} name="check" sm/>` : null}</span>
+              <span class="mdl-del__text">
+                <span class="mdl-del__top"><b>Also delete its downloaded files</b><b class="mdl-del__size">${bytes(p.bytes)}</b></span>
+                <code>${p.folder}</code>
+                <span>${filesSaid(p)}${users.length ? "" : " No other model uses them."}</span></span></button>`
+          : html`<p class="mdl-del__note">${p.ok ? "Its files are not on this PC any more." : `Its files stay: ${p.why}.`}</p>`}
+        ${can ? (p.kept || []).map((k) => html`<p class="mdl-del__note">${k}</p>`) : null}
+        ${can && users.length ? html`<p class="mdl-del__note">${and(users)} ${users.length > 1 ? "draft" : "drafts"} with the same DFlash2
+          drafter: with its files deleted, ${users.length > 1 ? "they draft" : "it drafts"} with MTP until the setup downloads it again.</p>` : null}
+        ${files ? html`<div class="mdl-warn">This cannot be undone. To use this model again, the setup ${p.gguf
+          ? `downloads its ${bytes(p.bytes)} again` : "builds its pack again"}.</div>` : null}
+        ${d.err ? html`<div class="mdl-warn mdl-warn--err" role="alert">${d.err}</div>` : null}
+      </div>
+      <div class="dialog__actions">
+        <button type="button" class="btn btn--secondary" disabled=${d.busy} onClick=${closeDelete}>Cancel</button>
+        <button type="button" class="btn btn--danger" disabled=${d.busy || !p} onClick=${deleteModel}>
+          ${d.busy ? "Deleting…" : files ? `Delete it and ${bytes(p.bytes)}` : "Delete from the list"}</button>
+      </div>
+    </div></div>`;
+}
+
 // ------------------------------------------------------------------ a model's card
 function Card({m}) {
   const s = m.settings, open = !!MS.details[m.file], editing = MS.edit === m.file, r = MS.restart;
@@ -518,6 +626,8 @@ function Card({m}) {
           onClick=${() => openEditor(m)}><${Icon} name="sliders" sm/>Engine settings</button>
         <button type="button" class="btn btn--ghost btn--sm" aria-expanded=${String(open)} onClick=${() => { MS.details[m.file] = !open; emit(); }}>
           Details<${Icon} name="chevron" sm cls=${`chev${open ? "" : " is-closed"}`}/></button>
+        ${m.running ? null : html`<button type="button" class="btn btn--ghost btn--sm" aria-haspopup="dialog" aria-label=${`Delete ${titleOf(m)}`}
+          disabled=${!!r} onClick=${() => askDelete(m)}><${Icon} name="trash" sm/>Delete</button>`}
       </span>
     </div>
     ${open ? html`<dl class="mdl-facts">${facts.map(([k, v, mono]) => html`<dt>${k}</dt><dd style=${mono ? `font-family:${MONO}` : ""}>${v}</dd>`)}</dl>` : null}
@@ -553,6 +663,11 @@ export function ModelsPage() {
       ${r ? html`<div class="callout callout--info" role="status"><${Icon} name="info" sm/><span>
           <b>${r.why === "switch" ? `Switching to ${r.name}.` : `Restarting ${r.name} with the new engine settings.`}</b>
           ${" "}Maya finishes the answer it is writing, then loads the model (a few minutes). This page reloads when it is back.</span></div>` : null}
+      ${MS.gone ? html`<div class="callout callout--ok" role="status"><${Icon} name="check" sm/><span>
+          <b>${MS.gone.name} is deleted.</b>${" "}${MS.gone.files ? `${bytes(MS.gone.freed)} freed on the disk.`
+            : MS.gone.folder ? `Its files stay in ${MS.gone.folder}.` : ""}${MS.gone.users.length
+            ? ` ${and(MS.gone.users)} ${MS.gone.users.length > 1 ? "draft" : "drafts"} with MTP now.` : ""}</span>
+          <button type="button" class="icon-btn icon-btn--sm" aria-label="Dismiss" onClick=${() => { MS.gone = null; emit(); }}><${Icon} name="close" sm/></button></div>` : null}
       ${MS.err && !D ? html`<div class="card mon__wait">${MS.err}</div>`
         : !D ? html`<div class="card mon__wait">Reading the models…</div>`
         : !D.models.length ? html`<div class="card mon__wait">No model is set up in this folder yet. The setup writes one: <code>./maya.sh --setup</code> (Windows: <code>START-MAYA.bat --setup</code>)</div>`
@@ -561,5 +676,6 @@ export function ModelsPage() {
         ? "Switching, or saving the running model's engine settings, starts Maya again through its start script, as a port change does. Each model keeps its own chat settings."
         : "This server was not started by maya.sh or START-MAYA.bat, so it cannot start again by itself: a switch or new settings apply from Maya's next start."}</span></p>` : null}
     </div></div>
+    ${MS.del ? html`<${DeleteDialog} key=${MS.del.m.file}/>` : null}
   </main>`;
 }

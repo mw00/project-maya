@@ -112,6 +112,26 @@
 .mdl-count.is-on { color: var(--st-accent-text); }
 .mdl-grow { flex: 1; }
 
+/* deleting a model: the dialog, its files a box to tick */
+.mdl-del .dialog__body { display: flex; flex-direction: column; gap: 14px; }
+.mdl-del p { margin: 0; line-height: 1.55; }
+.mdl-del p code { font-family: var(--st-font-mono); font-size: var(--st-fs-sm); overflow-wrap: anywhere; }
+.mdl-del__box { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 12px 14px; border: 1px solid var(--st-line-strong);
+                border-radius: var(--st-r-md); background: transparent; color: var(--st-ink); font: inherit; text-align: left; }
+.mdl-del__box.is-on { border-color: color-mix(in srgb, var(--st-danger) 55%, var(--st-line)); background: var(--st-danger-tint); }
+.mdl-del__check { display: grid; place-items: center; width: 18px; height: 18px; flex: none; margin-top: 2px; box-sizing: border-box;
+                  border: 1.5px solid var(--st-line-strong); border-radius: 5px; color: #ffffff; }
+.mdl-del__box.is-on .mdl-del__check { background: var(--st-danger); border-color: var(--st-danger); }
+.mdl-del__check .st-icon { width: 12px; height: 12px; --st-icon-stroke: 3; }
+.mdl-del__text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; line-height: 1.45; }
+.mdl-del__top { display: flex; justify-content: space-between; gap: 12px; font-size: var(--st-fs-md); }
+.mdl-del__top b { font-weight: 600; }
+.mdl-del__size { flex: none; font-variant-numeric: tabular-nums; }
+.mdl-del__text code { font-family: var(--st-font-mono); font-size: var(--st-fs-xs); color: var(--st-ink-soft); overflow-wrap: anywhere; }
+.mdl-del__text > span:last-child { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.mdl-del__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.callout .icon-btn { margin: -4px -6px -4px 0; color: inherit; }
+
 @media (max-width: 767px) {
   .mdl-card { padding: 16px; }
   .mdl-card__head { flex-wrap: wrap; }

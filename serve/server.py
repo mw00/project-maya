@@ -2172,6 +2172,23 @@ class Service:
               " next (a start without --config picks it)"), flush=True)
         return {"to": p.name, "model": cfg.get("model_name") or "", "restarts": restarts}
 
+    def delete_model(self, name, files: bool = False, dry_run: bool = False) -> dict:
+        """The Models page's Delete: the config `name` off the list (models.delete), with `files` what its setup
+        downloaded for it as well.  Not the model running, nor while Maya starts again.  dry_run: what would go
+        (models.delete_plan), nothing deleted."""
+        p = self._model_path(name)
+        if self._is_running(p):
+            raise ValueError(f"{p.name} is the model running now: switch to another one first")
+        if getattr(self, "model_restart", None):
+            raise ValueError("Maya is starting again; try again when it is done")
+        if dry_run:
+            return {"file": p.name, **models.delete_plan(self.models_root(), p)}
+        out = models.delete(self.models_root(), p, bool(files))
+        print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if files else
+              " (its files stay)") + "".join(f"; {n} drafts with MTP now (its DFlash2 drafter was deleted)"
+                                             for n in out["drafter_users"]), flush=True)
+        return out
+
     def _restart_into(self, p: Path, why: str):
         _, port = getattr(self, "listen", None) or ("127.0.0.1", None)
         note = {"config": str(p.resolve()), "port": port, "why": why, "time": time.time()}
@@ -4089,7 +4106,7 @@ def make_handler(svc: Service):
                 if path == "/api/update":
                     self._update()
                     return
-                if path in ("/api/models/settings", "/api/models/switch"):
+                if path in ("/api/models/settings", "/api/models/switch", "/api/models/delete"):
                     self._models(path.rsplit("/", 1)[1])
                     return
                 if path == "/api/savings/reset":
@@ -4239,12 +4256,14 @@ def make_handler(svc: Service):
                     raise ValueError("the request body must be a JSON object")
                 if what == "switch":
                     out = svc.switch_model(req.get("file"))
+                elif what == "delete":
+                    out = svc.delete_model(req.get("file"), bool(req.get("files")), bool(req.get("dry_run")))
                 else:
                     out = svc.model_settings(req.get("file"), req.get("settings") or {}, bool(req.get("dry_run")))
             except (TypeError, ValueError, OSError) as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            self._json(200 if what == "settings" and req.get("dry_run") else 202, out)
+            self._json(200 if what == "delete" or (what == "settings" and req.get("dry_run")) else 202, out)
 
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page

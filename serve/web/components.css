@@ -176,6 +176,7 @@ a:hover { color: var(--st-ink); }
 .callout--warn { background: var(--st-warn-tint); color: var(--st-warn-text); }
 .callout--info { background: var(--st-info-tint); color: var(--st-info-text); }
 .callout--danger { background: var(--st-danger-tint); color: var(--st-danger-text); }
+.callout--ok { background: var(--st-ok-tint); color: var(--st-ok-text); }
 .msg-error { padding: 10px 14px; border-radius: var(--st-r-md); background: var(--st-danger-tint); color: var(--st-danger-text);
              font-size: var(--st-fs-md); white-space: pre-wrap; overflow-wrap: anywhere; }
 

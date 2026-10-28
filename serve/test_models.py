@@ -289,8 +289,8 @@ class Settings(unittest.TestCase):
         self.assertEqual(M.maya_quants.config_label(cfg), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
 
 
-class Page(unittest.TestCase):
-    """GET /api/models, POST /api/models/settings and /api/models/switch."""
+class Served(unittest.TestCase):
+    """The server on the mock engine, its config beside another model's."""
 
     def setUp(self):
         os.environ.pop("MAYA_RESTART_ON_UPDATE", None)
@@ -324,6 +324,10 @@ class Page(unittest.TestCase):
         except urllib.error.HTTPError as e:
             with e:
                 return e.code, json.loads(e.read())
+
+
+class Page(Served):
+    """GET /api/models, POST /api/models/settings and /api/models/switch."""
 
     def test_listed(self):
         s, b = self.req("GET", "/api/models")
@@ -448,6 +452,144 @@ class Page(unittest.TestCase):
                         {"Origin": "http://elsewhere.example"})
         self.assertEqual(s, 403)
         self.assertEqual(M.flag(json.loads(self.cfg.read_text())["args"], "--max-context"), "131072")
+
+
+
+def glm_quant(d: Path, quant: str, folder: Path | None = None, pack_name="pack", shards=3, dflash=False,
+              models: Path | None = None) -> Path:
+    """A GLM config as the setup writes it for `quant`: its GGUF shards and pack in <folder> (<models>/<quant>), the
+    image encoder in vision/, the DFlash2 drafter in <models>/GLM-5.3-Flash-DFlash2 when it drafts with it."""
+    models = models or d
+    folder = folder or models / "GLM-5.3-Flash" / quant
+    pack = folder / pack_name
+    pack.mkdir(parents=True, exist_ok=True)
+    names = [f"GLM-5.3-Flash-{quant}-{i:05d}-of-{shards:05d}.gguf" for i in range(1, shards + 1)]
+    for n in names:
+        (folder / n).write_bytes(b"g" * 1000)
+    (pack / "index.txt").write_bytes(b"i" * 100)
+    (pack / "sources.json").write_text(json.dumps({"files": [{"name": n, "size": 1000} for n in names]}))
+    (folder / "vision").mkdir(exist_ok=True)
+    (folder / "vision" / "mmproj.gguf").write_bytes(b"v" * 200)
+    args = ["--glm-pack", str(pack), "--max-context", "65536"]
+    if dflash:
+        drafter = models / "GLM-5.3-Flash-DFlash2" / "GLM-5.3-Flash-DFlash2-Q4_K_M.gguf"
+        drafter.parent.mkdir(parents=True, exist_ok=True)
+        drafter.write_bytes(b"f" * 700)
+        args += ["--dflash", str(drafter)]
+    cfg = {"exe": "/b/maya", "args": args, "model_name": "glm-5.3-flash", "gpu": [0],
+           "vision": {"mmproj": str(folder / "vision" / "mmproj.gguf")},
+           "installer": {"models_dir": str(models), "quant": quant, "draft": "dflash2" if dflash else "mtp"}}
+    p = d / f"maya-{quant.lower()}.json"
+    p.write_text(json.dumps(cfg, indent=1))
+    return p
+
+
+class Delete(unittest.TestCase):
+    """A model off the list, and with its files: what its setup downloaded for it and the pack Maya built - never what
+    another model runs from, nor a GGUF of your own."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_its_own_folder_and_drafter(self):
+        m = glm_quant(self.d, "Maya-M")
+        l = glm_quant(self.d, "Maya-L", dflash=True)
+        (self.d / f"run-{l.stem}.sh").write_text("#!/bin/sh\n")
+        plan = M.delete_plan(self.d, l)
+        folder = self.d / "GLM-5.3-Flash" / "Maya-L"
+        self.assertTrue(plan["ok"])
+        self.assertEqual([(Path(i["path"]).name, i["what"]) for i in plan["items"]],
+                         [("Maya-L", "folder"), ("GLM-5.3-Flash-DFlash2-Q4_K_M.gguf", "drafter")])
+        self.assertEqual((plan["gguf"], plan["pack"], plan["vision"], plan["drafter"], plan["drafter_users"]),
+                         (3, True, True, 700, []))
+        self.assertEqual(plan["bytes"], 3 * 1000 + 100 + len((folder / "pack" / "sources.json").read_bytes()) + 200 + 700)
+        out = M.delete(self.d, l, files=True)
+        self.assertEqual((out["deleted"], out["freed"]), (l.name, plan["bytes"]))
+        self.assertFalse(folder.exists() or l.exists() or (self.d / f"run-{l.stem}.sh").exists())
+        self.assertFalse((self.d / "GLM-5.3-Flash-DFlash2").exists())       # (its folder, empty now)
+        self.assertTrue(m.exists() and (self.d / "GLM-5.3-Flash" / "Maya-M" / "pack").is_dir())
+
+    def test_off_the_list_only(self):
+        l = glm_quant(self.d, "Maya-L")
+        prev, shared = l.with_name(l.name + ".prev"), l.with_name(l.stem + ".shared-settings.json")
+        prev.write_text("{}")
+        shared.write_text("{}")
+        out = M.delete(self.d, l)
+        self.assertEqual((out["freed"], out["files"]), (0, False))
+        self.assertFalse(l.exists() or prev.exists() or shared.exists())
+        self.assertTrue((self.d / "GLM-5.3-Flash" / "Maya-L" / "pack").is_dir())
+
+    def test_a_folder_another_model_runs_from(self):
+        # two quants' files in one folder (the setup's pack-<model>/ beside pack/): only its own pack and GGUF files
+        folder = self.d / "GLM-5.3-Flash"
+        glm_quant(self.d, "Maya-M", folder=folder)
+        l = glm_quant(self.d, "Maya-L", folder=folder, pack_name="pack-maya-l")
+        plan = M.delete_plan(self.d, l)
+        self.assertEqual(sorted(i["what"] for i in plan["items"]), ["gguf", "gguf", "gguf", "pack"])
+        self.assertFalse(plan["vision"])                    # (vision/: Maya-M's too)
+        M.delete(self.d, l, files=True)
+        self.assertEqual(sorted(p.name for p in folder.iterdir()),
+                         [f"GLM-5.3-Flash-Maya-M-{i:05d}-of-00003.gguf" for i in (1, 2, 3)] + ["pack", "vision"])
+
+    def test_your_own_gguf_stays(self):
+        own = self.d / "elsewhere"
+        l = glm_quant(self.d, "Maya-L", folder=own, models=self.d / "models")
+        plan = M.delete_plan(self.d, l)
+        self.assertEqual([i["what"] for i in plan["items"]], ["pack"])
+        self.assertIn("Your own model files", plan["kept"][0])
+        M.delete(self.d, l, files=True)
+        self.assertEqual(len(list(own.glob("*.gguf"))), 3)
+        self.assertFalse((own / "pack").exists())
+
+    def test_a_drafter_another_model_drafts_with(self):
+        m = glm_quant(self.d, "Maya-M", dflash=True)
+        l = glm_quant(self.d, "Maya-L", dflash=True)
+        os.utime(m, (1_700_000_000, 1_700_000_000))
+        plan = M.delete_plan(self.d, l)
+        self.assertEqual(plan["drafter_users"], [m.name])
+        out = M.delete(self.d, l, files=True)
+        self.assertEqual(out["drafter_users"], [m.name])
+        cfg = json.loads(m.read_text())
+        self.assertNotIn("--dflash", cfg["args"])           # (it drafts with MTP now: its drafter is gone)
+        self.assertEqual(M.settings_of(cfg)["draft"], "mtp")
+        self.assertEqual(m.stat().st_mtime, 1_700_000_000)  # (which model starts next: as it was)
+        self.assertIn("--dflash", json.loads(m.with_name(m.name + ".prev").read_text())["args"])
+
+    def test_without_the_setups_record(self):
+        p = ds4_cfg(self.d)                                 # (no models_dir: which files are its own is not known)
+        plan = M.delete_plan(self.d, p)
+        self.assertEqual((plan["ok"], plan["items"]), (False, []))
+        with self.assertRaises(ValueError):
+            M.delete(self.d, p, files=True)
+        self.assertTrue(p.exists())
+
+
+class DeletePage(Served):
+    """POST /api/models/delete: not the model running, the app's own page only, dry_run deletes nothing."""
+
+    def test_delete(self):
+        l = glm_quant(self.d, "Maya-L", dflash=True)
+        s, b = self.req("POST", "/api/models/delete", {"file": l.name, "files": True, "dry_run": True})
+        self.assertEqual((s, b["file"], b["ok"], b["gguf"]), (200, l.name, True, 3))
+        self.assertTrue(l.exists())
+        s, _ = self.req("POST", "/api/models/delete", {"file": l.name, "files": True},
+                        {"Origin": "http://elsewhere.example"})
+        self.assertEqual(s, 403)
+        s, b = self.req("POST", "/api/models/delete", {"file": l.name, "files": True})
+        self.assertEqual((s, b["deleted"], b["freed"] > 3000), (200, l.name, True))
+        s, b = self.req("GET", "/api/models")
+        self.assertNotIn(l.name, [m["file"] for m in b["models"]])
+        self.assertFalse((self.d / "GLM-5.3-Flash" / "Maya-L").exists())
+
+    def test_not_the_one_running(self):
+        for f in (self.cfg.name, "../maya-x.json", "maya-none.json", None):
+            s, _ = self.req("POST", "/api/models/delete", {"file": f})
+            self.assertEqual(s, 400, f)
+        self.assertTrue(self.cfg.exists())
 
 
 if __name__ == "__main__":

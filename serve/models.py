@@ -1,5 +1,5 @@
 """serve/models.py - the web app's Models page: the run configs the setup wrote (maya-<model>.json beside maya.py), what
-each one runs with, and the engine settings the page changes in them.
+each one runs with, the engine settings the page changes in them, and a model deleted (delete_plan, delete).
 
 A config's settings, as the page shows them (None: the engine's own default, or "auto"):
   both:      context, images, gpus, reserve_mib, env
@@ -17,6 +17,8 @@ import copy
 import json
 import os
 import re
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -578,3 +580,218 @@ def save(path: Path, settings: dict) -> dict:
     write(path, new)
     os.utime(path, (st.st_atime, st.st_mtime))         # (its time says when it last ran: a start picks the latest)
     return {"changed": True, "prev": prev.name}
+
+
+# ------------------------------------------------------------------ deleting a model (the page's Delete)
+# Off the list: its config, its start scripts and what Maya keeps beside it.  With its files: what the setup downloaded
+# for it and the pack Maya built - never a file another model here runs from, nor one outside the models folder the
+# setup downloaded into (a GGUF of your own stays; its pack goes).  Its DFlash2 drafter goes too: another model drafting
+# with the same file drafts with MTP from then on (its --dflash taken out).
+GGUF_PART = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
+
+
+def _res(p) -> Path | None:
+    try:
+        return Path(p).expanduser().resolve() if p else None
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return None
+
+
+def _within(p: Path, d: Path) -> bool:
+    """`p` is `d` or in it."""
+    return p == d or d in p.parents
+
+
+def drafter_of(cfg: dict) -> Path | None:
+    """The DFlash2 drafter a config drafts with, or the one its setup downloaded for it (installer.draft)."""
+    p = flag(cfg.get("args") or [], "--dflash")
+    if p:
+        return Path(p)
+    return dflash_file(cfg) if (cfg.get("installer") or {}).get("draft") == "dflash2" else None
+
+
+def vision_files(cfg: dict) -> list:
+    """GLM's image encoder: its mmproj and vocab files (on or switched off)."""
+    out = []
+    for key in ("vision", "vision_off"):
+        v = cfg.get(key)
+        if isinstance(v, dict):
+            out += [Path(v[k]) for k in ("mmproj", "model") if isinstance(v.get(k), str) and v[k]]
+    return out
+
+
+def pack_shards(pack: Path) -> list:
+    """The model files a pack indexes, in its folder: its sources.json's list, else the GGUF its native_experts.txt
+    names (every part of a split one)."""
+    names = []
+    try:
+        rec = json.loads((pack / "sources.json").read_text(encoding="utf-8")).get("files") or []
+        names = [r["name"] for r in rec if isinstance(r, dict) and isinstance(r.get("name"), str)]
+    except (OSError, ValueError, AttributeError):
+        names = []
+    if not names:
+        try:
+            with open(pack / "native_experts.txt", encoding="utf-8") as f:
+                m = re.search(r"absolute offsets in ([^,)]+)", f.readline())
+        except OSError:
+            m = None
+        first = Path(m.group(1).strip()).name if m else None
+        part = GGUF_PART.match(first) if first else None
+        names = ([f"{part.group(1)}-{i:05d}-of-{part.group(3)}.gguf" for i in range(1, int(part.group(3)) + 1)]
+                 if part else [first] if first else [])
+    return [pack.parent / Path(n).name for n in names]   # (by name: nothing outside the pack's folder)
+
+
+def runs_from(cfg: dict) -> list:
+    """Every path a config runs from: its pack and the model files in it, its drafter, image encoder and tokenizer, and
+    the folder or GGUF its setup named."""
+    pack = pack_of(cfg)
+    found = ([pack] + pack_shards(pack)) if pack else []
+    inst = cfg.get("installer") or {}
+    found += [Path(inst[k]) for k in ("model_dir", "gguf", "gguf_dir") if isinstance(inst.get(k), str) and inst[k]]
+    found += [Path(v) for v in (flag(cfg.get("args") or [], "--dflash"), flag(cfg.get("args") or [], "--mtp"),
+                                cfg.get("tokenizer")) if isinstance(v, str) and v]
+    found += vision_files(cfg)
+    return [r for r in map(_res, found) if r is not None]
+
+
+def _size(p: Path) -> int:
+    try:
+        st = os.lstat(p)
+    except OSError:
+        return 0
+    if not stat.S_ISDIR(st.st_mode):
+        return st.st_size if stat.S_ISREG(st.st_mode) else 0
+    total = 0
+    for dp, _, files in os.walk(p):                     # (symlinked folders: not followed)
+        for n in files:
+            try:
+                st = os.lstat(os.path.join(dp, n))
+            except OSError:
+                continue
+            total += st.st_size if stat.S_ISREG(st.st_mode) else 0
+    return total
+
+
+def delete_plan(root: Path, path: Path) -> dict:
+    """What deleting the config at `path` with its files would delete: {"ok", "why" (when not ok), "items": [{"path",
+    "what" (folder, pack, gguf, vision, drafter), "bytes"}], "bytes", "folder", "gguf" (model files), "pack", "vision",
+    "drafter" (its bytes, or None), "drafter_users" (the other configs drafting with it), "kept" (what stays, said)}."""
+    path = Path(path)
+    cfg = read(path)
+    me = _res(path)
+    others = [(p, read(p)) for p in config_paths(root) if _res(p) != me]
+    refs = [r for _, c in others for r in runs_from(c)]
+    out = {"ok": False, "why": None, "items": [], "bytes": 0, "folder": None, "gguf": 0, "pack": False,
+           "vision": False, "drafter": None, "drafter_users": [], "kept": []}
+    models = _res((cfg.get("installer") or {}).get("models_dir"))
+    pack = _res(pack_of(cfg))
+    if models is None or pack is None:
+        out["why"] = "Maya's setup did not download this model's files, so it does not know which ones are its own"
+        return out
+    folder = pack.parent
+    out["folder"] = str(folder)
+    project = _res(Path(root))
+    items: list = []
+
+    def shared(p: Path) -> bool:                        # (another model runs from it, or from something in it)
+        return any(_within(r, p) for r in refs)
+
+    def covered(p: Path) -> bool:
+        return any(_within(p, it) for it, _ in items)
+
+    def add(p: Path, what: str):
+        if not covered(p) and (p.exists() or p.is_symlink()):
+            items.append((p, what))
+
+    downloaded = _within(folder, models)
+    if (downloaded and folder != models and not shared(folder) and not _within(project, folder)
+            and not _within(Path.home().resolve(), folder)):
+        add(folder, "folder")                           # (its own folder: the files, the pack, the image encoder)
+    else:                                               # (a folder other models' files are in too, or your own)
+        if not shared(pack):
+            add(pack, "pack")
+        if downloaded:
+            for f in pack_shards(pack):
+                if not shared(f):
+                    add(f, "gguf")
+        else:
+            out["kept"].append(f"Your own model files in {folder} stay; only the pack Maya built from them goes.")
+    for v in map(_res, vision_files(cfg)):
+        if v is not None and _within(v, models) and not shared(v):
+            add(v, "vision")
+    d = _res(drafter_of(cfg))
+    if d is not None and d.is_file() and _within(d, models):
+        out["drafter_users"] = [p.name for p, c in others if _res(flag(c.get("args") or [], "--dflash")) == d]
+        add(d, "drafter")
+    for p, what in items:
+        n = _size(p)
+        out["items"].append({"path": str(p), "what": what, "bytes": n})
+        out["bytes"] += n
+        if what == "drafter":
+            out["drafter"] = n
+        elif what == "vision":
+            out["vision"] = True
+        elif what == "pack":
+            out["pack"] = True
+        elif what == "gguf":
+            out["gguf"] += 1
+        else:                                           # (its folder: the GGUF files in it, the pack, the encoder)
+            try:
+                out["gguf"] += sum(1 for e in p.iterdir() if e.suffix.lower() == ".gguf" and e.is_file())
+                out["pack"] = out["pack"] or pack.is_dir()
+                out["vision"] = out["vision"] or any(v is not None and _within(v, p) and v.exists()
+                                                     for v in map(_res, vision_files(cfg)))
+            except OSError:
+                pass
+    out["ok"] = True
+    return out
+
+
+def delete(root: Path, path: Path, files: bool = False) -> dict:
+    """The config at `path` off the list: it, its start scripts, the settings kept beside it (.prev,
+    .shared-settings.json); with `files`, delete_plan's files first (a file that cannot be deleted keeps the config,
+    and says which).  {"deleted", "freed" (bytes), "drafter_users" (now drafting with MTP)}."""
+    path = Path(path)
+    freed, users, errors = 0, [], []
+    if files:
+        plan = delete_plan(root, path)
+        if not plan["ok"]:
+            raise ValueError(plan["why"])
+        for it in plan["items"]:
+            p = Path(it["path"])
+            try:
+                if p.is_dir() and not p.is_symlink():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                freed += it["bytes"]
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                errors.append(f"{p} ({e.strerror or e})")
+                continue
+            if it["what"] == "drafter":
+                try:
+                    p.parent.rmdir()                    # (its folder, when nothing else is in it)
+                except OSError:
+                    pass
+                for name in plan["drafter_users"]:      # (another model drafting with it: with MTP from now on)
+                    other = Path(root) / name
+                    cfg = read(other)
+                    if not cfg:
+                        continue
+                    other.with_name(other.name + ".prev").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+                    st = other.stat()
+                    write(other, {**cfg, "args": drop_flag(cfg.get("args") or [], "--dflash")})
+                    os.utime(other, (st.st_atime, st.st_mtime))
+                    users.append(name)
+        if errors:
+            raise OSError("could not delete " + "; ".join(errors) + " - the model stays on the list")
+    for p in (path, path.with_name(f"run-{path.stem}.sh"), path.with_name(f"run-{path.stem}.bat"),
+              path.with_name(path.name + ".prev"), path.with_name(path.stem + ".shared-settings.json")):
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    return {"deleted": path.name, "freed": freed, "files": bool(files), "drafter_users": users}
