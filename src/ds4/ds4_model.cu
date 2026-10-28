@@ -10219,6 +10219,61 @@ struct Model::Impl {
         if (rqueued) ram_cv.notify_one();
     }
 
+    // DS4_SETTLE_MS=<ms> (opt-in until measured): after a chunked prompt the expert cache catches up with what the
+    // prompt picked.  Windows feed the cache tick by tick (a window's CPU-lane picks are that tick's hits, its picks
+    // add to the heat); a run of chunks is a single tick and fed it nothing, so the decode after a long prompt found
+    // the cache as the prompt before had left it.  With it the run's picks (its own counts in the profile) add to
+    // each layer's heat and its CPU-lane picks are the tick's hits; then rounds of the ordinary swap rule (a layer's
+    // hottest CPU-lane expert in for its coldest VRAM one, while one is worth moving), each round's landed moves
+    // switched in, until no layer has one to make or the milliseconds are spent - the moves still under way then land
+    // at the next ticks.  Placement only, the expert cache's own moves (--no-expert-cache: none)
+    static double settle_ms() {
+        static const double ms = [] {
+            const char* v = ds4_env("DS4_SETTLE_MS");
+            return v != nullptr ? std::max(0.0, std::atof(v)) : 0.0;
+        }();
+        return ms;
+    }
+    bool settle_on() const { return settle_ms() > 0.0 && o.expert_cache && !cache_ths.empty(); }
+    std::vector<uint32_t> prof_run0;   // (the profile before the run)
+    void settle_learn() {
+        if (prof_run0.size() != prof.size()) return;
+        for (Layer& l : L) {
+            if (l.mtp || l.heat.size() < (size_t) l.n_exp || l.slot.size() < (size_t) l.n_exp) continue;
+            const size_t o0 = (size_t) l.il * g.n_exp;
+            for (int e = 0; e < l.n_exp; ++e) {
+                const uint32_t dn = prof[o0 + (size_t) e] - prof_run0[o0 + (size_t) e];
+                if (dn == 0) continue;
+                l.heat[(size_t) e] += (float) dn;
+                if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+            }
+        }
+    }
+    void cache_settle() {
+        const double t0 = now_ms();
+        const int64_t s0 = st.swaps;
+        int rounds = 0;
+        while (now_ms() - t0 < settle_ms()) {
+            tick_begin();
+            cache_switch();
+            for (Layer& l : L) {   // (every hot CPU-lane expert a hit: cache_queue takes the hottest a layer)
+                if (l.mtp || l.spare_vram < 0 || l.swap_pending || l.heat.size() < (size_t) l.n_exp) continue;
+                l.cpu_hits.clear();
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 2.0f) l.cpu_hits.push_back(e);
+            }
+            cache_queue();
+            tick_flush();
+            ++rounds;
+            if (sw_inflight == 0) break;   // (nothing queued, nothing under way: no expert worth moving)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (o.verbose)
+            std::fprintf(stderr, "ds4: expert cache after the prompt: %lld moves into VRAM in %.0f ms (%d rounds, "
+                                 "DS4_SETTLE_MS=%.0f)\n",
+                         (long long) (st.swaps - s0), now_ms() - t0, rounds, settle_ms());
+    }
+
     // lookahead's thread: the ranges the CPU lane asked for, read in (os::prefetch) off the lane, which computes
     void prefetch_loop() {
         std::vector<std::pair<const void*, size_t>> b;
@@ -16722,6 +16777,9 @@ struct Model::Impl {
         }
         blas_wait();   // (the prompt path's GEMM warm-up, if it still runs: finished first)
         warm_end();   // (the last prompt's warm-up: this one streams what it needs)
+        // (DS4_SETTLE_MS: the profile's counts before the run - what the run picked is the difference)
+        const bool settle = settle_on();
+        if (settle) prof_run0 = prof;
         struct Lent {   // (every way out, a failed borrow_begin's too: the room handed back once the devices are done)
             Impl* p;
             ~Lent() { (void) p->borrow_end(); }   // (an early way out already fails the prompt)
@@ -17013,10 +17071,15 @@ struct Model::Impl {
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
         pos += n;
         st.tokens += n;
+        if (settle) settle_learn();
         cache_tick(n);
         // (a part with more to come: the next part reads on, and the last one seeds the drafter - its last chunk's
-        //  taps, as one call's; a part before the skip's cut never reaches the layers they are taken at)
-        if (run_end) warm_after(n);
+        //  taps, as one call's; a part before the skip's cut never reaches the layers they are taken at - and settles
+        //  the cache once, after the whole prompt)
+        if (run_end) {
+            if (settle) cache_settle();
+            warm_after(n);
+        }
         const int nr = std::min(T_last, tap_cap);
         if (run_end && !seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
