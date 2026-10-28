@@ -1625,9 +1625,14 @@ void bench_moe() {
         cudaEventElapsedTime(&ms, a, b);
         return ms / iters;
     };
-    const int k1[6][3] = {{2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}, {2, 2, 2}};
+    int k1[6][3];   // (BENCH_MOE_K2: the uniform set's K2, default 2)
+    {
+        const char* v = std::getenv("BENCH_MOE_K2");
+        const int kk = v != nullptr ? std::atoi(v) : 2;
+        for (auto& r : k1) r[0] = r[1] = r[2] = kk;
+    }
     const int kx[6][3] = {{2, 2, 2}, {2, 2, 2}, {4, 4, 4}, {2, 2, 4}, {6, 6, 6}, {4, 2, 4}};
-    for (const auto* ks : {k1, kx}) {
+    for (const int (*ks)[3] : {(const int (*)[3]) k1, kx}) {
         ex::MixedLayouts mix;
         std::vector<unsigned long long> ptrs;
         std::vector<uint8_t*> blobs;
