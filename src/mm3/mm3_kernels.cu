@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace mm3::k {
 namespace {
@@ -26,21 +27,68 @@ __device__ __forceinline__ uint16_t f2bf(float f) {
 }
 __device__ __forceinline__ uint16_t f2h(float f) { return __half_as_ushort(__float2half_rn(f)); }
 
+#if defined(__gfx906__)
+template<int Mask> __device__ __forceinline__ float lane_swizzle_xor(float v) {
+    // In AMD GCN/CDNA ISA, bit 15 is 0 for BITMASK_PERM mode, with xor_mask in [14:10] and and_mask in [4:0].
+    static_assert((Mask & 0x8000) == 0, "ds_swizzle bitmask mode requires bit 15 (0x8000) to be 0");
+    return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), Mask));
+}
+template<int Ctrl> __device__ __forceinline__ float lane_dpp(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl, 0xf, 0xf, false));
+}
+
+// 32-lane sub-warp reduction (preserves exact 16->8->4->2->1 tree order for 2-rows-per-wave kernels like rows_dot_kernel)
+__device__ __forceinline__ float warp_sum(float v) {
+    v += lane_swizzle_xor<0x401f>(v);
+    v += lane_swizzle_xor<0x201f>(v);
+    v += lane_swizzle_xor<0x101f>(v);
+    v += lane_dpp<0x4e>(v);
+    v += lane_dpp<0xb1>(v);
+    return v;
+}
+
+// 6-Stage Wave64 Butterfly Reduction (used only where a full 64-lane wavefront is one reduction group)
+__device__ __forceinline__ float wave64_sum(float v) {
+    v = warp_sum(v);
+    v += __shfl_xor(v, 32, 64);
+    return v;
+}
+
+__device__ __forceinline__ float wave64_max(float v) {
+    v = fmaxf(v, lane_swizzle_xor<0x401f>(v));
+    v = fmaxf(v, lane_swizzle_xor<0x201f>(v));
+    v = fmaxf(v, lane_swizzle_xor<0x101f>(v));
+    v = fmaxf(v, lane_dpp<0x4e>(v));
+    v = fmaxf(v, lane_dpp<0xb1>(v));
+    v = fmaxf(v, __shfl_xor(v, 32, 64));
+    return v;
+}
+#else
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
+#endif
 
-// the sum of v over the block (blockDim.x a multiple of 32, at most 1024), every thread gets it
+// the sum of v over the block (blockDim.x a multiple of wave size, at most 1024), every thread gets it
 __device__ float block_sum(float v, float* red) {
+#if defined(__gfx906__)
+    v = wave64_sum(v);
+    const int w = threadIdx.x >> 6, l = threadIdx.x & 63, nw = blockDim.x >> 6;
+#else
     v = warp_sum(v);
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
+#endif
     __syncthreads();
     if (l == 0) red[w] = v;
     __syncthreads();
     float t = l < nw ? red[l] : 0.0f;
+#if defined(__gfx906__)
+    if (w == 0) t = wave64_sum(t);
+#else
     if (w == 0) t = warp_sum(t);
+#endif
     if (threadIdx.x == 0) red[32] = t;
     __syncthreads();
     return red[32];
@@ -49,9 +97,14 @@ __device__ float block_sum(float v, float* red) {
 // the block's max of |v| (every thread gets it)
 __device__ float block_absmax(float v, float* red) {
     v = fabsf(v);
+#if defined(__gfx906__)
+    v = wave64_max(v);
+    const int w = threadIdx.x >> 6, l = threadIdx.x & 63, nw = blockDim.x >> 6;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     const int w = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
+#endif
     __syncthreads();
     if (l == 0) red[w] = v;
     __syncthreads();
@@ -430,11 +483,18 @@ __global__ void __launch_bounds__(256) block_scores_tok_kernel(const float* iq, 
             best = fmaxf(best, dot);
         }
     }
+#if defined(__gfx906__)
+    best = wave64_max(best);
+    if ((tid & 63) == 0 && v < Hi) {
+        bs[(size_t) v * nblk + b] = best;
+    }
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) best = fmaxf(best, __shfl_xor_sync(0xffffffffu, best, o));
     if ((tid & 31) == 0) red[tid >> 5] = best;
     __syncthreads();
     if (tid < Hi) bs[(size_t) tid * nblk + b] = fmaxf(red[2 * tid], red[2 * tid + 1]);
+#endif
 }
 // A prompt's: a block takes 64 vectors (64 / Hi queries x Hi heads) and a key block's keys 64 at a time, thread
 // (tv = tid / 16, tk = tid % 16) the dot products of vectors 4 tv .. 4 tv + 3 with keys tk + 16 i (i < 4) of each 64 -
@@ -534,20 +594,30 @@ constexpr int kSelWarps = 4;
 __global__ void select_kernel(const float* bs, const int* pos, int T, int Hi, int nblk, int blk, int topk, int* kept,
                               bool stage) {
     extern __shared__ float srow[];
+#if defined(__gfx906__)
+    const int wl = threadIdx.x >> 6, wid = blockIdx.x * kSelWarps + wl, lane = threadIdx.x & 63;
+    constexpr int kLaneStride = 64;
+#else
     const int wl = threadIdx.x >> 5, wid = blockIdx.x * kSelWarps + wl, lane = threadIdx.x & 31;
+    constexpr int kLaneStride = 32;
+#endif
     if (wid >= T * Hi) return;
     const int h = wid / T, t = wid % T;
     const int qb = pos[t] / blk;
     int* out = kept + ((size_t) h * T + t) * topk;
     const float* row = bs + ((size_t) h * T + t) * nblk;
     if (qb + 1 <= topk) {
-        for (int i = lane; i < topk; i += 32) out[i] = i <= qb ? i : -1;
+        for (int i = lane; i < topk; i += kLaneStride) out[i] = i <= qb ? i : -1;
         return;
     }
     if (stage) {
         float* sr = srow + (size_t) wl * nblk;
-        for (int b = lane; b < qb; b += 32) sr[b] = row[b];
+        for (int b = lane; b < qb; b += kLaneStride) sr[b] = row[b];
+#if defined(__gfx906__)
+        __builtin_amdgcn_wave_barrier();
+#else
         __syncwarp();
+#endif
         row = sr;
     }
     if (lane == 0) out[0] = qb;
@@ -556,13 +626,24 @@ __global__ void select_kernel(const float* bs, const int* pos, int T, int Hi, in
     for (int r = 1; r < topk; ++r) {
         float bv = -INFINITY;
         int bi = 0x7fffffff;
-        for (int b = lane; b < qb; b += 32) {
+        for (int b = lane; b < qb; b += kLaneStride) {
             const float sv = row[b];
             if (better(ps, pi, sv, b) && better(sv, b, bv, bi)) {
                 bv = sv;
                 bi = b;
             }
         }
+#if defined(__gfx906__)
+#pragma unroll
+        for (int o = 32; o > 0; o >>= 1) {
+            const float ov = __shfl_xor(bv, o, 64);
+            const int oi = __shfl_xor(bi, o, 64);
+            if (better(ov, oi, bv, bi)) {
+                bv = ov;
+                bi = oi;
+            }
+        }
+#else
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
@@ -572,6 +653,7 @@ __global__ void select_kernel(const float* bs, const int* pos, int T, int Hi, in
                 bi = oi;
             }
         }
+#endif
         if (lane == 0) out[r] = bi == 0x7fffffff ? -1 : bi;
         ps = bv;
         pi = bi;
@@ -2118,13 +2200,32 @@ void block_scores(const float* iq, const uint16_t* ic, const int* pos, int T, in
     check("block_scores");
 }
 
+static int select_wave_size() {
+#if defined(STRATA_USE_HIP)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 32;
+    static int cached[16] = {};
+    if (cached[dev] != 0) return cached[dev];
+    cudaDeviceProp prop{};
+    const int ws = (cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+                    std::strncmp(prop.gcnArchName, "gfx906", 6) == 0)
+                       ? 64
+                       : 32;
+    cached[dev] = ws;
+    return ws;
+#else
+    return 32;
+#endif
+}
+
 void select_blocks(const float* bs, const int* pos, int T, int Hi, int nblk, int blk, int topk, int* kept,
                    cudaStream_t s) {
     if (T <= 0) return;
     const int warps = T * Hi;
     const size_t smem = (size_t) kSelWarps * nblk * sizeof(float);
     const bool stage = !msa_old && smem <= 48 * 1024;
-    select_kernel<<<(warps + kSelWarps - 1) / kSelWarps, 32 * kSelWarps, stage ? smem : 0, s>>>(
+    const int wave_size = select_wave_size();
+    select_kernel<<<(warps + kSelWarps - 1) / kSelWarps, wave_size * kSelWarps, stage ? smem : 0, s>>>(
         bs, pos, T, Hi, nblk, blk, topk, kept, stage);
     check("select_blocks");
 }
