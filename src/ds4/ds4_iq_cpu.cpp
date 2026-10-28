@@ -4,6 +4,7 @@
 #include "ds4_gguf_cpu.hpp"
 
 #if defined(STRATA_NATIVE_EXPERTS)
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #define GGML_COMMON_DECL_CPP
@@ -107,37 +108,9 @@ const IqCpuIsa& isa() {
     return c;
 }
 
-// ---- CPUs whose BMI2 pdep / pext run in microcode: AMD family 17h (Zen, Zen+, Zen 2) and Hygon's family 18h (Zen's
-// design) - one pdep there takes hundreds of cycles against one elsewhere (Intel since Haswell, Zen 3 and later).
-// ggml-cpu builds IQ1_S's grid indices by pdep wherever it is compiled with BMI2 (-march=native, or the portable
-// build's GGML_BMI2), so a Zen 2 CPU lane spent most of an IQ1_S expert there.
-bool pdep_slow_cpu() {
-#if defined(IQ_X86)
-    unsigned r[4] = {0, 0, 0, 0};
-    auto cpuid = [&](unsigned leaf) {
-#if defined(_MSC_VER)
-        int x[4];
-        __cpuidex(x, (int) leaf, 0);
-        for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
-#else
-        __cpuid_count(leaf, 0, r[0], r[1], r[2], r[3]);
-#endif
-    };
-    cpuid(0);
-    char v[13];
-    std::memcpy(v, &r[1], 4);   // (the vendor: ebx, edx, ecx)
-    std::memcpy(v + 4, &r[3], 4);
-    std::memcpy(v + 8, &r[2], 4);
-    v[12] = 0;
-    const bool amd = std::strcmp(v, "AuthenticAMD") == 0, hygon = std::strcmp(v, "HygonGenuine") == 0;
-    if ((!amd && !hygon) || r[0] < 1) return false;
-    cpuid(1);
-    const unsigned base = (r[0] >> 8) & 0xfu, fam = base == 0xfu ? base + ((r[0] >> 20) & 0xffu) : base;
-    return amd ? fam == 0x17u : fam == 0x18u;
-#else
-    return false;
-#endif
-}
+// ---- ggml-cpu builds IQ1_S's grid indices by pdep wherever it is compiled with BMI2 (-march=native, or the portable
+// build's GGML_BMI2), so on the CPUs that run pdep in microcode (kc::cpu_pdep_slow: AMD family 17h, Hygon) a Zen 2
+// CPU lane spent most of an IQ1_S expert there.
 // IQ1_S's rows without pdep (ours, the integer index form - ggml's non-BMI2 branch, the same bits): for every token
 // count (one token too, where ggml-cpu's dot serves elsewhere) and on every setup (the one-GPU path's switch,
 // iq_cpu_iq1s_rows, does not turn them off).  DS4_IQ1_PDEP=0 forces it on any CPU (tests: the parity of the form);
@@ -146,7 +119,7 @@ bool iq1_no_pdep() {
     static const bool v = [] {
         const char* e = std::getenv("DS4_IQ1_PDEP");
         if (e != nullptr && e[0] != '\0') return std::atoi(e) == 0;
-        return pdep_slow_cpu();
+        return kc::cpu_pdep_slow();
     }();
     return v;
 }
@@ -846,7 +819,7 @@ bool own(int type) {
             ok[k] = good;   // dot that runs pdep in microcode here, or that the test asked to leave out)
             std::fprintf(stderr, "ds4: CPU lane IQ1_S rows: %s\n",
                          !good ? "ggml-cpu's (ours differ from its dot in this build)"
-                         : pdep_slow_cpu() ? "ours without pdep (this CPU runs pdep in microcode)"
+                         : kc::cpu_pdep_slow() ? "ours without pdep (this CPU runs pdep in microcode)"
                                            : "ours without pdep (DS4_IQ1_PDEP=0)");
             return;
         }

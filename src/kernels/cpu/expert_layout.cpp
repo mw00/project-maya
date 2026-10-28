@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
@@ -25,6 +26,7 @@ const ExpertLayout& expert_layout() { return g_layout; }
 bool cpu_avx512_ok() { return false; }
 bool cpu_avx512bw_ok() { return false; }
 bool cpu_avx2_ok() { return false; }
+bool cpu_pdep_slow() { return false; }
 #else
 bool cpu_avx512_ok() {
     static const bool ok = [] {
@@ -122,6 +124,35 @@ bool cpu_avx2_ok() {
         return ((r[1] >> 5) & 1u) != 0;                    // AVX2
     }();
     return ok;
+}
+
+// AMD family 17h (Zen, Zen+, Zen 2) and Hygon's family 18h (Zen's design) run BMI2 pdep / pext in microcode - one
+// pdep there takes hundreds of cycles against one elsewhere (Intel since Haswell, Zen 3 and later)
+bool cpu_pdep_slow() {
+    static const bool slow = [] {
+        unsigned r[4] = {0, 0, 0, 0};
+        auto cpuid = [&](unsigned leaf) {
+#if defined(_MSC_VER)
+            int x[4];
+            __cpuidex(x, (int) leaf, 0);
+            for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+            __cpuid_count(leaf, 0, r[0], r[1], r[2], r[3]);
+#endif
+        };
+        cpuid(0);
+        char v[13];
+        std::memcpy(v, &r[1], 4);   // (the vendor: ebx, edx, ecx)
+        std::memcpy(v + 4, &r[3], 4);
+        std::memcpy(v + 8, &r[2], 4);
+        v[12] = 0;
+        const bool amd = std::strcmp(v, "AuthenticAMD") == 0, hygon = std::strcmp(v, "HygonGenuine") == 0;
+        if ((!amd && !hygon) || r[0] < 1) return false;
+        cpuid(1);
+        const unsigned base = (r[0] >> 8) & 0xfu, fam = base == 0xfu ? base + ((r[0] >> 20) & 0xffu) : base;
+        return amd ? fam == 0x17u : fam == 0x18u;
+    }();
+    return slow;
 }
 
 #endif  // STRATA_X86

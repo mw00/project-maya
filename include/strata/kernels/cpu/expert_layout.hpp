@@ -43,6 +43,9 @@ struct ExpertLayout {
 bool cpu_avx512_ok();
 /// AVX2 + FMA, with the OS saving the YMM state (the AVX2 kernels' gate).
 bool cpu_avx2_ok();
+/// Whether BMI2 pdep / pext run in microcode here (AMD Zen, Zen+, Zen 2; Hygon): the kernels that avoid pdep serve
+/// these CPUs, ggml-cpu's pdep forms the others.
+bool cpu_pdep_slow();
 /// AVX-512 F, BW, VL and DQ with the OS saving the state: what iq_avx512.cpp's kernels need to run (no VNNI or
 /// VBMI).  The engine still picks them only where cpu_avx512_ok() (faster than AVX-2 there); tests run them on any
 /// such CPU.  STRATA_FORCE_AVX2=1 answers no.
