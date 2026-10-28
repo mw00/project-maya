@@ -620,9 +620,11 @@ __global__ void EXL3_BOUNDS(kMinBlocksMv<K2>) mv_kernel(const KBatch b) {
 // and at agent scope that is a write-back and an invalidate of the XCD's whole L2 (buffer_wbl2 / buffer_inv: on a
 // MI350X most of a 6-bit attention GEMV's time - DeepSeek-V4.1's wq_b, 512 blocks: 77.7 -> 30.1 us, wo_b 125.8 -> 40.9
 // us; its decode with DSpark 52.0 -> 74.3 tok/s); the launch boundary orders them once instead.  The same sums in split order and the same epilogue: the same bits.  Block: one output
-// block of a split job
-__global__ void __launch_bounds__(kThreads) mv_reduce_kernel(const KBatch b) {
-    __shared__ float out[kTok * kCols];
+// block of a split job for one activation (blockIdx.y), a thread a column; the split's loads go out 8 at a time ahead
+// of their adds (a block for all the activations, a thread's nc x S loads one after another: 19.3 us a call with
+// DSpark, half the GEMV's own)
+__global__ void __launch_bounds__(kCols) mv_reduce_kernel(const KBatch b) {
+    __shared__ float out[kCols];
     if (b.skip != nullptr && *b.skip) return;
     int ji = 0, g = (int) blockIdx.x;
     for (;; ++ji) {
@@ -631,16 +633,23 @@ __global__ void __launch_bounds__(kThreads) mv_reduce_kernel(const KBatch b) {
         g -= groups;
     }
     const KJob& J = b.j[ji];
-    const int warp = threadIdx.x >> 5;
-    if (threadIdx.x < kCols)
-        for (int c = 0; c < J.nc; ++c) {
-            float s = 0.0f;
-            for (int i = 0; i < J.S; ++i) s += J.part[((size_t) c * J.S + i) * J.n + g * kCols + threadIdx.x];
-            out[c * kCols + threadIdx.x] = s;
-        }
+    const int c = (int) blockIdx.y;
+    if (c >= J.nc) return;
+    const float* p = J.part + (size_t) c * J.S * J.n + g * kCols + threadIdx.x;
+    float s = 0.0f;
+    int i = 0;
+    for (; i + 8 <= J.S; i += 8) {
+        float v[8];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) v[u] = p[(size_t) (i + u) * J.n];
+#pragma unroll
+        for (int u = 0; u < 8; ++u) s += v[u];
+    }
+    for (; i < J.S; ++i) s += p[(size_t) i * J.n];
+    out[threadIdx.x] = s;
     __syncthreads();
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
-    if (warp < J.nc) epilogue(out + warp * kCols, J.svh + g * kCols, J.alpha, bias, J.y + warp * J.y_cs + g * kCols);
+    if (threadIdx.x < 32) epilogue(out, J.svh + g * kCols, J.alpha, bias, J.y + c * J.y_cs + g * kCols);
 }
 #endif
 
@@ -2228,9 +2237,10 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         b.skip = g_skip;
         if (!dispatch<RunMv>(m0.k2, m0.cb, b, blocks, s)) return false;
 #if defined(STRATA_USE_HIP)
-        int rblocks = 0;
-        for (int j = 0; j < nb; ++j) rblocks += b.j[j].S > 1 ? b.j[j].n / kCols : 0;
-        if (rblocks > 0) mv_reduce_kernel<<<rblocks, kThreads, 0, s>>>(b);
+        int rblocks = 0, rnc = 0;
+        for (int j = 0; j < nb; ++j)
+            if (b.j[j].S > 1) rblocks += b.j[j].n / kCols, rnc = std::max(rnc, b.j[j].nc);
+        if (rblocks > 0) mv_reduce_kernel<<<dim3(rblocks, rnc), kCols, 0, s>>>(b);
 #endif
     }
     launch_check("mv");
