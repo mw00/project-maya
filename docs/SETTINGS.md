@@ -401,6 +401,9 @@ context shares the memory beside the model among the N conversations.
   another, each alone with the drafter. The drafts of two or three requests are made in one drafter pass (their
   blocks' rows through the DSpark blocks together: 79.3 against 72.4 with a pass each); where the experts are mostly
   in RAM, each verified row costs the CPU lane its experts, so a round of two windows takes longer than one of one.
+  One RTX 3090 + two RTX 5060 Ti (`--tp 2`, 207 GB of experts read in place from the files), 2 x 160 tokens: 25.2
+  tok/s in all in one drafter pass, 19.4 with a pass each, 19.8 without drafts, 19.5 one after another alone with
+  the drafter; through the server two requests at once ran at 14-19 tok/s each, about what each gets alone.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
   longer wait in line for a whole answer - but a new prompt is read while the others wait.
 
