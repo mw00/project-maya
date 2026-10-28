@@ -680,16 +680,29 @@ void x512_rows(const uint8_t* w, size_t rb, int n, const void* const* act, int n
 }
 
 // the calls of `type` these rows take: from how many tokens (0: none).  DS4_IQ512=1: every call of IQ2_XS, IQ3_XXS and
-// IQ1_M wherever the CPU runs them (they give ggml-cpu's bits, so only the speed changes); unset or 0: none.  The CPUs
-// that run pdep in microcode never take the IQ1_M rows.
+// IQ1_M wherever the CPU runs them; =0: none.  Unset, by the CPU (the rows give ggml-cpu's bits everywhere, so the choice
+// only changes the speed): IQ2_XS from one token and IQ1_M from one token, but from two on AMD Zen 4 (family 19h: one
+// token there within the noise of ggml-cpu's dot; the same scheme timed faster than ggml-cpu's dot on Zen 4 and Zen 5).
+// A Xeon Gold 6152 (Skylake-SP), one thread, GB/s of weights against the rows the lane took before (ds4_iq512_rows_test
+// --bench): IQ2_XS 1 / 2 / 4 tokens 2.32 / 2.05 / 1.37 -> 3.62 / 3.02 / 2.09, IQ1_M 1.12 / 0.95 / 0.64 -> 2.05 / 1.63 /
+// 1.08.  IQ3_XXS keeps the rows above: the VBMI ones where the CPU has VBMI, and on that Xeon the AVX2 ones were faster
+// (3.00 / 2.66 / 2.00 against 2.52 / 2.36 / 2.03).  The CPUs that run pdep in microcode never take the IQ1_M rows.
 int x512_from(int type) {
-    static const bool on = [] {
+    struct From {
+        int k[3];   // (IQ2_XS, IQ3_XXS, IQ1_M)
+    };
+    static const From from = [] {
         const char* v = std::getenv("DS4_IQ512");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        const int mode = v == nullptr || v[0] == '\0' ? -1 : std::atoi(v) != 0 ? 1 : 0;   // (-1 unset)
+        const CpuFam f = cpu_fam();
+        From m{};
+        if (!isa().x512 || mode == 0) return m;
+        m.k[0] = 1;
+        m.k[1] = mode == 1 ? 1 : 0;
+        m.k[2] = pdep_slow_cpu() ? 0 : mode == 1 ? 1 : f.amd && f.fam == 0x19u ? 2 : 1;
+        return m;
     }();
-    if (!on || !isa().x512) return 0;
-    if (type == GGML_TYPE_IQ1_M) return pdep_slow_cpu() ? 0 : 1;
-    return type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS ? 1 : 0;
+    return type == GGML_TYPE_IQ2_XS ? from.k[0] : type == GGML_TYPE_IQ3_XXS ? from.k[1] : type == GGML_TYPE_IQ1_M ? from.k[2] : 0;
 }
 // a type of these rows (IQ3_XXS when own() took them)
 bool x512_type(int type) {
@@ -1009,7 +1022,7 @@ bool own_nt(int type, int nt) {
     if (type == GGML_TYPE_IQ1_S && !iq1_no_pdep() && (nt < 2 || !g_iq1_on.load(std::memory_order_relaxed))) return false;
 #if defined(IQ_X86)
     if (!own(type)) return false;
-    return !x512_type(type) || nt >= x512_from(type);
+    return !x512_type(type) || nt >= x512_from(type);   // (IQ1_M on Zen 4: from 2 tokens)
 #else
     return own(type);
 #endif

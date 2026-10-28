@@ -757,18 +757,22 @@ measured choice as before. The log says `ds4: CPU lane IQ1_S rows: ours without 
 | --- | --- | --- |
 | `DS4_IQ1_PDEP` | `0` on AMD family 17h / Hygon, else `1` | `0`: the rows without `pdep` on any CPU (tests: `ds4_iq1_rows_test` checks them against ggml-cpu); `1`: the measured choice (ggml-cpu's dot for a single token) |
 
-## DeepSeek: AVX-512 rows for IQ2_XS, IQ3_XXS and IQ1_M experts
+## DeepSeek: AVX-512 rows for IQ2_XS and IQ1_M experts
 
 On a CPU with AVX-512 (F, BW, VL, DQ) and BMI2 - Intel Xeons since Skylake-SP, AMD Zen 4 and later - the CPU lane has
-rows of its own for IQ2_XS, IQ3_XXS and IQ1_M experts: ggml-cpu's AVX2 dot in 512-bit lanes, each 64 values decoded
-once for the call's tokens. The 7-bit sign indices of IQ2_XS / IQ3_XXS get their parity bits in a vector (by VPOPCNTDQ
-where the CPU has it) instead of a table load each, and IQ1_M's grid indices come from `pdep`. They need no VBMI, and
-they give ggml-cpu's numbers bit for bit (checked against its dot at the start; if they ever differ, the rows before
-are kept). Opt-in until measured. The log says `ds4: CPU lane iq2_xs rows: AVX-512` when they apply.
+rows of its own for IQ2_XS and IQ1_M experts (and IQ3_XXS): ggml-cpu's AVX2 dot in 512-bit lanes, each 64 values
+decoded once for the call's tokens. The 7-bit sign indices of IQ2_XS / IQ3_XXS get their parity bits in a vector (by
+VPOPCNTDQ where the CPU has it) instead of a table load each, and IQ1_M's grid indices come from `pdep`. They need no
+VBMI, and they give ggml-cpu's numbers bit for bit (checked against its dot at the start; if they ever differ, the rows
+before are kept). By default they serve IQ2_XS from one token a call and IQ1_M from one token (from two on Zen 4).
+A Xeon Gold 6152 (Skylake-SP), one thread, GB/s of weights for 1 / 2 / 4 tokens against the rows before: IQ2_XS
+2.32 / 2.05 / 1.37 -> 3.62 / 3.02 / 2.09, IQ1_M 1.12 / 0.95 / 0.64 -> 2.05 / 1.63 / 1.08 (`ds4_iq512_rows_test
+--bench`, not yet measured on a whole CPU lane). IQ3_XXS keeps its rows (on that Xeon its AVX2 rows were faster). The
+log says `ds4: CPU lane iq2_xs rows: AVX-512` when they apply.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `DS4_IQ512` | off | `1`: these rows for every call of the three types wherever the CPU runs them (tests: `ds4_iq512_rows_test` checks them against ggml-cpu) |
+| `DS4_IQ512` | by CPU (above) | `1`: these rows for every call of the three types wherever the CPU runs them (tests: `ds4_iq512_rows_test` checks them against ggml-cpu); `0`: never |
 
 ## DeepSeek: a GEMV call's int8 inputs rounded in one launch
 
