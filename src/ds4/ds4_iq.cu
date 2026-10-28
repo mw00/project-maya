@@ -42,11 +42,13 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 
 namespace strata::ds4::gguf::iq {
 namespace {
@@ -1210,30 +1212,33 @@ __global__ void __launch_bounds__(kThreads) values_kernel(const uint8_t* __restr
     }
 }
 
-bool tc_ok() {   // as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_DS4_NO_TC=1 keeps the F32 kernel
-#if defined(STRATA_USE_HIP)
-#if STRATA_HAS_WMMA
-    static const bool ok = [] {
-        int dev = 0;
-        cudaDeviceProp p{};
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
-        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-               (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0) &&
-               !(v != nullptr && v[0] == '1');
-    }();
-    return ok;
-#else
+// as ds4_gguf.cu's: sm_70 and later (AMD: RDNA 3 / 4), STRATA_DS4_NO_TC=1 keeps the F32 kernel - per device (the GPUs
+// of a run need not be of one generation: one before sm_70 beside newer ones keeps its F32 kernel)
+bool tc_ok() {
+#if defined(STRATA_USE_HIP) && !STRATA_HAS_WMMA
     return false;
-#endif
 #else
-    static const bool ok = [] {
-        int dev = 0, major = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    static const bool off = [] {
         const char* v = std::getenv("STRATA_DS4_NO_TC");
-        return major >= 7 && !(v != nullptr && v[0] == '1');
+        return v != nullptr && v[0] == '1';
     }();
-    return ok;
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+#if defined(STRATA_USE_HIP)
+        cudaDeviceProp p{};
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                        (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0);
+#else
+        int major = 0;
+        const bool ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 7;
+#endif
+        k = ok ? 2 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k == 2;
 #endif
 }
 
@@ -1343,17 +1348,20 @@ void launch_set(const SetArgs& a, dim3 grid, cudaStream_t s) {
     }
     pdl_launch(set_kernel<T, GU, BM, EPI>, grid, kThreads, 0, s, a);
 }
-// the light sets' int8 rows, per stream (kLightMaxExp kLightRows rows of k)
+// the light sets' int8 rows, per device and stream (kLightMaxExp kLightRows rows of k): the default stream is one handle
+// on every device (and a destroyed stream's handle may come back on another)
 struct LightBuf {
     int8_t* q = nullptr;
     float* d = nullptr;
     size_t cap = 0;
 };
 std::mutex g_lmu;
-std::unordered_map<cudaStream_t, LightBuf> g_light;
+std::map<std::pair<int, cudaStream_t>, LightBuf> g_light;
 LightBuf* light_buf(cudaStream_t s, int k) {
     std::lock_guard<std::mutex> lk(g_lmu);
-    LightBuf& b = g_light[s];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    LightBuf& b = g_light[{dev, s}];
     const size_t need = (size_t) kLightMaxExp * kLightRows * (size_t) std::max(k, 8192);
     if (b.cap < need) {
         if (b.q != nullptr) cudaFree(b.q);

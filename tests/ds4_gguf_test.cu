@@ -7,7 +7,7 @@
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
 // ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ar <device> <device> [rows]
 // (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times) | --trims (the decode trims alone:
-// test_decode_trims)
+// test_decode_trims) | --devices (every GPU in one process: each one's default stream and its own, bit for bit)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
@@ -1172,6 +1172,187 @@ const std::pair<int, int> kQPairs[] = {
     // (MXFP4 beside a low-bit role: orcarouter's Mix-256G - IQ3 gate / ups over MXFP4 downs, and the other way round)
     {gg::iq::kIQ3_XXS, gg::kTypeMXFP4},   {gg::kTypeMXFP4, gg::iq::kIQ3_S},   {gg::iq::kIQ2_S, gg::kTypeMXFP4}};
 constexpr int kQPairIQ1 = 9;   // (the first IQ1 pair)
+
+// ---------------------------------------------------------------- one layer's outputs, compared between runs
+// a low-bit layer's outputs on the token, window and light paths (on stream s, the current device; ex: the experts'
+// blobs there): 3 tokens' experts (one pick off the device: an empty group), their window, and two prompt sets - one of
+// experts of at most 4 rows, one of at most 12 (the light kernels' two forms) - all in one vector
+std::vector<float> iq_outputs(const QExperts& E, const uint8_t* ex, cudaStream_t s) {
+    const int D = E.D, F = E.F, n_exp = E.n_exp, k = 6, T = 3;
+    const float lim = 10.0f;
+    std::mt19937 r2(77);   // (the same inputs whichever run asks)
+    auto fr = [&](float a) { return std::uniform_real_distribution<float>(-a, a)(r2); };
+    std::vector<int> pick((size_t) T * 8, 0);
+    std::vector<float> pw((size_t) T * 8, 0.0f);
+    std::vector<unsigned long long> pp((size_t) T * 8, 0ull);
+    for (int t = 0; t < T; ++t)
+        for (int i = 0; i < k; ++i) {
+            pick[t * 8 + i] = (3 * t + 2 * i) % n_exp;
+            pw[t * 8 + i] = 0.2f + 0.1f * fr(1.0f);
+            pp[t * 8 + i] = t == 1 && i == 2 ? 0ull : (unsigned long long) (ex + (size_t) pick[t * 8 + i] * E.blob);
+        }
+    std::vector<float> x((size_t) T * D), sh((size_t) T * D);
+    for (auto& v : x) v = fr(1.0f);
+    for (auto& v : sh) v = fr(0.1f);
+    float *dx = dev(x), *dsh = dev(sh), *dpw = dev(pw);
+    unsigned long long* dpp = dev(pp);
+    float* dh = dev(std::vector<float>((size_t) 8 * F));
+    float* dout = dev(std::vector<float>(D));
+    std::vector<float> out;
+    for (int t = 0; t < T; ++t) {
+        x3::MoeArgs a;
+        a.plan_ptr = dpp + t * 8;
+        a.plan_w = dpw + t * 8;
+        a.lay = E.lay;
+        a.k = k;
+        a.n_embd = D;
+        a.n_ff = F;
+        a.limit = lim;
+        gg::moe_gate_up(a, dx + (size_t) t * D, dh, s);
+        gg::moe_down(a, dh, dsh + (size_t) t * D, dout, s);
+        CU(cudaStreamSynchronize(s));
+        for (const auto& v : {host(dout, (size_t) D), host(dh, (size_t) k * F)}) out.insert(out.end(), v.begin(), v.end());
+    }
+    {   // the window
+        std::vector<unsigned long long> gptr;
+        std::vector<int> gstart, gent;
+        for (int x0 = 0; x0 < n_exp; ++x0) {
+            std::vector<int> ents;
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < k; ++i)
+                    if (pick[t * 8 + i] == x0 && pp[t * 8 + i] != 0ull) ents.push_back(t * 8 + i);
+            if (ents.empty()) continue;
+            gptr.push_back((unsigned long long) (ex + (size_t) x0 * E.blob));
+            gstart.push_back((int) gent.size());
+            for (int e : ents) gent.push_back(e);
+        }
+        gstart.push_back((int) gent.size());
+        std::vector<int> ng(1, (int) gptr.size()), cflag(T, 0);
+        unsigned long long* dgp = dev(gptr);
+        int *dgs = dev(gstart), *dge = dev(gent), *dng = dev(ng), *dflag = dev(cflag);
+        float* dcpu = dev(std::vector<float>((size_t) T * D, 0.0f));
+        float* dwh = dev(std::vector<float>((size_t) T * 8 * F));
+        float* dpart = dev(std::vector<float>((size_t) T * 8 * D));
+        float* dwo = dev(std::vector<float>((size_t) T * D));
+        x3::WinArgs w;
+        w.grp_ptr = dgp;
+        w.grp_start = dgs;
+        w.grp_ent = dge;
+        w.n_groups = dng;
+        w.plan_ptr = dpp;
+        w.plan_w = dpw;
+        w.cpu_part = dcpu;
+        w.cpu_stride = D;
+        w.cpu_flag = dflag;
+        w.x = dx;
+        w.x_stride = D;
+        w.h = dwh;
+        w.part = dpart;
+        w.sh_out = dsh;
+        w.out = dwo;
+        w.out_stride = D;
+        w.lay = E.lay;
+        w.T = T;
+        w.k = k;
+        w.n_embd = D;
+        w.n_ff = F;
+        w.limit = lim;
+        if (!gg::win_experts(w, s)) ++g_fail;
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> wo = host(dwo, (size_t) T * D);
+        out.insert(out.end(), wo.begin(), wo.end());
+        cudaFree(dgp), cudaFree(dgs), cudaFree(dge), cudaFree(dng), cudaFree(dflag), cudaFree(dcpu), cudaFree(dwh);
+        cudaFree(dpart), cudaFree(dwo);
+    }
+    for (int mul : {1, 3}) {   // the prompt sets: experts of 0 .. 4 rows, then 0 .. 12
+        std::vector<int> bounds(n_exp + 1, 0);
+        for (int e = 0; e < n_exp; ++e) bounds[e + 1] = bounds[e] + mul * ((e * 7 + 3) % 5);
+        const int R = bounds[n_exp], NT = 16;
+        int max_rows = 0;
+        for (int e = 0; e < n_exp; ++e) max_rows = std::max(max_rows, bounds[e + 1] - bounds[e]);
+        std::vector<int> idx(R);
+        for (int r = 0; r < R; ++r) idx[r] = (r * 5) % NT;
+        std::vector<float> xs((size_t) NT * D);
+        for (auto& v : xs) v = fr(1.0f);
+        float* dxs = dev(xs);
+        int *dbd = dev(bounds), *didx = dev(idx);
+        uint16_t* dh16 = dev(std::vector<uint16_t>((size_t) R * F));
+        float* dy = dev(std::vector<float>((size_t) R * D));
+        x3::SetArgs sa;
+        sa.wbase = ex;
+        sa.stride = E.blob;
+        sa.lay = E.lay;
+        sa.n_exp = n_exp;
+        sa.bounds = dbd;
+        sa.row0 = 0;
+        sa.max_rows = max_rows;
+        sa.n_embd = D;
+        sa.n_ff = F;
+        sa.limit = lim;
+        gg::set_gate_up(sa, dxs, D, didx, dh16, F, s);
+        gg::set_down(sa, dh16, F, dy, D, s);
+        CU(cudaStreamSynchronize(s));
+        for (uint16_t v : host(dh16, (size_t) R * F)) out.push_back((float) v);   // (the F16 bits)
+        const std::vector<float> y = host(dy, (size_t) R * D);
+        out.insert(out.end(), y.begin(), y.end());
+        cudaFree(dxs), cudaFree(dbd), cudaFree(didx), cudaFree(dh16), cudaFree(dy);
+    }
+    cudaFree(dx), cudaFree(dsh), cudaFree(dpw), cudaFree(dpp), cudaFree(dh), cudaFree(dout);
+    return out;
+}
+bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
+}
+
+// --devices: every GPU in this process - a low-bit layer's token experts, window and light sets on each one's default
+// stream (one handle on every device: the light sets' scratch and the tensor-core check are the device's own) and on a
+// stream of its own, bit for bit the same; and, between GPUs of one compute capability, the same as the first one's
+void test_devices() {
+    int n = 0;
+    CU(cudaGetDeviceCount(&n));
+    std::vector<std::vector<float>> first;   // (each compute capability's first results)
+    std::vector<int> first_cc;
+    for (int round = 0; round < 2; ++round)   // (twice round: a GPU after another on the default stream, both ways)
+        for (int d = 0; d < n; ++d) {
+            CU(cudaSetDevice(d));
+            int major = 0, minor = 0;
+            CU(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d));
+            CU(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, d));
+            cudaStream_t own;
+            CU(cudaStreamCreate(&own));
+            if (!gg::prepare(own) || !gg::prepare(nullptr)) {
+                ++g_fail;
+                std::printf("device %d: prepare failed\n", d);
+                continue;
+            }
+            rng.seed(4321);   // (the same experts on every GPU)
+            QExperts E = make_q(1024, 512, 10, gg::iq::kIQ1_M, gg::iq::kIQ2_S);
+            const std::vector<float> a = iq_outputs(E, E.dev, own), b = iq_outputs(E, E.dev, nullptr);
+            const bool same = same_bits(a, b);
+            if (!same) ++g_fail;
+            std::printf("device %d (sm_%d%d) round %d: default stream vs its own  %s\n", d, major, minor, round,
+                        same ? "ok    bit for bit" : "FAIL  differ");
+            const int cc = 10 * major + minor;
+            size_t at = 0;
+            while (at < first_cc.size() && first_cc[at] != cc) ++at;
+            if (at == first_cc.size()) {
+                if (!first.empty())   // (another generation: its own math library's expf - told, not failed)
+                    std::printf("device %d: the first GPU's results (sm_%d)          %s\n", d, first_cc[0],
+                                same_bits(first[0], a) ? "same bits" : "differ (another compute capability)");
+                first_cc.push_back(cc);
+                first.push_back(a);
+            } else {
+                const bool eq = same_bits(first[at], a);
+                if (!eq) ++g_fail;
+                std::printf("device %d: the first sm_%d's results                 %s\n", d, cc, eq ? "ok    bit for bit" : "FAIL  differ");
+            }
+            CU(cudaStreamSynchronize(own));
+            CU(cudaStreamDestroy(own));
+            cudaFree(E.dev);
+        }
+    CU(cudaSetDevice(0));
+    if (n < 2) std::printf("devices: one GPU - nothing between GPUs to compare\n");
+}
 
 // a token's 6 low-bit experts at full size: GB/s of the weights read (only: the token experts of the first pair - the
 // reference - and of the pairs with a type whose name holds it, e.g. "IQ1"; no prompt sets)
@@ -2695,6 +2876,21 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::strcmp(argv[1], "--kv") == 0) {   // the caches' packing alone
         test_kv_pack(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--devices") == 0) {   // every GPU, each one's default stream and its own
+        // (plain launches on the legacy default stream, unless DS4_PDL says otherwise)
+#ifdef _WIN32
+        if (std::getenv("DS4_PDL") == nullptr) _putenv_s("DS4_PDL", "0");
+#else
+        setenv("DS4_PDL", "0", 0);
+#endif
+        test_devices();
+        if (gg::launch_errors() != 0) {
+            std::printf("launch errors: %d\n", gg::launch_errors());
+            ++g_fail;
+        }
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }

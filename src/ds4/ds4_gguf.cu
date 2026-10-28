@@ -15,8 +15,9 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 #include <thread>
 #include <string>
@@ -1083,31 +1084,32 @@ __global__ void __launch_bounds__(kThreads) mx_set_wmma_kernel(const SetK a) {
         }
 }
 #endif
-bool tc_ok() {   // sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); STRATA_DS4_NO_TC=1 keeps the F32 kernel
+// sm_70 and later (WMMA F16) / AMD gfx11, gfx12 (wave32 WMMA); STRATA_DS4_NO_TC=1 keeps the F32 kernel - per device
+// (the GPUs of a run need not be of one generation: a card before sm_70 beside newer ones keeps its F32 kernel)
+bool tc_ok() {
+    static const bool off = [] {
+        const char* v = std::getenv("STRATA_DS4_NO_TC");
+        return v != nullptr && v[0] == '1';
+    }();
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int k = known[dev].load(std::memory_order_relaxed);
+    if (k == 0) {
+        bool ok = false;
 #if defined(STRATA_USE_HIP)
-    static const bool ok = [] {
-        int dev = 0;
-        cudaGetDevice(&dev);
         cudaDeviceProp prop{};
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
-        if (v != nullptr && v[0] == '1') return false;
-        const char* arch = prop.gcnArchName;
-        for (const char* p : {"gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201"})
-            if (std::strncmp(arch, p, 7) == 0) return true;
-        return false;
-    }();
-    return ok;
+        if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess)
+            for (const char* p : {"gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200", "gfx1201"})
+                ok = ok || std::strncmp(prop.gcnArchName, p, 7) == 0;
 #else
-    static const bool ok = [] {
-        int dev = 0, major = 0;
-        cudaGetDevice(&dev);
-        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
-        const char* v = std::getenv("STRATA_DS4_NO_TC");
-        return major >= 7 && !(v != nullptr && v[0] == '1');
-    }();
-    return ok;
+        int major = 0;
+        ok = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 7;
 #endif
+        k = ok ? 2 : 1;
+        known[dev].store(k, std::memory_order_relaxed);
+    }
+    return k == 2;
 }
 
 // ---------------------------------------------------------------- scratch
@@ -1119,11 +1121,15 @@ struct Scratch {
     float *xd = nullptr, *hd = nullptr, *md = nullptr;     // [kMaxMvJobs * kMaxMvCols] inputs; their scales
 };
 std::mutex g_mu;
-std::unordered_map<cudaStream_t, Scratch> g_scratch;
+// (by device and stream: the default stream is one handle on every device, and a destroyed stream's handle may come
+// back on another)
+std::map<std::pair<int, cudaStream_t>, Scratch> g_scratch;
 
 Scratch* scratch(cudaStream_t s) {
     std::lock_guard<std::mutex> lk(g_mu);
-    auto it = g_scratch.find(s);
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return nullptr;
+    auto it = g_scratch.find({dev, s});
     if (it != g_scratch.end()) return &it->second;
     Scratch sc;
     const size_t nx = (size_t) kMaxEnt * kMaxEmbd, nh = (size_t) kMaxEnt * 8 * kMaxEmbd,
@@ -1135,7 +1141,7 @@ Scratch* scratch(cudaStream_t s) {
         fail("scratch: cudaMalloc failed");
         return nullptr;
     }
-    return &g_scratch.emplace(s, sc).first->second;
+    return &g_scratch.emplace(std::make_pair(dev, s), sc).first->second;
 }
 
 bool mx_geometry(const char* who, int k, int n_embd, int n_ff) {
