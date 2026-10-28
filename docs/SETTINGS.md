@@ -408,6 +408,11 @@ context shares the memory beside the model among the N conversations.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
   longer wait in line for a whole answer - but a new prompt is read while the others wait, unless the settings below
   are on.
+- **Checking that conversations stay apart:** `python tools/ds4/concurrent_check.py --clients 4 --turns 2` against the
+  running server (`--url`, default `http://127.0.0.1:8080/v1`) sends that many conversations at once, each hiding a
+  code of its own after a text they all share, and asks for it back (`--turns 2`: in a second turn). An answer naming
+  another conversation's code is a leak (exit 1); one that misses its own is counted, and fails only with `--strict`.
+  `--rounds N` repeats with new codes, `--stream` reads streamed answers.
 
 #### A long prompt beside running requests (opt-in until measured)
 
