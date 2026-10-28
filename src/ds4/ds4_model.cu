@@ -24,6 +24,7 @@
 #include "ds4_iq.cuh"
 #include "ds4_kernels.cuh"
 #include "ds4_lt.hpp"
+#include "ds4_marks.hpp"
 #include "ds4_os.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
@@ -1306,20 +1307,29 @@ struct Model::Impl {
         int64_t pos = -1;
         std::vector<std::vector<uint8_t>> win;
         std::vector<std::vector<float>> comp;
+        bool shared = false;          // (a mark's: the end of a shared start, kept before the others)
+        uint64_t used = 0;            // (a mark's: its last use, mark_clock)
     };
     Check ck[3];                      // the end of the last prompt, the position before it, and the anchor: the
                                       // position before the end of the first prompt of the run of prompts that each
                                       // continued the last in place (a chat template that drops earlier turns'
                                       // reasoning at a new user message re-renders the history from about there)
+    // the restore points a request asked for (GEN marks= / shared=, ds4_marks.hpp): the start of the last user message,
+    // a point near the prompt's tail, the end of a shared start - each a Check, taken where the read stopped for it; at
+    // most marks_cap() a conversation (MAYA_DS4_RESTORE_POINTS), none unless a request asks.  Like ck, every one is at
+    // or before pos and holds the state of the conversation's own tokens up to it
+    std::vector<Check> mk;
+    uint64_t mark_clock = 0;
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
     // --parallel (Options::seqs > 1): every conversation's state.  The bound one's host state lives in the fields above
-    // (pos, toks, ctoks, ck, slot_held) and its device buffers in the layers and the sources; seq_park() moves that
+    // (pos, toks, ctoks, ck, mk, slot_held) and its device buffers in the layers and the sources; seq_park() moves that
     // host state here (a multi step reads every conversation's from here), seq_unpark() back.  Every conversation's
     // device pointers stay here, the bound one's too.
     struct SeqState {
         int64_t pos = 0;
         std::vector<int32_t> toks, ctoks;
         Check ck[3];
+        std::vector<Check> mk;
         bool slot_held = false;
         std::vector<uint8_t*> win;                   // [layer member] (sq_base[layer] + member)
         std::vector<float*> c_kv, c_score;
@@ -7602,6 +7612,8 @@ struct Model::Impl {
         q.toks = std::move(toks);
         q.ctoks = std::move(ctoks);
         for (int i = 0; i < 3; ++i) q.ck[i] = std::move(ck[i]);
+        q.mk = std::move(mk);
+        mk.clear();
         q.slot_held = slot_held;
         toks.clear();
         ctoks.clear();
@@ -7612,6 +7624,8 @@ struct Model::Impl {
         toks = std::move(q.toks);
         ctoks = std::move(q.ctoks);
         for (int i = 0; i < 3; ++i) ck[i] = std::move(q.ck[i]);
+        mk = std::move(q.mk);
+        q.mk.clear();
         slot_held = q.slot_held;
         q.toks.clear();
         q.ctoks.clear();
@@ -7652,6 +7666,7 @@ struct Model::Impl {
         ctoks.clear();
         slot_held = false;
         ck[0].pos = ck[1].pos = ck[2].pos = -1;
+        mk.clear();
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
                 Layer& l = member(l0, m);
@@ -7669,8 +7684,8 @@ struct Model::Impl {
 
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
-    void checkpoint(int slot) {
-        Check& c = ck[slot & 1];
+    void checkpoint(int slot) { snap_into(ck[slot & 1]); }
+    void snap_into(Check& c) {
         c.pos = pos;
         c.win.resize(L.size());
         c.comp.resize(L.size() * 2);
@@ -7694,16 +7709,50 @@ struct Model::Impl {
         }
     }
 
-    // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
+    // the restore points a conversation keeps besides its three (MAYA_DS4_RESTORE_POINTS, 4; 0: a request's marks= and
+    // shared= are not kept)
+    static int marks_cap() {
+        static const int n = [] {
+            const char* v = ds4_env("DS4_RESTORE_POINTS");
+            return v != nullptr ? std::clamp(std::atoi(v), 0, kMarksMax) : 4;
+        }();
+        return n;
+    }
+    // the state at pos as a restore point a request asked for (shared: the end of a shared start, given up last); one
+    // at this position already is kept (it holds the same state), else the one mark_victim() picks makes room
+    void mark(bool shared) {
+        if (marks_cap() <= 0 || pos <= 0) return;
+        for (Check& x : mk)
+            if (x.pos == pos) {
+                x.shared = x.shared || shared;
+                x.used = ++mark_clock;
+                return;
+            }
+        size_t k = mk.size();
+        if ((int) k >= marks_cap()) {
+            std::vector<MarkUse> u;
+            for (const Check& x : mk) u.push_back({x.pos, x.shared, x.used});
+            k = (size_t) mark_victim(u);
+        } else
+            mk.emplace_back();
+        Check& c = mk[k];   // (one given up: its buffers taken over)
+        snap_into(c);
+        c.shared = shared;
+        c.used = ++mark_clock;
+        slot_held = false;   // (a slot taken before holds no such point)
+    }
+    // checkpoint i of best_check()'s: ck[0..2], then the marks
+    const Check& check_at(int i) const { return i < 3 ? ck[i] : mk[(size_t) i - 3]; }
+
+    // the checkpoint or mark at or before position limit (the state's tokens agree with a new prompt up to there), or -1
     int best_check(int64_t limit) const {
-        int b = -1;
-        for (int i = 0; i < 3; ++i)
-            if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
-        return b;
+        std::vector<int64_t> at(3 + mk.size());
+        for (size_t i = 0; i < at.size(); ++i) at[i] = check_at((int) i).pos;
+        return latest_point(at, limit, pos);
     }
     int64_t restorable(int64_t limit) const {
         const int b = best_check(limit);
-        return b < 0 ? -1 : ck[b].pos;
+        return b < 0 ? -1 : check_at(b).pos;
     }
 
     // checkpoint 1 (the position before the last prompt's end) becomes the anchor too
@@ -7713,18 +7762,21 @@ struct Model::Impl {
     // the checkpoints the state can go back to (what a slot of it keeps), latest first
     std::vector<int64_t> check_positions() const {
         std::vector<int64_t> v;
-        for (const Check& c : ck)
-            if (c.pos > 0 && c.pos <= pos && c.win.size() == L.size() &&
-                std::find(v.begin(), v.end(), c.pos) == v.end())
-                v.push_back(c.pos);
+        for (int k : slot_checks())
+            if (std::find(v.begin(), v.end(), check_at(k).pos) == v.end()) v.push_back(check_at(k).pos);
         std::sort(v.rbegin(), v.rend());
         return v;
     }
-    // the checkpoints a slot keeps (each with its role: 0, 1 or the anchor)
+    // the checkpoints a slot keeps, as best_check() numbers them (each with its role: 0, 1, the anchor, a mark)
+    // (the marks least recently used first: a slot taken back keeps that order)
     std::vector<int> slot_checks() const {
-        std::vector<int> v;
-        for (int i = 0; i < 3; ++i)
-            if (ck[i].pos > 0 && ck[i].pos <= pos && ck[i].win.size() == L.size()) v.push_back(i);
+        std::vector<int> v, m;
+        for (int i = 0; i < 3 + (int) mk.size(); ++i) {
+            const Check& c = check_at(i);
+            if (c.pos > 0 && c.pos <= pos && c.win.size() == L.size()) (i < 3 ? v : m).push_back(i);
+        }
+        std::stable_sort(m.begin(), m.end(), [this](int a, int b) { return check_at(a).used < check_at(b).used; });
+        v.insert(v.end(), m.begin(), m.end());
         return v;
     }
     size_t check_bytes() const {
@@ -7736,7 +7788,7 @@ struct Model::Impl {
     bool restore(int64_t limit) {
         const int b = best_check(limit);
         if (b < 0) return false;
-        const Check& c = ck[b];
+        const Check& c = check_at(b);
         for (size_t i = 0; i < L.size(); ++i)
             for (int m = 0; m < L[i].nm; ++m) {   // (a group's members hold the same state: the lead's copy)
                 Layer& l = member(L[i], m);
@@ -7759,6 +7811,9 @@ struct Model::Impl {
         slot_held = false;
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
+        mk.erase(std::remove_if(mk.begin(), mk.end(), [this](const Check& x) { return x.pos > pos; }), mk.end());
+        for (Check& x : mk)   // (a mark gone back to: in use)
+            if (x.pos == pos) x.used = ++mark_clock;
         return true;
     }
 
@@ -7884,9 +7939,9 @@ struct Model::Impl {
             const std::vector<int> cs = slot_checks();
             const uint64_t nc = cs.size();
             put(&nc, 8);
-            for (int k : cs) {
-                const Check& c = ck[k];
-                const uint64_t role = (uint64_t) k, cp = (uint64_t) c.pos;
+            for (int k : cs) {   // (a role: 0, 1, the anchor 2; a mark 3, a shared start's mark 4)
+                const Check& c = check_at(k);
+                const uint64_t role = k < 3 ? (uint64_t) k : c.shared ? 4 : 3, cp = (uint64_t) c.pos;
                 put(&role, 8);
                 put(&cp, 8);
                 for (size_t i = 0; i < L.size(); ++i) {
@@ -8071,6 +8126,7 @@ struct Model::Impl {
             off += cb + ib;
         }
         Check got[3];   // the slot's checkpoints: the positions it can be taken back at
+        std::vector<Check> got_mk;   // (and its marks)
         {
             uint64_t nc = 0;
             if (!room(8)) {
@@ -8079,7 +8135,7 @@ struct Model::Impl {
             }
             std::memcpy(&nc, data + off, 8);
             off += 8;
-            if (nc > 3) {
+            if (nc > 3 + (uint64_t) kMarksMax) {
                 err = "the slot's checkpoints are damaged";
                 return false;
             }
@@ -8092,11 +8148,15 @@ struct Model::Impl {
                 std::memcpy(&role, data + off, 8);
                 std::memcpy(&cp, data + off + 8, 8);
                 off += 16;
-                if (role > 2 || got[role].pos >= 0 || cp == 0 || cp > (uint64_t) n_pos) {
+                if (role > 4 || (role < 3 && got[role].pos >= 0) || cp == 0 || cp > (uint64_t) n_pos) {
                     err = "the slot's checkpoints are damaged";
                     return false;
                 }
-                Check& c = got[role];
+                if (role >= 3) {
+                    got_mk.emplace_back();
+                    got_mk.back().shared = role == 4;
+                }
+                Check& c = role < 3 ? got[role] : got_mk.back();
                 c.pos = (int64_t) cp;
                 c.win.resize(L.size());
                 c.comp.resize(L.size() * 2);
@@ -8141,6 +8201,13 @@ struct Model::Impl {
         if (pics != nullptr) *pics = std::move(marks);
         for (int k = 0; k < 3; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
+        mk = std::move(got_mk);
+        for (Check& x : mk) x.used = ++mark_clock;   // (in the slot's order; past this engine's cap, the ones
+        while ((int) mk.size() > marks_cap()) {       //  mark_victim() picks go)
+            std::vector<MarkUse> u;
+            for (const Check& x : mk) u.push_back({x.pos, x.shared, x.used});
+            mk.erase(mk.begin() + mark_victim(u));
+        }
         slot_held = false;
         ok = true;
         return true;
@@ -18426,6 +18493,9 @@ void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 void Model::pin() { p_->pin(); }
+void Model::mark(bool shared) { p_->mark(shared); }
+int Model::marks_cap() const { return Impl::marks_cap(); }
+size_t Model::check_bytes() const { return p_->check_bytes(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err, const std::vector<PicMark>& pics) {

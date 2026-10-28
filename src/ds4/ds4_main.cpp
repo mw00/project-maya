@@ -15,7 +15,11 @@
 // compressed KV included), and across runs in MAYA_DS4_SLOT_DIR - so a request that does not continue the state but
 // does continue a kept conversation reads only its new tokens.  A kept conversation holds its pictures' marks too (a
 // span's start, its pixels' fingerprint, its length): it comes back only for a prompt whose pictures are the same at
-// the same places.
+// the same places.  `marks=<pos>,...` and `shared=<pos>` on a GEN ask for restore points besides the end of the last
+// prompt (the server's MAYA_DS4_RESTORE_POINTS: the start of the last user message, a point near the prompt's tail,
+// the end of the system prompt and tools): the read stops at each to keep the state there, and a later prompt that
+// leaves this one past one of them goes back to it (ds4_marks.hpp).
+#include "ds4_marks.hpp"
 #include "ds4_model.hpp"
 #include "ds4_watchdog.hpp"
 #include "strata/platform/env_alias.hpp"
@@ -363,6 +367,11 @@ struct Req {
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
     long long rid = -1;   // rid=<id> (--parallel: every request's, its lines tagged with it)
+    // marks=<pos>,... and shared=<pos>: restore points the read keeps (the server's: the start of the last user
+    // message, a point near the prompt's tail; the end of a start other conversations share, given up last) - a later
+    // prompt that leaves this one past one of them goes back there (ds4_marks.hpp); none: as before
+    std::vector<int64_t> marks;
+    long long shared = -1;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -483,6 +492,10 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
         else if (k == "rid") r.rid = std::atoll(v.c_str());
+        else if (k == "marks") {
+            for (int x : parse_ids(v))
+                if (x > 0) r.marks.push_back(x);
+        } else if (k == "shared") r.shared = std::atoll(v.c_str());
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
@@ -659,7 +672,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) m.max_context())
             return false;
         toks.resize(nt);
-        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 3)
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) ||
+            nc > 3 + (uint64_t) strata::ds4::kMarksMax)   // (the three checkpoints and the marks)
             return false;
         cks.resize(nc);
         if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t))) || !f.read((char*) &np, 8)) return false;
@@ -1192,6 +1206,26 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // the prompt in windows (PP <read> <total> <ms> <tok/s> <reuse> every 64 tokens), a checkpoint before its last
         // token and one after it: the next turn re-renders this one, and shares its start up to one of them
         const size_t total = r.ids.size();
+        // the restore points the request asks for (marks= / shared=; ds4_marks.hpp picks the ones this read reaches):
+        // the read stops at each and keeps the state there.  Each piece is read as a run of its own, so a long piece's
+        // skip (MAYA_DS4_PROMPT_SKIP) runs every layer on its own last ~2,700 rows - the state kept at the point is the
+        // one a whole read leaves (the later layers' window rings included), at the cost of up to that many rows
+        // through the layers the skip leaves out (V4.1: 20-39) that one run would have skipped - as many as lie
+        // between the point and the prompt's end, when that is less
+        std::vector<strata::ds4::MarkAt> cuts;
+        if ((!r.marks.empty() || r.shared >= 0) && m.marks_cap() > 0) {
+            std::vector<std::pair<int64_t, int64_t>> spans;
+            for (const Pic& q : pics) spans.push_back({q.start, (int64_t) q.len});
+            cuts = strata::ds4::mark_plan(r.marks, r.shared, (int64_t) from, (int64_t) total, m.marks_cap(), 16, spans);
+            static bool said = false;
+            if (!said)
+                std::fprintf(stderr, "maya ds4 serve: restore points a request asks for: up to %d a conversation, "
+                                     "%.1f MB of RAM each (MAYA_DS4_RESTORE_POINTS)\n",
+                             m.marks_cap(), (double) m.check_bytes() / 1e6);
+            said = true;
+        }
+        size_t next_cut = 0;
+        if (!cuts.empty() && cuts[0].pos == (int64_t) from) m.mark(cuts[next_cut++].shared);   // (the state as it is)
         size_t done = from, next_pp = from + 64;
         int64_t beat_at = -1;   // (the run's progress at the last beat)
         m.set_progress([&](int64_t d) {   // (a run of chunks: each one through every layer)
@@ -1219,7 +1253,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 stopped = true;
                 break;
             }
-            const size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
+            if (next_cut < cuts.size() && (size_t) cuts[next_cut].pos < done + n)   // (a restore point: the read
+                n = (size_t) cuts[next_cut].pos - done;                             //  stops there)
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = done + n == total;
             if (fin && last_window) {
@@ -1231,6 +1267,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                          : m.feed(r.ids.data() + done, (int) n, 0, err);
             done += n;
             beat();
+            if (ok && next_cut < cuts.size() && done == (size_t) cuts[next_cut].pos) m.mark(cuts[next_cut++].shared);
             if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;
                 std::printf("PP%s %zu %zu %.1f %.1f %zu\n", tag.c_str(), done, r.ids.size(), ms,

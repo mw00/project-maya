@@ -6,7 +6,8 @@
 // its own 128-token window, the compressed groups completed by its position.  The state a token leaves is the
 // 128-token window ring of every layer, the compressors' partial groups, the compressed KV and index keys of the KV
 // source layers (append-only), and the Engram n-gram history; checkpoint() / restore() keep the first two (the rest is
-// truncated by position) so a conversation can go back to the end of its last prompt.  A conversation that leaves the
+// truncated by position) so a conversation can go back to the end of its last prompt, or to a restore point a request
+// asked for (mark()).  A conversation that leaves the
 // model altogether (another chat answered in between) is a slot: slot_save / slot_load take the same state - the
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
@@ -222,6 +223,13 @@ public:
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
     /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
     void pin();
+    /// Keep the state at the current position as a restore point a request asked for (GEN marks= / shared=: the start
+    /// of the last user message, a point near the prompt's tail, the end of a shared start - shared: given up last),
+    /// besides the three above: restore() and a slot go back to these too.  At most marks_cap() a conversation
+    /// (MAYA_DS4_RESTORE_POINTS, 4; 0: none kept), the least recently used giving way; each check_bytes() of host RAM.
+    void mark(bool shared = false);
+    int marks_cap() const;
+    size_t check_bytes() const;
     /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
     std::vector<int64_t> check_positions() const;
 
