@@ -439,6 +439,25 @@ context shares the memory beside the model among the N conversations.
   another conversation's code is a leak (exit 1); one that misses its own is counted, and fails only with `--strict`.
   `--rounds N` repeats with new codes, `--stream` reads streamed answers.
 
+#### A step's attention in one launch (opt-in until measured)
+
+In a step of several requests each layer runs every request's attention on its own: its window ring read into a
+window buffer, its new KV rows finished and written to the ring, the compressor, the indexer, the sparse attention and
+the output's rotation - several launches a request a layer. `MAYA_DS4_MULTI_ATTN=1` gives each request's window buffer
+a block of one shared buffer and runs the ring reads, the KV rows' finish, the ring writes, the sparse attention, its
+output's rotation and q's rotation once for all the step's rows: one token each, verify windows of up to 7 rows, the
+drafter's blocks. The compressor and the indexer still run a request at a time, and a verify window of 8 rows or more
+keeps its own attention launch. Each row is computed by the same kernels with the same arithmetic - only which launch
+computes it changes - so its logits are meant to be the same bits. It takes ~11 MB a GPU (the shared buffer and the
+decoded selections of 16 rows) from the experts' room, and nothing without `--parallel`. Not checked on a GPU or
+measured yet: `build/ds4_multi_attn_test` (built by name) compares the two ways' launches on random caches bit for bit
+(`--time` times them); `maya-ds4 --parallel 4 --multi-check --ids ...` with and without it must give the same logits
+and tokens; then the server with 2 and 4 requests at once.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_MULTI_ATTN` | off (0) | `1`: with `--parallel` above 1, a step's attention for all its requests' rows in one launch a step instead of one a request (the same bits; opt-in until measured) |
+
 #### A long prompt beside running requests (opt-in until measured)
 
 By default a new request's prompt is read in one run while every other request waits: a 185K-token agent prompt stops

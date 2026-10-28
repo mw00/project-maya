@@ -26,6 +26,7 @@
 #include "ds4_lt.hpp"
 #include "ds4_marks.hpp"
 #include "ds4_markov_q8.hpp"
+#include "ds4_multi_attn.hpp"
 #include "ds4_os.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
@@ -661,6 +662,11 @@ struct Dev {
     // (--parallel) a multi step's new compressed rows of each row's conversation gathered for the other groups' readers:
     // kWin ckv rows, then kWin index-key rows
     uint8_t* mstage = nullptr;
+    // (DS4_MULTI_ATTN) a multi step's window buffers side by side, and the few-queries scratch for all its rows; the
+    // layer's plan of them (layer(), on this device's thread)
+    uint16_t* mext = nullptr;
+    AttnScratch mscr;
+    MaPlan mplan;
 };
 
 // the chunked prompt path's buffers on a device: a chunk of C tokens through a layer at once (the attention in slabs of
@@ -7907,10 +7913,24 @@ struct Model::Impl {
                      lane_name.c_str(), cpu_threads(), kPer, lane_report.c_str());
     }
 
+    // DS4_MULTI_ATTN=1 (--parallel): a multi step's attention for all its rows in one launch a step where attn_core
+    // launches it a conversation at a time (attn_multi) - the rings into the window buffers, the KV rows' finish, the
+    // rings' new rows, the sparse attention and its output's finish, and q's rotation; the compressor and the indexer
+    // still a conversation at a time.  Each row the same kernels' arithmetic; opt-in until measured
+    bool multi_attn = false;
+    static_assert(kMaRows == kWin, "a multi step's rows");
+
     // ---- --parallel: several conversations (Options::seqs), each its own rings, partial groups and KV
     bool alloc_seqs(std::string& err) {
         const int n = std::max(1, o.seqs);
         if (n == 1) return true;
+        if (const char* v = ds4_env("DS4_MULTI_ATTN")) {   // (MAYA_DS4_MULTI_ATTN)
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_MULTI_ATTN=") + v + ": 1 or 0";
+                return false;
+            }
+            multi_attn = std::strcmp(v, "1") == 0;
+        }
         sq_base.assign(L.size(), 0);
         int nmem = 0;
         for (size_t i = 0; i < L.size(); ++i) {
@@ -7960,6 +7980,18 @@ struct Model::Impl {
         }
         for (Dev& d : devs)
             if (!dalloc(d, d.mstage, (size_t) kWin * (ckv_rb() + ik_rb()), err)) return false;
+        for (Dev& d : devs)   // (DS4_MULTI_ATTN: a step's window buffers, kWin queries' decoded selections)
+            if (multi_attn) {
+                if (!dalloc(d, d.mext, (size_t) ma_rows_max(g.win) * g.hd, err, &d.caches) ||
+                    !dalloc(d, d.mscr.rows, (size_t) kWin * topk_stride() * g.hd, err, &d.caches))
+                    return false;
+                d.mscr.max_t = kWin;
+                d.mscr.cap = (int) topk_stride();
+            }
+        if (multi_attn)
+            std::fprintf(stderr, "ds4: a multi step's attention for all its rows in one launch a step, %.1f MB a GPU "
+                                 "(DS4_MULTI_ATTN)\n",
+                         ((double) ma_rows_max(g.win) * g.hd + (double) kWin * topk_stride() * g.hd) * 2 / 1e6);
         double more = 0;
         for (size_t di = 0; di < devs.size(); ++di) more += (double) (devs[di].caches - before[di]);
         std::fprintf(stderr, "ds4: --parallel %d: %d conversations at once, each its own rings and KV (%.2f GB more "
@@ -17686,56 +17718,20 @@ struct Model::Impl {
         A.ik = l.ik_src >= 0 ? &q.ik[(size_t) l.ik_src] : nullptr;
         return A;
     }
-    // layer l's attention for T queries from position p0 of one conversation (A), rows r0 .. r0 + T - 1 of the
-    // window's buffers: q (rotated already), the KV row, the compressor's rows, the indexer's inputs in, the
-    // attention's output (rotated back) out - what layer() runs for a window, and for each row of a multi step
-    // (a verify window - spec_win - keeps its backups at its rows r0 .. of the ring's and the compressor's rows, and
-    //  the compressor's state in snapshot `snap`: a multi step's windows each their own)
-    bool attn_core(Layer& l, int mi, Dev& d, int64_t p0, int T, int r0, const WinPlan& wp, const AttnSeq& A,
-                   std::string& err, int snap = 0) {
+    // attn_core's compressed part for T queries from position p0 of one conversation (A), rows r0 .. of the window's
+    // buffers: the compressor, the indexer and its top k, the new compressed rows - each query's selected count to
+    // nsel[t] and the compressed KV it selects from to ckv (a layer without them: neither touched)
+    bool attn_sel(Layer& l, int mi, Dev& d, int64_t p0, int T, int r0, const WinPlan& wp, const AttnSeq& A,
+                  std::string& err, int snap, int* nsel, const void*& ckv) {
         cudaStream_t s = d.st;
-        const int D = g.dim, HD = g.hd, NHL = l.ahn, HQ = NHL * HD;
+        const int D = g.dim, HD = g.hd;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
-        float* q = d.q + (size_t) r0 * HQ;
-        float* kvr = d.kvr + (size_t) r0 * HD;
         float* ckr = d.ckr + (size_t) r0 * HD;
         float* cgr = d.cgr + (size_t) r0 * HD;
         float* qr = d.qr + (size_t) r0 * g.q_lora;
         float* x = d.x + (size_t) r0 * D;
         int* topk_r = d.topk + (size_t) r0 * topk_stride();
         int* cand_r = d.cand + (size_t) r0 * cand_stride();
-        float* o_r = d.o + (size_t) r0 * HQ;
-        (void) D;
-        // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
-        // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
-        // that ring and to the whole block, and leaves the ring as it was
-        ring_to_ext(A.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
-        Finish fk;
-        fk.w = l.kv_norm;
-        fk.eps = g.eps;
-        fk.rd = g.rd;
-        fk.pos = (int) p0;
-        fk.freqs = freqs;
-        fk.quant = 1;
-        fk.dst = d.ext + (size_t) g.win * HD;
-        fk.dst_stride = HD;
-        finish(kvr, T, HD, HD, fk, s);
-        if (!l.mtp) ext_to_ring(d.ext, A.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak + (size_t) r0 * win_rb() : nullptr);
-        AttnRows ar;
-        for (int t = 0; t < T; ++t) {
-            if (l.mtp) {
-                ar.win0[t] = 0;
-                ar.nwin[t] = (int) std::min<int64_t>(g.win, p0);
-                ar.nsel[t] = T;
-                continue;
-            }
-            const int first = (int) std::max<int64_t>(g.win - p0, t + 1);   // ext row of position max(0, p - win + 1)
-            ar.win0[t] = first;
-            ar.nwin[t] = g.win + t - first + 1;
-            ar.nsel[t] = 0;
-        }
-        const void* ckv = nullptr;
-        int ckv_fmt = kKvFp4;
         if (l.ratio > 0) {
             Src& sr = srcs[(size_t) l.src];
             const int R = l.ratio;
@@ -17923,9 +17919,56 @@ struct Model::Impl {
                     xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
                 }
             }
-            for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][r0 + t] : 0;
+            for (int t = 0; t < T; ++t) nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][r0 + t] : 0;
             ckv = (*A.ckv)[(size_t) l.dev];
         }
+        return true;
+    }
+    // layer l's attention for T queries from position p0 of one conversation (A), rows r0 .. r0 + T - 1 of the
+    // window's buffers: q (rotated already), the KV row, the compressor's rows, the indexer's inputs in, the
+    // attention's output (rotated back) out - what layer() runs for a window, and for each row of a multi step
+    // (a verify window - spec_win - keeps its backups at its rows r0 .. of the ring's and the compressor's rows, and
+    //  the compressor's state in snapshot `snap`: a multi step's windows each their own)
+    bool attn_core(Layer& l, int mi, Dev& d, int64_t p0, int T, int r0, const WinPlan& wp, const AttnSeq& A,
+                   std::string& err, int snap = 0) {
+        cudaStream_t s = d.st;
+        const int HD = g.hd, NHL = l.ahn, HQ = NHL * HD;
+        const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        float* q = d.q + (size_t) r0 * HQ;
+        float* kvr = d.kvr + (size_t) r0 * HD;
+        int* topk_r = d.topk + (size_t) r0 * topk_stride();
+        float* o_r = d.o + (size_t) r0 * HQ;
+        // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
+        // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
+        // that ring and to the whole block, and leaves the ring as it was
+        ring_to_ext(A.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
+        Finish fk;
+        fk.w = l.kv_norm;
+        fk.eps = g.eps;
+        fk.rd = g.rd;
+        fk.pos = (int) p0;
+        fk.freqs = freqs;
+        fk.quant = 1;
+        fk.dst = d.ext + (size_t) g.win * HD;
+        fk.dst_stride = HD;
+        finish(kvr, T, HD, HD, fk, s);
+        if (!l.mtp) ext_to_ring(d.ext, A.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak + (size_t) r0 * win_rb() : nullptr);
+        AttnRows ar;
+        for (int t = 0; t < T; ++t) {
+            if (l.mtp) {
+                ar.win0[t] = 0;
+                ar.nwin[t] = (int) std::min<int64_t>(g.win, p0);
+                ar.nsel[t] = T;
+                continue;
+            }
+            const int first = (int) std::max<int64_t>(g.win - p0, t + 1);   // ext row of position max(0, p - win + 1)
+            ar.win0[t] = first;
+            ar.nwin[t] = g.win + t - first + 1;
+            ar.nsel[t] = 0;
+        }
+        const void* ckv = nullptr;
+        int ckv_fmt = kKvFp4;
+        if (!attn_sel(l, mi, d, p0, T, r0, wp, A, err, snap, ar.nsel, ckv)) return false;
         if (l.mtp) {   // the block's rows (BF16), after the ring's in ext, as every query's selection
             ckv = d.ext + (size_t) g.win * HD;
             ckv_fmt = kKvBf16;
@@ -17942,6 +17985,116 @@ struct Model::Impl {
             fo.inverse = 1;
             fo.quant = 1;
             finish(o_r, T * NHL, HD, HD, fo, s);
+        }
+        return true;
+    }
+    // (DS4_MULTI_ATTN) a multi step's attention for its T rows, each run of them (a conversation's: mp) what attn_core
+    // makes of it, in one launch a step where the rows read only their own state: the runs' window buffers side by side
+    // in d.mext, the rings into them, the KV rows' finish and the rings' new rows; then the compressor and the indexer
+    // a run at a time (attn_sel, the k-th run's snapshot k); then the sparse attention - the runs attn_core gives the
+    // few-queries kernels in a launch for all of them (sparse_attn_rows, d.mscr), any other run alone - and the
+    // output's finish.  Only which launch computes a row differs: each row's values and kernels are attn_core's
+    bool attn_multi(Layer& L0, int mi, const MaPlan& mp, const WinPlan& wp, std::string& err) {
+        Layer& l = member(L0, mi);
+        Dev& d = devs[(size_t) l.dev];
+        cudaStream_t s = d.st;
+        const int HD = g.hd, NHL = l.ahn, HQ = NHL * HD, T = mp.T, ts = (int) topk_stride();
+        const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        RingRuns rr;
+        rr.runs = mp.nrun;
+        for (int k = 0; k < mp.nrun; ++k) {
+            const MaRun& u = mp.run[k];
+            rr.ring[k] = attn_seq(L0, mi, u.seq).win;
+            rr.bak[k] = spec_win ? l.ring_bak + (size_t) u.r0 * win_rb() : nullptr;
+            rr.p0[k] = l.mtp ? (long long) g.win : (long long) u.p0;   // (a block's ring: its rows as they lie)
+            rr.e0[k] = u.e0;
+            rr.T[k] = u.n;
+        }
+        ring_to_ext_runs(rr, d.mext, g.win, HD, s);
+        Finish fk;
+        fk.w = l.kv_norm;
+        fk.eps = g.eps;
+        fk.rd = g.rd;
+        fk.freqs = freqs;
+        fk.quant = 1;
+        fk.dst = d.mext;
+        fk.dst_stride = HD;
+        FinishRows fr;
+        for (int t = 0; t < T; ++t) {
+            fr.pos[t] = mp.pos[t];
+            fr.dst[t] = mp.dst[t];
+        }
+        if (!finish_rows(d.kvr, T, HD, HD, fk, fr, s)) {
+            err = "DS4_MULTI_ATTN: the KV rows' finish refused";
+            return false;
+        }
+        if (!l.mtp) ext_to_ring_runs(rr, d.mext, g.win, HD, s);
+        AttnRows ar;
+        AttnCkv ck;
+        for (int t = 0; t < T; ++t) {
+            ar.win0[t] = mp.win0[t];
+            ar.nwin[t] = mp.nwin[t];
+            ar.nsel[t] = l.mtp ? mp.run[mp.row_run[t]].n : 0;
+        }
+        for (int k = 0; k < mp.nrun; ++k) {
+            const MaRun& u = mp.run[k];
+            const void* c = nullptr;
+            if (!attn_sel(l, mi, d, u.p0, u.n, u.r0, wp, attn_seq(L0, mi, u.seq), err, k, ar.nsel + u.r0, c)) return false;
+            for (int i = 0; i < u.n; ++i) ck.ckv[u.r0 + i] = c;
+        }
+        if (NHL == 0) return true;
+        const float scale = 1.0f / std::sqrt((float) HD);
+        if (l.mtp) {   // (each block's rows after its ring's in d.mext, as its queries' selection: one launch)
+            IotaRows io;
+            for (int t = 0; t < T; ++t) {
+                const MaRun& u = mp.run[mp.row_run[t]];
+                io.base[t] = u.e0 + g.win;
+                io.n[t] = u.n;
+            }
+            iota_rows_at(d.topk, T, io, ts, s);
+            sparse_attn(d.q, d.mext, d.mext, d.topk, ts, ar, l.sink, NHL, HD, T, scale, d.o, s, kKvBf16, 0, &d.attn_scr);
+        } else {
+            // a run's class: the kernels sparse_attn takes for it - the few-queries path for one query (1) or a few
+            // (2), else (0) the packed kernel, which keeps its own launch
+            int cls[kMaRows];
+            for (int k = 0; k < mp.nrun; ++k)
+                cls[k] = attn_few(mp.run[k].n, ts, &d.attn_scr) ? (mp.run[k].n == 1 ? 1 : 2) : 0;
+            MaSpan sp[kMaRows];
+            const int ns = ma_spans(mp, cls, d.mscr.max_t, sp);
+            for (int i = 0; i < ns; ++i) {
+                const MaSpan& b = sp[i];
+                AttnRows a;
+                AttnCkv c;
+                for (int t = 0; t < b.n; ++t) {
+                    a.win0[t] = ar.win0[b.r0 + t];
+                    a.nwin[t] = ar.nwin[b.r0 + t];
+                    a.nsel[t] = ar.nsel[b.r0 + t];
+                    c.ckv[t] = ck.ckv[b.r0 + t];
+                }
+                float* qb = d.q + (size_t) b.r0 * HQ;
+                float* ob = d.o + (size_t) b.r0 * HQ;
+                int* sel = d.topk + (size_t) b.r0 * ts;
+                if (b.cls == 0)
+                    sparse_attn(qb, d.mext, c.ckv[0], sel, ts, a, l.sink, NHL, HD, b.n, scale, ob, s, kKvFp4, 0,
+                                &d.attn_scr);
+                else if (!sparse_attn_rows(qb, d.mext, c, sel, ts, a, l.sink, NHL, HD, b.n, scale, ob, s, b.cls == 1,
+                                           &d.mscr)) {
+                    err = "DS4_MULTI_ATTN: the rows' attention refused";
+                    return false;
+                }
+            }
+        }
+        Finish fo;
+        fo.rd = g.rd;
+        fo.vpp = NHL;
+        fo.freqs = freqs;
+        fo.inverse = 1;
+        fo.quant = 1;
+        FinishRows fp;
+        for (int t = 0; t < T; ++t) fp.pos[t] = mp.pos[t];
+        if (!finish_rows(d.o, T * NHL, HD, HD, fo, fp, s)) {
+            err = "DS4_MULTI_ATTN: the output's finish refused";
+            return false;
         }
         return true;
     }
@@ -18040,6 +18193,10 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        // (DS4_MULTI_ATTN: a multi step's rows' attention in one launch a step - attn_multi - where each conversation's
+        //  rows are one run)
+        const bool ma =
+            multi_attn && wp.nrow > 0 && d.mext != nullptr && ma_plan(wp.rseq, wp.rpos, T, g.win, l.mtp, d.mplan);
         prof_mark(d, 0);
         // Engram
         if (l.eg >= 0) {
@@ -18114,7 +18271,14 @@ struct Model::Impl {
             fr.vpp = NHL;
             fr.freqs = freqs;
             if (wp.nrow == 0) finish(d.q, T * NHL, HD, HD, fr, s);
-            else
+            else if (ma) {   // (DS4_MULTI_ATTN: every row by its own position, one launch)
+                FinishRows fp;
+                for (int t = 0; t < T; ++t) fp.pos[t] = (int) wp.rpos[t];
+                if (!finish_rows(d.q, T * NHL, HD, HD, fr, fp, s)) {
+                    err = "DS4_MULTI_ATTN: q's rotation refused";
+                    return false;
+                }
+            } else
                 for (int t = 0; t < T; ++t) {   // (--parallel: each row by its own position)
                     fr.pos = (int) wp.rpos[t];
                     finish(d.q + (size_t) t * HQ, NHL, HD, HD, fr, s);
@@ -18122,6 +18286,9 @@ struct Model::Impl {
         }
         if (wp.nrow == 0) {
             if (!attn_core(l, mi, d, p0, T, 0, wp, attn_bound(l), err)) return false;
+        } else if (ma) {   // (DS4_MULTI_ATTN: the rows' attention in one launch a step)
+            if (!attn_multi(L0, mi, d.mplan, wp, err)) return false;
+            if (!multi_put(l, mi, d, wp, err)) return false;
         } else {   // (--parallel: each row its own conversation's attention, then its new rows to the other groups -
                    //  a conversation's run of rows, a verify window's, as that window: the k-th run's snapshot k)
             for (int t = 0, k = 0; t < T; ++k) {

@@ -207,6 +207,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_interleave_test.cpp")
   target_link_libraries(ds4_interleave_test PRIVATE strata_warnings)
   add_test(NAME ds4_interleave_test COMMAND ds4_interleave_test)
 endif()
+# maya-ds4 --parallel, DS4_MULTI_ATTN: a multi step's window buffers side by side and the attention's launches over them
+# (src/ds4/ds4_multi_attn.hpp; host code only, so a build without the suite builds it by name)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_multi_attn_plan_test.cpp")
+  add_executable(ds4_multi_attn_plan_test EXCLUDE_FROM_ALL tests/ds4_multi_attn_plan_test.cpp)
+  target_link_libraries(ds4_multi_attn_plan_test PRIVATE strata_warnings)
+  add_test(NAME ds4_multi_attn_plan_test COMMAND ds4_multi_attn_plan_test)
+endif()
 # DeepSeek's prompt-path and memory rules (src/ds4/ds4_prompt_mem.hpp; pure functions, CPU only, so a build without
 # the suite builds it by name)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_prompt_mem_test.cpp")
@@ -579,6 +586,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)
     endif()
+    # DS4_MULTI_ATTN: a multi step's attention for all its rows in one launch a step against each conversation's run
+    # alone (attn_core's launches), bit for bit on random rings and caches - decode rows, verify windows, drafter
+    # blocks (needs a GPU, no model; built by name)
+    add_executable(ds4_multi_attn_test EXCLUDE_FROM_ALL tests/ds4_multi_attn_test.cu src/ds4/ds4_kernels.cu
+                                       src/ds4/ds4_host_ar.cpp)
+    target_include_directories(ds4_multi_attn_test PRIVATE ${_strata_gpu_include_directories} include)
+    target_link_libraries(ds4_multi_attn_test PRIVATE ${_strata_gpu_runtime_target})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ds4_packinfo_test.cpp")
       # maya-ds4 --pack-info on packs written for it (healthy, dead, short, a type no kernel takes, a drafter its
       # metadata leaves out, a profile of another size): host code only, no GPU

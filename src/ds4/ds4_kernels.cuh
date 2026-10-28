@@ -235,6 +235,20 @@ struct AttnRows {
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
                  int ckv_fmt = kKvFp4, int heads_per_block = 0, const AttnScratch* scr = nullptr);
+/// Whether sparse_attn (kKvFp4, heads_per_block 0) takes T queries through the few-queries path: the selected rows
+/// decoded into scr, then the BF16 rows' kernel.
+bool attn_few(int T, int sel_stride, const AttnScratch* scr);
+/// (DS4_MULTI_ATTN, --parallel) that path for T rows of several conversations in one launch each: row t's compressed
+/// rows from its own cache ckv[t] (kKvFp4; null with nsel 0), its window rows a.win0 / a.nwin of `win`, its selection
+/// sel[t], its scratch rows scr's t-th - the kernels sparse_attn runs for a run of one query (`one`) or of a few, each
+/// row's arithmetic theirs.  false, nothing launched: not that path's shapes (d 512, a.gen 0, T <= scr->max_t,
+/// sel_stride <= scr->cap)
+struct AttnCkv {
+    const void* ckv[kWin] = {};
+};
+bool sparse_attn_rows(const float* q, const uint16_t* win, const AttnCkv& c, const int* sel, int sel_stride,
+                      const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
+                      cudaStream_t s, bool one, const AttnScratch* scr);
 /// The window buffer: ext[r] = ring[(p0 - n + r) % n] for the n rows before p0 (zeros before position 0); afterwards
 /// ring[(p0 + t) % n] = ext[n + t] for t < T.  The ring's rows kKvFp8 (each group of 32 at the smallest power-of-two
 /// scale its BF16 values fit under: exact for values on the FP8 grid, the window's), the window buffer's BF16 (p0 = n:
@@ -242,6 +256,34 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
 void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, cudaStream_t s);
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, cudaStream_t s,
                  uint8_t* backup = nullptr);
+
+/// (DS4_MULTI_ATTN, --parallel) a multi step's runs at once - run k one conversation's T[k] rows from position p0[k],
+/// its ring ring[k], its window buffer the rows e0[k] .. e0[k] + n + T[k] - 1 of one shared buffer (ds4_multi_attn.hpp):
+/// ring_to_ext's and ext_to_ring's rows (bak[k]: run k's backups, or null) for every run in one launch each, every row
+/// those kernels' own code.
+struct RingRuns {
+    uint8_t* ring[kWin] = {};
+    uint8_t* bak[kWin] = {};
+    long long p0[kWin] = {};
+    int e0[kWin] = {}, T[kWin] = {};
+    int runs = 0;
+};
+void ring_to_ext_runs(const RingRuns& r, uint16_t* ext, int n, int d, cudaStream_t s);
+void ext_to_ring_runs(const RingRuns& r, const uint16_t* ext, int n, int d, cudaStream_t s);
+/// (DS4_MULTI_ATTN) finish over the rows of several conversations: vector v is row v / f.vpp's, which takes the rope
+/// position pos[row] (f.pos and f.pos_step not read) and with f.dst writes to f.dst + (dst[row] f.vpp + v % f.vpp)
+/// f.dst_stride - each vector finish's own code.  No pdst, no q8 (false, nothing launched; also more than kWin rows)
+struct FinishRows {
+    int pos[kWin] = {};
+    int dst[kWin] = {};
+};
+bool finish_rows(float* x, int n_vec, int len, long long stride, const Finish& f, const FinishRows& r, cudaStream_t s);
+/// out[t][i] = base[t] + i for i < n[t], rows `stride` apart (DS4_MULTI_ATTN: drafter blocks' rows in a shared window
+/// buffer as their queries' selection, iota_rows' for each block).
+struct IotaRows {
+    int base[kWin] = {}, n[kWin] = {};
+};
+void iota_rows_at(int* out, int T, const IotaRows& r, int stride, cudaStream_t s);
 /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
 /// The same for up to kMaxRingBatch layers' rings at once (one launch).
