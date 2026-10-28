@@ -1941,8 +1941,8 @@ __global__ void __launch_bounds__(kThreads) set_mix_kernel(const KSetMix a, KMix
 // decoded once for all of them - and the products on the matrix cores.  A warp's decoded tile goes through LDS into
 // A's layout (lane m and m + 16: output m's 16 inputs); each 16 activations of the slice are a B (lane n and n + 16:
 // activation n's 16 inputs); D's element i is output 2i + lane / 16 of the tile for activation lane % 16.  The host
-// uses this layout on gfx11; the gfx12 implementation follows below. Both use EXL3_WMMA_ROWS 16 or 32
-// (by default 16). The decode and verify kernels keep
+// uses this layout on gfx11 and, through the MFMA branch below, on gfx950; the gfx12 implementation follows below.
+// All use EXL3_WMMA_ROWS 16 or 32 (by default 16). The decode and verify kernels keep
 // block_gemv (their bits are the token path's).
 // Volta / Turing (sm_70 .. sm_75: no mma.m16n8k16, so not the tensor-core kernels below) run the same kernel on
 // nvcuda::wmma's 16x16x16 FP16 product with F32 sums: A the warp's decoded tile from wt (row-major, output by input),
@@ -1971,6 +1971,13 @@ typedef uint32_t exl3_u8 __attribute__((ext_vector_type(8)));
 #endif
 #if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700 && __CUDA_ARCH__ < 800
 #define EXL3_WMMA_V70 1
+#endif
+// CDNA 4 (gfx950): v_mfma_f32_16x16x16_f16 on the wave64 - the wave's two logical warps' tiles are two products
+#if defined(STRATA_USE_HIP) && defined(__gfx950__)
+#define EXL3_MFMA 1
+typedef _Float16 exl3_h4 __attribute__((ext_vector_type(4)));
+typedef float exl3_f4 __attribute__((ext_vector_type(4)));
+typedef uint32_t exl3_u2 __attribute__((ext_vector_type(2)));
 #endif
 
 // RDNA4's WMMA has eight FP16 inputs per lane and a different accumulator layout.
@@ -2134,6 +2141,79 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
         if (b * 16 + m < nc)
 #pragma unroll
             for (int i = 0; i < 8; ++i) sm.out[(b * 16 + m) * kCols + warp * 16 + 2 * i + (lane >> 4)] = c[b][i];
+    __syncthreads();
+#elif defined(EXL3_MFMA)
+    // Each logical warp decodes its tile into wt as on gfx11; the wave (warps w0, w0 + 1) then multiplies both: A
+    // (lane L: output L % 16, inputs 4 (L / 16) ..) from wt, B (lane L: activation L % 16, the same inputs) from xb, D
+    // (lane L: outputs 4 (L / 16) + i, activation L % 16).
+    static_assert(K2 <= KS, "the shared memory's stage holds K2 words a lane");
+    constexpr int W = Words<K2>::W, R = Words<K2>::R, NJ = NR / 8, NB = NR / 16;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
+    const int m = threadIdx.x & 15, kq = (threadIdx.x >> 4) & 3, w0 = warp & ~1;
+    const size_t sstride = (size_t) ld * W;
+    const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
+    uint32_t* st = sm.stage + warp * W;
+    uint32_t* wt = sm.wt + warp * 16 * kWtP;
+    const int nq = (k1 - k0) / kCols;
+    uint32_t wc[8][R], wn[8][R];
+    float xv[NJ][4], xs[NJ][4];
+    load_tiles<K2>(tile, sstride, lane, wc);
+#pragma unroll
+    for (int j = 0; j < NJ; ++j)
+        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[j]);
+    exl3_f4 c[2][NB];
+#pragma unroll
+    for (int u = 0; u < 2; ++u)
+#pragma unroll
+        for (int b = 0; b < NB; ++b) c[u][b] = exl3_f4{};
+    for (int q = 0; q < nq; ++q) {
+        __half* xq = sm.xb + (q & 1) * (NR * kXS);
+#pragma unroll
+        for (int j = 0; j < NJ; ++j)
+            if (warp + 8 * j < nc) chunk_store(xv[j], xs[j], lane, xq + (warp + 8 * j) * kXS);
+        __syncthreads();
+        if (q + 1 < nq) {
+            load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
+#pragma unroll
+            for (int j = 0; j < NJ; ++j)
+                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[j]);
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            uint32_t f[4];
+            slice_frags<K2, cb>(wc[s], st, lane, f);
+            wt[g * kWtP + t] = f[0];
+            wt[g * kWtP + 4 + t] = f[1];
+            wt[(g + 8) * kWtP + t] = f[2];
+            wt[(g + 8) * kWtP + 4 + t] = f[3];
+            __syncwarp();
+            exl3_h4 a[2];
+#pragma unroll
+            for (int u = 0; u < 2; ++u) {
+                const uint32_t* wr = sm.wt + ((w0 + u) * 16 + m) * kWtP + 2 * kq;
+                a[u] = __builtin_bit_cast(exl3_h4, exl3_u2{wr[0], wr[1]});
+            }
+            __syncwarp();   // (wt: the next slice's)
+#pragma unroll
+            for (int b = 0; b < NB; ++b) {   // (activations past nc: whatever xb holds - their outputs are not written)
+                const uint32_t* xr = reinterpret_cast<const uint32_t*>(xq + (b * 16 + m) * kXS + s * 16) + 2 * kq;
+                const exl3_h4 bx = __builtin_bit_cast(exl3_h4, exl3_u2{xr[0], xr[1]});
+#pragma unroll
+                for (int u = 0; u < 2; ++u) c[u][b] = __builtin_amdgcn_mfma_f32_16x16x16f16(a[u], bx, c[u][b], 0, 0, 0);
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < 8; ++s)
+#pragma unroll
+            for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
+    }
+#pragma unroll
+    for (int b = 0; b < NB; ++b)
+        if (b * 16 + m < nc)
+#pragma unroll
+            for (int u = 0; u < 2; ++u)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) sm.out[(b * 16 + m) * kCols + (w0 + u) * 16 + 4 * kq + i] = c[u][b][i];
     __syncthreads();
 #elif defined(EXL3_WMMA_V70)
     namespace wm = nvcuda::wmma;
@@ -3006,8 +3086,8 @@ bool mma_now() {
 #endif
 }
 
-// Matrix prompt path: gfx11 by default, gfx12 with EXL3_WMMA_GFX12=1 (opt-in until it is measured on an RDNA4 GPU
-// of ours; unset or 0 keeps gfx12 on the portable path); EXL3_WMMA=0 disables both. The RDNA4 numerical
+// Matrix prompt path: gfx11 and gfx950 by default, gfx12 with EXL3_WMMA_GFX12=1 (opt-in until it is measured on an
+// RDNA4 GPU of ours; unset or 0 keeps gfx12 on the portable path); EXL3_WMMA=0 disables all three. The RDNA4 numerical
 // differences are accumulation grouping/rounding, as documented above rdna4_block_wmma,
 // with the same weight and operand formats. Decode/verify kernels keep their arithmetic;
 // a changed prefill state can still change later routing or generated tokens.
@@ -3023,7 +3103,7 @@ static bool wmma_now() {
         const char* v = std::getenv("EXL3_WMMA_GFX12");
         const bool rdna4 = v != nullptr && std::atoi(v) != 0;
         known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-                     (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 ||
+                     (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx950", 6) == 0 ||
                       (rdna4 && std::strncmp(p.gcnArchName, "gfx12", 5) == 0)) ? 2 : 1;
     }
     return known[dev] == 2;
