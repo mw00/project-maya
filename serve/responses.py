@@ -104,7 +104,8 @@ def normalize_request(req):
     """
     allowed = {"model", "input", "instructions", "tools", "tool_choice", "parallel_tool_calls", "reasoning",
                "max_output_tokens", "temperature", "top_p", "stream", "store", "metadata", "previous_response_id",
-               "background", "text", "truncation", "include", "service_tier", "prompt_cache_key", "client_metadata"}
+               "background", "text", "truncation", "include", "service_tier", "prompt_cache_key", "client_metadata",
+               "top_logprobs"}
     for key in req:
         if key not in allowed:
             raise ValueError(f"unsupported Responses parameter: {key}")
@@ -127,6 +128,14 @@ def normalize_request(req):
     if req.get("truncation", "disabled") != "disabled":
         raise ValueError("truncation: only disabled is supported; requests are never truncated")
     include = req.get("include")
+    # logprobs: include "message.output_text.logprobs" (OpenAI's way to ask), or a top_logprobs alone; the answer's
+    # output_text parts then carry them (Chat-style: logprobs true and top_logprobs, for Service.run and the engine)
+    logprobs = isinstance(include, list) and "message.output_text.logprobs" in include
+    if logprobs:
+        include = [x for x in include if x != "message.output_text.logprobs"]
+    top = req.get("top_logprobs")
+    if top is not None and (type(top) is not int or not 0 <= top <= 20):
+        raise ValueError("top_logprobs must be an integer from 0 to 20")
     if include not in (None, []):
         no_reasoning = isinstance(req.get("reasoning"), dict) and req["reasoning"].get("effort") == "none"
         if include != ["reasoning.encrypted_content"] or not no_reasoning:
@@ -260,6 +269,8 @@ def normalize_request(req):
     normalized.update(messages=messages, tools=tools, tool_choice=choice, _response_validation=validation)
     if "max_output_tokens" in req:
         normalized["max_completion_tokens"] = req["max_output_tokens"]
+    if logprobs or top is not None:
+        normalized.update(logprobs=True, top_logprobs=top or 0)
     return normalized
 
 
@@ -276,6 +287,8 @@ def new_response(model, req, response_id=None, status="in_progress"):
                 "truncation": "disabled", "usage": None}
     if "prompt_cache_key" in req:
         response["prompt_cache_key"] = req["prompt_cache_key"]
+    if "top_logprobs" in req:
+        response["top_logprobs"] = req["top_logprobs"]
     return response
 
 
@@ -343,7 +356,8 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
         fields = {"item_id": item["id"], "output_index": index}
         if item["type"] == "message":
             part = item["content"][0]
-            yield event("response.output_text.done", **fields, content_index=0, text=part["text"], logprobs=[])
+            yield event("response.output_text.done", **fields, content_index=0, text=part["text"],
+                        logprobs=part["logprobs"])
             yield event("response.content_part.done", **fields, content_index=0, part=part)
         elif item["type"] == "reasoning":
             yield event("response.reasoning_text.done", **fields, content_index=0, text=item["content"][0]["text"])
@@ -370,7 +384,10 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
                     item = response["output"][current]
                     item["content"][0]["text"] += ev.text
                     name = "response.reasoning_text.delta" if want == "reasoning" else "response.output_text.delta"
-                    extra = {"logprobs": []} if want == "message" else {}
+                    # (logprobs: the answer's tokens' entries, on the delta and in its part; the reasoning has none)
+                    extra = {"logprobs": list(ev.logprobs or [])} if want == "message" else {}
+                    if want == "message" and ev.logprobs:
+                        item["content"][0]["logprobs"] += ev.logprobs
                     yield event(name, item_id=item["id"], output_index=current, content_index=0, delta=ev.text, **extra)
                 elif ev.kind == "tool_start" or (ev.kind == "tool_call" and ev.call.id not in calls):
                     check_call(ev.call)

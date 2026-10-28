@@ -31,6 +31,7 @@ import hmac
 import codecs
 import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -161,7 +162,9 @@ class MockEngine:
                                                                                  else script)]
         self.script, self.turns = self.scripts[0], 0
         self.last_prompt: list[int] = []
-        self.info = {"logit_bias": 1}   # it samples nothing, so every request's bias is as good as applied
+        # it samples nothing, so every request's bias is as good as applied; and a scripted token is certain: logprob 0,
+        # the only token its row has (logprobs)
+        self.info = {"logit_bias": 1, "logprobs": TOP_LOGPROBS_MAX}
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.last_prompt = list(ids)
@@ -169,11 +172,15 @@ class MockEngine:
         if len(self.scripts) > 1:
             self.script = self.scripts[min(self.turns, len(self.scripts) - 1)]
             self.turns += 1
+        n_top = logprobs_asked(sampling)
         for t in self.script[:max_new]:
             if cancel.is_set():
                 return
             if self.delay:
                 time.sleep(self.delay)
+            if n_top is not None:
+                t = LpToken(t)
+                t.lp = (0.0, [(int(t), 0.0)] if n_top > 0 else [])
             yield t
 
 
@@ -336,6 +343,96 @@ NONFINITE = "non-finite"
 
 # what Service._sliced yields when the loop guard ends an answer (a loop that came back): run() ends it, "stop"
 LOOP_STOP = object()
+
+# ---- log-probabilities (OpenAI's `logprobs` / `top_logprobs`; the DeepSeek engine's GEN logprobs=<n> and LP lines).
+# The engine reports, for each token it writes, the token's logprob and its row's n most likely, from the model's
+# softmax after the request's penalties, at temperature 1 and before top_k / top_p / min_p (OpenAI's convention: the
+# same numbers whatever the request's temperature).  Only a request that asks gets them; an engine that does not say
+# INFO logprobs=<n> is refused with a 400.
+TOP_LOGPROBS_MAX = 20
+LOGPROB_FLOOR = -9999.0           # OpenAI's logprob for a token the model gives no chance (-inf is no JSON number)
+
+
+def logprobs_of(req: dict | None) -> int | None:
+    """The engine's logprobs=<n> for a request (n alternatives a token, 0..20), None when it does not ask.
+    OpenAI's chat completions: "logprobs": true asks, "top_logprobs" (0..20, 0 when absent) says how many alternatives;
+    top_logprobs without logprobs true, or a value of the wrong type, is a 400 (ValueError) naming the field.  (The
+    Responses API's include / top_logprobs arrive here in this form: serve/responses.py's normalize_request.)"""
+    lp, top = (req or {}).get("logprobs"), (req or {}).get("top_logprobs")
+    if lp is not None and not isinstance(lp, bool):
+        raise ValueError("logprobs: true or false")
+    if isinstance(top, str) and re.fullmatch(r"\s*\d+\s*", top):
+        top = int(top)
+    if top is not None:
+        if isinstance(top, bool) or not isinstance(top, int) or not 0 <= top <= TOP_LOGPROBS_MAX:
+            raise ValueError(f"top_logprobs: an integer from 0 to {TOP_LOGPROBS_MAX}")
+        if lp is not True:
+            raise ValueError("top_logprobs: it needs \"logprobs\": true")
+    return (top or 0) if lp is True else None
+
+
+def logprobs_asked(req: dict | None) -> int | None:
+    """logprobs_of() for a request already checked (Service.check_request): None for one it would refuse."""
+    try:
+        return logprobs_of(req)
+    except ValueError:
+        return None
+
+
+class LpToken(int):
+    """A token id from an engine asked for logprobs: the id itself, as every token goes through the server (the stop
+    ids, the loop guard, fair slices), with its LP line's figures in `lp` - (its logprob, [(id, logprob), ...] its
+    row's most likely, most likely first) - or None when the engine wrote none for it."""
+    lp = None
+
+
+def parse_lp(fields: list[str]):
+    """An LP line's fields after its tag (`LP [<rid>]`): `<id> <logprob> <id>:<logprob> ...` -> (id, logprob,
+    [(id, logprob), ...]); None for a line that does not read (cut short)."""
+    try:
+        top = []
+        for f in fields[2:]:
+            i, _, v = f.partition(":")
+            top.append((int(i), float(v)))
+        return int(fields[0]), float(fields[1]), top
+    except (IndexError, ValueError):
+        return None
+
+
+def lp_attach(tok: LpToken, fields: list[str]) -> LpToken:
+    """The token's LP line (its fields after the tag) into tok.lp, when the line is that token's."""
+    got = parse_lp(fields)
+    if got is not None and got[0] == int(tok):
+        tok.lp = (got[1], got[2])
+    return tok
+
+
+def token_piece(tok, t: int) -> bytes:
+    """One token's bytes (a logprobs entry's `bytes`): the tokenizer's own, else its decode; b"" for an id it lacks."""
+    try:
+        if hasattr(tok, "token_bytes"):
+            return tok.token_bytes(int(t))
+        return tok.decode([int(t)]).encode("utf-8")
+    except (IndexError, KeyError, ValueError):
+        return b""
+
+
+def logprob_entry(tok, t, n_top: int) -> dict | None:
+    """OpenAI's logprobs entry for token t - {token, logprob, bytes, top_logprobs: [{token, logprob, bytes}, ...]} -
+    from its LP line (LpToken.lp; at most n_top alternatives); None for a token without one (the loop guard's own
+    end of thinking).  A token split inside a UTF-8 character has the replacement character in `token` and its own
+    bytes in `bytes`, as OpenAI's do."""
+    lp = getattr(t, "lp", None)
+    if lp is None:
+        return None
+
+    def piece(i, v):
+        b = token_piece(tok, i)
+        return {"token": b.decode("utf-8", "replace"), "logprob": v if math.isfinite(v) else LOGPROB_FLOOR,
+                "bytes": list(b)}
+    e = piece(int(t), lp[0])
+    e["top_logprobs"] = [piece(i, v) for i, v in lp[1][:n_top]]
+    return e
 
 
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
@@ -742,10 +839,10 @@ class StrataEngine:
         if part:
             self.vram = [part if v.get("dev") == part["dev"] else v for v in self.vram]
 
-    _TAGGED = ("T ", "PP ", "DONE ", "ERR ")
+    _TAGGED = ("T ", "LP ", "PP ", "DONE ", "ERR ")
 
     def _route(self, line: str) -> bool:
-        """Several conversations at once: a request's own lines (T / PP / DONE / ERR <rid> ...) go to its queue, the
+        """Several conversations at once: a request's own lines (T / LP / PP / DONE / ERR <rid> ...) go to its queue, the
         engine's (STAT, NOTE) are handled here; True when the line was taken."""
         if line.startswith(self._TAGGED):
             f = line.split(None, 2)
@@ -755,7 +852,7 @@ class StrataEngine:
                 if q is not None:
                     q.put(line)
                     return True
-                return line.startswith(("T ", "PP ", "DONE "))   # a request already gone: dropped
+                return line.startswith(("T ", "LP ", "PP ", "DONE "))   # a request already gone: dropped
             return False
         if line.startswith("STAT "):
             self._parse_stat(line)
@@ -958,7 +1055,7 @@ class StrataEngine:
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic) - but
             # the penalties do: they change the logits greedy picks from (#273: a greedy answer's loops)
             return (" temperature=0" + penalty_keys + think + tune_keys + StrataEngine.projection_key(sampling) +
-                    bias_key + StrataEngine.restore_keys(sampling))
+                    bias_key + StrataEngine.restore_keys(sampling) + StrataEngine.logprob_key(sampling))
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -976,7 +1073,8 @@ class StrataEngine:
         if isinstance(seed, int) and seed > 0:
             keys += f" seed={seed}"
         keys += think + tune_keys
-        return keys + StrataEngine.projection_key(sampling) + bias_key + StrataEngine.restore_keys(sampling)
+        return (keys + StrataEngine.projection_key(sampling) + bias_key + StrataEngine.restore_keys(sampling) +
+                StrataEngine.logprob_key(sampling))
 
     @staticmethod
     def penalty_keys(sampling: dict) -> str:
@@ -1024,6 +1122,13 @@ class StrataEngine:
                  else ""))
 
     @staticmethod
+    def logprob_key(sampling: dict) -> str:
+        """`logprobs=<n>`: an LP line after each of the request's T lines, n alternatives in each (OpenAI's logprobs /
+        top_logprobs, checked by the handler: logprobs_of).  "" when the request does not ask: the line as before."""
+        n = logprobs_asked(sampling)
+        return f" logprobs={n}" if n is not None else ""
+
+    @staticmethod
     def projection_key(sampling: dict) -> str:
         """`cvec=0|1`: the experimental-speed-projection control vector for this request, when the engine was
         started with one (--control-vector-scaled; an engine without one ignores the key).  Absent = on."""
@@ -1049,11 +1154,17 @@ class StrataEngine:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
         done = False
         heard, stall = time.monotonic(), {}               # the last line's time; the stall watchdog's samples
+        # logprobs: a token is held until its LP line, which the engine writes right after its T line (an engine that
+        # writes none for it: the token goes on at the next other line, without them)
+        want_lp, lp_wait = logprobs_asked(sampling) is not None, None
         try:
             while True:
                 try:
                     line = self.lines.get(timeout=10)
                 except queue.Empty:
+                    if lp_wait is not None:
+                        t, lp_wait = lp_wait, None
+                        yield t
                     if cancel.is_set():
                         return
                     if ENGINE_STALL_S > 0:
@@ -1069,10 +1180,20 @@ class StrataEngine:
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
                 heard = time.monotonic()
                 stall.clear()
+                if lp_wait is not None and not line.startswith("LP "):
+                    t, lp_wait = lp_wait, None
+                    yield t
                 if line.startswith("T "):
                     if cancel.is_set():
                         return
-                    yield int(line[2:])
+                    if want_lp:
+                        lp_wait = LpToken(int(line[2:]))
+                    else:
+                        yield int(line[2:])
+                elif line.startswith("LP "):
+                    if lp_wait is not None:
+                        t, lp_wait = lp_attach(lp_wait, line.split()[1:]), None
+                        yield t
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -1205,10 +1326,14 @@ class StrataEngine:
             # how long a wait before the checks (the engine-wide stall watchdog, this request's own quiet): 10 s, or
             # less when STRATA_REQUEST_QUIET_S is set low (so a test - or a tuned server - sees it in its own time)
             poll_s = 10.0 if REQUEST_QUIET_S <= 0 else min(10.0, max(0.2, REQUEST_QUIET_S / 2))
+            want_lp, lp_wait = logprobs_asked(sampling) is not None, None   # (as generate(): a token waits for its LP)
             while True:
                 try:
                     line = q.get(timeout=poll_s)
                 except queue.Empty:
+                    if lp_wait is not None:
+                        t, lp_wait = lp_wait, None
+                        yield t
                     if cancel.is_set():
                         return
                     if ENGINE_STALL_S > 0:
@@ -1240,10 +1365,20 @@ class StrataEngine:
                 heard = time.monotonic()
                 stall.clear()
                 f = line.split()
+                if lp_wait is not None and not line.startswith("LP "):
+                    t, lp_wait = lp_wait, None
+                    yield t
                 if line.startswith("T "):
                     if cancel.is_set():
                         return
-                    yield int(f[2])
+                    if want_lp:
+                        lp_wait = LpToken(int(f[2]))
+                    else:
+                        yield int(f[2])
+                elif line.startswith("LP "):
+                    if lp_wait is not None:
+                        t, lp_wait = lp_attach(lp_wait, f[2:]), None
+                        yield t
                 elif line.startswith("PP "):
                     if len(f) >= 4 and f[2].isdigit() and f[3].isdigit():
                         self.progress = (int(f[2]), int(f[3]),
@@ -1871,6 +2006,15 @@ class Service:
             raise ValueError("logit_bias: this engine does not apply token biases - update Maya (./maya.sh --setup)")
         if "logit_bias" in req:
             req["logit_bias"] = bias
+        # logprobs need an engine that writes them (INFO logprobs=<n>: the DeepSeek engine); another would answer
+        # without them, which a client that asked could not tell from a bug
+        n = logprobs_of(req)
+        if isinstance(req.get("top_logprobs"), str):
+            req["top_logprobs"] = n
+        top = (getattr(self.engine, "info", None) or {}).get("logprobs")
+        if n is not None and not (isinstance(top, int) and top >= n):
+            raise ValueError("logprobs: this model's engine does not report token log-probabilities (the DeepSeek "
+                             "engine does - update Maya (./maya.sh --setup) if it is that one)")
 
     def render_ids(self, messages, tools, kwargs, suffix="") -> list[int]:
         """The template rendered for `messages` and `tools` (+ `suffix`, text the server appends to the prompt) and
@@ -3012,6 +3156,28 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         guards = []                                     # this request's loop guard (the Monitor's row says what it did)
+        # logprobs (a request that asks): each token's entry waits in lp_wait until text goes out, then rides with the
+        # first text event (content or reasoning) after it.  The tokens of a tool call and of the end of the thinking
+        # (a feed that leaves the reasoning: what waits then and is not the reasoning's last text) are none of the text
+        # and are dropped, as are those of a stop string that ends the answer with no text before it (with text before
+        # it, they go with that text); the end-of-turn token is never one (it ends the answer before its entry)
+        n_top, lp_wait = logprobs_asked(sampling), []
+
+        def with_lp(evs, was):
+            if n_top is not None:
+                crossed = was == "reasoning" and parser.state != "reasoning"
+                for ev in evs:
+                    if ev.kind in ("content", "reasoning") and ev.text:
+                        if crossed and ev.kind == "content":
+                            lp_wait.clear()
+                            crossed = False
+                        ev.logprobs = list(lp_wait)
+                        lp_wait.clear()
+                    elif ev.kind in ("tool_start", "tool_args", "tool_call"):
+                        lp_wait.clear()
+                if crossed:
+                    lp_wait.clear()
+            return evs
         emb = getattr(self.embeddings, "path", None)
         # Identity token: only a DONE line replaces engine.last, so a request that died, errored or was
         # disconnected must not have the PREVIOUS request's decode figures recorded as its own.
@@ -3127,6 +3293,10 @@ class Service:
                         if parser.state == "reasoning":
                             reasoning_tokens += 1
                         raw_ids.append(t)
+                        if n_top is not None:
+                            e = logprob_entry(self.tok, t, n_top)
+                            if e is not None:
+                                lp_wait.append(e)
                         text, stopped = detok.push(t), False
                         stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
                         if stops:
@@ -3135,12 +3305,15 @@ class Service:
                             if hits:
                                 cut, s = min(hits)
                                 text, held, stopped = held[:cut], "", True
+                                if not text:
+                                    lp_wait.clear()   # (the marker's own tokens: no text of the answer)
                                 matched = s if s in client_stops and s not in self.stop_texts else None
                             else:               # keep back the longest tail that could still grow into a marker
                                 k = max((j for s in stops for j in range(1, len(s))
                                          if held.endswith(s[:j])), default=0)
                                 text, held = held[:len(held) - k], held[len(held) - k:]
-                        evs = parser.feed(text)
+                        was = parser.state
+                        evs = with_lp(parser.feed(text), was)
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
@@ -3152,7 +3325,8 @@ class Service:
                             finish = "stop"
                             break
                     if held:                    # the run ended on what only looked like a marker's start
-                        for ev in parser.feed(held):
+                        was = parser.state
+                        for ev in with_lp(parser.feed(held), was):
                             yield "event", ev
                         held = ""
                     if cancel.is_set():
@@ -3172,7 +3346,8 @@ class Service:
                         print(f"[maya] the engine's numbers went non-finite after {n} tokens ({e}): the answer ends "
                               "there", flush=True)
                         if held:
-                            for ev in parser.feed(held):
+                            was = parser.state
+                            for ev in with_lp(parser.feed(held), was):
                                 yield "event", ev
                             held = ""
                     else:
@@ -3248,7 +3423,8 @@ class Service:
                 self.status["busy"] = self.active > 0
             if book is not None and self.savings is not None:
                 self.savings.add(*book)
-        for ev in parser.finish():
+        was = parser.state
+        for ev in with_lp(parser.finish(), was):
             yield "event", ev
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
@@ -3434,7 +3610,19 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     # response_format json_object / json_schema: the answer is held and its JSON sent alone at the end (Strata #762)
     rf = req.get("response_format")
     json_mode = isinstance(rf, dict) and rf.get("type") in ("json_object", "json_schema")
-    held = []
+    held, held_lp = [], []
+    # logprobs (a request that asks): a text chunk's choice carries its tokens' entries - OpenAI's `content` for the
+    # answer, and `reasoning_content` (as the delta's field of that name) for the reasoning
+    want_lp = logprobs_asked(req) is not None
+
+    def text_chunk(delta, entries, key="content"):
+        c = chunk(delta)
+        if want_lp:
+            lp = {"content": [], "refusal": None}
+            lp[key] = list(entries or [])
+            c["choices"][0]["logprobs"] = lp
+        return c
+
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel):
         # ^ kind "ping": x carries the prompt's progress (total, cache, processed, time_ms) while the engine reads,
         #   or None while this request just waits (queued again, an MCP round's engine work)
@@ -3452,12 +3640,13 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         elif kind == "event":
             ev: Event = x
             if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
+                yield text_chunk({"reasoning_content": ev.text}, ev.logprobs, "reasoning_content")
             elif ev.kind == "content" and ev.text:
                 if json_mode:
                     held.append(ev.text)
+                    held_lp += ev.logprobs or []
                     continue
-                yield chunk({"content": ev.text})
+                yield text_chunk({"content": ev.text}, ev.logprobs)
             elif ev.kind == "tool_start":
                 streamed[ev.call.id] = calls
                 calls += 1
@@ -3471,7 +3660,7 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                 calls += 1
         else:
             if held:
-                yield chunk({"content": json_from_text("".join(held))})
+                yield text_chunk({"content": json_from_text("".join(held))}, held_lp)
             finish = "tool_calls" if calls and x["finish"] == "stop" else {"cancel": "stop"}.get(x["finish"], x["finish"])
             last = chunk({}, finish)
             pt = x.get("prompt_tokens", len(ids))     # after MCP rounds: the last round's prompt
@@ -3599,13 +3788,19 @@ def jobs_put(job: StreamJob) -> None:
         JOBS[job.id] = job
 
 
-def openai_collect(chunks) -> dict:
+def openai_collect(chunks, logprobs: bool = False) -> dict:
+    """The chunks as one chat.completion; `logprobs` (the request asked): the choice's logprobs, every text chunk's
+    entries in order - OpenAI's `content`, and `reasoning_content` when there was reasoning."""
     content, reasoning, by_index, last, mcp = [], [], {}, None, []
+    lp_content, lp_reasoning = [], []
     for c in chunks:
         if c is None or c.get("prompt_progress"):  # a heartbeat, a prompt-progress chunk: not answer content
             continue
         if c.get("strata_mcp"):
             mcp.append(c["strata_mcp"])
+        lp = c["choices"][0].get("logprobs") or {}
+        lp_content += lp.get("content") or []
+        lp_reasoning += lp.get("reasoning_content") or []
         d = c["choices"][0]["delta"]
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
@@ -3630,6 +3825,9 @@ def openai_collect(chunks) -> dict:
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
            "usage": last["usage"]}
+    if logprobs:
+        out["choices"][0]["logprobs"] = {"content": lp_content, "refusal": None,
+                                         **({"reasoning_content": lp_reasoning} if lp_reasoning else {})}
     if last.get("timings"):
         out["timings"] = last["timings"]
     return out
@@ -4472,7 +4670,7 @@ def make_handler(svc: Service):
                                {t["name"] for t in extra}) if use_mcp else None
             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run)
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._json(200, openai_collect(chunks, logprobs=logprobs_asked(req) is not None))
             if req.get("strata_resume") is True:
                 # the web app: the answer runs on if the connection drops; the page reconnects to it by id
                 first = next(chunks)

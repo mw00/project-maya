@@ -57,6 +57,11 @@ print(response.output_text)
 - The `include:["reasoning.encrypted_content"]` projection is accepted only with
   explicit `reasoning.effort:"none"`, when there are no reasoning items to encrypt.
   Encryption and encrypted reasoning input remain unsupported.
+- `include:["message.output_text.logprobs"]` and `top_logprobs` (0-20; either one
+  asks) return token log-probabilities in the message's `output_text` part and its
+  `response.output_text.delta` / `.done` events, on the DeepSeek engine only (another
+  engine refuses the request with a 400). See docs/SETTINGS.md, "Token
+  log-probabilities".
 
 ## Conversation State
 

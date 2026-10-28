@@ -646,6 +646,7 @@ class Event:
     text: str = ""
     call: ToolCall | None = None
     complete: bool = True          # false when the model never closed the call's syntax
+    logprobs: list | None = None   # a text event's tokens' OpenAI logprobs entries (a request that asked: Service.run)
 
 
 THINK_END = "</think>"

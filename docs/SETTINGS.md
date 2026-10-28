@@ -301,6 +301,29 @@ included (a sampled request's drafts are then kept by the speculative-sampling r
 repeat penalty of 1 and frequency and presence penalties of 0 are off: such a request decodes exactly as one without
 them.
 
+## Token log-probabilities (`logprobs`, DeepSeek)
+
+A chat completion with `"logprobs": true` (and `"top_logprobs"`: 0 to 20 alternatives, 0 when absent) gets OpenAI's
+`choices[0].logprobs`: for each token of the answer its `token`, `logprob`, `bytes` and `top_logprobs` (the most likely
+tokens of its position, most likely first) - in `logprobs.content`, and for the reasoning's tokens in
+`logprobs.reasoning_content` (as the `reasoning_content` text beside `content`). Streamed, each text chunk carries its
+own tokens' entries. The Responses API asks with `include: ["message.output_text.logprobs"]` (or a `top_logprobs`) and
+returns them in the message's `output_text` part and its deltas; the reasoning item has none.
+
+The numbers are the model's softmax over its logits after the request's repetition penalties, at temperature 1 and
+before `top_k` / `top_p` / `min_p` - OpenAI's convention, the same whatever the request's temperature (a sampled token
+can be one the list does not show). A token the model gives no chance has -9999 (JSON has no -inf). Each token's own
+row is used: with DSpark drafts, an accepted draft's and the token after them each come from their own row of the
+verify window, so the numbers are those of a step without drafts, up to the rounding of a window's arithmetic. Tool
+calls, the end-of-thinking token and the end of turn have no entries.
+
+Only the DeepSeek engine (maya-ds4) reports them (`GEN ... logprobs=<n>`: an `LP [<rid>] <id> <logprob> <id>:<logprob>
+...` line after each token's `T` line; its start says `INFO logprobs=20`). A request without them decodes exactly as
+before - no device work, no extra wait; one that asks costs a kernel over the token's logit row (the window's rows with
+drafts) and a small copy a step. Another engine (GLM, MiniMax) answers a request that asks with a 400.
+`MAYA_DS4_LOGPROBS_CHECK=1` (tests, off by default; `DS4_LOGPROBS_CHECK` too) also computes each row on the host from its
+logits and logs every row that differs by more than 1e-4, and a count every 256 rows.
+
 ## The loop guard
 
 A quantized model, greedy above all, can fall into a loop: the same sentence, number sequence or block of code again
