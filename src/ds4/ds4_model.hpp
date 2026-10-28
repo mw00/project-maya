@@ -117,6 +117,9 @@ struct Stats {
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
+    // the drafter's passes on the GPUs (events): their blocks on the blocks' device, the head and the markov steps
+    // on the head device - what a pass costs each GPU, against draft_ms (the host's wait)
+    double draft_block_ms = 0.0, draft_head_ms = 0.0;
 };
 
 class Model {
@@ -151,6 +154,12 @@ public:
     /// DeepSeek's reference does.  verify() keeps a draft d with probability min(1, p(d) / q(d)) over the request's
     /// chain - the speculative-sampling rule, so every token is still distributed as the model's own draw.
     int draft_block() const;
+    /// The trunk's routed experts not in VRAM (the CPU lane's).  With any, and the expert cache on (the default), the
+    /// cache moves experts between VRAM and the CPU lane as they are used - a row's sums depend on where its experts
+    /// sat when it ran (the GPU's kernels and the CPU lane round differently), not on the rows batched with it - so two
+    /// runs of the same rows at different times are not bit for bit the same; with --no-expert-cache the placement is
+    /// the load's (--multi-check reports which comparisons are expected to hold).
+    int lane_experts() const;
     bool draft(int y, std::vector<int>& drafts, std::vector<float>& conf, std::string& err, float temperature = 0.0f,
                float top_p = 1.0f, int top_k = 0, float min_p = 0.0f, uint64_t seed = 0, uint64_t counter = 0);
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
@@ -218,6 +227,31 @@ public:
         int next = -1;      // out
     };
     bool verify_multi(MultiSpec* rs, int n, std::string& err);
+    /// verify_multi in two halves, two windows in flight (MAYA_DS4_MD_PIPE=1 at load; a layer split over two GPUs in
+    /// threads mode, a request ring a GPU, no layer streaming over the PCIe lane - pipe_ok says whether, and why not).  verify_multi_issue(rs, n, slot)
+    /// makes the window as verify_multi does and runs its first GPU's layers; verify_multi_take(rs, n, slot) runs its
+    /// second GPU's layers and the head, waits, and gives each conversation its verdict, rollback and seeding exactly
+    /// as verify_multi does (the same rows, kernels and reduction orders: the tokens are the same).  Two slots (0, 1):
+    /// with both issued, one window's second stage runs while the other's first does.  Windows are taken in issue
+    /// order; a conversation is in one window in flight at most; rs must be the issue's array.  While any window is in
+    /// flight, step_multi / verify_multi / seq_bind are refused (draft_multi and seq_pos are fine - the drafter runs
+    /// between a take and the next issue).  A failed issue consumed nothing; a failed take undid its window - the loop
+    /// then calls pipe_reset(), which waits for every stage in flight and undoes every window left.
+    bool pipe_ok(std::string* why = nullptr) const;
+    bool verify_multi_issue(MultiSpec* rs, int n, int slot, std::string& err);
+    bool verify_multi_take(MultiSpec* rs, int n, int slot, std::string& err);
+    void pipe_reset();
+    /// The expert cache's tick (its switches and new swaps) held while on - the experts stay where they are - and the
+    /// held rows ticked at the release (when no window is in flight).  verify_multi_take never ticks with the other
+    /// window in flight; a run of windows - a pipelined round, and the same windows one at a time as its reference -
+    /// holds it, so both tick at the same points; --multi-check holds it throughout (the load's placement).
+    void cache_hold(bool on);
+    /// The GPU time of each stage of the window last taken from slot (verify_multi_take): s0 its first GPU's layers
+    /// (from the embedding rows' copy to the hand-off's put), s1 its second GPU's layers and the head (from the hand-off's
+    /// get - the wait for the first stage left out - to the head's last work), in ms, from events on each device's
+    /// stream.  False (and -1) when a stage was not timed.  The serve loop prices a pipelined window by them
+    /// (MAYA_DS4_MD_PIPE_PRICE=stage).
+    bool pipe_window_ms(int slot, float* s0, float* s1) const;
     /// draft() for n conversations at once (--parallel): conversation seqs[i]'s drafts after its token ys[i] (the token
     /// at its position, not fed yet) with their confidences, as draft() gives them bound to it alone - up to
     /// draft_pass() conversations' blocks through the drafter's blocks and the head as one window (each block a

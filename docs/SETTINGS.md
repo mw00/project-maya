@@ -434,6 +434,38 @@ context shares the memory beside the model among the N conversations.
   several with and without drafts, and its drafter time. The drafts are the drafter's argmax (`DS4_DSPARK_SAMPLE=1`
   is not taken here); a request's `spec=0` keeps it a plain row. The `DONE` line's accepted / offered counts cover
   each request's own drafts.
+- **Two windows in flight** (`MAYA_DS4_MD_PIPE=1`, off by default; experimental; with every conversation drafting
+  on a layer split over two GPUs in threads mode, no PCIe lane, no helper - the engine says at start what it is
+  missing otherwise): the answering conversations in two groups, each a window of its own (its plan, its drafters in
+  one pass, its verdicts as above), the two windows in flight at once - one window's second GPU's layers and head
+  run while the other window's first GPU's layers do, where one window at a time left each GPU idle through the
+  other's stage. Each group runs `MAYA_DS4_MD_PIPE_WINDOWS` windows a round (3; 1 is two windows with no overlap
+  after the first): a window's tokens are written as it lands, all but the last, which the group's next window
+  takes as its input. Each window's rows, kernels and reduction orders are the one window's. Experts on the CPU lane
+  are served through a request ring a GPU (the one ring answered in order would queue the second window's requests
+  behind the first's). Costs: a second set of the verify backups, hand-off buffers and request rings, and 32 logits
+  rows (the second window's and the drafter's own: a pass may run while a window's logits wait to be sampled). The
+  windows overlap, so the policy prices each from its own stages (`MAYA_DS4_MD_PIPE_PRICE=stage`, the default): the
+  slower of its two stages' GPU time (events on each GPU's stream; the second stage's wait for the first left out),
+  plus an equal share of what the round spent beyond the stages and the drafter. `share` shares the round's time less
+  the drafter's out in proportion to the cost model's current cost of each window's rows, `equal` in equal parts. A
+  serving window's time grows far less with its rows than a lone window's (`FIXED`) shape says, so pricing by that
+  shape over-charges the drafted windows and the policy declines drafts that pay. `MAYA_DS4_MD_PIPE_DRAFT_PRICE=gpu`
+  (off: `wall`) also prices the drafter's passes by their GPU time (blocks and head) instead of the host's wait for
+  them, which for a pass drafted beside the other window's first stage includes the rest of that stage. The log line is
+  `maya ds4 multi draft pipe: ...` with the windows' rows and the round's time, and with `MAYA_DS4_MULTI_DRAFT_LOG=1`
+  a `maya ds4 multi draft pipe window: ...` line a window (its rows, stage times, price, mode, the plain step's and
+  the plan's expected tokens a second, the plan's mean acceptance); the `request N:` line adds its drafted rounds
+  of several by its acceptance band. `MAYA_DS4_MD_PIPE_SERIAL=1`
+  runs the same groups and windows one window at a time, the expert cache ticking where the pipe's round does (at
+  its end: no tick while a window is in flight) - a pipelined run's reference through the serve protocol
+  (`tools/ds4/parallel_test.py --ref-lanes N --ref-env MAYA_DS4_MD_PIPE_SERIAL=1`). With experts on the CPU lane the
+  expert cache moves them between VRAM and the lane as they are used, and the two round an expert differently, so a
+  conversation's bits depend on where its experts sat when its rows ran: two runs agree token for token only as far
+  as the cache moved the same experts at the same points. `--multi-check` holds the experts where the load put them
+  for the whole check, so every comparison - alone and together, two windows in flight and the same windows one at a
+  time (its drafting phase runs both ways) - counts on any placement (a row's CPU-lane experts are summed per token,
+  in expert order, whatever rows share its request).
 
 ## Drafting with DFlash2
 

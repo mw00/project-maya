@@ -235,8 +235,17 @@ def main() -> int:
     ap.add_argument("--skip-long", action="store_true", help="the interleaving check and the long measurement only "
                                                              "with --long-len, which a --ctx below it cannot run")
     ap.add_argument("--measure", action="store_true", help="run and print the measurement table")
+    ap.add_argument("--ref-lanes", type=int, default=1,
+                    help="the reference run's --parallel (1: each prompt alone, the default; <lanes>: the same prompts at "
+                         "once in a run with --ref-env - e.g. MAYA_DS4_MD_PIPE_SERIAL=1 against the pipelined run, the "
+                         "same windows one at a time: the comparison that holds whatever the experts' placement)")
+    ap.add_argument("--ref-env", default="", help="k=v;k=v... settings of the reference run only")
     a = ap.parse_args()
     settings = config_env(a.config) if a.config else {}
+    ref_settings = dict(settings)
+    for kv in [s for s in a.ref_env.split(";") if s]:
+        k, _, v = kv.partition("=")
+        ref_settings[k.strip()] = v.strip()
 
     if not os.path.exists(a.exe):
         print(f"{a.exe}: no engine - build it first (cmake --build build --target maya-ds4)", flush=True)
@@ -266,22 +275,35 @@ def main() -> int:
 
     # ---- alone: one at a time, --parallel 1, twice (the prompt path's own run-to-run agreement is measured)
     alone_runs: list[list[list[int]]] = []
+    ref_lanes = max(1, min(lanes, a.ref_lanes))
     try:
-        eng = one_run(a, settings, 1, a.ctx, os.path.join(tmp, "alone1"))
+        eng = one_run(a, ref_settings, ref_lanes, a.ctx, os.path.join(tmp, "alone1"))
         for k in range(2):
             got = []
-            for i, p in enumerate(probes):
-                r = eng.stream(eng.send(p, a.check_new, a.spec))
-                if r["error"]:
-                    raise RuntimeError(f"alone {i}: {r['error']}")
-                got.append(r["tokens"])
+            if ref_lanes > 1:   # (the reference: the same prompts at once, as the together run sends them)
+                for i, r in enumerate(eng.run_at_once(probes[:lanes], a.check_new, a.spec)):
+                    if r["error"]:
+                        raise RuntimeError(f"reference {i}: {r['error']}")
+                    got.append(r["tokens"])
+                for i in range(lanes, len(probes)):   # (the rest one at a time: the slots check's prompts)
+                    r = eng.stream(eng.send(probes[i], a.check_new, a.spec))
+                    if r["error"]:
+                        raise RuntimeError(f"reference {i}: {r['error']}")
+                    got.append(r["tokens"])
+            else:
+                for i, p in enumerate(probes):
+                    r = eng.stream(eng.send(p, a.check_new, a.spec))
+                    if r["error"]:
+                        raise RuntimeError(f"alone {i}: {r['error']}")
+                    got.append(r["tokens"])
             alone_runs.append(got)
         eng.quit()
     except Exception as e:  # noqa: BLE001
         print(f"the alone run failed: {e}", flush=True)
         return 2
     same = all(x == y for x, y in zip(*alone_runs))
-    print(f"  {'ok' if same else 'note'}    alone: two reads of the same prompts "
+    what = "alone" if ref_lanes == 1 else f"the reference ({ref_lanes} at once{', ' + a.ref_env if a.ref_env else ''})"
+    print(f"  {'ok' if same else 'note'}    {what}: two reads of the same prompts "
           f"{'agree' if same else 'differ - compared against both'} ({eng.load_s:.0f} s to load)", flush=True)
     ref = alone_runs[0]
 
