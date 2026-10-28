@@ -59,6 +59,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -131,7 +133,11 @@ void usage() {
                  "maya-ds4 --pack ... --profile-run FILE [--profile-out OUT]   an expert profile from a corpus (a line "
                  "of ids each)\n"
                  "           [--profile-readonly] [--profile-out OUT]   any run: the profile never written back; this "
-                 "run's counts alone to OUT\n");
+                 "run's counts alone to OUT\n"
+                 "maya-ds4 --pack ... --spec-eval FILE [--n N]   the drafter's acceptance over prompts, every draft "
+                 "verified (DS4_ROUND_LOG=<file>: a line a round)\n"
+                 "maya-ds4 --pack ... --sampler-test N --ids I,J,...   speculative sampling against the model's own "
+                 "draws\n");
 }
 
 // --pack-info: the types the kernels take, asked of them (ds4_gguf / ds4_iq: the routed experts' and the dense GEMVs'
@@ -297,6 +303,44 @@ struct Lookup {
     }
 };
 
+// DS4_ROUND_LOG=<file>: a line a decoding round that drafted (appended) - the tag (ids: the CLI's run, p<n>: a
+// --spec-eval prompt, r<n> / rid<n>: a serve request), the position, the drafts' source (dspark / lookup), how many
+// were made, verified and kept, and the drafter's confidences for its drafts (- for the lookup's): the drafter's
+// acceptance read off afterwards, for any confidence floor.  The rounds of one conversation at a time (a --parallel
+// step of several is not logged).  --spec-eval reads the last round's note (record) without a file too
+struct RoundLog {
+    std::FILE* f = nullptr;
+    bool record = false;
+    std::string tag = "-";
+    // the last round's note: drafts made (-1: no drafter round), verified, kept; the drafter's confidences
+    int made = -1, verified = 0, kept = 0;
+    bool lookup = false;
+    std::vector<float> conf;
+    bool on() const { return f != nullptr || record; }
+    void note(long long pos, bool lk, int made_, int verified_, int kept_, const std::vector<float>& c) {
+        made = made_, verified = verified_, kept = kept_, lookup = lk;
+        conf = c;
+        if (f == nullptr) return;
+        std::fprintf(f, "%s\t%lld\t%s\t%d\t%d\t%d\t", tag.c_str(), pos, lk ? "lookup" : "dspark", made_, verified_, kept_);
+        if (lk || c.empty()) std::fputc('-', f);
+        for (size_t i = 0; !lk && i < c.size(); ++i) std::fprintf(f, "%s%.4f", i ? "," : "", c[i]);
+        std::fputc('\n', f);
+        std::fflush(f);
+    }
+};
+RoundLog& round_log() {
+    static RoundLog r = [] {
+        RoundLog x;
+        if (const char* p = std::getenv("DS4_ROUND_LOG")) {
+            x.f = std::fopen(p, "a");
+            if (x.f == nullptr) std::fprintf(stderr, "maya-ds4: DS4_ROUND_LOG=%s: cannot open it\n", p);
+            else std::fprintf(x.f, "# tag\tposition\tsource\tmade\tverified\tkept\tconfidences\n");
+        }
+        return x;
+    }();
+    return r;
+}
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them) - or the lookup's (lk, above) - verified together; else a plain step.
 // `out` gets the tokens that follow tok (the accepted drafts, then the trunk's next), the last of them the next round's
@@ -309,10 +353,14 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     const double t0 = now_ms();
     int match = 0;
     const bool drafter = spec && room > 1 && m.draft_block() > 0;
+    RoundLog& rl = round_log();   // (DS4_ROUND_LOG, --spec-eval)
+    const long long pos0 = rl.on() ? (long long) m.pos() : 0;
+    if (rl.on()) rl.made = -1;
     if (drafter) {
         std::vector<int> drafts;
         std::vector<float> conf;
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
+        const int made = (int) drafts.size();
         int keep = 0;
         if (cum_min < 0) cum_min = dspark_cum_default();
         float cum = 1.0f;
@@ -336,6 +384,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             drafts.resize((size_t) keep);
             int acc = 0, next = -1;
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            if (rl.on()) rl.note(pos0, from_lk, from_lk ? keep : made, keep, acc, conf);
             counter += (unsigned long long) acc + 1;
             for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
             out.push_back(next);
@@ -351,6 +400,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             }
             return true;
         }
+        if (rl.on() && made > 0) rl.note(pos0, false, made, 0, 0, conf);   // (drafts made, none confident enough)
     }
     // no drafter this round (DSpark not loaded or off, or resting after a round of drafts below its confidence): the
     // lookup's drafts alone, where the policy expects more committed tokens a millisecond from them than from a plain
@@ -364,6 +414,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             const std::vector<int> drafts(lk->buf.begin(), lk->buf.begin() + (pk.t - 1));
             int acc = 0, next = -1;
             if (!m.verify(tok, drafts, temperature, top_p, top_k, min_p, seed, counter, acc, next, err)) return false;
+            if (rl.on()) rl.note(pos0, true, k, (int) drafts.size(), acc, {});
             counter += (unsigned long long) acc + 1;
             for (int i = 0; i < acc; ++i) out.push_back(drafts[(size_t) i]);
             out.push_back(next);
@@ -581,6 +632,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     in.start();
     std::string line;
     unsigned long long counter = 0;
+    long long log_req = 0;   // (DS4_ROUND_LOG's tags)
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
     // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
@@ -1422,6 +1474,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             continue;
         }
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
+        if (round_log().f != nullptr) round_log().tag = "r" + std::to_string(++log_req);   // (DS4_ROUND_LOG)
         // a request's own seed: its draws from the start of its stream, so the same seed gives the same answer (the
         // counter ran on across requests: a seed was not reproducible); without one the stream runs on as before
         if (r.seed != 0) counter = 0;
@@ -1734,6 +1787,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (need.size() == 1) {   // alone (or the last of several still running): its rounds, as with one conversation
                 Act& a = *need[0];
                 bind(a.seq);
+                if (round_log().f != nullptr) round_log().tag = "rid" + std::to_string(a.r.rid);   // (DS4_ROUND_LOG)
                 int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.pos());
                 const bool closing = close_think(a);
                 if (closing) room = 1;
@@ -2110,6 +2164,287 @@ int profile_run(strata::ds4::Model& m, const std::string& path, const std::strin
                          "(python tools/ds4/profile.py make --pack <pack> --out <profile> %s ...)\n",
                  lines, tokens, cut, (now_ms() - t0) / 1000.0, out.c_str(), out.c_str());
     return lines > 0 ? 0 : 1;
+}
+
+// a prompt from a fresh state, its last row's logits kept (mark: the state before its last token kept in checkpoint 1)
+bool feed_prompt(strata::ds4::Model& m, const std::vector<int>& ids, bool mark, std::string& err) {
+    m.reset();
+    for (size_t done = 0; done < ids.size();) {
+        const size_t k = std::min<size_t>((size_t) m.feed_unit(), ids.size() - done);
+        const bool fin = done + k == ids.size();
+        if (!(fin && mark ? m.feed_mark(ids.data() + done, (int) k, 1, 1, err)
+                          : m.feed(ids.data() + done, (int) k, fin ? 1 : 0, err)))
+            return false;
+        done += k;
+    }
+    return true;
+}
+
+// --spec-eval FILE --n N: the drafter's acceptance over prompts (a line of ids each, BOS and text as --ppl's), each from
+// a fresh state, N tokens decoded after it (greedy, or --temperature / --seed) with every draft verified - no
+// confidence floor or cut, no prompt lookup - so what a floor would have kept can be read off afterwards.  Per prompt
+// and in all: rounds, tokens a round, the drafts kept per position and by the drafter's confidence; DS4_ROUND_LOG gets
+// a line a round
+int spec_eval(strata::ds4::Model& m, const std::string& path, int n, float temp, unsigned long long seed) {
+    if (m.draft_block() <= 0) {
+        std::fprintf(stderr, "maya-ds4: --spec-eval needs the DSpark drafter (a pack with it, --dspark on)\n");
+        return 2;
+    }
+    std::ifstream in(path);
+    if (!in) {
+        std::fprintf(stderr, "maya-ds4: --spec-eval: cannot open %s\n", path.c_str());
+        return 1;
+    }
+    RoundLog& rl = round_log();
+    rl.record = true;
+    const int top_k = temp > 0 ? 64 : 1;
+    const strata::ds4::Stats s0 = m.stats();
+    long long prompts = 0, all_tok = 0, all_rounds = 0, all_off = 0, all_acc = 0;
+    long long reach[10] = {}, kept[10] = {};   // drafts by the drafter's confidence (tenths): verified with all before
+                                              // them kept, and kept
+    std::string line, err;
+    const double t_all = now_ms();
+    while (std::getline(in, line)) {
+        const std::vector<int> ids = parse_ids(line);
+        if (ids.empty()) continue;
+        if ((long long) ids.size() + n + 16 > m.max_context()) {
+            std::fprintf(stderr, "spec-eval: a prompt of %zu tokens and %d more do not fit the context: left out\n",
+                         ids.size(), n);
+            continue;
+        }
+        rl.tag = "p" + std::to_string(++prompts);
+        if (!feed_prompt(m, ids, false, err)) {
+            std::fprintf(stderr, "maya-ds4: --spec-eval, prompt %lld: %s\n", prompts, err.c_str());
+            return 1;
+        }
+        unsigned long long counter = 0;
+        int tok = m.sample(temp, 1.0f, top_k, 0.0f, seed, counter++);
+        long long produced = 1, rounds = 0, off_p = 0, acc_p = 0;
+        std::vector<int> got;
+        const double t0 = now_ms();
+        bool end = tok == 1;
+        while (!end && produced < n) {
+            int off = 0, acc = 0;
+            if (!round(m, tok, (int) (n - produced), true, 0.0f, temp, 1.0f, top_k, 0.0f, seed, counter, got, off, acc,
+                       err, 0.0f, nullptr)) {
+                std::fprintf(stderr, "maya-ds4: --spec-eval, prompt %lld: %s\n", prompts, err.c_str());
+                return 1;
+            }
+            ++rounds;
+            off_p += off;
+            acc_p += acc;
+            for (int i = 0; rl.made > 0 && !rl.lookup && i < rl.verified && i < (int) rl.conf.size(); ++i) {
+                const int b = std::min(9, std::max(0, (int) (rl.conf[(size_t) i] * 10.0f)));
+                reach[b] += i <= rl.kept;
+                kept[b] += i < rl.kept;
+            }
+            for (int t : got) {
+                ++produced;
+                if (t == 1) {
+                    end = true;
+                    break;
+                }
+            }
+            tok = got.back();
+        }
+        const double ms = now_ms() - t0;
+        std::fprintf(stderr, "spec-eval %lld: prompt %zu tokens, %lld written in %lld rounds (%.2f a round), %lld of %lld "
+                             "drafts kept (%.0f%%), %.1f tok/s\n",
+                     prompts, ids.size(), produced, rounds, rounds > 0 ? (double) (produced - 1) / (double) rounds : 0.0,
+                     acc_p, off_p, off_p > 0 ? 100.0 * (double) acc_p / (double) off_p : 0.0,
+                     ms > 0 ? 1000.0 * (double) (produced - 1) / ms : 0.0);
+        all_tok += produced - 1;
+        all_rounds += rounds;
+        all_off += off_p;
+        all_acc += acc_p;
+    }
+    rl.record = false;
+    const strata::ds4::Stats& s1 = m.stats();
+    const double nr = (double) std::max<int64_t>(1, s1.drafts_rounds - s0.drafts_rounds);
+    std::printf("spec-eval: %lld prompts, %lld tokens after their first in %lld rounds (%.2f a round), %lld of %lld drafts "
+                "kept (%.1f%%); drafting %.2f ms a round, verifying %.2f ms a round; %.0f s\n",
+                prompts, all_tok, all_rounds, all_rounds > 0 ? (double) all_tok / (double) all_rounds : 0.0, all_acc,
+                all_off, all_off > 0 ? 100.0 * (double) all_acc / (double) all_off : 0.0, (s1.draft_ms - s0.draft_ms) / nr,
+                (s1.verify_ms - s0.verify_ms) / nr, (now_ms() - t_all) / 1000.0);
+    std::printf("spec-eval %s\n", per_position(s0, s1).c_str());
+    std::string bc = "spec-eval by the drafter's confidence (kept / reached):";
+    for (int b = 0; b < 10; ++b) {
+        if (reach[b] == 0) continue;
+        char s[96];
+        std::snprintf(s, sizeof s, " %.1f-%.1f %lld/%lld %.0f%%", b / 10.0, (b + 1) / 10.0, kept[b], reach[b],
+                      100.0 * (double) kept[b] / (double) reach[b]);
+        bc += s;
+    }
+    std::printf("%s\n", bc.c_str());
+    return prompts > 0 ? 0 : 1;
+}
+
+// the chi-square distribution's upper tail at x with df degrees of freedom: Q(df / 2, x / 2), the regularized upper
+// incomplete gamma function - its series below a + 1, its continued fraction (Lentz) above
+double chi2_tail(double x, int df) {
+    const double a = 0.5 * df, z = 0.5 * x;
+    if (df <= 0 || z <= 0) return 1.0;
+    const double front = std::exp(-z + a * std::log(z) - std::lgamma(a));
+    if (z < a + 1.0) {
+        double term = 1.0 / a, sum = term;
+        for (int i = 1; i < 10000 && term > sum * 1e-15; ++i) {
+            term *= z / (a + i);
+            sum += term;
+        }
+        return std::min(1.0, std::max(0.0, 1.0 - front * sum));
+    }
+    const double tiny = 1e-300;
+    double b = z + 1.0 - a, c = 1.0 / tiny, d = 1.0 / b, h = d;
+    for (int i = 1; i < 10000; ++i) {
+        const double an = -i * (i - a);
+        b += 2.0;
+        d = an * d + b;
+        if (std::fabs(d) < tiny) d = tiny;
+        c = b + an / c;
+        if (std::fabs(c) < tiny) c = tiny;
+        d = 1.0 / d;
+        h *= d * c;
+        if (std::fabs(d * c - 1.0) < 1e-15) break;
+    }
+    return std::min(1.0, std::max(0.0, front * h));
+}
+
+// whether two samples of tokens come from one distribution: the two-sample chi-square over the tokens they drew (those
+// whose expected count in the smaller sample is under 5 pooled into one group), its groups and p-value
+struct Chi {
+    double x = 0.0, p = 1.0;
+    int groups = 0;
+};
+Chi two_sample(const std::vector<int>& a, const std::vector<int>& b) {
+    std::map<int, std::pair<double, double>> n;
+    for (int t : a) n[t].first += 1.0;
+    for (int t : b) n[t].second += 1.0;
+    const double na = (double) a.size(), nb = (double) b.size(), small = std::min(na, nb);
+    std::vector<std::pair<double, double>> g;
+    double ra = 0.0, rb = 0.0;
+    for (const auto& kv : n) {
+        const auto& c = kv.second;
+        if ((c.first + c.second) * small / (na + nb) >= 5.0) {
+            g.push_back(c);
+        } else {
+            ra += c.first;
+            rb += c.second;
+        }
+    }
+    if (ra + rb > 0.0) g.emplace_back(ra, rb);
+    Chi r;
+    if (na <= 0.0 || nb <= 0.0) return r;
+    const double ka = std::sqrt(nb / na), kb = std::sqrt(na / nb);
+    for (const auto& [x, y] : g) r.x += (ka * x - kb * y) * (ka * x - kb * y) / (x + y);
+    r.groups = (int) g.size();
+    r.p = chi2_tail(r.x, r.groups - 1);
+    return r;
+}
+
+// --sampler-test N --ids I,J,...: speculative sampling against the model's own draws.  After the prompt and its greedy
+// next token y, the token after y is drawn 20 N times from the model's own row (sample(): a plain step's draw), and N
+// times as a drafted round writes it - the drafter's drafts (drawn from its own distribution with DS4_DSPARK_SAMPLE=1,
+// set unless given; else its argmax) verified by verify()'s rule, the state taken back to the prompt each time
+// (checkpoint 1, its last token fed again).  The two samples are compared with a chi-square test for four sampling
+// chains, the last with penalties (its drafts are the argmax: points); a p-value under 0.001 is a mismatch (exit 1).
+// The plain draws' two halves are the test's own reference.  A prompt whose next token is nearly certain is said: the
+// test then sees little
+int sampler_test(strata::ds4::Model& m, const std::vector<int>& ids, int n, unsigned long long seed) {
+    if (m.draft_block() <= 0) {
+        std::fprintf(stderr, "maya-ds4: --sampler-test needs the DSpark drafter (a pack with it, --dspark on)\n");
+        return 2;
+    }
+    if (ids.size() < 2 || n < 50) {
+        std::fprintf(stderr, "maya-ds4: --sampler-test N (50 or more) needs --ids of two tokens or more\n");
+        return 2;
+    }
+    std::string err;
+    const int64_t P = (int64_t) ids.size();
+    if (!feed_prompt(m, ids, true, err)) {
+        std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+        return 1;
+    }
+    const int y = m.sample(0.0f, 1.0f, 1, 0.0f, 0, 0);
+    // back to the prompt's end: the state before its last token, that token fed again (y's logits)
+    const auto back = [&]() -> bool {
+        if (!m.restore(P - 1) || m.pos() != P - 1) {
+            err = "the state before the prompt's last token did not come back";
+            return false;
+        }
+        return m.feed(ids.data() + P - 1, 1, 1, err);
+    };
+    struct Chain {
+        float t, top_p, min_p;
+        int top_k, pen_n;
+        float rep, freq, pres;
+    };
+    const Chain chains[] = {{1.0f, 1.0f, 0.0f, 64, 0, 1.0f, 0.0f, 0.0f},
+                            {0.8f, 0.95f, 0.0f, 20, 0, 1.0f, 0.0f, 0.0f},
+                            {0.7f, 0.9f, 0.05f, 40, 0, 1.0f, 0.0f, 0.0f},
+                            {0.8f, 0.95f, 0.0f, 20, 64, 1.3f, 0.1f, 0.1f}};
+    int bad = 0, cases = 0;
+    std::fprintf(stderr, "sampler-test: prompt %lld tokens, y = %d; %d plain draws and %d drafted rounds a chain\n",
+                 (long long) P, y, 20 * n, n);
+    for (const Chain& c : chains) {
+        m.set_penalties(c.pen_n, c.rep, c.freq, c.pres);
+        if (!back() || !m.step(y, true, err)) {
+            std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<int> plain((size_t) 20 * n), spec;
+        std::map<int, int> seen;
+        for (size_t i = 0; i < plain.size(); ++i) {
+            plain[i] = m.sample(c.t, c.top_p, c.top_k, c.min_p, seed, i);
+            ++seen[plain[i]];
+        }
+        int top = 0;
+        for (const auto& kv : seen) top = std::max(top, kv.second);
+        long long first_kept = 0, no_draft = 0;
+        bool drawn = false;
+        for (int i = 0; i < n; ++i) {
+            const uint64_t ctr = (1ull << 32) + (uint64_t) i * 64;   // (apart from the plain draws' and each other's)
+            std::vector<int> drafts;
+            std::vector<float> conf;
+            int acc = 0, next = -1;
+            if (!back() || !m.draft(y, drafts, conf, err, c.t, c.top_p, c.top_k, c.min_p, seed, ctr)) {
+                std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+                return 1;
+            }
+            drawn = drawn || m.drafts_sampled();
+            if (drafts.empty()) {
+                ++no_draft;
+                continue;
+            }
+            if ((int) drafts.size() > m.verify_max() - 1) drafts.resize((size_t) (m.verify_max() - 1));
+            if (!m.verify(y, drafts, c.t, c.top_p, c.top_k, c.min_p, seed, ctr, acc, next, err)) {
+                std::fprintf(stderr, "maya-ds4: --sampler-test: %s\n", err.c_str());
+                return 1;
+            }
+            spec.push_back(acc > 0 ? drafts[0] : next);
+            first_kept += acc > 0;
+        }
+        const Chi x = two_sample(plain, spec);
+        const std::vector<int> h0(plain.begin(), plain.begin() + (long) (plain.size() / 2)),
+            h1(plain.begin() + (long) (plain.size() / 2), plain.end());
+        const Chi ref = two_sample(h0, h1);
+        const bool ok = x.p >= 1e-3;
+        ++cases;
+        bad += !ok;
+        std::printf("sampler-test T %.2f top_k %d top_p %.2f min_p %.2f%s: %zu plain draws of %zu tokens (the most drawn "
+                    "%.0f%%%s), %zu drafted rounds (%s drafts, the first kept %lld times%s): chi-square %.1f over %d "
+                    "groups, p %.4f (the plain halves: p %.4f) - %s\n",
+                    c.t, c.top_k, c.top_p, c.min_p, c.pen_n > 0 ? " penalties" : "", plain.size(), seen.size(),
+                    100.0 * top / (double) plain.size(), top > 0.95 * (double) plain.size() ? ": nearly certain" : "",
+                    spec.size(), drawn ? "drawn" : "argmax", first_kept,
+                    no_draft > 0 ? (", " + std::to_string(no_draft) + " without drafts").c_str() : "", x.x, x.groups,
+                    x.p, ref.p, ok ? "the same distribution" : "MISMATCH");
+        std::fflush(stdout);
+    }
+    m.set_penalties(0, 1.0f, 0.0f, 0.0f);
+    std::printf("sampler-test: %s\n", bad == 0 ? "speculative sampling gave the model's own draws in every chain"
+                                                : (std::to_string(bad) + " of " + std::to_string(cases) +
+                                                   " chains MISMATCH").c_str());
+    return bad == 0 ? 0 : 1;
 }
 
 int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
@@ -2496,7 +2831,8 @@ int main(int argc, char** argv) {
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
     bool serve_mode = false, multi_check = false, parts_check = false, describe = false, dspark_set = false;
-    std::string prof_run, prof_out;
+    std::string prof_run, prof_out, spec_eval_path;
+    int sampler_n = 0;
     std::string images, enc_rgb, enc_out;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
@@ -2577,6 +2913,8 @@ int main(int argc, char** argv) {
         else if (a == "--profile-run") prof_run = val("--profile-run");
         else if (a == "--profile-out") prof_out = val("--profile-out");
         else if (a == "--profile-readonly") o.profile_readonly = true;
+        else if (a == "--spec-eval") spec_eval_path = val("--spec-eval");
+        else if (a == "--sampler-test") sampler_n = (int) num("--sampler-test", 50, 1e6, true);
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
             usage();
@@ -2603,7 +2941,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--multi-check needs --parallel 2..8 and --ids\n");
         return 2;
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty())) {
+    if (sampler_n > 0 && ids_s.empty()) {
+        std::fprintf(stderr, "--sampler-test needs --ids (a prompt whose next tokens are open)\n");
+        return 2;
+    }
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty() &&
+                           spec_eval_path.empty())) {
         usage();
         return 2;
     }
@@ -2629,6 +2972,17 @@ int main(int argc, char** argv) {
                      prof_run.c_str(), o.profile_out.c_str(), o.profile.empty() ? "(none)" : o.profile.c_str(),
                      skip_set ? "" : "; every layer on every token (the prompt skip off)");
     }
+    if (!spec_eval_path.empty() || sampler_n > 0) {   // (the drafter's tools: it loaded, no prompt lookup)
+        if (!dspark_set) o.dspark = true;
+        suffix_draft = 0;
+    }
+    if (sampler_n > 0 && std::getenv("DS4_DSPARK_SAMPLE") == nullptr) {   // (drafts drawn from the drafter's q)
+#if defined(_WIN32)
+        _putenv_s("DS4_DSPARK_SAMPLE", "1");
+#else
+        setenv("DS4_DSPARK_SAMPLE", "1", 1);
+#endif
+    }
     o.vision_only = !enc_rgb.empty();
     strata::ds4::Model m;
     std::string err;
@@ -2646,6 +3000,14 @@ int main(int argc, char** argv) {
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
     if (!prof_run.empty()) return profile_run(m, prof_run, o.profile_out);
+    if (!spec_eval_path.empty()) return spec_eval(m, spec_eval_path, n > 0 ? n : 256, temp, cli_seed);
+    if (sampler_n > 0) {
+        if (!ids_s.empty() && ids_s[0] == '@') {   // (--ids @FILE, as the CLI's run takes it)
+            std::ifstream f(ids_s.substr(1));
+            ids_s.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+        }
+        return sampler_test(m, parse_ids(ids_s), sampler_n, cli_seed);
+    }
     if (multi_check) return check_multi(m, parse_ids(ids_s), std::max(2, n));
     if (parts_check) return check_parts(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
@@ -2800,6 +3162,7 @@ int main(int argc, char** argv) {
     if (n > 0) {
         int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
         std::vector<int> got;
+        round_log().tag = "ids";   // (DS4_ROUND_LOG)
         if (lk) lk->start(m.tokens());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         for (;;) {
