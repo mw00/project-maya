@@ -65,6 +65,7 @@
   --st-shadow-pop:0 0 0 1px #3d3d46,0 12px 32px rgba(0,0,0,.45);
   --st-shadow-sheet:0 -12px 40px rgba(0,0,0,.45);
   --st-scrim:rgba(0,0,0,.55);
+  --st-push-dim:rgba(0,0,0,.42);   /* the page's edge beside the phone's chats */
   --st-glass-bg:rgba(48,48,56,.42); --st-glass-line:rgba(255,255,255,.14);
   --st-glass-bar:rgba(25,25,29,.74); --st-bar-shadow:0 6px 18px rgba(0,0,0,.32);   /* the phone's top bar */
   --st-switch-knob:#ffffff;
@@ -113,6 +114,7 @@
   --st-shadow-pop:0 0 0 1px #d4d4dc,0 12px 32px rgba(24,24,29,.12);
   --st-shadow-sheet:0 -12px 40px rgba(24,24,29,.16);
   --st-scrim:rgba(24,24,29,.35);
+  --st-push-dim:rgba(24,24,29,.16);
   --st-glass-bg:rgba(255,255,255,.55); --st-glass-line:rgba(24,24,29,.10);
   --st-glass-bar:rgba(255,255,255,.76); --st-bar-shadow:0 6px 18px rgba(24,24,29,.08);
   color-scheme:light;

@@ -277,18 +277,24 @@ function StatusCard() {
     </button></div>`;
 }
 
-export function Sidebar({drawer}) {
+// drawer: the phone's chats (app.js's PhonePush), in the page whether open or not - shut, nothing in them is reached
+export function Sidebar({drawer, open}) {
   const newer = S.update && S.update.newer && !S.updateWatch;
-  const head = useRef(null);
-  useEffect(() => {   // the phone's drawer: the keyboard goes into it, and back to the Chats button when it closes
-    if (!drawer) return;
-    const ret = document.activeElement;
+  const head = useRef(null), nav = useRef(null);
+  const shown = drawer && open;
+  useEffect(() => {   // the phone's chats: the keyboard goes into them, and back to the Chats button when they close
+    if (!shown) return;
     const b = head.current && head.current.querySelector("button");
-    if (b) b.focus();
-    return () => { if (ret && ret.focus && document.contains(ret)) ret.focus(); };
-  }, [drawer]);
-  return html`<nav class=${`side${drawer ? " side--drawer" : ""}`} aria-label="Maya" role=${drawer ? "dialog" : undefined}
-    aria-modal=${drawer ? "true" : undefined}>
+    if (b) b.focus({preventScroll: true});
+    return () => {
+      const a = document.activeElement;            // (unless it went somewhere since: a chat's message box)
+      if (a && a !== document.body && !(nav.current && nav.current.contains(a))) return;
+      const back = document.querySelector('.push__main .chat-head--float button[aria-label="Chats"]');
+      if (back) back.focus({preventScroll: true});
+    };
+  }, [shown]);
+  return html`<nav ref=${nav} class=${`side${drawer ? " side--drawer" : ""}`} aria-label="Maya" role=${shown ? "dialog" : undefined}
+    aria-modal=${shown ? "true" : undefined} inert=${drawer && !open}>
     <div class="side__head" ref=${head}>
       <span class="side__brand"><${MayaMark}/><span>Maya</span></span>
       ${drawer

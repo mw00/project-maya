@@ -1,7 +1,7 @@
 // serve/web/app.js - the Project Maya web app: the chat, the Monitor and Settings, built with Preact + htm (web/preact.js,
 // local: the page needs nothing from the network).  The state lives in state.js; the server's side in server.js; the chats
 // in chats.js.
-import {html, render, useEffect} from "./preact.js";
+import {html, render, useEffect, useRef, useState} from "./preact.js";
 import {isPhone} from "./lib.js";
 import {S, applyScheme, applyTheme, closeDialog, emit, useStore} from "./state.js";
 import {loadHealth, loadMcp, loadUpdate, poll, whenHealth} from "./server.js";
@@ -25,16 +25,51 @@ function App() {
     const want = S.view === "monitor" ? "#monitor" : S.view === "models" ? "#models" : S.settings ? "#settings" : "";
     if (location.hash !== want) history.replaceState(null, "", want || location.pathname + location.search);
   });
+  const page = S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`;
   return html`<div class=${`shell${S.sideOpen && !phone ? "" : " shell--closed"}`}>
-    ${phone ? null : S.sideOpen ? html`<${Sidebar}/>` : null}
-    ${phone && S.drawer ? html`<div class="drawer-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) { S.drawer = false; emit(); } }}>
-      <${Sidebar} drawer/></div>` : null}
-    ${S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`}
+    ${phone ? html`<${PhonePush} page=${page}/>` : S.sideOpen ? html`<${Sidebar}/>` : null}
+    ${phone ? null : page}
     ${S.settings ? html`<${SettingsDialog}/>` : null}
     ${S.search ? html`<${SearchDialog}/>` : null}
     ${S.savedSheet && phone ? html`<${SavedSheet}/>` : null}
     <${DialogHost}/>
     <${Toasts}/>
+  </div>`;
+}
+
+// a phone: the chats slide in from the left and push the page over (as ChatGPT's app), its edge left in view, dimmed; a
+// tap there, a swipe to the left, Escape or × closes them.  Both stay in the page, so they slide back as well.
+function PhonePush({page}) {
+  const open = !!S.drawer;
+  const [drag, setDrag] = useState(0);
+  const touch = useRef(null);
+  const close = () => { S.drawer = false; emit(); };
+  const start = (e) => {
+    touch.current = open && e.touches.length === 1 ? {x: e.touches[0].clientX, y: e.touches[0].clientY, on: false} : null;
+  };
+  const move = (e) => {
+    const t = touch.current;
+    if (!t) return;
+    const dx = e.touches[0].clientX - t.x, dy = e.touches[0].clientY - t.y;
+    if (!t.on) {
+      if (Math.abs(dy) > 10 && Math.abs(dy) > Math.abs(dx)) { touch.current = null; return; }   // (a scroll)
+      if (dx > -10) return;
+      t.on = true;
+    }
+    setDrag(Math.min(0, dx));
+  };
+  const end = () => {
+    const t = touch.current;
+    touch.current = null;
+    if (!t || !t.on) return;
+    if (drag < -70) close();
+    setDrag(0);
+  };
+  return html`<div class=${`push${open ? " is-open" : ""}${drag ? " is-drag" : ""}`} style=${drag ? `--push-drag:${drag}px` : ""}
+      onTouchStart=${start} onTouchMove=${move} onTouchEnd=${end} onTouchCancel=${end}>
+    <${Sidebar} drawer open=${open}/>
+    <div class="push__main" inert=${open}>${page}</div>
+    <button type="button" class="push__dim" tabindex="-1" aria-hidden="true" onClick=${close}></button>
   </div>`;
 }
 

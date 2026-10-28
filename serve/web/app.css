@@ -341,13 +341,28 @@
 .think-panel__now { margin: 10px 0 0; padding: 12px 14px; border-radius: var(--st-r-md); background: var(--st-surface-2); font-size: var(--st-fs-md); color: var(--st-ink-soft); }
 .think-panel__now b { color: var(--st-ink); font-weight: 600; }
 
-/* ---------------------------------------------------------------- the phone: a chats drawer, floating buttons */
-.drawer-scrim { position: fixed; inset: 0; z-index: 45; background: var(--st-scrim); animation: fade 140ms ease; }
-.side--drawer { position: absolute; top: 0; left: 0; bottom: 0; width: min(86vw, 330px); border-right: 0;
-                --st-side-glass: color-mix(in srgb, var(--st-side) 84%, transparent);   /* (over the chat: more tint to read) */
-                box-shadow: inset -1px 0 0 var(--st-glass-edge), var(--st-shadow-pop);
-                animation: slidein 200ms var(--st-ease); padding-top: max(10px, env(safe-area-inset-top)); }
-@keyframes slidein { from { transform: translateX(-100%); } }
+/* ---------------------------------------------------------------- the phone: the chats push the page over, floating buttons */
+/* (as ChatGPT's app: the chats slide in from the left beside the page, not over it, and push it to the right; its edge
+   stays in view, dimmed - a tap there or a swipe to the left closes them.  --push-drag: the finger, while it swipes) */
+.push { --push-w: min(80vw, 320px); --push-drag: 0px; --push-ease: cubic-bezier(.32, .72, 0, 1);
+        position: relative; flex: 1; min-width: 0; height: 100%; overflow: hidden; }
+.push__main { position: absolute; inset: 0; display: flex; background: var(--st-bg); transition: transform 320ms var(--push-ease); }
+/* (the sidebar's glass as it looks on the page, without the blur: only the page is behind it here, and a blur at its edge
+   would pull in the pushed page's) */
+.push > .side--drawer { position: absolute; top: 0; left: 0; bottom: 0; width: var(--push-w); padding-top: max(10px, env(safe-area-inset-top));
+                        background: linear-gradient(to bottom, var(--st-glass-sheen), transparent 35%),
+                                    linear-gradient(var(--st-side-glass), var(--st-side-glass)), var(--st-bg);
+                        -webkit-backdrop-filter: none; backdrop-filter: none;
+                        transform: translateX(-100%); visibility: hidden; transition: transform 320ms var(--push-ease), visibility 0s 320ms; }
+.push__dim { position: absolute; z-index: 20; top: 0; bottom: 0; left: 0; width: 100%; padding: 0; border: 0; background: var(--st-push-dim);
+             opacity: 0; pointer-events: none; cursor: default; transition: transform 320ms var(--push-ease), opacity 320ms var(--push-ease); }
+.push.is-open > .side--drawer { transform: translateX(max(-100%, var(--push-drag))); visibility: visible; transition: transform 320ms var(--push-ease); }
+.push.is-open > .push__main, .push.is-open > .push__dim { transform: translateX(calc(var(--push-w) + max(-1 * var(--push-w), var(--push-drag)))); }
+.push.is-open > .push__main { box-shadow: -.5px 0 0 var(--st-line); }
+.push.is-open > .push__dim { opacity: 1; pointer-events: auto; }
+.push.is-open > .side--drawer, .push.is-open > .push__dim { touch-action: pan-y; }
+.push.is-drag > * { transition: none; }
+@media (prefers-reduced-motion: reduce) { .push > * { transition-duration: 0s, 0s; transition-delay: 0s, 0s; } }
 /* (a frosted bar the page scrolls under: the model's name and the buttons stay readable over any text) */
 .chat-head--float { position: absolute; z-index: 10; top: 0; left: 0; right: 0; height: auto; padding: 10px;
                     padding-top: max(10px, env(safe-area-inset-top)); background: var(--st-glass-bar);
