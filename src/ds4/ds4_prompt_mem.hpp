@@ -51,6 +51,15 @@ inline bool copy_all_auto(double all, double can, double spare, bool integrated,
     return all + spare <= can;
 }
 
+// ---- the copies on explicit huge pages: env DS4_COPY_HUGETLB (-1 unset, 0 off, 1 on); pool: the free bytes of the
+// kernel's reserved pool; need: the copies' bytes, each allocation rounded up to whole pages.  Unset: on only when the
+// pool already holds all of them (no pool reserved: the ordinary arena, as before)
+inline bool copy_hugetlb_on(int env, uint64_t pool, uint64_t need) {
+    if (env >= 0) return env != 0;
+    return pool > 0 && need > 0 && pool >= need;
+}
+inline uint64_t round_up(uint64_t bytes, uint64_t page) { return page == 0 ? bytes : (bytes + page - 1) / page * page; }
+
 // ---- an integrated GPU's room (Linux, NVIDIA): the driver's free figure counts only MemFree there, while the page
 // cache (the model's files just read) is what the kernel can still give back - MemAvailable (~0: not known) less
 // headroom when that is larger, at most the device's total

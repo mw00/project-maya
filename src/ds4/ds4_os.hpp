@@ -441,6 +441,54 @@ inline void anon_free(void* p, size_t bytes) {
 #endif
 }
 
+/// The kernel's pool of explicit 2 MB huge pages (reserved by the admin: `sysctl vm.nr_hugepages=N`): the bytes a new
+/// mapping can still take from it (free less already reserved); 0 where there is none or it cannot be read, and on
+/// Windows.  MemAvailable does not count this pool.
+constexpr size_t kHuge2M = (size_t) 2 << 20;
+inline uint64_t huge2m_free() {
+#if defined(_WIN32)
+    return 0;
+#else
+    auto num = [](const char* path) -> uint64_t {
+        std::FILE* f = std::fopen(path, "r");
+        if (f == nullptr) return 0;
+        unsigned long long v = 0;
+        const bool ok = std::fscanf(f, "%llu", &v) == 1;
+        std::fclose(f);
+        return ok ? (uint64_t) v : 0;
+    };
+    const uint64_t fr = num("/sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages"),
+                   rs = num("/sys/kernel/mm/hugepages/hugepages-2048kB/resv_hugepages");
+    return fr > rs ? (fr - rs) * kHuge2M : 0;
+#endif
+}
+
+/// Anonymous memory on explicit 2 MB pages from that pool (MAP_HUGETLB): `bytes` rounded up to whole pages, `*got` the
+/// size mapped (what anon_free takes back), NUMA node `node` of `nodes` preferred as anon_alloc does.  The pages are
+/// reserved at the call, so a mapping it returns does not fault for want of them later; nullptr: the pool cannot hold
+/// it (or Windows).  Unlike a transparent-huge-page arena, a pin (cudaHostRegister) of it keeps its 2 MB pages.
+inline void* huge_alloc(size_t bytes, int node, int nodes, size_t* got) {
+#if defined(_WIN32)
+    (void) bytes, (void) node, (void) nodes, (void) got;
+    return nullptr;
+#else
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+    const size_t hb = (bytes + kHuge2M - 1) / kHuge2M * kHuge2M;
+    void* m = ::mmap(nullptr, hb, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | (21 << MAP_HUGE_SHIFT),
+                     -1, 0);
+    if (m == MAP_FAILED) return nullptr;
+    if (node >= 0 && nodes > 1) {
+        unsigned long mask[4] = {0, 0, 0, 0};
+        mask[node / 64] = 1ul << (node % 64);
+        syscall(SYS_mbind, m, hb, 1 /* MPOL_PREFERRED */, mask, 256, 0);
+    }
+    if (got != nullptr) *got = hb;
+    return m;
+#endif
+}
+
 /// The calling thread, or `t`, on logical CPU `cpu` (Windows: the first 64 CPUs, processor group 0).
 inline void pin_self(int cpu) {
 #if defined(_WIN32)

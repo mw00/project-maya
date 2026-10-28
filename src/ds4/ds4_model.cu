@@ -6919,9 +6919,37 @@ struct Model::Impl {
                 all += (double) l.blob * (1 + (seen[(size_t) l.il]++ == 0 ? spare_of(l) : 0));
             }
         }
+        // NUMA parts: whole rows of each matrix, so any row count the nodes divide
+        int nh = (int) std::min<size_t>(2, std::max<size_t>(1, cores.size()));
+        if (const char* v = std::getenv("DS4_COPY_NUMA"))   // (0 / 1: one part; 2-4: that many, a node each; more
+            nh = std::max(1, std::min(kMaxNH, std::atoi(v)));   // than the host's nodes: a test on fewer)
+        if (g.ff % nh != 0 || g.dim % nh != 0) nh = 1;
+        // DS4_COPY_HUGETLB: the copies on explicit 2 MB pages out of the kernel's reserved pool (`sysctl
+        // vm.nr_hugepages=N`), so a pin of them (cp_pin, zc_pin) registers 2 MB pages - a transparent-huge-page arena
+        // pinned is registered in 4 KB pages, the DMA's translations 512 times as many.  Unset: on only when the
+        // pool already holds every copy (each layer's NUMA parts rounded up to whole pages) - no pool reserved, the
+        // ordinary arena as before; 0: the ordinary arena; 1: from the pool as far as it goes.  MemAvailable does not
+        // count the pool: the RAM the copies may take adds its free bytes
+        const uint64_t pool = os::huge2m_free();
+        uint64_t huge_need = 0;
+        {
+            std::vector<int> cnt(L.size(), 0);
+            for (const auto& h : hot) ++cnt[(size_t) h.first];
+            for (const Layer& l : L) {
+                if (cnt[(size_t) l.il] == 0) continue;
+                size_t part = 0;
+                for (int r = 0; r < 3; ++r) part += align256((size_t) (mx_n(r) / nh) * mx_row_b(l, r));
+                const size_t ns = (size_t) cnt[(size_t) l.il] + (size_t) spare_of(l) + (copy_swap ? 1 : 0);
+                huge_need += (uint64_t) nh * round_up((uint64_t) ns * part, os::kHuge2M);
+            }
+        }
+        const int huge_env = tri_of(ds4_env("DS4_COPY_HUGETLB"));
+        const bool huge = copy_hugetlb_on(huge_env, pool, huge_need);
         const uint64_t avail = ram_room();
         // (Windows: the copies are committed memory, within what its commit still has beside the other programs' margin)
-        const double can = std::min(avail == ~uint64_t{0} ? 1e300 : std::max(0.0, (double) avail - (double) kRamMargin),
+        const double can = std::min(avail == ~uint64_t{0} ? 1e300
+                                                          : std::max(0.0, (double) avail - (double) kRamMargin) +
+                                                                (huge ? (double) pool : 0.0),
                                     commit_room());
         // (auto: all or none - a part copied cost decode speed on 64 GB and on 32 GB of RAM, but every expert in RAM
         // keeps the SSD out of the decode: #339's reports)
@@ -6957,11 +6985,10 @@ struct Model::Impl {
                              all / 1e9, can / 1e9, kRamMargin / 1e9);
             return true;
         }
-        // NUMA parts: whole rows of each matrix, so any row count the nodes divide
-        int nh = (int) std::min<size_t>(2, std::max<size_t>(1, cores.size()));
-        if (const char* v = std::getenv("DS4_COPY_NUMA"))   // (0 / 1: one part; 2-4: that many, a node each; more
-            nh = std::max(1, std::min(kMaxNH, std::atoi(v)));   // than the host's nodes: a test on fewer)
-        if (g.ff % nh != 0 || g.dim % nh != 0) nh = 1;
+        if (huge && huge_env < 0)
+            std::fprintf(stderr, "ds4: the reserved 2 MB huge-page pool (%.1f GB free) holds the copies (%.1f GB): they go "
+                                 "on 2 MB pages (DS4_COPY_HUGETLB=0 keeps the ordinary arena)\n",
+                         (double) pool / 1e9, (double) huge_need / 1e9);
         NH = nh;
         cp_lay.assign(L.size(), {0, 0, 0, 0});
         for (const Layer& l : L) {
@@ -6984,6 +7011,8 @@ struct Model::Impl {
             ++n_copy[(size_t) l.il];
         }
         // each layer's slots: one block per node of (copies + spare) parts
+        bool huge_short = false;   // (the pool ran out: said once)
+        double huge_got = 0;       // (the bytes on huge pages)
         std::vector<int> first(L.size(), -1);
         copy_spare.assign(L.size(), -1);
         cs_free.assign(L.size(), -1);
@@ -6995,11 +7024,19 @@ struct Model::Impl {
             std::array<uint8_t*, kMaxNH> base{};
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
-                base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                size_t got = bytes;   // (on huge pages: rounded up to whole ones, what anon_free takes back)
+                base[(size_t) X] = huge ? (uint8_t*) os::huge_alloc(bytes, X, NH, &got) : nullptr;
+                if (huge && base[(size_t) X] == nullptr && !huge_short) {
+                    std::fprintf(stderr, "ds4: the 2 MB huge-page pool cannot hold more of the copies (reserve more: sysctl "
+                                         "vm.nr_hugepages=N) - the rest in the ordinary arena\n");
+                    huge_short = true;
+                }
+                if (base[(size_t) X] == nullptr) base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                else huge_got += (double) got;
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
                     ram_chunks.push_back(base[(size_t) X]);
-                    ram_chunk_bytes.push_back(bytes);
+                    ram_chunk_bytes.push_back(got);
                 }
             }
             if (!ok) {
@@ -7099,8 +7136,10 @@ struct Model::Impl {
         cp_pin();
         double cb = 0;
         for (const Job& j : jobs) cb += (double) L[(size_t) j.layer].blob;
-        std::fprintf(stderr, "ds4: %zu of the CPU lane's %zu experts copied into RAM (%.1f GB, %d NUMA part%s) in %.1f s%s\n",
-                     jobs.size(), hot.size(), cb / 1e9, NH, NH > 1 ? "s" : "", (now_ms() - t0) / 1000.0,
+        char hp[64] = "";
+        if (huge_got > 0) std::snprintf(hp, sizeof hp, ", %.1f GB on 2 MB huge pages", huge_got / 1e9);
+        std::fprintf(stderr, "ds4: %zu of the CPU lane's %zu experts copied into RAM (%.1f GB, %d NUMA part%s%s) in %.1f s%s\n",
+                     jobs.size(), hot.size(), cb / 1e9, NH, NH > 1 ? "s" : "", hp, (now_ms() - t0) / 1000.0,
                      jobs.size() < hot.size() ? "; the others read in place" : "");
         return true;
     }
@@ -7252,13 +7291,13 @@ struct Model::Impl {
             });
         }
         std::vector<char> done(nc, 0);
+        const unsigned pin_fl = copy_pin_flags(cudaHostRegisterPortable | cudaHostRegisterMapped);
         if (pin_by_need) {   // (in order, until one fails or the cap: one at a time)
             double gb = 0;
             for (size_t k = 0; k < nc; ++k) {
                 const size_t c = order[k];
                 if (pin_cap_gb > 0 && gb + (double) ram_chunk_bytes[c] / 1e9 > pin_cap_gb) break;
-                if (cudaHostRegister(ram_chunks[c], ram_chunk_bytes[c], cudaHostRegisterPortable | cudaHostRegisterMapped) !=
-                    cudaSuccess) {
+                if (cudaHostRegister(ram_chunks[c], ram_chunk_bytes[c], pin_fl) != cudaSuccess) {
                     cudaGetLastError();
                     break;
                 }
@@ -7272,8 +7311,7 @@ struct Model::Impl {
             for (int t = 0; t < 8; ++t)
                 th.emplace_back([&] {
                     for (size_t c; (c = next.fetch_add(1)) < nc;)
-                        done[c] = cudaHostRegister(ram_chunks[c], ram_chunk_bytes[c],
-                                                   cudaHostRegisterPortable | cudaHostRegisterMapped) == cudaSuccess;
+                        done[c] = cudaHostRegister(ram_chunks[c], ram_chunk_bytes[c], pin_fl) == cudaSuccess;
                 });
             for (auto& t : th) t.join();
             if (std::find(done.begin(), done.end(), 0) != done.end()) {
@@ -7321,6 +7359,28 @@ struct Model::Impl {
                                  "place\n", gb, (now_ms() - t0) / 1000.0);
     }
     std::vector<char> zc_chunk;   // ram_chunks -> pinned (zc_pin, cp_pin)
+    // the flags the copies are pinned with: DS4_COPY_PIN_RO=1 adds cudaHostRegisterReadOnly (the GPUs only read the
+    // copies - a swap's expert goes back into RAM through a buffer and the CPU) where every device takes it, else
+    // as before, said once (a GeForce takes none; HIP: not asked)
+    unsigned copy_pin_flags(unsigned f) const {
+        if (tri_of(ds4_env("DS4_COPY_PIN_RO")) != 1) return f;
+        static bool said = false;
+#if !defined(STRATA_USE_HIP)
+        bool all = !devs.empty();
+        for (const Dev& d : devs) {
+            int v = 0;
+            if (cudaDeviceGetAttribute(&v, cudaDevAttrHostRegisterReadOnlySupported, d.id) != cudaSuccess)
+                (void) cudaGetLastError();
+            all = all && v != 0;
+        }
+        if (all) return f | cudaHostRegisterReadOnly;
+#endif
+        if (!said)
+            std::fprintf(stderr, "ds4: DS4_COPY_PIN_RO=1: a GPU here takes no read-only registration - the copies are "
+                                 "pinned as before\n");
+        said = true;
+        return f;
+    }
     // the prompt path's copies in place (copy_mode, prompts in chunks): every chunk of the CPU lane's copies pinned, so
     // copy_ahead DMAs a streamed expert straight from its copy (copy_in_place) - the CPU gathers only a group member's
     // blocks of the down - where the readers staged every byte of it before: ~490 GB of copies for a 16K prompt at
@@ -7334,14 +7394,14 @@ struct Model::Impl {
         const size_t nc = ram_chunks.size();
         zc_chunk.resize(nc, 0);
         std::vector<char> mine(nc, 0);   // (1: this call pinned it, 2: it failed)
+        const unsigned pin_fl = copy_pin_flags(cudaHostRegisterPortable);
         std::atomic<size_t> next{0};
         std::vector<std::thread> th;
         for (int t = 0; t < 8; ++t)   // (pinning is the kernel's walk of the pages, ~0.6 GB/s a thread)
             th.emplace_back([&] {
                 for (size_t c; (c = next.fetch_add(1)) < nc;)
                     if (!zc_chunk[c])
-                        mine[c] = cudaHostRegister(ram_chunks[c], ram_chunk_bytes[c], cudaHostRegisterPortable) == cudaSuccess
-                                      ? 1 : 2;
+                        mine[c] = cudaHostRegister(ram_chunks[c], ram_chunk_bytes[c], pin_fl) == cudaSuccess ? 1 : 2;
             });
         for (auto& t : th) t.join();
         double gb = 0;

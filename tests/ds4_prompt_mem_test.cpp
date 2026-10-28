@@ -67,6 +67,18 @@ int main() {
         CHECK(!d::copy_all_auto(100 * GB, 200 * GB, spare, false, 0));
         CHECK(!d::copy_all_auto(100 * GB, 200 * GB, spare, true, 0));
     }
+    {   // the huge-page arena: unset -> only when the reserved pool holds every copy; 0 / 1 force it
+        const uint64_t GiB = 1ull << 30, page = 2ull << 20, need = 150 * GiB;
+        CHECK(!d::copy_hugetlb_on(-1, 0, need));             // (no pool: the ordinary arena, as before)
+        CHECK(!d::copy_hugetlb_on(-1, need - page, need));   // (one page short)
+        CHECK(d::copy_hugetlb_on(-1, need, need));
+        CHECK(d::copy_hugetlb_on(-1, 160 * GiB, need));
+        CHECK(!d::copy_hugetlb_on(-1, 160 * GiB, 0));        // (no copies)
+        CHECK(!d::copy_hugetlb_on(0, 160 * GiB, need));
+        CHECK(d::copy_hugetlb_on(1, 0, need));
+        CHECK(d::round_up(1, page) == page && d::round_up(page, page) == page);
+        CHECK(d::round_up(page + 1, page) == 2 * page && d::round_up(0, page) == 0);
+    }
     {   // an integrated GPU's room: MemAvailable less the headroom when larger, the driver's figure otherwise, at most
         // the device's total
         const uint64_t GiB = 1ull << 30, head = 6 * GiB, tot = 120 * GiB, unknown = ~uint64_t{0};

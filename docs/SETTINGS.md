@@ -1093,6 +1093,30 @@ CPU-only checks: `python tools/test_ds4_copy_cache.py`. On filesystems that refu
 buffered fallback; its output says whether direct reads were exercised. `DS4_TEST_FILE_DIR=/path/on/nvme` selects a
 filesystem for the fixture. Cache residency is diagnostic because DONTNEED does not promise immediate eviction.
 
+## DeepSeek: the experts' RAM copies on 2 MB huge pages
+
+The copies of the CPU lane's experts in RAM (`--mmap-experts auto` when they all fit, or `off`) are ordinary memory
+with transparent huge pages. Pinned for the GPUs (on by default with several GPUs and chunked prompts,
+`DS4_COPY_PIN`), such memory is registered in 4 KB pages, so a prompt's DMA from it goes through 512 times as many
+translations. Where the admin reserves the kernel's pool of explicit 2 MB pages and it holds every copy, the copies
+are taken from it instead (`MAP_HUGETLB`), and the pin keeps 2 MB pages. The pool is not counted in MemAvailable: the
+RAM the copies may take adds its free pages. Without a reserved pool nothing changes.
+
+The pool is reserved once a boot, in 2 MB pages: the copies' size (the load's `copied into RAM (N GB ...)` line)
+divided by 2 MiB, plus a little for rounding (each layer's NUMA part rounds up to a whole page) - 150 GB of copies:
+
+    sudo sysctl vm.nr_hugepages=72000
+
+A line in `/etc/sysctl.d/` keeps it (`vm.nr_hugepages = 72000`). Pages reserved this way are out of every other
+program's reach, whether the engine runs or not; reserve them early after a boot, before the RAM fragments (`grep Huge
+/proc/meminfo` shows how many the kernel found). The pool is split evenly over the NUMA nodes, and each node's copies
+are taken from its own node first.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_COPY_HUGETLB` | on when the reserved pool holds every copy | `0`: the ordinary arena; `1`: from the pool as far as it goes, the rest ordinary (a line says when it ran out) |
+| `MAYA_DS4_COPY_PIN_RO` | off | `1`: the copies pinned read-only (`cudaHostRegisterReadOnly`; the GPUs only read them), where every GPU takes it - a GeForce does not, and the log says so |
+
 ## DeepSeek: integrated GPUs
 
 An integrated GPU's memory is the PC's RAM. `--mmap-experts auto` no longer copies the CPU lane's experts into RAM
