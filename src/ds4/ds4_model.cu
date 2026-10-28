@@ -899,6 +899,9 @@ struct Layer {
     int n_main = 0, pv_n = 0;
     uint8_t* xbase = nullptr;
     size_t xstep = 0;
+    // a prompt read in parts that keeps its lend between them (lend_hold): expert -> 1 while its slot lies under the
+    // buffers and its table entries are 0 - on the CPU lane between the parts, back in VRAM at the hand-back
+    std::vector<uint8_t> lend_mark;
     std::vector<int> last_picks;                // the picks of a run's last rows through the layer, kPicks a row (warm_after)
     std::array<uint8_t*, 4> spare_host = {nullptr, nullptr, nullptr, nullptr};
     std::vector<float> heat;
@@ -1610,7 +1613,10 @@ struct Model::Impl {
     std::unique_ptr<ExpertStore> store;
     bool store_split = true, store_put = true, store_ahead = false, store_flow = true;
     // an expert the CPU lane would read from the files that the store covers
-    bool store_reads(const Layer& l, int e) const { return store && store->covers(l.il) && file_read(l, e); }
+    // (not one held out of VRAM between a prompt's parts: it goes back)
+    bool store_reads(const Layer& l, int e) const {
+        return store && store->covers(l.il) && file_read(l, e) && !held_out(l, e);
+    }
     // STRATA_DS4_DISK_SKIP_W (experimental opt-in, CHANGES THE ANSWERS; 0 = off): on the small windows (decode, a
     // draft's check - never the prompt path) the CPU lane leaves out a routed expert whose share of its token's route
     // weights is below this and whose pages are not in RAM now (the page cache or the RAM tier; os::in_ram - Linux every
@@ -1890,6 +1896,27 @@ struct Model::Impl {
     size_t rf_bytes = 0;
     int64_t lent_experts = 0;
     double lent_ms = 0;
+    // A prompt read in parts (Model::feed_part) keeps the room it borrowed from one part to the next: the lent slots
+    // stay its buffers', and between the parts - the other conversations decoding - their experts are on the CPU lane,
+    // as a swapped-out expert is (slot -1, host the file's mapping, table entries 0, lend_mark), the expert cache
+    // still (no swaps, recent fills or landings, helper fills, store puts of them).  The next part of the same plan
+    // finds its room lent already; anything else that needs it - another run of chunks, a picture's room, a Stop
+    // between the parts (Model::feed_release) - hands it back first (borrow_end: the experts read back, the tables
+    // set again).  DS4_PROMPT_KEEP_LEND=0: handed back after every part, as a run does.
+    struct Held {
+        int layer, e, slot;
+    };
+    std::atomic<bool> lend_held{false};   // (the service thread counts its picks of them)
+    std::vector<Held> held_list;
+    int held_seq = -1, held_k = -1, held_per = 0;   // (the plan it belongs to: its conversation, next chunk, chunk)
+    int64_t held_at = -1;
+    static bool keep_lend_on() {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_PROMPT_KEEP_LEND");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        return on;
+    }
     // the decode after a long prompt (warm_after): its thread, reading the experts the prompt's last rows picked into
     // the page cache while the first tokens decode; stopped by the next prompt
     std::thread warm_th;
@@ -8890,6 +8917,10 @@ struct Model::Impl {
     // a picture's room on the tower's GPU (vis_mode's lender; one that cannot lend it now: free memory)
     uint8_t* take_vis_room(int& src, std::string& err) {
         blas_wait();   // (the prompt buffers lent below are the GEMM warm-up's)
+        if (lend_held.load(std::memory_order_relaxed) && !borrow_end()) {   // (a prompt's room kept between its parts)
+            err = lend_broken ? std::string(kLendBroken) : "vision: the prompt path's room could not be handed back";
+            return nullptr;
+        }
         Dev& d = devs[0];
         const size_t need = vt.room_bytes();
         cudaSetDevice(d.id);
@@ -10210,7 +10241,9 @@ struct Model::Impl {
                 while ((int) l.rc_hist.size() > recent_win) l.rc_hist.pop_front();
             }
             int started = 0;
-            for (size_t h = l.cpu_hits.size(); start_fills && h-- > 0 && started < recent_fills;) {   // (latest first)
+            // (latest first; none while a prompt's room is kept between its parts - recent slots may lie under it)
+            const bool fills = start_fills && !lend_held.load(std::memory_order_relaxed);
+            for (size_t h = l.cpu_hits.size(); fills && h-- > 0 && started < recent_fills;) {
                 const int e = l.cpu_hits[h];
                 if (e < 0 || e >= l.n_exp || l.slot[(size_t) e] >= 0 || e == l.sw_in) continue;
                 int uses = 0;
@@ -10459,6 +10492,10 @@ struct Model::Impl {
             for (Layer& l : L)
                 for (float& h : l.heat) h *= c_decay;
         }
+        if (lend_held.load(std::memory_order_relaxed)) {   // (a prompt's room kept between its parts: no move starts -
+            for (Layer& l : L) l.cpu_hits.clear();          //  the spare slot and the slots under the buffers are its)
+            return;
+        }
         cache_queue();
     }
     // the swaps under way waited for and switched in: before a run of chunks lends the tail its slots (a swap's copy
@@ -10668,7 +10705,7 @@ struct Model::Impl {
                 const uint32_t dn = prof[o0 + (size_t) e] - prof_run0[o0 + (size_t) e];
                 if (dn == 0) continue;
                 l.heat[(size_t) e] += (float) dn;
-                if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                if (l.slot[(size_t) e] < 0 && !held_out(l, e)) l.cpu_hits.push_back(e);
             }
         }
     }
@@ -12699,7 +12736,8 @@ struct Model::Impl {
             l.hr_hist.push_back(l.cpu_hits);   // (this window's CPU-lane experts: cache_queue takes them after this)
             while ((int) l.hr_hist.size() > hr_win) l.hr_hist.pop_front();
             if (!o.expert_cache || cache_ths.empty()) l.cpu_hits.clear();   // (no cache_queue to take them)
-            if (!free_mirrors || hr_busy.load() || queued >= kHrQueued) continue;
+            if (!free_mirrors || hr_busy.load() || queued >= kHrQueued || lend_held.load(std::memory_order_relaxed))
+                continue;   // (none while a prompt's room is kept between its parts: its experts go back to VRAM)
             std::vector<int> n((size_t) l.n_exp, 0);
             for (const auto& h : l.hr_hist) {
                 std::vector<char> seen((size_t) l.n_exp, 0);   // (a window's tokens: one use of an expert a tick)
@@ -13175,6 +13213,7 @@ struct Model::Impl {
                         const bool light = dsk && r.w[t][i] < disk_skip_w * wsum;
                         if (aon && !light) ++heavy;
                         if (l.slot[(size_t) e] < 0) {
+                            if (held_out(l, e)) ++st.lend_picks;   // (its slot under a prompt's kept room)
                             if (hon && l.helper[(size_t) e] != nullptr) {
                                 hpicks.push_back({e, t * kPicks + i});
                                 if (l.hr_n > 0 && l.hr_slot[(size_t) e] >= 0) {   // (a recent slot's: its stamp)
@@ -13727,6 +13766,7 @@ struct Model::Impl {
         // A pending swap already owns this expert's destination. Landing it too would leave two owners and
         // publish two different vram_tab[e] values in one unordered tab_set batch.
         if (!ln_land || l.rc_n == 0 || l.nm != 1 || e == l.sw_in) return 0ull;
+        if (lend_held.load(std::memory_order_relaxed)) return 0ull;   // (a prompt's room kept: its recent slots too)
         int v = -1;
         for (int i = 0; i < l.rc_n; ++i) {
             if (l.rc_fill[(size_t) i] >= 0 || l.rc_land[(size_t) i] >= 0) continue;
@@ -16828,6 +16868,86 @@ struct Model::Impl {
         }
         return true;
     }
+    // expert e's table entry on every member of l's group from its slot (-1: 0), synchronously - with nothing queued
+    // that reads the table (false: a device selection or copy failed)
+    bool tab_entry(const Layer& l, int e) {
+        bool ok = true;
+        for (int m = 0; m < l.nm && ok; ++m) {
+            const Layer& x = member(l, m);
+            const int sl = l.slot[(size_t) e];
+            const unsigned long long v = sl >= 0 ? (unsigned long long) sat(l, x, sl, unit(x)) : 0ull;
+            ok = cudaSetDevice(devs[(size_t) x.dev].id) == cudaSuccess &&
+                 cudaMemcpy(x.vram_tab + e, &v, 8, cudaMemcpyHostToDevice) == cudaSuccess;
+        }
+        return ok;
+    }
+    // held out of VRAM between a prompt's parts (lend_hold): its slot under the buffers, the CPU lane computes it
+    bool held_out(const Layer& l, int e) const {
+        return lend_held.load(std::memory_order_relaxed) && !l.lend_mark.empty() && l.lend_mark[(size_t) e] != 0;
+    }
+    // after a part of a prompt read in parts that has more to come (the devices done with it): the room it borrowed
+    // kept for the next part (see Held) - the experts under the buffers on the CPU lane meanwhile, from where a GGUF's
+    // in-place experts are read (the file's mapping, mx_mat; only a GGUF's layers lend their slots).  false: nothing
+    // kept (not lent, or a layer that is not a GGUF's) - the caller hands the room back; a sync or table write that
+    // failed leaves lend_broken (sticky) as borrow_end's do
+    bool lend_hold(int64_t at, int next_k, int per) {
+        if (!lent || lend_held.load(std::memory_order_relaxed)) return false;
+        for (const Layer& l : L)
+            if (!l.mtp && l.pv_n < l.n_slots && (l.lay.fmt != gg::kFmtMXFP4 || !l.maddr.empty())) return false;
+        for (size_t di = 0; di < devs.size(); ++di) {   // (the run's work done: nothing writes the buffers now)
+            cudaError_t e = cudaSetDevice(devs[di].id);
+            if (e == cudaSuccess) e = cudaStreamSynchronize(devs[di].st);
+            if (e == cudaSuccess && di < chunks.size() && chunks[di] != nullptr && chunks[di]->cs != nullptr)
+                e = cudaStreamSynchronize(chunks[di]->cs);
+            if (e != cudaSuccess) {
+                lend_broken = true;
+                std::fprintf(stderr, "ds4: the prompt path's room between a prompt's parts: CUDA%d's streams: %s - "
+                                     "no further request runs\n", devs[di].id, cudaGetErrorString(e));
+                return false;
+            }
+        }
+        held_list.clear();
+        bool ok = true;
+        for (Layer& l : L) {
+            if (l.mtp || l.pv_n >= l.n_slots) continue;
+            if (l.lend_mark.size() != (size_t) l.n_exp) l.lend_mark.assign((size_t) l.n_exp, 0);
+            for (int e = 0; e < l.n_exp; ++e) {
+                const int sl = l.slot[(size_t) e];
+                if (sl < l.pv_n) continue;   // (in VRAM before the buffers, or the CPU lane's already)
+                held_list.push_back({l.il, e, sl});
+                l.lend_mark[(size_t) e] = 1;
+                l.slot[(size_t) e] = -1;
+                l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+                --l.n_vram;
+                ok = tab_entry(l, e) && ok;
+            }
+        }
+        lend_held.store(true, std::memory_order_relaxed);
+        held_seq = sq_bound;
+        held_at = at;
+        held_k = next_k;
+        held_per = per;
+        st.lend_kept += (int64_t) held_list.size();
+        if (!ok) {
+            lend_broken = true;
+            std::fprintf(stderr, "ds4: the prompt path's room between a prompt's parts: a table write failed - the "
+                                 "device's state unknown; no further request runs\n");
+        }
+        return true;
+    }
+    // before the next part (or the hand-back): the held experts back in their slots' books; their table entries stay 0
+    // until the hand-back (no decode before it: a run reads its slots by pv_n)
+    void lend_unhold() {
+        if (!lend_held.load(std::memory_order_relaxed)) return;
+        for (const Held& h : held_list) {
+            Layer& l = L[(size_t) h.layer];
+            l.slot[(size_t) h.e] = h.slot;
+            l.host[(size_t) h.e] = nullptr;
+            ++l.n_vram;
+        }
+        held_list.clear();
+        lend_held.store(false, std::memory_order_relaxed);
+    }
     // after the run (every device done with its buffers): the experts under them read back into their slots, in file
     // order by a few threads - one that cannot be read leaves VRAM for the CPU lane (the decode finds every other one
     // where it was).  false: DS4_CHECK_LEND found a part read back different from the file - those experts went to the
@@ -16835,6 +16955,7 @@ struct Model::Impl {
     // selection, sync, copy into a slot or table write failed: lend_broken (sticky), no later request runs
     bool borrow_end() {
         if (!lent) return true;
+        lend_unhold();   // (a prompt read in parts kept it: its experts back in their slots' books first)
         lent = false;
         std::atomic<bool> broken{false};   // (a runtime failure: the expert tables can no longer be vouched for)
         std::string why;
@@ -16864,7 +16985,17 @@ struct Model::Impl {
                     if (l.slot[(size_t) e] >= l.pv_n) jobs.push_back({l.il, e});
             l.pv_n = l.n_slots;
         }
-        if (jobs.empty()) return true;
+        if (jobs.empty()) {
+            bool ok = true;
+            for (Layer& l : L)   // (marks without a lent slot - none expected: each entry from its slot)
+                for (size_t e = 0; e < l.lend_mark.size(); ++e)
+                    if (l.lend_mark[e] != 0) {
+                        l.lend_mark[e] = 0;
+                        ok = tab_entry(l, (int) e) && ok;
+                    }
+            if (!ok) lend_broken = true;
+            return ok;
+        }
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
             if (la.mx_file[0] != lb.mx_file[0]) return la.mx_file[0] < lb.mx_file[0];
@@ -16965,7 +17096,13 @@ struct Model::Impl {
             Layer& l = L[(size_t) jobs[i].layer];
             const int e = jobs[i].e;
             bytes += l.blob;
-            if (!bad[i] && n_th > 0) continue;
+            // (kept lent between a prompt's parts: its table entries were 0 - set again where it is back in VRAM)
+            const bool marked = !l.lend_mark.empty() && l.lend_mark[(size_t) e] != 0;
+            if (marked) l.lend_mark[(size_t) e] = 0;
+            if (!bad[i] && n_th > 0) {
+                if (marked && !tab_entry(l, e)) broken = true;
+                continue;
+            }
             ++n_bad;   // (to the CPU lane: the file has it)
             l.slot[(size_t) e] = -1;
             l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
@@ -16978,8 +17115,16 @@ struct Model::Impl {
                     broken = true;   // (the device's table may still name the slot)
             }
         }
+        for (Layer& l : L)   // (a mark whose expert was not among them - none expected: its entry from its slot)
+            for (size_t e = 0; e < l.lend_mark.size(); ++e)
+                if (l.lend_mark[e] != 0) {
+                    l.lend_mark[e] = 0;
+                    if (!tab_entry(l, (int) e)) broken = true;
+                }
         lent_experts += (int64_t) jobs.size();
         lent_ms += now_ms() - t0;
+        st.lent_back += (int64_t) jobs.size();
+        st.lent_back_ms += now_ms() - t0;
         if (tp) {   // (DS4_TP_BORROW: always - the decode after a prompt waits for it, so its cost is a reading)
             std::string per;
             for (size_t di = 0; di < devs.size(); ++di)
@@ -17282,11 +17427,28 @@ struct Model::Impl {
         // (DS4_SETTLE_MS: the profile's counts before the run - what the run picked is the difference)
         const bool settle = settle_on();
         if (settle) prof_run0 = prof;
+        // (a prompt read in parts that kept its room: its next part finds it lent already - the same plan, the same
+        //  chunk; any other run hands it back first)
+        const bool cont = lend_held.load(std::memory_order_relaxed) && whole != nullptr && sq_bound == held_seq &&
+                          fp.at == held_at && k0 == held_k && per == held_per;
+        if (lend_held.load(std::memory_order_relaxed) && !cont && !borrow_end()) {
+            err = lend_broken ? std::string(kLendBroken)
+                              : "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file";
+            return false;
+        }
         struct Lent {   // (every way out, a failed borrow_begin's too: the room handed back once the devices are done)
             Impl* p;
-            ~Lent() { (void) p->borrow_end(); }   // (an early way out already fails the prompt)
+            bool keep = false;   // (kept for the plan's next part: lend_hold)
+            ~Lent() {
+                if (!keep) (void) p->borrow_end();   // (an early way out already fails the prompt)
+            }
         } lent_{this};
-        if (!borrow_begin(per, err)) return false;
+        if (cont) {   // (between the parts nothing moved into its slots: the cache stood still)
+            lend_unhold();
+            cache_drain();
+            if (ln_one || ln_land) rc_drain();
+        } else if (!borrow_begin(per, err))
+            return false;
         plan_streams();
         if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
             run.snap_pos = pos + n - 1;
@@ -17484,8 +17646,15 @@ struct Model::Impl {
                 err = "stopped while reading the prompt";
                 return false;
             }
-        // (before the cache looks at the slots again; no decode after a mismatch or a failure)
-        if (!borrow_end()) {
+        // (before the cache looks at the slots again; no decode after a mismatch or a failure) - or, a part of a prompt
+        // read in parts with more to come, its room kept for the next part (DS4_PROMPT_KEEP_LEND=0: handed back)
+        if (!run_end && whole != nullptr && keep_lend_on() && lend_hold(fp.at, k1, per)) {
+            lent_.keep = true;
+            if (lend_broken) {
+                err = kLendBroken;
+                return false;
+            }
+        } else if (!borrow_end()) {
             err = lend_broken ? std::string(kLendBroken)
                               : "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file - the "
                                 "prompt is not answered (those experts went to the CPU lane)";
@@ -18845,6 +19014,7 @@ struct Model::Impl {
                 ++pr[e];
                 l.heat[(size_t) e] += 1.0f;
                 if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                if (held_out(l, e)) ++st.lend_picks;   // (its slot under a prompt's kept room)
                 per[(size_t) e].push_back({t, i});
             }
         }
@@ -19424,6 +19594,7 @@ bool Model::step(int token, bool logits, std::string& err) { return p_->step(tok
 std::string Model::where() const { return p_->where(); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
+    if (!feed_release(err)) return false;   // (another read: a prompt's room kept between its parts handed back first)
     p.main_at.store("reading a prompt", std::memory_order_relaxed);
     p.pm.last = -1;
     p.halted = false;
@@ -19438,6 +19609,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
+    if (!feed_release(err)) return false;   // (another read: a prompt's room kept between its parts handed back first)
     p.main_at.store("reading a prompt", std::memory_order_relaxed);
     p.pm.last = -1;
     p.halted = false;
@@ -19457,6 +19629,8 @@ int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) 
 bool Model::feed_plan(int n, int logits_rows, int slot, FeedPlan& plan) {
     Impl& p = *p_;
     plan = FeedPlan{};
+    std::string e0;   // (another read: a prompt's room kept between its parts handed back first - pick_path sees the
+    if (!feed_release(e0)) return false;   //  experts where they are; a failure fails the read that follows)
     // (the path feed() / feed_mark() would take: windows - or every row's logits - stay one call; then the flow's
     //  chunks, two or more of them)
     if (p.lend_broken || p.chunk <= 0 || n < std::max(2, p.chunk_min) || logits_rows > kWin) return false;
@@ -19473,6 +19647,14 @@ bool Model::feed_plan(int n, int logits_rows, int slot, FeedPlan& plan) {
     plan.logits_rows = logits_rows;
     plan.slot = slot;
     return true;
+}
+bool Model::feed_release(std::string& err) {
+    Impl& p = *p_;
+    if (!p.lend_held.load(std::memory_order_relaxed)) return true;
+    if (p.borrow_end()) return true;
+    err = p.lend_broken ? std::string(Impl::kLendBroken)
+                        : "DS4_CHECK_LEND: an expert part handed back to VRAM differs from the model file";
+    return false;
 }
 bool Model::feed_part(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err) {
     Impl& p = *p_;

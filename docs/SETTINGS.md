@@ -462,9 +462,12 @@ within the run-to-run spread.
 #### A long prompt beside running requests (opt-in until measured)
 
 By default a new request's prompt is read in one run while every other request waits: a 185K-token agent prompt stops
-the other conversation for as long as it takes to read. `MAYA_DS4_PROMPT_SHARE` reads it in parts of one prompt chunk
-(`--prefill-chunk`) while another request decodes, and between two parts the running requests decode for that share
-of the time the part took - the long prompt slows them down instead of stopping them, and takes longer itself.
+the other conversation for as long as it takes to read. `MAYA_DS4_PROMPT_SHARE` reads it in parts while another
+request decodes, and between two parts the running requests decode for that share of the time the part took - the
+long prompt slows them down instead of stopping them, and takes longer itself. A part is whole prompt chunks
+(`--prefill-chunk`): the first one chunk, then as many as the parts so far say fit `MAYA_DS4_PROMPT_GAP_MS` (a part
+costs a fixed time at its start and end, and a time a chunk: the two are told apart once parts of two sizes ran), at
+least one - the gap is a target, a single chunk can take longer.
 `MAYA_DS4_PROMPT_YIELD` lets a long read give way at a part's end to a waiting request that needs at most half the
 tokens it has left to read (counting what an idle conversation already holds of it): that request is read, writes its
 first token, and the long read goes on where it stopped (at most twice a read; a free conversation is needed, so with
@@ -472,18 +475,34 @@ first token, and the long read goes on where it stopped (at most twice a read; a
 parts. The parts are whole chunks of the plan one read in a single run would use - the same chunks and the same
 prompt skip (`MAYA_DS4_PROMPT_SKIP`) - so the prompt's arithmetic is the same: the expert cache can still move experts
 between the parts, as it does between two requests. A request alone reads as before with `MAYA_DS4_PROMPT_SHARE` (no
-part, nothing between); `MAYA_DS4_PROMPT_YIELD` reads every long prompt in parts of n chunks, also alone. Each part
-costs what a run costs at its start and end: the pipeline over a layer split fills and drains, the expert slots a
-GPU lends the prompt's buffers are read back, and one GPU that reads the experts layer by layer reads each layer's
-once a part rather than once a prompt. A prompt read in windows of 16 (`--prefill-chunk 0`) pauses between its
-windows. The engine log says how many parts a prompt was read in and how long the others ran between them;
-`maya-ds4 --parts-check --ids ...` (tests; with `--parallel 2` another conversation read and stepped between the parts)
-compares a prompt read in parts of one chunk with one read in a single run, bit for bit.
+part, nothing between); `MAYA_DS4_PROMPT_YIELD` reads every long prompt in parts of n chunks, also alone.
+
+Each part costs what a run costs at its start and end: the pipeline over a layer split fills and drains, the Engram
+rows of its first chunk are read before its first layer (the next chunk's are read while a chunk runs), and one GPU
+that reads the experts layer by layer reads each layer's once a part rather than once a prompt. Where the GPUs lend
+the prompt's buffers their expert slots (a GGUF's experts, read in place: one GPU, or a tensor-parallel group with
+`DS4_TP_BORROW=1`), the room stays lent from one part to the next: between the parts the experts under the buffers are
+computed on the CPU lane - read from the model's files, through the page cache, as any expert the cache moved out of
+VRAM - and the expert cache stands still (no moves into VRAM, no recent-slot fills or landings); they are read back into
+VRAM once, after the last part. Anything else that needs the room first - another prompt, a picture - has it handed
+back before it starts. `DS4_PROMPT_KEEP_LEND=0` hands the room back after every part (each part then reads those experts
+back from the files). An EXL3 pack lends no slots: nothing to keep. With `MAYA_DS4_DISK_SKIP_W` the experts kept lent
+count as read from the SSD, so a light one may be left out between the parts.
+
+A prompt read in windows of 16 (`--prefill-chunk 0`) pauses between its windows. The engine log has a line for each
+prompt read in parts: its parts and chunks, their time, the longest part, the devices' waits for Engram rows in them,
+the time between them for the others, and where the room was kept, the experts kept out of VRAM, the others' picks of
+them and the read-back. `maya-ds4 --parts-check --ids ...` (tests; with `--parallel 2` another conversation read and
+stepped between the parts) compares a prompt read in parts of one chunk with one read in a single run, bit for bit; the
+other conversation's tokens against its own alone are informational (the experts kept lent run on the CPU lane between
+the parts, whose rounding can change the last bits).
 
 | Setting | Default | Effect |
 | --- | --- | --- |
-| `MAYA_DS4_PROMPT_SHARE` | 0 (off) | with `--parallel` above 1: while a prompt is read and another request decodes, the running requests decode between its chunks for this share of the time each chunk took (`0.5`: half as long; larger shortens their pauses more and lengthens the prompt's read) |
-| `MAYA_DS4_PROMPT_YIELD` | 0 (off) | `n`: a long prompt read gives way at a part's end to a waiting request that needs at most half its tokens left; the read goes in parts of `n` chunks where nothing else decodes (one chunk beside a decode with `MAYA_DS4_PROMPT_SHARE`) |
+| `MAYA_DS4_PROMPT_SHARE` | 0 (off) | with `--parallel` above 1: while a prompt is read and another request decodes, the running requests decode between its parts for this share of the time each part took (`0.5`: half as long; larger shortens their pauses more and lengthens the prompt's read) |
+| `MAYA_DS4_PROMPT_GAP_MS` | 2500 | with `MAYA_DS4_PROMPT_SHARE`: a part's chunks, as many as the parts so far say fit this long (at least one; `0`: one chunk a part) |
+| `MAYA_DS4_PROMPT_YIELD` | 0 (off) | `n`: a long prompt read gives way at a part's end to a waiting request that needs at most half its tokens left; the read goes in parts of `n` chunks where nothing else decodes (parts by `MAYA_DS4_PROMPT_GAP_MS` beside a decode with `MAYA_DS4_PROMPT_SHARE`) |
+| `DS4_PROMPT_KEEP_LEND` | on (1) | with the two above, where the GPUs lend their expert slots to the prompt's buffers: `0` hands the room back after every part instead of keeping it until the last |
 
 ## Drafting with DFlash2
 

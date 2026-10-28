@@ -146,6 +146,13 @@ struct Stats {
     // per draft position (the 1st .. 8th of a round): verified with all the drafts before it accepted, and accepted
     int64_t draft_reached[8] = {}, draft_kept[8] = {};
     double draft_ms = 0.0, verify_ms = 0.0;   // the drafter's time, the verification windows' time
+    // the prompt path's room (a GGUF's VRAM expert slots lent to a run's buffers): experts read back into VRAM at its
+    // hand-backs, and the time; a prompt read in parts that kept it between its parts (Model::feed_part): the experts
+    // held out of VRAM meanwhile (summed over its pauses), and the decode's picks of them (the CPU lane's, or the PCIe
+    // lane's)
+    int64_t lent_back = 0;
+    double lent_back_ms = 0.0;
+    int64_t lend_kept = 0, lend_picks = 0;
 };
 
 class Model {
@@ -210,9 +217,15 @@ public:
     /// run's n, from its start; pos() where chunk k0 starts), each as that one call reads it; the part with the last
     /// chunk takes the logits and keeps the checkpoint before the last token.  The parts in order leave the state one
     /// call leaves.  Between two parts other conversations may be bound, stepped and fed; a Stop in a part, or between
-    /// two, leaves the state past the run's start unusable, as a stopped feed does.
+    /// two, leaves the state past the run's start unusable, as a stopped feed does.  Where the GPUs lend the prompt
+    /// path their expert slots (a GGUF's), the room stays lent from one part to the next: between them those experts
+    /// are computed on the CPU lane, and the next part of the plan needs no new lend; anything else that needs the room
+    /// (another run of chunks, a picture) hands it back first.  feed_release(): a read in parts that ends before its
+    /// last part (a Stop or a failure between two parts) hands its room back (false: it could not - every later
+    /// request fails, as after a run whose room could not be handed back).
     bool feed_plan(int n, int logits_rows, int slot, FeedPlan& plan);
     bool feed_part(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err);
+    bool feed_release(std::string& err);
     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
     void set_progress(std::function<void(int64_t)> f);
     /// Asked while a run of chunks goes through the layers: true (a Stop) ends it early - one GPU after the layer it is

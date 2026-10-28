@@ -1260,11 +1260,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         size_t from = 0;         // the tokens the state already held
     };
     // --parallel: a prompt read beside the running requests (ds4_interleave.hpp; null: in one call, as before) -
-    // whether to read it in parts of whole chunks (Model::feed_plan), the next part's chunks of those left, and what
-    // runs between two parts (the part's ms, the tokens and chunks still to read; it binds this conversation again)
+    // whether to read it in parts of whole chunks (Model::feed_plan), the next part's chunks of those left (by the
+    // read's parts so far), and what runs between two parts (the part's ms, the tokens and chunks still to read; it
+    // binds this conversation again)
     struct Pace {
         std::function<bool()> parts;
-        std::function<int(int)> chunks;
+        std::function<int(int, const strata::ds4::PartTimes&)> chunks;
         std::function<void(double, int64_t, int)> between;
     };
     const auto prompt_in = [&](Req& r, bool geni, const std::string& tag, const std::function<bool()>& stop_now,
@@ -1429,8 +1430,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         strata::ds4::FeedPlan plan;
         size_t plan_from = 0;   // (where the plan's run starts)
         int plan_k = 0;         // (its next chunk)
-        int parts = 0, pauses = 0;
-        double paused_ms = 0;
+        int parts = 0, pauses = 0, part_chunks = 0;
+        double paused_ms = 0, part_max_ms = 0, parts_ms = 0, parts_eg_ms = 0;
+        strata::ds4::PartTimes times;   // (the parts' measured times: the next part's size)
         while (ok && done < total) {
             if (stop_now()) {
                 stopped = true;
@@ -1449,8 +1451,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             if (!plan.ends.empty()) {   // (the plan's next chunks: the last part takes the logits and the checkpoint)
                 const int nk = (int) plan.ends.size(), a = plan_k > 0 ? plan.ends[(size_t) plan_k - 1] : 0;
-                const int k1 = plan_k + std::max(1, std::min(nk - plan_k, pace->chunks(nk - plan_k)));
+                const int k1 = plan_k + std::max(1, std::min(nk - plan_k, pace->chunks(nk - plan_k, times)));
+                const double tf = now_ms(), eg0 = m.stats().engram_ms;
                 ok = m.feed_part(plan, r.ids.data() + plan_from, plan_k, k1, err);
+                const double part_ms = now_ms() - tf;
+                parts_ms += part_ms;
+                parts_eg_ms += m.stats().engram_ms - eg0;   // (the devices' waits for a chunk's Engram rows)
+                times.add(k1 - plan_k, part_ms);
+                part_max_ms = std::max(part_max_ms, part_ms);
+                part_chunks += k1 - plan_k;
                 n = (size_t) (plan.ends[(size_t) k1 - 1] - a);
                 plan_k = k1;
                 if (plan_k == nk) plan = strata::ds4::FeedPlan{};
@@ -1491,9 +1500,31 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.set_cancel(nullptr);
         m.set_progress(nullptr);   // (its lambda reads this read's locals)
         m.set_images({});
-        if (pauses > 0)
-            std::fprintf(stderr, "maya ds4 serve: request%s: the prompt was read in %d parts, %.0f ms between them for "
-                                 "the others\n", tag.c_str(), parts, paused_ms);
+        {   // (a read in parts that ended before its last part: the room it kept handed back)
+            std::string re;
+            if (!m.feed_release(re) && ok) {
+                ok = false;
+                err = re;
+            }
+        }
+        if (pauses > 0) {
+            const strata::ds4::Stats& se = m.stats();
+            std::string lend;
+            if (se.lend_kept > P.s0.lend_kept || se.lent_back > P.s0.lent_back) {
+                char b[256];
+                std::snprintf(b, sizeof b, "; the prompt path's room kept between them: %lld experts out of VRAM "
+                                           "(summed over the pauses), %lld of the others' picks on them; %lld experts "
+                                           "read back in %.0f ms",
+                              (long long) (se.lend_kept - P.s0.lend_kept),
+                              (long long) (se.lend_picks - P.s0.lend_picks),
+                              (long long) (se.lent_back - P.s0.lent_back), se.lent_back_ms - P.s0.lent_back_ms);
+                lend = b;
+            }
+            std::fprintf(stderr, "maya ds4 serve: request%s: the prompt was read in %d parts (%d chunks in parts, %.0f "
+                                 "ms, the longest %.0f ms; the devices waited %.0f ms in all for Engram rows), %.0f ms "
+                                 "between them for the others%s\n",
+                         tag.c_str(), parts, part_chunks, parts_ms, part_max_ms, parts_eg_ms, paused_ms, lend.c_str());
+        }
         if (stopped || (!ok && m.cancelled())) {
             const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
             if (!back) {
@@ -2112,11 +2143,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
         };
         // A prompt read beside them (ds4_interleave.hpp): MAYA_DS4_PROMPT_SHARE (STRATA_DS4_ / DS4_PROMPT_SHARE) - the
-        // running requests decode between the prompt's chunks for this share of the time each chunk took (0, the
-        // default: off - they wait for the whole prompt, as before); MAYA_DS4_PROMPT_YIELD=<n> - a long read gives way
-        // at a part's end to a waiting request that needs at most half the tokens it has left (at most twice a read),
-        // reading in parts of n chunks where nothing else decodes (0, the default: off).  The parts are whole chunks of
-        // the one call's plan (Model::feed_plan), so the prompt's arithmetic is the same.  Opt-in until measured.
+        // running requests decode between the prompt's parts for this share of the time each part took (0, the
+        // default: off - they wait for the whole prompt, as before), each part as many chunks as the parts so far say
+        // fit MAYA_DS4_PROMPT_GAP_MS (2500; the first part one chunk); MAYA_DS4_PROMPT_YIELD=<n> - a long read gives
+        // way at a part's end to a waiting request that needs at most half the tokens it has left (at most twice a
+        // read), reading in parts of n chunks where nothing else decodes (0, the default: off).  The parts are whole
+        // chunks of the one call's plan (Model::feed_plan), so the prompt's arithmetic is the same; where the GPUs lend
+        // the prompt path their expert slots, the room stays lent between the parts (Model::feed_part).  Opt-in until
+        // measured.
         strata::ds4::ReadPace pace_rule;
         {
             const auto env = [](const char* name) {
@@ -2125,12 +2159,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             };
             if (const char* v = env("DS4_PROMPT_SHARE")) pace_rule.share = std::max(0.0, std::atof(v));
             if (const char* v = env("DS4_PROMPT_YIELD")) pace_rule.yield = std::max(0, std::atoi(v));
+            if (const char* v = env("DS4_PROMPT_GAP_MS")) pace_rule.gap_ms = std::max(0.0, std::atof(v));
             if (pace_rule.on())
                 std::fprintf(stderr, "maya ds4 serve: a prompt read beside running requests: they decode %.2f x a "
-                                     "part's time between its parts (MAYA_DS4_PROMPT_SHARE); a long read gives way "
-                                     "to a much shorter one: %s (MAYA_DS4_PROMPT_YIELD)\n",
-                             pace_rule.share, pace_rule.yield > 0 ? ("in parts of " + std::to_string(pace_rule.yield) +
-                                                                     " chunks").c_str() : "off");
+                                     "part's time between its parts, each part as many chunks as fit %.0f ms "
+                                     "(MAYA_DS4_PROMPT_SHARE, MAYA_DS4_PROMPT_GAP_MS); a long read gives way to a much "
+                                     "shorter one: %s (MAYA_DS4_PROMPT_YIELD)\n",
+                             pace_rule.share, pace_rule.gap_ms,
+                             pace_rule.yield > 0
+                                 ? ("in parts of " + std::to_string(pace_rule.yield) + " chunks").c_str()
+                                 : "off");
         }
         int reading = 0;   // prompts being read (a read that gave way, and the one it let in)
         std::function<void(const std::string&, bool)> admit;   // (below: a read in parts lets a request in)
@@ -2198,7 +2236,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             int yields = 0;
             Pace pc;
             pc.parts = [&] { return pace_rule.parts(!acts.empty()); };
-            pc.chunks = [&](int left) { return pace_rule.part_chunks(left, !acts.empty()); };
+            pc.chunks = [&](int left, const strata::ds4::PartTimes& t) {
+                return pace_rule.part_chunks(left, !acts.empty(), t);
+            };
             pc.between = [&, best, rid, nested](double part_ms, int64_t left, int left_chunks) {
                 between(best, rid, nested, yields, part_ms, left, left_chunks);
             };
@@ -2869,6 +2909,9 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
     const bool beside = m.seq_count() > 1;
     const std::vector<int> other(ids.begin(), ids.begin() + std::min(N - 1, 300));
     int other_tok = -1, other_steps = 0;
+    // (its tokens between the parts: the first pause reads its prompt - the room a GGUF's GPUs lend handed back for
+    //  it - the later ones step it beside the kept room)
+    std::vector<int> other_toks;
     const auto pause = [&]() -> bool {
         if (!beside) return true;
         m.seq_bind(1);
@@ -2881,6 +2924,7 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
             ++other_steps;
         }
         if (ok) other_tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+        if (ok) other_toks.push_back(other_tok);
         m.seq_bind(0);
         return ok;
     };
@@ -2927,9 +2971,37 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
         return true;
     };
     Read one, parts;
-    if (!read(false, one) || !read(true, parts)) {
+    if (!read(false, one)) {
         std::fprintf(stderr, "parts check: %s\n", err.c_str());
         return 1;
+    }
+    const strata::ds4::Stats s0 = m.stats();
+    if (!read(true, parts)) {
+        std::fprintf(stderr, "parts check: %s\n", err.c_str());
+        return 1;
+    }
+    const strata::ds4::Stats s1 = m.stats();
+    // the other conversation alone: its prompt, then as many greedy steps - its tokens beside the parts against these
+    // (informational: between the parts the experts kept lent ran on the CPU lane, whose rounding can differ in the
+    // last bits, as between two runs)
+    size_t ot = 0;
+    if (beside && !other_toks.empty()) {
+        std::vector<int> alone;
+        m.seq_bind(1);
+        m.reset();
+        bool ok = m.feed(other.data(), (int) other.size(), 1, err);
+        int tok = ok ? m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0) : -1;
+        if (ok) alone.push_back(tok);
+        while (ok && alone.size() < other_toks.size()) {
+            ok = m.step(tok, true, err);
+            if (ok) alone.push_back(tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0));
+        }
+        m.seq_bind(0);
+        if (!ok) {
+            std::fprintf(stderr, "parts check: %s\n", err.c_str());
+            return 1;
+        }
+        while (ot < alone.size() && other_toks[ot] == alone[ot]) ++ot;
     }
     const auto diff = [](const std::vector<float>& a, const std::vector<float>& b, bool& same) {
         same = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
@@ -2948,6 +3020,15 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
                                           " times between them").c_str() : "",
                 same_last ? "bit for bit" : "DIFFER", d_last, same_again ? "bit for bit" : "DIFFERS", d_again, n,
                 same_toks ? "the same" : ("differ from token " + std::to_string(t) + " on").c_str());
+    if (beside && !other_toks.empty())
+        std::printf("parts check: the other conversation's %zu tokens between the parts %s its own alone\n",
+                    other_toks.size(),
+                    ot == other_toks.size() ? "the same as"
+                                            : ("differ from token " + std::to_string(ot) + " on from").c_str());
+    std::printf("parts check: the prompt path's room: %lld experts kept out of VRAM between the parts (summed over the "
+                "pauses), %lld of the other conversation's picks on them, %lld experts read back in %.0f ms\n",
+                (long long) (s1.lend_kept - s0.lend_kept), (long long) (s1.lend_picks - s0.lend_picks),
+                (long long) (s1.lent_back - s0.lent_back), s1.lent_back_ms - s0.lent_back_ms);
     return same_last && same_again && same_toks ? 0 : 1;
 }
 

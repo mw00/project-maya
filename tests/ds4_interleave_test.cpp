@@ -10,21 +10,23 @@
 #include <cstdio>
 #include <vector>
 
+using strata::ds4::PartTimes;
 using strata::ds4::ReadPace;
 
 namespace {
 
 // A prompt of `chunks` chunks of chunk_ms each read beside one request that decodes a step every step_ms (none:
-// decoding false), the server's loop as ds4_main.cpp runs it: a part (part_chunks), then the running request's steps
-// (decode_more).  The parts' chunk ranges, the request's longest wait between two steps while the prompt is read, and
-// when the prompt is read.
+// decoding false), the server's loop as ds4_main.cpp runs it: a part (part_chunks, from the parts' times so far) that
+// costs part_ms on top of its chunks, then the running request's steps (decode_more).  The parts' chunk ranges, the
+// request's longest wait between two steps while the prompt is read, and when the prompt is read.
 struct Sim {
     std::vector<std::pair<int, int>> parts;
     double longest = 0, read_at = 0;
     int steps = 0;
 };
-Sim simulate(const ReadPace& p, int chunks, double chunk_ms, bool decoding, double step_ms) {
+Sim simulate(const ReadPace& p, int chunks, double chunk_ms, bool decoding, double step_ms, double part_ms0 = 0) {
     Sim s;
+    PartTimes times;
     double t = 0, last_step = 0;
     if (!p.parts(decoding)) {   // one call, as without the pace
         s.parts.push_back({0, chunks});
@@ -35,10 +37,11 @@ Sim simulate(const ReadPace& p, int chunks, double chunk_ms, bool decoding, doub
     }
     int k = 0;
     while (k < chunks) {
-        const int c = p.part_chunks(chunks - k, decoding);
+        const int c = p.part_chunks(chunks - k, decoding, times);
         assert(c >= 1 && k + c <= chunks);
         s.parts.push_back({k, k + c});
-        const double part_ms = c * chunk_ms;
+        const double part_ms = part_ms0 + c * chunk_ms;
+        times.add(c, part_ms);
         t += part_ms;
         k += c;
         if (decoding) s.longest = std::max(s.longest, t - last_step);
@@ -112,8 +115,12 @@ int main() {
         assert(b.read_at == 64000 + 15 * 2000 && c.read_at == 64000 + 15 * 8000);
         assert(b.steps == 15 * 40 && c.steps == 15 * 160);
         // a step longer than the budget: still one a part
-        const Sim d = simulate(half, 4, 100, true, 500);
+        ReadPace each = half;
+        each.gap_ms = 0;   // (a chunk a part)
+        const Sim d = simulate(each, 4, 100, true, 500);
         assert(d.steps == 3 && d.longest == 100);
+        const Sim e = simulate(half, 4, 100, true, 500);   // (100 ms chunks fit the gap: the rest after the first)
+        assert(e.parts.size() == 2 && e.steps == 1 && e.longest == 300);
         std::printf("interleave: a 16-chunk prompt beside a decode: the longest wait %.0f / %.0f / %.0f ms at share "
                     "0 / 0.5 / 2, the prompt read at %.0f / %.0f / %.0f ms\n",
                     a.longest, b.longest, c.longest, a.read_at, b.read_at, c.read_at);
@@ -182,6 +189,52 @@ int main() {
             at = pr.second;
         }
         assert(at == chunks);
+    }
+    // the parts' time model: one size seen - its time a chunk, one more chunk while under the gap; two sizes - a part's
+    // fixed cost and a chunk's apart
+    {
+        PartTimes t;
+        assert(t.fit(2500) == 1);   // (nothing measured: one chunk)
+        t.add(1, 3000);
+        assert(t.fit(2500) == 1);   // (one chunk is over the gap already)
+        PartTimes u;
+        u.add(1, 1500);
+        assert(u.fit(2500) == 2);   // (500 a chunk + 1000 a part, seen as 1500 a chunk: one more, to learn the cost)
+        u.add(2, 2000);
+        assert(u.fit(2500) == 3 && u.fit(4000) == 6 && u.fit(1000) == 1);
+        u.add(3, 2500);             // (the latest and the latest other size: 2 and 3 chunks)
+        assert(u.n1 == 3 && u.n2 == 2 && u.fit(2500) == 3);
+        u.add(3, 2600);             // (the same size again: the other size kept)
+        assert(u.n2 == 2 && u.fit(2600 + 600) == 4);
+        PartTimes v;
+        v.add(2, 2000);
+        v.add(1, 2100);             // (noise: a smaller part took longer - by the latest's time a chunk)
+        assert(v.fit(2500) == 2);
+        PartTimes w;
+        w.add(4, 1000);
+        assert(w.fit(2500) == 10);
+        w.add(0, 5);                // (no part: ignored)
+        assert(w.n1 == 4);
+    }
+    // parts by the gap: fast chunks go several to a part, each part's fixed cost paid fewer times; a slow chunk alone
+    {
+        ReadPace p;
+        p.share = 0.5;
+        p.gap_ms = 2500;
+        const Sim fast = simulate(p, 40, 500, true, 50, 1000), slow = simulate(p, 10, 4000, true, 50, 1000);
+        check_cover(fast, 40);
+        check_cover(slow, 10);
+        assert(slow.parts.size() == 10);
+        assert(fast.parts.size() < 20 && fast.parts[0].second == 1 && fast.parts[1].second - fast.parts[1].first == 2);
+        for (size_t i = 2; i + 1 < fast.parts.size(); ++i) assert(fast.parts[i].second - fast.parts[i].first == 3);
+        assert(fast.longest <= 2500 + 1e-9);
+        ReadPace one = p;
+        one.gap_ms = 0;   // (no gap: a chunk a part)
+        const Sim each = simulate(one, 40, 500, true, 50, 1000);
+        assert(each.parts.size() == 40 && fast.read_at < each.read_at);
+        std::printf("interleave: 40 chunks of 500 ms, 1000 ms a part: %zu parts, the prompt read at %.0f ms, the "
+                    "longest wait %.0f ms (a chunk a part: %.0f ms, %.0f ms)\n",
+                    fast.parts.size(), fast.read_at, fast.longest, each.read_at, each.longest);
     }
     std::printf("ds4_interleave_test: all checks passed\n");
     return 0;
