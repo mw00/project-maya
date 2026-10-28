@@ -201,6 +201,13 @@ public:
     /// its conversation's tokens; the conversation keeps y and the accepted drafts, and its drafter rings are seeded
     /// with them.  The bound conversation stays bound.
     bool step_multi_spec(const int* seqs, const int* const* toks, const int* lens, int n, std::string& err);
+    /// The drafter for n conversations (2 or more, distinct) in one pass: draft()'s drafts and confidences for each
+    /// conversation seqs[i] after its token ys[i] (the drafter's argmax), the blocks' rows through the DSpark blocks
+    /// together.  can_draft_multi: whether these conversations fit one pass (their blocks in a window, each its
+    /// block's room in its context); else each drafts alone with draft().
+    bool can_draft_multi(const int* seqs, int n) const;
+    bool draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& drafts,
+                     std::vector<std::vector<float>>& conf, std::string& err);
     bool verify_multi(int i, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                       uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
 

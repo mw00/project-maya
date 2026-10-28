@@ -14014,6 +14014,226 @@ struct Model::Impl {
         return true;
     }
 
+    // ---- --parallel: the drafter for n conversations in one pass (Model::draft_multi).  Each conversation's block
+    // [y, noise x (block - 1)] at its own positions; the n blocks' rows through the DSpark blocks together - each
+    // block's rows attending to its own conversation's drafter ring and to its own block (step_multi's rows, a run a
+    // conversation) - and the trunk's head for all of them; then each conversation's markov chain and confidences, as
+    // draft_() makes them for one.  The drafter's argmax only (no sampled drafts).  draft_() itself is not used here:
+    // one conversation drafts exactly as before.
+    bool can_draft_multi(const int* sv, int n) const {
+        const int T = g.d_block;
+        if (g.n_mtp == 0 || sqs.empty() || n < 2 || T < 1 || n * T > kWin || n * (T + 1) > kWin + 2 ||
+            dump_d != nullptr || lend_broken)
+            return false;
+        for (int c = 0; c < n; ++c) {
+            if (sv[c] < 0 || sv[c] >= (int) sqs.size() || seq_pos(sv[c]) + T > o.max_context) return false;
+            for (int u = 0; u < c; ++u)
+                if (sv[u] == sv[c]) return false;
+        }
+        return true;
+    }
+    bool draft_multi(const int* sv, const int* ys, int n, std::vector<std::vector<int>>& out,
+                     std::vector<std::vector<float>>& conf, std::string& err) {
+        out.assign((size_t) std::max(0, n), {});
+        conf.assign((size_t) std::max(0, n), {});
+        if (!can_draft_multi(sv, n)) {
+            err = "draft_multi: these conversations do not draft in one pass";
+            return false;
+        }
+        const double t0 = now_ms();
+        drafts_q = false;
+        seq_park();   // (every conversation's position in sqs)
+        const bool ok = draft_multi_(sv, ys, n, out, conf, err);
+        seq_unpark();
+        for (int c = 0; c < n && max_drafts > 0; ++c)
+            if ((int) out[(size_t) c].size() > max_drafts) {
+                out[(size_t) c].resize((size_t) max_drafts);
+                conf[(size_t) c].resize((size_t) max_drafts);
+            }
+        st.draft_ms += now_ms() - t0;
+        st.drafts_rounds += n;
+        return ok;
+    }
+    bool draft_multi_(const int* sv, const int* ys, int n, std::vector<std::vector<int>>& out,
+                      std::vector<std::vector<float>>& conf, std::string& err) {
+        const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank, NR = n * T;
+        WinPlan dp;   // (the rows: conversation sv[c]'s block at rows c * T .., its positions pos ..)
+        dp.nrow = NR;
+        int tk[kWin];
+        for (int c = 0; c < n; ++c)
+            for (int t = 0; t < T; ++t) {
+                const int r = c * T + t;
+                tk[r] = t == 0 ? ys[c] : g.d_noise;
+                dp.rseq[r] = sv[c];
+                dp.rpos[r] = sqs[(size_t) sv[c]].pos + t;
+            }
+        Dev& d = devs[(size_t) d_dev];
+        cudaSetDevice(d.id);
+        for (int r = 0; r < NR; ++r) std::memcpy(h_emb + (size_t) r * D, embed_pinned + (size_t) tk[r] * D, (size_t) D * 2);
+        CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) NR * D * 2, cudaMemcpyHostToDevice, d.st));
+        embed(d.emb_rows, NR, d.h, D, H, d.st);
+        init_pre(d.pre, NR, d.st);
+        dp.async = par || (!sync_decode && NR <= async_max_t);   // (the trunk's rule for a window of NR rows)
+        for (int i = 0; i < g.n_mtp && dp.async; ++i) {
+            const int il = g.nl + i;
+            dp.seq[il] = 0;
+            if (host_free(L[(size_t) il])) continue;
+            dp.seq[il] = ++seq_issued;
+            layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
+        }
+        int cur = d_dev;   // the device the blocks' rows are on
+        std::vector<char> handed(devs.size(), 0);   // (DS4_DECODE_TRIM 8: a device's one block hand-off region)
+        const size_t nh = (size_t) NR * H * D * 4, np = (size_t) NR * 8 * 4;
+        for (int i = 0; i < g.n_mtp; ++i) {
+            Layer& l = L[(size_t) (g.nl + i)];
+            if (l.dev != cur && (decode_trim & 8) && !handed[(size_t) cur] && devs[(size_t) cur].dhand != nullptr) {
+                Dev& a = devs[(size_t) cur];
+                Dev& b = devs[(size_t) l.dev];
+                const unsigned sq = ++d_xseq;
+                Xfer px, gx;
+                px.n = gx.n = 2;
+                px.src[0] = a.h;
+                px.dst[0] = a.dhand;
+                px.bytes[0] = gx.bytes[0] = nh;
+                px.src[1] = a.pre;
+                px.dst[1] = a.dhand + nh;
+                px.bytes[1] = gx.bytes[1] = np;
+                gx.src[0] = a.dhand;
+                gx.dst[0] = b.h;
+                gx.src[1] = a.dhand + nh;
+                gx.dst[1] = b.pre;
+                cudaSetDevice(a.id);
+                xfer_put(px, a.dhand_flag, sq, a.xcnt, a.st);
+                cudaSetDevice(b.id);
+                xfer_get(gx, a.dhand_flag, sq, b.st);
+                handed[(size_t) cur] = 1;
+                cur = l.dev;
+            }
+            if (l.dev != cur) {   // (DS4_DRAFT_DEV: the next block on another card, through pinned host memory)
+                Dev& a = devs[(size_t) cur];
+                Dev& b = devs[(size_t) l.dev];
+                cudaSetDevice(a.id);
+                CK(cudaMemcpyAsync(a.bounce, a.h, nh, cudaMemcpyDeviceToHost, a.st));
+                CK(cudaMemcpyAsync(a.bounce + nh, a.pre, np, cudaMemcpyDeviceToHost, a.st));
+                CK(cudaEventRecord(a.ev_out, a.st));
+                cudaSetDevice(b.id);
+                CK(cudaStreamWaitEvent(b.st, a.ev_out, 0));
+                CK(cudaMemcpyAsync(b.h, a.bounce, nh, cudaMemcpyHostToDevice, b.st));
+                CK(cudaMemcpyAsync(b.pre, a.bounce + nh, np, cudaMemcpyHostToDevice, b.st));
+                cur = l.dev;
+            }
+            if (!layer(l, 0, 0, NR, dp, err)) return false;
+        }
+        Dev& dl = devs[(size_t) cur];   // the last block's device: the drafts' rows
+        cudaSetDevice(dl.id);
+        hc_pre_norm(dl.h, dl.pre, nullptr, D, H, NR, g.eps, dl.x, dl.st);   // (the confidence head reads it before the norm)
+        Dev& hd = devs[(size_t) head_dev];
+        const size_t nx = (size_t) NR * D * 4;
+        const bool xh = (decode_trim & 8) && dl.dhand != nullptr;
+        unsigned xsq = 0;
+        auto get_x = [&](Dev& e, float* dst) {
+            Xfer gx;
+            gx.n = 1;
+            gx.src[0] = dl.dhand + dhand_x();
+            gx.dst[0] = dst;
+            gx.bytes[0] = nx;
+            xfer_get(gx, dl.dhand_flag, xsq, e.st);
+        };
+        if (cur != head_dev || groups[(size_t) hd.grp].mem.size() > 1) {
+            if (xh) {
+                xsq = ++d_xseq;
+                Xfer px;
+                px.n = 1;
+                px.src[0] = dl.x;
+                px.dst[0] = dl.dhand + dhand_x();
+                px.bytes[0] = nx;
+                xfer_put(px, dl.dhand_flag, xsq, dl.xcnt, dl.st);
+            } else {
+                CK(cudaMemcpyAsync(dl.bounce, dl.x, nx, cudaMemcpyDeviceToHost, dl.st));
+                CK(cudaEventRecord(dl.ev_out, dl.st));
+            }
+        }
+        if (cur != head_dev) {
+            cudaSetDevice(hd.id);
+            if (xh) get_x(hd, hd.x);
+            else {
+                CK(cudaStreamWaitEvent(hd.st, dl.ev_out, 0));
+                CK(cudaMemcpyAsync(hd.x, dl.bounce, nx, cudaMemcpyHostToDevice, hd.st));
+            }
+        }
+        // the drafter's final norm and the trunk's head for every row, on every member of the head group
+        const std::vector<int>& hg = groups[(size_t) hd.grp].mem;
+        const bool mk = mk_split;
+        for (int m = (int) hg.size() - 1; m >= 0; --m) {
+            Dev& e = devs[(size_t) hg[(size_t) m]];
+            cudaSetDevice(e.id);
+            if (m > 0 && &e != &dl && xh) get_x(e, e.ao);
+            else if (m > 0 && &e != &dl) {
+                CK(cudaStreamWaitEvent(e.st, dl.ev_out, 0));
+                CK(cudaMemcpyAsync(e.ao, dl.bounce, nx, cudaMemcpyHostToDevice, e.st));
+            } else
+                CK(cudaMemcpyAsync(e.ao, m > 0 ? dl.x : e.x, nx, cudaMemcpyDeviceToDevice, e.st));
+            Finish fn;
+            fn.w = e.d_norm;
+            fn.eps = g.eps;
+            finish(e.ao, NR, D, D, fn, e.st);
+            if (!head_share(e, m, e.ao, NR, err, !mk)) return false;
+        }
+        // each conversation's markov chain: its tokens at d_ints + c * (block + 1) (its y first), its rows c * block ..
+        const int W = T + 1;
+        for (int c = 0; c < n; ++c) h_idx[(size_t) c * W] = ys[c];
+        if (mk) {   // (over the group, as draft_(): each member its rows of the bias, every member the global argmax)
+            const int nm = (int) hg.size();
+            const unsigned seq = ++mk_seq;
+            for (int c = 0; c < n; ++c) {
+                for (int m = 0; m < nm; ++m) {
+                    Dev& e = devs[(size_t) hg[(size_t) m]];
+                    cudaSetDevice(e.id);
+                    CK(cudaMemcpyAsync(e.mk_ints + (size_t) c * W, h_idx + (size_t) c * W, 4, cudaMemcpyHostToDevice, e.st));
+                    CK(cudaMemcpyAsync(e.mk_erow, h_mk_embed + (size_t) ys[c] * R, (size_t) R * 2, cudaMemcpyHostToDevice,
+                                       e.st));
+                }
+                for (int i = 0; i < T; ++i) {
+                    const int r = c * T + i;
+                    for (int m = 0; m < nm; ++m) {
+                        Dev& e = devs[(size_t) hg[(size_t) m]];
+                        cudaSetDevice(e.id);
+                        float* row = m == 0 ? hd.logits + (size_t) r * V : e.logits_part + (size_t) r * e.mk_vn;
+                        markov_share(row, e.mk_share, e.mk_erow, e.mk_vn, R, e.st);
+                        argmax_share(row, e.mk_vn, e.mk_v0, mk_slots + ((size_t) r * nm + m) * 4, seq, e.st);
+                        markov_pick(mk_slots + (size_t) r * nm * 4, nm, seq, e.mk_ints + (size_t) c * W + i + 1, h_mk_embed,
+                                    e.mk_erow, R, e.st);
+                    }
+                }
+            }
+            cudaSetDevice(hd.id);
+        } else {
+            CK(cudaMemcpyAsync(d_ints, h_idx, (size_t) n * W * 4, cudaMemcpyHostToDevice, hd.st));
+            strata::kernels::SamplerParams sp;
+            sp.greedy = true;
+            sp.temperature = 0.0f;
+            for (int c = 0; c < n; ++c)
+                for (int i = 0; i < T; ++i) {
+                    float* row = hd.logits + (size_t) (c * T + i) * V;
+                    int* ic = d_ints + (size_t) c * W;
+                    markov_add(row, d_mk_embed, d_mk_head, ic + i, V, R, hd.st);
+                    strata::kernels::sample_tokens(row, 1, V, nullptr, 0, sp, ic + i + 1, hd.st);
+                }
+        }
+        for (int c = 0; c < n; ++c)
+            confidence(hd.x + (size_t) c * T * D, d_mk_embed, d_ints + (size_t) c * W, d_conf, T, D, R, d_confv + (size_t) c * T,
+                       hd.st);
+        CK(cudaMemcpyAsync(h_idx, d_ints, (size_t) n * W * 4, cudaMemcpyDeviceToHost, hd.st));
+        CK(cudaMemcpyAsync(h_w, d_confv, (size_t) NR * 4, cudaMemcpyDeviceToHost, hd.st));
+        CK(cudaStreamSynchronize(hd.st));
+        for (int c = 0; c < n; ++c)
+            for (int i = 0; i < T; ++i) {
+                out[(size_t) c].push_back(h_idx[(size_t) c * W + i + 1]);
+                conf[(size_t) c].push_back(h_w[(size_t) c * T + i]);
+            }
+        return true;
+    }
+
     // the penalty rows of T picks (on the head device, its stream): row t the last h of toks[0 .. end0 + t), -1 in
     // front; the penalties into sp.  nullptr and h = 0 (sp untouched) for a request without penalties
     // (hist: whose tokens - null: the bound conversation's; a multi step's row: its own conversation's)
@@ -18147,6 +18367,11 @@ int Model::sample_multi(int row, float t, float tp, int tk, float mp, uint64_t s
 }
 bool Model::step_multi_spec(const int* seqs, const int* const* toks, const int* lens, int n, std::string& err) {
     return p_->step_runs(seqs, toks, lens, n, true, err);
+}
+bool Model::can_draft_multi(const int* seqs, int n) const { return p_->can_draft_multi(seqs, n); }
+bool Model::draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& d,
+                        std::vector<std::vector<float>>& c, std::string& err) {
+    return p_->draft_multi(seqs, ys, n, d, c, err);
 }
 bool Model::verify_multi(int i, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed,
                          uint64_t counter, int& accepted, int& next, std::string& err) {

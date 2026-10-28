@@ -395,9 +395,12 @@ context shares the memory beside the model among the N conversations.
   drafts.
 - **The drafter in the steps of several:** each request's rounds keep the drafts the model agrees with, as alone. One
   RTX 3090 + eight RTX 5060 Ti (`--tp 8`, EXL3 3.5 bpw, two thirds of the experts in RAM), two requests at once,
-  greedy: two short stories 37.0 + 47.8 tok/s each (32.1 + 34.7 without drafts), two pieces of code 49.4 + 47.1 tok/s;
-  `--multi-check` with the drafter, 2 x 200 tokens of code: 83.4 tok/s in all against 57.5 without drafts (x1.45).
-  The drafts of several are made one request after another (a drafter pass each), then verified together.
+  greedy, just started: two short stories 37.3 + 44.5 tok/s each (32.1 + 34.7 without drafts), two pieces of code
+  46.3 + 50.1 tok/s; warmer, 46.7 + 53.6 and 62.9 + 62.8. `--multi-check`, 2 x 200 tokens of code, every draft
+  verified: 79.3 tok/s in all together with the drafter, against 56.4 without drafts and 73.0 for the two one after
+  another, each alone with the drafter. The drafts of two or three requests are made in one drafter pass (their
+  blocks' rows through the DSpark blocks together: 79.3 against 72.4 with a pass each); where the experts are mostly
+  in RAM, each verified row costs the CPU lane its experts, so a round of two windows takes longer than one of one.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
   longer wait in line for a whole answer - but a new prompt is read while the others wait.
 

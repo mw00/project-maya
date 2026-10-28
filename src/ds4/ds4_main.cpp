@@ -1681,24 +1681,45 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     }
                 };
                 std::vector<std::vector<int>> drafts((size_t) nn);
+                std::vector<std::vector<float>> confs((size_t) nn);
                 std::vector<char> tried((size_t) nn, 0), closing((size_t) nn, 0);
+                std::vector<int> rooms((size_t) nn, 1), dsv, dys, dix;   // (the ones that draft: conversation, y, index)
                 bool any = false, failed = false;
-                for (int i = 0; i < nn && !failed; ++i) {
+                for (int i = 0; i < nn; ++i) {
                     Act& a = *need[(size_t) i];
                     int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
                     closing[(size_t) i] = close_think(a);
                     if (closing[(size_t) i]) room = 1;
                     else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
-                    room = std::min(room, share);
+                    rooms[(size_t) i] = room = std::min(room, share);
                     if (!((a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0)) continue;
                     tried[(size_t) i] = 1;
-                    bind(a.seq);
-                    std::vector<int>& d = drafts[(size_t) i];
-                    std::vector<float> conf;
-                    if (!m.draft(a.tok, d, conf, err)) {   // (the drafter's argmax: verify_multi takes each as a point)
-                        failed = true;
-                        break;
+                    dsv.push_back(a.seq);
+                    dys.push_back(a.tok);
+                    dix.push_back(i);
+                }
+                // their drafts: in one drafter pass where they fit one (Model::draft_multi), else one after another
+                // (the drafter's argmax either way: verify_multi takes each draft as a point)
+                const int nd = (int) dsv.size();
+                if (nd > 1 && m.can_draft_multi(dsv.data(), nd)) {
+                    std::vector<std::vector<int>> dd;
+                    std::vector<std::vector<float>> cc;
+                    failed = !m.draft_multi(dsv.data(), dys.data(), nd, dd, cc, err);
+                    for (int j = 0; j < nd && !failed; ++j) {
+                        drafts[(size_t) dix[(size_t) j]] = std::move(dd[(size_t) j]);
+                        confs[(size_t) dix[(size_t) j]] = std::move(cc[(size_t) j]);
                     }
+                } else
+                    for (int j = 0; j < nd && !failed; ++j) {
+                        bind(dsv[(size_t) j]);
+                        failed = !m.draft(dys[(size_t) j], drafts[(size_t) dix[(size_t) j]], confs[(size_t) dix[(size_t) j]], err);
+                    }
+                for (int i = 0; i < nn && !failed; ++i) {
+                    if (!tried[(size_t) i]) continue;
+                    Act& a = *need[(size_t) i];
+                    const int room = rooms[(size_t) i];
+                    std::vector<int>& d = drafts[(size_t) i];
+                    const std::vector<float>& conf = confs[(size_t) i];
                     const float cmin = a.r.conf >= 0 ? a.r.conf : conf_min;
                     const float cum_min = a.r.cum >= 0 ? a.r.cum : dspark_cum_default();
                     int keep = 0;
@@ -1898,12 +1919,16 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
                 N, n, same_rows, rows, max_d, tokens_same ? "yes" : "NO",
                 ms_alone > 0 ? 1000.0 * steps * N / ms_alone : 0.0, ms_together > 0 ? 1000.0 * steps * N / ms_together : 0.0,
                 ms_together > 0 ? ms_alone / ms_together : 0.0);
-    // ... then together with the drafter (step_multi_spec / verify_multi, as the server's rounds): each conversation's
-    // drafts - every one of them, whatever its confidence, so rejected windows are undone often - its share of a
-    // window; greedy, so the tokens alone are due again
+    // ... then with the drafter, greedy, so the tokens alone are due again - every draft verified, whatever its
+    // confidence, so rejected windows are undone often: each conversation alone (draft / verify, one conversation's
+    // rounds), then together (step_multi_spec / verify_multi, as the server's rounds, each conversation's drafts its
+    // share of a window) with the drafts made one conversation after another, then in one drafter pass (draft_multi)
     bool spec_same = true;
-    if (m.draft_block() > 0) {
+    double ms_spec_alone = 0;
+    for (int pass = 0; pass < 3 && m.draft_block() > 0; ++pass) {
         std::vector<std::vector<int>> spec_t((size_t) N);
+        long long offered = 0, kept = 0, rounds = 0, one_pass = 0;
+        double ms_spec = 0;
         for (int i = 0; i < N; ++i) {
             if (!prompt(i)) {
                 std::fprintf(stderr, "multi check: %s\n", err.c_str());
@@ -1911,63 +1936,125 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
             }
             spec_t[(size_t) i].push_back(m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0));
         }
-        const int share = m.verify_max() / N;
-        long long offered = 0, kept = 0, rounds = 0;
-        const double t0 = now_ms();
-        for (;;) {
-            std::vector<int> sv;
-            for (int i = 0; i < N; ++i)
-                if ((int) spec_t[(size_t) i].size() < n) sv.push_back(i);
-            if (sv.empty()) break;
-            const int k = (int) sv.size();
-            std::vector<std::vector<int>> rws((size_t) k), drafts((size_t) k);
-            std::vector<const int*> tp((size_t) k);
-            std::vector<int> lens((size_t) k);
-            for (int j = 0; j < k; ++j) {
-                const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
-                const int room = std::min(share, n - (int) got.size());
-                std::vector<float> conf;
-                m.seq_bind(sv[(size_t) j]);
-                if (room > 1 && !m.draft(got.back(), drafts[(size_t) j], conf, err)) {
+        if (pass == 0)
+            for (int i = 0; i < N; ++i) {
+                std::vector<int>& got = spec_t[(size_t) i];
+                m.seq_bind(i);
+                const double t0 = now_ms();
+                while ((int) got.size() < n) {
+                    const int room = std::min(m.verify_max(), n - (int) got.size());
+                    std::vector<int> drafts;
+                    std::vector<float> conf;
+                    int acc = 0, next = -1;
+                    if (room > 1 && !m.draft(got.back(), drafts, conf, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    if ((int) drafts.size() > room - 1) drafts.resize((size_t) std::max(0, room - 1));
+                    if (drafts.empty()) {
+                        if (!m.step(got.back(), true, err)) {
+                            std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                            return 1;
+                        }
+                        next = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+                    } else if (!m.verify(got.back(), drafts, 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    got.insert(got.end(), drafts.begin(), drafts.begin() + acc);
+                    got.push_back(next);
+                    offered += (long long) drafts.size();
+                    kept += acc;
+                    ++rounds;
+                }
+                ms_spec += now_ms() - t0;
+            }
+        else {
+            const int share = m.verify_max() / N;
+            const double t0 = now_ms();
+            for (;;) {
+                std::vector<int> sv;
+                for (int i = 0; i < N; ++i)
+                    if ((int) spec_t[(size_t) i].size() < n) sv.push_back(i);
+                if (sv.empty()) break;
+                const int k = (int) sv.size();
+                std::vector<std::vector<int>> rws((size_t) k), drafts((size_t) k);
+                std::vector<const int*> tp((size_t) k);
+                std::vector<int> lens((size_t) k), dsv, dys, dix;
+                for (int j = 0; j < k; ++j) {
+                    const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    if (std::min(share, n - (int) got.size()) > 1) {
+                        dsv.push_back(sv[(size_t) j]);
+                        dys.push_back(got.back());
+                        dix.push_back(j);
+                    }
+                }
+                const int nd = (int) dsv.size();
+                if (pass == 2 && nd > 1 && m.can_draft_multi(dsv.data(), nd)) {
+                    std::vector<std::vector<int>> dd;
+                    std::vector<std::vector<float>> cc;
+                    if (!m.draft_multi(dsv.data(), dys.data(), nd, dd, cc, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (int j = 0; j < nd; ++j) drafts[(size_t) dix[(size_t) j]] = dd[(size_t) j];
+                    ++one_pass;
+                } else
+                    for (int j = 0; j < nd; ++j) {
+                        std::vector<float> conf;
+                        m.seq_bind(dsv[(size_t) j]);
+                        if (!m.draft(dys[(size_t) j], drafts[(size_t) dix[(size_t) j]], conf, err)) {
+                            std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                            return 1;
+                        }
+                    }
+                for (int j = 0; j < k; ++j) {
+                    const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    const int room = std::min(share, n - (int) got.size());
+                    if ((int) drafts[(size_t) j].size() > room - 1) drafts[(size_t) j].resize((size_t) std::max(0, room - 1));
+                    rws[(size_t) j].push_back(got.back());
+                    rws[(size_t) j].insert(rws[(size_t) j].end(), drafts[(size_t) j].begin(), drafts[(size_t) j].end());
+                    tp[(size_t) j] = rws[(size_t) j].data();
+                    lens[(size_t) j] = (int) rws[(size_t) j].size();
+                }
+                if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), k, err)) {
                     std::fprintf(stderr, "multi check: %s\n", err.c_str());
                     return 1;
                 }
-                if ((int) drafts[(size_t) j].size() > room - 1) drafts[(size_t) j].resize((size_t) std::max(0, room - 1));
-                rws[(size_t) j].push_back(got.back());
-                rws[(size_t) j].insert(rws[(size_t) j].end(), drafts[(size_t) j].begin(), drafts[(size_t) j].end());
-                tp[(size_t) j] = rws[(size_t) j].data();
-                lens[(size_t) j] = (int) rws[(size_t) j].size();
-            }
-            if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), k, err)) {
-                std::fprintf(stderr, "multi check: %s\n", err.c_str());
-                return 1;
-            }
-            for (int j = 0; j < k; ++j) {
-                int acc = 0, next = -1;
-                if (!m.verify_multi(j, drafts[(size_t) j], 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
-                    std::fprintf(stderr, "multi check: %s\n", err.c_str());
-                    return 1;
+                for (int j = 0; j < k; ++j) {
+                    int acc = 0, next = -1;
+                    if (!m.verify_multi(j, drafts[(size_t) j], 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    got.insert(got.end(), drafts[(size_t) j].begin(), drafts[(size_t) j].begin() + acc);
+                    got.push_back(next);
+                    offered += (long long) drafts[(size_t) j].size();
+                    kept += acc;
                 }
-                std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
-                got.insert(got.end(), drafts[(size_t) j].begin(), drafts[(size_t) j].begin() + acc);
-                got.push_back(next);
-                offered += (long long) drafts[(size_t) j].size();
-                kept += acc;
+                ++rounds;
             }
-            ++rounds;
+            ms_spec = now_ms() - t0;
         }
-        const double ms_spec = now_ms() - t0;
+        if (pass == 0) ms_spec_alone = ms_spec;
+        bool same_all = true;
         for (int i = 0; i < N; ++i) {
             size_t d = 0;
             while (d < alone[(size_t) i].size() && alone[(size_t) i][d] == spec_t[(size_t) i][d]) ++d;
             const bool same = d == alone[(size_t) i].size();
-            spec_same = spec_same && same;
-            if (!same) std::printf("multi check: conversation %d with the drafter: differs from token %zu on\n", i, d);
+            same_all = same_all && same;
+            if (!same) std::printf("multi check: conversation %d with the drafter (pass %d): differs from token %zu on\n", i, pass, d);
         }
-        std::printf("multi check: %d conversations x %d tokens together with the drafter: tokens the same: %s; %lld "
-                    "rounds, drafts %lld of %lld kept; %.2f tok/s in all (x%.2f over together without)\n",
-                    N, n, spec_same ? "yes" : "NO", rounds, kept, offered,
-                    ms_spec > 0 ? 1000.0 * steps * N / ms_spec : 0.0, ms_spec > 0 ? ms_together / ms_spec : 0.0);
+        spec_same = spec_same && same_all;
+        static const char* const what[3] = {"alone with the drafter", "together, drafts one after another",
+                                            "together, drafts in one pass"};
+        std::printf("multi check: %d conversations x %d tokens %s: tokens the same: %s; %lld rounds%s, drafts %lld of "
+                    "%lld kept; %.2f tok/s in all (x%.2f over together without, x%.2f over alone with the drafter)\n",
+                    N, n, what[pass], same_all ? "yes" : "NO", rounds,
+                    pass == 2 ? (" (" + std::to_string(one_pass) + " drafted in one pass)").c_str() : "", kept, offered,
+                    ms_spec > 0 ? 1000.0 * steps * N / ms_spec : 0.0, ms_spec > 0 ? ms_together / ms_spec : 0.0,
+                    ms_spec > 0 ? ms_spec_alone / ms_spec : 0.0);
     }
     return tokens_same && spec_same && same_rows == rows ? 0 : 1;
 }
