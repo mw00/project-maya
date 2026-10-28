@@ -42,6 +42,7 @@
 #include "ggml-common.h"
 
 #include <algorithm>
+#include <type_traits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1086,6 +1087,167 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const Jobs J) {
         }
 }
 
+// (DS4_Q5K_IMMA) mv_kernel<kQ5_K>'s sums by int8 tensor cores: a block 16 rows x 8 activations (NG groups of 8),
+// mma m16n8k32 a 32-value sub-block for the exact integer dots and a second one against ones for the activations' half
+// sums, then each output's F32 terms exactly as mv_kernel takes them - lane kb % 32's running sum, then warp_sum's tree
+// over the 32 - so the same bits.  Those 32 sums are independent: warp q of the block's 4 keeps the 8 of the
+// super-blocks sb % 4 == q (lanes 8 q + ib) in registers; the tree reads all 32 from shared memory at the end.
+constexpr int kImmaWarps = 4;
+template <int NG>
+__global__ void __launch_bounds__(kImmaWarps * 32) mv_q5k_imma_kernel(const Jobs J) {
+#if !defined(STRATA_USE_HIP) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    extern __shared__ float accs[];   // [lane sum 8 q + ib][output j][NG][lane]: rows g, g + 8 x columns 2 t, 2 t + 1
+    const MvJob& b = J.j[blockIdx.y];
+    const int q = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int r0 = blockIdx.x * 16;
+    if (r0 >= b.n) return;
+    const int nsb = b.k / 32, ra = r0 + g, rb = r0 + g + 8;
+    const uint8_t* wa = b.w + (size_t) (ra < b.n ? ra : r0) * b.ld;   // (a row past n: row r0's bytes, not written)
+    const uint8_t* wb = b.w + (size_t) (rb < b.n ? rb : r0) * b.ld;
+    const uint32_t one_lo = t < 2 ? 0x01010101u : 0u, one_hi = t < 2 ? 0u : 0x01010101u;
+    float4 acc[8][NG];
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib)
+#pragma unroll
+        for (int G = 0; G < NG; ++G) acc[ib][G] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int sb = q; sb < nsb / 8; sb += kImmaWarps) {   // a super-block (8 sub-blocks) a step, its loads first
+        // (thread t takes words 2 t, 2 t + 1 of each sub-block - values 8 t .. 8 t + 7 - in the mma's k slots 4 t and
+        //  16 + 4 t, the activations the same: the integer dot is the same sum in any order)
+        uint32_t hd[2], scw[2][3];
+        uint2 qh[2], qs[2][4];   // rows g, g + 8: d | dmin, scales, this thread's words
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const uint8_t* bl = (r == 0 ? wa : wb) + (size_t) sb * Ty<kQ5_K>::B;
+            const uint4 hdr = *(const uint4*) bl;
+            hd[r] = hdr.x;
+            scw[r][0] = hdr.y;
+            scw[r][1] = hdr.z;
+            scw[r][2] = hdr.w;
+            qh[r] = *(const uint2*) (bl + 16 + 8 * t);
+#pragma unroll
+            for (int pr = 0; pr < 4; ++pr) qs[r][pr] = *(const uint2*) (bl + 48 + 32 * pr + 8 * t);
+        }
+        uint32_t xb[NG][8][2];
+        float xs[NG][8][2];
+#pragma unroll
+        for (int G = 0; G < NG; ++G) {
+            const int cb = G * 8 + g, c0 = G * 8 + 2 * t;
+#pragma unroll
+            for (int ib = 0; ib < 8; ++ib) {
+                const int kb = sb * 8 + ib;
+                xb[G][ib][0] = xb[G][ib][1] = 0;
+                if (cb < b.ncol) {
+                    const int8_t* xp = b.xq + (size_t) cb * b.k + (size_t) kb * 32;
+                    const uint2 xv = *(const uint2*) (xp + 8 * t);
+                    xb[G][ib][0] = xv.x;
+                    xb[G][ib][1] = xv.y;
+                }
+                xs[G][ib][0] = c0 < b.ncol ? b.xd[(size_t) c0 * nsb + kb] : 0.0f;
+                xs[G][ib][1] = c0 + 1 < b.ncol ? b.xd[(size_t) (c0 + 1) * nsb + kb] : 0.0f;
+            }
+        }
+#pragma unroll
+        for (int ib = 0; ib < 8; ++ib) {
+            const int sh = 4 * (ib & 1);
+            uint32_t a[2][2];   // [row][word]: decode<kQ5_K>'s words 2 t, 2 t + 1
+            int sc[2], mi[2];
+            float dd[2], mm[2];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                a[r][0] = ((qs[r][ib >> 1].x >> sh) & 0x0f0f0f0fu) | (((qh[r].x >> ib) & 0x01010101u) << 4);
+                a[r][1] = ((qs[r][ib >> 1].y >> sh) & 0x0f0f0f0fu) | (((qh[r].y >> ib) & 0x01010101u) << 4);
+                uint8_t qb[12];   // (q4k_scale's bytes)
+#pragma unroll
+                for (int i = 0; i < 12; ++i) qb[i] = (uint8_t) (scw[r][i >> 2] >> (8 * (i & 3)));
+                q4k_scale(qb, ib, sc[r], mi[r]);
+                dd[r] = __half2float(__ushort_as_half((uint16_t) (hd[r] & 0xffffu)));
+                mm[r] = __half2float(__ushort_as_half((uint16_t) (hd[r] >> 16))) * (float) mi[r];
+            }
+#pragma unroll
+            for (int G = 0; G < NG; ++G) {
+                int d[4] = {0, 0, 0, 0}, h[4] = {0, 0, 0, 0};   // h: rows < 8 ones on values 0..15 (threads t < 2), the
+                                                                 // others on 16..31
+                asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+                    : "r"(a[0][0]), "r"(a[1][0]), "r"(a[0][1]), "r"(a[1][1]), "r"(xb[G][ib][0]), "r"(xb[G][ib][1]));
+                asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                    : "+r"(h[0]), "+r"(h[1]), "+r"(h[2]), "+r"(h[3])
+                    : "r"(one_lo), "r"(one_hi), "r"(one_lo), "r"(one_hi), "r"(xb[G][ib][0]), "r"(xb[G][ib][1]));
+                auto term = [](float dv, int scv, int dot, float m, int sl, int shi) {   // sub_dot<kQ5_K>'s
+                    const float v = __fmul_rn(dv, (float) (scv * dot));
+                    return __fsub_rn(v, __fadd_rn(__fmul_rn(m, (float) sl), __fmul_rn(m, (float) shi)));
+                };
+                float4& v = acc[ib][G];
+                v.x = fmaf(xs[G][ib][0], term(dd[0], sc[0], d[0], mm[0], h[0], h[2]), v.x);
+                v.y = fmaf(xs[G][ib][1], term(dd[0], sc[0], d[1], mm[0], h[1], h[3]), v.y);
+                v.z = fmaf(xs[G][ib][0], term(dd[1], sc[1], d[2], mm[1], h[0], h[2]), v.z);
+                v.w = fmaf(xs[G][ib][1], term(dd[1], sc[1], d[3], mm[1], h[1], h[3]), v.w);
+            }
+        }
+    }
+#pragma unroll
+    for (int ib = 0; ib < 8; ++ib)
+#pragma unroll
+        for (int G = 0; G < NG; ++G) {
+            float* f = accs + ((size_t) (q * 8 + ib) * 4 * NG + G) * 32 + lane;
+            f[0] = acc[ib][G].x;
+            f[NG * 32] = acc[ib][G].y;
+            f[2 * NG * 32] = acc[ib][G].z;
+            f[3 * NG * 32] = acc[ib][G].w;
+        }
+    __syncthreads();
+    // the tree: warp q the lane's output j = q of each group
+    const int j = q, row = j < 2 ? ra : rb;
+#pragma unroll
+    for (int G = 0; G < NG; ++G) {
+        const int c = G * 8 + 2 * t + (j & 1);
+        if (row >= b.n || c >= b.ncol) continue;
+        float p[32];
+#pragma unroll
+        for (int l = 0; l < 32; ++l) p[l] = accs[(((size_t) l * 4 + j) * NG + G) * 32 + lane];
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1)   // (warp_sum's: lane 0's value after each xor step)
+#pragma unroll
+            for (int l = 0; l < o; ++l) p[l] += p[l + o];
+        const float v = p[0];
+        b.y[c * b.ycs + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+    }
+#else
+    __builtin_trap();   // (never launched: imma_ok)
+#endif
+}
+
+int imma_set = -1;   // (tests: set_imma's value; -1: the environment's)
+// DS4_Q5K_IMMA=N (MAYA_DS4_Q5K_IMMA): Q5_K GEMVs of >= N activations on the tensor cores (0 / unset: off)
+int imma_min_cols() {
+    static const int env = [] {
+        const char* e = std::getenv("STRATA_DS4_Q5K_IMMA");
+        if (e == nullptr) e = std::getenv("DS4_Q5K_IMMA");
+        const int n = e != nullptr ? std::atoi(e) : 0;
+        if (n > 0)
+            std::fprintf(stderr, "ds4: Q5_K GEMVs of >= %d activations on the int8 tensor cores (DS4_Q5K_IMMA)\n", n);
+        return n;
+    }();
+    return imma_set >= 0 ? imma_set : env;
+}
+bool imma_ok(int max_c) {
+#if defined(STRATA_USE_HIP)
+    return false;
+#else
+    const int min_c = imma_min_cols();
+    if (min_c <= 0 || max_c < min_c || max_c > 16) return false;
+    static int cc[16] = {};   // (per device: sm_80 and later)
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
+    if (cc[dev] == 0) {
+        int major = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cc[dev] = major >= 8 ? 1 : -1;
+    }
+    return cc[dev] > 0;
+#endif
+}
+
 // ---------------------------------------------------------------- the prompt sets' light experts
 // A set's experts of a few rows (<= kLightRows: a prompt of a few hundred tokens spreads ~10 over most of 384 experts)
 // in the token kernels' form: each weight sub-block decoded once and dotted with every row's int8 input (rounded per 32
@@ -1428,6 +1590,19 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
 
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+    if constexpr (T == kQ5_K)
+        if (imma_ok(max_c) && std::all_of(J.j, J.j + nj, [](const MvJob& j) {   // (its 16- / 8-byte loads: aligned)
+                return ((uintptr_t) j.w & 15u) == 0 && j.ld % 16 == 0 && ((uintptr_t) j.xq & 7u) == 0;
+            })) {
+            auto go = [&](auto ng) {
+                constexpr int NG = decltype(ng)::value;
+                const dim3 gi((unsigned) ((max_n + 15) / 16), (unsigned) nj);
+                mv_q5k_imma_kernel<NG><<<gi, kImmaWarps * 32, kImmaWarps * 8 * 32 * NG * 16, s>>>(J);
+            };
+            if (max_c <= 8) go(std::integral_constant<int, 1>{});
+            else go(std::integral_constant<int, 2>{});
+            return;
+        }
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) pdl_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) pdl_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
@@ -1435,6 +1610,8 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 }
 
 }  // namespace
+
+void set_imma(int min_cols) { imma_set = min_cols; }
 
 bool supported(int t) { return t != kQ6_K && t != kQ8_0 && block_bytes(t) > 0; }
 bool mv_supported(int t) { return block_bytes(t) > 0; }

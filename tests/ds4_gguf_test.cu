@@ -789,6 +789,50 @@ void test_mv_q(int type, cudaStream_t s) {
     }
 }
 
+// DS4_Q5K_IMMA's Q5_K GEMV on the int8 tensor cores against the dp4a kernel, bit for bit: rows past a tile and fewer
+// than 32 sub-blocks, several lane rounds with a partial tile, and a bias with alpha 0.5, at every activation count 1-16
+void test_mv_imma(cudaStream_t s) {
+    for (const auto& kn : {std::pair<int, int>{768, 136}, std::pair<int, int>{1280, 61}, std::pair<int, int>{5120, 40}}) {
+        const int k = kn.first, n = kn.second, type = gg::iq::kQ5_K;
+        std::vector<uint8_t> wq = q_rand(type, n, k);
+        std::vector<float> x((size_t) k * 16), bias(n);
+        for (auto& v : x) v = frand();
+        for (auto& v : bias) v = frand(0.1f);
+        float *dx = dev(x), *db = dev(bias), *dy = dev(std::vector<float>((size_t) n * 16));
+        uint8_t* dw = dev(wq);
+        x3::Mat m;
+        m.fmt = gg::kFmtGG;
+        m.gg_type = type;
+        m.raw = dw;
+        m.k = k;
+        m.n = n;
+        x3::MvJob j;
+        j.m = &m;
+        j.xf = dx;
+        j.y = dy;
+        j.bias = db;
+        j.alpha = 0.5f;
+        j.xf_cs = k;
+        j.y_cs = n;
+        int bad = 0;
+        for (int nc = 1; nc <= 16; ++nc) {
+            j.ncol = nc;
+            std::vector<float> y[2];
+            for (int on = 0; on < 2; ++on) {
+                gg::iq::set_imma(on);
+                if (!gg::mv(&j, 1, s)) ++g_fail;
+                CU(cudaStreamSynchronize(s));
+                y[on] = host(dy, (size_t) n * nc);
+            }
+            gg::iq::set_imma(0);
+            if (std::memcmp(y[0].data(), y[1].data(), (size_t) n * nc * 4) != 0) ++bad;
+        }
+        if (bad) ++g_fail;
+        std::printf("mv Q5_K %dx%d on tensor cores = dp4a, 1-16 activations %s\n", n, k, bad ? "FAIL" : "ok");
+        cudaFree(dx), cudaFree(db), cudaFree(dy), cudaFree(dw);
+    }
+}
+
 // --parallel's multi step (maya-ds4 Model::step_multi): the rows of several conversations through one mv - each
 // activation's outputs bit for bit its own mv alone, whatever its place among the others (every dense format, every
 // low-bit one; the decode's activation counts)
@@ -2242,6 +2286,69 @@ void test_q5k_host() {
     std::printf("%-52s %s\n", "Q5_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
 }
 
+// the dense GEMVs' cost by activation count (is the per-column part compute / issue time?) - the pack's Q5_K and
+// Q8_0 shapes, us a call for 1 .. 16 activations
+void bench_cols(cudaStream_t s) {
+    cudaEvent_t a, b;
+    cudaEventCreate(&a);
+    cudaEventCreate(&b);
+    auto us = [&](auto&& fn) {
+        fn();
+        CU(cudaStreamSynchronize(s));
+        cudaEventRecord(a, s);
+        for (int i = 0; i < 50; ++i) fn();
+        cudaEventRecord(b, s);
+        CU(cudaEventSynchronize(b));
+        float ms = 0;
+        cudaEventElapsedTime(&ms, a, b);
+        return ms * 1000 / 50;
+    };
+    const std::pair<int, int> shapes[] = {{1280, 32768}, {8192, 5120}, {4096, 1024}, {5120, 1024}, {5120, 129280}};
+    for (int fmt : {gg::kFmtGG, gg::kFmtQ8_0})
+        for (const auto& kn : shapes) {
+            const int k = kn.first, n = kn.second;
+            const size_t bytes = fmt == gg::kFmtGG ? gg::type_row_bytes(gg::iq::kQ5_K, k) * n : gg::q8_row_bytes(k) * n;
+            uint8_t* dw;
+            if (cudaMalloc(&dw, bytes) != cudaSuccess) {   // (a server beside the bench: skip what does not fit)
+                cudaGetLastError();
+                std::printf("cols %6dx%-5d skipped: no memory\n", n, k);
+                continue;
+            }
+            CU(cudaMemset(dw, 0x11, bytes));
+            float *dx = dev(std::vector<float>((size_t) k * 16, 0.01f)), *dy = dev(std::vector<float>((size_t) n * 16));
+            x3::Mat m;
+            m.fmt = fmt;
+            m.gg_type = gg::iq::kQ5_K;
+            m.raw = dw;
+            m.k = k;
+            m.n = n;
+            x3::MvJob j;
+            j.m = &m;
+            j.xf = dx;
+            j.xf_cs = k;
+            j.y = dy;
+            j.y_cs = n;
+            // (Q5_K: the dp4a kernel / the tensor cores' (DS4_Q5K_IMMA) back to back at each count - the clocks drift)
+            std::printf("cols %s %6dx%-5d (%.1f MB, %.1f us at 1.68 TB/s)", fmt == gg::kFmtGG ? "Q5_K" : "Q8_0", n, k,
+                        bytes / 1e6, bytes / 1.68e6);
+            for (int nc : {1, 2, 3, 4, 5, 6, 8, 16}) {
+                j.ncol = nc;
+                gg::iq::set_imma(0);
+                const float t0 = us([&] { gg::mv(&j, 1, s); });
+                if (fmt != gg::kFmtGG) {
+                    std::printf("  %d:%.1f", nc, t0);
+                    continue;
+                }
+                gg::iq::set_imma(1);
+                const float t1 = us([&] { gg::mv(&j, 1, s); });
+                gg::iq::set_imma(0);
+                std::printf("  %d:%.1f/%.1f", nc, t0, t1);
+            }
+            std::printf(" us\n");
+            cudaFree(dw), cudaFree(dx), cudaFree(dy);
+        }
+}
+
 // ---------------------------------------------------------------- a group of two's chunk all-reduce (ds4_kernels.cu)
 // Two GPUs, a thread and a stream each, the rows and flags host-mapped as maya-ds4's hmap leaves them (mapped,
 // portable, zeroed).  allreduce as before (xfer_put + ar_sum_kernel) and DS4_AR2 1 / 2 (ar2_kernel), interleaved on one
@@ -2400,6 +2507,16 @@ int main(int argc, char** argv) {
         bench_q(s);
         return 0;
     }
+    if (argc >= 2 && std::strcmp(argv[1], "--imma") == 0) {   // DS4_Q5K_IMMA's Q5_K GEMV: = dp4a, then its speed
+        test_mv_imma(s);
+        bench_cols(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--bench-cols") == 0) {
+        bench_cols(s);
+        return 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--bench-q") == 0) {   // [a type name's part: those pairs' token experts]
         bench_q(s, argc >= 3 ? argv[2] : nullptr);
         return 0;
@@ -2444,6 +2561,7 @@ int main(int argc, char** argv) {
     test_decode_values(s);
     test_f16_rows(s);
     for (int t : kQTypes) test_mv_q(t, s);
+    test_mv_imma(s);
     test_mv_rows(s);
     for (const auto& pr : kQPairs) test_experts_q(512, 256, pr.first, pr.second, s);
     test_lanes(s);

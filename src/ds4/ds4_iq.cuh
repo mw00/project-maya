@@ -145,6 +145,9 @@ struct MvJob {
     float alpha = 1.0f;
 };
 bool mv(const MvJob* jobs, int n, cudaStream_t s);
+/// (tests) DS4_Q5K_IMMA's value: Q5_K GEMVs of at least min_cols activations on the int8 tensor cores (0: off) - the
+/// same bits as the dp4a kernel
+void set_imma(int min_cols);
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m), tile = the prompt tiles' loader (F32,
