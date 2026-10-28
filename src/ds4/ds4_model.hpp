@@ -80,6 +80,16 @@ struct PicMark {
     uint64_t len = 0;
 };
 
+/// A prompt's run of chunks planned once and read in parts (Model::feed_plan / feed_part): where it starts, its tokens,
+/// the logits and checkpoint its last part takes, where each chunk ends (tokens from the run's start), and the prompt
+/// skip's cut (its first layer, -1 none; the chunk and row the cut is at) - as one call plans them
+struct FeedPlan {
+    int64_t at = -1;
+    int n = 0, logits_rows = 0, slot = -1;
+    std::vector<int> ends;
+    int skip = -1, cut_k = 0, cut_r = 0;
+};
+
 struct Stats {
     int64_t tokens = 0;
     int64_t experts = 0, cpu_experts = 0;   // routed experts run, and how many of them on the CPU lane
@@ -167,6 +177,16 @@ public:
     /// Tokens a feed call takes at a time to use the chunked prompt path (all of a prompt: its chunks run as a
     /// pipeline; 16 without it).
     int feed_unit() const;
+    /// A prompt read in parts of whole chunks (--parallel: the other conversations decode between them).  feed_plan()
+    /// plans the next n tokens at pos() as feed() (slot < 0) or feed_mark(..., slot) would read them in one call - the
+    /// path, the chunks and the prompt skip's cut decided once, over all n - and is false where that call is not a run
+    /// of two chunks or more (feed them in one call then).  feed_part() feeds the plan's chunks [k0, k1) (`tokens`: the
+    /// run's n, from its start; pos() where chunk k0 starts), each as that one call reads it; the part with the last
+    /// chunk takes the logits and keeps the checkpoint before the last token.  The parts in order leave the state one
+    /// call leaves.  Between two parts other conversations may be bound, stepped and fed; a Stop in a part, or between
+    /// two, leaves the state past the run's start unusable, as a stopped feed does.
+    bool feed_plan(int n, int logits_rows, int slot, FeedPlan& plan);
+    bool feed_part(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err);
     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
     void set_progress(std::function<void(int64_t)> f);
     /// Asked while a run of chunks goes through the layers: true (a Stop) ends it early - one GPU after the layer it is

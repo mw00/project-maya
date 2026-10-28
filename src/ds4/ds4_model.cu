@@ -15377,9 +15377,13 @@ struct Model::Impl {
             c.buffered = run_n <= buf_max;
             if (!c.fl_layers.empty()) {
                 // A group starting at the YOCO source has only KV work before the cut: no flow_layer to advance it.
+                // (A part of a prompt's run read before its cut, Model::feed_part: no chunk of it past the cut, so
+                // nothing for such a group to stream.)
                 const int il = c.fl_layers[0], k = run.yoco >= 0 && il >= run.yoco ? run.cut_k : 0;
-                flow_spec(c, k, il, fl_rows(c, k, il));
-                if (!flow_pump(c, err)) return false;
+                if (k < nk) {
+                    flow_spec(c, k, il, fl_rows(c, k, il));
+                    if (!flow_pump(c, err)) return false;
+                }
             }
             if (c.lm) return run_dev_layers(di, run, err, stream_start);
         }
@@ -16342,34 +16346,23 @@ struct Model::Impl {
         return yl;
     }
 
-    // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
-    // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
-    bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
-        if (lend_broken) {
-            err = kLendBroken;
-            return false;
-        }
-        if (n < 1) return true;
-        if (pos + n > o.max_context) {
-            err = "the context is full";
-            return false;
-        }
-        for (int t = 0; t < n; ++t)
-            if (tk[t] < 0 || tk[t] >= g.vocab) {
-                err = "token " + std::to_string(tk[t]) + " out of range";
-                return false;
-            }
-        // a long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
-        // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
-        // layer before - so they need their own work only on the last keep = (nl - yoco) (win - 1) + win rows for the
-        // run's last rows and the rings the decode reads to be what the full work gives (up to the experts' summing
-        // order).  The chunks stay as they are: the ones before the cut go through the layers before yoco and its
-        // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
-        // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
-        // skip.  On several GPUs the rows before the cut and the rows from it on are chunked apart (the cut a chunk's
-        // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, or one
-        // tensor-parallel group under DS4_YOCO_TP (yoco_tp_group), as on one GPU.  DS4_YOCO=1 (0: off); not with every
-        // row's logits (tests)
+    // the chunks and the prompt skip of a run of n tokens: where each chunk ends (from the run's start) and the skip's
+    // cut - one call's plan, and its parts' (Model::feed_part) alike, so the parts read the chunks one call reads.
+    // A long prompt's skip: the layers from yoco_layer() on (V4.1: 20-39) read the earlier positions only through
+    // that layer's compressed KV and index keys, and each looks back one window (win - 1 positions) more than the
+    // layer before - so they need their own work only on the last keep = (nl - yoco) (win - 1) + win rows for the
+    // run's last rows and the rings the decode reads to be what the full work gives (up to the experts' summing
+    // order).  The chunks stay as they are: the ones before the cut go through the layers before yoco and its
+    // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
+    // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
+    // skip.  On several GPUs the rows before the cut and the rows from it on are chunked apart (the cut a chunk's
+    // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, or one
+    // tensor-parallel group under DS4_YOCO_TP (yoco_tp_group), as on one GPU.  DS4_YOCO=1 (0: off); not with every
+    // row's logits (tests)
+    void plan_chunks(int n, int logits_rows, FeedPlan& fp) {
+        fp.ends.clear();
+        fp.skip = -1;
+        fp.cut_k = fp.cut_r = 0;
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
         // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
         //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
@@ -16387,35 +16380,82 @@ struct Model::Impl {
                              L[0].nm, devs[(size_t) L[0].dev].id, yl, g.nl - 1);
             said = true;
         }
-        Run run;
         int per = 0;   // (the widest chunk)
         auto part = [&](int a0, int a1) {   // rows [a0, a1) in equal chunks of at most `chunk`
             if (a1 <= a0) return;
             const int nc = (a1 - a0 + chunk - 1) / chunk, w = (a1 - a0 + nc - 1) / nc;
-            for (int x = a0; x < a1; x += w) {
-                run.p0.push_back(pos + x);
-                run.T.push_back(std::min(w, a1 - x));
-                run.seq.push_back(++win_seq);
-            }
+            for (int x = a0; x < a1; x += w) fp.ends.push_back(std::min(x + w, a1));
             per = std::max(per, w);
         };
         if (a > 0 && !cut_rows) {
             part(0, a);
-            run.yoco = yl;
-            run.cut_k = (int) run.T.size();
-            run.cut_r = 0;
+            fp.skip = yl;
+            fp.cut_k = (int) fp.ends.size();
+            fp.cut_r = 0;
             part(a, n);
         } else {
             part(0, n);
             if (a > 0) {
-                run.yoco = yl;
-                run.cut_k = a / per;
-                run.cut_r = a - run.cut_k * per;
+                fp.skip = yl;
+                fp.cut_k = a / per;
+                fp.cut_r = a - fp.cut_k * per;
             }
         }
-        if (run.yoco >= 0 && o.verbose)
+        if (fp.skip >= 0 && o.verbose)
             std::fprintf(stderr, "ds4: prompt skip: layers %d-%d from CUDA%d, %d early rows KV-only, %d kept\n",
                          yl, g.nl - 1, devs[(size_t) L[(size_t) yl].dev].id, a, n - a);
+    }
+
+    // n tokens at positions pos .. in chunks of equal size (at most `chunk`), pipelined over the groups; the logits of
+    // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits).
+    // whole (Model::feed_part): the n tokens are chunks [k0, k1) of that plan, read as its one call reads them - the
+    // same chunks, the skip's cut where the whole run has it, the buffers laid out for its widest chunk
+    bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1,
+                        const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0) {
+        if (lend_broken) {
+            err = kLendBroken;
+            return false;
+        }
+        if (n < 1) return true;
+        if (pos + n > o.max_context) {
+            err = "the context is full";
+            return false;
+        }
+        for (int t = 0; t < n; ++t)
+            if (tk[t] < 0 || tk[t] >= g.vocab) {
+                err = "token " + std::to_string(tk[t]) + " out of range";
+                return false;
+            }
+        FeedPlan own;
+        if (whole == nullptr) {
+            plan_chunks(n, logits_rows, own);
+            k0 = 0;
+            k1 = (int) own.ends.size();
+        }
+        const FeedPlan& fp = whole != nullptr ? *whole : own;
+        if (k0 < 0 || k1 <= k0 || k1 > (int) fp.ends.size() ||
+            fp.ends[(size_t) k1 - 1] - (k0 > 0 ? fp.ends[(size_t) k0 - 1] : 0) != n) {
+            err = "a part of a prompt's chunks that is not the plan's";
+            return false;
+        }
+        const int x0 = k0 > 0 ? fp.ends[(size_t) k0 - 1] : 0;
+        const bool run_end = k1 == (int) fp.ends.size();   // (the run's last chunk: one call's, or its last part)
+        Run run;
+        int per = 0;   // (the widest chunk, of the whole run)
+        for (size_t k = 0; k < fp.ends.size(); ++k) per = std::max(per, fp.ends[k] - (k > 0 ? fp.ends[k - 1] : 0));
+        for (int k = k0; k < k1; ++k) {
+            const int b0 = k > 0 ? fp.ends[(size_t) k - 1] : 0;
+            run.p0.push_back(pos + (b0 - x0));
+            run.T.push_back(fp.ends[(size_t) k] - b0);
+            run.seq.push_back(++win_seq);
+        }
+        // (a part: the chunks before the cut skip as the whole run's do, the cut's chunk is cut where it is; past it
+        //  no skip)
+        if (fp.skip >= 0 && k0 <= fp.cut_k) {
+            run.yoco = fp.skip;
+            run.cut_k = std::min(fp.cut_k, k1) - k0;
+            run.cut_r = fp.cut_k < k1 ? fp.cut_r : 0;
+        }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
         for (int t = 0; t < n; ++t) {
@@ -16701,7 +16741,8 @@ struct Model::Impl {
                              devs[di].id, (unsigned long long) c.chk_n, (unsigned long long) c.it_helper);
             }
         flow_check_now = false;
-        if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
+        // (the picks' spread for pick_path: the CPU-lane experts this run picked - a prompt's own run, not a part)
+        if (pm.on && run.T.size() == 1 && whole == nullptr) {
             bool tp = false;
             for (const Layer& l : L) tp = tp || l.nm > 1;
             double picked = 0;
@@ -16714,9 +16755,11 @@ struct Model::Impl {
         pos += n;
         st.tokens += n;
         cache_tick(n);
-        warm_after(n);
+        // (a part with more to come: the next part reads on, and the last one seeds the drafter - its last chunk's
+        //  taps, as one call's; a part before the skip's cut never reaches the layers they are taken at)
+        if (run_end) warm_after(n);
         const int nr = std::min(T_last, tap_cap);
-        if (!seed_drafter(pos - nr, nr, 0, err)) return false;
+        if (run_end && !seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
             // the next feed seeds them again from its own rows, past this position)
             Check& ckp = ck[snap_slot & 1];
@@ -18420,6 +18463,44 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     return ok;
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
+bool Model::feed_plan(int n, int logits_rows, int slot, FeedPlan& plan) {
+    Impl& p = *p_;
+    plan = FeedPlan{};
+    // (the path feed() / feed_mark() would take: windows - or every row's logits - stay one call; then the flow's
+    //  chunks, two or more of them)
+    if (p.lend_broken || p.chunk <= 0 || n < std::max(2, p.chunk_min) || logits_rows > kWin) return false;
+    const bool flow = p.pick_path(n);
+    p.pm.last = -1;   // (no path_done for a read in parts: its parts' times are not one call's)
+    if (!flow) return false;
+    p.plan_chunks(n, logits_rows, plan);
+    if (plan.ends.size() < 2) {
+        plan = FeedPlan{};
+        return false;
+    }
+    plan.at = p.pos;
+    plan.n = n;
+    plan.logits_rows = logits_rows;
+    plan.slot = slot;
+    return true;
+}
+bool Model::feed_part(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err) {
+    Impl& p = *p_;
+    const int nk = (int) plan.ends.size();
+    if (plan.at < 0 || k0 < 0 || k1 <= k0 || k1 > nk) {
+        err = "feed_part: chunks the plan does not have";
+        return false;
+    }
+    const int a = k0 > 0 ? plan.ends[(size_t) k0 - 1] : 0, b = plan.ends[(size_t) k1 - 1];
+    if (p.pos != plan.at + a) {
+        err = "feed_part: the conversation is not where the part starts";
+        return false;
+    }
+    p.main_at.store("reading a prompt", std::memory_order_relaxed);
+    p.pm.last = -1;
+    p.halted = false;
+    const bool last = k1 == nk;
+    return p.forward_chunks(tokens + a, b - a, last ? plan.logits_rows : 0, err, last ? plan.slot : -1, &plan, k0, k1);
+}
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
 bool Model::cancelled() const { return p_->halted; }

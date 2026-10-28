@@ -2119,6 +2119,112 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
     return tokens_same && spec_same && same_rows == rows ? 0 : 1;
 }
 
+// --parts-check (tests): the --ids prompt read as the server reads it - in one call (feed_mark: the last row's logits,
+// the checkpoint before the last token) - then again in parts of one chunk (Model::feed_plan / feed_part), with
+// --parallel 2 or more another conversation read and stepped between every two parts, as a prompt read beside a
+// running request.  The last row's logits must be the same bit for bit, the n greedy tokens after them the same, and
+// the state before the last token too (the last token stepped again from that checkpoint: the same logits).
+// (--no-expert-cache keeps the experts where the load put them, so the flow sums a chunk's experts in the same order
+// in both reads.)
+int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
+    std::string err;
+    const int N = (int) ids.size();
+    if (N < 2) {
+        std::fprintf(stderr, "parts check: --ids needs two tokens at least\n");
+        return 2;
+    }
+    struct Read {
+        std::vector<float> last, again;
+        std::vector<int> toks;
+        int parts = 0;
+    };
+    // the other conversation: its prompt (the --ids' first 300 tokens at most) read at the first pause, a greedy step
+    // at each one after
+    const bool beside = m.seq_count() > 1;
+    const std::vector<int> other(ids.begin(), ids.begin() + std::min(N - 1, 300));
+    int other_tok = -1, other_steps = 0;
+    const auto pause = [&]() -> bool {
+        if (!beside) return true;
+        m.seq_bind(1);
+        bool ok = true;
+        if (other_tok < 0) {
+            m.reset();
+            ok = m.feed(other.data(), (int) other.size(), 1, err);
+        } else {
+            ok = m.step(other_tok, true, err);
+            ++other_steps;
+        }
+        if (ok) other_tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+        m.seq_bind(0);
+        return ok;
+    };
+    const auto read = [&](bool in_parts, Read& rd) -> bool {
+        m.seq_bind(0);
+        m.reset();
+        if (!in_parts) {
+            if (!m.feed_mark(ids.data(), N, 1, 1, err)) return false;
+            rd.parts = 1;
+        } else {
+            strata::ds4::FeedPlan plan;
+            if (!m.feed_plan(N, 1, 1, plan)) {
+                err = "the prompt is not a run of two chunks or more here (a longer --ids, or a smaller "
+                      "--prefill-chunk)";
+                return false;
+            }
+            const int nk = (int) plan.ends.size();
+            for (int k = 0; k < nk; ++k) {
+                if (!m.feed_part(plan, ids.data(), k, k + 1, err)) return false;
+                if (k + 1 < nk && !pause()) return false;
+            }
+            rd.parts = nk;
+        }
+        if (!m.logits(rd.last)) {
+            err = "no logits";
+            return false;
+        }
+        int tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+        rd.toks.push_back(tok);
+        for (int k = 1; k < n; ++k) {
+            if (!m.step(tok, true, err)) return false;
+            tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+            rd.toks.push_back(tok);
+        }
+        // the checkpoint the prompt's end kept, before its last token: back there, and the last token again
+        if (!m.restore(N - 1) || m.pos() != N - 1) {
+            err = "the checkpoint before the prompt's last token is not there";
+            return false;
+        }
+        if (!m.step(ids.back(), true, err) || !m.logits(rd.again)) {
+            if (err.empty()) err = "no logits";
+            return false;
+        }
+        return true;
+    };
+    Read one, parts;
+    if (!read(false, one) || !read(true, parts)) {
+        std::fprintf(stderr, "parts check: %s\n", err.c_str());
+        return 1;
+    }
+    const auto diff = [](const std::vector<float>& a, const std::vector<float>& b, bool& same) {
+        same = a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+        double d = 0;
+        for (size_t i = 0; i < std::min(a.size(), b.size()); ++i) d = std::max(d, (double) std::fabs(a[i] - b[i]));
+        return d;
+    };
+    bool same_last = false, same_again = false;
+    const double d_last = diff(one.last, parts.last, same_last), d_again = diff(one.again, parts.again, same_again);
+    size_t t = 0;
+    while (t < one.toks.size() && t < parts.toks.size() && one.toks[t] == parts.toks[t]) ++t;
+    const bool same_toks = t == one.toks.size() && t == parts.toks.size();
+    std::printf("parts check: %d prompt tokens in one call and in %d parts%s: the last row's logits %s (max |d| %.3g); "
+                "the state before the last token %s (max |d| %.3g); %d greedy tokens %s\n",
+                N, parts.parts, beside ? (", another conversation stepped " + std::to_string(other_steps) +
+                                          " times between them").c_str() : "",
+                same_last ? "bit for bit" : "DIFFER", d_last, same_again ? "bit for bit" : "DIFFERS", d_again, n,
+                same_toks ? "the same" : ("differ from token " + std::to_string(t) + " on").c_str());
+    return same_last && same_again && same_toks ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2166,7 +2272,7 @@ int main(int argc, char** argv) {
     bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
-    bool serve_mode = false, multi_check = false;
+    bool serve_mode = false, multi_check = false, parts_check = false;
     std::string images, enc_rgb, enc_out;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
@@ -2237,6 +2343,7 @@ int main(int argc, char** argv) {
         else if (a == "--serve") serve_mode = true;
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
+        else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
             usage();
@@ -2246,6 +2353,10 @@ int main(int argc, char** argv) {
             usage();
             return 2;
         }
+    }
+    if (parts_check && ids_s.empty()) {
+        std::fprintf(stderr, "--parts-check needs --ids (a prompt of two chunks or more)\n");
+        return 2;
     }
     if (multi_check && (o.seqs < 2 || ids_s.empty())) {
         std::fprintf(stderr, "--multi-check needs --parallel 2..8 and --ids\n");
@@ -2274,6 +2385,7 @@ int main(int argc, char** argv) {
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
     if (multi_check) return check_multi(m, parse_ids(ids_s), std::max(2, n));
+    if (parts_check) return check_parts(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;
