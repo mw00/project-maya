@@ -757,6 +757,21 @@ measured choice as before. The log says `ds4: CPU lane IQ1_S rows: ours without 
 | --- | --- | --- |
 | `DS4_IQ1_PDEP` | `0` on AMD family 17h / Hygon, else `1` | `0`: the rows without `pdep` on any CPU (tests: `ds4_iq1_rows_test` checks them against ggml-cpu); `1`: the measured choice (ggml-cpu's dot for a single token) |
 
+## DeepSeek: IQ1_S, IQ1_M and IQ2_S experts on the GPU
+
+IQ1_S, IQ1_M and IQ2_S decode through a codebook of 8 KiB, which the GPU kernels copy into each block's shared memory
+before the block reads its weights - for a decoded token's few experts nearly as much as the weights themselves. On
+CUDA the kernels of these three types for a token's and a verify window's experts, and for a prompt's experts of at
+most 4 rows, run only as many blocks as the GPU holds at once: each loads the codebook once, then takes one tile of
+rows after another. IQ1_M's codes then come from a table of 4096 entries (the grid value and its 1/8 shift in one
+lookup). Each output is summed by the same lanes in the same order as before, so the answers are the same bits
+(`ds4_gguf_test --persist` checks this on a GPU; `ds4_iq_host_test` checks the table against ggml without one). The
+other types, MiniMax's kernels and AMD (HIP) are unchanged.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_IQ_PERSIST` | on (CUDA) | `0`: the full grids for IQ1_S / IQ1_M / IQ2_S as before (a block a tile, each loading the codebook); the same answers. `DS4_IQ_RP=4` or `DS4_IQ_AHEAD=1` also keep the full grids for the IQ1 types' token kernels |
+
 ## DeepSeek: IQ4_NL experts
 
 A pack whose experts are IQ4_NL (ggml type 20, blocks of 32 values) loads: the GPU kernels take them on every path

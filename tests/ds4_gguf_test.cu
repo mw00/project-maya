@@ -3,12 +3,13 @@
 // aligned or not), the token experts (gate / up / swiglu / down / combine, experts off the device, the CPU part, the
 // shared expert), a window's grouped experts (bit for bit the token path's), the prompt path's expert sets and the CPU
 // lane's rows - for MXFP4 and every low-bit type (IQ1_S .. Q6_K, IQ4_NL; their decode equal to ggml's dequantize_row_*
-// on random blocks), and layers that put MXFP4 beside a low-bit role; the PCIe lane's streamed experts (bit for bit
-// the VRAM ones'); and the KV caches' packed rows
+// on random blocks), and layers that put MXFP4 beside a low-bit role; the large codebooks' persistent grids (bit for
+// bit the full grids'); the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
 // ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ar <device> <device> [rows]
 // (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times) | --trims (the decode trims alone:
-// test_decode_trims) | --devices (every GPU in one process: each one's default stream and its own, bit for bit)
+// test_decode_trims) | --persist (the persistent grids alone) | --devices (every GPU in one process: each one's default
+// stream and its own, bit for bit)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <utility>
 #include <vector>
 
 namespace gg = strata::ds4::gguf;
@@ -719,9 +721,17 @@ void test_f16_rows(cudaStream_t s) {
 }
 
 // every low-bit type's decode against ggml's own dequantize_row_* on random blocks: the token / window / light
-// kernels' codes times their scales, and the prompt tiles' loader - each value equal to ggml's (a zero's sign aside)
+// kernels' codes times their scales, and the prompt tiles' loader - each value equal to ggml's (a zero's sign aside);
+// IQ1_M with the persistent kernels on (its code table) and off (the grid)
 void test_decode_values(cudaStream_t s) {
+    std::vector<std::pair<int, int>> runs;   // (type, set_persist's: -1 the environment's)
     for (int t : kQTypes) {
+        if (t != gg::iq::kIQ1_M) runs.push_back({t, -1});
+        else runs.push_back({t, 0}), runs.push_back({t, 1});
+    }
+    for (const auto& [t, pm] : runs) {
+        gg::iq::set_persist(pm);
+        const bool table = t == gg::iq::kIQ1_M && gg::iq::persist_on();
         const int k = 2048, n = 40;
         const std::vector<uint8_t> w = q_rand(t, n, k);
         std::vector<float> want((size_t) n * k);
@@ -742,7 +752,7 @@ void test_decode_values(cudaStream_t s) {
         const bool ok = ran && bs == 0 && bt == 0;
         if (!ok) ++g_fail;
         char what[96];
-        std::snprintf(what, sizeof what, "decode %s = ggml's dequantize_row", tn(t));
+        std::snprintf(what, sizeof what, "decode %s%s = ggml's dequantize_row", tn(t), table ? " (code table)" : "");
         if (ok) std::printf("%-44s ok    %d values, kernels and tiles\n", what, n * k);
         else
             std::printf("%-44s FAIL  %s%zu kernel / %zu tile values differ (first at %zu: %.9g / %.9g vs %.9g)\n", what,
@@ -750,6 +760,7 @@ void test_decode_values(cudaStream_t s) {
                         at < want.size() ? gt[at] : 0.0f, at < want.size() ? want[at] : 0.0f);
         cudaFree(dw), cudaFree(dsub), cudaFree(dtile);
     }
+    gg::iq::set_persist(-1);
 }
 
 void test_mv_q(int type, cudaStream_t s) {
@@ -1323,6 +1334,35 @@ bool same_bits(const std::vector<float>& a, const std::vector<float>& b) {
     return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
 }
 
+// the persistent grids (DS4_IQ_PERSIST): the large-codebook types (IQ1_S, IQ1_M, IQ2_S) in either role with them and
+// with the full grids, every output bit for bit the same (the token experts, the window, the light sets of <= 4 and
+// <= 12 rows)
+void test_persist(cudaStream_t s) {
+    struct P {
+        int tg, td, D, F;
+    };
+    const P cases[] = {{gg::iq::kIQ1_M, gg::iq::kIQ1_S, 1024, 512}, {gg::iq::kIQ1_S, gg::iq::kIQ1_M, 1024, 512},
+                       {gg::iq::kIQ2_S, gg::iq::kIQ1_M, 1024, 512}, {gg::iq::kIQ1_M, gg::iq::kIQ2_S, 1024, 512},
+                       {gg::iq::kIQ2_S, gg::kTypeMXFP4, 1024, 512}, {gg::iq::kIQ1_M, gg::iq::kIQ1_S, 5120, 2304}};
+    for (const P& c : cases) {
+        QExperts E = make_q(c.D, c.F, 10, c.tg, c.td);
+        gg::iq::set_persist(0);
+        const std::vector<float> full = iq_outputs(E, E.dev, s);
+        gg::iq::set_persist(1);
+        const bool on = gg::iq::persist_on();
+        const std::vector<float> pers = iq_outputs(E, E.dev, s);
+        gg::iq::set_persist(-1);
+        const bool same = same_bits(full, pers);
+        if (!same) ++g_fail;
+        char what[96];
+        std::snprintf(what, sizeof what, "persistent grids %s/%s (D %d, F %d)", tn(c.tg), tn(c.td), c.D, c.F);
+        std::printf("%-52s %s\n", what, !on ? "skip  (not on this platform)"
+                                     : same ? "ok    bit for bit the full grids' (token, window, light sets)"
+                                            : "FAIL  differs from the full grids'");
+        cudaFree(E.dev);
+    }
+}
+
 // --devices: every GPU in this process - a low-bit layer's token experts, window and light sets on each one's default
 // stream (one handle on every device: the light sets' scratch and the tensor-core check are the device's own) and on a
 // stream of its own, bit for bit the same; and, between GPUs of one compute capability, the same as the first one's
@@ -1438,12 +1478,28 @@ void bench_q(cudaStream_t s, const char* only = nullptr) {
             next();
             gg::moe_down(ma, dh, nullptr, dout, s);
         });
+        {   // one of the 6 picks on the device (the others the CPU lane's): the grid mostly empty groups
+            std::vector<unsigned long long> p1(pp);
+            for (int c = 0; c < NS; ++c)
+                for (int i = 1; i < 6; ++i) p1[(size_t) c * 8 + i] = 0ull;
+            unsigned long long* dp1 = dev(p1);
+            unsigned long long* keep = dpp;
+            dpp = dp1;
+            timed("  1 of the 6 on the device (gate/up + down)", (gu + dn) / 6, [&] {
+                next();
+                gg::moe_gate_up(ma, dx, dh, s);
+                gg::moe_down(ma, dh, nullptr, dout, s);
+            });
+            dpp = keep;
+            cudaFree(dp1);
+        }
         cudaFree(E.dev), cudaFree(big), cudaFree(dpp), cudaFree(dpw), cudaFree(dx), cudaFree(dh), cudaFree(dout);
     }
     if (only != nullptr) return;
     // the prompt path's sets: 32 experts x R rows (128: an 8K chunk's share of 384 experts; 8: a short prompt's - the
-    // weights' bandwidth), the MXFP4 ones first
-    for (int R : {128, 8}) {
+    // weights' bandwidth; 2: a draft's verify - the light sets of <= 4 rows, persistent for the large codebooks), the
+    // MXFP4 ones first
+    for (int R : {128, 8, 2}) {
         const int NE = 32;
         for (int pi = -1; pi < (int) (sizeof(kQPairs) / sizeof(kQPairs[0])); ++pi) {
             x3::ExpertLayout lay;
@@ -2898,6 +2954,12 @@ int main(int argc, char** argv) {
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }
+    if (argc >= 2 && std::strcmp(argv[1], "--persist") == 0) {   // the persistent grids alone (and IQ1_M's decode)
+        test_persist(s);
+        test_decode_values(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--devices") == 0) {   // every GPU, each one's default stream and its own
         // (plain launches on the legacy default stream, unless DS4_PDL says otherwise)
 #ifdef _WIN32
@@ -2927,6 +2989,7 @@ int main(int argc, char** argv) {
     test_mv_rows(s);
     test_decode_trims(s);
     for (const auto& pr : kQPairs) test_experts_q(512, 256, pr.first, pr.second, s);
+    test_persist(s);
     test_lanes(s);
     if (argc >= 3) {
         test_experts(std::atoi(argv[1]), std::atoi(argv[2]), s);
