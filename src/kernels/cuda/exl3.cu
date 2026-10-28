@@ -671,8 +671,10 @@ struct KMoe {
     int k, n_embd, n_ff;
     float limit;
     const int* skip;     // set_skip's flag (nullptr: none)
-    float* xp;           // gS / dS > 1: the input splits' partial sums (xsplit)
+#if defined(STRATA_USE_HIP)
+    float* xp;           // gS / dS > 1: the input splits' partial sums (xsplit, AMD)
     int gS, gkr, dS, dkr;   // gate / up and down: the input splits and their width (1, the whole input: none)
+#endif
 };
 
 // the pieces the token's experts (moe_*_kernel) and a window's grouped experts (win_*_kernel) share, so each window
@@ -718,6 +720,7 @@ __device__ __forceinline__ float combine(const float* plan_w, const float* p, in
     if (cpu_part != nullptr) m = __fadd_rn(m, *cpu_part);
     return __fadd_rn(m, sh);
 }
+#if defined(STRATA_USE_HIP)
 // an input split's sums for one output in split order (p: split 0's, the next split's `stride` floats on), the loads
 // 8 at a time ahead of their adds
 __device__ __forceinline__ float split_sum(const float* p, int S, size_t stride) {
@@ -738,6 +741,7 @@ template <class Row>
 __device__ __forceinline__ void split_store(const float* out, int nc, Row row) {
     for (int i = threadIdx.x; i < nc * kCols; i += kThreads) row(i / kCols)[i % kCols] = out[i];
 }
+#endif
 
 // grid (n_ff / 128, k, 2): expert blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values; the pair's
 // second block to finish turns them into the clamped swiglu, in h
@@ -745,7 +749,11 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
+#if defined(STRATA_USE_HIP)
     const int ei = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
+#else
+    const int ei = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
+#endif
     const unsigned long long ptr = a.plan_ptr[ei];
     if (ptr == 0ull) return;
     if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
@@ -753,12 +761,17 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
     const int warp = threadIdx.x >> 5;
     Xin x;
     x.f = a.x;
+#if defined(STRATA_USE_HIP)
     block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                       min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), 1, sm);
     if (a.gS > 1) {   // (moe_gu_red_kernel)
         split_store(sm.out, 1, [&](int) { return a.xp + (((size_t) ei * 2 + r) * a.gS + sp) * a.n_ff + g * kCols; });
         return;
     }
+#else
+    block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                      (const uint16_t*) (blob + a.suh[r]), 1, sm);
+#endif
     const size_t row = (size_t) ei * a.n_ff + g * kCols;
     if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[r]) + g * kCols, (r == 0 ? a.h : a.u) + row);
     if (!pair_last(a.cnt_gu + ei * (a.n_ff / kCols) + g, last)) return;
@@ -773,22 +786,30 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
-    const int ei = blockIdx.y, g = blockIdx.x, sp = blockIdx.z;
+    const int ei = blockIdx.y, g = blockIdx.x;
     const unsigned long long ptr = a.plan_ptr[ei];
     const int warp = threadIdx.x >> 5;
     float* part = a.part + (size_t) ei * a.n_embd + g * kCols;
     if (a.skip != nullptr && *a.skip) return;   // a skipped token (set_skip, as mv_kernel)
+#if defined(STRATA_USE_HIP)
+    const int sp = blockIdx.z;
     if (a.dS > 1 && ptr == 0ull) return;        // (moe_down_red_kernel writes its zeros)
+#endif
     if (ptr != 0ull) {
         const uint8_t* blob = (const uint8_t*) ptr;
         Xin x;
         x.f = a.h + (size_t) ei * a.n_ff;
+#if defined(STRATA_USE_HIP)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
                           min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), 1, sm);
         if (a.dS > 1) {
             split_store(sm.out, 1, [&](int) { return a.xp + ((size_t) ei * a.dS + sp) * a.n_embd + g * kCols; });
             return;
         }
+#else
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                          (const uint16_t*) (blob + a.suh[2]), 1, sm);
+#endif
         if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[2]) + g * kCols, part);
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
@@ -837,8 +858,10 @@ struct KWin {
     size_t suh[3], svh[3], tr[3];
     int k, n_embd, n_ff;
     float limit;
+#if defined(STRATA_USE_HIP)
     float* xp;           // (KMoe's)
     int gS, gkr, dS, dkr;
+#endif
 };
 
 // grid (n_ff / 128, groups at most, 2): group blockIdx.y's gate (z 0, into h) or up (z 1, into u) for 128 h values of
@@ -847,7 +870,11 @@ template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
     __shared__ int last;
+#if defined(STRATA_USE_HIP)
     const int grp = blockIdx.y, g = blockIdx.x, r = (int) blockIdx.z / a.gS, sp = (int) blockIdx.z % a.gS;
+#else
+    const int grp = blockIdx.y, g = blockIdx.x, r = blockIdx.z;
+#endif
     if (grp >= *a.n_groups) return;
     const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
     const int warp = threadIdx.x >> 5;
@@ -857,6 +884,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.x + (size_t) (a.grp_ent[mm + warp] >> 3) * a.x_stride;
+#if defined(STRATA_USE_HIP)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, sp * a.gkr,
                           min(a.n_embd, (sp + 1) * a.gkr), x, (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (a.gS > 1)   // (win_gu_red_kernel)
@@ -864,6 +892,11 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
                 return a.xp + (((size_t) a.grp_ent[mm + c] * 2 + r) * a.gS + sp) * a.n_ff + g * kCols;
             });
         else if (warp < nc)
+#else
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                          (const uint16_t*) (blob + a.suh[r]), nc, sm);
+        if (warp < nc)
+#endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
                       dst + (size_t) a.grp_ent[mm + warp] * a.n_ff + g * kCols);
         __syncthreads();
@@ -880,7 +913,10 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
 template <int K2, int cb>
 __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
     __shared__ __align__(16) BlockSmem<K2> sm;
-    const int grp = blockIdx.y, g = blockIdx.x, sp = blockIdx.z;
+    const int grp = blockIdx.y, g = blockIdx.x;
+#if defined(STRATA_USE_HIP)
+    const int sp = blockIdx.z;
+#endif
     if (grp >= *a.n_groups) return;
     const uint8_t* blob = (const uint8_t*) a.grp_ptr[grp];
     const int warp = threadIdx.x >> 5;
@@ -889,6 +925,7 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
         const int nc = min(kTok, m1 - mm);
         Xin x;
         if (warp < nc) x.f = a.h + (size_t) a.grp_ent[mm + warp] * a.n_ff;
+#if defined(STRATA_USE_HIP)
         block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, sp * a.dkr,
                           min(a.n_ff, (sp + 1) * a.dkr), x, (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (a.dS > 1)   // (win_down_red_kernel)
@@ -896,6 +933,11 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
                 return a.xp + ((size_t) a.grp_ent[mm + c] * a.dS + sp) * a.n_embd + g * kCols;
             });
         else if (warp < nc)
+#else
+        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                          (const uint16_t*) (blob + a.suh[2]), nc, sm);
+        if (warp < nc)
+#endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
                       a.part + (size_t) a.grp_ent[mm + warp] * a.n_embd + g * kCols);
         __syncthreads();
@@ -955,6 +997,7 @@ __global__ void __launch_bounds__(kCols) win_swiglu_kernel(const KWin a) {
 #define EXL3_WIN_SWIGLU(a, groups, s) (void) 0
 #endif
 
+#if defined(STRATA_USE_HIP)
 // an input split's (xsplit) sums, added up in split order and then on as the unsplit kernels: block_out into h / u
 // (gate / up) or the part rows (down).  grid (n_ff / 128, k): moe_gate_up_kernel's
 __global__ void __launch_bounds__(kCols) moe_gu_red_kernel(const KMoe a) {
@@ -1019,6 +1062,7 @@ __global__ void __launch_bounds__(kCols) win_down_red_kernel(const KWin a) {
         __syncthreads();
     }
 }
+#endif
 
 // ---------------------------------------------------------------- a mixed-precision layer's experts (MixedLayouts)
 // Each expert's layout by its class (the class whose VRAM range holds its blob), each part's K picked per block - the
@@ -2017,30 +2061,39 @@ bool dispatch(int K2, int cb, A&&... args) {
 template <int K2, int cb> struct RunMv {
     static void run(const KBatch& b, int blocks, cudaStream_t s) { mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b); }
 };
+// AMD: the experts' launches with their input split (xsplit) - its blocks' z and the kernel that adds them up
+#if defined(STRATA_USE_HIP)
+#define EXL3_XS(n) (n)
+#define EXL3_XS_RED(on, kernel, grid, a, s) \
+    if (on) kernel<<<grid, kCols, 0, s>>>(a)
+#else
+#define EXL3_XS(n) 1u
+#define EXL3_XS_RED(on, kernel, grid, a, s) (void) 0
+#endif
 template <int K2, int cb> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * a.gS), kThreads, 0, s>>>(a);
-        if (a.gS > 1) win_gu_red_kernel<<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), kCols, 0, s>>>(a);
+        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.gS > 1, win_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), a, s);
         EXL3_WIN_SWIGLU(a, groups, s);
     }
 };
 template <int K2, int cb> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, (unsigned) a.dS), kThreads, 0, s>>>(a);
-        if (a.dS > 1) win_down_red_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kCols, 0, s>>>(a);
+        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.dS > 1, win_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), a, s);
     }
 };
 template <int K2, int cb> struct RunGU {
     static void run(const KMoe& a, cudaStream_t s) {
-        moe_gate_up_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u * a.gS), kThreads, 0, s>>>(a);
-        if (a.gS > 1) moe_gu_red_kernel<<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k), kCols, 0, s>>>(a);
+        moe_gate_up_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u * EXL3_XS(a.gS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.gS > 1, moe_gu_red_kernel, dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k), a, s);
         EXL3_MOE_SWIGLU(a, s);
     }
 };
 template <int K2, int cb> struct RunDown {
     static void run(const KMoe& a, cudaStream_t s) {
-        moe_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k, (unsigned) a.dS), kThreads, 0, s>>>(a);
-        if (a.dS > 1) moe_down_red_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), kCols, 0, s>>>(a);
+        moe_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k, EXL3_XS((unsigned) a.dS)), kThreads, 0, s>>>(a);
+        EXL3_XS_RED(a.dS > 1, moe_down_red_kernel, dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), a, s);
         EXL3_MOE_COMBINE(a, s);
     }
 };
@@ -2079,9 +2132,21 @@ constexpr size_t kCounters = 16384;
 constexpr size_t kCntGU = 8192;                    // the counters from here on: the experts' gate / up pairs
 constexpr size_t kHFloats = (size_t) 8 * 8192;     // the experts' h
 constexpr size_t kUFloats = (size_t) 128 * 4096;   // the experts' up values: a window's 16 tokens x 8, n_ff <= 4096
-constexpr size_t kXPFloats = (size_t) 6 << 20;     // the experts' input split partials (xsplit): 24 MB
+#if defined(STRATA_USE_HIP)
+constexpr size_t kXPFloats = (size_t) 6 << 20;     // the experts' input split partials (xsplit, AMD): 24 MB
+// the split EXL3_XSPLIT asks for (1: none)
+int xsplit_want() {
+    static const int env = [] {
+        const char* v = std::getenv("EXL3_XSPLIT");
+        return v != nullptr ? std::max(1, std::min(8, std::atoi(v))) : 1;
+    }();
+    return env;
+}
+#endif
 struct Scratch {
-    float* xp = nullptr;
+#if defined(STRATA_USE_HIP)
+    float* xp = nullptr;   // (xsplit_want() > 1 only)
+#endif
     float* part = nullptr;
     unsigned* cnt = nullptr;
     float* h = nullptr;
@@ -2114,7 +2179,9 @@ Scratch* scratch(cudaStream_t s) {
         cudaMalloc(&sc.cnt, kCounters * sizeof(unsigned)) != cudaSuccess ||
         cudaMalloc(&sc.h, kHFloats * sizeof(float)) != cudaSuccess ||
         cudaMalloc(&sc.u, kUFloats * sizeof(float)) != cudaSuccess ||
-        cudaMalloc(&sc.xp, kXPFloats * sizeof(float)) != cudaSuccess ||
+#if defined(STRATA_USE_HIP)
+        (xsplit_want() > 1 && cudaMalloc(&sc.xp, kXPFloats * sizeof(float)) != cudaSuccess) ||
+#endif
         cudaMemsetAsync(sc.cnt, 0, kCounters * sizeof(unsigned), s) != cudaSuccess) {
         std::fprintf(stderr, "exl3: scratch did not allocate\n");
         return nullptr;
@@ -2360,17 +2427,11 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     return true;
 }
 
-// the routed experts' input split for an input of k (HIP: EXL3_XSPLIT, default 1 - the whole input a block): S
-// blocks of kr inputs, their partial sums added up in split order by the *_red kernels
-static void xsplit(int k, int& S, int& kr) {
-    int want = 1;
 #if defined(STRATA_USE_HIP)
-    static const int env = [] {
-        const char* v = std::getenv("EXL3_XSPLIT");
-        return v != nullptr ? std::max(1, std::min(8, std::atoi(v))) : 1;
-    }();
-    want = env;
-#endif
+// the routed experts' input split for an input of k (EXL3_XSPLIT, default 1 - the whole input a block): S blocks of
+// kr inputs, their partial sums added up in split order by the *_red kernels
+static void xsplit(int k, int& S, int& kr) {
+    const int want = xsplit_want();
     kr = ((k + want - 1) / want + kCols - 1) / kCols * kCols;
     S = (k + kr - 1) / kr;
 }
@@ -2384,6 +2445,7 @@ static bool xsplit_set(int rows, int n_embd, int n_ff, float* xp, float*& dst, i
     }
     return true;
 }
+#endif
 
 static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     Scratch* sc = scratch(s);
@@ -2414,7 +2476,11 @@ static bool moe_args(const MoeArgs& a, KMoe& m, cudaStream_t s) {
     m.n_ff = a.n_ff;
     m.limit = a.limit;
     m.skip = g_skip;
+#if defined(STRATA_USE_HIP)
     return xsplit_set(a.k, a.n_embd, a.n_ff, sc->xp, m.xp, m.gS, m.gkr, m.dS, m.dkr);
+#else
+    return true;
+#endif
 }
 
 // a mixed layer's launch: the classes' codebook (one for all of them; mixed_ok checked it), as a template argument
@@ -2542,7 +2608,9 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_embd = a.n_embd;
     w.n_ff = a.n_ff;
     w.limit = a.limit;
+#if defined(STRATA_USE_HIP)
     if (!xsplit_set(a.T * 8, a.n_embd, a.n_ff, sc->xp, w.xp, w.gS, w.gkr, w.dS, w.dkr)) return false;
+#endif
     if (a.mix.n > 0) {
         const KMix k = kmix(a.mix);
         mix_launch(a.mix, [&](auto cb) {
