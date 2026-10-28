@@ -384,6 +384,13 @@ void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s);
 void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
                  cudaStream_t s);
+/// markov_add / markov_share for n logits rows at once (a draft pass over several conversations: each row its own
+/// previous token), the head's rows read once for all of them, each row's sum as the single row's: row j's logits `ls`
+/// floats apart, its token tok[j * ts] (markov_add_rows) or its E row erow + j * es on the device (markov_share_rows).
+void markov_add_rows(float* logits, long long ls, const uint16_t* E, const uint16_t* H, const int* tok, int ts, int n,
+                     int V, int R, cudaStream_t s);
+void markov_share_rows(float* logits, long long ls, const uint16_t* H, const uint16_t* erow, long long es, int n, int vn,
+                       int R, cudaStream_t s);
 /// The DSpark confidence: out[t] = sigmoid(w . [x[t] | E[tok[t]]]) (x rows dim floats, w F32 [dim + R]).
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s);

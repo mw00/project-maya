@@ -401,6 +401,39 @@ context shares the memory beside the model among the N conversations.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
   longer wait in line for a whole answer, nor a whole prompt read - but their batched steps carry no drafts, so on one
   GPU a whole turn can take longer than one at a time with the drafter.
+- **Every conversation drafting** (`MAYA_DS4_MULTI_DRAFT=1`, off by default; experimental): with two or more
+  answering, each one drafts its own tokens with the DSpark drafter and one window verifies them all - each
+  conversation's token and its drafts as rows of their own, the trunk's weights, routing and experts shared by all,
+  then each conversation's verdict as alone. Greedy, each answers token for token as it does alone (the drafts and the
+  verdicts are its own; only how many drafts a round takes differs: `maya-ds4 --parallel 4 --multi-check --ids ...`
+  checks it after the plain rows' check). The drafts are cut as a lone round's (`--dspark-conf`,
+  `MAYA_DS4_DSPARK_CUM`), then to `MAYA_DS4_MULTI_DRAFT_MAX` a conversation (the drafter's block) and to what fits the
+  window of `MAYA_DS4_MULTI_DRAFT_ROWS` rows (8: two answering get 3 drafts each, four get one; up to 16, but a window
+  of more than 8 rows is not bit for bit what a conversation gets alone - the experts' kernels sum an expert's rows
+  in tiles of up to 8, with 9 or more in another order - so 16 is for where the speed matters more than that; the
+  check above says so). Which conversations draft in a round, and how many drafts each, a measured cost model
+  decides (`MAYA_DS4_MULTI_DRAFT_POLICY=1`, the default): the engine times its rounds by window rows and the
+  drafter's pass (the drafting conversations' blocks go through the drafter together, as many as fit 16 rows a pass,
+  before the window) and averages each conversation's acceptance per draft as it serves; of the plans "the j
+  conversations with the best acceptance draft, (rows - n) / j each at most" it takes the one expecting the most
+  tokens a millisecond when that beats the plain step (every row one token) by `MAYA_DS4_MULTI_DRAFT_MARGIN` (0.03) -
+  otherwise the round is the plain step, as with the setting off. A conversation the plan leaves out drafts once every
+  `MAYA_DS4_MULTI_DRAFT_RETRY` rounds (8) anyway, the gap doubling to `MAYA_DS4_MULTI_DRAFT_PROBE_CAP` (128) while the
+  probes do not get it into the plan, so the measurements stay fresh; a new conversation starts from the engine's
+  recent averages and drafts once in its first round of several. `MAYA_DS4_MULTI_DRAFT_POLICY=0` is the earlier
+  fixed rule: a window of R rows costs about a + b R, so drafts beside n - 1 other conversations' rows pay only
+  while their acceptance is above n / (a / b + n) - 0.28, 0.44, 0.54, 0.61 at 1 .. 4 answering with
+  `MAYA_DS4_MULTI_DRAFT_FIXED=2.6` rows (a / b; `MAYA_DS4_MULTI_DRAFT_MIN=F` sets one floor for every n): a
+  conversation under the floor takes a plain row for `RETRY` rounds, then drafts once (that rule counts the window
+  alone, not the drafter's calls; `FIXED` is also the shape the measured model scales a row count it has not timed
+  yet from). A window's tokens are written in one turn (`MAYA_DS4_MULTI_DRAFT_LOCKSTEP=1`, the default), so every
+  answering conversation is in every round - written one a turn, the conversations whose drafts were kept would sit
+  out the next rounds while the one left took plain steps of one row. `MAYA_DS4_MULTI_DRAFT_LOG=1` writes a line on
+  stderr for every round of two or more (who drafted, the drafter's and the window's time, the tokens, against the
+  plan it beat), and the engine's `request N:` line reports each request's drafts kept / offered, its rounds of
+  several with and without drafts, and its drafter time. The drafts are the drafter's argmax (`DS4_DSPARK_SAMPLE=1`
+  is not taken here); a request's `spec=0` keeps it a plain row. The `DONE` line's accepted / offered counts cover
+  each request's own drafts.
 
 ## Drafting with DFlash2
 

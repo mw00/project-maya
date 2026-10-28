@@ -36,6 +36,7 @@ namespace strata::ds4 {
 namespace {
 
 constexpr int kThreads = 256;
+constexpr int kMarkovRows = 4;   // logits rows a markov_rows launch takes at once (the markov head read once for them)
 
 __device__ __forceinline__ float bf16f(uint16_t b) { return __uint_as_float((uint32_t) b << 16); }
 
@@ -2370,6 +2371,45 @@ __global__ void __launch_bounds__(kThreads) markov_kernel(float* __restrict__ lo
     if (lane == 0) logits[v] += a;
 }
 
+// markov_kernel's sums for up to kMarkovRows logits rows at once (a draft pass over several conversations: each row its
+// own previous token), H read once for all of them: row j's logits `ls` floats apart, its token tok[j * ts]; each row's
+// sum in markov_kernel's order (the same lanes, the same loop), so its bias is as the single row's
+__global__ void __launch_bounds__(kThreads) markov_rows_kernel(float* __restrict__ logits, long long ls,
+                                                               const uint16_t* __restrict__ E,
+                                                               const uint16_t* __restrict__ H,
+                                                               const int* __restrict__ tok, int ts, int n, int V, int R) {
+    pdl_wait();
+    pdl_trigger();
+    extern __shared__ float er[];   // [n][R]
+    for (int i = threadIdx.x; i < n * R; i += blockDim.x)
+        er[i] = bf16f(E[(size_t) tok[(size_t) (i / R) * ts] * R + (size_t) (i % R)]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    if (v >= V) return;
+    const uint16_t* hr = H + (size_t) v * R;
+    float a[kMarkovRows];
+#pragma unroll
+    for (int j = 0; j < kMarkovRows; ++j) a[j] = 0.0f;
+    for (int c = lane * 8; c < R; c += 32 * 8) {
+        const uint4 q = *(const uint4*) (hr + c);
+        const __half2* hp = (const __half2*) &q;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __half22float2(hp[i]);
+#pragma unroll
+            for (int j = 0; j < kMarkovRows; ++j)
+                if (j < n) a[j] += f.x * er[j * R + c + 2 * i] + f.y * er[j * R + c + 2 * i + 1];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kMarkovRows; ++j) {
+        if (j >= n) break;
+        const float s = warp_sum(a[j]);
+        if (lane == 0) logits[(size_t) j * ls + v] += s;
+    }
+}
+
 // ---------------------------------------------------------------- the markov bias over a head group (markov_share)
 // a member's rows [v0, v0 + vn) of the bias (markov_kernel's sums, the prev token's E row already on the device, BF16)
 __global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restrict__ logits,
@@ -2396,6 +2436,42 @@ __global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restric
     }
     a = warp_sum(a);
     if (lane == 0) logits[v] += a;
+}
+// markov_share_kernel's sums for up to kMarkovRows rows at once (a draft pass over several conversations), the share
+// read once: row j's logits `ls` floats apart, its previous token's E row erow + j * es (on the device)
+__global__ void __launch_bounds__(kThreads) markov_share_rows_kernel(float* __restrict__ logits, long long ls,
+                                                                     const uint16_t* __restrict__ H,
+                                                                     const uint16_t* __restrict__ erow, long long es,
+                                                                     int n, int vn, int R) {
+    pdl_wait();
+    pdl_trigger();
+    extern __shared__ float er[];   // [n][R]
+    for (int i = threadIdx.x; i < n * R; i += blockDim.x) er[i] = bf16f(erow[(size_t) (i / R) * es + (size_t) (i % R)]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    if (v >= vn) return;
+    const uint16_t* hr = H + (size_t) v * R;
+    float a[kMarkovRows];
+#pragma unroll
+    for (int j = 0; j < kMarkovRows; ++j) a[j] = 0.0f;
+    for (int c = lane * 8; c < R; c += 32 * 8) {
+        const uint4 q = *(const uint4*) (hr + c);
+        const __half2* hp = (const __half2*) &q;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 f = __half22float2(hp[i]);
+#pragma unroll
+            for (int j = 0; j < kMarkovRows; ++j)
+                if (j < n) a[j] += f.x * er[j * R + c + 2 * i] + f.y * er[j * R + c + 2 * i + 1];
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < kMarkovRows; ++j) {
+        if (j >= n) break;
+        const float s = warp_sum(a[j]);
+        if (lane == 0) logits[(size_t) j * ls + v] += s;
+    }
 }
 // the share's argmax (the greedy sampler's rule: the larger value, on a tie the lower index) -> slot {value, v0 + i,
 // seq}, the seq last
@@ -4064,6 +4140,22 @@ void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* 
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
     pdl_launch(markov_share_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, H, erow, vn, R);
+}
+void markov_add_rows(float* logits, long long ls, const uint16_t* E, const uint16_t* H, const int* tok, int ts, int n,
+                     int V, int R, cudaStream_t s) {
+    for (int j = 0; j < n; j += kMarkovRows) {
+        const int nj = std::min(kMarkovRows, n - j);
+        pdl_launch(markov_rows_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) nj * R * sizeof(float), s,
+                   logits + (size_t) j * ls, ls, E, H, tok + (size_t) j * ts, ts, nj, V, R);
+    }
+}
+void markov_share_rows(float* logits, long long ls, const uint16_t* H, const uint16_t* erow, long long es, int n, int vn,
+                       int R, cudaStream_t s) {
+    for (int j = 0; j < n; j += kMarkovRows) {
+        const int nj = std::min(kMarkovRows, n - j);
+        pdl_launch(markov_share_rows_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) nj * R * sizeof(float), s,
+                   logits + (size_t) j * ls, ls, H, erow + (size_t) j * es, es, nj, vn, R);
+    }
 }
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s) {
     pdl_launch(argmax_share_kernel, 1, 1024, 0, s, row, vn, v0, slot, seq);

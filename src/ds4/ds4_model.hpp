@@ -197,6 +197,38 @@ public:
     /// seeded as its own step would seed them, so it drafts on alone later.  The bound conversation stays bound.
     bool step_multi(const int* seqs, const int* tokens, int n, std::string& err);
     int sample_multi(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter);
+    /// A token of each of n conversations with its drafts after it (draft_multi's, or draft() on each bound in turn:
+    /// its own drafter rings either way), all through the model in one window of at most 16 rows: each conversation's rows a window of their own
+    /// for its attention, the trunk's dense weights, routing, experts and head shared by all.  Then each conversation's
+    /// verdict as verify() gives one alone - `accepted` drafts kept, `next` the trunk's token after them, its state
+    /// back to what it kept, its drafter rings seeded from its rows - with its own sampling chain and penalties.  A
+    /// conversation with no drafts is a plain row (its next token as sample_multi's).  The drafts are taken as the
+    /// drafter's argmax (q a point at each, as verify() takes drafts not its own draws).  The bound conversation stays
+    /// bound.  false and err: nothing consumed.
+    struct MultiSpec {
+        int seq = 0;
+        int tok = -1;
+        std::vector<int> drafts;
+        float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+        int top_k = 0;
+        uint64_t seed = 0, counter = 0;
+        int pen_n = 0;   // its penalties, set_penalties' arguments
+        float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+        int accepted = 0;   // out
+        int next = -1;      // out
+    };
+    bool verify_multi(MultiSpec* rs, int n, std::string& err);
+    /// draft() for n conversations at once (--parallel): conversation seqs[i]'s drafts after its token ys[i] (the token
+    /// at its position, not fed yet) with their confidences, as draft() gives them bound to it alone - up to
+    /// draft_pass() conversations' blocks through the drafter's blocks and the head as one window (each block a
+    /// segment of its own for the attention, on its own conversation's rings; the blocks' experts and the head read
+    /// once for all of them), more of them in passes.  The drafts are the drafter's argmax (as verify_multi takes
+    /// them).  A conversation without room for its block gets none.  The bound conversation stays bound.
+    bool draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& drafts,
+                     std::vector<std::vector<float>>& conf, std::string& err);
+    /// Conversations a draft_multi pass takes at most (their blocks' rows in one window of verify_max() rows;
+    /// MAYA_DS4_DRAFT_PASS caps it).
+    int draft_pass() const;
 
     void reset();
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
