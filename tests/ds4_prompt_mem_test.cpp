@@ -48,6 +48,15 @@ int main() {
         while (c > 0) c = d::chunk_fallback(c), ++tries;
         CHECK(tries == 7);   // 8192 4096 2048 1024 512 256 0
     }
+    {   // the staging ring: 64 MB a GB of the device's room, 400 to 1200 MB
+        const double GB = 1e9;
+        CHECK(d::staging_ring_mb(0.0) == 400 && d::staging_ring_mb(-5 * GB) == 400);
+        CHECK(d::staging_ring_mb(4 * GB) == 400);
+        CHECK(d::staging_ring_mb(6.25 * GB) == 400);
+        CHECK(d::staging_ring_mb(10 * GB) == 640);
+        CHECK(d::staging_ring_mb(18.75 * GB) == 1200);
+        CHECK(d::staging_ring_mb(80 * GB) == 1200);
+    }
     if (fails == 0) std::printf("ds4 prompt / memory rules: ok\n");
     return fails == 0 ? 0 : 1;
 }

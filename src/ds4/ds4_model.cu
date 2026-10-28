@@ -4547,7 +4547,20 @@ struct Model::Impl {
             }
             if (!halloc(c.bounds_pin, 2048, err)) return false;
             if (stride > 0) {   // DS4_RING_MB (400) of slots in kParts batches
-                const size_t mb = std::getenv("DS4_RING_MB") ? (size_t) std::atoi(std::getenv("DS4_RING_MB")) : 400;
+                // (DS4_RING_MB=auto, opt-in until measured: from this device's VRAM room for experts, what is free now
+                // less --reserve-mib - 64 MB a GB of it, 400 to 1200 MB: the deeper ring lets a prompt queue more of
+                // its likely experts early where the cards cannot hold them, for that much VRAM less for experts)
+                const char* rm = std::getenv("DS4_RING_MB");
+                size_t mb = rm != nullptr ? (size_t) std::atoi(rm) : 400;
+                if (rm != nullptr && std::strcmp(rm, "auto") == 0) {
+                    size_t fr = 0, tot = 0;
+                    CK(mem_info(&fr, &tot));
+                    const double room =
+                        std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+                    mb = (size_t) staging_ring_mb(room);
+                    std::fprintf(stderr, "ds4: CUDA%d staging ring (DS4_RING_MB=auto): %.1f GB of VRAM room -> %zu MB\n",
+                                 d.id, room / 1e9, mb);
+                }
                 c.ring_stride = stride;
                 c.ring_n = std::max(Chunk::kParts, (int) ((mb << 20) / stride) / Chunk::kParts * Chunk::kParts);
                 if (!dalloc(d, c.ring, (size_t) c.ring_n * stride, err)) return false;

@@ -37,4 +37,10 @@ inline int chunk_fallback(int chunk) {
     return h >= kChunkFloor ? h : 0;
 }
 
+// ---- the staging ring (MB) from a device's VRAM room for experts (bytes): 64 MB a GB of it, 400 to 1200 MB
+inline int staging_ring_mb(double room_bytes) {
+    const double mb = std::max(0.0, room_bytes) / 1e9 * 64.0;
+    return (int) std::min(1200.0, std::max(400.0, mb));
+}
+
 }  // namespace strata::ds4
