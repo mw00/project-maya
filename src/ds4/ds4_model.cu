@@ -25,6 +25,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_lt.hpp"
 #include "ds4_marks.hpp"
+#include "ds4_markov_q8.hpp"
 #include "ds4_os.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
@@ -620,6 +621,7 @@ struct Dev {
     // the drafter's markov bias over the head group (markov_share): this member's rows [mk_v0, mk_v0 + mk_vn) of the
     // markov head, the previous token's E row, the drafted tokens (the lead's: d_ints)
     uint16_t *mk_share = nullptr, *mk_erow = nullptr;
+    uint8_t* mk_share_q8 = nullptr;   // (DS4_MARKOV_Q8: the rows as Q8_0 blocks, in place of mk_share)
     int* mk_ints = nullptr;
     int mk_v0 = 0, mk_vn = 0;
     uint8_t* hand = nullptr;
@@ -1122,6 +1124,11 @@ struct Model::Impl {
     // come from the trunk's head); main_proj / main_norm on every device that holds a block (Dev::d_proj)
     float *d_norm = nullptr, *d_conf = nullptr;
     uint16_t *d_mk_embed = nullptr, *d_mk_head = nullptr;   // BF16 [vocab][rank], F16 [vocab][rank]
+    // DS4_MARKOV_Q8=1 (opt-in until measured): the markov head as Q8_0 blocks, rounded as it loads (ds4_markov_q8.hpp;
+    // d_mk_head_q8 and each member's mk_share_q8 in place of the F16 rows) - half the bytes every markov step reads and
+    // half the memory, the bias off by the rounding: the drafts may change, never the tokens verify keeps
+    bool markov_q8 = false;
+    uint8_t* d_mk_head_q8 = nullptr;
     // a head group of two or more: the markov steps over its members (each its rows of the bias and an argmax of its
     // share, the global one through host-mapped slots [step][member] {value, index, seq}) in place of the lead's whole
     // rows - E host-mapped (each member reads the picked token's row), a draft's seq in mk_seq
@@ -2514,6 +2521,28 @@ struct Model::Impl {
         return upload(d, *t, p, err);
     }
 
+    // (DS4_MARKOV_Q8) rows [v0, v0 + vn) of the markov head t (F16 / BF16 [vocab][rank] in the pack) as Q8_0 blocks on
+    // device d: read and rounded on the host (markov_q8_rows), the pack untouched
+    bool mk_q8(Dev& d, const Tensor& t, int v0, int vn, uint8_t*& p, std::string& err, size_t* acct = nullptr) {
+        const int R = g.d_rank;
+        const int fmt = t.dtype == "F16" ? kMarkovF16 : t.dtype == "BF16" ? kMarkovBF16 : -1;
+        if (fmt < 0 || R % 32 != 0 || t.bytes != (uint64_t) g.vocab * R * 2) {
+            err = "the markov head: not an F16 / BF16 [vocab][rank] table of whole 32-value blocks (DS4_MARKOV_Q8)";
+            return false;
+        }
+        std::vector<uint16_t> rows((size_t) vn * R);
+        if (!pk.read_at(t.file, t.off + (uint64_t) v0 * R * 2, rows.size() * 2, rows.data())) {
+            err = "the markov head: read failed";
+            return false;
+        }
+        std::vector<uint8_t> q((size_t) vn * markov_q8_row_bytes(R));
+        markov_q8_rows(rows.data(), fmt, (size_t) vn, R, q.data());
+        if (!dalloc(d, p, q.size(), err, acct)) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(p, q.data(), q.size(), cudaMemcpyHostToDevice));
+        return true;
+    }
+
     size_t mat_bytes(const std::string& pre) const {
         if (const Tensor* t = pk.get(pre + ".weight")) return align256(t->bytes);
         size_t b = 0;
@@ -3031,6 +3060,21 @@ struct Model::Impl {
             if (hc_ms != 1)
                 std::fprintf(stderr, "ds4: a window's HC mix and split %s (DS4_HC_MIX_SPLIT=%d)\n",
                              hc_ms == 2 ? "in one launch on the side stream too" : "in two launches", hc_ms);
+        }
+        if (const char* v = ds4_env("DS4_MARKOV_Q8")) {   // (MAYA_DS4_MARKOV_Q8)
+            if (std::strcmp(v, "1") != 0 && std::strcmp(v, "0") != 0) {
+                err = std::string("DS4_MARKOV_Q8=") + v + ": 1 or 0";
+                return false;
+            }
+            markov_q8 = std::strcmp(v, "1") == 0 && g.n_mtp > 0;
+            if (markov_q8 && g.d_rank % 32 != 0) {
+                err = "DS4_MARKOV_Q8=1: the markov head's rank " + std::to_string(g.d_rank) +
+                      " is not whole 32-value blocks";
+                return false;
+            }
+            if (markov_q8)
+                std::fprintf(stderr, "ds4: the drafter's markov head as Q8_0 blocks, half its bytes a step - the "
+                                     "drafts may change, the verified tokens do not (DS4_MARKOV_Q8)\n");
         }
         if (const char* v = ds4_env("DS4_HEAD_COLS")) {   // (MAYA_DS4_HEAD_COLS)
             char* end = nullptr;
@@ -3703,7 +3747,8 @@ struct Model::Impl {
         // host-mapped, the steps' slots
         // (only where every member holds its rows of the markov head: a type load_dense does not take keeps the lead's)
         bool mk_rows = g.n_mtp > 0 && head_nm() > 1;
-        for (int m : groups[(size_t) devs[(size_t) head_dev].grp].mem) mk_rows = mk_rows && devs[(size_t) m].mk_share != nullptr;
+        for (int m : groups[(size_t) devs[(size_t) head_dev].grp].mem)
+            mk_rows = mk_rows && (devs[(size_t) m].mk_share != nullptr || devs[(size_t) m].mk_share_q8 != nullptr);
         if (mk_rows && !(std::getenv("DS4_MK_SPLIT") != nullptr && std::atoi(std::getenv("DS4_MK_SPLIT")) == 0)) {
             const Tensor* te = pk.get("mtp." + std::to_string(g.n_mtp - 1) + ".markov_head.embed.weight");
             if (te == nullptr || te->dtype != "BF16" || te->bytes != (uint64_t) g.vocab * g.d_rank * 2) {
@@ -5547,8 +5592,15 @@ struct Model::Impl {
                 const int R = g.d_rank;
                 head_cols(hn, d.mi, d.mk_v0, d.mk_vn);   // (its share of the head's columns: the same rows)
                 // F16 as the pack holds it, or a GGUF drafter's BF16 rounded to F16 as f16raw rounds d_mk_head (the same
-                // values as the lead's whole rows); another type: no mk_split (the lead's whole rows)
-                if (th != nullptr && (th->dtype == "F16" || th->dtype == "BF16") && th->bytes == (uint64_t) g.vocab * R * 2) {
+                // values as the lead's whole rows; DS4_MARKOV_Q8: either as Q8_0 blocks, mk_q8's like the lead's);
+                // another type: no mk_split (the lead's whole rows)
+                const bool f16 = th != nullptr && (th->dtype == "F16" || th->dtype == "BF16") &&
+                                 th->bytes == (uint64_t) g.vocab * R * 2;
+                if (f16 && markov_q8) {   // (DS4_MARKOV_Q8: its rows as Q8_0 blocks, the whole head's bytes for them)
+                    if (!mk_q8(d, *th, d.mk_v0, d.mk_vn, d.mk_share_q8, err, acct) ||
+                        !dalloc(d, d.mk_erow, (size_t) R, err) || !dalloc(d, d.mk_ints, (size_t) kWin + 2, err))
+                        return false;
+                } else if (f16) {
                     std::vector<uint16_t> rows((size_t) d.mk_vn * R);
                     if (!pk.read_at(th->file, th->off + (uint64_t) d.mk_v0 * R * 2, rows.size() * 2, rows.data())) {
                         err = "the markov head: read failed";
@@ -5578,7 +5630,8 @@ struct Model::Impl {
                     return false;
                 }
                 if (!dalloc(d, d_mk_embed, te->bytes / 2, err, acct) || !upload(d, *te, d_mk_embed, err) ||
-                    !f16raw(d, Z + "markov_head.head.weight", d_mk_head, err, acct))
+                    !(markov_q8 ? mk_q8(d, *th, 0, g.vocab, d_mk_head_q8, err, acct)
+                                : f16raw(d, Z + "markov_head.head.weight", d_mk_head, err, acct)))
                     return false;
             }
         }
@@ -14089,7 +14142,8 @@ struct Model::Impl {
                     Dev& e = devs[(size_t) hg[(size_t) m]];
                     cudaSetDevice(e.id);
                     float* row = m == 0 ? hd.logits + (size_t) i * V : e.logits_part + (size_t) i * e.mk_vn;
-                    markov_share(row, e.mk_share, e.mk_erow, e.mk_vn, R, e.st);
+                    if (markov_q8) markov_share_q8(row, e.mk_share_q8, e.mk_erow, e.mk_vn, R, e.st);
+                    else markov_share(row, e.mk_share, e.mk_erow, e.mk_vn, R, e.st);
                     argmax_share(row, e.mk_vn, e.mk_v0, mk_slots + ((size_t) i * nm + m) * 4, seq, e.st);
                     markov_pick(mk_slots + (size_t) i * nm * 4, nm, seq, e.mk_ints + i + 1, h_mk_embed, e.mk_erow, R,
                                 e.st);
@@ -14109,7 +14163,9 @@ struct Model::Impl {
                 sp.seed = dq_seed;
             }
             for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's draft
-                markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
+                float* row = hd.logits + (size_t) i * V;
+                if (markov_q8) markov_add_q8(row, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
+                else markov_add(row, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
                 if (drafts_q) {
                     sp.counter = dq_counter + (uint64_t) i;
                     strata::kernels::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
@@ -14337,7 +14393,8 @@ struct Model::Impl {
                         Dev& e = devs[(size_t) hg[(size_t) m]];
                         cudaSetDevice(e.id);
                         float* row = m == 0 ? hd.logits + (size_t) r * V : e.logits_part + (size_t) r * e.mk_vn;
-                        markov_share(row, e.mk_share, e.mk_erow, e.mk_vn, R, e.st);
+                        if (markov_q8) markov_share_q8(row, e.mk_share_q8, e.mk_erow, e.mk_vn, R, e.st);
+                        else markov_share(row, e.mk_share, e.mk_erow, e.mk_vn, R, e.st);
                         argmax_share(row, e.mk_vn, e.mk_v0, mk_slots + ((size_t) r * nm + m) * 4, seq, e.st);
                         markov_pick(mk_slots + (size_t) r * nm * 4, nm, seq, e.mk_ints + (size_t) c * W + i + 1, h_mk_embed,
                                     e.mk_erow, R, e.st);
@@ -14354,7 +14411,8 @@ struct Model::Impl {
                 for (int i = 0; i < T; ++i) {
                     float* row = hd.logits + (size_t) (c * T + i) * V;
                     int* ic = d_ints + (size_t) c * W;
-                    markov_add(row, d_mk_embed, d_mk_head, ic + i, V, R, hd.st);
+                    if (markov_q8) markov_add_q8(row, d_mk_embed, d_mk_head_q8, ic + i, V, R, hd.st);
+                    else markov_add(row, d_mk_embed, d_mk_head, ic + i, V, R, hd.st);
                     strata::kernels::sample_tokens(row, 1, V, nullptr, 0, sp, ic + i + 1, hd.st);
                 }
         }

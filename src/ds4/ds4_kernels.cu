@@ -2411,6 +2411,44 @@ __global__ void __launch_bounds__(kThreads) markov_kernel(float* __restrict__ lo
     if (lane == 0) logits[v] += a;
 }
 
+// (DS4_MARKOV_Q8) the same bias from the markov head as Q8_0 blocks (ds4_markov_q8.hpp: 34 bytes, an F16 scale and 32
+// int8; a row R / 32 blocks, only 2-byte aligned): lane l takes values 8 l .. 8 l + 7 of each 256, a quarter of one
+// block - its 8 codes against E's row in F32, then times the block's scale.  Half the bytes markov_kernel reads; the
+// sums differ from the F16 head's by the quantisation (the drafts may change, the verified tokens do not).  One row's
+// code for markov_q8_kernel and markov_share_q8_kernel, so a head group's shares give the whole rows' bits
+__device__ __forceinline__ float markov_row_q8(const uint8_t* __restrict__ hr, const float* er, int R, int lane) {
+    float a = 0.0f;
+    for (int c = lane * 8; c < R; c += 32 * 8) {
+        const uint8_t* blk = hr + (size_t) (c >> 5) * 34;
+        const float d = __half2float(__ushort_as_half(*(const uint16_t*) blk));
+        const uint16_t* q = (const uint16_t*) (blk + 2 + (c & 31));
+        float t = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const uint16_t v = q[i];
+            t = fmaf((float) (int8_t) (v & 0xffu), er[c + 2 * i], t);
+            t = fmaf((float) (int8_t) (v >> 8), er[c + 2 * i + 1], t);
+        }
+        a = fmaf(d, t, a);
+    }
+    return warp_sum(a);
+}
+__global__ void __launch_bounds__(kThreads) markov_q8_kernel(float* __restrict__ logits, const uint16_t* __restrict__ E,
+                                                             const uint8_t* __restrict__ Hq,
+                                                             const int* __restrict__ tok, int V, int R) {
+    pdl_wait();
+    pdl_trigger();
+    extern __shared__ float er[];
+    const uint16_t* erow = E + (size_t) (*tok) * R;
+    for (int i = threadIdx.x; i < R; i += blockDim.x) er[i] = bf16f(erow[i]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    if (v >= V) return;
+    const float a = markov_row_q8(Hq + (size_t) v * (size_t) (R / 32) * 34, er, R, lane);
+    if (lane == 0) logits[v] += a;
+}
+
 // ---------------------------------------------------------------- the markov bias over a head group (markov_share)
 // a member's rows [v0, v0 + vn) of the bias (markov_kernel's sums, the prev token's E row already on the device, BF16)
 __global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restrict__ logits,
@@ -2436,6 +2474,21 @@ __global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restric
         }
     }
     a = warp_sum(a);
+    if (lane == 0) logits[v] += a;
+}
+// (DS4_MARKOV_Q8) a member's rows of the bias from its rows of the Q8_0 head (markov_q8_kernel's sums)
+__global__ void __launch_bounds__(kThreads) markov_share_q8_kernel(float* __restrict__ logits,
+                                                                   const uint8_t* __restrict__ Hq,
+                                                                   const uint16_t* __restrict__ erow, int vn, int R) {
+    pdl_wait();
+    pdl_trigger();
+    extern __shared__ float er[];
+    for (int i = threadIdx.x; i < R; i += blockDim.x) er[i] = bf16f(erow[i]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    if (v >= vn) return;
+    const float a = markov_row_q8(Hq + (size_t) v * (size_t) (R / 32) * 34, er, R, lane);
     if (lane == 0) logits[v] += a;
 }
 // the share's argmax (the greedy sampler's rule: the larger value, on a tie the lower index) -> slot {value, v0 + i,
@@ -4111,6 +4164,14 @@ void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* 
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
     pdl_launch(markov_share_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, H, erow, vn, R);
+}
+void markov_add_q8(float* logits, const uint16_t* E, const uint8_t* Hq, const int* tok, int V, int R, cudaStream_t s) {
+    pdl_launch(markov_q8_kernel, cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, E, Hq, tok, V,
+               R);
+}
+void markov_share_q8(float* logits, const uint8_t* Hq, const uint16_t* erow, int vn, int R, cudaStream_t s) {
+    pdl_launch(markov_share_q8_kernel, cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s, logits, Hq,
+               erow, vn, R);
 }
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s) {
     pdl_launch(argmax_share_kernel, 1, 1024, 0, s, row, vn, v0, slot, seq);

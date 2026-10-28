@@ -390,6 +390,11 @@ void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, cudaStream_t s);
 void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R,
                  cudaStream_t s);
+/// (DS4_MARKOV_Q8) markov_add / markov_share with the head as Q8_0 blocks (Hq: rows of R / 32 blocks of 34 bytes,
+/// an F16 scale and 32 int8 - ds4_markov_q8.hpp's; R % 32 == 0): half the bytes, the sums off by the quantisation.  A
+/// share's rows give markov_add_q8's bits for them.
+void markov_add_q8(float* logits, const uint16_t* E, const uint8_t* Hq, const int* tok, int V, int R, cudaStream_t s);
+void markov_share_q8(float* logits, const uint8_t* Hq, const uint16_t* erow, int vn, int R, cudaStream_t s);
 /// The DSpark confidence: out[t] = sigmoid(w . [x[t] | E[tok[t]]]) (x rows dim floats, w F32 [dim + R]).
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s);

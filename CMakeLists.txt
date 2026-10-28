@@ -1172,7 +1172,13 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  # DeepSeek's DSpark markov head as Q8_0 blocks (DS4_MARKOV_Q8, src/ds4/ds4_markov_q8.hpp) byte for byte against
+  # ggml's quantize_row_q8_0_ref, a head group member's rows against the whole head's (no GPU)
+  add_executable(ds4_markov_q8_test tests/ds4_markov_q8_test.cpp)
+  target_include_directories(ds4_markov_q8_test PRIVATE include)
+  target_link_libraries(ds4_markov_q8_test PRIVATE ggml-base)
   if(STRATA_BUILD_TESTS)
+    add_test(NAME ds4_markov_q8_test COMMAND ds4_markov_q8_test)
     # GLM's split-base expert rows (the CPU lane on a GGUF's own gate/up/down tensors) vs the contiguous blob path
     add_executable(native_split_test src/kernels/cpu/native_split_test.cpp)
     target_link_libraries(native_split_test PRIVATE strata_kernels_cpu)

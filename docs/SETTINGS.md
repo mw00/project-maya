@@ -893,6 +893,17 @@ room. A request's log then says how many of the drafter's picks took the CPU lan
 | `MAYA_DS4_DRAFT_DEV` | off (every block on the lead) | the member each DSpark block runs on: one number for every block, or one a block (`1,0,0`: block 0 on member 1, the others on the lead); 0 is the lead |
 | `MAYA_DS4_DRAFT_VRAM` | off (placed as above) | the most VRAM experts each DSpark block keeps, its profile's hottest: one number for every block, or one a block (`96,48,32`); 0 .. a block's experts (128) |
 
+`MAYA_DS4_MARKOV_Q8=1` keeps the drafter's markov head (its F16 bias over the vocabulary, about 66 MB, read in full by
+every drafted token) as Q8_0 blocks instead, rounded from the pack as it loads (the pack is not changed): half the
+bytes each step reads and half the VRAM. It applies on the drafter's lead and on a head group's members that split
+the markov steps (`DS4_MK_SPLIT`). This changes outputs of the drafter: the bias moves by the rounding, so some drafts
+may change and fewer or more may be kept. Every draft is still verified, so the answer's tokens stay the model's own
+choices. Opt-in until measured on GPUs.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_MARKOV_Q8` | off (0) | `1`: the DSpark markov head as Q8_0 blocks (half its bytes and memory; the drafts may change, the verified answers do not) |
+
 ## DeepSeek: a helper GPU for the experts VRAM leaves over
 
 A GGUF pack's routed experts that do not fit the layer GPUs' VRAM run on the CPU lane. A GPU that is not one of the

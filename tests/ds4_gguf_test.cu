@@ -12,6 +12,7 @@
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
 #include "../src/ds4/ds4_kernels.cuh"
+#include "../src/ds4/ds4_markov_q8.hpp"
 #include "../src/ds4/ds4_pcie.cuh"
 #include "../src/ds4/ds4_q6k.cuh"
 
@@ -2436,10 +2437,68 @@ void test_head_cols(cudaStream_t s) {
     cudaFree(dx);
 }
 
+// The markov bias from a Q8_0 head (DS4_MARKOV_Q8; the rows ds4_markov_q8.hpp makes of an F16 head): markov_add_q8
+// against a double-precision sum of the same Q8_0 values, a head group's shares (markov_share_q8, uneven) the whole
+// rows' bits, and its difference from the F16 head's bias (markov_add) the rounding's own
+void test_markov_q8(cudaStream_t s) {
+    const int V = 4099, R = 256, tok = 1717;
+    std::vector<uint16_t> E((size_t) V * R), H((size_t) V * R);
+    for (auto& v : E) v = f2bf(frand(0.5f));
+    for (auto& v : H) {
+        const __half hv = __float2half(frand(0.08f));
+        std::memcpy(&v, &hv, 2);
+    }
+    const size_t rb = dk::markov_q8_row_bytes(R);
+    std::vector<uint8_t> Hq((size_t) V * rb);
+    dk::markov_q8_rows(H.data(), dk::kMarkovF16, (size_t) V, R, Hq.data());
+    uint16_t *dE = dev(E), *dH = dev(H);
+    uint8_t* dHq = dev(Hq);
+    int* dtok = dev(std::vector<int>{tok});
+    uint16_t* derow = dev(std::vector<uint16_t>(E.begin() + (size_t) tok * R, E.begin() + (size_t) (tok + 1) * R));
+    float *dq = dev(std::vector<float>((size_t) V, 0.0f)), *df = dev(std::vector<float>((size_t) V, 0.0f));
+    dk::markov_add_q8(dq, dE, dHq, dtok, V, R, s);
+    dk::markov_add(df, dE, dH, dtok, V, R, s);
+    CU(cudaStreamSynchronize(s));
+    const std::vector<float> q = host(dq, (size_t) V), f16 = host(df, (size_t) V);
+    std::vector<double> want((size_t) V), dwant((size_t) V);
+    std::vector<float> dgot((size_t) V);
+    for (int v = 0; v < V; ++v) {
+        double a = 0.0, b = 0.0;
+        for (int i = 0; i < R; ++i) {
+            const double e = bf16f(E[(size_t) tok * R + i]);
+            a += e * dk::markov_q8_value(Hq.data() + (size_t) v * rb, i);
+            __half hv;
+            std::memcpy(&hv, &H[(size_t) v * R + i], 2);
+            b += e * (double) __half2float(hv);
+        }
+        want[(size_t) v] = a;
+        dwant[(size_t) v] = a - b;
+        dgot[(size_t) v] = q[(size_t) v] - f16[(size_t) v];
+    }
+    expect("markov bias, Q8_0 head", q.data(), want.data(), want.size(), 2e-6);
+    expect("  ... minus the F16 head's: the rounding's", dgot.data(), dwant.data(), dwant.size(), 2e-3);
+    // a head group's shares: each member's rows alone, the whole rows' bits
+    const int cuts[4] = {0, 1371, 1372, V};
+    bool same = true;
+    for (int c = 0; c < 3; ++c) {
+        const int v0 = cuts[c], vn = cuts[c + 1] - cuts[c];
+        float* ds = dev(std::vector<float>((size_t) vn, 0.0f));
+        dk::markov_share_q8(ds, dHq + (size_t) v0 * rb, derow, vn, R, s);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> got = host(ds, (size_t) vn);
+        same = same && std::memcmp(got.data(), q.data() + v0, (size_t) vn * 4) == 0;
+        cudaFree(ds);
+    }
+    if (!same) ++g_fail;
+    std::printf("%-52s %s\n", "markov_share_q8's shares = markov_add_q8's rows", same ? "ok" : "FAIL");
+    cudaFree(dE), cudaFree(dH), cudaFree(dHq), cudaFree(dtok), cudaFree(derow), cudaFree(dq), cudaFree(df);
+}
+
 void test_decode_trims(cudaStream_t s) {
     test_q8_share(s);
     test_hc_mix_split(s);
     test_head_cols(s);
+    test_markov_q8(s);
 }
 
 // ---------------------------------------------------------------- a group of two's chunk all-reduce (ds4_kernels.cu)
