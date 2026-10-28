@@ -4,6 +4,8 @@
 // does it for GLM: no FILE_FLAG_RANDOM_ACCESS - the page cache must keep what it read.)
 #pragma once
 
+#include "ds4_expert_prefetch.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
@@ -354,23 +356,15 @@ inline bool resident_sampled(const void* p, size_t bytes, int samples = 8) {
     return true;
 #endif
 }
-/// prefetch() of the ranges that do not look resident (resident_sampled) - on Windows, where PrefetchVirtualMemory walks
-/// every page of a resident range (0.34 ms a 6.3 MB expert matrix on a Strix Halo); Linux's madvise(WILLNEED) on cached
-/// pages costs ~1 us a matrix (a Core i5-12600T), less than the residency check (2.5 us): every range there
+/// Best-effort expert read-ahead: DS4_PF_SAMPLES=0 hints every range; 1-16 probes skip ranges that look warm.
+/// Defaults stay always-hint on Linux and eight probes on Windows. Missed cold pages still load on demand.
 inline void prefetch_cold(const std::vector<std::pair<const void*, size_t>>& ranges) {
-#if defined(_WIN32)
-    static const bool all = [] {   // (DS4_PF_ALL=1: every range, as before)
-        const char* v = std::getenv("DS4_PF_ALL");
-        return v != nullptr && std::atoi(v) != 0;
-    }();
-    if (all) return prefetch(ranges);
+    const auto& policy = expert_prefetch_policy();
+    if (policy.samples == 0) return prefetch(ranges);
     std::vector<std::pair<const void*, size_t>> cold;
     for (const auto& x : ranges)
-        if (!resident_sampled(x.first, x.second)) cold.push_back(x);
+        if (!resident_sampled(x.first, x.second, policy.samples)) cold.push_back(x);
     prefetch(cold);
-#else
-    prefetch(ranges);
-#endif
 }
 
 /// Whether [p, p + n) of a file's mapping is in RAM now: every page (Linux, one mincore), sampled pages of the working

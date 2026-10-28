@@ -18,6 +18,7 @@
 // the same places.
 #include "ds4_model.hpp"
 #include "ds4_watchdog.hpp"
+#include "ds4_expert_prefetch.hpp"
 #include "strata/platform/env_alias.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -1834,6 +1835,12 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
 
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+    try {
+        (void) strata::ds4::expert_prefetch_policy();
+    } catch (const std::invalid_argument& error) {
+        std::fprintf(stderr, "maya-ds4: %s\n", error.what());
+        return 2;
+    }
     // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
     // reproducibility): the chunked prompt path's GEMMs run beside the copy and hc streams, and without this each
     // process could pick other kernels - a long prompt's logits differing from one start to the next.  Before any

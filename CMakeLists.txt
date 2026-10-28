@@ -1344,6 +1344,22 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_
 endif()
 
 if(STRATA_BUILD_TESTS)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # OS-policy tests need no GPU backend or model; advice touches only private fixtures.
+    add_executable(ds4_prefetch_test tests/ds4_prefetch_test.cpp)
+    target_link_options(ds4_prefetch_test PRIVATE "LINKER:--wrap=madvise")
+    add_test(NAME ds4_prefetch_test COMMAND ds4_prefetch_test)
+    add_test(NAME ds4_prefetch_default_test COMMAND ds4_prefetch_test --default)
+    add_test(NAME ds4_prefetch_all_test COMMAND ds4_prefetch_test --all)
+    add_test(NAME ds4_prefetch_legacy_zero_test COMMAND ds4_prefetch_test --legacy-zero)
+    add_test(NAME ds4_prefetch_override_test COMMAND ds4_prefetch_test --override)
+    foreach(samples 0 1 2 4 8 16)
+      add_test(NAME ds4_prefetch_samples_${samples}_test COMMAND ds4_prefetch_test --samples ${samples})
+    endforeach()
+    add_executable(ds4_prefetch_policy_test tests/ds4_prefetch_policy_test.cpp)
+    add_test(NAME ds4_prefetch_policy_test COMMAND ds4_prefetch_policy_test)
+  endif()
+
   # Plan v0.3 P6: one expert applied to several tokens, bitwise vs the single-token kernel (synthetic, CPU only).
   # plan v0.3 P5: the device dequantizers vs the artifact's CPU dequantizers on the real shards (not a ctest: needs
   # the 38 GB model; run it by hand or from tools/gpu_session.py)

@@ -504,6 +504,7 @@ windows. The stream lane's time is measured on the GPU itself. On an RTX 3090 + 
 
 | Setting | Default | |
 | --- | --- | --- |
+| `DS4_PF_SAMPLES` | Linux: 0; Windows: 8 | Expert read-ahead: `0` always hints; `1`-`16` probes per range skip hints when all probes look warm. Positive counts enable Linux sampling; [tradeoffs and compatibility overrides](ds4-expert-prefetch.md). Restart after changing it |
 | `MAYA_DS4_STREAM` | on (1) | `0`: every expert VRAM does not hold on the CPU, as before |
 | `DS4_STREAM_TOKEN_AB` | on (1) | `0`: the per-layer check alone decides, as in v1.1.24 |
 | `DS4_STREAM_ZC` | on with one NVIDIA GPU on Linux where experts stream | `0`: copied experts pass the pinned staging, as before (the GPU does not pull them in place) |

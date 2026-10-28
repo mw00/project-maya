@@ -196,7 +196,8 @@ slowest while the caches fill with what you use.
 - **Pictures:** attach one in the chat, or send image parts through either API.
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
-  [docs/SETTINGS.md](docs/SETTINGS.md).
+  [docs/SETTINGS.md](docs/SETTINGS.md). Optional DeepSeek [expert read-ahead sampling](docs/ds4-expert-prefetch.md)
+  keeps platform defaults; compare your workload before enabling it.
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**Each model's own options** - GLM-5.3-Flash's several requests at once (`--parallel`), long contexts and DFlash2
   drafter; DeepSeek's kept conversations, expert loading and Engram read-ahead; MiniMax's thinking levels:
   [docs/MODELS.md](docs/MODELS.md).
