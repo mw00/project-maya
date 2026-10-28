@@ -150,16 +150,23 @@ class Engine(Protocol):
     def generate(self, ids: list[int], max_new: int, sampling: dict, cancel: threading.Event) -> Iterator[int]: ...
 
 
+PEAK_MIN_TOKENS = 32   # the Monitor's peak decode speed: answers this long or longer (a few tokens' speed says little)
+
+
 class MockEngine:
     """Replays a scripted completion (text) as token ids, one per step, then the end-of-turn token.  Given a list of
     scripts, each request gets the next one and the last one repeats (a tool call, then the answer after it)."""
 
-    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0):
+    def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0,
+                 tok_s: float | None = None):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
+        # tok_s: it writes at about that speed and reports its clock as the engine's DONE does (the Monitor's speeds;
+        # `--engine mock` takes MAYA_MOCK_TOK_S)
+        self.tok_s = tok_s
         end = tokenizer.encode(IM_END, parse_special=True)
         self.scripts = [tokenizer.encode(x, parse_special=True) + end for x in ([script] if isinstance(script, str)
                                                                                  else script)]
-        self.script, self.turns = self.scripts[0], 0
+        self.script, self.turns, self._runs = self.scripts[0], 0, 0
         self.last_prompt: list[int] = []
         self.info = {"logit_bias": 1}   # it samples nothing, so every request's bias is as good as applied
 
@@ -169,11 +176,18 @@ class MockEngine:
         if len(self.scripts) > 1:
             self.script = self.scripts[min(self.turns, len(self.scripts) - 1)]
             self.turns += 1
-        for t in self.script[:max_new]:
+        t0, steps = time.time(), self.script[:max_new]
+        self._runs += 1
+        for i, t in enumerate(steps):
             if cancel.is_set():
                 return
             if self.delay:
                 time.sleep(self.delay)
+            if self.tok_s:
+                time.sleep((0.8 + 0.4 * ((t * 7919 + self._runs * 104729) % 101) / 100) / self.tok_s)   # (uneven)
+                if i == len(steps) - 1:                 # (its DONE, before the last token: the server stops there)
+                    self.last = {"generated": i + 1, "decode_ms": (time.time() - t0) * 1000,
+                                 "prompt_ms": len(ids) * 0.5, "reused": 0}
             yield t
 
 
@@ -1738,7 +1752,8 @@ class Service:
         self.history = collections.deque(maxlen=500)    # the last finished requests, newest last (GET /metrics)
         # since the server started (the Monitor's totals, issue #35)
         self.totals = {"since": time.time(), "requests": 0, "prompt_tokens": 0, "reused": 0, "output_tokens": 0,
-                       "prompt_ms": 0.0, "decode_ms": 0.0}
+                       "prompt_ms": 0.0, "decode_ms": 0.0,
+                       "peak_decode": None}   # the fastest answer's decode: {tok_s, tokens, time} (PEAK_MIN_TOKENS+)
         # the loop guard (serve/loop_guard.py; MAYA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the server started: loops seen, and how each was broken (the Monitor's totals, /metrics, Prometheus)
         self.loop_guard = True
@@ -2448,6 +2463,9 @@ class Service:
             ("llamacpp:requests_processing", "gauge", "Requests running", max(active, int(bool(s.get("busy"))))),
             ("llamacpp:requests_deferred", "gauge", "Requests waiting their turn", s.get("queued") or 0),
             ("maya:requests_total", "counter", "Requests finished", t["requests"]),
+            ("maya:decode_peak_tokens_seconds", "gauge",
+             f"The fastest answer's generation throughput in tokens/s ({PEAK_MIN_TOKENS} tokens or more)",
+             (t.get("peak_decode") or {}).get("tok_s") or 0),
             ("maya:engine_alive", "gauge", "1 while the engine process runs",
              int(self.engine.alive()) if hasattr(self.engine, "alive") else 1),
             ("maya:loop_guard_detected_total", "counter", "Loops the loop guard saw in answers", guard["detected"]),
@@ -3137,7 +3155,7 @@ class Service:
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
-                    self.history.append({
+                    row = {
                         "projection": (sampling or {}).get("experimental_speed_projection") is not False
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
@@ -3150,8 +3168,13 @@ class Service:
                         "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                         if n and last.get("generated") and last.get("decode_ms") else None,
                         "hit_rate": hit_rate,
-                        "loop_guard": guards[0].summary() if guards and guards[0].events else None})
+                        "loop_guard": guards[0].summary() if guards and guards[0].events else None}
+                    self.history.append(row)
                     t = self.totals
+                    peak = t.get("peak_decode")
+                    if row["decode_tok_s"] and n >= PEAK_MIN_TOKENS and \
+                            (peak is None or row["decode_tok_s"] > peak["tok_s"]):
+                        t["peak_decode"] = {"tok_s": row["decode_tok_s"], "tokens": n, "time": started}
                     t["requests"] += 1
                     t["prompt_tokens"] += len(ids)
                     t["reused"] += last.get("reused") or 0
@@ -4998,7 +5021,8 @@ def main() -> int:
                 vision = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
-            "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}
+            "Thinking about it.</think>\n\nHello from the mock engine."],
+            tok_s=float(os.environ.get("MAYA_MOCK_TOK_S") or 0) or None), None, {}
     # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
     # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
     # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls

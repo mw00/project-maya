@@ -176,6 +176,7 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
   .mon__page { padding: calc(78px + max(10px, env(safe-area-inset-top))) 16px 40px; gap: 16px; }
   .card { padding: 16px; }
   .speed__big { font-size: 40px; }
+  .speeds { row-gap: 14px; }
   .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
   .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }

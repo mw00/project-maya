@@ -169,6 +169,30 @@ class Dashboard(unittest.TestCase):
             {"type": "text", "text": "and this"}, {"type": "image_url", "image_url": {"url": "data:,"}}]}]})
         self.assertTrue(json.loads(b)["approximate"])
 
+    def test_peak_decode_speed(self):
+        # the Monitor's peak decode: the fastest answer since the server started, of PEAK_MIN_TOKENS tokens or more
+        from serve.server import PEAK_MIN_TOKENS
+        s, _, b = self.req("GET", "/metrics")
+        self.assertIsNone(json.loads(b)["totals"]["peak_decode"])
+        end = self.engine.script[-1:]                                  # (its end-of-turn token)
+        self.engine.script = self.engine.scripts[0] = ByteTokenizer().encode("</think>\n\n" + "a long enough answer " * 3) + end
+        self.engine.tok_s = 4000
+        rows = []
+        for _ in range(3):
+            self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+            rows.append(json.loads(self.req("GET", "/metrics")[2])["requests"][0])
+        peak = json.loads(self.req("GET", "/metrics")[2])["totals"]["peak_decode"]
+        top = max(rows, key=lambda r: r["decode_tok_s"])
+        self.assertEqual((peak["tok_s"], peak["tokens"], peak["time"]), (top["decode_tok_s"], top["output_tokens"], top["time"]))
+        self.assertGreaterEqual(peak["tokens"], PEAK_MIN_TOKENS)
+        _, _, b = self.req("GET", "/metrics/prometheus")
+        self.assertIn(f"maya:decode_peak_tokens_seconds {peak['tok_s']}", b.decode())
+        # a short answer, however fast, is not the peak
+        self.engine.tok_s = 400000
+        self.req("POST", "/v1/chat/completions", {"model": "m", "max_tokens": 5,
+                                                  "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(json.loads(self.req("GET", "/metrics")[2])["totals"]["peak_decode"], peak)
+
     def test_requests_record_their_api(self):
         self.req("POST", "/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
         s, _, b = self.req("GET", "/metrics")
