@@ -341,13 +341,40 @@ RoundLog& round_log() {
     return r;
 }
 
+// a DS4_ setting as MAYA_DS4_* sets it (read as STRATA_DS4_*), else the DS4_* name itself (the model's ds4_env)
+const char* ds4_env(const char* name) {
+    const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+    return v != nullptr ? v : std::getenv(name);
+}
+
+// DS4_DRAFT_COST=1 (MAYA_DS4_DRAFT_COST): DSpark's window by what a verified row costs on this PC, in place of the
+// fixed cut on the product of the confidences (MAYA_DS4_DSPARK_CUM) - the cost-aware window of
+// strata/spec/draft_policy.hpp.  Under the floor on each draft's own confidence (dspark_conf), a request alone verifies
+// the drafts that commit the most tokens a millisecond at the measured round time of its window's rows; with
+// --parallel the windows of a step are planned together at the measured time of a step of that many requests by its
+// rows in all, so a request's extra rows are charged for the time they add to the others' tokens too, and a request
+// whose drafts are likelier to hold may take more than an even share of the 16 rows.  Every draft is still verified:
+// the same tokens, only the speed moves.  A request's own dspark_cum key keeps the fixed cut for it.  Off by default
+// (opt-in until measured on GPUs: a choice made from timings)
+struct DraftCost {
+    strata::spec::DraftPolicy alone;                 // a request alone (and the drafter's acceptance table for all)
+    std::vector<strata::spec::DraftPolicy> shared;   // --parallel: steps of n requests at [n - 2], by their rows in all
+    explicit DraftCost(int max_t) : alone(max_t), shared(7, strata::spec::DraftPolicy(max_t)) {}
+    std::string text() const {   // (the log's line: the measured round times by rows, ms (rounds))
+        std::string s = "alone " + alone.cost_text();
+        for (size_t i = 0; i < shared.size(); ++i)
+            if (!shared[i].cost_text().empty()) s += "; " + std::to_string(i + 2) + " at once " + shared[i].cost_text();
+        return s;
+    }
+};
+
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
 // confidence holds (at most `room` - 1 of them) - or the lookup's (lk, above) - verified together; else a plain step.
 // `out` gets the tokens that follow tok (the accepted drafts, then the trunk's next), the last of them the next round's
-// tok.
+// tok.  dc (DS4_DRAFT_COST, above): how many of the drafts by their cost
 bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, float temperature, float top_p, int top_k,
            float min_p, unsigned long long seed, unsigned long long& counter, std::vector<int>& out, int& offered,
-           int& accepted, std::string& err, float cum_min = -1.0f, Lookup* lk = nullptr) {
+           int& accepted, std::string& err, float cum_min = -1.0f, Lookup* lk = nullptr, DraftCost* dc = nullptr) {
     out.clear();
     offered = accepted = 0;
     const double t0 = now_ms();
@@ -362,11 +389,22 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         if (!m.draft(tok, drafts, conf, err, temperature, top_p, top_k, min_p, seed, counter)) return false;
         const int made = (int) drafts.size();
         int keep = 0;
-        if (cum_min < 0) cum_min = dspark_cum_default();
-        float cum = 1.0f;
-        while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
-               (cum *= conf[(size_t) keep]) >= cum_min)
-            ++keep;
+        if (dc != nullptr) dc->alone.set_context(m.pos());
+        if (dc != nullptr && cum_min < 0) {   // (the drafts under the floor; of those, the window that pays best)
+            int n = 0;
+            while (n < (int) drafts.size() && n < room - 1 && n < strata::spec::DraftPolicy::kMaxT - 1 &&
+                   conf[(size_t) n] >= conf_min)
+                ++n;
+            double q[strata::spec::DraftPolicy::kMaxT];
+            dc->alone.chain(conf.data(), n, q);
+            keep = dc->alone.window(q, n, room) - 1;
+        } else {
+            if (cum_min < 0) cum_min = dspark_cum_default();
+            float cum = 1.0f;
+            while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
+                   (cum *= conf[(size_t) keep]) >= cum_min)
+                ++keep;
+        }
         bool from_lk = false;
         if (lk != nullptr && !drafts.empty() && !m.drafts_sampled()) {
             const int k = lk->sfx.propose(std::min(room, m.verify_max()) - 1, lk->buf.data());
@@ -390,6 +428,10 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
             out.push_back(next);
             offered = keep;
             accepted = acc;
+            if (dc != nullptr) {   // (the round's time by its rows, the lookup's windows too; DSpark's drafts' verdicts)
+                dc->alone.observe_cost(keep + 1, now_ms() - t0);
+                if (!from_lk) dc->alone.observe_drafts(conf.data(), keep, acc);
+            }
             if (lk != nullptr) {
                 lk->policy.observe(from_lk, keep + 1, acc, match, now_ms() - t0);
                 if (from_lk) {
@@ -430,6 +472,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     if (!m.step(tok, true, err)) return false;
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
     if (lk != nullptr) lk->policy.observe(false, 1, 0, match, now_ms() - t0);
+    if (dc != nullptr && drafter) dc->alone.observe_cost(1, now_ms() - t0);   // (drafted, none verified)
     return true;
 }
 
@@ -618,7 +661,7 @@ void start_watchdog(const strata::ds4::Model& m) {
 }
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack,
-          Lookup* lk) {
+          Lookup* lk, DraftCost* dc) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
@@ -1551,7 +1594,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
-                           off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk)) {
+                           off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
                     break;
@@ -1604,6 +1647,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (lk && lk->windows > lk_w0)
             std::fprintf(stderr, "maya ds4 serve: prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the above)\n",
                          lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
+        if (dc != nullptr && d_off > 0)
+            std::fprintf(stderr, "maya ds4 serve: draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n", dc->text().c_str());
         prof_line(s_dec, s);   // DS4_PROF: this request's decode (the CLI's line, a request at a time)
         m.save_profile();
     }
@@ -1680,6 +1725,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                          a.t1 > a.P.t0 ? 1000.0 * (double) (a.r.ids.size() - a.P.from) / (a.t1 - a.P.t0) : 0.0,
                          a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size(),
                          a.d_acc, a.d_off);
+            if (dc != nullptr && a.d_off > 0)
+                std::fprintf(stderr, "maya ds4 serve: draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n",
+                             dc->text().c_str());
             seq_rid[(size_t) a.seq] = -1;
             seq_used[(size_t) a.seq] = ++use_clock;
             in.forget(a.r.rid);
@@ -1803,7 +1851,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 int off = 0, acc = 0;
                 const bool try_spec = (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool;
                 if (!round(m, a.tok, room, try_spec, a.r.conf >= 0 ? a.r.conf : conf_min, a.r.temperature, a.r.top_p,
-                           a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L)) {
+                           a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     a.finish = "cancel";
                     a.done = true;
@@ -1819,8 +1867,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             } else if (need.size() > 1) {   // several: a round of each through the model together
                 // each one's drafts (DSpark, a conversation at a time: its own drafter rings) while their confidence
                 // holds, its share of a window at most; then every one's token and drafts through the model at once
-                // (step_multi_spec) and each its verdict (verify_multi).  No drafts this round: a token of each
+                // (step_multi_spec) and each its verdict (verify_multi).  No drafts this round: a token of each.
+                // DS4_DRAFT_COST (DraftCost): the windows planned together instead, the rows in all a window at most
                 const int nn = (int) need.size(), share = m.verify_max() / nn;
+                const double t_step = now_ms();   // (DS4_DRAFT_COST: the step's time, its drafting included)
                 const auto cancel_all = [&] {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     for (Act* a : need) {
@@ -1832,13 +1882,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::vector<std::vector<float>> confs((size_t) nn);
                 std::vector<char> tried((size_t) nn, 0), closing((size_t) nn, 0);
                 std::vector<int> rooms((size_t) nn, 1), dsv, dys, dix;   // (the ones that draft: conversation, y, index)
-                bool any = false, failed = false;
+                std::vector<int> room_all((size_t) nn, 1);   // (DS4_DRAFT_COST: the room past the even share)
+                bool any = false, failed = false, stepped = false;
                 for (int i = 0; i < nn; ++i) {
                     Act& a = *need[(size_t) i];
                     int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
                     closing[(size_t) i] = close_think(a);
                     if (closing[(size_t) i]) room = 1;
                     else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
+                    room_all[(size_t) i] = room;
                     rooms[(size_t) i] = room = std::min(room, share);
                     if (!((a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0)) continue;
                     tried[(size_t) i] = 1;
@@ -1866,13 +1918,41 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         bind(dsv[(size_t) j]);
                         failed = !m.draft(dys[(size_t) j], drafts[(size_t) dix[(size_t) j]], confs[(size_t) dix[(size_t) j]], err);
                     }
+                // DS4_DRAFT_COST: each drafting request's drafts under its floor (their chain from the drafter's
+                // acceptance table), planned together at the measured time of a step of nn requests by its rows in
+                // all; a request with its own dspark_cum keeps its cut, beside the plan as one that does not draft
+                strata::spec::DraftPolicy* sp = dc != nullptr && !failed && nd > 0
+                                                    ? &dc->shared[(size_t) (std::min(nn, (int) dc->shared.size() + 1) - 2)]
+                                                    : nullptr;
+                std::vector<std::vector<double>> qs((size_t) nn);
+                std::vector<const double*> pq;
+                std::vector<int> plen, pcap, pix;
+                int fixed_rows = 0;
+                double fixed_tok = 0.0;
                 for (int i = 0; i < nn && !failed; ++i) {
-                    if (!tried[(size_t) i]) continue;
+                    if (!tried[(size_t) i]) {
+                        ++fixed_rows;   // (its token: a row, a token)
+                        fixed_tok += 1.0;
+                        continue;
+                    }
                     Act& a = *need[(size_t) i];
                     const int room = rooms[(size_t) i];
                     std::vector<int>& d = drafts[(size_t) i];
                     const std::vector<float>& conf = confs[(size_t) i];
                     const float cmin = a.r.conf >= 0 ? a.r.conf : conf_min;
+                    if (sp != nullptr && a.r.cum < 0) {
+                        int n = 0;
+                        while (n < (int) d.size() && n < room_all[(size_t) i] - 1 &&
+                               n < strata::spec::DraftPolicy::kMaxT - 1 && conf[(size_t) n] >= cmin)
+                            ++n;
+                        qs[(size_t) i].resize((size_t) n);
+                        dc->alone.chain(conf.data(), n, qs[(size_t) i].data());
+                        pq.push_back(qs[(size_t) i].data());
+                        plen.push_back(n);
+                        pcap.push_back(room_all[(size_t) i]);
+                        pix.push_back(i);
+                        continue;
+                    }
                     const float cum_min = a.r.cum >= 0 ? a.r.cum : dspark_cum_default();
                     int keep = 0;
                     float cum = 1.0f;
@@ -1881,6 +1961,24 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         ++keep;
                     d.resize((size_t) keep);
                     any = any || keep > 0;
+                    if (sp != nullptr) {   // (its own cut: its rows, and the tokens they likely commit)
+                        qs[(size_t) i].resize((size_t) keep);
+                        dc->alone.chain(conf.data(), keep, qs[(size_t) i].data());
+                        fixed_rows += keep + 1;
+                        fixed_tok += strata::spec::DraftPolicy::tokens(qs[(size_t) i].data(), keep);
+                    }
+                }
+                if (sp != nullptr && !failed) {
+                    int64_t ctx = 0;   // (the band: the longest context of the step)
+                    for (Act* a : need) ctx = std::max<int64_t>(ctx, m.seq_pos(a->seq));
+                    sp->set_context(ctx);
+                    std::vector<int> prow(pix.size(), 1);
+                    sp->plan(pq.data(), plen.data(), pcap.data(), (int) pix.size(), m.verify_max(), fixed_rows, fixed_tok,
+                             prow.data());
+                    for (size_t j = 0; j < pix.size(); ++j) {
+                        drafts[(size_t) pix[j]].resize((size_t) (prow[j] - 1));
+                        any = any || prow[j] > 1;
+                    }
                 }
                 if (failed) cancel_all();
                 else if (!any) {
@@ -1890,7 +1988,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         tv.push_back(a->tok);
                     }
                     if (!m.step_multi(sv.data(), tv.data(), nn, err)) cancel_all();
-                    else
+                    else {
                         for (int i = 0; i < nn; ++i) {
                             Act& a = *need[(size_t) i];
                             penalties(a.r);
@@ -1899,6 +1997,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             if (closing[(size_t) i]) a.tok = a.r.think_end;
                             a.cool = tried[(size_t) i] != 0;   // (its drafter tried and kept none: rests a round)
                         }
+                        stepped = true;
+                    }
                 } else {
                     std::vector<std::vector<int>> rows((size_t) nn);
                     std::vector<const int*> tp((size_t) nn);
@@ -1922,6 +2022,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                 cancel_all();
                                 break;
                             }
+                            stepped = i == nn - 1;   // (every verdict taken)
+                            if (dc != nullptr && !d.empty()) dc->alone.observe_drafts(confs[(size_t) i].data(), (int) d.size(), acc);
                             a.counter += (unsigned long long) acc + 1;
                             a.d_off += (long long) d.size();
                             a.d_acc += acc;
@@ -1933,6 +2035,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             a.tok = a.got.back();
                             a.got.pop_back();
                         }
+                }
+                if (sp != nullptr && stepped) {   // (DS4_DRAFT_COST: the step's time by its rows in all)
+                    int rows_all = 0;
+                    for (const std::vector<int>& d : drafts) rows_all += 1 + (int) d.size();
+                    sp->observe_cost(rows_all, now_ms() - t_step);
                 }
             }
             for (size_t i = 0; i < acts.size();) {
@@ -2998,7 +3105,14 @@ int main(int argc, char** argv) {
     std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
-    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
+    std::unique_ptr<DraftCost> dc;   // (DS4_DRAFT_COST: DSpark's window by this PC's measured cost, over the run)
+    if (const char* v = ds4_env("DS4_DRAFT_COST"); v != nullptr && std::atoi(v) != 0 && m.draft_block() > 0) {
+        dc = std::make_unique<DraftCost>(m.verify_max());
+        std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: DSpark's window by the measured cost of its rows (opt-in; the "
+                             "same tokens)\n");
+    } else if (ds4_env("DS4_DRAFT_COST") != nullptr && std::atoi(ds4_env("DS4_DRAFT_COST")) != 0)
+        std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
+    if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
     if (!prof_run.empty()) return profile_run(m, prof_run, o.profile_out);
     if (!spec_eval_path.empty()) return spec_eval(m, spec_eval_path, n > 0 ? n : 256, temp, cli_seed);
     if (sampler_n > 0) {
@@ -3179,7 +3293,7 @@ int main(int argc, char** argv) {
                 int off = 0, acc = 0;
                 const bool try_spec = spec && !cool;
                 if (!round(m, tok, n - (int) out.size(), try_spec, o.dspark_conf, temp, 1.0f, temp > 0 ? 64 : 1, 0.0f,
-                           cli_seed, counter, got, off, acc, err, -1.0f, lk.get())) {
+                           cli_seed, counter, got, off, acc, err, -1.0f, lk.get(), dc.get())) {
                     std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
                     return 1;
                 }
@@ -3197,6 +3311,7 @@ int main(int argc, char** argv) {
         if (lk && lk->windows > lk_w0)
             std::fprintf(stderr, "prompt lookup: %lld rounds, %lld of its %lld drafts kept (in the dspark line's)\n",
                          lk->windows - lk_w0, lk->accepted - lk_a0, lk->offered - lk_o0);
+        if (dc != nullptr) std::fprintf(stderr, "draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n", dc->text().c_str());
     }
     if (prof && rep == reps - 1) cudaProfilerStop();
     if (spec && rounds > 0) {
