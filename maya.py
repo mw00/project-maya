@@ -4849,7 +4849,8 @@ def write_config_ds4(a, pc: dict, meta: dict, pack: Path, ctx: int, models: Path
     same_gpus = tp_keepable(old, pc)
     kept = keep_args(old.get("args") or [], args, (("--tp",) if same_gpus else ()) +
                      ("--prefill-chunk", "--reserve-mib", "--vram-experts", "--cpu-threads", "--threads", "--dspark",
-                      "--dspark-conf", "--expert-profile", "--mmap-experts", "--parallel"))
+                      "--dspark-conf", "--expert-profile", "--mmap-experts", "--parallel", "--ssd-cache",
+                      "--ssd-policy"))
     if getattr(a, "parallel", None):   # given now: written, and a later setup keeps it
         set_arg(args, "--parallel", a.parallel)
         ok(f"answers at once: {a.parallel} (--parallel; each its own context's caches in VRAM)")

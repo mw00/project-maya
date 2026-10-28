@@ -127,6 +127,7 @@ void usage() {
                  "           [--tp N] [--threads on|off] [--prefill-chunk N] [--dspark on|off|none] [--dspark-conf F]\n"
                  "           [--suffix-draft N]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--parallel N (--serve: N conversations at once)]\n"
+                 "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
@@ -1181,6 +1182,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         out += b;
         if (sx > 0) {   // (the PCIe lane: experts a token streamed to the GPU)
             std::snprintf(b, sizeof b, " pcie=%.3f", sx / fed);
+            out += b;
+        }
+        if (s.store_slots > 0) {   // (--ssd-cache: a token's CPU-lane experts from the RAM store, read into it; the
+                                   //  lane's wait for its reads, ms a token)
+            std::snprintf(b, sizeof b, " store_hit=%.3f store_miss=%.3f store_wait_ms=%.3f",
+                          (double) (s.store_hits - s_dec.store_hits) / fed, (double) (s.store_misses - s_dec.store_misses) / fed,
+                          (s.store_wait_ms - s_dec.store_wait_ms) / fed);
             out += b;
         }
         if (s.helper_held > 0) {   // (DS4_HELPER: experts a token the helper GPU computed, the CPU lane for it after
@@ -3042,6 +3050,24 @@ int main(int argc, char** argv) {
         else if (a == "--mmap-experts") {
             const std::string v = val("--mmap-experts");
             o.mmap_experts = v == "on" ? 1 : v == "off" ? 0 : -1;
+        } else if (a == "--ssd-cache") {   // (the RAM expert store: GB, auto - the free RAM less 12 GB - or off)
+            const std::string v = val("--ssd-cache");
+            char* end = nullptr;
+            const double gb = std::strtod(v.c_str(), &end);
+            if (v == "auto") o.ssd_cache_gb = -1.0;
+            else if (v == "off") o.ssd_cache_gb = 0.0;
+            else if (!v.empty() && end != v.c_str() && *end == '\0' && gb >= 0.0 && gb <= 1e6) o.ssd_cache_gb = gb;
+            else {
+                std::fprintf(stderr, "--ssd-cache needs a size in GB, auto or off, not \"%s\"\n", v.c_str());
+                return 2;
+            }
+        } else if (a == "--ssd-policy") {
+            const std::string v = val("--ssd-policy");
+            if (v != "lru" && v != "lfu") {
+                std::fprintf(stderr, "--ssd-policy needs lru or lfu, not \"%s\"\n", v.c_str());
+                return 2;
+            }
+            o.ssd_policy = v == "lfu" ? 1 : 0;
         } else if (a == "--images") images = val("--images");
         else if (a == "--encode-image") enc_rgb = val("--encode-image");
         else if (a == "--dump-image") enc_out = val("--dump-image");
@@ -3389,6 +3415,16 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    if (s.store_slots > 0)   // --ssd-cache
+        std::fprintf(stderr, "RAM store: a token's CPU-lane experts %.2f from it, %.2f read (%.2f of them in place: no slot); "
+                             "the lane waited %.2f ms a token for its reads; %lld put in from VRAM, %lld guesses (%lld "
+                             "asked for, %lld dropped unread), %lld given up, %lld reads failed; %lld of %lld slots held\n",
+                     (double) (s.store_hits - s0.store_hits) / nt, (double) (s.store_misses - s0.store_misses) / nt,
+                     (double) (s.store_no_slot - s0.store_no_slot) / nt, (s.store_wait_ms - s0.store_wait_ms) / nt,
+                     (long long) (s.store_put - s0.store_put), (long long) (s.store_guesses - s0.store_guesses),
+                     (long long) (s.store_guess_used - s0.store_guess_used),
+                     (long long) (s.store_cancelled - s0.store_cancelled), (long long) (s.store_evicted - s0.store_evicted),
+                     (long long) (s.store_failed - s0.store_failed), (long long) s.store_held, (long long) s.store_slots);
     if (s.helper_held > 0)   // DS4_HELPER
         std::fprintf(stderr, "decode helper: %lld experts on the helper GPU (%d held), %lld on the CPU lane after it failed%s; "
                              "waits for it %.2f ms a token\n",

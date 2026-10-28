@@ -40,6 +40,11 @@ struct Options {
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
     int mmap_experts = -1;
+    // --ssd-cache (ds4_store.hpp; opt-in until measured): a GGUF's in-place CPU-lane experts kept whole in a RAM store
+    // of this many GB, read past the page cache - 0 off, < 0 auto (the free RAM less 12 GB); --ssd-policy: which expert
+    // gives way, 0 lru, 1 lfu
+    double ssd_cache_gb = 0.0;
+    int ssd_policy = 0;
     bool dspark = true;              // load the DSpark drafter (the checkpoint's mtp.* blocks) for speculative decoding
     float dspark_conf = 0.5f;         // a draft is verified while its confidence (sigmoid) is at least this
     // prompt lookup (ds4_main's --suffix-draft): its verify windows run without the drafter too - their buffers (the
@@ -121,6 +126,14 @@ struct Stats {
     int64_t skip_switches = 0;        // ... the times it switched
     double skip_cold = 0.0;           // ... the cold share over its window (while skipping)
     int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
+    // the RAM store (--ssd-cache): its slots (0: off) and how many hold an expert; the CPU lane's asks it held, read
+    // (and of them could not take: read in place), the lookahead's guesses (started, asked for later, dropped unread),
+    // experts the VRAM cache put in, experts given up, failed reads, the CPU lane's waits for its reads
+    int64_t store_slots = 0, store_held = 0;
+    int64_t store_hits = 0, store_misses = 0, store_no_slot = 0;
+    int64_t store_guesses = 0, store_guess_used = 0, store_cancelled = 0;
+    int64_t store_put = 0, store_evicted = 0, store_failed = 0;
+    double store_wait_ms = 0.0;
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this

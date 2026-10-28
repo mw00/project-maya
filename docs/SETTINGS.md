@@ -722,6 +722,60 @@ left out in the second half; after a 4,096-token answer, 6 prompts' KL against n
 With `MAYA_DS4_DISK_SKIP_W` set, the engine log gets a line every 512 decoded tokens: the experts a token left out and
 the copy swaps (`ds4: DISK_SKIP: ...`).
 
+## DeepSeek: a RAM store for the experts read from the SSD (opt-in until measured)
+
+Where the RAM cannot hold every expert VRAM leaves over (a 64 GB PC beside a 120-270 GB GGUF), the CPU lane reads them
+in place from the model's files (`--mmap-experts`, auto when the copy does not fit), and the OS page cache decides which
+stay in RAM: it knows nothing of which experts are hot, reads a page at a time as the lane faults, and gives them up to
+any other I/O. `--ssd-cache` gives that RAM to a store of whole experts instead:
+
+- an expert is read whole into a slot of the store's own, past the page cache (Linux: `O_DIRECT`; on Windows through
+  the files' ordinary handles, so there the page cache still sees the reads - see `DS4_STORE_UNBUFFERED`);
+- when it is full, `--ssd-policy` decides which expert gives way: `lru` the least recently asked for, `lfu` the least
+  asked for lately (its count decays); never one a token is computing;
+- at load it is filled with the profile's hottest CPU-lane experts, then (`DS4_STORE_SPARE`) with the VRAM experts the
+  profile counts least - the ones the expert cache gives back to the CPU lane first - and an expert that leaves VRAM is
+  copied into it from VRAM (`DS4_STORE_PUT`), so the lane does not read it from the SSD;
+- a token computes the experts the store holds while it reads the others, each as its read lands (`DS4_STORE_SPLIT`);
+- the PCIe lane, the expert cache's moves into VRAM and the prompt's chunks copy an expert out of the store when it
+  holds one, instead of reading it;
+- it grows in chunks while 8 GB of RAM stays free beside it, and gives chunks back when the free RAM falls below 4 GB
+  (another program opened), checked every second.
+
+It changes no arithmetic: the same bytes are computed the same way (the PCIe lane's split follows measured times, so
+it may stream other experts, as it can from one run to the next). Whether it is faster than the page cache has not been
+measured yet, so it is off by default. It applies to a GGUF's experts read in place; where
+`--mmap-experts auto` copies them all into RAM it does nothing (the copy is the faster way), and it stays off with
+`MAYA_DS4_RAM_TIER=1`. The engine log says what it took (`ds4: RAM store ...`) and, after a decode, how a token's
+experts came (`RAM store: ...`; STAT lines: `store_hit=`, `store_miss=`, `store_wait_ms=`).
+
+The `DS4_STORE_*` settings go in a config's `"env"`, or as `MAYA_DS4_STORE_*` in the settings.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `--ssd-cache GB\|auto\|off` (or `DS4_STORE_GB`) | off | the store's size in GB, at most every expert it could hold; `auto`: the free RAM at load (after VRAM's experts and any RAM copies) less `DS4_STORE_ROOM_GB`, not started under 4 GB |
+| `--ssd-policy lru\|lfu` (or `DS4_STORE_POLICY`) | `lru` | which expert gives way when it is full |
+| `DS4_STORE_ROOM_GB` | 12 | `auto` leaves this much of the free RAM to the system and the owner's programs |
+| `DS4_STORE_FLOOR_GB` | 4 | below this much free RAM the store gives chunks back |
+| `DS4_STORE_GROW_GB` | 8 | a new chunk only while this much RAM stays free beside it |
+| `DS4_STORE_THREADS` | 8 | its reading threads |
+| `DS4_STORE_PRELOAD` | 1 | `0`: nothing read at load; the first tokens fill it |
+| `DS4_STORE_SPARE` | 1 | `0`: no VRAM experts in the slots the CPU lane's leave over |
+| `DS4_STORE_PUT` | 1 | `0`: an expert leaving VRAM is not copied into the store (the lane reads it from the SSD when it needs it) |
+| `DS4_STORE_SPLIT` | 1 | `0`: a token waits for all its reads, then computes its experts at once |
+| `DS4_STORE_FLOW` | 1 | `0`: a prompt's chunks read every expert from the files, as without the store |
+| `DS4_STORE_AHEAD` | 0 | `1`: the lookahead's guesses for the next layers are read into the store behind every demand read, a guess still queued once the token is past its layer dropped. Off: with the store the guesses are not read at all (never into the page cache) |
+| `DS4_STORE_UNBUFFERED` | 0 | Windows: `1` reads with `FILE_FLAG_NO_BUFFERING`, a handle a reading thread; Windows' unbuffered reads of a file the engine also maps take a slow path, so measure it first |
+
+Not taken over from the design this follows, as they measured as losses there: filling the store in the background
+after the model is ready, the GPU reading the store's slots in place over PCIe, and filling it after each prompt with
+the prompt's experts.
+
+To measure it against the page cache (one model, the same prompts, both ways): a GGUF set larger than the RAM, e.g. the
+2.25 bpw set, the engine started in a memory cgroup (`systemd-run --user --scope -p MemoryMax=64G ...`) with the page
+cache emptied before each run, `--n` decodes of the same prompts with and without `--ssd-cache auto`, comparing decode
+tok/s, `decode reads from the disk` and the `RAM store` line.
+
 ## DeepSeek: explicit RAM residency
 
 These independent settings are off by default. They are for Linux hosts with enough physical RAM to hold the

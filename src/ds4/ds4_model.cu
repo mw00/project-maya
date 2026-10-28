@@ -35,6 +35,7 @@
 #include "ds4_prefill_stats.hpp"
 #include "ds4_prompt_mem.hpp"
 #include "ds4_ram_slice.hpp"
+#include "ds4_store.hpp"
 #include "ds4_vision.cuh"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -760,6 +761,7 @@ struct Chunk {
         bool dpart = false;                            // (DS4_FLOW_DOWN_PART) its down's read compacted to the member's
                                                        // columns where it landed, DMA'd as one run (flow_copy)
         int64_t after = -1;                            // (layer-major) the items up to this one read first
+        int sto = -1;                                  // (the RAM store) its slot, pinned while copied out of it
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
     };
@@ -1599,6 +1601,16 @@ struct Model::Impl {
     std::thread ram_th;
     int ram_inflight = 0, ram_held = 0;
     bool ram_tier = std::getenv("STRATA_DS4_RAM_TIER") != nullptr && std::atoi(std::getenv("STRATA_DS4_RAM_TIER")) != 0;
+    // the RAM expert store (--ssd-cache, DS4_STORE_GB; ds4_store.hpp; opt-in until measured): a GGUF's in-place CPU-lane
+    // experts of the trunk kept whole in RAM slots of its own instead of the page cache - read past it (Linux O_DIRECT),
+    // lru or lfu deciding which gives way, preloaded from the profile.  The CPU lane computes the ones it holds while it
+    // reads the others, each as its read lands (DS4_STORE_SPLIT); an expert the VRAM cache gives back is put in from VRAM
+    // (DS4_STORE_PUT); the lookahead's guesses go into its queue, behind the demand reads, only with DS4_STORE_AHEAD=1.
+    // Null: off - the page cache, as before.  (Declared before ln_pool: the PCIe lane's readers copy out of it)
+    std::unique_ptr<ExpertStore> store;
+    bool store_split = true, store_put = true, store_ahead = false, store_flow = true;
+    // an expert the CPU lane would read from the files that the store covers
+    bool store_reads(const Layer& l, int e) const { return store && store->covers(l.il) && file_read(l, e); }
     // STRATA_DS4_DISK_SKIP_W (experimental opt-in, CHANGES THE ANSWERS; 0 = off): on the small windows (decode, a
     // draft's check - never the prompt path) the CPU lane leaves out a routed expert whose share of its token's route
     // weights is below this and whose pages are not in RAM now (the page cache or the RAM tier; os::in_ram - Linux every
@@ -1623,6 +1635,7 @@ struct Model::Impl {
     }();
     bool in_ram(const Layer& l, int e) const {   // (DISK_SKIP_W) expert e's pages in RAM now
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0) return true;
+        if (store && store->has(l.il, e)) return true;
         if (l.lay.fmt == gg::kFmtMXFP4) {
             for (int r = 0; r < 3; ++r)
                 if (!os::in_ram(mx_mat(l, e, r), mx_part_bytes(l, r))) return false;
@@ -2104,6 +2117,9 @@ struct Model::Impl {
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
+        if (store)   // (the RAM store goes after this body: a run's copies still queued out of its slots end first)
+            for (auto& c : chunks)
+                if (c) c->io.reset();
         for (size_t i = 0; i < ram_chunks.size(); ++i) {
             if (i < zc_chunk.size() && zc_chunk[i]) cudaHostUnregister(ram_chunks[i]);
             os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
@@ -2701,6 +2717,12 @@ struct Model::Impl {
         if (copy_mode && l.ram[(size_t) e] >= 0)
             return ram_part[(size_t) l.ram[(size_t) e]][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r];
         return mx_mat(l, e, r) + (size_t) X * (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+    }
+    // (the CPU lane) entry en's part X of matrix r: in its RAM store slot when the call holds one there (en.src), else
+    // where mx_part_ptr has it - the same rows of the same bytes
+    const uint8_t* ent_part(const Layer& l, const LaneEnt& en, int r, int X) const {
+        if (en.src[r] != nullptr) return en.src[r] + (size_t) X * (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+        return mx_part_ptr(l, en.e, r, X);
     }
     // a copy's NH parts -> the blob, and back (each matrix's rows of part X at X n / NH rows into the blob's matrix)
     void ram_to_blob(const Layer& l, int s, uint8_t* blob) const {
@@ -5383,6 +5405,12 @@ struct Model::Impl {
         }
         return false;
     }
+    // (the RAM store) a flow item's slot pin let go once its copy is done
+    void flow_unpin(Chunk::Item& it) {
+        if (it.sto < 0) return;
+        if (it.left.load(std::memory_order_acquire) == 0) store->unpin(it.sto);   // (else kept: a copy may still run)
+        it.sto = -1;
+    }
     // the reads (in order, each into its staging slot once that slot's last DMA is done) and the DMAs (in order, each
     // into its ring slot once that slot's last use is queued: the copy stream waits for it) as far as they can go now
     bool flow_pump(Chunk& c, std::string& err) {
@@ -5415,8 +5443,28 @@ struct Model::Impl {
                 const Layer& l = L[(size_t) it.il];
                 uint8_t* sb = c.stage + (size_t) it.stage * c.stage_stride;
                 const int cs = copy_mode && it.ram != nullptr ? l.ram[(size_t) it.e] : -1;   // (a copy's slot)
+                // (the RAM store holds a file item's expert: copied out of its slot by io as a RAM-tier one is - the
+                //  same bytes, no read - and pinned until the copy has landed; DS4_STORE_FLOW=0: read as before)
+                if (store_flow && it.ram == nullptr && it.hsrc == nullptr && it.keep == nullptr && store_reads(l, it.e))
+                    it.sto = store->acquire(l.il, it.e);
                 int nj = 0;
                 for (int r = 0; r < 3; ++r) {
+                    if (it.sto >= 0) {
+                        IoQueue::Job& j = jobs[nj++];
+                        j = IoQueue::Job{};
+                        j.len = mx_read_len(l, it.mi, r);
+                        j.dst = sb;
+                        j.left = &it.left;
+                        j.bad = &it.bad;
+                        j.mem = store->mat_of(it.sto, r) + mx_read_off(l, it.mi, r);
+                        if (r == 2 && it.dpart) {   // (DS4_FLOW_DOWN_PART: the member's columns, where copied)
+                            down_cut(l, it.mi, j.cpitch, j.coff, j.clen);
+                            j.crows = (size_t) g.dim;
+                        }
+                        it.src[r] = sb;   // (a copy lands where it is put: no read's lead)
+                        sb += flow_region(r);
+                        continue;
+                    }
                     if (cs >= 0) {   // a copy: the rows the member reads (as from the file: mx_read_off / _len - a
                         // group's member its gate / up rows [ff0, ff0 + ffn), the down whole), from the NH parts that
                         // hold them, side by side into staging
@@ -5499,6 +5547,7 @@ struct Model::Impl {
         while (c.n_dma < c.n_read && c.n_dma < c.n_comp + R) {
             Chunk::Item& it = fit(c, c.n_dma);
             if (it.left.load(std::memory_order_acquire) != 0) break;
+            flow_unpin(it);   // (copied out of the store's slot by now)
             if (it.bad.load(std::memory_order_acquire)) {
                 err = "reading layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) +
                       " from the model's files failed";
@@ -5580,6 +5629,7 @@ struct Model::Impl {
         }
         if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
         while (c.base < c.n_comp && c.items.size() > 4096) {   // (done with: read, copied and used)
+            flow_unpin(c.items.front());
             c.items.pop_front();
             ++c.base;
         }
@@ -6836,6 +6886,11 @@ struct Model::Impl {
                 if (av != ~uint64_t{0}) warm_bytes = av > kRamMargin ? std::min<uint64_t>(warm_bytes, av - kRamMargin) : 0;
             }
         }
+        if (store_request() != 0.0) {   // (--ssd-cache: the RAM store in place of the page cache's read-ahead below)
+            std::vector<std::pair<int, int>> hot, unseen;
+            for (const Warm& w : warm) (w.share > 0 ? hot : unseen).push_back({w.layer, w.e});
+            if (init_store(hot, unseen)) return true;
+        }
         if (ram_tier && warm_bytes > 0 && !warm.empty()) {
             // chunks of 32 slots up to warm_bytes (all the RAM the rest leaves, kRamMargin kept), one slot kept free for
             // a move in; the hottest experts read in, their pages then dropped from the page cache.  Plain memory, not
@@ -6898,6 +6953,125 @@ struct Model::Impl {
         return true;
     }
 
+    // --ssd-cache's size in GB (DS4_STORE_GB when the flag gives none: a number or auto): < 0 auto, 0 off
+    double store_request() const {
+        if (o.ssd_cache_gb != 0.0) return o.ssd_cache_gb;
+        const char* v = ds4_env("DS4_STORE_GB");
+        if (v == nullptr || v[0] == '\0') return 0.0;
+        return std::string(v) == "auto" ? -1.0 : std::max(0.0, std::atof(v));
+    }
+    static double store_env(const char* name, double def) {
+        const char* v = ds4_env(name);
+        return v != nullptr && v[0] != '\0' ? std::atof(v) : def;
+    }
+    // --ssd-cache: the RAM store over the trunk's in-place CPU-lane experts, set up once VRAM's experts and the RAM
+    // copies are in (they take their RAM first): auto - the free RAM less DS4_STORE_ROOM_GB (12), 4 GB at least - or the
+    // size given, at most every expert it could ever hold.  Preloaded (DS4_STORE_PRELOAD) with `hot` (the CPU lane's
+    // experts the profile saw, the most-routed first), then (DS4_STORE_SPARE) the VRAM experts the profile counts least -
+    // the ones the VRAM cache gives back to the CPU lane first, which the lane would otherwise read from the SSD - then
+    // the lane's experts the profile never saw: the slots the likely ones leave over.  The later in that order, the
+    // sooner an expert gives way.  Not set up (said why, false): the page cache, as before
+    bool init_store(const std::vector<std::pair<int, int>>& hot, const std::vector<std::pair<int, int>>& unseen) {
+        auto off = [](const std::string& why) {
+            std::fprintf(stderr, "ds4: RAM store (--ssd-cache): off - %s; the experts read in place through the page "
+                                 "cache, as without it\n", why.c_str());
+            return false;
+        };
+        if (!pk.gguf) return off("it holds a GGUF's experts only");
+        if (ram_tier) return off("the RAM tier (MAYA_DS4_RAM_TIER) is on");
+        std::vector<ExpertStore::Geo> geo((size_t) g.nl);   // (the trunk's layers: the drafter's stay in place)
+        size_t lane = 0, all = 0;   // (the in-place CPU-lane experts; every routed expert of the layers)
+        for (const Layer& l : L) {
+            if (l.mtp || l.il < 0 || l.il >= g.nl || l.lay.fmt != gg::kFmtMXFP4 || l.packed_host) continue;
+            ExpertStore::Geo& gl = geo[(size_t) l.il];
+            gl.n_exp = l.n_exp;
+            for (int r = 0; r < 3; ++r) {
+                gl.file[r] = l.mx_file[r];
+                gl.off[r] = l.mx_off[r];
+                gl.stride[r] = l.mx_stride[r];
+                gl.bytes[r] = mx_part_bytes(l, r);
+            }
+            all += (size_t) l.n_exp;
+            for (int e = 0; e < l.n_exp; ++e) lane += file_read(l, e) ? 1 : 0;
+        }
+        if (lane == 0) return off(copy_mode ? "every CPU-lane expert is copied into RAM" : "no expert is read in place");
+        const bool spare = store_env("DS4_STORE_SPARE", 1) != 0;
+        const size_t sb = ExpertStore::slot_layout(geo);
+        const uint64_t cap = (uint64_t) sb * (uint64_t) (spare ? all : lane);
+        const double req = store_request();
+        uint64_t bytes = 0;
+        if (req < 0) {
+            const double room = std::max(0.0, store_env("DS4_STORE_ROOM_GB", 12.0));
+            bytes = store_auto_bytes(ram_room(), (uint64_t) (room * 1e9), cap, (uint64_t) 4e9);
+            if (bytes == 0) {
+                char b[160];
+                std::snprintf(b, sizeof b, "too little RAM free (auto: the free RAM less %.0f GB, 4 GB at least)", room);
+                return off(b);
+            }
+        } else {
+            bytes = std::min<uint64_t>(cap, (uint64_t) (req * 1e9));
+        }
+        ExpertStore::Cfg c;
+        c.budget = (size_t) bytes;
+        c.floor = (size_t) (std::max(0.0, store_env("DS4_STORE_FLOOR_GB", 4.0)) * 1e9);
+        c.grow_room = std::max(c.floor, (size_t) (std::max(0.0, store_env("DS4_STORE_GROW_GB", 8.0)) * 1e9));
+        c.policy = o.ssd_policy == 1 ? ExpertStore::kLfu : ExpertStore::kLru;
+        if (const char* v = ds4_env("DS4_STORE_POLICY"))   // (beside the flag's default)
+            if (o.ssd_policy == 0 && std::string(v) == "lfu") c.policy = ExpertStore::kLfu;
+        c.readers = std::max(1, std::min(64, (int) store_env("DS4_STORE_THREADS", 8.0)));
+#if defined(_WIN32)
+        c.unbuffered = store_env("DS4_STORE_UNBUFFERED", 0.0) != 0;   // (Windows: the buffered handles by default)
+#endif
+        c.ram_avail = [this] { return ram_room(); };
+        ExpertStore::Files f;
+        bool direct = c.unbuffered;
+        for (size_t i = 0; i < pk.files.size(); ++i) {
+            f.buf.push_back(i < pk.pfds.size() && pk.pfds[i] != os::kBadFd ? pk.pfds[i] : pk.fds[i]);
+            f.direct.push_back(i < pk.dfds.size() ? pk.dfds[i] : os::kBadFd);
+            f.paths.push_back(pk.model_dir + "/" + pk.files[i]);
+            direct = direct || f.direct.back() != os::kBadFd;
+        }
+        auto made = std::make_unique<ExpertStore>();
+        std::string err;
+        if (!made->init(c, geo, f, err)) return off(err);
+        store = std::move(made);
+        store_split = store_env("DS4_STORE_SPLIT", 1.0) != 0;
+        store_put = store_env("DS4_STORE_PUT", 1.0) != 0;
+        store_ahead = store_env("DS4_STORE_AHEAD", 0.0) != 0;
+        store_flow = store_env("DS4_STORE_FLOW", 1.0) != 0;
+        std::fprintf(stderr, "ds4: RAM store (--ssd-cache): up to %zu experts in slots of %.1f MB (%.1f GB; the CPU lane "
+                             "reads %zu in place), %s, %d readers, %s; below %.1f GB of free RAM it gives RAM back\n",
+                     store->slots_max(), sb / 1e6, store->slots_max() * (double) sb / 1e9, lane,
+                     c.policy == ExpertStore::kLfu ? "lfu" : "lru", c.readers,
+                     direct ? "reads past the page cache" : "reads through the page cache (no unbuffered handle)",
+                     c.floor / 1e9);
+        if (store_env("DS4_STORE_PRELOAD", 1.0) != 0) {
+            std::vector<std::pair<int, int>> list;
+            for (const auto& x : hot)
+                if (store->covers(x.first)) list.push_back(x);
+            const size_t n_hot = list.size();
+            if (spare) {   // (the VRAM experts, the profile's least counted first)
+                std::vector<std::pair<uint32_t, std::pair<int, int>>> v;
+                for (const Layer& l : L)
+                    if (store->covers(l.il) && !l.mtp)
+                        for (int e = 0; e < l.n_exp; ++e)
+                            if (l.slot[(size_t) e] >= 0) v.push_back({prof[(size_t) l.il * g.n_exp + e], {l.il, e}});
+                std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+                for (const auto& x : v) list.push_back(x.second);
+            }
+            for (const auto& x : unseen)
+                if (store->covers(x.first)) list.push_back(x);
+            const double t0 = now_ms();
+            const size_t n = store->preload(list, 0);
+            std::fprintf(stderr, "ds4: RAM store: %zu experts read in at load (%.1f GB, %.1f s) - the profile's hottest "
+                                 "CPU-lane experts first (%zu)%s\n",
+                         n, n * (double) sb / 1e9, (now_ms() - t0) / 1000.0, std::min(n, n_hot),
+                         spare ? ", then the VRAM ones it counts least (DS4_STORE_SPARE)" : "");
+        }
+        store->watch_every(1000);
+        store_stats();
+        return true;
+    }
     // a GGUF's CPU-lane experts copied into RAM (copy_mode), decided once VRAM's are in - on a unified-memory APU the GPU
     // has taken its share of the RAM by then, so the copies only get what it leaves.  `hot`: the CPU lane's experts, the
     // most-routed first.  --mmap-experts off: all that fit beside kRamMargin (a warning if not all do); auto: all of
@@ -7465,6 +7639,8 @@ struct Model::Impl {
 
     bool load_experts(std::string& err) {
         if (!L.empty() && L[0].lay.fmt == gg::kFmtMXFP4) return load_experts_mx(err);
+        if (store_request() != 0.0)
+            std::fprintf(stderr, "ds4: RAM store (--ssd-cache): off - it holds a GGUF's experts only\n");
         const bool drop_cache = load_drop_cache();
         // every expert's region, in file order, by a few threads; VRAM ones through a pinned staging blob.  In place
         // (file_experts) the CPU lane's experts are not copied: the most-routed of them (the profile's share of their
@@ -9100,7 +9276,7 @@ struct Model::Impl {
             // more than computing a warm expert, 0.34 ms a 6.3 MB matrix on Windows)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (l.ram.empty() || l.ram[(size_t) en.e] < 0)
+                if ((l.ram.empty() || l.ram[(size_t) en.e] < 0) && en.src[0] == nullptr)   // (not the store's)
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             os::prefetch_cold(want);
         }
@@ -9137,8 +9313,8 @@ struct Model::Impl {
                     up[i] = yu[i];
                 }
                 // (part X's rows, from where they are: a copy's part on node X, or the file's)
-                gg::mx_rows(mx_part_ptr(l, en.e, 0, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, gp);
-                gg::mx_rows(mx_part_ptr(l, en.e, 1, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, up);
+                gg::mx_rows(ent_part(l, en, 0, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, gp);
+                gg::mx_rows(ent_part(l, en, 1, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, up);
                 for (int i = 0; i < en.n; ++i) {
                     float* h = band_q ? yg[i] : c_xhd.data() + (size_t) (en.slot0 + i) * FF + r0;
                     for (int r = r0; r < r1; ++r) {
@@ -9177,7 +9353,7 @@ struct Model::Impl {
                     }
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + r0;
                 }
-                gg::mx_rows(mx_part_ptr(l, en.e, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, ap, en.n, yp);
+                gg::mx_rows(ent_part(l, en, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, ap, en.n, yp);
             };
         run_nodes(ne * DB, f);
     }
@@ -9203,7 +9379,7 @@ struct Model::Impl {
             // DS4_IQ_PF_ALL=1: every range, as before)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (l.ram.empty() || l.ram[(size_t) en.e] < 0)
+                if ((l.ram.empty() || l.ram[(size_t) en.e] < 0) && en.src[0] == nullptr)   // (not the store's)
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             static const bool pf_all = std::getenv("DS4_IQ_PF_ALL") != nullptr && std::atoi(std::getenv("DS4_IQ_PF_ALL")) != 0;
             if (pf_all) os::prefetch(want);
@@ -9240,7 +9416,7 @@ struct Model::Impl {
                 }
                 // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
                 // block size of the type)
-                gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
+                gg::iq_cpu_gate_up(fm, ent_part(l, en, 0, X), ent_part(l, en, 1, X), ap, en.n, hp,
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
         run_nodes(ne * GB, f);
@@ -9258,7 +9434,7 @@ struct Model::Impl {
                     hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
                 }
-                gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
     }
@@ -9287,7 +9463,7 @@ struct Model::Impl {
         {   // (os::prefetch_cold, as above)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
-                if (l.ram.empty() || l.ram[(size_t) en.e] < 0)
+                if ((l.ram.empty() || l.ram[(size_t) en.e] < 0) && en.src[0] == nullptr)   // (not the store's)
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             os::prefetch_cold(want);
         }
@@ -9321,15 +9497,15 @@ struct Model::Impl {
                     hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
                 }
                 if (!mx_gu) {
-                    gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
+                    gg::iq_cpu_gate_up(fm, ent_part(l, en, 0, X), ent_part(l, en, 1, X), ap, en.n, hp,
                                        r0 - X * FFh, r1 - X * FFh, lim);
                     return;
                 }
                 float yg[gg::kMxCpuMaxN][RB], yu[gg::kMxCpuMaxN][RB];
                 float *gp[gg::kMxCpuMaxN], *up[gg::kMxCpuMaxN];
                 for (int i = 0; i < en.n; ++i) gp[i] = yg[i], up[i] = yu[i];
-                gg::mx_rows(mx_part_ptr(l, en.e, 0, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, gp);
-                gg::mx_rows(mx_part_ptr(l, en.e, 1, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, up);
+                gg::mx_rows(ent_part(l, en, 0, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, gp);
+                gg::mx_rows(ent_part(l, en, 1, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, up);
                 for (int i = 0; i < en.n; ++i)
                     for (int r = r0; r < r1; ++r) {   // (cpu_experts_mx's swiglu)
                         float gv = yg[i][r - r0], uv = yu[i][r - r0];
@@ -9358,11 +9534,11 @@ struct Model::Impl {
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
                 }
                 if (mx_gu) {
-                    gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                    gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
                     return;
                 }
                 for (int i = 0; i < en.n; ++i) yp[i] += r0 - X * Eh;   // (mx_rows: y from row r0 on)
-                gg::mx_rows(mx_part_ptr(l, en.e, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, hp, en.n, yp);
+                gg::mx_rows(ent_part(l, en, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, hp, en.n, yp);
             };
         run_nodes(ne * DB, f);
     }
@@ -9569,6 +9745,81 @@ struct Model::Impl {
             if (nc % 256 == 0 || bad)
                 std::fprintf(stderr, "ds4: CPU flow check: %lld calls, %lld differed\n", nc, diffs.load());
         }
+    }
+
+    // (serve_lane) a window's CPU-lane entries with the RAM store on: their experts it covers held or read into it
+    // (ExpertStore::begin - demand reads, before any guess), the entries that wait for nothing computed first, then each
+    // miss as its read lands (several that landed together in one call); DS4_STORE_SPLIT=0: every read waited for, then
+    // the window in one call.  An entry's rows are its own (its slots' outputs, its tokens' inputs quantized alike), so
+    // the outputs are the same either way and the same as the page cache's; an expert the store could not take (no slot
+    // to be had, a failed read) is read in place as before
+    void cpu_experts_store(const Layer& l, const float* x, std::vector<Ent>& ents, size_t ldx, const int* ord) {
+        int es[kWin * kPicks];
+        int hi[kWin * kPicks];   // (entry -> its expert's index in the hold, -1: not the store's)
+        int ne = 0;
+        const int n = std::min((int) ents.size(), kWin * kPicks);
+        for (int q = 0; q < n; ++q) {
+            Ent& en = ents[(size_t) q];
+            en.src[0] = en.src[1] = en.src[2] = nullptr;
+            hi[q] = -1;
+            if (!store_reads(l, en.e)) continue;
+            for (int i = 0; i < ne && hi[q] < 0; ++i)
+                if (es[i] == en.e) hi[q] = i;   // (an expert of more tokens than an entry takes: one hold)
+            if (hi[q] < 0) {
+                hi[q] = ne;
+                es[ne++] = en.e;
+            }
+        }
+        if (ne == 0 || n < (int) ents.size()) return cpu_experts(l, x, ents, ldx, ord);
+        ExpertStore::Hold h;
+        store->begin(l.il, es, ne, h);
+        if (store_ahead) store->cancel_stale(l.il);   // (the token is at this layer: its other guesses are wrong)
+        std::vector<int> got;
+        auto take = [&](const std::vector<int>& idx) {   // (the entries of the hold's experts idx: their store slots)
+            for (int i : idx)
+                for (int q = 0; q < n; ++q)
+                    if (hi[q] == i)
+                        for (int r = 0; r < 3; ++r) ents[(size_t) q].src[r] = store->mat(h, i, r);
+        };
+        if (!store_split) {
+            while (store->next(h, got, true)) take(got);
+            cpu_experts(l, x, ents, ldx, ord);
+        } else {
+            std::vector<Ent> part;
+            store->next(h, got, false);
+            take(got);
+            for (int q = 0; q < n; ++q)   // (the ones not waiting on a read; the lookahead's order kept among them)
+                if (hi[ord != nullptr ? ord[q] : q] < 0 || h.given[(size_t) hi[ord != nullptr ? ord[q] : q]])
+                    part.push_back(ents[(size_t) (ord != nullptr ? ord[q] : q)]);
+            if (!part.empty()) cpu_experts(l, x, part, ldx);
+            while (store->next(h, got, true)) {
+                take(got);
+                part.clear();
+                for (int q = 0; q < n; ++q)
+                    if (hi[q] >= 0 && std::find(got.begin(), got.end(), hi[q]) != got.end()) part.push_back(ents[(size_t) q]);
+                cpu_experts(l, x, part, ldx);
+            }
+        }
+        store->release(h);
+        for (Ent& en : ents) en.src[0] = en.src[1] = en.src[2] = nullptr;
+        store_stats();
+    }
+    // the store's counters into st (the service thread's; read by stats())
+    void store_stats() {
+        if (!store) return;
+        const ExpertStore::Counts& c = store->counts();
+        st.store_slots = (int64_t) store->slots_max();
+        st.store_held = (int64_t) store->held();
+        st.store_hits = c.hits.load(std::memory_order_relaxed);
+        st.store_misses = c.misses.load(std::memory_order_relaxed);
+        st.store_no_slot = c.no_slot.load(std::memory_order_relaxed);
+        st.store_guesses = c.guesses.load(std::memory_order_relaxed);
+        st.store_guess_used = c.guess_used.load(std::memory_order_relaxed);
+        st.store_cancelled = c.cancelled.load(std::memory_order_relaxed);
+        st.store_put = c.put.load(std::memory_order_relaxed);
+        st.store_evicted = c.evicted.load(std::memory_order_relaxed);
+        st.store_failed = c.failed.load(std::memory_order_relaxed);
+        st.store_wait_ms = (double) c.wait_ns.load(std::memory_order_relaxed) / 1e6;
     }
 
     // ---- the expert cache.  A swap moves a CPU-lane expert (`in`) into the layer's spare VRAM slot and the VRAM expert it
@@ -10048,11 +10299,21 @@ struct Model::Impl {
     // a GGUF's swap: expert sw.in from the file (copy_mode: its copy) into the spare VRAM slot (each member its part);
     // the expert it replaces goes back to the CPU lane, which reads it from the file's mapping - or (copy_mode, sw.ram)
     // from the layer's spare RAM slot, which it is copied into from VRAM here
+    // (the RAM store) expert e's blob out of its store slot when the store holds it (pinned while copied): no read
+    bool store_blob(const Layer& l, int e, uint8_t* blob) {
+        const int s = store_reads(l, e) ? store->acquire(l.il, e) : -1;
+        if (s < 0) return false;
+        for (int r = 0; r < 3; ++r) std::memcpy(blob + l.lay.trellis[r], store->mat_of(s, r), mx_part_bytes(l, r));
+        store->unpin(s);
+        return true;
+    }
     void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
         uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
         const std::vector<cudaStream_t>& copy_st = B.st;
-        bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
-                                                                                          // this swap's switch)
+        // (a copy holds its slot till this swap's switch; an in-place one the RAM store holds: from its slot)
+        bool ok = copy_mode && !l.ram.empty() && l.ram[(size_t) sw.in] >= 0
+                      ? read_mx(l, sw.in, sw_a)
+                      : store_blob(l, sw.in, sw_a) || read_mx_file(l, sw.in, sw_a);
         for (int m = 0; m < l.nm && ok; ++m) {
             const Layer& x = member(l, m);
             cudaSetDevice(devs[(size_t) x.dev].id);
@@ -10075,6 +10336,23 @@ struct Model::Impl {
             }
             if (got) blob_to_ram(l, sw_b, sw.ram);
             else sw.ram = -1;   // (back to the file's pages then)
+        }
+        if (ok && sw.ram < 0 && store_put && store && store->covers(l.il) && !store->has(l.il, sw.out)) {
+            // (the RAM store, DS4_STORE_PUT) `out` goes back to the CPU lane, which would read it from the SSD: its blob
+            // out of its VRAM slot (each member its part) into a store slot now, off the lane's way
+            bool got = true;
+            for (int m = 0; m < l.nm && got; ++m) {
+                const Layer& x = member(l, m);
+                cudaSetDevice(devs[(size_t) x.dev].id);
+                cudaStream_t cs = copy_st[(size_t) x.dev];
+                got = cudaMemcpyAsync(l.nm > 1 ? sw_h : sw_b, sat(l, x, l.slot[(size_t) sw.out], unit(x)), unit(x),
+                                      cudaMemcpyDeviceToHost, cs) == cudaSuccess &&
+                      cudaStreamSynchronize(cs) == cudaSuccess;
+                if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
+            }
+            const uint8_t* src[3] = {sw_b + l.lay.trellis[0], sw_b + l.lay.trellis[1], sw_b + l.lay.trellis[2]};
+            if (got) store->put(l.il, sw.out, src);
+            else (void) cudaGetLastError();
         }
         if (check_swaps) {   // DS4_CHECK_SWAPS: the slot (and `out`'s RAM copy) against the model file, byte for byte
             std::vector<uint8_t> dev(l.blob), h(l.blob), file(l.blob);   // (h: the widest member's part fits)
@@ -10472,12 +10750,20 @@ struct Model::Impl {
                     fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
                     if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
                     if ((fl[e] & 8) || !file_read(n, e)) continue;
+                    // (the RAM store's experts: never read ahead into the page cache - a guess in the store's queue
+                    //  with DS4_STORE_AHEAD=1, else nothing)
+                    const bool sto = store && store->covers(j);
+                    if (sto && !store_ahead) continue;
                     fl[e] |= 8;
                     // (DISK_SKIP_AUTO while skipping: not in RAM when asked for - the lookahead's read would hide it)
                     if (disk_skip_auto && j < g.nl && sk_auto.on.load(std::memory_order_relaxed) && !in_ram(n, e))
                         fl[e] |= 16;
-                    for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
                     ++st.ahead_pf;
+                    if (sto) {
+                        store->guess(j, e);
+                        continue;
+                    }
+                    for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
                 }
         }
         if (pf_want.empty()) return;
@@ -12991,7 +13277,8 @@ struct Model::Impl {
                 }
                 if (!ents.empty()) {
                     const double tc = now_ms();
-                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    if (store && store->covers(l.il)) cpu_experts_store(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    else cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
                     lt.c_ms = now_ms() - tc;
                     lt.n_cpu = (int) ents.size();
                     const int D = g.dim;
@@ -13249,9 +13536,13 @@ struct Model::Impl {
         uint8_t* stg = ln_host + (size_t) i * ln_stride;
         const bool zc = zc_ok(l, e);   // (in place: the device pulls it from where it lies, nothing to read)
         const bool held = zc || (!l.ram.empty() && l.ram[(size_t) e] >= 0);
+        // (the RAM store's copy when it holds one: pinned while it is copied, nothing read from the files)
+        const int ss = !held && store_reads(l, e) ? store->acquire(l.il, e) : -1;
         bool ok = !held || zc || read_mx(l, e, stg);
         for (int r = 0; r < 3; ++r) {
-            if (ok && !held)
+            if (ok && !held && ss >= 0)
+                std::memcpy(stg + l.lay.trellis[r], store->mat_of(ss, r), mx_part_bytes(l, r));
+            else if (ok && !held)
                 ok = pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r], mx_part_bytes(l, r),
                                 stg + l.lay.trellis[r]);
             if (!ok && *(volatile unsigned*) &J.pull->bad[i] == 0u) {
@@ -13261,6 +13552,7 @@ struct Model::Impl {
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &J.pull->ready[i][r] = J.seq;
         }
+        if (ss >= 0) store->unpin(ss);
         if (J.left.fetch_sub(1, std::memory_order_acq_rel) != 1 || ln_no_done.load()) return;
         // the last read: until the device has pulled them all (the stream lane's end, decode's timing of it) - it does
         // soon (its fetch kernel waits for nothing else); not seen within 200 ms: never waited for again
@@ -13340,6 +13632,7 @@ struct Model::Impl {
     // lane: a Strix Halo's MXFP4 expert 5.9 ms against 0.14)
     bool lane_warm(const Layer& l, int e) const {
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0) return true;
+        if (store && store->has(l.il, e)) return true;
         return os::resident_sampled(mx_mat(l, e, 0), mx_part_bytes(l, 0), 1) &&
                os::resident_sampled(mx_mat(l, e, 2), mx_part_bytes(l, 2), 1);
     }
@@ -15863,6 +16156,7 @@ struct Model::Impl {
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
             CK(cudaStreamSynchronize(s));
             CK(cudaStreamSynchronize(c.cs));
+            for (Chunk::Item& it : c.items) flow_unpin(it);   // (a run that ended early: its store pins)
             c.items.clear();
             c.base = c.n_read = c.n_dma = c.n_comp = 0;
             c.n_file = 0;
@@ -19306,8 +19600,10 @@ Model::Tiers Model::tiers() const {
     // in RAM: the copies (copy_experts / the RAM tier); in place, the read-ahead's share of the page cache; not in
     // place (the experts copied whole into RAM): every CPU-lane expert
     if (m.ram_held > 0) t.ram = m.ram_held;
+    else if (m.store) t.ram = 0;   // (the RAM store's, below)
     else if (m.file_experts) t.ram = t.cpu_blob > 0 ? (int) std::min<double>(t.cpu, (double) m.warm_bytes / t.cpu_blob) : 0;
     else t.ram = t.cpu;
+    if (m.store) t.ram = (int) std::min<size_t>((size_t) t.cpu, (size_t) t.ram + m.store->held());
     t.ram_gb = t.ram * t.cpu_blob / 1e9;
     return t;
 }

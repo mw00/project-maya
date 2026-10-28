@@ -17,15 +17,18 @@
 #include <atomic>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 
 namespace strata::ds4 {
 
-/// One expert of a window for n of its tokens: the CPU lane's rows slot0 .. slot0 + n - 1.
+/// One expert of a window for n of its tokens: the CPU lane's rows slot0 .. slot0 + n - 1.  src[r]: a GGUF expert's
+/// matrix r in a RAM store slot (--ssd-cache) for this call, else null (where the layer has it)
 struct LaneEnt {
     int e = 0, n = 0, slot0 = 0;
     int tok[kernels::cpu::kExl3CpuMaxN] = {};
+    const uint8_t* src[3] = {nullptr, nullptr, nullptr};
 };
 
 /// The CPU lane's EXL3 scratch (the engine's buffers) and geometry.
