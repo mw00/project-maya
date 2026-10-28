@@ -1521,9 +1521,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 lend = b;
             }
             std::fprintf(stderr, "maya ds4 serve: request%s: the prompt was read in %d parts (%d chunks in parts, %.0f "
-                                 "ms, the longest %.0f ms; the devices waited %.0f ms in all for Engram rows), %.0f ms "
-                                 "between them for the others%s\n",
-                         tag.c_str(), parts, part_chunks, parts_ms, part_max_ms, parts_eg_ms, paused_ms, lend.c_str());
+                                 "ms, the longest %.0f ms; the devices waited %.0f ms in all for Engram rows, %lld "
+                                 "lookups of the parts' first chunks read ahead), %.0f ms between them for the "
+                                 "others%s\n",
+                         tag.c_str(), parts, part_chunks, parts_ms, part_max_ms, parts_eg_ms,
+                         (long long) (se.eg_ahead - P.s0.eg_ahead), paused_ms, lend.c_str());
         }
         if (stopped || (!ok && m.cancelled())) {
             const bool back = from > 0 && m.restore((int64_t) from) && (size_t) m.pos() == from;
@@ -2903,6 +2905,7 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
         std::vector<float> last, again;
         std::vector<int> toks;
         int parts = 0;
+        double eg_ms = 0;   // (the devices' waits for Engram rows while the prompt was fed)
     };
     // the other conversation: its prompt (the --ids' first 300 tokens at most) read at the first pause, a greedy step
     // at each one after
@@ -2932,7 +2935,9 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
         m.seq_bind(0);
         m.reset();
         if (!in_parts) {
+            const double eg0 = m.stats().engram_ms;
             if (!m.feed_mark(ids.data(), N, 1, 1, err)) return false;
+            rd.eg_ms = m.stats().engram_ms - eg0;
             rd.parts = 1;
         } else {
             strata::ds4::FeedPlan plan;
@@ -2943,7 +2948,9 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
             }
             const int nk = (int) plan.ends.size();
             for (int k = 0; k < nk; ++k) {
+                const double eg0 = m.stats().engram_ms;
                 if (!m.feed_part(plan, ids.data(), k, k + 1, err)) return false;
+                rd.eg_ms += m.stats().engram_ms - eg0;
                 if (k + 1 < nk && !pause()) return false;
             }
             rd.parts = nk;
@@ -3026,9 +3033,12 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
                     ot == other_toks.size() ? "the same as"
                                             : ("differ from token " + std::to_string(ot) + " on from").c_str());
     std::printf("parts check: the prompt path's room: %lld experts kept out of VRAM between the parts (summed over the "
-                "pauses), %lld of the other conversation's picks on them, %lld experts read back in %.0f ms\n",
+                "pauses), %lld of the other conversation's picks on them, %lld experts read back in %.0f ms; %lld "
+                "Engram lookups read ahead for the parts' first chunks, the devices' Engram waits %.0f ms (one call: "
+                "%.0f ms)\n",
                 (long long) (s1.lend_kept - s0.lend_kept), (long long) (s1.lend_picks - s0.lend_picks),
-                (long long) (s1.lent_back - s0.lent_back), s1.lent_back_ms - s0.lent_back_ms);
+                (long long) (s1.lent_back - s0.lent_back), s1.lent_back_ms - s0.lent_back_ms,
+                (long long) (s1.eg_ahead - s0.eg_ahead), parts.eg_ms, one.eg_ms);
     return same_last && same_again && same_toks ? 0 : 1;
 }
 

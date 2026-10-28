@@ -1356,6 +1356,20 @@ struct Model::Impl {
     EgPrefetch* eg_pf = nullptr;
     std::mutex eg_cache_mu;
     std::vector<std::unique_ptr<EgBatch>> eg_win;
+    // A prompt read in parts (eg_pre): the first chunk of its next part has its Engram rows read ahead (inside a run,
+    // chunk k + 1's are read while chunk k runs; a part's first chunk's would be read before its first layer).  Asked
+    // for while the part before it runs, read behind every other read (EgReader's low queue) through that part and the
+    // pause after it, and put into the row cache before the next run starts - where that chunk's own reads find them:
+    // the same bytes, read earlier.  DS4_PROMPT_EG_AHEAD=0: none.
+    struct EgAhead {
+        int seq = -1, k = -1;                         // (the plan's conversation and chunk, where it starts)
+        int64_t at = -1;
+        std::vector<int32_t> cts;                     // (the compressed ids of its positions and their look-back)
+        std::vector<std::unique_ptr<EgBatch>> b;      // (an Engram layer's each)
+        std::vector<uint8_t> rows;                    // (their destination; the cache keeps them at the end)
+        int64_t lookups = 0;
+    };
+    std::unique_ptr<EgAhead> eg_pre;
     std::vector<uint8_t> eg_q6k;   // Engram layer li's row format: 1 ggml Q6_K (superblocks of 256), 2 IQ4_NL (blocks of
                                    // 32), 0 FP8
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
@@ -2097,6 +2111,7 @@ struct Model::Impl {
         cs_cv.notify_all();
         if (cs_th.joinable()) cs_th.join();
         warm_end();
+        eg_ahead_end();   // (its reads in flight: done before the reader stops)
         eg_io.stop();   // (its threads write into h_eg)
         for (auto& w : workers) w->stop();
         for (size_t i = 0; i < chunks.size(); ++i)
@@ -9093,8 +9108,11 @@ struct Model::Impl {
     // copies the repeats and keeps the new rows in the cache.  The rows are the file's bytes either way.
     // (rows: a multi step's - row t is conversation rows->rseq[t]'s token at rows->rpos[t], its look-back in that
     //  conversation's tokens, parked in sqs)
+    // (cts: the compressed ids of positions cts_p0 .. in place of the bound conversation's - a prompt's next part's,
+    //  read ahead before they are fed: eg_ahead_start)
     void eg_issue(int64_t p0, int T, int li, uint8_t* dst, EgBatch& b, bool account = true, bool submit = true,
-                  bool defer_dups = false, const WinPlan* rows = nullptr) {
+                  bool defer_dups = false, const WinPlan* rows = nullptr, const int32_t* cts = nullptr,
+                  int64_t cts_p0 = 0) {
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
         const size_t per = (size_t) cols * (hd + hd / 32);
         b.clear();
@@ -9113,17 +9131,18 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t) {
                 const int64_t p = rows != nullptr ? rows->rpos[t] : p0 + t;
                 const std::vector<int32_t>& ct = rows != nullptr ? sqs[(size_t) rows->rseq[t]].ctoks : ctoks;
+                const auto ctat = [&](int64_t q) { return cts != nullptr ? cts[q - cts_p0] : ct[(size_t) q]; };
                 uint8_t* rd0 = dst != nullptr ? dst + (size_t) t * per : h_eg + ((size_t) li * eg_cap + t) * per;
                 uint8_t* scales = rd0 + (size_t) cols * hd;
-                if (ct[(size_t) p] < 0) {   // a picture's token: no rows (zeros: its gate adds nothing)
+                if (ctat(p) < 0) {   // a picture's token: no rows (zeros: its gate adds nothing)
                     std::memset(rd0, 0, per);
                     continue;
                 }
                 int64_t prod[8];
                 bool blocked = false;
                 for (int s = 0; s < pk.eg_ngram; ++s) {   // (the look-back stops at the start and at a picture)
-                    blocked = blocked || p < s || ct[(size_t) (p - s)] < 0;
-                    const int64_t tk = blocked ? pk.eg_pad : ct[(size_t) (p - s)];
+                    blocked = blocked || p < s || ctat(p - s) < 0;
+                    const int64_t tk = blocked ? pk.eg_pad : ctat(p - s);
                     prod[s] = tk * pk.eg_mult[(size_t) li * pk.eg_ngram + s];
                 }
                 int64_t rolling = prod[0];
@@ -9246,6 +9265,48 @@ struct Model::Impl {
         st.eg_cached = (int64_t) eg_cache.size();
         st.eg_cache_cap = (int64_t) eg_cache.capacity();
         st.eg_cache_row_bytes = (int64_t) eg_cache.row_bytes();
+    }
+    // (eg_pre) chunk k of a prompt's plan (`tokens`: the plan's, from its start) - its Engram rows asked for, behind
+    // every other read; as many of its first tokens as half the row cache holds (every Engram layer's rows of them)
+    void eg_ahead_start(const FeedPlan& plan, const int* tokens, int k) {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_PROMPT_EG_AHEAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        eg_ahead_end();
+        if (!on || pk.eg_layers <= 0 || eg_cache.capacity() == 0 || k <= 0 || k >= (int) plan.ends.size()) return;
+        const int64_t p0 = plan.at + plan.ends[(size_t) k - 1];
+        const int cols = (pk.eg_ngram - 1) * pk.eg_heads, nl = pk.eg_layers;
+        const size_t per = (size_t) cols * (pk.eg_hd + pk.eg_hd / 32);
+        int T = plan.ends[(size_t) k] - plan.ends[(size_t) k - 1];
+        T = (int) std::min<int64_t>(T, (int64_t) (eg_cache.capacity() / 2) / std::max(1, cols * nl));
+        if (T <= 0) return;
+        auto a = std::make_unique<EgAhead>();
+        a->seq = sq_bound;
+        a->at = plan.at;
+        a->k = k;
+        const int64_t c0 = std::max<int64_t>(0, p0 - (pk.eg_ngram - 1));   // (the look-back's first position)
+        a->cts.resize((size_t) (p0 + T - c0));
+        for (int64_t q = c0; q < p0 + T; ++q)   // (fed already: the state's; the plan's tokens past it as fed would be)
+            a->cts[(size_t) (q - c0)] = q < (int64_t) ctoks.size() ? ctoks[(size_t) q]
+                                                                  : ctok(q, tokens[(size_t) (q - plan.at)]);
+        a->rows.resize((size_t) nl * T * per);
+        for (int li = 0; li < nl; ++li) {
+            a->b.emplace_back(new EgBatch());
+            EgBatch& b = *a->b.back();
+            eg_issue(p0, T, li, a->rows.data() + (size_t) li * T * per, b, false, false, false, nullptr, a->cts.data(),
+                     c0);
+            a->lookups += b.lookups;
+            eg_io.submit(b, true);
+        }
+        st.eg_ahead += a->lookups;
+        eg_pre = std::move(a);
+    }
+    // (eg_pre) the rows read ahead, waited for and into the row cache (before any run of chunks, a prompt's end)
+    void eg_ahead_end() {
+        if (!eg_pre) return;
+        for (auto& b : eg_pre->b) eg_finish(*b, false);
+        eg_pre.reset();
     }
     // the chunked prompt path: rows of Engram layer `only` into dst, now (a helper thread, a chunk ahead)
     void engram_rows(int64_t p0, int T, int only, uint8_t* dst, bool account = true) {
@@ -17422,6 +17483,10 @@ struct Model::Impl {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
+        // (a prompt read in parts: this part's first chunk's Engram rows, read ahead, into the row cache - or what
+        //  another read left)
+        if (eg_pre && !(whole != nullptr && sq_bound == eg_pre->seq && fp.at == eg_pre->at && eg_pre->k > k0))
+            eg_ahead_end();
         blas_wait();   // (the prompt path's GEMM warm-up, if it still runs: finished first)
         warm_end();   // (the last prompt's warm-up: this one streams what it needs)
         // (DS4_SETTLE_MS: the profile's counts before the run - what the run picked is the difference)
@@ -17595,6 +17660,9 @@ struct Model::Impl {
             bool& now;
             ~CheckEnd() { now = false; }
         } check_end_{flow_check_now};
+        // (a part with more to come: the next part's first chunk's Engram rows asked for now, behind the run's own -
+        //  this thread only waits for the devices meanwhile)
+        const bool ahead_next = whole != nullptr && !run_end;
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
@@ -17609,6 +17677,7 @@ struct Model::Impl {
                     }
                 }
             });
+        if (ahead_next) eg_ahead_start(*whole, tk - x0, k1);
         main_at.store("a run of chunks: waiting for the devices", std::memory_order_relaxed);
         size_t reported = 0;
         for (;;) {
@@ -19650,6 +19719,7 @@ bool Model::feed_plan(int n, int logits_rows, int slot, FeedPlan& plan) {
 }
 bool Model::feed_release(std::string& err) {
     Impl& p = *p_;
+    p.eg_ahead_end();   // (a read in parts that ended: rows read ahead for a part that does not come - into the cache)
     if (!p.lend_held.load(std::memory_order_relaxed)) return true;
     if (p.borrow_end()) return true;
     err = p.lend_broken ? std::string(Impl::kLendBroken)

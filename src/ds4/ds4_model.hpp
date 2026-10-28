@@ -153,6 +153,7 @@ struct Stats {
     int64_t lent_back = 0;
     double lent_back_ms = 0.0;
     int64_t lend_kept = 0, lend_picks = 0;
+    int64_t eg_ahead = 0;   // a prompt read in parts: Engram lookups of its next part's first chunk read ahead
 };
 
 class Model {

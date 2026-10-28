@@ -136,6 +136,8 @@ struct EgBatch {
 };
 
 /// The reader's threads: each read on whichever is free, in submission order, with that thread's own file handles.
+/// A batch submitted `low` (read ahead of need: a prompt's next part) waits behind every other one - its reads only
+/// where no other is queued.
 class EgReader {
 public:
     ~EgReader() {
@@ -203,7 +205,7 @@ public:
     }
     int threads() const { return (int) th_.size(); }
     bool ram_only() const { return ram_only_; }
-    void submit(EgBatch& b) {
+    void submit(EgBatch& b, bool low = false) {
         b.io_reads = (int) b.reads.size();
         b.ok.assign(b.reads.size(), 0);
         b.post.store(0);
@@ -218,7 +220,14 @@ public:
         int jobs = 0;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            for (int i = 0; i < n; i += step, ++jobs) q_.push_back({&b, i, std::min(n, i + step)});
+            std::deque<Job>& q = low ? qlo_ : q_;
+            for (int i = 0; i < n; i += step, ++jobs) {
+                Job j;
+                j.b = &b;
+                j.i0 = i;
+                j.i1 = std::min(n, i + step);
+                q.push_back(std::move(j));
+            }
         }
         if (jobs >= (int) th_.size()) cv_.notify_all();
         else
@@ -416,10 +425,11 @@ private:
             Job job;
             {
                 std::unique_lock<std::mutex> lk(mu_);
-                cv_.wait(lk, [&] { return quit_ || !q_.empty(); });
-                if (quit_ && q_.empty()) break;
-                job = q_.front();
-                q_.pop_front();
+                cv_.wait(lk, [&] { return quit_ || !q_.empty() || !qlo_.empty(); });
+                if (quit_ && q_.empty() && qlo_.empty()) break;
+                std::deque<Job>& q = !q_.empty() ? q_ : qlo_;   // (the batches read ahead only after the rest)
+                job = q.front();
+                q.pop_front();
             }
             EgBatch& b = *job.b;
             int done = 0;
@@ -568,7 +578,7 @@ public:
             }
         }
     }
-    std::deque<Job> q_;
+    std::deque<Job> q_, qlo_;
     bool quit_ = false;
     std::mutex done_mu_;
     std::condition_variable done_cv_;
