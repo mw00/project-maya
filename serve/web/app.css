@@ -266,28 +266,6 @@
 .edit-bar span { flex: 1; }
 .plus-menu .menu__item[role="menuitemcheckbox"] { align-items: center; }
 
-/* the thinking speedometer's panel: a slider with four stops */
-.think-panel { position: absolute; z-index: 25; right: 48px; bottom: calc(100% + 8px); width: 340px; display: flex; flex-direction: column; gap: 14px;
-               padding: 16px 18px; border-radius: var(--st-r-lg); background: var(--st-surface); box-shadow: var(--st-shadow-pop); animation: popup 140ms var(--st-ease); }
-.think-panel--below { bottom: auto; top: calc(100% + 8px); animation-name: pop; }
-.think-panel__head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
-.think-panel__head b { font-size: var(--st-fs-md); font-weight: 600; }
-.think-panel__head span { font-size: var(--st-fs-sm); color: var(--st-ink-muted); text-align: right; }
-.think-panel__note { margin: 0; padding-top: 12px; border-top: 1px solid var(--st-line); font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
-.think-slider { position: relative; height: 52px; margin: 0 22px; }
-.think-slider__track, .think-slider__fill { position: absolute; left: 0; top: 12px; height: 4px; border-radius: 2px; }
-.think-slider__track { right: 0; background: var(--st-surface-3); }
-.think-slider__fill { width: var(--fill); background: var(--st-accent); transition: width 160ms var(--st-ease); }
-.think-slider__stop { position: absolute; top: 0; width: 56px; height: 52px; margin-left: -28px; padding: 0; border: 0; background: transparent;
-                      display: flex; flex-direction: column; align-items: center; gap: 4px; }
-.think-slider__dot { display: block; width: 12px; height: 12px; margin: 8px 0; border-radius: 50%; background: var(--st-line-strong);
-                     transition: all 160ms var(--st-ease); }
-.think-slider__stop.is-on .think-slider__dot { background: var(--st-accent); }
-.think-slider__stop.is-sel .think-slider__dot { width: 22px; height: 22px; margin: 3px 0; box-shadow: 0 0 0 6px var(--st-accent-tint); }
-.think-slider__name { font-size: var(--st-fs-xs); line-height: 1.2; font-weight: 500; color: var(--st-ink-muted); }
-.think-slider__stop.is-sel .think-slider__name { color: var(--st-ink); font-weight: 600; }
-.think-slider__stop:focus-visible { outline: none; }
-.think-slider__stop:focus-visible .think-slider__dot { outline: 2px solid var(--st-focus); outline-offset: 3px; }
 
 /* ---------------------------------------------------------------- a new chat: the greeting, the box, ideas */
 .greeting { min-height: 100%; width: 100%; max-width: calc(var(--maya-read) + 48px); margin: 0 auto; padding: 24px 24px 12vh;
@@ -329,8 +307,8 @@
          border-radius: var(--st-r-xl) var(--st-r-xl) 0 0; background: var(--st-surface); box-shadow: var(--st-shadow-sheet); animation: slideup 200ms var(--st-ease); }
 @keyframes slideup { from { transform: translateY(100%); } }
 .sheet__grip { align-self: center; width: 36px; height: 4px; margin: 2px 0 12px; border-radius: 2px; background: var(--st-line-strong); }
-/* the phone's thinking level: a thick bar hovering over the chat above the message box, a segment a level, filled up to
-   the one set; a tap or a drag along it sets another */
+/* the thinking level: a thick bar hovering over the chat by the message box, a segment a level, filled up to the one set;
+   a tap, a click or a drag along it sets another.  On a phone it spans the message box; wider, it sits by the chip */
 .think-bar { position: absolute; z-index: 25; left: 2px; right: 2px; bottom: calc(100% + 10px); padding: 5px;
              border: 1px solid var(--st-glass-line); border-radius: var(--st-r-pill); background: var(--st-glass-bar);
              box-shadow: var(--st-shadow-float); -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%);
@@ -345,7 +323,11 @@
                   color: var(--st-ink-muted); white-space: nowrap; transition: color 180ms var(--st-ease); }
 .think-bar__seg.is-on { color: color-mix(in srgb, var(--st-accent-ink) 78%, transparent); }
 .think-bar__seg.is-sel { color: var(--st-accent-ink); font-weight: 700; }
-.think-bar--many .think-bar__seg { font-size: var(--st-fs-xs); }   /* (MiniMax's seven levels) */
+.think-bar--many:not(.think-bar--pop) .think-bar__seg { font-size: var(--st-fs-xs); }   /* (MiniMax's seven, on a phone) */
+.think-bar--pop { left: auto; right: 44px; width: min(calc(var(--n) * 84px + 12px), calc(100% - 48px)); }
+.think-bar--below { bottom: auto; top: calc(100% + 10px); animation-name: thinkbar-down; }
+@keyframes thinkbar-down { from { opacity: 0; transform: translateY(-6px); } }
+@media (hover: hover) { .think-bar__seg:not(.is-on):hover { color: var(--st-ink); } }
 
 /* ---------------------------------------------------------------- the phone: the chats push the page over, floating buttons */
 /* (as ChatGPT's app: the chats slide in from the left beside the page, not over it, and push it to the right; its edge
