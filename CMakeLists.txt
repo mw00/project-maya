@@ -513,6 +513,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
                               src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    # the commit and the release `maya-ds4 --version` and --verbose name, written at every build (cmake/build_id.cmake:
+    # git's commit, a source archive's BUILD_ID file, or -DMAYA_BUILD_ID=...; the release from VERSION)
+    set(MAYA_BUILD_ID "" CACHE STRING "maya-ds4 --version's build id (empty: git's commit, or the BUILD_ID file)")
+    add_custom_target(maya_build_id
+      COMMAND ${CMAKE_COMMAND} -DSRC=${CMAKE_CURRENT_SOURCE_DIR}
+              -DOUT=${CMAKE_CURRENT_BINARY_DIR}/generated/maya_build_id.h -DID=${MAYA_BUILD_ID}
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/build_id.cmake
+      BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/maya_build_id.h
+      VERBATIM)
+    add_dependencies(maya-ds4 maya_build_id)
+    target_include_directories(maya-ds4 PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu strata_spec ${_strata_gpu_runtime_target}
                           ${_strata_gpu_blas_target})
     if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)

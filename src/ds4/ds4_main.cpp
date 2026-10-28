@@ -32,6 +32,18 @@
 
 #include <cuda_profiler_api.h>
 
+// the commit and the release this binary was built from (--version, the --verbose "ds4: build" line):
+// cmake/build_id.cmake writes them at every build
+#if __has_include("maya_build_id.h")
+#include "maya_build_id.h"
+#endif
+#ifndef MAYA_BUILD_ID
+#define MAYA_BUILD_ID "unknown"
+#endif
+#ifndef MAYA_RELEASE
+#define MAYA_RELEASE "?"
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -114,7 +126,8 @@ void usage() {
                  "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
                  "maya-ds4 --pack <model>/maya-ds4 --pack-info [--expert-profile FILE]   the pack described: no GPU, no "
-                 "weights read\n");
+                 "weights read\n"
+                 "maya-ds4 --version   the release and the commit it was built from\n");
 }
 
 // --pack-info: the types the kernels take, asked of them (ds4_gguf / ds4_iq: the routed experts' and the dense GEMVs'
@@ -2490,6 +2503,10 @@ int main(int argc, char** argv) {
         else if (a == "--temperature") temp = (float) std::atof(val("--temperature").c_str());
         else if (a == "--seed") cli_seed = std::strtoull(val("--seed").c_str(), nullptr, 10);
         else if (a == "--verbose" || a == "-v") o.verbose = true;
+        else if (a == "--version") {
+            std::printf("maya-ds4 %s (build %s)\n", MAYA_RELEASE, MAYA_BUILD_ID);
+            return 0;
+        }
         else if (a == "--ids") ids_s = val("--ids");
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
@@ -2513,6 +2530,7 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+    if (o.verbose) std::fprintf(stderr, "ds4: build %s (Maya %s)\n", MAYA_BUILD_ID, MAYA_RELEASE);
     if (describe) {   // the pack's description alone, before anything that would touch a GPU
         if (o.pack.empty()) {
             usage();
