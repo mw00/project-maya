@@ -730,16 +730,19 @@ measured choice as before. The log says `ds4: CPU lane IQ1_S rows: ours without 
 
 ## DeepSeek: a GEMV call's int8 inputs rounded in one launch
 
-A GGUF pack's Q8_0 (and low-bit dense) GEMVs round their activations to int8 first, one small launch per job: a
-decoded token runs a few hundred of them per GPU, each about 2 us of work behind a launch gap. With
-`MAYA_DS4_Q8_BATCH=1` a call's jobs are rounded in one launch before its GEMVs, by the same per-block code, so the
-int8 values, the scales and the answers are bit for bit the same. `MAYA_DS4_Q8_CHECK=1` checks the batched rounding
-against the per-job one on every GPU at load (any difference fails the start).
+A GGUF pack's Q8_0 (and low-bit dense) GEMVs round their activations to int8 first. This used to take one small launch
+per job: a decoded token runs a few hundred of them per GPU, each about 2 us of work behind a launch gap. Now a call's
+jobs are rounded in one launch before its GEMVs, by the same per-block code. An input that several jobs of the call
+read is rounded once and shared: the attention's `wq_a`, `wkv` and the compressor's two matrices all read one x, and
+the shared expert's `w1` and `w3` read one too. The int8 values, the scales and the answers are bit for bit the same.
+`MAYA_DS4_Q8_CHECK=1` checks the batched, shared rounding against the per-job one on every GPU at load (any
+difference fails the start); `ds4_gguf_test --trims` checks every mode.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_Q8_BATCH` | off | `1`: a GEMV call's int8 rounding in one launch (the same bits) |
-| `MAYA_DS4_Q8_CHECK` | off | `1`: the batched rounding checked against the per-job one on every GPU at load |
+| `MAYA_DS4_Q8_BATCH` | on | `0`: a launch a job, as before (the same bits either way) |
+| `MAYA_DS4_Q8_SHARE` | on | `0`: each job rounds its own input, even one another job of the call reads (the same bits either way); both `0`: as before |
+| `MAYA_DS4_Q8_CHECK` | off | `1`: the batched, shared rounding checked against the per-job one on every GPU at load |
 
 ## DeepSeek: a decoded token's small launches fused
 

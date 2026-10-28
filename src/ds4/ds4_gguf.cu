@@ -242,6 +242,33 @@ void q8_quant_jobs(const Q8Jobs& J, int n, cudaStream_t s) {
     }
     pdl_launch(q8_quant_jobs_kernel, dim3((unsigned) bx, (unsigned) by, (unsigned) n), kThreads, 0, s, J);
 }
+// a mv call's int8 inputs: each job's rows rounded into its own scratch, in one launch before the GEMVs (batch) or a
+// launch at each job; share: a job whose input an earlier one's is (the same x, stride, rows and k - wq_a, wkv and the
+// compressor's two on one x, the shared expert's w1 and w3) reads that job's rows instead of rounding them again
+struct Q8Round {
+    Q8Jobs J;
+    int n = 0;   // (<= kMaxMvJobs: a job adds one at most)
+    bool batch = true, share = true;
+    // (rq, rd): where the job reads its rows - (q, d), or the earlier job's
+    void add(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, const int8_t*& rq, const float*& rd,
+             cudaStream_t s) {
+        for (int i = 0; share && i < n; ++i) {
+            const Q8Job& a = J.j[i];
+            if (a.x == x && a.ldx == ldx && a.rows == rows && a.k == k) {
+                rq = a.q;
+                rd = a.d;
+                return;
+            }
+        }
+        J.j[n++] = {x, ldx, q, d, k, rows};
+        rq = q;
+        rd = d;
+        if (!batch) q8_quant(x, ldx, rows, k, q, d, s);
+    }
+    void flush(cudaStream_t s) const {
+        if (batch && n > 0) q8_quant_jobs(J, n, s);
+    }
+};
 
 // ---- the low-bit experts' activations as the CPU lane rounds them (ggml's Q8_K, quantize_row_q8_K_ref, ggml-cpu's
 // on x86): per 256 values max = the signed value of the largest magnitude (the first one), iscale = -127 / max, q =
@@ -1125,34 +1152,56 @@ bool mx_geometry(const char* who, int k, int n_embd, int n_ff) {
 // ---------------------------------------------------------------- entry points
 bool prepare(cudaStream_t s) { return scratch(s) != nullptr; }
 
-bool q8_batch() {   // DS4_Q8_BATCH=1: a mv call's int8 inputs in one launch (unset: a launch a job, as before)
+namespace {
+std::atomic<int> g_q8_mode{-1};   // (tests: q8_mode)
+bool q8_env(const char* name) {   // (unset: on)
+    const char* v = std::getenv((std::string("STRATA_") + name).c_str());
+    if (v == nullptr) v = std::getenv(name);
+    return v == nullptr || std::atoi(v) != 0;
+}
+}  // namespace
+bool q8_batch() {   // a mv call's int8 inputs in one launch (DS4_Q8_BATCH=0: a launch a job, as before)
+    const int m = g_q8_mode.load(std::memory_order_relaxed);
+    if (m >= 0) return (m & 1) != 0;
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_DS4_Q8_BATCH");
-        if (v == nullptr) v = std::getenv("DS4_Q8_BATCH");
-        const bool b = v != nullptr && std::atoi(v) != 0;
-        if (b) std::fprintf(stderr, "ds4: a GEMV call's int8 inputs rounded in one launch (DS4_Q8_BATCH)\n");
+        const bool b = q8_env("DS4_Q8_BATCH");
+        if (!b) std::fprintf(stderr, "ds4: a GEMV call's int8 inputs rounded a launch a job (DS4_Q8_BATCH=0)\n");
         return b;
     }();
     return on;
 }
+bool q8_share() {   // jobs on one input share its rounding (DS4_Q8_SHARE=0: each job its own, as before)
+    const int m = g_q8_mode.load(std::memory_order_relaxed);
+    if (m >= 0) return (m & 2) != 0;
+    static const bool on = [] {
+        const bool b = q8_env("DS4_Q8_SHARE");
+        if (!b) std::fprintf(stderr, "ds4: each GEMV job rounds its own int8 input (DS4_Q8_SHARE=0)\n");
+        return b;
+    }();
+    return on;
+}
+void q8_mode(int m) { g_q8_mode.store(m, std::memory_order_relaxed); }
 
 // DS4_Q8_CHECK=1 (at load, before any request): eight jobs - k 5120 / 2304 / 256 / 32, rows 1 / 4 / 16, strided rows,
-// two jobs reading one input, values with zero blocks, negative zeros, halves at the rounding, tiny and large
-// magnitudes - rounded by the per-job launches into a set of outputs filled 0xA5, then by the batched launch into a
-// second set filled 0xA5 and a third filled 0x5A, each job's int8 rows and scales between 256 guard bytes.  The first
-// two must be the same byte for byte (every int8, every scale's bits, every guard), the third the same as the first in
-// every row and scale byte (each written) and 0x5A in every guard (none touched past a job's rows or k).  The uploads,
-// the fills and the launches on one stream of its own, their end waited for, bounded; a CUDA error, a mismatch or no
-// clean end in time fails the load (without a clean end everything is kept).  No tolerance: the batched kernel runs
-// the per-job one's code
+// two jobs reading one input with other k, two of the same input, stride, rows and k, values with zero blocks,
+// negative zeros, halves at the rounding, tiny and large magnitudes - rounded by the per-job launches, each job its own
+// (no sharing), into a set of outputs filled 0xA5, then by mv's batched launch with sharing (Q8Round) into a second
+// set filled 0xA5 and a third filled 0x5A, each job's int8 rows and scales between 256 guard bytes.  Only the last job
+// may share (the second's twin): every other one reads its own rows.  What each job reads must be the same as the
+// first set's rows of that job byte for byte (every int8, every scale's bits); the guards stay 0xA5 / 0x5A (none
+// touched past a job's rows or k), and the sharing job's own rows and scales are never written.  The uploads, the
+// fills and the launches on one stream of its own, their end waited for, bounded; a CUDA error, a mismatch or no clean
+// end in time fails the load (without a clean end everything is kept).  No tolerance: the batched kernel runs the
+// per-job one's code
 bool q8_batch_check(int dev, std::string& err) {
     struct Spec {
         int k, rows, ldx, input;
     };
     static const Spec spec[x3::kMaxMvJobs] = {{5120, 1, 5120, 0}, {2304, 4, 2368, 1}, {256, 16, 288, 2},
                                               {32, 1, 32, 3},     {5120, 4, 5248, 4}, {2304, 1, 5120, 0},
-                                              {32, 16, 64, 5},    {256, 4, 256, 6}};
-    constexpr int kInputs = 7;
+                                              {32, 16, 64, 5},    {2304, 4, 2368, 1}};
+    constexpr int kInputs = 6;
+    constexpr int kTwin = 7, kTwinOf = 1;   // (the job that shares, the one it shares)
     constexpr size_t kGuard = 256;
     const char* where = "";
     auto fail_at = [&](const std::string& why) {
@@ -1222,6 +1271,9 @@ bool q8_batch_check(int dev, std::string& err) {
         }
     }
     where = "setup";
+    int reads[3][x3::kMaxMvJobs];   // (sets 1 and 2: the job whose rows job i reads)
+    for (int b = 0; b < 3; ++b)
+        for (int i = 0; i < x3::kMaxMvJobs; ++i) reads[b][i] = i;
     if (ok) {
         uint8_t* set[3] = {out, out + set_bytes, out + 2 * set_bytes};
         ok = cudaMemsetAsync(set[0], 0xA5, set_bytes, s) == cudaSuccess &&
@@ -1231,11 +1283,21 @@ bool q8_batch_check(int dev, std::string& err) {
             q8_quant(dx[(size_t) spec[i].input], (size_t) spec[i].ldx, spec[i].rows, spec[i].k,
                      (int8_t*) (set[0] + qat[i]), (float*) (set[0] + dat[i]), s);
         for (int b = 1; ok && b < 3; ++b) {
-            Q8Jobs J;
-            for (int i = 0; i < x3::kMaxMvJobs; ++i)
-                J.j[i] = {dx[(size_t) spec[i].input], (size_t) spec[i].ldx, (int8_t*) (set[b] + qat[i]),
-                          (float*) (set[b] + dat[i]), spec[i].k, spec[i].rows};
-            q8_quant_jobs(J, x3::kMaxMvJobs, s);
+            Q8Round R;
+            R.batch = true;
+            R.share = true;
+            for (int i = 0; i < x3::kMaxMvJobs; ++i) {
+                const int8_t* rq = nullptr;
+                const float* rd = nullptr;
+                R.add(dx[(size_t) spec[i].input], (size_t) spec[i].ldx, spec[i].rows, spec[i].k,
+                      (int8_t*) (set[b] + qat[i]), (float*) (set[b] + dat[i]), rq, rd, s);
+                int j = 0;   // (the job whose rows these are; kMaxMvJobs: none of them)
+                while (j < x3::kMaxMvJobs &&
+                       !((const uint8_t*) rq == set[b] + qat[j] && (const uint8_t*) rd == set[b] + dat[j]))
+                    ++j;
+                reads[b][i] = j;
+            }
+            R.flush(s);
         }
         const bool launched = cudaGetLastError() == cudaSuccess;
         ok = ok && launched &&
@@ -1273,6 +1335,14 @@ bool q8_batch_check(int dev, std::string& err) {
     }
     cudaSetDevice(cur);
     if (!ok) return fail_at(std::string("a CUDA error or no end (") + where + ")");
+    for (int b = 1; b < 3; ++b)   // (the twin reads its original's rows, every other job its own)
+        for (int i = 0; i < x3::kMaxMvJobs; ++i)
+            if (reads[b][i] != (i == kTwin ? kTwinOf : i)) {
+                char m[160];
+                std::snprintf(m, sizeof m, "job %d reads job %d's rows (expected %d's)", i, reads[b][i],
+                              i == kTwin ? kTwinOf : i);
+                return fail_at(m);
+            }
     const uint8_t *a = h.data(), *b = a + set_bytes, *c = b + set_bytes;
     for (int i = 0; i < x3::kMaxMvJobs; ++i) {
         const size_t qn = (size_t) spec[i].rows * (size_t) spec[i].k, dn = qn / 32 * sizeof(float);
@@ -1285,19 +1355,30 @@ bool q8_batch_check(int dev, std::string& err) {
                                   i, o, a[o], b[o], c[o]);
                     return fail_at(m);
                 }
+        const int j = reads[1][i];   // (what job i reads in the batched sets: job j's rows, at its offsets)
         const size_t body[2][2] = {{qat[i], qat[i] + qn}, {dat[i], dat[i] + dn}};
+        const size_t at[2] = {qat[j], dat[j]};
         for (int r = 0; r < 2; ++r)
-            for (size_t o = body[r][0]; o < body[r][1]; ++o)
-                if (a[o] != b[o] || a[o] != c[o]) {
+            for (size_t o = body[r][0]; o < body[r][1]; ++o) {
+                const size_t ob = at[r] + (o - body[r][0]);
+                if (a[o] != b[ob] || a[o] != c[ob]) {
                     char m[160];
                     std::snprintf(m, sizeof m, "job %d: %s byte %zu (per-job 0x%02x, batched 0x%02x / 0x%02x)", i,
-                                  r == 0 ? "an int8" : "a scale", o - body[r][0], a[o], b[o], c[o]);
+                                  r == 0 ? "an int8" : "a scale", o - body[r][0], a[o], b[ob], c[ob]);
                     return fail_at(m);
                 }
+                if (j != i && (b[o] != 0xA5 || c[o] != 0x5A)) {   // (a sharing job's own rows: never written)
+                    char m[160];
+                    std::snprintf(m, sizeof m, "job %d (sharing job %d's rows): its own %s byte %zu written", i, j,
+                                  r == 0 ? "int8" : "scale", o - body[r][0]);
+                    return fail_at(m);
+                }
+            }
     }
     std::fprintf(stderr,
-                 "ds4: CUDA%d Q8 batch check: 8 jobs (k 32 .. 5120, rows 1 .. 16, strided, one input shared): %zu int8 "
-                 "and %zu scales the per-job launches' bit for bit, every guard intact (DS4_Q8_CHECK)\n",
+                 "ds4: CUDA%d Q8 batch check: 8 jobs (k 32 .. 5120, rows 1 .. 16, strided, one input read with two k, "
+                 "two jobs sharing a rounding): %zu int8 and %zu scales the per-job launches' bit for bit, every guard "
+                 "intact (DS4_Q8_CHECK)\n",
                  dev, payload_q, payload_d);
     return true;
 }
@@ -1396,13 +1477,9 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
     bool vec[3] = {true, true, true};
     iq::MvJob IJ[x3::kMaxMvJobs];   // the low-bit ones (ds4_iq: a launch a type)
     int nij = 0;
-    Q8Jobs QJ;   // (DS4_Q8_BATCH: the jobs' int8 inputs, one launch before the GEMVs; else each at its job)
-    int nq = 0;
-    const bool batch = q8_batch();
-    auto quant = [&](const float* x, size_t ldx, int rows, int k, int8_t* q, float* d) {
-        if (batch) QJ.j[nq++] = {x, ldx, q, d, k, rows};
-        else q8_quant(x, ldx, rows, k, q, d, s);
-    };
+    Q8Round QR;   // (the jobs' int8 inputs: one launch before the GEMVs, an input read by several jobs rounded once)
+    QR.batch = q8_batch();
+    QR.share = q8_share();
     for (int i = 0; i < n; ++i) {
         const x3::MvJob& q = jobs[i];
         const x3::Mat& m = *q.m;
@@ -1418,16 +1495,15 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
             // (per 32: a dense matrix - the CPU lane computes only experts, so Q8_K's rounding, a scale per 256, would only
             //  lose precision here)
-            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32);
             iq::MvJob& b = IJ[nij++];
+            QR.add(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, b.xq, b.xd,
+                   s);
             b.w = (const uint8_t*) m.raw;
             b.ld = row_stride(m);
             b.type = m.gg_type;
             b.k = m.k;
             b.n = m.n;
             b.ncol = q.ncol;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
             b.y = q.y;
             b.ycs = q.y_cs;
             b.bias = q.bias;
@@ -1470,15 +1546,14 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
                 return false;
             }
             const size_t at = (size_t) i * x3::kMaxMvCols * kMaxQK;
-            b.xq = sc->mq + at;
-            b.xd = sc->md + at / 32;
-            quant(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32);
+            QR.add(q.xf, q.ncol > 1 ? q.xf_cs : (size_t) m.k, q.ncol, m.k, sc->mq + at, sc->md + at / 32, b.xq, b.xd,
+                   s);
             vec[f] = vec[f] && b.ld % 4 == 0 && ((uintptr_t) b.w & 3u) == 0 && (m.k / 32) % 2 == 0;
         } else {
             vec[f] = vec[f] && xa && (f != 0 || (m.k % 8 == 0 && b.ld % 8 == 0 && ((uintptr_t) b.w & 15u) == 0));
         }
     }
-    if (nq > 0) q8_quant_jobs(QJ, nq, s);
+    QR.flush(s);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
     if (nij > 0 && !iq::mv(IJ, nij, s)) {
         fail("mv: a low-bit job not covered");

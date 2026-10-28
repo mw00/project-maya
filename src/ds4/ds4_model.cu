@@ -2974,9 +2974,11 @@ struct Model::Impl {
                 CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * sizeof(float), cudaMemcpyHostToDevice));
             }
         }
-        // (MAYA_DS4_Q8_BATCH: its line now, at load; MAYA_DS4_Q8_CHECK=1: the batched rounding checked on every device first)
+        // (MAYA_DS4_Q8_BATCH / _SHARE: their lines now, at load; MAYA_DS4_Q8_CHECK=1: the batched rounding with sharing
+        //  checked on every device first)
         if (pk.gguf) {
             gg::q8_batch();
+            gg::q8_share();
             if (std::getenv("STRATA_DS4_Q8_CHECK") != nullptr || std::getenv("DS4_Q8_CHECK") != nullptr) {
                 for (int id : ids)
                     if (!gg::q8_batch_check(id, err)) return false;

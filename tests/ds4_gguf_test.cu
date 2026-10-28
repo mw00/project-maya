@@ -6,7 +6,8 @@
 // random blocks), and layers that put MXFP4 beside a low-bit role; the PCIe lane's streamed experts (bit for bit the VRAM ones'); and the KV caches' packed rows
 // (ds4_kernels.cu) against the BF16 rows bit for bit.  Needs a GPU, no model.
 // ds4_gguf_test [n_embd n_ff] | --kv (the caches alone) | --lane (the PCIe lane alone) | --ar <device> <device> [rows]
-// (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times)
+// (a group of two's chunk all-reduce: DS4_AR2 against the old one, then their times) | --trims (the decode trims alone:
+// test_decode_trims)
 #include "../src/ds4/ds4_gguf.cuh"
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 #include "../src/ds4/ds4_iq.cuh"
@@ -2242,6 +2243,92 @@ void test_q5k_host() {
     std::printf("%-52s %s\n", "Q5_K embedding (host) = ggml's, bit for bit", same ? "ok" : "FAIL");
 }
 
+// ---------------------------------------------------------------- the decode trims
+// (each against the path it stands in for; test_decode_trims runs them all)
+
+// A GEMV call's int8 inputs in its four modes (gg::q8_mode: bit 1 one launch for the call, bit 2 an input read by
+// several jobs rounded once): eight jobs - Q8_0 and low-bit (Q6_K, IQ4_XS) matrices, three of them on one token's x,
+// two on a window's strided rows, one on those rows' first as one row, one on the token's x with another k, a BF16 one
+// beside them - every output of every mode the per-job unshared mode's bit for bit; then q8_batch_check (DS4_Q8_CHECK:
+// the batched rounding with sharing against the per-job one, every byte and guard)
+void test_q8_share(cudaStream_t s) {
+    const int k = 1280, nc = 4;
+    const size_t xcs = (size_t) k + 64;
+    std::vector<float> x0((size_t) k), x1(xcs * nc);
+    for (auto& v : x0) v = frand();
+    for (auto& v : x1) v = frand(3.0f);
+    float *d0 = dev(x0), *d1 = dev(x1);
+    struct Spec {
+        int fmt, type, n, k, ncol;
+        float* x;
+    };
+    const Spec sp[8] = {{gg::kFmtQ8_0, 0, 136, k, 1, d0},           {gg::kFmtQ8_0, 0, 72, k, 1, d0},
+                        {gg::kFmtGG, gg::iq::kQ6_K, 40, k, 1, d0},   {gg::kFmtQ8_0, 0, 64, k, nc, d1},
+                        {gg::kFmtGG, gg::iq::kIQ4_XS, 48, k, nc, d1}, {gg::kFmtQ8_0, 0, 56, k, 1, d1},
+                        {gg::kFmtQ8_0, 0, 40, 256, 1, d0},            {gg::kFmtBF16, 0, 96, k, 1, d0}};
+    x3::Mat m[8];
+    void* dw[8];
+    float* dy[8];
+    x3::MvJob j[8];
+    for (int i = 0; i < 8; ++i) {
+        const Spec& q = sp[i];
+        if (q.fmt == gg::kFmtBF16) {
+            std::vector<uint16_t> w((size_t) q.n * q.k);
+            for (auto& v : w) v = f2bf(frand(0.05f));
+            dw[i] = dev(w);
+        } else
+            dw[i] = dev(q.fmt == gg::kFmtQ8_0 ? q8_rand(q.n, q.k) : q_rand(q.type, q.n, q.k));
+        m[i] = x3::Mat{};
+        m[i].fmt = q.fmt;
+        m[i].gg_type = q.type;
+        m[i].raw = dw[i];
+        m[i].k = q.k;
+        m[i].n = q.n;
+        dy[i] = dev(std::vector<float>((size_t) q.n * q.ncol));
+        j[i] = x3::MvJob{};
+        j[i].m = &m[i];
+        j[i].xf = q.x;
+        j[i].xf_cs = q.ncol > 1 ? xcs : 0;
+        j[i].ncol = q.ncol;
+        j[i].y = dy[i];
+        j[i].y_cs = (size_t) q.n;
+        j[i].alpha = 1.0f;
+    }
+    std::vector<std::vector<float>> ref(8);
+    const char* name[4] = {"a launch a job, each its own", "one launch, each its own", "a launch a job, shared",
+                           "one launch, shared (the default)"};
+    for (int mode = 0; mode < 4; ++mode) {
+        gg::q8_mode(mode);
+        for (int i = 0; i < 8; ++i) CU(cudaMemsetAsync(dy[i], 0xA5, (size_t) sp[i].n * sp[i].ncol * 4, s));
+        if (!gg::mv(j, 8, s)) ++g_fail;
+        CU(cudaStreamSynchronize(s));
+        bool same = true;
+        for (int i = 0; i < 8; ++i) {
+            std::vector<float> y = host(dy[i], (size_t) sp[i].n * sp[i].ncol);
+            if (mode == 0) ref[(size_t) i] = y;
+            else same = same && std::memcmp(y.data(), ref[(size_t) i].data(), y.size() * 4) == 0;
+        }
+        if (mode == 0) continue;
+        if (!same) ++g_fail;
+        char what[96];
+        std::snprintf(what, sizeof what, "mv int8 inputs: %s = per job", name[mode]);
+        std::printf("%-52s %s\n", what, same ? "ok" : "FAIL");
+    }
+    gg::q8_mode(-1);
+    int devn = 0;
+    CU(cudaGetDevice(&devn));
+    std::string err;
+    const bool ok = gg::q8_batch_check(devn, err);
+    if (!ok) ++g_fail;
+    std::printf("%-52s %s%s\n", "q8_batch_check (DS4_Q8_CHECK)", ok ? "ok" : "FAIL ", ok ? "" : err.c_str());
+    for (int i = 0; i < 8; ++i) cudaFree(dw[i]), cudaFree(dy[i]);
+    cudaFree(d0), cudaFree(d1);
+}
+
+void test_decode_trims(cudaStream_t s) {
+    test_q8_share(s);
+}
+
 // ---------------------------------------------------------------- a group of two's chunk all-reduce (ds4_kernels.cu)
 // Two GPUs, a thread and a stream each, the rows and flags host-mapped as maya-ds4's hmap leaves them (mapped,
 // portable, zeroed).  allreduce as before (xfer_put + ar_sum_kernel) and DS4_AR2 1 / 2 (ar2_kernel), interleaved on one
@@ -2428,6 +2515,12 @@ int main(int argc, char** argv) {
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }
+    if (argc >= 2 && std::strcmp(argv[1], "--trims") == 0) {   // the decode trims alone
+        test_decode_trims(s);
+        if (gg::launch_errors() != 0) ++g_fail;
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--kv") == 0) {   // the caches' packing alone
         test_kv_pack(s);
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
@@ -2445,6 +2538,7 @@ int main(int argc, char** argv) {
     test_f16_rows(s);
     for (int t : kQTypes) test_mv_q(t, s);
     test_mv_rows(s);
+    test_decode_trims(s);
     for (const auto& pr : kQPairs) test_experts_q(512, 256, pr.first, pr.second, s);
     test_lanes(s);
     if (argc >= 3) {

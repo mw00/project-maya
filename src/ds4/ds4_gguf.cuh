@@ -56,10 +56,16 @@ const char* type_name(int type);
 
 /// The per-stream scratch of the MXFP4 experts on the current device (once per stream, as x3::prepare).
 bool prepare(cudaStream_t s);
-/// DS4_Q8_BATCH=1: mv()'s int8 inputs a launch a call (its line the first time it is asked: the load asks it).
+/// mv()'s int8 inputs a launch a call (DS4_Q8_BATCH=0: a launch a job), and a job reading the same input (x, stride,
+/// rows, k) as an earlier one of the call reads that one's int8 rows (DS4_Q8_SHARE=0: each rounds its own) - the same
+/// int8 values either way (a line when one is off, the first time it is asked: the load asks both).
 bool q8_batch();
-/// DS4_Q8_CHECK=1: the batched rounding against the per-job one on device dev (load time) - false and err when any byte
-/// differs, a guard is written, or a CUDA call fails or does not end.
+bool q8_share();
+/// (tests) the two above from here on: bit 1 batch, bit 2 share (-1: the environment's again).
+void q8_mode(int mode);
+/// DS4_Q8_CHECK=1: the batched rounding with sharing against the per-job one without on device dev (load time) - false
+/// and err when any byte a job reads differs, a guard or a sharing job's own rows are written, the sharing is not as
+/// expected, or a CUDA call fails or does not end.
 bool q8_batch_check(int dev, std::string& err);
 
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
