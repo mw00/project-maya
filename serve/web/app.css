@@ -105,6 +105,39 @@
 .saved-pop__prices > div span:last-child { text-align: right; color: var(--st-ink-soft); font-variant-numeric: tabular-nums; white-space: nowrap; flex: none; }
 .saved-pop__foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
 .saved-pop__foot .btn { height: 30px; font-size: var(--st-fs-xs); }
+
+/* the phone's Saved: a bottom sheet, its title with a close button, the prices folded */
+.saved-sheet { gap: 0; padding: 8px 0 0; max-height: min(88vh, 88dvh); transition: transform 200ms var(--st-ease); }
+.saved-sheet__grab { flex: none; padding: 0 10px 4px 22px; touch-action: none; }
+.saved-sheet__grab .sheet__grip { display: block; margin: 2px auto 8px; }
+.saved-sheet__title { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.saved-sheet__title h2 { margin: 0; font-size: var(--st-fs-base); font-weight: 600; color: var(--st-ink-muted); }
+.saved-sheet__title .icon-btn { width: 44px; height: 44px; }
+.saved-sheet__body { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; display: flex; flex-direction: column; gap: 18px;
+                     padding: 0 22px calc(20px + env(safe-area-inset-bottom)); }
+.saved-sheet .saved-pop__head b { font-size: 40px; }
+.saved-sheet .saved-pop__head > span:last-child { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__start { padding: 12px 14px; }
+.saved-sheet .saved-pop__start > span b { font-size: var(--st-fs-md); }
+.saved-sheet .saved-pop__start > span span { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__start > b { font-size: var(--st-fs-lg); }
+.saved-sheet .saved-pop__h { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__models { gap: 14px; }
+.saved-sheet .saved-pop__model { gap: 12px; }
+.saved-sheet .saved-pop__model > span b { font-size: var(--st-fs-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.saved-sheet .saved-pop__model > span span { font-size: var(--st-fs-sm); }
+.saved-sheet .saved-pop__model > b { font-size: var(--st-fs-md); }
+.saved-pop__how { border-top: 1px solid var(--st-line); }
+.saved-pop__how summary { display: flex; align-items: center; justify-content: space-between; min-height: 48px; list-style: none;
+                          font-size: var(--st-fs-md); font-weight: 500; color: var(--st-ink-soft); cursor: pointer; }
+.saved-pop__how summary::-webkit-details-marker { display: none; }
+.saved-pop__how summary .chev { transform: rotate(-90deg); color: var(--st-ink-muted); }
+.saved-pop__how[open] summary .chev { transform: none; }
+.saved-pop__how .saved-pop__prices { padding: 0 0 4px; border-top: 0; font-size: var(--st-fs-sm); gap: 8px; }
+.saved-pop__how .saved-pop__price { flex-direction: column; gap: 1px; }
+.saved-pop__how .saved-pop__price span:last-child { text-align: left; color: var(--st-ink); }
+.saved-sheet__acts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.saved-sheet__acts .btn { height: 44px; }
 .status { display: flex; align-items: center; gap: 6px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
 .status__dot { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--st-ink-muted); }

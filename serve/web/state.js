@@ -20,6 +20,7 @@ export const S = {
   view: "chat",             // "chat", "monitor" or "models"
   sideOpen: store.get("side-open", true),   // the sidebar on a wide screen
   drawer: false,            // the chats drawer on a phone
+  savedSheet: false,        // the phone's Saved sheet (what the API would have charged)
   settings: null,           // the Settings dialog's open section, or null
   search: false,            // the search dialog
   dialog: null,             // a confirmation or a question

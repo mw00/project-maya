@@ -1,7 +1,7 @@
 // serve/web/sidebar.js - the sidebar (new chat, search, Models, Monitor, Settings; the chats: pinned, in folders, then by day;
 // the model's status and what it saved against its API), a chat's ⋯ menu, and the search dialog.
 import {html, useEffect, useLayoutEffect, useMemo, useRef, useState} from "./preact.js";
-import {MOD, api, ctxfmt, dayGroup, fmt, modelName, relTime, store} from "./lib.js";
+import {MOD, api, ctxfmt, dayGroup, fmt, isPhone, modelName, relTime, store} from "./lib.js";
 import {S, confirmDialog, emit, toast} from "./state.js";
 import {chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
         renameChat, renameFolder, deleteFolder, toggleFolder} from "./chats.js";
@@ -131,50 +131,118 @@ function upFor(s) {
   return m < 60 ? `${m} min` : `${Math.floor(m / 60)} h ${m % 60} min`;
 }
 
-function SavedPop({anchor, close}) {
-  const ref = useRef(null);
-  const [r, setR] = useState(null), [pos, setPos] = useState(null);
+// the breakdown (GET /api/savings), read again when the total moves
+function useSavings() {
+  const [r, setR] = useState(null);
   const total = S.metrics && S.metrics.savings ? S.metrics.savings.usd : null;
-  useDismiss(true, close, ref, anchor);
   useEffect(() => { api("api/savings").then(setR).catch((e) => setR({error: e.message})); }, [total]);
-  useLayoutEffect(() => {
-    const place = () => {
-      if (!anchor.current || !ref.current) return;
-      const a = anchor.current.getBoundingClientRect(), w = ref.current.offsetWidth;
-      setPos({left: Math.max(8, Math.min(a.left, innerWidth - w - 8)), bottom: innerHeight - a.top + 6});
-    };
-    place();
-    addEventListener("resize", place);
-    return () => removeEventListener("resize", place);
-  }, [!!r]);
+  return [r, setR];
+}
+
+// what the popover (a wide screen) and the bottom sheet (a phone) show: the total, this start, each model, the prices
+function SavedBody({r, setR, close, sheet}) {
   const reset = async () => {
     if (!await confirmDialog("Start over from $0?", "<p>Every model's count of tokens and what they would have cost goes back to zero. This cannot be undone.</p>", "Start over", true)) return;
     try { setR(await api("api/savings/reset", {method: "POST", body: {}})); toast("success", "Started over", "Maya counts from $0 again."); }
     catch (e) { toast("error", "Not reset", e.message, 6000); }
   };
-  const apis = r && r.prices ? [...new Set(r.prices.map((p) => p.api))] : [];
+  if (!r) return html`<p class="saved-pop__note">Counting…</p>`;
+  if (r.error) return html`<p class="saved-pop__note">${r.error}</p>`;
+  const apis = r.prices ? [...new Set(r.prices.map((p) => p.api))] : [];
   // (two configs of one model, e.g. two GPU layouts: each row says its config)
   const twin = (m) => r.models.filter((x) => x.model === m.model && x.quant === m.quant).length > 1;
-  const since = r && r.since ? new Date(r.since * 1000).toLocaleDateString([], {month: "short", day: "numeric"}) : null;
-  const style = pos ? `left:${pos.left}px;bottom:${pos.bottom}px` : "left:0;bottom:0;visibility:hidden";
+  const nb = (q) => q.replace(/-/g, "‑");          // (a quant is not broken at its hyphens)
+  const since = r.since ? new Date(r.since * 1000).toLocaleDateString([], {month: "short", day: "numeric"}) : null;
+  const prices = r.prices && r.prices.length ? html`
+    ${r.prices.map((p) => html`<div class="saved-pop__price"><span>${modelName(p.model)} (${p.custom ? "your prices" : p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}
+    <span>${r.prices.some((p) => p.peak) ? "DeepSeek charges twice that at its peak hours (weekdays 01–04 and 06–10 UTC), and Maya counts those tokens at that price. " : ""}The prompt Maya reads again from its own cache counts at the cached price. Electricity is not counted.</span>` : null;
+  const change = () => { close(); openSettings("savings"); };
+  return html`
+    <div class="saved-pop__head">${sheet ? null : html`<span>Saved, compared with the API</span>`}<b>${usd(r.usd)}</b>
+      <span>What ${apis.map((a) => `${a}'s`).join(" and ") || "the model's"} own API${apis.length > 1 ? "s" : ""} would have charged for the same tokens${since ? `, since ${since}` : ""}.</span></div>
+    ${r.start ? html`<div class="saved-pop__start"><span><b>This start</b><span>${modelName(r.start.model)}${r.start.quant ? ` ${r.start.quant}` : ""} · up ${upFor(r.start.started)}</span></span>
+      <b>${r.start.usd == null ? "–" : usd(r.start.usd)}</b></div>` : null}
+    ${r.models && r.models.length ? html`<div class="saved-pop__models"><span class="saved-pop__h">By model</span>
+      ${r.models.map((m) => html`<div class="saved-pop__model" key=${m.key}><${ModelLogo} model=${m.model} size=${sheet ? 36 : 28}/>
+        ${sheet   /* (a phone: the quant on a line of its own, the counts shorter) */
+          ? html`<span><b>${modelName(m.model)}</b>${m.quant ? html`<span>${nb(m.quant)}${twin(m) ? ` · ${m.key}` : ""}</span>` : null}
+              <span>${mtok(m.tokens.input + m.tokens.cached)} read${m.tokens.cached ? ` (${mtok(m.tokens.cached)} cached)` : ""} · ${mtok(m.tokens.output)} written</span></span>`
+          : html`<span><b>${modelName(m.model)}${m.quant ? ` · ${nb(m.quant)}` : ""}</b>
+              <span>${twin(m) ? `${m.key} · ` : ""}read ${mtok(m.tokens.input + m.tokens.cached)}${m.tokens.cached ? `, ${mtok(m.tokens.cached)} of it cached` : ""} · wrote ${mtok(m.tokens.output)}</span></span>`}
+        <b>${m.usd == null ? "no API price" : usd(m.usd)}</b></div>`)}</div>` : null}
+    ${!prices ? null : sheet
+      ? html`<details class="saved-pop__how"><summary>How it is counted<${Icon} name="chevron" sm cls="chev"/></summary>
+          <div class="saved-pop__prices"><span class="saved-pop__h">Per 1M tokens: input · cached input · output</span>${prices}</div></details>`
+      : html`<div class="saved-pop__prices"><span class="saved-pop__h">The prices, per 1M tokens: input · cached input · output</span>${prices}</div>`}
+    ${sheet
+      ? html`<div class="saved-sheet__acts"><button type="button" class="btn btn--secondary" onClick=${change}>Change the prices</button>
+          <button type="button" class="btn btn--danger" onClick=${reset}>Start over</button></div>`
+      : html`<div class="saved-pop__foot">
+          <button type="button" class="btn btn--ghost btn--sm" onClick=${change}>Change the prices</button>
+          <button type="button" class="btn btn--ghost btn--sm" onClick=${reset}>Start over from $0</button></div>`}`;
+}
+
+// a wide screen: a popover above the line, as tall as the room above it
+function SavedPop({anchor, close}) {
+  const ref = useRef(null);
+  const [r, setR] = useSavings();
+  const [pos, setPos] = useState(null);
+  useDismiss(true, close, ref, anchor);
+  useLayoutEffect(() => {
+    const place = () => {
+      if (!anchor.current || !ref.current) return;
+      const a = anchor.current.getBoundingClientRect(), w = ref.current.offsetWidth;
+      setPos({left: Math.max(8, Math.min(a.left, innerWidth - w - 8)), bottom: innerHeight - a.top + 6, max: a.top - 14});
+    };
+    place();
+    addEventListener("resize", place);
+    return () => removeEventListener("resize", place);
+  }, [!!r]);
+  const style = pos ? `left:${pos.left}px;bottom:${pos.bottom}px;max-height:${pos.max}px` : "left:0;bottom:0;visibility:hidden";
   return html`<div ref=${ref} class="saved-pop" role="dialog" aria-label="Saved, compared with the API" style=${style}>
-    ${!r ? html`<p class="saved-pop__note">Counting…</p>` : r.error ? html`<p class="saved-pop__note">${r.error}</p>` : html`
-      <div class="saved-pop__head"><span>Saved, compared with the API</span><b>${usd(r.usd)}</b>
-        <span>What ${apis.map((a) => `${a}'s`).join(" and ") || "the model's"} own API${apis.length > 1 ? "s" : ""} would have charged for the same tokens${since ? `, since ${since}` : ""}.</span></div>
-      ${r.start ? html`<div class="saved-pop__start"><span><b>This start</b><span>${modelName(r.start.model)}${r.start.quant ? ` ${r.start.quant}` : ""} · up ${upFor(r.start.started)}</span></span>
-        <b>${r.start.usd == null ? "–" : usd(r.start.usd)}</b></div>` : null}
-      ${r.models && r.models.length ? html`<div class="saved-pop__models"><span class="saved-pop__h">By model</span>
-        ${r.models.map((m) => html`<div class="saved-pop__model" key=${m.key}><${ModelLogo} model=${m.model} size=${28}/>
-          <span><b>${modelName(m.model)}${m.quant ? ` · ${m.quant.replace(/-/g, "‑")}` : ""}</b>
-            <span>${twin(m) ? `${m.key} · ` : ""}read ${mtok(m.tokens.input + m.tokens.cached)}${m.tokens.cached ? `, ${mtok(m.tokens.cached)} of it cached` : ""} · wrote ${mtok(m.tokens.output)}</span></span>
-          <b>${m.usd == null ? "no API price" : usd(m.usd)}</b></div>`)}</div>` : null}
-      ${r.prices && r.prices.length ? html`<div class="saved-pop__prices"><span class="saved-pop__h">The prices, per 1M tokens: input · cached input · output</span>
-        ${r.prices.map((p) => html`<div><span>${modelName(p.model)} (${p.custom ? "your prices" : p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}
-        <span>${r.prices.some((p) => p.peak) ? "DeepSeek charges twice that at its peak hours (weekdays 01–04 and 06–10 UTC), and Maya counts those tokens at that price. " : ""}The prompt Maya reads again from its own cache counts at the cached price. Electricity is not counted.</span></div>` : null}
-      <div class="saved-pop__foot">
-        <button type="button" class="btn btn--ghost btn--sm" onClick=${() => { close(); openSettings("savings"); }}>Change the prices</button>
-        <button type="button" class="btn btn--ghost btn--sm" onClick=${reset}>Start over from $0</button></div>`}
-  </div>`;
+    <${SavedBody} r=${r} setR=${setR} close=${close}/></div>`;
+}
+
+// a phone: a bottom sheet over the page (the drawer closes for it), a drag down or the scrim closes it
+export function SavedSheet() {
+  const [r, setR] = useSavings();
+  const ref = useRef(null), closeBtn = useRef(null), from = useRef(null);
+  const [drag, setDrag] = useState(0);
+  const close = () => { S.savedSheet = false; emit(); };
+  useEffect(() => {
+    setTimeout(() => closeBtn.current && closeBtn.current.focus(), 0);
+    const key = (e) => {
+      if (e.key === "Escape") { e.stopPropagation(); close(); }
+      else if (e.key === "Tab" && ref.current) trapTab(e, ref.current);
+    };
+    document.addEventListener("keydown", key, true);
+    return () => {
+      document.removeEventListener("keydown", key, true);
+      const b = document.querySelector('.chat-head--float button[aria-label="Chats"]');   // (back where it was opened from)
+      if (b) b.focus();
+    };
+  }, []);
+  const down = (e) => {
+    if (e.target.closest("button")) return;
+    from.current = e.clientY;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+  const move = (e) => { if (from.current != null) setDrag(Math.max(0, e.clientY - from.current)); };
+  const up = () => {
+    if (from.current == null) return;
+    from.current = null;
+    if (drag > 90) close(); else setDrag(0);
+  };
+  return html`<div class="sheet-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) close(); }}>
+    <div ref=${ref} class="sheet saved-sheet" role="dialog" aria-modal="true" aria-labelledby="saved-sheet-title"
+      style=${drag ? `transform:translateY(${drag}px);transition:none` : ""}>
+      <div class="saved-sheet__grab" onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up}>
+        <span class="sheet__grip" aria-hidden="true"></span>
+        <div class="saved-sheet__title"><h2 id="saved-sheet-title">Saved, compared with the API</h2>
+          <button type="button" ref=${closeBtn} class="icon-btn" aria-label="Close" onClick=${close}><${Icon} name="close"/></button></div>
+      </div>
+      <div class="saved-sheet__body"><${SavedBody} r=${r} setR=${setR} close=${close} sheet/></div>
+    </div></div>`;
 }
 
 function SavedLine() {
@@ -182,12 +250,17 @@ function SavedLine() {
   const [open, setOpen] = useState(false);
   const btn = useRef(null);
   if (!sv || !sv.priced) return null;
+  const phone = isPhone();
+  const toggle = () => {
+    if (phone) { S.drawer = false; S.savedSheet = true; emit(); return; }   // (a phone: the sheet, over the page)
+    setOpen(!open);
+  };
   return html`<div class="saved">
-    <button type="button" ref=${btn} class="saved__line" aria-haspopup="dialog" aria-expanded=${String(open)}
-      title="What the model's own API would have charged for the same tokens" onClick=${() => setOpen(!open)}>
+    <button type="button" ref=${btn} class="saved__line" aria-haspopup="dialog" aria-expanded=${String(phone ? !!S.savedSheet : open)}
+      title="What the model's own API would have charged for the same tokens" onClick=${toggle}>
       <span class="saved__icon"><${Icon} name="dollar"/></span><span class="saved__text">Saved <b>${usd(sv.usd)}</b></span>
       <span class="saved__vs">vs the API</span><${Icon} name="chevron-right" sm/></button>
-    ${open ? html`<${SavedPop} anchor=${btn} close=${() => setOpen(false)}/>` : null}
+    ${open && !phone ? html`<${SavedPop} anchor=${btn} close=${() => setOpen(false)}/>` : null}
   </div>`;
 }
 

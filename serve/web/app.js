@@ -8,7 +8,7 @@ import {loadHealth, loadMcp, loadUpdate, poll, whenHealth} from "./server.js";
 import {cancelEdit, chatView, focusInput, loadChats, newChat, newChatObj, openChat, resumePending, send, stopAnswer,
         updateCtxMeter} from "./chats.js";
 import {DialogHost, Toasts, trapTab} from "./ui.js";
-import {SearchDialog, Sidebar, openSettings, setSide, showView} from "./sidebar.js";
+import {SavedSheet, SearchDialog, Sidebar, openSettings, setSide, showView} from "./sidebar.js";
 import {ChatPage} from "./chat-view.js";
 import {SettingsDialog} from "./settings.js";
 import {MonitorPage} from "./monitor.js";
@@ -32,6 +32,7 @@ function App() {
     ${S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`}
     ${S.settings ? html`<${SettingsDialog}/>` : null}
     ${S.search ? html`<${SearchDialog}/>` : null}
+    ${S.savedSheet && phone ? html`<${SavedSheet}/>` : null}
     <${DialogHost}/>
     <${Toasts}/>
   </div>`;
@@ -57,7 +58,7 @@ document.addEventListener("keydown", (e) => {
 
 // a phone turned into a tablet (or a window resized past the breakpoint) gets the other layout
 let wasPhone = isPhone();
-addEventListener("resize", () => { if (isPhone() !== wasPhone) { wasPhone = isPhone(); S.drawer = false; emit(); } });
+addEventListener("resize", () => { if (isPhone() !== wasPhone) { wasPhone = isPhone(); S.drawer = false; S.savedSheet = false; emit(); } });
 
 // the address: #monitor, #models, #settings, #about
 function route() {
