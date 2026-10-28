@@ -729,8 +729,10 @@ in place from the model's files (`--mmap-experts`, auto when the copy does not f
 stay in RAM: it knows nothing of which experts are hot, reads a page at a time as the lane faults, and gives them up to
 any other I/O. `--ssd-cache` gives that RAM to a store of whole experts instead:
 
-- an expert is read whole into a slot of the store's own, past the page cache (Linux: `O_DIRECT`; on Windows through
-  the files' ordinary handles, so there the page cache still sees the reads - see `DS4_STORE_UNBUFFERED`);
+- an expert is read whole into a slot of the store's own, past the page cache (Linux: `O_DIRECT`; a file whose
+  unbuffered reads fail - some USB bridges refuse them - is read through the page cache from then on, and the log says
+  so; on Windows through the files' ordinary handles, so there the page cache still sees the reads - see
+  `DS4_STORE_UNBUFFERED`);
 - when it is full, `--ssd-policy` decides which expert gives way: `lru` the least recently asked for, `lfu` the least
   asked for lately (its count decays); never one a token is computing;
 - at load it is filled with the profile's hottest CPU-lane experts, then (`DS4_STORE_SPARE`) with the VRAM experts the

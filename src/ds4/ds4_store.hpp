@@ -24,6 +24,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -89,6 +90,7 @@ public:
     struct Counts {
         std::atomic<int64_t> hits{0}, misses{0}, no_slot{0}, guesses{0}, guess_used{0}, guess_wasted{0}, cancelled{0},
             evicted{0}, failed{0}, put{0}, bytes{0}, direct_bytes{0}, wait_ns{0}, shrunk{0};
+        std::atomic<int64_t> direct_off{0};   // files whose unbuffered reads failed where buffered ones worked
     };
     /// a window's experts of one layer from begin() to release(): st[i] kHit (in its slot, pinned - mat() reads it),
     /// kMiss (its read under way, the slot pinned), kNone (no slot to be had, or its read failed: read it in place)
@@ -156,6 +158,8 @@ public:
             return false;
         }
         chunk_slots_ = std::max<size_t>(1, cfg_.chunk_slots);
+        no_direct_.reset(new std::atomic<bool>[files_.buf.size() + 1]);
+        for (size_t i = 0; i <= files_.buf.size(); ++i) no_direct_[i].store(false, std::memory_order_relaxed);
         slots_.reset(new Slot[nmax_]);
         where_.resize(geo_.size());
         heat_.resize(geo_.size());
@@ -717,12 +721,17 @@ private:
         done_cv_.notify_all();
     }
     // one matrix into its region: unbuffered (the aligned span, the bytes landing at dst + the lead), else buffered
-    // straight to where they belong
+    // straight to where they belong.  A file whose unbuffered read fails where the buffered one then works (a file
+    // system or a USB bridge that opens with O_DIRECT but refuses its reads) is read buffered from then on
     bool read(const Job& j, std::vector<os::fd_t>& own, std::vector<char>& tried) {
         const size_t f = (size_t) j.file;
-        if (f < files_.direct.size() && files_.direct[f] != os::kBadFd && os::pread_direct(files_.direct[f], j.dst, j.len, j.off)) {
-            counts_.direct_bytes.fetch_add((int64_t) j.len, std::memory_order_relaxed);
-            return true;
+        bool direct_failed = false;
+        if (f < files_.direct.size() && files_.direct[f] != os::kBadFd && !no_direct_[f].load(std::memory_order_relaxed)) {
+            if (os::pread_direct(files_.direct[f], j.dst, j.len, j.off)) {
+                counts_.direct_bytes.fetch_add((int64_t) j.len, std::memory_order_relaxed);
+                return true;
+            }
+            direct_failed = true;
         }
         if (cfg_.unbuffered && f < files_.paths.size()) {
             if (own.size() <= f) {
@@ -738,8 +747,13 @@ private:
                 return true;
             }
         }
-        return f < files_.buf.size() && files_.buf[f] != os::kBadFd &&
-               os::pread_par(files_.buf[f], j.dst + j.off % kAlign, j.len, j.off);
+        const bool ok = f < files_.buf.size() && files_.buf[f] != os::kBadFd &&
+                        os::pread_par(files_.buf[f], j.dst + j.off % kAlign, j.len, j.off);
+        if (ok && direct_failed && !no_direct_[f].exchange(true)) {
+            counts_.direct_off.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr, "ds4: RAM store: unbuffered reads of file %zu fail - it is read through the page cache\n", f);
+        }
+        return ok;
     }
     void reader() {
         std::vector<os::fd_t> own;   // (unbuffered: this reader's own handles, opened as first needed)
@@ -785,6 +799,7 @@ private:
     std::mutex done_mu_;
     std::condition_variable done_cv_;
     uint64_t done_ = 0;
+    std::unique_ptr<std::atomic<bool>[]> no_direct_;   // [file]: unbuffered reads fail there
     std::vector<std::thread> th_;
     std::mutex w_mu_;   // (watch_every's thread)
     std::condition_variable w_cv_;

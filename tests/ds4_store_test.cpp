@@ -8,6 +8,10 @@
 // Build: g++ -std=c++17 -O2 -pthread -I src/ds4 tests/ds4_store_test.cpp
 #include "ds4_store.hpp"
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -226,6 +230,36 @@ void test_reads(const Model& m, bool direct) {
     if (!direct) EXPECT(st.counts().direct_bytes.load() == 0);
     std::fprintf(stderr, "  reads (%s): %lld bytes, %lld of them unbuffered\n", direct ? "direct handles" : "buffered only",
                  (long long) st.counts().bytes.load(), (long long) st.counts().direct_bytes.load());
+}
+
+// unbuffered handles that open but whose reads fail (a write-only descriptor stands in for a file system or a USB
+// bridge that refuses O_DIRECT reads): each file read buffered from its first failure on, the bytes right
+void test_direct_refused(const Model& m) {
+#if !defined(_WIN32)
+    Model bad;
+    bad.geo = m.geo;
+    bad.plain = m.plain;
+    bad.plain.direct.clear();
+    for (const std::string& p : m.paths) bad.plain.direct.push_back(os::fd_t(::open(p.c_str(), O_WRONLY)));
+    Mk k;
+    k.direct = false;   // (bad.plain: the refusing handles as the direct ones)
+    ExpertStore st;
+    EXPECT(make_store(bad, k, st));
+    std::vector<int> all;
+    for (int e = 0; e < kExp; ++e) all.push_back(e);
+    for (int l = 0; l < 3; ++l) {
+        const std::vector<uint8_t> a = ask(st, m, l, all);
+        EXPECT(std::count(a.begin(), a.end(), ExpertStore::kMiss) == kExp);
+    }
+    EXPECT(st.counts().failed.load() == 0);
+    EXPECT(st.counts().direct_bytes.load() == 0);
+    EXPECT(st.counts().direct_off.load() == 2);   // (once a file)
+    for (os::fd_t f : bad.plain.direct) os::close_fd(f);
+    bad.paths.clear();   // (m's files: m removes them)
+    bad.files = ExpertStore::Files{};
+#else
+    (void) m;
+#endif
 }
 
 void test_lru(const Model& m) {
@@ -531,6 +565,7 @@ int main(int argc, char** argv) {
     test_auto_size();
     test_reads(m, true);
     test_reads(m, false);
+    test_direct_refused(m);
     test_lru(m);
     test_lfu(m);
     test_pinned(m);
