@@ -681,8 +681,8 @@ void x512_rows(const uint8_t* w, size_t rb, int n, const void* const* act, int n
 
 // the calls of `type` these rows take: from how many tokens (0: none).  DS4_IQ512=1: every call of IQ2_XS, IQ3_XXS and
 // IQ1_M wherever the CPU runs them; =0: none.  Unset, by the CPU (the rows give ggml-cpu's bits everywhere, so the choice
-// only changes the speed): IQ2_XS from one token and IQ1_M from one token, but from two on AMD Zen 4 (family 19h: one
-// token there within the noise of ggml-cpu's dot; the same scheme timed faster than ggml-cpu's dot on Zen 4 and Zen 5).
+// only changes the speed): IQ2_XS from one token and IQ1_M from one token, but from two on AMD Zen 4 (family 19h: a
+// cautious start there - not measured on an AMD CPU).
 // A Xeon Gold 6152 (Skylake-SP), one thread, GB/s of weights against the rows the lane took before (ds4_iq512_rows_test
 // --bench): IQ2_XS 1 / 2 / 4 tokens 2.32 / 2.05 / 1.37 -> 3.62 / 3.02 / 2.09, IQ1_M 1.12 / 0.95 / 0.64 -> 2.05 / 1.63 /
 // 1.08.  IQ3_XXS keeps the rows above: the VBMI ones where the CPU has VBMI, and on that Xeon the AVX2 ones were faster
