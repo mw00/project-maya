@@ -2381,9 +2381,65 @@ void test_hc_mix_split(cudaStream_t s) {
                 }
 }
 
+// A GGUF head's passes (maya-ds4 head_share: DS4_HEAD_COLS activations a pass, 8 by default, 4 before): 16 rows and 5
+// (a drafter's block) of logits by 8 a pass the same bits as by 4 and by 1 - a Q8_0, a BF16 and a Q6_K head (a share of
+// the vocabulary's rows, the model's width)
+void test_head_cols(cudaStream_t s) {
+    const int k = 5120, n = 2048, rmax = 16;
+    std::vector<float> x((size_t) rmax * k);
+    for (auto& v : x) v = frand();
+    float* dx = dev(x);
+    for (int f = 0; f < 3; ++f) {
+        x3::Mat m;
+        m.fmt = f == 0 ? gg::kFmtQ8_0 : f == 1 ? gg::kFmtBF16 : gg::kFmtGG;
+        m.gg_type = f == 2 ? gg::iq::kQ6_K : 0;
+        m.k = k;
+        m.n = n;
+        void* dw = nullptr;
+        if (f == 1) {
+            std::vector<uint16_t> w((size_t) n * k);
+            for (auto& v : w) v = f2bf(frand(0.02f));
+            dw = dev(w);
+        } else
+            dw = dev(f == 0 ? q8_rand(n, k) : q_rand(gg::iq::kQ6_K, n, k));
+        m.raw = dw;
+        float* dy = dev(std::vector<float>((size_t) rmax * n));
+        for (int rows : {16, 5}) {
+            std::vector<float> ref;
+            bool same = true;
+            for (int per : {1, 4, 8}) {
+                CU(cudaMemsetAsync(dy, 0xA5, (size_t) rmax * n * 4, s));
+                for (int c = 0; c < rows; c += per) {
+                    x3::MvJob j;
+                    j.m = &m;
+                    j.xf = dx + (size_t) c * k;
+                    j.xf_cs = (size_t) k;
+                    j.ncol = std::min(per, rows - c);
+                    j.y = dy + (size_t) c * n;
+                    j.y_cs = (size_t) n;
+                    j.alpha = 1.0f;
+                    if (!gg::mv(&j, 1, s)) ++g_fail;
+                }
+                CU(cudaStreamSynchronize(s));
+                const std::vector<float> y = host(dy, (size_t) rows * n);
+                if (ref.empty()) ref = y;
+                else same = same && std::memcmp(y.data(), ref.data(), y.size() * 4) == 0;
+            }
+            if (!same) ++g_fail;
+            char what[96];
+            std::snprintf(what, sizeof what, "head %s, %d rows: 8 a pass = 4 = 1",
+                          f == 0 ? "Q8_0" : f == 1 ? "BF16" : "Q6_K", rows);
+            std::printf("%-52s %s\n", what, same ? "ok" : "FAIL");
+        }
+        cudaFree(dw), cudaFree(dy);
+    }
+    cudaFree(dx);
+}
+
 void test_decode_trims(cudaStream_t s) {
     test_q8_share(s);
     test_hc_mix_split(s);
+    test_head_cols(s);
 }
 
 // ---------------------------------------------------------------- a group of two's chunk all-reduce (ds4_kernels.cu)

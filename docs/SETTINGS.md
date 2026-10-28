@@ -771,6 +771,14 @@ so there the default keeps the two launches (`2` fuses them there too; not measu
 | --- | --- | --- |
 | `MAYA_DS4_HC_MIX_SPLIT` | `1` | `1`: the HC mix and split in one launch where they run on the layer's own stream (AMD, `DS4_HC_STREAM=0`); `2`: on NVIDIA's side stream too; `0`: two launches everywhere, as before (the same bits every way) |
 
+A GGUF pack's output head now takes 8 rows a pass instead of 4. Each pass reads the whole head (129280 rows, or a
+GPU's share of them), so up to 8 rows (the drafter's block, a short verify window) read it once instead of twice, and
+16 rows twice instead of four times. Each row's logits are the same bits at any count.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HEAD_COLS` | 8 | a GGUF head's rows a pass, `1` .. `16` (it was 4; the same logits at any count) |
+
 `MAYA_DS4_DECODE_TRIM=<bits>` takes four more small steps out of a decoded window, each checked at load the same way:
 `1` the shared expert's swiglu rounds its output to int8 for its down GEMV, `2` q's norm rounds its output for wq_b,
 `4` a verify window's compressor snapshot (four copies) and a ratio-1 layer's latent copy one kernel each, `8` the

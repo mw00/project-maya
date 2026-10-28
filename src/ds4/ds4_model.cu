@@ -1469,6 +1469,8 @@ struct Model::Impl {
     // not measured yet; 0: the two launches everywhere, as before.  DS4_HC_FUSE's split (with the pre norm) keeps its
     // own launch
     int hc_ms = 1;
+    // DS4_HEAD_COLS=<1..16>: a GGUF head's activations a pass (head_share; 8 by default, 4 before)
+    int head_cols_gguf = 8;
     bool hc_mix_split_on(bool side, int T) const {
         return (hc_ms == 2 || (hc_ms == 1 && !side)) && T <= kWin && (2 + g.hc) * g.hc <= 32;
     }
@@ -3029,6 +3031,17 @@ struct Model::Impl {
             if (hc_ms != 1)
                 std::fprintf(stderr, "ds4: a window's HC mix and split %s (DS4_HC_MIX_SPLIT=%d)\n",
                              hc_ms == 2 ? "in one launch on the side stream too" : "in two launches", hc_ms);
+        }
+        if (const char* v = ds4_env("DS4_HEAD_COLS")) {   // (MAYA_DS4_HEAD_COLS)
+            char* end = nullptr;
+            const long c = std::strtol(v, &end, 10);
+            if (*v == 0 || end == nullptr || *end != 0 || c < 1 || c > x3::kMaxMvCols) {
+                err = std::string("DS4_HEAD_COLS=") + v + ": 1 .. " + std::to_string(x3::kMaxMvCols);
+                return false;
+            }
+            head_cols_gguf = (int) c;
+            if (pk.gguf)
+                std::fprintf(stderr, "ds4: the head's GEMV %d activations a pass (DS4_HEAD_COLS)\n", head_cols_gguf);
         }
         if (const char* v = ds4_env("DS4_DECODE_TRIM")) {   // (MAYA_DS4_DECODE_TRIM)
             char* end = nullptr;
@@ -16878,8 +16891,10 @@ struct Model::Impl {
         const size_t ld = mi == 0 ? (size_t) V : (size_t) vn;
         cudaSetDevice(d.id);
         // (an EXL3 head: as many activations at a time as its split-K partials fit the scratch - 8 for a shared head, 4
-        // for a whole one, each pass reading the whole share; a GGUF's: 4 at a time, as before)
-        const int per = d.head.fmt != 0 ? 4 : std::max(1, x3::mv_cols(d.head));
+        // for a whole one, each pass reading the whole share; a GGUF's: head_cols_gguf, 8 - each pass reads its whole
+        // share of the vocabulary's rows, so up to 8 rows (the drafter's block) take one pass instead of two and 16
+        // two instead of four; a column's logits are the same at any count: gguf mv sums each activation on its own)
+        const int per = d.head.fmt != 0 ? head_cols_gguf : std::max(1, x3::mv_cols(d.head));
         for (int c = 0; c < rows; c += per)
             if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, rows - c), D, ld)}, err))
                 return false;
