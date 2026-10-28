@@ -1214,6 +1214,20 @@ struct Model::Impl {
     static constexpr int kPenCap = 4096;
     int32_t* h_pen = nullptr;
     int32_t* d_pen = nullptr;
+    // the request's log-probabilities (Model::set_logprobs, GEN logprobs=<k>): each pick also leaves its tokens' rows
+    // in lp_rows (logprob_rows over the rows they came from, after the pick).  lp_k -1: none - no launch, no copy, no
+    // wait.  lp_force: the pick's last token is that one instead (the thinking budget's end).  The buffers (kWin rows)
+    // are allocated with the first request that asks
+    int lp_k = -1, lp_force = -1;
+    std::vector<LogprobRow> lp_rows;
+    // (tests) DS4_LOGPROBS_CHECK=1: each pick's rows also computed on the host from its logit rows (logprob_row_host),
+    // a line for each that differs and a count every 256 rows checked - the kernel checked on the cards it runs on
+    bool lp_check = ds4_env("DS4_LOGPROBS_CHECK") != nullptr && std::atoi(ds4_env("DS4_LOGPROBS_CHECK")) != 0;
+    long long lp_checked = 0, lp_differ = 0;
+    LogprobRow* h_lp = nullptr;
+    LogprobRow* d_lp = nullptr;
+    int32_t* h_lp_ids = nullptr;
+    int32_t* d_lp_ids = nullptr;
     // (tests) DS4_DSPARK_SAMPLE=1: a sampled request's drafts drawn from the drafter's distribution through the
     // request's chain, as DeepSeek's reference does (else its argmax: the same acceptance on Uranus, 31-32% of 5
     // drafts a round either way); DS4_DSPARK_QTEMP=f: those draws at f x the request's temperature (any q keeps the
@@ -14788,6 +14802,64 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4 sample: %s\n", cudaGetErrorString(e));
         return -1;
     }
+    // a pick's log-probabilities (lp_k >= 0 only; set_logprobs): its T tokens `ids` (lp_force in place of the last),
+    // `rows` the T logit rows they came from on the head device, the penalty windows as the pick's (pen_rows from end0,
+    // hist as there) -> lp_rows.  Called after the pick's own wait: its penalty rows and its token copy are done
+    void lp_pick(const float* rows, int T, const int* ids, int64_t end0, const std::vector<int32_t>* hist = nullptr) {
+        if (lp_k < 0) return;
+        lp_rows.clear();
+        if (T < 1 || T > kWin) return;
+        Dev& d = devs[(size_t) head_dev];
+        cudaSetDevice(d.id);
+        if (d_lp_ids == nullptr) {   // (allocated in this order: d_lp_ids last)
+            std::string e;
+            if (!((h_lp != nullptr || halloc(h_lp, kWin, e)) && (h_lp_ids != nullptr || halloc(h_lp_ids, kWin, e)) &&
+                  (d_lp != nullptr || dalloc(d, d_lp, kWin, e)) && dalloc(d, d_lp_ids, kWin, e))) {
+                std::fprintf(stderr, "ds4: the logprobs' rows: %s - this request's tokens without them\n", e.c_str());
+                lp_k = -1;
+                return;
+            }
+        }
+        for (int i = 0; i < T; ++i) h_lp_ids[i] = ids[i];
+        if (lp_force >= 0) h_lp_ids[T - 1] = lp_force;
+        cudaMemcpyAsync(d_lp_ids, h_lp_ids, (size_t) T * sizeof(int32_t), cudaMemcpyHostToDevice, d.st);
+        strata::kernels::SamplerParams sp;
+        int h = 0;
+        const int* hr = pen_rows(end0, T, sp, h, hist);
+        logprob_rows(rows, g.vocab, T, hr, h, sp.penalty_repeat, sp.penalty_freq, sp.penalty_present, d_lp_ids, lp_k,
+                     d_lp, d.st);
+        cudaMemcpyAsync(h_lp, d_lp, (size_t) T * sizeof(LogprobRow), cudaMemcpyDeviceToHost, d.st);
+        const cudaError_t e = cudaStreamSynchronize(d.st);
+        if (e != cudaSuccess) {
+            std::fprintf(stderr, "ds4: the logprobs' rows: %s\n", cudaGetErrorString(e));
+            return;
+        }
+        lp_rows.assign(h_lp, h_lp + T);
+        if (lp_check) lp_check_rows(rows, T, hr != nullptr ? h_pen : nullptr, h, sp);
+    }
+    // DS4_LOGPROBS_CHECK: lp_rows against the host's reference over the same rows and penalty windows (h_pen: the rows
+    // pen_rows staged).  A top id may differ where its value agrees with the reference's to 1e-4 (a near tie)
+    void lp_check_rows(const float* rows, int T, const int32_t* pen, int h, const strata::kernels::SamplerParams& sp) {
+        std::vector<float> host((size_t) T * g.vocab);
+        if (cudaMemcpy(host.data(), rows, host.size() * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+        for (int t = 0; t < T; ++t) {
+            const LogprobRow& got = lp_rows[(size_t) t];
+            LogprobRow ref;
+            logprob_row_host(host.data() + (size_t) t * g.vocab, g.vocab, pen != nullptr ? pen + (size_t) t * h : nullptr,
+                             pen != nullptr ? h : 0, sp.penalty_repeat, sp.penalty_freq, sp.penalty_present, got.id, lp_k,
+                             ref);
+            const auto off = [](float a, float b) { return !(std::fabs(a - b) <= 1e-4f * (1.0f + std::fabs(b))) && a != b; };
+            bool bad = got.n != ref.n || off(got.lp, ref.lp);
+            for (int j = 0; !bad && j < ref.n; ++j) bad = off(got.top_lp[j], ref.top_lp[j]);
+            if (bad) {
+                ++lp_differ;
+                std::fprintf(stderr, "ds4: logprobs check: row %d of %d differs: device %s / host %s\n", t, T,
+                             lp_line(-1, got).c_str(), lp_line(-1, ref).c_str());
+            }
+            if (++lp_checked % 256 == 0)
+                std::fprintf(stderr, "ds4: logprobs check: %lld rows, %lld differ\n", lp_checked, lp_differ);
+        }
+    }
 
     // `hist_end`: the pick's penalty history ends there (toks[0 .. hist_end): the tokens up to its row's position)
     int sample_row(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
@@ -14878,6 +14950,11 @@ struct Model::Impl {
             next = m < n ? h_idx[m]
                          : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr,
                                       p0 + 1 + n);
+        }
+        if (lp_k >= 0) {   // (each kept token's row - the drafts', then next's - before the window is undone)
+            for (int i = 0; i < m; ++i) tk[i] = drafts[(size_t) i];
+            tk[m] = next;
+            lp_pick(hd.logits, m + 1, tk, p0 + 1);
         }
         drafts_q = false;
         rollback(p0, T, m + 1);
@@ -18397,9 +18474,11 @@ struct Model::Impl {
         sp.counter = counter;
         int h = 0;
         const int* hr = pen_rows((int64_t) toks.size(), 1, sp, h);   // (the last fed token's row: every token consumed)
-        strata::kernels::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, hr, h,
-                                       sp, d.tok, d.st);
-        return tok_back(d);
+        const float* row = d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab;
+        strata::kernels::sample_tokens(row, 1, g.vocab, hr, h, sp, d.tok, d.st);
+        const int t = tok_back(d);
+        if (t >= 0) lp_pick(row, 1, &t, (int64_t) toks.size());
+        return t;
     }
 
     // ---- --parallel: one token of each of T conversations through the model together (Model::step_multi).  The rows
@@ -18631,6 +18710,12 @@ struct Model::Impl {
                 CK(cudaStreamSynchronize(hd.st));
             }
         }
+        if (lp_k >= 0) {   // (each kept token's row - the drafts', then next's - before the run is undone)
+            int tk[kWin];
+            for (int k = 0; k < m; ++k) tk[k] = drafts[(size_t) k];
+            tk[m] = next;
+            lp_pick(lg, m + 1, tk, r.p0 + 1, &q.toks);
+        }
         rollback_run(i, m + 1);
         bool ok = true;
         if (g.n_mtp > 0) {
@@ -18719,7 +18804,9 @@ struct Model::Impl {
         int h = 0;
         const int* hr = pen_rows((int64_t) hist.size(), 1, sp, h, &hist);
         strata::kernels::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, hr, h, sp, d.tok, d.st);
-        return tok_back(d);
+        const int t = tok_back(d);
+        if (t >= 0) lp_pick(d.logits + (size_t) row * g.vocab, 1, &t, (int64_t) hist.size(), &hist);
+        return t;
     }
 
     bool logits(std::vector<float>& out) {
@@ -18956,6 +19043,12 @@ void Model::set_penalties(int last_n, float repeat, float freq, float present) {
     p_->pen_freq = freq;
     p_->pen_present = present;
 }
+void Model::set_logprobs(int k, int force) {
+    p_->lp_k = k < 0 ? -1 : std::min(k, kTopLogprobs);
+    p_->lp_force = k < 0 ? -1 : force;
+    if (k < 0) p_->lp_rows.clear();
+}
+const std::vector<LogprobRow>& Model::logprobs() const { return p_->lp_rows; }
 bool Model::logits(std::vector<float>& out) { return p_->logits(out); }
 int Model::image_token() const { return p_->img_tok; }
 int Model::dim() const { return p_->g.dim; }

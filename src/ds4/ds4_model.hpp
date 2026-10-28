@@ -12,6 +12,8 @@
 // compressed KV and index keys included, which a checkpoint leaves in place - through a file or a host buffer.
 #pragma once
 
+#include "ds4_logprobs.hpp"
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -154,6 +156,14 @@ public:
     /// verify() alike: over the last `last_n` tokens the state has consumed (at most 4096; a verify window's row counts
     /// the drafts before it).  last_n 0 (or every penalty neutral): none, the picks exactly as without.
     void set_penalties(int last_n, float repeat, float freq, float present);
+    /// The request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp) for every pick after this - sample(),
+    /// sample_multi(), verify() and verify_multi() alike: logprobs() then holds a row for each token the pick returned
+    /// (verify: the accepted drafts, then the token after them), each its token's logprob and its row's top k, from the
+    /// row that token came from, after the request's penalties, at temperature 1.  k < 0: none - the picks exactly as
+    /// without, no device work.  force >= 0: the caller writes that token in place of the pick's last one (the thinking
+    /// budget's end), and that row reports it.
+    void set_logprobs(int k, int force = -1);
+    const std::vector<LogprobRow>& logprobs() const;
     /// The last feed's logit rows on the host (rows x vocab floats).
     bool logits(std::vector<float>& out);
 

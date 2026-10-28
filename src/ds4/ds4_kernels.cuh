@@ -12,6 +12,7 @@
 #include <cuda_runtime.h>
 
 #include "strata/kernels/sampler.hpp"
+#include "ds4_logprobs.hpp"
 
 #include <vector>
 
@@ -398,6 +399,11 @@ void markov_share_q8(float* logits, const uint8_t* Hq, const uint16_t* erow, int
 /// The DSpark confidence: out[t] = sigmoid(w . [x[t] | E[tok[t]]]) (x rows dim floats, w F32 [dim + R]).
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s);
+/// A request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp): T logit rows (V each) -> out[t], the row's
+/// logprob of the token ids[t] and its top k (0 .. kTopLogprobs), over the logits after the penalties (hist: the rows
+/// of sample_tokens' penalty windows, h ids each, or nullptr), at temperature 1.  One block a row; only when asked.
+void logprob_rows(const float* logits, int V, int T, const int* hist, int h, float repeat, float freq, float present,
+                  const int* ids, int k, LogprobRow* out, cudaStream_t s);
 
 /// The pipeline's hand-offs and tensor parallelism, through host-mapped memory (these cards copy peer to peer only
 /// through the driver's staging).  xfer_put copies up to 4 segments (any size and alignment: each in 16-byte units

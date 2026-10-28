@@ -18,8 +18,11 @@
 // the same places.  `marks=<pos>,...` and `shared=<pos>` on a GEN ask for restore points besides the end of the last
 // prompt (the server's MAYA_DS4_RESTORE_POINTS: the start of the last user message, a point near the prompt's tail,
 // the end of the system prompt and tools): the read stops at each to keep the state there, and a later prompt that
-// leaves this one past one of them goes back to it (ds4_marks.hpp).
+// leaves this one past one of them goes back to it (ds4_marks.hpp).  `logprobs=<k>` (0 .. 20) asks for an
+// `LP <id> <logprob> <id>:<logprob> ...` line after each T line: the token's log-probability and its row's k most likely
+// (ds4_logprobs.hpp; INFO logprobs=20 says the engine has them).
 #include "ds4_interleave.hpp"
+#include "ds4_logprobs.hpp"
 #include "ds4_marks.hpp"
 #include "ds4_gguf.cuh"       // (--pack-info: the types the kernels take, asked of them)
 #include "ds4_iq.cuh"
@@ -501,6 +504,9 @@ struct Req {
     // prompt that leaves this one past one of them goes back there (ds4_marks.hpp); none: as before
     std::vector<int64_t> marks;
     long long shared = -1;
+    // logprobs=<k> (0 .. 20; the server's OpenAI logprobs / top_logprobs): after each T line an LP line - the token's
+    // logprob and its row's k most likely (ds4_logprobs.hpp); -1: none, the request exactly as without
+    int logprobs = -1;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -625,8 +631,25 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
             for (int x : parse_ids(v))
                 if (x > 0) r.marks.push_back(x);
         } else if (k == "shared") r.shared = std::atoll(v.c_str());
+        else if (k == "logprobs") {
+            const int n = std::atoi(v.c_str());
+            r.logprobs = n < 0 ? -1 : std::min(n, strata::ds4::kTopLogprobs);
+        }
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
+}
+
+// logprobs=<k>: a pick's rows for its n tokens, the last first (as the serve loop keeps a round's tokens); a row the
+// pick did not leave is empty (id -1), and its token gets no LP line
+std::vector<strata::ds4::LogprobRow> lp_take(const strata::ds4::Model& m, size_t n) {
+    std::vector<strata::ds4::LogprobRow> v = m.logprobs();
+    v.resize(n);
+    std::reverse(v.begin(), v.end());
+    return v;
+}
+// ... and a token's LP line after its T line (rid >= 0: --parallel's tag)
+void lp_out(long long rid, int tok, const strata::ds4::LogprobRow& row) {
+    if (row.id == tok) std::printf("%s\n", strata::ds4::lp_line(rid, row).c_str());
 }
 
 // the serve watchdog (#539, #494): a request whose heartbeat - its prompt's progress, its tokens, the steps between -
@@ -664,6 +687,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
           Lookup* lk, DraftCost* dc) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -1544,8 +1568,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
                         std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+        m.set_logprobs(r.logprobs);   // (logprobs=<k>: each token's row, kept as its token is: tok_lp, got_lp)
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
+        strata::ds4::LogprobRow tok_lp;
+        std::vector<strata::ds4::LogprobRow> got_lp;
+        if (r.logprobs >= 0) tok_lp = lp_take(m, 1).back();
         if (lk) lk->start(m.tokens());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
@@ -1570,6 +1598,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             std::printf("T %d\n", tok);
+            if (r.logprobs >= 0) lp_out(-1, tok, tok_lp);
             beat();
             ++produced;
             if (lk) lk->sfx.append(tok);
@@ -1592,6 +1621,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 // a round whose drafts were all below the confidence floor: the next one does without the drafter
                 // (a request's spec / dspark_conf keys over the engine's: the speed calibration measures both ways)
                 const bool try_spec = (r.spec < 0 ? spec : r.spec != 0) && !cool;
+                m.set_logprobs(r.logprobs, close_think ? r.think_end : -1);
                 if (!round(m, tok, room, try_spec, r.conf >= 0 ? r.conf : conf_min, r.temperature, r.top_p, r.top_k,
                            r.min_p, r.seed, counter, got,
                            off, acc, err, r.cum, r.lookup == 0 ? nullptr : lk, dc)) {
@@ -1604,11 +1634,17 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 cool = try_spec && off == 0;
                 if (close_think && !got.empty()) got.back() = r.think_end;   // (room 1: one token, not fed yet)
                 std::reverse(got.begin(), got.end());
+                if (r.logprobs >= 0) got_lp = lp_take(m, got.size());
                 dump_rows();
             }
             tok = got.back();
             got.pop_back();
+            if (!got_lp.empty()) {
+                tok_lp = got_lp.back();
+                got_lp.pop_back();
+            }
         }
+        m.set_logprobs(-1);
         if (dump_f != nullptr) std::fflush(dump_f);
         // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
         //  the checkpoint at this prompt's end)
@@ -1678,6 +1714,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             unsigned long long counter = 0;   // (its own: its picks the same alone or beside others)
             int tok = -1;                     // written next, not fed yet
             std::vector<int> got;             // a round's tokens still to write, the last first
+            strata::ds4::LogprobRow tok_lp;   // (logprobs=<k>: tok's row, and got's rows as got)
+            std::vector<strata::ds4::LogprobRow> got_lp;
         };
         const int nseq = m.seq_count();
         std::vector<long long> seq_rid((size_t) nseq, -1);   // the request in each conversation (-1: idle)
@@ -1710,6 +1748,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         };
         // a request's next token: the thinking budget closes its reasoning (as one conversation's round at the budget)
         const auto close_think = [](const Act& a) { return a.in_think && a.produced >= a.r.think_budget; };
+        // the next of a round's tokens to write (and its row: logprobs=<k>)
+        const auto next_tok = [](Act& a) {
+            a.tok = a.got.back();
+            a.got.pop_back();
+            if (!a.got_lp.empty()) {
+                a.tok_lp = a.got_lp.back();
+                a.got_lp.pop_back();
+            }
+        };
         const auto finish_act = [&](Act& a) {
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();   // (the engine's over the request's decode, the others' too)
@@ -1800,6 +1847,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         break;
                     }
                     std::printf("T %lld %d\n", a.r.rid, a.tok);
+                    if (a.r.logprobs >= 0) lp_out(a.r.rid, a.tok, a.tok_lp);
                     beat();
                     ++a.produced;
                     ++busy_n;
@@ -1817,8 +1865,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         break;
                     }
                     if (!a.got.empty()) {
-                        a.tok = a.got.back();
-                        a.got.pop_back();
+                        next_tok(a);
                         if (several) continue;
                         break;
                     }
@@ -1848,6 +1895,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     lk_owner = a.r.rid;
                 }
                 penalties(a.r);
+                m.set_logprobs(a.r.logprobs, closing ? a.r.think_end : -1);
                 int off = 0, acc = 0;
                 const bool try_spec = (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool;
                 if (!round(m, a.tok, room, try_spec, a.r.conf >= 0 ? a.r.conf : conf_min, a.r.temperature, a.r.top_p,
@@ -1861,8 +1909,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     a.cool = try_spec && off == 0;
                     if (closing && !a.got.empty()) a.got.back() = a.r.think_end;
                     std::reverse(a.got.begin(), a.got.end());
-                    a.tok = a.got.back();
-                    a.got.pop_back();
+                    if (a.r.logprobs >= 0) a.got_lp = lp_take(m, a.got.size());
+                    next_tok(a);
                 }
             } else if (need.size() > 1) {   // several: a round of each through the model together
                 // each one's drafts (DSpark, a conversation at a time: its own drafter rings) while their confidence
@@ -1992,9 +2040,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         for (int i = 0; i < nn; ++i) {
                             Act& a = *need[(size_t) i];
                             penalties(a.r);
+                            m.set_logprobs(a.r.logprobs, closing[(size_t) i] ? a.r.think_end : -1);
                             a.tok = m.sample_multi(i, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
                                                    a.counter++);
                             if (closing[(size_t) i]) a.tok = a.r.think_end;
+                            if (a.r.logprobs >= 0) a.tok_lp = lp_take(m, 1).back();
                             a.cool = tried[(size_t) i] != 0;   // (its drafter tried and kept none: rests a round)
                         }
                         stepped = true;
@@ -2016,6 +2066,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             Act& a = *need[(size_t) i];
                             const std::vector<int>& d = drafts[(size_t) i];
                             penalties(a.r);
+                            m.set_logprobs(a.r.logprobs, closing[(size_t) i] ? a.r.think_end : -1);
                             int acc = 0, next = -1;
                             if (!m.verify_multi(i, d, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
                                                 a.counter, acc, next, err)) {
@@ -2032,8 +2083,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             a.got.push_back(next);
                             if (closing[(size_t) i]) a.got.back() = a.r.think_end;
                             std::reverse(a.got.begin(), a.got.end());
-                            a.tok = a.got.back();
-                            a.got.pop_back();
+                            if (a.r.logprobs >= 0) a.got_lp = lp_take(m, a.got.size());
+                            next_tok(a);
                         }
                 }
                 if (sp != nullptr && stepped) {   // (DS4_DRAFT_COST: the step's time by its rows in all)
@@ -2159,7 +2210,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             a->limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
             a->in_think = r.think_budget > 0 && r.think_end >= 0;
             penalties(r);
+            m.set_logprobs(r.logprobs);
             a->tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, a->counter++);
+            if (r.logprobs >= 0) a->tok_lp = lp_take(m, 1).back();
             if (acts.empty()) {
                 busy_t1 = now_ms();
                 busy_n = 0;

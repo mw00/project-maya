@@ -3419,6 +3419,83 @@ __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, cons
     acc[(size_t) t * dim + e] = a;
 }
 
+// logprob_rows: one block a row.  A value is the row's logit after the penalties (the window's ids marked in a shared
+// bitmap, as the sampler marks them; only a marked id counts its window).  Each thread keeps its stride's running
+// log-sum-exp and its k best in order (LpStride, ds4_logprobs.hpp); the block merges the sums, then takes the k best of
+// the threads' lists a round at a time (each round's winner is the head of its own thread's list, which moves on)
+constexpr int kLpThreads = 256;
+
+__global__ void __launch_bounds__(kLpThreads) logprob_rows_kernel(const float* __restrict__ logits, int V,
+                                                                  const int* __restrict__ hist, int h, float repeat,
+                                                                  float freq, float present, const int* __restrict__ ids,
+                                                                  int k, LogprobRow* __restrict__ out) {
+    extern __shared__ unsigned lp_bits[];
+    __shared__ float sm[32], ss[32];
+    __shared__ int si[32];
+    __shared__ float lse_sh, wv_sh;
+    __shared__ int wi_sh;
+    const int t = blockIdx.x, tid = threadIdx.x, nt = blockDim.x, lane = tid & 31, w = tid >> 5, nw = nt >> 5;
+    const float* l = logits + (size_t) t * V;
+    const int* hr = hist != nullptr && h > 0 ? hist + (size_t) t * h : nullptr;
+    if (hr != nullptr) {
+        for (int i = tid; i < (V + 31) >> 5; i += nt) lp_bits[i] = 0u;
+        __syncthreads();
+        for (int i = tid; i < h; i += nt)
+            if (hr[i] >= 0 && hr[i] < V) atomicOr(&lp_bits[hr[i] >> 5], 1u << (hr[i] & 31));
+        __syncthreads();
+    }
+    const auto val = [&](int v) {
+        float x = l[v];
+        if (hr != nullptr && ((lp_bits[v >> 5] >> (v & 31)) & 1u)) {
+            int c = 0;
+            for (int i = 0; i < h; ++i) c += hr[i] == v;
+            x = lp_penalized(x, c, repeat, freq, present);
+        }
+        return x;
+    };
+    LpStride st;
+    for (int v = tid; v < V; v += nt) st.push(val(v), v, k);
+    float m = st.m, s = st.s;
+    for (int o = 16; o > 0; o >>= 1) lse_merge(m, s, __shfl_xor_sync(0xffffffffu, m, o), __shfl_xor_sync(0xffffffffu, s, o));
+    if (lane == 0) sm[w] = m, ss[w] = s;
+    __syncthreads();
+    if (tid == 0) {
+        for (int i = 1; i < nw; ++i) lse_merge(m, s, sm[i], ss[i]);
+        lse_sh = m == -INFINITY ? -INFINITY : m + logf(s);
+    }
+    __syncthreads();
+    const float lse = lse_sh;
+    LogprobRow& o = out[t];
+    if (tid == 0) {
+        const int id = ids[t];
+        o.id = id;
+        o.lp = id >= 0 && id < V ? val(id) - lse : __int_as_float(0x7fc00000);
+    }
+    int n = 0, hp = 0;
+    for (; n < k; ++n) {
+        float bv = hp < st.tn ? st.tv[hp] : -INFINITY;
+        int bi = hp < st.tn ? st.ti[hp] : 0x7fffffff;
+        for (int q = 16; q > 0; q >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, bv, q);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, q);
+            if (lp_before(ov, oi, bv, bi)) bv = ov, bi = oi;
+        }
+        if (lane == 0) sm[w] = bv, si[w] = bi;
+        __syncthreads();
+        if (tid == 0) {
+            for (int i = 1; i < nw; ++i)
+                if (lp_before(sm[i], si[i], bv, bi)) bv = sm[i], bi = si[i];
+            wv_sh = bv, wi_sh = bi;
+        }
+        __syncthreads();
+        bv = wv_sh, bi = wi_sh;
+        if (bi == 0x7fffffff) break;   // (every finite value listed)
+        if (tid == 0) o.top[n] = bi, o.top_lp[n] = bv - lse;
+        if (hp < st.tn && st.ti[hp] == bi) ++hp;   // (an id is in one thread's stride only)
+    }
+    if (tid == 0) o.n = n;
+}
+
 int cdiv(int a, int b) { return (a + b - 1) / b; }
 
 }  // namespace
@@ -4183,6 +4260,13 @@ void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const ui
 void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out,
                 cudaStream_t s) {
     pdl_launch(confidence_kernel, T, 1024, 0, s, x, E, tok, w, dim, R, out);
+}
+void logprob_rows(const float* logits, int V, int T, const int* hist, int h, float repeat, float freq, float present,
+                  const int* ids, int k, LogprobRow* out, cudaStream_t s) {
+    if (T < 1) return;
+    const size_t bits = hist != nullptr && h > 0 ? (size_t) ((V + 31) / 32) * sizeof(unsigned) : 0;
+    logprob_rows_kernel<<<T, kLpThreads, bits, s>>>(logits, V, hist, h, repeat, freq, present, ids,
+                                                    std::max(0, std::min(k, kTopLogprobs)), out);
 }
 
 void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int fmt) {
