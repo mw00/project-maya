@@ -172,6 +172,9 @@ bool mv_heads(const MvJob& b, int H, size_t w_stride, size_t xq_stride, size_t x
 void set_mv_rows(int on);
 /// (tests) whether mv_heads packs short rows on the current GPU now (set_mv_rows, else MAYA_IQ_MV_RW, else gfx1100)
 bool mv_rows_on();
+/// (tests) DS4_Q5K_IMMA's value: Q5_K GEMVs of at least min_cols activations on the int8 tensor cores (0: off) - the
+/// same bits as the dp4a kernel
+void set_imma(int min_cols);
 
 /// (tests) every value of n rows of k (rows row_bytes(type, k) apart, on the device) as the kernels decode them: sub =
 /// the token / window / light kernels' codes times their scales (d s q - m; IQ1_M through the persistent kernels'
