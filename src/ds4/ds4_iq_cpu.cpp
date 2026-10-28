@@ -65,9 +65,10 @@ kc::NativeFmt native(const IqCpu& f) {   // (the fields the rows read; no lookup
     return n;
 }
 
-// ---- what this CPU runs: AVX2 + FMA (the OS saving the YMM state), and AVX-512 F / BW + VBMI with BMI2 (the ZMM state)
+// ---- what this CPU runs: AVX2 + FMA (the OS saving the YMM state), and AVX-512 F / BW + VBMI with BMI2 (the ZMM state);
+// x512: AVX-512 F / BW / VL / DQ with BMI2 (no VBMI: Skylake-SP Xeons too), pop512: and VPOPCNTDQ
 struct IqCpuIsa {
-    bool avx2 = false, w512 = false, bmi2 = false;
+    bool avx2 = false, w512 = false, bmi2 = false, x512 = false, pop512 = false;
 };
 IqCpuIsa iq_isa() {
     IqCpuIsa c;
@@ -99,6 +100,9 @@ IqCpuIsa iq_isa() {
     c.bmi2 = (r[1] >> 8) & 1u;
     c.w512 = c.avx2 && (xcr0 & 0xE6) == 0xE6 && ((r[1] >> 16) & 1u) && ((r[1] >> 30) & 1u) && ((r[2] >> 1) & 1u) &&
              ((r[1] >> 8) & 1u);   // AVX-512 F, BW, VBMI; BMI2
+    c.x512 = c.avx2 && (xcr0 & 0xE6) == 0xE6 && ((r[1] >> 16) & 1u) && ((r[1] >> 17) & 1u) && ((r[1] >> 30) & 1u) &&
+             ((r[1] >> 31) & 1u) && ((r[1] >> 8) & 1u);   // AVX-512 F, DQ, BW, VL; BMI2
+    c.pop512 = c.x512 && ((r[2] >> 14) & 1u);              // AVX-512 VPOPCNTDQ
 #endif
     return c;
 }
@@ -107,11 +111,14 @@ const IqCpuIsa& isa() {
     return c;
 }
 
-// ---- CPUs whose BMI2 pdep / pext run in microcode: AMD family 17h (Zen, Zen+, Zen 2) and Hygon's family 18h (Zen's
-// design) - one pdep there takes hundreds of cycles against one elsewhere (Intel since Haswell, Zen 3 and later).
-// ggml-cpu builds IQ1_S's grid indices by pdep wherever it is compiled with BMI2 (-march=native, or the portable
-// build's GGML_BMI2), so a Zen 2 CPU lane spent most of an IQ1_S expert there.
-bool pdep_slow_cpu() {
+// ---- the CPU's vendor (AMD or Hygon) and family (0x17 Zen / Zen+ / Zen 2, 0x19 Zen 3 / Zen 4, 0x1A Zen 5); fam 0 on
+// any other vendor
+struct CpuFam {
+    bool amd = false, hygon = false;
+    unsigned fam = 0;
+};
+CpuFam cpu_fam() {
+    CpuFam f;
 #if defined(IQ_X86)
     unsigned r[4] = {0, 0, 0, 0};
     auto cpuid = [&](unsigned leaf) {
@@ -129,14 +136,23 @@ bool pdep_slow_cpu() {
     std::memcpy(v + 4, &r[3], 4);
     std::memcpy(v + 8, &r[2], 4);
     v[12] = 0;
-    const bool amd = std::strcmp(v, "AuthenticAMD") == 0, hygon = std::strcmp(v, "HygonGenuine") == 0;
-    if ((!amd && !hygon) || r[0] < 1) return false;
+    f.amd = std::strcmp(v, "AuthenticAMD") == 0;
+    f.hygon = std::strcmp(v, "HygonGenuine") == 0;
+    if ((!f.amd && !f.hygon) || r[0] < 1) return CpuFam{};
     cpuid(1);
-    const unsigned base = (r[0] >> 8) & 0xfu, fam = base == 0xfu ? base + ((r[0] >> 20) & 0xffu) : base;
-    return amd ? fam == 0x17u : fam == 0x18u;
-#else
-    return false;
+    const unsigned base = (r[0] >> 8) & 0xfu;
+    f.fam = base == 0xfu ? base + ((r[0] >> 20) & 0xffu) : base;
 #endif
+    return f;
+}
+
+// ---- CPUs whose BMI2 pdep / pext run in microcode: AMD family 17h (Zen, Zen+, Zen 2) and Hygon's family 18h (Zen's
+// design) - one pdep there takes hundreds of cycles against one elsewhere (Intel since Haswell, Zen 3 and later).
+// ggml-cpu builds IQ1_S's grid indices by pdep wherever it is compiled with BMI2 (-march=native, or the portable
+// build's GGML_BMI2), so a Zen 2 CPU lane spent most of an IQ1_S expert there.
+bool pdep_slow_cpu() {
+    const CpuFam f = cpu_fam();
+    return f.amd ? f.fam == 0x17u : f.hygon && f.fam == 0x18u;
 }
 // IQ1_S's rows without pdep (ours, the integer index form - ggml's non-BMI2 branch, the same bits): for every token
 // count (one token too, where ggml-cpu's dot serves elsewhere) and on every setup (the one-GPU path's switch,
@@ -470,8 +486,12 @@ IQ_BMI2 void iq1s_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_
 // lanes, then ggml's float steps: the same numbers to the bit (own_check).
 #if defined(__GNUC__) || defined(__clang__)
 #define IQ_512 __attribute__((target("avx512f,avx512bw,avx512vbmi,bmi2,avx2,fma")))
+#define IQ_512BW __attribute__((target("avx512f,avx512bw,avx2,fma")))   // (fold, scales4: these rows' and the x512 tiers')
+#define IQX_TARGET(s) __attribute__((target(s)))
 #else
 #define IQ_512
+#define IQ_512BW
+#define IQX_TARGET(s)
 #endif
 alignas(64) uint16_t g_code3x[256], g_code3s[512];
 bool g_codes_ok = false;
@@ -510,10 +530,10 @@ bool build_codes3() {
     }
     return true;
 }
-IQ_512 inline __m256i fold(__m512i a) {   // a block's 16 int32 lanes -> ggml's 8 (lane k + lane k + 8), exact
+IQ_512BW inline __m256i fold(__m512i a) {   // a block's 16 int32 lanes -> ggml's 8 (lane k + lane k + 8), exact
     return _mm256_add_epi32(_mm512_castsi512_si256(a), _mm512_extracti64x4_epi64(a, 1));
 }
-IQ_512 inline __m512i scales4(int s0, int s1, int s2, int s3) {   // int16 lanes 0-7 s0, 8-15 s1, 16-23 s2, 24-31 s3
+IQ_512BW inline __m512i scales4(int s0, int s1, int s2, int s3) {   // int16 lanes 0-7 s0, 8-15 s1, 16-23 s2, 24-31 s3
     const __m512i idx = _mm512_set_epi16(3, 3, 3, 3, 3, 3, 3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1, 1,   //
                                          0, 0, 0, 0, 0, 0, 0, 0);
     const uint64_t packed = (uint64_t) (uint16_t) s0 | ((uint64_t) (uint16_t) s1 << 16) |
@@ -616,6 +636,66 @@ IQ_512 void iq3_rows_512(const uint8_t* w, size_t rb, int nb, const block_q8_K* 
     }
 }
 
+// ---- the exact AVX-512 rows without VBMI (ds4_iq512_kern.inc): IQ2_XS and IQ3_XXS - their sign bytes' parities in a
+// vector instead of a table load each, by VPOPCNTDQ where the CPU has it - and IQ1_M (its indices by pdep).  They need
+// AVX-512 F / BW / VL / DQ and BMI2 (isa().x512); which calls take them: x512_from
+bool g_iq1m_fma = true;   // IQ1_M's last step one FMA (gcc's build of ggml-cpu) or a multiply then an add (own())
+#define IQX_NS iqx
+#define IQX_ATTR IQX_TARGET("avx512f,avx512bw,avx512vl,avx512dq,bmi2,avx2,fma")
+#include "ds4_iq512_kern.inc"
+#define IQX_NS iqx_pop
+#define IQX_ATTR IQX_TARGET("avx512f,avx512bw,avx512vl,avx512dq,avx512vpopcntdq,bmi2,avx2,fma")
+#define IQX_POP 1
+#include "ds4_iq512_kern.inc"
+bool g_x512_18 = false;   // IQ3_XXS on these rows rather than the ones above (own())
+
+template <int TY, int NT>
+void x512_pass(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0, int r1) {
+    if constexpr (TY == 29) {
+        iqx::rows_iq1m<NT>(w, rb, nb, y, out, r0, r1);
+    } else {
+        if (isa().pop512) iqx_pop::rows<TY, NT>(w, rb, nb, y, out, r0, r1);
+        else iqx::rows<TY, NT>(w, rb, nb, y, out, r0, r1);
+    }
+}
+// out[t][r - r0] for the rows of TY 17 (IQ2_XS), 18 (IQ3_XXS) or 29 (IQ1_M), 4 tokens a pass (as iq_rows_n)
+template <int TY>
+void x512_rows(const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
+    const int nb = n / QK_K;
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const block_q8_K* y[4];
+        float* o[4];
+        const int c = nt - t0 < 4 ? nt - t0 : 4;
+        for (int t = 0; t < c; ++t) {
+            y[t] = (const block_q8_K*) act[t0 + t];
+            o[t] = out[t0 + t];
+        }
+        switch (c) {
+            case 1: x512_pass<TY, 1>(w, rb, nb, y, o, r0, r1); break;
+            case 2: x512_pass<TY, 2>(w, rb, nb, y, o, r0, r1); break;
+            case 3: x512_pass<TY, 3>(w, rb, nb, y, o, r0, r1); break;
+            default: x512_pass<TY, 4>(w, rb, nb, y, o, r0, r1); break;
+        }
+    }
+}
+
+// the calls of `type` these rows take: from how many tokens (0: none).  DS4_IQ512=1: every call of IQ2_XS, IQ3_XXS and
+// IQ1_M wherever the CPU runs them (they give ggml-cpu's bits, so only the speed changes); unset or 0: none.  The CPUs
+// that run pdep in microcode never take the IQ1_M rows.
+int x512_from(int type) {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_IQ512");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    if (!on || !isa().x512) return 0;
+    if (type == GGML_TYPE_IQ1_M) return pdep_slow_cpu() ? 0 : 1;
+    return type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ3_XXS ? 1 : 0;
+}
+// a type of these rows (IQ3_XXS when own() took them)
+bool x512_type(int type) {
+    return type == GGML_TYPE_IQ2_XS || type == GGML_TYPE_IQ1_M || (type == GGML_TYPE_IQ3_XXS && g_x512_18);
+}
+
 template <int TY>
 void iq_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     static const bool w512 = [] {
@@ -686,11 +766,30 @@ void own_rows(int type, const uint8_t* w, size_t rb, int n, const void* const* a
 #if defined(IQ_X86)
     if (type == GGML_TYPE_IQ2_XXS) return iq_rows_n<16>(w, rb, n, act, nt, out, r0, r1);
     if (type == GGML_TYPE_IQ2_S) return iq_rows_n<22>(w, rb, n, act, nt, out, r0, r1);
-    if (type == GGML_TYPE_IQ3_XXS) return iq_rows_n<18>(w, rb, n, act, nt, out, r0, r1);
+    if (type == GGML_TYPE_IQ3_XXS) {
+        if (g_x512_18) return x512_rows<18>(w, rb, n, act, nt, out, r0, r1);
+        return iq_rows_n<18>(w, rb, n, act, nt, out, r0, r1);
+    }
     if (type == GGML_TYPE_IQ3_S) return iq_rows_n<21>(w, rb, n, act, nt, out, r0, r1);
     if (type == GGML_TYPE_IQ1_S) return iq1s_rows_n(w, rb, n, act, nt, out, r0, r1);
+    if (type == GGML_TYPE_IQ2_XS) return x512_rows<17>(w, rb, n, act, nt, out, r0, r1);
+    if (type == GGML_TYPE_IQ1_M) return x512_rows<29>(w, rb, n, act, nt, out, r0, r1);
 #endif
     (void) type, (void) w, (void) rb, (void) n, (void) act, (void) nt, (void) out, (void) r0, (void) r1;
+}
+
+// a block's F16 scale: the first field, or (IQ1_M) the top nibbles of its four scale words
+void put_scale(ggml_type t, uint8_t* blk, ggml_fp16_t d) {
+    if (t != GGML_TYPE_IQ1_M) {
+        std::memcpy(blk, &d, sizeof d);
+        return;
+    }
+    for (int j = 0; j < 4; ++j) {
+        uint16_t sw;
+        std::memcpy(&sw, blk + QK_K / 8 + QK_K / 16 + 2 * j, 2);
+        sw = (uint16_t) ((sw & 0x0fffu) | (((unsigned) d >> (4 * j)) & 15u) << 12);
+        std::memcpy(blk + QK_K / 8 + QK_K / 16 + 2 * j, &sw, 2);
+    }
 }
 
 // our rows against ggml-cpu's dot, bit for bit: random blocks of the type (its F16 scale a small normal value), Q8_K
@@ -711,7 +810,7 @@ bool own_check(int type) {
     for (auto& b : w) b = (uint8_t) next();
     for (size_t o = 0; o < w.size(); o += bb) {
         const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
-        std::memcpy(&w[o], &d, sizeof d);
+        put_scale(t, &w[o], d);
     }
     const auto* q8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
     const auto dot = ggml_get_type_traits_cpu(t)->vec_dot;
@@ -746,7 +845,7 @@ double time_variant(int type, int variant, int nt = 1) {
     for (auto& b : w) b = (uint8_t) ((s = s * 1664525u + 1013904223u) >> 24);
     for (size_t o = 0; o < w.size(); o += bb) {
         const ggml_fp16_t d = ggml_fp32_to_fp16(0.003f);
-        std::memcpy(&w[o], &d, sizeof d);
+        put_scale(t, &w[o], d);
     }
     std::vector<float> x((size_t) n), y((size_t) rows * nt);
     std::vector<const void*> ap((size_t) nt);
@@ -789,6 +888,8 @@ double time_variant(int type, int variant, int nt = 1) {
 // against ggml-cpu's dot (each variant), then the fastest of ours and the native lane's measured on this CPU (they
 // give the same bits, so the choice changes no answer).  DS4_IQ_OWN=0: the native lane's rows; =1: ours without
 // measuring (DS4_IQ_GATHER=1: the IQ3 grids by vpgatherdd); DS4_IQ_AVX2=1: our AVX2 rows on an AVX-512 CPU too.
+// IQ2_XS / IQ1_M (and IQ3_XXS with DS4_IQ512=1) on the AVX-512 rows without VBMI where x512_from says so, checked the
+// same way and not timed.
 bool own(int type) {
 #if defined(IQ_X86)
     int k;
@@ -798,6 +899,8 @@ bool own(int type) {
         case GGML_TYPE_IQ2_XXS: k = 2; break;
         case GGML_TYPE_IQ2_S: k = 3; break;
         case GGML_TYPE_IQ1_S: k = 4; break;
+        case GGML_TYPE_IQ2_XS: k = 5; break;
+        case GGML_TYPE_IQ1_M: k = 6; break;
         default: return false;
     }
     static int mode = -1;   // DS4_IQ_OWN: -1 measured, 0 never, 1 always
@@ -815,10 +918,34 @@ bool own(int type) {
         return mode != 0 && isa().avx2;
     }();
     // (IQ2 on an AVX-512 CPU: the GLM lane's AVX-512 rows serve them, unless DS4_IQ_AVX2; IQ1_S has no such rows)
-    if (!allowed || ((k == 2 || k == 3) && isa().w512 && !force_avx2)) return false;
-    static std::once_flag once[5];
-    static bool ok[5];
+    if (!allowed || ((k == 2 || k == 3) && isa().w512 && !force_avx2) || (k >= 5 && x512_from(type) == 0)) return false;
+    static std::once_flag once[7];
+    static bool ok[7];
     std::call_once(once[k], [&] {
+        if (x512_from(type) > 0) {   // (the AVX-512 rows without VBMI: chosen by the CPU, x512_from)
+            bool good = false;
+            if (k == 6) {   // (IQ1_M: the last step's form that gives ggml-cpu's bits, gcc's FMA first)
+                for (bool fused : {true, false}) {
+                    g_iq1m_fma = fused;
+                    if ((good = own_check(type))) break;
+                }
+            } else {
+                if (k == 0) g_x512_18 = true;
+                good = own_check(type);
+            }
+            const int from = x512_from(type);
+            if (good)
+                std::fprintf(stderr, "ds4: CPU lane %s rows: AVX-512%s%s\n", ggml_type_name((ggml_type) type),
+                             k != 6 && isa().pop512 ? " (VPOPCNTDQ)" : "", from > 1 ? ", from 2 tokens a call" : "");
+            else
+                std::fprintf(stderr, "ds4: CPU lane %s rows: not the AVX-512 ones (they differ from ggml-cpu's dot in this "
+                                     "build)\n", ggml_type_name((ggml_type) type));
+            if (good || k != 0) {
+                ok[k] = good;
+                return;
+            }
+            g_x512_18 = false;   // (IQ3_XXS: the rows above, chosen as before)
+        }
         const bool no_pdep = k == 4 && iq1_no_pdep();
         bool* gflag = k == 0 ? &g_gather18 : k == 1 ? &g_gather21 : k == 2 ? &g_ct16 :
                       k == 4 && isa().bmi2 && !no_pdep ? &g_iq1_pdep : nullptr;   // (the second form)
@@ -880,7 +1007,12 @@ std::atomic<bool> g_iq1_on{true};
 // without pdep (iq1_no_pdep): then ours for every call, ggml-cpu's dot taking pdep's microcode on such a CPU
 bool own_nt(int type, int nt) {
     if (type == GGML_TYPE_IQ1_S && !iq1_no_pdep() && (nt < 2 || !g_iq1_on.load(std::memory_order_relaxed))) return false;
+#if defined(IQ_X86)
+    if (!own(type)) return false;
+    return !x512_type(type) || nt >= x512_from(type);
+#else
     return own(type);
+#endif
 }
 }  // namespace
 

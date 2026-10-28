@@ -547,6 +547,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(ds4_lane_bench tests/ds4_lane_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp)
     target_include_directories(ds4_lane_bench PRIVATE third_party/ggml)
     target_link_libraries(ds4_lane_bench PRIVATE strata_kernels_cpu)
+    # the CPU lane's exact AVX-512 rows without VBMI (src/ds4/ds4_iq512_kern.inc: IQ2_XS, IQ3_XXS, IQ1_M) bit for bit
+    # against ggml-cpu's dot, one thread, no GPU: forced on (any CPU with AVX-512 F/BW/VL/DQ and BMI2), and this CPU's
+    # default choice; --bench times the rows
+    enable_testing()
+    add_executable(ds4_iq512_rows_test tests/ds4_iq512_rows_test.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_iq512_rows_test PRIVATE third_party/ggml)
+    target_link_libraries(ds4_iq512_rows_test PRIVATE strata_kernels_cpu)
+    add_test(NAME ds4_iq512_rows COMMAND ds4_iq512_rows_test)
+    set_tests_properties(ds4_iq512_rows PROPERTIES ENVIRONMENT DS4_IQ512=1 TIMEOUT 120)
+    add_test(NAME ds4_iq512_rows_default COMMAND ds4_iq512_rows_test)
+    set_tests_properties(ds4_iq512_rows_default PROPERTIES TIMEOUT 120)
     # the GGUF kernels (BF16 matrices, MXFP4 experts) against a double-precision reference, and the packed KV caches
     # against the BF16 rows bit for bit (needs a GPU, no model)
     add_executable(ds4_gguf_test tests/ds4_gguf_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
