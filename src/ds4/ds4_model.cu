@@ -18753,15 +18753,23 @@ struct Model::Impl {
                              cpu_job_n[i] ? cpu_job_ns[i] / 1e3 / cpu_job_n[i] : 0.0,
                              100.0 * cpu_job_ns[i] / 1e6 / (cpu_ph_ms[i] * thr), thr);
         }
-        if (o.profile.empty()) return;
-        const std::string tmp = o.profile + ".tmp";
-        std::FILE* f = std::fopen(tmp.c_str(), "wb");
-        if (f == nullptr) return;
-        const bool ok = std::fwrite(prof.data(), 4, prof.size(), f) == prof.size();
-        std::fclose(f);
-        // (the old profile replaced: std::rename does not replace an existing file on Windows, so there the profile
-        // never moved on and only .tmp files were left)
-        if (!ok || !os::replace_file(tmp, o.profile)) std::remove(tmp.c_str());
+        const auto write = [](const std::string& path, const std::vector<uint32_t>& v) {
+            const std::string tmp = path + ".tmp";
+            std::FILE* f = std::fopen(tmp.c_str(), "wb");
+            if (f == nullptr) return;
+            const bool ok = std::fwrite(v.data(), 4, v.size(), f) == v.size();
+            std::fclose(f);
+            // (the old profile replaced: std::rename does not replace an existing file on Windows, so there the profile
+            // never moved on and only .tmp files were left)
+            if (!ok || !os::replace_file(tmp, path)) std::remove(tmp.c_str());
+        };
+        if (!o.profile_out.empty()) {   // (--profile-out: this run's routing alone - the counts only ever grow)
+            std::vector<uint32_t> run(prof.size());
+            for (size_t i = 0; i < prof.size(); ++i) run[i] = prof[i] - (i < prof_load.size() ? prof_load[i] : 0u);
+            write(o.profile_out, run);
+        }
+        if (o.profile.empty() || o.profile_readonly) return;
+        write(o.profile, prof);
     }
 
     std::vector<std::string> info_lines() const {

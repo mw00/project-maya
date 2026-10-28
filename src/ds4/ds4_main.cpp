@@ -127,7 +127,11 @@ void usage() {
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
                  "maya-ds4 --pack <model>/maya-ds4 --pack-info [--expert-profile FILE]   the pack described: no GPU, no "
                  "weights read\n"
-                 "maya-ds4 --version   the release and the commit it was built from\n");
+                 "maya-ds4 --version   the release and the commit it was built from\n"
+                 "maya-ds4 --pack ... --profile-run FILE [--profile-out OUT]   an expert profile from a corpus (a line "
+                 "of ids each)\n"
+                 "           [--profile-readonly] [--profile-out OUT]   any run: the profile never written back; this "
+                 "run's counts alone to OUT\n");
 }
 
 // --pack-info: the types the kernels take, asked of them (ds4_gguf / ds4_iq: the routed experts' and the dense GEMVs'
@@ -2060,6 +2064,54 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
 // decode n greedy tokens alone (a plain step at a time, one conversation after another), then all of them together
 // (Model::step_multi).  Each row's logits must be its own step's alone bit for bit, its tokens the same.  (The times
 // are the steps' alone and together on tiers the first pass warmed; the server's real questions are the measure.)
+// --profile-run FILE: an expert profile from a corpus - each line of FILE a run of ids (BOS + text, as --ppl's) fed
+// from a fresh state, no logits but its last row; what the runs route is counted, and saved as it goes (every 10 lines
+// or minute, and at the end) to --profile-out: this run's counts alone, while the pack's profile places the experts and
+// stays as it was.  A line longer than the context is cut there.  tools/ds4/profile.py make takes such files
+int profile_run(strata::ds4::Model& m, const std::string& path, const std::string& out) {
+    std::ifstream in(path);
+    if (!in) {
+        std::fprintf(stderr, "maya-ds4: --profile-run: cannot open %s\n", path.c_str());
+        return 1;
+    }
+    std::string line, err;
+    long long lines = 0, tokens = 0, cut = 0;
+    const double t0 = now_ms();
+    double saved = t0;
+    while (std::getline(in, line)) {
+        std::vector<int> seq = parse_ids(line);
+        if (seq.empty()) continue;
+        if (seq.size() > (size_t) m.max_context()) {
+            seq.resize((size_t) m.max_context());
+            ++cut;
+        }
+        m.reset();
+        for (size_t done = 0; done < seq.size();) {
+            const size_t k = std::min<size_t>((size_t) m.feed_unit(), seq.size() - done);
+            if (!m.feed(seq.data() + done, (int) k, done + k == seq.size() ? 1 : 0, err)) {
+                std::fprintf(stderr, "maya-ds4: --profile-run, line %lld: %s\n", lines + 1, err.c_str());
+                m.save_profile();
+                return 1;
+            }
+            done += k;
+        }
+        ++lines;
+        tokens += (long long) seq.size();
+        const double now = now_ms();
+        std::fprintf(stderr, "profile-run %lld: %zu tokens, %lld in all, %.0f s, %.0f tok/s\n", lines, seq.size(), tokens,
+                     (now - t0) / 1000.0, 1000.0 * (double) tokens / std::max(1.0, now - t0));
+        if (lines % 10 == 0 || now - saved > 60000.0) {
+            m.save_profile();
+            saved = now;
+        }
+    }
+    m.save_profile();
+    std::fprintf(stderr, "profile-run: %lld lines, %lld tokens (%lld lines cut at the context) in %.0f s; the counts in %s "
+                         "(python tools/ds4/profile.py make --pack <pack> --out <profile> %s ...)\n",
+                 lines, tokens, cut, (now_ms() - t0) / 1000.0, out.c_str(), out.c_str());
+    return lines > 0 ? 0 : 1;
+}
+
 int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
     const int N = m.seq_count(), V = m.vocab();
     std::string err;
@@ -2443,7 +2495,8 @@ int main(int argc, char** argv) {
     bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
-    bool serve_mode = false, multi_check = false, parts_check = false, describe = false;
+    bool serve_mode = false, multi_check = false, parts_check = false, describe = false, dspark_set = false;
+    std::string prof_run, prof_out;
     std::string images, enc_rgb, enc_out;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
@@ -2483,6 +2536,7 @@ int main(int argc, char** argv) {
             spec = v != "off";
             o.dspark = v != "none";   // none: not even loaded
             dspark_on_asked = v == "on";
+            dspark_set = true;
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
@@ -2520,6 +2574,9 @@ int main(int argc, char** argv) {
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
         else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
         else if (a == "--pack-info") describe = true;
+        else if (a == "--profile-run") prof_run = val("--profile-run");
+        else if (a == "--profile-out") prof_out = val("--profile-out");
+        else if (a == "--profile-readonly") o.profile_readonly = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
         else if (a == "--help" || a == "-h") {
             usage();
@@ -2546,12 +2603,32 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--multi-check needs --parallel 2..8 and --ids\n");
         return 2;
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty())) {
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty())) {
         usage();
         return 2;
     }
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
+    o.profile_out = prof_out;
+    if (!prof_run.empty()) {   // (a profile run: the pack's profile read only, the run's counts to their own file)
+        o.profile_readonly = true;
+        if (o.profile_out.empty()) o.profile_out = prof_run + ".profile.bin";
+        if (!dspark_set) o.dspark = false;   // (it never drafts: the drafter's VRAM to experts)
+        suffix_draft = 0;
+        // every layer routes every token, as a decode's do: the prompt skip (layers 21-39 of a long run's earlier
+        // tokens left out) off unless set
+        const bool skip_set = std::getenv("DS4_YOCO") != nullptr || std::getenv("MAYA_DS4_PROMPT_SKIP") != nullptr;
+        if (!skip_set) {
+#if defined(_WIN32)
+            _putenv_s("DS4_YOCO", "0");
+#else
+            setenv("DS4_YOCO", "0", 1);
+#endif
+        }
+        std::fprintf(stderr, "profile-run: %s's routing counted into %s; the expert profile %s is only read%s\n",
+                     prof_run.c_str(), o.profile_out.c_str(), o.profile.empty() ? "(none)" : o.profile.c_str(),
+                     skip_set ? "" : "; every layer on every token (the prompt skip off)");
+    }
     o.vision_only = !enc_rgb.empty();
     strata::ds4::Model m;
     std::string err;
@@ -2568,6 +2645,7 @@ int main(int argc, char** argv) {
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
     if (serve_mode) return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get());
+    if (!prof_run.empty()) return profile_run(m, prof_run, o.profile_out);
     if (multi_check) return check_multi(m, parse_ids(ids_s), std::max(2, n));
     if (parts_check) return check_parts(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored

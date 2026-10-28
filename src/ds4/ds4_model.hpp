@@ -31,6 +31,9 @@ struct Options {
     // NUMA node's cores when measured faster at load; n: at most n, a thread a core
     int cpu_threads = 0;
     std::string profile;              // expert hit counts (read to place the hottest experts in VRAM, written back)
+    bool profile_readonly = false;    // (--profile-readonly) the profile is read, never written back
+    // (--profile-out) where save_profile() also writes what this run routed alone: the counts read at the load taken off
+    std::string profile_out;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them

@@ -6,11 +6,14 @@ ahead, counted on as it runs and saved after each answer.  A pack without one st
 first answers then run from an arbitrary placement until the expert cache has moved the used experts in.  The setup
 copies the shipped profile into a pack that has none (maya.py ds4_seed_profile).
 
-    make     the shipped profile from engine-saved ones (each an engine run over representative text with
-             --expert-profile <file>): the trunk's layers, every input weighing the same, each layer's counts scaled
-             to --tokens tokens' worth (k picks a token) - small, so what a PC routes itself soon outweighs it
+    make     the shipped profile from engine-saved ones (each an engine run over representative text: maya-ds4
+             --profile-run CORPUS.ids --profile-out RUN.bin, a line of token ids each - that run's counts alone, the
+             pack's profile left as it was; or a run with --expert-profile <new file>): the trunk's layers, every
+             input weighing the same, each layer's counts scaled to --tokens tokens' worth (k picks a token) - small,
+             so what a PC routes itself soon outweighs it
     compare  how much two profiles agree: per layer, the share of A's top --top experts also in B's top --top
 
+    maya-ds4 --pack <pack> --profile-run code.ids --profile-out code.bin   (one corpus a run; see docs/SETTINGS.md)
     python tools/ds4/profile.py make --pack <pack> --out data/expert-profile-ds4.bin RUN.bin [RUN.bin ...]
     python tools/ds4/profile.py compare --pack <pack> A.bin B.bin [--top 64]
 """
