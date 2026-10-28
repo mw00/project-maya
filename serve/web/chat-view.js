@@ -275,14 +275,13 @@ function ThinkingPanel() {
     </div>
     <p class="think-panel__note">For this chat. New chats start at the level in Settings › Chat defaults${isDefault ? "" : ` (${LEVELS.find((l) => l.id === P.thinking).name})`}.</p>`;
 }
-// a phone: a bar hovering over the chat, above the message box - the level filled in, a tap or a drag along it sets
-// another (one slider: the arrow keys too)
+// a phone: a thick bar hovering over the chat above the message box, one segment a level (the model's own: GLM's Off, Low,
+// High and Max), filled up to the one set; a tap or a drag along it sets another (one slider: the arrow keys too)
 function ThinkingBar({bar}) {
   const level = thinkingOf(), n = LEVELS.length, li = Math.max(0, LEVELS.findIndex((l) => l.id === level));
   const track = useRef(null), dragging = useRef(false);
-  const at = (i) => (n > 1 ? (i * 100) / (n - 1) : 100);
   const set = (i) => { const l = LEVELS[Math.min(n - 1, Math.max(0, i))]; if (l.id !== thinkingOf()) setThinking(l.id); };
-  const from = (x) => { const r = track.current.getBoundingClientRect(); return Math.round(((x - r.left) / r.width) * (n - 1)); };
+  const from = (x) => { const r = track.current.getBoundingClientRect(); return Math.floor(((x - r.left) / r.width) * n); };
   const down = (e) => { dragging.current = true; e.currentTarget.setPointerCapture(e.pointerId); set(from(e.clientX)); };
   const move = (e) => { if (dragging.current) set(from(e.clientX)); };
   const up = () => { dragging.current = false; };
@@ -292,14 +291,13 @@ function ThinkingBar({bar}) {
     e.preventDefault();
     set(to);
   };
-  return html`<div ref=${bar} class="think-bar" role="group" aria-label="Thinking">
-    <span class="think-bar__now"><${Gauge} level=${level}/><b>${LEVELS[li].name}</b></span>
+  return html`<div ref=${bar} class=${`think-bar${n > 5 ? " think-bar--many" : ""}`}>
     <div ref=${track} class="think-bar__track" role="slider" tabIndex="0" aria-label="Thinking level" aria-valuemin="0"
-      aria-valuemax=${n - 1} aria-valuenow=${li} aria-valuetext=${`${LEVELS[li].name}: ${LEVELS[li].desc}`} style=${`--fill:${at(li)}%`}
+      aria-valuemax=${n - 1} aria-valuenow=${li} aria-valuetext=${`${LEVELS[li].name}: ${LEVELS[li].desc}`}
+      style=${`--fill:${((li + 1) * 100) / n}%`}
       onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up} onKeyDown=${keys}>
-      <span class="think-bar__rail"><span class="think-bar__fill"></span></span>
-      ${LEVELS.map((l, i) => html`<i class=${`think-bar__tick${i <= li ? " is-on" : ""}`} style=${`left:${at(i)}%`}></i>`)}
-      <span class="think-bar__knob"></span>
+      <span class="think-bar__fill"></span>
+      ${LEVELS.map((l, i) => html`<span class=${`think-bar__seg${i <= li ? " is-on" : ""}${i === li ? " is-sel" : ""}`}>${l.name}</span>`)}
     </div>
   </div>`;
 }

@@ -329,23 +329,23 @@
          border-radius: var(--st-r-xl) var(--st-r-xl) 0 0; background: var(--st-surface); box-shadow: var(--st-shadow-sheet); animation: slideup 200ms var(--st-ease); }
 @keyframes slideup { from { transform: translateY(100%); } }
 .sheet__grip { align-self: center; width: 36px; height: 4px; margin: 2px 0 12px; border-radius: 2px; background: var(--st-line-strong); }
-/* the phone's thinking level: a bar hovering over the chat above the message box, the level filled in; a tap or a drag
-   along it sets another (its rail is thin, its touch area the bar's height) */
-.think-bar { position: absolute; z-index: 25; left: 2px; right: 2px; bottom: calc(100% + 10px); display: flex; align-items: center; gap: 14px;
-             height: 52px; padding: 0 20px 0 14px; border: 1px solid var(--st-glass-line); border-radius: var(--st-r-pill);
-             background: var(--st-glass-bar); box-shadow: var(--st-shadow-float);
-             -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%); animation: thinkbar 160ms var(--st-ease); }
+/* the phone's thinking level: a thick bar hovering over the chat above the message box, a segment a level, filled up to
+   the one set; a tap or a drag along it sets another */
+.think-bar { position: absolute; z-index: 25; left: 2px; right: 2px; bottom: calc(100% + 10px); padding: 5px;
+             border: 1px solid var(--st-glass-line); border-radius: var(--st-r-pill); background: var(--st-glass-bar);
+             box-shadow: var(--st-shadow-float); -webkit-backdrop-filter: blur(18px) saturate(160%); backdrop-filter: blur(18px) saturate(160%);
+             animation: thinkbar 160ms var(--st-ease); }
 @keyframes thinkbar { from { opacity: 0; transform: translateY(6px); } }
-.think-bar__now { display: flex; align-items: center; gap: 7px; min-width: 84px; color: var(--st-ink); font-size: var(--st-fs-md); }
-.think-bar__now b { font-weight: 600; }
-.think-bar__track { position: relative; flex: 1; height: 100%; margin: 0 9px; cursor: pointer; touch-action: none; outline: none; }
-.think-bar__rail { position: absolute; left: 0; right: 0; top: 50%; height: 6px; margin-top: -3px; border-radius: 3px; background: var(--st-surface-3); overflow: hidden; }
-.think-bar__fill { position: absolute; left: 0; top: 0; bottom: 0; width: var(--fill); background: var(--st-accent); transition: width 160ms var(--st-ease); }
-.think-bar__tick { position: absolute; top: 50%; width: 4px; height: 4px; margin: -2px 0 0 -2px; border-radius: 50%; background: var(--st-ink-muted); }
-.think-bar__tick.is-on { background: color-mix(in srgb, var(--st-accent-ink) 70%, transparent); }
-.think-bar__knob { position: absolute; top: 50%; left: var(--fill); width: 18px; height: 18px; margin: -9px 0 0 -9px; border-radius: 50%;
-                   background: var(--st-accent); box-shadow: 0 0 0 5px var(--st-accent-tint); transition: left 160ms var(--st-ease); }
-.think-bar__track:focus-visible .think-bar__knob { outline: 2px solid var(--st-focus); outline-offset: 4px; }
+.think-bar__track { position: relative; display: flex; height: 44px; border-radius: var(--st-r-pill); background: var(--st-surface-3);
+                    overflow: hidden; cursor: pointer; touch-action: none; user-select: none; -webkit-user-select: none; outline: none; }
+.think-bar__track:focus-visible { box-shadow: 0 0 0 2px var(--st-focus); }
+.think-bar__fill { position: absolute; left: 0; top: 0; bottom: 0; width: var(--fill); border-radius: var(--st-r-pill); background: var(--st-accent);
+                   transition: width 180ms var(--st-ease); }
+.think-bar__seg { position: relative; flex: 1; min-width: 0; display: grid; place-items: center; font-size: var(--st-fs-sm); font-weight: 500;
+                  color: var(--st-ink-muted); white-space: nowrap; transition: color 180ms var(--st-ease); }
+.think-bar__seg.is-on { color: color-mix(in srgb, var(--st-accent-ink) 78%, transparent); }
+.think-bar__seg.is-sel { color: var(--st-accent-ink); font-weight: 700; }
+.think-bar--many .think-bar__seg { font-size: var(--st-fs-xs); }   /* (MiniMax's seven levels) */
 
 /* ---------------------------------------------------------------- the phone: the chats push the page over, floating buttons */
 /* (as ChatGPT's app: the chats slide in from the left beside the page, not over it, and push it to the right; its edge
