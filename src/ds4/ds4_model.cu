@@ -1815,6 +1815,9 @@ struct Model::Impl {
     std::thread warm_th;
     std::atomic<bool> warm_stop{false};
     int64_t decay_tokens = 0;
+    // (cache_hold) the expert cache's tick held: the rows decoded meanwhile, which the release's tick takes in
+    bool tick_held = false;
+    int tick_defer = 0;
     bool check_swaps = std::getenv("DS4_CHECK_SWAPS") != nullptr;
     std::vector<float> host_logits;
     std::vector<void*> host_allocs;
@@ -9660,6 +9663,12 @@ struct Model::Impl {
         tick_jobs.clear();
     }
     void cache_tick(int T) {
+        if (tick_held) {   // (cache_hold: the experts stay where they are; the rows go into the release's tick)
+            tick_defer += T;
+            return;
+        }
+        T += tick_defer;
+        tick_defer = 0;
         tick_begin();
         rc_tick();
         hr_tick(T);   // (DS4_HELPER_RECENT: before the swaps, whose queue takes this window's CPU-lane hits)
@@ -14080,6 +14089,25 @@ struct Model::Impl {
         }
         return true;
     }
+    // the conversations a pass holds at most (can_draft_multi's bounds; 1: no pass of several)
+    int draft_pass() const {
+        const int T = g.d_block;
+        if (g.n_mtp == 0 || sqs.empty() || T < 1 || dump_d != nullptr || lend_broken) return g.n_mtp > 0 ? 1 : 0;
+        int n = 1;
+        while ((n + 1) * T <= kWin && (n + 1) * (T + 1) <= kWin + 2) ++n;
+        return n;
+    }
+    // (Model::cache_hold) the expert cache's tick held - the swaps and recent-slot fills under way switched in first,
+    // then nothing switched, nothing queued or filled, the CPU lane's experts where they are - and released: the held
+    // rows' tick now
+    void cache_hold(bool on) {
+        if (on && !tick_held) {
+            cache_drain();
+            rc_drain();
+        }
+        tick_held = on;
+        if (!on && tick_defer > 0) cache_tick(0);
+    }
     bool draft_multi(const int* sv, const int* ys, int n, std::vector<std::vector<int>>& out,
                      std::vector<std::vector<float>>& conf, std::string& err) {
         out.assign((size_t) std::max(0, n), {});
@@ -18465,6 +18493,8 @@ bool Model::step_multi_spec(const int* seqs, const int* const* toks, const int* 
     return p_->step_runs(seqs, toks, lens, n, true, err);
 }
 bool Model::can_draft_multi(const int* seqs, int n) const { return p_->can_draft_multi(seqs, n); }
+int Model::draft_pass() const { return p_->draft_pass(); }
+void Model::cache_hold(bool on) { p_->cache_hold(on); }
 bool Model::draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& d,
                         std::vector<std::vector<float>>& c, std::string& err) {
     return p_->draft_multi(seqs, ys, n, d, c, err);

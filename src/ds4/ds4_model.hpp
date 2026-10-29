@@ -216,12 +216,19 @@ public:
     /// The drafter for n conversations (2 or more, distinct) in one pass: draft()'s drafts and confidences for each
     /// conversation seqs[i] after its token ys[i] (the drafter's argmax), the blocks' rows through the DSpark blocks
     /// together.  can_draft_multi: whether these conversations fit one pass (their blocks in a window, each its
-    /// block's room in its context); else each drafts alone with draft().
+    /// block's room in its context); else each drafts alone with draft().  draft_pass: the conversations a pass holds
+    /// at most (1: none of several; 0: no drafter).
     bool can_draft_multi(const int* seqs, int n) const;
+    int draft_pass() const;
     bool draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& drafts,
                      std::vector<std::vector<float>>& conf, std::string& err);
     bool verify_multi(int i, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                       uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
+
+    /// The expert cache's tick (its switches and new swaps) held while on - the experts stay where they are, the CPU
+    /// lane's on the lane - and the held rows ticked at the release (--multi-check holds it throughout: two runs of the
+    /// same rows then meet the same placement).
+    void cache_hold(bool on);
 
     void reset();
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);

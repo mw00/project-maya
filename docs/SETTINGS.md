@@ -370,12 +370,12 @@ keys, its checkpoints. That is about 1.1 KB a position on each GPU for each of t
 taken from the experts' VRAM at the start (the log's `ds4: --parallel` line gives the size). The setup's recommended
 context shares the memory beside the model among the N conversations.
 - **A request alone** decodes as with one conversation: the DSpark drafter and the prompt lookup as configured.
-- **Two or more:** their rounds go through the model together. Each request's DSpark drafter guesses its next tokens
-  (its share of a 16-row window: up to 7 drafts for two at once, 3 for four), and every request's token and drafts
-  are verified in one step; a request whose drafts are rejected undoes only its own rows. A round with no drafts
-  (the drafter's confidence too low, or `--dspark off`) is a token of each. The dense weights, the router and the
-  experts the requests share are read once for all of them, and each request's attention reads its own
-  conversation's caches.
+- **Two or more:** their rounds go through the model together. Each request the round's plan picks (below) has the
+  DSpark drafter guess its next tokens (in a window of 16 rows, the drafter's block at most), and every request's
+  token and drafts are verified in one step; a request whose drafts are rejected undoes only its own rows. A round
+  with no drafts (the drafter's confidence too low, or `--dspark off`) is a token of each. The dense weights, the
+  router and the experts the requests share are read once for all of them, and each request's attention reads its
+  own conversation's caches.
   Each request gets exactly the tokens it would get alone with plain steps: greedy, with the experts where the load put
   them and the PCIe lane off, its logits are bit for bit its own (checked with 2 and 4 at once: `maya-ds4 --parallel 4
   --multi-check --ids ...`). The CPU lane's and the PCIe lane's rounding can change the last bits, as it already can
@@ -423,6 +423,25 @@ context shares the memory beside the model among the N conversations.
   One RTX 3090 + two RTX 5060 Ti (`--tp 2`, 207 GB of experts read in place from the files), 2 x 160 tokens: 25.2
   tok/s in all in one drafter pass, 19.4 with a pass each, 19.8 without drafts, 19.5 one after another alone with
   the drafter; through the server two requests at once ran at 14-19 tok/s each, about what each gets alone.
+- **Who drafts in a round of several** (`MAYA_DS4_MULTI_DRAFT_POLICY=1`, the default): a measured cost model. The
+  engine times its rounds by the window's rows (a round without drafts is a row each), the drafter's calls by the
+  requests in each (a pass takes three with DSpark's block of 5; more drafting take another call), and averages each
+  request's acceptance per draft and the drafts its cut keeps as it serves. Of the plans "the j requests with the
+  best acceptance draft, (16 - n) / j each at most", each priced with the drafter calls it needs, it takes the one
+  expecting the most tokens a millisecond when that beats a round without drafts by `MAYA_DS4_MULTI_DRAFT_MARGIN`
+  (0.03), else the round is a token of each. With four at once that may be three drafting 4 each in one pass, two
+  drafting 5, one, or none. A request the plan leaves out drafts once every `MAYA_DS4_MULTI_DRAFT_RETRY` rounds (8)
+  anyway, the gap doubling to `MAYA_DS4_MULTI_DRAFT_PROBE_CAP` (128) while those probes do not get it into the plan,
+  so its acceptance stays measured; a new request starts from the engine's recent averages. Until the engine has
+  timed two window sizes and a drafter call, and always with `MAYA_DS4_MULTI_DRAFT_POLICY=0`, every request drafts
+  its share of the window where their drafters fit one pass, and none drafts where they do not (four with DSpark's
+  block: a drafter pass each cost more than the drafts won). Greedy, which requests draft changes only how many
+  tokens a round takes, not which. `MAYA_DS4_MULTI_DRAFT_LOG=1` writes a line on stderr for each round of several
+  (each request's drafts kept / offered, the drafter's and the round's time, the tokens, against what the plan
+  expected) and each request's averages as it ends. `--multi-check` holds the experts where the load put them for the
+  whole check (the expert cache neither switches nor moves one), so its runs alone and together meet the same
+  placement - an expert the cache moved between the GPU and the CPU lane in between would round differently - and
+  drafts its last phase in passes as the server does.
 - **Agents** (several tool-using conversations, long prompts): a turn's first token comes sooner - the requests no
   longer wait in line for a whole answer, nor for a whole prompt read.
 
