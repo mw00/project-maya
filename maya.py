@@ -3302,7 +3302,8 @@ def add_profile(cfg: dict) -> bool:
     if (not isinstance(args, list) or not any(f in args[:-1] for f in ("--glm-pack", "--gguf"))
             or "--expert-profile" in args or not PROFILE.exists()):
         return False
-    if not profile_fits(flag_value(args, "--glm-pack")):
+    pack = flag_value(args, "--glm-pack")              # (a Metal config has no pack: --gguf names the model file)
+    if pack is not None and not profile_fits(pack):
         return False
     args += ["--expert-profile", str(PROFILE)]
     return True
