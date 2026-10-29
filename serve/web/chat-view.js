@@ -1,6 +1,6 @@
 // serve/web/chat-view.js - the chat: its header (the model menu, the context meter, the chat's ⋯ menu), the messages
 // (an answer is painted in place while it streams), the message box with its thinking speedometer, and a new chat's
-// greeting with ideas to start from.
+// greeting: the model that answers it and the chats to pick up again.
 import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
 import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, relTime, timeStr, tokfmt} from "./lib.js";
 import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkTitles} from "./state.js";
@@ -45,17 +45,18 @@ function ModelMenu({open, close, anchor}) {
   <//>`;
 }
 
-function Header() {
+// (empty: a new chat - its model card says which model answers, so no model button or context meter up here)
+function Header({empty}) {
   const [model, setModel] = useState(false), [opts, setOpts] = useState(false);
   const mBtn = useRef(null), oBtn = useRef(null);
   const name = modelName(S.health.model, true);   // (the short form here: "Qwen-3.8-Flash-Next"; the menu's line below it has the full one)
   if (isPhone()) {
     return html`<header class="chat-head chat-head--float">
       <button type="button" class="glass-btn" aria-label="Chats" onClick=${() => { S.drawer = true; emit(); }}><${Icon} name="menu"/></button>
-      <button type="button" ref=${mBtn} class="model-btn model-btn--phone" aria-haspopup="menu" aria-expanded=${String(model)}
-        onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>
+      ${empty ? html`<span></span>` : html`<button type="button" ref=${mBtn} class="model-btn model-btn--phone" aria-haspopup="menu" aria-expanded=${String(model)}
+        onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>`}
       <button type="button" class="glass-btn" aria-label="New chat" onClick=${newChat}><${Icon} name="new-chat"/></button>
-      <${ModelMenu} open=${model} close=${() => setModel(false)} anchor=${mBtn}/>
+      ${empty ? null : html`<${ModelMenu} open=${model} close=${() => setModel(false)} anchor=${mBtn}/>`}
     </header>`;
   }
   return html`<header class="chat-head">
@@ -63,14 +64,14 @@ function Header() {
       ${S.sideOpen ? null : html`
         <button type="button" class="icon-btn" aria-label="Open the sidebar" title="Open the sidebar" onClick=${() => setSide(true)}><${Icon} name="panel-left"/></button>
         <button type="button" class="icon-btn" aria-label="New chat" title="New chat" onClick=${newChat}><${Icon} name="new-chat"/></button>`}
-      <span class="anchor">
+      ${empty ? null : html`<span class="anchor">
         <button type="button" ref=${mBtn} class=${`model-btn${model ? " is-open" : ""}`} aria-haspopup="menu" aria-expanded=${String(model)}
           title=${S.health.model} onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>
         <${ModelMenu} open=${model} close=${() => setModel(false)} anchor=${mBtn}/>
-      </span>
+      </span>`}
     </div>
     <div class="chat-head__right">
-      <${Meter}/>
+      ${empty ? null : html`<${Meter}/>`}
       <span class="anchor">
         <button type="button" ref=${oBtn} class="icon-btn" aria-label="Chat options" title="Chat options" aria-haspopup="menu"
           aria-expanded=${String(opts)} onClick=${() => setOpts(!opts)}><${Icon} name="ellipsis"/></button>
@@ -363,19 +364,7 @@ function note() {
                                        : "Runs on this machine. Nothing leaves it.";
 }
 
-// ------------------------------------------------------------------ a new chat's greeting
-const IDEAS = [
-  {icon: "box", label: "A three.js scene in one HTML file",
-   q: "Write a single-file HTML page with a three.js scene: a slowly rotating, softly lit crystal on a dark background, with orbit controls."},
-  {icon: "code", label: "Explain and improve some code",
-   q: "Explain step by step what this code does, then suggest two improvements:\n\n```\n\n```"},
-  {icon: "tool", label: "Plan and write a small tool",
-   q: "Plan a small Python command-line tool that renames photos by the date they were taken. List the steps, then write it."},
-  {icon: "thinking", label: "Explain a topic clearly",
-   q: "Summarize the key ideas of mixture-of-experts language models for a curious engineer, in five short paragraphs."},
-];
-const useIdea = (q) => { S.draft = q; emit(); updateCtxMeter(); focusInput(); };
-
+// ------------------------------------------------------------------ a new chat: the model, the box, the chats to pick up
 // the model that answers here: ready or busy, its context, the last answer's speed, images, what it saved - and the Models
 // page, to switch to another
 function ModelCard() {
@@ -402,26 +391,24 @@ function recentChats() {
   return S.chats.filter((c) => c !== S.current && c.messages.length)
     .sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, 3);
 }
-function Recent({list}) {
+function Recent() {
+  const list = recentChats();
   const folder = (c) => (c.folder && (S.folders.find((f) => f.id === c.folder) || {}).name) || "";
   return html`<section class="recent" aria-labelledby="recent-title"><h2 id="recent-title">Pick up where you left off</h2>
-    <div class="recent__list">${list.map((c) => html`<button type="button" class="recent__chat" key=${c.id} onClick=${() => openChat(c)}>
+    ${list.length ? html`<div class="recent__list">${list.map((c) => html`<button type="button" class="recent__chat" key=${c.id} onClick=${() => openChat(c)}>
       <span class="recent__meta"><${Icon} name=${folder(c) ? "folder" : "chat"} sm/><span>${[folder(c), relTime(c.updated)].filter(Boolean).join(" · ")}</span></span>
-      <b>${chatTitle(c)}</b></button>`)}</div></section>`;
+      <b>${chatTitle(c)}</b></button>`)}</div>`
+      : html`<p class="recent__none"><${Icon} name="chat" sm/><span>Your last three chats show here. They stay in this browser.</span></p>`}
+  </section>`;
 }
 
-// a new chat: what are we building, the model that answers it, the box, and the chats to pick up again - before there are
-// any, ideas to start from
+// a new chat: what are we building, the model that answers it, the box, and the chats to pick up again
 function Greeting({phone}) {
-  const recent = recentChats();
   return html`<div class=${`greeting${phone ? " greeting--phone" : ""}`}>
     <h1>What are we building today?</h1>
     <${ModelCard}/>
     ${phone ? null : html`<${Composer} center/>`}
-    ${recent.length ? html`<${Recent} list=${recent}/>` : html`<div class="ideas" role="list" aria-label="Ideas to start with">
-      ${IDEAS.map((it) => html`<div role="listitem"><button type="button" class="idea" onClick=${() => useIdea(it.q)}>
-        <${Icon} name=${it.icon}/><span>${it.label}</span></button></div>`)}
-    </div>`}
+    <${Recent}/>
   </div>`;
 }
 
@@ -481,7 +468,7 @@ export function ChatPage() {
     onDragOver=${(e) => { if (!files(e)) return; e.preventDefault(); setDrop(true); }}
     onDragLeave=${(e) => { if (e.target === e.currentTarget || !e.currentTarget.contains(e.relatedTarget)) setDrop(false); }}
     onDrop=${(e) => { setDrop(false); if (!e.dataTransfer || !e.dataTransfer.files.length) return; e.preventDefault(); addFiles(e.dataTransfer.files); focusInput(); }}>
-    <${Header}/>
+    <${Header} empty=${empty}/>
     <div class="chat__scroll" ref=${scroller} onScroll=${onScroll}>
       ${empty ? html`<${Greeting} phone=${phone}/>` : html`<${Thread}/>`}
     </div>
