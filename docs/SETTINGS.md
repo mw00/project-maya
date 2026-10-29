@@ -996,6 +996,17 @@ difference fails the start); `ds4_gguf_test --trims` checks every mode.
 | `MAYA_DS4_Q8_SHARE` | on | `0`: each job rounds its own input, even one another job of the call reads (the same bits either way); both `0`: as before |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched, shared rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: tensor-parallel layers without the host
+
+A decoded layer whose routed experts are all in VRAM skips the host (no mailbox, no wait) when it runs on one GPU.
+With `MAYA_DS4_HOST_FREE_TP=1` a tensor-parallel group's layer with every expert in its members' VRAM does the same:
+nothing of it is on the CPU lane, and otherwise the lead's round trip through the host delays every member at the
+next all-reduce. The tokens are the same either way.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_HOST_FREE_TP` | off | `1`: a tensor-parallel group's layer with every expert in VRAM decodes without the host, as a one-GPU layer does (the same tokens) |
+
 ## DeepSeek: a decoded token's small launches fused
 
 A decoded token runs a few launches a layer that do almost nothing: the HC split (one warp) and its pre-norm (one
