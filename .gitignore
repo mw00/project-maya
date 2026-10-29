@@ -42,6 +42,7 @@ td.log
 /run-maya-*.sh
 /run-maya-*.bat
 /maya-report.txt
+/maya-bench.txt
 /build-strata.bat
 /build-maya*.bat
 

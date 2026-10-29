@@ -207,6 +207,32 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(env["ROCM_PATH"], str(self.rocm))
         self.assertEqual(meta["backend"], "hip")
 
+    def test_refresh_compiles_a_target_the_new_source_has_not_built(self):
+        # #664: after a git pull, starting GLM compiled build-hip/maya and stamped the new source with targets
+        # ["maya"]; the DeepSeek setup's next start found that source in the stamp and ran the old maya-ds4.
+        build = self.root / "build-hip"
+        build.mkdir()
+        (self.root / "llama/ggml").mkdir(parents=True)
+        (self.root / "llama/ggml/CMakeLists.txt").touch()
+        stamp = {"backend": "hip", "src": "new-sha", "archs": ["gfx1151"], "rocm": str(self.rocm),
+                 "llama": str(self.root / "llama"), "targets": ["maya"]}
+        cfg = {"exe": str(build / "maya-ds4"), "backend": "hip", "gpu": [0]}
+        with patch.object(maya, "EXE", build / "maya"), patch.object(maya, "DS4_EXE", build / "maya-ds4"), \
+                patch.object(maya, "MM3_EXE", build / "maya-mm3"), \
+                patch.object(maya, "STAMP", build / "MAYA-BUILD.json"), \
+                patch.object(maya.S, "source_hash", return_value="new-sha"), \
+                patch.object(maya, "hip_clang", return_value=self.rocm / "llvm/bin/clang++"), \
+                patch.object(maya, "compile_engine_hip") as compile_hip:
+            maya.STAMP.write_text(json.dumps(stamp))
+            maya.refresh_engine(cfg)
+            compile_hip.assert_called_once()
+            self.assertEqual(compile_hip.call_args.kwargs["target"], "maya-ds4")
+            compile_hip.reset_mock()
+            stamp["targets"] = ["maya", "maya-ds4"]
+            maya.STAMP.write_text(json.dumps(stamp))
+            maya.refresh_engine(cfg)                    # compiled from this source already: nothing to do
+            compile_hip.assert_not_called()
+
     def test_hip_skips_vision_without_downloading(self):
         with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):
             self.assertIsNone(maya.vision_step(self.a, {"backend": "hip"}, {}, self.root, self.root, "test"))
