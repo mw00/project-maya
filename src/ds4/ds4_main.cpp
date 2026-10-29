@@ -577,6 +577,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::getenv("STRATA_DS4_SLOT_KEEP") != nullptr && std::atoi(std::getenv("STRATA_DS4_SLOT_KEEP")) != 0;
     int slot_max = slot_keep ? std::max(0, (int) env_num("STRATA_DS4_SLOT_CAP", 4)) : 0;
     const size_t slot_min = (size_t) std::max(1.0, env_num("STRATA_DS4_SLOT_MIN", 1024));
+    m.set_turn_checks((int) env_num("STRATA_DS4_CKPTS", 16));   // (16; 0 off, at most 64: Model::set_turn_checks)
     const double slot_days = env_num("STRATA_DS4_SLOT_DAYS", 7);
     const uint64_t slot_budget = (uint64_t) (env_num("STRATA_DS4_SLOT_GB", 16) * 1073741824.0);
     const uint64_t slot_ram_budget = [] {
@@ -659,7 +660,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) m.max_context())
             return false;
         toks.resize(nt);
-        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 3)
+        if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) ||
+            nc > 3 + (uint64_t) strata::ds4::kMaxTurnChecks)
             return false;
         cks.resize(nc);
         if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t))) || !f.read((char*) &np, 8)) return false;
@@ -1211,7 +1213,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         // a STOP while the prompt is read ends it there (the engine's run of chunks at a layer or chunk, windows between
         // feeds) and goes back to the state before this prompt - kept here first, in checkpoint 1, which the prompt's
         // own end overwrites as before - so the next request still shares the conversation up to it
-        if (from > 0 && from < total) m.checkpoint(1);
+        if (from > 0 && from < total) {
+            m.checkpoint(1);
+            m.keep_turn();   // (and as this turn's start: an edit of this prompt reads on from here)
+        }
         m.set_cancel(stop_now);
         bool stopped = false;
         while (ok && done < total) {

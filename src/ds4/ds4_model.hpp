@@ -20,6 +20,9 @@
 
 namespace strata::ds4 {
 
+/// The most turns' checkpoints a conversation keeps (Model::set_turn_checks; a slot's .meta lists them beside the other 3).
+inline constexpr int kMaxTurnChecks = 64;
+
 struct Options {
     std::string pack;                 // <model>/maya-ds4
     int64_t max_context = 32768;
@@ -222,6 +225,13 @@ public:
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
     /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
     void pin();
+    /// The turns' checkpoints a conversation keeps (clamped to 0..kMaxTurnChecks; 0: none): the state where a turn
+    /// starts, so an edited message, or a client that goes back some turns, reads on from the latest one it still
+    /// agrees with.  A prompt read in a run of chunks keeps one before each user or tool-result message inside it, on
+    /// the way (not with the long-prompt skip); keep_turn() keeps the current position as one (call it where a prompt
+    /// that reads on from an earlier one starts).  ~3 MB each with Maya-S: the window rings, the compressors' groups.
+    void set_turn_checks(int cap);
+    void keep_turn();
     /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
     std::vector<int64_t> check_positions() const;
 
