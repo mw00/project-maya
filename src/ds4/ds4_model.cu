@@ -5304,7 +5304,8 @@ struct Model::Impl {
     // a chunk of T rows streams a layer's CPU-lane experts once its routing is known, only those its rows picked (the
     // same slots, batches and summing order: an expert no row picked adds nothing) - instead of every one, queued ahead
     // across layers: where a chunk picks few of them its streams are that much shorter, where it picks most the copies
-    // waiting for each layer's routing cost more than the few skipped save.  An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5
+    // waiting for each layer's routing cost more than the few skipped save (unless its ring holds too little to queue
+    // much ahead: run_dev_chunks).  An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5
     // bpw, two thirds of the experts on the CPU lane, one chunk of 530 tokens: 4.6-4.9 s -> 3.7-3.8 s, 1,040: about
     // the same, 2,050: 6.0-6.3 -> 6.7 s.  CUDA: chunks up to DS4_SKIP_UNPICKED_ROWS (1536); DS4_SKIP_UNPICKED=1 every
     // chunk, 0 none (HIP: none unless DS4_SKIP_UNPICKED=1, as before)
@@ -17123,8 +17124,15 @@ struct Model::Impl {
             }
             if (c.lm) return run_dev_layers(di, run, err, stream_start);
         }
+        // (a device whose ring holds less than half a layer of its CPU-lane experts queues next to nothing ahead of a
+        //  layer's routing anyway: every chunk of it skips - an RTX 3090's 400 MB, 17 of its ~210 a layer)
+        size_t cold = 0, n_l = 0;
+        for (const Layer& l0 : L)
+            for (int m = 0; m < l0.nm && !l0.mtp; ++m)
+                if (member(l0, m).dev == di) cold += l0.host_list.size(), ++n_l;
+        const bool shallow = skip_unpicked_rows() > 0 && n_l > 0 && (size_t) c.ring_n * 2 * n_l < cold;
         S.skip_k.assign((size_t) nk, 0);
-        for (int k = 0; k < nk && !c.flow; ++k) S.skip_k[(size_t) k] = run.T[(size_t) k] <= skip_unpicked_rows();
+        for (int k = 0; k < nk && !c.flow; ++k) S.skip_k[(size_t) k] = shallow || run.T[(size_t) k] <= skip_unpicked_rows();
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
                 if (!run.runs(k, il) || run.kv_only(k, il)) continue;   // (a long prompt's skip: no experts there)
