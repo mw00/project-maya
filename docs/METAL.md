@@ -4,9 +4,15 @@ Back to the [README](../README.md).
 
 Experimental: GLM-5.3-Flash on a Mac with Apple Silicon, on its GPU through Metal, with the same dashboard and the same
 OpenAI- and Anthropic-compatible API as on Linux and Windows (streamed answers, tool calls, thinking levels). It reads
-pictures (`maya-vision`, the image encoder, runs on the GPU too: about 0.15 s an image on an M4 Max), and it drafts
+pictures (`maya-vision`, the image encoder, runs on the GPU too), and it drafts
 with the model's MTP block or the DFlash2 drafter (`--draft dflash2`) when that is faster on the Mac. One conversation at a time;
-DeepSeek-V4.1-Flash is NVIDIA / AMD only for now.
+DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash and Qwen-3.8-Flash-Next are NVIDIA / AMD only for now.
+
+**Status: experimental.** Mac support is a community contribution. Every change is built and unit-tested on GitHub's
+Apple Silicon runners (the `macos` workflow: the engine, its sampler and the small synthetic-model tests), but the
+Maya team has no Mac and has not run it with the real model. If you try it on a Mac, please tell us how it went in a
+[GitHub issue](https://github.com/mw00/project-maya/issues): the chip and its unified memory, the model, the speed
+`./maya.sh --bench` prints, and anything that went wrong (`./maya.sh --report` collects the details).
 
 ```sh
 ./maya.sh --backend metal --check            # this Mac: chip, unified memory, Xcode's compiler, CMake
@@ -35,28 +41,18 @@ What is Maya's own is the memory plan. A Mac has one pool of unified memory, usu
   recently used experts make room. At start the pool is filled from this Mac's own expert profile, which the engine
   learns from every request (`expert-profile.bin` beside the model), or from the shipped one
   (`data/expert-profile-glm.bin`) the first time.
-- The GPU never pages model data in from the file: on an M4 Max that measured 12-29 MB/s, against 5+ GB/s for
-  parallel reads into the pool.
+- The GPU never pages model data in from the file: that is far slower than the engine's parallel reads into the
+  pool.
 
 On a Mac with less unified memory than the model, decode speed depends on how many experts a token needs that are
 not resident, and so on the SSD.
 
 ## Speed
 
-Maya-S (96.5 GB) on a MacBook Pro with an M4 Max (40-core GPU, 64 GB), context 32768, `./maya.sh --bench`:
-
-| | |
-| --- | --- |
-| decode (writing the answer) | 7.5 tokens/s (6.5 / 8.7 / 7.4 over the three bench questions, 256 tokens each) |
-| prefill (reading the prompt) | 31 tokens/s at 2048 tokens, 30 at 8192 |
-| load | about 20 s |
-| image (maya-vision, 448 px) | 0.11-0.16 s, 256 image tokens |
-
-On 64 GB about 41 GB of the experts stay in memory and the rest come from the SSD as a conversation needs them
-(about 80 % of the experts a token routes to are resident; the reads run at 5+ GB/s). Decode is bound by those reads,
-not by the GPU: on this Mac MTP and DFlash2 write the same tokens no faster (MTP 6.9 tokens/s, DFlash2 7.3, plain 7.3
-over 128 tokens), so MTP is off when experts stream. A Mac that holds every expert (128 GB and more) decodes from
-memory, where drafting pays.
+Not measured by the Maya team yet (no Mac): your `./maya.sh --bench` numbers are welcome in an issue. What to expect:
+with less unified memory than the model, part of the experts come from the SSD as a conversation needs them, and decode
+is bound by those reads rather than by the GPU - so MTP drafting is off then (`MAYA_GLM_MTP_DECODE=1` turns it on). A
+Mac that holds every expert (128 GB and more for the smaller quants) decodes from memory, where drafting pays.
 
 The pool takes no more than the Mac has free when Maya starts, less `MAYA_GLM_RAM_HEADROOM_GB` (6 GB): unified memory
 is shared with every other program, and a pool past it would be swapped (a slice that reads swapped experts stalls
@@ -86,7 +82,8 @@ another path the second time (a prefix-cache hit after a cold prompt, say). `MAY
 ## Accuracy
 
 The engine holds the CUDA engine's GLM parity gates (`src/core/glm_model_test.cpp`, `glm_model_big_test.cpp`) on the
-Metal GPU (`ctest` in a Metal build):
+Metal GPU (`ctest` in a Metal build; the figures below are from the contributor's Mac - GitHub's runners repeat the
+small fixture's tests on every change):
 
 | Test | Gate | maya-metal |
 | --- | --- | --- |

@@ -234,6 +234,8 @@ The setup shows every download before it starts it, builds everything once (20-4
 - **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
 - **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
 - **Mac with Apple Silicon (experimental, GLM-5.3-Flash):** `./maya.sh --backend metal` - see [docs/METAL.md](docs/METAL.md).
+  Built and unit-tested on GitHub's Macs, not yet tested by us with the real model (we have no Mac): if you run it,
+  please tell us how it went in an issue.
 - **Intel Arc:** not supported by Maya's engine; a community report of the Maya-XS DeepSeek GGUFs on llama.cpp's SYCL backend: [docs/INTEL_ARC.md](docs/INTEL_ARC.md).
 - **Updating:** the page's **Settings › About and updates**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
 - **Model files downloaded another way** (a download manager, another PC, a Hugging Face cache): `./maya.sh --import-model FOLDER`
