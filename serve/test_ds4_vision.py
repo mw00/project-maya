@@ -74,7 +74,7 @@ class Template(unittest.TestCase):
     def setUp(self):
         import sys
         sys.path.insert(0, str(ROOT / "tools"))
-        import strata_tokenizer as ST
+        import maya_tokenizer as ST
         from serve.frontend import ChatTemplate
         self.tok = ST.Tokenizer.from_dir(PACK)
         self.tpl = ChatTemplate(TEMPLATE)

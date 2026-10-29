@@ -168,7 +168,7 @@ def main() -> int:
         print(f"{a.exe}: no engine", flush=True)
         return 2
     try:
-        from strata_tokenizer import Tokenizer
+        from maya_tokenizer import Tokenizer
     except ImportError as e:
         print(f"the tokenizer cannot be imported: {e}", flush=True)
         return 2

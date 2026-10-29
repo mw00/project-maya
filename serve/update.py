@@ -139,17 +139,18 @@ class Updater:
     # ---------------------------------------------------------------- the update itself
     def start(self, svc) -> dict:
         """Update to the latest release on a thread (after the request in flight; new requests get a 503 meanwhile)."""
-        if not self.newer():
-            raise ValueError("this is the latest version")
-        why = self.blocker()
-        if why:
-            raise ValueError(f"Maya can't update itself here: {why}")
-        if self.busy():
-            raise ValueError("an update is already running")
-        self.state = {"state": "updating", "to": self.latest["version"], "started": time.time(), "error": None}
-        self.thread = threading.Thread(target=self._update, args=(svc, self.latest["tag"]), daemon=True)
-        self.thread.start()
-        return dict(self.state)
+        with self.lock:                                 # two clicks: one update
+            if not self.newer():
+                raise ValueError("this is the latest version")
+            why = self.blocker()
+            if why:
+                raise ValueError(f"Maya can't update itself here: {why}")
+            if self.busy():
+                raise ValueError("an update is already running")
+            self.state = {"state": "updating", "to": self.latest["version"], "started": time.time(), "error": None}
+            self.thread = threading.Thread(target=self._update, args=(svc, self.latest["tag"]), daemon=True)
+            self.thread.start()
+            return dict(self.state)
 
     def _update(self, svc, tag: str):
         with svc.fifo:                                  # the request in flight finishes first

@@ -227,7 +227,7 @@ def main() -> int:
     ap.add_argument("--from", dest="start", default="", help='--trace: the window\'s start, "MM-DD HH:MM" (default: busiest)')
     a = ap.parse_args()
     try:
-        from strata_tokenizer import Tokenizer
+        from maya_tokenizer import Tokenizer
         tok = Tokenizer.from_dir(os.path.join(a.pack, "tokenizer"))
     except Exception as e:  # noqa: BLE001
         print(f"{os.path.join(a.pack, 'tokenizer')}: no tokenizer (the prompts are real text): {e}", flush=True)

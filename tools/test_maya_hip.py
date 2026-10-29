@@ -303,7 +303,7 @@ class HipSetupTests(unittest.TestCase):
         tok = MagicMock()
         tok.encode.return_value = list(range(9000))
         # Exercise the real server's engine_args/child_env without optional tokenizer/template packages.
-        modules = {"strata_tokenizer": SimpleNamespace(Tokenizer=SimpleNamespace(from_dir=MagicMock(return_value=tok))),
+        modules = {"maya_tokenizer": SimpleNamespace(Tokenizer=SimpleNamespace(from_dir=MagicMock(return_value=tok))),
                    "serve.frontend": MagicMock()}
         with patch("urllib.request.urlopen", side_effect=OSError("no server")), \
                 patch.dict(sys.modules, modules), \
@@ -540,6 +540,7 @@ class HipSetupTests(unittest.TestCase):
                 patch.object(sys, "argv", ["maya.py", "--check"]), \
                 patch.object(maya.S, "gpus", return_value=nvidia), \
                 patch.object(maya.S, "amd_gpus", return_value=amd), \
+             patch.object(maya, "apple_silicon", return_value=False), \
                 patch.object(maya, "check_pc", return_value={"gpus": [{"index": 0}]}) as check:
             self.assertEqual(maya.main(), 0)
         return check.call_args.args[0].backend

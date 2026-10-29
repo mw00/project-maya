@@ -2,7 +2,8 @@
 """Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
 (CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, text only.
 GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
-validated), Linux and Windows, text only.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
+validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
+one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
 and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
 The quants are named model first, then the tier by the experts' bits (XS, S, M, L): --model glm-maya-s,
 deepseek-maya-xs, minimax-maya-xs ... (tools/maya_quants.py); every name used before still works.
@@ -63,6 +64,7 @@ import argparse
 import json
 import math
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -592,7 +594,7 @@ DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211,
 MM3 = "MiniMax-M3.1-Flash"
 MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
 MM3_MANIFEST = ROOT / "tools" / "mm3" / "download.json"
-MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenizer.py", "tools/mm3/chat_template.jinja")
+MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/maya_tokenizer.py", "tools/mm3/chat_template.jinja")
 MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
 # Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
 # Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
@@ -666,7 +668,7 @@ MM3_GGUF_MIN_CC = 70                               # (maya-ds4's GGUF kernels' r
 QWEN = "CYBER-FROST-3.8-PS"                        # (its id: the folder, the installer record, --model; never shown)
 QWEN_SHOWN = Q.SHOWN["qwen"]                       # (its name on screen: "Qwen-3.8-Flash-Next (CYBER-FROST)")
 QWEN_MANIFEST = ROOT / "tools" / "qwen" / "download.json"
-QWEN_PACK_TOOLS = ("tools/iq_pack.py", "tools/strata_tokenizer.py", "tools/mtp_from_gguf.py", "tools/mtp_rt.py")
+QWEN_PACK_TOOLS = ("tools/iq_pack.py", "tools/maya_tokenizer.py", "tools/mtp_from_gguf.py", "tools/mtp_rt.py")
 QWEN_MODEL_NAME = "cyber-frost-3.8-ps"
 QWEN_SAMPLING, QWEN_EFFORT = Q.MODEL_DEFAULTS["qwen"]   # (its card's; its template's default level: Qwen's "xhigh")
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]     # (the model's native reach: 256K)
@@ -742,6 +744,11 @@ def mem_gb() -> tuple:
     if WIN:
         m = S._memory_status()
         return m.ullTotalPhys / 2**30, m.ullAvailPhys / 2**30
+    if sys.platform == "darwin":             # free + inactive + speculative pages: what a new program can take
+        vm, total = S.out(["vm_stat"]), S.out(["sysctl", "-n", "hw.memsize"]).strip()
+        page = re.search(r"page size of (\d+) bytes", vm)
+        pages = sum(int(n) for n in re.findall(r"^Pages (?:free|inactive|speculative):\s+(\d+)", vm, re.M))
+        return int(total or 0) / 2**30, pages * int(page.group(1) if page else 0) / 2**30
     info = {}
     try:
         with open("/proc/meminfo") as f:
@@ -752,6 +759,19 @@ def mem_gb() -> tuple:
         pass
     avail = info.get("MemAvailable", 0.0)
     return info.get("MemTotal", 0.0), avail + zfs_arc_gb() if avail > 0 else avail
+
+
+def apple_silicon() -> bool:
+    """macOS on an M-series Mac: the machine of the Metal backend."""
+    return platform.system() == "Darwin" and platform.machine() == "arm64"
+
+
+def metal_gpus() -> list:
+    """The Mac's one GPU, which shares its unified memory with the CPU.
+    shortcut: 85% of the RAM stands for what Metal lets a program use (MTLDevice.recommendedMaxWorkingSetSize), the
+    real figure is not asked - ask the engine for it if the estimate misleads."""
+    return [{"index": 0, "name": S.out(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or "Apple GPU",
+             "vram_gb": 0.85 * mem_gb()[0], "vendor": "apple"}]
 
 
 def existing(path: Path) -> Path:
@@ -864,8 +884,8 @@ def fix_config_names(cfg: dict) -> bool:
 def select_build_backend(backend: str) -> None:
     """Separate build folders and stamps prevent reusing a binary from the other backend."""
     global BUILD, EXE, STAMP, DS4_EXE, MM3_EXE
-    BUILD = ROOT / ("build-hip" if backend == "hip" else "build")
-    EXE = BUILD / ("maya.exe" if WIN else "maya")
+    BUILD = ROOT / {"hip": "build-hip", "metal": "build-metal"}.get(backend, "build")
+    EXE = BUILD / ("maya-metal" if backend == "metal" else "maya.exe" if WIN else "maya")
     DS4_EXE = BUILD / ("maya-ds4.exe" if WIN else "maya-ds4")
     MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
     STAMP = BUILD / "MAYA-BUILD.json"
@@ -1180,6 +1200,50 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
             **({"rocm_bin": str(bindir)} if WIN else {})}
 
 
+def check_metal_pc(a) -> dict:
+    """The Metal backend's PC check: macOS on Apple Silicon (its GPU always does Metal), the Xcode command line tools'
+    C++ compiler, CMake, RAM and free disk.  Nothing asks nvidia-smi."""
+    if not apple_silicon():
+        fail("Maya's Metal backend runs on macOS on Apple Silicon (an M-series Mac)",
+             "other PCs: --backend cuda (NVIDIA) or --backend hip (AMD)")
+    if a.gpus or a.gpu is not None:
+        warn("--gpu / --gpus do not apply on a Mac: the one Apple GPU is used")
+    problems = []
+    gpu = metal_gpus()[0]
+    total, avail = mem_gb()
+    ok(f"using {gpu['name']} ({total:.0f} GB unified memory, about {gpu['vram_gb']:.0f} GB of it for the GPU); "
+       "experimental Metal: text only, one conversation at a time")
+    if total < 100:
+        warn(f"the model is about 95-100 GB (Maya-S) and this Mac has {total:.0f} GB of unified memory: the routed experts "
+             "stream from the SSD while it answers, so decode speed is limited by the SSD (an internal NVMe drive)")
+    ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
+    if not S.out(["xcode-select", "-p"]).strip() or not S.out(["xcrun", "--find", "clang++"]).strip():
+        problems.append(("no C++ compiler (the Xcode command line tools)", "xcode-select --install"))
+    else:
+        ok("C++ compiler: " + (S.out(["xcrun", "clang++", "--version"]).splitlines() or ["clang++"])[0])
+    sc = pick_cmake() or shutil.which("cmake")
+    scv = tool_version(sc) if sc else (0, 0)
+    if scv >= (3, 24):
+        ok(f"CMake {scv[0]}.{scv[1]}")
+    else:
+        ok((f"CMake {scv[0]}.{scv[1]} is older than 3.24" if sc else "no CMake on PATH") +
+           ": a current one goes into .venv in step 3 (pip)")
+    ok(f"Python {sys.version.split()[0]} ({sys.prefix})")
+    free = shutil.disk_usage(ROOT).free / 1e9
+    if free < 5:
+        problems.append((f"only {free:.0f} GB free disk in {ROOT}: the engine's build needs a few GB", "free some space"))
+    else:
+        ok(f"free disk: {free:.0f} GB here")
+    if problems:
+        say()
+        for what, how in problems:
+            say(f"  [X] {what}")
+            say(f"      {how}")
+        fail("something Maya needs is missing (above)", f"install it and run {ME} again - the script installs nothing system-wide")
+    select_build_backend("metal")
+    return {"backend": "metal", "gpus": [gpu]}
+
+
 def nvcc_range(archs) -> tuple:
     """The CUDA toolkit versions that can build for these GPUs: (lowest, first too new or None)."""
     lo = (12, 8) if max(archs) >= 100 else (12, 0)  # Blackwell needs 12.8
@@ -1321,12 +1385,18 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
                  f"whole model has not been measured on one - Maya's GGUF quants (--model deepseek-maya-s / "
                  "deepseek-maya-xs) are the tested way there")
         return check_hip_pc(a, text_only=not mm3)
+    if a.backend == "metal":
+        if family != "glm":
+            fail(f"Maya's Metal engine runs GLM-5.3-Flash only (no Metal engine for {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
+                 "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
+        return check_metal_pc(a)
     if ds4 and not gguf and S.ARM:
         # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): this CPU has neither
         fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this ARM CPU does not have",
              f"set up one of Maya's GGUF quants instead: {ME} --setup --model deepseek-maya-s (or deepseek-maya-xs)")
     if not (WIN or sys.platform.startswith("linux")):
-        fail("Project Maya runs on Linux and Windows", "the engine needs an NVIDIA GPU and CUDA")
+        fail("Project Maya runs on Linux and Windows (and on Apple Silicon: --backend metal)",
+             "the engine needs an NVIDIA GPU and CUDA")
     min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
               else QWEN_MIN_CC if family == "qwen" else MIN_CC)
     if WIN:
@@ -1538,7 +1608,7 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
     else asked - the earlier setup's answer is the default.  AMD (HIP) setups keep MTP: DFlash2 is measured on NVIDIA.
     So do NVIDIA GPUs before sm_80 (RTX 30 / A100): on Tesla V100s DFlash2 decoded slower than the MTP block (one GPU
     and two).  A DFlash2 answer is then checked on this PC by the speed calibration (speed_calibration): it stays only
-    where it is faster."""
+    where it is faster.  On Metal both are exact and neither is measured: MTP is the default, the choice is yours."""
     if getattr(a, "draft", None):
         return a.draft
     if pc.get("backend") == "hip":
@@ -1546,15 +1616,16 @@ def choose_draft(a, pc: dict, inst: dict) -> str:
     if pc.get("archs") and min(int(x) for x in pc["archs"]) < 80:
         return "mtp"
     default = inst.get("draft") if inst.get("draft") in DRAFTS else "mtp"
+    metal = pc.get("backend") == "metal"
     rows = [("the model's MTP block", "default",
-             "The model's own draft block guesses the next token, which the model then checks. On two GPUs or "
-             "more; one GPU decodes without drafting."),
+             "The model's own draft block guesses the next token, which the model then checks." +
+             ("" if metal else " On two GPUs or more; one GPU decodes without drafting.")),
             (f"a DFlash2 drafter (download {DFLASH['bytes'] / 1e9:.1f} GB from Hugging Face)", None,
              "A small drafter made for GLM-5.3-Flash drafts up to 7 tokens a round, which the model then checks: the "
-             "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one "
-             "RTX 3090. A speed calibration then measures it against the MTP block on this PC (5-20 minutes) and "
-             "keeps it only if it is faster here. The drafter's license is "
-             f"{DFLASH['license']}: non-commercial use only.")]
+             + ("same answers either way. Not measured on a Mac: which one is faster is yours to try. " if metal else
+             "same answers, faster. Maya-L: +44% on nine GPUs and +12% on two against the MTP block, +19% on one RTX 3090. A speed "
+             "calibration then measures it against the MTP block on this PC (5-20 minutes) and keeps it only if it "
+             "is faster here. ") + f"The drafter's license is {DFLASH['license']}: non-commercial use only.")]
     pick = choose("Drafting?", ["How the model drafts tokens ahead (the answers are the same either way):"], rows,
                   DRAFTS.index(default), a.yes)
     return DRAFTS[pick]
@@ -1585,7 +1656,7 @@ def choose_family(a, prev: dict) -> str:
     is the default."""
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else "glm"
-    if a.gguf_dir or a.draft:
+    if a.gguf_dir or a.draft or (a.backend == "metal" and not a.model_dir):     # (Metal runs GLM only: no question)
         return "glm"
     if a.model_dir:                                    # (an EXL3 folder of GLM or MiniMax; else DeepSeek's files)
         return exl3_folder_family(a.model_dir) or "deepseek"
@@ -1636,8 +1707,11 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
             fail(why, "--gguf-dir takes the folder that holds the GLM-5.3-Flash .gguf files, or the (first) .gguf file")
         return "local", first
     if a.model:
+        if a.backend == "metal" and is_exl3(a.model):
+            fail(f"{a.model} runs on NVIDIA GPUs only", f"a GGUF quant runs on Metal: {ME} --setup --model {next(iter(MODELS))}")
         return "download", a.model
-    opts = [q for q in MODELS if q not in MODELS_BY_HAND or q == inst.get("quant")]   # (a chosen-by-hand download: only where it is installed)
+    opts = [q for q in MODELS if (q not in MODELS_BY_HAND or q == inst.get("quant"))
+            and not (a.backend == "metal" and is_exl3(q))]   # (a chosen-by-hand download: only where it is installed)
     # cards of 24 GB or less: Maya-S24 (its 4-bit attention leaves ~1.5 GB more of the card for experts - decode about
     # 14% faster there), else Maya-S
     try:
@@ -1960,11 +2034,43 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     return meta
 
 
+def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
+    """`maya-metal` (GLM-5.3-Flash on ggml's Metal backend) in build-metal/; the commands are printed as they run.
+    soft: a failure warns and returns None (the engine compiled before keeps working) instead of stopping."""
+    cmake = pick_cmake()
+    if cmake is None:
+        fail("CMake 3.24 or newer is needed", f"pip installs one into .venv: run {ME} --setup")
+    gen = cached_generator()
+    ninja = venv_tool("ninja") or shutil.which("ninja")
+    conf = [cmake]
+    if ninja and gen in (None, "Ninja"):
+        conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
+    conf += ["-S", str(ROOT), "-B", str(BUILD), "-DMAYA_ENABLE_METAL=ON", "-DMAYA_METAL_TESTS=OFF",
+             f"-DMAYA_GGML_DIR={llama}", "-DCMAKE_BUILD_TYPE=Release"]
+    say("  Compiling Maya for Apple Silicon (Metal) ... (a few minutes first time)")
+    if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "maya-metal", "-j", str(os.cpu_count() or 4)],
+                   dict(os.environ), ""):
+        if soft:
+            warn("the Metal engine's rebuild failed; starting the previous engine")
+            return None
+        fail("the Metal engine build failed", "see the compiler output above (no compiler: xcode-select --install)")
+    meta = {"backend": "metal", "src": src, "llama": str(llama), "version": maya_version(),
+            "date": time.strftime("%Y-%m-%d %H:%M"), "targets": ["maya-metal"]}
+    STAMP.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+    ok(f"engine compiled: {EXE}")
+    return meta
+
+
 def build_step(a, pc, llama: Path, target: str = "maya") -> dict:
     step(4, "the engine")
     src = S.source_hash(S.ENGINE_SOURCES)              # src/, include/, third_party/ggml, CMakeLists.txt
     meta = read_json(STAMP)
     exe = exe_for_target(target)
+    if pc.get("backend") == "metal":
+        if exe.exists() and not a.rebuild and meta.get("backend") == "metal" and meta.get("src") == src:
+            ok(f"Metal engine already compiled: {exe}")
+            return meta
+        return compile_engine_metal(llama, src)
     if pc.get("backend") == "hip":
         if (exe.exists() and not a.rebuild and meta.get("backend") == "hip" and meta.get("src") == src
                 and meta.get("archs") == pc["archs"] and meta.get("rocm") == pc["rocm"]
@@ -2006,6 +2112,13 @@ def refresh_engine(cfg: dict) -> None:
         if WIN and meta.get("lib_dirs"):
             pc["rocm_bin"] = meta["lib_dirs"][0]
         compile_engine_hip(pc, llama, src, soft=True, target=target)
+        return
+    if cfg.get("backend") == "metal":
+        llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
+        if not (llama / "ggml/CMakeLists.txt").exists():
+            warn("llama.cpp's source is missing; starting the previous engine")
+            return
+        compile_engine_metal(llama, src, soft=True)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
@@ -2487,7 +2600,9 @@ def offer_download(a, quant: str, d: Path, shards: list, m: dict | None = None) 
             fail(f"{s.name} after the download: {why}", f"delete it and run {ME} --download-model again")
         want = m["sha256"].get(hf_name(m, s))
         if want and not sha256_checked(s, want):
-            fail(f"{s.name}: the sha256 does not match the published one", "delete it and download it again")
+            s.unlink(missing_ok=True)                  # complete by size but damaged: kept, it would pass as done
+            fail(f"{s.name}: the sha256 does not match the published one (the file was removed)",
+                 f"run {ME} --download-model again")
         ok(f"{s.name} downloaded")
     return True
 
@@ -2595,6 +2710,38 @@ def stamp_pack(pack: Path, shards: list) -> None:
         pass
 
 
+def check_sha256(shards: list, quant: str | None) -> None:
+    """The files a pack is built from (or Metal reads): a Maya download's against its published sha256 (once a file - a
+    download is checked as it lands), so a file still being written or damaged stops here, not as garbage answers (#155)."""
+    m = MODELS.get(quant or "") or {}
+    for s in shards:
+        want = (m.get("sha256") or {}).get(hf_name(m, s)) if m else None
+        if want and not sha256_checked(s, want):
+            fail(f"{s.name}: the sha256 does not match the published one - still being downloaded, or damaged",
+                 f"let the download finish, or delete the file and run {ME} --download-model")
+
+
+def metal_tokenizer_step(a, d: Path, shards: list, quant: str) -> Path:
+    """Step 6 on Metal: the engine reads the GGUF files itself (no pack), the server needs the tokenizer and the chat
+    template, exported from the first shard into <model folder>/metal/tokenizer (tools/maya_tokenizer.py)."""
+    step(6, "the tokenizer (Metal reads the GGUF files itself: no pack)")
+    check_sha256(shards, quant)
+    out = d / "metal"
+    vocab = out / "tokenizer" / "vocab.json"
+    if not a.repack and vocab.exists() and vocab.stat().st_mtime >= shards[0].stat().st_mtime:
+        ok(f"tokenizer already exported: {vocab.parent}")
+        return out
+    if not os.access(d, os.W_OK):
+        fail(f"{d} is not writable: the tokenizer is written next to the GGUF files", "pass --gguf-dir with a writable folder")
+    r = run([sys.executable, str(ROOT / "tools" / "maya_tokenizer.py"), "--gguf", str(shards[0]), "--out", str(out)],
+            check=False)
+    if r.returncode != 0 or not vocab.exists():
+        fail(f"the tokenizer could not be exported from {shards[0].name}", "the reason is in the messages above (the "
+             "first file of a GLM-5.3-Flash GGUF carries its tokenizer)")
+    ok(f"tokenizer: {vocab.parent}")
+    return out
+
+
 def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -> Path:
     step(6, "the pack (the engine's index of the model files)")
     if quant is not None and is_exl3(quant):
@@ -2619,14 +2766,7 @@ def pack_step(a, d: Path, shards: list, llama: Path, quant: str | None = None) -
             base_template(pack)
             return pack
         warn(f"the pack is built again: {why}")
-    # the files a pack is built from: a Maya download's against its published sha256 (once a file - a download is
-    # checked as it lands), so a file still being written or damaged stops here, not as garbage answers (#155)
-    m = MODELS.get(quant or "") or {}
-    for s in shards:
-        want = (m.get("sha256") or {}).get(hf_name(m, s)) if m else None
-        if want and not sha256_checked(s, want):
-            fail(f"{s.name}: the sha256 does not match the published one - still being downloaded, or damaged",
-                 f"let the download finish, or delete the file and run {ME} --download-model")
+    check_sha256(shards, quant)
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the pack is written next to the GGUF files (the engine finds them at <pack>/..)",
              "link the .gguf files into a writable folder (" + ("mklink /H DIR\\<file> <file>, for each file" if WIN
@@ -2785,20 +2925,25 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
     conf = [cmake]
     if ninja and (gen is None or gen.group(1).strip() == "Ninja"):
         conf += ["-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}"]
-    archs = meta.get("archs") or pc["archs"]
+    metal = pc.get("backend") == "metal"
+    archs = meta.get("archs") or pc.get("archs") or []
     conf += ["-S", str(ROOT / "tools" / "vision"), "-B", str(VBUILD), "-DCMAKE_BUILD_TYPE=Release",
-             f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=ON",
-             "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
-             f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
-             *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
-    if S.ARM and S.arm_cpu_arch():
-        conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
-    if meta.get("host_compiler"):
+             f"-DLLAMA_DIR={llama}"]
+    if not metal:                                      # (macOS: ggml builds its Metal backend by default, no CUDA)
+        conf += ["-DSTRATA_VISION_CUDA=ON",
+                 "-DCMAKE_CUDA_ARCHITECTURES=" + ";".join(str(x) for x in archs),
+                 f"-DCMAKE_CUDA_COMPILER={meta.get('nvcc') or pc['nvcc']}",
+                 *toolkit_root_defs(meta.get('nvcc') or pc['nvcc'])]
+        if S.ARM and S.arm_cpu_arch():
+            conf.append(f"-DGGML_CPU_ARM_ARCH={S.arm_cpu_arch()}")
+    if meta.get("host_compiler") and not metal:
         conf.append(f"-DCMAKE_CUDA_HOST_COMPILER={shutil.which(meta['host_compiler']) or meta['host_compiler']}")
     jobs = max(2, min((os.cpu_count() or 4) // 2, int(mem_gb()[0] // 4) or 2))
-    say("  Compiling the vision encoder (llama.cpp's image library with ggml's CUDA kernels: 10-20 minutes, once) ...")
-    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)], None,
-                   "build-maya-vision.bat", nvcc=meta.get("nvcc") or pc["nvcc"]):
+    say("  Compiling the vision encoder (llama.cpp's image library with ggml's " +
+        ("Metal backend: a minute or two" if metal else "CUDA kernels: 10-20 minutes") + ", once) ...")
+    if cmake_steps(conf, [cmake, "--build", str(VBUILD), "--target", "maya-vision", "-j", str(jobs)],
+                   dict(os.environ) if metal else None, "" if metal else "build-maya-vision.bat",
+                   nvcc=None if metal else meta.get("nvcc") or pc["nvcc"]):
         return False
     VSTAMP.write_text(json.dumps({"src": src, "archs": archs, "llama": str(llama),
                                   "date": time.strftime("%Y-%m-%d %H:%M")}, indent=1), encoding="utf-8")
@@ -2808,7 +2953,8 @@ def compile_vision(pc, meta, llama: Path, src: str) -> bool:
 def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     """The config's "vision" entry - the image encoder and its files - or None (images off).  The server starts the
     encoder only while a request's new pictures are encoded, in GPU memory the model lends it, and measures on the
-    first start how much that is on this GPU (serve/server.py, vision_footprint)."""
+    first start how much that is on this GPU (serve/server.py, vision_footprint).  On a Mac (Metal: one memory, no
+    lending) it stays resident beside the model."""
     step(7, "images (the vision encoder)")
     if pc.get("backend") == "hip":
         ok("HIP port: text only; vision is not enabled")
@@ -2842,7 +2988,7 @@ def vision_step(a, pc, meta, llama: Path, d: Path, quant: str) -> dict | None:
     src = S.source_hash(("tools/vision",))
     vmeta = read_json(VSTAMP)
     if not (VEXE.exists() and not a.rebuild and vmeta.get("src") == src
-            and set(meta.get("archs") or pc["archs"]) <= set(vmeta.get("archs", []))):
+            and set(meta.get("archs") or pc.get("archs") or []) <= set(vmeta.get("archs", []))):
         if not compile_vision(pc, meta, llama, src):
             warn("the vision encoder did not compile (the reason is above): the model reads text only - "
                  f"{ME} --setup --rebuild tries again")
@@ -2944,9 +3090,10 @@ def glm_sampling(choice: tuple | None, quant: str) -> dict:
 
 
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
-                 choice: tuple | None = None, dflash: Path | None = None) -> Path:
+                 choice: tuple | None = None, dflash: Path | None = None, gguf: Path | None = None) -> Path:
     step(8, "the configuration and the start script")
     port = a.port or 8080
+    metal = pc.get("backend") == "metal"
     # --expert-cache auto: the expert pool takes the VRAM left free less the reserve (--vram-reserve-mib, 700 MiB) and
     # is checked again once written; a number set by hand caps it at that many experts (a setup again keeps it)
     # --prefill auto (as Strata's setup writes it): the engine picks its prompt chunk - the largest its expert pool
@@ -2957,6 +3104,12 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": glm_sampling(choice, quant), "reasoning_effort": EFFORT,
            "lib_dirs": meta.get("lib_dirs") or [], "port": port}
+    if metal:                      # ggml reads the GGUF files itself: no pack, no expert cache / prefill / KV streaming
+        # the learned expert profile (read at start when it is there, rewritten after each request) lives with the
+        # tokenizer, in <model folder>/metal/; a setup again keeps it (keep_args)
+        cfg["args"] = ["--gguf", str(gguf), "--max-context", str(ctx),
+                       "--expert-profile-save", str(pack / "expert-profile.bin")]
+        cfg["backend"] = "metal"
     if dflash is not None:                         # DFlash2 drafts instead of the MTP block (the engine loads no MTP)
         cfg["args"] += ["--dflash", str(dflash)]
     env = parse_env(a.env)
@@ -3003,7 +3156,7 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         cfg["api_key"] = a.api_key
     if vision:
         cfg["vision"] = vision
-    suffix = "-hip" if pc.get("backend") == "hip" else ""
+    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
     cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
@@ -3018,9 +3171,9 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         kept += keep_profile(old, cfg["args"])
         if kept:
             ok("kept from the config before: " + ", ".join(kept))
-    if getattr(a, "parallel", None):
+    if getattr(a, "parallel", None) and not metal:      # (Metal: one conversation)
         set_arg(cfg["args"], "--parallel", a.parallel)
-    if getattr(a, "vram_reserve_mib", None) is not None:   # given now: written, and a later setup keeps it
+    if getattr(a, "vram_reserve_mib", None) is not None and not metal:   # given now: written, and a later setup keeps it
         set_arg(cfg["args"], "--vram-reserve-mib", a.vram_reserve_mib)
         ok(f"VRAM kept free beside the expert pool: {a.vram_reserve_mib} MiB (--vram-reserve-mib)")
     for line in prefill_tips(cfg["args"], mem_gb()[0], len(pc["gpus"])):
@@ -3146,7 +3299,8 @@ def add_profile(cfg: dict) -> bool:
     would write it: an update restarts the installed config without setting up again.  Not a pruned model's (its
     experts are not the profile's).  True when `cfg` changed."""
     args = cfg.get("args")
-    if not isinstance(args, list) or "--glm-pack" not in args[:-1] or "--expert-profile" in args or not PROFILE.exists():
+    if (not isinstance(args, list) or not any(f in args[:-1] for f in ("--glm-pack", "--gguf"))
+            or "--expert-profile" in args or not PROFILE.exists()):
         return False
     if not profile_fits(flag_value(args, "--glm-pack")):
         return False
@@ -3229,7 +3383,7 @@ def saved_calibration(cfg: dict, any_context=False) -> dict | None:
     any_context: else the ones tuned at the nearest other context, with that context in "context" - the CPU lane's
     split depends on the PC far more than on the context, and a setup for another context used to drop them (#57: the
     engine's own settings, half the speed on a two-socket DDR3 PC)."""
-    if cfg.get("backend") == "hip":
+    if cfg.get("backend") in ("hip", "metal"):
         return None
     store, key = load_calibrations(), hardware_key(cfg)
     now = None
@@ -3370,6 +3524,9 @@ def calibrate_config(cfg_path: Path) -> bool:
     if cfg.get("backend") == "hip":
         warn("the tuning measures the CUDA engine's CPU lane (NVIDIA GPUs): the HIP port keeps its own settings")
         return False
+    if cfg.get("backend") == "metal":
+        warn("the tuning measures the CUDA engine's CPU lane: it does not apply to the Metal engine")
+        return False
     busy = busy_gpus(cfg)
     if busy:
         warn("the tuning needs the GPU(s) to itself: " + ", ".join(f"GPU {i} has {m} MiB in use" for i, m in busy) +
@@ -3489,11 +3646,12 @@ def needs_speed_calibration(cfg: dict) -> bool:
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
     the engine then decodes without the drafter."""
     args = cfg.get("args") or []
+    if cfg.get("backend") == "metal":                  # (CUDA's measurement: on a Mac MTP or DFlash2 is the user's choice)
+        return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: measured at its setup, or --speed-calibration)
         return False
     if config_family(cfg) in ("deepseek", "minimax"):  # (their DSpark drafter: measured once too)
-        return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and \
-            not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
+        return CDS.has_drafter(cfg) and "speed_calibration" not in (cfg.get("installer") or {}) and             not (config_family(cfg) == "minimax" and parallel_of(cfg) > 1)   # (maya-mm3 --parallel: no drafting)
     return "--dflash" in args[:-1] and parallel_of(cfg) <= 1 and \
         "speed_calibration" not in (cfg.get("installer") or {})
 
@@ -3505,6 +3663,10 @@ def speed_calibration(cfg_path: Path, why: str = "") -> bool:
     that chooses DFlash2, or --speed-calibration, measures again.  False: not measured (the reason is shown; nothing
     changed, and a failure is recorded so that a start does not try again by itself)."""
     cfg = read_json(cfg_path)
+    if cfg.get("backend") == "metal":
+        warn("no speed calibration on Metal: MTP and DFlash2 are both exact, which is faster here is your choice "
+             f"({ME} --setup --draft mtp|dflash2)")
+        return False
     if config_family(cfg) == "qwen":                   # (CYBER-FROST: its MTP drafter or none)
         return bool(qwen_draft_calibration(cfg_path) is not None)
     if config_family(cfg) in ("deepseek", "minimax"):
@@ -3762,9 +3924,10 @@ def server_command(cfg_path: Path, a) -> tuple:
     select_build_backend(cfg.get("backend", "cuda"))
     args = cfg.get("args") or []
     ds4 = config_family(cfg) == "deepseek"
-    flag = "--glm-pack" if config_family(cfg) == "glm" else "--pack"   # (maya-ds4 and maya-mm3: --pack)
-    pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None
-    for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the pack"),
+    metal = cfg.get("backend") == "metal"
+    flag = ("--gguf" if metal else "--glm-pack") if config_family(cfg) == "glm" else "--pack"   # (maya-ds4 and maya-mm3: --pack)
+    pack = Path(args[args.index(flag) + 1]) if flag in args[:-1] else None       # (Metal: the first GGUF file)
+    for p, what in ((Path(cfg.get("exe", "")), "the engine"), (pack, "the model's GGUF file" if metal else "the pack"),
                     (Path(cfg.get("tokenizer", "")) / "vocab.json", "the tokenizer")):
         if p is None or not p.exists():
             fail(f"{cfg_path.name}: {what} is missing ({p})", f"run {ME} --setup to repair it")
@@ -3776,7 +3939,11 @@ def server_command(cfg_path: Path, a) -> tuple:
         if why is not None:
             fail(f"{cfg_path.name}: {why}, so its index of where the tensors sit is wrong",
                  f"run {ME} --setup --repack to build it again (a minute)")
-    src = pack_source(pack)
+    if metal:                                          # (no pack: the engine reads every shard of the model itself)
+        for s in shard_set(pack):
+            if not s.exists():
+                fail(f"{cfg_path.name}: the model's file {s.name} is missing ({s.parent})", f"run {ME} --setup to repair it")
+    src = None if metal else pack_source(pack)
     if src is not None and src != EXL3_GGUF and all(s.exists() for s in shard_set(pack.parent / src)):
         why = pack_stale(pack, shard_set(pack.parent / src))
         if why is not None:
@@ -3817,7 +3984,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         cmd += ["--api-key", a.api_key]
     if a.gpus or a.gpu is not None:                    # this start only, on these cards
         cmd += ["--gpu", str(a.gpus or a.gpu)]
-    if WIN or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    if WIN or sys.platform == "darwin" or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         cmd.append("--open")                           # a desktop: the browser opens when the model is ready
     here = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else None
@@ -3830,7 +3997,7 @@ def server_command(cfg_path: Path, a) -> tuple:
     env = dict(os.environ, MAYA_RESTART_ON_UPDATE="1")  # (the dashboard may update Maya)
     if S.UI is not None:                               # (the setup's screen shows the same in its card, and reads
         env["PYTHONUNBUFFERED"] = "1"                  # the server's output from a pipe)
-        found = S.amd_gpus() if cfg.get("backend") == "hip" else S.gpus()
+        found = S.amd_gpus() if cfg.get("backend") == "hip" else metal_gpus() if metal else S.gpus()
         info["vram"] = {g["index"]: g["vram_gb"] for g in found}   # (its load: a GPU not started yet, by its VRAM)
         return cmd, env, info
     say()
@@ -3852,6 +4019,9 @@ def server_command(cfg_path: Path, a) -> tuple:
     elif ds4:
         say("  Loading takes a few minutes: the engine places the experts in VRAM by how often they are used, copies the")
         say("  rest into RAM for its CPU lane and pins them - the first answers are the slowest.")
+    elif metal:
+        say("  Loading takes a few minutes: the engine reads the GGUF files; with less unified memory than the model the")
+        say("  experts stream from the SSD while it answers (decode speed is SSD-bound) - the first answers are the slowest.")
     else:
         say("  Loading takes a few minutes: the engine pins up to all but about 6 GB of the free RAM for its expert tier")
         say("  (MAYA_GLM_RAM_HEADROOM_GB changes the 6) and warms its caches - the first answers are the slowest.")
@@ -4101,6 +4271,8 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
                     or stamp.get("rocm") or "/opt/rocm").expanduser().resolve()
         add("GPUs", hip_gpu_report(rocm, (stamp.get("lib_dirs") or [None])[0] if WIN else None))
         add("ROCm", rocm_report(rocm))
+    elif backend == "metal":
+        add("GPUs", S.out(["system_profiler", "SPDisplaysDataType"]) or "system_profiler did not answer")
     else:
         add("GPUs", S.out(["nvidia-smi", "--query-gpu=index,name,memory.total,memory.used,driver_version,"
                                          "pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max,power.limit,"
@@ -4117,7 +4289,7 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
     else:
         disks = S.out(["lsblk", "-d", "-o", "NAME,MODEL,ROTA,TRAN,SIZE"])
     add("Disks", disks)
-    keys = ("backend", "archs", "rocm", "date") if backend == "hip" else ("archs", "nvcc", "host_compiler", "date")
+    keys = ("backend", "archs", "rocm", "date") if backend == "hip" else ("backend", "version", "date") if backend == "metal" else ("archs", "nvcc", "host_compiler", "date")
     add("Engine build", json.dumps({k: stamp.get(k) for k in keys})
         if stamp else "not compiled yet")
     if not have:
@@ -4239,7 +4411,7 @@ def bench(cfg_path: Path, version: str) -> int:
         pass
     sys.path.insert(0, str(ROOT))
     import serve.server as SV                      # the server's own engine command and environment
-    import strata_tokenizer as ST
+    import maya_tokenizer as ST
     args = cfg.get("args") or []
     pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
     tp = Path(cfg.get("tokenizer") or (pack / "tokenizer" if pack else ""))
@@ -4311,7 +4483,8 @@ def bench(cfg_path: Path, version: str) -> int:
     if cfg.get("backend") == "hip" and SV.gpu_list(cfg):
         by_index = {g["index"]: g for g in found}
         found = [by_index[i] for i in SV.gpu_list(cfg) if i in by_index]
-    gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in found) or "?"
+    gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in found) or (
+        "the Apple GPU (Metal)" if cfg.get("backend") == "metal" else "?")
     total, _ = mem_gb()
     lines = [f"Project Maya v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
              f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
@@ -4386,6 +4559,7 @@ def set_up(a, prev: dict) -> Path | None:
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
     pc = check_pc(a)                                   # 1
+    metal = pc["backend"] == "metal"
     step(2, "your choices")                            # 2
     ctx = choose_context(a, prev_ctx)
     ok(f"context: {ctx} tokens")
@@ -4408,10 +4582,13 @@ def set_up(a, prev: dict) -> Path | None:
         return None
     d, shards, quant = got
     dflash = drafter_step(models) if draft == "dflash2" else None
-    pack = pack_step(a, d, shards, llama, quant)       # 6
+    pack = metal_tokenizer_step(a, d, shards, quant) if metal else pack_step(a, d, shards, llama, quant)       # 6
     vision = vision_step(a, pc, meta, llama, d, quant)  # 7
-    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash)   # 8
-    if dflash is not None:                             # DFlash2: kept only if it makes THIS PC faster (measured)
+    cfg_path = write_config(a, pc, meta, pack, quant, ctx, models, vision, choice, dflash, shards[0] if metal else None)   # 8
+    if dflash is not None and metal:                   # (the speed calibration is CUDA's: on a Mac the choice is yours)
+        ok("DFlash2 drafts on this Mac, not measured against the MTP block (both are exact): "
+           f"{ME} --setup --draft mtp goes back")
+    elif dflash is not None:                           # DFlash2: kept only if it makes THIS PC faster (measured)
         how = drafting_choice(a, "DFlash2", "5-20")
         if how != "measure":                           # (or as the user chose)
             keep_drafting(cfg_path, how == "on")
@@ -4423,9 +4600,11 @@ def set_up(a, prev: dict) -> Path | None:
     # answers (--yes and --no-start setups are not held up by it)
     tuned = None
     cfg = read_json(cfg_path)
-    offer = (cfg.get("backend") != "hip" and saved_calibration(cfg, any_context=True) is None and not a.yes and
-             not a.no_start)
-    if a.calibrate or (offer and ask(
+    offer = (cfg.get("backend") not in ("hip", "metal") and saved_calibration(cfg, any_context=True) is None
+             and not a.yes and not a.no_start)
+    if metal and a.calibrate:
+        warn("--calibrate does not apply to Metal: there is no CPU lane to tune")
+    if (a.calibrate and not metal) or (offer and ask(
             "Tune Maya for this PC now? It measures the split of the work between the CPU and the PCIe link and the "
             "CPU threads (about 10-15 minutes; later: ./maya.sh --calibrate)", ["y", "n"], "y", a.yes) == "y"):
         if S.UI is not None:                           # (the screen lists the tuning as a step of its own)
@@ -4671,7 +4850,8 @@ def ds4_vision_step(a, pc: dict, d: Path) -> bool:
         return False
     for f in files:                                    # (offer_download checked the ones it fetched; these too)
         if not sha256_checked(f, m["sha256"][f.name]):
-            fail(f"{f}: the sha256 does not match the published one", "delete it and run the setup again")
+            f.unlink(missing_ok=True)                  # else the next run finds it complete and fails here again
+            fail(f"{f}: the sha256 does not match the published one (the file was removed)", "run the setup again")
     say("  Reading the picture markers (30 KB of DeepSeek's shard 2, a range request) and copying the tower into one "
         "file (exactly the same values; a few seconds) ...")
     r = run([sys.executable, str(ROOT / "tools" / "ds4" / "vision_pack.py"), "--dir", str(v)], check=False)
@@ -5959,7 +6139,7 @@ def qwen_draft_calibration(cfg_path: Path) -> bool | None:
         warn("no MTP drafter in the pack: decoding without it")
         return None
     sys.path.insert(0, str(ROOT / "tools"))
-    import strata_tokenizer as ST
+    import maya_tokenizer as ST
     tok = ST.Tokenizer.from_dir(Path(cfg["tokenizer"]))
     ids = tok.encode("<|im_start|>user\n" + BENCH_TOPICS[0] + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
                      parse_special=True)
@@ -6082,7 +6262,9 @@ def main() -> int:
     N.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engines read, for all it starts)
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--backend", choices=["cuda", "hip"], help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows)")
+    ap.add_argument("--backend", choices=["cuda", "hip", "metal"],
+                    help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
+                         "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
     ap.add_argument("--no-start", action="store_true", help="set up, but do not start the dashboard")
@@ -6130,7 +6312,7 @@ def main() -> int:
                          "minimax-maya-xs / minimax-maya-s)")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
-                         f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA)")
+                         f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA or Apple Silicon)")
     ap.add_argument("--no-vision", action="store_true", help="text only: no image encoder (saves its build and "
                                                              "its 1.1 GB of files)")
     ap.add_argument("--gguf-dir", help="use GLM-5.3-Flash GGUF files you already have: the folder with all of them, "
@@ -6225,11 +6407,12 @@ def main() -> int:
     if a.backend:
         have = [p for p in have if read_json(p).get("backend", "cuda") == a.backend]
     elif have:
-        a.backend = "hip" if read_json(have[0]).get("backend") == "hip" else "cuda"
+        a.backend = read_json(have[0]).get("backend") if read_json(have[0]).get("backend") in ("hip", "metal") else "cuda"
     else:
-        # nothing set up yet (START-MAYA.bat / ./maya.sh without --backend): HIP on a PC with a supported AMD GPU
-        # and no NVIDIA one, e.g. Strix Halo
-        a.backend = "hip" if not S.gpus() and any(g["arch"] in HIP_ARCHS for g in S.amd_gpus()) else "cuda"
+        # nothing set up yet (START-MAYA.bat / ./maya.sh without --backend): Metal on a Mac with Apple Silicon, HIP on
+        # a PC with a supported AMD GPU and no NVIDIA one (e.g. Strix Halo)
+        a.backend = ("metal" if apple_silicon() else
+                     "hip" if not S.gpus() and any(g["arch"] in HIP_ARCHS for g in S.amd_gpus()) else "cuda")
     setting_up = a.setup or a.check or a.gguf_dir or a.model or a.model_dir or a.rebuild or a.repack or \
         a.download_model
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
@@ -6248,6 +6431,11 @@ def main() -> int:
                 set_arg(cfg.setdefault("args", []), "--mmap-experts", a.mmap_experts)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
                 ok(f"{pick.name}: --mmap-experts {a.mmap_experts}")
+        if (a.calibrate or a.speed_calibration) and read_json(pick).get("backend") == "metal":
+            ok("the Metal engine has no CPU lane to tune and no drafter to measure: nothing to tune")
+            a.calibrate = a.speed_calibration = False
+            if a.no_start:
+                return 0
         # (DeepSeek too: --speed-calibration measures its DSpark drafter against none - speed_calibration_ds4 - and keeps
         #  the faster; it used to stop here with "nothing to tune", so a config the setup wrote with --dspark none until
         #  that measurement could never get it - #393.  --calibrate tunes its --tp and CPU threads)
@@ -6273,7 +6461,9 @@ def main() -> int:
         quant = choose_ds4_quant(a, prev) if ds4 else None
         pc = check_pc(a, "deepseek" if ds4 else "glm", gguf=ds4 and quant != "exl3")
         say()
-        if a.backend == "hip":
+        if a.backend == "metal":
+            say(f"This Mac can run Maya on Metal (experimental). Run {ME} without --check to set it up.")
+        elif a.backend == "hip":
             pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) > 1
                     else f"--gpu {pc['gpus'][0]['index']}")
             say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to try the experimental port.")

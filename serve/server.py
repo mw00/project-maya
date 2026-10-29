@@ -28,12 +28,14 @@ import contextlib
 import base64
 import hashlib
 import hmac
+import ipaddress
 import codecs
 import itertools
 import json
 import math
 import os
 import queue
+import socket
 import re
 import subprocess
 import struct
@@ -74,11 +76,41 @@ try:                        # Project Maya's release (the dashboard's About; the
     MAYA_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or None
 except OSError:
     MAYA_VERSION = None
+MAC_FREE_SETTLE_BYTES = 1 << 30    # macOS: the old engine's memory is back once free memory rises by less than this ...
+MAC_FREE_POLL_S = 0.5              # ... between two reads this far apart
+
+
+def mac_free_bytes() -> int | None:
+    """What macOS could give a process now (vm_stat: free, inactive, purgeable and speculative pages), as maya-metal's
+    free_memory() counts it; None when vm_stat can't say."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    size = re.search(r"page size of (\d+) bytes", out)
+    counts = [re.search(rf"^Pages {k}:\s+(\d+)", out, re.M) for k in ("free", "inactive", "purgeable", "speculative")]
+    if not size or not all(counts):
+        return None
+    return sum(int(c.group(1)) for c in counts) * int(size.group(1))
+
+
 def wait_gpu_release(pid: int, timeout: float = 60.0):
     """An engine that has ended still holds its GPU memory for a few seconds - the driver frees tens of GB of VRAM and
     its pinned RAM tier after the process is gone - and an engine started at once finds the cards full (the split
     search measures them before anything loads: the context reload's new engine got 0.09 GB and failed).  Waits until
-    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD)."""
+    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD).  On a Mac no GPU lists it,
+    but its unified memory comes back over seconds too, and maya-metal sizes its expert pool from what is free when it
+    starts (a restart after a crash came back with a smaller pool, partly streaming from the SSD and MTP off): waits
+    until free memory stops rising."""
+    if sys.platform == "darwin":
+        t0, prev = time.time(), mac_free_bytes()
+        while prev is not None and time.time() - t0 < timeout:
+            time.sleep(MAC_FREE_POLL_S)
+            cur = mac_free_bytes()
+            if cur is None or cur - prev < MAC_FREE_SETTLE_BYTES:
+                break
+            prev = cur
+        return
     try:
         from serve.telemetry import gpu_pids
     except ImportError:
@@ -1882,11 +1914,13 @@ def child_env(cfg: dict) -> dict:
     env = dict(os.environ)
     if gpu_list(cfg) and cfg.get("backend") == "hip":   # AMD: numbered as HIP numbers them (setup's KFD order)
         env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
-    elif gpu_list(cfg):                              # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
+    elif gpu_list(cfg) and cfg.get("backend") != "metal":   # issue #51: the GPU(s) to run on, numbered as nvidia-smi does; CUDA's
         env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"      # own default order (fastest first) can number the cards otherwise
         env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in gpu_list(cfg))
     for k, v in (cfg.get("env") or {}).items():      # engine settings the config carries (AMD: the GEMM tuning table)
         env[str(k)] = str(v)
+        if cfg.get("backend") == "metal":            # maya-metal reads its settings by their MAYA_* names
+            env[maya_names.shown(str(k))] = str(v)
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -4158,6 +4192,32 @@ def _backlog() -> int:
         return 256
 
 
+def request_timeout() -> float:
+    """Seconds one socket read or write may wait (a client that sends half a request and nothing more must not hold a
+    thread for ever): 300 by default, STRATA_REQUEST_TIMEOUT_S changes it.  Per operation: a long answer that writes
+    nothing while it thinks is not cut."""
+    try:
+        s = float(os.environ.get("STRATA_REQUEST_TIMEOUT_S", "0"))
+    except ValueError:
+        s = 0.0
+    return s if s > 0 else 300.0
+
+
+def local_host(host: str) -> bool:
+    """A Host header naming this machine: an IP address, localhost, or this machine's own name.  A page on another
+    site that re-points its own name at 127.0.0.1 (DNS rebinding) sends that name, so it is refused."""
+    if not host:
+        return True                                     # HTTP/1.0 without Host: no browser sends that
+    name = (urlsplit("//" + host).hostname or "").rstrip(".").lower()
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    me = socket.gethostname().lower()
+    return name == "localhost" or name.endswith(".localhost") or name in (me, me.split(".")[0] + ".local", me.split(".")[0])
+
+
 def body_limit() -> int:
     """The most a request body may hold, in bytes (it is read into memory): 256 MiB, a million-token conversation with
     room to spare; STRATA_MAX_BODY_MIB changes it.  A larger one is answered 413 before it is read (Strata #893)."""
@@ -4200,6 +4260,7 @@ def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         answer_started = False                              # a malformed request's 400 only replaces an answer not begun
+        timeout = request_timeout()
 
         def log_message(self, fmt, *args):
             pass
@@ -4290,7 +4351,11 @@ def make_handler(svc: Service):
 
         def _authorized(self) -> bool:
             if not svc.api_key:
-                return True
+                if local_host(self.headers.get("Host", "")):
+                    return True
+                self._json(403, {"error": {"type": "permission_error", "message":
+                                 "open Maya by its IP address or localhost, or set an api_key to use another name"}})
+                return False
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             if given and any(hmac.compare_digest(given.encode(), k.encode()) for k in key_list(svc.api_key)):
@@ -4401,6 +4466,8 @@ def make_handler(svc: Service):
             self._json(200, out)
 
         def do_DELETE(self):
+            if self._foreign_page():
+                return
             if self.path.split("?")[0].startswith("/v1/responses/"):
                 self._response_resource(delete=True)
             elif self._authorized():
@@ -4576,8 +4643,27 @@ def make_handler(svc: Service):
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
+        def _foreign_page(self) -> bool:
+            """A browser page on another site (its Origin neither this server nor in cors_origins): it can post a
+            text/plain body with no CORS preflight (CSRF), so it is refused before anything runs.  curl and the SDKs
+            send no Origin."""
+            origin = self.headers.get("Origin")
+            if not origin or origin.split("://", 1)[-1] == self.headers.get("Host", "") or self._cors_allow():
+                return False
+            self._json(403, {"error": {"type": "permission_error", "message": "requests from other web pages are "
+                                       "refused (the config's cors_origins lists the pages allowed)"}})
+            return True
+
+        def _fail(self, code, kind, message):
+            """An error as JSON, while nothing was sent; once an answer has begun (a stream), only the log has it."""
+            if self.answer_started:
+                print(f"[maya] request failed mid-answer: {message}", file=sys.stderr, flush=True)
+                self.close_connection = True
+                return
+            self._json(code, {"error": {"type": kind, "message": message}})
+
         def do_POST(self):
-            if not self._authorized():
+            if not self._authorized() or self._foreign_page():
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
@@ -4658,19 +4744,20 @@ def make_handler(svc: Service):
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except BadBody as e:
-                self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                self._fail(e.status, "invalid_request_error", str(e))
             except (JobError, StoreBusy) as e:
-                self._json(getattr(e, "status", 503), {"error": {"type": "server_error", "message": str(e)}})
+                self._fail(getattr(e, "status", 503), "server_error", str(e))
             except ValueError as e:                          # (a ContextOverflow with its code: #432)
-                self._json(400, error_body(e))
-            except EngineDied as e:                          # before the answer started (not streamed)
-                self._json(503, {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}})
+                if self.answer_started:
+                    self._fail(400, "invalid_request_error", str(e))
+                else:
+                    self._json(400, error_body(e))
+            except EngineDied as e:
+                self._fail(503, "server_error", f"{e}; the next request restarts it")
             except (KeyError, TypeError, AttributeError, IndexError) as e:
                 # a field of the wrong shape (Strata: a 400 with the traceback in the log, not a dropped connection)
                 traceback.print_exc()
-                if not self.answer_started:
-                    self._json(400, {"error": {"type": "invalid_request_error",
-                                               "message": f"malformed request ({type(e).__name__}: {e})"}})
+                self._fail(400, "invalid_request_error", f"malformed request ({type(e).__name__}: {e})")
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
@@ -5416,7 +5503,7 @@ def main() -> int:
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
-        import strata_tokenizer as ST
+        import maya_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":
@@ -5434,11 +5521,12 @@ def main() -> int:
         vcfg = cfg.get("vision") or None
         vlog = (open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None) if vcfg else None
         venv = dict(env)
-        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") != "hip":
+        if vcfg and vcfg.get("gpu") and gpu_list(cfg) and cfg.get("backend") not in ("hip", "metal"):
             venv["CUDA_VISIBLE_DEVICES"] = str(gpu_list(cfg)[0])   # the encoder on the first GPU only
         # the GLM engine lends the encoder the tail of its expert cache while it encodes, sized by what the encoder
         # measured on this GPU ("resident": true keeps the encoder running beside the model, holding its VRAM)
-        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident")
+        # (Metal: one memory shared with the engine, which answers ERR to VLEND / VRECLAIM: the encoder stays resident)
+        on_demand = bool(vcfg) and vcfg.get("gpu") and not vcfg.get("resident") and cfg.get("backend") != "metal"
         engine_env = env
         if on_demand:
             fp = vision_footprint(vcfg, venv, Path(a.config).resolve().with_name("vision-memory.json"),
@@ -5552,8 +5640,9 @@ def main() -> int:
         svc.savings = savings.Ledger(p.parent / savings.FILE, p.name, svc.model, models.quant_label(cfg, p))
         threading.Thread(target=svc.finish_delete, daemon=True).start()   # (the model before, if the page deleted it)
     args = [str(x) for x in cfg.get("args") or []]
-    if "--glm-pack" in args[:-1]:                       # the model's folder: the pack's parent holds its GGUF files
-        svc.model_dir = Path(args[args.index("--glm-pack") + 1]).resolve().parent
+    flag = next((f for f in ("--glm-pack", "--gguf") if f in args[:-1]), None)   # (Metal: the first GGUF file, no pack)
+    if flag:                                            # the model's folder: the parent of the pack or GGUF file
+        svc.model_dir = Path(args[args.index(flag) + 1]).resolve().parent
         threading.Thread(target=lambda: setattr(svc, "trained_context", trained_context(svc.model_dir)),
                          daemon=True).start()
     elif "--pack" in args[:-1]:                         # DeepSeek's pack (its ds4.txt), MiniMax's (mm3.txt); its folder

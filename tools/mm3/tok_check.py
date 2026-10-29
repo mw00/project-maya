@@ -19,7 +19,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent))
 import pack  # noqa: E402
-from strata_tokenizer import Tokenizer  # noqa: E402
+from maya_tokenizer import Tokenizer  # noqa: E402
 
 CASES = [
     "e\u0301t\u00e9 caf\u00e9 cafe\u0301 \u212b \u0041\u030a",                   # NFC composes these

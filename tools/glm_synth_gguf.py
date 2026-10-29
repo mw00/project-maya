@@ -14,7 +14,7 @@ Usage:
     python tools/glm_synth_gguf.py --out glm5-synth.gguf [--seed 1234]
 
 The tokenizer is deliberately absent: the oracle runs on token ids, and the real tokenizer is a
-conversion concern (tools/strata_tokenizer.py), not a reference-model one.
+conversion concern (tools/maya_tokenizer.py), not a reference-model one.
 """
 from __future__ import annotations
 
@@ -99,6 +99,13 @@ BIG = dict(n_embd=256, n_vocab=512, n_layers=45, n_head=8, kda_head_dim=32, d_co
            n_ff_exp=256, n_shared=1, n_ff_dense=512, dense_lead=3, hc=4, sinkhorn=5,
            idx_heads=8, idx_dim=64, idx_topk=256, kpool=4, ctx=1024, hot_ffn=0.25, dt_spikes=8.0,
            n_head_kv=[1 if il % 4 == 3 else 0 for il in range(45)])
+
+
+# the small fixture with the heads the DSA products' matrix kernels need: ggml-metal takes mul_mm from 9 columns and a
+# 64-long inner product (glm_metal.cpp dsa_mm), which SMALL/BIG's 8 heads never reach - and a top-k past the 64-cell pad
+WIDE = dict(SMALL, n_head=16, idx_heads=16, idx_dim=64, idx_topk=128)
+# and with GLM-5.3-Flash's 512-wide latent: ggml_sparse_mla's D=512 kernel (third_party/ggml/metal-sparse-mla.patch)
+WIDE512 = dict(WIDE, kv_lora=512)
 
 
 def build(seed: int, vocab: bool = False) -> tuple[list[tuple[str, bytes]], list[tuple[str, np.ndarray]]]:

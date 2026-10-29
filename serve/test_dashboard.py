@@ -437,7 +437,8 @@ class GpuRelease(unittest.TestCase):
         from serve import server as SV, telemetry as T
         seen = [{4242, 7}, {4242, 7}, {7}]
         with mock.patch.object(T, "gpu_pids", side_effect=lambda: seen.pop(0) if len(seen) > 1 else seen[0]), \
-                mock.patch.object(SV.time, "sleep") as sleep:
+                mock.patch.object(SV.time, "sleep") as sleep, \
+                mock.patch.object(SV.sys, "platform", "linux"):
             SV.wait_gpu_release(4242, timeout=30)
         self.assertEqual(seen, [{7}])
         self.assertEqual(sleep.call_count, 2)
@@ -445,9 +446,31 @@ class GpuRelease(unittest.TestCase):
     def test_without_nvml_a_short_wait(self):
         from unittest import mock
         from serve import server as SV, telemetry as T
-        with mock.patch.object(T, "gpu_pids", return_value=None), mock.patch.object(SV.time, "sleep") as sleep:
+        with mock.patch.object(T, "gpu_pids", return_value=None), mock.patch.object(SV.time, "sleep") as sleep, \
+             mock.patch.object(SV.sys, "platform", "linux"):
             SV.wait_gpu_release(4242)
         sleep.assert_called_once()
+
+    def test_mac_waits_until_free_memory_stops_rising(self):
+        from unittest import mock
+        from serve import server as SV
+        gb = 1 << 30
+        free = [4 * gb, 20 * gb, 40 * gb, 40 * gb, 90 * gb]
+        with mock.patch.object(SV, "mac_free_bytes", side_effect=lambda: free.pop(0)), \
+                mock.patch.object(SV.time, "sleep") as sleep, mock.patch.object(SV.sys, "platform", "darwin"):
+            SV.wait_gpu_release(4242)
+        self.assertEqual(sleep.call_count, 3)                   # rising, rising, settled: started
+        self.assertEqual(free, [90 * gb])
+
+    def test_mac_free_bytes_reads_vm_stat(self):
+        from unittest import mock
+        from serve import server as SV
+        out = ("Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:      10.\n"
+               "Pages active:   99.\nPages inactive:  20.\nPages speculative:  3.\nPages purgeable:  2.\n")
+        with mock.patch.object(SV.subprocess, "run", return_value=mock.Mock(stdout=out)):
+            self.assertEqual(SV.mac_free_bytes(), 35 * 16384)
+        with mock.patch.object(SV.subprocess, "run", return_value=mock.Mock(stdout="")):
+            self.assertIsNone(SV.mac_free_bytes())
 
 
 class NvmlPids(unittest.TestCase):

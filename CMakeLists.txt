@@ -78,6 +78,13 @@ endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
+# Apple Silicon: maya-metal (GLM-5.3-Flash through ggml's Metal backend, cmake/metal_backend.cmake) and nothing else
+option(MAYA_ENABLE_METAL "Build maya-metal for Apple Silicon (GLM-5.3-Flash on the Metal GPU)" OFF)
+if(MAYA_ENABLE_METAL)   # (the CUDA / AMD options do not apply to this build)
+  include(cmake/metal_backend.cmake)
+  return()
+endif()
+
 if(STRATA_ENABLE_CUDA)
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to

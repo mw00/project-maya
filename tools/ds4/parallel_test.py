@@ -242,7 +242,7 @@ def main() -> int:
         print(f"{a.exe}: no engine - build it first (cmake --build build --target maya-ds4)", flush=True)
         return 2
     try:
-        from strata_tokenizer import Tokenizer   # (tools/strata_tokenizer.py's own: `regex`)
+        from maya_tokenizer import Tokenizer   # (tools/maya_tokenizer.py's own: `regex`)
         tok = Tokenizer.from_dir(os.path.join(a.pack, "tokenizer"))
     except Exception as e:  # noqa: BLE001
         print(f"{os.path.join(a.pack, 'tokenizer')}: no tokenizer (the prompts are real text): {e}", flush=True)

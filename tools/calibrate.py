@@ -110,7 +110,7 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
 
         def start_engine(args):
             return StrataEngine(cfg["exe"], args, cwd=cfg.get("cwd"), log=cfg.get("log"), env=child_env(cfg))
-    import strata_tokenizer as ST
+    import maya_tokenizer as ST
     tpath = Path(cfg["tokenizer"])
     vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
     toks = [None] * len(vocab)

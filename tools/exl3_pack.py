@@ -618,8 +618,8 @@ def write_all(plan: Plan, d: pathlib.Path, out: pathlib.Path, t: dict, nextn: in
              n_exp // max(1, len(plan.layers))))
 
     # ---- tokenizer/ through the GGUF, as for every other pack
-    import strata_tokenizer
-    cfg = strata_tokenizer.extract(gpath, out)
+    import maya_tokenizer
+    cfg = maya_tokenizer.extract(gpath, out)
     print("tokenizer/: vocab %d, merges %d, pre %s" % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"]))
 
 

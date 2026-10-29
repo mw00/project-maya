@@ -90,7 +90,7 @@ READ_CHUNKS = (4, 2)                     # tried against the engine's own (8) wh
 
 def prompt_ids(cfg: dict) -> list[list[int]]:
     """PROMPTS as the server sends them: the model's chat template, thinking off (decode speed, not reasoning)."""
-    import strata_tokenizer as ST
+    import maya_tokenizer as ST
     from serve.frontend import ChatTemplate, effort_kwargs
     tpath = Path(cfg["tokenizer"])
     vocab = json.loads((tpath / "vocab.json").read_text(encoding="utf-8"))
