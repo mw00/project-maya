@@ -46,7 +46,7 @@ class OldDetokenizer:
 class Detok(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        import maya_tokenizer as ST
+        import strata_tokenizer as ST
         cls.tok = ST.Tokenizer.from_dir(find_tokenizer())
 
     def same_stream(self, ids):

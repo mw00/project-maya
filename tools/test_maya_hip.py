@@ -303,7 +303,7 @@ class HipSetupTests(unittest.TestCase):
         tok = MagicMock()
         tok.encode.return_value = list(range(9000))
         # Exercise the real server's engine_args/child_env without optional tokenizer/template packages.
-        modules = {"maya_tokenizer": SimpleNamespace(Tokenizer=SimpleNamespace(from_dir=MagicMock(return_value=tok))),
+        modules = {"strata_tokenizer": SimpleNamespace(Tokenizer=SimpleNamespace(from_dir=MagicMock(return_value=tok))),
                    "serve.frontend": MagicMock()}
         with patch("urllib.request.urlopen", side_effect=OSError("no server")), \
                 patch.dict(sys.modules, modules), \

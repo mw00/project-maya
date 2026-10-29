@@ -57,7 +57,7 @@ def prompt_ids(cfg: dict, n: int = TOKENS) -> list[int]:
     prompt), about n tokens; [] when the tokenizer is not there (the engine then measures on its own token mix)."""
     try:
         import calibrate_ds4_tp as C4
-        import maya_tokenizer as ST
+        import strata_tokenizer as ST
         from serve.frontend import ChatTemplate
         tpath = Path(cfg["tokenizer"])
         tok = ST.Tokenizer.from_dir(tpath)

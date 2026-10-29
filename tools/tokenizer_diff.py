@@ -14,7 +14,7 @@ import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from maya_tokenizer import Tokenizer  # noqa: E402
+from strata_tokenizer import Tokenizer  # noqa: E402
 
 
 def main() -> int:

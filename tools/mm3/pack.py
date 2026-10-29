@@ -10,7 +10,7 @@ writes <model>/maya-mm3/:
   tensors.txt   every tensor of the model's safetensors and of dspark/'s: `file <i> <path>` lines (paths relative to
                 the model directory), then `t <name> <dtype> <file> <offset> <bytes> <dims...>` - the draft's names
                 prefixed `dspark.`
-  tokenizer/    the server's tokenizer (tools/maya_tokenizer.py's layout, pre "minimax") and Maya's chat template
+  tokenizer/    the server's tokenizer (tools/strata_tokenizer.py's layout, pre "minimax") and Maya's chat template
                 (this directory's chat_template.jinja: MiniMax's own plus thinking turned off - the same for every
                 quant, whichever template its files carry)
 

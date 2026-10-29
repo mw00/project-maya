@@ -280,7 +280,7 @@ class MetalSetupTests(unittest.TestCase):
             out = maya.metal_tokenizer_step(SimpleNamespace(repack=False), shard.parent, [shard], "x")
             self.assertEqual(out, self.root / "models" / "metal")
             cmd = run.call_args.args[0]
-            self.assertEqual((Path(cmd[1]).name, cmd[2:]), ("maya_tokenizer.py", ["--gguf", str(shard), "--out", str(out)]))
+            self.assertEqual((Path(cmd[1]).name, cmd[2:]), ("strata_tokenizer.py", ["--gguf", str(shard), "--out", str(out)]))
             maya.metal_tokenizer_step(SimpleNamespace(repack=False), shard.parent, [shard], "x")
             run.assert_called_once()                             # (the second step found it exported)
 

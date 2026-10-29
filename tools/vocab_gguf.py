@@ -5,7 +5,7 @@ against the source, but the ID-level behavior of the whole tokenizer (byte mappi
 merge order) has never been diffed against llama.cpp on real text.  This writes the vocabulary of
 a HF `tokenizer.json` (BPE) as a GGUF with NO tensors - the same artifact llama.cpp's
 `convert_hf_to_gguf.py --vocab-only` produces - so `llama-tokenize` can run it, and the same
-vocabulary feeds tools/maya_tokenizer.py on our side.  Same ids or the diff fails.
+vocabulary feeds tools/strata_tokenizer.py on our side.  Same ids or the diff fails.
 
     python tools/vocab_gguf.py --tokenizer tokenizer.json --out vocab.gguf [--arch glm5-next]
 """

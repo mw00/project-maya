@@ -14,7 +14,7 @@ Usage:
     python tools/glm_synth_gguf.py --out glm5-synth.gguf [--seed 1234]
 
 The tokenizer is deliberately absent: the oracle runs on token ids, and the real tokenizer is a
-conversion concern (tools/maya_tokenizer.py), not a reference-model one.
+conversion concern (tools/strata_tokenizer.py), not a reference-model one.
 """
 from __future__ import annotations
 

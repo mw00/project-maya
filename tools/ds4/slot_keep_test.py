@@ -63,7 +63,7 @@ DS4_ENV = ("DS4_", "STRATA_DS4_")   # (the engine's own names: it aliases MAYA_D
 
 
 def text_tokens(tok, salt: str, n: int) -> list[int]:
-    """`n` tokens of real text (through the pack's tokenizer, tools/maya_tokenizer.py): the corpus's passages, each
+    """`n` tokens of real text (through the pack's tokenizer, tools/strata_tokenizer.py): the corpus's passages, each
     numbered under `salt` (so two prompts diverge at their first words), repeated until long enough and cut at `n`."""
     with open(CORPUS, encoding="utf-8", newline="") as f:   # (CRLF kept: the tokenizer's boundaries depend on it)
         text = f.read()
@@ -280,7 +280,7 @@ def main() -> int:
         print(f"{a_.exe}: no engine - build it first (cmake --build build --target maya-ds4)", flush=True)
         return 2
     try:
-        from maya_tokenizer import Tokenizer   # (tools/maya_tokenizer.py's own: `regex`)
+        from strata_tokenizer import Tokenizer   # (tools/strata_tokenizer.py's own: `regex`)
     except ImportError as e:
         print(f"the tokenizer cannot be imported: {e} (pip install regex)", flush=True)
         return 2

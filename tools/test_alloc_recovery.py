@@ -117,7 +117,7 @@ class AllocRecovery(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         sys.path.insert(0, str(ROOT / "tools"))
-        import maya_tokenizer as ST
+        import strata_tokenizer as ST
 
         cfg_path = config_path()
         cfg = json.loads(cfg_path.read_text(encoding="utf-8"))

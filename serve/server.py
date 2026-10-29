@@ -5483,7 +5483,7 @@ def main() -> int:
     if a.engine == "strata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
-        import maya_tokenizer as ST
+        import strata_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
     if a.engine == "strata":

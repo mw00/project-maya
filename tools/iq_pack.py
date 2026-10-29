@@ -15,7 +15,7 @@ its GGUF form:
                        With --base: the base (Q2_0) pack's dense.bin, hard-linked - the float tensors are
                        byte-identical in all three model files (checked) - plus extra.bin for tensors that are
                        float here but quantized in the base pack (blk.1.ple_key).
-  tokenizer/           exported from the GGUF (tools/maya_tokenizer.py), with the model's chat template.
+  tokenizer/           exported from the GGUF (tools/strata_tokenizer.py), with the model's chat template.
 
 Split files: every shard of the model is read (<name>-0000N-of-0000M.gguf beside --gguf), so the layers may be
 split anyhow (Swift 1.5's GGUFs put layers 13-47 in shard 2 and the PLE table in shard 1).  A layer whose experts
@@ -400,7 +400,7 @@ def main() -> int:
     if rc:
         return rc
     if not (out / "tokenizer" / "vocab.json").exists() or not (out / "tokenizer" / "chat_template.jinja").exists():
-        subprocess.run([sys.executable, str(HERE / "maya_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
+        subprocess.run([sys.executable, str(HERE / "strata_tokenizer.py"), "--gguf", str(src), "--out", str(out)],
                        check=True)   # writes <out>/tokenizer/
 
     # ---- the experts

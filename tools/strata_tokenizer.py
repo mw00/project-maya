@@ -1,4 +1,4 @@
-"""tools/maya_tokenizer.py - the tokenizer, as the reference implementation of record.
+"""tools/strata_tokenizer.py - the tokenizer, as the reference implementation of record.
 
 WHY THIS EXISTS AND WHERE IT SITS.  The GGUF carries the whole tokenizer in metadata: `tokenizer.ggml.model`
 = `gpt2`, 248,320 `tokens`, 247,587 `merges`, `token_type`, `pre` = `qwen35`, and a Jinja `chat_template`.

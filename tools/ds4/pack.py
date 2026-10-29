@@ -10,7 +10,7 @@ writes <model>/maya-ds4/:
   engram.bin    the Engram hash tables (tools/ds4/engram_hash.py): int32 magic 'DSE1', vocab, layers, max_ngram,
                 heads, head_dim, pad (compressed); int32 token_map[vocab]; int64 mult[layers][max_ngram];
                 int64 primes[layers][cols]; int64 offsets[layers][cols]   (cols = (max_ngram - 1) * heads)
-  tokenizer/    the server's tokenizer (tools/maya_tokenizer.py's layout, pre "deepseek3") and the model repo's own
+  tokenizer/    the server's tokenizer (tools/strata_tokenizer.py's layout, pre "deepseek3") and the model repo's own
                 chat_template.jinja (a port of DeepSeek's encoding/encoding.py, byte for byte its prompts) - this
                 directory's chat_template.jinja only for a repo without one
 

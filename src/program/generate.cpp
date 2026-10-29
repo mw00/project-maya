@@ -6,7 +6,7 @@
 //     embed_row(token)  ->  48 captured layer graphs (the CPU expert pool behind the doorbell)  ->
 //     lm_head(R)        ->  sample        ->  embed_row(next)  ->  ...
 //
-// WHAT IT IS NOT.  There is no tokenizer here.  `pack/full/tokenizer/` and `tools/maya_tokenizer.py` exist,
+// WHAT IT IS NOT.  There is no tokenizer here.  `pack/full/tokenizer/` and `tools/strata_tokenizer.py` exist,
 // and a C++ BPE is Phase 1's deliverable rather than this program's, so the prompt arrives as IDS via
 // `--tokens`.  That is not a placeholder: it is exactly what Gate C1 needs, because C1 compares logits against
 // llama.cpp on the SAME ids, and a tokenizer on only one side of that comparison is a second variable.

@@ -594,7 +594,7 @@ DS4_EXL3 = {"exl3": {"bits": "2.9", "manifest": DS4_MANIFEST, "weights_gb": 211,
 MM3 = "MiniMax-M3.1-Flash"
 MM3_EXE = BUILD / ("maya-mm3.exe" if WIN else "maya-mm3")
 MM3_MANIFEST = ROOT / "tools" / "mm3" / "download.json"
-MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/maya_tokenizer.py", "tools/mm3/chat_template.jinja")
+MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenizer.py", "tools/mm3/chat_template.jinja")
 MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
 # Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
 # Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
@@ -668,7 +668,7 @@ MM3_GGUF_MIN_CC = 70                               # (maya-ds4's GGUF kernels' r
 QWEN = "CYBER-FROST-3.8-PS"                        # (its id: the folder, the installer record, --model; never shown)
 QWEN_SHOWN = Q.SHOWN["qwen"]                       # (its name on screen: "Qwen-3.8-Flash-Next (CYBER-FROST)")
 QWEN_MANIFEST = ROOT / "tools" / "qwen" / "download.json"
-QWEN_PACK_TOOLS = ("tools/iq_pack.py", "tools/maya_tokenizer.py", "tools/mtp_from_gguf.py", "tools/mtp_rt.py")
+QWEN_PACK_TOOLS = ("tools/iq_pack.py", "tools/strata_tokenizer.py", "tools/mtp_from_gguf.py", "tools/mtp_rt.py")
 QWEN_MODEL_NAME = "cyber-frost-3.8-ps"
 QWEN_SAMPLING, QWEN_EFFORT = Q.MODEL_DEFAULTS["qwen"]   # (its card's; its template's default level: Qwen's "xhigh")
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]     # (the model's native reach: 256K)
@@ -2727,7 +2727,7 @@ def check_sha256(shards: list, quant: str | None) -> None:
 
 def metal_tokenizer_step(a, d: Path, shards: list, quant: str) -> Path:
     """Step 6 on Metal: the engine reads the GGUF files itself (no pack), the server needs the tokenizer and the chat
-    template, exported from the first shard into <model folder>/metal/tokenizer (tools/maya_tokenizer.py)."""
+    template, exported from the first shard into <model folder>/metal/tokenizer (tools/strata_tokenizer.py)."""
     step(6, "the tokenizer (Metal reads the GGUF files itself: no pack)")
     check_sha256(shards, quant)
     out = d / "metal"
@@ -2737,7 +2737,7 @@ def metal_tokenizer_step(a, d: Path, shards: list, quant: str) -> Path:
         return out
     if not os.access(d, os.W_OK):
         fail(f"{d} is not writable: the tokenizer is written next to the GGUF files", "pass --gguf-dir with a writable folder")
-    r = run([sys.executable, str(ROOT / "tools" / "maya_tokenizer.py"), "--gguf", str(shards[0]), "--out", str(out)],
+    r = run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(shards[0]), "--out", str(out)],
             check=False)
     if r.returncode != 0 or not vocab.exists():
         fail(f"the tokenizer could not be exported from {shards[0].name}", "the reason is in the messages above (the "
@@ -4416,7 +4416,7 @@ def bench(cfg_path: Path, version: str) -> int:
         pass
     sys.path.insert(0, str(ROOT))
     import serve.server as SV                      # the server's own engine command and environment
-    import maya_tokenizer as ST
+    import strata_tokenizer as ST
     args = cfg.get("args") or []
     pack = Path(args[args.index("--glm-pack") + 1]) if "--glm-pack" in args[:-1] else None
     tp = Path(cfg.get("tokenizer") or (pack / "tokenizer" if pack else ""))
@@ -6144,7 +6144,7 @@ def qwen_draft_calibration(cfg_path: Path) -> bool | None:
         warn("no MTP drafter in the pack: decoding without it")
         return None
     sys.path.insert(0, str(ROOT / "tools"))
-    import maya_tokenizer as ST
+    import strata_tokenizer as ST
     tok = ST.Tokenizer.from_dir(Path(cfg["tokenizer"]))
     ids = tok.encode("<|im_start|>user\n" + BENCH_TOPICS[0] + "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
                      parse_special=True)

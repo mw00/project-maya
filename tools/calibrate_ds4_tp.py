@@ -131,7 +131,7 @@ def long_prompt_ids(tok, tpl, n: int = LONG_TOKENS) -> list[int]:
 def prompt_ids(cfg: dict) -> tuple[list[list[int]], list[int]]:
     """calibrate_glm.PROMPTS and the long prompt as the server sends them: the pack's tokenizer (with its own
     pre-tokenizer) and its chat template, thinking off (decode speed, not reasoning)."""
-    import maya_tokenizer as ST
+    import strata_tokenizer as ST
     from serve.frontend import ChatTemplate, effort_kwargs
     tpath = Path(cfg["tokenizer"])
     tok = ST.Tokenizer.from_dir(tpath)
