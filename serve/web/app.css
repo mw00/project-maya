@@ -294,6 +294,31 @@
 .recent__meta > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .recent__chat b { font-size: var(--st-fs-md); font-weight: 500; line-height: 1.4; overflow: hidden;
                   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+/* a phone: the card one row (a button: the Models page), the chats a list */
+.model-card--phone { width: 100%; flex-wrap: nowrap; gap: 12px; padding: 10px 12px 10px 10px; color: var(--st-ink); text-align: left; }
+.model-card--phone:active { background: var(--st-surface-2); }
+.model-card--phone .model-card__text { flex: 1 1 auto; gap: 2px; }
+.model-card--phone .model-card__name { flex-wrap: nowrap; gap: 8px; }
+.model-card--phone .model-card__name > b { min-width: 0; color: var(--st-ink); font-size: var(--st-fs-md); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.model-card__state { color: var(--st-ink-soft); }
+.model-card__state > i { display: inline-block; width: 7px; height: 7px; margin: 0 6px 1px 0; border-radius: 50%; background: var(--st-ink-muted); }
+.model-card__state[data-tone="ok"] > i { background: var(--st-ok); }
+.model-card__state[data-tone="accent"] > i { background: var(--st-accent); }
+.model-card__state[data-tone="info"] > i { background: var(--st-info); }
+.model-card__state[data-tone="warn"] > i { background: var(--st-warn); }
+.model-card__state[data-tone="danger"] > i { background: var(--st-danger); }
+.model-card__line { font-size: var(--st-fs-sm); color: var(--st-ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.model-card--phone > .st-icon { flex: none; color: var(--st-ink-muted); }
+.recent--phone { gap: 8px; }
+.recent__rows { display: flex; flex-direction: column; border: 1px solid var(--st-line); border-radius: var(--st-r-lg); background: var(--st-surface); overflow: hidden; }
+.recent__row { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 0 14px; border: 0; background: transparent;
+               color: var(--st-ink); font-size: var(--st-fs-md); text-align: left; }
+.recent__row + .recent__row { border-top: 1px solid var(--st-line); }
+.recent__row:active { background: var(--st-surface-2); }
+.recent__row > .st-icon { flex: none; color: var(--st-ink-muted); }
+.recent__title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.recent__when { flex: none; max-width: 40%; font-size: var(--st-fs-xs); color: var(--st-ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.recent--phone .recent__none { padding: 12px 14px; }
 .recent__none { margin: 0; display: flex; align-items: center; gap: 10px; padding: 16px; border: 1px dashed var(--st-line-strong);
                 border-radius: var(--st-r-lg); color: var(--st-ink-muted); font-size: var(--st-fs-sm); }
 
@@ -390,10 +415,8 @@
   .think-chip { height: 36px; }
   .send { width: 40px; height: 40px; }
   .composer-note { padding: 8px 0 6px; }
-  .greeting--phone { padding: 24px 16px; gap: 20px; }
-  .greeting--phone h1 { font-size: 24px; }
-  .greeting--phone .model-card { align-items: flex-start; padding: 14px; }
-  .greeting--phone .model-card .btn { margin-left: 58px; }   /* (under the name, beside the logo's column) */
+  .greeting--phone { padding: 16px 16px 20px; gap: 18px; justify-content: flex-end; }   /* (near the box, under the thumb) */
+  .greeting--phone h1 { margin-bottom: 4px; font-size: 22px; }
   .jump { bottom: 130px; }
   .dialog-scrim { padding: 12px; }
   .dialog-scrim--top { padding-top: 12px; }

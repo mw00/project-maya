@@ -367,10 +367,25 @@ function note() {
 // ------------------------------------------------------------------ a new chat: the model, the box, the chats to pick up
 // the model that answers here: ready or busy, its context, the last answer's speed, images, what it saved - and the Models
 // page, to switch to another
-function ModelCard() {
+function ModelCard({phone}) {
   const h = S.health || {}, m = S.metrics, st = status(true);
   const ready = S.conn === "ok" && st.text === "Idle";
   const last = m && (m.requests || [])[0], sv = m && m.savings;
+  const name = h.model_label || modelName(h.model) || "The model", state = ready ? "Ready" : st.text;
+  const pill = html`<span class=${`pill pill--${ready ? "ok" : st.tone}`}><i class="status__dot"></i>${state}</span>`;
+  if (phone) {   // (the whole card a button: the name, then its state and the facts on one line, short)
+    // (the speed and what it saved; the context size when there is neither yet - a narrow line has room for two)
+    let facts = [last && last.decode_tok_s ? `${fmt(last.decode_tok_s, last.decode_tok_s < 10 ? 1 : 0)} tok/s` : null,
+                 sv && sv.priced ? `${usd(sv.usd)} saved` : null].filter(Boolean);
+    if (!facts.length && h.max_context) facts = [`${ctxfmt(h.max_context)} context`];
+    return html`<button type="button" class="model-card model-card--phone" onClick=${() => showView("models")}
+        aria-label=${`${name}, ${state}${facts.length ? `, ${facts.join(", ")}` : ""}. Switch model`}>
+      <${ModelLogo} model=${h.model} size=${40}/>
+      <span class="model-card__text"><span class="model-card__name"><b>${name}</b></span>
+        <span class="model-card__line num"><span class="model-card__state" data-tone=${ready ? "ok" : st.tone}><i></i>${state}</span>${
+          facts.length ? ` · ${facts.join(" · ")}` : ""}</span></span>
+      <${Icon} name="chevron-right" sm/></button>`;
+  }
   const facts = [h.max_context ? ["Context", ctxfmt(h.max_context)] : null,
                  last && last.decode_tok_s ? ["Last answer", `${fmt(last.decode_tok_s, 1)} tok/s`] : null,
                  h.model ? ["Images", h.images ? "on" : "off"] : null,
@@ -378,8 +393,7 @@ function ModelCard() {
   return html`<section class="model-card" aria-label="The model">
     <${ModelLogo} model=${h.model} size=${44}/>
     <div class="model-card__text">
-      <div class="model-card__name"><b title=${h.model || ""}>${h.model_label || modelName(h.model) || "The model"}</b>
-        <span class=${`pill pill--${ready ? "ok" : st.tone}`} role="status"><i class="status__dot"></i>${ready ? "Ready" : st.text}</span></div>
+      <div class="model-card__name" role="status"><b title=${h.model || ""}>${name}</b>${pill}</div>
       ${facts.length ? html`<div class="model-card__facts num">${facts.map(([k, v]) => html`<span>${k}<b>${v}</b></span>`)}</div>` : null}
     </div>
     <button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>
@@ -391,14 +405,17 @@ function recentChats() {
   return S.chats.filter((c) => c !== S.current && c.messages.length)
     .sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, 3);
 }
-function Recent() {
+function Recent({phone}) {
   const list = recentChats();
   const folder = (c) => (c.folder && (S.folders.find((f) => f.id === c.folder) || {}).name) || "";
-  return html`<section class="recent" aria-labelledby="recent-title"><h2 id="recent-title">Pick up where you left off</h2>
-    ${list.length ? html`<div class="recent__list">${list.map((c) => html`<button type="button" class="recent__chat" key=${c.id} onClick=${() => openChat(c)}>
-      <span class="recent__meta"><${Icon} name=${folder(c) ? "folder" : "chat"} sm/><span>${[folder(c), relTime(c.updated)].filter(Boolean).join(" · ")}</span></span>
-      <b>${chatTitle(c)}</b></button>`)}</div>`
-      : html`<p class="recent__none"><${Icon} name="chat" sm/><span>Your last three chats show here. They stay in this browser.</span></p>`}
+  const when = (c) => [folder(c), relTime(c.updated)].filter(Boolean).join(" · ");
+  return html`<section class=${`recent${phone ? " recent--phone" : ""}`} aria-labelledby="recent-title"><h2 id="recent-title">Pick up where you left off</h2>
+    ${!list.length ? html`<p class="recent__none"><${Icon} name="chat" sm/><span>Your last three chats show here${phone ? "." : ". They stay in this browser."}</span></p>`
+      : phone ? html`<div class="recent__rows">${list.map((c) => html`<button type="button" class="recent__row" key=${c.id} onClick=${() => openChat(c)}>
+          <${Icon} name=${folder(c) ? "folder" : "chat"} sm/><span class="recent__title">${chatTitle(c)}</span><span class="recent__when">${when(c)}</span></button>`)}</div>`
+      : html`<div class="recent__list">${list.map((c) => html`<button type="button" class="recent__chat" key=${c.id} onClick=${() => openChat(c)}>
+          <span class="recent__meta"><${Icon} name=${folder(c) ? "folder" : "chat"} sm/><span>${when(c)}</span></span>
+          <b>${chatTitle(c)}</b></button>`)}</div>`}
   </section>`;
 }
 
@@ -406,9 +423,9 @@ function Recent() {
 function Greeting({phone}) {
   return html`<div class=${`greeting${phone ? " greeting--phone" : ""}`}>
     <h1>What are we building today?</h1>
-    <${ModelCard}/>
+    <${ModelCard} phone=${phone}/>
     ${phone ? null : html`<${Composer} center/>`}
-    <${Recent}/>
+    <${Recent} phone=${phone}/>
   </div>`;
 }
 
