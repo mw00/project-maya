@@ -28,7 +28,6 @@ import contextlib
 import base64
 import hashlib
 import hmac
-import ipaddress
 import codecs
 import itertools
 import json
@@ -4203,21 +4202,6 @@ def request_timeout() -> float:
     return s if s > 0 else 300.0
 
 
-def local_host(host: str) -> bool:
-    """A Host header naming this machine: an IP address, localhost, or this machine's own name.  A page on another
-    site that re-points its own name at 127.0.0.1 (DNS rebinding) sends that name, so it is refused."""
-    if not host:
-        return True                                     # HTTP/1.0 without Host: no browser sends that
-    name = (urlsplit("//" + host).hostname or "").rstrip(".").lower()
-    try:
-        ipaddress.ip_address(name)
-        return True
-    except ValueError:
-        pass
-    me = socket.gethostname().lower()
-    return name == "localhost" or name.endswith(".localhost") or name in (me, me.split(".")[0] + ".local", me.split(".")[0])
-
-
 def body_limit() -> int:
     """The most a request body may hold, in bytes (it is read into memory): 256 MiB, a million-token conversation with
     room to spare; STRATA_MAX_BODY_MIB changes it.  A larger one is answered 413 before it is read (Strata #893)."""
@@ -4351,11 +4335,7 @@ def make_handler(svc: Service):
 
         def _authorized(self) -> bool:
             if not svc.api_key:
-                if local_host(self.headers.get("Host", "")):
-                    return True
-                self._json(403, {"error": {"type": "permission_error", "message":
-                                 "open Maya by its IP address or localhost, or set an api_key to use another name"}})
-                return False
+                return True
             auth = self.headers.get("Authorization", "")
             given = auth[7:].strip() if auth.lower().startswith("bearer ") else self.headers.get("x-api-key", "")
             if given and any(hmac.compare_digest(given.encode(), k.encode()) for k in key_list(svc.api_key)):

@@ -1520,14 +1520,6 @@ class CorsOptIn(unittest.TestCase):
         code, _, _ = self.call("DELETE", "/v1/responses/resp_x", {"Origin": "http://evil.example"})
         self.assertEqual(code, 403)
 
-    def test_a_rebound_name_is_refused_without_an_api_key(self):
-        # DNS rebinding: the page's own name, now resolving to 127.0.0.1, arrives as the Host
-        code, _, _ = self.call("GET", "/v1/models", {"Host": "evil.example:8095"})
-        self.assertEqual(code, 403)
-        for host in ("localhost:8095", "127.0.0.1", "[::1]:8095", "192.168.1.20:8095"):
-            code, _, _ = self.call("GET", "/v1/models", {"Host": host})
-            self.assertEqual(code, 200, host)
-
     def test_the_config_value(self):
         self.assertEqual(parse_cors_origins(None), [])
         self.assertEqual(parse_cors_origins([]), [])
