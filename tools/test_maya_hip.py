@@ -345,6 +345,18 @@ class HipSetupTests(unittest.TestCase):
         query.assert_any_call(["/usr/bin/rocm-smi", "--showproductname", "--showmeminfo", "vram",
                                "--showdriverversion", "--json"])
 
+    def test_report_carries_minimax_engine_lines(self):
+        # a MiniMax report had none of its engine's lines ("last 80 of 0"): maya-mm3 --serve wrote where the model went
+        # to the server only, and REPORT_LINES knew no maya-mm3 line
+        kept = ["maya-mm3: loaded in 171.2 s, 9216 of 9216 experts in VRAM, 0.0 GB pinned pool",
+                "maya-mm3: weights: GGUF MiniMax-M3.1-Flash-Maya-S (dense Q6_K)",
+                "maya-mm3: VRAM 0 dense 7.9 GB, experts 118.1 GB",
+                "maya mm3 serve: DSpark kept 189 of 245 drafts",
+                "maya mm3 serve: prompt 201 tokens = 172 reused + 29 read in 806 ms (36.0 tok/s), 256 generated in "
+                "13334 ms (19.20 tok/s); CPU lane 0.0% of the experts"]
+        other = ["maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT"]
+        self.assertEqual(maya.speed_lines(kept + other), kept)
+
     def test_report_kfd_fallback_without_smi_or_rocm_version(self):
         self.installed_config()
         text, query = self.run_report()
