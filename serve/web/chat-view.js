@@ -149,6 +149,23 @@ class Answer extends Component {
       const body = d.querySelector(".think__body");
       if (d.open && body.dataset.pending) { body.textContent = this.props.m.reasoning; delete body.dataset.pending; }
     };
+    // the answer's numbers (tokens, speed, the prompt read): behind the info button, a tap or a click shows them
+    this.info = (open) => {
+      const pop = this.pop, btn = this.infoBtn;
+      if (!pop || open === !pop.hidden) return;
+      pop.hidden = !open;
+      btn.setAttribute("aria-expanded", String(open));
+      btn.classList.toggle("is-on", open);
+      if (open) {
+        this.away = (e) => { if (!pop.contains(e.target) && !btn.contains(e.target)) this.info(false); };
+        this.esc = (e) => { if (e.key === "Escape") { e.stopPropagation(); this.info(false); btn.focus(); } };
+        setTimeout(() => document.addEventListener("pointerdown", this.away, true), 0);
+        document.addEventListener("keydown", this.esc, true);
+      } else {
+        document.removeEventListener("pointerdown", this.away, true);
+        document.removeEventListener("keydown", this.esc, true);
+      }
+    };
     this.copy = () => {
       copyText(this.props.m.text, true);
       const use = this.base.querySelector("[data-a=copy] use");
@@ -157,7 +174,7 @@ class Answer extends Component {
     };
   }
   componentDidMount() { painters.set(this.props.m, this.paint); this.update(this.props, true); }
-  componentWillUnmount() { if (painters.get(this.props.m) === this.paint) painters.delete(this.props.m); }
+  componentWillUnmount() { this.info(false); if (painters.get(this.props.m) === this.paint) painters.delete(this.props.m); }
   shouldComponentUpdate(np) {
     if (np.m !== this.props.m) return true;
     this.update(np, false);
@@ -203,7 +220,15 @@ class Answer extends Component {
     }
     body.classList.toggle("is-streaming", streaming && !!m.text);
     const acts = this.acts;
-    acts.querySelector(".answer__meta").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
+    // (a stop stays in sight; the numbers go behind the info button, a line each)
+    acts.querySelector(".answer__meta").textContent = !streaming && m.stopped ? "Stopped" : "";
+    const lines = streaming ? [] : (m.meta || "").split(" · ").filter(Boolean).map((t) => t[0].toUpperCase() + t.slice(1));
+    this.infoBtn.hidden = !lines.length;
+    if (!lines.length) this.info(false);
+    if (this.pop.dataset.text !== lines.join("\n")) {
+      this.pop.dataset.text = lines.join("\n");
+      this.pop.replaceChildren(...lines.map((t) => { const d = document.createElement("div"); d.textContent = t; return d; }));
+    }
     acts.querySelector("[data-a=copy]").hidden = streaming || !m.text;
     acts.querySelector("[data-a=regen]").hidden = streaming || !!S.busy || !last;   // the last answer only, when nothing runs
     acts.hidden = streaming;
@@ -217,6 +242,10 @@ class Answer extends Component {
       <div class="answer__actions" ref=${(e) => { this.acts = e; }}>
         <button type="button" class="icon-btn icon-btn--sm" data-a="copy" aria-label="Copy the answer" title="Copy" onClick=${this.copy}><${Icon} name="copy" sm/></button>
         <button type="button" class="icon-btn icon-btn--sm" data-a="regen" aria-label="Write this answer again" title="Regenerate" onClick=${regenerate}><${Icon} name="refresh" sm/></button>
+        <span class="anchor">
+          <button type="button" class="icon-btn icon-btn--sm" data-a="info" ref=${(e) => { this.infoBtn = e; }} hidden aria-label="About this answer"
+            title="Tokens and speed" aria-haspopup="dialog" aria-expanded="false" onClick=${() => this.info(this.pop.hidden)}><${Icon} name="info" sm/></button>
+          <div class="answer__pop" role="dialog" aria-label="About this answer" hidden ref=${(e) => { this.pop = e; }}></div></span>
         <span class="answer__meta"></span></div>
     </article>`;
   }
