@@ -2,13 +2,13 @@
 // (an answer is painted in place while it streams), the message box with its thinking speedometer, and a new chat's
 // greeting with ideas to start from.
 import {Component, html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
-import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, timeStr, tokfmt} from "./lib.js";
+import {SPRITE, coarse, ctxfmt, esc, fmt, isPhone, modelName, relTime, timeStr, tokfmt} from "./lib.js";
 import {LEVELS, P, PRESET_NAMES, S, copyText, emit, presetOf, savePrefs, thinkTitles} from "./state.js";
 import {mcpOn} from "./server.js";
-import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newChat, painters, regenerate,
+import {addFiles, cancelEdit, chatTitle, chatView, ctxMeter, editMessage, focusInput, newChat, openChat, painters, regenerate,
         removeAttachment, scrollDown, send, setThinking, stopAnswer, thinkingOf, updateCtxMeter} from "./chats.js";
 import {markdown, onCodeClick, patchHtml, streamingMarkdown} from "./md.js";
-import {ChatMenuItems, openSettings, setSide, showView} from "./sidebar.js";
+import {ChatMenuItems, openSettings, setSide, showView, status, usd} from "./sidebar.js";
 import {MS, loadModels} from "./models.js";
 import {Gauge, Icon, Menu, MenuItem, MenuSep, ModelLogo, useDismiss} from "./ui.js";
 
@@ -375,14 +375,53 @@ const IDEAS = [
    q: "Summarize the key ideas of mixture-of-experts language models for a curious engineer, in five short paragraphs."},
 ];
 const useIdea = (q) => { S.draft = q; emit(); updateCtxMeter(); focusInput(); };
+
+// the model that answers here: ready or busy, its context, the last answer's speed, images, what it saved - and the Models
+// page, to switch to another
+function ModelCard() {
+  const h = S.health || {}, m = S.metrics, st = status(true);
+  const ready = S.conn === "ok" && st.text === "Idle";
+  const last = m && (m.requests || [])[0], sv = m && m.savings;
+  const facts = [h.max_context ? ["Context", ctxfmt(h.max_context)] : null,
+                 last && last.decode_tok_s ? ["Last answer", `${fmt(last.decode_tok_s, 1)} tok/s`] : null,
+                 h.model ? ["Images", h.images ? "on" : "off"] : null,
+                 sv && sv.priced ? ["Saved", usd(sv.usd)] : null].filter(Boolean);
+  return html`<section class="model-card" aria-label="The model">
+    <${ModelLogo} model=${h.model} size=${44}/>
+    <div class="model-card__text">
+      <div class="model-card__name"><b title=${h.model || ""}>${h.model_label || modelName(h.model) || "The model"}</b>
+        <span class=${`pill pill--${ready ? "ok" : st.tone}`} role="status"><i class="status__dot"></i>${ready ? "Ready" : st.text}</span></div>
+      ${facts.length ? html`<div class="model-card__facts num">${facts.map(([k, v]) => html`<span>${k}<b>${v}</b></span>`)}</div>` : null}
+    </div>
+    <button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>
+  </section>`;
+}
+
+// the chats to pick up again: the last three written in (a folder's name with its chats), newest first
+function recentChats() {
+  return S.chats.filter((c) => c !== S.current && c.messages.length)
+    .sort((a, b) => (b.updated || 0) - (a.updated || 0)).slice(0, 3);
+}
+function Recent({list}) {
+  const folder = (c) => (c.folder && (S.folders.find((f) => f.id === c.folder) || {}).name) || "";
+  return html`<section class="recent" aria-labelledby="recent-title"><h2 id="recent-title">Pick up where you left off</h2>
+    <div class="recent__list">${list.map((c) => html`<button type="button" class="recent__chat" key=${c.id} onClick=${() => openChat(c)}>
+      <span class="recent__meta"><${Icon} name=${folder(c) ? "folder" : "chat"} sm/><span>${[folder(c), relTime(c.updated)].filter(Boolean).join(" · ")}</span></span>
+      <b>${chatTitle(c)}</b></button>`)}</div></section>`;
+}
+
+// a new chat: what are we building, the model that answers it, the box, and the chats to pick up again - before there are
+// any, ideas to start from
 function Greeting({phone}) {
+  const recent = recentChats();
   return html`<div class=${`greeting${phone ? " greeting--phone" : ""}`}>
     <h1>What are we building today?</h1>
+    <${ModelCard}/>
     ${phone ? null : html`<${Composer} center/>`}
-    <div class="ideas" role="list" aria-label="Ideas to start with">
+    ${recent.length ? html`<${Recent} list=${recent}/>` : html`<div class="ideas" role="list" aria-label="Ideas to start with">
       ${IDEAS.map((it) => html`<div role="listitem"><button type="button" class="idea" onClick=${() => useIdea(it.q)}>
         <${Icon} name=${it.icon}/><span>${it.label}</span></button></div>`)}
-    </div>
+    </div>`}
   </div>`;
 }
 

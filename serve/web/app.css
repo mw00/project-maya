@@ -267,11 +267,33 @@
 .plus-menu .menu__item[role="menuitemcheckbox"] { align-items: center; }
 
 
-/* ---------------------------------------------------------------- a new chat: the greeting, the box, ideas */
+/* ---------------------------------------------------------------- a new chat: the greeting, the model, the box, the chats
+   to pick up again (ideas before there are any) */
 .greeting { min-height: 100%; width: 100%; max-width: calc(var(--maya-read) + 48px); margin: 0 auto; padding: 24px 24px 12vh;
             display: flex; flex-direction: column; justify-content: center; gap: 28px; }
 .greeting h1 { margin: 0; font-size: var(--st-fs-display); font-weight: 600; letter-spacing: -.015em; line-height: 1.2; text-align: center; }
 .greeting .composer-wrap { gap: 16px; }
+/* the model that answers: ready or busy, its context, the last answer's speed, images, what it saved; Switch model */
+.model-card { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; padding: 14px 14px 14px 16px; border: 1px solid var(--st-line);
+              border-radius: var(--st-r-lg); background: var(--st-surface); box-shadow: var(--st-shadow-box); }
+.model-card .model-logo { border-radius: var(--st-r-md); }
+.model-card__text { flex: 1 1 260px; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.model-card__name { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.model-card__name > b { font-size: var(--st-fs-lg); font-weight: 600; }
+.model-card .pill { height: 24px; padding: 0 9px; gap: 6px; font-size: var(--st-fs-xs); }
+.model-card__facts { display: flex; flex-wrap: wrap; gap: 2px 18px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.model-card__facts b { margin-left: 6px; font-size: var(--st-fs-md); font-weight: 600; color: var(--st-ink); }
+/* the chats to pick up again */
+.recent { display: flex; flex-direction: column; gap: 10px; }
+.recent h2 { margin: 0; padding: 0 4px; font-size: var(--st-fs-sm); font-weight: 500; color: var(--st-ink-muted); }
+.recent__list { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; }
+.recent__chat { display: flex; flex-direction: column; gap: 6px; min-width: 0; padding: 14px; border: 1px solid var(--st-line); border-radius: var(--st-r-lg);
+                background: transparent; color: var(--st-ink); text-align: left; transition: background var(--st-dur), border-color var(--st-dur); }
+.recent__chat:hover { background: var(--st-surface-2); border-color: var(--st-line-strong); }
+.recent__meta { display: flex; align-items: center; gap: 6px; min-width: 0; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.recent__meta > span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.recent__chat b { font-size: var(--st-fs-md); font-weight: 500; line-height: 1.4; overflow: hidden;
+                  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .ideas { display: flex; flex-direction: column; gap: 2px; padding: 0 6px; }
 .idea { display: flex; align-items: center; gap: 12px; width: 100%; min-height: 44px; padding: 0 12px; border: 0; border-radius: var(--st-r-md);
         background: transparent; color: var(--st-ink-soft); font-size: var(--st-fs-base); text-align: left; }
@@ -373,6 +395,8 @@
   .composer-note { padding: 8px 0 6px; }
   .greeting--phone { padding: 24px 16px; gap: 20px; }
   .greeting--phone h1 { font-size: 24px; }
+  .greeting--phone .model-card { align-items: flex-start; padding: 14px; }
+  .greeting--phone .model-card .btn { margin-left: 58px; }   /* (under the name, beside the logo's column) */
   .jump { bottom: 130px; }
   .dialog-scrim { padding: 12px; }
   .dialog-scrim--top { padding-top: 12px; }

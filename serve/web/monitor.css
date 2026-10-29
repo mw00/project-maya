@@ -18,6 +18,8 @@
 .pill--warn .status__dot { background: var(--st-warn); }
 .pill--danger { background: var(--st-danger-tint); color: var(--st-danger-text); }
 .pill--danger .status__dot { background: var(--st-danger); }
+.pill--ok { background: var(--st-ok-tint); color: var(--st-ok-text); }
+.pill--ok .status__dot { background: var(--st-ok); }
 .mon__wait { color: var(--st-ink-muted); }
 .banners { display: flex; flex-direction: column; gap: 8px; }
 .mon__h2 { margin: 8px 0 -4px; font-size: var(--st-fs-base); font-weight: 600; }
