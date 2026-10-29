@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import random
@@ -14,6 +15,7 @@ import time
 import unittest
 import unittest.mock
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -1524,6 +1526,27 @@ class WebApp(unittest.TestCase):
         self.assertIsNone(json.loads(self.get("/health")[2])["model_label"])   # (a hand-written config: the id)
         side = (ROOT / "serve/web/sidebar.js").read_text(encoding="utf-8")   # (the sidebar's model card)
         self.assertIn("S.health.model_label || modelName(S.health.model)", side)
+
+    def test_home_screen_start_url(self):
+        """The manifest's start_url and scope resolve to the page, not to /web/ (iOS's Add to Home Screen opened a 404);
+        an icon saved with the old /web/ is sent to the page."""
+        code, _, body = self.get("/web/manifest.webmanifest")
+        self.assertEqual(code, 200)
+        man = json.loads(body)
+        base = self.base + "/web/manifest.webmanifest"
+        for key in ("start_url", "scope"):
+            self.assertEqual(urllib.parse.urljoin(base, man[key]), self.base + "/")
+        for path, loc in (("/web/", "../"), ("/web", "./"), ("/web/?q=hi", "../?q=hi")):
+            with self.subTest(path=path):
+                conn = http.client.HTTPConnection(self.base.split("//")[1], timeout=10)
+                conn.request("GET", path)
+                r = conn.getresponse()
+                self.assertEqual((r.status, r.getheader("Location")), (302, loc))
+                conn.close()
+                self.assertEqual(urllib.parse.urljoin(self.base + path, loc).split("?")[0], self.base + "/")
+        code, _, body = self.get("/web/")   # (followed: the page)
+        self.assertEqual(code, 200)
+        self.assertIn(b"\"web/app.js\"", body)
 
     def test_only_the_app_files_are_served(self):
         for path in ("/web/..%2Fserver.py", "/web/index.html", "/web/test.py", "/fonts/..%2F..%2Fsetup.py",

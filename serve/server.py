@@ -3929,6 +3929,16 @@ def make_handler(svc: Service):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if path == "/web":
+                # a home-screen icon saved with the manifest's old start_url (/web/): the page is one level up. Relative,
+                # so it still works behind a path-prefixed proxy
+                raw = self.path.split("?")[0]
+                query = self.path[len(raw):]
+                self.send_response(302)
+                self.send_header("Location", ("../" if raw.endswith("/") else "./") + query)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if path.startswith("/web/"):
                 # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
                 name = path[len("/web/"):]
