@@ -214,7 +214,7 @@
 /* the answer's numbers, behind its info button: a line each, below it */
 .answer__pop { position: absolute; z-index: 20; left: 0; top: calc(100% + 6px); width: max-content; max-width: min(320px, 80vw);
                display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border-radius: var(--st-r-md); background: var(--st-surface);
-               box-shadow: var(--st-shadow-pop); font-size: var(--st-fs-sm); color: var(--st-ink-soft); font-variant-numeric: tabular-nums;
+               box-shadow: var(--st-shadow-soft); font-size: var(--st-fs-sm); color: var(--st-ink-soft); font-variant-numeric: tabular-nums;
                line-height: 1.45; animation: pop 120ms var(--st-ease); }
 .answer__pop[hidden] { display: none; }
 .thread.has-pop { padding-bottom: 130px; }

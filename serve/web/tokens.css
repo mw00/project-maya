@@ -63,6 +63,7 @@
 
   --st-shadow-box:none;
   --st-shadow-pop:0 0 0 1px #3d3d46,0 12px 32px rgba(0,0,0,.45);
+  --st-shadow-soft:0 0 0 1px #34343b,0 4px 14px rgba(0,0,0,.16);   /* (a small popover: an edge, a light lift) */
   --st-shadow-sheet:0 -12px 40px rgba(0,0,0,.45);
   --st-scrim:rgba(0,0,0,.55);
   --st-push-dim:rgba(0,0,0,.42);   /* the page's edge beside the phone's chats */
@@ -112,6 +113,7 @@
 
   --st-shadow-box:0 1px 2px rgba(24,24,29,.04),0 6px 24px rgba(24,24,29,.06);
   --st-shadow-pop:0 0 0 1px #d4d4dc,0 12px 32px rgba(24,24,29,.12);
+  --st-shadow-soft:0 0 0 1px #e6e6eb,0 4px 14px rgba(24,24,29,.05);
   --st-shadow-sheet:0 -12px 40px rgba(24,24,29,.16);
   --st-scrim:rgba(24,24,29,.35);
   --st-push-dim:rgba(24,24,29,.16);
