@@ -5204,6 +5204,8 @@ struct Model::Impl {
                          (unsigned long long) prefill.vram_unique_uses, (unsigned long long) streamed_bytes);
         }
         int routed_layer = -1, routed_chunk = -1;
+        std::vector<char> skip_k;   // chunk k's streams only its picks (skip_unpicked_rows)
+        bool skips(int k) const { return k >= 0 && (size_t) k < skip_k.size() && skip_k[(size_t) k]; }
         std::vector<int> routed_bounds;
         size_t skipped = 0, copied = 0;
     };
@@ -5299,18 +5301,33 @@ struct Model::Impl {
         if (!ok) err = "streaming layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
         return ok;
     }
+    // a chunk of T rows streams a layer's CPU-lane experts once its routing is known, only those its rows picked (the
+    // same slots, batches and summing order: an expert no row picked adds nothing) - instead of every one, queued ahead
+    // across layers: where a chunk picks few of them its streams are that much shorter, where it picks most the copies
+    // waiting for each layer's routing cost more than the few skipped save.  An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5
+    // bpw, two thirds of the experts on the CPU lane, one chunk of 530 tokens: 4.6-4.9 s -> 3.7-3.8 s, 1,040: about
+    // the same, 2,050: 6.0-6.3 -> 6.7 s.  CUDA: chunks up to DS4_SKIP_UNPICKED_ROWS (1536); DS4_SKIP_UNPICKED=1 every
+    // chunk, 0 none (HIP: none unless DS4_SKIP_UNPICKED=1, as before)
+    static int skip_unpicked_rows() {
+        static const int n = [] {
+            const char* v = std::getenv("DS4_SKIP_UNPICKED");
+            if (v != nullptr) return std::atoi(v) != 0 ? INT_MAX : 0;
+#if defined(STRATA_USE_HIP)
+            return 0;
+#else
+            const char* r = std::getenv("DS4_SKIP_UNPICKED_ROWS");
+            return r != nullptr ? std::max(0, std::atoi(r)) : 1536;
+#endif
+        }();
+        return n;
+    }
     bool copy_ahead(Dev& d, Chunk& c, Streamer& S, int di, std::string& err) {
         const int P = Chunk::kParts;
-#if defined(STRATA_USE_HIP)
-        static const bool skip_unpicked = std::getenv("DS4_SKIP_UNPICKED") != nullptr &&
-                                          std::atoi(std::getenv("DS4_SKIP_UNPICKED")) != 0;
-#else
-        constexpr bool skip_unpicked = false;
-#endif
         while (S.cp < S.b.size() && S.cp < S.kp + P) {
             const Batch& bt = S.b[S.cp];
             // Wait for this layer's routing rather than staging every expert
             // speculatively. Copies still overlap compute within the layer.
+            const bool skip_unpicked = S.skips(bt.k);
             if (skip_unpicked && (bt.il != S.routed_layer || bt.k != S.routed_chunk)) break;
             const int half = (int) (S.cp % P);
             const Layer& l0 = L[(size_t) bt.il];
@@ -16639,14 +16656,12 @@ struct Model::Impl {
         // the streamed experts as their batches arrive (each batch's slots freed for the copies at once), the VRAM ones
         // in shares between them (the device works while the copies run)
         const int di = l.dev, P = Chunk::kParts;
-#if defined(STRATA_USE_HIP)
-        if (std::getenv("DS4_SKIP_UNPICKED") != nullptr && std::atoi(std::getenv("DS4_SKIP_UNPICKED")) != 0) {
+        if (S.skips(wp.k)) {
             S.routed_layer = L0.il;
             S.routed_chunk = wp.k;
             S.routed_bounds = b;
             if (!copy_ahead(d, c, S, di, err)) return false;
         }
-#endif
         int nb = 0;
         for (size_t q = S.kp; q < S.b.size() && S.b[q].il == L0.il && S.b[q].k == wp.k; ++q) ++nb;
         int v_done = 0;
@@ -17049,6 +17064,19 @@ struct Model::Impl {
         Streamer S;
         const double stream_start = c.stream_bytes;
         const int B = std::max(1, c.ring_n / Chunk::kParts);
+        // (DS4_RUN_TRACE: this device's timeline of the run - each chunk's first layer and its end on the compute stream,
+        //  the streamed experts' copies done on the copy stream - from events at the run's start, printed at its end)
+        static const bool trace = std::getenv("DS4_RUN_TRACE") != nullptr;
+        std::vector<cudaEvent_t> tr_ev;   // (run start: compute, copies; then a chunk's first layer and end each)
+        const auto tr_rec = [&](cudaStream_t st) {
+            cudaEvent_t e = nullptr;
+            if (cudaEventCreate(&e) == cudaSuccess && cudaEventRecord(e, st) == cudaSuccess) tr_ev.push_back(e);
+            else tr_ev.push_back(nullptr);
+        };
+        if (trace && !c.flow) {
+            tr_rec(s);
+            tr_rec(c.cs);
+        }
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
             CK(cudaStreamSynchronize(s));
             CK(cudaStreamSynchronize(c.cs));
@@ -17095,6 +17123,8 @@ struct Model::Impl {
             }
             if (c.lm) return run_dev_layers(di, run, err, stream_start);
         }
+        S.skip_k.assign((size_t) nk, 0);
+        for (int k = 0; k < nk && !c.flow; ++k) S.skip_k[(size_t) k] = run.T[(size_t) k] <= skip_unpicked_rows();
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
                 if (!run.runs(k, il) || run.kv_only(k, il)) continue;   // (a long prompt's skip: no experts there)
@@ -17263,6 +17293,7 @@ struct Model::Impl {
                 }
                 // (a chunk before the cut, past the yoco layer: its sources' rows taken above, for the chunks after it)
                 if (!run.runs(k, il)) continue;
+                if (trace && !c.flow && tr_ev.size() == 2 + 2 * (size_t) k) tr_rec(s);
                 if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
                 if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, il, p0, T);
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
@@ -17275,6 +17306,7 @@ struct Model::Impl {
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
             }
+            if (trace && !c.flow && tr_ev.size() == 3 + 2 * (size_t) k) tr_rec(s);   // (DS4_RUN_TRACE: chunk k's end)
             // (chunk k's copies out of its Engram slot issued, their event recorded: the reader may refill it)
             if (!egs.empty()) c.eg_copied_seq[slot].store(wp.win, std::memory_order_release);
             if (di == head_dev && (size_t) k < chunk_done.size()) {
@@ -17299,6 +17331,26 @@ struct Model::Impl {
                     if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
                 }
             }
+        }
+        if (trace && !c.flow) {
+            tr_rec(c.cs);   // (the copies done)
+            std::string line;
+            char b[96];
+            float ms = 0;
+            for (size_t i = 2; i + 1 < tr_ev.size(); i += 2) {
+                float a = -1, z = -1;
+                if (tr_ev[0] && tr_ev[i] && cudaEventSynchronize(tr_ev[i]) == cudaSuccess) cudaEventElapsedTime(&a, tr_ev[0], tr_ev[i]);
+                if (tr_ev[0] && tr_ev[i + 1] && cudaEventSynchronize(tr_ev[i + 1]) == cudaSuccess)
+                    cudaEventElapsedTime(&z, tr_ev[0], tr_ev[i + 1]);
+                std::snprintf(b, sizeof b, " chunk %zu %.0f-%.0f", (i - 2) / 2, a, z);
+                line += b;
+            }
+            if (tr_ev[1] && tr_ev.back() && cudaEventSynchronize(tr_ev.back()) == cudaSuccess)
+                cudaEventElapsedTime(&ms, tr_ev[1], tr_ev.back());
+            std::fprintf(stderr, "ds4 run trace, CUDA%d:%s ms; copies done %.0f ms, %.2f GB streamed\n", d.id, line.c_str(),
+                         ms, (c.stream_bytes - stream_start) / 1e9);
+            for (cudaEvent_t e : tr_ev)
+                if (e) cudaEventDestroy(e);
         }
         S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
         if (!c.flow && S.copied + S.skipped > 0 && std::getenv("DS4_FLOW_STATS") != nullptr)
