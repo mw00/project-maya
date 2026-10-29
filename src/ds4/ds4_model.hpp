@@ -128,8 +128,9 @@ public:
     /// Feeds `token` at position pos(); with logits, the next token's logits are left on the head's device.
     bool step(int token, bool logits, std::string& err);
     /// Feeds n tokens (windows of up to 16, or a long run in chunks of prefill_chunk); the last `logits_rows` of them get
-    /// logits (logits_rows > 16: only a run of one chunk or window).
-    bool feed(const int* tokens, int n, int logits_rows, std::string& err);
+    /// logits (logits_rows > 16: only a run of one chunk or window).  `after`: the prompt's tokens still to come in
+    /// later feeds (a piece of it) - a long prompt's skip counts its kept rows from the prompt's end.
+    bool feed(const int* tokens, int n, int logits_rows, std::string& err, int after = 0);
     /// feed() of a prompt's end that also keeps the state before its last token in checkpoint `slot` (a prompt's
     /// last token then rides along in the run of chunks instead of a window of its own); the same as
     /// feed(n - 1), checkpoint(slot), feed(1)
@@ -166,6 +167,10 @@ public:
     /// Tokens a feed call takes at a time to use the chunked prompt path (all of a prompt: its chunks run as a
     /// pipeline; 16 without it).
     int feed_unit() const;
+    /// The chunked prompt path's chunk (0: windows), and the split's pipeline stages (its groups of GPUs, one after
+    /// another): a read of that many chunks keeps them all busy - --parallel's prompt pieces are that many chunks.
+    int prompt_chunk() const;
+    int pipeline_stages() const;
     /// Called from feed() while a run of chunks goes through the layers, with the tokens done so far.
     void set_progress(std::function<void(int64_t)> f);
     /// Asked while a run of chunks goes through the layers: true (a Stop) ends it early - one GPU after the layer it is
@@ -173,6 +178,11 @@ public:
     /// prompt's start is then not usable: restore() a checkpoint kept before the feed, or reset().
     void set_cancel(std::function<bool()> f);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
+    /// Asked while a run of chunks goes through the layers: true (a yield) ends it at a chunk every GPU reaches, as a
+    /// Stop does, but keeps the chunks read - feed() / feed_mark() return true having taken fed() of their tokens (the
+    /// rest a later feed's; feed_mark's checkpoint then not kept).  Not on a run that goes layer by layer.
+    void set_yield(std::function<bool()> f);
+    int fed() const;   // the tokens the last feed() / feed_mark() took (all of them unless a yield)
     /// A request starts (before its prompt): DISK_SKIP_AUTO may switch back on here, never mid-answer.
     void begin_request();
     int64_t pos() const;
@@ -206,12 +216,19 @@ public:
     /// The drafter for n conversations (2 or more, distinct) in one pass: draft()'s drafts and confidences for each
     /// conversation seqs[i] after its token ys[i] (the drafter's argmax), the blocks' rows through the DSpark blocks
     /// together.  can_draft_multi: whether these conversations fit one pass (their blocks in a window, each its
-    /// block's room in its context); else each drafts alone with draft().
+    /// block's room in its context); else each drafts alone with draft().  draft_pass: the conversations a pass holds
+    /// at most (1: none of several; 0: no drafter).
     bool can_draft_multi(const int* seqs, int n) const;
+    int draft_pass() const;
     bool draft_multi(const int* seqs, const int* ys, int n, std::vector<std::vector<int>>& drafts,
                      std::vector<std::vector<float>>& conf, std::string& err);
     bool verify_multi(int i, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                       uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err);
+
+    /// The expert cache's tick (its switches and new swaps) held while on - the experts stay where they are, the CPU
+    /// lane's on the lane - and the held rows ticked at the release (--multi-check holds it throughout: two runs of the
+    /// same rows then meet the same placement).
+    void cache_hold(bool on);
 
     void reset();
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
