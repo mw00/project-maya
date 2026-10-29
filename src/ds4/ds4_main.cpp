@@ -1591,12 +1591,34 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             // (a restore point: the read stops there, and a piece tells the model of the prompt only up to it - the
             //  state kept at the point is the one a whole read up to it leaves)
             const size_t upto = P.next_cut < P.cuts.size() ? (size_t) P.cuts[P.next_cut].pos : total;
-            const size_t n = std::min<size_t>({(size_t) m.feed_unit(), upto - P.done, piece - (P.done - start)});
+            size_t n = std::min<size_t>({(size_t) m.feed_unit(), upto - P.done, piece - (P.done - start)});
+            // (the rest of the prompt in one read that keeps the restore points left on the way, where that costs
+            //  at most a chunk's rows more than stopping at each - a run of chunks has a fixed cost of its own, the
+            //  CPU lane's experts streamed for it: a point near the prompt's tail read alone cost as much as the rest)
+            std::vector<std::pair<int64_t, bool>> inner;
+            const size_t rest = total - P.done;
+            // (not past a shared start a read from token 0 reaches first: the read stops there, and its state is kept
+            //  apart for new conversations - prefix_keep keeps the state the model holds then)
+            const bool start_kept = prefix_max > 0 && P.from == 0 && P.next_cut == 0 && P.next_cut < P.cuts.size() &&
+                                    P.cuts[0].shared && (size_t) P.cuts[0].pos >= prefix_min;
+            if (P.next_cut < P.cuts.size() && !last_window && !start_kept && rest <= (size_t) m.feed_unit() &&
+                rest <= piece - (P.done - start)) {
+                std::vector<int64_t> rel;
+                for (size_t j = P.next_cut; j < P.cuts.size(); ++j) rel.push_back(P.cuts[j].pos - (int64_t) P.done);
+                if (m.marks_inside((int) rest, rel))
+                    for (size_t j = P.next_cut; j < P.cuts.size(); ++j) inner.push_back({P.cuts[j].pos, P.cuts[j].shared});
+            }
+            if (!inner.empty()) n = rest;
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = P.done + n == total;
             size_t took = n;   // (fewer: a yield - the model ended the run early, the rest a later piece's)
             const double f0 = P.tail_at >= 0 ? now_ms() : 0.0;   // (TailCost: the run's wall time)
-            if (fin && last_window) {
+            if (!inner.empty()) {
+                ok = m.feed_marks(r.ids.data() + P.done, (int) n, 1, 1, inner, err);
+                if (ok) took = (size_t) m.fed();
+                // (the points the read went past: kept by it)
+                while (ok && P.next_cut < P.cuts.size() && (size_t) P.cuts[P.next_cut].pos < P.done + took) ++P.next_cut;
+            } else if (fin && last_window) {
                 ok = (n < 2 || m.feed(r.ids.data() + P.done, (int) n - 1, 0, err));
                 if (ok && n >= 2 && (size_t) m.fed() < n - 1) took = (size_t) m.fed();
                 else {
@@ -3237,6 +3259,122 @@ int check_parts(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
     return same_last && same_again && same_toks ? 0 : 1;
 }
 
+// --marks-check (tests): the --ids prompt with restore points at every whole chunk short of its end, read as the server
+// reads such a prompt - in one call that keeps them on the way (feed_marks) - and as it stopped at each before (feed()
+// up to it, mark() there, feed_mark() of the rest).  With the points on the chunks' bounds both reads take the same
+// chunks: the last row's logits must be the same bit for bit, the n greedy tokens after them the same, and from each
+// point the prompt's rest read again must give the same logits too (the state kept there is the same).
+// (--no-expert-cache keeps the experts where the load put them.)
+int check_marks(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
+    std::string err;
+    const int N = (int) ids.size(), C = m.prompt_chunk();
+    std::vector<std::pair<int64_t, bool>> at;
+    for (int p = C; C > 0 && p < N - 1 && at.size() < 4; p += C) at.push_back({p, false});
+    if (at.empty()) {
+        std::fprintf(stderr, "marks check: --ids needs more than one chunk of tokens (--prefill-chunk %d)\n", C);
+        return 2;
+    }
+    struct Read {
+        std::vector<float> last;
+        std::vector<std::vector<float>> again;   // (from each point, the rest read again)
+        std::vector<int> toks;
+    };
+    const auto read = [&](bool inside, Read& rd) -> bool {
+        m.reset();
+        if (inside) {
+            if (!m.feed_marks(ids.data(), N, 1, 1, at, err)) return false;
+        } else {
+            int done = 0;
+            for (const auto& a : at) {
+                if (!m.feed(ids.data() + done, (int) a.first - done, 0, err)) return false;
+                done = (int) a.first;
+                m.mark(a.second);
+            }
+            if (!m.feed_mark(ids.data() + done, N - done, 1, 1, err)) return false;
+        }
+        if (!m.logits(rd.last)) {
+            err = "no logits";
+            return false;
+        }
+        int tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+        rd.toks.push_back(tok);
+        for (int k = 1; k < n; ++k) {
+            if (!m.step(tok, true, err)) return false;
+            tok = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+            rd.toks.push_back(tok);
+        }
+        for (auto it = at.rbegin(); it != at.rend(); ++it) {   // (latest first: going back drops the later ones)
+            const int p = (int) it->first;
+            if (!m.restore(p) || m.pos() != p) {
+                err = "the restore point at " + std::to_string(p) + " is not there";
+                return false;
+            }
+            rd.again.emplace_back();
+            if (!m.feed_mark(ids.data() + p, N - p, 1, 1, err) || !m.logits(rd.again.back())) {
+                if (err.empty()) err = "no logits";
+                return false;
+            }
+        }
+        return true;
+    };
+    Read one, split;
+    const double t0 = now_ms();
+    if (!read(true, one)) {
+        std::fprintf(stderr, "marks check: %s\n", err.c_str());
+        return 1;
+    }
+    const double t1 = now_ms();
+    if (!read(false, split)) {
+        std::fprintf(stderr, "marks check: %s\n", err.c_str());
+        return 1;
+    }
+    const double t2 = now_ms();
+    const auto diff = [](const std::vector<float>& a, const std::vector<float>& b) {
+        double d = a.size() == b.size() ? 0.0 : 1e30;
+        for (size_t i = 0; i < a.size() && i < b.size(); ++i) d = std::max(d, (double) std::fabs(a[i] - b[i]));
+        return d;
+    };
+    const bool same_last = one.last == split.last;
+    bool same_again = one.again.size() == split.again.size();
+    double d_again = 0;
+    for (size_t i = 0; same_again && i < one.again.size(); ++i) {
+        same_again = one.again[i] == split.again[i];
+        d_again = std::max(d_again, diff(one.again[i], split.again[i]));
+    }
+    size_t t = 0;
+    while (t < one.toks.size() && t < split.toks.size() && one.toks[t] == split.toks[t]) ++t;
+    const bool same_toks = t == one.toks.size() && t == split.toks.size();
+    // (the distributions' KL, one read's against the other's: the size of a difference, rounding or not)
+    const auto kl = [](const std::vector<float>& a, const std::vector<float>& b) {
+        if (a.size() != b.size() || a.empty()) return -1.0;
+        const double ma = *std::max_element(a.begin(), a.end()), mb = *std::max_element(b.begin(), b.end());
+        double za = 0, zb = 0;
+        for (size_t i = 0; i < a.size(); ++i) za += std::exp(a[i] - ma), zb += std::exp(b[i] - mb);
+        double k = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double pa = std::exp(a[i] - ma) / za;
+            if (pa > 0) k += pa * ((a[i] - ma - std::log(za)) - (b[i] - mb - std::log(zb)));
+        }
+        return k;
+    };
+    double kl_again = 0;
+    for (size_t i = 0; i < one.again.size() && i < split.again.size(); ++i) kl_again = std::max(kl_again, kl(one.again[i], split.again[i]));
+    std::printf("marks check: %d tokens, %zu restore points (every %d); the last row's logits %s (max diff %.3g, KL "
+                "%.3g), from each point the rest again %s (max diff %.3g, KL %.3g), %d greedy tokens %s; one read %.0f "
+                "ms, stopping at each %.0f ms (each with the reads again)\n",
+                N, at.size(), C, same_last ? "bit for bit" : "DIFFER", diff(one.last, split.last), kl(one.last, split.last),
+                same_again ? "bit for bit" : "DIFFER", d_again, kl_again, n,
+                same_toks ? "the same" : ("differ from token " + std::to_string(t) + " on").c_str(), t1 - t0, t2 - t1);
+    if (const char* f = std::getenv("DS4_MARKS_DUMP")) {   // (the last rows' logits of both reads: <f>.one, <f>.split)
+        for (const auto& w : {std::make_pair(std::string(".one"), &one.last), std::make_pair(std::string(".split"), &split.last)})
+            if (FILE* fp = std::fopen((std::string(f) + w.first).c_str(), "wb")) {
+                std::fwrite(w.second->data(), 4, w.second->size(), fp);
+                std::fclose(fp);
+            }
+    }
+    return same_last && same_again && same_toks ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3284,7 +3422,7 @@ int main(int argc, char** argv) {
     bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
-    bool serve_mode = false, multi_check = false, parts_check = false, describe = false, dspark_set = false;
+    bool serve_mode = false, multi_check = false, parts_check = false, marks_check = false, describe = false, dspark_set = false;
     std::string prof_run, prof_out, spec_eval_path;
     int sampler_n = 0;
     std::string images, enc_rgb, enc_out;
@@ -3382,6 +3520,7 @@ int main(int argc, char** argv) {
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
         else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
+        else if (a == "--marks-check") marks_check = true;   // (tests: restore points kept in one read, or stopping at each)
         else if (a == "--pack-info") describe = true;
         else if (a == "--profile-run") prof_run = val("--profile-run");
         else if (a == "--profile-out") prof_out = val("--profile-out");
@@ -3405,6 +3544,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         return strata::ds4::pack_info(o.pack, o.profile, kernel_types(), stdout);
+    }
+    if (marks_check && ids_s.empty()) {
+        std::fprintf(stderr, "--marks-check needs --ids (a prompt of two chunks or more)\n");
+        return 2;
     }
     if (parts_check && ids_s.empty()) {
         std::fprintf(stderr, "--parts-check needs --ids (a prompt of two chunks or more)\n");
@@ -3493,6 +3636,7 @@ int main(int argc, char** argv) {
     }
     if (multi_check) return check_multi(m, parse_ids(ids_s), std::max(2, n));
     if (parts_check) return check_parts(m, parse_ids(ids_s), std::max(2, n));
+    if (marks_check) return check_marks(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
         std::ifstream in(ppl);
         std::string line;

@@ -808,6 +808,10 @@ struct Chunk {
     uint64_t it_lc = 0;                      // items taken from the layer cache
 };
 
+// the states a run of chunks keeps on the way, at most: the restore points inside it (feed_marks) and the checkpoint
+// before its last row (feed_mark)
+constexpr int kSnapN = 8;
+
 struct Layer {
     int il = 0, dev = 0, ratio = 0;
     // its group (tensor parallel: nm members, each a copy of the device state in mates, member mi's share of the
@@ -844,9 +848,10 @@ struct Layer {
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
-    // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
-    uint8_t* snap_win = nullptr;
-    float *snap_kv = nullptr, *snap_sc = nullptr;
+    // a run of chunks' states on the way (feed_mark, feed_marks): the ring and the partial group as they were before a
+    // row, a set for each
+    uint8_t* snap_win[kSnapN] = {};
+    float *snap_kv[kSnapN] = {}, *snap_sc[kSnapN] = {};
     // routed experts
     x3::ExpertLayout lay;
     size_t blob = 0;                            // bytes of one expert's blob
@@ -1039,7 +1044,10 @@ struct WinPlan {
     bool par = false, async = false;
     unsigned win = 0;
     int k = 0;              // (a run of chunks) the chunk's index: its hand-off slot k % 2
-    int snap_t = -1;        // (a run of chunks) the chunk's row whose state before it the layers keep (-1: none)
+    // (a run of chunks) the chunk's rows whose states before them the layers keep: row snap_t[i] into the layers'
+    // snapshot set snap_ix[i], in row order
+    int snap_n = 0;
+    int snap_t[kSnapN] = {}, snap_ix[kSnapN] = {};
     int eg_slot = -1;       // (a run of chunks, layer-major) the Engram rows' slot (-1: k % 2)
     unsigned vl = 0;        // (a window) bit t: token t is inside a picture's span (routed with the image bias)
     // (--parallel, Impl::step_multi) rows of nrow conversations instead of a window of one: row t is conversation
@@ -8683,12 +8691,16 @@ struct Model::Impl {
     // the state at pos as a restore point a request asked for (shared: the end of a shared start, given up last); one
     // at this position already is kept (it holds the same state), else the one mark_victim() picks makes room
     void mark(bool shared) {
-        if (marks_cap() <= 0 || pos <= 0) return;
+        if (Check* c = mark_room(pos, shared)) snap_into(*c);
+    }
+    // the restore point at position `at` to fill (nullptr: none kept, or one there already - in use again)
+    Check* mark_room(int64_t at, bool shared) {
+        if (marks_cap() <= 0 || at <= 0) return nullptr;
         for (Check& x : mk)
-            if (x.pos == pos) {
+            if (x.pos == at) {
                 x.shared = x.shared || shared;
                 x.used = ++mark_clock;
-                return;
+                return nullptr;
             }
         size_t k = mk.size();
         if ((int) k >= marks_cap()) {
@@ -8698,10 +8710,10 @@ struct Model::Impl {
         } else
             mk.emplace_back();
         Check& c = mk[k];   // (one given up: its buffers taken over)
-        snap_into(c);
         c.shared = shared;
         c.used = ++mark_clock;
         slot_held = false;   // (a slot taken before holds no such point)
+        return &c;
     }
     // checkpoint i of best_check()'s: ck[0..2], then the marks
     const Check& check_at(int i) const { return i < 3 ? ck[i] : mk[(size_t) i - 3]; }
@@ -16304,7 +16316,7 @@ struct Model::Impl {
         if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, HD, 0.0f, err)) return false;
         if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, HD, 0.0f, err)) return false;
         prof_mark(d, 4);
-        const bool snap = !kv_only && wp.snap_t >= 0 && mi == 0 && L0.snap_win != nullptr;
+        const bool snap = !kv_only && wp.snap_n > 0 && mi == 0;
         if (!kv_only) {
             Finish fq;
             fq.w = l.q_norm;
@@ -16323,10 +16335,13 @@ struct Model::Impl {
             fk.dst = c.ext + (size_t) g.win * HD;
             fk.dst_stride = HD;
             finish(c.kvr, T, HD, HD, fk, s);
-            // feed_mark's checkpoint: the ring as it was before row snap_t - the old ring, then the chunk's rows before it
-            if (snap) {
-                CK(cudaMemcpyAsync(L0.snap_win, l.win, (size_t) g.win * win_rb(), cudaMemcpyDeviceToDevice, s));
-                if (wp.snap_t > 0) ext_to_ring(c.ext, L0.snap_win, p0, g.win, wp.snap_t, HD, s, nullptr);
+            // the states kept on the way (feed_mark, feed_marks): the ring as it was before each row snap_t - the old
+            // ring, then the chunk's rows before it
+            for (int i = 0; snap && i < wp.snap_n; ++i) {
+                uint8_t* sw = L0.snap_win[wp.snap_ix[i]];
+                if (sw == nullptr) continue;
+                CK(cudaMemcpyAsync(sw, l.win, (size_t) g.win * win_rb(), cudaMemcpyDeviceToDevice, s));
+                if (wp.snap_t[i] > 0) ext_to_ring(c.ext, sw, p0, g.win, wp.snap_t[i], HD, s, nullptr);
             }
             ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
         }
@@ -16346,14 +16361,16 @@ struct Model::Impl {
                     finish(c.ckr, T, HD, HD, fc, s);
                     latent = c.ckr;
                 } else {
-                    if (snap && L0.snap_kv != nullptr) {   // (each slot: the latest row before snap_t that holds it)
-                        const int64_t ps = p0 + wp.snap_t;
+                    for (int i = 0; snap && i < wp.snap_n; ++i) {   // (each slot: the latest row before snap_t that holds it)
+                        float *skv = L0.snap_kv[wp.snap_ix[i]], *ssc = L0.snap_sc[wp.snap_ix[i]];
+                        if (skv == nullptr) continue;
+                        const int64_t ps = p0 + wp.snap_t[i];
                         for (int sl = 0; sl < R; ++sl) {
                             const int64_t q = ps - 1 - (((ps - 1 - sl) % R) + R) % R;
                             const float* kv = q >= p0 ? c.ckr + (size_t) (q - p0) * HD : l.c_kv + (size_t) sl * HD;
                             const float* sc = q >= p0 ? c.cgr + (size_t) (q - p0) * HD : l.c_score + (size_t) sl * HD;
-                            CK(cudaMemcpyAsync(L0.snap_kv + (size_t) sl * HD, kv, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
-                            CK(cudaMemcpyAsync(L0.snap_sc + (size_t) sl * HD, sc, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(skv + (size_t) sl * HD, kv, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
+                            CK(cudaMemcpyAsync(ssc + (size_t) sl * HD, sc, (size_t) HD * 4, cudaMemcpyDeviceToDevice, s));
                         }
                     }
                     compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, c.latent, s);
@@ -16699,7 +16716,18 @@ struct Model::Impl {
         std::vector<int64_t> p0;
         std::vector<int> T;
         std::vector<unsigned> seq;
-        int64_t snap_pos = -1;   // feed_mark: the position whose state before it the layers keep (-1: none)
+        // the positions whose states before them the layers keep, in order, each into the layers' snapshot set of its
+        // index: feed_marks' restore points inside the run, then feed_mark's position before the run's last row
+        std::vector<int64_t> snap_pos;
+        // chunk [p0, p0 + T)'s rows among them, into wp
+        void snaps(int64_t p0, int T, WinPlan& wp) const {
+            wp.snap_n = 0;
+            for (size_t i = 0; i < snap_pos.size() && wp.snap_n < kSnapN; ++i)
+                if (snap_pos[i] >= p0 && snap_pos[i] < p0 + T) {
+                    wp.snap_t[wp.snap_n] = (int) (snap_pos[i] - p0);
+                    wp.snap_ix[wp.snap_n++] = (int) i;
+                }
+        }
         // a long prompt's skip (forward_chunks): the cut at row cut_r of chunk cut_k - the chunks before it go through
         // the layers before `yoco`, that layer as layer_chunk's kv_only and none after it; chunk cut_k's rows before
         // cut_r the same, its rows from cut_r on and the chunks after it through every layer (yoco -1: no skip)
@@ -16862,7 +16890,7 @@ struct Model::Impl {
         if (r0 <= 0) return layer_chunk(L0, mi, p0, T, wp, S, err);
         if (il == run.yoco) {
             WinPlan w0 = wp;
-            w0.snap_t = -1;
+            w0.snap_n = 0;
             if (!layer_chunk(L0, mi, p0, r0, w0, S, err, true)) return false;
         }
         Chunk& c = *chunks[(size_t) member(L0, mi).dev];
@@ -16871,7 +16899,12 @@ struct Model::Impl {
         c.h += (size_t) r0 * g.hc * g.dim;
         c.pre += (size_t) r0 * 8;
         WinPlan w1 = wp;
-        w1.snap_t = wp.snap_t >= r0 ? wp.snap_t - r0 : -1;
+        w1.snap_n = 0;
+        for (int i = 0; i < wp.snap_n; ++i)
+            if (wp.snap_t[i] >= r0) {
+                w1.snap_t[w1.snap_n] = wp.snap_t[i] - r0;
+                w1.snap_ix[w1.snap_n++] = wp.snap_ix[i];
+            }
         const bool ok = layer_chunk(L0, mi, p0 + r0, T - r0, w1, S, err);
         c.h = h0;
         c.pre = pre0;
@@ -16923,7 +16956,7 @@ struct Model::Impl {
                 wp.async = true;
                 wp.win = run.seq[(size_t) k];
                 wp.k = k;
-                wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
+                run.snaps(p0, T, wp);
                 if (L0.eg >= 0) {   // this unit's rows ready, the next one's on their way
                     const double te = now_ms();
                     eg_next.get();
@@ -17168,7 +17201,7 @@ struct Model::Impl {
             wp.async = true;
             wp.win = run.seq[(size_t) k];
             wp.k = k;
-            wp.snap_t = run.snap_pos >= p0 && run.snap_pos < p0 + T ? (int) (run.snap_pos - p0) : -1;
+            run.snaps(p0, T, wp);
             bool started = false;
             std::vector<char> got(srcs.size(), 0);
             for (int il = 0; il < g.nl; ++il) {
@@ -18139,20 +18172,41 @@ struct Model::Impl {
     // start: chunk cut_k's rows go to the other groups whole); with the suffix on one GPU of a layer split, or one
     // tensor-parallel group under DS4_YOCO_TP (yoco_tp_group), as on one GPU.  DS4_YOCO=1 (0: off); not with every
     // row's logits (tests)
-    void plan_chunks(int n, int logits_rows, FeedPlan& fp, int after = 0) {
+    // the rows at a read's end that a long prompt's skip runs through every layer (layer yl the skip's first; 0: none)
+    int yoco_keep(int yl) const {
+        // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
+        //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
+        static const int keep_env = std::getenv("DS4_YOCO_KEEP") ? std::atoi(std::getenv("DS4_YOCO_KEEP")) : 0;
+        return yl <= 0 ? 0
+               : keep_env > 0 ? std::max(keep_env, g.win)
+               : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
+    }
+    // a read of n tokens that keeps restore points at rows rel (in order) on the way (feed_marks): the rows it runs
+    // through the layers past a long prompt's skip that reading up to each point and stopping there would have left out
+    // - each stretch after the first one's skip (the one read runs every row from keep before its first point through
+    // every layer, so that the states at the points are the ones those reads leave; the first stretch's skip is its own)
+    int inner_cost(int n, const std::vector<int64_t>& rel) const {
+        const int yl = yoco_layer(), keep = yoco_keep(yl);
+        if (yl <= 0) return 0;
+        int cost = 0;
+        for (size_t j = 0; j < rel.size(); ++j) {
+            const int len = (int) ((j + 1 < rel.size() ? rel[j + 1] : n) - rel[j]), skip = len - keep;
+            if (skip >= kYocoMin) cost += skip;
+        }
+        return cost;
+    }
+    // first_mark: the first restore point the read keeps on the way (feed_marks), its row (-1: none) - the rows from
+    // keep before it go through every layer
+    void plan_chunks(int n, int logits_rows, FeedPlan& fp, int after = 0, int first_mark = -1) {
         fp.ends.clear();
         fp.skip = -1;
         fp.cut_k = fp.cut_r = 0;
         const int yl = logits_rows > kWin ? -1 : yoco_layer();
-        // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
-        //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
-        static const int keep_env = std::getenv("DS4_YOCO_KEEP") ? std::atoi(std::getenv("DS4_YOCO_KEEP")) : 0;
-        const int keep = yl <= 0 ? 0
-                         : keep_env > 0 ? std::max(keep_env, g.win)
-                         : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
+        const int keep = yoco_keep(yl);
         // (a piece of a longer prompt, `after` more of its tokens in later feeds: the kept rows are the prompt's last,
         //  so a piece wholly before them is KV-only past yoco - as its rows are in the prompt read whole)
-        const int skip = std::min(n, n + after - keep);
+        int skip = std::min(n, n + after - keep);
+        if (first_mark >= 0) skip = std::min(skip, first_mark - keep);
         const int a = yl > 0 && skip >= kYocoMin ? skip : 0;
         const bool cut_rows = a > 0 && (yoco_one_gpu() || yoco_suffix_gpu(yl) || yoco_tp_group());
         if (a > 0 && yoco_tp_group()) {   // (DS4_YOCO_TP: once)
@@ -18194,14 +18248,21 @@ struct Model::Impl {
     // whole (Model::feed_part): the n tokens are chunks [k0, k1) of that plan, read as its one call reads them - the
     // same chunks, the skip's cut where the whole run has it, the buffers laid out for its widest chunk.
     // after: a piece of a longer prompt (whole: none), its tokens still to come in later feeds (plan_chunks)
+    // inner (feed_marks): restore points inside the run (positions in it, in order, at most kSnapN - 1; shared: the end of
+    // a shared start), each kept from what the layers kept of it on the way - as mark() at that position would keep it
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1,
-                        const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0, int after = 0) {
+                        const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0, int after = 0,
+                        const std::vector<std::pair<int64_t, bool>>* inner = nullptr) {
 #if defined(STRATA_USE_HIP)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;
         }
 #endif
+        if (inner != nullptr && (whole != nullptr || inner->size() + 1 > (size_t) kSnapN)) {
+            err = "forward_chunks: restore points a run cannot keep";
+            return false;
+        }
         if (lend_broken) {
             err = kLendBroken;
             return false;
@@ -18218,7 +18279,7 @@ struct Model::Impl {
             }
         FeedPlan own;
         if (whole == nullptr) {
-            plan_chunks(n, logits_rows, own, after);
+            plan_chunks(n, logits_rows, own, after, inner != nullptr && !inner->empty() ? (int) (inner->front().first - pos) : -1);
             k0 = 0;
             k1 = (int) own.ends.size();
         }
@@ -18284,14 +18345,20 @@ struct Model::Impl {
         } else if (!borrow_begin(per, err))
             return false;
         plan_streams();
-        if (snap_slot >= 0) {   // feed_mark: the state before the run's last row, kept by its layers on the way
-            run.snap_pos = pos + n - 1;
-            for (int il = 0; il < g.nl; ++il) {
-                Layer& l = L[(size_t) il];
-                Dev& d = devs[(size_t) l.dev];
-                if (l.snap_win == nullptr && !dalloc(d, l.snap_win, (size_t) g.win * win_rb(), err)) return false;
-                if (l.c_kv != nullptr && l.snap_kv == nullptr &&
-                    (!dalloc(d, l.snap_kv, (size_t) l.ratio * g.hd, err) || !dalloc(d, l.snap_sc, (size_t) l.ratio * g.hd, err)))
+        // the states the layers keep on the way: feed_marks' restore points inside the run, then feed_mark's state
+        // before the run's last row - a set of buffers each
+        run.snap_pos.clear();
+        if (inner != nullptr)
+            for (const auto& m : *inner) run.snap_pos.push_back(m.first);
+        if (snap_slot >= 0) run.snap_pos.push_back(pos + n - 1);
+        for (int il = 0; il < g.nl && !run.snap_pos.empty(); ++il) {
+            Layer& l = L[(size_t) il];
+            Dev& d = devs[(size_t) l.dev];
+            for (size_t i = 0; i < run.snap_pos.size(); ++i) {
+                if (l.snap_win[i] == nullptr && !dalloc(d, l.snap_win[i], (size_t) g.win * win_rb(), err)) return false;
+                if (l.c_kv != nullptr && l.snap_kv[i] == nullptr &&
+                    (!dalloc(d, l.snap_kv[i], (size_t) l.ratio * g.hd, err) ||
+                     !dalloc(d, l.snap_sc[i], (size_t) l.ratio * g.hd, err)))
                     return false;
             }
         }
@@ -18621,33 +18688,43 @@ struct Model::Impl {
         const bool kv_only = fp.skip >= 0 && fp.cut_k >= k1;
         const int nr = std::min(T_last, tap_cap);
         if (run_end && took == n && !kv_only && !seed_drafter(pos - nr, nr, 0, err)) return false;
-        if (snap_slot >= 0 && took == n) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
-            // the next feed seeds them again from its own rows, past this position)
-            Check& ckp = ck[snap_slot & 1];
-            ckp.pos = run.snap_pos;
-            ckp.win.resize(L.size());
-            ckp.comp.resize(L.size() * 2);
-            for (size_t i = 0; i < L.size(); ++i) {
-                Layer& l = L[i];
-                Dev& dv = devs[(size_t) l.dev];
-                cudaSetDevice(dv.id);
-                const bool kept = !l.mtp && l.snap_win != nullptr;
-                ckp.win[i].resize((size_t) g.win * win_rb());
-                CK(cudaMemcpyAsync(ckp.win[i].data(), kept ? l.snap_win : l.win, ckp.win[i].size(),
-                                   cudaMemcpyDeviceToHost, dv.st));
-                if (l.c_kv) {
-                    ckp.comp[2 * i].resize((size_t) l.ratio * g.hd);
-                    ckp.comp[2 * i + 1].resize((size_t) l.ratio * g.hd);
-                    CK(cudaMemcpyAsync(ckp.comp[2 * i].data(), kept && l.snap_kv ? l.snap_kv : l.c_kv,
-                                       ckp.comp[2 * i].size() * 4, cudaMemcpyDeviceToHost, dv.st));
-                    CK(cudaMemcpyAsync(ckp.comp[2 * i + 1].data(), kept && l.snap_sc ? l.snap_sc : l.c_score,
-                                       ckp.comp[2 * i + 1].size() * 4, cudaMemcpyDeviceToHost, dv.st));
-                }
+        // feed_marks' restore points the run went past (a yield's: those before where it stopped), in order, as mark()
+        // keeps them; then feed_mark's checkpoint `snap_slot` - each from what the layers kept of it
+        for (size_t j = 0; inner != nullptr && j < inner->size(); ++j)
+            if ((*inner)[j].first < pos)
+                if (Check* c = mark_room((*inner)[j].first, (*inner)[j].second))
+                    if (!snap_check(*c, (*inner)[j].first, (int) j, err)) return false;
+        if (snap_slot >= 0 && took == n &&
+            !snap_check(ck[snap_slot & 1], run.snap_pos.back(), (int) run.snap_pos.size() - 1, err))
+            return false;
+        return true;
+    }
+    // the state before position `at` from the layers' snapshot set ix (the drafter's blocks: as they are - the next
+    // feed seeds them again from its own rows, past this position)
+    bool snap_check(Check& ckp, int64_t at, int ix, std::string& err) {
+        ckp.pos = at;
+        ckp.win.resize(L.size());
+        ckp.comp.resize(L.size() * 2);
+        for (size_t i = 0; i < L.size(); ++i) {
+            Layer& l = L[i];
+            Dev& dv = devs[(size_t) l.dev];
+            cudaSetDevice(dv.id);
+            const bool kept = !l.mtp && l.snap_win[ix] != nullptr;
+            ckp.win[i].resize((size_t) g.win * win_rb());
+            CK(cudaMemcpyAsync(ckp.win[i].data(), kept ? l.snap_win[ix] : l.win, ckp.win[i].size(),
+                               cudaMemcpyDeviceToHost, dv.st));
+            if (l.c_kv) {
+                ckp.comp[2 * i].resize((size_t) l.ratio * g.hd);
+                ckp.comp[2 * i + 1].resize((size_t) l.ratio * g.hd);
+                CK(cudaMemcpyAsync(ckp.comp[2 * i].data(), kept && l.snap_kv[ix] ? l.snap_kv[ix] : l.c_kv,
+                                   ckp.comp[2 * i].size() * 4, cudaMemcpyDeviceToHost, dv.st));
+                CK(cudaMemcpyAsync(ckp.comp[2 * i + 1].data(), kept && l.snap_sc[ix] ? l.snap_sc[ix] : l.c_score,
+                                   ckp.comp[2 * i + 1].size() * 4, cudaMemcpyDeviceToHost, dv.st));
             }
-            for (Dev& dv : devs) {
-                cudaSetDevice(dv.id);
-                CK(cudaStreamSynchronize(dv.st));
-            }
+        }
+        for (Dev& dv : devs) {
+            cudaSetDevice(dv.id);
+            CK(cudaStreamSynchronize(dv.st));
         }
         return true;
     }
@@ -20536,6 +20613,51 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
     const bool ok = n < 1 || p.feed_windows(tokens + n - 1, 1, logits_rows, err);
     if (ok) p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
     return ok;
+}
+bool Model::feed_marks(const int* tokens, int n, int logits_rows, int slot,
+                       const std::vector<std::pair<int64_t, bool>>& inner, std::string& err) {
+    if (inner.empty()) return feed_mark(tokens, n, logits_rows, slot, err);
+    Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    for (size_t j = 0; j < inner.size(); ++j)
+        if (inner[j].first <= p0 || inner[j].first >= p0 + n - 1 || (j > 0 && inner[j].first <= inner[j - 1].first)) {
+            err = "feed_marks: a restore point that is not inside the read, or out of order";
+            return false;
+        }
+    if (!feed_release(err)) return false;   // (another read: a prompt's room kept between its parts handed back first)
+    p.main_at.store("reading a prompt", std::memory_order_relaxed);
+    p.pm.last = -1;
+    p.halted = false;
+    p.fed_n = n;
+    const double t0 = now_ms();
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && inner.size() + 1 <= (size_t) kSnapN && p.pick_path(n)) {
+        const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot, nullptr, 0, 0, 0, &inner);
+        if (ok) p.path_done(now_ms() - t0);
+        return ok;
+    }
+    // windows: up to each point, the state kept there, then feed_mark's (a window of its own for the last token)
+    int done = 0;
+    for (const auto& m : inner) {
+        const int to = (int) (m.first - p0);
+        if (!p.feed_windows(tokens + done, to - done, 0, err)) return false;
+        done = to;
+        p.mark(m.second);
+    }
+    if (n - 1 > done && !p.feed_windows(tokens + done, n - 1 - done, 0, err)) return false;
+    p.checkpoint(slot);
+    const bool ok = p.feed_windows(tokens + n - 1, 1, logits_rows, err);
+    if (ok) p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
+    return ok;
+}
+bool Model::marks_inside(int n, const std::vector<int64_t>& rel) const {
+    const Impl& p = *p_;
+    if (p.chunk <= 0 || rel.empty() || rel.size() + 1 > (size_t) kSnapN || rel.front() <= 0 || rel.back() >= n - 1)
+        return false;
+    static const bool on = [] {
+        const char* v = Impl::ds4_env("DS4_MARKS_INSIDE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on && p.inner_cost(n, rel) <= p.chunk;
 }
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
 bool Model::feed_plan(int n, int logits_rows, int slot, FeedPlan& plan) {

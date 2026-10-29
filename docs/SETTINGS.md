@@ -1562,14 +1562,22 @@ keep the state at three more places of each prompt it reads:
 - the end of the system prompt and its tools (the first user turn), given up last: another conversation behind the same
   start reads only its own part.
 
-None under 1,024 tokens, and none for a prompt with pictures. The read stops at each point and copies the state there to
-RAM - the window rings and the compressors' partial groups, a few MB (V4.1: its 43 layers' 128-row rings; the engine's
-log gives the size at the first one) - and a later prompt that leaves this one past a point reads on from there, from
-exactly the state the read kept. Each piece is read as a prompt of its own: with the prompt skip
-(`MAYA_DS4_PROMPT_SKIP`), layers 20-39 then also run on up to ~2,700 tokens before a point, which a read without the
-point would have skipped (as many as lie between the point and the prompt's end, when that is fewer), and the pieces'
-chunks end at the point, so that first read's answer can differ from a read without points the way another
-`--prefill-chunk` can. Each conversation `--parallel` holds has its own points, and a kept conversation keeps them and
+None under 1,024 tokens, and none for a prompt with pictures. The read keeps the state at each point - the window rings
+and the compressors' partial groups, a few MB in RAM (V4.1: its 43 layers' 128-row rings; the engine's log gives the
+size at the first one) - and a later prompt that leaves this one past a point reads on from there, from exactly that
+state. Where the points lie near the prompt's end (the tail point, and the last user turn's start when that turn is
+short), the read takes them on the way: one run of chunks, its layers keeping the state before each point as they pass
+it (`MAYA_DS4_MARKS_INSIDE`). Before, the read stopped at each and read the stretch after it as a prompt of its own -
+and with experts on the CPU lane each run of chunks streams them all once, a few seconds on GPUs that cannot hold them,
+so an agent's turn of 1,000 tokens took two of those. Elsewhere it still stops at the point: with the prompt skip
+(`MAYA_DS4_PROMPT_SKIP`) the one run would put the rows between a far point and the prompt's end through layers 20-39,
+which the stretch read alone skips (one read through a point does so only while that costs at most a chunk's rows).
+A read from token 0 also stops at the end of the system prompt and its tools, whose state is kept apart for new
+conversations (below). A tail point taken on the way costs no stop, so the tail point's measured cost (above) counts
+only the reads that stop at it. Each piece read alone, layers 20-39 also run on up to ~2,700 tokens before its point, which a read without the point
+would have skipped, and the pieces' chunks end at the point, so that first read's answer can differ from a read without
+points the way another `--prefill-chunk` can. `maya-ds4 --marks-check --ids ...` compares the two reads: with the skip
+off the same logits bit for bit, and from each point the same state. Each conversation `--parallel` holds has its own points, and a kept conversation keeps them and
 is taken back at them too. An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5 bpw, an 18K-token chat: its last message edited, the
 first token after 15.0 s without the points (every token read again), 0.2 s with them (18,041 tokens kept, 14 read);
 the first read of the chat 16.7 -> 17.7 s.
@@ -1579,6 +1587,7 @@ the first read of the chat 16.7 -> 17.7 s.
 | `MAYA_DS4_RESTORE_POINTS` | 4 | `N` (1-16): the server asks for the points, and the engine keeps up to N a conversation besides its three - the least recently used gives way, the shared start last - in RAM, in every conversation it holds and in every kept conversation's slot; `0`: no GEN line carries them, the engine as before |
 | `MAYA_DS4_RESTORE_TAIL` | 512 | how many tokens before the prompt's end the tail point sits; `0`: no tail point |
 | `MAYA_DS4_RESTORE_TAIL_AUTO` | 1 | the engine leaves the tail point out where it measured its cost higher than reading its tokens again (above); `0`: kept on every read, as before |
+| `MAYA_DS4_MARKS_INSIDE` | on (1) | `0`: the read stops at every point, as before |
 
 ### New conversations behind the same system prompt and tools
 
