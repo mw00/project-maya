@@ -3934,6 +3934,8 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
         d = pack.parent if pack else None
         if config_family(cfg) == "deepseek":   # (maya-ds4 runs its vision tower itself: on unless --vision off, #416)
             images = "off" if "--vision" in args[:-1] and args[args.index("--vision") + 1] == "off" else "on"
+        elif config_family(cfg) == "minimax":   # (maya-mm3's too: --vision on when the pack has it, left out without)
+            images = "on" if flag_value(args, "--vision") == "on" else "off"
         else:
             images = "on" if cfg.get("vision") else "off"
         where = ""

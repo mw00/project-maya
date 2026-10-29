@@ -357,6 +357,18 @@ class HipSetupTests(unittest.TestCase):
         other = ["maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT"]
         self.assertEqual(maya.speed_lines(kept + other), kept)
 
+    def test_report_minimax_images_from_its_vision_arg(self):
+        # a MiniMax report said "images off" with --vision on: it read cfg["vision"], which only GLM's configs set
+        path = self.installed_config()
+        cfg = maya.read_json(path)
+        cfg["exe"] = str(self.root / "build-hip/maya-mm3")
+        for args, shown in ((["--vision", "on"], "images on"), (["--vision", "off"], "images off"), ([], "images off")):
+            with self.subTest(args=args):
+                cfg["args"] = ["--pack", str(self.root / "model/maya-mm3"), "--max-context", "65536"] + args
+                path.write_text(json.dumps(cfg))
+                text, _ = self.run_report(cfg_path=path)
+                self.assertIn(shown + ",", text)
+
     def test_report_kfd_fallback_without_smi_or_rocm_version(self):
         self.installed_config()
         text, query = self.run_report()
