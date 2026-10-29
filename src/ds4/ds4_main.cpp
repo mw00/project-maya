@@ -131,7 +131,7 @@ void usage() {
                  "           [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
                  "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
-                 "           (--ids I,J,... [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
+                 "           (--ids I,J,... | @FILE [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
                  "maya-ds4 --pack <model>/maya-ds4 --pack-info [--expert-profile FILE]   the pack described: no GPU, no "
                  "weights read\n"
@@ -3508,7 +3508,17 @@ int main(int argc, char** argv) {
             std::printf("maya-ds4 %s (build %s)\n", MAYA_RELEASE, MAYA_BUILD_ID);
             return 0;
         }
-        else if (a == "--ids") ids_s = val("--ids");
+        else if (a == "--ids") {   // (@FILE: the ids from a file - a long prompt's are more than one argument may hold)
+            ids_s = val("--ids");
+            if (!ids_s.empty() && ids_s[0] == '@') {
+                std::ifstream f(ids_s.substr(1));
+                if (!f) {
+                    std::fprintf(stderr, "--ids: cannot read %s\n", ids_s.c_str() + 1);
+                    return 2;
+                }
+                ids_s.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+            }
+        }
         else if (a == "--n") n = std::atoi(val("--n").c_str());
         else if (a == "--window") window = std::max(1, std::atoi(val("--window").c_str()));   // (> 16: the chunked prompt path)
         else if (a == "--dump-logits") dump = val("--dump-logits");
