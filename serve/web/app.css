@@ -211,12 +211,13 @@
 .dot-pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--st-ink); animation: pulse 1s ease-in-out infinite; }
 .answer__actions { display: flex; align-items: center; gap: 2px; margin-left: -8px; min-height: 32px; }
 .answer__meta { margin-left: 8px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
-/* the answer's numbers, behind its info button: a line each */
-.answer__pop { position: absolute; z-index: 20; left: 0; bottom: calc(100% + 6px); width: max-content; max-width: min(320px, 80vw);
+/* the answer's numbers, behind its info button: a line each, below it */
+.answer__pop { position: absolute; z-index: 20; left: 0; top: calc(100% + 6px); width: max-content; max-width: min(320px, 80vw);
                display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border-radius: var(--st-r-md); background: var(--st-surface);
                box-shadow: var(--st-shadow-pop); font-size: var(--st-fs-sm); color: var(--st-ink-soft); font-variant-numeric: tabular-nums;
                line-height: 1.45; animation: pop 120ms var(--st-ease); }
 .answer__pop[hidden] { display: none; }
+.thread.has-pop { padding-bottom: 130px; }
 .answer__pop > div:first-child { color: var(--st-ink); font-weight: 600; }
 .answer__actions .icon-btn.is-on { background: var(--st-surface-2); color: var(--st-ink); }
 

@@ -156,7 +156,13 @@ class Answer extends Component {
       pop.hidden = !open;
       btn.setAttribute("aria-expanded", String(open));
       btn.classList.toggle("is-on", open);
+      const thread = this.base && this.base.closest(".thread");
+      if (thread) thread.classList.toggle("has-pop", open);   // (room under the last answer for it, while open)
       if (open) {
+        // (the last answer's would open under the message box: the chat scrolls it into sight above the box)
+        const sc = chatView.el, dock = document.querySelector(".chat__dock");
+        const over = sc && dock ? pop.getBoundingClientRect().bottom + 12 - dock.getBoundingClientRect().top : 0;
+        if (over > 0) sc.scrollBy({top: over, behavior: "smooth"});
         this.away = (e) => { if (!pop.contains(e.target) && !btn.contains(e.target)) this.info(false); };
         this.esc = (e) => { if (e.key === "Escape") { e.stopPropagation(); this.info(false); btn.focus(); } };
         setTimeout(() => document.addEventListener("pointerdown", this.away, true), 0);
