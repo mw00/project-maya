@@ -7097,6 +7097,25 @@ struct Model::Impl {
             }
         }
         std::stable_sort(warm.begin(), warm.end(), [](const Warm& a, const Warm& b) { return a.share > b.share; });
+        // layer-fair: a token crosses EVERY layer, so greedy over the global order - which can leave a colder
+        // layer with no copied expert at all - bottlenecks decode on that layer's disk reads.  Interleave each
+        // layer's hottest round-robin, so the budget covers every layer once before it doubles anywhere
+        // (DS4_COPY_FAIR=0 restores the plain global order)
+        if (std::getenv("DS4_COPY_FAIR") == nullptr || std::atoi(std::getenv("DS4_COPY_FAIR")) != 0) {
+            std::map<int, std::vector<const Warm*>> by;
+            for (const Warm& w : warm) by[w.layer].push_back(&w);
+            std::vector<const std::vector<const Warm*>*> order;
+            std::vector<size_t> at;
+            for (const auto& kv : by) { order.push_back(&kv.second); at.push_back(0); }
+            std::vector<Warm> fair;
+            fair.reserve(warm.size());
+            for (bool more = true; more;) {
+                more = false;
+                for (size_t b = 0; b < order.size(); ++b)
+                    if (at[b] < order[b]->size()) { fair.push_back(*(*order[b])[at[b]++]); more = true; }
+            }
+            warm = std::move(fair);
+        }
         if (!ram_tier && !warm.empty()) {   // copied into RAM (copy_experts decides), the rest read ahead into what is left
             std::vector<std::pair<int, int>> hot;
             for (const Warm& w : warm) hot.push_back({w.layer, w.e});

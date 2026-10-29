@@ -639,6 +639,7 @@ tokens/s.
 | `DS4_COPY_PIN` | on (several GPUs, copies in RAM, chunked prompts) | `0`: the copies are not pinned; the prompt path stages every expert through the CPU, as before |
 | `MAYA_DS4_PIN_LAST` | on with NVIDIA on Windows, else off | `1`: the copies are pinned at the end of the load, after the engine's own pinned buffers (prompt staging, the CPU lane's rings), and only while `MAYA_DS4_PIN_ROOM_GB` more can still be locked - else they stay unpinned and the prompt path stages them, as when the pin fails. Windows caps what one process may lock; pinning 131.8 GB of copies on a 160 GB PC left too little for the staging and the start failed (#589). `0`: pinned as the experts are copied, as on Linux |
 | `MAYA_DS4_PIN_ROOM_GB` | 1 | with `MAYA_DS4_PIN_LAST`: the room left lockable for what the engine pins later |
+| `DS4_COPY_FAIR` | on (with RAM copies) | `0`: the copy budget takes the experts in one global most-routed order, as before. On: each layer's most-routed experts interleave round-robin, so the budget covers every layer once before it deepens any - a token crosses every layer, and a colder layer with no copied expert at all disk-reads on each of its picks (measured on 2x RTX 3080 + 96 GB RAM, a 155 GB GGUF with 61% of the CPU-lane experts copied: long generations collapsed to 5-8 tok/s over the global order; with the fair interleave the same run stays 16-22 tok/s). |
 
 ## DeepSeek: long prompts read without the second half's work
 
