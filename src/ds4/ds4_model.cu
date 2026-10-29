@@ -3925,24 +3925,30 @@ struct Model::Impl {
             G.arb = G.ar;   // (a chunk's: two slots of chunk rows)
             G.arb.slots = 2;
             G.arb.stride = (size_t) chunk * g.dim;
-            if (chunk > 0 && G.arb.nm > 1 && (!hmap(G.arb.data, (size_t) G.arb.nm * G.arb.slots * G.arb.stride, err) ||
-                                              !hmap(G.arb.flags, (size_t) G.arb.nm * G.arb.slots * 32, err)))
-                return false;
-            if (chunk > 0 && G.arb.nm > 2 &&
-                (!hmap(G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err) ||
-                 !hmap(G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err)))
+            G.arb.data = G.arb.sums = nullptr;   // (G.ar's: the decode's - a chunk's are its own, or none)
+            if (chunk > 0 && G.arb.nm > 1 && !hmap(G.arb.flags, (size_t) G.arb.nm * G.arb.slots * 32, err)) return false;
+            if (chunk > 0 && G.arb.nm > 2 && !hmap(G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err))
                 return false;
             // 5 members or more: a chunk's sums by the host (DS4_AR_HOST: the members from which, 0 off; threads
-            // DS4_AR_HOST_THREADS, 32)
+            // DS4_AR_HOST_THREADS, 32) - unless DS4_AR_DMA=0 (chunk_allreduce_on: the kernels' own sums then)
             const char* hm = std::getenv("DS4_AR_HOST");
             const int host_from = hm != nullptr ? std::atoi(hm) : 5;
-            if (chunk > 0 && host_from > 0 && G.arb.nm >= host_from && G.arb.nm <= 16 && G.arb.sums != nullptr) {
+            const char* ad = std::getenv("DS4_AR_DMA");
+            if (chunk > 0 && (ad == nullptr || std::atoi(ad) != 0) && host_from > 0 && G.arb.nm >= host_from &&
+                G.arb.nm <= 16) {
                 const char* ht = std::getenv("DS4_AR_HOST_THREADS");
                 std::vector<int> ids;
                 for (int m : G.mem) ids.push_back(devs[(size_t) m].id);
                 G.hred = std::make_shared<HostReducer>(G.arb, ids, G.arb.stride, ht != nullptr ? std::max(1, std::atoi(ht)) : 32);
                 if (!G.hred->ok()) G.hred.reset();   // (the sums by the copy engines then)
             }
+            // the members' F32 rows and the sums the copy engines' sums go through: not with the host's, which has rows of
+            // its own (FP16) - 1.3 GB of pinned RAM at 8 members and chunks of 4096, more at larger chunks
+            if (chunk > 0 && G.arb.nm > 1 && G.hred == nullptr &&
+                !hmap(G.arb.data, (size_t) G.arb.nm * G.arb.slots * G.arb.stride, err))
+                return false;
+            if (chunk > 0 && G.arb.nm > 2 && G.hred == nullptr && !hmap(G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err))
+                return false;
             if (chunk > 0 && G.arb.nm == 2 && ar2() > 0) {   // DS4_AR2: ar2_kernel's progress words (zeroed)
                 if (!hmap(G.arb.pflags, (size_t) G.arb.nm * G.arb.slots * kAr2Blocks * 16, err)) return false;
                 G.arb.ar2 = ar2();
