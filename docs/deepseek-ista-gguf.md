@@ -26,29 +26,32 @@ Linux with NVIDIA GPUs is what it was run on; AMD and Windows have not been trie
 
 ```sh
 hf download ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF \
-  --revision 653a9874aa38c356233c5f3cc8c96b19a43b57eb \
+  --revision 65d53bc8be65123e255ff02f3ded958b6dbf54fd \
   --include "*IQ2_XXS*.gguf" --include "*Engram*.gguf" \
   --local-dir /path/to/models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF
 ```
 
-That is four shards and the Engram file, in one folder (repeat `--include` for each pattern: with some versions of
+That is five shards and the Engram file, in one folder (repeat `--include` for each pattern: with some versions of
 `hf`, a second pattern after one `--include` is read as a file name). Their sizes and sha256 at that revision:
 
 | File | Bytes | sha256 |
 | --- | ---: | --- |
-| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf` | 39075725728 | `2dfe9711eac1f7814aa59154d11e8f27739f8b96875dc1e667eac9f8c756e1fe` |
-| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf` | 39388449504 | `cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70` |
-| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf` | 39246891616 | `9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3` |
-| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf` | 20527837312 | `9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059` |
-| `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 110595290816 | `eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00006.gguf` | 5780704 | `f356f198561f56df36f7ab92d7238a926646d76de992c34f15bcb939a5f529b9` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00006.gguf` | 39535781184 | `25af3785ccf925f54137e1ead4c481a8952315dc0b1af6519a99407f67bce8f3` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00006.gguf` | 39736712000 | `8168d0998fc494def2e1952d83c131425a108660aae9d29190f5a8670ab62b48` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00006.gguf` | 39036908384 | `9eb9b4de1968f150dfc207eb31c27be9cd9b5666a9a6246bde8a22b184b4bee0` |
+| `DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00005-of-00006.gguf` | 19923784832 | `7e35f6b4e6fc46f6c4b152b593d84d683c5ece695ae6ad734f556198c041bec1` |
+| `DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf` | 110595290816 | `3dac4c54893ad7aa89103c0028500eadc78e74112cef3a2930a97e67dc9fb4f3` |
 
-The revision is pinned because the repo changed its files' layout on October 27, 2026: the current files are six
-shards in llama.cpp's own DeepSeek-V4.1 layout (b11870 and newer), with the Engram file linked as shard 6. That layout
-packs too (the Engram gate comes folded into one tensor, which the engine reads), but it has not been served with
-Maya yet; the four-shard files above are the ones that were. The repo's `chat_template.jinja`,
-`patch_chat_template.py` and `mmproj-*.gguf` are not used: the pack carries Maya's own chat template and the server
-renders prompts with DeepSeek's pinned encoder ([prompt format](deepseek-prompt-format.md)), and the pictures come
-from DeepSeek's own vision tower (step 2).
+This is llama.cpp's own DeepSeek-V4.1 layout (b11870 and newer), which the repo moved to on October 27, 2026: the
+first shard holds only the metadata, the Engram file is the split's sixth file (the pack reads it as such; no link
+named `-00006-of-00006` is needed), the Engram gate comes folded into one F32 tensor, and the image tokens' router
+bias is added. The four-shard files of the earlier revision (`653a9874`) hold the same weights and pack the same
+way; their Engram file has a different header, so the two revisions' files do not mix in one folder. The repo's
+`chat_template.jinja`, `convert_ds41_upstream.py`, `exp_probs_b_vl.f32` and `mmproj-*.gguf` are not used: the pack
+carries Maya's own chat template and the server renders prompts with DeepSeek's pinned encoder
+([prompt format](deepseek-prompt-format.md)), the downloaded shards already hold what the converter adds, and the
+pictures come from DeepSeek's own vision tower (step 2).
 
 ## 2. The drafter and the vision tower
 
@@ -128,8 +131,7 @@ Check that `/health` reports `images: true`, then send a picture. Other settings
   `../vision/vision.bin`). Moving or renaming a folder, or starting the engine where the models are mounted somewhere
   else (a container), fails with "cannot open": run step 3 again from the path the engine sees, or edit the
   `model_dir` line.
-- **The pack records each tensor's offset in its shard.** Change a shard and pack again. ISTA's
-  `patch_chat_template.py` rewrites the first shard in place, and Maya does not read the GGUF's own template, so leave
-  it alone.
+- **The pack records each tensor's offset in its shard.** Change a shard and pack again. Maya does not
+  read the GGUF's own chat template, so there is no need to patch the first shard.
 - **The setup does not know these files.** A later `./setup.sh` writes `maya-ds4.json` and leaves
   `maya-ds4-ista.json` as it is.
