@@ -2199,7 +2199,7 @@ class QueuedKeepAlives(GoneClients):
         import socket
         b = json.dumps(body).encode()
         s = socket.create_connection(("127.0.0.1", self.port))
-        s.sendall(b"POST " + path.encode() + b" HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n"
+        s.sendall(b"POST " + path.encode() + b" HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                   b"Content-Length: " + str(len(b)).encode() + b"\r\n\r\n" + b)
         return s
 
