@@ -19,8 +19,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve import loop_guard as LG  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (IM_END, LOOP_STOP_NOTE, ByteTokenizer, Service, check_request_sampling, loop_guard_setting,  # noqa: E402
-                          serve)
+from serve.server import (IM_END, LOOP_STOP_NOTE, THINK_NOTE, THINK_RESTARTS, ByteTokenizer, Service, check_request_sampling,  # noqa: E402
+                          loop_guard_setting, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -953,6 +953,133 @@ class GuardedUsage(unittest.TestCase):
         self.assertEqual((got["prompt_tokens"], got["reused"], got["prompt_ms"]), (246, 127, 9.5))
         self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 300}, 1000)["reused"], 0)
         self.assertEqual(own_prompt_figures({"prompt_tokens": 1300, "reused": 5000}, 1000)["reused"], 1000)
+
+
+# DeepSeek-V4.1's turn markers, as its vocabulary has them (one CONTROL token each): built from code points, so this
+# file never spells them out (an agent's own stream through the server must not read as the marker)
+DS_USER = chr(0x3c) + chr(0xff5c) + "User" + chr(0xff5c) + chr(0x3e)
+DS_EOS = chr(0x3c) + chr(0xff5c) + "end" + chr(0x2581) + "of" + chr(0x2581) + "sentence" + chr(0xff5c) + chr(0x3e)
+
+
+class DeepTok(Tok):
+    """Tok, with DeepSeek's two full-width turn markers as one token each (the only ones its vocabulary has as one;
+    the ASCII ones are spelled out of ordinary pieces there)."""
+
+    SPECIALS = Tok.SPECIALS + [DS_USER, DS_EOS]
+    special_ids = {"eos": 256 + len(SPECIALS) - 1}     # (DS_EOS: the engine's --eos, default the tokenizer's)
+
+
+class SeqEngine:
+    """Answer k of a request (its k-th engine call) is seqs[k] (the last one again after that), then the turn's end.
+    Records every call's prompt."""
+
+    def __init__(self, tok, *seqs):
+        self.tok, self.max_context, self.prompts = tok, 1 << 20, []
+        self.seqs = seqs
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.prompts.append(list(ids))
+        seq = self.seqs[min(len(self.prompts), len(self.seqs)) - 1]
+        for t in (seq + self.tok.encode(IM_END, parse_special=True))[:max_new]:
+            yield t
+
+
+class ThinkingMarkers(unittest.TestCase):
+    """A model that quotes one of the server's end-of-turn markers inside its thinking ended the turn there (the
+    engine stops at its own EOS token, the server at its markers) - the agent died mid-thinking.  Inside the thinking
+    such a marker is the model's text: its token is skipped, and at the engine's EOS the server goes on with a note
+    (THINK_RESTARTS times).  In the answer it is text too when quoted in code or inside a tool call's body; spelled
+    out in ordinary pieces or in plain prose it ends the turn as always."""
+
+    def answer(self, *seqs, tok=None):
+        from serve.frontend import openai_to_messages
+        tok = tok or DeepTok()
+        eng = SeqEngine(tok, *seqs)
+        svc = Server().service(eng)
+        msgs, tools, kw = openai_to_messages(agent())
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        events, done = [], None
+        sampling = {"_blocked": kw.get("_blocked"), "_think_resume": kw.get("_think_resume")}
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, threading.Event()):
+            if kind == "event":
+                events.append(x)
+            elif kind == "done":
+                done = x
+        text = "".join(e.text for e in events if e.kind == "content")
+        reason = "".join(e.text for e in events if e.kind == "reasoning")
+        calls = [e.call.name for e in events if e.kind == "tool_call"]
+        return svc, eng, text, reason, calls, done
+
+    def test_a_user_marker_in_the_thinking_is_text(self):
+        # its token is skipped, not fed: the thinking goes on and the answer follows
+        tok = DeepTok()
+        mark = tok.encode(DS_USER, parse_special=True)[0]
+        seq = tok.encode("thinking `", parse_special=True) + [mark] + \
+            tok.encode("` still thinking.\n</think>\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertIn("ANSWER OK", text)
+        self.assertNotIn(DS_USER, reason)                  # (the marker is the turn's token, not the thinking's text)
+
+    def test_the_engine_eos_in_the_thinking_resumes_it(self):
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        self.assertEqual(tok.special_ids["eos"], eos)
+        first = tok.encode("thinking about ", parse_special=True) + [eos]
+        second = tok.encode("</think>\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(first, second, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (2, "stop"))
+        self.assertIn("ANSWER OK", text)
+        said = svc.tok.decode(eng.prompts[1][len(eng.prompts[0]):])
+        self.assertIn(THINK_NOTE, said)                 # (the server's note: go on with the thinking)
+        self.assertIn(LG.keep_steer(1), said)
+
+    def test_the_resume_is_capped(self):
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("thinking ", parse_special=True) + [eos]
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"], text), (1 + THINK_RESTARTS, "stop", ""))
+
+    def test_a_marker_in_code_or_a_call_in_the_answer_is_text(self):
+        tok = DeepTok()
+        user = tok.encode(DS_USER, parse_special=True)[0]
+        code = tok.encode("</think>\n\nThe marker is `", parse_special=True) + [user] + \
+            tok.encode("` in the docs.\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(code, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertIn("ANSWER OK", text)
+        self.assertIn(DS_USER, text)                       # (kept as the answer's text)
+        fence = tok.encode("</think>\n\n```\n", parse_special=True) + [user] + \
+            tok.encode("\n```\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(fence, tok=tok)
+        self.assertIn("ANSWER OK", text)
+        call = tok.encode("</think>\n\n" + call_text("cat `" + DS_USER + "`") +
+                          "\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(call, tok=tok)
+        self.assertEqual((len(eng.prompts), calls, done["finish"]), (1, ["bash"], "stop"))
+        self.assertIn("ANSWER OK", text)
+
+    def test_a_marker_in_the_answer_prose_ends_the_turn(self):
+        tok = DeepTok()
+        eos = tok.encode(DS_EOS, parse_special=True)[0]
+        seq = tok.encode("</think>\n\nIt said ", parse_special=True) + [eos] + \
+            tok.encode(" here.\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual(done["finish"], "stop")
+        self.assertNotIn("ANSWER OK", text)
+        # spelled out in ordinary pieces, in the answer's prose: the text scan ends it too
+        seq = tok.encode("</think>\n\nIt said ", parse_special=True) + tok.encode(DS_EOS, parse_special=False) + \
+            tok.encode(" here.\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertNotIn("ANSWER OK", text)
+        # ... but in inline code the pieces are text
+        seq = tok.encode("</think>\n\n`", parse_special=True) + tok.encode(DS_EOS, parse_special=False) + \
+            tok.encode("`\n\nANSWER OK", parse_special=True)
+        svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
+        self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
+        self.assertIn("ANSWER OK", text)
+
 
 
 if __name__ == "__main__":

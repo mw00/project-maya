@@ -381,6 +381,14 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   same thoughts to go on from (GLM-5.3 had one sentence 543 times in an 88K prompt). Only the prompt changes, and each
   message depends only on the ones before it, so the next request's prompt starts the same and the cache holds.
   Counted in `loop_guard.collapsed` and `maya:loop_guard_collapsed_total`.
+- **A turn-end marker inside the thinking:** a model that quotes these markers, or writes about them, wrote them in its
+  thinking - and there the server ended the turn (or the engine itself, at its EOS token): the thinking was cut off
+  and the answer never came. Inside the thinking such a marker is the model's text, not the turn's end: the server
+  skips the marker's token and the thinking goes on; at the engine's own end-of-sequence token it goes on from the
+  quote with a short note as the server's (at most twice), and the thinking continues in its own channel. In the
+  answer a marker other than the engine's own EOS token, written as text - quoted in inline code or a code fence, or
+  inside a tool call's arguments - is text too; a marker spelled out of ordinary pieces in the answer's prose still
+  ends it, and so does the engine's EOS token there (a call cut off by it is incomplete, not failed).
 
 The server window gets a line for each loop broken (`[maya] loop guard: a 19-token block 5 times in the answer at
 token 1,763: repeats dropped, a short repetition penalty`); the dashboard's Monitor marks that request (Loop guard,
