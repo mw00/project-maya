@@ -453,6 +453,19 @@ def logprob_entry(tok, t, n_top: int) -> dict | None:
     return e
 
 
+def model_management_setting(cfg: dict | None, env=None) -> bool:
+    """llama.cpp's model management (/models/load, /models/unload, /models/sse, for Open WebUI's Models page): off
+    unless the run config has "model_management": true or MAYA_MODEL_MANAGEMENT (STRATA_MODEL_MANAGEMENT) says 1 /
+    on / true / yes; the environment, when set, wins over the config."""
+    on = ("1", "on", "true", "yes")
+    env = os.environ if env is None else env
+    v = env.get("STRATA_MODEL_MANAGEMENT", env.get("MAYA_MODEL_MANAGEMENT"))
+    if v is not None and str(v).strip():
+        return str(v).strip().lower() in on
+    v = (cfg or {}).get("model_management")
+    return bool(v) if v is not None else False
+
+
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
     """The loop guard (serve/loop_guard.py), on unless MAYA_LOOP_GUARD (STRATA_LOOP_GUARD) says 0 / off / false / no
     or the run config has "loop_guard": false; the environment, when set, wins over the config."""
@@ -4158,6 +4171,68 @@ def make_handler(svc: Service):
             self.end_headers()
             self.wfile.write(body)
 
+        def _llamacpp_model(self, op: str):
+            """llama.cpp's /models/load and /models/unload: Open WebUI's Models page (load / switch)."""
+            if not getattr(svc, "model_management", False):
+                self._json(404, {"error": {"message": "model management is off (\"model_management\": true, or "
+                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                return
+            try:
+                body = json.loads(self._body().decode() or "{}")
+            except Exception:  # noqa: BLE001 - no body: the running model
+                body = {}
+            name = (body or {}).get("model") or svc.model
+            if name != svc.model:
+                self._json(404, {"error": {"message": "model not found"}})
+                return
+            if op == "unload":
+                state = svc.unload()
+                if state == "busy":
+                    self._json(409, {"error": {"message": "a request is running or waiting; unload when idle"}})
+                elif state == "unsupported":
+                    self._json(400, {"error": {"message": "this engine cannot unload"}})
+                else:
+                    self._json(200, {"model": name, "status": {"value": "unloaded"}})
+                return
+            if hasattr(svc.engine, "alive") and svc.engine.alive():
+                self._json(200, {"model": name, "status": {"value": "loaded"}})
+                return
+            if not svc.fifo.acquire(blocking=True):
+                self._json(503, {"error": {"message": "the engine has no free place to start"}})
+                return
+            try:
+                svc.ensure_engine()
+            except Exception as e:  # noqa: BLE001 - the reason goes back to the caller
+                self._json(503, {"error": {"message": f"the engine did not start: {e}"}})
+                return
+            finally:
+                svc.fifo.release()
+            self._json(200, {"model": name, "status": {"value": "loaded"}})
+
+        def _models_sse(self):
+            """llama.cpp's /models/sse: the Models page's live state, a snapshot every few seconds."""
+            if not getattr(svc, "model_management", False):
+                self._json(404, {"error": {"message": "model management is off (\"model_management\": true, or "
+                                                      "MAYA_MODEL_MANAGEMENT=1, turns it on)"}})
+                return
+            if not self._authorized():
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                while True:
+                    alive = not hasattr(svc.engine, "alive") or svc.engine.alive()
+                    value = "loaded" if alive else ("unloaded" if svc.unloaded else "loading")
+                    payload = {"object": "list", "data": [{"id": svc.model, "status": {"value": value}}]}
+                    self.wfile.write(("data: " + json.dumps(payload) + "\n\n").encode())
+                    self.wfile.flush()
+                    time.sleep(5)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
         def _cors_allow(self):
             """The Access-Control-Allow-Origin value for this request, or None: only /v1/* paths and only an origin the
             config's cors_origins lists (or "*")."""
@@ -4309,6 +4384,9 @@ def make_handler(svc: Service):
 
         def do_GET(self):
             path = self.path.split("?")[0].rstrip("/")
+            if path == "/models/sse":
+                self._models_sse()
+                return
             if path.startswith("/v1/responses/"):
                 self._response_resource()
                 return
@@ -4471,6 +4549,9 @@ def make_handler(svc: Service):
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
+                if path in ("/models/load", "/models/unload"):
+                    self._llamacpp_model(path.rsplit("/", 1)[1])
+                    return
                 if path.startswith("/v1/responses/") and path.endswith("/cancel"):
                     self._response_cancel(path)
                     return
@@ -5422,6 +5503,9 @@ def main() -> int:
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     if svc.think_budget:
         print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
+    svc.model_management = model_management_setting(cfg)   # ("model_management": true: llama.cpp's load/unload/sse)
+    if svc.model_management:
+        print("[maya] model management: on (/models/load, /models/unload, /models/sse)", flush=True)
     svc.loop_guard = loop_guard_setting(cfg)            # (MAYA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
         print("[maya] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
