@@ -5341,7 +5341,8 @@ struct Model::Impl {
             // Preserve the original virtual slots, batches and accumulation order.
             const auto picked = [&](int i) {
                 if (!skip_unpicked || bt.il != S.routed_layer || bt.k != S.routed_chunk) return true;
-                const size_t v = (size_t) l0.n_slots + bt.j0 + i;
+                const size_t v = (size_t) l0.pv_n + bt.j0 + i;   // (the streamed ones' virtual slots: from pv_n - slots lent
+                                                                  //  to a prompt's buffers stream too, plan_streams)
                 return S.routed_bounds[v + 1] > S.routed_bounds[v];
             };
             int mi = 0;
