@@ -3213,6 +3213,15 @@ struct Model::Impl {
             CK(cudaStreamCreateWithPriority(&d.st2, cudaStreamNonBlocking, greatest));
             CK(cudaEventCreateWithFlags(&d.hc_go, cudaEventDisableTiming));
             CK(cudaEventCreateWithFlags(&d.hc_done, cudaEventDisableTiming));
+            {   // what other programs hold on it (this process: its context only, so far) - the plan below works around
+                // it, so the experts it would have held go to the CPU lane: said loudly, not only in the placement lines
+                size_t fr = 0, tot = 0;
+                CK(mem_info(&fr, &tot));
+                if (tot - fr > ((size_t) 1 << 30))
+                    std::fprintf(stderr, "ds4: WARNING - CUDA%d: %.1f of its %.1f GB already in use as the engine starts "
+                                         "(other programs: nvidia-smi lists them) - what they hold is not planned for "
+                                         "experts\n", d.id, (tot - fr) / 1e9, tot / 1e9);
+            }
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
                 err = "exl3 scratch on CUDA" + std::to_string(d.id);
                 return false;
@@ -6431,6 +6440,29 @@ struct Model::Impl {
         return true;
     }
 
+    // an expert arena on device d, sized by the plan from what d had free at the start: when another program took
+    // memory since, tried again a few times (it may give it back) - never a smaller arena (the plan stands; fewer experts
+    // in VRAM would only hide it), and at the end an error that says the device, the bytes, and what is free now
+    bool arena_alloc(Dev& d, void*& v, size_t bytes, const std::string& what, std::string& err) {
+        for (int t = 0;; ++t) {
+            if (cudaMalloc(&v, bytes) == cudaSuccess) return true;
+            (void) cudaGetLastError();
+            size_t fr = 0, tot = 0;
+            (void) mem_info(&fr, &tot);
+            char b[320];
+            std::snprintf(b, sizeof b, "cudaMalloc of %s on CUDA%d failed: %.0f MiB asked, %.0f MiB free now, %.0f MiB "
+                                       "when the engine started - another program took this GPU's memory meanwhile "
+                                       "(nvidia-smi lists it)", what.c_str(), d.id, bytes / 1048576.0, fr / 1048576.0,
+                          d.free0 / 1048576.0);
+            if (t == 4) {
+                err = b;
+                return false;
+            }
+            std::fprintf(stderr, "ds4: WARNING - %s; trying again in 3 s\n", b);
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        }
+    }
+
     bool place_experts(std::string& err) {
         // a mixed-precision quant (layers with experts in several layouts): every expert of those layers
         // in VRAM, in its class's arena - one GPU, no lending of the experts' room (the prompt path keeps its own)
@@ -6502,6 +6534,7 @@ struct Model::Impl {
         // tail of expert slots (sized for it below); else - a tensor-parallel member's tail (DS4_TP_BORROW: the slots a
         // group shares part by part) is not lent to the tower - the tower's own after all, taken now, before the experts
         // take the rest
+        size_t vis_late = 0;
         if (vis_mode == kVisChunk) {
             const Chunk* c = chunks.empty() ? nullptr : chunks[0].get();
             if (c != nullptr && c->room != nullptr && c->room_bytes >= vt.room_bytes()) {
@@ -6509,6 +6542,7 @@ struct Model::Impl {
                 vis_mode = kVisTail;
             } else {
                 if (!dalloc(devs[0], vis_res, vt.room_bytes(), err, &vis_acct)) return false;
+                vis_late = vis_acct;   // (taken after load_vision's snapshot of devs[0]: not another program's)
                 vis_mode = kVisResident;
                 std::fprintf(stderr, "ds4: the vision tower's room (%.0f MiB) stays on CUDA%d: its prompt buffers (%.0f "
                                      "MiB) are smaller\n", (double) vt.room_bytes() / (1 << 20), devs[0].id,
@@ -6534,9 +6568,21 @@ struct Model::Impl {
             bool charged = false;
             std::vector<double> own;   // (each member's own room, this snapshot: its dense, scratch and head already in)
             for (int m : groups[gi].mem) {
-                cudaSetDevice(devs[(size_t) m].id);
+                Dev& dm = devs[(size_t) m];
+                cudaSetDevice(dm.id);
                 size_t fr = 0, tot = 0;
                 CK(mem_info(&fr, &tot));
+                // what left the GPU since the start and is not this engine's (its weights, caches, scratch, and the
+                // prompt chunks' buffers, and the vision tower's room when taken just above): another program took it
+                // while the weights loaded, and the plan below works around it - said loudly
+                const double gone = (double) dm.free0 - (double) fr -
+                                    (double) (dm.weights + dm.caches + dm.scratch + dm.prompt) -
+                                    (double) (m == 0 ? vis_late : 0);
+                if (o.verbose) std::fprintf(stderr, "ds4: CUDA%d at the expert plan: %.0f MiB free, %.0f MiB gone to "
+                                                    "others since the start\n", dm.id, fr / 1048576.0, gone / 1048576.0);
+                if (gone > (double) (1 << 30))
+                    std::fprintf(stderr, "ds4: WARNING - CUDA%d: %.1f GB went to other programs while the engine loaded "
+                                         "(nvidia-smi lists them) - the experts' plan works around it\n", dm.id, gone / 1e9);
                 mroom.push_back(std::max(0.0, ((double) fr - (double) ((size_t) o.reserve_mib << 20))) * o.vram_experts);
                 own.push_back(mroom.back());
                 charged = charged || commit_charged(devs[(size_t) m]);
@@ -6879,11 +6925,10 @@ struct Model::Impl {
                     for (uint8_t x : l.cls) n += x == c;
                     const size_t step = align256(l.cblob[c]);
                     void* v = nullptr;
-                    if (cudaMalloc(&v, (size_t) n * step) != cudaSuccess) {
-                        err = "cudaMalloc of layer " + std::to_string(l.il) + "'s class " + std::to_string(c) + " (" +
-                              std::to_string(n) + " experts) failed";
+                    if (!arena_alloc(d, v, (size_t) n * step,
+                                     "layer " + std::to_string(l.il) + "'s class " + std::to_string(c) + " (" +
+                                         std::to_string(n) + " experts)", err))
                         return false;
-                    }
                     d.allocs.push_back(v);
                     d.experts += (size_t) n * step;
                     int i = 0;
@@ -6935,11 +6980,9 @@ struct Model::Impl {
                 Dev& d = devs[(size_t) x.dev];
                 cudaSetDevice(d.id);
                 void* v = nullptr;
-                if (cudaMalloc(&v, (size_t) l.n_main * unit(x)) != cudaSuccess) {
-                    err = "cudaMalloc of layer " + std::to_string(l.il) + "'s " + std::to_string(l.n_main) +
-                          " experts on CUDA" + std::to_string(d.id) + " failed";
+                if (!arena_alloc(d, v, (size_t) l.n_main * unit(x),
+                                 "layer " + std::to_string(l.il) + "'s " + std::to_string(l.n_main) + " experts", err))
                     return false;
-                }
                 d.allocs.push_back(v);
                 d.experts += (size_t) l.n_main * unit(x);
                 x.vram_base = (uint8_t*) v;
@@ -14118,6 +14161,7 @@ struct Model::Impl {
                 continue;
             }
             d.allocs.push_back(v);
+            d.scratch += (size_t) D.slots * stride;
             D.vram = (uint8_t*) v;
             D.stride = stride;
             ln_stride = std::max(ln_stride, stride);
