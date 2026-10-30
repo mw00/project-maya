@@ -683,6 +683,7 @@ struct Chunk {
     // Dev::tail) or their own (laid out once at the largest chunk); tp_lend: borrowed as a tensor-parallel group's
     // member (DS4_TP_BORROW=1: each member its own part of the group's last slots, the group's members all or none)
     bool borrow = false, tp_lend = false;
+    bool x3_lend = false;   // (DS4_EXL3_LEND) an EXL3 lender: the expert cache's slots lent, their experts copied back
     uint8_t* own = nullptr;
     // its largest buffers' region of its own (all of them, or a lending device's fixed part): between prompts the
     // vision tower's room for a picture (Impl::take_vis_room), zeroed again after it
@@ -1963,8 +1964,13 @@ struct Model::Impl {
     // the tick is done.  DS4_COPY_IDLE=0: every copy at once
     std::vector<cudaEvent_t> idle_ev;
     std::unique_ptr<std::atomic<unsigned>[]> idle_win;
+    // (before an EXL3 lend: the cache's held copies - swaps and recent-slot fills - go now, not at their device's turn,
+    //  which no prompt brings: the drains wait for every one of them)
+    std::atomic<bool> copy_flush{false};
     bool copy_open(int di, unsigned w) const {
-        if (idle_ev.empty() || devs[(size_t) di].grp == devs[(size_t) head_dev].grp) return true;
+        if (idle_ev.empty() || devs[(size_t) di].grp == devs[(size_t) head_dev].grp ||
+            copy_flush.load(std::memory_order_acquire))
+            return true;
         const unsigned iw = idle_win[(size_t) di].load(std::memory_order_acquire);
         return (int) (iw - w) > 0 && (int) (iw - win_now.load(std::memory_order_acquire)) >= 0;
     }
@@ -1996,6 +2002,12 @@ struct Model::Impl {
     // a run of chunks borrowing the lending devices' tails (borrow_begin / borrow_end): whether one does now, the
     // pinned staging that reads the experts back after it (rf_bytes each), what that read back in all
     bool lent = false;
+    // (DS4_CHECK_LEND, an EXL3 lender: each lent slot's bytes before the lend, against what borrow_end copies back)
+    struct LentCheck {
+        int layer, e, slot, m;
+        std::vector<uint8_t> bytes;
+    };
+    std::vector<LentCheck> x3_check;
     // a hand-back that could not finish (a device selection, sync, copy or table write failed): an expert table may
     // name a slot the prompt path's buffers overwrote - no later request runs (forward / forward_chunks refuse)
     bool lend_broken = false;
@@ -2336,6 +2348,15 @@ struct Model::Impl {
     }
     // DS4_TP_BORROW=1 (off by default): a tensor-parallel group's members lend the prompt path their experts' room too
     // (Chunk::tp_lend) - on the flow only (DS4_FLOW_TP=1), which streams the lent slots' experts, each member its part
+    // DS4_EXL3_LEND (on; 0 off): an EXL3 pack whose CPU-lane experts are copied into RAM (not read in place) and whose
+    // expert cache keeps recent slots - a tensor-parallel group's members lend the prompt path their tail of the
+    // cache's slots (the spare and the recent ones: copies of CPU-lane experts, streamed from RAM while lent and copied
+    // back after), so their chunk buffers hold no VRAM of their own between prompts and a larger chunk costs the
+    // decode nothing.  (A one-GPU group keeps its own room: lent there, the answers came out wrong - not found yet)
+    bool exl3_lend_on() const {
+        const char* v = ds4_env("DS4_EXL3_LEND");
+        return (v == nullptr || std::atoi(v) != 0) && !file_experts && !pk.gguf && o.expert_cache && recent_n > 0;
+    }
     static bool tp_borrow_on() {
         const auto on = [](const char* v) { return v != nullptr && std::atoi(v) != 0; };
         return on(ds4_env("DS4_TP_BORROW")) && on(std::getenv("DS4_FLOW_TP"));
@@ -4813,6 +4834,7 @@ struct Model::Impl {
         // =0: its own room, as before)
         const bool borrow_on = file_experts && one_gpu_or("DS4_BORROW") &&
                                (std::getenv("DS4_FLOW") == nullptr || std::atoi(std::getenv("DS4_FLOW")) != 0);
+        const bool x3l = exl3_lend_on();   // (an EXL3 pack's tensor-parallel groups: a group's members all or none)
         // DS4_TP_BORROW=1: a device whose every trunk layer is a tensor-parallel group's member on the flow (the flow's
         // own condition for a member, below in load) lends as such - only when every member of its group does (a
         // group's slots past n_main lie in each member's tail, or in none)
@@ -4836,6 +4858,21 @@ struct Model::Impl {
                 for (int m : G.mem) tp_ok[(size_t) m] = all;
             }
         }
+        if (x3l) {   // (DS4_EXL3_LEND) a tensor-parallel group of EXL3 layers: every member lends, or none
+            std::vector<char> any(devs.size(), 0), all(devs.size(), 1);
+            for (const Layer& l : L)
+                for (int m = 0; m < l.nm && !l.mtp; ++m) {
+                    const size_t di = (size_t) member(l, m).dev;
+                    any[di] = 1;
+                    all[di] = all[di] && l.nm > 1 && l.lay.fmt != gg::kFmtMXFP4 && l.n_cls == 1;
+                }
+            for (const Group& G : groups) {
+                bool ok = G.mem.size() > 1;
+                for (int m : G.mem) ok = ok && any[(size_t) m] && all[(size_t) m];
+                for (int m : G.mem)
+                    if (ok) tp_ok[(size_t) m] = 1;
+            }
+        }
         for (size_t di = 0; di < devs.size(); ++di) {
             Dev& d = devs[di];
             cudaSetDevice(d.id);
@@ -4848,7 +4885,7 @@ struct Model::Impl {
                              d.id, c.A, c.w16_elems >> 19);
             const size_t C = (size_t) chunk;
             c.C = chunk;
-            bool has_eg = false, has_first = false, lend = borrow_on;
+            bool has_eg = false, has_first = false, lend = borrow_on || x3l, x3 = false;
             size_t stride = 0;
             for (const Layer& l : L)
                 for (int m = 0; m < l.nm; ++m)
@@ -4856,11 +4893,13 @@ struct Model::Impl {
                         has_eg = has_eg || l.eg >= 0;
                         has_first = has_first || l.il == 0;
                         stride = std::max(stride, align256(unit(member(l, m))));
-                        lend = lend && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4;
+                        lend = lend && l.nm == 1 && (l.lay.fmt == gg::kFmtMXFP4 ? borrow_on : x3l && l.n_cls == 1);
+                        x3 = x3 || l.lay.fmt != gg::kFmtMXFP4;
                     }
             c.has_eg = has_eg, c.has_first = has_first;
             c.tp_lend = tp_ok[di] && stride > 0;   // (DS4_TP_BORROW: lend is false here - its layers are a group's)
             c.borrow = (lend || c.tp_lend) && stride > 0;
+            c.x3_lend = c.borrow && x3;
             {   // (its own room, laid out once: all of it, or a lending device's buffers of a fixed size)
                 const int part = c.borrow ? 1 : 3;
                 c.room_bytes = lay_chunk(c, chunk, nullptr, part);
@@ -6779,8 +6818,9 @@ struct Model::Impl {
             // (the first device's tail is a picture's room too, kVisTail: as many slots a layer as that takes, when it
             //  is more - the tail stays expert slots between prompts and pictures, so it costs the decode nothing)
             const size_t vneed = di == 0 && vis_mode == kVisTail ? vt.room_bytes() + 256 : 0;
-            const int k = (int) std::min<size_t>((std::max(need, vneed) + step - 1) / step,
-                                                 (size_t) std::max(0, min_slots - 1));
+            // (an EXL3 lender: the cache's slots alone - the spare and the recent ones, whose experts RAM holds)
+            const int kmax = c.x3_lend ? std::min(min_slots - 1, recent_n) : min_slots - 1;
+            const int k = (int) std::min<size_t>((std::max(need, vneed) + step - 1) / step, (size_t) std::max(0, kmax));
             const size_t cap = (size_t) k * step;
             if (vneed > cap)
                 std::fprintf(stderr, "ds4: CUDA%d keeps too few experts in VRAM (%d a layer) to lend a picture its room: "
@@ -6841,7 +6881,8 @@ struct Model::Impl {
                 for (size_t i = 0; i < mems.size(); ++i) need[i] = lay_chunk(*chunks[(size_t) mems[i]], C, nullptr, 2);
             };
             needs(chunk);
-            const int k = tp_tail_k(need, step, min_slots - 1);
+            const bool gx3 = chunks[(size_t) mems[0]]->x3_lend;   // (an EXL3 group: the cache's slots alone)
+            const int k = tp_tail_k(need, step, gx3 ? std::min(min_slots - 1, recent_n) : min_slots - 1);
             if (k > 0 && !tp_tail_fits(need, step, k)) {   // (few VRAM slots a layer: chunks the tails hold)
                 int c2 = chunk;
                 while (c2 > 256 && !tp_tail_fits(need, step, k)) {
@@ -6955,6 +6996,14 @@ struct Model::Impl {
                 l.spare_vram = l.n_slots - 1;
                 l.rc_base = l.n_vram;
                 l.rc_n = r;
+                // (an EXL3 lender: the spare first, the recent slots last - the lent tail the recent slots alone, whose
+                //  experts are copies of RAM's; a swap's spare moves among the layer's own slots and never into the tail,
+                //  where the expert it takes in - its RAM copy given up - could not stream while the slot is lent)
+                const Chunk* lc = (size_t) l.dev < chunks.size() ? chunks[(size_t) l.dev].get() : nullptr;
+                if (r > 0 && !l.mtp && lc != nullptr && lc->x3_lend) {
+                    l.spare_vram = l.n_vram;
+                    l.rc_base = l.n_vram + 1;
+                }
             } else {
                 l.n_vram = l.n_slots;
                 l.spare_vram = -1;
@@ -6963,6 +7012,14 @@ struct Model::Impl {
             // (the last n_tail slots - the coldest of them, and the cache's spare - in the device's tail region)
             l.n_main = l.n_slots - std::min(l.n_slots, n_tail[(size_t) (&l - &L[0])]);
             l.pv_n = l.n_slots;
+            // (DS4_EXL3_LEND: the tail the cache's slots alone - an expert placed there has no copy in RAM to stream from)
+            if ((l.rc_n == 0 || l.n_main < l.rc_base) && l.n_main < l.n_slots && !l.mtp && chunks.size() > (size_t) l.dev &&
+                chunks[(size_t) l.dev] != nullptr && chunks[(size_t) l.dev]->x3_lend) {
+                err = "DS4_EXL3_LEND: layer " + std::to_string(l.il) + " keeps " + std::to_string(l.rc_n) +
+                      " recent slots, its tail " + std::to_string(l.n_slots - l.n_main) +
+                      " - fewer VRAM experts a layer than the lend needs (a smaller --prefill-chunk, or DS4_EXL3_LEND=0)";
+                return false;
+            }
             for (int m = 0; m < l.nm && l.n_main > 0; ++m) {
                 Layer& x = member(l, m);
                 Dev& d = devs[(size_t) x.dev];
@@ -9380,8 +9437,14 @@ struct Model::Impl {
     bool lend_tail(size_t need, uint8_t*& p) {
         Dev& d = devs[0];
         if (lent || d.tail == nullptr || need + 256 > d.tail_bytes) return false;
+        const bool x3 = !chunks.empty() && chunks[0] != nullptr && chunks[0]->x3_lend;
+        struct Unflush {
+            std::atomic<bool>& f;
+            ~Unflush() { f.store(false, std::memory_order_release); }
+        } unflush_{copy_flush};
+        if (x3) copy_flush.store(true, std::memory_order_release);
         cache_drain();
-        if (ln_one || ln_land) rc_drain();
+        if (ln_one || ln_land || x3) rc_drain(x3);
         const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
         for (Layer& l : L) {
             if (l.dev != 0 || l.mtp || l.n_main >= l.n_slots) continue;
@@ -10580,16 +10643,25 @@ struct Model::Impl {
     // a stalled copy must not hang the prompt, so past it the prompt goes on as in v1.1.27 (no wait, nothing mapped
     // now: the next tick maps what landed).  The wait itself makes no GPU call.
     static constexpr double kRcDrainMs = 5000.0;
-    void rc_drain() {
+    // for_lend (an EXL3 lender: the recent slots its run borrows): the held fills issued now, and every one waited for -
+    // one still to come could land in the run's buffers, or be mapped over what the run wrote there
+    void rc_drain(bool for_lend = false) {
         if (recent_n <= 0 || rc_cs.empty()) return;
         const double t0 = now_ms();
+        if (for_lend) rc_cv.notify_one();   // (the caller set copy_flush: the held fills go now)
         while (rc_pending.load() > 0) {
-            if (now_ms() - t0 > kRcDrainMs) {
+            if (now_ms() - t0 > kRcDrainMs && !for_lend) {
                 static std::atomic<bool> said{false};
                 if (!said.exchange(true))
                     std::fprintf(stderr, "ds4: recent slots: %d fills still running %.0f ms before a prompt - the prompt goes "
                                          "on without waiting for them\n", rc_pending.load(), now_ms() - t0);
                 return;
+            }
+            if (for_lend && now_ms() - t0 > kRcDrainMs) {   // (a lend waits for them all: say so once)
+                static std::atomic<bool> said_l{false};
+                if (!said_l.exchange(true))
+                    std::fprintf(stderr, "ds4: recent slots: %d fills still running %.0f ms before a prompt that borrows their "
+                                         "slots - waiting for them\n", rc_pending.load(), now_ms() - t0);
             }
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
@@ -10598,7 +10670,7 @@ struct Model::Impl {
         tick_flush();
     }
     void rc_tick(bool start_fills = true) {
-        if (recent_n <= 0) return;
+        if (recent_n <= 0 || lent) return;   // (the tail lent: the recent slots under the buffers are the run's)
         const double t_tick = now_ms();
         struct Tm {
             Model::Impl* m;
@@ -10974,9 +11046,9 @@ struct Model::Impl {
             for (Layer& l : L)
                 for (float& h : l.heat) h *= c_decay;
         }
-        if (lend_held.load(std::memory_order_relaxed)) {   // (a prompt's room kept between its parts: no move starts -
-            for (Layer& l : L) l.cpu_hits.clear();          //  the spare slot and the slots under the buffers are its)
-            return;
+        if (lend_held.load(std::memory_order_relaxed) || lent) {   // (a prompt's room kept between its parts, or lent
+            for (Layer& l : L) l.cpu_hits.clear();                  //  to a run still: no move starts - the spare slot
+            return;                                                 //  and the slots under the buffers are its)
         }
         cache_queue();
     }
@@ -17725,8 +17797,15 @@ struct Model::Impl {
         bool any = false;
         for (const auto& cp : chunks) any = any || (cp != nullptr && cp->borrow);
         if (!any) return true;
+        bool x3 = false;   // (an EXL3 lender's tail is the recent slots' too: their fills done first, every one)
+        for (const auto& cp : chunks) x3 = x3 || (cp != nullptr && cp->x3_lend);
+        struct Unflush {
+            std::atomic<bool>& f;
+            ~Unflush() { f.store(false, std::memory_order_release); }
+        } unflush_{copy_flush};
+        if (x3) copy_flush.store(true, std::memory_order_release);   // (the drains wait on held swaps and fills)
         cache_drain();
-        if (ln_one || ln_land) rc_drain();   // (the one-GPU path's; elsewhere v1.1.27's: no wait)
+        if (ln_one || ln_land || x3) rc_drain(x3);   // (the one-GPU path's; elsewhere v1.1.27's: no wait)
         bool tp = false;   // (DS4_TP_BORROW: a group's layer keeps the fewest of its members' slots - from all of them)
         for (const auto& cp : chunks) tp = tp || (cp != nullptr && cp->tp_lend);
         // (every lending device's room first, before any is touched: a refusal leaves every slot as it was)
@@ -17734,13 +17813,31 @@ struct Model::Impl {
             if (chunks[di] == nullptr || !chunks[di]->borrow) continue;
             const Dev& d = devs[di];
             const size_t need = lay_chunk(*chunks[di], C, nullptr, 2);
-            if (d.tail == nullptr || !chunks[di]->flow || need + 256 > d.tail_bytes) {   // (only the flow streams them)
+            // (the flow streams the lent slots' experts; an EXL3 lender's are the cache's, which the streams copy from RAM)
+            if (d.tail == nullptr || (!chunks[di]->flow && !chunks[di]->x3_lend) || need + 256 > d.tail_bytes) {
                 err = "the prompt path's room on CUDA" + std::to_string(d.id) + ": " + std::to_string(need >> 20) +
                       " MiB for chunks of " + std::to_string(C) + " tokens, " + std::to_string(d.tail_bytes >> 20) +
                       " lent";
                 return false;
             }
         }
+        static const bool check = std::getenv("DS4_CHECK_LEND") != nullptr;
+        x3_check.clear();
+        if (check && x3)   // (an EXL3 lender's tail slots as they are, before the room is cleared: borrow_end compares)
+            for (const Layer& l : L) {
+                if (l.mtp || l.n_main >= l.n_slots || l.lay.fmt == gg::kFmtMXFP4) continue;
+                for (int e = 0; e < l.n_exp; ++e) {
+                    const int sl = l.slot[(size_t) e];
+                    if (sl < l.n_main) continue;
+                    for (int m = 0; m < l.nm; ++m) {
+                        const Layer& x = member(l, m);
+                        LentCheck k{l.il, e, sl, m, std::vector<uint8_t>(unit(x))};
+                        cudaSetDevice(devs[(size_t) x.dev].id);
+                        cudaMemcpy(k.bytes.data(), sat(l, x, sl, unit(x)), k.bytes.size(), cudaMemcpyDeviceToHost);
+                        x3_check.push_back(std::move(k));
+                    }
+                }
+            }
         if (tp)
             for (Layer& l : L) l.pv_n = l.n_slots;
         for (size_t di = 0; di < chunks.size(); ++di) {
@@ -17915,6 +18012,57 @@ struct Model::Impl {
                     }
             if (!ok) lend_broken = true;
             return ok;
+        }
+        if (L[(size_t) jobs[0].layer].lay.fmt != gg::kFmtMXFP4) {   // (DS4_EXL3_LEND) the cache's experts, from RAM
+            const double t0 = now_ms();
+            std::string e2;
+            for (size_t i = 0; i < jobs.size() && !broken; ++i) {
+                const Layer& l = L[(size_t) jobs[i].layer];
+                const int e = jobs[i].e;
+                if (l.lay.fmt == gg::kFmtMXFP4 || l.hh[(size_t) e][0] == nullptr) {   // (no copy in RAM: no cache slot's)
+                    broken = true;
+                    why = "layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " lent without a copy in RAM";
+                    break;
+                }
+                for (int m = 0; m < l.nm && !broken; ++m) {
+                    const Layer& x = member(l, m);
+                    const Dev& dv = devs[(size_t) x.dev];
+                    if (cudaSetDevice(dv.id) != cudaSuccess ||
+                        !stream_expert(l, m, e, sat(l, x, l.slot[(size_t) e], unit(x)), dv.st, e2)) {
+                        broken = true;
+                        why = e2.empty() ? "a copy into its slot failed" : e2;
+                    }
+                }
+            }
+            for (const Dev& dv : devs)
+                if (cudaSetDevice(dv.id) != cudaSuccess || cudaStreamSynchronize(dv.st) != cudaSuccess) broken = true;
+            if (broken) {
+                lend_broken = true;
+                std::fprintf(stderr, "ds4: the prompt path's room: the expert cache's slots were not copied back (%s) - "
+                                     "the device's state unknown; no further request runs\n", why.c_str());
+                return false;
+            }
+            st.lent_back += (int64_t) jobs.size();
+            st.lent_back_ms += now_ms() - t0;
+            size_t n_diff = 0;
+            for (const LentCheck& k : x3_check) {   // (DS4_CHECK_LEND)
+                const Layer& l = L[(size_t) k.layer];
+                const Layer& x = member(l, k.m);
+                std::vector<uint8_t> now(k.bytes.size());
+                cudaSetDevice(devs[(size_t) x.dev].id);
+                cudaMemcpy(now.data(), sat(l, x, k.slot, unit(x)), now.size(), cudaMemcpyDeviceToHost);
+                const bool moved = l.slot[(size_t) k.e] != k.slot;
+                if (moved || now != k.bytes) {
+                    if (n_diff < 8)
+                        std::fprintf(stderr, "ds4 DS4_CHECK_LEND: layer %d expert %d slot %d member %d: %s\n", l.il, k.e,
+                                     k.slot, k.m, moved ? "moved" : "bytes differ from before the lend");
+                    ++n_diff;
+                }
+            }
+            if (!x3_check.empty())
+                std::fprintf(stderr, "ds4 DS4_CHECK_LEND: %zu lent slot parts, %zu not as before\n", x3_check.size(), n_diff);
+            x3_check.clear();
+            return true;
         }
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
@@ -18573,6 +18721,11 @@ struct Model::Impl {
                 std::string e;
                 if (!run_dev_chunks((int) di, run, e)) {
                     errs[di] = e.empty() ? "a device's thread failed" : e;
+                    // (said now: the other devices may wait on this one's work for good - the hand-off, the sums - and
+                    //  the run's own report would never come)
+                    if (e != kHalted)
+                        std::fprintf(stderr, "ds4: CUDA%d's part of a run of chunks failed: %s\n", devs[di].id,
+                                     errs[di].c_str());
                     // (a device's failure ends every wait; a Stop's early end does not - the devices still in a chunk
                     //  every device runs wait for its Engram rows, #539: one device's early end let another group's
                     //  member leave its chunk while its partner ran it)
