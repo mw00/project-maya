@@ -2837,6 +2837,7 @@ class Service:
             "concurrency": {"serving": places, "requested": places},   # more than that wait their turn
             "dialects": ["/v1/chat/completions", "/v1/responses", "/v1/messages"],
             "responses": {"cache": self.responses.stats(), "jobs": self.response_jobs.stats(),
+                          "reasoning": {"summary": "model-reasoning", "encrypted_content": False},
                           "structured_outputs": {"mode": "validate-before-publish", "schema_draft": "2020-12",
                                                  "constrained_decoding": False}},
             "vision": {"enabled": images, "available": images,
