@@ -935,6 +935,18 @@ class Collapse(unittest.TestCase):
         c = LG.collapse(msgs)
         self.assertEqual([m["content"] for m in c.messages[2:]], [f"Done.\n\n{code}"] * 2)
 
+    def test_a_long_conversation_keeps_its_prompt_whole(self):
+        """#702: above COLLAPSE_MAX_CHARS the collapse is skipped, so the prompt's prefix stays the same and the
+        engine's conversation cache is still valid (a 126K-token prompt was read again, ~2 minutes)."""
+        msgs = self.turns(200)
+        self.assertGreater(LG.conv_chars(msgs), LG.COLLAPSE_MAX_CHARS)
+        self.assertIsNone(LG.collapse(msgs))
+        os.environ["MAYA_LOOP_GUARD_COLLAPSE_MAX"] = "1000000"          # (the behaviour before #702)
+        try:
+            self.assertIsNotNone(LG.collapse(msgs))
+        finally:
+            os.environ.pop("MAYA_LOOP_GUARD_COLLAPSE_MAX", None)
+
     def test_a_conversation_without_a_loop_is_untouched(self):
         msgs = [{"role": "user", "content": "x"}]
         for i in range(6):

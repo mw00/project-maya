@@ -39,6 +39,7 @@ it on for that request when the server has it off).
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
 from typing import Callable, NamedTuple
@@ -535,6 +536,29 @@ def echoes(messages: list[dict]) -> bool:
         longest >= ECHO_TURNS
 
 
+# Above this many characters of conversation (roughly tokens x 3.5) the prompt is left whole: collapsing history
+# rewrites the prompt's prefix, and the engine's conversation cache (snapshot/checkpoints) then no longer matches, so
+# the whole conversation is read again (a 126K-token prompt: 16 chunks, ~2 minutes, #702).  The generation-side
+# protections (stops_short, keep_going, the repetition penalty) still apply to long conversations.
+# MAYA_LOOP_GUARD_COLLAPSE_MAX overrides it; 0 = no limit (the behaviour before #702).
+COLLAPSE_MAX_CHARS = 32000
+
+
+def conv_chars(messages: list[dict]) -> int:
+    """The conversation's size in characters (content, reasoning and tool calls): what COLLAPSE_MAX_CHARS bounds."""
+    n = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            n += len(c)
+        r = m.get("reasoning_content")
+        if isinstance(r, str):
+            n += len(r)
+        for tc in m.get("tool_calls") or []:
+            n += len(json.dumps(tc, ensure_ascii=False))
+    return n
+
+
 def collapse(messages: list[dict]) -> Collapse | None:
     """The prompt of a conversation that carries a loop (echoes()) without what the model already wrote: a paragraph
     of its reasoning or text that it wrote before (an earlier message, or earlier in the same one) is left out, and
@@ -542,10 +566,13 @@ def collapse(messages: list[dict]) -> Collapse | None:
     bytes) goes with its results and its thinking.  What the
     model sees is then what it found, once - not dozens of copies of the same thoughts to go on from (GLM-5.3 had
     "Hmm - hold on: I realize something important." 543 times in an 88K prompt, 89% of its own text repeats).  Each
-    message depends only on the ones before it, so the next request's prompt starts the same.  None: no loop, or
-    nothing to leave out."""
+    message depends only on the ones before it, so the next request's prompt starts the same.  None: no loop,
+    nothing to leave out, or a conversation above COLLAPSE_MAX_CHARS (whose prompt must not change, #702)."""
     if not echoes(messages):
         return None
+    limit = int(os.environ.get("MAYA_LOOP_GUARD_COLLAPSE_MAX") or COLLAPSE_MAX_CHARS)
+    if limit and conv_chars(messages) > limit:
+        return None          # a long conversation keeps its prompt whole: the engine's cache stays valid (#702)
     out, seen, made, paras, rounds, i, last = [], set(), set(), 0, 0, 0, None
     while i < len(messages):
         m = messages[i]
