@@ -1993,6 +1993,28 @@ struct Model::Impl {
     bool lend_broken = false;
     static constexpr const char* kLendBroken =
         "the prompt path's room could not be handed back - the expert tables are unknown; restart the engine";
+    // Model::broken: no later request can trust this process's state - the hand-back above failed, or a layer device's
+    // context took a fault inside a kernel (an illegal address, a failed launch, ...), after which every call on it
+    // returns that error for the rest of the process.  A query of each device's stream returns it at once and never
+    // waits (a stream still at work is not one); an error a call returned and nothing later repeats - a failed
+    // allocation, a bad argument - is not one.  The helper is not asked: an error there already hands its picks to the
+    // CPU lane (helper_dead) and the layer devices go on
+    bool broken() {
+        if (lend_broken) return true;
+        int cur = -1;
+        const bool had = cudaGetDevice(&cur) == cudaSuccess;
+        bool bad = false;
+        for (const Dev& d : devs) {
+            cudaError_t e = cudaSetDevice(d.id);
+            if (e == cudaSuccess) e = cudaStreamQuery(d.st);
+            if (e != cudaSuccess && e != cudaErrorNotReady) {
+                std::fprintf(stderr, "ds4: CUDA%d: %s - the device's state is unknown\n", d.id, cudaGetErrorString(e));
+                bad = true;
+            }
+        }
+        if (had) cudaSetDevice(cur);
+        return bad;
+    }
     std::vector<uint8_t*> rf_stage, rf_half;   // (rf_half: DS4_TP_BORROW's member parts, one a thread)
     size_t rf_bytes = 0;
     int64_t lent_experts = 0;
@@ -20594,6 +20616,7 @@ void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
 void Model::set_yield(std::function<bool()> f) { p_->yield_to = std::move(f); }
 int Model::fed() const { return p_->fed_n; }
 bool Model::cancelled() const { return p_->halted; }
+bool Model::broken() { return p_->broken(); }
 void Model::begin_request() { p_->begin_request(); }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample(t, tp, tk, mp, seed, counter);

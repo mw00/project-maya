@@ -2614,5 +2614,55 @@ class NoDelayStreaming(unittest.TestCase):
             conn.close(), client.close(), listener.close()
 
 
+class EngineEndTests(unittest.TestCase):
+    """An engine that ends itself (maya-ds4 after a GPU's fault): the server takes it as ended from its END line, and
+    why it ended, as the server prints it for a request it took down, comes from the end of its log."""
+
+    def note(self, tail: str, returncode=3) -> str:
+        import tempfile
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "engine.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(tail)
+            e = StrataEngine.__new__(StrataEngine)
+            e.log_path = log
+            e.proc = SimpleNamespace(returncode=returncode)
+            return e.death_note()
+
+    def test_a_gpu_fault_the_engine_caught_is_not_read_as_ram(self):
+        n = self.note("ds4: CUDA0: an illegal memory access was encountered - the device's state is unknown\n"
+                      "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) so the "
+                      "server starts it again for the next request\n")
+        self.assertIn("a GPU took a fault inside a kernel", n)
+        self.assertIn("the engine ends (exit 3)", n)
+        self.assertNotIn("RAM", n)
+
+    def test_end_ahead_of_done_marks_the_engine_ended_before_the_request_ends(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc = SimpleNamespace(stdout=io.StringIO("ERR cudaMemcpyAsync(...): an illegal memory access was encountered\n"
+                                                    "END a GPU's state is unknown after this request - the engine ends "
+                                                    "(exit 3); the next request starts a fresh one\n"
+                                                    "DONE 0 12 0.0 0.0 cancel 0 0 0 0 0\n"),
+                                 poll=lambda: None)
+        e.lines, e.multi, e.ended = queue.Queue(), 0, False
+        e._routes, e._routes_lock = {}, threading.Lock()
+        e._pump()
+        got = []
+        while (line := e.lines.get_nowait()) is not None:
+            got.append(line.split()[0])
+        self.assertEqual(got, ["ERR", "DONE"])           # END is the server's, not the request's
+        self.assertTrue(e.ended)
+        self.assertFalse(e.alive())                      # (the process may still be exiting: the next request restarts)
+
+    def test_the_watchdog_and_ram_notes_are_unchanged(self):
+        self.assertIn("a hang it caught", self.note("maya ds4 serve: no progress for 600 s during a request - stopping "
+                                                    "the engine so the server starts it again (issue #29, #539)\n"))
+        self.assertIn("running out of RAM", self.note("ds4: something else\n", returncode=-9))
+
+
 if __name__ == "__main__":
     unittest.main()

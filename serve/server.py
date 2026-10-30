@@ -906,6 +906,13 @@ class StrataEngine:
             if line.startswith("VRAM "):
                 self._vram_line(line)
                 continue
+            # END (maya-ds4, ahead of a request's DONE): a GPU's state is unknown and the engine ends once that DONE
+            # is out - taken as ended now, so the next request, even one already waiting, starts a fresh engine
+            # instead of writing to this one while it exits
+            if line.startswith("END "):
+                print("[maya] " + line[4:].strip(), flush=True)
+                self.ended = True
+                continue
             if self.multi and self._route(line):
                 continue
             self.lines.put(line)
@@ -946,7 +953,8 @@ class StrataEngine:
         return False
 
     def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), a GPU's fault it
+        caught after a request (exit 3), else RAM."""
         tail = ""
         try:
             with open(self.log_path, "rb") as f:
@@ -959,6 +967,11 @@ class StrataEngine:
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/mw00/project-maya/issues.")
+            if "a GPU's state is unknown" in line:
+                return ("The engine stopped itself because a GPU took a fault inside a kernel (an illegal address or "
+                        "the like), after which that GPU's state is lost; a fresh engine starts with the next request. "
+                        "Its log line: " + line.strip() + " - the lines above it name the GPU and the error; please "
+                        "report it at github.com/mw00/project-maya/issues.")
         if getattr(getattr(self, "proc", None), "returncode", None) in (-2, -15):   # (#539: read as a lack of RAM)
             return ("A signal from outside ended it (SIGINT or SIGTERM: Ctrl+C, kill, a service manager), not a lack "
                     "of RAM.")

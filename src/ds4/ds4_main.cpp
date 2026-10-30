@@ -710,6 +710,26 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     unsigned long long counter = 0;
     long long log_req = 0;   // (DS4_ROUND_LOG's tags)
     std::vector<Pic> held;   // the pictures the state holds (start, hash, span)
+    // a request that leaves a GPU's state unknown - a layer GPU's context took a fault inside a kernel (an illegal
+    // address, ...), or the prompt path's room was not handed back (Model::broken): its last lines say so, END ahead of
+    // its DONE (the server then takes this engine as ended, and the next request, even one already waiting, starts a
+    // fresh one), and once that DONE is out the engine ends (exit 3, as its watchdog does).  Staying up, it refused
+    // every later request until a restart by hand
+    bool ending = false;
+    const auto end_note = [&m, &ending] {   // (before a request's DONE)
+        if (ending || !m.broken()) return;
+        ending = true;
+        std::printf("END a GPU's state is unknown after this request - the engine ends (exit 3); the next request "
+                    "starts a fresh one\n");
+        std::fprintf(stderr, "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) "
+                             "so the server starts it again for the next request\n");
+    };
+    const auto end_if_broken = [&ending] {   // (after it)
+        if (!ending) return;
+        std::fflush(stdout);
+        std::fflush(stderr);
+        std::_Exit(3);   // (not abort(): a core dump of the pinned expert tiers takes minutes)
+    };
     // (DS4_SERVE_DUMP=<prefix>, tests: request i's logits - the prompt's last row, then every decode step's rows - into
     //  <prefix>.<i>.f32, to compare a request's logits byte for byte across processes and histories)
     const char* dump_prefix = std::getenv("DS4_SERVE_DUMP");
@@ -1391,6 +1411,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         e = "a picture's span does not start at an image token of the prompt";
             if (!e.empty()) {
                 std::printf("ERR%s %s\n", tag.c_str(), e.c_str());
+                end_note();
                 std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
                 std::fflush(stdout);
                 return false;
@@ -1492,6 +1513,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
+            end_note();
             std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), r.ids.size());
             std::fflush(stdout);
             m.set_images({});
@@ -1654,6 +1676,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::fprintf(stderr, "maya ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
                          total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
+            end_note();
             std::printf("DONE%s 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", tag.c_str(), total, now_ms() - t0, back ? from : (size_t) 0);
             std::fflush(stdout);
             return false;
@@ -1662,6 +1685,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             m.set_images({});
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR%s %s\n", tag.c_str(), err.c_str());
+            end_note();
             std::printf("DONE%s 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", tag.c_str(), total);
             std::fflush(stdout);
             m.reset();
@@ -1698,6 +1722,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     };
     const bool multi = m.seq_count() > 1;
     while (!multi) {   // one conversation: a request at a time
+        end_if_broken();   // (the last request's DONE is out, on every path that ended it)
         g_busy.store(false);   // (waiting for a request: no watchdog)
         if (!in.next(line) || line == "QUIT") break;
         beat();
@@ -1826,6 +1851,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         stat_line();
         const double t2 = now_ms();
         const strata::ds4::Stats& se = m.stats();   // (hits / lookups: the decode's routed experts in VRAM / all)
+        end_note();
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
                     finish, d_acc, d_off, from, (long long) ((se.experts - sd.experts) - (se.cpu_experts - sd.cpu_experts)),
                     (long long) (se.experts - sd.experts));
@@ -1971,6 +1997,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const auto finish_act = [&](Act& a) {
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();   // (the engine's over the request's decode, the others' too)
+            end_note();
             std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", a.r.rid, a.produced, a.r.ids.size(),
                         a.t1 - a.P.t0, t2 - a.t1, a.finish, a.d_acc, a.d_off, a.P.from,
                         (long long) ((se.experts - a.sd.experts) - (se.cpu_experts - a.sd.cpu_experts)),
@@ -2072,6 +2099,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const long long rid = r.rid;
             if (!prompt_begin(r, geni, " " + std::to_string(rid), a->P)) {
                 in.forget(rid);
+                end_if_broken();
                 return;
             }
             a->seq = best;
@@ -2080,6 +2108,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 read_turn(*a, r.ids.size(), false);
                 if (a->ended) {
                     in.forget(rid);
+                    end_if_broken();
                     return;
                 }
             }
@@ -2441,6 +2470,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 else finish_act(*a);
                 freed = true;
             }
+            if (freed) end_if_broken();   // (the other conversations' state is the same GPUs': lost with it)
             if (freed) admit_waiting();
             if (!acts.empty()) {
                 queue_turn();
