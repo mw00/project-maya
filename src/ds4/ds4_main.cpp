@@ -7,7 +7,11 @@
 // --serve speaks what serve/server.py's StrataEngine expects: INFO lines, then `READY <context> stop`; per request
 // `GEN <max_new> [key=value ...] <id,id,...>` answered by `T <id>` lines and `DONE <generated> <prompt> <prompt ms>
 // <decode ms> <stop|length|cancel> <accepted> <offered> <reused> <hits> <lookups>` (the drafts; the decode's routed
-// experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  A prompt that
+// experts in VRAM / all); `STOP` ends a request early, `QUIT` the engine.  Right before a request's DONE, a
+// `DP kept=<n> offered=<n> ds_kept=<n> ds_offered=<n> lk_kept=<n> lk_offered=<n> rounds=<n> [pos=1:k/r,...]` line
+// splits the same drafts by source (#590): DSpark's kept/offered (the sums less the prompt lookup's), the lookup's
+// own drafts and rounds, and per draft position kept/reached (the single-conversation path only - with several
+// decoding, the per-position counters are the engine's over every conversation, so DP there carries no pos=).  A prompt that
 // continues the state (the conversation so far) reuses it; one that only shares the last prompt's start goes back to
 // that prompt's end; anything else starts over.  `GENI <max_new> [keys] <file> <ids>` carries the prompt's pictures
 // (the file: see read_pics); the state is shared only where the same picture sits at the same place.  With
@@ -265,6 +269,20 @@ std::string per_position(const strata::ds4::Stats& s0, const strata::ds4::Stats&
         pp += b;
     }
     return pp;
+}
+
+// The same per-position counters as per_position(), in the DP line's key=value form (" pos=1:k/r,2:k/r", empty
+// when no draft was verified): one pair per position reached in this request's verify windows
+std::string positions_kv(const strata::ds4::Stats& s0, const strata::ds4::Stats& s1) {
+    std::string out;
+    for (int i = 0; i < 8; ++i) {
+        const long long r = s1.draft_reached[i] - s0.draft_reached[i], k = s1.draft_kept[i] - s0.draft_kept[i];
+        if (r <= 0) break;
+        char b[48];
+        std::snprintf(b, sizeof b, "%s%d:%lld/%lld", i == 0 ? " pos=" : ",", i + 1, k, r);
+        out += b;
+    }
+    return out;
 }
 
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule, GLM's spec_cum): a draft is
@@ -1850,6 +1868,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         stat_line();
         const double t2 = now_ms();
         const strata::ds4::Stats& se = m.stats();   // (hits / lookups: the decode's routed experts in VRAM / all)
+        // (#590: the drafts by source, for the server's /metrics - DONE keeps their sum, DP splits them.  DSpark's
+        //  kept/offered are the sums less the prompt lookup's, whose verified drafts are part of the same rounds;
+        //  pos= is per draft position, kept/reached, over this request's verify windows)
+        const long long lk_w = lk ? lk->windows - lk_w0 : 0, lk_o = lk ? lk->offered - lk_o0 : 0,
+                        lk_a = lk ? lk->accepted - lk_a0 : 0;
+        std::printf("DP kept=%lld offered=%lld ds_kept=%lld ds_offered=%lld lk_kept=%lld lk_offered=%lld "
+                    "rounds=%lld%s\n",
+                    d_acc, d_off, d_acc - lk_a, d_off - lk_o, lk_a, lk_o, lk_w, positions_kv(s_dec, se).c_str());
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
                     finish, d_acc, d_off, from, (long long) ((se.experts - sd.experts) - (se.cpu_experts - sd.cpu_experts)),
                     (long long) (se.experts - sd.experts));
@@ -1863,8 +1889,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0,
                      s.experts > s0.experts ? 100.0 * (double) (s.cpu_experts - s0.cpu_experts) / (double) (s.experts - s0.experts)
                                             : 0.0);
-        if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
-                                    per_position(s_dec, s).c_str());
+        if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept (DSpark %lld of %lld); %s\n",
+                                    d_acc, d_off, d_acc - lk_a, d_off - lk_o, per_position(s_dec, s).c_str());
         // (DS4_DRAFT_VRAM, read as STRATA_DS4_DRAFT_VRAM or DS4_DRAFT_VRAM: the cap's misses - this request's decode,
         //  the drafter's picks)
         if (std::getenv("STRATA_DS4_DRAFT_VRAM") != nullptr || std::getenv("DS4_DRAFT_VRAM") != nullptr)
@@ -1914,6 +1940,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             double t1 = 0;
             strata::ds4::Stats sd;
             long long produced = 0, limit = 0, d_off = 0, d_acc = 0;
+            long long lk_off = 0, lk_acc = 0, lk_win = 0;   // (the prompt lookup's own rounds/drafts, #590's split)
             const char* finish = "length";
             bool cool = false, in_think = false, done = false;
             bool reading = false;   // its prompt is being read, a piece a turn
@@ -1995,6 +2022,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const auto finish_act = [&](Act& a) {
             const double t2 = now_ms();
             const strata::ds4::Stats& se = m.stats();   // (the engine's over the request's decode, the others' too)
+            // (#590: as the single path's DP, without pos= - with several decoding, the per-position counters are the
+            //  engine's over every conversation, so only this request's own splits are exact and printed)
+            std::printf("DP %lld kept=%lld offered=%lld ds_kept=%lld ds_offered=%lld lk_kept=%lld lk_offered=%lld "
+                        "rounds=%lld\n",
+                        a.r.rid, a.d_acc, a.d_off, a.d_acc - a.lk_acc, a.d_off - a.lk_off, a.lk_acc, a.lk_off,
+                        a.lk_win);
             std::printf("DONE %lld %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", a.r.rid, a.produced, a.r.ids.size(),
                         a.t1 - a.P.t0, t2 - a.t1, a.finish, a.d_acc, a.d_off, a.P.from,
                         (long long) ((se.experts - a.sd.experts) - (se.cpu_experts - a.sd.cpu_experts)),
@@ -2002,11 +2035,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             std::fprintf(stderr,
                          "maya ds4 serve: request %lld: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), "
-                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running; drafts %lld of %lld kept)\n",
+                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running; drafts %lld of %lld kept, "
+                         "DSpark %lld of %lld)\n",
                          a.r.rid, a.r.ids.size(), a.P.from, a.r.ids.size() - a.P.from, a.t1 - a.P.t0,
                          a.t1 > a.P.t0 ? 1000.0 * (double) (a.r.ids.size() - a.P.from) / (a.t1 - a.P.t0) : 0.0,
                          a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size(),
-                         a.d_acc, a.d_off);
+                         a.d_acc, a.d_off, a.d_acc - a.lk_acc, a.d_off - a.lk_off);
             if (dc != nullptr && a.d_off > 0)
                 std::fprintf(stderr, "maya ds4 serve: draft cost (DS4_DRAFT_COST), ms a round by its rows: %s\n",
                              dc->text().c_str());
@@ -2216,6 +2250,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 m.set_logprobs(a.r.logprobs, closing ? a.r.think_end : -1);
                 int off = 0, acc = 0;
                 const bool try_spec = (a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool;
+                const long long lw0 = L ? L->windows : 0, lo0 = L ? L->offered : 0, la0 = L ? L->accepted : 0;
                 if (!round(m, a.tok, room, try_spec, a.r.conf >= 0 ? a.r.conf : conf_min, a.r.temperature, a.r.top_p,
                            a.r.top_k, a.r.min_p, a.r.seed, a.counter, a.got, off, acc, err, a.r.cum, L, dc)) {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
@@ -2224,6 +2259,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 } else {
                     a.d_off += off;
                     a.d_acc += acc;
+                    if (L != nullptr) {   // (this round's lookup drafts, to split them from DSpark's at DONE)
+                        a.lk_win += L->windows - lw0;
+                        a.lk_off += L->offered - lo0;
+                        a.lk_acc += L->accepted - la0;
+                    }
                     a.cool = try_spec && off == 0;
                     if (closing && !a.got.empty()) a.got.back() = a.r.think_end;
                     std::reverse(a.got.begin(), a.got.end());
