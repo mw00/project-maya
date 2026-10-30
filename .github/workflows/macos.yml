@@ -52,8 +52,11 @@ jobs:
           }
           EOF
           clang -fobjc-arc -framework Foundation -framework Metal "$RUNNER_TEMP/metal_check.m" -o "$RUNNER_TEMP/metal_check"
-          if "$RUNNER_TEMP/metal_check"; then
+          if "$RUNNER_TEMP/metal_check" > "$RUNNER_TEMP/metal_check.txt"; then
+            cat "$RUNNER_TEMP/metal_check.txt"
             echo "gpu=yes" >> "$GITHUB_OUTPUT"
+            # Apple7 (every Apple-silicon Mac) has the simdgroup kernels; a virtual Mac's GPU does not
+            if grep -q "Apple7 1" "$RUNNER_TEMP/metal_check.txt"; then echo "apple7=yes" >> "$GITHUB_OUTPUT"; else echo "apple7=no" >> "$GITHUB_OUTPUT"; fi
           else
             echo "::warning::No Metal GPU on this runner: the GPU tests are skipped, only the build and the CPU tests run"
             echo "gpu=no" >> "$GITHUB_OUTPUT"
@@ -83,11 +86,31 @@ jobs:
       # slice and the --serve protocol. (The 45-layer / MTP / DFlash2 / Q8 / 16-head fixtures - 1.2 GB GGUFs generated
       # into the build tree, up to an hour each - are left to a real Mac.)
       - name: GPU tests
-        if: steps.metal.outputs.gpu == 'yes'
+        if: steps.metal.outputs.gpu == 'yes' && steps.metal.outputs.apple7 == 'yes'
         working-directory: build-metal
         run: >-
           ctest --output-on-failure --timeout 1800
           -R '^(metal_model_test|metal_model_test_evict|metal_model_window|metal_model_big_slice|metal_serve_test)$'
+      # a virtual Mac's GPU (no Apple7 simdgroup kernels): the engine must refuse it with a clear message, and with
+      # MAYA_METAL_ALLOW_ANY_GPU=1 the tests whose weights stay in shared memory still run (the 2048-token slice puts
+      # experts in GPU-only memory and needs a real Apple-silicon GPU)
+      - name: GPU without Apple7 is refused clearly
+        if: steps.metal.outputs.gpu == 'yes' && steps.metal.outputs.apple7 != 'yes'
+        run: |
+          if ./build-metal/metal_model_test prefill data/glm5-synth.gguf 64 > refuse.txt 2>&1; then
+            cat refuse.txt; echo "::error::maya-metal started on a GPU without Apple7 support"; exit 1
+          fi
+          cat refuse.txt
+          grep -q "needs Apple silicon" refuse.txt || { echo "::error::no clear message for an unsupported GPU"; exit 1; }
+          if grep -q "GGML_ASSERT" refuse.txt; then echo "::error::an assert instead of the message"; exit 1; fi
+      - name: GPU tests (virtual GPU, MAYA_METAL_ALLOW_ANY_GPU=1)
+        if: steps.metal.outputs.gpu == 'yes' && steps.metal.outputs.apple7 != 'yes'
+        working-directory: build-metal
+        env:
+          MAYA_METAL_ALLOW_ANY_GPU: "1"
+        run: >-
+          ctest --output-on-failure --timeout 1800
+          -R '^(metal_model_test|metal_model_test_evict|metal_model_window|metal_serve_test)$'
       - name: GPU tests skipped
         if: steps.metal.outputs.gpu != 'yes'
         run: echo "::notice::GPU tests skipped - this runner has no usable Metal device (see the first step)"

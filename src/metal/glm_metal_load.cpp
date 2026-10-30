@@ -238,6 +238,23 @@ bool GlmMetal::Impl::init_backends(std::string& err) {
             err = "no Metal GPU found";
             return false;
         }
+        // a GPU without Apple7-class simdgroup support (an Intel Mac's GPU, a virtual Mac's) runs no matrix product in
+        // Metal: the graphs would fall back to the CPU and stop at the first one whose weights sit in GPU-only memory
+        // (a ggml assert) - say so up front instead.  MAYA_METAL_ALLOW_ANY_GPU=1 starts anyway (CI's virtual Macs).
+        const char* any = std::getenv("MAYA_METAL_ALLOW_ANY_GPU");
+        if (!(any && *any && *any != '0')) {
+            ggml_init_params ip = {3 * ggml_tensor_overhead(), nullptr, true};
+            ggml_context* c = ggml_init(ip);
+            ggml_tensor* a = ggml_new_tensor_2d(c, GGML_TYPE_F32, 64, 64);
+            ggml_tensor* b = ggml_new_tensor_2d(c, GGML_TYPE_F32, 64, 8);
+            const bool mm = ggml_backend_dev_supports_op(gpu_dev, ggml_mul_mat(c, a, b));
+            ggml_free(c);
+            if (!mm) {
+                err = std::string("this Mac's GPU (") + ggml_backend_dev_description(gpu_dev) +
+                      ") cannot run maya-metal's matrix products: Maya on a Mac needs Apple silicon (M1 or newer)";
+                return false;
+            }
+        }
         gpu = ggml_backend_dev_init(gpu_dev, nullptr);
         if (!gpu) {
             err = "cannot start the Metal backend";
