@@ -1101,11 +1101,26 @@ adapter's, on other weights it is the exact projection rather than the adapter. 
 Measured with drafting off, 4x RTX 3090, four restart pairs alternating the two: decode 1.5-3.8% slower (about 3%),
 no consistent prompt-speed difference.
 
+`--ablate-sites` and `--ablate-layers` narrow it to some of those writes: `attn` (the attention's only) or `moe` (the
+MoE's only), and the layers FIRST-LAST, 0-based, both included (without it every layer, a drafter's too). That is the
+shape of an edit made to one writer of some blocks, which an adapter cannot carry. huihui-ai's
+Huihui-DeepSeek-V4.1-Flash-1017-abliterated is one: it changes only `attn_output_b` of blocks 11-28, each by the same
+rank-1 update W' = W - s r r^T W, so r is the top left singular vector of W' - W (any of the 18 blocks; over 99% of each
+block's change lies along it) and s about 4.599. With r written as a one-direction control vector,
+`--ablate r.gguf --ablate-scale 4.5994 --ablate-sites attn --ablate-layers 11-28` on the unedited pack gives the edited
+model's logits within float rounding: over 512 tokens of code on one RTX 3090, expert streaming off (so each run repeats
+bit for bit), KL 0.020 between the two, as much as moving only rounding at the same 18 writes gives
+(`--ablate-scale 0.000001`: 0.019). A range past the model's last layer is refused at load. Those 18 writes cost less
+than every write: decode 1.5% slower on questions and no difference on code edits (one RTX 3090, drafting on, two
+restart pairs alternating).
+
 | Setting | Default | |
 | --- | --- | --- |
 | `--ablate FILE` (the config's engine `args`) | off | a control vector or a whole-model abliteration adapter (GGUF) |
 | `--ablate-layer N` | the adapter's, or a one-direction file's | which `direction.N` of a control vector (1-4096) |
 | `--ablate-scale F` | the adapter's `abliterate.scale` (x `adapter.lora.alpha`), else 1 | s, 1e-6 to 1e6; 1 removes the component along r, above 1 over-projects |
+| `--ablate-sites` | `all` | `attn`: only the attention outputs lose it, `moe`: only the MoE outputs |
+| `--ablate-layers FIRST-LAST` | every layer | only these layers' writes (0-based, both included, e.g. `11-28`) |
 
 ## DeepSeek: tensor parallel 2 on Maya's own quants
 

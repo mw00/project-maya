@@ -1073,6 +1073,7 @@ struct Model::Impl {
     std::vector<float> abl_dir;
     float abl_scale = 0.0f;
     std::string abl_what;
+    ablate::Pick abl_pick;   // the writes and layers that lose it (--ablate-sites, --ablate-layers)
     Pack pk;
     Geo g;
     std::vector<Dev> devs;
@@ -2333,9 +2334,11 @@ struct Model::Impl {
     }
     static Layer& member(Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // abliteration: the T rows of y (a write about to enter hc_post, all-reduced already) lose their component along
-    // the direction - what the rank-1 LoRA does to attn_output_b / ffn_down_shexp / ffn_down_exps
-    void ablate(const Dev& d, float* y, int T, cudaStream_t s) const {
-        if (d.abl_r != nullptr) project_out(y, d.abl_r, abl_scale, g.dim, T, s);
+    // the direction - what the rank-1 LoRA does to attn_output_b / ffn_down_shexp / ffn_down_exps.  Layer il's attention
+    // write (moe false) or MoE write (moe true), when --ablate-sites / --ablate-layers take it (by default: every one)
+    void ablate(const Dev& d, float* y, int T, cudaStream_t s, int il, bool moe) const {
+        if (d.abl_r == nullptr || !abl_pick.takes(il, moe)) return;
+        project_out(y, d.abl_r, abl_scale, g.dim, T, s);
     }
     static const Layer& member(const Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // bytes of a VRAM slot of l's experts (a member's part of each, in a group)
@@ -3268,6 +3271,17 @@ struct Model::Impl {
                 err = o.ablate + ": direction of " + std::to_string(abl_dir.size()) + " values, the model's dim is " +
                       std::to_string(g.dim);
                 return false;
+            }
+            // the writes and layers it is limited to (the defaults: every write of every layer)
+            abl_pick = ablate::Pick{};
+            if (!ablate::parse_sites(o.ablate_sites, abl_pick, err) ||
+                (!o.ablate_layers.empty() && !ablate::parse_layers(o.ablate_layers, abl_pick, err)) ||
+                !ablate::check_layers(abl_pick, g.nl, err))
+                return false;
+            if (abl_pick.narrowed()) {   // (the start-up line names them instead of every write)
+                const std::string all = ablate::describe(ablate::Pick{});
+                const size_t at = abl_what.rfind(all);
+                abl_what = (at != std::string::npos ? abl_what.substr(0, at) : abl_what) + ablate::describe(abl_pick);
             }
             for (Dev& d : devs) {
                 if (!dalloc(d, d.abl_r, abl_dir.size(), err)) return false;
@@ -16746,7 +16760,7 @@ struct Model::Impl {
             CK(cudaStreamWaitEvent(s, c.ar_done, 0));
         } else if (nm > 1)
             chunk_allreduce(d, c, ab, mi, T * D, s);
-        ablate(d, c.acc, T, s);
+        ablate(d, c.acc, T, s, L0.il, false);
         hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
         prof_mark(d, 1);
         kick(s);   // (the attention submitted while the host queues the routing)
@@ -16828,7 +16842,7 @@ struct Model::Impl {
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
             if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
-            ablate(d, c.acc, T, s);
+            ablate(d, c.acc, T, s, L0.il, true);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 3);
@@ -16864,7 +16878,7 @@ struct Model::Impl {
         }
         if (!run_vram(d, c, L0, l, l, b.data(), v_done, L0.pv_n, T, err)) return false;
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
-        ablate(d, c.acc, T, s);
+        ablate(d, c.acc, T, s, L0.il, true);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         prof_mark(d, 3);
@@ -20050,7 +20064,7 @@ struct Model::Impl {
         } else CK(cudaMemsetAsync(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-        ablate(d, d.ao, T, s);
+        ablate(d, d.ao, T, s, L0.il, false);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
@@ -20238,7 +20252,7 @@ struct Model::Impl {
             if (mi == 0 && l.mtp) st.draft_experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-            ablate(d, d.moe_out, T, s);
+            ablate(d, d.moe_out, T, s, L0.il, true);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
             if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
@@ -20362,7 +20376,7 @@ struct Model::Impl {
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
         if (hs) CK(cudaStreamWaitEvent(s, d.hc_done, 0));
-        ablate(d, d.moe_out, T, s);
+        ablate(d, d.moe_out, T, s, L0.il, true);
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
         if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
