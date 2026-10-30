@@ -742,6 +742,10 @@ class ScriptEngine:
         self.prompts: list[list[int]] = []
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        from serve.server import CTX_SLACK
+        if len(ids) + max_new + CTX_SLACK > self.max_context:     # (as `strata --serve` rejects it)
+            raise ValueError(f"the prompt ({len(ids)} tokens) and max_new {max_new} are more than the context "
+                             f"{self.max_context}")
         self.prompts.append(list(ids))
         for t in (self.scripts[min(len(self.prompts), len(self.scripts)) - 1] + self.end)[:max_new]:
             self.made += 1
@@ -753,12 +757,12 @@ class ToolBlock(unittest.TestCase):
     differently" - and the same grep, ten more times): that call is blocked - it never reaches the client, the server
     answers it in the prompt and the model goes on in the same answer."""
 
-    def answer(self, *scripts, rounds=(NMCLI,) * 5, engine=None):
+    def answer(self, *scripts, rounds=(NMCLI,) * 5, engine=None, max_tokens=2000):
         from serve.frontend import openai_to_messages
         eng = engine or ScriptEngine(Tok(), *scripts)
         svc = Server().service(eng)
         msgs, tools, kw = openai_to_messages(agent(*rounds))
-        ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
+        ids, thinking, max_new = svc.prepare(msgs, tools, kw, max_tokens)
         events, done = [], None
         for kind, x in svc.run(ids, thinking, tools, max_new, {"_blocked": kw.get("_blocked")}, threading.Event()):
             if kind == "event":
@@ -818,6 +822,21 @@ class ToolBlock(unittest.TestCase):
         self.assertGreater(eng.temps[3], eng.temps[2])
         self.assertLessEqual(max(t for t in eng.temps if t), LG.BLOCK_HEAT_MAX)
         self.assertEqual(svc.metrics()["loop_guard"]["tool_blocked"], 3)
+
+    def test_an_unlimited_answer_kept_going_fits_the_context(self):
+        # v1.1.41: no max_tokens (max_new = the context's room), kept going - the next engine call's prompt holds
+        # KEEP_NOTE and a steer too, and max_new - n ran past the context: "the prompt (188077 tokens) and max_new
+        # 860569 are more than the context 1048576", the answer an error
+        other = "grep -n on_bytes host/bellhost/bridge.py"
+        talk = "OK \u2014 the loop guard is right. Stop repeating identical greps. Break out: use what I have."
+        svc, eng, kw, calls, text, done = self.answer(talk, call_text(other), rounds=(NMCLI,) * 4, max_tokens=None)
+        self.assertEqual(calls, [other])
+        self.assertEqual(len(eng.prompts), 2)
+        self.assertEqual(svc.metrics()["loop_guard"]["kept_going"], 1)
+        # and a blocked call's result in the prompt
+        other = "cat host/bellhost/bridge.py"
+        svc, eng, kw, calls, text, done = self.answer(call_text(NMCLI[0]), call_text(other), max_tokens=None)
+        self.assertEqual((calls, len(eng.prompts)), ([other], 2))
 
     def test_a_continue_hears_what_is_blocked(self):
         from serve.frontend import openai_to_messages
