@@ -381,6 +381,15 @@ model (GLM, DeepSeek, MiniMax) - beside the GLM engine's own check for short pat
   same thoughts to go on from (GLM-5.3 had one sentence 543 times in an 88K prompt). Only the prompt changes, and each
   message depends only on the ones before it, so the next request's prompt starts the same and the cache holds.
   Counted in `loop_guard.collapsed` and `maya:loop_guard_collapsed_total`.
+- **An answer that ends the turn with nothing new:** in a conversation that repeats itself a model can end its turn
+  with its own words about the loop ("OK - the loop guard is right. Break out: use what I have") or with what it
+  already said - and the agent stops there while the work is not done. Such an answer goes on: a short user message,
+  marked as the server's, follows it ("do not stop here, the task is not done: take the next concrete step") and the
+  model continues in the same answer. An answer with anything new in it - a finding, an answer to the user, one line
+  of it - ends the turn as always, however short it is, and so does any answer after 3 such notes in one answer. The
+  reasoning is not re-opened: it was closed before the answer went out, so the model goes on in the answer's own
+  channel (a client sees the answer continue, not its thinking rewritten). Counted in `loop_guard.kept_going` and
+  `maya:loop_guard_kept_going_total`.
 - **A turn-end marker inside the thinking:** a model that quotes these markers, or writes about them, wrote them in its
   thinking - and there the server ended the turn (or the engine itself, at its EOS token): the thinking was cut off
   and the answer never came. Inside the thinking such a marker is the model's text, not the turn's end: the server

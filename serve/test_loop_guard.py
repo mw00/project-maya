@@ -738,12 +738,16 @@ class ScriptEngine:
     def __init__(self, tok, *scripts):
         self.tok, self.max_context, self.made = tok, 1 << 20, 0
         self.end = tok.encode(IM_END, parse_special=True)
+        self.think_end = tok.encode("</think>", parse_special=True)
         self.scripts = [tok.encode("</think>\n\n" + s, parse_special=True) for s in scripts]   # (thinking: on)
         self.prompts: list[list[int]] = []
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         self.prompts.append(list(ids))
-        for t in (self.scripts[min(len(self.prompts), len(self.scripts)) - 1] + self.end)[:max_new]:
+        script = self.scripts[min(len(self.prompts), len(self.scripts)) - 1]
+        if any(i == self.think_end[0] for i in ids[-2:]):   # (the prompt already closed the thinking)
+            script = script[len(self.think_end):]
+        for t in (script + self.end)[:max_new]:
             self.made += 1
             yield t
 
@@ -842,14 +846,18 @@ class ToolBlock(unittest.TestCase):
         self.assertEqual(calls, [other])
         said = svc.tok.decode(eng.prompts[1][len(eng.prompts[0]):])
         self.assertIn(LG.KEEP_NOTE, said)
-        self.assertTrue(said.endswith(LG.keep_steer(1)))
+        self.assertEqual(eng.prompts[1][-1], eng.think_end[0])   # (the answer went out: it goes on as the answer,
+        #                                                        its thinking closed - not re-opened after it)
         self.assertEqual(svc.metrics()["loop_guard"]["kept_going"], 1)
+        # an answer with something new in it may end the turn, however short it is: the model asked for the date
+        svc, eng, kw, calls, text, done = self.answer("30.10.2026", call_text(other), rounds=(NMCLI,) * 4)
+        self.assertEqual((calls, len(eng.prompts), text), ([], 1, "30.10.2026"))
         # a report of what it found may end the turn
         report = "What I found:\n\n" + "\n".join(f"- Finding {i}: the operator claim at step {i} is read-only, so "
                                                   "the bytes are dropped in on_bytes." for i in range(5))
         svc, eng, kw, calls, text, done = self.answer(report, report.replace("Finding", "Result"),
                                                       report.replace("Finding", "Fact"), rounds=(NMCLI,) * 4)
-        self.assertEqual((calls, len(eng.prompts)), ([], 1 + LG.KEEP_MIN))   # (after KEEP_MIN pushes on)
+        self.assertEqual((calls, len(eng.prompts)), ([], 1))            # (it says something new: it ends)
         # the same report once more, what it already said: not something new - it goes on
         from serve.frontend import openai_to_messages
         req = agent(*(NMCLI,) * 4)
@@ -863,6 +871,10 @@ class ToolBlock(unittest.TestCase):
                                                               {"_blocked": kw.get("_blocked")}, threading.Event())
                if k == "event" and x.kind == "tool_call"]
         self.assertEqual(got, [other])
+        # and only so often: talk again and again ends the turn after KEEP_MAX pushes (never the token cap)
+        svc, eng, kw, calls, text, done = self.answer(talk, talk, talk, talk, call_text(other), rounds=(NMCLI,) * 4)
+        self.assertEqual((len(eng.prompts), calls, done["finish"]), (1 + LG.KEEP_MAX, [], "stop"))
+        self.assertEqual(svc.metrics()["loop_guard"]["kept_going"], LG.KEEP_MAX)
         # a conversation that does not repeat itself: a short answer ends the turn as always
         svc, eng, kw, calls, text, done = self.answer("Done.", call_text(other), rounds=(NMCLI, GREP))
         self.assertEqual((calls, len(eng.prompts), text), ([], 1, "Done."))
@@ -1079,7 +1091,6 @@ class ThinkingMarkers(unittest.TestCase):
         svc, eng, text, reason, calls, done = self.answer(seq, tok=tok)
         self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
         self.assertIn("ANSWER OK", text)
-
 
 
 if __name__ == "__main__":

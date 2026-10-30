@@ -27,6 +27,10 @@ and runs it again (GLM-5.3 ran two commands in turn 25 times over opencode, unti
                      all the same - come TOOL_REPS times among the last TOOL_WINDOW calls since the user's last
                      message?  Then tool_note() follows that result as a message of its own, for the model to read before it
                      answers (inside the tool's result GLM-5.3 ran the call a 4th time; as a message it moved on).
+    stops_short      ... and the conversation repeats itself (collapse): the same model ended its turn with talk about
+                     its loop, or with what it had already said, and the agent stopped there.  Such an answer - one
+                     that says nothing new - goes on (KEEP_NOTE, answered, not thought about), at most KEEP_MAX times
+                     in one answer; an answer with anything new in it ends the turn as always.
 
 Until a loop is seen nothing changes: the engine gets the same calls with the same sampling and writes the same
 tokens (the stream only holds back up to HOLD_MAX tokens of a tail that repeats while it does).  Legit repetition - a table's rows, an array
@@ -590,8 +594,9 @@ def collapse(messages: list[dict]) -> Collapse | None:
 TALK = re.compile(r"(?i)loop.?guard|break(ing)? out|stop (repeating|re-running|theorizing)|act differently|"
                   r"change (approach|something real)|identical (output|result|nc|grep|command|call)|"
                   r"(been|keep|kept|am) (looping|stuck|repeating)|repeating myself|in a (reasoning )?loop")
-KEEP_SHORT = 300        # an answer that ends the turn with less text than this (or only TALK) in a looping conversation
-KEEP_MIN = 2            # ... and any answer that ends the turn there, the first this many times in an answer, goes on
+KEEP_MAX = 3            # an answer that ends the turn with nothing new in a looping conversation goes on: at most
+#                         this many times in one answer (then it ends - a model that only talks must not be pushed on
+#                         until the token cap)
 
 
 def talk(text: str) -> bool:
@@ -607,11 +612,11 @@ def said_before(messages: list[dict]) -> set[str]:
 
 def stops_short(text: str, seen: set[str] = frozenset()) -> bool:
     """Does an answer that ends the turn (no tool call) in a conversation that repeats itself end it with nothing new:
-    talk about its loop, what it already said (`seen`), or a line or two?  GLM-5.3 ended its turn with "OK - the
-    loop guard is right. ... Break out: use what I have or answer the user." - and the agent stopped; then with its
-    "What I actually know" list once more.  A report that says something new may end the turn."""
-    kept = [u for u, _ in _units(text, "content") if u.strip() and not talk(u) and _key(u) not in seen]
-    return len(" ".join(kept).strip()) < KEEP_SHORT
+    talk about its loop, or what it already said (`seen`) - or nothing at all?  GLM-5.3 ended its turn with "OK -
+    the loop guard is right. ... Break out: use what I have or answer the user." - and the agent stopped; then with
+    its "What I actually know" list once more.  Anything new in the answer - a finding, an answer to the user, one
+    line of it - may end the turn: "30.10.2026" said to a user who asked for the date is not nothing."""
+    return not any(u.strip() and not talk(u) and _key(u) not in seen for u, _ in _units(text, "content"))
 
 
 KEEP_NOTE = ("[The server's loop guard, not the user: do not stop here, the task is not done. Keep working on it: "

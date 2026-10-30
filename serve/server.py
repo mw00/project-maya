@@ -3758,8 +3758,8 @@ class Service:
                         if t in self.stop_ids and not quoted:
                             finish = "stop"
                             key = blocked_call() if blocked else None
-                            if key is None and keep is not None and not called and \
-                                    (kept < loop_guard.KEEP_MIN or loop_guard.stops_short("".join(said), keep[2])):
+                            if key is None and keep is not None and not called and kept < loop_guard.KEEP_MAX and \
+                                    (not answered or loop_guard.stops_short("".join(said), keep[2])):
                                 # it would end the turn in a conversation that repeats itself: with nothing at all,
                                 # or with nothing new (talk about its loop, what it said before), it goes on - the
                                 # note answered, never thought about: an answer that already went out keeps its
@@ -3767,11 +3767,16 @@ class Service:
                                 kept += 1
                                 self._kept_going(kept, "".join(said))
                                 ids_k, thinks, _ = keep
+                                if answered and thinks and self.think_end_id is not None:
+                                    ids_k, thinks = [*ids_k, self.think_end_id], False
+                                    sampling = {k: v for k, v in (sampling or {}).items()
+                                                if k not in ("_think_budget", "_think_soft", "_think_end")}
                                 steer = self.tok.encode(loop_guard.keep_steer(kept)) if thinks else []
                                 seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
                                 sampling = loop_guard.block_sampling(sampling, kept)
-                                parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
-                                in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                                parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
+                                in_think = thinks and bool(thinking) and self.think_end_id is not None \
+                                    and self.think_budget > 0
                                 continue
                             if key is None:
                                 break
