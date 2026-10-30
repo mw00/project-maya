@@ -6799,6 +6799,17 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: Windows' commit has room for the GPU's experts (%.1f GB beside %.0f GB for the other "
                                  "programs)\n", room0 / 1e9, commit_margin() / 1e9);
         }
+        // (an EXL3 lender: a layer of its that every expert fitted keeps one out - so it has the cache's slots, the
+        //  recent ones its part of the lent tail, their experts copies of RAM's to stream from while lent)
+        for (Layer& l : L) {
+            if (chunk <= 0 || l.mtp || l.n_cls > 1 || l.n_vram < l.n_exp || (size_t) l.dev >= chunks.size() ||
+                chunks[(size_t) l.dev] == nullptr || !chunks[(size_t) l.dev]->x3_lend)
+                continue;
+            l.n_vram = l.n_exp - 1;
+            if (o.verbose)
+                std::fprintf(stderr, "ds4: %s keeps an expert of its %d off the GPU: the cache's slots to lend (DS4_EXL3_LEND)\n",
+                             l.name.c_str(), l.n_exp);
+        }
         // the prompt path's borrowed room (Chunk::borrow): such a device's layers keep their last tail_k slots in one
         // region, slot-major - the room a run of chunks lays its buffers out in (its chunk size's bytes, at the region's
         // end), the experts' slots the rest of the time
