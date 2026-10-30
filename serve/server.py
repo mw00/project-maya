@@ -2932,6 +2932,8 @@ class Service:
                 for _, (path, _) in enc:
                     f.write(path.read_bytes())
             self.embeddings.path = combined
+        if self.engine.max_context <= 0:   # (a reload / /models/load: the start has not reported its context yet)
+            raise BadBody(503, "the model is starting; try again in a moment")
         room = self.engine.max_context - CTX_SLACK - len(ids)
         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
             if room < 1:
@@ -4420,6 +4422,8 @@ def make_handler(svc: Service):
                     self.end_headers()
                     self.wfile.write(body)
             elif path == "/status":
+                if not self._authorized():   # (it carries `tail`: the last 600 characters written)
+                    return
                 with svc.status_lock:
                     s = dict(svc.status)
                     answering = svc.latest_request in svc.current_requests
