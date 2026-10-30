@@ -374,8 +374,12 @@ void usage() {
                  "  --glm-ram-resident   the pinned RAM tier holds every expert VRAM does not, and nothing is evicted\n"
                  "                       to disk. The start fails if the tier cannot hold them (raise MAYA_GLM_RAM_GB\n"
                  "                       or lower --max-context). Env: MAYA_GLM_RAM_RESIDENT=1\n"
+                 "  --glm-ram-inclusive  INCLUSIVE tiers (implies --glm-ram-resident): the pinned RAM tier holds a copy\n"
+                 "                       of EVERY expert and VRAM caches it, so an eviction only forgets the VRAM\n"
+                 "                       copy (no write-back over PCIe). Needs RAM for all experts. Env:\n"
+                 "                       MAYA_GLM_RAM_INCLUSIVE=1\n"
                  "  --glm-ram-slack N    extra RAM-tier slots per MoE layer (MAYA_GLM_RAM_SLACK; default 16 when\n"
-                 "                       resident, 0 otherwise)\n"
+                 "                       resident, 0 when inclusive or otherwise)\n"
                  "  --parallel N         --serve: up to N requests decode at once (1-8, default 1). One GPU decodes\n"
                  "                       them together (each weight read once for all); a split pipelines them\n"
                  "                       across its cards. Each extra conversation keeps its own context state\n"
@@ -4373,6 +4377,13 @@ int main(int argc, char** argv) {
             _putenv_s("STRATA_GLM_RAM_RESIDENT", "1");
 #else
             setenv("STRATA_GLM_RAM_RESIDENT", "1", 1);
+#endif
+        }
+        else if (a == "--glm-ram-inclusive") {
+#if defined(_WIN32)
+            _putenv_s("STRATA_GLM_RAM_INCLUSIVE", "1");
+#else
+            setenv("STRATA_GLM_RAM_INCLUSIVE", "1", 1);
 #endif
         }
         else if (a == "--parallel") {   // the sequence states (STRATA_GLM_SEQS): n conversations at once
