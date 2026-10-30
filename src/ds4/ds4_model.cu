@@ -1588,6 +1588,10 @@ struct Model::Impl {
     // for, so no mailbox seq and no wait - each wait is a round trip through the host (on Windows HIP, ~1 ms a
     // layer).  DS4_HOST_FREE=0: every layer through the host as before (the same tokens either way)
     bool host_free_on = std::getenv("DS4_HOST_FREE") == nullptr || std::atoi(std::getenv("DS4_HOST_FREE")) != 0;
+    // DS4_HOST_FREE_TP=1 (MAYA_DS4_HOST_FREE_TP): a tensor-parallel group's layer with every expert in its members' VRAM
+    // leaves the host out too - none of it on the CPU lane, and the lead's round trip would delay every member at the
+    // next all-reduce.  Off: such a layer through the host as before (the same tokens either way)
+    bool host_free_tp = ds4_env("DS4_HOST_FREE_TP") != nullptr && std::atoi(ds4_env("DS4_HOST_FREE_TP")) != 0;
     // a window's hc_mix + hc_split on the device's second stream (st2) beside the attention and the MoE - CUDA's: a
     // layer on one GPU each verify round 66.6 vs 68.8 ms on its stream (every layer on one GPU, 9 GPUs, 3.5 bits, the same
     // tokens), a group's beside its all-reduces.  HIP keeps them on the layer's stream: its two cross-stream waits a layer
@@ -18688,8 +18692,11 @@ struct Model::Impl {
         }
     }
 
-    // host_free_on's layers: one GPU, every expert in its VRAM (none on the CPU lane, nothing to stream or swap in)
-    bool host_free(const Layer& l) const { return host_free_on && l.nm == 1 && l.n_exp > 0 && l.n_vram >= l.n_exp; }
+    // host_free_on's layers: every expert in VRAM (none on the CPU lane, nothing to stream or swap in) - on one GPU, or
+    // with host_free_tp a tensor-parallel group's
+    bool host_free(const Layer& l) const {
+        return host_free_on && (l.nm == 1 || host_free_tp) && l.n_exp > 0 && l.n_vram >= l.n_exp;
+    }
     int head_nm() const { return (int) groups[(size_t) devs[(size_t) head_dev].grp].mem.size(); }
     // the head's columns on member mi of its group of nm: an EXL3 head's split128 of the vocabulary (mat's), a GGUF's
     // BF16 / Q8_0 head's even shares, or split128's where the vocabulary does not split evenly (mat_bf16's) - head_share's,
