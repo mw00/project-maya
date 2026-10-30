@@ -299,6 +299,8 @@ struct MoeDev {
     unsigned int* dcnt = nullptr;              // ... [n_keys] routes per key (halved every 4096 routes): the coldest
                                                //     RAM-tier experts go to the host, the hot ones are promoted
     volatile int* route_error = nullptr;       // host-mapped, first invalid route: 4 * layer + kind (1..3)
+    int* route_err_d = nullptr;                // ... and its device copy, which the route kernel reads (a read of the
+                                               //     host-mapped one crossed PCIe at every route's start); null: none
     const int* skip = nullptr;                 // set_skip's flag: non-zero = the experts' kernels do nothing
     // moe_experts_multi: mt_T tokens in one launch, token t's plan at plan_ptr / plan_w + 8 t and its rows at these
     // strides (q8_1 blocks: its FFN input, its h, its shared expert's h; floats: its output, its CPU part)

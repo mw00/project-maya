@@ -937,6 +937,10 @@ bool Glm5Model::fast_setup(std::string& err) {
     F->md.ring = dp;
     F->route_error_h = (volatile int*) (F->ring_h + gf::kRingSize);
     F->md.route_error = (volatile int*) ((gf::MoeRequest*) dp + gf::kRingSize);
+    if (cudaMalloc((void**) &F->md.route_err_d, 64) != cudaSuccess || cudaMemset(F->md.route_err_d, 0, 64) != cudaSuccess) {
+        err = "glm fast: the route error flag did not allocate";
+        return false;
+    }
     if (cudaHostAlloc(&hp, sizeof(gf::MoeResponse), cudaHostAllocMapped) != cudaSuccess) {
         err = "glm fast: the routing response did not allocate";
         return false;
@@ -3943,6 +3947,7 @@ void Glm5Model::fast_destroy() {
     if (F->upd_val_d) cudaFree(F->upd_val_d);
     if (F->ring_h) cudaFreeHost(F->ring_h);
     if (F->resp_h) cudaFreeHost(F->resp_h);
+    if (F->md.route_err_d) cudaFree(F->md.route_err_d);
     if (F->emb_h) cudaFreeHost(F->emb_h);
     if (F->hop_h) cudaFreeHost(F->hop_h);
     if (F->tok_h) cudaFreeHost(F->tok_h);

@@ -843,6 +843,7 @@ void Glm5Model::reset() {
     if (fast_ != nullptr) {
         cudaMemsetAsync(state_, 0, state_bytes_, fast_->cs);
         kv_stream_reset_maps();   // (the zeroed slots hold no block now - on the same stream)
+        if (fast_->md.route_err_d != nullptr) cudaMemsetAsync(fast_->md.route_err_d, 0, sizeof(int), fast_->cs);
         if (cudaStreamSynchronize(fast_->cs) == cudaSuccess && fast_->route_error_h)
             *fast_->route_error_h = 0;   // a failed route belongs to the previous request
     } else {
