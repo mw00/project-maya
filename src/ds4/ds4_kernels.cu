@@ -8,6 +8,9 @@
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
+#include <cuda.h>   // (cuStreamWaitValue32's types: the function itself from the driver at run time, ar_wait_fn)
+#endif
+#if !defined(STRATA_USE_HIP)
 #include <mma.h>   // (sparse_attn_v7_kernel: Volta / Turing's FP16 tensor cores)
 #endif
 
@@ -4796,6 +4799,34 @@ void HostReducer::submit(unsigned seq, int n) {
     p_->cv.notify_one();
 }
 
+#if !defined(STRATA_USE_HIP)
+namespace {
+// cuStreamWaitValue32 from the driver (no link to libcuda): nullptr where the driver or the runtime has none
+using WaitValue32 = CUresult (*)(CUstream, CUdeviceptr, cuuint32_t, unsigned int);
+WaitValue32 ar_wait_fn() {
+    static const WaitValue32 f = []() -> WaitValue32 {
+        const char* e = std::getenv("DS4_AR_BACK_DMA");
+        if (e != nullptr && std::atoi(e) == 0) return nullptr;
+#if CUDART_VERSION >= 12050
+        void* fp = nullptr;
+        cudaDriverEntryPointQueryResult q{};
+        if (cudaGetDriverEntryPointByVersion("cuStreamWaitValue32", &fp, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+            q != cudaDriverEntryPointSuccess)
+            fp = nullptr;
+        return (WaitValue32) fp;
+#else
+        return nullptr;
+#endif
+    }();
+    return f;
+}
+}  // namespace
+#endif
+
+// a chunk's sum read back (DS4_AR_BACK_DMA, on where the driver has stream waits): the stream itself waits for each
+// piece's flag and the piece is DMA'd into this member's own FP16 rows (out by then: the host sums a piece only once
+// every member's is in), then converted - where the zero-copy kernel read it at half the link's speed beside the expert
+// ring's copies (76 MB: 20.5 ms against 11.5, an RTX 5060 Ti on PCIe 3.0 x8) and spun on the flag on the GPU
 void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
                     cudaStream_t s, const ArAux& aux) {
     const int slot = (int) (seq % (unsigned) a.slots), nm = a.nm, n4 = n / 4, NP = ar_host_pieces(), P4 = cdiv(n4, NP);
@@ -4811,6 +4842,30 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
         if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDeviceToHost, aux.s2);
         pdl_launch(set_flag_kernel, 1, 1, 0, aux.s2, a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
     }
+#if !defined(STRATA_USE_HIP)
+    if (const WaitValue32 wait = ar_wait_fn()) {
+        bool ok = true;
+        for (int p = 0; p < NP && ok; ++p) {
+            const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
+            const unsigned* f = a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8;
+            ok = wait((CUstream) s, (CUdeviceptr) f, seq, CU_STREAM_WAIT_VALUE_GEQ) == CUDA_SUCCESS;
+            if (ok && p1 > p0) {
+                cudaMemcpyAsync(own + p0, hsum + p0, (size_t) (p1 - p0) * 8, cudaMemcpyHostToDevice, s);
+                pdl_launch(ar_from16_kernel, std::max(1, std::min(1024, cdiv(p1 - p0, kThreads))), kThreads, 0, s,
+                           (float4*) x + p0, (const uint2*) own + p0, p1 - p0, 0, 0);
+            }
+            if (!ok) {   // (the driver refused the wait: this piece on, as the kernels read them)
+                for (int q = p; q < NP; ++q) {
+                    const int q0 = std::min(n4, q * P4), q1 = std::min(n4, q0 + P4);
+                    pdl_launch(wait_flags_kernel, 1, 32, 0, s, a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + q) * 8, 1, 0, seq);
+                    if (q1 > q0)
+                        pdl_launch(ar_from16_zc_kernel, std::max(1, std::min(1024, cdiv(q1 - q0, kThreads))), kThreads, 0, s, (float4*) x, hsum, q1, q1, q1, q0);
+                }
+            }
+        }
+        return;
+    }
+#endif
     for (int p = 0; p < NP; ++p) {
         const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
         pdl_launch(wait_flags_kernel, 1, 32, 0, s, a.bflags + (((size_t) nm * a.slots + slot) * kArBlocks + p) * 8, 1, 0, seq);
