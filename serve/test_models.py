@@ -267,6 +267,9 @@ class Settings(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "no DSpark drafter"):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
+        ista = {"exe": "/b/maya-ds4", "args": ["--pack", "/m/ISTA/maya-ds4"],     # (set up by hand: docs/deepseek-ista-gguf.md)
+                "installer": {"family": "deepseek", "ds4_quant": "ista-iq2xxs"}}
+        self.assertEqual(M.quant_label(ista, Path("maya-ds4-ista.json")), "ISTA GSQ-RCO IQ2_XXS")
 
     def test_minimax_answers_at_once(self):
         """maya-mm3 --parallel: read (1 where the config names none), written where it changes, 1-8; the KV streaming and
