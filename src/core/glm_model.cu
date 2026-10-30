@@ -32,6 +32,7 @@
 #include "ggml.h"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <cctype>
@@ -244,6 +245,28 @@ static bool exl3_table(const std::string& pack_dir, Exl3Table& t, std::string& e
     return true;
 }
 
+// the keep16 rows the fast path reads ONLY through q() (a q8_1 activation dotted against the weights; glm_fast_path.cu
+// resolves these names from ws_map_ alone, never from w16_): at load such a row gets its Q8_0 copy INSTEAD of the
+// BF16 one.  Every other keep16 row - the routers, hc_*_fn, the ssm gates, the indexer, attn_k_b / attn_v_b (b16()),
+// and attn_q_a / attn_kv_a_mqa (q_or_b16(), which wants the exact BF16 over a requantized twin) - keeps only its
+// BF16 copy.  The suffix after the "blk.N." prefix must match exactly: indexer.attn_q_b.weight is a b16() row and
+// must not match attn_q_b.weight.
+static bool keep16_q_only(const std::string& name) {
+    size_t b = 0;
+    if (name.rfind("blk.", 0) == 0) {
+        const size_t dot = name.find('.', 4);
+        if (dot == std::string::npos) return false;
+        b = dot + 1;
+    }
+    const char* const q_only[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_q_b.weight",
+                                  "attn_output.weight", "output.weight",
+                                  "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight",
+                                  "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
+    for (const char* n : q_only)
+        if (name.compare(b, name.size() - b, n) == 0) return true;
+    return false;
+}
+
 // a dense row's VRAM bytes as load_pack uploads it (0: not uploaded), and how: the fast path keeps the pack's big BF16
 // rows (kind 4) BF16 and the natively served rows (kind 0) quantized, dequantizes the rest to F32, and leaves
 // token_embd on the host (the embedding row is dequantized there from the shard mapping)
@@ -251,8 +274,14 @@ static uint64_t pack_row_vram(const std::string& name, const std::string& kind, 
                               std::string* how = nullptr) {
     if (fast && name == "token_embd.weight") return 0;
     if (fast && kind == "4" && t->elements() >= 65536) {
-        if (how) *how = " bf16";
-        return ((uint64_t) t->elements() * 2 + 255u) & ~(uint64_t) 255u;
+        const uint64_t ne = (uint64_t) t->elements();
+        const uint64_t q8 = (ne / 32) * 34 + (ne % 32 ? 34 : 0);   // the Q8_0 copy's bytes
+        if (keep16_q_only(name)) {   // only q() reads it: the Q8_0 copy replaces the BF16 one
+            if (how) *how = " q8";
+            return (q8 + 255u) & ~(uint64_t) 255u;
+        }
+        if (how) *how = " bf16";     // b16()/q_or_b16() read it: BF16 only, as before the twins
+        return ((ne * 2) + 255u) & ~(uint64_t) 255u;
     }
     if (kind != "0" || name == "attn_k_b.weight" || name == "attn_v_b.weight") {
         if (how) *how = " f32";
@@ -297,6 +326,25 @@ static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const s
         bytes += ((uint64_t) t->elements() * 4 + 255u) & ~(uint64_t) 255u;
     }
     return true;
+}
+
+// quantize a host F32 row to GGML Q8_0 (ggml's quantize_row_q8_0_ref: d = amax/127 in F32; the
+// file stores d as FP16 bits the kernel decodes with __half2float - the keep16 twin's recipe)
+static void q8_row(const float* x, size_t ne, std::vector<uint8_t>& out) {
+    const size_t nblocks = (ne + 31) / 32;
+    out.assign(nblocks * 34, 0);
+    for (size_t b = 0; b < nblocks; ++b) {
+        const size_t i0 = (size_t) b * 32;
+        const size_t n = std::min<size_t>(32, ne - i0);
+        float amax = 0.f;
+        for (size_t j = 0; j < n; ++j) amax = std::max(amax, std::abs(x[i0 + j]));
+        const float d = amax / 127.f;
+        const float inv = d != 0.f ? 1.f / d : 0.f;
+        const uint16_t dh = __half_as_ushort(__float2half_rn(d));
+        std::memcpy(out.data() + b * 34, &dh, 2);
+        for (size_t j = 0; j < 32; ++j)
+            out[b * 34 + 2 + j] = (uint8_t) (j < n ? (int8_t) std::round(x[i0 + j] * inv) : 0);
+    }
 }
 
 namespace strata::core {
@@ -1604,11 +1652,18 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             stride[(size_t) L] = (double) glmfast::expert_stride((size_t) blob[(size_t) L], (int) tg->type, (int) td->type);
             mtp_dense = (double) b;
             mtp = true;
-        } else if (g.nextn > 0 && xtab.mats.count(P + "nextn.eh_proj.weight") && xtab.layers.count(L)) {
+        } else if (g.nextn > 0 && xtab.layers.count(L) &&
+                   (xtab.mats.count(P + "nextn.eh_proj.weight") || find(P + "nextn.eh_proj.weight") != nullptr)) {
             // an EXL3 pack: the block's matrices and experts from exl3.txt, its floats from the GGUF (as load_mtp)
             double d = 0;
-            for (const char* nm : kMtpRaw)
-                if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
+            for (const char* nm : kMtpRaw) {
+                if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end())
+                    d += (double) it->second.vram();
+                else if (const strata::TensorInfo* t = find(P + nm)) {
+                    const uint64_t ne = (uint64_t) t->elements();   // an unquantized projection: Q8_0 (load_mtp's)
+                    d += (double) (((ne / 32) * 34 + (ne % 32 ? 34 : 0) + 255u) & ~(uint64_t) 255u);
+                }
+            }
             for (const char* nm : kMtpB16) {
                 if (const auto it = xtab.mats.find(P + nm); it != xtab.mats.end()) d += (double) it->second.vram();
                 else if (const strata::TensorInfo* t = find(P + nm)) d += (double) t->elements() * 2;
@@ -3189,6 +3244,55 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                 err = "pack: short read on dense.bin for " + r.name;
                 return false;
             }
+            if (keep16_q_only(r.name)) {
+                // experts-only community quants keep the attention/dense-FFN projections (and the head)
+                // BF16.  The fast path's q() slots dot those weights against a q8_1 activation, so a
+                // BF16 row cannot serve them; quantize the row to Q8_0 on the host and register ONLY
+                // that copy in ws_map_ (type 8; mv_type_ok accepts it) - no BF16 copy is uploaded,
+                // nothing reads one (b16()/q_or_b16() are never called on these names).
+                const uint64_t ne = (uint64_t) t->elements();
+                const size_t nblocks = (size_t) ((ne + 31) / 32);
+                std::vector<uint8_t> q8(nblocks * 34);
+                const uint16_t* sb = (const uint16_t*) raw.data();
+                auto bf16_bits_to_f32 = [](uint32_t b) { const uint32_t bits = b << 16; float f; std::memcpy(&f, &bits, 4); return f; };
+                for (size_t b = 0; b < nblocks; ++b) {
+                    const size_t i0 = (size_t) b * 32;
+                    const size_t n = std::min<size_t>(32, (size_t) ne - i0);
+                    float amax = 0.f;
+                    for (size_t j = 0; j < n; ++j)
+                        amax = std::max(amax, std::abs(bf16_bits_to_f32(sb[i0 + j])));
+                    // ggml's quantize_row_q8_0_ref: d = amax/127 in F32, id uses that F32 d
+                    // (the fp16-rounded d would let |q| round to 128 and wrap int8)
+                    const float d = amax / 127.f;
+                    const float inv = d != 0.f ? 1.f / d : 0.f;
+                    uint16_t dh;
+                    {   // float->fp16, round-to-nearest-even (IEEE binary16, the field
+                        // DecW<8> decodes with __half2float).  NOTE: the memcpy/shift idiom
+                        // used at the b16() upload above is float->BF16 and is NOT float->FP16.
+                        dh = __half_as_ushort(__float2half_rn(d));
+                    }
+                    std::memcpy(q8.data() + b * 34, &dh, 2);
+                    for (size_t j = 0; j < 32; ++j) {
+                        int8_t q = 0;
+                        if (j < n)
+                            q = (int8_t) std::round(bf16_bits_to_f32(sb[i0 + j]) * inv);
+                        q8[b * 34 + 2 + j] = (uint8_t) q;
+                    }
+                }
+                const size_t qbytes = q8.size();
+                const uint64_t qat = (at + 255u) & ~(uint64_t) 255u;
+                { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + qat, q8.data(), qbytes,
+                                              cudaMemcpyHostToDevice);
+                  if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
+                ws_map_[r.name] = strata::core::WSlot{nullptr, 8 /*GGML Q8_0*/,
+                    (const void*) ((uint8_t*) w_arena_ + qat),
+                    (int64_t) t->shape[0], (int64_t) t->shape[1]};
+                at = qat + ((qbytes + 255u) & ~(uint64_t) 255u);
+                continue;
+            }
+            // every other keep16 row keeps ONLY its BF16 copy (b16() reads the routers, hc_*_fn, the
+            // ssm gates, the indexer, attn_k_b / attn_v_b; q_or_b16() reads attn_q_a / attn_kv_a_mqa
+            // and prefers the exact BF16 to a requantized twin).  No Q8_0 twin: nothing reads one.
             { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + at, raw.data(), (size_t) r.bytes, cudaMemcpyHostToDevice); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
             w16_[r.name] = (const uint16_t*) ((uint8_t*) w_arena_ + at);
             at += (r.bytes + 255u) & ~(uint64_t) 255u;
@@ -3668,7 +3772,9 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
             err = "mtp: " + (xe.empty() ? std::string("exl3.txt is gone") : xe);
             return false;
         }
-        if (xt.mats.count(P + "nextn.eh_proj.weight") == 0) return true;   // packed without the draft block
+        if (xt.mats.count(P + "nextn.eh_proj.weight") == 0 &&
+            find(P + "nextn.eh_proj.weight", si) == nullptr)
+            return true;   // packed without the draft block (eh_proj neither an EXL3 mat nor in the GGUF)
     } else if (find(P + "nextn.eh_proj.weight", si) == nullptr) {
         return true;   // a GGUF without the draft block
     }
@@ -3679,8 +3785,11 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
     uint64_t bytes = 0;
     if (exl3_) {
         for (const char* n : raw_names) {
-            if (!x3(P + n)) { err = "mtp: " + P + n + " is not in exl3.txt"; return false; }
-            bytes += xt.mats.at(P + n).vram();
+            if (x3(P + n)) { bytes += xt.mats.at(P + n).vram(); continue; }
+            const strata::TensorInfo* t = find(P + n, si);   // unquantized in the source: Q8_0 below
+            if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
+            const uint64_t ne = (uint64_t) t->elements();
+            bytes += ((ne / 32) * 34 + (ne % 32 ? 34 : 0) + 255u) & ~(uint64_t) 255u;
         }
         for (const char* n : b16_names) {
             if (x3(P + n)) { bytes += xt.mats.at(P + n).vram(); continue; }
@@ -3745,9 +3854,27 @@ bool strata::core::Glm5Model::load_mtp(const std::vector<std::unique_ptr<strata:
         ws_map_[n] = strata::core::WSlot{nullptr, strata::kernels::exl3::kTypeEXL3, &slot, m.k, m.n};
         return true;
     };
+    std::vector<uint8_t> q8;
     for (const char* n : raw_names) {
         if (exl3_) {
-            if (!up_x3(P + n)) return false;
+            if (x3(P + n)) {
+                if (!up_x3(P + n)) return false;
+                continue;
+            }
+            // the experts-only community quants keep the draft block's projections BF16: quantize to
+            // Q8_0 on the host (the keep16 twin's recipe) and serve the slot from it - the draft's
+            // forward reads it like any quantized row (its activation is already quantized)
+            const strata::TensorInfo* t = find(P + n, si);
+            if (t == nullptr) { err = "mtp: " + P + n + " missing"; return false; }
+            if (!to_host(t, si)) return false;
+            q8_row(host.data(), host.size(), q8);
+            if (cudaMemcpy(base + at, q8.data(), q8.size(), cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = "mtp: upload";
+                return false;
+            }
+            ws_map_[P + n] = strata::core::WSlot{nullptr, 8 /*GGML Q8_0*/, (const void*) (base + at),
+                                                 (int64_t) t->shape[0], (int64_t) t->shape[1]};
+            at += ((uint64_t) q8.size() + 255u) & ~(uint64_t) 255u;
             continue;
         }
         const strata::TensorInfo* t = find(P + n, si);
