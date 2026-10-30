@@ -3489,6 +3489,7 @@ class Service:
         def new_parser():
             return OutputParser(thinking=thinking, tools=tools, stream_tools=True,
                                 dsml=getattr(self.template, "deepseek", False),
+                                token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
                                 strict_tools=responses, single_tool=single_tool)
         parser = new_parser()
@@ -3687,7 +3688,8 @@ class Service:
                         n += 1
                         if my_first is None:
                             my_first = time.time()
-                        if in_think and t == self.think_end_id:
+                        end_think = bool(in_think and t == self.think_end_id)
+                        if end_think:
                             in_think = False
                             if n == think_budget + 1:
                                 print(f"[maya] thinking reached its budget ({think_budget} tokens"
@@ -3736,6 +3738,8 @@ class Service:
                             if e is not None:
                                 lp_wait.append(e)
                         text, stopped = detok.push(t), False
+                        if end_think and parser.token_only_end:
+                            text = ""            # (the token's own text: the reasoning ends at the token, the tag is no one's text)
                         stops = self.stop_texts + (client_stops if parser.state != "reasoning" else [])
                         if stops:
                             held += text
@@ -3751,7 +3755,8 @@ class Service:
                                          if held.endswith(s[:j])), default=0)
                                 text, held = held[:len(held) - k], held[len(held) - k:]
                         was = parser.state
-                        evs = with_lp(parser.feed(text), was)
+                        evs = with_lp(parser.close_reasoning() if end_think and parser.token_only_end
+                                      else parser.feed(text), was)
                         self._say_malformed(parser)
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)

@@ -1072,8 +1072,15 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False):
+                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
+                 token_only_end: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
+        # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
+        # the server's own code, would have its reasoning cut there and spill into the answer).  The server closes it
+        # through close_reasoning(), at the token.  A template that spells the end as text (GLM's, Qwen's) keeps the
+        # text search.
+        self.token_only_end = token_only_end
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
@@ -1116,6 +1123,22 @@ class OutputParser:
     def _in_code(self) -> bool:
         """The answer so far leaves the next character inside a code fence or inline code."""
         return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+
+    def in_code_after(self, text: str) -> bool:
+        """Would `text` - the text held back from the stop-marker scan, which has not been fed yet - leave the next
+        character inside code?  The scan runs before feed(), so _in_code() alone is the state before this piece.  Tracks
+        it on a copy of the state and restores (the answer's own tracking sees the text only in feed)."""
+        snap = (self.fence, self.line, self.ticks)
+        try:
+            self._track(text)
+            return self._in_code()
+        finally:
+            self.fence, self.line, self.ticks = snap
+
+    @property
+    def call_opened(self) -> bool:
+        """A tool call is being read (its body): inside one, even quoted markers are the call's text."""
+        return self.state == "call"
 
     def _reset_scan(self):
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
@@ -1297,6 +1320,17 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def close_reasoning(self) -> list[Event]:
+        """The model's end-of-thinking token arrived: the reasoning ends there (token_only_end parsers; a text template
+        closes its own through the text).  Returns the events this close makes, if any."""
+        if self.state != "reasoning" or self.finished:
+            return []
+        out = [Event("reasoning", self.buf)] if self.buf else []
+        self.buf = ""
+        self.state, self.lead = "content", True
+        self.fence, self.line, self.ticks = "", "", 0
+        return out
+
     def feed(self, delta: str) -> list[Event]:
         if self.finished:
             return []
@@ -1313,6 +1347,11 @@ class OutputParser:
             if self.state != "content" and THINK_AGAIN in self.buf:
                 self.buf = self.buf.replace(THINK_AGAIN, "")    # (already reasoning; in a call: not an opening)
             if self.state == "reasoning":
+                if self.token_only_end:
+                    if self.buf:
+                        out.append(Event("reasoning", self.buf))
+                        self.buf = ""
+                    return out
                 i = self.buf.find(THINK_END)
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END,))

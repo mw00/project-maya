@@ -342,6 +342,30 @@ class Parsing(_CleanToolOrders):
                         events = parse(text, thinking=thinking, stream=stream, step=step)
                         self.assertEqual("".join(e.text for e in events if e.kind == "content"), "\n\nanswer")
 
+    def test_a_quoted_end_tag_does_not_end_the_reasoning(self):
+        # the vocabulary has the end of thinking as a token, so the text form is the model's own text, not a marker:
+        # reasoning that quotes the tag (the server's own code does) must not spill into the answer there
+        tag = "</think>"
+        for step in (1, 3, len(tag) + 9):
+            with self.subTest(step=step):
+                parser = OutputParser(thinking=True, dsml=True, token_only_end=True)
+                events = []
+                text = "it is written " + tag + " in the prompt"
+                for i in range(0, len(text), step):
+                    events.extend(parser.feed(text[i:i + step]))
+                self.assertEqual(parser.state, "reasoning")
+                self.assertEqual("".join(e.text for e in events), text)          # (kept, not swallowed)
+                # ... and the token closes it: what follows is the answer's
+                events = parser.close_reasoning() + parser.feed("the answer")
+                self.assertEqual(parser.state, "content")
+                self.assertEqual([e.kind for e in events], ["content"])
+                self.assertEqual(events[0].text, "the answer")
+        # a template whose end is text (GLM's, Qwen's) is unchanged: the tag there does end the reasoning
+        parser = OutputParser(thinking=True)
+        events = parser.feed("quote " + tag + " answer")
+        self.assertEqual(parser.state, "content")
+        self.assertEqual([(e.kind, e.text) for e in events], [("reasoning", "quote "), ("content", " answer")])
+
     def test_long_string_argument_streams_before_its_closing_tag(self):
         # issue #403: a file's content (string="true") goes out as the model writes it, not at its closing tag;
         # the pieces join to the same JSON as the whole call, a string="false" value still arrives whole
