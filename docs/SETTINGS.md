@@ -1404,10 +1404,12 @@ keep the state at three more places of each prompt it reads:
 - 512 tokens before the prompt's end, when the last turn is longer than that: a new question after the same document,
   in the same message, reads those 512 tokens and itself. The read stops there, so those tokens are a run of their own;
   where most experts are not in VRAM that short run costs nearly a whole pass over them, on the CPU lane or lent to the
-  GPU's prompt path (#668: a ~20K-token prompt read ~13% slower on one GPU with 91% of the experts on the CPU lane; one
-  V100 with 12% of the experts in VRAM: ~11%). The engine measures it on the reads that keep
-  the point - the time an expert pick takes in that run against the rest of the read - and leaves the point out while
-  it costs more than reading those tokens again; one read in 32 still keeps it, to measure again;
+  GPU's prompt path, and on a layer split whose experts stream it is one more pass of them through every GPU, one
+  after another (#668: a ~20K-token prompt read ~13% slower on one GPU with 91% of the experts on the CPU lane; one
+  V100 with 12% of the experts in VRAM: ~11%; a 4-GPU split: ~2.3 s more on every prompt). The engine measures it on
+  the reads that keep the point - that run's wall time a token against the rest of the read's - and leaves the point
+  out while it costs more than reading those tokens again (over twice the time a token); one read in 32 still keeps
+  it, to measure again;
 - the end of the system prompt and its tools (the first user turn), given up last: another conversation behind the same
   start reads only its own part.
 

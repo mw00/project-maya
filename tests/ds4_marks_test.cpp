@@ -252,35 +252,40 @@ int main() {
         for (const MarkUse& m : cv.mk) assert(m.pos <= 3000);
         for (int64_t c : cv.ck) assert(c < 0 || c <= cv.pos());
     }
-    {   // the tail point's cost (#668): kept until measured; left out where its run's picks cost more than twice the
-        // long run's (most experts on the CPU lane: the short run is nearly a whole pass over them); probed again
+    {   // the tail point's cost (#668): kept until measured; left out where its run's wall time a token is more than
+        // twice the long read's (most experts on the CPU lane, or streamed again through a split's stages); probed again
         TailCost tc;
         assert(tc.keep() && !tc.measured());
-        assert(!tc.add(1000.0, 100000, 2000, 50.0, 2000, 512));     // (too short before the point to be a long run)
-        assert(!tc.add(0.0, 100000, 19000, 50.0, 2000, 512));       // (nothing timed)
-        assert(tc.add(1000.0, 100000, 19000, 25.0, 2000, 512));     // 1.25x: a GPU that holds the experts
+        assert(!tc.add(2000.0, 2000, 50.0, 512));        // (too short before the point to be a long run)
+        assert(!tc.add(0.0, 19000, 600.0, 512));         // (nothing timed)
+        assert(!tc.add(19000.0, 19000, 600.0, 0));       // (no tail run)
+        assert(tc.add(19000.0, 19000, 640.0, 512));      // 1.25x: a GPU that holds the experts
         assert(tc.keep() && !tc.costly());
-        assert(tc.add(1000.0, 100000, 19000, 30.0, 2000, 512));
+        assert(tc.add(19000.0, 19000, 768.0, 512));      // 1.5x
         assert(tc.measured() && !tc.costly());
+        assert(tc.last_tail_tokens == 512 && tc.last_tail_ms == 768.0 && tc.last_main_ms_token == 1.0);
         for (int i = 0; i < 100; ++i) assert(tc.keep());
         TailCost cpu;
-        assert(cpu.add(18000.0, 100000, 19000, 3000.0, 2000, 512));   // 8.3x: the CPU lane's pass
-        assert(cpu.keep());                                           // (one read: not decided yet)
-        assert(cpu.add(18000.0, 100000, 19000, 2800.0, 2000, 512));
+        assert(cpu.add(18000.0, 19000, 4000.0, 512));    // 8.2x: the CPU lane's pass
+        assert(cpu.keep());                              // (one read: not decided yet)
+        assert(cpu.add(18000.0, 19000, 3800.0, 512));
         assert(cpu.costly());
         int kept = 0;
         for (int i = 0; i < 64; ++i) kept += cpu.keep(32);
-        assert(kept == 2);                                            // (one in 32: measured again)
+        assert(kept == 2);                               // (one in 32: measured again)
         // the PC changed (more experts in VRAM): the probes' cheap runs bring it back
-        assert(cpu.add(1000.0, 100000, 19000, 20.0, 2000, 512) && cpu.add(1000.0, 100000, 19000, 20.0, 2000, 512));
-        assert(cpu.add(1000.0, 100000, 19000, 20.0, 2000, 512) && !cpu.costly() && cpu.keep());
-        // three pipeline stages: a one-chunk run goes through them one after another (3.75x a pick: 1.25x a stage)
-        TailCost three;
-        assert(three.add(1000.0, 100000, 19000, 75.0, 2000, 512, 3) && three.add(1000.0, 100000, 19000, 75.0, 2000, 512, 3));
-        assert(three.measured() && !three.costly());
-        TailCost one;   // (the same times on one GPU: costly)
-        assert(one.add(1000.0, 100000, 19000, 75.0, 2000, 512, 1) && one.add(1000.0, 100000, 19000, 75.0, 2000, 512));
-        assert(one.costly());
+        assert(cpu.add(19000.0, 19000, 600.0, 512) && cpu.add(19000.0, 19000, 600.0, 512));
+        assert(cpu.add(19000.0, 19000, 600.0, 512) && cpu.costly());   // (a running mean: 8x -> 2.03x)
+        assert(cpu.add(19000.0, 19000, 600.0, 512) && !cpu.costly() && cpu.keep());
+        // #668's 4-GPU layer split, experts streamed: the tail run a near-constant ~2.5 s, 4.2x and 6.3x a token (the
+        // time a pick over the 4 stages read ~1x, and kept it)
+        TailCost split;
+        assert(split.add(7768.0, 6899, 2456.0, 512) && split.add(11205.0, 14328, 2521.0, 512));
+        assert(split.costly() && split.ratio > 4.0);
+        // a split whose tail run costs a little more a token than the long read (its stages one after another): kept
+        TailCost cheap;
+        assert(cheap.add(10000.0, 20000, 450.0, 512) && cheap.add(10000.0, 20000, 460.0, 512));
+        assert(cheap.measured() && !cheap.costly());
     }
     std::printf("ds4_marks_test: ok\n");
     return 0;

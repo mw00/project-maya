@@ -73,27 +73,32 @@ inline std::vector<MarkAt> mark_plan(const std::vector<int64_t>& asked, int64_t 
 // The tail point's cost on this PC (the server's tail=<pos>, MAYA_DS4_RESTORE_TAIL; #668).  The read stops there, so
 // the tokens after it are a run of their own: where most experts are not in VRAM, that short run costs nearly a whole
 // pass over them (each expert's weights read for a few rows - on the CPU lane, or lent to the GPU's prompt path one
-// run at a time), seconds on a long prompt that a single run did not spend.  Measured on the reads that kept the
-// point - the time a routed expert pick took in the run after it against the runs before it (a pick: a row through a
-// layer's experts; the long-prompt skip's rows have none, so the two compare like for like), over the split's pipeline
-// stages (`stages`: a run of one chunk goes through them one after another, as a single run's last chunk does; a long
-// run keeps them all busy) - the point costs what its run spends beyond those picks at that rate.  It is kept while
-// that is no more than reading its tokens again (the tail run's picks at that rate): a ratio of 2 or less.  Until two
-// reads have measured it the point is kept, and one tail point in `probe` is kept while it is left out, to measure
-// again (the cost moves with the experts the PC holds in VRAM).  Pure logic (tests/ds4_marks_test.cpp).
+// run at a time; on a layer split whose experts stream, one more pass of them through every stage, one stage after
+// another), seconds on a long prompt that a single run did not spend.  Measured on the reads that kept the point, in
+// wall time a token: the run after it against the runs before it.  Read as one run, the tail's tokens would have cost
+// about the long read's time a token (the long-prompt skip's cut moves with the run's end, and a split's pipeline fills
+// and drains once either way), so the point costs what its run spends beyond that.  It is kept while that is no more
+// than reading its tokens again: a ratio of 2 or less.  (v1.1.39 compared the time a routed expert pick took, over the
+// split's stages: a run's fixed cost - the experts streamed again, the stages one after another - hid behind both, and
+// a 4-GPU split kept a point that cost 4-9x, #668.)  Until two reads have measured it the point is kept, and one tail
+// point in `probe` is kept while it is left out, to measure again (the cost moves with the experts the PC holds in
+// VRAM).  Pure logic (tests/ds4_marks_test.cpp).
 struct TailCost {
     int n = 0;              // the reads measured
-    double ratio = 0.0;     // their tail run's time a pick over the rest of the read's (over the stages), a running
-                            // mean (the last two halves: the first read after a start is slow everywhere)
+    double ratio = 0.0;     // their tail run's time a token over the rest of the read's, a running mean (the last two
+                            // halves: the first read after a start is slow everywhere)
     int left_out = 0;       // tail points left out since the last one kept
+    double last_tail_ms = 0.0, last_main_ms_token = 0.0;   // the last read measured (the log's line)
+    size_t last_tail_tokens = 0;
     static constexpr double kKeepAt = 2.0;
-    // a read that kept the point: its runs before it (ms, picks) and its run after it (ms, picks).  A read too short
+    // a read that kept the point: its runs before it (ms, tokens) and its run after it (ms, tokens).  A read too short
     // before the point to be a long run's rate (`tail_tokens` x 4 tokens or fewer) is not counted: false
-    bool add(double ms_main, int64_t picks_main, size_t main_tokens, double ms_tail, int64_t picks_tail,
-             size_t tail_tokens, int stages = 1) {
-        if (!(ms_main > 0.0) || !(ms_tail > 0.0) || picks_main <= 0 || picks_tail <= 0 || main_tokens <= 4 * tail_tokens)
-            return false;
-        const double r = (ms_tail / (double) picks_tail) / (ms_main / (double) picks_main) / (double) std::max(1, stages);
+    bool add(double ms_main, size_t main_tokens, double ms_tail, size_t tail_tokens) {
+        if (!(ms_main > 0.0) || !(ms_tail > 0.0) || tail_tokens == 0 || main_tokens <= 4 * tail_tokens) return false;
+        const double r = (ms_tail / (double) tail_tokens) / (ms_main / (double) main_tokens);
+        last_tail_ms = ms_tail;
+        last_tail_tokens = tail_tokens;
+        last_main_ms_token = ms_main / (double) main_tokens;
         ratio = n == 0 ? r : 0.5 * (ratio + r);
         ++n;
         left_out = 0;
