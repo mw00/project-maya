@@ -15,13 +15,12 @@ namespace strata::ds4 {
 
 /// F32 -> BF16 bits, round to nearest even (a NaN stays a NaN).
 __device__ __forceinline__ uint16_t bf16_rn(float f) {
-#if !defined(STRATA_USE_HIP)
-    return __nv_bfloat16_raw(__float2bfloat16_rn(f)).x;   // (__bfloat16_as_ushort: CUDA 12.2+ only - #336)
-#else
+    // the bits, not __nv_bfloat16_raw(): under -std=c++20 (CUDA 12.1's cuda_bf16.hpp) that conversion turns
+    // numeric (1.0f -> 0x0001) and every BF16 value this header writes becomes garbage (the DS4 vision tower
+    // came out all zeros); the arithmetic below gives the same bits in C++17 and C++20.
     const uint32_t u = __float_as_uint(f);
     if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x40u);
     return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-#endif
 }
 
 /// An E4M3 code's value (exact in F32).
