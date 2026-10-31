@@ -19,6 +19,10 @@ Open an issue with:
 
 Name your Maya version (`VERSION`, or the commit). Say what you measured and what you didn't.
 
+For a separate HTTP timing/session-cache protocol, see the [four-4090 DS4.1 case study](docs/benchmarks/ds41-four-4090-20261029.md)
+and its offline input helper. A separate [v1.1.41 configuration report](docs/benchmarks/ds41-four-4090-v1141-20261030.md)
+includes later HTTP observations, with no per-parameter controlled A/B. Neither protocol is directly comparable to the official speed tables.
+
 ## A bug
 
 Run `./maya.sh --report` right after the failure and attach `maya-report.txt`. If the engine stopped, add the end
