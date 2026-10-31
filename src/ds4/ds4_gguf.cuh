@@ -106,6 +106,16 @@ void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int 
 /// kernels take (unless DS4_IQ_Q8K=0)
 void act_q8k(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s);
 
+/// DS4_LANE_PARITY (MAYA_DS4_LANE_PARITY=1, off by default; mw00/project-maya#644): the low-bit experts' token kernels
+/// take exp_portable in their SwiGLU, and the CPU lane computes its low-bit experts in their arithmetic
+/// (ds4_lane_parity.hpp), its outputs entering the expert sum as each pick's own part (x3::MoeArgs / WinArgs cpu_picks) -
+/// so an expert gives the same bits on either lane and in the same place of the sum.  Off: CUDA's expf, ggml's
+/// arithmetic on the CPU lane and its summed part, as before.  Only with Q8_K activations (DS4_IQ_Q8K on: the CPU lane's
+/// rounding), and only in CUDA builds (an AMD build ignores it).
+bool lane_parity();
+/// (tests) lane_parity from here on: 1 on, 0 off (-1: the environment's again).  The engine reads it once at load.
+void lane_parity_mode(int mode);
+
 /// Launch failures of these kernels since the process started (each is also printed).
 int launch_errors();
 

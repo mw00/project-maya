@@ -295,6 +295,70 @@ ones in groups, the rows summed as each set comes in - which rounds otherwise. W
 tokens parted after 17 of 48. The decode does not depend on where the experts sit: with the prompt read token by token
 (`MAYA_GLM_NO_PREFILL=1`, far slower prompts) both gave the same logits.
 
+## DeepSeek: an expert's bits wherever it sits
+
+DeepSeek's CPU lane does not give the bits the same expert gives in VRAM, so with any routed expert off VRAM a greedy
+answer follows where the experts sit: the placement, the expert cache's moves between requests, the expert profile's
+updates between starts. One conversation does not repeat itself, and `--parallel N --multi-check` fails (#644). Five
+things differ:
+
+- the lane sums a row's blocks ggml's way, not in the order of the device kernels' lanes;
+- the SwiGLU's `exp` is the CPU's on the lane and CUDA's `expf` (the SFU's `ex2.approx`, which no CPU reproduces) on
+  the device;
+- the lane's part enters the expert sum as one weighted vector after the VRAM experts';
+- the chunked prompt pass sums a layer's experts set by set in the order the placement makes them (the VRAM slots, then
+  the streamed experts as they land), and gives only the VRAM experts the busy experts' FP16 GEMMs;
+- the prompt goes through the chunked pass or windows of 16 by a timing prediction, and the two round differently
+  (`MAYA_DS4_PROMPT_PICK` below).
+
+`MAYA_DS4_LANE_PARITY=1` (opt-in) makes an expert's part the same bits on either lane, in the same place of the sum:
+
+- **The CPU lane in the device's arithmetic** (`src/ds4/ds4_lane_parity.cpp`; IQ2_XXS, IQ2_S, IQ3_XXS and IQ3_S
+  experts, Maya-S's types): the activation rounded as the device's Q8_K, each row's 32-value sub-blocks dealt to the
+  token kernels' lanes (32 a gate / up row, 16 a down row) and summed in their order, the lanes added in the kernels'
+  tree. The integer dots run in AVX2 where the CPU has it (exact either way), checked against the scalar form at the
+  first use.
+- **The SwiGLU's `exp` in plain IEEE operations on both sides** (`src/ds4/ds4_par_exp.h`): fma, multiply, add and an
+  exact power-of-two scale, within 1 ulp of e^x for x >= -87.
+- **Each CPU-lane pick its own part of the sum:** the lane writes each pick's output (`Resp::pmask` says which), and the
+  device adds it in that pick's place, as it adds the expert from VRAM.
+- **The chunked pass's expert sum exact and in no order** (64-bit fixed point, 2^-32 units, one rounding at the end of
+  the layer), and the busy experts' FP16 GEMMs for the streamed experts too.
+- **The prompt's path by its length** (`MAYA_DS4_PROMPT_PICK=length`, unless it is set otherwise).
+
+Measured on 2x RTX PRO 6000 (layer split), Maya-S, greedy, against v1.1.45:
+
+| | v1.1.45 | `MAYA_DS4_LANE_PARITY=1` |
+| --- | --- | --- |
+| one conversation, three passes in one start, at 0 / ~400 / ~790 experts on the CPU lane (`--reserve-mib` 3072 / 6144 / 8192) | the passes with experts on the lane differ from each other and from the one with none | all nine: the prompt's last logits and 48 tokens byte for byte the same (the cache moved 140 and 257 experts) |
+| `--parallel 2 --multi-check`, DSpark on | 45 of 79 rows bit for bit (16 experts on the lane), 0 of 47 (362) | 94 of 94 (50), 94 of 94 (430) |
+| a 3,000-token prompt through the chunked pass, at the three placements and with `--expert-profile none` | differs between placements, and between two starts with every expert in VRAM (the profile's update moves experts between slots) | the same in every start |
+| perplexity, 8 x 1,024 tokens of this file | 16.841 with every expert in VRAM, 16.949 with 722 on the lane | 16.829 at both (each sequence's the same) |
+
+With the setting off (the default) the engine is as before: the same logits as v1.1.45 bit for bit (with every
+expert in VRAM; with 299 on the lane and `--no-expert-cache`; through the chunked pass with `--expert-profile none`).
+With it on, the bits change even with every expert in VRAM (the portable `exp`, the exact sums): on the synthetic prompt
+above, logits up to 3.3 apart from v1.1.45's with the same top token; perplexity as in the table.
+
+Its cost: decode with every expert in VRAM unchanged (384 tokens of an essay, DSpark and prompt lookup off: 80.2 / 80.8
+tok/s on v1.1.45, 80.7 / 80.6 with the setting; with DSpark 98.6 / 101.9). With 720-790 experts on the lane and the PCIe
+lane off on both, 72.2 / 74.2 tok/s against 78.3 / 77.6: the parity rows take 1.4-1.6x ggml's time an IQ2_XXS expert and
+2.3-2.8x an IQ2_S one (`build/ds4_par_bench`, one thread), and the exact sums' buffer takes `chunk` x dim x 8 bytes of
+VRAM a GPU (335 MB at 8192 tokens: ~30 experts a GPU fewer). A 3,000-token prompt through the chunked pass 1.15 s
+against 1.10 with every expert in VRAM, 1.45-1.50 against 1.40-1.46 with 720-790 on the lane. `build/ds4_gguf_test --parity`
+checks the rows and the `exp` against the device's kernels bit for bit (no model needed).
+
+Not covered yet (their answers still follow the placement): other expert formats on the CPU lane (MXFP4, EXL3,
+IQ1_S / IQ1_M, IQ4_XS, IQ4_NL), mixed layers, the helper GPU (`MAYA_DS4_HELPER`), tensor-parallel groups, the
+host-routed path (`DS4_SYNC=1`), and AMD builds (the rows follow the CUDA kernels; there the setting is ignored). The
+chunk's size comes from the free VRAM at the load, so a prompt longer than a chunk can still differ between two
+configurations (not between two starts of one).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LANE_PARITY` | off | `1`: as above (with `DS4_IQ_Q8K` on, the default) |
+| `MAYA_DS4_LANE_PARITY_SCALAR` | off | `1` (tests): the CPU lane's parity rows in their scalar form - the same bits, slower |
+
 ## Repetition penalties
 
 A request's `repeat_penalty` (or `repetition_penalty`), `frequency_penalty` and `presence_penalty` work as in
@@ -460,7 +524,8 @@ context shares the memory beside the model among the N conversations.
   Each request gets exactly the tokens it would get alone with plain steps: greedy, with the experts where the load put
   them and the PCIe lane off, its logits are bit for bit its own (checked with 2 and 4 at once: `maya-ds4 --parallel 4
   --multi-check --ids ...`). The CPU lane's and the PCIe lane's rounding can change the last bits, as it already can
-  between two runs of one request.
+  between two runs of one request ([`MAYA_DS4_LANE_PARITY=1`](#deepseek-an-experts-bits-wherever-it-sits) takes that
+  away for Maya-S's expert types).
 - **A new request** takes the idle conversation its prompt continues. If none fits, it takes an empty one, else the
   least recently used, which first goes to a [kept conversation](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)
   with `MAYA_DS4_SLOT_KEEP=1`. Its pictures are read by the engine between two of the others' tokens: the vision tower

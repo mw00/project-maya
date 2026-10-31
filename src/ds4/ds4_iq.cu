@@ -2,6 +2,7 @@
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
 #include "ds4_iq1_codes.hpp"
+#include "ds4_par_exp.h"
 #include "ds4_pdl.cuh"
 #if defined(STRATA_USE_HIP) && !defined(MAYA_DS4_IQ_ONLY)   // (#354; maya-mm3 builds ds4_iq.cu without it)
 #include "strata/prefill/moe_mmq.hpp"
@@ -670,8 +671,8 @@ __device__ __forceinline__ float swigluoai(float gv, float uv, float limit) {
 template <int EPI>
 constexpr bool kBoth = EPI < 2;   // (gate and up in this pass)
 template <int EPI>
-__device__ __forceinline__ float act_out(float gv, float uv, float limit) {
-    if constexpr (EPI == 0) return swiglu(gv, uv, limit);
+__device__ __forceinline__ float act_out(float gv, float uv, float limit, int pexp = 0) {
+    if constexpr (EPI == 0) return pexp ? strata::ds4::par::swiglu_portable(gv, uv, limit) : swiglu(gv, uv, limit);
     else return swigluoai(gv, uv, limit);
 }
 template <int EPI>
@@ -843,7 +844,7 @@ __global__ void __launch_bounds__(kThreads) gate_up_kernel(const Args a, int gro
                         float* hp = &a.h[(size_t) es[i] * a.n_ff + row];
                         if constexpr (TWO) {
                             const float gv = lanes_sum<RW>(ag[i]), uv = lanes_sum<RW>(au[i]);
-                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit);
+                            if (lane == 0) *hp = act_out<EPI>(gv, uv, a.limit, a.pexp);
                         } else {
                             const float v = lanes_sum<RW>(ag[i]);   // (EPI 2: the gate's sums; 3: the up's)
                             if (lane == 0) *hp = EPI == 2 ? v : swigluoai(*hp, v, a.limit);
