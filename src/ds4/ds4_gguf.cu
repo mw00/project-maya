@@ -333,6 +333,21 @@ bool iq_q8k() {
     }();
     return on;
 }
+// DS4_LANE_PARITY (MAYA_DS4_LANE_PARITY=1; off by default): see lane_parity in ds4_gguf.cuh
+std::atomic<int> g_lane_par{-1};   // (tests: lane_parity_mode)
+bool lane_parity_on() {
+#if defined(STRATA_USE_HIP)
+    return false;   // (an AMD build keeps its own sums: the parity rows are the CUDA kernels', not run on AMD yet)
+#else
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_DS4_LANE_PARITY");
+        if (v == nullptr) v = std::getenv("DS4_LANE_PARITY");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    const int m = g_lane_par.load(std::memory_order_relaxed);
+    return (m >= 0 ? m != 0 : env) && iq_q8k();
+#endif
+}
 void iq_act_quant(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d, cudaStream_t s) {
     if (iq_q8k() && k % 256 == 0) q8k_quant(x, ldx, rows, k, q, d, s);
     else q8_quant(x, ldx, rows, k, q, d, s);
@@ -891,26 +906,41 @@ struct CombArgs {
     const float* cpu_part;
     size_t cpu_stride;
     const int* cpu_flag;
+    const float* cpu_picks;               // (DS4_LANE_PARITY) [T * 8][cpu_pick_stride]: the CPU lane's own picks
+    size_t cpu_pick_stride;
+    const int* cpu_pmask;                 // [T]: bit i - pick i's part is cpu_picks' row t * 8 + i
     const float* sh_out;                  // [T][n_embd]
     float* out;
     size_t out_stride;
     int k, n_embd;
 };
-// grid (n_embd / 128, T): each token's outputs - the experts in plan order (an expert off the device adds 0), then
-// the CPU lane's part and the shared expert's (x3's combine)
+// grid (n_embd / 128, T): each token's outputs - the experts in plan order (an expert off the device adds 0, or its
+// CPU-lane part when cpu_pmask says the lane answered it: the same place in the sum either way), then the CPU lane's
+// summed part and the shared expert's (x3's combine)
 __global__ void __launch_bounds__(128) mx_combine_kernel(const CombArgs a) {
     pdl_wait();
     pdl_trigger();
     const int t = blockIdx.y, r = blockIdx.x * 128 + threadIdx.x;
+    // (the pick mask from the host's answer, read once a block: host-mapped, every thread's own read of it cost the
+    //  kernel ~10x its time on two RTX PRO 6000s)
+    __shared__ int s_pm, s_cf;
+    if (threadIdx.x == 0) {
+        s_pm = a.cpu_pmask != nullptr ? a.cpu_pmask[t] : 0;
+        s_cf = a.cpu_flag != nullptr ? a.cpu_flag[t] : 0;
+    }
+    __syncthreads();
     if (r >= a.n_embd) return;
     float p[8];
+    const int pm = s_pm;
     for (int i = 0; i < a.k; ++i) {
         const int e = t * 8 + i;
-        p[i] = a.plan_ptr[e] != 0ull ? a.part[(size_t) e * a.n_embd + r] : 0.0f;
+        p[i] = a.plan_ptr[e] != 0ull ? a.part[(size_t) e * a.n_embd + r]
+               : (pm >> i) & 1  ? a.cpu_picks[(size_t) e * a.cpu_pick_stride + r]
+                                : 0.0f;
     }
     a.out[(size_t) t * a.out_stride + r] =
         combine(a.plan_w + t * 8, p, a.k,
-                a.cpu_flag != nullptr && a.cpu_flag[t] ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
+                s_cf ? a.cpu_part + (size_t) t * a.cpu_stride + r : nullptr,
                 a.sh_out != nullptr ? a.sh_out[(size_t) t * a.n_embd + r] : 0.0f);
 }
 
@@ -1573,6 +1603,8 @@ bool q8_batch_check(int dev, std::string& err) {
 }
 
 int launch_errors() { return g_errors.load(std::memory_order_relaxed); }
+bool lane_parity() { return lane_parity_on(); }
+void lane_parity_mode(int m) { g_lane_par.store(m, std::memory_order_relaxed); }
 
 void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s) {
     if (q8_batch()) {
@@ -1613,6 +1645,7 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     ia.limit = limit;
     ia.tg = expert_type(lay, 0);
     ia.td = expert_type(lay, 2);
+    ia.pexp = lane_parity_on() ? 1 : 0;
     // (a row of the role's inputs in whole blocks: 256 values, IQ4_NL's 32)
     if (gu ? ia.tg != expert_type(lay, 1) || !iq::supported(ia.tg) || n_embd % iq::block_values(ia.tg) != 0
            : !iq::supported(ia.td) || n_ff % iq::block_values(ia.td) != 0) {
@@ -1910,6 +1943,9 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
     c.cpu_part = a.cpu_part;
     c.cpu_stride = (size_t) a.n_embd;
     c.cpu_flag = a.cpu_flag;
+    c.cpu_picks = a.cpu_picks;
+    c.cpu_pick_stride = a.cpu_pick_stride;
+    c.cpu_pmask = a.cpu_pmask;
     c.sh_out = sh_out;
     c.out = out;
     c.out_stride = (size_t) a.n_embd;
@@ -1973,6 +2009,9 @@ bool win_experts(const x3::WinArgs& a, cudaStream_t s) {
     c.cpu_part = a.cpu_part;
     c.cpu_stride = a.cpu_stride != 0 ? a.cpu_stride : (size_t) a.n_embd;
     c.cpu_flag = a.cpu_flag;
+    c.cpu_picks = a.cpu_picks;
+    c.cpu_pick_stride = a.cpu_pick_stride;
+    c.cpu_pmask = a.cpu_pmask;
     c.sh_out = a.sh_out;
     c.out = a.out;
     c.out_stride = a.out_stride;

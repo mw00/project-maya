@@ -648,7 +648,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                              src/ds4/ds4_lane_parity.cpp
                               src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp)
+    # DS4_LANE_PARITY's CPU rows: each float operation the one written (the device's _rn intrinsics' roundings), so no
+    # multiply-add is fused behind the source's back (GCC contracts by default where FMA is on: the AVX2 rows' target)
+    if(MSVC)
+      set_source_files_properties(src/ds4/ds4_lane_parity.cpp PROPERTIES COMPILE_OPTIONS "/fp:precise")
+    else()
+      set_source_files_properties(src/ds4/ds4_lane_parity.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    endif()
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     # the commit and the release `maya-ds4 --version` and --verbose name, written at every build (cmake/build_id.cmake:
     # git's commit, a source archive's BUILD_ID file, or -DMAYA_BUILD_ID=...; the release from VERSION)
@@ -688,6 +696,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the CPU lane's MXFP4 rows: every tier this CPU runs (and ggml-cpu's dot) at the experts' real size (no GPU)
     add_executable(ds4_mx_bench tests/ds4_mx_bench.cpp src/ds4/ds4_gguf_cpu.cpp)
     target_link_libraries(ds4_mx_bench PRIVATE strata_kernels_cpu)
+    # DS4_LANE_PARITY's CPU rows against the CPU lane's ggml rows, one thread (built by name)
+    add_executable(ds4_par_bench EXCLUDE_FROM_ALL tests/ds4_par_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp
+                                 src/ds4/ds4_lane_parity.cpp)
+    target_include_directories(ds4_par_bench PRIVATE third_party/ggml)
+    target_link_libraries(ds4_par_bench PRIVATE strata_kernels_cpu)
     # the CPU lane's time an expert by format, as the PCIe lane's calibration times it (no GPU), and the split it plans
     add_executable(ds4_lane_bench tests/ds4_lane_bench.cpp src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq_cpu.cpp)
     target_include_directories(ds4_lane_bench PRIVATE third_party/ggml)
@@ -713,9 +726,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the GGUF kernels (BF16 matrices, MXFP4 experts) against a double-precision reference, and the packed KV caches
     # against the BF16 rows bit for bit (needs a GPU, no model)
     add_executable(ds4_gguf_test tests/ds4_gguf_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
-                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu
+                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu src/ds4/ds4_lane_parity.cpp
                                  src/ds4/ds4_host_ar.cpp)
     target_include_directories(ds4_gguf_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    if(NOT MSVC)   # (its host side computes exp_portable too: no fused multiply-adds there either, as ds4_lane_parity.cpp)
+      target_compile_options(ds4_gguf_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
+    endif()
     target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     if(STRATA_ENABLE_HIP)
       target_link_libraries(ds4_gguf_test PRIVATE strata_mmq)

@@ -368,6 +368,7 @@ struct Resp {
     unsigned seq;
     int pad[3];
     int cpu[kWin];   // 1: part[t] is the CPU lane's weighted sum for token t
+    int pmask[kWin];   // (DS4_LANE_PARITY) bit i: token t's pick i answered on its own in the picks buffer
     float part[kWin][kMaxDim];
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
@@ -427,6 +428,11 @@ void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s);
 /// acc[t] += w[t][i] * y[pos[t][i] - r0] for each pick of t (in pick order) whose sorted row is in [r0, r1).
+/// (DS4_LANE_PARITY) moe_combine's sum exact and order-free: acc64 (2^-32 units) += round(w y 2^32) for each pick;
+/// moe_x_finish: acc[i] += acc64[i] 2^-32 (one F32 rounding) after the layer's last set
+void moe_combine_x(long long* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1,
+                   int dim, cudaStream_t s);
+void moe_x_finish(float* acc, const long long* acc64, size_t n, cudaStream_t s);
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s);
 /// rows[t][0] = 1, the rest 0 (the first layer's pre-mix: stream 0).
