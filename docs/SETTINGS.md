@@ -1016,6 +1016,20 @@ difference fails the start); `ds4_gguf_test --trims` checks every mode.
 | `MAYA_DS4_Q8_SHARE` | on | `0`: each job rounds its own input, even one another job of the call reads (the same bits either way); both `0`: as before |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched, shared rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: Q5_K GEMVs of a verify window on the int8 tensor cores
+
+A GGUF pack's Q5_K dense matrices (wq_b, wo_a, wo_b, the shared expert, the head) run once per row of a DSpark or
+lookup verify window, and the dp4a kernel pays most of its time again for each extra row. With `MAYA_DS4_Q5K_IMMA=N`
+a Q5_K GEMV of at least N (and at most 16) activations runs on the int8 tensor cores (`mma` m16n8k32, NVIDIA sm_80
+and later; HIP keeps the dp4a kernel), with each output's float steps in the dp4a kernel's order: the same bits
+(`ds4_gguf_test --imma` checks it at every count 1-16 and times both). At one activation it is slower, so it is a
+threshold. On 2x CMP 170HX (sm_80) with DeepSeek-V4.1-Flash GSQ-RCO and DSpark, `2` took the verify windows' time down 12%
+(the same tokens); other GPUs are not measured.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_Q5K_IMMA` | off | `N`: Q5_K GEMVs of N-16 activations on the int8 tensor cores (the same bits); `2` measured on sm_80 |
+
 ## DeepSeek: a decoded token's small launches fused
 
 A decoded token runs a few launches a layer that do almost nothing: the HC split (one warp) and its pre-norm (one
