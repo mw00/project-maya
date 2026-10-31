@@ -274,11 +274,15 @@ __global__ void __launch_bounds__(NTHR, 2)
 // half2 (w[k], w[k+1]), a token's activations half2 (x[k], x[k+1]), and one HFMA2 adds both products to a half2 whose
 // lanes are summed when it is flushed to the FP32 accumulators (every 256 values of K - a block - so a half chain is
 // 128 products).  The weights are the dequantized values rounded to half (a scale error of 2^-12 a 32-value group),
-// the activations are rounded to half (clamped to its range).
+// the activations are rounded to half (clamped to its range).  A tile with few rows (most experts of a chunk have
+// under 32) lets the warps whose 8 tokens lie past its last row skip the FMAs, and the threads of a missing token skip
+// its activation loads: the weights are decoded and staged by every warp either way.
 __device__ __forceinline__ __half2 h2_from(const uint32_t u) { return *reinterpret_cast<const __half2*>(&u); }
 
+constexpr int WPAD = BM + 4;   // a stage row of the FP16 weight tile, padded so a row's two decode threads store apart
+
 template <int BUF>
-__device__ __forceinline__ void fma_stage_h(const uint4 (*Ws)[BK / 2][BM / 4], const uint4 (*Xs)[BK / 2][BN / 4],
+__device__ __forceinline__ void fma_stage_h(const uint4 (*Ws)[BK / 2][WPAD / 4], const uint4 (*Xs)[BK / 2][BN / 4],
                                             int tx, int ty, __half2 (&acc)[8][4]) {
 #pragma unroll
     for (int kp = 0; kp < BK / 2; ++kp) {
@@ -313,17 +317,19 @@ __global__ void __launch_bounds__(NTHR, 2)
 
     // Ws[buf][kp][row]: half2 (k = 2 kp, 2 kp + 1) of a weight row; Xs[buf][kp][token]: the same of a token.  Both
     // are read as uint4 (4 rows / 4 tokens); the token index is swizzled by the k chunk as in the FP32 kernel.
-    __shared__ __align__(16) uint32_t Ws[2][BK / 2][BM];
+    __shared__ __align__(16) uint32_t Ws[2][BK / 2][WPAD];
     __shared__ __align__(16) uint32_t Xs[2][BK / 2][BN];
 
     const int tid = threadIdx.x;
-    const int wrow = tid & (BM - 1), hh = tid >> 7;
+    const int wrow = tid >> 1, hh = tid & 1;   // a row's two threads side by side: one load transaction serves both
     const uint8_t* wp = w + (size_t) e * expert_bytes + (size_t) (mt * BM + wrow) * (size_t) (K / 256) * F::BYTES;
     const int xr = tid >> 2, xc = tid & 3;
     const int tok = t0 + min(xr, ntok - 1);
     const float* xp = x + (int64_t) (row_map ? row_map[tok] : tok) * ld_x + 4 * xc;
     const int xs = xr ^ (xc << 3);
     const int tx = tid & 15, ty = tid >> 4;
+    const bool xok = xr < ntok;                    // this thread's token exists
+    const bool active = (tid >> 5) * 8 < ntok;     // a warp's 2 x 16 threads hold 8 tokens
 
     float acc32[8][4];
     __half2 acc[8][4];
@@ -335,6 +341,7 @@ __global__ void __launch_bounds__(NTHR, 2)
             acc[i][j] = __float2half2_rn(0.f);
         }
 
+    const float4 zero4 = make_float4(0.f, 0.f, 0.f, 0.f);
     const auto put_x = [&](int buf, const float4& v) {
         Xs[buf][2 * xc][xs] = pack_h(v.x, v.y);
         Xs[buf][2 * xc + 1][xs] = pack_h(v.z, v.w);
@@ -353,7 +360,7 @@ __global__ void __launch_bounds__(NTHR, 2)
             }
     };
 
-    const auto Wv = reinterpret_cast<const uint4 (*)[BK / 2][BM / 4]>(&Ws[0][0][0]);
+    const auto Wv = reinterpret_cast<const uint4 (*)[BK / 2][WPAD / 4]>(&Ws[0][0][0]);
     const auto Xv = reinterpret_cast<const uint4 (*)[BK / 2][BN / 4]>(&Xs[0][0][0]);
 
     const int nsb = K / 32;
@@ -362,9 +369,9 @@ __global__ void __launch_bounds__(NTHR, 2)
         __half2 wv[4];
         F::template decode_h<0>(rawC, hh, wv);
         put_w(0, wv);
-        put_x(0, ldg4(xp));
+        put_x(0, xok ? ldg4(xp) : zero4);
     }
-    float4 xa = ldg4(xp + 16);
+    float4 xa = xok ? ldg4(xp + 16) : zero4;
     __syncthreads();
     for (int sb = 0; sb < nsb; ++sb) {
         const bool more = sb + 1 < nsb;
@@ -378,9 +385,9 @@ __global__ void __launch_bounds__(NTHR, 2)
             if (more) {
                 const int k1 = sb + 1;
                 rawN = F::load(wp + (size_t) (k1 >> 3) * F::BYTES, k1 & 7);
-                xb = ldg4(xp + (2 * sb + 2) * 16);
+                xb = xok ? ldg4(xp + (2 * sb + 2) * 16) : zero4;
             }
-            fma_stage_h<0>(Wv, Xv, tx, ty, acc);
+            if (active) fma_stage_h<0>(Wv, Xv, tx, ty, acc);
             __syncthreads();
         }
         {
@@ -389,13 +396,13 @@ __global__ void __launch_bounds__(NTHR, 2)
                 F::template decode_h<0>(rawN, hh, wv);
                 put_w(0, wv);
                 put_x(0, xb);
-                xa = ldg4(xp + (2 * sb + 3) * 16);
+                xa = xok ? ldg4(xp + (2 * sb + 3) * 16) : zero4;
                 rawC = rawN;
             }
-            fma_stage_h<1>(Wv, Xv, tx, ty, acc);
+            if (active) fma_stage_h<1>(Wv, Xv, tx, ty, acc);
             __syncthreads();
         }
-        if ((sb & 7) == 7) flush();
+        if (active && (sb & 7) == 7) flush();
     }
 #pragma unroll
     for (int j = 0; j < 4; ++j) {
@@ -404,6 +411,101 @@ __global__ void __launch_bounds__(NTHR, 2)
         float* d = dst + (int64_t) (t0 + t) * ld_dst + mt * BM;
         *(float4*) (d + tx * 4) = make_float4(acc32[0][j], acc32[1][j], acc32[2][j], acc32[3][j]);
         *(float4*) (d + BM / 2 + tx * 4) = make_float4(acc32[4][j], acc32[5][j], acc32[6][j], acc32[7][j]);
+    }
+}
+
+// ---- the dense FP16 product: the FP16 expert kernel's tile and FMA stage with the weights read as they are (a row's
+// two threads load 32 contiguous bytes of its next 32 values; the activations are half already)
+__global__ void __launch_bounds__(NTHR, 2)
+    dense_gemm_h(const __half* __restrict__ W, int N, int K, const __half* __restrict__ X, int64_t ldx,
+                 float* __restrict__ Y, int64_t ldy, int T) {
+    const int mt = blockIdx.x;
+    const int t0 = blockIdx.y * BN;
+    const int ntok = min(BN, T - t0);
+    __shared__ __align__(16) uint32_t Ws[2][BK / 2][WPAD];
+    __shared__ __align__(16) uint32_t Xs[2][BK / 2][BN];
+    const int tid = threadIdx.x;
+    const int wrow = tid >> 1, hh = tid & 1;
+    const int nrow = min(mt * BM + wrow, N - 1);
+    const __half* wp = W + (size_t) nrow * K + 8 * hh;
+    const int xr = tid >> 2, xc = tid & 3;
+    const bool xok = xr < ntok;
+    const __half* xp = X + (int64_t) (t0 + min(xr, ntok - 1)) * ldx + 4 * xc;
+    const int xs = xr ^ (xc << 3);
+    const int tx = tid & 15, ty = tid >> 4;
+    const bool active = (tid >> 5) * 8 < ntok;
+    float acc32[8][4];
+    __half2 acc[8][4];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc32[i][j] = 0.f;
+            acc[i][j] = __float2half2_rn(0.f);
+        }
+    const uint2 zero2 = make_uint2(0u, 0u);
+    const auto put_x = [&](int buf, const uint2& v) {
+        Xs[buf][2 * xc][xs] = v.x;
+        Xs[buf][2 * xc + 1][xs] = v.y;
+    };
+    const auto put_w = [&](int buf, const uint4& v) {
+        Ws[buf][4 * hh][wrow] = v.x;
+        Ws[buf][4 * hh + 1][wrow] = v.y;
+        Ws[buf][4 * hh + 2][wrow] = v.z;
+        Ws[buf][4 * hh + 3][wrow] = v.w;
+    };
+    const auto ldw = [&](int k) { return __ldg((const uint4*) (wp + k)); };
+    const auto ldx2 = [&](int k) { return xok ? __ldg((const uint2*) (xp + k)) : zero2; };
+    const auto flush = [&]() {
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                acc32[i][j] += __low2float(acc[i][j]) + __high2float(acc[i][j]);
+                acc[i][j] = __float2half2_rn(0.f);
+            }
+    };
+    const auto Wv = reinterpret_cast<const uint4 (*)[BK / 2][WPAD / 4]>(&Ws[0][0][0]);
+    const auto Xv = reinterpret_cast<const uint4 (*)[BK / 2][BN / 4]>(&Xs[0][0][0]);
+    const int nsb = K / 32;
+    uint4 wc1;
+    put_w(0, ldw(0));
+    wc1 = ldw(16);
+    put_x(0, ldx2(0));
+    uint2 xa = ldx2(16);
+    __syncthreads();
+    for (int sb = 0; sb < nsb; ++sb) {
+        const bool more = sb + 1 < nsb;
+        put_w(1, wc1);
+        put_x(1, xa);
+        uint4 wn0 = make_uint4(0, 0, 0, 0), wn1 = wn0;
+        uint2 xb = zero2;
+        if (more) {
+            wn0 = ldw((sb + 1) * 32);
+            wn1 = ldw((sb + 1) * 32 + 16);
+            xb = ldx2((sb + 1) * 32);
+        }
+        if (active) fma_stage_h<0>(Wv, Xv, tx, ty, acc);
+        __syncthreads();
+        if (more) {
+            put_w(0, wn0);
+            put_x(0, xb);
+            xa = ldx2((sb + 1) * 32 + 16);
+            wc1 = wn1;
+        }
+        if (active) fma_stage_h<1>(Wv, Xv, tx, ty, acc);
+        __syncthreads();
+        if (active && (sb & 7) == 7) flush();
+    }
+    if (active && (nsb & 7) != 0) flush();
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int t = ty * 4 + j;
+        if (t >= ntok) continue;
+        float* d = Y + (int64_t) (t0 + t) * ldy + mt * BM;
+        const int c0 = mt * BM + tx * 4, c1 = mt * BM + BM / 2 + tx * 4;
+        if (c0 + 3 < N) *(float4*) (d + tx * 4) = make_float4(acc32[0][j], acc32[1][j], acc32[2][j], acc32[3][j]);
+        if (c1 + 3 < N) *(float4*) (d + BM / 2 + tx * 4) = make_float4(acc32[4][j], acc32[5][j], acc32[6][j], acc32[7][j]);
     }
 }
 
@@ -481,6 +583,33 @@ void run(const Product& p, void* stream) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill pascal: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
+
+bool dense_usable(const Dense& d) {
+    if (d.n <= 0 || d.t <= 0 || d.k % 32 != 0 || d.n % 4 != 0 || d.ld_x % 4 != 0 || d.ld_y % 4 != 0 || d.k > (1 << 20))
+        return false;
+    if (((uintptr_t) d.w & 15) != 0 || ((uintptr_t) d.x & 7) != 0 || ((uintptr_t) d.y & 15) != 0) return false;
+    static const int env = std::getenv("STRATA_GLM_PREFILL_PASCAL_DENSE") ? std::atoi(std::getenv("STRATA_GLM_PREFILL_PASCAL_DENSE")) : -1;
+    if (env == 0) return false;
+    if (env < 0) {
+        int dev = 0, major = 0, minor = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess) return false;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        if (major * 10 + minor >= 61) return false;
+    }
+    return ((d.n + BM - 1) / BM) * ((d.t + BN - 1) / BN) >= 160;   // (2 blocks an SM: 112 on a P100)
+}
+
+void dense_run(const Dense& d, void* stream) {
+    const dim3 grid((unsigned) ((d.n + BM - 1) / BM), (unsigned) ((d.t + BN - 1) / BN));
+    dense_gemm_h<<<grid, NTHR, 0, (cudaStream_t) stream>>>((const __half*) d.w, (int) d.n, (int) d.k, (const __half*) d.x,
+                                                           d.ld_x, d.y, d.ld_y, (int) d.t);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "prefill pascal dense: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
 }

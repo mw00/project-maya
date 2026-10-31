@@ -2278,6 +2278,24 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->lt->f16(X16, S->w16, Y + r0, Tn, n, Kd, ldy, beta);
                 continue;
             }
+#else
+            // compute < 6.1 (no tensor cores): cuBLAS's FP16 x FP16 -> F32 runs at the FP32 rate; the HFMA2 kernel
+            // is 1.8x that on the big projections (STRATA_GLM_PREFILL_PASCAL_DENSE=0 keeps cuBLAS)
+            if (beta == 0.0f) {
+                pas::Dense dd;
+                dd.w = S->w16;
+                dd.n = n;
+                dd.k = Kd;
+                dd.x = X16;
+                dd.ld_x = ldx;
+                dd.t = Tn;
+                dd.y = Y + r0;
+                dd.ld_y = ldy;
+                if (pas::dense_usable(dd)) {
+                    pas::dense_run(dd, s);
+                    continue;
+                }
+            }
 #endif
             const cublasStatus_t st = cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16,
                                                    CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy,

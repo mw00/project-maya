@@ -44,4 +44,25 @@ bool f16_default();
 
 void run(const Product& p, void* stream);
 
+/// A dense FP16 product for the same cards: y[t][n] = sum_k x[t][k] * w[n][k] (FP32 out, no beta), the weights
+/// already dequantized to FP16 (row n at w + n * k) and the activations FP16.  cuBLAS runs this at the FP32 rate on
+/// sm_60 (about 3.3 TMAC/s); the HFMA2 kernel sums products in half for 256 values of K at a time and in FP32 across
+/// them (error ~0.17% vs cuBLAS's FP32 sums), at 5.5-5.9 TMAC/s.
+struct Dense {
+    const void* w = nullptr;   // __half [n][k]
+    int64_t n = 0, k = 0;
+    const void* x = nullptr;   // __half [t][ld_x]
+    int64_t ld_x = 0;
+    int64_t t = 0;
+    float* y = nullptr;        // [t][ld_y]
+    int64_t ld_y = 0;
+};
+
+/// The device is compute < 6.1, the shapes and pointers fit (k % 32, n % 4, ld_x and ld_y % 4, aligned) and the grid
+/// fills the card (a product of fewer than about 1.5 waves of tiles stays with cuBLAS).
+/// STRATA_GLM_PREFILL_PASCAL_DENSE=0 turns it off, 1 forces it on whatever the card.
+bool dense_usable(const Dense& d);
+
+void dense_run(const Dense& d, void* stream);
+
 }  // namespace strata::prefill::pascal

@@ -1,6 +1,7 @@
 // tests/pascal_moe_gemm_test.cu - the Pascal prompt path's expert product (pascal::run: FP32 activations, weights
 // dequantized into shared memory) against a double-precision product over ggml's own dequantizer, for the expert
-// types of the GLM packs (IQ2_XXS, IQ2_S, IQ3_XXS).  Synthetic weights from ggml's quantizers; no model needed.
+// types of the GLM packs (IQ2_XXS, IQ2_S, IQ3_XXS), and its dense FP16 product (pascal::dense_run) against a double
+// product of the same half inputs.  Synthetic weights from ggml's quantizers; no model needed.
 //
 //   pascal_moe_gemm_test           the parity checks (ctest)
 //   pascal_moe_gemm_test --bench   Maya-S24's shapes: the time of pascal::run against ggml's MMQ on the same experts
@@ -9,6 +10,7 @@
 
 #include "ggml.h"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -65,8 +67,9 @@ std::vector<uint8_t> make_experts(int type, int n_exp, int rows, int cols, std::
 int parity(cudaStream_t s, bool f16) {
     const int w_rows = 256, w_cols = 512;
     std::mt19937 rng(20261016);
-    // rows per expert: empty, one, short of a token tile, exactly one, one past, several tiles
-    const std::vector<int32_t> counts = {37, 0, 130, 1, 64, 9, 65, 200, 0, 5, 63, 128};
+    // rows per expert: empty, one, short of a token tile, exactly one, one past, several tiles, and the edges of the
+    // 8-token warp groups the FP16 kernel skips (8, 16, 17, 24, 31, 32, 33)
+    const std::vector<int32_t> counts = {37, 0, 130, 1, 64, 9, 65, 200, 0, 5, 63, 128, 8, 16, 17, 24, 31, 32, 33};
     const int n_exp = (int) counts.size();
     std::vector<int32_t> hb(n_exp + 1, 0);
     for (int e = 0; e < n_exp; ++e) hb[e + 1] = hb[e] + counts[e];
@@ -149,6 +152,62 @@ int parity(cudaStream_t s, bool f16) {
     }
     std::printf("pascal_moe_gemm_test: all pass\n");
     return 0;
+}
+
+// pascal::dense_run on tile edges: tokens short of / past a 64-token tile and of the 8-token warp groups, an N that
+// is not a multiple of 128, a K that is not a multiple of 256 (the last flush), a long K
+int dense_parity(cudaStream_t s) {
+    struct Shape { int t, n, k; };
+    const Shape shapes[] = {{70, 256, 512}, {65, 260, 256}, {9, 128, 1536}, {130, 512, 288}, {1, 132, 64}, {200, 384, 4096}};
+    std::mt19937 rng(20261017);
+    int failures = 0;
+    for (const Shape& sh : shapes) {
+        std::normal_distribution<float> nw(0.f, 0.02f), nx(0.f, 1.f);
+        std::vector<__half> hw((size_t) sh.n * sh.k), hx((size_t) sh.t * sh.k);
+        std::vector<float> fw(hw.size()), fx(hx.size());
+        for (size_t i = 0; i < hw.size(); ++i) { hw[i] = __float2half(nw(rng)); fw[i] = __half2float(hw[i]); }
+        for (size_t i = 0; i < hx.size(); ++i) { hx[i] = __float2half(nx(rng)); fx[i] = __half2float(hx[i]); }
+        __half* w = upload(hw);
+        __half* x = upload(hx);
+        float* y = dev<float>((size_t) sh.t * sh.n);
+        check(cudaMemsetAsync(y, 0xff, (size_t) sh.t * sh.n * 4, s), "memset");
+        pas::Dense d;
+        d.w = w;
+        d.n = sh.n;
+        d.k = sh.k;
+        d.x = x;
+        d.ld_x = sh.k;
+        d.t = sh.t;
+        d.y = y;
+        d.ld_y = sh.n;
+        pas::dense_run(d, s);
+        std::vector<float> hy((size_t) sh.t * sh.n);
+        check(cudaMemcpyAsync(hy.data(), y, hy.size() * 4, cudaMemcpyDeviceToHost, s), "download");
+        check(cudaStreamSynchronize(s), "sync");
+        double worst = 0;
+        long bad = 0;
+        for (int t = 0; t < sh.t; ++t) {
+            double num = 0, den = 0;
+            for (int n = 0; n < sh.n; ++n) {
+                double ref = 0;
+                for (int k = 0; k < sh.k; ++k) ref += (double) fw[(size_t) n * sh.k + k] * fx[(size_t) t * sh.k + k];
+                const double got = hy[(size_t) t * sh.n + n];
+                num += (got - ref) * (got - ref);
+                den += ref * ref;
+                bad += !std::isfinite(got);
+            }
+            worst = std::max(worst, std::sqrt(num / std::max(den, 1e-30)));
+        }
+        const bool ok = bad == 0 && worst < 4e-3;
+        std::printf("  dense    fp16 t=%d n=%d k=%d: worst row rel L2 %.3g, %ld non-finite%s\n", sh.t, sh.n, sh.k, worst, bad,
+                    ok ? "" : "  FAIL");
+        failures += !ok;
+        cudaFree(y);
+        cudaFree(x);
+        cudaFree(w);
+    }
+    if (failures != 0) std::printf("pascal_moe_gemm_test: %d dense FAILED\n", failures);
+    return failures != 0;
 }
 
 int bench(cudaStream_t s) {
@@ -280,5 +339,5 @@ int main(int argc, char** argv) {
     check(cudaGetDeviceProperties(&prop, 0), "device");
     std::printf("pascal_moe_gemm_test: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) return bench(s);
-    return parity(s, false) | parity(s, true);
+    return parity(s, false) | parity(s, true) | dense_parity(s);
 }
