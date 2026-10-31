@@ -57,7 +57,7 @@ the arithmetic around the dot and, on sm_60, the integer multiply itself: there 
 (16 x 16 -> 32 bits, about 3 for one 32-bit multiply). Maya's 16-byte-load pattern with the arithmetic removed reaches 490-560 GB/s, so
 the loads are not the limit either.
 
-`mv_q4k_pascal` (Q4_K, 1-4 columns, `STRATA_GLM_PASCAL_MV=0` turns it off) takes two weights and two activations through one
+`mv_q4k_pascal` (Q4_K, 1-4 columns, `MAYA_GLM_PASCAL_MV=0` turns it off) takes two weights and two activations through one
 multiply (`(a0 << 16) + a2` against `w0 | w2 << 16`: the high half is `a0*w0 + a2*w2`; 8 of them stay under 2^15 in both halves,
 so the result is the exact integer dot), stages the activations in shared memory in a bank-conflict-free layout, and unpacks the
 eight sub-block scales without a branch. 8192 x 4096, one column: 84 -> 55 us (210 -> 330 GB/s); two columns 92.5 -> 80.5 us;

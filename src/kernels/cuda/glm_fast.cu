@@ -2084,7 +2084,7 @@ void mvc_launch(const MvBatch& b, int blocks, int nc, cudaStream_t s) {
     else mvc_kernel_t<T, 16><<<blocks, 256, 0, s>>>(b);
 }
 
-// whether the Pascal Q4_K GEMV above serves this device (compute 6.0, no dp4a; STRATA_GLM_PASCAL_MV=0: never), once per device
+// whether the Pascal Q4_K GEMV above serves this device (compute 6.0, no dp4a; MAYA_GLM_PASCAL_MV=0: never), once per device
 bool pascal_mv_arch() {
 #if defined(STRATA_USE_HIP)
     return false;
@@ -2097,7 +2097,7 @@ bool pascal_mv_arch() {
         int major = 0, minor = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
-        static const bool off = getenv("STRATA_GLM_PASCAL_MV") != nullptr && std::atoi(getenv("STRATA_GLM_PASCAL_MV")) == 0;
+        static const bool off = getenv("MAYA_GLM_PASCAL_MV") != nullptr && std::atoi(getenv("MAYA_GLM_PASCAL_MV")) == 0;
         cache[dev] = major * 10 + minor < 61 && !off ? 1 : 2;
     }
     return cache[dev] == 1;
