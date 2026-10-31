@@ -1048,18 +1048,30 @@ bool Glm5Model::window(const int32_t* tokens, int T, int32_t* out, std::string& 
             gf::embed_streams(W.emb + (size_t) t * E, W.R[0] + (size_t) t * hcE, E, F->cs);
     }
     if (!fast_window_layers(p0, T, err)) return false;
-    // each later part: the rows cross over through the previous part's pinned buffer, ordered on the devices
+    // each later part: the rows cross over through the previous part's pinned buffer (or direct P2P BAR when enabled)
     Glm5Model* tail = this;
     for (Glm5Model* B = split_next_.get(); B != nullptr; B = B->split_next_.get()) {
         auto& WA = tail->fast_->win;
         auto& WB = B->fast_->win;
         const size_t bytes = (size_t) T * hcE * sizeof(float);
-        cudaSetDevice(tail->dev_);
-        cudaMemcpyAsync(WA.hop_h, WA.R[WA.out], bytes, cudaMemcpyDeviceToHost, tail->fast_->cs);
-        cudaEventRecord(WA.ev_hop, tail->fast_->cs);
-        cudaSetDevice(B->dev_);
-        cudaStreamWaitEvent(B->fast_->cs, WA.ev_hop, 0);
-        cudaMemcpyAsync(WB.R[0], WA.hop_h, bytes, cudaMemcpyHostToDevice, B->fast_->cs);
+        static const bool p2p_env = getenv("STRATA_GLM_P2P") != nullptr && std::atoi(getenv("STRATA_GLM_P2P")) != 0;
+        int can_peer = 0;
+        if (p2p_env && cudaDeviceCanAccessPeer(&can_peer, B->dev_, tail->dev_) == cudaSuccess && can_peer != 0) {
+            cudaSetDevice(B->dev_);
+            if (cudaDeviceEnablePeerAccess(tail->dev_, 0) != cudaSuccess) cudaGetLastError();
+            cudaSetDevice(tail->dev_);
+            cudaEventRecord(WA.ev_hop, tail->fast_->cs);
+            cudaSetDevice(B->dev_);
+            cudaStreamWaitEvent(B->fast_->cs, WA.ev_hop, 0);
+            cudaMemcpyPeerAsync(WB.R[0], B->dev_, WA.R[WA.out], tail->dev_, bytes, B->fast_->cs);
+        } else {
+            cudaSetDevice(tail->dev_);
+            cudaMemcpyAsync(WA.hop_h, WA.R[WA.out], bytes, cudaMemcpyDeviceToHost, tail->fast_->cs);
+            cudaEventRecord(WA.ev_hop, tail->fast_->cs);
+            cudaSetDevice(B->dev_);
+            cudaStreamWaitEvent(B->fast_->cs, WA.ev_hop, 0);
+            cudaMemcpyAsync(WB.R[0], WA.hop_h, bytes, cudaMemcpyHostToDevice, B->fast_->cs);
+        }
         if (!B->fast_window_layers(p0, T, err)) return false;
         tail = B;
     }
@@ -1244,6 +1256,36 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     auto& W = F->win;
     const int64_t p = fast_->win.p0 + t;
     const int sl = W.bank * kPipeMax + t;   // this window's slot of token t
+    static const bool p2p_env = getenv("STRATA_GLM_P2P") != nullptr && std::atoi(getenv("STRATA_GLM_P2P")) != 0;
+    static std::mutex p2p_mu;
+    static float* p2p_slot_buf[16] = {};
+    static int p2p_ready[16][16] = {};   // 0: unknown, 1: enabled, -1: unsupported
+    auto get_p2p_buf = [&](int src_dev, int dst_dev) -> float* {
+        if (!p2p_env || src_dev < 0 || src_dev >= 16 || dst_dev < 0 || dst_dev >= 16) return nullptr;
+        std::lock_guard<std::mutex> lk(p2p_mu);
+        if (p2p_ready[src_dev][dst_dev] == 0) {
+            int can = 0;
+            if (cudaDeviceCanAccessPeer(&can, dst_dev, src_dev) == cudaSuccess && can != 0) {
+                int cur = 0;
+                cudaGetDevice(&cur);
+                cudaSetDevice(dst_dev);
+                if (cudaDeviceEnablePeerAccess(src_dev, 0) != cudaSuccess) cudaGetLastError();
+                if (p2p_slot_buf[src_dev] == nullptr) {
+                    cudaSetDevice(src_dev);
+                    if (cudaMalloc((void**) &p2p_slot_buf[src_dev], (size_t) kPipeSlots * hcE * sizeof(float)) != cudaSuccess) {
+                        cudaGetLastError();
+                        p2p_slot_buf[src_dev] = nullptr;
+                    }
+                }
+                cudaSetDevice(cur);
+                p2p_ready[src_dev][dst_dev] = p2p_slot_buf[src_dev] != nullptr ? 1 : -1;
+            } else {
+                cudaGetLastError();
+                p2p_ready[src_dev][dst_dev] = -1;
+            }
+        }
+        return p2p_ready[src_dev][dst_dev] > 0 ? p2p_slot_buf[src_dev] : nullptr;
+    };
     cudaSetDevice(m->dev_);
     if (prev == nullptr) {
         cudaMemcpyAsync(W.emb + (size_t) sl * E, W.emb_h + (size_t) sl * E, (size_t) E * sizeof(float),
@@ -1251,8 +1293,12 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
         gf::embed_streams(W.emb + (size_t) sl * E, m->state_, E, F->cs);
     } else {
         cudaStreamWaitEvent(F->cs, prev->fast_->win.ev_tok[sl], 0);
-        cudaMemcpyAsync(m->state_, prev->fast_->win.hop_h + (size_t) sl * hcE, hcE * sizeof(float),
-                        cudaMemcpyHostToDevice, F->cs);
+        if (float* pbuf = get_p2p_buf(prev->dev_, m->dev_)) {
+            cudaMemcpyPeerAsync(m->state_, m->dev_, pbuf + (size_t) sl * hcE, prev->dev_, hcE * sizeof(float), F->cs);
+        } else {
+            cudaMemcpyAsync(m->state_, prev->fast_->win.hop_h + (size_t) sl * hcE, hcE * sizeof(float),
+                            cudaMemcpyHostToDevice, F->cs);
+        }
     }
     W.pipe_t = t;
     F->bnd_tokens.fetch_add(1, std::memory_order_relaxed);
@@ -1265,7 +1311,11 @@ bool Glm5Model::win_pipe_part(int k, int t, std::string& err) {
     }
     if (m->split_next_) {
         gf::set_skip(nullptr);
-        cudaMemcpyAsync(W.hop_h + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
+        if (float* pbuf = get_p2p_buf(m->dev_, m->split_next_->dev_)) {
+            cudaMemcpyAsync(pbuf + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToDevice, F->cs);
+        } else {
+            cudaMemcpyAsync(W.hop_h + (size_t) sl * hcE, m->state_, hcE * sizeof(float), cudaMemcpyDeviceToHost, F->cs);
+        }
         cudaEventRecord(W.ev_tok[sl], F->cs);
         return true;
     }

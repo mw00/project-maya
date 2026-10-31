@@ -6682,7 +6682,7 @@ void moe_cpu_wait_rows(const CpuWaitRows& w, int n, int n_embd, cudaStream_t s) 
 namespace {
 // Limit automatic dispatch to the measured decode geometry and RDNA3/3.5
 // targets. RDNA4 and all other shapes retain the original expert kernels.
-bool rdna3_expert_device(bool allow_gfx1151 = true) {
+bool rdna3_expert_device(bool allow_gfx1151 = true, bool allow_gfx906 = false) {
     static const bool legacy = [] {
         const char* v = std::getenv("STRATA_HIP_EXPERTS_LEGACY");
         return v && v[0] == '1';
@@ -6694,15 +6694,17 @@ bool rdna3_expert_device(bool allow_gfx1151 = true) {
     static thread_local bool gfx1100 = false;
     static thread_local bool gfx1151 = false;
     static thread_local bool gfx120x = false;
+    static thread_local bool gfx906 = false;
     if (cached_device != device) {
         hipDeviceProp_t prop{};
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
         gfx1100 = std::strncmp(prop.gcnArchName, "gfx1100", 7) == 0;
         gfx1151 = std::strncmp(prop.gcnArchName, "gfx1151", 7) == 0;
         gfx120x = std::strncmp(prop.gcnArchName, "gfx120", 6) == 0;
+        gfx906 = std::strncmp(prop.gcnArchName, "gfx906", 6) == 0;
         cached_device = device;
     }
-    return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151);
+    return gfx1100 || gfx120x || (allow_gfx1151 && gfx1151) || (allow_gfx906 && gfx906);
 }
 // IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (STRATA_GLM_GU22_TUNED=1) until it is measured end
 // to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel on gfx1100 and
@@ -6765,7 +6767,7 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 0);
     if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
@@ -6922,7 +6924,7 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     const auto* SH = (const block_q8_1*) sh_hq;
     // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
     const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
-    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true);
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device(true, gu_type == 22 && gu22_tuned());
     if (gu_type == 22) note_gu22(tuned, 1);
     if (tuned) {
         if (gu_type == 16)
