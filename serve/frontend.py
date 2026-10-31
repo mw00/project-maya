@@ -722,6 +722,8 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
+        if ">" not in rest:
+            raise MalformedToolCall(body)
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
         end = rest.find("</parameter>")

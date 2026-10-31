@@ -2526,6 +2526,15 @@ class MalformedToolCallAnswers(unittest.TestCase):
                 self.assertIn(CALL_START + self.BAD + CALL_END, text)
             self.assertIn("Then more.", text)
 
+    def test_qwen_form_with_an_unclosed_parameter_tag(self):   # (#706: its plain ValueError got past the handler)
+        from serve.frontend import CALL_END, CALL_START, OutputParser
+        bad = "<function=write>\n<parameter=path"
+        for stream in (False, True):
+            p = OutputParser(thinking=False, tools=self.TOOLS, stream_tools=stream)
+            evs = p.feed("Let me write it." + CALL_START + bad + CALL_END + " Then more.") + p.finish()
+            self.assertEqual(p.malformed, [bad])
+            self.assertIn("Then more.", "".join(e.text for e in evs if e.kind == "content"))
+
     def test_the_request_answers(self):
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, "</think>Let me write it.<tool_call>" + self.BAD + "</tool_call>"), tok,
