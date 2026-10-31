@@ -56,10 +56,12 @@ struct Dense {
     int64_t t = 0;
     float* y = nullptr;        // [t][ld_y]
     int64_t ld_y = 0;
+    int pieces = 0;            // K pieces: 0 picks from the tile grid, 1 / 2 force.  Two pieces add into y (zeroed first)
 };
 
 /// The device is compute < 6.1, the shapes and pointers fit (k % 32, n % 4, ld_x and ld_y % 4, aligned) and the grid
-/// fills the card (a product of fewer than about 1.5 waves of tiles stays with cuBLAS).
+/// is big enough (under 20 tiles of 128 x 64 stays with cuBLAS; a grid of 20..80 or 113..139 tiles runs in two K pieces
+/// that add into y, zeroed first on the stream: two sums add the same in either order, so the bits do not change).
 /// STRATA_GLM_PREFILL_PASCAL_DENSE=0 turns it off, 1 forces it on whatever the card.
 bool dense_usable(const Dense& d);
 

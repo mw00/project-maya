@@ -155,57 +155,78 @@ int parity(cudaStream_t s, bool f16) {
 }
 
 // pascal::dense_run on tile edges: tokens short of / past a 64-token tile and of the 8-token warp groups, an N that
-// is not a multiple of 128, a K that is not a multiple of 256 (the last flush), a long K
+// is not a multiple of 128, a K that is not a multiple of 256 (the last flush), a long K.  `pieces` 2 takes the split
+// path (K halves added into y: the output starts as garbage, and the pitch padding of x and y must stay untouched; a
+// K of one 256 group stays whole), 0 lets the grid pick; `step` checks every step-th token (and the last) against the
+// double product.
 int dense_parity(cudaStream_t s) {
-    struct Shape { int t, n, k; };
-    const Shape shapes[] = {{70, 256, 512}, {65, 260, 256}, {9, 128, 1536}, {130, 512, 288}, {1, 132, 64}, {200, 384, 4096}};
+    struct Shape { int t, n, k, pieces, pad, step; };
+    const Shape shapes[] = {{70, 256, 512, 1, 0, 1}, {65, 260, 256, 1, 0, 1}, {9, 128, 1536, 1, 0, 1}, {130, 512, 288, 1, 0, 1},
+                            {1, 132, 64, 1, 0, 1}, {200, 384, 4096, 1, 0, 1},
+                            {70, 256, 512, 2, 0, 1}, {65, 260, 256, 2, 0, 1}, {130, 512, 288, 2, 8, 1}, {9, 128, 1536, 2, 0, 1},
+                            {70, 388, 4032, 2, 12, 1}, {64, 132, 1280, 2, 4, 1}, {37, 2052, 2336, 2, 0, 1}, {1, 132, 64, 2, 0, 1},
+                            {256, 2048, 4096, 0, 8, 17}, {255, 2048, 4096, 0, 0, 17}};
     std::mt19937 rng(20261017);
     int failures = 0;
+    double worst_all = 0;
     for (const Shape& sh : shapes) {
         std::normal_distribution<float> nw(0.f, 0.02f), nx(0.f, 1.f);
-        std::vector<__half> hw((size_t) sh.n * sh.k), hx((size_t) sh.t * sh.k);
+        const int ldx = sh.k + sh.pad, ldy = sh.n + sh.pad;
+        std::vector<__half> hw((size_t) sh.n * sh.k), hx((size_t) sh.t * ldx);
         std::vector<float> fw(hw.size()), fx(hx.size());
         for (size_t i = 0; i < hw.size(); ++i) { hw[i] = __float2half(nw(rng)); fw[i] = __half2float(hw[i]); }
         for (size_t i = 0; i < hx.size(); ++i) { hx[i] = __float2half(nx(rng)); fx[i] = __half2float(hx[i]); }
         __half* w = upload(hw);
         __half* x = upload(hx);
-        float* y = dev<float>((size_t) sh.t * sh.n);
-        check(cudaMemsetAsync(y, 0xff, (size_t) sh.t * sh.n * 4, s), "memset");
+        float* y = dev<float>((size_t) sh.t * ldy);
+        check(cudaMemsetAsync(y, 0xff, (size_t) sh.t * ldy * 4, s), "memset");
         pas::Dense d;
         d.w = w;
         d.n = sh.n;
         d.k = sh.k;
         d.x = x;
-        d.ld_x = sh.k;
+        d.ld_x = ldx;
         d.t = sh.t;
         d.y = y;
-        d.ld_y = sh.n;
+        d.ld_y = ldy;
+        d.pieces = sh.pieces;
         pas::dense_run(d, s);
-        std::vector<float> hy((size_t) sh.t * sh.n);
+        std::vector<float> hy((size_t) sh.t * ldy), hy2(hy.size());
         check(cudaMemcpyAsync(hy.data(), y, hy.size() * 4, cudaMemcpyDeviceToHost, s), "download");
+        check(cudaMemsetAsync(y, 0x7f, hy.size() * 4, s), "memset");   // (another garbage)
+        pas::dense_run(d, s);
+        check(cudaMemcpyAsync(hy2.data(), y, hy2.size() * 4, cudaMemcpyDeviceToHost, s), "download");
         check(cudaStreamSynchronize(s), "sync");
         double worst = 0;
         long bad = 0;
         for (int t = 0; t < sh.t; ++t) {
+            for (int n = sh.n; n < ldy; ++n) bad += !std::isnan(hy[(size_t) t * ldy + n]);   // (the pitch padding: still 0xff)
+            const bool check_row = t % sh.step == 0 || t == sh.t - 1;
             double num = 0, den = 0;
             for (int n = 0; n < sh.n; ++n) {
+                const double got = hy[(size_t) t * ldy + n];
+                bad += !std::isfinite(got);
+                if (!check_row) continue;
                 double ref = 0;
-                for (int k = 0; k < sh.k; ++k) ref += (double) fw[(size_t) n * sh.k + k] * fx[(size_t) t * sh.k + k];
-                const double got = hy[(size_t) t * sh.n + n];
+                for (int k = 0; k < sh.k; ++k) ref += (double) fw[(size_t) n * sh.k + k] * fx[(size_t) t * ldx + k];
                 num += (got - ref) * (got - ref);
                 den += ref * ref;
-                bad += !std::isfinite(got);
             }
-            worst = std::max(worst, std::sqrt(num / std::max(den, 1e-30)));
+            if (check_row) worst = std::max(worst, std::sqrt(num / std::max(den, 1e-30)));
         }
-        const bool ok = bad == 0 && worst < 4e-3;
-        std::printf("  dense    fp16 t=%d n=%d k=%d: worst row rel L2 %.3g, %ld non-finite%s\n", sh.t, sh.n, sh.k, worst, bad,
-                    ok ? "" : "  FAIL");
+        long same = 0;   // two runs over different garbage: the same bits
+        for (int t = 0; t < sh.t; ++t)
+            same += std::memcmp(&hy[(size_t) t * ldy], &hy2[(size_t) t * ldy], (size_t) sh.n * 4) != 0;
+        const bool ok = bad == 0 && same == 0 && worst < 4e-3;
+        worst_all = std::max(worst_all, worst);
+        std::printf("  dense    fp16 t=%d n=%d k=%d pieces=%d pad=%d: worst row rel L2 %.3g, %ld bad, %ld rows differ run to run%s\n",
+                    sh.t, sh.n, sh.k, sh.pieces, sh.pad, worst, bad, same, ok ? "" : "  FAIL");
         failures += !ok;
         cudaFree(y);
         cudaFree(x);
         cudaFree(w);
     }
+    std::printf("  dense    fp16 worst over all shapes %.3g\n", worst_all);
     if (failures != 0) std::printf("pascal_moe_gemm_test: %d dense FAILED\n", failures);
     return failures != 0;
 }

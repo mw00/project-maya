@@ -14,6 +14,7 @@
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 
@@ -416,9 +417,15 @@ __global__ void __launch_bounds__(NTHR, 2)
 
 // ---- the dense FP16 product: the FP16 expert kernel's tile and FMA stage with the weights read as they are (a row's
 // two threads load 32 contiguous bytes of its next 32 values; the activations are half already)
+// SPLIT: block z takes sub-blocks [z * piece_sb, (z + 1) * piece_sb) of K (piece_sb % 8 == 0: the FP32 flushes fall as in
+// the whole product) and adds its sums into a Y that is zero
+template <bool SPLIT>
 __global__ void __launch_bounds__(NTHR, 2)
     dense_gemm_h(const __half* __restrict__ W, int N, int K, const __half* __restrict__ X, int64_t ldx,
-                 float* __restrict__ Y, int64_t ldy, int T) {
+                 float* __restrict__ Y, int64_t ldy, int T, int piece_sb) {
+    const int sb0 = SPLIT ? blockIdx.z * piece_sb : 0;
+    const int nsb = SPLIT ? min(K / 32, sb0 + piece_sb) - sb0 : K / 32;
+    if (SPLIT && nsb <= 0) return;
     const int mt = blockIdx.x;
     const int t0 = blockIdx.y * BN;
     const int ntok = min(BN, T - t0);
@@ -427,10 +434,10 @@ __global__ void __launch_bounds__(NTHR, 2)
     const int tid = threadIdx.x;
     const int wrow = tid >> 1, hh = tid & 1;
     const int nrow = min(mt * BM + wrow, N - 1);
-    const __half* wp = W + (size_t) nrow * K + 8 * hh;
+    const __half* wp = W + (size_t) nrow * K + sb0 * 32 + 8 * hh;
     const int xr = tid >> 2, xc = tid & 3;
     const bool xok = xr < ntok;
-    const __half* xp = X + (int64_t) (t0 + min(xr, ntok - 1)) * ldx + 4 * xc;
+    const __half* xp = X + (int64_t) (t0 + min(xr, ntok - 1)) * ldx + sb0 * 32 + 4 * xc;
     const int xs = xr ^ (xc << 3);
     const int tx = tid & 15, ty = tid >> 4;
     const bool active = (tid >> 5) * 8 < ntok;
@@ -467,7 +474,6 @@ __global__ void __launch_bounds__(NTHR, 2)
     };
     const auto Wv = reinterpret_cast<const uint4 (*)[BK / 2][WPAD / 4]>(&Ws[0][0][0]);
     const auto Xv = reinterpret_cast<const uint4 (*)[BK / 2][BN / 4]>(&Xs[0][0][0]);
-    const int nsb = K / 32;
     uint4 wc1;
     put_w(0, ldw(0));
     wc1 = ldw(16);
@@ -504,9 +510,28 @@ __global__ void __launch_bounds__(NTHR, 2)
         if (t >= ntok) continue;
         float* d = Y + (int64_t) (t0 + t) * ldy + mt * BM;
         const int c0 = mt * BM + tx * 4, c1 = mt * BM + BM / 2 + tx * 4;
-        if (c0 + 3 < N) *(float4*) (d + tx * 4) = make_float4(acc32[0][j], acc32[1][j], acc32[2][j], acc32[3][j]);
-        if (c1 + 3 < N) *(float4*) (d + BM / 2 + tx * 4) = make_float4(acc32[4][j], acc32[5][j], acc32[6][j], acc32[7][j]);
+        if (SPLIT) {
+            // two pieces: 0 + a is exact and a + b == b + a, so the sum does not depend on the order they land in
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                if (c0 + 3 < N) atomicAdd(d + tx * 4 + i, acc32[i][j]);
+                if (c1 + 3 < N) atomicAdd(d + BM / 2 + tx * 4 + i, acc32[4 + i][j]);
+            }
+        } else {
+            if (c0 + 3 < N) *(float4*) (d + tx * 4) = make_float4(acc32[0][j], acc32[1][j], acc32[2][j], acc32[3][j]);
+            if (c1 + 3 < N) *(float4*) (d + BM / 2 + tx * 4) = make_float4(acc32[4][j], acc32[5][j], acc32[6][j], acc32[7][j]);
+        }
     }
+}
+
+// K pieces for a dense product by its tile grid (0: cuBLAS keeps it).  A P100 holds 112 blocks (56 SMs x 2).  Measured
+// for K 512..8192, cuBLAS 3.0-3.5 TMAC/s: two pieces win under 81 tiles (about one block an SM) and from 113 to 139 (a
+// short second wave); one piece wins from 81 to 112 (one wave) and from 140.  Under 20 tiles cuBLAS stays ahead.
+int grid_pieces(const Dense& d) {
+    const int64_t tiles = ((d.n + BM - 1) / BM) * ((d.t + BN - 1) / BN);
+    if (tiles < 20) return 0;
+    if (d.k >= 1024 && (tiles <= 80 || (tiles >= 113 && tiles <= 139))) return 2;   // (a shorter K gains nothing)
+    return tiles >= 30 ? 1 : 0;
 }
 
 }  // namespace
@@ -600,13 +625,28 @@ bool dense_usable(const Dense& d) {
         cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
         if (major * 10 + minor >= 61) return false;
     }
-    return ((d.n + BM - 1) / BM) * ((d.t + BN - 1) / BN) >= 160;   // (2 blocks an SM: 112 on a P100)
+    return grid_pieces(d) > 0;
 }
 
 void dense_run(const Dense& d, void* stream) {
-    const dim3 grid((unsigned) ((d.n + BM - 1) / BM), (unsigned) ((d.t + BN - 1) / BN));
-    dense_gemm_h<<<grid, NTHR, 0, (cudaStream_t) stream>>>((const __half*) d.w, (int) d.n, (int) d.k, (const __half*) d.x,
-                                                           d.ld_x, d.y, d.ld_y, (int) d.t);
+    const cudaStream_t s = (cudaStream_t) stream;
+    const int groups = ((int) (d.k / 32) + 7) / 8;   // (flush groups of 256 values of K)
+    const int pieces = std::min(d.pieces > 0 ? std::min(d.pieces, 2) : std::max(grid_pieces(d), 1), groups);
+    const dim3 grid((unsigned) ((d.n + BM - 1) / BM), (unsigned) ((d.t + BN - 1) / BN), (unsigned) pieces);
+    if (pieces > 1) {
+        // the two pieces add into y: zero its [t][n] slice first
+        const cudaError_t em =
+            cudaMemset2DAsync(d.y, (size_t) d.ld_y * sizeof(float), 0, (size_t) d.n * sizeof(float), (size_t) d.t, s);
+        if (em != cudaSuccess) {
+            std::fprintf(stderr, "prefill pascal dense: %s\n", cudaGetErrorString(em));
+            std::exit(1);
+        }
+        dense_gemm_h<true><<<grid, NTHR, 0, s>>>((const __half*) d.w, (int) d.n, (int) d.k, (const __half*) d.x, d.ld_x, d.y,
+                                                 d.ld_y, (int) d.t, 8 * ((groups + pieces - 1) / pieces));
+    } else {
+        dense_gemm_h<false><<<grid, NTHR, 0, s>>>((const __half*) d.w, (int) d.n, (int) d.k, (const __half*) d.x, d.ld_x, d.y,
+                                                  d.ld_y, (int) d.t, 0);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "prefill pascal dense: %s\n", cudaGetErrorString(e));
