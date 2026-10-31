@@ -3242,20 +3242,26 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
         env = {**hip_env, **env}
     if env:
         cfg["env"] = env
+    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
+    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
+    old_cfg = read_json(cfg_path)
+    # the server's own settings from the config before (the address it listens on, its API key, ...): kept, as the
+    # DeepSeek, MiniMax and Qwen setups keep them - a GLM setup run again dropped them; --host / --api-key given now win
+    for k in ("host", "api_key", "cors_origins", "mcp_servers"):
+        if old_cfg.get(k) is not None:
+            cfg[k] = old_cfg[k]
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
         cfg["api_key"] = a.api_key
     if vision:
         cfg["vision"] = vision
-    suffix = {"hip": "-hip", "metal": "-metal"}.get(pc.get("backend"), "")
-    cfg_path = ROOT / f"maya-{quant.lower()}{suffix}.json"
     cfg["log"] = str(cfg_path.with_suffix(".log"))
     local = choice[1] if choice and choice[0] == "local" else None   # (choose_model's answer)
     if PROFILE.exists() and profile_fits(pack):
         cfg["args"] += ["--expert-profile", str(PROFILE)]
     if cfg_path.exists():
-        old = read_json(cfg_path).get("args") or []
+        old = old_cfg.get("args") or []
         kept = keep_args(old, cfg["args"],
                          ("--expert-cache", "--vram-reserve-mib", "--vram-reserve-later-mib", "--prefill",
                           "--parallel", "--expert-profile-save", "--expert-profile-save-every", "--kv-streaming",

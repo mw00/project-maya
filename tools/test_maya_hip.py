@@ -102,6 +102,21 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(cfg["exe"], str(self.root / "build-hip/maya"))
         self.assertNotIn("vision", cfg)
 
+    def test_config_again_keeps_the_servers_own_settings(self):
+        # a GLM setup run again dropped the config's host, API key, CORS origins and MCP servers (the DeepSeek, MiniMax
+        # and Qwen setups keep them): a PC set up for its network was back on 127.0.0.1 without a key
+        pc = {"backend": "hip", "gpus": [self.gpus[0]]}   # (what check_pc gives; the config's own settings are the point)
+        first = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data", None)
+        own = {"host": "0.0.0.0", "api_key": "k", "cors_origins": ["http://x"], "mcp_servers": {"m": {"url": "u"}}}
+        first.write_text(json.dumps({**maya.read_json(first), **own}))
+        again = maya.read_json(maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data",
+                                                 None))
+        self.assertEqual({k: again.get(k) for k in own}, own)
+        self.a.host, self.a.api_key = "127.0.0.1", "k2"   # given now: they win
+        again = maya.read_json(maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data",
+                                                 None))
+        self.assertEqual((again["host"], again["api_key"], again["cors_origins"]), ("127.0.0.1", "k2", ["http://x"]))
+
     def test_config_prompt_defaults_and_tuning_table(self):
         tables = self.root / "tools/hip"
         tables.mkdir(parents=True)
