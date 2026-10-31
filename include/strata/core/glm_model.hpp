@@ -21,6 +21,8 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm_dflash.hpp"
+#include "strata/core/glm_pages.hpp"
+#include "strata/core/glm_prefix.hpp"   // Task 3.2: the store's block IDs (the members' type)
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/sampler.hpp"
@@ -28,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <condition_variable>
 #include <functional>
@@ -94,6 +97,41 @@ struct Glm5Geometry {
 
 class Glm5Model {
 public:
+    // Task 2.1: dynamic acquire/release - STRATA_GLM_SEQS is a CAP, not a reservation.  seq_
+    // stays pre-sized to the cap at load (slot 0 is the load-time alias, the others park with
+    // null pointers until seq_acquire), so the destructor's per-pointer sweep needs no edit for
+    // the state/snapshot/KDA pointers; the pipeline buffers moved into ONE reusable pool
+    // (seq_hop_slot), which the destructor frees whole instead of per slot.
+    int seq_acquire();                    // allocates on demand (free-list first); -1 past the cap
+    bool seq_live(int s) const;           // the slot's own buffers live (on every part)
+    bool seq_ready(int64_t want) const;   // one more sequence fits: the free list, the ctx, the VRAM
+    int seq_release_all(int s);           // every part releases the slot; the parts that parked it
+    int pages_sweep_idle();               // the pool-pages rung: every refcount-0 page back
+    bool seq_release(int s);              // frees the sequence's own buffers, parks the slot (the
+                                          // answer: whether anything was freed - the park guard)
+    // Task 4.1: dynamic slots + eviction - the scheduler's primitives.  The driver binds
+    // without acquire (generate.cpp's bind_ctx), so the bind IS the acquire: seq_bind pops the
+    // free list when it allocates a parked slot, and seq_release parks exactly once (a second
+    // release frees nothing and pushes nothing twice) and drops the slot's snapshot position
+    // (a parked slot advertises no snapshot: its snapshot pair is freed).  seq_live is the
+    // slot's pointer truth over every part of the split; seq_release_all is the split's bulk
+    // form (the pressure ladder's eviction); seq_ready is the admission check (a free-list
+    // slot, its parked context holds the want, and the slot's own bytes fit the device's free
+    // VRAM on every part); pages_sweep_idle is the ladder's pool-pages rung (every refcount-0
+    // page back, the capture's allocator lock held).
+    size_t state_bytes_outstanding() const { return seq_bytes_outstanding_; }
+    bool seq_layout_matches() const;      // the acquired layout matches load_pack's check
+    bool seq_acquire_past_cap();          // acquiring past the cap fails cleanly (and undoes itself)
+    bool seq_parked_slots_null() const;   // the destructor-sweep invariant, its own require in the test
+    std::vector<int> seq_free_;           // parked / never-acquired slot indices
+    size_t seq_bytes_outstanding_ = 0;    // live per-sequence device bytes
+    // the load-time captures (seq_alloc_arenas): the sizing anchors every later acquire re-runs
+    size_t seq_state_bytes_ = 0;          // one sequence's arena bytes (slot 0's own layout)
+    int64_t seq_ctx_ = 0;                 // the parked slots' ctx (STRATA_GLM_SEQ_CTX at load)
+    size_t seq_snap_n_rec_bytes_ = 0;     // one sequence's snapshot bytes (the recurrent run)
+    size_t seq_snap_pool_bytes_ = 0;      // ... and its open key pool
+    void* seq_hop_pool_ = nullptr;        // one cap-sized reusable pinned pipeline-buffer pool
+    size_t seq_hop_slot_bytes_ = 0;
     Glm5Model() = default;
     ~Glm5Model();
     Glm5Model(const Glm5Model&) = delete;
@@ -323,6 +361,14 @@ private:
 
     // per-layer state offsets, in floats into state_ (-1: the layer has no such state)
     std::vector<int64_t> kda_S_, kda_conv_, dsa_lat_, dsa_ik_, dsa_ig_, dsa_pool_;
+
+    // Task 1.3: the latent page pool (STRATA_GLM_PAGED, default OFF) and the bound sequence's
+    // page table: NULL = incumbent absolute rows (byte-identical), else the pool's device
+    // identity table for now; per-sequence non-identity tables land with the kernel work.
+    GlmPages lat_pages_;
+    int32_t* lat_table_ = nullptr;
+    // the pool's row capacity (the cells route's OOB guard; 0 while the pool is off)
+    int32_t lat_max_rows() const { return lat_pages_.n_pages() * lat_pages_.page_size(); }
 
 public:
     // ---- per-weight serving slots (strata::core::WSlot below): F32 pointers for the
@@ -781,6 +827,7 @@ public:
     // The pipelined decode issues a token of one sequence through every part without waiting, so with n sequences in
     // flight each part works on a different one (a layer split's cards no longer wait for each other).
     struct SeqCtx {
+        int32_t* lat_table = nullptr;   // Task 1.3: this sequence's latent page table (NULL = incumbent absolute rows, STRATA_GLM_PAGED off)
         float* state = nullptr;
         int64_t pos = 0, snap_pos = -1;
         // its own context (STRATA_GLM_SEQ_CTX: the extra sequences can be smaller than the first) and so its own
@@ -789,6 +836,14 @@ public:
         uint64_t bytes = 0;
         int ik_ring = 0;
         std::vector<int64_t> kda_S, kda_conv, dsa_lat, dsa_ik, dsa_ig, dsa_pool;
+        // the shared row-addressing helper: the page-table indirection the
+        // parity test pins (the per-sequence table pointer above is what the
+        // engine routes through; Task 1.2's process-shared statics retired)
+        static size_t lat_row_offset(const int* table, int page, size_t row_bytes, int t) {
+            if (!table) return (size_t) t * row_bytes;
+            return (size_t) table[(size_t) t / (size_t) page] * ((size_t) page * row_bytes)
+                   + (size_t) (t % page) * row_bytes;
+        }
         float *snap = nullptr, *snap_pool = nullptr, *kda_bak = nullptr;
         int last_tok = -1;
         std::vector<int64_t> img_pos;
@@ -810,6 +865,13 @@ public:
     void seq_bind_all(int s);                              // every part of the split
     bool seq_alloc_arenas(std::string& err);               // load: the extra arenas (STRATA_GLM_SEQS), before the pool
     uint64_t seq_layout(int64_t ctx, SeqCtx& c) const;     // load_pack's arena layout for a context of ctx tokens
+    // Task 2.1: the lazy lifecycle's helpers (the load-time anchors + the pooled pipeline buffers)
+    size_t seq_arena_bytes() const;                        // the per-sequence arena bytes (the load-time capture)
+    size_t seq_snap_bytes(const SeqCtx& c) const;          // the snapshot pair's bytes (the load-time capture)
+    void* seq_hop_slot(int s);                             // the slot in the cap-sized reusable pipeline-buffer pool
+    bool seq_alloc_slot(int s);                            // one parked slot's on-demand allocation (shared by acquire/bind)
+    size_t seq_bytes_reserved_ = 0;                        // the cap's parked bytes (the cap's true accounting; the sizing subtracts seq_bytes_floor_)
+    size_t seq_bytes_floor_ = 0;                           // Task 4.1 amendment: the guaranteed states' bytes (the pool sizing subtracts this; the ladder arbitrates the cap's tail)
     int64_t seq_max_ctx(int s) const {                     // a sequence's context (the bound one's is max_ctx_)
         return seq_.empty() || s == cur_seq_ ? max_ctx_ : seq_[(size_t) s].max_ctx;
     }
@@ -897,6 +959,58 @@ public:
     RowsState* rows_ = nullptr;
     bool rows_alloc(std::string& err);                     // load, several sequences on one GPU: before the pool
     void rows_destroy();
+
+    // ---- Task 3.2: the prefix cache (the intake lookup + LRU eviction).  The store lives in
+    // src/core/glm_multi.cu (one process-wide store + registry): a block = a page-aligned prompt
+    // span (or the head's partial end), its canonical rows in the pool's slab pages (per part,
+    // one page per DSA layer) and its boundary state (the KDA runs + the pooled rows + the open
+    // ik/ig pool, the slot_save regions) as host copies.  The intake looks a request's blocks up
+    // by their tokens' key, verifies the full-content ID, refcounts hits and ADOPTS the canonical
+    // state into the sequence's arena (the identity table keeps the incumbent addresses, so the
+    // adopt is byte-identical by construction); the prefill then runs only the tail.  evict_lru
+    // runs under pool pressure only (page_alloc's sweep); the store reconciles blocks whose
+    // canonical pages died.
+    size_t prefix_intake(const std::vector<int32_t>& prompt);
+    bool prefix_apply(const std::vector<int32_t>& prompt, size_t skip, std::string& err);
+    bool prefix_register(int64_t start_pos, const std::vector<int32_t>& tail, std::string& err);
+    void prefix_release();
+    void prefix_capture_part(int64_t boundary, int64_t chunk_start, int64_t pos_start);   // one part's share at a chunk end
+    void prefix_finalize(const std::vector<int32_t>& tokens, int64_t pos_start, int64_t prompt_end, bool final);  // the store's entries from the pending captures
+    // the content-ID staging (the tokens + every part's canonical bytes) + the row
+    // bytes (the FP16 latent takes half a float each, INT8 records lat8_rec_bytes/4)
+    static strata::prefix::BlockId prefix_content_hash(const std::vector<int32_t>& toks,
+                                                       const std::vector<std::vector<int32_t>>& pages,
+                                                       const std::vector<Glm5Model*>& chain,
+                                                       int64_t tile_rows,
+                                                       const std::vector<int64_t>& row_bytes);
+    static int64_t prefix_row_bytes(const Glm5Model* m);
+    int64_t prefix_base_ = 0;           // the intake's skip (the arena is prompt-aligned, so
+                                        // the capture's tile base stays 0; this records the skip)
+    std::vector<strata::prefix::BlockId> prefix_refs_;   // this request's refcounts (prefix_release drops them)
+    std::vector<strata::prefix::BlockId> prefix_chain_;  // the intake's verified chain (the apply's walk)
+
+    // ---- Task 4.2: the PAUSE path's registry-owned snapshots (src/core/glm_multi.cu).  A paused
+    // request's state (the KDA runs + the open ik/ig pool + the pooled sums + the latent rows
+    // [0, pos) through the bound table) packs D2D into refcounted pool pages (the Task 3.3
+    // carriage), so the pages survive every pressure sweep and the conversation resumes from
+    // them even after the ladder parked the slot (the incumbent pair dies at the park).  The
+    // registry is off = the pool off or STRATA_GLM_NO_PREFIX: the incumbent snap_/snap_pool_
+    // pair is the only path (unchanged).  The capture's room (Task 4.2 step 3): the packer's
+    // free+idle pages first; the tile store's refcount-0 entries evict LRU-first to cover the
+    // shortfall; a still-short pool refuses with numbers.  pause_resume answers the restored
+    // position (0: no
+    // match); span_out takes the capture's token span (the driver's snap_tokens record).
+    bool pause_capture(const int32_t* tokens, int n);       // the bound slot's state at PAUSE
+    int64_t pause_resume(const std::vector<int32_t>& prompt, std::vector<int32_t>& span_out);
+    void pause_release(const std::vector<int32_t>& span);   // the resume's dedupe + the STOP path
+    void pause_release_all();   // the destructor's: every entry this engine owns drops
+    static std::vector<char> pause_state_bytes(const Glm5Model& m);   // the selftest's byte-compare helper
+    static bool glm_pause_snapshots_selftest(const std::string& pack, int* checks, int* failures);
+    // the capture's room answer (Task 4.2 step 3): the tile store's refcount-0
+    // entries evict LRU-first to cover the shortfall; the answer is the pages
+    // freed.  Static member: the free-function form cannot reach lat_pages_.
+    static int64_t pause_evict_tiles_for(const std::vector<Glm5Model*>& chain, size_t part,
+                                         int64_t shortfall);
 
     // ---- the verify window (src/core/glm_window.cu)
     static constexpr int kWinMax = 16;                     // its tokens at most (gf::kMaxMvCols)

@@ -393,6 +393,9 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         d.kv_raw = W.kv_raw + (size_t) t * g.kv_lora;
         d.kv_norm = Ly.kv_a_norm;
         kv_prep_targets(kv_, il, (uint16_t*) (state_ + dsa_lat_[(size_t) il]), d);   // (KV streaming: + host copy)
+        d.paged_lat_table = lat_table_;   // Task 1.3: NULL when STRATA_GLM_PAGED is off
+        d.paged_page_rows = lat_pages_.page_size();
+        d.paged_max_rows = lat_max_rows();
         d.kv_lora = g.kv_lora;
         d.lat_q8 = lat_q8_;
         d.ik_raw = W.ik_raw + (size_t) t * g.idx_key;
@@ -455,7 +458,8 @@ bool Glm5Model::fast_dsa_window(int il, int64_t p0, int t0, int T, std::string& 
         const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
         int* const sel = rows ? W.cells + (size_t) (t - t0) * nsm : F->cells;
         if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
-        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
+        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s, lat_table_,
+                            lat_pages_.page_size(), lat_max_rows());
         if (rows) {
             nsel.push_back(n_sel);
             continue;

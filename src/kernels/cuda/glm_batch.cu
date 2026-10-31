@@ -452,6 +452,26 @@ __global__ void __launch_bounds__(128) kda_out_kernel(const float* __restrict__ 
 }
 
 // ---------------------------------------------------------------- DSA
+// Task 1.3: logical row -> physical row through the sequence's latent page table (NULL table or
+// page_rows <= 0 = incumbent absolute rows; the identity table maps row -> row unchanged).
+__device__ __forceinline__ int lat_row_page(const int32_t* table, int page_rows, int row) {
+    if (table == nullptr || page_rows <= 0) return row;
+    const int pg = row / page_rows;
+    return table[pg] * page_rows + row - pg * page_rows;
+}
+// Task 1.3: the mla read path routes through the same table: the cells buffer holds LOGICAL
+// token positions, so the launcher translates it in place before the kernel (the buffer is
+// per-step scratch, rewritten by dsa_select; a NULL table or a 0 cap skips the launch).
+// NOTE: STRATA_GLM_PREFILL_ATTN_CHECK's second launch reuses the routed cells (idempotent
+// under identity; non-identity re-route lands with P3's reorder work).
+__global__ void lat_route_cells_kernel(int32_t* cells, long n, const int32_t* table, int page_rows,
+                                       int max_row) {
+    const long i = (long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && cells[i] >= 0 && cells[i] < max_row) {
+        const int pg = cells[i] / page_rows;
+        cells[i] = table[pg] * page_rows + cells[i] - pg * page_rows;
+    }
+}
 // value c of a latent row y into row `row` of a cache (FP16 rows, or INT8 records written by whole warps)
 __device__ __forceinline__ void lat_put(uint16_t* lat, int row, float y, bool q8, int kv_lora, int c) {
     if (q8) {
@@ -496,7 +516,7 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const DsaPrepArgs a) {
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
             const float y = v * inv * a.kv_norm[tid];
-            if (a.lat != nullptr) lat_put(a.lat, p, y, a.lat_q8, a.kv_lora, tid);
+            if (a.lat != nullptr) lat_put(a.lat, lat_row_page(a.paged_lat_table, a.paged_page_rows, p), y, a.lat_q8, a.kv_lora, tid);
             if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
                 lat_put(a.lat_host, p, y, a.lat_q8, a.kv_lora, tid);
                 const int sl = a.lat_table[p / a.lat_page];
@@ -2413,9 +2433,13 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
 }
 
 void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_pools_max, int tail, int T,
-                int n_sel_max, int* cells, int* n_sel, cudaStream_t s) {
+                int n_sel_max, int* cells, int* n_sel, cudaStream_t s, const int32_t* paged_lat_table,
+                int paged_page_rows, int paged_max_rows) {
     if (T <= 0) return;
     dsa_select_kernel<<<T, 1024, 0, s>>>(score, score_ld, p0, kpool, top_pools_max, tail, n_sel_max, cells, n_sel);
+    if (paged_lat_table != nullptr && paged_page_rows > 0)   // Task 1.3: logical cells -> physical rows
+        lat_route_cells_kernel<<<(int) (((long long) T * n_sel_max + 255) / 256), 256, 0, s>>>(
+            cells, (long long) T * n_sel_max, paged_lat_table, paged_page_rows, paged_max_rows);
     check("dsa_select");
 }
 

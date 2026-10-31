@@ -81,6 +81,12 @@ struct DsaPrepArgs {
     int ring = 1 << 30;   // the ik / ig caches hold positions modulo ring (a multiple of kpool)
     int p0 = 0, T = 0;
     float eps = 1e-5f;
+    // Task 1.3: the latent page table routing (NULL = incumbent absolute rows; the launchers'
+    // route helper maps the write's logical row to the page table's physical row).  "paged_"
+    // renamed in the port: upstream's KV streaming (glm_kv_stream.hpp) owns the plain names.
+    const int32_t* paged_lat_table = nullptr;
+    int paged_page_rows = 0;
+    int paged_max_rows = 0;   // the pool's row capacity (the cells route skips entries past it)
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 /// The pooled keys of pools [pool0, pool0 + n) (their cells all in the caches, positions modulo ring).
@@ -90,9 +96,11 @@ void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, fl
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int p0, int kpool,
                int T, int max_vis, float* score, int score_ld, cudaStream_t s);
 /// Per token: the top pools (all of them while they fit; else the stable top-k of the scores) as cells, then the
-/// tail cells - cells[t][0 .. n_sel[t]), -1 = masked; rows of n_sel_max.
+/// tail cells - cells[t][0 .. n_sel[t]), -1 = masked; rows of n_sel_max.  Task 1.3: paged_lat_table routes the
+/// cells through the sequence's latent page table (logical token position -> physical row; NULL = incumbent).
 void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_pools_max, int tail, int T,
-                int n_sel_max, int* cells, int* n_sel, cudaStream_t s);
+                int n_sel_max, int* cells, int* n_sel, cudaStream_t s, const int32_t* paged_lat_table = nullptr,
+                int paged_page_rows = 0, int paged_max_rows = 0);
 #if defined(STRATA_USE_HIP)
 /// The same attention with Q in FP16 ([T][n_head][512]) on the WMMA units (rocWMMA, RDNA3/RDNA4): FP16 operands, F32
 /// accumulation and softmax.  n_head % 16 == 0, kv_lora 512.

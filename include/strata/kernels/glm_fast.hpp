@@ -182,6 +182,12 @@ struct DsaPrepArgs {
     int ring = 1 << 30;   // the ik / ig caches hold positions modulo ring (a multiple of kpool)
     int p = 0;
     float eps = 1e-5f;
+    // Task 1.3: the latent page table routing (NULL = incumbent absolute rows; the launchers'
+    // route helper maps the write's logical row to the page table's physical row).  "paged_"
+    // renamed in the port: upstream's KV streaming (glm_kv_stream.hpp) owns the plain names.
+    const int32_t* paged_lat_table = nullptr;
+    int paged_page_rows = 0;
+    int paged_max_rows = 0;   // the pool's row capacity (the cells route skips entries past it)
 };
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 /// score[p] = sum_h relu(iq_h . pooled_p) * iw_h for the n_pools completed pools.
@@ -191,8 +197,11 @@ void dsa_prep(const DsaPrepArgs& a, cudaStream_t s);
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
                float* score, cudaStream_t s, bool token = false);
 /// The stable top-k of the pools (ties by lower index) expanded to cells, then the tail cells.
+/// Task 1.3: paged_lat_table routes the cells through the sequence's latent page table (logical token
+/// position -> physical row; NULL = incumbent).
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
-                cudaStream_t s);
+                cudaStream_t s, const int32_t* paged_lat_table = nullptr, int paged_page_rows = 0,
+                int paged_max_rows = 0);
 /// dsa_score of up to kMaxMvNt rows of different sequences (the batched rows) in one launch: row r's query, pools,
 /// weights, scores and pool count as dsa_score's arguments - each row's scores dsa_score's
 struct DsaScoreRows {

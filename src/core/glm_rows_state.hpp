@@ -64,6 +64,7 @@ struct Glm5Model::RowSeq {
     int ring = 0;
     const std::vector<int64_t> *kda_S = nullptr, *kda_conv = nullptr, *dsa_lat = nullptr, *dsa_ik = nullptr,
                                *dsa_ig = nullptr, *dsa_pool = nullptr;
+    const int32_t* lat_table = nullptr;   // Task 1.3: this row's latent page table (NULL = incumbent)
     const float* img = nullptr;
     const KvStream* kv = nullptr;   // KV streaming: that sequence's stream (null: not streamed)
     // the residual pair's base: the sequence's arena start (rows_bind), a verify window's row its own pair

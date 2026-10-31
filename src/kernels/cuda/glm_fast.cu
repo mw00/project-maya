@@ -2872,6 +2872,22 @@ __device__ __forceinline__ uint16_t lat_h(float v) { return __half_as_ushort(__f
 __device__ __forceinline__ float lat8_f(const uint8_t* rec, int kv_lora, int c) {
     return (float) ((const int8_t*) rec)[c] * __half2float(((const __half*) (rec + kv_lora))[c >> 5]);
 }
+// Task 1.3: logical row -> physical row through the sequence's latent page table (NULL table or
+// page_rows <= 0 = incumbent absolute rows; the identity table maps row -> row unchanged).
+__device__ __forceinline__ int lat_row_page(const int32_t* table, int page_rows, int row) {
+    if (table == nullptr || page_rows <= 0) return row;
+    const int pg = row / page_rows;
+    return table[pg] * page_rows + row - pg * page_rows;
+}
+// Task 1.3: the cells route for the fast path's one-token select (dsa_select's launcher).
+__global__ void lat_route_cells1_kernel(int32_t* cells, int n, const int32_t* table, int page_rows,
+                                        int max_row) {
+    const int i = (int) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n && cells[i] >= 0 && cells[i] < max_row) {
+        const int pg = cells[i] / page_rows;
+        cells[i] = table[pg] * page_rows + cells[i] - pg * page_rows;
+    }
+}
 // latent value c of cell: FP16 rows or INT8 records
 __device__ __forceinline__ float lat_any(const uint16_t* lat, bool q8, int kv_lora, int cell, int c) {
     return q8 ? lat8_f((const uint8_t*) lat + (size_t) lat8_rec_bytes(kv_lora) * cell, kv_lora, c)
@@ -2925,7 +2941,7 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTAN
         const float inv = rsqrtf(ss / (float) a.kv_lora + a.eps);
         if (tid < a.kv_lora) {   // (kv_lora % 32 == 0: whole warps)
             const float y = v * inv * a.kv_norm[tid];
-            if (a.lat != nullptr) lat_put(a.lat, a.p, y, a.lat_q8, a.kv_lora, tid);
+            if (a.lat != nullptr) lat_put(a.lat, lat_row_page(a.paged_lat_table, a.paged_page_rows, a.p), y, a.lat_q8, a.kv_lora, tid);
             if (a.lat_host != nullptr) {   // KV streaming: the host copy, and the block's VRAM slot when it is resident
                 lat_put(a.lat_host, a.p, y, a.lat_q8, a.kv_lora, tid);
                 const int sl = a.lat_table[a.p / a.lat_page];
@@ -6226,8 +6242,11 @@ void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cu
 }
 
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
-                cudaStream_t s) {
+                cudaStream_t s, const int32_t* paged_lat_table, int paged_page_rows, int paged_max_rows) {
     dsa_select_kernel<<<1, 1024, 0, s>>>(score, n_vis, kpool, top_pools, n_sel, pos, cells);
+    if (paged_lat_table != nullptr && paged_page_rows > 0)   // Task 1.3: logical cells -> physical rows
+        lat_route_cells1_kernel<<<(n_sel + 255) / 256, 256, 0, s>>>(cells, n_sel, paged_lat_table,
+                                                                    paged_page_rows, paged_max_rows);
     launch_check("dsa_select");
 }
 

@@ -30,6 +30,10 @@
 #include "strata/core/glm_split_devices.hpp"
 
 #include "ggml.h"
+// Task 2.1: the load no longer reserves a per-sequence arena eagerly; seq_ stays pre-sized to
+// the cap with every slot's pointers null until seq_acquire (glm_multi.cu), so the destructor's
+// per-pointer sweep below stays valid unchanged.  The per-sequence byte size the acquire path
+// re-runs is captured here next to the pre-sizing.
 
 #include <cuda_runtime.h>
 
@@ -622,6 +626,10 @@ bool Glm5Geometry::from_gguf(const strata::GgufFile& g, Glm5Geometry& out, std::
 
 Glm5Model::~Glm5Model() {
     ckpt_join();
+    // Task 4.2: the pause store's entries never outlive their owner (the pages
+    // are this instance's slab): the destructor drops this engine's entries
+    // (the driver holds one engine per process, so production is unaffected)
+    pause_release_all();
     if (split_next_) split_next_.reset();   // the tail half first (its service thread, its device)
     cudaSetDevice(dev_);   // every free below belongs to this half's device
     if (!seq_.empty()) {   // STRATA_GLM_SEQS: sequence 0 goes back to the members (freed below), the others here
@@ -633,9 +641,15 @@ Glm5Model::~Glm5Model() {
                     if (d) cudaFree(d);
                 kv_stream_free(c.kv);   // (sequence 0's is kv_, freed below)
             }
-            if (c.hop_h) cudaFreeHost(c.hop_h);
-            if (c.emb_h) cudaFreeHost(c.emb_h);
-            if (c.tok_h) cudaFreeHost(c.tok_h);
+            // Task 2.1: the pipeline buffers are carvings of ONE reusable pool (seq_hop_pool_),
+            // not per-slot cudaHostAllocs: they free with the pool below, not per slot
+        }
+        if (seq_hop_pool_) {   // the pool is portable pinned RAM: one free for every slot
+            cudaFreeHost(seq_hop_pool_);
+            seq_hop_pool_ = nullptr;
+        }
+        for (size_t s = 0; s < seq_.size(); ++s) {
+            SeqCtx& c = seq_[s];
             if (c.ev_hop) cudaEventDestroy(c.ev_hop);
             if (c.ev_done) cudaEventDestroy(c.ev_done);
         }
@@ -644,6 +658,8 @@ Glm5Model::~Glm5Model() {
     rows_destroy();
     mtpw_destroy();
     fast_destroy();
+    lat_pages_.shutdown();   // Task 1.3: free the latent pool slab + device tables (no-op when never inited)
+    lat_table_ = nullptr;
     pen_free();
     if (!stage_workers_.empty()) {
         // stop the staging pool: without this the workers block in stage_cv_ forever and the
@@ -2075,9 +2091,10 @@ bool Glm5Model::step_issue(int32_t token, int64_t& p, std::string& err) {
         float* const A = sc_;
         float* R = S;   // the residual stack lives at the state arena's head
         float* emb = A + sc_emb;
-        if (pack_) {
+        if (pack_ && pack_emb_src_ != nullptr) {
             // the pack keeps token_embd QUANTIZED (2.2 GB of F32 the expert pool gets instead): the
             // one row this token needs is dequantized from the host mapping with ggml's own traits
+            // (the guard: the multi-seq paths set pack_ with the src unmapped; incumbent: fall back)
             static std::vector<float> emb_host;
             emb_host.resize((size_t) g.n_embd);
             const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
@@ -2382,7 +2399,16 @@ bool Glm5Model::step_layers(int64_t p, std::string& err) {
             if (pack_) {
                 // the routed experts ride the native path (quantized blobs, per-token);
                 // docs/GLM5-FLASH.md §9 - device pool with LRU (M2b), CPU native fallback
-                if (dev_experts_) {
+                // The synthetic BF16 pack can fit a device pool when the GPU is empty,
+                // but native_expert_grouped only accepts these quantized type codes.
+                // Without the guard it calls std::exit(1) for gate/up type 0. The
+                // CPU native path below handles the BF16 fixture in either geometry.
+                const int gu = pack_layers_[(size_t) il].fmt.gu_type;
+                const int dn = pack_layers_[(size_t) il].fmt.d_type;
+                const bool gu_gpu = gu == 16 || gu == 17 || gu == 18 || gu == 19 ||
+                                    gu == 21 || gu == 22 || gu == 23 || gu == 29 || gu == 42;
+                const bool dn_gpu = dn == 18 || dn == 20 || dn == 23 || dn == 42;
+                if (dev_experts_ && gu_gpu && dn_gpu) {
                     if (!pack_moe_tail_device(err, ids, rw, A, il)) return false;
                 } else {
                     GM_CHECK(pack_moe_tail(err, ids, rw, A, il), err);
@@ -3438,7 +3464,28 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     state_bytes_ = (uint64_t) floats * sizeof(float);
     { cudaError_t e_ = cudaMalloc(&state_, state_bytes_); if (e_ != cudaSuccess) { err = std::string("pack: ") + cudaGetErrorString(e_); return false; } }
     if (kv_cells > 0 && !kv_stream_setup(kv_cells, err)) return false;
-    if (fast_mode_ && !seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
+    // Task 2.1: the cap is a cap in BOTH paths (the slow path's lifecycle test runs here); with
+    // the default STRATA_GLM_SEQS=1 this parks nothing and reserves no bytes
+    if (!seq_alloc_arenas(err)) return false;   // STRATA_GLM_SEQS: before the expert pool takes the rest
+    // Task 1.3: the latent page pool (STRATA_GLM_PAGED, default OFF), constructed after the seq
+    // arenas and before the expert pool sizing so its VRAM is accounted first; with the
+    // identity table the pool's slab holds rows at the incumbent addresses (byte-identical).
+    if (const char* pg = getenv("STRATA_GLM_PAGED"); pg != nullptr && pg[0] != '\0' && pg[0] != '0') {
+        const int32_t bytes_per_token = (g_.kv_lora * (lat_q8_ ? 1 : 2) + 31) / 32 * 32
+                                            + (lat_q8_ ? 32 : 0);
+        if (!lat_pages_.init(GlmPages::env_page_size(), GlmPages::env_pool_pages(bytes_per_token),
+                             bytes_per_token)) {
+            err = std::string("pages: the latent pool init failed (STRATA_GLM_PAGED)");
+            return false;
+        }
+        const int32_t blocks = (int32_t)((max_ctx_ + lat_pages_.page_size() - 1) / lat_pages_.page_size());
+        lat_table_ = blocks <= lat_pages_.n_pages() ? lat_pages_.table_ptr()   // the device identity table
+                                                    : nullptr;   // pool too small for full ctx: incumbent rows
+        for (SeqCtx& c : seq_) c.lat_table = lat_table_;   // every sequence starts identity (P3 reorders)
+        std::fprintf(stderr, "glm pages: %d page(s) x %d rows x %d B (identity table %s)\n",
+                     lat_pages_.n_pages(), (int) lat_pages_.page_size(), (int) bytes_per_token,
+                     lat_table_ ? "on" : "off");   // Task 3.2 Step 2's window diagnostic
+    }
 
     const int64_t ff_max = std::max<long long>({g_.n_ff_dense, (int64_t) g_.n_ff_exp * g_.n_shared});
     int64_t s = 0;
@@ -3540,7 +3587,11 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         size_t free_b = 0, total_b = 0;
         cudaMemGetInfo(&free_b, &total_b);
         const size_t reserve = (size_t) 1536 << 20;   // context growth + the driver's share
-        const size_t pool_avail = free_b > reserve ? free_b - reserve : 0;
+        // Task 2.1, amended (Task 4.1): the pool sizing subtracts the guaranteed states' floor
+        // (seq_bytes_floor_), not the full cap - the ladder + the wait gate arbitrate the cap's
+        // tail dynamically (glm_multi.cu's seq_alloc_arenas)
+        const size_t pool_avail = free_b > reserve + seq_bytes_floor_
+                                      ? free_b - reserve - seq_bytes_floor_ : 0;
         // STRATA_GLM_POOL_SLOTS0=n caps the pool at n largest-class-equivalent slots (debug/tuning)
         size_t pool_bytes_cap = pool_avail;
         if (const char* ps = getenv("STRATA_GLM_POOL_SLOTS0"))

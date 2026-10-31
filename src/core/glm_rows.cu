@@ -229,6 +229,7 @@ bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) 
             r.dsa_ik = &dsa_ik_;
             r.dsa_ig = &dsa_ig_;
             r.dsa_pool = &dsa_pool_;
+            r.lat_table = lat_table_;   // Task 1.3: NULL when STRATA_GLM_PAGED is off
             r.kv = kv_;
             r.img = image_row(r.p);
             max_ctx = max_ctx_;
@@ -243,6 +244,7 @@ bool Glm5Model::rows_bind(const int* seqs, int n, RowSeq* rw, std::string& err) 
             r.dsa_ik = &c.dsa_ik;
             r.dsa_ig = &c.dsa_ig;
             r.dsa_pool = &c.dsa_pool;
+            r.lat_table = c.lat_table;   // Task 1.3: the row's own sequence's table
             r.kv = c.kv;
             r.img = image_row_in(c.img_pos, c.img_rows, r.p, E);
             max_ctx = c.max_ctx;
@@ -494,6 +496,9 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
         d.kv_raw = rows(S->kv_raw, g.kv_lora, i);
         d.kv_norm = Ly.kv_a_norm;
         kv_prep_targets(rw[i].kv, il, (uint16_t*) (rw[i].state + (*rw[i].dsa_lat)[(size_t) il]), d);
+        d.paged_lat_table = rw[i].lat_table;   // Task 1.3: the row's own sequence's table (NULL = incumbent)
+        d.paged_page_rows = lat_pages_.page_size();
+        d.paged_max_rows = lat_max_rows();
         d.kv_lora = g.kv_lora;
         d.lat_q8 = lat_q8_;
         d.ik_raw = rows(S->ik_raw, g.idx_key, i);
@@ -584,7 +589,8 @@ bool Glm5Model::rows_dsa(int il, RowSeq* rw, int n, std::string& err) {
             continue;
         }
         if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, sel, s);
-        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s);
+        else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, sel, s, rw[i].lat_table,
+                            lat_pages_.page_size(), lat_max_rows());
         const int* cells = kv_attend_cells(rw[i].kv, il, lat, F->cells, n_sel, F->slot_cells, s);
         gf::mla(rows(S->q, qd, i), Ly.k_b, Ly.v_b, lat, cells, n_sel, g.n_head,
                 g.qk_nope, g.kv_lora, g.v_head, rows_q(S->attn_q, (int64_t) g.n_head * g.v_head, i), s,

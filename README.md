@@ -18,6 +18,17 @@ with <b><a href="https://github.com/needmorevram">@needmorevram</a></b></p>
 <a href="https://buymeacoffee.com/peasantsmith"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
 <sub>Project Maya is free. If it runs well on your PC, sponsoring it pays for the test hardware and the work on it.</sub></p>
 
+> ### About this fork (2026-10-28)
+>
+> Everything below is upstream Project Maya, untouched. This fork adds one change, submitted upstream as a pull request:
+>
+> **GLM paged attention and multi-sequence serving with prefix-aware scheduling.** [Clint Moody](https://github.com/ClintMoody) adapted GLM-5.3-Flash's latent cache to a page-pool and page-table layout, added per-sequence state and prefix sharing, and schedules several requests with admission and pressure management. It includes CUDA gather routing, parity tests for pages, prefixes and latent cache, and a synthetic dynamic-sequence test.
+>
+> - **Measured on the port build in isolated probe windows:** all concurrent probe requests (4- and 8-wide) completed with `finish_reason=stop`; a repeated-prefix probe reused 1,536 of 1,775 prompt tokens from the cache; the speculative-drafter path under concurrency stayed byte-identical to the serial MTP path and gained 12.5% aggregate throughput versus the incumbent pipelined reference in the same window.
+> - **Not production-validated:** with paging enabled, one of three temperature-zero canaries diverged in wording from the stock answer; sustained-load, long-context and error-path gates remain open. This is a research contribution, not a promoted default.
+> - Developed against upstream `v1.1.33` (`88a746c`); MIT license unchanged; upstream README untouched below this note.
+> - The paged-attention, multi-sequence serving and scheduler work is by Clint Moody; Project Maya and Strata retain all upstream credits and copyright notices.
+
 Models this size usually need a datacenter. Maya runs three of them on the hardware you already have:
 **GLM-5.3-Flash**, **DeepSeek-V4.1-Flash-1017** and **MiniMax-M3.1-Flash**. Each model has an engine built for it. It
 keeps the experts your conversation uses most on the GPU, the next ones in RAM and the rest on your NVMe SSD, and moves
