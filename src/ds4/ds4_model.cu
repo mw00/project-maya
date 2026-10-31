@@ -16828,7 +16828,16 @@ struct Model::Impl {
         }
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
-            if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+            static const bool flow_ar_dma = [] {
+                const char* on = ds4_env("DS4_FLOW_AR_DMA");
+                const char* wire = std::getenv("DS4_AR_F16");
+                return on != nullptr && std::atoi(on) != 0 && (wire == nullptr || std::atoi(wire) != 0);
+            }();
+            if (nm > 1) {
+                // The DMA helper uses the same FP16 sums; keep F32 and two-member reductions unchanged.
+                if (flow_ar_dma && nm > 2) chunk_allreduce(d, c, ab, mi, T * D, s);
+                else allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+            }
             ablate(d, c.acc, T, s);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
             CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
