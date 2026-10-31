@@ -27,6 +27,7 @@
 #include "strata/core/prefill_chunks.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/cuda_compat/pascal_gemm.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/kq_avx512.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -541,7 +542,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
                 blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, nff, n, E, &one,
                                      L.w16 + (size_t) r * nff * E, CUDA_R_16F, E, Xr, CUDA_R_16F, E, &zero,
                                      GU + (size_t) c0 * E + (size_t) r * nff, CUDA_R_32F, E,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                     CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                         "gemm exl3 gate/up");
             }
         }
@@ -554,7 +555,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
             x3::rows_rot_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, mat(2).suh, H16, s);
             blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff,
                                  H16, CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E,
-                                 CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                 CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                     "gemm exl3 down");
         }
         x3::rows_rot_out(GU, E, nrows, E, mat(2).svh, s);
@@ -568,7 +569,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
         x3::rows_f16(L.x, E, L.row_tok + r0 + a + c0, n, E, X16, s);
         blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, L.w16, CUDA_R_16F, E,
                              X16, CUDA_R_16F, E, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                             STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                 "gemm exl3 gate/up");
     }
     gb::swiglu_rows(GU, GU, nrows, nff, L.limit, s, 2 * nff);
@@ -579,7 +580,7 @@ void x3_run_blas(const X3Lane& L, const uint8_t* blob, int a, int nrows, int r0)
         x3::rows_f16(GU + (size_t) c0 * E, E, nullptr, n, nff, H16, s);
         blas_ck(cublasGemmEx(L.blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, L.w16, CUDA_R_16F, nff, H16,
                              CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                             CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                             STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                 "gemm exl3 down");
     }
 }
@@ -2272,7 +2273,8 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
 #endif
             const cublasStatus_t st = cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, n, Tn, Kd, &one, S->w16,
                                                    CUDA_R_16F, Kd, X16, CUDA_R_16F, ldx, &beta, Y + r0, CUDA_R_32F, ldy,
-                                                   CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                                                   CUBLAS_COMPUTE_32F,
+                                                   STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, Tn));
             gemm_fail(st, "gemm f16", S->w16, X16, Y + r0, n, Tn, Kd, Kd, ldx, ldy);
             blas_ck(st, "gemm f16");
         }
@@ -4067,7 +4069,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 x3::rows_f16(S->x, E, M.row_tok + r0 + a + c0, n, E, X16, s);
                 blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, 2 * nff, n, E, &one, S->w16, CUDA_R_16F, E,
                                      X16, CUDA_R_16F, E, &zero, G2 + (size_t) c0 * ldg, CUDA_R_32F, ldg,
-                                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                     CUBLAS_COMPUTE_32F, STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                         "gemm q gate/up");
             }
             gb::swiglu_rows(G2, G2, nrows, nff, g.swiglu_exp, s, 2 * nff);
@@ -4078,7 +4080,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 x3::rows_f16(G2 + (size_t) c0 * ldg, ldg, nullptr, n, nff, H16, s);
                 blas_ck(cublasGemmEx(S->blas, CUBLAS_OP_T, CUBLAS_OP_N, E, n, nff, &one, S->w16, CUDA_R_16F, nff, H16,
                                      CUDA_R_16F, nff, &zero, GU + (size_t) c0 * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F,
-                                     CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                                     STRATA_F16_GEMM_ALGO(CUBLAS_GEMM_DEFAULT_TENSOR_OP, n)),
                         "gemm q down");
             }
         };

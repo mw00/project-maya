@@ -16,6 +16,8 @@
 // cuBLAS' pedantic mode keeps F32 GEMMs in F32 (no TF32); hipBLAS' default math already does (XF32 is opt-in), and
 // HIPBLAS_DEFAULT_MATH exists in every hipBLAS the build supports.
 #define CUBLAS_PEDANTIC_MATH HIPBLAS_DEFAULT_MATH
+// hipBLAS has no numbered algorithms; only the CUDA branch of cuda_compat/pascal_gemm.hpp picks ALGO6.
+#define CUBLAS_GEMM_ALGO6 HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 // hipBLAS selects the available matrix instructions with its default algorithm.
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
@@ -28,6 +30,7 @@
 #define cudaDataType hipDataType
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
+#define cublasGemmAlgo_t hipblasGemmAlgo_t
 #define cublasGemmEx hipblasGemmEx
 // (the same argument order: hipDataType operands, hipblasStride strides, hipblasComputeType_t; glm-dsa's prompt MLA)
 #define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
