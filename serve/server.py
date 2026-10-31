@@ -784,6 +784,38 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[maya] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+def open_run_log(path: str, buffering: int = -1):
+    """Append even through an inherited subprocess handle, alongside the server's own log handle."""
+    opener = None
+    if os.name == "nt":
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        def opener(name, flags):
+            # Windows CRT O_APPEND is a seek before each write; Popen inherits only
+            # the OS handle and loses that flag (python/cpython#89400). Append-only
+            # access also prevents a seek/write race between the two log handles.
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                       wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+            k32.CreateFileW.restype = wintypes.HANDLE
+            k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            k32.CloseHandle.restype = wintypes.BOOL
+            # FILE_APPEND_DATA (without FILE_WRITE_DATA), FILE_SHARE_READ|WRITE,
+            # OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL. Popen duplicates the handle for inheritance.
+            handle = k32.CreateFileW(name, 0x4, 0x3, None, 4, 0x80, None)
+            if handle == wintypes.HANDLE(-1).value:
+                raise ctypes.WinError(ctypes.get_last_error())
+            try:
+                return msvcrt.open_osfhandle(handle, os.O_APPEND | os.O_NOINHERIT)
+            except BaseException:
+                k32.CloseHandle(handle)
+                raise
+
+    return open(path, "a", encoding="utf-8", buffering=buffering, opener=opener)
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -802,7 +834,7 @@ class StrataEngine:
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
-        self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        self.log = open_run_log(log) if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
         if log:
@@ -5702,7 +5734,7 @@ def tee_server_log(path: str) -> None:
     if not path or isinstance(sys.stdout, ServerLogTee):
         return
     try:
-        handle = open(path, "a", encoding="utf-8", buffering=1)
+        handle = open_run_log(path, buffering=1)
     except OSError as e:
         print(f"[maya] this server's lines cannot also go to {path} ({e}): they stay on this terminal", flush=True)
         return
