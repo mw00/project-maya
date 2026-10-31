@@ -1932,16 +1932,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::vector<std::unique_ptr<Act>> acts;
         std::deque<std::string> waiting;   // GEN lines no conversation is free for yet
         std::deque<Act*> read_line;        // the prompts being read, in turn: a piece each, then to the back
-        const bool read_pieces = [] {
-            const char* v = std::getenv("MAYA_DS4_READ_ORDER");
+        // serve's maya_names.env_in keeps the STRATA_ alias of a config's MAYA_ setting. Accept that alias here too;
+        // reading MAYA_ alone silently restored piece reads for a config that asked for arrival order.
+        const auto read_env = [](const char* name) {
+            if (const char* v = std::getenv(name)) return v;
+            return ds4_env(name + 5);   // (these names all start MAYA_; ds4_env tries STRATA_, then the bare name)
+        };
+        const bool read_pieces = [&] {
+            const char* v = read_env("MAYA_DS4_READ_ORDER");
             return v == nullptr || std::string(v) != "arrival";
         }();
         // MAYA_DS4_READ_PIECE=<chunks>: a piece is that many chunks a pipeline stage (1); MAYA_DS4_READ_ROUNDS=<n>: the
         // running answers write n tokens each (n rounds) between two pieces (1); MAYA_DS4_READ_SHARE=<percent>: instead,
         // they write for that share of the time, their rounds' against the last piece's (a round at least; 0: off)
         constexpr int kReadPieceChunks = 1, kReadRounds = 1, kReadShareMax = 90;
-        const auto env_count = [](const char* name, int dflt) {
-            const char* v = std::getenv(name);
+        const auto env_count = [&](const char* name, int dflt) {
+            const char* v = read_env(name);
             const int x = v != nullptr ? std::atoi(v) : 0;
             return x > 0 ? x : dflt;
         };
