@@ -50,10 +50,12 @@ endif()
 # engine keeps its gather + mul_mm attention.
 set(_maya_gg ${_maya_llamacpp_dir}/ggml)
 set(_maya_mla_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/metal-sparse-mla.patch)
+set(_maya_alloc_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/metal-allocator-free-blocks.patch)
 set(_maya_mla_copy ${CMAKE_BINARY_DIR}/maya-ggml)
 file(SHA256 ${_maya_mla_patch} _maya_mla_patch_sha)
+file(SHA256 ${_maya_alloc_patch} _maya_alloc_patch_sha)
 file(SHA256 ${_maya_gg}/include/ggml.h _maya_mla_src_sha)
-set(_maya_mla_stamp "${_maya_gg}|${_maya_mla_src_sha}|${_maya_mla_patch_sha}")
+set(_maya_mla_stamp "${_maya_gg}|${_maya_mla_src_sha}|${_maya_mla_patch_sha}|${_maya_alloc_patch_sha}")
 set(_maya_mla_done "")
 if(EXISTS ${_maya_mla_copy}/.maya-stamp)
   file(READ ${_maya_mla_copy}/.maya-stamp _maya_mla_done)
@@ -74,6 +76,16 @@ if(NOT _maya_mla_done STREQUAL _maya_mla_stamp)
                             ${GIT_EXECUTABLE} apply --ignore-whitespace ${_maya_mla_patch}
                     WORKING_DIRECTORY ${_maya_mla_copy} RESULT_VARIABLE _maya_mla_rc ERROR_VARIABLE _maya_mla_err)
     if(_maya_mla_rc EQUAL 0)
+      # The pinned ggml allocator's 256 free ranges can fragment during long
+      # Metal prefill and abort at ~92K input tokens. Patch ONLY the copied ggml
+      # tree, never the vendored llama.cpp checkout. Fail closed on patch drift.
+      execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}
+                              ${GIT_EXECUTABLE} apply --ignore-whitespace ${_maya_alloc_patch}
+                      WORKING_DIRECTORY ${_maya_mla_copy} RESULT_VARIABLE _maya_alloc_rc
+                      ERROR_VARIABLE _maya_alloc_err)
+      if(NOT _maya_alloc_rc EQUAL 0)
+        message(FATAL_ERROR "Metal ggml allocator patch failed against the pinned ggml copy:\n${_maya_alloc_err}")
+      endif()
       file(WRITE ${_maya_mla_copy}/.maya-stamp "${_maya_mla_stamp}")
     else()
       message(WARNING "third_party/ggml/metal-sparse-mla.patch (made for the pinned ggml) does not apply to ${_maya_gg} - "
@@ -83,7 +95,7 @@ if(NOT _maya_mla_done STREQUAL _maya_mla_stamp)
     endif()
   endif()
 endif()
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_maya_mla_patch} ${_maya_gg}/include/ggml.h)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_maya_mla_patch} ${_maya_alloc_patch} ${_maya_gg}/include/ggml.h)
 if(_maya_mla)
   add_subdirectory(${_maya_mla_copy} ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
 else()
@@ -106,6 +118,15 @@ target_link_libraries(maya-metal PRIVATE maya_metal)
 
 if(MAYA_METAL_TESTS)
   enable_testing()
+  if(_maya_mla)
+    # Pure allocator regression: no model weights or Metal device required.
+    add_executable(metal_allocator_free_blocks_test tools/test_metal_alloc_free_blocks.c)
+    target_include_directories(metal_allocator_free_blocks_test PRIVATE
+      ${_maya_mla_copy}/include ${_maya_mla_copy}/src)
+    target_compile_options(metal_allocator_free_blocks_test PRIVATE -ffunction-sections -fdata-sections)
+    target_link_options(metal_allocator_free_blocks_test PRIVATE -Wl,-dead_strip)
+    add_test(NAME metal_allocator_free_blocks COMMAND metal_allocator_free_blocks_test)
+  endif()
   # the CUDA engine's GLM gates (src/core/glm_model_test.cpp, glm_model_big_test.cpp) on maya-metal
   add_executable(metal_model_test src/metal/metal_model_test.cpp)
   target_link_libraries(metal_model_test PRIVATE maya_metal)
