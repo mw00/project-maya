@@ -128,26 +128,25 @@ def normalize_request(req):
     if req.get("truncation", "disabled") != "disabled":
         raise ValueError("truncation: only disabled is supported; requests are never truncated")
     include = req.get("include")
+    # Optional projections do not enable encryption: this backend omits encrypted_content.
+    if include is not None and (not isinstance(include, list) or any(
+            not isinstance(value, str) or value not in ("message.output_text.logprobs", "reasoning.encrypted_content")
+            for value in include)):
+        raise ValueError("include must be an array of supported response projections")
     # logprobs: include "message.output_text.logprobs" (OpenAI's way to ask), or a top_logprobs alone; the answer's
     # output_text parts then carry them (Chat-style: logprobs true and top_logprobs, for Service.run and the engine)
     logprobs = isinstance(include, list) and "message.output_text.logprobs" in include
-    if logprobs:
-        include = [x for x in include if x != "message.output_text.logprobs"]
     top = req.get("top_logprobs")
     if top is not None and (type(top) is not int or not 0 <= top <= 20):
         raise ValueError("top_logprobs must be an integer from 0 to 20")
-    if include not in (None, []):
-        no_reasoning = isinstance(req.get("reasoning"), dict) and req["reasoning"].get("effort") == "none"
-        if include != ["reasoning.encrypted_content"] or not no_reasoning:
-            raise ValueError("encrypted reasoning projection is only accepted with reasoning.effort=none; encryption is unavailable")
     if req.get("service_tier", "auto") != "auto":
         raise ValueError("service_tier: only auto is supported")
     reasoning = req.get("reasoning")
     if reasoning is not None:
         if not isinstance(reasoning, dict) or set(reasoning) - {"effort", "summary"}:
-            raise ValueError("reasoning: only effort is supported")
-        if reasoning.get("summary") is not None:
-            raise ValueError("reasoning.summary is not supported; reasoning is returned as reasoning_text")
+            raise ValueError("reasoning: only effort and summary are supported")
+        if reasoning.get("summary") not in (None, "auto", "concise", "detailed"):
+            raise ValueError("reasoning.summary must be auto, concise, detailed or null")
     metadata = req.get("metadata")
     if metadata is not None and (not isinstance(metadata, dict) or len(metadata) > 16 or any(
             not isinstance(k, str) or len(k) > 64 or not isinstance(v, str) or len(v) > 512
@@ -306,6 +305,7 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
         run = validation.events(run, cancel)
     sequence, current, calls = 0, None, {}
     incomplete_call = False
+    summary_requested = (req.get("reasoning") or {}).get("summary") is not None
     names = {tool["name"] for tool in req.get("tools") or []}
     choice = req.get("tool_choice", "auto")
 
@@ -319,11 +319,11 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
         if req.get("parallel_tool_calls") is False and calls and call.id not in calls:
             raise ValueError("parallel_tool_calls=false: generation produced more than one function call")
 
-    def event(name, **data):
+    def event(event_type, **data):
         nonlocal sequence
-        out = {"type": name, "sequence_number": sequence, **data}
+        out = {"type": event_type, "sequence_number": sequence, **data}
         sequence += 1
-        return name, copy.deepcopy(out)
+        return event_type, copy.deepcopy(out)
 
     def start(kind, call=None):
         nonlocal current
@@ -345,7 +345,13 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
             item["content"].append(part)
             yield event("response.content_part.added", item_id=item["id"], output_index=index, content_index=0, part=part)
         elif kind == "reasoning":
-            item["content"].append({"type": "reasoning_text", "text": ""})
+            if summary_requested:
+                part = {"type": "summary_text", "text": ""}
+                item["summary"].append(part)
+                yield event("response.reasoning_summary_part.added", item_id=item["id"], output_index=index,
+                            summary_index=0, part=part)
+            else:
+                item["content"].append({"type": "reasoning_text", "text": ""})
 
     def close(status="completed"):
         nonlocal current
@@ -360,9 +366,14 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
                         logprobs=part["logprobs"])
             yield event("response.content_part.done", **fields, content_index=0, part=part)
         elif item["type"] == "reasoning":
-            yield event("response.reasoning_text.done", **fields, content_index=0, text=item["content"][0]["text"])
+            if summary_requested:
+                part = item["summary"][0]
+                yield event("response.reasoning_summary_text.done", **fields, summary_index=0, text=part["text"])
+                yield event("response.reasoning_summary_part.done", **fields, summary_index=0, part=part)
+            else:
+                yield event("response.reasoning_text.done", **fields, content_index=0, text=item["content"][0]["text"])
         elif status == "completed":
-            yield event("response.function_call_arguments.done", **fields, arguments=item["arguments"])
+            yield event("response.function_call_arguments.done", **fields, name=item["name"], arguments=item["arguments"])
         item["status"] = status
         yield event("response.output_item.done", output_index=index, item=item)
 
@@ -382,6 +393,11 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
                         yield from close()
                         yield from start(want)
                     item = response["output"][current]
+                    if want == "reasoning" and summary_requested:
+                        item["summary"][0]["text"] += ev.text
+                        yield event("response.reasoning_summary_text.delta", item_id=item["id"], output_index=current,
+                                    summary_index=0, delta=ev.text)
+                        continue
                     item["content"][0]["text"] += ev.text
                     name = "response.reasoning_text.delta" if want == "reasoning" else "response.output_text.delta"
                     # (logprobs: the answer's tokens' entries, on the delta and in its part; the reasoning has none)
