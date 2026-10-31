@@ -184,4 +184,67 @@ inline bool load_direction(const std::string& path, int layer, int n_layer, floa
     }
 }
 
+// --ablate-sites / --ablate-layers: which residual writes lose the direction.  The defaults - the attention's and the
+// MoE's write of every layer, the DSpark drafter's blocks too - are --ablate's behaviour without them.  An edit made on
+// some writers only (HuiHui's DeepSeek-V4.1-Flash-1017 abliteration: attn_output_b of blocks 11-28) is the projection
+// of those writes alone: (W - s r r^T W) x = y - s r (r . y) for the writer W, y = W x.
+struct Pick {
+    bool attn = true, moe = true;   // the attention's write, the MoE's
+    int first = -1, last = -1;      // the layers, 0-based, both included; -1: every layer
+    bool takes(int il, bool moe_write) const {
+        return (moe_write ? moe : attn) && (first < 0 || (il >= first && il <= last));
+    }
+    bool narrowed() const { return !(attn && moe) || first >= 0; }
+};
+
+// --ablate-sites all|attn|moe
+inline bool parse_sites(const std::string& v, Pick& p, std::string& err) {
+    if (v == "all") p.attn = p.moe = true;
+    else if (v == "attn") p.attn = true, p.moe = false;
+    else if (v == "moe") p.attn = false, p.moe = true;
+    else {
+        err = "--ablate-sites: all, attn or moe, not '" + v + "'";
+        return false;
+    }
+    return true;
+}
+
+// --ablate-layers FIRST-LAST: 0-based, both included, FIRST <= LAST <= 4095, digits only
+inline bool parse_layers(const std::string& v, Pick& p, std::string& err) {
+    auto num = [](const std::string& t, int& out) {
+        if (t.empty() || t.size() > 4 || t.find_first_not_of("0123456789") != std::string::npos) return false;
+        out = std::stoi(t);
+        return out <= 4095;
+    };
+    const size_t dash = v.find('-');
+    int a = -1, b = -1;
+    if (dash == std::string::npos || !num(v.substr(0, dash), a) || !num(v.substr(dash + 1), b) || b < a) {
+        err = "--ablate-layers: FIRST-LAST, 0-based, both included (e.g. 11-28), not '" + v + "'";
+        return false;
+    }
+    p.first = a;
+    p.last = b;
+    return true;
+}
+
+// at load: the layers inside the model's (its n_layer blocks; the drafter's are not named by --ablate-layers)
+inline bool check_layers(const Pick& p, int n_layer, std::string& err) {
+    if (p.first >= 0 && p.last >= n_layer) {
+        err = "--ablate-layers " + std::to_string(p.first) + "-" + std::to_string(p.last) + ": the model has layers 0-" +
+              std::to_string(n_layer - 1);
+        return false;
+    }
+    return true;
+}
+
+// the start-up line's end: the writes the direction is projected out of
+inline std::string describe(const Pick& p) {
+    const std::string layers = p.first >= 0 ? "layers " + std::to_string(p.first) + "-" + std::to_string(p.last) + "'s"
+                                            : std::string("every layer's");
+    const std::string writes = p.attn && p.moe ? " attention and MoE writes"
+                             : p.attn          ? " attention writes only"
+                                               : " MoE writes only";
+    return ", projected out of " + layers + writes;
+}
+
 }  // namespace strata::ds4::ablate

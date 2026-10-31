@@ -21,6 +21,7 @@
 // leaves this one past one of them goes back to it (ds4_marks.hpp).  `logprobs=<k>` (0 .. 20) asks for an
 // `LP <id> <logprob> <id>:<logprob> ...` line after each T line: the token's log-probability and its row's k most likely
 // (ds4_logprobs.hpp; INFO logprobs=20 says the engine has them).
+#include "ds4_ablate.hpp"
 #include "ds4_evt.hpp"
 #include "ds4_logprobs.hpp"
 #include "ds4_marks.hpp"
@@ -131,7 +132,8 @@ void usage() {
                  "           [--vision on|off] [--mmap-experts on|off|auto] [--experts N (lossy: the router's top N)]\n"
                  "           [--parallel N (--serve: N conversations at once)]\n"
                  "           [--ssd-cache GB|auto|off [--ssd-policy lru|lfu]]   (the in-place experts in a RAM store; opt-in)\n"
-                 "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]]\n"
+                 "           [--ablate DIRECTION.gguf|ADAPTER.gguf [--ablate-layer N] [--ablate-scale F]\n"
+                 "            [--ablate-sites all|attn|moe] [--ablate-layers FIRST-LAST]]\n"
                  "           (--ids I,J,... | @FILE [--images FILE] [--n N] [--dump-logits FILE] | --ppl FILE | --serve\n"
                  "           | --encode-image FILE.rgb --size WxH --dump-image OUT)\n"
                  "maya-ds4 --pack <model>/maya-ds4 --pack-info [--expert-profile FILE]   the pack described: no GPU, no "
@@ -3528,6 +3530,17 @@ int main(int argc, char** argv) {
         else if (a == "--ablate") o.ablate = val("--ablate");
         else if (a == "--ablate-layer") o.ablate_layer = (int) num("--ablate-layer", 1, 4096, true);
         else if (a == "--ablate-scale") o.ablate_scale = (float) num("--ablate-scale", 1e-6, 1e6, false);
+        else if (a == "--ablate-sites" || a == "--ablate-layers") {   // (which writes lose the direction)
+            const std::string v = val(a.c_str());
+            strata::ds4::ablate::Pick pick;
+            std::string e;
+            if (!(a == "--ablate-sites" ? strata::ds4::ablate::parse_sites(v, pick, e)
+                                        : strata::ds4::ablate::parse_layers(v, pick, e))) {
+                std::fprintf(stderr, "%s\n", e.c_str());
+                return 2;
+            }
+            (a == "--ablate-sites" ? o.ablate_sites : o.ablate_layers) = v;
+        }
         else if (a == "--serve") serve_mode = true;
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
