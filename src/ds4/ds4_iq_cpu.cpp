@@ -68,7 +68,7 @@ kc::NativeFmt native(const IqCpu& f) {   // (the fields the rows read; no lookup
 // ---- what this CPU runs: AVX2 + FMA (the OS saving the YMM state), and AVX-512 F / BW + VBMI with BMI2 (the ZMM state);
 // x512: AVX-512 F / BW / VL / DQ with BMI2 (no VBMI: Skylake-SP Xeons too), pop512: and VPOPCNTDQ
 struct IqCpuIsa {
-    bool avx2 = false, w512 = false, bmi2 = false, x512 = false, pop512 = false;
+    bool avx2 = false, w512 = false, bmi2 = false, f16c = false, x512 = false, pop512 = false;
 };
 IqCpuIsa iq_isa() {
     IqCpuIsa c;
@@ -87,6 +87,7 @@ IqCpuIsa iq_isa() {
     if (r[0] < 7) return c;
     cpuid(1, 0);
     if (!((r[2] >> 12) & 1u) || !((r[2] >> 27) & 1u) || !((r[2] >> 28) & 1u)) return c;   // FMA, OSXSAVE, AVX
+    const bool f16c = (r[2] >> 29) & 1u;
 #if defined(_MSC_VER)
     const unsigned long long xcr0 = _xgetbv(0);
 #else
@@ -98,6 +99,7 @@ IqCpuIsa iq_isa() {
     cpuid(7, 0);
     c.avx2 = (r[1] >> 5) & 1u;
     c.bmi2 = (r[1] >> 8) & 1u;
+    c.f16c = f16c && c.avx2;   // (IQ1_S's rows: every FMA3 CPU has it)
     c.w512 = c.avx2 && (xcr0 & 0xE6) == 0xE6 && ((r[1] >> 16) & 1u) && ((r[1] >> 30) & 1u) && ((r[2] >> 1) & 1u) &&
              ((r[1] >> 8) & 1u);   // AVX-512 F, BW, VBMI; BMI2
     c.x512 = c.avx2 && (xcr0 & 0xE6) == 0xE6 && ((r[1] >> 16) & 1u) && ((r[1] >> 17) & 1u) && ((r[1] >> 30) & 1u) &&
@@ -154,10 +156,10 @@ bool pdep_slow_cpu() {
     const CpuFam f = cpu_fam();
     return f.amd ? f.fam == 0x17u : f.hygon && f.fam == 0x18u;
 }
-// IQ1_S's rows without pdep (ours, the integer index form - ggml's non-BMI2 branch, the same bits): for every token
-// count (one token too, where ggml-cpu's dot serves elsewhere) and on every setup (the one-GPU path's switch,
-// iq_cpu_iq1s_rows, does not turn them off).  DS4_IQ1_PDEP=0 forces it on any CPU (tests: the parity of the form);
-// =1 keeps the measured choice (ggml-cpu's dot for one token, pdep where it times faster); unset: 0 on the CPUs above
+// IQ1_S's own rows (none of them take pdep) on every setup (the one-GPU path's switch, iq_cpu_iq1s_rows, does not turn
+// them off) and without timing them against ggml-cpu's dot, whose pdep runs in microcode here.  DS4_IQ1_PDEP=0 forces
+// it on any CPU (tests); =1 keeps the measured choice (ours where they time faster, while iq_cpu_iq1s_rows allows);
+// unset: 0 on the CPUs above
 bool iq1_no_pdep() {
     static const bool v = [] {
         const char* e = std::getenv("DS4_IQ1_PDEP");
@@ -404,19 +406,38 @@ inline float mul_exact(float a, float b) {   // a * b rounded on its own (never 
 
 // IQ1_S (Maya-XS's experts) rows [r0, r1) of NT tokens: ggml_vec_dot_iq1_s_q8_K's AVX2 branch with each block's grid,
 // scales and delta signs decoded once for all the tokens (ggml decodes them again for every token).  The int32 sums
-// are the same; the float steps are ggml's: d = y.d * x.d, the 8 lanes by FMA, then g_iq1_fma's two
+// are the same; the float steps are ggml's: d = y.d * x.d, the 8 lanes by FMA, then g_iq1_fma's two.  What ggml does
+// in scalar code a block, here a segment of 16 blocks at a time in vectors (ggml's one-token dot is ~95 instructions a
+// pair of chunks, bound by issue, not by memory - a cached expert runs as fast as a cold one): the 11-bit grid indices
+// (no pdep: the same on Zen 2), the blocks' F16 scales (F16C, exact) and the delta's integer sums (the signed scales
+// times the bsums' pair sums, folded by hadd); then a block is its table loads and the vector products.  (Ryzen 9
+// 5900X, an expert 4096 x 2048: 1 token 1.43 -> 1.14 ms a thread, 4 tokens 3.2 -> 2.5 ms; vpgatherqq, broadcast +
+// blend assembly and prefetching the next row were no faster)
 #if defined(IQ_X86) && (defined(__GNUC__) || defined(__clang__))
-#define IQ_BMI2 __attribute__((target("avx2,fma,bmi2")))
+#define IQ_F16C __attribute__((target("avx2,fma,f16c")))
 #else
-#define IQ_BMI2 IQ_AVX2
+#define IQ_F16C IQ_AVX2
 #endif
-bool g_iq1_pdep = false;   // IQ1_S's grid indices by BMI2's pdep, as ggml-cpu builds them with -march=native (own():
-                           // if faster here - Zen 2 runs pdep in microcode)
 
-template <int NT, bool PD>
-IQ_BMI2 void iq1s_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0,
+template <int NT>
+IQ_F16C void iq1s_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_K* const* y, float* const* out, int r0,
                             int r1) {
     const bool fa = (g_iq1_fma & 1) != 0, ff = (g_iq1_fma & 2) != 0;
+    // index j of a block (chunk j / 4): qs[j] | bits 3 (j % 4) .. + 2 of qh[j / 4] at 8 - qh's word to each of its 4
+    // indices (a byte shuffle), the field to bits 9-11 (a multiply by 512 / 64 / 8 / 1), masked, then down by one
+    const __m256i ca = _mm256_setr_epi8(0, 1, 0, 1, 0, 1, 0, 1, 2, 3, 2, 3, 2, 3, 2, 3, 4, 5, 4, 5, 4, 5, 4, 5, 6, 7, 6, 7, 6, 7, 6, 7);
+    const __m256i cb = _mm256_add_epi8(ca, _mm256_set1_epi8(8));
+    const __m256i mul = _mm256_setr_epi16(512, 64, 8, 1, 512, 64, 8, 1, 512, 64, 8, 1, 512, 64, 8, 1);
+    const __m256i m0e = _mm256_set1_epi16(0x0E00), k14 = _mm256_set1_epi16(14), k1 = _mm256_set1_epi16(1);
+    constexpr int S = 16;   // blocks a segment
+    // the tokens' bsums pair sums (chunk c: bsums[2c] + bsums[2c + 1], as ggml adds them), 8 int16 a block, once a call
+    thread_local std::vector<int16_t> pbuf;
+    pbuf.resize((size_t) 8 * NT * nb);
+    int16_t* P = pbuf.data();
+    for (int t = 0; t < NT; ++t)
+        for (int i = 0; i < nb; ++i)
+            _mm_storeu_si128((__m128i*) (P + 8 * (t * nb + i)), _mm_hadd_epi16(_mm_loadu_si128((const __m128i*) y[t][i].bsums),
+                                                                              _mm_loadu_si128((const __m128i*) (y[t][i].bsums + 8))));
     for (int r = r0; r < r1; ++r) {
         const block_iq1_s* x = (const block_iq1_s*) (w + (size_t) r * rb);
         __m256 accf[NT];
@@ -425,51 +446,75 @@ IQ_BMI2 void iq1s_rows_avx2(const uint8_t* w, size_t rb, int nb, const block_q8_
             accf[t] = _mm256_setzero_ps();
             acc1[t] = 0.0f;
         }
-        for (int i = 0; i < nb; ++i) {
-            const uint8_t* qs = x[i].qs;
-            const uint16_t* qh = x[i].qh;
-            __m256i sumi[NT];
-            int sumi1[NT];
-            for (int t = 0; t < NT; ++t) {
-                sumi[t] = _mm256_setzero_si256();
-                sumi1[t] = 0;
-            }
-            for (int ib = 0; ib < QK_K / 32; ib += 2, qs += 8) {   // a pair of 32-value chunks: decoded once
-                const unsigned h1 = qh[ib], h2 = qh[ib + 1];
-                __m256i g1, g2;
-                if constexpr (PD) {
-#if defined(IQ_X86) && (defined(__GNUC__) || defined(__clang__) || defined(_MSC_VER))
-                    const uint64_t p1 = _pdep_u64(u32(qs), 0x00ff00ff00ff00ffULL) | _pdep_u64(h1, 0x0700070007000700ULL);
-                    const uint64_t p2 = _pdep_u64(u32(qs + 4), 0x00ff00ff00ff00ffULL) | _pdep_u64(h2, 0x0700070007000700ULL);
-                    g1 = _mm256_set_epi64x(iq1s_grid[p1 >> 48], iq1s_grid[(p1 >> 32) & 0xffff], iq1s_grid[(p1 >> 16) & 0xffff],
-                                           iq1s_grid[p1 & 0xffff]);
-                    g2 = _mm256_set_epi64x(iq1s_grid[p2 >> 48], iq1s_grid[(p2 >> 32) & 0xffff], iq1s_grid[(p2 >> 16) & 0xffff],
-                                           iq1s_grid[p2 & 0xffff]);
-#endif
-                } else {
-                    g1 = _mm256_set_epi64x(iq1s_grid[qs[3] | ((h1 >> 1) & 0x700)], iq1s_grid[qs[2] | ((h1 << 2) & 0x700)],
-                                           iq1s_grid[qs[1] | ((h1 << 5) & 0x700)], iq1s_grid[qs[0] | ((h1 << 8) & 0x700)]);
-                    g2 = _mm256_set_epi64x(iq1s_grid[qs[7] | ((h2 >> 1) & 0x700)], iq1s_grid[qs[6] | ((h2 << 2) & 0x700)],
-                                           iq1s_grid[qs[5] | ((h2 << 5) & 0x700)], iq1s_grid[qs[4] | ((h2 << 8) & 0x700)]);
+        alignas(32) uint16_t ix[S * 32];
+        alignas(32) int32_t s1[NT][S];
+        alignas(32) float dxs[S];
+        alignas(16) uint16_t dh[S];
+        for (int i0 = 0; i0 < nb; i0 += S) {
+            const int ns = nb - i0 < S ? nb - i0 : S;
+            for (int k = 0; k < S; ++k) dh[k] = k < ns ? x[i0 + k].d : 0;
+            _mm256_store_ps(dxs, _mm256_cvtph_ps(_mm_load_si128((const __m128i*) dh)));
+            _mm256_store_ps(dxs + 8, _mm256_cvtph_ps(_mm_load_si128((const __m128i*) (dh + 8))));
+            // sumi1 of 8 blocks: each one's signed scales (2 s + 1, negated by qh's bit 15) times its pair sums, two
+            // blocks a vector, the 8 sums by two hadd levels (lanes: blocks 0 2 4 6 | 1 3 5 7) - exact int32 either way
+            for (int k0 = 0; k0 < ns; k0 += 8) {
+                __m256i m[NT][4];
+                for (int p = 0; p < 4; ++p) {
+                    const int ka = std::min(i0 + k0 + 2 * p, nb - 1), kb = std::min(i0 + k0 + 2 * p + 1, nb - 1);
+                    const __m256i q = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*) x[ka].qh)),
+                                                              _mm_loadu_si128((const __m128i*) x[kb].qh), 1);
+                    const __m256i ls = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q, 11), k14), k1);
+                    const __m256i sl = _mm256_sign_epi16(ls, _mm256_or_si256(q, k1));
+                    for (int t = 0; t < NT; ++t)
+                        m[t][p] = _mm256_madd_epi16(sl, _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_loadu_si128((const __m128i*) (P + 8 * (t * nb + ka)))),
+                                                                                _mm_loadu_si128((const __m128i*) (P + 8 * (t * nb + kb))), 1));
                 }
-                const __m256i a1 = _mm256_sign_epi8(g1, g1), a2 = _mm256_sign_epi8(g2, g2);   // (mul_add_epi8: |g| x q8 with g's signs)
-                const int ls1 = 2 * ((h1 >> 12) & 7) + 1, ls2 = 2 * ((h2 >> 12) & 7) + 1;
-                const __m256i c1 = _mm256_set1_epi16((short) ls1), c2 = _mm256_set1_epi16((short) ls2);
-                const int sl1 = (h1 & 0x8000 ? -1 : 1) * ls1, sl2 = (h2 & 0x8000 ? -1 : 1) * ls2;   // (the delta's sign)
                 for (int t = 0; t < NT; ++t) {
-                    const block_q8_K& b = y[t][i];
-                    const int8_t* q8 = b.qs + 32 * ib;
-                    const __m256i d1 = _mm256_maddubs_epi16(a1, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) q8), g1));
-                    const __m256i d2 = _mm256_maddubs_epi16(a2, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) (q8 + 32)), g2));
-                    sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(_mm256_madd_epi16(d1, c1), _mm256_madd_epi16(d2, c2)));
-                    sumi1[t] += (b.bsums[2 * ib] + b.bsums[2 * ib + 1]) * sl1 + (b.bsums[2 * ib + 2] + b.bsums[2 * ib + 3]) * sl2;
+                    const __m256i h = _mm256_hadd_epi32(_mm256_hadd_epi32(m[t][0], m[t][1]), _mm256_hadd_epi32(m[t][2], m[t][3]));
+                    _mm256_store_si256((__m256i*) (s1[t] + k0), _mm256_permutevar8x32_epi32(h, _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7)));
                 }
             }
-            const float dx = h2f(x[i].d);
-            for (int t = 0; t < NT; ++t) {
-                const float d = y[t][i].d * dx;
-                accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[t]), accf[t]);
-                acc1[t] = fa ? std::fma(d, (float) sumi1[t], acc1[t]) : acc1[t] + mul_exact(d, (float) sumi1[t]);
+            for (int k = 0; k < ns; ++k) {   // (stored: the table loads take them as address registers)
+                const block_iq1_s& b = x[i0 + k];
+                const __m256i h = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) b.qh));
+                const __m256i ja = _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) b.qs)),
+                                     _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(h, ca), mul), m0e), 1));
+                const __m256i jb = _mm256_or_si256(_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) (b.qs + 16))),
+                                     _mm256_srli_epi16(_mm256_and_si256(_mm256_mullo_epi16(_mm256_shuffle_epi8(h, cb), mul), m0e), 1));
+                _mm256_store_si256((__m256i*) (ix + 32 * k), ja);
+                _mm256_store_si256((__m256i*) (ix + 32 * k + 16), jb);
+            }
+            for (int k = 0; k < ns; ++k) {
+                const int i = i0 + k;
+                // the chunks' 2 s + 1 in both halves of int32 lane c; chunk c's broadcast by one in-lane shuffle
+                const __m256i q2 = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) x[i].qh));
+                const __m256i ls = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(q2, 11), _mm256_set1_epi32(14)), _mm256_set1_epi32(1));
+                const __m256i lsd = _mm256_or_si256(ls, _mm256_slli_epi32(ls, 16));
+                const __m256i L0 = _mm256_permute2x128_si256(lsd, lsd, 0x00), L1 = _mm256_permute2x128_si256(lsd, lsd, 0x11);
+                __m256i sumi[NT];
+                for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+#pragma GCC unroll 4
+                for (int ib = 0; ib < QK_K / 32; ib += 2) {   // a pair of 32-value chunks: decoded once
+                    const uint16_t* p = ix + 32 * k + 4 * ib;
+                    const __m256i g1 = _mm256_set_epi64x(iq1s_grid[p[3]], iq1s_grid[p[2]], iq1s_grid[p[1]], iq1s_grid[p[0]]);
+                    const __m256i g2 = _mm256_set_epi64x(iq1s_grid[p[7]], iq1s_grid[p[6]], iq1s_grid[p[5]], iq1s_grid[p[4]]);
+                    const __m256i a1 = _mm256_sign_epi8(g1, g1), a2 = _mm256_sign_epi8(g2, g2);   // (mul_add_epi8)
+                    const __m256i Lh = ib < 4 ? L0 : L1;
+                    const __m256i c1 = (ib & 2) ? _mm256_shuffle_epi32(Lh, 0xAA) : _mm256_shuffle_epi32(Lh, 0x00);
+                    const __m256i c2 = (ib & 2) ? _mm256_shuffle_epi32(Lh, 0xFF) : _mm256_shuffle_epi32(Lh, 0x55);
+                    for (int t = 0; t < NT; ++t) {
+                        const int8_t* q8 = y[t][i].qs + 32 * ib;
+                        const __m256i d1 = _mm256_maddubs_epi16(a1, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) q8), g1));
+                        const __m256i d2 = _mm256_maddubs_epi16(a2, _mm256_sign_epi8(_mm256_loadu_si256((const __m256i*) (q8 + 32)), g2));
+                        sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(_mm256_madd_epi16(d1, c1), _mm256_madd_epi16(d2, c2)));
+                    }
+                }
+                const float dx = dxs[k];
+                for (int t = 0; t < NT; ++t) {
+                    const float d = y[t][i].d * dx;
+                    accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi[t]), accf[t]);
+                    acc1[t] = fa ? std::fma(d, (float) s1[t][k], acc1[t]) : acc1[t] + mul_exact(d, (float) s1[t][k]);
+                }
             }
         }
         for (int t = 0; t < NT; ++t)
@@ -754,20 +799,11 @@ void iq1s_rows_n(const uint8_t* w, size_t rb, int n, const void* const* act, int
             y[t] = (const block_q8_K*) act[t0 + t];
             o[t] = out[t0 + t];
         }
-        if (g_iq1_pdep) {
-            switch (c) {
-                case 1: iq1s_rows_avx2<1, true>(w, rb, nb, y, o, r0, r1); break;
-                case 2: iq1s_rows_avx2<2, true>(w, rb, nb, y, o, r0, r1); break;
-                case 3: iq1s_rows_avx2<3, true>(w, rb, nb, y, o, r0, r1); break;
-                default: iq1s_rows_avx2<4, true>(w, rb, nb, y, o, r0, r1); break;
-            }
-            continue;
-        }
         switch (c) {
-            case 1: iq1s_rows_avx2<1, false>(w, rb, nb, y, o, r0, r1); break;
-            case 2: iq1s_rows_avx2<2, false>(w, rb, nb, y, o, r0, r1); break;
-            case 3: iq1s_rows_avx2<3, false>(w, rb, nb, y, o, r0, r1); break;
-            default: iq1s_rows_avx2<4, false>(w, rb, nb, y, o, r0, r1); break;
+            case 1: iq1s_rows_avx2<1>(w, rb, nb, y, o, r0, r1); break;
+            case 2: iq1s_rows_avx2<2>(w, rb, nb, y, o, r0, r1); break;
+            case 3: iq1s_rows_avx2<3>(w, rb, nb, y, o, r0, r1); break;
+            default: iq1s_rows_avx2<4>(w, rb, nb, y, o, r0, r1); break;
         }
     }
 }
@@ -873,8 +909,7 @@ double time_variant(int type, int variant, int nt = 1) {
     std::string err;
     if (variant == 0 && !kc::native_fmt(type, type, n, QK_K, nf, err)) return 1e30;
     bool* gflag = type == GGML_TYPE_IQ3_XXS ? &g_gather18 : type == GGML_TYPE_IQ3_S ? &g_gather21 :
-                  type == GGML_TYPE_IQ2_XXS ? &g_ct16 :
-                  type == GGML_TYPE_IQ1_S && isa().bmi2 && !iq1_no_pdep() ? &g_iq1_pdep : nullptr;
+                  type == GGML_TYPE_IQ2_XXS ? &g_ct16 : nullptr;
     const bool keep = gflag != nullptr && *gflag;
     if (gflag != nullptr) *gflag = variant >= 2;
     double best = 1e30;
@@ -931,7 +966,9 @@ bool own(int type) {
         return mode != 0 && isa().avx2;
     }();
     // (IQ2 on an AVX-512 CPU: the GLM lane's AVX-512 rows serve them, unless DS4_IQ_AVX2; IQ1_S has no such rows)
-    if (!allowed || ((k == 2 || k == 3) && isa().w512 && !force_avx2) || (k >= 5 && x512_from(type) == 0)) return false;
+    if (!allowed || ((k == 2 || k == 3) && isa().w512 && !force_avx2) || (k == 4 && !isa().f16c) ||
+        (k >= 5 && x512_from(type) == 0))
+        return false;
     static std::once_flag once[7];
     static bool ok[7];
     std::call_once(once[k], [&] {
@@ -960,8 +997,7 @@ bool own(int type) {
             g_x512_18 = false;   // (IQ3_XXS: the rows above, chosen as before)
         }
         const bool no_pdep = k == 4 && iq1_no_pdep();
-        bool* gflag = k == 0 ? &g_gather18 : k == 1 ? &g_gather21 : k == 2 ? &g_ct16 :
-                      k == 4 && isa().bmi2 && !no_pdep ? &g_iq1_pdep : nullptr;   // (the second form)
+        bool* gflag = k == 0 ? &g_gather18 : k == 1 ? &g_gather21 : k == 2 ? &g_ct16 : nullptr;   // (the second form)
         bool good = false;
         if (k == 4) {   // (IQ1_S: the float steps' form that gives ggml-cpu's bits, gcc's FMAs first)
             for (int m : {3, 0, 1, 2}) {
@@ -993,7 +1029,7 @@ bool own(int type) {
         // the variants timed in turns, the best of each kept (other work on the machine - the load's read-ahead, the
         // prompt - then hits them alike), and ours taken only when clearly faster (10 %): the choice changes no answer,
         // a wrong one costs time (Uranus' Golden Cove: one-shot timings 30-80 % apart run to run, the choice flipping)
-        // (IQ1_S timed on 4 tokens: on one, ours does ggml's work and is no faster - it serves 2 tokens or more, own_nt)
+        // (IQ1_S timed on 4 tokens, where the two differ most: ours are ~2.3x ggml-cpu's there, ~1.25x on one)
         const int nt = k == 4 ? 4 : 1;
         double tn = 1e30, tb = 1e30, tg = 1e30;
         for (int it = 0; it < 5; ++it) {
@@ -1005,7 +1041,7 @@ bool own(int type) {
         ok[k] = std::min(tb, tg) < 0.9 * tn;
         if (std::getenv("DS4_IQ_VERBOSE") != nullptr)
             std::fprintf(stderr, "ds4: CPU lane %s rows (%d token%s): native %.0f us, ours %.0f us%s -> %s\n",
-                         ggml_type_name((ggml_type) type), nt, nt > 1 ? "s" : "", tn, tb, gflag != nullptr ? (std::string(" (second form: gather / one table / pdep ") + std::to_string((int) tg) + " us)").c_str() : "",
+                         ggml_type_name((ggml_type) type), nt, nt > 1 ? "s" : "", tn, tb, gflag != nullptr ? (std::string(" (second form: gather / one table ") + std::to_string((int) tg) + " us)").c_str() : "",
                          ok[k] ? (gflag != nullptr && *gflag ? "ours (second form)" : "ours") : "native");
     });
     return ok[k];
@@ -1016,10 +1052,12 @@ bool own(int type) {
 }
 // iq_cpu_iq1s_rows: whether IQ1_S may take its own rows at all (the engine's one-GPU decode path)
 std::atomic<bool> g_iq1_on{true};
-// own(type) for a call of nt tokens: IQ1_S's rows only from 2 tokens on (one token: ggml-cpu's dot, as fast) - except
-// without pdep (iq1_no_pdep): then ours for every call, ggml-cpu's dot taking pdep's microcode on such a CPU
+// own(type) for a call of nt tokens: IQ1_S's rows for one token too (a decode step's: the vector decode above is ~20 %
+// faster than ggml-cpu's dot there) while g_iq1_on - and without pdep (iq1_no_pdep) for every call, ggml-cpu's dot
+// taking pdep's microcode on such a CPU
 bool own_nt(int type, int nt) {
-    if (type == GGML_TYPE_IQ1_S && !iq1_no_pdep() && (nt < 2 || !g_iq1_on.load(std::memory_order_relaxed))) return false;
+    (void) nt;
+    if (type == GGML_TYPE_IQ1_S && !iq1_no_pdep() && !g_iq1_on.load(std::memory_order_relaxed)) return false;
 #if defined(IQ_X86)
     if (!own(type)) return false;
     return !x512_type(type) || nt >= x512_from(type);   // (IQ1_M on Zen 4: from 2 tokens)
