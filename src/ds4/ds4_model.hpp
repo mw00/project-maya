@@ -256,6 +256,10 @@ public:
     /// prompt's start is then not usable: restore() a checkpoint kept before the feed, or reset().
     void set_cancel(std::function<bool()> f);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
+    /// After a request: true when no later one can trust this process - a layer GPU took a fault inside a kernel (its
+    /// context returns that error from then on) or the prompt path's room was not handed back.  The serve loop then
+    /// ends the engine (exit 3) once the request's DONE is out, and the server starts a fresh one for the next request.
+    bool broken();
     /// Asked while a run of chunks goes through the layers: true (a yield) ends it at a chunk every GPU reaches, as a
     /// Stop does, but keeps the chunks read - feed() / feed_mark() return true having taken fed() of their tokens (the
     /// rest a later feed's; feed_mark's checkpoint then not kept).  Not on a run that goes layer by layer.
