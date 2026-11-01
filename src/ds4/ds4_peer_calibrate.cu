@@ -1,6 +1,8 @@
 // Small, startup-only exact-F32 transport comparison. Never uses model activations or weights.
 #include "ds4_kernels.cuh"
+#if defined(STRATA_USE_HIP)
 #include <hip/hip_runtime.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -74,6 +76,14 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
     for (int m = 0; m < 2 && ok; ++m) {
         if (expired()) { ok = false; break; }
         auto& r = rank[m];
+        if (hipSetDevice(ids[m]) == hipSuccess) {   // (CUDA lazy loading: no first launch beside a spinning rank)
+            peer_ar_preload();
+#if !defined(STRATA_USE_HIP)
+            cudaFuncAttributes fa{};
+            (void) cudaFuncGetAttributes(&fa, check_probe);
+            (void) cudaGetLastError();
+#endif
+        }
         ok = hipSetDevice(ids[m]) == hipSuccess &&
              hipStreamCreateWithFlags(&r.stream, hipStreamNonBlocking) == hipSuccess &&
              hipMalloc((void**) &r.x, size_t(n) * sizeof(float)) == hipSuccess &&

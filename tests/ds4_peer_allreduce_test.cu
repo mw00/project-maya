@@ -1,7 +1,9 @@
 // Two-rank peer-VRAM transport against the existing host transport, including failure/draining.
 // Run with exactly two visible GPUs; needs about 800 MiB of spare VRAM on each, including calibration scratch.
 #include "../src/ds4/ds4_kernels.cuh"
+#if defined(STRATA_USE_HIP)
 #include <hip/hip_runtime.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -97,10 +99,16 @@ int main() {
         CK(hipExtMallocWithFlags((void**) &r.peer.flags, flag_count * sizeof(unsigned), hipDeviceMallocFinegrained));
         r.peer.stride = kCapacity;
         r.peer.timeout_ticks = uint64_t(r.wall_clock_khz) * 2000;
+#if defined(STRATA_USE_HIP)
         hipPointerAttribute_t attr{};
         CK(hipPointerGetAttributes(&attr, r.peer.recv));
         REQUIRE(attr.type == hipMemoryTypeDevice && attr.device == i && !attr.isManaged &&
                 (attr.allocationFlags & hipDeviceMallocFinegrained));
+#else
+        cudaPointerAttributes attr{};
+        CK(cudaPointerGetAttributes(&attr, r.peer.recv));
+        REQUIRE(attr.type == cudaMemoryTypeDevice && attr.device == i);
+#endif
     }
     for (int i = 0; i < 2; ++i) {
         ranks[i].peer.peer_recv = ranks[1 - i].peer.recv;

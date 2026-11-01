@@ -1030,7 +1030,7 @@ struct Worker {
 struct Group {
     std::vector<int> mem;   // device indices, member order (member 0 the lead)
     ArGroup ar, arb;        // a window's all-reduces, a chunk's
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
     std::array<PeerAr, 2> peer_arb{};
     bool peer_arb_on = false;
 #endif
@@ -1070,7 +1070,7 @@ struct WinPlan {
 // ------------------------------------------------------------------ the model
 struct Model::Impl {
     Options o;
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
     std::atomic<bool> peer_ar_failed{false}; // sticky across reset: reload after a transport failure
 #endif
     // abliteration (ds4_ablate.hpp): the direction on the host, its scale, the start-up line describing it
@@ -4737,7 +4737,7 @@ struct Model::Impl {
                 workers.back()->start();
             }
         if (cp_pin_last()) cp_pin();   // (#589: after every pinned buffer above, before the paths are timed)
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (!init_peer_ar(err)) return false; // after expert placement: optional scratch does not shrink the expert cache
 #endif
         tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
@@ -15792,7 +15792,7 @@ struct Model::Impl {
     // running product at least cum_min) - the lazy head stops where it stops, but not before min_n rows
     bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err, int max_n = 0,
                 float conf_min = 0.0f, float cum_min = 0.0f, int min_n = 0) {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;
@@ -16623,7 +16623,7 @@ struct Model::Impl {
         }();
         return on;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
     // Optional transport scratch is allocated only after expert placement. Failure leaves the
     // original host transport intact for both ranks, without changing expert cache capacity.
     bool init_peer_ar(std::string& err) {
@@ -16676,6 +16676,7 @@ struct Model::Impl {
                 ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
                 if (!ok) break;
                 hipGetLastError(); // consume already-enabled status, if any
+                peer_ar_preload();  // (CUDA lazy loading: load before the first spinning launch)
                 int wall_clock_khz = 0;
                 ok = hipDeviceGetAttribute(&wall_clock_khz, hipDeviceAttributeWallClockRate, d.id) == hipSuccess &&
                      wall_clock_khz > 0;
@@ -16689,7 +16690,15 @@ struct Model::Impl {
                 if (hipMemGetInfo(&available, &total) != hipSuccess || available < need ||
                     (automatic && now_ms() >= deadline)) { ok = false; break; }
                 a[m].stride = G.arb.stride;
-                a[m].timeout_ticks = uint64_t(wall_clock_khz) * 2000; // bounded two-second wait
+                // bounded wait for the partner (DS4_PEER_AR_TIMEOUT_S, 60 s): two seconds timed out on a 469K-token prompt on
+                // 8x RTX 3090 - the lead (head, a drafter block, restore points) ran more than 2 s behind its partner at one
+                // all-reduce, a skew the host transport just waits out. Maya's request watchdog still catches a real hang.
+                static const double peer_timeout_s = [] {
+                    const char* e = ds4_env("DS4_PEER_AR_TIMEOUT_S");
+                    const double v = e ? std::atof(e) : 60.0;
+                    return v > 0 ? v : 60.0;
+                }();
+                a[m].timeout_ticks = uint64_t(double(wall_clock_khz) * 1000.0 * peer_timeout_s);
                 ok = hipExtMallocWithFlags((void**) &a[m].recv, 2 * a[m].stride * sizeof(float),
                                            hipDeviceMallocFinegrained) == hipSuccess &&
                      hipExtMallocWithFlags((void**) &a[m].flags,
@@ -16758,7 +16767,7 @@ struct Model::Impl {
             }
             G.peer_arb = a;
             G.peer_arb_on = true;
-            std::fprintf(stderr, "ds4: exact peer prefill all-reduce enabled on HIP%d/HIP%d (%zu MiB/rank)\n",
+            std::fprintf(stderr, "ds4: exact peer prefill all-reduce enabled on GPU%d/GPU%d (%zu MiB/rank)\n",
                          devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id,
                          (2 * a[0].stride * sizeof(float)) >> 20);
         }
@@ -16806,7 +16815,7 @@ struct Model::Impl {
             const char* e = std::getenv("DS4_AR_DMA");
             return e == nullptr || std::atoi(e) != 0;
         }();
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         Group& pg = groups[(size_t) d.grp];
         if (pg.peer_arb_on) {
             // A failed launch cannot silently switch a single rank to another transport.
@@ -18934,7 +18943,7 @@ struct Model::Impl {
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1,
                         const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0, int after = 0,
                         const std::vector<std::pair<int64_t, bool>>* inner = nullptr) {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;
@@ -19234,7 +19243,7 @@ struct Model::Impl {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         main_at.store("a run of chunks: the devices done, the head next", std::memory_order_relaxed);
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (!check_peer_ar(err)) return false;
         // A worker's early failure can leave peers with different submission sequences. Do not reuse the model.
         for (const std::string& e : errs)
@@ -19547,7 +19556,7 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;
@@ -20788,7 +20797,7 @@ struct Model::Impl {
     // `spec` each run is a verify window (its backups kept, its drafter rings left for verify_multi to seed with the
     // rows it keeps), without it every row seeds its conversation's drafter rings here
     bool step_runs(const int* sv, const int* const* toks, const int* lens, int n, bool spec, std::string& err) {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
             return false;

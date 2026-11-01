@@ -6,6 +6,7 @@
 // What differs from query to query (its window, how much of the compressed KV it sees, how many rows it selects) is
 // known on the host and passed by value.
 #pragma once
+#include "ds4_peer_cuda_compat.cuh"
 
 #include <cstddef>
 #include <cstdint>
@@ -504,7 +505,7 @@ constexpr int kAr2Piece = 8192;   // (float4s a piece: 128 KB of F32 rows, 64 KB
 void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 /// A group of two with pflags (DS4_AR2): ar2_kernel, the put and the sums in one pipelined launch
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 constexpr int kPeerArBlocks = 64, kPeerArFlagStride = 32;
 // Optional diagnostic written only by the first block to set the timeout bit.
 struct PeerArFailure {
@@ -530,6 +531,8 @@ struct PeerAr {
     uint64_t timeout_ticks = 0; // HIP wall_clock64 ticks, calibrated with hipDeviceAttributeWallClockRate.
 };
 bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s);
+/// load the transports' kernels on the current device before any of them spins (CUDA lazy loading; HIP: no-op)
+void peer_ar_preload();
 enum class PeerTransport { host, ar2, peer };
 struct PeerCalibration {
     PeerTransport selected = PeerTransport::host;

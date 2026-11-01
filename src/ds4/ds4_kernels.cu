@@ -3367,7 +3367,7 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 __global__ void __launch_bounds__(kThreads) ar_peer_kernel(float* x, int n4, PeerAr a, int mi, unsigned seq) {
     __shared__ int ready;
     if (threadIdx.x == 0) ready = (*reinterpret_cast<volatile unsigned*>(a.error) & 1u) == 0;
@@ -4633,7 +4633,7 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     pdl_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s) {
     if (!x || (reinterpret_cast<uintptr_t>(x) & 15u) || n <= 0 || n % 4 || mi < 0 || mi > 1 || !a.recv || !a.peer_recv ||
         (reinterpret_cast<uintptr_t>(a.recv) & 15u) || (reinterpret_cast<uintptr_t>(a.peer_recv) & 15u) || !a.flags ||
@@ -4641,6 +4641,22 @@ bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cuda
     const int blocks = std::max(1, std::min(kPeerArBlocks, cdiv(n / 4, kThreads)));
     ar_peer_kernel<<<blocks, kThreads, 0, s>>>(x, n / 4, a, mi, seq);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+// CUDA loads a kernel on a device at its first launch there (lazy loading, the default since CUDA 12.2), and with
+// peer access on that load can wait for the device's or its peer's running work. The transports' kernels spin for
+// their partner, so a first launch beside a spinning partner never returns: calibrate_peer submits both ranks from
+// one thread and hung for good on 8x RTX 3090 (NVLink pairs). Load them up front on the current device.
+void peer_ar_preload() {
+#if !defined(STRATA_USE_HIP)
+    cudaFuncAttributes fa{};
+    (void) cudaFuncGetAttributes(&fa, ar_peer_kernel);
+    (void) cudaFuncGetAttributes(&fa, ar_sum_kernel);
+    (void) cudaFuncGetAttributes(&fa, xfer_put_kernel);
+    (void) cudaFuncGetAttributes(&fa, xfer_get_kernel);
+    (void) cudaFuncGetAttributes(&fa, ar2_kernel<true>);
+    (void) cudaFuncGetAttributes(&fa, ar2_kernel<false>);
+    (void) cudaGetLastError();
+#endif
 }
 #endif
 
