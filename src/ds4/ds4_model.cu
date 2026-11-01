@@ -19216,9 +19216,25 @@ struct Model::Impl {
             said = true;
         }
         int per = 0;   // (the widest chunk)
-        auto part = [&](int a0, int a1) {   // rows [a0, a1) in equal chunks of at most `chunk`
+        // a run's own chunk on a layer split: n / (DS4_CHUNK_PER_GROUP (2) x groups) rows, at least DS4_CHUNK_AUTO_MIN (1024; not DS4_CHUNK_MIN,
+        // the windows-vs-chunks threshold)
+        // and at most `chunk` - a short prompt in one chunk ran its groups one after another (4K on 4 GPUs: 4 stages
+        // back to back); smaller chunks keep every group busy, each chunk re-streaming the experts it picks
+        // (DS4_CHUNK_AUTO=0: `chunk` as before)
+        int cr = chunk;
+        {
+            static const bool on = std::getenv("DS4_CHUNK_AUTO") == nullptr || std::atoi(std::getenv("DS4_CHUNK_AUTO")) != 0;
+            static const int pg = std::getenv("DS4_CHUNK_PER_GROUP") ? std::max(1, std::atoi(std::getenv("DS4_CHUNK_PER_GROUP"))) : 2;
+            static const int cmin = std::getenv("DS4_CHUNK_AUTO_MIN") ? std::max(16, std::atoi(std::getenv("DS4_CHUNK_AUTO_MIN"))) : 1024;
+            const int G = (int) groups.size();
+            if (on && G > 1) {
+                const int want = (n + pg * G - 1) / (pg * G);
+                cr = std::min(chunk, std::max(cmin, (want + 15) / 16 * 16));
+            }
+        }
+        auto part = [&](int a0, int a1) {   // rows [a0, a1) in equal chunks of at most `cr`
             if (a1 <= a0) return;
-            const int nc = (a1 - a0 + chunk - 1) / chunk, w = (a1 - a0 + nc - 1) / nc;
+            const int nc = (a1 - a0 + cr - 1) / cr, w = (a1 - a0 + nc - 1) / nc;
             for (int x = a0; x < a1; x += w) fp.ends.push_back(std::min(x + w, a1));
             per = std::max(per, w);
         };
