@@ -12,13 +12,21 @@ Both ranks must support HIP peer access, fine-grained device allocations and a q
 
 Only two-member groups using the batch prompt loader are eligible. Single-GPU execution performs no peer queries, allocation or timing. Groups of three or more, decode/verification windows, logits gathering and pipeline handoffs keep their existing paths. `MAYA_DS4_AR2_DECODE` remains independent.
 
-Automatic mode logs `PEER_AR_AUTO` with GPU IDs, payload size, sample count, candidate median times, selected transport, calibration duration and completion status. An active peer pair also logs `exact peer prefill all-reduce enabled`; do not infer activation from the environment setting alone.
+Automatic mode logs `PEER_AR_AUTO` with GPU IDs, payload size, sample count, candidate median times, selected transport, calibration duration and completion status. `budget_used_ms` excludes probe allocation/initialization, while `elapsed_ms` includes them. An active peer pair also logs `exact peer prefill all-reduce enabled`; do not infer activation from the environment setting alone.
 
 ## Startup calibration
 
 The probe uses private synthetic inputs, one warmup per candidate and up to six rotated timing rounds, requiring at least three samples per candidate. Every result is checked exactly before it can be selected. Flags and sequence state are reset before inference; model activations, weights and expert placement are untouched. Peer buffers are released if host or AR2 wins. The chosen transport stays fixed for that model instance.
 
-The target is roughly 0.5–2 seconds of startup overhead, with a shared three-second submission/polling budget across all eligible groups. A current R9700-pair primitive test completed calibration in 237 ms at 4096 x 5120 floats (host 18.16 ms, AR2 7.14 ms, peer 3.46 ms per reduction). These are collective timings, not end-to-end model speeds. An incomplete, safely drained probe keeps the existing transport. Incorrect results or undrained work refuse model loading. GPU driver calls cannot be forcibly interrupted by this userspace budget; this is not a hard recovery deadline for driver hangs.
+The sampling allowance is three seconds shared across all eligible groups. Persistent peer-buffer allocation and private probe initialization do not consume that allowance; large prompt chunks can make these setup calls costly. Once the allowance expires, no further candidate is submitted. An already-submitted candidate gets a separate bounded drain wait of up to 2.5 seconds, allowing the peer kernel's two-second timeout to finish. Its output and transport error are still checked before any fallback, flag reset or buffer release. Sampling and draining time are charged against the allowance remaining for later groups, rather than granting three seconds to every pair.
+
+A current R9700-pair primitive test completed calibration in 237 ms at 4096 x 5120 floats (host 18.16 ms, AR2 7.14 ms, peer 3.46 ms per reduction). These are historical collective timings, not end-to-end model speeds or measurements of the revised budget handling. An incomplete, safely drained and valid probe keeps the existing transport. Incorrect results, stream errors, device timeouts or undrained work refuse model loading. Setup and draining can extend startup beyond the sampling allowance. GPU driver calls cannot be forcibly interrupted by this userspace budget; this is not a hard recovery deadline for driver hangs.
+
+## Virtualized AMD troubleshooting
+
+A Proxmox/VFIO user with two RX 7900 XTX cards reported that the guest's QEMU PCIe root ports did not advertise AtomicOps, despite host support. The guest logged `PCIE atomic ops is not supported`; peer flags were not observed and the probe timed out. On that particular configuration, setting `HSA_FORCE_FINE_GRAIN_PCIE=1` in the engine process environment before startup allowed the exact chain, timeout and poison/drain tests to pass. See [the hardware report](https://github.com/mw00/project-maya/pull/592#issuecomment-6548674176).
+
+This is a platform-specific troubleshooting option, not a default or a substitute for compatible/coherent peer access. If testing it, validate the standalone transport test on the actual guest and GPU pair before enabling peer transport for serving. If validation fails, retain host transport (`MAYA_DS4_HIP_PEER_AR=0`). This VM workaround has not been independently reproduced by this patch.
 
 ## Memory and failure handling
 
@@ -37,9 +45,13 @@ Build a HIP/gfx1201 tree, then:
 ```sh
 cmake --build build-hip --target maya-ds4 ds4_peer_allreduce_test -j 4
 HIP_VISIBLE_DEVICES=0,1 ./build-hip/ds4_peer_allreduce_test
+# Larger payload regression (needs about 1.7 GiB spare VRAM per rank):
+HIP_VISIBLE_DEVICES=0,1 ./build-hip/ds4_peer_allreduce_test 16384
 ```
 
 Choose the two visible IDs appropriate to the machine. The standalone test needs about 800 MiB spare VRAM per rank and 640 MiB pinned host memory. It returns 77 when the selected pair lacks peer access, a queryable clock or sufficient spare VRAM. It compares 256 chained variable-size collectives against the existing host transport, with guarded outputs, signed zero, subnormals, extreme finite values, sequence wraparound and payloads through 8192 x 5120 floats. It also checks automatic selection against all three transports, a zero-budget fallback, explicit exclusion of AR2, first-sequence exact reuse after calibration, invalid argument rejection, an absent peer with a 50 ms physical deadline, and 32 subsequent poisoned calls preserving the first error record. The test's reset helper is only for isolated cases; the runtime never resets a failed transport.
+
+The 1 ms calibration case checks that an exhausted sampling allowance returns a valid, quiescent, incomplete result. The optional `16384` argument increases both the allocation capacity and the timed calibration payload. It requires about 1.7 GiB spare VRAM per rank and 1.25 GiB pinned host memory. The host-only `tests/ds4_peer_poll_test.cpp` runs in CI with a deterministic clock: it covers sampling already expired, unequal rank completion, the independent drain deadline and stream-query errors. It does not establish GPU/VM coherence or replace hardware validation.
 
 Current-base full-model startup checks passed in auto, disabled, explicit AR2=1, and single-GPU modes. Automatic selection chose peer in 222 ms; auto/off/AR2 completed the same 1,213-token prompt with identical short greedy text. Disabled, explicit-AR2 and single-GPU runs emitted no calibration or peer-enable line. This smoke check does not establish full-logit parity or broad model quality.
 

@@ -1,5 +1,6 @@
 // Small, startup-only exact-F32 transport comparison. Never uses model activations or weights.
 #include "ds4_kernels.cuh"
+#include "ds4_peer_poll.hpp"
 #include <hip/hip_runtime.h>
 #include <algorithm>
 #include <array>
@@ -33,7 +34,6 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
                                const PeerAr peer[2], int n, double budget_ms) {
     PeerCalibration result;
     const auto start = Clock::now();
-    const auto deadline = start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(budget_ms));
     std::array<ProbeRank, 2> rank{};
     ArGroup host = original;
     host.ar2 = 0;
@@ -41,22 +41,19 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
     int previous = 0;
     hipGetDevice(&previous);
     bool launched = false;
-    auto expired = [&] { return Clock::now() >= deadline; };
     auto wait = [&] {
-        for (;;) {
+        return drain_peer_probe([&] {
             bool ready = true;
             for (int m = 0; m < 2; ++m) {
                 if (!rank[m].stream) continue;
-                if (hipSetDevice(ids[m]) != hipSuccess) return false;
+                if (hipSetDevice(ids[m]) != hipSuccess) return PeerPoll::error;
                 const auto status = hipStreamQuery(rank[m].stream);
-                if (status != hipSuccess && status != hipErrorNotReady) return false;
+                if (status != hipSuccess && status != hipErrorNotReady) return PeerPoll::error;
                 if (status == hipErrorNotReady) (void) hipGetLastError();
                 ready = ready && status == hipSuccess;
             }
-            if (ready) return true;
-            if (expired()) return false;
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
+            return ready ? PeerPoll::ready : PeerPoll::pending;
+        }, [] { return Clock::now(); }, [] { std::this_thread::sleep_for(std::chrono::microseconds(50)); });
     };
     auto reset_flags = [&] {
         std::memset(host.flags, 0, size_t(host.nm) * host.slots * 32 * sizeof(unsigned));
@@ -72,7 +69,6 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
     };
     bool ok = n > 0 && n % 4 == 0 && size_t(n) <= host.stride && host.nm == 2 && budget_ms > 0;
     for (int m = 0; m < 2 && ok; ++m) {
-        if (expired()) { ok = false; break; }
         auto& r = rank[m];
         ok = hipSetDevice(ids[m]) == hipSuccess &&
              hipStreamCreateWithFlags(&r.stream, hipStreamNonBlocking) == hipSuccess &&
@@ -83,6 +79,13 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
              hipEventCreateWithFlags(&r.done, hipEventDisableTiming) == hipSuccess;
     }
     if (ok) ok = reset_flags();
+    // Private allocations/initialization do not consume the shared sampling
+    // allowance. Once a candidate is submitted, wait() drains it independently
+    // of this deadline and its result is still checked exactly.
+    const auto sample_start = Clock::now();
+    const auto deadline = sample_start + std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double, std::milli>(budget_ms));
+    auto expired = [&] { return Clock::now() >= deadline; };
     const unsigned input[2] = {0x3f3f3f3fu, 0x40404040u};
     float left = 0, right = 0;
     std::memcpy(&left, input, sizeof(float));
@@ -135,6 +138,7 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
             if (ok && round >= 0) times[mode].push_back(elapsed);
         }
     }
+    result.budget_used_ms = std::chrono::duration<double, std::milli>(Clock::now() - sample_start).count();
     if (ok) {
         result.samples = int(std::min(times[0].size(), times[2].size()));
         if (ar2) result.samples = std::min(result.samples, int(times[1].size()));
