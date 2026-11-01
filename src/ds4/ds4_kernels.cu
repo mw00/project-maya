@@ -3833,6 +3833,14 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
     pdl_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
     pdl_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
 }
+void moe_sort_count(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, cudaStream_t s) {
+    pdl_launch(moe_sort_kernel<false>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, (int*) nullptr, (int*) nullptr);
+    pdl_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
+}
+void moe_sort_fill(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
+                   cudaStream_t s) {
+    pdl_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
+}
 void ep_gather(const float* x, const int* idx, int n, float* out, int dim, cudaStream_t s) {
     if (n > 0) pdl_launch(ep_gather_kernel, dim3(cdiv(dim, kThreads), n), kThreads, 0, s, x, idx, out, dim);
 }

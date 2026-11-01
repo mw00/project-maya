@@ -426,6 +426,10 @@ void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 /// bounds[n_vs + 1], row_tok[r], pos[t][i] (the pick's sorted row, rows kPicks apart).
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s);
+/// moe_sort in two steps (DS4_EP: the slots may change between them, bounds with them)
+void moe_sort_count(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, cudaStream_t s);
+void moe_sort_fill(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
+                   cudaStream_t s);
 /// out[r] = x[idx[r]], rows of dim floats (DS4_EP: the helpers' rows, gathered)
 void ep_gather(const float* x, const int* idx, int n, float* out, int dim, cudaStream_t s);
 /// acc[t] += w[t][i] * y[pos[t][i] - r0] for each pick of t (in pick order) whose sorted row is in [r0, r1).

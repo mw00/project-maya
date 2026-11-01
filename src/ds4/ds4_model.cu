@@ -6429,8 +6429,8 @@ struct Model::Impl {
         ep_run = true;
         return true;
     }
-    // layer L0 routed (bounds b by virtual slot, this device's stream synced): the split, the second sort, b as it now is,
-    // the gather, the helpers told.  No helpers (a short layer): nothing changes
+    // layer L0 routed and its picks counted (bounds b by virtual slot, this device's stream synced): the split, b as it now
+    // is, the rows placed (moe_sort's second pass), the gather, the helpers told.  No helpers (a short layer): only the rows
     bool ep_plan(Dev& d, Chunk& c, Layer& L0, Layer& l, int T, int n_vs, std::vector<int>& b, std::string& err) {
         c.ep_posted = 0;
         const double t0 = now_ms();
@@ -6453,7 +6453,10 @@ struct Model::Impl {
         }
         int H = ep_env();
         while (H > 0 && (int) light.size() / H < min_items) --H;
-        if (H == 0) return true;
+        if (H == 0) {
+            moe_sort_fill(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
+            return true;
+        }
         // the owner's share first (its likely ones and busy ones count), the busiest of the light ones
         std::stable_sort(light.begin(), light.end(), [](const Cand& a, const Cand& x) { return a.rows > x.rows; });
         const size_t total = n_rest + (size_t) c.n_spec, target = total / (size_t) (H + 1), have = own.size() + (size_t) c.n_spec;
@@ -6478,8 +6481,12 @@ struct Model::Impl {
         // the new virtual slots: the likely ones as they are, the owner's, the helpers' one after another, the unpicked
         std::vector<char> done((size_t) L0.n_exp, 0);
         int j = L0.pv_n + c.n_spec;
+        std::vector<int> cnt((size_t) n_vs, 0);   // (the rows of each new slot, from the counted bounds)
+        for (int v = 0; v < j; ++v) cnt[(size_t) v] = b[(size_t) v + 1] - b[(size_t) v];
+        const auto rows_of = [&](int e) { return b[(size_t) vs[e] + 1] - b[(size_t) vs[e]]; };
         c.ep_own.clear();
         for (int e : own) {
+            cnt[(size_t) j] = rows_of(e);
             vs[e] = j;
             c.ep_own.push_back({e, j++});
             done[(size_t) e] = 1;
@@ -6490,6 +6497,7 @@ struct Model::Impl {
             r.items.clear();
             vh[(size_t) h] = j;
             for (int e : hs[(size_t) h]) {
+                cnt[(size_t) j] = rows_of(e);
                 vs[e] = j;
                 r.items.push_back({e, j++});
                 done[(size_t) e] = 1;
@@ -6498,11 +6506,12 @@ struct Model::Impl {
         vh[(size_t) H] = j;
         for (int e : L0.host_list)
             if (vs[e] >= L0.pv_n + c.n_spec && !done[(size_t) e]) vs[e] = j++;
+        b[0] = 0;
+        for (int v = 0; v < n_vs; ++v) b[(size_t) v + 1] = b[(size_t) v] + cnt[(size_t) v];
+        std::copy(b.begin(), b.end(), c.bounds_pin);
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));
-        moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
-        CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
-        CK(cudaStreamSynchronize(s));
-        b.assign(c.bounds_pin, c.bounds_pin + n_vs + 1);
+        CK(cudaMemcpyAsync(c.bounds, c.bounds_pin, (size_t) (n_vs + 1) * 4, cudaMemcpyHostToDevice, s));
+        moe_sort_fill(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
         const int a1 = b[(size_t) vh[0]], ng = b[(size_t) vh[(size_t) H]] - a1;
         ep_gather(c.x, c.row_tok + a1, ng, c.ep_g, g.dim, s);
         CK(cudaEventRecord(c.ep_ev, s));
@@ -17758,7 +17767,8 @@ struct Model::Impl {
         }
         const int n_vs = L0.pv_n + (int) L0.host_list.size();
         CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));   // (this member's)
-        moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
+        if (ep_run) moe_sort_count(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, s);   // (ep_plan: the rows placed once split)
+        else moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
         CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
         // the shared expert into acc while the host waits for the bounds
         if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
