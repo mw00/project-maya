@@ -8554,6 +8554,14 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: CPU lane: its workers spin %d us idle before they sleep (DS4_LANE_SPIN_US)\n",
                          spin);
         (void) gg::mx_tier();   // (measured here, not on the first token)
+        // DS4_CPU_W16=1 (MAYA_DS4_CPU_W16): the AVX2 tier's EXL3 codebook products and byte sums in 16-bit lanes
+        // (kc::exl3_cpu_set_w16) - fewer port-0 uops a weight on Haswell / Broadwell; the same sums, the same bits.
+        // Off by default until measured (CPUs with more integer-multiply ports may not gain)
+        if (const char* v = ds4_env("DS4_CPU_W16"); v != nullptr && std::atoi(v) != 0) {
+            kc::exl3_cpu_set_w16(true);
+            std::fprintf(stderr, "ds4: CPU lane: EXL3 codebook products in 16-bit lanes %s (DS4_CPU_W16)\n",
+                         kc::exl3_cpu_w16() ? "on" : "off - this CPU's lane does not run the AVX2 tier");
+        }
         if (o.verbose) {
             int nthr = 0;
             for (auto& p : pools) nthr += p->size();
@@ -10373,6 +10381,23 @@ struct Model::Impl {
             const long long nc = ++calls;
             if (nc % 256 == 0 || bad)
                 std::fprintf(stderr, "ds4: CPU flow check: %lld calls, %lld differed\n", nc, diffs.load());
+        }
+        // DS4_CPU_W16_CHECK=1 (with DS4_CPU_W16=1): each call's outputs against the same call without the 16-bit lanes,
+        // bit for bit (twice the time; the switch is off only between the two runs, when no lane job is running)
+        static const bool w16_check = kc::exl3_cpu_w16() && std::getenv("DS4_CPU_W16_CHECK") != nullptr;
+        if (w16_check && ne > 0) {
+            int rows = 0;
+            for (const Ent& en : ents) rows = std::max(rows, en.slot0 + en.n);
+            std::vector<float> w16(c_yd.begin(), c_yd.begin() + (size_t) rows * E);
+            kc::exl3_cpu_set_w16(false);
+            exl3_experts(c, x, ldx, ents.data(), ne, part, nodes, phase, flow_on);
+            kc::exl3_cpu_set_w16(true);
+            const bool bad = std::memcmp(w16.data(), c_yd.data(), w16.size() * 4) != 0;
+            static std::atomic<long long> calls{0}, diffs{0};
+            if (bad) ++diffs;
+            const long long nc = ++calls;
+            if (nc % 256 == 0 || bad)
+                std::fprintf(stderr, "ds4: CPU W16 check: %lld calls, %lld differed\n", nc, diffs.load());
         }
     }
 

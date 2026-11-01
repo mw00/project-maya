@@ -1593,6 +1593,16 @@ if(STRATA_BUILD_TESTS)
   if(STRATA_CPU_X86)
     add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
     target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
+    # exl3_cpu_set_w16 (the AVX2 tier's codebook product and byte sum in 16-bit lanes, DS4_CPU_W16) against the 32-bit
+    # path and a scalar model, bit for bit: every bitrate, 1-8 and 11 activations, the bands, the split-K rows, the
+    # GEMM, and all 65536 states' byte sums (synthetic weights, no GPU); the second entry keeps an AVX-512 host on AVX2
+    add_executable(exl3_cpu_w16_test tests/exl3_cpu_w16_test.cpp)
+    target_link_libraries(exl3_cpu_w16_test PRIVATE strata_kernels_cpu)
+    enable_testing()
+    add_test(NAME exl3_cpu_w16_test COMMAND exl3_cpu_w16_test)
+    add_test(NAME exl3_cpu_w16_test_avx2 COMMAND exl3_cpu_w16_test)
+    set_tests_properties(exl3_cpu_w16_test exl3_cpu_w16_test_avx2 PROPERTIES TIMEOUT 600)
+    set_tests_properties(exl3_cpu_w16_test_avx2 PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1")
   endif()
 
   if(WIN32)
