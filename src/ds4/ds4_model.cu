@@ -6293,8 +6293,9 @@ struct Model::Impl {
         return true;
     }
     // ---- DS4_EP=N (1..3; unset: off): expert parallel on the relay.  A run on it takes its chunks one at a time, so one
-    // device works at a time and three copy channels are idle.  After a layer routes, its owner keeps its busy experts (rows > DS4_EP_ROWS, 16) and
-    // about its share of the rest, and hands N idle devices the others - most of the bytes, few of the rows.  The routing
+    // device works at a time and three copy channels are idle.  After a layer routes, its owner keeps the busiest of its experts, up to its share
+    // of them (DS4_EP_ROWS: and any over that many rows), and hands N idle devices the others - most of the bytes, few of
+    // the rows.  The routing
     // is sorted again so each helper's rows are one run; the owner gathers those rows of x; each helper pulls its run
     // over P2P, DMAs its experts from the pinned copies over its own link and runs the sets into its own y; the owner
     // pulls y back and combines it as a batch of its own.  A helper works on its own device thread, on its own chunk
@@ -6440,7 +6441,7 @@ struct Model::Impl {
         };
         std::vector<int> own;
         std::vector<Cand> light;
-        static const int thr = ep_env_i("DS4_EP_ROWS", 16), min_items = ep_env_i("DS4_EP_MIN_ITEMS", 8);
+        static const int thr = ep_env_i("DS4_EP_ROWS", INT_MAX), min_items = ep_env_i("DS4_EP_MIN_ITEMS", 8);
         const uint8_t* src[3];
         size_t n_rest = 0;
         for (int e : L0.host_list) {
