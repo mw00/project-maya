@@ -10967,6 +10967,19 @@ struct Model::Impl {
         c.accd = c_accd.data();
         c.yd = c_yd.data();
         if (!c.cnt) c.alloc_counters(2);
+        // DS4_CPU_SPLIT_COLS=1 (MAYA_DS4_CPU_SPLIT_COLS): a call of few entries (a decoded token's one or two experts a
+        // layer) has its gate / up and down pieces cut by columns too, so more of the lane's threads share it
+        // (ds4_cpu_exl3.hpp, exl3_split_runs: the threads of the smallest node's batch) - every sum the same, bit for
+        // bit.  Off by default until measured
+        static const bool split_cols = [] {
+            const char* v = ds4_env("DS4_CPU_SPLIT_COLS");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        c.split_w = 0;
+        if (split_cols) {
+            c.split_w = pools[0]->size();   // (node 0's workers and the caller, the others' workers)
+            for (int X = 1; X < NH; ++X) c.split_w = std::min(c.split_w, pools[(size_t) X]->size() - 1);
+        }
         auto part = [&](int e, int X, int r) {
             const uint8_t* b = l.hh[(size_t) e][(size_t) X];
             kc::Exl3Part p;
@@ -10980,7 +10993,8 @@ struct Model::Impl {
         };
         auto nodes = [&](int n, const std::function<void(int)>* f, int ph) { run_nodes(n, f, ph); };
         // DS4_CPU_FLOW=0: the four steps as four batches (as before); DS4_CPU_STATS times them, so it takes them too.
-        // DS4_CPU_FLOW_CHECK=1: each call's flow outputs against the steps', bit for bit (twice the time)
+        // DS4_CPU_FLOW_CHECK=1: each call's flow outputs against the steps', bit for bit (twice the time); with
+        // DS4_CPU_SPLIT_COLS the steps uncut, so the check covers the cut too
         static const bool flow_on =
             !stats && (std::getenv("DS4_CPU_FLOW") == nullptr || std::atoi(std::getenv("DS4_CPU_FLOW")) != 0);
         static const bool flow_check = flow_on && std::getenv("DS4_CPU_FLOW_CHECK") != nullptr;
@@ -10990,7 +11004,10 @@ struct Model::Impl {
             int rows = 0;
             for (const Ent& en : ents) rows = std::max(rows, en.slot0 + en.n);
             std::vector<float> fl(c_yd.begin(), c_yd.begin() + (size_t) rows * E);
+            const int split_w = c.split_w;
+            c.split_w = 0;
             exl3_experts(c, x, ldx, ents.data(), ne, part, nodes, phase, false);
+            c.split_w = split_w;
             const bool bad = std::memcmp(fl.data(), c_yd.data(), fl.size() * 4) != 0;
             static std::atomic<long long> calls{0}, diffs{0};
             if (bad) ++diffs;
