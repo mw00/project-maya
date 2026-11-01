@@ -5956,6 +5956,15 @@ struct Model::Impl {
             ++c.it_ram;
             return;
         }
+        // (a pinned copy in one part, any format - cp_pin's: DMA'd from where it lies, as above; the readers' memcpy
+        // into staging first was the 4-GPU prompt's limit on the IQ quants, ~2.7 GB/s a GPU; DS4_FLOW_COPY_DMA=0: not)
+        static const bool copy_dma = std::getenv("DS4_FLOW_COPY_DMA") == nullptr || std::atoi(std::getenv("DS4_FLOW_COPY_DMA")) != 0;
+        if (in_ram && copy_mode && cp_dma && copy_dma && NH == 1) {
+            const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
+            for (int r = 0; r < 3; ++r) it.src[r] = p + cp_lay[(size_t) l.il][(size_t) r] + mx_read_off(l, mi, r);
+            ++c.it_ram;
+            return;
+        }
         if (in_ram)   // (copied into staging by io, then DMA'd; copy_mode: from its NH parts, flow_pump)
             it.ram = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] : ram_slots[(size_t) l.ram[(size_t) e]];
         it.dpart = down_part && l.nm > 1 && !(in_ram && copy_mode);   // (DS4_FLOW_DOWN_PART: through staging)
