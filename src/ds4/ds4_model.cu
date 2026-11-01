@@ -34,6 +34,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 #include "ds4_path_policy.hpp"
+#include "ds4_place.hpp"
 #include "ds4_prefill_stats.hpp"
 #include "ds4_prompt_mem.hpp"
 #include "ds4_ram_slice.hpp"
@@ -1945,6 +1946,11 @@ struct Model::Impl {
     // protocol at 3.5 bits, 8 / 16 / 24 / 32 of them: 59.0 / 61.5 / 62.2 / 62.9 tok/s, a routing trace's VRAM-neutral
     // optimum ~32), at most DS4_RECENT_FILLS (2) new ones a layer a tick
     int recent_n = 0;
+    // DS4_RECENT_FIT (MAYA_DS4_RECENT_FIT, ds4_place.hpp; unset or 0: off, the split below as before): 1 - a layer whose
+    // slots cannot hold the whole recent set beside a static and the spare keeps as many recent slots as leave one,
+    // not none; 2 - also the queue: each layer its recent set, a static and the spare first, the slots past them priced
+    // as the statics they add (its floor over the budget: as at 1)
+    const int recent_fit = place::recent_fit_of(ds4_env("DS4_RECENT_FIT"));
     const int recent_fills = std::max(1, (int) env_f("DS4_RECENT_FILLS", 2.0f));
     // a fill once the expert was on the CPU lane DS4_RECENT_NEED (2) times in the layer's last DS4_RECENT_WIN (8)
     // ticks: a one-off pick stays out (a routing trace of 12 answers, 16 slots: 8.9% of picks on the CPU lane for
@@ -6676,6 +6682,12 @@ struct Model::Impl {
             for (int m = 0; m < l.nm; ++m) s += (double) unit(member(l, m));
             return s / l.nm;
         };
+        // (DS4_RECENT_FIT: a device that lends its EXL3 cache slots keeps the default split - its lent tail is its recent
+        //  slots alone; fit0: the default queue's slots of a layer DS4_RECENT_FIT=2 placed, for the load's line)
+        auto x3_lends = [&](int di) {
+            return (size_t) di < chunks.size() && chunks[(size_t) di] != nullptr && chunks[(size_t) di]->x3_lend;
+        };
+        std::vector<int> fit0(recent_fit >= 2 ? L.size() : 0, -1);
         for (size_t gi = 0; gi < groups.size(); ++gi) {
             std::vector<double> mroom;   // each member's
             bool charged = false;
@@ -6793,7 +6805,32 @@ struct Model::Impl {
                     want += (double) ucount(l) * l.n_exp;
                     for (int e = 0; e < l.n_exp; ++e) seen += prof[(size_t) l.il * g.n_exp + e];
                 }
-            if (seen > 0 && std::getenv("DS4_PLACE_UNIFORM") == nullptr) {
+            // DS4_RECENT_FIT=2 (ds4_place.hpp): by the profile, each layer first its recent set, a static and the spare,
+            // then the queue below with each slot priced at the static it adds (the split keeps recent_n + 1 of a
+            // layer's slots for the cache); the floor over the budget, or no recent slots here: as at 1
+            bool fitted = false;
+            if (recent_fit >= 2 && seen > 0 && std::getenv("DS4_PLACE_UNIFORM") == nullptr && recent_n > 0 &&
+                o.expert_cache && (!file_experts || (pk.gguf && ln_land)) &&
+                std::none_of(groups[gi].mem.begin(), groups[gi].mem.end(), x3_lends)) {
+                std::vector<place::QLayer> q;
+                for (const Layer& l : L)
+                    if (l.grp == (int) gi && !l.mtp && l.n_cls == 1)
+                        q.push_back({l.il, l.n_exp, ucount(l), place::shares(prof.data() + (size_t) l.il * g.n_exp, l.n_exp)});
+                std::vector<int> s0, s2;
+                place::queue(q, budget, recent_n, 0, s0);
+                fitted = place::queue(q, budget, recent_n, 2, s2);
+                for (size_t i = 0; i < q.size() && fitted; ++i) {
+                    L[(size_t) q[i].il].n_vram = s2[i];
+                    fit0[(size_t) q[i].il] = s0[i];
+                }
+                if (!fitted)
+                    std::fprintf(stderr, "ds4: DS4_RECENT_FIT=2: group %zu's floor (%d recent slots, a static and the spare "
+                                         "a layer) is over its %.2f GB for experts: placed as at 1\n",
+                                 gi, recent_n, budget / 1e9);
+            }
+            if (fitted) {
+                // (placed above)
+            } else if (seen > 0 && std::getenv("DS4_PLACE_UNIFORM") == nullptr) {
                 // by the profile: the room to the experts that take the largest share of their layer's routes a byte
                 // (every layer routes as often; one whose routes spread wider gets more of the room) - each layer's
                 // shares smoothed a tenth toward even, so a layer the profile barely saw is not left without
@@ -7018,6 +7055,13 @@ struct Model::Impl {
                                      "(DS4_TP_BORROW)\n", d.id, cap / 1e9, k, chunk);
             }
         }
+        // (DS4_RECENT_FIT: the split against the default rule's - the layers it gave recent slots, the statics now and by
+        //  the default, the bytes of the experts that left the statics: each keeps a copy in RAM for the CPU lane)
+        struct {
+            int layers = 0, rmin = 1 << 30, rmax = 0, now = 0, def = 0;
+            double bytes = 0;
+        } fit_note;
+        if (recent_fit > 0 && o.verbose) std::fprintf(stderr, "ds4: DS4_RECENT_FIT=%d, each layer:\n", recent_fit);
         for (Layer& l : L) {
             // the hottest experts of the profile first, then by index
             std::vector<int> order((size_t) l.n_exp);
@@ -7076,8 +7120,15 @@ struct Model::Impl {
             // a layer with experts on both sides keeps one VRAM slot free for the cache's swaps
             l.n_slots = std::min(l.n_vram, l.n_exp);
             if (o.expert_cache && l.n_slots >= 2 && l.n_slots < l.n_exp) {   // (every expert fits: nothing to swap)
-                const int r = recent_n > 0 && !l.mtp && (!file_experts || (pk.gguf && ln_land)) &&
-                                      l.n_slots - 1 - recent_n >= 1 ? recent_n : 0;
+                int r = recent_n > 0 && !l.mtp && (!file_experts || (pk.gguf && ln_land)) &&
+                                l.n_slots - 1 - recent_n >= 1 ? recent_n : 0;
+                // (DS4_RECENT_FIT: a layer too small for the whole set keeps as many as leave a static and the spare -
+                //  not an EXL3 lender's)
+                bool x3l = false;
+                for (int m = 0; m < l.nm && recent_fit > 0; ++m) x3l = x3l || x3_lends(member(l, m).dev);
+                if (recent_fit > 0 && r == 0 && !x3l)
+                    r = place::recent_slots(l.n_slots, recent_n, !l.mtp && (!file_experts || (pk.gguf && ln_land)),
+                                            recent_fit);
                 l.n_vram = l.n_slots - 1 - r;   // (the recent slots: [n_vram, n_vram + r), from the profile's coldest)
                 l.spare_vram = l.n_slots - 1;
                 l.rc_base = l.n_vram;
@@ -7093,6 +7144,24 @@ struct Model::Impl {
             } else {
                 l.n_vram = l.n_slots;
                 l.spare_vram = -1;
+            }
+            if (recent_fit > 0) {   // (DS4_RECENT_FIT: this layer against the default rule, for the load's line)
+                const size_t li = (size_t) (&l - &L[0]);
+                const int s0 = li < fit0.size() && fit0[li] >= 0 ? fit0[li] : l.n_slots;
+                const place::Split d = place::split(s0, l.n_exp, o.expert_cache, recent_n,
+                                                    !l.mtp && (!file_experts || (pk.gguf && ln_land)), 0);
+                if (d.recent == 0 && l.rc_n > 0) {
+                    ++fit_note.layers;
+                    fit_note.rmin = std::min(fit_note.rmin, l.rc_n);
+                    fit_note.rmax = std::max(fit_note.rmax, l.rc_n);
+                }
+                fit_note.now += l.n_vram;
+                fit_note.def += d.statics;
+                fit_note.bytes += (double) (d.statics - l.n_vram) * (double) l.blob;
+                if (o.verbose)
+                    std::fprintf(stderr, "  layer %d: %d slots - %d statics, %d recent, %d spare (the default rule: %d slots - "
+                                         "%d statics, %d recent)\n",
+                                 l.il, l.n_slots, l.n_vram, l.rc_n, l.spare_vram >= 0 ? 1 : 0, d.slots, d.statics, d.recent);
             }
             for (int i = 0; i < l.n_vram; ++i) l.slot[(size_t) order[(size_t) i]] = i;
             // (the last n_tail slots - the coldest of them, and the cache's spare - in the device's tail region)
@@ -7233,6 +7302,18 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) x.dev].id);
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
+        }
+        if (recent_fit > 0) {
+            if (fit_note.layers > 0)
+                std::fprintf(stderr, "ds4: DS4_RECENT_FIT=%d: %d layers keep %d-%d recent slots where the default split keeps "
+                                     "none; %d experts stay in VRAM (the default: %d), so %d more keep a copy in RAM for the "
+                                     "CPU lane - about %.2f GB more RAM (file pages where the experts are read in place)\n",
+                             recent_fit, fit_note.layers, fit_note.rmin, fit_note.rmax, fit_note.now, fit_note.def,
+                             fit_note.def - fit_note.now, fit_note.bytes / 1e9);
+            else
+                std::fprintf(stderr, "ds4: DS4_RECENT_FIT=%d: every layer keeps its whole recent set or none can (DS4_RECENT "
+                                     "%d), %d experts stay in VRAM (the default: %d)\n",
+                             recent_fit, recent_n, fit_note.now, fit_note.def);
         }
         for (const Layer& l : L)   // (DS4_DRAFT_VRAM: what each block kept - its slots, the cache's spare among them)
             if (l.mtp && !draft_vram.empty())

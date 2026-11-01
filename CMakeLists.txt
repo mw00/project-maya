@@ -252,6 +252,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
+  # maya-ds4's trunk expert placement (src/ds4/ds4_place.hpp): the shipped profile on the 2.25bpw EXL3 pack's experts
+  # gives the slots and statics a real load printed, the functions match the engine's own code, and DS4_RECENT_FIT=1 /
+  # 2 keep a recent slot in every layer of 3 or more slots within the budget (host code only, no model, no GPU)
+  add_executable(ds4_place_test tests/ds4_place_test.cpp)
+  target_link_libraries(ds4_place_test PRIVATE strata_warnings)
+  add_test(NAME ds4_place_test COMMAND ds4_place_test ${CMAKE_CURRENT_SOURCE_DIR}/data/expert-profile-ds4.bin)
 endif()
 # maya-ds4's Engram reader: a batch read ahead (a prompt's next part's rows) waits behind the others, every read the
 # file's bytes (src/ds4/ds4_engram_io.hpp; a file in the temp folder, host code only)
