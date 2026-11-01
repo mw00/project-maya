@@ -628,7 +628,7 @@ def get_llama_cpp():
 
 
 def pip_install(packages, what):
-    """pip install into .venv, skipped when the same list was installed before."""
+    """uv (when it is on PATH) or pip into .venv, skipped when the same list was installed before."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
     try:
         have = json.loads(stamp.read_text()) if stamp.exists() else []
@@ -639,7 +639,11 @@ def pip_install(packages, what):
         ok(f"{what} already installed")
         return
     say(f"  Installing {what} ...")
-    run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need])
+    uv = shutil.which("uv")
+    if uv:   # ppc64le: pip resolves and builds these sdist by sdist; uv does the same work much faster
+        run([uv, "pip", "install", "--python", sys.executable, "--quiet", *need])
+    else:
+        run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need])
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
     ok(f"{what} installed")
 
