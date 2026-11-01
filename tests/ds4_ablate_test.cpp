@@ -6,6 +6,8 @@
 //   * refused: an adapter missing a writer (no routed experts) or a block, one for a deeper model, one whose
 //     writers carry different directions; a tensor offset that wraps around to bytes elsewhere in the file;
 //     out-of-range metadata; a zero direction; a non-F32 direction; a truncated file; a bad caller scale.
+// And the writes it is projected out of (Pick, --ablate-sites / --ablate-layers): the defaults take every write of every
+// layer (the drafter's past n_layer too), a pick only the named ones; malformed values and layers past the model refused.
 //
 // The fixtures are minimal GGUF v3 files written here (32-byte alignment, F32 tensors).
 #include "../src/ds4/ds4_ablate.hpp"
@@ -22,6 +24,7 @@
 
 namespace {
 using strata::ds4::ablate::load_direction;
+using strata::ds4::ablate::Pick;
 
 int g_fail = 0;
 void check(bool ok, const char* what) {
@@ -212,6 +215,55 @@ int main() {
               "abliterate.direction_layer out of int range: refused");
         check(!loads(mk(write("adscale", adapter_kv(-1.0f), adapter_tensors(2))), 0, 2, 0.0f),
               "a negative abliterate.scale: refused");
+    }
+
+    std::printf("--ablate-sites / --ablate-layers (Pick)\n");
+    {
+        namespace ab = strata::ds4::ablate;
+        std::string e;
+        const Pick all;
+        bool every = !all.narrowed();
+        for (int il : {0, 11, 39, 40, 41})   // (40, 41: the DSpark drafter's blocks past DSF's 40 layers)
+            every = every && all.takes(il, false) && all.takes(il, true);
+        check(every, "the defaults: every write of every layer, the drafter's too");
+        check(ab::describe(all) == ", projected out of every layer's attention and MoE writes",
+              "the defaults' start-up line is load_direction's own");
+
+        Pick hh;
+        check(ab::parse_sites("attn", hh, e) && ab::parse_layers("11-28", hh, e) && hh.narrowed(),
+              "attn + 11-28 (HuiHui's DSF edit) parsed");
+        check(hh.takes(11, false) && hh.takes(28, false) && hh.takes(20, false), "  its attention writes in 11..28");
+        check(!hh.takes(10, false) && !hh.takes(29, false) && !hh.takes(40, false), "  none outside (the drafter's either)");
+        check(!hh.takes(11, true) && !hh.takes(20, true), "  no MoE write");
+        check(ab::describe(hh) == ", projected out of layers 11-28's attention writes only", "  its start-up line");
+        check(ab::check_layers(hh, 40, e), "  inside a 40-layer model (DSF)");
+        check(!ab::check_layers(hh, 28, e) && e.find("layers 0-27") != std::string::npos, "  past a 28-layer model: refused");
+
+        Pick m;
+        check(ab::parse_sites("moe", m, e) && m.takes(5, true) && !m.takes(5, false) && m.narrowed(),
+              "moe: the MoE writes only, every layer");
+        check(ab::describe(m) == ", projected out of every layer's MoE writes only", "  its start-up line");
+        Pick one;
+        check(ab::parse_layers("7-7", one, e) && one.takes(7, false) && one.takes(7, true) && !one.takes(6, true) &&
+                  !one.takes(8, false), "one layer (7-7): both its writes, no other layer's");
+        Pick back;
+        check(ab::parse_sites("attn", back, e) && ab::parse_sites("all", back, e) && !back.narrowed(),
+              "a later --ablate-sites all restores both writes");
+
+        bool refused = true;
+        for (const char* bad : {"", "ATTN", "attention", "attn,moe", "none", " attn"}) {
+            Pick p;
+            refused = refused && !ab::parse_sites(bad, p, e) && p.attn && p.moe;
+        }
+        check(refused, "sites: anything but all / attn / moe refused, the pick untouched");
+        refused = true;
+        for (const char* bad : {"", "11", "11-", "-28", "28-11", "11-28-30", "a-b", "11 - 28", "+11-28", "11-0x1c",
+                                "-1-5", "0-4096", "99999-100000", "11-28 "}) {
+            Pick p;
+            refused = refused && !ab::parse_layers(bad, p, e) && p.first < 0;
+        }
+        check(refused, "layers: malformed, reversed, signed or past 4095 refused, the pick untouched");
+        check(ab::parse_layers("0-4095", one, e) && one.first == 0 && one.last == 4095, "layers 0-4095: the widest taken");
     }
 
     for (const auto& p : made) {

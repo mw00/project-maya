@@ -71,6 +71,9 @@ struct Options {
     std::string ablate;
     int ablate_layer = 0;
     float ablate_scale = 0.0f;
+    // which writes lose it (ds4_ablate.hpp's Pick): --ablate-sites all|attn|moe, --ablate-layers FIRST-LAST (empty: every
+    // layer, the drafter's too) - as given, checked when parsed and again at load
+    std::string ablate_sites = "all", ablate_layers;
     // --parallel: conversations held at once (1-8), each its own state - its position, tokens, checkpoints, window rings,
     // the compressors' partial groups, the compressed KV and the index keys (a full context's each); 1: as before
     int seqs = 1;
