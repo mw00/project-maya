@@ -152,6 +152,8 @@ void exl3_cpu_band_gemm(const Exl3Part&, const float* const*, int, int, int, flo
 bool exl3_cpu_band_acc_on(int, const Exl3Part&, const float* const*, int, int, int, int, float* const*) {
     return false;
 }
+void exl3_cpu_set_w16(bool) {}   // (no AVX2 tier here: nothing to switch)
+bool exl3_cpu_w16() { return false; }
 void exl3_cpu_band_out(const Exl3Part&, const float*, float, int, float*) { unsupported("the EXL3 CPU kernel"); }
 
 }  // namespace strata::kernels::cpu
