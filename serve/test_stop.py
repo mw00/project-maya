@@ -199,6 +199,16 @@ class ServerStops(unittest.TestCase):
         self.assertIn(f"[maya] stopping ({why}): the engine ends", out)
         self.assertEqual(gone(self.engine), [], "the engine outlived the server")
 
+    @unittest.skipUnless(FAKE_ENGINE, "the tokenizer's regex module")
+    def test_old_engine_name(self):
+        """--engine strata (the old name, in older run scripts) starts the configured engine, not the mock one."""
+        cmd = server_cmd(self.cfg, free_port())
+        cmd[cmd.index("maya")] = "strata"
+        p = Proc(cmd, stdin=subprocess.DEVNULL)
+        self.addCleanup(p.close)
+        self.assertTrue(p.until("ready:"), "the server did not start:\n" + "\n".join(p.seen))
+        self.assertTrue(descendants(p.p.pid), "no engine process: --engine strata ran the mock engine")
+
     def test_parent_pipe_closed(self):
         p = self.start(["--parent-pipe"], stdin=subprocess.PIPE)
         p.p.stdin.close()
