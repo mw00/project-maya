@@ -41,6 +41,17 @@ class StructuredResponses(ResponseCase):
         self.assertEqual(events[-1]["type"], "response.incomplete")
         self.assertFalse(any(e["type"] == "response.output_text.delta" for e in events))
 
+    def test_instructions_stay_the_system_message(self):
+        """The JSON note goes at the end of the leading system message: put ahead of `instructions` as a system
+        message of its own, it made them the second system message, which the template takes as a user turn."""
+        self.script('{"count":3}')
+        status, out = self.post(text=FORMAT, instructions="Count carefully.")
+        self.assertEqual(status, 200, out)
+        prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertLess(prompt.index("Count carefully."), prompt.index("JSON Schema"))
+        self.assertLess(prompt.index("JSON Schema"), prompt.index("<|im_start|>user\nhi"))
+        self.assertEqual(prompt.count("<|im_start|>user"), 1)
+
     def test_strict_function_arguments_are_validated_before_publication(self):
         schema = {"type": "object", "properties": {"key": {"type": "string", "enum": ["alpha"]}},
                   "required": ["key"], "additionalProperties": False}

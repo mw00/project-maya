@@ -7,7 +7,7 @@ import time
 import uuid
 
 from serve.response_store import ResponseStore  # compatibility import for existing callers
-from serve.response_schema import ResponseValidation, OutputValidationError
+from serve.response_schema import ResponseValidation, OutputValidationError, with_system_note
 
 
 def _string(value, name, *, empty=False):
@@ -264,7 +264,7 @@ def normalize_request(req):
     validation = ResponseValidation(req)
     instruction = validation.prompt()
     if instruction:
-        messages.insert(0, {"role": "system", "content": instruction})
+        messages = with_system_note(messages, instruction)
     normalized = {k: req[k] for k in ("temperature", "top_p", "reasoning", "stream", "parallel_tool_calls") if k in req}
     normalized.update(messages=messages, tools=tools, tool_choice=choice, _response_validation=validation)
     if "max_output_tokens" in req:
