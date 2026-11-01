@@ -1320,7 +1320,7 @@ class StrataEngine:
                 if line.startswith("T "):
                     if cancel.is_set():
                         return
-                    if TURN_TRACE and "first_t" not in TURN:
+                    if TURN_TRACE and "gen_start" in TURN and "first_t" not in TURN:
                         turn_mark("first_t")
                         turn_print(len(ids))
                     if want_lp:
@@ -2100,8 +2100,9 @@ class PromptMemo:
                     if e["changed"]:
                         l = min(l, e["mpos"][0]) if e["mpos"] else l
                     else:
-                        m = self.mark_re.search(e["marked"], 0, l)
-                        l = m.start() if m is not None else l
+                        for ch in self.marks:   # (str.find per mark: this class's regex takes a microsecond a character)
+                            i = e["marked"].find(ch, 0, l)
+                            l = i if i >= 0 else l
                 if l >= best_l:
                     best, best_l = e, l
             use, n_ids, m_at, t_at, c_sp, c_cut = None, 0, 0, 0, 0, 0
