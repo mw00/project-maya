@@ -32,6 +32,14 @@ bool exl3_cpu_available();
 /// The kernel the functions below run here: 2 AVX-512 (F, BW), 1 AVX2 + FMA (+ F16C), 0 scalar.  STRATA_FORCE_AVX2=1
 /// keeps an AVX-512 CPU on AVX2 (to compare the two; they give the same bits).
 int exl3_cpu_tier();
+/// STRATA_EXL3_AVX2_SHUF=1 (MAYA_EXL3_AVX2_SHUF): the AVX2 tier takes a state whose window shift is a whole number of
+/// bytes (8, 16 or 24 bits) with byte shuffles instead of vector shifts - for Haswell / Broadwell, where the shifts
+/// share the one port the multiplies and the byte sums are bound by.  The same states, so the same bits; off by
+/// default.  Read at the first AVX2 call and checked there against the shifts (kept off if any sum differs, with a
+/// line on stderr either way).  exl3_cpu_avx2_shuf says whether it is on; exl3_cpu_set_avx2_shuf sets it for the
+/// process, unchecked (tests: both forms in one run).  It changes tier 1 alone (exl3_cpu_band_acc_on's too).
+bool exl3_cpu_avx2_shuf();
+void exl3_cpu_set_avx2_shuf(bool on);
 /// xh = H(x * suh) (k values, k % 128 == 0); returns the sum of xh.
 float exl3_cpu_prepare(const Exl3Part& m, const float* x, float* xh);
 /// One 128-value block of that: xh[i] = H(x * suh)[i] for i < 128 (suh: the block's 128 scales); returns its sum.
