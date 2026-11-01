@@ -14,7 +14,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <utility>
@@ -380,14 +382,41 @@ EXL3_AVX2_INLINE Avx2Consts avx2_consts() {
     return {_mm256_set1_epi32((int) kMul1), _mm256_set1_epi8(1), _mm256_set1_epi16(1), _mm256_set1_epi32(0xffff)};
 }
 
+// STRATA_EXL3_AVX2_SHUF (the kernels' S = true): a window whose right shift is a whole number of bytes taken by byte
+// moves.  Haswell and Broadwell run every vector shift on port 0 alone - beside vpmulld (2 uops), vpmaddubsw and
+// vpmaddwd, the port this loop is bound by there - and vpshufb / vpblendw on port 5.  (b >> 8) & 0xffff and b >> 16
+// are one vpshufb (bytes 1-2 or 2-3 of each lane to bytes 0-1, zeros above); ((b >> 24) | (a << 8)) & 0xffff is one
+// vpblendw (a's low 16 bits, b's high 16) and one vpshufb (byte 3, then byte 0).  The same 16-bit states.
+template <int Q>   // (b >> 8 Q) & 0xffff, Q = 1 or 2
+EXL3_AVX2_INLINE __m256i avx2_bytes(__m256i b) {
+    static_assert(Q == 1 || Q == 2, "a 16-bit window inside the lane");
+    constexpr char z = (char) 0x80;
+    __m256i mk = _mm256_setr_epi8(Q, Q + 1, z, z, Q + 4, Q + 5, z, z, Q + 8, Q + 9, z, z, Q + 12, Q + 13, z, z, Q, Q + 1,
+                                  z, z, Q + 4, Q + 5, z, z, Q + 8, Q + 9, z, z, Q + 12, Q + 13, z, z);
+#if defined(__clang__)
+    __asm__("" : "+x"(mk));   // (clang turns the Q = 2 shuffle back into vpsrld; GCC 13 and MSVC keep vpshufb)
+#endif
+    return _mm256_shuffle_epi8(b, mk);
+}
+EXL3_AVX2_INLINE __m256i avx2_bytes3(__m256i a, __m256i b) {   // ((b >> 24) | (a << 8)) & 0xffff
+    constexpr char z = (char) 0x80;
+    return _mm256_shuffle_epi8(_mm256_blend_epi16(a, b, 0xAA),
+                               _mm256_setr_epi8(3, 0, z, z, 7, 4, z, z, 11, 8, z, z, 15, 12, z, z, 3, 0, z, z, 7, 4, z, z,
+                                                11, 8, z, z, 15, 12, z, z));
+}
+
 // row R's half H: its 8 states, and their codebook byte sums as F32
-template <int K, int R, int H>
+template <int K, int R, int H, bool S = false>
 EXL3_AVX2_INLINE __m256 avx2_sums(const __m256i (&C)[K], const Avx2Consts& k) {
     constexpr const Avx2Tab<K>& T = kAvx2Tab<K>;
     constexpr int sh = T.sh[R][H];
     const __m256i b = avx2_gather<K, R, H, 1>(C);
     __m256i st;
-    if constexpr (T.one[R][H] && sh == 16) {
+    if constexpr (S && T.one[R][H] && (sh == 8 || sh == 16)) {
+        st = avx2_bytes<sh / 8>(b);
+    } else if constexpr (S && !T.one[R][H] && sh == 24) {
+        st = avx2_bytes3(avx2_gather<K, R, H, 0>(C), b);
+    } else if constexpr (T.one[R][H] && sh == 16) {
         st = _mm256_srli_epi32(b, 16);
     } else if constexpr (T.one[R][H]) {
         st = _mm256_and_si256(_mm256_srli_epi32(b, sh), k.low16);
@@ -400,14 +429,14 @@ EXL3_AVX2_INLINE __m256 avx2_sums(const __m256i (&C)[K], const Avx2Consts& k) {
 }
 
 // A tile as the row kernels below read it: load() once a tile, then sums<R, H>() - row R's half H as 8 F32 byte sums,
-// the columns in order.  An integer K: the K class registers above.
-template <int K>
+// the columns in order.  An integer K: the K class registers above.  S: STRATA_EXL3_AVX2_SHUF's byte moves.
+template <int K, bool S = false>
 struct Avx2TileInt {
     static_assert(kAvx2Tab<K>.ok, "EXL3 tile layout: a half row's words must share a residue class and a shift");
     __m256i C[K];
     EXL3_AVX2_INLINE void load(const uint32_t* w) { avx2_classes<K>(w, C); }
     template <int R, int H>
-    EXL3_AVX2_INLINE __m256 sums(const Avx2Consts& k) const { return avx2_sums<K, R, H>(C, k); }
+    EXL3_AVX2_INLINE __m256 sums(const Avx2Consts& k) const { return avx2_sums<K, R, H, S>(C, k); }
 };
 
 // A half-integer K (K2 = 2 KA + 1 odd: exllamav3 1.6's 1.5 / 2.5 / 3.5).  The integer path's invariant - a half row's
@@ -524,7 +553,7 @@ EXL3_AVX2_INLINE __m256i half_span(const __m256i (&P)[K2]) {
                            _mm256_sllv_epi32(a, _mm256_loadu_si256((const __m256i*) T.sl[G])));
 }
 
-template <int K2>
+template <int K2, bool S = false>
 struct Avx2TileHalf {
     static_assert(kHalfTab<K2>.ok, "EXL3 half-integer tile layout: a span's words must lie in one pair register");
     __m256i X[8];   // group g = 2 l + h
@@ -543,22 +572,39 @@ struct Avx2TileHalf {
         constexpr int sh = kHalfTab<K2>.dsh[JJ];
         __m256i st;
         if constexpr (sh == 0) st = _mm256_and_si256(X[G], k.low16);
+        else if constexpr (S && (sh == 8 || sh == 16)) st = avx2_bytes<sh / 8>(X[G]);   // (K 2.5's window 0: 8)
         else st = _mm256_and_si256(_mm256_srli_epi32(X[G], sh), k.low16);
         return _mm256_cvtepi32_ps(
             _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_mullo_epi32(st, k.mult), k.ones8), k.ones16));
     }
 };
 
-template <int K2, bool Half = (K2 & 1) != 0>
+template <int K2, bool S = false, bool Half = (K2 & 1) != 0>
 struct Avx2TileSel {
-    using type = Avx2TileInt<K2 / 2>;
+    using type = Avx2TileInt<K2 / 2, S>;
 };
-template <int K2>
-struct Avx2TileSel<K2, true> {
-    using type = Avx2TileHalf<K2>;
+template <int K2, bool S>
+struct Avx2TileSel<K2, S, true> {
+    using type = Avx2TileHalf<K2, S>;
 };
+template <int K2, bool S = false>
+using Avx2Tile = typename Avx2TileSel<K2, S>::type;
+
+// whether S changes anything at this bitrate: a window shift of 8 or 16 bits inside a word, or 24 across two (K 1..8
+// and 2.5 have some; 1.5 and 3.5 none, so their S kernels would be copies)
 template <int K2>
-using Avx2Tile = typename Avx2TileSel<K2>::type;
+constexpr bool avx2_shuf_any() {
+    if constexpr ((K2 & 1) != 0) {
+        for (int jj = 0; jj < 4; ++jj)
+            if (kHalfTab<K2>.dsh[jj] == 8 || kHalfTab<K2>.dsh[jj] == 16) return true;
+    } else {
+        constexpr const Avx2Tab<K2 / 2>& T = kAvx2Tab<K2 / 2>;
+        for (int r = 0; r < 16; ++r)
+            for (int h = 0; h < 2; ++h)
+                if (T.one[r][h] ? T.sh[r][h] == 8 || T.sh[r][h] == 16 : T.sh[r][h] == 24) return true;
+    }
+    return false;
+}
 
 template <class Tile, int R>
 EXL3_AVX2_INLINE void avx2_rows(const Tile& T, const float* xk, __m256& lo, __m256& hi, const Avx2Consts& k) {
@@ -570,9 +616,9 @@ EXL3_AVX2_INLINE void avx2_rows(const Tile& T, const float* xk, __m256& lo, __m2
     }
 }
 
-template <int K2>
+template <int K2, bool S = false>
 EXL3_AVX2 void band_avx2(const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, float* out /* 128 */) {
-    using Tile = Avx2Tile<K2>;
+    using Tile = Avx2Tile<K2, S>;
     constexpr int W = 4 * K2;
     const int ld = m.n / 16;
     const size_t row_words = (size_t) ld * W;
@@ -633,10 +679,10 @@ EXL3_AVX2_INLINE void avx2_rows_n2(const Tile& T, const float* const (&xk)[N], _
         avx2_rows_n2<Tile, N, R + 1>(T, xk, lo, hi, k);
     }
 }
-template <int K2, int N>
+template <int K2, int N, bool S = false>
 EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, int ks0, int ks1,
                            float* const* out /* N x 128 */) {
-    using Tile = Avx2Tile<K2>;
+    using Tile = Avx2Tile<K2, S>;
     constexpr int W = 4 * K2;
     const int ld = m.n / 16;
     const size_t row_words = (size_t) ld * W;
@@ -679,10 +725,10 @@ EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, i
 // #188's split-K piece (rows_avx512_n) on the AVX2 tier: slices [ks0, ks1) of EVERY column for N activations, the
 // tile rows in memory order, a tile's sums in acc between slices; each row's decode and FMAs are band_avx2's, so acc[i]
 // is the band kernel's for its columns and xh[i] alone, bit for bit (and rows_avx512_n's)
-template <int K2, int N>
+template <int K2, int N, bool S = false>
 EXL3_AVX2 void rows_avx2_n(const Exl3Part& m, const float* const* xh, int ks0, int ks1, int t0, int t1,
                            float* const* acc) {
-    using Tile = Avx2Tile<K2>;
+    using Tile = Avx2Tile<K2, S>;
     constexpr int W = 4 * K2;
     const int ld = m.n / 16;
     const size_t row_words = (size_t) ld * W;
@@ -735,9 +781,9 @@ EXL3_AVX2_INLINE void avx2_decode_rows(const Tile& T, float* wr, int t, const Av
         avx2_decode_rows<Tile, R + 1>(T, wr, t, k);
     }
 }
-template <int K2>
+template <int K2, bool S = false>
 EXL3_AVX2 void decode_chunk_avx2(const Exl3Part& m, int tc0, int ks0, int ks1, float* wc /* (ks1 - ks0) 16 x 128 */) {
-    using Tile = Avx2Tile<K2>;
+    using Tile = Avx2Tile<K2, S>;
     constexpr int W = 4 * K2;
     const size_t row_words = (size_t) (m.n / 16) * W;
     const Avx2Consts k = avx2_consts();
@@ -776,7 +822,7 @@ EXL3_AVX2 void gemm_tile_avx2(const float* wc, int kr, const float* const* x, fl
             for (int j = 0; j < 4; ++j) _mm256_storeu_ps(acc[t] + cb + j * 8, a[t][j]);
     }
 }
-template <int K2>
+template <int K2, bool S = false>
 EXL3_AVX2 void band_gemm_avx2(const Exl3Part& m, const float* const* xh, int n, int tc0, int nb, float* const* acc,
                               float* wc) {
     constexpr int KS = kGemmK / 16;
@@ -786,7 +832,7 @@ EXL3_AVX2 void band_gemm_avx2(const Exl3Part& m, const float* const* xh, int n, 
     for (int ks0 = 0; ks0 < m.k / 16; ks0 += KS) {
         const int ks1 = std::min(m.k / 16, ks0 + KS), kr = (ks1 - ks0) * 16;
         for (int bb = 0; bb < nb; ++bb) {
-            decode_chunk_avx2<K2>(m, tc0 + 8 * bb, ks0, ks1, wc);
+            decode_chunk_avx2<K2, S>(m, tc0 + 8 * bb, ks0, ks1, wc);
             for (int t = 0; t < n; ++t) ab[(size_t) t] = acc[t] + bb * 128;
             float* const* ap = ab.data();
             int t = 0;
@@ -859,6 +905,87 @@ EXL3_AVX2 void band_out_avx2(const float* acc, float ki, float kz, const uint16_
         const __m256 sc = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*) (svh + i)));
         _mm256_storeu_ps(y + i, _mm256_mul_ps(_mm256_loadu_ps(y + i), sc));
     }
+}
+
+// the AVX2 kernels for n activations (1..kExl3CpuMaxN), S0 as STRATA_EXL3_AVX2_SHUF: the switch's path (S0 true) and
+// its start check (both); S0 at a bitrate S changes nothing takes the default kernels
+template <int K2, bool S0, bool S = S0 && avx2_shuf_any<K2>()>
+void band_avx2_any(const Exl3Part& m, const float* const* xh, int n, int tc0, int ks0, int ks1, float* const* acc) {
+    switch (n) {
+        case 1: band_avx2<K2, S>(m, xh[0], tc0, ks0, ks1, acc[0]); return;
+        case 2: band_avx2_n<K2, 2, S>(m, xh, tc0, ks0, ks1, acc); return;
+        case 3: band_avx2_n<K2, 3, S>(m, xh, tc0, ks0, ks1, acc); return;
+        case 4: band_avx2_n<K2, 4, S>(m, xh, tc0, ks0, ks1, acc); return;
+        case 5: band_avx2_n<K2, 5, S>(m, xh, tc0, ks0, ks1, acc); return;
+        case 6: band_avx2_n<K2, 6, S>(m, xh, tc0, ks0, ks1, acc); return;
+        case 7: band_avx2_n<K2, 7, S>(m, xh, tc0, ks0, ks1, acc); return;
+        default: band_avx2_n<K2, 8, S>(m, xh, tc0, ks0, ks1, acc); return;
+    }
+}
+template <int K2, bool S0, bool S = S0 && avx2_shuf_any<K2>()>
+void rows_avx2_any(const Exl3Part& m, const float* const* xh, int n, int ks0, int ks1, int t0, int t1,
+                   float* const* acc) {
+    switch (n) {
+        case 1: rows_avx2_n<K2, 1, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+        case 2: rows_avx2_n<K2, 2, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+        case 3: rows_avx2_n<K2, 3, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+        case 4: rows_avx2_n<K2, 4, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+        case 5: rows_avx2_n<K2, 5, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+        case 6: rows_avx2_n<K2, 6, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+        case 7: rows_avx2_n<K2, 7, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+        default: rows_avx2_n<K2, 8, S>(m, xh, ks0, ks1, t0, t1, acc); return;
+    }
+}
+// STRATA_EXL3_AVX2_SHUF's start check for one bitrate: random tile words (8 slices x 128 columns), 1..8 activations,
+// the band, the split-K rows and the band GEMM with the byte moves against the shifts - the outputs that differ
+// (memcmp; each side's buffer poisoned with its own NaN first, so a side that skips one differs too) and compared
+template <int K2>
+void avx2_shuf_check(size_t& differ, size_t& compared) {
+    if constexpr (!avx2_shuf_any<K2>()) return;
+    constexpr int k = 128, n = 128, NM = kExl3CpuMaxN;
+    uint64_t r = 0x9E3779B97F4A7C15ull + (uint64_t) K2;
+    auto rnd = [&r] {
+        r ^= r << 13;
+        r ^= r >> 7;
+        r ^= r << 17;
+        return (uint32_t) (r >> 32);
+    };
+    std::vector<uint32_t> tr((size_t) (k / 16) * (n / 16) * 4 * K2);
+    for (uint32_t& w : tr) w = rnd();
+    Exl3Part m;   // (suh / svh: these kernels read neither)
+    m.trellis = tr.data();
+    m.k = k;
+    m.n = n;
+    m.k2 = K2;
+    std::vector<float> x((size_t) NM * k), out((size_t) 2 * NM * n), wcb((size_t) kGemmK * 128 + 16);
+    for (float& v : x) v = (float) ((int) (rnd() % 4001) - 2000) / 997.0f;
+    float* wc = wcb.data();
+    while (((uintptr_t) wc & 63) != 0) ++wc;
+    const float* xp[NM];
+    float* op[2][NM];
+    for (int i = 0; i < NM; ++i) {
+        xp[i] = x.data() + (size_t) i * k;
+        for (int s = 0; s < 2; ++s) op[s][i] = out.data() + ((size_t) s * NM + i) * n;
+    }
+    for (int nn = 1; nn <= NM; ++nn)
+        for (int path = 0; path < 3; ++path) {
+            for (int s = 0; s < 2; ++s) {
+                const uint32_t poison = 0x7fc0dead + (uint32_t) s;
+                for (int i = 0; i < NM * n; ++i) std::memcpy(op[s][0] + i, &poison, 4);
+            }
+            if (path == 0) {
+                band_avx2_any<K2, false>(m, xp, nn, 0, 0, k / 16, op[0]);
+                band_avx2_any<K2, true>(m, xp, nn, 0, 0, k / 16, op[1]);
+            } else if (path == 1) {
+                rows_avx2_any<K2, false>(m, xp, nn, 0, k / 16, 0, n / 16, op[0]);
+                rows_avx2_any<K2, true>(m, xp, nn, 0, k / 16, 0, n / 16, op[1]);
+            } else {
+                band_gemm_avx2<K2, false>(m, xp, nn, 0, n / 128, op[0], wc);
+                band_gemm_avx2<K2, avx2_shuf_any<K2>()>(m, xp, nn, 0, n / 128, op[1], wc);
+            }
+            for (int i = 0; i < nn * n; ++i) differ += std::memcmp(op[0][0] + i, op[1][0] + i, 4) != 0;
+            compared += (size_t) nn * n;
+        }
 }
 
 // AVX-512 F and BW with FMA, the OS saving the state (STRATA_FORCE_AVX2 is the tier choice's, below)
@@ -935,6 +1062,8 @@ int detect_tier() {
     return (t & 2) ? 1 : 0;
 }
 
+bool avx2_shuf();   // STRATA_EXL3_AVX2_SHUF (below)
+
 template <int K2>
 void band_on(int tier, const Exl3Part& m, const float* xh, int tc0, int ks0, int ks1, float* acc) {
 #if defined(EXL3_X86)
@@ -944,6 +1073,10 @@ void band_on(int tier, const Exl3Part& m, const float* xh, int tc0, int ks0, int
     }
     if (tier == 2) {
         avx512::band_avx512<K2>(m, xh, tc0, ks0, ks1, acc);
+        return;
+    }
+    if (tier == 1 && avx2_shuf()) {
+        band_avx2_any<K2, true>(m, &xh, 1, tc0, ks0, ks1, &acc);
         return;
     }
     if (tier >= 1) {
@@ -980,6 +1113,10 @@ void band_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int t
             case 7: avx512::band_avx512_n<K2, 7>(m, xh, tc0, ks0, ks1, acc); return;
             default: avx512::band_avx512_n<K2, 8>(m, xh, tc0, ks0, ks1, acc); return;
         }
+    }
+    if (tier == 1 && n > 1 && avx2_shuf()) {
+        band_avx2_any<K2, true>(m, xh, n, tc0, ks0, ks1, acc);
+        return;
     }
     if (tier >= 1 && n > 1) {
         switch (n) {
@@ -1026,6 +1163,10 @@ void rows_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int k
             default: avx512::rows_avx512_n<K2, 8>(m, xh, ks0, ks1, t0, t1, acc); return;
         }
     }
+    if (tier == 1 && avx2_shuf()) {
+        rows_avx2_any<K2, true>(m, xh, n, ks0, ks1, t0, t1, acc);
+        return;
+    }
     if (tier >= 1) {
         switch (n) {
             case 1: rows_avx2_n<K2, 1>(m, xh, ks0, ks1, t0, t1, acc); return;
@@ -1045,6 +1186,39 @@ void rows_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int k
 
 // every bitrate the lane takes (exl3_cpu_k2_ok): K 1..8 and the half-integer 1.5 / 2.5 / 3.5
 #define EXL3_LANE_K2(X) X(2) X(3) X(4) X(5) X(6) X(7) X(8) X(10) X(12) X(14) X(16)
+
+// STRATA_EXL3_AVX2_SHUF: -1 until the first AVX2 call reads it (avx2_shuf), then 0 or 1; exl3_cpu_set_avx2_shuf sets it
+std::atomic<int> g_avx2_shuf{-1};
+// the variable, read once: 1 (its first character) on a CPU with the AVX2 tier turns the byte moves on if every
+// bitrate's start check finds no output differing (else they stay off); one line on stderr whenever it is set
+int avx2_shuf_env() {
+    const char* v = std::getenv("STRATA_EXL3_AVX2_SHUF");
+    if (v == nullptr || v[0] != '1') return 0;
+#if defined(EXL3_X86)
+    if ((tier_mask() & 2) != 0) {
+        size_t differ = 0, compared = 0;
+#define EXL3_CASE(K2) avx2_shuf_check<K2>(differ, compared);
+        EXL3_LANE_K2(EXL3_CASE)
+#undef EXL3_CASE
+        std::fprintf(stderr, "EXL3 CPU lane: STRATA_EXL3_AVX2_SHUF=1, the AVX2 tier's byte-aligned windows by byte "
+                             "shuffles: start check %zu of %zu outputs differ - %s%s\n", differ, compared,
+                     differ == 0 ? "on" : "left off", detect_tier() == 1 ? "" : " (the lane runs another tier)");
+        return differ == 0 ? 1 : 0;
+    }
+#endif
+    std::fprintf(stderr, "EXL3 CPU lane: STRATA_EXL3_AVX2_SHUF=1 has no effect here (no AVX2 tier)\n");
+    return 0;
+}
+bool avx2_shuf() {
+    int v = g_avx2_shuf.load(std::memory_order_relaxed);
+    if (v < 0) {
+        static const int env = avx2_shuf_env();
+        int unread = -1;
+        g_avx2_shuf.compare_exchange_strong(unread, env, std::memory_order_relaxed);
+        v = g_avx2_shuf.load(std::memory_order_relaxed);
+    }
+    return v != 0;
+}
 
 void band_acc_tier(int tier, const Exl3Part& m, const float* xh, int c0, int ks0, int ks1, float* acc) {
     const int tc0 = c0 / 16;
@@ -1079,6 +1253,10 @@ int exl3_cpu_tier() {
     static const int tier = detect_tier();
     return tier;
 }
+
+bool exl3_cpu_avx2_shuf() { return avx2_shuf(); }
+
+void exl3_cpu_set_avx2_shuf(bool on) { g_avx2_shuf.store(on ? 1 : 0, std::memory_order_relaxed); }
 
 bool exl3_cpu_vector() { return exl3_cpu_tier() > 0; }
 
@@ -1156,6 +1334,14 @@ void exl3_cpu_band_gemm(const Exl3Part& m, const float* const* xh, int n, int c0
     if (exl3_cpu_tier() == 2) {
         switch (m.k2) {
 #define EXL3_CASE(K2) case K2: avx512::band_gemm_avx512<K2>(m, xh, n, c0 / 16, nb, acc, wc); return;
+            EXL3_LANE_K2(EXL3_CASE)
+#undef EXL3_CASE
+            default: break;
+        }
+    }
+    if (exl3_cpu_tier() == 1 && avx2_shuf()) {
+        switch (m.k2) {
+#define EXL3_CASE(K2) case K2: band_gemm_avx2<K2, avx2_shuf_any<K2>()>(m, xh, n, c0 / 16, nb, acc, wc); return;
             EXL3_LANE_K2(EXL3_CASE)
 #undef EXL3_CASE
             default: break;

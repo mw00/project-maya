@@ -1593,6 +1593,18 @@ if(STRATA_BUILD_TESTS)
   if(STRATA_CPU_X86)
     add_executable(exl3_cpu_bench src/kernels/cpu/exl3_cpu_bench.cpp)
     target_link_libraries(exl3_cpu_bench PRIVATE strata_kernels_cpu)
+    # STRATA_EXL3_AVX2_SHUF (the AVX2 tier's byte-aligned trellis windows by byte shuffles) against the shifts and the
+    # scalar tier, bit for bit: every bitrate, 1-8 activations, the bands, the split-K rows with column runs, the GEMM
+    # (synthetic weights, no GPU). Both entries keep an AVX-512 host on AVX2; the second starts with the variable set,
+    # so the kernels' own start check runs. Exit 77 (skipped) where the lane does not run the AVX2 tier
+    add_executable(exl3_cpu_shuf_test tests/exl3_cpu_shuf_test.cpp)
+    target_link_libraries(exl3_cpu_shuf_test PRIVATE strata_kernels_cpu)
+    enable_testing()
+    add_test(NAME exl3_cpu_shuf_test COMMAND exl3_cpu_shuf_test)
+    add_test(NAME exl3_cpu_shuf_test_env COMMAND exl3_cpu_shuf_test --env)
+    set_tests_properties(exl3_cpu_shuf_test exl3_cpu_shuf_test_env PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+    set_tests_properties(exl3_cpu_shuf_test PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1")
+    set_tests_properties(exl3_cpu_shuf_test_env PROPERTIES ENVIRONMENT "STRATA_FORCE_AVX2=1;STRATA_EXL3_AVX2_SHUF=1")
   endif()
 
   if(WIN32)
