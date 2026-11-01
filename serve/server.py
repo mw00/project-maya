@@ -2164,7 +2164,22 @@ class Service:
         bias = logit_bias_of(req.get("logit_bias"), len(getattr(self.tok, "tokens", None) or ()) or None)
         if bias and (getattr(self.engine, "info", None) or {}).get("logit_bias") != 1:
             raise ValueError("logit_bias: this engine does not apply token biases - update Maya (./maya.sh --setup)")
-        if "logit_bias" in req:
+        # ignore_eos (vLLM's and llama.cpp's): the tokens that end an answer are banned, so it runs to max_tokens - as
+        # llama.cpp does it, through the logit bias, so the text past the model's natural end stays text it would write
+        ignore = req.get("ignore_eos")
+        if ignore is not None and not isinstance(ignore, bool):
+            raise ValueError("ignore_eos: true or false")
+        if ignore:
+            try:
+                limit = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            if limit <= 0:
+                raise ValueError("ignore_eos: needs max_tokens (the answer would run until the context is full)")
+            if (getattr(self.engine, "info", None) or {}).get("logit_bias") != 1:
+                raise ValueError("ignore_eos: this engine does not apply token biases - update Maya (./maya.sh --setup)")
+            bias = {**bias, **{t: -100.0 for t in sorted(self.stop_ids | self.eos_ids)}}
+        if "logit_bias" in req or ignore:
             req["logit_bias"] = bias
         # logprobs need an engine that writes them (INFO logprobs=<n>: the DeepSeek engine); another would answer
         # without them, which a client that asked could not tell from a bug

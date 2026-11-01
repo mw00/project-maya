@@ -313,6 +313,14 @@ included (a sampled request's drafts are then kept by the speculative-sampling r
 repeat penalty of 1 and frequency and presence penalties of 0 are off: such a request decodes exactly as one without
 them.
 
+## Writing to max_tokens (`ignore_eos`)
+
+A chat completion with `"ignore_eos": true` (vLLM's and llama.cpp's field) runs to its `max_tokens`: each token that
+ends an answer (the end of a turn, and the markers a model would start the next turn with) gets a logit bias of -100,
+as in llama.cpp, so the model goes on with what it would write next instead of stopping - for speed benchmarks at a
+fixed answer length. It needs `max_tokens`, and an engine that applies token biases - GLM's and DeepSeek's (which take
+a request's own `logit_bias` as well); MiniMax's does not, so there it is refused.
+
 ## Token log-probabilities (`logprobs`, DeepSeek)
 
 A chat completion with `"logprobs": true` (and `"top_logprobs"`: 0 to 20 alternatives, 0 when absent) gets OpenAI's

@@ -788,6 +788,31 @@ class RequestChecks(unittest.TestCase):
             svc.check_request({"logit_bias": {"65": 1}})
         svc.check_request({"logit_bias": {}})      # none asked for: fine anywhere
 
+    def test_ignore_eos(self):
+        """ignore_eos bans every token that ends an answer through the logit bias (a client's other biases kept), needs
+        max_tokens and an engine that applies biases, and takes only true or false."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ends = sorted(svc.stop_ids | svc.eos_ids)
+        self.assertTrue(ends)
+        req = {"ignore_eos": True, "max_tokens": 64, "logit_bias": {"65": 2, str(ends[0]): 5}}
+        svc.check_request(req)
+        self.assertEqual(req["logit_bias"], {65: 2.0, **{t: -100.0 for t in ends}})
+        req = {"ignore_eos": True, "max_completion_tokens": "32"}
+        svc.check_request(req)
+        self.assertEqual(req["logit_bias"], {t: -100.0 for t in ends})
+        self.assertIn("logit_bias=" + ",".join(f"{t}:-100" for t in ends), StrataEngine.sampling_keys(req))
+        req = {"ignore_eos": False, "max_tokens": 8}
+        svc.check_request(req)
+        self.assertNotIn("logit_bias", req)
+        for bad in ({"ignore_eos": True}, {"ignore_eos": True, "max_tokens": 0}, {"ignore_eos": "yes", "max_tokens": 8}):
+            with self.assertRaises(ValueError) as cm:
+                svc.check_request(dict(bad))
+            self.assertTrue(str(cm.exception).startswith("ignore_eos:"), cm.exception)
+        svc.engine.info = {}                       # an engine that applies no biases: refused, not ignored
+        with self.assertRaises(ValueError):
+            svc.check_request({"ignore_eos": True, "max_tokens": 8})
+
 
 class PrometheusMetrics(unittest.TestCase):
     """GET /metrics/prometheus: llama-server's metric names in Prometheus' text format, behind the API key."""
