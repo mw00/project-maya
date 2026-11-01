@@ -2105,10 +2105,19 @@ class PromptMemo:
         with self.lock:
             best, best_l = None, 0
             for e in self.entries:
-                if e["changed"] == changed:
-                    l = common_prefix(e["marked"], marked)
-                    if l >= best_l:
-                        best, best_l = e, l
+                l = common_prefix(e["marked"], marked)
+                # (a prompt whose first literal just appeared, or whose last just went, starts as one of the other kind
+                #  too: both read the same text up to the first mark character, whichever of them is unmarked)
+                if e["changed"] != changed:
+                    if self.mark_re is None:
+                        continue
+                    if e["changed"]:
+                        l = min(l, e["mpos"][0]) if e["mpos"] else l
+                    else:
+                        m = self.mark_re.search(e["marked"], 0, l)
+                        l = m.start() if m is not None else l
+                if l >= best_l:
+                    best, best_l = e, l
             use, n_ids, m_at, t_at, c_sp, c_cut = None, 0, 0, 0, 0, 0
             if best is not None:
                 mpos, spans, cuts = best["mpos"], best["spans"], best["cuts"]
