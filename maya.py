@@ -1444,9 +1444,10 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
             fail(f"Maya's Metal engine runs GLM-5.3-Flash only (no Metal engine for {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
                  "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
         return check_metal_pc(a)
-    if ds4 and not gguf and S.ARM:
-        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): this CPU has neither
-        fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this ARM CPU does not have",
+    if ds4 and not gguf and (S.ARM or S.PPC):
+        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): neither this ARM nor this POWER CPU has them
+        fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this {platform.machine()} CPU "
+             "does not have",
              f"set up one of Maya's GGUF quants instead: {ME} --setup --model deepseek-maya-s (or deepseek-maya-xs)")
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows (and on Apple Silicon: --backend metal)",
