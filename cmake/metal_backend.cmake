@@ -105,7 +105,8 @@ endif()
 # the engine reports Maya's release (VERSION) as its version
 file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION _maya_version LIMIT_COUNT 1)
 add_library(maya_metal STATIC src/metal/glm_metal.cpp src/metal/glm_metal_load.cpp src/metal/expert_pool.cpp
-                              src/metal/glm_metal_dflash.cpp src/metal/spec.cpp src/metal/sampler.cpp)
+                              src/metal/glm_metal_dflash.cpp src/metal/spec.cpp src/metal/sampler.cpp
+                              src/metal/mm3_metal.cpp src/metal/mm3_metal_load.cpp src/metal/mm3_serve.cpp)
 target_include_directories(maya_metal PUBLIC src/metal)
 target_compile_definitions(maya_metal PUBLIC MAYA_VERSION="${_maya_version}")
 target_link_libraries(maya_metal PUBLIC ggml ggml-base ggml-cpu ggml-metal)
@@ -115,6 +116,9 @@ endif()
 
 add_executable(maya-metal src/metal/main.cpp src/metal/serve.cpp)
 target_link_libraries(maya-metal PRIVATE maya_metal)
+
+add_executable(maya-metal-mm3 src/metal/mm3_main.cpp)
+target_link_libraries(maya-metal-mm3 PRIVATE maya_metal)
 
 if(MAYA_METAL_TESTS)
   enable_testing()
@@ -142,6 +146,29 @@ if(MAYA_METAL_TESTS)
                      ${CMAKE_CURRENT_SOURCE_DIR}/data/glm5-synth.gguf)
   endif()
   add_test(NAME metal_model_test COMMAND metal_model_test small)
+  # MiniMax-M3.1 (src/metal/mm3_metal.cpp): the synthetic fixture is generated into the build tree
+  # (tools/mm3_metal_fixture.py needs numpy, like the GLM fixture generators)
+  add_executable(metal_mm3_test src/metal/metal_mm3_test.cpp)
+  target_link_libraries(metal_mm3_test PRIVATE maya_metal)
+  find_program(MAYA_MM3_PYTHON3 python3)
+  if(MAYA_MM3_PYTHON3)
+    add_test(NAME metal_mm3_gen
+             COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/mm3_metal_fixture.py
+                     --out ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
+    set_tests_properties(metal_mm3_gen PROPERTIES FIXTURES_SETUP metal_mm3_gguf)
+    add_test(NAME metal_mm3_test
+             COMMAND metal_mm3_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf
+                     ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf.expected.bin)
+    add_test(NAME metal_mm3_test_cpu
+             COMMAND metal_mm3_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf
+                     ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf.expected.bin)
+    set_tests_properties(metal_mm3_test_cpu PROPERTIES ENVIRONMENT MAYA_MM3_CPU=1)
+    set_tests_properties(metal_mm3_test metal_mm3_test_cpu PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
+    add_test(NAME metal_mm3_serve_test
+             COMMAND ${MAYA_MM3_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_mm3_serve.py $<TARGET_FILE:maya-metal-mm3>
+                     ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf)
+    set_tests_properties(metal_mm3_serve_test PROPERTIES FIXTURES_REQUIRED metal_mm3_gguf)
+  endif()
   # the same gates on ggml-cpu (the oracle backend), and with the expert pool at its floor and small slices
   add_test(NAME metal_model_test_cpu COMMAND metal_model_test small)
   add_test(NAME metal_model_test_evict COMMAND metal_model_test small)
