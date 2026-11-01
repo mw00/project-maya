@@ -6683,9 +6683,9 @@ def main() -> int:
                  f"Close it, or start this one with a different --port")
     if cfg.get("tokenizer"):
         a.tokenizer = cfg["tokenizer"]
-    for k_ in ("MAYA_PROMPT_MEMO", "MAYA_TURN_TRACE"):   # (the server's own keys, from the run's config as the engine's are)
-        if isinstance(cfg.get("env"), dict) and k_ in cfg["env"]:
-            os.environ[k_] = str(cfg["env"][k_])
+    for k_ in ("MAYA_PROMPT_MEMO", "MAYA_TURN_TRACE"):   # (the server's own keys, from the run's config; env_in renamed them)
+        if isinstance(cfg.get("env"), dict) and maya_names.read_as(k_) in cfg["env"]:
+            os.environ[k_] = str(cfg["env"][maya_names.read_as(k_)])
     globals()["TURN_TRACE"] = os.environ.get("MAYA_TURN_TRACE", "") not in ("", "0")
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
