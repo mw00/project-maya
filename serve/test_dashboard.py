@@ -219,6 +219,31 @@ class Dashboard(unittest.TestCase):
             {"type": "text", "text": "and this"}, {"type": "image_url", "image_url": {"url": "data:,"}}]}]})
         self.assertTrue(json.loads(b)["approximate"])
 
+    def test_tokenize_and_detokenize(self):
+        """POST /tokenize and /detokenize in llama.cpp's and vLLM's forms: a text's ids (its special tokens' text as
+        those tokens unless parse_special is false), a chat request's prompt as prepare() makes it, and the text back."""
+        tok = ByteTokenizer()
+        s, _, b = self.req("POST", "/tokenize", {"content": "hi<|im_end|>"})
+        self.assertEqual((s, json.loads(b)["tokens"]), (200, tok.encode("hi<|im_end|>", parse_special=True)))
+        s, _, b = self.req("POST", "/tokenize", {"model": "m", "prompt": "hi<|im_end|>", "parse_special": False})
+        j = json.loads(b)
+        self.assertEqual((j["tokens"], j["count"]), (tok.encode("hi<|im_end|>"), len("hi<|im_end|>")))
+        self.assertEqual(j["max_model_len"], self.svc.engine.max_context)
+        msgs = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "count me"}]
+        s, _, b = self.req("POST", "/tokenize", {"messages": msgs, "reasoning_effort": "high"})
+        from serve.frontend import openai_to_messages
+        m, tools, kw = openai_to_messages({"messages": msgs, "reasoning_effort": "high"})
+        ids, _, _ = self.svc.prepare(m, tools, kw)
+        self.assertEqual((s, json.loads(b)["tokens"]), (200, ids))
+        s, _, b = self.req("POST", "/detokenize", {"tokens": ids})
+        j = json.loads(b)
+        self.assertEqual((s, j["content"]), (200, tok.decode(ids)))
+        self.assertEqual(j["prompt"], j["content"])
+        for path, body in (("/tokenize", {"content": 3}), ("/tokenize", {}), ("/detokenize", {"tokens": [1, -1]}),
+                           ("/detokenize", {"tokens": "1,2"})):
+            s, _, _ = self.req("POST", path, body)
+            self.assertEqual(s, 400, (path, body))
+
     def test_peak_decode_speed(self):
         # the Monitor's peak decode: the fastest answer since the server started, of PEAK_MIN_TOKENS tokens or more
         from serve.server import PEAK_MIN_TOKENS

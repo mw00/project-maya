@@ -4,7 +4,7 @@
     python -m serve.server --engine maya --config maya.json --port 8080   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions and /v1/responses (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
-non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
+non-stream), POST /tokenize and /detokenize, GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time behind a FIFO (plan: one resident sequence).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
@@ -3150,10 +3150,9 @@ class Service:
                 given["_think_resume"] = resume
         return ids, thinking, max_new
 
-    def count_tokens(self, req: dict) -> dict:
-        """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
-        tools and tokenizer as prepare(), with nothing run (no image encoder: a picture or a video counts as its
-        marker, so the count is approximate then).  The web app's context meter."""
+    def chat_prompt(self, req: dict):
+        """A chat request's template messages, tools and kwargs as prepare() gets them (the run config's thinking
+        level included), for measuring its prompt without running it."""
         messages, tools, kw = openai_to_messages(req, deepseek=getattr(self.template, "deepseek", False))
         kw = {k: v for k, v in kw.items() if k != "_force_tool"}
         if req.get("strata_mcp") is True and self.mcp is not None:
@@ -3162,6 +3161,39 @@ class Service:
         if self.default_effort and "reasoning_effort" not in kw and "enable_thinking" not in kw:
             kw = {**kw, **(deepseek_effort_kwargs(self.default_effort) if getattr(self.template, "deepseek", False)
                                   else effort_kwargs(self.default_effort))}
+        return messages, tools, kw
+
+    def tokenize(self, req: dict) -> dict:
+        """POST /tokenize (llama.cpp's and vLLM's): the ids of `content` (llama.cpp's name) or `prompt` (vLLM's), or
+        of a chat request's whole prompt (`messages`, with its `tools`: chat_prompt, as /api/tokens counts it - a
+        picture as its marker).  A special token's text in the text is that token unless parse_special is false;
+        add_special (or add_special_tokens) puts the tokenizer's BOS first."""
+        if "messages" in req:
+            messages, tools, kw = self.chat_prompt(req)
+            ids = self.render_ids(messages, tools, kw)
+        else:
+            text = req.get("content", req.get("prompt"))
+            if not isinstance(text, str):
+                raise ValueError("tokenize needs content (or prompt) as a string, or messages")
+            ids = self.tok.encode(text, parse_special=req.get("parse_special", True) is not False)
+            bos = (getattr(self.tok, "special_ids", None) or {}).get("bos")
+            if (req.get("add_special") or req.get("add_special_tokens")) and bos is not None:
+                ids = [bos] + ids
+        return {"tokens": ids, "count": len(ids), "max_model_len": self.engine.max_context}
+
+    def detokenize(self, req: dict) -> dict:
+        """POST /detokenize: the text of `tokens`, as `content` (llama.cpp's name) and `prompt` (vLLM's)."""
+        ids = req.get("tokens")
+        if not isinstance(ids, list) or not all(isinstance(t, int) and not isinstance(t, bool) and t >= 0 for t in ids):
+            raise ValueError("detokenize needs tokens as a list of token ids")
+        text = self.tok.decode(ids)
+        return {"content": text, "prompt": text}
+
+    def count_tokens(self, req: dict) -> dict:
+        """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
+        tools and tokenizer as prepare(), with nothing run (no image encoder: a picture or a video counts as its
+        marker, so the count is approximate then).  The web app's context meter."""
+        messages, tools, kw = self.chat_prompt(req)
         if getattr(self.template, "deepseek", False) or isinstance(self.vision, mm3_vision.Vision):
             # (DeepSeek, MiniMax: the engine's own vision tower - a picture's span is its resize's)
             sources = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
@@ -5139,6 +5171,12 @@ def make_handler(svc: Service):
                     raise ValueError("the request body must be a JSON object")
                 if path == "/api/tokens":                    # the context meter: a prompt's size, nothing run
                     self._json(200, svc.count_tokens(req))
+                    return
+                if path == "/tokenize":                      # llama.cpp's and vLLM's: a text's or a prompt's ids
+                    self._json(200, svc.tokenize(req))
+                    return
+                if path == "/detokenize":
+                    self._json(200, svc.detokenize(req))
                     return
                 if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages") and (svc.reloading() or svc.updater.busy()):
                     # a context change is reloading the model, or Maya is updating: say so, and when to try again
