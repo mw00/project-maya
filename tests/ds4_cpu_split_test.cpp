@@ -6,12 +6,19 @@
 //
 // DeepSeek-V4.1-Flash's geometry (5120 -> 2304 -> 5120; --small 1280 -> 768 -> 1280 for a slow CPU), random trellis
 // words for K 2 (k2 4) and K 2.5 (k2 5), one and two NUMA parts (a pool a part, node 0's caller helping as the engine's
-// service thread does), 1, 2, 3 and 6 entries of one token each (decode) and of 1-3 tokens (a verify window), several
-// thread counts (1, 2, 5, 16, 30 by default).  Each case's outputs from the four steps uncut (the reference: today's
-// schedule) against the uncut flow, the split steps and the split flow, memcmp; the scratch is poisoned with NaN
-// before every run, so a run that left a sum unwritten cannot pass on the reference's leftovers.  Also: the runs
-// exl3_split_runs picks (the 3090 box's lane: 29 workers + the service thread, one part), the batches' job counts with
-// the split, and that the cases cut both steps somewhere (else the test proves nothing).
+// service thread does), 1, 2, 3 and 6 entries of one token each (decode), of 1-3 tokens and of 4-8 tokens (verify
+// windows; the wider one's first entry 8 tokens, the kernels' widest call, the others 4 + i % 5, so a cut call of one or
+// two entries reaches the kernels' N >= 4 and N = 8 code too), several thread counts (1, 2, 5, 16, 30 by default).
+// Each case's outputs from the four steps uncut (the reference: today's schedule) against the uncut flow, the split
+// steps and the split flow, memcmp; the scratch is poisoned with NaN before every run, so a run that left a sum
+// unwritten cannot pass on the reference's leftovers.  Also: the runs exl3_split_runs picks (the 3090 box's lane: 29
+// workers + the service thread, one part), the batches' job counts with the split, and that the cases cut both steps
+// somewhere (else the test proves nothing).
+//
+// The EXL3 kernels run on the one tier this CPU picks (exl3_cpu_tier(), printed at start-up): 0 scalar, 1 AVX2 + FMA +
+// F16C, 2 AVX-512 F/BW, 3 AVX-512 VNNI - the widest the CPU has.  STRATA_FORCE_AVX2=1 keeps an AVX-512 CPU on tier 1
+// (ctest ds4_cpu_split_test_avx2; on a CPU without AVX-512 that is the default run again).  Tier 2 cannot be forced on a
+// VNNI CPU (it always takes 3), so only a CPU with AVX-512 F/BW and no VNNI tests it.
 #include "../src/ds4/ds4_cpu_exl3.hpp"
 
 #include <algorithm>
@@ -99,10 +106,19 @@ int main(int argc, char** argv) {
             }
         }
     }
+    // the kernels' tier this run tests (src/kernels/cpu/exl3_cpu.cpp detect_tier)
+    const int tier = kc::exl3_cpu_tier();
+    const char* tier_names[] = {"scalar", "AVX2 + FMA + F16C", "AVX-512 F/BW", "AVX-512 VNNI"};
+    const char* force = std::getenv("STRATA_FORCE_AVX2");
+    const bool forced = force != nullptr && force[0] == '1';
+    std::printf("EXL3 CPU tier %d (%s)%s\n", tier, tier >= 0 && tier <= 3 ? tier_names[tier] : "unknown",
+                forced ? ", STRATA_FORCE_AVX2=1" : "");
+    expect(tier >= 0 && tier <= 3, "exl3_cpu_tier() = " + std::to_string(tier) + ", not 0-3");
+    expect(!forced || tier <= 1, "STRATA_FORCE_AVX2=1 but tier " + std::to_string(tier));
     test_runs();
 
     const int E = small ? 1280 : 5120, FF = small ? 768 : 2304;
-    constexpr int kWin = 16, S = 16, kExp = 6;   // token rows of x, the slots, distinct experts
+    constexpr int kWin = 16, S = 64, kExp = 6;   // token rows of x, the slots, distinct experts
     const float nan = std::numeric_limits<float>::quiet_NaN();
     std::mt19937 rs(11);
     std::normal_distribution<float> nd(0.0f, 0.5f);
@@ -163,7 +179,6 @@ int main(int argc, char** argv) {
                 for (auto* v : {&xh, &xsb, &acc, &xhd, &xsd, &accd, &yd}) std::fill(v->begin(), v->end(), nan);
             };
             for (const int W : thread_counts) {
-                if (NH > 1 && W < 1) continue;
                 // the engine's pools: node 0's W - 1 workers and the caller, the other nodes' W workers each
                 std::vector<std::unique_ptr<Pool>> pools;
                 for (int X = 0; X < NH; ++X) pools.push_back(std::make_unique<Pool>(X == 0 ? W - 1 : W, std::vector<int>{}, 50));
@@ -176,21 +191,22 @@ int main(int argc, char** argv) {
                 };
                 auto nophase = [](int) {};
                 for (const int ne : {1, 2, 3, 6})
-                    for (const int window : {0, 1}) {
+                    for (const int window : {0, 1, 2}) {   // tokens an entry: 1; 1-3; 4-8 (the first entry 8)
                         std::vector<LaneEnt> ents;
                         int rows = 0;
                         for (int i = 0; i < ne; ++i) {
                             LaneEnt en;
                             en.e = (i + ne + window) % kExp;
-                            en.n = window ? 1 + i % 3 : 1;
+                            en.n = window == 2 ? (i == 0 ? kc::kExl3CpuMaxN : 4 + i % 5) : window ? 1 + i % 3 : 1;
                             for (int t = 0; t < en.n; ++t) en.tok[t] = (i * 5 + t * 3 + window) % kWin;
                             en.slot0 = rows;
                             rows += en.n;
                             ents.push_back(en);
                         }
+                        expect(rows <= S, "the entries' rows exceed the slots");
                         const std::string what = "K2 " + std::to_string(k2) + ", " + std::to_string(NH) + " part(s), " +
                                                  std::to_string(W) + " threads, " + std::to_string(ne) + " entries" +
-                                                 (window ? " (1-3 tokens)" : "");
+                                                 (window == 2 ? " (4-8 tokens)" : window ? " (1-3 tokens)" : "");
                         auto run = [&](int split_w, bool flow) {
                             poison();
                             batches.clear();
@@ -243,8 +259,9 @@ int main(int argc, char** argv) {
     // a negative control of the matrix itself: some case must have cut each step, else nothing above tested the cut
     expect(cut_gu > 0, "no case cut the gate / up pieces");
     expect(cut_dn > 0, "no case cut the down pieces");
-    std::printf("split: %ld cases (gate / up cut in %ld, down in %ld), %ld runs differ from the uncut steps, bit for bit\n",
-                cases, cut_gu, cut_dn, differ);
+    std::printf("split, tier %d: %ld cases (gate / up cut in %ld, down in %ld), %ld runs differ from the uncut steps, "
+                "bit for bit\n",
+                tier, cases, cut_gu, cut_dn, differ);
     std::printf("%s\n", g_fail == 0 ? "ds4_cpu_split_test: ok" : "ds4_cpu_split_test: FAIL");
     return g_fail == 0 ? 0 : 1;
 }
