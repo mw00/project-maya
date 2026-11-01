@@ -3651,6 +3651,10 @@ int main(int argc, char** argv) {
     if (parts_check) return check_parts(m, parse_ids(ids_s), std::max(2, n));
     if (marks_check) return check_marks(m, parse_ids(ids_s), std::max(2, n));
     if (!ppl.empty()) {   // --ppl FILE: a line a sequence of ids (BOS + text), each in one forward, tokens 2.. scored
+        // DS4_PPL_STEP=1 (MAYA_DS4_PPL_STEP; tests): each sequence through the decode path instead - a token a step
+        // (Model::step, a one-token forward, as a decoded token's), so a change to decode alone is scored too (decode's
+        // expert placement, DS4_RECENT_FIT); slow (a decoded token's time a token)
+        const bool ppl_step = ds4_env("DS4_PPL_STEP") != nullptr && std::atoi(ds4_env("DS4_PPL_STEP")) != 0;
         std::ifstream in(ppl);
         std::string line;
         double nll = 0.0;
@@ -3662,8 +3666,18 @@ int main(int argc, char** argv) {
             const std::vector<int> seq = parse_ids(line);
             if (seq.size() < 2) continue;
             m.reset();
-            if (!m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) || !m.logits(lg) ||
-                lg.size() < (seq.size() - 1) * (size_t) V) {
+            bool fed = true;
+            if (ppl_step) {   // (the first token as a one-token read, then a step a token, each row's logits kept)
+                std::vector<float> row;
+                lg.assign((seq.size() - 1) * (size_t) V, 0.0f);
+                for (size_t i = 0; fed && i + 1 < seq.size(); ++i) {
+                    fed = (i == 0 ? m.feed(seq.data(), 1, 1, err) : m.step(seq[i], true, err)) && m.logits(row) &&
+                          row.size() >= (size_t) V;
+                    if (fed) std::copy(row.begin(), row.begin() + V, lg.begin() + (std::ptrdiff_t) (i * (size_t) V));
+                }
+            } else
+                fed = m.feed(seq.data(), (int) seq.size(), (int) seq.size(), err) && m.logits(lg);
+            if (!fed || lg.size() < (seq.size() - 1) * (size_t) V) {
                 std::fprintf(stderr, "maya-ds4: sequence %d: %s\n", k, err.empty() ? "no logits" : err.c_str());
                 return 1;
             }
