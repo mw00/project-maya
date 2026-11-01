@@ -2364,8 +2364,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // the start-up timing's gate: the CPU lane takes prompt experts only when PCIe moves one more than this many times
+    // slower than the lane computes it (STRATA_GLM_PREFILL_CPU_GATE, default 2; the per-expert plan below still
+    // balances both lanes, so a lower gate only lets it try: one RTX 5070 on PCIe 4.0 x16 beside an EPYC 7302,
+    // 0.357 vs 0.252 ms, Maya-S24 2K / 8K-token prompts 309 / 323 -> 404 / 428 tok/s at 0)
+    static const double pf_cpu_gate = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_CPU_GATE");
+        return v != nullptr ? std::atof(v) : 2.0;
+    }();
     const auto cpu_lane = [&](int il) {
-        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
+        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > pf_cpu_gate * F->cpu_c_ms &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
