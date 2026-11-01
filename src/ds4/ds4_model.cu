@@ -772,6 +772,18 @@ struct Chunk {
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
     };
+    // (DS4_EP) this device as a helper of another device's layer: a small ring of its own in VRAM, its own copy stream
+    uint8_t* ep_ring = nullptr;
+    size_t ep_stride = 0;
+    int ep_n = 0;
+    cudaStream_t ep_cs = nullptr;
+    std::vector<cudaEvent_t> ep_fill, ep_free;
+    int ep_posted = 0;   // (the owner) helpers of the layer now running
+    std::vector<std::pair<int, int>> ep_own;   // (the owner) the layer's rest of its own: (expert, virtual slot)
+    float* ep_g = nullptr;                     // (the owner) the helpers' rows of x, gathered in sorted order
+    int ep_g_rows = 0;
+    int* ep_id = nullptr;                      // (a helper) 0, 1, 2 ..: its rows come gathered
+    cudaEvent_t ep_ev = nullptr;               // (the owner) the gather done
     bool flow = false;
     uint8_t* down = nullptr;                 // (DS4_FLOW_TP, an uneven group's member: one expert's whole down, DMA'd in
                                              //  one copy, its member's columns then gathered into the ring slot)
@@ -6061,6 +6073,10 @@ struct Model::Impl {
             const int v = fit(c, i).v;
             if (b[(size_t) v + 1] == b[(size_t) v]) ++c.it_spec_unused;
         }
+        if (ep_run && c.ep_posted > 0) {   // (ep_plan's: its slots follow the likely ones without a gap)
+            for (const auto& x : c.ep_own) flow_push(c, l, mi, k, x.first, x.second);
+            return;
+        }
         for (int e : l.host_list) {   // (index order: their virtual slots ascending)
             const int v = vs[e];
             if (v >= l.pv_n + c.n_spec && b[(size_t) v + 1] > b[(size_t) v]) flow_push(c, l, mi, k, e, v);
@@ -6276,6 +6292,365 @@ struct Model::Impl {
         }
         return true;
     }
+    // ---- DS4_EP=N (1..3; unset: off): expert parallel on the relay.  A run on it takes its chunks one at a time, so one
+    // device works at a time and three copy channels are idle.  After a layer routes, its owner keeps its busy experts (rows > DS4_EP_ROWS, 16) and
+    // about its share of the rest, and hands N idle devices the others - most of the bytes, few of the rows.  The routing
+    // is sorted again so each helper's rows are one run; the owner gathers those rows of x; each helper pulls its run
+    // over P2P, DMAs its experts from the pinned copies over its own link and runs the sets into its own y; the owner
+    // pulls y back and combines it as a batch of its own.  A helper works on its own device thread, on its own chunk
+    // buffers, only while that thread has nothing of its own: waiting for its hand-off or a source's rows (ep_wait_hand, on
+    // the host, not in xfer_get's kernel), for the chunk before to end (ep_wait_chunk) or done with the run (ep_finish).  The split depends only on the routing, so a run's sums are the
+    // same whatever the timing; their order differs from the plain path (quality class order_of_sums).
+    struct EpReq {
+        std::atomic<int> state{0};   // 0 none, 1 posted (the owner's), 2 done (the helper's)
+        const Layer* l = nullptr;
+        int owner = -1;
+        int a0 = 0, nh = 0, g0 = 0;   // its run of sorted rows, how many, where they start in the owner's ep_g
+        const int* b = nullptr;
+        std::vector<std::pair<int, int>> items;   // (expert, virtual slot), slots ascending
+    };
+    std::unique_ptr<EpReq[]> ep_req;
+    bool ep_run = false;              // this run: all of the above
+    std::atomic<int> ep_left{0};      // devices not yet through their part of the run
+    std::unique_ptr<std::atomic<int>[]> ep_k_done;   // [chunk] devices through it
+    std::atomic<bool> ep_abort{false};
+    std::atomic<uint64_t> ep_wait_us{0}, ep_pull_n{0}, ep_items{0}, ep_layers{0}, ep_rows{0}, ep_own_n{0}, ep_plan_us{0};
+    static int ep_env() {
+        static const int n = [] {
+            const char* e = ds4_env("DS4_EP");
+            return e != nullptr ? std::min(3, std::max(0, std::atoi(e))) : 0;
+        }();
+        return n;
+    }
+    static int ep_env_i(const char* name, int dflt) {
+        const char* e = std::getenv(name);
+        return e != nullptr ? std::atoi(e) : dflt;
+    }
+    int ep_helper(int di, int h) const {   // owner di's helper h: the other link first (GPU0 <-> GPU2, GPU1 <-> GPU3)
+        const int n = (int) devs.size();
+        static const int order[3] = {2, 1, 3};
+        return (di + order[h]) % n;
+    }
+    bool ep_src(const Layer& l, int e, const uint8_t** src) const {   // (flow_push's two ways of DMA from where it lies)
+        if (l.ram.empty() || l.ram[(size_t) e] < 0) return false;
+        if (ram_pinned) {
+            const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
+            for (int r = 0; r < 3; ++r) src[r] = p + l.lay.trellis[r];
+            return true;
+        }
+        static const bool copy_dma = std::getenv("DS4_FLOW_COPY_DMA") == nullptr || std::atoi(std::getenv("DS4_FLOW_COPY_DMA")) != 0;
+        if (copy_mode && cp_dma && copy_dma && NH == 1) {
+            const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
+            for (int r = 0; r < 3; ++r) src[r] = p + cp_lay[(size_t) l.il][(size_t) r];
+            return true;
+        }
+        return false;
+    }
+    // (main thread, before a run's devices start) this run on DS4_EP?  The helpers' room at the first one
+    bool ep_begin(const std::vector<int>& run_T, bool lm, bool logits_all) {
+        ep_run = false;
+        const int H = ep_env();
+        if (H <= 0 || lm || logits_all || run_T.empty() || devs.size() != 4) return true;
+        const int run_n = std::accumulate(run_T.begin(), run_T.end(), 0);
+        if (run_n < ep_env_i("DS4_EP_MIN_T", 64) || run_n > ep_env_i("DS4_EP_MAX_T", 16384)) return true;
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (chunks[di] == nullptr || !chunks[di]->flow || chunks[di]->lm) return true;
+        for (const Layer& l : L)
+            if (!l.mtp && l.nm != 1) return true;
+        static int setup = 0;   // 0 not yet, 1 ready, -1 failed
+        if (setup == 0) {
+            setup = -1;
+            int cur = 0;
+            cudaGetDevice(&cur);
+            size_t stride = 0;
+            for (const Layer& l : L)
+                if (!l.mtp) stride = std::max(stride, align256(unit(l)));
+            const int n_slots = std::max(2, ep_env_i("DS4_EP_RING", 16));
+            bool ok = true;
+            std::string e;
+            for (size_t di = 0; di < devs.size() && ok; ++di) {
+                cudaSetDevice(devs[di].id);
+                for (size_t j = 0; j < devs.size() && ok; ++j) {
+                    if (j == di) continue;
+                    const cudaError_t pe = cudaDeviceEnablePeerAccess(devs[j].id, 0);
+                    if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) {
+                        std::fprintf(stderr, "ds4: DS4_EP: peer access CUDA%d to CUDA%d: %s\n", devs[di].id, devs[j].id,
+                                     cudaGetErrorString(pe));
+                        ok = false;
+                    }
+                }
+                (void) cudaGetLastError();
+                Chunk& c = *chunks[di];
+                size_t acct = 0;
+                if (ok) ok = dalloc(devs[di], c.ep_ring, (size_t) n_slots * stride, e, &acct);
+                if (ok) ok = cudaStreamCreateWithFlags(&c.ep_cs, cudaStreamNonBlocking) == cudaSuccess;
+                const int cap = std::max(64, ep_env_i("DS4_EP_ROWS_CAP", 4096));
+                if (ok) ok = dalloc(devs[di], c.ep_g, (size_t) cap * g.dim, e, &acct);
+                c.ep_g_rows = cap;
+                if (ok) ok = dalloc(devs[di], c.ep_id, (size_t) cap, e, &acct);
+                if (ok) {
+                    std::vector<int> ids((size_t) cap);
+                    std::iota(ids.begin(), ids.end(), 0);
+                    ok = cudaMemcpy(c.ep_id, ids.data(), (size_t) cap * 4, cudaMemcpyHostToDevice) == cudaSuccess;
+                }
+                if (ok) ok = cudaEventCreateWithFlags(&c.ep_ev, cudaEventDisableTiming) == cudaSuccess;
+                c.ep_stride = stride;
+                c.ep_n = n_slots;
+                c.ep_fill.resize((size_t) n_slots);
+                c.ep_free.resize((size_t) n_slots);
+                for (auto* v : {&c.ep_fill, &c.ep_free})
+                    for (cudaEvent_t& ev : *v)
+                        if (ok) ok = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) == cudaSuccess;
+            }
+            if (ok) {
+                ep_req.reset(new EpReq[devs.size()]);
+                setup = 1;
+                std::fprintf(stderr, "ds4: DS4_EP=%d: %d helper slots of %.1f MB a device, peer access on\n", H, n_slots,
+                             stride / 1048576.0);
+            } else
+                std::fprintf(stderr, "ds4: DS4_EP off: %s\n", e.c_str());
+            cudaSetDevice(cur);
+        }
+        if (setup != 1) return true;
+        ep_left.store((int) devs.size(), std::memory_order_release);
+        ep_k_done.reset(new std::atomic<int>[run_T.size()]);
+        for (size_t k = 0; k < run_T.size(); ++k) ep_k_done[k].store(0, std::memory_order_relaxed);
+        ep_abort.store(false, std::memory_order_release);
+        ep_wait_us = 0;
+        ep_pull_n = 0;
+        ep_items = 0;
+        ep_layers = 0;
+        ep_rows = 0;
+        ep_own_n = 0;
+        ep_plan_us = 0;
+        for (size_t di = 0; di < devs.size(); ++di) chunks[di]->ep_posted = 0;
+        for (size_t di = 0; di < devs.size(); ++di) ep_req[di].state.store(0, std::memory_order_release);
+        ep_run = true;
+        return true;
+    }
+    // layer L0 routed (bounds b by virtual slot, this device's stream synced): the split, the second sort, b as it now is,
+    // the gather, the helpers told.  No helpers (a short layer): nothing changes
+    bool ep_plan(Dev& d, Chunk& c, Layer& L0, Layer& l, int T, int n_vs, std::vector<int>& b, std::string& err) {
+        c.ep_posted = 0;
+        const double t0 = now_ms();
+        cudaStream_t s = d.st;
+        int* vs = l.vs_pin;
+        struct Cand {
+            int e, rows;
+        };
+        std::vector<int> own;
+        std::vector<Cand> light;
+        static const int thr = ep_env_i("DS4_EP_ROWS", 16), min_items = ep_env_i("DS4_EP_MIN_ITEMS", 8);
+        const uint8_t* src[3];
+        size_t n_rest = 0;
+        for (int e : L0.host_list) {
+            const int v = vs[e], rows = b[(size_t) v + 1] - b[(size_t) v];
+            if (v < L0.pv_n + c.n_spec || rows <= 0) continue;
+            ++n_rest;
+            if (rows > thr || !ep_src(L0, e, src)) own.push_back(e);
+            else light.push_back({e, rows});
+        }
+        int H = ep_env();
+        while (H > 0 && (int) light.size() / H < min_items) --H;
+        if (H == 0) return true;
+        // the owner's share first (its likely ones and busy ones count), the busiest of the light ones
+        std::stable_sort(light.begin(), light.end(), [](const Cand& a, const Cand& x) { return a.rows > x.rows; });
+        const size_t total = n_rest + (size_t) c.n_spec, target = total / (size_t) (H + 1), have = own.size() + (size_t) c.n_spec;
+        size_t first = have < target ? std::min(target - have, light.size()) : 0;
+        for (size_t i = 0; i < first; ++i) own.push_back(light[i].e);
+        std::vector<std::vector<int>> hs((size_t) H);
+        std::vector<int> hrows((size_t) H, 0);
+        int gate = 0;
+        const int cap = c.ep_g_rows;
+        for (size_t i = first; i < light.size(); ++i) {   // (round robin: their rows and bytes about even)
+            const size_t h = (i - first) % (size_t) H;
+            const int hc = chunks[(size_t) ep_helper(c.dev, (int) h)]->C;
+            if (gate + light[i].rows > cap || hrows[h] + light[i].rows > hc) {
+                own.push_back(light[i].e);
+                continue;
+            }
+            hs[h].push_back(light[i].e);
+            hrows[h] += light[i].rows;
+            gate += light[i].rows;
+        }
+        std::sort(own.begin(), own.end());
+        // the new virtual slots: the likely ones as they are, the owner's, the helpers' one after another, the unpicked
+        std::vector<char> done((size_t) L0.n_exp, 0);
+        int j = L0.pv_n + c.n_spec;
+        c.ep_own.clear();
+        for (int e : own) {
+            vs[e] = j;
+            c.ep_own.push_back({e, j++});
+            done[(size_t) e] = 1;
+        }
+        std::vector<int> vh((size_t) H + 1, 0);
+        for (int h = 0; h < H; ++h) {
+            EpReq& r = ep_req[(size_t) ep_helper(c.dev, h)];
+            r.items.clear();
+            vh[(size_t) h] = j;
+            for (int e : hs[(size_t) h]) {
+                vs[e] = j;
+                r.items.push_back({e, j++});
+                done[(size_t) e] = 1;
+            }
+        }
+        vh[(size_t) H] = j;
+        for (int e : L0.host_list)
+            if (vs[e] >= L0.pv_n + c.n_spec && !done[(size_t) e]) vs[e] = j++;
+        CK(cudaMemcpyAsync(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, cudaMemcpyHostToDevice, s));
+        moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
+        CK(cudaMemcpyAsync(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, cudaMemcpyDeviceToHost, s));
+        CK(cudaStreamSynchronize(s));
+        b.assign(c.bounds_pin, c.bounds_pin + n_vs + 1);
+        const int a1 = b[(size_t) vh[0]], ng = b[(size_t) vh[(size_t) H]] - a1;
+        ep_gather(c.x, c.row_tok + a1, ng, c.ep_g, g.dim, s);
+        CK(cudaEventRecord(c.ep_ev, s));
+        kick(s);
+        for (int h = 0; h < H; ++h) {
+            EpReq& r = ep_req[(size_t) ep_helper(c.dev, h)];
+            r.l = &L0;
+            r.owner = c.dev;
+            r.b = b.data();
+            r.a0 = b[(size_t) vh[(size_t) h]];
+            r.nh = b[(size_t) vh[(size_t) h + 1]] - r.a0;
+            r.g0 = r.a0 - a1;
+            ep_items.fetch_add(r.items.size(), std::memory_order_relaxed);
+            r.state.store(1, std::memory_order_release);
+        }
+        ep_rows.fetch_add((uint64_t) ng, std::memory_order_relaxed);
+        ep_own_n.fetch_add(own.size() + (size_t) c.n_spec, std::memory_order_relaxed);
+        ep_layers.fetch_add(1, std::memory_order_relaxed);
+        ep_plan_us.fetch_add((uint64_t) ((now_ms() - t0) * 1000), std::memory_order_relaxed);
+        c.ep_posted = H;
+        return true;
+    }
+    // (the owner, its own experts queued) each helper's rows combined, helpers in order
+    bool ep_collect(Dev& d, Chunk& c, const Layer& l, int T, std::string& err) {
+        const int H = c.ep_posted;
+        c.ep_posted = 0;
+        for (int h = 0; h < H; ++h) {
+            const int hd = ep_helper(c.dev, h);
+            EpReq& r = ep_req[(size_t) hd];
+            const double t0 = now_ms();
+            while (r.state.load(std::memory_order_acquire) != 2) {
+                if (ep_abort.load(std::memory_order_acquire)) {
+                    err = "DS4_EP: another device's part of the run ended";
+                    return false;
+                }
+                std::this_thread::yield();
+            }
+            ep_wait_us.fetch_add((uint64_t) ((now_ms() - t0) * 1000), std::memory_order_relaxed);
+            r.state.store(0, std::memory_order_release);
+            if (r.nh > 0) {
+                CK(cudaMemcpyPeerAsync(c.y, d.id, chunks[(size_t) hd]->y, devs[(size_t) hd].id, (size_t) r.nh * g.dim * 4, d.st));
+                moe_combine(c.acc, c.y, c.pos, c.rw, T, l.k_exp, r.a0, r.a0 + r.nh, g.dim, d.st);
+            }
+            ep_pull_n.fetch_add(1, std::memory_order_relaxed);
+        }
+        return true;
+    }
+    // (a helper's device thread) the request waiting for it, if any
+    bool ep_serve(int di, std::string& err) {
+        EpReq& r = ep_req[(size_t) di];
+        if (r.state.load(std::memory_order_acquire) != 1) return true;
+        Dev& d = devs[(size_t) di];
+        Chunk& c = *chunks[(size_t) di];
+        const Chunk& o = *chunks[(size_t) r.owner];
+        const int oid = devs[(size_t) r.owner].id, D = g.dim;
+        const Layer& l = *r.l;
+        cudaStream_t s = d.st;
+        CK(cudaStreamWaitEvent(s, o.ep_ev, 0));
+        if (r.nh > 0) {
+            CK(cudaMemcpyPeerAsync(c.x, d.id, o.ep_g + (size_t) r.g0 * D, oid, (size_t) r.nh * D * 4, s));
+            x3::rows_f16(c.x, D, nullptr, r.nh, D, c.x16, s);
+        }
+        const size_t N = r.items.size(), R = (size_t) c.ep_n, bmax = std::max<size_t>(1, R / 2);
+        const int* b = r.b;
+        size_t n_dma = 0, n_comp = 0;
+        const uint8_t* src[3];
+        while (n_comp < N) {
+            while (n_dma < N && n_dma < n_comp + R) {
+                const size_t sl = n_dma % R;
+                if (n_dma >= R) CK(cudaStreamWaitEvent(c.ep_cs, c.ep_free[sl], 0));
+                if (!ep_src(l, r.items[n_dma].first, src) ||
+                    !flow_copy(l, 0, src, false, c.ep_ring + sl * c.ep_stride, nullptr, c.ep_cs, false)) {
+                    const cudaError_t e = cudaGetLastError();
+                    err = std::string("DS4_EP: a helper's copy: ") + (e != cudaSuccess ? cudaGetErrorString(e) : "no pinned copy");
+                    return false;
+                }
+                CK(cudaEventRecord(c.ep_fill[sl], c.ep_cs));
+                c.stream_bytes += (double) unit(l);
+                ++n_dma;
+            }
+            const size_t i0 = n_comp, i1 = std::min({N, i0 + bmax, (i0 / R + 1) * R});
+            const int n = (int) (i1 - i0);
+            int* bc = c.bc_pin + (size_t) (c.n_batch % (uint64_t) c.bc_n) * c.bc_w;
+            int* bcd = c.bc_dev + (size_t) (c.n_batch % (uint64_t) c.bc_n) * c.bc_w;
+            ++c.n_batch;
+            // (its rows from 0: x gathered, y side by side for the owner)
+            for (int m = 0; m < n; ++m) bc[m] = b[(size_t) r.items[i0 + (size_t) m].second] - r.a0;
+            bc[n] = b[(size_t) r.items[i1 - 1].second + 1] - r.a0;
+            if (bc[n] > bc[0]) {
+                CK(cudaStreamWaitEvent(s, c.ep_fill[(i1 - 1) % R], 0));
+                CK(cudaMemcpyAsync(bcd, bc, (size_t) (n + 1) * 4, cudaMemcpyHostToDevice, s));
+                int max_rows = 0;
+                for (int m = 0; m < n; ++m) max_rows = std::max(max_rows, bc[m + 1] - bc[m]);
+                x3::SetArgs sa;
+                sa.wbase = c.ep_ring + (i0 % R) * c.ep_stride;
+                sa.stride = c.ep_stride;
+                sa.lay = l.lay;
+                sa.n_exp = n;
+                sa.bounds = bcd;
+                sa.row0 = bc[0];
+                sa.max_rows = max_rows;
+                sa.n_embd = D;
+                sa.n_ff = l.ffn;
+                sa.limit = g.lim;
+                if (sa.lay.fmt == gg::kFmtMXFP4) {
+                    gg::set_gate_up(sa, c.x, D, c.ep_id + bc[0], c.h16, l.ffn, s, c.x16);
+                    gg::set_down(sa, c.h16, l.ffn, c.y + (size_t) bc[0] * D, D, s);
+                } else {
+                    x3::set_gate_up(sa, c.x, D, c.ep_id + bc[0], c.h16, l.ffn, s);
+                    x3::set_down(sa, c.h16, l.ffn, c.y + (size_t) bc[0] * D, D, s);
+                }
+            }
+            for (size_t i = i0; i < i1; ++i) CK(cudaEventRecord(c.ep_free[i % R], s));
+            kick(s);
+            n_comp = i1;
+        }
+        CK(cudaStreamSynchronize(s));
+        r.state.store(2, std::memory_order_release);
+        return true;
+    }
+    // (a device thread) the previous group's hand-off on the host, helping meanwhile: xfer_get then finds its flag up
+    bool ep_wait_hand(int di, const unsigned* flag, unsigned seq, std::string& err) {
+        const volatile unsigned* f = flag;
+        while ((int) (*f - seq) < 0 && !ep_abort.load(std::memory_order_acquire)) {
+            if (!ep_serve(di, err)) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    }
+    // (a device thread) helping until every device is through chunk k
+    bool ep_wait_chunk(int di, int k, std::string& err) {
+        while (ep_k_done[(size_t) k].load(std::memory_order_acquire) < (int) devs.size() &&
+               !ep_abort.load(std::memory_order_acquire) && !halt.load(std::memory_order_acquire)) {
+            if (!ep_serve(di, err)) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    }
+    // (a device thread, through its part of the run) helping until every device is
+    bool ep_finish(int di, Dev& d, std::string& err) {
+        CK(cudaStreamSynchronize(d.st));
+        ep_left.fetch_sub(1, std::memory_order_acq_rel);
+        while (ep_left.load(std::memory_order_acquire) > 0 && !ep_abort.load(std::memory_order_acquire)) {
+            if (!ep_serve(di, err)) return false;
+            std::this_thread::yield();
+        }
+        return true;
+    }
+
     // layer L0 of chunk k routed (bounds b, the device's copy d_bounds): its streamed experts as they land, the VRAM
     // ones in shares between them (the device works while the reads run)
     bool flow_layer(Dev& d, Chunk& c, Layer& L0, int mi, int k, int T, const std::vector<int>& b, std::string& err) {
@@ -6330,6 +6705,7 @@ struct Model::Impl {
             v_done = v_to;
         }
         if (!run_vram(d, c, L0, vx, vx, b.data(), v_done, L0.pv_n, T, err)) return false;
+        if (ep_run && !ep_collect(d, c, L0, T, err)) return false;
         while (c.base < c.n_comp && c.items.size() > 4096) {   // (done with: read, copied and used)
             flow_unpin(c.items.front());
             c.items.pop_front();
@@ -6382,7 +6758,8 @@ struct Model::Impl {
                 // - VRAM's experts only: one streamed into the ring is used for this chunk alone, and on a card short of
                 // VRAM (most experts streamed) the path cost prompts 5-7% (a V100 held to 20 GB, Maya-XS; #438)
                 std::vector<int> fat;
-                const bool ringed = wbase >= c.ring && wbase < c.ring + (size_t) c.ring_n * c.ring_stride;
+                const bool ringed = (wbase >= c.ring && wbase < c.ring + (size_t) c.ring_n * c.ring_stride) ||
+                                    (c.ep_ring != nullptr && wbase >= c.ep_ring && wbase < c.ep_ring + (size_t) c.ep_n * c.ep_stride);
                 // (low-bit experts only, both roles: the MXFP4 tiles take every row of a set)
                 if (sa.lay.fmt == gg::kFmtMXFP4 && gg::expert_type(sa.lay, 0) != gg::kTypeMXFP4 &&
                     gg::expert_type(sa.lay, 2) != gg::kTypeMXFP4 && sa.mix.n == 0 && !ringed && fat_ready(d, c, D, FF)) {
@@ -17401,6 +17778,7 @@ struct Model::Impl {
             }
         CK(cudaStreamSynchronize(s));
         std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
+        if (ep_run && c.flow && !ep_plan(d, c, L0, l, T, n_vs, b, err)) return false;
         // pv_n is this run's resident prefix: slots lent to buffers are streamed, not hits.
         if (S.collect_prefill && !S.prefill.add_bounds(b.data(), (size_t) n_vs, (size_t) L0.pv_n)) {
             err = "invalid prefill routing bounds for statistics";
@@ -18016,6 +18394,7 @@ struct Model::Impl {
                         std::this_thread::sleep_for(std::chrono::microseconds(100));
                     }
             }
+            if (ep_run && k > 0 && !ep_wait_chunk(di, k - 1, err)) return false;
             if (trunk_participant && !chunk_go(k)) return halt_end(di, err);
             c.at_k.store(k, std::memory_order_relaxed);
             c.at_il.store(-1, std::memory_order_relaxed);
@@ -18068,6 +18447,7 @@ struct Model::Impl {
                         init_pre(c.pre, T, s);
                     } else {
                         Chunk& a = *chunks[(size_t) L[(size_t) il - 1].dev];
+                        if (ep_run && !ep_wait_hand(di, a.hand_flag[slot], wp.win, err)) return false;
                         xfer_get(chunk_xfer(a.hand[slot], c, T, false), a.hand_flag[slot], wp.win, s);
                         set_flag(a.hand_ack + ((size_t) slot * 8 + mi) * 32, wp.win, s);
                     }
@@ -18090,7 +18470,10 @@ struct Model::Impl {
                         x.dst[x.n] = sr.ik[(size_t) di] + (size_t) g_first * ik_rb();
                         x.bytes[x.n++] = (size_t) ng * ik_rb();
                     }
-                    if (x.n > 0) xfer_get(x, sr.flag(slot), wp.win, s);
+                    if (x.n > 0) {
+                        if (ep_run && !ep_wait_hand(di, sr.flag(slot), wp.win, err)) return false;
+                        xfer_get(x, sr.flag(slot), wp.win, s);
+                    }
                     set_flag(sr.x_ack + ((size_t) slot * devs.size() + di) * 32, wp.win, s);   // (taken, or none)
                 }
                 if (last_k && mi == 0 && g.n_mtp > 0) {   // the drafter's taps: the last chunk's last rows
@@ -18143,6 +18526,10 @@ struct Model::Impl {
                     hc_pre_norm(c.h + (size_t) t0 * H * D, c.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, s);
                     if (!head_share(d, d.mi, d.x, n_logits, err)) return false;
                 }
+            }
+            if (ep_run) {   // (the chunk through here: the next one waits for every device's)
+                CK(cudaStreamSynchronize(s));
+                ep_k_done[(size_t) k].fetch_add(1, std::memory_order_acq_rel);
             }
         }
         if (trace && !c.flow) {
@@ -19487,10 +19874,19 @@ struct Model::Impl {
         // (a part with more to come: the next part's first chunk's Engram rows asked for now, behind the run's own -
         //  this thread only waits for the devices meanwhile)
         const bool ahead_next = whole != nullptr && !run_end;
+        ep_begin(run.T, lm, logits_all);
+        const double ep_t0 = now_ms();
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
-                if (!run_dev_chunks((int) di, run, e)) {
+                const bool dev_ok = run_dev_chunks((int) di, run, e);
+                if (ep_run) {   // (any way out: this device helps the others to the run's end; a failure ends their waits)
+                    if (!dev_ok && e != kHalted) ep_abort.store(true, std::memory_order_release);
+                    std::string e2;
+                    if (!ep_finish((int) di, devs[di], e2))
+                        std::fprintf(stderr, "ds4: CUDA%d's help: %s\n", devs[di].id, e2.c_str());
+                }
+                if (!dev_ok) {
                     errs[di] = e.empty() ? "a device's thread failed" : e;
                     // (said now: the other devices may wait on this one's work for good - the hand-off, the sums - and
                     //  the run's own report would never come)
@@ -19539,6 +19935,15 @@ struct Model::Impl {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
         main_at.store("a run of chunks: the devices done, the head next", std::memory_order_relaxed);
+        if (ep_run) {
+            std::fprintf(stderr, "ds4 ep: T=%d (%zu chunks), %.0f ms: %lu layers helped, %lu helper experts, %lu owner experts, %lu helper rows, "
+                                 "plan %.0f ms, owner waited %.0f ms\n",
+                         std::accumulate(run.T.begin(), run.T.end(), 0), run.T.size(), now_ms() - ep_t0,
+                         (unsigned long) ep_layers.load(), (unsigned long) ep_items.load(),
+                         (unsigned long) ep_own_n.load(), (unsigned long) ep_rows.load(), ep_plan_us.load() / 1000.0,
+                         ep_wait_us.load() / 1000.0);
+            ep_run = false;
+        }
 #if defined(STRATA_USE_HIP)
         if (!check_peer_ar(err)) return false;
         // A worker's early failure can leave peers with different submission sequences. Do not reuse the model.

@@ -426,6 +426,8 @@ void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 /// bounds[n_vs + 1], row_tok[r], pos[t][i] (the pick's sorted row, rows kPicks apart).
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
               cudaStream_t s);
+/// out[r] = x[idx[r]], rows of dim floats (DS4_EP: the helpers' rows, gathered)
+void ep_gather(const float* x, const int* idx, int n, float* out, int dim, cudaStream_t s);
 /// acc[t] += w[t][i] * y[pos[t][i] - r0] for each pick of t (in pick order) whose sorted row is in [r0, r1).
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s);
