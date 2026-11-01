@@ -109,4 +109,12 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 
+// MoE (token, expert) pairs, one column each: y row p (P x n_out) = expert pair_exp[p]'s matrix (expert_bytes apart
+// from weights) . Q8_1 row pair_row[p] (rows of n_in). Types: Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_XS. With weights2
+// (the same type and shape) also y2 = its experts' products, in the same launch (gate and up).
+bool native_mmvq_pairs_supported(int ggml_type) noexcept;
+void native_mmvq_pairs(int ggml_type, const void* weights, std::size_t expert_bytes, const int* pair_exp,
+                       const int* pair_row, const void* x_q8_1, float* y, int n_in, int n_out, int P, void* stream,
+                       const void* weights2 = nullptr, float* y2 = nullptr);
+
 } // namespace strata::kernels

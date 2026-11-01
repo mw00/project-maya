@@ -1471,6 +1471,87 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     return row_bytes * std::size_t(n_out);
 }
 
+// ---- MoE pairs: blockIdx.y a (token, expert) pair - its expert's matrix (pair_exp * expert_bytes from W), its
+// token's Q8_1 row (pair_row; rows n_in apart), output row p of y (P x n_out); the ncols = 1 layout
+template<typename F, int ROWS>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_mmvq_pairs_kernel(const uint8_t* __restrict__ wb, const uint8_t* __restrict__ wb2,
+                                         std::size_t expert_bytes,
+                                         const int32_t* __restrict__ pair_exp, const int32_t* __restrict__ pair_row,
+                                         const Q81Block* __restrict__ xb, float* __restrict__ y, float* __restrict__ y2,
+                                         int n_in, int n_out, int P) {
+    // blockIdx.y >= P: the second matrix (gate and up of the same pairs in one launch)
+    const bool second = int(blockIdx.y) >= P;
+    const int p = second ? int(blockIdx.y) - P : int(blockIdx.y);
+    if (second) { wb = wb2; y = y2; }
+    const auto* w = reinterpret_cast<const typename F::Block*>(wb + std::size_t(pair_exp[p]) * expert_bytes);
+    const Q81Block* x = xb + std::size_t(pair_row[p]) * (n_in / Q8K);
+    float* yp = y + std::size_t(p) * n_out;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += F::apply(F::load(w + block, kqs), x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) yp[row0 + i] = tmp[i];
+    }
+}
+
+template<typename F>
+void launch_pairs(const void* w, const void* w2, std::size_t expert_bytes, const int32_t* pe, const int32_t* pr,
+                  const void* x, float* y, float* y2, int n_in, int n_out, int P, cudaStream_t s) {
+    const auto* wb = static_cast<const uint8_t*>(w);
+    const auto* wb2 = static_cast<const uint8_t*>(w2 ? w2 : w);
+    const auto* xb = static_cast<const Q81Block*>(x);
+    const unsigned gy = unsigned(w2 ? 2 * P : P);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / F::DIV < F::BPI)
+        native_mmvq_pairs_kernel<F, WARPS><<<dim3(unsigned((n_out + WARPS - 1) / WARPS), gy), threads, 0, s>>>(
+            wb, wb2, expert_bytes, pe, pr, xb, y, y2, n_in, n_out, P);
+    else
+        native_mmvq_pairs_kernel<F, 1><<<dim3(unsigned(n_out), gy), threads, 0, s>>>(wb, wb2, expert_bytes, pe, pr, xb, y,
+                                                                                y2, n_in, n_out, P);
+}
+
+bool native_mmvq_pairs_supported(int t) noexcept { return t == 8 || t == 12 || t == 13 || t == 14 || t == 11 || t == 23; }
+
+void native_mmvq_pairs(int ggml_type, const void* weights, std::size_t expert_bytes, const int32_t* pair_exp,
+                       const int32_t* pair_row, const void* x_q8_1, float* y, int n_in, int n_out, int P, void* stream,
+                       const void* weights2, float* y2) {
+    cudaStream_t s = static_cast<cudaStream_t>(stream);
+    switch (ggml_type) {
+    case 8: launch_pairs<SmallTraits<Q80Block, 8>>(weights, weights2, expert_bytes, pair_exp, pair_row, x_q8_1, y, y2, n_in, n_out, P, s); break;
+    case 11: launch_pairs<Q3KTraits>(weights, weights2, expert_bytes, pair_exp, pair_row, x_q8_1, y, y2, n_in, n_out, P, s); break;
+    case 12: launch_pairs<Q4KTraits>(weights, weights2, expert_bytes, pair_exp, pair_row, x_q8_1, y, y2, n_in, n_out, P, s); break;
+    case 13: launch_pairs<Q5KTraits>(weights, weights2, expert_bytes, pair_exp, pair_row, x_q8_1, y, y2, n_in, n_out, P, s); break;
+    case 14: launch_pairs<Q6KTraits>(weights, weights2, expert_bytes, pair_exp, pair_row, x_q8_1, y, y2, n_in, n_out, P, s); break;
+    case 23: launch_pairs<IQ4XSTraits>(weights, weights2, expert_bytes, pair_exp, pair_row, x_q8_1, y, y2, n_in, n_out, P, s); break;
+    default: throw std::invalid_argument("native_mmvq_pairs: GGML type");
+    }
+    launch_check();
+}
+
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream) {
     switch (ggml_type) {

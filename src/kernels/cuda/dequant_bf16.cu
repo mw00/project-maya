@@ -153,11 +153,13 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
 
 template <int TYPE, typename T>
 __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0, int64_t rows,
-                               int64_t groups_per_row, T* __restrict__ out) {
+                               int64_t groups_per_row, T* __restrict__ out, const int32_t* __restrict__ d_row0 = nullptr) {
     const int64_t g = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (g >= rows * groups_per_row) return;
     const int64_t r = g / groups_per_row, gi = g % groups_per_row;
-    group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
+    // (d_row0: the rows named on the device - output row r is source row d_row0[r])
+    const int64_t src = d_row0 != nullptr ? (int64_t) d_row0[r] : row0 + r;
+    group32<TYPE>(blocks + src * row_bytes, (int) gi, out + r * groups_per_row * 32 + gi * 32);
 }
 
 // Q8_0 -> f16, 8 values a thread: one 16-byte store each, so a warp writes 512 contiguous bytes (the generic kernel's
@@ -265,7 +267,8 @@ bool geometry(int type, int& block_elems, int& block_bytes) {
 }
 
 template <typename T>
-void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream) {
+void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, T* out, void* stream,
+            const int32_t* d_row0 = nullptr) {
     int be = 0, bb = 0;
     if (!geometry(type, be, bb) || cols % be != 0 || rows <= 0) {
         std::fprintf(stderr, "dequant: unsupported type %d or shape %lld x %lld\n", type, (long long) rows,
@@ -276,7 +279,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     const unsigned grid = (unsigned) ((total + 255) / 256);
     const uint8_t* p = (const uint8_t*) blocks;
     cudaStream_t st = (cudaStream_t) stream;
-#define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); break
+#define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out, d_row0); break
     switch (type) {
     case 2: STRATA_DQ(2);
     case 6: STRATA_DQ(6);
@@ -305,6 +308,8 @@ namespace {
 // plan v0.3 P6: the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
 bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
 }  // namespace
+
+bool dequant_f16_supported(int ggml_type) noexcept { return dequant_bf16_supported(ggml_type) || iq_only(ggml_type); }
 
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                   void* stream) {
@@ -354,6 +359,17 @@ void dequant_f32(int ggml_type, const void* blocks, int64_t row0, int64_t rows, 
         return;
     }
     launch<float>(ggml_type, blocks, row0, rows, cols, out, stream);
+}
+
+bool dequant_f32_dev_supported(int ggml_type) noexcept { return dequant_bf16_supported(ggml_type) && !iq_only(ggml_type); }
+
+void dequant_f32_dev(int ggml_type, const void* blocks, const int32_t* d_row, int64_t cols, float* out, void* stream) {
+    launch<float>(ggml_type, blocks, 0, 1, cols, out, stream, d_row);
+}
+
+void dequant_f32_rows_dev(int ggml_type, const void* blocks, const int32_t* d_rows, int64_t rows, int64_t cols, float* out,
+                          void* stream) {
+    launch<float>(ggml_type, blocks, 0, rows, cols, out, stream, d_rows);
 }
 
 }  // namespace strata::kernels

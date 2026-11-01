@@ -408,6 +408,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/exl3.cu
                           src/kernels/cuda/exl3_legacy.cu
                           src/kernels/cuda/glm_kv_stream.cu
+                          src/kernels/cuda/dense_kernels.cu
+                          src/kernels/cuda/q35_kernels.cu
+                          src/kernels/cuda/q35_mmt.cu
+                          src/kernels/cuda/q35_dflash.cu
+                          src/kernels/cuda/q35_moe.cu
+                          src/kernels/cuda/g4_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
@@ -544,7 +550,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/dense_model.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_CUDA)
@@ -627,6 +633,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(maya src/program/generate.cpp)
   target_include_directories(maya PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(maya PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
+
+  # dense models (Qwen3.8-27B: Gated DeltaNet + gated attention, MTP / DFlash2 drafts; Gemma 4): the same --serve
+  # protocol as `maya`, no experts
+  add_executable(strata-dense src/program/dense_main.cpp)
+  target_include_directories(strata-dense PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(strata-dense PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
   # DeepSeek-V4.1-Flash (EXL3, tools/ds4/pack.py; or a GGUF, tools/ds4/pack_gguf.py): its own engine over the kernel
   # libraries (src/ds4)
@@ -1465,7 +1477,8 @@ if(STRATA_NATIVE_EXPERTS)
       set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
     endif()
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
-                ${_strata_mmq}/convert.cu)
+                ${_strata_mmq}/convert.cu src/prefill/moe_tc_kq.cu)
+    target_compile_definitions(strata_mmq PUBLIC STRATA_PREFILL_TCKQ=1)   # (moe_tc_kq: CUDA only)
     if(_strata_mmq_glu)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_GLU=1)
     endif()
