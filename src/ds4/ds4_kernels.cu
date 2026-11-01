@@ -4578,8 +4578,8 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
         for (int p = 0; p < kArPieces; ++p) {
             int p0, p1, q0, q1;
             piece(p, p0, p1, q0, q1);
-            if (q0 > p0) cudaMemcpyAsync(hrow(mi) + p0, own + p0, (size_t) (q0 - p0) * 8, cudaMemcpyDeviceToHost, aux->s2);
-            if (p1 > q1) cudaMemcpyAsync(hrow(mi) + q1, own + q1, (size_t) (p1 - q1) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            if (q0 > p0) cudaMemcpyAsync(hrow(mi) + p0, own + p0, (size_t) (q0 - p0) * 8, cudaMemcpyDefault, aux->s2);
+            if (p1 > q1) cudaMemcpyAsync(hrow(mi) + q1, own + q1, (size_t) (p1 - q1) * 8, cudaMemcpyDefault, aux->s2);
             pdl_launch(set_flag_kernel, 1, 1, 0, aux->s2, rfp(p) + (size_t) mi * fs, seq);
         }
         for (int p = 0; p < kArPieces; ++p) {
@@ -4594,7 +4594,7 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
             int p0, p1, q0, q1;
             piece(p, p0, p1, q0, q1);
             cudaStreamWaitEvent(aux->s2, aux->ev[1 + p], 0);
-            if (q1 > q0) cudaMemcpyAsync(hsum + q0, own + q0, (size_t) (q1 - q0) * 8, cudaMemcpyDeviceToHost, aux->s2);
+            if (q1 > q0) cudaMemcpyAsync(hsum + q0, own + q0, (size_t) (q1 - q0) * 8, cudaMemcpyDefault, aux->s2);
             pdl_launch(set_flag_kernel, 1, 1, 0, aux->s2, sfp(p) + (size_t) mi * fs, seq);
         }
         for (int p = 0; p < kArPieces; ++p) {
@@ -4606,15 +4606,15 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
         }
         return;
     }
-    if (c0 > 0) cudaMemcpyAsync(hrow(mi), own, (size_t) c0 * 8, cudaMemcpyDeviceToHost, s);   // (the others' slices)
-    if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDeviceToHost, s);
+    if (c0 > 0) cudaMemcpyAsync(hrow(mi), own, (size_t) c0 * 8, cudaMemcpyDefault, s);   // (the others' slices)
+    if (c1 < n4) cudaMemcpyAsync(hrow(mi) + c1, own + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDefault, s);
     pdl_launch(set_flag_kernel, 1, 1, 0, s, rf + (size_t) mi * fs, seq);
     pdl_launch(wait_flags_kernel, 1, 32, 0, s, rf, nm, fs, seq);
     if (nm <= std::min(8, zc_max)) {
         const int nb = std::max(1, std::min(1024, cdiv(c1 - c0, kThreads)));
         if (c1 > c0) {
             pdl_launch(ar_sum16_zc_kernel, nb, kThreads, 0, s, (float4*) x, own, hrow(0), a.slots * a.stride / 2, nm, mi, c0, c1);
-            cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
+            cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDefault, s);
         }
         pdl_launch(set_flag_kernel, 1, 1, 0, s, sf + (size_t) mi * fs, seq);
         pdl_launch(wait_flags_kernel, 1, 32, 0, s, sf, nm, fs, seq);
@@ -4624,14 +4624,14 @@ void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void
     if (c1 > c0) {
         for (int m = 0; m < nm; ++m)
             if (m != mi)
-                cudaMemcpyAsync(peers + (size_t) m * cq, hrow(m) + c0, (size_t) (c1 - c0) * 8, cudaMemcpyHostToDevice, s);
+                cudaMemcpyAsync(peers + (size_t) m * cq, hrow(m) + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDefault, s);
         pdl_launch(ar_sum16_kernel, std::max(1, std::min(1024, cdiv(c1 - c0, kThreads))), kThreads, 0, s, (float4*) x, own, peers, (size_t) cq, nm, mi, c0, c1);
-        cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDeviceToHost, s);
+        cudaMemcpyAsync(hsum + c0, own + c0, (size_t) (c1 - c0) * 8, cudaMemcpyDefault, s);
     }
     pdl_launch(set_flag_kernel, 1, 1, 0, s, sf + (size_t) mi * fs, seq);
     pdl_launch(wait_flags_kernel, 1, 32, 0, s, sf, nm, fs, seq);
-    if (c0 > 0) cudaMemcpyAsync(own, hsum, (size_t) c0 * 8, cudaMemcpyHostToDevice, s);
-    if (c1 < n4) cudaMemcpyAsync(own + c1, hsum + c1, (size_t) (n4 - c1) * 8, cudaMemcpyHostToDevice, s);
+    if (c0 > 0) cudaMemcpyAsync(own, hsum, (size_t) c0 * 8, cudaMemcpyDefault, s);
+    if (c1 < n4) cudaMemcpyAsync(own + c1, hsum + c1, (size_t) (n4 - c1) * 8, cudaMemcpyDefault, s);
     pdl_launch(ar_from16_kernel, blocks, kThreads, 0, s, (float4*) x, own, n4, c0, c1);
 }
 
@@ -4839,7 +4839,7 @@ void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, in
     cudaStreamWaitEvent(aux.s2, aux.ev[0], 0);
     for (int p = 0; p < NP; ++p) {
         const int p0 = std::min(n4, p * P4), p1 = std::min(n4, p0 + P4);
-        if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDeviceToHost, aux.s2);
+        if (p1 > p0) cudaMemcpyAsync(hrow + p0, own + p0, (size_t) (p1 - p0) * 8, cudaMemcpyDefault, aux.s2);
         pdl_launch(set_flag_kernel, 1, 1, 0, aux.s2, a.bflags + ((size_t) slot * kArBlocks + p) * 8 + (size_t) mi * fs, seq);
     }
 #if !defined(STRATA_USE_HIP)

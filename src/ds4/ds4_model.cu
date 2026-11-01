@@ -57,6 +57,7 @@
 #include <deque>
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <climits>
 #include <cmath>
 #include <cstdio>
@@ -70,6 +71,8 @@
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <system_error>
+#include <tuple>
 #include <thread>
 #include <unordered_map>
 
@@ -2403,6 +2406,103 @@ struct Model::Impl {
         p = (T*) v;
         return true;
     }
+    // DS4_AR_P2P=1 (groups of up to 4): a group's all-reduce buffers and flags in the memory of its first member's GPU,
+    // the other members reaching it by peer access (the drivers' P2P: the host-mapped rows were a round trip through RAM),
+    // zeroed.  Falls back to host-mapped memory where a pair cannot reach each other and where a member's BAR1 is small
+    size_t bar1_bytes(int id) const {
+        char bus[64] = {};
+        if (cudaDeviceGetPCIBusId(bus, (int) sizeof(bus), id) != cudaSuccess) return 0;
+        std::string b = bus;
+        for (char& ch : b) ch = (char) std::tolower((unsigned char) ch);
+        std::error_code ec;
+        const auto sz = std::filesystem::file_size("/sys/bus/pci/devices/" + b + "/resource1", ec);
+        return ec ? 0 : (size_t) sz;   // (unknown, or not Linux: 0 - the host-mapped rows)
+    }
+    template <class T>
+    bool gmap(const Group& G, T*& p, size_t n, std::string& err) {
+        static const bool want = std::getenv("DS4_AR_P2P") != nullptr && std::atoi(std::getenv("DS4_AR_P2P")) != 0;
+        if (!want || G.mem.size() > 4) return hmap(p, n, err);
+        const int home = devs[(size_t) G.mem[0]].id;
+        // (a member with a small BAR1 - 256 MiB, no ReBAR - takes the copy engines' P2P but not the kernels' loads
+        // and stores: ar2_kernel spun forever on a pair of them, whichever side held the buffers, even 64 KB of them)
+        bool reach = true;
+        for (int m : G.mem) {
+            int can = 0;
+            if (bar1_bytes(devs[(size_t) m].id) < ((size_t) 1 << 30)) reach = false;
+            if (devs[(size_t) m].id != home &&
+                (cudaDeviceCanAccessPeer(&can, devs[(size_t) m].id, home) != cudaSuccess || !can))
+                reach = false;
+        }
+        if (!reach && std::getenv("DS4_AR_P2P_LOG") != nullptr) {   // (once a group: its first buffer)
+            std::string m;
+            for (int k : G.mem) m += " CUDA" + std::to_string(devs[(size_t) k].id) + " BAR1 " +
+                                     std::to_string(bar1_bytes(devs[(size_t) k].id) >> 20) + " MiB";
+            std::fprintf(stderr, "ds4: DS4_AR_P2P: the group%s stays host-mapped (BAR1 under 1 GiB, or no peer access)\n", m.c_str());
+        }
+        if (!reach) return hmap(p, n, err);
+        // placed at the load's end (p2p_place): a peer enabled while the load still allocates and calibrates left
+        // route_kernel reading out of range on another GPU (even 1 -> 0 with nothing on a device: GPU4 faulted);
+        // enabled after it, the same run went through.  Until then the host-mapped rows
+        if (!hmap(p, n, err)) return false;
+        std::vector<int> ids;
+        for (int m : G.mem) ids.push_back(devs[(size_t) m].id);
+        p2p_todo.push_back({home, ids, (void**) &p, n * sizeof(T) + 64});
+        return true;
+    }
+    struct P2pBuf {
+        int home;
+        std::vector<int> members;
+        void** where;   // (the group's field: groups[] stays put after the load)
+        size_t bytes;
+    };
+    std::vector<P2pBuf> p2p_todo;
+    // DS4_AR_P2P: the buffers gmap noted moved into their home GPU's memory, the members given peer access to it;
+    // where the room is short a buffer stays host-mapped (the kernels take either)
+    void p2p_place() {
+        if (p2p_todo.empty()) return;
+        int cur = 0;
+        cudaGetDevice(&cur);
+        size_t moved = 0, kept = 0;
+        for (const P2pBuf& b : p2p_todo) {
+            bool ok = true;
+            for (int id : b.members) {
+                if (id == b.home) continue;
+                cudaSetDevice(id);
+                const cudaError_t pe = cudaDeviceEnablePeerAccess(b.home, 0);
+                if (pe != cudaSuccess) (void) cudaGetLastError();   // (AlreadyEnabled: not left for a later check)
+                if (pe != cudaSuccess && pe != cudaErrorPeerAccessAlreadyEnabled) ok = false;
+            }
+            void* v = nullptr;
+            cudaSetDevice(b.home);
+            if (ok && (cudaMalloc(&v, b.bytes) != cudaSuccess || cudaMemset(v, 0, b.bytes) != cudaSuccess)) {
+                (void) cudaGetLastError();
+                if (v != nullptr) cudaFree(v);
+                v = nullptr;
+            }
+            if (v == nullptr) {
+                kept += b.bytes;
+                continue;
+            }
+            cudaDeviceSynchronize();
+            for (Dev& d : devs)
+                if (d.id == b.home) d.allocs.push_back(v);   // (freed with the GPU's others)
+            void* old = *b.where;
+            for (Group& G : groups)   // (G.arb = G.ar copies: every field that held the host rows now holds these)
+                for (ArGroup* a : {&G.ar, &G.arb})
+                    for (void** f : {(void**) &a->data, (void**) &a->flags, (void**) &a->sums, (void**) &a->bflags,
+                                     (void**) &a->pflags})
+                        if (*f == old) *f = v;
+            auto it = std::find(host_allocs.begin(), host_allocs.end(), old);
+            if (it != host_allocs.end()) host_allocs.erase(it);
+            cudaFreeHost(old);
+            moved += b.bytes;
+        }
+        cudaSetDevice(cur);
+        std::fprintf(stderr, "ds4: DS4_AR_P2P: %.1f MB of all-reduce buffers in their group's first GPU, peers reaching "
+                             "them directly%s\n", moved / 1e6,
+                     kept > 0 ? (", " + std::to_string(kept >> 20) + " MiB left host-mapped (no room)").c_str() : "");
+        p2p_todo.clear();
+    }
     template <class T>
     bool halloc(T*& p, size_t n, std::string& err) {
         void* v = nullptr;
@@ -4000,12 +4100,12 @@ struct Model::Impl {
             G.ar.nm = (int) G.mem.size();
             G.ar.slots = 4;
             G.ar.stride = (size_t) kWin * g.dim;
-            if (G.ar.nm > 1 && (!hmap(G.ar.data, (size_t) G.ar.nm * G.ar.slots * G.ar.stride, err) ||
-                                !hmap(G.ar.flags, (size_t) G.ar.nm * G.ar.slots * 32, err)))
+            if (G.ar.nm > 1 && (!gmap(G, G.ar.data, (size_t) G.ar.nm * G.ar.slots * G.ar.stride, err) ||
+                                !gmap(G, G.ar.flags, (size_t) G.ar.nm * G.ar.slots * 32, err)))
                 return false;
             // three members or more: the reduce-scatter's sums and its per-block flags (allreduce)
-            if (G.ar.nm > 2 && (!hmap(G.ar.sums, (size_t) G.ar.slots * G.ar.stride, err) ||
-                                !hmap(G.ar.bflags, (size_t) 2 * G.ar.nm * G.ar.slots * kArBlocks * 8, err)))
+            if (G.ar.nm > 2 && (!gmap(G, G.ar.sums, (size_t) G.ar.slots * G.ar.stride, err) ||
+                                !gmap(G, G.ar.bflags, (size_t) 2 * G.ar.nm * G.ar.slots * kArBlocks * 8, err)))
                 return false;
             if (G.ar.nm > 1 && &G == &groups[(size_t) devs[(size_t) head_dev].grp] &&
                 (!hmap(G.lg_stage, (size_t) 2 * (G.ar.nm - 1) * kWin * ((g.vocab / 128 + G.ar.nm - 1) / G.ar.nm * 128), err) ||
@@ -4015,8 +4115,8 @@ struct Model::Impl {
             G.arb.slots = 2;
             G.arb.stride = (size_t) chunk * g.dim;
             G.arb.data = G.arb.sums = nullptr;   // (G.ar's: the decode's - a chunk's are its own, or none)
-            if (chunk > 0 && G.arb.nm > 1 && !hmap(G.arb.flags, (size_t) G.arb.nm * G.arb.slots * 32, err)) return false;
-            if (chunk > 0 && G.arb.nm > 2 && !hmap(G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err))
+            if (chunk > 0 && G.arb.nm > 1 && !gmap(G, G.arb.flags, (size_t) G.arb.nm * G.arb.slots * 32, err)) return false;
+            if (chunk > 0 && G.arb.nm > 2 && !gmap(G, G.arb.bflags, (size_t) 2 * G.arb.nm * G.arb.slots * kArBlocks * 8, err))
                 return false;
             // 5 members or more: a chunk's sums by the host (DS4_AR_HOST: the members from which, 0 off; threads
             // DS4_AR_HOST_THREADS, 32) - unless DS4_AR_DMA=0 (chunk_allreduce_on: the kernels' own sums then)
@@ -4034,12 +4134,12 @@ struct Model::Impl {
             // the members' F32 rows and the sums the copy engines' sums go through: not with the host's, which has rows of
             // its own (FP16) - 1.3 GB of pinned RAM at 8 members and chunks of 4096, more at larger chunks
             if (chunk > 0 && G.arb.nm > 1 && G.hred == nullptr &&
-                !hmap(G.arb.data, (size_t) G.arb.nm * G.arb.slots * G.arb.stride, err))
+                !gmap(G, G.arb.data, (size_t) G.arb.nm * G.arb.slots * G.arb.stride, err))
                 return false;
-            if (chunk > 0 && G.arb.nm > 2 && G.hred == nullptr && !hmap(G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err))
+            if (chunk > 0 && G.arb.nm > 2 && G.hred == nullptr && !gmap(G, G.arb.sums, (size_t) G.arb.slots * G.arb.stride, err))
                 return false;
             if (chunk > 0 && G.arb.nm == 2 && ar2() > 0) {   // DS4_AR2: ar2_kernel's progress words (zeroed)
-                if (!hmap(G.arb.pflags, (size_t) G.arb.nm * G.arb.slots * kAr2Blocks * 16, err)) return false;
+                if (!gmap(G, G.arb.pflags, (size_t) G.arb.nm * G.arb.slots * kAr2Blocks * 16, err)) return false;
                 G.arb.ar2 = ar2();
             }
             // DS4_AR2_DECODE=1 (unset: as before): the decode windows' all-reduces of a group of two (G.ar: the
@@ -4048,7 +4148,7 @@ struct Model::Impl {
             // other's rows read 16 bytes a lane.  Its own progress words: G.arb was copied from G.ar before, so it
             // shares none of them
             if (G.ar.nm == 2 && ar2_decode()) {
-                if (!hmap(G.ar.pflags, (size_t) G.ar.nm * G.ar.slots * kAr2Blocks * 16, err)) return false;
+                if (!gmap(G, G.ar.pflags, (size_t) G.ar.nm * G.ar.slots * kAr2Blocks * 16, err)) return false;
                 G.ar.ar2 = 1;
             }
         }
@@ -4593,6 +4693,7 @@ struct Model::Impl {
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         reset();
         blas_warm_start();
+        p2p_place();
         return true;
     }
 
