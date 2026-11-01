@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <regex>
 #include <thread>
 
@@ -38,11 +39,32 @@ std::vector<std::string> shard_paths(const std::string& path) {
     return out;
 }
 
-// the set's stem: the path without ".gguf" and without a shard suffix
-std::string set_stem(const std::string& path) {
-    static const std::regex re("^(.*?)(-\\d{5}-of-\\d{5})?\\.gguf$");
-    std::smatch m;
-    return std::regex_match(path, m, re) ? m[1].str() : path;
+// the set's indexer side file, found the way the real sets name it: <set name>-maya-indexers.bin beside
+// the shards, where the set name is a prefix of the shard name but not the whole stem (the shards carry
+// a quant tag the side file does not: ...-Maya-XS-IQ1_S-00001-of-00002.gguf next to
+// ...-Maya-XS-maya-indexers.bin).  The longest matching prefix in the shards' directory wins.
+std::string side_file(const std::string& shard) {
+    const size_t slash = shard.find_last_of('/');
+    const std::string dir = slash == std::string::npos ? "." : shard.substr(0, slash);
+    const std::string base = slash == std::string::npos ? shard : shard.substr(slash + 1);
+    for (const char* suf : {"-maya-indexers.bin", "-maya-indexers.gguf"}) {
+        std::string best;
+        size_t best_stem = 0;
+        std::error_code ec;
+        for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+            if (!e.is_regular_file()) continue;
+            const std::string name = e.path().filename().string();
+            const size_t sl = std::strlen(suf);
+            if (name.size() <= sl || name.compare(name.size() - sl, std::string::npos, suf) != 0) continue;
+            const std::string stem = name.substr(0, name.size() - sl);
+            if (base.compare(0, stem.size(), stem) == 0 && stem.size() > best_stem) {
+                best = dir + "/" + name;
+                best_stem = stem.size();
+            }
+        }
+        if (!best.empty()) return best;
+    }
+    return {};
 }
 
 bool file_exists(const std::string& p) {
@@ -112,14 +134,8 @@ bool Mm3Metal::Impl::open_files(const std::string& path, std::string& err) {
     std::vector<std::string> paths = shard_paths(path);
     // the dense layers' indexers ride in a side file beside the shards (a GGUF under a .bin name in the
     // current sets; older sets used -maya-indexers.gguf)
-    const std::string stem = set_stem(path);
-    for (const char* suf : {"-maya-indexers.bin", "-maya-indexers.gguf"}) {
-        const std::string side = stem + suf;
-        if (file_exists(side) && std::find(paths.begin(), paths.end(), side) == paths.end()) {
-            paths.push_back(side);
-            break;
-        }
-    }
+    const std::string side = side_file(path);
+    if (!side.empty() && std::find(paths.begin(), paths.end(), side) == paths.end()) paths.push_back(side);
     for (const std::string& p : paths) {
         ggml_context* meta = nullptr;
         gguf_init_params ip{true, &meta};

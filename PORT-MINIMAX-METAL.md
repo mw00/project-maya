@@ -104,3 +104,34 @@ metal --setup` does not offer MiniMax yet, and serve/server.py is not pointed at
 the setup. The engine speaks the server's protocol, so the remaining work is launcher plumbing in
 maya.py (model routing, the GGUF download + pack step, recommended context), best done against
 maya.py's own test suite (tools/test_maya.py, tools/test_maya_metal.py) rather than by feel.
+
+## Progress — 2026-11-01, evening (milestone 4: the real model runs)
+
+**Maya-XS runs on the Mac.** The full 93 GB set (peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF, Maya-XS:
+two IQ1_S shards, 47.8 + 45.1 GB, plus the 12.5 MB indexers side file) was downloaded to
+models/Maya-XS after freeing space on the Sabrent (121 GB free before the download, ~34 GB after).
+All runs below are maya-metal-mm3 on the M5 Max with 8,192-token context state (1.16 GB) and
+92.99 GB of weights resident.
+
+- Load: 103–117 s (disk-bound).
+- Chat prompt (the model's own template, 191 tokens): prefill 153 tok/s; the model answered
+  "The capital of France is Paris." and emitted EOS. Decode 16.2 tok/s.
+- Document prompt (3,227 tokens = 26 index blocks, so top-16 selection genuinely prunes): prefill
+  242 tok/s; asked for the Maya-XS size "according to the document", the model reasoned over the
+  document and quoted its line back ("Maya-XS (93 GB) fits into a 128 GB Mac with …") before the
+  48-token budget cut its think block. Decode at ~3.2 k context: 6.7 tok/s — the sparse attention
+  over ≤2,048 kept keys plus the per-layer host selection is the v1 cost, as designed.
+- A raw completion prompt with no BOS and no chat template derailed into a repetition loop on this
+  1.6-bit instruct quant — a prompt-format artifact, recorded so nobody re-diagnoses it: use the
+  model's template (its tokenizer BOS is 200019, EOS 200020).
+
+**One real bug found and fixed by the real set:** the loader derived the indexers side file's name
+from the shard stem, but the real sets name it after the set, not the quant-tagged shard
+(…-Maya-XS-maya-indexers.bin beside …-Maya-XS-IQ1_S-00001-of-00002.gguf), so the dense layers'
+indexers were never found and the first real load failed on blk.0. The loader now discovers the
+side file by scanning the shards' directory for the longest -maya-indexers.bin/.gguf name that
+prefixes a shard name. Fixture parity unchanged (rel L2 4.24e-05); the four mm3 tests pass 4/4.
+
+**Still not done (deliberately)**: maya.py launcher integration, as in milestone 3. Speed work
+(fusing the per-layer host selection, batching decode graphs) is future work; v1 is
+correctness-first, as the GLM engine was.
