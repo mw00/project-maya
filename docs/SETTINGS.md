@@ -1051,6 +1051,21 @@ same. Not on a wave64 build (gfx908).
 | `MAYA_DS4_HC_FUSE` | off (0) | `1`: a decoded token's HC split and norm in one launch, the attention input rounded to int8 there; `2`: a verify window's rows too, and the FFN input rounded for the shared expert (the same bits, checked at load) |
 | `MAYA_DS4_ROUTE_FUSE` | off (0) | `1`: a decoded token's router stage on a group's lead in two launches instead of four; `2`: a verify window's rows too (the same bits, checked at load; one layer of lookahead, `DS4_AHEAD` 1, the default) |
 
+## DeepSeek: the router's weights in BF16
+
+The router (384 experts x 5120 a layer) is read twice a decoded token a layer: its gate and the next layer's guesses.
+DeepSeek-V4.1's GGUFs hold it in BF16, and the engine kept an F32 copy - 7.9 MB a read instead of 3.9. With
+`MAYA_DS4_ROUTER_BF16=1` the BF16 rows stay as they are on the GPU and the kernels widen each value to F32 (exactly) and
+sum the same products in the same order, so the logits are the same bits; the router's VRAM (~160 MB) goes to experts.
+On AMD it is the default, with the router's loads four at a time a lane (gfx1151: 52 -> 21 us a read, decode +3.5%).
+`MAYA_DS4_ROUTER_CHECK=1` compares every BF16 router at load against the F32 copy and against the host's replay of the
+old kernel's sums (1, 3 and 40 rows, and the pair kernel of `MAYA_DS4_ROUTE_FUSE`) - a difference fails the start.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_ROUTER_BF16` | on (AMD), off (NVIDIA) | `1`: a BF16 router stays BF16 on the GPU (half the bytes, the same bits); `0`: the F32 copy, as before |
+| `MAYA_DS4_ROUTER_CHECK` | off | `1`: every BF16 router checked at load against the F32 copy and the old kernel's sums |
+
 The HC mix and split (`hc_mix`, then a one-warp `hc_split`) run twice a layer. Where they are not fused as above,
 one launch now does both: the block that finishes a token's last mix runs that token's split, with the same code, so
 the values are the same. On NVIDIA they run on a second stream beside the attention and the MoE, off the layer's path,
