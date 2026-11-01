@@ -19589,6 +19589,7 @@ struct Model::Impl {
         //  another read left)
         if (eg_pre && !(whole != nullptr && sq_bound == eg_pre->seq && fp.at == eg_pre->at && eg_pre->k > k0))
             eg_ahead_end();
+        const double trc_t0 = now_ms();
         blas_wait();   // (the prompt path's GEMM warm-up, if it still runs: finished first)
         warm_end();   // (the last prompt's warm-up: this one streams what it needs)
         // (DS4_SETTLE_MS: the profile's counts before the run - what the run picked is the difference)
@@ -19822,8 +19823,20 @@ struct Model::Impl {
                     progress(run.p0[reported - 1] + run.T[reported - 1] - run.p0[0]);
             }
             if (all) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            // (DS4_RUN_POLL_MS, 50: how often it looks whether the devices are done; the progress stays at 50 ms)
+            static const int run_poll = [] {
+                const char* v = std::getenv("DS4_RUN_POLL_MS");
+                return v != nullptr ? std::max(1, std::min(50, std::atoi(v))) : 50;
+            }();
+            for (int waited = 0; waited < 50; waited += run_poll) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(run_poll));
+                if (run_poll >= 50) break;
+                bool now_all = true;
+                for (auto& w : workers) now_all = now_all && w->idle();
+                if (now_all) break;
+            }
         }
+        const double trc_done = now_ms();
         main_at.store("a run of chunks: the devices done, the head next", std::memory_order_relaxed);
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (!check_peer_ar(err)) return false;
@@ -19863,6 +19876,7 @@ struct Model::Impl {
                                 "prompt is not answered (those experts went to the CPU lane)";
             return false;
         }
+        const double trc_back = now_ms();
         st.layer_ms += now_ms() - tl;
         eg_stats();
         Dev& d = devs[(size_t) head_dev];
@@ -19951,8 +19965,10 @@ struct Model::Impl {
         }
         pos += took;
         st.tokens += took;
+        const double trc_head = now_ms();
         if (settle) settle_learn();
         cache_tick(took);
+        const double trc_tick = now_ms();
         // (a part with more to come: the next part reads on, and the last one seeds the drafter - its last chunk's
         //  taps, as one call's; a part before the skip's cut never reaches the layers they are taken at - and settles
         //  the cache once, after the whole prompt)
@@ -19964,7 +19980,9 @@ struct Model::Impl {
         // run wholly KV-only past the skip (a piece of a longer prompt, `after`: the piece that ends it seeds it)
         const bool kv_only = fp.skip >= 0 && fp.cut_k >= k1;
         const int nr = std::min(T_last, tap_cap);
+        const double trc_warm = now_ms();
         if (run_end && took == n && !kv_only && !seed_drafter(pos - nr, nr, 0, err)) return false;
+        const double trc_seed = now_ms();
         // feed_marks' restore points the run went past (a yield's: those before where it stopped), in order, as mark()
         // keeps them; then feed_mark's checkpoint `snap_slot` - each from what the layers kept of it
         for (size_t j = 0; inner != nullptr && j < inner->size(); ++j)
@@ -19974,6 +19992,12 @@ struct Model::Impl {
         if (snap_slot >= 0 && took == n &&
             !snap_check(ck[snap_slot & 1], run.snap_pos.back(), (int) run.snap_pos.size() - 1, err))
             return false;
+        static const bool turn_trace = std::getenv("DS4_TURN_TRACE") != nullptr;
+        if (turn_trace)
+            std::fprintf(stderr, "ds4 trace run: %d tokens: before the run %.1f, the devices %.1f, hand-back %.1f, head + stats %.1f, "
+                                 "cache tick %.1f, warm %.1f, drafter seed %.1f, snapshots %.1f ms\n",
+                         n, tl - trc_t0, trc_done - tl, trc_back - trc_done, trc_head - trc_back, trc_tick - trc_head,
+                         trc_warm - trc_tick, trc_seed - trc_warm, now_ms() - trc_seed);
         return true;
     }
     // the state before position `at` from the layers' snapshot set ix (the drafter's blocks: as they are - the next
