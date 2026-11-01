@@ -694,14 +694,18 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       target_link_libraries(ds4_cpu_flow_test PRIVATE strata_kernels_cpu)
     endif()
     # DS4_CPU_SPLIT_COLS: the CPU lane's EXL3 experts with a small call's pieces cut by columns against the uncut
-    # schedule, bit for bit - K 2 and 2.5, 1-6 entries, one and two parts, several thread counts, steps and flow
-    # (synthetic weights, no GPU, no model; the EXL3 CPU kernels are x86 only)
+    # schedule, bit for bit - K 2 and 2.5, 1-6 entries of 1-8 tokens, one and two parts, several thread counts, steps
+    # and flow (synthetic weights, no GPU, no model; the EXL3 CPU kernels are x86 only).  It tests the kernels' tier this
+    # CPU picks (printed); _avx2 holds an AVX-512 CPU on AVX2 (STRATA_FORCE_AVX2=1; without AVX-512 the same run twice).
+    # Tier 2 (AVX-512 without VNNI) cannot be forced on a VNNI CPU.
     if(STRATA_BUILD_TESTS AND STRATA_CPU_X86 AND NOT WIN32)
       add_executable(ds4_cpu_split_test tests/ds4_cpu_split_test.cpp)
       target_link_libraries(ds4_cpu_split_test PRIVATE strata_kernels_cpu)
       enable_testing()
       add_test(NAME ds4_cpu_split_test COMMAND ds4_cpu_split_test)
-      set_tests_properties(ds4_cpu_split_test PROPERTIES TIMEOUT 600)
+      add_test(NAME ds4_cpu_split_test_avx2 COMMAND ds4_cpu_split_test)
+      set_tests_properties(ds4_cpu_split_test_avx2 PROPERTIES ENVIRONMENT STRATA_FORCE_AVX2=1)
+      set_tests_properties(ds4_cpu_split_test ds4_cpu_split_test_avx2 PROPERTIES TIMEOUT 600)
     endif()
     # the CPU lane's MXFP4 rows: every tier this CPU runs (and ggml-cpu's dot) at the experts' real size (no GPU)
     add_executable(ds4_mx_bench tests/ds4_mx_bench.cpp src/ds4/ds4_gguf_cpu.cpp)
