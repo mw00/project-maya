@@ -32,6 +32,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -358,14 +359,16 @@ int main(int argc, char** argv) {
                     stop_ids.push_back((int32_t) i);
     } catch (const std::exception&) {}
     int32_t im_start = -1;   // the chat template's message header: prompts are checkpointed at its last occurrence
+    int32_t image_pad = -1;
     try {
         strata::GgufFile g(gguf);
         strata::MetaValue tv;   // (every token: metadata() keeps a sample of each array)
         if (const auto* toks = g.get_full("tokenizer.ggml.tokens", tv) ? &tv : nullptr)
             for (size_t i = 0; i < toks->items.size(); ++i)
                 if (toks->items[i].s == "<|im_start|>" || toks->items[i].s == "<|start|>" || toks->items[i].s == "<|turn>") {
-                    im_start = (int32_t) i;   // (Qwen's, Muse Glimmer's, Gemma 4's message header)
-                    break;
+                    if (im_start < 0) im_start = (int32_t) i;   // (Qwen's, Muse Glimmer's, Gemma 4's message header)
+                } else if (toks->items[i].s == "<|image_pad|>") {
+                    image_pad = (int32_t) i;   // (GENI: an image's tokens)
                 }
     } catch (const std::exception&) {}
     if (std::filesystem::is_directory(gguf)) {   // (a checkpoint directory: its tokenizer_config.json's added tokens)
@@ -502,10 +505,12 @@ int main(int argc, char** argv) {
     while (in.pop(line)) {
         if (line == "QUIT") break;
         in.stop.store(false);                       // a STOP between requests is stale
-        if (line.rfind("GEN ", 0) != 0) { std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n"); std::fflush(stdout); continue; }
+        // GENI <max_new> [key=value ...] <embeddings file> <ids>: a prompt with images (maya-vision records)
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) { std::printf("ERR expected: GEN <max_new> [key=value ...] <id,id,...>\n"); std::fflush(stdout); continue; }
 
         char* endp = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &endp, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
         strata::kernels::SamplerParams sp;
         sp.top_k = 20; sp.top_p = 1.0f; sp.temperature = 0.0f; sp.greedy = true;
         unsigned long long seed = 0;
@@ -537,12 +542,67 @@ int main(int argc, char** argv) {
             else if (key == "think_end") think_end = (int32_t) std::atol(tok.c_str() + eq + 1);
             else if (key == "draft") req_draft = std::max(0, std::min(draft, std::atoi(tok.c_str() + eq + 1)));
         }
+        std::string emb_path;
+        if (geni) {   // the embeddings file: the token after the keys
+            while (*endp == ' ') ++endp;
+            const char* e = std::strchr(endp, ' ');
+            if (!e) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
+            emb_path.assign(endp, (size_t) (e - endp));
+            endp = const_cast<char*>(e);
+        }
         std::vector<int32_t> ids;
         if (max_new < 1 || !parse_ids(endp, ids)) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
         if ((long long) ids.size() + 1 > model.max_context()) {
             std::printf("ERR the prompt (%zu tokens) does not fit the context (%lld)\n", ids.size(), (long long) model.max_context());
             std::fflush(stdout);
             continue;
+        }
+        // images: each run of <|image_pad|> is one maya-vision record (int32 'SVE1', n, nx, ny, n_embd, n x n_embd
+        // floats), in order.  idk: the prompt as the state's history compares it - an image's tokens carry its rows'
+        // hash (negative ids), so a cached prefix or checkpoint is reused only with the same pictures
+        std::vector<int32_t> idk = ids;
+        {
+            std::vector<strata::core::DenseModel::ImagePlace> places;
+            std::vector<float> rows;
+            std::string ge;
+            if (geni) {
+                const int64_t E = cfg.n_embd;
+                std::FILE* f = std::fopen(emb_path.c_str(), "rb");
+                if (!f) ge = "cannot open " + emb_path;
+                std::vector<std::array<int32_t, 3>> recs;   // (n, nx, ny)
+                while (f && ge.empty()) {
+                    int32_t hdr[5];
+                    const size_t got = std::fread(hdr, 1, sizeof hdr, f);
+                    if (got == 0 && std::feof(f)) break;
+                    if (got != sizeof hdr || hdr[0] != 0x31455653 || hdr[1] <= 0 || hdr[4] != E ||
+                        (int64_t) hdr[2] * hdr[3] != hdr[1] || (size_t) hdr[1] > ids.size()) { ge = "not a maya-vision record for this model"; break; }
+                    const size_t at = rows.size();
+                    rows.resize(at + (size_t) hdr[1] * (size_t) E);
+                    if (std::fread(rows.data() + at, sizeof(float) * (size_t) E, (size_t) hdr[1], f) != (size_t) hdr[1]) ge = "short embeddings file";
+                    recs.push_back({hdr[1], hdr[2], hdr[3]});
+                }
+                if (f) std::fclose(f);
+                size_t k = 0, r0 = 0;
+                for (size_t i = 0; ge.empty() && i < ids.size();) {
+                    if (ids[i] != image_pad) { ++i; continue; }
+                    size_t j = i;
+                    while (j < ids.size() && ids[j] == image_pad) ++j;
+                    if (k >= recs.size() || (size_t) recs[k][0] != j - i) { ge = "the prompt's image tokens do not match the embeddings"; break; }
+                    places.push_back({(int64_t) i, recs[k][1], recs[k][2]});
+                    uint64_t h = 1469598103934665603ull;   // the image's rows (and grid) as a key
+                    const uint32_t* w = (const uint32_t*) (rows.data() + r0 * E);
+                    for (size_t q = 0; q < (j - i) * (size_t) E; ++q) { h ^= w[q]; h *= 1099511628211ull; }
+                    h ^= (uint64_t) recs[k][1] << 32 | (uint32_t) recs[k][2];
+                    for (size_t q = i; q < j; ++q) idk[q] = -(int32_t) (1 + ((h + (q - i)) & 0x3fffffff));
+                    r0 += j - i;
+                    ++k;
+                    i = j;
+                }
+                if (ge.empty() && k != recs.size()) ge = "the prompt's image tokens do not match the embeddings";
+                if (ge.empty() && !model.vision_enabled()) ge = "this engine was started without images (STRATA_DENSE_VISION=1)";
+            }
+            if (ge.empty() && model.vision_enabled() && !model.set_images(places, std::move(rows), ge)) {}
+            if (!ge.empty()) { std::printf("ERR %s\n", ge.c_str()); std::fflush(stdout); continue; }
         }
         sp.seed = seed;
         auto is_stop = [&](int32_t t) { return !ignore_eos && std::binary_search(stop_ids.begin(), stop_ids.end(), t); };
@@ -553,17 +613,17 @@ int main(int argc, char** argv) {
 
         // ---- what of the state can be kept (the MTP cache follows the trunk: the same positions are valid)
         size_t resume = 0;
-        if (!fed.empty() && fed.size() < ids.size() && std::equal(fed.begin(), fed.end(), ids.begin())) resume = fed.size();
+        if (!fed.empty() && fed.size() < idk.size() && std::equal(fed.begin(), fed.end(), idk.begin())) resume = fed.size();
         bool restored = false;
         if (resume == 0 && !fed.empty() && n_ckpt > 0) {
             // the K/V cache holds fed's tokens: a checkpoint inside the common prefix of fed and the prompt is valid
             size_t cp = 0;
-            while (cp < fed.size() && cp + 1 < ids.size() && fed[cp] == ids[cp]) ++cp;
+            while (cp < fed.size() && cp + 1 < idk.size() && fed[cp] == idk[cp]) ++cp;
             int best = -1;
             for (int c = 0; c < n_ckpt; ++c)
                 if (ckpts[(size_t) c].len > 0 && (size_t) ckpts[(size_t) c].len <= cp &&
                     (best < 0 || ckpts[(size_t) c].len > ckpts[(size_t) best].len) &&
-                    ckpts[(size_t) c].hash == prefix_hash(ids, ckpts[(size_t) c].len))
+                    ckpts[(size_t) c].hash == prefix_hash(idk, ckpts[(size_t) c].len))
                     best = c;
             std::fprintf(stderr, "strata-dense: history diverges at %zu of %zu; checkpoint %d\n", cp, fed.size(), best);
             if (best >= 0 && model.ckpt_restore(best, ckpts[(size_t) best].len, err)) {
@@ -615,10 +675,10 @@ int main(int argc, char** argv) {
                     cudaMemcpyAsync(d_hrows, model.hidden_norm() + (size_t) (T - 1) * cfg.n_embd, cfg.n_embd * 4,
                                     cudaMemcpyDeviceToDevice, cs);
             }
-            fed.insert(fed.end(), ids.begin() + i, ids.begin() + i + T);
+            fed.insert(fed.end(), idk.begin() + i, idk.begin() + i + T);
             i += T;
             if (i == anchor_at) {
-                const uint64_t h = prefix_hash(ids, i);
+                const uint64_t h = prefix_hash(idk, i);
                 int slot = -1;
                 for (int c = 0; c < n_ckpt && slot < 0; ++c)
                     if (ckpts[(size_t) c].len == i && ckpts[(size_t) c].hash == h) slot = -2;   // (already there)
@@ -652,6 +712,7 @@ int main(int argc, char** argv) {
         if (sp.penalty_last_n > 0) {
             const size_t take = std::min<size_t>((size_t) sp.penalty_last_n, fed.size());
             hist.assign(fed.end() - (std::ptrdiff_t) take, fed.end());
+            hist.erase(std::remove_if(hist.begin(), hist.end(), [](int32_t t) { return t < 0; }), hist.end());   // (images)
         }
         // the reasoning budget: past it, the next token not yet fed (a round's last pick, the next anchor) becomes the
         // end of the reasoning - as the GLM engine forces it

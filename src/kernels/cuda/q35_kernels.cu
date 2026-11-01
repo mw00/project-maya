@@ -626,7 +626,8 @@ __device__ __forceinline__ float warp_max(float v) {
 __global__ void attn_prep_kernel(const float* __restrict__ q_full, int ldq, const float* __restrict__ k,
                                  const float* __restrict__ v, int ldk, const float* __restrict__ q_norm,
                                  const float* __restrict__ k_norm, float eps, float theta_scale, int n_rot, int p0,
-                                 int n_head, int D, float* __restrict__ q_out, Q35Kv kv) {
+                                 int n_head, int D, float* __restrict__ q_out, Q35Kv kv,
+                                 const int32_t* __restrict__ mtab) {
     __shared__ float sh[32];
     __shared__ float row[256];
     const int t = blockIdx.x, hh = blockIdx.y + (q_full ? 0 : n_head), d = threadIdx.x, pos = p0 + t;
@@ -640,7 +641,9 @@ __global__ void attn_prep_kernel(const float* __restrict__ q_full, int ldq, cons
     const int half_rot = n_rot / 2;
     if (d < n_rot) {
         const int pair = d < half_rot ? d : d - half_rot;
-        const float theta = (float) pos * powf(theta_scale, (float) pair);
+        // (images: interleaved M-RoPE - pair i rotates by the cell's (t, h, w)[i % 3]; text has t = h = w)
+        const int rp = mtab ? __ldg(mtab + (size_t) pos * 3 + pair % 3) : pos;
+        const float theta = (float) rp * powf(theta_scale, (float) pair);
         const float c = cosf(theta), s = sinf(theta);
         const float a = row[pair], bb = row[pair + half_rot];
         r = d < half_rot ? a * c - bb * s : a * s + bb * c;
@@ -1976,13 +1979,16 @@ uint64_t q35_kv_bytes(int mode, int n_kv, int D, int max_ctx) {
     return mode == 0 ? cells * D * 2 * 2 : mode == 2 ? cells * (D + D / 32 * 2) * 2 : cells * (D + D / 32 * 2 + D / 2 + D / 32 * 2);
 }
 
+static const int32_t* g_mrope = nullptr;
+void q35_set_mrope_table(const int32_t* device_table) { g_mrope = device_table; }
+
 void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v, int ldk, const float* q_norm,
                    const float* k_norm, float eps, float rope_base, int n_rot, int p0, int T, int n_head, int n_kv,
                    int D, float* q_out, const Q35Kv& kv, void* stream) {
     if (D != 256 || n_rot > D) throw std::invalid_argument("q35_attn_prep: head size 256");
     const float theta_scale = powf(rope_base, -2.0f / n_rot);
     attn_prep_kernel<<<dim3(T, (q_full ? n_head : 0) + n_kv), D, 0, (cudaStream_t) stream>>>(
-        q_full, ldq, k, v, ldk, q_norm, k_norm, eps, theta_scale, n_rot, p0, n_head, D, q_out, kv);
+        q_full, ldq, k, v, ldk, q_norm, k_norm, eps, theta_scale, n_rot, p0, n_head, D, q_out, kv, g_mrope);
     check("q35_attn_prep");
 }
 

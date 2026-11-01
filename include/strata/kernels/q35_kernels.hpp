@@ -106,6 +106,10 @@ uint64_t q35_kv_bytes(int mode, int n_kv, int D, int max_ctx);
 /// A K8V8 cache's keys [0, n_keys) unpacked to FP16 at the same cells of k16 / v16 (an FP16 cache's layout, n_kv x
 /// max_ctx rows of D) - the same values the attention kernels unpack (the prompt path then reads them as FP16).
 void q35_kv_expand_f16(const Q35Kv& kv, int n_keys, int n_kv, int D, uint16_t* k16, uint16_t* v16, void* stream);
+/// images: a device int32 [cells][3] table of (t, h, w) rotary positions read by q35_attn_prep (interleaved M-RoPE,
+/// pair i of the rotated dims takes component i % 3); nullptr (the default) rotates by the cell index.  Set it before
+/// any graph is captured; its contents may change between requests
+void q35_set_mrope_table(const int32_t* device_table);
 void q35_attn_prep(const float* q_full, int ldq, const float* k, const float* v, int ldk, const float* q_norm,
                    const float* k_norm, float eps, float rope_base, int n_rot, int p0, int T, int n_head, int n_kv,
                    int D, float* q_out, const Q35Kv& kv, void* stream);

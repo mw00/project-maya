@@ -731,6 +731,12 @@ struct DenseModel::Impl {
     bool fuse = true;
     // commit from the verify pass's recorded recurrence updates (STRATA_DENSE_COMMIT_REC=0: recomputed)
     bool commit_rec = true;
+    // images (STRATA_DENSE_VISION=1): the (t, h, w) rotary position of every cell, on the device for q35_attn_prep and
+    // on the host (what was uploaded), and this request's image cells (ascending) with their embedding rows
+    int32_t* mrope_dev = nullptr;
+    std::vector<int32_t> mrope_host;
+    std::vector<int64_t> img_cells;
+    std::vector<float> img_rows;
     uint16_t* h8_out(int T) const { return fuse && T <= kMaxCols ? xh8 : nullptr; }
     void prep_h8(const float* x, int n_in, int T) {
         prep(x, n_in, T);
@@ -1357,6 +1363,16 @@ bool DenseModel::load(const std::string& path, int64_t max_context, std::string&
         }
         if (!I.gemm.init(I.stream, (int64_t) cfg_.n_ff * E, err)) return false;
         q35_set_gdn_scratch((float*) I.gemm.scratch(), I.gemm.scratch_elems() / 2);   // (the chunked GDN prompt form)
+        if (std::getenv("STRATA_DENSE_VISION") && std::atoi(std::getenv("STRATA_DENSE_VISION")) != 0) {
+            // the identity until a request has images; set before any decode graph is captured
+            I.mrope_host.resize((size_t) max_context_ * 3);
+            for (int64_t c = 0; c < max_context_; ++c)
+                I.mrope_host[(size_t) c * 3] = I.mrope_host[(size_t) c * 3 + 1] = I.mrope_host[(size_t) c * 3 + 2] = (int32_t) c;
+            if (!I.alloc(&I.mrope_dev, I.mrope_host.size() * 4, err, "image positions") ||
+                cudaMemcpy(I.mrope_dev, I.mrope_host.data(), I.mrope_host.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess)
+                return false;
+            q35_set_mrope_table(I.mrope_dev);
+        }
         if (const char* e = std::getenv("STRATA_DENSE_MULTI_EXACT")) native_mmvq_set_multi_exact(std::atoi(e) != 0);
         if (const char* e = std::getenv("STRATA_DENSE_MMT")) I.mmt_on = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_DENSE_MMT1")) I.mmt1 = std::atoi(e) != 0;
@@ -1598,6 +1614,17 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
             for (int t = 0; t < T; ++t)
                 dequant_f32(I.embd.type, I.embd.dev, tokens[t], 1, E, I.x + (size_t) t * E, s);
         }
+        if (!I.img_cells.empty()) {   // the images' rows over their tokens' embeddings, a copy a run of cells
+            auto it = std::lower_bound(I.img_cells.begin(), I.img_cells.end(), p0);
+            while (it != I.img_cells.end() && *it < p0 + T) {
+                auto run = it;
+                while (run + 1 != I.img_cells.end() && *(run + 1) == *run + 1 && *(run + 1) < p0 + T) ++run;
+                const size_t r0 = (size_t) (it - I.img_cells.begin()), n = (size_t) (run - it) + 1;
+                cudaMemcpyAsync(I.x + (size_t) (*it - p0) * E, I.img_rows.data() + r0 * E, n * E * 4,
+                                cudaMemcpyHostToDevice, s);
+                it = run + 1;
+            }
+        }
         I.stage("embed", s);
 
         auto post = [&](int l) {   // the layer from the mixer's output: the residual add, the FFN, the drafter taps
@@ -1729,6 +1756,55 @@ bool DenseModel::forward(const int32_t* tokens, int T, bool verify, int want, st
         err = std::string("dense model: ") + e.what();
         return false;
     }
+}
+
+bool DenseModel::vision_enabled() const { return impl_->mrope_dev != nullptr; }
+
+bool DenseModel::set_images(const std::vector<ImagePlace>& places, std::vector<float> rows, std::string& err) {
+    Impl& I = *impl_;
+    const int64_t E = cfg_.n_embd;
+    if (!places.empty() && !I.mrope_dev) { err = "dense model: images need STRATA_DENSE_VISION=1 at load"; return false; }
+    if (!I.mrope_dev) return true;
+    int64_t n_img = 0;
+    for (const ImagePlace& p : places) n_img += (int64_t) p.nx * p.ny;
+    if ((int64_t) rows.size() != n_img * E) { err = "dense model: image rows do not match the image tokens"; return false; }
+    std::vector<int64_t> cells;
+    cells.reserve((size_t) n_img);
+    std::vector<int32_t> tab(I.mrope_host.size());
+    int64_t r = 0;   // the rotary position of the next text cell
+    size_t k = 0;
+    for (int64_t c = 0; c < max_context_;) {
+        if (k < places.size() && places[k].cell == c) {
+            const ImagePlace& p = places[k++];
+            const int64_t n = (int64_t) p.nx * p.ny;
+            if (c + n > max_context_) { err = "dense model: an image past the context"; return false; }
+            for (int64_t j = 0; j < n; ++j) {
+                tab[(size_t) (c + j) * 3] = (int32_t) r;
+                tab[(size_t) (c + j) * 3 + 1] = (int32_t) (r + j / p.nx);
+                tab[(size_t) (c + j) * 3 + 2] = (int32_t) (r + j % p.nx);
+                cells.push_back(c + j);
+            }
+            c += n;
+            r += std::max(p.nx, p.ny);
+        } else {
+            if (k < places.size() && places[k].cell < c) { err = "dense model: overlapping images"; return false; }
+            tab[(size_t) c * 3] = tab[(size_t) c * 3 + 1] = tab[(size_t) c * 3 + 2] = (int32_t) r++;
+            ++c;
+        }
+    }
+    // upload from the first cell that changed (text only after images: back to the identity)
+    size_t first = 0;
+    while (first < tab.size() && tab[first] == I.mrope_host[first]) ++first;
+    if (first < tab.size()) {
+        first -= first % 3;
+        if (cudaMemcpyAsync(I.mrope_dev + first, tab.data() + first, (tab.size() - first) * 4, cudaMemcpyHostToDevice,
+                            I.stream) != cudaSuccess) { err = "dense model: image positions upload"; return false; }
+        cudaStreamSynchronize(I.stream);
+        I.mrope_host.swap(tab);
+    }
+    I.img_cells.swap(cells);
+    I.img_rows.swap(rows);
+    return true;
 }
 
 bool DenseModel::commit(int n, std::string& err) {

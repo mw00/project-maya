@@ -103,6 +103,15 @@ public:
     bool ckpt_save(int slot, std::string& err);
     bool ckpt_restore(int slot, int64_t pos, std::string& err);
     uint64_t ckpt_bytes() const;
+
+    /// Images (GENI, STRATA_DENSE_VISION=1 at load): an image's tokens sit at cells cell .. cell + nx * ny - 1 (row
+    /// i at grid x = i % nx, y = i / nx); their embedding rows (E floats each, the images' in order) replace the
+    /// token embeddings, and every attention layer rotates them by interleaved M-RoPE (t, h, w) = (p, p + y, p + x),
+    /// the text after an image going on at p + max(nx, ny).  An empty list: text only (the positions back to the
+    /// cell index).  Applies to the forward passes until the next call.
+    struct ImagePlace { int64_t cell; int nx, ny; };
+    bool vision_enabled() const;
+    bool set_images(const std::vector<ImagePlace>& places, std::vector<float> rows, std::string& err);
     /// Blocks until everything queued has run.
     bool sync(std::string& err);
 
