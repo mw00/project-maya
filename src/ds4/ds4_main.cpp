@@ -1764,6 +1764,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     while (!multi) {   // one conversation: a request at a time
         g_busy.store(false);   // (waiting for a request: no watchdog)
         if (!in.next(line) || line == "QUIT") break;
+        static const bool turn_trace = std::getenv("DS4_TURN_TRACE") != nullptr;   // (one line a request: this clock's times)
+        const double tr_got = now_ms();
+        double tr_first = 0;
         beat();
         g_busy.store(true);
         const bool geni = line.rfind("GENI ", 0) == 0;
@@ -1779,6 +1782,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             continue;
         }
+        const double tr_parsed = now_ms();
         m.begin_request();   // (DISK_SKIP_AUTO: between requests only)
         if (round_log().f != nullptr) round_log().tag = "r" + std::to_string(++log_req);   // (DS4_ROUND_LOG)
         // a request's own seed: its draws from the start of its stream, so the same seed gives the same answer (the
@@ -1838,6 +1842,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 break;
             }
             std::printf("T %d\n", tok);
+            if (tr_first == 0) tr_first = now_ms();
             if (r.logprobs >= 0) lp_out(-1, tok, tok_lp);
             beat();
             ++produced;
@@ -1891,6 +1896,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
+        if (turn_trace)
+            std::fprintf(stderr, "maya ds4 serve: trace got=%.1f parsed=%.1f read_start=%.1f read_end=%.1f first_t=%.1f end=%.1f\n",
+                         tr_got, tr_parsed, t0, t1, tr_first, t2);
         const strata::ds4::Stats& se = m.stats();   // (hits / lookups: the decode's routed experts in VRAM / all)
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu %lld %lld\n", produced, r.ids.size(), t1 - t0, t2 - t1,
                     finish, d_acc, d_off, from, (long long) ((se.experts - sd.experts) - (se.cpu_experts - sd.cpu_experts)),

@@ -924,6 +924,8 @@ struct Layer {
     // a prompt read in parts that keeps its lend between them (lend_hold): expert -> 1 while its slot lies under the
     // buffers and its table entries are 0 - on the CPU lane between the parts, back in VRAM at the hand-back
     std::vector<uint8_t> lend_mark;
+    // (DS4_LENT_RAM_GB) expert -> its slot in the lent copies' arena (Impl::lc_arena), -1: none; empty: none yet
+    std::vector<int> lent_copy;
     std::vector<int> last_picks;                // the picks of a run's last rows through the layer, kPicks a row (warm_after)
     std::array<uint8_t*, 4> spare_host = {nullptr, nullptr, nullptr, nullptr};
     std::vector<float> heat;
@@ -2082,6 +2084,20 @@ struct Model::Impl {
     std::vector<uint8_t*> rf_stage, rf_half;   // (rf_half: DS4_TP_BORROW's member parts, one a thread)
     std::thread rf_pre;   // (borrow_begin: the lent experts' file ranges asked for while the prompt runs; borrow_end joins it)
     bool rf_pre_cached = false;   // (the lent experts' ranges were asked for: borrow_end reads them through the page cache)
+    // DS4_LENT_RAM_GB (off: 0): pinned RAM copies of the experts a prompt's buffers lie over.  Taken from their slots
+    // just before the buffers overwrite them (borrow_begin), once an expert; while lent they are DMA'd from the copy
+    // as a RAM expert is (flow_push), and the hand-back DMAs them back on the devices' streams (borrow_end): no disk on
+    // the prompt path and no read before the first token.  The bytes are those the slot held, so nothing else changes.
+    // An expert's bytes never change, so a copy stays good whatever slot it moves to; full: the oldest one not lent
+    // now gives its place up (lc_stamp: the borrow that last used a place)
+    uint8_t* lc_arena = nullptr;
+    size_t lc_stride = 0;
+    int lc_n = 0, lc_used = 0, lc_hand = 0;
+    uint64_t lc_gen = 0;
+    std::vector<std::pair<int, int>> lc_owner;
+    std::vector<uint64_t> lc_stamp;
+    int64_t lc_taken = 0, lc_taken_bytes = 0;
+    double lc_taken_ms = 0;
     size_t rf_bytes = 0;
     int64_t lent_experts = 0;
     double lent_ms = 0;
@@ -4634,6 +4650,7 @@ struct Model::Impl {
         if (!place_experts(err)) return false;
         if (helper_id >= 0 && !helper_select(err)) return false;
         if (!load_experts(err)) return false;
+        if (!lent_ram_init(err)) return false;
         if (copy_swap && copy_mode) {   // (DS4_COPY_SWAP: after the copies)
             if (const char* v = cs_env("COPY_SWAP_MARGIN")) cs_margin = (float) std::atof(v);
             if (const char* v = cs_env("COPY_SWAP_EVERY")) cs_every = std::max(1, std::atoi(v));
@@ -5991,6 +6008,13 @@ struct Model::Impl {
         if (in_ram && copy_mode && cp_dma && copy_dma && NH == 1) {
             const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
             for (int r = 0; r < 3; ++r) it.src[r] = p + cp_lay[(size_t) l.il][(size_t) r] + mx_read_off(l, mi, r);
+            ++c.it_ram;
+            return;
+        }
+        // (DS4_LENT_RAM_GB: a lent expert's own RAM copy - DMA'd from where it lies, no disk)
+        if (!in_ram && lc_arena != nullptr && l.nm == 1 && !l.lent_copy.empty() && l.lent_copy[(size_t) e] >= 0) {
+            const uint8_t* p = lc_arena + (size_t) l.lent_copy[(size_t) e] * lc_stride;
+            for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
             ++c.it_ram;
             return;
         }
@@ -18593,6 +18617,91 @@ struct Model::Impl {
         }
     }
 
+    // (DS4_LENT_RAM_GB) the copies' arena, at the load: pinning takes seconds, not for a request to wait on
+    bool lent_ram_init(std::string& err) {
+        const char* v = std::getenv("DS4_LENT_RAM_GB");
+        const double gb = v != nullptr ? std::atof(v) : 0.0;
+        if (!(gb > 0)) return true;
+        bool any = false;
+        for (const auto& cp : chunks) any = any || (cp != nullptr && cp->borrow && !cp->tp_lend && !cp->x3_lend);
+        if (!any) return true;
+        for (const Layer& l : L)
+            if (!l.mtp && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4) lc_stride = std::max(lc_stride, l.blob);
+        if (lc_stride == 0) return true;
+        lc_stride = (lc_stride + 4095) & ~(size_t) 4095;
+        lc_n = (int) ((size_t) (gb * 1073741824.0) / lc_stride);
+        if (lc_n <= 0) return true;
+        const double t0 = now_ms();
+        if (cudaHostAlloc((void**) &lc_arena, (size_t) lc_n * lc_stride, cudaHostAllocPortable) != cudaSuccess) {
+            lc_arena = nullptr;
+            lc_n = 0;
+            (void) err;
+            std::fprintf(stderr, "ds4: DS4_LENT_RAM_GB: the copies' %.1f GB could not be pinned - lent experts as before\n", gb);
+            return true;
+        }
+        host_allocs.push_back(lc_arena);
+        lc_owner.assign((size_t) lc_n, {-1, -1});
+        lc_stamp.assign((size_t) lc_n, 0);
+        std::fprintf(stderr, "ds4: lent experts' RAM copies: %d places of %.1f MB (%.1f GB pinned in %.0f ms)\n", lc_n,
+                     lc_stride / 1048576.0, (double) lc_n * lc_stride / 1e9, now_ms() - t0);
+        return true;
+    }
+    int lc_grab() {   // a free place, or the oldest one not lent in this borrow (-1: none)
+        if (lc_used < lc_n) return lc_used++;
+        for (int i = 0; i < lc_n; ++i) {
+            const int k = lc_hand;
+            lc_hand = (lc_hand + 1) % lc_n;
+            if (lc_stamp[(size_t) k] == lc_gen) continue;
+            const auto o = lc_owner[(size_t) k];
+            if (o.first >= 0) L[(size_t) o.first].lent_copy[(size_t) o.second] = -1;
+            return k;
+        }
+        return -1;
+    }
+    // before device di's buffers at tail offset b0 overwrite the slots under them: a RAM copy of each of their experts
+    // that has none (false: a copy failed - the caller's lend_broken: nothing was overwritten yet, but the stream's state is unknown)
+    bool lent_take(int di, size_t b0) {
+        Dev& d = devs[(size_t) di];
+        const double t0 = now_ms();
+        int64_t n = 0, bytes = 0;
+        for (Layer& l : L) {
+            if (l.dev != di || l.mtp || l.n_main >= l.n_slots || l.nm != 1 || l.lay.fmt != gg::kFmtMXFP4) continue;
+            const size_t off = (size_t) (l.xbase - d.tail), u = align256(unit(l));
+            int keep = 0;   // (as borrow_begin: the slots wholly before the buffers)
+            while (l.n_main + keep < l.n_slots && off + (size_t) keep * d.tail_step + u <= b0) ++keep;
+            const int pv = l.n_main + keep;
+            if (l.lent_copy.empty()) l.lent_copy.assign((size_t) l.n_exp, -1);
+            for (int e = 0; e < l.n_exp; ++e) {
+                const int sl = l.slot[(size_t) e];
+                if (sl < pv) continue;
+                int k = l.lent_copy[(size_t) e];
+                if (k < 0) {
+                    k = lc_grab();
+                    if (k < 0) continue;   // (the arena smaller than one lend: this one from the files, as before)
+                    if (cudaMemcpyAsync(lc_arena + (size_t) k * lc_stride, sat(l, l, sl, l.blob), l.blob,
+                                        cudaMemcpyDeviceToHost, d.st) != cudaSuccess) {
+                        std::fprintf(stderr, "ds4: DS4_LENT_RAM_GB: a copy out of its slot failed\n");
+                        return false;
+                    }
+                    lc_owner[(size_t) k] = {l.il, e};
+                    l.lent_copy[(size_t) e] = k;
+                    ++n;
+                    bytes += (int64_t) l.blob;
+                }
+                lc_stamp[(size_t) k] = lc_gen;
+            }
+        }
+        if (n > 0 && cudaStreamSynchronize(d.st) != cudaSuccess) return false;
+        if (n > 0) {
+            lc_taken += n;
+            lc_taken_bytes += bytes;
+            lc_taken_ms += now_ms() - t0;
+            if (o.verbose)
+                std::fprintf(stderr, "ds4: lent experts' RAM copies: CUDA%d took %lld (%.2f GB) in %.0f ms, %d of %d places used\n",
+                             d.id, (long long) n, bytes / 1e9, now_ms() - t0, lc_used, lc_n);
+        }
+        return true;
+    }
     // a run of chunks of C rows borrows each lending device's room (Chunk::borrow): its buffers laid out at the end of
     // the tail region (zeroed, as their own room was), and of every layer the slots under them out of the run's VRAM
     // set (pv_n: their experts stream in as the CPU lane's do)
@@ -18644,12 +18753,19 @@ struct Model::Impl {
             }
         if (tp)
             for (Layer& l : L) l.pv_n = l.n_slots;
+        ++lc_gen;
         for (size_t di = 0; di < chunks.size(); ++di) {
             if (chunks[di] == nullptr || !chunks[di]->borrow) continue;
             Dev& d = devs[di];
             Chunk& c = *chunks[di];
             const size_t need = lay_chunk(c, C, nullptr, 2);
             const size_t b0 = (d.tail_bytes - need) & ~(size_t) 255;
+            // (DS4_LENT_RAM_GB: the experts about to be overwritten, each once: into RAM before the clear below)
+            if (lc_arena != nullptr && !c.tp_lend && !c.x3_lend && (cudaSetDevice(d.id) != cudaSuccess || !lent_take((int) di, b0))) {
+                lend_broken = true;
+                err = std::string("the prompt path's room on CUDA") + std::to_string(d.id) + ": " + kLendBroken;
+                return false;
+            }
             lay_chunk(c, C, d.tail + b0, 2);
             c.C = C;
             // (the clear writes over slots still mapped: a failure leaves them unknown - sticky, no later request runs;
@@ -18911,6 +19027,80 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4 DS4_CHECK_LEND: %zu lent slot parts, %zu not as before\n", x3_check.size(), n_diff);
             x3_check.clear();
             return true;
+        }
+        // (DS4_LENT_RAM_GB) those with a RAM copy: DMA'd back on their devices' streams, nothing read; the rest as before
+        const double tc0 = now_ms();
+        size_t lc_back = 0, lc_bytes = 0;
+        if (lc_arena != nullptr) {
+            static const bool lc_check = std::getenv("DS4_CHECK_LEND") != nullptr;
+            std::vector<Job> rest;
+            std::vector<Job> done;
+            std::vector<char> used(devs.size(), 0);
+            for (const Job& j : jobs) {
+                Layer& l = L[(size_t) j.layer];
+                const int k = l.nm == 1 && !l.lent_copy.empty() ? l.lent_copy[(size_t) j.e] : -1;
+                if (k < 0) {
+                    rest.push_back(j);
+                    continue;
+                }
+                const Dev& dv = devs[(size_t) l.dev];
+                const uint8_t* src = lc_arena + (size_t) k * lc_stride;
+                if (lc_check) {   // (each copy against the file, before it goes back)
+                    std::vector<uint8_t> file(l.blob);
+                    if (!read_mx_file(l, j.e, file.data()) || std::memcmp(file.data(), src, l.blob) != 0)
+                        std::fprintf(stderr, "ds4 DS4_CHECK_LEND: MISMATCH: RAM copy of layer %d expert %d\n", l.il, j.e);
+                }
+                if (cudaSetDevice(dv.id) != cudaSuccess ||
+                    cudaMemcpyAsync(sat(l, l, l.slot[(size_t) j.e], l.blob), src, l.blob, cudaMemcpyHostToDevice,
+                                    dv.st) != cudaSuccess) {
+                    broken = true;
+                    break;
+                }
+                used[(size_t) l.dev] = 1;
+                done.push_back(j);
+                lc_bytes += l.blob;
+            }
+            for (size_t di = 0; di < devs.size(); ++di)
+                if (used[di] && (cudaSetDevice(devs[di].id) != cudaSuccess || cudaStreamSynchronize(devs[di].st) != cudaSuccess))
+                    broken = true;
+            if (broken) {
+                lend_broken = true;
+                std::fprintf(stderr, "ds4: the prompt path's room: a copy back into a slot failed - the device's state "
+                                     "unknown; no further request runs\n");
+                return false;
+            }
+            for (const Job& j : done) {   // (kept lent between a prompt's parts: its table entries were 0)
+                Layer& l = L[(size_t) j.layer];
+                if (!l.lend_mark.empty() && l.lend_mark[(size_t) j.e] != 0) {
+                    l.lend_mark[(size_t) j.e] = 0;
+                    if (!tab_entry(l, j.e)) broken = true;
+                }
+            }
+            lc_back = done.size();
+            lent_experts += (int64_t) lc_back;
+            lent_ms += now_ms() - tc0;
+            st.lent_back += (int64_t) lc_back;
+            st.lent_back_ms += now_ms() - tc0;
+            if (o.verbose && lc_back > 0)
+                std::fprintf(stderr, "ds4: the prompt path's room handed back: %zu experts (%.2f GB) from their RAM copies "
+                                     "in %.0f ms; %zu others from the files\n",
+                             lc_back, lc_bytes / 1e9, now_ms() - tc0, rest.size());
+            jobs.swap(rest);
+            if (jobs.empty()) {
+                for (Layer& l : L)   // (a mark whose expert was not among them - none expected)
+                    for (size_t e = 0; e < l.lend_mark.size(); ++e)
+                        if (l.lend_mark[e] != 0) {
+                            l.lend_mark[e] = 0;
+                            if (!tab_entry(l, (int) e)) broken = true;
+                        }
+                if (broken) {
+                    lend_broken = true;
+                    std::fprintf(stderr, "ds4: the prompt path's room: a table write failed - the device's state "
+                                         "unknown; no further request runs\n");
+                    return false;
+                }
+                return true;
+            }
         }
         std::sort(jobs.begin(), jobs.end(), [&](const Job& a, const Job& b) {
             const Layer &la = L[(size_t) a.layer], &lb = L[(size_t) b.layer];
