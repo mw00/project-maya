@@ -19144,8 +19144,11 @@ struct Model::Impl {
         if (yl <= 0 || !L[(size_t) yl].kv_src) return -1;
         const bool one = yoco_one_gpu(), suffix = !one && yoco_suffix_gpu(yl);
         const bool tp = !one && !suffix && yoco_tp_group();   // (DS4_YOCO_TP: the flow too)
+        // (DS4_YOCO_FLOW=1: a layer split whose groups are on the flow too - the cut at a chunk's start, the flow
+        // skipping the chunks before it from the source's layer on)
+        static const bool yflow = std::getenv("DS4_YOCO_FLOW") != nullptr && std::atoi(std::getenv("DS4_YOCO_FLOW")) != 0;
         for (const auto& c : chunks)
-            if (!one && !suffix && !tp && c != nullptr && c->flow) return -1;
+            if (!one && !suffix && !tp && c != nullptr && c->flow && !yflow) return -1;
         for (int il = 0; il < g.nl; ++il) {
             const Layer& l = L[(size_t) il];
             if (il > yl && (g.ratios[(size_t) il] != 1 || l.kv_src)) return -1;
