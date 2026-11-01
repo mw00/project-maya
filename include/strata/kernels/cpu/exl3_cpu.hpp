@@ -70,8 +70,9 @@ bool exl3_cpu_band_acc_on(int tier, const Exl3Part& m, const float* const* xh, i
 /// The AVX2 tier's codebook product and byte sum in 16-bit lanes, a tile row's two halves at once: two vpmullw, one
 /// vpmulhuw and two vpmaddubsw for 16 weights where the 32-bit path takes two vpmulld (two uops each), two vpmaddubsw
 /// and two vpmaddwd - fewer uops on port 0, which every vector integer multiply and shift shares on Haswell and
-/// Broadwell.  The same integer byte sums, so the same bits.  Off by default; process-wide, for the calls that start
-/// after it; the other tiers ignore it.
+/// Broadwell.  The same integer byte sums, so the same bits.  Calls of 1-3 activations and the band GEMM's decode; more
+/// activations keep the 32-bit path.  Off by default; process-wide, for the calls that start after it; the other tiers
+/// ignore it.
 void exl3_cpu_set_w16(bool on);
 /// Whether the kernels above take that path now: set, and this CPU's lane runs the AVX2 tier.
 bool exl3_cpu_w16();

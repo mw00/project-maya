@@ -687,28 +687,12 @@ EXL3_AVX2_INLINE void avx2_rows_n2(const Tile& T, const float* const (&xk)[N], _
         avx2_rows_n2<Tile, N, R + 1, W16>(T, xk, lo, hi, k);
     }
 }
-// W16 with more than 3 activations: half 0's pass (avx2_rows_n<.., 0, ..>'s FMAs) keeps the half 1 sums it made with
-// it (16 rows x 8, on the stack), half 1's pass takes them (avx2_rows_n<.., 1, ..>'s FMAs) - N accumulators, as there
-template <class Tile, int N, int R>
-EXL3_AVX2_INLINE void avx2_rows_n_w16(const Tile& T, const float* const (&xk)[N], __m256 (&a)[N], __m256 (&s1)[16],
-                                      const Avx2Consts& k) {
-    if constexpr (R < 16) {
-        __m256 f0;
-        T.template sums2<R>(k, f0, s1[R]);
-        avx2_fma_n<N>(f0, xk, R, a, std::make_integer_sequence<int, N>{});
-        avx2_rows_n_w16<Tile, N, R + 1>(T, xk, a, s1, k);
-    }
-}
-template <int N, int R>
-EXL3_AVX2_INLINE void avx2_rows_n_kept(const __m256 (&s1)[16], const float* const (&xk)[N], __m256 (&a)[N]) {
-    if constexpr (R < 16) {
-        avx2_fma_n<N>(s1[R], xk, R, a, std::make_integer_sequence<int, N>{});
-        avx2_rows_n_kept<N, R + 1>(s1, xk, a);
-    }
-}
+// W16 (exl3_cpu_set_w16) only with 1-3 activations: with more, the per-half passes below have no registers to keep a
+// tile row's second half, and holding it on the stack measured slower than the 32-bit path - so they keep that path
 template <int K2, int N, bool W16 = false>
 EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, int ks0, int ks1,
                            float* const* out /* N x 128 */) {
+    static_assert(!W16 || N <= 3, "W16 with 1-3 activations only");
     using Tile = Avx2Tile<K2>;
     constexpr int W = 4 * K2;
     const int ld = m.n / 16;
@@ -732,13 +716,6 @@ EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, i
                 for (int i = 0; i < N; ++i) lo[i] = acc[t][0][i], hi[i] = acc[t][1][i];
                 avx2_rows_n2<Tile, N, 0, W16>(T, xk, lo, hi, k);
                 for (int i = 0; i < N; ++i) acc[t][0][i] = lo[i], acc[t][1][i] = hi[i];
-            } else if constexpr (W16) {
-                __m256 a[N], s1[16];
-                for (int i = 0; i < N; ++i) a[i] = acc[t][0][i];
-                avx2_rows_n_w16<Tile, N, 0>(T, xk, a, s1, k);
-                for (int i = 0; i < N; ++i) acc[t][0][i] = a[i], a[i] = acc[t][1][i];
-                avx2_rows_n_kept<N, 0>(s1, xk, a);
-                for (int i = 0; i < N; ++i) acc[t][1][i] = a[i];
             } else {
                 __m256 a[N];
                 for (int i = 0; i < N; ++i) a[i] = acc[t][0][i];
@@ -762,6 +739,7 @@ EXL3_AVX2 void band_avx2_n(const Exl3Part& m, const float* const* xh, int tc0, i
 template <int K2, int N, bool W16 = false>
 EXL3_AVX2 void rows_avx2_n(const Exl3Part& m, const float* const* xh, int ks0, int ks1, int t0, int t1,
                            float* const* acc) {
+    static_assert(!W16 || N <= 3, "W16 with 1-3 activations only (band_avx2_n)");
     using Tile = Avx2Tile<K2>;
     constexpr int W = 4 * K2;
     const int ld = m.n / 16;
@@ -792,13 +770,6 @@ EXL3_AVX2 void rows_avx2_n(const Exl3Part& m, const float* const* xh, int ks0, i
                 avx2_rows_n2<Tile, N, 0, W16>(T, xk, lo, hi, k);
                 for (int i = 0; i < N; ++i)
                     _mm256_storeu_ps(acc[i] + t * 16, lo[i]), _mm256_storeu_ps(acc[i] + t * 16 + 8, hi[i]);
-            } else if constexpr (W16) {
-                __m256 a[N], s1[16];
-                for (int i = 0; i < N; ++i) a[i] = _mm256_loadu_ps(acc[i] + t * 16);
-                avx2_rows_n_w16<Tile, N, 0>(T, xk, a, s1, k);
-                for (int i = 0; i < N; ++i) _mm256_storeu_ps(acc[i] + t * 16, a[i]), a[i] = _mm256_loadu_ps(acc[i] + t * 16 + 8);
-                avx2_rows_n_kept<N, 0>(s1, xk, a);
-                for (int i = 0; i < N; ++i) _mm256_storeu_ps(acc[i] + t * 16 + 8, a[i]);
             } else {
                 __m256 a[N];
                 for (int i = 0; i < N; ++i) a[i] = _mm256_loadu_ps(acc[i] + t * 16);
@@ -1086,16 +1057,10 @@ void band_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int t
             default: avx512::band_avx512_n<K2, 8>(m, xh, tc0, ks0, ks1, acc); return;
         }
     }
-    if (tier == kTierW16 && n > 1) {
-        switch (n) {
-            case 2: band_avx2_n<K2, 2, true>(m, xh, tc0, ks0, ks1, acc); return;
-            case 3: band_avx2_n<K2, 3, true>(m, xh, tc0, ks0, ks1, acc); return;
-            case 4: band_avx2_n<K2, 4, true>(m, xh, tc0, ks0, ks1, acc); return;
-            case 5: band_avx2_n<K2, 5, true>(m, xh, tc0, ks0, ks1, acc); return;
-            case 6: band_avx2_n<K2, 6, true>(m, xh, tc0, ks0, ks1, acc); return;
-            case 7: band_avx2_n<K2, 7, true>(m, xh, tc0, ks0, ks1, acc); return;
-            default: band_avx2_n<K2, 8, true>(m, xh, tc0, ks0, ks1, acc); return;
-        }
+    if (tier == kTierW16 && (n == 2 || n == 3)) {   // (4 or more: the 32-bit kernels below, as band_avx2_n says)
+        if (n == 2) band_avx2_n<K2, 2, true>(m, xh, tc0, ks0, ks1, acc);
+        else band_avx2_n<K2, 3, true>(m, xh, tc0, ks0, ks1, acc);
+        return;
     }
     if (tier >= 1 && n > 1) {
         switch (n) {
@@ -1142,16 +1107,11 @@ void rows_on_n(int tier, const Exl3Part& m, const float* const* xh, int n, int k
             default: avx512::rows_avx512_n<K2, 8>(m, xh, ks0, ks1, t0, t1, acc); return;
         }
     }
-    if (tier == kTierW16) {
+    if (tier == kTierW16 && n <= 3) {   // (4 or more: the 32-bit kernels below, as band_avx2_n says)
         switch (n) {
             case 1: rows_avx2_n<K2, 1, true>(m, xh, ks0, ks1, t0, t1, acc); return;
             case 2: rows_avx2_n<K2, 2, true>(m, xh, ks0, ks1, t0, t1, acc); return;
-            case 3: rows_avx2_n<K2, 3, true>(m, xh, ks0, ks1, t0, t1, acc); return;
-            case 4: rows_avx2_n<K2, 4, true>(m, xh, ks0, ks1, t0, t1, acc); return;
-            case 5: rows_avx2_n<K2, 5, true>(m, xh, ks0, ks1, t0, t1, acc); return;
-            case 6: rows_avx2_n<K2, 6, true>(m, xh, ks0, ks1, t0, t1, acc); return;
-            case 7: rows_avx2_n<K2, 7, true>(m, xh, ks0, ks1, t0, t1, acc); return;
-            default: rows_avx2_n<K2, 8, true>(m, xh, ks0, ks1, t0, t1, acc); return;
+            default: rows_avx2_n<K2, 3, true>(m, xh, ks0, ks1, t0, t1, acc); return;
         }
     }
     if (tier >= 1) {
