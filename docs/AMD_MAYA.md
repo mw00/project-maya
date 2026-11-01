@@ -342,8 +342,7 @@ so Strata's model benchmarks do not establish Maya performance.
 
 ## Validation
 
-Test host: RX 7900 XT 20 GiB, Ryzen 7 9800X3D, 192 GB installed DDR5, native
-Ubuntu Linux, system ROCm 7.2.1 / Clang 22, plus AI PRO R9700 32 GiB. Maya base v1.0.10 (`e4bd57e`).
+Test host: RX 7900 XT 20 GiB, Ryzen 7 9800X3D, 192 GB installed DDR5, native Ubuntu Linux, system ROCm 7.2.1 / Clang 22, plus AI PRO R9700 32 GiB. Maya base v1.0.10 (`e4bd57e`).
 
 The HIP engine and selected test targets build. All 14 selected GPU checks
 pass: device allocation, expert upload staging, packed-byte/shuffle
@@ -391,3 +390,8 @@ seven smoke requests (arithmetic, code, a two-turn conversation, three
 prompts at 307-385 tok/s on 1.8-2.5K-token prompts and the hipBLASLt table
 loaded. The R9700 runs the full model with every expert in VRAM or a pinned
 RAM tier; the prompt speeds above were measured there.
+
+
+### Confirmed working 
+-  Test host: RX 7900 XT 20 GiB, Ryzen 9 7900X, 96 GB installed DDR5, decokerized Ubuntu Linux, system ROCm 7.2.4, Maya base v1.1.46 (`3589d6f`). 
+- Model : Maya-S24, 1M context
