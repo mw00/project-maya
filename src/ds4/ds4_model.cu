@@ -2456,7 +2456,17 @@ struct Model::Impl {
         if (cudaDeviceGetPCIBusId(bus, (int) sizeof(bus), id) != cudaSuccess) return 0;
         std::string b = bus;
         for (char& ch : b) ch = (char) std::tolower((unsigned char) ch);
-        std::error_code ec;
+        // BAR1 from line 2 of the "resource" table (start end flags, in hex - what lspci reports; #798): the size of the
+        // resource1 file is only an mmap handle's and read 256 MiB on a 32 GiB BAR
+        {
+            std::ifstream rt("/sys/bus/pci/devices/" + b + "/resource");
+            std::string line;
+            unsigned long long lo = 0, hi = 0, fl = 0;
+            if (std::getline(rt, line) && std::getline(rt, line) &&
+                std::sscanf(line.c_str(), "%llx %llx %llx", &lo, &hi, &fl) == 3 && lo != 0 && hi != 0 && hi > lo)
+                return (size_t) (hi - lo + 1);
+        }
+        std::error_code ec;   // (no table, or it does not parse: the file size, as before)
         const auto sz = std::filesystem::file_size("/sys/bus/pci/devices/" + b + "/resource1", ec);
         return ec ? 0 : (size_t) sz;   // (unknown, or not Linux: 0 - the host-mapped rows)
     }
