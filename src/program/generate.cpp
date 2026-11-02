@@ -1257,7 +1257,6 @@ static int glm_pack_generate(const Options& o) {
                     }
                     if (rid == admitting_rid.load()) {
                         admit_stop.store(true);
-                        if (interleave.tokens == 0 && read_gaps.percent == 0) stop_req.store(true);
                     }
                     continue;
                 }
@@ -2656,7 +2655,7 @@ static int glm_pack_generate(const Options& o) {
                 return false;
             }
         }
-        if (stop_req.load()) {
+        if (quit_req.load() || (stop_req.load() && gens.size() <= 1)) {
             g.finish = "cancel";
             return false;
         }
@@ -2994,6 +2993,10 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (gens.empty()) stop_req.store(false);
+        {
+            std::lock_guard<std::mutex> lk(ctl_mu);
+            ctl.erase(rid);
+        }
         gap_failed = false;
         bind_ctx(best);
         model.set_image_rows(cur_img_pos, cur_img_rows);
