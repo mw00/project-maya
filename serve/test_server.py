@@ -35,6 +35,28 @@ class RecordingEngine(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class StampedLog(unittest.TestCase):
+    """#783: a time before each of the server's own `[maya]` lines; the engine's lines and other text are untouched."""
+
+    def test_only_maya_lines_get_a_time(self):
+        import io
+        import re
+        from serve.server import StampedStdout
+        buf = io.StringIO()
+        out = StampedStdout(buf)
+        print("[maya] request 1 done", file=out)
+        print("[maya] in", "pieces", end="", file=out)
+        print(" - one line", file=out)
+        print("maya ds4 serve: request 926: prompt 100 tokens", file=out)
+        print("  [maya] indented is not stamped", file=out)
+        lines = buf.getvalue().splitlines()
+        stamp = r"\d\d:\d\d:\d\d "
+        self.assertRegex(lines[0], "^" + stamp + r"\[maya\] request 1 done$")
+        self.assertRegex(lines[1], "^" + stamp + r"\[maya\] in pieces - one line$")
+        self.assertEqual(lines[2:], ["maya ds4 serve: request 926: prompt 100 tokens", "  [maya] indented is not stamped"])
+        self.assertEqual(len(re.findall(stamp, buf.getvalue())), 2)
+
+
 class ThinkingBudget(unittest.TestCase):
     """Real HTTP adapters must leave room for reasoning and a final answer at small output limits."""
 
@@ -765,6 +787,31 @@ class RequestChecks(unittest.TestCase):
         with self.assertRaises(ValueError):
             svc.check_request({"logit_bias": {"65": 1}})
         svc.check_request({"logit_bias": {}})      # none asked for: fine anywhere
+
+    def test_ignore_eos(self):
+        """ignore_eos bans every token that ends an answer through the logit bias (a client's other biases kept), needs
+        max_tokens and an engine that applies biases, and takes only true or false."""
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        ends = sorted(svc.stop_ids | svc.eos_ids)
+        self.assertTrue(ends)
+        req = {"ignore_eos": True, "max_tokens": 64, "logit_bias": {"65": 2, str(ends[0]): 5}}
+        svc.check_request(req)
+        self.assertEqual(req["logit_bias"], {65: 2.0, **{t: -100.0 for t in ends}})
+        req = {"ignore_eos": True, "max_completion_tokens": "32"}
+        svc.check_request(req)
+        self.assertEqual(req["logit_bias"], {t: -100.0 for t in ends})
+        self.assertIn("logit_bias=" + ",".join(f"{t}:-100" for t in ends), StrataEngine.sampling_keys(req))
+        req = {"ignore_eos": False, "max_tokens": 8}
+        svc.check_request(req)
+        self.assertNotIn("logit_bias", req)
+        for bad in ({"ignore_eos": True}, {"ignore_eos": True, "max_tokens": 0}, {"ignore_eos": "yes", "max_tokens": 8}):
+            with self.assertRaises(ValueError) as cm:
+                svc.check_request(dict(bad))
+            self.assertTrue(str(cm.exception).startswith("ignore_eos:"), cm.exception)
+        svc.engine.info = {}                       # an engine that applies no biases: refused, not ignored
+        with self.assertRaises(ValueError):
+            svc.check_request({"ignore_eos": True, "max_tokens": 8})
 
 
 class PrometheusMetrics(unittest.TestCase):
