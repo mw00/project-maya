@@ -1,0 +1,943 @@
+{
+  "date": "2026-11-02 Asia/Shanghai",
+  "upstream_commit": "3589d6f12a3f77e813b184b51a586f8fc3de2185",
+  "build": "v1.1.46 plus two local CPU startup patches; not stock",
+  "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+  "selected_arm": "B",
+  "selection_reason": "B is a prefill-oriented choice: 8K/32K prefill +40.82%/+17.33%, with 128K prefill +3.22% but decode -6.92% in one 256-token answer. The advisory all-cells 5% non-regression rule suggests A and was NOT passed; B is retained as an explicit latency trade-off, not a universal winner. D showed no useful gain and was rejected; INDEX_TC stays off. No repeated screening.",
+  "baseline_profile_sha256": "c7bded41c7c76f099e8f1633446682fa91b4624b3e9b7cdbda63ff2a4cd40493",
+  "official_seed_sha256": "c7bded41c7c76f099e8f1633446682fa91b4624b3e9b7cdbda63ff2a4cd40493",
+  "official": {
+    "GEN_count": 7,
+    "decode_mean_tps": 85.3,
+    "prefill_tps": {
+      "2048": 642.0,
+      "8192": 1585.0
+    },
+    "native_results": [
+      {
+        "at": 1793552103.0446575,
+        "kind": "result",
+        "native_T_count": 56,
+        "native_reply": [
+          "DONE",
+          "56",
+          "10",
+          "192.9",
+          "568.1",
+          "stop",
+          "41",
+          "44",
+          "0",
+          "10808",
+          "14835"
+        ],
+        "native_token_ids_sha256": "a09431188730db359103ffda659f77f7f2987063129255878f1bde237257819a",
+        "suite": "official",
+        "token_hash_encoding": "concatenated little-endian signed32 T IDs",
+        "uid": "official-1"
+      },
+      {
+        "at": 1793552106.3395548,
+        "kind": "result",
+        "native_T_count": 256,
+        "native_reply": [
+          "DONE",
+          "256",
+          "28",
+          "579.7",
+          "2712.4",
+          "length",
+          "190",
+          "206",
+          "0",
+          "47119",
+          "67875"
+        ],
+        "native_token_ids_sha256": "48e1a3d328bbc6c10af220e7e5493628304cfc5b774acf4ece66dc496a06f0be",
+        "suite": "official",
+        "token_hash_encoding": "concatenated little-endian signed32 T IDs",
+        "uid": "official-2"
+      },
+      {
+        "at": 1793552110.2450728,
+        "kind": "result",
+        "native_T_count": 256,
+        "native_reply": [
+          "DONE",
+          "256",
+          "19",
+          "174.8",
+          "3727.9",
+          "length",
+          "133",
+          "167",
+          "0",
+          "54535",
+          "74040"
+        ],
+        "native_token_ids_sha256": "5e93eb42d652c710c15eef7af2cf06399474cabfc3e2c34b78416d876292affe",
+        "suite": "official",
+        "token_hash_encoding": "concatenated little-endian signed32 T IDs",
+        "uid": "official-3"
+      },
+      {
+        "at": 1793552113.174485,
+        "kind": "result",
+        "native_T_count": 256,
+        "native_reply": [
+          "DONE",
+          "256",
+          "21",
+          "167.5",
+          "2759.1",
+          "length",
+          "205",
+          "217",
+          "0",
+          "40122",
+          "66330"
+        ],
+        "native_token_ids_sha256": "d1066b69c1cd9bc309cf55fc5eb241fb889e9046ac5364d38c3593472d796583",
+        "suite": "official",
+        "token_hash_encoding": "concatenated little-endian signed32 T IDs",
+        "uid": "official-4"
+      },
+      {
+        "at": 1793552116.11447,
+        "kind": "result",
+        "native_T_count": 1,
+        "native_reply": [
+          "DONE",
+          "1",
+          "2048",
+          "2936.6",
+          "0.1",
+          "length",
+          "0",
+          "0",
+          "0",
+          "0",
+          "0"
+        ],
+        "native_token_ids_sha256": "972b8373b897c65c4f631c6bdf2443d0d817a88f224b54d8e593fdcf32488d60",
+        "suite": "official",
+        "token_hash_encoding": "concatenated little-endian signed32 T IDs",
+        "uid": "official-5"
+      },
+      {
+        "at": 1793552119.3095298,
+        "kind": "result",
+        "native_T_count": 1,
+        "native_reply": [
+          "DONE",
+          "1",
+          "2048",
+          "3191.9",
+          "0.1",
+          "length",
+          "0",
+          "0",
+          "0",
+          "0",
+          "0"
+        ],
+        "native_token_ids_sha256": "c28025e818c14c3b4f2f256716a4ff0c392bf7aa495ee53c54c59569c907e217",
+        "suite": "official",
+        "token_hash_encoding": "concatenated little-endian signed32 T IDs",
+        "uid": "official-6"
+      },
+      {
+        "at": 1793552124.4862218,
+        "kind": "result",
+        "native_T_count": 1,
+        "native_reply": [
+          "DONE",
+          "1",
+          "8192",
+          "5168.0",
+          "0.1",
+          "length",
+          "0",
+          "0",
+          "0",
+          "0",
+          "0"
+        ],
+        "native_token_ids_sha256": "321a9c66c48eeaa12bc993c785210d518f2d92f019bad543b0c43e943ece1bee",
+        "suite": "official",
+        "token_hash_encoding": "concatenated little-endian signed32 T IDs",
+        "uid": "official-7"
+      }
+    ]
+  },
+  "screening": [
+    {
+      "arm": "A",
+      "case": "128k_r1",
+      "input_tokens": 131072,
+      "payload_sha256": "db4067a5df2873e454aa0f32003966734dc9d64f928e61b733f39a68649320b5",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "354368f4436013f67aabfdbece8b77829a730df7eca7891c9ce9e6ea2ecdb621",
+        "finish_reason": "length",
+        "first_content_s": 27.30912166298367,
+        "first_effective_s": 27.30912166298367,
+        "first_event_s": 0.3040448669344187,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 107,
+          "draft_n_accepted": 94,
+          "predicted_ms": 3472.2,
+          "predicted_n": 256,
+          "predicted_per_second": 73.7,
+          "predicted_per_token_ms": 13.563,
+          "prompt_ms": 26953.2,
+          "prompt_n": 131072,
+          "prompt_per_second": 4862.9,
+          "prompt_per_token_ms": 0.206
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 131072,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 131328
+        },
+        "wall_s": 30.782031
+      },
+      "expert_slots": 7338,
+      "cpu_experts": 8022,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "A",
+      "case": "32k_r1",
+      "input_tokens": 32768,
+      "payload_sha256": "f7ab778f11650c40cc61d3100be3d9472c3eae3af0eb7192613091398f4082fe",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "188bdd7963b81d91835c9d5f173d7713108871230a7b8efdaafcbc784688808c",
+        "finish_reason": "length",
+        "first_content_s": 9.009371841792017,
+        "first_effective_s": 9.009371841792017,
+        "first_event_s": 0.08848749496974051,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 107,
+          "draft_n_accepted": 88,
+          "predicted_ms": 3866.2,
+          "predicted_n": 256,
+          "predicted_per_second": 66.2,
+          "predicted_per_token_ms": 15.102,
+          "prompt_ms": 8911.6,
+          "prompt_n": 32768,
+          "prompt_per_second": 3677.0,
+          "prompt_per_token_ms": 0.272
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 32768,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 33024
+        },
+        "wall_s": 12.876289
+      },
+      "expert_slots": 7338,
+      "cpu_experts": 8022,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "A",
+      "case": "8k_r1",
+      "input_tokens": 8192,
+      "payload_sha256": "4331e6b456cd6eb84626bfc55e92577bf2b7074d48e744342017cde02a73928e",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "bfee8cccb67502320b39f914d90240a78220abb9e8ce56a7c90a079726878777",
+        "finish_reason": "length",
+        "first_content_s": 5.1637812200933695,
+        "first_effective_s": 5.1637812200933695,
+        "first_event_s": 0.051845510955899954,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 134,
+          "draft_n_accepted": 91,
+          "predicted_ms": 4458.5,
+          "predicted_n": 256,
+          "predicted_per_second": 57.4,
+          "predicted_per_token_ms": 17.416,
+          "prompt_ms": 5107.2,
+          "prompt_n": 8192,
+          "prompt_per_second": 1604.0,
+          "prompt_per_token_ms": 0.623
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 8192,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 8448
+        },
+        "wall_s": 9.622281
+      },
+      "expert_slots": 7338,
+      "cpu_experts": 8022,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "B",
+      "case": "128k_r1",
+      "input_tokens": 131072,
+      "payload_sha256": "db4067a5df2873e454aa0f32003966734dc9d64f928e61b733f39a68649320b5",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "771971324fb6f08a863e55da02f40a27188d211c0c213d0cb3f152ffc22d8127",
+        "finish_reason": "length",
+        "first_content_s": 26.42783613409847,
+        "first_effective_s": 26.42783613409847,
+        "first_event_s": 0.2823341509792954,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 108,
+          "draft_n_accepted": 85,
+          "predicted_ms": 3730.2,
+          "predicted_n": 256,
+          "predicted_per_second": 68.6,
+          "predicted_per_token_ms": 14.571,
+          "prompt_ms": 26112.5,
+          "prompt_n": 131072,
+          "prompt_per_second": 5019.5,
+          "prompt_per_token_ms": 0.199
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 131072,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 131328
+        },
+        "wall_s": 30.161233
+      },
+      "expert_slots": 7657,
+      "cpu_experts": 7703,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "B",
+      "case": "32k_r1",
+      "input_tokens": 32768,
+      "payload_sha256": "f7ab778f11650c40cc61d3100be3d9472c3eae3af0eb7192613091398f4082fe",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "8d480b4f63acd66a47efac14628e9b8d3e0a25cb951155fe02d66280147e3a25",
+        "finish_reason": "length",
+        "first_content_s": 7.69768842193298,
+        "first_effective_s": 7.69768842193298,
+        "first_event_s": 0.09330744901672006,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 117,
+          "draft_n_accepted": 96,
+          "predicted_ms": 3587.2,
+          "predicted_n": 256,
+          "predicted_per_second": 71.4,
+          "predicted_per_token_ms": 14.012,
+          "prompt_ms": 7595.1,
+          "prompt_n": 32768,
+          "prompt_per_second": 4314.4,
+          "prompt_per_token_ms": 0.232
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 32768,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 33024
+        },
+        "wall_s": 11.285488
+      },
+      "expert_slots": 7657,
+      "cpu_experts": 7703,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "B",
+      "case": "8k_r1",
+      "input_tokens": 8192,
+      "payload_sha256": "4331e6b456cd6eb84626bfc55e92577bf2b7074d48e744342017cde02a73928e",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "7724ff60f9f5b47e18b16c83c495b4b2a644ccc17ef1007515554b65ad384d0d",
+        "finish_reason": "length",
+        "first_content_s": 3.685998166911304,
+        "first_effective_s": 3.685998166911304,
+        "first_event_s": 0.05398258403874934,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 106,
+          "draft_n_accepted": 86,
+          "predicted_ms": 4388.2,
+          "predicted_n": 256,
+          "predicted_per_second": 58.3,
+          "predicted_per_token_ms": 17.141,
+          "prompt_ms": 3626.9,
+          "prompt_n": 8192,
+          "prompt_per_second": 2258.7,
+          "prompt_per_token_ms": 0.443
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 8192,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 8448
+        },
+        "wall_s": 8.074405
+      },
+      "expert_slots": 7657,
+      "cpu_experts": 7703,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "C",
+      "case": "128k_r1",
+      "input_tokens": 131072,
+      "payload_sha256": "db4067a5df2873e454aa0f32003966734dc9d64f928e61b733f39a68649320b5",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "b64f0b3a8334f890bad9fa266dfc0707747b67bf32434db75edaf1d25859833c",
+        "finish_reason": "length",
+        "first_content_s": 23.65552179282531,
+        "first_effective_s": 23.65552179282531,
+        "first_event_s": 0.29907607077620924,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 113,
+          "draft_n_accepted": 84,
+          "predicted_ms": 4438.9,
+          "predicted_n": 256,
+          "predicted_per_second": 57.7,
+          "predicted_per_token_ms": 17.339,
+          "prompt_ms": 23317.1,
+          "prompt_n": 131072,
+          "prompt_per_second": 5621.3,
+          "prompt_per_token_ms": 0.178
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 131072,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 131328
+        },
+        "wall_s": 28.094828
+      },
+      "expert_slots": 7657,
+      "cpu_experts": 7703,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "D",
+      "case": "32k_r1",
+      "input_tokens": 32768,
+      "payload_sha256": "f7ab778f11650c40cc61d3100be3d9472c3eae3af0eb7192613091398f4082fe",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "567caa3b2621954d22ee199270041ba039b7f67653f22c3200ac5ec137a21ec0",
+        "finish_reason": "length",
+        "first_content_s": 7.919783945893869,
+        "first_effective_s": 7.919783945893869,
+        "first_event_s": 0.08856659685261548,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 115,
+          "draft_n_accepted": 90,
+          "predicted_ms": 3829.8,
+          "predicted_n": 256,
+          "predicted_per_second": 66.8,
+          "predicted_per_token_ms": 14.96,
+          "prompt_ms": 7822.0,
+          "prompt_n": 32768,
+          "prompt_per_second": 4189.2,
+          "prompt_per_token_ms": 0.239
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 32768,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 33024
+        },
+        "wall_s": 11.750196
+      },
+      "expert_slots": 7646,
+      "cpu_experts": 7714,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    },
+    {
+      "arm": "D",
+      "case": "8k_r1",
+      "input_tokens": 8192,
+      "payload_sha256": "4331e6b456cd6eb84626bfc55e92577bf2b7074d48e744342017cde02a73928e",
+      "functional_valid": true,
+      "screening_valid": true,
+      "marker_found": true,
+      "result": {
+        "cold_cache_evidence": "zero",
+        "content_sha256": "b82a8577cd3c1d0ba3d8dddb21a1e8e8ac67955aeb38cb3c9c4a24af2c823ba7",
+        "finish_reason": "length",
+        "first_content_s": 3.6374508128501475,
+        "first_effective_s": 3.6374508128501475,
+        "first_event_s": 0.04995294800028205,
+        "first_reasoning_s": null,
+        "first_tool_s": null,
+        "http_status": 200,
+        "malformed_sse": false,
+        "native_timings": {
+          "cache_n": 0,
+          "draft_n": 110,
+          "draft_n_accepted": 94,
+          "predicted_ms": 4406.9,
+          "predicted_n": 256,
+          "predicted_per_second": 58.1,
+          "predicted_per_token_ms": 17.214,
+          "prompt_ms": 3582.5,
+          "prompt_n": 8192,
+          "prompt_per_second": 2286.7,
+          "prompt_per_token_ms": 0.437
+        },
+        "reasoning_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "seen_done": true,
+        "stream_valid": true,
+        "tool_sha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+        "truncated_sse": false,
+        "usage": {
+          "completion_tokens": 256,
+          "prompt_tokens": 8192,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          },
+          "total_tokens": 8448
+        },
+        "wall_s": 8.044003
+      },
+      "expert_slots": 7646,
+      "cpu_experts": 7714,
+      "binary_sha256": "6a0da4cbf3098e99b8865c05d0d681012ff87799b8bdce3de5aa4c9c56d028c2",
+      "gpu_layers": [
+        [
+          0,
+          8
+        ],
+        [
+          9,
+          19
+        ],
+        [
+          20,
+          29
+        ],
+        [
+          30,
+          39
+        ]
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "base": "A",
+      "case": "8k_r1",
+      "decode_gain": 0.015679442508710784,
+      "eligible": true,
+      "other": "B",
+      "prefill_gain": 0.40816708229426424,
+      "same_content_hash": false,
+      "scope": "one paired input, no ABA/drift estimate; automatic capacity changes are part of measured configuration effect"
+    },
+    {
+      "base": "A",
+      "case": "32k_r1",
+      "decode_gain": 0.0785498489425982,
+      "eligible": true,
+      "other": "B",
+      "prefill_gain": 0.17334783791134067,
+      "same_content_hash": false,
+      "scope": "one paired input, no ABA/drift estimate; automatic capacity changes are part of measured configuration effect"
+    },
+    {
+      "base": "A",
+      "case": "128k_r1",
+      "decode_gain": -0.06919945725915888,
+      "eligible": true,
+      "other": "B",
+      "prefill_gain": 0.03220300643648866,
+      "same_content_hash": false,
+      "scope": "one paired input, no ABA/drift estimate; automatic capacity changes are part of measured configuration effect"
+    },
+    {
+      "base": "B",
+      "case": "128k_r1",
+      "decode_gain": -0.1588921282798833,
+      "eligible": true,
+      "other": "C",
+      "prefill_gain": 0.11989241956370167,
+      "same_content_hash": false,
+      "scope": "one paired input, no ABA/drift estimate; automatic capacity changes are part of measured configuration effect"
+    },
+    {
+      "base": "B",
+      "case": "8k_r1",
+      "decode_gain": -0.0034305317324184736,
+      "eligible": true,
+      "other": "D",
+      "prefill_gain": 0.012396511267543264,
+      "same_content_hash": false,
+      "scope": "one paired input, no ABA/drift estimate; automatic capacity changes are part of measured configuration effect"
+    },
+    {
+      "base": "B",
+      "case": "32k_r1",
+      "decode_gain": -0.06442577030812335,
+      "eligible": true,
+      "other": "D",
+      "prefill_gain": -0.029019098831818968,
+      "same_content_hash": false,
+      "scope": "one paired input, no ABA/drift estimate; automatic capacity changes are part of measured configuration effect"
+    }
+  ],
+  "startup_expert_NUMA_policy_groups": {
+    "A": {
+      "prefer:1": {
+        "mappings": 40,
+        "N0_KiB": 380928,
+        "N1_KiB": 33359968
+      },
+      "prefer:0": {
+        "mappings": 40,
+        "N0_KiB": 33740896,
+        "N1_KiB": 0
+      }
+    },
+    "B": {
+      "prefer:1": {
+        "mappings": 40,
+        "N0_KiB": 0,
+        "N1_KiB": 32411644
+      },
+      "prefer:0": {
+        "mappings": 40,
+        "N0_KiB": 29203200,
+        "N1_KiB": 3208444
+      }
+    },
+    "C": {
+      "prefer:1": {
+        "mappings": 40,
+        "N0_KiB": 0,
+        "N1_KiB": 32411644
+      },
+      "prefer:0": {
+        "mappings": 40,
+        "N0_KiB": 30037008,
+        "N1_KiB": 2374636
+      }
+    },
+    "D": {
+      "prefer:1": {
+        "mappings": 40,
+        "N0_KiB": 0,
+        "N1_KiB": 32413444
+      },
+      "prefer:0": {
+        "mappings": 40,
+        "N0_KiB": 31461124,
+        "N1_KiB": 952320
+      }
+    }
+  },
+  "limitations": [
+    "One request per screening cell; no uncertainty estimate or ABA drift control.",
+    "Automatic expert capacity, CPU/GPU routing and actual NUMA placement vary at startup.",
+    "Text hashes can diverge; marker retrieval is not a general quality evaluation.",
+    "No isolated CPU-patch throughput comparison; no claimed CPU speedup percentage.",
+    "Serving capacity is eight, but these are serial single-request measurements.",
+    "Profile seeds are identified by hash, not distributed; exact routing replay requires those seeds.",
+    "C/128K is its first request, while B/128K follows 8K and 32K; cold prompt cache does not imply matched expert-cache state. C/B decode is not an isolated INDEX_TC effect."
+  ],
+  "reproduction": {
+    "engine_env": {
+      "DS4_ENGRAM_RAM": "1",
+      "DS4_REQUIRE_ALL_RAM": "0",
+      "STRATA_DS4_SLOT_DIR": "/isolated/slots",
+      "STRATA_DS4_SLOT_KEEP": "1",
+      "STRATA_DS4_SLOT_CAP": "16",
+      "STRATA_DS4_SLOT_RAM_GB": "24",
+      "DS4_ENGRAM_RAM_NUMA": "1",
+      "MAYA_DS4_ENGRAM_RAM_NUMA": "1",
+      "STRATA_DS4_ENGRAM_RAM_NUMA": "1",
+      "DS4_CPU_PREPARE_ROWS": "1",
+      "MAYA_DS4_CPU_PREPARE_ROWS": "1",
+      "STRATA_DS4_CPU_PREPARE_ROWS": "1"
+    },
+    "metadata_sha256": {
+      "ds4.txt": "1b544f99e40631985fcf3866211b2ed39780fc661238813eefb8a351f7eebf64",
+      "tensors.txt": "655b0292de97de3ee24e6344fcb808f8471bf12b2b660f711b000934bb2dbeb9",
+      "engram.bin": "08d55d6433f389b14aa115f4ea4eb31d6a2d63df1ae40821f03facf4c2d49142"
+    },
+    "storage": {
+      "filesystem": "ext4   /dev/mapper/ubuntu--vg-lv--0\n",
+      "devices": "{\n   \"blockdevices\": [\n      {\n         \"name\": \"sda\",\n         \"model\": \"PERC H755 Front\",\n         \"size\": \"2.2T\",\n         \"rota\": true\n      },{\n         \"name\": \"sdb\",\n         \"model\": \"DELLBOSS VD\",\n         \"size\": \"447.1G\",\n         \"rota\": true\n      }\n   ]\n}\n"
+    }
+  }
+}

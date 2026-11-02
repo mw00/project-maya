@@ -1,0 +1,51 @@
+Project Maya v1.1.46 + CPU NUMA/cold-row patches benchmark, 2026-11-01 16:55
+GPUs: NVIDIA GeForce RTX 4090 24 GB, NVIDIA GeForce RTX 4090 24 GB, NVIDIA GeForce RTX 4090 24 GB, NVIDIA GeForce RTX 4090 24 GB; RAM 251 GB; CPU Intel(R) Xeon(R) Platinum 8380 CPU @ 2.30GHz
+setup: isolated-benchmark.json, context 262144, GPUs [0, 1, 2, 3]
+decode (writing the answer): mean 85.3 tokens/s over 3 answers of up to 256 tokens (greedy, thinking off)
+    94.4 tokens/s  Write a Python function that parses a CSV file into a list of dictionaries, with type hints and a docstring.
+    68.7 tokens/s  Explain how photosynthesis works, step by step, for a high-school student.
+    92.8 tokens/s  Write a complete HTML page with a canvas that draws a bouncing ball animation in JavaScript.
+prefill (reading the prompt): 642 tokens/s, 2048 tokens
+prefill (reading the prompt): 1585 tokens/s, 8192 tokens
+
+engine lines:
+ds4: Engram RAM ONLY: 2 complete tables (Q6_K/Q5_K/IQ4_NL/FP8), 110.595 GB locked; reads use memcpy
+ds4: a multi step's attention for all its rows in one launch a step, 10.5 MB a GPU (DS4_MULTI_ATTN)
+ds4: --parallel 8: 8 conversations at once, each its own rings and KV (2.69 GB more VRAM for the other 7, from the experts' room)
+ds4: CUDA0 prompt ring: 48 slots of 7.8 MB, 12 a batch (375 MB) for its 21.8 GB/s link (DS4_RING_MB sets it)
+ds4: CUDA1 prompt ring: 44 slots of 9.0 MB, 11 a batch (394 MB) for its 22.8 GB/s link (DS4_RING_MB sets it)
+ds4: CUDA2 prompt ring: 44 slots of 9.1 MB, 11 a batch (398 MB) for its 24.4 GB/s link (DS4_RING_MB sets it)
+ds4: CUDA3 prompt ring: 40 slots of 9.8 MB, 10 a batch (390 MB) for its 24.3 GB/s link (DS4_RING_MB sets it)
+ds4: the experts VRAM leaves over (~65.7 GB) are read in place from the model's files (copied into RAM after the GPUs' share when the RAM holds them all; --mmap-experts on keeps them in place) (135.6 GB of RAM free to keep them: the most-routed 65.7 GB read ahead; prompts in chunks of 5120)
+ds4: --mmap-experts auto: the CPU lane's experts (66.4 GB) fit the RAM this process can get (126.2 GB): copied into RAM (--mmap-experts on keeps them in the files)
+ds4: copied expert cache: DONTNEED hints accepted for 65.941 GB of whole source pages (eviction is advisory)
+ds4: the copied experts pinned (66.4 GB in 8.2 s): the prompt path DMAs them in place
+ds4: 7703 of the CPU lane's 7703 experts copied into RAM (66.0 GB, 2 NUMA parts) in 86.7 s
+ds4: CPU lane iq2_xs rows: AVX-512 (VPOPCNTDQ)
+ds4: CPU lane iq1_m rows: AVX-512
+ds4: CPU row checks prepared at load for 3 CPU weight types (DS4_CPU_PREPARE_ROWS)
+ds4: CUDA0 layers [0, 42]: weights 1.91 GB, experts 18.01 GB (1751 of 3840 in VRAM), caches 0.79 GB, 1400 MiB free
+ds4: CUDA1 layers [9, 19]: weights 1.52 GB, experts 18.57 GB (2166 of 4224 in VRAM), caches 0.70 GB, 1400 MiB free
+ds4: CUDA2 layers [20, 29]: weights 1.30 GB, experts 18.80 GB (2118 of 3840 in VRAM), caches 0.79 GB, 1404 MiB free
+ds4: CUDA3 layers [30, 39] + head: weights 1.88 GB, experts 18.22 GB (2006 of 3840 in VRAM), caches 0.79 GB, 1396 MiB free
+ds4: 7703 routed experts on the CPU lane (66.0 GB): 7703 copied into RAM (2 NUMA parts), the rest in place in the model's files; 80 threads
+ds4 slots: folder <local>/final_selection_20261102/arms/B/runs/official/slots: 0 conversation(s) kept from earlier runs (0.00 GB)
+ds4 slots: RAM conversation budget: 25.77 GB (LRU states spill to the folder; one RAM slot is always kept)
+maya ds4 serve: prompt read: 10 tokens in 0.2 s; VRAM free CUDA0 1.4 of 23.5, CUDA1 1.4 of 23.5, CUDA2 1.4 of 23.5, CUDA3 1.4 of 23.5 GB before, 1.4, 1.4, 1.4, 1.4 after
+ds4: CUDA0 prompt attention on the tensor cores (sm_89)
+ds4: CUDA0 busy experts (64 rows or more) as FP16 GEMMs, 1024 rows a piece, FFN up to 2304 (77 MB)
+ds4: CUDA1 prompt attention on the tensor cores (sm_89)
+ds4: CUDA1 busy experts (64 rows or more) as FP16 GEMMs, 1024 rows a piece, FFN up to 2304 (77 MB)
+ds4: CUDA2 prompt attention on the tensor cores (sm_89)
+ds4: CUDA2 busy experts (64 rows or more) as FP16 GEMMs, 1024 rows a piece, FFN up to 2304 (77 MB)
+ds4: CUDA3 prompt attention on the tensor cores (sm_89)
+ds4: CUDA3 busy experts (64 rows or more) as FP16 GEMMs, 1024 rows a piece, FFN up to 2304 (77 MB)
+maya ds4 serve: prompt read: 28 tokens in 0.6 s; VRAM free CUDA0 1.4 of 23.5, CUDA1 1.4 of 23.5, CUDA2 1.4 of 23.5, CUDA3 1.4 of 23.5 GB before, 1.2, 1.2, 1.2, 1.2 after
+maya ds4 serve: prompt read: 19 tokens in 0.2 s; VRAM free CUDA0 1.2 of 23.5, CUDA1 1.2 of 23.5, CUDA2 1.2 of 23.5, CUDA3 1.2 of 23.5 GB before, 1.2, 1.2, 1.2, 1.2 after
+maya ds4 serve: prompt read: 21 tokens in 0.2 s; VRAM free CUDA0 1.2 of 23.5, CUDA1 1.2 of 23.5, CUDA2 1.2 of 23.5, CUDA3 1.2 of 23.5 GB before, 1.2, 1.2, 1.2, 1.2 after
+maya ds4 serve: prompt read: 2048 tokens in 2.9 s; VRAM free CUDA0 1.2 of 23.5, CUDA1 1.2 of 23.5, CUDA2 1.2 of 23.5, CUDA3 1.2 of 23.5 GB before, 1.2, 1.2, 1.2, 1.2 after
+maya ds4 serve: prompt read: 2048 tokens in 3.2 s; VRAM free CUDA0 1.2 of 23.5, CUDA1 1.2 of 23.5, CUDA2 1.2 of 23.5, CUDA3 1.2 of 23.5 GB before, 1.2, 1.2, 1.2, 1.2 after
+maya ds4 serve: prompt read: 8192 tokens in 5.2 s; VRAM free CUDA0 1.2 of 23.5, CUDA1 1.2 of 23.5, CUDA2 1.2 of 23.5, CUDA3 1.2 of 23.5 GB before, 1.2, 1.2, 1.2, 1.2 after
+ds4 slots: saved a 8192-token conversation as the engine ended (0.02 GB in RAM in 0.0 s); 1 in RAM, 0 in <local>/final_selection_20261102/arms/B/runs/official/slots
+ds4 slots: RAM conversations: 0.02 GB / 25.77 GB; 1 in RAM, 0 in the folder
+ds4 slots: wrote 1 conversation(s) to <local>/final_selection_20261102/arms/B/runs/official/slots; 1 there in all

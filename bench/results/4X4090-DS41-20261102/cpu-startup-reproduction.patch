@@ -1,0 +1,207 @@
+--- a/src/ds4/ds4_model.cu
++++ b/src/ds4/ds4_model.cu
+@@ -4568,6 +4568,20 @@
+ #if defined(STRATA_USE_HIP)
+         if (!init_peer_ar(err)) return false; // after expert placement: optional scratch does not shrink the expert cache
+ #endif
++        // Opt-in startup work only: a calibration of one representative layer does not prepare every
++        // CPU format, nor both one-token and multi-token backends. Never defer their parity checks to a
++        // pool's first routed request when this option is requested; do not skip or weaken those checks.
++        if (const char* v = ds4_env("DS4_CPU_PREPARE_ROWS"); pk.gguf && v && std::strcmp(v, "1") == 0) {
++            std::vector<int> types;
++            for (const Layer& l : L) {
++                if (l.n_vram >= l.n_exp) continue;
++                for (int role : {0, 2}) types.push_back(gg::expert_type(l.lay, role));
++            }
++            std::sort(types.begin(), types.end());
++            types.erase(std::unique(types.begin(), types.end()), types.end());
++            for (int type : types) gg::iq_cpu_prepare_rows(type);
++            std::fprintf(stderr, "ds4: CPU row checks prepared at load for %zu CPU weight types (DS4_CPU_PREPARE_ROWS)\n", types.size());
++        }
+         tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
+         pick_len = chunk > 0 ? prompt_pick_length(ds4_env("DS4_PROMPT_PICK")) : 0;
+         if (pick_len > 0)
+--- a/src/ds4/ds4_iq_cpu.cpp
++++ b/src/ds4/ds4_iq_cpu.cpp
+@@ -1045,6 +1045,14 @@
+     return true;
+ }
+ 
++void iq_cpu_prepare_rows(int type) {
++    // Keep all original checks and fallback decisions; only their first-use time moves to load.
++    if (!own_nt(type, 1)) (void) kc::native_rows1_exact(type);
++    // one_gpu_plan can later disable IQ1_S own rows. Prepare its native multi fallback as well,
++    // without changing g_iq1_on, own selection, or either backend's numerical gate.
++    if (!own_nt(type, 2) || type == GGML_TYPE_IQ1_S) (void) kc::native_multi_rows_exact(type);
++}
++
+ void iq_cpu_quant(int act, const float* x, int k, void* dst) {
+     kc::NativeFmt n;
+     n.gu_act = act;
+@@ -1148,6 +1156,7 @@
+     err = "this build has no ggml-cpu (STRATA_NATIVE_EXPERTS=OFF): the low-bit experts' CPU lane is not in it";
+     return false;
+ }
++void iq_cpu_prepare_rows(int) {}
+ void iq_cpu_quant(int, const float*, int, void*) {}
+ void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int,
+                     float) {}
+--- a/src/ds4/ds4_gguf_cpu.hpp
++++ b/src/ds4/ds4_gguf_cpu.hpp
+@@ -75,6 +75,8 @@
+ /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512: ggml-cpu's numbers bit for bit, checked against its dot on first use;
+ /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
+ bool iq_cpu_own_rows(int type);
++/// Load-time preparation of the same guarded one/multi CPU row selection/parity checks.
++void iq_cpu_prepare_rows(int type);
+ /// IQ1_S's own multi-token rows (the same bits as ggml-cpu's dot): allowed by default; the engine turns them off where
+ /// the one-GPU decode path is off (Model::Impl::one_gpu_path), so those setups keep ggml's rows as before.
+ void iq_cpu_iq1s_rows(bool on);
+--- a/src/ds4/ds4_engram_io.hpp
++++ b/src/ds4/ds4_engram_io.hpp
+@@ -12,6 +12,7 @@
+ #endif
+ 
+ #include "ds4_os.hpp"
++#include "ds4_engram_numa.hpp"
+ 
+ #include <algorithm>
+ #include <atomic>
+@@ -159,6 +160,13 @@
+             err = "Engram RAM: range is too large"; return false;
+         }
+         const size_t length = (size_t) (off - begin + n);
++        const bool numa_on = engram_numa_on();
++#if defined(__linux__)
++        EngramNuma numa;
++        if (numa_on && !numa.init(err)) return false;
++#else
++        if (numa_on) { err = "Engram RAM NUMA requires Linux"; return false; }
++#endif
+         const os::fd_t fd = os::open_ro(path);
+         if (fd == os::kBadFd) { err = "Engram RAM: cannot open " + path; return false; }
+         const uint64_t bytes = os::file_size(fd);
+@@ -171,6 +179,12 @@
+         uint8_t* base = (uint8_t*) raw;
+         const size_t chunk = 256ull << 20;
+         for (size_t pos = 0; pos < length; pos += chunk) {
++#if defined(__linux__)
++            // Existing warm shared-cache pages must be relocated, not merely assigned a new policy.
++            if (numa_on && !numa.balance(base + pos, std::min(chunk, length - pos), begin + pos, err)) {
++                ::munlock(base, length); ::munmap(base, length); return false;
++            }
++#endif
+             if (::mlock(base + pos, std::min(chunk, length - pos)) != 0) {
+                 err = "Engram RAM: mlock failed: " + std::string(std::strerror(errno)) +
+                       "; check available RAM and RLIMIT_MEMLOCK (ulimit -l)";
+@@ -180,6 +194,12 @@
+                 std::fprintf(stderr, "ds4: Engram RAM file %d locked %.2f / %.2f GB\n", file,
+                              (double) std::min(pos + chunk, length) / 1e9, (double) length / 1e9);
+         }
++#if defined(__linux__)
++        if (numa_on)
++            std::fprintf(stderr, "ds4: Engram RAM NUMA file %d: verified N0=%llu N1=%llu pages, relocated_batches=%llu (2 MiB strict batches/stripes)\n",
++                         file, (unsigned long long) numa.verified[0], (unsigned long long) numa.verified[1],
++                         (unsigned long long) numa.relocated_batches);
++#endif
+         ram_.push_back({file, off, n, base, length, (size_t) (off - begin)});
+         return true;
+ #endif
+--- /dev/null
++++ b/src/ds4/ds4_engram_numa.hpp
+@@ -0,0 +1,95 @@
++// Startup-only placement of locked Engram file pages. No tensor arithmetic or file writes.
++#pragma once
++#include <algorithm>
++#include <array>
++#include <cerrno>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#if defined(__linux__)
++#include <linux/mempolicy.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++#endif
++
++namespace strata::ds4 {
++inline bool engram_numa_on() {
++    const char* v = std::getenv("STRATA_DS4_ENGRAM_RAM_NUMA");
++    if (!v) v = std::getenv("MAYA_DS4_ENGRAM_RAM_NUMA");
++    if (!v) v = std::getenv("DS4_ENGRAM_RAM_NUMA");
++    return v && std::strcmp(v, "1") == 0;
++}
++
++#if defined(__linux__)
++class EngramNuma {
++public:
++    static constexpr size_t kStripe = size_t{2} << 20;
++    using Bind = long (*)(void*, size_t, int, unsigned long, unsigned);
++    explicit EngramNuma(Bind bind = system_bind) : bind_(bind) {}
++    bool init(std::string& err) {
++        page_ = ::sysconf(_SC_PAGESIZE);
++        if (page_ <= 0 || kStripe % (size_t) page_ != 0)
++            return fail(err, "unsupported page size");
++        unsigned long mask[4] = {};
++        if (::syscall(SYS_get_mempolicy, nullptr, mask, 256ul, nullptr, MPOL_F_MEMS_ALLOWED) != 0)
++            return fail(err, "get_mempolicy", errno);
++        if (mask[0] != 3ul || mask[1] || mask[2] || mask[3])
++            return fail(err, "requires allowed memory nodes exactly 0 and 1");
++        return true;
++    }
++    bool balance(uint8_t* base, size_t bytes, uint64_t file_offset, std::string& err) {
++        if (page_ <= 0 || (uintptr_t) base % (size_t) page_ || file_offset % (size_t) page_ ||
++            bytes > UINT64_MAX - file_offset) return fail(err, "invalid mapped range");
++        for (size_t pos = 0; pos < bytes;) {
++            const uint64_t off = file_offset + pos;
++            const size_t extent = std::min(bytes - pos, kStripe - (size_t) (off % kStripe));
++            const size_t n = (extent + (size_t) page_ - 1) / (size_t) page_;
++            const int node = (int) ((off / kStripe) % 2);
++            const unsigned long mask = 1ul << node;
++            // Every page must already be present before STRICT scans it. No stores and no shadow copy.
++            for (size_t i = 0; i < n; ++i) (void) *static_cast<volatile const uint8_t*>(base + pos + i * (size_t) page_);
++            uint8_t* p = base + pos;
++            // A single-node STRICT check detects misplaced warm cache pages. Unlike INTERLEAVE over{0,1},
++            // it cannot accept an all-node1 range just because node1 belongs to the allowed set.
++            if (bind_(p, extent, MPOL_BIND, mask, MPOL_MF_STRICT) != 0) {
++                const int before_error = errno;
++                if (before_error != EIO) return clear_and_fail(p, extent, err, "initial strict check", before_error);
++                if (bind_(p, extent, MPOL_BIND, mask, MPOL_MF_MOVE_ALL | MPOL_MF_STRICT) != 0)
++                    return clear_and_fail(p, extent, err, "strict migration incomplete; candidate refused", errno);
++                ++relocated_batches;
++            }
++            if (bind_(p, extent, MPOL_BIND, mask, MPOL_MF_STRICT) != 0)
++                return clear_and_fail(p, extent, err, "post-migration strict verification", errno);
++            // Restore policy immediately: shared file pages retain migrated physical homes, but tens of
++            // thousands of stripe VMAs must not accumulate, nor should future allocations be hard-bound.
++            if (bind_(p, extent, MPOL_DEFAULT, 0, 0) != 0)
++                return fail(err, "restore mapping policy; candidate refused", errno);
++            verified[(size_t) node] += n;
++            pos += extent;
++        }
++        return true;
++    }
++    uint64_t relocated_batches = 0;
++    std::array<uint64_t, 2> verified{};
++private:
++    static long system_bind(void* p, size_t n, int mode, unsigned long mask, unsigned flags) {
++        return ::syscall(SYS_mbind, p, n, mode, &mask, sizeof(mask) * 8ul, flags);
++    }
++    bool clear_and_fail(void* p, size_t n, std::string& err, const char* what, int code) {
++        const bool cleared = bind_(p, n, MPOL_DEFAULT, 0, 0) == 0;
++        fail(err, what, code);
++        err += cleared ? "; policy restored; completed/partial page moves can persist"
++                       : "; policy reset also failed; completed/partial page moves can persist";
++        return false;
++    }
++    static bool fail(std::string& err, const char* what, int code = 0) {
++        err = std::string("Engram RAM NUMA: ") + what;
++        if (code) err += ": " + std::string(std::strerror(code));
++        return false;
++    }
++    Bind bind_;
++    long page_ = 0;
++};
++#endif
++}  // namespace strata::ds4
