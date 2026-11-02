@@ -62,6 +62,24 @@ class BackgroundResponses(ResponseCase):
         self.script("Next")
         self.assertEqual(self.post(previous_response_id=first["id"])[0], 200)
 
+    def test_background_reasoning_summary_retrieval_and_event_replay(self):
+        self.script("Check this.</think>\n\n42")
+        status, initial = self.post(background=True, store=True,
+                                    reasoning={"effort": "xhigh", "summary": "auto"},
+                                    include=["reasoning.encrypted_content"])
+        self.assertEqual(status, 200, initial)
+        out = self.wait(initial["id"])
+        self.assertEqual(out["output"][0]["summary"], [{"type": "summary_text", "text": "Check this."}])
+        self.assertNotIn("encrypted_content", out["output"][0])
+        with self.request(path=f"/v1/responses/{out['id']}?stream=true") as response:
+            raw = response.read().decode()
+        events = [json.loads(block.split("\ndata: ", 1)[1]) for block in raw.strip().split("\n\n")
+                  if block.startswith("event:")]
+        self.assertEqual("".join(e["delta"] for e in events if e["type"] == "response.reasoning_summary_text.delta"),
+                         "Check this.")
+        self.assertEqual(events[-1]["response"], out)
+        self.assertEqual([e["sequence_number"] for e in events], list(range(len(events))))
+
     def test_background_stream_can_disconnect_without_cancelling_generation(self):
         self.script("x" * 100, delay_s=0.002)
         rid = None

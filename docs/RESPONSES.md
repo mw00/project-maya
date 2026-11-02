@@ -43,8 +43,15 @@ print(response.output_text)
   A group of function results can arrive in a different order from its calls.
   All calls need their results in the input before generation can continue.
 - `reasoning.effort`, `temperature`, `top_p`, `max_output_tokens`, and `metadata`.
-  Reasoning is returned as a `reasoning` item with `reasoning_text` content, and
-  can be replayed in history. It is plain model reasoning, not a generated summary.
+  Reasoning is returned as a `reasoning` item and can be replayed in history.
+  With `reasoning.summary` omitted or null it uses `content` / `reasoning_text`.
+  With `summary:"auto"`, `"concise"` or `"detailed"` it uses `summary` / `summary_text`
+  and `response.reasoning_summary_part.added`, `response.reasoning_summary_text.delta`,
+  `response.reasoning_summary_text.done`, and `response.reasoning_summary_part.done`
+  events. Maya projects the model's visible reasoning verbatim into this summary
+  channel; all three modes return the same text, without an additional summarizer.
+  Only the selected reasoning channel emits deltas, so clients do not receive
+  duplicate text. Requesting a summary does not disable or lower reasoning effort.
 - SSE response/item/content lifecycles, text and function-argument deltas, and final
   usage. Hitting the output limit yields `response.incomplete` with
   `incomplete_details.reason="max_output_tokens"`; an engine failure yields
@@ -54,9 +61,11 @@ print(response.output_text)
   echoed in the response. Native prompt-prefix reuse determines actual cache hits;
   the hint does not partition or force the engine cache. String-valued
   `client_metadata` is accepted as diagnostic context and is not stored or echoed.
-- The `include:["reasoning.encrypted_content"]` projection is accepted only with
-  explicit `reasoning.effort:"none"`, when there are no reasoning items to encrypt.
-  Encryption and encrypted reasoning input remain unsupported.
+- The `include:["reasoning.encrypted_content"]` projection is accepted with any
+  supported reasoning effort, including `xhigh`. This backend does not encrypt
+  reasoning, so the response omits `encrypted_content`; requesting this projection
+  does not change the visible reasoning or its token usage. Nonempty encrypted
+  reasoning input is rejected. `/v1/status` advertises this capability explicitly.
 - `include:["message.output_text.logprobs"]` and `top_logprobs` (0-20; either one
   asks) return token log-probabilities in the message's `output_text` part and its
   `response.output_text.delta` / `.done` events, on the DeepSeek engine only (another
@@ -284,7 +293,7 @@ history without recursive parent lookups.
 Unsupported parameters and item types return HTTP 400 before generation. In particular:
 
 - the Conversations API, item references, and WebSocket transport;
-- hosted/custom tools, encrypted reasoning, reasoning summaries, files and audio;
+- hosted/custom tools, encrypted reasoning input, files and audio;
 - token-level constrained decoding, unsupported JSON Schema keywords, automatic
   input truncation, and non-default service tiers. Namespace tools remain unsupported.
 
