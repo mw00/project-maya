@@ -84,6 +84,14 @@ public:
     // every routed expert has a slot in use (all resident, or a streaming pool grown that far: after each expert's
     // first use, nothing misses)
     bool holds_all() const { return all_resident_ || slots_total() >= (size_t) n_pairs_; }
+    // every routed expert is resident right now.  Sticky once true: a miss is then impossible, so no slot ever
+    // changes hands again and the slot map may be latched on the GPU (GlmMetal's slot_tab) instead of being
+    // read back through ensure() after every router.
+    bool fully_resident() const { return n_pairs_ > 0 && resident_count_ >= n_pairs_; }
+    // expert -> slot of a layer (-1: not resident; empty for a layer without routed experts)
+    const std::vector<int>& slot_map(int layer) const { return layers_[(size_t) layer].slot_of; }
+    int pairs() const { return n_pairs_; }
+    int resident_pairs() const { return resident_count_; }
     // all resident: expert e of `layer` sits in slot slot_base(layer) + e of its group
     int slot_base(int layer) const { return layers_[(size_t) layer].base; }
     size_t slots_total() const;
@@ -118,6 +126,7 @@ private:
     ParallelReader* reader_ = nullptr;
     int n_expert_ = 0;
     int n_pairs_ = 0;                    // (layer, expert) pairs with routed experts
+    int resident_count_ = 0;             // pairs resident right now (their layer's slot_of >= 0)
     std::vector<uint32_t> usage_;
     uint64_t tick_ = 0;
     uint32_t call_ = 0;

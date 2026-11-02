@@ -523,6 +523,7 @@ bool GlmMetal::Impl::init_state(std::string& err) {
         }
     }
     pool_tab = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, kp, n_pools);
+    slot_tab = ggml_new_tensor_2d(sctx, GGML_TYPE_I32, g.n_expert, held);   // filled by arm_slot_tab(), if ever
     const int64_t U = o.n_ubatch;
     c_res = ggml_new_tensor_3d(sctx, GGML_TYPE_F32, g.n_embd, g.hc, U);
     c_post = ggml_new_tensor_2d(sctx, GGML_TYPE_F32, g.hc, U);

@@ -8,6 +8,11 @@
 // Between two graphs the host reads the router's top-k, ExpertPool::ensure() maps experts to slots (reading the
 // misses from the SSD), and the slot ids are the next graph's input.  Everything a graph hands to the next one
 // lives in the carry tensors (glm_metal_impl.hpp); everything a token hands to the next lives in LayerState.
+//
+// The cut is only for a pool that can miss.  A pool born holding every expert gives each one a fixed slot
+// (slot_ids), and a pool that grows until it holds every expert can never miss again, so its slot map is
+// latched onto the GPU (arm_slot_tab / table_ids): both run the whole slice as one graph, ids looked up on
+// the GPU, the same ops on the same values as the cut path computes across its two graphs.
 #include "glm_metal_impl.hpp"
 
 #include "ggml-alloc.h"
@@ -449,8 +454,13 @@ struct Builder {
         }
         ggml_tensor *top, *wts, *sh;
         route(il, x, &top, &wts, &sh);
-        if (m.pool.all_resident()) {   // every expert has its fixed slot: the lookup is on the GPU, no cut
-            ggml_tensor* out = experts_out(il, slot_ids(il, top), x, wts, sh);
+        // every expert resident - born that way (fixed slots) or grown there (the slot map latched on the
+        // GPU): either way the lookup is on the GPU and the layer finishes here, no cut
+        ggml_tensor* ids = m.pool.all_resident() ? slot_ids(il, top)
+                           : m.slot_tab_live   ? table_ids(il, top)
+                                               : nullptr;
+        if (ids) {
+            ggml_tensor* out = experts_out(il, ids, x, wts, sh);
             R = hc_post(out, R, post, comb);
             cb(R, "l_out", il);
             return R;
@@ -497,6 +507,14 @@ struct Builder {
     ggml_tensor* slot_ids(int il, ggml_tensor* top) {
         ggml_tensor* f = ggml_scale_bias(ctx, ggml_cast(ctx, top, GGML_TYPE_F32), 1.0f, (float) m.pool.slot_base(il));
         return ggml_cast(ctx, f, GGML_TYPE_I32);
+    }
+
+    // a pool that grew to hold every expert: expert e's slot is slot_tab[e, il], latched on the GPU by
+    // arm_slot_tab() (the map cannot move again - a miss is impossible), gathered here on the GPU
+    ggml_tensor* table_ids(int il, ggml_tensor* top) {
+        ggml_tensor* tab = ggml_view_1d(ctx, m.slot_tab, g.n_expert, (size_t) il * m.slot_tab->nb[1]);
+        ggml_tensor* ids = ggml_get_rows(ctx, tab, ggml_reshape_1d(ctx, top, (int64_t) g.n_expert_used * T));
+        return ggml_reshape_2d(ctx, ids, g.n_expert_used, T);
     }
 
     // the routed experts (ids: their slots) weighted by w, plus the shared expert's sh
@@ -591,7 +609,30 @@ size_t GlmMetal::Impl::graph_size(int T) const {
            moe * (((size_t) T + kFloatGroup - 1) / kFloatGroup) * kGroupTensors;
 }
 
+bool GlmMetal::Impl::arm_slot_tab() {
+    if (slot_tab_live) return true;
+    if (!pool.fully_resident()) {
+        if (std::getenv("MAYA_METAL_POOL_DEBUG"))
+            std::fprintf(stderr, "slot_tab: the pool holds %d of %d experts, the map is not final yet\n",
+                         pool.resident_pairs(), pool.pairs());
+        return false;
+    }
+    const int held = (int) ls.size();
+    std::vector<int32_t> tab((size_t) g.n_expert * (size_t) held, 0);
+    for (int l = 0; l < held; ++l) {
+        const std::vector<int>& map = pool.slot_map(l);
+        if (map.size() != (size_t) g.n_expert) continue;   // no routed experts: this row is never gathered
+        for (int e = 0; e < g.n_expert; ++e) tab[(size_t) l * (size_t) g.n_expert + (size_t) e] = map[(size_t) e];
+    }
+    ggml_backend_tensor_set(slot_tab, tab.data(), 0, tab.size() * sizeof(int32_t));
+    slot_tab_live = true;
+    if (std::getenv("MAYA_METAL_POOL_DEBUG"))
+        std::fprintf(stderr, "slot_tab: the pool holds every expert, the slot map is latched on the GPU\n");
+    return true;
+}
+
 bool GlmMetal::Impl::run_slice(const int32_t* tok, int T, std::vector<float>& logits, std::string& err, bool window) {
+    arm_slot_tab();
     std::vector<float> emb;
     if (!embed(tok, T, emb, err)) return false;
     const size_t nodes = graph_size(T);
@@ -808,6 +849,7 @@ bool GlmMetal::mtp_step(int32_t token, int64_t pos, bool from_trunk, int32_t& dr
         err = "no MTP input for position " + std::to_string(pos);
         return false;
     }
+    m.arm_slot_tab();
     std::vector<float> e;
     if (!m.embed_raw(&token, 1, e, err)) return false;
     const std::vector<float> h = from_trunk ? std::vector<float>(m.hid_host.begin() + (long) m.hx_col * g.n_embd,
@@ -828,8 +870,11 @@ bool GlmMetal::mtp_step(int32_t token, int64_t pos, bool from_trunk, int32_t& dr
             ggml_tensor* f = b.rms(x, m.wl(il, "ffn_norm.weight"));
             ggml_tensor *wts, *sh;
             b.route(il, f, &top, &wts, &sh);
-            if (m.pool.all_resident()) {
-                out = ggml_add(ctx, x, b.experts_out(il, b.slot_ids(il, top), f, wts, sh));
+            ggml_tensor* ids = m.pool.all_resident() ? b.slot_ids(il, top)
+                               : m.slot_tab_live   ? b.table_ids(il, top)
+                                                   : nullptr;
+            if (ids) {
+                out = ggml_add(ctx, x, b.experts_out(il, ids, f, wts, sh));
             } else {
                 b.expand(ggml_cpy(ctx, f, b.cols(m.c_x, 1)));
                 b.expand(ggml_cpy(ctx, wts, b.cols3(m.c_w, 1)));

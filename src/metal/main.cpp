@@ -51,6 +51,12 @@ std::vector<int32_t> parse_ids(const char* s) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    // Residency: ggml-metal stops requesting residency for the weight buffers 3 minutes after
+    // the last compute by default; at ~97 GB resident the unwire costs a long stall when
+    // generation resumes after a pause. Ask for a day instead - the variable is read when the
+    // Metal device initialises, before any backend exists. An operator's own
+    // GGML_METAL_RESIDENCY_KEEP_ALIVE_S wins (overwrite = 0).
+    setenv("GGML_METAL_RESIDENCY_KEEP_ALIVE_S", "86400", 0);
     std::string gguf;
     int64_t max_ctx = 32768;
     bool serve = false;
