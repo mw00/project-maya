@@ -324,6 +324,13 @@ float bf16_to_f32(uint16_t b) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+// a float as BF16, rounded to nearest even (a NaN stays a quiet NaN)
+static uint16_t f32_to_bf16(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) (u >> 16 | 0x40u);
+    return (uint16_t) ((u + 0x7fffu + (u >> 16 & 1u)) >> 16);
+}
 float f16_to_f32(uint16_t h) {
     const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 0x1f, m = h & 0x3ff;
     uint32_t u;
@@ -2534,8 +2541,11 @@ struct Model::Impl {
     bool mat_bf16(Dev& d, const std::string& pre, const Tensor& t, x3::Mat& m, std::string& err, size_t* acct, int part,
                   int np, bool cols, int r0 = -1, int rn = 0) {
         const bool q8 = t.dtype == "Q8_0";
+        // an F16 matrix (turboderp's EXL3 packs keep engram.wkv so): read as F16, then BF16 on the host, as every BF16
+        // dense matrix here runs
+        const bool f16 = t.dtype == "F16";
         // a low-bit dense matrix (a GGUF's Q5_K, say): ds4_iq's GEMV for a token, its FP16 rows for a prompt
-        const int lb = q8 || t.dtype == "BF16" ? -1 : gg_type_of(t.dtype);
+        const int lb = q8 || t.dtype == "BF16" || f16 ? -1 : gg_type_of(t.dtype);
         const int lbv = lb > 0 ? gg::iq::block_values(lb) : 0;   // (its block: 256 values, IQ4_NL's 32)
         const int per = q8 ? 32 : lb > 0 ? lbv : 1;
         if (t.shape.size() != 2 || t.shape[1] % per != 0 || lb == gg::kTypeMXFP4) {
@@ -2552,6 +2562,10 @@ struct Model::Impl {
         if (t.bytes != w.size() || !pk.read(t, w.data())) {
             err = pre + ": read failed";
             return false;
+        }
+        if (f16) {   // (2 bytes a value either way: the rest of this reads it as BF16)
+            uint16_t* h = (uint16_t*) w.data();
+            for (size_t i = 0; i < w.size() / 2; ++i) h[i] = f32_to_bf16(f16_to_f32(h[i]));
         }
         if (np > 1) {
             const int whole = cols ? n : k;
@@ -2693,9 +2707,10 @@ struct Model::Impl {
     }
     // a Q5_K superblock's 256 values as F32 (host): ggml's dequantize_row_q5_K (get_scale_min_k4's scales)
     // (q5k_values: ds4_q6k.cuh's, the Q5_K token embedding's host decode)
-    // a GGUF dense matrix mat_bf16 takes: BF16, Q8_0, or a low-bit type ds4_iq reads (not MXFP4: experts only)
+    // a GGUF dense matrix mat_bf16 takes: BF16, Q8_0, or a low-bit type ds4_iq reads (not MXFP4: experts only); and an
+    // EXL3 pack's F16 matrix (turboderp's engram.wkv), as BF16
     static bool gguf_dense(const std::string& dtype) {
-        const int t = dtype == "BF16" || dtype == "Q8_0" ? 0 : gg_type_of(dtype);
+        const int t = dtype == "BF16" || dtype == "Q8_0" || dtype == "F16" ? 0 : gg_type_of(dtype);
         return t == 0 || (t > 0 && t != gg::kTypeMXFP4);
     }
     // a Q8_0 tensor's values as F32 (host)
