@@ -158,6 +158,16 @@ class Rendering(_CleanToolOrders):
                 with self.assertRaises(ValueError):
                     self.template.render(BASE, reasoning_effort=effort)
 
+    def test_config_numeric_string_is_a_budget(self):   # (#768: "reasoning_effort": "42" in the run config)
+        from serve.frontend import config_budget, deepseek_effort_kwargs
+        self.assertEqual(deepseek_effort_kwargs(config_budget("42")), {"reasoning_effort": 42})
+        self.assertEqual(deepseek_effort_kwargs(config_budget(" 7 ")), {"reasoning_effort": 7})
+        self.assertEqual(config_budget("high"), "high")
+        self.assertEqual(config_budget(42), 42)
+        for bad in ("0", "101", "unknown", "4.5", "-3"):   # out of range, a word, not a whole number
+            with self.subTest(value=bad), self.assertRaises(ValueError):
+                deepseek_effort_kwargs(config_budget(bad))
+
     def test_thinking_disabled_omits_budget(self):
         for options in ({"reasoning_effort": "none"}, {"reasoning_effort": False},
                         {"reasoning_effort": 37, "chat_template_kwargs": {"enable_thinking": False}}):

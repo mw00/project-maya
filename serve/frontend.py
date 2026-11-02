@@ -212,6 +212,14 @@ def deepseek_effort_kwargs(value) -> dict:
     return effort_kwargs(value)
 
 
+def config_budget(value):
+    """A run config's reasoning_effort for DeepSeek: a numeric string ("42") is the number 42 (#768); every other value is
+    returned unchanged, so a named effort and a real unknown word are judged by deepseek_effort_kwargs as before."""
+    if isinstance(value, str) and value.strip().isascii() and value.strip().isdecimal():
+        return int(value.strip())
+    return value
+
+
 def deepseek_keep_thinking() -> bool:
     """MAYA_DS4_KEEP_THINKING=1: an earlier turn's reasoning stays in the prompt for the turns after it, where
     DeepSeek's own serving drops it at the next user turn - so a tool-less chat's next turn starts with the prompt the
