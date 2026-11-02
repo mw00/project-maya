@@ -2524,6 +2524,36 @@ class Service:
               " - they apply from its next start" if out["changed"] else " (nothing changed)"), flush=True)
         return {**out, "running": running, "restarts": restarts}
 
+    def turbo_info(self) -> dict:
+        """The Turbo button: whether it is on, what switching it on changes in the engine's settings, and whether this
+        server can start the engine again by itself.  A server with no run config (--config) has only the request-level
+        half: the page's greedy decoding, thinking and prompts."""
+        restarts = bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if not self.config_path:
+            return {"on": bool(getattr(self, "turbo_mem", False)), "engine": False, "plan": {}, "env": {},
+                    "restarts": False, "family": None}
+        cfg = models.read(Path(self.config_path))
+        return {**models.turbo_info(cfg), "engine": True, "restarts": restarts,
+                "restarting": getattr(self, "model_restart", None)}
+
+    def set_turbo(self, on: bool) -> dict:
+        """Turbo on or off.  The engine's part (models.turbo_enable / turbo_disable: the context, the expert skipping, the
+        drafting, written into the run config) starts Maya again as a saved engine setting does, after the request in
+        flight; nothing to restart where the engine already runs so (or without a run config)."""
+        if not self.config_path:
+            self.turbo_mem = bool(on)
+            return self.turbo_info()
+        p = Path(self.config_path)
+        self._restart_busy()
+        out = models.turbo_enable(p) if on else models.turbo_disable(p)
+        restarts = bool(out["changed"] and os.environ.get("MAYA_RESTART_ON_UPDATE"))
+        if restarts:
+            self._restart_into(p, "settings")
+        print(f"[maya] Turbo {'on' if on else 'off'}: {p.name}" + (": Maya starts again" if restarts else
+              " - the engine settings apply from its next start" if out["changed"] else " (the engine needs no restart)"),
+              flush=True)
+        return {**self.turbo_info(), "restarting_now": restarts, "changed": out["changed"]}
+
     def switch_model(self, name) -> dict:
         """The Models page's Switch: the config `name` becomes the most recently used one (a start without --config
         picks it), and when maya.py started this server it ends with RESTART_EXIT after the request in flight, leaving
@@ -4982,6 +5012,10 @@ def make_handler(svc: Service):
                 # the dashboard's Port: where the server listens, and whether a new one applies at once
                 if self._authorized():
                     self._json(200, svc.port_info())
+            elif path == "/api/turbo":
+                # the Turbo button (Settings > Chat defaults): on or off, and what it would change in the engine
+                if self._authorized():
+                    self._json(200, svc.turbo_info())
             elif path == "/api/models":
                 # the Models page: the configs the setup wrote, the running one, each one's engine settings
                 if self._authorized():
@@ -5102,6 +5136,9 @@ def make_handler(svc: Service):
                     return
                 if path == "/api/update":
                     self._update()
+                    return
+                if path == "/api/turbo":
+                    self._turbo()
                     return
                 if path in ("/api/models/settings", "/api/models/switch", "/api/models/delete", "/api/models/leftovers"):
                     self._models(path.rsplit("/", 1)[1])
@@ -5266,6 +5303,21 @@ def make_handler(svc: Service):
                 return
             self._json(200 if what in ("delete", "leftovers") and not out.get("deleting")
                        or (what == "settings" and req.get("dry_run")) else 202, out)
+
+        def _turbo(self):
+            # It changes the engine's settings (and restarts it) for every client: only the app's own page
+            body = self._body()
+            if not self._own_page("Turbo can be switched"):
+                return
+            try:
+                req = json.loads(body or b"{}")
+                if not isinstance(req, dict) or not isinstance(req.get("on"), bool):
+                    raise ValueError('send {"on": true} or {"on": false}')
+                out = svc.set_turbo(req["on"])
+            except (TypeError, ValueError, OSError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            self._json(202 if out.get("restarting_now") else 200, out)
 
         def _update(self):
             # It replaces the server's files and restarts it for every client: only the app's own page
