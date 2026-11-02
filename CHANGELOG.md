@@ -4,6 +4,12 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## [UNRELEASED]
+
+- **ROCm installs with versioned LLVM slots:** `hip_clang` finds a distribution's LLVM slot (`<root>/lib/llvm/<version>/bin/clang++`,
+ newest first), so Gentoo passes the HIP check with `ROCM_PATH=/usr` and no `/usr/lib64/rocm/llvm` symlink (`tools/test_maya_hip.py`
+ covers it).
+
 ## v1.1.49 - 2026-11-02
 
 A fix release: Maya-XS updates start cleanly and give back their disk space, and Qwen CYBER-FROST runs on 8 GB cards again.
@@ -579,6 +585,7 @@ Fixes:
 - **`--parallel` is refused for DeepSeek and MiniMax** before it is written into their configs (#525, @DailyDisco).
 - **MiniMax quants on the Hub:** the dense layers' indexers file is now `<name>-maya-indexers.bin` (the same bytes;
   the Hub read the lone `.gguf` as the model). The setup renames a v1.1.30 download in place.
+
 ## v1.1.30 - 2026-10-27
 
 MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
@@ -1740,6 +1747,7 @@ Better drafts for speculative decode on two GPUs or more.
 ## v1.0.21 - 2026-10-09
 
 Eight community pull requests, with every default fitted to the machine it runs on:
+
 - a split search and prompt chunks sized from the expert pool;
 - a smaller KV cache at long context (decode 6-8% faster at 128K);
 - pictures from the web app read again;
