@@ -3670,7 +3670,7 @@ struct Model::Impl {
         // holds most of them a prompt streams every expert from RAM once a chunk, so the larger chunk wins and what its
         // buffers take from the VRAM experts costs the decode little - 2 V100 with ~24 GB each, Maya-XS v2, chunk 4096 /
         // 8192 / 16384: a 3K prompt 343 / 347 / 335 tok/s, 8K 567 / 675 / 654, 29K 675 / 870 / 994.  By the share of the
-        // experts on the CPU lane (estimated): under 40% 4096, to 60% 8192, above 16384)
+        // experts on the CPU lane (estimated): under 40% 4096, 40% and above 8192; 16384 is not used)
         if (dc == nullptr && o.prefill_chunk < 0 && chunk > 0 && file_experts && devs.size() > 1) {
             double exp_b = 0, other_b = 0, room = 0;
             for (const auto& kt : pk.t) {
@@ -3684,7 +3684,7 @@ struct Model::Impl {
                 room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - 1.5 * (1 << 30)) *
                         o.vram_experts;
             const double cpu_share = exp_b > 0 ? 1.0 - std::min(1.0, std::max(0.0, room - other_b) / exp_b) : 0.0;
-            chunk = cpu_share >= 0.6 ? 16384 : cpu_share >= 0.4 ? 8192 : 4096;
+            chunk = cpu_share >= 0.4 ? 8192 : 4096;
             if (chunk > 4096) std::fprintf(stderr, "ds4: prompt chunk %d (about %.0f%% of the experts on the CPU lane)\n", chunk, cpu_share * 100.0);
         }
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));

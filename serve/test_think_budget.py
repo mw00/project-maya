@@ -11,7 +11,7 @@ import maya_quants as Q  # noqa: E402
 import models as M  # noqa: E402
 import server  # noqa: E402
 
-GLM = {"exe": "x/maya", "args": ["--glm-pack", "p"], "installer": {"quant": "Maya-XS"}}
+GLM = {"exe": "x/maya", "args": ["--glm-pack", "p"], "installer": {"quant": "Maya-XS-IQ1_S"}}
 GLM_S24 = {"exe": "x/maya", "args": ["--glm-pack", "p"], "installer": {"quant": "Maya-S24"}}
 DS = {"exe": "x/maya-ds4", "args": ["--pack", "p"]}
 
@@ -85,6 +85,26 @@ class Field(unittest.TestCase):
         self.assertFalse(s.think_budget_info()["supported"])
         with self.assertRaises(ValueError):
             s.set_think_budget(1024)
+
+
+class GlmMayaXS(unittest.TestCase):
+    """The catalog entry of GLM-5.3-Flash Maya-XS and the defaults it brings."""
+
+    def test_defaults(self):
+        self.assertEqual(Q.model_defaults(GLM)[0], {"temperature": 0.7, "top_p": 0.95, "min_p": 0.05})
+        self.assertEqual(Q.model_defaults(GLM_S24)[0], {"temperature": 1.0, "top_p": 0.95})
+        self.assertEqual(Q.default_thinking_budget(GLM), 8192)
+
+    def test_entry(self):
+        import maya
+        m = maya.MODELS["Maya-XS-IQ1_S"]
+        self.assertEqual(m["revision"], "6728cf78a5b198a6a6f84b7fb88956a17ec56521")
+        self.assertEqual(maya.shard_names(m), ["GLM-5.3-Flash-Maya-XS-IQ1_S-0000%d-of-00002.gguf" % i for i in (1, 2)])
+        self.assertEqual(set(m["sha256"]), set(maya.shard_names(m)))
+        self.assertEqual((m["kv"], m["context"]), ("int8", 131072))
+        self.assertEqual(maya.recommended_context(("download", "Maya-S-v2-IQ2_XXS"), {"gpus": []}), maya.DEFAULT_CONTEXT)
+        self.assertEqual(maya.glm_sampling(("download", "Maya-XS-IQ1_S"), "Maya-XS-IQ1_S"),
+                         {"temperature": 0.7, "top_p": 0.95, "min_p": 0.05})
 
 
 if __name__ == "__main__":

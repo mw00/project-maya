@@ -43,10 +43,17 @@ MODEL_DEFAULTS = {
 }
 
 
+# A quant with its own sampling (the owner validated it on that quant, 2026-11-02): GLM-5.3-Flash Maya-XS - temperature
+# 0.7, top_p 0.95, min_p 0.05, no penalties.  Every other quant keeps its model's (MODEL_DEFAULTS).
+QUANT_SAMPLING = {("glm", "Maya-XS"): {"temperature": 0.7, "top_p": 0.95, "min_p": 0.05}}
+
+
 def model_defaults(cfg: dict) -> tuple:
-    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its family), copies."""
-    sampling, effort = MODEL_DEFAULTS.get(family_of(cfg), MODEL_DEFAULTS["glm"])
-    return dict(sampling), effort
+    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its family, the quant's own
+    sampling where it has one: QUANT_SAMPLING), copies."""
+    fam = family_of(cfg)
+    sampling, effort = MODEL_DEFAULTS.get(fam, MODEL_DEFAULTS["glm"])
+    return dict(QUANT_SAMPLING.get((fam, tier_of(cfg)), sampling)), effort
 
 
 # The thinking budget (the config's "thinking_budget": tokens, 0 = no limit; the reasoning ends there and the answer
@@ -99,6 +106,7 @@ def check_thinking_budget(value) -> int:
 QUANTS = (
     ("glm", "Maya-S-v2-IQ2_XXS", "Maya-S", "glm-maya-s"),
     ("glm", "Maya-S24", "Maya-S24", "glm-maya-s24"),
+    ("glm", "Maya-XS-IQ1_S", "Maya-XS", "glm-maya-xs"),
     ("glm", "Maya-M", "Maya-M", "glm-maya-m"),
     ("glm", "Maya-M-Derisked", "Maya-M-Derisked", "glm-maya-m-derisked"),
     ("glm", "Maya-L", "Maya-L", "glm-maya-l"),
