@@ -5399,6 +5399,17 @@ def ds4_shared_tables(quant: str, d: Path, models: Path, m: dict) -> dict | None
         return None
     if all(whole(d / n, m["files"][n], m["sha256"][n]) for n in names):
         return None                                      # (its own pair is there already)
+    for other, onames in pairs.items():                  # the other Maya quant's pair (or the shared Engram-Q6_K copy), #776
+        if other == tier:
+            continue
+        q = ds4_tier_files(man.get("maya") or {}, other)
+        full = {Path(n).name: v for n, v in q.items() if Path(n).name in onames}
+        for where in (models / f"{DS4}-Maya-GGUF" / other, d.parent / "Engram-Q6_K"):
+            if len(full) == len(onames) and all(whole(where / n, v[0], v[1]) for n, v in full.items()):
+                return {"model": trimmed(names), "without": names, "src": {n: where / n for n in full},
+                        "folder": d.parent / "Engram-Q6_K",
+                        "what": f"Maya's Q6_K n-gram tables ({other}'s pair of shards, {where}) are read for {tier} too: "
+                                f"its own pair is left out"}
     for ud, v in uds.items():
         table = Path(v["table"]).name
         want = {Path(n).name: x for n, x in v["files"].items()}[table]

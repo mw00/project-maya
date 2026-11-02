@@ -9,6 +9,7 @@ from pathlib import Path
 import hashlib
 import json
 import re
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -637,6 +638,32 @@ class Gguf(unittest.TestCase):
             for n in pair:                                                              # (Maya's own pair is there)
                 man["maya"]["quants"]["Maya-S"]["files"][n] = mk(d / Path(n).name, b"mine" + n.encode())
             self.assertIsNone(maya.ds4_shared_tables("maya-s", d, models, maya.ds4_gguf_model("maya-s")))
+
+    def test_shared_tables_maya_s_after_maya_xs(self):
+        """#776: Maya-S set up where Maya-XS's Q6_K pair is whole (or in Engram-Q6_K) does not download its own pair: it is
+        left out and the XS pair is read, linked; a damaged XS pair shares nothing."""
+        models, man, xs, _, mk = self._tables()
+        spair = man["abliterated"]["engram"]["from"]["Maya-S"]
+        src = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-XS"
+        for n in xs:
+            man["maya"]["quants"]["Maya-XS"]["tables"][n] = mk(src / Path(n).name, Path(n).name.encode() * 3)
+        d = models / "DeepSeek-V4.1-Flash-1017-Maya-GGUF" / "Maya-S"
+        d.mkdir(parents=True)
+        real = maya.read_json
+        full = maya.ds4_gguf_model("maya-s")
+        with patch.object(maya, "read_json", lambda p: man if Path(p) == maya.DS4_GGUF_MANIFEST else real(p)), \
+                patch.object(maya, "say", lambda *a: None), patch.object(maya, "ok", lambda *a: None):
+            plan = maya.ds4_shared_tables("maya-s", d, models, full)
+            self.assertEqual(plan["without"], [Path(n).name for n in spair])
+            self.assertEqual(len(plan["model"]["files"]), len(full["files"]) - 2)
+            e = maya.ds4_share_step(plan)
+            self.assertEqual(e, d.parent / "Engram-Q6_K")
+            for n in xs:
+                self.assertEqual((e / Path(n).name).stat().st_ino, (src / Path(n).name).stat().st_ino)
+            shutil.rmtree(src.parent / "Maya-XS")             # (only the shared copy is left: still found)
+            self.assertIsNotNone(maya.ds4_shared_tables("maya-s", d, models, full))
+            (e / Path(xs[0]).name).write_bytes(b"damaged")
+            self.assertIsNone(maya.ds4_shared_tables("maya-s", d, models, full))
 
     def test_every_quant_takes_maya_tables(self):
         """Every unsloth GGUF names its table-only shard (left out: Maya's Q6_K tables are read), Maya-XS's tables are the
