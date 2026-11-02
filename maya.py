@@ -176,6 +176,23 @@ MODELS = {
                            "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
+    "Maya-XS-IQ1_S": {
+        "about": "Maya-XS, Project Maya's smallest GLM quant: about 73 GB, for PCs with 64 GB of RAM and a 24 GB "
+                 "card at 128K context (KV cache in int8; thinking budget 8192)",
+        "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "6728cf78a5b198a6a6f84b7fb88956a17ec56521",
+        "folder": "Maya-XS", "file": "GLM-5.3-Flash-Maya-XS-IQ1_S-{i:05d}-of-{n:05d}.gguf", "shards": 2,
+        "download_gb": 73.4, "kv": "int8", "context": 131072, "min_ram_gb": 64, "min_vram_gb": 24,
+        "sha256": {
+            "GLM-5.3-Flash-Maya-XS-IQ1_S-00001-of-00002.gguf": "711b427e55fa6da1cbe28933eb00174424f6201f0210b5e4a216d5e33b6222c7",
+            "GLM-5.3-Flash-Maya-XS-IQ1_S-00002-of-00002.gguf": "a9841bc37abef5e3e5bc84e49e753b67f7e249098e8e9bc3dd17415104112885"},
+        "vision": {
+            "repo": "peasantsmith/GLM-5.3-Flash-Maya-GGUF", "revision": "main",
+            "folder": "vision", "mmproj": "mmproj-GLM-5.3-Flash-F16.gguf", "vocab": "GLM-5.3-Flash-vocab.gguf",
+            "download_gb": 1.14,
+            "sha256": {"mmproj-GLM-5.3-Flash-F16.gguf":
+                           "3627575df16bd152db0f3fd7e488d270b33f3a9e6c7fa3b1b8ac381faafde882",
+                       "GLM-5.3-Flash-vocab.gguf":
+                           "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
     "Maya-M": {
         "about": "Maya-M, Project Maya's larger quant: error-feedback-rounded IQ2_S gate/up experts, IQ3_XXS down "
                  "projections (IQ3_S in the most sensitive layers), Q6_K attention, the MTP draft block, made from "
@@ -918,11 +935,14 @@ def hip_reserve_mib(gpus) -> int:
 
 def hip_clang(root: Path) -> Path | None:
     """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), <root>/lib/llvm/bin (TheRock's wheels),
-    <root>/lib64/rocm/llvm/bin (a distribution's own ROCm packages under /usr, e.g. Fedora's), or <root>/bin (AMD's HIP
-    SDK for Windows)."""
+    <root>/lib/llvm/<version>/bin (a distribution's LLVM slot, e.g. Gentoo's), <root>/lib64/rocm/llvm/bin (a
+    distribution's own ROCm packages under /usr, e.g. Fedora's), or <root>/bin (AMD's HIP SDK for Windows)."""
     exe = "clang++.exe" if WIN else "clang++"
+    slots = sorted((root / "lib" / "llvm").glob(f"*/bin/{exe}"),
+                   key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)],
+                   reverse=True) if not WIN else []
     return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe,
-                             root / "lib64" / "rocm" / "llvm" / "bin" / exe, root / "bin" / exe)
+                             root / "lib64" / "rocm" / "llvm" / "bin" / exe, *slots, root / "bin" / exe)
                  if p.exists()), None)
 
 
@@ -1564,6 +1584,20 @@ def choose_context(a, prev_ctx, contexts=CONTEXTS, recommended=DEFAULT_CONTEXT) 
                   [(f"{context_label(c)} tokens", "recommended" if c == recommended else None, None) for c in contexts],
                   contexts.index(default), a.yes)
     return contexts[pick]
+
+
+def recommended_context(choice, pc) -> int:
+    """The context the setup recommends for the model chosen: its own (GLM Maya-XS: 128K) on a PC with the RAM and the
+    card it names (64 GB + 24 GB), else the usual one."""
+    m = MODELS.get(choice[1], {}) if choice and choice[0] == "download" else {}
+    if not m.get("context") or pc.get("backend") == "metal":
+        return DEFAULT_CONTEXT
+    try:
+        vram = max((g.get("vram_gb") or 0 for g in pc.get("gpus") or []), default=0)
+        fits = mem_gb()[0] >= m.get("min_ram_gb", 0) * 0.95 and vram >= m.get("min_vram_gb", 0) * 0.95
+    except Exception:  # noqa: BLE001 - no reading of the PC: the usual context
+        fits = False
+    return m["context"] if fits and m["context"] in CONTEXTS else DEFAULT_CONTEXT
 
 
 def shard_names(m: dict, pattern: str | None = None) -> list:
@@ -3197,7 +3231,7 @@ def glm_sampling(choice: tuple | None, quant: str) -> dict:
         return folder_sampling(choice[1], SAMPLING)
     if choice and choice[0] == "local" and quant not in MODELS:
         return gguf_sampling(choice[1], SAMPLING)
-    return dict(SAMPLING)
+    return dict(Q.QUANT_SAMPLING.get(("glm", Q.tier("glm", quant)), SAMPLING))   # (Maya-XS: its own)
 
 
 def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vision: dict | None,
@@ -3215,6 +3249,8 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
            "tokenizer": str(pack / "tokenizer"), "model_name": MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
            "sampling": glm_sampling(choice, quant), "reasoning_effort": EFFORT,
            "lib_dirs": meta.get("lib_dirs") or [], "port": port}
+    if MODELS.get(quant, {}).get("kv") and not metal:   # a quant with its own KV format (GLM Maya-XS: int8)
+        cfg["args"] += ["--kv", MODELS[quant]["kv"]]
     if metal:                      # ggml reads the GGUF files itself: no pack, no expert cache / prefill / KV streaming
         # the learned expert profile (read at start when it is there, rewritten after each request) lives with the
         # tokenizer, in <model folder>/metal/; a setup again keeps it (keep_args)
@@ -3294,6 +3330,14 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                         "gguf_dir": str(gguf_dir) if gguf_dir else None, "draft": "dflash2" if dflash else "mtp",
                         **({"model_dir": str(choice[1])} if choice and choice[0] == "exl3" else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    if cfg_path.exists():                              # a setup again: the budget the user set stays (GLM's 8192 else)
+        before = read_json(cfg_path)
+        if before.get("thinking_budget") is not None:
+            cfg["thinking_budget"] = before["thinking_budget"]
+            if (before.get("installer") or {}).get("thinking_budget_set"):
+                cfg["installer"]["thinking_budget_set"] = True
+    if Q.thinking_budget_for(cfg) is not None:         # (Maya-XS: 8192; every other quant: nothing written, 32768)
+        cfg["thinking_budget"] = Q.thinking_budget_for(cfg)
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
         tuned = CAL.apply(cfg.get("env") or {}, cal.get("settings") or {})
@@ -4711,8 +4755,6 @@ def set_up(a, prev: dict) -> Path | None:
     pc = check_pc(a)                                   # 1
     metal = pc["backend"] == "metal"
     step(2, "your choices")                            # 2
-    ctx = choose_context(a, prev_ctx)
-    ok(f"context: {ctx} tokens")
     # the models folder: --models-dir, else the one set up before (a config from before the option has its data
     # folder, whose models/ held the downloads), else Maya-data/models next to this folder
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
@@ -4723,6 +4765,8 @@ def set_up(a, prev: dict) -> Path | None:
         ok(f"model: {Q.shown('glm', choice[1])}, in {download_dir(models, choice[1])}")
     else:
         ok(f"model: {choice[1]} (yours)")
+    ctx = choose_context(a, prev_ctx, recommended=recommended_context(choice, pc))
+    ok(f"context: {ctx} tokens")
     draft = choose_draft(a, pc, inst)
     ok("drafting: " + ("a DFlash2 drafter (downloaded with the model)" if draft == "dflash2" else "the MTP block"))
     llama = tools_step(a)                              # 3
@@ -5399,6 +5443,17 @@ def ds4_shared_tables(quant: str, d: Path, models: Path, m: dict) -> dict | None
         return None
     if all(whole(d / n, m["files"][n], m["sha256"][n]) for n in names):
         return None                                      # (its own pair is there already)
+    for other, onames in pairs.items():                  # the other Maya quant's pair (or the shared Engram-Q6_K copy), #776
+        if other == tier:
+            continue
+        q = ds4_tier_files(man.get("maya") or {}, other)
+        full = {Path(n).name: v for n, v in q.items() if Path(n).name in onames}
+        for where in (models / f"{DS4}-Maya-GGUF" / other, d.parent / "Engram-Q6_K"):
+            if len(full) == len(onames) and all(whole(where / n, v[0], v[1]) for n, v in full.items()):
+                return {"model": trimmed(names), "without": names, "src": {n: where / n for n in full},
+                        "folder": d.parent / "Engram-Q6_K",
+                        "what": f"Maya's Q6_K n-gram tables ({other}'s pair of shards, {where}) are read for {tier} too: "
+                                f"its own pair is left out"}
     for ud, v in uds.items():
         table = Path(v["table"]).name
         want = {Path(n).name: x for n, x in v["files"].items()}[table]
