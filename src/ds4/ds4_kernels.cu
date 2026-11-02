@@ -661,53 +661,78 @@ __global__ void __launch_bounds__(kThreads) gemv_f16_rows_kernel(const uint16_t*
 }
 
 // ---------------------------------------------------------------- gemv over F32 weights, a warp a row (the router)
-__global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const float* __restrict__ W, const float* __restrict__ x,
+// float4 c of a router row: F32 weights as they are, or the pack's BF16 widened (exactly: the same four values) - the
+// kernels below sum the same F32 products in the same order either way, so a BF16 router keeps the F32 copy's bits
+// with half its bytes read (DeepSeek-V4.1's router is BF16 in its GGUFs: 3.9 MB a layer instead of 7.9)
+__device__ __forceinline__ float4 gate_ld(const float* __restrict__ w, int c) { return ((const float4*) w)[c]; }
+__device__ __forceinline__ float4 gate_ld(const uint16_t* __restrict__ w, int c) {
+    const uint2 a = ((const uint2*) w)[c];
+    return make_float4(bf16f((uint16_t) a.x), bf16f((uint16_t) (a.x >> 16)), bf16f((uint16_t) a.y),
+                       bf16f((uint16_t) (a.y >> 16)));
+}
+// a decoded token's router row is 5120 values a warp: kGateLd of a lane's float4s are loaded before any is summed
+// (the loads in flight, not one at a time), then summed in the order c = lane + 32 j as before - the same bits.  On
+// AMD 4 (gfx1151: the router 52 -> 21 us with BF16 weights); NVIDIA keeps one at a time, the loop as it was
+#if defined(STRATA_USE_HIP)
+constexpr int kGateLd = 4;
+#else
+constexpr int kGateLd = 1;
+#endif
+template <typename TW>
+__device__ __forceinline__ float gate_row(const TW* __restrict__ w, const float4* __restrict__ xv, int k4, int lane) {
+    float acc = 0.0f;
+    int c = lane;
+    for (; c + 32 * (kGateLd - 1) < k4; c += 32 * kGateLd) {
+        float4 a[kGateLd];
+#pragma unroll
+        for (int u = 0; u < kGateLd; ++u) a[u] = gate_ld(w, c + 32 * u);
+#pragma unroll
+        for (int u = 0; u < kGateLd; ++u) {
+            const float4 b = xv[c + 32 * u];
+            acc = fmaf(a[u].x, b.x, acc);
+            acc = fmaf(a[u].y, b.y, acc);
+            acc = fmaf(a[u].z, b.z, acc);
+            acc = fmaf(a[u].w, b.w, acc);
+        }
+    }
+    for (; c < k4; c += 32) {
+        const float4 a = gate_ld(w, c), b = xv[c];
+        acc = fmaf(a.x, b.x, acc);
+        acc = fmaf(a.y, b.y, acc);
+        acc = fmaf(a.z, b.z, acc);
+        acc = fmaf(a.w, b.w, acc);
+    }
+    return warp_sum(acc);
+}
+template <typename TW>
+__global__ void __launch_bounds__(kThreads) gemv_f32_kernel(const TW* __restrict__ W, const float* __restrict__ x,
                                                             int n, int k, float* __restrict__ y, int ldy) {
     pdl_wait();
     pdl_trigger();
     const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t = blockIdx.y;
     if (row >= n) return;
-    const float4* w = (const float4*) (W + (size_t) row * k);
-    const float4* xv = (const float4*) (x + (size_t) t * k);
-    float acc = 0.0f;
-    for (int c = lane; c < k / 4; c += 32) {
-        const float4 a = w[c], b = xv[c];
-        acc = fmaf(a.x, b.x, acc);
-        acc = fmaf(a.y, b.y, acc);
-        acc = fmaf(a.z, b.z, acc);
-        acc = fmaf(a.w, b.w, acc);
-    }
-    acc = warp_sum(acc);
+    const float acc = gate_row(W + (size_t) row * k, (const float4*) (x + (size_t) t * k), k / 4, lane);
     if (lane == 0) y[(size_t) t * ldy + row] = acc;
 }
 // (DS4_ROUTE_FUSE, a decoded token: T 1) two gemv_f32_kernel launches in one grid - its first cdiv(n0, 8) blocks are
 // W0's rows into y0, the rest W1's into y1 - each row gemv_f32_kernel's code (a warp a row, a lane's float4s c = lane +
 // 32 j in order, fmaf, the warp's sum), so each row's bits.  The old kernel stays as it is: route_fuse_check
 // (ds4_model.cu) compares the two
-__global__ void __launch_bounds__(kThreads) gemv_f32_pair_kernel(const float* __restrict__ W0, int n0,
-                                                                 float* __restrict__ y0, const float* __restrict__ W1,
+template <typename TW>
+__global__ void __launch_bounds__(kThreads) gemv_f32_pair_kernel(const TW* __restrict__ W0, int n0,
+                                                                 float* __restrict__ y0, const TW* __restrict__ W1,
                                                                  int n1, float* __restrict__ y1,
                                                                  const float* __restrict__ x, int k) {
     const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
     const bool second = (int) blockIdx.x >= b0;
-    const float* W = second ? W1 : W0;
+    const TW* W = second ? W1 : W0;
     const int n = second ? n1 : n0;
     float* y = second ? y1 : y0;
     const int row = ((int) blockIdx.x - (second ? b0 : 0)) * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31;
     if (row >= n) return;
-    const float4* w = (const float4*) (W + (size_t) row * k);
-    const float4* xv = (const float4*) x;
-    float acc = 0.0f;
-    for (int c = lane; c < k / 4; c += 32) {
-        const float4 a = w[c], b = xv[c];
-        acc = fmaf(a.x, b.x, acc);
-        acc = fmaf(a.y, b.y, acc);
-        acc = fmaf(a.z, b.z, acc);
-        acc = fmaf(a.w, b.w, acc);
-    }
-    acc = warp_sum(acc);
+    const float acc = gate_row(W + (size_t) row * k, (const float4*) x, k / 4, lane);
     if (lane == 0) y[row] = acc;
 }
 // ... a prompt's rows: a block 8 rows of W for kGemvT tokens, their inputs kGemvK float4s at a time in shared memory.
@@ -716,14 +741,15 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_pair_kernel(const float* __
 // prompt read DeepSeek-V4.1's 7.9 MB router 4096 times a layer)
 constexpr int kGemvT = 8, kGemvK = 128;
 static_assert(kGemvK % 32 == 0, "a lane's float4s in the one-token kernel's order");
-__global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __restrict__ W, const float* __restrict__ x,
+template <typename TW>
+__global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const TW* __restrict__ W, const float* __restrict__ x,
                                                                  int n, int k, int T, float* __restrict__ y, int ldy) {
     pdl_wait();
     pdl_trigger();
     __shared__ float4 xs[kGemvT][kGemvK];
     const int row = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
-    const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
+    const TW* w = W + (size_t) min(row, n - 1) * k;
     float acc[kGemvT];
 #pragma unroll
     for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
@@ -736,7 +762,7 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __
         }
         __syncthreads();
         for (int c = lane; c < nc; c += 32) {
-            const float4 a = w[c0 + c];
+            const float4 a = gate_ld(w, c0 + c);
 #pragma unroll
             for (int t = 0; t < kGemvT; ++t) {
                 const float4 b = xs[t][c];
@@ -759,21 +785,22 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_rows_kernel(const float* __
 // cdiv(n0, 8) blocks are W0's rows into y0, the rest W1's into y1, each block gemv_f32_rows_kernel's code for its
 // kGemvT tokens (blockIdx.y) - so each (token, row) the rows kernel's bits, the one-token kernel's.  The old kernel
 // stays as it is: route_fuse_check (ds4_model.cu) compares the two
-__global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const float* __restrict__ W0, int n0,
+template <typename TW>
+__global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const TW* __restrict__ W0, int n0,
                                                                       float* __restrict__ y0,
-                                                                      const float* __restrict__ W1, int n1,
+                                                                      const TW* __restrict__ W1, int n1,
                                                                       float* __restrict__ y1,
                                                                       const float* __restrict__ x, int k, int T,
                                                                       int ldy) {
     __shared__ float4 xs[kGemvT][kGemvK];
     const int b0 = (n0 + kThreads / 32 - 1) / (kThreads / 32);
     const bool second = (int) blockIdx.x >= b0;
-    const float* W = second ? W1 : W0;
+    const TW* W = second ? W1 : W0;
     const int n = second ? n1 : n0;
     float* y = second ? y1 : y0;
     const int row = ((int) blockIdx.x - (second ? b0 : 0)) * (kThreads / 32) + (threadIdx.x >> 5);
     const int lane = threadIdx.x & 31, t0 = blockIdx.y * kGemvT, nt = min(kGemvT, T - t0), k4 = k / 4;
-    const float4* w = (const float4*) (W + (size_t) min(row, n - 1) * k);
+    const TW* w = W + (size_t) min(row, n - 1) * k;
     float acc[kGemvT];
 #pragma unroll
     for (int t = 0; t < kGemvT; ++t) acc[t] = 0.0f;
@@ -786,7 +813,7 @@ __global__ void __launch_bounds__(kThreads) gemv_f32_pair_rows_kernel(const floa
         }
         __syncthreads();
         for (int c = lane; c < nc; c += 32) {
-            const float4 a = w[c0 + c];
+            const float4 a = gate_ld(w, c0 + c);
 #pragma unroll
             for (int t = 0; t < kGemvT; ++t) {
                 const float4 b = xs[t][c];
@@ -3761,22 +3788,48 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
                    y, ldy);
 }
 
-bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
-                   cudaStream_t s, int T, int ldy) {
+template <typename TW>
+static bool gemv_f32_pair_t(const TW* W0, int n0, float* y0, const TW* W1, int n1, float* y1, const float* x, int k,
+                            cudaStream_t s, int T, int ldy) {
     if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
         return false;
     const int b0 = (int) cdiv(n0, kThreads / 32), b1 = (int) cdiv(n1, kThreads / 32);
-    if (T == 1) gemv_f32_pair_kernel<<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
+    if (T == 1) gemv_f32_pair_kernel<TW><<<b0 + b1, kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k);
     else   // (=2, a window's rows)
-        gemv_f32_pair_rows_kernel<<<dim3(b0 + b1, cdiv(T, kGemvT)), kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k, T,
-                                                                                      ldy);
+        gemv_f32_pair_rows_kernel<TW><<<dim3(b0 + b1, cdiv(T, kGemvT)), kThreads, 0, s>>>(W0, n0, y0, W1, n1, y1, x, k,
+                                                                                          T, ldy);
     return cudaGetLastError() == cudaSuccess;
 }
-void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
+template <typename TW>
+static void gemv_f32_t(const TW* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
     if (T == 1 || (T > 0 && std::getenv("DS4_ROUTER_ROWS") != nullptr && std::atoi(std::getenv("DS4_ROUTER_ROWS")) == 0))
-        pdl_launch(gemv_f32_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
+        pdl_launch(gemv_f32_kernel<TW>, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, y, ldy);
     else if (T > 1)   // (DS4_ROUTER_ROWS=0: a launch a token, as before - the same bits)
-        pdl_launch(gemv_f32_rows_kernel, dim3(cdiv(n, kThreads / 32), cdiv(T, kGemvT)), kThreads, 0, s, W, x, n, k, T, y, ldy);
+        pdl_launch(gemv_f32_rows_kernel<TW>, dim3(cdiv(n, kThreads / 32), cdiv(T, kGemvT)), kThreads, 0, s, W, x, n, k,
+                   T, y, ldy);
+}
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
+                   cudaStream_t s, int T, int ldy) {
+    return gemv_f32_pair_t(W0, n0, y0, W1, n1, y1, x, k, s, T, ldy);
+}
+void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
+    gemv_f32_t(W, x, n, k, T, y, ldy, s);
+}
+void gemv_f32(GateW W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s) {
+    if (W.h != nullptr) gemv_f32_t(W.h, x, n, k, T, y, ldy, s);
+    else gemv_f32_t(W.f, x, n, k, T, y, ldy, s);
+}
+bool gemv_f32_pair(GateW W0, int n0, float* y0, GateW W1, int n1, float* y1, const float* x, int k, cudaStream_t s,
+                   int T, int ldy) {
+    if ((W0.h != nullptr) == (W1.h != nullptr))
+        return W0.h != nullptr ? gemv_f32_pair_t(W0.h, n0, y0, W1.h, n1, y1, x, k, s, T, ldy)
+                               : gemv_f32_pair_t(W0.f, n0, y0, W1.f, n1, y1, x, k, s, T, ldy);
+    // (one router BF16, the other F32: each its own launch - a row's code and so its bits are the pair's)
+    if (n0 < 1 || n1 < 1 || k < 4 || k % 4 != 0 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1)))
+        return false;
+    gemv_f32(W0, x, n0, k, T, y0, T > 1 ? ldy : n0, s);
+    gemv_f32(W1, x, n1, k, T, y1, T > 1 ? ldy : n1, s);
+    return cudaGetLastError() == cudaSuccess;
 }
 
 void route(const float* logits, const float* bias, int n, int k, int T, float route_scale, int* idx, float* w,

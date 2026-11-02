@@ -850,7 +850,8 @@ struct Layer {
           *hcf_fn = nullptr, *hcf_scale = nullptr, *hcf_base = nullptr, *gate_bias = nullptr, *eg_w = nullptr,
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
-    float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
+    GateW gate_w;   // the router's weights: F32, or the pack's BF16 as it is (DeepSeek's inference computes the gate in
+                    // F32: the kernels widen BF16 exactly, the same sums - gate())
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
     // a run of chunks' states on the way (feed_mark, feed_marks): the ring and the partial group as they were before a
@@ -2835,6 +2836,41 @@ struct Model::Impl {
         CK(cudaMemcpy(p, v.data(), n * 4, cudaMemcpyHostToDevice));
         return true;
     }
+    // the router's weights (gate_w): DS4_ROUTER_BF16=1 (AMD's default) - a BF16 tensor's rows go to the device as they
+    // are, half an F32 copy's bytes, read every token twice a layer (the gate and the next layer's guesses), with the
+    // same bits (gemv_f32 widens each value exactly; DS4_ROUTER_CHECK=1 compares them at load) - another dtype as F32
+    // (f32()).  0 (NVIDIA's default): the F32 copy for every dtype, as before
+    bool gate(Dev& d, const std::string& name, GateW& g, std::string& err, size_t* acct, size_t want) {
+#if defined(STRATA_USE_HIP)
+        constexpr bool kBf16Default = true;
+#else
+        constexpr bool kBf16Default = false;
+#endif
+        static const bool keep_f32 = ds4_env("DS4_ROUTER_BF16") != nullptr ? std::atoi(ds4_env("DS4_ROUTER_BF16")) == 0
+                                                                            : !kBf16Default;
+        const Tensor* t = pk.get(name);
+        if (keep_f32 || t == nullptr || t->dtype != "BF16") {
+            float* p = nullptr;
+            if (!f32(d, name, p, err, acct, want)) return false;
+            g.f = p;
+            return true;
+        }
+        if (t->bytes != want * 2) {
+            err = name + ": " + std::to_string(t->bytes / 2) + " values, expected " + std::to_string(want);
+            return false;
+        }
+        std::vector<uint8_t> raw(t->bytes);
+        if (!pk.read(*t, raw.data())) {
+            err = name + ": read failed";
+            return false;
+        }
+        uint16_t* p = nullptr;
+        if (!dalloc(d, p, want, err, acct)) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(p, raw.data(), t->bytes, cudaMemcpyHostToDevice));
+        g.h = p;
+        return true;
+    }
     bool f16raw(Dev& d, const std::string& name, uint16_t*& p, std::string& err, size_t* acct) {
         const Tensor* t = pk.get(name);
         if (t != nullptr && (t->dtype == "F32" || t->dtype == "BF16" || t->dtype == "Q8_0")) {   // (a GGUF's)
@@ -4615,6 +4651,8 @@ struct Model::Impl {
             if (hc_fuse_win && !(hc_fuse_check(err, 1, true) && hc_fuse_check(err, kWin, true)))   // (=2: a window too)
                 return false;
             if (route_fuse && !route_fuse_check(err)) return false;   // (no request yet)
+            if (ds4_env("DS4_ROUTER_CHECK") != nullptr && std::atoi(ds4_env("DS4_ROUTER_CHECK")) != 0 && !router_check(err))
+                return false;   // (MAYA_DS4_ROUTER_CHECK=1: at load, no request yet)
             if ((decode_trim & 3) && !trim_q8_check(err)) return false;   // (DS4_DECODE_TRIM: no request yet)
             if ((decode_trim & 12) && !trim_copy_check(err)) return false;
             if (route_fuse_win && !(route_fuse_check(err, 3) && route_fuse_check(err, kWin)))   // (=2: windows too)
@@ -6288,7 +6326,7 @@ struct Model::Impl {
                       f32(d, P + "hc_attn_base", l.hca_base, err, acct) && f32(d, P + "hc_ffn_fn", l.hcf_fn, err, acct) &&
                       f32(d, P + "hc_ffn_scale", l.hcf_scale, err, acct) &&
                       f32(d, P + "hc_ffn_base", l.hcf_base, err, acct) &&
-                      f32(d, P + "ffn.gate.weight", l.gate_w, err, acct, (size_t) l.n_exp * g.dim) &&
+                      gate(d, P + "ffn.gate.weight", l.gate_w, err, acct, (size_t) l.n_exp * g.dim) &&
                       f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
@@ -12603,6 +12641,119 @@ struct Model::Impl {
         std::fflush(stderr);
         std::fflush(stdout);
         std::_Exit(kExitUnknown);
+    }
+    // DS4_ROUTER_CHECK=1 (at load): each BF16 router (gate()) against the F32 copy it replaces and against the host's
+    // replay of the old one-token kernel's sums (a lane's fmaf chain over float4s c = lane + 32 j, then the warp's
+    // xor-16 .. 1 adds) - 1, 3 and kRows rows (the token, a window, a chunk's rows kernel), and the pair kernel against
+    // the single one; any bit off fails the load
+    bool router_check(std::string& err) {
+        constexpr int kRows = 40;
+        const int D = g.dim;
+        uint32_t st = 0x2545f491u;
+        auto rnd = [&]() {
+            st = st * 1664525u + 1013904223u;
+            return (float) (int) (st % 2001u - 1000u) / 250.0f;   // -4 .. 4
+        };
+        int layers = 0;
+        const Layer* prev = nullptr;
+        for (const Layer& l0 : L)
+            for (int mi = 0; mi < std::max(1, l0.nm); ++mi) {
+                const Layer& l = member(l0, mi);
+                if (l.gate_w.h == nullptr) continue;
+                auto fail_at = [&](const std::string& why) {
+                    err = "router check, layer " + std::to_string(l.il) + ": " + why;
+                    std::fprintf(stderr, "ds4: router check FAILED: %s\n", err.c_str());
+                    return false;
+                };
+                const int n = l.n_exp;
+                const size_t nw = (size_t) n * D;
+                CK(cudaSetDevice(devs[(size_t) l.dev].id));
+                std::vector<uint16_t> hw(nw);
+                std::vector<float> fw(nw), hx((size_t) kRows * D), y16((size_t) kRows * 1024), y32(y16.size());
+                CK(cudaMemcpy(hw.data(), l.gate_w.h, nw * 2, cudaMemcpyDeviceToHost));
+                for (size_t i = 0; i < nw; ++i) fw[i] = bf16_to_f32(hw[i]);
+                for (auto& v : hx) v = rnd();
+                float *dw = nullptr, *dx = nullptr, *dy = nullptr;
+                if (cudaMalloc((void**) &dw, nw * 4) != cudaSuccess || cudaMalloc((void**) &dx, hx.size() * 4) != cudaSuccess ||
+                    cudaMalloc((void**) &dy, 2 * y16.size() * 4) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    if (dw) cudaFree(dw);
+                    if (dx) cudaFree(dx);
+                    return fail_at("its buffers");
+                }
+                CK(cudaMemcpy(dw, fw.data(), nw * 4, cudaMemcpyHostToDevice));
+                CK(cudaMemcpy(dx, hx.data(), hx.size() * 4, cudaMemcpyHostToDevice));
+                bool ok = true;
+                std::string why;
+                for (const int T : {1, 3, kRows}) {
+                    CK(cudaMemset(dy, 0xff, 2 * y16.size() * 4));
+                    gemv_f32(l.gate_w, dx, n, D, T, dy, 1024, 0);
+                    gemv_f32((const float*) dw, dx, n, D, T, dy + y16.size(), 1024, 0);
+                    CK(cudaDeviceSynchronize());
+                    CK(cudaMemcpy(y16.data(), dy, y16.size() * 4, cudaMemcpyDeviceToHost));
+                    CK(cudaMemcpy(y32.data(), dy + y16.size(), y32.size() * 4, cudaMemcpyDeviceToHost));
+                    for (int t = 0; t < T && ok; ++t)
+                        for (int r = 0; r < n && ok; ++r) {
+                            const size_t o = (size_t) t * 1024 + r;
+                            if (std::memcmp(&y16[o], &y32[o], 4) != 0) {
+                                ok = false;
+                                why = std::to_string(T) + " rows: row " + std::to_string(r) + " of token " +
+                                      std::to_string(t) + " BF16 " + std::to_string(y16[o]) + ", F32 " + std::to_string(y32[o]);
+                            }
+                        }
+                    // the old kernel's sums on the host: the first token, every row
+                    for (int r = 0; r < n && ok; ++r) {
+                        float v[32];
+                        for (int lane = 0; lane < 32; ++lane) {
+                            float acc = 0.0f;
+                            for (int c = lane; c < D / 4; c += 32)
+                                for (int e = 0; e < 4; ++e)
+                                    acc = std::fmaf(fw[(size_t) r * D + 4 * c + e], hx[(size_t) 4 * c + e], acc);
+                            v[lane] = acc;
+                        }
+                        for (int o = 16; o > 0; o >>= 1) {
+                            float w[32];
+                            for (int lane = 0; lane < 32; ++lane) w[lane] = v[lane] + v[lane ^ o];
+                            std::memcpy(v, w, sizeof v);
+                        }
+                        if (std::memcmp(&v[0], &y16[r], 4) != 0) {
+                            ok = false;
+                            why = std::to_string(T) + " rows: row " + std::to_string(r) + " " + std::to_string(y16[r]) +
+                                  ", the old kernel's sums " + std::to_string(v[0]);
+                        }
+                    }
+                }
+                // the pair kernel (DS4_ROUTE_FUSE): this router and the one before it on this device, against singles
+                if (ok && prev != nullptr && prev->dev == l.dev && prev->gate_w.h != nullptr && prev->n_exp <= 1024)
+                    for (const int T : {1, 3}) {
+                        CK(cudaMemset(dy, 0xff, 2 * y16.size() * 4));
+                        if (!gemv_f32_pair(prev->gate_w, prev->n_exp, dy, l.gate_w, n, dy + T * 1024, dx, D, 0, T, 1024)) {
+                            ok = false;
+                            why = "the pair kernel's launch";
+                            break;
+                        }
+                        gemv_f32(prev->gate_w, dx, prev->n_exp, D, T, dy + y16.size(), 1024, 0);
+                        gemv_f32(l.gate_w, dx, n, D, T, dy + y16.size() + T * 1024, 1024, 0);
+                        CK(cudaDeviceSynchronize());
+                        CK(cudaMemcpy(y16.data(), dy, y16.size() * 4, cudaMemcpyDeviceToHost));
+                        CK(cudaMemcpy(y32.data(), dy + y16.size(), y32.size() * 4, cudaMemcpyDeviceToHost));
+                        for (int t = 0; t < 2 * T && ok; ++t)
+                            for (int r = 0; r < (t < T ? prev->n_exp : n) && ok; ++r)
+                                if (std::memcmp(&y16[(size_t) t * 1024 + r], &y32[(size_t) t * 1024 + r], 4) != 0) {
+                                    ok = false;
+                                    why = "the pair kernel (" + std::to_string(T) + " rows) against the single one";
+                                }
+                    }
+                cudaFree(dw);
+                cudaFree(dx);
+                cudaFree(dy);
+                if (!ok) return fail_at(why);
+                prev = &l;
+                ++layers;
+            }
+        std::fprintf(stderr, "ds4: router check: %d BF16 routers, the F32 copy's bits and the old kernel's (1, 3, %d rows; "
+                     "the pair kernel)\n", layers, kRows);
+        return true;
     }
     bool route_fuse_check(std::string& err, int T = 1) {
         const int D = g.dim;
