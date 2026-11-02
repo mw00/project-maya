@@ -885,6 +885,9 @@ class StrataEngine:
                 break
         loading.set()
         if self.max_context <= 0:
+            # its output closed: it is gone, even before the OS says so (as _pump) - alive() is False at once, not
+            # only after the process is reaped (a busy CI runner saw it alive right after a failed restart)
+            self.ended = True
             raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
