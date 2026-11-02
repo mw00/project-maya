@@ -104,11 +104,30 @@ struct Spec {
     float p_cum = 0.0f;
 };
 
+// a request's restore points (GEN keys marks=/shared=, the DS4 engine's spellings): positions in the prompt
+// where prefill should record a reusable state, shared= the one another conversation may resume from
+struct Restore {
+    std::vector<int64_t> marks;
+    int64_t shared = -1;
+};
+
 struct Server {
     GlmMetal& model;
     Input in;
     std::vector<int32_t> cached;      // the previous prompt less its last token: what the snapshot holds
     uint64_t cached_img = 0;          // the images inside it (positions and rows, hashed)
+    // cross-request restore points (P5): entries an earlier request recorded at its marks=/shared= points.
+    // An entry certifies "the first toks.size() positions hold this prefix and slot holds the recurrent
+    // state there"; run() keeps that true by dropping every entry deeper than a request's reuse depth
+    // before that request's prefill overwrites from there, and by clearing the table wherever it resets.
+    struct PrefixEntry {
+        std::vector<int32_t> toks;    // the prefix (its size is the position)
+        uint64_t img = 0;             // the images inside it, hashed as cached_img
+        int slot = -1;                // the engine snapshot slot holding the state at toks.size()
+        bool shared = false;          // recorded from a shared= point: the eviction victim of last resort
+    };
+    std::vector<PrefixEntry> entries;
+    static constexpr size_t kMaxEntries = 8;
     const int loop_w_think = env_int("MAYA_GLM_LOOP_THINK", 256);
     const int loop_w_answer = env_int("MAYA_GLM_LOOP_ANSWER", 1024);
     int chunk = 512;                            // prompt tokens a forward() takes: the engine's slice (serve())
@@ -136,6 +155,55 @@ struct Server {
         std::fflush(stdout);
     }
 
+    // the lowest snapshot slot no entry holds (-1: all of 0..kMaxEntries+7 taken - cannot happen while
+    // entries.size() <= kMaxEntries, kept as a guard)
+    int alloc_slot() {
+        for (int s = 0; s < (int) kMaxEntries + 8; ++s) {
+            bool used = false;
+            for (const PrefixEntry& e : entries) used = used || e.slot == s;
+            if (!used) return s;
+        }
+        return -1;
+    }
+
+    void drop_entry(size_t i) {
+        model.snapshot_drop_slot(entries[i].slot);
+        entries.erase(entries.begin() + (long) i);
+    }
+
+    // every entry dies (the engine's state was reset or discarded: the slots no longer certify anything)
+    void clear_entries() {
+        for (const PrefixEntry& e : entries) model.snapshot_drop_slot(e.slot);
+        entries.clear();
+    }
+
+    // capture the state at position p (the prompt's first p tokens, just prefilled) as an entry
+    void record_point(const std::vector<int32_t>& prompt, int64_t p, bool is_shared) {
+        for (size_t i = 0; i < entries.size();) {   // one entry per depth: this request's prefix replaces it
+            if ((int64_t) entries[i].toks.size() == p) drop_entry(i);
+            else ++i;
+        }
+        if (entries.size() >= kMaxEntries) {   // full: the deepest non-shared entry goes (the root stays)
+            long victim = -1;
+            for (size_t i = 0; i < entries.size(); ++i)
+                if (!entries[i].shared && (victim < 0 || entries[i].toks.size() >= entries[(size_t) victim].toks.size()))
+                    victim = (long) i;
+            if (victim < 0)   // every entry is a shared root: the deepest goes
+                for (size_t i = 0; i < entries.size(); ++i)
+                    if (victim < 0 || entries[i].toks.size() >= entries[(size_t) victim].toks.size())
+                        victim = (long) i;
+            if (victim >= 0) drop_entry((size_t) victim);
+        }
+        const int slot = alloc_slot();
+        if (slot < 0 || !model.snapshot_save_slot(slot)) return;   // no slot: the point is skipped, not fatal
+        PrefixEntry e;
+        e.toks.assign(prompt.begin(), prompt.begin() + (long) p);
+        e.img = img_prefix_hash(p);
+        e.slot = slot;
+        e.shared = is_shared;
+        entries.push_back(std::move(e));
+    }
+
     void gen(const std::string& line) {
         std::istringstream ss(line);
         std::string cmd, tok;
@@ -149,6 +217,7 @@ struct Server {
         Spec spec;
         int pen_n = 0;
         float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
+        Restore restore;
         std::string ids_s, bias_err, emb_path;
         const int n_vocab = model.geometry().n_vocab;
         while (ss >> tok) {
@@ -173,6 +242,22 @@ struct Server {
             else if (k == "spec_min_p") spec.p_min = (float) std::atof(v.c_str());
             else if (k == "spec_n_min") spec.n_min = std::atoi(v.c_str());
             else if (k == "spec_cum") spec.p_cum = (float) std::atof(v.c_str());
+            else if (k == "marks") {   // restore points to record during prefill: <pos>,<pos>,...
+                for (size_t at = 0; at < v.size();) {
+                    const size_t end = v.find(',', at);
+                    const std::string one = v.substr(at, end == std::string::npos ? end : end - at);
+                    char* p = nullptr;
+                    const long long pos = std::strtoll(one.c_str(), &p, 10);
+                    if (p != one.c_str() && *p == '\0' && pos > 0) restore.marks.push_back(pos);
+                    if (end == std::string::npos) break;
+                    at = end + 1;
+                }
+            }
+            else if (k == "shared") {   // the restore point another conversation may resume from
+                char* p = nullptr;
+                const long long pos = std::strtoll(v.c_str(), &p, 10);
+                if (p != v.c_str() && *p == '\0' && pos > 0) restore.shared = pos;
+            }
             else if (k == "penalty_last_n") pen_n = std::atoi(v.c_str());
             else if (k == "penalty_repeat") pen_repeat = std::strtof(v.c_str(), nullptr);
             else if (k == "penalty_freq") pen_freq = std::strtof(v.c_str(), nullptr);
@@ -269,11 +354,11 @@ struct Server {
             return err("the prompt (" + std::to_string(prompt.size()) + " tokens) fills the context (" +
                        std::to_string(model.max_context()) + ")");
         spec.req = spec_req;
-        run(prompt, max_new, sp, think_budget, think_end, spec);
+        run(prompt, max_new, sp, think_budget, think_end, spec, restore);
     }
 
     void run(const std::vector<int32_t>& prompt, int64_t max_new, Sampling sp, int64_t think_budget,
-             int32_t think_end, const Spec& spec) {
+             int32_t think_end, const Spec& spec, const Restore& restore) {
         const int spec_req = spec.req;
         const int n_vocab = model.geometry().n_vocab;
         std::string e;
@@ -288,9 +373,32 @@ struct Server {
             std::equal(cached.begin(), cached.end(), prompt.begin()) && cached_img == img_prefix_hash(snap) &&
             model.snapshot_restore())
             reuse = (size_t) snap;
-        else
-            model.reset();
+        else {
+            // a restore point an earlier request recorded: this prompt resumes from the deepest one it
+            // starts with (a matching entry is never deeper than a matching snapshot - the invalidation
+            // below saw to that - so the snapshot above keeps its first claim)
+            int best = -1;
+            for (size_t i = 0; i < entries.size(); ++i) {
+                const PrefixEntry& e = entries[i];
+                if (e.toks.size() <= n - 1 && (best < 0 || e.toks.size() > entries[(size_t) best].toks.size()) &&
+                    std::equal(e.toks.begin(), e.toks.end(), prompt.begin()) &&
+                    e.img == img_prefix_hash((int64_t) e.toks.size()) &&
+                    model.snapshot_position_slot(e.slot) == (int64_t) e.toks.size())
+                    best = (int) i;
+            }
+            if (best >= 0 && model.snapshot_restore_slot(entries[(size_t) best].slot))
+                reuse = entries[(size_t) best].toks.size();
+            else
+                model.reset();
+        }
         cached.clear();
+        // this request writes every position from reuse on: entries standing deeper are overwritten by
+        // its prefill, so they die here unless the prefill records them again; entries at or above the
+        // reuse depth keep the state they certify
+        for (size_t i = 0; i < entries.size();) {
+            if (entries[i].toks.size() > reuse) drop_entry(i);
+            else ++i;
+        }
 
         std::vector<float> logits;
         auto pp = [&](size_t read) {
@@ -298,18 +406,45 @@ struct Server {
             std::printf("PP %zu %zu %.1f %.1f %zu\n", read, n, ms, ms > 0 ? (read - reuse) * 1000.0 / ms : 0.0, reuse);
             std::fflush(stdout);
         };
-        for (size_t at = reuse; at + 1 < n; at += (size_t) chunk) {   // every prompt token but the last
+        // the restore points to record while prefilling: this request's shared= and marks= inside the span
+        // prefill actually writes (a point at or below the reuse depth is already behind us; the snapshot
+        // itself stands at the last one, n - 1)
+        std::vector<std::pair<int64_t, bool>> points;   // (position, is_shared), ascending, unique
+        if (restore.shared > (int64_t) reuse && restore.shared <= (int64_t) n - 1)
+            points.emplace_back(restore.shared, true);
+        for (const int64_t p : restore.marks)
+            if (p > (int64_t) reuse && p <= (int64_t) n - 1) points.emplace_back(p, false);
+        std::stable_sort(points.begin(), points.end(),
+                         [](const std::pair<int64_t, bool>& a, const std::pair<int64_t, bool>& b) {
+                             return a.first < b.first;
+                         });
+        points.erase(std::unique(points.begin(), points.end(),
+                                 [](const std::pair<int64_t, bool>& a, const std::pair<int64_t, bool>& b) {
+                                     return a.first == b.first;
+                                 }),
+                     points.end());
+        size_t next_pt = 0;
+        for (size_t at = reuse; at + 1 < n;) {   // every prompt token but the last
             if (in.stop.load()) {
                 finish = "cancel";
                 break;
             }
-            const size_t k = std::min((size_t) chunk, n - 1 - at);
+            size_t k = std::min((size_t) chunk, n - 1 - at);
+            if (next_pt < points.size() && points[next_pt].first > (int64_t) at &&
+                points[next_pt].first < (int64_t) (at + k))
+                k = (size_t) (points[next_pt].first - (int64_t) at);   // land exactly on the point
             if (!model.forward(std::vector<int32_t>(prompt.begin() + (long) at, prompt.begin() + (long) (at + k)),
                                logits, e)) {
                 model.reset();
+                clear_entries();
                 return err(e);
             }
             pp(at + k);
+            at += k;
+            if (next_pt < points.size() && points[next_pt].first == (int64_t) at) {
+                record_point(prompt, points[next_pt].first, points[next_pt].second);
+                ++next_pt;
+            }
         }
         int64_t produced = 0;
         auto t1 = std::chrono::steady_clock::now();
@@ -320,12 +455,14 @@ struct Server {
             if (!model.forward({prompt.back()}, logits, e)) {
                 model.reset();
                 cached.clear();
+                clear_entries();
                 return err(e);
             }
             pp(n);
             t1 = std::chrono::steady_clock::now();
         } else {
             model.reset();   // a cut prompt leaves no state worth keeping
+            clear_entries();
         }
 
         std::vector<int32_t> pen_hist;
@@ -417,6 +554,9 @@ struct Server {
             }
             return produced < max_new;
         };
+        long long d_acc = 0, d_off = 0;   // this request's drafts kept / offered (the DONE line's draft fields)
+        const long long mtp_acc0 = mtp_len ? mtp_len->drafts_accepted() : 0;   // (MTP tallies on its DraftLength)
+        const long long mtp_off0 = mtp_len ? mtp_len->drafts_offered() : 0;
         if (std::strcmp(finish, "cancel") != 0) {
             // one token: the plain pick of these logits (a forced token wins), the counter one draw on
             bool bad = false;
@@ -439,6 +579,7 @@ struct Server {
                 if (bad) {
                     model.reset();
                     cached.clear();
+                    clear_entries();
                     return err("non-finite logits");
                 }
                 if (on_token(y)) {
@@ -451,10 +592,12 @@ struct Server {
                         const Drafter df = [&](int32_t tok, int64_t, int n, std::vector<int32_t>& d, std::string& er) {
                             return model.dflash_draft(tok, n, spec.p_min, spec.n_min, spec.p_cum, d, er);
                         };
-                        const bool ok = decode_spec(model, y, n_max, df, nullptr, hk, e);
+                        const bool ok = decode_spec(model, y, n_max, df,
+                                                    [&](int n, int acc, double) { d_off += n; d_acc += acc; }, hk, e);
                         if (!ok || bad) {
                             model.reset();
                             cached.clear();
+                            clear_entries();
                             return err(bad ? "non-finite logits" : e);
                         }
                     } else if (mtp && spec_req != 1) {   // the NextN block drafts, a verify window checks (same tokens)
@@ -462,6 +605,7 @@ struct Server {
                         if (!ok || bad) {
                             model.reset();
                             cached.clear();
+                            clear_entries();
                             return err(bad ? "non-finite logits" : e);
                         }
                     } else {
@@ -469,12 +613,14 @@ struct Server {
                             if (!model.forward({t}, logits, e)) {
                                 model.reset();
                                 cached.clear();
+                                clear_entries();
                                 return err(e);
                             }
                             t = pick_one(logits.data());
                             if (bad) {
                                 model.reset();
                                 cached.clear();
+                                clear_entries();
                                 return err("non-finite logits");
                             }
                             if (!on_token(t)) break;
@@ -495,9 +641,11 @@ struct Server {
             cached.insert(cached.end(), emitted.begin(), emitted.end() - 1);
             cached_img = img_prefix_hash((int64_t) cached.size());
         }
-        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0\n", (long long) produced, n,
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", (long long) produced, n,
                     std::chrono::duration<double, std::milli>(t1 - t0).count(),
-                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish, reuse);
+                    std::chrono::duration<double, std::milli>(t2 - t1).count(), finish,
+                    d_acc + (mtp_len ? mtp_len->drafts_accepted() - mtp_acc0 : 0),
+                    d_off + (mtp_len ? mtp_len->drafts_offered() - mtp_off0 : 0), reuse);
         std::fflush(stdout);
         if (const size_t grown = model.grow_pool()) {   // memory freed since the start: more experts stay resident
             std::fprintf(stderr, "maya-metal: the expert pool grew by %.1f GB to %.1f GB\n", grown / 1e9,
@@ -552,11 +700,13 @@ int serve(GlmMetal& model, const std::vector<std::string>& args) {
                     "block's memory for the expert pool\n");
     if (s.mtp) s.mtp_len = std::make_unique<DraftLength>(mtp_draft_cap());
     const auto& st = model.stats();
-    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=%zu\n",
+    std::printf("INFO engine=%s context=%lld logit_bias=1 kv_ctx=%lld kv_gb=%.3f vram_gb=%.1f vram_slots=%zu "
+                "mtp=%d dflash=%d\n",
                 MAYA_VERSION, (long long) model.max_context(), (long long) model.max_context(), st.state_bytes / 1e9,
-                (st.dense_bytes + st.pool_bytes + st.state_bytes) / 1e9, st.pool_slots);
+                (st.dense_bytes + st.pool_bytes + st.state_bytes) / 1e9, st.pool_slots, s.mtp ? 1 : 0,
+                model.has_dflash() ? 1 : 0);
     std::printf("NOTE %s\n", model.describe().c_str());
-    std::printf("READY %lld stop pause\n", (long long) model.max_context());
+    std::printf("READY %lld stop pause restore\n", (long long) model.max_context());
     std::fflush(stdout);
     std::thread reader([&] { s.in.run(); });
     reader.detach();   // blocked in getline until stdin closes; the process exits around it

@@ -45,15 +45,20 @@ else()
   set(_maya_llamacpp_dir ${maya_llamacpp_SOURCE_DIR})
 endif()
 # ggml is built from a copy in the build tree with third_party/ggml/metal-sparse-mla.patch applied (ggml_sparse_mla:
-# the DSA layers' sparse attention as one Metal kernel; the checkout stays untouched).  The copy is redone when the
-# checkout, its ggml.h or the patch changes.  A checkout the patch does not apply to (or no git) builds as it is, and the
-# engine keeps its gather + mul_mm attention.
+# the DSA layers' sparse attention as one Metal kernel; the checkout stays untouched) and, on top of it,
+# third_party/ggml/metal-tensor-fa.patch (the tensor-core flash-attention kernels: upstream llama.cpp PR #29570 +
+# #30491 ported to the pinned ggml).  The copy is redone when the checkout, its ggml.h or either patch changes.
+# A checkout the sparse patch does not apply to (or no git) builds as it is, and the engine keeps its gather +
+# mul_mm attention; a tensor patch that does not apply on top of the sparse one leaves the sparse-patched copy
+# building without the tensor kernels, with the same kind of warning.
 set(_maya_gg ${_maya_llamacpp_dir}/ggml)
 set(_maya_mla_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/metal-sparse-mla.patch)
+set(_maya_fa_patch ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml/metal-tensor-fa.patch)
 set(_maya_mla_copy ${CMAKE_BINARY_DIR}/maya-ggml)
 file(SHA256 ${_maya_mla_patch} _maya_mla_patch_sha)
+file(SHA256 ${_maya_fa_patch} _maya_fa_patch_sha)
 file(SHA256 ${_maya_gg}/include/ggml.h _maya_mla_src_sha)
-set(_maya_mla_stamp "${_maya_gg}|${_maya_mla_src_sha}|${_maya_mla_patch_sha}")
+set(_maya_mla_stamp "${_maya_gg}|${_maya_mla_src_sha}|${_maya_mla_patch_sha}|${_maya_fa_patch_sha}")
 set(_maya_mla_done "")
 if(EXISTS ${_maya_mla_copy}/.maya-stamp)
   file(READ ${_maya_mla_copy}/.maya-stamp _maya_mla_done)
@@ -74,6 +79,14 @@ if(NOT _maya_mla_done STREQUAL _maya_mla_stamp)
                             ${GIT_EXECUTABLE} apply --ignore-whitespace ${_maya_mla_patch}
                     WORKING_DIRECTORY ${_maya_mla_copy} RESULT_VARIABLE _maya_mla_rc ERROR_VARIABLE _maya_mla_err)
     if(_maya_mla_rc EQUAL 0)
+      execute_process(COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}
+                              ${GIT_EXECUTABLE} apply --ignore-whitespace ${_maya_fa_patch}
+                      WORKING_DIRECTORY ${_maya_mla_copy} RESULT_VARIABLE _maya_fa_rc ERROR_VARIABLE _maya_fa_err)
+      if(NOT _maya_fa_rc EQUAL 0)
+        message(WARNING "third_party/ggml/metal-tensor-fa.patch (made for the pinned ggml) does not apply on top of "
+                        "the sparse-mla patch in ${_maya_mla_copy} - ggml is built without the tensor flash-attention "
+                        "kernels:\n${_maya_fa_err}")
+      endif()
       file(WRITE ${_maya_mla_copy}/.maya-stamp "${_maya_mla_stamp}")
     else()
       message(WARNING "third_party/ggml/metal-sparse-mla.patch (made for the pinned ggml) does not apply to ${_maya_gg} - "
@@ -83,7 +96,7 @@ if(NOT _maya_mla_done STREQUAL _maya_mla_stamp)
     endif()
   endif()
 endif()
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_maya_mla_patch} ${_maya_gg}/include/ggml.h)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_maya_mla_patch} ${_maya_fa_patch} ${_maya_gg}/include/ggml.h)
 if(_maya_mla)
   add_subdirectory(${_maya_mla_copy} ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
 else()
@@ -123,6 +136,9 @@ if(MAYA_METAL_TESTS)
   if(MAYA_SERVE_PYTHON3)
     add_test(NAME metal_serve_test
              COMMAND ${MAYA_SERVE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_metal_serve.py $<TARGET_FILE:maya-metal>
+                     ${CMAKE_CURRENT_SOURCE_DIR}/data/glm5-synth.gguf)
+    add_test(NAME metal_serve_restore_test
+             COMMAND ${MAYA_SERVE_PYTHON3} ${CMAKE_CURRENT_SOURCE_DIR}/tools/test_metal_serve_restore.py $<TARGET_FILE:maya-metal>
                      ${CMAKE_CURRENT_SOURCE_DIR}/data/glm5-synth.gguf)
   endif()
   add_test(NAME metal_model_test COMMAND metal_model_test small)
@@ -169,6 +185,12 @@ if(MAYA_METAL_TESTS)
       add_test(NAME metal_mm3_dspark_test
                COMMAND metal_mm3_dspark_test ${CMAKE_CURRENT_BINARY_DIR}/dspark-fixture)
       set_tests_properties(metal_mm3_dspark_test PROPERTIES FIXTURES_REQUIRED metal_mm3_dspark)
+    add_executable(metal_mm3_divergence_test src/metal/metal_mm3_divergence_test.cpp)
+    target_link_libraries(metal_mm3_divergence_test PRIVATE maya_metal)
+    add_test(NAME metal_mm3_divergence_test
+             COMMAND metal_mm3_divergence_test ${CMAKE_CURRENT_BINARY_DIR}/minimax-m3-synth.gguf
+                     ${CMAKE_CURRENT_BINARY_DIR}/dspark-fixture/dspark)
+    set_tests_properties(metal_mm3_divergence_test PROPERTIES FIXTURES_REQUIRED "metal_mm3_gguf;metal_mm3_dspark")
     endif()
   endif()
   # the same gates on ggml-cpu (the oracle backend), and with the expert pool at its floor and small slices

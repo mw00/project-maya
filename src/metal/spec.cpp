@@ -72,6 +72,11 @@ int DraftLength::choose() {
     return best_;
 }
 
+void DraftLength::tally(int offered, int accepted) {
+    tot_off_ += offered;
+    tot_acc_ += accepted;
+}
+
 void DraftLength::record(int n, int accepted, double ms) {
     ++rounds_;
     if (probing_ > 0) --probing_;
@@ -150,7 +155,8 @@ bool decode_mtp(GlmMetal& model, int32_t y, DraftLength& len, const DecodeHooks&
         }
         return true;
     };
-    return decode_spec(model, y, 15, mtp, [&](int n, int acc, double ms) { len.record(chosen, std::min(acc, n), ms); },
+    return decode_spec(model, y, 15, mtp, [&](int n, int acc, double ms) { len.record(chosen, std::min(acc, n), ms);
+                                                                          len.tally(n, acc); },
                        hooks, err);
 }
 

@@ -160,6 +160,16 @@ public:
     bool snapshot_restore();          // false: no snapshot
     int64_t snapshot_position() const;  // -1: none
 
+    // Restore points (P5): numbered slots holding their own copies of the recurrent state (host-side bytes;
+    // the positional caches need no copy, so a slot is just the KDA state at its position).  The serve layer
+    // records a slot at a prompt prefix it may be asked to resume from, and restores it when a later request
+    // starts with that prefix.  snapshot_save()/restore() above are the serve loop's own implicit slot and
+    // stay separate; reset() drops every slot.
+    bool snapshot_save_slot(int slot);              // capture the current state (false: slot out of range)
+    bool snapshot_restore_slot(int slot);           // false: the slot holds nothing
+    int64_t snapshot_position_slot(int slot) const; // -1: the slot holds nothing
+    void snapshot_drop_slot(int slot);
+
     const GlmGeometry& geometry() const;
     int64_t position() const;
     int64_t max_context() const;

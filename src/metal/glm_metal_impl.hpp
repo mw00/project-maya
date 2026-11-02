@@ -9,6 +9,7 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -127,6 +128,63 @@ struct GlmMetal::Impl {
     int64_t n_ctx = 0;
     int64_t pos = 0;
     int64_t snap_pos = -1;
+    // restore-point slots (snapshot_save_slot & friends): one entry per slot id, grown on first save.
+    // state = every KDA layer's conv then ssm tensor bytes in layer order (empty when the model has none);
+    // hid = hx's row at the save, as hid_snap.  pos -1: the slot holds nothing.
+    struct SnapSlot {
+        int64_t pos = -1;
+        int64_t hx_pos = -1;
+        std::vector<float> hid;
+        std::vector<uint8_t> state;
+    };
+    std::vector<SnapSlot> snap_slots;
+
+    // Decode plan cache: the recurring T=1 trunk slice and the MTP part-0 graph, kept built and allocated
+    // on schedulers of their own (the two alternate every round, so a shared scheduler would re-plan on
+    // every alternation), with their uploads re-derived from the position on every hit instead of rebuilt.
+    // A plan graph is built with its cache writes as position-indexed ggml_set_rows (the row indices are
+    // uploads), so the one graph is exact for every position its signature covers; the signature therefore
+    // carries everything structural, and anything that can change structure behind it - a reset, a snapshot
+    // restore, the slot-table latch - frees the plans.  MAYA_GLM_PLAN_CACHE=0 disables the cache entirely.
+    struct PlanSig {
+        int branch = 0;                 // 1: born-resident slot ids, 2: latched table ids (0 never cached)
+        int64_t n_pool = 0;             // the DSA layers' complete-pool count at the graph's position
+        bool pool_write = false;        // the graph's own cache write completes a pool
+        int fill = 0;                   // trunk: the NextN fill the head performs (1: from the row before)
+        bool fill_pool_write = false;
+        bool operator==(const PlanSig& o) const {
+            return branch == o.branch && n_pool == o.n_pool && pool_write == o.pool_write && fill == o.fill &&
+                   fill_pool_write == o.fill_pool_write;
+        }
+    };
+    struct DecodePlan {
+        struct Up {
+            ggml_tensor* t = nullptr;
+            std::vector<uint8_t> data;
+            std::function<void(std::vector<uint8_t>&)> regen;
+        };
+        ggml_context* ctx = nullptr;         // keep-alive: the graph's tensors live here
+        ggml_cgraph* gf = nullptr;
+        ggml_backend_sched_t sched = nullptr;
+        std::vector<uint8_t> arena;          // the context's memory, owned with it
+        std::vector<Up> uploads;
+        ggml_tensor* out = nullptr;          // trunk: the logits; MTP: the argmax
+        ggml_tensor* aux = nullptr;          // MTP: the step's hidden state
+        int hid_rows = 0;                    // trunk: hidden rows the head wrote at build
+        PlanSig sig;
+        bool valid = false;
+    };
+    DecodePlan trunk_plan, mtp_plan;
+    bool plan_cache_on = true;               // MAYA_GLM_PLAN_CACHE, read at load()
+    const float* pc_emb = nullptr;           // the running slice's embeddings (plan upload regen source)
+    const float* pc_e = nullptr;             // MTP: the step's token embedding
+    const float* pc_h = nullptr;             // MTP: the step's hidden-state input
+    int64_t pc_p0 = 0;                       // the running graph's first position (regen source)
+    void plans_invalidate();
+    void plan_free(DecodePlan& p);
+    ggml_backend_sched_t make_sched();
+    PlanSig trunk_sig(int branch, int64_t at) const;
+    bool plan_hit_trunk(std::vector<float>& logits, std::string& err);
 
     ~Impl();
     bool open_files(const std::string& path, std::string& err);

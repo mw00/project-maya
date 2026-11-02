@@ -196,6 +196,7 @@ class MockEngine:
     def __init__(self, tokenizer, script: str | list[str], max_context: int = 32768, delay_s: float = 0.0,
                  tok_s: float | None = None):
         self.tok, self.max_context, self.delay = tokenizer, max_context, delay_s
+        self.can_restore = False         # named restore points (READY ... restore): a test sets it true
         # tok_s: it writes at about that speed and reports its clock as the engine's DONE does (the Monitor's speeds;
         # `--engine mock` takes MAYA_MOCK_TOK_S)
         self.tok_s = tok_s
@@ -768,6 +769,82 @@ def deepseek_restore_points(ids, user_id, system_id=None, tail=512, least=RESTOR
     return out
 
 
+# MAYA_METAL_RESTORE_POINTS (0, off by default): the same points for a Metal engine whose READY line advertises
+# restore points (READY ... restore); MAYA_METAL_RESTORE_TAIL (512) is its tail distance.  Off until the engine
+# side's greedy-identity gate passes (the P5 mini-plan's bar 4): with it off, or on an engine that does not
+# advertise, every GEN line is exactly as before.  The points are hints only: the engine keeps an entry per point
+# holding this prompt's own tokens and reuses it only where a later prompt starts with those very tokens, so a
+# point that fits nothing costs a full read, never a wrong answer.
+
+
+def metal_restore_point_settings(env=None) -> tuple[bool, int]:
+    """(on, tail) from MAYA_METAL_RESTORE_POINTS and MAYA_METAL_RESTORE_TAIL (as the code reads them:
+    maya_names).  Off by default, unlike the DeepSeek setting: the Metal engines are growing the support, and
+    the flag turns the keys on only where an engine advertises them on its READY line."""
+    env = os.environ if env is None else env
+
+    def whole(name, default):
+        try:
+            return max(0, int(str(env.get(maya_names.read_as(name), default)).strip()))
+        except ValueError:
+            return default
+    return whole("MAYA_METAL_RESTORE_POINTS", 0) > 0, whole("MAYA_METAL_RESTORE_TAIL", 512)
+
+
+def metal_restore_points(ids, user_id=None, system_id=None, obs_id=None, turn_id=None, tail=512,
+                         least=RESTORE_LEAST) -> dict:
+    """Where a Metal engine keeps restore points for this prompt -> the deepseek_restore_points shape
+    ({"marks": [pos, ...], "tail": pos, "shared": pos}; any may be missing, {}: none), from the prompt's ids
+    as the template wrote them - the same positions, from the templates these engines serve:
+
+    - GLM (user_id/system_id given): a turn opens with its role token (<|user|>; a system message after the
+      first turn with <|system|>) and a tool result's turn with <|observation|>.  The first <|user|> ends the
+      system prompt and its tools ("shared": another conversation behind the same start goes back there); the
+      last turn of any of them is where an edited or resent message leaves the prompt ("marks");
+    - MiniMax (turn_id given): every turn opens with the same token (]~b]) and the role is written as text
+      after it, which the ids alone cannot tell apart - so "shared" is the second turn's start (the first
+      turn is the system prompt; a conversation without one simply never matches that entry) and "marks"
+      the last turn's start.
+
+    Positions under `least` are left out, exactly as the DeepSeek points: a start that short is read again in
+    about the time a point costs.  And a point is only a place the engine is asked to remember - its entry
+    holds this prompt's tokens, reused only by a later prompt that starts with them."""
+    if len(ids) < 2:
+        return {}
+    out = {}
+    if turn_id is not None:
+        turns = [i for i, t in enumerate(ids) if t == turn_id]
+        if not turns:
+            return {}
+        first = turns[1] if len(turns) > 1 else None
+        last = turns[-1]
+        if first is not None and first >= least:
+            out["shared"] = first
+        if last >= least and last != first:
+            out["marks"] = [last]
+        t = len(ids) - tail
+        if tail > 0 and t >= least and t > last:
+            out["tail"] = t
+        return out
+    if user_id is None:
+        return {}
+    first = last = None
+    for i, t in enumerate(ids):
+        if t == user_id:
+            first = i if first is None else first
+            last = i
+        elif first is not None and (t == system_id or (obs_id is not None and t == obs_id)):
+            last = i
+    if first is not None and first >= least:
+        out["shared"] = first
+    if last is not None and last >= least and last != first:
+        out["marks"] = [last]
+    t = len(ids) - tail
+    if tail > 0 and t >= least and (last is None or t > last):
+        out["tail"] = t
+    return out
+
+
 def narrate_start(log_path: str, offset: int, args: list, done: threading.Event, heartbeat=20.0) -> None:
     """While the engine starts, say in the server window what it is doing, from its log: the start reads tens of GB
     into RAM and locks part of it for the GPU, and on many PCs everything is slow or frozen for a minute or more -
@@ -832,6 +909,7 @@ class StrataEngine:
 
     gpu_busy = None   # () -> bool: the engine's GPUs are working (the service's telemetry); kept across restarts
     multi = 0         # READY ... multi=<n> (set per start; the class default for engines built without __init__)
+    can_restore = False   # READY ... restore: the engine keeps named restore points (marks=/shared= on GEN)
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
                  env: dict | None = None):
@@ -850,6 +928,7 @@ class StrataEngine:
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
+        self.can_restore = False         # ... and restore points: points it keeps when a GEN line asks (READY restore)
         self.multi = 0                   # READY ... multi=<n>: n conversations at once (requests tagged rid=<id>)
         self._routes: dict[int, queue.Queue] = {}       # rid -> its lines (multi)
         self._routes_lock = threading.Lock()
@@ -880,6 +959,7 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 self.can_pause = "pause" in f[2:]
+                self.can_restore = "restore" in f[2:] or any(x.startswith("restore=") for x in f[2:])
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
@@ -1234,7 +1314,8 @@ class StrataEngine:
     @staticmethod
     def restore_keys(sampling: dict) -> str:
         """`marks=<pos>,...`, `tail=<pos>` and `shared=<pos>`: the DeepSeek engine's restore points for this prompt
-        (Service.run puts them in `_restore` with MAYA_DS4_RESTORE_POINTS; no other engine gets them).  "" without: the
+        (Service.run puts them in `_restore`: MAYA_DS4_RESTORE_POINTS for the DeepSeek engine,
+        MAYA_METAL_RESTORE_POINTS for a Metal engine whose READY line advertises restore points).  "" without: the
         line as before."""
         pts = sampling.get("_restore")
         if not isinstance(pts, dict):
@@ -2136,6 +2217,13 @@ class Service:
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
+        # ... and the Metal templates' openers, for the same points on their engines (MAYA_METAL_RESTORE_POINTS):
+        # GLM opens a turn with its role token and a tool result's turn with <|observation|>; MiniMax opens
+        # every turn with the same token and writes the role as text after it
+        self.glm_user_id = (_special_ids("<|user|>") or [None])[0]
+        self.glm_system_id = (_special_ids("<|system|>") or [None])[0]
+        self.glm_obs_id = (_special_ids("<|observation|>") or [None])[0]
+        self.mm_turn_id = (_special_ids("]~b]") or [None])[0]
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
@@ -2474,10 +2562,10 @@ class Service:
         """Where the configs are: beside this server's own (maya.py's folder)."""
         return Path(self.config_path).parent if self.config_path else ROOT
 
-    def models_info(self) -> dict:
+    def models_info(self, port: int | None = None) -> dict:
         """The configs the setup wrote, the running one marked, each with its engine settings; whether a switch or a
         change to the running one can start Maya again at once (maya.py started this server)."""
-        out = models.listing(self.models_root(), self.config_path)
+        out = models.listing(self.models_root(), self.config_path, port)
         out.update(restarts=bool(os.environ.get("MAYA_RESTART_ON_UPDATE")),
                    running=Path(self.config_path).name if self.config_path else None,
                    restarting=getattr(self, "model_restart", None),
@@ -2655,7 +2743,8 @@ class Service:
         import platform
         out = [f"Project Maya {MAYA_VERSION or '?'} - report of {time.strftime('%Y-%m-%d %H:%M')}",
                f"System: {platform.platform()}, Python {platform.python_version()}",
-               f"GPU: {st.get('gpu_name') or 'not readable'} ({gib(hw.get('gpu_mem_total'))} VRAM)",
+               f"GPU: {st.get('gpu_name') or st.get('gpu_note') or 'not readable'}" +
+               (f" ({gib(hw.get('gpu_mem_total'))} VRAM)" if st.get('gpu_name') else ""),
                f"CPU: {st.get('cpu_name') or '?'}, {st.get('threads') or '?'} threads; RAM {gib(hw.get('ram_total'))}",
                f"Model: {self.model}" + (f" ({self.model_label})" if self.model_label else "") +
                f", context {self.engine.max_context}"]
@@ -3722,6 +3811,20 @@ class Service:
                     pts = deepseek_restore_points(ids, self.ds_user_id, self.ds_system_id, tail)
                     if pts:
                         sampling = {**(sampling or {}), "_restore": pts}
+                elif not emb and getattr(self.engine, "can_restore", False):
+                    # MAYA_METAL_RESTORE_POINTS (off by default): the same points for a Metal engine that
+                    # advertises restore points on its READY line.  The setting off, or an engine without
+                    # the advertisement, leaves every GEN line exactly as before; not with pictures either,
+                    # whose spans the engine reads whole.
+                    mon, mtail = metal_restore_point_settings()
+                    if mon:
+                        pts = metal_restore_points(ids, user_id=self.glm_user_id,
+                                                   system_id=self.glm_system_id, obs_id=self.glm_obs_id,
+                                                   turn_id=self.mm_turn_id if getattr(self.template,
+                                                                                      "minimax", False) else None,
+                                                   tail=mtail)
+                        if pts:
+                            sampling = {**(sampling or {}), "_restore": pts}
 
                 def attempts(prompt, left):
                     """The engine's tokens.  When its numbers went non-finite (a NaN or an infinity in a route: the
@@ -4985,7 +5088,7 @@ def make_handler(svc: Service):
             elif path == "/api/models":
                 # the Models page: the configs the setup wrote, the running one, each one's engine settings
                 if self._authorized():
-                    self._json(200, svc.models_info())
+                    self._json(200, svc.models_info(self.server.server_address[1]))
             elif path == "/api/savings":
                 # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
                 if self._authorized():
@@ -5566,7 +5669,8 @@ SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
               "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD", "STRATA_QUEUE_PING_S",
               "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
-    tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
+    tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL",
+                                          "MAYA_METAL_RESTORE_POINTS", "MAYA_METAL_RESTORE_TAIL"))
 
 
 def apply_server_env(cfg: dict) -> None:

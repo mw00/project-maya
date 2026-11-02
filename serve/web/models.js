@@ -701,7 +701,7 @@ function Card({m}) {
   const loading = r && r.why === "switch" && r.file === m.file;
   const chips = [["Context", ctxfmt(s.context)], ["Draft", DRAFTS[s.draft] || s.draft], ["GPUs", s.gpus.join(", ") || "–"],
                  ["Images", s.images ? "on" : "off"], ...(s.parallel > 1 ? [["At once", String(s.parallel)]] : [])];
-  const about = [m.backend === "hip" ? "HIP" : "CUDA", size(m.size), setUpOn(m.written)].filter(Boolean).join(" · ");
+  const about = [m.backend === "hip" ? "HIP" : m.backend === "metal" ? "Metal" : "CUDA", size(m.size), setUpOn(m.written)].filter(Boolean).join(" · ");
   const facts = [["Config", m.path, true], ["Start script", m.script ? `./${m.script}` : "–", !!m.script], ["Model folder", m.folder || "–", true],
                  ["Port", m.port ? String(m.port) : "8080"], ["API model name", m.model, true]];
   return html`<section class=${`card mdl-card${m.running ? " is-running" : ""}${loading ? " is-loading" : ""}`} aria-label=${titleOf(m)}>

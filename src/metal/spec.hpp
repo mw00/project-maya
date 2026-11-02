@@ -31,6 +31,9 @@ public:
     explicit DraftLength(int n_cap);
     int choose();
     void record(int n, int accepted, double ms);   // a round of n drafts kept `accepted` of them in ms
+    void tally(int offered, int accepted);         // the same rounds as plain totals (the serve DONE line's fields)
+    long long drafts_offered() const { return tot_off_; }
+    long long drafts_accepted() const { return tot_acc_; }
 
 private:
     int cap_, start_, fixed_;
@@ -39,6 +42,7 @@ private:
     std::vector<double> ms_;            // per length (0..cap): ms of a round, measured
     std::vector<int> ms_n_;
     int last_n_ = -1, run_ = 0, rounds_ = 0, probe_at_ = 32, probe_gap_ = 32, probing_ = 0, probe_n_ = -1, best_ = 0;
+    long long tot_off_ = 0, tot_acc_ = 0;   // every round's drafts offered / accepted, never decayed (DONE totals)
 };
 
 // a drafter: up to n_max drafts after y (at position p0, not fed yet); false on an error

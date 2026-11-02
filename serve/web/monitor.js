@@ -52,6 +52,9 @@ function Throughput({m}) {
   const gen = live.state === "generating";
   const many = live.active > 1;                  // several answers at once (--parallel): their total, the graph's newest point
   const speed = many ? (h.tok_s || []).at(-1) : gen ? live.tok_s : last ? last.decode_tok_s : null;
+  // (no live rate while a prompt reads: the figure in the slot is then the last answer's, and the label
+  // below says so - a dash only when nothing has finished yet)
+  const lastRate = !many && !gen && !!(last && last.decode_tok_s != null);
   // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
     : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
@@ -64,17 +67,24 @@ function Throughput({m}) {
   // (the drafters on, and the share of their drafts the model kept: live from the engine's STAT lines, else the last answer's)
   const spec = speculationView(m);
   // the highest Decode figure since Maya started - live or a finished answer's (the server's, kept as each reading beats
-  // it; from 32 tokens on: a few tokens' speed says little)
-  const peak = m.totals && m.totals.peak_decode;
+  // it; from 32 tokens on: a few tokens' speed says little). Until one exists, the fastest of the finished answers
+  // below stands in - a real DONE figure, labelled as such in its tooltip - so a session that has finished answers
+  // never shows a dash for a peak it has in fact reached.
+  let peak = m.totals && m.totals.peak_decode, peakRecent = false;
+  if (!peak) for (const r of m.requests || [])
+    if (r.decode_tok_s != null && (!peak || r.decode_tok_s > peak.tok_s)) {
+      peak = {tok_s: r.decode_tok_s, tokens: r.output_tokens, time: r.time}; peakRecent = true;
+    }
   const when = peak ? new Date(peak.time * 1000) : null;
   const at = when ? when.toLocaleString([], new Date().toDateString() === when.toDateString()
     ? {hour: "2-digit", minute: "2-digit"} : {weekday: "short", hour: "2-digit", minute: "2-digit"}) : "";
   return html`<section class="card card--wide" aria-label="Throughput">
     <div class="speeds">
-      <div class="speed"><span class="speed__label"><i class="key key--line"></i>Decode · ${many ? `${live.writing} writing` : gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
+      <div class="speed"><span class="speed__label"><i class="key key--line"></i>Decode · ${many ? `${live.writing} writing` : gen ? "writing now" : lastRate ? "last answer" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
         <div class="speed__row"><span class="speed__big num">${speed == null ? "–" : fmt(speed, 1)}<small>tok/s</small></span>
           ${/* the peak beside the live Decode (below it on a phone), small: a reference, not a second headline */ ""}
-          <span class="speed__peak num" title=${peak ? `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
+          <span class="speed__peak num" title=${peak ? peakRecent ? `The fastest decode of the finished answers shown below: ${fmt(peak.tok_s, 1)} tok/s at ${at}, an answer of ${fmt(peak.tokens)} tokens. The session peak takes its place once an answer of 32 tokens or more has finished.`
+              : `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
               : "The highest decode speed since Maya started. Live speeds and finished answers count, from 32 tokens on."}>Peak ${peak ? `${fmt(peak.tok_s, 1)} tok/s` : "–"}</span></div></div>
       <div class="speed" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
         <span class="speed__label"><i class="key key--dash"></i>Prefill · ${live.state === "reading" ? "reading now" : gen ? "this request" : last ? "last request" : "waiting"}</span>
@@ -222,6 +232,10 @@ function Tiers({t, eng}) {
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
   const {vu, ru, total, disk, vramGb, ramGb, diskGb} = tierShares(n, eng || {});
+  // one memory, no tiers: an engine that slots nothing and fetches nothing, yet reports resident bytes, holds every
+  // expert in the one memory (the Metal engines: all resident in unified memory) - the bar says that, not "on the SSD"
+  const unified = !ds4 && vu === 0 && ru === 0 && !(n.vram_slots > 0) && !(n.ram_slots > 0) &&
+                    vramGb != null && vramGb > 0 && (n.vram_hit == null || n.vram_hit >= 0.999);
   let tip = "";
   if (ds4) {
     if (!stale && n.disk_mb != null && n.disk_mb >= 500) tip = "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
@@ -238,14 +252,18 @@ function Tiers({t, eng}) {
   const pc = (x) => (100 * x) / total;
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
     <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
-      <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : `live · ${fmt(total)} routed experts`}</span></div>
-    <div class="tierbar" role="img" aria-label=${`${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
+      <span class="card__sub">${age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer` : unified ? `live · ${fmt(vramGb, 1)} GB resident` : `live · ${fmt(total)} routed experts`}</span></div>
+    ${unified ? html`<div class="tierbar" role="img" aria-label="All of the experts resident in unified memory">
+      <span class="tierbar__vram" style="flex-grow:1"></span></div>
+    <div class="legend">
+      <span><i class="sw sw--vram"></i>Unified memory (Metal) <b class="num">${fmt(vramGb, 1)} GB resident</b></span></div>`
+    : html`<div class="tierbar" role="img" aria-label=${`${fmt(pc(vu), 0)}% of the experts in VRAM, ${fmt(pc(ru), 0)}% in ${ds4 ? "RAM" : "pinned RAM"}, ${fmt(pc(disk), 0)}% on the SSD only`}>
       <span class="tierbar__vram" style=${`flex-grow:${vu}`}></span><span class="tierbar__ram" style=${`flex-grow:${ru}`}></span>
       <span class="tierbar__disk" style=${`flex-grow:${disk}`}></span></div>
     <div class="legend">
       <span><i class="sw sw--vram"></i>${helper ? "Primary VRAM" : "VRAM"} <b class="num">${fmt(vu)} · ${fmt(vramGb, 1)} GB</b></span>
       <span><i class="sw sw--ram"></i>${ds4 ? "RAM" : "Pinned RAM"} <b class="num">${fmt(ru)} · ${fmt(ramGb, 1)} GB</b></span>
-      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}${diskGb == null ? "" : ` · ${fmt(diskGb, 1)} GB`}</b></span></div>
+      <span><i class="sw sw--disk"></i>SSD only <b class="num">${fmt(disk)}${diskGb == null ? "" : ` · ${fmt(diskGb, 1)} GB`}</b></span></div>`}
     <div class=${`tiles${set.length === 4 ? " tiles--4" : ""}`}>
       ${set.map((x) => {
         const v = n[x.key];

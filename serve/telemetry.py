@@ -907,6 +907,8 @@ class Telemetry:
         self.fallback = _CpuRamFallback()
         self.static = {
             "gpu_name": " + ".join(g.get("name") or "?" for g in cards) if cards else None,
+            "gpu_note": ("not available on macOS (no NVML) - the engine runs on Metal with unified memory"
+                         if sys.platform == "darwin" else None),
             "gpu_count": len(cards) or 1,
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,

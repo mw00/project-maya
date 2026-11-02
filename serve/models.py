@@ -67,6 +67,16 @@ def flag(args: list, name: str, default=None):
     return args[args.index(name) + 1] if name in args[:-1] else default
 
 
+def _metal(cfg: dict) -> bool:
+    """A config the Metal engines run: their exe names are the setup's with -metal in them (maya-metal,
+    maya-metal-mm3), which the CUDA-era name checks do not know."""
+    return Path(str(cfg.get("exe", ""))).name.startswith("maya-metal")
+
+
+def _metal_mm3(cfg: dict) -> bool:
+    return Path(str(cfg.get("exe", ""))).name.startswith("maya-metal-mm3")
+
+
 def set_flag(args: list, name: str, value) -> list:
     """The arguments with `name value` (replaced where it was, else added at the end)."""
     out = [str(a) for a in args]
@@ -105,6 +115,8 @@ def _float(v, default=None):
 
 def family(cfg: dict) -> str:
     """"minimax", "deepseek", "qwen" or "glm" (maya_quants.family_of, as maya.py and the server read it)."""
+    if _metal_mm3(cfg):   # (family_of knows the CUDA exe name, maya-mm3; the Metal MiniMax engine's is maya-metal-mm3)
+        return "minimax"
     return maya_quants.family_of(cfg)
 
 
@@ -269,7 +281,7 @@ def settings_of(cfg: dict) -> dict:
         vision, kvs = flag(args, "--vision"), flag(args, "--kv-streaming")
         out.update(images=vision == "on" or (vision is None and mm3_pack_has(cfg, "vision.hidden_size")),
                    parallel=_int(flag(args, "--parallel"), 1),
-                   draft="dspark" if flag(args, "--dspark", "off") not in ("off", "none") else "none",
+                   draft="dspark" if flag(args, "--dspark", "on" if _metal(cfg) else "off") not in ("off", "none") else "none",
                    tp=_int(flag(args, "--tp"), 0), kv_cache=flag(args, "--kv-cache", "int8"),
                    kv_streaming=kvs == "on" or (kvs is None and _int(flag(args, "--kv-resident"), 0) > 0),
                    kv_resident=_int(flag(args, "--kv-resident")), cpu_threads=_int(flag(args, "--cpu-threads")),
@@ -613,9 +625,14 @@ def missing(cfg: dict) -> str | None:
     return None
 
 
-def describe(path: Path, running: str | None) -> dict:
+def describe(path: Path, running: str | None, port: int | None = None) -> dict:
     cfg = read(path)
     pack = pack_of(cfg)
+    folder = str(pack.parent) if pack else None
+    if folder is None:   # (a Metal config names its model file with --gguf, not a pack: the file's folder is its own)
+        g = flag(cfg.get("args") or [], "--gguf")
+        folder = str(Path(g).parent) if g else None
+    is_running = running is not None and str(path.resolve()) == str(Path(running).resolve())
     why = missing(cfg)
     inst = cfg.get("installer") or {}
     script = next((s.name for s in (path.with_name(f"run-{path.stem}.sh"), path.with_name(f"run-{path.stem}.bat"))
@@ -628,9 +645,10 @@ def describe(path: Path, running: str | None) -> dict:
     setup = dict(inst.get("as_set_up") or cur)
     setup["env"] = shown_env(setup.get("env"))
     return {"file": path.name, "path": str(path), "model": cfg.get("model_name") or "", "family": family(cfg),
-            "quant": quant_label(cfg, path), "backend": cfg.get("backend") or "cuda", "written": inst.get("written"),
-            "used": used, "running": running is not None and str(path.resolve()) == str(Path(running).resolve()),
-            "port": cfg.get("port"), "script": script, "folder": str(pack.parent) if pack else None,
+            "quant": quant_label(cfg, path), "backend": cfg.get("backend") or ("metal" if _metal(cfg) else "cuda"),
+            "written": inst.get("written"),
+            "used": used, "running": is_running,
+            "port": cfg.get("port") or (port if is_running else None), "script": script, "folder": folder,
             "size": folder_size(pack), "ok": why is None, "missing": why,
             "settings": cur, "setup": setup, "choices": choices(cfg), "command": command(cfg),
             "contexts": {"deepseek": DS4_CONTEXTS, "minimax": MM3_CONTEXTS, "qwen": QWEN_CONTEXTS}.get(family(cfg),
@@ -660,8 +678,8 @@ def machine_gpus(backend: str = "cuda") -> list:
     return found
 
 
-def listing(root: Path, running: str | None) -> dict:
-    models = [describe(p, running) for p in config_paths(root)]
+def listing(root: Path, running: str | None, port: int | None = None) -> dict:
+    models = [describe(p, running, port) for p in config_paths(root)]
     backend = next((m["backend"] for m in models if m["running"]), models[0]["backend"] if models else "cuda")
     gpus = machine_gpus(backend)
     seen = {g["index"] for g in gpus}

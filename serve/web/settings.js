@@ -400,7 +400,7 @@ function facts() {
                   : eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
                   : "off (one GPU, or no draft block in this model file)"],
     ["Images", eng.images != null ? (eng.images ? "On" : "Off") : (S.health.images ? "On" : "Off")],
-    ["GPU", st.gpu_name ? `${gpuNames(st.gpu_name, gpus.length)}${hw.gpu_mem_total ? ` · ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],
+    ["GPU", st.gpu_name ? `${gpuNames(st.gpu_name, gpus.length)}${hw.gpu_mem_total ? ` · ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : (st.gpu_note || "not readable (NVML)")],
     ["PCIe", pcie],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],

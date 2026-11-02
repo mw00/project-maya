@@ -53,15 +53,20 @@ not resident, and so on the SSD.
 `maya-metal-mm3` (src/metal/mm3_metal.cpp, beside the GLM engine) runs MiniMax-M3.1-Flash from Maya's own GGUF
 quants (the set's `-maya-indexers.bin` side file is read automatically). Its graph follows `tools/mm3/ref.py` op
 for op: Gemma norms, per-head q/k norms, NeoX partial RoPE, MiniMax Sparse Attention on every layer (the indexer
-scores read back to the host, which keeps the top blocks exactly as the reference selects them), swigluoai MLPs,
+selection runs fused on the GPU and keeps the top blocks exactly as the reference selects them;
+MAYA_MM3_HOST_SELECT=1 restores the original host read-back), swigluoai MLPs,
 sigmoid routing with the correction bias. Sampling and the serve protocol are the GLM engine's, shared code and
 all (`maya-metal-mm3 --serve`, driven by serve/server.py like the other engines).
 
 The memory plan is the simple one the quants were made for: **every expert is resident**. Maya-XS (93 GB) fits a
 128 GB Mac with room for the caches; Maya-S (122 GB) is past a 128 GB Mac's GPU working set, so XS is the Mac
-quant. With nothing streamed there is no expert pool and no drafting yet (a request's `spec` keys are accepted;
-plain decoding writes the same tokens), and pictures are not wired (the vision tower stays with the CUDA engine
-for now), so MiniMax on a Mac is text only. `./maya.sh --backend metal --setup` does not offer MiniMax yet; run
+quant. With nothing streamed there is no expert pool. Drafting is DSpark (the set's own drafter, loaded
+automatically when present), tuned per request with the `spec` keys: it wins large on predictable text and can
+lose on open prose, so the confidence floor is worth setting per workload. Drafted and plain decoding write
+identical tokens, except that batched
+verify rows can flip a pick whose top-2 logits are within ~1e-4 (the standard speculative-decoding numerics
+caveat); counting/predictable text never flipped in testing. Pictures are not wired (the vision tower stays
+with the CUDA engine for now), so MiniMax on a Mac is text only. `./maya.sh --backend metal --setup` does not offer MiniMax yet; run
 it by hand:
 
 ```sh
@@ -157,3 +162,23 @@ cmake -S . -B build-metal -DMAYA_ENABLE_METAL=ON
 cmake --build build-metal -j
 ctest --test-dir build-metal          # the parity tests above (the 45-layer fixture needs Python with numpy)
 ```
+
+
+## Later additions (2026-11-02, metal-speed-2)
+
+- **Restore points (GLM, opt-in):** the engine keeps named restore points
+  (GEN keys `marks=`/`shared=`, advertised as `restore` on the READY line);
+  the serve layer computes points for GLM/MiniMax templates when
+  `MAYA_METAL_RESTORE_POINTS` is set (>0; off by default). A later request
+  whose prompt starts with a recorded point's tokens resumes prefill at that
+  depth (recurrent state is copied per point; entries are dropped when a
+  request's own reuse depth is shallower, which keeps the KV pool coherent).
+  Fixture: `tools/test_metal_serve_restore.py`.
+- **Decode plan cache (GLM):** decode graphs and their scheduler allocations
+  are kept alive per shape signature, removing per-token graph build/alloc
+  cost on hits. `MAYA_GLM_PLAN_CACHE=0` restores the previous path exactly.
+- **Tensor flash-attention (ggml):** upstream llama.cpp's tensor FA kernels
+  (PRs #29570 + #30491) are carried as `third_party/ggml/metal-tensor-fa.patch`
+  and applied by the same cmake stamp mechanism as the sparse-MLA patch.
+  GLM's attention routes through sparse MLA today, so the kernels engage
+  where a graph calls `ggml_flash_attn_ext` at tensor-eligible shapes.
