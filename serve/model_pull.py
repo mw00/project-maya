@@ -1,4 +1,4 @@
-"""Downloading models from the Models page and the API (Ollama's /api/pull).  Nothing here downloads or verifies a file
+"""Downloading models from the Models page and the API (/api/pull).  Nothing here downloads or verifies a file
 itself: the download is the setup's own (`maya.py --setup --model <id> --download-model --yes --plain --no-start`: curl
 with resume, sha256 check, the pack, the config), run as a child process whose output is read for its progress line.
 One download at a time."""
@@ -166,7 +166,7 @@ class Puller:
 
 
 def ndjson_events(pull: Pull, poll: float = 1.0):
-    """Ollama's /api/pull stream for `pull`: {"status": ...} lines, with total / completed while it downloads, then
+    """The /api/pull stream for `pull`: {"status": ...} lines, with total / completed while it downloads, then
     "success" (or an {"error": ...} line)."""
     yield {"status": "pulling " + pull.id}
     last = None

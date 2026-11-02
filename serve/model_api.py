@@ -1,4 +1,4 @@
-"""Ollama's model API on Maya (phase 1): the names, keep_alive, the request/answer translation between Ollama's native
+"""Maya's model API (phase 1): the names, keep_alive, the request/answer translation between the native
 chat API (/api/chat, /api/generate) and the OpenAI path the server already runs, and the model listings (/api/tags,
 /api/ps, /api/show).  Pure functions: serve/server.py does the I/O, serve/model_pull.py the downloads."""
 from __future__ import annotations
@@ -15,7 +15,7 @@ _UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "ms": 0.001}
 
 
 def parse_keep_alive(v):
-    """Ollama's keep_alive: seconds (a number; negative = for ever) or a duration string ("5m", "1h30m", "-1", "0").
+    """keep_alive: seconds (a number; negative = for ever) or a duration string ("5m", "1h30m", "-1", "0").
     None / "" -> None (the server's own idle setting).  Raises ValueError for anything else."""
     if v is None or v == "":
         return None
@@ -111,7 +111,7 @@ def _options(req: dict, out: dict):
             out[dst] = opts[k]
     n = opts.get("num_predict")
     if isinstance(n, int) and not isinstance(n, bool) and n > 0:
-        out["max_tokens"] = n                      # (-1 / -2: the rest of the context, as Ollama)
+        out["max_tokens"] = n                      # (-1 / -2: the rest of the context)
     stop = opts.get("stop")
     if stop:
         out["stop"] = stop
@@ -141,7 +141,7 @@ def _tool_calls_in(msg: dict) -> list:
 
 
 def chat_to_openai(req: dict) -> dict:
-    """/api/chat's body as an OpenAI chat.completions one (Ollama streams unless stream is false)."""
+    """/api/chat's body as an OpenAI chat.completions one (streamed unless stream is false)."""
     msgs = []
     for m in req.get("messages") or []:
         if not isinstance(m, dict):
@@ -185,7 +185,7 @@ def _ns(t) -> int:
 
 
 class Translator:
-    """OpenAI chat.completion.chunk dicts -> Ollama NDJSON objects for one request (chat: "message", generate:
+    """OpenAI chat.completion.chunk dicts -> NDJSON objects for one request (chat: "message", generate:
     "response").  feed() returns the objects to send for a chunk; done() the final one with the counts."""
 
     def __init__(self, model: str, kind: str, started: float | None = None, load_s: float = 0.0):
@@ -234,7 +234,7 @@ class Translator:
         return [self._body(text, think)]
 
     def finish_calls(self) -> list:
-        """The tool calls the chunks carried, whole (Ollama sends them as parsed objects), as one message."""
+        """The tool calls the chunks carried, whole (sent as parsed objects), as one message."""
         import json
         out = []
         for i in sorted(self.calls):

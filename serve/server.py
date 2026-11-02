@@ -53,7 +53,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_pull, models, ollama, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -2116,7 +2116,7 @@ class Service:
         # its GPU memory and its pinned RAM tier, and the next request starts it again (0: never).  With
         # STRATA_GLM_SLOT_KEEP=1 the conversation in the model is kept on disk across it.
         self.idle_unload_s = 0.0
-        self.keep_alive_s = None                          # a request's Ollama keep_alive (None: idle_unload_s; -1: never)
+        self.keep_alive_s = None                          # a request's keep_alive (None: idle_unload_s; -1: never)
         self.puller = None                               # serve/model_pull.py: the one model download (the Models page, /api/pull)
         self.unloaded = False                            # the engine was ended by the idle unload (not by a crash)
         self._engine_start = threading.Lock()            # ensure_engine: one start, also with --parallel's requests
@@ -2309,7 +2309,7 @@ class Service:
             self.fifo.release()
 
     def idle_limit(self) -> float:
-        """Seconds without a request before the model unloads: the last request's keep_alive (Ollama's), else the config's
+        """Seconds without a request before the model unloads: the last request's keep_alive, else the config's
         idle_unload_s; 0 = never."""
         ka = self.keep_alive_s
         if ka is None:
@@ -2720,9 +2720,9 @@ class Service:
         return self.pull_slot().start(ident, cfg).snapshot()
 
     def delete_installed(self, name) -> dict:
-        """Ollama's DELETE /api/delete and the Models page: the model's config and its own files (models.delete_plan
+        """DELETE /api/delete and the Models page: the model's config and its own files (models.delete_plan
         never lists a file another config runs from).  Not the running model, not during a download."""
-        p = ollama.find_config(self.models_root(), name)
+        p = model_api.find_config(self.models_root(), name)
         if p is None:
             raise KeyError(name)
         if self._is_running(p):
@@ -2731,7 +2731,7 @@ class Service:
             raise ValueError("a model is downloading; delete when it is done")
         return self.delete_model(p.name, True)
 
-    def ollama_listing(self) -> list:
+    def model_listing(self) -> list:
         return models.listing(self.models_root(), self.config_path)["models"]
 
     def expires_at(self):
@@ -4832,9 +4832,9 @@ def make_handler(svc: Service):
                 body = {}
             name = (body or {}).get("model") or svc.model
             if name != svc.model:
-                other = ollama.find_config(svc.models_root(), name)
-                if op == "load" and other is not None:    # another installed model: the swap (Ollama's load on request)
-                    self._ollama_target(name)
+                other = model_api.find_config(svc.models_root(), name)
+                if op == "load" and other is not None:    # another installed model: the swap (a load on request)
+                    self._mapi_target(name)
                     return
                 self._json(404, {"error": {"message": "model not found"}})
                 return
@@ -4862,8 +4862,8 @@ def make_handler(svc: Service):
                 svc.fifo.release()
             self._json(200, {"model": name, "status": {"value": "loaded"}})
 
-        # ------------------------------------------------------------ Ollama's model API (serve/ollama.py)
-        def _ollama_gate(self, manage: bool = False) -> bool:
+        # ------------------------------------------------------------ the model API (serve/model_api.py)
+        def _mapi_gate(self, manage: bool = False) -> bool:
             """Model management on, the API key given when one is set; `manage` (pull, delete, swap): without a key only
             from this PC - nobody else on the network may download or delete models."""
             if not getattr(svc, "model_management", False):
@@ -4877,74 +4877,74 @@ def make_handler(svc: Service):
                     return False
             return True
 
-        def _ollama_json(self) -> dict:
+        def _mapi_json(self) -> dict:
             req = json.loads(self._body() or b"{}")
             if not isinstance(req, dict):
                 raise ValueError("the request body must be a JSON object")
             return req
 
-        def _ollama_ps(self) -> dict:
+        def _mapi_ps(self) -> dict:
             loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
             out = []
-            run = next((m for m in svc.ollama_listing() if m["running"]), None)
+            run = next((m for m in svc.model_listing() if m["running"]), None)
             lock = getattr(svc, "_engine_start", None)
             starting = run is not None and loaded and lock is not None and lock.locked()   # (the weights are loading)
             if run is not None and loaded and not starting:
-                out.append(ollama.ps_entry(run, svc.expires_at(), 0))
+                out.append(model_api.ps_entry(run, svc.expires_at(), 0))
             res = {"models": out}
             restart = getattr(svc, "model_restart", None)
             if restart:
-                res["loading"] = {"model": ollama.public_name(Path(restart["to"])) + ":latest", "since": restart["started"]}
+                res["loading"] = {"model": model_api.public_name(Path(restart["to"])) + ":latest", "since": restart["started"]}
             elif starting:
-                res["loading"] = {"model": ollama.public_name(Path(run["file"])) + ":latest", "since": time.time()}
+                res["loading"] = {"model": model_api.public_name(Path(run["file"])) + ":latest", "since": time.time()}
             elif run is not None and not loaded:
-                res["unloaded"] = ollama.public_name(Path(run["file"])) + ":latest"
+                res["unloaded"] = model_api.public_name(Path(run["file"])) + ":latest"
             return res
 
-        def _ollama_get(self, path: str):
-            if not self._ollama_gate():
+        def _mapi_get(self, path: str):
+            if not self._mapi_gate():
                 return
             if path == "/api/version":
                 self._json(200, {"version": "0.0.0-maya"})
             elif path == "/api/tags":
-                self._json(200, {"models": [ollama.tags_entry(m) for m in svc.ollama_listing()]})
+                self._json(200, {"models": [model_api.tags_entry(m) for m in svc.model_listing()]})
             elif path == "/api/ps":
-                self._json(200, self._ollama_ps())
+                self._json(200, self._mapi_ps())
             elif path == "/api/catalog":
                 self._json(200, {"models": model_pull.catalog(svc.models_root()), "pull": svc.pull_slot().snapshot(),
                                  "restarts": bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))})
             elif path == "/api/pull/status":
                 self._json(200, {"pull": svc.pull_slot().snapshot()})
 
-        def _ollama_post(self, path: str):
+        def _mapi_post(self, path: str):
             try:
-                req = self._ollama_json()
+                req = self._mapi_json()
                 if path == "/api/show":
                     name = req.get("model") or req.get("name")
-                    p = ollama.find_config(svc.models_root(), name)
+                    p = model_api.find_config(svc.models_root(), name)
                     if p is None:
                         self._json(404, {"error": f"model '{name}' not found"})
                         return
                     d = models.describe(p, svc.config_path)
                     plan = models.delete_plan(svc.models_root(), p) if req.get("verbose") else None
-                    self._json(200, ollama.show_entry(d, plan))
+                    self._json(200, model_api.show_entry(d, plan))
                 elif path == "/api/pull":
-                    if self._ollama_gate(manage=True):
+                    if self._mapi_gate(manage=True):
                         self._pull(req)
                 elif path == "/api/pull/cancel":
-                    if self._ollama_gate(manage=True):
+                    if self._mapi_gate(manage=True):
                         self._json(200, {"cancelled": svc.pull_slot().cancel()})
                 elif path == "/api/delete":
-                    if self._ollama_gate(manage=True):
-                        self._ollama_delete(req)
+                    if self._mapi_gate(manage=True):
+                        self._mapi_delete(req)
                 elif path in ("/api/chat", "/api/generate"):
-                    self._ollama_chat(path.rsplit("/", 1)[1], req)
+                    self._mapi_chat(path.rsplit("/", 1)[1], req)
             except ValueError as e:
                 if self.answer_started:
                     raise
                 self._json(400, {"error": str(e)})
 
-        def _ollama_delete(self, req: dict):
+        def _mapi_delete(self, req: dict):
             name = req.get("model") or req.get("name")
             try:
                 out = svc.delete_installed(name)
@@ -4989,19 +4989,19 @@ def make_handler(svc: Service):
             self.end_headers()
             self.answer_started = True
 
-        def _ollama_target(self, name) -> bool:
+        def _mapi_target(self, name) -> bool:
             """The model a chat / generate names: True when it is the one running (or none named); otherwise the answer
             is sent - 404, or the swap to that installed model (Maya starts again with it: a 503 + Retry-After says so)."""
-            run = next((m for m in svc.ollama_listing() if m["running"]), None)
+            run = next((m for m in svc.model_listing() if m["running"]), None)
             if not name or run is None:
                 return True
-            p = ollama.find_config(svc.models_root(), name)
+            p = model_api.find_config(svc.models_root(), name)
             if p is None:
                 self._json(404, {"error": f"model '{name}' not found, try pulling it first"})
                 return False
             if p.name == run["file"]:
                 return True
-            if not self._ollama_gate(manage=True):
+            if not self._mapi_gate(manage=True):
                 return False
             if not getattr(svc, "model_restart", None):
                 if not os.environ.get("MAYA_RESTART_ON_UPDATE"):
@@ -5013,9 +5013,9 @@ def make_handler(svc: Service):
                 except ValueError as e:
                     self._json(409, {"error": str(e)})
                     return False
-            body = json.dumps({"error": f"loading model {ollama.public_name(p)}: Maya starts again with it (a big model "
+            body = json.dumps({"error": f"loading model {model_api.public_name(p)}: Maya starts again with it (a big model "
                                         "takes minutes); retry this request, GET /api/ps shows when it is loaded",
-                               "loading": ollama.public_name(p) + ":latest"}).encode()
+                               "loading": model_api.public_name(p) + ":latest"}).encode()
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self.send_header("Retry-After", "30")
@@ -5024,16 +5024,16 @@ def make_handler(svc: Service):
             self.wfile.write(body)
             return False
 
-        def _ollama_chat(self, kind: str, req: dict):
+        def _mapi_chat(self, kind: str, req: dict):
             """/api/chat and /api/generate through the same pipeline as /v1/chat/completions."""
-            if not self._ollama_gate():
+            if not self._mapi_gate():
                 return
-            if not self._ollama_target(req.get("model")):
+            if not self._mapi_target(req.get("model")):
                 return
-            ka = ollama.parse_keep_alive(req.get("keep_alive"))
-            name = ollama.public_name(Path(svc.config_path)) + ":latest" if svc.config_path else svc.model
+            ka = model_api.parse_keep_alive(req.get("keep_alive"))
+            name = model_api.public_name(Path(svc.config_path)) + ":latest" if svc.config_path else svc.model
             empty = not (req.get("messages") if kind == "chat" else (req.get("prompt") or req.get("images")))
-            if empty:                                          # Ollama's preload (load) and its unload (keep_alive 0)
+            if empty:                                          # the preload (load) and its unload (keep_alive 0)
                 if ka == 0:
                     if svc.unload() == "busy":
                         self._json(409, {"error": "a request is running or waiting; unload when idle"})
@@ -5050,11 +5050,11 @@ def make_handler(svc: Service):
                     finally:
                         svc.fifo.release()
                     reason = "load"
-                o = {"model": name, "created_at": ollama._iso(time.time()), "done": True, "done_reason": reason}
+                o = {"model": name, "created_at": model_api._iso(time.time()), "done": True, "done_reason": reason}
                 o.update({"message": {"role": "assistant", "content": ""}} if kind == "chat" else {"response": ""})
                 self._json(200, o)
                 return
-            oreq = ollama.chat_to_openai(req) if kind == "chat" else ollama.generate_to_openai(req)
+            oreq = model_api.chat_to_openai(req) if kind == "chat" else model_api.generate_to_openai(req)
             svc.keep_alive_s = ka                               # (the model stays loaded that long after this request)
             oreq = svc.with_shared(oreq, "openai")
             oreq["_api"] = "openai"
@@ -5068,7 +5068,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             watch_client(self, cancel)
             chunks = openai_chunks(svc, oreq, ids, thinking, tools, max_new, cancel)
-            tr = ollama.Translator(name, kind)
+            tr = model_api.Translator(name, kind)
 
             def line(ev):
                 self.wfile.write((json.dumps(ev, ensure_ascii=False) + "\n").encode())
@@ -5283,7 +5283,7 @@ def make_handler(svc: Service):
                 self._response_resource(delete=True)
             elif self.path.split("?")[0].rstrip("/") == "/api/delete":
                 if self._authorized():
-                    self._ollama_post("/api/delete")
+                    self._mapi_post("/api/delete")
             elif self._authorized():
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -5294,7 +5294,7 @@ def make_handler(svc: Service):
                 return
             if path in ("/api/tags", "/api/ps", "/api/version", "/api/catalog", "/api/pull/status"):
                 if self._authorized():
-                    self._ollama_get(path)
+                    self._mapi_get(path)
                 return
             if path.startswith("/v1/responses/"):
                 self._response_resource()
@@ -5509,7 +5509,7 @@ def make_handler(svc: Service):
                     self._response_cancel(path)
                     return
                 if path in ("/api/show", "/api/pull", "/api/pull/cancel", "/api/delete", "/api/chat", "/api/generate"):
-                    self._ollama_post(path)
+                    self._mapi_post(path)
                     return
                 if path == "/settings":
                     self._settings()

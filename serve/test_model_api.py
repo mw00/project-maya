@@ -1,7 +1,7 @@
-"""serve/test_ollama.py - Ollama's model API on Maya: /api/tags, /api/ps, /api/show, /api/chat, /api/generate, /api/pull,
+"""serve/test_model_api.py - Maya's model API: /api/tags, /api/ps, /api/show, /api/chat, /api/generate, /api/pull,
 /api/delete, the swap on request and keep_alive - against the mock engine, no GPU.
 
-    python -m unittest serve.test_ollama -v
+    python -m unittest serve.test_model_api -v
 """
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve import model_pull, ollama  # noqa: E402
+from serve import model_api, model_pull  # noqa: E402
 from serve.server import Service  # noqa: E402
 from serve.test_models import Served, glm_quant  # noqa: E402
 
 
 class Pure(unittest.TestCase):
     def test_keep_alive(self):
-        k = ollama.parse_keep_alive
+        k = model_api.parse_keep_alive
         self.assertEqual((k(None), k(""), k(0), k(-1), k("-1"), k("0")), (None, None, 0.0, -1.0, -1.0, 0.0))
         self.assertEqual((k("5m"), k("1h30m"), k(30), k("90s"), k("-5m")), (300.0, 5400.0, 30.0, 90.0, -1.0))
         for bad in ("soon", "5x", True, [1]):
@@ -31,19 +31,19 @@ class Pure(unittest.TestCase):
                 k(bad)
 
     def test_requests_translate(self):
-        o = ollama.chat_to_openai({"messages": [{"role": "user", "content": "hi", "images": ["QUJD"]}],
+        o = model_api.chat_to_openai({"messages": [{"role": "user", "content": "hi", "images": ["QUJD"]}],
                                    "options": {"temperature": 0.2, "num_predict": 7, "stop": ["x"], "repeat_penalty": 1.1},
                                    "stream": False, "format": "json"})
         self.assertEqual((o["stream"], o["temperature"], o["max_tokens"], o["stop"], o["repetition_penalty"]),
                          (False, 0.2, 7, ["x"], 1.1))
         self.assertEqual(o["response_format"], {"type": "json_object"})
         self.assertEqual(o["messages"][0]["content"][1]["image_url"]["url"], "data:image/png;base64,QUJD")
-        g = ollama.generate_to_openai({"prompt": "p", "system": "s"})
+        g = model_api.generate_to_openai({"prompt": "p", "system": "s"})
         self.assertEqual([m["role"] for m in g["messages"]], ["system", "user"])
-        self.assertTrue(g["stream"])                      # (Ollama streams unless told not to)
+        self.assertTrue(g["stream"])                      # (streamed unless told not to)
 
     def test_translator(self):
-        t = ollama.Translator("m:latest", "chat")
+        t = model_api.Translator("m:latest", "chat")
         ch = lambda d, **k: {"choices": [{"delta": d, "finish_reason": k.get("fin")}], **k.get("x", {})}   # noqa: E731
         out = t.feed(ch({"content": "he"})) + t.feed(ch({"reasoning_content": "hm"})) + t.feed(None)
         self.assertEqual([o["message"].get("content") or o["message"].get("thinking") for o in out], ["he", "hm"])
@@ -60,18 +60,18 @@ class Pure(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             p = glm_quant(d, "Maya-L")
-            self.assertEqual(ollama.public_name(p), p.stem)
+            self.assertEqual(model_api.public_name(p), p.stem)
             for n in (p.stem, p.stem + ":latest", p.name, p.stem.removeprefix("maya-")):
-                self.assertEqual(ollama.find_config(d, n), p, n)
+                self.assertEqual(model_api.find_config(d, n), p, n)
             for n in ("", None, "../x", "nope", "maya-"):
-                self.assertIsNone(ollama.find_config(d, n), n)
+                self.assertIsNone(model_api.find_config(d, n), n)
 
 
 class Api(Served):
     def setUp(self):
         super().setUp()
         self.svc.model_management = True
-        self.run_name = ollama.public_name(self.cfg)
+        self.run_name = model_api.public_name(self.cfg)
 
     def raw(self, method, path, body=None, headers=None):
         h = {"Content-Type": "application/json"}
@@ -88,7 +88,7 @@ class Api(Served):
     def test_tags_ps_show(self):
         s, b = self.req("GET", "/api/tags")
         names = {m["name"] for m in b["models"]}
-        self.assertEqual((s, names), (200, {self.run_name + ":latest", ollama.public_name(self.other) + ":latest"}))
+        self.assertEqual((s, names), (200, {self.run_name + ":latest", model_api.public_name(self.other) + ":latest"}))
         s, b = self.req("GET", "/api/ps")
         self.assertEqual([m["name"] for m in b["models"]], [self.run_name + ":latest"])
         s, b = self.req("POST", "/api/show", {"model": self.run_name, "verbose": True})
@@ -128,7 +128,7 @@ class Api(Served):
             un.assert_called_once()
 
     def test_swap_on_request(self):
-        other = ollama.public_name(self.other)
+        other = model_api.public_name(self.other)
         msg = [{"role": "user", "content": "hi"}]
         s, b = self.req("POST", "/api/chat", {"model": other, "messages": msg})
         self.assertEqual(s, 409)                                 # (not started by maya.sh: cannot switch itself)
@@ -145,7 +145,7 @@ class Api(Served):
         l = glm_quant(self.d, "Maya-L")
         m = glm_quant(self.d, "Maya-L2", folder=l.parent / "GLM-5.3-Flash" / "Maya-L", pack_name="pack2")
         folder = self.d / "GLM-5.3-Flash" / "Maya-L"
-        s, b = self.req("DELETE", "/api/delete", {"model": ollama.public_name(m)})
+        s, b = self.req("DELETE", "/api/delete", {"model": model_api.public_name(m)})
         self.assertEqual(s, 200)
         self.assertFalse(m.exists())
         self.assertTrue((folder / "pack" / "index.txt").exists())            # the other model's pack stays
@@ -173,7 +173,7 @@ class Api(Served):
         total = sum(f.stat().st_size for f in lf.rglob("*") if f.is_file())
         self.assertTrue(plan["ok"])
         self.assertIn(total - 1000, [plan["bytes"], sum(i["bytes"] for i in plan["items"])])   # (the hard link not counted)
-        s, b = self.req("DELETE", "/api/delete", {"model": ollama.public_name(l)})
+        s, b = self.req("DELETE", "/api/delete", {"model": model_api.public_name(l)})
         self.assertEqual(s, 200)
         self.assertEqual((mf / "tables-hard.bin").read_bytes(), b"g" * 1000)                 # the link's data is intact
         self.assertEqual((mf / "tables-sym.bin").read_bytes(), b"g" * 1000)                  # the symlink still reads
@@ -228,7 +228,7 @@ class Pull(Api):
         first = self.svc.pull_slot().start("glm-maya-s", None)
         s, b = self.req("POST", "/api/pull", {"model": "deepseek-maya-xs", "stream": False})
         self.assertEqual(s, 409)
-        s, b = self.req("DELETE", "/api/delete", {"model": ollama.public_name(self.other)})
+        s, b = self.req("DELETE", "/api/delete", {"model": model_api.public_name(self.other)})
         self.assertEqual(s, 409)                                  # (no deleting while a download runs)
         self.assertEqual(self.req("POST", "/api/pull/cancel", {})[1], {"cancelled": True})
         first.proc.wait(10)
