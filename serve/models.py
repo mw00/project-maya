@@ -681,12 +681,14 @@ def own_defaults(path: Path) -> bool:
     if not cfg:
         return False
     sampling, effort = maya_quants.model_defaults(cfg)
-    if cfg.get("sampling") == sampling and cfg.get("reasoning_effort") == effort:
+    budget = maya_quants.thinking_budget_for(cfg)      # (GLM's 8192 where none was set, or still the old 32768)
+    if cfg.get("sampling") == sampling and cfg.get("reasoning_effort") == effort and budget is None:
         return False
     p = Path(path)
     p.with_name(p.name + ".prev").write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     st = p.stat()
-    write(p, {**cfg, "sampling": sampling, "reasoning_effort": effort})
+    write(p, {**cfg, "sampling": sampling, "reasoning_effort": effort,
+              **({} if budget is None else {"thinking_budget": budget})})
     os.utime(p, (st.st_atime, st.st_mtime))
     return True
 

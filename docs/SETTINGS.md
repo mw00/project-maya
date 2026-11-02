@@ -1859,7 +1859,7 @@ always thinks; its reasoning effort is the thinking level:
 The prompt is the GGUF's own template, verbatim (`<pack>/tokenizer/chat_template.jinja`): it always adds a fixed
 system prompt of the model's makers ahead of any system message a request sends, and thinking is always on in
 it. Tool calls are Qwen's XML form. A
-thinking budget (`"thinking_budget"` in the config, 32768 by default) closes the think block when it is reached.
+thinking budget (`"thinking_budget"` in the config, 32768 by default; 8192 for GLM-5.3-Flash Maya-XS; Settings > Chat defaults > Thinking budget changes it without a restart) closes the think block when it is reached.
 
 **The context.** 32K to 256K (the model's reach). Only the 12 attention layers keep a KV cache, about 14 KB a token in
 INT8 (26 KB in FP16), in VRAM; the setup recommends the largest context whose cache takes at most ~12% of the VRAM.

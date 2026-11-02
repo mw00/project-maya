@@ -2422,6 +2422,32 @@ class Service:
         except (OSError, ValueError) as e:
             print(f"[maya] could not save the new context in {self.config_path}: {e}", flush=True)
 
+    def think_budget_info(self) -> dict:
+        """The dashboard's Thinking budget: tokens (0 = no limit), whether this model has a think block at all."""
+        return {"budget": int(self.think_budget or 0), "supported": self.think_end_id is not None,
+                "saved": bool(self.config_path)}
+
+    def set_think_budget(self, value) -> dict:
+        """The dashboard's Thinking budget: 0 or 256..262144 tokens.  It applies from the next request (think_budget is
+        read per request, no restart) and is saved into the run config - marked as the user's own, so a setup or a
+        switch keeps it."""
+        if self.think_end_id is None:
+            raise ValueError("this model has no thinking budget")
+        n = maya_quants.check_thinking_budget(value)
+        self.think_budget = n
+        saved = False
+        if self.config_path:
+            p = Path(self.config_path)
+            cfg = json.loads(p.read_text(encoding="utf-8-sig"))
+            cfg["thinking_budget"] = n
+            cfg.setdefault("installer", {})["thinking_budget_set"] = True
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+            os.replace(tmp, p)
+            saved = True
+        print(f"[maya] thinking budget: {n or 'no limit'}" + (" (saved)" if saved else ""), flush=True)
+        return {"budget": n, "supported": True, "saved": saved}
+
     def port_info(self) -> dict:
         """The dashboard's Port: where the server listens, and whether a new port can apply at once (maya.py started
         this server and starts it again on the saved port) or only from the next start."""
@@ -5024,6 +5050,9 @@ def make_handler(svc: Service):
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
                     self._json(200, svc.context_limits())
+            elif path == "/api/thinking-budget":
+                if self._authorized():
+                    self._json(200, svc.think_budget_info())
             elif path == "/api/port":
                 # the dashboard's Port: where the server listens, and whether a new one applies at once
                 if self._authorized():
@@ -5145,6 +5174,18 @@ def make_handler(svc: Service):
                     return
                 if path == "/api/port":
                     self._port()
+                    return
+                if path == "/api/thinking-budget":
+                    body = self._body()
+                    if not self._own_page("the thinking budget can be changed"):
+                        return
+                    try:
+                        req = json.loads(body or b"{}")
+                        out = svc.set_think_budget(req.get("budget") if isinstance(req, dict) else None)
+                    except (TypeError, ValueError, OSError) as e:
+                        self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                        return
+                    self._json(200, out)
                     return
                 if path == "/api/update":
                     self._update()
@@ -6128,7 +6169,8 @@ def main() -> int:
         print(f"[maya] thinking level when a request names none: {level}"
               f"{'' if level in (svc.default_effort, f'{svc.default_effort} of 100') else f' (the config says {svc.default_effort})'}",
               flush=True)
-    svc.think_budget = int(cfg.get("thinking_budget", 32768) or 0) if svc.think_end_id is not None else 0
+    svc.think_budget = int(cfg["thinking_budget"] if cfg.get("thinking_budget") is not None else
+                           maya_quants.default_thinking_budget(cfg) if a.engine == "maya" else 32768)         if svc.think_end_id is not None else 0
     svc.idle_unload_s = max(0.0, a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0))
     if svc.think_budget:
         print(f"[maya] thinking budget: {svc.think_budget} tokens (then the answer)", flush=True)
