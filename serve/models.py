@@ -798,8 +798,28 @@ def _size(p: Path) -> int:
                 st = os.lstat(os.path.join(dp, n))
             except OSError:
                 continue
-            total += st.st_size if stat.S_ISREG(st.st_mode) else 0
+            # (a hard link another model's folder also holds - the Engram tables the setup links between folders - frees
+            # nothing when this one goes: the data stays with the last link, so it is not counted)
+            total += st.st_size if stat.S_ISREG(st.st_mode) and st.st_nlink <= 1 else 0
     return total
+
+
+def _links_into(roots: list, p: Path) -> bool:
+    """Whether a symbolic link under one of `roots` (another model's folders) points into `p`: deleting `p` would leave
+    it dangling (the setup links the Engram tables between model folders when it cannot hard link them)."""
+    seen = 0
+    for r in roots:
+        if not r.is_dir():
+            continue
+        for dp, dirs, files in os.walk(r):
+            for n in dirs + files:
+                seen += 1
+                f = os.path.join(dp, n)
+                if os.path.islink(f) and _within(_res(f) or Path(f), p):
+                    return True
+            if seen > 20000:
+                return False
+    return False
 
 
 def delete_plan(root: Path, path: Path) -> dict:
@@ -811,6 +831,7 @@ def delete_plan(root: Path, path: Path) -> dict:
     me = _res(path)
     others = [(p, read(p)) for p in config_paths(root) if _res(p) != me]
     refs = [r for _, c in others for r in runs_from(c)]
+    homes = [h.parent for h in (_res(pack_of(c)) for _, c in others) if h is not None]   # (their folders: links in them)
     out = {"ok": False, "why": None, "items": [], "bytes": 0, "folder": None, "gguf": 0, "pack": False,
            "vision": False, "drafter": None, "drafter_users": [], "kept": []}
     models = _res((cfg.get("installer") or {}).get("models_dir"))
@@ -823,8 +844,8 @@ def delete_plan(root: Path, path: Path) -> dict:
     project = _res(Path(root))
     items: list = []
 
-    def shared(p: Path) -> bool:                        # (another model runs from it, or from something in it)
-        return any(_within(r, p) for r in refs)
+    def shared(p: Path) -> bool:                        # (another model runs from it, or from something in it, or links to it)
+        return any(_within(r, p) for r in refs) or _links_into(homes + refs, p)
 
     def covered(p: Path) -> bool:
         return any(_within(p, it) for it, _ in items)

@@ -156,6 +156,30 @@ class Api(Served):
         self.assertTrue(self.cfg.exists())
         self.assertEqual(self.req("DELETE", "/api/delete", {"model": "nope"})[0], 404)
 
+    def test_delete_with_files_linked_from_another_model(self):
+        """The Engram tables are hard linked (or symlinked) between model folders: a hard link frees nothing and the
+        other folder keeps its data; a symlink into this folder keeps the file it points at."""
+        l = glm_quant(self.d, "Maya-L")
+        m = glm_quant(self.d, "Maya-L2")
+        lf, mf = self.d / "GLM-5.3-Flash" / "Maya-L", self.d / "GLM-5.3-Flash" / "Maya-L2"
+        shard = lf / "GLM-5.3-Flash-Maya-L-00001-of-00003.gguf"
+        try:
+            os.link(shard, mf / "tables-hard.bin")
+            os.symlink(lf / "GLM-5.3-Flash-Maya-L-00002-of-00003.gguf", mf / "tables-sym.bin")
+        except (OSError, NotImplementedError):
+            self.skipTest("this file system cannot link")
+        from serve import models as M
+        plan = M.delete_plan(self.d, l)
+        total = sum(f.stat().st_size for f in lf.rglob("*") if f.is_file())
+        self.assertTrue(plan["ok"])
+        self.assertIn(total - 1000, [plan["bytes"], sum(i["bytes"] for i in plan["items"])])   # (the hard link not counted)
+        s, b = self.req("DELETE", "/api/delete", {"model": ollama.public_name(l)})
+        self.assertEqual(s, 200)
+        self.assertEqual((mf / "tables-hard.bin").read_bytes(), b"g" * 1000)                 # the link's data is intact
+        self.assertEqual((mf / "tables-sym.bin").read_bytes(), b"g" * 1000)                  # the symlink still reads
+        self.assertTrue((lf / "GLM-5.3-Flash-Maya-L-00002-of-00003.gguf").exists())          # what it points at stayed
+        self.assertTrue(m.exists())
+
     def test_api_key(self):
         self.svc.api_key = "k"
         for method, path in (("GET", "/api/tags"), ("POST", "/api/pull"), ("DELETE", "/api/delete"),
