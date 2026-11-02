@@ -7414,6 +7414,7 @@ int main(int argc, char** argv) {
                 ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
+            err.clear();             // ... and so is the "cancelled" an abandoned read left behind (#703: every request after it failed)
             // VLEND / VRECLAIM (between requests): the on-demand vision encoder is about to start on this GPU
             // ("VLENT <bytes taken from the expert cache>"; 0: the free VRAM holds it) - and has ended ("VRECLAIMED";
             // an ERR while its memory is not free yet: try again)
