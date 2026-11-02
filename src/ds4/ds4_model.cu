@@ -2364,6 +2364,13 @@ struct Model::Impl {
         const char* v = std::getenv(k);
         return v != nullptr ? std::atoi(v) != 0 : devs.size() == 1;
     }
+    // the lent prompt room (Chunk::borrow): by default on one GPU, and on several where the CPU lane holds most of the
+    // experts and each layer sits on one GPU (auto_borrow, set by the chunk rule in load); DS4_BORROW=1/0 forces it
+    bool borrow_wanted() const {
+        const char* v = std::getenv("DS4_BORROW");
+        return v != nullptr ? std::atoi(v) != 0 : devs.size() == 1 || auto_borrow;
+    }
+    bool auto_borrow = false;
     // DS4_TP_BORROW=1 (off by default): a tensor-parallel group's members lend the prompt path their experts' room too
     // (Chunk::tp_lend) - on the flow only (DS4_FLOW_TP=1), which streams the lent slots' experts, each member its part
     // DS4_EXL3_LEND (opt-in: 1 on): an EXL3 pack whose CPU-lane experts are copied into RAM (not read in place) and
@@ -3685,6 +3692,17 @@ struct Model::Impl {
                         o.vram_experts;
             const double cpu_share = exp_b > 0 ? 1.0 - std::min(1.0, std::max(0.0, room - other_b) / exp_b) : 0.0;
             chunk = cpu_share >= 0.4 ? 8192 : 4096;
+            // (the CPU lane holds most of the experts, each layer on one GPU: the prompt path borrows the experts' room
+            // instead of keeping its own, so a long prompt reads in pieces of 16384 while the resident buffers stay
+            // small - the 16384 buffers' cost in decode is gone, and the experts the borrowed room held return after)
+            if (cpu_share >= 0.4 && std::getenv("DS4_BORROW") == nullptr) {
+                bool single = true;
+                for (const Group& G : groups) single = single && G.mem.size() == 1;
+                if (single) {
+                    const int c2 = chunk_default(chunk, true);
+                    if (c2 > chunk) chunk = c2, auto_borrow = true;
+                }
+            }
             if (chunk > 4096) std::fprintf(stderr, "ds4: prompt chunk %d (about %.0f%% of the experts on the CPU lane)\n", chunk, cpu_share * 100.0);
         }
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
@@ -4883,10 +4901,11 @@ struct Model::Impl {
     // most half of each GPU's experts' room (its free memory less the reserve and its share of the other weights,
     // estimated), and with hand-offs between groups their pinned rows (two chunks a GPU) within an eighth of the RAM;
     // else c0
-    int chunk_default(int c0) const {
+    int chunk_default(int c0, bool auto_b = false) const {
         const auto env_on = [](const char* k) { return std::getenv(k) == nullptr || std::atoi(std::getenv(k)) != 0; };
         const bool tp_lend = tp_borrow_on();   // (DS4_TP_BORROW: a group's members lend their room as one GPU does)
-        if (!pk.gguf || !file_experts || !(one_gpu_or("DS4_BORROW") || tp_lend) || !env_on("DS4_FLOW")) return c0;
+        if (!(pk.gguf || auto_b) || !file_experts || !(borrow_wanted() || auto_b || tp_lend) || !env_on("DS4_FLOW"))
+            return c0;
         for (const Group& G : groups)
             if (G.mem.size() > 1 && !tp_lend) return c0;
         double other_b = 0;
@@ -4904,6 +4923,7 @@ struct Model::Impl {
         const double hand_row = (double) g.hc * g.dim * 4 + 32 + (double) topk_stride() * 4 + (double) cand_stride() * 4;
         const uint64_t ram = ram_room();
         for (int C : {kMaxChunk, kMaxChunk / 2}) {
+            if (auto_b && C > 16384) continue;   // (several GPUs, the CPU lane's share large: 16384 - see load)
             if (C <= c0) break;
             const double rows = (double) lay_chunk(tc, C, nullptr, 2);
             bool ok = true;
@@ -5080,7 +5100,7 @@ struct Model::Impl {
         // a device whose trunk layers will all be on the flow (as in load(): a GGUF's in-place experts, each layer on
         // it alone) lends its buffers' room to its experts between prompts - on one GPU (DS4_BORROW=1: on more too,
         // =0: its own room, as before)
-        const bool borrow_on = file_experts && one_gpu_or("DS4_BORROW") &&
+        const bool borrow_on = file_experts && borrow_wanted() &&
                                (std::getenv("DS4_FLOW") == nullptr || std::atoi(std::getenv("DS4_FLOW")) != 0);
         const bool x3l = exl3_lend_on();   // (an EXL3 pack's tensor-parallel groups: a group's members all or none)
         // DS4_TP_BORROW=1: a device whose every trunk layer is a tensor-parallel group's member on the flow (the flow's
