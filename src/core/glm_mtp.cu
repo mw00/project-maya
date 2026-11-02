@@ -248,13 +248,17 @@ void Glm5Model::mtp_draft_setup(bool chain) {
             if (F->L[(size_t) il].moe) experts += F->L[(size_t) il].blob * (size_t) g.n_expert;
         room = free_b > experts + tb + ((size_t) 4 << 30);
     }
+    if (F->mtp_emb_h == nullptr)
+        if (cudaHostAlloc((void**) &F->mtp_emb_h, (size_t) g.n_embd * sizeof(float), cudaHostAllocDefault) != cudaSuccess)
+            cudaGetLastError();
+    if (F->ev_mtp_emb == nullptr)
+        if (cudaEventCreateWithFlags(&F->ev_mtp_emb, cudaEventDisableTiming) != cudaSuccess)
+            cudaGetLastError();
     if (want && room && pack_emb_src_ != nullptr &&
         (pack_emb_type_ == GGML_TYPE_Q6_K || pack_emb_type_ == GGML_TYPE_Q8_0) && g.n_embd % 256 == 0) {
         bool ok = cudaMalloc(&F->mtp_emb, tb) == cudaSuccess &&
                   cudaMemcpy(F->mtp_emb, pack_emb_src_, tb, cudaMemcpyHostToDevice) == cudaSuccess &&
-                  cudaHostAlloc((void**) &F->mtp_emb_h, (size_t) g.n_embd * sizeof(float), cudaHostAllocDefault) ==
-                      cudaSuccess &&
-                  cudaEventCreateWithFlags(&F->ev_mtp_emb, cudaEventDisableTiming) == cudaSuccess;
+                  F->mtp_emb_h != nullptr && F->ev_mtp_emb != nullptr;
         F->mtp_emb_type = (int) pack_emb_type_;
         // the device's rows against the host's dequantization (the token path's): the same floats, or no chain
         const ggml_type_traits* tt = ggml_get_type_traits((ggml_type) pack_emb_type_);
@@ -276,11 +280,7 @@ void Glm5Model::mtp_draft_setup(bool chain) {
         if (!ok) {
             cudaGetLastError();
             if (F->mtp_emb) cudaFree(F->mtp_emb);
-            if (F->mtp_emb_h) cudaFreeHost(F->mtp_emb_h);
-            if (F->ev_mtp_emb) cudaEventDestroy(F->ev_mtp_emb);
             F->mtp_emb = nullptr;
-            F->mtp_emb_h = nullptr;
-            F->ev_mtp_emb = nullptr;
             std::fprintf(stderr, "glm mtp: CUDA%d token_embd did not set up on the device - the drafts go step by step\n",
                          dev_);
         }
@@ -765,4 +765,284 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
     return ok;
 }
 
+// ---------------------------------------------------------------- the pipelined MTP decode on a split
+// STRATA_GLM_SPEC_WIN=1: the split could not run decode_mtp (the NextN block is on the split's last part, and the
+// token path's own per-token pipeline puts one token through the whole split per round).  The pipelined verify window
+// (win_pipe_*, glm_window.cu, the DFlash decode's) runs over the split's parts, and the NextN block drafts with its
+// own chain on the block part.  A round: the anchor pass through every part (the last confirmed token y, begun by the
+// previous round: win_pipe_begin fresh = false queues behind its late tokens without waiting the devices; every 8th
+// window waits, so the tiers' boundary runs), the NextN block drafts n tokens on the block part, the drafts go into
+// the window as tokens 1..n, the picks compare against the next draft and the tokens past the first wrong one skip
+// their work (win_pipe_cancel_from), the kept rows commit (their recurrent states restored/replayed per part), and
+// the kept rows' trunk hidden states feed the NextN cache and the next round's first draft step - so the draft chain
+// can be enqueued while the parts' commit runs.  The draft-ahead shape of the DFlash decode; the drafter is the
+// NextN block's chain.
+bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                                 int64_t& produced, std::string& err) {
+    produced = 0;
+    const bool on = [] {
+        const char* e = getenv("STRATA_GLM_SPEC_WIN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    if (!on || split_next_ == nullptr || spec_tail_last()->mtp_il_ < 0) {
+        err = "glm spec pipe: needs STRATA_GLM_SPEC_WIN and a split with the NextN block";
+        return false;
+    }
+    Glm5Model* TL = spec_tail_last();
+    if (TL->fast_ == nullptr || TL->fast_->mtpc.cap < 1) {
+        err = "glm spec pipe: the block part's drafting buffers are not set up";
+        return false;
+    }
+    FastState* FT = TL->fast_;
+    const Glm5Geometry& g = g_;
+    (void) g;
+    const int n_cap = std::min(mtp_draft_cap(), std::min(kPipeMax - 1, 8));
+    static const bool trace = getenv("STRATA_GLM_MTP_TRACE") != nullptr;
+    const auto ms_since = [](std::chrono::steady_clock::time_point a) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+    };
+    // the first token: the prompt's last forward left its logits (and greedy argmax) on the tail group's last part
+    int y = -1;
+    if (sp.greedy && sp.penalty_last_n <= 0 && last_tok_ >= 0) {
+        y = last_tok_;
+    } else {
+        cudaSetDevice(TL->dev_);
+        y = TL->fast_sample(sp, err);
+        if (y < 0) return false;
+    }
+    y = forced(y);
+    sp.counter += 1;
+    last_tok_ = y;
+    ++produced;
+    if (!emit(y) || produced >= max_new || pos_ + 1 >= max_ctx_) return true;
+    TL->mtp_hx_pos_ = pos_ - 1;   // the prompt's last forward left position pos_ - 1's trunk hidden state in head_x
+    mtp_same_ = 0;   // (a request's first rounds carry its prompt's tier work: not measured)
+    static const double acc_keep = [] {
+        const char* v = getenv("STRATA_GLM_MTP_ACC_WINDOW");
+        const double w = v != nullptr ? std::max(8.0, std::atof(v)) : 128.0;
+        return (w - 1.0) / w;
+    }();
+    std::vector<int32_t> winv((size_t) n_cap + 1), out((size_t) n_cap + 1);
+    const float* rows_hx = nullptr;
+    bool begun = false;
+    bool ok = true;
+    int64_t rounds = 0, drafted = 0, accepted = 0;
+    // STRATA_GLM_WIN_COMMIT_WAIT=1: the parts' commits waited for (A/B; off: the next window queues behind them)
+    static const bool commit_wait = [] {
+        const char* v = getenv("STRATA_GLM_WIN_COMMIT_WAIT");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    // the first token's round also carries the prompt path's tier work: the window begins ahead of it like the
+    // DFlash decode's rounds do
+    for (;;) {
+        const auto t_round = std::chrono::steady_clock::now();
+        const int64_t N = pos_;                 // where y (the last confirmed token) goes
+        // STRATA_GLM_SPEC_WIN=2: the batched verify window (window(): the whole window through the parts, like the
+        // one-GPU MTP decode's) instead of the pipelined per-token one
+        static const bool batched_win = [] {
+            const char* e = getenv("STRATA_GLM_SPEC_WIN");
+            return e != nullptr && std::atoi(e) == 2;
+        }();
+        if (!batched_win && !begun) {
+            if (!win_pipe_begin(-1 - y, err, &sp, rounds % 8 == 0)) { ok = false; break; }
+        }
+        begun = false;
+        // ---- the drafts: the NextN block's chain on the block part's stream (the last part's crew worker is held
+        // while we draft here, and the earlier parts run t = 0..i in parallel as each draft is pushed)
+        int nd = 0;
+        {
+            int n = mtp_choose(n_cap);
+            n = (int) std::min<int64_t>(n, max_new - produced - 1);
+            n = (int) std::min<int64_t>(n, max_ctx_ - 1 - N);
+            if (TL->mtp_hx_pos_ != N - 1) n = 0;   // (head_x has no trunk state for the first draft step: a plain token)
+            n = std::max(n, 0);
+            const bool chain = FT->mtp_emb != nullptr && mtp_chain_wanted();
+            if (n > 0) {
+                cudaSetDevice(TL->dev_);
+                if (chain) {
+                    for (int i = 0; i < n && ok; ++i)
+                        ok = TL->fast_mtp(N - 1 + i, i == 0 ? y : -1, err, i, true, false);
+                    if (ok) {
+                        cudaMemcpyAsync(FT->mtp_tok_h, FT->mtp_tok, (size_t) n * sizeof(int), cudaMemcpyDeviceToHost,
+                                        FT->cs);
+                        cudaEventRecord(FT->ev_mtp, FT->cs);
+                        ok = glmfast::wait_event(FT->ev_mtp, "glm spec pipe drafts", err) && TL->fast_->route_ok(err);
+                    }
+                    for (int i = 0; i < n && ok; ++i) {
+                        winv[(size_t) i + 1] = FT->mtp_tok_h[i];
+                        if (!batched_win) ok = win_pipe_push(winv[(size_t) i + 1], err);
+                    }
+                } else {
+                    int32_t tok = y;
+                    for (int i = 0; i < n && ok; ++i) {
+                        if (!TL->fast_mtp(N - 1 + i, tok, err, i, true) ||
+                            !glmfast::wait_event(FT->ev_mtp, "glm spec pipe draft", err) ||
+                            !TL->fast_->route_ok(err)) {
+                            ok = false;
+                            break;
+                        }
+                        tok = FT->mtp_tok_h[i];
+                        winv[(size_t) i + 1] = tok;
+                        if (!batched_win && !win_pipe_push(tok, err)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if (!ok) {
+                    if (!batched_win) (void) win_pipe_push(-1, err);
+                    break;
+                }
+                nd = n;
+                TL->mtp_hx_pos_ = -1;   // (head_x holds the block's own hidden state once the steps ran)
+            }
+        }
+        if (!batched_win && !win_pipe_push(-1, err)) { ok = false; break; }
+        if (trace) std::fprintf(stderr, "glm spec pipe: p0 %lld drafts %d\n", (long long) N, nd);
+        // ---- the window's tokens: the anchor y (t = 0, already begun) and the drafts
+        const int T = 1 + nd;
+        int acc = 0;
+        if (batched_win) {
+            // the whole window through every part at once (the batched one: T columns a layer), every row's pick
+            // back with out[]
+            winv[0] = y;
+            if (!window(winv.data(), T, out.data(), err, &sp)) { ok = false; break; }
+            for (int t = 0; t < T; ++t) {
+                out[(size_t) t] = forced(out[(size_t) t]);
+                if (t + 1 >= T) break;
+                mtp_hit_[t + 1] *= acc_keep;
+                mtp_reach_[t + 1] = mtp_reach_[t + 1] * acc_keep + 1.0;
+                if (out[(size_t) t] != winv[(size_t) t + 1]) break;
+                mtp_hit_[t + 1] += 1.0;
+                ++acc;
+            }
+        } else {
+            // ---- the picks: each row's pick as its token comes out; the first pick a draft does not repeat skips the
+            // tokens past it (their queued kernels leave without their work)
+            for (int t = 0; t < T; ++t) {
+                int32_t pick = -1;
+                if (!win_pipe_pick(t, pick, err)) { ok = false; break; }
+                out[(size_t) t] = pick;
+                if (t + 1 >= T) break;
+                const int32_t want = (t == 0 && force_tok_ >= 0) ? force_tok_ : winv[(size_t) t + 1];
+                mtp_hit_[t + 1] *= acc_keep;
+                mtp_reach_[t + 1] = mtp_reach_[t + 1] * acc_keep + 1.0;
+                if (pick != want) {
+                    win_pipe_cancel_from(t + 1);
+                    break;
+                }
+                mtp_hit_[t + 1] += 1.0;
+                ++acc;
+            }
+            if (!ok) break;
+            if (!win_pipe_settle(err)) { ok = false; break; }
+        }
+        drafted += nd;
+        accepted += acc;
+        spec_steps_ += (uint64_t) nd;
+        spec_hits_ += (uint64_t) acc;
+        ++rounds;
+        // the kept rows' trunk hidden states: the pipelined window's per-row buffers are SLOT-indexed
+        // (bank * kPipeMax + t), not flat rows
+        {
+            const size_t sl0 = (size_t) (batched_win ? 0 : TL->fast_->win.bank * kPipeMax);
+            rows_hx = TL->fast_->win.head_x + sl0 * (size_t) g.n_embd;
+        }
+        // ---- the kept tokens go out in order
+        bool more = true;
+        int kept = 0;
+        for (; kept < acc; ++kept) {
+            sp.counter += 1;
+            ++produced;
+            more = emit(forced(out[(size_t) kept])) && produced < max_new;
+            if (!more || force_tok_ >= 0) {
+                ++kept;
+                break;
+            }
+        }
+        const int keep = 1 + kept;
+        const int32_t y2 = forced(out[(size_t) keep - 1]);
+        // ---- the commit: the kept rows' recurrent states restored/replayed per part; wait for the crew threads to
+        // finish enqueueing their commit work before touching the block part's stream below
+        if (!window_commit(keep, err, commit_wait || !more)) { ok = false; break; }
+        win_commit_wait();
+        // ---- the NextN cache: entries p0..p0 + keep - 2 from the kept rows' trunk states and the accepted drafts
+        // (a kept row's cache entries replace what the wrong drafts wrote at the same positions), and head_x again
+        // holds the FIRST DRAFT STEP's trunk hidden state for the next round's drafts.  STRATA_GLM_SPEC_PIPE_DRAIN=1
+        // (the safe ordering): the parts' commits waited for and the parts drained before these direct enqueues - the
+        // crew schedules them per part behind the window's late tokens, and this host thread's own enqueues here could
+        // otherwise land between them in a way the streams do not agree on.
+        static const bool pipe_drain = [] {
+            const char* e = getenv("STRATA_GLM_SPEC_PIPE_DRAIN");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        if (pipe_drain) {
+            cudaSetDevice(TL->dev_);
+            std::string de;
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(FT->cs), "glm spec pipe tail drain", de)) { err = de; ok = false; break; }
+        }
+        if (keep > 1 && !TL->mtp_cache_rows(N, keep - 1, rows_hx, winv.data() + 1, err, false)) { ok = false; break; }
+        cudaSetDevice(TL->dev_);
+        cudaMemcpyAsync(FT->head_x, rows_hx + (size_t) (keep - 1) * g.n_embd, (size_t) g.n_embd * sizeof(float),
+                        cudaMemcpyDeviceToDevice, FT->cs);
+        TL->mtp_hx_pos_ = N + keep - 1;
+        if (trace) std::fprintf(stderr, "glm spec pipe2: p0 %lld keep %d acc %d (%d rows)\n", (long long) N, keep, acc, T);
+        // the adaptive length's bookkeeping (decode_mtp's; the round's wall time is the length's next measurement)
+        {
+            const double ms = ms_since(t_round);
+            ++mtp_rounds_;
+            ++mtp_round_n_[std::min(nd, 8)];
+            if (nd == mtp_prev_n_) ++mtp_same_;
+            else { mtp_prev_n_ = nd; mtp_same_ = 0; }
+            if (mtp_same_ >= 2 && nd < 9) {
+                mtp_ms_[nd] += (ms - mtp_ms_[nd]) / (double) std::min<uint64_t>(mtp_seen_[nd] + 1, 10);
+                ++mtp_seen_[nd];
+            }
+        }
+        if (!more) break;
+        cudaSetDevice(dev_);
+        sp.counter += 1;   // (the anchor token: the request's counter as the token loop would have run it)
+        ++produced;
+        last_tok_ = y2;
+        if (!emit(y2) || produced >= max_new || pos_ + 1 >= max_ctx_) break;
+        y = y2;
+        // ---- the next window's anchor begins now, behind the commit (on the earlier parts' crew threads; the last
+        // part's crew thread stays held while the next round drafts)
+        if (!batched_win) {
+            if (!win_pipe_begin(-1 - y, err, &sp, (rounds % 8) == 0)) { ok = false; break; }
+            begun = true;
+        }
+    }
+    // the drain: the parts' streams idle and the routes checked
+    {
+        cudaSetDevice(TL->dev_);
+        std::string drain_err;
+        if (!glmfast::cuda_ok(cudaStreamSynchronize(FT->cs), "glm spec pipe drain", drain_err) ||
+            !FT->route_ok(drain_err)) {
+            if (ok) err = drain_err;
+            ok = false;
+        }
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
+            cudaSetDevice(m->dev_);
+            std::string de2;
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm spec pipe drain", de2)) {
+                if (ok) err = de2;
+                ok = false;
+            }
+        }
+        cudaSetDevice(dev_);
+    }
+    if (rounds > 0 && trace)
+        std::fprintf(stderr, "glm spec pipe: %lld rounds, %.2f drafts, %.2f accepted a round\n",
+                     (long long) rounds, (double) drafted / (double) rounds, (double) accepted / (double) rounds);
+    win_prof_report();
+    if (ok && gf::launch_errors() > 0) {
+        err = "glm spec pipe: a kernel launch failed (see stderr)";
+        ok = false;
+    }
+    cudaSetDevice(dev_);
+    return ok;
+}
+
+// ---------------------------------------------------------------- the decode
 }  // namespace strata::core

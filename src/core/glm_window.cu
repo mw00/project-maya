@@ -1207,6 +1207,8 @@ struct Glm5Model::PipeCrew {
     std::vector<std::unique_ptr<Worker>> w;
     std::atomic<bool> failed{false};
     std::atomic<bool> fresh{false};   // this window's begin waits for the devices (win_pipe_begin_part)
+    bool hold_last = false;           // decode_spec_pipe: hold the last part's jobs while the main thread drafts on it
+    std::vector<int> held;
     std::vector<unsigned> commit_want;   // a commit not waited for (window_commit's wait = false): each part's count
     std::mutex emu;
     std::string err;
@@ -1435,6 +1437,8 @@ bool Glm5Model::win_pipe_begin_part(bool fresh, std::string& err) {
 
 bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::kernels::SamplerParams* sp,
                                bool fresh) {
+    const bool hold_last = first < 0;
+    if (hold_last) first = -1 - first;
     if (fast_ == nullptr) {
         err = "glm window: needs the fast path";
         return false;
@@ -1531,12 +1535,27 @@ bool Glm5Model::win_pipe_begin(int32_t first, std::string& err, const strata::ke
         crew_->failed.store(false);
         crew_->err.clear();
         crew_->fresh.store(fresh, std::memory_order_release);
+        crew_->hold_last = hold_last;
+        crew_->held.clear();
         for (auto& wk : crew_->w) wk->done.store(0);
     }
     return win_pipe_push(first, err);
 }
 
 bool Glm5Model::win_pipe_push(int32_t token, std::string& err) {
+    if (token < 0) {
+        if (crew_ != nullptr && crew_->hold_last && !crew_->w.empty()) {
+            crew_->hold_last = false;
+            auto& wk = crew_->w.back();
+            {
+                std::lock_guard<std::mutex> lk(wk->mu);
+                for (int ht : crew_->held) wk->jobs.push_back(ht);
+                crew_->held.clear();
+            }
+            wk->cv.notify_one();
+        }
+        return true;
+    }
     const Glm5Geometry& g = g_;
     const int E = g.n_embd;
     FastState* F0 = fast_;
@@ -1560,8 +1579,13 @@ bool Glm5Model::win_pipe_push(int32_t token, std::string& err) {
         m->fast_->win.T = t + 1;
     }
     if (crew_ != nullptr && win_threads_on() && split_next_ != nullptr) {
-        // each part's thread takes it in turn
-        for (auto& wk : crew_->w) {
+        // each part's thread takes it in turn (except the last part while hold_last is set for drafting)
+        for (size_t k = 0; k < crew_->w.size(); ++k) {
+            if (crew_->hold_last && k + 1 == crew_->w.size()) {
+                crew_->held.push_back(t);
+                continue;
+            }
+            auto& wk = crew_->w[k];
             {
                 std::lock_guard<std::mutex> lk(wk->mu);
                 wk->jobs.push_back(t);
