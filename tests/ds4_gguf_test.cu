@@ -2870,12 +2870,32 @@ void test_ar2(int da, int db, int rows) {
     namespace sd = strata::ds4;
     const int D = 5120, devs[2] = {da, db};
     const size_t nmax = (size_t) rows * D;
-    auto hm = [](size_t bytes) {
+    // DS4_AR_P2P=1: the buffers in the first device's memory, the second reaching them by peer access (as the
+    // engine's gmap); =2: in the second's
+    const int p2p = std::getenv("DS4_AR_P2P") != nullptr ? std::atoi(std::getenv("DS4_AR_P2P")) : 0;
+    auto hm = [&](size_t bytes) {
         void* v = nullptr;
-        CU(cudaHostAlloc(&v, bytes + 64, cudaHostAllocMapped | cudaHostAllocPortable));
-        std::memset(v, 0, bytes + 64);
+        if (p2p == 0) {
+            CU(cudaHostAlloc(&v, bytes + 64, cudaHostAllocMapped | cudaHostAllocPortable));
+            std::memset(v, 0, bytes + 64);
+            return v;
+        }
+        const int home = p2p == 2 ? db : da, peer = p2p == 2 ? da : db;
+        CU(cudaSetDevice(peer));
+        const cudaError_t pe = cudaDeviceEnablePeerAccess(home, 0);
+        if (pe == cudaErrorPeerAccessAlreadyEnabled) (void) cudaGetLastError();
+        else CU(pe);
+        CU(cudaSetDevice(home));
+        CU(cudaMalloc(&v, bytes + 64));
+        CU(cudaMemset(v, 0, bytes + 64));
+        CU(cudaDeviceSynchronize());
         return v;
     };
+    auto hfree = [&](void* v) {
+        if (p2p == 0) CU(cudaFreeHost(v));
+        else CU(cudaFree(v));
+    };
+    if (p2p != 0) std::printf("all-reduce buffers on CUDA%d's memory (DS4_AR_P2P=%d)\n", p2p == 2 ? db : da, p2p);
     sd::ArGroup a;
     a.nm = 2;
     a.slots = 2;
@@ -2968,9 +2988,9 @@ void test_ar2(int da, int db, int rows) {
         CU(cudaFree(x[m]));
         CU(cudaFree(cnt[m]));
     }
-    CU(cudaFreeHost(a.data));
-    CU(cudaFreeHost(a.flags));
-    CU(cudaFreeHost(a.pflags));
+    hfree(a.data);
+    hfree(a.flags);
+    hfree(a.pflags);
 }
 
 int main(int argc, char** argv) {

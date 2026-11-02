@@ -11,6 +11,31 @@ VALIDATION_CONTEXT = ContextVar("responses_validation_context", default=None)
 _VALIDATOR_TYPE = None
 
 
+def json_instruction(schema=None):
+    """What the model is told when a request asks for JSON: the schema too, when there is one."""
+    if schema is None:
+        return "Return only a valid JSON object, with no Markdown or surrounding text."
+    return "Return only a JSON object matching this JSON Schema, with no Markdown or surrounding text:\n" + json.dumps(schema)
+
+
+def with_system_note(messages, note):
+    """The messages with `note` at the end of the leading system message, or as a new one when there is none. A
+    system message put before it would not stay one: a template takes a system message only first, so a later one
+    becomes a user turn (frontend._late_system_to_user) or, with DeepSeek, a mid-conversation system turn."""
+    out = list(messages)
+    if out and out[0].get("role") == "system":
+        first = dict(out[0])
+        content = first.get("content")
+        if isinstance(content, list):
+            first["content"] = content + [{"type": "text", "text": "\n\n" + note}]
+        else:
+            first["content"] = (content + "\n\n" if content else "") + note
+        out[0] = first
+    else:
+        out.insert(0, {"role": "system", "content": note})
+    return out
+
+
 class OutputValidationError(ValueError):
     def __init__(self, message, done=None):
         super().__init__(message)
@@ -118,9 +143,7 @@ class ResponseValidation:
     def prompt(self):
         if self.format["type"] == "text":
             return None
-        if self.validator is None:
-            return "Return only a valid JSON object, with no Markdown or surrounding text."
-        return "Return only a JSON object matching this JSON Schema, with no Markdown or surrounding text:\n" + json.dumps(self.format["schema"])
+        return json_instruction(None if self.validator is None else self.format["schema"])
 
     def events(self, run, cancel=None):
         if not self.buffered:

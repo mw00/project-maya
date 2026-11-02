@@ -13,7 +13,7 @@ import {CtxSlider, Icon, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 // the page's own state (beside S: nothing else reads it but the model menu's count)
 export const MS = {data: null, err: null, add: false, details: {}, edit: null, draft: null, tab: 0, preview: null,
-                   check: "", saving: false, restart: null, del: null, gone: null};
+                   check: "", saving: false, restart: null, del: null, gone: null, cat: null, catErr: null, loadBusy: null};
 
 export async function loadModels() {
   try {
@@ -106,6 +106,20 @@ async function switchTo(m) {
     return;
   }
   watchRestart({why: "switch", file: m.file, name: titleOf(m)});
+}
+
+// Unload: the engine ends and the GPU has its memory back (POST /models/unload); Load starts it again (/models/load, a
+// few minutes).  Any request to the API loads it too.
+async function loadOrUnload(op) {
+  MS.loadBusy = op === "load" ? "load" : null;
+  emit();
+  try {
+    await api(`models/${op}`, {method: "POST", body: {}});
+  } catch (e) {
+    toast("error", op === "load" ? "The model did not load" : "The model did not unload", e.message, 8000);
+  }
+  MS.loadBusy = null;
+  await loadModels();
 }
 
 // ------------------------------------------------------------------ the engine settings (one card's, as a draft)
@@ -662,6 +676,79 @@ function DeleteDialog() {
     </div></div>`;
 }
 
+// ------------------------------------------------------------------ downloading (GET /api/catalog, POST /api/pull)
+// MS.cat: {models: what the setup can download, pull: the download running (or the last one)}.  The download is the
+// setup's own (curl with resume, the sha256 check, the pack, the config), run by the server: it goes on if the page closes.
+const pulling = (p) => !!p && (p.state === "starting" || p.state === "downloading");
+let pullTimer = null;
+
+export async function loadCatalog() {
+  try { MS.cat = await api("api/catalog"); MS.catErr = null; } catch (e) { MS.catErr = e.message; }
+  emit();
+  watchPull();
+}
+
+function watchPull() {
+  if (pullTimer || !pulling(MS.cat && MS.cat.pull)) return;
+  pullTimer = setTimeout(async () => {
+    pullTimer = null;
+    try {
+      const was = MS.cat.pull, out = await api("api/pull/status");
+      MS.cat.pull = out.pull;
+      if (was && out.pull && was.state !== out.pull.state && out.pull.state === "success") {
+        toast("success", "Download finished", `${out.pull.model} is on this PC and in the list.`, 8000);
+        await loadModels();
+        loadCatalog();
+        return;
+      }
+      if (out.pull && out.pull.state === "error") toast("error", "The download stopped", out.pull.error || "", 10000);
+    } catch (e) { /* the server is busy or restarting: asked again */ }
+    emit();
+    watchPull();
+  }, 2000);
+}
+
+async function startPull(c) {
+  try {
+    const out = await api("api/pull", {method: "POST", body: {model: c.id, detach: true}});
+    MS.cat.pull = out.pull;
+  } catch (e) {
+    toast("error", "The download did not start", e.message, 8000);
+  }
+  emit();
+  watchPull();
+}
+
+async function cancelPull() {
+  if (!(await confirmDialog("Cancel the download?", "<p>What is downloaded stays; the next download continues from it.</p>", "Cancel the download"))) return;
+  try { await api("api/pull/cancel", {method: "POST", body: {}}); } catch (e) { toast("error", "Not cancelled", e.message, 6000); }
+  loadCatalog();
+}
+
+function Download() {
+  const C = MS.cat, p = C && C.pull, busy = pulling(p);
+  const row = (c) => {
+    const mine = p && p.model === c.id && (busy || p.state === "error");
+    const pct = mine && p.percent != null ? p.percent : null;
+    return html`<div class="mdl-dl" key=${c.id}>
+      <span class="mdl-dl__name"><b>${c.name}</b><span>${c.size_gb ? `about ${fmt(c.size_gb, 0)} GB` : "size shown when it starts"}</span></span>
+      ${c.installed ? html`<span class="pill pill--accent">Installed</span>`
+        : mine && busy ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${cancelPull}>Cancel</button>`
+        : html`<button type="button" class="btn btn--secondary btn--sm" disabled=${busy} onClick=${() => startPull(c)}><${Icon} name="download" sm/>Download</button>`}
+      ${mine ? html`<div class="mdl-dl__bar" role=${busy ? "progressbar" : "alert"} aria-valuemin="0" aria-valuemax="100" aria-valuenow=${pct == null ? undefined : pct}
+          aria-label=${`Downloading ${c.name}`}><i style=${`width:${pct == null ? 4 : pct}%`}></i></div>
+        <span class="mdl-dl__txt">${p.state === "error" ? `It stopped: ${p.error}`
+          : p.total ? `${bytes(p.completed)} of ${bytes(p.total)}${pct != null ? ` (${pct}%)` : ""}${p.bytes_per_s ? ` · ${fmt(p.bytes_per_s / 1e6, 0)} MB/s` : ""}`
+          : p.message || "The setup is starting…"}</span>` : null}
+    </div>`;
+  };
+  return html`<section class="card mdl-add" aria-label="Download a model">
+    <b>Download a model</b>
+    <span>The setup's own download: it resumes where it stopped, checks every file's sha256, then builds the pack and writes the model's config, which appears in the list.</span>
+    ${MS.catErr ? html`<div class="mdl-warn mdl-warn--err" role="alert">${MS.catErr}</div>` : !C ? html`<span role="status">Reading the catalog…</span>` : C.models.map(row)}
+  </section>`;
+}
+
 // ------------------------------------------------------------------ files no model uses (POST /api/models/leftovers)
 async function deleteLeftover(x) {
   const what = [x.pack ? "a pack Maya built" : null, x.hub ? "a download from Hugging Face" : null].filter(Boolean);
@@ -709,8 +796,9 @@ function Card({m}) {
       <${ModelLogo} model=${m.model} size=${44}/>
       <span class="mdl-card__name"><span><b>${modelName(m.model)}</b><span class="mdl-badge">${m.quant}</span></span>
         <span class="mdl-card__about">${about}</span></span>
-      ${m.running ? html`<span class=${`pill pill--${stopping ? "warn" : restarting ? "info" : "accent"}`} role="status">
-          <i class=${`status__dot${stopping || restarting ? " is-pulse" : ""}`}></i>${stopping ? "Stopping…" : restarting ? "Restarting…" : "Running"}</span>`
+      ${m.running ? html`<span class=${`pill pill--${stopping ? "warn" : restarting || MS.loadBusy ? "info" : MS.data.loaded ? "accent" : "warn"}`} role="status">
+          <i class=${`status__dot${stopping || restarting || MS.loadBusy ? " is-pulse" : ""}`}></i>${stopping ? "Stopping…" : restarting ? "Restarting…"
+            : MS.loadBusy ? "Loading…" : MS.data.loaded ? "Running" : "Unloaded"}</span>`
         : loading ? html`<span class="pill pill--info" role="status"><i class="status__dot is-pulse"></i>Loading…</span>`
         : !m.ok ? html`<span class="pill pill--warn" title=${m.missing || ""}>${m.missing && m.missing.startsWith("its model files") ? "Files missing" : "Incomplete"}</span>`
         : html`<button type="button" class="btn btn--secondary btn--sm" disabled=${!!r} onClick=${() => switchTo(m)}><${Icon} name="swap" sm/>Switch to this</button>`}
@@ -721,6 +809,8 @@ function Card({m}) {
       <span class="mdl-card__file"><code>${m.file}</code><span>·</span><span>${m.running ? "running now" : m.used ? `last used ${relTime(m.used * 1000)}` : ""}</span></span>
       <span class="mdl-card__acts">
         ${m.running ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${() => showView("monitor")}><${Icon} name="activity" sm/>Monitor</button>` : null}
+        ${m.running && MS.data.can_unload && !r ? html`<button type="button" class="btn btn--ghost btn--sm" disabled=${!!MS.loadBusy}
+          onClick=${() => loadOrUnload(MS.data.loaded ? "unload" : "load")}><${Icon} name=${MS.data.loaded ? "stop" : "refresh"} sm/>${MS.data.loaded ? "Unload" : "Load"}</button>` : null}
         <button type="button" class=${`btn btn--ghost btn--sm${editing ? " is-on" : ""}`} aria-expanded=${String(editing)} disabled=${!m.ok}
           onClick=${() => openEditor(m)}><${Icon} name="sliders" sm/>Engine settings</button>
         <button type="button" class="btn btn--ghost btn--sm" aria-expanded=${String(open)} onClick=${() => { MS.details[m.file] = !open; emit(); }}>
@@ -751,11 +841,12 @@ export function ModelsPage() {
       <div class="mon__head">
         <div><h1>Models</h1><p>The models set up on this machine. Maya runs one at a time.</p></div>
         <div class="mon__acts"><button type="button" class=${`btn btn--secondary btn--sm${MS.add ? " is-on" : ""}`} aria-expanded=${String(MS.add)}
-          onClick=${() => { MS.add = !MS.add; emit(); }}><${Icon} name="plus" sm/>Add a model</button></div>
+          onClick=${() => { MS.add = !MS.add; emit(); if (MS.add) loadCatalog(); }}><${Icon} name="plus" sm/>Add a model</button></div>
       </div>
-      ${MS.add ? html`<section class="card mdl-add" aria-label="Add a model">
-        <b>Add a model</b>
-        <span>Run the setup again and pick another model or quant. It shows the download's size first, then builds the model's pack and writes its config, which appears here.</span>
+      ${MS.add || pulling(D && D.pull) ? html`<${Download}/>` : null}
+      ${MS.add ? html`<section class="card mdl-add" aria-label="Run the setup yourself">
+        <b>Or run the setup yourself</b>
+        <span>It asks which model and quant, shows the download's size first, then builds the model's pack and writes its config, which appears here.</span>
         ${cmds.map(([os, c]) => html`<div class="mdl-add__cmd"><span class="mdl-add__os">${os}</span><code>${c}</code>
           <button type="button" class="icon-btn icon-btn--sm" aria-label=${`Copy ${c}`} onClick=${() => copyText(c)}><${Icon} name="copy" sm/></button></div>`)}
       </section>` : null}

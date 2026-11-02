@@ -4,6 +4,37 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## [UNRELEASED]
+
+- **ROCm installs with versioned LLVM slots:** `hip_clang` finds a distribution's LLVM slot (`<root>/lib/llvm/<version>/bin/clang++`,
+ newest first), so Gentoo passes the HIP check with `ROCM_PATH=/usr` and no `/usr/lib64/rocm/llvm` symlink (`tools/test_maya_hip.py`
+ covers it).
+
+## v1.1.50 - 2026-11-02
+
+Models you can download, swap and delete from the Models page or the API, a Turbo button, a thinking budget you can set, GLM Maya-XS, faster long prompts on DeepSeek, and a round of community pull requests.
+
+- **Models page:** the catalog lists every Maya model with its size. Download one with a progress bar, load it, unload the running one, or delete one (a file that another model's folder links to stays). Nothing needs a command line.
+- **Model API:** `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` and `/api/delete` list, load, download and delete models from any app or script. A request for a model that is not loaded swaps to it, and `keep_alive` unloads it when idle. `/api/ps` shows "loading" while the weights load.
+- **Turbo:** one button beside the model's parameters sets the fastest settings for the model (greedy sampling, no thinking, 32K context on GLM and MiniMax, expert skipping, the fastest drafting). It says "Turbo ON" with a flame while it is on, and switching it off restores your settings exactly. It trades some quality for speed; on the smallest quants (GLM and DeepSeek Maya-XS) it keeps every expert, so their answers stay sound.
+- **Thinking budget:** a field in the settings sets how many tokens the model may think before it answers, and applies at once. The default stays 32768; GLM Maya-XS defaults to 8192.
+- **GLM-5.3-Flash Maya-XS:** a new, smaller GLM quant (about 73 GB) for PCs with 64 GB of RAM and a 24 GB card at 128K context. The setup offers it as `glm-maya-xs`, with the int8 KV cache, a thinking budget of 8192 and sampling of temperature 0.7, top-p 0.95, min-p 0.05.
+- **DeepSeek long prompts:** the prompt chunk now follows how many experts live in RAM. Where RAM holds most of them, a long prompt reads up to about 19% faster; where the VRAM holds them, nothing changes.
+- **DeepSeek thinking budget 0:** the reasoning closes again, so answers and tool calls no longer land in `reasoning_content` (#786).
+- **Maya-S n-gram tables:** Maya-S reuses Maya-XS's tables instead of downloading a second pair (#776).
+- **Log timestamps:** every `[maya]` log line starts with the time, in the terminal and in the log file (#783).
+- **Gentoo:** the HIP check finds versioned LLVM folders (#787, thanks @Wilsonfabozi).
+- **Community pull requests:**
+  - `/tokenize` and `/detokenize` endpoints (#764, thanks @cresslank).
+  - A chat request's `response_format` reaches the model (#763, thanks @cresslank).
+  - `ignore_eos`, and `logit_bias` on DeepSeek (#772, thanks @cresslank).
+  - GLM prompts: the CPU lane takes a share where PCIe is not much slower than the CPU, with `MAYA_GLM_PREFILL_CPU_GATE` (#752, thanks @hugou74130).
+  - DeepSeek on AMD keeps the router's weights in BF16 (#745, thanks @mrsirg97-rgb).
+  - DeepSeek flow prompt chunks: an opt-in DMA/host all-reduce (#736, thanks @hajekt2).
+  - Metal: no free-block exhaustion on long-context prefill (#742, thanks @appleguy).
+  - Opt-in, off by default: peer-to-peer all-reduce over ReBAR for DeepSeek on 2+ GPUs, up to 29% faster prompts on the PCs it was measured on (`DS4_AR_P2P=1`, #762, thanks @486DX4-100). It was a little slower on V100s, so Maya does not turn it on.
+  - Speed table and AMD docs (#756 thanks @Cayaf, #749 thanks @Diudid).
+
 ## v1.1.49 - 2026-11-02
 
 A fix release: Maya-XS updates start cleanly and give back their disk space, and Qwen CYBER-FROST runs on 8 GB cards again.
@@ -579,6 +610,7 @@ Fixes:
 - **`--parallel` is refused for DeepSeek and MiniMax** before it is written into their configs (#525, @DailyDisco).
 - **MiniMax quants on the Hub:** the dense layers' indexers file is now `<name>-maya-indexers.bin` (the same bytes;
   the Hub read the lone `.gguf` as the model). The setup renames a v1.1.30 download in place.
+
 ## v1.1.30 - 2026-10-27
 
 MiniMax-M3.1-Flash in Project Maya's own quants: the whole model in a 128 GB PC.
@@ -1740,6 +1772,7 @@ Better drafts for speculative decode on two GPUs or more.
 ## v1.0.21 - 2026-10-09
 
 Eight community pull requests, with every default fitted to the machine it runs on:
+
 - a split search and prompt chunks sized from the expert pool;
 - a smaller KV cache at long context (decode 6-8% faster at 128K);
 - pictures from the web app read again;

@@ -43,16 +43,70 @@ MODEL_DEFAULTS = {
 }
 
 
+# A quant with its own sampling (the owner validated it on that quant, 2026-11-02): GLM-5.3-Flash Maya-XS - temperature
+# 0.7, top_p 0.95, min_p 0.05, no penalties.  Every other quant keeps its model's (MODEL_DEFAULTS).
+QUANT_SAMPLING = {("glm", "Maya-XS"): {"temperature": 0.7, "top_p": 0.95, "min_p": 0.05}}
+
+
 def model_defaults(cfg: dict) -> tuple:
-    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its family), copies."""
-    sampling, effort = MODEL_DEFAULTS.get(family_of(cfg), MODEL_DEFAULTS["glm"])
-    return dict(sampling), effort
+    """(sampling, reasoning_effort): a config's model's own defaults (MODEL_DEFAULTS by its family, the quant's own
+    sampling where it has one: QUANT_SAMPLING), copies."""
+    fam = family_of(cfg)
+    sampling, effort = MODEL_DEFAULTS.get(fam, MODEL_DEFAULTS["glm"])
+    return dict(QUANT_SAMPLING.get((fam, tier_of(cfg)), sampling)), effort
+
+
+# The thinking budget (the config's "thinking_budget": tokens, 0 = no limit; the reasoning ends there and the answer
+# starts).  GLM-5.3-Flash Maya-XS thinks past 32K on a plain three.js prompt and never answers; 8192 gave complete,
+# valid answers fastest.  Only the quants listed here get another default (the owner, 2026-11-02: Maya-XS only); every
+# other quant and model keeps 32768.  Keyed by (family, tier): a quant's catalog entry in QUANTS (and maya.MODELS)
+# carries the tier, so adding the GLM Maya-XS entry there is all it needs to pick this up.
+OLD_THINK_BUDGET = 32768
+GLM_THINK_BUDGET = 8192
+QUANT_THINK_BUDGET = {("glm", "Maya-XS"): GLM_THINK_BUDGET}
+
+
+def tier_of(cfg: dict) -> str:
+    """The tier ("Maya-XS") of the quant a config was set up with (installer.quant: a catalog key or a tier)."""
+    fam, quant = family_of(cfg), str((cfg.get("installer") or {}).get("quant") or "")
+    for f, key, tier, _ in QUANTS:
+        if f == fam and quant in (key, tier):
+            return tier
+    return quant
+THINK_BUDGET_MIN, THINK_BUDGET_MAX = 256, 262144
+
+
+def default_thinking_budget(cfg: dict) -> int:
+    """The thinking budget a config without one runs with: its quant's (QUANT_THINK_BUDGET), else 32768."""
+    return QUANT_THINK_BUDGET.get((family_of(cfg), tier_of(cfg)), OLD_THINK_BUDGET)
+
+
+def thinking_budget_for(cfg: dict) -> int | None:
+    """The "thinking_budget" a setup or a switch writes into `cfg`, or None for 'leave it as it is'.  A value the user
+    set (installer.thinking_budget_set, written by the dashboard's field) or any value but the old default stays; a
+    config of a quant with its own default (QUANT_THINK_BUDGET) and none set, or still at the old 32768, gets it."""
+    new = default_thinking_budget(cfg)
+    if new == OLD_THINK_BUDGET or (cfg.get("installer") or {}).get("thinking_budget_set"):
+        return None
+    value = cfg.get("thinking_budget")
+    return new if value is None or value == OLD_THINK_BUDGET else None
+
+
+def check_thinking_budget(value) -> int:
+    """A thinking budget from the dashboard: 0 (no limit) or 256..262144 tokens; ValueError otherwise."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value):
+        raise ValueError("the thinking budget must be a whole number of tokens")
+    value = int(value)
+    if value != 0 and not THINK_BUDGET_MIN <= value <= THINK_BUDGET_MAX:
+        raise ValueError(f"the thinking budget is 0 (no limit) or {THINK_BUDGET_MIN} to {THINK_BUDGET_MAX} tokens")
+    return value
 
 # Maya's own quants: (family, the setup's key for it, its tier, its setup id).  The key is what the setup and the
 # configs' installer records use: a GLM download's MODELS key, a --ds4-quant / --mm3-quant value
 QUANTS = (
     ("glm", "Maya-S-v2-IQ2_XXS", "Maya-S", "glm-maya-s"),
     ("glm", "Maya-S24", "Maya-S24", "glm-maya-s24"),
+    ("glm", "Maya-XS-IQ1_S", "Maya-XS", "glm-maya-xs"),
     ("glm", "Maya-M", "Maya-M", "glm-maya-m"),
     ("glm", "Maya-M-Derisked", "Maya-M-Derisked", "glm-maya-m-derisked"),
     ("glm", "Maya-L", "Maya-L", "glm-maya-l"),

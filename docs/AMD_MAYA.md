@@ -9,8 +9,10 @@ Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
 3.10+, CMake 3.24+, and a C++20 compiler. `ROCM_PATH` selects an installation
-outside `/opt/rocm`. Everything Maya downloads goes into the project or its
-model-data folder; setup does not install system packages.
+outside `/opt/rocm`. Versioned LLVM slots, as Gentoo's
+`<root>/lib/llvm/22/bin/clang++`, are accepted too. Everything Maya downloads
+goes into the project or its model-data folder; setup does not install system
+packages.
 
 ```sh
 ./maya.sh --backend hip --gpu 0 --check
@@ -342,8 +344,7 @@ so Strata's model benchmarks do not establish Maya performance.
 
 ## Validation
 
-Test host: RX 7900 XT 20 GiB, Ryzen 7 9800X3D, 192 GB installed DDR5, native
-Ubuntu Linux, system ROCm 7.2.1 / Clang 22, plus AI PRO R9700 32 GiB. Maya base v1.0.10 (`e4bd57e`).
+Test host: RX 7900 XT 20 GiB, Ryzen 7 9800X3D, 192 GB installed DDR5, native Ubuntu Linux, system ROCm 7.2.1 / Clang 22, plus AI PRO R9700 32 GiB. Maya base v1.0.10 (`e4bd57e`).
 
 The HIP engine and selected test targets build. All 14 selected GPU checks
 pass: device allocation, expert upload staging, packed-byte/shuffle
@@ -391,3 +392,8 @@ seven smoke requests (arithmetic, code, a two-turn conversation, three
 prompts at 307-385 tok/s on 1.8-2.5K-token prompts and the hipBLASLt table
 loaded. The R9700 runs the full model with every expert in VRAM or a pinned
 RAM tier; the prompt speeds above were measured there.
+
+
+### Confirmed working 
+-  Test host: RX 7900 XT 20 GiB, Ryzen 9 7900X, 96 GB installed DDR5, decokerized Ubuntu Linux, system ROCm 7.2.4, Maya base v1.1.46 (`3589d6f`). 
+- Model : Maya-S24, 1M context

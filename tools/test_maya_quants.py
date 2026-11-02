@@ -21,6 +21,7 @@ import maya_quants as Q  # noqa: E402
 # old name -> (family, the setup's key): every --model / --ds4-quant / --mm3-quant value of v1.1.29 and before
 ALIASES = {
     "Maya-S-v2-IQ2_XXS": ("glm", "Maya-S-v2-IQ2_XXS"), "Maya-S24": ("glm", "Maya-S24"), "Maya-M": ("glm", "Maya-M"),
+    "Maya-XS-IQ1_S": ("glm", "Maya-XS-IQ1_S"),
     "Maya-M-Derisked": ("glm", "Maya-M-Derisked"), "Maya-L": ("glm", "Maya-L"),
     "EXL3-3.05bpw": ("glm", "EXL3-3.05bpw"), "EXL3-4.05bpw": ("glm", "EXL3-4.05bpw"),
     "EXL3-sc_4.10bpw": ("glm", "EXL3-sc_4.10bpw"),
@@ -30,6 +31,7 @@ ALIASES = {
 IDS = {
     "glm-maya-s": ("glm", "Maya-S-v2-IQ2_XXS", "GLM-5.3 · Maya-S"),
     "glm-maya-s24": ("glm", "Maya-S24", "GLM-5.3 · Maya-S24"),
+    "glm-maya-xs": ("glm", "Maya-XS-IQ1_S", "GLM-5.3 · Maya-XS"),
     "glm-maya-m": ("glm", "Maya-M", "GLM-5.3 · Maya-M"),
     "glm-maya-m-derisked": ("glm", "Maya-M-Derisked", "GLM-5.3 · Maya-M-Derisked"),
     "glm-maya-l": ("glm", "Maya-L", "GLM-5.3 · Maya-L"),

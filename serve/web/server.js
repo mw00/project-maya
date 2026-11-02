@@ -236,6 +236,32 @@ export async function watchReload(to) {
   }
 }
 
+// ------------------------------------------------------------------ the thinking budget (applies at once, no restart)
+export async function loadThinkBudget() {
+  try { S.thinkBudget = await api("api/thinking-budget"); } catch (e) { S.thinkBudget = null; }
+  emit();
+  return S.thinkBudget;
+}
+export const budgetError = (text) => {
+  const t = String(text).trim();
+  if (!/^\d+$/.test(t)) return "Use a whole number of tokens.";
+  const n = +t;
+  return n === 0 || (n >= 256 && n <= 262144) ? "" : "Use 0 (no limit) or 256 to 262144 tokens.";
+};
+export async function saveThinkBudget(text) {
+  const bad = budgetError(text);
+  if (bad) { toast("error", "The thinking budget did not change", bad, 6000); return false; }
+  try {
+    S.thinkBudget = await api("api/thinking-budget", {method: "POST", body: {budget: +String(text).trim()}});
+    emit();
+    toast("success", "Thinking budget saved", +text ? `Thinking stops at ${fmt(+text)} tokens, from the next answer.` : "Thinking has no limit, from the next answer.", 5000);
+    return true;
+  } catch (e) {
+    toast("error", "The thinking budget did not change", e.message, 6000);
+    return false;
+  }
+}
+
 // ------------------------------------------------------------------ the port (Maya starts again on it)
 export async function loadPortInfo() {
   try {

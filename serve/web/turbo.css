@@ -1,0 +1,49 @@
+/* serve/web/turbo.css - the Turbo button (turbo.js): a flame that stays dim while Turbo is off and burns while it is on. */
+.set-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 6px; flex-wrap: wrap; }
+.set-head h3 { margin: 0; }
+
+.turbo {
+  --turbo-a: #ff9a3c; --turbo-b: #ff5a1f; --turbo-core: #ffd36b;
+  position: relative; display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 14px 0 10px;
+  border-radius: var(--st-r-pill); border: 1px solid var(--st-line-strong); background: transparent; color: var(--st-ink-soft);
+  font: inherit; font-size: var(--st-fs-sm); font-weight: 600; cursor: pointer;
+  transition: background var(--st-dur) var(--st-ease), border-color var(--st-dur) var(--st-ease), color var(--st-dur) var(--st-ease), box-shadow var(--st-dur) var(--st-ease);
+}
+.turbo:hover { background: var(--st-surface-2); color: var(--st-ink); }
+.turbo:focus-visible { outline: 2px solid var(--st-focus); outline-offset: 2px; }
+.turbo:disabled { cursor: progress; opacity: .7; }
+.turbo__flame { width: 20px; height: 20px; flex: none; overflow: visible; transform-origin: 50% 90%; }
+.turbo__outer { fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linejoin: round; stroke-linecap: round; transition: fill var(--st-dur) var(--st-ease); }
+.turbo__inner { fill: none; stroke: none; }
+.turbo__state { font-weight: 500; font-size: var(--st-fs-xs); color: var(--st-ink-muted); letter-spacing: .02em; }
+
+/* on: the flame fills, the button warms and the flame flickers a little */
+.turbo--on { color: #b8420c; border-color: color-mix(in srgb, var(--turbo-b) 55%, transparent);
+  background: color-mix(in srgb, var(--turbo-a) 14%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--turbo-b) 18%, transparent), 0 0 14px color-mix(in srgb, var(--turbo-b) 28%, transparent); }
+.turbo--on:hover { background: color-mix(in srgb, var(--turbo-a) 22%, transparent); color: #b8420c; }
+.turbo--on .turbo__outer { fill: var(--turbo-b); stroke: var(--turbo-a); }
+.turbo--on .turbo__inner { fill: var(--turbo-core); }
+.turbo--on .turbo__state { color: inherit; }
+:root[data-theme="dark"] .turbo--on, html[data-theme="dark"] .turbo--on { color: #ffb36b; }
+:root[data-theme="dark"] .turbo--on:hover, html[data-theme="dark"] .turbo--on:hover { color: #ffc48a; }
+.turbo--on .turbo__flame { animation: turbo-flicker 1.5s ease-in-out infinite; }
+.turbo--on .turbo__inner { animation: turbo-core 1.1s ease-in-out infinite; transform-origin: 50% 90%; }
+.turbo--busy .turbo__flame { animation: turbo-flicker .8s ease-in-out infinite; }
+
+@keyframes turbo-flicker {
+  0%, 100% { transform: scale(1, 1) rotate(0deg); }
+  30% { transform: scale(.97, 1.07) rotate(-2deg); }
+  55% { transform: scale(1.03, .96) rotate(1.5deg); }
+  80% { transform: scale(.98, 1.05) rotate(-1deg); }
+}
+@keyframes turbo-core { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .75; transform: scale(.9, 1.08); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .turbo--on .turbo__flame, .turbo--on .turbo__inner, .turbo--busy .turbo__flame { animation: none; }
+  .turbo { transition: none; }
+}
+@media (max-width: 640px) {
+  .turbo { min-height: 44px; }                   /* (a thumb-sized target on a phone) */
+  .set-head { align-items: flex-start; }
+}

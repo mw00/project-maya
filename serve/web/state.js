@@ -11,6 +11,7 @@ export const S = {
   mcp: {servers: [], tools: 0},
   ctxInfo: null,            // GET /api/context
   portInfo: null,           // GET /api/port
+  thinkBudget: null,        // GET /api/thinking-budget: {budget, supported, saved}
   update: null,             // GET /api/update
   updateWatch: null,        // {to, down}: an update in progress
   reload: null,             // {to}: a context reload in progress (the composer waits)

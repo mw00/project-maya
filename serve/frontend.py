@@ -29,6 +29,8 @@ from pathlib import Path
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from serve.response_schema import json_instruction, with_system_note
+
 
 # ------------------------------------------------------------------------------------------------ template
 class ChatTemplate:
@@ -459,6 +461,19 @@ def stable_tool_order(tools: list[dict] | None) -> list[dict] | None:
     return sorted(tools, key=lambda t: pos[t["name"]])
 
 
+def _json_format_note(req: dict, messages: list[dict]) -> list[dict]:
+    """response_format json_object / json_schema: the model is told to answer in JSON, with the schema when there is
+    one (OpenAI's json_schema.schema, or llama.cpp's response_format.schema), as the Responses API tells it.  The
+    answer is still held and its JSON sent alone at the end (server.openai_chunks); nothing checks it against the
+    schema."""
+    rf = req.get("response_format")
+    if not isinstance(rf, dict) or rf.get("type") not in ("json_object", "json_schema"):
+        return messages
+    spec = rf.get("json_schema")
+    schema = spec.get("schema") if isinstance(spec, dict) else rf.get("schema")
+    return with_system_note(messages, json_instruction(schema if isinstance(schema, dict) else None))
+
+
 def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     if deepseek:
@@ -513,7 +528,7 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
             if choice.get("namespace") is not None:
                 function["namespace"] = choice["namespace"]
             kwargs["_force_tool"] = _tool_name_for_encoding(function) if function.get("name") else ""
-        return messages, tools, kwargs
+        return _json_format_note(req, messages), tools, kwargs
     messages = []
     for m in req.get("messages", []):
         role = m.get("role")
@@ -554,7 +569,7 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         kwargs["_force_tool"] = ""
     elif tools and isinstance(tc, dict) and tc.get("type") == "function" and (tc.get("function") or {}).get("name"):
         kwargs["_force_tool"] = tc["function"]["name"]
-    return _late_system_to_user(messages), tools, kwargs
+    return _late_system_to_user(_json_format_note(req, messages)), tools, kwargs
 
 
 def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:

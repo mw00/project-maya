@@ -122,15 +122,26 @@ void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alph
 /// gemv_f16's bit for bit.
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    cudaStream_t s);
+/// The router's weights on the device: F32 (f), or the pack's BF16 rows as they are (h; half the bytes to read, each
+/// value widened to F32 exactly in the kernels - the same sums, so the same bits as an F32 copy of them).  One is set.
+struct GateW {
+    const float* f = nullptr;
+    const uint16_t* h = nullptr;
+    bool operator==(std::nullptr_t) const { return f == nullptr && h == nullptr; }
+    bool operator!=(std::nullptr_t) const { return !(*this == nullptr); }
+};
 /// y[t ldy + r] = sum_k W[r][k] x[t][k] in F32 (W [n][k], k % 128 == 0): the router's logits, as DeepSeek's
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
+void gemv_f32(GateW W, const float* x, int n, int k, int T, float* y, int ldy, cudaStream_t s);
 /// (DS4_ROUTE_FUSE) gemv_f32 for one token (T 1) of two matrices on the same x in one launch: y0 = x W0 (n0 rows), y1 =
 /// x W1 (n1 rows), each row gemv_f32's bits.  k a multiple of 4, else false and nothing launched; false too when the
 /// launch did not go in.  (=2) T up to kWin tokens: x's rows k apart, y0's and y1's ldy apart (ldy >= n0, n1).
 bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x, int k,
                    cudaStream_t s, int T = 1, int ldy = 0);
+bool gemv_f32_pair(GateW W0, int n0, float* y0, GateW W1, int n1, float* y1, const float* x, int k, cudaStream_t s,
+                   int T = 1, int ldy = 0);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -396,6 +407,8 @@ struct RoutePair {
     const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
     int a_n = 0, m = 0, off = 0;
     int T = 1;   // (=2: a window's rows, 1 .. kWin)
+    float rs_w = 0.0f;   // (route_pair sets these from STRATA_DS4_RESIDENT_SKIP_W / _TOPK)
+    int rs_k = 0;
 };
 bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.

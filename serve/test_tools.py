@@ -267,6 +267,51 @@ class JsonMode(unittest.TestCase):
             "model": "m", "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": "json"}]})
         self.assertEqual(json.loads(b["choices"][0]["message"]["content"]), {"city": "Paris"})
 
+    SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"],
+              "additionalProperties": False}
+    MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Where?"}]
+
+    def prompt_for(self, body, template="serve/chat_template.jinja"):
+        """What the engine is given for a chat request, and the server's own count of that prompt (/api/tokens)."""
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, '</think>\n\n{"city": "Paris"}', max_context=8192)
+        svc = Service(engine, tok, ChatTemplate(ROOT / template))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        code, b = HttpToolCalls.post(self, "/v1/chat/completions", {"model": "m", **body})
+        self.assertEqual(code, 200, b)
+        self.assertEqual(json.loads(b["choices"][0]["message"]["content"]), {"city": "Paris"})
+        return tok.decode(engine.last_prompt), svc.count_tokens(body)["tokens"], len(engine.last_prompt)
+
+    def test_schema_reaches_the_model(self):
+        """A json_schema request: the model is told the schema, at the end of the leading system message - the
+        client's system prompt stays one, ahead of it - and the prompt's count includes it."""
+        rf = {"type": "json_schema", "json_schema": {"name": "city", "strict": True, "schema": self.SCHEMA}}
+        for template, user in (("serve/chat_template.jinja", "<|im_start|>user"), ("tools/ds4/chat_template.jinja",
+                                                                                    "<｜User｜>")):
+            with self.subTest(template=template):
+                prompt, counted, given = self.prompt_for({"messages": self.MESSAGES, "response_format": rf}, template)
+                self.assertLess(prompt.index("You are terse."), prompt.index(json.dumps(self.SCHEMA)))
+                self.assertLess(prompt.index(json.dumps(self.SCHEMA)), prompt.index(user))
+                self.assertEqual(prompt.count(user), 1)
+                self.assertEqual(counted, given)
+
+    def test_json_object_and_no_format(self):
+        """json_object: a plain JSON note, or the schema when one comes as llama.cpp sends it (response_format.schema,
+        and no system message to add to); a request without a JSON format: the prompt as before."""
+        prompt, _, _ = self.prompt_for({"messages": self.MESSAGES, "response_format": {"type": "json_object"}})
+        self.assertIn("Return only a valid JSON object", prompt)
+        prompt, _, _ = self.prompt_for({"messages": self.MESSAGES[1:],
+                                        "response_format": {"type": "json_object", "schema": self.SCHEMA}})
+        self.assertIn("<|im_start|>system\n", prompt)
+        self.assertIn(json.dumps(self.SCHEMA), prompt)
+        for rf in (None, {"type": "text"}):
+            body = {"messages": self.MESSAGES, **({"response_format": rf} if rf else {})}
+            prompt, _, _ = self.prompt_for(body)
+            self.assertNotIn("Return only", prompt)
+
 
 class ConditionalThinkingTools(unittest.TestCase):
     """A RED-SNOW-style template must open the block the server's parser expects by default."""
