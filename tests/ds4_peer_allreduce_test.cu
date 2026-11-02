@@ -1,5 +1,5 @@
 // Two-rank peer-VRAM transport against the existing host transport, including failure/draining.
-// Run with exactly two visible GPUs; needs about 800 MiB of spare VRAM on each, including calibration scratch.
+// Run with exactly two visible GPUs. Optional argument: calibration rows (4096 or 16384).
 #include "../src/ds4/ds4_kernels.cuh"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -15,7 +15,7 @@ using namespace strata::ds4;
     std::fprintf(stderr, "line %d %s: %s\n", __LINE__, #x, hipGetErrorString(status_)); std::exit(2); } } while (0)
 #define REQUIRE(x) do { if (!(x)) { \
     std::fprintf(stderr, "line %d failed: %s\n", __LINE__, #x); std::exit(3); } } while (0)
-constexpr int kCapacity = 8192 * 5120;
+int kCapacity = 8192 * 5120;
 constexpr unsigned kGuard = 0xdeadbeefu;
 
 __device__ uint32_t input_bits(int i, int rank, unsigned seed) {
@@ -56,7 +56,13 @@ struct Rank {
     hipStream_t stream{};
     int wall_clock_khz = 0;
 };
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 2 || (argc == 2 && std::strcmp(argv[1], "4096") != 0 && std::strcmp(argv[1], "16384") != 0)) {
+        std::fprintf(stderr, "usage: %s [4096|16384]\n", argv[0]);
+        return 2;
+    }
+    const int probe_rows = argc == 2 && std::strcmp(argv[1], "16384") == 0 ? 16384 : 4096;
+    kCapacity = std::max(kCapacity, probe_rows * 5120);
     int count = 0;
     CK(hipGetDeviceCount(&count));
     if (count != 2) { std::puts("SKIP: select exactly two GPUs with HIP_VISIBLE_DEVICES"); return 77; }
@@ -173,7 +179,11 @@ int main() {
     const PeerAr peers[2] = {ranks[0].peer, ranks[1].peer};
     const auto no_budget = calibrate_peer(ids, host, &pipelined, peers, 4096 * 5120, 0);
     REQUIRE(!no_budget.complete && no_budget.quiescent && no_budget.valid);
-    const auto tuned = calibrate_peer(ids, host, &pipelined, peers, 4096 * 5120, 3000);
+    // Large transfers exhaust this sampling allowance. Any submitted work must
+    // drain and validate before a safely incomplete probe can retain host mode.
+    const auto short_budget = calibrate_peer(ids, host, &pipelined, peers, probe_rows * 5120, 1);
+    REQUIRE(!short_budget.complete && short_budget.quiescent && short_budget.valid);
+    const auto tuned = calibrate_peer(ids, host, &pipelined, peers, probe_rows * 5120, 3000);
     REQUIRE(tuned.complete && tuned.quiescent && tuned.valid && tuned.samples >= 3);
     const int selected = int(tuned.selected);
     REQUIRE(tuned.ms[selected] <= tuned.ms[0] && tuned.ms[selected] <= tuned.ms[1] && tuned.ms[selected] <= tuned.ms[2]);

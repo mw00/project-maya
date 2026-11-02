@@ -536,10 +536,12 @@ struct PeerCalibration {
     bool complete = false, quiescent = true, valid = true;
     int samples = 0;
     double ms[3] = {0, 0, 0}, elapsed_ms = 0;
+    double budget_used_ms = 0; // sampling and draining, excluding private allocations/initialization
 };
 // Startup only, before requests: private input rows/streams, original exact-F32 transport and optional AR2.
-// Both ranks' production flags are reset before returning. budget_ms bounds submission/polling;
-// driver API calls themselves cannot be interrupted by a userspace deadline.
+// Both ranks' production flags are reset only after the probe drains. budget_ms bounds sampling
+// after initialization; submitted work gets a separate bounded drain wait (2.5 s per candidate).
+// Driver API calls themselves cannot be interrupted by a userspace deadline.
 PeerCalibration calibrate_peer(const int ids[2], const ArGroup& host, const ArGroup* ar2,
                                const PeerAr peer[2], int n, double budget_ms);
 #endif

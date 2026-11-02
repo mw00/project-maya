@@ -16643,7 +16643,7 @@ struct Model::Impl {
         }
         int original_device = 0;
         cudaGetDevice(&original_device);
-        const double deadline = now_ms() + 3000.0; // shared by every group, not three seconds per pair
+        double budget_ms = 3000.0; // sampling allowance shared by every group; initialization is excluded
 
         for (Group& G : groups) {
             if (G.mem.size() != 2 || G.arb.nm != 2) continue;
@@ -16652,7 +16652,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: peer prefill all-reduce not selected for AR2/flow group\n");
                 continue;
             }
-            if (automatic && now_ms() >= deadline) continue;
+            if (automatic && budget_ms <= 0) continue;
             std::array<PeerAr, 2> a{};
             auto release = [&] {
                 for (int m = 0; m < 2; ++m) {
@@ -16686,8 +16686,7 @@ struct Model::Impl {
                 // Leave 64 MiB free; never evict experts or resize the expert pool to make tuning fit.
                 const size_t need = (automatic ? 3 : 2) * payload + (64ull << 20) +
                                    2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned);
-                if (hipMemGetInfo(&available, &total) != hipSuccess || available < need ||
-                    (automatic && now_ms() >= deadline)) { ok = false; break; }
+                if (hipMemGetInfo(&available, &total) != hipSuccess || available < need) { ok = false; break; }
                 a[m].stride = G.arb.stride;
                 a[m].timeout_ticks = uint64_t(wall_clock_khz) * 2000; // bounded two-second wait
                 ok = hipExtMallocWithFlags((void**) &a[m].recv, 2 * a[m].stride * sizeof(float),
@@ -16725,13 +16724,14 @@ struct Model::Impl {
                 }
                 const int ids[2] = {devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id};
                 const auto result = calibrate_peer(ids, G.arb, progress ? &ar2_group : nullptr, a.data(),
-                                                   int(G.arb.stride), std::max(0.0, deadline - now_ms()));
+                                                   int(G.arb.stride), budget_ms);
+                budget_ms = std::max(0.0, budget_ms - result.budget_used_ms);
                 const char* selected = result.complete && result.selected == PeerTransport::peer ? "peer" :
                                        result.complete && result.selected == PeerTransport::ar2 ? "ar2" : "host";
                 std::fprintf(stderr, "PEER_AR_AUTO gpu=%d,%d floats=%zu samples=%d host_ms=%.6f ar2_ms=%.6f "
-                                     "peer_ms=%.6f selected=%s elapsed_ms=%.1f complete=%d\n",
+                                     "peer_ms=%.6f selected=%s elapsed_ms=%.1f complete=%d budget_used_ms=%.1f\n",
                              ids[0], ids[1], G.arb.stride, result.samples, result.ms[0], progress ? result.ms[1] : -1.0,
-                             result.ms[2], selected, result.elapsed_ms, int(result.complete));
+                             result.ms[2], selected, result.elapsed_ms, int(result.complete), result.budget_used_ms);
                 if (!result.quiescent || !result.valid) {
                     // Never start inference or release buffers that a failed probe may still be reading.
                     if (result.quiescent) { release(); if (progress) hipHostFree(progress); }
