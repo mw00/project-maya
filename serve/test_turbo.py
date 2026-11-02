@@ -21,7 +21,62 @@ from serve.test_models import ds4_cfg, glm_cfg, mm3_cfg  # noqa: E402
 WEB = Path(__file__).resolve().parent / "web"
 
 
+class ResidentSkip(unittest.TestCase):
+    """MAYA_DS4_RESIDENT_* / MAYA_GLM_RESIDENT_*: the experts a token goes without wherever they live (Turbo's lever for
+    a model that fits in VRAM): the option names, their env aliasing, Turbo's values, the engines reading them."""
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_turbo_values_are_sane(self):
+        for fam, name, k_exp in (("glm", "MAYA_GLM_RESIDENT_TOPK", 8), ("deepseek", "MAYA_DS4_RESIDENT_TOPK", 6)):
+            k = int(M.TURBO_ENV[fam][name])
+            self.assertTrue(1 <= k < k_exp, (fam, k))          # (a cap below the model's own k, never zero: top-1 stays)
+        # the weight rule is not part of Turbo (the sweep on the test PC: 0.20 gave garbage)
+        for env in M.TURBO_ENV.values():
+            self.assertFalse([k for k in env if k.endswith("RESIDENT_SKIP_W")])
+
+    def test_turbo_env_aliases_to_the_names_the_engines_read(self):
+        from tools import maya_names as N
+        env = dict(M.TURBO_ENV["glm"], **M.TURBO_ENV["deepseek"])
+        N.alias_env(env)
+        self.assertEqual(env["STRATA_GLM_RESIDENT_TOPK"], env["MAYA_GLM_RESIDENT_TOPK"])
+        self.assertEqual(env["STRATA_DS4_RESIDENT_TOPK"], env["MAYA_DS4_RESIDENT_TOPK"])
+        self.assertEqual(N.read_as("MAYA_DS4_RESIDENT_SKIP_W"), "STRATA_DS4_RESIDENT_SKIP_W")
+        exported = {}
+        N.export_env(exported, {"MAYA_GLM_RESIDENT_TOPK": "4"})
+        self.assertEqual((exported["MAYA_GLM_RESIDENT_TOPK"], exported["STRATA_GLM_RESIDENT_TOPK"]), ("4", "4"))
+
+    def test_the_engines_read_the_options_and_the_docs_name_them(self):
+        src = {"DS4": (self.ROOT / "src/ds4/ds4_kernels.cu").read_text(encoding="utf-8"),
+               "GLM": (self.ROOT / "src/kernels/cuda/glm_fast.cu").read_text(encoding="utf-8")}
+        docs = (self.ROOT / "docs/SETTINGS.md").read_text(encoding="utf-8")
+        for prefix, text in src.items():
+            for opt in ("RESIDENT_TOPK", "RESIDENT_SKIP_W"):
+                self.assertIn(f'getenv("STRATA_{prefix}_{opt}")', text, (prefix, opt))
+                self.assertIn(f"MAYA_{prefix}_{opt}", docs)
+        self.assertEqual(docs.count("changes the answers - Turbo"), 2)
+
+    def test_a_dropped_expert_is_a_null_plan_entry_and_the_top_one_stays(self):
+        # (the rule itself runs on the GPU; this pins the pieces the kernels' comments and the docs promise)
+        ds = (self.ROOT / "src/ds4/ds4_kernels.cu").read_text(encoding="utf-8")
+        self.assertIn("rank == 0 || ((rs_k <= 0 || rank < rs_k)", ds)            # (top-1 always kept)
+        self.assertIn("kept ? vram[pick[r]] : 0ull", ds)                          # (dropped: off the device ...)
+        self.assertIn("kept ? pick[r] : -1", ds)                                  # ... and not on the CPU lane
+        glm = (self.ROOT / "src/kernels/cuda/glm_fast.cu").read_text(encoding="utf-8")
+        self.assertIn("const bool out = rank != 0 &&", glm)
+        self.assertIn("if (a.norm_w && drop != 0u) inv =", glm)                   # (renormalised only where the model does)
+        self.assertIn("resident_ok", (self.ROOT / "include/strata/kernels/glm_fast.hpp").read_text(encoding="utf-8"))
+
+    def test_off_in_a_config_without_turbo(self):
+        d = Path(tempfile.mkdtemp())
+        try:
+            for make, key in ((glm_cfg, "MAYA_GLM_RESIDENT_TOPK"), (ds4_cfg, "MAYA_DS4_RESIDENT_TOPK")):
+                self.assertNotIn(key, M.read(make(d)).get("env") or {})   # (opt-in: nothing sets it but Turbo)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 class TurboMap(unittest.TestCase):
+
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
 
@@ -34,6 +89,7 @@ class TurboMap(unittest.TestCase):
         self.assertEqual(patch["context"], 32768)
         self.assertEqual(patch["env"]["MAYA_GLM_MISS_SKIP_W"], "0.16")
         self.assertEqual(patch["env"]["MAYA_GLM_MISS_SKIP_FROM"], "23")
+        self.assertEqual(patch["env"]["MAYA_GLM_RESIDENT_TOPK"], "4")       # (the all-in-VRAM lever, below)
         self.assertEqual(patch["env"]["MAYA_GLM_RAM_HEADROOM_GB"], "4")     # (the config's own variable stays)
         self.assertNotIn("draft", patch)                       # (GLM keeps the drafter the setup measured)
 
@@ -41,7 +97,8 @@ class TurboMap(unittest.TestCase):
         p = ds4_cfg(self.d)
         patch = M.turbo_patch(M.read(p))
         self.assertNotIn("context", patch)
-        self.assertEqual(patch["env"], {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3"})
+        self.assertEqual(patch["env"], {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3",
+                                        "MAYA_DS4_RESIDENT_TOPK": "3"})
         self.assertEqual(patch["dspark_conf"], 0.3)                    # (the draft floor lowered from 0.7)
         self.assertNotIn("MAYA_LOOP_GUARD", patch["env"])              # (the loop guard is left on)
 

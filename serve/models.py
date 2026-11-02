@@ -736,8 +736,14 @@ TURBO_CONTEXT_FAMILIES = ("glm", "minimax")         # ... DeepSeek's context is 
 # MAYA_*_DISK_SKIP_* (only for experts that fit neither VRAM nor RAM), MAYA_GLM_DFLASH_MIN/_CUM (meant for per-request
 # tuning, no measured fast value).  The loop guard (MAYA_LOOP_GUARD) is deliberately NOT touched: it costs no speed and
 # stops greedy runaway loops, which would ruin a benchmark.
-TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23"},
-             "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3"}}
+# Where the whole model is in VRAM those skips have nothing to leave out, so Turbo also caps the routed experts a token
+# computes, wherever they live (MAYA_*_RESIDENT_TOPK, docs/SETTINGS.md; the weight rule MAYA_*_RESIDENT_SKIP_W is not
+# used: on the AMD Strix Halo test PC 0.20 already gave garbage, the rank cap degrades more gently).  The values are the
+# fastest whose output was still sound there (a three.js page that parses with `node --check`, short factual answers):
+# DeepSeek IQ1_M keeps 3 of its 6 experts a token (40.8 -> 49.5 tok/s with Turbo's other settings), GLM Maya-M-Derisked 4
+# of its 8 (33.2 -> 38.8; 3 gave a page with a duplicate import and slower drafts).
+TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23", "MAYA_GLM_RESIDENT_TOPK": "4"},
+             "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3", "MAYA_DS4_RESIDENT_TOPK": "3"}}
 # the drafter that goes fastest where the pack has it: DSpark (DeepSeek, MiniMax), MTP (Qwen).  GLM keeps the drafter the
 # setup measured for this PC (MTP or DFlash2: which is faster depends on the GPUs).
 TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}

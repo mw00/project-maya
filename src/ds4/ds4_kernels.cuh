@@ -396,6 +396,8 @@ struct RoutePair {
     const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
     int a_n = 0, m = 0, off = 0;
     int T = 1;   // (=2: a window's rows, 1 .. kWin)
+    float rs_w = 0.0f;   // (route_pair sets these from STRATA_DS4_RESIDENT_SKIP_W / _TOPK)
+    int rs_k = 0;
 };
 bool route_pair(const RoutePair& a, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
