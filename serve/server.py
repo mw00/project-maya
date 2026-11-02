@@ -4815,12 +4815,16 @@ def make_handler(svc: Service):
             loaded = not hasattr(svc.engine, "alive") or svc.engine.alive()
             out = []
             run = next((m for m in svc.ollama_listing() if m["running"]), None)
-            if run is not None and loaded:
+            lock = getattr(svc, "_engine_start", None)
+            starting = run is not None and loaded and lock is not None and lock.locked()   # (the weights are loading)
+            if run is not None and loaded and not starting:
                 out.append(ollama.ps_entry(run, svc.expires_at(), 0))
             res = {"models": out}
             restart = getattr(svc, "model_restart", None)
             if restart:
                 res["loading"] = {"model": ollama.public_name(Path(restart["to"])) + ":latest", "since": restart["started"]}
+            elif starting:
+                res["loading"] = {"model": ollama.public_name(Path(run["file"])) + ":latest", "since": time.time()}
             elif run is not None and not loaded:
                 res["unloaded"] = ollama.public_name(Path(run["file"])) + ":latest"
             return res
