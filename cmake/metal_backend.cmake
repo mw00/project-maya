@@ -304,3 +304,88 @@ if(MAYA_METAL_TESTS)
                          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} FIXTURES_REQUIRED metal_big_gguf TIMEOUT 3600)
   endif()
 endif()
+
+# ---- Qwen 3.8 Flash Next (CYBER-FROST) on Metal: maya-metal-qwen -------------------------------
+# A third Metal engine, vendored whole under src/qwen-metal/ from Niko1221/Strata at c62d5e3 (MIT;
+# src/qwen-metal/LICENSE) - the engine measured standalone on this Mac class - in the same style as
+# src/ds4: a self-contained engine directory with its own host copy, headers and data, so neither
+# tree's strata core shadows the other's.  Unlike GLM (ggml graph ops), this engine is raw Metal:
+# its .metal kernels compile at run time over metal/src/mtl_rt.* + metal/src/gpu/runtime.cpp
+# (metal-cpp), and ggml enters only as ggml-cpu/ggml-base (expert CPU lanes, quant type traits) -
+# the fork build's own targets from the pinned checkout above, so there is no second ggml here.
+# Its serve protocol is the shared one: serve/server.py's StrataEngine drives it from a config
+# (~/maya-models/maya-qwen.json) exactly as it drives the CUDA build of the same generate.cpp.
+option(MAYA_QWEN_METAL "Build the Qwen3.8-Flash-Next Metal engine (maya-metal-qwen)" ON)
+set(_maya_qwen_root ${CMAKE_CURRENT_SOURCE_DIR}/src/qwen-metal)
+if(MAYA_QWEN_METAL AND EXISTS ${_maya_qwen_root}/metal-cpp/Metal/Metal.hpp)
+  enable_language(OBJCXX)
+  set(_qw_host ${_maya_qwen_root}/src)
+  set(_qw_metal ${_maya_qwen_root}/metal)
+  set(_qw_ggml_common ${_maya_qwen_root}/ggml-common/ggml-common.h)
+
+  # the kernel tree's runtime face (his mtl_rt): the Metal runtime + GGUF reader + CPU references
+  add_library(qwen_mtl_rt STATIC ${_qw_metal}/src/mtl_rt.mm ${_qw_metal}/src/ref_quant.cpp
+                                 ${_qw_metal}/src/gguf_lite.cpp)
+  target_include_directories(qwen_mtl_rt PUBLIC ${_qw_metal}/src ${_maya_qwen_root}/ggml-common
+                                                ${_maya_qwen_root}/include)
+  target_compile_options(qwen_mtl_rt PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+  target_compile_definitions(qwen_mtl_rt PRIVATE
+    STRATA_GGML_COMMON_DEFAULT="${_qw_ggml_common}"
+    STRATA_METAL_KERNELS_DEFAULT="${_qw_metal}/kernels")
+  target_link_libraries(qwen_mtl_rt PUBLIC "-framework Metal" "-framework Foundation")
+
+  # the device runtime: the shared host code's CUDA names over Metal (metal_compat first, as HIP does)
+  add_library(qwen_gpu_metal STATIC ${_qw_metal}/src/gpu/runtime.cpp)
+  target_include_directories(qwen_gpu_metal BEFORE PUBLIC ${_qw_metal}/include/metal_compat
+                             ${_qw_metal}/include ${_maya_qwen_root}/include)
+  target_include_directories(qwen_gpu_metal SYSTEM PUBLIC ${_maya_qwen_root}/metal-cpp)
+  target_compile_definitions(qwen_gpu_metal PUBLIC STRATA_GPU_METAL=1)
+  target_link_libraries(qwen_gpu_metal PUBLIC "-framework Metal" "-framework Foundation"
+                                              "-framework QuartzCore")
+
+  # the engine's host: his STRATA_METAL_HOST_SOURCES list, from the vendored host copy
+  set(_qw_host_sources
+    ${_qw_host}/core/device.cu ${_qw_host}/core/pinned.cu ${_qw_host}/platform/memory.cpp
+    ${_qw_host}/core/graph.cpp ${_qw_host}/core/weights.cpp ${_qw_host}/core/layout.cpp
+    ${_qw_host}/core/layer.cpp ${_qw_host}/core/session.cpp ${_qw_host}/core/expert_source.cpp
+    ${_qw_host}/core/remote_experts.cpp ${_qw_host}/core/expert_cache.cpp ${_qw_host}/core/native_head.cpp
+    ${_qw_host}/core/native_dense.cpp ${_qw_host}/core/verify.cpp ${_qw_host}/core/mtp.cpp
+    ${_qw_host}/core/conversation_snapshot.cpp ${_qw_host}/core/conversation_state.cpp
+    ${_qw_host}/core/conversation_memory.cpp ${_qw_host}/core/peer_experts.cpp
+    ${_qw_host}/core/arch_defaults.cpp ${_qw_host}/core/vmm.cpp ${_qw_host}/core/conversation_file.cpp
+    ${_qw_host}/kernels/ngram.cpp ${_qw_host}/ngram/ple_reader.cpp ${_qw_host}/platform/direct_file.cpp
+    ${_qw_host}/prefill/prefill.cpp
+    ${_qw_host}/spec/suffix_drafter.cpp ${_qw_host}/spec/controller.cpp ${_qw_host}/spec/draft_policy.cpp
+    ${_qw_host}/spec/draft_source.cpp
+    ${_qw_host}/kernels/cpu/pool.cpp ${_qw_host}/kernels/cpu/expert_layout.cpp
+    ${_qw_host}/kernels/cpu/native_expert.cpp ${_qw_host}/kernels/cpu/hadamard.cpp
+    ${_qw_host}/kernels/cpu/tq_cpu.cpp)
+  set_source_files_properties(${_qw_host}/core/device.cu ${_qw_host}/core/pinned.cu
+                              PROPERTIES LANGUAGE CXX)
+  add_library(qwen_host STATIC ${_qw_host_sources})
+  target_include_directories(qwen_host PUBLIC ${_maya_qwen_root}/include ${_qw_host}/core
+                             ${_maya_qwen_root}/ggml-common
+                             ${_maya_llamacpp_dir}/ggml/include ${_maya_llamacpp_dir}/ggml/src
+                             ${_maya_llamacpp_dir}/ggml/src/ggml-cpu)
+  target_compile_definitions(qwen_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_VERSION="0.1.55-metal")
+  target_compile_options(qwen_host PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
+  target_link_libraries(qwen_host PUBLIC qwen_gpu_metal ggml-cpu ggml-base)
+
+  # the kernel library: Metal implementations of the entry points, plus his committed stubs for
+  # the ones not ported (a stub stops the engine with the entry point's name, never silently)
+  file(GLOB _qw_engine_sources CONFIGURE_DEPENDS ${_qw_metal}/src/engine/*.cpp)
+  add_library(qwen_kernels STATIC ${_qw_engine_sources})
+  target_include_directories(qwen_kernels PRIVATE ${_qw_metal}/src ${_maya_qwen_root}/ggml-common)
+  target_compile_definitions(qwen_kernels PRIVATE
+    STRATA_GGML_COMMON_DEFAULT="${_qw_ggml_common}"
+    STRATA_METAL_KERNELS_DEFAULT="${_qw_metal}/kernels"
+    STRATA_METAL_ENGINE_KERNELS_DEFAULT="${_qw_metal}/src/engine/msl"
+    STRATA_METAL_DATA_DEFAULT="${_maya_qwen_root}/data")
+  target_link_libraries(qwen_kernels PUBLIC qwen_host qwen_mtl_rt)
+
+  add_executable(maya-metal-qwen ${_qw_host}/program/generate.cpp)
+  target_link_libraries(maya-metal-qwen PRIVATE qwen_kernels qwen_host qwen_kernels)
+else()
+  message(STATUS "maya-metal-qwen skipped: vendored metal-cpp headers not found at "
+                 "${_maya_qwen_root}/metal-cpp (MAYA_QWEN_METAL=${MAYA_QWEN_METAL})")
+endif()
