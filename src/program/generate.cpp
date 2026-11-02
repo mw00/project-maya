@@ -1197,7 +1197,7 @@ static int glm_pack_generate(const Options& o) {
     std::atomic<int> admitting_rid{-1};
     // STRATA_GLM_PREFILL_INTERLEAVE (strata/core/prefill_pieces.hpp): the other requests decode between the pieces of
     // a prompt being read, so a STOP / PAUSE for the request being admitted stops its read alone (admit_stop) - not
-    // stop_req, which every decoding request reads as its own.  Off: stop_req as before (nothing decodes meanwhile)
+    // stop_req, which every decoding request reads as its own.
     static const strata::core::PrefillInterleave interleave =
         strata::core::prefill_interleave_parse(std::getenv("STRATA_GLM_PREFILL_INTERLEAVE"));
     // STRATA_GLM_PREFILL_GAPS (strata/core/prefill_gaps.hpp): the other requests decode at the chunk boundaries of a
@@ -1257,7 +1257,6 @@ static int glm_pack_generate(const Options& o) {
                     }
                     if (rid == admitting_rid.load()) {
                         admit_stop.store(true);
-                        if (interleave.tokens == 0 && read_gaps.percent == 0) stop_req.store(true);
                     }
                     continue;
                 }
@@ -2994,6 +2993,10 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (gens.empty()) stop_req.store(false);
+        {
+            std::lock_guard<std::mutex> lk(ctl_mu);
+            ctl.erase(rid);
+        }
         gap_failed = false;
         bind_ctx(best);
         model.set_image_rows(cur_img_pos, cur_img_rows);
@@ -3070,9 +3073,13 @@ static int glm_pack_generate(const Options& o) {
             ctl.erase(rid);
             return;
         }
-        // a STOP <rid> during its prompt (with interleave: admit_stop alone)
+        // a STOP <rid> during its prompt sets admit_stop alone (global STOP sets stop_req)
         const bool stopped_all = stop_req.exchange(false), stopped_this = admit_stop.exchange(false);
-        if (stopped_all || stopped_this) g->finish = "cancel";
+        if (stopped_all || stopped_this) {
+            g->finish = "cancel";
+            std::lock_guard<std::mutex> lk(ctl_mu);
+            ctl.erase(rid);
+        }
         g->t1 = std::chrono::steady_clock::now();
         g->st1 = model.fast_stats();
         g->spec_steps0 = model.spec_steps_;
