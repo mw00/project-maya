@@ -95,7 +95,7 @@ class Boxes(unittest.TestCase):
 
     def test_gpus_hardware_requests_and_banners(self):
         gpus = text(D.gpus(METRICS))
-        for want in ("RTX 5060 Ti", "RTX 3090", "41%", "14.0 / 16 GB", "88 / 180 W", "Gen5 x8", "3,100 MB/s"):
+        for want in ("RTX 5060 Ti", "RTX 3090", "41%", "14.0 / 16 GB", "88 / 180 W", "Gen5 x8", "3.0 GB/s"):
             self.assertIn(want, gpus)
         hw = text(D.hardware(METRICS, 116))
         for want in ("GPU load", "41%", "28.0 / 32 GB", "5,248 experts cached", "CPU", "88 cores", "RAM",
@@ -106,6 +106,16 @@ class Boxes(unittest.TestCase):
             self.assertIn(want, reqs)
         self.assertIn("GPU 1 is at 88 °C", D.banners(METRICS, 0).plain)
         self.assertIn("does not answer", D.banners(METRICS, 3).plain)
+
+    def test_gpu_columns_keep_their_place_when_a_reading_changes(self):   # (#793: a PCIe burst moved the others)
+        def cols(rx, power, used):
+            g = dict(GPU, pcie_rx_mb=rx, power=power, mem_used=used)
+            m = dict(METRICS, hardware=dict(METRICS["hardware"], gpus=[g]))
+            line = text(D.gpus(m), 120).rstrip().splitlines()[-1]
+            return line.index(" / "), line.index(" W"), len(line.rstrip())
+        quiet = cols(0.4, 88.0, 9.5 * 2**30)
+        for rx, power, used in ((204789.0, 88.0, 9.5 * 2**30), (3100.0, 100.0, 9.5 * 2**30), (12.0, 9.0, 10.0 * 2**30)):
+            self.assertEqual(cols(rx, power, used), quiet, (rx, power, used))
 
     def test_an_empty_server_is_no_error(self):            # (before the first request, or a server just started)
         empty = {"engine": {}, "live": {"state": "idle"}, "hardware": {}, "history": {}}

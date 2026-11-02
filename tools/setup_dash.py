@@ -69,6 +69,11 @@ def fmt(n, d: int = 0) -> str:
     return "–" if n is None else f"{n:,.{d}f}"
 
 
+def rate_text(mb) -> str:
+    """A transfer rate in MB/s (GB/s from 1000): the dashboard's one spelling of it."""
+    return "–" if mb is None else f"{mb / 1024:.1f} GB/s" if mb >= 1000 else f"{mb:,.{1 if mb < 10 else 0}f} MB/s"
+
+
 def kfmt(n) -> str:
     return "–" if n is None else f"{n / 1000:,.{0 if n >= 10000 else 1}f}k" if n >= 1000 else fmt(n)
 
@@ -248,6 +253,8 @@ def gpus(m: dict) -> Table:
                                if hw.get("gpu_mem_total") else [])   # (one card: the server sends its gpu_* only)
     names = (st.get("gpu_name") or "").split(" + ")
     t = Table(box=None, expand=True, padding=(0, 1), header_style=f"bold {MUTED}", pad_edge=False)
+    # (PCIe, power and VRAM cells are padded to one width: an idle link's burst - "204,789 MB/s" for a second - or a
+    # third digit must not push the columns beside them back and forth - #793)
     for col, right in (("GPU", False), ("Load", False), ("VRAM", True), ("Power", True), ("Temp", True),
                        ("PCIe", True)):
         t.add_column(col, justify="right" if right else "left", no_wrap=True)
@@ -259,12 +266,12 @@ def gpus(m: dict) -> Table:
         rx = g.get("pcie_rx_mb")
         t.add_row(Text.assemble((f"{g.get('index')} ", f"bold {INK}"), (name, MUTED)),
                   Text.assemble(bar((util or 0) / 100, 10), (f" {fmt(util):>3}%", INK)),
-                  Text.assemble((gb(g.get("mem_used")), INK), (f" / {gb(g.get('mem_total'), 0)} GB", MUTED)),
-                  Text.assemble((fmt(g.get("power")), INK), (f" / {fmt(g.get('power_limit'))} W", MUTED)),
-                  Text(f"{fmt(temp)} °C", DANGER if (temp or 0) >= 87 else WARN if (temp or 0) >= 80 else INK),
+                  Text.assemble((gb(g.get("mem_used")).rjust(4), INK), (f" / {gb(g.get('mem_total'), 0)} GB", MUTED)),
+                  Text.assemble((fmt(g.get("power")).rjust(3), INK), (f" / {fmt(g.get('power_limit')).rjust(3)} W", MUTED)),
+                  Text(f"{fmt(temp).rjust(2)} °C", DANGER if (temp or 0) >= 87 else WARN if (temp or 0) >= 80 else INK),
                   Text.assemble((f"Gen{gen}" if gen else "–", INK),
                                 (f" x{g.get('pcie_width')}" if g.get("pcie_width") else "", MUTED),
-                                (f" · {fmt(rx, 1 if rx < 10 else 0)} MB/s" if rx is not None else "", MUTED)))
+                                (f" · {rate_text(rx).rjust(10)}" if rx is not None else "", MUTED)))
     if not cards:
         t.add_row(Text("no GPU readings (nvidia-smi / NVML did not answer)", MUTED), "", "", "", "", "")
     return t
@@ -275,8 +282,7 @@ def hardware(m: dict, width: int) -> Table:
     disk - each with its last minute."""
     hw, st, h, eng = (m.get(k) or {} for k in ("hardware", "hardware_static", "history", "engine"))
 
-    def rate(mb):
-        return "–" if mb is None else f"{mb / 1024:.1f} GB/s" if mb >= 1000 else f"{mb:,.{1 if mb < 10 else 0}f} MB/s"
+    rate = rate_text
     n = len(hw.get("gpus") or [])
     tiles = [("GPU load", fmt(hw.get("gpu_util")), "%", f"mean of {n} cards" if n > 1 else "", h.get("gpu_util"), 100),
              ("VRAM", gb(hw.get("gpu_mem_used")), f"/ {gb(hw.get('gpu_mem_total'), 0)} GB",
