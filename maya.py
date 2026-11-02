@@ -3297,6 +3297,14 @@ def write_config(a, pc, meta, pack: Path, quant: str, ctx: int, models: Path, vi
                         "gguf_dir": str(gguf_dir) if gguf_dir else None, "draft": "dflash2" if dflash else "mtp",
                         **({"model_dir": str(choice[1])} if choice and choice[0] == "exl3" else {}),
                         "written": time.strftime("%Y-%m-%d %H:%M")}
+    if cfg_path.exists():                              # a setup again: the budget the user set stays (GLM's 8192 else)
+        before = read_json(cfg_path)
+        if before.get("thinking_budget") is not None:
+            cfg["thinking_budget"] = before["thinking_budget"]
+            if (before.get("installer") or {}).get("thinking_budget_set"):
+                cfg["installer"]["thinking_budget_set"] = True
+    if Q.thinking_budget_for(cfg) is not None:         # (Maya-XS: 8192; every other quant: nothing written, 32768)
+        cfg["thinking_budget"] = Q.thinking_budget_for(cfg)
     cal = saved_calibration(cfg, any_context=True)     # tuned on this PC for this model (and context) before
     if cal is not None:
         tuned = CAL.apply(cfg.get("env") or {}, cal.get("settings") or {})
