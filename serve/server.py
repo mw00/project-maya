@@ -5860,6 +5860,29 @@ class ServerLogTee:
         return getattr(self.stream, name)
 
 
+class StampedStdout:
+    """stdout with a local `HH:MM:SS ` before each of this server's own lines (`[maya] ...`, #783); the engine's lines and
+    any other text pass through as they are.  A line is stamped when it starts, whatever pieces print() writes it in."""
+
+    def __init__(self, stream):
+        self.stream, self.at_start, self.lock = stream, True, threading.Lock()
+
+    def write(self, text):
+        with self.lock:
+            out = []
+            for seg in text.splitlines(keepends=True):
+                if self.at_start and seg.startswith("[maya]"):
+                    out.append(time.strftime("%H:%M:%S "))
+                out.append(seg)
+                self.at_start = seg.endswith(chr(10)) or seg.endswith(chr(13))
+            if out:
+                self.stream.write("".join(out))
+        return len(text)
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 def tee_server_log(path: str) -> None:
     """This server's own lines (`[maya] ...`) go to `path` as well as this terminal (STRATA_SERVER_LOG=0: terminal
     only).  The engine's stderr is already appended there, so the file tells both sides of a request."""
@@ -5915,6 +5938,8 @@ def main() -> int:
     maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
     cfg = maya_names.env_in(json.loads(Path(a.config).read_text(encoding="utf-8-sig"))) if a.config else {}   # (a BOM: Notepad)
     apply_server_env(cfg)
+    if not isinstance(sys.stdout, StampedStdout):       # (#783: a time before each [maya] line, in the log too)
+        sys.stdout = StampedStdout(sys.stdout)
     # the server's own lines go to the run's log as well (the engine writes its stderr there): a run whose terminal
     # was closed leaves the record a stuck queue needs (STRATA_SERVER_LOG=0 keeps them on the terminal only)
     _srv_log = os.environ.get("STRATA_SERVER_LOG")
