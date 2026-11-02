@@ -31,7 +31,8 @@ them as you chat. It measures your GPUs, CPU, RAM and SSD and tunes itself to th
 - **Plugs into your tools:** OpenAI- and Anthropic-compatible API with tool calls, ready for coding agents.
 - **Several requests at once:** up to 8 answered together with GLM-5.3-Flash, DeepSeek-V4.1-Flash and
   MiniMax-M3.1-Flash - for agents that run several sessions, or several people on one PC.
-- **Everything in the box:** a chat and a live monitor in the browser, pictures, thinking levels, a one-command setup.
+- **Everything in the box:** a chat and a live monitor in the browser, pictures on every model, thinking levels, a
+  Models page that downloads, loads and deletes models, a Turbo button, a one-command setup.
 
 ## Quick start
 
@@ -57,7 +58,7 @@ recommends one for your PC; to pick one yourself, give its setup id: `./setup.sh
 | | Maya-M-Derisked · `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals; experimental |
 | | Maya-L · `glm-maya-l` | 156.3 GB | the biggest memory pools; the closest to the original |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (default) · `deepseek-maya-s` | 340 GB | any amount of memory: what VRAM and RAM don't hold is read from the SSD |
-| | Maya-XS · `deepseek-maya-xs` | 277 GB | the whole model in a 128 GB PC's memory (the Engram tables stay on the SSD) |
+| | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | the whole model in a 128 GB PC's memory (the Engram tables stay on the SSD); v2 is about 12% closer to the original and about 20% faster at writing than v1 - running the setup again offers the update |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B active · up to 1M context</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | the whole model in a 128 GB PC's memory |
 | | Maya-S · `minimax-maya-s` | 122 GB | closer to the original |
 
@@ -195,6 +196,11 @@ slowest while the caches fill with what you use.
   each GPU's memory), a context size and port you can change in Settings, and **Models**: every model set up on this
   machine, switching to another (Maya starts again with it) and each one's engine settings (context, GPUs, drafting,
   images, memory), saved into its `maya-<model>.json`.
+- **Models page:** the catalog lists every Maya model with its size. Download one with a progress bar, load it, unload
+  the running one or delete one - no command line needed.
+- **Turbo:** one button beside the model's parameters sets the fastest settings for the model (greedy sampling, no
+  thinking, expert skipping, the fastest drafting). It trades some quality for speed; switching it off restores your
+  settings exactly.
 - **Saved:** the sidebar's Saved line adds up what the model's own API (DeepSeek's, Z.ai's or MiniMax's) would have
   charged for the same tokens - the prompt Maya reuses from its cache at the API's cached price, DeepSeek's peak hours
   at its peak price - kept per model in `token-savings.json`; its prices can be changed in **Settings › Savings**.
@@ -207,8 +213,15 @@ slowest while the caches fill with what you use.
   schema-validated output, background tasks with cancellation/replay, and optional shared in-memory history
   (`store:true`, `previous_response_id`). Responses are not stored by default. Options and limits:
   [docs/RESPONSES.md](docs/RESPONSES.md).
-- **Thinking:** Off, Low, High (the default) or Max, in Settings or per request.
-- **Pictures:** attach one in the chat, or send image parts through either API.
+- **Model API:** `/api/tags`, `/api/ps`, `/api/show`, `/api/chat`, `/api/generate`, `/api/pull` and `/api/delete` list,
+  load, download and delete models from any app or script. A request for a model that is not loaded swaps to it, and
+  `keep_alive` unloads it when idle. `/models/load`, `/models/unload` and `/models/sse` are on by default too
+  (`"model_management": false` turns them off).
+- **Thinking:** Off, Low, High (the default) or Max, in Settings or per request, and a **thinking budget** field that
+  sets how many tokens the model may think before it answers.
+- **Loop guard:** on by default - an agent that repeats the same tool call with the same result is steered off it.
+- **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them (setup details per
+  model: [docs/MODELS.md](docs/MODELS.md)).
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).
@@ -222,7 +235,7 @@ slowest while the caches fill with what you use.
 | --- | --- |
 | **GPU** | NVIDIA, compute capability 7.0 or newer (V100, RTX 20 and newer): one, or up to 16 that share the model. More VRAM is faster. Pascal (Tesla P40 / P100, GTX 10) is experimental, not validated yet. **AMD (experimental):** RX 7900 XT / XTX, Radeon AI PRO R9700 / RX 9070, Strix Halo and Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 and Radeon PRO V620 / W6800 not validated yet; GLM-5.3-Flash and DeepSeek-V4.1-Flash-1017 read pictures there too - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB runs it. More RAM keeps more experts close and is faster |
-| **Disk** | **A fast NVMe SSD** with room for the model (~100 GB for GLM-5.3 · Maya-S, ~160 GB for GLM-5.3 · Maya-L, ~350 GB for DeepSeek V4.1 · Maya-S, ~470 GB for unsloth's Q8 GGUF of it, ~95 GB for MiniMax M3.1 · Maya-XS, ~200 GB for MiniMax-M3.1-Flash's EXL3 quant) and its picture encoder (1.1 GB). Not a hard disk |
+| **Disk** | **A fast NVMe SSD** with room for the model (~75 GB for GLM-5.3 · Maya-XS, ~100 GB for GLM-5.3 · Maya-S, ~160 GB for GLM-5.3 · Maya-L, ~350 GB for DeepSeek V4.1 · Maya-S, ~470 GB for unsloth's Q8 GGUF of it, ~95 GB for MiniMax M3.1 · Maya-XS, ~200 GB for MiniMax-M3.1-Flash's EXL3 quant) and its picture encoder (1.1 GB). Not a hard disk |
 | **System** | Linux (x86-64; a CPU with AVX2 is best), the NVIDIA driver, CUDA 12.x (CUDA 13 works for RTX 20 and newer, not for the V100 or Pascal), g++, Python 3.10+. Windows 10/11 (experimental): [docs/WINDOWS.md](docs/WINDOWS.md). Not WSL2. AMD: ROCm 7 |
 
 The setup checks all of this, prints the exact command for anything missing, and installs nothing system-wide.
@@ -235,9 +248,9 @@ The setup shows every download before it starts it, builds everything once (20-4
 
 - **Windows:** `START-MAYA.bat` instead of `./setup.sh` - see [docs/WINDOWS.md](docs/WINDOWS.md).
 - **AMD:** [docs/AMD_MAYA.md](docs/AMD_MAYA.md).
-- **Mac with Apple Silicon (experimental, GLM-5.3-Flash):** `./maya.sh --backend metal` - see [docs/METAL.md](docs/METAL.md).
-  Built and unit-tested on GitHub's Macs, not yet tested by us with the real model (we have no Mac): if you run it,
-  please tell us how it went in an issue.
+- **Mac with Apple Silicon (experimental, GLM-5.3-Flash only):** `./maya.sh --backend metal` (on a Mac, `./maya.sh`
+  picks Metal by itself) - see [docs/METAL.md](docs/METAL.md). Built and unit-tested on GitHub's Macs, not yet tested
+  by us with the real model (we have no Mac): if you run it, please tell us how it went in an issue.
 - **Intel Arc:** not supported by Maya's engine; a community report of the Maya-XS DeepSeek GGUFs on llama.cpp's SYCL backend: [docs/INTEL_ARC.md](docs/INTEL_ARC.md).
 - **Updating:** the page's **Settings › About and updates**, or `git pull` then `./setup.sh`. The model isn't downloaded again.
 - **Model files downloaded another way** (a download manager, another PC, a Hugging Face cache): `./maya.sh --import-model FOLDER`
@@ -294,10 +307,7 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   conversation checkpoints, the layer-split search, the expert profile and the CPU expert kernels, and for
   `maya-ds4` the 3.5-bit EXL3 option, tensor parallel over 4 / 8 GPUs and the threaded expert-cache swaps (#276). Thanks also to everyone who sent code and speed reports
   ([contributors](https://github.com/mw00/project-maya/graphs/contributors)).
-- **Built on [Strata](https://github.com/Niko1221/Strata)** (MIT License, Copyright (c) 2026 Niko1221 and the Strata
-  contributors): Maya's engine started from Strata's and was rewritten for GLM-5.3-Flash (the expert tiers across VRAM,
-  RAM and SSD, the layer split, MTP decoding), and its server and dashboard grew from Strata's. **And on
-  [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License, Copyright (c) 2023-2026 The ggml
+- **Built on [ggml / llama.cpp](https://github.com/ggml-org/llama.cpp)** (MIT License, Copyright (c) 2023-2026 The ggml
   authors): the quantization formats, the CPU dot products and the prompt path's MMQ kernels, built from a pinned
   commit (`third_party/ggml/LICENSE`).
 - **EXL3 support** follows [exllamav3](https://github.com/turboderp-org/exllamav3)'s format, codebooks, CPU expert
@@ -318,5 +328,5 @@ Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONT
   [Lucide](https://lucide.dev) (ISC License, `serve/web/LICENSE.lucide.txt`); its UI library:
   [Preact](https://preactjs.com) (MIT License) with [htm](https://github.com/developit/htm) (Apache License 2.0),
   bundled in `serve/web/preact.js` with their notices.
-- Maya is open source under the [MIT License](LICENSE); the notices of Strata, ggml, exllamav3 and beellama.cpp stay
+- Maya is open source under the [MIT License](LICENSE); the notices in [LICENSE](LICENSE) and `third_party/` stay
   with every copy.
