@@ -2738,13 +2738,38 @@ __global__ void combine_kernel(const float* __restrict__ ed, const float* __rest
     out[(size_t) t * dim + e] = a;
 }
 
+// STRATA_DS4_RESIDENT_SKIP_W / _TOPK (CHANGES THE ANSWERS - Turbo; 0 = off): which of a token's k routed experts the
+// decode keeps, wherever they live (VRAM too).  Rank = the weight order (sc, ties by pick order).  Dropped: a pick whose
+// share of the route's weights is below rs_w, or whose rank is >= rs_k (rs_k > 0); the top-1 is always kept.  The kept
+// weights are renormalised (DeepSeek's route weights sum to route_scale).  keep: the bit of each kept pick.
+__device__ __forceinline__ unsigned route_keep(const float* sc, const int* pick, int k, float s, float rs_w, int rs_k,
+                                               float& s_keep) {
+    unsigned m = (k >= 32) ? 0xffffffffu : ((1u << k) - 1u);
+    s_keep = s;
+    if ((rs_w <= 0.0f && rs_k <= 0) || k < 2) return m;
+    m = 0u;
+    float sk = 0.0f;
+    for (int r = 0; r < k; ++r) {
+        const float v = sc[pick[r]];
+        int rank = 0;
+        for (int q = 0; q < k; ++q) {
+            const float u = sc[pick[q]];
+            rank += (q != r) && (u > v || (u == v && q < r));
+        }
+        const bool keep = rank == 0 || ((rs_k <= 0 || rank < rs_k) && !(rs_w > 0.0f && v < rs_w * s));
+        if (keep) m |= 1u << r, sk += v;
+    }
+    s_keep = sk;
+    return m;
+}
+
 __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restrict__ logits,
                                                             const float* __restrict__ bias, int n, int k,
                                                             float route_scale, const unsigned long long* __restrict__ vram,
                                                             const float* __restrict__ x, int dim, int* idx, float* w,
                                                             unsigned long long* plan_ptr, Req* req,
                                                             const float* __restrict__ bias_vl, unsigned vl,
-                                                            int* cpu_any) {
+                                                            int* cpu_any, float rs_w, int rs_k) {
     pdl_wait();
     pdl_trigger();
     __shared__ float sc[1024], bs[1024];
@@ -2789,14 +2814,17 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         float s = 0.0f;
         for (int r = 0; r < k; ++r) s += sc[pick[r]];
         int cpu = 0;
+        float sk;
+        const unsigned keep = route_keep(sc, pick, k, s, rs_w, rs_k, sk);
         for (int r = 0; r < k; ++r) {
-            const float wv = sc[pick[r]] / (s + 1e-20f) * route_scale;
+            const bool kept = (keep >> r) & 1u;   // (a dropped pick: no weight, off the device, not on the CPU lane)
+            const float wv = kept ? sc[pick[r]] / (sk + 1e-20f) * route_scale : 0.0f;
             idx[(size_t) t * kPicks + r] = pick[r];
             w[(size_t) t * kPicks + r] = wv;
-            plan_ptr[(size_t) t * kPicks + r] = vram[pick[r]];
-            cpu |= vram[pick[r]] == 0ull;
+            plan_ptr[(size_t) t * kPicks + r] = kept ? vram[pick[r]] : 0ull;
+            cpu |= kept && vram[pick[r]] == 0ull;
             if (req != nullptr) {
-                req->ids[t][r] = pick[r];
+                req->ids[t][r] = kept ? pick[r] : -1;
                 req->w[t][r] = wv;
             }
         }
@@ -2902,14 +2930,17 @@ __global__ void __launch_bounds__(512) route_pair_kernel(const RoutePair a) {
             float s = 0.0f;
             for (int r = 0; r < k; ++r) s += sc[pick[r]];
             int cpu = 0;
+            float sk;
+            const unsigned keep = route_keep(sc, pick, k, s, a.rs_w, a.rs_k, sk);
             for (int r = 0; r < k; ++r) {
-                const float wv = sc[pick[r]] / (s + 1e-20f) * a.route_scale;
+                const bool kept = (keep >> r) & 1u;
+                const float wv = kept ? sc[pick[r]] / (sk + 1e-20f) * a.route_scale : 0.0f;
                 a.idx[(size_t) t * kPicks + r] = pick[r];
                 a.w[(size_t) t * kPicks + r] = wv;
-                a.plan_ptr[(size_t) t * kPicks + r] = a.vram[pick[r]];
-                cpu |= a.vram[pick[r]] == 0ull;
+                a.plan_ptr[(size_t) t * kPicks + r] = kept ? a.vram[pick[r]] : 0ull;
+                cpu |= kept && a.vram[pick[r]] == 0ull;
                 if (a.req != nullptr) {
-                    a.req->ids[t][r] = pick[r];
+                    a.req->ids[t][r] = kept ? pick[r] : -1;
                     a.req->w[t][r] = wv;
                 }
             }
@@ -3665,14 +3696,32 @@ bool pdl_on() {
 #endif
 }
 
+// STRATA_DS4_RESIDENT_SKIP_W / STRATA_DS4_RESIDENT_TOPK (MAYA_ names alias them), read once; 0 = off
+namespace {
+struct ResidentSkip {
+    float w;
+    int k;
+};
+ResidentSkip resident_skip() {
+    static const ResidentSkip rs = [] {
+        ResidentSkip r{0.0f, 0};
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_SKIP_W")) r.w = std::max(0.0f, std::min(0.9f, (float) std::atof(v)));
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_TOPK")) r.k = std::max(0, std::min(kPicks, std::atoi(v)));
+        return r;
+    }();
+    return rs;
+}
+}  // namespace
+
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
                    unsigned vl, int na0, int na1, Resp* resp, int* cpu_any, const unsigned* host_done) {
     if (req == nullptr || host_done == nullptr) resp = nullptr;
     if (resp == nullptr) cpu_any = nullptr;
+    const ResidentSkip rs = resident_skip();
     pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-               vl != 0 ? bias_vl : nullptr, vl, cpu_any);
+               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k);
     if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, resp, cpu_any, host_done);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
@@ -3683,7 +3732,10 @@ bool route_pair(const RoutePair& a, cudaStream_t s) {
     if (a.req == nullptr || a.n < 1 || a.n > 1024 || a.k < 1 || a.k > kPicks || a.a_n < 1 || a.a_n > 1024 || a.m < 1 ||
         a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim || a.T < 1 || a.T > kWin)
         return false;
-    route_pair_kernel<<<dim3(2, (unsigned) a.T), 512, 0, s>>>(a);
+    RoutePair b = a;
+    const ResidentSkip rs = resident_skip();
+    b.rs_w = rs.w, b.rs_k = rs.k;
+    route_pair_kernel<<<dim3(2, (unsigned) b.T), 512, 0, s>>>(b);
     if (cudaGetLastError() != cudaSuccess) return false;   // (a routing that did not go in is never published)
     publish_kernel<<<1, 1, 0, s>>>(a.req, a.T, a.seq, a.na0, a.na1, nullptr, nullptr, nullptr);
     return cudaGetLastError() == cudaSuccess;

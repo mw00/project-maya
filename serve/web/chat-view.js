@@ -10,6 +10,7 @@ import {addFiles, cancelEdit, chatView, ctxMeter, editMessage, focusInput, newCh
 import {markdown, onCodeClick, patchHtml, streamingMarkdown} from "./md.js";
 import {ChatMenuItems, openSettings, setSide, showView, status, usd} from "./sidebar.js";
 import {MS, loadModels} from "./models.js";
+import {CODING_IDEAS} from "./turbo-core.js";
 import {Gauge, Icon, Menu, MenuItem, MenuSep, ModelLogo, useDismiss} from "./ui.js";
 
 // ------------------------------------------------------------------ the header
@@ -456,7 +457,7 @@ function Greeting({phone}) {
     <${ModelCard} phone=${phone}/>
     ${phone ? null : html`<${Composer} center/>`}
     <div class="ideas" role="list" aria-label="Ideas to start with">
-      ${IDEAS.map((it) => html`<div role="listitem"><button type="button" class="idea" onClick=${() => useIdea(it.q)}>
+      ${(S.turbo && S.turbo.on ? CODING_IDEAS : IDEAS).map((it) => html`<div role="listitem"><button type="button" class="idea" onClick=${() => useIdea(it.q)}>
         <${Icon} name=${it.icon}/><span>${it.label}</span></button></div>`)}
     </div>
   </div>`;

@@ -693,13 +693,12 @@ def own_defaults(path: Path) -> bool:
     return True
 
 
-def save(path: Path, settings: dict) -> dict:
-    """The settings written into the config at `path` (its settings before kept beside it, <config>.prev, and the
-    first time the page changes it, what the setup wrote: installer.as_set_up, the page's Reset)."""
-    cfg = read(path)
-    if not cfg:
-        raise ValueError(f"{Path(path).name}: not a config Maya can read")
-    new = apply(cfg, settings)
+def _commit(path: Path, cfg: dict, new: dict) -> dict:
+    """`new` written over the config at `path` (`cfg` as it was): its settings before kept beside it (<config>.prev), and
+    the first time the page changes it, what the setup wrote (installer.as_set_up).  "changed": the engine's command or
+    environment is not what it was - a restart is due (a Turbo marker alone is not one)."""
+    engine = ("args", "env", "gpu", "vision", "vision_off")
+    changed = any(new.get(k) != cfg.get(k) for k in engine)
     if new == cfg:
         return {"changed": False}
     inst = new.setdefault("installer", {})
@@ -710,7 +709,126 @@ def save(path: Path, settings: dict) -> dict:
     st = Path(path).stat()
     write(path, new)
     os.utime(path, (st.st_atime, st.st_mtime))         # (its time says when it last ran: a start picks the latest)
-    return {"changed": True, "prev": prev.name}
+    return {"changed": changed, "prev": prev.name}
+
+
+def save(path: Path, settings: dict) -> dict:
+    """The settings written into the config at `path` (its settings before kept beside it, <config>.prev, and the
+    first time the page changes it, what the setup wrote: installer.as_set_up, the page's Reset)."""
+    cfg = read(path)
+    if not cfg:
+        raise ValueError(f"{Path(path).name}: not a config Maya can read")
+    return _commit(path, cfg, apply(cfg, settings))
+
+
+# ------------------------------------------------------------------ Turbo (the page's Turbo button)
+# The fastest settings the engine has, for people who play with speed and run benchmarks.  What the engine needs a start
+# for is written into the config (the same "settings saved, Maya starts again" flow); the config keeps a "turbo" note:
+# what it was before, so that switching Turbo off puts every one of these back.  The request-level half (greedy
+# decoding, the fastest thinking level, coding prompts) lives in the page (serve/web/turbo-core.js).
+TURBO_CONTEXT = 32768                               # GLM and MiniMax: a smaller context leaves VRAM to the experts ...
+TURBO_CONTEXT_FAMILIES = ("glm", "minimax")         # ... DeepSeek's context is cheap, Qwen keeps its own
+# Turbo trades quality for speed on purpose (benchmarks, playing with the engine): it goes past the safeguards.
+# Expert skipping, where the engine has it (docs/SETTINGS.md): GLM's MISS_SKIP leaves out the light experts VRAM does not
+# hold on layers 23 and up, at the highest value the docs measured (0.16: 30.9 vs 27.4 tok/s on Maya-S24, KL 0.075;
+# _FROM stays 23 - the docs warn the early layers notice it far more); DeepSeek's RAM_SKIP the same rule for every
+# expert VRAM does not hold, at the highest value documented (Maya-XS, DSpark: 27.8 -> 39.7 tok/s at 0.14).  MiniMax and
+# Qwen have no skipping.  DeepSeek's DSPARK_CUM is lowered with the draft floor below (longer verified windows).
+# Not used: MAYA_GLM_TRUNK_KEEP(_MAP) (its layer map is per model, a uniform value hurts the early layers),
+# MAYA_*_DISK_SKIP_* (only for experts that fit neither VRAM nor RAM), MAYA_GLM_DFLASH_MIN/_CUM (meant for per-request
+# tuning, no measured fast value).  The loop guard (MAYA_LOOP_GUARD) is deliberately NOT touched: it costs no speed and
+# stops greedy runaway loops, which would ruin a benchmark.
+# Where the whole model is in VRAM those skips have nothing to leave out, so Turbo also caps the routed experts a token
+# computes, wherever they live (MAYA_*_RESIDENT_TOPK, docs/SETTINGS.md; the weight rule MAYA_*_RESIDENT_SKIP_W is not
+# used: on the AMD Strix Halo test PC 0.20 already gave garbage, the rank cap degrades more gently).  The values are the
+# fastest whose output was still sound there (a three.js page that parses with `node --check`, short factual answers):
+# DeepSeek IQ1_M keeps 3 of its 6 experts a token (40.8 -> 49.5 tok/s with Turbo's other settings), GLM Maya-M-Derisked 4
+# of its 8 (33.2 -> 38.8; 3 gave a page with a duplicate import and slower drafts).
+TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23", "MAYA_GLM_RESIDENT_TOPK": "4"},
+             "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3", "MAYA_DS4_RESIDENT_TOPK": "3"}}
+# the drafter that goes fastest where the pack has it: DSpark (DeepSeek, MiniMax), MTP (Qwen).  GLM keeps the drafter the
+# setup measured for this PC (MTP or DFlash2: which is faster depends on the GPUs).
+TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}
+# DSpark's draft confidence floor (default 0.7), lowered so that longer windows are verified
+TURBO_DSPARK_CONF = 0.3
+TURBO_DSPARK_FAMILIES = ("deepseek", "minimax")
+
+
+def turbo_patch(cfg: dict) -> dict:
+    """The engine settings Turbo changes in `cfg` (only those that differ from what it has now), for apply()."""
+    fam, cur, can = family(cfg), settings_of(cfg), choices(cfg)
+    patch = {}
+    if fam in TURBO_CONTEXT_FAMILIES and (cur.get("context") or 0) > TURBO_CONTEXT:
+        patch["context"] = TURBO_CONTEXT
+    if (cur.get("parallel") or 1) > 1:                 # (one answer at a time is the fastest one)
+        patch["parallel"] = 1
+    want = TURBO_DRAFT.get(fam)
+    if want and want in can["draft"] and cur.get("draft") != want:
+        patch["draft"] = want
+    if fam in TURBO_DSPARK_FAMILIES and (want in can["draft"] or cur.get("draft") == "dspark")             and cur.get("dspark_conf") != TURBO_DSPARK_CONF:
+        patch["dspark_conf"] = TURBO_DSPARK_CONF
+    if fam == "deepseek" and cur.get("prompt_lookup") is False:
+        patch["prompt_lookup"] = True
+    env = TURBO_ENV.get(fam)
+    if env and any(cur["env"].get(k) != v for k, v in env.items()):
+        patch["env"] = {**cur["env"], **env}
+    return patch
+
+
+def turbo_on(cfg: dict) -> bool:
+    return isinstance(cfg.get("turbo"), dict)
+
+
+def turbo_info(cfg: dict) -> dict:
+    """What the page needs: whether Turbo is on, and what switching it on would change (before -> after)."""
+    cur = settings_of(cfg)
+    if turbo_on(cfg):
+        return {"on": True, "family": family(cfg), "since": cfg["turbo"].get("since"), "plan": {}}
+    patch = turbo_patch(cfg)
+    return {"on": False, "family": family(cfg),
+            "plan": {k: {"from": cur.get(k), "to": v} for k, v in patch.items() if k != "env"},
+            "env": {k: v for k, v in (patch.get("env") or {}).items() if cur["env"].get(k) != v}}
+
+
+def turbo_enable(path: Path) -> dict:
+    """Turbo on: its settings written into the config at `path`, and the note that undoes them.  "changed": the engine
+    must start again."""
+    cfg = read(path)
+    if not cfg:
+        raise ValueError(f"{Path(path).name}: not a config Maya can read")
+    if turbo_on(cfg):
+        raise ValueError("Turbo is already on")
+    cur, patch = settings_of(cfg), turbo_patch(cfg)
+    new = apply(cfg, patch)
+    new["turbo"] = {"since": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "before": {k: cur.get(k) for k in patch},            # (the settings Turbo changed, as they were)
+                    "args": list(cfg.get("args") or []), "env": cfg.get("env"),   # (and the command and environment whole)
+                    "applied": {"args": list(new.get("args") or []), "env": new.get("env")}}
+    return _commit(path, cfg, new)
+
+
+def turbo_disable(path: Path) -> dict:
+    """Turbo off: the config as it was before.  The command and environment come back whole when nothing else changed
+    them since; if they were changed meanwhile (the context raised, a setting edited), only the settings Turbo changed go
+    back to what they were."""
+    cfg = read(path)
+    if not cfg:
+        raise ValueError(f"{Path(path).name}: not a config Maya can read")
+    note = cfg.get("turbo")
+    if not isinstance(note, dict):
+        raise ValueError("Turbo is not on")
+    applied = note.get("applied") or {}
+    if list(cfg.get("args") or []) == applied.get("args") and cfg.get("env") == applied.get("env"):
+        new = copy.deepcopy(cfg)
+        new["args"] = list(note.get("args") or [])
+        if note.get("env"):
+            new["env"] = note["env"]
+        else:
+            new.pop("env", None)
+    else:
+        new = apply(cfg, dict(note.get("before") or {}))
+    new.pop("turbo", None)
+    return _commit(path, cfg, new)
 
 
 # ------------------------------------------------------------------ deleting a model (the page's Delete)
@@ -800,8 +918,28 @@ def _size(p: Path) -> int:
                 st = os.lstat(os.path.join(dp, n))
             except OSError:
                 continue
-            total += st.st_size if stat.S_ISREG(st.st_mode) else 0
+            # (a hard link another model's folder also holds - the Engram tables the setup links between folders - frees
+            # nothing when this one goes: the data stays with the last link, so it is not counted)
+            total += st.st_size if stat.S_ISREG(st.st_mode) and st.st_nlink <= 1 else 0
     return total
+
+
+def _links_into(roots: list, p: Path) -> bool:
+    """Whether a symbolic link under one of `roots` (another model's folders) points into `p`: deleting `p` would leave
+    it dangling (the setup links the Engram tables between model folders when it cannot hard link them)."""
+    seen = 0
+    for r in roots:
+        if not r.is_dir():
+            continue
+        for dp, dirs, files in os.walk(r):
+            for n in dirs + files:
+                seen += 1
+                f = os.path.join(dp, n)
+                if os.path.islink(f) and _within(_res(f) or Path(f), p):
+                    return True
+            if seen > 20000:
+                return False
+    return False
 
 
 def delete_plan(root: Path, path: Path) -> dict:
@@ -813,6 +951,7 @@ def delete_plan(root: Path, path: Path) -> dict:
     me = _res(path)
     others = [(p, read(p)) for p in config_paths(root) if _res(p) != me]
     refs = [r for _, c in others for r in runs_from(c)]
+    homes = [h.parent for h in (_res(pack_of(c)) for _, c in others) if h is not None]   # (their folders: links in them)
     out = {"ok": False, "why": None, "items": [], "bytes": 0, "folder": None, "gguf": 0, "pack": False,
            "vision": False, "drafter": None, "drafter_users": [], "kept": []}
     models = _res((cfg.get("installer") or {}).get("models_dir"))
@@ -825,8 +964,8 @@ def delete_plan(root: Path, path: Path) -> dict:
     project = _res(Path(root))
     items: list = []
 
-    def shared(p: Path) -> bool:                        # (another model runs from it, or from something in it)
-        return any(_within(r, p) for r in refs)
+    def shared(p: Path) -> bool:                        # (another model runs from it, or from something in it, or links to it)
+        return any(_within(r, p) for r in refs) or _links_into(homes + refs, p)
 
     def covered(p: Path) -> bool:
         return any(_within(p, it) for it, _ in items)

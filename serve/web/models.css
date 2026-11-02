@@ -12,6 +12,12 @@
 .mdl-add__cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .mdl-add__os { flex: none; width: 120px; color: var(--st-code-dim); font-size: var(--st-fs-xs); }
 .mdl-add__cmd .icon-btn { color: var(--st-code-dim); }
+.mdl-dl { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 6px 12px; padding: 10px 0; border-top: 1px solid var(--st-line); }
+.mdl-dl__name { display: flex; flex-direction: column; min-width: 0; }
+.mdl-dl__name > span { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.mdl-dl__bar { grid-column: 1 / -1; height: 6px; border-radius: 3px; background: var(--st-line); overflow: hidden; }
+.mdl-dl__bar > i { display: block; height: 100%; background: var(--st-accent); transition: width .4s; }
+.mdl-dl__txt { grid-column: 1 / -1; font-size: var(--st-fs-xs); color: var(--st-ink-muted); overflow-wrap: anywhere; }
 .mdl-add__cmd .icon-btn:hover { background: rgba(255, 255, 255, .08); color: var(--st-code-ink); }
 
 /* a model's card */

@@ -10,6 +10,7 @@ import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStop
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
 import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
+import {TurboButton} from "./turbo.js";
 import {CtxSlider, Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 const SECTIONS = [
@@ -142,7 +143,7 @@ function ChatDefaults() {
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
     : "API clients get them for anything they don't set themselves.";
-  return html`<h3>Chat defaults</h3>
+  return html`<div class="set-head"><h3>Chat defaults</h3><${TurboButton}/></div>
     <p class="set-intro">How ${modelName(S.health.model)} writes new answers. Each model keeps its own.</p>
     <${Row} label="Presets"><${Seg} label="Presets" value=${preset} onChange=${(id) => set(PRESETS[id])}
       options=${[{id: "precise", label: "Precise", title: "Temperature 0: the same question gives the same answer"},
