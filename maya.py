@@ -918,11 +918,14 @@ def hip_reserve_mib(gpus) -> int:
 
 def hip_clang(root: Path) -> Path | None:
     """ROCm's clang++: <root>/llvm/bin (a system ROCm on Linux), <root>/lib/llvm/bin (TheRock's wheels),
-    <root>/lib64/rocm/llvm/bin (a distribution's own ROCm packages under /usr, e.g. Fedora's), or <root>/bin (AMD's HIP
-    SDK for Windows)."""
+    <root>/lib/llvm/<version>/bin (a distribution's LLVM slot, e.g. Gentoo's), <root>/lib64/rocm/llvm/bin (a
+    distribution's own ROCm packages under /usr, e.g. Fedora's), or <root>/bin (AMD's HIP SDK for Windows)."""
     exe = "clang++.exe" if WIN else "clang++"
+    slots = sorted((root / "lib" / "llvm").glob(f"*/bin/{exe}"),
+                   key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)],
+                   reverse=True) if not WIN else []
     return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe,
-                             root / "lib64" / "rocm" / "llvm" / "bin" / exe, root / "bin" / exe)
+                             root / "lib64" / "rocm" / "llvm" / "bin" / exe, *slots, root / "bin" / exe)
                  if p.exists()), None)
 
 

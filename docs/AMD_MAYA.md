@@ -9,8 +9,10 @@ Windows: see [Windows](#windows).
 
 Use a system ROCm 7 installation with its HIP compiler and hipBLAS, Python
 3.10+, CMake 3.24+, and a C++20 compiler. `ROCM_PATH` selects an installation
-outside `/opt/rocm`. Everything Maya downloads goes into the project or its
-model-data folder; setup does not install system packages.
+outside `/opt/rocm`. Versioned LLVM slots, as Gentoo's
+`<root>/lib/llvm/22/bin/clang++`, are accepted too. Everything Maya downloads
+goes into the project or its model-data folder; setup does not install system
+packages.
 
 ```sh
 ./maya.sh --backend hip --gpu 0 --check

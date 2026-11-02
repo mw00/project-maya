@@ -53,6 +53,18 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(pc["gpus"], [self.gpus[1]])
         self.assertEqual(maya.EXE, self.root / "build-hip/maya")
 
+    def test_versioned_llvm_slot_is_found(self) -> None:
+        """Gentoo's versioned LLVM slots count as ROCm's compiler."""
+        # Gentoo keeps each LLVM version in its own slot: <root>/lib/llvm/22/bin/clang++
+        (self.rocm / "llvm/bin/clang++").unlink()
+        for v in ("18", "22"):
+            slot = self.rocm / f"lib/llvm/{v}/bin/clang++"
+            slot.parent.mkdir(parents=True, exist_ok=True)
+            slot.touch()
+        self.assertEqual(maya.hip_clang(self.rocm), self.rocm / "lib/llvm/22/bin/clang++")
+        pc = maya.check_pc(self.a)
+        self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
+
     def test_rdna2_is_experimental_and_compiled_only_when_chosen(self):
         pc = maya.check_pc(self.a)      # the RX 7900 XT: its own architecture only (#255)
         self.assertEqual(pc["archs"], ["gfx1100"])
