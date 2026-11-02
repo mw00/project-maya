@@ -3682,7 +3682,8 @@ class Service:
                 last_print = time.time()
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
-                in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
+                budgeted = in_think and self.think_budget > 0   # (0 = no budget: the end token is still tracked)
                 # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
                 # side request such as a title, which must still get an answer: a reserve is kept for it (a quarter,
@@ -3692,18 +3693,18 @@ class Service:
                 # reasoning. The forced </think> also consumes one token of max_new, so account for it.
                 think_budget = self.think_budget
                 soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
-                if in_think and max_new and int(max_new) <= THINK_TINY_LIMIT:
+                if budgeted and max_new and int(max_new) <= THINK_TINY_LIMIT:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
                     reserve = max(int(max_new) // 4, min(reserve_floor, max(1, int(max_new) // 2)))
                     think_budget = max(1, min(think_budget, int(max_new) - reserve - 1))
-                elif in_think:
+                elif budgeted:
                     # the engine's own close THINK_GRACE tokens later (at most half the room max_tokens leaves after
                     # the budget); the reasoning ends at its first sentence or line end past the budget (#613)
                     room = (int(max_new) - think_budget - 1) // 2 if max_new else THINK_GRACE
                     grace = max(0, min(THINK_GRACE, room))
                     if grace > 0:
                         soft, think_budget = think_budget, think_budget + grace
-                if in_think:
+                if budgeted:
                     sampling = {**(sampling or {}), "_think_budget": think_budget, "_think_end": self.think_end_id}
                     if soft is not None:
                         sampling["_think_soft"] = soft
@@ -3804,7 +3805,7 @@ class Service:
                         end_think = bool(in_think and t == self.think_end_id)
                         if end_think:
                             in_think = False
-                            if n == think_budget + 1:
+                            if think_budget > 0 and n == think_budget + 1:
                                 print(f"[maya] thinking reached its budget ({think_budget} tokens"
                                       f"{f', {soft} + {think_budget - soft} without a sentence end' if soft else ''})"
                                       ": closed, answering", flush=True)
@@ -3830,8 +3831,7 @@ class Service:
                             steer = self.tok.encode(loop_guard.keep_steer(think_restarts)) if thinks else []
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
                             parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
-                            in_think = thinks and bool(thinking) and self.think_end_id is not None \
-                                and self.think_budget > 0
+                            in_think = thinks and bool(thinking) and self.think_end_id is not None
                             continue
                         # a marker the model wrote as its answer's text - quoted, in a code fence, a tool call's body - is
                         # not the turn's end (the stream's own parser has the same rule for calls)
@@ -3857,8 +3857,7 @@ class Service:
                                 seg["next"] = list(seg["prompt"]) + seg["ids"] + ids_k + steer
                                 sampling = loop_guard.block_sampling(sampling, kept)
                                 parser, detok, held, said[:] = new_parser(thinks), Detokenizer(self.tok), "", []
-                                in_think = thinks and bool(thinking) and self.think_end_id is not None \
-                                    and self.think_budget > 0
+                                in_think = thinks and bool(thinking) and self.think_end_id is not None
                                 continue
                             if key is None:
                                 break
@@ -3874,7 +3873,7 @@ class Service:
                             seg["next"] = list(seg["prompt"]) + seg["ids"] + suffix + steer
                             sampling = loop_guard.block_sampling(sampling, tries[key])
                             parser, detok, held, said[:] = new_parser(), Detokenizer(self.tok), "", []
-                            in_think = bool(thinking) and self.think_end_id is not None and self.think_budget > 0
+                            in_think = bool(thinking) and self.think_end_id is not None
                             continue
                         seg["ids"].append(t)
                         if parser.state == "reasoning":

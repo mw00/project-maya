@@ -1048,11 +1048,15 @@ class ThinkingMarkers(unittest.TestCase):
     (THINK_RESTARTS times).  In the answer it is text too when quoted in code or inside a tool call's body; spelled
     out in ordinary pieces or in plain prose it ends the turn as always."""
 
-    def answer(self, *seqs, tok=None, stop=None):
+    def answer(self, *seqs, tok=None, stop=None, budget=None, token_only_end=False):
         from serve.frontend import openai_to_messages
         tok = tok or DeepTok()
         eng = SeqEngine(tok, *seqs)
         svc = Server().service(eng)
+        if budget is not None:
+            svc.think_budget = budget
+        if token_only_end:
+            svc.template.deepseek = True
         msgs, tools, kw = openai_to_messages(agent())
         ids, thinking, max_new = svc.prepare(msgs, tools, kw, 2000)
         events, done = [], None
@@ -1079,6 +1083,18 @@ class ThinkingMarkers(unittest.TestCase):
         self.assertEqual((len(eng.prompts), done["finish"]), (1, "stop"))
         self.assertIn("ANSWER OK", text)
         self.assertNotIn(DS_USER, reason)                  # (the marker is the turn's token, not the thinking's text)
+
+    def test_no_budget_still_closes_the_thinking_at_its_end_token(self):
+        # #786: thinking_budget 0 and DeepSeek's token-only end: the end token is tracked all the same, the reasoning
+        # closes there and the answer is the content - no "</think>" in the reasoning, no restart
+        tok = DeepTok()
+        seq = tok.encode("thinking.</think>" + chr(10) * 2 + "ANSWER OK", parse_special=True)
+        for budget in (0, 32768):
+            svc, eng, text, reason, calls, done = self.answer(seq, tok=tok, budget=budget, token_only_end=True)
+            self.assertEqual((len(eng.prompts), done["finish"], svc.think_end_id is not None), (1, "stop", True))
+            self.assertIn("ANSWER OK", text)
+            self.assertNotIn("</think>", reason)
+            self.assertIn("thinking.", reason)
 
     def test_the_engine_eos_in_the_thinking_resumes_it(self):
         tok = DeepTok()
