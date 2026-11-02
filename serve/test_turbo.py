@@ -32,7 +32,7 @@ class TurboMap(unittest.TestCase):
         p = glm_cfg(self.d)                                    # (131072 context, MTP, no parallel)
         patch = M.turbo_patch(M.read(p))
         self.assertEqual(patch["context"], 32768)
-        self.assertEqual(patch["env"]["MAYA_GLM_MISS_SKIP_W"], "0.14")
+        self.assertEqual(patch["env"]["MAYA_GLM_MISS_SKIP_W"], "0.16")
         self.assertEqual(patch["env"]["MAYA_GLM_MISS_SKIP_FROM"], "23")
         self.assertEqual(patch["env"]["MAYA_GLM_RAM_HEADROOM_GB"], "4")     # (the config's own variable stays)
         self.assertNotIn("draft", patch)                       # (GLM keeps the drafter the setup measured)
@@ -41,7 +41,9 @@ class TurboMap(unittest.TestCase):
         p = ds4_cfg(self.d)
         patch = M.turbo_patch(M.read(p))
         self.assertNotIn("context", patch)
-        self.assertEqual(patch["env"], {"MAYA_DS4_RAM_SKIP_W": "0.14"})
+        self.assertEqual(patch["env"], {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3"})
+        self.assertEqual(patch["dspark_conf"], 0.3)                    # (the draft floor lowered from 0.7)
+        self.assertNotIn("MAYA_LOOP_GUARD", patch["env"])              # (the loop guard is left on)
 
     def test_deepseek_lookup_and_drafter(self):
         p = ds4_cfg(self.d)
@@ -58,6 +60,7 @@ class TurboMap(unittest.TestCase):
         patch = M.turbo_patch(M.read(mm3_cfg(self.d)))
         self.assertEqual(patch.get("context"), 32768 if M.settings_of(M.read(mm3_cfg(self.d)))["context"] > 32768 else None)
         self.assertNotIn("env", patch)                         # (no expert skipping in maya-mm3)
+        self.assertEqual(patch.get("dspark_conf"), 0.3)
 
     def test_smaller_context_is_kept(self):
         cfg = M.read(glm_cfg(self.d))
@@ -80,7 +83,7 @@ class TurboSnapshot(unittest.TestCase):
         on = M.read(self.p)
         self.assertTrue(M.turbo_on(on))
         self.assertEqual(M.settings_of(on)["context"], 32768)
-        self.assertEqual(on["env"]["MAYA_GLM_MISS_SKIP_W"], "0.14")
+        self.assertEqual(on["env"]["MAYA_GLM_MISS_SKIP_W"], "0.16")
         self.assertTrue(M.turbo_info(on)["on"])
         out = M.turbo_disable(self.p)
         self.assertTrue(out["changed"])

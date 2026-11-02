@@ -726,14 +726,24 @@ def save(path: Path, settings: dict) -> dict:
 # decoding, the fastest thinking level, coding prompts) lives in the page (serve/web/turbo-core.js).
 TURBO_CONTEXT = 32768                               # GLM and MiniMax: a smaller context leaves VRAM to the experts ...
 TURBO_CONTEXT_FAMILIES = ("glm", "minimax")         # ... DeepSeek's context is cheap, Qwen keeps its own
-# expert skipping, where the engine has it (docs/SETTINGS.md): GLM's MISS_SKIP leaves out the light experts VRAM does not
-# hold on layers 23 and up (RTX 3090 + 9700X, Maya-S24: 27.4 -> 30.1 tok/s at 0.14); DeepSeek's RAM_SKIP the same rule
-# for every expert VRAM does not hold (Maya-XS, DSpark: 27.8 -> 39.7 tok/s at 0.14).  MiniMax and Qwen have none.
-TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.14", "MAYA_GLM_MISS_SKIP_FROM": "23"},
-             "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14"}}
+# Turbo trades quality for speed on purpose (benchmarks, playing with the engine): it goes past the safeguards.
+# Expert skipping, where the engine has it (docs/SETTINGS.md): GLM's MISS_SKIP leaves out the light experts VRAM does not
+# hold on layers 23 and up, at the highest value the docs measured (0.16: 30.9 vs 27.4 tok/s on Maya-S24, KL 0.075;
+# _FROM stays 23 - the docs warn the early layers notice it far more); DeepSeek's RAM_SKIP the same rule for every
+# expert VRAM does not hold, at the highest value documented (Maya-XS, DSpark: 27.8 -> 39.7 tok/s at 0.14).  MiniMax and
+# Qwen have no skipping.  DeepSeek's DSPARK_CUM is lowered with the draft floor below (longer verified windows).
+# Not used: MAYA_GLM_TRUNK_KEEP(_MAP) (its layer map is per model, a uniform value hurts the early layers),
+# MAYA_*_DISK_SKIP_* (only for experts that fit neither VRAM nor RAM), MAYA_GLM_DFLASH_MIN/_CUM (meant for per-request
+# tuning, no measured fast value).  The loop guard (MAYA_LOOP_GUARD) is deliberately NOT touched: it costs no speed and
+# stops greedy runaway loops, which would ruin a benchmark.
+TURBO_ENV = {"glm": {"MAYA_GLM_MISS_SKIP_W": "0.16", "MAYA_GLM_MISS_SKIP_FROM": "23"},
+             "deepseek": {"MAYA_DS4_RAM_SKIP_W": "0.14", "MAYA_DS4_DSPARK_CUM": "0.3"}}
 # the drafter that goes fastest where the pack has it: DSpark (DeepSeek, MiniMax), MTP (Qwen).  GLM keeps the drafter the
 # setup measured for this PC (MTP or DFlash2: which is faster depends on the GPUs).
 TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}
+# DSpark's draft confidence floor (default 0.7), lowered so that longer windows are verified
+TURBO_DSPARK_CONF = 0.3
+TURBO_DSPARK_FAMILIES = ("deepseek", "minimax")
 
 
 def turbo_patch(cfg: dict) -> dict:
@@ -747,6 +757,8 @@ def turbo_patch(cfg: dict) -> dict:
     want = TURBO_DRAFT.get(fam)
     if want and want in can["draft"] and cur.get("draft") != want:
         patch["draft"] = want
+    if fam in TURBO_DSPARK_FAMILIES and (want in can["draft"] or cur.get("draft") == "dspark")             and cur.get("dspark_conf") != TURBO_DSPARK_CONF:
+        patch["dspark_conf"] = TURBO_DSPARK_CONF
     if fam == "deepseek" and cur.get("prompt_lookup") is False:
         patch["prompt_lookup"] = True
     env = TURBO_ENV.get(fam)

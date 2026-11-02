@@ -107,14 +107,14 @@ export async function setTurbo(on) {
 export function TurboButton() {
   const t = S.turbo;
   if (t.unavailable) return null;
-  const tip = t.on ? "Turbo is on: greedy decoding, no thinking and the engine's fastest settings. Click to put your settings back."
-                   : "Turbo: the fastest settings, for benchmarks and playing with speed. Your own come back when you switch it off.";
+  const tip = t.on ? "Turbo ON: trades quality for maximum speed (greedy decoding, no thinking, expert skipping, aggressive drafting). Click to put your settings back."
+                   : "Turbo: trades quality for maximum speed, for benchmarks and playing with the engine. Your own settings come back when you switch it off.";
   return html`<button type="button" class=${`turbo${t.on ? " turbo--on" : ""}${t.busy ? " turbo--busy" : ""}`} aria-pressed=${t.on ? "true" : "false"}
       title=${tip} disabled=${t.busy} onClick=${() => setTurbo(!t.on)}>
     <svg class="turbo__flame" viewBox="0 0 24 24" aria-hidden="true">
       <path class="turbo__outer" d="M12 2c.6 3.2-1.2 4.8-2.8 6.7C7.5 10.6 6 12.4 6 15a6 6 0 0 0 12 0c0-2.2-1-3.9-2.2-5.2-.3 1.3-.9 2.1-1.8 2.6.6-3.8-.3-7.8-2-10.4z"/>
       <path class="turbo__inner" d="M12 22a3.6 3.6 0 0 0 3.6-3.6c0-1.6-1-2.6-1.9-3.6-.4 1-.9 1.5-1.5 1.8.2-1.7-.2-3.2-1.2-4.4-.3 2.1-2.6 3.1-2.6 6.2A3.6 3.6 0 0 0 12 22z"/>
     </svg>
-    <span>Turbo</span><span class="turbo__state">${t.on ? "On" : "Off"}</span>
+    <span>${t.on ? "Turbo ON" : "Turbo"}</span>
   </button>`;
 }
