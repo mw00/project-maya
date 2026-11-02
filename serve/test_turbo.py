@@ -93,6 +93,17 @@ class TurboMap(unittest.TestCase):
         self.assertEqual(patch["env"]["MAYA_GLM_RAM_HEADROOM_GB"], "4")     # (the config's own variable stays)
         self.assertNotIn("draft", patch)                       # (GLM keeps the drafter the setup measured)
 
+    def test_smallest_quants_keep_every_expert(self):
+        """GLM and DeepSeek Maya-XS: Turbo's other settings, but no expert cap (TURBO_NO_TOPK)."""
+        for make, key, other in ((glm_cfg, "MAYA_GLM_RESIDENT_TOPK", "MAYA_GLM_MISS_SKIP_W"),
+                                 (ds4_cfg, "MAYA_DS4_RESIDENT_TOPK", "MAYA_DS4_RAM_SKIP_W")):
+            cfg = M.read(make(self.d))
+            cfg.setdefault("installer", {})["ds4_quant" if key.startswith("MAYA_DS4") else "quant"] = \
+                "maya-xs" if key.startswith("MAYA_DS4") else "Maya-XS-IQ1_S"
+            patch = M.turbo_patch(cfg)
+            self.assertNotIn(key, patch["env"])
+            self.assertIn(other, patch["env"])
+
     def test_deepseek_keeps_its_context(self):
         p = ds4_cfg(self.d)
         patch = M.turbo_patch(M.read(p))

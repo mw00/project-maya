@@ -752,6 +752,18 @@ TURBO_DRAFT = {"deepseek": "dspark", "minimax": "dspark", "qwen": "mtp"}
 # DSpark's draft confidence floor (default 0.7), lowered so that longer windows are verified
 TURBO_DSPARK_CONF = 0.3
 TURBO_DSPARK_FAMILIES = ("deepseek", "minimax")
+# The smallest quants (GLM and DeepSeek Maya-XS, experts at 1-2 bits) keep every expert a token routes to: on 3x V100 the
+# cap gained at most 2-6% there, and GLM Maya-XS with 4 of 8 experts invented three.js classes and rambled.
+TURBO_NO_TOPK = ("maya-xs",)
+
+
+def turbo_smallest_quant(cfg: dict) -> bool:
+    """Whether cfg runs one of TURBO_NO_TOPK's quants (the setup's record of the quant, else the pack's folder)."""
+    inst = cfg.get("installer") or {}
+    names = [str(inst.get(k) or "") for k in ("ds4_quant", "quant", "model_dir")]
+    args = cfg.get("args") or []
+    names += [str(args[i + 1]) for i, a in enumerate(args[:-1]) if a in ("--pack", "--glm-pack")]
+    return any(t in n.lower().replace("_", "-") for n in names for t in TURBO_NO_TOPK)
 
 
 def turbo_patch(cfg: dict) -> dict:
@@ -770,6 +782,8 @@ def turbo_patch(cfg: dict) -> dict:
     if fam == "deepseek" and cur.get("prompt_lookup") is False:
         patch["prompt_lookup"] = True
     env = TURBO_ENV.get(fam)
+    if env and turbo_smallest_quant(cfg):              # (no expert cap on the 1-2 bit quants: see TURBO_NO_TOPK)
+        env = {k: v for k, v in env.items() if not k.endswith("_RESIDENT_TOPK")}
     if env and any(cur["env"].get(k) != v for k, v in env.items()):
         patch["env"] = {**cur["env"], **env}
     return patch
