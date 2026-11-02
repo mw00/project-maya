@@ -5,6 +5,7 @@
 // their sums run in another order), and how many of each row's top 512 positions the two agree on.
 //   nvcc -O3 -std=c++17 -arch=native -I include -I src/ds4 tests/ds4_index_score_tc.cu src/ds4/ds4_kernels.cu \
 //        src/ds4/ds4_host_ar.cpp -Xcompiler -mavx2,-mfma,-mf16c -o build/ds4_index_score_tc
+//   (or with CMake, CUDA or HIP: cmake --build build --target ds4_index_score_tc; on RDNA 3 the WMMAs' kernel)
 //   DS4_INDEX_TC=1 build/ds4_index_score_tc   (the engine's default is the CUDA cores' kernel)
 #include "ds4_kernels.cuh"
 
@@ -29,15 +30,37 @@ int main() {
     const int HD = 128, H = 32, k = 512;
     const size_t RB = kv_row_bytes(kKvFp4p, HD);   // (the cache's rows: codes, scales, padded to 16)
     int fails = 0;
-    struct Case { int n, T; bool cand; };
-    for (Case cs : {Case{1000, 1, false}, Case{65536, 3, false}, Case{131072, 6, false}, Case{20000, 64, false},
-                    Case{65536, 3, true}, Case{40000, 16, true}}) {
+    int dev = 0;
+    cudaDeviceProp prop{};
+    cudaGetDevice(&dev);
+    cudaGetDeviceProperties(&prop, dev);
+#if defined(STRATA_USE_HIP)
+    std::printf("device %d: %s (%s)\n", dev, prop.name, prop.gcnArchName);
+#else
+    std::printf("device %d: %s (compute capability %d.%d)\n", dev, prop.name, prop.major, prop.minor);
+#endif
+    struct Case { int n, T; bool cand, edge = false; };
+    std::vector<Case> cases = {Case{1000, 1, false}, Case{65536, 3, false}, Case{131072, 6, false}, Case{20000, 64, false},
+                               Case{65536, 3, true}, Case{40000, 16, true}, Case{131072, 64, false}};
+#if defined(STRATA_USE_HIP)
+    // (edge: a quarter of the key blocks' scale bytes 0 - a zero block, as ue8m0_val reads it - 1 (the cache's for an
+    // all-zero block) or 2, beside ordinary blocks in the same rows: RDNA 3's kernel takes the scales as ue8m0_val
+    // does; the sm80 kernel's 2^(ea + eq) assumes normal powers of two)
+    cases.push_back(Case{20000, 6, false, true});
+    cases.push_back(Case{20000, 1, true, true});
+    // (decode windows of 5 and 6 queries: two blocks of up to 3 there - a 130K prompt's 32768 keys, a 512K one's)
+    cases.push_back(Case{32768, 6, false});
+    cases.push_back(Case{32768, 5, false});
+    cases.push_back(Case{131072, 5, false});
+#endif
+    for (Case cs : cases) {
         const int n = cs.n, T = cs.T, blk = 8, nb = (n + blk - 1) / blk;
         std::vector<uint8_t> keys((size_t) n * RB);
         for (int p = 0; p < n; ++p) {
             uint8_t* r = keys.data() + (size_t) p * RB;
             for (int b = 0; b < HD / 2; ++b) r[b] = (uint8_t) (code(rng) | (code(rng) << 4));
-            for (int b = 0; b < HD / 32; ++b) r[HD / 2 + b] = (uint8_t) cbyte(rng);
+            for (int b = 0; b < HD / 32; ++b)
+                r[HD / 2 + b] = (uint8_t) (cs.edge && code(rng) < 4 ? code(rng) % 3 : cbyte(rng));
         }
         std::vector<float> q((size_t) T * H * HD), w((size_t) T * 64);
         for (size_t i = 0; i < q.size(); i += 32) {   // (a 32's codes times its power of two: quant 3's grid)
@@ -127,8 +150,9 @@ int main() {
             agree += (double) both.size() / kk / T;
         }
         const bool ok = masks && worst < 2e-5;
-        std::printf("n %6d, %2d rows%s: masks %s, worst difference %.2e of the row's largest, top-%d agreement %.4f; "
-                    "%.1f -> %.1f us a call\n", n, T, cs.cand ? ", candidates" : "", masks ? "the same" : "DIFFER", worst, k,
+        std::printf("n %6d, %2d rows%s%s: masks %s, worst difference %.2e of the row's largest, top-%d agreement %.4f; "
+                    "%.1f -> %.1f us a call\n", n, T, cs.cand ? ", candidates" : "", cs.edge ? ", scales 0-2" : "",
+                    masks ? "the same" : "DIFFER", worst, k,
                     agree, 1000.0 * ms[0] / 20, 1000.0 * ms[1] / 20);
         fails += !ok;
         cudaFree(dk);
