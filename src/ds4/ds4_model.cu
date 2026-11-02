@@ -2032,6 +2032,8 @@ struct Model::Impl {
     static constexpr const char* kLendBroken =
         "the prompt path's room could not be handed back - the expert tables are unknown; restart the engine";
     std::vector<uint8_t*> rf_stage, rf_half;   // (rf_half: DS4_TP_BORROW's member parts, one a thread)
+    std::thread rf_pre;   // (borrow_begin: the lent experts' file ranges asked for while the prompt runs; borrow_end joins it)
+    bool rf_pre_cached = false;   // (the lent experts' ranges were asked for: borrow_end reads them through the page cache)
     size_t rf_bytes = 0;
     int64_t lent_experts = 0;
     double lent_ms = 0;
@@ -2227,6 +2229,7 @@ struct Model::Impl {
     }
 
     ~Impl() {
+        if (rf_pre.joinable()) rf_pre.join();
         blas_skip.store(true);
         if (blas_th.joinable()) blas_th.join();   // (it uses the cuBLAS handles destroyed below)
         {
@@ -3068,11 +3071,13 @@ struct Model::Impl {
         }
         return read_mx_file(l, e, blob);
     }
-    bool read_mx_file(const Layer& l, int e, uint8_t* blob) const {   // (the movers: never a slot that may change)
-        for (int r = 0; r < 3; ++r)
-            if (!pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r], mx_part_bytes(l, r),
-                            blob + l.lay.trellis[r]))
+    bool read_mx_file(const Layer& l, int e, uint8_t* blob, bool cached = false) const {   // (the movers: never a slot that may change; cached: through the page cache)
+        for (int r = 0; r < 3; ++r) {
+            const uint64_t off = l.mx_off[r] + (uint64_t) e * l.mx_stride[r];
+            if (!(cached ? os::pread_full(pk.fds[(size_t) l.mx_file[r]], blob + l.lay.trellis[r], mx_part_bytes(l, r), off)
+                         : pk.read_at(l.mx_file[r], off, mx_part_bytes(l, r), blob + l.lay.trellis[r])))
                 return false;
+        }
         return true;
     }
     // (l the group's first member: member m's own range [ff0, ff0 + ffn) and its own layout - whole blocks of the
@@ -18369,7 +18374,48 @@ struct Model::Impl {
             }
             lent = true;
         }
+        lend_prefetch();
         return true;
+    }
+    // the lent slots' experts are read back from their files when the prompt is done (borrow_end): asked for now, the
+    // page cache holds them by then - the disk's reads overlap the prompt instead of following it (DS4_LEND_PREFETCH=0
+    // off; Linux: the readahead hint, nothing elsewhere)
+    void lend_prefetch() {
+        static const bool on = std::getenv("DS4_LEND_PREFETCH") == nullptr || std::atoi(std::getenv("DS4_LEND_PREFETCH")) != 0;
+        if (!on || rf_pre.joinable()) return;
+        struct Rng {
+            os::fd_t fd;
+            uint64_t off, n;
+        };
+        std::vector<Rng> rg;
+        for (const Layer& l : L) {
+            if (l.mtp || l.pv_n >= l.n_slots || l.lay.fmt != gg::kFmtMXFP4) continue;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.slot[(size_t) e] >= l.pv_n)
+                    for (int r = 0; r < 3; ++r)
+                        rg.push_back({pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
+                                      (uint64_t) mx_part_bytes(l, r)});
+        }
+        uint64_t total = 0;
+        for (const Rng& x : rg) total += x.n;
+        // (the page cache holds them till borrow_end: only where the RAM has room to spare - else the slower direct reads)
+        if (rg.empty() || total > ram_room() / 4) return;
+        rf_pre_cached = true;
+        rf_pre = std::thread([rg = std::move(rg)] {   // (read, not advised: the kernel's readahead hint fills too little)
+            std::atomic<size_t> next{0};
+            std::vector<std::thread> th;
+            for (int t = 0; t < 4; ++t)
+                th.emplace_back([&] {
+                    std::vector<uint8_t> buf;
+                    for (;;) {
+                        const size_t i = next.fetch_add(1);
+                        if (i >= rg.size()) break;
+                        buf.resize((size_t) rg[i].n);
+                        (void) os::pread_full(rg[i].fd, buf.data(), rg[i].n, rg[i].off);
+                    }
+                });
+            for (auto& x : th) x.join();
+        });
     }
     // expert e's table entry on every member of l's group from its slot (-1: 0), synchronously - with nothing queued
     // that reads the table (false: a device selection or copy failed)
@@ -18457,6 +18503,9 @@ struct Model::Impl {
     // CPU lane too (nothing reads those slots), and the caller fails the prompt before any decode - or a device
     // selection, sync, copy into a slot or table write failed: lend_broken (sticky), no later request runs
     bool borrow_end() {
+        if (rf_pre.joinable()) rf_pre.join();
+        const bool cached = rf_pre_cached;   // (the prompt's time spent reading the lent experts into the page cache)
+        rf_pre_cached = false;
         if (!lent) return true;
         lend_unhold();   // (a prompt read in parts kept it: its experts back in their slots' books first)
         lent = false;
@@ -18622,7 +18671,7 @@ struct Model::Impl {
                                            mx_part_bytes(l, r), false);
                         continue;
                     }
-                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage);
+                    const bool read = l.blob <= rf_bytes && read_mx_file(l, e, stage, cached);
                     const bool put = read && cudaSetDevice(devs[(size_t) l.dev].id) == cudaSuccess &&
                                      cudaMemcpy(sat(l, l, l.slot[(size_t) e], l.blob), stage, l.blob,
                                                 cudaMemcpyHostToDevice) == cudaSuccess;
