@@ -3665,7 +3665,28 @@ struct Model::Impl {
         else if (chunk > 0 && o.prefill_chunk < 0) chunk = chunk_default(chunk);
         // (experts read from files on several GPUs: 4096 - 3x V100, Maya-XS: an 8K prompt +30%, 32K +8%, 3.5% more
         // experts in VRAM, decode the same; --prefill-chunk sets it by hand)
-        if (dc == nullptr && o.prefill_chunk < 0 && chunk > 4096 && file_experts && devs.size() > 1) chunk = 4096;
+        // (the chunk is a PC's cap, set when the model loads: a prompt shorter than it is read in one pass whatever it is,
+        // a longer one in equal chunks of at most it.  4096 where the VRAM holds most of the experts; where the CPU lane
+        // holds most of them a prompt streams every expert from RAM once a chunk, so the larger chunk wins and what its
+        // buffers take from the VRAM experts costs the decode little - 2 V100 with ~24 GB each, Maya-XS v2, chunk 4096 /
+        // 8192 / 16384: a 3K prompt 343 / 347 / 335 tok/s, 8K 567 / 675 / 654, 29K 675 / 870 / 994.  By the share of the
+        // experts on the CPU lane (estimated): under 40% 4096, to 60% 8192, above 16384)
+        if (dc == nullptr && o.prefill_chunk < 0 && chunk > 0 && file_experts && devs.size() > 1) {
+            double exp_b = 0, other_b = 0, room = 0;
+            for (const auto& kt : pk.t) {
+                const std::string& n = kt.first;
+                if (n.find(".engram.embed.") != std::string::npos || n.rfind("vision.", 0) == 0 || n == "embed.weight" ||
+                    (!o.dspark && n.rfind("mtp.", 0) == 0))
+                    continue;
+                (n.find(".ffn.experts.") != std::string::npos ? exp_b : other_b) += (double) kt.second.bytes;
+            }
+            for (const Dev& d : devs)
+                room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20) - 1.5 * (1 << 30)) *
+                        o.vram_experts;
+            const double cpu_share = exp_b > 0 ? 1.0 - std::min(1.0, std::max(0.0, room - other_b) / exp_b) : 0.0;
+            chunk = cpu_share >= 0.6 ? 16384 : cpu_share >= 0.4 ? 8192 : 4096;
+            if (chunk > 4096) std::fprintf(stderr, "ds4: prompt chunk %d (about %.0f%% of the experts on the CPU lane)\n", chunk, cpu_share * 100.0);
+        }
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
         one_gpu_path();   // (the devices, their groups and the helper GPU known: before the recent slots' count)
         // (a GGUF: 32 too while streamed experts land in them, DS4_LAND - the link's bytes stay in VRAM)
