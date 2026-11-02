@@ -333,6 +333,7 @@ bool ExpertPool::init(const std::vector<std::vector<ExpertMatrix>>& layers, int 
                                     (char*) G.t[w]->data + (size_t) s * G.ebytes[w], G.ebytes[w]});
             }
         }
+        resident_count_ = n_pairs_;
         if (!reader_->read(jobs, err)) return false;
     }
     return true;
@@ -358,6 +359,7 @@ bool ExpertPool::warm(const std::vector<std::pair<int, int>>& ranked, std::strin
         if (s >= G.active) continue;
         G.owner[(size_t) s] = l * n_expert_ + e;
         L.slot_of[(size_t) e] = s;
+        ++resident_count_;
         for (int w = 0; w < 3; ++w)
             jobs.push_back({L.m[w].fd, L.m[w].offset + (uint64_t) e * L.m[w].expert_bytes,
                             (char*) G.t[w]->data + (size_t) s * G.ebytes[w], G.ebytes[w]});
@@ -399,10 +401,13 @@ bool ExpertPool::ensure(int layer, const int32_t* experts, size_t n, int32_t* sl
                 err = "the expert pool has fewer slots than one layer needs";
                 return false;
             }
-            if (const int o = G.owner[(size_t) s]; o >= 0)
+            if (const int o = G.owner[(size_t) s]; o >= 0) {
                 layers_[(size_t) (o / n_expert_)].slot_of[(size_t) (o % n_expert_)] = -1;
+                --resident_count_;
+            }
             G.owner[(size_t) s] = layer * n_expert_ + e;
             L.slot_of[(size_t) e] = s;
+            ++resident_count_;
             filled.push_back(s);
             for (int w = 0; w < 3; ++w) {
                 jobs.push_back({L.m[w].fd, L.m[w].offset + (uint64_t) e * L.m[w].expert_bytes,
@@ -423,6 +428,7 @@ bool ExpertPool::ensure(int layer, const int32_t* experts, size_t n, int32_t* sl
         for (const int s : filled) {
             const int o = G.owner[(size_t) s];
             layers_[(size_t) (o / n_expert_)].slot_of[(size_t) (o % n_expert_)] = -1;
+            --resident_count_;
             G.owner[(size_t) s] = -1;
         }
     return ok;

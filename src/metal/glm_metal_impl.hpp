@@ -111,6 +111,8 @@ struct GlmMetal::Impl {
     int64_t hx_snap = -1;
     std::vector<float> mtp_hx;          // the last MTP step's own hidden state (the next chained step's input)
     ggml_tensor* c_mres = nullptr;      // [n_embd] the MTP step's residual across its expert cut
+    ggml_tensor* slot_tab = nullptr;    // [n_expert, held] I32: each expert's pool slot, latched once the pool holds them all
+    bool slot_tab_live = false;         // slot_tab holds the pool's final slot map (no slot can change hands after)
     int win_T = 0;                      // the open window's rows (0: none)
     int64_t win_p0 = 0;
 
@@ -138,6 +140,10 @@ struct GlmMetal::Impl {
     bool embed(const int32_t* tok, int n, std::vector<float>& out, std::string& err) const;   // rows pos .. pos+n-1
     bool embed_raw(const int32_t* tok, int n, std::vector<float>& out, std::string& err) const;   // no image rows
     size_t graph_size(int T) const;   // tensors a T-token slice's graph may hold
+    // once the pool holds every expert its slot map can never change again: copy it into slot_tab so the
+    // graphs look slots up on the GPU (the born-resident path's twin for a pool that started partial).
+    // False while any expert is still out; a no-op once latched.
+    bool arm_slot_tab();
     bool run_slice(const int32_t* tok, int n, std::vector<float>& logits, std::string& err, bool window = false);
     bool load_dflash(std::string& err);
     bool dflash_inject(int64_t p0, int n, std::string& err);   // rows 0..n-1 of feat = positions p0..p0+n-1
