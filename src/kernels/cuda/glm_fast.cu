@@ -3927,6 +3927,10 @@ struct RouteArgs {
     int fast;                   // STRATA_GLM_ROUTE_FAST (on by default; =0: the old order, A/B): the error flag from
                                 // its device copy, the request's x out at the start, the plan's reads in parallel
                                 // into shared memory, the request head a thread a field - the same plan and request
+    float res_w;                // STRATA_GLM_RESIDENT_SKIP_W (CHANGES THE ANSWERS - Turbo): a routed expert, in VRAM or not,
+                                // whose share of the route's weights is below this is left out (0: none) ...
+    int res_k;                  // ... STRATA_GLM_RESIDENT_TOPK: only the res_k heaviest of the route's experts run
+                                // (0: all); the top-1 always runs, the kept weights are renormalised when the model's are
 };
 
 __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_GRID_CONSTANT RouteArgs a) {
@@ -4172,6 +4176,26 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
             inv = (float) (a.norm_w ? 1.0 / fmax(sum, 6.103515625e-5) : 1.0);
         }
         unsigned int mask = 0, fetch = 0, promo = 0, cpu = 0, skip = 0;
+        // RESIDENT_SKIP_W / _TOPK: the experts the token goes without, wherever they live (not for a token past a wrong
+        // draft: that one already leaves out everything it can).  Rank = the weight order, ties by route order.
+        unsigned int drop = 0;
+        if (!skipped && a.k > 1 && (a.res_w > 0.0f || a.res_k > 0)) {
+            double all = 0.0;
+            for (int i = 0; i < a.k; ++i) all += (double) s_p[s_ids[i]];
+            double kept = 0.0;
+            for (int i = 0; i < a.k; ++i) {
+                const float v = s_p[s_ids[i]];
+                int rank = 0;
+                for (int j = 0; j < a.k; ++j) {
+                    const float u = s_p[s_ids[j]];
+                    rank += (j != i) && (u > v || (u == v && j < i));
+                }
+                const bool out = rank != 0 && ((a.res_k > 0 && rank >= a.res_k) || (a.res_w > 0.0f && (double) v < (double) a.res_w * all));
+                if (out) drop |= 1u << i;
+                else kept += (double) v;
+            }
+            if (a.norm_w && drop != 0u) inv = (float) (1.0 / fmax(kept, 6.103515625e-5));
+        }
         unsigned long long* rtab = a.d.tab + a.d.n_keys;
         unsigned long long* spares = a.d.tab + 2 * (size_t) a.d.n_keys + (size_t) a.layer * kSpares;
         int next_spare = 0;
@@ -4206,14 +4230,17 @@ __global__ void __launch_bounds__(ROUTE_THREADS) moe_route_kernel(const STRATA_G
         }
         pt[1] = clock64();   // the CPU lane's picks
         for (int i = 0; i < a.k; ++i) {
-            const float w = (float) ((double) s_p[s_ids[i]] * inv * a.w_scale);
+            const bool dropped = (drop >> i) & 1u;
+            const float w = dropped ? 0.0f : (float) ((double) s_p[s_ids[i]] * inv * a.w_scale);
             s_w[i] = w;
             const size_t key = (size_t) a.layer * E + s_ids[i];
             unsigned long long ptr = s_tab[i];
             unsigned long long src = 0ull;
             s_pp[i] = 0ull;
             s_cs[i] = 0ull;
-            if (ptr == 0ull && (i >= skip_from || light_miss(i))) {
+            if (dropped) {
+                ptr = 0ull;   // RESIDENT_SKIP_W / _TOPK: left out (a null plan entry, no fetch, no CPU work, weight 0)
+            } else if (ptr == 0ull && (i >= skip_from || light_miss(i))) {
                 // left out: the expert kernels skip a null plan entry (a draft only has to be a good guess)
             } else if (ptr == 0ull && (a.fast ? s_ho[i] != 0 : a.d.helper_owned && a.d.helper_owned[key])) {
                 // A helper resident is claimed BEFORE PCIe quotas, promotion or disk skipping.
@@ -6553,7 +6580,7 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
                int max_prefetch, const float* ahead_logits, const float* const* ahead_bias, int n_ahead,
                int skip_from, unsigned long long cpu_plan, int promote_min, int pf_rank, int near_n, int win,
                unsigned int* scr_used, int win_n, int disk_skip_from, float disk_skip_w, float miss_skip_w,
-               int win_rows) {
+               int win_rows, bool resident_ok) {
     RouteArgs a{logits, bias, n_expert, k, w_scale, norm_w ? 1 : 0, layer, x, n_embd, d,
                 sh_gate, sh_up, sh_limit, n_ff_sh, (block_q8_1*) sh_hq, pred_logits, pred_bias, max_prefetch,
                 ahead_logits, {}, 0, skip_from, d.cpu_seq != nullptr ? cpu_plan : 0ull, promote_min,
@@ -6564,6 +6591,17 @@ void moe_route(const float* logits, const float* bias, int n_expert, int k, floa
         return v ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
     }();
     a.affinity = affinity;
+    // STRATA_GLM_RESIDENT_SKIP_W / STRATA_GLM_RESIDENT_TOPK (changes the answers; Turbo): read once; 0 = off
+    static const float res_w = [] {
+        const char* v = getenv("STRATA_GLM_RESIDENT_SKIP_W");
+        return v ? std::max(0.0f, std::min(0.9f, (float) std::atof(v))) : 0.0f;
+    }();
+    static const int res_k = [] {
+        const char* v = getenv("STRATA_GLM_RESIDENT_TOPK");
+        return v ? std::max(0, std::atoi(v)) : 0;
+    }();
+    a.res_w = resident_ok ? res_w : 0.0f;
+    a.res_k = resident_ok ? res_k : 0;
     // STRATA_GLM_ROUTE_RANK=0: the selections by topk_warp's serial rounds again (A/B); topk_rank needs whole warps of
     // experts that one block's threads cover and at most 8 picks
     static const bool rank_on = [] {

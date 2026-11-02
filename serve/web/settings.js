@@ -7,9 +7,10 @@ import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emi
         themeChoice, thinkTitles, toast} from "./state.js";
 import {usd} from "./sidebar.js";
 import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
-        loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
+        budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
 import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
+import {TurboButton} from "./turbo.js";
 import {CtxSlider, Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 const SECTIONS = [
@@ -98,6 +99,23 @@ function Model() {
       </div>` : null}` : null}`;
 }
 
+// ------------------------------------------------------------------ Thinking budget (the model's run config; applies at once)
+function ThinkBudget() {
+  const tb = S.thinkBudget, [text, setText] = useState("");
+  useEffect(() => { if (tb) setText(String(tb.budget)); }, [tb && tb.budget]);
+  if (!tb || !tb.supported) return null;
+  const bad = budgetError(text), changed = text.trim() !== String(tb.budget);
+  return html`<div class="set-block">
+    <label class="field"><span class="field__label">Thinking budget</span>
+      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${tb.saved ? "" : " Not saved: this server runs without a config."}</span>
+      <span class="set-row__ctl"><input id="set-think-budget" class="input input--num" inputmode="numeric" value=${text}
+        aria-invalid=${changed && bad ? "true" : "false"} aria-label="Thinking budget in tokens"
+        onInput=${(e) => setText(e.target.value.replace(/\D/g, ""))}
+        onKeyDown=${(e) => { if (e.key === "Enter" && changed && !bad) saveThinkBudget(text); }}/>
+      ${changed ? html`<button type="button" class="btn btn--primary btn--sm" disabled=${!!bad} onClick=${() => saveThinkBudget(text)}>Save</button>` : null}</span></label>
+    ${changed && bad ? html`<span class="set-row__sub" role="alert">${bad}</span>` : null}</div>`;
+}
+
 // ------------------------------------------------------------------ Chat defaults (sampling)
 function ChatDefaults() {
   const t = +P.temperature, greedy = t === 0, preset = presetOf(P);
@@ -125,7 +143,7 @@ function ChatDefaults() {
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
     : "API clients get them for anything they don't set themselves.";
-  return html`<h3>Chat defaults</h3>
+  return html`<div class="set-head"><h3>Chat defaults</h3><${TurboButton}/></div>
     <p class="set-intro">How ${modelName(S.health.model)} writes new answers. Each model keeps its own.</p>
     <${Row} label="Presets"><${Seg} label="Presets" value=${preset} onChange=${(id) => set(PRESETS[id])}
       options=${[{id: "precise", label: "Precise", title: "Temperature 0: the same question gives the same answer"},
@@ -150,6 +168,7 @@ function ChatDefaults() {
         <input class="input" inputmode="numeric" placeholder="Random" value=${P.seed}
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
+    <${ThinkBudget}/>
     <p class="set-row__sub">Penalties: none by default (no model has any as a standard). Set one to discourage repeats.</p>
     <div class="set-pair set-pair--3">
       ${[["repetition_penalty", "Repetition", "1.0 off, e.g. 1.1"], ["frequency_penalty", "Frequency", "0 off, e.g. 0.3"],
@@ -434,7 +453,7 @@ export function SettingsDialog() {
   const box = useRef(null), body = useRef(null);
   const sec = BODIES[S.settings] ? S.settings : "general";
   useEffect(() => {
-    loadShared(); loadMcp(); loadCtxInfo(); loadPortInfo(); loadUpdate();
+    loadShared(); loadMcp(); loadCtxInfo(); loadPortInfo(); loadThinkBudget(); loadUpdate();
     const ret = document.activeElement;
     setTimeout(() => { const b = box.current && box.current.querySelector(".set-nav [aria-current=page]"); if (b) b.focus(); }, 0);
     return () => { if (ret && ret.focus && document.contains(ret)) ret.focus(); };

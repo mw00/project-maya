@@ -537,6 +537,9 @@ struct Req {
     // logprobs=<k> (0 .. 20; the server's OpenAI logprobs / top_logprobs): after each T line an LP line - the token's
     // logprob and its row's k most likely (ds4_logprobs.hpp); -1: none, the request exactly as without
     int logprobs = -1;
+    // logit_bias=<id>:<bias>,... (OpenAI's logit_bias; the server's ignore_eos bans the end tokens with -100): added to
+    // the logits of every pick of the answer (Model::set_logit_bias); none: the picks exactly as without
+    std::vector<std::pair<int, float>> bias;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -669,6 +672,15 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "logprobs") {
             const int n = std::atoi(v.c_str());
             r.logprobs = n < 0 ? -1 : std::min(n, strata::ds4::kTopLogprobs);
+        } else if (k == "logit_bias") {   // <id>:<bias>,... (the server checked them: ids in the vocabulary, -100..100)
+            size_t at = 0;
+            while (at < v.size()) {
+                const size_t end = std::min(v.find(',', at), v.size()), colon = v.find(':', at);
+                if (colon != std::string::npos && colon < end)
+                    r.bias.emplace_back(std::atoi(v.substr(at, colon - at).c_str()),
+                                        std::strtof(v.substr(colon + 1, end - colon - 1).c_str(), nullptr));
+                at = end + 1;
+            }
         }
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
@@ -725,6 +737,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
+    std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
     if (m.seq_count() > 1)   // (--parallel: n conversations at once, GEN rid=<id>)
         std::printf("READY %lld stop multi=%d\n", (long long) m.max_context(), m.seq_count());
     else
@@ -1794,6 +1807,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
                         std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                         std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f, std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+        m.set_logit_bias(r.bias);
         m.set_logprobs(r.logprobs);   // (logprobs=<k>: each token's row, kept as its token is: tok_lp, got_lp)
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
@@ -1997,11 +2011,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             held = std::move(held_of[(size_t) s]);
             held_of[(size_t) s].clear();
         };
-        const auto penalties = [&](const Req& r) {
+        const auto penalties = [&](const Req& r) {   // (and its logit_bias: the request's picks, set before each)
             m.set_penalties(r.pen_n < 0 ? INT_MAX : r.pen_n,
                             std::isfinite(r.pen_repeat) && r.pen_repeat > 0.0f ? r.pen_repeat : 1.0f,
                             std::isfinite(r.pen_freq) ? r.pen_freq : 0.0f,
                             std::isfinite(r.pen_present) ? r.pen_present : 0.0f);
+            m.set_logit_bias(r.bias);
         };
         // a request's next token: the thinking budget closes its reasoning (as one conversation's round at the budget)
         const auto close_think = [](const Act& a) {
