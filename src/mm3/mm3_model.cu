@@ -3122,12 +3122,17 @@ bool Model::load(const Options& o_in, std::string& err) {
     p->tkey = tune_key_of(o.gpus);
     p->tfile = o.prefill_tune.empty() ? o.pack + "/prefill-tune.txt" : o.prefill_tune;
     std::string tuned;
+    bool other_calibration = false;   // (a line of another key on file: another GPU list, runtime or driver)
     if (o.tune && o.tp <= 0) {
         std::ifstream f(p->tfile);
         for (std::string line; std::getline(f, line);) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             const size_t tab = line.find('\t');
-            if (tab == std::string::npos || line.compare(0, tab, p->tkey) != 0) continue;
+            if (tab == std::string::npos) continue;
+            if (line.compare(0, tab, p->tkey) != 0) {
+                if (line.compare(0, 14, "mm3-prefill-1|") == 0) other_calibration = true;
+                continue;
+            }
             std::istringstream is(line.substr(tab + 1));
             for (std::string kv; is >> kv;) {
                 const size_t eq = kv.find('=');
@@ -3202,7 +3207,10 @@ bool Model::load(const Options& o_in, std::string& err) {
                           (p->gguf ? std::string(", ") + (gg::gemm_backend() == 1 ? "hipBLASLt" : "BLAS") + " GEMMs" : ""));
     else if (o.tune && o.tp <= 0)
         p->info.push_back("NOTE: prefill not calibrated on this PC (./maya.sh --calibrate measures it): chunk " +
-                          std::to_string(p->o.chunk));
+                          std::to_string(p->o.chunk) +
+                          (other_calibration ? std::string("; ") + p->tfile + " holds a calibration of other GPUs, "
+                                               "another GPU list or another runtime / driver: run it again for this setup"
+                                             : std::string()));
     return true;
 }
 int Model::chunk() const { return tpe ? 0 : p->run_chunk(); }
