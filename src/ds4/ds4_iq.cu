@@ -115,12 +115,12 @@ __device__ __forceinline__ void load_tab(uint32_t* tab) {
     }
 }
 
-// (#529) DS4_IQ_STRICT_FP: on RDNA 4 (gfx1200 / gfx1201) ROCm's clang contracted the token kernels' (NE 1) and the
+// (#529) DS4_IQ_STRICT_FP: on RDNA 4 (gfx1200 / gfx1201) and Vega 20 (gfx906) ROCm's clang contracted the token kernels' (NE 1) and the
 // window kernels' (NE 4) multiply-adds differently, so their sums differed in the last bits (ds4_gguf_test there):
 // there every rounding is explicit (no contraction, barriers the compiler cannot fold through) and IQ4_XS's rows load
 // in 16-bit halves.  Elsewhere - gfx11 and the other AMD GPUs, CUDA - the kernels compile as before (the same bits and
 // speed as v1.1.30: the barriers cost a Strix Halo ~7% of its decode).
-#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__))
+#if defined(STRATA_USE_HIP) && defined(__clang__) && (defined(__gfx1200__) || defined(__gfx1201__) || defined(__gfx906__))
 #define DS4_IQ_STRICT_FP 1
 #else
 #define DS4_IQ_STRICT_FP 0
