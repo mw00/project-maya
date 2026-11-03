@@ -508,13 +508,24 @@ __global__ void __launch_bounds__(kThreads) q8_mv_kernel(const BfJobs J) {
 // two of its four
 template <int CH>
 __host__ __device__ constexpr int tc_str() { return CH == 32 ? 1104 : 560; }
+// (cp.async and mma.sync's int8 m16n8k32: sm_80+, CUDA; elsewhere the kernel is empty and never launched - q8_tc_dev)
 __device__ __forceinline__ void tc_cp16(void* s, const void* g) {
+#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     const unsigned sa = (unsigned) __cvta_generic_to_shared(s);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(g));
+#endif
 }
-__device__ __forceinline__ void tc_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+__device__ __forceinline__ void tc_commit() {
+#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.commit_group;\n" ::);
+#endif
+}
 template <int N>
-__device__ __forceinline__ void tc_wait() { asm volatile("cp.async.wait_group %0;\n" ::"n"(N)); }
+__device__ __forceinline__ void tc_wait() {
+#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
+#endif
+}
 // 4 bytes at a 2-byte aligned shared offset (ODD: the offset 4-byte aligned)
 template <bool AL>
 __device__ __forceinline__ uint32_t tc_ld32(const uint8_t* p) {
@@ -526,6 +537,7 @@ template <int NC, int MT, int STG, int CH>
 __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
     pdl_wait();
     pdl_trigger();
+#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)
     extern __shared__ __align__(16) uint8_t tc_sm[];
     constexpr int R = 16 * MT, NT = NC > 8 ? 2 : 1;   // (NT: 8-column tiles, 9..16 columns two)
     const BfJob& b = J.j[blockIdx.y];
@@ -664,6 +676,7 @@ __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
         const float v = ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
         b.y[col * b.ycs + row0 + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row0 + row] : 0.0f);
     }
+#endif
 }
 template <int MT, int STG, int CH>
 constexpr int q8_tc_smem() { return STG * 16 * MT * tc_str<CH>() > 8 * 16 * MT * 16 * 4 ? STG * 16 * MT * tc_str<CH>() : 8 * 16 * MT * 16 * 4; }
@@ -1622,6 +1635,23 @@ bool q8_tc_ok(const BfJobs& J, int nj) {
     }
     return true;
 }
+// the tensor-core q8_mv's device: compute capability 8.0+ (cp.async, mma.sync's int8 m16n8k32), CUDA; asked once a device
+bool q8_tc_dev() {
+#if !defined(STRATA_USE_HIP)
+    static std::atomic<int> known[64];   // 0: not asked yet, 1: no, 2: yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = known[dev].load(std::memory_order_relaxed);
+    if (v == 0) {
+        int major = 0;
+        v = cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess && major >= 8 ? 2 : 1;
+        known[dev].store(v, std::memory_order_relaxed);
+    }
+    return v == 2;
+#else
+    return false;
+#endif
+}
 template <int NC>
 void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t s) {
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
@@ -1631,8 +1661,13 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
         // DS4_Q8MV_TC=1: the tensor-core kernel for 3..16 columns (2: also 2), the same bits; 32 rows a CTA in
         // 16-block chunks when that still gives 128+ CTAs, else 16 a CTA in 32-block chunks - the microbench's best
-        static const int tc = std::getenv("DS4_Q8MV_TC") != nullptr ? std::atoi(std::getenv("DS4_Q8MV_TC")) : 0;
-        if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj)) {
+        // (MAYA_DS4_Q8MV_TC, read as STRATA_DS4_Q8MV_TC, else DS4_Q8MV_TC; compute capability 8.0+, CUDA - q8_tc_dev)
+        static const int tc = [] {
+            const char* v = std::getenv("STRATA_DS4_Q8MV_TC");
+            if (v == nullptr) v = std::getenv("DS4_Q8MV_TC");
+            return v != nullptr ? std::atoi(v) : 0;
+        }();
+        if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj) && q8_tc_dev()) {
             if ((max_n + 31) / 32 * nj >= 128)
                 pdl_launch(q8_mv_tc_kernel<NC, 2, 2, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
                            (size_t) q8_tc_smem<2, 2, 16>(), s, J);
