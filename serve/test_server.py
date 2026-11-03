@@ -971,6 +971,69 @@ class NonFiniteRetry(unittest.TestCase):
         self.assertEqual(Broken.calls, 1)
 
 
+class VocabTokenizer(ByteTokenizer):
+    """ByteTokenizer with the pack tokenizer's token_bytes (tools/strata_tokenizer.py): an id outside the vocabulary
+    is an IndexError, as in #805's traceback."""
+
+    def token_bytes(self, i):
+        if i < 0 or i >= 256 + len(self.SPECIALS):
+            raise IndexError("token id %d is outside the vocabulary (%d)" % (i, 256 + len(self.SPECIALS)))
+        return self.SPECIALS[i - 256].encode() if i >= 256 else bytes([i])
+
+
+class NoRoomOrNoToken(unittest.TestCase):
+    """#805: a 351,912-token prompt read, then "done: 0 tokens (length)" and an IndexError for token id -1 in the
+    tokenizer under the loop guard.  On the engine's own lines (StrataEngine.generate): an answer of no tokens that
+    ends "length" is an empty answer, and a T line of -1 (an engine whose sample failed) is the request's error -
+    never an id for the tokenizer."""
+
+    def answer(self, lines):
+        import io
+        import queue
+        from types import SimpleNamespace
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        eng.lines = queue.Queue()
+        eng.can_stop = True
+        eng.max_context = CTX
+        for line in lines:
+            eng.lines.put(line)
+        tok = VocabTokenizer()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertTrue(svc.loop_guard)                   # (the guard's piece() decoded the -1)
+        out, done, err = "", None, None
+        try:
+            for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+                if kind == "event":
+                    out += v.text
+                elif kind == "done":
+                    done = v
+        except ValueError as e:
+            err = str(e)
+        return out, done, err, eng, svc
+
+    def test_no_tokens_length_is_an_empty_answer(self):
+        out, done, err, _, svc = self.answer(["PP 3 3 1.0 3.0", "DONE 0 3 414000.0 0.0 length 0 0 0"])
+        self.assertEqual((out, err), ("", None))
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 0))
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "length")
+
+    def test_token_minus_one_is_an_error(self):
+        out, done, err, eng, svc = self.answer(["PP 3 3 1.0 3.0", "T -1", "T 104", "DONE 2 3 414000.0 1.0 cancel 0 0 0"])
+        self.assertEqual((out, done), ("", None))
+        self.assertIn("could not pick a token", err)
+        self.assertIn("STOP", eng.proc.stdin.getvalue())  # (the engine stopped, drained to its DONE)
+        self.assertTrue(eng.lines.empty())
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+
+    def test_engine_token(self):
+        from serve.server import engine_token
+        self.assertEqual(engine_token("129279"), 129279)
+        for bad in ("-1", "-2"):
+            with self.assertRaises(ValueError):
+                engine_token(bad)
+
+
 class EngineDeath(unittest.TestCase):
     """Issue #27: a dead engine is an error (not "length"), and the next request starts it again."""
 

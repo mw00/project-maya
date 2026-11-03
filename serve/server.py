@@ -512,6 +512,17 @@ def lp_attach(tok: LpToken, fields: list[str]) -> LpToken:
     return tok
 
 
+def engine_token(field: str) -> int:
+    """A T line's id.  Below 0 it is no token: an engine whose sample failed (maya-ds4 before #619, or one an
+    update could not rebuild) wrote -1 as one - an error for the request, never an id for the tokenizer and the
+    loop guard (#805: an IndexError there ended a 351K-token prompt's request with a traceback)."""
+    t = int(field)
+    if t < 0:
+        raise ValueError(f"the engine could not pick a token (it wrote the id {t}: its sampling failed - the engine's "
+                         "log says why)")
+    return t
+
+
 def token_piece(tok, t: int) -> bytes:
     """One token's bytes (a logprobs entry's `bytes`): the tokenizer's own, else its decode; b"" for an id it lacks."""
     try:
@@ -1317,9 +1328,9 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     if want_lp:
-                        lp_wait = LpToken(int(line[2:]))
+                        lp_wait = LpToken(engine_token(line[2:]))
                     else:
-                        yield int(line[2:])
+                        yield engine_token(line[2:])
                 elif line.startswith("LP "):
                     if lp_wait is not None:
                         t, lp_wait = lp_attach(lp_wait, line.split()[1:]), None
@@ -1524,9 +1535,9 @@ class StrataEngine:
                     if cancel.is_set():
                         return
                     if want_lp:
-                        lp_wait = LpToken(int(f[2]))
+                        lp_wait = LpToken(engine_token(f[2]))
                     else:
-                        yield int(f[2])
+                        yield engine_token(f[2])
                 elif line.startswith("LP "):
                     if lp_wait is not None:
                         t, lp_wait = lp_attach(lp_wait, f[2:]), None
