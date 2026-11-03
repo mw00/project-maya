@@ -1313,6 +1313,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                       ex > 0 ? 1.0 - (cx + sx + hx) / ex : 1.0, cx / fed, (double) (s.ram_experts - s_dec.ram_experts) / fed,
                       (double) (s.swaps - s_dec.swaps) / fed, (s.engram_ms - s_dec.engram_ms) / fed);
         out += b;
+        const int64_t sub_picks = s.sub_picks - s_dec.sub_picks;
+        if (sub_picks > 0) {
+            std::snprintf(b, sizeof b, " sub_picks=%lld cache_substituted=%lld sub_demand_gpu=%.6f sub_executed_gpu=%.6f",
+                          (long long) sub_picks, (long long) (s.cache_substituted - s_dec.cache_substituted),
+                          (double) (s.sub_demand_gpu - s_dec.sub_demand_gpu) / sub_picks,
+                          (double) (s.sub_executed_gpu - s_dec.sub_executed_gpu) / sub_picks);
+            out += b;
+            const double rows = (double) std::max<int64_t>(1, s.sub_rows - s_dec.sub_rows);
+            std::snprintf(b, sizeof b, " sub_removed_mass=%.6f sub_executed_mass=%.6f",
+                          (s.sub_removed_mass - s_dec.sub_removed_mass) / rows,
+                          (s.sub_executed_mass - s_dec.sub_executed_mass) / rows);
+            out += b;
+        }
         if (sx > 0) {   // (the PCIe lane: experts a token streamed to the GPU)
             std::snprintf(b, sizeof b, " pcie=%.3f", sx / fed);
             out += b;
@@ -3928,6 +3941,11 @@ int main(int argc, char** argv) {
                          "head wait %.2f, Engram reads %.2f\n",
                  (s.layer_ms - s0.layer_ms) / nt, (s.gpu_wait_ms - s0.gpu_wait_ms) / nt, (s.cpu_ms - s0.cpu_ms) / nt,
                  (s.head_ms - s0.head_ms) / nt, (s.engram_ms - s0.engram_ms) / nt);
+    if (s.sub_picks > 0)
+        std::fprintf(stderr, "cache substitution: %lld of %lld decode picks replaced; %lld prefill picks eligible\n",
+                     (long long) (s.cache_substituted - s0.cache_substituted),
+                     (long long) (s.sub_picks - s0.sub_picks),
+                     (long long) (s0.sub_picks - sp.sub_picks));
     if (s.store_slots > 0)   // --ssd-cache
         std::fprintf(stderr, "RAM store: a token's CPU-lane experts %.2f from it, %.2f read (%.2f of them in place: no slot); "
                              "the lane waited %.2f ms a token for its reads; %lld put in from VRAM, %lld guesses (%lld "
