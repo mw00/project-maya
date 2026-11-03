@@ -10,6 +10,33 @@ only what changed and starts; the model is not downloaded again.
  newest first), so Gentoo passes the HIP check with `ROCM_PATH=/usr` and no `/usr/lib64/rocm/llvm` symlink (`tools/test_maya_hip.py`
  covers it).
 
+## v1.1.51 - 2026-11-03
+
+DeepSeek fills every GPU in tensor parallel and reads long prompts faster when most experts live in RAM, a round of issue fixes, the README in Japanese, Simplified Chinese and Brazilian Portuguese, and community pull requests.
+
+- **DeepSeek tensor parallel fills every GPU:** each GPU's part of the experts now follows the room it has left (after the drafter, the head and buffers), so no GPU keeps VRAM unused. On the PCs it was measured on, about 10% more experts sit in VRAM and decode is up to 10% faster. `DS4_TP_SHARES=off` keeps the even split (#766).
+- **DeepSeek long prompts with most experts in RAM:** on several GPUs, the prompt path borrows the experts' room and reads long prompts in larger pieces, and the borrowed experts are read back from the page cache instead of the disk. Prompts from about 10K tokens read up to about 12% faster, depending on the setup, and about 7% more experts stay in VRAM; prompts around 8K are about 3% slower on those setups. Setups whose experts are mostly in VRAM are unchanged.
+- **Several conversations at once:** stopping one answer no longer disturbs the others (#791, thanks @nicholas631).
+- **GLM engine watchdog:** many short requests back to back (the zero-shot suite) no longer trip the "no progress" watchdog on a healthy engine.
+- **Qwen engine:** a prompt read the client abandoned no longer makes every later request fail with "cancelled" (#703).
+- **CYBER-FROST:** the dashboard has a thinking Off button.
+- **Dashboard:** while the model thinks, its thoughts follow the newest line down, as the answer does (scroll them up to read and they stay put).
+- **Dashboard, long answers:** a page that lost its connection to an answer for a long time (a sleeping phone, a background tab) no longer gives the answer up for good: it tries again when it is shown, and if it has stopped trying, coming back to the page or reloading it takes the answer up again while the server still holds it.
+- **DeepSeek:** a failed GPU allocation says its size, the driver's reason and the free VRAM (#794); a numeric `reasoning_effort` in the config is a thinking budget (#768); `DS4_AR_P2P` reads the real BAR size, so it engages on large-BAR cards (#798); `DS4_RAM_MARGIN_GB` sets the system-RAM headroom the memory planning leaves, default 8 GiB (#739).
+- **MiniMax:** the "prefill not calibrated" note says when the saved calibration is for another GPU list, runtime or driver (#721).
+- **Savings ledger:** `MAYA_SAVINGS_PATH` chooses its file (`off` keeps none), and a file that cannot be written is logged once (#724).
+- **Responses API:** the rejections name the tool type or include value the client sent (#726).
+- **Text dashboard:** the GPU table's columns keep their width (#793).
+- **README:** the Models page and API, Turbo, the thinking budget, the loop guard, GLM and DeepSeek Maya-XS, Mac state, users' speed reports, and Japanese, Simplified Chinese and Brazilian Portuguese translations.
+- **Community pull requests:**
+  - DeepSeek `--parallel`: when the engine ends, every conversation is set aside, not only the bound one (#732, thanks @hajekt2).
+  - DeepSeek `--parallel`: the read scheduler settings also work under their older aliases (#682, thanks @handmade0octopus).
+  - A GLM setup run again keeps the config's host, API key, CORS origins and MCP servers (#720, thanks @tobitege).
+  - Opt-in: GLM `--parallel` keeps conversation checkpoints for each conversation (`MAYA_GLM_MULTI_CKPTS=1`, #714, thanks @coco-famihiro).
+  - Opt-in: DeepSeek tensor-parallel layers with every expert in VRAM can leave the host out (`MAYA_DS4_HOST_FREE_TP=1`, #701, thanks @loktar00).
+  - DeepSeek warns when another program holds a GPU's memory, and retries an expert allocation a few times before it fails (#700, thanks @loktar00).
+  - Opt-in: DeepSeek prepares its CPU row checks while the model loads (`MAYA_DS4_CPU_PREPARE_ROWS=1`, #781, thanks @oscarlius).
+
 ## v1.1.50 - 2026-11-02
 
 Models you can download, swap and delete from the Models page or the API, a Turbo button, a thinking budget you can set, GLM Maya-XS, faster long prompts on DeepSeek, and a round of community pull requests.
