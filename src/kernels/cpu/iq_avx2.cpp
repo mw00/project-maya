@@ -18,19 +18,21 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
 
-#include <immintrin.h>
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h>
-#else
-#include <cpuid.h>
-#endif
-
+// (the C++ headers first: on Windows, clang's <algorithm> reaches the MSVC headers' intrin.h, whose __cpuid
+// declaration <cpuid.h>'s __cpuid macro would break)
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+
+#include <immintrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
