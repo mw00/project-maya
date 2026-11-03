@@ -1167,10 +1167,23 @@ member's parts as decode runs them, summed on the host and compared with the who
 1e-3 of the largest output fails the start), and each member's prompt copies on its GPU against the file's bytes, bit
 for bit.
 
+A group's members rarely have the same room left for experts: the DSpark drafter, the head and some buffers sit on one
+GPU, and the GPUs may differ in size or in what other programs hold. Each VRAM expert takes its part on every member, so
+with equal parts the tightest member sets how many experts fit and the others keep VRAM unused (#766). On a GGUF pack
+Maya now sizes the parts from the rooms themselves: the load measures each member's room for experts after its dense
+weights, caches, buffers and the drafter's experts, gives each member a part of every layer's FFN in proportion
+(units of the experts' block, 128 values at least; the shared expert follows), and loads again with those parts, so
+every member fills up. It does so only where it pays (the experts do not all fit, and the parts hold at least one more
+expert a layer); the second pass reads the dense weights again, mostly from the page cache. The start log says what it
+chose (`tensor parallel group 0: the experts' room each GPU has left ...`). One GPU, a layer split and a group whose
+experts all fit load as before; a group with uneven parts gives slightly different text from the even split, as any
+split change does.
+
 | Setting | Default | |
 | --- | --- | --- |
 | `MAYA_DS4_TP_GGUF_UNEVEN` | off | `1`: a GGUF's experts split in whole blocks, as even as they go, so its group can form; with `MAYA_DS4_HELPER`, the helper takes the group's layers too (on its lead) |
 | `MAYA_DS4_TP_CHECK` | off | `1`: each member's parts checked against the whole expert at load |
+| `DS4_TP_SHARES` | from the members' rooms (GGUF packs) | the parts by hand instead, in whole blocks: `w0,w1,..` a member's share of each layer's FFN, `:` between patterns that go round the layers, `/` between groups (`4,5`: the lead 4 of 9 blocks); `off`: the split as before (even, or `MAYA_DS4_TP_GGUF_UNEVEN`'s) |
 | `MAYA_DS4_FLOW_DOWN_SHARE` | off | `1` (with `DS4_FLOW_TP=1`): a group's members read each streamed expert's down from the files once, through the page cache (dropped once every member read it), where each member read it from the disk itself - the same bytes |
 | `MAYA_DS4_FLOW_AR_DMA` | off | `1` (on the flow, `DS4_FLOW_TP=1`, and a group of three members or more, with the wire's sums in FP16 - `DS4_AR_F16`, on by default): a prompt chunk's all-reduce goes through `chunk_allreduce`, the helper the batches off the flow already use - the DMA reduce-scatter (`ar_rs16_kernel`), or the host's sums when `MAYA_DS4_AR_HOST` covers the group - instead of the group's F32 kernel all-reduce: the same rows, in FP16 on the wire. Two members and `DS4_AR_F16=0` are unchanged. On four mixed-capacity GPUs (two RTX 3090s, two CMP 170HX), weighted `--tp 4`, 50K-token prompt, `--prefill-chunk 4096`, `DS4_FAT_ROWS=64`, three repeats: 1,623.7 tok/s with the setting off, 1,684.5 with the DMA path, 1,734.0 with `MAYA_DS4_AR_HOST=4` and its four threads; decode 62.7 / 62.0 / 65.7, inside that box's noise (two copies of the same binary differed by 7% in decode across arms) |
 | `MAYA_DS4_FLOW_DOWN_PART` | off | `1` (with `DS4_FLOW_TP=1` and `MAYA_DS4_TP_GGUF_UNEVEN`): each member copies only its own columns of a streamed expert's down to the GPU, compacted where it was read, not the whole down and a gather there - the same bytes in its slot (`MAYA_DS4_TP_CHECK` checks them at load) |

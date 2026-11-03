@@ -1354,6 +1354,21 @@ struct Model::Impl {
     // they go (splitb, the odd blocks going round the members layer by layer) instead of only even shares
     bool tp_uneven = false;
     int tp_blk = 0;
+    int ffn_blk = 0;   // (a GGUF's: the experts' widest block, the FFN's split in multiples of it)
+    // (#766) a tensor-parallel group's FFN parts from its members' rooms: the experts' room each member has left after
+    // its dense weights, caches, buffers and the drafter's experts - measured in place_experts on the split as before,
+    // then the load made again with each layer's parts in proportion (Model::load) - so a member with more room (not
+    // the drafter's) holds more of every VRAM expert and every member fills up.  tp_auto[il]: layer il's units a member
+    // (empty: the split as before), tp_auto_unit values a unit; tp_auto_redo: the first pass found them worth a reload
+    std::vector<std::vector<int>> tp_auto;
+    int tp_auto_unit = 0;
+    bool tp_auto_redo = false;
+    bool tp_auto_given = false;   // (the second pass: the parts came from the first)
+    const std::vector<int>* tp_auto_parts(const Layer& l) const {
+        if (l.mtp || (size_t) l.il >= tp_auto.size()) return nullptr;
+        const std::vector<int>& b = tp_auto[(size_t) l.il];
+        return (int) b.size() == l.nm && l.nm > 1 ? &b : nullptr;
+    }
     // DS4_HC_FUSE=1: a decoded token's (T 1) hc_split and hc_pre_norm in one launch (hc_split_pre_norm), the attention
     // input's int8 rounding there, the layer's copy of the pre slots by its FFN split - checked at load (hc_fuse_check)
     bool hc_fuse = false;
@@ -1391,11 +1406,16 @@ struct Model::Impl {
     // of room (the drafter's lead) holds less of each VRAM expert; several patterns (':') go round the group's layers
     // by index (2,3,4:2,4,3 - 3.5 parts each for members 1 and 2 on average); a group without an entry, or whose
     // patterns are not its width, takes the whole-block split
+    // DS4_TP_SHARES=off: the whole-block split as before (#766: no shares from the members' rooms either)
+    static bool tp_shares_off() {
+        const char* e = std::getenv("DS4_TP_SHARES");
+        return e != nullptr && std::strcmp(e, "off") == 0;
+    }
     static const std::vector<std::vector<std::vector<int>>>& tp_shares() {
         static const std::vector<std::vector<std::vector<int>>> s = [] {
             std::vector<std::vector<std::vector<int>>> r;
             const char* e = std::getenv("DS4_TP_SHARES");
-            if (e == nullptr || *e == 0) return r;
+            if (e == nullptr || *e == 0 || tp_shares_off()) return r;
             std::stringstream gs(e);
             std::string grp;
             while (std::getline(gs, grp, '/')) {
@@ -3590,7 +3610,13 @@ struct Model::Impl {
                 if (ty >= 0) blk = std::max(blk, gg::type_block(ty));
             }
             // (DS4_TP_GGUF_UNEVEN: whole blocks, as many as members at least - n_ff 2304 in 256s: 5 + 4)
+            ffn_blk = blk;
             if (!tp_shares().empty()) tp_uneven = true;   // (DS4_TP_SHARES: on the whole-block member ranges)
+            // (#766: the parts from the first pass - their units whole blocks of these, checked at the split)
+            if (!tp_auto.empty() && tp_auto_unit > 0 && tp_auto_unit % blk == 0 && g.ff % tp_auto_unit == 0)
+                tp_uneven = true;
+            else
+                tp_auto.clear();
             const bool uneven = tp_uneven && g.ff % blk == 0;
             // DS4_TP_UNEVEN_HEADS=1 (experimental): keep a width the heads do not split in evenly - the layers' own
             // check takes the heads over head_members(tp) of the members, as a non-GGUF pack's do (64 heads, tp 3: 2)
@@ -4015,7 +4041,20 @@ struct Model::Impl {
                 x.ogn = ha < 0 ? 0 : g.o_groups / na;
                 x.og0 = ha < 0 ? 0 : ha * x.ogn;
                 if (gguf_x && tp_uneven) {   // (DS4_TP_GGUF_UNEVEN: whole blocks, the odd ones round the members)
-                    if (const std::vector<int>* w = tp_share(l.grp, l.nm, l.il)) {   // (DS4_TP_SHARES' parts)
+                    if (const std::vector<int>* b = tp_auto_parts(l)) {   // (#766: the parts from the members' rooms)
+                        int sum = 0, before = 0;
+                        for (int j = 0; j < l.nm; ++j) {
+                            sum += (*b)[(size_t) j];
+                            if (j < m) before += (*b)[(size_t) j];
+                        }
+                        if ((*b)[(size_t) m] < 1 || sum * tp_auto_unit != g.ff) {
+                            err = "tensor parallel: layer " + std::to_string(l.il) + "'s FFN parts from the members' "
+                                  "rooms do not add up to n_ff " + std::to_string(g.ff);
+                            return false;
+                        }
+                        x.ff0 = tp_auto_unit * before;
+                        x.ffn = tp_auto_unit * (*b)[(size_t) m];
+                    } else if (const std::vector<int>* w = tp_share(l.grp, l.nm, l.il)) {   // (DS4_TP_SHARES' parts)
                         int sum = 0, before = 0;
                         bool pos = true;
                         for (int j = 0; j < l.nm; ++j) {
@@ -4976,6 +5015,9 @@ struct Model::Impl {
                 for (int v : w) sum += v, most = std::max(most, v);
                 if (sum > 0 && g.ff % sum == 0) FF = std::max(FF, g.ff / sum * most);
             }
+        for (const auto& b : tp_auto)   // (#766: the widest part of any layer a group this wide)
+            if ((int) b.size() == nm && nm > 1)
+                for (int v : b) FF = std::max(FF, tp_auto_unit * v);
         c.HQ = HQ, c.OG = OG, c.FF = FF;
         // The attention slab (its q in millions of values: the rows of q, the sparse attention and the output
         // projections at a time) and the dense weights' FP16 scratch (MB): 8 / 16, or on a device with much memory
@@ -6776,6 +6818,96 @@ struct Model::Impl {
         return true;
     }
 
+    // (#766) the first pass's parts for group gi from its members' rooms (mroom: each member's room for experts, after
+    // its dense weights, caches, buffers and the drafter's experts): each layer's FFN in units of max(block, 128)
+    // values, a member's units in proportion to its room plus its part of the shared experts (which follow the parts),
+    // one unit at least, the remainders carried layer to layer so each member's total comes to its proportion.  Only
+    // where it pays: the experts do not all fit and the parts hold one more expert a layer at least; not with
+    // DS4_TP_SHARES (its parts, or off), a helper GPU, or a commit-charged GPU (its room is the commit's share)
+    template <class UC>
+    void tp_auto_plan(int gi, const std::vector<double>& mroom, bool charged, const UC& ucount) {
+        const int nm = (int) groups[(size_t) gi].mem.size();
+        if (nm < 2 || (int) mroom.size() != nm || charged || helper_id >= 0 || !pk.gguf || ffn_blk <= 0 ||
+            tp_shares_off() || !tp_shares().empty())
+            return;
+        const int unit_v = std::max(ffn_blk, 128);
+        if (unit_v % ffn_blk != 0 || g.ff % unit_v != 0 || g.ff / unit_v < nm) return;
+        const int U = g.ff / unit_v;
+        double want = 0, mean = 0;
+        std::vector<double> mine((size_t) nm, 0.0), sh((size_t) nm, 0.0);
+        int nl = 0;
+        for (const Layer& l : L) {
+            if (l.grp != gi || l.mtp) continue;
+            if (l.nm != nm || l.n_cls != 1 || l.lay.fmt != gg::kFmtMXFP4) return;
+            ++nl;
+            want += ucount(l) * l.n_exp;
+            mean += ucount(l);
+            for (int m = 0; m < nm; ++m) {
+                const Layer& x = member(l, m);
+                mine[(size_t) m] += (double) unit(x);
+                for (const char* w : {"w1", "w2", "w3"}) {
+                    const auto it = pk.t.find(l.name + "ffn.shared_experts." + w + ".weight");
+                    if (it != pk.t.end()) sh[(size_t) m] += (double) it->second.bytes * x.ffn / g.ff;
+                }
+            }
+        }
+        if (nl == 0) return;
+        double now = 1e300, total = 0, all = 0;   // (now: the split's slots, in the mean part's bytes, as placed)
+        for (int m = 0; m < nm; ++m) {
+            if (mine[(size_t) m] <= 0) return;
+            now = std::min(now, mroom[(size_t) m] * mean / mine[(size_t) m]);
+            total += mroom[(size_t) m];
+            all += mroom[(size_t) m] + sh[(size_t) m];
+        }
+        const double after = std::min(want, total / nm);
+        if (now >= want || all <= 0 || after - now < mean) return;
+        std::vector<double> f((size_t) nm), carry((size_t) nm, 0.0);
+        for (int m = 0; m < nm; ++m) f[(size_t) m] = (mroom[(size_t) m] + sh[(size_t) m]) / all;
+        if (tp_auto.size() < L.size()) tp_auto.resize(L.size());
+        std::vector<double> got((size_t) nm, 0.0);
+        for (const Layer& l : L) {
+            if (l.grp != gi || l.mtp) continue;
+            std::vector<double> t((size_t) nm);
+            std::vector<int> b((size_t) nm);
+            int s = 0;
+            for (int m = 0; m < nm; ++m) {
+                t[(size_t) m] = f[(size_t) m] * U + carry[(size_t) m];
+                b[(size_t) m] = std::max(1, (int) std::floor(t[(size_t) m]));
+                s += b[(size_t) m];
+            }
+            while (s > U) {   // (the one-unit floors took too many: from the member furthest over its target)
+                int k = -1;
+                for (int m = 0; m < nm; ++m)
+                    if (b[(size_t) m] > 1 && (k < 0 || b[(size_t) m] - t[(size_t) m] > b[(size_t) k] - t[(size_t) k])) k = m;
+                --b[(size_t) k], --s;
+            }
+            while (s < U) {   // (the remainders: to the member furthest under its target)
+                int k = 0;
+                for (int m = 1; m < nm; ++m)
+                    if (t[(size_t) m] - b[(size_t) m] > t[(size_t) k] - b[(size_t) k]) k = m;
+                ++b[(size_t) k], ++s;
+            }
+            for (int m = 0; m < nm; ++m) {
+                carry[(size_t) m] = t[(size_t) m] - b[(size_t) m];
+                got[(size_t) m] += b[(size_t) m];
+            }
+            tp_auto[(size_t) l.il] = b;
+        }
+        tp_auto_unit = unit_v;
+        tp_auto_redo = true;
+        std::string rooms, parts;
+        for (int m = 0; m < nm; ++m) {
+            char s1[64], s2[64];
+            std::snprintf(s1, sizeof s1, "%s%s %.2f", m ? ", " : "", ("CUDA" + std::to_string(devs[(size_t) groups[(size_t) gi].mem[(size_t) m]].id)).c_str(),
+                          mroom[(size_t) m] / 1e9);
+            std::snprintf(s2, sizeof s2, "%s%.2f", m ? " / " : "", got[(size_t) m] / nl);
+            rooms += s1, parts += s2;
+        }
+        std::fprintf(stderr, "ds4: tensor parallel group %d: the experts' room each GPU has left (GB): %s - the FFN's "
+                             "%d units of %d a layer split %s (from the rooms) for about %.0f%% more experts in VRAM; "
+                             "loading again with them (DS4_TP_SHARES=off: the split as before)\n",
+                     gi, rooms.c_str(), U, unit_v, parts.c_str(), 100.0 * (after / now - 1.0));
+    }
     bool place_experts(std::string& err) {
         // a mixed-precision quant (layers with experts in several layouts): every expert of those layers
         // in VRAM, in its class's arena - one GPU, no lending of the experts' room (the prompt path keeps its own)
@@ -6973,8 +7105,9 @@ struct Model::Impl {
             }
             // (DS4_TP_SHARES: each member's room in the mean part's bytes - its own part of a slot is not the mean's -
             //  so the proposal takes the member whose room runs out first in slots; trim_to_fit then checks the bytes)
+            if (!tp_auto_given) tp_auto_plan((int) gi, mroom, charged, ucount);
             std::vector<double> mslots = mroom;
-            if (tp_uneven && !tp_shares().empty() && mroom.size() > 1)
+            if (tp_uneven && (!tp_shares().empty() || !tp_auto.empty()) && mroom.size() > 1)
                 for (size_t mi = 0; mi < mroom.size(); ++mi) {
                     double mine = 0, mean = 0;
                     for (const Layer& l : L)
@@ -7055,6 +7188,10 @@ struct Model::Impl {
             //  against its own room from the same snapshot; over it, a slot less in its group's layer with the most
             //  (the drafter's last), one at a time, till every member fits - no slot left to take: the load refused)
             if (tp_uneven && groups[gi].mem.size() > 1 && !trim_to_fit((int) gi, own, err)) return false;
+        }
+        if (tp_auto_redo) {   // (#766: the first pass ends here - Model::load makes the load again with the parts)
+            err = "tensor parallel: the load is made again with the FFN parts from the members' rooms";
+            return false;
         }
         if (kept > 0) {   // the commit kept experts off the GPU: say so, and the page file that keeps them on it
             const os::Commit c = os::commit();
@@ -21335,7 +21472,21 @@ struct Model::Impl {
 
 Model::Model() : p_(new Impl) {}
 Model::~Model() = default;
-bool Model::load(const Options& o, std::string& err) { return p_->load(o, err); }
+bool Model::load(const Options& o, std::string& err) {
+    if (p_->load(o, err)) return true;
+    if (!p_->tp_auto_redo) return false;
+    // (#766) the first pass measured the members' rooms and chose the FFN parts: everything it loaded goes, the load
+    // is made again with the parts (its reads mostly from the page cache now)
+    std::vector<std::vector<int>> parts = std::move(p_->tp_auto);
+    const int unit = p_->tp_auto_unit;
+    p_.reset();
+    p_.reset(new Impl);
+    p_->tp_auto = std::move(parts);
+    p_->tp_auto_unit = unit;
+    p_->tp_auto_given = true;
+    err.clear();
+    return p_->load(o, err);
+}
 bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
 std::string Model::where() const { return p_->where(); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, int after) {
