@@ -772,6 +772,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(ds4_iq512_rows PROPERTIES ENVIRONMENT DS4_IQ512=1 TIMEOUT 120)
     add_test(NAME ds4_iq512_rows_default COMMAND ds4_iq512_rows_test)
     set_tests_properties(ds4_iq512_rows_default PROPERTIES TIMEOUT 120)
+    # the same for IQ1_S's AVX-512 rows (rows_iq1s, vpdpbusd where the CPU has VNNI): forced on (DS4_IQ1S512=1), and
+    # this CPU's default choice; --bench [--threads N] times them (--bench-ggml: ggml-cpu's dot)
+    add_executable(ds4_iq1s512_rows_test tests/ds4_iq1s512_rows_test.cpp src/ds4/ds4_iq_cpu.cpp)
+    target_include_directories(ds4_iq1s512_rows_test PRIVATE third_party/ggml)
+    target_link_libraries(ds4_iq1s512_rows_test PRIVATE strata_kernels_cpu)
+    add_test(NAME ds4_iq1s512_rows COMMAND ds4_iq1s512_rows_test)
+    set_tests_properties(ds4_iq1s512_rows PROPERTIES ENVIRONMENT DS4_IQ1S512=1 TIMEOUT 300)
+    add_test(NAME ds4_iq1s512_rows_default COMMAND ds4_iq1s512_rows_test)
+    set_tests_properties(ds4_iq1s512_rows_default PROPERTIES TIMEOUT 300)
     # the i-quant pieces on the host (no GPU): IQ1_M's code table (ds4_iq1_codes.hpp, the persistent device kernels'
     # decode) and IQ1_S's codes against ggml's own values bit for bit, IQ4_NL experts on the CPU lane against ggml-cpu's
     # dot bit for bit
