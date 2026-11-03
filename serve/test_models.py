@@ -268,6 +268,25 @@ class Settings(unittest.TestCase):
             M.apply(bare, {"draft": "dspark"})
         self.assertEqual(M.quant_label(cfg, Path("maya-mm3.json")), "EXL3 3.5 bpw")
 
+    def test_exl3_label_from_the_folder(self):
+        """A DeepSeek EXL3 quant set up by hand under the "exl3" key (turboderp's 2.25 bpw): its folder says its bits,
+        not LibertAIDAI's 2.9 the key names; the setup's own folders keep the setup's label."""
+        own = {"exe": "maya-ds4", "args": ["--pack", "/m/DeepSeek-V4.1-Flash-1017-EXL3-2.25bpw/maya-ds4"],
+               "installer": {"family": "deepseek", "ds4_quant": "exl3",
+                             "model_dir": "/m/DeepSeek-V4.1-Flash-1017-EXL3-2.25bpw"}}
+        self.assertEqual(M.quant_label(own, Path("maya-deepseek-exl3-225-hip.json")), "EXL3 2.25 bpw")
+        del own["installer"]["model_dir"]                       # (the pack's folder says it too)
+        self.assertEqual(M.quant_label(own, Path("x.json")), "EXL3 2.25 bpw")
+        setup = {"exe": "maya-ds4", "args": ["--pack", "/m/DeepSeek-V4.1-Flash-1017/maya-ds4"],
+                 "installer": {"family": "deepseek", "ds4_quant": "exl3", "model_dir": "/m/DeepSeek-V4.1-Flash-1017"}}
+        self.assertEqual(M.quant_label(setup, Path("maya-ds4.json")), "EXL3 2.9 bpw")
+        setup35 = {"exe": "maya-ds4", "args": ["--pack", "/m/DeepSeek-V4.1-Flash-1017-3.5bpw/maya-ds4"],
+                   "installer": {"family": "deepseek", "ds4_quant": "exl3-3.5"}}
+        self.assertEqual(M.quant_label(setup35, Path("maya-ds4.json")), "EXL3 3.5 bpw")
+        gguf = {"exe": "maya-ds4", "args": ["--pack", "/m/Some-3bpw-GGUF/maya-ds4"],
+                "installer": {"family": "deepseek", "ds4_quant": "gguf-q8"}}
+        self.assertEqual(M.quant_label(gguf, Path("maya-ds4.json")), "UD-Q8_K_XL")   # (a GGUF: never read)
+
     def test_minimax_answers_at_once(self):
         """maya-mm3 --parallel: read (1 where the config names none), written where it changes, 1-8; the KV streaming and
         DSpark choices stay as they are for the day it is 1 again (the engine leaves both out while it is above 1)."""
