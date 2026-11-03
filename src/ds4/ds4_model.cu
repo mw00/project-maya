@@ -6339,7 +6339,8 @@ struct Model::Impl {
             for (int r = 0; r < 3; ++r) src[r] = p + l.lay.trellis[r];
             return true;
         }
-        static const bool copy_dma = std::getenv("DS4_FLOW_COPY_DMA") == nullptr || std::atoi(std::getenv("DS4_FLOW_COPY_DMA")) != 0;
+        // (DS4_FLOW_COPY_DMA=1: a pinned copy in one part, any format; unset: MXFP4's pinned RAM slots only, as flow_push)
+        static const bool copy_dma = std::getenv("DS4_FLOW_COPY_DMA") != nullptr && std::atoi(std::getenv("DS4_FLOW_COPY_DMA")) != 0;
         if (copy_mode && cp_dma && copy_dma && NH == 1) {
             const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
             for (int r = 0; r < 3; ++r) src[r] = p + cp_lay[(size_t) l.il][(size_t) r];
