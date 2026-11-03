@@ -18743,8 +18743,9 @@ struct Model::Impl {
         for (const Layer& l : L) {
             if (l.mtp || l.pv_n >= l.n_slots || l.lay.fmt != gg::kFmtMXFP4) continue;
             for (int e = 0; e < l.n_exp; ++e)
-                if (l.slot[(size_t) e] >= l.pv_n)
-                    for (int r = 0; r < 3; ++r)
+                if (l.slot[(size_t) e] >= l.pv_n &&
+                    !(lc_arena != nullptr && l.nm == 1 && !l.lent_copy.empty() && l.lent_copy[(size_t) e] >= 0))
+                    for (int r = 0; r < 3; ++r)   // (DS4_LENT_RAM_GB: one with a RAM copy goes back from it, not read)
                         rg.push_back({pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) e * l.mx_stride[r],
                                       (uint64_t) mx_part_bytes(l, r)});
         }
