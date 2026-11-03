@@ -4851,6 +4851,20 @@ struct Model::Impl {
 #if defined(STRATA_USE_HIP)
         if (!init_peer_ar(err)) return false; // after expert placement: optional scratch does not shrink the expert cache
 #endif
+        // Opt-in startup work only: a calibration of one representative layer does not prepare every
+        // CPU format, nor both one-token and multi-token backends. Never defer their parity checks to a
+        // pool's first routed request when this option is requested; do not skip or weaken those checks.
+        if (const char* v = ds4_env("DS4_CPU_PREPARE_ROWS"); pk.gguf && v && std::strcmp(v, "1") == 0) {
+            std::vector<int> types;
+            for (const Layer& l : L) {
+                if (l.n_vram >= l.n_exp) continue;
+                for (int role : {0, 2}) types.push_back(gg::expert_type(l.lay, role));
+            }
+            std::sort(types.begin(), types.end());
+            types.erase(std::unique(types.begin(), types.end()), types.end());
+            for (int type : types) gg::iq_cpu_prepare_rows(type);
+            std::fprintf(stderr, "ds4: CPU row checks prepared at load for %zu CPU weight types (DS4_CPU_PREPARE_ROWS)\n", types.size());
+        }
         tune_lane();   // (before calibrate_paths: its CPU-lane speed is the chosen pools')
         pick_len = chunk > 0 ? prompt_pick_length(ds4_env("DS4_PROMPT_PICK")) : 0;
         if (pick_len > 0)

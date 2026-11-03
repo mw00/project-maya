@@ -2,6 +2,7 @@
 // experts (src/kernels/cpu/native_expert.cpp), whose arithmetic is ggml-cpu's - and for IQ3_XXS / IQ3_S (Maya-S's
 // down, Maya-M's gate / up / down) rows of our own, the same numbers bit for bit, faster.
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_cpu_prepare_rows.hpp"
 
 #if defined(STRATA_NATIVE_EXPERTS)
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -1045,6 +1046,11 @@ bool iq_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     return true;
 }
 
+void iq_cpu_prepare_rows(int type) {
+    // Keep all original checks and fallback decisions; only their first-use time moves to load.
+    detail::prepare_cpu_rows(type, GGML_TYPE_IQ1_S, own_nt, kc::native_rows1_exact, kc::native_multi_rows_exact);
+}
+
 void iq_cpu_quant(int act, const float* x, int k, void* dst) {
     kc::NativeFmt n;
     n.gu_act = act;
@@ -1148,6 +1154,7 @@ bool iq_cpu_fmt(int, int, int, int, IqCpu&, std::string& err) {
     err = "this build has no ggml-cpu (STRATA_NATIVE_EXPERTS=OFF): the low-bit experts' CPU lane is not in it";
     return false;
 }
+void iq_cpu_prepare_rows(int) {}
 void iq_cpu_quant(int, const float*, int, void*) {}
 void iq_cpu_gate_up(const IqCpu&, const uint8_t*, const uint8_t*, const void* const*, int, float* const*, int, int,
                     float) {}
