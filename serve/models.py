@@ -905,11 +905,38 @@ def pack_shards(pack: Path) -> list:
     return [pack.parent / Path(n).name for n in names]   # (by name: nothing outside the pack's folder)
 
 
+def pack_reads(pack: Path) -> list:
+    """The files a DeepSeek or MiniMax pack reads: its tensors.txt's `file <i> <path>` lines (they come first: read up to
+    the first tensor only), each relative to the model_dir its ds4.txt / mm3.txt names - the model's own shards, and
+    what it takes from other folders: the Engram tables of a GGUF set beside it, the DSpark drafter, the vision tower."""
+    model = None
+    for name in ("ds4.txt", "mm3.txt"):
+        try:
+            with open(pack / name, encoding="utf-8", errors="replace") as f:
+                model = next((ln[len("model_dir "):].strip() for ln in f if ln.startswith("model_dir ")), None)
+        except OSError:
+            continue
+        if model:
+            break
+    base = Path(model) if model and Path(model).is_dir() else pack.parent   # (a pack moved since: its own folder's)
+    out = []
+    try:
+        with open(pack / "tensors.txt", encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                w = ln.split()
+                if len(w) < 3 or w[0] != "file":
+                    break
+                out.append(base / w[2])
+    except OSError:
+        pass
+    return out
+
+
 def runs_from(cfg: dict) -> list:
-    """Every path a config runs from: its pack and the model files in it, its drafter, image encoder and tokenizer, and
-    the folder or GGUF its setup named."""
+    """Every path a config runs from: its pack and the model files in it (a DeepSeek or MiniMax pack's from other
+    folders too), its drafter, image encoder and tokenizer, and the folder or GGUF its setup named."""
     pack = pack_of(cfg)
-    found = ([pack] + pack_shards(pack)) if pack else []
+    found = ([pack] + pack_shards(pack) + pack_reads(pack)) if pack else []
     inst = cfg.get("installer") or {}
     found += [Path(inst[k]) for k in ("model_dir", "gguf", "gguf_dir") if isinstance(inst.get(k), str) and inst[k]]
     found += [Path(v) for v in (flag(cfg.get("args") or [], "--dflash"), flag(cfg.get("args") or [], "--mtp"),
@@ -1086,8 +1113,9 @@ def delete(root: Path, path: Path, files: bool = False) -> dict:
 # version, a quant set up again into another folder.  Only what is in a folder the setup downloaded into: at its top a
 # folder or a file of 100 MB or more (a download's log is not listed), and one level down in a folder another model
 # runs from only a folder with a pack of its own (GLM's quants side by side in GLM-5.3-Flash/: DeepSeek's dspark/ and
-# vision/ beside its GGUF folder are read through the pack, so a folder without one is never taken for unused).  Never
-# a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
+# vision/ beside its GGUF folder are read through the pack, so a folder without one is never taken for unused).  A
+# folder a pack reads from is used too (pack_reads: a DeepSeek EXL3 quant's Engram tables in the GGUF set's folder,
+# its vision tower in another's).  Never a hidden one, the project or the home folder.  Maya may not have downloaded it: the page says what is in it, and
 # deletes one at a time.
 LEFTOVER_MIN = 10 ** 8
 PACK_MARKS = ("sources.json", "tensors.txt", "mm3.txt", "ds4.txt", "native_experts.txt", "index.txt")

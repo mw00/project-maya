@@ -675,6 +675,37 @@ class Leftovers(unittest.TestCase):
             (root / side / f"{side}.bin").write_bytes(b"d" * 2000)
         self.assertEqual(M.leftovers(self.d)["items"], [])
 
+    def test_never_a_folder_another_pack_reads_files_from(self):
+        # an EXL3 quant's pack reading the Engram tables from the GGUF set's folder and the vision tower from another's
+        # (its tensors.txt's file lines, relative to ds4.txt's model_dir): no config names those folders
+        p = ds4_cfg(self.d)
+        cfg = json.loads(p.read_text())
+        exl3 = self.models / "DeepSeek-V4.1-Flash-EXL3-2.25bpw"
+        pack = exl3 / "maya-ds4"
+        pack.mkdir(parents=True)
+        (exl3 / "model-00001-of-00001.safetensors").write_bytes(b"s" * 2000)
+        (pack / "ds4.txt").write_text(f"hidden_size 5120\nmodel_dir {exl3}\n")
+        (pack / "tensors.txt").write_text("file 0 model-00001-of-00001.safetensors\n"
+                                          "file 1 ../DeepSeek-V4.1-Flash-Maya-GGUF/Engram/E-00008-of-00010.gguf\n"
+                                          "file 2 ../DeepSeek-V4.1-Flash-GGUF/vision/vision.bin\n"
+                                          "t embed.weight BF16 0 0 10 5 2\nt layers.0.engram.w BF16 1 0 10 5 2\n")
+        cfg["args"][1] = str(pack)
+        cfg["installer"]["models_dir"] = str(self.models)
+        p.write_text(json.dumps(cfg))
+        gguf, other = self.models / "DeepSeek-V4.1-Flash-Maya-GGUF", self.models / "DeepSeek-V4.1-Flash-GGUF"
+        (gguf / "Engram").mkdir(parents=True)
+        (gguf / "Engram" / "E-00008-of-00010.gguf").write_bytes(b"e" * 2000)
+        (gguf / "DeepSeek-V4.1-Flash-Maya-S-00001-of-00002.gguf").write_bytes(b"g" * 2000)
+        (other / "vision").mkdir(parents=True)
+        (other / "vision" / "vision.bin").write_bytes(b"v" * 2000)
+        old = self.models / "Unused"                       # (and one no pack reads: still listed)
+        old.mkdir()
+        (old / "x.gguf").write_bytes(b"x" * 2000)
+        self.assertEqual([i["name"] for i in M.leftovers(self.d)["items"]], ["Unused"])
+        with self.assertRaisesRegex(ValueError, "not a file no model uses"):
+            M.delete_leftover(self.d, str(gguf))
+        self.assertTrue((gguf / "Engram" / "E-00008-of-00010.gguf").is_file())
+
     def test_only_what_is_listed_is_deleted(self):
         m = glm_quant(self.d, "Maya-M", models=self.models)
         with self.assertRaisesRegex(ValueError, "not a file no model uses"):
