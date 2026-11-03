@@ -141,11 +141,14 @@ class Puller:
         self._lock = threading.Lock()
 
     def start(self, ident: str, cfg: dict | None) -> Pull:
-        known = {c["id"] for c in catalog(self.root, {})}
-        ident = str(ident or "").strip().lower()
-        ident = ident.removesuffix(":latest")
-        if ident not in known:
-            raise ValueError(f"{ident!r} is not in Maya's catalog (GET /api/catalog lists the ids)")
+        # Preserve catalog spelling: some GGUF ids contain case-sensitive quant names
+        # (Q3_K_XL/IQ4_XS).  The API is case-insensitive, but maya.py's --model
+        # accepts its canonical catalog key, not a lowercased variant.
+        known = {c["id"].lower(): c["id"] for c in catalog(self.root, {})}
+        requested = str(ident or "").strip()
+        ident = known.get(requested.lower().removesuffix(":latest"))
+        if ident is None:
+            raise ValueError(f"{requested!r} is not in Maya's catalog (GET /api/catalog lists the ids)")
         with self._lock:
             if self.current is not None and self.current.active():
                 raise ValueError(f"{self.current.id} is downloading; wait for it or cancel it")

@@ -534,6 +534,41 @@ MODELS = {
                        "GLM-5.3-Flash-vocab.gguf":
                            "8f53cb1bd2e631c14ef413e3284735d9e53f3c508d07a6f609e705b487105912"}}},
 }
+# huihui-ai's GLM-5.3-Flash abliterated GGUFs. The 9.43 MB first shard is primarily
+# GGUF metadata/tokenizer; the remaining shards contain the weights. Keep the published
+# filenames unchanged: iq_pack.py resolves -00002..N beside -00001 automatically.
+# All nine SHA-256 digests are published on each Hugging Face file's Xet details page.
+HUIHUI_REPO = "huihui-ai/Huihui-GLM-5.3-Flash-abliterated-GGUF"
+HUIHUI_QUANTS = (
+    ("glm5.3-flash-ablit-Q3_K_XL", "UD-Q3_K_XL", 4, 147.5, (
+        "1d8240406d3371157c04846efbdce830a303861b8fab99905f77498392052c33",
+        "3f1c3107fc07bb4dddb42dff048f4ed26e843a0aa799fb8f1c321160421e46de",
+        "eb490d5e6f17b639b3bdd9472cdda213cd124fbe908bafebe85fd7a09bfb725d",
+        "9ca01847fbfd16adb19977652b531327950d018ff59ed4f77f60852d52284d8c")),
+    ("glm5.3-flash-ablit-IQ4_XS", "UD-IQ4_XS", 5, 156.8, (
+        "c2f3b6ab98d3df844f322ea376059202d2eaeedcee1f0eff455345b86a137dbd",
+        "b2b6d0f519f25e1f6adfb6ce81375d58666bdb99731ba402fc361e81e2c02a9d",
+        "f4eceffc465d44ea81c243f1332c6e3b2f4ae59ac70bb77890bb3befe87377d5",
+        "ff6a85441a5e8d7805d81f162dd37eec16a6b29bf9df0b000a8df365d2d67bb1",
+        "d7e1e587c756bac31cd74b7456e18b36bbe4be7ec3ffffd090053e3acea52d9f")),
+)
+for _id, _folder, _n, _gb, _hashes in HUIHUI_QUANTS:
+    MODELS[_id] = {
+        "about": (f"Huihui GLM-5.3-Flash abliterated {_folder}; published GGUF files "
+                  "(experimental with Maya, reduced refusal behavior)"),
+        "repo": HUIHUI_REPO, "revision": "main", "folder": _folder,
+        "file": f"GLM-5.3-Flash-{_folder}-{{i:05d}}-of-{{n:05d}}.gguf",
+        "shards": _n, "download_gb": _gb,
+        "sha256": {f"GLM-5.3-Flash-{_folder}-{_i:05d}-of-{_n:05d}.gguf": _hash
+                   for _i, _hash in enumerate(_hashes, 1)},
+        # The base GLM-5.3 vision encoder is compatible at the architecture/tokenizer
+        # level, but image inference with this abliterated quant remains unvalidated.
+        # The vision data is hosted by peasantsmith, not in Huihui's repo.
+        # Without explicit provenance vision_step falls back to this quant's repo.
+        "vision": {**MODELS["Maya-M"]["vision"],
+                   "repo": MODELS["Maya-M"]["repo"],
+                   "revision": MODELS["Maya-M"]["revision"]},
+    }
 # Downloads the setup's model list no longer offers (the owner, v1.1.34): they stay in MODELS, so --model EXL3-sc_4.10bpw,
 # an install's update and a config that names them work as before; the list shows one only on a PC that has it set up
 # (its default there: a setup again, --yes included, keeps the model).
@@ -1777,7 +1812,10 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
     for q in opts:
         m, d = MODELS[q], download_dir(models, q)
         have = all(p.exists() for p in local_shards(m, d))
-        rows.append((f"{Q.shown('glm', q)}: " + (f"downloaded, in {d}" if have else
+        # Display the exact --model ID for the Huihui quants, as requested, not just
+        # the friendly UD-* label.  The same rows are used by both OS setup launchers.
+        label = Q.shown("glm", q) + (f" [{q}]" if q in (x[0] for x in HUIHUI_QUANTS) else "")
+        rows.append((f"{label}: " + (f"downloaded, in {d}" if have else
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
                      else "experimental" if is_exl3(q) else None, m["about"]))
@@ -2312,7 +2350,7 @@ def quant_of(first: Path) -> str:
     for q, mm in MODELS.items():                       # a Maya download, under its name on Hugging Face or its old one
         if "files" in mm:                              # (an EXL3 download is no .gguf file)
             continue
-        if first.name in [names[0] for names in [shard_names(mm)] + old_names(mm)]:
+        if any(first.name in names for names in [shard_names(mm)] + old_names(mm)):
             return q
     m = re.match(r"GLM-5\.3-Flash-(.+?)(-\d{5}-of-\d{5})?\.gguf$", first.name, re.I)
     return m.group(1) if m else first.parent.name

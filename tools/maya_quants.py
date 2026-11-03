@@ -110,6 +110,8 @@ QUANTS = (
     ("glm", "Maya-M", "Maya-M", "glm-maya-m"),
     ("glm", "Maya-M-Derisked", "Maya-M-Derisked", "glm-maya-m-derisked"),
     ("glm", "Maya-L", "Maya-L", "glm-maya-l"),
+    ("glm", "glm5.3-flash-ablit-Q3_K_XL", "abliterated UD-Q3_K_XL", "glm5.3-flash-ablit-Q3_K_XL"),
+    ("glm", "glm5.3-flash-ablit-IQ4_XS", "abliterated UD-IQ4_XS", "glm5.3-flash-ablit-IQ4_XS"),
     ("deepseek", "maya-xs", "Maya-XS", "deepseek-maya-xs"),
     ("deepseek", "maya-s", "Maya-S", "deepseek-maya-s"),
     ("deepseek", "maya-m", "Maya-M", "deepseek-maya-m"),
@@ -175,7 +177,7 @@ def resolve(name: str, glm_downloads=()) -> tuple | None:
     key None."""
     low = (name or "").strip().lower()
     for f, k, _, i in QUANTS:
-        if low in (i, full_name(f, k).lower()):
+        if low in (i.lower(), full_name(f, k).lower()):
             return f, k
     for k in glm_downloads:
         if low == k.lower():

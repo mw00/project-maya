@@ -35,6 +35,8 @@ IDS = {
     "glm-maya-m": ("glm", "Maya-M", "GLM-5.3 · Maya-M"),
     "glm-maya-m-derisked": ("glm", "Maya-M-Derisked", "GLM-5.3 · Maya-M-Derisked"),
     "glm-maya-l": ("glm", "Maya-L", "GLM-5.3 · Maya-L"),
+    "glm5.3-flash-ablit-Q3_K_XL": ("glm", "glm5.3-flash-ablit-Q3_K_XL", "GLM-5.3 · abliterated UD-Q3_K_XL"),
+    "glm5.3-flash-ablit-IQ4_XS": ("glm", "glm5.3-flash-ablit-IQ4_XS", "GLM-5.3 · abliterated UD-IQ4_XS"),
     "deepseek-maya-xs": ("deepseek", "maya-xs", "DeepSeek V4.1 · Maya-XS"),
     "deepseek-maya-s": ("deepseek", "maya-s", "DeepSeek V4.1 · Maya-S"),
     "deepseek-maya-m": ("deepseek", "maya-m", "DeepSeek V4.1 · Maya-M"),
@@ -100,7 +102,8 @@ class Aliases(unittest.TestCase):
     def test_old_names_still_work(self):
         for old, hit in ALIASES.items():
             self.assertEqual(Q.resolve(old, list(maya.MODELS)), hit, old)
-        self.assertEqual(set(maya.MODELS) - {k for k in ALIASES}, set())     # (every GLM download kept)
+        known_glm = set(ALIASES) | {key for family, key, _, _ in Q.QUANTS if family == "glm"}
+        self.assertEqual(set(maya.MODELS) - known_glm, set())  # existing aliases and current GLM downloads
         self.assertIsNone(Q.resolve("Maya-XS", list(maya.MODELS)))           # (a bare tier names no model)
         self.assertIsNone(Q.resolve("glm-maya-zz", list(maya.MODELS)))
 
