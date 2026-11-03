@@ -4471,8 +4471,11 @@ struct Model::Impl {
             //  in one chunk, 1.36M rows before layer 1: 10 threads 17.1 s, 32 14.1 s, 64 13.4 s on a 20-core PC)
             int nth = 64;
 #else
-            const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-            int nth = (int) std::min(16u, std::max(4u, hw / 2));
+            // (Linux: buffered reads, but a cold table's rows still come from the SSD, whose queue these threads keep:
+            //  a 16-thread host read real-text prompts ~21 % faster with 32 than with 8 - twice the hardware threads,
+            //  16 to 64; an unknown count: 16)
+            const unsigned hw = std::thread::hardware_concurrency();
+            int nth = hw == 0 ? 16 : (int) std::min(64u, std::max(16u, hw * 2));
 #endif
             if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
             const uint64_t avail = ram_room();

@@ -559,6 +559,11 @@ lent from one part to the next (`DS4_PROMPT_KEEP_LEND=0`: handed back after ever
 Engram rows are read while the part before it runs (`DS4_PROMPT_EG_AHEAD=0`: when the part starts). The server does
 not read prompts this way: its pieces are the scheduler's above.
 
+`DS4_ENGRAM_THREADS` sets how many threads read a prompt's Engram rows. Rows that are not in the page cache come from
+the SSD, and the threads are its queue: on Linux the default is twice the hardware threads, at least 16 and at most 64
+(a 16-thread host read real-text prompts about 21 % faster with 32 threads than with 8); on Windows 64. Rows already
+in RAM need few threads, so it matters most for Engram tables on an SSD.
+
 
 ## Drafting with DFlash2
 
