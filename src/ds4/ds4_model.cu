@@ -1235,7 +1235,8 @@ struct Model::Impl {
     // runs compare every such item with the files (each read again, so those runs time nothing), a difference failing
     // the prompt; each member of such a run ends with its check line.  (Tests) DS4_FLOW_HELPER_FAIL=copy: the first
     // such copy fails as a failed read would; =check: the first compared item's file bytes altered, the check must
-    // fail the prompt
+    // fail the prompt.  An EXL3 pack in place (no flow: its batches, copy_ahead) the same: an expert the helper holds
+    // staged out of its pool as the VRAM slot's layout (x3_pool) - its count in the DS4_FLOW_STATS line
     bool flow_helper = ds4_env("DS4_FLOW_HELPER") != nullptr && std::atoi(ds4_env("DS4_FLOW_HELPER")) != 0;
     const int flow_check_runs =
         ds4_env("DS4_FLOW_HELPER_CHECK") ? std::max(0, std::atoi(ds4_env("DS4_FLOW_HELPER_CHECK"))) : 0;
@@ -4742,7 +4743,8 @@ struct Model::Impl {
                         if (l.lay.fmt == gg::kFmtMXFP4) {   // (a GGUF's: read as its blob)
                             mr = std::max(mr, l.blob);
                             for (int r = 0; r < 3; ++r) flow_part[r] = std::max(flow_part[r], mx_part_bytes(l, r));
-                        }
+                        } else if (flow_helper)   // (an EXL3 expert out of the helper's pool: staged as its blob)
+                            mr = std::max(mr, l.blob);
                     }
                 const char* nr = std::getenv("DS4_READERS");
                 const int n_readers = std::max(1, nr != nullptr ? std::atoi(nr) : 8);
@@ -5752,6 +5754,7 @@ struct Model::Impl {
         bool spec(int k) const { return k >= 0 && (size_t) k < spec_k.size() && spec_k[(size_t) k]; }
         std::vector<int> routed_bounds;
         size_t skipped = 0, copied = 0;
+        size_t pooled = 0;   // (DS4_FLOW_HELPER: EXL3 experts staged out of the helper's pool)
     };
     // in place (file_experts): the batches' file regions read ahead of their copies - POSIX_FADV_WILLNEED, the kernel
     // reading them in the background in large requests, where the copies alone fault the pages in a few at a time -
@@ -5784,6 +5787,7 @@ struct Model::Impl {
                         nb += (double) l0.blob;
                         continue;
                     }
+                    if (x3_pool(l0, e) != nullptr) continue;   // (DS4_FLOW_HELPER: out of the pool, nothing to read)
                     os::advise(pk.fds[(size_t) l0.region_file[(size_t) e]], l0.region_off[(size_t) e], l0.region_bytes[(size_t) e], true);
                     nb += (double) l0.region_bytes[(size_t) e];
                 }
@@ -5800,7 +5804,31 @@ struct Model::Impl {
         return cp_dma && l.lay.fmt == gg::kFmtMXFP4 && !l.ram.empty() && l.ram[(size_t) e] >= 0;
     }
     bool stage_needed(const Layer& l, int e) const { return !stream_direct(l, e) || l.nm > 1; }
-    bool stage_streamed(const Layer& l, int mi, int e, uint8_t* si) const {
+    // (DS4_FLOW_HELPER, an EXL3 pack in place) expert e of l in the helper's pool: its blob there - the VRAM slots'
+    // layout, the bytes its file region repacks to - which the prompt's copy is staged out of instead of the files
+    // (the helper's static pool: never rewritten while it holds e).  nullptr: from the files, as before
+    const uint8_t* x3_pool(const Layer& l, int e) const {
+        if (!flow_helper || !file_experts || l.lay.fmt == gg::kFmtMXFP4 || l.n_cls > 1 || !helper_owned(l, e) ||
+            helper_dead.load(std::memory_order_relaxed))
+            return nullptr;
+        return l.helper[(size_t) e];
+    }
+    // pool: x3_pool's blob (decided once for the item - stage_streamed and copy_streamed must agree), staged as the
+    // slot's layout: the blob, or member mi's part cut from it (blob_to_half) - one copy into the ring
+    bool stage_streamed(const Layer& l, int mi, int e, uint8_t* si, const uint8_t* pool = nullptr) const {
+        if (pool != nullptr) {   // (the readers' pool runs items on the device's own thread too: its device kept)
+            int cur = 0;
+            const bool got = cudaGetDevice(&cur) == cudaSuccess;
+            const bool copied = helper_copy(helper_id, si, pool, l.blob);
+            if (!got || cudaSetDevice(cur) != cudaSuccess || !copied) return false;
+            if (l.nm > 1) {
+                thread_local std::vector<uint8_t> half;
+                half.resize(unit(member(l, mi)));
+                blob_to_half(l, si, mi, half.data());
+                std::memcpy(si, half.data(), half.size());
+            }
+            return !flow_check_now || pool_same(l, mi, e, si);
+        }
         if (stream_direct(l, e)) {
             if (l.nm > 1) mx_down_member(l, e, mi, si);
             return true;
@@ -5808,12 +5836,35 @@ struct Model::Impl {
         if (l.lay.fmt == gg::kFmtMXFP4) return l.nm > 1 ? read_mx_part(l, e, mi, si) : read_mx(l, e, si);
         return pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], l.region_bytes[(size_t) e], si);
     }
+    // (DS4_FLOW_HELPER_CHECK) an EXL3 item staged out of the pool against its file region repacked the same way
+    bool pool_same(const Layer& l, int mi, int e, const uint8_t* si) const {
+        std::vector<uint8_t> region(l.region_bytes[(size_t) e]), want(l.blob, 0);
+        const bool read = e < (int) l.esplit.size() && l.esplit[(size_t) e]   // (as the load read it for the pool)
+                              ? read_split(l, e, region.data())
+                              : pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], region.size(), region.data());
+        if (!read) return false;
+        repack(l, e, region.data(), want.data());
+        if (l.nm > 1) {
+            std::vector<uint8_t> half(unit(member(l, mi)), 0);
+            blob_to_half(l, want.data(), mi, half.data());
+            want.swap(half);
+        }
+        if (std::memcmp(want.data(), si, want.size()) == 0) return true;
+        std::fprintf(stderr, "ds4: DS4_FLOW_HELPER_CHECK: layer %d expert %d member %d: the helper's pool differs from "
+                             "the model's files\n", l.il, e, mi);
+        return false;
+    }
     bool copy_streamed(const Layer& l, int mi, int e, const uint8_t* si, uint8_t* dst, cudaStream_t cs,
-                       std::string& err) {
+                       std::string& err, bool pooled = false) {
         auto cp = [&](uint8_t* to, const uint8_t* from, size_t n) {
             return cudaMemcpyAsync(to, from, n, cudaMemcpyHostToDevice, cs) == cudaSuccess;
         };
         bool ok = true;
+        if (pooled) {   // (staged out of the helper's pool as the slot's layout)
+            ok = cp(dst, si, unit(member(l, mi)));
+            if (!ok) err = "streaming layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
+            return ok;
+        }
         if (stream_direct(l, e) && (l.nm == 1 || si != nullptr)) {
             const int s = l.ram[(size_t) e];
             if (l.nm == 1) {
@@ -5901,13 +5952,17 @@ struct Model::Impl {
             bool staged = false;     // (a batch of copies in place, alone: nothing to stage)
             for (int i = 0; i < bt.n && !staged; ++i)
                 staged = stage_needed(l0, l0.host_list[(size_t) (bt.j0 + i)]);
+            // (DS4_FLOW_HELPER, EXL3: each item's source decided once - its staging and its copy must agree)
+            std::vector<const uint8_t*> pool((size_t) bt.n, nullptr);
             if (c.stage != nullptr && staged) {
                 if (S.cp >= (size_t) P) CK(cudaEventSynchronize(c.filled[half]));   // (its last batch's copies out)
                 sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
+                for (int i = 0; i < bt.n; ++i) pool[(size_t) i] = x3_pool(l0, l0.host_list[(size_t) (bt.j0 + i)]);
                 std::atomic<bool> bad{false};
                 c.readers->run(bt.n, [&](int i) {
                     if (!picked(i)) return;   // (DS4_SKIP_UNPICKED: an expert no token routed to)
-                    if (!stage_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb + (size_t) i * c.stage_stride))
+                    if (!stage_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb + (size_t) i * c.stage_stride,
+                                        pool[(size_t) i]))
                         bad.store(true);
                 });
                 if (bad.load()) {
@@ -5921,8 +5976,9 @@ struct Model::Impl {
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
                 if (!copy_streamed(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], sb != nullptr ? sb + (size_t) i * c.stage_stride
                                                                                              : nullptr,
-                                   dst, c.cs, err))
+                                   dst, c.cs, err, pool[(size_t) i] != nullptr))
                     return false;
+                S.pooled += pool[(size_t) i] != nullptr;
                 c.stream_bytes += (double) unit(member(l0, mi));
             }
             CK(cudaEventRecord(c.filled[half], c.cs));
@@ -18624,9 +18680,11 @@ struct Model::Impl {
                 if (e) cudaEventDestroy(e);
         }
         S.report_prefill(d.id, std::accumulate(run.T.begin(), run.T.end(), 0), chunk, c.stream_bytes - stream_start);
-        if (!c.flow && S.copied + S.skipped > 0 && std::getenv("DS4_FLOW_STATS") != nullptr)
-            std::fprintf(stderr, "ds4 prompt batches, CUDA%d: %zu experts copied, %zu unpicked experts skipped\n",
-                         devs[(size_t) di].id, S.copied, S.skipped);
+        if (!c.flow && S.copied + S.skipped + S.pooled > 0 && std::getenv("DS4_FLOW_STATS") != nullptr)
+            std::fprintf(stderr, "ds4 prompt batches, CUDA%d: %zu experts copied, %zu unpicked experts skipped, %zu out "
+                                 "of the helper's pool%s\n",
+                         devs[(size_t) di].id, S.copied, S.skipped, S.pooled,
+                         flow_check_now && S.pooled > 0 ? " (DS4_FLOW_HELPER_CHECK: each compared with the files)" : "");
         return true;
     }
 

@@ -1532,7 +1532,9 @@ changes by default. See [EXL3 helper configuration and validation](EXL3-HELPER.m
 
 A prompt's experts that VRAM does not hold are read from the model's files as the prompt picks them (the flow), those
 the helper's pool holds too. With `MAYA_DS4_FLOW_HELPER=1` an expert the pool holds is copied out of it instead - the
-same bytes, so the same answers, the decode unchanged - and the disk reads only the rest.
+same bytes, so the same answers, the decode unchanged - and the disk reads only the rest. An EXL3 pack read in place
+(`--mmap-experts on`, with `MAYA_DS4_HELPER_EXL3=1`) streams its prompt's experts in batches rather than the flow; the
+setting does the same there: an expert the pool holds is copied out of it as its VRAM layout, one copy to the GPU.
 `MAYA_DS4_FLOW_HELPER_CHECK=N` has the load's first N prompts compare every expert copied out of the pool with the
 model's files (each read again, so those prompts are not timed); a difference fails the prompt.
 
