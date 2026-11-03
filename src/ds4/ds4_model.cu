@@ -2398,9 +2398,15 @@ struct Model::Impl {
         }
         // zeroed before anything lands in it: the loads copy in on the default stream, which the non-blocking d.st
         // does not order against - a zeroing still queued there could wipe the weights just copied
-        if (cudaMemsetAsync(v, 0, b, d.st) != cudaSuccess || cudaStreamSynchronize(d.st) != cudaSuccess) {
+        cudaError_t ze = cudaMemsetAsync(v, 0, b, d.st);
+        if (ze == cudaSuccess) ze = cudaStreamSynchronize(d.st);
+        if (ze != cudaSuccess) {
+            // (the driver's reason too: a small zeroing that fails is an earlier error surfacing on this stream's wait,
+            //  not this buffer - #805 read only "zeroing 0 MiB on CUDA0 failed")
+            (void) cudaGetLastError();
             cudaFree(v);
-            err = "zeroing " + std::to_string(b >> 20) + " MiB on CUDA" + std::to_string(d.id) + " failed";
+            err = "zeroing " + (b < (1u << 20) ? std::to_string(b >> 10) + " KiB" : std::to_string(b >> 20) + " MiB") +
+                  " on CUDA" + std::to_string(d.id) + " failed (" + cudaGetErrorString(ze) + ")";
             return false;
         }
         d.allocs.push_back(v);
