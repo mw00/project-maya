@@ -68,7 +68,8 @@ not make this policy equivalent to the native model or a token-at-a-time cache h
 Native `STAT` counters, when active: `sub_picks`, `cache_substituted`, `sub_demand_gpu`, `sub_executed_gpu`,
 `sub_removed_mass`, `sub_executed_mass`. GPU fractions compare original demand with executed picks; mass fields
 are normalized per token/layer. They count target routing rows, including speculative rows later rejected,
-not only emitted tokens. The ordinary cache-hit fraction describes executed routing and can rise mechanically.
+not only emitted tokens. Counters cover published target routes; host-free, fully resident layers may be omitted.
+The ordinary cache-hit fraction describes executed routing and can rise mechanically.
 
 ## Quality evidence from the research stack
 
