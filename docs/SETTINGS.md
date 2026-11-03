@@ -917,6 +917,7 @@ skip any experts, and do not promise a speed increase over a warm page cache.
 | Setting | Default | Effect |
 | --- | --- | --- |
 | `DS4_ENGRAM_RAM` | `0` | `1`: map and lock both complete Engram tables before serving. The reader copies rows from the locked mappings, including FP8 scales; an unregistered range fails instead of reading the file. Supports Q6_K, MXFP8 and native FP8 + separate scales. Linux; explicitly requesting it on Windows fails. |
+| `DS4_RAM_MARGIN_GB` | `8` | DeepSeek: the system RAM (in GiB, 0 to 4096) the memory planning leaves to everything else when it sizes the expert copies, the warm-up and the prompt caches. A larger value keeps more RAM for other programs; the separate extra room `--mmap-experts auto` wants before it copies every expert is unchanged. It is planning headroom only: later allocations and page-cache growth are not limited by it. `DS4_COPY_GB` and `DS4_WARM_CAP_GB` still cap what is copied or warmed. Logged at start when set. |
 | `DS4_REQUIRE_ALL_RAM` | `0` | `1`, with `--mmap-experts off`: copy every CPU-lane GGUF expert to anonymous RAM. Do not reduce the selection to the available-memory estimate or `DS4_COPY_GB`; insufficient allocation or an incomplete selection fails startup instead of silently leaving experts in their files. |
 
 The second option applies to the GGUF expert-copy path. It does not lock the experts: **locked Engram tables and
