@@ -1048,6 +1048,20 @@ difference fails the start); `ds4_gguf_test --trims` checks every mode.
 | `MAYA_DS4_Q8_SHARE` | on | `0`: each job rounds its own input, even one another job of the call reads (the same bits either way); both `0`: as before |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched, shared rounding checked against the per-job one on every GPU at load |
 
+## DeepSeek: Q8_0 GEMVs on the tensor cores
+
+A GGUF pack's Q8_0 matrices (the attention's projections, the shared expert, the output head) are read by `q8_mv`, one
+lane a 32-value block with `dp4a`. With 3 to 16 columns - a DSpark verify window, a few requests at once - it is no
+longer bound by the memory. `MAYA_DS4_Q8MV_TC=1` runs those calls on the tensor cores instead (`mma.sync` m16n8k32
+int8, weights staged with `cp.async`): a block's integer sum is the same as the `dp4a` chain's and the float part keeps
+`q8_mv`'s order of additions, so the answers are bit for bit the same. One and two columns stay on `q8_mv`, which
+reads the weights at the memory's speed already. Compute capability 8.0 and newer (Ampere on), CUDA only; on Volta,
+Turing and AMD the setting does nothing.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_Q8MV_TC` | off (0) | `1`: Q8_0 GEMVs of 3 to 16 columns on the tensor cores (the same bits); `2`: two columns too (no faster on an RTX 3090) |
+
 ## DeepSeek: tensor-parallel layers without the host
 
 A decoded layer whose routed experts are all in VRAM skips the host (no mailbox, no wait) when it runs on one GPU.
