@@ -19120,7 +19120,10 @@ struct Model::Impl {
         }
         static const bool check = std::getenv("DS4_CHECK_LEND") != nullptr;
         x3_check.clear();
-        if (check && x3)   // (an EXL3 lender's tail slots as they are, before the room is cleared: borrow_end compares)
+        // (an EXL3 lender's tail slots as they are, before the room is cleared: borrow_end compares - a lender whose
+        //  experts are copies in RAM; in place the files are the reference, borrow_end compares each part with its
+        //  file, and the whole tail's copy - 14.5 GB on 2x RX 7900 XTX at chunk 32768 - would take the host's RAM)
+        if (check && x3 && !file_experts)
             for (const Layer& l : L) {
                 if (l.mtp || l.n_main >= l.n_slots || l.lay.fmt == gg::kFmtMXFP4) continue;
                 for (int e = 0; e < l.n_exp; ++e) {
@@ -19659,7 +19662,6 @@ struct Model::Impl {
                                  "device's state unknown; no further request runs\n");
             return false;
         }
-        if (!x3_check.empty()) x3_check_compare();   // (an EXL3 lender in place: also each part against before)
         return differ.load() == 0;
     }
 
