@@ -4096,10 +4096,17 @@ static int glm_pack_generate(const Options& o) {
         if (o.expert_profile_save_min > 0 &&
             Clock::now() - profile_saved_at >= std::chrono::duration<double>(o.expert_profile_save_min * 60.0))
             save_profile("periodic");
-        // the watchdog watches a command from here until this iteration ends, whichever way it ends
+        // the watchdog watches a command from here until this iteration ends, whichever way it ends.  A command that
+        // ended is progress: back-to-back short commands (the zero-shot suite's LOGP lines, ~0.4 s each on the token
+        // path, which has no beat of its own) leave the watchdog's 1 s look almost never on an idle moment, so
+        // without this beat it stopped a healthy engine after STRATA_WATCHDOG_S of answers
         struct BusyScope {
             BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("the request"); }
-            ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+            ~BusyScope() {
+                strata::core::progress_beat();
+                strata::core::progress().busy.store(false);
+                strata::core::progress_at("idle");
+            }
         } busy_scope;
         // LOGP <n_ctx> <id,id,...>: the summed log-probability of the tokens from n_ctx on given those before
         // ("LP <sum> <n> <1 if every one was the most likely>") - the multiple-choice scoring of the zero-shot suite
@@ -4148,7 +4155,9 @@ static int glm_pack_generate(const Options& o) {
                     for (size_t i = 0; ok && i < head.size(); i += 8) {
                         const std::vector<int32_t> part(head.begin() + (long) i,
                                                         head.begin() + (long) std::min(head.size(), i + 8));
+                        strata::core::progress_at("LOGP: the context on the token path, at token", (int64_t) i);
                         ok = model.forward(part, lg0, err);
+                        strata::core::progress_beat();
                     }
                 }
                 lp_ctx.clear();
@@ -4158,8 +4167,10 @@ static int glm_pack_generate(const Options& o) {
             double lp = 0.0;
             bool greedy = true;
             for (int64_t j = n_ctx; ok && j < (int64_t) t.size(); ++j) {
+                strata::core::progress_at("LOGP: the continuation, at token", j);
                 ok = model.forward({t[(size_t) j - 1]}, lgv, err);
                 if (!ok) break;
+                strata::core::progress_beat();
                 float mx = lgv[0];
                 size_t am = 0;
                 for (size_t v = 1; v < lgv.size(); ++v)
@@ -7408,10 +7419,15 @@ int main(int argc, char** argv) {
         constexpr int64_t kMinPromptChunk = 256;   // the layout's floor: a chunk smaller than this is not read
         while (next_line(line)) {
             if (line == "QUIT") break;
-            // the watchdog watches a request from here until this iteration ends, whichever way it ends
+            // the watchdog watches a request from here until this iteration ends, whichever way it ends; a request
+            // that ended is progress (back-to-back short requests leave the watchdog's 1 s look no idle moment)
             struct BusyScope {
                 BusyScope() { strata::core::progress().busy.store(true); strata::core::progress_at("request"); }
-                ~BusyScope() { strata::core::progress().busy.store(false); strata::core::progress_at("idle"); }
+                ~BusyScope() {
+                    strata::core::progress_beat();
+                    strata::core::progress().busy.store(false);
+                    strata::core::progress_at("idle");
+                }
             } busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();             // ... and so is the "cancelled" an abandoned read left behind (#703: every request after it failed)
