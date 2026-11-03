@@ -6783,6 +6783,20 @@ struct Model::Impl {
         return true;
     }
 
+    // a layer's state on its device: the window ring, a verify's backups, the expert table
+    bool layer_state(Dev& d, Layer& l, std::string& err, size_t* acct) {
+        if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
+        if (spec_bufs() && !l.mtp) {   // (a verify window's backups: the rows and states a rejected draft undoes)
+            // (--parallel: a multi step's verify windows share the window's rows - the ring's backups and the
+            //  compressor's rows by row - and each its own compressor snapshot, one a conversation)
+            if (!dalloc(d, l.ring_bak, (size_t) kWin * win_rb(), err)) return false;
+            if (l.kv_src && l.ratio > 1 &&
+                (!dalloc(d, l.c_snap, (size_t) 2 * l.ratio * g.hd * (size_t) std::max(1, o.seqs), err) ||
+                 !dalloc(d, l.c_rows, (size_t) 2 * kWin * g.hd, err)))
+                return false;
+        }
+        return dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct);
+    }
     bool load_dense(int di, std::string& err) {
         Dev& d = devs[(size_t) di];
         cudaSetDevice(d.id);
@@ -6791,7 +6805,10 @@ struct Model::Impl {
           for (int mi = 0; mi < l0.nm; ++mi) {
             Layer& l = member(l0, mi);
             if (l.dev != di) continue;
-            if (part_srv && away(l.il) && std::getenv("MAYA_POOL_SKIP_DENSE")) continue;   // (a part server: the front's layers' weights - experimental: a later layer still reads one)
+            if (part_srv && away(l.il) && part_skip_dense()) {   // (a part server: the front's layers' weights stay on
+                if (!layer_state(d, l, err, acct)) return false;    //  disk; their state buffers - every loop over the
+                continue;                                           //  layers (reset, undo, checkpoints) touches them)
+            }
             // (a group's member: its share of the heads (wq_b columns, the sinks), of wo_a's groups and wo_b's rows,
             // of the shared expert's FFN; the rest whole)
             const int nm = l0.nm, na = g.heads / std::max(1, l.ahn), ha = l.ah0 / std::max(1, l.ahn);
@@ -6872,17 +6889,7 @@ struct Model::Impl {
                     l.eg_w = qw;
                 }
             }
-            if (!dalloc(d, l.win, (size_t) g.win * win_rb(), err, &d.caches)) return false;
-            if (spec_bufs() && !l.mtp) {   // (a verify window's backups: the rows and states a rejected draft undoes)
-                // (--parallel: a multi step's verify windows share the window's rows - the ring's backups and the
-                //  compressor's rows by row - and each its own compressor snapshot, one a conversation)
-                if (!dalloc(d, l.ring_bak, (size_t) kWin * win_rb(), err)) return false;
-                if (l.kv_src && l.ratio > 1 &&
-                    (!dalloc(d, l.c_snap, (size_t) 2 * l.ratio * g.hd * (size_t) std::max(1, o.seqs), err) ||
-                                                !dalloc(d, l.c_rows, (size_t) 2 * kWin * g.hd, err)))
-                    return false;
-            }
-            if (!dalloc(d, l.vram_tab, (size_t) l.n_exp, err, acct)) return false;
+            if (!layer_state(d, l, err, acct)) return false;
             if (nm > 1) d.tp_w += (d.weights - w0) / (size_t) nm * (size_t) (nm - 1);
             d.weights += sp;
           }
@@ -16602,6 +16609,11 @@ struct Model::Impl {
         int n = 0;
         for (const x3::MvJob& x : jobs) j[n++] = x;
         if (!mv_any(j, n, d.st)) {
+            for (int i = 0; i < n; ++i)   // (which weight: a pool part without a layer's weights shows k / n 0)
+                std::fprintf(stderr, "ds4 mv: job %d k %d n %d fmt %d type %d raw %p ncol %d xf %p y %p\n", i,
+                             j[i].m ? j[i].m->k : -1, j[i].m ? j[i].m->n : -1, j[i].m ? j[i].m->fmt : -1,
+                             j[i].m ? j[i].m->gg_type : -1, j[i].m ? j[i].m->raw : nullptr, j[i].ncol,
+                             (const void*) j[i].xf, (void*) j[i].y);
             err = "exl3 mv failed";
             return false;
         }
@@ -16768,6 +16780,7 @@ struct Model::Impl {
         dq_seed = seed;
         dq_counter = counter;
         const bool ok = draft_(y, out, conf, err, max_n, conf_min, cum_min, min_n);
+        pp_mark(11);
         if (!ok) drafts_q = false;
         if (max_drafts > 0 && (int) out.size() > max_drafts) {
             out.resize((size_t) max_drafts);
@@ -16870,6 +16883,7 @@ struct Model::Impl {
                 CK(cudaMemcpyAsync(h_dump + (size_t) i * hs, db.h, hs * 4, cudaMemcpyDeviceToHost, db.st));
             }
         }
+        pp_mark(6);
         Dev& dl = devs[(size_t) cur];   // the last block's device: the drafts' rows
         cudaSetDevice(dl.id);
         hc_pre_norm(dl.h, dl.pre, nullptr, D, H, T, g.eps, dl.x, dl.st);   // (the confidence head reads it before the norm)
@@ -16931,6 +16945,7 @@ struct Model::Impl {
             finish(e.ao, T, D, D, fn, e.st);
             if (!lazy && !head_share(e, m, e.ao, T, err, !mk)) return false;
         }
+        pp_mark(7);
         h_idx[0] = y;
         strata::kernels::SamplerParams sp;
         sp.greedy = true;
@@ -17021,6 +17036,7 @@ struct Model::Impl {
             CK(cudaMemcpyAsync(h_w, d_confv, (size_t) T * 4, cudaMemcpyDeviceToHost, hd.st));
             CK(cudaStreamSynchronize(hd.st));
         }
+        pp_mark(8);
         int tok[kWin + 1];
         float cf[kWin];
         for (int i = 0; i <= T; ++i) tok[i] = h_idx[i];
@@ -17452,6 +17468,7 @@ struct Model::Impl {
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
+        pp_mark(2);
         Dev& hd = devs[(size_t) head_dev];
         cudaSetDevice(hd.id);
         int m = 0;
@@ -17510,9 +17527,12 @@ struct Model::Impl {
             tk[m] = next;
             lp_pick(hd.logits, m + 1, tk, p0 + 1);
         }
+        pp_mark(3);
         drafts_q = false;
         rollback(p0, T, m + 1);
+        pp_mark(4);
         if (!seed_drafter(p0, m + 1, 0, err)) return false;
+        pp_mark(5);
         accepted = m;
         st.drafts_offered += n;
         st.drafts_accepted += m;
@@ -17554,7 +17574,7 @@ struct Model::Impl {
             for (int m = 0; m < L[(size_t) il].nm; ++m) {
                 Layer& l = member(L[(size_t) il], m);
                 Dev& d = devs[(size_t) l.dev];
-                if (l.c_snap == nullptr) continue;
+                if (l.c_snap == nullptr || away(l.il)) continue;   // (the pool: another PC's layer - its compressor is not here)
                 CompBatch& b = cb[(size_t) l.dev];
                 if (b.n == kMaxRingBatch) {   // (more than a batch takes: this one alone)
                     cudaSetDevice(d.id);
@@ -21045,6 +21065,7 @@ struct Model::Impl {
         cudaSetDevice(d.id);
         const int D = g.dim, H = g.hc;
         if (n_logits <= 0) return true;
+        pp_mark(12);
         const int t0 = T - n_logits;
         hc_pre_norm(d.h + (size_t) t0 * H * D, d.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, d.st);
         return head_share(d, d.mi, d.x, n_logits, err);
@@ -22607,7 +22628,7 @@ struct Model::Impl {
                         b.ring[b.n] = q.win[k];
                         b.bak[b.n++] = bak;
                     }
-                    if (l.c_snap == nullptr) continue;
+                    if (l.c_snap == nullptr || away(l.il)) continue;
                     const int R = l.ratio;
                     float* sn = l.c_snap + (size_t) i * 2 * R * g.hd;   // (run i's snapshot: attn_core's snap)
                     float* rows = l.c_rows + (size_t) r.r0 * g.hd;

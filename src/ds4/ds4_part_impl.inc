@@ -27,6 +27,21 @@ double part_busy_ms = 0;     // a part: its time on the calls since its last ans
 double part_busy_total = 0;
 int64_t part_waits = 0, part_pre_hits = 0;
 int64_t part_rounds = 0, part_tx_bytes = 0;
+// DS4_POOL_PROF (a part server): every step of a call waits for the GPU and adds its time to a slot; the session's end
+// prints them (the waits cost a little - for measuring only)
+bool pp_on = false;
+double pp_t = 0, pp_ms[16] = {};
+int64_t pp_n[16] = {};
+int pp_redirect = -1;   // (a run of chunks: every step into its own slot)
+void pp_mark(int s) {
+    if (!pp_on) return;
+    cudaDeviceSynchronize();
+    const double t = now_ms();
+    const int k = pp_redirect >= 0 ? pp_redirect : s;
+    pp_ms[k] += t - pp_t;
+    ++pp_n[k];
+    pp_t = t;
+}
 struct PartSrc {
     int sidx = -1;
 };
@@ -91,6 +106,15 @@ struct PreDraft {
 
 // ---- common
 bool away(int il) const { return il < g.nl && (il < part_lo || il >= part_hi); }
+// a part server leaves the front's layers' dense weights on disk (~5 GB of VRAM for experts; MAYA_POOL_SKIP_DENSE=0:
+// loads them)
+static bool part_skip_dense() {
+    static const bool on = [] {
+        const char* e = std::getenv("MAYA_POOL_SKIP_DENSE");
+        return e == nullptr || std::atoi(e) != 0;
+    }();
+    return on;
+}
 bool part_link() const { return pc != nullptr && pc->ok() && part_hi < g.nl; }
 size_t part_hand_row() const { return (size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4; }
 void part_src_list(int K) {
@@ -779,8 +803,9 @@ bool part_reply_send(int32_t st, const std::string& msg, const part::Writer* w =
     else {
         h.put<double>(part_busy_ms);
         part_busy_ms = 0;
+        if (w != nullptr) h.put_bytes(w->b.data(), w->b.size());   // (one send: the answer in the header's packet)
     }
-    return pc->send_frame(part::kReply, h.b.data(), h.b.size(), w ? w->b.data() : nullptr, w ? w->b.size() : 0);
+    return pc->send_frame(part::kReply, h.b.data(), h.b.size());
 }
 // the part server's loop: one front at a time; each connection starts from an empty conversation
 bool part_serve(int port, std::string& err) {
@@ -799,7 +824,19 @@ bool part_serve(int port, std::string& err) {
         std::thread rd([this] { part_reader_loop(); });
         const Stats s0 = st;
         const double tb0 = part_busy_total;
+        pp_on = std::getenv("DS4_POOL_PROF") != nullptr;
+        for (int i = 0; i < 16; ++i) pp_ms[i] = 0, pp_n[i] = 0;
+        pp_t = now_ms();
         std::string why = part_session();
+        if (pp_on) {
+            static const char* nm[16] = {"idle", "win fwd", "verify fwd", "verify pick", "rollback", "seed",
+                                         "draft blocks", "draft head", "draft picks", "reply", "sample", "draft rest",
+                                         "fwd layers", "prompt runs", "", ""};
+            for (int i = 0; i < 16; ++i)
+                if (pp_n[i] > 0)
+                    std::fprintf(stderr, "ds4 pool prof: %-12s n=%6lld %9.1f ms %7.3f ms each\n", nm[i],
+                                 (long long) pp_n[i], pp_ms[i], pp_ms[i] / (double) pp_n[i]);
+        }
         std::fprintf(stderr, "ds4 pool: the session: busy %.0f ms; layers %.0f ms (head wait %.0f), %lld tokens; drafting "
                      "%.0f ms in %lld drafts; verify windows %.0f ms\n", part_busy_total - tb0, st.layer_ms - s0.layer_ms,
                      st.head_ms - s0.head_ms, (long long) (st.tokens - s0.tokens), st.draft_ms - s0.draft_ms,
@@ -826,6 +863,7 @@ std::string part_session() {
         }
         const uint32_t op = m.first;
         if (op == part::kBye) return "the link closed";
+        pp_mark(0);
         const double t_op = now_ms();
         part::Reader r(m.second);
         std::string err;
@@ -869,6 +907,7 @@ std::string part_session() {
                 part_cur = &pr;
                 ok = forward(t.data(), T, lr, err, sr);
                 part_cur = nullptr;
+                pp_mark(1);
             }
             break;
         }
@@ -910,6 +949,7 @@ std::string part_session() {
             const uint64_t seed = r.get<uint64_t>(), counter = r.get<uint64_t>();
             if (fail.empty()) {
                 const int x = sample(t, tp, tk, mp, seed, counter);
+                pp_mark(10);
                 if (x < 0) ok = false, err = "the sample failed";
                 w.put<int32_t>(x);
                 part_predraft(x, w, err);
@@ -947,6 +987,7 @@ std::string part_session() {
             break;
         }
         case part::kChunks: {
+            pp_redirect = 13;
             FeedPlan fp;
             const bool whole = r.get<uint8_t>() != 0;
             fp.at = r.get<int64_t>();
@@ -1073,6 +1114,8 @@ std::string part_session() {
         if (reply && !pc->ok()) return "the link closed";
         if (reply && !part_reply_send(fail.empty() ? 0 : 1, fail, fail.empty() ? &w : nullptr))
             return "the link closed while answering";
+        if (reply) pp_mark(9);
+        pp_redirect = -1;
     }
 }
 // the part: the next round's drafts after token y, with the last draft call's arguments, into an answer (n -1: none) -
@@ -1081,8 +1124,13 @@ void part_predraft(int y, part::Writer& w, std::string& err) {
     std::vector<int> nd;
     std::vector<float> nc;
     const DraftArgs& a = part_dargs;
+    // (with the last call's cut: the lazy head makes only the rows that cut can keep - none at a cut first draft, the
+    //  head's 5 rows a third of a round; MAYA_POOL_FULL_DRAFT=1: the whole block, cut by the front alone)
+    static const bool full = std::getenv("MAYA_POOL_FULL_DRAFT") != nullptr;
     if (a.set && g.n_mtp > 0 && y >= 0 &&
-        draft(y, nd, nc, err, a.t, a.tp, a.tk, a.mp, a.seed, a.counter, 0, 0.0f, 0.0f, 0)) {
+        (full ? draft(y, nd, nc, err, a.t, a.tp, a.tk, a.mp, a.seed, a.counter, 0, 0.0f, 0.0f, 0)
+              : draft(y, nd, nc, err, a.t, a.tp, a.tk, a.mp, a.seed, a.counter, a.max_n, a.conf_min, a.cum_min,
+                      a.min_n))) {
         w.put<int32_t>((int32_t) nd.size());
         w.put<uint8_t>(drafts_q ? 1 : 0);
         for (int x : nd) w.put<int32_t>(x);
