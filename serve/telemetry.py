@@ -57,7 +57,9 @@ class _Reader:
         self.lock = threading.Lock()
         self.skip: set = set()        # the calls that crashed or hung a reader
         self.crashes = 0
-        self.off = False              # no NVML here (no NVIDIA driver), or the reader crashed too often
+        # A reader process can contain a userspace crash, not a driver/GPU failure. Allow the owner to opt out
+        # before the first NVML call while investigating such failures; all other hardware readings remain.
+        self.off = os.environ.get("MAYA_GLM_NVML", os.environ.get("STRATA_GLM_NVML", "1")) == "0"
         self.proc = None
         self.lines = None
         self.pump = None

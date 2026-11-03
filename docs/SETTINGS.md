@@ -12,6 +12,16 @@ server settings under `MAYA_GLM_RESPONSES_*`, with defaults and units in
 [Responses settings](RESPONSES.md#settings-and-metrics). They can be set in the same
 config `env` block; response storage and background work remain request opt-ins.
 
+**GPU monitoring.** `MAYA_GLM_NVML=0` disables this server's NVIDIA NVML reader before it makes any driver calls
+(default `1`; the earlier name `STRATA_GLM_NVML` also works). It can be set in the config's `env` block. Use it
+to isolate monitoring when investigating a driver hang or a GPU disconnect. The Monitor tab still reads the CPU,
+RAM and disk; NVIDIA temperature, utilization, power, PCIe and per-process VRAM readings are unavailable. The
+server's GPU-busy stall hint is also unavailable, and model reloads use the existing five-second fallback wait
+for GPU memory release. Engine logs and inference timings remain available. This does not disable monitoring in
+other applications and does not repair a driver or hardware fault. NVIDIA's
+[580.196.07 notes](https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-580-196-07/index.html) describe a
+related extended-PCI monitoring fix; a subprocess can isolate a reader crash, but cannot contain a GPU disconnect.
+
 The engine sizes itself: it splits the layers across the GPUs it is given (up to 16; with more than two, each GPU
 takes layers in proportion to its free VRAM), fills each GPU's free VRAM with experts, sizes its RAM tier from the
 free RAM, and measures the CPU against the PCIe link at start to decide how many RAM experts the CPU computes itself.
@@ -46,6 +56,7 @@ These settings change what the engine chooses (put them in the config with `--en
 
 | Setting | Default | |
 | --- | --- | --- |
+| `MAYA_GLM_NVML` | `1` | Set `0` to stop this server from calling NVIDIA NVML while diagnosing driver faults. CPU/RAM/disk monitoring remains; GPU readings, the GPU-busy stall hint and NVML-based release checks are unavailable. See **GPU monitoring** above. |
 | `MAYA_GLM_EXPERT_HELPER` | unset (off) | Experimental native-GGUF expert helper: the visible GPU index (`1`, not a Boolean). GPU 0 keeps the trunk and MTP; the helper owns a complementary expert cache, with heat-coordinated replacement and GPU quantization/reduction. Alone: `MAYA_GLM_SPLIT=0`, without `--layer-split`. Beside a layer split (`MAYA_GLM_SPLIT=auto` or boundaries): the helper's device is left out of the split and each part owns its own share of the helper over its own layers - two cards and a Ryzen AI Max APU as the unified-memory helper; `MAYA_GLM_DEVS` may name the split's devices (never the helper's). Unset this variable to disable. UMA helpers alias the pinned RAM tier; discrete helpers use their VRAM. See [AMD helper setup and scope](AMD_MAYA.md#experimental-expert-helper) |
 | `MAYA_GLM_HELPER_CHECK` | unset (off) | A load-time self-check of the expert helper, on a sample: of every MoE layer it serves, up to N (1-8) of its experts - their RAM-tier bytes against the pack's, then their weighted sum on a fixed input by the helper and by the part's own GPU with the same kernels. A differing byte or a sum beyond 1e-5 relative fails the start; a layer split checks each part's helper once all of them are open. One `glm helper check:` line per part, counting its MoE layers, those holding helper experts and those checked (or saying NO helper / NO expert) |
 | `MAYA_GLM_HELPER_ZEROCOPY` | on for an integrated helper | An integrated (unified-memory) expert helper reads each call's input and plan from, and writes its result into, one mapped pinned block - four copies fewer a call; `0` makes the copies (a discrete helper always copies). With `MAYA_GLM_PROF` set, each helper prints a `glm helper prof` line at the end: its calls, experts a call, host time (enqueue, wait, the result's copy), each stage's GPU time and the bandwidth its kernels read the experts at |
