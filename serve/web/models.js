@@ -731,7 +731,8 @@ function Download() {
     const mine = p && p.model === c.id && (busy || p.state === "error");
     const pct = mine && p.percent != null ? p.percent : null;
     return html`<div class="mdl-dl" key=${c.id}>
-      <span class="mdl-dl__name"><b>${c.name}</b><span>${c.size_gb ? `about ${fmt(c.size_gb, 0)} GB` : "size shown when it starts"}</span></span>
+      <span class="mdl-dl__name"><b>${c.name}</b><span>${[c.group === "other" && c.by ? `by ${c.by}` : "",
+        c.size_gb ? `about ${fmt(c.size_gb, 0)} GB` : "size shown when it starts", c.note || ""].filter(Boolean).join(" · ")}</span></span>
       ${c.installed ? html`<span class="pill pill--accent">Installed</span>`
         : mine && busy ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${cancelPull}>Cancel</button>`
         : html`<button type="button" class="btn btn--secondary btn--sm" disabled=${busy} onClick=${() => startPull(c)}><${Icon} name="download" sm/>Download</button>`}
@@ -745,7 +746,11 @@ function Download() {
   return html`<section class="card mdl-add" aria-label="Download a model">
     <b>Download a model</b>
     <span>The setup's own download: it resumes where it stopped, checks every file's sha256, then builds the pack and writes the model's config, which appears in the list.</span>
-    ${MS.catErr ? html`<div class="mdl-warn mdl-warn--err" role="alert">${MS.catErr}</div>` : !C ? html`<span role="status">Reading the catalog…</span>` : C.models.map(row)}
+    ${MS.catErr ? html`<div class="mdl-warn mdl-warn--err" role="alert">${MS.catErr}</div>` : !C ? html`<span role="status">Reading the catalog…</span>`
+      : html`${C.models.filter((c) => c.group !== "other").map(row)}
+        ${C.models.some((c) => c.group === "other") ? html`<b class="mdl-add__group">Other quants</b>
+          <span>Files by other makers that the setup also downloads and runs: the same download, checks and pack.</span>
+          ${C.models.filter((c) => c.group === "other").map(row)}` : null}`}
   </section>`;
 }
 

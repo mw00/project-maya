@@ -4926,7 +4926,8 @@ def make_handler(svc: Service):
             elif path == "/api/ps":
                 self._json(200, self._mapi_ps())
             elif path == "/api/catalog":
-                self._json(200, {"models": model_pull.catalog(svc.models_root()), "pull": svc.pull_slot().snapshot(),
+                run = models.read(Path(svc.config_path)) if svc.config_path else None   # (its backend: the files offered)
+                self._json(200, {"models": model_pull.catalog(svc.models_root(), cfg=run), "pull": svc.pull_slot().snapshot(),
                                  "restarts": bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))})
             elif path == "/api/pull/status":
                 self._json(200, {"pull": svc.pull_slot().snapshot()})

@@ -7,6 +7,7 @@
 /* adding a model: the setup's command */
 .mdl-add { gap: 10px; padding: 16px 18px; }
 .mdl-add > span { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.mdl-add__group { margin-top: 10px; font-size: var(--st-fs-base); }
 .mdl-add__cmd { display: flex; align-items: center; gap: 12px; padding: 6px 6px 6px 14px; border-radius: var(--st-r-row); background: var(--st-code-bg);
                 color: var(--st-code-ink); font-size: var(--st-fs-sm); }
 .mdl-add__cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
