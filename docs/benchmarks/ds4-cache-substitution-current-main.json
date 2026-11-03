@@ -1,0 +1,169 @@
+{
+  "scope": "Current-main bounded throughput smoke:2prompts x4loads,512token capped,greedy; no quality score. Prefill peer AR off identically; no #748 patch. Earlier complete-answer quality results are separate.",
+  "base": "3c935e411cd6625a9af0f292dd0af52598e866d8",
+  "validated_code_commit": "90f91d69b1f7bfc96f7b113b5aacf32403d4d7e2",
+  "policy": {
+    "ratio": 0.1,
+    "candidates": 12,
+    "normalization": "reference",
+    "mass_budget": 0.6
+  },
+  "full_model": {
+    "time": 1793735867.6709228,
+    "passed": true,
+    "stock_off_logits_bitexact": true,
+    "stock_off_generated_tokens_identical": true,
+    "enabled_prefill_bitexact": true,
+    "active_decode_picks": 7440,
+    "substitutions": 1733,
+    "prefill_substitution_picks": 0
+  },
+  "multiple_conversations": {
+    "conversations": 2,
+    "tokens_per_conversation": 8,
+    "logit_rows_bitexact": 14,
+    "MTP_modes_passed": 3
+  },
+  "API_ABBA": {
+    "0": {
+      "answers": 4,
+      "tokens": 2048,
+      "decode_ms": 56495.8,
+      "pooled_decode_tps": 36.25048233674008,
+      "wall_seconds": 60.658655643463135,
+      "all_completion_limited": true,
+      "helper_failures": false,
+      "per_answer_tps": [
+        32.3,
+        40.2,
+        33.5,
+        40.6
+      ]
+    },
+    "0.1": {
+      "answers": 4,
+      "tokens": 2048,
+      "decode_ms": 33645.5,
+      "pooled_decode_tps": 60.86995289117415,
+      "wall_seconds": 37.76111030578613,
+      "all_completion_limited": true,
+      "helper_failures": false,
+      "per_answer_tps": [
+        55.5,
+        61.0,
+        57.1,
+        72.5
+      ]
+    }
+  },
+  "API_decode_speedup": 0.6791487717525373,
+  "sampling": {
+    "temperature": 0,
+    "top_p": 1,
+    "top_k": 64,
+    "max_tokens": 512,
+    "reasoning_effort": "none"
+  },
+  "prompts": [
+    "Write a complete Python module implementing a thread-safe bounded LRU cache with get, put, delete, clear, and useful unit tests. Return only Python code.",
+    "Write a complete Python module that parses JSON-RPC responses, validates identifiers, raises typed exceptions for remote errors, and includes table-driven unit tests. Return only Python code."
+  ],
+  "answers": [
+    {
+      "label": "off-A",
+      "prompt_index": 0,
+      "ratio": 0,
+      "tokens": 512,
+      "decode_ms": 15858.5,
+      "wall_seconds": 16.9409339427948,
+      "finish_reason": "length",
+      "cache_substituted": 0,
+      "sub_picks": 0,
+      "CPU_experts_per_target_row": 83.154
+    },
+    {
+      "label": "off-A",
+      "prompt_index": 1,
+      "ratio": 0,
+      "tokens": 512,
+      "decode_ms": 12726.3,
+      "wall_seconds": 13.746577024459839,
+      "finish_reason": "length",
+      "cache_substituted": 0,
+      "sub_picks": 0,
+      "CPU_experts_per_target_row": 51.63
+    },
+    {
+      "label": "on-A",
+      "prompt_index": 0,
+      "ratio": 0.1,
+      "tokens": 512,
+      "decode_ms": 9223.8,
+      "wall_seconds": 10.29245376586914,
+      "finish_reason": "length",
+      "cache_substituted": 27790.0,
+      "sub_picks": 134160.0,
+      "CPU_experts_per_target_row": 34.327
+    },
+    {
+      "label": "on-A",
+      "prompt_index": 1,
+      "ratio": 0.1,
+      "tokens": 512,
+      "decode_ms": 8394.5,
+      "wall_seconds": 9.443726539611816,
+      "finish_reason": "length",
+      "cache_substituted": 23520.0,
+      "sub_picks": 139920.0,
+      "CPU_experts_per_target_row": 17.973
+    },
+    {
+      "label": "on-B",
+      "prompt_index": 0,
+      "ratio": 0.1,
+      "tokens": 512,
+      "decode_ms": 8969.8,
+      "wall_seconds": 10.00263261795044,
+      "finish_reason": "length",
+      "cache_substituted": 26777.0,
+      "sub_picks": 134880.0,
+      "CPU_experts_per_target_row": 24.795
+    },
+    {
+      "label": "on-B",
+      "prompt_index": 1,
+      "ratio": 0.1,
+      "tokens": 512,
+      "decode_ms": 7057.4,
+      "wall_seconds": 8.022297382354736,
+      "finish_reason": "length",
+      "cache_substituted": 19116.0,
+      "sub_picks": 130080.0,
+      "CPU_experts_per_target_row": 11.574
+    },
+    {
+      "label": "off-B",
+      "prompt_index": 0,
+      "ratio": 0,
+      "tokens": 512,
+      "decode_ms": 15292.4,
+      "wall_seconds": 16.349743366241455,
+      "finish_reason": "length",
+      "cache_substituted": 0,
+      "sub_picks": 0,
+      "CPU_experts_per_target_row": 83.121
+    },
+    {
+      "label": "off-B",
+      "prompt_index": 1,
+      "ratio": 0,
+      "tokens": 512,
+      "decode_ms": 12618.6,
+      "wall_seconds": 13.621401309967041,
+      "finish_reason": "length",
+      "cache_substituted": 0,
+      "sub_picks": 0,
+      "CPU_experts_per_target_row": 52.337
+    }
+  ]
+}

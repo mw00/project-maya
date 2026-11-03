@@ -62,7 +62,8 @@ The feature refuses `DS4_SYNC` and resident/RAM/disk expert skipping combination
 uses the unfused router rather than silently bypassing substitution through `DS4_ROUTE_FUSE`; lookahead is
 still published. No predictor, prefetch policy, cache eviction rule, weights or global defaults are changed.
 The same request and cache history matters: residency-dependent routing is not reproducible from a sampling
-seed alone.
+seed alone. Batching and verification windows can also change those choices; speculative decoding does
+not make this policy equivalent to the native model or a token-at-a-time cache history.
 
 Native `STAT` counters, when active: `sub_picks`, `cache_substituted`, `sub_demand_gpu`, `sub_executed_gpu`,
 `sub_removed_mass`, `sub_executed_mass`. GPU fractions compare original demand with executed picks; mass fields
@@ -100,3 +101,29 @@ invariants. `ds4_route_sub_test` needs a CUDA/HIP GPU but no model: it compares 
 selector, checks bit-identical native/off routing, helper eligibility, reference mass, vision bias, windows
 of 1/4/16 rows and different expert counts. Full-model integration checks and current-main performance
 measurements must be reported separately from the earlier research result above.
+
+## Current-main port validation
+
+On `3c935e411cd6625a9af0f292dd0af52598e866d8` (v1.1.52), with the same source model/quant and three R9700s:
+
+- Pristine upstream versus port disabled: all **83 x 129,280** saved FP32 logits were finite and bit-identical;
+  32 generated token IDs matched. This includes 81 prompt rows and the last target verification window.
+- Port enabled: all 81 prompt rows remained bit-identical; 1,733 of 7,440 decode picks were substituted,
+  with zero eligible prefill picks.
+- The native two-conversation check at context 4,096 passed: 14/14 logits rows bit-identical alone/together,
+  with the same generated tokens in each of three MTP modes (serial, separate drafts, one-pass drafts).
+- Two short API prompts, independent model loads in off/on/on/off order, greedy, a **512-token cap per answer**:
+  pooled decode **36.25 -> 60.87 tok/s (+67.9%)**. All eight responses reached the cap. This is a small
+  throughput smoke test, **not** completed-answer quality evidence or a general speedup estimate.
+
+[Current-main measurements](benchmarks/ds4-cache-substitution-current-main.json) retain the prompts, timings,
+counts and test configuration. Each load starts from identical profile/LT copies; ordinary adaptive expert
+caching and MTP remain on for the API check. Both arms disable the prompt peer all-reduce identically, avoiding
+the unrelated startup-probe drain issue tracked in #748; that patch is not included here. Other performance
+settings remain the same in both arms. Normal serving was restored and its executable, configuration,
+environment and health independently verified.
+
+Local operator checks: 20,000 randomized CPU selector cases plus parser/protection/fallback cases passed,
+including ASan/UBSan. The GPU test passed 2,916 cases on two R9700s, including native/off bit parity.
+`tools/check_hip_compat.py` and all 48 dashboard tests passed. CUDA execution has not been measured on this
+workstation. Model integration tests are bounded diagnostics, not proof for all contexts, batches or workloads.
