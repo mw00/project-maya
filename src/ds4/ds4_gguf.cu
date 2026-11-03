@@ -527,7 +527,7 @@ __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
     pdl_wait();
     pdl_trigger();
     extern __shared__ __align__(16) uint8_t tc_sm[];
-    constexpr int R = 16 * MT;
+    constexpr int R = 16 * MT, NT = NC > 8 ? 2 : 1;   // (NT: 8-column tiles, 9..16 columns two)
     const BfJob& b = J.j[blockIdx.y];
     const int row0 = blockIdx.x * R;
     if (row0 >= b.n) return;
@@ -553,14 +553,16 @@ __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) cls[i] = (int) (__brev((unsigned) (4 * warp + i)) >> 27);
     const bool al = (cls[0] & 1) != 0;   // (the classes of a warp share their parity)
-    float acc[4][MT][4];
+    float acc[4][MT][NT][4];
 #pragma unroll
     for (int i = 0; i < 4; ++i)
 #pragma unroll
         for (int m = 0; m < MT; ++m)
 #pragma unroll
-            for (int e = 0; e < 4; ++e) acc[i][m][e] = 0.0f;
-    const uint32_t* xq = (const uint32_t*) (b.xq + (size_t) g * b.k) + t;
+            for (int n = 0; n < NT; ++n)
+#pragma unroll
+                for (int e = 0; e < 4; ++e) acc[i][m][n][e] = 0.0f;
+    const uint32_t* xq = (const uint32_t*) (b.xq + (size_t) g * b.k) + t;   // (tile n: + 8 n k bytes)
     // a class's place in chunk ch (-1: none) - CH 32 every class, CH 16 the half (c >> 4) == (ch & 1)
     auto where = [&](int ch, int c) {
         const int nbk = min(CH, nb - ch * CH);
@@ -569,31 +571,36 @@ __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
         return j < nbk ? j : -1;
     };
     // the activations of a chunk's classes, a chunk ahead (registers)
-    uint32_t B0[4], B1[4];
-    float X0[4], X1[4];
+    uint32_t B0[4][NT], B1[4][NT];
+    float X0[4][NT], X1[4][NT];
     auto ldB = [&](int ch) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const int j = ch < nch ? where(ch, cls[i]) : -1;
-            B0[i] = B1[i] = 0u;
-            X0[i] = X1[i] = 0.0f;
-            if (j < 0) continue;
-            const int kb = ch * CH + j;
-            if (g < ncol) {
-                B0[i] = xq[kb * 8];
-                B1[i] = xq[kb * 8 + 4];
+#pragma unroll
+            for (int n = 0; n < NT; ++n) {
+                B0[i][n] = B1[i][n] = 0u;
+                X0[i][n] = X1[i][n] = 0.0f;
+                if (j < 0) continue;
+                const int kb = ch * CH + j, c0 = 8 * n;
+                if (c0 + g < ncol) {
+                    B0[i][n] = xq[(size_t) c0 * (b.k / 4) + kb * 8];
+                    B1[i][n] = xq[(size_t) c0 * (b.k / 4) + kb * 8 + 4];
+                }
+                if (c0 + 2 * t < ncol) X0[i][n] = b.xd[(size_t) (c0 + 2 * t) * nb + kb];
+                if (c0 + 2 * t + 1 < ncol) X1[i][n] = b.xd[(size_t) (c0 + 2 * t + 1) * nb + kb];
             }
-            if (2 * t < ncol) X0[i] = b.xd[(size_t) (2 * t) * nb + kb];
-            if (2 * t + 1 < ncol) X1[i] = b.xd[(size_t) (2 * t + 1) * nb + kb];
         }
     };
     ldB(0);
     for (int ch = 0; ch < nch; ++ch) {
         issue(ch + STG - 1);
-        uint32_t b0r[4], b1r[4];
-        float x0r[4], x1r[4];
+        uint32_t b0r[4][NT], b1r[4][NT];
+        float x0r[4][NT], x1r[4][NT];
 #pragma unroll
-        for (int i = 0; i < 4; ++i) b0r[i] = B0[i], b1r[i] = B1[i], x0r[i] = X0[i], x1r[i] = X1[i];
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int n = 0; n < NT; ++n) b0r[i][n] = B0[i][n], b1r[i][n] = B1[i][n], x0r[i][n] = X0[i][n], x1r[i][n] = X1[i][n];
         ldB(ch + 1);
         tc_wait<STG - 1>();
         __syncthreads();
@@ -602,8 +609,6 @@ __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
         for (int i = 0; i < 4; ++i) {
             const int c = where(ch, cls[i]);
             if (c < 0) continue;   // (warp-uniform)
-            const uint32_t b0 = b0r[i], b1 = b1r[i];
-            const float xs0 = x0r[i], xs1 = x1r[i];
 #pragma unroll
             for (int m = 0; m < MT; ++m) {
                 const uint8_t* ra = st + (m * 16 + g) * kTcStr + c * 34;
@@ -617,43 +622,51 @@ __global__ void __launch_bounds__(256) q8_mv_tc_kernel(const BfJobs J) {
                     a2 = tc_ld32<false>(ra + 18 + 4 * t); a3 = tc_ld32<false>(rb + 18 + 4 * t);
                 }
                 const float dw0 = __half2float(*(const __half*) ra), dw1 = __half2float(*(const __half*) rb);
-                int d0, d1, d2, d3;
-                asm volatile(
-                    "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
-                    "{%10,%10,%10,%10};\n"
-                    : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
-                    : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(0));
-                acc[i][m][0] = fmaf(dw0 * xs0, (float) d0, acc[i][m][0]);
-                acc[i][m][1] = fmaf(dw0 * xs1, (float) d1, acc[i][m][1]);
-                acc[i][m][2] = fmaf(dw1 * xs0, (float) d2, acc[i][m][2]);
-                acc[i][m][3] = fmaf(dw1 * xs1, (float) d3, acc[i][m][3]);
+#pragma unroll
+                for (int n = 0; n < NT; ++n) {
+                    int d0, d1, d2, d3;
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                        "{%10,%10,%10,%10};\n"
+                        : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3)
+                        : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0r[i][n]), "r"(b1r[i][n]), "r"(0));
+                    const float xs0 = x0r[i][n], xs1 = x1r[i][n];
+                    acc[i][m][n][0] = fmaf(dw0 * xs0, (float) d0, acc[i][m][n][0]);
+                    acc[i][m][n][1] = fmaf(dw0 * xs1, (float) d1, acc[i][m][n][1]);
+                    acc[i][m][n][2] = fmaf(dw1 * xs0, (float) d2, acc[i][m][n][2]);
+                    acc[i][m][n][3] = fmaf(dw1 * xs1, (float) d3, acc[i][m][n][3]);
+                }
             }
         }
         __syncthreads();
     }
     tc_wait<0>();
     __syncthreads();
-    float* red = (float*) tc_sm;   // [warp][row][8 columns]
+    constexpr int CW = 8 * NT;
+    float* red = (float*) tc_sm;   // [warp][row][CW columns]
 #pragma unroll
     for (int m = 0; m < MT; ++m)
 #pragma unroll
-        for (int e = 0; e < 4; ++e) {
-            const int row = m * 16 + g + (e >= 2 ? 8 : 0), col = 2 * t + (e & 1);
-            red[(warp * R + row) * 8 + col] = (acc[0][m][e] + acc[1][m][e]) + (acc[2][m][e] + acc[3][m][e]);
-        }
+        for (int n = 0; n < NT; ++n)
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                const int row = m * 16 + g + (e >= 2 ? 8 : 0), col = 8 * n + 2 * t + (e & 1);
+                red[(warp * R + row) * CW + col] =
+                    (acc[0][m][n][e] + acc[1][m][n][e]) + (acc[2][m][n][e] + acc[3][m][n][e]);
+            }
     __syncthreads();
-    for (int i = tid; i < R * 8; i += 256) {
-        const int row = i >> 3, col = i & 7;
+    for (int i = tid; i < R * CW; i += 256) {
+        const int row = i / CW, col = i % CW;
         if (row >= nr || col >= ncol) continue;
         float p[8];
 #pragma unroll
-        for (int w = 0; w < 8; ++w) p[w] = red[(w * R + row) * 8 + col];
+        for (int w = 0; w < 8; ++w) p[w] = red[(w * R + row) * CW + col];
         const float v = ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]));
         b.y[col * b.ycs + row0 + row] = b.alpha * v + (b.bias != nullptr ? b.bias[row0 + row] : 0.0f);
     }
 }
 template <int MT, int STG, int CH>
-constexpr int q8_tc_smem() { return STG * 16 * MT * tc_str<CH>() > 8 * 16 * MT * 8 * 4 ? STG * 16 * MT * tc_str<CH>() : 8 * 16 * MT * 8 * 4; }
+constexpr int q8_tc_smem() { return STG * 16 * MT * tc_str<CH>() > 8 * 16 * MT * 16 * 4 ? STG * 16 * MT * tc_str<CH>() : 8 * 16 * MT * 16 * 4; }
 
 // grid (max rows / 8, jobs): bf16_mv_kernel for MXFP4 (Q8 false) or Q8_0 (Q8 true) matrices - a lane a 32-value block
 // a step, dequantised once for the job's activations
@@ -1599,12 +1612,12 @@ bool iq_args(const x3::ExpertLayout& lay, int n_embd, int n_ff, float limit, iq:
     return true;
 }
 // the tensor-core q8_mv's terms: whole 8-block pieces a row (16-byte chunks), the rows 16-byte aligned, 4-byte int8
-// activations and scales
+// activations and scales, at most 16 columns
 bool q8_tc_ok(const BfJobs& J, int nj) {
     for (int i = 0; i < nj; ++i) {
         const BfJob& b = J.j[i];
         if (b.k % 256 != 0 || b.ld % 16 != 0 || ((uintptr_t) b.w & 15) != 0 || ((uintptr_t) b.xq & 3) != 0 ||
-            ((uintptr_t) b.xd & 3) != 0 || b.ncol > 8)
+            ((uintptr_t) b.xd & 3) != 0 || b.ncol > 16)
             return false;
     }
     return true;
@@ -1616,11 +1629,11 @@ void mv_launch(int f, const BfJobs& J, int nj, int max_n, bool vec, cudaStream_t
         if (vec) pdl_launch(mx_mv_kernel<NC, true, false>, grid, kThreads, 0, s, J);
         else pdl_launch(mx_mv_kernel<NC, false, false>, grid, kThreads, 0, s, J);
     } else if (f == 2) {   // (vec here: every row 4-byte aligned, so staged)
-        // DS4_Q8MV_TC=1: the tensor-core kernel for 3..8 columns (2: also 2), the same bits; 2048+ rows 32 a CTA in
-        // 16-block chunks, fewer 16 a CTA in 32-block chunks (more CTAs) - what measured fastest in the microbench
+        // DS4_Q8MV_TC=1: the tensor-core kernel for 3..16 columns (2: also 2), the same bits; 32 rows a CTA in
+        // 16-block chunks when that still gives 128+ CTAs, else 16 a CTA in 32-block chunks - the microbench's best
         static const int tc = std::getenv("DS4_Q8MV_TC") != nullptr ? std::atoi(std::getenv("DS4_Q8MV_TC")) : 0;
-        if (vec && tc > 0 && NC <= 8 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj)) {
-            if (max_n >= 2048)
+        if (vec && tc > 0 && (NC >= 4 || (tc >= 2 && NC == 2)) && q8_tc_ok(J, nj)) {
+            if ((max_n + 31) / 32 * nj >= 128)
                 pdl_launch(q8_mv_tc_kernel<NC, 2, 2, 16>, dim3((unsigned) ((max_n + 31) / 32), (unsigned) nj), 256,
                            (size_t) q8_tc_smem<2, 2, 16>(), s, J);
             else
