@@ -1,6 +1,9 @@
 // Small, startup-only exact-F32 transport comparison. Never uses model activations or weights.
 #include "ds4_kernels.cuh"
+#include "ds4_peer_cuda_compat.cuh"  // (the HIP names the peer all-reduce uses, on CUDA)
+#if defined(STRATA_USE_HIP)
 #include <hip/hip_runtime.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -33,7 +36,9 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
                                const PeerAr peer[2], int n, double budget_ms) {
     PeerCalibration result;
     const auto start = Clock::now();
-    const auto deadline = start + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(budget_ms));
+    // the budget bounds the timed rounds only: it starts after this function's own setup (streams, allocations,
+    // kernel preload), which host I/O or page-cache pressure can slow down
+    auto deadline = Clock::time_point::max();
     std::array<ProbeRank, 2> rank{};
     ArGroup host = original;
     host.ar2 = 0;
@@ -42,7 +47,11 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
     hipGetDevice(&previous);
     bool launched = false;
     auto expired = [&] { return Clock::now() >= deadline; };
+    // a launched probe is waited for up to kDrainMs, independent of the budget: running out of measurement time is not
+    // a probe that never drains (only that one makes the caller refuse to start)
+    constexpr int kDrainMs = 10000;
     auto wait = [&] {
+        const auto limit = Clock::now() + std::chrono::milliseconds(kDrainMs);
         for (;;) {
             bool ready = true;
             for (int m = 0; m < 2; ++m) {
@@ -54,7 +63,7 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
                 ready = ready && status == hipSuccess;
             }
             if (ready) return true;
-            if (expired()) return false;
+            if (Clock::now() >= limit) return false;
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     };
@@ -72,8 +81,15 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
     };
     bool ok = n > 0 && n % 4 == 0 && size_t(n) <= host.stride && host.nm == 2 && budget_ms > 0;
     for (int m = 0; m < 2 && ok; ++m) {
-        if (expired()) { ok = false; break; }
         auto& r = rank[m];
+        if (hipSetDevice(ids[m]) == hipSuccess) {   // (CUDA lazy loading: no first launch beside a spinning rank)
+            peer_ar_preload();
+#if !defined(STRATA_USE_HIP)
+            cudaFuncAttributes fa{};
+            (void) cudaFuncGetAttributes(&fa, check_probe);
+            (void) cudaGetLastError();
+#endif
+        }
         ok = hipSetDevice(ids[m]) == hipSuccess &&
              hipStreamCreateWithFlags(&r.stream, hipStreamNonBlocking) == hipSuccess &&
              hipMalloc((void**) &r.x, size_t(n) * sizeof(float)) == hipSuccess &&
@@ -83,6 +99,7 @@ PeerCalibration calibrate_peer(const int ids[2], const ArGroup& original, const 
              hipEventCreateWithFlags(&r.done, hipEventDisableTiming) == hipSuccess;
     }
     if (ok) ok = reset_flags();
+    deadline = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(budget_ms));
     const unsigned input[2] = {0x3f3f3f3fu, 0x40404040u};
     float left = 0, right = 0;
     std::memcpy(&left, input, sizeof(float));
