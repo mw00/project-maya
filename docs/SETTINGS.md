@@ -778,6 +778,35 @@ below that prompts run in windows of 16. The log says which.
 | `DS4_RING_MB` | by the link | the prompt path's staging ring a GPU (MB). Unset: sized at load from the GPU's measured host link - batches (a quarter of the ring each) of about 10 ms of it - one expert where the link takes 1 ms or more for one - at least one expert, at most the 400 MB it was before and 1/16 of the GPU's VRAM room for experts, so a slow link (PCIe Gen2) waits less for each batch and a fast one keeps 400 MB (the log's `prompt ring` line); `auto`: from each GPU's VRAM room for experts at load, 64 MB a GB of it, 400-1200 MB - more of a prompt's likely experts queued early where the GPUs cannot hold them, for that much VRAM less for experts (opt-in until measured) |
 | `MAYA_DS4_SETTLE_MS` | 0 (off) | after a chunked prompt, the expert cache learns from the prompt's picks (as it does from windows) and moves the hottest of them into VRAM in rounds of its usual swap rule, for at most this many ms, so the decode that follows finds them on the card; the first answer token comes that much later. Placement only, as the cache's own moves (opt-in until measured) |
 
+## DeepSeek: a long conversation's next turn (lent experts in RAM, prompt preparation by increment)
+
+Two costs of a turn in a long conversation that are not the model's work:
+
+- **Lent experts.** With `DS4_BORROW` a prompt's buffers lie over the last expert slots of a GPU; after the prompt
+  those experts are read back, from the SSD or the page cache, before the first token. With `DS4_LENT_RAM_GB=N` the
+  engine pins N GB of RAM at load and copies each expert into it just before the buffers overwrite its slot: while
+  lent it is DMA'd from that copy (as a RAM expert is), and the hand-back DMAs it back on the GPU's stream - no disk on
+  the prompt path. An expert with such a copy is also left out of the lent experts' page-cache prefetch. The bytes are
+  the ones the slot held, so the answers are the same. Full, the oldest copy not lent now gives its place up.
+  `DS4_CHECK_LEND=1` compares every copy handed back with the model's files (slow; for tests).
+- **Prompt preparation.** The server marks the special-token literals in every message of every request, and an agent
+  client re-sends the whole history each turn: about 1.8 s a turn at 150-350K tokens. `MAYA_PROMPT_MEMO=1` remembers
+  the marked text per string and builds the token ids by increment from the last prompt's, the same ids;
+  `MAYA_PROMPT_MEMO=verify` also builds them the whole way and fails a request whose ids differ (for tests).
+
+`MAYA_TURN_TRACE=1` (server) and `DS4_TURN_TRACE=1` (engine) print one line a request with its clock marks (prompt
+preparation, first token, the engine's run), and `DS4_RUN_POLL_MS` sets how often the engine looks whether the GPUs are
+done with a prompt run (50 ms, the progress line keeps its 50 ms).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_LENT_RAM_GB` | off (0) | N: pinned RAM copies (N GB) of the experts a prompt's borrowed buffers lie over; they go back from RAM, not from the disk (the same bytes) |
+| `DS4_CHECK_LEND` | off | `1`: every expert handed back from its RAM copy compared with the files |
+| `MAYA_PROMPT_MEMO` | off (0) | `1`: the server's prompt preparation by increment (the same token ids); `verify`: checked against the whole way every request |
+| `MAYA_TURN_TRACE` | off | `1`: a line a request with the server's clock marks |
+| `DS4_TURN_TRACE` | off | `1`: a line a request with the engine's clock marks |
+| `DS4_RUN_POLL_MS` | 50 | 1-50: how often the engine looks whether a prompt run's GPUs are done |
+
 ## DeepSeek: choosing the drafter GPU group (experimental)
 
 With several GPU groups, the DSpark drafter normally occupies the first group's lead GPU. Set
