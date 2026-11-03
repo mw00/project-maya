@@ -3569,6 +3569,14 @@ __global__ void bounds_scan_kernel(int* bounds, int n_vs) {   // one thread: bou
     for (int s = 0; s < n_vs; ++s) bounds[s + 1] += bounds[s];
 }
 
+// (DS4_EP) out[r] = x[idx[r]], whole rows
+__global__ void ep_gather_kernel(const float* __restrict__ x, const int* __restrict__ idx, float* __restrict__ out, int dim) {
+    pdl_wait();
+    pdl_trigger();
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, r = blockIdx.y;
+    if (e < dim) out[(size_t) r * dim + e] = x[(size_t) idx[r] * dim + e];
+}
+
 __global__ void moe_combine_kernel(float* acc, const float* __restrict__ y, const int* __restrict__ pos,
                                    const float* __restrict__ w, int k, int r0, int r1, int dim) {
     pdl_wait();
@@ -3824,6 +3832,17 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
     pdl_launch(moe_sort_kernel<false>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
     pdl_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
     pdl_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
+}
+void moe_sort_count(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, cudaStream_t s) {
+    pdl_launch(moe_sort_kernel<false>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, (int*) nullptr, (int*) nullptr);
+    pdl_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
+}
+void moe_sort_fill(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos,
+                   cudaStream_t s) {
+    pdl_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
+}
+void ep_gather(const float* x, const int* idx, int n, float* out, int dim, cudaStream_t s) {
+    if (n > 0) pdl_launch(ep_gather_kernel, dim3(cdiv(dim, kThreads), n), kThreads, 0, s, x, idx, out, dim);
 }
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s) {
