@@ -303,6 +303,35 @@ class HipSetupTests(unittest.TestCase):
             maya.refresh_engine(cfg)                    # compiled from this source already: nothing to do
             compile_hip.assert_not_called()
 
+    def test_failed_update_build_never_starts_the_engine_from_before(self):
+        # #805: "HIP rebuild failed; starting the previous engine" ran the old exe under the new server and config
+        pc = {"rocm": str(self.rocm), "archs": ["gfx1151"], "gpus": [{"index": 0}]}
+        with patch.object(maya, "pick_cmake", return_value="cmake"), patch.object(maya, "WIN", False), \
+                patch.object(maya, "hip_toolchain", return_value=(self.rocm, self.rocm / "llvm/bin/clang++",
+                                                                  self.rocm / "bin", {})), \
+                patch.object(maya, "cmake_steps", return_value="compiling"), \
+                patch.object(maya, "fail", side_effect=SystemExit(1)) as stop:
+            with self.assertRaises(SystemExit):
+                maya.compile_engine_hip(pc, self.root / "llama", "source-sha", soft=True)
+        self.assertIn("not started", stop.call_args.args[0])
+
+    def test_refresh_without_the_hip_compiler_stops(self):
+        build = self.root / "build-hip"
+        build.mkdir()
+        stamp = {"backend": "hip", "src": "old-sha", "archs": ["gfx1151"], "rocm": str(self.root / "gone"),
+                 "llama": str(self.root / "llama"), "targets": ["maya-ds4"]}
+        cfg = {"exe": str(build / "maya-ds4"), "backend": "hip", "gpu": [0]}
+        with patch.object(maya, "EXE", build / "maya"), patch.object(maya, "DS4_EXE", build / "maya-ds4"), \
+                patch.object(maya, "MM3_EXE", build / "maya-mm3"), \
+                patch.object(maya, "STAMP", build / "MAYA-BUILD.json"), \
+                patch.object(maya.S, "source_hash", return_value="new-sha"), \
+                patch.object(maya, "hip_clang", return_value=None), \
+                patch.object(maya, "fail", side_effect=SystemExit(1)) as stop:
+            maya.STAMP.write_text(json.dumps(stamp))
+            with self.assertRaises(SystemExit):
+                maya.refresh_engine(cfg)
+        self.assertIn("--setup --rebuild", stop.call_args.args[1])
+
     def test_hip_no_vision_skips_without_downloading(self):
         self.a.no_vision = True
         with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):

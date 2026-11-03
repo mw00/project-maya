@@ -2107,8 +2107,14 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=vcvars):
         if soft:
-            warn("HIP rebuild failed; starting the previous engine")
-            return None
+            # (not the engine compiled before: it is from the older source, and this version's server and config
+            #  start it with settings it may not know or silently ignore - #805's start failed that way)
+            fail("Maya's AMD engine changed with this update, and compiling it failed: the engine from before does "
+                 "not match this version, so it is not started",
+                 "the compiler's reason is above - fix it, then start Maya again (it compiles again)" +
+                 ("; build-maya-hip.bat > build-hip.txt 2>&1 runs the same build alone and keeps its output"
+                  if WIN else "") +
+                 (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
         fail("the HIP engine build failed", "see the compiler output above" +
              (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
     if WIN:
@@ -2195,8 +2201,11 @@ def refresh_engine(cfg: dict) -> None:
         root = Path(meta.get("rocm") or "/opt/rocm")
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if hip_clang(root) is None or not (llama / "ggml/CMakeLists.txt").exists():
-            warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
-            return
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail(f"Maya's AMD engine changed with this update, but the HIP compiler ({root}) or llama.cpp's source "
+                 f"({llama}) it was compiled with is gone: the engine from before does not match this version, so it "
+                 "is not started",
+                 f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
         pc = {"rocm": str(root), "archs": meta["archs"],
               "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
         if WIN and meta.get("lib_dirs"):
