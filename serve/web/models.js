@@ -246,7 +246,7 @@ function AutoOr({label, k, d, dflt, unit, subLabel}) {
       on=${(v) => setDraft({[k]: v})}/></div>` : null};
 }
 
-// the Context size: Settings > Model's slider (ui.js' CtxSlider) over this model's own range (up to the context it was
+// the Context size: Settings > Chat defaults's slider (ui.js' CtxSlider) over this model's own range (up to the context it was
 // trained for: GET /api/models' context_range), with the same line under it (server.js' ctxHint). `cost`: the cache's
 // bytes per token as the draft sets it (ctxHint's win / whole / ram / vram); `keys`: the settings that change it - while
 // none does, the running model's line is the engine's own measurement, as in Settings

@@ -122,7 +122,7 @@ export function Seg({options, value, onChange, label, cls = ""}) {
     ${options.map((o) => html`<button type="button" role="radio" aria-checked=${String(o.id === value)} title=${o.title}
       tabIndex=${o.id === value || (none && o === options[0]) ? 0 : -1} onClick=${() => onChange(o.id)}>${o.label}</button>`)}</div>`;
 }
-// the Context size slider (Settings > Model, and each model's Engine settings on the Models page): one stop per size in
+// the Context size slider (Settings > Chat defaults, and each model's Engine settings on the Models page): one stop per size in
 // `stops` (server.js' ctxStopsIn), the size picked and "now" when it is the one the model has, the range's ends, and
 // `hint` (server.js' ctxHint) under it.  `label`: the name beside the size (empty where the row around it names it).
 export const CtxSlider = ({id, label = "Context size", value, now, stops, disabled, hint, onChange}) => html`<div class="ctx-slider">

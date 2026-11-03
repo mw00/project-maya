@@ -46,7 +46,7 @@ export async function poll() {
     const r = await fetch(reqAll.on ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
       S.conn = "key";
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it in Settings › Connect your tools.", 6000); }
+      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it in Settings › Connection.", 6000); }
     } else if (r.ok) {
       S.metrics = await r.json();
       S.conn = "ok";
@@ -139,7 +139,7 @@ export async function loadCtxInfo() {
   emit();
   return S.ctxInfo;
 }
-// the Context size slider's stops (Settings > Model and the Models page's Engine settings): CTX_STOPS within a model's
+// the Context size slider's stops (Settings > Chat defaults and the Models page's Engine settings): CTX_STOPS within a model's
 // range ({min, max}: GET /api/context, or /api/models' context_range), and the sizes given (the one now, a draft's)
 export function ctxStopsIn(r, ...sizes) {
   if (!r) return [];
@@ -163,7 +163,7 @@ export function ctxEstimate(n) {
   const expertGb = c.vram_gb && c.vram_slots ? +c.vram_gb / c.vram_slots : null;
   return {gb: est, delta: est - now, experts: expertGb ? Math.round((est - now) / expertGb) : null, vram: +c.vram_gb || null};
 }
-// the Context size slider's line under it (Settings > Model and the Models page alike): what n tokens of context cost.
+// the Context size slider's line under it (Settings > Chat defaults and the Models page alike): what n tokens of context cost.
 // `live`: the running engine's own measurement scaled (ctxEstimate); else from the cache's bytes per token - `ram`: a
 // streamed cache, every position in pinned RAM and `win` of them in VRAM (`whole`: a context up to `win` is not streamed,
 // GLM's), `vram`: a cache wholly in VRAM.  `now`: the size it has now (the change in GB is shown against it).
@@ -398,6 +398,6 @@ export async function watchUpdate(to) {
 // ------------------------------------------------------------------ the troubleshooting report (GET /api/report)
 export async function fetchReport() {
   const r = await fetch("api/report", {headers: headers()});
-  if (!r.ok) throw new Error(r.status === 401 ? "this server needs its API key (Settings › Connect your tools)" : `HTTP ${r.status}`);
+  if (!r.ok) throw new Error(r.status === 401 ? "this server needs its API key (Settings › Connection)" : `HTTP ${r.status}`);
   return r.text();
 }

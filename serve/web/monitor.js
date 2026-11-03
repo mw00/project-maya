@@ -69,22 +69,26 @@ function Throughput({m}) {
   const when = peak ? new Date(peak.time * 1000) : null;
   const at = when ? when.toLocaleString([], new Date().toDateString() === when.toDateString()
     ? {hour: "2-digit", minute: "2-digit"} : {weekday: "short", hour: "2-digit", minute: "2-digit"}) : "";
-  return html`<section class="card card--wide" aria-label="Throughput">
-    <div class="speeds">
-      <div class="speed"><span class="speed__label"><i class="key key--line"></i>Decode · ${many ? `${live.writing} writing` : gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
-        <div class="speed__row"><span class="speed__big num">${speed == null ? "–" : fmt(speed, 1)}<small>tok/s</small></span>
-          ${/* the peak beside the live Decode (below it on a phone), small: a reference, not a second headline */ ""}
-          <span class="speed__peak num" title=${peak ? `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
-              : "The highest decode speed since Maya started. Live speeds and finished answers count, from 32 tokens on."}>Peak ${peak ? `${fmt(peak.tok_s, 1)} tok/s` : "–"}</span></div></div>
-      <div class="speed" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
+  // the prefill tile's line: the last request's new tokens and the time they took (the reused ones are Right now's)
+  const read = last ? Math.max(0, last.prompt_tokens - (last.reused || 0)) : null;
+  const psub = live.state !== "idle" ? "the mean over this request"
+    : last && last.prompt_ms > 0 ? `${fmt(read)} new token${read === 1 ? "" : "s"} in ${fmt(last.prompt_ms / 1000, last.prompt_ms < 10000 ? 1 : 0)} s`
+    : "prompt tokens read per second";
+  // decode and prefill side by side, the same size: each its figure, its line and its own sparkline (the last minute)
+  return html`<section class="card card--wide tp" aria-label="Throughput">
+    <div class="card__head"><span class="card__title">Throughput</span>
+      <span class="card__sub">${a || b ? "the last minute" : "no activity in the last minute"}</span></div>
+    <div class="tp__tiles">
+      <div class="tp__tile"><span class="speed__label"><i class="key key--line"></i>Decode · ${many ? `${live.writing} writing` : gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
+        <span class="tp__num num">${speed == null ? "–" : fmt(speed, 1)}<small>tok/s</small></span>
+        <span class="tp__sub num" title=${peak ? `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
+            : "The highest decode speed since Maya started. Live speeds and finished answers count, from 32 tokens on."}>Peak ${peak ? `${fmt(peak.tok_s, 1)} tok/s` : "–"}</span>
+        <${Spark} values=${h.tok_s} cls="tp__spark"/></div>
+      <div class="tp__tile" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
         <span class="speed__label"><i class="key key--dash"></i>Prefill · ${live.state === "reading" ? "reading now" : gen ? "this request" : last ? "last request" : "waiting"}</span>
-        <span class="speed__mid num">${prefill == null ? "–" : fmt(prefill)}<small>tok/s</small></span></div>
-    </div>
-    <div class=${`spark-wrap${a || b ? "" : " is-empty"}`}>
-      <svg class="spark spark--hero" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
-        ${a ? html`<path class="spark__area" d=${a.area}/><path class="spark__line" d=${a.line} vector-effect="non-scaling-stroke"/>` : null}
-        ${b ? html`<path class="spark__line spark__line--dash" d=${b.line} vector-effect="non-scaling-stroke"/>` : null}</svg>
-      <span class="spark-wrap__empty">No activity in the last minute</span>
+        <span class="tp__num num">${prefill == null ? "–" : fmt(prefill)}<small>tok/s</small></span>
+        <span class="tp__sub num">${psub}</span>
+        <${Spark} values=${h.prefill_tok_s_mean} tone="info" cls="tp__spark"/></div>
     </div>
     <div class="stats">
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>
@@ -162,7 +166,7 @@ function ContextCard({m}) {
   // (the VRAM window is KV streaming's --kv-resident: Models > Engine settings > Prompts and cache, GLM and MiniMax alike)
   const W = ctxfmt(win), where = showWin
     ? "The window is a setting: Models › Engine settings › Prompts and cache › Positions each layer keeps in VRAM."
-    : "The size is a setting: Settings › Model › Context size.";
+    : "The size is a setting: Settings › Chat defaults › Context size.";
   const note = !running && !last ? "No conversation yet: the context fills as a chat goes on, with every message, file and tool result in it."
     : showWin ? (used > win ? `This chat is past the ${W} VRAM window: its cache is kept in RAM (about ${fmt((used * 12288) / 1e9, 1)} GB), ${W} tokens of it in GPU memory and the rest copied in when needed.`
                             : `VRAM window: a chat up to ${W} tokens keeps its whole cache in GPU memory. A longer one keeps it in RAM, ${W} tokens of it in GPU memory and the rest copied in when needed.`)
@@ -566,7 +570,7 @@ export function MonitorPage() {
         <${Hardware} m=${m} gpuEach=${gpuEach}/>
         <${Requests} m=${m}/>`
       : html`<div class="card mon__wait">${S.conn === "down" ? "The server is not reachable. It may be starting, or stopped."
-                                        : S.conn === "key" ? "This server needs its API key: add it in Settings › Connect your tools."
+                                        : S.conn === "key" ? "This server needs its API key: add it in Settings › Connection."
                                         : "Waiting for the first reading…"}</div>`}
     </div></div>
   </main>`;

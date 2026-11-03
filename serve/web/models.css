@@ -23,8 +23,10 @@
 
 /* a model's card */
 .mdl-card { gap: 14px; padding: 18px 20px; }
-.mdl-card.is-running { border-color: color-mix(in srgb, var(--st-accent) 45%, var(--st-line)); }
-.mdl-card.is-loading { border-color: color-mix(in srgb, var(--st-info) 45%, var(--st-line)); }
+/* the running model: a violet wash and a bar at its left edge (the grouped look: fills, no outline) */
+.mdl-card.is-running { background: linear-gradient(0deg, color-mix(in srgb, var(--st-accent) 7%, transparent), color-mix(in srgb, var(--st-accent) 7%, transparent)), var(--st-card);
+                       box-shadow: inset 3px 0 0 var(--st-accent); }
+.mdl-card.is-loading { box-shadow: inset 3px 0 0 var(--st-info); }
 .mdl-card__head { display: flex; align-items: center; gap: 14px; }
 .mdl-card__head .model-logo { border-radius: var(--st-r-md); background: var(--st-surface-2); flex: none; }
 .mdl-card__name { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.35; }
@@ -79,7 +81,7 @@
 .mdl-num { display: inline-flex; align-items: center; gap: 8px; }
 .mdl-num .input--num { width: 96px; height: 34px; text-align: right; }
 .mdl-num > span { min-width: 44px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
-.mdl-step { display: inline-flex; align-items: center; height: 34px; border: 1px solid var(--st-line-strong); border-radius: var(--st-r-row); }
+.mdl-step { display: inline-flex; align-items: center; height: 34px; border: 1px solid transparent; background: var(--st-fill); border-radius: var(--st-r-row); }
 .mdl-step button { display: grid; place-items: center; width: 34px; height: 32px; padding: 0; border: 0; background: transparent; color: var(--st-ink); }
 .mdl-step button:first-child { border-radius: 9px 0 0 9px; }
 .mdl-step button:last-child { border-radius: 0 9px 9px 0; }
@@ -92,8 +94,8 @@
 .mdl-warn { padding: 8px 12px; border-radius: var(--st-r-row); background: var(--st-warn-tint); color: var(--st-warn-text); font-size: var(--st-fs-sm); line-height: 1.45; }
 .mdl-warn--err { margin-top: 12px; background: var(--st-danger-tint); color: var(--st-danger-text); }
 .mdl-gpus { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
-.mdl-gpu { display: flex; align-items: center; gap: 10px; min-width: 180px; min-height: 46px; padding: 0 14px 0 12px; border: 1px solid var(--st-line-strong);
-           border-radius: var(--st-r-md); background: transparent; color: var(--st-ink); text-align: left; }
+.mdl-gpu { display: flex; align-items: center; gap: 10px; min-width: 180px; min-height: 46px; padding: 0 14px 0 12px; border: 1px solid transparent; background: var(--st-fill);
+           border-radius: var(--st-r-md); color: var(--st-ink); text-align: left; }
 .mdl-gpu[aria-checked="true"] { border-color: color-mix(in srgb, var(--st-accent) 55%, var(--st-line)); background: var(--st-accent-tint); }
 .mdl-gpu__box { display: grid; place-items: center; width: 18px; height: 18px; flex: none; box-sizing: border-box; border-radius: 5px;
                 border: 1.5px solid var(--st-line-strong); color: var(--st-accent-ink); }
@@ -123,8 +125,8 @@
 .mdl-del .dialog__body { display: flex; flex-direction: column; gap: 14px; }
 .mdl-del p { margin: 0; line-height: 1.55; }
 .mdl-del p code { font-family: var(--st-font-mono); font-size: var(--st-fs-sm); overflow-wrap: anywhere; }
-.mdl-del__box { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 12px 14px; border: 1px solid var(--st-line-strong);
-                border-radius: var(--st-r-md); background: transparent; color: var(--st-ink); font: inherit; text-align: left; }
+.mdl-del__box { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 12px 14px; border: 1px solid transparent; background: var(--st-fill);
+                border-radius: var(--st-r-md); color: var(--st-ink); font: inherit; text-align: left; }
 .mdl-del__box.is-on { border-color: color-mix(in srgb, var(--st-danger) 55%, var(--st-line)); background: var(--st-danger-tint); }
 .mdl-del__check { display: grid; place-items: center; width: 18px; height: 18px; flex: none; margin-top: 2px; box-sizing: border-box;
                   border: 1.5px solid var(--st-line-strong); border-radius: 5px; color: #ffffff; }
