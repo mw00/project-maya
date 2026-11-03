@@ -201,10 +201,18 @@ def effort_kwargs(value) -> dict:
     return {"reasoning_effort": level} if name == level else {"reasoning_effort": level, "effort_name": name}
 
 
+TOKEN_CAP_HINT = ('to cap the thinking in tokens, set "thinking_budget" (the dashboard\'s Thinking budget) - '
+                  'reasoning_effort is not a token count')
+
+
 def deepseek_effort_kwargs(value) -> dict:
-    """DeepSeek's 1..100 budget, retaining the existing named effort aliases."""
+    """DeepSeek's 1..100 effort level (its encoder calls it a "budget", but it is a hint written into the prompt, not a
+    token cap: that is the config's thinking_budget), retaining the existing named effort aliases."""
     if type(value) is int:
-        if not 1 <= value <= 100:
+        if value > 100:   # (#807: "4096" meant as tokens)
+            raise ValueError(f"DeepSeek reasoning_effort must be in [1, 100] (the model's effort level), "
+                             f"not {value}: {TOKEN_CAP_HINT}")
+        if value < 1:
             raise ValueError("DeepSeek reasoning_effort must be in [1, 100]")
         return {"reasoning_effort": value}
     if value is not None and value is not False and not isinstance(value, str):
@@ -213,10 +221,26 @@ def deepseek_effort_kwargs(value) -> dict:
 
 
 def config_budget(value):
-    """A run config's reasoning_effort for DeepSeek: a numeric string ("42") is the number 42 (#768); every other value is
-    returned unchanged, so a named effort and a real unknown word are judged by deepseek_effort_kwargs as before."""
+    """A run config's reasoning_effort for DeepSeek: a numeric string ("42") is the effort level 42 of 100 (#768), not a
+    token count; every other value is returned unchanged, so a named effort and a real unknown word are judged by
+    deepseek_effort_kwargs as before."""
     if isinstance(value, str) and value.strip().isascii() and value.strip().isdecimal():
         return int(value.strip())
+    return value
+
+
+def config_effort(value, deepseek: bool):
+    """A run config's reasoning_effort, checked by the model's family before the model loads (#807) -> the value the
+    server keeps.  DeepSeek: a level 1..100 ("42" is 42) or a named effort; every other model: a named effort only.
+    ValueError says what is wrong; a number meant as tokens is pointed to thinking_budget."""
+    if deepseek:
+        value = config_budget(value)
+        deepseek_effort_kwargs(value)
+        return value
+    if (type(value) is int or type(value) is float or
+            isinstance(value, str) and value.strip().lstrip("+-").replace(".", "", 1).isdecimal()):
+        raise ValueError(f"reasoning_effort is a level ({EFFORT_WORDS}), not a number: {TOKEN_CAP_HINT}")
+    effort_kwargs(value)
     return value
 
 

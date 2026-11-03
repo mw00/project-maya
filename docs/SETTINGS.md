@@ -332,6 +332,18 @@ as in llama.cpp, so the model goes on with what it would write next instead of s
 fixed answer length. It needs `max_tokens`, and an engine that applies token biases - GLM's and DeepSeek's (which take
 a request's own `logit_bias` as well); MiniMax's does not, so there it is refused.
 
+## The thinking level and the thinking budget
+
+Two config settings shape the thinking, and only one of them counts tokens:
+
+| Setting | What it is |
+|---|---|
+| `"thinking_budget"` | the cap on the thinking, in tokens (32768 by default; 8192 for GLM-5.3-Flash Maya-XS; 0 = none). Past it the server closes the thinking at the next sentence or line end and the answer starts. Settings > Chat defaults > Thinking budget changes it without a restart |
+| `"reasoning_effort"` | the thinking level a request gets when it names none: a word (`none`, `auto`, `low`, `medium`, `high`, `xhigh`, `max`). DeepSeek-V4.1 also takes a number from 1 to 100 (`42` or `"42"`), its own effort level: it is written into the prompt as a hint to the model, not a token cap |
+
+A `reasoning_effort` the model does not take (a number above 100 for DeepSeek, any number for the other models) stops
+the start before the model loads, with a message that points to `thinking_budget`.
+
 ## Token log-probabilities (`logprobs`, DeepSeek)
 
 A chat completion with `"logprobs": true` (and `"top_logprobs"`: 0 to 20 alternatives, 0 when absent) gets OpenAI's

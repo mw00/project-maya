@@ -9,6 +9,10 @@ only what changed and starts; the model is not downloaded again.
 - **ROCm installs with versioned LLVM slots:** `hip_clang` finds a distribution's LLVM slot (`<root>/lib/llvm/<version>/bin/clang++`,
  newest first), so Gentoo passes the HIP check with `ROCM_PATH=/usr` and no `/usr/lib64/rocm/llvm` symlink (`tools/test_maya_hip.py`
  covers it).
+- **DeepSeek, `reasoning_effort` in the config (#807):** it is checked before the model loads, by the model's family, so
+ a bad value stops the start at once instead of after the load; a number above 100 (DeepSeek's effort is a level from 1
+ to 100, a hint in the prompt) gets a message that points to `"thinking_budget"`, the cap on the thinking in tokens.
+ docs/SETTINGS.md says which setting is which.
 
 ## v1.1.51 - 2026-11-03
 
@@ -22,7 +26,7 @@ DeepSeek fills every GPU in tensor parallel and reads long prompts faster when m
 - **CYBER-FROST:** the dashboard has a thinking Off button.
 - **Dashboard:** while the model thinks, its thoughts follow the newest line down, as the answer does (scroll them up to read and they stay put).
 - **Dashboard, long answers:** a page that lost its connection to an answer for a long time (a sleeping phone, a background tab) no longer gives the answer up for good: it tries again when it is shown, and if it has stopped trying, coming back to the page or reloading it takes the answer up again while the server still holds it.
-- **DeepSeek:** a failed GPU allocation says its size, the driver's reason and the free VRAM (#794); a numeric `reasoning_effort` in the config is a thinking budget (#768); `DS4_AR_P2P` reads the real BAR size, so it engages on large-BAR cards (#798); `DS4_RAM_MARGIN_GB` sets the system-RAM headroom the memory planning leaves, default 8 GiB (#739).
+- **DeepSeek:** a failed GPU allocation says its size, the driver's reason and the free VRAM (#794); a numeric `reasoning_effort` in the config (`"42"`) is the model's effort level from 1 to 100, not an unknown word (#768; the cap on the thinking in tokens is `"thinking_budget"`); `DS4_AR_P2P` reads the real BAR size, so it engages on large-BAR cards (#798); `DS4_RAM_MARGIN_GB` sets the system-RAM headroom the memory planning leaves, default 8 GiB (#739).
 - **MiniMax:** the "prefill not calibrated" note says when the saved calibration is for another GPU list, runtime or driver (#721).
 - **Savings ledger:** `MAYA_SAVINGS_PATH` chooses its file (`off` keeps none), and a file that cannot be written is logged once (#724).
 - **Responses API:** the rejections name the tool type or include value the client sent (#726).

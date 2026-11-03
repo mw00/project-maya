@@ -57,7 +57,7 @@ from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
-                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_budget, deepseek_effort_kwargs,
+                            EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
                             deepseek_images,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
@@ -6171,6 +6171,21 @@ def chat_template_path(tpath) -> Path:
     return tpl
 
 
+def checked_config_effort(cfg: dict, template, maya: bool) -> dict:
+    """The run config with its reasoning_effort checked by the model's family (its chat template), before the model
+    loads (#807): a config without one gets the model's own level (the real engine); DeepSeek's "42" becomes its level
+    42 of 100 (#768).  A bad value stops the start at once (SystemExit), a number meant as tokens pointed to
+    thinking_budget."""
+    if "reasoning_effort" not in cfg and maya:          # (a config without one: the model's own level)
+        cfg = dict(cfg, reasoning_effort=maya_quants.model_defaults(cfg)[1])
+    if cfg.get("reasoning_effort") or (template.deepseek and cfg.get("reasoning_effort") is not None):
+        try:
+            cfg = dict(cfg, reasoning_effort=config_effort(cfg["reasoning_effort"], template.deepseek))
+        except ValueError as e:
+            raise SystemExit(f"[maya] config reasoning_effort: {e}")
+    return cfg
+
+
 def sampling_defaults_from_config(cfg: dict) -> dict:
     """The run config's optional `sampling` block: defaults for the sampling fields a request leaves out, so
     a plain client gets configured sampling instead of greedy.  Supported: temperature, top_p, top_k, min_p,
@@ -6440,6 +6455,14 @@ def main() -> int:
         import strata_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)              # with the pack's own pre-tokenizer (GLM: glm4, #27)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
+    # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
+    # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
+    # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
+    # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.  Read before the load: it tells the model's family, by which
+    # the config's reasoning_effort is checked here, not after the minutes of loading (#807)
+    template = ChatTemplate(chat_template_path(tpath))
+    cfg = checked_config_effort(cfg, template, a.engine == "maya")
     if a.engine == "maya":
         if not cfg:
             ap.error("--engine maya needs --config")
@@ -6520,29 +6543,15 @@ def main() -> int:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."],
             tok_s=float(os.environ.get("MAYA_MOCK_TOK_S") or 0) or None), None, {}
-    # the model's own chat template (exported with its tokenizer), else the original model's.  A GLM-5.3-Flash pack's
-    # copy is the one its GGUF carried (August's): the template zai-org publishes now renders the same prompts and
-    # matches tool results to their calls without nested loops (zai-org/GLM-5.3-Flash PR #63: 100 parallel calls
-    # 137 -> 6 ms a render), so the server uses the copy shipped here (serve/glm5_chat_template.jinja) for a GLM-5
-    # pack.  MAYA_PACK_TEMPLATE=1 keeps the pack's own.
-    tpl = chat_template_path(tpath)
-    svc = Service(engine, tok, ChatTemplate(tpl),
+    svc = Service(engine, tok, template,
                   model_name=cfg.get("model_name", "qwen3.8-flash-next"), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
     if getattr(engine, "multi", 0) > 1:                 # n conversations at once: n places in the FIFO
         svc.fifo.set_capacity(engine.multi)
         print(f"[maya] {engine.multi} conversations at once (--parallel)", flush=True)
-    if "reasoning_effort" not in cfg and a.engine == "maya":   # (a config without one: the model's own level)
-        cfg = dict(cfg, reasoning_effort=maya_quants.model_defaults(cfg)[1])
-    if svc.template.deepseek and isinstance(cfg.get("reasoning_effort"), str):   # ("42" in the config = 42, #768)
-        cfg = dict(cfg, reasoning_effort=config_budget(cfg["reasoning_effort"]))
     if cfg.get("reasoning_effort") or (svc.template.deepseek and cfg.get("reasoning_effort") is not None):
-        try:
-            (deepseek_effort_kwargs if svc.template.deepseek else effort_kwargs)(cfg["reasoning_effort"])
-        except ValueError as e:
-            raise SystemExit(f"[maya] config reasoning_effort: {e}")
-        svc.default_effort = cfg["reasoning_effort"]
+        svc.default_effort = cfg["reasoning_effort"]    # (checked before the load: checked_config_effort)
         # (#363: DeepSeek's 1..100 budget is a level of its own - it was shown as "none")
         level = (effort_name if svc.template.minimax else effort_level)(svc.default_effort) or \
             (f"{svc.default_effort} of 100" if type(svc.default_effort) is int

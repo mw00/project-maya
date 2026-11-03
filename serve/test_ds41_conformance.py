@@ -158,7 +158,7 @@ class Rendering(_CleanToolOrders):
                 with self.assertRaises(ValueError):
                     self.template.render(BASE, reasoning_effort=effort)
 
-    def test_config_numeric_string_is_a_budget(self):   # (#768: "reasoning_effort": "42" in the run config)
+    def test_config_numeric_string_is_an_effort_level(self):   # (#768: "reasoning_effort": "42" in the run config)
         from serve.frontend import config_budget, deepseek_effort_kwargs
         self.assertEqual(deepseek_effort_kwargs(config_budget("42")), {"reasoning_effort": 42})
         self.assertEqual(deepseek_effort_kwargs(config_budget(" 7 ")), {"reasoning_effort": 7})
@@ -167,6 +167,47 @@ class Rendering(_CleanToolOrders):
         for bad in ("0", "101", "unknown", "4.5", "-3"):   # out of range, a word, not a whole number
             with self.subTest(value=bad), self.assertRaises(ValueError):
                 deepseek_effort_kwargs(config_budget(bad))
+
+    def test_config_effort_by_family(self):   # (#807: a number meant as tokens is pointed to thinking_budget)
+        from serve.frontend import config_effort
+        for value, kept in (("42", 42), (42, 42), ("100", 100), ("1", 1), ("high", "high"), ("none", "none"),
+                            ("auto", "auto")):
+            with self.subTest(value=value):
+                self.assertEqual(config_effort(value, deepseek=True), kept)
+        for value in ("4096", 4096, "101", 32768):
+            with self.subTest(value=value), self.assertRaises(ValueError) as e:
+                config_effort(value, deepseek=True)
+            self.assertIn("thinking_budget", str(e.exception))
+            self.assertIn("[1, 100]", str(e.exception))
+        for value in ("0", 0, "-3", "unknown"):   # (not a token count: the plain range message)
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                config_effort(value, deepseek=True)
+        for value in ("max", "low", "xhigh", "auto"):   # every other model: the named levels
+            with self.subTest(value=value):
+                self.assertEqual(config_effort(value, deepseek=False), value)
+        for value in ("4096", 4096, "42", 42, 1.5, "8192.0"):
+            with self.subTest(value=value), self.assertRaises(ValueError) as e:
+                config_effort(value, deepseek=False)
+            self.assertIn("thinking_budget", str(e.exception))
+        with self.assertRaises(ValueError) as e:
+            config_effort("loud", deepseek=False)
+        self.assertNotIn("thinking_budget", str(e.exception))
+
+    def test_config_effort_checked_before_the_model_loads(self):   # (#807)
+        import inspect
+        from serve import server
+        ds4 = ChatTemplate(ROOT / "tools/ds4/chat_template.jinja")
+        glm = ChatTemplate(ROOT / "serve/glm5_chat_template.jinja")
+        self.assertEqual(server.checked_config_effort({"reasoning_effort": "42"}, ds4, True)["reasoning_effort"], 42)
+        self.assertEqual(server.checked_config_effort({}, glm, False), {})   # (the mock: none given, none set)
+        with self.assertRaises(SystemExit) as e:
+            server.checked_config_effort({"reasoning_effort": "4096"}, ds4, True)
+        self.assertIn("thinking_budget", str(e.exception.code))
+        with self.assertRaises(SystemExit):
+            server.checked_config_effort({"reasoning_effort": "4096"}, glm, True)
+        # main(): the check comes before the engine (the model's load) is started
+        src = inspect.getsource(server.main)
+        self.assertLess(src.index("checked_config_effort("), src.index("StrataEngine("))
 
     def test_thinking_disabled_omits_budget(self):
         for options in ({"reasoning_effort": "none"}, {"reasoning_effort": False},
