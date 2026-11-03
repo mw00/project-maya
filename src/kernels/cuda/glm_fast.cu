@@ -6686,6 +6686,31 @@ void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s) {
     launch_check("moe_prefetch");
 }
 
+__global__ void moe_pf_need_kernel(const int* pf_n, const unsigned int* seq, unsigned int* need) {
+    *need = *pf_n > 0 ? *seq : 0u;
+}
+
+__global__ void moe_pf_wait_kernel(const unsigned int* need, const unsigned int* flag) {
+    const unsigned int n = *(volatile const unsigned int*) need;
+    if (n == 0u) return;
+    for (long long i = 0; i < (1ll << 27); ++i) {
+        if ((int) (*(volatile const unsigned int*) flag - n) >= 0) return;
+#if !defined(STRATA_USE_HIP)
+        __nanosleep(200);
+#endif
+    }
+}
+
+void moe_pf_need(const MoeDev& d, unsigned int* need, cudaStream_t s) {
+    moe_pf_need_kernel<<<1, 1, 0, s>>>(d.pf_n, d.seq, need);
+    launch_check("moe_pf_need");
+}
+
+void moe_pf_wait(const unsigned int* need, const unsigned int* flag, cudaStream_t s) {
+    moe_pf_wait_kernel<<<1, 1, 0, s>>>(need, flag);
+    launch_check("moe_pf_wait");
+}
+
 void moe_fetch(const MoeDev& d, int k, size_t blob_bytes, cudaStream_t s) {
     static int sms = 0;
     if (sms == 0) {

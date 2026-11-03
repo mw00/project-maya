@@ -344,7 +344,55 @@ static int numa_node_cpus() {
 // threads through that node's memory controllers only (2-socket Xeon, Q3_K experts, 44 threads: 216 us an expert
 // node-local, 152 us interleaved).  Mapped, so the device reads its host pointers as it does cudaHostAlloc's.
 // nullptr: one node, STRATA_GLM_NUMA=0, no host-pointer access for registered memory, or a failure.
-static void* numa_pinned(size_t bytes) {
+// STRATA_GLM_ROW_HALVES=1 (Part 8 Opt 09, ported): ROW halves - each RAM-tier slot keeps its layout ([gate | up | down],
+// contiguous for the device, the warm-up and the prompt path) but its pages alternate nodes: gate rows [0, n_ff/2), up
+// rows [0, n_ff/2) and down rows [0, n_embd/2) on the first node, the other halves on the second.  The CPU lane then
+// reads each half with that node's threads (lane_experts) - no expert byte crosses QPI.  E5-2690 v4: 22 threads on
+// interleaved pages 18.6 GB/s, each socket on its own half ~15.7 GB/s at once
+struct RowLayout {
+    size_t stride, gu, doff, blob;   // a slot, the gate (= up) part, where down starts, the blob
+};
+struct RowHalves {
+    const uint8_t* a;
+    const uint8_t* b;
+    RowLayout l;
+    int n0, n1;
+};
+static RowHalves g_rh[32];
+static std::atomic<int> g_rh_n{0};
+static const RowHalves* row_halves_of(const void* p) {
+    const int n = g_rh_n.load(std::memory_order_acquire);
+    const uint8_t* q = (const uint8_t*) p;
+    for (int i = 0; i < n; ++i)
+        if (q >= g_rh[i].a && q < g_rh[i].b) return &g_rh[i];
+    return nullptr;
+}
+// the node of the CPU this thread runs on now (-1: unknown)
+static int cpu_node_now() {
+#ifdef __linux__
+    static const std::vector<int> node_of_cpu = [] {
+        std::vector<int> t(CPU_SETSIZE, -1);
+        for (int n : numa_nodes()) {
+            std::string list;
+            std::ifstream("/sys/devices/system/node/node" + std::to_string(n) + "/cpulist") >> list;
+            std::stringstream ss(list);
+            std::string r;
+            while (std::getline(ss, r, ',')) {
+                const size_t d = r.find('-');
+                const int a = std::atoi(r.c_str()), b = d == std::string::npos ? a : std::atoi(r.c_str() + d + 1);
+                for (int c = a; c <= b && c < CPU_SETSIZE; ++c) t[(size_t) c] = n;
+            }
+        }
+        return t;
+    }();
+    const int c = sched_getcpu();
+    return c >= 0 && c < CPU_SETSIZE ? node_of_cpu[(size_t) c] : -1;
+#else
+    return -1;
+#endif
+}
+
+static void* numa_pinned(size_t bytes, const RowLayout* rl = nullptr) {
 #ifdef __linux__
     const char* v = getenv("STRATA_GLM_NUMA");
     const auto nodes = numa_nodes();
@@ -359,6 +407,49 @@ static void* numa_pinned(size_t bytes) {
     if (p == MAP_FAILED) return nullptr;
     unsigned long mask[4] = {0, 0, 0, 0};
     for (int n : nodes) mask[n / 64] |= 1ul << (n % 64);
+    static const bool halves = getenv("STRATA_GLM_ROW_HALVES") != nullptr && std::atoi(getenv("STRATA_GLM_ROW_HALVES")) != 0;
+    if (halves && rl != nullptr) {
+        // 4 KB pages (a 2 MB page would span both halves); each range preferred on its node: a full node spills
+        const size_t pg = 4096, gh = rl->gu / 2, dh = (rl->blob - rl->doff) / 2;
+        const bool aligned = rl->stride % pg == 0 && rl->gu % (2 * pg) == 0 && rl->doff % pg == 0 && dh % pg == 0 &&
+                             rl->doff == 2 * rl->gu && rl->blob <= rl->stride && (rl->blob - rl->doff) % 2 == 0 &&
+                             bytes % rl->stride == 0;
+        if (aligned) {
+            const int n0 = nodes[0], n1 = nodes[1];
+            const auto bind = [&](size_t off, size_t len, int node) {
+                if (len == 0) return true;
+                unsigned long m[4] = {0, 0, 0, 0};
+                m[node / 64] = 1ul << (node % 64);
+                return syscall(SYS_mbind, (char*) p + off, len, 1 /* MPOL_PREFERRED */, m, (unsigned long) (sizeof m * 8),
+                               0u) == 0;
+            };
+            bool ok = true;
+            for (size_t o = 0; ok && o < bytes; o += rl->stride)
+                ok = bind(o, gh, n0) && bind(o + gh, gh, n1) && bind(o + rl->gu, gh, n0) && bind(o + rl->gu + gh, gh, n1) &&
+                     bind(o + rl->doff, dh, n0) && bind(o + rl->doff + dh, rl->stride - rl->doff - dh, n1);
+            if (ok) {
+                madvise(p, bytes, MADV_NOHUGEPAGE);
+                for (size_t o = 0; o < bytes; o += 4096) ((volatile char*) p)[o] = 0;   // placed now, by the policies
+                if (cudaHostRegister(p, bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+                    cudaGetLastError();
+                    munmap(p, bytes);
+                    return nullptr;
+                }
+                const int i = g_rh_n.load();
+                if (i < 32) {
+                    g_rh[i] = {(const uint8_t*) p, (const uint8_t*) p + bytes, *rl, n0, n1};
+                    g_rh_n.store(i + 1, std::memory_order_release);
+                }
+                std::fprintf(stderr, "glm fast: CUDA%d RAM arena %.2f GB in row halves (nodes %d / %d, %zu slots)\n", dev,
+                             bytes / 1073741824.0, n0, n1, bytes / rl->stride);
+                return p;
+            }
+            std::fprintf(stderr, "glm fast: CUDA%d row halves: mbind refused - interleaved\n", dev);
+        } else {
+            std::fprintf(stderr, "glm fast: CUDA%d row halves: this layout's halves are not whole pages (stride %zu gu %zu "
+                                 "doff %zu blob %zu) - interleaved\n", dev, rl->stride, rl->gu, rl->doff, rl->blob);
+        }
+    }
     // huge pages only while free 2 MB blocks cover the tier (/proc/buddyinfo, orders 9 and up): otherwise every 2 MB
     // fault of a MADV_HUGEPAGE region compacts memory on the spot (transparent_hugepage/defrag "madvise") and mostly
     // fails - a split's second card, pinning its tier after the first card's had taken most of the RAM and the page
@@ -691,6 +782,21 @@ bool Glm5Model::fast_setup(std::string& err) {
     if (F->prof_on) F->pskip = (uint64_t) std::max(0, std::atoi(getenv("STRATA_GLM_PROF")));
     if (const char* pn = getenv("STRATA_GLM_PREFETCH_N")) {
         F->max_pf = std::max(0, std::min(gf::kSpares - 1, std::atoi(pn)));
+        if (F->max_pf > 0 && getenv("STRATA_GLM_PF_CE") != nullptr && std::atoi(getenv("STRATA_GLM_PF_CE")) != 0) {
+            int lo = 0, hi = 0;
+            cudaDeviceGetStreamPriorityRange(&lo, &hi);
+            if (cudaStreamCreateWithPriority(&F->pfce_stream, cudaStreamNonBlocking, hi) == cudaSuccess &&
+                cudaMalloc((void**) &F->pf_flag_d, 64) == cudaSuccess &&
+                cudaHostAlloc((void**) &F->pfce_seq_h, gf::kRingSize * sizeof(unsigned int), cudaHostAllocPortable) ==
+                    cudaSuccess) {
+                cudaMemset(F->pf_flag_d, 0, 64);
+                F->pf_ce = true;
+                std::fprintf(stderr, "glm fast: CUDA%d prefetch copies on a copy engine (MAYA_GLM_PF_CE)\n", dev_);
+            } else {
+                cudaGetLastError();
+                std::fprintf(stderr, "glm fast: CUDA%d MAYA_GLM_PF_CE: buffers did not allocate - the SM copy\n", dev_);
+            }
+        }
         // said at start: the prefetch's settings are read once and nothing else shows them (#6)
         if (F->max_pf > 0) {
             const char* at = getenv("STRATA_GLM_PREFETCH_AT");
@@ -1007,6 +1113,19 @@ bool Glm5Model::fast_setup(std::string& err) {
     size_t win_free0 = 0, win_total = 0;
     cudaMemGetInfo(&win_free0, &win_total);
     if (dflash_on_ && !win_reserve(err)) return false;
+    // the pipelined MTP decode over a split (STRATA_GLM_SPEC_WIN, decode_spec_pipe in glm_mtp.cu): every part gets
+    // the verify window's buffers and its own recurrent-state backup (the window commits restore/replay per part),
+    // and the NextN block's part also the cache rows' buffers and the draft head; all before the pool takes the card
+    if (!dflash_on_ && g_.nextn > 0) {
+        const char* swe = getenv("STRATA_GLM_SPEC_WIN");
+        if (swe != nullptr && std::atoi(swe) != 0) {
+            if (!win_reserve(err) || !spec_kda_reserve(err)) return false;
+            if (mtp_il_ >= 0 && l1_ == g_.n_layers) {
+                if (!mtp_cache_setup(err)) return false;
+                mtp_draft_setup(true);   // (the chain's token_embd only where the room allows; else step by step)
+            }
+        }
+    }
     // the one-GPU MTP decode (glm_mtp.cu; load_pack loaded the NextN block for it): the same window, the NextN cache
     // fill's rows, the draft head and the chain's token_embd - before the pool too; without them, token by token
     if (mtp_il_ >= 0 && split_next_ == nullptr && l0_ == 0 && !dflash_on_ && mtp_decode_wanted(dev_, n_parts_)) {
@@ -1028,6 +1147,11 @@ bool Glm5Model::fast_setup(std::string& err) {
             // the draft vocabulary's rows are gathered from a GGUF-typed head; an EXL3 head drafts over all of it
             if (ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) mtp_draft_setup(false);
         }
+    }
+    if (mtp_il_ >= 0 && F->mtp_dv == 0 && F->mtp_emb_h == nullptr &&
+        ws_map_.find("output.weight") != ws_map_.end() &&
+        ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) {
+        mtp_draft_setup(false);
     }
     {
         size_t f1 = 0, t1 = 0;
@@ -1793,7 +1917,13 @@ bool Glm5Model::fast_setup(std::string& err) {
             // a refusal near a pinning cap: the size measured (above), and should that be refused too, 1/32 less a
             // try for the first four (a tier just over a cap loses ~3%, not the 12% of a 7/8 step), then 1/8 less
             for (int tries = 0; n >= least; ++tries) {
-                if ((p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
+                RowLayout rl{R.stride, 0, 0, 0};   // (a layer of this class: its blob's parts, for ROW_HALVES)
+                for (int il2 = l0_; il2 < lt_; ++il2)
+                    if (F->L[(size_t) il2].moe && F->layer_rc[(size_t) il2] == (int) c && !F->L[(size_t) il2].exl3) {
+                        rl = {R.stride, F->L[(size_t) il2].gu_bytes, F->L[(size_t) il2].down_off, F->L[(size_t) il2].blob};
+                        break;
+                    }
+                if ((p = numa_pinned((size_t) n * R.stride, rl.gu > 0 ? &rl : nullptr)) != nullptr) {   // (over every socket: numa_pinned)
                     R.registered = true;
                     R.per_part = 0;   // (one mapping)
                     break;
@@ -2010,6 +2140,8 @@ void Glm5Model::ram_left_check() const {
     }
 }
 
+static std::vector<int> cpu_list_env(const std::string& name);
+
 bool Glm5Model::fast_setup_finish(std::string& err) {
     FastState* F = fast_;
     if (F == nullptr || !F->lane_pending) return true;
@@ -2019,7 +2151,8 @@ bool Glm5Model::fast_setup_finish(std::string& err) {
     if (const char* h = getenv("STRATA_GLM_EXPERT_HELPER"); h != nullptr && h[0] != '\0')
         if (!fast_helper_setup(err)) return false;
     F->svc = std::thread([this] { fast_service(); });
-    glmfast::pin_thread(F->svc.native_handle(), F->cpu_pin);   // (the CPU lane's last worker: on its pool's node)
+    const std::vector<int> svc_cpus = cpu_list_env("STRATA_GLM_SVC_CPUS" + std::to_string(dev_));
+    glmfast::pin_thread(F->svc.native_handle(), svc_cpus.empty() ? F->cpu_pin : svc_cpus);   // (the CPU lane's last worker: on its pool's node)
     return true;
 }
 
@@ -2501,6 +2634,34 @@ void x3_jobs(glmfast::Workers& pool, int n, int E, int FF, const GP& gu_prep, co
 // a route's CPU-lane experts on `pool` with the scratch rows act / hq / ff / dn / x3 (fast_cpu_experts: cpu_pool and
 // the lane's own rows; a verify window's lanes: their pools and rows) - each row's dot is one job's, so the answer is
 // the same bit for bit whatever the pool
+// STRATA_GLM_LANE_PROF=1: the CPU lane's calls timed by stage (activation quant, gate/up, h quant, down, sum), with
+// their experts a call, printed every 4096 calls (all parts together)
+struct LaneProf {
+    std::atomic<uint64_t> calls{0}, experts{0}, us[5] = {}, ne_hist[9] = {};
+    static bool on() {
+        static const bool v = getenv("STRATA_GLM_LANE_PROF") != nullptr;
+        return v;
+    }
+    void add(int ne, const std::chrono::steady_clock::time_point* t) {
+        for (int k = 0; k < 5; ++k)
+            us[k].fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t[k + 1] - t[k]).count(),
+                            std::memory_order_relaxed);
+        experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+        ne_hist[std::min(8, ne)].fetch_add(1, std::memory_order_relaxed);
+        const uint64_t c = calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c % 4096 == 0) {
+            const double n = (double) c;
+            std::fprintf(stderr, "glm lane prof: %llu calls, %.2f experts a call | us a call: act %.1f, gate/up %.1f, h %.1f, "
+                                 "down %.1f, sum %.1f | calls by experts 1-4: %llu %llu %llu %llu\n",
+                         (unsigned long long) c, (double) experts.load() / n, us[0].load() / n / 1e3, us[1].load() / n / 1e3,
+                         us[2].load() / n / 1e3, us[3].load() / n / 1e3, us[4].load() / n / 1e3,
+                         (unsigned long long) ne_hist[1].load(), (unsigned long long) ne_hist[2].load(),
+                         (unsigned long long) ne_hist[3].load(), (unsigned long long) ne_hist[4].load());
+        }
+    }
+};
+static LaneProf g_lane_prof;
+
 void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, float* ff, float* dn, float* x3,
                              int il, int ne, const uint8_t* const* blob, const float* w, const float* x, float* out) {
     FastState* F = fast_;
@@ -2555,7 +2716,71 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
     }
     const int threads = pool.active();
     const int T = threads * (kSplit > 0 ? kSplit : std::max(1, std::min(8, 48 / std::max(1, threads))));
+    const bool lprof = LaneProf::on();
+    std::chrono::steady_clock::time_point lt[6];
+    const auto mark = [&](int k) {
+        if (lprof) lt[k] = std::chrono::steady_clock::now();
+    };
+    mark(0);
     kc::native_quant_act(nf, x, act);
+    mark(1);
+    // STRATA_GLM_ROW_HALVES' arenas (row_halves_of): the low half of each matrix's rows on node n0, the high half on n1.
+    // Each phase's rows then go in two queues, one a node, and a thread takes its own node's jobs first, the other's
+    // after - the rows and their arithmetic are the shared queue's below, so the answers are the same bit for bit
+    const RowHalves* rh0 = ne <= 8 && n_ff % 2 == 0 && n_embd % 2 == 0 ? row_halves_of(blob[0]) : nullptr;
+    for (int i = 1; rh0 != nullptr && i < ne; ++i)
+        if (const RowHalves* rh = row_halves_of(blob[i]); rh == nullptr || rh->n0 != rh0->n0 || rh->n1 != rh0->n1)
+            rh0 = nullptr;
+    if (rh0 != nullptr) {
+        const int J = std::max(1, T / 2);   // jobs a node and phase
+        const int n0 = rh0->n0;
+        // phase: rows [0, R) of each of the ne experts, half h of them ([0, R/2) or [R/2, R)) on node h's queue;
+        // job j of a queue covers its flattened rows [tot * j / J, tot * (j + 1) / J)
+        const auto phase = [&](int R, const auto& rows_fn) {
+            const int half = R / 2, tot = ne * half;
+            alignas(64) std::atomic<int> qp[2];
+            qp[0].store(0, std::memory_order_relaxed);
+            qp[1].store(0, std::memory_order_relaxed);
+            pool.run(2 * J, [&](int) {
+                const int me = cpu_node_now() == n0 ? 0 : 1;
+                for (int t = 0; t < 2; ++t) {
+                    const int h = t == 0 ? me : 1 - me;
+                    const int j = qp[h].fetch_add(1, std::memory_order_acq_rel);
+                    if (j >= J) continue;
+                    const int q1 = (int) ((int64_t) tot * (j + 1) / J);
+                    for (int q = (int) ((int64_t) tot * j / J); q < q1;) {
+                        const int i = q / half, r0 = q % half, r1 = std::min(half, r0 + (q1 - q));
+                        rows_fn(i, h * half + r0, h * half + r1);
+                        q += r1 - r0;
+                    }
+                    return;
+                }
+            });
+        };
+        phase(n_ff, [&](int i, int r0, int r1) {
+            const void* a[1] = {act};
+            float* o[1] = {ff + (size_t) i * n_ff};
+            kc::native_gu_rows_split(nf, blob[i], blob[i] + Ly.gu_bytes, a, 1, o, r0, r1, g.swiglu_exp);
+        });
+        mark(2);
+        for (int i = 0; i < ne; ++i)
+            kc::native_quant_h(nf, ff + (size_t) i * n_ff, hq + (size_t) i * kc::kNativeHBytes);
+        mark(3);
+        phase(n_embd, [&](int i, int r0, int r1) {
+            const void* h[1] = {hq + (size_t) i * kc::kNativeHBytes};
+            float* o[1] = {dn + (size_t) i * n_embd};
+            kc::native_down_rows_split(nf, blob[i] + Ly.down_off, h, 1, o, r0, r1);
+        });
+        mark(4);
+        for (int r = 0; r < n_embd; ++r) {
+            float m = 0.0f;
+            for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
+            out[r] = m;
+        }
+        mark(5);
+        if (lprof) g_lane_prof.add(ne, lt);
+        return;
+    }
     const int gu_tot = ne * n_ff;
     pool.run(T, [&](int job) {
         const void* a[1] = {act};
@@ -2567,8 +2792,10 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             q += r1 - r0;
         }
     });
+    mark(2);
     for (int i = 0; i < ne; ++i)
         kc::native_quant_h(nf, ff + (size_t) i * n_ff, hq + (size_t) i * kc::kNativeHBytes);
+    mark(3);
     const int dn_tot = ne * n_embd;
     pool.run(T, [&](int job) {
         const int q1 = (int) ((int64_t) dn_tot * (job + 1) / T);
@@ -2580,11 +2807,14 @@ void Glm5Model::lane_experts(glmfast::Workers& pool, uint8_t* act, uint8_t* hq, 
             q += r1 - r0;
         }
     });
+    mark(4);
     for (int r = 0; r < n_embd; ++r) {
         float m = 0.0f;
         for (int i = 0; i < ne; ++i) m += w[i] * dn[(size_t) i * n_embd + r];
         out[r] = m;
     }
+    mark(5);
+    if (lprof) g_lane_prof.add(ne, lt);
 }
 
 // A verify window's CPU lane (FastState::win_lane): the routes the service thread hands it, each run on the lane's pool
@@ -2954,6 +3184,19 @@ void Glm5Model::fast_cpu_experts(int il, int ne, const uint8_t* const* blob, con
 // The CPU lane's pool a split's parts share (fast_cpu_lane_setup): made by the first part, found by the later ones -
 // one model a process; a reload, or another count, makes a new one.  Concurrent (Workers): the parts' routes run at
 // once, a later part's jobs first (STRATA_GLM_CPU_CONCURRENT=0: one route at a time - A/B)
+// STRATA_GLM_POOL_CPUS=<cpu,cpu,...>: the shared pool's workers one to a CPU, in that order (unset: unpinned);
+// STRATA_GLM_SVC_CPUS<n>=<cpu,...>: CUDA<n>'s service thread (its routes' last worker) on those CPUs
+static std::vector<int> cpu_list_env(const std::string& name) {
+    std::vector<int> v;
+    const char* e = getenv(name.c_str());
+    if (e == nullptr) return v;
+    std::stringstream ss(e);
+    std::string t;
+    while (std::getline(ss, t, ','))
+        if (!t.empty()) v.push_back(std::atoi(t.c_str()));
+    return v;
+}
+
 static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     static std::mutex mu;
     static std::weak_ptr<glmfast::Workers> held;
@@ -2964,7 +3207,8 @@ static std::shared_ptr<glmfast::Workers> shared_cpu_pool(int threads) {
     std::lock_guard<std::mutex> lk(mu);
     std::shared_ptr<glmfast::Workers> p = held.lock();
     if (p == nullptr || p->size() != threads) {
-        p = std::make_shared<glmfast::Workers>(threads - 1, 20000, std::vector<int>{}, concurrent);
+        const std::vector<int> cpus = cpu_list_env("STRATA_GLM_POOL_CPUS");
+        p = std::make_shared<glmfast::Workers>(threads - 1, 20000, cpus, concurrent, !cpus.empty());
         held = p;
     }
     return p;
@@ -3131,6 +3375,16 @@ bool Glm5Model::fast_cpu_lane_setup(std::string& err) {
             const int n_cores = (int) (std::unique(pc.begin(), pc.end()) - pc.begin());
             threads = n_cores < (int) pin_cpus.size() ? std::max(2, n_cores)
                                                       : std::max(2, (int) pin_cpus.size() - spare);
+        }
+    }
+    // STRATA_GLM_LANE_CPUS<n>=<cpu,...>: CUDA<n>'s own pool (a count of its own, STRATA_GLM_CPU_LANE<n>) on exactly
+    // these CPUs - e.g. cores of BOTH sockets, so that with STRATA_GLM_ROW_HALVES each pool's threads read their own
+    // node's half of every expert while the split's pools run at once (several conversations: every part busy)
+    if (own_count && threads > 0) {
+        const std::vector<int> mine = cpu_list_env("STRATA_GLM_LANE_CPUS" + std::to_string(dev_));
+        if (!mine.empty()) {
+            pin_cpus = mine;
+            pin_node = -1;
         }
     }
     if (threads <= 0 || g.n_embd > 4096 || g.n_exp_used > 8) return true;
@@ -4425,6 +4679,26 @@ void Glm5Model::fast_service() {
             last_route = std::chrono::steady_clock::now();
         }
         std::atomic_thread_fence(std::memory_order_acquire);
+        // STRATA_GLM_PF_CE: this route's prefetch copies first, on the copy engine, then its seq into the flag on the
+        // same stream (the flag lands after the experts; the next layer waits for it)
+        if (F->pf_ce && rq->error == 0 && rq->pf_n > 0 && rq->layer + 1 < (int) F->layer_rc.size() &&
+            F->layer_rc[(size_t) rq->layer + 1] >= 0) {
+            const int il1 = rq->layer + 1;
+            const auto& R1 = F->rc[(size_t) F->layer_rc[(size_t) il1]];
+            const size_t bb = F->L[(size_t) il1].blob;
+            for (int q2 = 0; q2 < rq->pf_n && q2 < 8; ++q2) {
+                const int rs = F->ram_of[(size_t) il1 * g_.n_expert + rq->pf_ids[q2]];
+                if (rs < 0 || rq->pf_ptr[q2] == 0ull) {
+                    F->pfce_lost.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
+                cudaMemcpyAsync((void*) rq->pf_ptr[q2], R1.slot((size_t) rs), bb, cudaMemcpyHostToDevice, F->pfce_stream);
+                F->pfce_copies.fetch_add(1, std::memory_order_relaxed);
+            }
+            unsigned int* sv = F->pfce_seq_h + (sq % gf::kRingSize);
+            *sv = sq;
+            cudaMemcpyAsync(F->pf_flag_d, sv, sizeof(unsigned int), cudaMemcpyHostToDevice, F->pfce_stream);
+        }
         // (the lanes are made at the CPU lane's setup, after this thread started; an EXL3 pack's merged rows with them)
         // A batched rows step's group (STRATA_GLM_GROUP_EXPERTS, win_rows) is held the same way and merged on this part's
         // own pool - the other part works on its own group meanwhile; not with a helper GPU (it answers per route)
@@ -5722,6 +5996,10 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     }();
     const bool pf = pred && F->max_pf > 0;
     const auto issue_prefetch = [&] {
+        if (F->pf_ce) {   // the copies are the service thread's (on its copy engine): only the need, for the next layer
+            gf::moe_pf_need(md, (unsigned int*) (F->pf_n_buf[il & 1] + 4), s);
+            return;
+        }
         cudaEventRecord(F->ev_pred, s);
         cudaStreamWaitEvent(F->ps, F->ev_pred, 0);
         gf::moe_prefetch(md, F->L[(size_t) il + 1].blob, F->ps);
@@ -5747,7 +6025,12 @@ bool Glm5Model::fast_moe_experts(int il, const MoeIo& io, bool pred, int n_ah, c
     }
     if (pf && pf_at == 1) issue_prefetch();
     // this layer's own prefetched experts (issued one layer ago) must have landed before they are read
-    if (pf_pending) cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
+    if (pf_pending) {
+        if (F->pf_ce)
+            gf::moe_pf_wait((const unsigned int*) (F->pf_n_buf[(il - 1) & 1] + 4), F->pf_flag_d, s);
+        else
+            cudaStreamWaitEvent(s, F->ev_pf_prev, 0);
+    }
     pf_pending = false;
     if (Ly.exl3) {
         // EXL3: the shared expert's down first (its h is moe_route's q8_1), then the routed experts' gate/up/swiglu
@@ -5803,9 +6086,13 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
     float* Rc = state_;
     float* Ro = state_ + (int64_t) g.hc * g.n_embd;
     const char* graph_opt = getenv("STRATA_GLM_KDA_GRAPH");
-    const bool graphs = graph_opt && std::atoi(graph_opt) != 0 && n_parts_ == 1 && !hop_in &&
-                        mtp_il_ < 0 && !F->prof_on && !dumps && F->max_pf == 0 && F->n_ahead == 0 &&
+    const bool graphs = graph_opt && std::atoi(graph_opt) != 0 && (F->win.pipe_t < 8) && !F->spec_gate &&
+                        !F->prof_on && !dumps && F->max_pf == 0 && F->n_ahead == 0 &&
                         getenv("GLM_DUMP_H") == nullptr && cap_d_ == nullptr;
+    static const bool dsa_ffn_graphs = [] {
+        const char* v = getenv("STRATA_GLM_DSA_FFN_GRAPH");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
     F->kda_graph_on = graphs;
     // STRATA_GLM_DEFER_CPU=1 (LOSSY, after lighttransport/Strata glm53f's expert deferral): a MoE layer's CPU-lane
     // experts are added after the NEXT layer's mixer instead of before its read - the CPU's work overlaps that layer's
@@ -5916,49 +6203,61 @@ bool Glm5Model::fast_layers(int64_t p, bool hop_in, std::string& err) {
             if (F->prof_on) F->mark("moe_cpu_wait");
         }
         // ---- the FFN-side read (fused with the mixer's write)
-        h.block_out = F->mixer;
-        h.R_old = Rc;
-        h.R_new = Ro;
-        h.w_fn = Ly.hc_ffn_fn;
-        h.w_scale = Ly.hc_ffn_scale;
-        h.w_base = Ly.hc_ffn_base;
-        h.norm_w = Ly.ffn_norm;
-        gf::hc(h, s);
-        if (F->prof_on) F->mark("hc_ffn");
-        std::swap(Rc, Ro);
-        if (dumps) {
-            const std::string Ls = std::to_string(il);
-            fast_dump(s, "hc_attn_post-" + Ls, Rc, (int64_t) g.hc * g.n_embd);
-            fast_dump(s, "ffn_norm-" + Ls, F->x, g.n_embd);
-            fast_dump(s, "mixer-" + Ls, F->mixer, g.n_embd);
-        }
-
-        if (!Ly.moe) {
-            gf::MvJob j[2];
-            j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
-            j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
-            if (!gf::mv(j, 2, s)) { err = "glm fast: dense ffn"; return false; }
-            if (F->prof_on) F->mark("dense_gu_mv");
-            gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
-            if (F->prof_on) F->mark("dense_swiglu");
-            gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
-                            g.n_embd};
-            if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
-            if (F->prof_on) F->mark("dense_down_mv");
-        } else {
-            const bool def = defer && il + 1 < l1_ && F->cpu_fmt[(size_t) il].n_ff > 0;
-            if (!fast_moe(il, pf_pending, err, !def)) return false;
-            if (def) {   // this layer's FFN-side post weights (the next read overwrites them)
-                cudaMemcpyAsync(F->defer_post, F->post, 8 * sizeof(float), cudaMemcpyDeviceToDevice, s);
-                deferred = true;
+        const auto ffn_body = [&]() -> bool {
+            gf::HcArgs hf = h;
+            hf.block_out = F->mixer;
+            hf.R_old = Rc;
+            hf.R_new = Ro;
+            hf.w_fn = Ly.hc_ffn_fn;
+            hf.w_scale = Ly.hc_ffn_scale;
+            hf.w_base = Ly.hc_ffn_base;
+            hf.norm_w = Ly.ffn_norm;
+            gf::hc(hf, s);
+            if (F->prof_on) F->mark("hc_ffn");
+            std::swap(Rc, Ro);
+            if (dumps) {
+                const std::string Ls = std::to_string(il);
+                fast_dump(s, "hc_attn_post-" + Ls, Rc, (int64_t) g.hc * g.n_embd);
+                fast_dump(s, "ffn_norm-" + Ls, F->x, g.n_embd);
+                fast_dump(s, "mixer-" + Ls, F->mixer, g.n_embd);
             }
+
+            if (!Ly.moe) {
+                gf::MvJob j[2];
+                j[0] = {Ly.ffn_gate.q, F->xq, F->x, F->dg, nullptr, 1.0f, Ly.ffn_gate.type, g.n_embd, g.n_ff_dense};
+                j[1] = {Ly.ffn_up.q, F->xq, F->x, F->du, nullptr, 1.0f, Ly.ffn_up.type, g.n_embd, g.n_ff_dense};
+                if (!gf::mv(j, 2, s)) { err = "glm fast: dense ffn"; return false; }
+                if (F->prof_on) F->mark("dense_gu_mv");
+                gf::swiglu_q8(F->dg, F->du, g.swiglu_shexp, g.n_ff_dense, F->dhq, s);
+                if (F->prof_on) F->mark("dense_swiglu");
+                gf::MvJob dn = {Ly.ffn_down.q, F->dhq, nullptr, F->ffn, nullptr, 1.0f, Ly.ffn_down.type, g.n_ff_dense,
+                                g.n_embd};
+                if (!gf::mv(&dn, 1, s)) { err = "glm fast: dense ffn down"; return false; }
+                if (F->prof_on) F->mark("dense_down_mv");
+            } else {
+                const bool def = defer && il + 1 < l1_ && F->cpu_fmt[(size_t) il].n_ff > 0;
+                if (!fast_moe(il, pf_pending, err, !def)) return false;
+                if (def) {   // this layer's FFN-side post weights (the next read overwrites them)
+                    cudaMemcpyAsync(F->defer_post, F->post, 8 * sizeof(float), cudaMemcpyDeviceToDevice, s);
+                    deferred = true;
+                }
+            }
+            if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
+            return true;
+        };
+        if (graphs && !Ly.recr && dsa_ffn_graphs) {
+            bool replayed = false;
+            const glmfast::LayerGraphs::Key key{F->cpu_plan, Rc, Ro, F->all_resident, F->win.pipe_t};
+            if (!F->kda_graphs.enqueue(il + 100, key, s, F->expected, Ly.moe ? 1 : 0, ffn_body, replayed, err))
+                return false;
+            if (replayed) std::swap(Rc, Ro);
+            return true;
         }
-        if (dumps) fast_dump(s, "ffn_out-" + std::to_string(il), F->ffn, g.n_embd);
-        return true;
+        return ffn_body();
         };
         if (graphs && Ly.recr) {
             bool replayed = false;
-            const glmfast::LayerGraphs::Key key{F->cpu_plan, Rc, Ro, F->all_resident};
+            const glmfast::LayerGraphs::Key key{F->cpu_plan, Rc, Ro, F->all_resident, F->win.pipe_t};
             if (!F->kda_graphs.enqueue(il, key, s, F->expected, Ly.moe ? 1 : 0, body, replayed, err))
                 return false;
             // Capture executes the host pointer swaps; replay only executes device
@@ -6124,7 +6423,12 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
     }
     const auto& Ly = F->L[(size_t) il];
     const int E = g.n_embd;
-    sub = sub && F->mtp_dv > 0;
+    static const bool full_head = [] {
+        const char* v = getenv("STRATA_GLM_MTP_FULL_HEAD");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    const bool sample_draft_on = mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0;
+    sub = (sub || (!full_head && !sample_draft_on)) && F->mtp_dv > 0;
     mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
     if (next_tok < 0) {
         if (F->mtp_emb == nullptr || step < 1) {
@@ -6636,13 +6940,9 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
         t0 = t;
     };
     Glm5Model* hl = spec_head_last();
-    // every part of the head group idle first: a part's hop slot and boundary must not race its previous position
-    for (Glm5Model* m = split_next_.get(); m != nullptr && m != hl->split_next_.get(); m = m->split_next_.get()) {
-        cudaSetDevice(m->dev_);
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm spec head part sync", err) ||
-            !m->fast_->route_ok(err) || !m->fast_boundary(err)) return false;
-    }
-    cudaSetDevice(dev_);
+    // sync the FIRST head part (this) and enqueue its layers BEFORE waiting for the later head parts (hl): on a wrong
+    // draft, CUDA0 finishes the redo q+2 ~8 ms before CUDA1 finishes q+2, so CUDA0 can start q+3 immediately in
+    // parallel with CUDA1's q+2 pass using double-buffered hop slot hsl = spec_n_ & 1
     if (!glmfast::cuda_ok(cudaStreamSynchronize(F->cs), "glm spec head sync", err) || !F->route_ok(err)) return false;
     // STRATA_GLM_SPEC_CANCEL: a speculative pass (decode_spec says so) reads the live word before every layer; it is
     // set now, with the stream idle, so no earlier pass reads it any more.  Other passes (a redo, the confirmed token's)
@@ -6692,16 +6992,37 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
         gf::set_skip(nullptr);
     }
     if (!layers_ok) return false;
-    for (Glm5Model* m = this; m != hl; m = m->split_next_.get())
-        if (!m->hop_to_next(m->split_next_.get(), p, err)) return false;
+    const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
+    const int hsl = (int) (spec_n_ & 1);
+    const int sl = (int) (p & 1);
+    if (this != hl) {
+        // hand off to the next head part through this part's double-buffered hop slot hsl (alternates every spec_head
+        // call, including redos at the same p, so CUDA0's next call never overwrites the slot CUDA1 is still reading)
+        cudaMemcpyAsync(spec_hop_h_[hsl], state_, hop, cudaMemcpyDeviceToHost, F->cs);
+        cudaEventRecord(spec_ev_hop_[hsl], F->cs);
+        Glm5Model* prev = this;
+        for (Glm5Model* m = split_next_.get(); m != nullptr && m != hl->split_next_.get();
+             prev = m, m = m->split_next_.get()) {
+            FastState* Fm = m->fast_;
+            cudaSetDevice(m->dev_);
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(Fm->cs), "glm spec head part sync", err) ||
+                !Fm->route_ok(err)) return false;
+            if (Fm->prof_on) Fm->collect();
+            if (!m->fast_boundary(err)) return false;
+            m->pos_ = p + 1;
+            cudaStreamWaitEvent(Fm->cs, prev->spec_ev_hop_[hsl], 0);
+            cudaMemcpyAsync(m->state_, prev->spec_hop_h_[hsl], hop, cudaMemcpyHostToDevice, Fm->cs);
+            if (!m->fast_layers(p, true, err)) return false;
+            const int out_sl = (m == hl) ? sl : hsl;
+            cudaMemcpyAsync(m->spec_hop_h_[out_sl], m->state_, hop, cudaMemcpyDeviceToHost, Fm->cs);
+            cudaEventRecord(m->spec_ev_hop_[out_sl], Fm->cs);
+        }
+    } else {
+        cudaMemcpyAsync(hl->spec_hop_h_[sl], hl->state_, hop, cudaMemcpyDeviceToHost, hl->fast_->cs);
+        cudaEventRecord(hl->spec_ev_hop_[sl], hl->fast_->cs);
+    }
     lap(3);
     ++spec_n_;
-    const int sl = (int) (p & 1);
-    // the head group's last part hands the residual to the tail group through hl's slots (events on hl's device)
-    cudaSetDevice(hl->dev_);
-    cudaMemcpyAsync(hl->spec_hop_h_[sl], hl->state_, (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyDeviceToHost,
-                    hl->fast_->cs);
-    cudaEventRecord(hl->spec_ev_hop_[sl], hl->fast_->cs);
     cudaSetDevice(dev_);
     if (sprof) {
         cudaEventRecord(spec_ev_[1], F->cs);
@@ -6711,7 +7032,7 @@ bool Glm5Model::spec_head(int64_t p, int32_t token, std::string& err) {
 }
 
 // the tail half (this) for position p: waits on the head's hop slot ON THE DEVICE, then its layers, the head and the
-// argmax (tok_h after ev_done)
+// argmax/sampler (tok_h after ev_done)
 bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
@@ -6732,6 +7053,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     ++spec_n_;
     pos_ = p + 1;
     const int sl = (int) (p & 1);
+    const size_t hop = (size_t) g.hc * g.n_embd * sizeof(float);
     if (sprof) {
         if (spec_ev_[0] == nullptr)
             for (auto& e : spec_ev_) cudaEventCreate(&e);
@@ -6742,23 +7064,48 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             ++spec_dev_n_;
         }
     }
-    for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) {
-        cudaSetDevice(m->dev_);
-        if (!glmfast::cuda_ok(cudaStreamSynchronize(m->fast_->cs), "glm spec tail part sync", err) ||
-            !m->fast_->route_ok(err) || !m->fast_boundary(err)) return false;
-        m->pos_ = p + 1;
-    }
-    cudaSetDevice(dev_);
+    // enqueue this first tail part's (CUDA2's) layers BEFORE syncing the later tail parts (CUDA3): CUDA3 is busy
+    // running fast_mtp for ~1.8 ms, and enqueueing CUDA2 first lets CUDA2 run its layers simultaneously with CUDA3's
+    // fast_mtp pass
     cudaStreamWaitEvent(F->cs, head->spec_ev_hop_[sl], 0);
     if (sprof) cudaEventRecord(spec_ev_[0], F->cs);
-    cudaMemcpyAsync(state_, head->spec_hop_h_[sl], (size_t) g.hc * g.n_embd * sizeof(float), cudaMemcpyHostToDevice,
-                    F->cs);
+    cudaMemcpyAsync(state_, head->spec_hop_h_[sl], hop, cudaMemcpyHostToDevice, F->cs);
     if (!fast_layers(p, true, err)) return false;
+    const auto enqueue_pick = [&](Glm5Model* m, FastState* FL) {
+        if (m->mtp_sample_ != nullptr && FL->spec_q != nullptr) {
+            strata::kernels::sample_verify(m->sc_ + m->sc_logits, 1, (int) g.n_vocab, *m->mtp_sample_,
+                                           (const strata::kernels::SpecList*) FL->spec_q, FL->mtp_tok, m->d_tok_,
+                                           FL->cs);
+            cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
+        } else if (m->mtp_sample_ != nullptr) {
+            m->pick_tokens(m->sc_ + m->sc_logits, 1, *m->mtp_sample_, nullptr, 0, m->d_tok_, FL->cs);
+            cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
+        } else {
+            gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
+            cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
+        }
+        cudaEventRecord(FL->ev_done, FL->cs);
+    };
     if (split_next_) {
-        // a tail GROUP: down its parts; the last one computes the head and the argmax
+        // a tail GROUP: down its parts; the last one computes the head and the pick
         Glm5Model* m = this;
-        for (; m->split_next_; m = m->split_next_.get())
-            if (!m->hop_to_next(m->split_next_.get(), p, err)) return false;
+        for (; m->split_next_; m = m->split_next_.get()) {
+            Glm5Model* next = m->split_next_.get();
+            FastState* FA = m->fast_;
+            FastState* FB = next->fast_;
+            cudaSetDevice(m->dev_);
+            cudaMemcpyAsync(FA->hop_h, m->state_, hop, cudaMemcpyDeviceToHost, FA->cs);
+            cudaEventRecord(FA->ev_hop, FA->cs);
+            cudaSetDevice(next->dev_);
+            if (!glmfast::cuda_ok(cudaStreamSynchronize(FB->cs), "glm spec tail part sync", err) ||
+                !FB->route_ok(err)) return false;
+            if (FB->prof_on) FB->collect();
+            if (!next->fast_boundary(err)) return false;
+            next->pos_ = p + 1;
+            cudaStreamWaitEvent(FB->cs, FA->ev_hop, 0);
+            cudaMemcpyAsync(next->state_, FA->hop_h, hop, cudaMemcpyHostToDevice, FB->cs);
+            if (!next->fast_layers(p, true, err)) return false;
+        }
         cudaSetDevice(m->dev_);
         FastState* FL = m->fast_;
         gf::head_prep(m->state_, m->w_.at("output_norm.weight"), g.norm_eps, g.n_embd, FL->head_x, FL->head_xq, FL->cs);
@@ -6770,9 +7117,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
             err = "glm spec: output head";
             return false;
         }
-        gf::argmax(m->sc_ + m->sc_logits, g.n_vocab, FL->tok, FL->cs);
-        cudaMemcpyAsync(FL->tok_h, FL->tok, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
-        cudaEventRecord(FL->ev_done, FL->cs);
+        enqueue_pick(m, FL);
         cudaSetDevice(dev_);
         return true;
     }
@@ -6784,9 +7129,7 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
         err = "glm spec: output head";
         return false;
     }
-    gf::argmax(sc_ + sc_logits, g.n_vocab, F->tok, F->cs);
-    cudaMemcpyAsync(F->tok_h, F->tok, sizeof(int), cudaMemcpyDeviceToHost, F->cs);
-    cudaEventRecord(F->ev_done, F->cs);
+    enqueue_pick(this, F);
     if (sprof) {
         cudaEventRecord(spec_ev_[1], F->cs);
         spec_ev_live_ = true;
@@ -6805,17 +7148,19 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
     Glm5Model* B = hl->split_next_.get();     // the tail group's first part (spec_tail runs from it)
     Glm5Model* TL = spec_tail_last();         // its last: the token, the logits and the draft block live there
     const Glm5Geometry& g = g_;
-    if (hl->spec_hop_h_[0] == nullptr) {
-        cudaSetDevice(hl->dev_);
-        for (int i = 0; i < 2; ++i)
-            if (cudaHostAlloc((void**) &hl->spec_hop_h_[i], (size_t) g.hc * g.n_embd * sizeof(float),
-                              cudaHostAllocPortable) != cudaSuccess ||
-                cudaEventCreateWithFlags(&hl->spec_ev_hop_[i], cudaEventDisableTiming) != cudaSuccess) {
-                err = "glm spec: the hop slots did not allocate";
-                return false;
-            }
-        cudaSetDevice(dev_);
+    for (Glm5Model* m = this; m != hl->split_next_.get(); m = m->split_next_.get()) {
+        if (m->spec_hop_h_[0] == nullptr) {
+            cudaSetDevice(m->dev_);
+            for (int i = 0; i < 2; ++i)
+                if (cudaHostAlloc((void**) &m->spec_hop_h_[i], (size_t) g.hc * g.n_embd * sizeof(float),
+                                  cudaHostAllocPortable) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&m->spec_ev_hop_[i], cudaEventDisableTiming) != cudaSuccess) {
+                    err = "glm spec: the hop slots did not allocate";
+                    return false;
+                }
+        }
     }
+    cudaSetDevice(dev_);
     // STRATA_GLM_SPEC_CANCEL=1 (opt-in): a wrong draft stops the head's speculative pass at its next layer (spec_head
     // arms a skip_gate before each of its layers) and the redo is enqueued at once, before the next draft - instead of
     // after the rest of a pass already known to be thrown away.  Only a head group of one GPU (two-GPU splits).
@@ -6885,20 +7230,21 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         std::fprintf(stderr, "glm spec: speculative sampling ON (MAYA_GLM_SPEC_SAMPLE) - sampled requests draw the draft "
                              "from the draft block and keep it with min(1, p/q)\n");
     }
-    struct MtpSampleOff {   // fast_mtp draws only inside this request's decode
+    const bool tail_samples = !sp.greedy && sp.penalty_last_n <= 0;
+    struct MtpSampleOff {   // fast_mtp / spec_tail draw only inside this request's decode
         Glm5Model* m;
         ~MtpSampleOff() { if (m != nullptr) m->mtp_sample_ = nullptr; }
-    } mtp_sample_off{spec_sample ? TL : nullptr};
-    if (spec_sample) TL->mtp_sample_ = &sp;
+    } mtp_sample_off{tail_samples ? TL : nullptr};
+    if (tail_samples) TL->mtp_sample_ = &sp;
     bool have_draft = false;   // the verify needs a draft drawn for its position: none before the first one
-    // the tail's token for its last position: the argmax it left, or a sample from its logits
+    // the tail's token for its last position: the argmax/sample spec_tail left in tok_h, or a sample from its logits
     const auto take = [&](int& y) -> bool {
-        if (sp.greedy && sp.penalty_last_n <= 0) {   // (the tail's argmax; penalties: picked through the sampler)
+        if ((sp.greedy || have_draft) && sp.penalty_last_n <= 0) {
             cudaSetDevice(TL->dev_);
             if (!glmfast::wait_event(TL->fast_->ev_done, "glm spec token", err)) return false;
             y = TL->fast_->tok_h[0];
         } else {
-            // the tail group's last part holds the logits (and, with speculative sampling, the draft's list)
+            // the prompt's first token (before spec_tail ran) or a request with repetition penalties
             y = (spec_sample && have_draft) ? TL->fast_sample_verify(sp, err) : TL->fast_sample(sp, err);
             if (y < 0) return false;
         }
@@ -6984,34 +7330,45 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         const bool more = emit(y2) && produced < max_new && q + 3 < max_ctx_;
         if (!more) break;
         const bool wrong = d != y2;
-        // (STRATA_GLM_SPEC_CANCEL) a wrong draft: the head's speculative pass for q+2 stops at its next layer, its
-        // states are restored behind it and the redo goes in now - the head redoes q+2 while the tail drafts
-        if (cancel && wrong) {
-            *(volatile int*) fast_->spec_live_h = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            kda_all(true);
+        // a wrong draft: the head's standing speculative pass for q+2 is redone with the true token.  This must go
+        // BEFORE the tail's q+2 enqueue: the tail's pass snapshots the head's hop event as it is enqueued, so the
+        // redo's hop record has to be the one in place already.  (STRATA_GLM_SPEC_CANCEL: the head's speculative
+        // pass stops at its next layer, its states are restored behind it and the redo goes in now - the head
+        // redoes q+2 while the tail drafts)
+        if (wrong) {
+            if (cancel) {
+                *(volatile int*) fast_->spec_live_h = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                kda_all(true);
+            } else {
+                kda_all(true);
+            }
             if (!spec_head(q + 2, y2, err)) { ok = false; break; }
             lap(2);
         }
-        // (2) the draft for q+3 from (h_{q+1}, y2)
-        int d2 = -1;
-        if (!draft(q + 1, y2, d2)) { ok = false; break; }
-        lap(1);
-        // (3) the head's speculative position q+2 stands iff its draft was y2; else restore and redo it
-        ++spec_steps_;
-        if (!wrong) {
-            ++spec_hits_;
-        } else if (!cancel) {
-            kda_all(true);
-            if (!spec_head(q + 2, y2, err)) { ok = false; break; }
-        }
-        lap(2);
-        // (4) the tail's next position goes in first (it waits for the head's hop on the device), then the head's
-        //     next speculative position (its boundary waits for the head's current one)
+        // (2) the draft for q+3 from (h_{q+1}, y2) is enqueued BEFORE the tail's q+2 pass: the drafter reads the
+        //     tail's head_x for position q+1, which the q+2 pass's own head would overwrite once its kernels run
+        //     (stream order).  The host waits for it after enqueuing the tail's pass below.
+        int64_t dp = q + 1;
+        cudaSetDevice(TL->dev_);
+        if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
+        // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
+        //     layers while the host waits for the draft (and the head group's next enqueue)
         if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
         lap(3);
         kda_all(false);
         if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
+        cudaSetDevice(TL->dev_);
+        if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err)) { ok = false; break; }
+        int d2 = TL->fast_->mtp_tok_h[0];
+        if (!TL->fast_->route_ok(err)) { ok = false; break; }
+        lap(1);
+        have_draft = true;
+        // (3) the head's speculative position q+2 stood iff its draft was y2 (redone above otherwise)
+        ++spec_steps_;
+        if (!wrong) ++spec_hits_;
+        // (5) the head's next speculative position (its boundary waits for the head's current one)
+        cudaSetDevice(dev_);
         if (!spec_head(q + 3, d2, err)) { ok = false; break; }
         lap(4);
         ++np;

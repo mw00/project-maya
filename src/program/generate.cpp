@@ -2355,8 +2355,14 @@ static int glm_pack_generate(const Options& o) {
         } else if (std::strcmp(finish, "cancel") != 0 && model.fast() && model.spec_ready()) {
             // the pipelined speculative decode: the two halves of the split work on consecutive tokens, the head
             // running the NextN block's draft (same tokens as the loop below)
+            // STRATA_GLM_SPEC_WIN=1: the MTP drafts + the pipelined verify window through a split (decode_spec_pipe)
             int64_t n_spec = 0;
-            if (!model.decode_spec(sp, max_new, on_token, n_spec, err)) {
+            int spec_win = 0;
+            if (const char* e = getenv("STRATA_GLM_SPEC_WIN")) spec_win = std::atoi(e) != 0;
+            const bool piped = spec_win != 0;
+            const bool done_ok = piped ? model.decode_spec_pipe(sp, max_new, on_token, n_spec, err)
+                                       : model.decode_spec(sp, max_new, on_token, n_spec, err);
+            if (!done_ok) {
                 drop_if_poisoned(prompt, err);
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -2787,6 +2793,11 @@ static int glm_pack_generate(const Options& o) {
     // windows' drafts - the next group's last part is queued between the drafts and their wait, so the last GPU goes
     // on with it; the requests that ended, ended
     const auto win_take = [&]() -> bool {
+        // phase timing of a rows path's round (STRATA_GLM_MTPW_TRACE=1): the wait for the picks, the accept + the
+        // commit, the next round's drafts, the whole wall
+        static const bool trace = getenv("STRATA_GLM_MTPW_TRACE") != nullptr &&
+                                  std::atoi(getenv("STRATA_GLM_MTPW_TRACE")) != 0;
+        const auto t_round0 = std::chrono::steady_clock::now();
         WinGroup w = std::move(wflight.front());
         wflight.pop_front();
         const int n = (int) w.seqs.size();
@@ -2794,6 +2805,8 @@ static int glm_pack_generate(const Options& o) {
         for (const int c : w.counts) rows += c;
         std::vector<int32_t> picks((size_t) rows);
         if (!win_back(w) || !model.mtpw_picks(w.seqs.data(), w.counts.data(), n, picks.data(), err)) return false;
+        const double t_picks = trace ? std::chrono::duration<double, std::milli>(
+                                           std::chrono::steady_clock::now() - t_round0).count() : 0.0;
         std::vector<int> keep((size_t) n, 1), nd((size_t) n, 0);
         std::vector<int32_t> written, last((size_t) n, -1);
         std::vector<char> ended((size_t) n, 0);
@@ -2841,6 +2854,8 @@ static int glm_pack_generate(const Options& o) {
             }
         }
         if (!model.mtpw_commit(w.seqs.data(), w.counts.data(), keep.data(), n, err)) return false;
+        const double t_commit = trace ? std::chrono::duration<double, std::milli>(
+                                            std::chrono::steady_clock::now() - t_round0).count() : 0.0;
         if (!model.mtpw_draft_queue(w.seqs.data(), keep.data(), n, written.data(), last.data(), nd.data(), err))
             return false;
         if (!wflight.empty() && !win_back(wflight.front())) return false;
@@ -2859,6 +2874,15 @@ static int glm_pack_generate(const Options& o) {
         for (int i = 0; i < n; ++i)
             if (ended[(size_t) i]) gen_finish(*w.g[(size_t) i]);
         since_boundary += n;
+        if (trace) {
+            const double now = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_round0).count();
+            int got = 0;
+            for (const int k : keep) got += k;
+            std::fprintf(stderr, "glm mtpw trace: rows %d (groups %d) -> committed %d in %.2f ms | picks+back %.2f | "
+                                 "accept+commit %.2f | drafts %.2f\n",
+                         rows, n, got, now, t_picks, t_commit - t_picks, now - t_commit);
+        }
         return true;
     };
     // every issued token back (before a prompt, a boundary or the speculative path)
@@ -3193,6 +3217,55 @@ static int glm_pack_generate(const Options& o) {
             std::none_of(gens.begin(), gens.end(), [](const std::unique_ptr<Gen>& p) { return p->ready && !p->done; }))
             flush_pauses();
         Gen* only = gens.size() == 1 ? gens[0].get() : nullptr;
+        static const bool spec_win_env = [] {
+            const char* e = getenv("STRATA_GLM_SPEC_WIN");
+            return e != nullptr && std::atoi(e) != 0;
+        }();
+        if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready() && spec_win_env) {
+            Gen& g = *only;
+            bind_ctx(g.ctx);
+            if (g.pending >= 0) {   // its last token through the token path: the next one's logits on the tail
+                if (!model.forward({g.pending}, lg, err)) {
+                    multi_fail(err);
+                    return;
+                }
+                g.pending = -1;
+            }
+            g.ready = false;
+            model.force_next(g.force);
+            g.force = -1;
+            int32_t last = -1, forced_unused = -1;
+            bool interrupted = false;
+            int64_t n_spec = 0;
+            const bool ok = model.decode_spec_pipe(g.sp, g.max_new - g.produced, [&](int tok) {
+                forced_unused = -1;   // a force handed over is consumed by the token that comes next
+                last = tok;
+                if (!gen_token(g, tok)) return false;
+                if (g.force >= 0) {
+                    model.force_next(g.force);
+                    forced_unused = g.force;
+                    g.force = -1;
+                }
+                if (input_pending()) {
+                    interrupted = true;
+                    return false;
+                }
+                return true;
+            }, n_spec, err);
+            if (forced_unused >= 0) {   // handed over, never taken: it stays the request's
+                g.force = forced_unused;
+                model.force_next(-1);
+            }
+            if (!ok) {
+                multi_fail(err);
+                return;
+            }
+            // not interrupted by input: the pipelined decode ended the request (a stop, its budget, the context)
+            if (interrupted) g.pending = last;
+            else gen_finish(g);
+            gen_sweep();
+            return;
+        }
         if (only != nullptr && !only->inflight && multi_spec && !step_no_spec && model.spec_ready()) {
             Gen& g = *only;
             bind_ctx(g.ctx);

@@ -411,6 +411,10 @@ void moe_cpu_wait(const MoeDev& d, int n_embd, float* out, cudaStream_t s);
 void moe_cpu_wait_streams(const MoeDev& d, int n_embd, const float* post, float* R, int hc, cudaStream_t s);
 /// The side stream's copy of the prefetch list (pf_src -> pf_dst, pf_n entries of blob_bytes each).
 void moe_prefetch(const MoeDev& d, size_t blob_bytes, cudaStream_t s);
+/// STRATA_GLM_PF_CE: need = (this route prefetched anything) ? its seq : 0 - read after the route, on its stream
+void moe_pf_need(const MoeDev& d, unsigned int* need, cudaStream_t s);
+/// STRATA_GLM_PF_CE: hold the stream until flag reaches need (no-op for need 0; gives up after ~25 s)
+void moe_pf_wait(const unsigned int* need, const unsigned int* flag, cudaStream_t s);
 /// Waits (on the device) for the host's response when the last route had misses, then applies it.
 void moe_wait(const MoeDev& d, int n_embd, cudaStream_t s);
 /// Copies every planned expert with a fetch source from the RAM tier (host-mapped) into its VRAM slot.

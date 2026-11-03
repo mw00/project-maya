@@ -127,11 +127,14 @@ class Workers {
 public:
     // spin_us: how long an idle worker spins for the next batch before it sleeps; cpus: the CPUs the workers run on
     // (empty: any)
-    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false)
+    // (one_to_one: worker i on cpus[i] alone, the rest on all of them)
+    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false,
+                     bool one_to_one = false)
         : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent) {
         for (int i = 0; i < n; ++i) {
             th_.emplace_back([this, i] { concurrent_ ? loop_c(i) : loop(i); });
-            pin_thread(th_.back().native_handle(), cpus);
+            pin_thread(th_.back().native_handle(),
+                       one_to_one && i < (int) cpus.size() ? std::vector<int>{cpus[(size_t) i]} : cpus);
         }
     }
     ~Workers() {
@@ -384,7 +387,14 @@ struct Glm5Model::FastState {
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
     std::atomic<uint64_t> prefetches{0};
     unsigned long long* pf_buf[2] = {nullptr, nullptr};   // [src 8 | dst 8] per layer parity
-    int* pf_n_buf[2] = {nullptr, nullptr};
+    int* pf_n_buf[2] = {nullptr, nullptr};   // (+ word 4: STRATA_GLM_PF_CE's need - the route's seq, 0: no copies)
+    // STRATA_GLM_PF_CE=1: the prefetch's copies on a copy engine, issued by the service thread (no SMs held); the next
+    // layer waits for pf_flag_d (written after the copies on the same stream) to reach its need
+    bool pf_ce = false;
+    cudaStream_t pfce_stream = nullptr;
+    unsigned int* pf_flag_d = nullptr;
+    unsigned int* pfce_seq_h = nullptr;   // [kRingSize] pinned: the value each route's flag copy writes
+    std::atomic<uint64_t> pfce_copies{0}, pfce_lost{0};
     void* arena = nullptr;
     size_t arena_bytes = 0;
     size_t scratch_bytes = 0, win_bytes = 0;   // the scratch slots; the verify window's buffers (the VRAM report)
