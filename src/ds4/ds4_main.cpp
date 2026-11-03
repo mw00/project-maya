@@ -2567,11 +2567,18 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         });
         eng.run();
         reader.join();
+        // Each idle sequence still owns its conversation when the parallel scheduler exits.
+        if (slot_max > 0) {
+            for (int s = 0; s < nseq; ++s) {
+                bind(s);
+                slot_put(" as the parallel engine ended");
+            }
+        }
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
     // RAM is written to the folder, so the next run reads on from them
     if (slot_max > 0) {
-        slot_put(" as the engine ended");
+        if (!multi) slot_put(" as the engine ended");
         size_t written = 0;
         while (true) {   // (a write can take the folder's least recently used conversation away: the list is asked again)
             size_t i = SIZE_MAX;
