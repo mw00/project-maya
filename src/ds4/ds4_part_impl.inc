@@ -22,6 +22,10 @@ bool part_defer = false;    // a front: forward() keeps its window's frame in pa
 int part_timeout_ms = 20000;
 part::Writer part_w;
 double part_net_ms = 0, part_wait_ms = 0, part_local_ms = 0;   // a front: time sending; waiting for replies; own layers
+double part_remote_ms = 0;   // a front: the part's own time on the calls it answered (it says so in each answer)
+double part_busy_ms = 0;     // a part: its time on the calls since its last answer
+double part_busy_total = 0;
+int64_t part_waits = 0, part_pre_hits = 0;
 int64_t part_rounds = 0, part_tx_bytes = 0;
 struct PartSrc {
     int sidx = -1;
@@ -55,7 +59,7 @@ struct PartRows {
     };
     std::vector<S> src;
     const uint8_t* hand = nullptr;
-    int T = 0;
+    int T = 0, r0 = 0;   // the hand-off's rows: [r0, T) of the window / chunk
     int k = -1;
 };
 const PartRows* part_cur = nullptr;
@@ -105,7 +109,7 @@ void part_src_rows(int s, int64_t p0, int T, int64_t& g_first, int& ng) const {
     ng = (int) std::max<int64_t>(0, (p0 + T) / sr.ratio - g_first);
 }
 // the header of a rows block (sources, then the hand-off of T rows or none) and its raw bytes
-size_t part_rows_hdr(part::Writer& w, int64_t p0, int T, bool hand, int dev) const {
+size_t part_rows_hdr(part::Writer& w, int64_t p0, int T, bool hand, int dev, int r0 = 0) const {
     size_t raw = 0;
     w.put<uint32_t>((uint32_t) part_srcs.size());
     for (const PartSrc& ps : part_srcs) {
@@ -122,12 +126,14 @@ size_t part_rows_hdr(part::Writer& w, int64_t p0, int T, bool hand, int dev) con
         raw += (size_t) ng * ((hc ? ckv_rb() : 0) + (hi ? ik_rb() : 0));
     }
     w.put<int32_t>(hand ? T : 0);
-    if (hand) raw += (size_t) T * part_hand_row();
+    w.put<int32_t>(hand ? r0 : 0);
+    if (hand) raw += (size_t) (T - r0) * part_hand_row();
     return raw;
 }
 // the raw bytes after it, from device dev into dst on stream s: each source's KV rows, its index keys, then the four
 // parts of the hand-off (x: the window's or the chunk's buffers)
-bool part_rows_d2h(uint8_t* dst, int64_t p0, int T, const Xfer* hand, int dev, cudaStream_t s, std::string& err) {
+bool part_rows_d2h(uint8_t* dst, int64_t p0, int T, const Xfer* hand, int dev, cudaStream_t s, std::string& err,
+                   int r0 = 0) {
     for (const PartSrc& ps : part_srcs) {
         const Src& sr = srcs[(size_t) ps.sidx];
         int64_t gf;
@@ -146,9 +152,10 @@ bool part_rows_d2h(uint8_t* dst, int64_t p0, int T, const Xfer* hand, int dev, c
         }
     }
     if (hand != nullptr)
-        for (int i = 0; i < hand->n; ++i) {
-            CK(cudaMemcpyAsync(dst, hand->src[i], hand->bytes[i], cudaMemcpyDeviceToHost, s));
-            dst += hand->bytes[i];
+        for (int i = 0; i < hand->n; ++i) {   // (each part's rows [r0, T))
+            const size_t row = hand->bytes[i] / (size_t) T, n = (size_t) (T - r0) * row;
+            CK(cudaMemcpyAsync(dst, (const uint8_t*) hand->src[i] + (size_t) r0 * row, n, cudaMemcpyDeviceToHost, s));
+            dst += n;
         }
     return true;
 }
@@ -172,7 +179,8 @@ bool part_rows_parse(part::Reader& r, PartRows& pr) {
         ms.push_back(m);
     }
     pr.T = r.get<int32_t>();
-    if (r.bad) return false;
+    pr.r0 = r.get<int32_t>();
+    if (r.bad || pr.r0 < 0 || (pr.T > 0 && pr.r0 >= pr.T)) return false;
     pr.src.clear();
     for (const M& m : ms) {
         if (m.sidx < 0 || m.sidx >= (int) srcs.size()) return false;
@@ -181,7 +189,7 @@ bool part_rows_parse(part::Reader& r, PartRows& pr) {
         if (m.hi) s.ik = r.bytes((size_t) m.ng * ik_rb());
         pr.src.push_back(s);
     }
-    pr.hand = pr.T > 0 ? r.bytes((size_t) pr.T * part_hand_row()) : nullptr;
+    pr.hand = pr.T > 0 ? r.bytes((size_t) (pr.T - pr.r0) * part_hand_row()) : nullptr;
     return !r.bad;
 }
 // a part server: the sources' rows of pr into this device's copies (before the first layer reads them)
@@ -205,8 +213,9 @@ bool part_hand_h2d(const PartRows& pr, const Xfer& x, int T, cudaStream_t s, std
     }
     const uint8_t* q = pr.hand;
     for (int i = 0; i < x.n; ++i) {
-        CK(cudaMemcpyAsync(x.dst[i], q, x.bytes[i], cudaMemcpyHostToDevice, s));
-        q += x.bytes[i];
+        const size_t row = x.bytes[i] / (size_t) T, n = (size_t) (T - pr.r0) * row;
+        CK(cudaMemcpyAsync((uint8_t*) x.dst[i] + (size_t) pr.r0 * row, q, n, cudaMemcpyHostToDevice, s));
+        q += n;
     }
     return true;
 }
@@ -245,6 +254,13 @@ bool part_reply(std::vector<uint8_t>& out, std::string& err, int timeout_ms = -1
         part_lost(err);
         return false;
     }
+    if (out.size() >= 12) {   // (the part's busy time, after the status: taken out here)
+        double b = 0;
+        std::memcpy(&b, out.data() + 4, 8);
+        part_remote_ms += b;
+        out.erase(out.begin() + 4, out.begin() + 12);
+    }
+    ++part_waits;
     return true;
 }
 // the link is gone: the front takes every layer back; the conversation is read again before the next call uses it
@@ -339,8 +355,10 @@ bool part_verify(int y, const std::vector<int>& drafts, float temperature, float
     tk[0] = y;
     for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
     part_defer = true;
+    spec_win = true;
     const double tv = now_ms();
     const bool ok = forward(tk, T, T, err, 0);
+    spec_win = false;
     part_defer = false;
     if (!ok) return false;
     part_local_ms += now_ms() - tv;
@@ -362,14 +380,7 @@ bool part_verify(int y, const std::vector<int>& drafts, float temperature, float
     (void) r.get<int32_t>();
     const int m = r.get<int32_t>();
     next = r.get<int32_t>();
-    const int nd = r.get<int32_t>();
-    part_pre.have = nd >= 0;
-    part_pre.y = next;
-    part_pre.q = r.get<uint8_t>() != 0;
-    part_pre.d.assign((size_t) std::max(0, nd), 0);
-    part_pre.c.assign((size_t) std::max(0, nd), 0.0f);
-    for (int i = 0; i < nd; ++i) part_pre.d[(size_t) i] = r.get<int32_t>();
-    for (int i = 0; i < nd; ++i) part_pre.c[(size_t) i] = r.get<float>();
+    part_take_pre(r, next);
     if (r.bad || m < 0 || m > n) {
         err = "pool: a bad verify answer";
         part_lost(err);
@@ -404,11 +415,25 @@ bool part_draft(int y, std::vector<int>& out, std::vector<float>& conf, std::str
     a.cum_min = cum_min;
     a.min_n = min_n;
     const double t0 = now_ms();
-    if (part_pre.have && part_pre.y == y && a.same(part_dargs, part_pre.q)) {   // (drafted with the verify's answer)
-        out = part_pre.d;
-        conf = part_pre.c;
+    DraftArgs a_cut = a;   // (the pre-draft's: the whole block, cut here)
+    a_cut.max_n = part_dargs.max_n;
+    a_cut.conf_min = part_dargs.conf_min;
+    a_cut.cum_min = part_dargs.cum_min;
+    a_cut.min_n = part_dargs.min_n;
+    if (part_pre.have && part_pre.y == y && a_cut.same(part_dargs, part_pre.q)) {   // (drafted with the last answer)
+        out.clear();
+        conf.clear();
+        double cum = 1.0;
+        for (size_t i = 0; i < part_pre.d.size(); ++i) {   // (round()'s cut: draft_'s, on the block's rows)
+            if (max_n > 0 && (int) i >= max_n) break;
+            cum *= part_pre.c[i];
+            if ((int) i >= min_n && (part_pre.c[i] < conf_min || cum < cum_min)) break;
+            out.push_back(part_pre.d[i]);
+            conf.push_back(part_pre.c[i]);
+        }
         drafts_q = part_pre.q;
         part_pre.have = false;
+        ++part_pre_hits;
     } else {
         part_pre.have = false;
         part::Writer w;
@@ -474,7 +499,9 @@ int part_sample(float temperature, float top_p, int top_k, float min_p, uint64_t
     part::Reader r(rep);
     (void) r.get<int32_t>();
     const int t = r.get<int32_t>();
-    return r.bad ? -2 : t;
+    if (r.bad) return -2;
+    part_take_pre(r, t);
+    return t;
 }
 // a simple call made on the part too (no answer: a failure there shows at the next answer)
 void part_mirror(uint32_t op, const part::Writer& w) {
@@ -627,12 +654,13 @@ bool part_chunk_out(Dev& d, int di, Chunk& c, const Run& run, int k, cudaStream_
     const int64_t p0 = run.p0[(size_t) k];
     const int T = run.T[(size_t) k];
     const bool hand = run.runs(k, part_hi);
+    const int r0 = hand && run.yoco >= 0 && k == run.cut_k ? std::max(0, std::min(run.cut_r, T - 1)) : 0;
     std::vector<uint8_t> h;
     size_t raw = 0;
     {
         part::Writer w;
         w.put<int32_t>(k);
-        raw = part_rows_hdr(w, p0, T, hand, di);
+        raw = part_rows_hdr(w, p0, T, hand, di, r0);
         if (raw > ptx.cap) {
             err = "pool: a chunk larger than its slot";
             return false;
@@ -640,7 +668,7 @@ bool part_chunk_out(Dev& d, int di, Chunk& c, const Run& run, int k, cudaStream_
         h = std::move(w.b);
     }
     const Xfer x = chunk_xfer(nullptr, c, T, true);
-    if (!part_rows_d2h(ptx.slot[sl], p0, T, hand ? &x : nullptr, di, s, err)) return false;
+    if (!part_rows_d2h(ptx.slot[sl], p0, T, hand ? &x : nullptr, di, s, err, r0)) return false;
     CK(cudaEventRecord(ptx.ev[sl], s));
     ptx.busy[sl].store(1, std::memory_order_release);
     {
@@ -748,6 +776,10 @@ bool part_reply_send(int32_t st, const std::string& msg, const part::Writer* w =
     part::Writer h;
     h.put<int32_t>(st);
     if (st != 0) h.put_str(msg);
+    else {
+        h.put<double>(part_busy_ms);
+        part_busy_ms = 0;
+    }
     return pc->send_frame(part::kReply, h.b.data(), h.b.size(), w ? w->b.data() : nullptr, w ? w->b.size() : 0);
 }
 // the part server's loop: one front at a time; each connection starts from an empty conversation
@@ -765,7 +797,13 @@ bool part_serve(int port, std::string& err) {
         prx_chunks.clear();
         prx_ops.clear();
         std::thread rd([this] { part_reader_loop(); });
+        const Stats s0 = st;
+        const double tb0 = part_busy_total;
         std::string why = part_session();
+        std::fprintf(stderr, "ds4 pool: the session: busy %.0f ms; layers %.0f ms (head wait %.0f), %lld tokens; drafting "
+                     "%.0f ms in %lld drafts; verify windows %.0f ms\n", part_busy_total - tb0, st.layer_ms - s0.layer_ms,
+                     st.head_ms - s0.head_ms, (long long) (st.tokens - s0.tokens), st.draft_ms - s0.draft_ms,
+                     (long long) (st.drafts_rounds - s0.drafts_rounds), st.verify_ms - s0.verify_ms);
         pc->close();
         if (rd.joinable()) rd.join();
         prx_chunks.clear();
@@ -788,6 +826,7 @@ std::string part_session() {
         }
         const uint32_t op = m.first;
         if (op == part::kBye) return "the link closed";
+        const double t_op = now_ms();
         part::Reader r(m.second);
         std::string err;
         part::Writer w;
@@ -858,23 +897,7 @@ std::string part_session() {
                 if (ok) {
                     w.put<int32_t>(acc);
                     w.put<int32_t>(next);
-                    // the next round's drafts now, with the last draft call's arguments (the front takes them when
-                    // its draft() asks the same)
-                    std::vector<int> nd;
-                    std::vector<float> nc;
-                    const DraftArgs& a = part_dargs;
-                    if (a.set && g.n_mtp > 0 && next >= 0 &&
-                        draft(next, nd, nc, err, a.t, a.tp, a.tk, a.mp, a.seed, a.counter, a.max_n, a.conf_min,
-                              a.cum_min, a.min_n)) {
-                        w.put<int32_t>((int32_t) nd.size());
-                        w.put<uint8_t>(drafts_q ? 1 : 0);
-                        for (int x : nd) w.put<int32_t>(x);
-                        for (float x : nc) w.put<float>(x);
-                    } else {
-                        err.clear();
-                        w.put<int32_t>(-1);
-                        w.put<uint8_t>(0);
-                    }
+                    part_predraft(next, w, err);
                 }
             }
             break;
@@ -889,6 +912,7 @@ std::string part_session() {
                 const int x = sample(t, tp, tk, mp, seed, counter);
                 if (x < 0) ok = false, err = "the sample failed";
                 w.put<int32_t>(x);
+                part_predraft(x, w, err);
             }
             break;
         }
@@ -1011,6 +1035,7 @@ std::string part_session() {
             break;
         case part::kBegin:
             begin_request();
+            part_dargs = DraftArgs();   // (a request's first draft call says whether it drafts)
             break;
         case part::kPenalties: {
             const int n = r.get<int32_t>();
@@ -1038,6 +1063,8 @@ std::string part_session() {
             err = "an unknown frame " + std::to_string(op);
             reply = true;
         }
+        part_busy_ms += now_ms() - t_op;
+        part_busy_total += now_ms() - t_op;
         if (!ok && fail.empty()) {
             fail = err.empty() ? "a call failed" : err;
             std::fprintf(stderr, "ds4 pool: %s\n", fail.c_str());
@@ -1048,6 +1075,36 @@ std::string part_session() {
             return "the link closed while answering";
     }
 }
+// the part: the next round's drafts after token y, with the last draft call's arguments, into an answer (n -1: none) -
+// the front takes them when its draft() asks the same, a round trip fewer a round
+void part_predraft(int y, part::Writer& w, std::string& err) {
+    std::vector<int> nd;
+    std::vector<float> nc;
+    const DraftArgs& a = part_dargs;
+    if (a.set && g.n_mtp > 0 && y >= 0 &&
+        draft(y, nd, nc, err, a.t, a.tp, a.tk, a.mp, a.seed, a.counter, 0, 0.0f, 0.0f, 0)) {
+        w.put<int32_t>((int32_t) nd.size());
+        w.put<uint8_t>(drafts_q ? 1 : 0);
+        for (int x : nd) w.put<int32_t>(x);
+        for (float x : nc) w.put<float>(x);
+    } else {
+        err.clear();
+        w.put<int32_t>(-1);
+        w.put<uint8_t>(0);
+    }
+}
+// the front: an answer's drafts for the round after token y
+void part_take_pre(part::Reader& r, int y) {
+    const int nd = r.get<int32_t>();
+    part_pre.have = nd >= 0;
+    part_pre.y = y;
+    part_pre.q = r.get<uint8_t>() != 0;
+    part_pre.d.assign((size_t) std::max(0, nd), 0);
+    part_pre.c.assign((size_t) std::max(0, nd), 0.0f);
+    for (int i = 0; i < nd; ++i) part_pre.d[(size_t) i] = r.get<int32_t>();
+    for (int i = 0; i < nd; ++i) part_pre.c[(size_t) i] = r.get<float>();
+    if (r.bad) part_pre.have = false;
+}
 void set_pen(int last_n, float repeat, float freq, float present) {
     const bool on = last_n > 0 && (repeat != 1.0f || freq != 0.0f || present != 0.0f);
     pen_n = on ? last_n : 0;
@@ -1056,9 +1113,10 @@ void set_pen(int last_n, float repeat, float freq, float present) {
     pen_present = present;
 }
 std::string part_stats() const {
-    char b[256];
-    std::snprintf(b, sizeof b, "pool: %lld verify rounds, own layers %.0f ms, sending %.0f ms, waiting for the part %.0f "
-                  "ms, %.1f MB sent",
-                  (long long) part_rounds, part_local_ms, part_net_ms, part_wait_ms, part_tx_bytes / 1e6);
+    char b[320];
+    std::snprintf(b, sizeof b, "pool: %lld verify rounds, %lld answers, %lld drafts from answers; own layers (verify) %.0f ms, sending %.0f ms, "
+                  "waiting for answers %.0f ms (the part busy %.0f ms of it, the link the rest), %.1f MB sent",
+                  (long long) part_rounds, (long long) part_waits, (long long) part_pre_hits, part_local_ms, part_net_ms, part_wait_ms,
+                  part_remote_ms, part_tx_bytes / 1e6);
     return b;
 }

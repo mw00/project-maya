@@ -23036,6 +23036,7 @@ bool Model::cancelled() const { return p_->halted; }
 bool Model::broken() { return p_->broken(); }
 void Model::begin_request() {
     p_->begin_request();
+    p_->part_pre.have = false;
     if (p_->part_link()) p_->part_mirror(part::kBegin, part::Writer());
 }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {

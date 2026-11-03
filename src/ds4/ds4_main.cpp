@@ -2005,6 +2005,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                             : 0.0);
         if (d_off > 0) std::fprintf(stderr, "maya ds4 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (!m.pool_line().empty()) std::fprintf(stderr, "maya ds4 serve: %s\n", m.pool_line().c_str());
         // (DS4_DRAFT_VRAM, read as MAYA_DS4_DRAFT_VRAM or DS4_DRAFT_VRAM: the cap's misses - this request's decode,
         //  the drafter's picks)
         if (std::getenv("MAYA_DS4_DRAFT_VRAM") != nullptr || std::getenv("DS4_DRAFT_VRAM") != nullptr)
