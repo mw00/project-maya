@@ -4,15 +4,27 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
-## [UNRELEASED]
+## v1.1.52 - 2026-11-03
 
-- **ROCm installs with versioned LLVM slots:** `hip_clang` finds a distribution's LLVM slot (`<root>/lib/llvm/<version>/bin/clang++`,
- newest first), so Gentoo passes the HIP check with `ROCM_PATH=/usr` and no `/usr/lib64/rocm/llvm` symlink (`tools/test_maya_hip.py`
- covers it).
-- **DeepSeek, `reasoning_effort` in the config (#807):** it is checked before the model loads, by the model's family, so
- a bad value stops the start at once instead of after the load; a number above 100 (DeepSeek's effort is a level from 1
- to 100, a hint in the prompt) gets a message that points to `"thinking_budget"`, the cap on the thinking in tokens.
- docs/SETTINGS.md says which setting is which.
+Faster GLM decode, fixes for AMD PCs on Windows (setup, updates and start errors), a DeepSeek config check, and community pull requests.
+
+- **GLM decode:** the DSA layers' feed-forward runs in CUDA graphs by default. On the PCs it was measured on, decode is about 8-9% faster, with the same greedy answers (#795, thanks @saatvik-viniak).
+- **AMD PCs on Windows (#805):**
+  - A first setup without `--backend hip` finds an AMD-only PC (every card the HIP check accepts, named by an installed ROCm's `hipInfo`) instead of stopping at `nvidia-smi`.
+  - An update whose engine rebuild fails stops with the reason and how to rebuild (`build-maya-hip.bat > build-hip.txt 2>&1`, or `START-MAYA.bat --setup --rebuild`) instead of starting the engine from before under the new server and config.
+  - An engine error in the middle of an answer ends that request with an error instead of stopping the server.
+  - A failed GPU buffer zeroing at start names its size and the driver's reason.
+- **DeepSeek, `reasoning_effort` in the config (#807):** it is checked before the model loads, so a bad value stops the start at once instead of after the load. A number above 100 (DeepSeek's effort is a level from 1 to 100) gets a message that points to `"thinking_budget"`, the cap on the thinking in tokens. docs/SETTINGS.md says which setting is which.
+- **DeepSeek on Linux:** the n-gram table readers use twice the CPU's hardware threads (between 16 and 64) instead of a fixed 8, so cold prompts read faster on larger CPUs (#716, thanks @SeriousRising).
+- **Models page:** a folder that another model reads files from is no longer listed under "Files no model uses".
+- **Community pull requests:**
+  - GLM on several GPUs: an opt-in RAM tier that keeps each expert's halves on both CPU sockets (`MAYA_GLM_ROW_HALVES=1`), plus CPU-lane pinning and profiling settings (#795, thanks @saatvik-viniak).
+  - CPU lane: IQ1_S rows decode in vectors, with the same results (#695, thanks @sociolog).
+  - Opt-in: GLM decode defers the CPU's experts on every part of a split (`MAYA_GLM_DEFER_CPU=2`, #722, thanks @oisee).
+  - DeepSeek EXL3 packs: an F16 dense matrix loads as BF16 (#802, thanks @pepuscz).
+  - Opt-in: DeepSeek on RDNA 3 runs the indexer's scores on WMMA (`DS4_INDEX_TC=1`, #801, thanks @pepuscz).
+  - Experimental AMD MI50 (gfx906) support: the wave64 check, opt-in peer-to-peer split hops (`MAYA_GLM_P2P`, #397), and MiniMax wave64 attention kernels (#800), thanks @nicholas631.
+  - Opt-in: DeepSeek `--tp 2` on NVIDIA reads prompts with an exact peer-VRAM all-reduce (`MAYA_DS4_HIP_PEER_AR`, #773, thanks @olobarius).
 
 ## v1.1.51 - 2026-11-03
 
