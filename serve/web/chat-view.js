@@ -208,8 +208,12 @@ class Answer extends Component {
         m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts";
       det.classList.toggle("is-live", thinkingNow);
       const body = det.querySelector(".think__body");
-      if (det.open || thinkingNow) body.textContent = m.reasoning;
-      else body.dataset.pending = "1";
+      if (det.open || thinkingNow) {
+        // (live: the box's own scroll follows the newest thoughts down, as the chat does - unless the reader scrolled it up)
+        const atEnd = body.scrollHeight - body.scrollTop - body.clientHeight < 24;
+        body.textContent = m.reasoning;
+        if (thinkingNow && atEnd) body.scrollTop = body.scrollHeight;
+      } else body.dataset.pending = "1";
       // open while it streams (if wanted), closed once the answer starts - unless the reader toggled it themselves
       if (thinkingNow && P.show && !det.dataset.touched && !det.open) { det._auto = true; det.open = true; }
       if (!thinkingNow && det.open && !det.dataset.touched) { det._auto = true; det.open = false; }
