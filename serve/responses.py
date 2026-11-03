@@ -139,7 +139,8 @@ def normalize_request(req):
     if include not in (None, []):
         no_reasoning = isinstance(req.get("reasoning"), dict) and req["reasoning"].get("effort") == "none"
         if include != ["reasoning.encrypted_content"] or not no_reasoning:
-            raise ValueError("encrypted reasoning projection is only accepted with reasoning.effort=none; encryption is unavailable")
+            raise ValueError("encrypted reasoning projection is only accepted with reasoning.effort=none; encryption is unavailable "
+                             f"(this request's include: {str(include)[:80]})")
     if req.get("service_tier", "auto") != "auto":
         raise ValueError("service_tier: only auto is supported")
     reasoning = req.get("reasoning")
@@ -162,7 +163,9 @@ def normalize_request(req):
     names = set()
     for tool in tools:
         if not isinstance(tool, dict) or tool.get("type") != "function":
-            raise ValueError("only function tools are supported")
+            kind = tool.get("type") if isinstance(tool, dict) else type(tool).__name__
+            raise ValueError(f"only function tools are supported (this request has a tool of type {str(kind)[:40]!r}; "
+                             "a client that sends built-in tools such as web_search or local_shell must send functions only)")
         if set(tool) - {"type", "name", "description", "parameters", "strict"}:
             raise ValueError("unsupported function tool parameter")
         name = _string(tool.get("name"), "tools.name")

@@ -106,6 +106,14 @@ class ToolContracts(ResponseCase):
         events = self.stream(tools=TOOLS, tool_choice="required", max_output_tokens=3)
         self.assertEqual(events[-1]["type"], "response.incomplete")
 
+    def test_the_rejection_names_the_tool_type_and_the_include(self):
+        status, out = self.post(tools=[{"type": "web_search"}])
+        self.assertEqual(status, 400, out)
+        self.assertIn("web_search", json.dumps(out))
+        status, out = self.post(include=["reasoning.encrypted_content"], reasoning={"effort": "high"})
+        self.assertEqual(status, 400, out)
+        self.assertIn("reasoning.encrypted_content", json.dumps(out))
+
     def test_codex_hints_and_reasoning_disabled_projection(self):
         status, out = self.post(prompt_cache_key="test-session", client_metadata={"session_id": "fixture"},
                                 include=["reasoning.encrypted_content"])
