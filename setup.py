@@ -640,7 +640,7 @@ AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",
 # Strix Halo / Gorgon Halo APU, Navi 21), else from its name ("AMD Radeon(TM) 8060S Graphics", 8050S, 8065S, ...)
 AMD_DEVICE_ARCHS = {"744c": "gfx1100", "7550": "gfx1201", "7551": "gfx1201", "1586": "gfx1151",
                     "73a1": "gfx1030", "73a3": "gfx1030", "73a5": "gfx1030", "73af": "gfx1030", "73bf": "gfx1030"}
-AMD_NAME_ARCHS = ((r"Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", "gfx1151"), (r"RX\s*7900", "gfx1100"),
+AMD_NAME_ARCHS = ((r"Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", "gfx1151"), (r"RX\s*7900|PRO\s*W7[89]00", "gfx1100"),
                   (r"RX\s*9070|R9700", "gfx1201"),
                   (r"RX\s*6[89][05]0(?:\s*XT)?\b|PRO\s*V620|PRO\s*W6800", "gfx1030"))   # (not the 6800M / 6800S: Navi 22 / 23)
 

@@ -1052,6 +1052,31 @@ def hip_info(bindir) -> str | None:
     return str(p) if p and p.exists() else shutil.which("hipInfo")
 
 
+def installed_hip_info() -> str | None:
+    """hipInfo of a ROCm already installed (ROCM_PATH, HIP_PATH, the newest in C:\\Program Files\\AMD\\ROCm, PATH),
+    only to name the GPUs - not windows_rocm(), whose rocm-sdk init can unpack gigabytes."""
+    base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "AMD" / "ROCm"
+    roots = [Path(os.environ[k]) for k in ("ROCM_PATH", "HIP_PATH") if os.environ.get(k)] + sorted(
+        base.glob("[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)], reverse=True)
+    return next((str(r / "bin" / "hipInfo.exe") for r in roots if (r / "bin" / "hipInfo.exe").exists()),
+                shutil.which("hipInfo"))
+
+
+def first_run_backend() -> str:
+    """The backend of a first run without --backend (nothing set up yet): Metal on a Mac with Apple Silicon, HIP on a
+    PC with an AMD GPU Maya's HIP build takes (check_hip_pc's list, the experimental ones too) and no NVIDIA one, else
+    CUDA.  On Windows the AMD GPUs are named by an installed ROCm's hipInfo first: Windows' adapter table knows the
+    common cards only, and an AMD-only PC whose card it did not know was sent to the CUDA checks, which stop at
+    nvidia-smi (#805)."""
+    if apple_silicon():
+        return "metal"
+    if S.gpus():
+        return "cuda"
+    amd = S.amd_gpus(installed_hip_info()) if WIN else S.amd_gpus()
+    takes = HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64
+    return "hip" if any(g["arch"] in takes for g in amd) else "cuda"
+
+
 THEROCK_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"   # AMD's ROCm for Windows: TheRock's pip wheels
 THEROCK_VERSION = "7.14.1"                                     # 7.14: the first with Gorgon Halo (Ryzen AI Max 400)
 
@@ -6966,8 +6991,7 @@ def main() -> int:
     else:
         # nothing set up yet (START-MAYA.bat / ./maya.sh without --backend): Metal on a Mac with Apple Silicon, HIP on
         # a PC with a supported AMD GPU and no NVIDIA one (e.g. Strix Halo)
-        a.backend = ("metal" if apple_silicon() else
-                     "hip" if not S.gpus() and any(g["arch"] in HIP_ARCHS for g in S.amd_gpus()) else "cuda")
+        a.backend = first_run_backend()
     setting_up = a.setup or a.check or a.gguf_dir or a.model or a.model_dir or a.rebuild or a.repack or \
         a.download_model
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):

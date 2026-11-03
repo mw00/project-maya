@@ -620,6 +620,32 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(self.first_run_backend([], [self.gpus[2]]), "cuda")   # (unsupported iGPU: CUDA's message)
         self.assertEqual(self.first_run_backend([{"index": 0, "arch": "70"}], [strix]), "cuda")
 
+    def test_first_run_without_backend_takes_every_arch_the_hip_check_takes(self):
+        # (#805) the experimental ones too: the CUDA checks would stop at nvidia-smi
+        for arch in maya.HIP_ARCHS_UNVALIDATED + maya.HIP_ARCHS_WAVE64:
+            card = {"index": 0, "arch": arch, "vendor": "amd", "name": arch, "vram_gb": 16}
+            self.assertEqual(self.first_run_backend([], [card]), "hip", arch)
+
+    def test_first_run_on_windows_names_the_amd_gpus_with_an_installed_hipinfo(self):
+        r9700 = {"index": 0, "arch": "gfx1201", "vendor": "amd", "name": "R9700", "vram_gb": 32}
+        with patch.object(maya, "WIN", True), patch.object(maya, "apple_silicon", return_value=False), \
+                patch.object(maya.S, "gpus", return_value=[]), \
+                patch.object(maya, "installed_hip_info", return_value=r"C:\rocm\bin\hipInfo.exe"), \
+                patch.object(maya.S, "amd_gpus", return_value=[r9700]) as amd:
+            self.assertEqual(maya.first_run_backend(), "hip")
+        amd.assert_called_once_with(r"C:\rocm\bin\hipInfo.exe")
+
+    def test_installed_hipinfo_is_the_newest_rocm_in_program_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            for ver in ("6.4", "7.2", "7.10"):
+                (Path(d) / "AMD/ROCm" / ver / "bin").mkdir(parents=True)
+            (Path(d) / "AMD/ROCm/6.4/bin/hipInfo.exe").touch()
+            (Path(d) / "AMD/ROCm/7.2/bin/hipInfo.exe").touch()
+            env = {k: v for k, v in os.environ.items() if k not in ("ROCM_PATH", "HIP_PATH")}
+            with patch.dict(os.environ, dict(env, ProgramFiles=d), clear=True), \
+                    patch.object(maya.shutil, "which", return_value=None):
+                self.assertEqual(maya.installed_hip_info(), str(Path(d) / "AMD/ROCm/7.2/bin/hipInfo.exe"))
+
 
 class ConfigsTests(unittest.TestCase):
     def test_dashboard_settings_beside_a_config_are_not_a_config(self):
