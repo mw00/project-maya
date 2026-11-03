@@ -97,7 +97,7 @@ export function openChat(c) {
   emit();
   scrollDown(true);
   updateCtxMeter();
-  resumePending();
+  resumePending(true);
 }
 export function newChat() {
   const c = S.current;
@@ -393,6 +393,7 @@ export async function answer(resumeJob = null) {
   }
   let firstAt = null, thinkStart = null, usage = null, pending = false, lastPaint = 0, jobId = resumeJob, nRecv = 0, finished = false;
   let ended = false;                               // a repaint queued while streaming must not land after the end
+  let keep = false;                                // given up on the connection, not the answer: its id stays for later
   const paint = () => {
     pending = false;
     if (ended || chat !== S.current) return;
@@ -454,19 +455,21 @@ export async function answer(resumeJob = null) {
       }
     }
   };
-  // reconnect to the running answer by id (every 2 s for up to 10 minutes, at once when the page is shown again)
+  // reconnect to the running answer by id (every 2 s, at once when the page is shown again); only the server's "no such
+  // answer" ends it for good - after 10 minutes without reaching the server the page stops trying but keeps the id, so
+  // coming back to it (or a reload) takes the answer up again
   const follow = async (gone) => {
-    const t0 = Date.now();
+    let t0 = Date.now();
     setHint(resumeJob ? "Taking the answer back up…" : "Connection lost - reconnecting to the answer…");
     for (;;) {
       if (controller.signal.aborted) throw new DOMException("stopped", "AbortError");
-      if (Date.now() - t0 > 600000) throw gone;
       try {
         const r2 = await fetch(`v1/strata/stream?id=${encodeURIComponent(jobId)}&from=${nRecv}`,
                                {headers: headers(false), signal: controller.signal});
         if (r2.status === 404) throw gone;
         if (r2.ok) {
           setHint("");
+          t0 = Date.now();                         // (it reached the answer: the 10 minutes count from here again)
           await consume(r2);
           if (finished) return;
         }
@@ -474,6 +477,8 @@ export async function answer(resumeJob = null) {
         if (e2.name === "AbortError" || e2 === gone) throw e2;
         /* still offline: try again */
       }
+      // (checked after a try, not before one: a page woken from a long sleep tries once before it gives up)
+      if (Date.now() - t0 > 600000) { keep = true; throw gone; }
       await sleepOrVisible(2000);
     }
   };
@@ -500,7 +505,11 @@ export async function answer(resumeJob = null) {
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+    else if (keep) {
+      m.error = `The connection to the answer was lost (${e.message || e}). Come back to this page or reload it to take ` +
+                "the answer up again - the server keeps it for 15 minutes after it ends.";
+      toast("error", "Connection lost", m.error, 6000);
+    } else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
   }
   if (S.hint && !S.reload) S.hint = "";
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
@@ -509,8 +518,8 @@ export async function answer(resumeJob = null) {
                         cached: (usage.prompt_tokens_details || {}).cached_tokens || 0};
   for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
   m.meta = answerMeta(m, n, firstAt ? (performance.now() - firstAt) / 1000 : 0);
-  delete m.pending;
-  delete m.job;
+  if (keep) m.lost = true;                         // (pending and its id stay: resumePending(true) takes it up later)
+  else { delete m.pending; delete m.job; delete m.lost; }
   if (m._md) m._md = null;
   ended = true;
   S.busy = null;
@@ -519,11 +528,13 @@ export async function answer(resumeJob = null) {
   if (chat === S.current) { scrollDown(); updateCtxMeter(); }
   resumePending();                                 // the open chat's answer cut off by a reload, now that none runs
 }
-// after a reload: an answer the page was streaming when it went away is taken back up from the server
-export function resumePending() {
+// after a reload: an answer the page was streaming when it went away is taken back up from the server; one whose
+// connection was given up on (lost) only when the reader comes back - a reload, its chat opened, the page shown again
+export function resumePending(again = false) {
   const ms = S.current.messages, m = ms[ms.length - 1];
-  if (!S.busy && m && m.role === "assistant" && m.pending && m.job) answer(m.job);
+  if (!S.busy && m && m.role === "assistant" && m.pending && m.job && (again || !m.lost)) answer(m.job);
 }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) resumePending(true); });
 
 export async function send() {
   const text = S.draft.trim();

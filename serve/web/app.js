@@ -115,7 +115,7 @@ whenHealth(() => updateCtxMeter());
 loadChats().then(() => { if (S.view === "chat" && !S.settings) focusInput(); return loadHealth(); }).then(loadMcp).then(() => {
   loadTurbo();                                     // (the Turbo button: on or off)
   loadUpdate();                                    // (Settings' dot when a new version is out)
-  resumePending();
+  resumePending(true);
   if (startQuestion) {
     if (S.current.messages.length) openChat(newChatObj());
     S.draft = startQuestion;
