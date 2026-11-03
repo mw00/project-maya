@@ -599,24 +599,8 @@ def quant_label(cfg: dict, path: Path) -> str:
     names, maya_quants); else its installer key, or the config's own name for one the setup did not write."""
     fam, key = family(cfg), maya_quants.config_key(cfg)
     what = maya_quants.tier(fam, key) or maya_quants.OTHERS.get((fam, key)) or OTHER_QUANTS.get((fam, str(key).lower()))
-    if str(key).lower().startswith("exl3") and fam in ("deepseek", "minimax"):
-        what = exl3_bits_label(cfg) or what
+    what = maya_quants.exl3_bits(cfg) or what          # (an EXL3 quant set up by hand: its folder's bits, maya_quants)
     return str(what or key or path.stem.removeprefix("maya-").removesuffix("-hip"))
-
-
-EXL3_BPW = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)[ _-]?bpw(?![a-z])", re.I)
-
-
-def exl3_bits_label(cfg: dict) -> str | None:
-    """"EXL3 2.25 bpw" from the model folder's name (DeepSeek-V4.1-Flash-1017-EXL3-2.25bpw: a DeepSeek or MiniMax EXL3
-    quant of other bits than the setup's, set up by hand under the "exl3" key), else None - the setup's own label then."""
-    inst = cfg.get("installer") or {}
-    pack = pack_of(cfg)
-    for d in (inst.get("model_dir"), pack.parent if pack else None):
-        m = EXL3_BPW.search(Path(str(d)).name) if d else None
-        if m:
-            return f"EXL3 {m.group(1)} bpw"
-    return None
 
 
 def missing(cfg: dict) -> str | None:
