@@ -71,9 +71,19 @@ constexpr int kInjRows = 64;    // context positions an injection batch carries
 constexpr int kHeadDim = 128;   // the attention / rope kernels' head size
 
 __device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    const int i = __builtin_bit_cast(int, v);
+    v += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x168, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x164, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x162, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x161, 0xf, 0xf, false));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 
 // sum over the block (blockDim.x a multiple of 32, <= 1024); every thread gets it
@@ -245,15 +255,31 @@ __global__ void attn_kernel(const float* __restrict__ Q, const __half* __restric
 constexpr int kAttnQ = 32, kAttnKeys = 16, kAttnSplits = 32, kAttnPart = kHeadDim + 2;
 
 __device__ __forceinline__ float half_warp_max(float v) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x168, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x164, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x162, 0xf, 0xf, false)));
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x161, 0xf, 0xf, false)));
+    return v;
+#else
 #pragma unroll
     for (int o = 8; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
+#endif
 }
 
 __device__ __forceinline__ float half_warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x168, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x164, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x162, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x161, 0xf, 0xf, false));
+    return v;
+#else
 #pragma unroll
     for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 
 __global__ void __launch_bounds__(256) attn_split_kernel(const float* __restrict__ Q, const __half* __restrict__ Kr,

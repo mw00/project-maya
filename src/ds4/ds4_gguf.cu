@@ -44,9 +44,19 @@ constexpr int kWarps = 8, kThreads = kWarps * 32;
 constexpr int kMaxEnt = 16;   // a group's entries in one pass (a window's tokens at most)
 
 __device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    const int i = __builtin_bit_cast(int, v);
+    v += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x168, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x164, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x162, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x161, 0xf, 0xf, false));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 
 // ---------------------------------------------------------------- BF16 matrices

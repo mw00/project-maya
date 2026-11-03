@@ -204,9 +204,19 @@ __device__ __forceinline__ float dot(const Sub& s, const int4& xa, const int4& x
 }
 
 __device__ __forceinline__ float warp_sum(float v) {   // (ds4_iq.cu's butterfly)
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    const int i = __builtin_bit_cast(int, v);
+    v += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x168, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x164, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x162, 0xf, 0xf, false));
+    v += __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x161, 0xf, 0xf, false));
+    return v;
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
+#endif
 }
 
 // grid (rows / (kWarps R), jobs): a warp R rows, a lane sub-blocks lane, lane + 32, ... of each - its R rows' raw words
