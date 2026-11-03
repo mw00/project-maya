@@ -116,6 +116,27 @@ class Counting(unittest.TestCase):
         self.assertFalse(a.price_list()[0]["custom"])
 
 
+class LedgerPath(unittest.TestCase):
+    def test_default_is_beside_the_config(self):
+        self.assertEqual(SV.ledger_path(Path("/a/b/run.json"), {}), Path("/a/b") / SV.FILE)
+
+    def test_env_names_the_file_and_off_keeps_none(self):
+        self.assertEqual(SV.ledger_path(Path("/a/b/run.json"), {"MAYA_SAVINGS_PATH": "/w/s.json"}), Path("/w/s.json"))
+        for v in ("off", "OFF", "none"):
+            self.assertIsNone(SV.ledger_path(Path("/a/b/run.json"), {"MAYA_SAVINGS_PATH": v}))
+
+    def test_a_failed_save_is_logged_once(self):
+        import io
+        from contextlib import redirect_stdout
+        with tempfile.TemporaryDirectory() as d:
+            led = SV.Ledger(Path(d) / "no-such-folder" / SV.FILE, "k.json", "m")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                for _ in range(3):
+                    led.add(10, 0, 5)
+            self.assertEqual(out.getvalue().count("could not save"), 1)
+
+
 class Page(unittest.TestCase):
     """A request through the server is counted; /metrics carries the sidebar's line, /api/savings the breakdown."""
 
