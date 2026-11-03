@@ -32,6 +32,7 @@
 #include "ds4_markov_q8.hpp"
 #include "ds4_multi_attn.hpp"
 #include "ds4_os.hpp"
+#include "ds4_part_net.hpp"
 #include "ds4_pcie.cuh"
 #include "ds4_pcie.hpp"
 #include "ds4_q6k.cuh"
@@ -3556,6 +3557,11 @@ struct Model::Impl {
     bool load(const Options& opt, std::string& err) {
         o = opt;
         const double t0 = now_ms();
+        // the pool: a part server runs the trunk's layers from part_from on (the others never touched here)
+        if (o.part_from > 0) {
+            part_lo = o.part_from;
+            part_srv = true;
+        }
         if (!pk.load(o.pack, err)) return false;
         // (AMD: the prompt GEMMs' measured kernels) the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's file - empty: none,
         // each start measures its own and keeps them to itself (a pack that must not change: a run's own store instead)
@@ -5050,6 +5056,23 @@ struct Model::Impl {
         reset();
         blas_warm_start();
         p2p_place();
+        if ((part_srv || !o.remote_part.empty()) && !par) {
+            err = "the pool runs with --threads on";
+            return false;
+        }
+        if (part_srv && (part_lo >= g.nl || g.n_mtp == 0 && o.dspark)) {
+            err = "--part-from " + std::to_string(part_lo) + ": not a layer of this model";
+            return false;
+        }
+        if (!o.remote_part.empty()) {   // a front: the part's layers run there while the link lives
+            const size_t c = o.remote_part.rfind(':');
+            part_host = o.remote_part.substr(0, c);
+            part_port = c == std::string::npos ? 8092 : std::atoi(o.remote_part.c_str() + c + 1);
+            if (const char* v = std::getenv("MAYA_POOL_TIMEOUT_MS")) part_timeout_ms = std::max(1000, std::atoi(v));
+            std::string e;
+            if (!part_connect(e))
+                std::fprintf(stderr, "ds4 pool: %s - every layer runs here\n", e.c_str());
+        }
         return true;
     }
 
@@ -6768,6 +6791,7 @@ struct Model::Impl {
           for (int mi = 0; mi < l0.nm; ++mi) {
             Layer& l = member(l0, mi);
             if (l.dev != di) continue;
+            if (part_srv && away(l.il) && std::getenv("MAYA_POOL_SKIP_DENSE")) continue;   // (a part server: the front's layers' weights - experimental: a later layer still reads one)
             // (a group's member: its share of the heads (wq_b columns, the sinks), of wo_a's groups and wo_b's rows,
             // of the shared expert's FFN; the rest whole)
             const int nm = l0.nm, na = g.heads / std::max(1, l.ahn), ha = l.ah0 / std::max(1, l.ahn);
@@ -7585,7 +7609,7 @@ struct Model::Impl {
             const double budget = *std::min_element(mslots.begin(), mslots.end());
             double want = 0, seen = 0;
             for (const Layer& l : L)
-                if (l.grp == (int) gi && !l.mtp && l.n_cls == 1) {
+                if (l.grp == (int) gi && !l.mtp && l.n_cls == 1 && !away(l.il)) {
                     want += (double) ucount(l) * l.n_exp;
                     for (int e = 0; e < l.n_exp; ++e) seen += prof[(size_t) l.il * g.n_exp + e];
                 }
@@ -7624,6 +7648,7 @@ struct Model::Impl {
                 for (Layer& l : L) {
                     if (l.grp != (int) gi || l.mtp || l.n_cls > 1) continue;
                     l.n_vram = 0;
+                    if (away(l.il)) continue;   // (the pool: another PC runs this layer)
                     const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
                     double sum = 0;
                     for (int e = 0; e < l.n_exp; ++e) sum += p[e];
@@ -7646,7 +7671,7 @@ struct Model::Impl {
                 const double frac = want > 0 ? std::min(1.0, budget / want) : 0.0;
                 for (Layer& l : L) {
                     if (l.grp != (int) gi || l.mtp || l.n_cls > 1) continue;
-                    l.n_vram = std::min(l.n_exp, (int) std::floor(frac * l.n_exp));
+                    l.n_vram = away(l.il) ? 0 : std::min(l.n_exp, (int) std::floor(frac * l.n_exp));
                     // never more than fits: the floor of each layer's share can still round up the total
                     while (l.n_vram > 0 && (double) ucount(l) * l.n_vram > budget) --l.n_vram;
                 }
@@ -7655,7 +7680,7 @@ struct Model::Impl {
                     if (l.grp == (int) gi && !l.mtp && l.n_cls == 1) used += (double) ucount(l) * l.n_vram;
                 // what the floors left: whole experts, layer by layer
                 for (Layer& l : L) {
-                    if (l.grp != (int) gi || l.mtp || l.n_cls > 1) continue;
+                    if (l.grp != (int) gi || l.mtp || l.n_cls > 1 || away(l.il)) continue;
                     while (l.n_vram < l.n_exp && used + (double) ucount(l) <= budget) {
                         ++l.n_vram;
                         used += (double) ucount(l);
@@ -8084,6 +8109,7 @@ struct Model::Impl {
                 for (int e = 0; e < l.n_exp; ++e)
                     if (l.slot[(size_t) e] >= 0)
                         tab[(size_t) e] = (unsigned long long) sat(l, x, l.slot[(size_t) e], unit(x));
+                if (x.vram_tab == nullptr) continue;   // (a part server: a layer it does not run)
                 cudaSetDevice(devs[(size_t) x.dev].id);
                 CK(cudaMemcpy(x.vram_tab, tab.data(), tab.size() * 8, cudaMemcpyHostToDevice));
             }
@@ -9739,6 +9765,7 @@ struct Model::Impl {
     }
 
     void reset() {
+        if (part_link()) part_mirror(part::kReset, part::Writer());
         pos = 0;
         toks.clear();
         ctoks.clear();
@@ -9762,7 +9789,14 @@ struct Model::Impl {
 
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
-    void checkpoint(int slot) { snap_into(ck[slot & 1]); }
+    void checkpoint(int slot) {
+        snap_into(ck[slot & 1]);
+        if (part_link()) {
+            part::Writer w;
+            w.put<int32_t>(slot);
+            part_mirror(part::kCheckpoint, w);
+        }
+    }
     void snap_into(Check& c) {
         c.pos = pos;
         c.win.resize(L.size());
@@ -9800,6 +9834,11 @@ struct Model::Impl {
     // at this position already is kept (it holds the same state), else the one mark_victim() picks makes room
     void mark(bool shared) {
         if (Check* c = mark_room(pos, shared)) snap_into(*c);
+        if (part_link()) {
+            part::Writer w;
+            w.put<uint8_t>(shared ? 1 : 0);
+            part_mirror(part::kMark, w);
+        }
     }
     // the restore point at position `at` to fill (nullptr: none kept, or one there already - in use again)
     Check* mark_room(int64_t at, bool shared) {
@@ -16716,6 +16755,9 @@ struct Model::Impl {
     bool draft(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err, float temperature, float top_p,
                int top_k, float min_p, uint64_t seed, uint64_t counter, int max_n, float conf_min, float cum_min,
                int min_n) {
+        if (part_link())
+            return part_draft(y, out, conf, err, temperature, top_p, top_k, min_p, seed, counter, max_n, conf_min,
+                              cum_min, min_n);
         const double t0 = now_ms();
         // (with penalties the drafts are the drafter's argmax: its own draws know no history - verify() is as exact)
         drafts_q = temperature > 0.0f && sample_drafts && pen_n <= 0;
@@ -17397,6 +17439,7 @@ struct Model::Impl {
     // residual max(0, p - q) - so each kept token is distributed as the trunk's own draw.
     bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
                 uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err) {
+        if (part_link()) return part_verify(y, drafts, temperature, top_p, top_k, min_p, seed, counter, accepted, next, err);
         const int n = (int) std::min<size_t>(drafts.size(), (size_t) kWin - 1);
         const int T = n + 1, V = g.vocab;
         const int64_t p0 = pos;
@@ -18729,7 +18772,7 @@ struct Model::Impl {
         }
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
-                if (!run.runs(k, il) || run.kv_only(k, il)) continue;   // (a long prompt's skip: no experts there)
+                if (!run.runs(k, il) || run.kv_only(k, il) || away(il)) continue;   // (the skip; the pool)
                 const Layer& L0 = L[(size_t) il];
                 bool here = false;
                 for (int m = 0; m < L0.nm; ++m) here = here || member(L0, m).dev == di;
@@ -18758,7 +18801,7 @@ struct Model::Impl {
         std::vector<int> egs;
         for (const Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m)
-                if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0) egs.push_back(l0.eg);
+                if (member(l0, m).dev == di && !l0.mtp && l0.eg >= 0 && !away(l0.il)) egs.push_back(l0.eg);
         const size_t eg_per = (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32);
         // (a group's: its first member reads them for every member - slot k % 2 once each member's copies of chunk
         //  k - 2 out of it are done - and the others wait for its slots)
@@ -18836,8 +18879,15 @@ struct Model::Impl {
             run.snaps(p0, T, wp);
             bool started = false;
             std::vector<char> got(srcs.size(), 0);
+            const bool part_in = part_srv && part_lo < g.nl && L[(size_t) part_lo].dev == di;
+            if (part_in) {   // (a part server: chunk k's rows from the front - the sources' first, before any layer)
+                c.at.store("waiting for the front's rows", std::memory_order_relaxed);
+                if (!part_chunk_in(k, err)) return err == kHalted ? halt_end(di, err) : false;
+                if (!part_src_h2d(*prx_hold[k % 2], di, s, err)) return false;
+            }
             for (int il = 0; il < g.nl; ++il) {
                 if (halt_now()) return halt_end(di, err);   // (one GPU: after the layer it is on)
+                if (away(il)) continue;   // (the pool: another PC's layer)
                 Layer& L0 = L[(size_t) il];
                 int mi = -1;
                 for (int m = 0; m < L0.nm; ++m)
@@ -18846,7 +18896,9 @@ struct Model::Impl {
                 c.at_il.store(il, std::memory_order_relaxed);
                 if (!started && run.runs(k, il)) {   // the chunk's input: its embedding rows, or the previous group's hand-off
                     started = true;
-                    if (il == 0) {
+                    if (part_in && il == part_lo) {
+                        if (!part_hand_h2d(*prx_hold[k % 2], chunk_xfer(nullptr, c, T, false), T, s, err)) return false;
+                    } else if (il == 0) {
                         if (k >= 2) CK(cudaEventSynchronize(c.emb_ev[slot]));
                         for (int t = 0; t < T; ++t)
                             std::memcpy(c.emb_host[slot] + (size_t) t * D, emb_row(p0 + t, toks[(size_t) (p0 + t)]),
@@ -18908,6 +18960,9 @@ struct Model::Impl {
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
             }
+            // (a front: chunk k's rows to the part, read back on this stream, sent by the sender thread)
+            if (part_link() && L[(size_t) part_hi - 1].dev == di && !part_chunk_out(d, di, c, run, k, s, err))
+                return false;
             if (trace && !c.flow && tr_ev.size() == 3 + 2 * (size_t) k) tr_rec(s);   // (DS4_RUN_TRACE: chunk k's end)
             // (chunk k's copies out of its Engram slot issued, their event recorded: the reader may refill it)
             if (!egs.empty()) c.eg_copied_seq[slot].store(wp.win, std::memory_order_release);
@@ -18915,7 +18970,7 @@ struct Model::Impl {
                 CK(cudaEventRecord(chunk_done[(size_t) k], s));
                 chunk_rec[(size_t) k].store(1, std::memory_order_release);
             }
-            if (d.grp == devs[(size_t) head_dev].grp) {   // the head group: each member its share of the logits
+            if (d.grp == devs[(size_t) head_dev].grp && !away(g.nl - 1)) {   // the head group: each member its share of the logits
                 if (logits_all) {   // every row's logits (tests): the head over the chunk's rows, 16 at a time
                     const size_t base = (size_t) (p0 - run.p0[0]) * g.vocab;
                     for (int r0 = 0; r0 < T; r0 += kWin) {
@@ -20353,7 +20408,11 @@ struct Model::Impl {
                 return false;
             }
         FeedPlan own;
-        if (whole == nullptr) {
+        if (whole == nullptr && part_plan_force != nullptr) {   // (a part server: the front's plan)
+            own = *part_plan_force;
+            k0 = 0;
+            k1 = (int) own.ends.size();
+        } else if (whole == nullptr) {
             plan_chunks(n, logits_rows, own, after, inner != nullptr && !inner->empty() ? (int) (inner->front().first - pos) : -1);
             k0 = 0;
             k1 = (int) own.ends.size();
@@ -20586,7 +20645,14 @@ struct Model::Impl {
         } check_end_{flow_check_now};
         // (a part with more to come: the next part's first chunk's Engram rows asked for now, behind the run's own -
         //  this thread only waits for the devices meanwhile)
-        const bool ahead_next = whole != nullptr && !run_end;
+        const bool ahead_next = whole != nullptr && !run_end && !part_srv;
+        // (a front: the run's plan and tokens to the part before the devices start; each chunk's rows follow)
+        const bool part_run = part_link();
+        if (part_run && !part_chunks_begin(fp, whole != nullptr, k0, k1, tk, n, logits_rows, snap_slot, after, inner,
+                                           per, err)) {
+            part_failed = true;
+            return false;
+        }
         for (size_t di = 0; di < devs.size(); ++di)
             workers[di]->submit([this, di, &run, &errs] {
                 std::string e;
@@ -20651,6 +20717,16 @@ struct Model::Impl {
         }
         const double trc_done = now_ms();
         main_at.store("a run of chunks: the devices done, the head next", std::memory_order_relaxed);
+        if (part_run) {   // (the part's answer: its layers through the same chunks)
+            bool here_ok = true;
+            for (const std::string& e : errs) here_ok = here_ok && e.empty();
+            std::string pe;
+            if (!part_chunks_end(-1, here_ok, pe)) {
+                part_failed = true;
+                err = pe;
+                return false;
+            }
+        }
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (!check_peer_ar(err)) return false;
         // A worker's early failure can leave peers with different submission sequences. Do not reuse the model.
@@ -20806,7 +20882,7 @@ struct Model::Impl {
         const bool kv_only = fp.skip >= 0 && cut_kl >= k1;
         const int nr = std::min(T_last, tap_cap);
         const double trc_warm = now_ms();
-        if (run_end && took == n && !kv_only && !seed_drafter(pos - nr, nr, 0, err)) return false;
+        if (run_end && took == n && !kv_only && !part_run && !seed_drafter(pos - nr, nr, 0, err)) return false;
         const double trc_seed = now_ms();
         // feed_marks' restore points the run went past (a yield's: those before where it stopped), in order, as mark()
         // keeps them; then feed_mark's checkpoint `snap_slot` - each from what the layers kept of it
@@ -20884,7 +20960,7 @@ struct Model::Impl {
                 for (int t = 0; t < T; ++t) wp.topk[il][t] = cur_topk_n[t];
             }
             wp.seq[il] = 0;
-            if (wp.async && !host_free(l)) {
+            if (wp.async && !host_free(l) && !away(il)) {
                 wp.seq[il] = ++seq_issued;
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
@@ -21026,6 +21102,7 @@ struct Model::Impl {
         for (int li = 0; li < pk.eg_layers; ++li) {
             EgBatch& b = *eg_win[(size_t) li];
             if (b.live) eg_finish(b);   // (a window that failed midway: its reads end before h_eg is reused)
+            if (li < (int) g.eg_layers.size() && away(g.eg_layers[(size_t) li])) continue;   // (the pool: not here)
             eg_issue(p0, T, li, nullptr, b);
         }
         st.engram_ms += now_ms() - te;
@@ -21042,6 +21119,10 @@ struct Model::Impl {
             if (!forward_par(p0, T, err)) return false;
         } else if (!forward_serial(p0, T, err)) return false;
         st.layer_ms += now_ms() - tl;
+        if (part_link() && !part_window_out(p0, T, tk, logits_rows, seed_rows, err)) {
+            part_failed = true;
+            return false;
+        }
         for (auto& b : eg_win)
             if (b->live) eg_finish(*b);
         st.engram_ms += (double) (eg_wait_ns.load() - eg_w0) / 1e6;
@@ -21055,7 +21136,7 @@ struct Model::Impl {
         pos += T;
         st.tokens += T;
         cache_tick(T);
-        if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
+        if (seed_rows != 0 && !part_link() && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
 
@@ -21160,6 +21241,7 @@ struct Model::Impl {
         bool started = false;
         std::vector<char> got(srcs.size(), 0);
         for (int il = 0; il < g.nl; ++il) {
+            if (away(il)) continue;   // (the pool: another PC's layer)
             Layer& L0 = L[(size_t) il];
             int mi = -1;
             for (int m = 0; m < L0.nm; ++m)
@@ -21167,7 +21249,15 @@ struct Model::Impl {
             if (mi < 0) continue;
             if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
-                if (il == 0) {
+                if (part_srv && il == part_lo) {   // (a part server: the front's rows)
+                    if (part_cur == nullptr) {
+                        err = "pool: a window without the front's rows";
+                        return false;
+                    }
+                    if (!part_src_h2d(*part_cur, di, s, err) ||
+                        !part_hand_h2d(*part_cur, hand_xfer(nullptr, d, T, false), T, s, err))
+                        return false;
+                } else if (il == 0) {
                     CK(cudaMemcpyAsync(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                     embed(d.emb_rows, T, d.h, D, H, s);
                     init_pre(d.pre, T, s);
@@ -21208,7 +21298,7 @@ struct Model::Impl {
             const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
             if (last && mi == 0 && il + 1 < g.nl) xfer_put(hand_xfer(d.hand, d, T, true), d.hand_flag, wp.win, d.xcnt, s);
         }
-        if (d.grp == devs[(size_t) head_dev].grp && !head_rows_dev(di, T, err)) return false;
+        if (d.grp == devs[(size_t) head_dev].grp && !away(g.nl - 1) && !head_rows_dev(di, T, err)) return false;
         if (!idle_ev.empty()) {   // (its turn over: the expert cache's copies from here, copy_open)
             CK(cudaEventRecord(idle_ev[(size_t) di], s));
             idle_win[(size_t) di].store(wp.win, std::memory_order_release);
@@ -22210,7 +22300,10 @@ struct Model::Impl {
         return true;
     }
 
+#include "ds4_part_impl.inc"
+
     int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter) {
+        if (part_link()) return part_sample(temperature, top_p, top_k, min_p, seed, counter);
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
         strata::kernels::SamplerParams sp;
@@ -22757,9 +22850,37 @@ bool Model::load(const Options& o, std::string& err) {
     err.clear();
     return p_->load(o, err);
 }
-bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
+// the pool's fallback: a call the link failed under is made again here, after the conversation's first `keep` tokens
+// were read again through every layer (a link that failed between calls: read again first)
+template <class F> static bool pool_guard(Model::Impl& p, int64_t keep, bool logits, std::string& err, F f) {
+    if (p.part_pending && !p.part_recover(p.pos, logits, err)) return false;
+    if (p.part_pending) return false;
+    p.part_failed = false;
+    if (f()) return true;
+    if (!p.part_failed) return false;
+    std::fprintf(stderr, "ds4 pool: %s - the request goes on here\n", err.c_str());
+    std::string e2;
+    if (!p.part_recover(keep, logits, e2)) {
+        err = "pool fallback: " + e2;
+        return false;
+    }
+    err.clear();
+    return f();
+}
+bool Model::step(int token, bool logits, std::string& err) {
+    Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    return pool_guard(p, p0, false, err, [&] { return p.step(token, logits, err); });
+}
+bool Model::part_serve(int port, std::string& err) { return p_->part_serve(port, err); }
+std::string Model::pool_line() const { return p_->pc != nullptr && !p_->part_srv ? p_->part_stats() : std::string(); }
 std::string Model::where() const { return p_->where(); }
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, int after) {
+    Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    return pool_guard(p, p0, false, err, [&] { return feed_(tokens, n, logits_rows, err, after); });
+}
+bool Model::feed_(const int* tokens, int n, int logits_rows, std::string& err, int after) {
     Impl& p = *p_;
     if (!feed_release(err)) return false;   // (another read: a prompt's room kept between its parts handed back first)
     p.main_at.store("reading a prompt", std::memory_order_relaxed);
@@ -22776,6 +22897,11 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err, in
     return p.feed_windows(tokens, n, logits_rows, err);
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
+    Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    return pool_guard(p, p0, false, err, [&] { return feed_mark_(tokens, n, logits_rows, slot, err); });
+}
+bool Model::feed_mark_(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
     if (!feed_release(err)) return false;   // (another read: a prompt's room kept between its parts handed back first)
     p.main_at.store("reading a prompt", std::memory_order_relaxed);
@@ -22797,6 +22923,12 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
 bool Model::feed_marks(const int* tokens, int n, int logits_rows, int slot,
                        const std::vector<std::pair<int64_t, bool>>& inner, std::string& err) {
     if (inner.empty()) return feed_mark(tokens, n, logits_rows, slot, err);
+    Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    return pool_guard(p, p0, false, err, [&] { return feed_marks_(tokens, n, logits_rows, slot, inner, err); });
+}
+bool Model::feed_marks_(const int* tokens, int n, int logits_rows, int slot,
+                        const std::vector<std::pair<int64_t, bool>>& inner, std::string& err) {
     Impl& p = *p_;
     const int64_t p0 = p.pos;
     for (size_t j = 0; j < inner.size(); ++j)
@@ -22873,6 +23005,11 @@ bool Model::feed_release(std::string& err) {
 }
 bool Model::feed_part(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err) {
     Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    return pool_guard(p, p0, false, err, [&] { return feed_part_(plan, tokens, k0, k1, err); });
+}
+bool Model::feed_part_(const FeedPlan& plan, const int* tokens, int k0, int k1, std::string& err) {
+    Impl& p = *p_;
     const int nk = (int) plan.ends.size();
     if (plan.at < 0 || k0 < 0 || k1 <= k0 || k1 > nk) {
         err = "feed_part: chunks the plan does not have";
@@ -22897,18 +23034,49 @@ void Model::set_yield(std::function<bool()> f) { p_->yield_to = std::move(f); }
 int Model::fed() const { return p_->fed_n; }
 bool Model::cancelled() const { return p_->halted; }
 bool Model::broken() { return p_->broken(); }
-void Model::begin_request() { p_->begin_request(); }
+void Model::begin_request() {
+    p_->begin_request();
+    if (p_->part_link()) p_->part_mirror(part::kBegin, part::Writer());
+}
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
-    return p_->sample(t, tp, tk, mp, seed, counter);
+    Impl& p = *p_;
+    std::string err;
+    if (p.part_pending && !p.part_recover(p.pos, true, err)) {
+        std::fprintf(stderr, "ds4 pool fallback: %s\n", err.c_str());
+        return -1;
+    }
+    const int x = p.sample(t, tp, tk, mp, seed, counter);
+    if (x != -2) return x;
+    std::fprintf(stderr, "ds4 pool: the sample's answer did not come - the request goes on here\n");
+    if (!p.part_recover(p.pos, true, err)) {
+        std::fprintf(stderr, "ds4 pool fallback: %s\n", err.c_str());
+        return -1;
+    }
+    return p.sample(t, tp, tk, mp, seed, counter);
 }
 void Model::set_penalties(int last_n, float repeat, float freq, float present) {
-    const bool on = last_n > 0 && (repeat != 1.0f || freq != 0.0f || present != 0.0f);
-    p_->pen_n = on ? last_n : 0;
-    p_->pen_repeat = repeat;
-    p_->pen_freq = freq;
-    p_->pen_present = present;
+    p_->set_pen(last_n, repeat, freq, present);
+    if (p_->part_link()) {
+        part::Writer w;
+        w.put<int32_t>(last_n);
+        w.put<float>(repeat);
+        w.put<float>(freq);
+        w.put<float>(present);
+        p_->part_mirror(part::kPenalties, w);
+    }
 }
-void Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries) { p_->set_logit_bias(entries); }
+void Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries) {
+    p_->set_logit_bias(entries);
+    if (p_->part_link()) {
+        part::Writer w;
+        w.put<uint32_t>((uint32_t) entries.size());
+        for (const auto& e : entries) {
+            w.put<int32_t>(e.first);
+            w.put<float>(e.second);
+        }
+        p_->part_mirror(part::kBias, w);
+    }
+}
 void Model::set_logprobs(int k, int force) {
     p_->lp_k = k < 0 ? -1 : std::min(k, kTopLogprobs);
     p_->lp_force = k < 0 ? -1 : force;
@@ -22934,11 +23102,17 @@ void Model::set_images(std::vector<Image> images) {
 int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
 bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
                   float mp, uint64_t seed, uint64_t counter, int max_n, float conf_min, float cum_min, int min_n) {
-    return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter, max_n, conf_min, cum_min, min_n);
+    Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    return pool_guard(p, p0, false, err,
+                      [&] { return p.draft(y, d, c, err, t, tp, tk, mp, seed, counter, max_n, conf_min, cum_min, min_n); });
 }
 bool Model::verify(int y, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter,
                    int& accepted, int& next, std::string& err) {
-    return p_->verify(y, d, t, tp, tk, mp, seed, counter, accepted, next, err);
+    Impl& p = *p_;
+    const int64_t p0 = p.pos;
+    return pool_guard(p, p0, false, err,
+                      [&] { return p.verify(y, d, t, tp, tk, mp, seed, counter, accepted, next, err); });
 }
 int Model::verify_max() const { return kWin; }
 bool Model::drafts_sampled() const { return p_->drafts_q; }
@@ -22977,19 +23151,46 @@ bool Model::verify_multi(int i, const std::vector<int>& d, float t, float tp, in
                          uint64_t counter, int& accepted, int& next, std::string& err) {
     return p_->verify_multi(i, d, t, tp, tk, mp, seed, counter, accepted, next, err);
 }
-void Model::reset() { p_->reset(); }
+void Model::reset() {
+    p_->reset();
+    if (p_->part_pending) {   // (an empty conversation: nothing to read again - the part's layers stay here)
+        p_->part_pending = false;
+        p_->part_hi = 1 << 30;
+    }
+}
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
-bool Model::restore(int64_t limit) { return p_->restore(limit); }
-void Model::pin() { p_->pin(); }
+bool Model::restore(int64_t limit) {
+    Impl& p = *p_;
+    const bool live = p.part_link();
+    const bool ok = p.restore(limit);
+    if (live && !p.part_restore_check(limit, ok, p.pos)) {   // (the halves no longer agree: start again, here)
+        std::string e;
+        p.part_recover(0, false, e);
+        return false;
+    }
+    return ok;
+}
+void Model::pin() {
+    p_->pin();
+    if (p_->part_link()) p_->part_mirror(part::kPin, part::Writer());
+}
 void Model::mark(bool shared) { p_->mark(shared); }
 int Model::marks_cap() const { return Impl::marks_cap(); }
 size_t Model::check_bytes() const { return p_->check_bytes(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err, const std::vector<PicMark>& pics) {
+    if (p_->part_link()) {   // (the pool: half of the state is on the other PC)
+        err = "no slots with a remote part";
+        return 0;
+    }
     return p_->slot_save(out, err, pics);
 }
 bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err, std::vector<PicMark>* pics) {
+    if (p_->part_link()) {
+        err = "no slots with a remote part";
+        return false;
+    }
     return p_->slot_load(data, bytes, n_pos, err, pics);
 }
 std::string Model::slot_identity() const { return p_->slot_identity(); }

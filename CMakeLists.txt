@@ -705,7 +705,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
                               src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
                               src/ds4/ds4_lane_parity.cpp
-                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp)
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp src/ds4/ds4_packinfo.cpp
+                              src/ds4/ds4_part_net.cpp)
     # DS4_LANE_PARITY's CPU rows: each float operation the one written (the device's _rn intrinsics' roundings), so no
     # multiply-add is fused behind the source's back (GCC contracts by default where FMA is on: the AVX2 rows' target)
     if(MSVC)

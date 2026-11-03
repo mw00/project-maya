@@ -3595,6 +3595,7 @@ int main(int argc, char** argv) {
     bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
+    int part_port = 0;
     bool serve_mode = false, multi_check = false, parts_check = false, marks_check = false, describe = false, dspark_set = false;
     std::string prof_run, prof_out, spec_eval_path;
     int sampler_n = 0;
@@ -3708,6 +3709,9 @@ int main(int argc, char** argv) {
             o.ablate_default = v == "on" || v == "1";
         }
         else if (a == "--serve") serve_mode = true;
+        else if (a == "--remote-part") o.remote_part = val("--remote-part");   // the pool: host:port of the part server
+        else if (a == "--part-from") o.part_from = (int) num("--part-from", 1, 1000, true);   // the pool: a part's first layer
+        else if (a == "--part-serve") part_port = (int) num("--part-serve", 1, 65535, true);  // the pool: serve as a part
         else if (a == "--parallel") o.seqs = (int) num("--parallel", 1, 8, true);   // (--serve: conversations at once)
         else if (a == "--multi-check") multi_check = true;   // (tests: --parallel's rows against each alone)
         else if (a == "--parts-check") parts_check = true;   // (tests: a prompt in parts against one call)
@@ -3752,7 +3756,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "--sampler-test needs --ids (a prompt whose next tokens are open)\n");
         return 2;
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty() &&
+    if (o.pack.empty() || (!serve_mode && part_port == 0 && ids_s.empty() && enc_rgb.empty() && ppl.empty() && prof_run.empty() &&
                            spec_eval_path.empty())) {
         usage();
         return 2;
@@ -3791,6 +3795,10 @@ int main(int argc, char** argv) {
 #endif
     }
     o.vision_only = !enc_rgb.empty();
+    if (part_port > 0 && o.part_from <= 0) {
+        std::fprintf(stderr, "maya-ds4: --part-serve needs --part-from <the first layer it runs>\n");
+        return 2;
+    }
     strata::ds4::Model m;
     std::string err;
     o.lookup = suffix_draft > 0;   // (its verify windows' buffers, with no drafter too)
@@ -3812,6 +3820,13 @@ int main(int argc, char** argv) {
                              "same tokens)\n");
     } else if (ds4_env("DS4_DRAFT_COST") != nullptr && std::atoi(ds4_env("DS4_DRAFT_COST")) != 0)
         std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
+    if (part_port > 0) {   // the pool's part server: the front's layers come over the link
+        if (!m.part_serve(part_port, err)) {
+            std::fprintf(stderr, "maya-ds4: %s\n", err.c_str());
+            return 1;
+        }
+        return 0;
+    }
     if (serve_mode) {
         g_vram_gpus = o.gpus;
         return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());
@@ -4046,6 +4061,7 @@ int main(int argc, char** argv) {
     const double t2 = now_ms();
     const auto& s = m.stats();
     const double nt = std::max<double>(1.0, (double) (s.tokens - s0.tokens));
+    if (!m.pool_line().empty()) std::fprintf(stderr, "%s\n", m.pool_line().c_str());
     std::fprintf(stderr, "decode: %zu tokens in %.0f ms (%.2f tok/s); CPU lane: %lld of %lld experts, streamed to the GPU: "
                          "%lld; the cache moved %lld (%lld in all)\n", out.size(), t2 - t1,
                  out.size() > 1 ? 1000.0 * (double) (out.size() - 1) / (t2 - t1) : 0.0,
