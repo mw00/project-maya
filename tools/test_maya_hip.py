@@ -65,6 +65,40 @@ class HipSetupTests(unittest.TestCase):
         pc = maya.check_pc(self.a)
         self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
 
+    def test_debian_multiarch_rocm_is_found(self) -> None:
+        """Debian/Ubuntu's own ROCm packages: clang in lib/llvm-<N>/bin, hipBLAS in lib/<multiarch>, the device
+        bitcode in the LLVM's clang resource folder (handed to clang as HIP_DEVICE_LIB_PATH)."""
+        (self.rocm / "llvm/bin/clang++").unlink()
+        (self.rocm / "lib/libhipblas.so").unlink()
+        clang = self.rocm / "lib/llvm-21/bin/clang++"
+        clang.parent.mkdir(parents=True)
+        clang.touch()
+        (self.rocm / "lib/x86_64-linux-gnu").mkdir()
+        (self.rocm / "lib/x86_64-linux-gnu/libhipblas.so.2").touch()
+        bitcode = self.rocm / "lib/llvm-21/lib/clang/21/amdgcn/bitcode"
+        bitcode.mkdir(parents=True)
+        self.assertEqual(maya.hip_clang(self.rocm), clang)
+        pc = maya.check_pc(self.a)
+        self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("HIP_DEVICE_LIB_PATH", None)
+            _, _, _, env = maya.hip_toolchain({"rocm": str(self.rocm)})
+        self.assertEqual(env["HIP_DEVICE_LIB_PATH"], str(bitcode))
+
+    def test_rocm6_refused_unless_allowed(self) -> None:
+        with patch.object(maya, "tool_version", return_value=(6, 4)):
+            with self.assertRaises(SystemExit):
+                maya.check_pc(self.a)
+            with patch.dict(os.environ, {"MAYA_HIP_ALLOW_ROCM6": "1"}):
+                pc = maya.check_pc(self.a)
+        self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
+
+    def test_cpu_without_avx2_warns_and_goes_on(self) -> None:
+        """As on CUDA (#32): the CPU expert lane falls back to ggml's kernels, setup does not stop."""
+        with patch.object(maya.S, "cpu_info", return_value=("Xeon E5-2695 v2", False, False)):
+            pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [self.gpus[0]])
+
     def test_rdna2_is_experimental_and_compiled_only_when_chosen(self):
         pc = maya.check_pc(self.a)      # the RX 7900 XT: its own architecture only (#255)
         self.assertEqual(pc["archs"], ["gfx1100"])

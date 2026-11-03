@@ -14,6 +14,13 @@ outside `/opt/rocm`. Versioned LLVM slots, as Gentoo's
 goes into the project or its model-data folder; setup does not install system
 packages.
 
+A distribution's own ROCm packages under `/usr` work too, including Debian's and Ubuntu's multiarch layout
+(`/usr/lib/x86_64-linux-gnu/libhipblas.so`, the compiler in `/usr/lib/llvm-<N>/bin`, the device bitcode in
+`/usr/lib/llvm-<N>/lib/clang/<N>/amdgcn/bitcode`). A ROCm older than 7 (Debian's 6.4, hipBLAS 2.x) is untested and
+refused by default; `MAYA_HIP_ALLOW_ROCM6=1` lets setup go on with a warning. The build then turns on hipBLAS 2's
+`HIPBLAS_V2` API and skips `hipblasSetWorkspace` (absent before hipBLAS 3). Measured that way on Debian sid
+(ROCm 6.4.3, hipBLAS 2.4) with an MI50 + MI100 layer split and a CPU without AVX2 - see the pull request.
+
 ```sh
 ./maya.sh --backend hip --gpu 0 --check
 ./maya.sh --backend hip --gpu 0 --context 8192 --no-vision --yes \
