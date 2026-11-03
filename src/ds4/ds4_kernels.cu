@@ -1,6 +1,7 @@
 // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
 // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
 #include "ds4_kernels.cuh"
+#include "ds4_peer_cuda_compat.cuh"  // (the HIP names the peer all-reduce uses, on CUDA)
 #include "ds4_pdl.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"

@@ -24,6 +24,7 @@
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_iq.cuh"
 #include "ds4_kernels.cuh"
+#include "ds4_peer_cuda_compat.cuh"  // (the HIP names the peer all-reduce uses, on CUDA)
 #include "ds4_lt.hpp"
 #include "ds4_marks.hpp"
 #include "ds4_markov_q8.hpp"
@@ -16643,7 +16644,13 @@ struct Model::Impl {
         }
         int original_device = 0;
         cudaGetDevice(&original_device);
-        const double deadline = now_ms() + 3000.0; // shared by every group, not three seconds per pair
+        // each pair's own measurement budget, from after its setup (DS4_PEER_AR_PROBE_MS, 3000): a slow first pair under
+        // host I/O no longer uses up the others' time
+        static const double probe_ms = [] {
+            const char* e = ds4_env("DS4_PEER_AR_PROBE_MS");
+            const double v = e ? std::atof(e) : 3000.0;
+            return v > 0 ? v : 3000.0;
+        }();
 
         for (Group& G : groups) {
             if (G.mem.size() != 2 || G.arb.nm != 2) continue;
@@ -16652,7 +16659,6 @@ struct Model::Impl {
                 std::fprintf(stderr, "ds4: peer prefill all-reduce not selected for AR2/flow group\n");
                 continue;
             }
-            if (automatic && now_ms() >= deadline) continue;
             std::array<PeerAr, 2> a{};
             auto release = [&] {
                 for (int m = 0; m < 2; ++m) {
@@ -16665,16 +16671,17 @@ struct Model::Impl {
                 }
             };
             bool ok = G.arb.stride <= size_t(INT_MAX);
+            std::string why = ok ? "" : "chunk too large";
             for (int m = 0; m < 2 && ok; ++m) {
                 Dev& d = devs[(size_t) G.mem[m]];
                 const int peer = devs[(size_t) G.mem[1-m]].id;
                 if (cudaSetDevice(d.id) != cudaSuccess) { ok = false; break; }
                 int capable = 0;
                 ok = hipDeviceCanAccessPeer(&capable, d.id, peer) == hipSuccess && capable;
-                if (!ok) break;
+                if (!ok) { why = "no peer access"; break; }
                 auto status = hipDeviceEnablePeerAccess(peer, 0);
                 ok = status == hipSuccess || status == hipErrorPeerAccessAlreadyEnabled;
-                if (!ok) break;
+                if (!ok) { why = "peer access not enabled"; break; }
                 hipGetLastError(); // consume already-enabled status, if any
                 peer_ar_preload();  // (CUDA lazy loading: load before the first spinning launch)
                 int wall_clock_khz = 0;
@@ -16687,8 +16694,11 @@ struct Model::Impl {
                 // Leave 64 MiB free; never evict experts or resize the expert pool to make tuning fit.
                 const size_t need = (automatic ? 3 : 2) * payload + (64ull << 20) +
                                    2 * kPeerArBlocks * kPeerArFlagStride * sizeof(unsigned);
-                if (hipMemGetInfo(&available, &total) != hipSuccess || available < need ||
-                    (automatic && now_ms() >= deadline)) { ok = false; break; }
+                if (hipMemGetInfo(&available, &total) != hipSuccess || available < need) {
+                    why = "GPU" + std::to_string(d.id) + " has " + std::to_string(available >> 20) + " MiB free, needs " +
+                          std::to_string(need >> 20) + (automatic ? " (auto: + the probe's input row)" : "");
+                    ok = false; break;
+                }
                 a[m].stride = G.arb.stride;
                 // bounded wait for the partner (DS4_PEER_AR_TIMEOUT_S, 60 s): two seconds timed out on a 469K-token prompt on
                 // 8x RTX 3090 - the lead (head, a drafter block, restore points) ran more than 2 s behind its partner at one
@@ -16713,7 +16723,8 @@ struct Model::Impl {
             }
             if (!ok) {
                 release();
-                std::fprintf(stderr, "ds4: peer prefill all-reduce unavailable; retaining host transport\n");
+                std::fprintf(stderr, "ds4: peer prefill all-reduce unavailable on GPU%d/GPU%d (%s); retaining host transport\n",
+                             devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id, why.empty() ? "setup failed" : why.c_str());
                 continue;
             }
             for (int m = 0; m < 2; ++m) {
@@ -16734,19 +16745,27 @@ struct Model::Impl {
                 }
                 const int ids[2] = {devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id};
                 const auto result = calibrate_peer(ids, G.arb, progress ? &ar2_group : nullptr, a.data(),
-                                                   int(G.arb.stride), std::max(0.0, deadline - now_ms()));
+                                                   int(G.arb.stride), probe_ms);
                 const char* selected = result.complete && result.selected == PeerTransport::peer ? "peer" :
                                        result.complete && result.selected == PeerTransport::ar2 ? "ar2" : "host";
                 std::fprintf(stderr, "PEER_AR_AUTO gpu=%d,%d floats=%zu samples=%d host_ms=%.6f ar2_ms=%.6f "
                                      "peer_ms=%.6f selected=%s elapsed_ms=%.1f complete=%d\n",
                              ids[0], ids[1], G.arb.stride, result.samples, result.ms[0], progress ? result.ms[1] : -1.0,
                              result.ms[2], selected, result.elapsed_ms, int(result.complete));
-                if (!result.quiescent || !result.valid) {
-                    // Never start inference or release buffers that a failed probe may still be reading.
-                    if (result.quiescent) { release(); if (progress) hipHostFree(progress); }
+                if (!result.quiescent) {
+                    // Never start inference or release buffers that a probe may still be reading.
                     cudaSetDevice(original_device);
-                    err = "startup transport probe failed validation or did not drain; reload required";
+                    err = "startup transport probe did not drain; reload required";
                     return false;
+                }
+                if (!result.valid || !result.complete) {
+                    // drained: nothing reads the probe's buffers any more and the host rows' flags are reset
+                    std::fprintf(stderr, "ds4: peer prefill all-reduce probe on GPU%d/GPU%d %s; keeping the host transport\n",
+                                 ids[0], ids[1], !result.valid ? "failed validation"
+                                                               : "did not finish within its budget (DS4_PEER_AR_PROBE_MS)");
+                    release();
+                    if (progress) hipHostFree(progress);
+                    continue;
                 }
                 if (result.complete && result.selected == PeerTransport::ar2) {
                     G.arb = ar2_group;

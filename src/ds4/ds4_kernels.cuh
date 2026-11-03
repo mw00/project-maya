@@ -6,7 +6,6 @@
 // What differs from query to query (its window, how much of the compressed KV it sees, how many rows it selects) is
 // known on the host and passed by value.
 #pragma once
-#include "ds4_peer_cuda_compat.cuh"
 
 #include <cstddef>
 #include <cstdint>
