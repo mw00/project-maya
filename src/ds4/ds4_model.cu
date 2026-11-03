@@ -5105,8 +5105,8 @@ struct Model::Impl {
         const size_t qb = (slab_mb != nullptr ? (size_t) std::max(1, std::atoi(slab_mb)) : auto_mb) << 20;
         c.A = std::max(64, (int) (qb / (size_t) HQ) / 64 * 64);
         c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
-        // (DS4_AI_RUN=0: the context's rows in the buffers too - the same expert placement, and bits, as without the patch)
-        static const bool ai_run = std::getenv("DS4_AI_RUN") == nullptr || std::atoi(std::getenv("DS4_AI_RUN")) != 0;
+        // (DS4_AI_RUN=1: room for a run's own rows; unset or 0: the context's rows, the same buffers and expert placement as before)
+        static const bool ai_run = std::getenv("DS4_AI_RUN") != nullptr && std::atoi(std::getenv("DS4_AI_RUN")) != 0;
         c.AIM = ai_run ? std::max(c.AI, 128) : c.AI;
         c.w16_elems = (w16_mb != nullptr ? (size_t) std::max(1, std::atoi(w16_mb)) : 2 * auto_mb) << 19;
     }
@@ -5961,8 +5961,8 @@ struct Model::Impl {
             return;
         }
         // (a pinned copy in one part, any format - cp_pin's: DMA'd from where it lies, as above; the readers' memcpy
-        // into staging first was the 4-GPU prompt's limit on the IQ quants, ~2.7 GB/s a GPU; DS4_FLOW_COPY_DMA=0: not)
-        static const bool copy_dma = std::getenv("DS4_FLOW_COPY_DMA") == nullptr || std::atoi(std::getenv("DS4_FLOW_COPY_DMA")) != 0;
+        // into staging first was the 4-GPU prompt's limit on the IQ quants, ~2.7 GB/s a GPU; DS4_FLOW_COPY_DMA=1; unset: not)
+        static const bool copy_dma = std::getenv("DS4_FLOW_COPY_DMA") != nullptr && std::atoi(std::getenv("DS4_FLOW_COPY_DMA")) != 0;
         if (in_ram && copy_mode && cp_dma && copy_dma && NH == 1) {
             const uint8_t* p = ram_part[(size_t) l.ram[(size_t) e]][0];
             for (int r = 0; r < 3; ++r) it.src[r] = p + cp_lay[(size_t) l.il][(size_t) r] + mx_read_off(l, mi, r);
@@ -17227,8 +17227,8 @@ struct Model::Impl {
                         return false;
                     // the slab's rows as wide as this run's keys, not the context's: a prompt shorter than the
                     // context gets the rows a context of its length would (128 below ~64K keys) - the same GEMM
-                    // shapes, fewer slabs (DS4_AI_RUN=0: the context's AI rows, as before)
-                    static const bool ai_run = std::getenv("DS4_AI_RUN") == nullptr || std::atoi(std::getenv("DS4_AI_RUN")) != 0;
+                    // shapes, fewer slabs (DS4_AI_RUN=1; unset or 0: the context's AI rows, as before)
+                    static const bool ai_run = std::getenv("DS4_AI_RUN") != nullptr && std::atoi(std::getenv("DS4_AI_RUN")) != 0;
                     long long ssr = ss;
                     int air = c.AI;
                     if (ai_run) {
@@ -19236,10 +19236,10 @@ struct Model::Impl {
         // the windows-vs-chunks threshold)
         // and at most `chunk` - a short prompt in one chunk ran its groups one after another (4K on 4 GPUs: 4 stages
         // back to back); smaller chunks keep every group busy, each chunk re-streaming the experts it picks
-        // (DS4_CHUNK_AUTO=0: `chunk` as before)
+        // (DS4_CHUNK_AUTO=1; unset or 0: `chunk` as before)
         int cr = chunk;
         {
-            static const bool on = std::getenv("DS4_CHUNK_AUTO") == nullptr || std::atoi(std::getenv("DS4_CHUNK_AUTO")) != 0;
+            static const bool on = std::getenv("DS4_CHUNK_AUTO") != nullptr && std::atoi(std::getenv("DS4_CHUNK_AUTO")) != 0;
             static const int pg = std::getenv("DS4_CHUNK_PER_GROUP") ? std::max(1, std::atoi(std::getenv("DS4_CHUNK_PER_GROUP"))) : 2;
             static const int cmin = std::getenv("DS4_CHUNK_AUTO_MIN") ? std::max(16, std::atoi(std::getenv("DS4_CHUNK_AUTO_MIN"))) : 1024;
             const int G = (int) groups.size();
