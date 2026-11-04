@@ -47,16 +47,39 @@ function Banners({m}) {
 }
 
 // ------------------------------------------------------------------ the speed, and what is happening now
+// the prefill's peak: the highest live rate while a prompt is read, kept once its reading ends ("peak this request", then
+// "peak last request"), reset when the next reading starts.  n: the requests served when it was read - the request it
+// belongs to is the one running while that count stands, the last one finished once it is one more.  A request whose
+// reading this page did not see (too quick for a poll, or the page opened later) shows its final rate.
+const PF = {peak: null, reading: false, n: null};
+function prefillPeak(m) {
+  const live = m.live || {}, n = m.totals && m.totals.requests != null ? m.totals.requests : null;
+  if (live.state === "reading") {
+    if (!PF.reading) { PF.peak = null; PF.n = n; }
+    PF.reading = true;
+    if (live.prefill_tok_s_mean > 0) PF.peak = Math.max(PF.peak || 0, live.prefill_tok_s_mean);
+    return {rate: PF.peak, now: true};
+  }
+  PF.reading = false;
+  if (PF.peak == null || PF.n == null || n == null) return null;
+  if (live.state !== "idle" && n === PF.n) return {rate: PF.peak, now: false, label: "peak this request"};
+  if (live.state === "idle" && n === PF.n + 1) return {rate: PF.peak, now: false, label: "peak last request"};
+  return null;
+}
+
 function Throughput({m}) {
   const live = m.live || {}, h = m.history || {}, last = (m.requests || [])[0], eng = m.engine || {}, tn = m.tiers && m.tiers.now;
   const gen = live.state === "generating";
   const many = live.active > 1;                  // several answers at once (--parallel): their total, the graph's newest point
   const speed = many ? (h.tok_s || []).at(-1) : gen ? live.tok_s : last ? last.decode_tok_s : null;
-  // prefill: the engine's rate over the tokens it read (not the reused prefix), live while a request runs
-  const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+  // prefill: the engine's rate over the tokens it read (not the reused prefix): the peak of the reading this page saw
+  // (prefillPeak), else live while a request runs, else the last request's final rate
+  const pk = prefillPeak(m);
+  const prefill = pk && pk.rate != null ? pk.rate : live.state !== "idle" ? live.prefill_tok_s_mean
     : last ? (last.prefill_tok_s != null ? last.prefill_tok_s
               : last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null)
     : null;
+  const pwhat = live.state === "reading" ? "reading now" : pk && pk.label ? pk.label : gen ? "this request" : last ? "last request" : "waiting";
   const fresh = tn && tn.time && Date.now() / 1000 - tn.time <= 30;
   const ms = gen && tn && tn.ms_tok ? tn.ms_tok : speed ? 1000 / speed : null;
   const hit = fresh && tn.vram_hit != null ? 100 * tn.vram_hit : last && last.hit_rate != null ? 100 * last.hit_rate : null;
@@ -69,26 +92,24 @@ function Throughput({m}) {
   const when = peak ? new Date(peak.time * 1000) : null;
   const at = when ? when.toLocaleString([], new Date().toDateString() === when.toDateString()
     ? {hour: "2-digit", minute: "2-digit"} : {weekday: "short", hour: "2-digit", minute: "2-digit"}) : "";
-  // the prefill tile's line: the last request's new tokens and the time they took (the reused ones are Right now's)
-  const read = last ? Math.max(0, last.prompt_tokens - (last.reused || 0)) : null;
-  const psub = live.state !== "idle" ? "the mean over this request"
-    : last && last.prompt_ms > 0 ? `${fmt(read)} new token${read === 1 ? "" : "s"} in ${fmt(last.prompt_ms / 1000, last.prompt_ms < 10000 ? 1 : 0)} s`
-    : "prompt tokens read per second";
-  // decode and prefill side by side, the same size: each its figure, its line and its own sparkline (the last minute)
+  // (as v1.1.52: the two figures side by side over one chart - decode the area and line, prefill the dashed line)
   return html`<section class="card card--wide tp" aria-label="Throughput">
-    <div class="card__head"><span class="card__title">Throughput</span>
-      <span class="card__sub">${a || b ? "the last minute" : "no activity in the last minute"}</span></div>
-    <div class="tp__tiles">
-      <div class="tp__tile"><span class="speed__label"><i class="key key--line"></i>Decode · ${many ? `${live.writing} writing` : gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
-        <span class="tp__num num">${speed == null ? "–" : fmt(speed, 1)}<small>tok/s</small></span>
-        <span class="tp__sub num" title=${peak ? `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
-            : "The highest decode speed since Maya started. Live speeds and finished answers count, from 32 tokens on."}>Peak ${peak ? `${fmt(peak.tok_s, 1)} tok/s` : "–"}</span>
-        <${Spark} values=${h.tok_s} cls="tp__spark"/></div>
-      <div class="tp__tile" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache">
-        <span class="speed__label"><i class="key key--dash"></i>Prefill · ${live.state === "reading" ? "reading now" : gen ? "this request" : last ? "last request" : "waiting"}</span>
-        <span class="tp__num num">${prefill == null ? "–" : fmt(prefill)}<small>tok/s</small></span>
-        <span class="tp__sub num">${psub}</span>
-        <${Spark} values=${h.prefill_tok_s_mean} tone="info" cls="tp__spark"/></div>
+    <div class="card__head"><span class="card__title">Throughput</span>${a || b ? html`<span class="card__sub">the last minute</span>` : null}</div>
+    <div class="speeds">
+      <div class="speed"><span class="speed__label"><i class="key key--line"></i>Decode · ${many ? `${live.writing} writing` : gen ? "writing now" : live.state === "reading" ? "reading the prompt" : last ? "last request" : "waiting for a request"}</span>
+        <div class="speed__row"><span class="speed__big num">${speed == null ? "–" : fmt(speed, 1)}<small>tok/s</small></span>
+          ${/* the peak beside the live Decode (below it on a phone), small: a reference, not a second headline */ ""}
+          <span class="speed__peak num" title=${peak ? `The highest decode speed since Maya started: ${fmt(peak.tok_s, 1)} tok/s at ${at}, ${fmt(peak.tokens)} tokens into the answer. Live speeds and finished answers count, from 32 tokens on.`
+              : "The highest decode speed since Maya started. Live speeds and finished answers count, from 32 tokens on."}>Peak ${peak ? `${fmt(peak.tok_s, 1)} tok/s` : "–"}</span></div></div>
+      <div class="speed" title="Prompt tokens read per second (the prefill), counting only the tokens read - not the ones reused from the conversation cache. While a prompt is read and after: the highest rate of that reading.">
+        <span class="speed__label"><i class="key key--dash"></i>Prefill · ${pwhat}</span>
+        <span class="speed__mid num">${prefill == null ? "–" : fmt(prefill)}<small>tok/s</small></span></div>
+    </div>
+    <div class=${`spark-wrap${a || b ? "" : " is-empty"}`}>
+      <svg class="spark spark--hero" viewBox="0 0 100 32" preserveAspectRatio="none" aria-hidden="true">
+        ${a ? html`<path class="spark__area" d=${a.area}/><path class="spark__line" d=${a.line} vector-effect="non-scaling-stroke"/>` : null}
+        ${b ? html`<path class="spark__line spark__line--dash" d=${b.line} vector-effect="non-scaling-stroke"/>` : null}</svg>
+      <span class="spark-wrap__empty">No activity in the last minute</span>
     </div>
     <div class="stats">
       <div class="stat"><span class="stat__label">Time per token</span><${Num} v=${ms == null ? null : fmt(ms, 1)} unit="ms"/></div>

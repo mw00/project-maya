@@ -59,15 +59,7 @@
 .spark[data-tone="warn"] { color: var(--st-warn); }
 .spark[data-tone="info"] { color: var(--st-info); }
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: 12px; padding-top: 14px; border-top: 1px solid var(--st-hair); }
-/* Throughput: decode and prefill as two tiles of the same size (figure, line, sparkline), then the stats strip set into the card */
-.tp__tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 28px; }
-.tp__tile { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.tp__num { margin-top: 6px; font-size: 40px; font-weight: 600; letter-spacing: -.02em; line-height: 1.1; white-space: nowrap; }
-.tp__num small { margin-left: 6px; font-size: var(--st-fs-sm); font-weight: 500; letter-spacing: 0; color: var(--st-ink-muted); }
-.tp__sub { font-size: var(--st-fs-sm); color: var(--st-ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.spark.tp__spark { height: 44px; margin-top: 12px; }
-.spark.tp__spark[data-tone="info"] .spark__area { opacity: .1; }
-.spark.tp__spark[data-tone="info"] .spark__line { stroke-dasharray: 3 2; }   /* (dashed, as its key) */
+/* Throughput (as v1.1.52: the two figures over one chart), then the stats strip set into the card */
 .tp .stats { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; padding: 14px 16px; border: 0; border-radius: var(--st-r-md); background: var(--st-inset); }
 .tp .stat__value { font-size: var(--st-fs-xl); }
 .stat { display: flex; flex-direction: column; gap: 2px; }
@@ -193,9 +185,6 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
 @media (max-width: 767px) {
   .mon__page { padding: calc(78px + max(10px, env(safe-area-inset-top))) 16px 40px; gap: 16px; }
   .card { padding: 16px; }
-  .tp__tiles { gap: 16px; }
-  .tp__num { font-size: 30px; }
-  .tp__sub { white-space: normal; }
   .tp .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); padding: 12px 14px; }
   .speed__big { font-size: 40px; }
   .speeds { row-gap: 14px; flex-wrap: nowrap; justify-content: space-between; gap: 16px; }
