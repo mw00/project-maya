@@ -2283,3 +2283,9 @@ IDs, including the end-of-thinking trigger when applicable. The loop guard is di
 requests, since its inserted steering text would change the grammar's language. Streaming and nonstreaming
 chat completions use the same native grammar path. Responses API extensions for GBNF are not provided;
 unsupported fields there are rejected. Existing `response_format` behavior is separate.
+
+The native `grammar_hex=1` capability transports temporary grammar paths as UTF-8 hex, so spaces and
+Unicode in the platform's temporary directory remain one protocol field. Older engines use `grammar=`
+only for paths without whitespace or NUL; an unsafe legacy path is rejected explicitly. A host subprocess
+test covers hex paths, parallel routes, replay fields and cancellation ownership with spaces and Unicode.
+This is CPU protocol coverage, not Windows GPU qualification.
