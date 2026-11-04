@@ -334,9 +334,11 @@ PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int n
     const size_t stride = rs != 0 ? rs : rb;
     const int nsb = kMx ? k / 32 : (k / 256) * 8;   // (the sub-blocks: a 256-value step is 8 of them)
     const int nb = nsb / 8, tail = nsb - nb * 8;   // (a band of 32-value blocks: the last ones below a step)
+    const size_t sbytes = kMx ? (size_t) 8 * 17 : (size_t) block_bytes(TYPE);   // (a step's bytes: 8 blocks, or the one)
     const __m256i ones16 = _mm256_set1_epi16(1), ones8 = _mm256_set1_epi8(1), x80 = _mm256_set1_epi8((char) 0x80);
     thread_local std::vector<uint8_t> xu_buf;
-    if (xu_buf.size() < (size_t) kMaxT * (size_t) k) xu_buf.resize((size_t) kMaxT * (size_t) k);
+    // (+256: the last step of a band reads a whole 256-value step of x, its blocks past the band's end times zero weights)
+    if (xu_buf.size() < (size_t) kMaxT * ((size_t) k + 256)) xu_buf.resize((size_t) kMaxT * ((size_t) k + 256));
     const uint8_t* xu[kMaxT];
     const float* xd[kMaxT];
     for (int t = 0; t < nt; ++t) {   // (x + 128 as u8, a call's once)
@@ -347,61 +349,75 @@ PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int n
         xu[t] = u;
         xd[t] = act_d(act[t], k);
     }
+    // one 256-value step (8 sub-blocks) of a row: `wblk` its bytes, `xds` the activations' 8 scale rows, `b` the step
+    // (its sub-blocks go to the lanes 8 b .. 8 b + 7 mod LPR)
+    __m256 acc[kMaxT][NQ];
+    auto step = [&](const uint8_t* wblk, const float* const* xds, int b) PAR_AVX2 {
+        __m256i ws[8], s0v, s1v;
+        __m256 dv;
+        if constexpr (kMx) {
+            dec8_mx(wblk, ws, dv);
+            s0v = _mm256_set1_epi32(1);
+            s1v = s0v;
+        } else {
+            float d = 0.0f;
+            dec8<TYPE>(wblk, ws, s0v, s1v, d);
+            dv = _mm256_set1_ps(d);
+        }
+        __m256i p[8], wlo, whi;
+        for (int i = 0; i < 8; ++i) p[i] = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, ws[i]), ones16);
+        halves8(p, wlo, whi);
+        wlo = _mm256_slli_epi32(wlo, 7);
+        whi = _mm256_slli_epi32(whi, 7);
+        const int q = b % NQ;   // (sub-blocks 8 b .. 8 b + 7: lanes (8 b) mod LPR ..)
+        for (int t = 0; t < nt; ++t) {
+            const uint8_t* x = xu[t] + (size_t) b * 256;
+            for (int i = 0; i < 8; ++i)
+                p[i] = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*) (x + 32 * i)), ws[i]), ones16);
+            __m256i lo, hi;
+            halves8(p, lo, hi);
+            lo = _mm256_sub_epi32(lo, wlo);
+            hi = _mm256_sub_epi32(hi, whi);
+            const __m256i is = kHalves ? _mm256_add_epi32(_mm256_mullo_epi32(lo, s0v), _mm256_mullo_epi32(hi, s1v))
+                                       : _mm256_mullo_epi32(_mm256_add_epi32(lo, hi), s0v);
+            const __m256 xs = _mm256_load_ps(xds[t]);
+            if constexpr (kMx)   // fma(block scale * activation scale, the exact int, sum) - the mx kernels' form
+                acc[t][q] = _mm256_fmadd_ps(_mm256_mul_ps(dv, xs), _mm256_cvtepi32_ps(is), acc[t][q]);
+            else {
+                const __m256 v = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(is));
+                acc[t][q] = _mm256_fmadd_ps(xs, v, acc[t][q]);
+            }
+        }
+    };
+    alignas(32) float xds[kMaxT][8];   // (a step's 8 scale rows: the row's own, or the band's last with 0s after it)
+    const float* xdp[kMaxT];
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * stride;
-        __m256 acc[kMaxT][NQ];
         for (int t = 0; t < nt; ++t)
             for (int q = 0; q < NQ; ++q) acc[t][q] = _mm256_setzero_ps();
         for (int b = 0; b < nb; ++b) {
-            __m256i ws[8], s0v, s1v;
-            __m256 dv;
-            if constexpr (kMx) {
-                dec8_mx(row + (size_t) b * 136, ws, dv);
-                s0v = _mm256_set1_epi32(1);
-                s1v = s0v;
-            } else {
-                float d = 0.0f;
-                dec8<TYPE>(row + (size_t) b * (size_t) block_bytes(TYPE), ws, s0v, s1v, d);
-                dv = _mm256_set1_ps(d);
-            }
-            __m256i p[8], wlo, whi;
-            for (int i = 0; i < 8; ++i) p[i] = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, ws[i]), ones16);
-            halves8(p, wlo, whi);
-            wlo = _mm256_slli_epi32(wlo, 7);
-            whi = _mm256_slli_epi32(whi, 7);
-            const int q = b % NQ;   // (sub-blocks 8 b .. 8 b + 7: lanes (8 b) mod LPR ..)
             for (int t = 0; t < nt; ++t) {
-                const uint8_t* x = xu[t] + (size_t) b * 256;
-                for (int i = 0; i < 8; ++i)
-                    p[i] = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_loadu_si256((const __m256i*) (x + 32 * i)), ws[i]), ones16);
-                __m256i lo, hi;
-                halves8(p, lo, hi);
-                lo = _mm256_sub_epi32(lo, wlo);
-                hi = _mm256_sub_epi32(hi, whi);
-                const __m256i is = kHalves ? _mm256_add_epi32(_mm256_mullo_epi32(lo, s0v), _mm256_mullo_epi32(hi, s1v))
-                                           : _mm256_mullo_epi32(_mm256_add_epi32(lo, hi), s0v);
-                if constexpr (kMx)   // fma(block scale * activation scale, the exact int, sum) - the mx kernels' form
-                    acc[t][q] = _mm256_fmadd_ps(_mm256_mul_ps(dv, _mm256_loadu_ps(xd[t] + (size_t) b * 8)),
-                                                _mm256_cvtepi32_ps(is), acc[t][q]);
-                else {
-                    const __m256 v = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(is));
-                    acc[t][q] = _mm256_fmadd_ps(_mm256_loadu_ps(xd[t] + (size_t) b * 8), v, acc[t][q]);
-                }
+                std::memcpy(xds[t], xd[t] + (size_t) b * 8, sizeof xds[t]);
+                xdp[t] = xds[t];
             }
+            step(row + (size_t) b * sbytes, xdp, b);
+        }
+        if (kMx && tail > 0) {   // (an IQ type's k is whole 256-value blocks: never a tail here)
+            // (an FF band of 32-value blocks has less than a step at its end - 36 blocks: 4 of them.  The rest of the step
+            //  is zeros: scale 0, no codes, so the sub-blocks add nothing and the lanes past the band stay empty; the
+            //  blocks past the band read zero scales and the x past the band's end meets zero weights.  The scalar form
+            //  this replaces cost 5x the row.)
+            alignas(32) uint8_t padb[136] = {};
+            std::memcpy(padb, row + (size_t) nb * sbytes, (size_t) tail * 17);
+            for (int t = 0; t < nt; ++t) {
+                for (int j = 0; j < 8; ++j) xds[t][j] = j < tail ? xd[t][(size_t) nb * 8 + (size_t) j] : 0.0f;
+                xdp[t] = xds[t];
+            }
+            step(padb, xdp, nb);
         }
         for (int t = 0; t < nt; ++t) {
             alignas(32) float a[32];
             for (int q = 0; q < NQ; ++q) _mm256_store_ps(a + 8 * q, acc[t][q]);
-            // the sub-blocks below a 256-value step (a member's FF band of 36 blocks: 4 of them): one block a time through
-            // the scalar form, into the same lanes (b % LPR) and with the same fma as the steps above
-            if (kMx)
-                for (int kb = nb * 8; kb < nb * 8 + tail; ++kb) {
-                    Sub s;
-                    decode(TYPE, row, kb, s);
-                    const int lane = kb & (LPR - 1);
-                    a[lane] = p_fma(p_mul(s.d, act_d(act[t], k)[kb]), (float) sub_dot_int(s, act_q(act[t]) + 32 * kb),
-                                    a[lane]);
-                }
             sums[r - r0][t] = lanes_tree(a, LPR);
         }
     }
