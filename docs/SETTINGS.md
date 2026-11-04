@@ -2002,8 +2002,8 @@ for this PC: its GPUs, their architecture, the GPU runtime and the driver) and t
 driver gets the defaults until it is measured again. The config records the result (`installer.prefill_calibration`).
 It takes one start of the model and a few minutes; the answers are the model's either way.
 
-**Projecting a direction out (`--ablate`).** As DeepSeek's [`--ablate`](#deepseek-projecting-a-direction-out---ablate):
-`--ablate FILE` removes one direction r from every residual write - each layer's attention output and its FFN output
+**Projecting a direction out (`--ablate`; off by default, changes the answers).** As DeepSeek's
+[`--ablate`](#deepseek-projecting-a-direction-out---ablate): `--ablate FILE` removes one direction r from every residual write - each layer's attention output and its FFN output
 (the dense MLP's in a dense layer, else the routed experts' and the shared expert's together) become
 y - s r (r . y) before they are added to the residual stream. The use it is written for is abliteration (r a refusal
 direction); the pack is not changed. The direction comes from a `llama-cvector-generator` file (`direction.N`, pick N
@@ -2015,7 +2015,7 @@ ended at the token cap with no answer, against 22 refusals and 2 with no answer 
 
 | Option | Default | What it does |
 |---|---|---|
-| `--ablate FILE` | off | a control vector (GGUF) whose direction is projected out |
+| `--ablate FILE` | off | a control vector (GGUF) whose direction is projected out (changes the answers; without it nothing is loaded or run) |
 | `--ablate-layer N` (with `--ablate`) | the file's only `direction.N` | which `direction.N` of the control vector (1-4096) |
 | `--ablate-scale F` (with `--ablate`) | 1 | s, 1e-6 to 1e6; 1 removes the component along r, above 1 over-projects |
 
