@@ -414,6 +414,21 @@ class AmdWindows(unittest.TestCase):
         g = T._WinGpu(0, adapters=self.MIXED, pdh=self.FakePdh({}), buses={})
         self.assertEqual(g.luid, "luid_0x00000000_0x00010617")
 
+    def test_hipinfo_without_adapter_buses_keeps_dxgi_order(self):
+        """hipInfo answers but Windows gives no adapter's bus (a driver that refuses the address query): DXGI's order,
+        as before #825 - not no card (a single Halo would otherwise show no GPU in the Monitor)."""
+        buses = T.parse_hipinfo_buses(self.HIPINFO)
+        g = T._WinGpu(0, adapters=self.ADAPTERS, pdh=self.FakePdh(self.VALUES), buses={0: 197},
+                      bus_of=lambda hi, lo: None)
+        self.assertTrue(g.ok())
+        self.assertEqual((g.name(), g.luid), ("AMD Radeon(TM) 8060S Graphics", self.LUID))
+        g = T._WinGpu(1, adapters=self.MIXED, pdh=self.FakePdh({}), buses=buses, bus_of=lambda hi, lo: None)
+        self.assertEqual(g.luid, "luid_0x00000000_0x00013f16")   # DXGI's second AMD adapter, as before
+        # one bus readable is enough to match by bus: an adapter whose bus is unknown is just not that card
+        g = T._WinGpu(0, adapters=self.MIXED, pdh=self.FakePdh({}), buses=buses,
+                      bus_of=lambda hi, lo: 12 if lo == 0x13F16 else None)
+        self.assertEqual(g.luid, "luid_0x00000000_0x00013f16")
+
     def test_windows_picks_it_when_sysfs_has_no_card(self):
         fake = T._WinGpu(0, adapters=self.ADAPTERS, pdh=self.FakePdh(self.VALUES))
         with mock.patch.object(T, "SYSFS", "/nonexistent-sysfs"), mock.patch.object(T, "_WinGpu", return_value=fake), \

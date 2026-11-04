@@ -777,16 +777,20 @@ class _WinGpu:
     and memory used from Windows' GPU performance counters (_Pdh). No temperature, power or PCIe link (Windows has no
     such counters for it). `index` is HIP's number (the config's "gpu", as HIP_VISIBLE_DEVICES takes it): the card is
     the AMD adapter on the PCI bus that hipInfo gives that number, as HIP's and DXGI's orders can differ (a card HIP
-    does not run on - a gfx906 next to gfx1030 under ROCm 7 - is still a DXGI adapter); DXGI's order only when hipInfo
-    cannot be asked. Every failure leaves ok() False."""
+    does not run on - a gfx906 next to gfx1030 under ROCm 7 - is still a DXGI adapter); DXGI's order when hipInfo
+    cannot be asked or Windows gives no AMD adapter's bus. Every failure leaves ok() False."""
     VENDOR_AMD = 0x1002
 
     def __init__(self, index=0, adapters=None, pdh=None, buses=None, bus_of=None):
         amd = [a for a in (_dxgi_adapters() if adapters is None else adapters) if a[1] == self.VENDOR_AMD]
         buses = (_hip_buses() if adapters is None else {}) if buses is None else buses
-        if buses:
-            bus, bus_of = buses.get(index), bus_of or _adapter_bus
-            self.card = next((a for a in amd if bus is not None and bus_of(a[3], a[4]) == bus), None)
+        # (the adapters' buses: when Windows gives none of them - a driver that refuses the address query - DXGI's
+        #  order, as before, rather than no card at all)
+        bus_of = bus_of or _adapter_bus
+        on_bus = [(a, bus_of(a[3], a[4])) for a in amd] if buses else []
+        if any(b is not None for _, b in on_bus):
+            bus = buses.get(index)
+            self.card = next((a for a, b in on_bus if bus is not None and b == bus), None)
         else:
             self.card = amd[index] if 0 <= index < len(amd) else None
         self.pdh = pdh if pdh is not None or self.card is None else _Pdh()
