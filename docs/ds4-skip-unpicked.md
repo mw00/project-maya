@@ -1,8 +1,18 @@
 # DeepSeek prefill transfers: only the experts a chunk picks
 
-CUDA: on for chunks of up to `DS4_SKIP_UNPICKED_ROWS` rows (1536) - an agent's turn, a short prompt. HIP: off unless
-`DS4_SKIP_UNPICKED=1`, as before. `DS4_SKIP_UNPICKED=1` takes every chunk, `0` none, on either. This affects the normal
-chunked prefill streamer, not `DS4_FLOW_TP` or decode. `DS4_FLOW_STATS=1` reports copied/skipped expert counts.
+CUDA: on for chunks of up to `DS4_SKIP_UNPICKED_ROWS` rows (1536) - an agent's turn, a short prompt. HIP: on for every
+chunk where the CPU lane's experts are read in place from the model's files (`--mmap-experts on`, or `auto` choosing
+it), off otherwise, as before. `DS4_SKIP_UNPICKED=1` takes every chunk, `0` none, on either; `DS4_SKIP_UNPICKED=alt`
+(tests, one GPU) turns it off and on by turns, a run each. This affects the normal chunked prefill streamer, not
+`DS4_FLOW_TP` or decode. `DS4_FLOW_STATS=1` reports copied/skipped expert counts.
+
+Why by the files on HIP: read in place, a chunk's streams are the disk's reads, and those set its pace, not the wait for
+each layer's routing. A Radeon 8065S (Strix Halo, Windows), EXL3 2.9 bpw, 11,802 of 15,744 experts in VRAM and the rest
+read from the SSD, chunks of 8192: a chunk streamed all 51 GB of those experts while its rows picked about 1,100 of them;
+now 5-7 GB. Fresh prompts, median of 2: 2K tokens 53.8 -> 210.0 tok/s, 8K 171.7 -> 330.1. The skip changes no
+arithmetic (the parity below); on that PC the streamed path's last-row logits already differ from one pass of a prompt
+to the next without it, and with it they differ by the same amount (`DS4_SKIP_UNPICKED=alt`, three passes of one
+6,000-token prompt in one process: off/off KL 0.027, off/on 0.023 and 0.032, the same top token).
 
 Why by size on CUDA: a chunk that skips waits for each layer's routing before it copies that layer's experts, where
 otherwise the copies run ahead across layers. A short chunk picks few of the CPU lane's experts, so its streams are that

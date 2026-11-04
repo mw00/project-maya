@@ -5852,13 +5852,19 @@ struct Model::Impl {
     // much ahead: run_dev_chunks).  An RTX 3090 + eight RTX 5060 Ti, EXL3 3.5
     // bpw, two thirds of the experts on the CPU lane, one chunk of 530 tokens: 4.6-4.9 s -> 3.7-3.8 s, 1,040: about
     // the same, 2,050: 6.0-6.3 -> 6.7 s.  CUDA: chunks up to DS4_SKIP_UNPICKED_ROWS (1536); DS4_SKIP_UNPICKED=1 every
-    // chunk, 0 none (HIP: none unless DS4_SKIP_UNPICKED=1, as before)
+    // chunk, 0 none.  HIP: every chunk where the CPU lane's experts are read in place from the model's files (their
+    // reads, not the wait for a layer's routing, set the pace there: a Radeon 8065S, EXL3 2.9 bpw with 3,942 of 15,744
+    // experts read from the SSD, chunks of 8192 - a chunk streamed all 51 GB of them, picking ~1,100: 5-7 GB now, a 2K
+    // prompt 53.8 -> 210.0 tok/s, 8K 171.7 -> 330.1), else none, as before (kSkipFiles: run_dev_chunks decides).
+    // DS4_SKIP_UNPICKED=alt (tests, one GPU): off and on by turns, a run each - the same logits both ways
+    static constexpr int kSkipFiles = -1;
     static int skip_unpicked_rows() {
         static const int n = [] {
             const char* v = std::getenv("DS4_SKIP_UNPICKED");
+            if (v != nullptr && std::strcmp(v, "alt") == 0) return INT_MIN;
             if (v != nullptr) return std::atoi(v) != 0 ? INT_MAX : 0;
 #if defined(STRATA_USE_HIP)
-            return 0;
+            return kSkipFiles;
 #else
             const char* r = std::getenv("DS4_SKIP_UNPICKED_ROWS");
             return r != nullptr ? std::max(0, std::atoi(r)) : 1536;
@@ -18360,7 +18366,15 @@ struct Model::Impl {
         for (const Layer& l0 : L)
             for (int m = 0; m < l0.nm && !l0.mtp; ++m)
                 if (member(l0, m).dev == di) cold += l0.host_list.size(), ++n_l;
-        const bool shallow = skip_unpicked_rows() > 0 && n_l > 0 && (size_t) c.ring_n * 2 * n_l < cold;
+        int sur = skip_unpicked_rows();
+        if (sur == kSkipFiles) sur = file_experts ? INT_MAX : 0;   // (HIP: by where the CPU lane's experts are read)
+        if (sur == INT_MIN) {   // (DS4_SKIP_UNPICKED=alt: a run without, the next with)
+            static std::atomic<unsigned> runs{0};
+            sur = runs.fetch_add(1) % 2 == 1 ? INT_MAX : 0;
+            std::fprintf(stderr, "ds4: this run's chunks stream %s (DS4_SKIP_UNPICKED=alt)\n",
+                         sur > 0 ? "only the experts their rows picked" : "every CPU-lane expert");
+        }
+        const bool shallow = sur > 0 && n_l > 0 && (size_t) c.ring_n * 2 * n_l < cold;
         S.skip_k.assign((size_t) nk, 0);
         S.spec_k.assign((size_t) nk, 0);
         // (MAYA_DS4_SPEC_HEAD=0: a shallow ring's chunks wait for each layer's routing before any of its copies, as
@@ -18372,7 +18386,7 @@ struct Model::Impl {
             return v == nullptr || std::atoi(v) != 0;
         }();
         for (int k = 0; k < nk && !c.flow; ++k) {
-            const bool few = run.T[(size_t) k] <= skip_unpicked_rows();
+            const bool few = run.T[(size_t) k] <= sur;
             S.skip_k[(size_t) k] = shallow || few;
             S.spec_k[(size_t) k] = spec_head && shallow && !few && c.stage == nullptr;
             if (S.spec_k[(size_t) k] && !c.spec_said) {
