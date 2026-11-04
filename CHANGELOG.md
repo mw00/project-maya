@@ -4,6 +4,15 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+- **DeepSeek, other EXL3 quants from Hugging Face (#806):**
+  - `tools/ds4/pack.py` accepts a head kept as BF16 (`head.weight`); the engine already reads it.
+  - Shards that write their tensors grouped by type instead of expert by expert stop the pack with that reason and the fix (rewrite them in expert order); the engine's own message says the same instead of "split across files".
+  - Engram tables a quant stored in its own INT4 layout stop the pack with a message that points to DeepSeek's FP8 shards 47 / 48; docs/MODELS.md says so too.
+- **Updates on NVIDIA and Apple Silicon (as on AMD in v1.1.52):** an update whose engine rebuild fails, or whose compiler or llama.cpp source is gone, stops with the reason and how to rebuild instead of starting the engine from before under the new server and config.
+- **Monitor, tensor-parallel pairs:** "What fills the GPUs" no longer says a restart gives more experts for free VRAM that the GPU's tensor-parallel partner cannot match (the members of a `--tp` group hold the same expert slots). That room is shown as idle, and with DeepSeek's DSpark drafter it points to `MAYA_DS4_DRAFT_DEV`, which can place drafter blocks there.
+
 ## v1.1.52 - 2026-11-03
 
 Faster GLM decode, fixes for AMD PCs on Windows (setup, updates and start errors), a DeepSeek config check, and community pull requests.
