@@ -6920,11 +6920,44 @@ struct Model::Impl {
         return true;
     }
 
+    // DS4_DRAFT_DEV unset: the DSpark blocks of a tensor-parallel drafter group spread over its members (as evenly as
+    // the blocks go, the lead the fewest) where the GPUs cannot hold every expert - on the lead alone they took its
+    // room, and since a group's members hold the same trunk experts the other members' room went unused (3x V100,
+    // EXL3 2.9 bpw, tensor parallel 2 + one GPU, 3 blocks: 7.3 GB idle on member 1; 0,1,1 read 2K / 8K / 32K prompts
+    // +4 / +2 / +3% faster, decode the same).  Where every expert fits, or MAYA_DS4_DRAFT_SPREAD=0: on the lead, as before
+    bool draft_spread() {
+        if (g.n_mtp < 2 || ds4_env("DS4_DRAFT_GPU") != nullptr) return true;
+        if (const char* s = ds4_env("DS4_DRAFT_SPREAD"); s != nullptr && std::atoi(s) == 0) return true;
+        const Group& G = groups[(size_t) L[(size_t) g.nl].grp];
+        const int nm = (int) G.mem.size();
+        if (nm < 2) return true;
+        double exp_b = 0, all_b = 0, room = 0;
+        for (const auto& kt : pk.t) {
+            const std::string& n = kt.first;
+            if (n.find(".engram.embed.") != std::string::npos || n.rfind("vision.", 0) == 0 || n == "embed.weight")
+                continue;
+            all_b += (double) kt.second.bytes;
+            if (n.find(".ffn.experts.") != std::string::npos) exp_b += (double) kt.second.bytes;
+        }
+        for (const Dev& d : devs)
+            room += std::max(0.0, (double) d.free0 - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
+        if (exp_b <= 0 || all_b <= room) return true;   // (every expert fits: the lead keeps them, no hand-offs)
+        const int n = g.n_mtp, base = n / nm, extra = n % nm;
+        for (int m = 0; m < nm; ++m)
+            for (int k = 0; k < base + (m >= nm - extra ? 1 : 0); ++k) draft_dev.push_back(m);
+        std::string where;
+        for (int i = 0; i < n; ++i)
+            where += std::string(i ? ", " : "") + std::to_string(i) + " on CUDA" +
+                     std::to_string(devs[(size_t) G.mem[(size_t) draft_dev[(size_t) i]]].id);
+        std::fprintf(stderr, "ds4: DSpark blocks spread over the drafter's group (the experts do not all fit the GPUs): "
+                             "block %s (MAYA_DS4_DRAFT_SPREAD=0: all on the lead)\n", where.c_str());
+        return true;
+    }
     bool draft_devs(std::string& err) {
         draft_dev.clear();
         const char* v = std::getenv("STRATA_DS4_DRAFT_DEV");
         if (v == nullptr) v = std::getenv("DS4_DRAFT_DEV");
-        if (v == nullptr) return true;
+        if (v == nullptr) return draft_spread();
         if (g.n_mtp == 0) {
             err = std::string("DS4_DRAFT_DEV=") + v + ": no DSpark blocks loaded (--dspark none)";
             return false;
