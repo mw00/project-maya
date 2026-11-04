@@ -87,7 +87,7 @@ CPU expert kernels**, the expert profile, the layer split, KV streaming, convers
 DFlash2 drafting.
 
 **The AMD (HIP) port, and the unified-memory policy.** Before this build, Maya already ran on a machine whose GPU
-memory is the system's RAM: **AMD's Ryzen AI Max / Strix Halo APUs on Linux** (the experimental HIP path, measured and
+memory is the system's RAM: **AMD's Ryzen AI Max / Strix Halo APUs on Linux** (the HIP path, measured and
 documented in `docs/AMD_MAYA.md`). That port established the policy this build reuses - size the expert pool from
 `/proc/meminfo`'s `MemAvailable` rather than the runtime's free figure, because on a unified device the runtime
 counts the model's page cache as used. Our change lifts that policy from "AMD only" to "any device whose memory is

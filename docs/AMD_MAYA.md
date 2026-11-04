@@ -1,4 +1,4 @@
-# Experimental Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo
+# Maya on RX 7900 XT / XTX, R9700 / RX 9070 and Strix Halo / Gorgon Halo
 
 This branch adds a Linux HIP build and installer path for Maya's GLM-5.3-Flash
 engine on `gfx1100`, `gfx1201` and `gfx1151` (Strix Halo, Gorgon Halo). It uses one GPU, or two supported GPUs that split the

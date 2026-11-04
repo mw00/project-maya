@@ -3,7 +3,7 @@
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B) を自分の GPU で</b><br>
-プライベートで高速 · NVIDIA GPU 1 枚から最大 16 枚まで · AMD と Windows (実験的) · チャット、画像、OpenAI / Anthropic 互換 API · 複数リクエストの同時処理</p>
+プライベートで高速 · NVIDIA GPU 1 枚から最大 16 枚まで · AMD と Windows · チャット、画像、OpenAI / Anthropic 互換 API · 複数リクエストの同時処理</p>
 
 <p align="center">
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm.svg" alt="GLM-5.3-Flash Maya downloads"></a>
@@ -55,7 +55,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
 
-いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows (実験的; [必要なもの](#what-you-need)を参照) で動きます。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、そして画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST) ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
+いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、そして画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST) ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>品質
 
@@ -201,10 +201,10 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA、compute capability 7.0 以上 (V100、RTX 20 以降): 1 枚、またはモデルを分け合う最大 16 枚。VRAM が多いほど速くなります。Pascal (Tesla P40 / P100、GTX 10) は実験的で、まだ検証されていません。**AMD (実験的):** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo と Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 と Radeon PRO V620 / W6800 はまだ検証されていません; GLM-5.3-Flash と DeepSeek-V4.1-Flash-1017 は AMD でも画像を読めます - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA、compute capability 7.0 以上 (V100、RTX 20 以降): 1 枚、またはモデルを分け合う最大 16 枚。VRAM が多いほど速くなります。Pascal (Tesla P40 / P100、GTX 10) は実験的で、まだ検証されていません。**AMD:** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo と Gorgon Halo (Radeon 8060S / 8065S); RX 6800 / 6900 と Radeon PRO V620 / W6800 はまだ検証されていません; GLM-5.3-Flash と DeepSeek-V4.1-Flash-1017 は AMD でも画像を読めます - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **RAM** | 32 GB で動きます。RAM が多いほど多くのエキスパートを近くに置け、速くなります |
 | **ディスク** | モデルが入る空きのある**高速な NVMe SSD** (GLM-5.3 · Maya-XS で約 75 GB、GLM-5.3 · Maya-S で約 100 GB、GLM-5.3 · Maya-L で約 160 GB、DeepSeek V4.1 · Maya-S で約 350 GB、その unsloth の Q8 GGUF で約 470 GB、MiniMax M3.1 · Maya-XS で約 95 GB、MiniMax-M3.1-Flash の EXL3 量子化で約 200 GB) と、画像エンコーダー (1.1 GB)。ハードディスクは不可 |
-| **システム** | Linux (x86-64; AVX2 対応 CPU が最適)、NVIDIA ドライバー、CUDA 12.x (CUDA 13 は RTX 20 以降で動作し、V100 と Pascal では動作しません)、g++、Python 3.10+。Windows 10/11 (実験的): [docs/WINDOWS.md](docs/WINDOWS.md)。WSL2 は不可。AMD: ROCm 7 |
+| **システム** | Linux (x86-64; AVX2 対応 CPU が最適)、NVIDIA ドライバー、CUDA 12.x (CUDA 13 は RTX 20 以降で動作し、V100 と Pascal では動作しません)、g++、Python 3.10+。Windows 10/11: [docs/WINDOWS.md](docs/WINDOWS.md)。WSL2 は不可。AMD: ROCm 7 |
 
 セットアップがこれらをすべて確認し、足りないものには正確なコマンドを表示します。システム全体には何もインストールしません。
 

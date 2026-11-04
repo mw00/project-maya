@@ -1,4 +1,4 @@
-# R9700 / RX 9070: experimental Maya HIP
+# R9700 / RX 9070: Maya HIP
 
 The Linux HIP installer accepts RX 7900 XT/XTX (`gfx1100`) and RX 9070 /
 Radeon AI PRO R9700 (`gfx1201`). It uses one GPU, text input, and system ROCm 7.

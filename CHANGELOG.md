@@ -4,6 +4,10 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## Unreleased
+
+- **No longer marked experimental:** AMD support (RX 7900, R9700 / RX 9070, Strix Halo / Gorgon Halo), Windows support, and the EXL3 quants (GLM's 3.05 / 4.05 / sc_4.10 bpw, DeepSeek's 2.9 / 3.5 bpw, MiniMax's 3.5 bpw) on NVIDIA from V100 and on AMD. The setup no longer warns about them, and the README and docs say plainly where they run.
+
 ## v1.1.52 - 2026-11-03
 
 Faster GLM decode, fixes for AMD PCs on Windows (setup, updates and start errors), a DeepSeek config check, and community pull requests.

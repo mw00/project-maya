@@ -1,5 +1,5 @@
 @echo off
-rem Project Maya on AMD under native Windows (experimental), after Strata's tools\hip\build_windows.bat.
+rem Project Maya on AMD under native Windows, after Strata's tools\hip\build_windows.bat.
 rem Needs: Visual Studio 2022 or 2026 Build Tools (C++ x64), CMake + Ninja on PATH, and a Python venv with TheRock's ROCm wheels
 rem (the rocm-sdk package; Strata's build_windows.bat pins the same ones) named by ROCM_VENV.
 rem   set ROCM_VENV=C:\path\to\rocm-venv
