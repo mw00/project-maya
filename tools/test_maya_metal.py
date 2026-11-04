@@ -253,6 +253,31 @@ class MetalSetupTests(unittest.TestCase):
             maya.refresh_engine({"backend": "metal", "exe": str(maya.EXE)})
         compile_.assert_called_once_with(self.root / "llama.cpp", "new", soft=True)
 
+    def test_failed_update_build_never_starts_the_engine_from_before(self):
+        # (#805 on Metal: "starting the previous engine" ran the old engine under the new server and config)
+        maya.select_build_backend("metal")
+        maya.BUILD.mkdir(parents=True)
+        with patch.object(maya, "cmake_steps", return_value="compiling"), patch.object(maya, "venv_tool", return_value=None), \
+             patch.object(maya.shutil, "which", return_value=None), patch.object(maya, "say"), \
+             patch.object(maya, "warn", side_effect=AssertionError("no warning-and-go-on")), \
+             patch.object(maya, "fail", side_effect=SystemExit(1)) as stop:
+            with self.assertRaises(SystemExit):
+                maya.compile_engine_metal(self.root / "llama.cpp", "abc", soft=True)
+        self.assertIn("not started", stop.call_args.args[0])
+        self.assertIn("start Maya again", stop.call_args.args[1])
+
+    def test_refresh_without_llama_source_stops(self):
+        maya.select_build_backend("metal")
+        maya.BUILD.mkdir(parents=True)
+        maya.STAMP.write_text(json.dumps({"backend": "metal", "src": "old", "llama": str(self.root / "gone")}))
+        with patch.object(maya.S, "source_hash", return_value="new"), \
+             patch.object(maya, "compile_engine_metal", side_effect=AssertionError("nothing to compile")), \
+             patch.object(maya, "fail", side_effect=SystemExit(1)) as stop:
+            with self.assertRaises(SystemExit):
+                maya.refresh_engine({"backend": "metal", "exe": str(maya.EXE)})
+        self.assertIn("not started", stop.call_args.args[0])
+        self.assertIn("--setup --rebuild", stop.call_args.args[1])
+
     def test_server_environment_for_metal(self):
         from serve.server import child_env
         cfg = {"backend": "metal", "gpu": [0], "env": {"MAYA_METAL_PP_CHUNK": "64"}}
