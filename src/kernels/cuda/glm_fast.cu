@@ -60,12 +60,12 @@ namespace strata::kernels::glmf {
 namespace {
 
 // ---------------------------------------------------------------- small helpers
-__device__ __forceinline__ float warp_sum(float v) {
+__device__ __forceinline__ float warp_sum_shfl(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
     return v;
 }
-__device__ __forceinline__ float warp_max(float v) {
+__device__ __forceinline__ float warp_max_shfl(float v) {
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
@@ -118,9 +118,23 @@ __device__ __forceinline__ float warp_max_lanes(float v) {
 }
 #else
 constexpr bool kLaneSum = false;
-__device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum(v); }
-__device__ __forceinline__ float warp_max_lanes(float v) { return warp_max(v); }
+__device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum_shfl(v); }
+__device__ __forceinline__ float warp_max_lanes(float v) { return warp_max_shfl(v); }
 #endif
+__device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    return warp_sum_lanes(v);
+#else
+    return warp_sum_shfl(v);
+#endif
+}
+__device__ __forceinline__ float warp_max(float v) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    return warp_max_lanes(v);
+#else
+    return warp_max_shfl(v);
+#endif
+}
 template<bool L> __device__ __forceinline__ float wsum(float v) { return L ? warp_sum_lanes(v) : warp_sum(v); }
 template<bool L> __device__ __forceinline__ float wmax(float v) { return L ? warp_max_lanes(v) : warp_max(v); }
 // block-wide sum; every thread gets the total.  sh: >= 32 floats.  blockDim % 32 == 0.
@@ -6297,7 +6311,7 @@ __global__ void warp_reduce_check_kernel(const float* __restrict__ in, float* su
                                          float* max_lanes, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     const float v = i < n ? in[i] : 0.0f;
-    const float a = warp_sum(v), b = warp_sum_lanes(v), c = warp_max(v), d = warp_max_lanes(v);
+    const float a = warp_sum_shfl(v), b = warp_sum_lanes(v), c = warp_max_shfl(v), d = warp_max_lanes(v);
     if (i < n) {
         sum_shfl[i] = a;
         sum_lanes[i] = b;

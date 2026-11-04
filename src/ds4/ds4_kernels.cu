@@ -1027,9 +1027,15 @@ __device__ __forceinline__ void rows_at(const Rows& r, int t, int& n, int& k) {
 // The powers of two as floats (sq: the query blocks', in D's head order; ek: the keys' - ue8m0_val's, a scale byte 0
 // a zero block), their product exact.
 #if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-                                defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__))
+                                defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || \
+                                defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__))
 #define DS4_INDEX_WMMA 1
+#if defined(__GFX12__) || defined(__gfx1200__) || defined(__gfx1201__)
+#define DS4_INDEX_WMMA_GFX12 1
+typedef int ds4_i2 __attribute__((ext_vector_type(2)));
+#else
 typedef int ds4_i4 __attribute__((ext_vector_type(4)));
+#endif
 typedef int ds4_i8 __attribute__((ext_vector_type(8)));
 #endif
 template <int QT>
@@ -1066,14 +1072,24 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
 #pragma unroll
         for (int u = 0; u < 4; ++u) {
             float a = fmaxf(fmaxf(fabsf(v[u].x), fabsf(v[u].y)), fmaxf(fabsf(v[u].z), fabsf(v[u].w)));
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+            a = fmaxf(a, ds4_lane_dpp<0x164>(a));
+            a = fmaxf(a, ds4_lane_dpp<0x162>(a));
+            a = fmaxf(a, ds4_lane_dpp<0x161>(a));
+#else
             for (int o = 4; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, o));
+#endif
             // (a = m 2^e, m in [0.5, 1): e from its exponent bits; 0 for none - and its powers of two exactly)
             const int e = a > 0.0f ? (int) ((__float_as_uint(a) >> 23) & 0xffu) - 126 : 0;
             const float sc = __int_as_float((127 + 4 - e) << 23);
             const uint32_t b0 = (uint8_t) (int8_t) __float2int_rn(v[u].x * sc), b1 = (uint8_t) (int8_t) __float2int_rn(v[u].y * sc),
                            b2 = (uint8_t) (int8_t) __float2int_rn(v[u].z * sc), b3 = (uint8_t) (int8_t) __float2int_rn(v[u].w * sc);
             *(uint32_t*) (Qs + (r0 + u) * LD + lane * 4) = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
-#if defined(DS4_INDEX_WMMA)   // (2^(e - 4) at [block][16 heads' tile][head % 2][head % 16 / 2]: D's order)
+#if defined(DS4_INDEX_WMMA_GFX12)   // (RDNA 4: D's element i in half-warp hi is head hi * 8 + i: natural head order)
+            const int r = r0 + u;
+            if ((lane & 7) == 0)
+                ((float*) eq)[lane / 8 * NQ + r] = ldexpf(1.0f, e - 4);
+#elif defined(DS4_INDEX_WMMA)   // (RDNA 3: 2^(e - 4) at [block][16 heads' tile][head % 2][head % 16 / 2]: D's order)
             const int r = r0 + u;
             if ((lane & 7) == 0)
                 ((float*) eq)[lane / 8 * NQ + (r & ~15) + (r & 1) * 8 + (r & 15) / 2] = ldexpf(1.0f, e - 4);
@@ -1158,18 +1174,33 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
             for (int i = 0; i < 8; ++i) acc[ht][i] = 0.0f;
 #pragma unroll
         for (int b = 0; b < NB; ++b) {
+#if defined(DS4_INDEX_WMMA_GFX12)
+            const uint2 k0 = *(const uint2*) (Ks + kc * LD + b * 32 + hi * 8),
+                        k1 = *(const uint2*) (Ks + kc * LD + b * 32 + 16 + hi * 8);
+            const ds4_i2 bk0 = {(int) k0.x, (int) k0.y}, bk1 = {(int) k1.x, (int) k1.y};
+#else
             const uint4 k0 = *(const uint4*) (Ks + kc * LD + b * 32), k1 = *(const uint4*) (Ks + kc * LD + b * 32 + 16);
             const ds4_i4 bk0 = {(int) k0.x, (int) k0.y, (int) k0.z, (int) k0.w}, bk1 = {(int) k1.x, (int) k1.y, (int) k1.z, (int) k1.w};
+#endif
             const float sk = __int_as_float(ek[kc * NB + b]);
             const float* sq = (const float*) eq + b * NQ + hi * 8;
 #pragma unroll
             for (int ht = 0; ht < QT * 2; ++ht) {
+#if defined(DS4_INDEX_WMMA_GFX12)
+                const int8_t* qr = Qs + (ht * 16 + (lane & 15)) * LD + b * 32 + hi * 8;
+                const uint2 q0 = *(const uint2*) qr, q1 = *(const uint2*) (qr + 16);
+                const ds4_i2 a0 = {(int) q0.x, (int) q0.y}, a1 = {(int) q1.x, (int) q1.y};
+                ds4_i8 c = {0, 0, 0, 0, 0, 0, 0, 0};
+                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a0, true, bk0, c, false);
+                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a1, true, bk1, c, false);
+#else
                 const int8_t* qr = Qs + (ht * 16 + (lane & 15)) * LD + b * 32;
                 const uint4 q0 = *(const uint4*) qr, q1 = *(const uint4*) (qr + 16);
-                const ds4_i4 a0 = {(int) q0.x, (int) q0.y, (int) q0.z, (int) q0.w}, a1 = {(int) q1.x, (int) q1.y, (int) q1.z, (int) q1.w};
+                const ds4_i4 a0 = {(int) q0.x, (int) q0.y}, a1 = {(int) q1.x, (int) q1.y};
                 ds4_i8 c = {0, 0, 0, 0, 0, 0, 0, 0};
                 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, bk0, c, false);
                 c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, bk1, c, false);
+#endif
                 const float4 s0 = *(const float4*) (sq + ht * 16), s1 = *(const float4*) (sq + ht * 16 + 4);
                 const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
 #pragma unroll
@@ -1183,8 +1214,18 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
 #pragma unroll
             for (int u = 0; u < 2; ++u)
 #pragma unroll
-                for (int i = 0; i < 8; ++i) s += fmaxf(acc[tq * 2 + u][i], 0.0f) * ws[tq * 32 + u * 16 + 2 * i + hi];
+                for (int i = 0; i < 8; ++i)
+#if defined(DS4_INDEX_WMMA_GFX12)
+                    s += fmaxf(acc[tq * 2 + u][i], 0.0f) * ws[tq * 32 + u * 16 + hi * 8 + i];
+#else
+                    s += fmaxf(acc[tq * 2 + u][i], 0.0f) * ws[tq * 32 + u * 16 + 2 * i + hi];
+#endif
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+            const int si = __builtin_bit_cast(int, s);
+            s += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(si, si, 0x76543210, 0xfedcba98, false, false));
+#else
             s += __shfl_xor_sync(0xffffffffu, s, 16);
+#endif
             const int t = t0 + tq, ia = i0 + kc;
             if (hi == 0 && t < T && ia < n) out[(long long) t * out_stride + ia] = pos_of(ia, tq) >= 0 ? s : -INFINITY;
         }
@@ -4038,8 +4079,9 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
             }
 #else
             (void) major;
-            cudaDeviceProp p{};   // (RDNA 3: the same kernel on its WMMAs - its shared memory below 64 KB, no opt-in)
-            if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0)
+            cudaDeviceProp p{};   // (RDNA 3 / RDNA 4: the same kernel on its WMMAs - its shared memory below 64 KB, no opt-in)
+            if (cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                (std::strncmp(p.gcnArchName, "gfx11", 5) == 0 || std::strncmp(p.gcnArchName, "gfx12", 5) == 0))
                 capable.fetch_or(1ull << dev);
 #endif
             cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);

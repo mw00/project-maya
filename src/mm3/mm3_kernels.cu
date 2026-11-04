@@ -63,6 +63,28 @@ __device__ __forceinline__ float wave64_max(float v) {
     v = fmaxf(v, __shfl_xor(v, 32, 64));
     return v;
 }
+#elif defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+template<int Ctrl> __device__ __forceinline__ float lane_dpp(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl, 0xf, 0xf, false));
+}
+__device__ __forceinline__ float warp_sum(float v) {
+    const int i = __builtin_bit_cast(int, v);
+    v += __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+    v += lane_dpp<0x168>(v);
+    v += lane_dpp<0x164>(v);
+    v += lane_dpp<0x162>(v);
+    v += lane_dpp<0x161>(v);
+    return v;
+}
+__device__ __forceinline__ float warp_max(float v) {
+    const int i = __builtin_bit_cast(int, v);
+    v = fmaxf(v, __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false)));
+    v = fmaxf(v, lane_dpp<0x168>(v));
+    v = fmaxf(v, lane_dpp<0x164>(v));
+    v = fmaxf(v, lane_dpp<0x162>(v));
+    v = fmaxf(v, lane_dpp<0x161>(v));
+    return v;
+}
 #else
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -100,6 +122,9 @@ __device__ float block_absmax(float v, float* red) {
 #if defined(__gfx906__)
     v = wave64_max(v);
     const int w = threadIdx.x >> 6, l = threadIdx.x & 63, nw = blockDim.x >> 6;
+#elif defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__GFX12__))
+    v = warp_max(v);
+    const int w = threadIdx.x >> 5, l = threadIdx.x & 31, nw = blockDim.x >> 5;
 #else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));

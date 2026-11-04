@@ -5,7 +5,7 @@
 // their sums run in another order), and how many of each row's top 512 positions the two agree on.
 //   nvcc -O3 -std=c++17 -arch=native -I include -I src/ds4 tests/ds4_index_score_tc.cu src/ds4/ds4_kernels.cu \
 //        src/ds4/ds4_host_ar.cpp -Xcompiler -mavx2,-mfma,-mf16c -o build/ds4_index_score_tc
-//   (or with CMake, CUDA or HIP: cmake --build build --target ds4_index_score_tc; on RDNA 3 the WMMAs' kernel)
+//   (or with CMake, CUDA or HIP: cmake --build build --target ds4_index_score_tc; on RDNA 3 / RDNA 4 the WMMAs' kernel)
 //   DS4_INDEX_TC=1 build/ds4_index_score_tc   (the engine's default is the CUDA cores' kernel)
 #include "ds4_kernels.cuh"
 
