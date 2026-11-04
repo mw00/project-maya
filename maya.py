@@ -1869,8 +1869,8 @@ def toolkit_root_defs(nvcc) -> list:
 def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False,
                    target: str = "maya") -> dict | None:
     """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/; the exact commands are
-    printed as they run.  soft: a failure warns and returns None (the engine already there keeps working) instead of
-    stopping."""
+    printed as they run.  soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that
+    the engine from before is not started (#805)."""
     def stop(what):
         msg = f"the engine build stopped while {what} (the reason is above)"
         hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12.x needs Visual Studio 2019 or "
@@ -1882,8 +1882,11 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
                 "again "
                 "(it continues)")
         if soft:
-            warn(msg + "; starting the engine compiled before")
-            return None
+            # (not the engine compiled before: it is from the older source, and this version's server and config
+            #  start it with settings it may not know or silently ignore - #805, on NVIDIA as on AMD)
+            fail("Maya's NVIDIA engine changed with this update, and " + msg + ": the engine from before does not "
+                 "match this version, so it is not started",
+                 hint + "\n       fix the reason, then start Maya again (it compiles again)")
         fail(msg, hint)
 
     cmake = pick_cmake()
@@ -2132,7 +2135,8 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
 
 def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     """`maya-metal` (GLM-5.3-Flash on ggml's Metal backend) in build-metal/; the commands are printed as they run.
-    soft: a failure warns and returns None (the engine compiled before keeps working) instead of stopping."""
+    soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that the engine from before
+    is not started (#805)."""
     cmake = pick_cmake()
     if cmake is None:
         fail("CMake 3.24 or newer is needed", f"pip installs one into .venv: run {ME} --setup")
@@ -2147,8 +2151,11 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "maya-metal", "-j", str(os.cpu_count() or 4)],
                    dict(os.environ), ""):
         if soft:
-            warn("the Metal engine's rebuild failed; starting the previous engine")
-            return None
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail("Maya's Metal engine changed with this update, and compiling it failed: the engine from before does "
+                 "not match this version, so it is not started",
+                 "the compiler's reason is above (no compiler: xcode-select --install) - fix it, then start Maya "
+                 "again (it compiles again)")
         fail("the Metal engine build failed", "see the compiler output above (no compiler: xcode-select --install)")
     meta = {"backend": "metal", "src": src, "llama": str(llama), "version": maya_version(),
             "date": time.strftime("%Y-%m-%d %H:%M"), "targets": ["maya-metal"]}
@@ -2215,16 +2222,20 @@ def refresh_engine(cfg: dict) -> None:
     if cfg.get("backend") == "metal":
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if not (llama / "ggml/CMakeLists.txt").exists():
-            warn("llama.cpp's source is missing; starting the previous engine")
-            return
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail(f"Maya's Metal engine changed with this update, but llama.cpp's source ({llama}) it was compiled "
+                 "with is gone: the engine from before does not match this version, so it is not started",
+                 f"{ME} --setup --rebuild fetches it and compiles the engine again")
         compile_engine_metal(llama, src, soft=True)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
     if not nvcc or not Path(nvcc).exists() or not (llama / "ggml" / "CMakeLists.txt").exists():
-        warn("the compiler or llama.cpp's source it was built with is gone: starting the engine compiled before "
-             f"({ME} --setup --rebuild compiles it again)")
-        return
+        # (the engine from before would run under this version's server and config: not started - #805)
+        fail(f"Maya's NVIDIA engine changed with this update, but the CUDA compiler ({nvcc}) or llama.cpp's source "
+             f"({llama}) it was compiled with is gone: the engine from before does not match this version, so it is "
+             "not started",
+             f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
     gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
     compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
 
