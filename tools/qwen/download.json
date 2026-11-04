@@ -1,0 +1,20 @@
+{
+ "_": "CYBER-FROST-3.8-PS: Blackfrost-AI/CYBER-FROST-3.8-BF16 (a fine-tune of Qwen/Qwen3.8-Flash-Next, architecture qwen4exp) in peasantsmith's GGUF - one file, routed experts Q5_K gate/up and IQ4_NL down, the n-gram table IQ4_NL, its MTP (NextN) block inside. The `maya` engine runs it from the file in place (tools/iq_pack.py indexes it; tools/mtp_from_gguf.py builds the drafter from its NextN block). \"revision\" is the commit the file was uploaded at and the file has its sha256: the setup checks it against it. Pictures: \"vision\" below.",
+ "name": "CYBER-FROST-3.8-PS",
+ "repo": "peasantsmith/CYBER-FROST-3.8-PS-GUFF",
+ "revision": "32867bb9e228afac427c136dd657b34b7c3f0e86",
+ "license": "Qwen Community License 1.0 (LICENSE.qwen-community-1.0)",
+ "about": "Q5_K experts (gate/up) and IQ4_NL (down), 180B parameters, 10 of 512 experts a token",
+ "memory_gb": 84,
+ "files": {
+  "CYBER-FROST-3.8-PS-GUFF-Q5_K_M.gguf": [112534603328, "1c03787fc8f5b53481213f92689e33f8ad124151e834362295458d6a89dca9c5"]
+ },
+ "vision": {
+  "_": "Pictures: the model's vision tower (27 blocks, Qwen3-VL's merger) as llama.cpp's mmproj, from unsloth's GGUF repo of the base model Qwen/Qwen3.8-Flash-Next. CYBER-FROST's fine-tune left the tower as it was: all 333 model.visual.* tensors in Blackfrost-AI/CYBER-FROST-3.8-BF16's shard 1 are byte for byte the base model's (checked 2026-10-30), so the base model's mmproj is this model's. maya-vision reads it (the vocabulary from the GGUF above, opened vocab-only); it stays on the SSD / in RAM and is on a GPU only while a picture is encoded.",
+  "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "revision": "766911a6b7369840a91dbcd95f9f997acaab6cd6",
+  "files": {
+   "mmproj-F16.gguf": [904004000, "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980"]
+  }
+ }
+}

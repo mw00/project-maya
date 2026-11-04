@@ -19,7 +19,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--reqs", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "strata"))
+    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "maya"))
     ap.add_argument("engine", nargs=argparse.REMAINDER)
     a = ap.parse_args()
     args = [x for x in a.engine if x != "--"]

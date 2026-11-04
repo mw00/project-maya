@@ -1,0 +1,39 @@
+# Daily: the README's download badges (.github/scripts/hf_badges.py) refreshed on the `badges` branch, which holds only
+# the SVGs - main never gets a bot commit.
+name: badges
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: badges
+  cancel-in-progress: false
+
+jobs:
+  badges:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: main
+      - name: The badges branch
+        run: |
+          git init -q badges && cd badges
+          git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          if git fetch -q --depth 1 origin badges; then git checkout -q -b badges FETCH_HEAD; else git checkout -q --orphan badges; fi
+      - name: Download counts
+        run: python3 main/.github/scripts/hf_badges.py badges
+      - name: Commit if any changed
+        working-directory: badges
+        run: |
+          git add -A
+          if git diff --cached --quiet; then echo "no change"; exit 0; fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Download badges $(date -u +%F)"
+          git push -q origin HEAD:badges

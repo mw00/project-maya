@@ -46,7 +46,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
-#include <immintrin.h>
+#include "strata/platform/cpu_relax.hpp"
 
 namespace strata::core {
 namespace {
@@ -307,6 +307,22 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 }
 
 const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) (g_->hc * g_->n_embd); }
+
+bool Verifier::read_head_logits(int rows, float* host, std::string& err) {
+    if (next_ != nullptr) return next_->read_head_logits(rows, host, err);
+    if (rows < 0 || rows > max_t_ || head_logits_ == nullptr) {
+        err = "verify: no head logits for that many rows";
+        return false;
+    }
+    if (rows == 0) return true;
+    if (cudaSetDevice(device_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess ||
+        cudaMemcpy(host, head_logits_, (size_t) rows * (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost) !=
+            cudaSuccess) {
+        err = std::string("verify: reading the head logits failed: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    return true;
+}
 
 // ================================ THE WINDOW, AS CAPTURED ================================
 //
@@ -957,6 +973,22 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[0].max_cells) { err = "verify: the window runs past the context"; return false; }
+    // (v1.1.32) Windows' HIP runtime submits queued GPU work only at a host wait (#133's lesson): a window that does
+    // not continue the last committed one - the first after a prompt was read, a conversation taken back - waits for
+    // the device first, so it reads what the prompt path and the expert-cache refills wrote.  MAYA_QWEN_SYNC: 0 off,
+    // 1 that (the default on Windows + HIP), 2 before every window (a diagnosis arm)
+    static const int sync_mode = [] {
+        if (const char* v = std::getenv("MAYA_QWEN_SYNC")) return std::atoi(v);
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+        return 1;
+#else
+        return 0;
+#endif
+    }();
+    if (sync_mode >= 2 || (sync_mode == 1 && pos0 != next_pos_)) {
+        const cudaError_t se = cudaDeviceSynchronize();
+        if (se != cudaSuccess) { err = std::string("verify: device sync: ") + cudaGetErrorString(se); return false; }
+    }
     if (!capture(T, err) || !capture_commit(err)) return false;
     VDBG("captured; staging\n");
     const Clock::time_point t0 = Clock::now();
@@ -1007,7 +1039,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         uint32_t spins = 0;
         progress_at("verify window: waiting for the GPU to reach layer", l);
         while (*seq < want) {
-            _mm_pause();
+            strata_cpu_pause();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -1033,7 +1065,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         VDBG("layer %lld served\n", (long long) l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
+        strata_store_fence();
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -1168,7 +1200,7 @@ void Verifier::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t byt
 
 void Verifier::publish_plan(void* ctx) {
     Verifier* v = (Verifier*) ctx;
-    _mm_sfence();
+    strata_store_fence();
     *(volatile uint32_t*) v->h_flagA_ = v->cur_layer_ + 1;
 }
 
@@ -1184,6 +1216,7 @@ bool Verifier::commit(int n_keep, std::string& err) {
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    next_pos_ = last_pos0_ + n_keep;
     if (ple_stage())   // stages that share one session must advance it once
         for (int t = 0; t < n_keep; ++t) {
             ss_->ple_prev[0] = ss_->ple_prev[1];

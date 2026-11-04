@@ -1,6 +1,7 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/prefill/failure.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -35,10 +36,12 @@
 namespace strata::prefill {
 namespace {
 
+// A failed cuBLAS call (an allocation, most of the time) ends this request, not the process: the reason is thrown
+// and the caller turns it into an error for the request (include/strata/prefill/failure.hpp).
 void ck(cublasStatus_t s, const char* what) {
     if (s != CUBLAS_STATUS_SUCCESS) {
         std::fprintf(stderr, "prefill gemm: %s: cuBLAS status %d\n", what, (int) s);
-        std::exit(1);
+        strata::prefill::fail(std::string("prefill gemm: ") + what + ": cuBLAS status " + std::to_string((int) s));
     }
 }
 
@@ -67,8 +70,16 @@ struct HipLtState {
     hipblasLtHandle_t handle = nullptr;
     void* workspace = nullptr;
     size_t workspace_bytes = 0;
-    strata::prefill::hipblaslt::TuningTable table;
     std::map<HipLtCallKey, HipLtCachedAlgo> cache;
+    // Every table whose header names this card and hipBLASLt version, in the order given. One hipBLASLt version can
+    // number its solutions differently from build to build (AMD's Windows wheels vs a Linux ROCm of the same
+    // version), so a shape takes the first table whose solution this build accepts, then plain hipBLAS.
+    struct NamedTable {
+        std::string path;
+        strata::prefill::hipblaslt::TuningTable table;
+        bool announced = false;
+    };
+    std::vector<NamedTable> tables;
     uint64_t lt_launches = 0;
     uint64_t fallbacks = 0;
     std::set<std::tuple<strata::prefill::hipblaslt::InputType, int, int, int, int>> fallback_shapes;
@@ -145,30 +156,33 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     const auto suffix = arch.find(':');
     if (suffix != std::string::npos) arch.resize(suffix);
 
-    // A ':'-separated list (one table per architecture, for a layer split across different cards): each device
-    // takes the first table whose header names its architecture and hipBLASLt version.
-    std::string error, list(path);
-    bool loaded = false;
-    for (size_t at = 0; at <= list.size() && !loaded;) {
-        const size_t end = std::min(list.find(':', at), list.size());
-        const std::string one = list.substr(at, end - at);
-        at = end + 1;
-        if (one.empty()) continue;
+    // A path list (':' on Linux, ';' on Windows; split_table_list) - one table per architecture, for a layer split
+    // across different cards: each device keeps every table whose header names its architecture and hipBLASLt
+    // version, in this order (resolve_hipblaslt_algo takes, per shape, the first of them whose solution this
+    // hipBLASLt build accepts).
+    std::string error;
+    size_t rows = 0;
+    for (const std::string& one : strata::prefill::hipblaslt::split_table_list(path)) {
         strata::prefill::hipblaslt::TuningTable table;
         std::string e;
         if (table.load(one, arch, version, e)) {
-            state->table = std::move(table);
-            loaded = true;
+            rows += table.rows().size();
+            state->tables.push_back({one, std::move(table), false});
         } else {
             error += (error.empty() ? "" : "; ") + one + ": " + e;
         }
     }
-    if (!loaded) {
+    if (state->tables.empty()) {
         std::fprintf(stderr, "prefill gemm: %s; using hipBLASEx\n", error.c_str());
         return nullptr;
     }
-    std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d)\n",
-                 state->table.rows().size(), arch.c_str(), version);
+    if (state->tables.size() == 1) {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d)\n", rows,
+                     arch.c_str(), version);
+    } else {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu tables, %zu rows, %s, version %d)\n",
+                     state->tables.size(), rows, arch.c_str(), version);
+    }
     return state;
 }
 
@@ -183,53 +197,70 @@ HipLtCachedAlgo resolve_hipblaslt_algo(HipLtState& state, strata::prefill::hipbl
 
     HipLtCachedAlgo resolved;
     const bool verbose = std::getenv("STRATA_HIPBLASLT_VERBOSE") != nullptr;
-    const auto* row = state.table.closest(type, n, k, ldy, t);
-    if (!row) {
-        if (verbose) {
-            std::fprintf(stderr, "prefill gemm: Lt fallback; no calibration for dtype=%s T=%d N=%d K=%d ldy=%d\n",
-                         type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k, ldy);
-        }
-        return state.cache.emplace(key, resolved).first->second;
-    }
-
     HipLtDescriptors desc;
-    const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
-    if (!desc.init(input_type, t, n, k, ldy)) {
-        return state.cache.emplace(key, resolved).first->second;
-    }
+    bool desc_ready = false, any_row = false;
+    // Once per shape (the result is cached): the first table, in the given order, whose row for this shape names a
+    // solution this hipBLASLt build has and accepts; none -> plain hipBLAS.
+    for (auto& named : state.tables) {
+        const auto* row = named.table.closest(type, n, k, ldy, t);
+        if (!row) continue;
+        any_row = true;
+        if (!desc_ready) {
+            const hipDataType input_type = type == strata::prefill::hipblaslt::InputType::bf16 ? HIP_R_16BF : HIP_R_16F;
+            if (!desc.init(input_type, t, n, k, ldy)) {
+                return state.cache.emplace(key, resolved).first->second;
+            }
+            desc_ready = true;
+        }
 
-    std::vector<int> solution_ids{row->solution_id};
-    std::vector<hipblasLtMatmulHeuristicResult_t> candidates;
-    if (hipblaslt_ext::getAlgosFromIndex(state.handle, solution_ids, candidates) != HIPBLAS_STATUS_SUCCESS ||
-        candidates.empty() || candidates.front().state != HIPBLAS_STATUS_SUCCESS ||
-        hipblaslt_ext::getIndexFromAlgo(candidates.front().algo) != row->solution_id) {
+        std::vector<int> solution_ids{row->solution_id};
+        std::vector<hipblasLtMatmulHeuristicResult_t> candidates;
+        if (hipblaslt_ext::getAlgosFromIndex(state.handle, solution_ids, candidates) != HIPBLAS_STATUS_SUCCESS ||
+            candidates.empty() || candidates.front().state != HIPBLAS_STATUS_SUCCESS ||
+            hipblaslt_ext::getIndexFromAlgo(candidates.front().algo) != row->solution_id) {
+            if (verbose) {
+                std::fprintf(stderr, "prefill gemm: Lt fallback; solution %d unavailable for T=%d N=%d K=%d ldy=%d\n",
+                             row->solution_id, t, n, k, ldy);
+            }
+            continue;
+        }
+
+        const float alpha = 1.0f;
+        size_t required_workspace = 0;
+        auto algo = candidates.front().algo;
+        if (hipblaslt_ext::matmulIsAlgoSupported(state.handle, desc.op, &alpha, desc.a, desc.b, &beta, desc.c,
+                                                 desc.c, algo, required_workspace) != HIPBLAS_STATUS_SUCCESS) {
+            if (verbose) {
+                std::fprintf(stderr,
+                             "prefill gemm: Lt fallback; solution %d rejects actual T=%d N=%d K=%d ldy=%d beta=%.9g\n",
+                             row->solution_id, t, n, k, ldy, beta);
+            }
+            continue;
+        }
+
+        resolved.supported = true;
+        resolved.algo = algo;
+        resolved.workspace_bytes = required_workspace;
+        if (state.tables.size() > 1 && !named.announced) {   // (one table: the load line already says it)
+            named.announced = true;
+            std::fprintf(stderr, "prefill gemm: hipBLASLt table in use: %s\n", named.path.c_str());
+        }
         if (verbose) {
-            std::fprintf(stderr, "prefill gemm: Lt fallback; solution %d unavailable for T=%d N=%d K=%d ldy=%d\n",
-                         row->solution_id, t, n, k, ldy);
+            std::fprintf(stderr,
+                         "prefill gemm: Lt solution=%d dtype=%s T=%d N=%d K=%d ldy=%d beta=%.9g workspace=%zu\n",
+                         row->solution_id, type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t,
+                         n, k, ldy, beta, required_workspace);
         }
         return state.cache.emplace(key, resolved).first->second;
     }
-
-    const float alpha = 1.0f;
-    size_t required_workspace = 0;
-    auto algo = candidates.front().algo;
-    if (hipblaslt_ext::matmulIsAlgoSupported(state.handle, desc.op, &alpha, desc.a, desc.b, &beta, desc.c, desc.c,
-                                             algo, required_workspace) != HIPBLAS_STATUS_SUCCESS) {
-        if (verbose) {
-            std::fprintf(stderr, "prefill gemm: Lt fallback; solution %d rejects actual T=%d N=%d K=%d ldy=%d beta=%.9g\n",
-                         row->solution_id, t, n, k, ldy, beta);
-        }
-        return state.cache.emplace(key, resolved).first->second;
-    }
-
-    resolved.supported = true;
-    resolved.algo = algo;
-    resolved.workspace_bytes = required_workspace;
-    if (verbose) {
-        std::fprintf(stderr,
-                     "prefill gemm: Lt solution=%d dtype=%s T=%d N=%d K=%d ldy=%d beta=%.9g workspace=%zu\n",
-                     row->solution_id, type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n,
-                     k, ldy, beta, required_workspace);
+    if (!any_row) {
+        // A miss is not harmless: the heuristic can be several times slower than a
+        // tuned solution, and it is silent. GLM's projections ran at ~1.4% of fp16
+        // peak on gfx1151 for want of four rows here, which no log line showed.
+        // The cache above means this prints once per distinct shape.
+        std::fprintf(stderr, "prefill gemm: Lt fallback; no calibration for dtype=%s T=%d N=%d K=%d ldy=%d "
+                             "(tune it: tune_hipblaslt --shape %d,%d,%d)\n",
+                     type == strata::prefill::hipblaslt::InputType::bf16 ? "bf16" : "f16", t, n, k, ldy, t, n, k);
     }
     return state.cache.emplace(key, resolved).first->second;
 }
@@ -273,7 +304,7 @@ bool try_hipblaslt(void* opaque_state, strata::prefill::hipblaslt::InputType typ
     std::fprintf(stderr, "prefill gemm: hipBLASLt launch failed with status %d\n", (int) status);
     if (beta != 0.0f) {
         std::fprintf(stderr, "prefill gemm: refusing a fallback after hipBLASLt failed with nonzero beta\n");
-        std::exit(1);
+        strata::prefill::fail("prefill gemm: hipBLASLt launch failed with nonzero beta");
     }
     auto* mutable_state = static_cast<HipLtState*>(opaque_state);
     uint32_t beta_bits = 0;
@@ -394,7 +425,10 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
-        if (rows <= 0) { std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K); std::exit(1); }
+        if (rows <= 0) {
+            std::fprintf(stderr, "prefill gemm: scratch too small for K=%lld\n", (long long) K);
+            strata::prefill::fail("prefill gemm: the scratch is too small for K=" + std::to_string((long long) K));
+        }
         if (ldy <= 0) ldy = N;
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;

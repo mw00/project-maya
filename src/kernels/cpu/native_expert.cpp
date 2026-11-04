@@ -4,6 +4,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
+#include "strata/kernels/cpu/iq_avx512_one.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -52,13 +53,27 @@ bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5
     for (auto& b : w) b = (uint8_t) next();
     for (size_t o = 0; o < w.size(); o += bb) {
         const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
-        std::memcpy(&w[o], &d, sizeof d);
+        if (t == GGML_TYPE_IQ1_M) {
+            // Its FP16 scale is embedded in four high nibbles, not at the block's start.
+            for (int j = 0; j < 4; ++j) {
+                uint16_t word;
+                std::memcpy(&word, &w[o + 48 + 2 * j], sizeof word);
+                word = (word & 0x0fff) | (((d >> (4 * j)) & 15) << 12);
+                std::memcpy(&w[o + 48 + 2 * j], &word, sizeof word);
+            }
+        } else {
+            std::memcpy(&w[o], &d, sizeof d);
+        }
         if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K) {
             const ggml_fp16_t m = ggml_fp32_to_fp16(0.001f + 0.0005f * (float) (next() % 16));
             std::memcpy(&w[o + sizeof d], &m, sizeof m);
         }
     }
-    for (int nt : nts) {
+    // Check final IQ1_M delta rounding with subnormal accumulators too; other ggml builds may contract differently.
+    const int shifts[] = {0, -120, -128};
+    const int num_shifts = t == GGML_TYPE_IQ1_M ? 3 : 1;
+    for (int shift_index = 0; shift_index < num_shifts; ++shift_index) for (int nt : nts) {
+        const int shift = shifts[shift_index];
         std::vector<uint8_t> a(ab * (size_t) nt);
         std::vector<float> x((size_t) n), got((size_t) nt * rows), ref((size_t) nt * rows);
         std::vector<const void*> ap((size_t) nt);
@@ -66,6 +81,14 @@ bool rows_match_ggml(RowsFn fn, int type, std::initializer_list<int> nts = {2, 5
         for (int k = 0; k < nt; ++k) {
             for (auto& v : x) v = ((float) (next() % 2001) - 1000.0f) * 1e-3f;
             traits(at)->from_float(x.data(), a.data() + ab * (size_t) k, n);
+            if (shift != 0) {
+                for (size_t offset = ab * (size_t) k; offset < ab * (size_t) (k + 1); offset += ggml_type_size(at)) {
+                    float scale;
+                    std::memcpy(&scale, a.data() + offset, sizeof scale);
+                    scale = std::ldexp(scale, shift);
+                    std::memcpy(a.data() + offset, &scale, sizeof scale);
+                }
+            }
             ap[(size_t) k] = a.data() + ab * (size_t) k;
             op[(size_t) k] = got.data() + (size_t) k * rows;
         }
@@ -123,14 +146,24 @@ RowsFn exact_rows(int type) {
 // lookups: IQ3_XXS's four keven_signs loads per 32 values, IQ3_S's 9-bit indices built in vectors and read back from
 // memory.  iq256_rows1 is ggml's dot with two changes - IQ3_XXS's signs built in registers, IQ3_S's
 // indices in scalar registers - so it is bit-identical to ggml's dot (checked here once, 306 results).  On every AVX-2
-// CPU, like ggml-cpu's own dot (it has no AVX-512 form for these).  STRATA_GLM_CPU_1T=0 keeps ggml's dot.
+// CPU, like ggml-cpu's own dot (it has no AVX-512 form for these). IQ1_M and IQ2_XS use the same exact AVX2 row backend
+// in both modes, their grid / scale / delta decode kept off the shuffle port (ggml's is bound by it on Broadwell). IQ2_XXS (Maya-S's gate/up) first tries the
+// AVX-512 rows of iq_avx512_one.cpp (VBMI + BMI2: the grid as 2-bit codes in registers, the signs by pdep), checked
+// the same way.  STRATA_GLM_CPU_1T=0 keeps ggml's dot, STRATA_NO_IQ512 the AVX-2 rows.
 RowsFn pick_rows1(int type) {
     static const bool on = [] {
         const char* mt = std::getenv("STRATA_GLM_CPU_MT");
         const char* v = std::getenv("STRATA_GLM_CPU_1T");
         return (mt == nullptr || std::atoi(mt) != 0) && (v == nullptr || std::atoi(v) != 0);
     }();
-    if (!on || !iq256_rows1_supported(type)) return nullptr;
+    if (!on) return nullptr;
+    if (std::getenv("STRATA_NO_IQ512") == nullptr && iq512_one_supported(type)) {
+        init_once();
+        if (rows_match_ggml(iq512_one_rows, type, {1}, 306)) return iq512_one_rows;
+        std::fprintf(stderr, "native experts: the AVX-512 one-token %s rows differ from ggml-cpu's dot in this build - "
+                             "not used\n", ggml_type_name((ggml_type) type));
+    }
+    if (!iq256_rows1_supported(type)) return nullptr;
     init_once();
     if (!cpu_avx2_ok() || std::getenv("STRATA_NO_IQ256") != nullptr) return nullptr;
     if (rows_match_ggml(iq256_rows1, type, {1}, 306)) return iq256_rows1;
@@ -155,6 +188,8 @@ RowsFn exact_rows_nt(int type, int nt) { return nt >= 2 ? exact_rows(type) : exa
 bool native_experts_available() noexcept { return true; }
 
 bool native_multi_rows_exact(int type) { return exact_rows(type) != nullptr; }
+
+bool native_rows1_exact(int type) { return exact_rows1(type) != nullptr; }
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     if (gu_type < 0 || gu_type >= GGML_TYPE_COUNT || d_type < 0 || d_type >= GGML_TYPE_COUNT) {
@@ -318,7 +353,11 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
+#if defined(__x86_64__) || defined(_M_X64)
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
+#else
+    static const bool iq4nl_mt = false;
+#endif
     if (nt >= 2 && f.d_type == 20 && iq4nl_mt) {
         iq4nl256_down_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;

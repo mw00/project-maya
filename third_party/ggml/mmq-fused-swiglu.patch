@@ -1,5 +1,5 @@
 diff --git a/mmq-load-tiles.cuh b/mmq-load-tiles.cuh
-index 7f00bad..a9505ed 100644
+index 7f00bad..f7f9b2d 100644
 --- a/mmq-load-tiles.cuh
 +++ b/mmq-load-tiles.cuh
 @@ -4,8 +4,8 @@
@@ -406,7 +406,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1061,7 +1061,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1061,16 +1061,17 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -414,8 +414,20 @@ index 7f00bad..a9505ed 100644
 +        const block_iq1_s * bxi = ggml_cuda_mmq_x_row<block_iq1_s, has_fusion>(x, x_gate, kbx0, i, stride);
  
          const int       qs_packed = get_int_b2(bxi->qs, kqsx);
-         const uint8_t * qs        = (const uint8_t *) &qs_packed;
-@@ -1095,8 +1095,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
++        // Extract unsigned register bytes explicitly (NVCC local-pointer miscompilation).
+ 
+         const int qh = bxi->qh[kqsx];
+ 
+     #pragma unroll
+         for (int l = 0; l < QR1_S/2; ++l) {
+-            const int grid = iq1s_grid_gpu[qs[l] | (((qh >> (3*l)) & 0x07) << 8)];
++            const uint32_t qbyte = ((uint32_t) qs_packed >> (8*l)) & 0xffu;
++            const int grid = iq1s_grid_gpu[qbyte | (((qh >> (3*l)) & 0x07) << 8)];
+ 
+             const int grid0 = (grid >> 0) & 0x0F0F0F0F;
+             const int grid1 = (grid >> 4) & 0x0F0F0F0F;
+@@ -1095,8 +1096,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -426,7 +438,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1123,7 +1123,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1123,7 +1124,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -435,7 +447,7 @@ index 7f00bad..a9505ed 100644
  
          const int q2 = get_int_b2(bxi->qs, 2*kqsx+0);
          const uint8_t * aux8 = (const uint8_t *) &q2;
-@@ -1159,8 +1159,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1159,8 +1160,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -446,7 +458,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1187,7 +1187,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1187,7 +1188,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -455,7 +467,7 @@ index 7f00bad..a9505ed 100644
  
          const int2 q2_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
          const uint16_t * q2 = (const uint16_t *) &q2_packed;
-@@ -1224,8 +1224,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1224,8 +1225,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -466,7 +478,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1251,7 +1251,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1251,22 +1252,24 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -474,8 +486,31 @@ index 7f00bad..a9505ed 100644
 +        const block_iq2_s * bxi = ggml_cuda_mmq_x_row<block_iq2_s, has_fusion>(x, x_gate, kbx0, i, stride);
  
          const int       qs_packed = get_int_b2(bxi->qs, kqsx);
-         const uint8_t * qs        = (const uint8_t *) &qs_packed;
-@@ -1292,8 +1292,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
++        // Extract unsigned register bytes explicitly (NVCC local-pointer miscompilation).
+ 
+         const int qh = bxi->qh[kqsx];
+ 
+         const int       signs_packed_32 = get_int_b2(bxi->qs, QK_K/32 + kqsx);
+-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
++        // Extract the sign byte below with the same unsigned operation.
+ 
+ #pragma unroll
+         for (int l = 0; l < QR2_S; ++l) {
+-            const int * grid_pos = (const int *)(iq2s_grid + (qs[l] | ((qh << (8-2*l)) & 0x300)));
+-
+-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
++            const uint32_t qbyte = ((uint32_t) qs_packed >> (8*l)) & 0xffu;
++            const uint32_t sign_byte = ((uint32_t) signs_packed_32 >> (8*l)) & 0xffu;
++            const int * grid_pos = (const int *)(iq2s_grid + (qbyte | ((qh << (8-2*l)) & 0x300)));
++
++            const int signs0 = __vcmpne4(((sign_byte & 0x03) << 7) | ((sign_byte & 0x0C) << 21), 0x00000000);
++            const int signs1 = __vcmpne4(((sign_byte & 0x30) << 3) | ((sign_byte & 0xC0) << 17), 0x00000000);
+ 
+             const int grid_l = __vsub4(grid_pos[0] ^ signs0, signs0);
+             const int grid_h = __vsub4(grid_pos[1] ^ signs1, signs1);
+@@ -1292,8 +1295,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -486,7 +521,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1320,7 +1320,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1320,7 +1323,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -495,7 +530,7 @@ index 7f00bad..a9505ed 100644
  
          const int2 q3_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
          const uint8_t * q3 = (const uint8_t *) &q3_packed;
-@@ -1356,8 +1356,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1356,8 +1359,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -506,7 +541,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1384,7 +1384,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1384,24 +1387,28 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -514,8 +549,36 @@ index 7f00bad..a9505ed 100644
 +        const block_iq3_s * bxi = ggml_cuda_mmq_x_row<block_iq3_s, has_fusion>(x, x_gate, kbx0, i, stride);
  
          const int2      qs_packed = make_int2(get_int_b2(bxi->qs, 2*kqsx+0), get_int_b2(bxi->qs, 2*kqsx+1));
-         const uint8_t * qs        = (const uint8_t *) &qs_packed;
-@@ -1425,8 +1425,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+-        const uint8_t * qs        = (const uint8_t *) &qs_packed;
++        // Extract register bytes explicitly; do not take a byte pointer to int2.
+ 
+         const int qh = bxi->qh[kqsx];
+ 
+         const int       signs_packed_32 = get_int_b2(bxi->signs, kqsx);
+-        const uint8_t * signs_packed_8  = (const uint8_t *) &signs_packed_32;
++        // The sign byte is extracted below as an unsigned shift.
+ 
+ #pragma unroll
+         for (int l = 0; l < QR3_S; ++l) {
++            const uint32_t word = (uint32_t) (l < 2 ? qs_packed.x : qs_packed.y);
++            const uint32_t q0 = (word >> (16*(l & 1))) & 0xffu;
++            const uint32_t q1 = (word >> (16*(l & 1) + 8)) & 0xffu;
++            const uint32_t sign_byte = ((uint32_t) signs_packed_32 >> (8*l)) & 0xffu;
+             const int2 grid_pos = make_int2(
+-                iq3s_grid[qs[2*l+0] | ((qh << (8 - 2*l)) & 0x100)],
+-                iq3s_grid[qs[2*l+1] | ((qh << (7 - 2*l)) & 0x100)]);
+-
+-            const int signs0 = __vcmpne4(((signs_packed_8[l] & 0x03) << 7) | ((signs_packed_8[l] & 0x0C) << 21), 0x00000000);
+-            const int signs1 = __vcmpne4(((signs_packed_8[l] & 0x30) << 3) | ((signs_packed_8[l] & 0xC0) << 17), 0x00000000);
++                iq3s_grid[q0 | ((qh << (8 - 2*l)) & 0x100)],
++                iq3s_grid[q1 | ((qh << (7 - 2*l)) & 0x100)]);
++
++            const int signs0 = __vcmpne4(((sign_byte & 0x03) << 7) | ((sign_byte & 0x0C) << 21), 0x00000000);
++            const int signs1 = __vcmpne4(((sign_byte & 0x30) << 3) | ((sign_byte & 0xC0) << 17), 0x00000000);
+ 
+             const int grid_l = __vsub4(grid_pos.x ^ signs0, signs0);
+             const int grid_h = __vsub4(grid_pos.y ^ signs1, signs1);
+@@ -1425,8 +1432,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -526,7 +589,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1453,7 +1453,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1453,7 +1460,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -535,7 +598,7 @@ index 7f00bad..a9505ed 100644
  
          const int aux_q4 = get_int_b4(bxi->qs, kqsx);
          const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
-@@ -1477,7 +1477,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1477,7 +1484,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -544,7 +607,7 @@ index 7f00bad..a9505ed 100644
  
          const float d = __half2float(bxi->d);
  
-@@ -1492,8 +1492,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1492,8 +1499,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -555,7 +618,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1522,7 +1522,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1522,7 +1529,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -564,7 +627,7 @@ index 7f00bad..a9505ed 100644
  
          const int aux_q4 = get_int_b2(bxi->qs, kqsx);
          const int2 v = get_int_from_table_16(aux_q4, kvalues_iq4nl);
-@@ -1549,7 +1549,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1549,7 +1556,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -573,7 +636,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                       + kbxd] = __half2float(bxi->d);
-@@ -1561,8 +1561,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1561,8 +1568,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
  
  // ---------------------------------------------------------------------------------------------
  
@@ -584,7 +647,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1591,7 +1591,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1591,7 +1598,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -593,7 +656,7 @@ index 7f00bad..a9505ed 100644
  
          const int aux_q4 = get_int_b1(bxi->qs, kqsx);
          const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
-@@ -1618,7 +1618,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1618,7 +1625,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -602,7 +665,7 @@ index 7f00bad..a9505ed 100644
  
  #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
          x_df[i*sram_stride                           + kbxd] = ggml_cuda_e8m0_to_fp32(bxi->e)*0.5f;
-@@ -1628,8 +1628,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1628,8 +1635,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -613,7 +676,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1655,7 +1655,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1655,7 +1662,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
              i = min(i, i_max);
          }
  
@@ -622,7 +685,7 @@ index 7f00bad..a9505ed 100644
  
          // quantize_mxfp4_mmq permutes nibbles to match the quantized format
          const int k0 = kbx * 4;
-@@ -1670,8 +1670,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1670,8 +1677,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -635,7 +698,7 @@ index 7f00bad..a9505ed 100644
      constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
      constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
-@@ -1726,8 +1728,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+@@ -1726,8 +1735,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
      }
  }
  
@@ -649,7 +712,7 @@ index 7f00bad..a9505ed 100644
      constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
      constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
 diff --git a/mmq.cuh b/mmq.cuh
-index 6923f35..1d76291 100644
+index 6923f35..f31b630 100644
 --- a/mmq.cuh
 +++ b/mmq.cuh
 @@ -10,10 +10,12 @@
@@ -952,7 +1015,14 @@ index 6923f35..1d76291 100644
  
          // Defaults for regular matrix multiplication:
          int col_low    = 0;
-@@ -1040,21 +1149,21 @@ static __global__ void mul_mat_q(
+@@ -1034,27 +1143,27 @@
+                     break;
+                 }
+ 
+-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
++                ids_dst_shared[j] = jt*J + j < col_diff ? ids_dst[col_low + jt*J + j] : 0;
+             }
+             __syncthreads();
          }
  
          offset_y   += (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
@@ -979,6 +1049,15 @@ index 6923f35..1d76291 100644
               stride_row_x, ncols_y, stride_col_dst,
               tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
          return;
+@@ -1128,7 +1237,7 @@
+                     break;
+                 }
+ 
+-                ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
++                ids_dst_shared[j] = jt*J + j < col_diff ? ids_dst[col_low + jt*J + j] : 0;
+             }
+             __syncthreads();
+         }
 @@ -1148,7 +1257,7 @@ static __global__ void mul_mat_q(
  
          constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
@@ -997,6 +1076,15 @@ index 6923f35..1d76291 100644
           stride_row_x, ncols_y, stride_col_dst,
           tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
  }
+@@ -1350,7 +1459,7 @@
+     const int col_diff = col_high - col_low;
+ 
+     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
+-        ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
++        ids_dst_shared[j] = jt*J + j < col_diff ? ids_dst[col_low + jt*J + j] : 0;
+     }
+     __syncthreads();
+ 
 @@ -1383,6 +1492,8 @@ struct mmq_args {
      int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
      int64_t ncols_max;

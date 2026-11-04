@@ -19,6 +19,7 @@
 //   * all 512 routed experts live in VRAM (708 MB) and run through the grouped hit kernels.
 #pragma once
 
+#include "strata/core/expert_cache.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
@@ -48,6 +49,18 @@ public:
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
     uint64_t vram_bytes() const { return vram_; }
+    /// The on-demand vision encoder (serve VLEND / VRECLAIM): with `set_lendable(true)` before `load`, the 512
+    /// routed experts live in a LendableArena, so while a picture is read (nothing drafts then) their memory can go
+    /// to the encoder too - after the expert cache's - and come back at the same addresses, read again from
+    /// experts.bin.  Not lendable (HIP, no virtual memory API): `lendable_bytes()` is 0.
+    void set_lendable(bool on) { want_lend_ = on; }
+    uint64_t lendable_bytes() const { return experts_arena_.lendable_bytes(0); }
+    /// Gives back whole pieces from the experts' end until at least `bytes` are out; `given` = the bytes given.
+    bool lend_experts(uint64_t bytes, uint64_t& given, std::string& err);
+    /// Maps the lent pieces again and reads their experts back from experts.bin (false while the memory is not
+    /// free yet, or a read failed: `err`).  True when nothing is lent.
+    bool reclaim_experts(std::string& err);
+    bool experts_lent() const { return experts_arena_.lent(); }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
@@ -118,6 +131,9 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    uint64_t experts_bytes_ = 0;
+    bool want_lend_ = false;
+    LendableArena experts_arena_;   ///< `experts_` when lendable (not ok: one cudaMalloc)
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;

@@ -16,8 +16,10 @@ public:
         unsigned long long cpu_plan = 0;
         const float* residual = nullptr;
         const float* other = nullptr;
+        bool all_resident = false;   // fast_moe leaves its wait / fetch launches out then: another graph
         bool operator==(const Key& b) const {
-            return cpu_plan == b.cpu_plan && residual == b.residual && other == b.other;
+            return cpu_plan == b.cpu_plan && residual == b.residual && other == b.other &&
+                   all_resident == b.all_resident;
         }
     };
 

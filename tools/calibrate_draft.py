@@ -178,7 +178,8 @@ def run(other: dict, dflash: dict, say=print, start_engine=None, other_label: st
 if __name__ == "__main__":
     if len(sys.argv) != 2:
         sys.exit("usage: calibrate_draft.py <maya-*.json>  (a config that drafts with DFlash2: --dflash in its args)")
-    cfg = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+    import maya_names
+    cfg = maya_names.env_in(json.loads(Path(sys.argv[1]).read_text(encoding="utf-8-sig")))
     if "--dflash" not in (cfg.get("args") or [])[:-1]:
         sys.exit("this config does not draft with DFlash2 (no --dflash in its args)")
     print(json.dumps(run(without_dflash(cfg), cfg), indent=1))

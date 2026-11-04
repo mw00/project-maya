@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
-#include <immintrin.h>
+#include "strata/platform/cpu_relax.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -242,7 +242,7 @@ void ExpertPool::worker(int id) {
         uint32_t spins = 0;
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
-            _mm_pause();
+            strata_cpu_pause();
             if ((++spins & 1023u) != 0) continue;
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
@@ -300,7 +300,7 @@ void ExpertPool::wait_parked(const char* what) {
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
-        _mm_pause();
+        strata_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
@@ -322,7 +322,7 @@ void ExpertPool::wait_done(int n) {
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        _mm_pause();
+        strata_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
@@ -363,7 +363,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && nfmt_->gu_type == 42) {
+                if (mode_ == 5 && nfmt_->gu_type == 42 && q2_own_kernels()) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
                     float* gp[MAXT];
@@ -379,7 +379,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
                     native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (nfmt_->d_type == 42) {
+                } else if (nfmt_->d_type == 42 && q2_own_kernels()) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
@@ -499,7 +499,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (f.d_type == 42) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                if (f.d_type == 42 && q2_own_kernels()) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * H;
@@ -535,7 +535,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //
-    // The loop below used to be `while (done_ != n) _mm_pause();`.  The host is pinned to core 0 - the core
+    // The loop below used to be `while (done_ != n) strata_cpu_pause();`.  The host is pinned to core 0 - the core
     // `physical_cores(true)` deliberately keeps the five workers off - so for the whole drain that core was
     // idle while five cores did six cores' worth of work.  Measured before the change: 33.7 GB/s against
     // 5/6 x 44.14 = 36.8 for five workers and 44.14 for six.

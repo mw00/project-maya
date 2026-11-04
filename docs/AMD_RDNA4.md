@@ -17,7 +17,8 @@ VRAM when `--gpu` is omitted. See [AMD_MAYA.md](AMD_MAYA.md) for model setup.
 
 ## One binary, three code targets
 
-Setup compiles `gfx1100;gfx1201;gfx1151`. CMake also accepts space-separated
+Setup compiles the architectures of the chosen cards (a 7900 XT + R9700: `gfx1100;gfx1201`); a manual build can
+name all three, `gfx1100;gfx1201;gfx1151`. CMake also accepts space-separated
 lists and architecture feature suffixes. The runtime strips the feature suffix
 and checks exact membership in the compiled list, then requires wave32.
 Its diagnostics print the actual architecture and the compiled targets.
@@ -31,15 +32,15 @@ A manual build, using Maya's existing pinned llama.cpp checkout:
 ```sh
 maya_rocm_root="$(realpath "${ROCM_PATH:-/opt/rocm}")"
 cmake -S . -B build-multi -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
-  -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PREFILL_MMQ=ON \
-  -DSTRATA_BUILD_TESTS=OFF \
+  -DMAYA_ENABLE_HIP=ON -DMAYA_ENABLE_CUDA=OFF \
+  -DMAYA_NATIVE_EXPERTS=ON -DMAYA_PREFILL_MMQ=ON \
+  -DMAYA_BUILD_TESTS=OFF \
   '-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201;gfx1151' \
   -DCMAKE_HIP_COMPILER="$maya_rocm_root/llvm/bin/clang++" \
   -DCMAKE_HIP_COMPILER_ROCM_ROOT="$maya_rocm_root" \
   -DCMAKE_PREFIX_PATH="$maya_rocm_root" \
-  -DSTRATA_GGML_DIR="$PWD/third_party/llama.cpp"
-cmake --build build-multi --target strata strata-device hip_expert_cache_staging \
+  -DMAYA_GGML_DIR="$PWD/third_party/llama.cpp"
+cmake --build build-multi --target maya strata-device hip_expert_cache_staging \
   hip_intrinsics hip_handoff hip_glm_handoff hip_glm_prefill_attention iq1_s_parity \
   glm_hc_parity glm_kda_parity glm_ffn_parity glm_dsa_parity glm_layer_parity \
   glm_model_test hip_prefill_mmq_parity -j 3
@@ -60,9 +61,9 @@ env -u ROCR_VISIBLE_DEVICES LD_LIBRARY_PATH=/opt/rocm/lib HIP_VISIBLE_DEVICES=1 
   ctest --test-dir build-multi --output-on-failure --timeout 60 \
   -R '^(glm_(hc|kda|ffn|dsa|layer)_parity|glm_model_test|hip_intrinsics|hip_(glm_handoff|glm_prefill_attention|handoff|device_selftest|prefill_mmq_parity|expert_cache_staging)|iq1_s_parity)$'
 env -u ROCR_VISIBLE_DEVICES LD_LIBRARY_PATH=/opt/rocm/lib HIP_VISIBLE_DEVICES=1 \
-  STRATA_GLM_HC1=1 build-multi/glm_hc_parity --selftest
+  MAYA_GLM_HC1=1 build-multi/glm_hc_parity --selftest
 env -u ROCR_VISIBLE_DEVICES LD_LIBRARY_PATH=/opt/rocm/lib HIP_VISIBLE_DEVICES=1 \
-  STRATA_GLM_HC2=1 build-multi/glm_hc_parity --selftest
+  MAYA_GLM_HC2=1 build-multi/glm_hc_parity --selftest
 ```
 
 Both cards pass 14/14 GPU checks; HC1/HC2 also pass on the R9700. The intrinsics
@@ -76,3 +77,13 @@ They serve the inherited tuning loader. Maya's GLM prompt projections can now
 use the separate `gfx1201-glm-hipblaslt-100202.txt` table through that loader;
 shapes without a tuned row continue through hipBLAS. Its quantized expert path
 still uses GGML MMQ.
+
+## v1.1.29 R9700 Validation (2026-10-26)
+
+On upstream `v1.1.29` (`8b4b39f`) on AI PRO R9700 (`gfx1201`):
+
+- **`ds4_gguf_test`**: **100% PASS (`ALL OK (0 failed)`)** across all KV pack, sparse attention, WMMA, router, `mv`, `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_XS`, `Q2_K`, `Q3_K`, `Q4_K`, `Q5_K`, `MXFP4`, and CPU-lane tests. The 1-ULP `NE=4` vs `NE=1` discrepancy was resolved by wrapping `sub_dot`, `gate_up_kernel`, `down_kernel`, and `lanes_sum` reductions in explicit `#pragma clang fp contract(off)` helpers with `asm volatile` register barriers (`fadd_no_fma`, `fsub_no_fma`, `fmul_no_fma`, `fma_no_contract`).
+- **`glm_attn_bench`**: **PASS** (100% bit-exact parity; `dsa_score` is **3.84x faster** on `gfx1201` at 130K context: `65.0 us` vs `249.4 us` via `v_permlanex16` + `row_xmask` intra-lane butterfly reduction).
+- **`hip_expert_kernel_bench --parity-only`**: **PASS** (`bit_identical=yes` across all production quantization configurations including `gu=21/down=17` `IQ3_S/IQ2_XS` and `gu=22/down=22`).
+- **`hip_intrinsics`**: **PASS** (100% parity).
+

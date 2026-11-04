@@ -1,0 +1,112 @@
+// src/ds4/ds4_gguf.cuh - a GGUF's weights on the device for maya-ds4 (unsloth's DeepSeek-V4.1-Flash-1017 GGUFs,
+// tools/ds4/pack_gguf.py): the dense matrices in BF16 and the routed experts in MXFP4.  They stand in for
+// strata::kernels::exl3's matrices and experts (an x3::Mat with fmt kFmtBF16, an x3::ExpertLayout with fmt kFmtMXFP4)
+// with the same arguments and the same results' layout, so the engine's paths (decode, verify windows, chunked prompts,
+// tensor parallel) take either format.
+//
+// MXFP4 is ggml's block_mxfp4: 32 values in 17 bytes, an E8M0 scale e then 16 bytes of E2M1 codes - value j of the
+// block in byte j's low nibble (j < 16) or byte j - 16's high nibble, worth kvalues[code] * 2^(e - 128) with kvalues
+// {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12} (the E2M1 values doubled).  A matrix is [out][in / 32] blocks
+// (row r = output r), as the GGUF stores it, so an expert's blob is its gate, up and down matrices one after another.
+// Every product is an F32 sum of exactly dequantised weights times F32 activations, and a window's entry gets the bits
+// the token path gives it (the same kernel, the same order).
+#pragma once
+
+#include "strata/kernels/exl3.hpp"
+
+#include <cstddef>
+#include <cstdint>
+#include <cuda_runtime.h>
+#include <string>
+
+namespace strata::ds4::gguf {
+
+namespace x3 = strata::kernels::exl3;
+
+constexpr int kFmtBF16 = 1;    // x3::Mat::fmt
+constexpr int kFmtMXFP4 = 2;   // x3::ExpertLayout::fmt (and an expert's matrix as an x3::Mat)
+constexpr int kFmtQ8_0 = 3;    // x3::Mat::fmt: ggml's Q8_0, an FP16 scale and 32 int8 in 34 bytes (UD-Q4_K_XL's dense)
+constexpr int kFmtGG = 4;      // x3::Mat::fmt: ggml's low-bit block type m.gg_type (ds4_iq.cuh's: IQ2_XXS ..
+                               // Q4_K), [n][k / 256]
+constexpr int kMxBlock = 32, kMxBytes = 17, kQ8Bytes = 34;
+constexpr int kTypeMXFP4 = 39;   // ggml's type id
+
+/// Bytes of an MXFP4 row of k values (k % 32 == 0), and of a matrix of n such rows.
+__host__ __device__ inline size_t mx_row_bytes(int64_t k) { return (size_t) (k / kMxBlock) * kMxBytes; }
+__host__ __device__ inline size_t mx_bytes(int64_t n, int64_t k) { return (size_t) n * mx_row_bytes(k); }
+__host__ __device__ inline size_t q8_row_bytes(int64_t k) { return (size_t) (k / 32) * kQ8Bytes; }
+
+/// A GGUF expert layer (x3::ExpertLayout::fmt kFmtMXFP4: block-quantized experts read in place) keeps each role's ggml
+/// type in lay.gg_type[r] (r: gate, up, down; 0 = MXFP4): MXFP4 takes these kernels, the low-bit types ds4_iq.cuh's
+/// (gate and up of one type).  Roles of one layer may differ (down of another type, MXFP4 beside a low-bit one: each
+/// role its own kernels and its own activations' rounding).
+inline int expert_type(const x3::ExpertLayout& l, int r) { return l.gg_type[r] == 0 ? kTypeMXFP4 : l.gg_type[r]; }
+inline bool mx_experts(const x3::ExpertLayout& l) {
+    return expert_type(l, 0) == kTypeMXFP4 && expert_type(l, 1) == kTypeMXFP4 && expert_type(l, 2) == kTypeMXFP4;
+}
+/// Bytes of a row of k values of a type the device kernels take - MXFP4, a routed expert's low-bit type, or a dense
+/// matrix's beside them (Q6_K) - 0: not one, or k not whole blocks.
+size_t type_row_bytes(int type, int64_t k);
+/// Values a block of such a type (32: MXFP4, 256: the K and IQ types; 0: none).
+int type_block(int type);
+/// Whether a routed expert may be of this type (MXFP4, or one ds4_iq's expert kernels take).
+bool expert_type_ok(int type);
+/// The type's name (ggml's), "?" when unknown.
+const char* type_name(int type);
+
+/// The per-stream scratch of the MXFP4 experts on the current device (once per stream, as x3::prepare).
+bool prepare(cudaStream_t s);
+/// mv()'s int8 inputs a launch a call (DS4_Q8_BATCH=0: a launch a job), and a job reading the same input (x, stride,
+/// rows, k) as an earlier one of the call reads that one's int8 rows (DS4_Q8_SHARE=0: each rounds its own) - the same
+/// int8 values either way (a line when one is off, the first time it is asked: the load asks both).
+bool q8_batch();
+bool q8_share();
+/// (tests) the two above from here on: bit 1 batch, bit 2 share (-1: the environment's again).
+void q8_mode(int mode);
+/// DS4_Q8_CHECK=1: the batched rounding with sharing against the per-job one without on device dev (load time) - false
+/// and err when any byte a job reads differs, a guard or a sharing job's own rows are written, the sharing is not as
+/// expected, or a CUDA call fails or does not end.
+bool q8_batch_check(int dev, std::string& err);
+
+/// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
+/// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
+/// or kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)).
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s);
+/// (DS4_HC_FUSE) an F32 input x of k values already rounded to int8 as mv rounds a Q8_0 job's (q [k], d [k / 32]: see
+/// hc_split_pre_norm): a kFmtQ8_0 job whose xf is x, its k this k and one activation reads them instead of rounding x
+/// again; every other job (another input, format, k, or more activations) rounds its own as before.
+struct PreQ8 {
+    const float* x = nullptr;
+    const int8_t* q = nullptr;
+    const float* d = nullptr;
+    int k = 0;
+    int rows = 1;   // (DS4_HC_FUSE=2: a window's rows of x, k apart; their int8 rows k apart, scales k / 32 apart)
+};
+bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre);
+/// The int8 rounding mv gives a kFmtQ8_0 job's one F32 input of k values (DS4_Q8_BATCH: its batched launch's, else the
+/// per-job one's) - what the HC fuse check compares hc_split_pre_norm's against.
+void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s);
+/// The columns [c0, c0 + nc) of such a matrix: its rows c0 .. c0 + nc - 1, a contiguous range.
+x3::Mat view(const x3::Mat& m, int c0, int nc);
+/// x3::reconstruct_rows' layout from a BF16 or Q8_0 matrix: dst[r][c] = W[c][r] (n rows of k values), F16 or BF16
+/// bits (a Q8_0 weight rounded to them).
+void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
+
+/// x3::moe_gate_up / moe_down / win_experts / set_gate_up / set_down for a GGUF's experts (lay.fmt == kFmtMXFP4; the
+/// roles' types in lay.gg_type, see expert_type).
+void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s);
+void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
+bool win_experts(const x3::WinArgs& a, cudaStream_t s);
+void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
+                 cudaStream_t s, const uint16_t* x16 = nullptr);   // (x16: x's rows_f16, ldx apart - the low-bit tiles read it)
+void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
+
+/// (tests) rows of k values (k % 256 == 0, rows k apart) rounded as the CPU lane rounds a low-bit expert's activations
+/// (ggml's Q8_K): q[r][k] int8 and d[r][k / 32] (each 256's scale in its eight 32-blocks) - what the low-bit experts'
+/// kernels take (unless DS4_IQ_Q8K=0)
+void act_q8k(const float* x, int rows, int k, int8_t* q, float* d, cudaStream_t s);
+
+/// Launch failures of these kernels since the process started (each is also printed).
+int launch_errors();
+
+}  // namespace strata::ds4::gguf

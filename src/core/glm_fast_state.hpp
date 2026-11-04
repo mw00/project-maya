@@ -4,6 +4,7 @@
 #pragma once
 
 #include "strata/core/glm_model.hpp"
+#include "strata/core/remote_experts.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/glm_kv_stream.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -14,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -54,6 +56,49 @@ inline void cpu_relax() {
 #endif
 }
 
+// Windows' HIP runtime holds the launches a stream queues until the host waits on the GPU (Linux and CUDA submit each),
+// so a token's first layers sat queued while the main thread went on enqueuing the rest, until fast_service's 1 ms kick
+// (or the token's own wait) submitted them.  This submits what `s` has queued without waiting: cudaStreamQuery, whose
+// "not ready" is no error - it is taken back off the thread's last error, which launch_check reads after every launch.
+// A launch error already pending stays for the caller's check (no submit then).  Elsewhere a no-op.
+// STRATA_GLM_FLUSH=<n>: the decode submits after its first layer and then every n layers (submit_every), 0: never -
+// the default: on the 8065S (Maya-S, drafting with the MTP rework) a submission every 4 layers lost ~4% of the decode
+// (26.5 against 27.7 tok/s, same answers); the runtime's own batching plus the service thread's kick keep the GPU fed.
+inline void submit_queued(cudaStream_t s) {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    if (cudaPeekAtLastError() != cudaSuccess) return;
+    const cudaError_t e = cudaStreamQuery(s);
+    if (e == cudaErrorNotReady || e == cudaSuccess) (void) cudaGetLastError();
+#else
+    (void) s;
+#endif
+}
+inline int submit_every() {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    static const int v = [] {
+        const char* e = getenv("STRATA_GLM_FLUSH");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 0;
+    }();
+    return v;
+#else
+    return 0;
+#endif
+}
+// ... and the prompt path after each mixer sub-batch and each layer's experts: STRATA_GLM_PREFILL_FLUSH=1 (off by
+// default: Maya-S on the 8065S, 2K / 8K / 16K prompts 271 / 323 / 325 tok/s with it against 273-276 / 323-325 /
+// 329-339 without - the sub-batches are long enough that the runtime's batching costs nothing)
+inline bool prefill_submit() {
+#if defined(_WIN32) && defined(STRATA_USE_HIP)
+    static const bool v = [] {
+        const char* e = getenv("STRATA_GLM_PREFILL_FLUSH");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return v;
+#else
+    return false;
+#endif
+}
+
 // a thread's CPUs: `cpus` (empty: left to the OS).  Linux only; elsewhere a no-op.
 inline void pin_thread(std::thread::native_handle_type h, const std::vector<int>& cpus) {
 #ifdef __linux__
@@ -73,13 +118,19 @@ inline void pin_thread(std::thread::native_handle_type h, const std::vector<int>
 // when all finished.  Jobs are claimed lock-free; a worker spins ~300 us for the next batch before it sleeps,
 // because one miss request runs its batches back to back (reads, gate/up, down) and a futex wake per batch
 // was most of the CPU path's latency.
+// `concurrent`: several callers' batches at once (a pool a split's parts share - the parts' CPU-lane experts):
+// each run() takes one of kSlots batch slots, works its own batch and waits for it, and the workers take jobs from
+// the batch of the highest priority (set_thread_prio: the caller thread's; ties to the lower slot) a job at a time.
+// One batch at a time (the default) held a part's route behind another's whole batch - a lone expert's down
+// pieces leave most threads idle, and those threads now take the other part's jobs.
 class Workers {
 public:
     // spin_us: how long an idle worker spins for the next batch before it sleeps; cpus: the CPUs the workers run on
     // (empty: any)
-    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}) : spin_us_(spin_us), active_(n + 1) {
+    explicit Workers(int n, int spin_us = 300, const std::vector<int>& cpus = {}, bool concurrent = false)
+        : spin_us_(spin_us), active_(n + 1), concurrent_(concurrent) {
         for (int i = 0; i < n; ++i) {
-            th_.emplace_back([this, i] { loop(i); });
+            th_.emplace_back([this, i] { concurrent_ ? loop_c(i) : loop(i); });
             pin_thread(th_.back().native_handle(), cpus);
         }
     }
@@ -89,10 +140,15 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
         }
         cv_.notify_all();
+        idle_cv_.notify_all();
         for (auto& t : th_) t.join();
     }
     void run(int n, const std::function<void(int)>& fn) {
         if (n <= 0) return;
+        if (concurrent_) {
+            run_c(n, fn);
+            return;
+        }
         std::lock_guard<std::mutex> one(run_mu_);   // a pool a split's parts share: one batch at a time
         const uint64_t g = (gen_.load(std::memory_order_relaxed) + 1) & 0xffffffffu;
         // the ticket packs (generation, next index): a straggler of an older batch can never claim (or burn)
@@ -115,11 +171,22 @@ public:
     }
     int size() const { return (int) th_.size() + 1; }
     // only the caller and the first n - 1 workers take jobs (fewer threads without a restart: setup's calibration);
-    // a batch's job count should be active() for one job a thread
-    void set_active(int n) { active_.store(std::max(1, std::min(n, size())), std::memory_order_release); }
+    // a batch's job count should be active() for one job a thread.  The workers left out wait on idle_cv_, which only
+    // this wakes (under mu_, so none misses it)
+    void set_active(int n) {
+        std::lock_guard<std::mutex> lk(mu_);
+        active_.store(std::max(1, std::min(n, size())), std::memory_order_release);
+        idle_cv_.notify_all();
+    }
     int active() const { return active_.load(std::memory_order_acquire); }
+    // the priority of this thread's batches on a concurrent pool (higher first; default 0)
+    static void set_thread_prio(int p) { tl_prio() = p; }
 
 private:
+    static int& tl_prio() {
+        static thread_local int p = 0;
+        return p;
+    }
     void work(uint64_t g) {
         for (;;) {
             uint64_t t = ticket_.load(std::memory_order_acquire);
@@ -134,17 +201,26 @@ private:
     void loop(int id) {
         uint64_t seen = gen_.load();
         for (;;) {
-            const auto t0 = std::chrono::steady_clock::now();
-            int spins = 0;
             // a worker set_active left out sleeps at once: spinning, it held a CPU the active ones and the disk
             // readers wanted, so the setup's calibration timed fewer threads on a CPU still full of spinners
-            // (24-core Ultra 9 275HX, no SMT, Windows: a decode's disk wait 16.8 ms with 24 threads, 8.1 ms with 16)
-            const bool idle = id + 1 >= active_.load(std::memory_order_acquire);
+            // (24-core Ultra 9 275HX, no SMT, Windows: a decode's disk wait 16.8 ms with 24 threads, 8.1 ms with 16).
+            // It sleeps on idle_cv_ until set_active takes it in, outside sleeping_: on cv_, every batch's notify_all
+            // woke it to sleep again, and the pool's sleepers made run() notify at all - the fewer threads active, the
+            // more of them, so a calibration measured the lower counts slower than they run (#178)
+            if (id + 1 >= active_.load(std::memory_order_acquire)) {
+                std::unique_lock<std::mutex> lk(mu_);
+                idle_cv_.wait(lk, [&] { return quit_.load() || id + 1 < active_.load(std::memory_order_acquire); });
+                if (quit_.load()) return;
+                seen = gen_.load(std::memory_order_acquire);   // (a batch already running goes on without it)
+                continue;
+            }
+            const auto t0 = std::chrono::steady_clock::now();
+            int spins = 0;
             while (gen_.load(std::memory_order_acquire) == seen) {
                 if (quit_.load(std::memory_order_relaxed)) return;
                 cpu_relax();
-                if (idle || ((++spins & 255) == 0 &&
-                             std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_))) {
+                if ((++spins & 255) == 0 &&
+                    std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_)) {
                     std::unique_lock<std::mutex> lk(mu_);
                     sleeping_.fetch_add(1);
                     cv_.wait(lk, [&] { return quit_.load() || gen_.load() != seen; });
@@ -157,14 +233,107 @@ private:
             if (id + 1 < active_.load(std::memory_order_acquire)) work(seen);
         }
     }
+    // ---- the concurrent pool: a slot's ticket packs (generation, next index) as above, its own generation
+    static constexpr int kSlots = 16;
+    static constexpr uint64_t kClosed = 0x7fffffffu;
+    struct Slot {
+        std::atomic<uint64_t> ticket{kClosed};
+        std::atomic<int> total{0}, done{0}, prio{0};
+        std::atomic<const std::function<void(int)>*> fn{nullptr};
+        std::atomic<bool> busy{false};
+        uint64_t gen = 0;   // (its owner's alone)
+    };
+    // one job of slot s's batch g (false: none left to claim)
+    bool claim(Slot& S, uint64_t g) {
+        for (;;) {
+            uint64_t t = S.ticket.load(std::memory_order_acquire);
+            if ((t >> 32) != g || (t & 0xffffffffu) == kClosed) return false;
+            if ((int) (t & 0xffffffffu) >= S.total.load(std::memory_order_acquire)) return false;
+            if (!S.ticket.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
+            (*S.fn.load(std::memory_order_acquire))((int) (t & 0xffffffffu));
+            S.done.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        }
+    }
+    void run_c(int n, const std::function<void(int)>& fn) {
+        int s = 0;
+        for (bool got = false; !got;)
+            for (s = 0; s < kSlots && !got; ++s) {
+                bool f = false;
+                got = slots_[s].busy.compare_exchange_strong(f, true, std::memory_order_acq_rel);
+                if (got) break;
+            }
+        Slot& S = slots_[s];
+        const uint64_t g = ++S.gen & 0xffffffffu;
+        S.ticket.store((g << 32) | kClosed, std::memory_order_seq_cst);
+        S.fn.store(&fn, std::memory_order_relaxed);
+        S.prio.store(tl_prio(), std::memory_order_relaxed);
+        S.total.store(n, std::memory_order_release);
+        S.done.store(0, std::memory_order_relaxed);
+        S.ticket.store(g << 32, std::memory_order_seq_cst);
+        epoch_.fetch_add(1, std::memory_order_seq_cst);
+        if (sleeping_.load(std::memory_order_seq_cst) > 0) {
+            std::lock_guard<std::mutex> lk(mu_);
+            cv_.notify_all();
+        }
+        while (claim(S, g)) {
+        }
+        while (S.done.load(std::memory_order_acquire) < n) cpu_relax();
+        S.ticket.store((g << 32) | kClosed, std::memory_order_seq_cst);
+        S.busy.store(false, std::memory_order_release);
+    }
+    // the open slot of the highest priority with a job left (-1: none), its generation in g
+    int pick(uint64_t& g) {
+        int best = -1, bp = 0;
+        for (int s = 0; s < kSlots; ++s) {
+            Slot& S = slots_[s];
+            const uint64_t t = S.ticket.load(std::memory_order_acquire);
+            if ((t & 0xffffffffu) == kClosed || (int) (t & 0xffffffffu) >= S.total.load(std::memory_order_acquire))
+                continue;
+            const int p = S.prio.load(std::memory_order_relaxed);
+            if (best < 0 || p > bp) best = s, bp = p, g = t >> 32;
+        }
+        return best;
+    }
+    void loop_c(int id) {
+        for (;;) {
+            const auto t0 = std::chrono::steady_clock::now();
+            int spins = 0;
+            for (;;) {
+                if (quit_.load(std::memory_order_relaxed)) return;
+                const uint64_t e = epoch_.load(std::memory_order_acquire);
+                if (id + 1 < active_.load(std::memory_order_acquire)) {
+                    uint64_t g = 0;
+                    const int s = pick(g);
+                    if (s >= 0) {
+                        claim(slots_[s], g);
+                        break;
+                    }
+                }
+                cpu_relax();
+                const bool idle = id + 1 >= active_.load(std::memory_order_acquire);
+                if (idle || ((++spins & 255) == 0 &&
+                             std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(spin_us_))) {
+                    std::unique_lock<std::mutex> lk(mu_);
+                    sleeping_.fetch_add(1, std::memory_order_seq_cst);
+                    cv_.wait(lk, [&] { return quit_.load() || epoch_.load(std::memory_order_seq_cst) != e; });
+                    sleeping_.fetch_sub(1);
+                    break;
+                }
+            }
+        }
+    }
     int spin_us_;
     std::vector<std::thread> th_;
     std::mutex mu_, run_mu_;
-    std::condition_variable cv_;
+    std::condition_variable cv_, idle_cv_;
     const std::function<void(int)>* volatile fn_ = nullptr;
     std::atomic<int> total_{0}, done_{0}, sleeping_{0}, active_;
     std::atomic<uint64_t> ticket_{0}, gen_{0};
     std::atomic<bool> quit_{false};
+    const bool concurrent_;
+    Slot slots_[kSlots];
+    std::atomic<uint64_t> epoch_{0};
 };
 
 // [off, off + len) of a shard into dst (O_DIRECT when the shard has a direct fd; see glm_fast_path.cu)
@@ -209,7 +378,7 @@ int trunk_skip_from(int il);
 namespace gf = strata::kernels::glmf;
 
 struct Glm5Model::FastState {
-    bool unified_memory = false;   // set only for integrated HIP devices on Linux; CUDA and Windows keep the discrete policy
+    bool unified_memory = false;   // set for integrated devices on Linux (HIP APUs, CUDA's GB10 / Grace); Windows keeps the discrete policy
     cudaStream_t cs = nullptr, copy = nullptr, ps = nullptr;   // ps: the prefetch side stream
     cudaEvent_t ev_hop = nullptr, ev_done = nullptr, ev_pred = nullptr, ev_pf = nullptr, ev_pf_prev = nullptr;
     int max_pf = 0;   // STRATA_GLM_PREFETCH_N: measured a net LOSS on Mercury (the window between routes is shorter than one fetch)
@@ -218,8 +387,10 @@ struct Glm5Model::FastState {
     int* pf_n_buf[2] = {nullptr, nullptr};
     void* arena = nullptr;
     size_t arena_bytes = 0;
+    size_t scratch_bytes = 0, win_bytes = 0;   // the scratch slots; the verify window's buffers (the VRAM report)
     // activations (device)
     float *x = nullptr, *mixer = nullptr, *ffn = nullptr, *pre = nullptr, *post = nullptr, *comb = nullptr;
+    float* defer_post = nullptr;   // STRATA_GLM_DEFER_CPU: the deferred layer's FFN-side post weights (8 floats)
     float* part = nullptr;
     unsigned int* counter = nullptr;
     void* xq = nullptr;
@@ -227,6 +398,7 @@ struct Glm5Model::FastState {
     float* conv[3] = {nullptr, nullptr, nullptr};
     float *fa = nullptr, *ga = nullptr, *beta = nullptr, *g1 = nullptr, *g2 = nullptr;
     void* gated_q = nullptr;
+    float* rep = nullptr;   // a window commit's replay (win_commit_part): kKdaLayers x 5 x d_inner (q k v g1 g2)
     float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
     float *q = nullptr, *iq = nullptr, *score = nullptr;
     int* cells = nullptr;
@@ -278,6 +450,29 @@ struct Glm5Model::FastState {
     int* mtp_tok_h = nullptr;    // pinned
     void* spec_q = nullptr;      // speculative sampling (STRATA_GLM_SPEC_SAMPLE): the draft's kept list, a device SpecList
     cudaEvent_t ev_mtp = nullptr;
+    // the one-GPU MTP decode (src/core/glm_mtp.cu) - the draft head over the draft vocabulary (Glm5Model::mtp_vocab_scan;
+    // mtp_dv == 0: the whole head): the head's first mtp_dv rows in place, then mtp_dx rows gathered from the rest
+    // (mtp_dx_w) whose tokens are mtp_dx_ids (device: the argmax writes a token id either way)
+    int mtp_dv = 0, mtp_dx = 0;
+    void* mtp_dx_w = nullptr;
+    int* mtp_dx_ids = nullptr;
+    // ... the chained drafts (STRATA_GLM_MTP_CHAIN): token_embd on the device as stored (Q6_K / Q8_0), the token of a
+    // step after the first read there; null: every draft step takes its embedding from the host.  The host's own rows
+    // for a draft step go through mtp_emb_h, its copy out ordered by ev_mtp_emb
+    void* mtp_emb = nullptr;
+    int mtp_emb_type = -1;
+    float* mtp_emb_h = nullptr;   // pinned
+    cudaEvent_t ev_mtp_emb = nullptr;
+    bool mtp_emb_pending = false;
+    // ... and its NextN cache fill (Glm5Model::mtp_cache_rows): up to cap rows at once - the next tokens' embeddings
+    // (emb_h pinned), eh_proj's input and output, the attention norm and the cache rows' projections
+    struct MtpCacheRows {
+        int cap = 0;
+        void* arena = nullptr;
+        float *emb = nullptr, *hid = nullptr, *x = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr;
+        void *catq = nullptr, *xq = nullptr;
+        float* emb_h = nullptr;
+    } mtpc;
     // routing
     gf::MoeDev md;
     unsigned long long* tab = nullptr;
@@ -345,6 +540,46 @@ struct Glm5Model::FastState {
     };
     std::vector<LayerPool> lp;   // indexed by absolute layer
     std::vector<int> slot_of;    // il * n_expert + e -> slot in lp[il], -1 absent
+    // the pool is COMPLETE (glmfast::complete_pool: every layer's main slots hold every expert and the spares; fast_setup
+    // sized it so) ...
+    bool complete = false;
+    // ... and, as of the last boundary, every expert of every MoE layer IS in VRAM (the device tables point at all of
+    // them): a route can neither miss nor fetch, so the per-route moe_wait / moe_fetch / moe_cpu_wait launches - no-ops
+    // then - are left out (fast_moe).  Only the boundary and the prompt path's lending change the tables
+    // (a promotion only adds), so it is set there (check_resident) and holds until the next one.
+    // STRATA_GLM_RESIDENT_SKIP=0 launches them anyway (A/B); on by default on AMD only (glmfast::on_by_default_on_amd).
+    bool all_resident = false;
+    bool all_in_vram = false;   // every expert in VRAM as of the last boundary, whatever STRATA_GLM_RESIDENT_SKIP says
+    // STRATA_GLM_SKIP_EMPTY=1: the same per layer for the batched rows (glm_rows.cu; the token path keeps the rule
+    // above, its layers' launches are in its graphs' key) - layer_res[il]: every expert of layer il in VRAM as of the
+    // last boundary, so its routes leave out the wait, the fetch and the CPU lane's wait.  Off: empty.
+    std::vector<uint8_t> layer_res;
+    bool layer_resident(int il) const { return (size_t) il < layer_res.size() && layer_res[(size_t) il] != 0; }
+    void check_resident(int l0, int lt, int n_expert) {
+        static const bool on = glmfast::on_by_default_on_amd("STRATA_GLM_RESIDENT_SKIP");
+        if (glmfast::skip_empty_on()) {
+            layer_res.assign(L.size(), 0);
+            for (int il = l0; il < lt; ++il) {
+                if (!L[(size_t) il].moe) continue;
+                const int* so = slot_of.data() + (size_t) il * n_expert;
+                bool all = true;
+                for (int e = 0; e < n_expert && all; ++e) all = so[e] >= 0;
+                layer_res[(size_t) il] = all ? 1 : 0;
+            }
+        }
+        bool all = true;
+        for (int il = l0; il < lt && all; ++il) {
+            if (!L[(size_t) il].moe) continue;
+            const int* so = slot_of.data() + (size_t) il * n_expert;
+            for (int e = 0; e < n_expert; ++e)
+                if (so[e] < 0) {
+                    all = false;
+                    break;
+                }
+        }
+        all_in_vram = all;
+        all_resident = on && all;
+    }
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
     // the warm-up fills the tiers in its order (this user's experts first)
@@ -359,15 +594,31 @@ struct Glm5Model::FastState {
     // have that memory while it runs (vision_lend frees it, vision_reclaim allocates it again)
     uint8_t* xpool = nullptr;
     size_t xpool_bytes = 0;
+    // how far the prompt's lending (lend_tail) freed xpool: the first tail slot it kept, so [xpool + the prompt's
+    // need, lend_end) is a loan the layout did not use - where the prompt path's MMQ scratch lives (mmq::pool_slab)
+    size_t lend_end = 0;
     // ---- the RAM tier: pinned host slots per blob size class, holding experts that are NOT in VRAM
     //      (exclusive tiers).  rtab (on the device) points at HOLDING slots only.
     // kRPin: still the expert's live copy, being promoted (never a victim until the copy landed)
-    enum : char { kRFree = 0, kRHold = 1, kRRelease = 2, kRDemote = 3, kRNew = 4, kRLoad = 5, kRPin = 6 };
+    enum : char { kRFree = 0, kRHold = 1, kRRelease = 2, kRDemote = 3, kRNew = 4, kRLoad = 5, kRPin = 6,
+                  kRHelper = 7 };   // helper-owned UMA weights: readable by prefill, never a RAM-tier victim
     struct RamClass {
         size_t stride = 0;
-        uint8_t* base = nullptr;
+        uint8_t* base = nullptr;   // the first piece (the only one unless per_part > 0)
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        // pinned in pieces of per_part slots (Windows: a big block takes far more of the per-process pinning budget
+        // than its size - a 2-GPU split's second part got 0 GB, #417); 0: one block from base
+        int per_part = 0;
+        std::vector<uint8_t*> parts;
+        uint8_t* slot(size_t s) const {
+            return per_part > 0 ? parts[s / (size_t) per_part] + (s % (size_t) per_part) * stride : base + s * stride;
+        }
+        size_t part_slots(size_t i) const {   // the slots of piece i
+            return per_part > 0 ? std::min((size_t) per_part, (size_t) n - i * (size_t) per_part) : (size_t) n;
+        }
+        size_t n_parts() const { return per_part > 0 ? parts.size() : (base != nullptr ? 1 : 0); }
+        uint8_t* part(size_t i) const { return per_part > 0 ? parts[i] : base; }
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
         std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /
@@ -378,12 +629,14 @@ struct Glm5Model::FastState {
     std::vector<int> layer_rc;   // layer -> RAM class
     std::vector<int> ram_of;     // key -> slot in its class, -1
     // STRATA_GLM_TIER_DIAG=1 (debug): how each expert last left the tiers (0 never held, 1 dropped from VRAM, 2 evicted
-    // from RAM, 3 dropped by the prompt path's lending), and the disk reads by that cause
+    // from RAM, 3 dropped by the prompt path's lending, 4 evicted from RAM by the lending's park), and the disk reads by
+    // that cause
     std::vector<uint8_t> left;
-    uint64_t diag_disk[4] = {0, 0, 0, 0}, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_lend_park = 0, diag_b = 0;
+    uint64_t diag_disk[8] = {}, diag_lend_evict = 0, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_lend_park = 0, diag_b = 0;
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
     size_t ram_bytes = 0;
+    size_t all_bytes = 0;   // the bytes of every routed expert of this part's layers (the Monitor's tiers)
     // ---- demotions VRAM -> RAM (copy stream, D2H) of the victims that make room for spares
     struct Drain {
         int il, vslot, key, rclass, rslot;
@@ -414,6 +667,13 @@ struct Glm5Model::FastState {
     uint32_t upd_g = 0;
     int n_keys = 0;
     uint8_t* scratch = nullptr;
+    // STRATA_GLM_GROUP_EXPERTS: rows 1 .. rows_group - 1's scratch slots, and every row's 8 slot pointers (device)
+    uint8_t* rows_scratch = nullptr;
+    unsigned long long* rows_scr = nullptr;
+    int rows_group = 0;                        // a group's rows at most (0: grouping off)
+    // STRATA_GLM_MULTI_MTP: rows_scr's rows (a group of verify windows); rows rows_group .. rows_scr_rows - 1 have no
+    // scratch slots of their own (they name earlier rows'), so they group only while every expert is in VRAM
+    int rows_scr_rows = 0;
     std::vector<uint8_t*> stage;   // pinned: disk reads when no RAM slot is free
     size_t stage_bytes = 0;        // ... each (an expert's blob); the start's uploads go through stage[0] too
     std::mutex mu;   // the service thread vs the between-token boundary
@@ -423,6 +683,15 @@ struct Glm5Model::FastState {
     //      weighted sum (cpu_ans_h) before its down combine.  cpu_plan: how many of f RAM-tier experts go to the host.
     //      A split of 3+ GPUs shares one pool across its parts (fast_cpu_lane_setup).
     std::shared_ptr<glmfast::Workers> cpu_pool;
+    GlmExpertHelper helper;   // opt-in, independent expert ownership on the secondary GPU
+    uint8_t* helper_owned_d = nullptr;   // primary router excludes these experts from PCIe admission/prefetch
+    uint64_t helper_swaps = 0;
+    std::atomic<bool> helper_failed{false};
+    std::string helper_error;
+    std::atomic<uint64_t> helper_experts{0}, helper_routes{0}, helper_us{0};
+    // the lane's own thread count when cpu_pool holds more (STRATA_GLM_CPU_LANE_MAX): a request that names no
+    // cpu_threads returns to it, not to the whole pool; 0 = the pool's size
+    int cpu_threads0 = 0;
     // one GPU with a DFlash drafter, on a host of two NUMA nodes or more (STRATA_GLM_WIN_LANES, on): a batched verify
     // window's tokens' CPU-lane experts go to two lane threads, token t to lane t % 2 - lane 0 drives cpu_pool (then
     // pinned to the GPU's node), lane 1 a pool of its own on another node - so the window's tokens run on both
@@ -443,6 +712,7 @@ struct Glm5Model::FastState {
         float *qr_raw = nullptr, *qr = nullptr, *kv_raw = nullptr, *ik_raw = nullptr, *ig_raw = nullptr, *iw = nullptr;
         float *q = nullptr, *iq = nullptr;
         float *q_abs = nullptr, *ctx = nullptr;   // the absorbed MLA's per-token rows (n_head x kv_lora each)
+        int* cells = nullptr;                     // each token's selected cells (n_sel_max a row): one batched attention
         void *qr_q = nullptr, *attn_q = nullptr;
         float *rlog = nullptr, *sh_g = nullptr, *sh_u = nullptr, *dg = nullptr, *du = nullptr;
         void* dhq = nullptr;
@@ -460,8 +730,8 @@ struct Glm5Model::FastState {
         float* emb_h = nullptr;             // pinned, tmax x n_embd
         float* hop_h = nullptr;             // pinned, tmax x hc x n_embd: the rows to the next part
         cudaEvent_t ev_hop = nullptr;
-        cudaEvent_t ev_tok[16] = {};        // window_pipe's hop of each token (its threads record and wait out of turn)
-        cudaEvent_t ev_pick[16] = {};       // ... and (the last part) each token's pick copied out
+        cudaEvent_t ev_tok[32] = {};        // window_pipe's hop of each token slot (its threads record and wait out of
+        cudaEvent_t ev_pick[32] = {};       // turn) ... and (the last part) each token's pick copied out (kPipeSlots)
         int bank = 0;                       // ... the slots' bank this window (they alternate: kPipeMax a bank)
         bool pick_sampled = false;          // ... the picks drawn with pick_sp (row t at its counter + t), not argmax
         // ... the tokens past the first wrong draft skip their heavy kernels: the head part's pinned word per bank
@@ -471,6 +741,7 @@ struct Glm5Model::FastState {
         int* skip_d = nullptr;
         const volatile int* from = nullptr;
         strata::kernels::SamplerParams pick_sp;
+        int32_t pick_tok[32] = {};          // ... the tokens pushed, by slot (a pick's penalty rows count the drafts before it)
         int64_t p0 = 0;
         int T = 0;
         // STRATA_GLM_WIN_PROF=1: an event after each phase of the window's layers, the gaps summed per phase name
@@ -505,6 +776,7 @@ struct Glm5Model::FastState {
         gf::CpuAnswer* ans_h[16] = {};      // host-mapped answer slots for tokens 1.. (token 0: cpu_ans_h)
         void* ans_d[16] = {};
         bool per_token = false;             // the batched MoE off for this pass (the redo after a scratch clash)
+        bool piped = false;                 // this window is a pipelined one (win_pipe_begin), not window()'s
         int pipe_t = -1;                    // window_pipe: the token whose layers are being enqueued (its KDA inputs
                                             // to kin row pipe_t); -1 otherwise
         void mark(const char* nm, cudaStream_t st) {
@@ -575,6 +847,12 @@ struct Glm5Model::FastState {
     std::atomic<uint64_t> disk_skips{0};   // STRATA_GLM_DISK_SKIP_W / _FROM: disk-only experts left out
     int disk_skip_from = 8;                // ... at route rank >= this (8: none)
     float disk_skip_w = 0.0f;              // ... or of a smaller weight share than this (0: none)
+    // STRATA_GLM_MISS_SKIP_W / _FROM: a routed expert not in VRAM whose weight share is below miss_w is left out, on layers
+    // from miss_from on (0: none); a request's strata_tune miss_skip_w / miss_skip_from override them (< 0: these)
+    float miss_w = 0.0f;
+    int miss_from = 0;
+    float miss_w_req = -1.0f;
+    int miss_from_req = -1;
     std::atomic<uint64_t> scratch_uses{0}, demotions{0}, drops{0};
     std::atomic<uint64_t> miss_us{0}, disk_us{0};
     uint64_t tokens = 0;
@@ -631,6 +909,7 @@ struct Glm5Model::FastState {
         return e;
     }
     bool route_ok(std::string& err) const {
+        if (helper_failed.load(std::memory_order_acquire)) { err = helper_error; return false; }
         const int e = route_error_h ? *route_error_h : 0;
         if (e == 0) return true;
         const char* kind = (e % 4 == 1) ? "decode" : (e % 4 == 2) ? "predicted" : "lookahead";

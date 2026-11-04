@@ -1,0 +1,759 @@
+{
+ "_": "DeepSeek-V4.1-Flash-1017 as unsloth's GGUFs for maya-ds4 (maya.py's DeepSeek setup, tools/ds4/pack_gguf.py): dense weights BF16 (UD-Q8_K_XL) or Q8_0 (UD-Q4_K_XL), routed experts MXFP4, the Engram tables MXFP8; the smaller UD quants of unsloth's re-upload of 2026-10-28 (each pinned to that revision: its own \"revision\"; the Engram tables in the last shard, in IQ4_NL, Q5_K, Q6_K or MXFP8 - \"table\"; \"memory_gb\": the files but that shard) - every file pinned to a revision, with its size and sha256. Neither has the DSpark drafter or the vision tower (\"drafter\" and \"vision\" below: from DeepSeek's own checkpoint).",
+ "name": "DeepSeek-V4.1-Flash-1017",
+ "repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+ "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+ "license": "MIT",
+ "quants": {
+  "UD-Q8_K_XL": {
+   "files": {
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf": [
+     5780589,
+     "cc15d470afcb030558bbc4d8e2ccd840182e2e95de1a95198138efe63a5fd99f"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00002-of-00009.gguf": [
+     50536121984,
+     "9cb2047676bd20e448be2377b480080c97fb38fae117f4846e07de2c65bb8522"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00003-of-00009.gguf": [
+     50536121984,
+     "17d398dd327e7ff1991b382677814db75d970b074661757564b6f2ac3d0c8d95"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00004-of-00009.gguf": [
+     50536122016,
+     "7ea8da1143b9a6bf1424a361eb1b0d6f66c7ce79eac9711162f212cc4f39c319"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00005-of-00009.gguf": [
+     50536122016,
+     "1952da19a841176b46f9681c99ea57c674f8a8861e16d76fb35cec4befe039b2"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00006-of-00009.gguf": [
+     50536122016,
+     "d6711781d8effab79b410af9c40920bffcc0c28976e509bc1227ff0c6669c33a"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00007-of-00009.gguf": [
+     36097230048,
+     "2ebc8d198d03a14865e8a85df637285ceb5dd79b1ffc78424bd3c3e06df57823"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf": [
+     202758032592,
+     "12df293355efbd104b088a77e13ee22410fb1ec3f7ab3863947f09896e64bec7"
+    ],
+    "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00009.gguf": [
+     16835109952,
+     "df33722d1dcf5ffe0347ed8406f7acb3b18061f4ded2c13c2b0a184b8d41c9ea"
+    ]
+   },
+   "bytes": 508376763197,
+   "earlier": [
+    {
+     "_": "unsloth's layout before it re-sharded the GGUFs on 2026-10-19 (10 shards, the Engram tables in 00008 and 00009): used as it is when the folder holds it whole - nothing downloaded again",
+     "revision": "dc788bdb683b0af7a6e5315a7d98e9d082faf5e5",
+     "files": {
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00010.gguf": [
+       5781234,
+       "e88691700c4778890cfa845bc21242cf101faa014c8a44d1315402e3f64e701a"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00002-of-00010.gguf": [
+       48129640000,
+       "8b9e24ae7322af960c6cceb3cc79623ac79c173fba860da2b10fe5de04e763e2"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00003-of-00010.gguf": [
+       48129640000,
+       "9b5047e0f84d64f673d638a6d85282bae16b53f39cf12559c4b8605b127baeca"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00004-of-00010.gguf": [
+       48129640000,
+       "83a630d0dd9f2dc6e1d1223b265e78523a51ba6483ab70e3ae3f188978df2491"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00005-of-00010.gguf": [
+       48129640000,
+       "90ecd6d773dd0eab5ce1a7bdff626617f8b59360ae53a2cd5d763bde0088b2e8"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00006-of-00010.gguf": [
+       48129640000,
+       "e688bfa9a31f00ac33ac7cd739fbc0a903ae0d1601e85c485c23147c57a282fd"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00007-of-00010.gguf": [
+       48129640000,
+       "daf02b75c0ad3562c8ccc505fcd94ce08584f967f485b9e9e3ebdbfcafcaf286"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00010.gguf": [
+       101377628544,
+       "b9a5d8344f60c87bf8e8b2f56f89074e22c3a148342455129fd2a6f65bc6a612"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00010.gguf": [
+       101380404256,
+       "0dc8cda974060d492b147a0e3fa074a892bddb0c8b8d6322dc2367c6c6a72fbf"
+      ],
+      "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00010-of-00010.gguf": [
+       16835109952,
+       "93749d36aa1d2a73dba2bbaf903cc366e694769bc16c216ec2e0dff846e74cac"
+      ]
+     }
+    }
+   ],
+   "table": "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf"
+  },
+  "UD-Q4_K_XL": {
+   "files": {
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00009.gguf": [
+     5780589,
+     "cc15d470afcb030558bbc4d8e2ccd840182e2e95de1a95198138efe63a5fd99f"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00002-of-00009.gguf": [
+     48129640000,
+     "17df217d8fc26a39f21ea40805dc6ab788c7ce8623a59a95c431051df7eafc94"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00003-of-00009.gguf": [
+     48129640000,
+     "0c8065f620a049cb437024c54ff12c314c94603a1cc683f5191be4689d6d6d3b"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00004-of-00009.gguf": [
+     48129640000,
+     "3bd8b2ebf8f51d8708a73ae0895f8d4acc7e4c983ba4e89d038492b203cc89ac"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00005-of-00009.gguf": [
+     48129640000,
+     "929054a6bbf3701765779b58c37988b6c6284a3b8413901858b59c0e95f37cc3"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00006-of-00009.gguf": [
+     48129640000,
+     "49d3de04bd6a09de786c9ef7db900eae02ee9fd391573f91a923013d7d5b24d3"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00007-of-00009.gguf": [
+     48129640000,
+     "f18feae5878dd680f1ea87ecd1d84f4fb098480298b25a3162dcbdab8dc2ca5b"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00008-of-00009.gguf": [
+     202758032592,
+     "12df293355efbd104b088a77e13ee22410fb1ec3f7ab3863947f09896e64bec7"
+    ],
+    "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00009-of-00009.gguf": [
+     9165923392,
+     "c21ad6105a780bc2f44eb7dd41f9b1a1efb4e8ec87618f60b733bc2652bd2ffe"
+    ]
+   },
+   "bytes": 500707576573,
+   "earlier": [
+    {
+     "_": "unsloth's layout before it re-sharded the GGUFs on 2026-10-19 (10 shards, the Engram tables in 00008 and 00009): used as it is when the folder holds it whole - nothing downloaded again",
+     "revision": "dc788bdb683b0af7a6e5315a7d98e9d082faf5e5",
+     "files": {
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00001-of-00010.gguf": [
+       5781234,
+       "e88691700c4778890cfa845bc21242cf101faa014c8a44d1315402e3f64e701a"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00002-of-00010.gguf": [
+       48129640000,
+       "8b9e24ae7322af960c6cceb3cc79623ac79c173fba860da2b10fe5de04e763e2"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00003-of-00010.gguf": [
+       48129640000,
+       "9b5047e0f84d64f673d638a6d85282bae16b53f39cf12559c4b8605b127baeca"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00004-of-00010.gguf": [
+       48129640000,
+       "83a630d0dd9f2dc6e1d1223b265e78523a51ba6483ab70e3ae3f188978df2491"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00005-of-00010.gguf": [
+       48129640000,
+       "90ecd6d773dd0eab5ce1a7bdff626617f8b59360ae53a2cd5d763bde0088b2e8"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00006-of-00010.gguf": [
+       48129640000,
+       "e688bfa9a31f00ac33ac7cd739fbc0a903ae0d1601e85c485c23147c57a282fd"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00007-of-00010.gguf": [
+       48129640000,
+       "daf02b75c0ad3562c8ccc505fcd94ce08584f967f485b9e9e3ebdbfcafcaf286"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00008-of-00010.gguf": [
+       101377628544,
+       "b9a5d8344f60c87bf8e8b2f56f89074e22c3a148342455129fd2a6f65bc6a612"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00009-of-00010.gguf": [
+       101380404256,
+       "0dc8cda974060d492b147a0e3fa074a892bddb0c8b8d6322dc2367c6c6a72fbf"
+      ],
+      "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00010-of-00010.gguf": [
+       9165923392,
+       "82a3958d47e2c220f49d7235256a54c3a93a08f9c1bbf90c7a0c552a64c90d9a"
+      ]
+     }
+    }
+   ],
+   "table": "UD-Q4_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q4_K_XL-00008-of-00009.gguf"
+  },
+  "UD-IQ1_S": {
+   "about": "experts IQ1_S / IQ2_XXS by layer, dense weights Q5_K / Q6_K / Q8_0 / BF16, the Engram tables IQ4_NL (in its last shard)",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00001-of-00005.gguf": [
+     5780868,
+     "5197c309479c7be06e3612dc696d7f18e13e5942cfe52e70c3c586b7e585a5ac"
+    ],
+    "UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00002-of-00005.gguf": [
+     49120285248,
+     "e83af39db628614d252d49a316af8cd5911d78ab96a9e7a5997b392ece26eaf7"
+    ],
+    "UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00003-of-00005.gguf": [
+     48899707008,
+     "6caa1da6302b532374d55da6510fc92a9031a0ee1bd2bb5bf7defca2477f3d98"
+    ],
+    "UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00004-of-00005.gguf": [
+     24358544704,
+     "71c6c54dd1f20008e2130188cc655742d3738a365de4571d21a56de503b206b7"
+    ],
+    "UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00005-of-00005.gguf": [
+     110595290592,
+     "771805301e695d72d268151dfc43043581ba904298574aa879d4349cbe67b020"
+    ]
+   },
+   "bytes": 232979608420,
+   "table": "UD-IQ1_S/DeepSeek-V4.1-Flash-1017-UD-IQ1_S-00005-of-00005.gguf",
+   "memory_gb": 123
+  },
+  "UD-IQ1_M": {
+   "about": "experts IQ1_S / IQ2_XXS / IQ2_XS / IQ2_S by layer, dense weights Q5_K / Q6_K / Q8_0 / BF16, the Engram tables IQ4_NL (in its last shard)",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00001-of-00005.gguf": [
+     5780868,
+     "5197c309479c7be06e3612dc696d7f18e13e5942cfe52e70c3c586b7e585a5ac"
+    ],
+    "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00002-of-00005.gguf": [
+     49707332128,
+     "fbfb546557a33f41332ffbed7f15fbed249b9f7796975d9db571c8cf3870f335"
+    ],
+    "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00003-of-00005.gguf": [
+     49292777280,
+     "394b7a06e04d4b1b96b6028ec3d4dec49e4716900c26a493e8c2aa38a357ea1a"
+    ],
+    "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00004-of-00005.gguf": [
+     40803165856,
+     "323a7f59a2938879eaac82b37c443c85151e518071ad44c79b1e4580c91d0ed7"
+    ],
+    "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00005-of-00005.gguf": [
+     110595290592,
+     "771805301e695d72d268151dfc43043581ba904298574aa879d4349cbe67b020"
+    ]
+   },
+   "bytes": 250404346724,
+   "table": "UD-IQ1_M/DeepSeek-V4.1-Flash-1017-UD-IQ1_M-00005-of-00005.gguf",
+   "memory_gb": 140
+  },
+  "UD-IQ2_XXS": {
+   "about": "experts IQ1_S / IQ2_XXS / IQ2_XS / IQ2_S / Q2_K / IQ3_XXS by layer, dense weights Q5_K / Q6_K / Q8_0 / BF16, the Engram tables Q5_K (in its last shard)",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00001-of-00006.gguf": [
+     5780923,
+     "22ad51c224e499883c1a753ad35719af44c296bbc8bcb9c931de6bdf950fa3aa"
+    ],
+    "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00002-of-00006.gguf": [
+     49955895008,
+     "6880d0483490504a530b72686d79c92daa46e58ca5b71763bbfa3778d8a6131a"
+    ],
+    "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00003-of-00006.gguf": [
+     49950675200,
+     "04b3ec7947255efaf789da77557da9180e93128948644828798d07b8a6e7a60a"
+    ],
+    "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00004-of-00006.gguf": [
+     48971469632,
+     "318762f39cd7ebf03e3d7b30feaf938fab0464a9c2d6c0e0e99fc030bbfcd820"
+    ],
+    "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00005-of-00006.gguf": [
+     16419622240,
+     "34fa48fbe2237b1b71a4f18a04bbe10946f6b1c76b7bbff21c76da630da677b6"
+    ],
+    "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf": [
+     135172021792,
+     "406103485a7a7193337adee38b7178d3b636940aaa3ca033bc91e0d3687e3031"
+    ]
+   },
+   "bytes": 300475464795,
+   "table": "UD-IQ2_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ2_XXS-00006-of-00006.gguf",
+   "memory_gb": 166
+  },
+  "UD-Q2_K_XL": {
+   "about": "experts IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / MXFP4 by layer, dense weights Q6_K / Q8_0 / BF16, the Engram tables Q5_K (in its last shard)",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00001-of-00007.gguf": [
+     5780868,
+     "6b6e9ace54298156974cc3e024e5ba86d50c40c06482da8f64fece77d7f73452"
+    ],
+    "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00002-of-00007.gguf": [
+     49290279808,
+     "fa56e7cb79f88d992170bbc41b192991bd89b9534c53106e328fc03a5d26afed"
+    ],
+    "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00003-of-00007.gguf": [
+     49745070208,
+     "b279f9bbb331460d182658a9ec6a49eb232ef7d8c69600a2c53d5d797bf037b4"
+    ],
+    "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00004-of-00007.gguf": [
+     48680128800,
+     "c7fed7b94a11aeafbf07e164940718fab26e99a5f1d9986af0602c6515d18bff"
+    ],
+    "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00005-of-00007.gguf": [
+     49970937696,
+     "c8d6bd8063607e788db7daed01487f4e87a9529d5756dd561481bed78fea7d6d"
+    ],
+    "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00006-of-00007.gguf": [
+     1929325664,
+     "2f62bf418b0f722254728bdd88b4b1c88c1b64a4d664c7b696c08fecd49abd76"
+    ],
+    "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00007-of-00007.gguf": [
+     135172021792,
+     "a653c5309b7c74a6c41580aaa8c2d2bbdae0342253bca2cd3fc9e69d05f3d0eb"
+    ]
+   },
+   "bytes": 334793544836,
+   "table": "UD-Q2_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q2_K_XL-00007-of-00007.gguf",
+   "memory_gb": 200
+  },
+  "UD-IQ3_XXS": {
+   "about": "experts IQ2_XXS / IQ2_XS / IQ2_S / IQ3_XXS / IQ3_S / Q3_K / MXFP4 by layer, dense weights Q8_0 / BF16, the Engram tables Q6_K (in its last shard)",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00001-of-00007.gguf": [
+     5780927,
+     "0c2a2031bd93ebd60aa6a4f3912775ba3990b5f39b24c6edf9ea029d2f387a28"
+    ],
+    "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00002-of-00007.gguf": [
+     49485970112,
+     "aa7827cc3c88958f4bc4134fab2c2d63dff1e53f947f76cbb34ce429205d551c"
+    ],
+    "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00003-of-00007.gguf": [
+     49037273088,
+     "7e5bc7c88e2bbcdadafcf672a1959581aeb2f2b23732ffd77823a756151a4e76"
+    ],
+    "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00004-of-00007.gguf": [
+     49580635872,
+     "a6b33c1cc73bbd2a54617f0714c5144ee8ee6d6403ceea49628633a7a2be21de"
+    ],
+    "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00005-of-00007.gguf": [
+     48448165536,
+     "5e392a945c534eb439279bbb638e7ea47e5a1cfca620b96c3fd47da87d5923a8"
+    ],
+    "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00006-of-00007.gguf": [
+     36893972640,
+     "e1b4a74844e637d8b15c94c30757e2359f81f287824c421e8b5b746b010e030e"
+    ],
+    "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00007-of-00007.gguf": [
+     161284798692,
+     "9d21807ac1a40cd1635634c14135b5acca1c8b855dae228170361602c7de560b"
+    ]
+   },
+   "bytes": 394736596867,
+   "table": "UD-IQ3_XXS/DeepSeek-V4.1-Flash-1017-UD-IQ3_XXS-00007-of-00007.gguf",
+   "memory_gb": 234
+  },
+  "UD-IQ3_S": {
+   "about": "experts IQ2_S / IQ3_XXS / IQ3_S / Q3_K / MXFP4 by layer, dense weights Q8_0 / BF16, the Engram tables Q6_K (in its last shard)",
+   "tables_as_maya": "its table shard holds the same bytes as Maya's Q6_K pair (abliterated.engram.from; compared in full, 2026-10-30): either is read for both",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00001-of-00008.gguf": [
+     5780886,
+     "1d3027d28a1c749a5a185420640d2849849e5d42e7719df5d852572e1771de25"
+    ],
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00002-of-00008.gguf": [
+     49714948320,
+     "a5c5b3a1d56fc64e2018442170371348683a6ca31d805040946635c508698c89"
+    ],
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00003-of-00008.gguf": [
+     49249617536,
+     "0182203a6278cd29702003589b11635a8b6c58a17613270a94532a7487760092"
+    ],
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00004-of-00008.gguf": [
+     49262124864,
+     "5e1aed1952f95ada91abb3332adb8d77eff6a98281a09c246e827c6031ba0a93"
+    ],
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00005-of-00008.gguf": [
+     49616016928,
+     "69dd858b60744b9430be3b69684120d1bcb33ba4b5a740b60ddf8fc5a2875dee"
+    ],
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00006-of-00008.gguf": [
+     49262122592,
+     "962c493b4f41f2dedfb31ebbfe725d14b55d97a442f0cd14296a42ac51345ff7"
+    ],
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00007-of-00008.gguf": [
+     15235610176,
+     "c96d4a18a86dcdb3ed10e3e367bc9f3070d61a1da0144926519d2987c4e41b26"
+    ],
+    "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00008-of-00008.gguf": [
+     161284798692,
+     "e70b4bf3ac5b26aa2addb048cff61a6be5490e99ba88cfbc29f7fb7279000141"
+    ]
+   },
+   "bytes": 423631019994,
+   "table": "UD-IQ3_S/DeepSeek-V4.1-Flash-1017-UD-IQ3_S-00008-of-00008.gguf",
+   "memory_gb": 263
+  },
+  "UD-Q3_K_XL": {
+   "about": "experts IQ2_S / IQ3_XXS / IQ3_S / Q3_K / MXFP4 by layer, dense weights Q8_0 / BF16, the Engram tables MXFP8 (in its last shard)",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00001-of-00008.gguf": [
+     5780927,
+     "427a6be72b502c52562b1f1f7c5c764cad2a4cb3af991e9aaf02a33d958cc322"
+    ],
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00002-of-00008.gguf": [
+     48856795552,
+     "9a3500224d10ca5565f010f57154f5b1999406c9453d86e4a0903a8183503697"
+    ],
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00003-of-00008.gguf": [
+     48089732928,
+     "ba5c295631a392c7f929a14b633f6c9badc0eb1c9d719ecad92ec43efd4ddc6d"
+    ],
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00004-of-00008.gguf": [
+     49795067616,
+     "4dd4ea5d34219cd1444218352def2977dd153739853464154a3936276f31ffbb"
+    ],
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00005-of-00008.gguf": [
+     49964720992,
+     "1a733e505a723fb1a5ccc15a45547c6d42097d8830d8fa4c4d17ca7bbb580855"
+    ],
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00006-of-00008.gguf": [
+     49332666816,
+     "0592a53ddba5a57062e266116bae26e9f1a97c268acb5287c8f4be5bb1741314"
+    ],
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00007-of-00008.gguf": [
+     36265841792,
+     "e6e8dd016ffbb2820f0e6a37f4f8a531f5365fbdd009e758dda1c054453f9ffc"
+    ],
+    "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00008-of-00008.gguf": [
+     202758032592,
+     "18ddc73eea11981cb6317c6d3c4a4e58ec71baaea2de41b071d9127bc15c2a94"
+    ]
+   },
+   "bytes": 485068639215,
+   "table": "UD-Q3_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q3_K_XL-00008-of-00008.gguf",
+   "memory_gb": 283
+  }
+ },
+ "maya": {
+  "_": "Maya's quants of DeepSeek-V4.1-Flash-1017 (tools/maya_quant: per-expert statistics from the model itself, error-feedback rounding of the experts), each one GGUF split with everything in it - the Engram tables too, in Q6_K (made from DeepSeek's released weights). The files are listed here once they are uploaded, with the commit they were uploaded at. \"memory_gb\": the VRAM + RAM that hold a quant - its files but the Engram tables, which stay on the SSD, and its drafter - by which the setup recommends the context.",
+  "repo": "peasantsmith/DeepSeek-V4.1-Flash-1017-Maya-GGUF",
+  "revision": "c33d87b8c7a3b7d55e71324dc82395587a870b0b",
+  "quants": {
+   "Maya-S": {
+    "about": "experts IQ2_XXS / IQ3_XXS, the first and last four layers IQ2_S / IQ3_S, dense weights Q8_0, the Engram tables Q6_K",
+    "memory_gb": 186,
+    "files": {
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00006.gguf": [
+      47887697312,
+      "1f3437f57042e69f94c141ffbcba0d5610dab63feb07244fb468be4940d6763f"
+     ],
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00002-of-00006.gguf": [
+      47669578400,
+      "66501fee8702ffd54e6f065323ab54bb3150d20b10b01922c589e7462c7b5ba6"
+     ],
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00003-of-00006.gguf": [
+      47103347360,
+      "3195b23f33337c46a07c48583946d99147c3635412bc4adc6acdc4cf42bf30ad"
+     ],
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00004-of-00006.gguf": [
+      35532532032,
+      "d60dba35fac9601cd5c6026439dd980c457a5bb1c009192ea539b220108ea0db"
+     ],
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00005-of-00006.gguf": [
+      80641295472,
+      "c98d46f96a25d17c4c54da5a60782c130255c364a22e621ea28d5c98a692ceb2"
+     ],
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00006-of-00006.gguf": [
+      80643503412,
+      "98d65ef4f36e0b193935d44c3586241ca09b1b47e90f118e85332cfdb5860263"
+     ]
+    },
+    "earlier": [
+     {
+      "_": "v1.1.16's Maya-S: 4 shards without the Engram tables, which came from unsloth's MXFP8 shard of them beside it in <...-GGUF>/Engram (\"engram\": either of its layouts) - used as they are when both are whole, nothing downloaded again",
+      "revision": "26c6aeaf5ecce88fe47103f780279bcc6f1f0d9b",
+      "files": {
+       "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00001-of-00004.gguf": [
+        47887697280,
+        "b33d91333b463414fd91fbeb14a0939e3064a1abd820fa06310992da611eeb2e"
+       ],
+       "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00002-of-00004.gguf": [
+        47669578400,
+        "8198c1a5b9e2f964affacc1141627e2f0715711571c1fe04cb81702f232c5c39"
+       ],
+       "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00003-of-00004.gguf": [
+        47103347360,
+        "96b9b5e22ed60825794c377301cf2671a7a2ec463c7580b57e101f222c8ee516"
+       ],
+       "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00004-of-00004.gguf": [
+        35532532032,
+        "506dd95a2ea4f17c933534d730ec72b2ef1b82eec4847770f4f23c38344f96ca"
+       ]
+      },
+      "engram": [
+       {
+        "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf": [
+         202758032592,
+         "12df293355efbd104b088a77e13ee22410fb1ec3f7ab3863947f09896e64bec7"
+        ]
+       },
+       {
+        "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00010.gguf": [
+         101377628544,
+         "b9a5d8344f60c87bf8e8b2f56f89074e22c3a148342455129fd2a6f65bc6a612"
+        ],
+        "UD-Q8_K_XL/DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00010.gguf": [
+         101380404256,
+         "0dc8cda974060d492b147a0e3fa074a892bddb0c8b8d6322dc2367c6c6a72fbf"
+        ]
+       }
+      ]
+     }
+    ]
+   },
+   "Maya-M": {
+    "about": "experts IQ3_S, dense weights Q8_0",
+    "files": {}
+   },
+   "Maya-XS": {
+    "about": "every routed expert IQ1_S (error-feedback rounding, calibrated layer by layer on the quantized model itself), dense weights Q8_0, the Engram tables Q6_K (Maya's pair of table shards, \"tables\" below: read from the Engram-Q6_K folder, shared with Maya-S); with its own 2-bit DSpark drafter",
+    "memory_gb": 121,
+    "files": {
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-v2-IQ1_S-00001-of-00003.gguf": [
+      47993866016,
+      "9d92dd13d4603dbf07720845419963693f4c07ae098e55a5aae2f207dd44d04d"
+     ],
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-v2-IQ1_S-00002-of-00003.gguf": [
+      47421853600,
+      "b7f26bae6d6fccfb256c911f645289c0aec8459766ef83f6a04d7ed47c7e06c8"
+     ],
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-v2-IQ1_S-00003-of-00003.gguf": [
+      21422979296,
+      "62b98172562543126204fa2ff18f7d72d75353445ff93f4135d037355b409f35"
+     ]
+    },
+    "drafter": {
+     "about": "DeepSeek's drafter, its experts in IQ2_XXS, its dense weights Q8_0",
+     "json": "dspark-xs2.json",
+     "files": {
+      "dspark/dspark-xs2.bin": [
+       4251725568,
+       "8dfe21082a6cb320f334fddb454630c241c6d44e0463eef4f8b0b07334511779"
+      ],
+      "dspark/dspark-xs2.json": [
+       99146,
+       "56d47ad12d6548a8d3d50a79be96451411f18d5b77064de7b8544bb2da22988f"
+      ]
+     }
+    },
+    "earlier": [
+     {
+      "_": "Maya-XS v1 (the first release): 5 shards, its n-gram tables in shards 4-5 - used as it is when the folder holds it whole, nothing downloaded again",
+      "upgrade": true,
+      "revision": "c273fcbdda76a1db074c2f414cb70edbfca2f2ef",
+      "files": {
+       "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00001-of-00005.gguf": [
+        47781530400,
+        "a0cb7966afd68bc35c46f78018d1fa1d2e4bcbe3c3baf39f60cd1733ed9ad7e5"
+       ],
+       "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00002-of-00005.gguf": [
+        47775748128,
+        "ba5afb43adfc667436ebcfbd82d25411fa2843ee7e1d877290611cd60f93cca1"
+       ],
+       "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00003-of-00005.gguf": [
+        19784230848,
+        "1482443bb4957c8d2f005ded365445f98558ff05c50674f9ee9a96ddabc122a4"
+       ],
+       "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00004-of-00005.gguf": [
+        80641295472,
+        "0d93315942c523d82f6dbc0a6e0e1751548e309f3963f96b82f92e8f9bc52e36"
+       ],
+       "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00005-of-00005.gguf": [
+        80643503412,
+        "39bbc8cde8b17604fed9a7ba7fc6bc9c5e72e34733657943ac049b4b9ca2d340"
+       ]
+      }
+     }
+    ],
+    "tables": {
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00004-of-00005.gguf": [
+      80641295472,
+      "0d93315942c523d82f6dbc0a6e0e1751548e309f3963f96b82f92e8f9bc52e36"
+     ],
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00005-of-00005.gguf": [
+      80643503412,
+      "39bbc8cde8b17604fed9a7ba7fc6bc9c5e72e34733657943ac049b4b9ca2d340"
+     ]
+    }
+   }
+  },
+  "drafter": {
+   "_": "The DSpark drafter Maya ships: DeepSeek's FP4 experts as released, its FP8 dense weights in Q8_0 (the engine's formats: used as it is, beside the quants' folders as dspark/); the shards + drafter_pack.py path (\"drafter\" below) is the fallback while this is not pinned.",
+   "files": {
+    "dspark/dspark.bin": [
+     7967616768,
+     "42df65159f980a9189d80597e42b30012c7b10e0dd385a47051f3b2fd659bb7b"
+    ],
+    "dspark/dspark.json": [
+     96965,
+     "639c3144bca8cfe4db59057047dca40411f0cc732796e2a9321feb98fee2295f"
+    ]
+   }
+  }
+ },
+ "abliterated": {
+  "_": "orcarouter's abliterated DeepSeek-V4.1-Flash-1017 (orcarouter/DeepSeek-V4.1-Flash-1017-abliterated: the refusal direction orthogonalized out of every matrix that writes the residual stream - its card: harmful prompts refused 0.874 -> 0.074, MMLU 0.91 -> 0.92) as GGUFs for maya-ds4, two versions (Mix-128G, Mix-256G: the routed experts in other low-bit types layer by layer and role by role, MXFP4 downs under IQ3 gate / ups in some layers; dense weights Q5_K / Q6_K / Q8_0, the router F32), every file at one revision with its size and sha256. Each version's shard 2 holds only the Engram (n-gram) table, IQ4_NL - DeepSeek's released table quantized, not abliterated (checked 2026-10-27: 4096 rows against Maya's Q6_K of it differ as an IQ4_NL quantization of them does, in no shared direction) - so the setup leaves that shard out (\"table\": listed, never fetched) and the pack takes Maya's Q6_K tables instead (\"engram\"), one copy for both versions. Gated on Hugging Face: accept its terms there; the download sends HF_TOKEN (or the token of `hf auth login`). Neither the DSpark drafter nor the vision tower is in it: DeepSeek's (\"drafter\", \"vision\" below), as for unsloth's GGUFs - the drafter only drafts (each token checked by the model), so its answers are the model's own.",
+  "name": "DeepSeek-V4.1-Flash-1017-abliterated",
+  "repo": "orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF",
+  "revision": "349470a09c1fca35862b0796e726b9fe00a947df",
+  "license": "MIT",
+  "gated": true,
+  "quants": {
+   "Mix-128G": {
+    "about": "the experts IQ1_S (IQ1_M in 4 layers, IQ2_XXS downs in 3: ~1.6-1.7 bits), dense weights Q4_K - Q6_K: about 114 GB of VRAM + RAM hold all but the Engram tables",
+    "memory_gb": 114,
+    "files": {
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00001-of-00005.gguf": [
+      548777536,
+      "0d4eedd085f38e3190c7dbd7a3d9e1467a7ccc2b8f6327fc733b18a8ea3a20fa"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00002-of-00005.gguf": [
+      110595290592,
+      "bd72eee5a1ecccb2ab188a740c5bcd3ab484330f024b5d202779863ca5e512d4"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00003-of-00005.gguf": [
+      47934927328,
+      "3c86e27595d9e45a188efbf145a1163f8df60bb606365c5ee702ef01915bd1e6"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00004-of-00005.gguf": [
+      47884362016,
+      "d7fab155dcebfea89e6c9743f5f523bb766354f560305c49cf285a5c29765a04"
+     ],
+     "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00005-of-00005.gguf": [
+      17607926944,
+      "ecbf6562afd1b0559f08da31babd40d0ce1346a46a70f3213004777195698780"
+     ]
+    },
+    "table": "Mix-128G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-128G-00002-of-00005.gguf",
+    "bytes": 224571284416
+   },
+   "Mix-256G": {
+    "about": "the experts 2.5-4.25 bits by layer (IQ2_S / IQ3_XXS / IQ3_S / MXFP4), dense weights Q5_K - Q8_0: about 236 GB of VRAM + RAM hold all but the Engram tables",
+    "memory_gb": 236,
+    "files": {
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00001-of-00007.gguf": [
+      709084736,
+      "2cb066de483877f75b3dc79936b1fccf34aeecc60461701e5c39c98d7f922e03"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf": [
+      110595290592,
+      "342b6ee30a33f02fcef1d261ec7e700907f8b114370ebe90c228339f686a8c1b"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00003-of-00007.gguf": [
+      46798562592,
+      "b2583b9da6c3598f43d22714f3216709ab3160c618ad94e36d491a3bb20b5d2b"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00004-of-00007.gguf": [
+      47706985792,
+      "de9c5f8f3462c7df3db7bb2b79301eeab9d7874f581a9fa574ae4fffe127c602"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00005-of-00007.gguf": [
+      46565998336,
+      "1202e0ae311beb38de1b0899ab3cbba485385299a62e8e136e01fa922f0aeb13"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00006-of-00007.gguf": [
+      47857178816,
+      "dc7ce9ee6910e8f46a201e54c96e47b6b3bc9380c88b6187be3c860a0d0b1074"
+     ],
+     "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00007-of-00007.gguf": [
+      46145195616,
+      "ed00667671a8ca5c48da45e022b6482fc2d88a21848a98d26fba1d1f2848b429"
+     ]
+    },
+    "table": "Mix-256G/DeepSeek-V4.1-Flash-1017-abliterated-Mix-256G-00002-of-00007.gguf",
+    "bytes": 346378296480
+   }
+  },
+  "engram": {
+   "_": "Maya's Q6_K Engram tables (DeepSeek's released ones) for both versions: the two shards of a Maya quant that hold them (the \"maya\" entry's files and sha256), in their own folder beside the versions' (<models>/DeepSeek-V4.1-Flash-1017-abliterated-GGUF/Engram-Q6_K) - hard-linked from a Maya quant set up on the same drive (no second copy), else downloaded from Maya's repo (161.3 GB). Either quant's pair gives the same tables (their headers differ).",
+   "folder": "Engram-Q6_K",
+   "from": {
+    "Maya-XS": [
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00004-of-00005.gguf",
+     "Maya-XS/DeepSeek-V4.1-Flash-1017-Maya-XS-IQ1_S-00005-of-00005.gguf"
+    ],
+    "Maya-S": [
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00005-of-00006.gguf",
+     "Maya-S/DeepSeek-V4.1-Flash-1017-Maya-S-IQ2_XXS-00006-of-00006.gguf"
+    ]
+   },
+   "download": "Maya-XS"
+  }
+ },
+ "drafter": {
+  "_": "DeepSeek's DSpark drafter (the speculative decoder the GGUFs leave out): the three shards of DeepSeek's own checkpoint that hold only its blocks (mtp.0-2), at the revision the Engram tables come from; tools/ds4/drafter_pack.py makes them the GGUF path's formats (dspark.bin, beside the quants' folders).",
+  "repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "files": {
+   "model-00044-of-00048.safetensors": [
+    2652728736,
+    "3e8ac315c2bcca3e83c5e6e25c5758a75c03732063a6ff0c1b0e24b9ff49f6e6"
+   ],
+   "model-00045-of-00048.safetensors": [
+    2573998176,
+    "9c73b27c4343236790008979d5e0b565f687aa64440031b9e096fed1ab8039c5"
+   ],
+   "model-00046-of-00048.safetensors": [
+    2706402896,
+    "1dccc19a3741972c661de734572dc7d4b899e6e99bfbdf3ae4e057c707e5b339"
+   ]
+  }
+ },
+ "vision": {
+  "_": "DeepSeek's vision tower (the GGUFs leave it out; every GGUF of the model shares it, the Maya quants too): shard 1 of DeepSeek's own checkpoint holds only the tower (vision.*) and the aligner (aligner.*), BF16, and config.json their geometry; the picture span's three marker rows sit beside the embedding in shard 2, so only their 30 KB are read from it (\"marks\": an HTTP range request, each row [offset in the file, bytes, sha256]). tools/ds4/vision_pack.py makes them vision.bin + vision.json, beside the quants' folders.",
+  "repo": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  "revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+  "files": {
+   "model-00001-of-00048.safetensors": [
+    970533624,
+    "13bd121075f0b68cb7e8e8021a1011d42a81a83f557a2602fd9c07d52fddb0ec"
+   ],
+   "config.json": [
+    3311,
+    "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
+   ]
+  },
+  "marks": {
+   "file": "model-00002-of-00048.safetensors",
+   "bytes": 1323858272,
+   "rows": {
+    "image_start": [
+     1323848032,
+     10240,
+     "5f86461a3a0565f77468091e13c0c81db83614295ad004136b987cbc430470fd"
+    ],
+    "image_newline": [
+     1323837792,
+     10240,
+     "50e8ecbca5409f87546c3d9f78b49b1653204cfb2a8f5068dc738cd02b3df69f"
+    ],
+    "image_end": [
+     1323827552,
+     10240,
+     "f55bfbcb7e06217c4822d27cf7a6696966c099f2805dbf47fc1a6d6f56a885b6"
+    ]
+   }
+  },
+  "mmproj": {
+   "_": "unsloth's mmproj of the same tower (its UD quants take it: vision_pack.py --mmproj makes the same vision.bin from it, byte for byte - checked 2026-10-30)",
+   "repo": "unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+   "revision": "8a6ec9cf118e785a362ea94ee123c61c70553be6",
+   "files": {
+    "mmproj-BF16.gguf": [
+     972208288,
+     "9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9"
+    ]
+   }
+  }
+ }
+}

@@ -14,7 +14,7 @@ Open an issue with:
   - model and context length;
   - the engine log's `glm fast:`, `glm split`, `glm stat:` and `glm spec:` lines.
 
-  For numbers comparable with the README's table, measure the way `--bench` does: three questions of 256 tokens,
+  For numbers comparable with the README's [speed tables](README.md#how-fast-is-it), measure the way `--bench` does: three questions of 256 tokens,
   greedy, thinking off, one short warm-up first; prefill (reading the prompt) at 2048 and 8192 tokens.
 
 Name your Maya version (`VERSION`, or the commit). Say what you measured and what you didn't.
@@ -30,7 +30,7 @@ of its log (the `.log` next to your `maya-*.json`).
 - **Measure before and after** on your hardware, same harness, and put the numbers in the description. If the
   output changes (it can: which expert runs on the CPU or the GPU changes the last bits), say so.
 - **New settings** are `STRATA_GLM_*` environment variables, off or at today's behaviour by default unless measured
-  better, with a row in the README's Tuning table.
+  better, with a row in [docs/SETTINGS.md](docs/SETTINGS.md).
 - **AMD (HIP) and other backends:** keep NVIDIA's code path unchanged (`#if defined(STRATA_USE_HIP)`). We can't test
   AMD ourselves, so we merge AMD changes on your measurements once NVIDIA builds and behaves the same.
 - **A new CUDA call needs its AMD mapping.** The AMD build compiles the same sources with

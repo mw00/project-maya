@@ -59,7 +59,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", required=True)
     ap.add_argument("--tok", default="/mnt/nvme/maya/glm53-fp8/tokenizer.json")
-    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "strata"))
+    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "maya"))
     ap.add_argument("--max-new", type=int, default=6000)
     ap.add_argument("--runs", type=int, default=1, help="sampled runs per prompt (plus one greedy)")
     ap.add_argument("--only", default=None, help="comma list of prompt names (threejs,canvas,explain,pt-br,maths)")

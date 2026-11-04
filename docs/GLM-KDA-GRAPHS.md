@@ -1,6 +1,6 @@
 # Experimental opt-in KDA layer graphs
 
-`STRATA_GLM_KDA_GRAPH=1` captures recurrent layers of single-device GLM decode.
+`MAYA_GLM_KDA_GRAPH=1` captures recurrent layers of single-device GLM decode.
 Default is the ordinary direct path. DSA layers remain direct. Split/MTP,
 profiling, dumps, prefetch and lookahead bypass capture. Expert selection, weights,
 quantization and kernel arithmetic are unchanged; graph replay explicitly accounts
@@ -44,10 +44,10 @@ from a user-reported ~11 tok/s starting point are not this PR's isolated gain.
 
 ## Native validation
 
-Build with `-DSTRATA_BUILD_TESTS=ON`, then build `glm_layer_graph_test` and
+Build with `-DMAYA_BUILD_TESTS=ON`, then build `glm_layer_graph_test` and
 `glm_pack_graph_test`. The first is a small
 CUDA synthetic test; the second requires the real pack and GPU memory. Use an
-isolated `STRATA_GLM_USAGE` and slot directory, MTP off, sufficient RAM tier and
+isolated `MAYA_GLM_USAGE` and slot directory, MTP off, sufficient RAM tier and
 the intended CPU lane. Do not run against live pack sidecars or alongside a
 serving engine, and do not mistake compile-only checks for native execution.
 The pack test compares the full vocabulary, not only argmax. Preserve any failed

@@ -35,6 +35,31 @@ void iq_embed_rows(int ggml_type, const void* table, size_t row_bytes, const int
 void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t n_ff, int64_t n_embd, uint16_t* dst,
                        void* stream);
 
+/// The grouped WMMA launches' by-value weight table (the Volta prompt experts, STRATA_PF_WMMA): expert e's gate/up
+/// matrix at gu[e], its down matrix at dn[e].  The prompt path's group size (16) is the table's capacity.
+constexpr int kGroupedWeightTableMax = 16;
+struct GroupedWeightTable {
+    const void* gu[kGroupedWeightTableMax] = {};
+    const void* dn[kGroupedWeightTableMax] = {};
+    int n = 0;
+};
+
+/// Y[r][0..n_out) = X[ids ? ids[r] : r][0..K) . W_e (expert e's matrix: `n_out` rows of `K` values of `ggml_type`,
+/// expert e at W + e * expert_bytes, or at the by-value table's gu[e]/dn[e] when `indirect`) for the group's rows
+/// [bounds[e], bounds[e+1]), r in [bounds[0], bounds[n_experts]).  FP16 activations (X, row stride `ldx` halves,
+/// uint4-aligned), FP32 sums (Y, row stride `ldy` floats).  One grouped launch of FP16 tensor-core tiles over the
+/// whole group, the weights dequantized into shared memory.  Volta (sm_70) and up; returns false when this device
+/// or shape is not covered, having launched nothing.  `down` selects the table's dn half.
+bool gemm_iq_f16_grouped(int ggml_type, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
+                         const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream,
+                         const int32_t* ids = nullptr, const GroupedWeightTable* indirect = nullptr, bool down = false);
+
+/// Whether device `dev` (an engine device index, as cudaGetDevice reports it) accepts the grouped WMMA launches at
+/// all: its tensor-core capability and the shared-memory attributes the kernels need.  A caller deciding whether to
+/// convert its activations for the products (a conversion the MMQ path would not need) probes once with this instead
+/// of attempting a launch; `gemm_iq_f16_grouped` checks the same table per launch either way.
+bool gemm_iq_f16_grouped_supported(int dev);
+
 /// The layout of one native expert blob: [gate rows | up rows | down rows], raw GGUF blocks.
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;

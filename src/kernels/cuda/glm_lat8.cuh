@@ -27,9 +27,10 @@ __device__ __forceinline__ uint2 lat8_q4(uint32_t w, __half2 d) {
     const __half2 bias = __halves2half2(__ushort_as_half(0x6480), __ushort_as_half(0x6480));   // 1152
     const __half2 a = __hmul2(__hsub2(*(const __half2*) &lo, bias), d);
     const __half2 b = __hmul2(__hsub2(*(const __half2*) &hi, bias), d);
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) && !defined(__gfx942__) && !defined(__gfx950__)
     // a code 0 times a negative scale is -0 in FP16 and +0 through AMD's F32 product: a zero half loses its sign
-    // (only a code 0 makes a zero here - a normal scale times any other code is a normal number)
+    // (only a code 0 makes a zero here - a normal scale times any other code is a normal number).  CDNA3 and CDNA4 (gfx942, gfx950)
+    // keeps the sign through the F32 product as NVIDIA does, so its FP16 product is already the same bits
     const auto unsigned_zeros = [](unsigned x) {
         return x & (0x7FFF7FFFu | (((x & 0x7FFF7FFFu) + 0x7FFF7FFFu) & 0x80008000u));
     };

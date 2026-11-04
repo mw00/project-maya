@@ -61,6 +61,8 @@ void native_down_rows_split(const NativeFmt& f, const uint8_t* down_base, const 
 /// Whether the split variants take the multi-token kernels for this weight type here (the CPU has
 /// them, they are not switched off, and they matched ggml-cpu's dot bit for bit on synthetic rows).
 bool native_multi_rows_exact(int ggml_type);
+/// The same for the one-token rows (iq256_rows1 / iq512_one_rows; false: ggml-cpu's dot).
+bool native_rows1_exact(int ggml_type);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
                       int r0, int r1);

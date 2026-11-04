@@ -5,6 +5,7 @@
 // Synthetic weights from ggml's own quantizers; no model needed.
 //
 //   glm_mmq_glu_test           the parity checks (ctest; skipped where mmq::glu_supported is false)
+//   glm_mmq_glu_test --iq-s-only  only IQ1_S/IQ2_S/IQ3_S, for targeted Compute Sanitizer checks
 //   glm_mmq_glu_test --bench   Maya-L's shape (IQ3_S, n_embd 4096, n_ff 2048, 288 experts, 8192 tokens x 8): the time
 //                              of the fused product against the plain product + the SwiGLU kernel
 #include "strata/kernels/glm_batch.hpp"
@@ -152,6 +153,7 @@ int main(int argc, char** argv) {
     check(cudaGetDeviceProperties(&prop, 0), "device");
     std::printf("glm_mmq_glu_test: %s (sm_%d%d)\n", prop.name, prop.major, prop.minor);
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) return bench(s);
+    const bool iq_s_only = argc > 1 && std::strcmp(argv[1], "--iq-s-only") == 0;
 
     // Two expert sets: 288 experts of 0-64 rows (Maya-L's count; the plain product's launch then has a block per
     // tile, as at a prompt chunk's size, and both sum every output over K in the same order: BIT FOR BIT), and six
@@ -198,6 +200,7 @@ int main(int argc, char** argv) {
         float* gf = dev<float>((size_t) T * 2 * n_ff);
         std::vector<float> ha((size_t) T * 2 * n_ff), hf((size_t) T * 2 * n_ff);
         for (int type : types) {
+            if (iq_s_only && type != GGML_TYPE_IQ1_S && type != GGML_TYPE_IQ2_S && type != GGML_TYPE_IQ3_S) continue;
             if (!mmq::glu_supported(type, n_ff)) {
                 std::printf("  %-8s no fused product on this device/build - skipped\n", ggml_type_name((ggml_type) type));
                 continue;
@@ -216,6 +219,30 @@ int main(int argc, char** argv) {
                 check(cudaMemsetAsync(ga, 0xff, (size_t) T * 2 * n_ff * 4, s), "memset");
                 check(cudaMemsetAsync(gf, 0xff, (size_t) T * 2 * n_ff * 4, s), "memset");
                 ctx.run(product(c, ga), s);
+                if (std::isinf(limit)) {
+                    // An independent oracle: fused/plain parity alone can approve two equally wrong products.
+                    check(cudaMemcpyAsync(ha.data(), ga, ha.size() * 4, cudaMemcpyDeviceToHost, s), "plain oracle");
+                    check(cudaStreamSynchronize(s), "plain oracle sync");
+                    std::vector<float> decoded((size_t) 2 * n_ff * n_embd);
+                    double error2 = 0, reference2 = 0;
+                    for (int e : {0, n_exp - 1}) {
+                        if (rows[e] == 0) continue;
+                        ggml_get_type_traits((ggml_type) type)->to_float(hw.data() + eb * e, decoded.data(), decoded.size());
+                        for (int r : {hb[e], hb[e + 1] - 1})
+                            for (int j : {0, n_ff - 1, n_ff, 2 * n_ff - 1}) {
+                                double expected = 0;
+                                for (int k = 0; k < n_embd; ++k)
+                                    expected += (double) decoded[(size_t) j * n_embd + k] * hx[(size_t) r * n_embd + k];
+                                const double delta = ha[(size_t) r * 2 * n_ff + j] - expected;
+                                error2 += delta * delta;
+                                reference2 += expected * expected;
+                            }
+                    }
+                    const double relative = std::sqrt(error2 / std::max(1e-30, reference2));
+                    std::printf("  %-8s independent dequantized dot rel L2 %.6g%s\n", ggml_type_name((ggml_type) type),
+                                relative, relative < 0.04 ? "" : " FAIL");
+                    failures += !(relative < 0.04);
+                }
                 gb::swiglu_rows(ga, ga, T, n_ff, limit, s, 2 * n_ff);
                 ctx.run_glu(product(c, gf), limit, s);
                 check(cudaMemcpyAsync(ha.data(), ga, ha.size() * 4, cudaMemcpyDeviceToHost, s), "download");
@@ -226,6 +253,12 @@ int main(int argc, char** argv) {
                 for (int r = 0; r < T; ++r)
                     for (int k = 0; k < n_ff; ++k) {
                         const float a = ha[(size_t) r * 2 * n_ff + k], f = hf[(size_t) r * 2 * n_ff + k];
+                        if (!std::isfinite(a) || !std::isfinite(f)) {
+                            // Non-finite values must fail both exact parity and tolerance-based checks.
+                            ++differ;
+                            ++far;
+                            continue;
+                        }
                         if (std::memcmp(&a, &f, 4) != 0) {
                             ++differ;
                             worst = std::max(worst, std::fabs(a - f));

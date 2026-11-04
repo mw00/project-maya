@@ -241,6 +241,25 @@ void test_cgroup_memory_budget() {
             "missing memory.stat counters did not fail closed");
 }
 
+void test_drive_reads_at_once() {
+    using namespace strata::core::detail;
+    const std::vector<int> counts = {2, 4, 8, 16};
+    // an NVMe: more in flight is faster until ~8; 16 is within 3% of 8, so 8 (the fewest that close to the best)
+    require(pick_reads_at_once(counts, {1690, 1970, 2100, 2110}) == 8, "NVMe-like rates did not pick 8");
+    // a USB disk: flat, so the fewest
+    require(pick_reads_at_once(counts, {41, 42, 41, 41}) == 2, "flat rates did not pick the fewest");
+    require(pick_reads_at_once(counts, {40, 42, 41, 41}) == 4, "a count 5% under the best was kept");
+    require(pick_reads_at_once(counts, {0, 0, 0, 0}) == 0, "no measurement still picked a count");
+    require(pick_reads_at_once(counts, {}) == 0, "no rates still picked a count");
+    const std::string text = "nvme0n1:259:0:1953525168 reads=4 mbps=1/2/3/4 piece=1\n"
+                             "dm-0:253:0:1953525168 reads=8 mbps=1/2/3/4 piece=1\n"
+                             "nvme0n1:259:0:1953525168 reads=16 mbps=1/2/3/4 piece=1\n";
+    require(cached_reads_at_once(text, "nvme0n1:259:0:1953525168") == 16, "the last cache line did not win");
+    require(cached_reads_at_once(text, "dm-0:253:0:1953525168") == 8, "a drive's cache line was not found");
+    require(cached_reads_at_once(text, "dm-0:253:0") == 0, "a key prefix matched another drive's line");
+    require(cached_reads_at_once("", "dm-0:253:0:1") == 0, "an empty cache gave a count");
+}
+
 void test_begin_layer_prefetch() {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
@@ -292,6 +311,7 @@ int main() {
     try {
         test_complement_plan();
         test_cgroup_memory_budget();
+        test_drive_reads_at_once();
         test_canonical_layout();
         test_begin_layer_prefetch();
 #if defined(STRATA_NATIVE_EXPERTS)

@@ -2,6 +2,9 @@
 #include "strata/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
+#if !defined(STRATA_USE_HIP)
+#include <cuda.h>   // (the virtual memory API's types; its functions come through the runtime's entry points)
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -154,6 +157,226 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 
 ExpertCache::~ExpertCache() { close(); }
 
+// ---- The lendable arena (the on-demand vision encoder).  CUDA's virtual memory API through the runtime's driver
+// entry points (no link against the driver library): an address range is reserved once and backed by pieces of
+// physical memory, each mapped and then released (the mapping holds it), so unmapping a piece gives its memory back
+// to the driver, and a new piece mapped at the same address later makes the range whole again.  HIP builds keep
+// the one allocation (lendable() is false; the engine then lends only memory that is already free).
+#if !defined(STRATA_USE_HIP)
+namespace {
+struct Vmm {
+    CUresult (*dev_get)(CUdevice*, int) = nullptr;
+    CUresult (*attr)(int*, CUdevice_attribute, CUdevice) = nullptr;
+    CUresult (*gran)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags) = nullptr;
+    CUresult (*reserve)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long) = nullptr;
+    CUresult (*addr_free)(CUdeviceptr, size_t) = nullptr;
+    CUresult (*create)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*, unsigned long long) = nullptr;
+    CUresult (*release)(CUmemGenericAllocationHandle) = nullptr;
+    CUresult (*map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) = nullptr;
+    CUresult (*unmap)(CUdeviceptr, size_t) = nullptr;
+    CUresult (*access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t) = nullptr;
+    bool ok = false;
+};
+
+template <class F>
+bool driver_entry(const char* name, F& f) {
+    void* p = nullptr;
+    cudaDriverEntryPointQueryResult q{};
+#if CUDART_VERSION >= 12050
+    if (cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q) != cudaSuccess ||
+        q != cudaDriverEntryPointSuccess)
+        p = nullptr;
+#else
+    if (cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q) != cudaSuccess || q != cudaDriverEntryPointSuccess)
+        p = nullptr;
+#endif
+    f = reinterpret_cast<F>(p);
+    return p != nullptr;
+}
+
+const Vmm& vmm() {
+    static const Vmm v = [] {
+        Vmm m;
+        m.ok = driver_entry("cuDeviceGet", m.dev_get) && driver_entry("cuDeviceGetAttribute", m.attr) &&
+               driver_entry("cuMemGetAllocationGranularity", m.gran) && driver_entry("cuMemAddressReserve", m.reserve) &&
+               driver_entry("cuMemAddressFree", m.addr_free) && driver_entry("cuMemCreate", m.create) &&
+               driver_entry("cuMemRelease", m.release) && driver_entry("cuMemMap", m.map) &&
+               driver_entry("cuMemUnmap", m.unmap) && driver_entry("cuMemSetAccess", m.access);
+        cudaGetLastError();   // (a missing entry point leaves no sticky error, but the last-error slot is cleared)
+        return m;
+    }();
+    return v;
+}
+
+// this device and every GPU that can reach it (a layer split's peers keep the access a cudaMalloc gave them)
+std::vector<CUmemAccessDesc> access_list(int dev) {
+    std::vector<CUmemAccessDesc> d;
+    int n = 0;
+    cudaGetDeviceCount(&n);
+    for (int i = 0; i < n; ++i) {
+        int can = i == dev ? 1 : 0;
+        if (i != dev && cudaDeviceCanAccessPeer(&can, i, dev) != cudaSuccess) can = 0;
+        if (!can) continue;
+        CUdevice cd = 0;
+        if (vmm().dev_get(&cd, i) != CUDA_SUCCESS) continue;
+        CUmemAccessDesc a{};
+        a.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        a.location.id = cd;
+        a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        d.push_back(a);
+    }
+    cudaGetLastError();
+    return d;
+}
+}  // namespace
+
+bool LendableArena::map_piece(Piece& p, std::string& err) {
+    const Vmm& v = vmm();
+    CUdevice cd = 0;
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    if (v.dev_get(&cd, dev_) != CUDA_SUCCESS) { err = "cuDeviceGet failed"; return false; }
+    prop.location.id = cd;
+    CUmemGenericAllocationHandle h{};
+    if (CUresult r = v.create(&h, (size_t) p.size, &prop, 0); r != CUDA_SUCCESS) {
+        err = r == CUDA_ERROR_OUT_OF_MEMORY ? "the memory is not free yet" : "cuMemCreate failed (" + std::to_string((int) r) + ")";
+        return false;
+    }
+    const CUdeviceptr at = (CUdeviceptr) (uintptr_t) base_ + (CUdeviceptr) p.off;
+    if (v.map(at, (size_t) p.size, 0, h, 0) != CUDA_SUCCESS) {
+        v.release(h);
+        err = "cuMemMap failed";
+        return false;
+    }
+    v.release(h);   // the mapping keeps the memory; unmapping it gives the memory back
+    const std::vector<CUmemAccessDesc> acc = access_list(dev_);
+    if (acc.empty() || v.access(at, (size_t) p.size, acc.data(), acc.size()) != CUDA_SUCCESS) {
+        v.unmap(at, (size_t) p.size);
+        err = "cuMemSetAccess failed";
+        return false;
+    }
+    p.mapped = true;
+    return true;
+}
+
+bool LendableArena::open(uint64_t bytes, std::string& err) {
+    close();
+    const Vmm& v = vmm();
+    if (!v.ok) { err = "the driver has no virtual memory API"; return false; }
+    cudaGetDevice(&dev_);
+    CUdevice cd = 0;
+    int vm = 0;
+    if (v.dev_get(&cd, dev_) != CUDA_SUCCESS ||
+        v.attr(&vm, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cd) != CUDA_SUCCESS || vm == 0) {
+        err = "virtual memory management is not supported";
+        return false;
+    }
+    CUmemAllocationProp prop{};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = cd;
+    size_t gran = 0;
+    if (v.gran(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || gran == 0) {
+        err = "no allocation granularity";
+        return false;
+    }
+    // pieces of 64 MiB (whole granules): what a lend gives back is at most one piece more than it needs
+    const uint64_t g = (uint64_t) gran, piece = (((uint64_t) 64 << 20) + g - 1) / g * g;
+    const uint64_t total = (bytes + g - 1) / g * g;
+    CUdeviceptr va = 0;
+    if (v.reserve(&va, (size_t) total, 0, 0, 0) != CUDA_SUCCESS) {
+        err = "the address range could not be reserved";
+        return false;
+    }
+    base_ = (uint8_t*) (uintptr_t) va;
+    va_bytes_ = total;
+    for (uint64_t off = 0; off < total; off += piece) pieces_.push_back({off, std::min(piece, total - off), false});
+    for (Piece& p : pieces_) {
+        if (!map_piece(p, err)) {
+            close();
+            return false;
+        }
+    }
+    lent_from_ = UINT64_MAX;
+    return true;
+}
+
+void LendableArena::close() {
+    const Vmm& v = vmm();
+    if (base_ != nullptr) {
+        cudaDeviceSynchronize();
+        for (const Piece& p : pieces_)
+            if (p.mapped) v.unmap((CUdeviceptr) (uintptr_t) base_ + (CUdeviceptr) p.off, (size_t) p.size);
+        v.addr_free((CUdeviceptr) (uintptr_t) base_, (size_t) va_bytes_);
+    }
+    base_ = nullptr;
+    pieces_.clear();
+    va_bytes_ = 0;
+    lent_from_ = UINT64_MAX;
+}
+
+bool LendableArena::lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given,
+                              std::string& err) {
+    from = lent_from_;
+    given = 0;
+    if (pieces_.empty()) { err = "one allocation here: it cannot give memory back"; return false; }
+    if (cudaDeviceSynchronize() != cudaSuccess) { err = "the GPU reported an error before lending"; return false; }
+    const Vmm& v = vmm();
+    for (size_t i = pieces_.size(); i-- > 0 && given < bytes;) {
+        Piece& p = pieces_[i];
+        if (p.off < keep_bytes) break;
+        if (!p.mapped) { given += p.size; continue; }   // (lent already)
+        if (v.unmap((CUdeviceptr) (uintptr_t) base_ + (CUdeviceptr) p.off, (size_t) p.size) != CUDA_SUCCESS) {
+            err = "cuMemUnmap failed";
+            break;
+        }
+        p.mapped = false;
+        given += p.size;
+        lent_from_ = std::min(lent_from_, p.off);
+    }
+    from = lent_from_;
+    if (given == 0) {
+        if (err.empty()) err = "nothing to lend past the first " + std::to_string(keep_bytes >> 20) + " MiB";
+        return false;
+    }
+    return true;
+}
+
+bool LendableArena::reclaim_tail(std::string& err) {
+    if (lent_from_ == UINT64_MAX) return true;
+    for (Piece& p : pieces_)
+        if (!p.mapped && !map_piece(p, err)) return false;
+    lent_from_ = UINT64_MAX;
+    return true;
+}
+
+uint64_t LendableArena::lendable_bytes(uint64_t keep_bytes) const {
+    uint64_t b = 0;
+    for (const Piece& p : pieces_)
+        if (p.off >= keep_bytes) b += p.size;
+    return b;
+}
+#else
+bool LendableArena::open(uint64_t, std::string& err) { err = "a HIP build"; return false; }
+void LendableArena::close() {}
+bool LendableArena::map_piece(Piece&, std::string& err) { err = "a HIP build"; return false; }
+bool LendableArena::lend_tail(uint64_t, uint64_t, uint64_t& from, uint64_t& given, std::string& err) {
+    from = UINT64_MAX;
+    given = 0;
+    err = "one allocation here: it cannot give memory back";
+    return false;
+}
+bool LendableArena::reclaim_tail(std::string&) { return true; }
+uint64_t LendableArena::lendable_bytes(uint64_t) const { return 0; }
+#endif
+
+bool ExpertCache::lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err) {
+    const bool ok = arena_.lend_tail(bytes, keep_bytes, from, given, err);
+    if (!ok && !arena_.ok()) err = "the expert cache is " + err;
+    return ok;
+}
+
 #if defined(STRATA_USE_HIP)
 bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
     if (bytes <= blocking_staging_bytes_) return true;
@@ -205,7 +428,13 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-    if (cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
+    // lendable (the on-demand vision encoder): mapped in pieces, else (no virtual memory API) the one cudaMalloc
+    if (want_lend_) {
+        if (arena_.open(want, vmm_err_)) base_ = arena_.data();
+        else std::fprintf(stderr, "maya: the expert cache cannot be mapped in pieces on this GPU (%s) - only VRAM "
+                                  "that is free can go to the vision encoder\n", vmm_err_.c_str());
+    }
+    if (base_ == nullptr && cudaMalloc((void**) &base_, (size_t) want) != cudaSuccess) {
         base_ = nullptr;
         char buf[256];
         std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc(%.2f GiB) failed: %s",
@@ -278,7 +507,10 @@ void ExpertCache::close() {
     blocking_staging_bytes_ = 0;
 #endif
     off_.clear();
-    if (base_ != nullptr) {
+    if (base_ != nullptr && arena_.ok()) {
+        arena_.close();
+        base_ = nullptr;
+    } else if (base_ != nullptr) {
         cudaFree(base_);
         base_ = nullptr;
     }

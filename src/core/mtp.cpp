@@ -107,7 +107,8 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
     if (cs_) cudaStreamDestroy(cs_);
     if (dense_) cudaFree(dense_);
-    if (experts_) cudaFree(experts_);
+    if (experts_ && !experts_arena_.ok()) cudaFree(experts_);
+    experts_arena_.close();
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
@@ -128,6 +129,45 @@ const uint16_t* MtpDrafter::bf16(const char* name) const {
 const void* MtpDrafter::q8(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "q8_0") return dense_ + t.off;
     return nullptr;
+}
+
+bool MtpDrafter::lend_experts(uint64_t bytes, uint64_t& given, std::string& err) {
+    given = 0;
+    if (!experts_arena_.ok()) { err = "the draft layer's experts are one allocation here"; return false; }
+    const OnDevice on_device(device_);
+    if (cs_) cudaStreamSynchronize(cs_);
+    uint64_t from = 0;
+    return experts_arena_.lend_tail(bytes, 0, from, given, err);
+}
+
+bool MtpDrafter::reclaim_experts(std::string& err) {
+    if (!experts_arena_.lent()) return true;
+    const OnDevice on_device(device_);
+    const uint64_t from = experts_arena_.lent_from();
+    if (!experts_arena_.reclaim_tail(err)) return false;
+    // the lent part's bytes are gone: read again from the file they came from (the same bytes as at load)
+    FILE* f = std::fopen((rt_dir_ + "/experts.bin").c_str(), "rb");
+    bool ok = f != nullptr;
+    if (ok && from < experts_bytes_) {
+#if defined(_WIN32)
+        ok = _fseeki64(f, (long long) from, SEEK_SET) == 0;
+#else
+        ok = fseeko(f, (off_t) from, SEEK_SET) == 0;
+#endif
+        std::vector<uint8_t> chunk(64u << 20);
+        for (uint64_t off = from; ok && off < experts_bytes_;) {
+            const uint64_t n = std::min<uint64_t>(chunk.size(), experts_bytes_ - off);
+            ok = std::fread(chunk.data(), 1, (size_t) n, f) == (size_t) n &&
+                 cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice) == cudaSuccess;
+            off += n;
+        }
+    }
+    if (f != nullptr) std::fclose(f);
+    if (!ok) {
+        err = "the draft layer's experts could not be read again from " + rt_dir_ + "/experts.bin";
+        return false;
+    }
+    return true;
 }
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
@@ -179,7 +219,18 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        // lendable (an on-demand vision encoder): mapped in pieces, else (no virtual memory API) one cudaMalloc
+        std::string lerr;
+        if (want_lend_ && experts_arena_.open(bytes, lerr)) experts_ = experts_arena_.data();
+        else if (want_lend_)
+            std::fprintf(stderr, "maya mtp: the draft layer's experts cannot be mapped in pieces on this GPU (%s)\n",
+                         lerr.c_str());
+        if (experts_ == nullptr && cudaMalloc((void**) &experts_, bytes) != cudaSuccess) {
+            experts_ = nullptr;
+            err = "mtp: the 512 experts do not fit in VRAM";
+            return false;
+        }
+        experts_bytes_ = bytes;
         std::vector<uint8_t> chunk(64u << 20);
         for (uint64_t off = 0; off < bytes;) {
             const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);

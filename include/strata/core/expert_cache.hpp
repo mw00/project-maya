@@ -74,6 +74,46 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
 
+/// Device memory that can be given back to the driver while another process (the on-demand vision encoder) needs
+/// it, and taken back later at the SAME addresses: an address range reserved once and backed by 64 MiB pieces of
+/// physical memory through CUDA's virtual memory API (the runtime's driver entry points).  Unmapping a piece gives
+/// its memory back; mapping a new piece there makes the range whole again (its bytes must be written again), so
+/// every pointer into it and every captured graph stays valid.  HIP builds, and devices without that API: `open`
+/// fails and the caller keeps its plain allocation.
+class LendableArena {
+public:
+    LendableArena() = default;
+    ~LendableArena() { close(); }
+    LendableArena(const LendableArena&) = delete;
+    LendableArena& operator=(const LendableArena&) = delete;
+
+    /// Reserves and maps `bytes` (rounded up to the granularity) on the current device; false with `err`.
+    bool open(uint64_t bytes, std::string& err);
+    void close();
+    uint8_t* data() const { return base_; }
+    bool ok() const { return !pieces_.empty(); }
+    /// Unmaps whole pieces from the end until at least `bytes` are given back (never the first `keep_bytes`);
+    /// `from` = the offset where the unmapped part starts (bytes past it are lost), `given` = the bytes given back.
+    /// False with `err` when nothing could be given back.
+    bool lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err);
+    /// Maps the unmapped pieces again (false while the driver has not got that memory free yet; the pieces mapped
+    /// so far stay mapped, a later call maps the rest).  True when nothing is lent.
+    bool reclaim_tail(std::string& err);
+    /// Bytes `lend_tail` could give back at most, keeping the first `keep_bytes` (0 when not `ok`).
+    uint64_t lendable_bytes(uint64_t keep_bytes) const;
+    bool lent() const { return lent_from_ != UINT64_MAX; }
+    uint64_t lent_from() const { return lent_from_; }
+
+private:
+    struct Piece { uint64_t off, size; bool mapped; };
+    bool map_piece(Piece& p, std::string& err);
+    uint8_t* base_ = nullptr;
+    std::vector<Piece> pieces_;
+    uint64_t va_bytes_ = 0;
+    uint64_t lent_from_ = UINT64_MAX;
+    int dev_ = 0;
+};
+
 class ExpertCache {
 public:
     ExpertCache() = default;
@@ -159,7 +199,28 @@ public:
     /// Slots filled so far, for the startup report.
     int64_t fills() const { return fills_; }
 
+    /// The on-demand vision encoder (serve VLEND / VRECLAIM): with `set_lendable(true)` before `open`, the arena is
+    /// mapped in pieces through CUDA's virtual memory API instead of one cudaMalloc, so pieces at its end can be
+    /// given back to the driver - another process (the encoder) can then allocate that memory - and mapped again
+    /// later at the SAME addresses (every pointer, table and captured graph stays valid; the slots there must be
+    /// filled again).  A device or build without that API gets the plain allocation: `lendable()` is false.
+    void set_lendable(bool on) { want_lend_ = on; }
+    bool lendable() const { return arena_.ok(); }
+    /// Unmaps whole pieces from the end until at least `bytes` are given back (never the first `keep_bytes`);
+    /// `from` = the arena offset where the unmapped part starts (a slot ending past it has lost its contents),
+    /// `given` = the bytes given back.  False with `err` when nothing can be given back.
+    bool lend_tail(uint64_t bytes, uint64_t keep_bytes, uint64_t& from, uint64_t& given, std::string& err);
+    /// Maps the unmapped pieces again (false while the driver has not got that memory free yet; the pieces mapped
+    /// so far stay mapped, a later call maps the rest).  True when nothing is lent.
+    bool reclaim_tail(std::string& err) { return arena_.reclaim_tail(err); }
+    /// Bytes `lend_tail` could give back at most, keeping the first `keep_bytes` (0 without lending).
+    uint64_t lendable_bytes(uint64_t keep_bytes) const { return arena_.lendable_bytes(keep_bytes); }
+    bool lent() const { return arena_.lent(); }
+
 private:
+    std::string vmm_err_;
+    bool want_lend_ = false;
+    LendableArena arena_;                 ///< the slots' memory when it is lendable (not ok: one cudaMalloc)
 #if defined(STRATA_USE_HIP)
     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
     uint8_t* blocking_staging_ = nullptr;

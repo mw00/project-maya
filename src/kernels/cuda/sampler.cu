@@ -175,8 +175,11 @@ __global__ void sampler_greedy_kernel(const float* __restrict__ logits, int n_vo
 // the draft draft[t] with probability min(1, p/q), else a draw from max(0, p - q)).  The selection is shared.
 constexpr uint64_t kSpecDraftKey = 0x5bd1e9955bd1e995ull, kSpecAcceptKey = 0x9e3779b97f4a7c15ull,
                    kSpecResidKey = 0xc2b2ae3d27d4eb4full;
+// one block of 1024 threads per row (the launches below): the bound keeps every mode at 64 registers a thread, so a
+// block fits the 64K-register file - unbounded, sm_75 (Turing) compiled the draft mode to 68 and its launch failed
+// ("too many resources requested for launch") wherever the NextN block sat on a Turing card
 template <int MODE>
-__global__ void sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
+__global__ void __launch_bounds__(1024) sampler_kernel(const float* __restrict__ logits, int n_vocab, int n_tokens,
                                const int* __restrict__ history, int history_len, const SamplerParams p,
                                int* __restrict__ out, SpecList* __restrict__ ql, const int* __restrict__ draft) {
     const int t = blockIdx.x;
@@ -537,8 +540,9 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
 }
 
 namespace {
-void spec_check(const char* who, int n_tokens, int n_vocab, const SamplerParams& p) {
-    if (p.greedy || p.temperature <= 0.0f || p.penalty_last_n > 0 || n_vocab <= 0) {
+// (the draft's chain has no history: penalties only where the caller hands rows over - sample_verify)
+void spec_check(const char* who, int n_tokens, int n_vocab, const SamplerParams& p, bool history = false) {
+    if (p.greedy || p.temperature <= 0.0f || (p.penalty_last_n > 0 && !history) || n_vocab <= 0) {
         std::fprintf(stderr, "%s: a sampled request without penalties only (greedy %d, temperature %g, penalty_last_n "
                              "%d, n_vocab %d)\n", who, (int) p.greedy, p.temperature, p.penalty_last_n, n_vocab);
         std::exit(1);
@@ -565,11 +569,14 @@ void sample_draft(const float* logits, int n_tokens, int n_vocab, const SamplerP
 }
 
 void sample_verify(const float* logits, int n_tokens, int n_vocab, const SamplerParams& p, const SpecList* q,
-                   const int* draft, int* out, void* stream) {
+                   const int* draft, int* out, void* stream, const int* history, int history_len) {
     if (n_tokens <= 0) return;
-    spec_check("sample_verify", n_tokens, n_vocab, p);
-    sampler_kernel<2><<<(unsigned) n_tokens, 1024, 0, (cudaStream_t) stream>>>(logits, n_vocab, n_tokens, nullptr, 0,
-                                                                                p, out, const_cast<SpecList*>(q), draft);
+    const bool pen = p.penalty_last_n > 0 && history != nullptr && history_len > 0;
+    spec_check("sample_verify", n_tokens, n_vocab, p, pen);
+    const unsigned shmem = pen ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned) : 0;   // the penalty bitmap
+    sampler_kernel<2><<<(unsigned) n_tokens, 1024, shmem, (cudaStream_t) stream>>>(
+        logits, n_vocab, n_tokens, pen ? history : nullptr, pen ? history_len : 0, p, out, const_cast<SpecList*>(q),
+        draft);
     spec_launched("sample_verify", stream);
 }
 

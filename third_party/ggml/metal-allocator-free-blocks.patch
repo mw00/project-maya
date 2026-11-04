@@ -1,0 +1,13 @@
+--- a/src/ggml-alloc.c
++++ b/src/ggml-alloc.c
+@@ -11,7 +11,9 @@
+ #include <string.h>
+ 
+ #define MAX(a, b) ((a) > (b) ? (a) : (b))
+-#define MAX_FREE_BLOCKS 256
++// Larger free-list for fragmented Metal prefill graphs (>90K context).
++// 4096 entries cost at most 1 MiB across the allocator's 16 chunks.
++#define MAX_FREE_BLOCKS 4096
+ 
+ //#define GGML_ALLOCATOR_DEBUG
+ 

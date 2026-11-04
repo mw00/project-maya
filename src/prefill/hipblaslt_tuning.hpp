@@ -120,4 +120,35 @@ private:
     std::vector<TuningRow> rows_;
 };
 
+// The tuning-table list (STRATA_HIPBLASLT_TUNING): paths joined by the OS's path-list separator, ':' on Linux and
+// ';' on Windows (maya.py joins them with os.pathsep). On Windows a ':' still separates too, for configs written
+// before the switch, except the one of a drive prefix ("C:\..." or "C:/..."), which belongs to the path.
+// Empty entries are skipped.
+inline std::vector<std::string> split_table_list(const std::string& list, bool windows) {
+    std::vector<std::string> out;
+    std::string one;
+    for (size_t i = 0; i < list.size(); ++i) {
+        const char c = list[i];
+        const bool drive = windows && c == ':' && one.size() == 1 &&
+                           ((one[0] >= 'A' && one[0] <= 'Z') || (one[0] >= 'a' && one[0] <= 'z')) &&
+                           i + 1 < list.size() && (list[i + 1] == '\\' || list[i + 1] == '/');
+        if ((c == ':' && !drive) || (windows && c == ';')) {
+            if (!one.empty()) out.push_back(one);
+            one.clear();
+        } else {
+            one += c;
+        }
+    }
+    if (!one.empty()) out.push_back(one);
+    return out;
+}
+
+inline std::vector<std::string> split_table_list(const std::string& list) {
+#if defined(_WIN32)
+    return split_table_list(list, true);
+#else
+    return split_table_list(list, false);
+#endif
+}
+
 }  // namespace strata::prefill::hipblaslt

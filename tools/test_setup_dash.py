@@ -17,6 +17,7 @@ import setup as S  # noqa: E402
 from setup_bridge import Bridge  # noqa: E402
 try:
     from rich.console import Console
+    from rich.text import Text
     import setup_dash as D
     import setup_tui as T
 except ImportError:
@@ -120,6 +121,16 @@ class Boxes(unittest.TestCase):
         self.assertIn("28.0 / 32 GB", text(D.gpus(m)))
         self.assertIn("383", text(D.requests(m, 116)))          # 1,533 tokens read in 4 s
 
+    def test_a_boxes_shape_is_what_decides_its_layout(self):   # (put: laid out again only when it changes)
+        a, b = D.speed(METRICS, 50), D.speed(dict(METRICS, live=dict(METRICS["live"], tok_s=31.0)), 50)
+        self.assertEqual(D.shape(a), D.shape(b))                # a new reading of the same box: the same shape
+        self.assertIsNotNone(D.shape(a))
+        self.assertIsNotNone(D.shape(D.gpus(METRICS)))
+        self.assertNotEqual(D.shape(D.gpus(METRICS)), D.shape(D.gpus(dict(METRICS, hardware=dict(METRICS["hardware"], gpus=[GPU])))))
+        self.assertEqual(D.shape(Text("a\nb")), 1)
+        self.assertIsNone(D.shape("not a renderable we know"))
+
+
     def test_the_engines_facts_come_as_text(self):           # (its INFO line: "ram_gb": "107.8", as the server sends)
         m = dict(METRICS, engine=dict(METRICS["engine"], ram_gb="107.8", vram_gb="12.3"))
         self.assertIn("107.8 GB pinned", text(D.hardware(m, 116)))
@@ -159,6 +170,63 @@ class Screen(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause(0.1)
                     self.assertIsNone(app.view)
                     self.assertTrue(dash.display)
+                    await pilot.press("ctrl+c", "ctrl+c")
+                bridge.finish(10)
+            finally:
+                S.UI = None
+                bridge.log.close()
+
+
+@unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")
+class IdleScreen(unittest.IsolatedAsyncioTestCase):
+    """Issue #685: a screen with Maya ready and no request does as little as it shows - the card's clock once a second
+    (not the spinner's eight), the setup's events looked for less often, and a new reading of the dashboard's boxes
+    drawn without laying the whole screen out again."""
+
+    async def test_ready_and_quiet_slows_the_timers_and_lays_out_rarely(self):
+        server = "import time\nprint('ready: http://127.0.0.1:9/v1')\ntime.sleep(60)"
+        info = {"model": "glm-5.3-flash", "quant": "Maya-L", "context": "32768", "dashboard": "http://127.0.0.1:9/",
+                "api": "http://127.0.0.1:9/v1", "log": None, "key": ""}
+        with tempfile.TemporaryDirectory() as d:
+            bridge = Bridge(Path(d) / "setup.log")
+            S.UI = bridge
+            app = T.SetupApp(bridge, lambda: S.UI.serve([sys.executable, "-c", server], dict(os.environ, PYTHONUNBUFFERED="1"),
+                                                        info), "1.0", "./maya.sh", Path(d) / "setup.log")
+            try:
+                async with app.run_test(size=(120, 40)) as pilot:
+                    t0 = time.time()
+                    while app.state[T.SERVE] != "ready":
+                        self.assertLess(time.time() - t0, 20, "the stand-in server did not get ready")
+                        await pilot.pause(0.05)
+                    self.assertFalse(app.animating())
+                    await pilot.pause(1.6)
+                    self.assertEqual(app.tick_every, T.IDLE_TICK_S)             # the clock: once a second
+                    self.assertEqual(app.drain_every, T.IDLE_DRAIN_S)           # nothing comes in: four looks a second
+                    # a model loading again moves the spinner: the timer is quick at once
+                    app.serving["state"] = "Reloading the model"
+                    self.assertTrue(app.animating())
+                    app.set_tick(T.TICK_S)
+                    self.assertEqual(app.tick_every, T.TICK_S)
+                    app.serving["state"] = "ready"
+                    # the dashboard's boxes: the same shape is only drawn, a new one (or every tenth reading) laid out
+                    dash = app.query_one(T.Dashboard)
+                    seen = []
+                    real = T.Dashboard.put.__globals__["Static"].update
+                    def spy(widget, content="", *, layout=True):
+                        seen.append((widget.id, layout))
+                        return real(widget, content, layout=layout)
+                    with patch.object(T.Dashboard.put.__globals__["Static"], "update", spy):
+                        dash.puts.clear()
+                        dash.shapes.clear()
+                        for _ in range(12):
+                            dash.put("#dash-gpus", D.gpus(METRICS))
+                        one = [lay for i, lay in seen if i == "dash-gpus"]
+                        self.assertEqual(one[0], True)                          # the first: no shape known yet
+                        self.assertEqual(one[1:9], [False] * 8)                 # the same shape: drawn only
+                        self.assertEqual(one[9], True)                          # every tenth: laid out all the same
+                        seen.clear()
+                        dash.put("#dash-gpus", D.gpus(dict(METRICS, hardware=dict(METRICS["hardware"], gpus=[GPU]))))
+                        self.assertEqual([lay for i, lay in seen], [True])      # fewer cards: a new shape
                     await pilot.press("ctrl+c", "ctrl+c")
                 bridge.finish(10)
             finally:
@@ -220,12 +288,12 @@ class Loading(unittest.TestCase):
 
 @unittest.skipIf(T is None, "Textual is not installed (./maya.sh --setup installs it)")
 class Start(unittest.IsolatedAsyncioTestCase):
-    """./maya.sh on an installed Maya: the real engine (server.py --engine strata) on the screen - its dashboard and
+    """./maya.sh on an installed Maya: the real engine (server.py --engine maya) on the screen - its dashboard and
     log, without the setup's steps or its log; --plain (or no terminal): in the terminal as before."""
 
     async def test_a_start_runs_the_engine_on_the_screen(self):
         got, served = {}, []
-        cmd = [sys.executable, "serve/server.py", "--engine", "strata", "--config", "maya-test.json"]
+        cmd = [sys.executable, "serve/server.py", "--engine", "maya", "--config", "maya-test.json"]
         ui = SimpleNamespace(serve=lambda c, env, info: served.append((c, info)) or 0)
 
         def run(body, version, log_path, me, steps=True):
@@ -233,7 +301,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
             return body()
         with patch.object(maya, "setup_screen", return_value=True), patch("setup_tui.run", side_effect=run), \
                 patch.object(maya, "server_command", return_value=(cmd, {}, {"dashboard": "http://127.0.0.1:9/"})), \
-                patch.object(maya.S, "UI", ui), patch.object(maya.subprocess, "call") as plain:
+                patch.object(maya.S, "UI", ui), patch.object(maya, "run_server") as plain:
             self.assertEqual(maya.start(Path("maya-test.json"), SimpleNamespace(plain=False, yes=True)), 0)
         self.assertEqual(served[0][0], cmd)
         self.assertEqual(got, {"log": None, "steps": False})   # (the setup's log stays the setup's)
@@ -242,7 +310,7 @@ class Start(unittest.IsolatedAsyncioTestCase):
     def test_plain_starts_in_the_terminal(self):
         with patch.object(maya, "setup_screen", return_value=False), \
                 patch.object(maya, "server_command", return_value=(["server"], {}, {})), \
-                patch.object(maya.subprocess, "call", return_value=0) as plain, patch("setup_tui.run") as screen:
+                patch.object(maya, "run_server", return_value=0) as plain, patch("setup_tui.run") as screen:
             self.assertEqual(maya.start(Path("maya-test.json"), SimpleNamespace(plain=True, yes=False)), 0)
         plain.assert_called_once()
         screen.assert_not_called()

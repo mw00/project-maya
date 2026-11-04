@@ -211,7 +211,11 @@ __global__ void doorbell_ring_kernel(uint32_t* seq) {
 
 __global__ void doorbell_wait_kernel(const volatile uint32_t* flag, const volatile uint32_t* seq) {
     const uint32_t want = *seq;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    while (*flag != want) {}   // Pascal (sm_6x) has no __nanosleep: a plain spin
+#else
     while (*flag != want) __nanosleep(100);
+#endif
     __threadfence_system();
 }
 

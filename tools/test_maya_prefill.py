@@ -40,7 +40,7 @@ class PrefillConfigTests(unittest.TestCase):
                           ["token_embd.weight"] + [f"blk.{i}.ffn_norm.weight" for i in range(250)])
         for ctx in (
             patch.object(maya, "ROOT", self.root),
-            patch.object(maya, "EXE", self.root / "build/strata"),
+            patch.object(maya, "EXE", self.root / "build/maya"),
             patch.object(maya, "CAL_STORE", self.root / "calibration.json"),
             patch.object(maya, "WIN", False),
             patch.object(maya, "say"),
@@ -58,16 +58,16 @@ class PrefillConfigTests(unittest.TestCase):
         pc = {"gpus": [{"index": i, "name": "GPU", "vram_gb": 24} for i in gpus]}
         p = maya.write_config(self.a, pc, {}, self.model / "pack", "test", ctx, self.root / "models", None,
                               ("local", self.first))
-        return p, json.loads(p.read_text())["args"]
+        return p, maya.read_json(p)["args"]
 
     def test_tuned_settings_follow_a_new_context(self):
         # #57: tuned at 32K, a setup for 128K wrote the engine's own settings (half the speed there)
         p, _ = self.write([0])
-        store = {maya.hardware_key(json.loads(p.read_text())): {"settings": {"STRATA_GLM_PCIE_SHARE": "0.25"},
+        store = {maya.hardware_key(maya.read_json(p)): {"settings": {"STRATA_GLM_PCIE_SHARE": "0.25"},
                                                                   "date": "2026-10-09"}}
         maya.CAL_STORE.write_text(json.dumps(store))
         p, _ = self.write([0], 131072)
-        c = json.loads(p.read_text())
+        c = maya.read_json(p)
         self.assertEqual(c["env"]["STRATA_GLM_PCIE_SHARE"], "0.25")
         self.assertIsNone(maya.saved_calibration(c))                        # this context is not tuned itself
         self.assertEqual(maya.saved_calibration(c, any_context=True)["context"], 32768)
@@ -82,13 +82,53 @@ class PrefillConfigTests(unittest.TestCase):
         self.assertIsNone(maya.saved_calibration(dict(c, installer=dict(c["installer"], quant="other")),
                                                  any_context=True))
 
+    def test_tuning_measured_again_after_a_driver_or_p2p_change(self):
+        # #419: STRATA_GLM_PCIE_SHARE tuned before a P2P driver was installed halved the decode, nothing said why
+        topo = (" \t\x1b[4mGPU0\tGPU1\t\x1b[0m\n GPU0\tX\t{s}\t\n GPU1\t{s}\tX\t\n\nLegend:\n  X    = Self\n  OK   = Status Ok\n")
+        state = {"drv": "595.58", "p2p": "NS"}
+
+        def gpus():
+            return [{"index": i, "name": "RTX 3090", "vram_gb": 24, "driver": state["drv"], "pci": f"0000:0{i}:00.0"}
+                    for i in (0, 1)]
+
+        def out(cmd):
+            return topo.format(s=state["p2p"]) if cmd[1:3] == ["topo", "-p2p"] else ""
+        with patch.object(maya.S, "gpus", side_effect=gpus), patch.object(maya.S, "out", side_effect=out):
+            cfg = {"gpu": [0, 1], "args": ["--max-context", "32768"], "installer": {"quant": "Maya-S"},
+                   "env": {"STRATA_GLM_PCIE_SHARE": "0.25", "STRATA_GLM_CPU_LANE": "12", "STRATA_GLM_FOO": "1"}}
+            self.assertEqual(maya.gpu_env(cfg)["p2p"], {"0-1": "NS"})
+            # an older config: this PC's state is recorded, nothing changes
+            self.assertEqual(maya.stale_tuning(cfg), "")
+            self.assertEqual(cfg["installer"]["tuned_on"]["driver"], "595.58")
+            self.assertIsNone(maya.stale_tuning(cfg))
+            # the store's record: valid while nothing changed
+            store = {maya.hardware_key(cfg): {"settings": {"STRATA_GLM_PCIE_SHARE": "0.25"},
+                                              "gpu_env": maya.gpu_env(cfg)}}
+            maya.CAL_STORE.write_text(json.dumps(store))
+            self.assertIsNotNone(maya.saved_calibration(cfg))
+            # the P2P driver: P2P on, a new version - the tuned settings go, the others stay; a setup offers it again
+            state.update(drv="615.71", p2p="OK")
+            msg = maya.stale_tuning(cfg)
+            self.assertIn("driver 595.58 -> 615.71", msg)
+            self.assertIn("P2P 0-1:NS -> 0-1:OK", msg)
+            self.assertEqual(cfg["env"], {"STRATA_GLM_FOO": "1"})
+            self.assertNotIn("tuned_on", cfg["installer"])
+            self.assertIsNone(maya.saved_calibration(cfg))
+            self.assertIsNone(maya.saved_calibration(cfg, any_context=True))
+            # nvidia-smi silent once (no P2P answer): no change seen
+            cfg["env"] = {"STRATA_GLM_PCIE_SHARE": "0.3"}
+            cfg["installer"]["tuned_on"] = maya.gpu_env(cfg)
+            state["p2p"] = ""
+            self.assertIsNone(maya.stale_tuning(cfg))
+            self.assertEqual(cfg["env"], {"STRATA_GLM_PCIE_SHARE": "0.3"})
+
     def test_prefill_auto_is_written_and_an_edit_kept(self):
         for gpus in ([0], [0, 1]):
             p, args = self.write(gpus)
             self.assertEqual(args[args.index("--prefill") + 1], "auto")
             p.unlink()
         p, args = self.write([0])
-        c = json.loads(p.read_text())
+        c = maya.read_json(p)
         c["args"][c["args"].index("--prefill") + 1] = "32768"  # a bigger chunk, set by hand
         p.write_text(json.dumps(c))
         _, again = self.write([0])
@@ -110,20 +150,48 @@ class PrefillConfigTests(unittest.TestCase):
         self.assertEqual(args[args.index("--parallel") + 1], "2")
         self.assertEqual(args.count("--parallel"), 1)
 
+    def test_expert_cache_auto_and_the_vram_reserve(self):
+        # "--expert-cache", "auto" in every config; a number set by hand (and a reserve) kept by a setup again
+        for gpus in ([0], [0, 1]):
+            p, args = self.write(gpus)
+            self.assertEqual(args[args.index("--expert-cache") + 1], "auto")
+            self.assertNotIn("--vram-reserve-mib", args)      # the engine's default unless asked for
+            p.unlink()
+        p, _ = self.write([0])
+        c = maya.read_json(p)
+        c["args"][c["args"].index("--expert-cache") + 1] = "1200"
+        c["args"] += ["--vram-reserve-later-mib", "300"]
+        p.write_text(json.dumps(c))
+        _, again = self.write([0])
+        self.assertEqual(again[again.index("--expert-cache") + 1], "1200")
+        self.assertEqual(again[again.index("--vram-reserve-later-mib") + 1], "300")
+        self.assertEqual(again.count("--expert-cache"), 1)
+        # --vram-reserve-mib N at setup: written, kept by a later setup, a new value wins
+        self.a.vram_reserve_mib = 1500
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--vram-reserve-mib") + 1], "1500")
+        self.a.vram_reserve_mib = None
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--vram-reserve-mib") + 1], "1500")
+        self.a.vram_reserve_mib = 0
+        _, args = self.write([0])
+        self.assertEqual(args[args.index("--vram-reserve-mib") + 1], "0")
+        self.assertEqual(args.count("--vram-reserve-mib"), 1)
+
     def test_dflash2_drafter_in_the_config(self):
         # a DFlash2 setup: --dflash with the drafter's file, the answer kept for the next setup, its own tuning key
         pc = {"gpus": [{"index": i, "name": "GPU", "vram_gb": 24} for i in (0, 1)]}
         drafter = self.root / "models" / "GLM-5.3-Flash-DFlash2" / maya.DFLASH["file"]
         p = maya.write_config(self.a, pc, {}, self.model / "pack", "test", 32768, self.root / "models", None,
                               ("local", self.first), drafter)
-        c = json.loads(p.read_text())
+        c = maya.read_json(p)
         self.assertEqual(c["args"][c["args"].index("--dflash") + 1], str(drafter))
         self.assertEqual(c["installer"]["draft"], "dflash2")
         key = maya.hardware_key(c)
         # the MTP block (the default): no --dflash, not even one kept from the config before
         p = maya.write_config(self.a, pc, {}, self.model / "pack", "test", 32768, self.root / "models", None,
                               ("local", self.first))
-        c = json.loads(p.read_text())
+        c = maya.read_json(p)
         self.assertNotIn("--dflash", c["args"])
         self.assertEqual(c["installer"]["draft"], "mtp")
         self.assertNotEqual(maya.hardware_key(c), key)
@@ -147,7 +215,7 @@ class PrefillConfigTests(unittest.TestCase):
             p.unlink()
         # what was set by hand (off, or a window of its own) is kept by a setup again
         p, _ = self.write([0], 131072)
-        c = json.loads(p.read_text())
+        c = maya.read_json(p)
         c["args"][c["args"].index("--kv-streaming") + 1] = "off"
         c["args"] += ["--kv-resident", "65536"]
         p.write_text(json.dumps(c))

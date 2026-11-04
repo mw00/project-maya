@@ -66,6 +66,15 @@ const uint8_t* cache_complement_blob_or_fallback(
     size_t index, const std::vector<uint64_t>& offsets, const uint8_t* complement_host,
     const uint8_t* mapped_fallback);
 
+/// The drive probe's choice: of the reads-at-once counts tried (ascending) and the MB/s each reached, the fewest within
+/// `tol` (0.03: 3%) of the fastest - a drive that gains nothing from more reads in flight keeps few threads.  0: none
+/// measured.
+int pick_reads_at_once(const std::vector<int>& counts, const std::vector<double>& mbps, double tol = 0.03);
+
+/// A drive's line in the per-drive read cache ("<key> reads=<n> ..."): the count cached for `key` in `text` (the last
+/// line for it wins), 0 when there is none.
+int cached_reads_at_once(const std::string& text, const std::string& key);
+
 }  // namespace detail
 
 
@@ -98,6 +107,15 @@ public:
     virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k) { (void) layer; (void) ids; (void) k; }
     /// Plan v0.3 P6: the DEVICE address of a pinned, mapped blob (the GPU can read it over PCIe), or null.
     virtual const uint8_t* device_alias(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return nullptr; }
+
+    /// Whether `blob(layer, expert)` points at memory that stays put (a resident arena or a mapped file).  A source
+    /// that assembles some experts on demand into a staging ring (`GgufExpertSource`) answers false for those: their
+    /// pointer is good for the rest of the current layer only, so a caller that keeps it longer (the prompt path's
+    /// expert stream) has the expert copied with `copy_blob` instead.
+    virtual bool stable(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return true; }
+    /// Writes the expert's blob [gate rows | up rows | down rows] into `dst` (blob_bytes(layer) bytes).  Safe to call
+    /// from several threads at once for a source whose `stable()` is false; the default copies `blob()`.
+    virtual bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst);
 };
 
 /// Plan v0.3 P6: what the GPU computes in a verify window's layer, written by the pool (mapped host memory) right
@@ -449,6 +467,122 @@ private:
     double load_copy_s_ = 0.0;
     uint64_t pinned_bytes_ = 0;
     std::string gguf_;
+};
+
+// ================================ THE MODEL FILE ITSELF (v1.1.32) ================================
+
+/// The bytes of experts this PC's RAM can take now: the available RAM less the headroom kept for the OS and the page
+/// cache (12% of the RAM, at least 6 GiB).  `total_out`/`avail_out`/`headroom_out` report the three numbers.
+uint64_t expert_ram_room(uint64_t* avail_out = nullptr, uint64_t* headroom_out = nullptr, bool unbuffered = false);
+
+//
+// For a PC whose RAM cannot hold every expert (CYBER-FROST-3.8: 78 GB of Q5_K / IQ4_NL experts; a 64 GB PC) the
+// experts come straight from the model's GGUF, as GLM's and DeepSeek's do: the file is mapped read-only, and since
+// each layer's gate, up and down tensors hold the experts one after another, an expert's blob is three slices of the
+// mapping.  The experts no GPU holds are taken into a RESIDENT arena, hottest first, as far as this PC's free RAM
+// goes (`make_resident`, sized at run time - never a fixed count); any other is assembled when routed, into a
+// staging ring, from the OS page cache or the SSD.  So the tiers are VRAM, RAM, then the SSD.
+//
+// A ring blob stays valid while fewer than `ring/2` other experts are staged: the dispatch asks for at most
+// MAXT x k distinct experts per layer and the ring holds twice that, so a layer's blobs outlive the layer.  The
+// prompt path, which keeps pointers for whole chunks, asks `stable()` and copies with `copy_blob()`.
+class GgufExpertSource : public ExpertSource {
+public:
+    GgufExpertSource() = default;
+    ~GgufExpertSource() override;
+    GgufExpertSource(const GgufExpertSource&) = delete;
+    GgufExpertSource& operator=(const GgufExpertSource&) = delete;
+
+    /// Maps `shard1` (and any other shard the layout names) for the loaded native expert layout; `per_layer` is the
+    /// most distinct experts one dispatch asks for (MAXT x k), the ring holds twice that.
+    bool open(const std::string& shard1, int64_t n_layers, int64_t n_expert, int64_t per_layer, std::string& err);
+    /// Takes up to `budget` bytes of experts into the resident arena, in `order` (hottest first; pairs on a GPU
+    /// left out by the caller).  `budget` 0 = what this PC's available RAM allows (less a headroom for the OS, the
+    /// page cache the other experts and the n-gram rows are read through); MAYA_EXPERT_RAM_GB caps it.
+    /// `max_pinned`: as ArenaExpertSource (0 = register what CUDA takes).  The pairs in `drop` (the GPUs' own) are
+    /// released from the page cache.
+    bool make_resident(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget, uint64_t max_pinned,
+                       int threads, const std::vector<std::pair<int32_t, int32_t>>& drop, std::string& err);
+    void close();
+
+    const uint8_t* blob(int64_t layer, int64_t expert) override;
+    bool pinned(int64_t layer, int64_t expert) const override;
+    const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
+    void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    bool stable(int64_t layer, int64_t expert) const override;
+    bool copy_blob(int64_t layer, int64_t expert, uint8_t* dst) override;
+    int64_t reads() const override { return reads_; }
+
+    bool mapped() const { return !maps_.empty(); }
+    /// The GPU's residency table (per pair: its VRAM slot, or < 0), as the dispatch reads it: begin_layer then leaves
+    /// the experts the GPU computes alone.  Without it every routed expert the RAM tier does not hold is staged.
+    void set_gpu_residency(const int32_t* host_res) { gpu_res_ = host_res; }
+    /// Experts assembled from the mapping since open (ring fills; the misses no RAM tier held).
+    int64_t staged() const { return staged_; }
+    int64_t resident_blobs() const { return resident_blobs_; }
+    uint64_t resident_bytes() const { return resident_bytes_; }
+    uint64_t pinned_bytes() const { return pinned_bytes_; }
+    uint64_t all_bytes() const { return all_bytes_; }   // every routed expert in the file (the Monitor's SSD-only share)
+    const std::string& note() const { return note_; }
+    double load_seconds() const { return load_seconds_; }
+
+private:
+    struct Map {
+        std::string path;
+        const uint8_t* base = nullptr;
+        uint64_t bytes = 0;
+#if defined(_WIN32)
+        void* file = nullptr;
+        void* mapping = nullptr;
+#else
+        int fd = -1;
+        int dfd = -1;   ///< the same file opened O_DIRECT (Linux; -1: none) - the misses are read through it
+#endif
+    };
+    bool valid(int64_t layer, int64_t expert) const {
+        return layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_;
+    }
+    /// The three slices of an expert: source pointers and sizes (gate, up, down).
+    void parts(int64_t layer, int64_t expert, const uint8_t* src[3], uint64_t bytes[3], uint64_t file_off[3]) const;
+    void assemble(int64_t layer, int64_t expert, uint8_t* dst) const;
+    /// One slice (0 gate, 1 up, 2 down) of an expert into its place in `dst`: an unbuffered read when the file opened
+    /// for it (a miss then does not go through the page cache, and the SSD sees one read per slice), else the mapping.
+    void assemble_part(int64_t layer, int64_t expert, int part, uint8_t* dst) const;
+    bool read_part_direct(int64_t layer, int64_t expert, int part, uint8_t* dst) const;
+    bool direct_ = false;                  ///< every map has its O_DIRECT descriptor and stagers exist
+    std::vector<Map> maps_;
+    std::vector<int> map_of_;              ///< per layer: which map holds its experts
+    int64_t n_layers_ = 0, n_expert_ = 0;
+    // the resident arena: compact, grouped by layer; offset per pair or kNone
+    static constexpr uint64_t kNone = ~uint64_t{0};
+    void* arena_ = nullptr;                ///< PinnedArena, owned
+    const uint8_t* res_base_ = nullptr;
+    std::vector<uint64_t> res_off_;
+    std::vector<uint64_t> res_layer_start_;   ///< per layer: where its group starts (registration slice)
+    std::vector<const uint8_t*> dev_slice_;
+    uint64_t registered_bytes_ = 0;
+    bool sliced_ = false;
+    int64_t resident_blobs_ = 0;
+    uint64_t resident_bytes_ = 0, pinned_bytes_ = 0, all_bytes_ = 0;
+    // the staging ring
+    std::vector<uint8_t> ring_;
+    uint64_t ring_stride_ = 0;
+    int64_t ring_n_ = 0, ring_count_ = 0, per_layer_ = 0;
+    std::vector<int32_t> ring_of_;         ///< per pair: its ring slot, or -1
+    std::vector<int64_t> ring_owner_;      ///< per slot: the pair it holds, or -1
+    std::vector<int64_t> ring_stamp_;      ///< per slot: the staging count when it was filled
+    std::vector<int64_t> pf_stamp_;
+    int64_t pf_epoch_ = 0;
+    int64_t reads_ = 0, staged_ = 0;
+    std::string note_;
+    double load_seconds_ = 0.0;
+    // the stagers: a layer's routed experts are assembled into their ring slots by these threads as soon as
+    // begin_layer names them (their reads overlap; the SSD sees many at once), and blob() waits for its slot
+    const int32_t* gpu_res_ = nullptr;
+    int64_t take_slot(size_t pair);            ///< a ring slot for `pair` (waits for a stager still on it)
+    void stage_worker();
+    struct Stage;                              ///< the stagers' queue, threads and per-slot flags
+    Stage* st_ = nullptr;
 };
 
 }  // namespace strata::core

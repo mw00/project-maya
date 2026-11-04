@@ -101,6 +101,13 @@ BIG = dict(n_embd=256, n_vocab=512, n_layers=45, n_head=8, kda_head_dim=32, d_co
            n_head_kv=[1 if il % 4 == 3 else 0 for il in range(45)])
 
 
+# the small fixture with the heads the DSA products' matrix kernels need: ggml-metal takes mul_mm from 9 columns and a
+# 64-long inner product (glm_metal.cpp dsa_mm), which SMALL/BIG's 8 heads never reach - and a top-k past the 64-cell pad
+WIDE = dict(SMALL, n_head=16, idx_heads=16, idx_dim=64, idx_topk=128)
+# and with GLM-5.3-Flash's 512-wide latent: ggml_sparse_mla's D=512 kernel (third_party/ggml/metal-sparse-mla.patch)
+WIDE512 = dict(WIDE, kv_lora=512)
+
+
 def build(seed: int, vocab: bool = False) -> tuple[list[tuple[str, bytes]], list[tuple[str, np.ndarray]]]:
     return _build(SMALL, seed, vocab)
 

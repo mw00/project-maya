@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import hashlib
+import http.client
 import json
 import os
 import platform
@@ -23,10 +24,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
+ARM = platform.machine().lower() in ("aarch64", "arm64")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
-PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
+PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil", "jsonschema>=4.18,<5"]
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -124,6 +126,51 @@ def out(cmd):
         return ""
 
 
+_JOBS = []     # (Windows) the job objects of end_with_me: open while this process runs, closed by Windows when it ends
+
+
+def end_with_me(proc) -> bool:
+    """Windows: `proc` - and every process it starts (Maya's server: its engine, its vision encoder) - ends when this
+    process ends, however it ends: Task Manager or taskkill /F, the console window closed, a crash.  A job object
+    that kills its processes when its last handle - this process's, never closed here - closes.  Elsewhere nothing
+    to do (POSIX: the server's --parent-pipe).  False when it could not be set up."""
+    if not WIN:
+        return False
+    from ctypes import wintypes
+
+    class Basic(ctypes.Structure):                          # JOBOBJECT_BASIC_LIMIT_INFORMATION
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class Extended(ctypes.Structure):                       # JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        _fields_ = [("Basic", Basic), ("Io", ctypes.c_uint64 * 6), ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t)]
+    try:
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        job =k32.CreateJobObjectW(None, None)
+        if not job:
+            return False
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000                      # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)) or \
+                not k32.AssignProcessToJobObject(job, int(proc._handle)):   # (9: JobObjectExtendedLimitInformation)
+            k32.CloseHandle(job)
+            return False
+        _JOBS.append(job)
+        return True
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+
+
 def done(path: Path) -> bool:
     """A step's finish mark: <path>.done exists (written only after the step completed)."""
     return path.with_name(path.name + ".done").exists()
@@ -151,6 +198,8 @@ def _memory_status():
 def ram_gb():
     if WIN:
         return _memory_status().ullTotalPhys / 2**30
+    if sys.platform == "darwin":
+        return int(out(["sysctl", "-n", "hw.memsize"]).strip() or 0) / 2**30
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
@@ -167,16 +216,107 @@ def page_file_gb():
     return max(0.0, (m.ullTotalPageFile - m.ullTotalPhys) / 2**30)
 
 
+def arm_cpu_arch():
+    """ggml-cpu's -march value for this ARM CPU (aarch64 Linux), from the kernel's HWCAP feature list: the GB10
+    has dotprod, i8mm and bf16, which is armv8.6-a.  Empty when it cannot be read (ggml's own default is used)."""
+    if not ARM:
+        return ""
+    try:
+        txt = open("/proc/cpuinfo").read()
+        m = re.search(r"^Features\s*:\s*(.*)$", txt, re.M)
+        feats = set(m.group(1).split()) if m else set()
+        if {"asimddp", "i8mm", "bf16"} <= feats:
+            return "armv8.6-a+dotprod+i8mm+fp16"
+        if "asimddp" in feats:
+            return "armv8.2-a+dotprod+fp16"
+    except OSError:
+        pass
+    return ""
+
+
+def cuda_integrated_pci():
+    """{PCI id (as sysfs names it): True if CUDA calls the device integrated (its memory is the system's)} for the
+    NVIDIA GPUs the driver shows (cuDeviceGetAttribute CU_DEVICE_ATTRIBUTE_INTEGRATED, the attribute the engine asks
+    too).  Empty when the driver cannot be asked (Windows, no libcuda, a failing init): the caller falls back."""
+    res = {}
+    if WIN or sys.platform == "darwin":
+        return res
+    try:
+        cu = ctypes.CDLL("libcuda.so.1")
+        if cu.cuInit(0) != 0:
+            return res
+        n = ctypes.c_int(0)
+        if cu.cuDeviceGetCount(ctypes.byref(n)) != 0:
+            return res
+        for i in range(n.value):
+            dev, buf, integrated = ctypes.c_int(0), ctypes.create_string_buffer(32), ctypes.c_int(0)
+            if cu.cuDeviceGet(ctypes.byref(dev), i) != 0 or cu.cuDeviceGetPCIBusId(buf, 32, dev) != 0:
+                continue
+            if cu.cuDeviceGetAttribute(ctypes.byref(integrated), 18, dev) != 0:     # 18 = INTEGRATED
+                continue
+            res[_pci_key(buf.value.decode("ascii", "replace"))] = bool(integrated.value)
+    except (OSError, AttributeError, ValueError):
+        return {}
+    return res
+
+
+def unified_memory_pci_ids():
+    """PCI ids (as sysfs names them) of the GPUs that might have the system's RAM for memory (Grace/GB10, Jetson): the
+    device has no memory BAR of its own (only a tiny register window), unlike a discrete card's prefetchable BAR.
+    A candidate list only - a discrete card on a PC without Resizable BAR has a 256 MiB BAR1 too (issue #671); gpus()
+    decides with what the driver says."""
+    ids = set()
+    if WIN:
+        return ids
+    try:
+        for d in Path("/sys/bus/pci/devices").iterdir():
+            try:
+                if not (d / "class").read_text().strip().startswith("0x03"):
+                    continue
+                if (d / "vendor").read_text().strip() != "0x10de":
+                    continue
+                sizes = []
+                for line in (d / "resource").read_text().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        sizes.append(int(parts[1], 16) - int(parts[0], 16) + 1)
+                if not any(x >= 1 << 30 for x in sizes):
+                    ids.add(d.name.lower())
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return ids
+
+
+def _pci_key(bus_id: str) -> str:
+    return bus_id.strip().lower()[-12:]
+
+
 def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
+    if ARM and not WIN:
+        try:
+            txt = open("/proc/cpuinfo").read()
+            m = re.search(r"^(?:model name|Hardware|Processor)\s*:\s*(.*)$", txt, re.M)
+            if m:
+                name = m.group(1).strip()
+            else:
+                part = re.search(r"^CPU part\s*:\s*(.*)$", txt, re.M)
+                name = (f"ARM (CPU part {part.group(1).strip()})" if part else (platform.machine() or name))
+        except OSError:
+            name = platform.machine() or name
+        return name, False, False
     if WIN:
         pf = ctypes.windll.kernel32.IsProcessorFeaturePresent
         avx2 = bool(pf(40)) or _cpuid_avx2()      # PF_AVX2_INSTRUCTIONS_AVAILABLE, else the CPU itself (#159)
         n = out(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"]).strip()
         name = n or name
         avx512 = bool(pf(41)) and _cpuid_avx512_full()
+    elif sys.platform == "darwin":
+        name = out(["sysctl", "-n", "machdep.cpu.brand_string"]).strip() or name
     else:
         try:
             txt = open("/proc/cpuinfo").read()
@@ -254,14 +394,27 @@ def _cpuid_avx2() -> bool:
 
 def gpus():
     """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
-    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version,pci.bus_id",
              "--format=csv,noheader,nounits"])
+    umem = unified_memory_pci_ids()
+    integrated = cuda_integrated_pci() if umem else {}     # (only a card that might be unified needs the question)
     found = []
     for line in s.strip().splitlines():
         try:
-            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
-                          "driver": drv})
+            idx, name, mem, cc, drv, bus = [x.strip() for x in line.split(",")]
+            key = _pci_key(bus)
+            try:
+                vram, reported = float(mem) / 1024.0, True
+            except ValueError:
+                vram, reported = 0.0, False                # (a unified device: nvidia-smi says "[N/A]" or "Not Supported")
+            # Unified memory: what CUDA says (integrated) when it can be asked, else a card with no big memory BAR
+            # whose memory nvidia-smi cannot report.  A discrete card reports its VRAM - however small its BAR1 is
+            # without Resizable BAR (an RTX A4000 with 256 MiB, issue #671).
+            unified = integrated[key] if key in integrated else (key in umem and not reported)
+            if not reported:
+                vram = ram_gb() if unified else 0.0
+            found.append({"index": int(idx), "name": name, "vram_gb": vram, "arch": cc.replace(".", ""),
+                          "driver": drv, "pci": bus, "unified_memory": unified})
         except ValueError:
             continue
     return found
@@ -287,14 +440,40 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
-def find_vcvars(cuda=True):
+VS2026_MIN_CUDA = (13, 2)       # NVIDIA's Windows install guide first lists VS 2026's toolset (MSVC 195x) in CUDA 13.2
+
+
+def nvcc_version(nvcc):
+    """(major, minor) from `nvcc --version` ('... release 13.2, V13.2.51'), or None when it cannot be run or read."""
+    if not nvcc:
+        return None
+    m = re.search(r"release (\d+)\.(\d+)", out([str(nvcc), "--version"]))
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def nvcc_takes_vs2026(nvcc):
+    """True when that toolkit takes VS 2026's C++ toolset, so a 2026-only PC is usable with it.  NVIDIA's Windows
+    install guide names the supported MSVC per release: MSVC 195x / Visual Studio 2026 appears from CUDA 13.2 on,
+    while 13.1, 13.0 and every 12.x stop at 193x / VS 2022 - so the toolkit's own release says it."""
+    v = nvcc_version(nvcc)
+    return v is not None and v >= VS2026_MIN_CUDA    # unknown toolkit: False, the same requirement as CUDA 12.x
+
+
+def find_vcvars(cuda=True, nvcc=None):
+    """Visual Studio's vcvars64.bat for a build, newest first.
+    CUDA (the default) asks for 2019/2022 only ([16,18)): a newer one (2026 = version 18) installed next to them
+    must not be picked ("unsupported Microsoft Visual Studio version"), and with only a newer one there is none.
+    Given `nvcc` of CUDA 13.2 or newer - the release whose install guide first supports VS 2026's toolset - 2026
+    is taken as well, but an installed older VS stays the pick: such a PC often has a CUDA 12.x toolkit next to
+    the 13.2+ one, and 12.x takes only the older VS - the older one fits every toolkit the PC has.
+    ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first."""
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
-    # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
-    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none.
-    # ROCm's clang (the HIP build: cuda=False) takes a newer one too, 2019/2022 first
-    for versions in ([["-version", "[16.0,18.0)"]] if cuda else [["-version", "[16.0,18.0)"], []]):
+    ranges = [["-version", "[16.0,18.0)"]]
+    if not cuda or nvcc_takes_vs2026(nvcc):
+        ranges.append(["-version", "[18.0,)"])
+    for versions in ranges:
         p = out([str(vswhere), "-latest", "-products", "*", *versions, "-requires",
                  "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
         v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
@@ -304,9 +483,10 @@ def find_vcvars(cuda=True):
 
 
 # ------------------------------------------------------------------------------------------------ downloads
-def download(url, dst: Path, what=None):
+def download(url, dst: Path, what=None, headers=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
-    A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
+    A finished file gets a <name>.done mark, so a later run skips it without asking the server.  headers: sent to
+    url's host only (a gated repo's token: not to the host it redirects to)."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     if dst.exists() and done(dst):
         ok(f"{what or dst.name} already downloaded")
@@ -323,7 +503,9 @@ def download(url, dst: Path, what=None):
     total = 0
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "maya-setup"})
+            for k, v in (headers or {}).items():
+                req.add_unredirected_header(k, v)
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
             break
         except OSError as e:
@@ -336,8 +518,12 @@ def download(url, dst: Path, what=None):
         return
     have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
+        if total and have >= total:                    # killed between the last byte and the rename: no 416 loop
+            break
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
+            req = urllib.request.Request(url, headers={"User-Agent": "maya-setup", "Range": f"bytes={have}-"})
+            for k, v in (headers or {}).items():
+                req.add_unredirected_header(k, v)
             with urllib.request.urlopen(req, timeout=60) as r, open(part, "ab" if have else "wb") as f:
                 if have and r.status != 206:                     # the server ignored the range: start over
                     f.seek(0)
@@ -358,7 +544,7 @@ def download(url, dst: Path, what=None):
             progress()
             if not total or have >= total:
                 break
-        except OSError as e:
+        except (OSError, http.client.HTTPException) as e:     # IncompleteRead: the connection cut mid-body
             progress()
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
@@ -396,12 +582,20 @@ def get_llama_cpp():
     llama = ROOT / "third_party" / "llama.cpp"
     if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
+    if (llama / ".git").exists():                       # someone's own checkout: never deleted
+        fail(f"{llama} is a git checkout without ggml/CMakeLists.txt or gguf-py",
+             f"check out llama.cpp {LLAMA_CPP_COMMIT[:7]} there, or move the folder away")
     z = ROOT / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
     tmp = ROOT / "third_party" / "_unpack"
     shutil.rmtree(tmp, ignore_errors=True)
-    with zipfile.ZipFile(z) as f:
-        f.extractall(tmp)
+    try:
+        with zipfile.ZipFile(z) as f:
+            f.extractall(tmp)
+    except zipfile.BadZipFile:                          # cut short with no Content-Length: never mark it done
+        z.unlink(missing_ok=True)
+        z.with_name(z.name + ".done").unlink(missing_ok=True)
+        fail(f"{z.name} is damaged (the download was cut short)", "run the setup again: it downloads it anew")
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
     # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
@@ -425,7 +619,10 @@ def get_llama_cpp():
 def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else []
+    try:
+        have = json.loads(stamp.read_text()) if stamp.exists() else []
+    except ValueError:                                  # half written (power loss): install again
+        have = []
     need = [p for p in packages if p not in have]
     if not need:
         ok(f"{what} already installed")
@@ -437,12 +634,15 @@ def pip_install(packages, what):
 
 
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",
-             "gfx1201": "AMD Radeon RX 9070 / AI PRO R9700 (gfx1201)"}   # when sysfs has no product name
+             "gfx1201": "AMD Radeon RX 9070 / AI PRO R9700 (gfx1201)",
+             "gfx1030": "AMD Radeon RX 6800 / 6900 / PRO V620 / W6800 (gfx1030)"}   # when sysfs has no product name
 # Windows without ROCm's hipInfo yet: the architecture from the adapter's PCI device ID (Navi 31, Navi 48, the
-# Strix Halo / Gorgon Halo APU), else from its name ("AMD Radeon(TM) 8060S Graphics", 8050S, 8065S, ...)
-AMD_DEVICE_ARCHS = {"744c": "gfx1100", "7550": "gfx1201", "7551": "gfx1201", "1586": "gfx1151"}
+# Strix Halo / Gorgon Halo APU, Navi 21), else from its name ("AMD Radeon(TM) 8060S Graphics", 8050S, 8065S, ...)
+AMD_DEVICE_ARCHS = {"744c": "gfx1100", "7550": "gfx1201", "7551": "gfx1201", "1586": "gfx1151",
+                    "73a1": "gfx1030", "73a3": "gfx1030", "73a5": "gfx1030", "73af": "gfx1030", "73bf": "gfx1030"}
 AMD_NAME_ARCHS = ((r"Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", "gfx1151"), (r"RX\s*7900", "gfx1100"),
-                  (r"RX\s*9070|R9700", "gfx1201"))
+                  (r"RX\s*9070|R9700", "gfx1201"),
+                  (r"RX\s*6[89][05]0(?:\s*XT)?\b|PRO\s*V620|PRO\s*W6800", "gfx1030"))   # (not the 6800M / 6800S: Navi 22 / 23)
 
 
 def parse_hipinfo(text: str) -> list:

@@ -37,8 +37,28 @@ STEPS = {1: "This PC", 2: "Choices", 3: "Packages", 4: "Engine", 5: "Model", 6: 
          9: "Tuning", 10: "Dashboard", 11: "Log"}
 SERVE, LOG = 10, 11
 ROOT = Path(__file__).resolve().parents[1]              # the Maya folder (top right)
+READY = re.compile(r"(?:^|\s|\x1b\[[0-9;]*m)ready: http")      # the server's "ready:" line, wherever it sits in the chunk
+PROBE_S = 3.0                                       # while it loads: ask /health this often (a missed "ready:" line)
+
+
+def is_ready(line: str) -> bool:
+    return bool(READY.search(line)) or "the model runs with" in line or "engine is running again" in line
+
+
+def health_ok(api: str) -> bool:
+    """Maya's server answers /health: it is up (api: http://host:port/v1)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(api.rstrip("/").removesuffix("/v1") + "/health", timeout=2) as r:
+            return r.status == 200
+    except Exception:                                # noqa: BLE001 - not up yet
+        return False
+
+
 DONE = re.compile(r"\] done: (\d+) tokens in [\d.]+ s \(([\d.]+) tok/s\)")   # the server, after an answer
 SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+DRAIN_S, IDLE_DRAIN_S = 0.05, 0.25                        # the setup's events: looked for this often / when quiet
+TICK_S, IDLE_TICK_S = 0.12, 1.0                        # the card's timer: a spinner moving / only seconds counting
 NINJA = re.compile(r"\[(\d+)/(\d+)\] ")               # ninja's "[412/1033] Building CUDA object ..."
 
 
@@ -71,6 +91,7 @@ class SetupApp(App):
         self.written, self.flow = 0, 0                  # lines in the output box, and the width they wrap at
         self.printed = ""                               # print() from other threads, until its line ends
         self.serving = None                             # Maya's server, once it runs here: what the card shows
+        self.probed, self.probing = 0.0, None            # the last /health look while it loads, and its thread
         self.served = deque(maxlen=5000)                # its output (only here: it can run for days)
 
     def get_css_variables(self) -> dict[str, str]:
@@ -106,9 +127,32 @@ class SetupApp(App):
         out.border_title = title("Output")
         out.border_subtitle = Text(self.log_path.name if self.log_path else "", f"italic {FAINT}")
         self.show_keys()
-        self.set_interval(0.05, self.drain)
-        self.set_interval(0.12, self.tick)
+        self.quiet, self.drain_every = 0, DRAIN_S
+        self.drain_timer = self.set_interval(DRAIN_S, self.drain)
+        self.tick_every = TICK_S
+        self.tick_timer = self.set_interval(TICK_S, self.tick)
         self.begin_capture_print(self)
+        self.stop_on_signals()
+
+    def stop_on_signals(self) -> None:
+        """SIGTERM / SIGHUP (a service manager, `kill`, the terminal closed) stop the screen as a confirmed Ctrl+C does:
+        the setup's thread ends, Maya's server and its engine end (POSIX; on Windows the server ends with this process:
+        its --parent-pipe and job object).  A signal that is ignored (nohup) stays ignored."""
+        import os
+        import signal
+        def stop():
+            if not getattr(self, "signalled", False):   # (once: a second SIGINT would end the server at once)
+                self.signalled = True
+                self.stop_answered(True)
+        if os.name != "nt":   # (Windows has no SIGHUP and no loop signal handlers; the setup's thread starts all the same)
+            try:
+                import asyncio
+                loop = asyncio.get_running_loop()
+                for sig in (signal.SIGTERM, signal.SIGHUP):
+                    if signal.getsignal(sig) is not signal.SIG_IGN:
+                        loop.add_signal_handler(sig, stop)
+            except (ImportError, NotImplementedError, RuntimeError, ValueError):
+                pass
         self.bridge.thread = threading.Thread(target=self.work, name="setup", daemon=True)
         self.bridge.thread.start()
 
@@ -144,6 +188,7 @@ class SetupApp(App):
 
     # ---------------------------------------------------------------------------------------- the setup's events
     def drain(self) -> None:
+        worked = False
         for _ in range(500):
             if self.pending is not None:                # the setup waits for this answer
                 break
@@ -151,17 +196,29 @@ class SetupApp(App):
                 event = self.bridge.events.get_nowait()
             except queue.Empty:
                 break
+            worked = True
             self.flush()                                # (its lines come before what the event writes itself)
             getattr(self, "ev_" + event[0])(*event[1:])
-        self.flush()
+            if event[0] != "live" or self.animating():  # (the timer slows itself again once nothing moves)
+                self.set_tick(TICK_S)
+        worked = self.flush() or worked
+        # (twenty looks a second while something comes in; once it has been quiet for a second, four a second - a
+        # screen that waits for requests need not wake 20 times a second to find nothing)
+        self.quiet = 0 if worked else self.quiet + 1
+        want = DRAIN_S if self.quiet < 20 else IDLE_DRAIN_S
+        if want != self.drain_every:
+            self.drain_every = want
+            self.drain_timer.stop()
+            self.drain_timer = self.set_interval(want, self.drain)
 
-    def flush(self) -> None:
-        """The Bridge's new entries into the output box (when it shows the live output)."""
+    def flush(self) -> bool:
+        """The Bridge's new entries into the output box (when it shows the live output); whether there were any."""
         new = self.bridge.entries[self.shown:]
         self.shown += len(new)
         for n, kind, text in new:
             if self.view is None:
                 self.write(kind, text)
+        return bool(new)
 
     def write(self, kind: str, text: str) -> None:
         out = self.query_one("#output", RichLog)
@@ -209,6 +266,9 @@ class SetupApp(App):
             self.set_bar(done / total, f"{done} of {total}{left}")
 
     def ev_status(self, line: str) -> None:
+        if self.serving and is_ready(line):             # (a "ready:" that came with a carriage return: still ready)
+            self.ev_live(line)
+            return
         meter = curl_meter(line)
         if meter:
             self.set_bar(*meter)
@@ -252,7 +312,7 @@ class SetupApp(App):
         if self.view == LOG:
             self.write("live", line)
         s, m = self.serving, DONE.search(line)
-        if line.startswith("ready:") or "the model runs with" in line or "engine is running again" in line:
+        if is_ready(line):
             s["state"], s["since"], self.state[SERVE] = "ready", time.monotonic(), "ready"
             self.draw_tabs()
         elif "reloading the model" in line or "the engine had stopped" in line:   # (a load again: from 0%)
@@ -261,6 +321,26 @@ class SetupApp(App):
                                                          "Starting the engine again"), time.monotonic(), "run"
         elif m:
             s["speed"] = f"{m.group(1)} tokens at {m.group(2)} tok/s"
+
+    def ev_up(self) -> None:
+        """/health answered while the screen still said it loads: the line that says so was missed."""
+        s = self.serving
+        if s and s["state"] != "ready":
+            s["state"], s["since"], self.state[SERVE] = "ready", time.monotonic(), "ready"
+            self.draw_tabs()
+
+    def probe(self) -> None:
+        """While the screen says the model loads, /health is asked now and then (a thread; never blocks the screen)."""
+        s, now = self.serving, time.monotonic()
+        if not s or s["state"] == "ready" or not s.get("api") or now - self.probed < PROBE_S:
+            return
+        self.probed = now
+        api = s["api"]
+        if self.probing and self.probing.is_alive():
+            return
+        self.probing = threading.Thread(target=lambda: health_ok(api) and self.bridge.events.put(("up",)),
+                                        daemon=True)
+        self.probing.start()
 
     def ev_end(self, end: tuple) -> None:
         self.end_step("fail" if end[0] in ("fail", "error") else None)
@@ -400,8 +480,24 @@ class SetupApp(App):
         out.border_title = title("Output" if view is None else "Log" if view == LOG else f"Step {view} · {STEPS[view]}")
 
     # ---------------------------------------------------------------------------------------- drawing
+    def animating(self) -> bool:
+        """Whether anything on the screen moves faster than the clock: the spinner (a step or the model loading, a
+        question waiting, a stop) - not Maya waiting for requests, which only counts seconds."""
+        s = self.serving
+        return s is None or bool(self.pending) or s["state"] != "ready" or self.state.get(self.cur) == "run"
+
+    def set_tick(self, every: float) -> None:
+        """The card's and the tabs' timer at `every` seconds.  A screen that only counts seconds (Maya ready, no
+        request) ticks once a second instead of eight times: each tick that changes a line lays the screen out again."""
+        if every != self.tick_every:
+            self.tick_every = every
+            self.tick_timer.stop()
+            self.tick_timer = self.set_interval(every, self.tick)
+
     def tick(self) -> None:
+        self.set_tick(TICK_S if self.animating() else IDLE_TICK_S)
         self.frame += 1
+        self.probe()
         if self.state.get(self.cur) == "run":
             self.draw_tabs()
         if self.serving is None or self.pending:

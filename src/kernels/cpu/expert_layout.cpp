@@ -1,12 +1,14 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 
+#include "strata/platform/cpu_relax.hpp"
+
 #include <cstdio>
 #include <cstdlib>
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
-#else
+#elif defined(STRATA_X86)
 #include <cpuid.h>
 #endif
 #include <fstream>
@@ -19,6 +21,11 @@ ExpertLayout g_layout;
 
 const ExpertLayout& expert_layout() { return g_layout; }
 
+#if !defined(STRATA_X86)
+bool cpu_avx512_ok() { return false; }
+bool cpu_avx512bw_ok() { return false; }
+bool cpu_avx2_ok() { return false; }
+#else
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
@@ -117,21 +124,25 @@ bool cpu_avx2_ok() {
     return ok;
 }
 
+#endif  // STRATA_X86
+
 // A CPU without AVX2 (and without AVX-512) has no kernel for these: say so instead of an illegal instruction.
 // Run with the CPU expert lane off (STRATA_GLM_CPU_LANE=0) so the GPUs compute every expert.
 [[noreturn]] static void no_simd_kernel(const char* what) {
-    std::fprintf(stderr, "maya: %s needs AVX2 or AVX-512 and this CPU has neither; run with STRATA_GLM_CPU_LANE=0\n", what);
+    std::fprintf(stderr, "maya: %s needs AVX2 or AVX-512 and this CPU has neither; run with MAYA_GLM_CPU_LANE=0\n", what);
     std::abort();
 }
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {
+    if (!q2_own_kernels()) no_simd_kernel("Q2_0 expert rows");
     if (cpu_avx512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else if (!cpu_avx2_ok()) no_simd_kernel("Q2_0 expert rows");
     else q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
 }
 
 void act_quant_any(const float* x, int n, ActQ& a) {
+    if (!q2_own_kernels()) no_simd_kernel("the Q8_1 activation quantizer");
     if (cpu_avx512_ok()) act_quant_q8_1(x, n, a);
     else if (!cpu_avx2_ok()) no_simd_kernel("the Q8_1 activation quantizer");
     else act_quant_q8_1_avx2(x, n, a);
@@ -158,7 +169,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         return true;
     }
 #if !defined(STRATA_NATIVE_EXPERTS)
-    err = "this pack has native (IQ) experts but the engine was built without STRATA_NATIVE_EXPERTS";
+    err = "this pack has native (IQ) experts but the engine was built without MAYA_NATIVE_EXPERTS";
     return false;
 #else
     L.native = true;

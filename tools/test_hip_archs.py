@@ -27,6 +27,9 @@ class HipArchitectureTests(unittest.TestCase):
         r = self.probe("gfx1100;gfx1201;gfx1151")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("compiler=gfx1100;gfx1201;gfx1151;runtime=gfx1100,gfx1201,gfx1151", r.stdout)
+        self.assertNotIn("not validated", r.stderr)                 # (Strix Halo is validated)
+        r = self.probe("gfx1100;gfx1150")
+        self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("not validated", r.stderr)
 
     def test_spaces_suffixes_and_duplicates(self):

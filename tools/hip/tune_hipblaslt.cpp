@@ -186,6 +186,28 @@ void add_case(Options &o, const std::string &v) {
     add(o,f[0]=="bf16",positive(f[1],"T"),positive(f[2],"N"),positive(f[3],"K"),positive(f[4],"ldy"));
     o.explicit_shapes=true;
 }
+// A model family's own projection shapes. The defaults below are DeepSeek's; a
+// table tuned only for them leaves every other model's prompt GEMMs on
+// hipBLASLt's heuristic, which is where a GLM prompt spends most of its time
+// (kda_proj + dsa_proj were 58% of a GLM chunk). ldy is N for every one of these.
+void add_preset(Options &o, const std::string &name) {
+    // GLM-5.3-Flash (glm5_next): E=4096, KDA/DSA projections 4096->8192,
+    // dense FFN 12288, DSA LoRA 1536->16384 / 1536->4096 / 4096->1536, plus the
+    // shapes the engine actually asks for: the FP16 scratch slices a wide weight
+    // into remainder blocks (N=2730, 1366 of a 12288 row) and some callers pass
+    // ldy wider than N. ldy is not always N here.
+    struct PresetShape { int n, k, ldy; };
+    const PresetShape glm[] = {{8192,4096,8192},{4096,8192,4096},{12288,4096,12288},{4096,12288,4096},
+                               {16384,1536,16384},{4096,1536,4096},{1536,4096,1536},{512,4096,512},
+                               {1366,12288,4096},{2730,12288,4096},{2048,16384,4096},
+                               {4096,4096,12288},{8192,4096,12288}};
+    if (name != "glm") {
+        std::fprintf(stderr, "unknown preset: %s (known: glm)\n", name.c_str());
+        std::exit(2);
+    }
+    for (const auto &s : glm) { add(o,false,256,s.n,s.k,s.ldy); add(o,true,256,s.n,s.k,s.ldy); }
+    o.explicit_shapes = true;
+}
 std::vector<int> parse_tokens(const std::string &s) {
     std::vector<int> out;
     for (const auto &x : csv(s)) out.push_back(positive(x,"token bucket"));
@@ -211,8 +233,9 @@ void load_shapes(Options &o) {
 }
 void usage(const char *p) {
     std::printf("Usage: %s [--workspace-mib N] [--shape T,N,K]... [--case dtype,T,N,K,ldy]...\n",p);
-    std::printf("       [--shapes-file PATH [--tokens T1,T2,...]] [--tuning-out PATH]\n");
+    std::printf("       [--shapes-file PATH [--tokens T1,T2,...]] [--preset glm] [--tuning-out PATH]\n");
     std::printf("Defaults: original three shapes, f16+bf16, T=8192, workspace=32 MiB.\n");
+    std::printf("Presets: glm (GLM-5.3-Flash's projection shapes at T=256, f16+bf16).\n");
 }
 Options options(int argc,char **argv) {
     Options o;
@@ -226,6 +249,7 @@ Options options(int argc,char **argv) {
             o.workspace=(size_t)x*1024U*1024U;
         } else if(a=="--shape") add_shape(o,next());
         else if(a=="--case") add_case(o,next());
+        else if(a=="--preset") add_preset(o,next());
         else if(a=="--shapes-file"){o.shapes_file=next();o.explicit_shapes=true;}
         else if(a=="--tokens") o.tokens=parse_tokens(next());
         else if(a=="--tuning-out") o.tuning_out=next();

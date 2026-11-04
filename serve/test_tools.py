@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 import urllib.request
 from pathlib import Path
@@ -60,9 +61,17 @@ class GlmCalls(unittest.TestCase):
 
     def test_malformed(self):
         for body in ("<arg_key>a</arg_key><arg_value>1</arg_value>", "f<arg_key>a<arg_value>1</arg_value>",
-                     "f junk <b>"):
+                     "f junk <b>", "<function=f><parameter=a>1</parameter><parameter=b",
+                     "<function=f><parameter=a"):   # (#706: an unclosed <parameter= tag is malformed, not a crash)
             with self.assertRaises(ValueError, msg=body):
                 parse_tool_call(body)
+
+    def test_malformed_carries_the_whole_body(self):   # (#613: the log shows all of it, the message 80 characters)
+        body = "f<arg_key>a<arg_value>" + "x" * 300
+        with self.assertRaises(ValueError) as cm:
+            parse_tool_call(body)
+        self.assertEqual(cm.exception.body, body)
+        self.assertLess(len(str(cm.exception)), 120)
 
     def test_streamed_as_whole(self):
         for pieces in (None, 1, 3, 7):
@@ -258,6 +267,111 @@ class JsonMode(unittest.TestCase):
             "model": "m", "response_format": {"type": "json_object"}, "messages": [{"role": "user", "content": "json"}]})
         self.assertEqual(json.loads(b["choices"][0]["message"]["content"]), {"city": "Paris"})
 
+    SCHEMA = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"],
+              "additionalProperties": False}
+    MESSAGES = [{"role": "system", "content": "You are terse."}, {"role": "user", "content": "Where?"}]
+
+    def prompt_for(self, body, template="serve/chat_template.jinja"):
+        """What the engine is given for a chat request, and the server's own count of that prompt (/api/tokens)."""
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, '</think>\n\n{"city": "Paris"}', max_context=8192)
+        svc = Service(engine, tok, ChatTemplate(ROOT / template))
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        code, b = HttpToolCalls.post(self, "/v1/chat/completions", {"model": "m", **body})
+        self.assertEqual(code, 200, b)
+        self.assertEqual(json.loads(b["choices"][0]["message"]["content"]), {"city": "Paris"})
+        return tok.decode(engine.last_prompt), svc.count_tokens(body)["tokens"], len(engine.last_prompt)
+
+    def test_schema_reaches_the_model(self):
+        """A json_schema request: the model is told the schema, at the end of the leading system message - the
+        client's system prompt stays one, ahead of it - and the prompt's count includes it."""
+        rf = {"type": "json_schema", "json_schema": {"name": "city", "strict": True, "schema": self.SCHEMA}}
+        for template, user in (("serve/chat_template.jinja", "<|im_start|>user"), ("tools/ds4/chat_template.jinja",
+                                                                                    "<｜User｜>")):
+            with self.subTest(template=template):
+                prompt, counted, given = self.prompt_for({"messages": self.MESSAGES, "response_format": rf}, template)
+                self.assertLess(prompt.index("You are terse."), prompt.index(json.dumps(self.SCHEMA)))
+                self.assertLess(prompt.index(json.dumps(self.SCHEMA)), prompt.index(user))
+                self.assertEqual(prompt.count(user), 1)
+                self.assertEqual(counted, given)
+
+    def test_json_object_and_no_format(self):
+        """json_object: a plain JSON note, or the schema when one comes as llama.cpp sends it (response_format.schema,
+        and no system message to add to); a request without a JSON format: the prompt as before."""
+        prompt, _, _ = self.prompt_for({"messages": self.MESSAGES, "response_format": {"type": "json_object"}})
+        self.assertIn("Return only a valid JSON object", prompt)
+        prompt, _, _ = self.prompt_for({"messages": self.MESSAGES[1:],
+                                        "response_format": {"type": "json_object", "schema": self.SCHEMA}})
+        self.assertIn("<|im_start|>system\n", prompt)
+        self.assertIn(json.dumps(self.SCHEMA), prompt)
+        for rf in (None, {"type": "text"}):
+            body = {"messages": self.MESSAGES, **({"response_format": rf} if rf else {})}
+            prompt, _, _ = self.prompt_for(body)
+            self.assertNotIn("Return only", prompt)
+
+
+class ConditionalThinkingTools(unittest.TestCase):
+    """A RED-SNOW-style template must open the block the server's parser expects by default."""
+
+    TEMPLATE = ("{% if tools %}<tools>{% for tool in tools %}{{ tool.name }}{% endfor %}</tools>{% endif %}"
+                "<|assistant|>{% if enable_thinking is defined and enable_thinking %}<think>{% endif %}"
+                "{# <arg_key> #}")
+    TOOL = {"name": "add_numbers", "description": "Add two integers", "parameters": {"type": "object",
+            "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}}, "required": ["a", "b"]}}
+    CALL = ("<tool_call>add_numbers<arg_key>a</arg_key><arg_value>137</arg_value>"
+            "<arg_key>b</arg_key><arg_value>268</arg_value></tool_call>")
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        path = Path(self.temp.name) / "chat_template.jinja"
+        path.write_text(self.TEMPLATE, encoding="utf-8")
+        self.template = ChatTemplate(path)
+
+    def server(self, script):
+        tok = ByteTokenizer()
+        engine = MockEngine(tok, script, max_context=8192)
+        svc = Service(engine, tok, self.template, model_name="red-snow")
+        svc.default_effort = "max"
+        httpd = serve(svc, port=0)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        return engine, tok
+
+    def post(self, body):
+        req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read())
+
+    def test_auto_max_opens_thinking_and_parses_tool_call(self):
+        engine, tok = self.server("I should use the function.</think>\n\n" + self.CALL)
+        body = self.post({"model": "red-snow", "reasoning_effort": "max", "tools": [
+            {"type": "function", "function": self.TOOL}], "tool_choice": "auto",
+            "messages": [{"role": "user", "content": "Use add_numbers for 137+268."}]})
+        prompt = tok.decode(engine.last_prompt)
+        self.assertIn("<tools>add_numbers</tools>", prompt)
+        self.assertTrue(prompt.endswith("<|assistant|><think>"))
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        fn = body["choices"][0]["message"]["tool_calls"][0]["function"]
+        self.assertEqual((fn["name"], json.loads(fn["arguments"])), ("add_numbers", {"a": 137, "b": 268}))
+
+    def test_required_call_keeps_thinking_off(self):
+        engine, tok = self.server(self.CALL[len("<tool_call>"):])
+        body = self.post({"model": "red-snow", "reasoning_effort": "max", "tools": [
+            {"type": "function", "function": self.TOOL}], "tool_choice": "required",
+            "messages": [{"role": "user", "content": "Use add_numbers for 137+268."}]})
+        prompt = tok.decode(engine.last_prompt)
+        self.assertTrue(prompt.endswith("<|assistant|><tool_call>"))
+        self.assertNotIn("<think>", prompt[-40:])
+        self.assertEqual(body["choices"][0]["finish_reason"], "tool_calls")
+        fn = body["choices"][0]["message"]["tool_calls"][0]["function"]
+        self.assertEqual((fn["name"], json.loads(fn["arguments"])), ("add_numbers", {"a": 137, "b": 268}))
+
 
 class ForcedToolCalls(unittest.TestCase):
     """tool_choice "required" / a named function (Anthropic "any" / "tool"): the answer starts with the call - the
@@ -307,6 +421,38 @@ class ForcedToolCalls(unittest.TestCase):
         self.post("/v1/chat/completions", {"model": "m", "tools": tools, "tool_choice": "auto",
                                            "messages": [{"role": "user", "content": "hi"}]})
         self.assertFalse(tok.decode(engine.last_prompt).rstrip().endswith("<tool_call>"))
+
+
+class CallEndRescan(unittest.TestCase):
+    """In call state the parser searched for </tool_call> from offset 0 on every delta while the
+    body accumulated - O(body) per token on a large file-write argument.  The search now resumes where
+    the last one stopped (less a possible partial tag); every split of the same text must parse the same."""
+
+    BODY = ("<tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>"
+            + "echo line </tool_cal and </tool_callx and </tool_call\n" * 60
+            + "</arg_value>\n</tool_call>done")
+
+    def shape(self, events):
+        return (content(events),
+                [(c.name, c.arguments) for c in calls(events)],
+                "".join(e.text for e in events if e.kind == "tool_args"))
+
+    def test_every_split_agrees_with_whole(self):
+        whole = self.shape(run(self.BODY))
+        self.assertEqual(len(whole[1]), 1)
+        self.assertTrue(whole[1][0][1]["command"].startswith("echo line"))
+        for pieces in (1, 2, 3, 5, 11, 64):
+            self.assertEqual(self.shape(run(self.BODY, pieces=pieces)), whole, f"pieces={pieces}")
+
+    def test_search_resume_advances_with_the_body(self):
+        p = OutputParser(thinking=True, tools=TOOLS, stream_tools=True)
+        p.feed("think</think>\n\n<tool_call>bash\n<arg_key>command</arg_key>\n<arg_value>")
+        p.feed("x" * 5000)
+        self.assertGreater(p._call_resume, 4000)
+        p.feed("</arg_value>\n</tool_cal")          # a partial end tag: not a close, and not skipped either
+        self.assertEqual(p.state, "call")
+        out = p.feed("l>")
+        self.assertEqual([e.kind for e in out].count("tool_call"), 1)
 
 
 if __name__ == "__main__":

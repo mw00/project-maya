@@ -5,6 +5,19 @@
 // would have left up to float rounding - the projections around them (FP16 tensor-core GEMMs instead of q8_1 dot
 // products) are where the two paths really differ, as llama.cpp's batched and one-token paths do.
 #if defined(STRATA_USE_HIP)
+// rocWMMA (the f16q prompt attention) knows gfx11 and gfx12 only: its config.hpp stops a device pass for any other
+// architecture (RDNA 2, gfx1030) with a static_assert, so that pass leaves it out and compiles the f16q kernel empty -
+// a GPU without WMMA never takes f16q (glm_prefill.cu's mla_attn_path).  The host pass reads it only when the build
+// targets WMMA-capable archs (hip_backend.cmake's STRATA_HAS_WMMA) - an RDNA 2-only build skips the include entirely,
+// so it links without the rocWMMA headers (ROCm 7 no longer ships them).
+#if (!(defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && STRATA_HAS_WMMA) || \
+    ((defined(__HIP_DEVICE_COMPILE__) && __HIP_DEVICE_COMPILE__) && (defined(__gfx1100__) || defined(__gfx1101__) || \
+    defined(__gfx1102__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)))
+#define STRATA_ROCWMMA 1
+#else
+#define STRATA_ROCWMMA 0
+#endif
+#if STRATA_ROCWMMA
 // The HIP bf16/fp8 headers rocWMMA pulls in define the __shfl_*_sync names that the force-included hip_compat macros
 // remap; hide the macros while they are read.
 #pragma push_macro("__shfl_xor_sync")
@@ -20,6 +33,7 @@
 #pragma pop_macro("__shfl_down_sync")
 #pragma pop_macro("__shfl_up_sync")
 #pragma pop_macro("__shfl_sync")
+#endif
 #endif
 #include "strata/kernels/glm_batch.hpp"
 #include "dsa_topk.cuh"
@@ -784,6 +798,9 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
                                                           const int* __restrict__ cells_all,
                                                           const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
                                                           float scale, float* __restrict__ ctx, bool q8) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - mla_attn takes the F32 kernel there (major < 7), never this one
+#else
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -892,6 +909,379 @@ __global__ void __launch_bounds__(256) mla_attn_tc_kernel(const float* __restric
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? sO[i] / L : 0.0f;
     }
+#endif
+}
+
+// The same attention, two passes and 32 heads a block (DeepSeek-V4's prompt attention, glm_dsv4.cu rows_attn_tc): block
+// = (token, 32 heads), 256 threads, tiles of 32 cells (their latent rows FP16 in shared memory, read once a pass for 32
+// heads instead of 16).  Pass 1 the exact softmax max / sum per head; pass 2 P = exp(s - m) (FP16) . L straight into
+// wmma accumulators - no per-chunk rescale of a context in shared memory - then / sum.  FP16 operands, F32 sums.
+constexpr int T2_H = 32, T2_C = 32, T2_LD = 512 + 8, T2_CP = T2_C + 8;
+constexpr int T2_RT = T2_H / 16, T2_KP = 8 / (2 * T2_RT), T2_KW = 512 / T2_KP;   // row tiles; score k-parts; width
+constexpr int T2_CPT = T2_H * T2_C / 256, T2_TPH = T2_C / T2_CPT;               // softmax: columns a thread, threads a head
+constexpr int T2_CT = 32 * T2_RT / 8;                                           // PV: output tiles a warp
+constexpr size_t kT2Smem = (size_t) (T2_H + T2_C) * T2_LD * 2 + (size_t) T2_KP * T2_H * T2_C * 4 +
+                           (size_t) T2_H * T2_CP * 2 + (size_t) 2 * T2_H * 4;
+__global__ void __launch_bounds__(256) mla_attn_tc2_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                           const int* __restrict__ cells_all,
+                                                           const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
+                                                           float scale, float* __restrict__ ctx, bool q8) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - mla_attn takes the F32 kernel there (major < 7), never this one
+#else
+    using namespace nvcuda;
+    constexpr int KV = 512;
+    extern __shared__ __align__(128) unsigned char t2_sm[];
+    __half* sq = (__half*) t2_sm;                           // T2_H x T2_LD
+    __half* srow = sq + T2_H * T2_LD;                       // T2_C x T2_LD (the end: T2_H x 256 floats over it)
+    float* spart = (float*) (srow + T2_C * T2_LD);          // T2_KP x T2_H x T2_C
+    __half* sp16 = (__half*) (spart + T2_KP * T2_H * T2_C); // T2_H x T2_CP
+    float* sm = (float*) (sp16 + T2_H * T2_CP);             // T2_H max
+    float* sl = sm + T2_H;                                  // T2_H sums
+    __shared__ int s_cell[T2_C];
+    const int t = blockIdx.x, h0 = blockIdx.y * T2_H, tid = threadIdx.x, wp = tid >> 5;
+    const int ns = n_sel_arr[t];
+    const int* cl = cells_all + (size_t) t * n_sel_max;
+    const float* qa = q_abs + ((size_t) t * n_head + h0) * KV;
+    for (int i = tid; i < T2_H * KV; i += 256) sq[(i / KV) * T2_LD + i % KV] = __float2half_rn(qa[i]);
+    if (tid < T2_H) {
+        sm[tid] = -INFINITY;
+        sl[tid] = 0.0f;
+    }
+    const int st_c = wp & 1, st_r = (wp >> 1) % T2_RT, kp = wp / (2 * T2_RT);
+    const int hh = tid / T2_TPH, c0 = (tid % T2_TPH) * T2_CPT;
+    const int pr = wp % T2_RT, pc0 = (wp / T2_RT) * T2_CT;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> oacc[T2_CT];
+#pragma unroll
+    for (int i = 0; i < T2_CT; ++i) wmma::fill_fragment(oacc[i], 0.0f);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int i0 = 0; i0 < ns; i0 += T2_C) {
+            __syncthreads();
+            if (tid < T2_C) s_cell[tid] = i0 + tid < ns ? cl[i0 + tid] : -1;
+            __syncthreads();
+            for (int i = tid; i < T2_C * (KV / 8); i += 256) {
+                const int rr = i / (KV / 8), c8 = i % (KV / 8), cell = s_cell[rr];
+                const uint4 v = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+                                : q8      ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                                          : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+                *(uint4*) (srow + rr * T2_LD + c8 * 8) = v;
+            }
+            __syncthreads();
+            {
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> sacc;
+                wmma::fill_fragment(sacc, 0.0f);
+#pragma unroll
+                for (int kk = 0; kk < T2_KW; kk += 16) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                    wmma::load_matrix_sync(fa, sq + st_r * 16 * T2_LD + kp * T2_KW + kk, T2_LD);
+                    wmma::load_matrix_sync(fb, srow + st_c * 16 * T2_LD + kp * T2_KW + kk, T2_LD);
+                    wmma::mma_sync(sacc, fa, fb, sacc);
+                }
+                wmma::store_matrix_sync(spart + kp * T2_H * T2_C + st_r * 16 * T2_C + st_c * 16, sacc, T2_C,
+                                        wmma::mem_row_major);
+            }
+            __syncthreads();
+            float sv[T2_CPT];
+#pragma unroll
+            for (int jj = 0; jj < T2_CPT; ++jj) {
+                const int c = c0 + jj;
+                float v = 0.0f;
+#pragma unroll
+                for (int pp = 0; pp < T2_KP; ++pp) v += spart[pp * T2_H * T2_C + hh * T2_C + c];
+                sv[jj] = s_cell[c] >= 0 ? v * scale : -INFINITY;
+            }
+            if (pass == 0) {
+                float mt = -INFINITY;
+#pragma unroll
+                for (int jj = 0; jj < T2_CPT; ++jj) mt = fmaxf(mt, sv[jj]);
+#pragma unroll
+                for (int o = T2_TPH / 2; o > 0; o >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, o));
+                const float mo = sm[hh], mn = fmaxf(mo, mt);
+                float ps = 0.0f;
+                if (mn > -INFINITY)
+#pragma unroll
+                    for (int jj = 0; jj < T2_CPT; ++jj) ps += sv[jj] > -INFINITY ? expf(sv[jj] - mn) : 0.0f;
+#pragma unroll
+                for (int o = T2_TPH / 2; o > 0; o >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, o);
+                __syncwarp();
+                if (tid % T2_TPH == 0 && mn > -INFINITY) {
+                    sl[hh] = (mo > -INFINITY ? sl[hh] * expf(mo - mn) : 0.0f) + ps;
+                    sm[hh] = mn;
+                }
+            } else {
+                const float m = sm[hh];
+#pragma unroll
+                for (int jj = 0; jj < T2_CPT; ++jj)
+                    sp16[hh * T2_CP + c0 + jj] = __float2half_rn(sv[jj] > -INFINITY ? expf(sv[jj] - m) : 0.0f);
+                __syncthreads();
+#pragma unroll
+                for (int kk = 0; kk < T2_C; kk += 16) {
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::load_matrix_sync(fa, sp16 + pr * 16 * T2_CP + kk, T2_CP);
+#pragma unroll
+                    for (int i = 0; i < T2_CT; ++i) {
+                        wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> bv;
+                        wmma::load_matrix_sync(bv, srow + kk * T2_LD + (pc0 + i) * 16, T2_LD);
+                        wmma::mma_sync(oacc[i], fa, bv, oacc[i]);
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+    // the end, in two halves of the 512 dims (T2_H x 256 floats over the cell tile)
+    float* so = (float*) srow;
+    for (int half = 0; half < 2; ++half) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < T2_CT; ++i) {
+            const int col = (pc0 + i) * 16 - half * (KV / 2);
+            if (col >= 0 && col < KV / 2)
+                wmma::store_matrix_sync(so + pr * 16 * (KV / 2) + col, oacc[i], KV / 2, wmma::mem_row_major);
+        }
+        __syncthreads();
+        for (int i = tid; i < T2_H * KV / 2; i += 256) {
+            const int hl = i / (KV / 2), d = i % (KV / 2);
+            const float L = sl[hl];
+            ctx[((size_t) t * n_head + h0 + hl) * KV + half * (KV / 2) + d] = L > 0.0f ? so[hl * (KV / 2) + d] / L : 0.0f;
+        }
+    }
+#endif
+}
+
+// The tc2 attention in ONE pass (Volta's default; STRATA_GLM_PREFILL_ATTN=tc2 runs tc2).  tc2 walks a token's cells
+// twice - the gather and Q.K^T once for the softmax's max / sum and again for P - because a wmma accumulator's layout
+// is not known on Volta, so O could not be rescaled in registers.  mma.sync.m8n8k4's is (the layout measured on a
+// V100): here Q.K^T stays on wmma (into shared memory, as tc2), the online softmax keeps each head's max and sum and
+// writes P (FP16) and the rescale factor, and P.V runs on mma.m8n8k4 with O in registers - warp w owns heads 16 (w & 1)
+// .. +15 and dims 128 (w >> 1) .. +127 (8 groups of 16: 64 floats a lane), rescaled by its rows' factors each tile. The
+// next tile's latent rows are read into registers while this one computes (Volta has no cp.async).  The design follows
+// 1CatAI/1Cat-vLLM #1092 / #1125 (one pass, FP32 scores and softmax, FP16 operands, F32 sums); the code is this file's.
+// Same block, tiles and shared memory as tc2: block = (token, 32 heads), 256 threads.
+// The m8n8k4 layout (sm_70): a warp's 4 quad pairs qp = (L >> 2) & 3 each compute an 8 x 8 block - rows 8 (qp & 1) ..,
+// columns 8 (qp >> 1) ..; A row 8 rb + (L & 3) + 4 (L >= 16) holds k 0..3; .row B: lane L holds k row L & 3, columns
+// 4 (L >= 16) + i of its block; accumulator c[i]: row (L & 1) + (i & 2) + 4 (L >= 16), column (i & 4) + (L & 2) + (i & 1).
+__device__ __forceinline__ void v7_mma884rr(float* c, uint32_t a0, uint32_t a1, uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    (void) c, (void) a0, (void) a1, (void) b0, (void) b1;   // Pascal: never launched (major == 7 only)
+#else
+    asm volatile("mma.sync.aligned.m8n8k4.row.row.f32.f16.f16.f32 {%0,%1,%2,%3,%4,%5,%6,%7}, {%8,%9}, {%10,%11}, "
+                 "{%0,%1,%2,%3,%4,%5,%6,%7};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]), "+f"(c[4]), "+f"(c[5]), "+f"(c[6]), "+f"(c[7])
+                 : "r"(a0), "r"(a1), "r"(b0), "r"(b1));
+#endif
+}
+constexpr size_t kV7Smem = kT2Smem + (size_t) T2_H * 4;   // tc2's, and the heads' rescale factors
+// SPLIT (the decode, mla_decode_v70): one token's cells in splits of cblk, block (split, 32 heads) - its context
+// unnormalised and its heads' max and sum go to part[split][head][KV + 2] for mla_dec_combine_kernel (n_sel_max is the
+// token's cell count, n_sel_arr unused); else the prompt's block (token, 32 heads) over all its cells
+template <bool SPLIT>
+__global__ void __launch_bounds__(256, 1) mla_attn_v70_kernel(const float* __restrict__ q_abs,
+                                                              const uint16_t* __restrict__ lat,
+                                                              const int* __restrict__ cells_all,
+                                                              const int* __restrict__ n_sel_arr, int n_sel_max,
+                                                              int n_head, float scale, float* __restrict__ ctx, bool q8,
+                                                              int cblk = 0, float* __restrict__ part = nullptr) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - mla_attn launches this on Volta only
+#else
+    using namespace nvcuda;
+    constexpr int KV = 512, RPT = T2_C * (KV / 8) / 256;   // a tile's 16-byte row pieces a thread
+    static_assert(T2_H == 32 && T2_C == 32 && T2_KP == 2 && T2_TPH == 8 && T2_CPT == 4, "the v70 roles assume tc2's tiles");
+    extern __shared__ __align__(128) unsigned char v7_sm[];
+    __half* sq = (__half*) v7_sm;                           // T2_H x T2_LD
+    __half* srow = sq + T2_H * T2_LD;                       // T2_C x T2_LD
+    float* spart = (float*) (srow + T2_C * T2_LD);          // T2_KP x T2_H x T2_C
+    __half* sp16 = (__half*) (spart + T2_KP * T2_H * T2_C); // T2_H x T2_CP
+    float* sm = (float*) (sp16 + T2_H * T2_CP);             // T2_H max
+    float* sl = sm + T2_H;                                  // T2_H sums
+    float* sc = sl + T2_H;                                  // T2_H this tile's rescale
+    __shared__ int s_cell[T2_C];
+    const int t = SPLIT ? 0 : blockIdx.x, h0 = blockIdx.y * T2_H, tid = threadIdx.x, wp = tid >> 5, L = tid & 31;
+    // the cells [cb0, ns) of the token: all of them, or the split's
+    const int cb0 = SPLIT ? blockIdx.x * cblk : 0;
+    const int ns = SPLIT ? min(n_sel_max, cb0 + cblk) : n_sel_arr[t];
+    const int* cl = cells_all + (size_t) t * n_sel_max;
+    const float* qa = q_abs + ((size_t) t * n_head + h0) * KV;
+    for (int i = tid; i < T2_H * KV; i += 256) sq[(i / KV) * T2_LD + i % KV] = __float2half_rn(qa[i]);
+    if (tid < T2_H) {
+        sm[tid] = -INFINITY;
+        sl[tid] = 0.0f;
+    }
+    // Q.K^T roles (tc2's): score tile (st_r, st_c), k-part kp
+    const int st_c = wp & 1, st_r = (wp >> 1) & 1, kp = wp >> 2;
+    // softmax roles: head hh, its columns c0 .. c0 + 3
+    const int hh = tid / T2_TPH, c0 = (tid % T2_TPH) * T2_CPT;
+    // P.V roles: the warp's 16 heads (pr) and 128 dims (cbase); the lane's quad pair (rb, cb), j, hi
+    const int pr = wp & 1, cbase = (wp >> 1) * 128;
+    const int j = L & 3, hi = L >> 4, qp = (L >> 2) & 3, rb = qp & 1, cb = qp >> 1;
+    const int ra = 8 * rb + (L & 1) + 4 * hi;   // the lane's accumulator rows ra, ra + 2 of the warp's 16
+    float o[8][8];
+#pragma unroll
+    for (int g = 0; g < 8; ++g)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[g][i] = 0.0f;
+    uint4 pre[RPT];
+    const auto fetch = [&](int i0) {
+#pragma unroll
+        for (int r = 0; r < RPT; ++r) {
+            const int i = tid + 256 * r, rr = i / (KV / 8), c8 = i % (KV / 8);
+            const int cell = i0 + rr < ns ? cl[i0 + rr] : -1;
+            pre[r] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u)
+                     : q8      ? lat8_h8(lat8_rec(lat, KV, cell), KV, c8)
+                               : ((const uint4*) (lat + (size_t) KV * cell))[c8];
+        }
+    };
+    if (ns > cb0) fetch(cb0);
+    for (int i0 = cb0; i0 < ns; i0 += T2_C) {
+        __syncthreads();   // (the last tile's P.V has read srow and sp16)
+#pragma unroll
+        for (int r = 0; r < RPT; ++r) {
+            const int i = tid + 256 * r, rr = i / (KV / 8), c8 = i % (KV / 8);
+            *(uint4*) (srow + rr * T2_LD + c8 * 8) = pre[r];
+        }
+        if (tid < T2_C) s_cell[tid] = i0 + tid < ns ? cl[i0 + tid] : -1;
+        __syncthreads();
+        if (i0 + T2_C < ns) fetch(i0 + T2_C);   // in flight while this tile computes
+        {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> sacc;
+            wmma::fill_fragment(sacc, 0.0f);
+#pragma unroll
+            for (int kk = 0; kk < T2_KW; kk += 16) {
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fa, sq + st_r * 16 * T2_LD + kp * T2_KW + kk, T2_LD);
+                wmma::load_matrix_sync(fb, srow + st_c * 16 * T2_LD + kp * T2_KW + kk, T2_LD);
+                wmma::mma_sync(sacc, fa, fb, sacc);
+            }
+            wmma::store_matrix_sync(spart + kp * T2_H * T2_C + st_r * 16 * T2_C + st_c * 16, sacc, T2_C,
+                                    wmma::mem_row_major);
+        }
+        __syncthreads();
+        {
+            float sv[T2_CPT];
+            float mt = -INFINITY;
+#pragma unroll
+            for (int jj = 0; jj < T2_CPT; ++jj) {
+                const int c = c0 + jj;
+                const float v = spart[hh * T2_C + c] + spart[T2_H * T2_C + hh * T2_C + c];
+                sv[jj] = s_cell[c] >= 0 ? v * scale : -INFINITY;
+                mt = fmaxf(mt, sv[jj]);
+            }
+#pragma unroll
+            for (int x = T2_TPH / 2; x > 0; x >>= 1) mt = fmaxf(mt, __shfl_xor_sync(0xffffffffu, mt, x));
+            const float mo = sm[hh], mn = fmaxf(mo, mt);
+            float ps = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < T2_CPT; ++jj) {
+                const float p = sv[jj] > -INFINITY ? expf(sv[jj] - mn) : 0.0f;
+                ps += p;
+                sp16[hh * T2_CP + c0 + jj] = __float2half_rn(p);
+            }
+#pragma unroll
+            for (int x = T2_TPH / 2; x > 0; x >>= 1) ps += __shfl_xor_sync(0xffffffffu, ps, x);
+            __syncwarp();
+            if (tid % T2_TPH == 0) {
+                const float corr = mo > -INFINITY ? expf(mo - mn) : 0.0f;
+                sl[hh] = sl[hh] * corr + ps;
+                sm[hh] = mn;
+                sc[hh] = corr;
+            }
+        }
+        __syncthreads();
+        // O = O * corr + P V: A = P's row (16 pr +) 8 rb + j + 4 hi, cells 4 st ..; B (.row) = the latent row 4 st + j,
+        // dims cbase + 16 g + 8 cb + 4 hi ..
+        {
+            const float k0 = sc[pr * 16 + ra], k1 = sc[pr * 16 + ra + 2];
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) o[g][i] *= ((i >> 1) & 1) ? k1 : k0;
+#pragma unroll
+            for (int st = 0; st < T2_C / 4; ++st) {
+                const uint2 a = *(const uint2*) (sp16 + (pr * 16 + 8 * rb + j + 4 * hi) * T2_CP + 4 * st);
+#pragma unroll
+                for (int g = 0; g < 8; ++g) {
+                    const uint2 b = *(const uint2*) (srow + (4 * st + j) * T2_LD + cbase + 16 * g + 8 * cb + 4 * hi);
+                    v7_mma884rr(o[g], a.x, a.y, b.x, b.y);
+                }
+            }
+        }
+    }
+    __syncthreads();
+    if constexpr (SPLIT) {   // the split's partial: the context as summed (unnormalised), then each head's max and sum
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+            const int hl = pr * 16 + ra + 2 * x;
+            float* orow = part + ((size_t) blockIdx.x * n_head + h0 + hl) * (KV + 2) + cbase;
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+#pragma unroll
+                for (int i = 0; i < 8; i += 2) {
+                    if (((i >> 1) & 1) != x) continue;
+                    orow[16 * g + 8 * cb + (i & 4) + (L & 2)] = o[g][i];
+                    orow[16 * g + 8 * cb + (i & 4) + (L & 2) + 1] = o[g][i + 1];
+                }
+        }
+        if (tid < T2_H) {
+            float* ph = part + ((size_t) blockIdx.x * n_head + h0 + tid) * (KV + 2);
+            ph[KV] = sm[tid];
+            ph[KV + 1] = sl[tid];
+        }
+    } else {
+#pragma unroll
+        for (int x = 0; x < 2; ++x) {
+            const int hl = pr * 16 + ra + 2 * x;
+            const float Ls = sl[hl];
+            const float inv = Ls > 0.0f ? 1.0f / Ls : 0.0f;
+            float* orow = ctx + ((size_t) t * n_head + h0 + hl) * KV + cbase;
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+#pragma unroll
+                for (int i = 0; i < 8; i += 2) {
+                    if (((i >> 1) & 1) != x) continue;
+                    *(float2*) (orow + 16 * g + 8 * cb + (i & 4) + (L & 2)) =
+                        make_float2(o[g][i] * inv, o[g][i + 1] * inv);
+                }
+        }
+    }
+#endif
+}
+
+// mla_decode_v70's merge of its splits' partials: a block per (head, 128 columns), the splits' weights once into shared
+// memory (exp(m_split - M)), then one coalesced pass over the splits' rows; ctx = sum w O / sum w l
+__global__ void __launch_bounds__(128) mla_dec_combine_kernel(const float* __restrict__ part, int n_split, int n_head,
+                                                              float* __restrict__ ctx) {
+    constexpr int KV = 512;
+    __shared__ float s_w[64];
+    __shared__ float s_L;
+    const int h = blockIdx.x, tid = threadIdx.x;
+    const size_t st = (size_t) n_head * (KV + 2);
+    const float* ph = part + (size_t) h * (KV + 2);
+    if (tid < 32) {
+        float M = -INFINITY;
+        for (int b = tid; b < n_split; b += 32) M = fmaxf(M, ph[b * st + KV]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
+        float Lsum = 0.0f;
+        for (int b = tid; b < n_split; b += 32) {
+            const float mb = ph[b * st + KV];
+            const float w = mb == -INFINITY ? 0.0f : expf(mb - M);
+            s_w[b] = w;
+            Lsum += w * ph[b * st + KV + 1];
+        }
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) Lsum += __shfl_xor_sync(0xffffffffu, Lsum, o);
+        if (tid == 0) s_L = Lsum;
+    }
+    __syncthreads();
+    const float invL = s_L > 0.0f ? 1.0f / s_L : 0.0f;
+    const int c = blockIdx.y * 128 + tid;
+    float acc = 0.0f;
+#pragma unroll 8
+    for (int b = 0; b < n_split; ++b) acc += s_w[b] * ph[b * st + c];
+    ctx[(size_t) KV * h + c] = acc * invL;
 }
 
 // The same tensor-core attention with the context O in the wmma accumulator registers (four 16-wide column tiles a
@@ -905,6 +1295,9 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
                                                               const int* __restrict__ cells_all,
                                                               const int* __restrict__ n_sel_arr, int n_sel_max, int n_head,
                                                               float scale, float* __restrict__ ctx, bool q8) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - never picked there (it needs sm_75's fragment layout)
+#else
     using namespace nvcuda;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char tc_sm[];
@@ -1025,6 +1418,7 @@ __global__ void __launch_bounds__(256) mla_attn_tc_reg_kernel(const float* __res
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? o[i] / L : 0.0f;
     }
+#endif
 }
 
 // The same attention on Ampere and newer (sm_80+: mma.sync m16n8k16 and ldmatrix), FlashAttention-2 style: block =
@@ -1245,6 +1639,9 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
                                                             const int* __restrict__ cells_all,
                                                             const int* __restrict__ n_sel_arr, int n_sel_max,
                                                             int n_head, float scale, float* __restrict__ ctx, bool q8) {
+#if !STRATA_ROCWMMA
+    __builtin_trap();   // (a device pass without rocWMMA: never launched there)
+#else
     namespace wm = rocwmma;
     constexpr int KV = 512;
     extern __shared__ __align__(128) unsigned char hw_sm[];
@@ -1347,6 +1744,7 @@ __global__ void __launch_bounds__(256) mla_attn_wmma_kernel(const _Float16* __re
         const float L = s_l[i / KV];
         o[i] = L > 0.0f ? sO[i] / L : 0.0f;
     }
+#endif
 }
 
 using mla2_h16 = _Float16 __attribute__((ext_vector_type(16)));
@@ -1480,8 +1878,9 @@ __global__ void __launch_bounds__(256) mla_attn_wmma2_kernel(
         }
 }
 
-// Per device, the wave32 WMMA path: 0 not probed yet, 1 gfx12 (supported, the default), 2 gfx11 (supported),
-// 3 anything else (unsupported).
+// Per device, the wave32 WMMA path: 0 not probed yet, 1 gfx12, 2 other gfx11 (gfx1100/1101/1102/1150),
+// 4 gfx1151 (Strix Halo), 3 anything else (unsupported).
+// Default wmma2 on gfx12 and gfx1151; other gfx11 stay on f16q.
 int mla_wmma2_arch() {
     static std::atomic<int> cache[64]{};
     int dev = 0;
@@ -1494,9 +1893,10 @@ int mla_wmma2_arch() {
             const char* arch = prop.gcnArchName;
             if (std::strncmp(arch, "gfx1200", 7) == 0 || std::strncmp(arch, "gfx1201", 7) == 0)
                 c = 1;
+            else if (std::strncmp(arch, "gfx1151", 7) == 0)
+                c = 4;
             else if (std::strncmp(arch, "gfx1100", 7) == 0 || std::strncmp(arch, "gfx1101", 7) == 0 ||
-                     std::strncmp(arch, "gfx1102", 7) == 0 || std::strncmp(arch, "gfx1150", 7) == 0 ||
-                     std::strncmp(arch, "gfx1151", 7) == 0)
+                     std::strncmp(arch, "gfx1102", 7) == 0 || std::strncmp(arch, "gfx1150", 7) == 0)
                 c = 2;
         }
         cache[dev].store(c, std::memory_order_relaxed);
@@ -1716,6 +2116,18 @@ __global__ void swiglu_rows_kernel(const float* gu, float* h, int rows, int n_ff
     h[r * ld_h + c] = (g / (1.0f + expf(-g))) * u;
 }
 
+// the same rows, FP16 out with its own stride (the Volta grouped-WMMA down product reads its activations as FP16)
+__global__ void swiglu_rows_h16_kernel(const float* gu, uint16_t* h, int rows, int n_ff, int ld_h, float limit) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (int64_t) rows * n_ff) return;
+    const int64_t r = i / n_ff;
+    const int c = (int) (i - r * n_ff);
+    const float* row = gu + r * 2 * n_ff;
+    const float g = fminf(row[c], limit);
+    const float u = fminf(fmaxf(row[n_ff + c], -limit), limit);
+    h[r * ld_h + c] = __half_as_ushort(__float2half_rn((g / (1.0f + expf(-g))) * u));
+}
+
 __global__ void swiglu_f16_kernel(const float* __restrict__ gate, const float* __restrict__ up, __half* __restrict__ h,
                                   int64_t n, float limit) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -1881,6 +2293,77 @@ void dsa_pool(const float* ik_cache, const float* ig_cache, const float* ape, fl
     check("dsa_pool");
 }
 
+#if !defined(STRATA_USE_HIP)
+// The tiled kernel's scores on the FP16 tensor cores (the default on CUDA; STRATA_GLM_DSA_SCORE=2 as well): the same tile - 4 tokens' 128 (token,
+// head) query rows against 64 pools, the whole 128-long k in shared memory as FP16 - eight warps of 16 rows x 64 pools
+// (four m16n16k16 accumulators), FP32 sums; the epilogue as the tiled one's (relu(dot) * w over the 32 heads, FP32).
+constexpr int TC_LDA = 128 + 8, TC_LDC = 64 + 4;
+constexpr size_t dsa_tc_smem() {
+    return std::max((size_t) (128 + 64) * TC_LDA * 2, (size_t) 128 * TC_LDC * 4);
+}
+__global__ void __launch_bounds__(256) dsa_score_tc_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                           const float* __restrict__ iw, int p0, int kpool, int T,
+                                                           int max_vis, float* __restrict__ score, int score_ld) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 700
+    // Pascal (sm_6x): no tensor cores - dsa_score takes the FP32 tiled kernel there (major < 7), never this one
+#else
+    using namespace nvcuda;
+    constexpr int H = 32, K = 128;
+    extern __shared__ __align__(32) unsigned char sm_raw[];
+    __half* As = (__half*) sm_raw;            // [128 rows][TC_LDA]
+    __half* Bs = As + 128 * TC_LDA;          // [64 pools][TC_LDA]
+    float* Cs = (float*) sm_raw;             // [128 rows][TC_LDC] (after the products)
+    const int t0 = blockIdx.y * TS_T, pbeg = blockIdx.x * TS_P;
+    const int t_last = min(T, t0 + TS_T) - 1;
+    if (pbeg >= (p0 + t_last + 1) / kpool) return;
+    const int tid = threadIdx.x, warp = tid >> 5;
+    for (int i = tid; i < 128 * (K / 4); i += 256) {
+        const int r = i / (K / 4), k = (i % (K / 4)) * 4, t = t0 + (r >> 5);
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (t < T) v = *(const float4*) (iq + ((size_t) t * H + (r & 31)) * K + k);
+        __half2* d = (__half2*) (As + r * TC_LDA + k);
+        d[0] = __floats2half2_rn(v.x, v.y);
+        d[1] = __floats2half2_rn(v.z, v.w);
+    }
+    for (int i = tid; i < 64 * (K / 4); i += 256) {
+        const int pp = i / (K / 4), k = (i % (K / 4)) * 4, p = pbeg + pp;
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (p < max_vis) v = *(const float4*) (pooled + (size_t) p * K + k);
+        __half2* d = (__half2*) (Bs + pp * TC_LDA + k);
+        d[0] = __floats2half2_rn(v.x, v.y);
+        d[1] = __floats2half2_rn(v.z, v.w);
+    }
+    __syncthreads();
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+#pragma unroll
+    for (int n = 0; n < 4; ++n) wmma::fill_fragment(acc[n], 0.0f);
+#pragma unroll
+    for (int k = 0; k < K; k += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+        wmma::load_matrix_sync(a, As + warp * 16 * TC_LDA + k, TC_LDA);
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+            wmma::load_matrix_sync(b, Bs + n * 16 * TC_LDA + k, TC_LDA);
+            wmma::mma_sync(acc[n], a, b, acc[n]);
+        }
+    }
+    __syncthreads();   // (the operands are dead: the same storage holds the dots)
+#pragma unroll
+    for (int n = 0; n < 4; ++n) wmma::store_matrix_sync(Cs + warp * 16 * TC_LDC + n * 16, acc[n], TC_LDC, wmma::mem_row_major);
+    __syncthreads();
+    {   // 256 threads = 4 tokens x 64 pools: relu(dot) * w summed over the token's 32 heads
+        const int ot = tid >> 6, op = tid & 63, tok = t0 + ot, p = pbeg + op;
+        if (tok < T && p < (p0 + tok + 1) / kpool) {
+            float sum = 0.0f;
+            for (int h = 0; h < H; ++h) sum += fmaxf(Cs[(ot * 32 + h) * TC_LDC + op], 0.0f) * iw[(size_t) tok * H + h];
+            score[(size_t) tok * score_ld + p] = sum;
+        }
+    }
+#endif
+}
+#endif
+
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int p0, int kpool,
                int T, int max_vis, float* score, int score_ld, cudaStream_t s) {
     if (T <= 0 || max_vis <= 0) return;
@@ -1889,6 +2372,34 @@ void dsa_score(const float* iq, const float* pooled, const float* iw, int key_di
         const char* v = getenv("STRATA_GLM_DSA_SCORE");
         return v == nullptr || std::atoi(v) != 0;
     }();
+#if !defined(STRATA_USE_HIP)
+    // (the default on CUDA; STRATA_GLM_DSA_SCORE=1: the FP32 tiled kernel, 0: the warp kernel) - 27K prompt dsa_index
+    // 826 / 826 -> 495 / 495 ms, prompt 36.9 / 37.0 -> 36.6 / 36.6 s, the needle answered
+    static const bool tc = getenv("STRATA_GLM_DSA_SCORE") == nullptr || std::atoi(getenv("STRATA_GLM_DSA_SCORE")) == 2;
+    if (tc && idx_heads == 32 && key_dim == 128) {
+        // per device (a split's cards each need the shared-memory opt-in; Pascal has no tensor cores): 0 not looked
+        // at yet, 1 the tensor-core kernel, -1 the FP32 tiled one
+        static int tc_dev[16] = {};
+        int dev = 0;
+        cudaGetDevice(&dev);
+        if (dev < 0 || dev >= 16) dev = 0;
+        if (tc_dev[dev] == 0) {
+            int major = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            tc_dev[dev] = major >= 7 && cudaFuncSetAttribute(dsa_score_tc_kernel,
+                                                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                             (int) dsa_tc_smem()) == cudaSuccess
+                              ? 1 : -1;
+            cudaGetLastError();
+        }
+        if (tc_dev[dev] > 0) {
+            dsa_score_tc_kernel<<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + TS_T - 1) / TS_T)), 256,
+                                  dsa_tc_smem(), s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
+            check("dsa_score_tc");
+            return;
+        }
+    }
+#endif
     if (tiled && idx_heads == 32 && key_dim == 128) {
         dsa_score_tiled_kernel<<<dim3((unsigned) ((max_vis + TS_P - 1) / TS_P), (unsigned) ((T + TS_T - 1) / TS_T)), 256,
                                  0, s>>>(iq, pooled, iw, p0, kpool, T, max_vis, score, score_ld);
@@ -1906,6 +2417,56 @@ void dsa_select(const float* score, int score_ld, int p0, int kpool, int top_poo
     if (T <= 0) return;
     dsa_select_kernel<<<T, 1024, 0, s>>>(score, score_ld, p0, kpool, top_pools_max, tail, n_sel_max, cells, n_sel);
     check("dsa_select");
+}
+
+bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
+                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8) {
+#if defined(STRATA_USE_HIP)
+    (void) q_abs, (void) lat, (void) cells, (void) n_sel, (void) n_head, (void) kv_lora, (void) scale, (void) ctx;
+    (void) part, (void) part_cap, (void) s, (void) lat_q8;
+    return false;   // (Volta only)
+#else
+    // Volta (sm_70 / sm_72) only, and the v70 kernel's shapes; STRATA_GLM_MLA_V70=0: the F32 split kernel (A/B)
+    static const bool want = [] {
+        const char* v = getenv("STRATA_GLM_MLA_V70");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (!want || kv_lora != 512 || n_head % T2_H != 0 || n_sel <= 0 || part == nullptr) return false;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev >= 16) return false;
+    static int ok[16] = {};
+    static int sms[16] = {};
+    if (ok[dev] == 0) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaDeviceGetAttribute(&sms[dev], cudaDevAttrMultiProcessorCount, dev);
+        ok[dev] = major == 7 && minor < 5 &&
+                          cudaFuncSetAttribute(mla_attn_v70_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               (int) kV7Smem) == cudaSuccess
+                      ? 1
+                      : -1;
+        cudaGetLastError();
+        if (ok[dev] == 1) std::fprintf(stderr, "glm_batch: CUDA%d decode attention: the split one-pass kernel (mma.m8n8k4)\n", dev);
+    }
+    if (ok[dev] != 1) return false;
+    // splits of whole 32-cell tiles, about one block a multiprocessor over the head groups (STRATA_GLM_MLA_V70_SPLITS:
+    // the splits a head group wants), at most 64 (the combine's weights) and the partial buffer's capacity
+    static const int want_splits = [] {
+        const char* v = getenv("STRATA_GLM_MLA_V70_SPLITS");
+        return v ? std::max(1, std::atoi(v)) : 0;
+    }();
+    const int groups = n_head / T2_H;
+    const int target = std::min(64, std::min(part_cap, want_splits > 0 ? want_splits : std::max(1, sms[dev] / groups)));
+    const int tiles = (n_sel + T2_C - 1) / T2_C;
+    const int cblk = T2_C * ((tiles + target - 1) / target);
+    const int n_split = (n_sel + cblk - 1) / cblk;
+    mla_attn_v70_kernel<true><<<dim3((unsigned) n_split, (unsigned) groups), 256, kV7Smem, s>>>(
+        q_abs, lat, cells, nullptr, n_sel, n_head, scale, ctx, lat_q8, cblk, part);
+    mla_dec_combine_kernel<<<dim3((unsigned) n_head, (unsigned) (kv_lora / 128)), 128, 0, s>>>(part, n_split, n_head, ctx);
+    return true;
+#endif
 }
 
 void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,
@@ -1958,7 +2519,41 @@ void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const i
                                                 : "tensor cores");
     }
     if (tc_ok[dev] > 0 && !f32_only) {
-        if (tc_ok[dev] == 3)
+        // Volta: the two-pass kernel, 32 heads a block, unless STRATA_GLM_PREFILL_ATTN=tc (the 16-head one).  V100,
+        // Maya-S24, 27K prompts: dsa_attn 22.5 / 23.2 -> 12.2 / 12.5 s, the prompt's GPU time 78.5 / 82.1 -> 70.5 /
+        // 72.3 s; rel L2 against the F32 kernel 4.4-5.2e-5 (the 16-head one's)
+        static const bool want_tc2 = attn_mode == nullptr || std::strcmp(attn_mode, "tc") != 0;
+        // the shared-memory attribute is per GPU: set on each one (once set only on the first, a split's later GPUs
+        // failed the launch and their layers read stale attention)
+        static int tc2_ok[16] = {};
+        if (tc2_ok[dev] == 0) {
+            tc2_ok[dev] = cudaFuncSetAttribute(mla_attn_tc2_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               (int) kT2Smem) == cudaSuccess ? 1 : -1;
+            cudaGetLastError();
+        }
+        // the one-pass kernel (mla_attn_v70_kernel) by default on Volta (sm_70 / sm_72); STRATA_GLM_PREFILL_ATTN=tc2:
+        // the two-pass one.  Maya-S24, one V100: dsa_attn of a 27K prompt 6.87 -> 4.09 s, prompts 2K / 8K / 27K +4 / +9 /
+        // +9 %; KL against tc2 0.0119 where the exact F32 kernel's is 0.0124; needles 6 / 6 at 40K and 100K (128K context)
+        static const bool want_v70 = attn_mode == nullptr || std::strcmp(attn_mode, "v70") == 0;
+        static int v70_ok[16] = {};
+        if (v70_ok[dev] == 0) {
+            int major = 0, minor = 0;
+            cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+            v70_ok[dev] = want_v70 && major == 7 && minor < 5 &&
+                          cudaFuncSetAttribute(mla_attn_v70_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                               (int) kV7Smem) == cudaSuccess ? 1 : -1;
+            cudaGetLastError();
+            if (v70_ok[dev] == 1)
+                std::fprintf(stderr, "glm_batch: CUDA%d prompt attention: the one-pass kernel (mma.m8n8k4)\n", dev);
+        }
+        if (tc_ok[dev] == 1 && v70_ok[dev] == 1 && n_head % T2_H == 0)
+            mla_attn_v70_kernel<false><<<dim3((unsigned) T, (unsigned) (n_head / T2_H)), 256, kV7Smem, s>>>(
+                q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+        else if (tc_ok[dev] == 1 && want_tc2 && tc2_ok[dev] == 1 && n_head % T2_H == 0)
+            mla_attn_tc2_kernel<<<dim3((unsigned) T, (unsigned) (n_head / T2_H)), 256, kT2Smem, s>>>(
+                q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
+        else if (tc_ok[dev] == 3)
             mla_attn_mma_kernel<<<dim3((unsigned) T, (unsigned) (n_head / MT_H)), 256, kMtSmem, s>>>(
                 q_abs, lat, cells, n_sel, n_sel_max, n_head, scale, ctx, lat_q8);
         else if (tc_ok[dev] == 2)
@@ -2015,8 +2610,8 @@ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, c
     check("mla_attn_wmma");
 }
 
-bool mla_wmma2_supported() { return mla_wmma2_arch() <= 2; }
-bool mla_wmma2_default() { return mla_wmma2_arch() == 1; }
+bool mla_wmma2_supported() { const int a = mla_wmma2_arch(); return a == 1 || a == 2 || a == 4; }
+bool mla_wmma2_default() { const int a = mla_wmma2_arch(); return a == 1 || a == 4; }
 
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                     int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8) {
@@ -2084,6 +2679,13 @@ void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cud
     if (rows <= 0) return;
     swiglu_rows_kernel<<<nblk((int64_t) rows * n_ff), 256, 0, s>>>(gu, h, rows, n_ff, ld_h > 0 ? ld_h : n_ff, limit);
     check("swiglu_rows");
+}
+
+void swiglu_rows_h16(const float* gu, void* h16, int rows, int n_ff, float limit, cudaStream_t s, int ld_h) {
+    if (rows <= 0) return;
+    swiglu_rows_h16_kernel<<<nblk((int64_t) rows * n_ff), 256, 0, s>>>(gu, (uint16_t*) h16, rows, n_ff,
+                                                                       ld_h > 0 ? ld_h : n_ff, limit);
+    check("swiglu_rows_h16");
 }
 
 void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float limit, cudaStream_t s) {

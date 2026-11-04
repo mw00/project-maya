@@ -1,0 +1,116 @@
+# Every push and pull request: the experimental Metal engine (maya-metal, Apple Silicon) built on GitHub's macOS runner
+# and its small tests on the repository's synthetic GLM fixture - no model files. The runner is a virtual Mac: the first
+# step says whether Metal is usable there; without a Metal GPU the GPU tests are skipped (the CPU ones still run).
+name: macos
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  metal:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      # llama.cpp at the commit the installer pins (setup.py LLAMA_CPP_COMMIT): ggml for the build, gguf-py for the tools
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: 3cf03257f219afbe7334045ff7c6a06ac68c627d
+          path: third_party/llama.cpp
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Metal on this runner
+        id: metal
+        run: |
+          uname -a
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu
+          system_profiler SPDisplaysDataType || true
+          cat > "$RUNNER_TEMP/metal_check.m" <<'EOF'
+          #import <Foundation/Foundation.h>
+          #import <Metal/Metal.h>
+          int main(void) {
+              @autoreleasepool {
+                  id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+                  if (d == nil) { printf("metal=no (MTLCreateSystemDefaultDevice returned nil)\n"); return 1; }
+                  printf("metal device: %s\n", d.name.UTF8String);
+                  printf("unified memory: %d, recommendedMaxWorkingSetSize: %.2f GB\n", (int) d.hasUnifiedMemory,
+                         d.recommendedMaxWorkingSetSize / 1e9);
+                  printf("families: Apple7 %d, Apple8 %d, Apple9 %d, Metal3 %d\n",
+                         (int) [d supportsFamily:MTLGPUFamilyApple7], (int) [d supportsFamily:MTLGPUFamilyApple8],
+                         (int) [d supportsFamily:MTLGPUFamilyApple9], (int) [d supportsFamily:MTLGPUFamilyMetal3]);
+                  printf("metal=yes\n");
+              }
+              return 0;
+          }
+          EOF
+          clang -fobjc-arc -framework Foundation -framework Metal "$RUNNER_TEMP/metal_check.m" -o "$RUNNER_TEMP/metal_check"
+          if "$RUNNER_TEMP/metal_check" > "$RUNNER_TEMP/metal_check.txt"; then
+            cat "$RUNNER_TEMP/metal_check.txt"
+            echo "gpu=yes" >> "$GITHUB_OUTPUT"
+            # Apple7 (every Apple-silicon Mac) has the simdgroup kernels; a virtual Mac's GPU does not
+            if grep -q "Apple7 1" "$RUNNER_TEMP/metal_check.txt"; then echo "apple7=yes" >> "$GITHUB_OUTPUT"; else echo "apple7=no" >> "$GITHUB_OUTPUT"; fi
+          else
+            echo "::warning::No Metal GPU on this runner: the GPU tests are skipped, only the build and the CPU tests run"
+            echo "gpu=no" >> "$GITHUB_OUTPUT"
+          fi
+      # a venv, as installs run; numpy etc. for the setup tests (tools/test_maya_metal.py imports maya.py and the server)
+      - name: Python packages
+        run: |
+          python -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil 'jsonschema>=4.18,<5'
+      - name: Metal setup tests (maya.py on a Mac)
+        run: '"$RUNNER_TEMP/venv/bin/python" -m unittest tools.test_maya_metal tools.test_setup_download -v'
+      # as ./maya.sh --backend metal configures it, with the parity tests on and no -mcpu=native
+      - name: Configure maya-metal
+        run: |
+          cmake -S . -B build-metal -DCMAKE_BUILD_TYPE=Release -DMAYA_ENABLE_METAL=ON -DMAYA_METAL_TESTS=ON \
+            -DMAYA_METAL_PORTABLE=ON -DMAYA_GGML_DIR="$GITHUB_WORKSPACE/third_party/llama.cpp" \
+            -DMAYA_SERVE_PYTHON3="$RUNNER_TEMP/venv/bin/python" -DMAYA_PYTHON3="$RUNNER_TEMP/venv/bin/python"
+      - name: Build maya-metal and its tests
+        run: cmake --build build-metal --target maya-metal metal_model_test metal_sampler_test -j "$(sysctl -n hw.ncpu)"
+      - name: The engine starts
+        run: ./build-metal/maya-metal --help
+      # no GPU needed: the sampler against its reference, and the GLM gates on ggml-cpu (MAYA_METAL_CPU=1)
+      - name: CPU tests
+        working-directory: build-metal
+        run: ctest --output-on-failure --timeout 900 -R '^(metal_sampler_test|metal_model_test_cpu)$'
+      # the small fixture on the Metal GPU: the GLM gates, the expert pool at its floor, verify windows, a 2048-token
+      # slice and the --serve protocol. (The 45-layer / MTP / DFlash2 / Q8 / 16-head fixtures - 1.2 GB GGUFs generated
+      # into the build tree, up to an hour each - are left to a real Mac.)
+      - name: GPU tests
+        if: steps.metal.outputs.gpu == 'yes' && steps.metal.outputs.apple7 == 'yes'
+        working-directory: build-metal
+        run: >-
+          ctest --output-on-failure --timeout 1800
+          -R '^(metal_model_test|metal_model_test_evict|metal_model_window|metal_model_big_slice|metal_serve_test)$'
+      # a virtual Mac's GPU (no Apple7 simdgroup kernels): the engine must refuse it with a clear message, and with
+      # MAYA_METAL_ALLOW_ANY_GPU=1 the tests whose weights stay in shared memory still run (the 2048-token slice puts
+      # experts in GPU-only memory and needs a real Apple-silicon GPU)
+      - name: GPU without Apple7 is refused clearly
+        if: steps.metal.outputs.gpu == 'yes' && steps.metal.outputs.apple7 != 'yes'
+        run: |
+          if ./build-metal/metal_model_test prefill data/glm5-synth.gguf 64 > refuse.txt 2>&1; then
+            cat refuse.txt; echo "::error::maya-metal started on a GPU without Apple7 support"; exit 1
+          fi
+          cat refuse.txt
+          grep -q "needs Apple silicon" refuse.txt || { echo "::error::no clear message for an unsupported GPU"; exit 1; }
+          if grep -q "GGML_ASSERT" refuse.txt; then echo "::error::an assert instead of the message"; exit 1; fi
+      - name: GPU tests (virtual GPU, MAYA_METAL_ALLOW_ANY_GPU=1)
+        if: steps.metal.outputs.gpu == 'yes' && steps.metal.outputs.apple7 != 'yes'
+        working-directory: build-metal
+        env:
+          MAYA_METAL_ALLOW_ANY_GPU: "1"
+        run: >-
+          ctest --output-on-failure --timeout 1800
+          -R '^(metal_model_test|metal_model_test_evict|metal_model_window|metal_serve_test)$'
+      - name: GPU tests skipped
+        if: steps.metal.outputs.gpu != 'yes'
+        run: echo "::notice::GPU tests skipped - this runner has no usable Metal device (see the first step)"

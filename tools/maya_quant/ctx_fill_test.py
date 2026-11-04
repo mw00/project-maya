@@ -27,7 +27,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pack", required=True)
     ap.add_argument("--tok", default="/mnt/nvme/maya/glm53-fp8/tokenizer.json")
-    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "strata"))
+    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "maya"))
     ap.add_argument("--sizes", default="8000,16000,30000", help="prompt sizes in tokens")
     ap.add_argument("--max-context", type=int, default=32768)
     ap.add_argument("--max-new", type=int, default=1500)

@@ -2,6 +2,9 @@
 #include <hipblas/hipblas.h>
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUBLAS_DEFAULT_MATH HIPBLAS_DEFAULT_MATH
+// cuBLAS' pedantic mode keeps F32 GEMMs in F32 (no TF32); hipBLAS' default math already does (XF32 is opt-in), and
+// HIPBLAS_DEFAULT_MATH exists in every hipBLAS the build supports.
+#define CUBLAS_PEDANTIC_MATH HIPBLAS_DEFAULT_MATH
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 // hipBLAS selects the available matrix instructions with its default algorithm.
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
@@ -11,6 +14,7 @@
 #define CUDA_R_16BF HIP_R_16BF
 #define CUDA_R_16F HIP_R_16F
 #define CUDA_R_32F HIP_R_32F
+#define cudaDataType hipDataType
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
 #define cublasGemmEx hipblasGemmEx

@@ -268,7 +268,8 @@ struct MetaValue {
     double num() const { return (type == MetaType::F32 || type == MetaType::F64) ? f : (double)u; }
 };
 
-inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
+// keep: the items of an array kept (the rest are read past) - a sample by default, the count is what matters
+inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0, uint64_t keep = 64) {
     if (depth > 2) throw std::runtime_error("GGUF: array nesting too deep");
     MetaValue v;
     v.type = t;
@@ -316,10 +317,10 @@ inline MetaValue read_value(Cursor& c, MetaType t, int depth = 0) {
         v.elem = (MetaType)c.read<uint32_t>();
         v.count = c.read<uint64_t>();
         if (v.count > (1u << 24)) throw std::runtime_error("GGUF: implausible array length");
-        v.items.reserve((size_t)std::min<uint64_t>(v.count, 64));
+        v.items.reserve((size_t)std::min<uint64_t>(v.count, keep));
         for (uint64_t i = 0; i < v.count; ++i) {
             MetaValue e = read_value(c, v.elem, depth + 1);
-            if (i < 64) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
+            if (i < keep) v.items.push_back(std::move(e)); // keep a sample; the count is what matters
         }
         break;
     }
@@ -359,6 +360,26 @@ public:
     const MetaValue* get(const std::string& key) const {
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
+    }
+    // A metadata value with every item of its arrays (metadata() keeps a sample of each): the header walked again to
+    // the key - for the few readers that want a whole array (the tokenizer's tokens).  false: no such key.
+    bool get_full(const std::string& key, MetaValue& out) const {
+        if (meta_.find(key) == meta_.end()) return false;
+        Cursor c(base_, (size_t) size_);
+        c.read<uint32_t>();   // magic, version, n_tensors (parse() checked them)
+        c.read<uint32_t>();
+        c.read<uint64_t>();
+        const uint64_t n_kv = c.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            const std::string k = c.str();
+            const MetaType t = (MetaType)c.read<uint32_t>();
+            if (k == key) {
+                out = read_value(c, t, 0, UINT64_MAX);
+                return true;
+            }
+            read_value(c, t, 0, 0);
+        }
+        return false;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
@@ -489,10 +510,14 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
         {"qwen4exp.attention.head_count", want.head_count},
         {"qwen4exp.attention.head_count_kv", want.head_count_kv},
     };
+    // (a GGUF that ships its MTP block counts it into block_count - nextn_predict_layers more; the runner serves the
+    //  trunk, the packer leaves the MTP block out)
+    const MetaValue* nextn = g.get("qwen4exp.nextn_predict_layers");
+    const uint64_t extra = nextn ? nextn->u : 0;
     for (const auto& r : reqs) {
         const MetaValue* v = g.get(r.key);
         if (!v) return std::string("missing ") + r.key;
-        if (r.want && v->u != r.want)
+        if (r.want && v->u != r.want && !(r.key == reqs[0].key && extra > 0 && v->u == r.want + extra))
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
     return {}; // empty == ok

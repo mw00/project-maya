@@ -30,7 +30,7 @@ class HipSetupTests(unittest.TestCase):
         for ctx in (
             patch.object(maya, "ROOT", self.root),
             patch.object(maya, "BUILD", self.root / "build"),
-            patch.object(maya, "EXE", self.root / "build/strata"),
+            patch.object(maya, "EXE", self.root / "build/maya"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
             patch.object(maya, "WIN", False),
             patch.dict(os.environ, {"ROCM_PATH": str(self.rocm)}),
@@ -51,7 +51,28 @@ class HipSetupTests(unittest.TestCase):
         self.a.gpu = None
         pc = maya.check_pc(self.a)
         self.assertEqual(pc["gpus"], [self.gpus[1]])
-        self.assertEqual(maya.EXE, self.root / "build-hip/strata")
+        self.assertEqual(maya.EXE, self.root / "build-hip/maya")
+
+    def test_versioned_llvm_slot_is_found(self) -> None:
+        """Gentoo's versioned LLVM slots count as ROCm's compiler."""
+        # Gentoo keeps each LLVM version in its own slot: <root>/lib/llvm/22/bin/clang++
+        (self.rocm / "llvm/bin/clang++").unlink()
+        for v in ("18", "22"):
+            slot = self.rocm / f"lib/llvm/{v}/bin/clang++"
+            slot.parent.mkdir(parents=True, exist_ok=True)
+            slot.touch()
+        self.assertEqual(maya.hip_clang(self.rocm), self.rocm / "lib/llvm/22/bin/clang++")
+        pc = maya.check_pc(self.a)
+        self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
+
+    def test_rdna2_is_experimental_and_compiled_only_when_chosen(self):
+        pc = maya.check_pc(self.a)      # the RX 7900 XT: its own architecture only (#255)
+        self.assertEqual(pc["archs"], ["gfx1100"])
+        self.gpus.append({"index": 3, "arch": "gfx1030", "vendor": "amd", "name": "Radeon PRO V620", "vram_gb": 32})
+        self.a.gpu = 3
+        pc = maya.check_pc(self.a)
+        self.assertEqual(pc["gpus"], [self.gpus[3]])
+        self.assertEqual(pc["archs"], ["gfx1030"])     # no WMMA arch: no rocWMMA needed (ROCm 7 has none)
 
     def test_rejects_unsupported_card_and_bad_gpu_lists(self):
         self.a.gpu = 2
@@ -74,23 +95,23 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual([g["index"] for g in pc["gpus"]], [1, 0])   # the larger card first
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
-        cfg = json.loads(p.read_text())
+        cfg = maya.read_json(p)
         self.assertEqual(cfg["gpu"], [1, 0])
         self.assertNotIn("STRATA_GLM_SPLIT", cfg["env"])
         self.assertEqual(cfg["env"]["STRATA_HIPBLASLT_TUNING"],
-                         f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}:{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
+                         f"{tables / 'gfx1201-glm-hipblaslt-100202.txt'}{os.pathsep}{tables / 'gfx1100-glm-hipblaslt-100202.txt'}")
 
     def test_config_selects_hip_and_preserves_user_tuning(self):
         pc = maya.check_pc(self.a)
         self.a.env = ["STRATA_GLM_RESERVE_MB=4096"]
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
-        cfg = json.loads(p.read_text())
+        cfg = maya.read_json(p)
         self.assertEqual(cfg["backend"], "hip")
         self.assertEqual(cfg["gpu"], [0])
         self.assertEqual(cfg["env"]["STRATA_GLM_SPLIT"], "0")
         self.assertEqual(cfg["env"]["STRATA_GLM_RESERVE_MB"], "4096")
-        self.assertEqual(cfg["exe"], str(self.root / "build-hip/strata"))
+        self.assertEqual(cfg["exe"], str(self.root / "build-hip/maya"))
         self.assertNotIn("vision", cfg)
 
     def test_config_prompt_defaults_and_tuning_table(self):
@@ -98,24 +119,81 @@ class HipSetupTests(unittest.TestCase):
         tables.mkdir(parents=True)
         (tables / "gfx1100-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100202\n")
         (tables / "gfx1201-glm-hipblaslt-100202.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1201 100202\n")
+        (tables / "gfx1100-glm-hipblaslt-100401.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
+        # a second table for one version (another build's solution numbers) comes after that version's own file
+        (tables / "gfx1100-glm-hipblaslt-100401-b.txt").write_text("STRATA_HIPBLASLT_TUNING_V1 gfx1100 100401\n")
         pc = maya.check_pc(self.a)
         self.a.env = ["STRATA_GLM_PREFILL_SUB=512"]
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
                               self.root / "pack", "test", 8192, self.root / "data", None)
-        env = json.loads(p.read_text())["env"]
+        env = maya.read_json(p)["env"]
         self.assertNotIn("STRATA_GLM_PREFILL_CHUNK", env)
         self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "512")   # the user's setting wins
         self.assertEqual(env["STRATA_GLM_PREFILL_MB"], "4096")
         self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")
         self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
-        self.assertEqual(env["STRATA_HIPBLASLT_TUNING"], str(tables / "gfx1100-glm-hipblaslt-100202.txt"))
+        self.assertEqual(env["STRATA_HIPBLASLT_TUNING"].split(os.pathsep),
+                         [str(tables / "gfx1100-glm-hipblaslt-100202.txt"),
+                          str(tables / "gfx1100-glm-hipblaslt-100401.txt"),
+                          str(tables / "gfx1100-glm-hipblaslt-100401-b.txt")])
+        # Keep the runtime's exact-version choice; an explicit operator table still wins.
+        self.a.env.append("STRATA_HIPBLASLT_TUNING=/selected/table.txt")
+        p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                              self.root / "pack", "test", 8192, self.root / "data", None)
+        self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
 
-    def test_gpus_with_an_apu_is_rejected(self):
-        self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 4})
+    def test_rocm_devel_links_repaired(self):
+        # #574: rocm-sdk init skipped the device-library links whose unnormalized target passed 260 characters
+        site = self.root / "site"
+        lib = site / "_rocm_sdk_libraries"
+        (lib / "bin/rocblas/library/gfx1151").mkdir(parents=True)
+        for f in ("Kernels.hsaco", "TensileLibrary_Type_x.dat"):
+            (lib / "bin/rocblas/library/gfx1151" / f).write_bytes(f.encode())
+        (lib / ".devel_links").mkdir()
+        up = "../../../../../_rocm_sdk_libraries/bin/rocblas/library/gfx1151/"
+        links = [{"relpath": f"bin/rocblas/library/gfx1151/{f}", "target": up + f}
+                 for f in ("Kernels.hsaco", "TensileLibrary_Type_x.dat", "gone.dat")]
+        (lib / ".devel_links/gfx1151.json").write_text(json.dumps({"version": "7.14.1", "links": links}))
+        self.assertEqual(maya.rocm_devel_links(site), (0, []))           # (no expanded SDK yet: nothing to check)
+        devel = site / "_rocm_sdk_devel/bin/rocblas/library/gfx1151"
+        devel.mkdir(parents=True)
+        os.link(lib / "bin/rocblas/library/gfx1151/Kernels.hsaco", devel / "Kernels.hsaco")   # the one init made
+        self.assertEqual(maya.rocm_devel_links(site, repair=False),
+                         (0, [links[1]["relpath"], links[2]["relpath"]]))
+        made, absent = maya.rocm_devel_links(site)
+        self.assertEqual((made, absent), (1, [links[2]["relpath"]]))   # a target that is not there stays absent
+        self.assertEqual((devel / "TensileLibrary_Type_x.dat").read_bytes(), b"TensileLibrary_Type_x.dat")
+        self.assertTrue((devel / "TensileLibrary_Type_x.dat").samefile(
+            lib / "bin/rocblas/library/gfx1151/TensileLibrary_Type_x.dat"))   # a hard link, as init makes them
+        self.assertEqual(maya.rocm_devel_links(site), (0, [links[2]["relpath"]]))
+
+    def test_tuning_table_list_uses_the_os_path_separator(self):
+        # Windows joins with ';': a ':' would also split the drive letter of C:\... (the engine then opened \...)
+        tables = self.root / "tools/hip"
+        tables.mkdir(parents=True)
+        for v in ("100202", "100401"):
+            (tables / f"gfx1100-glm-hipblaslt-{v}.txt").write_text(f"STRATA_HIPBLASLT_TUNING_V1 gfx1100 {v}\n")
+        pc = maya.check_pc(self.a)
+        for sep in (";", ":"):
+            with self.subTest(sep=sep), patch.object(maya.os, "pathsep", sep):
+                p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "lib")]},
+                                      self.root / "pack", "test", 8192, self.root / "data", None)
+                self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"],
+                                 sep.join(str(tables / f"gfx1100-glm-hipblaslt-{v}.txt")
+                                          for v in ("100202", "100401")))
+
+    def test_gpus_with_an_apu_use_discrete_first_and_sequential_loading(self):
+        self.gpus.append({"index": 3, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 112})
         self.a.gpu = None
-        self.a.gpus = "1,3"
-        with self.assertRaises(SystemExit):
-            maya.check_pc(self.a)
+        for order in ("1,3", "3,1"):
+            self.a.gpus = order
+            pc = maya.check_pc(self.a)
+            self.assertEqual(pc["gpus"], [self.gpus[1], self.gpus[3]])
+            p = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192, self.root / "data", None)
+            cfg = maya.read_json(p)
+            self.assertEqual(cfg["gpu"], [1, 3])
+            self.assertEqual(cfg["env"]["STRATA_GLM_PARALLEL_LOAD"], "0")
+            self.assertNotIn("STRATA_GLM_SPLIT", cfg["env"])
         self.a.gpus = None
         self.a.gpu = 3
         self.assertEqual(maya.check_pc(self.a)["gpus"], [self.gpus[3]])
@@ -135,7 +213,7 @@ class HipSetupTests(unittest.TestCase):
             with self.subTest(ram=ram), patch.object(maya, "mem_gb", return_value=(ram, ram - 8)):
                 p = maya.write_config(self.a, pc, {}, self.root / "pack", "test", 8192,
                                       self.root / "data", None)
-                env = json.loads(p.read_text())["env"]
+                env = maya.read_json(p)["env"]
                 self.assertEqual(env["STRATA_GLM_SPLIT"], "0")
                 self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "1024")
                 self.assertEqual(env["STRATA_GLM_RAM_HEADROOM_GB"], "16")
@@ -157,7 +235,7 @@ class HipSetupTests(unittest.TestCase):
         self.a.env = [f"{k}={v}" for k, v in explicit.items()]
         p = maya.write_config(self.a, maya.check_pc(self.a), {}, self.root / "pack", "test", 8192,
                               self.root / "data", None)
-        env = json.loads(p.read_text())["env"]
+        env = maya.read_json(p)["env"]
         for k, v in explicit.items():
             self.assertEqual(env[k], v)
 
@@ -165,7 +243,7 @@ class HipSetupTests(unittest.TestCase):
         self.a.gpu = 1
         p = maya.write_config(self.a, maya.check_pc(self.a), {}, self.root / "pack", "test", 8192,
                               self.root / "data", None)
-        self.assertEqual(json.loads(p.read_text())["env"], {
+        self.assertEqual(maya.read_json(p)["env"], {
             "STRATA_GLM_SPLIT": "0", "STRATA_GLM_RESERVE_MB": "3072", "STRATA_GLM_RAM_HEADROOM_GB": "16",
             "STRATA_GLM_PREFILL_SUB": "1024", "STRATA_GLM_PREFILL_MB": "4096"})
         self.assertFalse(maya.hip_unified_memory(self.gpus[1]))
@@ -180,13 +258,57 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("-DSTRATA_ENABLE_HIP=ON", conf)
         self.assertIn("-DSTRATA_ENABLE_CUDA=OFF", conf)
         self.assertIn("-DSTRATA_PREFILL_MMQ=ON", conf)
-        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201;gfx1151", conf)
+        self.assertIn("-DCMAKE_HIP_ARCHITECTURES=gfx1100", conf)     # the chosen card's (#255)
         self.assertEqual(env["ROCM_PATH"], str(self.rocm))
         self.assertEqual(meta["backend"], "hip")
 
-    def test_hip_skips_vision_without_downloading(self):
+    def test_refresh_compiles_a_target_the_new_source_has_not_built(self):
+        # #664: after a git pull, starting GLM compiled build-hip/maya and stamped the new source with targets
+        # ["maya"]; the DeepSeek setup's next start found that source in the stamp and ran the old maya-ds4.
+        build = self.root / "build-hip"
+        build.mkdir()
+        (self.root / "llama/ggml").mkdir(parents=True)
+        (self.root / "llama/ggml/CMakeLists.txt").touch()
+        stamp = {"backend": "hip", "src": "new-sha", "archs": ["gfx1151"], "rocm": str(self.rocm),
+                 "llama": str(self.root / "llama"), "targets": ["maya"]}
+        cfg = {"exe": str(build / "maya-ds4"), "backend": "hip", "gpu": [0]}
+        with patch.object(maya, "EXE", build / "maya"), patch.object(maya, "DS4_EXE", build / "maya-ds4"), \
+                patch.object(maya, "MM3_EXE", build / "maya-mm3"), \
+                patch.object(maya, "STAMP", build / "MAYA-BUILD.json"), \
+                patch.object(maya.S, "source_hash", return_value="new-sha"), \
+                patch.object(maya, "hip_clang", return_value=self.rocm / "llvm/bin/clang++"), \
+                patch.object(maya, "compile_engine_hip") as compile_hip:
+            maya.STAMP.write_text(json.dumps(stamp))
+            maya.refresh_engine(cfg)
+            compile_hip.assert_called_once()
+            self.assertEqual(compile_hip.call_args.kwargs["target"], "maya-ds4")
+            compile_hip.reset_mock()
+            stamp["targets"] = ["maya", "maya-ds4"]
+            maya.STAMP.write_text(json.dumps(stamp))
+            maya.refresh_engine(cfg)                    # compiled from this source already: nothing to do
+            compile_hip.assert_not_called()
+
+    def test_hip_no_vision_skips_without_downloading(self):
+        self.a.no_vision = True
         with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):
             self.assertIsNone(maya.vision_step(self.a, {"backend": "hip"}, {}, self.root, self.root, "test"))
+
+    def test_hip_builds_the_vision_encoder(self):
+        # (#345) a HIP setup compiles maya-vision for its own GPUs, as a CUDA one does: the encoder on demand
+        spec = maya.MODELS.get("test") or maya.MODELS[next(iter(maya.MODELS))]
+        m = spec["vision"]
+        (self.root / m["folder"]).mkdir(parents=True, exist_ok=True)
+        for k in ("mmproj", "vocab"):
+            (self.root / m["folder"] / m[k]).write_bytes(b"x")
+        pc = {"backend": "hip", "archs": ["gfx1151"]}
+        self.a.rebuild = False
+        with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")), \
+                patch.object(maya, "compile_vision", return_value=True) as compile_vision, \
+                patch.object(maya, "VEXE", self.root / "no-maya-vision"):
+            v = maya.vision_step(self.a, pc, {"archs": ["gfx1151"]}, self.root, self.root, "test")
+        compile_vision.assert_called_once()
+        self.assertIs(compile_vision.call_args[0][0], pc)
+        self.assertTrue(v["gpu"])
 
     def installed_config(self, backend="hip", gpu=None):
         tp = self.root / "tokenizer"
@@ -195,7 +317,7 @@ class HipSetupTests(unittest.TestCase):
         (tp / "merges.txt").write_text("")
         (tp / "token_type.json").write_text("[1]")
         # A stale CUDA executable in a HIP config must not select the CUDA build.
-        cfg = {"exe": str(self.root / "build/strata"), "args": ["--max-context", "16384"],
+        cfg = {"exe": str(self.root / "build/maya"), "args": ["--max-context", "16384"],
                "tokenizer": str(tp), "gpu": [0] if gpu is None else gpu,
                "env": {"STRATA_GLM_PREFILL_SUB": "512", "STRATA_GLM_RAM_GB": "60"},
                "lib_dirs": [str(self.rocm / "lib")]}
@@ -231,7 +353,7 @@ class HipSetupTests(unittest.TestCase):
         call, text = self.run_bench(self.installed_config(gpu=[1, 0]))
         self.assertEqual(maya.BUILD, self.root / "build-hip")
         self.assertEqual(maya.STAMP, self.root / "build-hip/MAYA-BUILD.json")
-        self.assertEqual(call.args[0][:2], [str(self.root / "build-hip/strata"), "--serve"])
+        self.assertEqual(call.args[0][:2], [str(self.root / "build-hip/maya"), "--serve"])
         self.assertEqual(call.args[0][-2:], ["--layer-split", "auto"])
         env = call.kwargs["env"]
         self.assertEqual(env["HIP_VISIBLE_DEVICES"], "1,0")
@@ -245,7 +367,7 @@ class HipSetupTests(unittest.TestCase):
 
     def test_bench_cuda_command_and_env_unchanged(self):
         path = self.installed_config(backend="cuda", gpu=[1, 0])
-        cfg = json.loads(path.read_text())
+        cfg = maya.read_json(path)
         cfg["exe"] = str(self.root / "custom-cuda/strata")
         path.write_text(json.dumps(cfg))
         with patch.object(maya.S, "gpus", return_value=[{"name": "V100", "vram_gb": 16}]), \
@@ -263,6 +385,17 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(call.kwargs["env"]["HIP_VISIBLE_DEVICES"], "0")
         self.assertNotIn("--layer-split", call.args[0])
         self.assertIn("GPUs: RX 7900 XT 20 GB;", text)
+
+    def test_bench_uses_ds4_build_on_hip(self):
+        # #350: bench() hardcoded the GLM binary for every HIP config, so a DeepSeek setup's --bench crashed with
+        # FileNotFoundError (build-hip/maya was never built there - build-hip/maya-ds4 was).
+        path = self.installed_config(gpu=[1, 0])
+        cfg = maya.read_json(path)
+        cfg["exe"] = str(self.root / "build-hip/maya-ds4")            # what write_config_ds4 actually writes
+        cfg["args"] = ["--pack", str(self.root / "model/maya-ds4")] + cfg["args"]
+        path.write_text(json.dumps(cfg))
+        call, _ = self.run_bench(path)
+        self.assertEqual(call.args[0][:2], [str(self.root / "build-hip/maya-ds4"), "--serve"])
 
     def run_report(self, outputs=None, tools=(), backend=None, cfg_path=None):
         outputs = outputs or {}
@@ -301,7 +434,8 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("AMD Radeon AI PRO R9700", text)
         self.assertIn(str(32 * 2**30), text)
         self.assertIn("6.14.0-37", text)
-        self.assertIn(f"path {self.rocm}\nversion 7.2.1", text)
+        shown = str(self.rocm).replace(str(Path.home()), "~")
+        self.assertIn(f"path {shown}\nversion 7.2.1", text)
         self.assertIn('"backend": "hip"', text)
         self.assertIn("test-date", text)
         self.assertIn("the speed and memory lines (last 80 of 6)", text)
@@ -309,6 +443,30 @@ class HipSetupTests(unittest.TestCase):
             self.assertIn(line, text)
         query.assert_any_call(["/usr/bin/rocm-smi", "--showproductname", "--showmeminfo", "vram",
                                "--showdriverversion", "--json"])
+
+    def test_report_carries_minimax_engine_lines(self):
+        # a MiniMax report had none of its engine's lines ("last 80 of 0"): maya-mm3 --serve wrote where the model went
+        # to the server only, and REPORT_LINES knew no maya-mm3 line
+        kept = ["maya-mm3: loaded in 171.2 s, 9216 of 9216 experts in VRAM, 0.0 GB pinned pool",
+                "maya-mm3: weights: GGUF MiniMax-M3.1-Flash-Maya-S (dense Q6_K)",
+                "maya-mm3: VRAM 0 dense 7.9 GB, experts 118.1 GB",
+                "maya mm3 serve: DSpark kept 189 of 245 drafts",
+                "maya mm3 serve: prompt 201 tokens = 172 reused + 29 read in 806 ms (36.0 tok/s), 256 generated in "
+                "13334 ms (19.20 tok/s); CPU lane 0.0% of the experts"]
+        other = ["maya mm3 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <file> <ids>; STOP, QUIT"]
+        self.assertEqual(maya.speed_lines(kept + other), kept)
+
+    def test_report_minimax_images_from_its_vision_arg(self):
+        # a MiniMax report said "images off" with --vision on: it read cfg["vision"], which only GLM's configs set
+        path = self.installed_config()
+        cfg = maya.read_json(path)
+        cfg["exe"] = str(self.root / "build-hip/maya-mm3")
+        for args, shown in ((["--vision", "on"], "images on"), (["--vision", "off"], "images off"), ([], "images off")):
+            with self.subTest(args=args):
+                cfg["args"] = ["--pack", str(self.root / "model/maya-mm3"), "--max-context", "65536"] + args
+                path.write_text(json.dumps(cfg))
+                text, _ = self.run_report(cfg_path=path)
+                self.assertIn(shown + ",", text)
 
     def test_report_kfd_fallback_without_smi_or_rocm_version(self):
         self.installed_config()
@@ -318,10 +476,19 @@ class HipSetupTests(unittest.TestCase):
         self.assertIn("amdgpu driver:", text)
         self.assertIn("kernel", text)
         self.assertIn("using KFD topology", text)
-        self.assertIn(f"path {self.rocm}", text)
+        self.assertIn("path " + str(self.rocm).replace(str(Path.home()), "~"), text)
         self.assertIn("version unknown", text)
         self.assertFalse(any(Path(c.args[0][0]).name in ("rocm-smi", "amd-smi", "hipcc")
                              for c in query.call_args_list))
+
+    def test_report_rocm_path_inside_and_outside_home(self):
+        self.installed_config()
+        for home, shown in ((self.root, str(Path("~") / "rocm")), (self.root / "other-home", str(self.rocm))):
+            with self.subTest(home=home), patch.object(Path, "home", return_value=home):
+                text, _ = self.run_report()
+                self.assertIn(f"path {shown}\n", text)
+                if home == self.root:
+                    self.assertNotIn(str(home), text)
 
     def test_report_amd_smi_after_bad_rocm_smi_json(self):
         self.installed_config()
@@ -366,7 +533,7 @@ class HipSetupTests(unittest.TestCase):
     def test_report_explicit_config_selects_hip_env_and_log(self):
         self.installed_config(backend="cuda")
         path = self.installed_config().rename(self.root / "chosen.json")
-        cfg = json.loads(path.read_text())
+        cfg = maya.read_json(path)
         root = self.root / "chosen-rocm"
         (root / ".info").mkdir(parents=True)
         (root / ".info/version").write_text("7.2.2\n")
@@ -374,7 +541,8 @@ class HipSetupTests(unittest.TestCase):
         path.write_text(json.dumps(cfg))
         path.with_suffix(".log").write_text("glm stat: decode 50.0 ms/tok | prompt 413 tok/s\n")
         text, _ = self.run_report(cfg_path=path)
-        self.assertIn(f"path {root}\nversion 7.2.2", text)
+        shown = str(root).replace(str(Path.home()), "~")
+        self.assertIn(f"path {shown}\nversion 7.2.2", text)
         self.assertIn("Setup chosen.json", text)
         self.assertIn("Engine log chosen.log: the speed and memory lines", text)
         self.assertNotIn("Setup maya-test-cuda.json", text)
@@ -420,12 +588,29 @@ class HipSetupTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 maya.main()
 
+    def first_run_backend(self, nvidia, amd):
+        with patch.object(maya, "configs", return_value=[]), \
+                patch.dict(os.environ, MAYA_SH="1"), \
+                patch.object(sys, "argv", ["maya.py", "--check"]), \
+                patch.object(maya.S, "gpus", return_value=nvidia), \
+                patch.object(maya.S, "amd_gpus", return_value=amd), \
+             patch.object(maya, "apple_silicon", return_value=False), \
+                patch.object(maya, "check_pc", return_value={"gpus": [{"index": 0}]}) as check:
+            self.assertEqual(maya.main(), 0)
+        return check.call_args.args[0].backend
+
+    def test_first_run_without_backend_picks_hip_on_an_amd_only_pc(self):
+        strix = {"index": 0, "arch": "gfx1151", "vendor": "amd", "name": "Radeon 8060S", "vram_gb": 96}
+        self.assertEqual(self.first_run_backend([], [strix]), "hip")
+        self.assertEqual(self.first_run_backend([], [self.gpus[2]]), "cuda")   # (unsupported iGPU: CUDA's message)
+        self.assertEqual(self.first_run_backend([{"index": 0, "arch": "70"}], [strix]), "cuda")
+
 
 class ConfigsTests(unittest.TestCase):
     def test_dashboard_settings_beside_a_config_are_not_a_config(self):
         with tempfile.TemporaryDirectory() as d, patch.object(maya, "ROOT", Path(d)):
             cfg = Path(d) / "maya-maya-l-hip.json"
-            cfg.write_text(json.dumps({"backend": "hip", "exe": "strata.exe"}))
+            cfg.write_text(json.dumps({"backend": "hip", "exe": "maya.exe"}))
             side = Path(d) / "maya-maya-l-hip.shared-settings.json"
             side.write_text(json.dumps({"temperature": 0.7}))
             os.utime(cfg, (1, 1))   # the settings file is the newer one, as after a dashboard change
@@ -501,7 +686,7 @@ class WindowsHipSetupTests(unittest.TestCase):
         for ctx in (
             patch.object(maya, "ROOT", self.root),
             patch.object(maya, "BUILD", self.root / "build"),
-            patch.object(maya, "EXE", self.root / "build/strata.exe"),
+            patch.object(maya, "EXE", self.root / "build/maya.exe"),
             patch.object(maya, "STAMP", self.root / "build/MAYA-BUILD.json"),
             patch.object(maya, "WIN", True),
             patch.object(maya.S, "amd_gpus", return_value=[self.apu]),
@@ -524,16 +709,30 @@ class WindowsHipSetupTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 maya.check_pc(self.a)
 
-    def test_visual_studio_2026_is_taken_for_hip_not_for_cuda(self):
+    def test_visual_studio_2026_is_taken_for_hip_and_for_a_cuda_13_2_toolkit(self):
         pf = self.root / "pf86"
         (pf / "Microsoft Visual Studio/Installer").mkdir(parents=True)
         (pf / "Microsoft Visual Studio/Installer/vswhere.exe").touch()
         vs = self.root / "VS2026"
         (vs / "VC/Auxiliary/Build").mkdir(parents=True)
         (vs / "VC/Auxiliary/Build/vcvars64.bat").touch()
-        only_2026 = lambda cmd: "" if "-version" in cmd else str(vs)
+        nvcc = self.root / "cuda13.4/bin/nvcc.exe"       # NVIDIA's install guide: 13.2+ takes VS 2026 (MSVC 195x)
+        nvcc.parent.mkdir(parents=True)
+        nvcc.touch()
+        nvcc12 = self.root / "cuda12.8/bin/nvcc.exe"     # 12.x and CUDA <= 13.1 stop at VS 2022 (MSVC 193x)
+        nvcc12.parent.mkdir(parents=True)
+        nvcc12.touch()
+        releases = {str(nvcc): "Cuda compilation tools, release 13.4, V13.4.159\n",
+                    str(nvcc12): "Cuda compilation tools, release 12.8, V12.8.93\n"}
+
+        def only_2026(cmd):        # nvcc --version answers; vswhere finds VS 2026 only, never the 2019/2022 range
+            if cmd[1:] == ["--version"]:
+                return releases.get(cmd[0], "")
+            return "" if "[16.0,18.0)" in cmd else str(vs)
         with patch.dict(os.environ, {"ProgramFiles(x86)": str(pf)}), patch.object(maya.S, "out", side_effect=only_2026):
-            self.assertIsNone(FIND_VCVARS())                         # CUDA 12/13: 2019 or 2022 only
+            self.assertIsNone(FIND_VCVARS())                         # CUDA, no toolkit given: 2019/2022 only
+            self.assertIsNone(FIND_VCVARS(nvcc=str(nvcc12)))          # CUDA 12.8: its release stops at VS 2022
+            self.assertEqual(FIND_VCVARS(nvcc=str(nvcc)), vs / "VC/Auxiliary/Build/vcvars64.bat")
             self.assertEqual(FIND_VCVARS(cuda=False), vs / "VC/Auxiliary/Build/vcvars64.bat")
 
     def test_rocm_sdk_init_runs_before_any_path_query(self):
@@ -603,7 +802,7 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertEqual(pc["gpus"], [self.apu])
         self.assertEqual(pc["rocm"], str(self.rocm.resolve()))
         self.assertEqual(pc["rocm_bin"], str(self.rocm.resolve() / "bin"))
-        self.assertEqual(maya.EXE, self.root / "build-hip/strata.exe")
+        self.assertEqual(maya.EXE, self.root / "build-hip/maya.exe")
 
     def test_check_without_rocm_says_the_pip_command(self):
         with patch.object(maya, "windows_rocm", return_value=(None, None)), \
@@ -644,7 +843,7 @@ class WindowsHipSetupTests(unittest.TestCase):
             meta = maya.compile_engine_hip(pc, self.root / "llama", "source-sha")
         conf, _, env, bat = build.call_args.args
         self.assertEqual(build.call_args.kwargs["vcvars"], Path("C:/VS/vcvars64.bat"))
-        # the HIP runtime it was built with sits next to strata.exe (else System32's, the driver's, loads first);
+        # the HIP runtime it was built with sits next to maya.exe (else System32's, the driver's, loads first);
         # the libraries stay in lib_dirs
         self.assertEqual(sorted(p.name for p in maya.EXE.parent.glob("*.dll")),
                          ["amd_comgr0702.dll", "amdhip64_7.dll", "rocm_kpack.dll"])
@@ -655,7 +854,7 @@ class WindowsHipSetupTests(unittest.TestCase):
                      f"-DCMAKE_HIP_COMPILER={root}/lib/llvm/bin/clang++.exe",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                      "-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_PREFILL_MMQ=ON",
-                     "-DSTRATA_PORTABLE=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201;gfx1151"):
+                     "-DSTRATA_PORTABLE=ON", "-DCMAKE_HIP_ARCHITECTURES=gfx1151"):
             self.assertIn(want, conf)
         if " " not in root:
             self.assertIn(f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={root}/lib/llvm/amdgcn/bitcode",
@@ -713,9 +912,9 @@ class WindowsHipSetupTests(unittest.TestCase):
             pc = maya.check_pc(self.a)
         p = maya.write_config(self.a, pc, {"lib_dirs": [str(self.rocm / "bin")]}, self.root / "pack", "Maya-L", 32768,
                               self.root / "data", None)
-        cfg = json.loads(p.read_text())
+        cfg = maya.read_json(p)
         self.assertEqual(p.name, "maya-maya-l-hip.json")
-        self.assertEqual((cfg["backend"], cfg["gpu"], cfg["exe"]), ("hip", [0], str(self.root / "build-hip/strata.exe")))
+        self.assertEqual((cfg["backend"], cfg["gpu"], cfg["exe"]), ("hip", [0], str(self.root / "build-hip/maya.exe")))
         self.assertEqual(cfg["lib_dirs"], [str(self.rocm / "bin")])
         env = cfg["env"]
         self.assertEqual(env["STRATA_GLM_RESERVE_MB"], "3072")    # the desktop runs on the APU's GPU too
@@ -723,6 +922,18 @@ class WindowsHipSetupTests(unittest.TestCase):
         self.assertEqual(env["STRATA_GLM_PREFILL_SUB"], "1024")
         self.assertEqual(env["STRATA_GLM_SPLIT"], "0")
         self.assertNotIn("STRATA_GLM_POOL_GB", env)
+
+
+class Vs2026Hint(unittest.TestCase):
+    """#544: a HIP build with VS 2026's Build Tools alone - its folder is named 18, 2019 / 2022 by their year."""
+
+    def test_vs_2026(self):
+        vs = r"C:\Program Files (x86)\Microsoft Visual Studio\{}\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+        self.assertTrue(maya.vs_2026(vs.format("18")))
+        self.assertFalse(maya.vs_2026(vs.format("2022")))
+        self.assertFalse(maya.vs_2026(vs.format("2019")))
+        self.assertFalse(maya.vs_2026(None))
+        self.assertIn("2022", maya.VS2026_HIP_HINT)
 
 
 if __name__ == "__main__":

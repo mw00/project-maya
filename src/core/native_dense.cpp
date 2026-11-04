@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -25,6 +26,18 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+// the trunk's layers: a GGUF that ships its MTP block counts it into block_count (nextn_predict_layers more) - the
+// runner serves the trunk, so blk.<trunk>.* and above are not its (and have no canonical entry)
+int trunk_layers(const strata::GgufFile& gguf) {
+    const auto* bc = gguf.get("qwen4exp.block_count");
+    const auto* nextn = gguf.get("qwen4exp.nextn_predict_layers");
+    return bc ? (int) (bc->u - (nextn ? nextn->u : 0)) : INT_MAX;
+}
+bool in_mtp_block(const strata::TensorInfo& tensor, int trunk) {
+    const auto& name = tensor.name;
+    if (trunk == INT_MAX || name.rfind("blk.", 0) != 0) return false;
+    return std::atoi(name.c_str() + 4) >= trunk;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) cudaFree(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -40,8 +53,10 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     try {
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
+            const int trunk = trunk_layers(gguf);
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                if (eligible(tensor, include_ple_key) && !in_mtp_block(tensor, trunk) &&
+                    strata::kernels::native_mmvq_supported(tensor.type) &&
                     tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
@@ -126,8 +141,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
             }
+            const int trunk = trunk_layers(gguf);
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key)) continue;
+                if (!eligible(tensor, include_ple_key) || in_mtp_block(tensor, trunk)) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }

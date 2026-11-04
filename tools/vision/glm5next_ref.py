@@ -1,11 +1,11 @@
 """tools/vision/glm5next_ref.py - the reference for the glm5next encoder: transformers' own Glm5NextVisionModel with
-the checkpoint's BF16 weights (float32 compute), and a vocab-only GGUF for strata-vision (GLM-5.3's tokenizer under an
+the checkpoint's BF16 weights (float32 compute), and a vocab-only GGUF for maya-vision (GLM-5.3's tokenizer under an
 architecture the pinned llama.cpp knows: mtmd needs the text model only for its vocabulary and n_embd).
 
     python glm5next_ref.py image --ckpt DIR --out test.png --pixels pix.npy   # a 448x448 picture + pixel_values
     python glm5next_ref.py ref --ckpt DIR --pixels pix.npy --out ref.npy
     python glm5next_ref.py vocab --gguf <model>-00001-of-0000N.gguf --out vocab.gguf [--gguf-py DIR]
-    python glm5next_ref.py compare --ref ref.npy --sve out.sve        # strata-vision's output against the reference
+    python glm5next_ref.py compare --ref ref.npy --sve out.sve        # maya-vision's output against the reference
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def cmd_vocab(a):
     import gguf
     r = gguf.GGUFReader(a.gguf)
     w = gguf.GGUFWriter(a.out, arch="llama")
-    w.add_string("general.name", "GLM-5.3-Flash vocabulary (for strata-vision)")
+    w.add_string("general.name", "GLM-5.3-Flash vocabulary (for maya-vision)")
     w.add_uint32("llama.context_length", 65536)
     w.add_uint32("llama.embedding_length", 4096)
     w.add_uint32("llama.block_count", 1)

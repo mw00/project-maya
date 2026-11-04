@@ -331,6 +331,48 @@ class Screen(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ready:", log)                  # (the server's output stays on the screen: days of it)
         self.assertFalse(any("ready:" in text for _, _, text in bridge.entries))
 
+    def test_a_ready_line_is_found_wherever_it_sits(self):
+        for line in ("ready: http://127.0.0.1:8080/v1", "\x1b[1;32mready: http://127.0.0.1:8080/v1\x1b[0m",
+                     "loading 99%\rready: http://127.0.0.1:8080/v1", "  ready: http://127.0.0.1:8080/v1"):
+            self.assertTrue(T.is_ready(line), repr(line))
+        self.assertFalse(T.is_ready("not ready: the model is loading"))
+
+    async def test_the_screen_is_ready_when_the_server_answers_though_the_ready_line_was_missed(self):
+        import http.server
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *a):
+                pass
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        info = dict(self.INFO, api=f"http://127.0.0.1:{httpd.server_port}/v1")
+        server = "import time\nprint('loading the model ...', flush=True)\ntime.sleep(30)"   # (no "ready:" line at all)
+
+        def body():
+            S.step(8, "the configuration and the start script")
+            return S.UI.serve([sys.executable, "-c", server], dict(os.environ, PYTHONUNBUFFERED="1"), info)
+        bridge = Bridge(self.log)
+        S.UI = bridge
+        app = T.SetupApp(bridge, body, "1.0", "./maya.sh", self.log)
+        try:
+            async with app.run_test(size=(110, 40)) as pilot:
+                t0 = time.time()
+                while not (app.serving and app.serving["state"] == "ready"):
+                    self.assertLess(time.time() - t0, 20, "stuck at Loading the model")
+                    await pilot.pause(0.05)
+                self.assertEqual(app.state[T.SERVE], "ready")
+                bridge.stop()
+        finally:
+            httpd.shutdown()
+        bridge.finish(10)
+        bridge.log.close()
+
     async def test_a_server_that_ends_is_a_failure_and_an_update_starts_the_new_version(self):
         for code, keys, want in (("print('boom'); sys.exit(3)", ["enter"], "fail"), ("sys.exit(75)", [], "done")):
             with self.subTest(code=code), \

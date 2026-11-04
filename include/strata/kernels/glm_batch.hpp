@@ -103,11 +103,16 @@ void mla_attn_f16q(const uint16_t* q16, const uint16_t* lat, const int* cells, c
 /// n_head % 16 == 0, kv_lora 512. lat_q8 expands INT8 codes with one FP16 scale per 32 values as they are loaded.
 void mla_attn_wmma2(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max,
                     int n_head, int kv_lora, float scale, int T, float* ctx, cudaStream_t s, bool lat_q8 = false);
-/// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4),
+/// True on the current device where mla_attn_wmma2 runs (gfx11/gfx12); mla_wmma2_default() is true on gfx12 (RDNA4) and gfx1151 (Strix Halo),
 /// where the prompt path prefers it over mla_attn_f16q.
 bool mla_wmma2_supported();
 bool mla_wmma2_default();
 #endif
+/// One decode token's absorbed MLA attention on Volta's tensor cores (mla_attn_v70_kernel in cell splits, then their
+/// merge): ctx[h] = softmax(q_abs[h] . lat_c * scale) . lat_c over its n_sel cells.  part holds part_cap splits of
+/// n_head x (kv_lora + 2) floats.  False (nothing launched) off Volta, for other shapes, or with STRATA_GLM_MLA_V70=0.
+bool mla_decode_v70(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head, int kv_lora,
+                    float scale, float* ctx, float* part, int part_cap, cudaStream_t s, bool lat_q8 = false);
 /// Absorbed MLA attention per token and head over the token's cells: ctx[t][h] = softmax(q_abs[t][h] . lat_c *
 /// scale) . lat_c.  kv_lora 512, n_head % 16 == 0.
 void mla_attn(const float* q_abs, const uint16_t* lat, const int* cells, const int* n_sel, int n_sel_max, int n_head,
@@ -135,6 +140,8 @@ void expert_scatter(const int* ids, const int* rank, const int* base, int n, int
 /// h[r][c] = silu(min(gu[r][c], limit)) * clamp(gu[r][n_ff + c], +-limit), rows of [gate | up].
 void swiglu_rows(const float* gu, float* h, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
 // (ld_h: h's row stride, n_ff when 0; h = gu with ld_h = 2 n_ff writes each row's result over its gate half)
+/// The same rows, FP16 out (the Volta grouped-WMMA down product's activations): h16's row stride ld_h halves.
+void swiglu_rows_h16(const float* gu, void* h16, int rows, int n_ff, float limit, cudaStream_t s, int ld_h = 0);
 /// The same from separate gate/up arrays, FP16 out.
 void swiglu_f16(const float* gate, const float* up, void* h16, int64_t n, float limit, cudaStream_t s);
 /// ffn[t] = sum_j w[t][j] * out[pos[t*k + j]] + sh[t] (plan order, like the one-token combine).

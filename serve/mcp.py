@@ -1,7 +1,7 @@
 """serve/mcp.py - tools from MCP (Model Context Protocol) servers for the web app's chats.
 
 The user lists servers in the run config (`"mcp_servers"`, or Claude Desktop's `"mcpServers"` block pasted as is) or
-in a separate file (`--mcp-config`).  Each one is either a program Strata starts (`command`, `args`, `env`, `cwd`:
+in a separate file (`--mcp-config`).  Each one is either a program Maya starts (`command`, `args`, `env`, `cwd`:
 the stdio transport, newline-delimited JSON-RPC 2.0 on its stdin/stdout) or an address (`url`, `headers`: the
 Streamable HTTP transport, JSON-RPC POSTed, answered as JSON or as an event stream).  Both are implemented here with
 the standard library only; no MCP SDK is needed.
@@ -263,7 +263,7 @@ class HttpTransport:
 
     def _headers(self) -> dict:
         h = {"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
-             "User-Agent": "strata", **self.headers}
+             "User-Agent": "maya", **self.headers}
         if self.session:
             h["Mcp-Session-Id"] = self.session
         if self.protocol:
@@ -398,7 +398,7 @@ class McpServer:
         try:
             t.start()
             res = t.request("initialize", {"protocolVersion": PROTOCOL, "capabilities": {},
-                                           "clientInfo": {"name": "strata", "title": "Strata", "version": "1"}},
+                                           "clientInfo": {"name": "maya", "title": "Maya", "version": "1"}},
                             timeout)
             t.protocol = str(res.get("protocolVersion") or PROTOCOL)
             self.info = {k: v for k, v in (res.get("serverInfo") or {}).items() if k in ("name", "title", "version")}

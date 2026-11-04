@@ -21,6 +21,21 @@
 namespace strata::kernels::cpu {
 namespace {
 
+/// u8 x s8 dot products of four into int32 lanes: AVX512-VNNI's vpdpbusd, or (STRATA_CPU_DPBUSD_BW: a toolchain
+/// whose assembler has no VNNI, #535) AVX512-BW's maddubs + madd - the same sums here, since every unsigned operand
+/// is a 2-bit code (0..3): maddubs' 16-bit pair sums stay within 2 * 3 * 128, never saturating
+#if defined(STRATA_CPU_DPBUSD_BW)
+inline __m256i dpbusd256(__m256i acc, __m256i u, __m256i s) {
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(u, s), _mm256_set1_epi16(1)));
+}
+inline __m512i dpbusd512(__m512i acc, __m512i u, __m512i s) {
+    return _mm512_add_epi32(acc, _mm512_madd_epi16(_mm512_maddubs_epi16(u, s), _mm512_set1_epi16(1)));
+}
+#else
+inline __m256i dpbusd256(__m256i acc, __m256i u, __m256i s) { return _mm256_dpbusd_epi32(acc, u, s); }
+inline __m512i dpbusd512(__m512i acc, __m512i u, __m512i s) { return _mm512_dpbusd_epi32(acc, u, s); }
+#endif
+
 std::atomic<bool> oracle_q8_0{false};
 
 /// fp16 -> fp32, written out rather than using `_cvtsh_ss`, because the F16C intrinsic's behaviour on
@@ -134,7 +149,7 @@ inline __m256i unpack_q2_0(const uint8_t* codes) {
 /// 32 codes against 32 int8 activations. Codes 0 contribute nothing to `sum(c*xhat)`, so the zero lanes the
 /// narrow load leaves behind are harmless.
 inline __m256i block_dot(const uint8_t* codes, const int8_t* xq) {
-    return _mm256_dpbusd_epi32(_mm256_setzero_si256(), unpack_q2_0(codes),
+    return dpbusd256(_mm256_setzero_si256(), unpack_q2_0(codes),
                                _mm256_load_si256((const __m256i*) xq));
 }
 
@@ -184,7 +199,7 @@ inline float row_dot_z(const uint8_t* codes, const uint8_t* scales, const ActQ& 
         corr = _mm512_fmadd_ps(dd, _mm512_maskz_loadu_ps(m16, a.hx + 2 * b0), corr);
         for (int i = 0; i < nb; ++i) {
             const int b = b0 + i;
-            const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), unpack64_q2_0(codes + b * 16),
+            const __m512i dot = dpbusd512(_mm512_setzero_si512(), unpack64_q2_0(codes + b * 16),
                                                     _mm512_load_si512((const void*) (a.q + b * QK)));
             const __m512 sv = _mm512_permutexvar_ps(_mm512_add_epi32(base, _mm512_set1_epi32(2 * i)), p);
             acc = _mm512_fmadd_ps(sv, _mm512_cvtepi32_ps(dot), acc);
@@ -213,7 +228,7 @@ inline void row_dot_multi_z(const uint8_t* codes, const uint8_t* scales, const A
             const __m512i w = unpack64_q2_0(codes + b * 16);
             const __m512i idx = _mm512_add_epi32(base, _mm512_set1_epi32(2 * i));
             for (int t = 0; t < NT; ++t) {
-                const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w,
+                const __m512i dot = dpbusd512(_mm512_setzero_si512(), w,
                                                         _mm512_load_si512((const void*) (a[t]->q + b * QK)));
                 acc[t] = _mm512_fmadd_ps(_mm512_permutexvar_ps(idx, p[t]), _mm512_cvtepi32_ps(dot), acc[t]);
             }
@@ -289,9 +304,9 @@ inline void row_dot_multi(const uint8_t* codes, const uint8_t* scales, const Act
         const __m256i hi = unpack_q2_0(codes + b * 16 + 8);
         for (int t = 0; t < NT; ++t) {
             const __m256 slo = _mm256_cvtepi32_ps(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), lo, _mm256_load_si256((const __m256i*) (a[t]->q + b * QK))));
+                dpbusd256(_mm256_setzero_si256(), lo, _mm256_load_si256((const __m256i*) (a[t]->q + b * QK))));
             const __m256 shi = _mm256_cvtepi32_ps(
-                _mm256_dpbusd_epi32(_mm256_setzero_si256(), hi,
+                dpbusd256(_mm256_setzero_si256(), hi,
                                     _mm256_load_si256((const __m256i*) (a[t]->q + b * QK + QKA))));
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b]), slo, acc[t]);
             acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d * a[t]->scale[2 * b + 1]), shi, acc[t]);
@@ -578,7 +593,7 @@ inline void q2g_row_multi(const uint8_t* row, const ActQ* const* a, int nblocks,
             const __m512i w = unpack64_q2_0(row + (size_t) b * 18 + 2);
             const __m512i idx = _mm512_add_epi32(base, _mm512_set1_epi32(2 * i));
             for (int t = 0; t < NT; ++t) {
-                const __m512i dot = _mm512_dpbusd_epi32(_mm512_setzero_si512(), w,
+                const __m512i dot = dpbusd512(_mm512_setzero_si512(), w,
                                                         _mm512_load_si512((const void*) (a[t]->q + b * QK)));
                 acc[t] = _mm512_fmadd_ps(_mm512_permutexvar_ps(idx, p[t]), _mm512_cvtepi32_ps(dot), acc[t]);
             }

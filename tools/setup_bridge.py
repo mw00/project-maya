@@ -185,15 +185,22 @@ class Bridge:
         self._note("answer", f"  {question} {pick + 1}) {options[pick][0]}")
         return pick
 
-    def run(self, cmd, cwd=None, env=None, keep=True):
+    def run(self, cmd, cwd=None, env=None, keep=True, parent_pipe=False):
         """The command with its output on the screen as it comes (stdin closed: nothing can wait for a key).  keep:
-        its output also into the log and the summary (not the server's: it runs for days - "live" on the screen)."""
+        its output also into the log and the summary (not the server's: it runs for days - "live" on the screen).
+        parent_pipe: Maya's server - its stdin a pipe from here instead (--parent-pipe: it stops when this process
+        ends, however it ends), and on Windows in a job object that ends it with this process (setup.end_with_me)."""
         if not self._here():
             return None
         self.events.put(("run", cmd))
         own = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-        with subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                              stderr=subprocess.STDOUT, bufsize=0, **own) as p:
+        if parent_pipe:
+            cmd = list(cmd) + ["--parent-pipe"]
+        with subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE if parent_pipe else subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0, **own) as p:
+            if parent_pipe:
+                import setup
+                setup.end_with_me(p)
             self.proc = p
             rest = b""
             while chunk := p.stdout.read(1 << 16):
@@ -226,7 +233,7 @@ class Bridge:
         if not self._here():
             return None
         self.events.put(("serve", info))
-        return self.run(cmd, env=env, keep=False).returncode
+        return self.run(cmd, env=env, keep=False, parent_pipe=True).returncode
 
     def stop(self) -> None:
         """Stopped on the screen: the command running now gets Ctrl+C's SIGINT, with its children (the server closes

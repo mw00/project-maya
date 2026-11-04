@@ -224,7 +224,8 @@ class InTheSetup(unittest.TestCase):
             path.write_text(json.dumps(c), encoding="utf-8")
             return True
         with patch.object(maya, "refresh_engine"), patch.object(maya, "say"), \
-                patch.object(maya, "speed_calibration", side_effect=measured) as sc:
+                patch.object(maya, "unattended_start", return_value=None), \
+                patch.object(maya, "speed_calibration", side_effect=measured) as sc:   # (someone is at the terminal)
             maya.server_command(self.cfg_path, a)
             maya.server_command(self.cfg_path, a)
         sc.assert_called_once()

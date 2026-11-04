@@ -256,8 +256,11 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                 served += 1
                 rows.append([t.name, "0", "0", "0", "0", "0", "0", str(ne0), str(ne1), "8", "0", "32"] + ["0"] * 7)
     if dropped:
-        print("NextN/MTP: dropped %d tensors of blk.%d+ (the runner skips MTP; re-pack when a "
-              "GLM5-Next draft graph exists)" % (dropped, block_count))
+        # (#327: "the runner skips MTP" read as drafting off - it is not: the engine reads the block from the model's
+        #  files itself)
+        print("NextN/MTP: %d tensors of blk.%d+ left out of the pack - %s" % (
+            dropped, block_count, "the MTP drafter is built from them by tools/mtp_from_gguf.py" if arch == "qwen4exp"
+            else "the engine reads the MTP draft block from the model's files itself"))
     write_index(out, rows, src, served, 0)
     if compat_bf16:
         (out / "compat-bf16.json").write_text(json.dumps({
@@ -366,7 +369,10 @@ def main() -> int:
               "gate remains closed until the pack wiring lands - docs/GLM5-FLASH.md §9)" % arch)
     block_count = None
     trunk = None
-    if arch in ("glm5-next", "glm5next"):
+    # (a Qwen GGUF with its MTP block - qwen4exp, nextn_predict_layers 1, block_count 49 - the same: the trunk only)
+    if arch not in ("glm5-next", "glm5next"):
+        prefix = arch + "."
+    if arch in ("glm5-next", "glm5next") or int(g.metadata.get(prefix + "nextn_predict_layers", 0) or 0) > 0:
         bc = g.metadata.get(prefix + "block_count")
         if bc is None:
             print("%s: %sblock_count is missing; cannot tell the trunk from the NextN block" % (arch, prefix))

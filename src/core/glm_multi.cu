@@ -20,6 +20,7 @@
 namespace strata::core {
 
 void Glm5Model::seq_bind(int s) {
+    ckpt_join();   // (ckpt_save_snapshot reads snap_ / snap_pool_)
     if (seq_.empty() || s == cur_seq_ || s < 0 || s >= (int) seq_.size()) return;
     SeqCtx& o = seq_[(size_t) cur_seq_];
     o.state = state_;
@@ -127,7 +128,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     SeqCtx check;
     if (seq_layout(max_ctx_, check) != state_bytes_ || check.dsa_pool != dsa_pool_ || check.kda_conv != kda_conv_ ||
         check.dsa_lat != dsa_lat_ || check.ik_ring != ik_ring_) {
-        err = "glm multi: the state layout does not match load_pack's (this build cannot run STRATA_GLM_SEQS)";
+        err = "glm multi: the state layout does not match load_pack's (this build cannot run MAYA_GLM_SEQS)";
         return false;
     }
     seq_[0].state = state_;
@@ -140,7 +141,7 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
             cudaGetLastError();
             err = "pack: sequence state " + std::to_string(s) + " of " + std::to_string(n) + " (" +
                   std::to_string(c.bytes >> 20) + " MB) does not fit on CUDA" + std::to_string(dev_) +
-                  " - fewer STRATA_GLM_SEQS or a smaller STRATA_GLM_SEQ_CTX";
+                  " - fewer MAYA_GLM_SEQS or a smaller MAYA_GLM_SEQ_CTX";
             return false;
         }
         cudaMemset(a, 0, c.bytes);
@@ -176,8 +177,10 @@ bool Glm5Model::seq_alloc_arenas(std::string& err) {
     std::fprintf(stderr, "glm multi: CUDA%d %d sequence states: the first for %lld tokens (%.2f GB), %d more for %lld "
                  "(%.2f GB in all, with every sequence's snapshot)\n", dev_, n, (long long) max_ctx_,
                  (double) state_bytes_ / 1e9, n - 1, (long long) ctx, (double) more / 1e9);
-    // one GPU: the sequences decode together (glm_rows.cu), their activations allocated here, before the pool
-    if (n_parts_ == 1) return rows_alloc(err);
+    // several conversations drafting at once (STRATA_GLM_MULTI_MTP): their windows' buffers, before the pool too
+    if (multi_mtp_setting() > 0 && !mtpw_alloc(err)) return false;
+    // one GPU decodes the sequences together; opt-in split rows need the same activations on every part, before its pool
+    if (n_parts_ == 1 || split_rows_setting() > 0) return rows_alloc(err);
     return true;
 }
 
@@ -185,7 +188,7 @@ bool Glm5Model::seq_pipe_ready(std::string& err) {
     const Glm5Geometry& g = g_;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->seq_.empty()) {
-            err = "glm multi: one sequence state only (STRATA_GLM_SEQS)";
+            err = "glm multi: one sequence state only (MAYA_GLM_SEQS)";
             return false;
         }
         cudaSetDevice(m->dev_);
@@ -265,11 +268,10 @@ bool Glm5Model::multi_issue(int s, int32_t token, const strata::kernels::Sampler
     }
     // the logits are the tail's shared scratch: the draw goes on the same stream right behind them, before the next
     // sequence's head can write them again
-    if (sp.greedy || sp.temperature <= 0.0f)
+    if ((sp.greedy || sp.temperature <= 0.0f) && sp.penalty_last_n <= 0)   // (penalties: the sampler's greedy pick)
         gf::argmax(tail->sc_ + tail->sc_logits, g.n_vocab, FT->tok, FT->cs);
     else
-        strata::kernels::sample_tokens(tail->sc_ + tail->sc_logits, 1, (int) g.n_vocab, nullptr, 0, sp, FT->tok,
-                                       FT->cs);
+        tail->pick_tokens(tail->sc_ + tail->sc_logits, 1, sp, nullptr, 0, FT->tok, FT->cs);
     cudaMemcpyAsync(ct.tok_h, FT->tok, sizeof(int), cudaMemcpyDeviceToHost, FT->cs);
     cudaEventRecord(ct.ev_done, FT->cs);
     cudaSetDevice(dev_);

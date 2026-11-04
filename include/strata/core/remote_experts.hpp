@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
 
@@ -11,6 +12,66 @@
 #include <vector>
 
 namespace strata::core {
+
+/// GLM helper-owned experts. UMA aliases pinned RAM; discrete helpers cache in
+/// their own VRAM. Neither backend changes the legacy Qwen RemoteExperts path.
+class GlmExpertHelper {
+public:
+    GlmExpertHelper() = default;
+    ~GlmExpertHelper();
+    GlmExpertHelper(const GlmExpertHelper&) = delete;
+    GlmExpertHelper& operator=(const GlmExpertHelper&) = delete;
+    bool open(int device, int n_embd, int n_ff,
+              const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+    bool reserve(int keys, size_t requested_bytes, std::string& err);
+    bool insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
+    bool replace(int out, int in, const uint8_t* host, std::string& err);
+    struct Swap { uint32_t gain; int in, out; };
+    std::vector<Swap> swaps(const std::vector<uint32_t>& usage, const std::vector<int>& primary,
+                            int experts_per_layer, int max_swaps) const;
+    const std::vector<uint8_t>& owners() const { return owned_; }
+    bool owns(int key) const { return !owned_.empty() && owned_[(size_t) key] != 0; }
+    bool integrated() const { return integrated_; }
+    bool zero_copy() const { return zero_copy_; }   // the selected call path (an integrated helper's default)
+    bool profiling() const { return prof_; }         // STRATA_GLM_PROF read at open
+    size_t available() const { return capacity_ - used_; }
+    size_t used() const { return used_; }
+    bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                 const int* keys, const float* weights, const float* x,
+                 float* out, std::string& err);
+    void close();
+    int device() const { return device_; }
+
+private:
+    struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
+    std::vector<Region> regions_;
+    struct Slot { uint8_t* host = nullptr; uint8_t* device = nullptr; size_t bytes = 0; };
+    std::vector<Slot> slots_;
+    std::vector<uint8_t> owned_;
+    bool integrated_ = false;
+    uint8_t* pool_ = nullptr;
+    size_t capacity_ = 0, used_ = 0;
+    int device_ = -1, n_embd_ = 0, n_ff_ = 0;
+    cudaStream_t stream_ = nullptr;
+    uint8_t* arena_ = nullptr;
+    float *x_ = nullptr, *out_ = nullptr;
+    void *xq_ = nullptr, *hq_ = nullptr;
+    strata::kernels::glmf::MoeDev plan_;
+    // an integrated (UMA) helper: the input, the plan and the result in mapped pinned memory the kernels use in place
+    // - four copies fewer a call (STRATA_GLM_HELPER_ZEROCOPY=0: the copies)
+    bool zero_copy_ = false;
+    uint8_t* zc_host_ = nullptr;      // [x | out | plan pointers | plan weights], host side
+    float *x_h_ = nullptr, *out_h_ = nullptr;
+    unsigned long long* plan_ptr_h_ = nullptr;
+    float* plan_w_h_ = nullptr;
+    float *x_z_ = nullptr, *out_z_ = nullptr;   // the same, as the helper's device sees them
+    strata::kernels::glmf::MoeDev zplan_;
+    // STRATA_GLM_PROF: each call's host time and its stages' GPU time, summed; printed when the helper closes
+    bool prof_ = false;
+    cudaEvent_t ev_[6] = {};
+    unsigned long long calls_ = 0, experts_ = 0, bytes_ = 0;
+    double enqueue_ms_ = 0, wait_ms_ = 0, out_ms_ = 0, stage_ms_[5] = {};   // (out: the zero-copy result's host copy)
+};
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.

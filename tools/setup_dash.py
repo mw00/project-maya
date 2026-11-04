@@ -30,14 +30,27 @@ DIGITS = {"0": (0x3E, 0x63, 0x73, 0x7B, 0x6F, 0x67, 0x3E, 0x00), "1": (0x0C, 0x0
           ".": (0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00), "-": (0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00),
           "%": (0x00, 0x63, 0x33, 0x18, 0x0C, 0x66, 0x63, 0x00)}
 BLOCKS = "▁▂▃▄▅▆▇█"
-TIERS = (("ram_fetch", "From RAM", INFO_TEXT), ("disk", "From SSD", WARN), ("promo", "Promoted", ACCENT))   # per token
+TIERS = (("ram_fetch", "From RAM", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN, "/tok"),
+         ("promo", "Promoted", ACCENT, "/tok"))   # per token
+# DeepSeek's (maya-ds4): experts the CPU lane computed, MB the storage read (Linux), the cache's moves, the n-gram
+# memory's (Engram) read time - each a token
+TIERS_DS4 = (("cpu", "On the CPU", INFO_TEXT, "/tok"), ("disk_mb", "Disk reads", WARN, " MB/tok"),
+             ("promo", "Promoted", ACCENT, "/tok"), ("engram_ms", "N-gram memory", ACCENT, " ms/tok"))
+# MiniMax's (maya-mm3): GLM's keys, but the experts VRAM does not hold are computed on the CPU from pinned RAM
+TIERS_MM3 = (("ram_fetch", "On the CPU", INFO_TEXT, "/tok"), ("disk", "From SSD", WARN, "/tok"),
+             ("promo", "Promoted", ACCENT, "/tok"))
 TIPS = {   # the Monitor's advice under the tiers, said shorter as the box narrows (one line: the longest that fits)
     "disk": ("Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context "
              "makes answers faster.", "Many experts come from the SSD: more RAM or a shorter context is faster.",
              "Experts come from the SSD: more RAM helps."),
     "ram": ("Most misses come from RAM over PCIe: more VRAM (or a second GPU) keeps more experts on the card.",
             "Most misses come from RAM: more VRAM keeps more experts on the GPU.",
-            "Misses come from RAM: more VRAM helps.")}
+            "Misses come from RAM: more VRAM helps."),
+    "ds4_disk": ("Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and "
+                 "answers get faster.", "Much of every token comes from the SSD: more RAM is faster.",
+                 "Reads from the SSD: more RAM helps."),
+    "ds4_cpu": ("Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.",
+                "Most experts run on the CPU: more VRAM keeps more on the GPU.", "CPU-bound: more VRAM helps.")}
 FINISH = {"stop": ("Done", OK), "length": ("Max tokens", INK_SOFT), "cancel": ("Stopped", WARN),
           "disconnect": ("Closed", WARN), "error": ("Error", DANGER)}
 API = {"web": "Chat", "openai": "OpenAI", "anthropic": "Anthropic"}
@@ -112,6 +125,19 @@ def label(k: str, v, unit: str = "", width: int = 0) -> Text:
                          (unit if unit == "%" else f" {unit}" if unit else "", MUTED))
 
 
+def shape(content):
+    """What decides a box's height, without drawing it: the lines of a text, the rows of a table, the parts of a group
+    (None: not known - the box is laid out)."""
+    if isinstance(content, Text):
+        return content.plain.count("\n")
+    if isinstance(content, Table):
+        return ("table", content.row_count)
+    if isinstance(content, Group):
+        parts = tuple(shape(r) for r in content.renderables)
+        return None if None in parts else parts
+    return None
+
+
 def speed(m: dict, width: int):
     """The Monitor's hero: the decode speed in big (now, else the last request's), the prefill, the last minute,
     what the model is doing, and four headline numbers."""
@@ -164,25 +190,43 @@ def tiers(m: dict, width: int):
     n, h = t.get("now"), t.get("history") or {}
     if not n:
         return Text("The engine tells where its experts live while it writes an answer.", f"italic {MUTED}")
-    vu, ru = n.get("vram_used") or 0, n.get("ram_used") or 0
-    total = eng.get("experts") or max(1, vu + ru)
-    disk = max(0, total - vu - ru)
+    ds4 = eng.get("engine_kind") == "ds4"
+    tier = ds4 and int(eng.get("ram_experts") or 0) > 0
+    if ds4:   # DeepSeek: the VRAM slots, the RAM tier's (when on), the rest read in place from the model's files
+        vu = int(eng.get("expert_slots") or 0)
+        ru = int(eng.get("ram_experts") or 0) if tier else int(eng.get("cpu_experts") or 0)
+        disk = max(0, int(eng.get("cpu_experts") or 0) - ru) if tier else 0
+        total = max(1, vu + ru + disk)
+    else:
+        vu, ru = n.get("vram_used") or 0, n.get("ram_used") or 0
+        total = eng.get("experts") or max(1, vu + ru)
+        disk = max(0, total - vu - ru)
     whole = max(total, vu + ru)                         # (the RAM tier can hold experts VRAM has too: never wider)
     cols = [round(width * vu / whole)]
     cols.append(min(width - cols[0], round(width * ru / whole)))
     line = Text.assemble(gradient("█" * cols[0]), ("█" * cols[1], INFO_TEXT), ("█" * max(0, width - sum(cols)), WARN))
     legend = Table.grid(padding=(0, 1))
-    for color, what, k, extra in ((ACCENT, "VRAM", vu, f" · {fmt(n.get('vram_gb'), 1)} GB"),
-                                  (INFO_TEXT, "Pinned RAM", ru, f" · {fmt(n.get('ram_gb'), 1)} GB"),
-                                  (WARN, "SSD only", disk, "")):
+    parts = (((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "Pinned RAM", ru, ""), (WARN, "SSD only", disk, "")) if tier else
+             ((ACCENT, "VRAM", vu, ""), (INFO_TEXT, "RAM cache / SSD (in place)", ru, ""))) if ds4 else \
+        ((ACCENT, "VRAM", vu, f" · {fmt(n.get('vram_gb'), 1)} GB"),
+         (INFO_TEXT, "Pinned RAM", ru, f" · {fmt(n.get('ram_gb'), 1)} GB"), (WARN, "SSD only", disk, ""))
+    for color, what, k, extra in parts:
         legend.add_row(Text("■", color), Text(what, MUTED), Text(fmt(k), f"bold {INK}"), Text("experts" + extra, MUTED))
     rows = Table.grid(padding=(0, 2))
-    for key, name, color in TIERS:
-        rows.add_row(Text(name, MUTED), Text.assemble((fmt(n.get(key), 2), f"bold {INK}"), ("/tok", MUTED)),
+    mm3 = eng.get("engine_kind") in ("mm3", "qwen")   # (CYBER-FROST's Qwen path too: the CPU computes the others)
+    for key, name, color, unit in TIERS_DS4 if ds4 else TIERS_MM3 if mm3 else TIERS:
+        rows.add_row(Text(name, MUTED), Text.assemble((fmt(n.get(key), 2), f"bold {INK}"), (unit, MUTED)),
                      spark(h.get(key), max(8, width - 32), color=color))
     stale = time.time() - (n.get("time") or 0) > 30
-    tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \
-        TIPS["ram"] if (n.get("vram_hit") or 1) < 0.85 and (n.get("ram_fetch") or 0) >= 4 else ()
+    if ds4:
+        tips = () if stale else TIPS["ds4_disk"] if (n.get("disk_mb") or 0) >= 500 else \
+            TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
+    elif mm3:
+        tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \
+            TIPS["ds4_cpu"] if (n.get("vram_hit") or 1) < 0.5 else ()
+    else:
+        tips = () if stale else TIPS["disk"] if (n.get("disk") or 0) >= 3 else \
+            TIPS["ram"] if (n.get("vram_hit") or 1) < 0.85 and (n.get("ram_fetch") or 0) >= 4 else ()
     tip = next((t for t in tips if len(t) <= width), tips[-1] if tips else "")   # (one line: the longest that fits)
     return Group(line, legend, Text(""), rows,
                  *([Text(tip, f"italic {INK_SOFT}", no_wrap=True, overflow="ellipsis")] if tip else []))
@@ -383,6 +427,8 @@ class Dashboard(VerticalScroll):
 
     def on_mount(self) -> None:
         self.metrics, self.fails, self.drawn, self.load = None, 0, None, LoadWatch(None, [])
+        self.noted = None                               # the banner's notes as drawn
+        self.shapes, self.puts = {}, {}                 # each box's shape as drawn (put), and how often it was drawn
         for box, name in (("load", "Loading the model"), ("speed", "Throughput"), ("tiers", "Where the experts live"),
                           ("gpus", "GPUs"), ("hw", "Hardware"), ("reqs", "Recent requests")):
             self.query_one(f"#dash-{box}").border_title = title(name)
@@ -425,6 +471,7 @@ class Dashboard(VerticalScroll):
         try:
             self.fill(m)
         except Exception as e:                         # noqa: BLE001 - numbers it cannot show never stop the screen
+            self.noted = None
             self.query_one("#dash-banner", Static).update(Text(f"! the dashboard could not show these numbers ({e})",
                                                                DANGER))
             self.query_one("#dash-banner").display = True
@@ -433,14 +480,29 @@ class Dashboard(VerticalScroll):
         half = (self.size.width - 1) // (1 if self.screen.has_class("narrow") else 2) - 4
         full = self.size.width - 5
         note = banners(m, self.fails)
-        self.query_one("#dash-banner", Static).update(note)
-        self.query_one("#dash-banner").display = bool(note.plain)
-        self.query_one("#dash-speed", Static).update(speed(m, half))
-        self.query_one("#dash-tiers", Static).update(tiers(m, half))
+        if note != self.noted:                          # (the same notes, or none, every second: nothing to lay out)
+            self.noted = note
+            self.query_one("#dash-banner", Static).update(note)
+            self.query_one("#dash-banner").display = bool(note.plain)
+        self.put("#dash-speed", speed(m, half))
+        self.put("#dash-tiers", tiers(m, half))
         self.query_one("#dash-tiers").border_subtitle = tiers_sub(m)
         gpu_count = len((m.get("hardware") or {}).get("gpus") or [])
         self.query_one("#dash-gpus").border_subtitle = Text(f"{gpu_count} cards" if gpu_count > 1 else "",
                                                             f"italic {FAINT}")
-        self.query_one("#dash-gpus", Static).update(gpus(m))
-        self.query_one("#dash-hw", Static).update(hardware(m, full))
-        self.query_one("#dash-reqs", Static).update(requests(m, full))
+        self.put("#dash-gpus", gpus(m))
+        self.put("#dash-hw", hardware(m, full))
+        self.put("#dash-reqs", requests(m, full))
+
+    def put(self, box: str, content) -> None:
+        """A box's new numbers.  The screen is laid out again only when the box's shape changed (the lines of its text,
+        the rows of its table, its width): a new reading of the same boxes - once a second, all day - only draws them,
+        and the layout of the whole screen was most of an idle dashboard's CPU.  Every tenth reading is laid out all
+        the same, so a line that wrapped differently never stays wrong for long."""
+        w = self.query_one(box, Static)
+        key = (shape(content), w.content_size.width)
+        n = self.puts.get(box, 0) + 1
+        self.puts[box] = n
+        same = key[0] is not None and self.shapes.get(box) == key and n % 10 != 0
+        self.shapes[box] = key
+        w.update(content, layout=not same)

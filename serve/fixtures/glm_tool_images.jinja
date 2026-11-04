@@ -5,6 +5,8 @@
         {%- for item in content -%}
             {%- if item.type == 'image' -%}
                 {{- '<|begin_of_image|><|image|><|end_of_image|>' -}}
+            {%- elif item.type == 'video' -%}
+                {{- '<|begin_of_video|><|video|><|end_of_video|>' -}}
             {%- elif item.type == 'text' -%}
                 {{- item.text -}}
             {%- endif -%}

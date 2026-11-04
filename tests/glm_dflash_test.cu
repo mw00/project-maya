@@ -78,7 +78,8 @@ struct Ref {
 };
 
 // the GPU's q8_1 activations (glm_fast quantize_kernel: per 32 values d = max|x| / 127, q = round(x / d)), applied in
-// place: with them the reference sees what the GPU's quantized-weight GEMVs multiply
+// place: with them the reference sees what the GPU's quantized-weight GEMVs multiply (F32 / BF16 weights - a BF16
+// drafter's - read the float rows, as the GPU's GEMVs do: main's mm)
 bool g_q8 = true;
 std::vector<float> q8(const float* x, size_t n) {
     std::vector<float> y(x, x + n);
@@ -252,6 +253,11 @@ int main(int argc, char** argv) {
     }
     // ---- the CPU reference
     Ref R(G);
+    // (the GPU rounds a GEMV's activations to q8_1 only for quantized weights: F32 / BF16 ones read the floats)
+    const auto mm = [&](const std::string& n, int n_in, int n_out, const float* x, int rows, float* y) {
+        const int ty = (int) G.find(n)->type;
+        matmul(R.t(n), n_in, n_out, x, rows, y, ty != 0 && ty != 1 && ty != 30);
+    };
     const int64_t ctx_lo = std::max<int64_t>(0, n_past - window + 1);
     const int nc = (int) (n_past - ctx_lo);
     std::vector<std::vector<float>> Kc((size_t) n_layer, std::vector<float>((size_t) nc * kvd)),
@@ -261,12 +267,12 @@ int main(int argc, char** argv) {
         for (int r = 0; r < nc; ++r)
             for (int k = 0; k < K; ++k)
                 for (int e = 0; e < E; ++e) f[((size_t) r * K + k) * E + e] = feat(ctx_lo + r, k, e);
-        matmul(R.t("fc.weight"), K * E, E, f.data(), nc, g.data());
+        mm("fc.weight", K * E, E, f.data(), nc, g.data());
         for (int r = 0; r < nc; ++r) rms(&g[(size_t) r * E], R.t("enc.output_norm.weight").data(), eps, E, &gn[(size_t) r * E]);
         for (int il = 0; il < n_layer; ++il) {
             const std::string P = "blk." + std::to_string(il) + ".";
-            matmul(R.t(P + "attn_k.weight"), E, kvd, gn.data(), nc, Kc[(size_t) il].data());
-            matmul(R.t(P + "attn_v.weight"), E, kvd, gn.data(), nc, Vc[(size_t) il].data());
+            mm(P + "attn_k.weight", E, kvd, gn.data(), nc, Kc[(size_t) il].data());
+            mm(P + "attn_v.weight", E, kvd, gn.data(), nc, Vc[(size_t) il].data());
             for (int r = 0; r < nc; ++r)
                 head_norm_rope(&Kc[(size_t) il][(size_t) r * kvd], n_kv, R.t(P + "attn_k_norm.weight").data(), eps,
                                ctx_lo + r, base);
@@ -317,12 +323,12 @@ int main(int argc, char** argv) {
         if (il == 0) cmp("h0", h, h.size());
         for (int t = 0; t < B; ++t) rms(&h[(size_t) t * E], R.t(P + "attn_norm.weight").data(), eps, E, &x[(size_t) t * E]);
         if (il == 0) cmp("x0", x, x.size());
-        matmul(R.t(P + "attn_conv_proj.weight"), E, 2 * taps * ng, x.data(), B, c.data());
+        mm(P + "attn_conv_proj.weight", E, 2 * taps * ng, x.data(), B, c.data());
         conv(x.data(), c.data(), R.t(P + "attn_conv_base").data(), 0, xc.data());
         if (il == 0) cmp("c0", c, c.size()), cmp("xc0", xc, xc.size());
-        matmul(R.t(P + "attn_q.weight"), E, qd, xc.data(), B, q.data());
-        matmul(R.t(P + "attn_k.weight"), E, kvd, xc.data(), B, kb.data());
-        matmul(R.t(P + "attn_v.weight"), E, kvd, xc.data(), B, vb.data());
+        mm(P + "attn_q.weight", E, qd, xc.data(), B, q.data());
+        mm(P + "attn_k.weight", E, kvd, xc.data(), B, kb.data());
+        mm(P + "attn_v.weight", E, kvd, xc.data(), B, vb.data());
         for (int t = 0; t < B; ++t) {
             head_norm_rope(&q[(size_t) t * qd], n_head, R.t(P + "attn_q_norm.weight").data(), eps, n_past + t, base);
             head_norm_rope(&kb[(size_t) t * kvd], n_kv, R.t(P + "attn_k_norm.weight").data(), eps, n_past + t, base);
@@ -359,17 +365,17 @@ int main(int argc, char** argv) {
                 }
             }
         if (il == 0) cmp("a0", a, a.size());
-        matmul(R.t(P + "attn_output.weight"), qd, E, a.data(), B, o.data());
+        mm(P + "attn_output.weight", qd, E, a.data(), B, o.data());
         conv(o.data(), c.data(), R.t(P + "attn_conv_base").data(), 1, xc.data());
         if (il == 0) cmp("o0", o, o.size()), cmp("oc0", xc, xc.size());
         for (size_t i = 0; i < h.size(); ++i) h[i] += xc[i];
         for (int t = 0; t < B; ++t) rms(&h[(size_t) t * E], R.t(P + "ffn_norm.weight").data(), eps, E, &x[(size_t) t * E]);
-        matmul(R.t(P + "ffn_conv_proj.weight"), E, 2 * taps * ng, x.data(), B, c.data());
+        mm(P + "ffn_conv_proj.weight", E, 2 * taps * ng, x.data(), B, c.data());
         conv(x.data(), c.data(), R.t(P + "ffn_conv_base").data(), 0, xc.data());
-        matmul(R.t(P + "ffn_gate.weight"), E, n_ff, xc.data(), B, gt.data());
-        matmul(R.t(P + "ffn_up.weight"), E, n_ff, xc.data(), B, up.data());
+        mm(P + "ffn_gate.weight", E, n_ff, xc.data(), B, gt.data());
+        mm(P + "ffn_up.weight", E, n_ff, xc.data(), B, up.data());
         for (size_t i = 0; i < gt.size(); ++i) gt[i] = gt[i] / (1.0f + std::exp(-gt[i])) * up[i];
-        matmul(R.t(P + "ffn_down.weight"), n_ff, E, gt.data(), B, o.data());
+        mm(P + "ffn_down.weight", n_ff, E, gt.data(), B, o.data());
         conv(o.data(), c.data(), R.t(P + "ffn_conv_base").data(), 1, xc.data());
         for (size_t i = 0; i < h.size(); ++i) h[i] += xc[i];
         if (il == 0) cmp("l0", h, h.size());
@@ -381,7 +387,7 @@ int main(int argc, char** argv) {
         for (size_t i = 0; i < hw.size(); ++i) hw[i] = from_bf16(head_h[i]);
         matmul(hw, E, V, hn.data(), n, lg.data(), false);   // (a BF16 head reads the float rows)
     }
-    matmul(R.t("selector_hidden.weight"), E, rank, hn.data(), n, gate.data());
+    mm("selector_hidden.weight", E, rank, hn.data(), n, gate.data());
     const auto& prev = R.t("selector_predecessor.weight");
     const auto& next = R.t("selector_successor.weight");
     int bad = 0, pred = anchor, cand_miss = 0;

@@ -26,7 +26,7 @@ def main():
     ap.add_argument("--seqs", default=None, help="eval sequence indices (default: every 3rd)")
     ap.add_argument("--ctx", type=int, default=64, help="tokens of context before scoring starts")
     ap.add_argument("--len", type=int, default=1024, help="tokens per sequence used")
-    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "strata"))
+    ap.add_argument("--exe", default=str(pathlib.Path(__file__).resolve().parents[2] / "build" / "maya"))
     ap.add_argument("--max-context", type=int, default=8192)
     a = ap.parse_args()
     ev = np.load(a.eval)

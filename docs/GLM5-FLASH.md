@@ -1,10 +1,10 @@
-# Running GLM-5.3-Flash on Strata - the study
+# Running GLM-5.3-Flash - the study behind Maya's engine
 
 What it would take for [zai-org/GLM-5.3-Flash](https://huggingface.co/zai-org/GLM-5.3-Flash) to run on this
 engine, component by component, with every number the decision needs. Written 2026-09-29 against engine
 0.1.27 (`main`); all `file:line` references are to that tree.
 
-Strata is not a general inference engine: it is a native implementation of one architecture -
+The engine Maya started from is not a general inference engine: it is a native implementation of one architecture -
 Qwen3.8-Flash-Next ("qwen4exp") - with its memory tiers (VRAM expert cache / pinned RAM / mapped SSD) and
 its speculation stack built around that one shape. GLM-5.3-Flash is the same *kind* of model (a 3:1
 linear-attention/sparse-attention hybrid MoE with hyper-connections and an MTP layer), which is why a port
@@ -37,7 +37,7 @@ GGUFs already exist: [unsloth/GLM-5.3-Flash-GGUF](https://huggingface.co/unsloth
 (dynamic quants; ~120 GB at their 3-bit, ~180 GB at 4-bit). llama.cpp has the building blocks this
 architecture needs (KDA chunked + recurrent kernels, NoPE-MLA, DSA lightning indexer from the DeepSeek
 V3.2 work, nextn/MTP), which matters twice: it proves the kernels are portable, and `third_party/ggml`
-is the pinned dependency Strata builds its native path and `strata-vision` against.
+is the pinned dependency Maya builds its native path and `maya-vision` against.
 
 ## 2. What the engine already is
 
@@ -183,7 +183,7 @@ Either way this is the *cheapest* architecture delta; the risk is only parity di
   (`generate.cpp:1374`, 248320) and must come from the pack. GLM's MTP tensors must be in the GGUF
   (llama.cpp's glm5 conversion carries nextn tensors) and `tools/mtp_pack.py` taught the tensor names.
   Draft acceptance is an empirical question per model.
-* **Vision.** `strata-vision` is built from the pinned llama.cpp `mtmd` (`tools/vision/`). GLM's 24-block
+* **Vision.** `maya-vision` is built from the pinned llama.cpp `mtmd` (`tools/vision/`). GLM's 24-block
   ViT at 448 px is a standard layout; support reduces to what the pinned llama.cpp supports for
   `glm5-next` vision + a converted `mmproj` GGUF, plus the family wiring in `setup.py`. If the pinned
   llama.cpp predates glm5 vision support, this is a submodule pin bump with a re-run of the parity tests.
@@ -218,7 +218,7 @@ Either way this is the *cheapest* architecture delta; the risk is only parity di
 | IQ3_XXS-class | 2.66 | 8.4 MB | **~101 GB** | ~108 GB | ~120 GB |
 | 4-bit class | 4.25 | 13.4 MB | **~162 GB** | ~170 GB | ~180 GB |
 
-(Strata's own Qwen numbers for comparison: 23-50 GB of experts *pinned in RAM* - the design assumption
+(The original engine's Qwen numbers for comparison: 23-50 GB of experts *pinned in RAM* - the design assumption
 "all experts resident in RAM" is dead for GLM on consumer hardware. This is the thing the user flagged.)
 
 Decode traffic per token: 8 experts × 42 layers = 336 expert reads ≈ **2.4 GB/token at Q2_0 rates**
@@ -411,7 +411,7 @@ path runs through the MLA attention kernels and their parity harness.
 * The §6 Phase-0 architecture gate in the driver.
 * A build fix found by the clean-clone verification: `native_mmvq_multi` and `hit_cpu_order_parity` are
   now EXISTS-guarded like their siblings - their bench sources are not in the repository, and with
-  `STRATA_BUILD_TESTS=ON` the generate step refused to run at all.
+  `MAYA_BUILD_TESTS=ON` the generate step refused to run at all.
 * Phase 1: `ref/glm.py` (the glm5-next oracle), `tools/glm_synth_gguf.py` (the synthetic model it and the
   kernel parity tests run against), `tools/test_glm_oracle.py` (7 invariant tests, no GPU), and
   `ref/upstream-llama.cpp/` (the vendored llama.cpp spec, @ `272aad8b`).

@@ -113,6 +113,9 @@ public:
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
+    /// The last window's head logits, rows [0, rows) (n_vocab floats each, raw: before any sampling), copied to
+    /// `host`; valid until the next `run` (--dump-logits, issue #658).
+    bool read_head_logits(int rows, float* host, std::string& err);
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -171,6 +174,7 @@ private:
     int max_t_ = 0;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
+    int64_t next_pos_ = -1;   ///< where a window that continues the last committed one starts (-1: none yet)
     int32_t last_tokens_[8] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;

@@ -27,7 +27,7 @@ Two quants of our own, made from the official weights with error-feedback roundi
   Hessians and the calibration activations all fit at once. BF16 is native here (the V100s don't have it). Needs
   PyTorch for ROCm (gfx1151-class); check that first.
 - **Mercury / Uranus**: the engine side.
-  - Score every candidate quant in our engine (`STRATA_GLM_SCORE`: NLL, perplexity, top-1, and KL against a
+  - Score every candidate quant in our engine (`MAYA_GLM_SCORE`: NLL, perplexity, top-1, and KL against a
     reference dump).
   - Add kernels for the new types.
   - Measure speed.
@@ -78,7 +78,7 @@ Per layer it records:
   - REAP saliency (router weight x ||expert output||, averaged over the tokens routed to it)
   - the same per domain
 - **The reference**: for the evaluation tokens, the final logits as the top-64 log-probs plus logsumexp at every
-  position. This is the KL yardstick, in the format `STRATA_GLM_SCORE_REF` reads (extended to top-k).
+  position. This is the KL yardstick, in the format `MAYA_GLM_SCORE_REF` reads (extended to top-k).
 
 Estimate: ~1 h compute (18B active parameters x 1M tokens; Hessian accumulation) plus reading 328 GB once.
 

@@ -11,7 +11,7 @@ architecture:
 
 gfx1201 is unchanged and untuned by this expert-kernel work. Other shapes,
 other quant types, other architectures and CUDA keep the original dispatch. Set
-`STRATA_HIP_EXPERTS_LEGACY=1` before starting a process to force original HIP
+`MAYA_HIP_EXPERTS_LEGACY=1` before starting a process to force original HIP
 expert kernels for an end-to-end comparison.
 
 The main change is packed sign expansion: a multiply spreads four sign bits
@@ -45,13 +45,13 @@ paths. This work does not fuse gate/up and down into one kernel.
 cmake -S . -B build-multi -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH=/opt/rocm-7.2.1 \
   -DCMAKE_HIP_COMPILER=/opt/rocm-7.2.1/llvm/bin/clang++ \
-  -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
-  -DSTRATA_PREFILL_MMQ=ON -DSTRATA_NATIVE_EXPERTS=ON \
-  -DSTRATA_BUILD_TESTS=OFF \
-  -DSTRATA_GGML_DIR=/ai/github/project-maya/third_party/llama.cpp \
+  -DMAYA_ENABLE_HIP=ON -DMAYA_ENABLE_CUDA=OFF \
+  -DMAYA_PREFILL_MMQ=ON -DMAYA_NATIVE_EXPERTS=ON \
+  -DMAYA_BUILD_TESTS=OFF \
+  -DMAYA_GGML_DIR=/ai/github/project-maya/third_party/llama.cpp \
   '-DCMAKE_HIP_ARCHITECTURES=gfx1100;gfx1201;gfx1151'
 CCACHE_DIR=/tmp/maya-experts-ccache cmake --build build-multi -j 8 \
-  --target strata hip_expert_kernel_bench glm_ffn_parity glm_layer_parity \
+  --target maya hip_expert_kernel_bench glm_ffn_parity glm_layer_parity \
   glm_model_test iq1_s_parity hip_intrinsics
 export HIP_VISIBLE_DEVICES=0
 export LD_LIBRARY_PATH=/opt/rocm/lib
@@ -137,7 +137,7 @@ measured. gfx1201 continues to use the original kernels and remains untuned.
 Run the benchmark, `--shared`, and `--parity-only --sweep` on gfx1151 using the
 same ROCm build settings. Then compare the resident-pool Maya-S decode trace
 with the same prompt, token count and routing settings, once with
-`STRATA_HIP_EXPERTS_LEGACY=1` and once without it. Set that variable on the
+`MAYA_HIP_EXPERTS_LEGACY=1` and once without it. Set that variable on the
 separate profiling process; these changes do not require touching a running
 server.
 

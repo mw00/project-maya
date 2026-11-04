@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REPO = "mw00/project-maya"
 UPDATE_EXIT = 75                    # the server's exit code that tells maya.py: updated, start again (EX_TEMPFAIL)
+RESTART_EXIT = 76                   # ... the dashboard saved a new port: start again with the saved config
 SUPERVISED = "MAYA_RESTART_ON_UPDATE"   # set by maya.py for the server it starts: it starts it again after an update
 CHECK_EVERY = 6 * 3600
 RETRY_AFTER = 10 * 60               # GitHub not reached: ask again after this
@@ -138,17 +139,18 @@ class Updater:
     # ---------------------------------------------------------------- the update itself
     def start(self, svc) -> dict:
         """Update to the latest release on a thread (after the request in flight; new requests get a 503 meanwhile)."""
-        if not self.newer():
-            raise ValueError("this is the latest version")
-        why = self.blocker()
-        if why:
-            raise ValueError(f"Maya can't update itself here: {why}")
-        if self.busy():
-            raise ValueError("an update is already running")
-        self.state = {"state": "updating", "to": self.latest["version"], "started": time.time(), "error": None}
-        self.thread = threading.Thread(target=self._update, args=(svc, self.latest["tag"]), daemon=True)
-        self.thread.start()
-        return dict(self.state)
+        with self.lock:                                 # two clicks: one update
+            if not self.newer():
+                raise ValueError("this is the latest version")
+            why = self.blocker()
+            if why:
+                raise ValueError(f"Maya can't update itself here: {why}")
+            if self.busy():
+                raise ValueError("an update is already running")
+            self.state = {"state": "updating", "to": self.latest["version"], "started": time.time(), "error": None}
+            self.thread = threading.Thread(target=self._update, args=(svc, self.latest["tag"]), daemon=True)
+            self.thread.start()
+            return dict(self.state)
 
     def _update(self, svc, tag: str):
         with svc.fifo:                                  # the request in flight finishes first

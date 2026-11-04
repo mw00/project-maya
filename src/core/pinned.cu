@@ -76,7 +76,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note) {
                std::to_string((unsigned long long) large) + ", VirtualAlloc error " +
                std::to_string((unsigned long long) GetLastError()) + "); using 4 KB pages";
     } else if (std::getenv("STRATA_NO_LARGEPAGES") != nullptr) {
-        note = "large pages skipped (STRATA_NO_LARGEPAGES); using 4 KB pages";
+        note = "large pages skipped (MAYA_NO_LARGEPAGES); using 4 KB pages";
     } else {
         note = "this system has no large-page minimum; using 4 KB pages";
     }
@@ -204,7 +204,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                 locked_bytes = lr.locked_bytes;
                 note = lr.note + "; " + note;
             } else {
-                note = "arena lock disabled (STRATA_ARENA_LOCK=0); " + note;
+                note = "arena lock disabled (MAYA_ARENA_LOCK=0); " + note;
             }
         }
     }

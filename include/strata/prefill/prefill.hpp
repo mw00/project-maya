@@ -109,6 +109,7 @@ private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     const float* hand_in_ = nullptr;    ///< the previous stage's rows of the chunk being read (host, pinned)
+    bool drain_pipe(std::string& err);  // waits for the chunks handed on to the later stages
     bool carve(std::size_t T, void* alloc);   // the device buffers of a chunk (prefill.cpp's Alloc)
     struct Impl;
     std::unique_ptr<Impl> impl_;

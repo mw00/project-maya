@@ -42,7 +42,7 @@ class ProfileArgsTests(unittest.TestCase):
         self.shipped.write_bytes(b"STRP")
         for ctx in (
             patch.object(maya, "ROOT", self.root),
-            patch.object(maya, "EXE", self.root / "build/strata"),
+            patch.object(maya, "EXE", self.root / "build/maya"),
             patch.object(maya, "PROFILE", self.shipped),
             patch.object(maya, "CAL_STORE", self.root / "calibration.json"),
             patch.object(maya, "WIN", False),

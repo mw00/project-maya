@@ -51,7 +51,7 @@ compares, regardless of a package's version label. Upstream includes both
 Maya's GLM dense prompt products in `src/core/glm_prefill.cu` still use SGEMM
 and batched SGEMM through hipBLAS where appropriate. Its FP16 prompt
 projections now reuse the inherited hipBLASLt loader in `src/prefill/gemm.cu`
-when `STRATA_HIPBLASLT_TUNING` names a matching GLM table. Shapes absent from
+when `MAYA_HIPBLASLT_TUNING` names a matching GLM table. Shapes absent from
 the table fall back to GEMM Ex through hipBLAS, and the quantized expert path
 continues to use GGML MMQ. The GLM tables were tuned and checked separately for
 gfx1100, gfx1151 and gfx1201; the inherited Qwen tables are not interchangeable
