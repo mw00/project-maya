@@ -1,7 +1,12 @@
 #pragma once
 // hipBLAS 2.x (ROCm 6.x) keeps the hipDataType / hipblasComputeType_t GemmEx API behind HIPBLAS_V2 (ROCm 7's
 // hipBLAS 3 has it by default): opt in before the header, as a distribution's ROCm 6 (Debian's 6.4) needs it.
+// (a hipBLAS without the version header builds as before: no version, so neither ROCm 6 branch below)
+#if defined(__has_include)
+#if __has_include(<hipblas/hipblas-version.h>)
 #include <hipblas/hipblas-version.h>
+#endif
+#endif
 #if defined(hipblasVersionMajor) && hipblasVersionMajor < 3 && !defined(HIPBLAS_V2)
 #define HIPBLAS_V2
 #endif

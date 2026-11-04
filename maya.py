@@ -2065,10 +2065,13 @@ def hip_toolchain(pc: dict) -> tuple:
     env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
     if WIN:
         env["HIP_DEVICE_LIB_PATH"] = str(clang.parent.parent / "amdgcn" / "bitcode")
-    elif not (root / "amdgcn" / "bitcode").is_dir() and "HIP_DEVICE_LIB_PATH" not in env:
+    elif (clang.parent.parent.parent == root / "lib" and re.fullmatch(r"llvm-\d+", clang.parent.parent.name)
+          and not (root / "amdgcn" / "bitcode").is_dir() and "HIP_DEVICE_LIB_PATH" not in env):
         # Debian/Ubuntu's rocm-device-libs-<N>: the bitcode sits in the LLVM's clang resource folder
-        # (/usr/lib/llvm-<N>/lib/clang/<N>/amdgcn/bitcode), not under ROCM_PATH, where clang looks with ROCM_PATH set
-        found = sorted(clang.parent.parent.glob("lib/clang/*/amdgcn/bitcode"))
+        # (/usr/lib/llvm-<N>/lib/clang/<N>/amdgcn/bitcode), not under ROCM_PATH, where clang looks with ROCM_PATH set.
+        # Only for that layout's compiler (<root>/lib/llvm-<N>/bin): every other ROCm builds as before
+        found = sorted(clang.parent.parent.glob("lib/clang/*/amdgcn/bitcode"),
+                       key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)])
         if found:
             env["HIP_DEVICE_LIB_PATH"] = str(found[-1])
     return root, clang, bindir, env

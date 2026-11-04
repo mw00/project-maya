@@ -2142,3 +2142,13 @@ requests shared one loaded model; the drafter stayed loaded in both modes. A sep
 inconclusive because the controls drifted. These are limited model measurements, not production API acceptance or
 a general speed guarantee. Full-vocabulary diagnostic dumps matched across settings and repeats on the tested
 states; other GPU architectures and broader workloads remain unvalidated.
+
+## AMD: setting up with a ROCm older than 7
+
+The HIP setup takes ROCm 7 or newer. A distribution's own ROCm 6.x packages (Debian's 6.4 under `/usr`, hipBLAS 2.x) are
+untested and refused unless this is set when the setup or `--check` runs (in the shell, not the config's `"env"`); see
+[AMD_MAYA.md](AMD_MAYA.md). With ROCm 7 the setting does nothing.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `MAYA_HIP_ALLOW_ROCM6` | unset (ROCm 6 refused) | `1`: the setup goes on with a ROCm 6.x, with a warning (untested: the build or the engine may fail); the build then takes hipBLAS 2's `HIPBLAS_V2` API and leaves out `hipblasSetWorkspace`, which hipBLAS 2 does not have |
