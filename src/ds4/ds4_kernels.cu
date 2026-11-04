@@ -3068,7 +3068,7 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, 
     const int any = *(volatile int*) cpu_any;
     *cpu_any = 0;
     if (any || (int) (seq - *(volatile const unsigned*) host_done) >= kRing / 2) return;
-    for (int t = 0; t < T; ++t) resp->cpu[t] = 0;
+    for (int t = 0; t < T; ++t) resp->cpu[t] = 0, resp->pmask[t] = 0;
     __threadfence_system();
     *(volatile unsigned*) &resp->seq = seq;
 }
@@ -3889,6 +3889,42 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
     pdl_launch(moe_sort_kernel<false>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
     pdl_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
     pdl_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
+}
+// (DS4_LANE_PARITY) the prompt path's expert sum in exact fixed point: each pick's w y (exact in F64) times 2^32,
+// rounded to an integer once, summed in int64 - an exact, order-free sum, so the sets' order (VRAM slots first, then
+// the streamed ones as they land: the placement's) no longer changes a bit of it; moe_x_finish adds it to acc after the
+// layer's last set
+__global__ void moe_combine_x_kernel(long long* acc, const float* __restrict__ y, const int* __restrict__ pos,
+                                     const float* __restrict__ w, int k, int r0, int r1, int dim) {
+    pdl_wait();
+    pdl_trigger();
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (e >= dim) return;
+    long long a = 0;
+    bool any = false;
+    for (int i = 0; i < k; ++i) {
+        const int r = pos[(size_t) t * kPicks + i];
+        if (r < r0 || r >= r1) continue;
+        const double p = (double) w[(size_t) t * kPicks + i] * (double) y[(size_t) (r - r0) * dim + e];
+        a += __double2ll_rn(p * 4294967296.0);
+        any = true;
+    }
+    if (any) acc[(size_t) t * dim + e] += a;
+}
+__global__ void moe_x_finish_kernel(float* acc, const long long* __restrict__ acc64, size_t n) {
+    pdl_wait();
+    pdl_trigger();
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    acc[i] = __fadd_rn(acc[i], __double2float_rn((double) acc64[i] * 2.3283064365386962890625e-10));
+}
+void moe_combine_x(long long* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1,
+                   int dim, cudaStream_t s) {
+    if (r1 > r0 && T > 0)
+        pdl_launch(moe_combine_x_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, acc, y, pos, w, k, r0, r1, dim);
+}
+void moe_x_finish(float* acc, const long long* acc64, size_t n, cudaStream_t s) {
+    if (n > 0) pdl_launch(moe_x_finish_kernel, (unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, s, acc, acc64, n);
 }
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s) {

@@ -67,6 +67,8 @@ struct Args {
     int act = kActSwiglu;    // the activation (kActOai: MiniMax's)
     int tu = 0;              // (kActOai) the up's type when it is not the gate's (0: tg): gate and up then in two passes,
                              // the gate's sums in h first - each value the same as one pass gives
+    int pexp = 0;            // 1: the token kernels' SwiGLU takes exp_portable (ds4_par_exp.h, DS4_LANE_PARITY), the
+                             // CPU lane's exp bit for bit, in place of CUDA's expf (its ex2.approx)
 };
 /// grid (n_ff / 8, groups): h of every entry (ne_max: a group's most entries).  false: a type not covered.
 bool gate_up(const Args& a, int groups, int ne_max, cudaStream_t s);

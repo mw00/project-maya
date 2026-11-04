@@ -197,7 +197,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_THINK_RESERVE` | 1024 | the server: the token reserve for the final answer when a request's output limit is tiny. The config's `"thinking_budget"` (32768) is lowered by a request's `max_tokens` (or the context left) only when that limit is 1024 tokens or fewer (a side request such as a title): then a quarter is kept for the answer, with this preferred floor, capped at half the limit so reasoning still has room; the forced `</think>` token also counts toward the limit. A larger `max_tokens` is the cap on the whole output and leaves the thinking budget as it is (a chat client's 4096 no longer closes the thinking at ~3K tokens; a thinking that reaches the limit ends with `finish_reason` "length"); the reserve can also be supplied as `STRATA_GLM_THINK_RESERVE` in the run config's `env` |
 | `MAYA_ENGINE_STALL_S` | 90 | the server: an engine silent this long that also used no CPU, disk or GPU in that time is stuck - it is ended, the request gets an error and the next request starts it again (a silent engine that is working is never ended); `0` = off |
 | `MAYA_WATCHDOG_S` | 180 | the engine: a request that finishes no prompt layer and no token for this long has hung, even with a thread spinning (#40). The engine writes where it stopped to its log (on Windows also `maya-stall-<pid>.dmp`, every thread's stack: attach both to an issue) and ends; the request gets an error and the next request starts it again. `0` = off |
-| `MAYA_DS4_WATCHDOG_S` | 600 | DeepSeek's engine (`maya-ds4 --serve`): a request whose prompt, tokens and steps between stop moving for this long has hung (#539, #494: a tensor-parallel group with one GPU spinning and the other idle). The engine writes where the main thread and each GPU's thread of a prompt were (`maya ds4 serve: where it stopped: ...`) and ends; the request gets an error and the next one starts it again. `0` = off |
+| `MAYA_DS4_WATCHDOG_S` | 600 | DeepSeek's engine (`maya-ds4 --serve`): a request whose prompt, tokens and steps between stop moving for this long has hung (#539, #494: a tensor-parallel group with one GPU spinning and the other idle). The engine writes where the main thread and each GPU's thread of a prompt were (`maya ds4 serve: where it stopped: ...`) and ends; the request gets an error and the next one starts it again. `0` = off. Not this setting's, and always on: a request that leaves a GPU holding layers in a fault (an illegal address, a failed launch - every later call on that GPU fails) or the prompt path's room not handed back ends the engine the same way once that request's error is out (`maya ds4 serve: a GPU's state is unknown after this request`, exit 3), and the next request - even one already waiting - starts a fresh one; before, it stayed up and refused every later request until a restart by hand |
 | `MAYA_HTTP_BACKLOG`, `MAYA_MAX_BODY_MIB` | 256, 256 | the server: connections that may wait to be accepted, and the largest request body in MiB (a larger one gets a 413 before it is read) |
 | `MAYA_ENGINE_QUIT_S` | 50 | the server: how long the engine gets to end (and keep its conversation, with `MAYA_GLM_SLOT_KEEP`) after a stop - SIGTERM and SIGHUP are handled like Ctrl+C, a second one is ignored (a second Ctrl+C ends the server at once); a supervisor's own grace (llama-swap's `unloadTimeout`) should exceed it |
 | `MAYA_ENGINE_WRAP_S` | 40 | the server: on a stop, a request in progress is wrapped up instead of dropped - its thinking is closed at once and it answers for up to this long (then it is cut), so the client gets an answer and the turn ends; requests still queued are refused. Keep it plus the engine's end inside the supervisor's grace (llama-swap's `unloadTimeout`); `0` = cut at once |
@@ -306,6 +306,70 @@ and the prompt path computes a layer's experts in sets by where they sit - the r
 ones in groups, the rows summed as each set comes in - which rounds otherwise. With and without DFlash2 loaded the
 tokens parted after 17 of 48. The decode does not depend on where the experts sit: with the prompt read token by token
 (`MAYA_GLM_NO_PREFILL=1`, far slower prompts) both gave the same logits.
+
+## DeepSeek: an expert's bits wherever it sits
+
+DeepSeek's CPU lane does not give the bits the same expert gives in VRAM, so with any routed expert off VRAM a greedy
+answer follows where the experts sit: the placement, the expert cache's moves between requests, the expert profile's
+updates between starts. One conversation does not repeat itself, and `--parallel N --multi-check` fails (#644). Five
+things differ:
+
+- the lane sums a row's blocks ggml's way, not in the order of the device kernels' lanes;
+- the SwiGLU's `exp` is the CPU's on the lane and CUDA's `expf` (the SFU's `ex2.approx`, which no CPU reproduces) on
+  the device;
+- the lane's part enters the expert sum as one weighted vector after the VRAM experts';
+- the chunked prompt pass sums a layer's experts set by set in the order the placement makes them (the VRAM slots, then
+  the streamed experts as they land), and gives only the VRAM experts the busy experts' FP16 GEMMs;
+- the prompt goes through the chunked pass or windows of 16 by a timing prediction, and the two round differently
+  (`MAYA_DS4_PROMPT_PICK` below).
+
+`MAYA_DS4_LANE_PARITY=1` (opt-in) makes an expert's part the same bits on either lane, in the same place of the sum:
+
+- **The CPU lane in the device's arithmetic** (`src/ds4/ds4_lane_parity.cpp`; IQ2_XXS, IQ2_S, IQ3_XXS and IQ3_S
+  experts, Maya-S's types): the activation rounded as the device's Q8_K, each row's 32-value sub-blocks dealt to the
+  token kernels' lanes (32 a gate / up row, 16 a down row) and summed in their order, the lanes added in the kernels'
+  tree. The integer dots run in AVX2 where the CPU has it (exact either way), checked against the scalar form at the
+  first use.
+- **The SwiGLU's `exp` in plain IEEE operations on both sides** (`src/ds4/ds4_par_exp.h`): fma, multiply, add and an
+  exact power-of-two scale, within 1 ulp of e^x for x >= -87.
+- **Each CPU-lane pick its own part of the sum:** the lane writes each pick's output (`Resp::pmask` says which), and the
+  device adds it in that pick's place, as it adds the expert from VRAM.
+- **The chunked pass's expert sum exact and in no order** (64-bit fixed point, 2^-32 units, one rounding at the end of
+  the layer), and the busy experts' FP16 GEMMs for the streamed experts too.
+- **The prompt's path by its length** (`MAYA_DS4_PROMPT_PICK=length`, unless it is set otherwise).
+
+Measured on 2x RTX PRO 6000 (layer split), Maya-S, greedy, against v1.1.45:
+
+| | v1.1.45 | `MAYA_DS4_LANE_PARITY=1` |
+| --- | --- | --- |
+| one conversation, three passes in one start, at 0 / ~400 / ~790 experts on the CPU lane (`--reserve-mib` 3072 / 6144 / 8192) | the passes with experts on the lane differ from each other and from the one with none | all nine: the prompt's last logits and 48 tokens byte for byte the same (the cache moved 140 and 257 experts) |
+| `--parallel 2 --multi-check`, DSpark on | 45 of 79 rows bit for bit (16 experts on the lane), 0 of 47 (362) | 94 of 94 (50), 94 of 94 (430) |
+| a 3,000-token prompt through the chunked pass, at the three placements and with `--expert-profile none` | differs between placements, and between two starts with every expert in VRAM (the profile's update moves experts between slots) | the same in every start |
+| perplexity, 8 x 1,024 tokens of this file | 16.841 with every expert in VRAM, 16.949 with 722 on the lane | 16.829 at both (each sequence's the same) |
+
+With the setting off (the default) the engine is as before: the same logits as v1.1.45 bit for bit (with every
+expert in VRAM; with 299 on the lane and `--no-expert-cache`; through the chunked pass with `--expert-profile none`).
+With it on, the bits change even with every expert in VRAM (the portable `exp`, the exact sums): on the synthetic prompt
+above, logits up to 3.3 apart from v1.1.45's with the same top token; perplexity as in the table.
+
+Its cost: decode with every expert in VRAM unchanged (384 tokens of an essay, DSpark and prompt lookup off: 80.2 / 80.8
+tok/s on v1.1.45, 80.7 / 80.6 with the setting; with DSpark 98.6 / 101.9). With 720-790 experts on the lane and the PCIe
+lane off on both, 72.2 / 74.2 tok/s against 78.3 / 77.6: the parity rows take 1.4-1.6x ggml's time an IQ2_XXS expert and
+2.3-2.8x an IQ2_S one (`build/ds4_par_bench`, one thread), and the exact sums' buffer takes `chunk` x dim x 8 bytes of
+VRAM a GPU (335 MB at 8192 tokens: ~30 experts a GPU fewer). A 3,000-token prompt through the chunked pass 1.15 s
+against 1.10 with every expert in VRAM, 1.45-1.50 against 1.40-1.46 with 720-790 on the lane. `build/ds4_gguf_test --parity`
+checks the rows and the `exp` against the device's kernels bit for bit (no model needed).
+
+Not covered yet (their answers still follow the placement): other expert formats on the CPU lane (MXFP4, EXL3,
+IQ1_S / IQ1_M, IQ4_XS, IQ4_NL), mixed layers, the helper GPU (`MAYA_DS4_HELPER`), tensor-parallel groups, the
+host-routed path (`DS4_SYNC=1`), and AMD builds (the rows follow the CUDA kernels; there the setting is ignored). The
+chunk's size comes from the free VRAM at the load, so a prompt longer than a chunk can still differ between two
+configurations (not between two starts of one).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_LANE_PARITY` | off | `1`: as above (with `DS4_IQ_Q8K` on, the default) |
+| `MAYA_DS4_LANE_PARITY_SCALAR` | off | `1` (tests): the CPU lane's parity rows in their scalar form - the same bits, slower |
 
 ## Repetition penalties
 
@@ -492,7 +556,8 @@ context shares the memory beside the model among the N conversations.
   Each request gets exactly the tokens it would get alone with plain steps: greedy, with the experts where the load put
   them and the PCIe lane off, its logits are bit for bit its own (checked with 2 and 4 at once: `maya-ds4 --parallel 4
   --multi-check --ids ...`). The CPU lane's and the PCIe lane's rounding can change the last bits, as it already can
-  between two runs of one request.
+  between two runs of one request ([`MAYA_DS4_LANE_PARITY=1`](#deepseek-an-experts-bits-wherever-it-sits) takes that
+  away for Maya-S's expert types).
 - **A new request** takes the idle conversation its prompt continues. If none fits, it takes an empty one, else the
   least recently used, which first goes to a [kept conversation](#deepseek-conversations-kept-an-agents-parent-and-workers-on-one-model)
   with `MAYA_DS4_SLOT_KEEP=1`. Its pictures are read by the engine between two of the others' tokens: the vision tower
@@ -740,6 +805,7 @@ experts left in the files); all 101 GB of copies pinned in 3.3 s.
 | `DS4_STREAM_SLOTS` | 16 | a verify window's streamed experts at most, a layer (1-16) |
 | `DS4_LAND` | on with one NVIDIA GPU (Linux or Windows) where experts stream | `0`: a streamed expert does not stay in VRAM, and a GGUF gets no recent slots |
 | `DS4_RECENT` | 32 (a GGUF: with `DS4_LAND`) | the recent slots a layer (VRAM slots taken from the profile's coldest experts) |
+| `MAYA_DS4_RECENT_FIT` | off (0) | `1`: a layer whose VRAM slots cannot hold the whole `DS4_RECENT` set beside one profile expert and the cache's spare (it gets no recent slots at all otherwise - on the 2.25bpw EXL3 DeepSeek pack with its profile, the 2.5-bit layers keep 18-34 slots, so ten of them have none) keeps as many recent slots as leave one of each; `2`: also the placement gives each layer its recent set, one profile expert and the spare first, then the slots past them by the profile experts they add (where that does not fit: as `1`). Each profile expert that leaves VRAM for a recent slot keeps a copy in RAM: the start's `DS4_RECENT_FIT` line says how many and about how many GB (2.7 / 3.5 GB on that pack). Only which side computes an expert changes, so the answers can differ in the last bits. Not on an EXL3 lender's layers (`DS4_EXL3_LEND`) or the drafter's |
 | `MAYA_DS4_PIN_BY_NEED` | off (0); on for Windows' one-GPU path | where the system cannot lock every expert copied into RAM for the GPU (Windows locks about half the RAM): `1` pins them a layer at a time, the layers whose copies the routing profile uses most first, until a pin fails or `MAYA_DS4_PIN_GB` is reached; the GPU pulls those in place, the rest go through the staging. Without it a pin that fails leaves every copy to the staging (an RTX 3090, Maya-XS, 101 GB of copies held to 50 GB pinned: decode 16.3 -> 20.3 tokens/s; all of them pinned: 29.0). A GPU that does not address registered memory at its host address (Windows' WDDM) takes its mapped address, with one GPU |
 | `MAYA_DS4_PIN_GB` | 0 (no cap) | with `MAYA_DS4_PIN_BY_NEED`: pin at most this many GB of the copies |
 
@@ -802,6 +868,65 @@ below that prompts run in windows of 16. The log says which.
 | `MAYA_DS4_PROMPT_WARM` | on | `0`: the first chunked prompt pays the GEMM library's start, as before |
 | `DS4_RING_MB` | by the link | the prompt path's staging ring a GPU (MB). Unset: sized at load from the GPU's measured host link - batches (a quarter of the ring each) of about 10 ms of it - one expert where the link takes 1 ms or more for one - at least one expert, at most the 400 MB it was before and 1/16 of the GPU's VRAM room for experts, so a slow link (PCIe Gen2) waits less for each batch and a fast one keeps 400 MB (the log's `prompt ring` line); `auto`: from each GPU's VRAM room for experts at load, 64 MB a GB of it, 400-1200 MB - more of a prompt's likely experts queued early where the GPUs cannot hold them, for that much VRAM less for experts (opt-in until measured) |
 | `MAYA_DS4_SETTLE_MS` | 0 (off) | after a chunked prompt, the expert cache learns from the prompt's picks (as it does from windows) and moves the hottest of them into VRAM in rounds of its usual swap rule, for at most this many ms, so the decode that follows finds them on the card; the first answer token comes that much later. Placement only, as the cache's own moves (opt-in until measured) |
+
+## DeepSeek: long prompts on a layer split (`DS4_SPLIT`, several GPUs)
+
+With the layers split across GPUs (one GPU a group) a prompt runs as a relay: a chunk goes through the first GPU's
+layers, then the next GPU's. Four settings help that path when the experts sit in RAM; each is off by default.
+
+- `DS4_FLOW_COPY_DMA=1`: a streamed expert whose RAM copy is in one pinned part is DMA'd to the GPU from that copy.
+  Without it only MXFP4 experts went that way; the GGUF low-bit experts (IQ2_XXS, IQ3_S, ...) were first copied by a
+  reader thread into the pinned staging, about 2.7 GB/s a GPU on PCIe 3.0, which the four GPUs waited on. The same bytes.
+- `DS4_YOCO_FLOW=1`: the prompt skip of the layers after the YOCO source (`DS4_YOCO`) also on a layer split whose groups
+  read the prompt on the flow; the cut is at a chunk's start. It changes the answers as little as the skip does on one GPU.
+- `DS4_CHUNK_AUTO=1`: a prompt's chunk is `n / (DS4_CHUNK_PER_GROUP x groups)` rows, rounded up to 16, at least
+  `DS4_CHUNK_AUTO_MIN` and at most `--prefill-chunk`. A prompt that fit one chunk ran the groups one after another;
+  smaller chunks keep every group busy. Only with more than one group. `DS4_CHUNK_MIN` is still the windows threshold.
+  The chunks' boundaries move, so the answers can differ slightly from a run without it (as another `--prefill-chunk` does).
+- `DS4_AI_RUN=1`: the indexer's slabs sized by the keys this prompt has, not by `--max-context`. A large context split
+  every prompt's indexer into many small slabs; now a prompt gets the rows a context of its own length would (the same
+  GEMM shapes, fewer launches). Its buffers take room for 128 rows: at 512K about 2-3 experts of VRAM a GPU.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy in one part is DMA'd from that copy, any format (the same bytes) |
+| `DS4_YOCO_FLOW` | off (0) | `1`: the YOCO prompt skip also on a layer split whose groups are on the flow (changes the answers slightly) |
+| `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work (changes the answers slightly) |
+| `DS4_CHUNK_PER_GROUP` | 2 | with `DS4_CHUNK_AUTO=1`: chunks a group |
+| `DS4_CHUNK_AUTO_MIN` | 1024 | with `DS4_CHUNK_AUTO=1`: the smallest chunk, in tokens |
+| `DS4_AI_RUN` | off (0) | `1`: the indexer's slab rows from this prompt's keys, not the context's (the same answers; VRAM for 128 rows) |
+
+## DeepSeek: a long conversation's next turn (lent experts in RAM, prompt preparation by increment)
+
+Two costs of a turn in a long conversation that are not the model's work:
+
+- **Lent experts.** With `DS4_BORROW` a prompt's buffers lie over the last expert slots of a GPU; after the prompt
+  those experts are read back, from the SSD or the page cache, before the first token. With `DS4_LENT_RAM_GB=N` the
+  engine pins N GB of RAM at load and copies each expert into it just before the buffers overwrite its slot: while
+  lent it is DMA'd from that copy (as a RAM expert is), and the hand-back DMAs it back on the GPU's stream - no disk on
+  the prompt path. An expert with such a copy is also left out of the lent experts' page-cache prefetch. The bytes are
+  the ones the slot held, so the answers are the same. Full, the oldest copy not lent now gives its place up.
+  `DS4_CHECK_LEND=1` compares every copy handed back with the model's files (slow; for tests).
+- **Prompt preparation.** The server marks the special-token literals in every message of every request, and an agent
+  client re-sends the whole history each turn: about 1.8 s a turn at 150-350K tokens. `MAYA_PROMPT_MEMO=1` remembers
+  the marked text per string and builds the token ids by increment from the last prompt's, the same ids;
+  `MAYA_PROMPT_MEMO=verify` also builds them the whole way and fails a request whose ids differ (for tests). This one
+  is the server's, so it works the same for every model (GLM, MiniMax and Qwen prompts too, not only DeepSeek). It
+  keeps the marked text of up to about 100 M characters of messages (a few hundred MB of RAM on long agent sessions).
+
+`MAYA_TURN_TRACE=1` (server) and `DS4_TURN_TRACE=1` (engine) print one line a request with its clock marks (prompt
+preparation, first token, the engine's run; read them with one request at a time - with `--parallel` the server's
+marks of several requests mix), and `DS4_RUN_POLL_MS` sets how often the engine looks whether the GPUs are
+done with a prompt run (50 ms, the progress line keeps its 50 ms).
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_LENT_RAM_GB` | off (0) | N: pinned RAM copies (N GB) of the experts a prompt's borrowed buffers lie over; they go back from RAM, not from the disk (the same bytes) |
+| `DS4_CHECK_LEND` | off | `1`: every expert handed back from its RAM copy compared with the files |
+| `MAYA_PROMPT_MEMO` | off (0) | `1`: the server's prompt preparation by increment (the same token ids); `verify`: checked against the whole way every request |
+| `MAYA_TURN_TRACE` | off | `1`: a line a request with the server's clock marks |
+| `DS4_TURN_TRACE` | off | `1`: a line a request with the engine's clock marks |
+| `DS4_RUN_POLL_MS` | 50 | 1-50: how often the engine looks whether a prompt run's GPUs are done |
 
 ## DeepSeek: choosing the drafter GPU group (experimental)
 
@@ -1000,6 +1125,9 @@ on are used (`taskset`, a container's cpuset).
 | `MAYA_DS4_CPU_LANE` | measured | `cores`, `pcores`, `node` or `smt` (a thread per logical CPU): that way, nothing is measured |
 | `DS4_COPY_NUMA` (the config's `"env"`) | 2 parts at most | the CPU lane's RAM copies of its experts in this many NUMA parts, `1`-`4`, each on its own node with a worker pool there - so a host of three or four sockets uses them all (the default takes two). 4x Xeon E7-8880 v4 (88 cores), Maya-S + DSpark, `--mmap-experts off`: two RTX 3090s (a pair on sockets 0-1, and one on 2-3, two runs each on the first) 37-39 -> 49 tok/s decode, after a 68K prompt 24-26 -> 32-33 tok/s, the prompt read 644-655 -> 805 tok/s on the first pair (802 both ways on the second); four RTX 3090s (less on the CPU lane) unchanged |
 | `MAYA_DS4_LANE_SPIN_US` | 20000 | the lane's workers spin this many us idle before they sleep (0 .. 1000000): a decode hands the lane work on few layers, and on an APU a shorter spin leaves the integrated GPU more of the shared power (the answers are the same) |
+| `MAYA_DS4_CPU_SPLIT_COLS` | off | `1`: a call of few EXL3 experts on the lane (a decoded token's one or two a layer) has its gate / up and down pieces cut by columns too, so more of the lane's threads share it. A step is cut only where its pieces would leave threads idle for a whole piece (fewer than 8 jobs a thread), into the equal runs that take the fewest rounds; a call of more experts runs as before. Each output is the same sum in the same order, so the answers are the same bit for bit (`ds4_cpu_split_test` checks it; with the engine's own `DS4_CPU_FLOW_CHECK=1` - that bare name, in the config's `"env"`, as the engine reads no `MAYA_` or `STRATA_` name of it - each call is checked against the uncut steps). Off until measured: it may help where the lane has many threads for the few experts a layer leaves it |
+| `MAYA_DS4_CPU_W16` | off | `1`: on a CPU whose lane runs the AVX2 tier (no AVX-512), the EXL3 experts' codebook products and byte sums are computed in 16-bit lanes, a tile row's two halves at once (an expert's call of 1-3 tokens; 4 or more keep the 32-bit path) - fewer of the uops that Haswell and Broadwell run on one port only. The same byte sums and the same float steps, so the answers are the same bit for bit (`exl3_cpu_w16_test` checks it; `DS4_CPU_W16_CHECK=1`, the engine's bare name, checks each lane call against the 32-bit path). The log says whether it took (`ds4: CPU lane: EXL3 codebook products in 16-bit lanes on`); other tiers ignore it. Off until measured: CPUs with more integer-multiply ports (AMD Zen) may not gain |
+| `MAYA_EXL3_AVX2_SHUF` | off | `1`: on a CPU whose EXL3 CPU lane runs the AVX2 tier (no AVX-512), the trellis windows that start on a byte boundary (a shift of 8, 16 or 24 bits) are cut out with byte shuffles instead of vector shifts - on Haswell and Broadwell every vector shift shares the one port the codebook multiplies are bound by. Read by the EXL3 CPU kernels, so every model's CPU lane takes it (`STRATA_EXL3_AVX2_SHUF=1` when an engine is started directly). The same states, so the answers are the same bit for bit (`exl3_cpu_shuf_test` checks it); at its first call the kernel also checks the shuffles against the shifts on random weights and stays off if any output differs, with one line in the log either way (`EXL3 CPU lane: STRATA_EXL3_AVX2_SHUF=1, ... start check 0 of N outputs differ - on`). Other tiers ignore it. Off until measured: CPUs with two vector-shift ports may not gain |
 
 ## DeepSeek: IQ1_S experts on AMD Zen, Zen+ and Zen 2 CPUs
 
@@ -1080,6 +1208,20 @@ difference fails the start); `ds4_gguf_test --trims` checks every mode.
 | `MAYA_DS4_Q8_BATCH` | on | `0`: a launch a job, as before (the same bits either way) |
 | `MAYA_DS4_Q8_SHARE` | on | `0`: each job rounds its own input, even one another job of the call reads (the same bits either way); both `0`: as before |
 | `MAYA_DS4_Q8_CHECK` | off | `1`: the batched, shared rounding checked against the per-job one on every GPU at load |
+
+## DeepSeek: Q8_0 GEMVs on the tensor cores
+
+A GGUF pack's Q8_0 matrices (the attention's projections, the shared expert, the output head) are read by `q8_mv`, one
+lane a 32-value block with `dp4a`. With 3 to 16 columns - a DSpark verify window, a few requests at once - it is no
+longer bound by the memory. `MAYA_DS4_Q8MV_TC=1` runs those calls on the tensor cores instead (`mma.sync` m16n8k32
+int8, weights staged with `cp.async`): a block's integer sum is the same as the `dp4a` chain's and the float part keeps
+`q8_mv`'s order of additions, so the answers are bit for bit the same. One and two columns stay on `q8_mv`, which
+reads the weights at the memory's speed already. Compute capability 8.0 and newer (Ampere on), CUDA only; on Volta,
+Turing and AMD the setting does nothing.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_Q8MV_TC` | off (0) | `1`: Q8_0 GEMVs of 3 to 16 columns on the tensor cores (the same bits); `2`: two columns too (no faster on an RTX 3090) |
 
 ## DeepSeek: tensor-parallel layers without the host
 
@@ -1326,6 +1468,7 @@ these kernel switches do not use the `MAYA_*` alias convention.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `EXL3_WMMA_GFX12` | off | `1`: allow RDNA4 matrix instructions; unset or `0`: portable grouped EXL3 prefill on gfx12 |
+| `EXL3_WMMA_GFX950` | off | `1`: the EXL3 prompt path on CDNA 4 (gfx950, MI350X) matrix cores (MFMA); unset or `0`: the portable path on gfx950, as before. Its sums are grouped differently, so the answers can differ slightly |
 | `EXL3_WMMA_ROWS` | `16` | `16` or `32`: routed rows processed per block |
 | `EXL3_WMMA` | enabled where supported | `0`: disable matrix prefill, overriding the gfx12 setting; `1`: allow it |
 

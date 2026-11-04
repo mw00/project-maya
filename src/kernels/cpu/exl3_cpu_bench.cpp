@@ -5,7 +5,8 @@
 //
 // --K takes exllamav3 1.6's half-integer bitrates too (1.5, 2.5, 3.5).
 // Random trellis words (any bit pattern is a valid encoding), experts of 4096 -> 2048 -> 4096 (gate, up, down), each
-// tier this CPU runs (0 scalar, 1 AVX2 + FMA, 2 AVX-512, 3 AVX-512 VNNI) through exl3_cpu_band_acc_on:
+// tier this CPU runs (0 scalar, 1 AVX2 + FMA, 2 AVX-512, 3 AVX-512 VNNI; and 4, asked for by --tiers: tier 1 with
+// exl3_cpu_set_w16's 16-bit codebook products) through exl3_cpu_band_acc_on:
 //  HOT   one band of a gate matrix (every slice: 196 KB at K 3, in L2) again and again on one thread - the kernel's
 //        compute speed, weights a second, for 1..N tokens at once;
 //  COLD  --mb of experts read from DRAM once a pass, --per-call experts a call (the start-up timing's 4; a decode
@@ -170,7 +171,9 @@ std::vector<int> k2_list(const char* s) {
     return v;
 }
 
-const char* tier_name(int t) { return t == 3 ? "avx512vnni" : t == 2 ? "avx512" : t == 1 ? "avx2" : "scalar"; }
+const char* tier_name(int t) {
+    return t == 4 ? "avx2w16" : t == 3 ? "avx512vnni" : t == 2 ? "avx512" : t == 1 ? "avx2" : "scalar";
+}
 
 }  // namespace
 

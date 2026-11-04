@@ -16,6 +16,9 @@ Open an issue with:
 
   For numbers comparable with the README's [speed tables](README.md#how-fast-is-it), measure the way `--bench` does: three questions of 256 tokens,
   greedy, thinking off, one short warm-up first; prefill (reading the prompt) at 2048 and 8192 tokens.
+- **Several conversations at once** (agents, `--parallel`): `--bench` measures one request at a time. Add runs of
+  `tools/agent_bench.py` against your running server ([docs/AGENT_BENCH.md](docs/AGENT_BENCH.md)): a scripted agent
+  workload, the same requests every run, with per-request decode, read speeds and latencies.
 
 Name your Maya version (`VERSION`, or the commit). Say what you measured and what you didn't.
 
@@ -27,8 +30,8 @@ of its log (the `.log` next to your `maya-*.json`).
 ## A pull request
 
 - **Base it on `main`** and keep it to one topic.
-- **Measure before and after** on your hardware, same harness, and put the numbers in the description. If the
-  output changes (it can: which expert runs on the CPU or the GPU changes the last bits), say so.
+- **Measure before and after** on your hardware, same harness, and put the numbers in the description (a change for
+  several conversations at once: `tools/agent_bench.py`, each setting twice or more). If the output changes (it can: which expert runs on the CPU or the GPU changes the last bits), say so.
 - **New settings** are `STRATA_GLM_*` environment variables, off or at today's behaviour by default unless measured
   better, with a row in [docs/SETTINGS.md](docs/SETTINGS.md).
 - **AMD (HIP) and other backends:** keep NVIDIA's code path unchanged (`#if defined(STRATA_USE_HIP)`). We can't test

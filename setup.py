@@ -25,6 +25,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
 ARM = platform.machine().lower() in ("aarch64", "arm64")
+PPC = platform.machine().lower() in ("ppc64le", "ppc64")   # AC922 POWER9: no AVX, ggml-cpu VSX
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
 LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
@@ -297,6 +298,16 @@ def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
+    if PPC and not WIN:
+        # POWER (ppc64le): /proc/cpuinfo has "cpu" / "facilities" and no "flags" line, so the x86 probe below
+        # would raise AttributeError; the expert lane falls back to ggml-cpu's VSX/portable kernels
+        try:
+            txt = open("/proc/cpuinfo").read()
+            m = re.search(r"^(?:cpu|model name|Processor|machine)\s*:\s*(.*)$", txt, re.M)
+            name = (m.group(1).strip() if m else (platform.machine() or name))
+        except OSError:
+            name = platform.machine() or name
+        return name, False, False
     if ARM and not WIN:
         try:
             txt = open("/proc/cpuinfo").read()
@@ -616,8 +627,20 @@ def get_llama_cpp():
     return llama
 
 
+def pip_command(need, machine=None, system=None, which=None) -> list:
+    """The install command for `need`: pip, as always - and uv in its place on Linux ppc64le (IBM POWER9, the AC922)
+    only, when uv is on PATH: pip resolves and builds the packages there sdist by sdist, uv does the same work much
+    faster.  Any other OS or CPU installs with pip even when uv is on PATH."""
+    machine = (platform.machine() if machine is None else machine).lower()
+    system = sys.platform if system is None else system
+    uv = (which or shutil.which)("uv") if machine == "ppc64le" and system.startswith("linux") else None
+    if uv:
+        return [uv, "pip", "install", "--python", sys.executable, "--quiet", *need]
+    return [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need]
+
+
 def pip_install(packages, what):
-    """pip install into .venv, skipped when the same list was installed before."""
+    """pip (uv on Linux ppc64le, pip_command) into .venv, skipped when the same list was installed before."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
     try:
         have = json.loads(stamp.read_text()) if stamp.exists() else []
@@ -628,7 +651,7 @@ def pip_install(packages, what):
         ok(f"{what} already installed")
         return
     say(f"  Installing {what} ...")
-    run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need])
+    run(pip_command(need))
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
     ok(f"{what} installed")
 
