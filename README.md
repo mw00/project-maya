@@ -296,15 +296,20 @@ your setup and the engine's speed lines; nothing is sent anywhere by itself. The
 
 ## Support
 
-Project Maya is free and open source. Every release is tested on our own NVIDIA and AMD machines before it ships (the
-Mac support so far only on GitHub's virtual Macs), and sponsorship pays for that test hardware (the current goal: 50
-monthly sponsors for a real Mac and new GPUs, so Maya runs well on more hardware), for building
-new quants and models, and for faster fixes. If Maya saves you a cloud bill, consider sponsoring a small part of it
-back - thank you!
+Maya is free and open source, and it always will be. It exists so that anyone can run the biggest open models at home,
+on hardware they already own. Sponsors make that possible:
+
+- **More hardware runs well.** Every release is tested on our own NVIDIA and AMD machines before it ships. Macs are so
+  far tested only on GitHub's virtual Macs. The current goal is 50 monthly sponsors, enough for a real Mac and newer
+  GPUs.
+- **New models sooner.** Every new model and quant takes many hours of GPU time to build and check.
+- **Faster fixes** when something breaks on your setup.
+
+If you enjoy running big models on your own machine, a small monthly sponsorship is the best way to keep Maya growing.
+Thank you!
 
 <p align="center"><a href="https://github.com/sponsors/mw00"><img src="https://img.shields.io/badge/Sponsor_on_GitHub-ea4aaa?logo=githubsponsors&logoColor=white&style=for-the-badge" alt="Sponsor on GitHub" height="40"></a>
-<a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a><br>
-<b>Maya is free and open for everyone. Becoming a sponsor helps keep it that way and pays for the hardware every release is tested on. Thank you!</b></p>
+<a href="https://buymeacoffee.com/peasantsmith"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=black&style=for-the-badge" alt="Buy Me A Coffee" height="32"></a></p>
 
 Speed reports, bug reports and pull requests are welcome: [CONTRIBUTING.md](CONTRIBUTING.md) says what helps most.
 
