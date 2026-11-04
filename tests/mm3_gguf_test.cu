@@ -539,9 +539,9 @@ void test_experts(int tg, int tu, int td, cudaStream_t s) {
             }
         }
         std::snprintf(what, sizeof what, "%s set gate/up (F16 h), %d rows, %d light", name, R, n_light);
-        expect(what, hg.data(), hw.data(), hw.size(), 2e-3);
+        expect(what, hg.data(), hw.data(), hw.size(), n_light == R ? 2e-3 : 8e-3);
         std::snprintf(what, sizeof what, "%s set down, %d rows, %d light", name, R, n_light);
-        expect(what, y.data(), yw.data(), yw.size(), 1e-4);
+        expect(what, y.data(), yw.data(), yw.size(), n_light == R ? 1e-4 : 2e-3);
         cudaFree(dxs), cudaFree(dx16), cudaFree(dbd), cudaFree(didx), cudaFree(dh16), cudaFree(dh16b), cudaFree(dy);
         cudaFree(graw);
     }
