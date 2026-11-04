@@ -816,6 +816,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 - `DS4_CHUNK_AUTO=1`: a prompt's chunk is `n / (DS4_CHUNK_PER_GROUP x groups)` rows, rounded up to 16, at least
   `DS4_CHUNK_AUTO_MIN` and at most `--prefill-chunk`. A prompt that fit one chunk ran the groups one after another;
   smaller chunks keep every group busy. Only with more than one group. `DS4_CHUNK_MIN` is still the windows threshold.
+  The chunks' boundaries move, so the answers can differ slightly from a run without it (as another `--prefill-chunk` does).
 - `DS4_AI_RUN=1`: the indexer's slabs sized by the keys this prompt has, not by `--max-context`. A large context split
   every prompt's indexer into many small slabs; now a prompt gets the rows a context of its own length would (the same
   GEMM shapes, fewer launches). Its buffers take room for 128 rows: at 512K about 2-3 experts of VRAM a GPU.
@@ -823,11 +824,11 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 | Setting | Default | |
 | --- | --- | --- |
 | `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy in one part is DMA'd from that copy, any format (the same bytes) |
-| `DS4_YOCO_FLOW` | off (0) | `1`: the YOCO prompt skip also on a layer split whose groups are on the flow |
-| `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work |
+| `DS4_YOCO_FLOW` | off (0) | `1`: the YOCO prompt skip also on a layer split whose groups are on the flow (changes the answers slightly) |
+| `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work (changes the answers slightly) |
 | `DS4_CHUNK_PER_GROUP` | 2 | with `DS4_CHUNK_AUTO=1`: chunks a group |
 | `DS4_CHUNK_AUTO_MIN` | 1024 | with `DS4_CHUNK_AUTO=1`: the smallest chunk, in tokens |
-| `DS4_AI_RUN` | off (0) | `1`: the indexer's slab rows from this prompt's keys, not the context's (VRAM for 128 rows) |
+| `DS4_AI_RUN` | off (0) | `1`: the indexer's slab rows from this prompt's keys, not the context's (the same answers; VRAM for 128 rows) |
 
 ## DeepSeek: choosing the drafter GPU group (experimental)
 
