@@ -16,10 +16,14 @@ never acquires a GPU. The pack's `tokenizer/{vocab.json,token_type.json,
 merges.txt,tokenizer.json}` supply token IDs, token bytes, token types and EOS.
 The native engine checks that this vocabulary matches the model's output size.
 
-The engine advertises `INFO grammar=1 grammar_replay=1`. A request may carry:
+The engine advertises `INFO grammar=1 grammar_replay=1 grammar_hex=1`. A request may carry:
 
-- `grammar=FILE`: a UTF-8 GBNF file with a `root` rule, read and compiled before
-  prompt processing. Empty files and NUL bytes are rejected.
+- `grammar_hex=HEX`: the hex-encoded UTF-8 bytes of a GBNF file path, preserving
+  spaces and Unicode. The file must have a `root` rule and is read and compiled
+  before prompt processing. Empty files, NUL bytes and malformed path encodings
+  are rejected. Clients should use this field when `grammar_hex=1` is advertised.
+- `grammar=FILE`: the legacy unencoded path, retained for paths without spaces.
+  Supplying both path fields is an error.
 - `grammar_after=ID`: delay enforcement until this token is emitted. The trigger
   itself is not consumed by the grammar.
 - `grammar_prefix=ID,...`: replay previously emitted tokens into a fresh state
@@ -44,4 +48,4 @@ logits remain engine failures.
 
 The optional host test target `maya-ds4-grammar-state-test` takes one `PACK`
 argument. It exercises clone isolation, assignment, fresh request reset,
-delayed activation, EOS and malformed syntax without running inference.
+delayed activation, EOS, malformed syntax and file paths with spaces/Unicode without running inference.
