@@ -1534,6 +1534,7 @@ int usage() {
                  "                [--prefill-gemm blas|hipblaslt|auto] [--prefill-tune FILE] [--no-prefill-tune]\n"
                  "                [--calibrate-prefill OUT.json [--ids @prompt]] [--calibrate-decode OUT.json] [--verbose]\n"
                  "                [--serve [--parallel N (1-8: conversations at once)]] [--parallel N --rows-check G]\n"
+                 "                [--ablate DIRECTION.gguf [--ablate-layer N] [--ablate-scale F]]\n"
                  "       maya-mm3 --pack DIR --encode-image FILE.rgb --size WxH --dump-image OUT [--gpus N]\n");
     return 2;
 }
@@ -1575,6 +1576,18 @@ int main(int argc, char** argv) {
                 std::exit(2);
             }
             return argv[++i];
+        };
+        // (--ablate's numbers: a typo exits rather than falling back to the file's strength)
+        auto num = [&](double lo, double hi, bool whole) -> double {
+            const std::string v = val();
+            char* end = nullptr;
+            const double d = std::strtod(v.c_str(), &end);
+            if (v.empty() || end == v.c_str() || *end != '\0' || !(d >= lo && d <= hi) || (whole && std::trunc(d) != d)) {
+                std::fprintf(stderr, "%s needs a %s from %g to %g, not \"%s\"\n", a.c_str(),
+                             whole ? "whole number" : "number", lo, hi, v.c_str());
+                std::exit(2);
+            }
+            return d;
         };
         if (a == "--pack") o.pack = val();
         else if (a == "--ids") ids_arg = val();
@@ -1662,8 +1675,22 @@ int main(int argc, char** argv) {
         else if (a == "--parallel") o.seqs = std::atoi(val().c_str());   // (--serve: conversations at once, 1-8)
         else if (a == "--rows-check") rows_steps = std::atoi(val().c_str());
         else if (a == "--eos") eos_arg = val();
+        else if (a == "--ablate") {
+            o.ablate = val();
+            if (o.ablate.empty()) {
+                std::fprintf(stderr, "--ablate needs a file (a control vector GGUF)\n");
+                std::exit(2);
+            }
+        }
+        else if (a == "--ablate-layer") o.ablate_layer = (int) num(1, 4096, true);
+        else if (a == "--ablate-scale") o.ablate_scale = (float) num(1e-6, 1e6, false);
         else if (a == "--verbose") o.verbose = true;
         else return usage();
+    }
+    if (o.ablate.empty() && (o.ablate_layer != 0 || o.ablate_scale != 0.0f)) {   // (not silently off)
+        std::fprintf(stderr, "%s without --ablate FILE: nothing to project out\n",
+                     o.ablate_layer != 0 ? "--ablate-layer" : "--ablate-scale");
+        std::exit(2);
     }
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's rows into --dump-image
         int w = 0, h = 0;

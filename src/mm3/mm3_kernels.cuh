@@ -158,6 +158,8 @@ void draft_block(const uint16_t* anchor, const float* mask, int D, int B, int P,
                  cudaStream_t s);
 /// x += a (n floats).
 void add(float* x, const float* a, size_t n, cudaStream_t s);
+/// (--ablate, mm3_ablate.hpp) each of the T rows of y [T][D] loses its component along r: y -= scale * r (r . y).
+void project_out(float* y, const float* r, float scale, int T, int D, cudaStream_t s);
 /// (the tensor-parallel path) one thread spins until *flag (mapped host memory, a counter) reaches v, wrap-safe - for at
 /// most 120 s (then it goes on and wait_timeouts() counts it: a host that never answers leaves no GPU spinning).
 void wait_flag(const unsigned* flag, unsigned v, cudaStream_t s);

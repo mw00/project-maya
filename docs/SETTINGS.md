@@ -1333,6 +1333,12 @@ refused. Its A halves are not used; on the weights it was computed against the r
 adapter's, on other weights it is the exact projection rather than the adapter. Without `--ablate` nothing runs.
 Measured with drafting off, 4x RTX 3090, four restart pairs alternating the two: decode 1.5-3.8% slower (about 3%),
 no consistent prompt-speed difference.
+With thinking on, a direction fitted on thinking-off prompts can need a higher `--ablate-scale`. On Maya-S, with the
+refusal direction fitted at layer 22 on thinking-off prompts, 120 held-out harmful prompts, thinking "high" (4096
+tokens): scale 1 refused 92, 1.375 refused 12 (thinking off, 256 tokens: 5 and 0). Neither refused any of 120
+harmless prompts in either mode. The cost is the thinking: about 8,800 characters on a harmful prompt at 1.375
+against 3,400 at scale 1 (medians), about 130 s a request against 76 s on 2x RTX 3090. Higher scales repeated
+themselves more in the thinking; a direction refitted on thinking-on prompts did not help (one layer, one scale).
 
 | Setting | Default | |
 | --- | --- | --- |
@@ -1995,6 +2001,23 @@ faster and decodes at most 3% slower. The engine stores it beside the model (`pr
 for this PC: its GPUs, their architecture, the GPU runtime and the driver) and takes it at every start; a new GPU or
 driver gets the defaults until it is measured again. The config records the result (`installer.prefill_calibration`).
 It takes one start of the model and a few minutes; the answers are the model's either way.
+
+**Projecting a direction out (`--ablate`).** As DeepSeek's [`--ablate`](#deepseek-projecting-a-direction-out---ablate):
+`--ablate FILE` removes one direction r from every residual write - each layer's attention output and its FFN output
+(the dense MLP's in a dense layer, else the routed experts' and the shared expert's together) become
+y - s r (r . y) before they are added to the residual stream. The use it is written for is abliteration (r a refusal
+direction); the pack is not changed. The direction comes from a `llama-cvector-generator` file (`direction.N`, pick N
+with `--ablate-layer`); an abliteration adapter is DeepSeek's only and is refused here. It runs on the layer split:
+`--tp` with `--ablate` loads the layer split instead (a NOTE). Without `--ablate` nothing runs; `--ablate-layer` or
+`--ablate-scale` without it is an error. A refusal direction can need `--ablate-scale` above 1 on this model: 1.5
+for the one fitted on Maya-XS. With thinking on (24 harmful prompts, 4096 tokens) it refused none at 1.5, but 4
+ended at the token cap with no answer, against 22 refusals and 2 with no answer for the stock model.
+
+| Option | Default | What it does |
+|---|---|---|
+| `--ablate FILE` | off | a control vector (GGUF) whose direction is projected out |
+| `--ablate-layer N` (with `--ablate`) | the file's only `direction.N` | which `direction.N` of the control vector (1-4096) |
+| `--ablate-scale F` (with `--ablate`) | 1 | s, 1e-6 to 1e6; 1 removes the component along r, above 1 over-projects |
 
 Setup and debugging variables:
 

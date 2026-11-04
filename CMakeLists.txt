@@ -268,6 +268,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(ds4_ablate_test tests/ds4_ablate_test.cpp)
   target_link_libraries(ds4_ablate_test PRIVATE strata_artifact)
   add_test(NAME ds4_ablate_test COMMAND ds4_ablate_test)
+  # ... and maya-mm3's, which takes a control vector only
+  add_executable(mm3_ablate_test tests/mm3_ablate_test.cpp)
+  target_link_libraries(mm3_ablate_test PRIVATE strata_artifact)
+  add_test(NAME mm3_ablate_test COMMAND mm3_ablate_test)
   # maya-ds4's trunk expert placement (src/ds4/ds4_place.hpp): the shipped profile on the 2.25bpw EXL3 pack's experts
   # gives the slots and statics a real load printed, the functions match the engine's own code, and DS4_RECENT_FIT=1 /
   # 2 keep a recent slot in every layer of 3 or more slots within the budget (host code only, no model, no GPU)

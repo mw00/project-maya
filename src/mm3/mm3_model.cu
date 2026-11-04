@@ -29,6 +29,7 @@
 #include <thread>
 #include <tuple>
 
+#include "mm3_ablate.hpp"
 #include "mm3_cands.hpp"
 #include "mm3_cpu.hpp"
 #include "mm3_env.hpp"
@@ -166,6 +167,7 @@ struct Dev {
     float *win_h = nullptr, *win_part = nullptr;
     float* attp = nullptr;               // a token's / a window's attention splits' partials (k::attn_part_floats)
     float* wtmp = nullptr;               // (Q8_0 indexer projections) the prompt path's F32 copy of one of them
+    float* abl_r = nullptr;              // (--ablate) the direction projected out of each residual write (null: off)
     // scratch (chunk rows)
     float *h = nullptr, *xn = nullptr, *q = nullptr, *k = nullptr, *v = nullptr, *iq = nullptr, *ik = nullptr;
     float *bs = nullptr, *att = nullptr, *ao = nullptr, *g = nullptr, *u = nullptr, *logit = nullptr, *w = nullptr;
@@ -416,6 +418,13 @@ struct Model::Impl {
     std::vector<Model::Image> imgs;  // the pictures the image tokens of the next forwards take their rows from
     float* taps = nullptr;           // its context's input: [taps][chunk][dim] F32 (the head's GPU)
     std::vector<int> tap_of;         // layer -> its tap (-1: none)
+    // --ablate (mm3_ablate.hpp): the unit direction (empty: off; a copy on every GPU, Dev::abl_r) and its scale
+    std::vector<float> abl_dir;
+    float abl_scale = 0.0f;
+    // a residual write y [T][dim] (the attention's or the FFN's, before h += y) loses its component along it
+    void ablate(const Dev& d, float* y, int T) const {
+        if (d.abl_r != nullptr) k::project_out(y, d.abl_r, abl_scale, T, g.dim, d.s);
+    }
 
     // ---- MAYA_MM3_PROF=1 (one GPU): each forward's GPU time by part, from events on the stream - the time between two
     // marks goes to the second's part (a host wait before it included); printed at the end by kind of forward
@@ -1005,6 +1014,12 @@ struct Model::Impl {
             }
         }
         if (!pk.load(o.pack, err) || !g.read(pk, err)) return false;
+        if (!o.ablate.empty()) {   // (--ablate: the direction read once, a copy on every GPU with the scratch)
+            abl_scale = o.ablate_scale;
+            std::string what;
+            if (!::mm3::ablate::load(o.ablate,o.ablate_layer, g.dim, abl_scale, abl_dir, what, err)) return false;
+            info.push_back(what);
+        }
         gguf = pk.str("format") == "gguf";
         if (gguf) {   // (the prompt GEMMs' backend; hipBLASLt's measured kernels kept beside the pack)
             const char* ls = ::mm3::env("MM3_LT_STORE");
@@ -1144,6 +1159,10 @@ struct Model::Impl {
                 !A(inv_dev[di], inv_freq.size()))
                 return false;
             CK(cudaMemcpy(inv_dev[di], inv_freq.data(), inv_freq.size() * 4, cudaMemcpyHostToDevice));
+            if (!abl_dir.empty()) {
+                if (!A(d.abl_r, abl_dir.size())) return false;
+                CK(cudaMemcpy(d.abl_r, abl_dir.data(), abl_dir.size() * 4, cudaMemcpyHostToDevice));
+            }
             // before sm_80 (V100, T4, RTX 20): the prompt path's busy matrices as cuBLAS FP16 GEMMs over their decoded
             // weights - a handle and 160 MB of scratch for this GPU's stream (none: the tensor-core tiles take them)
             if (gguf) {   // (a GGUF's kernels: their activations' rows, FP16 weight bands and cuBLAS, before the weights)
@@ -1874,6 +1893,7 @@ struct Model::Impl {
             err = "mv o (window)";
             return false;
         }
+        ablate(d, d.ao, T);
         k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
         k::rms(d.h, l.post1, T, g.dim, g.eps, d.xn, nullptr, d.s);
         pmark(d, kPOut);
@@ -1889,6 +1909,7 @@ struct Model::Impl {
                 err = "mv dense down (window)";
                 return false;
             }
+            ablate(d, d.ao, T);
             k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
             pmark(d, kPDense);
             return true;
@@ -1967,6 +1988,7 @@ struct Model::Impl {
                 err = "win_experts";
                 return false;
             }
+            ablate(d, d.out, T);
             k::add(d.h, d.out, (size_t) T * g.dim, d.s);
             pmark(d, kPExperts);
             return true;
@@ -2075,6 +2097,7 @@ struct Model::Impl {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             *(volatile unsigned*) wait_word = d.win_wait;
         }
+        ablate(d, d.out, T);
         k::add(d.h, d.out, (size_t) T * g.dim, d.s);
         pmark(d, kPExperts);
         return true;
@@ -2289,6 +2312,7 @@ struct Model::Impl {
             err = "mv o";
             return false;
         }
+        ablate(d, d.ao, 1);
         k::add(d.h, d.ao, (size_t) g.dim, d.s);
         k::rms(d.h, l.post1, 1, g.dim, g.eps, d.xn, nullptr, d.s);
         pmark(d, kPOut);
@@ -2304,6 +2328,7 @@ struct Model::Impl {
                 err = "mv dense down";
                 return false;
             }
+            ablate(d, d.ao, 1);
             k::add(d.h, d.ao, (size_t) g.dim, d.s);
             pmark(d, kPDense);
             return true;
@@ -2347,6 +2372,7 @@ struct Model::Impl {
             a.limit = g.limit;
             x3::moe_gate_up(a, d.xn, nullptr, d.s);
             x3::moe_down(a, nullptr, d.sh, d.out, d.s);
+            ablate(d, d.out, 1);
             k::add(d.h, d.out, (size_t) g.dim, d.s);
             pmark(d, kPExperts);
             return true;
@@ -2419,6 +2445,7 @@ struct Model::Impl {
             a.cpu_flag = (const int*) (d.cpu_d + g.dim);
         }
         x3::moe_down(a, nullptr, d.sh, d.out, d.s);
+        ablate(d, d.out, 1);
         k::add(d.h, d.out, (size_t) g.dim, d.s);
         pmark(d, kPExperts);
         // (the plan's pinned copy is rewritten by the next MoE layer of this GPU after its routing sync, which
@@ -2541,11 +2568,12 @@ struct Model::Impl {
         const int di = l.dev;
         if (T == 1 && o.fast_decode && rseq.empty()) return layer_token(l, d, di, err);   // (rows: the window's)
         if (T <= kWin && o.fast_decode) return layer_window(l, d, di, T, err);
-        // h += x W: the BLAS's beta 1; with hipBLASLt (beta 0 products only) the product into ao, then the add - the
-        // same sum of the product and h
+        // h += x W: the BLAS's beta 1; with hipBLASLt (beta 0 products only) or --ablate the product into ao, then the
+        // add - the same sum of the product and h (projected first: ablate)
         const auto gemm_acc = [&](const x3::Mat& m, const uint16_t* x16, int ldx) {
-            if (gguf && gg::gemm_backend() == 1) {
+            if ((gguf && gg::gemm_backend() == 1) || d.abl_r != nullptr) {
                 x3::gemm_rows(m, x16, ldx, T, d.ao, g.dim, 0.0f, d.s);
+                ablate(d, d.ao, T);
                 k::add(d.h, d.ao, (size_t) T * g.dim, d.s);
             } else {
                 x3::gemm_rows(m, x16, ldx, T, d.h, g.dim, 1.0f, d.s);
@@ -2622,8 +2650,14 @@ struct Model::Impl {
         st.profiled += (long) top.size();
         pmark(d, kPSync);
         if (!experts(l, d, T, top, err)) return false;
-        k::moe_combine(d.h, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
-        std::swap(d.h, d.out);
+        if (d.abl_r != nullptr) {   // (--ablate: the MoE's write alone into out, projected, then added to h)
+            k::moe_combine(nullptr, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
+            ablate(d, d.out, T);
+            k::add(d.h, d.out, (size_t) T * g.dim, d.s);
+        } else {
+            k::moe_combine(d.h, d.y, d.invrow, d.w, d.sh, T, g.k_exp, g.dim, g.scale, d.out, d.s);
+            std::swap(d.h, d.out);
+        }
         pmark(d, kPExperts);
         return true;
     }
@@ -3169,6 +3203,14 @@ bool Model::load(const Options& o_in, std::string& err) {
                                             "split instead");
             return ok;
         }
+    }
+    if (o.tp > 0 && !o.ablate.empty()) {   // (--ablate: the layer split's residual writes - not the host's sums)
+        Options o2 = o;
+        o2.tp = 0;
+        const bool ok = load(o2, err);   // (as --parallel's: the layer split's prefill calibration read)
+        p->info.insert(p->info.begin(), "NOTE: --tp " + std::to_string(o.tp) + " with --ablate: the layer split "
+                                        "instead (the tensor-parallel path does not project)");
+        return ok;
     }
 #if defined(_WIN32)
     // Windows: the tensor-parallel path's host waits on the GPUs' counters depend on its launches being submitted as
