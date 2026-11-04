@@ -38,14 +38,10 @@ GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gat
 EXL3_MIN_CC = 70                                     # (maya.DS4_MIN_CC / mm3_min_cc: the EXL3 quants from V100 on)
 
 
-def _is_exl3(fam: str, key: str) -> bool:
-    return key.lower().startswith("exl3")
-
-
 def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
     """Whether the setup offers these files on this PC (maya.py's own checks): DeepSeek and MiniMax not on Metal; an
     EXL3 quant and DeepSeek's GGUFs on NVIDIA from V100 on (no GPU readable: offered, the setup's PC check says) and on
-    AMD (EXL3: experimental); GLM's EXL3 quants anywhere but Metal (experimental)."""
+    AMD; GLM's EXL3 quants anywhere but Metal."""
     if backend == "metal":
         return False
     if fam in ("deepseek", "minimax") and backend != "hip" and ccs:   # (their EXL3 quants and DeepSeek's GGUFs:
@@ -57,8 +53,6 @@ def _note(fam: str, key: str, backend: str) -> str:
     out = []
     if key in GATED:
         out.append("gated repo: needs your Hugging Face token (HF_TOKEN or `hf auth login`)")
-    if _is_exl3(fam, key) and (fam == "glm" or backend == "hip"):
-        out.append("experimental" + (" on AMD" if fam != "glm" else ""))
     return "; ".join(out)
 
 

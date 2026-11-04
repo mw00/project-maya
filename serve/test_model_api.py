@@ -279,7 +279,7 @@ class OtherQuantsTest(unittest.TestCase):
         self.assertEqual(c["minimax-exl3"]["name"], "MiniMax M3.1 · EXL3 3.5 bpw")
         self.assertEqual(c["glm-exl3-3.05bpw"]["name"], "GLM-5.3 · EXL3 3.05 bpw")
         self.assertEqual(c["deepseek-exl3"]["note"], "")
-        self.assertIn("experimental", c["glm-exl3-4.05bpw"]["note"])
+        self.assertEqual(c["glm-exl3-4.05bpw"]["note"], "")         # (the EXL3 quants: no longer experimental)
         ids = [m["id"] for m in self.cat()]
         self.assertEqual(len(ids), len(set(ids)))
 
@@ -291,8 +291,8 @@ class OtherQuantsTest(unittest.TestCase):
         self.assertIn("glm-exl3-3.05bpw", old)
         self.assertIn("deepseek-exl3", {m["id"] for m in self.cat(ccs=())})   # (no GPU readable: the setup's check says)
         amd = {m["id"]: m for m in self.cat("hip", ())}
-        self.assertIn("experimental on AMD", amd["deepseek-exl3"]["note"])
-        self.assertIn("experimental on AMD", amd["minimax-exl3"]["note"])
+        self.assertEqual(amd["deepseek-exl3"]["note"], "")
+        self.assertEqual(amd["minimax-exl3"]["note"], "")
         self.assertEqual({m["group"] for m in self.cat("metal", ())}, {"maya"})
 
     def test_installed(self):
