@@ -48,9 +48,10 @@ class GrammarAdapter(unittest.TestCase):
 
     def test_internal_paths_cannot_be_injected(self):
         svc = self.service()
-        req = {"_grammar_path": "/private", "_grammar_text": GRAMMAR, "_grammar_after": 0}
+        req = {"_grammar_path": "/private", "_grammar_text": GRAMMAR, "_grammar_after": 0, "grammar_hex": "deadbeef"}
         svc.check_request(req)
         self.assertFalse(any(k.startswith("_grammar_") for k in req))
+        self.assertNotIn("grammar_hex", req)
 
     def test_native_checker_uses_pack_and_reports_precise_error(self):
         engine = StrataEngine.__new__(StrataEngine)
@@ -144,35 +145,70 @@ else:
             removed.wait(.01)
         self.assertFalse(Path(path).exists())
 
+    def test_legacy_path_fallback_rejects_whitespace_and_nul(self):
+        for path in ("/tmp/a b", "/tmp/a\tb", "/tmp/a\0b"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "grammar.*path"):
+                StrataEngine.grammar_keys({"_grammar_path": path})
+        self.assertEqual(StrataEngine.grammar_keys({"_grammar_path": "/tmp/旧.gbnf"}), " grammar=/tmp/旧.gbnf")
+
     @unittest.skipUnless(os.name == "posix", "script engine uses a shebang")
-    def test_native_pipe_four_independent_files_and_routes(self):
+    def test_native_hex_paths_four_routes_replay_and_cancel_ownership(self):
         script = r'''import sys
 from pathlib import Path
-print("INFO grammar=1 grammar_replay=1", flush=True)
+print("INFO grammar=1 grammar_replay=1 grammar_hex=1", flush=True)
 print("READY 4096 stop multi=4", flush=True)
+pending = {}
 for line in sys.stdin:
     if line.startswith("QUIT"):
         break
+    if line.startswith("STOP "):
+        rid = line.split()[1]
+        path = pending.pop(rid, None)
+        if path is not None:
+            assert path.exists(), "grammar removed before cancellation DONE"
+            print(f"DONE {rid} 1 3 1.0 1.0 cancel 0 0 0", flush=True)
+        continue
     if not line.startswith("GEN "):
         continue
     fields = dict(x.split("=", 1) for x in line.split() if "=" in x)
+    assert "grammar" not in fields
+    path = Path(bytes.fromhex(fields["grammar_hex"]).decode("utf-8"))
+    assert "spaced 目录" in str(path)
+    assert fields["grammar_prefix"] == "8,2" and fields["grammar_after"] == "8"
     rid = fields["rid"]
-    text = Path(fields["grammar"]).read_text()
+    text = path.read_text()
     char = text.split('"')[1]
     print(f"T {rid} {ord(char)}", flush=True)
-    print(f"DONE {rid} 1 3 1.0 1.0 stop 0 0 0", flush=True)
+    if line.split()[1] == "9":
+        pending[rid] = path
+    else:
+        print(f"DONE {rid} 1 3 1.0 1.0 stop 0 0 0", flush=True)
 '''
         with tempfile.TemporaryDirectory() as directory:
+            tempdir = Path(directory) / "spaced 目录"
+            tempdir.mkdir()
             exe = Path(directory) / "engine"
             exe.write_text(f"#!{sys.executable}\n" + script)
             exe.chmod(0o755)
             engine = StrataEngine(str(exe), [])
+            original_mkstemp = tempfile.mkstemp
+            def mkstemp(**kwargs):
+                return original_mkstemp(dir=tempdir, **kwargs)
+            def sampling(char):
+                return {"_grammar_text": f'root ::= "{char}"', "_grammar_prefix": [8, 2], "_grammar_after": 8}
             try:
-                def call(char):
-                    return list(engine.generate([1, 2, 3], 8, {"_grammar_text": f'root ::= "{char}"'}, threading.Event()))
-                with concurrent.futures.ThreadPoolExecutor(4) as pool:
-                    self.assertEqual(list(pool.map(call, "ABCD")), [[65], [66], [67], [68]])
+                with patch("serve.server.tempfile.mkstemp", side_effect=mkstemp):
+                    def call(char):
+                        return list(engine.generate([1, 2, 3], 8, sampling(char), threading.Event()))
+                    with concurrent.futures.ThreadPoolExecutor(4) as pool:
+                        self.assertEqual(list(pool.map(call, "ABCD")), [[65], [66], [67], [68]])
+                    gen = engine.generate([1, 2, 3], 9, sampling("E"), threading.Event())
+                    self.assertEqual(next(gen), 69)
+                    self.assertEqual(len(list(tempdir.glob("*.gbnf"))), 1)
+                    gen.close()
                 self.assertEqual(engine._routes, {})
+                self.assertEqual(list(tempdir.glob("*.gbnf")), [])
+                self.assertIsNone(engine.proc.poll())  # the fake native's ownership assertions did not fail
             finally:
                 engine.close()
 
