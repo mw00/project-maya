@@ -73,7 +73,7 @@ GlmExpertHelper::~GlmExpertHelper() {
 }
 
 bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
-                           const std::vector<std::pair<void*, size_t>>& regions, std::string& err) {
+                           const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3) {
     close();
     DeviceScope scope(device);
     if (!scope.ok) { err = scope.error(device); return false; }
@@ -96,6 +96,11 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     const size_t need = 2 * (size_t) n_embd * sizeof(float) + (size_t) (n_embd + 8 * n_ff) / 32 * 36 + 1024;
     if (!check(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "helper stream", err, device) ||
         !check(cudaMalloc((void**) &arena_, need), "helper scratch", err, device)) return false;
+    // EXL3: the stream's kernel scratch now (the first launch would make it), before reserve() sizes the cache
+    if (exl3 && !strata::kernels::exl3::prepare(stream_)) {
+        err = "CUDA" + std::to_string(device) + " experts: the EXL3 kernels' scratch did not allocate";
+        return false;
+    }
     uint8_t* at = arena_;
     const auto take = [&](size_t bytes) {
         void* p = at;
@@ -243,8 +248,23 @@ std::vector<GlmExpertHelper::Swap> GlmExpertHelper::swaps(const std::vector<uint
 bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                               const int* keys, const float* weights, const float* x,
                               float* out, std::string& err) {
+    return run(nullptr, gu_type, d_type, down_off, limit, ne, keys, weights, x, out, err);
+}
+
+bool GlmExpertHelper::compute_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                                   const int* keys, const float* weights, const float* x,
+                                   float* out, std::string& err) {
+    return run(&lay, 0, 0, 0, limit, ne, keys, weights, x, out, err);
+}
+
+// xl: an EXL3 pack's layout (compute_exl3), null: native GGUF experts of gu_type / d_type (compute)
+bool GlmExpertHelper::run(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off,
+                          float limit, int ne, const int* keys, const float* weights, const float* x,
+                          float* out, std::string& err) {
     namespace gf = strata::kernels::glmf;
-    if (device_ < 0 || ne < 1 || ne > 8 || !gf::moe_supported(gu_type) || !gf::moe_supported(d_type)) {
+    namespace x3 = strata::kernels::exl3;
+    if (device_ < 0 || ne < 1 || ne > 8 ||
+        (xl == nullptr && (!gf::moe_supported(gu_type) || !gf::moe_supported(d_type)))) {
         err = "GLM expert helper: unsupported expert types or route width";
         return false;
     }
@@ -260,6 +280,8 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto t0 = std::chrono::steady_clock::now();
+    // (EXL3: the family's launch failures only print and count - DS4_HELPER's check, around this call's kernels)
+    const int x3_errors = xl != nullptr ? x3::launch_errors() : 0;
     if (prof_ && !check(cudaEventRecord(ev_[0], stream_), "helper profile event", err, device_)) return false;
     if (zero_copy_) {
         std::memcpy(x_h_, x, (size_t) n_embd_ * sizeof(float));
@@ -273,17 +295,40 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
                       "helper weights", err, device_)) return false;
     const gf::MoeDev& plan = zero_copy_ ? zplan_ : plan_;
     if (prof_ && !check(cudaEventRecord(ev_[1], stream_), "helper profile event", err, device_)) return false;
-    gf::quantize_q8_1(zero_copy_ ? x_z_ : x_, xq_, n_embd_, stream_);
-    if (prof_ && !check(cudaEventRecord(ev_[2], stream_), "helper profile event", err, device_)) return false;
-    gf::moe_gate_up(gu_type, plan, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
-    if (prof_ && !check(cudaEventRecord(ev_[3], stream_), "helper profile event", err, device_)) return false;
-    gf::moe_down(d_type, plan, ne, n_embd_, n_ff_, down_off, hq_, nullptr, zero_copy_ ? out_z_ : out_, stream_);
+    if (xl != nullptr) {
+        // EXL3: gate/up/swiglu and down over the F32 input (no quantize: its stage times 0), the weighted sum in plan
+        // order - the trunk's own decode call (glm_fast_path.cu's fast_moe_experts) without the CPU part and the
+        // shared expert; h in the stream's scratch
+        x3::MoeArgs xa;
+        xa.plan_ptr = plan.plan_ptr;
+        xa.plan_w = plan.plan_w;
+        xa.lay = *xl;
+        xa.k = ne;
+        xa.n_embd = n_embd_;
+        xa.n_ff = n_ff_;
+        xa.limit = limit;
+        if (prof_ && !check(cudaEventRecord(ev_[2], stream_), "helper profile event", err, device_)) return false;
+        x3::moe_gate_up(xa, zero_copy_ ? x_z_ : x_, nullptr, stream_);
+        if (prof_ && !check(cudaEventRecord(ev_[3], stream_), "helper profile event", err, device_)) return false;
+        x3::moe_down(xa, nullptr, nullptr, zero_copy_ ? out_z_ : out_, stream_);
+    } else {
+        gf::quantize_q8_1(zero_copy_ ? x_z_ : x_, xq_, n_embd_, stream_);
+        if (prof_ && !check(cudaEventRecord(ev_[2], stream_), "helper profile event", err, device_)) return false;
+        gf::moe_gate_up(gu_type, plan, ne, n_embd_, n_ff_, limit, xq_, hq_, nullptr, 0, nullptr, 0, nullptr, stream_);
+        if (prof_ && !check(cudaEventRecord(ev_[3], stream_), "helper profile event", err, device_)) return false;
+        gf::moe_down(d_type, plan, ne, n_embd_, n_ff_, down_off, hq_, nullptr, zero_copy_ ? out_z_ : out_, stream_);
+    }
     if (prof_ && !check(cudaEventRecord(ev_[4], stream_), "helper profile event", err, device_)) return false;
     if (!zero_copy_ && !check(cudaMemcpyAsync(out, out_, (size_t) n_embd_ * sizeof(float), cudaMemcpyDeviceToHost, stream_),
                               "helper result", err, device_)) return false;
     if (prof_ && !check(cudaEventRecord(ev_[5], stream_), "helper profile event", err, device_)) return false;
     const auto t1 = std::chrono::steady_clock::now();
     if (!check(cudaStreamSynchronize(stream_), "helper finish", err, device_)) return false;
+    if (xl != nullptr && x3::launch_errors() != x3_errors) {
+        err = "CUDA" + std::to_string(device_) + " experts: the helper's EXL3 kernels did not run (exl3 launch errors " +
+              std::to_string(x3_errors) + " -> " + std::to_string(x3::launch_errors()) + ")";
+        return false;
+    }
     const auto t2 = std::chrono::steady_clock::now();
     if (zero_copy_) std::memcpy(out, out_h_, (size_t) n_embd_ * sizeof(float));   // (the result's copy, on the host)
     const auto t3 = std::chrono::steady_clock::now();

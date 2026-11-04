@@ -2,6 +2,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
@@ -21,8 +22,10 @@ public:
     ~GlmExpertHelper();
     GlmExpertHelper(const GlmExpertHelper&) = delete;
     GlmExpertHelper& operator=(const GlmExpertHelper&) = delete;
+    /// exl3: the experts are an EXL3 pack's (compute_exl3): the helper stream's EXL3 scratch is made here, before
+    /// reserve() measures the free VRAM
     bool open(int device, int n_embd, int n_ff,
-              const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+              const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3 = false);
     bool reserve(int keys, size_t requested_bytes, std::string& err);
     bool insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
     bool replace(int out, int in, const uint8_t* host, std::string& err);
@@ -39,10 +42,18 @@ public:
     bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                  const int* keys, const float* weights, const float* x,
                  float* out, std::string& err);
+    /// The same for an EXL3 pack's experts (lay: their layer's blob layout; open(..., exl3 = true)): the F32 input
+    /// through exl3::moe_gate_up / moe_down on the helper's device - its decode kernels are exl3.cu's choice for it
+    /// (STRATA_GLM_EXL3_DECODE<n>).  A launch that failed there (exl3::launch_errors) fails the call.
+    bool compute_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                      const int* keys, const float* weights, const float* x,
+                      float* out, std::string& err);
     void close();
     int device() const { return device_; }
 
 private:
+    bool run(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off, float limit,
+             int ne, const int* keys, const float* weights, const float* x, float* out, std::string& err);
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
     std::vector<Region> regions_;
     struct Slot { uint8_t* host = nullptr; uint8_t* device = nullptr; size_t bytes = 0; };
