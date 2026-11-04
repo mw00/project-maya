@@ -60,6 +60,7 @@ WORDS = [f"The quick brown fox jumps over the lazy dog, line {k}, and the pale m
 LIMIT = 512 * 1024                     # the cap the chat page's health advertises at a small context
 
 
+@unittest.skipUnless(POPPLER, "poppler is not installed")
 class Extract(unittest.TestCase):
     def test_text_layer_becomes_text(self):
         r = pdfmod.extract(_pdf([_lines(WORDS)]), want_images=True, text_limit=LIMIT)
