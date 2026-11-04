@@ -194,6 +194,5 @@ Two measurement rules this machine taught:
 
 ## Credits
 
-The AC922 bring-up follows the ground work in [eelgaev/Strata-AC922](https://github.com/eelgaev/Strata-AC922),
-whose `docs/IBM_AC922.md` documents the platform, the `cudaHostAlloc`-only rule and the NVLink2 behaviour that
-this port depends on.
+The AC922 bring-up follows earlier ground work by eelgaev, which documented the platform, the `cudaHostAlloc`-only
+rule and the NVLink2 behaviour that this port depends on.

@@ -627,8 +627,20 @@ def get_llama_cpp():
     return llama
 
 
+def pip_command(need, machine=None, system=None, which=None) -> list:
+    """The install command for `need`: pip, as always - and uv in its place on Linux ppc64le (IBM POWER9, the AC922)
+    only, when uv is on PATH: pip resolves and builds the packages there sdist by sdist, uv does the same work much
+    faster.  Any other OS or CPU installs with pip even when uv is on PATH."""
+    machine = (platform.machine() if machine is None else machine).lower()
+    system = sys.platform if system is None else system
+    uv = (which or shutil.which)("uv") if machine == "ppc64le" and system.startswith("linux") else None
+    if uv:
+        return [uv, "pip", "install", "--python", sys.executable, "--quiet", *need]
+    return [sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need]
+
+
 def pip_install(packages, what):
-    """uv (when it is on PATH) or pip into .venv, skipped when the same list was installed before."""
+    """pip (uv on Linux ppc64le, pip_command) into .venv, skipped when the same list was installed before."""
     stamp = Path(sys.prefix) / ".strata-pip.json"
     try:
         have = json.loads(stamp.read_text()) if stamp.exists() else []
@@ -639,11 +651,7 @@ def pip_install(packages, what):
         ok(f"{what} already installed")
         return
     say(f"  Installing {what} ...")
-    uv = shutil.which("uv")
-    if uv:   # ppc64le: pip resolves and builds these sdist by sdist; uv does the same work much faster
-        run([uv, "pip", "install", "--python", sys.executable, "--quiet", *need])
-    else:
-        run([sys.executable, "-m", "pip", "install", "--quiet", "--disable-pip-version-check", *need])
+    run(pip_command(need))
     stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
     ok(f"{what} installed")
 
