@@ -5740,6 +5740,10 @@ struct Model::Impl {
         int routed_layer = -1, routed_chunk = -1;
         std::vector<char> skip_k;   // chunk k's streams only its picks (skip_unpicked_rows)
         bool skips(int k) const { return k >= 0 && (size_t) k < skip_k.size() && skip_k[(size_t) k]; }
+        // chunk k skips only because the ring is shallow (its rows are more than skip_unpicked_rows): a layer's first
+        // batches are copied whole before its routing is known, as far as the ring reaches (copy_ahead)
+        std::vector<char> spec_k;
+        bool spec(int k) const { return k >= 0 && (size_t) k < spec_k.size() && spec_k[(size_t) k]; }
         std::vector<int> routed_bounds;
         size_t skipped = 0, copied = 0;
     };
@@ -5862,8 +5866,12 @@ struct Model::Impl {
             const Batch& bt = S.b[S.cp];
             // Wait for this layer's routing rather than staging every expert
             // speculatively. Copies still overlap compute within the layer.
+            // (a chunk that skips only for the shallow ring, S.spec: the batches the ring has room for go out whole
+            //  before the routing - the link busy through the layer's attention and routing instead of idle; once the
+            //  routing is known the rest skip their unpicked experts. The same slots, batches and sums: an expert no
+            //  row picked adds nothing, copied or not)
             const bool skip_unpicked = S.skips(bt.k);
-            if (skip_unpicked && (bt.il != S.routed_layer || bt.k != S.routed_chunk)) break;
+            if (skip_unpicked && (bt.il != S.routed_layer || bt.k != S.routed_chunk) && !S.spec(bt.k)) break;
             const int half = (int) (S.cp % P);
             const Layer& l0 = L[(size_t) bt.il];
             // Preserve the original virtual slots, batches and accumulation order.
@@ -18313,7 +18321,18 @@ struct Model::Impl {
                 if (member(l0, m).dev == di) cold += l0.host_list.size(), ++n_l;
         const bool shallow = skip_unpicked_rows() > 0 && n_l > 0 && (size_t) c.ring_n * 2 * n_l < cold;
         S.skip_k.assign((size_t) nk, 0);
-        for (int k = 0; k < nk && !c.flow; ++k) S.skip_k[(size_t) k] = shallow || run.T[(size_t) k] <= skip_unpicked_rows();
+        S.spec_k.assign((size_t) nk, 0);
+        // (MAYA_DS4_SPEC_HEAD=0: a shallow ring's chunks wait for each layer's routing before any of its copies, as
+        //  before - 3x V100, EXL3 2.9 bpw, the pair's link was idle through every layer's attention)
+        static const bool spec_head = [] {
+            const char* v = ds4_env("DS4_SPEC_HEAD");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        for (int k = 0; k < nk && !c.flow; ++k) {
+            const bool few = run.T[(size_t) k] <= skip_unpicked_rows();
+            S.skip_k[(size_t) k] = shallow || few;
+            S.spec_k[(size_t) k] = spec_head && shallow && !few;
+        }
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
                 if (!run.runs(k, il) || run.kv_only(k, il)) continue;   // (a long prompt's skip: no experts there)
