@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import deep_sleep, ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
@@ -855,7 +855,7 @@ class StrataEngine:
     multi = 0         # READY ... multi=<n> (set per start; the class default for engines built without __init__)
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None):
+                 env: dict | None = None, sleep_mode: str = "off"):
         self.spawn = (exe, list(args), cwd, log, env)   # to start it again after it died (issue #27)
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -868,6 +868,9 @@ class StrataEngine:
                              daemon=True).start()
         self.proc = subprocess.Popen([exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env)
+        self.deep_sleep = sleep_mode
+        self.sleeping, self.sleep_via = False, None
+        self.sleep_pids = []
         self.max_context = 0
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_pause = False           # ... and PAUSE: a STOP that keeps the state with what was written (fair slices)
@@ -1112,7 +1115,7 @@ class StrataEngine:
         ctx = self.max_context
         self.ended = False
         try:
-            self.__init__(*self.spawn)
+            self.__init__(*self.spawn, sleep_mode=self.deep_sleep)
         except Exception:
             # (#351: a start that fails - a GPU that fell off the bus - left max_context 0, so every later request
             #  failed its size check with "exceeds the context (0)" before ensure_engine could try again; the context
@@ -1646,6 +1649,10 @@ class StrataEngine:
     def close(self):
         """QUIT, then wait for the engine to end: with kept conversations (STRATA_GLM_SLOT_KEEP) it first writes the
         one it holds, so it gets STRATA_ENGINE_QUIT_S seconds (50; llama-swap's unloadTimeout should exceed it)."""
+        if deep_sleep.end(self):
+            self.proc.wait(timeout=20)
+            self.ended = True
+            return
         wait = float(os.environ.get("STRATA_ENGINE_QUIT_S", "50") or 50)
         try:
             if self.can_stop:                           # a request in flight ends at its next step first: QUIT
@@ -2543,9 +2550,15 @@ class Service:
         """The engine running (the caller holds the FIFO): started again after an idle unload, or after it died in an
         earlier request (issue #27) instead of failing every request.  With --parallel several requests hold a place
         each: the first one starts it, the others wait for that start."""
-        if not hasattr(self.engine, "alive") or self.engine.alive():
+        if not hasattr(self.engine, "alive"):
             return
         with self._engine_start:
+            if getattr(self.engine, "sleeping", False):
+                if self.engine.alive():
+                    deep_sleep.wake(self.engine)
+                else:
+                    deep_sleep.end(self.engine)
+                    self.engine.sleeping = False
             if self.engine.alive():                      # (another request started it meanwhile)
                 return
             if self.unloaded:
@@ -2562,6 +2575,41 @@ class Service:
             if places != self.fifo.capacity:
                 self.fifo.set_capacity(places)
             print("[maya] the engine is running again", flush=True)
+
+    def sleep(self) -> dict:
+        """Checkpoint the idle CUDA engine while holding every request place."""
+        if not isinstance(self.engine, StrataEngine):
+            return {"status": "unsupported"}
+        # External vision has its own CUDA context; never claim the GPU is free.
+        if self.vision is not None and not isinstance(self.vision, ENGINE_VISION):
+            return {"status": "unsupported", "reason": "external vision helper"}
+        if not self.fifo.acquire(blocking=False):
+            return {"status": "busy"}
+        try:
+            if not self.engine.alive():
+                return {"status": "not loaded"}
+            if self.engine.sleeping:
+                return {"status": "asleep", **self.engine.info.get("asleep", {})}
+            with self.status_lock:
+                if self.status.get("busy") or self.status.get("queued") or self.active or (
+                    self.reload and self.reload.get("state") in ("waiting", "running")
+                ):
+                    return {"status": "busy"}
+            if deep_sleep.method(self.engine) is None:
+                return {"status": "unsupported"}
+            return {"status": "asleep", **deep_sleep.sleep(self.engine)}
+        finally:
+            self.fifo.release()
+
+    def wake(self) -> dict:
+        with self.fifo:
+            if not getattr(self.engine, "sleeping", False):
+                return {"status": "not asleep"}
+            with self._engine_start:
+                if not self.engine.alive():
+                    deep_sleep.end(self.engine)
+                    return {"status": "not loaded"}
+                return {"status": "awake", **deep_sleep.wake(self.engine)}
 
     def unload(self, idle_for: float | None = None) -> str:
         """End the engine between requests: "unloaded", "not loaded", "busy" (a request is running or waiting, a context
@@ -5923,7 +5971,9 @@ def make_handler(svc: Service):
                                  # GLM-5.3 alone, while its budget is the default: the most a Max its user picks may
                                  # think (the page then marks a level left at the default: strata_level_default)
                                  **({"thinking_budget_max": svc.think_budget_max}
-                                    if getattr(svc, "think_budget_max", 0) else {})})
+                                    if getattr(svc, "think_budget_max", 0) else {}),
+                                 "asleep": bool(getattr(svc.engine, "sleeping", False)),
+                                 "loaded": not svc.unloaded and (not hasattr(svc.engine, "alive") or svc.engine.alive())})
             elif path == "/api/context":
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():
@@ -6041,6 +6091,22 @@ def make_handler(svc: Service):
                 return
             path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
             try:
+                if path in ("/sleep", "/wake"):
+                    try:
+                        if path == "/sleep":
+                            wait = min(300.0, max(0.0, float(parse_qs(urlsplit(self.path).query).get("wait", [0])[0])))
+                            deadline = time.monotonic() + wait
+                            while True:
+                                result = svc.sleep()
+                                if result["status"] != "busy" or time.monotonic() >= deadline:
+                                    break
+                                time.sleep(min(0.25, max(0, deadline - time.monotonic())))
+                        else:
+                            result = svc.wake()
+                        self._json({"busy": 409, "not loaded": 409, "unsupported": 501}.get(result["status"], 200), result)
+                    except (ValueError, RuntimeError, OSError) as e:
+                        self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+                    return
                 if path in ("/models/load", "/models/unload"):
                     self._llamacpp_model(path.rsplit("/", 1)[1])
                     return
@@ -7021,6 +7087,10 @@ def main() -> int:
     maya_names.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engine read)
     cfg = maya_names.env_in(json.loads(Path(a.config).read_text(encoding="utf-8-sig"))) if a.config else {}   # (a BOM: Notepad)
     apply_server_env(cfg)
+    try:
+        sleep_mode = deep_sleep.mode_from_config(cfg)
+    except ValueError as e:
+        ap.error(str(e))
     if not isinstance(sys.stdout, StampedStdout):       # (#783: a time before each [maya] line, in the log too)
         sys.stdout = StampedStdout(sys.stdout)
     # the server's own lines go to the run's log as well (the engine writes its stderr there): a run whose terminal
@@ -7104,7 +7174,8 @@ def main() -> int:
         if len(gpu_list(cfg)) > 1:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
-        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+        engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env,
+                              sleep_mode=sleep_mode)
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         warn_tight_ram(engine.info.get("arena_mib"))
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
@@ -7291,10 +7362,13 @@ def main() -> int:
                 # last lines are read by the request and not by close()
                 with svc.fifo:
                     pass
-        if hasattr(engine, "close"):
-            engine.close()
-        if vision:
-            vision.close()
+        # A control request may be checkpointing or restoring even when status.busy is false.
+        # Hold all places until the engine and vision helper have ended.
+        with svc.fifo:
+            if hasattr(engine, "close"):
+                engine.close()
+            if vision:
+                vision.close()
         if hub is not None:
             hub.close()
     except KeyboardInterrupt:                          # a second Ctrl+C: at once
