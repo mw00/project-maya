@@ -28,6 +28,16 @@ quantized matmul (`q()` - the attention/dense-FFN projections, the shared expert
 gates, the ssm gates, the indexer, `attn_k_b` / `attn_v_b`, and `attn_q_a` / `attn_kv_a_mqa`) keeps
 only its exact BF16 copy. The freed VRAM goes to the expert pool.
 
+## The score baseline
+
+The fixed token fixture (7,667 held-out ShareGPT tokens, conversation ids in the note) and the neko 4bpw
+pack's score and loading-fidelity tables live outside the repo, in the
+[score gist](https://gist.github.com/waxinz/7c3d5e703e926bfab05b5a6b356d80e9) (`glm53-sharegpt-tail.tokens.txt`
++ `NEKO-4BPW-SCORE.md`): the same tokens score any engine change or any other GLM-5.3-Flash pack, and
+`tools/twin_fidelity.py <pack>` recomputes the fidelity table on any pack. On the fixture the neko pack
+through this engine scores nll 0.78023 / ppl 2.1820 / top-1 78.60% (the load-time requantization is
+end-to-end invisible; see the gist for the before/after table).
+
 ## Serving
 
 A serve config names the pack and the GPUs; adapt the paths:
