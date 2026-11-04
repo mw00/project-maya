@@ -128,7 +128,8 @@ OTHERS = {("deepseek", "gguf-q8"): "UD-Q8_K_XL", ("deepseek", "gguf-q4"): "UD-Q4
           ("deepseek", "exl3"): "EXL3 2.9 bpw", ("deepseek", "exl3-3.5"): "EXL3 3.5 bpw",
           ("deepseek", "abliterated-128g"): "orcarouter Abliterated Mix-128G",
           ("deepseek", "abliterated-256g"): "orcarouter Abliterated Mix-256G",
-          ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M"}
+          ("minimax", "exl3"): "EXL3 3.5 bpw", ("qwen", "q5_k_m"): "Q5_K_M",
+          ("qwen", "ud-iq2_xs"): "unsloth UD-IQ2_XS"}   # (the base model's GGUF, set up by hand: Neptune)
 # CYBER-FROST-3.8-PS: its one GGUF (peasantsmith/CYBER-FROST-3.8-PS-GUFF) - the setup ids it is asked for by
 QWEN_IDS = ("cyber-frost", "cyber-frost-3.8", "cyber-frost-3.8-ps", "cyber-frost-3.8-ps-q5_k_m", "cyber-frost-q5_k_m")
 # --mm3-quant also takes the tier as DeepSeek's --ds4-quant does (maya-xs), beside its first names (gguf-xs)
