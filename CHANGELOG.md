@@ -12,6 +12,7 @@ only what changed and starts; the model is not downloaded again.
   - Engram tables a quant stored in its own INT4 layout stop the pack with a message that points to DeepSeek's FP8 shards 47 / 48; docs/MODELS.md says so too.
 - **Updates on NVIDIA and Apple Silicon (as on AMD in v1.1.52):** an update whose engine rebuild fails, or whose compiler or llama.cpp source is gone, stops with the reason and how to rebuild instead of starting the engine from before under the new server and config.
 - **Monitor, tensor-parallel pairs:** "What fills the GPUs" no longer says a restart gives more experts for free VRAM that the GPU's tensor-parallel partner cannot match (the members of a `--tp` group hold the same expert slots). That room is shown as idle, and with DeepSeek's DSpark drafter it points to `MAYA_DS4_DRAFT_DEV`, which can place drafter blocks there.
+- **No longer marked experimental:** AMD support (RX 7900, R9700 / RX 9070, Strix Halo / Gorgon Halo), Windows support, and the EXL3 quants (GLM's 3.05 / 4.05 / sc_4.10 bpw, DeepSeek's 2.9 / 3.5 bpw, MiniMax's 3.5 bpw) on NVIDIA from V100 and on AMD. The setup no longer warns about them, and the README and docs say plainly where they run.
 
 ## v1.1.52 - 2026-11-03
 

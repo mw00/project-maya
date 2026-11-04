@@ -1,5 +1,5 @@
 @echo off
-rem Project Maya for Windows (experimental): the first run checks the PC, compiles the engine, asks before it
+rem Project Maya for Windows: the first run checks the PC, compiles the engine, asks before it
 rem downloads the model, builds the pack and starts the dashboard; later runs just start it.
 rem START-MAYA.bat --help lists the options. Like ./maya.sh, nothing is installed system-wide: a missing Python,
 rem compiler or CUDA toolkit is reported with where to get it.
