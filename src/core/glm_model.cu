@@ -328,8 +328,10 @@ static bool mtp_dense_vram(const std::function<const strata::TensorInfo*(const s
     return true;
 }
 
-// quantize a host F32 row to GGML Q8_0 (ggml's quantize_row_q8_0_ref: d = amax/127 in F32; the
-// file stores d as FP16 bits the kernel decodes with __half2float - the keep16 twin's recipe)
+// quantize a host F32 row to GGML Q8_0 (ggml's quantize_row_q8_0_ref: d = amax/127 in F32 - the
+// fp16-rounded d would let |q| round to 128 and wrap int8; the file stores d as FP16 bits the
+// kernel decodes with __half2float).  float->FP16 is __float2half_rn here, NOT the b16() upload's
+// float->BF16 memcpy/shift idiom.  Shared by load_mtp and load_pack's keep16 twin.
 static void q8_row(const float* x, size_t ne, std::vector<uint8_t>& out) {
     const size_t nblocks = (ne + 31) / 32;
     out.assign(nblocks * 34, 0);
@@ -3248,38 +3250,19 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
             if (keep16_q_only(r.name)) {
                 // experts-only community quants keep the attention/dense-FFN projections (and the head)
                 // BF16.  The fast path's q() slots dot those weights against a q8_1 activation, so a
-                // BF16 row cannot serve them; quantize the row to Q8_0 on the host and register ONLY
-                // that copy in ws_map_ (type 8; mv_type_ok accepts it) - no BF16 copy is uploaded,
-                // nothing reads one (b16()/q_or_b16() are never called on these names).
+                // BF16 row cannot serve them; quantize the row to Q8_0 on the host (q8_row, the
+                // keep16 twin's recipe) and register ONLY that copy in ws_map_ (type 8; mv_type_ok
+                // accepts it) - no BF16 copy is uploaded, nothing reads one (b16()/q_or_b16() are
+                // never called on these names).
                 const uint64_t ne = (uint64_t) t->elements();
-                const size_t nblocks = (size_t) ((ne + 31) / 32);
-                std::vector<uint8_t> q8(nblocks * 34);
+                std::vector<float> f32((size_t) ne);
                 const uint16_t* sb = (const uint16_t*) raw.data();
-                auto bf16_bits_to_f32 = [](uint32_t b) { const uint32_t bits = b << 16; float f; std::memcpy(&f, &bits, 4); return f; };
-                for (size_t b = 0; b < nblocks; ++b) {
-                    const size_t i0 = (size_t) b * 32;
-                    const size_t n = std::min<size_t>(32, (size_t) ne - i0);
-                    float amax = 0.f;
-                    for (size_t j = 0; j < n; ++j)
-                        amax = std::max(amax, std::abs(bf16_bits_to_f32(sb[i0 + j])));
-                    // ggml's quantize_row_q8_0_ref: d = amax/127 in F32, id uses that F32 d
-                    // (the fp16-rounded d would let |q| round to 128 and wrap int8)
-                    const float d = amax / 127.f;
-                    const float inv = d != 0.f ? 1.f / d : 0.f;
-                    uint16_t dh;
-                    {   // float->fp16, round-to-nearest-even (IEEE binary16, the field
-                        // DecW<8> decodes with __half2float).  NOTE: the memcpy/shift idiom
-                        // used at the b16() upload above is float->BF16 and is NOT float->FP16.
-                        dh = __half_as_ushort(__float2half_rn(d));
-                    }
-                    std::memcpy(q8.data() + b * 34, &dh, 2);
-                    for (size_t j = 0; j < 32; ++j) {
-                        int8_t q = 0;
-                        if (j < n)
-                            q = (int8_t) std::round(bf16_bits_to_f32(sb[i0 + j]) * inv);
-                        q8[b * 34 + 2 + j] = (uint8_t) q;
-                    }
+                for (size_t i = 0; i < (size_t) ne; ++i) {
+                    const uint32_t bits = (uint32_t) sb[i] << 16;   // BF16 bits -> F32 bits, exact
+                    std::memcpy(&f32[i], &bits, 4);
                 }
+                std::vector<uint8_t> q8;
+                q8_row(f32.data(), (size_t) ne, q8);
                 const size_t qbytes = q8.size();
                 const uint64_t qat = (at + 255u) & ~(uint64_t) 255u;
                 { cudaError_t e_ = cudaMemcpy((uint8_t*) w_arena_ + qat, q8.data(), qbytes,
