@@ -139,7 +139,7 @@ export async function loadCtxInfo() {
   emit();
   return S.ctxInfo;
 }
-// the Context size slider's stops (Settings > Model and the Models page's Engine settings): CTX_STOPS within a model's
+// the Context size slider's stops (Settings > Chat defaults and the Models page's Engine settings): CTX_STOPS within a model's
 // range ({min, max}: GET /api/context, or /api/models' context_range), and the sizes given (the one now, a draft's)
 export function ctxStopsIn(r, ...sizes) {
   if (!r) return [];
@@ -163,7 +163,7 @@ export function ctxEstimate(n) {
   const expertGb = c.vram_gb && c.vram_slots ? +c.vram_gb / c.vram_slots : null;
   return {gb: est, delta: est - now, experts: expertGb ? Math.round((est - now) / expertGb) : null, vram: +c.vram_gb || null};
 }
-// the Context size slider's line under it (Settings > Model and the Models page alike): what n tokens of context cost.
+// the Context size slider's line under it (Settings > Chat defaults and the Models page alike): what n tokens of context cost.
 // `live`: the running engine's own measurement scaled (ctxEstimate); else from the cache's bytes per token - `ram`: a
 // streamed cache, every position in pinned RAM and `win` of them in VRAM (`whole`: a context up to `win` is not streamed,
 // GLM's), `vram`: a cache wholly in VRAM.  `now`: the size it has now (the change in GB is shown against it).
@@ -231,6 +231,8 @@ export async function watchReload(to) {
     await loadHealth();
     if (rl && rl.state === "failed") toast("error", "The context did not change", rl.error || "the engine did not start with it", 9000);
     else toast("success", "Model reloaded", `It runs with a ${ctxfmt(info.context)} context now.`, 5000);
+    // (the same setting on the Models page: its Engine settings read the run config again)
+    try { window.dispatchEvent(new Event("maya:context")); } catch (e) { /* (no window: a test) */ }
     emit();
     return;
   }

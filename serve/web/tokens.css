@@ -42,6 +42,15 @@
   --st-glass-edge:rgba(255,255,255,.06);    /* its right edge */
   --st-line:#2e2e35;
   --st-line-strong:#3d3d46;
+  /* the grouped look: cards and inset groups are fills, not outlines; a row's hairline inside a group; a strip set into a
+     card; the fill of a quiet button or a field; the selected choice of a segmented control */
+  --st-card:#222227;
+  --st-inset:#1b1b20;
+  --st-hair:#2e2e35;
+  --st-fill:#2a2a30;
+  --st-fill-hover:#34343b;
+  --st-seg-on:#3a3550;
+  --st-seg-shadow:none;
   --st-ink:#ececf1;
   --st-ink-soft:#c9c9d3;
   --st-ink-muted:#9d9daa;
@@ -92,6 +101,13 @@
   --st-glass-edge:rgba(255,255,255,.8);
   --st-line:#e6e6eb;
   --st-line-strong:#d4d4dc;
+  --st-card:#f5f5f7;
+  --st-inset:#ffffff;
+  --st-hair:#e4e4ea;
+  --st-fill:#e9e9ee;
+  --st-fill-hover:#dedee5;
+  --st-seg-on:#ffffff;
+  --st-seg-shadow:0 1px 3px rgba(24,24,29,.12),0 0 0 .5px rgba(24,24,29,.06);
   --st-ink:#18181d;
   --st-ink-soft:#3a3a44;
   --st-ink-muted:#676773;
@@ -134,6 +150,12 @@
   --st-surface-3:#1e2240;
   --st-line:#252a4a;
   --st-line-strong:#323865;
+  --st-card:#11132a;
+  --st-inset:#0c0e20;
+  --st-hair:#232847;
+  --st-fill:#1b1e3a;
+  --st-fill-hover:#242849;
+  --st-seg-on:#2e2c5e;
   --st-ink:#eceefe;
   --st-ink-soft:#c3c7e6;
   --st-ink-muted:#8a8fb4;
@@ -151,6 +173,11 @@
   --st-surface-3:#e8e8f4;
   --st-line:#e0e1ef;
   --st-line-strong:#cfd1e6;
+  --st-card:#ffffff;
+  --st-inset:#f4f4fa;
+  --st-hair:#e6e7f2;
+  --st-fill:#ebebf5;
+  --st-fill-hover:#e0e0ee;
   --st-ink:#14152b;
   --st-ink-soft:#33365a;
   --st-ink-muted:#62668a;

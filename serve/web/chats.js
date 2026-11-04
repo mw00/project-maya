@@ -134,7 +134,7 @@ export async function renameChat(c) {
 export async function chatInstructions(c) {
   const v = await promptDialog({title: "Instructions for this chat", label: "The model reads them before the chat",
     value: c.system || "", placeholder: "e.g. Answer briefly. Write code in TypeScript.", multiline: true,
-    note: "Settings › Instructions has the ones new chats start with."});
+    note: "Settings › Global instructions has the ones new chats start with."});
   if (v == null) return;
   c.system = v;
   persist(c);

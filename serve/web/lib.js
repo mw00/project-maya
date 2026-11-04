@@ -2,6 +2,8 @@
 // settings, IndexedDB for the chats), the server's address and key, the clipboard and file downloads.
 
 export const SPRITE = "web/sprite.svg";
+// where Maya can be supported (GitHub Sponsors): a heart by the model's name, beside an update, and on About - never a popup
+export const SUPPORT_URL = "https://github.com/sponsors/mw00";
 
 export const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
 export const fmt = (n, d = 0) => (n == null || Number.isNaN(n) ? "–"

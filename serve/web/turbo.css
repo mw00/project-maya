@@ -1,15 +1,14 @@
 /* serve/web/turbo.css - the Turbo button (turbo.js): a flame that stays dim while Turbo is off and burns while it is on. */
-.set-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 0 6px; flex-wrap: wrap; }
-.set-head h3 { margin: 0; }
+/* (.set-head: settings.css) */
 
 .turbo {
   --turbo-a: #ff9a3c; --turbo-b: #ff5a1f; --turbo-core: #ffd36b;
   position: relative; display: inline-flex; align-items: center; gap: 8px; min-height: 36px; padding: 0 14px 0 10px;
-  border-radius: var(--st-r-pill); border: 1px solid var(--st-line-strong); background: transparent; color: var(--st-ink-soft);
+  border-radius: var(--st-r-pill); border: 1px solid transparent; background: var(--st-fill); color: var(--st-ink-soft);
   font: inherit; font-size: var(--st-fs-sm); font-weight: 600; cursor: pointer;
   transition: background var(--st-dur) var(--st-ease), border-color var(--st-dur) var(--st-ease), color var(--st-dur) var(--st-ease), box-shadow var(--st-dur) var(--st-ease);
 }
-.turbo:hover { background: var(--st-surface-2); color: var(--st-ink); }
+.turbo:hover { background: var(--st-fill-hover); color: var(--st-ink); }
 .turbo:focus-visible { outline: 2px solid var(--st-focus); outline-offset: 2px; }
 .turbo:disabled { cursor: progress; opacity: .7; }
 .turbo__flame { width: 20px; height: 20px; flex: none; overflow: visible; transform-origin: 50% 90%; }

@@ -387,7 +387,7 @@ function Composer({center}) {
         <span class="anchor">
           <button type="button" ref=${thinkBtn} class=${`think-chip${think ? " is-open" : ""}`} aria-haspopup="dialog" aria-expanded=${String(think)}
             aria-label=${`Thinking: ${lv.name}. Change it`} title="How long the model thinks" onClick=${() => setThink(!think)}>
-            <${Gauge} level=${level}/><span>${lv.name}</span></button>
+            <${Gauge} level=${level}/><span><span class="think-chip__word">Thinking · </span><b>${lv.name}</b></span></button>
         </span>
         ${mine ? html`<button type="button" class="send send--stop" aria-label="Stop the answer (Esc)" title="Stop (Esc)" onClick=${stopAnswer}>
                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg></button>`

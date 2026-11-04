@@ -2912,12 +2912,13 @@ class Service:
             raise ValueError("Maya is starting again; try again when it is done")
         if dry_run:
             return {"file": p.name, "running": running, **models.delete_plan(self.models_root(), p)}
+        if files and self.pull_slot().busy():            # (the download may be writing into the same folder)
+            raise ValueError("a model is downloading; delete its files when it is done")
         if running:
             return self._delete_running(p, files, then)
         out = models.delete(self.models_root(), p, bool(files))
         print(f"[maya] {p.name} deleted" + (f", and its files ({out['freed'] / 2**30:.1f} GB)" if files else
-              " (its files stay)") + "".join(f"; {n} drafts with MTP now (its DFlash2 drafter was deleted)"
-                                             for n in out["drafter_users"]), flush=True)
+              " (its files stay)"), flush=True)
         return out
 
     def _delete_running(self, p: Path, files: bool, then) -> dict:
@@ -5178,7 +5179,8 @@ def make_handler(svc: Service):
             elif path == "/api/ps":
                 self._json(200, self._mapi_ps())
             elif path == "/api/catalog":
-                self._json(200, {"models": model_pull.catalog(svc.models_root()), "pull": svc.pull_slot().snapshot(),
+                run = models.read(Path(svc.config_path)) if svc.config_path else None   # (its backend: the files offered)
+                self._json(200, {"models": model_pull.catalog(svc.models_root(), cfg=run), "pull": svc.pull_slot().snapshot(),
                                  "restarts": bool(os.environ.get("MAYA_RESTART_ON_UPDATE"))})
             elif path == "/api/pull/status":
                 self._json(200, {"pull": svc.pull_slot().snapshot()})

@@ -211,6 +211,10 @@ class OldConfigs(unittest.TestCase):
         # (a DeepSeek config from before its quants were recorded: the EXL3 quant's; a hand-written one: no label)
         self.assertEqual(Q.config_label({"exe": "/b/maya-ds4", "args": ["--pack", "/p"], "installer": {}}),
                          "DeepSeek V4.1 · EXL3 2.9 bpw")
+        # (an EXL3 quant of other bits set up by hand under the "exl3" key: its folder's bits - turboderp's 2.25 bpw)
+        self.assertEqual(Q.config_label({"exe": "/b/maya-ds4", "args": [
+            "--pack", "/m/DeepSeek-V4.1-Flash-1017-EXL3-2.25bpw/maya-ds4"], "installer": {"ds4_quant": "exl3"}}),
+            "DeepSeek V4.1 · EXL3 2.25 bpw")
         self.assertIsNone(Q.config_label({"exe": "/b/maya", "args": [], "model_name": "qwen3.8-flash-next"}))
 
     def test_the_next_setups_default(self):
