@@ -3265,6 +3265,7 @@ struct Model::Impl {
         l.esrc.assign((size_t) l.n_exp, {});
         l.esplit.assign((size_t) l.n_exp, 0);
         std::vector<Sig> sigs;
+        std::vector<uint8_t> xfile((size_t) l.n_exp, 0);   // expert -> 1: its pieces in two files (not just far apart)
         for (int e = 0; e < l.n_exp; ++e) {
             const std::string E = P + std::to_string(e) + ".";
             uint64_t lo = UINT64_MAX, hi = 0;
@@ -3291,6 +3292,7 @@ struct Model::Impl {
                     }
                     if (file < 0) file = t->file;
                     split = split || t->file != file;   // (a mixed quant's shards can cut an expert: read by pieces)
+                    if (t->file != file) xfile[(size_t) e] = 1;
                     lo = std::min(lo, t->off);
                     hi = std::max(hi, t->off + t->bytes);
                     sg.bytes[r][q] = t->bytes;
@@ -3328,8 +3330,12 @@ struct Model::Impl {
         if (l.n_cls == 1)   // (one layout: the CPU lane reads every expert's pieces where expert 0's lie, in one file)
             for (int e = 0; e < l.n_exp; ++e)
                 if (l.esrc[(size_t) e] != l.esrc[0] || l.esplit[(size_t) e]) {
-                    err = P + std::to_string(e) + (l.esplit[(size_t) e] ? ": split across files"
-                                                                        : ": the pieces lie differently from expert 0's");
+                    err = P + std::to_string(e) +
+                          (xfile[(size_t) e]    ? ": split across files"
+                           : l.esplit[(size_t) e] ? ": its pieces are not together in their file (the shards' tensors "
+                                                    "ordered by type, not expert by expert?) - rewrite those shards "
+                                                    "with each expert's tensors back to back"
+                                                  : ": the pieces lie differently from expert 0's");
                     return false;
                 }
         size_t bmax = 0;

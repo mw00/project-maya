@@ -113,5 +113,78 @@ class KMap(unittest.TestCase):
             self.check({**K_MAP, "mul1_multiplier": 1}, TENSORS)
 
 
+class FakeSt:
+    """SafeTensors' t and has() alone: name -> (file, dtype, shape, offset, bytes)."""
+    def __init__(self, t: dict):
+        self.t = t
+
+    def has(self, name: str) -> bool:
+        return name in self.t
+
+
+def need_st(**extra) -> FakeSt:
+    """Every tensor need() asks for in a one-layer model with an Engram layer, the head as EXL3."""
+    t = {}
+    for n in ("attn.wq_a.trellis", "attn.wq_b.trellis", "attn.wkv.trellis", "attn.wo_b.trellis", "attn.attn_sink",
+              "attn.q_norm.weight", "attn.kv_norm.weight", "attn_norm.weight", "ffn_norm.weight", "ffn.gate.weight",
+              "ffn.gate.bias", "hc_attn_fn", "hc_ffn_fn", "ffn.shared_experts.w1.trellis"):
+        t["layers.0." + n] = ("a", "I16", (1,), 0, 2)
+    t["layers.0.engram.embed.weight"] = ("e", "F8_E4M3", (1, 1), 0, 1)
+    for n in ("embed.weight", "norm.weight", "head.trellis"):
+        t[n] = ("a", "BF16", (1,), 0, 2)
+    t.update(extra)
+    return FakeSt({k: v for k, v in t.items() if v is not None})
+
+
+class Need(unittest.TestCase):
+    T = {"num_hidden_layers": 1, "engram_layer_ids": [0]}
+
+    def test_complete(self):
+        self.assertEqual(pack.need(need_st(), self.T), [])
+
+    def test_a_bf16_head(self):   # (#806: a quant that kept the head as BF16 head.weight)
+        self.assertEqual(pack.need(need_st(**{"head.trellis": None, "head.weight": ("a", "BF16", (1,), 0, 2)}),
+                                   self.T), [])
+        self.assertEqual(pack.need(need_st(**{"head.trellis": None}), self.T), ["head.trellis"])
+
+    def test_int4_engram_tables(self):   # (#806: a quant's own U8 + embed.scale tables, not DeepSeek's FP8)
+        miss = pack.need(need_st(**{"layers.0.engram.embed.weight": ("e", "U8", (1, 1), 0, 1)}), self.T)
+        self.assertEqual(len(miss), 1)
+        self.assertIn("INT4 (U8)", miss[0])
+        self.assertIn("47 / 48", miss[0])
+
+
+def experts(order: str, n: int = 3, sizes=(100, 10, 10)) -> FakeSt:
+    """n experts of layer 0 in one file: 'expert' = each expert's 9 pieces back to back, 'type' = every trellis first,
+    then every suh, then every svh (#806's shards)."""
+    pcs = [(r, q, sizes[i]) for r in ("w1", "w3", "w2") for i, q in enumerate(("trellis", "suh", "svh"))]
+    order_ = ([(e, p) for e in range(n) for p in pcs] if order == "expert"
+              else [(e, p) for q in ("trellis", "suh", "svh") for e in range(n) for p in pcs if p[1] == q])
+    t, off = {}, 0
+    for e, (r, q, nb) in order_:
+        nb = nb * 4096   # (pieces of a real size: the engine's slack is 1 MiB)
+        t["layers.0.ffn.experts.%d.%s.%s" % (e, r, q)] = ("s", "I16", (320, 144, 48), off, nb)
+        off += nb
+    return FakeSt(t)
+
+
+class TypeOrdered(unittest.TestCase):
+    def test_expert_major(self):
+        self.assertIsNone(pack.type_ordered(experts("expert", 40)))
+
+    def test_by_type_stops(self):
+        msg = pack.type_ordered(experts("type", 40))
+        self.assertIsNotNone(msg)
+        self.assertIn("layers.0.ffn.experts.0: its pieces are not together", msg)
+        self.assertIn("ordered by type", msg)
+
+    def test_mixed_layouts_are_read_by_pieces(self):   # (several layouts in a layer: the engine reads piece by piece)
+        st = experts("type", 40)
+        k = "layers.0.ffn.experts.1.w1.trellis"
+        f, dt, sh, off, nb = st.t[k]
+        st.t[k] = (f, dt, (320, 144, 32), off, nb)
+        self.assertIsNone(pack.type_ordered(st))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -94,6 +94,11 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
 - **Strix Halo / Gorgon Halo on Windows:** Windows counts the GPU's share of the memory against its page file, so the
   setup asks for a page file big enough to keep every expert on the GPU and says the size
   ([AMD_MAYA.md](AMD_MAYA.md)).
+- **Other EXL3 quants from Hugging Face:** `tools/ds4/pack.py` packs them too. A head kept as BF16 (`head.weight`)
+  is read as it is. Engram tables a quant stored in its own INT4 layout (`U8` + `embed.scale`, as in the quants derived
+  from Diffbot's mixed 3 bpw) are not read: the tables are DeepSeek's own and the quant leaves them unchanged, so put
+  DeepSeek's FP8 shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 in their place. Shards that write their
+  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order.
 
 ### DeepSeek's options
 
