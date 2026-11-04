@@ -444,7 +444,10 @@ const MmqPlan& mmq_plan() {
         p.fallback = !on || layers <= 0;
         for (int64_t l = 0; on && l < layers; ++l) {
             const int gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42, dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-            if (!mmq::supported(gt) || !mmq::supported(dt)) { p.fallback = true; continue; }
+            // (+ Q5_0 here only: unsloth's Qwen3.8 UD-IQ2_XS keeps blk.4's routed down experts in it; mmq::supported()
+            //  leaves it out, so the GLM / DeepSeek prompt paths take the same route as before for every pack)
+            const auto ok = [](int t) { return mmq::supported(t) || t == 6; };   // 6: GGML_TYPE_Q5_0
+            if (!ok(gt) || !ok(dt)) { p.fallback = true; continue; }
             p.layer[(size_t) l] = 1;
             p.any = true;
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
