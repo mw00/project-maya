@@ -5,6 +5,7 @@ import unittest
 import json
 import urllib.request
 import urllib.error
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from serve import deep_sleep as d
@@ -119,11 +120,19 @@ class CheckpointTests(unittest.TestCase):
             for operation in (d._checkpoint, d._restore):
                 with self.assertRaises(d._Stuck):
                     operation(drv, pids)
-            with patch.object(d.os, "kill") as kill, patch.object(d.os, "pidfd_open") as pidfd:
+            with patch.object(d.os, "kill") as kill, patch.object(d.os, "pidfd_open", create=True) as pidfd:
                 d._kill_processes([pids[1]])
                 kill.assert_not_called()
                 pidfd.assert_not_called()
         self.assertEqual(drv.calls, [])
+
+    def test_kill_falls_back_when_pidfd_api_is_unavailable(self):
+        with patch.object(d, "_process_start", return_value=42):
+            pid = d.ProcessId(101)
+            fallback_os = SimpleNamespace(kill=unittest.mock.Mock())
+            with patch.object(d, "os", fallback_os):
+                d._kill_processes([pid])
+            fallback_os.kill.assert_called_once_with(pid, d.signal.SIGKILL)
 
     def test_external_vision_rejected_before_checkpoint(self):
         svc = self.service(); svc.vision = object()
