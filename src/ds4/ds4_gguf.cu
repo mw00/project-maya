@@ -340,7 +340,8 @@ bool lane_parity_on() {
     return false;   // (an AMD build keeps its own sums: the parity rows are the CUDA kernels', not run on AMD yet)
 #else
     static const bool env = [] {
-        const char* v = std::getenv("STRATA_DS4_LANE_PARITY");
+        const char* v = std::getenv("MAYA_DS4_LANE_PARITY");
+        if (v == nullptr) v = std::getenv("STRATA_DS4_LANE_PARITY");
         if (v == nullptr) v = std::getenv("DS4_LANE_PARITY");
         return v != nullptr && std::atoi(v) != 0;
     }();
