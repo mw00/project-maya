@@ -255,7 +255,9 @@ class Exl3Mats(unittest.TestCase):
         plan = exl3_pack.Plan(source(), CFG)
         plan.build(mtp=False)
         g = mat_named(plan, "blk.1.ffn_gate_shexp.weight")[0]
-        self.assertEqual((g[2], g[3], g[4]), (64, 32, 1))    # k, n, K
+        # the mats tuple stores the bitrate as k2 = 2 K since the half-integer bitrates (#265:
+        # K 1.5 / 2.5 / 3.5 need the .5 in an int field); this mat is K 1, so k2 2
+        self.assertEqual((g[2], g[3], g[4]), (64, 32, 2))    # k, n, k2 = 2 K
         q = mat_named(plan, "blk.1.attn_qkv.weight")[0]
         self.assertEqual((q[2], q[3]), (64, 192))            # the fused KDA projection
 
