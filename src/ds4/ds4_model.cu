@@ -1,3 +1,4 @@
+#include "ds4_grammar.hpp"
 // src/ds4/ds4_model.cu - DeepSeek-V4.1-Flash on Maya (see ds4_model.hpp).
 //
 // The layer, for one token at position p (DeepSeek's inference/model.py, Block.forward with the lagged pre-mix):
@@ -1277,6 +1278,7 @@ struct Model::Impl {
     // head device that every pick of the request adds to its logits (sample, verify, the multi steps' picks; not the
     // drafter's own proposals, which the verify then judges by the biased logits).  nullptr: none.  The last few rows
     // stay, keyed by their entries, so the requests of a --parallel step do not upload theirs at each token
+    Grammar * grammar = nullptr; // request-owned, rebound before every scheduler pick
     const float* cur_bias = nullptr;
     struct BiasRow {
         std::string key;
@@ -17302,6 +17304,67 @@ struct Model::Impl {
         cur_bias = r.row;
     }
 
+    // Mask target logits in token-id order, preserving the existing device sampler,
+    // penalties, bias, probability cuts and random stream. No work without grammar.
+    int grammar_mask(const float * row, const Grammar & state) {
+        if (!state.active()) return 1;
+        Dev& hd = devs[(size_t) head_dev];
+        std::vector<float> host((size_t) g.vocab);
+        if (cudaMemcpyAsync(host.data(), row, host.size() * sizeof(float), cudaMemcpyDeviceToHost, hd.st) != cudaSuccess ||
+            cudaStreamSynchronize(hd.st) != cudaSuccess) return -1;
+        std::vector<int> ids((size_t) g.vocab);
+        for (int i = 0; i < g.vocab; ++i) {
+            if (std::isnan(host[i]) || host[i] == INFINITY) return -1;
+            ids[i] = i;
+        }
+        state.mask(host.data(), ids.data(), g.vocab);
+        if (std::none_of(host.begin(), host.end(), [](float x) { return std::isfinite(x); })) return 0;
+        return cudaMemcpyAsync(const_cast<float *>(row), host.data(), host.size() * sizeof(float),
+                               cudaMemcpyHostToDevice, hd.st) == cudaSuccess && cudaStreamSynchronize(hd.st) == cudaSuccess ? 1 : -1;
+    }
+    // Judge one target row at a time: a rejected draft must never advance the
+    // grammar, nor may an unreachable later row make this request fail.
+    bool grammar_verify(const float * rows, int n, const std::vector<int>& drafts, bool own,
+                        float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
+                        int64_t end0, const std::vector<int32_t> * hist, int & accepted, int & next, std::string & err) {
+        Dev& hd = devs[(size_t) head_dev];
+        Grammar trial = *grammar;
+        if (temperature > 0 && !own) {
+            for (int i = 0; i < n; ++i) {
+                h_specq[(size_t) i].n = 1;
+                h_specq[(size_t) i].ids[0] = drafts[(size_t) i];
+                h_specq[(size_t) i].p[0] = 1.0;
+            }
+            CK(cudaMemcpyAsync(d_specq, h_specq.data(), (size_t) n * sizeof(strata::kernels::SpecList),
+                               cudaMemcpyHostToDevice, hd.st));
+        }
+        for (int i = 0; i <= n; ++i) {
+            const float * row = rows + (size_t) i * g.vocab;
+            const int status = grammar_mask(row, trial);
+            if (status <= 0) {
+                err = status == 0 ? "grammar: no finite valid target token" : "nonfinite target logits or device transfer failed";
+                return false;
+            }
+            strata::kernels::SamplerParams sp;
+            sp.temperature = temperature; sp.greedy = temperature <= 0;
+            sp.top_p = top_p; sp.top_k = top_k; sp.min_p = min_p;
+            sp.seed = seed; sp.counter = counter + (uint64_t) i; sp.logit_bias = cur_bias;
+            int h = 0;
+            const int * hr = pen_rows(end0 + i, 1, sp, h, hist);
+            if (temperature > 0 && i < n) {
+                h_idx[0] = drafts[(size_t) i];
+                CK(cudaMemcpyAsync(d_ints + 32, h_idx, 4, cudaMemcpyHostToDevice, hd.st));
+                strata::kernels::sample_verify(row, 1, g.vocab, sp, d_specq + i, d_ints + 32, hd.tok, hd.st, hr, h);
+            } else strata::kernels::sample_tokens(row, 1, g.vocab, hr, h, sp, hd.tok, hd.st);
+            next = tok_back(hd);
+            if (next < 0) { err = "target sampler failed"; return false; }
+            accepted = i;
+            if (i == n || next != drafts[(size_t) i]) return true;
+            trial.accept(next);
+        }
+        return true;
+    }
+
     // `hist_end`: the pick's penalty history ends there (toks[0 .. hist_end): the tokens up to its row's position)
     int sample_row(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
                    const float* bias, int64_t hist_end) {
@@ -17345,7 +17408,12 @@ struct Model::Impl {
         cudaSetDevice(hd.id);
         int m = 0;
         // (penalties: row t counts the tokens up to its own position - y and the drafts before it, toks[0 .. p0 + 1 + t))
-        if (temperature <= 0.0f) {
+        if (grammar && grammar->active()) {
+            const bool own = drafts_q && dq_temp == temperature && dq_top_p == top_p && dq_top_k == top_k &&
+                             dq_min_p == min_p && dq_seed == seed && dq_counter == counter;
+            if (!grammar_verify(hd.logits, n, drafts, own, temperature, top_p, top_k, min_p, seed, counter,
+                                p0 + 1, nullptr, m, next, err)) { rollback(p0, T, 1); return false; }
+        } else if (temperature <= 0.0f) {
             strata::kernels::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
@@ -22016,6 +22084,7 @@ struct Model::Impl {
         int h = 0;
         const int* hr = pen_rows((int64_t) toks.size(), 1, sp, h);   // (the last fed token's row: every token consumed)
         const float* row = d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab;
+        if (grammar) { const int status = grammar_mask(row, *grammar); if (status <= 0) return status == 0 ? -2 : -1; }
         strata::kernels::sample_tokens(row, 1, g.vocab, hr, h, sp, d.tok, d.st);
         const int t = tok_back(d);
         if (t >= 0) lp_pick(row, 1, &t, (int64_t) toks.size());
@@ -22210,7 +22279,10 @@ struct Model::Impl {
         const float* lg = hd.logits + (size_t) r.r0 * V;
         int m = 0;
         // (penalties: row t counts the tokens up to its own position - y and the drafts before it, q.toks[0 .. p0 + 1 + t))
-        if (temperature <= 0.0f) {
+        if (grammar && grammar->active()) {
+            if (!grammar_verify(lg, n, drafts, false, temperature, top_p, top_k, min_p, seed, counter,
+                                r.p0 + 1, &q.toks, m, next, err)) { rollback_run(i, 1); seq_unpark(); return false; }
+        } else if (temperature <= 0.0f) {
             strata::kernels::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
@@ -22353,6 +22425,8 @@ struct Model::Impl {
         const std::vector<int32_t>& hist = seq_tokens(mrows[(size_t) row]);
         int h = 0;
         const int* hr = pen_rows((int64_t) hist.size(), 1, sp, h, &hist);
+        if (grammar) { const int status = grammar_mask(d.logits + (size_t) row * g.vocab, *grammar);
+            if (status <= 0) return status == 0 ? -2 : -1; }
         strata::kernels::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, hr, h, sp, d.tok, d.st);
         const int t = tok_back(d);
         if (t >= 0) lp_pick(d.logits + (size_t) row * g.vocab, 1, &t, (int64_t) hist.size(), &hist);
@@ -22699,6 +22773,7 @@ void Model::set_penalties(int last_n, float repeat, float freq, float present) {
     p_->pen_freq = freq;
     p_->pen_present = present;
 }
+void Model::set_grammar(Grammar * grammar) { p_->grammar = grammar; }
 void Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries) { p_->set_logit_bias(entries); }
 void Model::set_logprobs(int k, int force) {
     p_->lp_k = k < 0 ? -1 : std::min(k, kTopLogprobs);
