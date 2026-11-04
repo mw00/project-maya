@@ -460,6 +460,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_test(NAME exl3_mv_generic_test COMMAND ${CMAKE_COMMAND} -E env DS4_EXL3_MV1=0 $<TARGET_FILE:exl3_test>)
       set_tests_properties(exl3_mv1_test exl3_mv_generic_test PROPERTIES TIMEOUT 120)
     endif()
+    if(NOT STRATA_ENABLE_HIP)
+      # v1.1.8's kernels with the FP32 weight decode (STRATA_GLM_EXL3_DECODE=legacy-f32): every case as with the FP16
+      # decode; and the legacy cases' outputs (exl3_test --dump-legacy) bit for bit the FP16 decode's.  The FP32 decode
+      # is built for sm_6x only: on sm_70+ legacy-f32 runs the FP16 kernels, which these check too.  The bits test writes
+      # its dumps to a directory of its own under exl3_dump (removed when it passes): runs at once do not collide
+      add_test(NAME exl3_legacy_f32_test
+               COMMAND ${CMAKE_COMMAND} -E env STRATA_GLM_EXL3_DECODE=legacy-f32 $<TARGET_FILE:exl3_test>)
+      add_test(NAME exl3_legacy_f32_bits
+               COMMAND ${CMAKE_COMMAND} -DEXE=$<TARGET_FILE:exl3_test> -DOUT=${CMAKE_CURRENT_BINARY_DIR}/exl3_dump
+                       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/exl3_dump_compare.cmake)
+      set_tests_properties(exl3_legacy_f32_test PROPERTIES TIMEOUT 120)
+      set_tests_properties(exl3_legacy_f32_bits PROPERTIES TIMEOUT 300)
+    endif()
     # the same decoders against exllamav3 itself (tools/exl3_exllamav3_fixture.py's tiles): the same bits
     add_test(NAME exl3_exllamav3 COMMAND exl3_test --exllamav3 ${CMAKE_CURRENT_SOURCE_DIR}/data/exl3-exllamav3)
     set_tests_properties(exl3_exllamav3 PROPERTIES TIMEOUT 60)
