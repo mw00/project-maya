@@ -724,6 +724,7 @@ struct Chunk {
     int ring_n = 0;
     cudaStream_t cs = nullptr;
     cudaEvent_t filled[kParts] = {}, freed[kParts] = {};
+    bool spec_said = false;   // (the log's line once: the ring's first batches before a layer's routing, run_dev_chunks)
     // in place (file_experts): each streamed expert's file region read into pinned staging (ring_n slots of
     // stage_stride bytes, a part's slots free again once its `filled` copies are done) by the readers, in parallel,
     // and DMA'd from there - a copy from the files' pages goes through the driver's staging, one thread at ~1.3 GB/s
@@ -18323,7 +18324,9 @@ struct Model::Impl {
         S.skip_k.assign((size_t) nk, 0);
         S.spec_k.assign((size_t) nk, 0);
         // (MAYA_DS4_SPEC_HEAD=0: a shallow ring's chunks wait for each layer's routing before any of its copies, as
-        //  before - 3x V100, EXL3 2.9 bpw, the pair's link was idle through every layer's attention)
+        //  before - 3x V100, EXL3 2.9 bpw, the pair's link was idle through every layer's attention.  Only where the
+        //  copies come straight from pinned RAM: with staging (experts read from the files) copy_ahead's reads and
+        //  waits run on this thread, which would hold back the layer's own work)
         static const bool spec_head = [] {
             const char* v = ds4_env("DS4_SPEC_HEAD");
             return v == nullptr || std::atoi(v) != 0;
@@ -18331,7 +18334,13 @@ struct Model::Impl {
         for (int k = 0; k < nk && !c.flow; ++k) {
             const bool few = run.T[(size_t) k] <= skip_unpicked_rows();
             S.skip_k[(size_t) k] = shallow || few;
-            S.spec_k[(size_t) k] = spec_head && shallow && !few;
+            S.spec_k[(size_t) k] = spec_head && shallow && !few && c.stage == nullptr;
+            if (S.spec_k[(size_t) k] && !c.spec_said) {
+                c.spec_said = true;
+                std::fprintf(stderr, "ds4: CUDA%d prompt copies: a layer's first %d experts go out before its routing "
+                                     "(its ring holds %d of them; MAYA_DS4_SPEC_HEAD=0: after it)\n",
+                             d.id, c.ring_n, c.ring_n);
+            }
         }
         for (int k = 0; k < nk && !c.flow; ++k)
             for (int il = 0; il < g.nl; ++il) {
