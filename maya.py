@@ -1735,7 +1735,7 @@ def choose_family(a, prev: dict) -> str:
              "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
              "NVIDIA and AMD; pictures with its vision encoder."),
-            (DS4, "experimental",
+            (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
              "Mix-256G, its refusals removed) or LibertAIDAI's EXL3 quants at 2.9 or "

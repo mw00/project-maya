@@ -23,9 +23,9 @@ lists and architecture feature suffixes. The runtime strips the feature suffix
 and checks exact membership in the compiled list, then requires wave32.
 Its diagnostics print the actual architecture and the compiled targets.
 
-`gfx1151` **builds, untested**. Code is included for later Strix Halo work, but
-setup does not enable that APU here. Unified-memory accounting and hardware
-validation are separate requirements.
+`gfx1151` (Strix Halo / Gorgon Halo) is supported too: the setup takes the APU,
+with its unified-memory accounting, and it runs GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017
+and MiniMax-M3.1-Flash, their EXL3 quants included ([AMD_MAYA.md](AMD_MAYA.md)).
 
 A manual build, using Maya's existing pinned llama.cpp checkout:
 
