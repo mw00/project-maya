@@ -51,20 +51,21 @@ inline int staging_ring_mb(double room_bytes) {
 // x4 / x16 read prompts fastest at 1-3 slots a batch, an L40S at 5 of 18.8 MB (the most tried), a V100 on PCIe 3 x16
 // (6.9 MB experts) at 15, the 400 MB ring - smaller rings were slower there.  A link that takes kRingSlowS or more
 // for one expert takes one a batch: the CMP 170HX on Gen2 x16 (9 MB experts, 6.2 GB/s: 1.5 ms each) read 4K-32K
-// prompts 2-3.5% faster at one a batch than at the 6 of ~10 ms (#609) - only on a link under kRingSlowBps: a PCIe 3
-// x16 link (~12 GB/s) with large experts takes a millisecond for one too (3x V100, EXL3 2.9 bpw: 12.7 MB, 1.03 ms),
-// and there one a batch read prompts 2-4% slower than the link-sized batch (DS4_RING_MB=400).  -> the slots (a
-// multiple of parts)
+// prompts 2-3.5% faster at one a batch than at the 6 of ~10 ms (#609).  slow_bps (MAYA_DS4_RING_FAST_LINK=1:
+// kRingSlowBps, else no limit): the rule only on a link under it - a PCIe 3 x16 link (~12 GB/s) with large experts
+// takes a millisecond for one too (3x V100, EXL3 2.9 bpw: 12.7 MB, 1.03 ms), and there one a batch read prompts 2-4%
+// slower than the link-sized batch.  Opt-in: the larger ring takes VRAM experts, and an EXL3 pack's sums follow which
+// experts are in VRAM.  -> the slots (a multiple of parts)
 constexpr double kRingBatchS = 0.010;
 constexpr double kRingSlowS = 0.001;
 constexpr double kRingSlowBps = 8e9;
 constexpr int kRingMaxMB = 400;
-inline int ring_slots(double link, size_t stride, double room, int parts) {
+inline int ring_slots(double link, size_t stride, double room, int parts, double slow_bps = 1e300) {
     if (stride == 0 || parts <= 0) return parts;
     const double cap_b = std::min((double) ((size_t) kRingMaxMB << 20), room > 0 ? room / 16.0 : 1e300);
     const int cap = std::max(1, (int) (cap_b / (double) stride) / parts);   // (batches of the cap)
     const int want = link <= 0 ? cap
-                   : (double) stride / link >= kRingSlowS && link < kRingSlowBps ? 1
+                   : (double) stride / link >= kRingSlowS && link < slow_bps ? 1
                    : (int) (link * kRingBatchS / (double) stride);
     return std::max(1, std::min(cap, want)) * parts;
 }
