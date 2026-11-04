@@ -6,6 +6,7 @@ import {S, confirmDialog, emit, toast} from "./state.js";
 import {chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
         renameChat, renameFolder, deleteFolder, toggleFolder} from "./chats.js";
 import {Icon, Kbd, MayaMark, Menu, MenuItem, MenuLabel, MenuSep, ModelLogo, trapTab, useDismiss} from "./ui.js";
+import {languageChoice, t, tr} from "./i18n.js";
 
 export const showView = (v) => { S.view = v; S.drawer = false; emit(); };
 export const openSettings = (section = "general") => { S.settings = section; S.drawer = false; emit(); };
@@ -15,43 +16,43 @@ export const setSide = (open) => { S.sideOpen = open; store.set("side-open", ope
 // plain: the state alone - on the Monitor, whose hero and Context card show the speed and the context (every figure once)
 export function status(plain = false) {
   const m = S.metrics, live = (m && m.live) || {};
-  const ctx = S.health.max_context ? `${ctxfmt(S.health.max_context)} context` : "";
-  if (S.conn === "down") return {tone: "danger", text: "Server not reachable"};
-  if (S.conn === "key") return {tone: "warn", text: "API key needed"};
-  if (S.updateWatch) return {tone: "info", text: "Updating"};
-  if (S.reload) return {tone: "info", text: "Reloading"};
-  if (!m) return {tone: "muted", text: "Connecting…"};
-  if (live.queued > 0) return {tone: "warn", text: `${live.queued} queued`};
+  const ctx = S.health.max_context ? tr("{context} context", {context:ctxfmt(S.health.max_context)}) : "";
+  if (S.conn === "down") return {tone: "danger", text: tr("Server not reachable")};
+  if (S.conn === "key") return {tone: "warn", text: tr("API key needed")};
+  if (S.updateWatch) return {tone: "info", text: tr("Updating")};
+  if (S.reload) return {tone: "info", text: tr("Reloading")};
+  if (!m) return {tone: "muted", text: tr("Connecting…")};
+  if (live.queued > 0) return {tone: "warn", text: tr("{count} queued", {count:live.queued})};
   if (live.state === "reading") {
     const pct = live.prompt_total && !plain ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    return {tone: "info", text: pct != null ? `Reading · ${pct}%` : "Reading"};
+    return {tone: "info", text: pct != null ? tr("Reading · {percent}%", {percent:pct}) : tr("Reading")};
   }
   if (live.state === "generating") {
-    const many = live.active > 1 && !plain ? ` · ${live.active} at once` : "";   // (--parallel: answers written together)
-    return {tone: "accent", text: (live.tok_s && !plain ? `Writing · ${fmt(live.tok_s, 1)} tok/s` : "Writing") + many};
+    const many = live.active > 1 && !plain ? tr(" · {count} at once", {count:live.active}) : "";   // (--parallel: answers written together)
+    return {tone: "accent", text: (live.tok_s && !plain ? tr("Writing · {speed} tok/s", {speed:fmt(live.tok_s,1)}) : tr("Writing")) + many};
   }
-  return {tone: "muted", text: ["Idle", plain ? "" : ctx].filter(Boolean).join(" · ")};
+  return {tone: "muted", text: [tr("Idle"), plain ? "" : ctx].filter(Boolean).join(" · ")};
 }
 
 // ------------------------------------------------------------------ a chat's ⋯ menu (in the sidebar and the header)
 export function ChatMenuItems({c, close}) {
   const run = (f) => () => { close(); f(); };
   if (!c.messages.length) {
-    return html`<${MenuItem} icon="notebook-pen" label="Instructions for this chat" onClick=${run(() => chatInstructions(c))}/>`;
+    return html`<${MenuItem} icon="notebook-pen" label=${t("instructions", "Instructions for this chat")} onClick=${run(() => chatInstructions(c))}/>`;
   }
   return html`
-    <${MenuItem} icon=${c.pinned ? "pin-off" : "pin"} label=${c.pinned ? "Unpin" : "Pin"} onClick=${run(() => pinChat(c, !c.pinned))}/>
+    <${MenuItem} icon=${c.pinned ? "pin-off" : "pin"} label=${c.pinned ? t("unpin", "Unpin") : t("pin", "Pin")} onClick=${run(() => pinChat(c, !c.pinned))}/>
     <${MenuSep}/>
-    <${MenuLabel}>Move to folder<//>
+    <${MenuLabel}>${t("move-to-folder", "Move to folder")}<//>
     ${S.folders.map((f) => html`<${MenuItem} key=${f.id} icon="folder" label=${f.name} checked=${c.folder === f.id}
       onClick=${run(() => moveToFolder(c, c.folder === f.id ? null : f.id))}/>`)}
-    <${MenuItem} icon="folder-plus" label="New folder" onClick=${run(() => newFolder(c))}/>
-    ${c.folder ? html`<${MenuItem} icon="folder-minus" label="Take out of the folder" onClick=${run(() => moveToFolder(c, null))}/>` : null}
+    <${MenuItem} icon="folder-plus" label=${t("new-folder", "New folder")} onClick=${run(() => newFolder(c))}/>
+    ${c.folder ? html`<${MenuItem} icon="folder-minus" label=${tr("Take out of the folder")} onClick=${run(() => moveToFolder(c, null))}/>` : null}
     <${MenuSep}/>
-    <${MenuItem} icon="edit" label="Rename" onClick=${run(() => renameChat(c))}/>
-    <${MenuItem} icon="notebook-pen" label="Instructions" onClick=${run(() => chatInstructions(c))}/>
-    <${MenuItem} icon="download" label="Export as Markdown" onClick=${run(() => exportChat(c))}/>
-    <${MenuItem} icon="trash" label="Delete" danger onClick=${run(() => deleteChat(c))}/>`;
+    <${MenuItem} icon="edit" label=${t("rename", "Rename")} onClick=${run(() => renameChat(c))}/>
+    <${MenuItem} icon="notebook-pen" label=${t("instructions", "Instructions")} onClick=${run(() => chatInstructions(c))}/>
+    <${MenuItem} icon="download" label=${t("export-markdown", "Export as Markdown")} onClick=${run(() => exportChat(c))}/>
+    <${MenuItem} icon="trash" label=${t("delete", "Delete")} danger onClick=${run(() => deleteChat(c))}/>`;
 }
 
 function ChatRow({c, indent}) {
@@ -63,11 +64,11 @@ function ChatRow({c, indent}) {
   return html`<div class=${`row${cur ? " is-current" : ""}${open ? " is-menu" : ""}`}>
     <button type="button" class=${`row__open${indent ? " row__open--in" : ""}`} title=${chatTitle(c)} aria-current=${cur ? "page" : undefined}
       onClick=${() => openChat(c)}>${chatTitle(c)}</button>
-    ${writing ? html`<span class="row__live" title="An answer is being written" aria-label="Writing"></span>`
-      : c.pinned ? html`<span class="row__pin" title="Pinned"><${Icon} name="pin" sm/></span>` : null}
-    <button type="button" ref=${btn} class="row__more" aria-label=${`Options for ${chatTitle(c)}`} aria-haspopup="menu"
+    ${writing ? html`<span class="row__live" title=${tr("An answer is being written")} aria-label=${tr("Writing")}></span>`
+      : c.pinned ? html`<span class="row__pin" title=${tr("Pinned")}><${Icon} name="pin" sm/></span>` : null}
+    <button type="button" ref=${btn} class="row__more" aria-label=${tr("Options for {name}", {name: chatTitle(c)})} aria-haspopup="menu"
       aria-expanded=${String(open)} onClick=${() => setOpen(!open)}><${Icon} name="ellipsis" sm/></button>
-    <${Menu} open=${open} onClose=${() => setOpen(false)} anchor=${btn} label="Chat options" width=${240}>
+    <${Menu} open=${open} onClose=${() => setOpen(false)} anchor=${btn} label=${tr("Chat options")} width=${240}>
       <${ChatMenuItems} c=${c} close=${close}/>
     <//>
   </div>`;
@@ -81,11 +82,11 @@ function FolderRow({f, n}) {
     <button type="button" class="row__open row__folder" aria-expanded=${String(expanded)} onClick=${() => toggleFolder(f.id)}>
       <${Icon} name="chevron" sm cls=${expanded ? "chev" : "chev is-closed"}/><${Icon} name="folder" sm/>
       <span class="row__name">${f.name}</span><span class="row__count">${n}</span></button>
-    <button type="button" ref=${btn} class="row__more" aria-label=${`Options for the folder ${f.name}`} aria-haspopup="menu"
+    <button type="button" ref=${btn} class="row__more" aria-label=${tr("Options for the folder {name}", {name: f.name})} aria-haspopup="menu"
       aria-expanded=${String(open)} onClick=${() => setOpen(!open)}><${Icon} name="ellipsis" sm/></button>
-    <${Menu} open=${open} onClose=${() => setOpen(false)} anchor=${btn} label="Folder options" width=${220}>
-      <${MenuItem} icon="edit" label="Rename" onClick=${() => { setOpen(false); btn.current.focus(); renameFolder(f); }}/>
-      <${MenuItem} icon="trash" label="Delete folder" danger onClick=${() => { setOpen(false); btn.current.focus(); deleteFolder(f); }}/>
+    <${Menu} open=${open} onClose=${() => setOpen(false)} anchor=${btn} label=${tr("Folder options")} width=${220}>
+      <${MenuItem} icon="edit" label=${tr("Rename")} onClick=${() => { setOpen(false); btn.current.focus(); renameFolder(f); }}/>
+      <${MenuItem} icon="trash" label=${tr("Delete folder")} danger onClick=${() => { setOpen(false); btn.current.focus(); deleteFolder(f); }}/>
     <//>
   </div>`;
 }
@@ -100,24 +101,24 @@ function ChatList() {
   const rest = chats.filter((c) => !c.pinned && !(c.folder && known.has(c.folder)));
   const groups = [];
   for (const c of rest) {
-    const g = dayGroup(c.updated);
+    const g = dayGroup(c.updated, undefined, languageChoice() === "zh-CN" ? "zh-CN" : "en");
     if (!groups.length || groups[groups.length - 1].label !== g) groups.push({label: g, chats: []});
     groups[groups.length - 1].chats.push(c);
   }
-  return html`<div class="side__list" aria-label="Chats">
-    ${pinned.length ? html`<div class="side__label">Pinned</div>${pinned.map((c) => html`<${ChatRow} key=${c.id} c=${c}/>`)}` : null}
-    <div class="side__label side__label--row"><span>Folders</span>
-      <button type="button" class="icon-btn icon-btn--sm" aria-label="New folder" title="New folder" onClick=${() => newFolder()}>
+  return html`<div class="side__list" aria-label=${t("chats", "Chats")}>
+    ${pinned.length ? html`<div class="side__label">${t("pin", "Pinned")}</div>${pinned.map((c) => html`<${ChatRow} key=${c.id} c=${c}/>`)}` : null}
+    <div class="side__label side__label--row"><span>${tr("Folders")}</span>
+      <button type="button" class="icon-btn icon-btn--sm" aria-label=${tr("New folder")} title=${tr("New folder")} onClick=${() => newFolder()}>
         <${Icon} name="plus" sm/></button></div>
-    ${S.folders.length ? null : html`<div class="side__note">Keep chats together: add a folder with +.</div>`}
+    ${S.folders.length ? null : html`<div class="side__note">${tr("Keep chats together: add a folder with +.")}</div>`}
     ${S.folders.map((f) => {
       const inIt = byFolder[f.id] || [];
       return html`<${FolderRow} key=${f.id} f=${f} n=${inIt.length}/>
         ${S.folderOpen[f.id] ? (inIt.length ? inIt.map((c) => html`<${ChatRow} key=${c.id} c=${c} indent/>`)
-                                             : html`<div class="side__note side__note--in">Empty. Move a chat here from its ⋯ menu.</div>`) : null}`;
+                                             : html`<div class="side__note side__note--in">${tr("Empty. Move a chat here from its ⋯ menu.")}</div>`) : null}`;
     })}
-    ${groups.map((g) => html`<div class="side__label">${g.label}</div>${g.chats.map((c) => html`<${ChatRow} key=${c.id} c=${c}/>`)}`)}
-    ${chats.length ? null : html`<div class="side__note">Your chats appear here. They stay in this browser.</div>`}
+    ${groups.map((g) => html`<div class="side__label">${tr(g.label)}</div>${g.chats.map((c) => html`<${ChatRow} key=${c.id} c=${c}/>`)}`)}
+    ${chats.length ? null : html`<div class="side__note">${tr("Your chats appear here. They stay in this browser.")}</div>`}
   </div>`;
 }
 
@@ -142,44 +143,47 @@ function useSavings() {
 // what the popover (a wide screen) and the bottom sheet (a phone) show: the total, this start, each model, the prices
 function SavedBody({r, setR, close, sheet}) {
   const reset = async () => {
-    if (!await confirmDialog("Start over from $0?", "<p>Every model's count of tokens and what they would have cost goes back to zero. This cannot be undone.</p>", "Start over", true)) return;
-    try { setR(await api("api/savings/reset", {method: "POST", body: {}})); toast("success", "Started over", "Maya counts from $0 again."); }
-    catch (e) { toast("error", "Not reset", e.message, 6000); }
+    if (!await confirmDialog(tr("Start over from $0?"), tr("<p>Every model's count of tokens and what they would have cost goes back to zero. This cannot be undone.</p>"), tr("Start over"), true)) return;
+    try { setR(await api("api/savings/reset", {method: "POST", body: {}})); toast("success", tr("Started over"), tr("Maya counts from $0 again.")); }
+    catch (e) { toast("error", tr("Not reset"), e.message, 6000); }
   };
-  if (!r) return html`<p class="saved-pop__note">Counting…</p>`;
+  if (!r) return html`<p class="saved-pop__note">${tr("Counting…")}</p>`;
   if (r.error) return html`<p class="saved-pop__note">${r.error}</p>`;
   const apis = r.prices ? [...new Set(r.prices.map((p) => p.api))] : [];
   // (two configs of one model, e.g. two GPU layouts: each row says its config)
   const twin = (m) => r.models.filter((x) => x.model === m.model && x.quant === m.quant).length > 1;
   const nb = (q) => q.replace(/-/g, "‑");          // (a quant is not broken at its hyphens)
-  const since = r.since ? new Date(r.since * 1000).toLocaleDateString([], {month: "short", day: "numeric"}) : null;
+  const since = r.since ? new Date(r.since * 1000).toLocaleDateString(languageChoice() === "zh-CN" ? "zh-CN" : "en", {month: "short", day: "numeric"}) : null;
   const prices = r.prices && r.prices.length ? html`
-    ${r.prices.map((p) => html`<div class="saved-pop__price"><span>${modelName(p.model)} (${p.custom ? "your prices" : p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}
-    <span>${r.prices.some((p) => p.peak) ? "DeepSeek charges twice that at its peak hours (weekdays 01–04 and 06–10 UTC), and Maya counts those tokens at that price. " : ""}The prompt Maya reads again from its own cache counts at the cached price. Electricity is not counted.</span>` : null;
+    ${r.prices.map((p) => html`<div class="saved-pop__price"><span>${modelName(p.model)} (${p.custom ? tr("your prices") : p.api})</span><span>${dollars(p.input)} · ${dollars(p.cached)} · ${dollars(p.output)}</span></div>`)}
+    <span>${tr(r.prices.some((p) => p.peak) ? "DeepSeek charges twice that at its peak hours (weekdays 01–04 and 06–10 UTC), and Maya counts those tokens at that price. The prompt Maya reads again from its own cache counts at the cached price. Electricity is not counted." : "The prompt Maya reads again from its own cache counts at the cached price. Electricity is not counted.")}</span>` : null;
   const change = () => { close(); openSettings("savings"); };
   return html`
-    <div class="saved-pop__head">${sheet ? null : html`<span>Saved, compared with the API</span>`}<b>${usd(r.usd)}</b>
-      <span>What ${apis.map((a) => `${a}'s`).join(" and ") || "the model's"} own API${apis.length > 1 ? "s" : ""} would have charged for the same tokens${since ? `, since ${since}` : ""}.</span></div>
-    ${r.start ? html`<div class="saved-pop__start"><span><b>This start</b><span>${modelName(r.start.model)}${r.start.quant ? ` ${r.start.quant}` : ""} · up ${upFor(r.start.started)}</span></span>
+    <div class="saved-pop__head">${sheet ? null : html`<span>${tr("Saved, compared with the API")}</span>`}<b>${usd(r.usd)}</b>
+      <span>${tr(apis.length > 1 ? "What {apis} own APIs would have charged for the same tokens{since}." : "What {apis} own API would have charged for the same tokens{since}.", {
+        apis: apis.map((api) => tr("{api}'s", {api})).join(tr(" and ")) || tr("the model's"),
+        since: since ? tr(", since {date}", {date: since}) : "",
+      })}</span></div>
+    ${r.start ? html`<div class="saved-pop__start"><span><b>${tr("This start")}</b><span>${modelName(r.start.model)}${r.start.quant ? ` ${r.start.quant}` : ""} · ${tr("up {time}", {time: upFor(r.start.started)})}</span></span>
       <b>${r.start.usd == null ? "–" : usd(r.start.usd)}</b></div>` : null}
-    ${r.models && r.models.length ? html`<div class="saved-pop__models"><span class="saved-pop__h">By model</span>
+    ${r.models && r.models.length ? html`<div class="saved-pop__models"><span class="saved-pop__h">${tr("By model")}</span>
       ${r.models.map((m) => html`<div class="saved-pop__model" key=${m.key}><${ModelLogo} model=${m.model} size=${sheet ? 36 : 28}/>
         ${sheet   /* (a phone: the quant on a line of its own, the counts shorter) */
           ? html`<span><b>${modelName(m.model)}</b>${m.quant ? html`<span>${nb(m.quant)}${twin(m) ? ` · ${m.key}` : ""}</span>` : null}
-              <span>${mtok(m.tokens.input + m.tokens.cached)} read${m.tokens.cached ? ` (${mtok(m.tokens.cached)} cached)` : ""} · ${mtok(m.tokens.output)} written</span></span>`
+              <span>${tr("{read} read{cached} · {written} written", {read: mtok(m.tokens.input + m.tokens.cached), cached: m.tokens.cached ? tr(" ({count} cached)", {count: mtok(m.tokens.cached)}) : "", written: mtok(m.tokens.output)})}</span></span>`
           : html`<span><b>${modelName(m.model)}${m.quant ? ` · ${nb(m.quant)}` : ""}</b>
-              <span>${twin(m) ? `${m.key} · ` : ""}read ${mtok(m.tokens.input + m.tokens.cached)}${m.tokens.cached ? `, ${mtok(m.tokens.cached)} of it cached` : ""} · wrote ${mtok(m.tokens.output)}</span></span>`}
-        <b>${m.usd == null ? "no API price" : usd(m.usd)}</b></div>`)}</div>` : null}
+              <span>${twin(m) ? `${m.key} · ` : ""}${tr("read {read}{cached} · wrote {written}", {read: mtok(m.tokens.input + m.tokens.cached), cached: m.tokens.cached ? tr(", {count} of it cached", {count: mtok(m.tokens.cached)}) : "", written: mtok(m.tokens.output)})}</span></span>`}
+        <b>${m.usd == null ? tr("no API price") : usd(m.usd)}</b></div>`)}</div>` : null}
     ${!prices ? null : sheet
-      ? html`<details class="saved-pop__how"><summary>How it is counted<${Icon} name="chevron" sm cls="chev"/></summary>
-          <div class="saved-pop__prices"><span class="saved-pop__h">Per 1M tokens: input · cached input · output</span>${prices}</div></details>`
-      : html`<div class="saved-pop__prices"><span class="saved-pop__h">The prices, per 1M tokens: input · cached input · output</span>${prices}</div>`}
+      ? html`<details class="saved-pop__how"><summary>${tr("How it is counted")}<${Icon} name="chevron" sm cls="chev"/></summary>
+          <div class="saved-pop__prices"><span class="saved-pop__h">${tr("Per 1M tokens: input · cached input · output")}</span>${prices}</div></details>`
+      : html`<div class="saved-pop__prices"><span class="saved-pop__h">${tr("The prices, per 1M tokens: input · cached input · output")}</span>${prices}</div>`}
     ${sheet
-      ? html`<div class="saved-sheet__acts"><button type="button" class="btn btn--secondary" onClick=${change}>Change the prices</button>
-          <button type="button" class="btn btn--danger" onClick=${reset}>Start over</button></div>`
+      ? html`<div class="saved-sheet__acts"><button type="button" class="btn btn--secondary" onClick=${change}>${tr("Change the prices")}</button>
+          <button type="button" class="btn btn--danger" onClick=${reset}>${tr("Start over")}</button></div>`
       : html`<div class="saved-pop__foot">
-          <button type="button" class="btn btn--ghost btn--sm" onClick=${change}>Change the prices</button>
-          <button type="button" class="btn btn--ghost btn--sm" onClick=${reset}>Start over from $0</button></div>`}`;
+          <button type="button" class="btn btn--ghost btn--sm" onClick=${change}>${tr("Change the prices")}</button>
+          <button type="button" class="btn btn--ghost btn--sm" onClick=${reset}>${tr("Start over from $0")}</button></div>`}`;
 }
 
 // a wide screen: a popover above the line, as tall as the room above it
@@ -199,7 +203,7 @@ function SavedPop({anchor, close}) {
     return () => removeEventListener("resize", place);
   }, [!!r]);
   const style = pos ? `left:${pos.left}px;bottom:${pos.bottom}px;max-height:${pos.max}px` : "left:0;bottom:0;visibility:hidden";
-  return html`<div ref=${ref} class="saved-pop" role="dialog" aria-label="Saved, compared with the API" style=${style}>
+  return html`<div ref=${ref} class="saved-pop" role="dialog" aria-label=${tr("Saved, compared with the API")} style=${style}>
     <${SavedBody} r=${r} setR=${setR} close=${close}/></div>`;
 }
 
@@ -218,7 +222,7 @@ export function SavedSheet() {
     document.addEventListener("keydown", key, true);
     return () => {
       document.removeEventListener("keydown", key, true);
-      const b = document.querySelector('.chat-head--float button[aria-label="Chats"]');   // (back where it was opened from)
+      const b = document.querySelector('.chat-head--float [data-open-chats]');   // (back where it was opened from)
       if (b) b.focus();
     };
   }, []);
@@ -238,8 +242,8 @@ export function SavedSheet() {
       style=${drag ? `transform:translateY(${drag}px);transition:none` : ""}>
       <div class="saved-sheet__grab" onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up}>
         <span class="sheet__grip" aria-hidden="true"></span>
-        <div class="saved-sheet__title"><h2 id="saved-sheet-title">Saved, compared with the API</h2>
-          <button type="button" ref=${closeBtn} class="icon-btn" aria-label="Close" onClick=${close}><${Icon} name="close"/></button></div>
+        <div class="saved-sheet__title"><h2 id="saved-sheet-title">${tr("Saved, compared with the API")}</h2>
+          <button type="button" ref=${closeBtn} class="icon-btn" aria-label=${tr("Close")} onClick=${close}><${Icon} name="close"/></button></div>
       </div>
       <div class="saved-sheet__body"><${SavedBody} r=${r} setR=${setR} close=${close} sheet/></div>
     </div></div>`;
@@ -257,9 +261,9 @@ function SavedLine() {
   };
   return html`<div class="saved">
     <button type="button" ref=${btn} class="saved__line" aria-haspopup="dialog" aria-expanded=${String(phone ? !!S.savedSheet : open)}
-      title="What the model's own API would have charged for the same tokens" onClick=${toggle}>
-      <span class="saved__icon"><${Icon} name="dollar"/></span><span class="saved__text">Saved <b>${usd(sv.usd)}</b></span>
-      <span class="saved__vs">vs the API</span><${Icon} name="chevron-right" sm/></button>
+      title=${tr("What the model's own API would have charged for the same tokens")} onClick=${toggle}>
+      <span class="saved__icon"><${Icon} name="dollar"/></span><span class="saved__text">${tr("Saved")} <b>${usd(sv.usd)}</b></span>
+      <span class="saved__vs">${tr("vs the API")}</span><${Icon} name="chevron-right" sm/></button>
     ${open && !phone ? html`<${SavedPop} anchor=${btn} close=${() => setOpen(false)}/>` : null}
   </div>`;
 }
@@ -270,7 +274,7 @@ function StatusCard() {
   const name = S.health.model_label || modelName(S.health.model);
   return html`<div class="side__foot">
     <${SavedLine}/>
-    <button type="button" class="status-card" onClick=${() => showView("monitor")} aria-label=${`${name}, ${st.text}. Open the Monitor`}>
+    <button type="button" class="status-card" onClick=${() => showView("monitor")} aria-label=${tr("{name}, {status}. Open the Monitor", {name,status:st.text})}>
       <${ModelLogo} model=${S.health.model}/>
       <span class="status-card__text"><b title=${S.health.model}>${name}</b>
         <span class=${`status status--${st.tone}`}><i class="status__dot"></i>${st.text}</span></span>
@@ -289,7 +293,7 @@ export function Sidebar({drawer, open}) {
     return () => {
       const a = document.activeElement;            // (unless it went somewhere since: a chat's message box)
       if (a && a !== document.body && !(nav.current && nav.current.contains(a))) return;
-      const back = document.querySelector('.push__main .chat-head--float button[aria-label="Chats"]');
+      const back = document.querySelector('.push__main .chat-head--float [data-open-chats]');
       if (back) back.focus({preventScroll: true});
     };
   }, [shown]);
@@ -298,19 +302,19 @@ export function Sidebar({drawer, open}) {
     <div class="side__head" ref=${head}>
       <span class="side__brand"><${MayaMark}/><span>Maya</span></span>
       ${drawer
-        ? html`<button type="button" class="icon-btn" aria-label="Close the chats" onClick=${() => { S.drawer = false; emit(); }}><${Icon} name="close"/></button>`
-        : html`<button type="button" class="icon-btn" aria-label="Close the sidebar" title="Close the sidebar" onClick=${() => setSide(false)}>
+        ? html`<button type="button" class="icon-btn" aria-label=${tr("Close the chats")} onClick=${() => { S.drawer = false; emit(); }}><${Icon} name="close"/></button>`
+        : html`<button type="button" class="icon-btn" aria-label=${tr("Close the sidebar")} title=${tr("Close the sidebar")} onClick=${() => setSide(false)}>
             <${Icon} name="panel-left"/></button>`}
     </div>
-    <button type="button" class="nav-item" onClick=${newChat}><${Icon} name="new-chat"/><span>New chat</span><${Kbd} k=${`${MOD} ⇧ O`}/></button>
+    <button type="button" class="nav-item" onClick=${newChat}><${Icon} name="new-chat"/><span>${t("new-chat", "New chat")}</span><${Kbd} k=${`${MOD} ⇧ O`}/></button>
     <button type="button" class="nav-item" onClick=${() => { S.search = true; S.drawer = false; emit(); }}>
-      <${Icon} name="search"/><span>Search chats</span><${Kbd} k=${`${MOD} K`}/></button>
+      <${Icon} name="search"/><span>${t("search-chats", "Search chats")}</span><${Kbd} k=${`${MOD} K`}/></button>
     <button type="button" class=${`nav-item${S.view === "models" ? " is-current" : ""}`} aria-current=${S.view === "models" ? "page" : undefined}
-      onClick=${() => showView("models")}><${Icon} name="boxes"/><span>Models</span></button>
+      onClick=${() => showView("models")}><${Icon} name="boxes"/><span>${t("models", "Models")}</span></button>
     <button type="button" class=${`nav-item${S.view === "monitor" ? " is-current" : ""}`} aria-current=${S.view === "monitor" ? "page" : undefined}
-      onClick=${() => showView("monitor")}><${Icon} name="activity"/><span>Monitor</span></button>
+      onClick=${() => showView("monitor")}><${Icon} name="activity"/><span>${t("monitor", "Monitor")}</span></button>
     <button type="button" class="nav-item" onClick=${() => openSettings(newer ? "about" : "general")}>
-      <${Icon} name="settings"/><span>Settings</span>${newer ? html`<i class="nav-item__dot" title="A new version is available"></i>` : null}
+      <${Icon} name="settings"/><span>${t("settings", "Settings")}</span>${newer ? html`<i class="nav-item__dot" title=${tr("A new version is available")}></i>` : null}
       <${Kbd} k=${`${MOD} ,`}/></button>
     <${ChatList}/>
     <${StatusCard}/>
@@ -327,7 +331,7 @@ function snippet(c, q) {
     }
   }
   const a = c.messages.find((m) => m.role === "assistant" && m.text);
-  return [relTime(c.updated), a ? a.text.replace(/[#*`>|_-]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 90) : ""].filter(Boolean).join(" · ");
+  return [tr(relTime(c.updated, languageChoice() === "zh-CN" ? "zh-CN" : "en")), a ? a.text.replace(/[#*`>|_-]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 90) : ""].filter(Boolean).join(" · ");
 }
 export function SearchDialog() {
   const [q, setQ] = useState("");
@@ -351,20 +355,20 @@ export function SearchDialog() {
     if (el) el.scrollIntoView({block: "nearest"});
   }, [sel]);
   return html`<div class="dialog-scrim dialog-scrim--top" onPointerDown=${(e) => { if (e.target === e.currentTarget) close(); }}>
-    <div ref=${box} class="dialog search" role="dialog" aria-modal="true" aria-label="Search chats" onKeyDown=${keys}>
+    <div ref=${box} class="dialog search" role="dialog" aria-modal="true" aria-label=${t("search-chats", "Search chats")} onKeyDown=${keys}>
       <div class="search__bar"><${Icon} name="search"/>
-        <input ref=${input} class="search__input" placeholder="Search chats" aria-label="Search chats" value=${q}
+        <input ref=${input} class="search__input" placeholder=${t("search-chats", "Search chats")} aria-label=${t("search-chats", "Search chats")} value=${q}
           role="combobox" aria-expanded="true" aria-controls="search-results" aria-activedescendant=${found[sel] ? `sr-${sel}` : undefined}
           onInput=${(e) => { setQ(e.target.value); setSel(0); }}/>
-        <button type="button" class="icon-btn" aria-label="Close" onClick=${close}><${Icon} name="close"/></button></div>
-      <div class="search__results" id="search-results" role="listbox" aria-label="Chats">
+        <button type="button" class="icon-btn" aria-label=${t("close", "Close")} onClick=${close}><${Icon} name="close"/></button></div>
+      <div class="search__results" id="search-results" role="listbox" aria-label=${t("chats", "Chats")}>
         ${!ql ? html`<button type="button" class="search__item search__item--new" onClick=${() => { close(); newChat(); }}>
-          <${Icon} name="new-chat"/><span>New chat</span></button>` : null}
+          <${Icon} name="new-chat"/><span>${t("new-chat", "New chat")}</span></button>` : null}
         ${found.map((c, i) => html`<button type="button" key=${c.id} id=${`sr-${i}`} data-i=${i} role="option" aria-selected=${String(i === sel)}
           class=${`search__item${i === sel ? " is-sel" : ""}`} onClick=${() => go(c)} onPointerMove=${() => sel !== i && setSel(i)}>
           <${Icon} name=${c.pinned ? "pin" : c.folder ? "folder" : "chat"}/>
           <span class="search__text"><b>${chatTitle(c)}</b><span>${snippet(c, ql)}</span></span></button>`)}
-        ${found.length ? null : html`<p class="search__none">${ql ? "No chat matches." : "No chats yet."}</p>`}
+        ${found.length ? null : html`<p class="search__none">${ql ? t("no-chat-matches", "No chat matches.") : t("no-chats-yet", "No chats yet.")}</p>`}
       </div>
     </div></div>`;
 }

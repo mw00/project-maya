@@ -4,6 +4,7 @@
 import {SPRITE, api, coarse, ctxfmt, db, download, fmt, headers, store, uid} from "./lib.js";
 import {P, PENALTIES, S, confirmDialog, defaultSystem, emit, levelFor, modelId, promptDialog, toast} from "./state.js";
 import {mcpOn} from "./server.js";
+import {tr} from "./i18n.js";
 
 // ------------------------------------------------------------------ the chats' list
 let dbBroken = false;                 // IndexedDB unavailable (some private windows): localStorage, without pictures
@@ -11,9 +12,9 @@ function saveFolders() { store.set("folders", S.folders); store.set("folders-ope
 export const titleOf = (msgs) => {
   const u = msgs.find((m) => m.role === "user" && (m.text || (m.files || []).length));
   const t = u ? (u.text || (u.files || []).map((f) => f.name).join(", ")) : "";
-  return t.replace(/\s+/g, " ").trim().slice(0, 60) || "New chat";
+  return t.replace(/\s+/g, " ").trim().slice(0, 60) || tr("New chat");
 };
-export const chatTitle = (c) => c.title || (c.messages.length ? titleOf(c.messages) : "New chat");
+export const chatTitle = (c) => c.title || (c.messages.length ? titleOf(c.messages) : tr("New chat"));
 export function newChatObj() {
   return {id: uid(), title: "", created: Date.now(), updated: Date.now(), messages: [], system: defaultSystem(), thinking: P.thinking,
           thinkingFor: modelId()};
@@ -54,7 +55,7 @@ export async function persist(c = S.current) {
 export function saveChat(c = S.current) {
   if (!c) return;
   c.updated = Date.now();
-  if (!c.title || c.title === "New chat") c.title = titleOf(c.messages);
+  if (!c.title || c.title === "New chat" || c.title === tr("New chat")) c.title = titleOf(c.messages);
   S.chats.sort((a, b) => b.updated - a.updated);
   persist(c);
   emit();
@@ -108,7 +109,7 @@ export function newChat() {
   focusInput();
 }
 export async function deleteChat(c) {
-  if (S.busy && S.busy.chat === c) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (S.busy && S.busy.chat === c) { toast("warn", tr("Still writing"), tr("Stop the answer first.")); return; }
   S.chats = S.chats.filter((x) => x !== c);
   try { if (!dbBroken) await db.del(c.id); } catch (e) { /* ignore */ }
   if (dbBroken) {
@@ -117,7 +118,7 @@ export async function deleteChat(c) {
   if (S.current === c) openChat(S.chats[0] || newChatObj());
   focusInput();
   emit();
-  toast("info", "Chat deleted", chatTitle(c), 6000, {label: "Undo", run: () => {
+  toast("info", tr("Chat deleted"), chatTitle(c), 6000, {label: tr("Undo"), run: () => {
     S.chats.push(c);
     S.chats.sort((a, b) => b.updated - a.updated);
     persist(c);
@@ -125,22 +126,22 @@ export async function deleteChat(c) {
   }});
 }
 export async function renameChat(c) {
-  const v = await promptDialog({title: "Rename this chat", label: "Name", value: chatTitle(c), okLabel: "Rename"});
+  const v = await promptDialog({title: tr("Rename this chat"), label: tr("Name"), value: chatTitle(c), okLabel: tr("Rename")});
   if (v == null || !v.trim()) return;
   c.title = v.trim().slice(0, 80);
   persist(c);
   emit();
 }
 export async function chatInstructions(c) {
-  const v = await promptDialog({title: "Instructions for this chat", label: "The model reads them before the chat",
-    value: c.system || "", placeholder: "e.g. Answer briefly. Write code in TypeScript.", multiline: true,
-    note: "Settings › Instructions has the ones new chats start with."});
+  const v = await promptDialog({title: tr("Instructions for this chat"), label: tr("The model reads them before the chat"),
+    value: c.system || "", placeholder: tr("e.g. Answer briefly. Write code in TypeScript."), multiline: true,
+    note: tr("Settings › Instructions has the ones new chats start with.")});
   if (v == null) return;
   c.system = v;
   persist(c);
   emit();
   updateCtxMeter();
-  toast("success", "Instructions saved", v.trim() ? "The next answer reads them first." : "This chat has none now.");
+  toast("success", tr("Instructions saved"), v.trim() ? tr("The next answer reads them first.") : tr("This chat has none now."));
 }
 export function pinChat(c, on) {
   c.pinned = on || undefined;
@@ -150,7 +151,7 @@ export function pinChat(c, on) {
 
 // ------------------------------------------------------------------ folders ({id, name}, in this browser)
 export async function newFolder(c = null) {
-  const name = await promptDialog({title: "New folder", label: "Name", placeholder: "e.g. Maya engine", okLabel: "Create"});
+  const name = await promptDialog({title: tr("New folder"), label: tr("Name"), placeholder: tr("e.g. Maya engine"), okLabel: tr("Create")});
   if (name == null || !name.trim()) return null;
   const f = {id: uid(), name: name.trim().slice(0, 60)};
   S.folders = [...S.folders, f];
@@ -173,7 +174,7 @@ export function toggleFolder(id) {
   emit();
 }
 export async function renameFolder(f) {
-  const v = await promptDialog({title: "Rename the folder", label: "Name", value: f.name, okLabel: "Rename"});
+  const v = await promptDialog({title: tr("Rename the folder"), label: tr("Name"), value: f.name, okLabel: tr("Rename")});
   if (v == null || !v.trim()) return;
   f.name = v.trim().slice(0, 60);
   S.folders = [...S.folders];
@@ -182,9 +183,9 @@ export async function renameFolder(f) {
 }
 export async function deleteFolder(f) {
   const inIt = S.chats.filter((c) => c.folder === f.id);
-  const ok = await confirmDialog(`Delete the folder “${f.name}”?`,
-    inIt.length ? `<p>Its ${inIt.length} chat${inIt.length > 1 ? "s stay" : " stays"}: they move back to the list.</p>`
-                : "<p>It is empty.</p>", "Delete folder", true);
+  const ok = await confirmDialog(tr("Delete the folder “{name}”?", {name: f.name}),
+    inIt.length ? tr(inIt.length === 1 ? "<p>Its {count} chat stays: it moves back to the list.</p>" : "<p>Its {count} chats stay: they move back to the list.</p>", {count: inIt.length})
+                : tr("<p>It is empty.</p>"), tr("Delete folder"), true);
   if (!ok) return;
   for (const c of inIt) { c.folder = undefined; persist(c); }
   S.folders = S.folders.filter((x) => x !== f);
@@ -298,9 +299,11 @@ export function ctxMeter() {
   if (!max || c.tokens == null) return null;
   const pct = Math.min(100, (100 * c.tokens) / max);
   return {...c, max, pct, level: pct >= 95 ? "danger" : pct >= 80 ? "warn" : "",
-          title: `${c.why}: ${fmt(c.tokens)} of the ${fmt(max)}-token context (${fmt(pct, pct < 10 ? 1 : 0)}%)` +
-                 (c.approx ? " - approximate (images count once they are read)" : "") +
-                 (pct >= 95 ? ". Nearly full: start a new chat, or raise the context size in Settings." : "")};
+          title: tr("{why}: {tokens} of the {max}-token context ({percent}%){approx}{full}", {
+            why: tr(c.why), tokens: fmt(c.tokens), max: fmt(max), percent: fmt(pct, pct < 10 ? 1 : 0),
+            approx: c.approx ? tr(" - approximate (images count once they are read)") : "",
+            full: pct >= 95 ? tr(". Nearly full: start a new chat, or raise the context size in Settings.") : "",
+          })};
 }
 
 // ------------------------------------------------------------------ the view's hooks (the message list registers them)
@@ -353,7 +356,7 @@ const sleepOrVisible = (ms) => new Promise((ok) => {
   const tm = setTimeout(go, ms);
   document.addEventListener("visibilitychange", go);
 });
-const setHint = (t) => { S.hint = t || ""; emit(); };
+const setHint = (key, values) => { S.hint = key ? {key, values} : null; emit(); };
 
 // One answer, streamed: a new one (POST), or - after a page reload - the one still running on the server (resumeJob)
 export async function answer(resumeJob = null) {
@@ -361,7 +364,7 @@ export async function answer(resumeJob = null) {
   let m;
   if (resumeJob) {
     m = messages[messages.length - 1];
-    Object.assign(m, {text: "", reasoning: "", tools: [], error: undefined, meta: undefined, stopped: undefined});
+    Object.assign(m, {text: "", reasoning: "", tools: [], error: undefined, errorUI: undefined, meta: undefined, stopped: undefined});
   } else {
     m = {id: uid(), role: "assistant", text: "", reasoning: "", time: Date.now()};
     messages.push(m);
@@ -433,7 +436,7 @@ export async function answer(resumeJob = null) {
           m.pending = true;
           saveChat(chat);                                     // a reload can take this answer back up
         }
-        if (j.error) { finished = true; throw new Error(j.error.message || "the engine reported an error"); }
+        if (j.error) { finished = true; const err = new Error(j.error.message || "the engine reported an error"); if (!j.error.message) err.errorUI = {key: err.message}; throw err; }
         if (j.usage) usage = j.usage;
         if (j.timings) m.timings = j.timings;
         if (j.strata_mcp) { onTool(m, j.strata_mcp); emit(); }
@@ -485,19 +488,22 @@ export async function answer(resumeJob = null) {
   const failed = async (r) => {
     let msg = `HTTP ${r.status}`;
     try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-    if (r.status === 401) msg = "This server needs an API key: add it in Settings › Connect your tools.";
-    return new Error(msg);
+    const err = new Error(msg);
+    if (r.status === 401) err.errorUI = {key: "This server needs an API key: add it in Settings › Connect your tools."};
+    return err;
   };
   try {
     if (resumeJob) {
-      await follow(new Error("This answer was cut off when the page was reloaded, and the server no longer has it."));
+      const lost = new Error("This answer was cut off when the page was reloaded, and the server no longer has it.");
+      lost.errorUI = {key: lost.message};
+      await follow(lost);
     } else {
       const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), body: JSON.stringify(body),
                                                      signal: controller.signal});
       if (!r.ok) throw await failed(r);
       try {
         await consume(r);
-        if (!finished) throw new Error("the connection closed early");
+        if (!finished) { const err = new Error("the connection closed early"); err.errorUI = {key: err.message}; throw err; }
       } catch (e) {
         if (e.name === "AbortError" || finished || !jobId) throw e;
         await follow(e);
@@ -506,10 +512,10 @@ export async function answer(resumeJob = null) {
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
     else if (keep) {
-      m.error = `The connection to the answer was lost (${e.message || e}). Come back to this page or reload it to take ` +
-                "the answer up again - the server keeps it for 15 minutes after it ends.";
-      toast("error", "Connection lost", m.error, 6000);
-    } else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+      m.error = `The connection to the answer was lost (${e.message || e}). Come back to this page or reload it to take the answer up again - the server keeps it for 15 minutes after it ends.`;
+      m.errorUI = {key: "The connection to the answer was lost ({error}). Come back to this page or reload it to take the answer up again - the server keeps it for 15 minutes after it ends.", values: {error: e.message || e}};
+      toast("error", tr("Connection lost"), tr(m.errorUI.key, m.errorUI.values), 6000);
+    } else { m.error = e.message || String(e); m.errorUI = e.errorUI; toast("error", tr("The request failed"), m.errorUI ? tr(m.errorUI.key, m.errorUI.values) : m.error, 6000); }
   }
   if (S.hint && !S.reload) S.hint = "";
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
@@ -538,7 +544,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) resu
 
 export async function send() {
   const text = S.draft.trim();
-  if (S.reload) { toast("info", "The model is reloading", "Send it once the new context size is loaded."); return; }
+  if (S.reload) { toast("info", tr("The model is reloading"), tr("Send it once the new context size is loaded.")); return; }
   if ((!text && !S.attachments.length) || S.busy) return;
   const c = S.current;
   if (S.editIndex != null) c.messages.splice(S.editIndex);       // the edited message and every answer after it
@@ -561,7 +567,7 @@ export function regenerate() {
   answer();
 }
 export function editMessage(i) {
-  if (S.busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (S.busy) { toast("warn", tr("Still writing"), tr("Stop the answer first.")); return; }
   const m = S.current.messages[i];
   S.editIndex = i;
   S.draft = m.text || "";
@@ -599,24 +605,26 @@ const attached = (a) => { S.attachments = [...S.attachments, a]; emit(); updateC
 export function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
-      if (!S.health.images) { toast("warn", "Images are off", "This model runs without images: Models › Engine settings turns them on when it can."); continue; }
-      if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
+      if (!S.health.images) { toast("warn", tr("Images are off"), tr("This model runs without images: Models › Engine settings turns them on when it can.")); continue; }
+      if (f.size > 20e6) { toast("warn", tr("Picture too large"), tr("{name} is over 20 MB.", {name: f.name})); continue; }
       const r = new FileReader();
       r.onload = () => attached({kind: "image", name: f.name || "pasted image", url: r.result});
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${S.health.images ? " or images" : ""}.`); continue; }
+    if (!isTextFile(f)) { toast("warn", tr("Not a text file"), tr(S.health.images ? "{name}: attach text files (code, notes, logs, data) or images." : "{name}: attach text files (code, notes, logs, data).", {name: f.name})); continue; }
     if (f.size > textLimit()) {
       const ctx = S.health.max_context;
-      toast("warn", "File too large", `${f.name} (${sizeLabel(f.size)}) is over the limit for this model's ${ctx ? ctxfmt(ctx) + "-token " : ""}context ` +
-        `(${sizeLabel(textLimit())}).${ctx ? " A larger context size in Settings raises it; or attach a part of the file." : ""}`);
+      toast("warn", tr("File too large"), tr("{name} ({size}) is over the limit for this model's {context}context ({limit}).{advice}", {
+        name: f.name, size: sizeLabel(f.size), context: ctx ? tr("{count}-token ", {count: ctxfmt(ctx)}) : "", limit: sizeLabel(textLimit()),
+        advice: ctx ? tr(" A larger context size in Settings raises it; or attach a part of the file.") : "",
+      }));
       continue;
     }
     const r = new FileReader();
     r.onload = () => {
       const text = String(r.result);
-      if (text.includes("\u0000")) { toast("warn", "Not a text file", `${f.name} looks like a binary file.`); return; }
+      if (text.includes("\u0000")) { toast("warn", tr("Not a text file"), tr("{name} looks like a binary file.", {name: f.name})); return; }
       attached({kind: "file", name: f.name, text});
     };
     r.readAsText(f);
@@ -630,21 +638,20 @@ export function removeAttachment(i) {
 
 // ------------------------------------------------------------------ export (Markdown)
 export function exportChat(c = S.current) {
-  if (!c.messages.length) { toast("info", "Nothing to save yet"); return; }
+  if (!c.messages.length) { toast("info", tr("Nothing to save yet")); return; }
   const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
-    `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
+    `<details><summary>${tr("Tool")} ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : ` (${tr("error")})`}</summary>\n\n` +
     `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
-  const head = `# ${chatTitle(c)}\n\n` + (c.system ? `> Instructions: ${c.system.replace(/\n/g, " ")}\n\n` : "");
-  const md = head + c.messages.map((m) => m.role === "user" ? `## You\n\n${m.text}\n` :
-    `## ${S.health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
+  const head = `# ${chatTitle(c)}\n\n` + (c.system ? `> ${tr("Instructions")}: ${c.system.replace(/\n/g, " ")}\n\n` : "");
+  const md = head + c.messages.map((m) => m.role === "user" ? `## ${tr("You")}\n\n${m.text}\n` :
+    `## ${S.health.model}\n\n${m.reasoning ? `<details><summary>${tr("Thinking")}</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || (m.error && m.errorUI ? tr(m.errorUI.key, m.errorUI.values) : m.error) || ""}\n`).join("\n");
   download(`maya-chat-${new Date(c.updated || Date.now()).toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`, md, "text/markdown");
 }
 
 // ------------------------------------------------------------------ clear this browser
 export async function clearBrowser() {
-  const ok = await confirmDialog("Clear this browser's chats and settings?",
-    "<p>Every chat, its folders, the chat settings, the instructions and the API key kept in this browser are removed. " +
-    "The model, its files and the server's own settings are not touched.</p>", "Clear everything", true);
+  const ok = await confirmDialog(tr("Clear this browser's chats and settings?"),
+    tr("<p>Every chat, its folders, the chat settings, the instructions and the API key kept in this browser are removed. The model, its files and the server's own settings are not touched.</p>"), tr("Clear everything"), true);
   if (!ok) return;
   try { await db.clear(); } catch (e) { /* nothing stored there */ }
   try {

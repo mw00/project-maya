@@ -2,6 +2,7 @@
 // uses: toasts, dialogs (confirmations, a text to type, the HTML preview), the theme and the chat settings.
 import {useEffect, useState} from "./preact.js";
 import {store, writeClipboard} from "./lib.js";
+import {tr} from "./i18n.js";
 
 export const S = {
   // what the server says
@@ -63,7 +64,7 @@ export function toast(kind, title, text = "", ms = 3500, action = null) {
 export function dismissToast(id) { S.toasts = S.toasts.filter((t) => t.id !== id); emit(); }
 export async function copyText(text, quiet = false) {
   await writeClipboard(text);
-  if (!quiet) toast("success", "Copied to clipboard", "", 1800);
+  if (!quiet) toast("success", tr("Copied to clipboard"), "", 1800);
 }
 
 // ------------------------------------------------------------------ dialogs
@@ -94,7 +95,7 @@ export function confirmDialog(title, body, okLabel, danger = false) {
   });
 }
 // a text to type: resolves with it, or null
-export function promptDialog({title, label = "", value = "", placeholder = "", okLabel = "Save", multiline = false, note = ""}) {
+export function promptDialog({title, label = "", value = "", placeholder = "", okLabel = tr("Save"), multiline = false, note = ""}) {
   return new Promise((ok) => {
     let answered = false;
     openDialog({title, prompt: {label, value, placeholder, multiline, note}, onClose: () => { if (!answered) ok(null); },

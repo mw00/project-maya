@@ -207,6 +207,11 @@ slowest while the caches fill with what you use.
   each GPU's memory), a context size and port you can change in Settings, and **Models**: every model set up on this
   machine, switching to another (Maya starts again with it) and each one's engine settings (context, GPUs, drafting,
   images, memory), saved into its `maya-<model>.json`.
+- **Web language:** Settings → General → Language offers English and Simplified Chinese. The choice is stored only in
+  the browser as `maya.language`; English is the fallback. Chinese covers all nine Settings sections, Monitor, model
+  management, chat/composer/answers/tools, folders/search and shared dialogs/code previews. Model responses, tool output, API data, saved
+  chats, command examples, release notes and raw diagnostics keep their original content. See
+  [Web localization coverage and checks](serve/web/I18N.md) for the page batches and validation boundaries.
 - **Models page:** the catalog lists every Maya model with its size. Download one with a progress bar, load it, unload
   the running one or delete one - no command line needed.
 - **Turbo:** one button beside the model's parameters sets the fastest settings for the model (greedy sampling, no

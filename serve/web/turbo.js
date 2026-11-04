@@ -8,6 +8,7 @@ import {api, esc, store} from "./lib.js";
 import {S, THINKING, P, confirmDialog, emit, loadPrefs, prefsKey, toast} from "./state.js";
 import {loadTime} from "./server.js";
 import {turboEnter, turboLeave} from "./turbo-core.js";
+import {tr} from "./i18n.js";
 
 S.turbo = {on: false, engine: false, plan: {}, env: {}, restarts: false, busy: false};
 
@@ -21,12 +22,12 @@ export async function loadTurbo() {
 }
 
 const snapKey = () => `turbo_${prefsKey()}`;
-const WHAT = {context: (v) => `context ${Math.round(v / 1024)}K`, parallel: () => "one answer at a time",
-              draft: (v) => `${{dspark: "DSpark", mtp: "MTP", dflash2: "DFlash2"}[v] || v} drafting`, prompt_lookup: () => "prompt lookup"};
+const WHAT = {context: (v) => tr("context {context}", {context:`${Math.round(v/1024)}K`}), parallel: () => tr("one answer at a time"),
+              draft: (v) => tr("{drafter} drafting", {drafter:{dspark:"DSpark",mtp:"MTP",dflash2:"DFlash2"}[v] || v}), prompt_lookup: () => tr("prompt lookup")};
 
 function engineLines(t) {
   const out = Object.entries(t.plan || {}).map(([k, v]) => (WHAT[k] ? WHAT[k](v.to) : `${k} ${v.to}`));
-  if (t.env && Object.keys(t.env).length) out.push("expert skipping");
+  if (t.env && Object.keys(t.env).length) out.push(tr("expert skipping"));
   return out;
 }
 
@@ -61,14 +62,14 @@ async function followRestart(on) {
     try { const r = await fetch("health", {cache: "no-store"}); h = r.ok ? await r.json() : null; } catch (e) { h = null; }
     if (!h) { down = true; continue; }
     if (down && h.status === "ok") {
-      toast("success", on ? "Turbo is on" : "Turbo is off", "Reloading the page…", 3000);
+      toast("success", on ? tr("Turbo is on") : tr("Turbo is off"), tr("Reloading the page…"), 3000);
       setTimeout(() => location.reload(), 900);
       return;
     }
   }
   S.turbo = {...S.turbo, busy: false, restarting: false};
   emit();
-  toast("error", "Maya is not back yet", "The terminal it runs in shows why. This page reconnects when it is.", 30000);
+  toast("error", tr("Maya is not back yet"), tr("The terminal it runs in shows why. This page reconnects when it is."), 30000);
 }
 
 export async function setTurbo(on) {
@@ -77,11 +78,11 @@ export async function setTurbo(on) {
   const lines = engineLines(t);
   // the engine's part restarts it: say so first (the context and the experts are loaded again)
   if (on && t.engine && t.restarts && lines.length) {
-    const ok = await confirmDialog("Switch Turbo on?",
-      `<p>Greedy decoding, no thinking and the fastest settings the engine has: <b>${esc(lines.join(", "))}</b>.</p>` +
-      `<p>Maya starts again with them, which takes ${esc(loadTime())}. Switching Turbo off puts everything back as it is now.</p>` +
-      "<ul><li>Your chats stay here; the next answer reads the chat again.</li>" +
-      "<li>Apps using the API get a “try again” until it is back.</li></ul>", "Switch Turbo on");
+    const ok = await confirmDialog(tr("Switch Turbo on?"),
+      tr("<p>Greedy decoding, no thinking and the fastest settings the engine has: <b>{settings}</b>.</p>", {settings:esc(lines.join(", "))}) +
+      tr("<p>Maya starts again with them, which takes {time}. Switching Turbo off puts everything back as it is now.</p>", {time:esc(loadTime())}) +
+      tr("<ul><li>Your chats stay here; the next answer reads the chat again.</li>") +
+      tr("<li>Apps using the API get a “try again” until it is back.</li></ul>"), tr("Switch Turbo on"));
     if (!ok) return;
   }
   S.turbo = {...t, busy: true};
@@ -93,13 +94,13 @@ export async function setTurbo(on) {
     S.turbo = {...S.turbo, ...out, busy: false};
     emit();
     if (out.restarting_now) { followRestart(on); return; }
-    toast("success", on ? "Turbo is on" : "Turbo is off",
-          out.changed ? "The engine settings apply from Maya's next start." : on ? "Greedy decoding and the fastest thinking." : "Your settings are back.", 4000);
+    toast("success", on ? tr("Turbo is on") : tr("Turbo is off"),
+          out.changed ? tr("The engine settings apply from Maya's next start.") : on ? tr("Greedy decoding and the fastest thinking.") : tr("Your settings are back."), 4000);
   } catch (e) {
     if (on) leavePrefs();                                      // (the engine said no: nothing stays half on)
     S.turbo = {...S.turbo, busy: false};
     emit();
-    toast("error", on ? "Turbo did not start" : "Turbo did not switch off", e.message, 7000);
+    toast("error", on ? tr("Turbo did not start") : tr("Turbo did not switch off"), e.message, 7000);
   }
 }
 
@@ -107,14 +108,14 @@ export async function setTurbo(on) {
 export function TurboButton() {
   const t = S.turbo;
   if (t.unavailable) return null;
-  const tip = t.on ? "Turbo ON: trades quality for maximum speed (greedy decoding, no thinking, expert skipping, aggressive drafting). Click to put your settings back."
-                   : "Turbo: trades quality for maximum speed, for benchmarks and playing with the engine. Your own settings come back when you switch it off.";
+  const tip = t.on ? tr("Turbo ON: trades quality for maximum speed (greedy decoding, no thinking, expert skipping, aggressive drafting). Click to put your settings back.")
+                   : tr("Turbo: trades quality for maximum speed, for benchmarks and playing with the engine. Your own settings come back when you switch it off.");
   return html`<button type="button" class=${`turbo${t.on ? " turbo--on" : ""}${t.busy ? " turbo--busy" : ""}`} aria-pressed=${t.on ? "true" : "false"}
       title=${tip} disabled=${t.busy} onClick=${() => setTurbo(!t.on)}>
     <svg class="turbo__flame" viewBox="0 0 24 24" aria-hidden="true">
       <path class="turbo__outer" d="M12 2c.6 3.2-1.2 4.8-2.8 6.7C7.5 10.6 6 12.4 6 15a6 6 0 0 0 12 0c0-2.2-1-3.9-2.2-5.2-.3 1.3-.9 2.1-1.8 2.6.6-3.8-.3-7.8-2-10.4z"/>
       <path class="turbo__inner" d="M12 22a3.6 3.6 0 0 0 3.6-3.6c0-1.6-1-2.6-1.9-3.6-.4 1-.9 1.5-1.5 1.8.2-1.7-.2-3.2-1.2-4.4-.3 2.1-2.6 3.1-2.6 6.2A3.6 3.6 0 0 0 12 22z"/>
     </svg>
-    <span>${t.on ? "Turbo ON" : "Turbo"}</span>
+    <span>${t.on ? tr("Turbo ON") : "Turbo"}</span>
   </button>`;
 }

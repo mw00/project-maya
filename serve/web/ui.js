@@ -3,6 +3,7 @@
 import {html, useEffect, useLayoutEffect, useRef, useState} from "./preact.js";
 import {SPRITE, ctxfmt, modelLogo} from "./lib.js";
 import {S, closeDialog, dismissToast} from "./state.js";
+import {t as translateKey, tr} from "./i18n.js";
 
 export const Icon = ({name, sm, lg, cls = ""}) => html`
   <svg class=${`st-icon${sm ? " st-icon--sm" : ""}${lg ? " st-icon--lg" : ""}${cls ? " " + cls : ""}`} aria-hidden="true">
@@ -126,9 +127,9 @@ export function Seg({options, value, onChange, label, cls = ""}) {
 // `stops` (server.js' ctxStopsIn), the size picked and "now" when it is the one the model has, the range's ends, and
 // `hint` (server.js' ctxHint) under it.  `label`: the name beside the size (empty where the row around it names it).
 export const CtxSlider = ({id, label = "Context size", value, now, stops, disabled, hint, onChange}) => html`<div class="ctx-slider">
-  <label for=${id} class="set-split"><span>${label}</span><b class="num">${ctxfmt(value)} tokens${value === now ? " · now" : ""}</b></label>
-  <input id=${id} type="range" class="range" min="0" max=${stops.length - 1} step="1" disabled=${disabled} aria-label="Context size"
-    aria-valuetext=${`${ctxfmt(value)} tokens`} value=${Math.max(0, stops.indexOf(value))} onInput=${(ev) => onChange(stops[+ev.target.value])}/>
+  <label for=${id} class="set-split"><span>${tr(label)}</span><b class="num">${tr("{context} tokens{now}", {context:ctxfmt(value),now:value === now ? tr(" · now") : ""})}</b></label>
+  <input id=${id} type="range" class="range" min="0" max=${stops.length - 1} step="1" disabled=${disabled} aria-label=${tr("Context size")}
+    aria-valuetext=${tr("{count} tokens", {count:ctxfmt(value)})} value=${Math.max(0, stops.indexOf(value))} onInput=${(ev) => onChange(stops[+ev.target.value])}/>
   <span class="set-split set-split--muted"><span>${ctxfmt(stops[0])}</span><span>${ctxfmt(stops[stops.length - 1])}</span></span>
   ${hint ? html`<span class="set-row__sub">${hint}</span>` : null}</div>`;
 
@@ -172,7 +173,7 @@ export function DialogHost() {
   return html`<div class="dialog-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) closeDialog(); }}>
     <div ref=${box} class=${`dialog${d.wide ? " dialog--wide" : ""}`} role="dialog" aria-modal="true" aria-labelledby="dialog-title" onKeyDown=${keys}>
       <div class="dialog__head"><h2 id="dialog-title">${d.title}</h2>
-        <button type="button" class="icon-btn dialog__close" aria-label="Close" onClick=${() => closeDialog()}><${Icon} name="close"/></button></div>
+        <button type="button" class="icon-btn dialog__close" aria-label=${translateKey("close", "Close")} onClick=${() => closeDialog()}><${Icon} name="close"/></button></div>
       <div class="dialog__body">
         ${d.body ? html`<div class="prose" dangerouslySetInnerHTML=${{__html: d.body}}></div>` : null}
         ${d.node ? html`<div ref=${nodeHost}></div>` : null}
@@ -186,7 +187,7 @@ export function DialogHost() {
       </div>
       ${(d.actions || []).length ? html`<div class="dialog__actions">${d.actions.map((a) => html`
         <button type="button" class=${`btn ${a.primary ? "btn--primary" : a.danger ? "btn--danger" : "btn--secondary"}`}
-          onClick=${() => act(a)}>${a.label}</button>`)}</div>` : null}
+          onClick=${() => act(a)}>${a.label === "Cancel" ? tr("Cancel") : a.label}</button>`)}</div>` : null}
     </div></div>`;
 }
 
@@ -197,6 +198,6 @@ export const Toasts = () => html`<div class="toasts" aria-live="polite">${S.toas
     <${Icon} name=${TOAST_ICON[t.kind] || "info"}/>
     <div class="toast__text"><b>${t.title}</b>${t.text ? html`<span>${t.text}</span>` : null}</div>
     ${t.action ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => { t.action.run(); dismissToast(t.id); }}>${t.action.label}</button>` : null}
-    <button type="button" class="icon-btn icon-btn--sm toast__x" aria-label="Dismiss" title="Dismiss"
+    <button type="button" class="icon-btn icon-btn--sm toast__x" aria-label=${translateKey("close", "Dismiss")} title=${translateKey("close", "Dismiss")}
       onClick=${() => dismissToast(t.id)}><${Icon} name="close" sm/></button>
   </div>`)}</div>`;
