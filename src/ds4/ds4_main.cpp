@@ -1,4 +1,5 @@
 #include "ds4_grammar.hpp"
+#include "ds4_grammar_path.hpp"
 // src/ds4/ds4_main.cpp - maya-ds4: DeepSeek-V4.1-Flash on Maya.
 //
 //   maya-ds4 --pack <model>/maya-ds4 --ids 0,128803,... --n 16          greedy tokens after the ids
@@ -539,7 +540,8 @@ struct Req {
     long long tail = -1;
     // logprobs=<k> (0 .. 20; the server's OpenAI logprobs / top_logprobs): after each T line an LP line - the token's
     // logprob and its row's k most likely (ds4_logprobs.hpp); -1: none, the request exactly as without
-    std::string grammar_path, grammar_after, grammar_prefix;
+    std::string grammar_path, grammar_after, grammar_prefix, grammar_hex;
+    bool has_grammar_hex = false;
     std::shared_ptr<Grammar> grammar;
     int logprobs = -1;
     // logit_bias=<id>:<bias>,... (OpenAI's logit_bias; the server's ignore_eos bans the end tokens with -100): added to
@@ -649,6 +651,7 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         }
         const std::string k = tok.substr(0, eq), v = tok.substr(eq + 1);
         if (k == "grammar") r.grammar_path = v;
+        else if (k == "grammar_hex") { r.grammar_hex = v; r.has_grammar_hex = true; }
         else if (k == "grammar_after") r.grammar_after = v;
         else if (k == "grammar_prefix") r.grammar_prefix = v;
         else if (k == "temperature") r.temperature = std::strtof(v.c_str(), nullptr);
@@ -747,11 +750,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::printf("INFO logprobs=%d\n", strata::ds4::kTopLogprobs);   // (GEN logprobs=<k>: LP lines, k at most this)
     std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
 #ifdef MAYA_DS4_GRAMMAR
-    std::printf("INFO grammar=1 grammar_replay=1\n");
+    std::printf("INFO grammar=1 grammar_replay=1 grammar_hex=1\n");
 #endif
     std::unique_ptr<GrammarVocabulary> grammar_vocab;
     const auto prepare_grammar = [&](Req & r) {
         try {
+            if (r.has_grammar_hex) {
+                if (!r.grammar_path.empty()) throw std::runtime_error("grammar and grammar_hex are mutually exclusive");
+                r.grammar_path = ds4_decode_grammar_path(r.grammar_hex);
+            }
             if (r.grammar_path.empty() && r.grammar_after.empty() && r.grammar_prefix.empty()) return true;
             if (r.grammar_path.empty()) throw std::runtime_error("grammar replay/after requires grammar");
             const auto id_of = [&](const std::string & text) {

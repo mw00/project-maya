@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <memory>
@@ -117,7 +118,7 @@ public:
     }
     void init(const llama_vocab * v, const std::string & path, int trigger, Caches & caches, int end_token = -1) {
         if (path.empty()) throw std::runtime_error("grammar path required");
-        std::ifstream file(path, std::ios::binary);
+        std::ifstream file(std::filesystem::u8path(path), std::ios::binary);
         if (!file) throw std::runtime_error("cannot read grammar file");
         const std::string text((std::istreambuf_iterator<char>(file)), {});
         init_text(v, text, trigger, caches, end_token);
@@ -178,7 +179,7 @@ public:
     explicit GrammarVocabulary(const std::string & pack) {
         using json = nlohmann::json;
         const auto read = [&](const std::string & name) {
-            std::ifstream f(pack + "/tokenizer/" + name);
+            std::ifstream f(std::filesystem::u8path(pack + "/tokenizer/" + name));
             if (!f) throw std::runtime_error("cannot read grammar tokenizer " + name);
             return json::parse(f);
         };
@@ -195,7 +196,7 @@ public:
             seen[id] = true; tokens[id] = it.key();
         }
         for (const auto & t : types) token_types.push_back(t.get<int32_t>());
-        std::ifstream mf(pack + "/tokenizer/merges.txt");
+        std::ifstream mf(std::filesystem::u8path(pack + "/tokenizer/merges.txt"));
         if (!mf) throw std::runtime_error("cannot read grammar tokenizer merges");
         std::string line;
         while (std::getline(mf, line)) if (!line.empty() && line[0] != '#') merges.push_back(line);
