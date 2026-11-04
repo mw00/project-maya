@@ -242,6 +242,21 @@ def index_standalone(src, out, model: Model, compat_bf16: bool = False, arch: st
                         return 1
                     raw = (u >> 16).astype(np.uint16).tobytes()     # the exact BF16 values
                     kind = "4"
+                if arch == "qwen4exp" and t.type_name == "BF16" and t.name.endswith("ple_conv1d.weight"):
+                    # the engine's PLE conv reads F16 (ple.cu conv1d_f16); unsloth's GGUFs store it as BF16.  BF16's
+                    # 8-bit mantissa fits F16's 11 bits, so normal values carry over exactly; only the ones below F16's
+                    # normal range (|w| < 2^-14, F16 subnormals: unsloth's file has ~100 of 40960, all < 1e-5) round,
+                    # as llama.cpp's own F16 conversion rounds them.  Anything else is refused.
+                    f = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
+                    h = f.astype(np.float16)
+                    off = h.astype(np.float32) != f
+                    if np.any(off & (np.abs(f) >= 2.0 ** -14)) or not np.isfinite(h).all():
+                        print("%s: BF16 values that F16 cannot hold; the engine's PLE conv is F16" % t.name)
+                        return 1
+                    raw = h.tobytes()
+                    kind = "5"
+                    converted.append({"name": t.name, "source_type": "BF16", "bytes": len(raw),
+                                      "to": "F16", "rounded_subnormals": int(off.sum())})
                 rows.append([t.name, "0", kind, str(at), str(len(raw)), "0", str(len(raw)), str(ne0), str(ne1),
                              "0", "0", "1"] + ["0"] * 7)
                 fo.write(raw)
