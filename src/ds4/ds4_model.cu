@@ -5410,10 +5410,10 @@ struct Model::Impl {
                 c.ring_stride = stride;
                 if (rm == nullptr || rm[0] == '\0') {
                     const double link = link_h2d(d);
-                    // (MAYA_DS4_RING_FAST_LINK=1: the one-a-batch rule only under 8 GB/s - opt-in, the ring's room is VRAM experts')
+                    // (the one-a-batch rule only under 8 GB/s; MAYA_DS4_RING_FAST_LINK=0: on any link, as before)
                     static const bool fast_link = [] {
                         const char* v = ds4_env("DS4_RING_FAST_LINK");
-                        return v != nullptr && std::atoi(v) != 0;
+                        return v == nullptr || std::atoi(v) != 0;
                     }();
                     c.ring_n = ring_slots(link, stride, room, Chunk::kParts, fast_link ? kRingSlowBps : 1e300);
                     std::fprintf(stderr, "ds4: CUDA%d prompt ring: %d slots of %.1f MB, %d a batch (%.0f MB) for its "
@@ -6929,11 +6929,12 @@ struct Model::Impl {
     // the blocks go, the lead the fewest) where the GPUs cannot hold every expert - on the lead alone they took its
     // room, and since a group's members hold the same trunk experts the other members' room went unused (3x V100,
     // EXL3 2.9 bpw, tensor parallel 2 + one GPU, 3 blocks: 7.3 GB idle on member 1; 0,1,1 read 2K / 8K / 32K prompts
-    // +4 / +2 / +3% faster, decode the same).  Opt-in (MAYA_DS4_DRAFT_SPREAD=1): it moves which experts are in VRAM,
-    // and an EXL3 pack's sums follow that.  Where every expert fits, or unset: on the lead, as before
+    // +4 / +2 / +3% faster, decode the same).  It moves which experts are in VRAM, and an EXL3 pack's sums follow that:
+    // the answers can move slightly, the quality vs the full-precision model the same (KLD within noise).  Where every
+    // expert fits, or MAYA_DS4_DRAFT_SPREAD=0: on the lead, as before
     bool draft_spread() {
         if (g.n_mtp < 2 || ds4_env("DS4_DRAFT_GPU") != nullptr) return true;
-        if (const char* s = ds4_env("DS4_DRAFT_SPREAD"); s == nullptr || std::atoi(s) == 0) return true;
+        if (const char* s = ds4_env("DS4_DRAFT_SPREAD"); s != nullptr && std::atoi(s) == 0) return true;
         const Group& G = groups[(size_t) L[(size_t) g.nl].grp];
         const int nm = (int) G.mem.size();
         if (nm < 2) return true;
@@ -6955,8 +6956,8 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i)
             where += std::string(i ? ", " : "") + std::to_string(i) + " on CUDA" +
                      std::to_string(devs[(size_t) G.mem[(size_t) draft_dev[(size_t) i]]].id);
-        std::fprintf(stderr, "ds4: MAYA_DS4_DRAFT_SPREAD: DSpark blocks spread over the drafter's group (the experts do "
-                             "not all fit the GPUs): block %s\n", where.c_str());
+        std::fprintf(stderr, "ds4: DSpark blocks spread over the drafter's group (the experts do not all fit the GPUs): "
+                             "block %s (MAYA_DS4_DRAFT_SPREAD=0: all on the lead)\n", where.c_str());
         return true;
     }
     bool draft_devs(std::string& err) {
