@@ -941,6 +941,10 @@ def hip_clang(root: Path) -> Path | None:
     slots = sorted((root / "lib" / "llvm").glob(f"*/bin/{exe}"),
                    key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)],
                    reverse=True) if not WIN else []
+    # Debian/Ubuntu's own ROCm packages: hipcc drives the distribution's LLVM, /usr/lib/llvm-<N>/bin
+    slots += sorted((root / "lib").glob(f"llvm-[0-9]*/bin/{exe}"),
+                    key=lambda p: [int(x) for x in re.findall(r"\d+", p.parent.parent.name)],
+                    reverse=True) if not WIN else []
     return next((p for p in (root / "llvm" / "bin" / exe, root / "lib" / "llvm" / "bin" / exe,
                              root / "lib64" / "rocm" / "llvm" / "bin" / exe, *slots, root / "bin" / exe)
                  if p.exists()), None)
@@ -1201,20 +1205,26 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         root = root.resolve()
         clang = hip_clang(root)
         if (clang is None or clang.parent == root / "bin"
-                or not any(list((root / d).glob("libhipblas.so*")) for d in ("lib", "lib64"))):
+                or not any(list((root / d).glob("libhipblas.so*"))
+                           for d in ("lib", "lib64", *(q.relative_to(root) for q in (root / "lib").glob("*-linux-gnu"))))):
             fail("ROCm's HIP compiler and hipBLAS are required", "install ROCm 7, or set ROCM_PATH to its root")
         if tool_version(str(root / "bin/hipcc")) < (7, 0):
-            fail("Maya's HIP port requires ROCm 7 or newer")
+            if os.environ.get("MAYA_HIP_ALLOW_ROCM6") != "1":
+                fail("Maya's HIP port requires ROCm 7 or newer",
+                     "or set MAYA_HIP_ALLOW_ROCM6=1 to try a ROCm 6.x (untested, e.g. a distribution's packages)")
+            warn("ROCm older than 7 (MAYA_HIP_ALLOW_ROCM6=1): untested, the build or the engine may fail")
         if not shutil.which("c++"):
             fail("a C++ compiler is needed", "Ubuntu/Debian: sudo apt install build-essential")
     cpu, avx2, avx512 = S.cpu_info()
     if not avx2:
-        fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
+        # as on CUDA (#32): the CPU expert lane falls back to ggml's own kernels (src/kernels/cpu/expert_layout.cpp)
+        warn(f"the CPU ({cpu}) has no AVX2: the engine runs, its CPU expert lane on ggml's own kernels (slower). "
+             "MAYA_GLM_CPU_LANE=0 turns it off")
     total, avail = mem_gb()
     split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
     ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; HIP, {split}" +
        (", text only" if text_only else ""))
-    ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
+    ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
     if any(hip_unified_memory(g) for g in chosen) and WIN:
         # Windows gives the APU's GPU a fixed carve-out, which it does not count as RAM: the engine sizes the pool
@@ -2055,6 +2065,12 @@ def hip_toolchain(pc: dict) -> tuple:
     env.setdefault("CCACHE_DIR", str(BUILD / ".ccache"))
     if WIN:
         env["HIP_DEVICE_LIB_PATH"] = str(clang.parent.parent / "amdgcn" / "bitcode")
+    elif not (root / "amdgcn" / "bitcode").is_dir() and "HIP_DEVICE_LIB_PATH" not in env:
+        # Debian/Ubuntu's rocm-device-libs-<N>: the bitcode sits in the LLVM's clang resource folder
+        # (/usr/lib/llvm-<N>/lib/clang/<N>/amdgcn/bitcode), not under ROCM_PATH, where clang looks with ROCM_PATH set
+        found = sorted(clang.parent.parent.glob("lib/clang/*/amdgcn/bitcode"))
+        if found:
+            env["HIP_DEVICE_LIB_PATH"] = str(found[-1])
     return root, clang, bindir, env
 
 
