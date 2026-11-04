@@ -6,7 +6,8 @@
 //   nvcc -O3 -std=c++17 -arch=native -I include -I src/ds4 tests/ds4_index_score_tc.cu src/ds4/ds4_kernels.cu \
 //        src/ds4/ds4_host_ar.cpp -Xcompiler -mavx2,-mfma,-mf16c -o build/ds4_index_score_tc
 //   (or with CMake, CUDA or HIP: cmake --build build --target ds4_index_score_tc; on RDNA 3 the WMMAs' kernel)
-//   DS4_INDEX_TC=1 build/ds4_index_score_tc   (the engine's default is the CUDA cores' kernel)
+//   DS4_INDEX_TC=1 build/ds4_index_score_tc   (CUDA: the engine's default is the CUDA cores' kernel; RDNA 3 / 3.5:
+//   the WMMAs' by default, DS4_INDEX_TC=0 off)
 #include "ds4_kernels.cuh"
 
 #include <algorithm>

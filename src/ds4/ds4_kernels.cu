@@ -4052,9 +4052,25 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
         return;
     }
     if (n <= 0) return;
-    // (opt-in, DS4_INDEX_TC=1: its sums differ from the CUDA cores' in the last bits - perplexity the same, 7.5366 on
-    // 4 x 1024 tokens, but a long greedy run's tokens part after a while)
-    static const bool tc_ok = std::getenv("DS4_INDEX_TC") != nullptr && std::atoi(std::getenv("DS4_INDEX_TC")) != 0;
+    // The tensor cores' kernel (RDNA 3 / 3.5: its WMMAs) sums the same exact products in another order than the CUDA
+    // cores' one: the last bits differ and a long greedy run's tokens part after a while, the quality is the same
+    // (perplexity 7.5366 both on 4 x 1024 tokens; Strix Halo, DeepSeek EXL3 2.25: KL to the full-precision model 0.1649
+    // against 0.1661, the same top token 91.08 / 91.07%) and long prompts read faster (+3 / +6 / +10% at 8K / 32K / 64K).
+    // HIP: on by default on gfx11 (other archs keep the CUDA cores' kernel), DS4_INDEX_TC=0 turns it off.
+    // CUDA: opt-in, DS4_INDEX_TC=1 (compute capability 8.0+).
+    static const int tc_env = [] {
+        const char* e = std::getenv("DS4_INDEX_TC");
+        return e == nullptr ? -1 : std::atoi(e) != 0 ? 1 : 0;
+    }();
+#if defined(STRATA_USE_HIP)
+    static const bool tc_ok = tc_env != 0;
+    if (tc_env == 0 && tc && kfmt == kKvFp4p) {
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true)) std::fprintf(stderr, "ds4: the indexer's scores on the CUDA cores' kernel (DS4_INDEX_TC=0)\n");
+    }
+#else
+    static const bool tc_ok = tc_env == 1;
+#endif
     if (tc && tc_ok && kfmt == kKvFp4p) {   // (the tensor cores: a block a tile, looping, ~2 blocks an SM)
         static std::atomic<uint64_t> opted{0}, capable{0};   // (capable: compute capability 8.0+, CUDA - mma's int8; gfx11)
         static int sms[64] = {};
@@ -4075,9 +4091,12 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
             }
 #else
             (void) major;
-            cudaDeviceProp p{};   // (RDNA 3: the same kernel on its WMMAs - its shared memory below 64 KB, no opt-in)
-            if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0)
+            cudaDeviceProp p{};   // (RDNA 3: the same kernel on its WMMAs - its shared memory below 64 KB, no attribute)
+            if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0) {
                 capable.fetch_or(1ull << dev);
+                std::fprintf(stderr, "ds4: GPU%d (%s) the indexer's scores on the WMMAs (%s; DS4_INDEX_TC=0: off)\n", dev,
+                             p.gcnArchName, tc_env == 1 ? "DS4_INDEX_TC=1" : "the default on RDNA 3");
+            }
 #endif
             cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);
             opted.fetch_or(1ull << dev);

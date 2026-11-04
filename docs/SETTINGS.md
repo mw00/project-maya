@@ -2052,6 +2052,20 @@ The switch quantizes both the prompt activations and the FP16 SwiGLU intermediat
 This approximate prompt path can change answers; it is off by default. It uses a separate workspace for each
 host thread, device and stream, and keeps the existing path during graph capture.
 
+## DeepSeek: the indexer's scores on the matrix cores
+
+The sparse attention's indexer scores every earlier position of the context for each new row (prompt and answer).
+On RDNA 3 / 3.5 (`gfx11`: RX 7000, Radeon 780M, Strix Halo's 8060S / 8065S) these scores run on the WMMAs by
+default: the same exact products, summed in another order than the portable kernel, so the last bits differ and a
+long greedy answer can part from the other kernel's after a while; the quality is the same (Strix Halo, DeepSeek EXL3
+2.25: KL to the full-precision model 0.1649 against 0.1661, the same top token 91.08% against 91.07%) and long
+prompts read faster (+3% at 8K, +6% at 32K, +10% at 64K; answers the same speed). RDNA 4 (`gfx12`) and other AMD
+cards keep the portable kernel. On NVIDIA it stays opt-in.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `DS4_INDEX_TC` | on for AMD `gfx11`; off on NVIDIA | `0`: the portable kernel on AMD too (the log says so). `1` on NVIDIA (compute capability 8.0+): the tensor cores' kernel (int8 MMAs) |
+
 ## Qwen-3.8-Flash-Next (CYBER-FROST)
 
 `./maya.sh --setup --model cyber-frost` sets up Qwen-3.8-Flash-Next (CYBER-FROST): peasantsmith's GGUF of Blackfrost-AI's
