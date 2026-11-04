@@ -24,6 +24,7 @@ import json
 import os
 import platform
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -703,15 +704,91 @@ def win_gpu_reading(values, luid):
     return out
 
 
+HIP_BIN_DIRS: list = []   # the engine's ROCm DLL folders (the config's lib_dirs): the server sets them for HIP
+
+
+def parse_hipinfo_buses(text: str) -> dict:
+    """{HIP device index: PCI bus number} from ROCm's hipInfo output (its "device#" and "pciBusID" lines)."""
+    found, dev = {}, None
+    for line in text.splitlines():
+        key, _, val = line.strip().partition(":")
+        if key.startswith("device#"):
+            m = re.search(r"\d+", line)
+            dev = int(m.group()) if m else None
+        elif key.strip() == "pciBusID" and dev is not None and val.strip().isdigit():
+            found[dev] = int(val.strip())
+    return found
+
+
+_HIP_BUSES = None
+
+
+def _hip_buses():
+    """{HIP device index: PCI bus} from the hipInfo of the ROCm the engine runs on (HIP_BIN_DIRS), every GPU visible:
+    the numbering of the config's "gpu" and HIP_VISIBLE_DEVICES. {} without one. Asked once (once there is one)."""
+    global _HIP_BUSES
+    if _HIP_BUSES is None:
+        exe = next((os.path.join(d, "hipInfo.exe") for d in HIP_BIN_DIRS
+                    if os.path.isfile(os.path.join(d, "hipInfo.exe"))), None)
+        if not exe:
+            return {}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}
+        env["PATH"] = os.pathsep.join(HIP_BIN_DIRS + [env.get("PATH", "")])
+        try:
+            text = subprocess.run([exe], capture_output=True, text=True, timeout=60, env=env,
+                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            text = ""
+        _HIP_BUSES = parse_hipinfo_buses(text)
+    return _HIP_BUSES
+
+
+def _adapter_bus(luid_high, luid_low):
+    """The PCI bus number of the display adapter with this LUID (D3DKMTOpenAdapterFromLuid, then
+    D3DKMTQueryAdapterInfo with KMTQAITYPE_ADAPTERADDRESS); None when it cannot be asked."""
+    class Open(ctypes.Structure):                        # D3DKMT_OPENADAPTERFROMLUID
+        _fields_ = [("LuidLow", ctypes.c_uint32), ("LuidHigh", ctypes.c_int32), ("hAdapter", ctypes.c_uint32)]
+
+    class Query(ctypes.Structure):                       # D3DKMT_QUERYADAPTERINFO
+        _fields_ = [("hAdapter", ctypes.c_uint32), ("Type", ctypes.c_int), ("pPrivateDriverData", ctypes.c_void_p),
+                    ("PrivateDriverDataSize", ctypes.c_uint)]
+
+    class Address(ctypes.Structure):                     # D3DKMT_ADAPTERADDRESS
+        _fields_ = [("BusNumber", ctypes.c_uint), ("DeviceNumber", ctypes.c_uint), ("FunctionNumber", ctypes.c_uint)]
+
+    try:
+        gdi = ctypes.windll.gdi32
+        o = Open(luid_low & 0xFFFFFFFF, ctypes.c_int32(luid_high).value, 0)
+        if gdi.D3DKMTOpenAdapterFromLuid(ctypes.byref(o)) != 0:
+            return None
+        try:
+            a = Address()
+            q = Query(o.hAdapter, 6, ctypes.cast(ctypes.byref(a), ctypes.c_void_p), ctypes.sizeof(a))  # 6: ADAPTERADDRESS
+            return a.BusNumber if gdi.D3DKMTQueryAdapterInfo(ctypes.byref(q)) == 0 else None
+        finally:
+            gdi.D3DKMTCloseAdapter(ctypes.byref(ctypes.c_uint32(o.hAdapter)))
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 class _WinGpu:
     """An AMD card on Windows (the HIP backend), with _Amd's interface: the name and total memory from DXGI, the load
     and memory used from Windows' GPU performance counters (_Pdh). No temperature, power or PCIe link (Windows has no
-    such counters for it). `index` counts the AMD adapters in DXGI's order. Every failure leaves ok() False."""
+    such counters for it). `index` is HIP's number (the config's "gpu", as HIP_VISIBLE_DEVICES takes it): the card is
+    the AMD adapter on the PCI bus that hipInfo gives that number, as HIP's and DXGI's orders can differ (a card HIP
+    does not run on - a gfx906 next to gfx1030 under ROCm 7 - is still a DXGI adapter); DXGI's order only when hipInfo
+    cannot be asked. Every failure leaves ok() False."""
     VENDOR_AMD = 0x1002
 
-    def __init__(self, index=0, adapters=None, pdh=None):
+    def __init__(self, index=0, adapters=None, pdh=None, buses=None, bus_of=None):
         amd = [a for a in (_dxgi_adapters() if adapters is None else adapters) if a[1] == self.VENDOR_AMD]
-        self.card = amd[index] if 0 <= index < len(amd) else None
+        buses = (_hip_buses() if adapters is None else {}) if buses is None else buses
+        if buses:
+            bus, bus_of = buses.get(index), bus_of or _adapter_bus
+            self.card = next((a for a in amd if bus is not None and bus_of(a[3], a[4]) == bus), None)
+        else:
+            self.card = amd[index] if 0 <= index < len(amd) else None
         self.pdh = pdh if pdh is not None or self.card is None else _Pdh()
         self.luid = "luid_0x%08x_0x%08x" % (self.card[3], self.card[4]) if self.card else None
 
