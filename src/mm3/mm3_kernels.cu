@@ -1249,6 +1249,17 @@ __global__ void add_kernel(float* x, const float* a, size_t n) {
         x[i] += a[i];
 }
 
+// (--ablate) row blockIdx.x of y loses its component along r: y -= scale * r (r . y)
+__global__ void __launch_bounds__(1024) project_out_kernel(float* __restrict__ y, const float* __restrict__ r,
+                                                           float scale, int D) {
+    __shared__ float red[33];
+    y += (size_t) blockIdx.x * D;
+    float dot = 0.0f;
+    for (int e = threadIdx.x; e < D; e += blockDim.x) dot = fmaf(r[e], y[e], dot);
+    const float a = scale * block_sum(dot, red);
+    for (int e = threadIdx.x; e < D; e += blockDim.x) y[e] -= a * r[e];
+}
+
 unsigned grid_for(size_t n) { return (unsigned) std::min<size_t>(4096, (n + 255) / 256); }
 
 // one warp a weight row: lane l takes the row's values l, l + 32, l + 64 ... into one F32 sum in that order, then
@@ -2451,6 +2462,12 @@ void add(float* x, const float* a, size_t n, cudaStream_t s) {
     if (n == 0) return;
     add_kernel<<<grid_for(n), 256, 0, s>>>(x, a, n);
     check("add");
+}
+
+void project_out(float* y, const float* r, float scale, int T, int D, cudaStream_t s) {
+    if (T <= 0) return;
+    project_out_kernel<<<T, 1024, 0, s>>>(y, r, scale, D);
+    check("project_out");
 }
 
 namespace {

@@ -1,7 +1,8 @@
 // tests/mm3_kernels_test.cu - maya-mm3's MSA, candidate and sampling kernels on one GPU against references:
 //   block_scores / select_blocks vs a CPU reference (the same bits), a NaN query's kept list (no crash);
 //   sparse_attn split 16 ways vs one block vs an F64 reference, and INT8 K / V with and without the rotation vs BF16;
-//   topk_rows vs host_cands (the same lists); markov_sample's distribution and draw; wait_pull.
+//   topk_rows vs host_cands (the same lists); markov_sample's distribution and draw; wait_pull; project_out (--ablate)
+//   vs an F64 reference.
 //     nvcc -O2 -std=c++17 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_120,code=sm_120 -Isrc/mm3 \
 //          tests/mm3_kernels_test.cu src/mm3/mm3_kernels.cu -o build/mm3_kernels_test && build/mm3_kernels_test
 #include <cmath>
@@ -488,6 +489,40 @@ int main() {
         for (int i = 0; i < 16 * 6144; ++i) same &= h[(size_t) i] == (float) i;
         check(waited && same, "waits for the counter, then the rows are the host's");
     }
+    std::printf("project_out (--ablate)\n");
+    for (int D : {8, 1000, 6144})   // (one block's lanes, a partial last pass, the model's width)
+        for (int T : {1, 3, 64})
+            for (float s : {1.0f, 1.5f}) {
+                std::vector<float> r((size_t) D), y((size_t) T * D);
+                double nn = 0.0;
+                for (float& v : r) {
+                    v = nd(rng);
+                    nn += (double) v * v;
+                }
+                for (float& v : r) v = (float) (v / std::sqrt(nn));
+                for (float& v : y) v = nd(rng);
+                float* rd = dev(r);
+                float* yd = dev(y);
+                k::project_out(yd, rd, s, T, D, 0);
+                cudaDeviceSynchronize();
+                const auto got = host(yd, y.size());
+                double worst = 0.0, along = 0.0;
+                for (int t = 0; t < T; ++t) {
+                    double dot = 0.0, dot2 = 0.0;
+                    for (int e = 0; e < D; ++e) dot += (double) r[(size_t) e] * y[(size_t) t * D + e];
+                    for (int e = 0; e < D; ++e) {
+                        const double want = y[(size_t) t * D + e] - s * dot * r[(size_t) e];
+                        worst = std::max(worst, std::fabs(got[(size_t) t * D + e] - want));
+                        dot2 += (double) r[(size_t) e] * got[(size_t) t * D + e];
+                    }
+                    along = std::max(along, std::fabs(dot2 - (1.0 - s) * dot));   // (s 1: none left; above 1: -0.5 r.y)
+                }
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "D %d, T %d, scale %.1f: within 1e-4 of F64, r.y' = (1 - s) r.y", D, T, s);
+                check(cudaGetLastError() == cudaSuccess && worst < 1e-4 && along < 1e-3, buf);
+                cudaFree(rd);
+                cudaFree(yd);
+            }
     std::printf("%s\n", fails ? "FAILED" : "OK");
     return fails ? 1 : 0;
 }

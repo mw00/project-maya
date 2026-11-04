@@ -67,6 +67,11 @@ struct Options {
     // --parallel: conversations at once - a KV cache (and index-key cache) each, the context's room for every one of
     // them (more than 1: no KV streaming, no DSpark draft, the layer split)
     int seqs = 1;
+    // --ablate (mm3_ablate.hpp): a direction projected out of every residual write - its file (empty: off), the
+    // control vector's direction.N (0: a one-direction file's) and the scale (0: 1)
+    std::string ablate;
+    int ablate_layer = 0;
+    float ablate_scale = 0.0f;
     bool verbose = false;
 };
 
