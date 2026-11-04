@@ -353,9 +353,11 @@ function Savings() {
 }
 
 // ------------------------------------------------------------------ About and updates
-// supporting Maya (GitHub Sponsors): a link beside an update, and one line on About when no update is shown
-const Support = () => html`<a class="btn btn--ghost btn--sm support-link" href=${SUPPORT_URL} target="_blank" rel="noopener"
-  title="Support Maya on GitHub Sponsors"><${Icon} name="heart" sm/>Support Maya</a>`;
+// supporting Maya (GitHub Sponsors): one warm line, never a popup - on About, and as a row of its own under an update's
+// button (a little more visible there, still only where the update shows)
+const SupportLine = ({cls = "set-support"}) => html`<p class=${cls}><${Icon} name="heart" sm/><span>Maya is free and open, made by one
+  person with help from a small community. If it makes your work a little easier,${" "}<a class="support-link" href=${SUPPORT_URL}
+  target="_blank" rel="noopener" title="Sponsor Maya on GitHub">sponsoring it</a>, in any amount, helps it keep growing. Thank you.</span></p>`;
 function UpdateCard() {
   const u = S.update, w = S.updateWatch;
   if (!w && (!u || !u.enabled)) return null;
@@ -380,8 +382,7 @@ function UpdateCard() {
     title = `Project Maya v${latest.version} is out`;
     text = latest.summary || "";
     if (!u.can_update) how = `Update by hand: ${u.by_hand}. This page can't, because ${u.blocker}.`;
-    // (beside the update, a quiet ask: a link, never a popup)
-    acts = html`<${Support}/>${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>Update to v${latest.version}</button>` : null}`;
+    acts = html`${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>Update to v${latest.version}</button>` : null}`;
   } else if (u.error) {
     icon = "warning";
     title = "Couldn't check for updates";
@@ -397,7 +398,8 @@ function UpdateCard() {
   }
   return html`<div class=${`update${tone ? ` update--${tone}` : ""}`} aria-live="polite"><${Icon} name=${icon}/>
     <span class="update__text"><b>${title}</b>${text ? html`<span>${text}</span>` : null}${how ? html`<span class="update__how">${how}</span>` : null}</span>
-    ${acts ? html`<span class="update__acts">${acts}</span>` : null}</div>`;
+    ${acts ? html`<span class="update__acts">${acts}</span>` : null}
+    ${u && u.newer && !w && !(state && state.state) ? html`<${SupportLine} cls="update__support"/>` : null}</div>`;
 }
 // "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
 function gpuNames(name, count) {
@@ -471,8 +473,7 @@ function About() {
   const newer = S.update && S.update.newer && !S.updateWatch;   // (then the ask is beside the update instead)
   return html`<${Head} title="About and updates"/>
     <${UpdateCard}/>
-    ${newer ? null : html`<p class="set-support">Maya is free and open. If it helps you, you can
-      ${" "}<a class="support-link" href=${SUPPORT_URL} target="_blank" rel="noopener" title="Support Maya on GitHub Sponsors">support it<${Icon} name="heart" sm/></a></p>`}
+    ${newer ? null : html`<${SupportLine}/>`}
     <${Group} cap="This server"><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
     <${Group}>
     <div class="set-row set-row--top">

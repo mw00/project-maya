@@ -36,6 +36,14 @@
 .mon__top { display: flex; flex-wrap: wrap; gap: 16px; }
 .card--wide { flex: 2 1 520px; gap: 14px; }
 .card--side { flex: 1 1 300px; }
+/* a desktop: Right now as tall as Throughput beside it, no blank - its figures an inset filling the rest of the card, each
+   label over its value as Throughput's stats are, spread over the height */
+@media (min-width: 768px) {
+  .card--side .kv { flex: 1; grid-template-columns: minmax(0, 1fr); align-content: space-between; gap: 4px; padding: 14px 16px;
+                    border-radius: var(--st-r-md); background: var(--st-inset); font-size: var(--st-fs-sm); }
+  .card--side .kv dd { margin: -2px 0 6px; text-align: left; font-size: var(--st-fs-xl); letter-spacing: -.01em; }
+  .card--side .kv dd:last-child { margin-bottom: 0; }
+}
 .speeds { display: flex; align-items: flex-end; gap: 36px; flex-wrap: wrap; }
 .speed { display: flex; flex-direction: column; gap: 2px; }
 .speed__label { display: flex; align-items: center; gap: 6px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
@@ -186,15 +194,17 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
   .mon__page { padding: calc(78px + max(10px, env(safe-area-inset-top))) 16px 40px; gap: 16px; }
   .card { padding: 16px; }
   .tp .stats { padding: 12px 14px; gap: 12px 16px; }
-  .speed__big { font-size: 40px; }
-  .speeds { row-gap: 14px; flex-wrap: nowrap; justify-content: space-between; gap: 16px; }
-  /* Decode and Prefill side by side; the peak a small line under Decode */
-  .speed__row { flex-direction: column; align-items: flex-start; gap: 2px; }
-  .speed__mid { font-size: 26px; }
-  /* the three one-line figures side by side, the taller Speculation on its own row: no blank under a short one */
-  .stats { grid-template-columns: repeat(3, auto); justify-content: space-between; column-gap: 8px; }
+  /* Decode and Prefill as two equal columns sharing three rows (label, figure, Decode's peak): the labels, the figures
+     (one size, one baseline) and their units line up whatever the numbers' widths or a label on two lines */
+  .speeds { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-template-rows: auto auto auto; gap: 0 16px; }
+  .speed { display: grid; grid-row: span 3; grid-template-rows: subgrid; gap: 0; min-width: 0; }
+  .speed__label { align-self: end; align-items: flex-start; line-height: 1.35; }
+  .speed__label .key { margin-top: .6em; }
+  .speed__row { display: contents; }
+  .speed__big, .speed__mid { margin-top: 4px; font-size: clamp(28px, 8.4vw, 36px); letter-spacing: -.02em; line-height: 1.1; white-space: nowrap; }
+  .speed__big small, .speed__mid small { margin-left: 4px; font-size: var(--st-fs-sm); }
+  .speed__peak { margin-top: 2px; }
   .stats .stat__label { white-space: nowrap; }
-  .stat--spec { grid-column: 1 / -1; }
   .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
   .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }
