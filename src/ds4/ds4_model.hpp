@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 
+class Grammar;
 namespace strata::ds4 {
 
 struct Options {
@@ -194,6 +195,7 @@ public:
     /// verify() and verify_multi() alike: each bias is added to its token's logit before the penalties and the
     /// request's sampling (-100 bans the token).  The drafter's own proposals are not biased; the verify judges them
     /// by the biased logits.  Empty: none, the picks exactly as without.
+    void set_grammar(Grammar * grammar);
     void set_logit_bias(const std::vector<std::pair<int, float>>& entries);
     /// The request's log-probabilities (GEN logprobs=<k>, ds4_logprobs.hpp) for every pick after this - sample(),
     /// sample_multi(), verify() and verify_multi() alike: logprobs() then holds a row for each token the pick returned

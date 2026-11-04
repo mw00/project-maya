@@ -1766,3 +1766,5 @@ endif()
 
 # the glm-dsa (GLM-5.3) sources and tests, kept in their own file
 include(cmake/glm_dsa.cmake OPTIONAL)
+
+include(cmake/ds4_grammar.cmake)
