@@ -1,9 +1,10 @@
 // serve/web/settings.js - the Settings dialog, its pages in five groups: General (Appearance and behaviour; Chat defaults:
-// the running model's context size, sampling, thinking, shared with other apps; Global instructions), Integrations
-// (Connection: the model's name, the API key, the port; the OpenAI API; the Anthropic API; MCP tools), Usage (the API prices
-// the sidebar's Saved counts with), Privacy (Data) and About (updates).  A change applies at once; the two that restart
-// the model (the context size, the port) ask first.  Each page is inset groups of rows (the grouped look); on a phone
-// the dialog opens on the list of pages and a page has a way back to it.
+// the running model - its context size, also on the Models page's Engine settings, and the port - sampling, thinking,
+// shared with other apps; Global instructions), Integrations (Connect your tools: the OpenAI and Anthropic base URLs, the
+// model's name, the API key and the examples on one page, as in v1.1.52; MCP tools), Usage (the API prices the sidebar's
+// Saved counts with), Privacy (Data) and About (updates).  A change applies at once; the two that restart the model (the
+// context size, the port) ask first.  Each page is inset groups of rows (the grouped look); on a phone the dialog opens
+// on the list of pages and a page has a way back to it.
 import {html, useEffect, useRef, useState} from "./preact.js";
 import {MOD, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
 import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emit, presetOf, resetPrefs, savePrefs, schemeChoice, setScheme, setTheme,
@@ -13,6 +14,7 @@ import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStop
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
 import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
+import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
 import {CtxSlider, Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
@@ -20,17 +22,16 @@ const GROUPS = [
   {label: "General", items: [{id: "general", label: "Appearance and behaviour", icon: "settings"},
                              {id: "chat", label: "Chat defaults", icon: "gauge"},
                              {id: "instr", label: "Global instructions", icon: "edit"}]},
-  {label: "Integrations", items: [{id: "connection", label: "Connection", icon: "link"},
-                                  {id: "openai", label: "OpenAI API", icon: "code"},
-                                  {id: "anthropic", label: "Anthropic API", icon: "boxes"},
+  {label: "Integrations", items: [{id: "connect", label: "Connect your tools", icon: "link"},
                                   {id: "tools", label: "MCP tools", icon: "tool"}]},
   {label: "Usage", items: [{id: "savings", label: "Usage and savings", icon: "dollar"}]},
   {label: "Privacy", items: [{id: "data", label: "Data and privacy", icon: "disk"}]},
   {label: "About", items: [{id: "about", label: "About and updates", icon: "info"}]},
 ];
-// the pages' names before the groups (links and hashes that still say them): the context size is on Chat defaults now,
-// the API key and the addresses on Connection
-const OLD_IDS = {model: "chat", connect: "connection"};
+// other names a link or a hash may say: the Model page before the groups (its context size and port are on Chat
+// defaults now), and the revamp's API pages (one page again: Connect your tools)
+const OLD_IDS = {model: "chat", connection: "connect", openai: "connect", anthropic: "connect"};
+
 
 // a page's title and its line under it; an inset group of rows (an optional caption above it, a note under it)
 const Head = ({title, intro, children}) => html`<div class="set-head"><div class="set-head__text"><h3>${title}</h3>
@@ -98,10 +99,14 @@ function ModelCtx() {
         onChange=${(n) => setCtx(stops.indexOf(n))}/>
       ${changed ? html`<div class="callout callout--warn"><span>${warns.join(" ")}</span>
         <button type="button" class="btn btn--primary btn--sm" onClick=${reload}>Reload with ${ctxfmt(v)}</button></div>` : null}
-    </div>` : html`<p class="set-note">This server does not say its context range, so it can't be changed from here.</p>`}<//>`;
+    </div>` : html`<p class="set-note">This server does not say its context range, so it can't be changed from here.</p>`}
+    ${c ? html`<${Row} label="Engine settings" sub="The context size is on the Models page too, with this model's other engine settings: one setting, the same value.">
+      <button type="button" class="btn btn--ghost btn--sm" onClick=${() => { S.settings = null; openModelSheet("engine"); }}>
+        Models<${Icon} name="chevron-right" sm/></button><//>` : null}
+    <${Port}/><//>`;
 }
 
-// ------------------------------------------------------------------ the port (Connection): a restart
+// ------------------------------------------------------------------ the port (with the running model): a restart
 function Port() {
   const [port, setPort] = useState("");
   useEffect(() => { if (S.portInfo) setPort(String(S.portInfo.port)); }, [S.portInfo && S.portInfo.port]);
@@ -249,69 +254,34 @@ function Tools() {
         or start Maya with --mcp-config, and their tools appear here.</p>`}`;
 }
 
-// ------------------------------------------------------------------ Connection, the OpenAI API, the Anthropic API
-// (one server answers both APIs: the model's name, the API key and the port are shared - Connection; each API its own
-// page with its base URL, its endpoints and an example)
-const Copy = ({what, v}) => html`<button type="button" class="icon-btn icon-btn--sm" aria-label=${`Copy the ${what}`} title="Copy"
-  onClick=${() => copyText(v)}><${Icon} name="copy" sm/></button>`;
-const Addr = ({k, v, what}) => html`<div class="addr"><span>${k}</span><code>${v}</code><${Copy} what=${what || k} v=${v}/></div>`;
-const apiAuth = () => (S.health.api_key ? "<your API key>" : null);
-function Examples({examples}) {
-  const ids = Object.keys(examples), [tab, setTab] = useState(ids[0]);
-  const id = examples[tab] ? tab : ids[0];
-  return html`<div class="set-block">
-    ${ids.length > 1 ? html`<div class="tabs" role="tablist" aria-label="Examples">${ids.map((x) => html`
-      <button type="button" role="tab" aria-selected=${String(id === x)} class="tabs__tab" onClick=${() => setTab(x)}>${examples[x][0]}</button>`)}</div>`
-      : html`<span class="set-row__label">${examples[id][0]}</span>`}
-    <div onClick=${onCodeClick} dangerouslySetInnerHTML=${{__html: codeBlock("bash", examples[id][1])}}></div>
-  </div>`;
-}
-// the shared parts, linked from each API's page
-function SharedLinks({other}) {
-  const go = (id) => () => { S.settings = id; emit(); };
-  return html`<${Group}>
-    <${Row} label="Chat defaults for API requests" sub=${S.shared.on ? "On: requests get your chat defaults for anything they don't set." : "Off: requests use their own settings."}>
-      <button type="button" class="btn btn--ghost btn--sm" onClick=${go("chat")}>Chat defaults<${Icon} name="chevron-right" sm/></button><//>
-    <${Row} label="Model name, API key and port" sub=${`Shared with the ${other} API.`}>
-      <button type="button" class="btn btn--ghost btn--sm" onClick=${go("connection")}>Connection<${Icon} name="chevron-right" sm/></button><//><//>`;
-}
-function Connection() {
-  const key = !!S.health.api_key, model = S.health.model;
-  const [apikey, setKey] = useState(store.get("apikey", ""));
-  return html`<${Head} title="Connection" intro="Shared by the OpenAI and Anthropic APIs: any OpenAI- or Anthropic-compatible app or coding agent works with these. MCP servers have their own page."/>
-    <${Group}>
-      <${Addr} k="Model name" v=${model}/>
-      <${Row} label="API key" htmlFor="set-key" sub=${key ? "This server needs one. It is kept in this browser only." : "Only if the server was started with one. Kept in this browser only."}>
-        <input id="set-key" class="input input--key" type="password" autocomplete="off" placeholder="Not needed" value=${apikey}
-          onInput=${(e) => { setKey(e.target.value); store.set("apikey", e.target.value.trim()); }}
-          onChange=${() => toast("success", "API key saved", "Kept in this browser only.")}/><//>
-      <${Port}/><//>`;
-}
-function OpenAI() {
+// ------------------------------------------------------------------ Connect your tools (as in v1.1.52: both APIs' base URLs,
+// the model's name and the API key on one page, then the examples)
+function Connect() {
   const base = location.origin, model = S.health.model, key = !!S.health.api_key;
-  const examples = {
-    openai: ["OpenAI apps and SDKs", `OPENAI_BASE_URL=${base}/v1\nOPENAI_API_KEY=${key ? "<your API key>" : "any-text"}\nmodel: ${model}`],
-    curl: ["A first request", `curl ${base}/v1/chat/completions -H "Content-Type: application/json" ${apiAuth() ? '-H "Authorization: Bearer <your API key>" ' : ""}\\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello!"}]}'`],
-  };
-  return html`<${Head} title="OpenAI API" intro="For OpenAI-compatible apps and SDKs. The base URL ends in /v1."/>
-    <${Group}>
-      <${Addr} k="OpenAI base URL" v=${`${base}/v1`}/>
-      <${Addr} k="Chat completions" v="POST /v1/chat/completions" what="Chat completions endpoint"/>
-      <${Addr} k="Responses" v="POST /v1/responses" what="Responses endpoint"/><//>
-    <${Group} cap="Set up a client"><${Examples} examples=${examples}/><//>
-    <${SharedLinks} other="Anthropic"/>`;
-}
-function Anthropic() {
-  const base = location.origin, key = !!S.health.api_key;
+  const [tab, setTab] = useState("claude");
+  const [apikey, setKey] = useState(store.get("apikey", ""));
   const auth = key ? "<your API key>" : "maya";
-  const examples = {claude: ["Claude Code", `ANTHROPIC_BASE_URL=${base} ANTHROPIC_AUTH_TOKEN=${auth} claude`]};
-  return html`<${Head} title="Anthropic API" intro="For Anthropic Messages clients and coding agents. The base URL has no /v1."/>
-    <${Group}>
-      <${Addr} k="Anthropic base URL" v=${base}/>
-      <${Addr} k="Messages" v="POST /v1/messages" what="Messages endpoint"/><//>
-    <${Group} cap="Set up a client"><${Examples} examples=${examples}/><//>
-    <${SharedLinks} other="OpenAI"/>`;
+  const examples = {
+    claude: ["Claude Code", `ANTHROPIC_BASE_URL=${base} ANTHROPIC_AUTH_TOKEN=${auth} claude`],
+    openai: ["OpenAI apps and SDKs", `OPENAI_BASE_URL=${base}/v1\nOPENAI_API_KEY=${key ? "<your API key>" : "any-text"}\nmodel: ${model}`],
+    curl: ["A first request", `curl ${base}/v1/chat/completions -H "Content-Type: application/json" ${key ? '-H "Authorization: Bearer <your API key>" ' : ""}\\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello!"}]}'`],
+  };
+  const addrs = [["OpenAI base URL", `${base}/v1`], ["Anthropic base URL", base], ["Model name", model]];
+  return html`<${Head} title="Connect your tools" intro="Any OpenAI- or Anthropic-compatible app or coding agent works with these."/>
+    <${Group} cls="set-group--connect">
+    ${addrs.map(([k, v]) => html`<div class="addr"><span>${k}</span><code>${v}</code>
+      <button type="button" class="icon-btn icon-btn--sm" aria-label=${`Copy the ${k}`} title="Copy" onClick=${() => copyText(v)}><${Icon} name="copy" sm/></button></div>`)}
+    <${Row} label="API key" htmlFor="set-key" sub=${key ? "This server needs one. It is kept in this browser only." : "Only if the server was started with one. Kept in this browser only."}>
+      <input id="set-key" class="input input--key" type="password" autocomplete="off" placeholder="Not needed" value=${apikey}
+        onInput=${(e) => { setKey(e.target.value); store.set("apikey", e.target.value.trim()); }}
+        onChange=${() => toast("success", "API key saved", "Kept in this browser only.")}/><//><//>
+    <${Group}><div class="set-block">
+      <div class="tabs" role="tablist" aria-label="Examples">${Object.entries(examples).map(([id, [label]]) => html`
+        <button type="button" role="tab" aria-selected=${String(tab === id)} class="tabs__tab" onClick=${() => setTab(id)}>${label}</button>`)}</div>
+      <div onClick=${onCodeClick} dangerouslySetInnerHTML=${{__html: codeBlock("bash", examples[tab][1])}}></div>
+    </div><//>`;
 }
+
 
 // ------------------------------------------------------------------ Data
 function Data() {
@@ -507,7 +477,7 @@ function About() {
 }
 
 // ------------------------------------------------------------------ the dialog
-const BODIES = {general: General, chat: ChatDefaults, instr: Instructions, connection: Connection, openai: OpenAI, anthropic: Anthropic,
+const BODIES = {general: General, chat: ChatDefaults, instr: Instructions, connect: Connect,
                 tools: Tools, savings: Savings, data: Data, about: About};
 export function SettingsDialog() {
   const box = useRef(null), body = useRef(null);

@@ -46,7 +46,7 @@ export async function poll() {
     const r = await fetch(reqAll.on ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
       S.conn = "key";
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it in Settings › Connection.", 6000); }
+      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it in Settings › Connect your tools.", 6000); }
     } else if (r.ok) {
       S.metrics = await r.json();
       S.conn = "ok";
@@ -231,6 +231,8 @@ export async function watchReload(to) {
     await loadHealth();
     if (rl && rl.state === "failed") toast("error", "The context did not change", rl.error || "the engine did not start with it", 9000);
     else toast("success", "Model reloaded", `It runs with a ${ctxfmt(info.context)} context now.`, 5000);
+    // (the same setting on the Models page: its Engine settings read the run config again)
+    try { window.dispatchEvent(new Event("maya:context")); } catch (e) { /* (no window: a test) */ }
     emit();
     return;
   }
@@ -398,6 +400,6 @@ export async function watchUpdate(to) {
 // ------------------------------------------------------------------ the troubleshooting report (GET /api/report)
 export async function fetchReport() {
   const r = await fetch("api/report", {headers: headers()});
-  if (!r.ok) throw new Error(r.status === 401 ? "this server needs its API key (Settings › Connection)" : `HTTP ${r.status}`);
+  if (!r.ok) throw new Error(r.status === 401 ? "this server needs its API key (Settings › Connect your tools)" : `HTTP ${r.status}`);
   return r.text();
 }

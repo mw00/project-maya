@@ -80,7 +80,7 @@ export async function api(path, {method = "GET", body, signal} = {}) {
   if (!r.ok) {
     let msg = `HTTP ${r.status}`;
     try { const e = (await r.json()).error; msg = (e && e.message) || (typeof e === "string" && e) || msg; } catch (e) { /* not json */ }
-    if (r.status === 401) msg = "This server needs its API key: add it in Settings › Connection.";
+    if (r.status === 401) msg = "This server needs its API key: add it in Settings › Connect your tools.";
     const err = new Error(msg);
     err.status = r.status;
     throw err;

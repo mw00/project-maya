@@ -485,7 +485,7 @@ export async function answer(resumeJob = null) {
   const failed = async (r) => {
     let msg = `HTTP ${r.status}`;
     try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-    if (r.status === 401) msg = "This server needs an API key: add it in Settings › Connection.";
+    if (r.status === 401) msg = "This server needs an API key: add it in Settings › Connect your tools.";
     return new Error(msg);
   };
   try {
