@@ -374,8 +374,8 @@ def fair_slice_seconds() -> float:
 
 @contextlib.contextmanager
 def grammar_file(text, lease=None, proc=None):
-    # mkstemp in the system temp directory produces a protocol-safe path even with a spaced TMPDIR.
-    fd, path = tempfile.mkstemp(prefix="maya-grammar-", suffix=".gbnf", dir="/tmp" if os.name != "nt" else None)
+    # Keep the platform temp directory; the native hex-path capability handles spaces and Unicode.
+    fd, path = tempfile.mkstemp(prefix="maya-grammar-", suffix=".gbnf")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as out:
             out.write(text)
@@ -1340,9 +1340,12 @@ class StrataEngine:
             return
         # The native parser reads and compiles this file before its first reply. Keep it until
         # the generator has drained; on a bounded drain timeout with no reply retain it until exit.
-        lease = {"read": False}
+        lease = {"read": True}  # no native reader until the path has passed protocol validation
         with grammar_file(text, lease, self.proc) as path:
-            smp = {**sampling, "_grammar_path": path, "_grammar_lease": lease}
+            smp = {**sampling, "_grammar_path": path, "_grammar_lease": lease,
+                   "_grammar_hex_supported": (getattr(self, "info", None) or {}).get("grammar_hex") == 1}
+            self.grammar_keys(smp)  # reject unsafe legacy paths before submitting any native request
+            lease["read"] = False
             yield from self._generate_native(ids, max_new, smp, cancel, embeddings)
 
     @staticmethod
@@ -1350,7 +1353,14 @@ class StrataEngine:
         path = sampling.get("_grammar_path")
         if not path:
             return ""
-        keys = " grammar=" + path
+        if "\0" in path:
+            raise ValueError("grammar: a native grammar path cannot contain NUL")
+        if sampling.get("_grammar_hex_supported"):
+            keys = " grammar_hex=" + path.encode("utf-8").hex()
+        else:
+            if any(char.isspace() for char in path):
+                raise ValueError("grammar: this engine cannot read a grammar path containing whitespace; update the engine for grammar_hex support")
+            keys = " grammar=" + path
         after = sampling.get("_grammar_after")
         if isinstance(after, int):
             keys += f" grammar_after={after}"
@@ -2486,6 +2496,7 @@ class Service:
         line takes, before anything is sent.  A logit_bias needs an engine that applies it (INFO logit_bias=1): an
         older one would answer as if it had none."""
         # Protocol paths/replay are private: never trust client-supplied internal fields.
+        req.pop("grammar_hex", None)  # public clients cannot supply native file paths
         for key in list(req):
             if key.startswith("_grammar_"):
                 req.pop(key)
