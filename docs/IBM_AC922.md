@@ -191,8 +191,3 @@ Two measurement rules this machine taught:
   CMake tree but have not been measured on this machine.
 - **Prefill is the phase that reaches the power limit**: one card reports `SW Power Cap` at 226 W during
   prefill, while decode draws ~70 W a card.
-
-## Credits
-
-The AC922 bring-up follows earlier ground work by eelgaev, which documented the platform, the `cudaHostAlloc`-only
-rule and the NVLink2 behaviour that this port depends on.
