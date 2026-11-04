@@ -24,6 +24,9 @@
 .set-head__text { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1 1 280px; }
 .set-body h3 { margin: 0; font-size: var(--st-fs-xl); font-weight: 600; letter-spacing: -.01em; line-height: 1.25; }
 .set-intro { margin: 0; font-size: var(--st-fs-md); line-height: 1.45; color: var(--st-ink-muted); }
+.set-support { margin: 0; font-size: var(--st-fs-sm); line-height: 1.5; color: var(--st-ink-muted); }
+.set-support .support-link .st-icon { margin-left: 4px; vertical-align: -2px; }
+.update__acts .support-link .st-icon { margin-right: 2px; }
 .set-note { margin: 0; padding: 12px 14px; border-radius: var(--st-r-md); background: var(--st-card); font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 
 /* an inset group: a fill with rounded corners, its rows split by a hairline; a caption above it, a note under it */

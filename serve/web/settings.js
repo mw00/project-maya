@@ -1,4 +1,4 @@
-// serve/web/settings.js - the Settings dialog, its pages in five groups: General (Appearance and behaviour; Chat defaults:
+// serve/web/settings.js - the Settings dialog, its pages in five groups: General (Appearance; Chat defaults:
 // the running model - its context size, also on the Models page's Engine settings, and the port - sampling, thinking,
 // shared with other apps; Global instructions), Integrations (Connect your tools: the OpenAI and Anthropic base URLs, the
 // model's name, the API key and the examples on one page, as in v1.1.52; MCP tools), Usage (the API prices the sidebar's
@@ -6,7 +6,7 @@
 // context size, the port) ask first.  Each page is inset groups of rows (the grouped look); on a phone the dialog opens
 // on the list of pages and a page has a way back to it.
 import {html, useEffect, useRef, useState} from "./preact.js";
-import {MOD, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
+import {MOD, SUPPORT_URL, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
 import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emit, presetOf, resetPrefs, savePrefs, schemeChoice, setScheme, setTheme,
         themeChoice, thinkTitles, toast} from "./state.js";
 import {usd} from "./sidebar.js";
@@ -19,7 +19,7 @@ import {TurboButton} from "./turbo.js";
 import {CtxSlider, Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 const GROUPS = [
-  {label: "General", items: [{id: "general", label: "Appearance and behaviour", icon: "settings"},
+  {label: "General", items: [{id: "general", label: "Appearance", icon: "settings"},
                              {id: "chat", label: "Chat defaults", icon: "gauge"},
                              {id: "instr", label: "Global instructions", icon: "edit"}]},
   {label: "Integrations", items: [{id: "connect", label: "Connect your tools", icon: "link"},
@@ -51,7 +51,7 @@ const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", m
 function General() {
   const keys = [["Send", "Enter"], ["New line", "Shift Enter"], ["New chat", `${MOD} Shift O`], ["Search chats", `${MOD} K`],
                 ["Stop the answer", "Esc"], ["Settings", `${MOD} ,`], ["Show or hide the sidebar", `${MOD} Shift S`]];
-  return html`<${Head} title="Appearance and behaviour"/>
+  return html`<${Head} title="Appearance"/>
     <${Group}>
     <${Row} label="Theme" sub="System follows your computer's light or dark setting.">
       <${Seg} label="Theme" value=${themeChoice()} onChange=${setTheme}
@@ -353,6 +353,9 @@ function Savings() {
 }
 
 // ------------------------------------------------------------------ About and updates
+// supporting Maya (GitHub Sponsors): a link beside an update, and one line on About when no update is shown
+const Support = () => html`<a class="btn btn--ghost btn--sm support-link" href=${SUPPORT_URL} target="_blank" rel="noopener"
+  title="Support Maya on GitHub Sponsors"><${Icon} name="heart" sm/>Support Maya</a>`;
 function UpdateCard() {
   const u = S.update, w = S.updateWatch;
   if (!w && (!u || !u.enabled)) return null;
@@ -377,7 +380,8 @@ function UpdateCard() {
     title = `Project Maya v${latest.version} is out`;
     text = latest.summary || "";
     if (!u.can_update) how = `Update by hand: ${u.by_hand}. This page can't, because ${u.blocker}.`;
-    acts = html`${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>Update to v${latest.version}</button>` : null}`;
+    // (beside the update, a quiet ask: a link, never a popup)
+    acts = html`<${Support}/>${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>Update to v${latest.version}</button>` : null}`;
   } else if (u.error) {
     icon = "warning";
     title = "Couldn't check for updates";
@@ -464,8 +468,11 @@ function About() {
     if (log != null) { setLog(null); return; }
     try { setLog(await fetchReport()); } catch (e) { toast("error", "No report", e.message, 5000); }
   };
+  const newer = S.update && S.update.newer && !S.updateWatch;   // (then the ask is beside the update instead)
   return html`<${Head} title="About and updates"/>
     <${UpdateCard}/>
+    ${newer ? null : html`<p class="set-support">Maya is free and open. If it helps you, you can
+      ${" "}<a class="support-link" href=${SUPPORT_URL} target="_blank" rel="noopener" title="Support Maya on GitHub Sponsors">support it<${Icon} name="heart" sm/></a></p>`}
     <${Group} cap="This server"><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
     <${Group}>
     <div class="set-row set-row--top">

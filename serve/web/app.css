@@ -63,6 +63,13 @@
 .status-card { display: flex; align-items: center; gap: 10px; width: 100%; padding: 8px 10px; border: 0; border-radius: var(--st-r-md);
                background: transparent; color: var(--st-ink); text-align: left; }
 .status-card:hover { background: var(--st-surface-2); }
+.status-row { display: flex; align-items: center; gap: 2px; }
+.status-row .status-card { flex: 1; min-width: 0; }
+/* the heart: Maya's violet, quiet (a link to GitHub Sponsors, never a popup) */
+.heart-link { color: var(--st-accent-text); text-decoration: none; }
+.heart-link:hover { background: var(--st-accent-tint); color: var(--st-accent-text); }
+.support-link { display: inline-flex; align-items: center; gap: 6px; color: var(--st-accent-text); font-weight: 500; text-decoration: none; }
+.support-link:hover { text-decoration: underline; }
 .status-card__text { display: flex; flex-direction: column; min-width: 0; line-height: 1.3; }
 /* (a long model name wraps onto more lines - all of it shown - rather than ending in "…") */
 .status-card__text b { font-size: var(--st-fs-md); font-weight: 600; overflow-wrap: anywhere; text-wrap: balance; }   /* (balanced: "Qwen-3.8-Flash-Next / (CYBER-FROST) · Q5_K_M", not a break inside CYBER-FROST) */
