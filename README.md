@@ -236,7 +236,9 @@ slowest while the caches fill with what you use.
   sets how many tokens the model may think before it answers.
 - **Loop guard:** on by default - an agent that repeats the same tool call with the same result is steered off it.
 - **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them (setup details per
-  model: [docs/MODELS.md](docs/MODELS.md)).
+  model: [docs/MODELS.md](docs/MODELS.md)). **PDFs** too: their text layer when they have one, otherwise their first
+  pages as pictures - read by poppler on this machine (`sudo apt install poppler-utils`, Arch: `sudo pacman -S poppler`;
+  Maya installs nothing itself).
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).

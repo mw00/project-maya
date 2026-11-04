@@ -54,7 +54,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
-from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, pdf, savings  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -157,6 +157,7 @@ IMAGE_PAD = "<|image_pad|>"
 VISION_START = "<|vision_start|>"
 CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
 TEXT_FILE_MIN, TEXT_FILE_MAX = 512 * 1024, 16 * 1024 * 1024
+PDF_MAX_BYTES = 64 << 20    # the largest PDF POST /pdf takes: the page checks it too, before it reads the file
 
 
 def text_file_limit(context: int) -> int:
@@ -5970,6 +5971,9 @@ def make_handler(svc: Service):
                 if path == "/settings":
                     self._settings()
                     return
+                if path == "/pdf":
+                    self._pdf()
+                    return
                 if path == "/v1/strata/cancel":
                     self._job_cancel()
                     return
@@ -6211,6 +6215,29 @@ def make_handler(svc: Service):
             print("[maya] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
                   if shared else "[maya] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
+
+        def _pdf(self):
+            """POST /pdf: a PDF the chat page attached, as its raw bytes - the text layer back as text, or the
+            first pages as PNG data URLs when the PDF is scanned and the model reads pictures (serve/pdf.py,
+            #837).  The app's own page only, like the other dashboard routes: the API key answers it as
+            everywhere, and where _own_page asks for application/json this asks for application/pdf - a form
+            can carry neither, which is what the check is for."""
+            ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if ctype not in ("application/pdf", "application/octet-stream"):
+                self._json(415, {"error": {"message": "send the PDF bytes as application/pdf"}})
+                return
+            raw = self._body()
+            if len(raw) > PDF_MAX_BYTES:
+                self._json(413, {"error": {"message": f"the PDF is over the {PDF_MAX_BYTES >> 20} MB a chat "
+                                                      "attachment can be"}})
+                return
+            if not raw.startswith(b"%PDF-"):
+                self._json(400, {"error": {"message": "this is not a PDF"}})
+                return
+            # the same text-file cap health advertises (the page's own limit), and the same images flag: a model
+            # without vision gets a clear error instead of pictures its request would drop
+            self._json(200, pdf.extract(raw, want_images=svc.vision is not None,
+                                        text_limit=text_file_limit(svc.engine.max_context)))
 
         def _sse(self):
             # token frames are small and flushed as they come; Nagle would otherwise hold one

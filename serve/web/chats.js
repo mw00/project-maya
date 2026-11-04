@@ -599,7 +599,7 @@ export function stopAnswer() {
   b.controller.abort();
 }
 
-// ------------------------------------------------------------------ attachments: the + menu, a drop, a pasted picture
+// ------------------------------------------------------------------ attachments: the + menu, a drop, a pasted picture, a PDF
 const TEXT_EXT = /\.(txt|md|markdown|rst|tex|py|pyi|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|jsonl|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|less|c|cc|cpp|cxx|h|hh|hpp|cu|cuh|rs|go|java|kt|kts|swift|rb|php|pl|lua|r|jl|scala|sql|sh|bash|zsh|fish|ps1|psm1|bat|cmd|diff|patch|gradle|cmake|mk|dockerfile|gitignore|proto|graphql)$/i;
 // the server says how big a text file the context holds (health.max_text_file: about 4 bytes a token); 512 KB before it did
 const textLimit = () => S.health.max_text_file || 512 * 1024;
@@ -608,6 +608,10 @@ function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
+// a PDF is neither text nor a picture to the browser: it goes to the server (POST /pdf), which answers with its
+// text layer or with its first pages rendered (poppler, serve/pdf.py); the cap is the server's own (#837)
+const PDF_MAX = 64 * 1048576;   // the server's cap (PDF_MAX_BYTES in serve/server.py), checked here before the read
+const isPdf = (f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name);
 const attached = (a) => { S.attachments = [...S.attachments, a]; emit(); updateCtxMeter(); };
 export function addFiles(files) {
   for (const f of files) {
@@ -619,6 +623,7 @@ export function addFiles(files) {
       r.readAsDataURL(f);
       continue;
     }
+    if (isPdf(f)) { addPdf(f); continue; }
     if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${S.health.images ? " or images" : ""}.`); continue; }
     if (f.size > textLimit()) {
       const ctx = S.health.max_context;
@@ -634,6 +639,28 @@ export function addFiles(files) {
     };
     r.readAsText(f);
   }
+}
+// one PDF, read by the server: its text layer arrives as an ordinary text part; a scanned one (nothing to extract)
+// arrives as its first pages in pictures, for the vision path like any attached image. The toast says which came of
+// it; a machine without poppler gets its install line from the server, the way videos name ffmpeg.
+async function addPdf(f) {
+  if (f.size > PDF_MAX) { toast("warn", "PDF too large", `${f.name} is over ${sizeLabel(PDF_MAX)}.`); return; }
+  let j;
+  try {
+    const r = await fetch("pdf", {method: "POST", headers: {...headers(), "Content-Type": "application/pdf"},
+                                  body: await f.arrayBuffer()});
+    j = await r.json();
+  } catch (e) { toast("error", "The PDF could not be read", `${f.name}: ${e.message || e}.`); return; }
+  if (j.error) { toast("error", `PDF: ${f.name}`, j.error.message, 9000); return; }
+  if (j.kind === "images") {
+    for (const [k, im] of (j.images || []).entries()) attached({kind: "image", name: `${f.name} · page ${k + 1}`, url: im.data});
+    toast("info", "PDF attached as pictures", `${f.name}: ${j.pages} page${j.pages > 1 ? "s" : ""}` +
+      (j.note ? ` (${j.note})` : "") + ". Dense pages read better as text than as pictures.", 9000);
+    return;
+  }
+  attached({kind: "file", name: f.name, text: j.text});
+  toast("success", "PDF attached", `${f.name}: ${fmt(j.text.length)} characters${j.pages ? ` from ${j.pages} pages` : ""}` +
+    (j.truncated ? " - the rest is over the limit for this model's context." : "."), 8000);
 }
 export function removeAttachment(i) {
   S.attachments = S.attachments.filter((_, k) => k !== i);
