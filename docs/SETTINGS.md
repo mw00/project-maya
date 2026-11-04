@@ -844,10 +844,13 @@ Two costs of a turn in a long conversation that are not the model's work:
 - **Prompt preparation.** The server marks the special-token literals in every message of every request, and an agent
   client re-sends the whole history each turn: about 1.8 s a turn at 150-350K tokens. `MAYA_PROMPT_MEMO=1` remembers
   the marked text per string and builds the token ids by increment from the last prompt's, the same ids;
-  `MAYA_PROMPT_MEMO=verify` also builds them the whole way and fails a request whose ids differ (for tests).
+  `MAYA_PROMPT_MEMO=verify` also builds them the whole way and fails a request whose ids differ (for tests). This one
+  is the server's, so it works the same for every model (GLM, MiniMax and Qwen prompts too, not only DeepSeek). It
+  keeps the marked text of up to about 100 M characters of messages (a few hundred MB of RAM on long agent sessions).
 
 `MAYA_TURN_TRACE=1` (server) and `DS4_TURN_TRACE=1` (engine) print one line a request with its clock marks (prompt
-preparation, first token, the engine's run), and `DS4_RUN_POLL_MS` sets how often the engine looks whether the GPUs are
+preparation, first token, the engine's run; read them with one request at a time - with `--parallel` the server's
+marks of several requests mix), and `DS4_RUN_POLL_MS` sets how often the engine looks whether the GPUs are
 done with a prompt run (50 ms, the progress line keeps its 50 ms).
 
 | Setting | Default | |
