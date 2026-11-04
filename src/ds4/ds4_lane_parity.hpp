@@ -18,14 +18,20 @@
 namespace strata::ds4::par {
 
 /// ggml types with device-order rows here: IQ2_XXS, IQ2_S (gate / up), IQ3_XXS, IQ3_S (down) - and each in the other
-/// role too.  k must be a multiple of 256 (Q8_K's block).
+/// role too.  MXFP4 (a GGUF's expert format, 32 values a block) has them for both roles.  k must be a multiple of 256
+/// (MXFP4: of 32).
 bool lane_type(int type);
+/// The lanes a row of `type` is summed over: 32 for gate / up, 16 for a down - MXFP4: 32 for both, as its kernels.
+int lane_lanes(int type, bool gate_up);
 /// Bytes of an activation of k values: k int8, then k / 32 F32 scales (each 256-block's scale written 8 times, as the
 /// device's xd / hd hold it).
 inline size_t act_bytes(int k) { return (size_t) k + (size_t) (k / 32) * 4; }
 /// x (k values) -> its activation, byte for byte q8k_quant_kernel's (amax's first index, iscale = -127 / that value,
 /// q = min(127, nearest(iscale x)), d = 1 / iscale).
 void quant(const float* x, int k, void* act);
+/// The same for a weight type `type`: an IQ type's Q8_K (as above), MXFP4's per 32 values q8_quant's (sc = max|x| / 127,
+/// q = round-half-even(x / sc), d = sc) - the rounding the device's MXFP4 kernels make.
+void quant(int type, const float* x, int k, void* act);
 /// h[t][r] = swiglu_portable(gate_r . act[t], up_r . act[t], limit) for rows [r0, r1) of matrices of `type` with k
 /// inputs, nt <= 8 activations.
 void gate_up(int type, const uint8_t* gate, const uint8_t* up, int k, const void* const* act, int nt, float* const* h,

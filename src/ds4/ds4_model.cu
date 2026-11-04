@@ -2186,6 +2186,13 @@ struct Model::Impl {
         return f != nullptr ? std::fopen(f + 1, "wb") : nullptr;
     }();
     std::mutex dump_mu;
+    // DS4_DUMP_ACC=<file>: every layer's output (c.acc, T x dim floats) with a record a pass [layer, T, dim] - where
+    // two placements' hidden states part (a look, not a feature)
+    std::FILE* acc_dump = [] {
+        const char* v = std::getenv("DS4_DUMP_ACC");
+        return v != nullptr ? std::fopen(v, "wb") : nullptr;
+    }();
+    std::mutex acc_mu;
     // DS4_PROF: the GPU's time a decoded token by stage - events in stream order at a layer's start, after its
     // attention, after the routing and the shared expert, after the experts' gate / up, after the wait for the CPU
     // lane, after the down pass and the post - read after the token's sync, each the time since the mark before it
@@ -10590,6 +10597,7 @@ struct Model::Impl {
     // number of entries take it, and each job its band of h straight into the down's int8 input.
     // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
     void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+        if (lane_par_layer(l)) return cpu_experts_par(l, x, ents, ldx, ord);   // (DS4_LANE_PARITY: the device's bits)
         const bool mx_gu = gg::expert_type(l.lay, 0) == gg::kTypeMXFP4, mx_d = gg::expert_type(l.lay, 2) == gg::kTypeMXFP4;
         if (!mx_gu && !mx_d) return cpu_experts_iq(l, x, ents, ldx, ord);
         if (!mx_gu || !mx_d) return cpu_experts_both(l, x, ents, ldx, ord, mx_gu);
@@ -10689,11 +10697,21 @@ struct Model::Impl {
         run_nodes(ne * DB, f);
     }
     // (DS4_LANE_PARITY) the layer's experts in the device's arithmetic on the CPU lane: both types have device-order rows
-    // (ds4_lane_parity.hpp) and the activations are Q8_K (n_embd and n_ff in 256s)
+    // (ds4_lane_parity.hpp) and the activations are Q8_K (n_embd and n_ff in 256s) - a layer of MXFP4 experts on both
+    // roles takes them per 32 values, as its own kernels round them
     bool lane_par_layer(const Layer& l) const {
-        return lane_par && l.n_cls <= 1 && par::lane_type(gg::expert_type(l.lay, 0)) &&
-               gg::expert_type(l.lay, 1) == gg::expert_type(l.lay, 0) && par::lane_type(gg::expert_type(l.lay, 2)) &&
-               g.dim % 256 == 0 && g.ff % 256 == 0 && par::act_bytes(g.dim) <= (size_t) g.dim * 4;
+        const int tg = gg::expert_type(l.lay, 0), td = gg::expert_type(l.lay, 2);
+        const int bs = tg == gg::kTypeMXFP4 && td == gg::kTypeMXFP4 ? 32 : 256;
+        const bool ok = lane_par && l.n_cls <= 1 && par::lane_type(tg) && gg::expert_type(l.lay, 1) == tg &&
+                        par::lane_type(td) && g.dim % bs == 0 && g.ff % bs == 0 &&
+                        par::act_bytes(g.dim) <= (size_t) g.dim * 4;
+        static int said = 0;   // (DS4_LANE_PARITY_DEBUG: the first layers that do not take it)
+        if (!ok && lane_par && said < 2 && std::getenv("DS4_LANE_PARITY_DEBUG") != nullptr) {
+            ++said;
+            std::fprintf(stderr, "ds4: lane parity: layer %d keeps the lane's own rows (n_cls %d, types %d/%d/%d, dim %d, ff %d)\n",
+                         l.il, l.n_cls, tg, gg::expert_type(l.lay, 1), td, g.dim, g.ff);
+        }
+        return ok;
     }
     // ... cpu_experts_iq's rows in the device's arithmetic (par::): each token's x rounded once as the device's Q8_K
     // (par::quant), the gate / up rows as the token kernels sum them with exp_portable's SwiGLU, h rounded alike, the
@@ -10723,7 +10741,7 @@ struct Model::Impl {
                     const int t = en.tok[i];
                     if (t < kWin && done[t]) continue;
                     if (t < kWin) done[t] = true;
-                    par::quant(x + (size_t) t * ldx, E, x_act(en, i));
+                    par::quant(tg, x + (size_t) t * ldx, E, x_act(en, i));
                 }
         }
         std::function<void(int)> f[4];
@@ -10743,7 +10761,8 @@ struct Model::Impl {
         run_nodes(ne * GB, f);
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
-                par::quant(c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF, aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                par::quant(td, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                           aq + (size_t) (kWin + en.slot0 + i) * E * 4);
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -17921,6 +17940,16 @@ struct Model::Impl {
         if (nm > 1) chunk_allreduce(d, c, ab, mi, T * D, s);
         ablate(d, c.acc, T, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
+        if (acc_dump != nullptr) {
+            std::vector<float> av((size_t) T * (size_t) D);
+            CK(cudaStreamSynchronize(s));
+            CK(cudaMemcpy(av.data(), c.acc, av.size() * 4, cudaMemcpyDeviceToHost));
+            std::lock_guard<std::mutex> lk(acc_mu);
+            const int64_t hd[3] = {(int64_t) l.il, (int64_t) T, (int64_t) D};
+            std::fwrite(hd, 8, 3, acc_dump);
+            std::fwrite(av.data(), 4, av.size(), acc_dump);
+            std::fflush(acc_dump);
+        }
         CK(cudaMemcpyAsync(c.pre, c.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         prof_mark(d, 3);
         kick(s);   // (Windows HIP: the experts and the layer's end submitted now, not at the next layer's wait)
@@ -21591,6 +21620,16 @@ struct Model::Impl {
             ablate(d, d.moe_out, T, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
+            if (acc_dump != nullptr) {
+                std::vector<float> av((size_t) T * (size_t) D);
+                CK(cudaStreamSynchronize(s));
+                CK(cudaMemcpy(av.data(), d.h, av.size() * 4, cudaMemcpyDeviceToHost));
+                std::lock_guard<std::mutex> lk(acc_mu);
+                const int64_t hd[3] = {(int64_t) l.il, (int64_t) T, (int64_t) D};
+                std::fwrite(hd, 8, 3, acc_dump);
+                std::fwrite(av.data(), 4, av.size(), acc_dump);
+                std::fflush(acc_dump);
+            }
             if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
             prof_mark(d, 5);
             return true;
@@ -21715,6 +21754,16 @@ struct Model::Impl {
         ablate(d, d.moe_out, T, s);
         hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
         std::swap(d.h, d.h2);
+        if (acc_dump != nullptr) {
+            std::vector<float> av((size_t) T * (size_t) D);
+            CK(cudaStreamSynchronize(s));
+            CK(cudaMemcpy(av.data(), d.h, av.size() * 4, cudaMemcpyDeviceToHost));
+            std::lock_guard<std::mutex> lk(acc_mu);
+            const int64_t hd[3] = {(int64_t) l.il, (int64_t) T, (int64_t) D};
+            std::fwrite(hd, 8, 3, acc_dump);
+            std::fwrite(av.data(), 4, av.size(), acc_dump);
+            std::fflush(acc_dump);
+        }
         if (!fuse) CK(cudaMemcpyAsync(d.pre, d.f_pre, (size_t) T * 8 * 4, cudaMemcpyDeviceToDevice, s));
         // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
         return true;

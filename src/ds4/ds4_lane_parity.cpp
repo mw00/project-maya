@@ -37,6 +37,7 @@ namespace strata::ds4::par {
 namespace {
 
 constexpr int kIQ2_XXS = 16, kIQ3_XXS = 18, kIQ3_S = 21, kIQ2_S = 22;
+constexpr int kMXFP4 = 39;      // (a GGUF's expert format: 32 values a block, an E8M0 scale then 16 code bytes)
 constexpr int kMaxT = 8;        // activations a call (the CPU lane's entries hold at most 8 tokens)
 constexpr int kGuLanes = 32;    // ds4_iq.cu: kGuRW 1 -> 32 lanes a gate / up row
 constexpr int kDnLanes = 16;    // kDnRW 2 -> 16 lanes a down row
@@ -47,6 +48,7 @@ int block_bytes(int type) {
         case kIQ2_S: return 82;
         case kIQ3_XXS: return 98;
         case kIQ3_S: return 110;
+        case kMXFP4: return 17;
         default: return 0;
     }
 }
@@ -79,6 +81,15 @@ inline uint32_t ksigns8(uint32_t v) {   // 7 sign bits -> 8 (bit 7 their parity)
     v &= 127u;
     return v | ((uint32_t) (std::popcount(v) & 1) << 7);
 }
+// MXFP4: ggml's kvalues_mxfp4 / 2 - a nibble's E2M1 magnitude (ggml's own table holds the values doubled, the block's
+// E8M0 scale halved, so the code is the value)
+constexpr uint8_t kMxTab[8] = {0, 1, 2, 3, 4, 6, 8, 12};
+inline float e8m0(uint8_t e) {   // 2^(e - 128): ggml's GGML_E8M0_TO_FP32_HALF
+    const uint32_t bits = e < 2 ? (0x00200000u << e) : ((uint32_t) (e - 1) << 23);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
 
 // A 32-value sub-block as ds4_iq.cu's decode<T> makes it: 4 groups of 8 magnitudes (g[l]: byte j = value 8 l + j's),
 // their signs (sg[l] bit j: value 8 l + j negative), the scale d and the halves' multipliers s0 (values 0..15), s1.
@@ -89,6 +100,22 @@ struct Sub {
     int s0, s1;
 };
 inline void decode(int type, const uint8_t* row, int kb, Sub& s) {
+    if (type == kMXFP4) {   // a block is a sub-block: values 0..15 in bytes 0..15's low nibbles, 16..31 in their high ones
+        const uint8_t* b = row + (size_t) kb * 17;
+        uint64_t g[4] = {0, 0, 0, 0};
+        uint32_t sg[4] = {0, 0, 0, 0};
+        for (int l = 0; l < 4; ++l)
+            for (int i = 0; i < 8; ++i) {
+                const int v = 8 * l + i, byi = v & 15;
+                const int nib = v < 16 ? (b[1 + byi] & 15) : (b[1 + byi] >> 4);
+                g[l] |= (uint64_t) kMxTab[nib & 7] << (8 * i);
+                if (nib >> 3) sg[l] |= 1u << i;
+            }
+        for (int l = 0; l < 4; ++l) s.g[l] = g[l], s.sg[l] = sg[l];
+        s.s0 = s.s1 = 1;
+        s.d = e8m0(b[0]);
+        return;
+    }
     const int ib = kb & 7;
     const uint8_t* b = row + (size_t) (kb >> 3) * (size_t) block_bytes(type);
     if (type == kIQ2_XXS) {
@@ -139,13 +166,15 @@ inline int code(const Sub& s, int j) {
     const int m = (int) ((s.g[l] >> (8 * i)) & 255u);
     return (s.sg[l] >> i) & 1u ? -m : m;
 }
-// the device's sub_dot: the exact int8 dots of each half, s0 lo + s1 hi in int, then d times it in F32
-inline float sub_dot(const Sub& s, const int8_t* xq) {
+// the device's sub_dot's integer part: the exact int8 dots of each half, s0 lo + s1 hi in int
+inline int sub_dot_int(const Sub& s, const int8_t* xq) {
     int lo = 0, hi = 0;
     for (int j = 0; j < 16; ++j) lo += code(s, j) * (int) xq[j];
     for (int j = 16; j < 32; ++j) hi += code(s, j) * (int) xq[j];
-    return p_mul(s.d, (float) (s.s0 * lo + s.s1 * hi));
+    return s.s0 * lo + s.s1 * hi;
 }
+// ... then d times it in F32 (the low-bit kernels)
+inline float sub_dot(const Sub& s, const int8_t* xq) { return p_mul(s.d, (float) sub_dot_int(s, xq)); }
 inline float lanes_tree(float* acc, int lpr) {   // the device's lanes_sum: lane l += lane l + o, o = lpr / 2 .. 1
     for (int o = lpr / 2; o > 0; o >>= 1)
         for (int l = 0; l < o; ++l) acc[l] = p_add(acc[l], acc[l + o]);
@@ -155,9 +184,12 @@ inline const int8_t* act_q(const void* a) { return (const int8_t*) a; }
 inline const float* act_d(const void* a, int k) { return (const float*) ((const uint8_t*) a + k); }
 
 // rows [r0, r1) of one matrix against nt activations, scalar: sums[t][r - r0]
+// (an MXFP4 block is a sub-block: the value comes from the block, the activation's scale, its own E8M0 scale - in the
+// form the device's mx kernels use, fma(scale * activation scale, the block's exact int, sum))
 void rows_scalar(int type, const uint8_t* w, int k, const void* const* act, int nt, int lpr, int r0, int r1,
                  float (*sums)[kMaxT]) {
-    const size_t rb = (size_t) (k / 256) * (size_t) block_bytes(type);
+    const bool mx = type == kMXFP4;
+    const size_t rb = (size_t) (k / (mx ? 32 : 256)) * (size_t) block_bytes(type);
     const int nsb = k / 32;
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * rb;
@@ -167,7 +199,11 @@ void rows_scalar(int type, const uint8_t* w, int k, const void* const* act, int 
             decode(type, row, kb, s);
             const int lane = kb & (lpr - 1);   // (lpr: 16 or 32)
             for (int t = 0; t < nt; ++t)
-                acc[t][lane] = p_fma(act_d(act[t], k)[kb], sub_dot(s, act_q(act[t]) + 32 * kb), acc[t][lane]);
+                if (mx)
+                    acc[t][lane] = p_fma(p_mul(s.d, act_d(act[t], k)[kb]), (float) sub_dot_int(s, act_q(act[t]) + 32 * kb),
+                                         acc[t][lane]);
+                else
+                    acc[t][lane] = p_fma(act_d(act[t], k)[kb], sub_dot(s, act_q(act[t]) + 32 * kb), acc[t][lane]);
         }
         for (int t = 0; t < nt; ++t) sums[r - r0][t] = lanes_tree(acc[t], lpr);
     }
@@ -197,6 +233,23 @@ PAR_AVX2 inline uint32_t ld4u(const uint8_t* p) {
     uint32_t v;
     std::memcpy(&v, p, 4);
     return v;
+}
+// MXFP4: 8 consecutive blocks (a 256-value step, 136 bytes) -> the 8 sub-blocks' signed codes (a byte a value: ggml's
+// kvalues_mxfp4 halved: E2M1's own values, the block's E8M0 scale halved) and the 8 blocks' scales
+PAR_AVX2 inline void dec8_mx(const uint8_t* b, __m256i* ws, __m256& dv) {
+    const __m256i lut = _mm256_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12,   //
+                                         0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const __m256i m4 = _mm256_set1_epi8(0x0f);
+    alignas(32) float sc[8];
+    for (int i = 0; i < 8; ++i) {
+        const uint8_t* p = b + (size_t) i * 17;
+        const __m256i c = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*) (p + 1)));
+        const __m128i lo = _mm256_castsi256_si128(_mm256_shuffle_epi8(lut, _mm256_and_si256(c, m4)));
+        const __m128i hi = _mm256_castsi256_si128(_mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(c, 4), m4)));
+        ws[i] = _mm256_inserti128_si256(_mm256_castsi128_si256(lo), hi, 1);   // values 0..15 | 16..31
+        sc[i] = e8m0(p[0]);
+    }
+    dv = _mm256_load_ps(sc);
 }
 template <int TYPE>
 PAR_AVX2 inline void dec8(const uint8_t* b, __m256i* ws, __m256i& s0v, __m256i& s1v, float& d) {
@@ -271,8 +324,9 @@ PAR_AVX2 inline void halves8(const __m256i* p, __m256i& lo, __m256i& hi) {
 template <int TYPE, int LPR>
 PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int nt, int r0, int r1, float (*sums)[kMaxT]) {
     constexpr bool kHalves = TYPE == kIQ2_S;   // (the others: s0 == s1)
+    constexpr bool kMx = TYPE == kMXFP4;       // (a block is a sub-block; its own E8M0 scale)
     constexpr int NQ = LPR / 8;                // (the lanes as vectors of 8)
-    const size_t rb = (size_t) (k / 256) * (size_t) block_bytes(TYPE);
+    const size_t rb = (size_t) (k / (kMx ? 32 : 256)) * (size_t) block_bytes(TYPE);
     const int nb = k / 256;
     const __m256i ones16 = _mm256_set1_epi16(1), ones8 = _mm256_set1_epi8(1), x80 = _mm256_set1_epi8((char) 0x80);
     thread_local std::vector<uint8_t> xu_buf;
@@ -294,14 +348,21 @@ PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int n
             for (int q = 0; q < NQ; ++q) acc[t][q] = _mm256_setzero_ps();
         for (int b = 0; b < nb; ++b) {
             __m256i ws[8], s0v, s1v;
-            float d;
-            dec8<TYPE>(row + (size_t) b * (size_t) block_bytes(TYPE), ws, s0v, s1v, d);
+            __m256 dv;
+            if constexpr (kMx) {
+                dec8_mx(row + (size_t) b * 136, ws, dv);
+                s0v = _mm256_set1_epi32(1);
+                s1v = s0v;
+            } else {
+                float d = 0.0f;
+                dec8<TYPE>(row + (size_t) b * (size_t) block_bytes(TYPE), ws, s0v, s1v, d);
+                dv = _mm256_set1_ps(d);
+            }
             __m256i p[8], wlo, whi;
             for (int i = 0; i < 8; ++i) p[i] = _mm256_madd_epi16(_mm256_maddubs_epi16(ones8, ws[i]), ones16);
             halves8(p, wlo, whi);
             wlo = _mm256_slli_epi32(wlo, 7);
             whi = _mm256_slli_epi32(whi, 7);
-            const __m256 dv = _mm256_set1_ps(d);
             const int q = b % NQ;   // (sub-blocks 8 b .. 8 b + 7: lanes (8 b) mod LPR ..)
             for (int t = 0; t < nt; ++t) {
                 const uint8_t* x = xu[t] + (size_t) b * 256;
@@ -313,8 +374,13 @@ PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int n
                 hi = _mm256_sub_epi32(hi, whi);
                 const __m256i is = kHalves ? _mm256_add_epi32(_mm256_mullo_epi32(lo, s0v), _mm256_mullo_epi32(hi, s1v))
                                            : _mm256_mullo_epi32(_mm256_add_epi32(lo, hi), s0v);
-                const __m256 v = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(is));
-                acc[t][q] = _mm256_fmadd_ps(_mm256_loadu_ps(xd[t] + (size_t) b * 8), v, acc[t][q]);
+                if constexpr (kMx)   // fma(block scale * activation scale, the exact int, sum) - the mx kernels' form
+                    acc[t][q] = _mm256_fmadd_ps(_mm256_mul_ps(dv, _mm256_loadu_ps(xd[t] + (size_t) b * 8)),
+                                                _mm256_cvtepi32_ps(is), acc[t][q]);
+                else {
+                    const __m256 v = _mm256_mul_ps(dv, _mm256_cvtepi32_ps(is));
+                    acc[t][q] = _mm256_fmadd_ps(_mm256_loadu_ps(xd[t] + (size_t) b * 8), v, acc[t][q]);
+                }
             }
         }
         for (int t = 0; t < nt; ++t) {
@@ -336,6 +402,7 @@ PAR_AVX2 void rows_avx2(int type, const uint8_t* w, int k, const void* const* ac
         case kIQ2_XXS: return rows_avx2_lpr<kIQ2_XXS>(w, k, act, nt, lpr, r0, r1, sums);
         case kIQ2_S: return rows_avx2_lpr<kIQ2_S>(w, k, act, nt, lpr, r0, r1, sums);
         case kIQ3_XXS: return rows_avx2_lpr<kIQ3_XXS>(w, k, act, nt, lpr, r0, r1, sums);
+        case kMXFP4: return rows_avx2_lpr<kMXFP4>(w, k, act, nt, lpr, r0, r1, sums);
         default: return rows_avx2_lpr<kIQ3_S>(w, k, act, nt, lpr, r0, r1, sums);
     }
 }
@@ -375,12 +442,18 @@ const char* g_form = "scalar";
 std::once_flag g_once;
 
 std::vector<uint8_t> rand_rows(int type, int n, int k, std::mt19937& rng) {
-    const size_t rb = (size_t) (k / 256) * (size_t) block_bytes(type);
+    const size_t rbb = (size_t) block_bytes(type);
+    const size_t rb = (size_t) (k / (type == kMXFP4 ? 32 : 256)) * rbb;
     std::vector<uint8_t> w(rb * (size_t) n);
     for (auto& v : w) v = (uint8_t) rng();
+    if (type == kMXFP4) {   // (the E8M0 scale bytes: finite, a few powers of two around 1)
+        for (int r = 0; r < n; ++r)
+            for (int b = 0; b < k / 32; ++b) w[(size_t) r * rb + (size_t) b * rbb] = (uint8_t) (126 + (rng() % 5));
+        return w;
+    }
     for (int r = 0; r < n; ++r)   // (finite F16 scales: exponent below 31, small)
         for (int b = 0; b < k / 256; ++b) {
-            uint8_t* p = w.data() + (size_t) r * rb + (size_t) b * (size_t) block_bytes(type);
+            uint8_t* p = w.data() + (size_t) r * rb + (size_t) b * rbb;
             const uint16_t h = (uint16_t) (0x1000u + (rng() % 0x1800u)) | (uint16_t) ((rng() & 1u) << 15);
             std::memcpy(p, &h, 2);
         }
@@ -394,7 +467,7 @@ void pick_form() {
     if ((f != nullptr && std::atoi(f) != 0) || !cpu_avx2()) return;
     std::mt19937 rng(0x644u);
     bool same = true;
-    for (int type : {kIQ2_XXS, kIQ2_S, kIQ3_XXS, kIQ3_S})
+    for (int type : {kIQ2_XXS, kIQ2_S, kIQ3_XXS, kIQ3_S, kMXFP4})
         for (int k : {256, 2304, 5120}) {
             const int n = 5, nt = 3;
             const std::vector<uint8_t> w = rand_rows(type, n, k, rng);
@@ -403,7 +476,7 @@ void pick_form() {
             for (int t = 0; t < nt; ++t) {
                 std::vector<float> x((size_t) k);
                 for (auto& v : x) v = std::ldexp((float) ((int) (rng() % 20001u) - 10000), -12);
-                quant(x.data(), k, a[(size_t) t].data());
+                quant(type, x.data(), k, a[(size_t) t].data());
                 ap[t] = a[(size_t) t].data();
             }
             for (int lpr : {kGuLanes, kDnLanes}) {
@@ -453,10 +526,11 @@ PAR_AVX2 void swiglu_chunk_avx2(int a, int b, int nt, const float (*gs)[kMaxT], 
 void gate_up_with(RowsFn fn, int type, const uint8_t* gate, const uint8_t* up, int k, const void* const* act, int nt,
                   float* const* h, int r0, int r1, float limit) {
     float gs[8][kMaxT], us[8][kMaxT];
+    const int lpr = lane_lanes(type, true);
     for (int a = r0; a < r1; a += 8) {
         const int b = std::min(r1, a + 8);
-        fn(type, gate, k, act, nt, kGuLanes, a, b, gs);
-        fn(type, up, k, act, nt, kGuLanes, a, b, us);
+        fn(type, gate, k, act, nt, lpr, a, b, gs);
+        fn(type, up, k, act, nt, lpr, a, b, us);
 #if defined(PAR_X86)
         if (fn == rows_avx2) {
             swiglu_chunk_avx2(a, b, nt, gs, us, h, limit);
@@ -468,7 +542,7 @@ void gate_up_with(RowsFn fn, int type, const uint8_t* gate, const uint8_t* up, i
 }
 void down_with(RowsFn fn, int type, const uint8_t* down, int k, const void* const* act, int nt, float* const* y,
                int r0, int r1) {
-    run_rows(fn, type, down, k, act, nt, kDnLanes, r0, r1, [&](int a, int b, float (*s)[kMaxT]) {
+    run_rows(fn, type, down, k, act, nt, lane_lanes(type, false), r0, r1, [&](int a, int b, float (*s)[kMaxT]) {
         for (int r = a; r < b; ++r)
             for (int t = 0; t < nt; ++t) y[t][r] = s[r - a][t];
     });
@@ -477,6 +551,25 @@ void down_with(RowsFn fn, int type, const uint8_t* down, int k, const void* cons
 }  // namespace
 
 bool lane_type(int type) { return block_bytes(type) > 0; }
+int lane_lanes(int type, bool gate_up) {
+    if (type == kMXFP4) return kGuLanes;   // (the mx kernels stripe both roles over 32 lanes)
+    return gate_up ? kGuLanes : kDnLanes;
+}
+
+void quant(int type, const float* x, int k, void* act) {
+    if (type != kMXFP4) return quant(x, k, act);
+    int8_t* q = (int8_t*) act;
+    float* d = (float*) ((uint8_t*) act + k);
+    for (int b = 0; b < k / 32; ++b) {
+        const float* xb = x + (size_t) b * 32;
+        float am = 0.0f;
+        for (int j = 0; j < 32; ++j) am = std::fmax(am, std::fabs(xb[j]));
+        const float sc = am / 127.0f;   // (the device's q8_quant: the same division and rounding)
+        for (int j = 0; j < 32; ++j)
+            q[(size_t) b * 32 + (size_t) j] = (int8_t) (am > 0.0f ? std::nearbyint(xb[j] / sc) : 0.0);
+        d[b] = sc;
+    }
+}
 
 void quant(const float* x, int k, void* act) {
     int8_t* q = (int8_t*) act;
