@@ -3376,6 +3376,55 @@ void test_mx_lane(cudaStream_t s) {
     mx_lane_cmp("tiles (32 rows) vs token path", tile.second, y_tok);
     mx_lane_cmp("light vs tiles", light.second, tile.second);
     mx_lane_cmp("CPU lane vs light", yc, light.second);
+    // ---- ein Tensor-Parallel-Paar (--tp 2): die beiden FF-Baender eines Experten, wie die Gruppe ihn teilt - Gate / Up
+    // die Zeilen [ff0, ff0 + ffn), die Down in jeder Zeile nur die Bloecke des Bandes.  Das Geraet summiert je Mitglied
+    // ueber sein Band und addiert dann die zwei Teil-Summen; die Lane muss je Mitglied dieselben Bits liefern, sonst
+    // kippt die Platzierung das Ergebnis um 1 ulp (und spaeter das Routing).
+    for (const auto& band_of : {std::make_pair(0, 1152), std::make_pair(1216, 1088)}) {   // (1152/1152 und 1216/1088:
+        const int ff0 = band_of.first, fn = band_of.second;                              //  36 und 38/34 Bloecke)
+        const size_t gr = gg::mx_row_bytes(D), dr = gg::mx_row_bytes(F);
+        const size_t d0 = gg::type_row_bytes(gg::kTypeMXFP4, ff0), dh = gg::type_row_bytes(gg::kTypeMXFP4, fn);
+        x3::ExpertLayout ml = E.lay;
+        size_t off = 0;
+        for (int r = 0; r < 3; ++r) {
+            ml.trellis[r] = off;
+            off += (((r < 2 ? (size_t) fn * gr : (size_t) D * dh) + 255) >> 8) << 8;
+        }
+        std::vector<uint8_t> mblob(off, 0);
+        for (int r = 0; r < 2; ++r)
+            std::memcpy(mblob.data() + ml.trellis[r], emat(E, 0, r) + (size_t) ff0 * gr, (size_t) fn * gr);
+        for (int r = 0; r < D; ++r)
+            std::memcpy(mblob.data() + ml.trellis[2] + (size_t) r * dh, emat(E, 0, 2) + (size_t) r * dr + d0, dh);
+        // das Gerat: der Token-Pfad mit dem Band des Mitglieds (n_ff = ffn, sein Layout, sein Blob)
+        uint8_t* dmb = dev(mblob);
+        float* dh_m = dev(std::vector<float>((size_t) 8 * (size_t) fn));
+        float* dout_m = dev(std::vector<float>((size_t) D));
+        std::vector<unsigned long long> p1(8, 0ull);
+        p1[0] = (unsigned long long) dmb;
+        unsigned long long* dp1 = dev(p1);
+        x3::MoeArgs mb = ma;
+        mb.plan_ptr = dp1;
+        mb.lay = ml;
+        mb.n_ff = fn;
+        gg::moe_gate_up(mb, dx, dh_m, s);
+        gg::moe_down(mb, dh_m, nullptr, dout_m, s);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> h_m = host(dh_m, (size_t) fn), y_m = host(dout_m, (size_t) D);
+        // die Lane: dasselbe Band, dasselbe h (des ganzen Experten), ab dem ersten Block des Bandes
+        std::vector<uint8_t> band(par::act_bytes(fn));
+        par::quant(gg::kTypeMXFP4, h_par.data() + ff0, fn, band.data());
+        std::vector<float> y_lane((size_t) D), y_ref((size_t) D);
+        const void* bp[1] = {band.data()};
+        float* yl[1] = {y_lane.data()};
+        float* yr[1] = {y_ref.data()};
+        par::down_band(gg::kTypeMXFP4, emat(E, 0, 2) + d0, dr, fn, bp, 1, yl, 0, D);
+        par::down_band_ref(gg::kTypeMXFP4, emat(E, 0, 2) + d0, dr, fn, bp, 1, yr, 0, D);
+        std::printf("  TP-Band [%4d, %4d) (%2d Bloecke):\n", ff0, ff0 + fn, fn / 32);
+        mx_lane_cmp("h des Bandes: Lane vs Gerat", std::vector<float>(h_par.begin() + ff0, h_par.begin() + ff0 + fn), h_m);
+        mx_lane_cmp("down des Bandes: Lane vs Gerat", y_lane, y_m);
+        mx_lane_cmp("down des Bandes: AVX2 vs skalar", y_lane, y_ref);
+        cudaFree(dmb), cudaFree(dh_m), cudaFree(dout_m), cudaFree(dp1);
+    }
     // ---- Stabilitaet: derselbe Experte mit denselben 8 Zeilen, aber in Aufrufen unterschiedlicher Zusammensetzung.
     // Genau das ist die Platzierungsabhaengigkeit im Prefill: welche Experten in einem Aufruf landen, entscheidet der
     // Ring, und dessen Groesse kommt aus dem freien VRAM.

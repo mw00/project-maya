@@ -186,13 +186,16 @@ inline const float* act_d(const void* a, int k) { return (const float*) ((const 
 // rows [r0, r1) of one matrix against nt activations, scalar: sums[t][r - r0]
 // (an MXFP4 block is a sub-block: the value comes from the block, the activation's scale, its own E8M0 scale - in the
 // form the device's mx kernels use, fma(scale * activation scale, the block's exact int, sum))
+// (rs: the rows' stride in bytes where it is not k's own row - a member's FF band of a whole expert's down, the band's
+// blocks first in each row; 0: k's own)
 void rows_scalar(int type, const uint8_t* w, int k, const void* const* act, int nt, int lpr, int r0, int r1,
-                 float (*sums)[kMaxT]) {
+                 float (*sums)[kMaxT], size_t rs) {
     const bool mx = type == kMXFP4;
     const size_t rb = (size_t) (k / (mx ? 32 : 256)) * (size_t) block_bytes(type);
+    const size_t stride = rs != 0 ? rs : rb;
     const int nsb = k / 32;
     for (int r = r0; r < r1; ++r) {
-        const uint8_t* row = w + (size_t) r * rb;
+        const uint8_t* row = w + (size_t) r * stride;
         float acc[kMaxT][32] = {};
         Sub s;
         for (int kb = 0; kb < nsb; ++kb) {
@@ -322,12 +325,15 @@ PAR_AVX2 inline void halves8(const __m256i* p, __m256i& lo, __m256i& hi) {
     hi = _mm256_permute2x128_si256(a, b, 0x31);
 }
 template <int TYPE, int LPR>
-PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int nt, int r0, int r1, float (*sums)[kMaxT]) {
+PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int nt, int r0, int r1, float (*sums)[kMaxT],
+                          size_t rs) {
     constexpr bool kHalves = TYPE == kIQ2_S;   // (the others: s0 == s1)
     constexpr bool kMx = TYPE == kMXFP4;       // (a block is a sub-block; its own E8M0 scale)
     constexpr int NQ = LPR / 8;                // (the lanes as vectors of 8)
     const size_t rb = (size_t) (k / (kMx ? 32 : 256)) * (size_t) block_bytes(TYPE);
-    const int nb = k / 256;
+    const size_t stride = rs != 0 ? rs : rb;
+    const int nsb = kMx ? k / 32 : (k / 256) * 8;   // (the sub-blocks: a 256-value step is 8 of them)
+    const int nb = nsb / 8, tail = nsb - nb * 8;   // (a band of 32-value blocks: the last ones below a step)
     const __m256i ones16 = _mm256_set1_epi16(1), ones8 = _mm256_set1_epi8(1), x80 = _mm256_set1_epi8((char) 0x80);
     thread_local std::vector<uint8_t> xu_buf;
     if (xu_buf.size() < (size_t) kMaxT * (size_t) k) xu_buf.resize((size_t) kMaxT * (size_t) k);
@@ -342,7 +348,7 @@ PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int n
         xd[t] = act_d(act[t], k);
     }
     for (int r = r0; r < r1; ++r) {
-        const uint8_t* row = w + (size_t) r * rb;
+        const uint8_t* row = w + (size_t) r * stride;
         __m256 acc[kMaxT][NQ];
         for (int t = 0; t < nt; ++t)
             for (int q = 0; q < NQ; ++q) acc[t][q] = _mm256_setzero_ps();
@@ -386,24 +392,34 @@ PAR_AVX2 void rows_avx2_t(const uint8_t* w, int k, const void* const* act, int n
         for (int t = 0; t < nt; ++t) {
             alignas(32) float a[32];
             for (int q = 0; q < NQ; ++q) _mm256_store_ps(a + 8 * q, acc[t][q]);
+            // the sub-blocks below a 256-value step (a member's FF band of 36 blocks: 4 of them): one block a time through
+            // the scalar form, into the same lanes (b % LPR) and with the same fma as the steps above
+            if (kMx)
+                for (int kb = nb * 8; kb < nb * 8 + tail; ++kb) {
+                    Sub s;
+                    decode(TYPE, row, kb, s);
+                    const int lane = kb & (LPR - 1);
+                    a[lane] = p_fma(p_mul(s.d, act_d(act[t], k)[kb]), (float) sub_dot_int(s, act_q(act[t]) + 32 * kb),
+                                    a[lane]);
+                }
             sums[r - r0][t] = lanes_tree(a, LPR);
         }
     }
 }
 template <int TYPE>
 PAR_AVX2 void rows_avx2_lpr(const uint8_t* w, int k, const void* const* act, int nt, int lpr, int r0, int r1,
-                            float (*sums)[kMaxT]) {
-    if (lpr == kGuLanes) rows_avx2_t<TYPE, kGuLanes>(w, k, act, nt, r0, r1, sums);
-    else rows_avx2_t<TYPE, kDnLanes>(w, k, act, nt, r0, r1, sums);
+                            float (*sums)[kMaxT], size_t rs) {
+    if (lpr == kGuLanes) rows_avx2_t<TYPE, kGuLanes>(w, k, act, nt, r0, r1, sums, rs);
+    else rows_avx2_t<TYPE, kDnLanes>(w, k, act, nt, r0, r1, sums, rs);
 }
 PAR_AVX2 void rows_avx2(int type, const uint8_t* w, int k, const void* const* act, int nt, int lpr, int r0, int r1,
-                        float (*sums)[kMaxT]) {
+                        float (*sums)[kMaxT], size_t rs) {
     switch (type) {
-        case kIQ2_XXS: return rows_avx2_lpr<kIQ2_XXS>(w, k, act, nt, lpr, r0, r1, sums);
-        case kIQ2_S: return rows_avx2_lpr<kIQ2_S>(w, k, act, nt, lpr, r0, r1, sums);
-        case kIQ3_XXS: return rows_avx2_lpr<kIQ3_XXS>(w, k, act, nt, lpr, r0, r1, sums);
-        case kMXFP4: return rows_avx2_lpr<kMXFP4>(w, k, act, nt, lpr, r0, r1, sums);
-        default: return rows_avx2_lpr<kIQ3_S>(w, k, act, nt, lpr, r0, r1, sums);
+        case kIQ2_XXS: return rows_avx2_lpr<kIQ2_XXS>(w, k, act, nt, lpr, r0, r1, sums, rs);
+        case kIQ2_S: return rows_avx2_lpr<kIQ2_S>(w, k, act, nt, lpr, r0, r1, sums, rs);
+        case kIQ3_XXS: return rows_avx2_lpr<kIQ3_XXS>(w, k, act, nt, lpr, r0, r1, sums, rs);
+        case kMXFP4: return rows_avx2_lpr<kMXFP4>(w, k, act, nt, lpr, r0, r1, sums, rs);
+        default: return rows_avx2_lpr<kIQ3_S>(w, k, act, nt, lpr, r0, r1, sums, rs);
     }
 }
 bool cpu_avx2() {   // (AVX2 + FMA, the OS saving the YMM state: ds4_iq_cpu.cpp's iq_isa)
@@ -436,7 +452,8 @@ bool cpu_avx2() {   // (AVX2 + FMA, the OS saving the YMM state: ds4_iq_cpu.cpp'
 
 // ---- the form: AVX2 where the CPU runs it and it gives the scalar form's bits on random rows of every type (checked
 // once); DS4_LANE_PARITY_SCALAR=1 (MAYA_DS4_LANE_PARITY_SCALAR): the scalar form
-using RowsFn = void (*)(int, const uint8_t*, int, const void* const*, int, int, int, int, float (*)[kMaxT]);
+// (the last argument: the rows' stride in bytes, 0: k's own - a tensor-parallel member's FF band, down_band)
+using RowsFn = void (*)(int, const uint8_t*, int, const void* const*, int, int, int, int, float (*)[kMaxT], size_t);
 RowsFn g_rows = rows_scalar;
 const char* g_form = "scalar";
 std::once_flag g_once;
@@ -468,7 +485,10 @@ void pick_form() {
     std::mt19937 rng(0x644u);
     bool same = true;
     for (int type : {kIQ2_XXS, kIQ2_S, kIQ3_XXS, kIQ3_S, kMXFP4})
-        for (int k : {256, 2304, 5120}) {
+        // (MXFP4 too in the band sizes a tensor-parallel member's FFN takes: 32-value blocks, not a multiple of 256 -
+        //  the AVX2 rows' scalar tail there)
+        for (int k : type == kMXFP4 ? std::initializer_list<int>{256, 1056, 1152, 1248, 2304, 5120}
+                                    : std::initializer_list<int>{256, 2304, 5120}) {
             const int n = 5, nt = 3;
             const std::vector<uint8_t> w = rand_rows(type, n, k, rng);
             std::vector<std::vector<uint8_t>> a(nt, std::vector<uint8_t>(act_bytes(k)));
@@ -481,8 +501,8 @@ void pick_form() {
             }
             for (int lpr : {kGuLanes, kDnLanes}) {
                 float s1[8][kMaxT], s2[8][kMaxT];
-                rows_scalar(type, w.data(), k, ap, nt, lpr, 0, n, s1);
-                rows_avx2(type, w.data(), k, ap, nt, lpr, 0, n, s2);
+                rows_scalar(type, w.data(), k, ap, nt, lpr, 0, n, s1, 0);
+                rows_avx2(type, w.data(), k, ap, nt, lpr, 0, n, s2, 0);
                 for (int r = 0; r < n; ++r) same = same && std::memcmp(s1[r], s2[r], (size_t) nt * 4) == 0;
             }
         }
@@ -502,11 +522,11 @@ RowsFn rows_fn() {
 // rows [r0, r1) in chunks of 8 rows (the sums' stack array)
 template <class Out>
 void run_rows(RowsFn fn, int type, const uint8_t* w, int k, const void* const* act, int nt, int lpr, int r0, int r1,
-              Out out) {
+              Out out, size_t rs) {
     float sums[8][kMaxT];
     for (int a = r0; a < r1; a += 8) {
         const int b = std::min(r1, a + 8);
-        fn(type, w, k, act, nt, lpr, a, b, sums);
+        fn(type, w, k, act, nt, lpr, a, b, sums, rs);
         out(a, b, sums);
     }
 }
@@ -524,13 +544,13 @@ PAR_AVX2 void swiglu_chunk_avx2(int a, int b, int nt, const float (*gs)[kMaxT], 
 }
 #endif
 void gate_up_with(RowsFn fn, int type, const uint8_t* gate, const uint8_t* up, int k, const void* const* act, int nt,
-                  float* const* h, int r0, int r1, float limit) {
+                  float* const* h, int r0, int r1, float limit) {   // (whole rows: no stride)
     float gs[8][kMaxT], us[8][kMaxT];
     const int lpr = lane_lanes(type, true);
     for (int a = r0; a < r1; a += 8) {
         const int b = std::min(r1, a + 8);
-        fn(type, gate, k, act, nt, lpr, a, b, gs);
-        fn(type, up, k, act, nt, lpr, a, b, us);
+        fn(type, gate, k, act, nt, lpr, a, b, gs, 0);
+        fn(type, up, k, act, nt, lpr, a, b, us, 0);
 #if defined(PAR_X86)
         if (fn == rows_avx2) {
             swiglu_chunk_avx2(a, b, nt, gs, us, h, limit);
@@ -541,11 +561,11 @@ void gate_up_with(RowsFn fn, int type, const uint8_t* gate, const uint8_t* up, i
     }
 }
 void down_with(RowsFn fn, int type, const uint8_t* down, int k, const void* const* act, int nt, float* const* y,
-               int r0, int r1) {
+               int r0, int r1, size_t rs) {
     run_rows(fn, type, down, k, act, nt, lane_lanes(type, false), r0, r1, [&](int a, int b, float (*s)[kMaxT]) {
         for (int r = a; r < b; ++r)
             for (int t = 0; t < nt; ++t) y[t][r] = s[r - a][t];
-    });
+    }, rs);
 }
 
 }  // namespace
@@ -604,14 +624,22 @@ void gate_up(int type, const uint8_t* gate, const uint8_t* up, int k, const void
     gate_up_with(rows_fn(), type, gate, up, k, act, nt, h, r0, r1, limit);
 }
 void down(int type, const uint8_t* dn, int k, const void* const* act, int nt, float* const* y, int r0, int r1) {
-    down_with(rows_fn(), type, dn, k, act, nt, y, r0, r1);
+    down_with(rows_fn(), type, dn, k, act, nt, y, r0, r1, 0);
+}
+void down_band(int type, const uint8_t* dn, size_t rs, int k, const void* const* act, int nt, float* const* y, int r0,
+               int r1) {
+    down_with(rows_fn(), type, dn, k, act, nt, y, r0, r1, rs);
 }
 void gate_up_ref(int type, const uint8_t* gate, const uint8_t* up, int k, const void* const* act, int nt,
                  float* const* h, int r0, int r1, float limit) {
     gate_up_with(rows_scalar, type, gate, up, k, act, nt, h, r0, r1, limit);
 }
 void down_ref(int type, const uint8_t* dn, int k, const void* const* act, int nt, float* const* y, int r0, int r1) {
-    down_with(rows_scalar, type, dn, k, act, nt, y, r0, r1);
+    down_with(rows_scalar, type, dn, k, act, nt, y, r0, r1, 0);
+}
+void down_band_ref(int type, const uint8_t* dn, size_t rs, int k, const void* const* act, int nt, float* const* y,
+                   int r0, int r1) {
+    down_with(rows_scalar, type, dn, k, act, nt, y, r0, r1, rs);
 }
 const char* form() {
     (void) rows_fn();
@@ -619,7 +647,7 @@ const char* form() {
 }
 float row_ref(int type, const uint8_t* row, int k, const void* act, int lpr) {
     float s[8][kMaxT];
-    rows_scalar(type, row, k, &act, 1, lpr, 0, 1, s);
+    rows_scalar(type, row, k, &act, 1, lpr, 0, 1, s, 0);
     return s[0][0];
 }
 

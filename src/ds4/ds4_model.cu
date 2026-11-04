@@ -1564,11 +1564,19 @@ struct Model::Impl {
     Req* reqs = nullptr;
     Resp* resps = nullptr;
     // DS4_LANE_PARITY (gg::lane_parity, a GGUF): the CPU lane's low-bit experts in the device's arithmetic
-    // (cpu_experts_par), each pick's output its own part of the sum - lane_picks [kRing][kWin][kPicks][dim], host-mapped,
-    // with Resp::pmask saying which picks a window's answer holds there
+    // (cpu_experts_par), each pick's output its own part of the sum - lane_picks [kRing][lane_nm][kWin][kPicks][dim],
+    // host-mapped, with Resp::pmask saying which picks a window's answer holds there.  A tensor-parallel layer's answer
+    // is a part a member (lane_nm: the widest group): each member sums its own FF band of the expert, as its kernels do,
+    // so its own row of the picks buffer holds its member's part
     bool lane_par = false;
+    int lane_nm = 1;             // the most members a layer's picks hold (1: one part, as before)
     float* lane_picks = nullptr;
-    float* lane_pick_rows(unsigned seq) const { return lane_picks + (size_t) (seq % kRing) * kWin * kPicks * g.dim; }
+    float* lane_pick_rows(unsigned seq) const {
+        return lane_picks + (size_t) (seq % kRing) * (size_t) lane_nm * kWin * kPicks * g.dim;
+    }
+    float* lane_pick_member(unsigned seq, int m) const {   // (member m's part of the picks, the lead's first)
+        return lane_pick_rows(seq) + (size_t) m * kWin * kPicks * g.dim;
+    }
     // the helper GPU (DS4_HELPER=<visible GPU>, DS4_HELPER_GB=<its pool>): no layer of its own, outside every device
     // loop (devs, the groups, the trunk's buffers, the PCIe lane); its pool holds the most-routed of the experts the
     // layer devices' VRAM leaves over (helper_select), as they are from then on.  A decoded request's picks of them are
@@ -4685,6 +4693,7 @@ struct Model::Impl {
         NH = file_experts ? 1 : (int) std::min<size_t>(2, cores.size());
         if (NH > 1 && ((g.ff / NH) % 128 != 0 || (g.dim / NH) % 128 != 0)) NH = 1;
         if (!pk.gguf) make_pools();   // (a GGUF's after its experts: copy_experts decides NH)
+        for (const Layer& l : L) lane_nm = std::max(lane_nm, l.nm);   // (a group's members: an expert's parts)
         {
             const size_t E = (size_t) g.dim, FF = (size_t) g.ff, GQ = E / 256, DQ = FF / 128, S = kSlots;
             c_xh.resize((size_t) NH * S * 2 * E);
@@ -4693,7 +4702,7 @@ struct Model::Impl {
             c_xhd.resize(S * FF);
             c_xsd.resize(S * (FF / 128));
             c_accd.resize((size_t) NH * S * DQ * (E / NH));
-            c_yd.resize(S * E);
+            c_yd.resize((size_t) lane_nm * S * E);   // (a tensor-parallel layer's: each member's part a block)
         }
         // the experts: VRAM slots in what each device has left (after the PCIe lane's staging slots), the rest on the host
         if (!lane_alloc(err)) return false;
@@ -4867,7 +4876,7 @@ struct Model::Impl {
             resps = (Resp*) m;
             lane_par = pk.gguf && gg::lane_parity();
             if (lane_par) {
-                const size_t bytes = (size_t) kRing * kWin * kPicks * (size_t) g.dim * sizeof(float);
+                const size_t bytes = (size_t) kRing * (size_t) lane_nm * kWin * kPicks * (size_t) g.dim * sizeof(float);
                 if (cudaHostAlloc(&m, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
                     err = "host-mapped memory for the CPU lane's picks (MAYA_DS4_LANE_PARITY=1; unset turns it off)";
                     return false;
@@ -4875,8 +4884,9 @@ struct Model::Impl {
                 host_allocs.push_back(m);
                 lane_picks = (float*) m;
                 std::fprintf(stderr, "ds4: lane parity: the CPU lane's low-bit experts in the device's arithmetic (%s rows, "
-                                     "%.0f MB of picks; MAYA_DS4_LANE_PARITY)\n",
-                             par::form(), bytes / 1048576.0);
+                                     "%.0f MB of picks%s; MAYA_DS4_LANE_PARITY)\n",
+                             par::form(), bytes / 1048576.0,
+                             lane_nm > 1 ? ", a part a tensor-parallel member" : "");
             }
             if (!hmap(lane_done, 32, err)) return false;
             std::memset((void*) reqs, 0, sizeof(Req) * kRing);
@@ -10702,9 +10712,15 @@ struct Model::Impl {
     bool lane_par_layer(const Layer& l) const {
         const int tg = gg::expert_type(l.lay, 0), td = gg::expert_type(l.lay, 2);
         const int bs = tg == gg::kTypeMXFP4 && td == gg::kTypeMXFP4 ? 32 : 256;
-        const bool ok = lane_par && l.n_cls <= 1 && par::lane_type(tg) && gg::expert_type(l.lay, 1) == tg &&
-                        par::lane_type(td) && g.dim % bs == 0 && g.ff % bs == 0 &&
-                        par::act_bytes(g.dim) <= (size_t) g.dim * 4;
+        bool ok = lane_par && l.n_cls <= 1 && par::lane_type(tg) && gg::expert_type(l.lay, 1) == tg &&
+                  par::lane_type(td) && g.dim % bs == 0 && g.ff % bs == 0 &&
+                  par::act_bytes(g.dim) <= (size_t) g.dim * 4;
+        // (a tensor-parallel layer: each member's FF band whole blocks of the type - the band's down sums from its first
+        //  block over a row of ffn values, and its rows are the expert's rows [ff0, ff0 + ffn))
+        for (int m = 0; ok && m < l.nm; ++m) {
+            const Layer& x = member(l, m);
+            ok = x.ff0 % bs == 0 && x.ffn % bs == 0;
+        }
         static int said = 0;   // (DS4_LANE_PARITY_DEBUG: the first layers that do not take it)
         if (!ok && lane_par && said < 2 && std::getenv("DS4_LANE_PARITY_DEBUG") != nullptr) {
             ++said;
@@ -10759,6 +10775,39 @@ struct Model::Impl {
                              r1 - X * FFh, lim);
             };
         run_nodes(ne * GB, f);
+        if (l.nm > 1) {
+            // (a tensor-parallel layer) each member sums only its own FF band of the expert, as its kernels do: its gate /
+            // up rows [ff0, ff0 + ffn) (a row's sum is over the whole n_embd, so the whole expert's rows hold the same
+            // bits), then its down rows with only its blocks [ff0/32, (ff0 + ffn)/32) of each - the band's h quantized
+            // on its own (the same 32-value blocks) and summed from the band's first block, over the lanes of a row of
+            // ffn values.  Each member's part goes to its own block of c_yd; the device adds it in its member's sum and
+            // the group's all-reduce adds the members, so an expert keeps its bits wherever it is computed.
+            // (the band's activation reuses the h rows' bytes: one member's down jobs end before the next's start)
+            for (int m = 0; m < l.nm; ++m) {
+                const Layer& x = member(l, m);
+                const size_t d0 = gg::type_row_bytes(td, x.ff0), dr = gg::type_row_bytes(td, FF);
+                const int ffn = x.ffn, ff0 = x.ff0;
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i)
+                        par::quant(td, c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) ff0, ffn,
+                                   aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                for (int X = 0; X < NH; ++X)
+                    f[X] = [&, X, m, d0, dr, ffn](int j) {
+                        const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
+                        const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                        const void* hp[gg::kMxCpuMaxN];
+                        float* yp[gg::kMxCpuMaxN];
+                        for (int i = 0; i < en.n; ++i) {
+                            hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                            yp[i] = c_yd.data() + (size_t) (m * kSlots + en.slot0 + i) * E + (size_t) X * Eh;
+                        }
+                        // (the member's blocks of each row, from where the row holds them in the whole expert's part X)
+                        par::down_band(td, ent_part(l, en, 2, X) + d0, dr, ffn, hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                    };
+                run_nodes(ne * DB, f);
+            }
+            return;
+        }
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
                 par::quant(td, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
@@ -15083,15 +15132,20 @@ struct Model::Impl {
                     lt.n_cpu = (int) ents.size();
                     const int D = g.dim;
                     // (DS4_LANE_PARITY: each slot's output as its pick's own part - the device sums it in the pick's
-                    //  place, as it would have summed the expert from its VRAM; no weighted sum here)
+                    //  place, as it would have summed the expert from its VRAM; no weighted sum here.  A tensor-parallel
+                    //  layer: a part a member, each member's own row of the picks)
                     const bool own = lane_par && lane_par_layer(l);
                     if (own) {
-                        float* pk_rows = lane_pick_rows(next);
-                        for (int sl = 0; sl < nslots; ++sl) {
-                            const int t = tok_of[sl], i = pick_of[sl];
-                            std::memcpy(pk_rows + ((size_t) t * kPicks + (size_t) i) * D, c_yd.data() + (size_t) sl * D,
-                                        (size_t) D * sizeof(float));
-                            rp.pmask[t] |= 1 << i;
+                        const int nm = l.nm > 1 ? l.nm : 1;
+                        for (int m = 0; m < nm; ++m) {
+                            float* pk_rows = lane_pick_member(next, m);
+                            for (int sl = 0; sl < nslots; ++sl) {
+                                const int t = tok_of[sl], i = pick_of[sl];
+                                std::memcpy(pk_rows + ((size_t) t * kPicks + (size_t) i) * D,
+                                            c_yd.data() + (size_t) (nm > 1 ? m * kSlots + sl : sl) * D,
+                                            (size_t) D * sizeof(float));
+                                rp.pmask[t] |= 1 << i;   // (the picks the lane answered: the same for every member)
+                            }
                         }
                     }
                     for (int t = 0; !own && t < T; ++t) {
@@ -21518,6 +21572,9 @@ struct Model::Impl {
             if (!shared_down(d, l, T, FF, err)) return false;
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
+            // (a tensor-parallel group: every member sums its own FF band, so every member adds its own part of the
+            //  lane's picks and every member waits for the answer - the lane writes a part a member)
+            const bool lane_m = lane_par && nm > 1 && lane_picks != nullptr;
             if (T == 1 && moe_token_path) {
                 const int lc = lead && nm == 1 && lay.fmt == gg::kFmtMXFP4 ? lane_class(l.il) : -1;
                 const bool zc_nowait = lc >= 0 && ln_zc_nowait && zc_layer_full(l);
@@ -21529,8 +21586,8 @@ struct Model::Impl {
                 ma.plan_w = d.rw;
                 ma.cpu_part = lead && !zc_nowait ? resps[slot].part[0] : nullptr;
                 ma.cpu_flag = lead && !zc_nowait ? &resps[slot].cpu[0] : nullptr;
-                if (lead && !zc_nowait && lane_picks != nullptr) {
-                    ma.cpu_picks = lane_pick_rows(slot);
+                if ((lead || lane_m) && !zc_nowait && lane_picks != nullptr) {
+                    ma.cpu_picks = lane_pick_member(slot, mi);
                     ma.cpu_pick_stride = (size_t) D;
                     ma.cpu_pmask = &resps[slot].pmask[0];
                 }
@@ -21555,7 +21612,7 @@ struct Model::Impl {
                     m2.plan_ptr = LD.plan2;
                     gg::moe_gate_up(m2, d.x, d.xg, s);
                 }
-                if (lead && !zc_nowait) wait_seq(&resps[slot].seq, sq, s);
+                if ((lead || lane_m) && !zc_nowait) wait_seq(&resps[slot].seq, sq, s);
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
@@ -21587,12 +21644,12 @@ struct Model::Impl {
                 wa.cpu_part = lead ? &resps[slot].part[0][0] : nullptr;
                 wa.cpu_stride = kMaxDim;
                 wa.cpu_flag = lead ? resps[slot].cpu : nullptr;
-                if (lead && lane_picks != nullptr) {
-                    wa.cpu_picks = lane_pick_rows(slot);
+                if ((lead || lane_m) && lane_picks != nullptr) {
+                    wa.cpu_picks = lane_pick_member(slot, mi);
                     wa.cpu_pick_stride = (size_t) D;
                     wa.cpu_pmask = resps[slot].pmask;
                 }
-                wa.wait_ptr = lead ? &resps[slot].seq : nullptr;
+                wa.wait_ptr = lead || lane_m ? &resps[slot].seq : nullptr;
                 wa.wait_val = sq;
                 wa.x = d.x;
                 wa.x_stride = (size_t) D;

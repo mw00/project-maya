@@ -38,10 +38,18 @@ void gate_up(int type, const uint8_t* gate, const uint8_t* up, int k, const void
              int r0, int r1, float limit);
 /// y[t][r] = down_r . act[t] for rows [r0, r1) (k = n_ff inputs).
 void down(int type, const uint8_t* down, int k, const void* const* act, int nt, float* const* y, int r0, int r1);
+/// The same rows where a row is `rs` bytes in memory instead of k's own - a tensor-parallel member's FF band of a
+/// whole expert's down: `down` points at the band's first block of row 0, the band's k = ffn values are summed from
+/// that block on (the lanes b % 32 of the member's blocks, as the member's own kernel sums them).
+void down_band(int type, const uint8_t* down, size_t rs, int k, const void* const* act, int nt, float* const* y,
+               int r0, int r1);
 /// (tests) the scalar forms of the same, and which form the two above take ("avx2" or "scalar") after their check.
+/// The band's rows through the scalar form too (down_band_ref): same bits either form.
 void gate_up_ref(int type, const uint8_t* gate, const uint8_t* up, int k, const void* const* act, int nt,
                  float* const* h, int r0, int r1, float limit);
 void down_ref(int type, const uint8_t* down, int k, const void* const* act, int nt, float* const* y, int r0, int r1);
+void down_band_ref(int type, const uint8_t* down, size_t rs, int k, const void* const* act, int nt, float* const* y,
+                   int r0, int r1);
 const char* form();
 /// One row's sum with `lpr` lanes (the device's gate / up 32, down 16), scalar.
 float row_ref(int type, const uint8_t* row, int k, const void* act, int lpr);
