@@ -341,6 +341,23 @@ function gpuDetail(g, segs, m) {
     <i class=${`sw${s.key === "free" ? " sw--free" : ""}`} style=${`--gm-c:var(--gm-${s.key})`}></i><span>${s.label}</span>
     <b class="num">${gpuGb(s.bytes)}</b><span class="gpulegend__sub">${sub[s.key] || ""}</span></div>`)}</div>`;
 }
+// Free VRAM the next start's expert pool can use.  A tensor-parallel group's members hold the same expert slots, so
+// only the group's least free (tp_room, serve/gpu_map.py) grows them, counted once a group; a member's room beyond
+// it stays idle - a restart gives no experts there, a DSpark block moved onto it (MAYA_DS4_DRAFT_DEV) can use it.
+export function freeAdvice(frees, map, eng, where, pools, more) {
+  const room = (g) => (g.tp_room != null ? Math.min(g.free, g.tp_room) : g.free);
+  const grow = frees.filter((g) => room(g) >= 2 * GIB), idle = frees.filter((g) => g.free - room(g) >= 2 * GIB);
+  const seen = new Set(), out = [];
+  const n = grow.reduce((a, g) => { const k = g.tp_group ?? gpuKey(g); if (seen.has(k)) return a; seen.add(k); return a + more(g, room(g) - GIB); }, 0);
+  if (grow.length) out.push(`${gb(grow.reduce((a, g) => a + room(g), 0))} GB of ${where(grow)} are free: a restart gives ${pools(grow)} about ${fmt(n)} more experts.`);
+  if (idle.length) {
+    const draft = eng.engine_kind === "ds4" && map.some((g) => (g.parts || {}).drafter > 0);
+    out.push(`${gb(idle.reduce((a, g) => a + g.free - room(g), 0))} GB of ${where(idle)} sit idle: ` +
+      `the members of a tensor-parallel group hold the same expert slots and ${idle.length > 1 ? "their partners are" : "its partner is"} full, so a restart gives no more experts there` +
+      (draft ? `; moving DSpark drafter blocks onto ${idle.length > 1 ? "them" : "it"} (MAYA_DS4_DRAFT_DEV, see docs/SETTINGS.md) uses that room.` : "."));
+  }
+  return out.join(" ");
+}
 function GpuMap({m}) {
   const [open, setOpen] = useState(store.get("gpu-open", null));   // the row opened (several GPUs), remembered here
   const [focus, setFocus] = useState(null), [tip, setTip] = useState(null);
@@ -384,8 +401,7 @@ function GpuMap({m}) {
     const b = others.reduce((a, g) => a + g.parts.other, 0), n = others.reduce((a, g) => a + more(g, g.parts.other), 0);
     advice = `Other programs hold ${gb(b)} GB on ${where(others)}: with them closed, a restart gives ${pools(others)} about ${fmt(n)} more experts.`;
   } else if (frees.length) {
-    const b = frees.reduce((a, g) => a + g.free, 0), n = frees.reduce((a, g) => a + more(g, g.free - GIB), 0);
-    advice = `${gb(b)} GB of ${where(frees)} are free: a restart gives ${pools(frees)} about ${fmt(n)} more experts.`;
+    advice = freeAdvice(frees, map, eng, where, pools, more);
   }
   const pick = (k) => { const v = open === k ? null : k; setOpen(v); store.set("gpu-open", v); };
   const move = (e, r) => {
