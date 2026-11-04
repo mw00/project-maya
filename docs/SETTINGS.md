@@ -1399,6 +1399,7 @@ these kernel switches do not use the `MAYA_*` alias convention.
 | Setting | Default | What it does |
 | --- | --- | --- |
 | `EXL3_WMMA_GFX12` | off | `1`: allow RDNA4 matrix instructions; unset or `0`: portable grouped EXL3 prefill on gfx12 |
+| `EXL3_WMMA_GFX950` | off | `1`: the EXL3 prompt path on CDNA 4 (gfx950, MI350X) matrix cores (MFMA); unset or `0`: the portable path on gfx950, as before. Its sums are grouped differently, so the answers can differ slightly |
 | `EXL3_WMMA_ROWS` | `16` | `16` or `32`: routed rows processed per block |
 | `EXL3_WMMA` | enabled where supported | `0`: disable matrix prefill, overriding the gfx12 setting; `1`: allow it |
 
