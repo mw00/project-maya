@@ -488,6 +488,13 @@ model API: `partial_thinking` - when it was still thinking), less the last few t
 back. The message says how many tokens the answer had and why it stopped: after a GPU's fault on DeepSeek, the call
 that failed and the position in the context (what the engine prints on the console as it ends); otherwise that the
 reason is in the engine's log. After a GPU's fault the engine ends, and the next request starts a fresh one.
+## Server configuration
+
+These settings are top-level fields in the run configuration, not environment variables.
+
+| Setting | Default | What it is |
+|---|---|---|
+| `"deep_sleep"` | `"off"` | Opt in with `"checkpoint"` or `"auto"` (currently an alias for checkpoint) to allow the sleep endpoints to checkpoint a CUDA engine on Linux when its driver supports the required API. External vision helpers are unsupported. See [CUDA checkpoint sleep](CHECKPOINT_SLEEP.md) for behavior and limitations. |
 
 ## The thinking level and the thinking budget
 
