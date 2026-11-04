@@ -45,8 +45,9 @@ a:hover { color: var(--st-ink); }
 .btn--sm { height: 32px; padding: 0 12px; font-size: var(--st-fs-sm); }
 .btn--primary { background: var(--st-accent); color: var(--st-accent-ink); }
 .btn--primary:hover { background: var(--st-accent-hover); color: var(--st-accent-ink); }
-.btn--secondary { background: transparent; color: var(--st-ink); border: 1px solid var(--st-line-strong); font-weight: 500; }
-.btn--secondary:hover { background: var(--st-surface-2); color: var(--st-ink); }
+/* (a fill, not an outline: the grouped look) */
+.btn--secondary { background: var(--st-fill); color: var(--st-ink); font-weight: 500; }
+.btn--secondary:hover { background: var(--st-fill-hover); color: var(--st-ink); }
 .btn--danger { background: var(--st-danger-tint); color: var(--st-danger-text); }
 .btn--danger:hover { background: color-mix(in srgb, var(--st-danger) 22%, transparent); }
 .btn--ghost { background: transparent; color: var(--st-ink-soft); font-weight: 500; }
@@ -63,8 +64,8 @@ a:hover { color: var(--st-ink); }
              -webkit-backdrop-filter: blur(16px) saturate(160%); backdrop-filter: blur(16px) saturate(160%); }
 
 /* ---------------------------------------------------------------- inputs */
-.input { height: 36px; width: 100%; padding: 0 12px; border-radius: var(--st-r-row); border: 1px solid var(--st-line-strong);
-         background: var(--st-bg); color: var(--st-ink); font-size: var(--st-fs-md); }
+.input { height: 36px; width: 100%; padding: 0 12px; border-radius: var(--st-r-row); border: 1px solid transparent;
+         background: var(--st-fill); color: var(--st-ink); font-size: var(--st-fs-md); }
 .input:focus { outline: none; border-color: var(--st-focus); box-shadow: 0 0 0 3px var(--st-accent-tint); }
 .input--area { height: auto; min-height: 120px; padding: 12px 14px; border-radius: var(--st-r-md); font-size: var(--st-fs-base);
                line-height: 1.5; resize: vertical; }
@@ -91,13 +92,13 @@ a:hover { color: var(--st-ink); }
 .switch--sm[data-on="true"] .switch__knob { left: 15px; }
 
 /* a few choices side by side */
-.seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: var(--st-r-row); background: var(--st-surface-2); flex-wrap: wrap; }
+.seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: var(--st-r-md); background: var(--st-fill); flex-wrap: wrap; }
 .seg button { height: 30px; padding: 0 14px; border: 0; border-radius: var(--st-r-sm); background: transparent; color: var(--st-ink-muted);
               font-size: var(--st-fs-sm); font-weight: 500; transition: background var(--st-dur), color var(--st-dur); }
 .seg button:hover { color: var(--st-ink); }
-.seg button[aria-checked="true"] { background: var(--st-accent-tint); color: var(--st-accent-text); }
+.seg button[aria-checked="true"] { background: var(--st-seg-on); color: var(--st-ink); box-shadow: var(--st-seg-shadow); }
 
-.kbd { padding: 1px 7px; border-radius: var(--st-r-xs); border: 1px solid var(--st-line-strong); background: var(--st-surface-2);
+.kbd { padding: 1px 7px; border-radius: var(--st-r-xs); border: 0; background: var(--st-fill);
        font-family: inherit; font-size: var(--st-fs-xs); color: var(--st-ink); white-space: nowrap; }
 
 /* ---------------------------------------------------------------- menus */
@@ -126,7 +127,7 @@ a:hover { color: var(--st-ink); }
 .dialog-scrim--top { place-items: start center; padding-top: 12vh; }
 @keyframes fade { from { opacity: 0; } }
 .dialog { width: min(520px, 100%); max-height: calc(100vh - 48px); display: flex; flex-direction: column; overflow: hidden;
-          border-radius: var(--st-r-lg); background: var(--st-surface); box-shadow: var(--st-shadow-pop); animation: rise 160ms var(--st-ease); }
+          border-radius: var(--st-r-xl); background: var(--st-surface); box-shadow: var(--st-shadow-pop); animation: rise 160ms var(--st-ease); }
 @keyframes rise { from { opacity: 0; transform: translateY(8px) scale(.985); } }
 .dialog--wide { width: min(1100px, 100%); }
 .dialog__head { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 60px; padding: 0 12px 0 24px; flex: none; }

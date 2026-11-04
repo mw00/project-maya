@@ -126,4 +126,22 @@ def view(report: list[dict], cards: list[dict] | None, engine_pid, vision_pid=No
                     "slots": r.get("slots", 0), "layers": r.get("layers"), "ctx": r.get("ctx", 0),
                     "tp_n": r.get("tp_n", 0),
                     "kv_ram": r.get("kv_ram", 0), "measured": "nvml" if own is not None else "start"})
-    return out
+    return tp_rooms(out)
+
+
+def tp_rooms(gpus: list[dict]) -> list[dict]:
+    """A tensor-parallel group's members (tp_n > 1, the same layers) hold the same expert slots: a slot more takes room
+    on every member, so the room the next start's pool can use is the group's least free.  Each member gets
+    `tp_group` (its group's first dev) and `tp_room` (that least free); the room a member has beyond it stays idle -
+    the Monitor does not promise experts for it."""
+    groups: dict[tuple, list[dict]] = {}
+    for g in gpus:
+        lay = g.get("layers")
+        if g.get("tp_n", 0) > 1 and lay and lay[0] >= 0:
+            groups.setdefault((g["tp_n"], lay[0], lay[1]), []).append(g)
+    for ms in groups.values():
+        if len(ms) > 1:
+            room, first = min(m["free"] for m in ms), min(m["dev"] for m in ms)
+            for m in ms:
+                m.update(tp_group=first, tp_room=room)
+    return gpus

@@ -434,6 +434,73 @@ def mark_literals(messages: list[dict], tools: list[dict] | None, tags: dict[str
     return out, _mark_deep(tools, tags), True
 
 
+_SAME = object()   # (LiteralMemo: nothing to mark in this text)
+
+
+class LiteralMemo:
+    """mark_literals by text (MAYA_PROMPT_MEMO): _mark's answers remembered per text, so a re-sent history costs a dict
+    lookup a string instead of every literal searched in every string - a pure function of the text and the tags, the
+    same result.  Two generations, cap characters a generation; the old one goes when the new one is full."""
+
+    def __init__(self, tags: dict[str, str], cap: int = 48_000_000):
+        self.tags, self.own = tags, {t: v for t, v in tags.items() if t not in CALL_TAGS}
+        self.cap, self.chars = cap, 0
+        self.new, self.old = ({}, {}), ({}, {})
+
+    def _look(self, text: str, kind: int):
+        hit = self.new[kind].get(text)
+        if hit is None:
+            hit = self.old[kind].get(text)
+            if hit is None:
+                out = _mark(text, self.own if kind else self.tags)
+                hit = _SAME if out is text else out
+            self.new[kind][text] = hit
+            self.chars += len(text)
+            if self.chars > self.cap:
+                self.old, self.new, self.chars = self.new, ({}, {}), 0
+        return hit
+
+    def mark(self, text: str, kind: int = 0) -> str:
+        hit = self._look(text, kind)
+        return text if hit is _SAME else hit
+
+    def deep(self, v, kind: int = 0):
+        if isinstance(v, str):
+            return self.mark(v, kind)
+        if isinstance(v, dict):
+            return {k: self.deep(x, kind) for k, x in v.items()}
+        if isinstance(v, list):
+            return [self.deep(x, kind) for x in v]
+        return v
+
+    def has(self, v) -> bool:
+        if isinstance(v, str):
+            return self._look(v, 0) is not _SAME
+        if isinstance(v, dict):
+            return any(self.has(x) for x in v.values())
+        if isinstance(v, list):
+            return any(self.has(x) for x in v)
+        return False
+
+    def mark_literals(self, messages: list[dict], tools: list[dict] | None):
+        """mark_literals(messages, tools, self.tags), the same result."""
+        if not self.tags or (not self.has(messages) and not self.has(tools)):
+            return messages, tools, False
+        out = []
+        for m in messages:
+            m = dict(m)
+            assistant = m.get("role") == "assistant"
+            content = m.get("content")
+            for k, v in m.items():
+                if k != "role":
+                    m[k] = self.deep(v, 1 if assistant and k != "tool_calls" else 0)
+            if assistant and isinstance(content, str) and content.lstrip().startswith("<think>") and "</think>" in content:
+                i, j = content.index("<think>") + len("<think>"), content.index("</think>")
+                m["content"] = content[:i] + self.mark(content[i:j], 1) + "</think>" + self.mark(content[j + len("</think>"):], 1)
+            out.append(m)
+        return out, self.deep(tools, 0), True
+
+
 def unmark_literals(prompt: str, tags: dict[str, str]) -> tuple[str, list[tuple[int, int]]]:
     """The rendered prompt with the marks turned back into their literals' text, and the (start, end) spans of those
     literals in it - the spans the tokenizer encodes as ordinary text."""

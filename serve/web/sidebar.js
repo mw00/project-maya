@@ -1,7 +1,7 @@
 // serve/web/sidebar.js - the sidebar (new chat, search, Models, Monitor, Settings; the chats: pinned, in folders, then by day;
 // the model's status and what it saved against its API), a chat's ⋯ menu, and the search dialog.
 import {html, useEffect, useLayoutEffect, useMemo, useRef, useState} from "./preact.js";
-import {MOD, api, ctxfmt, dayGroup, fmt, isPhone, modelName, relTime, store} from "./lib.js";
+import {MOD, SUPPORT_URL, api, ctxfmt, dayGroup, fmt, isPhone, modelName, relTime, store} from "./lib.js";
 import {S, confirmDialog, emit, toast} from "./state.js";
 import {chatInstructions, chatTitle, deleteChat, exportChat, moveToFolder, newChat, newFolder, openChat, pinChat,
         renameChat, renameFolder, deleteFolder, toggleFolder} from "./chats.js";
@@ -270,11 +270,15 @@ function StatusCard() {
   const name = S.health.model_label || modelName(S.health.model);
   return html`<div class="side__foot">
     <${SavedLine}/>
+    <div class="status-row">
     <button type="button" class="status-card" onClick=${() => showView("monitor")} aria-label=${`${name}, ${st.text}. Open the Monitor`}>
       <${ModelLogo} model=${S.health.model}/>
       <span class="status-card__text"><b title=${S.health.model}>${name}</b>
         <span class=${`status status--${st.tone}`}><i class="status__dot"></i>${st.text}</span></span>
-    </button></div>`;
+    </button>
+    ${/* a quiet way to support Maya, beside the model's name: a link, never a popup */ ""}
+    <a class="icon-btn icon-btn--sm heart-link" href=${SUPPORT_URL} target="_blank" rel="noopener" aria-label="Support Maya" title="Support Maya">
+      <${Icon} name="heart" sm/></a></div></div>`;
 }
 
 // drawer: the phone's chats (app.js's PhonePush), in the page whether open or not - shut, nothing in them is reached

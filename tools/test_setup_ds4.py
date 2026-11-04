@@ -122,7 +122,7 @@ class Quant35(unittest.TestCase):
 
     def test_offered_only_where_exl3_runs(self):
         """--ds4-quant exl3-3.5, or the menu's row - on NVIDIA compute capability 7.0+ (not a PC whose GPUs are all
-        older) and on AMD, marked experimental there (as GLM's EXL3 quants)."""
+        older) and on AMD, unmarked there (as GLM's EXL3 quants; v1.1.53)."""
         self.assertIn("exl3-3.5", maya.DS4_QUANTS)
         def offered(gpus, backend="cuda", tags=None):
             rows = []
@@ -141,15 +141,15 @@ class Quant35(unittest.TestCase):
         self.assertEqual(offered([{"arch": 61}, {"arch": 61}]), [])            # (Pascal: the GGUFs only)
         nv, amd = [], []
         offered([{"arch": 89}], tags=nv)
-        self.assertEqual(len(offered([], backend="hip", tags=amd)), 2)          # (AMD: experimental, v1.1.30)
-        self.assertEqual(amd, ["experimental on AMD"] * 2)
-        self.assertNotIn("experimental on AMD", nv)
+        self.assertEqual(len(offered([], backend="hip", tags=amd)), 2)          # (AMD: since v1.1.30)
+        self.assertEqual(amd, [None] * 2)                                       # (no longer marked: v1.1.53)
+        self.assertEqual(nv, [None] * 2)
         self.assertRegex(offered([{"arch": 89}])[1], r"^DeepSeek V4\.1 · EXL3 3\.5 bpw \(461 GB\)$")
         self.assertEqual(maya.choose_ds4_quant(args(ds4_quant="exl3-3.5"), {}), "exl3-3.5")
 
-    def test_exl3_on_amd_experimental(self):
-        """AMD: the EXL3 quants go on to the AMD PC check with an experimental warning (as GLM's and MiniMax's EXL3
-        there), the GGUFs without one; neither is refused."""
+    def test_exl3_on_amd(self):
+        """AMD: the EXL3 quants and the GGUFs go on to the AMD PC check without a warning (as GLM's and MiniMax's
+        EXL3 there; v1.1.53); neither is refused."""
         def fail(*a, **kw):
             raise AssertionError(f"refused: {a}")
         for gguf in (False, True):
@@ -159,10 +159,7 @@ class Quant35(unittest.TestCase):
                     patch.object(maya, "check_hip_pc", lambda a, **kw: hip.append(kw) or {"backend": "hip"}):
                 self.assertEqual(maya.check_pc(args(backend="hip"), "deepseek", gguf=gguf), {"backend": "hip"})
             self.assertEqual(len(hip), 1)
-            self.assertEqual(len(said), 0 if gguf else 1)
-            if not gguf:
-                self.assertIn("experimental", said[0])
-                self.assertIn("deepseek-maya-s", said[0])
+            self.assertEqual(said, [])
 
     def test_own_folder_and_config(self):
         models = Path("/models")

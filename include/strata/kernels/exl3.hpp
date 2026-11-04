@@ -120,6 +120,11 @@ struct MoeArgs {
     const float* plan_w = nullptr;
     const float* cpu_part = nullptr;
     const int* cpu_flag = nullptr;
+    // (ds4 GGUF, DS4_LANE_PARITY) the CPU lane's picks, each its own part: pick i of token t (plan_ptr 0) at row
+    // t * 8 + i of cpu_picks (cpu_pick_stride floats apart) when bit i of cpu_pmask[t] is set
+    const float* cpu_picks = nullptr;
+    size_t cpu_pick_stride = 0;
+    const int* cpu_pmask = nullptr;
     ExpertLayout lay;
     MixedLayouts mix;     // (n > 0: the experts' layouts by class - lay is not used)
     int k = 8, n_embd = 4096, n_ff = 2048;
@@ -142,6 +147,9 @@ struct WinArgs {
     const float* cpu_part = nullptr;                // [T][n_embd] (rows cpu_stride apart when given)
     size_t cpu_stride = 0;
     const int* cpu_flag = nullptr;                  // [T]
+    const float* cpu_picks = nullptr;               // (ds4 GGUF, DS4_LANE_PARITY: as MoeArgs')
+    size_t cpu_pick_stride = 0;
+    const int* cpu_pmask = nullptr;
     const float* x = nullptr;
     size_t x_stride = 0;
     float* h = nullptr;

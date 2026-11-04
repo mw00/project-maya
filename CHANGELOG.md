@@ -4,6 +4,38 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.53 - 2026-11-04
+
+A new look for the web UI's Models, Monitor and Settings pages, AMD, Windows, the EXL3 quants and DeepSeek no longer marked experimental, MiniMax on Apple Silicon (experimental), fixes for third-party DeepSeek quants and failed updates, and many community pull requests.
+
+- **No longer marked experimental:** AMD support (RX 7900, R9700 / RX 9070, Strix Halo / Gorgon Halo), Windows support, DeepSeek-V4.1-Flash-1017, and the EXL3 quants (GLM's 3.05 / 4.05 / sc_4.10 bpw, DeepSeek's 2.9 / 3.5 bpw, MiniMax's 3.5 bpw) on NVIDIA from V100 and on AMD. The setup and the Models page no longer warn about them, and the README and docs say plainly where they run.
+- **Web UI:**
+  - **Models:** each model has a sheet - Overview (its setup, config, start script, folder, port, API name, last use), Engine (its settings) and Storage (what a delete would remove). Delete is on every row: its dialog names each folder and file with its size, what stays because another model uses it (a shared folder, the image encoder, a DFlash2 drafter other configs draft with - they are no longer switched to MTP), hard links, and the space freed. Maya deletes only inside the models folders it knows, by real path, and not while a model downloads; the running model is never deleted while loaded ("Switch, then delete" where another model can start).
+  - **Models, Add a model:** lists the other quants the setup offers on this PC (LibertAIDAI's DeepSeek EXL3, unsloth's GGUFs, orcarouter's abliterated quants, Mia-AiLab's MiniMax EXL3, turboderp's GLM EXL3), each downloaded through the setup. An EXL3 quant set up by hand is named by its own bits, from its folder's name.
+  - **Context size:** one setting, in Settings > Chat defaults and in a model's Engine tab; a change to the running model's context reloads it in place.
+  - **Monitor:** decode and prefill in one chart, with the prompt read's peak (this request's, then the last one's); the stats as a 2 x 2 grid; figures and labels lined up on phones.
+  - **Settings:** five groups (General, Integrations, Usage, Privacy, About), a list then a page on a phone; "Appearance"; the running model's port beside it in Chat defaults; Connect your tools as before. Cards, buttons and fields as fills instead of outlines; the thinking chip says "Thinking · <level>".
+  - **Support:** a small heart beside the model's name in the sidebar and a line on About (and under an update's button) link to GitHub Sponsors. No popups.
+- **MiniMax-M3.1-Flash on Apple Silicon (experimental):** a Metal engine of its own, `maya-metal-mm3`, runs Maya's MiniMax GGUF quants with every expert resident (Maya-XS fits a 128 GB Mac), text only, with parity tests against the reference forward. The setup does not offer it yet: docs/METAL.md says how to build and start it by hand. Nothing else in the engines changes (#778, thanks @Franzferdinan51).
+- **DeepSeek, other EXL3 quants from Hugging Face (#806):**
+  - `tools/ds4/pack.py` accepts a head kept as BF16 (`head.weight`); the engine already reads it.
+  - Shards that write their tensors grouped by type instead of expert by expert stop the pack with that reason and the fix (rewrite them in expert order); the engine's own message says the same instead of "split across files".
+  - Engram tables a quant stored in its own INT4 layout stop the pack with a message that points to DeepSeek's FP8 shards 47 / 48; docs/MODELS.md says so too.
+- **Updates on NVIDIA and Apple Silicon (as on AMD in v1.1.52):** an update whose engine rebuild fails, or whose compiler or llama.cpp source is gone, stops with the reason and how to rebuild instead of starting the engine from before under the new server and config.
+- **Monitor, tensor-parallel pairs:** "What fills the GPUs" no longer says a restart gives more experts for free VRAM that the GPU's tensor-parallel partner cannot match (the members of a `--tp` group hold the same expert slots). That room is shown as idle, and with DeepSeek's DSpark drafter it points to `MAYA_DS4_DRAFT_DEV`, which can place drafter blocks there.
+- **DeepSeek, a GPU fault:** a request that leaves a GPU in a fault ends the engine with an error, and the next request starts a fresh one; before, every later request failed until a restart by hand (#688, thanks @sociolog).
+- **Community pull requests** (every setting below is opt-in and off by default; unset, the engines run as in v1.1.52):
+  - Opt-in: DeepSeek decode runs Q8_0 GEMVs of 3-16 columns on the tensor cores of sm_80 and newer, with the same bits (`MAYA_DS4_Q8MV_TC=1`, #810, thanks @alesha-pro).
+  - Opt-in: DeepSeek prompts on a layer split - DMA from pinned RAM copies of any format (`DS4_FLOW_COPY_DMA`), the indexer's slabs sized by the prompt (`DS4_AI_RUN`), both with the same answers; chunks sized by the prompt's length (`DS4_CHUNK_AUTO`) and the YOCO skip on the flow (`DS4_YOCO_FLOW`), which change the answers slightly. On the author's 4x RTX 3090 they read prompts 29-72% faster (#811, thanks @alesha-pro).
+  - Opt-in: DeepSeek long conversations - experts lent to a prompt's buffers come back from pinned RAM copies instead of the disk (`DS4_LENT_RAM_GB`), and the server builds a turn's token ids by increment from the last prompt's, the same ids (`MAYA_PROMPT_MEMO=1`, every model) (#813, thanks @alesha-pro).
+  - Opt-in: DeepSeek's CPU lane gives an expert the same bits as in VRAM (`MAYA_DS4_LANE_PARITY=1`, #741, thanks @cresslank).
+  - Opt-in, the same bits: the DeepSeek CPU lane cuts a small EXL3 call's pieces by columns too (`DS4_CPU_SPLIT_COLS`, #758); the AVX2 EXL3 CPU kernels work in 16-bit lanes for calls of 1-3 activations (`DS4_CPU_W16`, #759) and cut byte-aligned trellis windows with byte shuffles (`MAYA_EXL3_AVX2_SHUF`, #760); DeepSeek expert placement keeps recent slots that survive per-byte placement (`DS4_RECENT_FIT`), and `DS4_PPL_STEP` is a test aid (#761) - thanks @bitaccesscomau.
+  - Opt-in: AMD Instinct MI350 / MI355 (gfx950) read EXL3 prompts on their matrix cores (`EXL3_WMMA_GFX950=1`, #692, thanks @yagop).
+  - Linux on POWER9 (ppc64le, IBM AC922): Maya builds and runs there; docs/IBM_AC922.md (#753, thanks @jefflaichunyin).
+  - `tools/agent_bench.py`: a benchmark shaped like coding agents - several long conversations at once against a running server, fixed by a seed (#406, thanks @somnergy).
+  - docs/DOCKER.md and `docker/`: a recipe to build a Docker image of a release; there is no official image (#808, thanks @noonghunna).
+  - README: a 4x RTX 4090 DeepSeek row in the speed table (#814, thanks @oscarlius).
+
 ## v1.1.52 - 2026-11-03
 
 Faster GLM decode, fixes for AMD PCs on Windows (setup, updates and start errors), a DeepSeek config check, and community pull requests.

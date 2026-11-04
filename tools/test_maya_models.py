@@ -65,7 +65,8 @@ class ModelChoice(unittest.TestCase):
         self.assertIn("GLM-5.3 · EXL3-3.05bpw: download", text)
         kind, quant, text = self.choose({"quant": "EXL3-sc_4.10bpw"})
         self.assertEqual((kind, quant), ("download", "EXL3-sc_4.10bpw"))
-        self.assertIn("GLM-5.3 · EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face   (experimental)", text)
+        self.assertIn("GLM-5.3 · EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face", text)
+        self.assertNotIn("EXL3-sc_4.10bpw: download 167.8 GB from Hugging Face   (experimental)", text)   # (v1.1.53)
         args = SimpleNamespace(gguf_dir=None, model="EXL3-sc_4.10bpw", yes=True)   # (by hand: no question at all)
         self.assertEqual(maya.choose_model(args, Path("/m"), {}), ("download", "EXL3-sc_4.10bpw"))
         self.assertIsNone(maya.model_option(SimpleNamespace(model="EXL3-sc_4.10bpw", mm3_quant=None)))
@@ -392,11 +393,12 @@ class Exl3Download(unittest.TestCase):
             quant = maya.choose_model(args, Path(d), {})[1]
         return quant, "\n".join(lines)
 
-    def test_offered_on_nvidia_as_experimental_never_the_default(self):
+    def test_offered_on_nvidia_never_the_default(self):
         for win in (False, True):   # Linux and Windows alike
             with patch.object(maya, "WIN", win):
                 quant, text = self.offered("cuda")
-            self.assertIn(f"{self.Q}: download {self.GB} GB from Hugging Face   (experimental)", text)
+            self.assertIn(f"{self.Q}: download {self.GB} GB from Hugging Face", text)
+            self.assertNotIn(f"{self.Q}: download {self.GB} GB from Hugging Face   (experimental)", text)   # (v1.1.53)
             self.assertNotEqual(quant, self.Q)
 
     def test_every_file_of_the_branch_with_size_and_hash(self):
@@ -501,7 +503,7 @@ class Exl3DownloadSc410(Exl3Download405):
     FILES = 33
     MTP = None
 
-    def test_offered_on_nvidia_as_experimental_never_the_default(self):
+    def test_offered_on_nvidia_never_the_default(self):
         # v1.1.34: out of the setup's list (maya.MODELS_BY_HAND) - named by hand it downloads, packs and starts as before
         for win in (False, True):   # Linux and Windows alike
             with patch.object(maya, "WIN", win):

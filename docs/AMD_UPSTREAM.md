@@ -28,8 +28,8 @@ Validation on native Linux / system ROCm 7.2.1:
 | 321B model request | Not verified | Not run |
 
 Both cards now use the same `gfx1100;gfx1201;gfx1151` build. HC1/HC2 pass on
-the R9700; `gfx1151` builds, untested. The installer enables the two discrete
-architectures. These checks do not establish full-model correctness or speed.
+the R9700. `gfx1151` (Strix Halo / Gorgon Halo) is supported now too and runs GLM, DeepSeek and
+MiniMax, EXL3 included ([AMD_MAYA.md](AMD_MAYA.md)). The installer enables all three architectures. These checks do not establish full-model correctness or speed.
 See [AMD_RDNA4.md](AMD_RDNA4.md) for build and validation commands.
 
 ## Further integration requirements

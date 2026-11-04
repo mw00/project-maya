@@ -7,6 +7,7 @@
 /* adding a model: the setup's command */
 .mdl-add { gap: 10px; padding: 16px 18px; }
 .mdl-add > span { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.mdl-add__group { margin-top: 10px; font-size: var(--st-fs-base); }
 .mdl-add__cmd { display: flex; align-items: center; gap: 12px; padding: 6px 6px 6px 14px; border-radius: var(--st-r-row); background: var(--st-code-bg);
                 color: var(--st-code-ink); font-size: var(--st-fs-sm); }
 .mdl-add__cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; }
@@ -22,8 +23,10 @@
 
 /* a model's card */
 .mdl-card { gap: 14px; padding: 18px 20px; }
-.mdl-card.is-running { border-color: color-mix(in srgb, var(--st-accent) 45%, var(--st-line)); }
-.mdl-card.is-loading { border-color: color-mix(in srgb, var(--st-info) 45%, var(--st-line)); }
+/* the running model: a violet wash and a bar at its left edge (the grouped look: fills, no outline) */
+.mdl-card.is-running { background: linear-gradient(0deg, color-mix(in srgb, var(--st-accent) 7%, transparent), color-mix(in srgb, var(--st-accent) 7%, transparent)), var(--st-card);
+                       box-shadow: inset 3px 0 0 var(--st-accent); }
+.mdl-card.is-loading { box-shadow: inset 3px 0 0 var(--st-info); }
 .mdl-card__head { display: flex; align-items: center; gap: 14px; }
 .mdl-card__head .model-logo { border-radius: var(--st-r-md); background: var(--st-surface-2); flex: none; }
 .mdl-card__name { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.35; }
@@ -78,7 +81,7 @@
 .mdl-num { display: inline-flex; align-items: center; gap: 8px; }
 .mdl-num .input--num { width: 96px; height: 34px; text-align: right; }
 .mdl-num > span { min-width: 44px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
-.mdl-step { display: inline-flex; align-items: center; height: 34px; border: 1px solid var(--st-line-strong); border-radius: var(--st-r-row); }
+.mdl-step { display: inline-flex; align-items: center; height: 34px; border: 1px solid transparent; background: var(--st-fill); border-radius: var(--st-r-row); }
 .mdl-step button { display: grid; place-items: center; width: 34px; height: 32px; padding: 0; border: 0; background: transparent; color: var(--st-ink); }
 .mdl-step button:first-child { border-radius: 9px 0 0 9px; }
 .mdl-step button:last-child { border-radius: 0 9px 9px 0; }
@@ -91,8 +94,8 @@
 .mdl-warn { padding: 8px 12px; border-radius: var(--st-r-row); background: var(--st-warn-tint); color: var(--st-warn-text); font-size: var(--st-fs-sm); line-height: 1.45; }
 .mdl-warn--err { margin-top: 12px; background: var(--st-danger-tint); color: var(--st-danger-text); }
 .mdl-gpus { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; }
-.mdl-gpu { display: flex; align-items: center; gap: 10px; min-width: 180px; min-height: 46px; padding: 0 14px 0 12px; border: 1px solid var(--st-line-strong);
-           border-radius: var(--st-r-md); background: transparent; color: var(--st-ink); text-align: left; }
+.mdl-gpu { display: flex; align-items: center; gap: 10px; min-width: 180px; min-height: 46px; padding: 0 14px 0 12px; border: 1px solid transparent; background: var(--st-fill);
+           border-radius: var(--st-r-md); color: var(--st-ink); text-align: left; }
 .mdl-gpu[aria-checked="true"] { border-color: color-mix(in srgb, var(--st-accent) 55%, var(--st-line)); background: var(--st-accent-tint); }
 .mdl-gpu__box { display: grid; place-items: center; width: 18px; height: 18px; flex: none; box-sizing: border-box; border-radius: 5px;
                 border: 1.5px solid var(--st-line-strong); color: var(--st-accent-ink); }
@@ -122,8 +125,8 @@
 .mdl-del .dialog__body { display: flex; flex-direction: column; gap: 14px; }
 .mdl-del p { margin: 0; line-height: 1.55; }
 .mdl-del p code { font-family: var(--st-font-mono); font-size: var(--st-fs-sm); overflow-wrap: anywhere; }
-.mdl-del__box { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 12px 14px; border: 1px solid var(--st-line-strong);
-                border-radius: var(--st-r-md); background: transparent; color: var(--st-ink); font: inherit; text-align: left; }
+.mdl-del__box { display: flex; align-items: flex-start; gap: 12px; width: 100%; padding: 12px 14px; border: 1px solid transparent; background: var(--st-fill);
+                border-radius: var(--st-r-md); color: var(--st-ink); font: inherit; text-align: left; }
 .mdl-del__box.is-on { border-color: color-mix(in srgb, var(--st-danger) 55%, var(--st-line)); background: var(--st-danger-tint); }
 .mdl-del__check { display: grid; place-items: center; width: 18px; height: 18px; flex: none; margin-top: 2px; box-sizing: border-box;
                   border: 1.5px solid var(--st-line-strong); border-radius: 5px; color: #ffffff; }
@@ -153,8 +156,55 @@
 .mdl-del__text > span:last-child { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 .mdl-del__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 .callout .icon-btn { margin: -4px -6px -4px 0; color: inherit; }
+.mdl-card__del:not(:disabled):hover { color: var(--st-danger-text); }
+.mdl-left:focus { outline: none; }
+
+/* a model's sheet: Overview, Engine, Storage (a dialog on a desktop, the whole screen on a phone) */
+.dialog.mdl-sheet { width: min(720px, 100%); max-height: min(780px, calc(100vh - 48px)); }
+.mdl-sheet__head { gap: 12px; padding-left: 20px; }
+.mdl-sheet__head .model-logo { flex: none; border-radius: var(--st-r-md); background: var(--st-surface-2); }
+.mdl-sheet__name { flex: 1; min-width: 0; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.mdl-sheet__name h2 { font-size: 18px; }
+.mdl-sheet__tabs { flex: none; margin: 0; padding: 0 20px; }
+.mdl-sheet__tabs button:disabled { opacity: .45; }
+.mdl-sheet__body { flex: 1; min-height: 0; padding: 4px 24px 0; }
+.mdl-sheet__sec { display: flex; flex-direction: column; gap: 14px; padding: 18px 0 24px; }
+.mdl-sheet .mdl-edit { border-top: 0; }
+.mdl-sheet .mdl-edit__head { padding-top: 12px; }
+/* (the Engine tab's Save and Cancel stay in view while its fields scroll) */
+.mdl-sheet .mdl-edit__foot { position: sticky; bottom: 0; margin: 12px -24px 0; padding: 12px 24px 16px; background: var(--st-surface);
+                             box-shadow: 0 -1px 0 var(--st-line); }
+.mdl-sheet .mdl-facts { margin: 0; }
+.mdl-mono-dd { font-family: var(--st-font-mono); font-size: var(--st-fs-xs); }
+.mdl-sheet__lead { margin: 0; font-size: var(--st-fs-md); color: var(--st-ink-soft); line-height: 1.5; }
+.mdl-sheet__lead b { color: var(--st-ink); font-variant-numeric: tabular-nums; }
+.mdl-sheet__del { display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap; padding-top: 4px; }
+
+/* its files: what deleting it deletes, and what stays (another model uses it) */
+.mdl-files { list-style: none; margin: 0; padding: 4px 14px; display: flex; flex-direction: column; border-radius: var(--st-r-md); background: var(--st-fill); }
+.mdl-files li { display: flex; align-items: flex-start; gap: 10px; padding: 10px 0; }
+.mdl-files li + li { box-shadow: 0 -1px 0 var(--st-line); }
+.mdl-files li > .st-icon { flex: none; margin-top: 3px; color: var(--st-ink-muted); }
+.mdl-files__text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; font-size: var(--st-fs-sm); color: var(--st-ink-muted); line-height: 1.4; }
+.mdl-files__text b { color: var(--st-ink); font-weight: 600; overflow-wrap: anywhere; }
+.mdl-files__text code { font-family: var(--st-font-mono); font-size: var(--st-fs-xs); color: var(--st-ink-soft); overflow-wrap: anywhere; }
+.mdl-files__size { flex: none; font-size: var(--st-fs-sm); font-variant-numeric: tabular-nums; color: var(--st-ink); }
+.mdl-files--kept .mdl-files__size { color: var(--st-ok-text); font-weight: 500; }
+.mdl-files__cap { margin-bottom: -6px; font-size: var(--st-fs-xs); font-weight: 600; letter-spacing: .02em; color: var(--st-ink-muted); }
+.mdl-del .mdl-files { max-height: 220px; overflow-y: auto; }
 
 @media (max-width: 767px) {
+  .dialog-scrim.mdl-sheet-scrim { padding: 0; }
+  .dialog.mdl-sheet { width: 100%; height: 100%; max-height: none; border-radius: 0; }
+  .mdl-sheet__head { min-height: 56px; padding-left: 16px; }
+  .mdl-sheet__tabs { padding: 0 12px; }
+  .mdl-sheet__tabs button { flex: 1; height: 44px; justify-content: center; }
+  .mdl-sheet__body { padding: 0 16px; }
+  .mdl-sheet .mdl-edit__foot { margin: 12px -16px 0; padding: 10px 16px calc(12px + env(safe-area-inset-bottom)); }
+  .mdl-sheet .mdl-edit__foot .btn { height: 44px; }
+  .mdl-sheet .mdl-edit__foot .mdl-grow { flex-basis: 100%; height: 0; }   /* (Cancel and Save on a row of their own) */
+  .mdl-sheet .mdl-edit__foot .btn--secondary, .mdl-sheet .mdl-edit__foot .btn--primary { flex: 1; }
+  .mdl-card__acts .btn { height: 36px; }
   .mdl-card { padding: 16px; }
   .mdl-card__head { flex-wrap: wrap; }
   .mdl-field .seg { flex-wrap: wrap; }

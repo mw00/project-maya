@@ -13,6 +13,7 @@ The files already published keep their names (their manifests list them).
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 FAMILIES = ("glm", "deepseek", "minimax", "qwen")
@@ -219,8 +220,28 @@ def config_key(cfg: dict) -> str | None:
     return inst.get("quant")
 
 
+EXL3_BPW = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)[ _-]?bpw(?![a-z])", re.I)
+
+
+def exl3_bits(cfg: dict) -> str | None:
+    """"EXL3 2.25 bpw" from the model folder's name (DeepSeek-V4.1-Flash-1017-EXL3-2.25bpw: a DeepSeek or MiniMax EXL3
+    quant of other bits than the setup's, set up by hand under the "exl3" key), else None - the setup's own label then."""
+    fam, key = family_of(cfg), config_key(cfg)
+    if fam not in ("deepseek", "minimax") or not str(key).lower().startswith("exl3"):
+        return None
+    inst = cfg.get("installer") or {}
+    args = [str(a) for a in cfg.get("args") or []]
+    pack = next((args[i + 1] for i, a in enumerate(args[:-1]) if a in ("--glm-pack", "--pack")), None)
+    for d in (inst.get("model_dir"), Path(pack).parent if pack else None):
+        m = EXL3_BPW.search(Path(str(d)).name) if d else None
+        if m:
+            return f"EXL3 {m.group(1)} bpw"
+    return None
+
+
 def config_label(cfg: dict) -> str | None:
     """What a config runs, as users see it ("GLM-5.3 · Maya-S24"), or None for a config the setup did not write."""
     if not isinstance(cfg.get("installer"), dict):
         return None
-    return shown(family_of(cfg), config_key(cfg))
+    fam, bits = family_of(cfg), exl3_bits(cfg)
+    return SHOWN.get(fam, fam) + SEP + bits if bits else shown(fam, config_key(cfg))

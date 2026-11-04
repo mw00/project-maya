@@ -37,7 +37,7 @@ The setup recommends one for your PC. How they're made and measured: [MAYA-S](..
 [MAYA-S24](../bench/results/MAYA-S24.md), [MAYA-M](../bench/results/MAYA-M.md), [MAYA-L](../bench/results/MAYA-L.md). On
 [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF).
 
-On AMD, GLM-5.3-Flash reads pictures too (experimental): setup builds its image encoder for the GPU.
+On AMD, GLM-5.3-Flash reads pictures too: setup builds its image encoder for the GPU.
 
 ### GLM-5.3-Flash's options
 
@@ -76,7 +76,7 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
 | unsloth's [UD-IQ1_M GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant gguf-iq1_m`): for PCs with about 150 GB of VRAM + RAM | 301 GB, with Maya's n-gram tables | the same |
 | unsloth's [UD-IQ3_S GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant gguf-iq3_s`): close to Q8's quality, for PCs with about 270 GB of VRAM + RAM; shares its n-gram tables with Maya's quants | 424 GB, with the n-gram tables | the same |
 | unsloth's [UD-Q8_K_XL GGUF](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) (`--ds4-quant gguf-q8`; DeepSeek's own formats): the closest to the original, for PCs with about 310 GB of VRAM + RAM | 467 GB, with Maya's n-gram tables | the same |
-| LibertAIDAI's [EXL3 2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) + DeepSeek's Engram tables | 414 GB | NVIDIA from Volta (V100) on; pictures from RTX 30 / A100 on; AMD experimental |
+| LibertAIDAI's [EXL3 2.9 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw) + DeepSeek's Engram tables | 414 GB | NVIDIA from Volta (V100) on; pictures from RTX 30 / A100 on; and AMD |
 | LibertAIDAI's [EXL3 3.5 bpw](https://huggingface.co/LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-3.5bpw) + the same Engram tables (`--ds4-quant exl3-3.5`: closer to the original, ~280 GB of VRAM + RAM) | 461 GB | the same |
 | orcarouter's [Abliterated GGUFs](https://huggingface.co/orcarouter/DeepSeek-V4.1-Flash-1017-abliterated-GGUF), the model with its refusals removed: Mix-128G (`--ds4-quant abliterated-128g`, ~114 GB of VRAM + RAM) or Mix-256G (`abliterated-256g`, ~236 GB); `abliterated` picks the one your PC holds. Their n-gram table is left out and Maya's Q6_K tables are read instead (once for both). A gated repo: accept its terms, then `HF_TOKEN` or `hf auth login` | 275 / 397 GB, with the 161 GB of n-gram tables shared with Maya's DeepSeek quants (downloaded once) | NVIDIA from Volta (V100) on (AMD not tried yet) |
 
@@ -94,6 +94,11 @@ results. See [the prompt format notes](deepseek-prompt-format.md) for API detail
 - **Strix Halo / Gorgon Halo on Windows:** Windows counts the GPU's share of the memory against its page file, so the
   setup asks for a page file big enough to keep every expert on the GPU and says the size
   ([AMD_MAYA.md](AMD_MAYA.md)).
+- **Other EXL3 quants from Hugging Face:** `tools/ds4/pack.py` packs them too. A head kept as BF16 (`head.weight`)
+  is read as it is. Engram tables a quant stored in its own INT4 layout (`U8` + `embed.scale`, as in the quants derived
+  from Diffbot's mixed 3 bpw) are not read: the tables are DeepSeek's own and the quant leaves them unchanged, so put
+  DeepSeek's FP8 shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 in their place. Shards that write their
+  tensors grouped by type instead of expert by expert stop the pack with that reason: rewrite them in expert order.
 
 ### DeepSeek's options
 
@@ -138,9 +143,9 @@ non-commercial use, commercial use has conditions) on an engine of its own (`may
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
-| **[MiniMax M3.1 · Maya-XS](https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF)** (`minimax-maya-xs`), Project Maya's own quant: the experts in ~1.6 bits - the whole model in a 128 GB PC's memory | 93 GB | NVIDIA V100 / RTX 20 and newer, and AMD; Linux and Windows |
+| **[MiniMax M3.1 · Maya-XS](https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF)** (`minimax-maya-xs`), Project Maya's own quant: the experts in ~1.6 bits - the whole model in a 128 GB PC's memory | 93 GB | NVIDIA V100 / RTX 20 and newer, and AMD; Linux and Windows; macOS on Apple Silicon (the [Metal engine](METAL.md#minimax-m31-flash), experimental) |
 | **[MiniMax M3.1 · Maya-S](https://huggingface.co/peasantsmith/MiniMax-M3.1-Flash-Maya-GGUF)** (`minimax-maya-s`): the experts in ~2.1 bits, closer to the original; 87.6% the same next token as the original (the average over its categories) | 122 GB | the same |
-| Mia-AiLab's [EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw), with MiniMax's DSpark drafter and vision tower | 197 GB | NVIDIA V100 / RTX 20 and newer, Linux and Windows |
+| Mia-AiLab's [EXL3 3.5 bpw](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw), with MiniMax's DSpark drafter and vision tower | 197 GB | the same |
 
 With Maya's quants the setup fetches the vision tower and the DSpark drafter from the EXL3 repo (about 4 GB) for
 pictures and drafting, on NVIDIA and AMD alike.
@@ -165,5 +170,5 @@ These also run on Maya:
 
 | Model | Size | How | Notes |
 | --- | ---: | --- | --- |
-| [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | experimental; NVIDIA, and AMD |
-| [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | experimental; NVIDIA, and AMD |
+| [EXL3 3.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/3.05bpw) by turboderp | 125.3 GB | in the setup: `--model EXL3-3.05bpw` | NVIDIA from V100, and AMD |
+| [EXL3 4.05 bpw](https://huggingface.co/turboderp/GLM-5.3-Flash-exl3/tree/4.05bpw) by turboderp | 165.2 GB | in the setup: `--model EXL3-4.05bpw` | NVIDIA from V100, and AMD |

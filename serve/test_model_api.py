@@ -5,9 +5,12 @@
 """
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 import urllib.error
@@ -241,6 +244,101 @@ class Pull(Api):
         self.assertIn("--download-model", cmd)
         self.assertEqual(cmd[cmd.index("--models-dir") + 1], "/m")
         self.assertEqual(cmd[cmd.index("--backend") + 1], "hip")
+
+
+class OtherQuantsTest(unittest.TestCase):
+    """The Models page's "Other quants": the other files the setup offers, each through the setup's own flags."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def cat(self, backend="cuda", ccs=(86,)):
+        return model_pull.catalog(self.root, {}, {"backend": backend}, list(ccs), other_sizes={})
+
+    def test_the_setup_lists_match(self):
+        sys.path.insert(0, str(model_pull.ROOT))
+        import maya
+        ds4 = {k for k, _ in model_pull.DS4_OTHER}
+        self.assertEqual(ds4, set(maya.DS4_QUANTS) - set(maya.DS4_MAYA) - set(maya.DS4_BY_HAND))
+        self.assertEqual(set(model_pull.GLM_EXL3), {k for k in maya.MODELS if maya.is_exl3(k)} - set(maya.MODELS_BY_HAND))
+        self.assertIn("exl3", maya.MM3_QUANTS)
+        self.assertEqual(set(model_pull.GATED), set(maya.DS4_ABL))
+
+    def test_groups_names_and_notes(self):
+        c = {m["id"]: m for m in self.cat()}
+        self.assertEqual(c["glm-maya-s"]["group"], "maya")
+        self.assertEqual(c["deepseek-exl3"]["group"], "other")
+        self.assertEqual(c["deepseek-exl3"]["name"], "DeepSeek V4.1 · EXL3 2.9 bpw")
+        self.assertEqual(c["deepseek-exl3-3.5"]["by"], "LibertAIDAI")
+        self.assertEqual(c["deepseek-gguf-q8"]["name"], "DeepSeek V4.1 · UD-Q8_K_XL")
+        self.assertIn("deepseek-gguf-iq1_s", c)
+        self.assertNotIn("deepseek-gguf-q4", c)                   # (by hand only, as in the setup's list)
+        self.assertNotIn("glm-exl3-sc_4.10bpw", c)
+        self.assertIn("HF_TOKEN", c["deepseek-abliterated-128g"]["note"])
+        self.assertEqual(c["minimax-exl3"]["name"], "MiniMax M3.1 · EXL3 3.5 bpw")
+        self.assertEqual(c["glm-exl3-3.05bpw"]["name"], "GLM-5.3 · EXL3 3.05 bpw")
+        self.assertEqual(c["deepseek-exl3"]["note"], "")
+        self.assertEqual(c["glm-exl3-4.05bpw"]["note"], "")         # (the EXL3 quants: no longer experimental)
+        ids = [m["id"] for m in self.cat()]
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_backends(self):
+        old = {m["id"] for m in self.cat(ccs=(61,))}             # (Pascal only: no EXL3, no DeepSeek GGUFs)
+        self.assertNotIn("deepseek-exl3", old)
+        self.assertNotIn("minimax-exl3", old)
+        self.assertNotIn("deepseek-gguf-q8", old)
+        self.assertIn("glm-exl3-3.05bpw", old)
+        self.assertIn("deepseek-exl3", {m["id"] for m in self.cat(ccs=())})   # (no GPU readable: the setup's check says)
+        amd = {m["id"]: m for m in self.cat("hip", ())}
+        self.assertEqual(amd["deepseek-exl3"]["note"], "")
+        self.assertEqual(amd["minimax-exl3"]["note"], "")
+        self.assertEqual({m["group"] for m in self.cat("metal", ())}, {"maya"})
+
+    def test_installed(self):
+        (self.root / "maya-ds4.json").write_text(json.dumps(
+            {"exe": "x", "args": ["--pack", "p"], "installer": {"family": "deepseek", "ds4_quant": "exl3-3.5"}}))
+        c = {m["id"]: m for m in self.cat()}
+        self.assertTrue(c["deepseek-exl3-3.5"]["installed"])
+        self.assertFalse(c["deepseek-exl3"]["installed"])
+
+    def test_setup_commands(self):
+        def which(ident, backend="cuda"):
+            cmd = model_pull.setup_command(ident, {"installer": {"models_dir": "/m"}, "backend": backend})
+            return cmd[cmd.index("--model"):cmd.index("--download-model")], cmd
+        self.assertEqual(which("deepseek-exl3")[0], ["--model", "DeepSeek-V4.1-Flash-1017", "--ds4-quant", "exl3"])
+        self.assertEqual(which("deepseek-exl3-3.5")[0], ["--model", "DeepSeek-V4.1-Flash-1017", "--ds4-quant", "exl3-3.5"])
+        self.assertEqual(which("deepseek-gguf-iq3_s")[0], ["--model", "DeepSeek-V4.1-Flash-1017", "--ds4-quant", "gguf-iq3_s"])
+        self.assertEqual(which("deepseek-abliterated-256g")[0],
+                         ["--model", "DeepSeek-V4.1-Flash-1017", "--ds4-quant", "abliterated-256g"])
+        self.assertEqual(which("minimax-exl3")[0], ["--model", "MiniMax-M3.1-Flash", "--mm3-quant", "exl3"])
+        self.assertEqual(which("glm-exl3-4.05bpw")[0], ["--model", "EXL3-4.05bpw"])
+        self.assertEqual(which("glm-maya-s")[0], ["--model", "glm-maya-s"])
+        _, cmd = which("deepseek-exl3", "hip")
+        self.assertEqual(cmd[cmd.index("--backend") + 1], "hip")
+        self.assertEqual(cmd[cmd.index("--models-dir") + 1], "/m")
+
+    def test_the_setup_takes_the_commands(self):
+        """maya.py's own argument check takes each command's --model / --ds4-quant / --mm3-quant."""
+        sys.path.insert(0, str(model_pull.ROOT))
+        import maya
+        for ident, fam, key, _ in model_pull.OTHER:
+            cmd = model_pull.setup_command(ident, None)
+            a = argparse.Namespace(model=cmd[cmd.index("--model") + 1], ds4_quant=None, mm3_quant=None)
+            if "--ds4-quant" in cmd:
+                a.ds4_quant = cmd[cmd.index("--ds4-quant") + 1]
+                self.assertIn(a.ds4_quant, maya.DS4_QUANTS)
+            if "--mm3-quant" in cmd:
+                a.mm3_quant = cmd[cmd.index("--mm3-quant") + 1]
+                self.assertIn(a.mm3_quant, maya.MM3_QUANTS)
+            self.assertIsNone(maya.model_option(a), ident)
+
+    def test_pull_takes_an_other_id(self):
+        slot = model_pull.Puller(self.root, lambda ident, cfg: [sys.executable, "-c", "print('ok')"])
+        p = slot.start("deepseek-exl3", {"backend": "cuda"})
+        p.proc.wait(10)
+        with self.assertRaises(ValueError):
+            model_pull.Puller(self.root, lambda i, c: []).start("deepseek-gguf-q4", None)
 
 
 if __name__ == "__main__":

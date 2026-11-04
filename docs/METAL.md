@@ -6,7 +6,8 @@ Experimental: GLM-5.3-Flash on a Mac with Apple Silicon, on its GPU through Meta
 OpenAI- and Anthropic-compatible API as on Linux and Windows (streamed answers, tool calls, thinking levels). It reads
 pictures (`maya-vision`, the image encoder, runs on the GPU too), and it drafts
 with the model's MTP block or the DFlash2 drafter (`--draft dflash2`) when that is faster on the Mac. One conversation at a time;
-DeepSeek-V4.1-Flash, MiniMax-M3.1-Flash and Qwen-3.8-Flash-Next are NVIDIA / AMD only for now.
+DeepSeek-V4.1-Flash and Qwen-3.8-Flash-Next are NVIDIA / AMD only for now. MiniMax-M3.1-Flash has its own
+Metal engine (below): newer and rougher than GLM's, text only, and not wired into the setup yet.
 
 **Status: experimental.** Mac support is a community contribution. Every change is built and unit-tested on GitHub's
 Apple Silicon runners (the `macos` workflow: the engine, its sampler and the small synthetic-model tests), but the
@@ -46,6 +47,35 @@ What is Maya's own is the memory plan. A Mac has one pool of unified memory, usu
 
 On a Mac with less unified memory than the model, decode speed depends on how many experts a token needs that are
 not resident, and so on the SSD.
+
+## MiniMax-M3.1-Flash
+
+**Experimental**, and newer than the GLM engine. `maya-metal-mm3` (src/metal/mm3_metal.cpp, beside the GLM engine) runs MiniMax-M3.1-Flash from Maya's own GGUF
+quants (the set's `-maya-indexers.bin` side file is read automatically). Its graph follows `tools/mm3/ref.py` op
+for op: Gemma norms, per-head q/k norms, NeoX partial RoPE, MiniMax Sparse Attention on every layer (the indexer
+scores read back to the host, which keeps the top blocks exactly as the reference selects them), swigluoai MLPs,
+sigmoid routing with the correction bias. Sampling and the serve protocol are the GLM engine's, shared code and
+all (`maya-metal-mm3 --serve`, driven by serve/server.py like the other engines).
+
+The memory plan is the simple one the quants were made for: **every expert is resident**. Maya-XS (93 GB) fits a
+128 GB Mac with room for the caches; Maya-S (122 GB) is past a 128 GB Mac's GPU working set, so XS is the Mac
+quant. With nothing streamed there is no expert pool and no drafting yet (a request's `spec` keys are accepted;
+plain decoding writes the same tokens), and pictures are not wired (the vision tower stays with the CUDA engine
+for now), so MiniMax on a Mac is text only. `./maya.sh --backend metal --setup` does not offer MiniMax yet; run
+it by hand:
+
+```sh
+cmake -S . -B build-metal -DMAYA_ENABLE_METAL=ON
+cmake --build build-metal -j --target maya-metal-mm3
+./build-metal/maya-metal-mm3 --gguf <the Maya-XS set's .gguf> --ids 1,2,3 --n 64
+```
+
+Its parity gate is `metal_mm3_test` (in the same `ctest` run): a synthetic 3-layer MiniMax (one dense lead
+layer, two MoE layers, 17 index blocks so the selection must drop one) against a numpy port of the reference
+forward in `tools/mm3_metal_fixture.py` - logits within 4.2e-5 relative L2 on the Metal GPU (gate 1e-3), a
+sliced prompt equal to a one-shot one, greedy decoding token for token; `tools/test_mm3_serve.py`
+(`metal_mm3_serve_test`) drives the serve protocol the same way. The contributor ran the real Maya-XS set on a 128 GB Mac Studio (M5 Max); bench
+numbers from other Macs are as welcome here as GLM's. The port's notes: [PORT-MINIMAX-METAL.md](PORT-MINIMAX-METAL.md).
 
 ## Speed
 
@@ -92,6 +122,7 @@ small fixture's tests on every change):
 | the same, the expert pool at its smallest and 64-token slices | the same gates | the same numbers |
 | `metal_model_window` / `metal_model_big_window` (verify windows of 1-8 rows, every third draft wrong) | tokens = plain decoding's | equal; logits within 4.9e-6 |
 | `metal_model_mtp` / `metal_model_big_mtp` (MTP drafting, fixed lengths 1 / 2 / 4 and adaptive) | tokens = plain decoding's | equal |
+| `metal_mm3_test` (MiniMax-M3.1, 3 layers, 2,176 tokens, against a numpy port of `tools/mm3/ref.py`) | logits within 1e-3; sliced = one-shot; greedy chain equal | 4.2e-5; equal; equal |
 
 Two choices keep it at f32 accuracy where Metal would otherwise round:
 

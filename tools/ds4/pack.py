@@ -51,10 +51,44 @@ def need(st: SafeTensors, t: dict) -> list[str]:
                 miss.append(L + n)
         if li in t["engram_layer_ids"] and not st.has(L + "engram.embed.weight"):
             miss.append(L + "engram.embed.weight (shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017)")
+        elif li in t["engram_layer_ids"] and st.t[L + "engram.embed.weight"][1] == "U8":
+            # (a quant's own INT4 Engram tables, U8 + embed.scale: the tables are DeepSeek's, unchanged by the quant)
+            miss.append(L + "engram.embed.weight: an INT4 (U8) layout the engine does not read - put DeepSeek's FP8 "
+                        "shards 47 / 48 of deepseek-ai/DeepSeek-V4.1-Flash-1017 in their place")
     for n in ("embed.weight", "norm.weight", "head.trellis"):
-        if not st.has(n):
+        # (the head as EXL3, or kept as a BF16 head.weight - the engine reads either)
+        if not st.has(n) and not (n == "head.trellis" and st.has("head.weight")):
             miss.append(n)
     return miss
+
+
+def type_ordered(st: SafeTensors) -> str | None:
+    """A layer whose experts share one layout (each part's K and pieces' bytes) is read by the engine as one region an
+    expert, its trellis / suh / svh close together in one file.  Shards that write their tensors grouped by type (all
+    trellis, then all suh, ...) put every expert's pieces far apart - the engine would stop at its start.
+    -> the first such layer's message, None when every layer is fine."""
+    layers: dict[str, list[int]] = {}
+    for n in st.t:
+        p, _, rest = n.partition(".ffn.experts.")
+        if rest.endswith(".w1.trellis") and rest[:-len(".w1.trellis")].isdigit():
+            layers.setdefault(p + ".ffn.experts.", []).append(int(rest[:-len(".w1.trellis")]))
+    for P, es in layers.items():
+        sigs, apart = set(), None
+        for e in sorted(es):
+            ts = [st.t.get("%s%d.%s.%s" % (P, e, r, q)) for r in ("w1", "w3", "w2") for q in ("trellis", "suh", "svh")]
+            if any(x is None for x in ts):
+                sigs = None   # (a missing piece: the engine names it)
+                break
+            sigs.add(tuple(x[4] for x in ts) + tuple(ts[i][2][-1] for i in (0, 3, 6)))
+            nb = sum(x[4] for x in ts)
+            lo, hi = min(x[3] for x in ts), max(x[3] + x[4] for x in ts)
+            if apart is None and len({x[0] for x in ts}) == 1 and hi - lo > 2 * nb + (1 << 20):
+                apart = e
+        if sigs is not None and len(sigs) == 1 and apart is not None:
+            return ("%s%d: its pieces are not together in their file (the shards' tensors ordered by type, not expert "
+                    "by expert?) - rewrite those shards with each expert's tensors back to back (the same tensors, "
+                    "only their order changes)" % (P, apart))
+    return None
 
 
 def write_engram(out: pathlib.Path, model: pathlib.Path, t: dict):
@@ -191,6 +225,9 @@ def main() -> int:
     miss = need(st, t)
     if miss:
         raise SystemExit("missing tensors:\n  " + "\n  ".join(miss[:20]))
+    apart = type_ordered(st)
+    if apart:
+        raise SystemExit(apart)
     out.mkdir(parents=True, exist_ok=True)
 
     with (out / "ds4.txt").open("w") as f:

@@ -3,7 +3,7 @@
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>在你自己的 GPU 上运行 GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B) 和 MiniMax-M3.1-Flash (428 B)</b><br>
-私密且快速 · 1 块到最多 16 块 NVIDIA GPU · 支持 AMD 和 Windows (实验性) · 聊天、图片、兼容 OpenAI 和 Anthropic 的 API · 同时处理多个请求</p>
+私密且快速 · 1 块到最多 16 块 NVIDIA GPU · 支持 AMD 和 Windows · 聊天、图片、兼容 OpenAI 和 Anthropic 的 API · 同时处理多个请求</p>
 
 <p align="center">
 <a href="https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF"><img src="https://raw.githubusercontent.com/mw00/project-maya/badges/glm.svg" alt="GLM-5.3-Flash Maya downloads"></a>
@@ -53,7 +53,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
 
-它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (实验性；见[你需要什么](#what-you-need))。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以及以 Q5_K_M GGUF 提供、支持图片的 Qwen-3.8-Flash-Next (CYBER-FROST) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
+它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以及以 Q5_K_M GGUF 提供、支持图片的 Qwen-3.8-Flash-Next (CYBER-FROST) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
 
 ## <a name="quality"></a>质量
 
@@ -145,6 +145,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **2x RX 7900 XTX 24 GB** (tensor parallel 2, PCIe 4.0 x4 each) + **Radeon 8060S** helper (Ryzen AI Max+ 395, 128 GB), the model on a USB4 NVMe | Maya-XS (v2), 512K context, `DS4_INDEX_TC=1` | **82.5 tokens/s** | 1587 tokens/s (130K; 663 at 8K) | @pepuscz (v1.1.50 + #801, #797) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 5.0 x16), Ryzen 9 9950X3D, 253 GB RAM, Windows 11 | Maya-S, 256K context | 72.3 tokens/s | 1757 tokens/s | @Andrey0710 (v1.1.43, #737) |
 | **2x RTX PRO 5000 Blackwell 72 GB**, Ryzen 9 9950X3D, 249 GB DDR5 | Maya-S, 512K context | 68-71 tokens/s (prose), up to 162 (code), tuned | ~3700 tokens/s (42K) | @realsquall1980-art (v1.1.28, #424) |
+| **4x RTX 4090 24 GB** (PCIe 4.0 x16), 2x Xeon Platinum 8380, 251 GB RAM, SATA SSD | Maya-S, 256K context | **67.5 tokens/s** | 1087 tokens/s (400 at 2K) | @oscarlius (v1.1.51) |
 | **1x A100-SXM4 80 GB**, Xeon Platinum 8360Y, 1 TB RAM | Maya-S, 1M context | 60.2 tokens/s | 241 tokens/s | @SunYong0821 (v1.1.34, #594) |
 | **4x AMD Instinct MI100 32 GB** (gfx908, PCIe 4.0 x16 each), EPYC 7402, 252 GB RAM | Maya-XS, 32K context | 51.8 tokens/s | 172 tokens/s | @nsaxploit (v1.1.22, #396) |
 | **4x RTX 3090 24 GB** (PCIe 3.0, SM clocks capped at 1500 MHz), Threadripper 1950X, 126 GB RAM | Maya-S, 256K context | 50-53 tokens/s (code), 40-43 (prose) | 947 tokens/s (10K), 1954 (90K) | @mgabor3141 (v1.1.26, #448) |
@@ -201,10 +202,10 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 
 | | |
 | --- | --- |
-| **GPU** | NVIDIA，计算能力 7.0 或更高 (V100、RTX 20 及更新)：1 块，或最多 16 块共同承载模型。显存越大越快。Pascal (Tesla P40 / P100、GTX 10) 为实验性，尚未验证。**AMD (实验性)：** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo 和 Gorgon Halo (Radeon 8060S / 8065S)；RX 6800 / 6900 和 Radeon PRO V620 / W6800 尚未验证；GLM-5.3-Flash 和 DeepSeek-V4.1-Flash-1017 在 AMD 上也能读取图片 - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
+| **GPU** | NVIDIA，计算能力 7.0 或更高 (V100、RTX 20 及更新)：1 块，或最多 16 块共同承载模型。显存越大越快。Pascal (Tesla P40 / P100、GTX 10) 为实验性，尚未验证。**AMD：** RX 7900 XT / XTX、Radeon AI PRO R9700 / RX 9070、Strix Halo 和 Gorgon Halo (Radeon 8060S / 8065S)；RX 6800 / 6900 和 Radeon PRO V620 / W6800 尚未验证；GLM-5.3-Flash 和 DeepSeek-V4.1-Flash-1017 在 AMD 上也能读取图片 - [docs/AMD_MAYA.md](docs/AMD_MAYA.md) |
 | **内存** | 32 GB 即可运行。内存越多，能让更多专家就近存放，速度也越快 |
 | **磁盘** | **一块高速 NVMe 固态硬盘**，空间足够放下模型 (GLM-5.3 · Maya-XS 约 75 GB、GLM-5.3 · Maya-S 约 100 GB、GLM-5.3 · Maya-L 约 160 GB、DeepSeek V4.1 · Maya-S 约 350 GB、其 unsloth Q8 GGUF 约 470 GB、MiniMax M3.1 · Maya-XS 约 95 GB、MiniMax-M3.1-Flash 的 EXL3 量化约 200 GB)，外加它的图片编码器 (1.1 GB)。不能用机械硬盘 |
-| **系统** | Linux (x86-64；最好带 AVX2 的 CPU)、NVIDIA 驱动、CUDA 12.x (CUDA 13 适用于 RTX 20 及更新，不适用于 V100 或 Pascal)、g++、Python 3.10+。Windows 10/11 (实验性)：[docs/WINDOWS.md](docs/WINDOWS.md)。不支持 WSL2。AMD：ROCm 7 |
+| **系统** | Linux (x86-64；最好带 AVX2 的 CPU)、NVIDIA 驱动、CUDA 12.x (CUDA 13 适用于 RTX 20 及更新，不适用于 V100 或 Pascal)、g++、Python 3.10+。Windows 10/11：[docs/WINDOWS.md](docs/WINDOWS.md)。不支持 WSL2。AMD：ROCm 7 |
 
 安装程序会检查以上所有项目，对缺少的内容打印出确切的命令，并且不会在系统范围内安装任何东西。
 
