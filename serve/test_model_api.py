@@ -340,6 +340,38 @@ class OtherQuantsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             model_pull.Puller(self.root, lambda i, c: []).start("deepseek-gguf-q4", None)
 
+    def test_qwen_unsloth_ud_iq2_xs(self):
+        """unsloth's Qwen3.8-Flash-Next GGUFs: UD-IQ2_XS only, under "Other quants" by unsloth (CYBER-FROST stays
+        Maya's row); offered from V100 on and on AMD as the setup's check_pc; its setup id on the command line; the
+        size the setup's list says (its files and the vision tower); installed by its own config."""
+        c = {m["id"]: m for m in self.cat()}
+        ud = c["qwen-ud-iq2_xs"]
+        self.assertEqual((ud["family"], ud["group"], ud["by"], ud["note"]), ("qwen", "other", "unsloth", ""))
+        self.assertEqual(ud["name"], "Qwen-3.8-Flash-Next · unsloth UD-IQ2_XS")
+        self.assertEqual(c["cyber-frost"]["group"], "maya")
+        self.assertEqual(sorted(i for i, m in c.items() if m["family"] == "qwen"), ["cyber-frost", "qwen-ud-iq2_xs"])
+        self.assertNotIn("qwen-ud-iq2_xs", {m["id"] for m in self.cat(ccs=(61,))})   # (Pascal: QWEN_MIN_CC)
+        self.assertIn("qwen-ud-iq2_xs", {m["id"] for m in self.cat(ccs=(70,))})
+        self.assertIn("qwen-ud-iq2_xs", {m["id"] for m in self.cat("hip", ())})
+        self.assertNotIn("qwen-ud-iq2_xs", {m["id"] for m in self.cat("metal", ())})
+        cmd = model_pull.setup_command("qwen-ud-iq2_xs", {"installer": {"models_dir": "/m"}})
+        self.assertEqual(cmd[cmd.index("--model"):cmd.index("--download-model")], ["--model", "qwen-ud-iq2_xs"])
+        sys.path.insert(0, str(model_pull.ROOT))
+        import maya
+        self.assertEqual(model_pull.QWEN_MIN_CC, maya.QWEN_MIN_CC)
+        model_pull._other_gb.clear()
+        try:
+            self.assertAlmostEqual(model_pull._other_sizes()["qwen-ud-iq2_xs"], 80.9, delta=0.1)   # (80.0 + the 0.9 GB mmproj)
+        finally:
+            model_pull._other_gb.clear()
+        self.assertFalse(ud["installed"])
+        (self.root / "maya-qwen-ud-iq2_xs.json").write_text(json.dumps(
+            {"exe": "x", "args": ["--pack", "p", "--ple-gguf", "g"],
+             "installer": {"family": "qwen", "quant": "Qwen3.8-Flash-Next-UD-IQ2_XS", "qwen_quant": "ud-iq2_xs"}}))
+        c = {m["id"]: m for m in self.cat()}
+        self.assertTrue(c["qwen-ud-iq2_xs"]["installed"])
+        self.assertFalse(c["cyber-frost"]["installed"])
+
 
 if __name__ == "__main__":
     unittest.main()

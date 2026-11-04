@@ -1,0 +1,24 @@
+{
+ "_": "Qwen3.8-Flash-Next (Qwen/Qwen3.8-Flash-Next, architecture qwen4exp) in unsloth's UD-IQ2_XS GGUF, on the `maya` engine's Qwen path as CYBER-FROST runs (tools/iq_pack.py indexes the files in place). Three shards: 1 the metadata and tokenizer, 2 the weights (routed gate/up experts IQ2_S / IQ2_XXS, down IQ4_NL / Q2_0 and blk.4's Q5_0), 3 the n-gram table alone (IQ4_NL). Shards 1-2 and the MTP head (a separate GGUF: tools/mtp_from_gguf.py builds the drafter from its blk.48) come from unsloth's repo at the pinned revision; shard 3, byte for byte unsloth's (the same sha256), from Maya's own repo (\"sources\"). Every file has its sha256: the setup checks it. Pictures: download.json's \"vision\" (the same mmproj as CYBER-FROST's, shared on the disk). unsloth's other UD quants run on the same code; only UD-IQ2_XS is listed.",
+ "name": "Qwen3.8-Flash-Next-UD-IQ2_XS",
+ "repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+ "revision": "d96201194f103c906994f283f504209dc8d2a10c",
+ "folder": "UD-IQ2_XS",
+ "license": "Qwen Community License 1.0 (LICENSE.qwen-community-1.0)",
+ "about": "IQ2_S / IQ2_XXS experts (gate/up) and IQ4_NL / Q2_0 (down), 180B parameters, 10 of 512 experts a token",
+ "memory_gb": 47,
+ "files": {
+  "Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf": [10946618, "91e8dc8f1428ce25d48fd1f711e4bf1f42215c5bac0f32eeb5608e6ec7ae91e9"],
+  "Qwen3.8-Flash-Next-UD-IQ2_XS-00002-of-00003.gguf": [47021008288, "11a67c82f54a9edf683d6b708062de78d803921a18a6cb2bf1dd55949b4ef9bd"],
+  "Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf": [28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"],
+  "mtp-Qwen3.8-Flash-Next-Q8_0.gguf": [4137429120, "58a47d6a216307e9b97172d5bfdc3436a8994b632f5e436b9bb6edf8951da8d1"]
+ },
+ "ngram": "Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf",
+ "mtp": "mtp-Qwen3.8-Flash-Next-Q8_0.gguf",
+ "sources": {
+  "Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf": {"repo": "peasantsmith/CYBER-FROST-3.8-PS-GUFF",
+   "revision": "b8069f8e31925001c5484cbb256daa3fdc0a3ca4", "folder": "Qwen3.8-Flash-Next-ngram"},
+  "mtp-Qwen3.8-Flash-Next-Q8_0.gguf": {"repo": "unsloth/Qwen3.8-Flash-Next-GGUF",
+   "revision": "d96201194f103c906994f283f504209dc8d2a10c", "folder": ""}
+ }
+}

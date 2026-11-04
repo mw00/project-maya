@@ -706,6 +706,15 @@ QWEN_PROFILE = ROOT / "data" / "expert-profile-qwen.bin"
 # the attention's time the same as FP16's, half its VRAM left to experts)
 QWEN_KV = "int8"
 QWEN_KV_BYTES = 12 * (2 * 2 * 256 + 2 * 2 * 256 // 64 * 2 + 128)
+# Qwen3.8-Flash-Next itself in unsloth's UD-IQ2_XS GGUF (v1.1.54; the only one of unsloth's UD quants listed): the same
+# Qwen path, three shards (1 the metadata, 2 the weights, 3 the n-gram table alone) and its MTP head as a separate GGUF
+# (tools/qwen/download_unsloth.json: pinned, sha256-checked; shard 3 from Maya's own repo, byte for byte unsloth's).  The
+# n-gram table is memory-mapped (--ple-io mmap: the page cache, never loaded into RAM by the engine).
+QWEN_UD = "ud-iq2_xs"                              # (its key: --qwen-quant, the installer record's qwen_quant)
+QWEN_UD_DIR = "Qwen3.8-Flash-Next-UD-IQ2_XS"       # (its folder in the models folder, the installer's "quant")
+QWEN_UD_MANIFEST = ROOT / "tools" / "qwen" / "download_unsloth.json"
+QWEN_UD_MODEL_NAME = "qwen3.8-flash-next"
+QWEN_QUANTS = ("q5_k_m", QWEN_UD)
 FAMILIES = ("glm", "deepseek", "minimax", "qwen")
 SHARD_RE = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
@@ -1733,6 +1742,8 @@ def choose_family(a, prev: dict) -> str:
     is the default."""
     if a.model:
         return "deepseek" if a.model == DS4 else "minimax" if a.model == MM3 else "qwen" if a.model == QWEN else "glm"
+    if getattr(a, "qwen_quant", None):                 # (--qwen-quant alone: Qwen's files named)
+        return "qwen"
     metal = getattr(a, "backend", None) == "metal"
     if a.gguf_dir or a.draft or (metal and not a.model_dir):     # (Metal runs GLM only: no question)
         return "glm"
@@ -1768,7 +1779,8 @@ def choose_family(a, prev: dict) -> str:
              f"{QWEN_SHOWN}: 180B, 10 of 512 experts a token; Blackfrost-AI's cybersecurity fine-tune of Qwen3.8-Flash-Next "
              "in peasantsmith's GGUF, on Maya's own Qwen path; NVIDIA from V100 on or AMD, Linux or Windows; all its "
              f"experts in about {qwen_entry()['memory_gb']:.0f} GB of VRAM and RAM together{here}, with less the others "
-             "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only.")]
+             "read from the SSD; tool calls, its three reasoning efforts, MTP drafting, up to a 256K context; text only. "
+             f"Or the base model itself in unsloth's UD-IQ2_XS GGUF ({qwen_entry(QWEN_UD)['download_gb']:.0f} GB).")]
     pick = choose("Model?", ["Which model to set up:"], rows, FAMILIES.index(default), a.yes)
     return FAMILIES[pick]
 
@@ -2467,6 +2479,9 @@ def import_catalog(models: Path) -> list:
     q = tolerant(qwen_entry)
     if q:
         entry(QWEN, QWEN, q)
+    q = tolerant(qwen_entry, QWEN_UD)
+    if q:
+        entry(QWEN_UD_DIR, QWEN_UD_DIR, q)
     return cat
 
 
@@ -6491,8 +6506,28 @@ def set_up_mm3(a, prev: dict) -> Path | None:
 
 
 # ------------------------------------------------------------------------------------------------ CYBER-FROST-3.8-PS
-def qwen_entry() -> dict:
-    """CYBER-FROST-3.8-PS's download (tools/qwen/download.json) as a MODELS entry (offer_download's form)."""
+def qwen_entry(quant: str = "q5_k_m") -> dict:
+    """CYBER-FROST-3.8-PS's download (tools/qwen/download.json) as a MODELS entry (offer_download's form); quant
+    QWEN_UD: unsloth's UD-IQ2_XS of Qwen3.8-Flash-Next (tools/qwen/download_unsloth.json: its n-gram shard from Maya's
+    repo, its MTP head from the repo's top - "sources")."""
+    if quant == QWEN_UD:
+        man = read_json(QWEN_UD_MANIFEST)
+        if not man.get("files") or not man.get("revision") or not man.get("ngram") or not man.get("mtp"):
+            fail(f"{QWEN_UD_MANIFEST} is missing or damaged",
+                 "restore it (git checkout tools/qwen/download_unsloth.json)")
+        src = man.get("sources") or {}
+        return {"about": f"Qwen3.8-Flash-Next in unsloth's UD-IQ2_XS GGUF ({man.get('about', '')}); "
+                         f"{man.get('license', 'the Qwen Community License')}",
+                "format": "qwen-gguf", "repo": man["repo"], "revision": man["revision"],
+                "folder": man.get("folder", ""),
+                "files": {k: v[0] for k, v in man["files"].items()},
+                "sha256": {k: v[1] for k, v in man["files"].items()},
+                "sources": {k: (v["repo"], v["revision"]) for k, v in src.items()},
+                "source_folders": {k: v.get("folder", "") for k, v in src.items()},
+                "ngram": man["ngram"], "mtp": man["mtp"],
+                "download_gb": sum(v[0] for v in man["files"].values()) / 1e9,
+                "ngram_gb": man["files"][man["ngram"]][0] / 1e9,
+                "memory_gb": float(man.get("memory_gb") or 47)}
     man = read_json(QWEN_MANIFEST)
     if not man.get("files") or not man.get("revision"):
         fail(f"{QWEN_MANIFEST} is missing or damaged", "restore it (git checkout tools/qwen/download.json)")
@@ -6518,43 +6553,87 @@ def qwen_recommended_context(vram: float, starved: bool = False) -> int:
     return max(fits) if fits else QWEN_CONTEXTS[0]
 
 
-def qwen_dir(a, models: Path, prev: dict) -> Path:
-    """The model's folder: --model-dir, else the folder of the setup before (its pack is inside it), else
-    <models folder>/CYBER-FROST-3.8-PS."""
+def qwen_dir(a, models: Path, prev: dict, quant: str = "q5_k_m") -> Path:
+    """The model's folder: --model-dir, else the folder of the setup before of the same files (its pack is inside it),
+    else <models folder>/CYBER-FROST-3.8-PS (unsloth's UD-IQ2_XS: <models folder>/Qwen3.8-Flash-Next-UD-IQ2_XS)."""
     if a.model_dir:
         return Path(a.model_dir).expanduser().resolve()
     args = prev.get("args") or []
-    if "--native" in args[:-1]:
+    if "--native" in args[:-1] and ((prev.get("installer") or {}).get("qwen_quant") or "q5_k_m") == quant:
         d = Path(args[args.index("--native") + 1]).parent
         if d.is_dir():
             return d
-    return models / QWEN
+    return models / (QWEN_UD_DIR if quant == QWEN_UD else QWEN)
 
 
-def qwen_model_step(a, d: Path) -> list | None:
-    """The GGUF in d (downloaded when it is not there, then checked against its published sha256): [the file], or None
-    when nothing was downloaded."""
-    step(5, f"the model ({QWEN_SHOWN})")
-    m = qwen_entry()
+def link_published(dst: Path, size: int, sha: str, places: list) -> Path | None:
+    """dst missing, the same published file (its size, then its sha256 - never assumed) whole in one of `places`:
+    hard-linked from it (one copy on the disk, no second download), with its sha256 record.  The source linked, or None
+    (none there, or on another drive: the download fetches it)."""
+    if dst.exists():
+        return None
+    for src in dict.fromkeys(Path(p) for p in places):
+        try:
+            if src.resolve() == dst.resolve() or not src.is_file() or src.stat().st_size != size:
+                continue
+            if not sha256_checked(src, sha):
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.link(src, dst)
+        except OSError:
+            continue
+        seen = read_json(src.parent / VERIFIED).get(src.name)
+        if seen:   # (a hard link: the same size and time - its check still holds)
+            book = read_json(dst.parent / VERIFIED)
+            book[dst.name] = seen
+            try:
+                (dst.parent / VERIFIED).write_text(json.dumps(book, indent=1), encoding="utf-8")
+            except OSError:
+                pass
+        ok(f"{dst.name}: linked from {src.parent} (the same file, one copy)")
+        return src
+    return None
+
+
+def qwen_places(models: Path, rel: str) -> list:
+    """Where another Qwen setup keeps the file `rel` (relative to its model folder): both quants' default folders in the
+    models folder and the folders of the Qwen configs here."""
+    dirs = [models / QWEN, models / QWEN_UD_DIR]
+    for c in configs():
+        cfg = read_json(c)
+        if config_family(cfg) == "qwen" and (cfg.get("installer") or {}).get("model_dir"):
+            dirs.append(Path(cfg["installer"]["model_dir"]))
+    return [x / rel for x in dirs]
+
+
+def qwen_model_step(a, d: Path, quant: str = "q5_k_m", models: Path | None = None) -> list | None:
+    """The model's files in d (downloaded when they are not there, then checked against their published sha256): [the
+    GGUF, or unsloth's shards and MTP head - the first shard first], or None when nothing was downloaded.  A file
+    another Qwen setup here already has (the same sha256) is hard-linked from it."""
+    step(5, f"the model ({Q.shown('qwen', quant)})")
+    m = qwen_entry(quant)
     files = [d / n for n in m["files"]]
+    for f in files:
+        if file_incomplete(m, f) and models is not None:
+            link_published(f, m["files"][f.name], m["sha256"][f.name], qwen_places(models, f.name))
     missing = [f for f in files if file_incomplete(m, f)]
-    if missing and not offer_download(a, Q.shown("qwen", "q5_k_m", m["download_gb"]), d, files, m):
+    if missing and not offer_download(a, Q.shown("qwen", quant, m["download_gb"]), d, files, m):
         return None
     for f in files:                                    # (a file that was already there: checked once, then remembered)
         if not sha256_checked(f, m["sha256"][f.name]):
             fail(f"{f.name}: the sha256 does not match the published one - still being downloaded, or damaged",
                  f"let the download finish, or delete the file and run {ME} --download-model")
-    ok(f"{QWEN_SHOWN}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
+    ok(f"{Q.shown('qwen', quant)}: {sum(f.stat().st_size for f in files) / 1e9:.1f} GB in {d}")
     if rotational(d):
-        warn(f"{d} is on a spinning hard disk: the engine reads the n-gram table (52 GB) from it row by row on every "
-             "token, and the experts RAM cannot hold - use an NVMe SSD (--models-dir)")
+        warn(f"{d} is on a spinning hard disk: the engine reads the n-gram table ({m.get('ngram_gb', 52):.0f} GB) from "
+             "it row by row on every token, and the experts RAM cannot hold - use an NVMe SSD (--models-dir)")
     return files
 
 
-def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
+def qwen_pack_step(a, d: Path, files: list, llama: Path, mtp_gguf: Path | None = None) -> Path:
     """tools/iq_pack.py's pack in <model>/pack (the index of every tensor, the small float weights, the tokenizer with
-    the GGUF's chat template), and the MTP drafter built from the GGUF's NextN block (<pack>/mtp, tools/mtp_from_gguf.py)
-    - built again when its tools or the model file changed."""
+    the GGUF's chat template), and the MTP drafter built from the GGUF's NextN block (<pack>/mtp, tools/mtp_from_gguf.py;
+    mtp_gguf: unsloth's separate MTP head) - built again when its tools or the model files changed."""
     step(6, "the pack (the engine's index of the model file) and the MTP drafter")
     pack = d / "pack"
     tools = S.source_hash(QWEN_PACK_TOOLS)
@@ -6577,8 +6656,8 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
         fail(f"the pack builder did not write {pack / missing[0]}", "the reason is in the messages above")
     say("  The MTP drafter from the model's NextN block (its 512 experts requantized to 2 bits for the drafts; a few "
         "minutes) ...")
-    run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(files[0]), "--out", str(pack / "mtp")],
-        env=env)
+    run([sys.executable, str(ROOT / "tools" / "mtp_from_gguf.py"), "--gguf", str(mtp_gguf or files[0]),
+         "--out", str(pack / "mtp")], env=env)
     if QWEN_PROFILE.exists():                          # (the shipped ranking of the experts: which start in VRAM)
         shutil.copyfile(QWEN_PROFILE, pack / "expert-profile.bin")
     stamp_pack(pack, files)
@@ -6590,21 +6669,24 @@ def qwen_pack_step(a, d: Path, files: list, llama: Path) -> Path:
 
 
 def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int, models: Path, d: Path,
-                      vision: dict | None = None) -> Path:
-    """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD) and its start script.  A setup again keeps what the
-    config before says that this one does not ask: its engine settings, the thinking level and sampling, where the
-    server listens and its key."""
+                      vision: dict | None = None, quant: str = "q5_k_m", ple: Path | None = None) -> Path:
+    """maya-cyber-frost.json (maya-cyber-frost-hip.json on AMD; unsloth's UD-IQ2_XS: maya-qwen-ud-iq2_xs.json) and its
+    start script.  A setup again keeps what the config before says that this one does not ask: its engine settings,
+    where the server listens and its key; the model's own sampling and thinking level every setup.  ple: the shard
+    that holds the n-gram table (unsloth's shard 3), else the GGUF itself."""
     step(8, "the configuration and the start script")
     port = a.port or 8080
     hip = pc.get("backend") == "hip"
-    cfg_path = ROOT / f"{Q.config_stem('qwen', 'q5_k_m')}{'-hip' if hip else ''}.json"
+    cfg_path = ROOT / f"{Q.config_stem('qwen', quant)}{'-hip' if hip else ''}.json"
     old = read_json(cfg_path)
     profile = pack / "expert-profile.bin"
     # the Qwen path: the pack, the model file for its native weights and its n-gram table, decode windows of up to 4
     # tokens (prompt-lookup drafts; the MTP drafter where it measures faster - qwen_draft_calibration), prompts in
     # chunks sized from the expert cache it lends them, the expert cache sized from the free VRAM
-    args = ["--pack", str(pack), "--native", str(gguf), "--ple-gguf", str(gguf), "--spec", "4", "--prefill", "auto",
-            "--expert-cache", "auto", "--max-context", str(ctx), "--kv", QWEN_KV]
+    args = ["--pack", str(pack), "--native", str(gguf), "--ple-gguf", str(ple or gguf), "--spec", "4", "--prefill",
+            "auto", "--expert-cache", "auto", "--max-context", str(ctx), "--kv", QWEN_KV]
+    if quant == QWEN_UD:                               # (its n-gram table memory-mapped: the page cache, never loaded)
+        args += ["--ple-io", "mmap"]
     if profile.exists():
         args += ["--expert-profile", str(profile)]
     # (the engine's server needs the MTP drafter loaded - the setup always builds it; drafting off is --mtp-max-t 1)
@@ -6613,11 +6695,14 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     if vision:                                         # (pictures: GENI requests, each image's rows at its pad tokens)
         args.append("--vision")
     kept = keep_args(old.get("args") or [], args, ("--mtp-max-t", "--kv", "--vram-reserve-mib", "--pool-workers",
-                                                   "--experts-from-gguf"))
+                                                   "--experts-from-gguf", "--ple-io"))
+    inst = {"family": "qwen", "quant": QWEN_UD_DIR if quant == QWEN_UD else QWEN, "qwen_quant": quant}
+    sampling, effort = Q.model_defaults({"installer": inst})   # (the model's own, every setup: its card's)
     cfg = {"exe": str(EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            **({"backend": "hip"} if hip else {}),
-           "model_name": QWEN_MODEL_NAME, "gpu": [g["index"] for g in pc["gpus"]],
-           "sampling": dict(QWEN_SAMPLING), "reasoning_effort": QWEN_EFFORT,   # (the model's own, every setup)
+           "model_name": QWEN_UD_MODEL_NAME if quant == QWEN_UD else QWEN_MODEL_NAME,
+           "gpu": [g["index"] for g in pc["gpus"]],
+           "sampling": sampling, "reasoning_effort": effort,
            "lib_dirs": meta.get("lib_dirs") or old.get("lib_dirs") or [], "port": port,
            **({"vision": vision} if vision else {})}
     for k in ("host", "api_key", "cors_origins", "mcp_servers", "layer_split"):
@@ -6634,8 +6719,7 @@ def write_config_qwen(a, pc: dict, meta: dict, pack: Path, gguf: Path, ctx: int,
     if kept:
         ok("kept from the config before: " + ", ".join(kept))
     cfg["log"] = str(cfg_path.with_suffix(".log"))
-    cfg["installer"] = {"family": "qwen", "models_dir": str(models), "quant": QWEN, "qwen_quant": "q5_k_m",
-                        "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
+    cfg["installer"] = {**inst, "models_dir": str(models), "model_dir": str(d), "written": time.strftime("%Y-%m-%d %H:%M")}
     cfg_path.write_text(json.dumps(N.env_out(cfg), indent=1), encoding="utf-8")
     ok(f"config: {cfg_path}")
     ok(f"start script: {write_run_script(cfg_path, port)}")
@@ -6748,10 +6832,12 @@ def vision_encoder_ready(a, pc: dict, meta: dict, llama: Path) -> bool:
     return False
 
 
-def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path) -> dict | None:
+def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path,
+                     models: Path | None = None) -> dict | None:
     """Step 7: the config's "vision" entry - maya-vision with the model's mmproj (in <model folder>/vision) and the
     GGUF's vocabulary - or None (text only, said why).  The server starts the encoder when a request carries a picture;
-    the engine places its rows at the <|image_pad|> tokens with their M-RoPE positions (--vision: GENI requests)."""
+    the engine places its rows at the <|image_pad|> tokens with their M-RoPE positions (--vision: GENI requests).  The
+    same mmproj serves CYBER-FROST and unsloth's GGUFs of the base model: another Qwen setup's copy is hard-linked."""
     step(7, "images (the vision encoder)")
     if a.no_vision:
         ok("skipped (--no-vision): the model reads text only")
@@ -6762,6 +6848,9 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path) 
         return None
     vd = d / "vision"
     files = [vd / n for n in m["files"]]
+    for f in files:
+        if models is not None and file_incomplete(m, f):
+            link_published(f, m["files"][f.name], m["sha256"][f.name], qwen_places(models, f"vision/{f.name}"))
     if any(file_incomplete(m, f) for f in files) and not offer_download(a, "the vision tower", vd, files, m):
         warn(f"the vision tower was not downloaded: the model reads text only ({ME} --setup asks again)")
         return None
@@ -6776,14 +6865,40 @@ def qwen_vision_step(a, pc: dict, meta: dict, llama: Path, d: Path, gguf: Path) 
     return {"exe": str(VEXE), "mmproj": str(files[0]), "model": str(gguf), "gpu": True}
 
 
+def choose_qwen_quant(a, prev: dict) -> str:
+    """Which Qwen files: --qwen-quant (or a --model id that names them), else asked - CYBER-FROST-3.8-PS's Q5_K_M or
+    unsloth's UD-IQ2_XS of the base model; the files set up before are the default."""
+    given = getattr(a, "qwen_quant", None)
+    if given:
+        return given
+    before = (prev.get("installer") or {}).get("qwen_quant") or "q5_k_m"
+    default = before if before in QWEN_QUANTS else "q5_k_m"
+    rows = []
+    for q in QWEN_QUANTS:
+        m = qwen_entry(q)
+        rows.append((Q.shown("qwen", q, m["download_gb"]), "new" if q == QWEN_UD else None,
+                     "Qwen3.8-Flash-Next itself in unsloth's UD-IQ2_XS GGUF (its n-gram table from Maya's repo, its MTP "
+                     f"head, the experts in about {m['memory_gb']:.0f} GB of VRAM and RAM together)" if q == QWEN_UD else
+                     "Blackfrost-AI's cybersecurity fine-tune in peasantsmith's GGUF (Q5_K experts, all of them in about "
+                     f"{m['memory_gb']:.0f} GB of VRAM and RAM together)"))
+    pick = choose("Which Qwen3.8-Flash-Next?", ["The files to set up:"], rows, QWEN_QUANTS.index(default),
+                  getattr(a, "yes", False))
+    return QWEN_QUANTS[pick]
+
+
 def set_up_qwen(a, prev: dict) -> Path | None:
     """CYBER-FROST-3.8-PS's steps 1-8: the PC (NVIDIA from V100, or AMD), the context (recommended by this PC's VRAM),
     the engine (build/maya), the file (pinned, sha256-checked), the pack and the MTP drafter, the config; then the
     drafter measured."""
     inst = prev.get("installer") or {}
+    quant = choose_qwen_quant(a, prev)
+    if (inst.get("qwen_quant") or "q5_k_m") != quant:   # (the other Qwen files' setup before: its own config's answers)
+        prev = next((c for c in map(read_json, configs()) if config_family(c) == "qwen" and
+                     ((c.get("installer") or {}).get("qwen_quant") or "q5_k_m") == quant), {})
+        inst = prev.get("installer") or inst
     prev_args = prev.get("args") or []
     prev_ctx = int(prev_args[prev_args.index("--max-context") + 1]) if "--max-context" in prev_args[:-1] else None
-    m = qwen_entry()
+    m = qwen_entry(quant)
     pc = check_pc(a, "qwen")                           # 1
     total, _ = mem_gb()
     vram = sum(g["vram_gb"] for g in pc["gpus"])
@@ -6791,7 +6906,8 @@ def set_up_qwen(a, prev: dict) -> Path | None:
         warn(f"{vram:.0f} GB of VRAM and {total:.0f} GB of RAM: below the ~{m['memory_gb']:.0f} GB that hold all of its "
              "experts - the engine reads the others from the SSD when they are routed (slower)")
     step(2, "your choices")                            # 2
-    ok(f"model: {Q.shown('qwen', 'q5_k_m', m['download_gb'])} - a fine-tune of Qwen3.8-Flash-Next "
+    ok(f"model: {Q.shown('qwen', quant, m['download_gb'])} - " +
+       ("unsloth's GGUF of Qwen3.8-Flash-Next " if quant == QWEN_UD else "a fine-tune of Qwen3.8-Flash-Next ") +
        "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
     rec = qwen_recommended_context(vram, vram + total < m["memory_gb"])
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
@@ -6799,16 +6915,18 @@ def set_up_qwen(a, prev: dict) -> Path | None:
        f"; its KV cache: {qwen_kv_gb(ctx):.1f} GB of VRAM")
     models = (Path(a.models_dir).expanduser().resolve() if a.models_dir else
               Path(inst["models_dir"]) if inst.get("models_dir") else ROOT.parent / "Maya-data" / "models")
-    d = qwen_dir(a, models, prev)
+    d = qwen_dir(a, models, prev, quant)
     ok(f"model folder: {d}")
     llama = tools_step(a)                              # 3
     meta = build_step(a, pc, llama)                    # 4
-    files = qwen_model_step(a, d)                      # 5
+    files = qwen_model_step(a, d, quant, models)       # 5
     if files is None:
         return None
-    pack = qwen_pack_step(a, d, files, llama)          # 6
-    vision = qwen_vision_step(a, pc, meta, llama, d, files[0])   # 7
-    cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision)   # 8
+    ud = quant == QWEN_UD
+    pack = qwen_pack_step(a, d, files, llama, d / m["mtp"] if ud else None)   # 6
+    vision = qwen_vision_step(a, pc, meta, llama, d, files[0], models)       # 7
+    cfg_path = write_config_qwen(a, pc, meta, pack, files[0], ctx, models, d, vision, quant,
+                                 d / m["ngram"] if ud else None)                # 8
     if "mtp_calibration" not in (read_json(cfg_path).get("installer") or {}) or a.calibrate:
         how = drafting_choice(a, "the MTP drafter", "10-40")
         if how != "measure":
@@ -6853,8 +6971,13 @@ def model_option(a) -> str | None:
     if family == "glm":
         a.model = key
         return None
-    if family == "qwen":                                 # (its one GGUF: no quant to choose)
+    if family == "qwen":                                 # (CYBER-FROST's GGUF, or unsloth's UD-IQ2_XS: --qwen-quant)
+        given = getattr(a, "qwen_quant", None)
+        if key is not None and given and given != key:
+            return (f"--model {a.model} is {Q.shown(family, key)}, but --qwen-quant says {given}: give one of them")
         a.model = QWEN
+        if key is not None:
+            a.qwen_quant = key
         return None
     a.model, flag = (DS4, "ds4_quant") if family == "deepseek" else (MM3, "mm3_quant")
     if key is not None:
@@ -6920,6 +7043,10 @@ def main() -> int:
                          "PC), maya-s (gguf-s) = MiniMax-M3.1-Flash-Maya-S (~2.1 bits, ~122 GB) - the GGUFs on NVIDIA "
                          "from V100 on and on AMD; with --model-dir: the files you have (the same as --model "
                          "minimax-maya-xs / minimax-maya-s)")
+    ap.add_argument("--qwen-quant", choices=list(QWEN_QUANTS),
+                    help=f"Qwen3.8-Flash-Next's files: q5_k_m = {Q.shown('qwen', 'q5_k_m')} (peasantsmith's GGUF), "
+                         f"{QWEN_UD} = Qwen3.8-Flash-Next in unsloth's UD-IQ2_XS GGUF (~81 GB with its vision tower; the same as --model "
+                         "qwen-ud-iq2_xs)")
     ap.add_argument("--draft", choices=list(DRAFTS),
                     help="how the model drafts: mtp = its MTP block (the default), dflash2 = a DFlash2 drafter "
                          f"(downloads {DFLASH['bytes'] / 1e9:.1f} GB; NVIDIA RTX 30 / A100 and newer, Apple Silicon, "

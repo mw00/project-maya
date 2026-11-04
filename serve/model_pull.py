@@ -32,10 +32,14 @@ DS4_OTHER = (("exl3", "LibertAIDAI"), ("exl3-3.5", "LibertAIDAI"), ("gguf-q8", "
              ("gguf-iq3_xxs", "unsloth"), ("gguf-iq3_s", "unsloth"), ("gguf-q3_k_xl", "unsloth"),
              ("abliterated-128g", "orcarouter"), ("abliterated-256g", "orcarouter"))
 GLM_EXL3 = ("EXL3-3.05bpw", "EXL3-4.05bpw")
+# (Qwen3.8-Flash-Next itself: unsloth's UD-IQ2_XS only - its other UD quants run on the same code but are not listed;
+#  the setup id: maya_quants.QWEN_UD_IDS[0])
+QWEN_OTHER = (("qwen-ud-iq2_xs", "qwen", "ud-iq2_xs", "unsloth"),)
 OTHER = tuple([(f"deepseek-{k}", "deepseek", k, by) for k, by in DS4_OTHER] + [("minimax-exl3", "minimax", "exl3", "Mia-AiLab")] +
-              [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3])
+              [(f"glm-{k.lower()}", "glm", k, "turboderp") for k in GLM_EXL3] + list(QWEN_OTHER))
 GATED = ("abliterated-128g", "abliterated-256g")     # (orcarouter's repo is gated: the setup sends the user's HF token)
 EXL3_MIN_CC = 70                                     # (maya.DS4_MIN_CC / mm3_min_cc: the EXL3 quants from V100 on)
+QWEN_MIN_CC = 70                                     # (maya.QWEN_MIN_CC: the Qwen path from V100 on)
 
 
 def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
@@ -46,6 +50,8 @@ def _offered(fam: str, key: str, backend: str, ccs: list) -> bool:
         return False
     if fam in ("deepseek", "minimax") and backend != "hip" and ccs:   # (their EXL3 quants and DeepSeek's GGUFs:
         return max(ccs) >= EXL3_MIN_CC                                  # maya-ds4's / maya-mm3's kernels, V100 on)
+    if fam == "qwen" and backend != "hip" and ccs:                     # (unsloth's Qwen GGUF: the setup's check_pc)
+        return max(ccs) >= QWEN_MIN_CC
     return True
 
 
@@ -140,6 +146,9 @@ def _other_sizes() -> dict:
                 gb = mk["download_gb"] - mk["files"].get(t, 0) / 1e9 + maya.ds4_abl_engram_gb() if t else mk["download_gb"]
             elif fam == "minimax":
                 gb = maya.mm3_models()[0]["download_gb"]
+            elif fam == "qwen":                        # (its files and the vision tower the setup fetches with them)
+                vision = maya.qwen_vision_model()
+                gb = maya.qwen_entry(key)["download_gb"] + (vision["download_gb"] if vision else 0)
             else:
                 continue                               # (GLM's: the MODELS table, as Maya's own)
             _other_gb[ident] = round(float(gb), 1)
@@ -165,6 +174,8 @@ def setup_command(model_id: str, cfg: dict | None) -> list:
         which = ["--model", model_id]
     elif other[0] == "glm":                            # (a GLM download by its name)
         which = ["--model", other[1]]
+    elif other[0] == "qwen":                           # (its setup id: maya_quants.QWEN_UD_IDS)
+        which = ["--model", model_id]
     else:                                              # (the model, its files by --ds4-quant / --mm3-quant)
         which = ["--model", Q.MODEL[other[0]], "--ds4-quant" if other[0] == "deepseek" else "--mm3-quant", other[1]]
     cmd = [sys.executable, str(ROOT / "maya.py"), "--setup", *which, "--download-model", "--yes",

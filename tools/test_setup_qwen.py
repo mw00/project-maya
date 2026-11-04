@@ -7,6 +7,7 @@ template's thinking (always on; thinking off closes the block as its Qwen base w
 """
 from pathlib import Path
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -258,6 +259,149 @@ class Vision(unittest.TestCase):
                                            self.d, self.d, vision)
                 c = json.loads(p.read_text())
                 self.assertEqual((c.get("vision"), "--vision" in c["args"]), (vision, vision is not None))
+
+
+UD = "ud-iq2_xs"
+UD_SHARDS = [f"Qwen3.8-Flash-Next-UD-IQ2_XS-0000{i}-of-00003.gguf" for i in (1, 2, 3)]
+UD_MTP = "mtp-Qwen3.8-Flash-Next-Q8_0.gguf"
+UD_REV = "d96201194f103c906994f283f504209dc8d2a10c"
+
+
+class UnslothUD(unittest.TestCase):
+    """unsloth's Qwen3.8-Flash-Next UD-IQ2_XS: its names and ids, the pinned manifest (shards 1-2 and the MTP head
+    from unsloth, the n-gram shard from Maya's repo), its config's defaults, and one copy of a shared file."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.patches = [patch.object(maya, n, lambda *a, **k: None) for n in ("say", "ok", "warn", "step")]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_names_and_ids(self):
+        self.assertEqual(Q.shown("qwen", UD, 79.97), "Qwen-3.8-Flash-Next · unsloth UD-IQ2_XS (80 GB)")
+        self.assertEqual(Q.shown("qwen", "q5_k_m"), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")   # (as before)
+        self.assertEqual(Q.config_stem("qwen", UD), "maya-qwen-ud-iq2_xs")
+        self.assertEqual(Q.config_stem("qwen", "q5_k_m"), "maya-cyber-frost")
+        for name in ("qwen-ud-iq2_xs", "Qwen3.8-Flash-Next-UD-IQ2_XS", "qwen3.8-ud-iq2_xs"):
+            self.assertEqual(Q.resolve(name), ("qwen", UD), name)
+        self.assertEqual(Q.resolve("cyber-frost"), ("qwen", "q5_k_m"))
+        self.assertEqual(maya.QWEN_QUANTS, ("q5_k_m", UD))
+
+    def test_model_option(self):
+        a = type("A", (), {"model": "qwen-ud-iq2_xs", "mm3_quant": None, "qwen_quant": None})()
+        self.assertIsNone(maya.model_option(a))
+        self.assertEqual((a.model, a.qwen_quant), (maya.QWEN, UD))
+        a = type("A", (), {"model": "cyber-frost", "mm3_quant": None, "qwen_quant": None})()
+        self.assertIsNone(maya.model_option(a))
+        self.assertEqual(a.qwen_quant, "q5_k_m")
+        a = type("A", (), {"model": "qwen-ud-iq2_xs", "mm3_quant": None, "qwen_quant": "q5_k_m"})()
+        self.assertIn("--qwen-quant", maya.model_option(a))
+
+    def test_manifest_pinned(self):
+        m = maya.qwen_entry(UD)
+        self.assertEqual((m["repo"], m["revision"], m["folder"]), ("unsloth/Qwen3.8-Flash-Next-GGUF", UD_REV, "UD-IQ2_XS"))
+        self.assertEqual(list(m["files"]), UD_SHARDS + [UD_MTP])
+        for name, sha in m["sha256"].items():
+            self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
+        self.assertEqual((m["ngram"], m["mtp"]), (UD_SHARDS[2], UD_MTP))
+        self.assertEqual(m["sha256"][UD_SHARDS[2]], "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6")
+        self.assertEqual(m["files"][UD_SHARDS[2]], 28800138432)
+        self.assertAlmostEqual(m["download_gb"], 79.97, delta=0.01)
+        u = "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/" + UD_REV
+        self.assertEqual(maya.file_url(m, UD_SHARDS[0]), f"{u}/UD-IQ2_XS/{UD_SHARDS[0]}")
+        self.assertEqual(maya.file_url(m, UD_SHARDS[1]), f"{u}/UD-IQ2_XS/{UD_SHARDS[1]}")
+        self.assertEqual(maya.file_url(m, UD_MTP), f"{u}/{UD_MTP}")   # (the MTP head: the repo's top)
+        # the n-gram table: Maya's own repo (its downloads counted there), byte for byte unsloth's shard
+        self.assertEqual(maya.file_url(m, UD_SHARDS[2]),
+                         "https://huggingface.co/peasantsmith/CYBER-FROST-3.8-PS-GUFF/resolve/"
+                         f"b8069f8e31925001c5484cbb256daa3fdc0a3ca4/Qwen3.8-Flash-Next-ngram/{UD_SHARDS[2]}")
+        self.assertEqual(maya.qwen_entry()["repo"], "peasantsmith/CYBER-FROST-3.8-PS-GUFF")   # (CYBER-FROST's: as before)
+        self.assertNotIn("sources", maya.qwen_entry())
+
+    def test_model_step_downloads_into_its_folder(self):
+        seen = {}
+
+        def offer(a, quant, d, shards, m):
+            seen.update(quant=quant, d=d, shards=[s.name for s in shards], m=m)
+            return False
+        a = type("A", (), {"model_dir": None})()
+        d = maya.qwen_dir(a, self.d, {"args": ["--native", str(self.d / "CYBER-FROST-3.8-PS" / "x.gguf")],
+                                      "installer": {"qwen_quant": "q5_k_m"}}, UD)
+        self.assertEqual(d, self.d / "Qwen3.8-Flash-Next-UD-IQ2_XS")   # (CYBER-FROST's folder is not this one's)
+        with patch.object(maya, "offer_download", offer), patch.object(maya, "configs", lambda: []):
+            self.assertIsNone(maya.qwen_model_step(a, d, UD, self.d))
+        self.assertEqual((seen["d"], seen["shards"]), (d, UD_SHARDS + [UD_MTP]))
+        self.assertEqual(seen["quant"], "Qwen-3.8-Flash-Next · unsloth UD-IQ2_XS (80 GB)")
+
+    def test_config_defaults(self):
+        """The model's own defaults in its config: the card's thinking-mode sampling (min_p 0 too), xhigh, its chat
+        template from the pack's tokenizer, MTP loaded, INT8 KV, the n-gram shard memory-mapped; the experts' place by
+        --expert-cache auto (this PC's VRAM / RAM)."""
+        d = self.d / "Qwen3.8-Flash-Next-UD-IQ2_XS"
+        pack = d / "pack"
+        (pack / "tokenizer").mkdir(parents=True)
+        (pack / "mtp").mkdir()
+        (pack / "mtp" / "dense.txt").write_text("x")
+        a = type("A", (), dict(port=None, env=[], host=None, api_key=None))()
+        with patch.object(maya, "ROOT", self.d), patch.object(maya, "write_run_script", lambda *x: self.d / "run"):
+            p = maya.write_config_qwen(a, {"gpus": [{"index": 0}, {"index": 1}]}, {}, pack, d / UD_SHARDS[0], 65536,
+                                       self.d, d, None, UD, d / UD_SHARDS[2])
+        self.assertEqual(p.name, "maya-qwen-ud-iq2_xs.json")
+        c = json.loads(p.read_text())
+        args = c["args"]
+        val = lambda k: args[args.index(k) + 1]   # noqa: E731
+        self.assertEqual((val("--native"), val("--ple-gguf")), (str(d / UD_SHARDS[0]), str(d / UD_SHARDS[2])))
+        self.assertEqual((val("--ple-io"), val("--kv"), val("--expert-cache"), val("--mtp")), ("mmap", "int8", "auto",
+                                                                                              str(pack / "mtp")))
+        self.assertEqual(c["sampling"], {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0})
+        self.assertEqual((c["reasoning_effort"], c["model_name"], c["tokenizer"]),
+                         ("xhigh", "qwen3.8-flash-next", str(pack / "tokenizer")))
+        self.assertEqual((c["installer"]["qwen_quant"], c["installer"]["quant"]), (UD, "Qwen3.8-Flash-Next-UD-IQ2_XS"))
+        self.assertEqual(Q.family_of(c), "qwen")
+        self.assertEqual(Q.config_label(c), "Qwen-3.8-Flash-Next · unsloth UD-IQ2_XS")
+        self.assertEqual(Q.model_defaults(c), ({"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0}, "xhigh"))
+        # CYBER-FROST's config: its defaults as before (no min_p, the GGUF itself for the table, no --ple-io)
+        with patch.object(maya, "ROOT", self.d), patch.object(maya, "write_run_script", lambda *x: self.d / "run"):
+            p = maya.write_config_qwen(a, {"gpus": [{"index": 0}]}, {}, pack, self.d / "cf.gguf", 65536, self.d,
+                                       self.d)
+        c = json.loads(p.read_text())
+        self.assertEqual(p.name, "maya-cyber-frost.json")
+        self.assertEqual((c["sampling"], c["reasoning_effort"], c["model_name"]),
+                         ({"temperature": 1.0, "top_p": 0.95, "top_k": 20}, "xhigh", "cyber-frost-3.8-ps"))
+        self.assertNotIn("--ple-io", c["args"])
+        self.assertEqual(c["args"][c["args"].index("--ple-gguf") + 1], str(self.d / "cf.gguf"))
+
+    def test_choose_quant(self):
+        a = type("A", (), {"qwen_quant": None, "yes": True})()
+        with patch.object(maya, "choose", lambda t, i, rows, default, yes: default):
+            self.assertEqual(maya.choose_qwen_quant(a, {}), "q5_k_m")
+            self.assertEqual(maya.choose_qwen_quant(a, {"installer": {"qwen_quant": UD}}), UD)
+        a.qwen_quant = UD
+        self.assertEqual(maya.choose_qwen_quant(a, {}), UD)
+
+    def test_shared_file_one_copy(self):
+        """A file another Qwen setup has (the mmproj: CYBER-FROST's and the base model's are the same bytes) is
+        hard-linked by its size and sha256 - never by its name alone - with its sha256 record."""
+        import hashlib
+        body = b"mmproj" * 1000
+        sha = hashlib.sha256(body).hexdigest()
+        src = self.d / "CYBER-FROST-3.8-PS" / "vision" / "mmproj-F16.gguf"
+        src.parent.mkdir(parents=True)
+        src.write_bytes(body)
+        dst = self.d / "Qwen3.8-Flash-Next-UD-IQ2_XS" / "vision" / "mmproj-F16.gguf"
+        with patch.object(maya, "configs", lambda: []):
+            places = maya.qwen_places(self.d, "vision/mmproj-F16.gguf")
+            self.assertIsNone(maya.link_published(dst, len(body), "0" * 64, places))   # (another file: not linked)
+            self.assertFalse(dst.exists())
+            self.assertEqual(maya.link_published(dst, len(body), sha, places), src)
+        self.assertTrue(dst.exists())
+        self.assertTrue(os.path.samefile(src, dst))
+        self.assertIn("mmproj-F16.gguf", json.loads((dst.parent / maya.VERIFIED).read_text()))
 
 
 if __name__ == "__main__":
