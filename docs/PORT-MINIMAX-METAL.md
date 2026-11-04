@@ -1,4 +1,7 @@
 # MiniMax-M3.1-Flash on Apple Silicon (Metal) - port notes
+
+Experimental. Back to [docs/METAL.md](METAL.md#minimax-m31-flash).
+
 Started 2026-11-01 on Duckets Mac Studio (M5 Max, 128 GB unified) - the Maya team has no Mac;
 this machine is the test hardware. Fork: Franzferdinan51/project-maya @ 465a981 (v1.1.48).
 

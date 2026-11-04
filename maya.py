@@ -1433,8 +1433,10 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
         return check_hip_pc(a, text_only=not mm3)
     if a.backend == "metal":
         if family != "glm":
-            fail(f"Maya's Metal engine runs GLM-5.3-Flash only (no Metal engine for {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
-                 "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
+            fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
+                 (f"{MM3} has an experimental Metal engine (maya-metal-mm3) that you build and start by hand: "
+                  "see docs/METAL.md; " if mm3 else "")
+                 + "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
         return check_metal_pc(a)
     if ds4 and not gguf and (S.ARM or S.PPC):
         # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): neither this ARM nor this POWER CPU has them

@@ -50,7 +50,7 @@ not resident, and so on the SSD.
 
 ## MiniMax-M3.1-Flash
 
-`maya-metal-mm3` (src/metal/mm3_metal.cpp, beside the GLM engine) runs MiniMax-M3.1-Flash from Maya's own GGUF
+**Experimental**, and newer than the GLM engine. `maya-metal-mm3` (src/metal/mm3_metal.cpp, beside the GLM engine) runs MiniMax-M3.1-Flash from Maya's own GGUF
 quants (the set's `-maya-indexers.bin` side file is read automatically). Its graph follows `tools/mm3/ref.py` op
 for op: Gemma norms, per-head q/k norms, NeoX partial RoPE, MiniMax Sparse Attention on every layer (the indexer
 scores read back to the host, which keeps the top blocks exactly as the reference selects them), swigluoai MLPs,
@@ -74,8 +74,8 @@ Its parity gate is `metal_mm3_test` (in the same `ctest` run): a synthetic 3-lay
 layer, two MoE layers, 17 index blocks so the selection must drop one) against a numpy port of the reference
 forward in `tools/mm3_metal_fixture.py` - logits within 4.2e-5 relative L2 on the Metal GPU (gate 1e-3), a
 sliced prompt equal to a one-shot one, greedy decoding token for token; `tools/test_mm3_serve.py`
-(`metal_mm3_serve_test`) drives the serve protocol the same way. The real model has not run on a Mac yet: the
-first bench numbers are as welcome here as GLM's.
+(`metal_mm3_serve_test`) drives the serve protocol the same way. The contributor ran the real Maya-XS set on a 128 GB Mac Studio (M5 Max); bench
+numbers from other Macs are as welcome here as GLM's. The port's notes: [PORT-MINIMAX-METAL.md](PORT-MINIMAX-METAL.md).
 
 ## Speed
 
