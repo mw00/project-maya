@@ -317,6 +317,10 @@ class Tokenizer:
     def _encode_matching(self, text: str, pat, plain=()) -> list[int]:
         """Encode `text`, emitting any literal `pat` matches as single tokens and BPE-ing the rest.
 
+        KEEP IN STEP: serve/server.py's PromptMemo._encode (MAYA_PROMPT_MEMO) runs a copy of this loop over a prompt's
+        tail, using `_special_re`, `special_tokens` and `_encode_segment`; a change here must be made there too
+        (serve/test_prompt_memo.py checks that both give the same ids).
+
         The split happens on the RAW text, before the byte mapping, because a special token's string is a
         literal to match rather than bytes to decompose.  Everything between the matches is tokenized
         normally - which is why a near-miss like `<|im_star` still costs ordinary tokens.  A match that starts

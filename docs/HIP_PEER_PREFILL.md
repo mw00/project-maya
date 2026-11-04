@@ -18,7 +18,7 @@ Automatic mode logs `PEER_AR_AUTO` with GPU IDs, payload size, sample count, can
 
 The probe uses private synthetic inputs, one warmup per candidate and up to six rotated timing rounds, requiring at least three samples per candidate. Every result is checked exactly before it can be selected. Flags and sequence state are reset before inference; model activations, weights and expert placement are untouched. Peer buffers are released if host or AR2 wins. The chosen transport stays fixed for that model instance.
 
-The target is roughly 0.5–2 seconds of startup overhead, with a shared three-second submission/polling budget across all eligible groups. A current R9700-pair primitive test completed calibration in 237 ms at 4096 x 5120 floats (host 18.16 ms, AR2 7.14 ms, peer 3.46 ms per reduction). These are collective timings, not end-to-end model speeds. An incomplete, safely drained probe keeps the existing transport. Incorrect results or undrained work refuse model loading. GPU driver calls cannot be forcibly interrupted by this userspace budget; this is not a hard recovery deadline for driver hangs.
+The target is roughly 0.5–2 seconds of startup overhead, with a three-second measurement budget per eligible group (`DS4_PEER_AR_PROBE_MS`), started after that group's setup (peer enable, allocations, kernel preload). A probe that runs out of budget but drains keeps the host transport with a log line; only a probe that does not drain (10 s) stops the start. A current R9700-pair primitive test completed calibration in 237 ms at 4096 x 5120 floats (host 18.16 ms, AR2 7.14 ms, peer 3.46 ms per reduction). These are collective timings, not end-to-end model speeds. An incomplete, safely drained probe keeps the existing transport. Incorrect results or undrained work refuse model loading. GPU driver calls cannot be forcibly interrupted by this userspace budget; this is not a hard recovery deadline for driver hangs.
 
 ## Memory and failure handling
 
@@ -46,3 +46,23 @@ Current-base full-model startup checks passed in auto, disabled, explicit AR2=1,
 Earlier full-model tests on our experimental EXL3 stack measured **9.2332% lower warm 2048-token prefill latency**, with a 95% interval of 8.9991–9.4673% across six balanced blocks/24 trials. Median latency was 7456.793 ms with host transport versus 6758.643 ms with peer transport. Cold results were inconclusive and no decode speedup was established. Scratch stayed allocated in both arms, keeping expert placement fixed; cold/warm/repeated logits and 80 greedy tokens matched independent references exactly.
 
 Those tests used an older experimental engine with additional scalar EXL3, host-packing, predecode, copy-wait and transfer-pruning changes. They are evidence for this technique, **not a current-upstream end-to-end measurement**. Source and raw results are recorded in [fork PR #15](https://github.com/LostVector/project-maya/pull/15), with timeout diagnostics and the steady-clock fix in [#35](https://github.com/LostVector/project-maya/pull/35) and [#38](https://github.com/LostVector/project-maya/pull/38). Current-base end-to-end performance, cancellation/reuse and model-level failure-injection checks remain separate validation work.
+
+## NVIDIA (CUDA)
+
+The same transport builds on CUDA (`DS4_CUDA_PEER_AR`, a cmake option, on): `src/ds4/ds4_peer_cuda_compat.cuh` maps the
+HIP runtime names it uses (fine-grained allocations are plain `cudaMalloc`; `wall_clock64()` reads `%globaltimer`, a
+wall-clock rate of 1,000,000 kHz). `MAYA_DS4_HIP_PEER_AR` turns it on as on HIP; the log lines are the same
+(`PEER_AR_AUTO`, `exact peer prefill all-reduce enabled on GPU0/GPU1`).
+
+- **CUDA's lazy module loading:** a kernel's first launch on a device loads it there, and with peer access on that can
+  wait for running work - beside a rank already spinning for its partner, for good (the probe submits both ranks from
+  one thread). `peer_ar_preload()` loads the transports' kernels on each device before anything spins.
+- **The partner wait** is `DS4_PEER_AR_TIMEOUT_S` (60 s; it was two). A 469K-token prompt had one rank more than two
+  seconds ahead of its partner at one all-reduce, a skew the host transport waits out.
+- `ds4_peer_allreduce_test` builds on CUDA too (`cmake --build build --target ds4_peer_allreduce_test`,
+  `CUDA_VISIBLE_DEVICES=0,1 ./build/ds4_peer_allreduce_test`).
+
+Measured on 8x RTX 3090 (NVLink pairs 0-1, 2-3, 4-5, 6-7), DeepSeek EXL3 2.9 bpw, `--tp 2`: per chunk all-reduce
+(20.97M floats) host 12.7-13.3 ms, AR2 11.5-12.0 ms, peer 1.98 ms; fresh prompts 9K / 37K / 150K / 469K tokens
++14 / +33 / +30 / +14-17 % (2,253-2,352 against 1,945-2,008 tok/s at 469K); decode and greedy output unchanged;
+the self-test exact on every NVLink pair and on a PCIe P2P pair.

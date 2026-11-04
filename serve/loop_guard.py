@@ -42,6 +42,7 @@ it on for that request when the server has it off).
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -347,6 +348,13 @@ def go_on(m: dict) -> bool:
 def _gist(result: str) -> str:
     """A result without its numbers, white space and anything outside printable ASCII: "bytes received: 12 ..."
     and "bytes received: 15 ..." the same."""
+    if os.environ.get("MAYA_PROMPT_MEMO", "") not in ("", "0"):   # (a re-sent history's results: by text, the same)
+        return _gist_memo(result)
+    return re.sub(r"\d+|[^\x21-\x7e]+", "", result)
+
+
+@functools.lru_cache(maxsize=8192)
+def _gist_memo(result: str) -> str:
     return re.sub(r"\d+|[^\x21-\x7e]+", "", result)
 
 

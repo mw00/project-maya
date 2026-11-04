@@ -971,6 +971,69 @@ class NonFiniteRetry(unittest.TestCase):
         self.assertEqual(Broken.calls, 1)
 
 
+class VocabTokenizer(ByteTokenizer):
+    """ByteTokenizer with the pack tokenizer's token_bytes (tools/strata_tokenizer.py): an id outside the vocabulary
+    is an IndexError, as in #805's traceback."""
+
+    def token_bytes(self, i):
+        if i < 0 or i >= 256 + len(self.SPECIALS):
+            raise IndexError("token id %d is outside the vocabulary (%d)" % (i, 256 + len(self.SPECIALS)))
+        return self.SPECIALS[i - 256].encode() if i >= 256 else bytes([i])
+
+
+class NoRoomOrNoToken(unittest.TestCase):
+    """#805: a 351,912-token prompt read, then "done: 0 tokens (length)" and an IndexError for token id -1 in the
+    tokenizer under the loop guard.  On the engine's own lines (StrataEngine.generate): an answer of no tokens that
+    ends "length" is an empty answer, and a T line of -1 (an engine whose sample failed) is the request's error -
+    never an id for the tokenizer."""
+
+    def answer(self, lines):
+        import io
+        import queue
+        from types import SimpleNamespace
+        eng = StrataEngine.__new__(StrataEngine)
+        eng.proc = SimpleNamespace(stdin=io.StringIO(), poll=lambda: None)
+        eng.lines = queue.Queue()
+        eng.can_stop = True
+        eng.max_context = CTX
+        for line in lines:
+            eng.lines.put(line)
+        tok = VocabTokenizer()
+        svc = Service(eng, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.assertTrue(svc.loop_guard)                   # (the guard's piece() decoded the -1)
+        out, done, err = "", None, None
+        try:
+            for kind, v in svc.run(tok.encode("hi"), False, None, 200, {}, threading.Event()):
+                if kind == "event":
+                    out += v.text
+                elif kind == "done":
+                    done = v
+        except ValueError as e:
+            err = str(e)
+        return out, done, err, eng, svc
+
+    def test_no_tokens_length_is_an_empty_answer(self):
+        out, done, err, _, svc = self.answer(["PP 3 3 1.0 3.0", "DONE 0 3 414000.0 0.0 length 0 0 0"])
+        self.assertEqual((out, err), ("", None))
+        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 0))
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "length")
+
+    def test_token_minus_one_is_an_error(self):
+        out, done, err, eng, svc = self.answer(["PP 3 3 1.0 3.0", "T -1", "T 104", "DONE 2 3 414000.0 1.0 cancel 0 0 0"])
+        self.assertEqual((out, done), ("", None))
+        self.assertIn("could not pick a token", err)
+        self.assertIn("STOP", eng.proc.stdin.getvalue())  # (the engine stopped, drained to its DONE)
+        self.assertTrue(eng.lines.empty())
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+
+    def test_engine_token(self):
+        from serve.server import engine_token
+        self.assertEqual(engine_token("129279"), 129279)
+        for bad in ("-1", "-2"):
+            with self.assertRaises(ValueError):
+                engine_token(bad)
+
+
 class EngineDeath(unittest.TestCase):
     """Issue #27: a dead engine is an error (not "length"), and the next request starts it again."""
 
@@ -1609,7 +1672,7 @@ class WebApp(unittest.TestCase):
         self.assertIn("text/html", ctype)
         self.assertIn(b"\"web/app.js\"", body)   # relative since #82 (works behind a path-prefixed proxy)
         for path, want in (("/web/app.js", "javascript"), ("/web/i18n.js", "javascript"),
-                            *((f"/web/i18n-{page}.js", "javascript") for page in ("settings", "server", "monitor", "models", "model-fields", "model-list", "common", "chat")),
+                            *((f"/web/i18n-{page}.js", "javascript") for page in ("settings", "server", "monitor", "models", "model-fields", "model-list", "common", "chat", "upstream", "integration")),
                            ("/web/app.css", "text/css"), ("/web/tokens.css", "text/css"),
                            ("/web/components.css", "text/css"), ("/web/sprite.svg", "image/svg+xml")):
             with self.subTest(path=path):
@@ -2674,6 +2737,56 @@ class NoDelayStreaming(unittest.TestCase):
             self.assertEqual(conn.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY), 1)
         finally:
             conn.close(), client.close(), listener.close()
+
+
+class EngineEndTests(unittest.TestCase):
+    """An engine that ends itself (maya-ds4 after a GPU's fault): the server takes it as ended from its END line, and
+    why it ended, as the server prints it for a request it took down, comes from the end of its log."""
+
+    def note(self, tail: str, returncode=3) -> str:
+        import tempfile
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "engine.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(tail)
+            e = StrataEngine.__new__(StrataEngine)
+            e.log_path = log
+            e.proc = SimpleNamespace(returncode=returncode)
+            return e.death_note()
+
+    def test_a_gpu_fault_the_engine_caught_is_not_read_as_ram(self):
+        n = self.note("ds4: CUDA0: an illegal memory access was encountered - the device's state is unknown\n"
+                      "maya ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3) so the "
+                      "server starts it again for the next request\n")
+        self.assertIn("a GPU took a fault inside a kernel", n)
+        self.assertIn("the engine ends (exit 3)", n)
+        self.assertNotIn("RAM", n)
+
+    def test_end_ahead_of_done_marks_the_engine_ended_before_the_request_ends(self):
+        import io
+        import queue
+        from types import SimpleNamespace
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc = SimpleNamespace(stdout=io.StringIO("ERR cudaMemcpyAsync(...): an illegal memory access was encountered\n"
+                                                    "END a GPU's state is unknown after this request - the engine ends "
+                                                    "(exit 3); the next request starts a fresh one\n"
+                                                    "DONE 0 12 0.0 0.0 cancel 0 0 0 0 0\n"),
+                                 poll=lambda: None)
+        e.lines, e.multi, e.ended = queue.Queue(), 0, False
+        e._routes, e._routes_lock = {}, threading.Lock()
+        e._pump()
+        got = []
+        while (line := e.lines.get_nowait()) is not None:
+            got.append(line.split()[0])
+        self.assertEqual(got, ["ERR", "DONE"])           # END is the server's, not the request's
+        self.assertTrue(e.ended)
+        self.assertFalse(e.alive())                      # (the process may still be exiting: the next request restarts)
+
+    def test_the_watchdog_and_ram_notes_are_unchanged(self):
+        self.assertIn("a hang it caught", self.note("maya ds4 serve: no progress for 600 s during a request - stopping "
+                                                    "the engine so the server starts it again (issue #29, #539)\n"))
+        self.assertIn("running out of RAM", self.note("ds4: something else\n", returncode=-9))
 
 
 if __name__ == "__main__":

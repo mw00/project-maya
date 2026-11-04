@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
 (CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, pictures too.
-GLM-5.3-Flash: CUDA on Linux and Windows (experimental); HIP: experimental gfx1100/gfx1201/gfx1151 (gfx1030: not
+GLM-5.3-Flash: CUDA on Linux and Windows; HIP: gfx1100/gfx1201/gfx1151 (gfx1030: experimental, not
 validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
 one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
-and Windows; their GGUFs on HIP too (their EXL3 quants: experimental there).
+and Windows; on HIP too (their GGUFs and their EXL3 quants).
 The quants are named model first, then the tier by the experts' bits (XS, S, M, L): --model glm-maya-s,
 deepseek-maya-xs, minimax-maya-xs ... (tools/maya_quants.py); every name used before still works.
 
@@ -34,7 +34,7 @@ no tuning step - it balances its own split):
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (GLM-5.3 ·
      Maya-S, Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits or the
-     self-calibrated one at 4.10, experimental: NVIDIA, and AMD)
+     self-calibrated one at 4.10: NVIDIA from V100, and AMD)
   3. Python packages into .venv, llama.cpp's source at the pinned commit (it lists them and asks first)
   4. compiles the engine (`build/maya`, or `build-hip/maya`) for your GPU(s): 10-30 minutes, once
   5. the model: GGUF files you already have (--gguf-dir), or a download it shows you first - the exact commands
@@ -266,7 +266,7 @@ MODELS = {
     # downloaded, and how a download is known whole); "revision": the branch's commit the hashes belong to.
     "EXL3-3.05bpw": {
         "about": "turboderp's EXL3 quant at 3.05 bits per weight (exllamav3's trellis format, which the engine reads "
-                 "in place from its safetensors), with the MTP draft block - experimental (NVIDIA; AMD too)",
+                 "in place from its safetensors), with the MTP draft block - NVIDIA from V100, and AMD",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "3.05bpw",
         "revision": "332ab457b709b7ba30dd9a448be5de03b80a7ac9", "folder": "", "download_gb": 125.3,
         "files": {
@@ -349,7 +349,7 @@ MODELS = {
     # tensors are in its shards (3.05bpw has them in kpool_aux.safetensors)
     "EXL3-4.05bpw": {
         "about": "turboderp's EXL3 quant at 4.05 bits per weight (exllamav3's trellis format, which the engine reads "
-                 "in place from its safetensors), with the MTP draft block - experimental (NVIDIA; AMD too)",
+                 "in place from its safetensors), with the MTP draft block - NVIDIA from V100, and AMD",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "4.05bpw",
         "revision": "2a30229e67012798ba9f0cd832bb78abf4c363d5", "folder": "", "download_gb": 165.2,
         "files": {
@@ -440,7 +440,7 @@ MODELS = {
     "EXL3-sc_4.10bpw": {
         "about": "turboderp's self-calibrated EXL3 quant at 4.10 bits per weight (exllamav3's trellis format, which the "
                  "engine reads in place from its safetensors): 4-bit routed experts like EXL3-4.05bpw, 8-bit "
-                 "attention and shared experts, with the MTP draft block - experimental (NVIDIA; AMD too)",
+                 "attention and shared experts, with the MTP draft block - NVIDIA from V100, and AMD",
         "format": "exl3", "repo": "turboderp/GLM-5.3-Flash-exl3", "branch": "sc_4.10bpw",
         "revision": "c6b8ac3f6069173343e253e1cba90536ed2c72dc", "folder": "", "download_gb": 167.8,
         "files": {
@@ -623,8 +623,8 @@ MM3_PACK_TOOLS = ("tools/mm3/pack.py", "tools/mm3/st.py", "tools/strata_tokenize
 MM3_DIR = "MiniMax-M3.1-Flash-EXL3-3.5bpw"
 # Where its EXL3 quant is offered: everywhere DeepSeek's EXL3 runs (NVIDIA from V100, cc 7.0 = DS4_MIN_CC; Linux and
 # Windows) once maya-mm3 builds and runs there - MM3_ALL_PLATFORMS, the one switch.  Until then: Linux, RTX 30 / A100 or
-# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD (HIP): experimental, as GLM's
-# EXL3 quants there - maya-mm3's EXL3 kernels take the shared exl3.cu's HIP paths (their tests pass on a Radeon 8065S).
+# newer (validated on sm_86 and sm_120); MAYA_MM3_MIN_CC=70 takes a V100 for testing.  AMD (HIP): too, as GLM's EXL3
+# quants there - maya-mm3's EXL3 kernels take the shared exl3.cu's HIP paths.
 MM3_ALL_PLATFORMS = True
 MM3_MIN_CC = 70                                    # (with MM3_ALL_PLATFORMS: DeepSeek's EXL3 reach)
 MM3_MIN_CC_NOW = 80                                # (until then)
@@ -1052,6 +1052,31 @@ def hip_info(bindir) -> str | None:
     return str(p) if p and p.exists() else shutil.which("hipInfo")
 
 
+def installed_hip_info() -> str | None:
+    """hipInfo of a ROCm already installed (ROCM_PATH, HIP_PATH, the newest in C:\\Program Files\\AMD\\ROCm, PATH),
+    only to name the GPUs - not windows_rocm(), whose rocm-sdk init can unpack gigabytes."""
+    base = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "AMD" / "ROCm"
+    roots = [Path(os.environ[k]) for k in ("ROCM_PATH", "HIP_PATH") if os.environ.get(k)] + sorted(
+        base.glob("[0-9]*"), key=lambda p: [int(x) for x in re.findall(r"\d+", p.name)], reverse=True)
+    return next((str(r / "bin" / "hipInfo.exe") for r in roots if (r / "bin" / "hipInfo.exe").exists()),
+                shutil.which("hipInfo"))
+
+
+def first_run_backend() -> str:
+    """The backend of a first run without --backend (nothing set up yet): Metal on a Mac with Apple Silicon, HIP on a
+    PC with an AMD GPU Maya's HIP build takes (check_hip_pc's list, the experimental ones too) and no NVIDIA one, else
+    CUDA.  On Windows the AMD GPUs are named by an installed ROCm's hipInfo first: Windows' adapter table knows the
+    common cards only, and an AMD-only PC whose card it did not know was sent to the CUDA checks, which stop at
+    nvidia-smi (#805)."""
+    if apple_silicon():
+        return "metal"
+    if S.gpus():
+        return "cuda"
+    amd = S.amd_gpus(installed_hip_info()) if WIN else S.amd_gpus()
+    takes = HIP_ARCHS + HIP_ARCHS_UNVALIDATED + HIP_ARCHS_WAVE64
+    return "hip" if any(g["arch"] in takes for g in amd) else "cuda"
+
+
 THEROCK_INDEX = "https://repo.amd.com/rocm/whl-multi-arch/"   # AMD's ROCm for Windows: TheRock's pip wheels
 THEROCK_VERSION = "7.14.1"                                     # 7.14: the first with Gorgon Halo (Ryzen AI Max 400)
 
@@ -1098,7 +1123,7 @@ def vs_2026(vcvars) -> bool:
 
 def check_hip_pc(a, installed=False, text_only=True) -> dict:
     if not WIN and (not sys.platform.startswith("linux") or S.is_wsl()):
-        fail("Maya's experimental HIP backend runs on native Linux or Windows")
+        fail("Maya's HIP backend runs on native Linux or Windows")
     vcvars = S.find_vcvars(cuda=False) if WIN else None
     if WIN and vcvars is None:      # (before ROCm's download: ROCm's clang needs its headers)
         fail("Visual Studio Build Tools (2022 or 2026) are needed: ROCm's compiler uses their headers and libraries",
@@ -1187,7 +1212,7 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
         fail(f"the CPU ({cpu}) needs AVX2 for the expert lane")
     total, avail = mem_gb()
     split = f"{len(chosen)} GPUs (layer split)" if len(chosen) > 1 else "one GPU"
-    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; experimental HIP, {split}" +
+    ok(f"using {' + '.join(gpu_label(g) for g in chosen)}; HIP, {split}" +
        (", text only" if text_only else ""))
     ok(f"ROCm: {root}; CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2'})")
     ok(f"RAM: {total:.0f} GB, {avail:.0f} GB available now")
@@ -1401,35 +1426,28 @@ def check_pc(a, family: str = "glm", gguf: bool = False, ds4_quant: str = "exl3"
     step(1, "checking this PC")
     ds4 = family == "deepseek"
     mm3 = family == "minimax"
-    if mm3 and a.backend == "hip" and not gguf:   # (as GLM's EXL3 quants on AMD: experimental)
-        warn(f"{MM3}'s EXL3 quant on AMD is experimental: its kernels pass their tests on AMD GPUs, but the whole "
-             f"model has not been run on one yet - Maya's GGUF quants (--model minimax-maya-xs / minimax-maya-s) are the tested "
-             "way there")
     if mm3 and WIN and not MM3_ALL_PLATFORMS:
         fail(f"{MM3}'s engine (maya-mm3) runs on Linux only for now (its Windows build is on the way)",
              f"set it up on a Linux PC with an NVIDIA GPU ({mm3_gpus()})")
     if a.backend == "hip":
-        if ds4 and not gguf:   # (as GLM's and MiniMax's EXL3 quants on AMD: experimental)
-            warn(f"{DS4}'s EXL3 quants on AMD are experimental: their kernels pass their tests on AMD GPUs, but the "
-                 f"whole model has not been measured on one - Maya's GGUF quants (--model deepseek-maya-s / "
-                 "deepseek-maya-xs) are the tested way there")
         return check_hip_pc(a, text_only=not mm3)
     if a.backend == "metal":
         if family != "glm":
-            fail(f"Maya's Metal engine runs GLM-5.3-Flash only (no Metal engine for {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
-                 "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
+            fail(f"Maya's setup runs GLM-5.3-Flash only on a Mac (not {ds4 and DS4 or mm3 and MM3 or QWEN_SHOWN})",
+                 (f"{MM3} has an experimental Metal engine (maya-metal-mm3) that you build and start by hand: "
+                  "see docs/METAL.md; " if mm3 else "")
+                 + "other models: an NVIDIA or AMD GPU (--backend cuda / --backend hip)")
         return check_metal_pc(a)
-    if ds4 and not gguf and S.ARM:
-        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): this CPU has neither
-        fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this ARM CPU does not have",
+    if ds4 and not gguf and (S.ARM or S.PPC):
+        # the EXL3 quant's expert kernels are x86 (AVX2/AVX-512): neither this ARM nor this POWER CPU has them
+        fail(f"{DS4}'s EXL3 quants need the x86 expert kernels (AVX2/AVX-512), which this {platform.machine()} CPU "
+             "does not have",
              f"set up one of Maya's GGUF quants instead: {ME} --setup --model deepseek-maya-s (or deepseek-maya-xs)")
     if not (WIN or sys.platform.startswith("linux")):
         fail("Project Maya runs on Linux and Windows (and on Apple Silicon: --backend metal)",
              "the engine needs an NVIDIA GPU and CUDA")
     min_cc = ((DS4_GGUF_MIN_CC if gguf else DS4_MIN_CC) if ds4 else (MM3_GGUF_MIN_CC if gguf else mm3_min_cc()) if mm3
               else QWEN_MIN_CC if family == "qwen" else MIN_CC)
-    if WIN:
-        warn("Windows support is new (experimental): Maya is developed and measured on Linux - tell us how it runs")
     if S.is_wsl():
         warn("this is WSL2, which Maya does not support: WSL2's driver pins only about 1 GB of "
              "RAM for the GPU, and Maya's RAM tier pins tens of GB. Use a native Linux install.")
@@ -1719,8 +1737,8 @@ def choose_family(a, prev: dict) -> str:
     rows = [("GLM-5.3-Flash", None,
              "Z.ai's GLM-5.3-Flash in Project Maya's GGUF quants (GLM-5.3-Flash-Maya-S to -Maya-L, 95-156 GB) or "
              "turboderp's EXL3 quants: from one GPU up, the experts that do not fit in VRAM from RAM and the SSD; "
-             "NVIDIA (AMD: experimental); pictures with its vision encoder."),
-            (DS4, "experimental",
+             "NVIDIA and AMD; pictures with its vision encoder."),
+            (DS4, None,
              "DeepSeek's DeepSeek-V4.1-Flash-1017 (748B) on its own engine: unsloth's GGUF (UD-Q8_K_XL, 508 GB; "
              "NVIDIA from V100 on or AMD, Linux or Windows), orcarouter's abliterated one (Mix-128G or "
              "Mix-256G, its refusals removed) or LibertAIDAI's EXL3 quants at 2.9 or "
@@ -1780,7 +1798,7 @@ def choose_model(a, models: Path, inst: dict) -> tuple:
         rows.append((f"{Q.shown('glm', q)}: " + (f"downloaded, in {d}" if have else
                                                  f"download {m['download_gb']:.1f} GB from Hugging Face"),
                      ("recommended for cards of 24 GB or less" if q == "Maya-S24" else "recommended") if q == rec
-                     else "experimental" if is_exl3(q) else None, m["about"]))
+                     else None, m["about"]))
     pick = choose("Which GLM-5.3-Flash?", ["The model to download (GLM-5.3-Flash GGUF files you already have: "
                                            "--gguf-dir <file or folder>):"], rows, opts.index(default), a.yes)
     return "download", opts[pick]
@@ -1844,8 +1862,8 @@ def toolkit_root_defs(nvcc) -> list:
 def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, soft=False,
                    target: str = "maya") -> dict | None:
     """cmake configure + build of the `maya` target (DeepSeek: `maya-ds4`) in build/; the exact commands are
-    printed as they run.  soft: a failure warns and returns None (the engine already there keeps working) instead of
-    stopping."""
+    printed as they run.  soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that
+    the engine from before is not started (#805)."""
     def stop(what):
         msg = f"the engine build stopped while {what} (the reason is above)"
         hint = ("common causes: 'unsupported Microsoft Visual Studio version' - CUDA 12.x needs Visual Studio 2019 or "
@@ -1857,8 +1875,11 @@ def compile_engine(archs, gpu_ids, nvcc, host_compiler, llama: Path, src: str, s
                 "again "
                 "(it continues)")
         if soft:
-            warn(msg + "; starting the engine compiled before")
-            return None
+            # (not the engine compiled before: it is from the older source, and this version's server and config
+            #  start it with settings it may not know or silently ignore - #805, on NVIDIA as on AMD)
+            fail("Maya's NVIDIA engine changed with this update, and " + msg + ": the engine from before does not "
+                 "match this version, so it is not started",
+                 hint + "\n       fix the reason, then start Maya again (it compiles again)")
         fail(msg, hint)
 
     cmake = pick_cmake()
@@ -2082,8 +2103,14 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", target, "-j", str(jobs)], env,
                    "build-maya-hip.bat", vcvars=vcvars):
         if soft:
-            warn("HIP rebuild failed; starting the previous engine")
-            return None
+            # (not the engine compiled before: it is from the older source, and this version's server and config
+            #  start it with settings it may not know or silently ignore - #805's start failed that way)
+            fail("Maya's AMD engine changed with this update, and compiling it failed: the engine from before does "
+                 "not match this version, so it is not started",
+                 "the compiler's reason is above - fix it, then start Maya again (it compiles again)" +
+                 ("; build-maya-hip.bat > build-hip.txt 2>&1 runs the same build alone and keeps its output"
+                  if WIN else "") +
+                 (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
         fail("the HIP engine build failed", "see the compiler output above" +
              (" - " + VS2026_HIP_HINT if vs_2026(vcvars) else ""))
     if WIN:
@@ -2101,7 +2128,8 @@ def compile_engine_hip(pc: dict, llama: Path, src: str, soft=False, target: str 
 
 def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     """`maya-metal` (GLM-5.3-Flash on ggml's Metal backend) in build-metal/; the commands are printed as they run.
-    soft: a failure warns and returns None (the engine compiled before keeps working) instead of stopping."""
+    soft: an update's rebuild (refresh_engine) - a failure stops with the reason and says that the engine from before
+    is not started (#805)."""
     cmake = pick_cmake()
     if cmake is None:
         fail("CMake 3.24 or newer is needed", f"pip installs one into .venv: run {ME} --setup")
@@ -2116,8 +2144,11 @@ def compile_engine_metal(llama: Path, src: str, soft=False) -> dict | None:
     if cmake_steps(conf, [cmake, "--build", str(BUILD), "--target", "maya-metal", "-j", str(os.cpu_count() or 4)],
                    dict(os.environ), ""):
         if soft:
-            warn("the Metal engine's rebuild failed; starting the previous engine")
-            return None
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail("Maya's Metal engine changed with this update, and compiling it failed: the engine from before does "
+                 "not match this version, so it is not started",
+                 "the compiler's reason is above (no compiler: xcode-select --install) - fix it, then start Maya "
+                 "again (it compiles again)")
         fail("the Metal engine build failed", "see the compiler output above (no compiler: xcode-select --install)")
     meta = {"backend": "metal", "src": src, "llama": str(llama), "version": maya_version(),
             "date": time.strftime("%Y-%m-%d %H:%M"), "targets": ["maya-metal"]}
@@ -2170,8 +2201,11 @@ def refresh_engine(cfg: dict) -> None:
         root = Path(meta.get("rocm") or "/opt/rocm")
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if hip_clang(root) is None or not (llama / "ggml/CMakeLists.txt").exists():
-            warn("HIP compiler or llama.cpp source is missing; starting the previous engine")
-            return
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail(f"Maya's AMD engine changed with this update, but the HIP compiler ({root}) or llama.cpp's source "
+                 f"({llama}) it was compiled with is gone: the engine from before does not match this version, so it "
+                 "is not started",
+                 f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
         pc = {"rocm": str(root), "archs": meta["archs"],
               "gpus": [{"index": i} for i in cfg.get("gpu", [0])]}
         if WIN and meta.get("lib_dirs"):
@@ -2181,16 +2215,20 @@ def refresh_engine(cfg: dict) -> None:
     if cfg.get("backend") == "metal":
         llama = Path(meta.get("llama") or ROOT / "third_party/llama.cpp")
         if not (llama / "ggml/CMakeLists.txt").exists():
-            warn("llama.cpp's source is missing; starting the previous engine")
-            return
+            # (the engine from before would run under this version's server and config: not started - #805)
+            fail(f"Maya's Metal engine changed with this update, but llama.cpp's source ({llama}) it was compiled "
+                 "with is gone: the engine from before does not match this version, so it is not started",
+                 f"{ME} --setup --rebuild fetches it and compiles the engine again")
         compile_engine_metal(llama, src, soft=True)
         return
     say("  The engine's source changed since it was compiled (an update): compiling what changed ...")
     nvcc, llama = meta.get("nvcc"), Path(meta.get("llama") or ROOT / "third_party" / "llama.cpp")
     if not nvcc or not Path(nvcc).exists() or not (llama / "ggml" / "CMakeLists.txt").exists():
-        warn("the compiler or llama.cpp's source it was built with is gone: starting the engine compiled before "
-             f"({ME} --setup --rebuild compiles it again)")
-        return
+        # (the engine from before would run under this version's server and config: not started - #805)
+        fail(f"Maya's NVIDIA engine changed with this update, but the CUDA compiler ({nvcc}) or llama.cpp's source "
+             f"({llama}) it was compiled with is gone: the engine from before does not match this version, so it is "
+             "not started",
+             f"{ME} --setup --rebuild finds the compiler and compiles the engine again")
     gpu_ids = meta.get("gpu_ids") or (cfg.get("gpu") if isinstance(cfg.get("gpu"), list) else [0])
     compile_engine(meta["archs"], gpu_ids, nvcc, meta.get("host_compiler"), llama, src, soft=True, target=target)
 
@@ -5180,8 +5218,8 @@ def choose_ds4_quant(a, prev: dict) -> str:
         return ds4_abl_recommended(getattr(a, "backend", None) == "hip") if a.ds4_quant == DS4_ABL_ALIAS else a.ds4_quant
     hip = getattr(a, "backend", None) == "hip"
     maya = [k for k in DS4_MAYA if ds4_maya_published(k)]
-    # the EXL3 quants where they run: NVIDIA V100 or newer (compute capability 7.0+), and AMD (experimental, as GLM's
-    # EXL3 quants there) - a PC whose NVIDIA GPUs are all older is not offered them (nvidia-smi silent: offered, the
+    # the EXL3 quants where they run: NVIDIA V100 or newer (compute capability 7.0+), and AMD (as GLM's EXL3 quants
+    # there) - a PC whose NVIDIA GPUs are all older is not offered them (nvidia-smi silent: offered, the
     # PC check says)
     try:
         ccs = [] if hip else [int(g["arch"]) for g in S.gpus()]
@@ -5237,11 +5275,10 @@ def choose_ds4_quant(a, prev: dict) -> str:
     label = {k: (Q.shown("deepseek", k, gb.get(k)), about[k]) for k in DS4_QUANTS}
     pick = choose(f"Which files of {DS4}?", ["The GGUFs run on any NVIDIA GPU from Volta (V100) on and on AMD, whatever "
                                              "the memory: the experts that do not", "fit in VRAM are read from RAM and "
-                                             "the SSD. The EXL3 quants need a V100 or newer (AMD: experimental) and "
+                                             "the SSD. The EXL3 quants need a V100 or newer, or AMD, and "
                                              "~230 / ~280 GB of VRAM + RAM:"],
                   [(label[k][0], "recommended" if k == keys[0] else
-                    "abliterated: fits this PC" if k == abl else
-                    "experimental on AMD" if hip and k in DS4_EXL3 else None, label[k][1]) for k in keys],
+                    "abliterated: fits this PC" if k == abl else None, label[k][1]) for k in keys],
                   keys.index(default), a.yes or a.check)
     return keys[pick]
 
@@ -6037,7 +6074,7 @@ def mm3_memory_gb(quant: str, own: Path | None = None) -> float:
 
 def choose_mm3_quant(a, prev: dict) -> str:
     """--mm3-quant, else the one set up before, else asked among those this PC runs: Maya's GGUF quants once published
-    and the EXL3 quant (on AMD: experimental) - by this PC's memory the one recommended."""
+    and the EXL3 quant - by this PC's memory the one recommended."""
     if getattr(a, "mm3_quant", None):
         return a.mm3_quant
     if mm3_own_dir(a, "exl3") is not None:            # --model-dir names an EXL3 folder of your own: its files are the quant
@@ -6057,15 +6094,15 @@ def choose_mm3_quant(a, prev: dict) -> str:
     if len(keys) == 1:
         return keys[0]
     gb = {k: mm3_models()[0]["download_gb"] if k == "exl3" else mm3_gguf_entry(k)["download_gb"] for k in keys}
-    about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM" + ("; experimental on AMD" if hip else ""),
+    about = {"exl3": f"Mia-AiLab's quant: pictures and DSpark drafting; ~{MM3_MEMORY_GB} GB of VRAM + RAM",
              "gguf-xs": "Maya's quant: experts in ~1.6 bits, the whole model in a 128 GB PC's memory",
              "gguf-s": "Maya's quant: experts in ~2.1 bits"}
     pics = "; pictures and DSpark drafting (their files, ~4 GB, beside it)"
     label = {k: (Q.shown("minimax", k, gb[k]), about[k] + ("" if k == "exl3" else pics)) for k in keys}
     order = sorted(keys, key=lambda k: k != rec)
     default = before if before in order else rec
-    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants run on NVIDIA from V100 on and on AMD; the EXL3 quant "
-                                             "on NVIDIA (on AMD: experimental):"],
+    pick = choose(f"Which files of {MM3}?", ["Maya's GGUF quants and the EXL3 quant run on NVIDIA from V100 on and "
+                                             "on AMD:"],
                   [(label[k][0], "recommended" if k == rec else None, label[k][1]) for k in order],
                   order.index(default), a.yes or a.check)
     return order[pick]
@@ -6815,7 +6852,7 @@ def main() -> int:
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["cuda", "hip", "metal"],
-                    help="GPU backend (HIP: experimental gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
+                    help="GPU backend (HIP: gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
                          "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
@@ -6852,7 +6889,7 @@ def main() -> int:
                          "(dense weights Q8_0: less VRAM; chosen by hand only, not in the setup's list), gguf-iq1_s / gguf-iq1_m / "
                          "gguf-iq2_xxs / gguf-q2_k_xl / gguf-iq3_xxs / gguf-iq3_s / gguf-q3_k_xl = its smaller UD quants (experts "
                          "1.6-3.5 bits; chosen by hand too), exl3 = LibertAIDAI's EXL3 quant at 2.9 bits, exl3-3.5 = its "
-                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, AMD experimental); "
+                         "3.5-bit quant (closer to the original; ~280 GB of VRAM + RAM; both V100 or newer, or AMD); "
                          "abliterated-128g / abliterated-256g = orcarouter's abliterated model (its refusals removed) "
                          "as its Mix-128G / Mix-256G GGUF (~114 / ~236 GB of VRAM + RAM, with Maya's Q6_K n-gram "
                          "tables; a gated repo: HF_TOKEN or `hf auth login`), abliterated = the one that fits this "
@@ -6966,8 +7003,7 @@ def main() -> int:
     else:
         # nothing set up yet (START-MAYA.bat / ./maya.sh without --backend): Metal on a Mac with Apple Silicon, HIP on
         # a PC with a supported AMD GPU and no NVIDIA one (e.g. Strix Halo)
-        a.backend = ("metal" if apple_silicon() else
-                     "hip" if not S.gpus() and any(g["arch"] in HIP_ARCHS for g in S.amd_gpus()) else "cuda")
+        a.backend = first_run_backend()
     setting_up = a.setup or a.check or a.gguf_dir or a.model or a.model_dir or a.rebuild or a.repack or \
         a.download_model
     if have and not setting_up and (a.calibrate or a.speed_calibration or not a.no_start):
@@ -7021,7 +7057,7 @@ def main() -> int:
         elif a.backend == "hip":
             pick = (f"--gpus {','.join(str(g['index']) for g in pc['gpus'])}" if len(pc["gpus"]) > 1
                     else f"--gpu {pc['gpus'][0]['index']}")
-            say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to try the experimental port.")
+            say(f"HIP prerequisites found. Run {ME} --backend hip {pick} to set it up.")
         else:
             say(f"This PC can run Maya. Run {ME} without --check to set it up.")
         return 0

@@ -517,6 +517,21 @@ class GpuMap(unittest.TestCase):
         (h,) = self.gm.view([self.r], [], engine_pid=100)
         self.assertEqual((h["parts"]["prompt"], h["parts"]["tp"], h["tp_n"]), (0, 0, 0))
 
+    def test_tensor_parallel_room_is_the_groups_least_free(self):
+        # (a --tp 2 pair holds the same expert slots: the 8 GB GPU 1 has beyond GPU 0's 1 GB give no expert more)
+        def line(dev, free, layers):
+            return self.gm.parse(f"VRAM dev={dev} pci=0000:0{dev + 1}:00.0 total={24 * GB} free={free} weights={GB} "
+                                 f"kv=0 kv_ram=0 act=0 drafter=0 window=0 pool={10 * GB} tail=0 borrow=0 vision=0 "
+                                 f"vision_own=0 prompt=0 tp=0 tp_n=2 slots=2000 ctx=65536 layers={layers}")
+        a, b, c, d = self.gm.view([line(0, GB, "0-20"), line(1, 9 * GB, "0-20"), line(2, 5 * GB, "21-42"),
+                                   line(3, 3 * GB, "21-42")], [], engine_pid=100)
+        self.assertEqual((a["tp_group"], b["tp_group"], c["tp_group"], d["tp_group"]), (0, 0, 2, 2))
+        self.assertEqual((a["tp_room"], b["tp_room"]), (a["free"], a["free"]))
+        self.assertGreater(b["free"] - b["tp_room"], 7 * GB)
+        self.assertEqual((c["tp_room"], d["tp_room"]), (d["free"], d["free"]))
+        (h,) = self.gm.view([self.r], [], engine_pid=100)        # (no group: as before)
+        self.assertNotIn("tp_room", h)
+
     def test_two_parts_on_one_card_add_up(self):
         a = dict(self.r, layers=[0, 20], slots=500)
         b = dict(self.r, layers=[20, 45], slots=700, free=self.r["free"] - GB)
@@ -711,6 +726,31 @@ console.log(JSON.stringify(out));""")
                     self.assertAlmostEqual(pill["at"], 100 * i / n)
                     self.assertAlmostEqual(pill["width"], 100 / n)      # (one segment wide: not from 0 up to it)
         self.assertEqual(got["glm-5.3-flash"][1][1]["at"], 25)            # Low: the second quarter only
+
+    def test_free_room_a_tensor_parallel_partner_cannot_use_promises_no_experts(self):
+        # a --tp 2 pair: GPU 1 has 9 GB free, GPU 0 (with the drafter) 1 GB - the members hold the same expert slots, so
+        # a restart gives none more; the room is idle, a DSpark block moved there can use it
+        got = self.node("""
+const {freeAdvice} = await import(web + "/monitor.js");
+const G = 2 ** 30, more = (g, b) => Math.max(0, Math.floor(b / (g.parts.pool / g.slots)));
+const where = (gs) => gs.map((g) => "GPU " + g.index).join(" and "), pools = () => "the pools";
+const m = (index, free, room, drafter) => ({index, dev: index, free, tp_room: room, tp_group: 0, slots: 1000,
+                                           parts: {pool: 10 * G, drafter}});
+const pair = [m(0, G, G, G), m(1, 9 * G, G, 0)], both = [m(0, 5 * G, 5 * G, 0), m(1, 7 * G, 5 * G, 0)];
+const plain = [{index: 0, dev: 0, free: 5 * G, slots: 1000, parts: {pool: 10 * G}}];
+console.log(JSON.stringify({
+  pair: freeAdvice([pair[1]], pair, {engine_kind: "ds4"}, where, pools, more),
+  mm3: freeAdvice([pair[1]], pair, {engine_kind: "mm3"}, where, pools, more),
+  both: freeAdvice(both, both, {engine_kind: "ds4"}, where, pools, more),
+  plain: freeAdvice(plain, plain, {engine_kind: "ds4"}, where, pools, more)}));""")
+        self.assertNotIn("restart gives the pools", got["pair"])
+        self.assertIn("GB of GPU 1 sit idle", got["pair"])
+        self.assertIn("MAYA_DS4_DRAFT_DEV", got["pair"])
+        self.assertNotIn("MAYA_DS4_DRAFT_DEV", got["mm3"])
+        # (both have room: 5 GB each grows the pair's slots once - 400 experts, not 800; GPU 1's other 2 GB idle)
+        self.assertIn("are free: a restart gives the pools about 400 more experts.", got["both"])
+        self.assertIn("GB of GPU 1 sit idle", got["both"])
+        self.assertTrue(got["plain"].endswith("GB of GPU 0 are free: a restart gives the pools about 400 more experts."))
 
     def test_speculation_says_off_waiting_or_the_acceptance(self):
         # the Monitor's Speculation, three states: off (no drafter, or the request asked for none: "off" in the field and

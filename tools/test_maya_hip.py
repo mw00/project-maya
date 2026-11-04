@@ -303,6 +303,35 @@ class HipSetupTests(unittest.TestCase):
             maya.refresh_engine(cfg)                    # compiled from this source already: nothing to do
             compile_hip.assert_not_called()
 
+    def test_failed_update_build_never_starts_the_engine_from_before(self):
+        # #805: "HIP rebuild failed; starting the previous engine" ran the old exe under the new server and config
+        pc = {"rocm": str(self.rocm), "archs": ["gfx1151"], "gpus": [{"index": 0}]}
+        with patch.object(maya, "pick_cmake", return_value="cmake"), patch.object(maya, "WIN", False), \
+                patch.object(maya, "hip_toolchain", return_value=(self.rocm, self.rocm / "llvm/bin/clang++",
+                                                                  self.rocm / "bin", {})), \
+                patch.object(maya, "cmake_steps", return_value="compiling"), \
+                patch.object(maya, "fail", side_effect=SystemExit(1)) as stop:
+            with self.assertRaises(SystemExit):
+                maya.compile_engine_hip(pc, self.root / "llama", "source-sha", soft=True)
+        self.assertIn("not started", stop.call_args.args[0])
+
+    def test_refresh_without_the_hip_compiler_stops(self):
+        build = self.root / "build-hip"
+        build.mkdir()
+        stamp = {"backend": "hip", "src": "old-sha", "archs": ["gfx1151"], "rocm": str(self.root / "gone"),
+                 "llama": str(self.root / "llama"), "targets": ["maya-ds4"]}
+        cfg = {"exe": str(build / "maya-ds4"), "backend": "hip", "gpu": [0]}
+        with patch.object(maya, "EXE", build / "maya"), patch.object(maya, "DS4_EXE", build / "maya-ds4"), \
+                patch.object(maya, "MM3_EXE", build / "maya-mm3"), \
+                patch.object(maya, "STAMP", build / "MAYA-BUILD.json"), \
+                patch.object(maya.S, "source_hash", return_value="new-sha"), \
+                patch.object(maya, "hip_clang", return_value=None), \
+                patch.object(maya, "fail", side_effect=SystemExit(1)) as stop:
+            maya.STAMP.write_text(json.dumps(stamp))
+            with self.assertRaises(SystemExit):
+                maya.refresh_engine(cfg)
+        self.assertIn("--setup --rebuild", stop.call_args.args[1])
+
     def test_hip_no_vision_skips_without_downloading(self):
         self.a.no_vision = True
         with patch.object(maya.S, "download", side_effect=AssertionError("no vision downloads")):
@@ -619,6 +648,32 @@ class HipSetupTests(unittest.TestCase):
         self.assertEqual(self.first_run_backend([], [strix]), "hip")
         self.assertEqual(self.first_run_backend([], [self.gpus[2]]), "cuda")   # (unsupported iGPU: CUDA's message)
         self.assertEqual(self.first_run_backend([{"index": 0, "arch": "70"}], [strix]), "cuda")
+
+    def test_first_run_without_backend_takes_every_arch_the_hip_check_takes(self):
+        # (#805) the experimental ones too: the CUDA checks would stop at nvidia-smi
+        for arch in maya.HIP_ARCHS_UNVALIDATED + maya.HIP_ARCHS_WAVE64:
+            card = {"index": 0, "arch": arch, "vendor": "amd", "name": arch, "vram_gb": 16}
+            self.assertEqual(self.first_run_backend([], [card]), "hip", arch)
+
+    def test_first_run_on_windows_names_the_amd_gpus_with_an_installed_hipinfo(self):
+        r9700 = {"index": 0, "arch": "gfx1201", "vendor": "amd", "name": "R9700", "vram_gb": 32}
+        with patch.object(maya, "WIN", True), patch.object(maya, "apple_silicon", return_value=False), \
+                patch.object(maya.S, "gpus", return_value=[]), \
+                patch.object(maya, "installed_hip_info", return_value=r"C:\rocm\bin\hipInfo.exe"), \
+                patch.object(maya.S, "amd_gpus", return_value=[r9700]) as amd:
+            self.assertEqual(maya.first_run_backend(), "hip")
+        amd.assert_called_once_with(r"C:\rocm\bin\hipInfo.exe")
+
+    def test_installed_hipinfo_is_the_newest_rocm_in_program_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            for ver in ("6.4", "7.2", "7.10"):
+                (Path(d) / "AMD/ROCm" / ver / "bin").mkdir(parents=True)
+            (Path(d) / "AMD/ROCm/6.4/bin/hipInfo.exe").touch()
+            (Path(d) / "AMD/ROCm/7.2/bin/hipInfo.exe").touch()
+            env = {k: v for k, v in os.environ.items() if k not in ("ROCM_PATH", "HIP_PATH")}
+            with patch.dict(os.environ, dict(env, ProgramFiles=d), clear=True), \
+                    patch.object(maya.shutil, "which", return_value=None):
+                self.assertEqual(maya.installed_hip_info(), str(Path(d) / "AMD/ROCm/7.2/bin/hipInfo.exe"))
 
 
 class ConfigsTests(unittest.TestCase):

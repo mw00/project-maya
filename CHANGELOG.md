@@ -4,11 +4,58 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
-## [UNRELEASED]
+## v1.1.53 - 2026-11-04
 
-- **ROCm installs with versioned LLVM slots:** `hip_clang` finds a distribution's LLVM slot (`<root>/lib/llvm/<version>/bin/clang++`,
- newest first), so Gentoo passes the HIP check with `ROCM_PATH=/usr` and no `/usr/lib64/rocm/llvm` symlink (`tools/test_maya_hip.py`
- covers it).
+A new look for the web UI's Models, Monitor and Settings pages, MiniMax on Apple Silicon (experimental), fixes for third-party DeepSeek quants and failed updates, and many community pull requests.
+
+- **Web UI:**
+  - **Models:** each model's details, engine settings and storage are in one sheet with three tabs (Overview, Engine, Storage). The delete dialog now lists each folder and file with its size, and keeps what another model still uses (a shared folder, the image encoder, a DFlash2 drafter other configs draft with - they no longer fall back to MTP). Maya deletes only inside the models folders it knows, by real path, and not while a model downloads.
+  - **Models, Add a model:** lists the other quants the setup offers on this PC (LibertAIDAI's DeepSeek EXL3, unsloth's GGUFs, orcarouter's abliterated quants, Mia-AiLab's MiniMax EXL3, turboderp's GLM EXL3), each downloaded through the setup. An EXL3 quant set up by hand is named by its own bits, from its folder's name.
+  - **Context size:** one setting, in Settings > Chat defaults and in a model's Engine tab; a change to the running model's context reloads it in place.
+  - **Monitor:** prefill shows the prompt read's peak (this request's, then the last one's) instead of its latest figure; the stats as a 2 x 2 grid; figures and labels lined up on phones.
+  - **Settings:** five groups (General, Integrations, Usage, Privacy, About), a list then a page on a phone; "Appearance"; the running model's port beside it in Chat defaults; Connect your tools as before. Cards, buttons and fields as fills instead of outlines; the thinking chip says "Thinking · <level>".
+  - **Support:** a small heart beside the model's name in the sidebar and a line on About (and under an update's button) link to GitHub Sponsors. No popups.
+- **MiniMax-M3.1-Flash on Apple Silicon (experimental):** a Metal engine of its own, `maya-metal-mm3`, runs Maya's MiniMax GGUF quants with every expert resident (Maya-XS fits a 128 GB Mac), text only, with parity tests against the reference forward. The setup does not offer it yet: docs/METAL.md says how to build and start it by hand. Nothing else in the engines changes (#778, thanks @Franzferdinan51).
+- **DeepSeek, other EXL3 quants from Hugging Face (#806):**
+  - `tools/ds4/pack.py` accepts a head kept as BF16 (`head.weight`); the engine already reads it.
+  - Shards that write their tensors grouped by type instead of expert by expert stop the pack with that reason and the fix (rewrite them in expert order); the engine's own message says the same instead of "split across files".
+  - Engram tables a quant stored in its own INT4 layout stop the pack with a message that points to DeepSeek's FP8 shards 47 / 48; docs/MODELS.md says so too.
+- **Updates on NVIDIA and Apple Silicon (as on AMD in v1.1.52):** an update whose engine rebuild fails, or whose compiler or llama.cpp source is gone, stops with the reason and how to rebuild instead of starting the engine from before under the new server and config.
+- **Monitor, tensor-parallel pairs:** "What fills the GPUs" no longer says a restart gives more experts for free VRAM that the GPU's tensor-parallel partner cannot match (the members of a `--tp` group hold the same expert slots). That room is shown as idle, and with DeepSeek's DSpark drafter it points to `MAYA_DS4_DRAFT_DEV`, which can place drafter blocks there.
+- **DeepSeek, a GPU fault:** a request that leaves a GPU in a fault ends the engine with an error, and the next request starts a fresh one; before, every later request failed until a restart by hand (#688, thanks @sociolog).
+- **Community pull requests** (every setting below is opt-in and off by default; unset, the engines run as in v1.1.52):
+  - Opt-in: DeepSeek decode runs Q8_0 GEMVs of 3-16 columns on the tensor cores of sm_80 and newer, with the same bits (`MAYA_DS4_Q8MV_TC=1`, #810, thanks @alesha-pro).
+  - Opt-in: DeepSeek prompts on a layer split - DMA from pinned RAM copies of any format (`DS4_FLOW_COPY_DMA`), the indexer's slabs sized by the prompt (`DS4_AI_RUN`), both with the same answers; chunks sized by the prompt's length (`DS4_CHUNK_AUTO`) and the YOCO skip on the flow (`DS4_YOCO_FLOW`), which change the answers slightly. On the author's 4x RTX 3090 they read prompts 29-72% faster (#811, thanks @alesha-pro).
+  - Opt-in: DeepSeek long conversations - experts lent to a prompt's buffers come back from pinned RAM copies instead of the disk (`DS4_LENT_RAM_GB`), and the server builds a turn's token ids by increment from the last prompt's, the same ids (`MAYA_PROMPT_MEMO=1`, every model) (#813, thanks @alesha-pro).
+  - Opt-in: DeepSeek's CPU lane gives an expert the same bits as in VRAM (`MAYA_DS4_LANE_PARITY=1`, #741, thanks @cresslank).
+  - Opt-in, the same bits: the DeepSeek CPU lane cuts a small EXL3 call's pieces by columns too (`DS4_CPU_SPLIT_COLS`, #758); the AVX2 EXL3 CPU kernels work in 16-bit lanes for calls of 1-3 activations (`DS4_CPU_W16`, #759) and cut byte-aligned trellis windows with byte shuffles (`MAYA_EXL3_AVX2_SHUF`, #760); DeepSeek expert placement keeps recent slots that survive per-byte placement (`DS4_RECENT_FIT`), and `DS4_PPL_STEP` is a test aid (#761) - thanks @bitaccesscomau.
+  - Opt-in: AMD Instinct MI350 / MI355 (gfx950) read EXL3 prompts on their matrix cores (`EXL3_WMMA_GFX950=1`, #692, thanks @yagop).
+  - Linux on POWER9 (ppc64le, IBM AC922): Maya builds and runs there; docs/IBM_AC922.md (#753, thanks @jefflaichunyin).
+  - `tools/agent_bench.py`: a benchmark shaped like coding agents - several long conversations at once against a running server, fixed by a seed (#406, thanks @somnergy).
+  - docs/DOCKER.md and `docker/`: a recipe to build a Docker image of a release; there is no official image (#808, thanks @noonghunna).
+  - README: a 4x RTX 4090 DeepSeek row in the speed table (#814, thanks @oscarlius).
+
+## v1.1.52 - 2026-11-03
+
+Faster GLM decode, fixes for AMD PCs on Windows (setup, updates and start errors), a DeepSeek config check, and community pull requests.
+
+- **GLM decode:** the DSA layers' feed-forward runs in CUDA graphs by default. On the PCs it was measured on, decode is about 8-9% faster, with the same greedy answers (#795, thanks @saatvik-viniak).
+- **AMD PCs on Windows (#805):**
+  - A first setup without `--backend hip` finds an AMD-only PC (every card the HIP check accepts, named by an installed ROCm's `hipInfo`) instead of stopping at `nvidia-smi`.
+  - An update whose engine rebuild fails stops with the reason and how to rebuild (`build-maya-hip.bat > build-hip.txt 2>&1`, or `START-MAYA.bat --setup --rebuild`) instead of starting the engine from before under the new server and config.
+  - An engine error in the middle of an answer ends that request with an error instead of stopping the server.
+  - A failed GPU buffer zeroing at start names its size and the driver's reason.
+- **DeepSeek, `reasoning_effort` in the config (#807):** it is checked before the model loads, so a bad value stops the start at once instead of after the load. A number above 100 (DeepSeek's effort is a level from 1 to 100) gets a message that points to `"thinking_budget"`, the cap on the thinking in tokens. docs/SETTINGS.md says which setting is which.
+- **DeepSeek on Linux:** the n-gram table readers use twice the CPU's hardware threads (between 16 and 64) instead of a fixed 8, so cold prompts read faster on larger CPUs (#716, thanks @SeriousRising).
+- **Models page:** a folder that another model reads files from is no longer listed under "Files no model uses".
+- **Community pull requests:**
+  - GLM on several GPUs: an opt-in RAM tier that keeps each expert's halves on both CPU sockets (`MAYA_GLM_ROW_HALVES=1`), plus CPU-lane pinning and profiling settings (#795, thanks @saatvik-viniak).
+  - CPU lane: IQ1_S rows decode in vectors, with the same results (#695, thanks @sociolog).
+  - Opt-in: GLM decode defers the CPU's experts on every part of a split (`MAYA_GLM_DEFER_CPU=2`, #722, thanks @oisee).
+  - DeepSeek EXL3 packs: an F16 dense matrix loads as BF16 (#802, thanks @pepuscz).
+  - Opt-in: DeepSeek on RDNA 3 runs the indexer's scores on WMMA (`DS4_INDEX_TC=1`, #801, thanks @pepuscz).
+  - Experimental AMD MI50 (gfx906) support: the wave64 check, opt-in peer-to-peer split hops (`MAYA_GLM_P2P`, #397), and MiniMax wave64 attention kernels (#800), thanks @nicholas631.
+  - Opt-in: DeepSeek `--tp 2` on NVIDIA reads prompts with an exact peer-VRAM all-reduce (`MAYA_DS4_HIP_PEER_AR`, #773, thanks @olobarius).
 
 ## v1.1.51 - 2026-11-03
 
@@ -22,7 +69,7 @@ DeepSeek fills every GPU in tensor parallel and reads long prompts faster when m
 - **CYBER-FROST:** the dashboard has a thinking Off button.
 - **Dashboard:** while the model thinks, its thoughts follow the newest line down, as the answer does (scroll them up to read and they stay put).
 - **Dashboard, long answers:** a page that lost its connection to an answer for a long time (a sleeping phone, a background tab) no longer gives the answer up for good: it tries again when it is shown, and if it has stopped trying, coming back to the page or reloading it takes the answer up again while the server still holds it.
-- **DeepSeek:** a failed GPU allocation says its size, the driver's reason and the free VRAM (#794); a numeric `reasoning_effort` in the config is a thinking budget (#768); `DS4_AR_P2P` reads the real BAR size, so it engages on large-BAR cards (#798); `DS4_RAM_MARGIN_GB` sets the system-RAM headroom the memory planning leaves, default 8 GiB (#739).
+- **DeepSeek:** a failed GPU allocation says its size, the driver's reason and the free VRAM (#794); a numeric `reasoning_effort` in the config (`"42"`) is the model's effort level from 1 to 100, not an unknown word (#768; the cap on the thinking in tokens is `"thinking_budget"`); `DS4_AR_P2P` reads the real BAR size, so it engages on large-BAR cards (#798); `DS4_RAM_MARGIN_GB` sets the system-RAM headroom the memory planning leaves, default 8 GiB (#739).
 - **MiniMax:** the "prefill not calibrated" note says when the saved calibration is for another GPU list, runtime or driver (#721).
 - **Savings ledger:** `MAYA_SAVINGS_PATH` chooses its file (`off` keeps none), and a file that cannot be written is logged once (#724).
 - **Responses API:** the rejections name the tool type or include value the client sent (#726).

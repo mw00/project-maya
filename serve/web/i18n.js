@@ -8,6 +8,8 @@ import modelsPhrases from "./i18n-models.js";
 import modelListPhrases from "./i18n-model-list.js";
 import commonPhrases from "./i18n-common.js";
 import chatPhrases from "./i18n-chat.js";
+import upstreamPhrases from "./i18n-upstream.js";
+import integrationPhrases from "./i18n-integration.js";
 
 export const LANGUAGE_KEY = "maya.language";
 const zhCN = {
@@ -24,7 +26,7 @@ const zhCN = {
   "model": "模型", "context-size": "上下文大小", "sampling": "采样", "custom": "自定义",
   "copy-answer": "复制回答", "about-answer": "关于此回答", "tokens-and-speed": "Token 与速度",
   "settings.general": "通用", "settings.model": "模型", "settings.savings": "节省金额",
-  "settings.chat": "对话默认值", "settings.instructions": "指令", "settings.tools": "工具",
+  "settings.chat": "对话默认值", "settings.instructions": "全局指令", "settings.tools": "工具",
   "settings.connect": "连接你的工具", "settings.data": "数据", "settings.about": "关于与更新",
   "Send": "发送", "New line": "换行", "New chat": "新建对话", "Search chats": "搜索对话",
   "Stop the answer": "停止回答", "Show or hide the sidebar": "显示或隐藏侧边栏",
@@ -44,7 +46,7 @@ const zhCN = {
   "Saved for the next start: this server was not started by Maya's start script, so it stays on": "已保存供下次启动使用：此服务器并非由 Maya 启动脚本启动，因此会保持在端口", "until then.": "，直到下次启动。", "Move to": "迁移到",
 };
 
-const tables = {"zh-CN": {...commonPhrases, ...settingsPhrases, ...serverPhrases, ...monitorPhrases, ...modelFieldPhrases, ...modelsPhrases, ...modelListPhrases, ...chatPhrases, ...zhCN}};
+const tables = {"zh-CN": {...commonPhrases, ...settingsPhrases, ...serverPhrases, ...monitorPhrases, ...modelFieldPhrases, ...modelsPhrases, ...modelListPhrases, ...chatPhrases, ...upstreamPhrases, ...integrationPhrases, ...zhCN}};
 
 
 export function languageChoice() {

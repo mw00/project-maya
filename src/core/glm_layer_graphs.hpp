@@ -17,9 +17,28 @@ public:
         const float* residual = nullptr;
         const float* other = nullptr;
         bool all_resident = false;   // fast_moe leaves its wait / fetch launches out then: another graph
+        int pipe_t = -1;
         bool operator==(const Key& b) const {
             return cpu_plan == b.cpu_plan && residual == b.residual && other == b.other &&
-                   all_resident == b.all_resident;
+                   all_resident == b.all_resident && pipe_t == b.pipe_t;
+        }
+    };
+
+    struct GraphId {
+        int layer = 0;
+        unsigned long long cpu_plan = 0;
+        const float* residual = nullptr;
+        const float* other = nullptr;
+        bool all_resident = false;
+        int pipe_t = -1;
+
+        bool operator<(const GraphId& b) const {
+            if (layer != b.layer) return layer < b.layer;
+            if (pipe_t != b.pipe_t) return pipe_t < b.pipe_t;
+            if (cpu_plan != b.cpu_plan) return cpu_plan < b.cpu_plan;
+            if (residual != b.residual) return residual < b.residual;
+            if (other != b.other) return other < b.other;
+            return all_resident < b.all_resident;
         }
     };
 
@@ -28,12 +47,8 @@ public:
     bool enqueue(int layer, Key key, cudaStream_t stream, uint64_t& expected, uint64_t requests,
                  const std::function<bool()>& body, bool& replayed, std::string& err) {
         replayed = false;
-        auto it = entries_.find(layer);
-        if (it != entries_.end() && !(it->second.key == key)) {
-            entries_.erase(it);   // caller changes plans only at a completed token boundary
-            it = entries_.end();
-            ++invalidations;
-        }
+        const GraphId gid{layer, key.cpu_plan, key.residual, key.other, key.all_resident, key.pipe_t};
+        auto it = entries_.find(gid);
         if (it != entries_.end()) {
             if (!it->second.graph.launch(stream, err)) return false;
             expected += requests;
@@ -62,7 +77,7 @@ public:
             expected = before;
             return false;
         }
-        entries_.emplace(layer, std::move(entry));
+        entries_.emplace(gid, std::move(entry));
         ++captures;
         return true;
     }
@@ -75,7 +90,7 @@ private:
         Key key;
         CapturedGraph graph;
     };
-    std::map<int, Entry> entries_;
+    std::map<GraphId, Entry> entries_;
 };
 
 }  // namespace strata::core::glmfast

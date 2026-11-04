@@ -4,7 +4,7 @@
 // one, 1 to 16 tokens a call, whole matrices and row ranges that start mid-way.  No GPU.
 //
 //   DS4_IQ1_PDEP=0 ds4_iq1_rows_test   the rows without pdep, on any CPU (the form AMD Zen / Zen+ / Zen 2 take by default)
-//   DS4_IQ1_PDEP=1 ds4_iq1_rows_test   the measured choice (ggml-cpu's dot for one token, pdep where it times faster)
+//   DS4_IQ1_PDEP=1 ds4_iq1_rows_test   the measured choice (the own rows where they time faster than ggml-cpu's dot)
 #include "../src/ds4/ds4_gguf_cpu.hpp"
 
 #include "ggml-cpu.h"

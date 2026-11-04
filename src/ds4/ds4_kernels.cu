@@ -1,6 +1,7 @@
 // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
 // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
 #include "ds4_kernels.cuh"
+#include "ds4_peer_cuda_compat.cuh"  // (the HIP names the peer all-reduce uses, on CUDA)
 #include "ds4_pdl.cuh"
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
@@ -994,6 +995,17 @@ __device__ __forceinline__ void rows_at(const Rows& r, int t, int& n, int& k) {
 // four blocks' sums in FP32 (index_score_kernel's FP32 sum of 128 products rounds more than this).  A tile of 128 key
 // slots at a time, QT queries' 32 heads each (the shared rows: 1-6 queries a block; with candidates 1, each query its
 // own rows), relu and the head weights' sum by lanes; a block loops over tiles (the queries converted once)
+// RDNA 3 (gfx11, wave32): the same integers through v_wmma_i32_16x16x16_iu8, a block's 32 values two WMMAs; the heads
+// are A (lane m and m + 16 head m's 16 values), the keys B (lane n and n + 16 key n's), so D's element i is head
+// 2i + lane / 16 of key lane % 16 - a warp 16 keys, a lane's 8 heads summed in place and the other 8 a shuffle away.
+// The powers of two as floats (sq: the query blocks', in D's head order; ek: the keys' - ue8m0_val's, a scale byte 0
+// a zero block), their product exact.
+#if defined(STRATA_USE_HIP) && (defined(__GFX11__) || defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+                                defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__))
+#define DS4_INDEX_WMMA 1
+typedef int ds4_i4 __attribute__((ext_vector_type(4)));
+typedef int ds4_i8 __attribute__((ext_vector_type(8)));
+#endif
 template <int QT>
 __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __restrict__ q, const float* __restrict__ w,
                                                              const uint8_t* __restrict__ kp, int heads, int n, int T,
@@ -1002,7 +1014,7 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
                                                              int ntiles) {
     pdl_wait();
     pdl_trigger();
-#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)   // (mma.sync's int8 shape)
+#if (!defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800)) || defined(DS4_INDEX_WMMA)   // (int8 MMAs)
     constexpr int HD = 128, KT = 128, LD = HD + 16, NQ = QT * 32, NB = HD / 32;
     constexpr size_t RB = kv_row_bytes(kKvFp4p, HD);   // (a packed key row: its codes, its scales, padded to 16)
     extern __shared__ __align__(16) int8_t tc_smem[];   // Ks [KT][LD], Qs [NQ][LD] (int8), ek [KT][NB], eq [NQ][NB]
@@ -1035,7 +1047,13 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
             const uint32_t b0 = (uint8_t) (int8_t) __float2int_rn(v[u].x * sc), b1 = (uint8_t) (int8_t) __float2int_rn(v[u].y * sc),
                            b2 = (uint8_t) (int8_t) __float2int_rn(v[u].z * sc), b3 = (uint8_t) (int8_t) __float2int_rn(v[u].w * sc);
             *(uint32_t*) (Qs + (r0 + u) * LD + lane * 4) = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+#if defined(DS4_INDEX_WMMA)   // (2^(e - 4) at [block][16 heads' tile][head % 2][head % 16 / 2]: D's order)
+            const int r = r0 + u;
+            if ((lane & 7) == 0)
+                ((float*) eq)[lane / 8 * NQ + (r & ~15) + (r & 1) * 8 + (r & 15) / 2] = ldexpf(1.0f, e - 4);
+#else
             if ((lane & 7) == 0) eq[(r0 + u) * NB + lane / 8] = e - 4;
+#endif
         }
     }
     for (int i = threadIdx.x; i < NQ; i += blockDim.x) {
@@ -1090,7 +1108,11 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
                 else hi |= byte << (8 * (e - 4));
             }
             *(uint2*) (Ks + j * LD + c) = make_uint2(lo, hi);
+#if defined(DS4_INDEX_WMMA)   // (2^(sb - 128): ue8m0_val(sb) / 2 - 0 for a byte 0, subnormal for 1)
+            if ((c & 31) == 0) ek[j * NB + c / 32] = __float_as_int(sb[u] != 0u ? ldexpf(1.0f, (int) sb[u] - 128) : 0.0f);
+#else
             if ((c & 31) == 0) ek[j * NB + c / 32] = (int) sb[u] - 128;
+#endif
         }
     };
     if (blockIdx.x < ntiles) fetch(blockIdx.x);
@@ -1099,6 +1121,48 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
         stage();
         __syncthreads();
         if (tile + (int) gridDim.x < ntiles) fetch(tile + gridDim.x);   // (in flight beside the MMAs below)
+#if defined(DS4_INDEX_WMMA)
+        // warp: keys warp*16 .. + 15 (B), lane's key kc; QT x 2 tiles of 16 heads (A); acc[tile][i]: head 2i + hi
+        const int kc = warp * 16 + (lane & 15), hi = lane >> 4;
+        (void) g, (void) tg;
+        float acc[QT * 2][8];
+#pragma unroll
+        for (int ht = 0; ht < QT * 2; ++ht)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) acc[ht][i] = 0.0f;
+#pragma unroll
+        for (int b = 0; b < NB; ++b) {
+            const uint4 k0 = *(const uint4*) (Ks + kc * LD + b * 32), k1 = *(const uint4*) (Ks + kc * LD + b * 32 + 16);
+            const ds4_i4 bk0 = {(int) k0.x, (int) k0.y, (int) k0.z, (int) k0.w}, bk1 = {(int) k1.x, (int) k1.y, (int) k1.z, (int) k1.w};
+            const float sk = __int_as_float(ek[kc * NB + b]);
+            const float* sq = (const float*) eq + b * NQ + hi * 8;
+#pragma unroll
+            for (int ht = 0; ht < QT * 2; ++ht) {
+                const int8_t* qr = Qs + (ht * 16 + (lane & 15)) * LD + b * 32;
+                const uint4 q0 = *(const uint4*) qr, q1 = *(const uint4*) (qr + 16);
+                const ds4_i4 a0 = {(int) q0.x, (int) q0.y, (int) q0.z, (int) q0.w}, a1 = {(int) q1.x, (int) q1.y, (int) q1.z, (int) q1.w};
+                ds4_i8 c = {0, 0, 0, 0, 0, 0, 0, 0};
+                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a0, true, bk0, c, false);
+                c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a1, true, bk1, c, false);
+                const float4 s0 = *(const float4*) (sq + ht * 16), s1 = *(const float4*) (sq + ht * 16 + 4);
+                const float sv[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+#pragma unroll
+                for (int i = 0; i < 8; ++i) acc[ht][i] = fmaf((float) c[i] * sv[i], sk, acc[ht][i]);   // (c sv exact)
+            }
+        }
+        // relu, the head weights: a lane's 8 heads of each tile, then the other half-warp's 8 (lane ^ 16)
+#pragma unroll
+        for (int tq = 0; tq < QT; ++tq) {
+            float s = 0.0f;
+#pragma unroll
+            for (int u = 0; u < 2; ++u)
+#pragma unroll
+                for (int i = 0; i < 8; ++i) s += fmaxf(acc[tq * 2 + u][i], 0.0f) * ws[tq * 32 + u * 16 + 2 * i + hi];
+            s += __shfl_xor_sync(0xffffffffu, s, 16);
+            const int t = t0 + tq, ia = i0 + kc;
+            if (hi == 0 && t < T && ia < n) out[(long long) t * out_stride + ia] = pos_of(ia, tq) >= 0 ? s : -INFINITY;
+        }
+#else
         float acc[QT * 4][4];
 #pragma unroll
         for (int nt = 0; nt < QT * 4; ++nt) acc[nt][0] = acc[nt][1] = acc[nt][2] = acc[nt][3] = 0.0f;
@@ -1149,10 +1213,11 @@ __global__ void __launch_bounds__(256) index_score_tc_kernel(const float* __rest
                 if (ib < n) o[ib] = pos_of(ib, tq) >= 0 ? s1 : -INFINITY;
             }
         }
+#endif
         __syncthreads();   // (the next tile's rows over these)
     }
 #elif defined(STRATA_USE_HIP)
-    __builtin_trap();   // (index_score takes it on CUDA devices of compute capability 8.0 and up alone)
+    __builtin_trap();   // (index_score takes it on CUDA devices of compute capability 8.0 and up, and RDNA 3, alone)
 #else
     __trap();
 #endif
@@ -3003,7 +3068,7 @@ __global__ void publish_kernel(Req* req, int T, unsigned seq, int na0, int na1, 
     const int any = *(volatile int*) cpu_any;
     *cpu_any = 0;
     if (any || (int) (seq - *(volatile const unsigned*) host_done) >= kRing / 2) return;
-    for (int t = 0; t < T; ++t) resp->cpu[t] = 0;
+    for (int t = 0; t < T; ++t) resp->cpu[t] = 0, resp->pmask[t] = 0;
     __threadfence_system();
     *(volatile unsigned*) &resp->seq = seq;
 }
@@ -3367,7 +3432,7 @@ __global__ void __launch_bounds__(kThreads) ar_sum_kernel(float* x, int n4, cons
 }
 
 
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 __global__ void __launch_bounds__(kThreads) ar_peer_kernel(float* x, int n4, PeerAr a, int mi, unsigned seq) {
     __shared__ int ready;
     if (threadIdx.x == 0) ready = (*reinterpret_cast<volatile unsigned*>(a.error) & 1u) == 0;
@@ -3825,6 +3890,42 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
     pdl_launch(bounds_scan_kernel, 1, 32, 0, s, bounds, n_vs);
     pdl_launch(moe_sort_kernel<true>, n_vs, kThreads, 0, s, idx, T, k, vs, bounds, row_tok, pos);
 }
+// (DS4_LANE_PARITY) the prompt path's expert sum in exact fixed point: each pick's w y (exact in F64) times 2^32,
+// rounded to an integer once, summed in int64 - an exact, order-free sum, so the sets' order (VRAM slots first, then
+// the streamed ones as they land: the placement's) no longer changes a bit of it; moe_x_finish adds it to acc after the
+// layer's last set
+__global__ void moe_combine_x_kernel(long long* acc, const float* __restrict__ y, const int* __restrict__ pos,
+                                     const float* __restrict__ w, int k, int r0, int r1, int dim) {
+    pdl_wait();
+    pdl_trigger();
+    const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
+    if (e >= dim) return;
+    long long a = 0;
+    bool any = false;
+    for (int i = 0; i < k; ++i) {
+        const int r = pos[(size_t) t * kPicks + i];
+        if (r < r0 || r >= r1) continue;
+        const double p = (double) w[(size_t) t * kPicks + i] * (double) y[(size_t) (r - r0) * dim + e];
+        a += __double2ll_rn(p * 4294967296.0);
+        any = true;
+    }
+    if (any) acc[(size_t) t * dim + e] += a;
+}
+__global__ void moe_x_finish_kernel(float* acc, const long long* __restrict__ acc64, size_t n) {
+    pdl_wait();
+    pdl_trigger();
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    acc[i] = __fadd_rn(acc[i], __double2float_rn((double) acc64[i] * 2.3283064365386962890625e-10));
+}
+void moe_combine_x(long long* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1,
+                   int dim, cudaStream_t s) {
+    if (r1 > r0 && T > 0)
+        pdl_launch(moe_combine_x_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, acc, y, pos, w, k, r0, r1, dim);
+}
+void moe_x_finish(float* acc, const long long* acc64, size_t n, cudaStream_t s) {
+    if (n > 0) pdl_launch(moe_x_finish_kernel, (unsigned) ((n + kThreads - 1) / kThreads), kThreads, 0, s, acc, acc64, n);
+}
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim,
                  cudaStream_t s) {
     if (r1 > r0 && T > 0) pdl_launch(moe_combine_kernel, dim3(cdiv(dim, kThreads), T), kThreads, 0, s, acc, y, pos, w, k, r0, r1, dim);
@@ -3928,7 +4029,7 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
     // 4 x 1024 tokens, but a long greedy run's tokens part after a while)
     static const bool tc_ok = std::getenv("DS4_INDEX_TC") != nullptr && std::atoi(std::getenv("DS4_INDEX_TC")) != 0;
     if (tc && tc_ok && kfmt == kKvFp4p) {   // (the tensor cores: a block a tile, looping, ~2 blocks an SM)
-        static std::atomic<uint64_t> opted{0}, capable{0};   // (capable: compute capability 8.0+, CUDA - mma's int8)
+        static std::atomic<uint64_t> opted{0}, capable{0};   // (capable: compute capability 8.0+, CUDA - mma's int8; gfx11)
         static int sms[64] = {};
         int dev = 0;
         cudaGetDevice(&dev);
@@ -3947,13 +4048,23 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
             }
 #else
             (void) major;
+            cudaDeviceProp p{};   // (RDNA 3: the same kernel on its WMMAs - its shared memory below 64 KB, no opt-in)
+            if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0)
+                capable.fetch_or(1ull << dev);
 #endif
             cudaDeviceGetAttribute(&sms[dev & 63], cudaDevAttrMultiProcessorCount, dev);
             opted.fetch_or(1ull << dev);
         }
+        // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
+#if defined(STRATA_USE_HIP)
+        // (RDNA 3: a window of 5 or 6 queries in one block - 10 or 12 head tiles' accumulators a lane - ties or loses to
+        //  the CUDA cores' kernel, measured on an RX 7900 XTX; it goes as two blocks of up to 3 queries instead)
+        const int qt = cand != nullptr ? 1 : T <= 4 ? T : T <= 6 ? 3 : 4;
+#else
+        const int qt = cand != nullptr ? 1 : T <= 6 ? T : 4;
+#endif
         if (capable.load(std::memory_order_relaxed) >> dev & 1u) {   // (else the CUDA cores' kernel below)
-            // queries a block: 1 with candidates (each its own rows); else a decode window's all (up to 6), a slab's 4
-            const int qt = cand != nullptr ? 1 : T <= 6 ? T : 4, qg = (T + qt - 1) / qt, ntiles = (n + 127) / 128;
+            const int qg = (T + qt - 1) / qt, ntiles = (n + 127) / 128;
             const int gx = std::max(1, std::min(ntiles, 2 * sms[dev & 63] / qg));
             const uint8_t* kp = (const uint8_t*) k;
             switch (qt) {
@@ -4633,7 +4744,7 @@ void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned
     pdl_launch(ar_sum_kernel, blocks, kThreads, 0, s, x, n4, a.data, a.stride, a.flags, a.nm, mi, slot, a.slots, seq);
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
 bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cudaStream_t s) {
     if (!x || (reinterpret_cast<uintptr_t>(x) & 15u) || n <= 0 || n % 4 || mi < 0 || mi > 1 || !a.recv || !a.peer_recv ||
         (reinterpret_cast<uintptr_t>(a.recv) & 15u) || (reinterpret_cast<uintptr_t>(a.peer_recv) & 15u) || !a.flags ||
@@ -4641,6 +4752,22 @@ bool allreduce_peer(float* x, int n, const PeerAr& a, int mi, unsigned seq, cuda
     const int blocks = std::max(1, std::min(kPeerArBlocks, cdiv(n / 4, kThreads)));
     ar_peer_kernel<<<blocks, kThreads, 0, s>>>(x, n / 4, a, mi, seq);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+// CUDA loads a kernel on a device at its first launch there (lazy loading, the default since CUDA 12.2), and with
+// peer access on that load can wait for the device's or its peer's running work. The transports' kernels spin for
+// their partner, so a first launch beside a spinning partner never returns: calibrate_peer submits both ranks from
+// one thread and hung for good on 8x RTX 3090 (NVLink pairs). Load them up front on the current device.
+void peer_ar_preload() {
+#if !defined(STRATA_USE_HIP)
+    cudaFuncAttributes fa{};
+    (void) cudaFuncGetAttributes(&fa, ar_peer_kernel);
+    (void) cudaFuncGetAttributes(&fa, ar_sum_kernel);
+    (void) cudaFuncGetAttributes(&fa, xfer_put_kernel);
+    (void) cudaFuncGetAttributes(&fa, xfer_get_kernel);
+    (void) cudaFuncGetAttributes(&fa, ar2_kernel<true>);
+    (void) cudaFuncGetAttributes(&fa, ar2_kernel<false>);
+    (void) cudaGetLastError();
+#endif
 }
 #endif
 

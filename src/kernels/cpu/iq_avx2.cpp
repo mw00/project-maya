@@ -18,17 +18,21 @@
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
 
+// (the C++ headers first: on Windows, clang's <algorithm> reaches the MSVC headers' intrin.h, whose __cpuid
+// declaration <cpuid.h>'s __cpuid macro would break)
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
 #include <immintrin.h>
 #if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h>
 #else
 #include <cpuid.h>
 #endif
-
-#include <atomic>
-#include <cmath>
-#include <cstdlib>
-#include <cstring>
 
 namespace strata::kernels::cpu {
 namespace {
@@ -639,6 +643,84 @@ inline float dot1_iq3_xxs(const uint8_t* row, int nb, const block_q8_K* y) {
     return 0.25f * hsum_ggml(accumf);
 }
 
+// IQ2_XXS (Maya-S's gate/up) on AVX2, one token: ggml's dot with its decode moved off Broadwell's shuffle port - each
+// half's four grid rows by broadcast loads + blends (tab4) instead of set_epi64x's inserts, the sign vectors built in
+// registers (dot1_iq3_xxs' neg: the two formats share the 7-bit sign + parity scheme) instead of four keven_signs loads
+// and inserts a half.  The bytes, the integer lanes and the float steps are ggml's, so the result is its dot bit for bit
+// (pick_rows1 checks it).  STRATA_IQ_PF_ROWS=<n> (default 2, 0 off): prefetch the row n ahead while a row runs - a
+// thread's run of rows is short (a lane call's ~100 rows), and the L2 streamer stops at every 4 KB page.
+template <int V>   // V: 0 grid by tab4 + signs in registers, 1 tab4 + ggml's sign table, 2 set_epi64x + registers
+inline float dot1_iq2_xxs(const uint8_t* row, int nb, const block_q8_K* y, const uint8_t* pf) {
+    static const auto signs_tab = [] {   // ggml's keven_signs_q2xs: per 7-bit index, 8 bytes of +1 / -1
+        std::array<uint64_t, 128> t{};
+        for (int k = 0; k < 128; ++k) {
+            uint64_t v = 0;
+            for (int j = 0; j < 8; ++j) v |= (uint64_t) ((ksigns_iq2xs[k] >> j) & 1 ? 0xFF : 0x01) << (8 * j);
+            t[(size_t) k] = v;
+        }
+        return t;
+    }();
+    const uint64_t* signs64 = signs_tab.data();
+    const __m256i shifts = _mm256_setr_epi32(0, 0, 7, 7, 14, 14, 21, 21);
+    const __m256i spread = _mm256_setr_epi8(0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12,
+                                            0, 0, 0, 0, 4, 4, 4, 4, 8, 8, 8, 8, 12, 12, 12, 12);
+    const __m256i bits = _mm256_set1_epi64x((long long) 0x8040201008040201ull);
+    const __m256i parity = _mm256_broadcastsi128_si256(
+        _mm_setr_epi8(0, -128, -128, 0, -128, 0, 0, -128, -128, 0, 0, -128, 0, -128, -128, 0));
+    const __m256i m127 = _mm256_set1_epi32(127), m15 = _mm256_set1_epi8(15);
+    const auto neg = [&](uint32_t w) {   // 0xFF where the value's sign bit is set
+        __m256i s = _mm256_and_si256(_mm256_srlv_epi32(_mm256_set1_epi32((int) w), shifts), m127);
+        s = _mm256_or_si256(s, _mm256_shuffle_epi8(parity, _mm256_and_si256(_mm256_xor_si256(s, _mm256_srli_epi32(s, 4)), m15)));
+        s = _mm256_shuffle_epi8(s, spread);
+        return _mm256_cmpeq_epi8(_mm256_and_si256(s, bits), bits);
+    };
+    const block_iq2_xxs* x = (const block_iq2_xxs*) row;
+    __m256 accumf = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        if (pf != nullptr) _mm_prefetch((const char*) (pf + (size_t) i * sizeof(block_iq2_xxs)), _MM_HINT_T0);
+        const float d = h2f(x[i].d) * y[i].d;
+        const uint8_t* q2 = (const uint8_t*) x[i].qs;
+        const int8_t* q8 = y[i].qs;
+        __m256i sumi1 = _mm256_setzero_si256(), sumi2 = _mm256_setzero_si256();
+#if defined(__GNUC__)
+#pragma GCC unroll 4
+#endif
+        for (int ib32 = 0; ib32 < QK_K / 32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*) q8); q8 += 32;
+            const uint32_t a0 = u32(q2), a1 = u32(q2 + 4), a2 = u32(q2 + 8), a3 = u32(q2 + 12);
+            q2 += 16;
+            __m256i q2_1, q2_2, q8s_1, q8s_2;
+            if constexpr (V == 2) {
+                q2_1 = _mm256_set_epi64x((long long) iq2xxs_grid[a0 >> 24], (long long) iq2xxs_grid[(a0 >> 16) & 255],
+                                         (long long) iq2xxs_grid[(a0 >> 8) & 255], (long long) iq2xxs_grid[a0 & 255]);
+                q2_2 = _mm256_set_epi64x((long long) iq2xxs_grid[a2 >> 24], (long long) iq2xxs_grid[(a2 >> 16) & 255],
+                                         (long long) iq2xxs_grid[(a2 >> 8) & 255], (long long) iq2xxs_grid[a2 & 255]);
+            } else {
+                q2_1 = tab4(iq2xxs_grid, a0 & 255, (a0 >> 8) & 255, (a0 >> 16) & 255, a0 >> 24);
+                q2_2 = tab4(iq2xxs_grid, a2 & 255, (a2 >> 8) & 255, (a2 >> 16) & 255, a2 >> 24);
+            }
+            if constexpr (V == 1) {
+                q8s_1 = _mm256_sign_epi8(q8_1, tab4(signs64, a1 & 127, (a1 >> 7) & 127, (a1 >> 14) & 127, (a1 >> 21) & 127));
+                q8s_2 = _mm256_sign_epi8(q8_2, tab4(signs64, a3 & 127, (a3 >> 7) & 127, (a3 >> 14) & 127, (a3 >> 21) & 127));
+            } else {
+                const __m256i n1 = neg(a1), n2 = neg(a3);
+                q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(q8_1, n1), n1);
+                q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(q8_2, n2), n2);
+            }
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16((short) (2 * (a1 >> 28) + 1)));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16((short) (2 * (a3 >> 28) + 1)));
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
+    }
+    if (pf != nullptr) _mm_prefetch((const char*) (pf + (size_t) nb * sizeof(block_iq2_xxs) - 1), _MM_HINT_T0);
+    return 0.125f * hsum_ggml(accumf);
+}
+
 inline float dot1_iq3_s(const uint8_t* row, int nb, const block_q8_K* y) {
     const __m256i mask1 = _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
                                            2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3);
@@ -689,6 +771,24 @@ inline float dot1_iq3_s(const uint8_t* row, int nb, const block_q8_K* y) {
 template <int TY>
 void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     const int nb = n / QK_K;
+    if constexpr (TY == 16) {
+        static const int pf_rows = [] {
+            const char* v = std::getenv("STRATA_IQ_PF_ROWS");
+            return v != nullptr ? std::max(0, std::atoi(v)) : 2;
+        }();
+        static const int var = std::getenv("STRATA_IQ2_VAR") ? std::atoi(std::getenv("STRATA_IQ2_VAR")) : 1;
+        for (int r = r0; r < r1; ++r) {
+            const uint8_t* row = w + (size_t) r * row_bytes;
+            const uint8_t* pf = pf_rows > 0 && r + pf_rows < r1 ? row + (size_t) pf_rows * row_bytes : nullptr;
+            for (int t = 0; t < nt; ++t) {
+                const block_q8_K* y = (const block_q8_K*) act[t];
+                const uint8_t* p = t == 0 ? pf : nullptr;
+                out[t][r] = var == 1 ? dot1_iq2_xxs<1>(row, nb, y, p) : var == 2 ? dot1_iq2_xxs<2>(row, nb, y, p)
+                                                                        : dot1_iq2_xxs<0>(row, nb, y, p);
+            }
+        }
+        return;
+    }
     for (int r = r0; r < r1; ++r) {
         const uint8_t* row = w + (size_t) r * row_bytes;
         for (int t = 0; t < nt; ++t) {
@@ -700,11 +800,17 @@ void rows1(const uint8_t* w, size_t row_bytes, int n, const void* const* act, in
 
 }  // namespace
 
-bool iq256_rows1_supported(int type) noexcept { return type == 17 || type == 18 || type == 21 || type == 29; }
+bool iq256_rows1_supported(int type) noexcept {
+    // opt-in: on one core 1.05x ggml's dot, but in the 4-GPU decode with every core and SMT sibling busy no faster
+    // (4 streams, 10,21,33 split: 19.5-19.8 tok/s a stream with it, 20.2-20.8 with ggml's) - STRATA_IQ2XXS_1T=1 tries it
+    static const bool iq2xxs = std::getenv("STRATA_IQ2XXS_1T") != nullptr && std::atoi(std::getenv("STRATA_IQ2XXS_1T")) != 0;
+    return type == 17 || type == 18 || type == 21 || type == 29 || (type == 16 && iq2xxs);
+}
 
 void iq256_rows1(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
-    if (type == 18) rows1<18>(w, row_bytes, n, act, nt, out, r0, r1);
+    if (type == 16) rows1<16>(w, row_bytes, n, act, nt, out, r0, r1);
+    else if (type == 18) rows1<18>(w, row_bytes, n, act, nt, out, r0, r1);
     else if (type == 21) rows1<21>(w, row_bytes, n, act, nt, out, r0, r1);
     else if (type == 29) dot_rows_nt<29>(nt, w, row_bytes, n, act, out, r0, r1);
     else if (type == 17) dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1);

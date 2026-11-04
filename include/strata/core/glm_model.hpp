@@ -746,6 +746,9 @@ public:
     bool mtp_ready() const;
     bool decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
                     int64_t& produced, std::string& err);
+    bool decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max_new, const std::function<bool(int)>& emit,
+                          int64_t& produced, std::string& err);   // the MTP drafts through a pipelined verify window
+                                                                   // over a split (STRATA_GLM_SPEC_WIN, glm_mtp.cu)
     uint64_t mtp_rounds_ = 0;                              // verify passes (spec_steps_ / spec_hits_: drafts, accepted)
     uint64_t mtp_round_n_[9] = {};                         // ... by the draft length the round used
     bool mtp_fill_prev(int32_t token, int64_t p, std::string& err);   // the token path: entry p - 1 from head_x and token
@@ -875,6 +878,15 @@ public:
                           const int* drafts, std::string& err);
     bool mtpw_draft_take(int32_t* out, std::string& err);   // the drafts, conversation after conversation
     uint64_t mtpw_steps_ = 0, mtpw_rows_ = 0;              // (statistics: verify steps and rows, every group)
+    // STRATA_GLM_MTPW_CREWS=1: the group's rows enqueued by the parts' own workers (the host's serial launch chain,
+    // which a row-4 group's round otherwise spends ~80-100 ms on, runs on all the parts at once).  The workers keep
+    // the same per-part body (mtpw_part), gated per row by the previous part's row-hop events; the host only hands the
+    // group to them (mtpw_front/mtpw_back turn into kicks) and waits for the enqueues at the picks.
+    void rows_crew_destroy();                              // (called with mtpw_destroy)
+    void rows_crew_kick(void* job, int k);                 // hand a job to a part's worker's queue
+    bool rows_crew_wait(void* job, int k, std::string& err);   // part k's enqueue of a job done (the host's picks precede)
+    void rows_crew_start(std::string& err);                // one worker a part, before the first kicked group
+    void* rows_crew_ = nullptr;                            // RowsCrew (the crew here, in glm_mtp_rows.cu)
 private:
     struct RowSeq;
     bool rows_bind_win(const int* seqs, const int* counts, int n, RowSeq* rw, std::string& err);

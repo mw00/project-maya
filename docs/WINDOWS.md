@@ -2,8 +2,8 @@
 
 Back to the [README](../README.md).
 
-Experimental: the same installer sets Maya up natively on Windows 10/11 (64-bit), and the engine and the image
-encoder compile there with Visual Studio 2022 and CUDA 12.8 (CUDA 13 works for RTX 20 and newer). Maya is developed
+The same installer sets Maya up natively on Windows 10/11 (64-bit), and the engine and the image encoder
+compile there with Visual Studio 2022 and CUDA 12.8 (CUDA 13 works for RTX 20 and newer). Maya is developed
 and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built with CUDA 13.4 (the speed table above,
 [#63](https://github.com/mw00/project-maya/issues/63)). Tell us how it runs on yours.
 
@@ -68,7 +68,7 @@ and measured on Linux; on Windows 11 a user runs Maya-L on an RTX 4090, built wi
   `START-MAYA.bat` in Windows itself.
 - A Tesla V100 runs it too, built with CUDA 12.4 ([#57](https://github.com/mw00/project-maya/issues/57)). Run
   `--calibrate` once: it tunes Maya for your PC, and a setup for another context keeps its settings.
-- AMD on Windows (more experimental still), Strix Halo / Gorgon Halo included: `START-MAYA.bat --backend hip --gpu 0
+- AMD on Windows, Strix Halo / Gorgon Halo included: `START-MAYA.bat --backend hip --gpu 0
   --setup` builds the HIP engine with AMD's HIP SDK, or offers AMD's ROCm SDK wheels in `.venv` when there is none
   ([docs/AMD_MAYA.md](AMD_MAYA.md#windows)).
   `tools\hip\build_maya_windows.bat` builds it by hand (an RX 7900 XTX,

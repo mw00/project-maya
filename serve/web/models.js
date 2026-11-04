@@ -1,31 +1,49 @@
 // serve/web/models.js - the Models page: the models set up on this machine (the run configs the setup wrote, GET
-// /api/models), the running one marked; switching to another (POST /api/models/switch: Maya starts again with it) and
-// each one's engine settings, edited in its card (POST /api/models/settings - a dry run first for the command they make);
-// and deleting one (POST /api/models/delete: off the list, and with its downloaded files if asked; the running one after a
-// switch to another); and the files in the models folders no model uses (POST /api/models/leftovers deletes one).
+// /api/models), the running one marked; switching to another (POST /api/models/switch: Maya starts again with it);
+// each one's sheet - Overview (its facts), Engine (its engine settings: POST /api/models/settings, a dry run first for
+// the command they make; the running model's context size alone reloads in place, as Settings > Chat defaults does) and
+// Storage (what deleting it frees and what stays because another model uses it); deleting one (POST /api/models/delete:
+// off the list, and with its downloaded files - ticked - the dialog naming them and the GB freed; the running one only
+// after a switch to another); and the files in the models folders no model uses (POST /api/models/leftovers deletes one).
 import {html, useEffect, useRef} from "./preact.js";
 import {api, ctxfmt, esc, fmt, isPhone, modelName, relTime} from "./lib.js";
 import {S, confirmDialog, copyText, emit, toast} from "./state.js";
-import {newChat} from "./chats.js";
+import {estimateTokens, newChat} from "./chats.js";
 import {setSide, showView} from "./sidebar.js";
-import {GLM_KV_BYTES, ctxHint, ctxStopsIn, loadCtxInfo} from "./server.js";
+import {GLM_KV_BYTES, confirmContext, ctxHint, ctxStopsIn, loadCtxInfo} from "./server.js";
 import {CtxSlider, Icon, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 import {tr, languageChoice} from "./i18n.js";
 
-// the page's own state (beside S: nothing else reads it but the model menu's count)
-export const MS = {data: null, err: null, add: false, details: {}, edit: null, draft: null, tab: 0, preview: null,
-                   check: "", saving: false, restart: null, del: null, gone: null, cat: null, catErr: null, loadBusy: null};
+// the page's own state (beside S: nothing else reads it but the model menu's count).  sheet: the model sheet open
+// ({file, tab: overview / engine / storage, from: the button}); plans: each model's files, as deleting it would go
+// (the delete's dry run); want: the sheet to open on the running model once the list is read (Settings' link)
+export const MS = {data: null, err: null, add: false, edit: null, draft: null, tab: 0, preview: null, sheet: null, plans: {},
+                   want: null, check: "", saving: false, restart: null, del: null, gone: null, cat: null, catErr: null, loadBusy: null};
 
 export async function loadModels() {
   try {
     MS.data = await api("api/models");
     MS.err = null;
+    MS.plans = {};                                     // (read again when a Storage tab or a Delete asks)
     saidDeleted(MS.data.deleted);
+    if (MS.want) {
+      const m = MS.data.models.find((x) => x.running), tab = MS.want;
+      MS.want = null;
+      if (m) openSheet(m, tab);
+    }
   } catch (e) {
     MS.err = e.message;
   }
   emit();
   return MS.data;
+}
+
+// Settings > Chat defaults' link: the Models page, the running model's sheet on its Engine settings
+export function openModelSheet(tab = "engine") {
+  const m = MS.data && MS.data.models.find((x) => x.running);
+  if (m) openSheet(m, tab);
+  else MS.want = tab;
+  showView("models");
 }
 
 // the model that was running, deleted by the server after the switch (said once a start, not on every visit)
@@ -40,7 +58,6 @@ function saidDeleted(x) {
                   folder: null, users: x.drafter_users || []};
 }
 
-const MONO = "ui-monospace, 'SF Mono', Menlo, Consolas, monospace";
 const dateLocale = () => languageChoice() === "zh-CN" ? "zh-CN" : "en";
 const titleOf = (m) => `${modelName(m.model)} ${m.quant}`;
 const DRAFTS = {mtp: "MTP", dflash2: "DFlash2", dspark: "DSpark", none: "off"};
@@ -118,9 +135,45 @@ async function loadOrUnload(op) {
   await loadModels();
 }
 
-// ------------------------------------------------------------------ the engine settings (one card's, as a draft)
+// ------------------------------------------------------------------ a model's sheet: Overview, Engine, Storage
+// (the engine settings a draft while the sheet is open: Cancel, Close or Esc drop it)
+const SHEET_TABS = [{id: "overview", label: "Overview"}, {id: "engine", label: "Engine"}, {id: "storage", label: "Storage"}];
+function openSheet(m, tab) {
+  MS.sheet = {file: m.file, tab: tab === "engine" && !m.ok ? "overview" : tab, from: document.activeElement};
+  if (m.ok) openEditor(m);
+  if (MS.sheet.tab === "storage") loadPlan(m);
+  emit();
+}
+function closeSheet() {
+  const s = MS.sheet;
+  if (!s || MS.saving) return;
+  MS.sheet = null;
+  closeEditor();
+  if (s.from && s.from.focus && document.contains(s.from)) s.from.focus();
+}
+function sheetTab(m, tab) {
+  MS.sheet.tab = tab;
+  if (tab === "storage") loadPlan(m);
+  emit();
+}
+
+// a model's files as deleting it would go (the delete's dry run: nothing deleted), for its Storage tab and the dialog
+async function loadPlan(m, again = false) {
+  if (MS.plans[m.file] && !again) return MS.plans[m.file];
+  MS.plans[m.file] = {loading: true, items: [], shared: [], kept: []};
+  let p;
+  try {
+    p = await api("api/models/delete", {method: "POST", body: {file: m.file, files: true, dry_run: true}});
+  } catch (e) {
+    p = {ok: false, why: e.message, items: [], shared: [], kept: []};
+  }
+  MS.plans[m.file] = p;
+  emit();
+  return p;
+}
+
+// ------------------------------------------------------------------ the engine settings (the sheet's Engine tab, a draft)
 function openEditor(m) {
-  if (MS.edit === m.file) { closeEditor(); return; }
   MS.edit = m.file;
   MS.draft = JSON.parse(JSON.stringify(m.settings));
   MS.tab = 0;
@@ -182,7 +235,8 @@ async function saveSettings(m) {
   emit();
   try {
     const out = await api("api/models/settings", {method: "POST", body: {file: m.file, settings: toSend(MS.draft)}});
-    closeEditor();
+    MS.saving = false;
+    closeSheet();
     if (out.restarts) { watchRestart({why: "settings", file: m.file, name: titleOf(m)}); return; }
     toast("success", tr("Engine settings saved"), m.running
       ? tr("Saved into {file}. They apply from Maya's next start (./maya.sh or START-MAYA.bat starts it again by itself).", {file: m.file})
@@ -195,6 +249,13 @@ async function saveSettings(m) {
     MS.saving = false;
     emit();
   }
+}
+
+// the running model's context size alone: reloaded in place (POST /api/context, saved into its config), the same as
+// Settings > Chat defaults > Context size - one setting in two places
+async function reloadContext(n) {
+  const tokens = S.ctx && S.ctx.tokens != null ? S.ctx.tokens : S.current ? estimateTokens(S.current.messages) : 0;
+  if (await confirmContext(n, tokens)) closeSheet();
 }
 
 const whole = (v) => v === "" || v == null || /^\s*\d+\s*$/.test(String(v));
@@ -239,7 +300,7 @@ function AutoOr({label, k, d, dflt, unit, subLabel}) {
       on=${(v) => setDraft({[k]: v})}/></div>` : null};
 }
 
-// the Context size: Settings > Model's slider (ui.js' CtxSlider) over this model's own range (up to the context it was
+// the Context size: Settings > Chat defaults's slider (ui.js' CtxSlider) over this model's own range (up to the context it was
 // trained for: GET /api/models' context_range), with the same line under it (server.js' ctxHint). `cost`: the cache's
 // bytes per token as the draft sets it (ctxHint's win / whole / ram / vram); `keys`: the settings that change it - while
 // none does, the running model's line is the engine's own measurement, as in Settings
@@ -248,6 +309,7 @@ function contextRow(m, d, ch, cost, keys = [], extra = null) {
   const n = Number(d.context), now = Number(s.context), stops = ctxStopsIn(r, now, n);
   const warn = [n !== now && n > r.tested ? tr("Beyond {context} is untested on this engine.", {context:ctxfmt(r.tested)}) : null, extra].filter(Boolean).join(" ");
   return html`<${Row} label=${tr("Context size")} flag="--max-context" changed=${ch("context")} warn=${warn || null}
+    hint=${m.running ? tr("The same setting as Settings › Chat defaults › Context size: changed alone, the model reloads with it in place.") : null}
     below=${html`<${CtxSlider} id=${`mdl-ctx-${m.file}`} label="" value=${n} now=${now} stops=${stops}
       hint=${ctxHint(n, {live: m.running && !ch(...keys), now, ...cost})} onChange=${(v) => setDraft({context: v})}/>`}/>`;
 }
@@ -481,8 +543,6 @@ function Command({c, saved}) {
 
 function Editor({m}) {
   const d = MS.draft, s = m.settings;
-  const ref = useRef(null);
-  useEffect(() => { const el = ref.current; if (el && el.scrollIntoView) el.scrollIntoView({block: "nearest", behavior: "smooth"}); }, []);
   if (!d) return null;
   const rows = d.envRows || Object.entries(d.env || {});
   const setEnv = (r) => setDraft({envRows: r});
@@ -495,6 +555,8 @@ function Editor({m}) {
   const bad = Object.entries(d).some(([k, v]) => (NUMS.includes(k) && !whole(v)) || (DECS.includes(k) && !decimal(v)));
   const canSave = changed.length > 0 && !bad && !MS.check && !MS.saving && !MS.restart;
   const restarts = m.running && MS.data.restarts;
+  // (the running model's context size alone, on a server that reloads it in place: Settings' reload, not a restart)
+  const ctxOnly = m.running && changed.length === 1 && changed[0] === "context" && !envChanged && !!S.ctxInfo && !S.reload;
   const tabDot = (t) => (t.adv ? envChanged : t.rows.some((r) => r && r.props && r.props.changed));
   const tabWarn = (t) => !t.adv && t.rows.some((r) => r && r.props && r.props.warn);
   const keysOf = (e) => {
@@ -505,7 +567,7 @@ function Editor({m}) {
     setTimeout(() => { const b = e.currentTarget && e.currentTarget.querySelector('[aria-selected="true"]'); if (b) b.focus(); }, 0);
   };
   const id = `mdl-${m.file.replace(/[^a-z0-9]/gi, "-")}`;
-  return html`<div class="mdl-edit" ref=${ref} role="region" aria-label=${tr("Engine settings for {model}", {model: titleOf(m)})}>
+  return html`<div class="mdl-edit" role="region" aria-label=${tr("Engine settings for {model}", {model: titleOf(m)})}>
     <div class="mdl-edit__head"><h3>${tr("Engine settings")}</h3><code>${m.file}</code></div>
     <div class="mdl-tabs" role="tablist" aria-label=${tr("Engine settings")} onKeyDown=${keysOf}>
       ${tabs.map((t, i) => html`<button type="button" role="tab" id=${`${id}-t${i}`} aria-controls=${`${id}-p`} aria-selected=${String(i === tab)}
@@ -531,7 +593,9 @@ function Editor({m}) {
       : tabs[tab].rows}
     </div>
     ${MS.check ? html`<div class="mdl-warn mdl-warn--err" role="alert">${MS.check}</div>` : null}
-    ${changed.length ? html`<p class="mdl-note">${restarts
+    ${changed.length ? html`<p class="mdl-note">${ctxOnly
+      ? tr("The model reloads with a {context} context in place (a few minutes), as Settings › Chat defaults does; {file} keeps it for the next start too.", {context:ctxfmt(sent.context),file:m.file})
+      : restarts
       ? tr("Maya starts again with these settings after the answer being written; the model loads again (a few minutes). The settings before stay in {file}.prev.", {file: m.file})
       : m.running ? tr("Saved into {file}; they apply from Maya's next start (this server was not started by maya.sh or START-MAYA.bat).", {file: m.file})
       : tr("Saved into {file}; {model} starts with them when you switch to it.", {file: m.file, model: titleOf(m)})}</p>` : null}
@@ -540,9 +604,11 @@ function Editor({m}) {
       <button type="button" class="btn btn--ghost btn--sm mdl-link" onClick=${() => { MS.draft = JSON.parse(JSON.stringify(m.setup)); setDraft({}); }}
         disabled=${same(toSend(d), toSend(m.setup))}><${Icon} name="undo" sm/>${tr("Reset to the setup's values")}</button>
       <span class="mdl-grow"></span>
-      <button type="button" class="btn btn--secondary" onClick=${closeEditor}>${tr("Cancel")}</button>
-      <button type="button" class="btn btn--primary" disabled=${!canSave} onClick=${() => saveSettings(m)}>
-        ${MS.saving ? tr("Saving…") : restarts ? tr("Save and restart") : tr("Save")}</button>
+      <button type="button" class="btn btn--secondary" onClick=${closeSheet}>${tr("Cancel")}</button>
+      ${ctxOnly ? html`<button type="button" class="btn btn--primary" disabled=${!canSave} onClick=${() => reloadContext(sent.context)}>
+          ${tr("Reload with {context}", {context:ctxfmt(sent.context)})}</button>`
+        : html`<button type="button" class="btn btn--primary" disabled=${!canSave} onClick=${() => saveSettings(m)}>
+        ${MS.saving ? tr("Saving…") : restarts ? tr("Save and restart") : tr("Save")}</button>`}
     </div>
   </div>`;
 }
@@ -559,17 +625,29 @@ const and = (xs) => (xs.length > 1
 // the models the running one can be switched to before it is deleted (the most recently used first)
 const startable = () => (MS.data ? MS.data.models.filter((x) => !x.running && x.ok) : []);
 
+// why a model's Delete is off, said beside it (null: it can be deleted). The running one: only by switching to another
+// model first (Maya deletes it at the next start, once nothing runs from it); never while it is loaded.
+function deleteBlock(m) {
+  if (MS.restart) return tr("Maya is starting again: delete when it is back.");
+  if (!m.running) return null;
+  if (!MS.data.restarts) return tr("It is the model running now. This server cannot switch by itself: start Maya with another model, then delete this one.");
+  if (!startable().length) return tr("It is the model running now, and no other model here can start instead: set up another one first.");
+  return null;
+}
+
 async function askDelete(m) {
-  const d = {m, plan: null, files: false, then: m.running ? (startable()[0] || {}).file || null : null, busy: false,
-             err: null, from: document.activeElement};
+  if (deleteBlock(m)) return;
+  const d = {m, plan: MS.plans[m.file] && !MS.plans[m.file].loading ? MS.plans[m.file] : null, files: false,
+             then: m.running ? (startable()[0] || {}).file || null : null, busy: false, err: null, from: document.activeElement};
+  d.files = !!(d.plan && d.plan.ok && d.plan.items.length);   // (Delete frees the disk: its files ticked, named first)
   MS.del = d;
   emit();
-  try {
-    d.plan = await api("api/models/delete", {method: "POST", body: {file: m.file, files: true, dry_run: true}});
-  } catch (e) {
-    d.plan = {ok: false, why: e.message, items: []};
-  }
-  if (MS.del === d) emit();
+  if (d.plan) return;
+  const p = await loadPlan(m, true);
+  if (MS.del !== d) return;
+  d.plan = p;
+  d.files = !!(p.ok && p.items.length);
+  emit();
 }
 
 function closeDelete() {
@@ -590,14 +668,14 @@ async function deleteModel() {
     const out = await api("api/models/delete", {method: "POST", body: {file: d.m.file, files: d.files, then: d.then}});
     if (out.deleting) {                              // (the running one: Maya switches, the next start deletes it)
       MS.del = null;
+      MS.sheet = null;
+      closeEditor();
       watchRestart({why: "switch", file: out.to, name: nameOf(out.to)});
       return;
     }
-    MS.gone = {name: titleOf(d.m), files: d.files, freed: out.freed, folder: d.m.folder,
-               users: (out.drafter_users || []).map(nameOf)};
+    MS.gone = {name: titleOf(d.m), files: d.files, freed: out.freed, folder: d.m.folder, users: []};
     MS.del = null;
-    if (MS.edit === d.m.file) closeEditor();
-    delete MS.details[d.m.file];
+    if (MS.sheet && MS.sheet.file === d.m.file) { MS.sheet = null; closeEditor(); }
     await loadModels();
     const h = document.querySelector(".mdl__page h1");
     if (h) { h.tabIndex = -1; h.focus(); }         // (its card is gone: the keyboard goes to the page's top)
@@ -615,7 +693,31 @@ function filesSaid(p) {
   if (p.pack) parts.push(p.gguf ? tr("the pack Maya built from them") : tr("the pack Maya built"));
   if (p.vision) parts.push(tr("its image encoder"));
   if (p.drafter != null) parts.push(tr("its DFlash2 drafter ({size})", {size: bytes(p.drafter)}));
-  return parts.length ? `${parts.join("、")}。` : "";
+  if (languageChoice() === "zh-CN") return parts.length ? `${parts.join("、")}。` : "";
+  const said = and(parts);
+  return said ? said[0].toUpperCase() + said.slice(1) + "." : "";
+}
+
+// what deleting it deletes (each folder or file, its size) and what stays because another model uses it
+const GOES = {folder: "Its folder", pack: "The pack Maya built", gguf: "A model file", vision: "Its image encoder", drafter: "Its DFlash2 drafter"};
+const STAYS = {folder: "The folder", pack: "The pack", vision: "The image encoder", drafter: "The DFlash2 drafter"};
+const baseName = (p) => String(p).split(/[\\/]/).filter(Boolean).pop() || String(p);
+function PlanList({p}) {
+  const shared = p.shared || [];
+  return html`${p.items.length ? html`<ul class="mdl-files" aria-label=${tr("Deleted with it")}>${p.items.map((i) => html`<li key=${i.path}>
+      <${Icon} name=${i.what === "folder" ? "folder" : "disk"} sm/>
+      <span class="mdl-files__text"><span><b>${baseName(i.path)}</b> · ${Object.hasOwn(GOES, i.what) ? tr(GOES[i.what]) : i.what}</span><code>${i.path}</code></span>
+      <b class="mdl-files__size">${bytes(i.bytes)}</b></li>`)}</ul>` : null}
+    ${shared.length ? html`<div class="mdl-files__cap">${tr(shared.length > 1 ? "Kept: another model uses them" : "Kept: another model uses it")}</div>
+      <ul class="mdl-files mdl-files--kept" aria-label=${tr("Kept, another model uses them")}>${shared.map((s) => {
+        const users = and((s.users || []).map(nameOf));
+        return html`<li key=${`${s.what}:${s.path}`}><${Icon} name=${s.what === "folder" ? "folder" : "disk"} sm/>
+          <span class="mdl-files__text"><span><b>${s.what === "gguf" ? tr(s.files === 1 ? "{count} model file" : "{count} model files", {count:s.files}) : Object.hasOwn(STAYS, s.what) ? tr(STAYS[s.what]) : s.what}</b>
+            ${" "}· ${tr((s.users || []).length > 1 ? (s.what === "gguf" && s.files > 1 ? "{models} use them too" : "{models} use it too") : (s.what === "gguf" && s.files > 1 ? "{models} uses them too" : "{models} uses it too"), {models:users})}</span><code>${s.path}</code></span>
+          <span class="mdl-files__size">${tr("stays")}</span></li>`;
+      })}</ul>` : null}
+    ${p.linked ? html`<p class="mdl-del__note">${tr(p.linked === 1 ? "{count} file in it is a hard link of another model's copy: deleting it frees nothing, and that copy stays (not counted above)." : "{count} files in it are hard links of another model's copy: deleting them frees nothing, and that copy stays (not counted above).", {count:p.linked})}</p>` : null}
+    ${(p.kept || []).map((k) => html`<p class="mdl-del__note">${k}</p>`)}`;
 }
 
 function DeleteDialog() {
@@ -628,7 +730,6 @@ function DeleteDialog() {
   const m = d.m, p = d.plan;
   const can = !!(p && p.ok && p.items.length);
   const files = can && d.files;
-  const users = (p && p.drafter_users || []).map(nameOf);
   const to = m.running ? startable() : [];
   const keys = (e) => {
     if (e.key === "Tab") trapTab(e, box.current);
@@ -641,7 +742,7 @@ function DeleteDialog() {
       <div class="dialog__body">
         <p>${tr("Maya takes it off this list: its config")} <code>${m.file}</code>${m.script ? html`${tr("and its start script")} <code>${m.script}</code>` : null}. ${tr("Your chats stay.")}</p>
         ${m.running ? html`<div class="mdl-del__to" role="radiogroup" aria-labelledby="mdl-del-to">
-          <p id="mdl-del-to">${tr("It is running now. Maya switches to another model first (a few minutes), then deletes it:")}</p>
+          <p id="mdl-del-to">${tr("It is running now, so it is not deleted while it is loaded: Maya switches to another model first (a few minutes), then deletes it:")}</p>
           ${to.map((x) => html`<button type="button" role="radio" aria-checked=${String(d.then === x.file)} key=${x.file} disabled=${d.busy}
             class=${`mdl-del__box mdl-del__box--radio${d.then === x.file ? " is-on" : ""}`} onClick=${() => { d.then = x.file; emit(); }}>
             <span class="mdl-del__check" aria-hidden="true"></span>
@@ -652,18 +753,90 @@ function DeleteDialog() {
               <span class="mdl-del__check" aria-hidden="true">${files ? html`<${Icon} name="check" sm/>` : null}</span>
               <span class="mdl-del__text">
                 <span class="mdl-del__top"><b>${tr("Also delete its downloaded files")}</b><b class="mdl-del__size">${bytes(p.bytes)}</b></span>
-                <code>${p.folder}</code>
-                <span>${filesSaid(p)}${users.length ? "" : ` ${tr("No other model uses them.")}`}</span></span></button>`
-          : html`<p class="mdl-del__note">${p.ok ? tr("Its files are not on this PC any more.") : tr("Its files stay: {reason}.", {reason: p.why})}</p>`}
-        ${can ? (p.kept || []).map((k) => html`<p class="mdl-del__note">${k}</p>`) : null}
-        ${can && users.length ? html`<p class="mdl-del__note">${tr(users.length > 1 ? "{models} draft with the same DFlash2 drafter: with its files deleted, they draft with MTP until the setup downloads it again." : "{models} drafts with the same DFlash2 drafter: with its files deleted, it drafts with MTP until the setup downloads it again.", {models: users.join("、")})}</p>` : null}
-        ${files ? html`<div class="mdl-warn">${tr(p.gguf ? "This cannot be undone. To use this model again, the setup downloads its {size} again." : "This cannot be undone. To use this model again, the setup builds its pack again.", {size: bytes(p.bytes)})}</div>` : null}
+                <span>${filesSaid(p)}${(p.shared || []).length ? "" : ` ${tr("No other model uses them.")}`}</span></span></button>`
+          : html`<p class="mdl-del__note">${p.ok ? tr("Its files are not on this PC any more.") : tr("Its files stay: {reason}.", {reason:p.why})}</p>`}
+        ${p && p.ok ? html`<${PlanList} p=${p}/>` : null}
+        ${files ? html`<div class="mdl-warn">${tr(p.gguf ? "This cannot be undone. To use this model again, the setup downloads its {size} again." : "This cannot be undone. To use this model again, the setup builds its pack again.", {size:bytes(p.bytes)})}</div>` : null}
         ${d.err ? html`<div class="mdl-warn mdl-warn--err" role="alert">${d.err}</div>` : null}
       </div>
       <div class="dialog__actions">
         <button type="button" class="btn btn--secondary" disabled=${d.busy} onClick=${closeDelete}>${tr("Cancel")}</button>
         <button type="button" class="btn btn--danger" disabled=${d.busy || !p || (m.running && !d.then)} onClick=${deleteModel}>
           ${d.busy ? (m.running ? tr("Switching…") : tr("Deleting…")) : m.running ? (files ? tr("Switch, then delete it and {size}", {size: bytes(p.bytes)}) : tr("Switch, then delete it from the list")) : (files ? tr("Delete it and {size}", {size: bytes(p.bytes)}) : tr("Delete it from the list"))}</button>
+      </div>
+    </div></div>`;
+}
+
+// ------------------------------------------------------------------ the sheet
+function Overview({m}) {
+  const about = [m.backend === "hip" ? "HIP" : "CUDA", size(m.size), setUpOn(m.written)].filter(Boolean).join(" · ");
+  const facts = [["Config", m.path, true], ["Start script", m.script ? `./${m.script}` : "–", !!m.script], ["Model folder", m.folder || "–", true],
+                 ["Port", m.port ? String(m.port) : "8080"], ["API model name", m.model, true],
+                 ["Last used", m.running ? tr("running now") : m.used ? tr(relTime(m.used * 1000, dateLocale())) : tr("not yet")]];
+  return html`<div class="mdl-sheet__sec">
+    ${m.missing ? html`<div class="mdl-warn">${tr("It can't start: {reason}. Run the setup again to repair it (", {reason:m.missing})}<code>./maya.sh --setup</code>).</div>` : null}
+    <dl class="mdl-facts">${[["Setup", about], ...facts].map(([k, v, mono]) => html`<dt>${tr(k)}</dt><dd class=${mono ? "mdl-mono-dd" : ""}>${v}</dd>`)}</dl>
+  </div>`;
+}
+
+function Storage({m}) {
+  const p = MS.plans[m.file], why = deleteBlock(m), L = MS.data && MS.data.leftovers;
+  const toLeft = () => {
+    closeSheet();
+    setTimeout(() => { const el = document.getElementById("mdl-left"); if (el) { el.scrollIntoView({block: "start", behavior: "smooth"}); el.focus(); } }, 0);
+  };
+  return html`<div class="mdl-sheet__sec">
+    ${!p || p.loading ? html`<p class="mdl-del__note" role="status">${tr("Looking at its files…")}</p>`
+      : !p.ok ? html`<p class="mdl-del__note">${tr("Deleting it takes it off the list only. Its files stay: {reason}.", {reason:p.why})}</p>`
+      : html`<p class="mdl-sheet__lead">${p.items.length > 1 ? html`${tr("Deleting it with its files frees ")}<b>${bytes(p.bytes)}</b>${tr(" on the disk:")}`
+          : p.items.length ? tr("Deleting it with its files frees this on the disk:")
+          : tr("Its files are not on this PC any more: deleting it takes it off the list.")}</p>
+        <${PlanList} p=${p}/>`}
+    <div class="mdl-sheet__del">
+      <button type="button" class="btn btn--danger" aria-haspopup="dialog" disabled=${!!why} aria-describedby=${why ? "mdl-del-why" : undefined}
+        onClick=${() => askDelete(m)}><${Icon} name="trash" sm/>${tr("Delete {model}", {model:titleOf(m)})}</button>
+      ${why ? html`<span id="mdl-del-why" class="mdl-del__note">${why}</span>` : null}
+    </div>
+    ${L && L.items && L.items.length ? html`<button type="button" class="btn btn--ghost btn--sm mdl-link" onClick=${toLeft}>
+      ${tr("Files no model uses: {size}", {size:bytes(L.bytes)})}<${Icon} name="chevron-right" sm/></button>` : null}
+  </div>`;
+}
+
+function Sheet() {
+  const box = useRef(null);
+  const s = MS.sheet, m = s && MS.data && MS.data.models.find((x) => x.file === s.file);
+  useEffect(() => {
+    setTimeout(() => { const b = box.current && box.current.querySelector('.mdl-sheet__tabs [aria-selected="true"]'); if (b) b.focus(); }, 0);
+  }, []);
+  if (!m) return null;
+  const tabs = SHEET_TABS.map((t) => ({...t, off: t.id === "engine" && !m.ok}));
+  const keys = (e) => {
+    if (MS.del) return;                              // (the delete dialog over it has the keyboard)
+    if (e.key === "Tab") trapTab(e, box.current);
+    else if (e.key === "Escape" && !e.defaultPrevented) { e.stopPropagation(); closeSheet(); }
+  };
+  const tabKeys = (e) => {
+    if (!["ArrowRight", "ArrowLeft"].includes(e.key)) return;
+    e.preventDefault();
+    const on = tabs.filter((t) => !t.off), i = on.findIndex((t) => t.id === s.tab);
+    sheetTab(m, on[(i + (e.key === "ArrowRight" ? 1 : -1) + on.length) % on.length].id);
+    setTimeout(() => { const b = box.current && box.current.querySelector('.mdl-sheet__tabs [aria-selected="true"]'); if (b) b.focus(); }, 0);
+  };
+  const r = MS.restart, stopping = m.running && r && r.why === "switch", restarting = m.running && r && r.why === "settings";
+  const pill = m.running ? html`<span class=${`pill pill--${stopping ? "warn" : restarting || MS.loadBusy ? "info" : MS.data.loaded ? "accent" : "warn"}`}>
+      <i class="status__dot"></i>${tr(stopping ? "Stopping…" : restarting ? "Restarting…" : MS.loadBusy ? "Loading…" : MS.data.loaded ? "Running" : "Unloaded")}</span>`
+    : !m.ok ? html`<span class="pill pill--warn">${tr(m.missing && m.missing.startsWith("its model files") ? "Files missing" : "Incomplete")}</span>` : null;
+  return html`<div class="dialog-scrim mdl-sheet-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) closeSheet(); }}>
+    <div ref=${box} class="dialog mdl-sheet" role="dialog" aria-modal="true" aria-labelledby="mdl-sheet-title" onKeyDown=${keys}>
+      <div class="dialog__head mdl-sheet__head"><${ModelLogo} model=${m.model} size=${40}/>
+        <span class="mdl-sheet__name"><h2 id="mdl-sheet-title">${modelName(m.model)}</h2><span class="mdl-badge">${m.quant}</span></span>
+        ${pill}<button type="button" class="icon-btn dialog__close" aria-label=${tr("Close")} onClick=${closeSheet}><${Icon} name="close"/></button></div>
+      <div class="mdl-tabs mdl-sheet__tabs" role="tablist" aria-label=${`${titleOf(m)}`} onKeyDown=${tabKeys}>
+        ${tabs.map((t) => html`<button type="button" role="tab" id=${`mdl-sheet-t-${t.id}`} aria-controls="mdl-sheet-p" aria-selected=${String(t.id === s.tab)}
+          tabIndex=${t.id === s.tab ? 0 : -1} disabled=${t.off} title=${t.off ? tr("It can't start: its files are missing") : undefined}
+          onClick=${() => sheetTab(m, t.id)}>${tr(t.label)}</button>`)}</div>
+      <div class="dialog__body mdl-sheet__body" role="tabpanel" id="mdl-sheet-p" aria-labelledby=${`mdl-sheet-t-${s.tab}`}>
+        ${s.tab === "engine" ? html`<${Editor} m=${m} key=${m.file}/>` : s.tab === "storage" ? html`<${Storage} m=${m}/>` : html`<${Overview} m=${m}/>`}
       </div>
     </div></div>`;
 }
@@ -723,7 +896,8 @@ function Download() {
     const mine = p && p.model === c.id && (busy || p.state === "error");
     const pct = mine && p.percent != null ? p.percent : null;
     return html`<div class="mdl-dl" key=${c.id}>
-      <span class="mdl-dl__name"><b>${c.name}</b><span>${c.size_gb ? tr("about {size} GB", {size: fmt(c.size_gb, 0)}) : tr("size shown when it starts")}</span></span>
+      <span class="mdl-dl__name"><b>${c.name}</b><span>${[c.group === "other" && c.by ? tr("by {maker}", {maker:c.by}) : "",
+        c.size_gb ? tr("about {size} GB", {size:fmt(c.size_gb, 0)}) : tr("size shown when it starts"), c.note || ""].filter(Boolean).join(" · ")}</span></span>
       ${c.installed ? html`<span class="pill pill--accent">${tr("Installed")}</span>`
         : mine && busy ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${cancelPull}>${tr("Cancel")}</button>`
         : html`<button type="button" class="btn btn--secondary btn--sm" disabled=${busy} onClick=${() => startPull(c)}><${Icon} name="download" sm/>${tr("Download")}</button>`}
@@ -737,7 +911,11 @@ function Download() {
   return html`<section class="card mdl-add" aria-label=${tr("Download a model")}>
     <b>${tr("Download a model")}</b>
     <span>${tr("The setup's own download: it resumes where it stopped, checks every file's sha256, then builds the pack and writes the model's config, which appears in the list.")}</span>
-    ${MS.catErr ? html`<div class="mdl-warn mdl-warn--err" role="alert">${MS.catErr}</div>` : !C ? html`<span role="status">${tr("Reading the catalog…")}</span>` : C.models.map(row)}
+    ${MS.catErr ? html`<div class="mdl-warn mdl-warn--err" role="alert">${MS.catErr}</div>` : !C ? html`<span role="status">${tr("Reading the catalog…")}</span>`
+      : html`${C.models.filter((c) => c.group !== "other").map(row)}
+        ${C.models.some((c) => c.group === "other") ? html`<b class="mdl-add__group">${tr("Other quants")}</b>
+          <span>${tr("Files by other makers that the setup also downloads and runs: the same download, checks and pack.")}</span>
+          ${C.models.filter((c) => c.group === "other").map(row)}` : null}`}
   </section>`;
 }
 
@@ -758,7 +936,7 @@ async function deleteLeftover(x) {
 
 function Leftovers({L}) {
   if (!L || !L.items || !L.items.length) return null;
-  return html`<section class="card mdl-left" aria-labelledby="mdl-left-title">
+  return html`<section class="card mdl-left" id="mdl-left" tabIndex="-1" aria-labelledby="mdl-left-title">
     <div class="mdl-left__head"><b id="mdl-left-title">${tr("Files no model uses")}</b><b class="mdl-del__size">${bytes(L.bytes)}</b></div>
     <span class="mdl-left__sub">${tr("In {folders}, and no model on this list runs from them: a model deleted by hand, or set up again somewhere else. Maya may not have downloaded all of them, so look before you delete.", {folders: and(L.folders)})}</span>
     <ul class="mdl-left__list">${L.items.map((x) => html`<li key=${x.path}>
@@ -772,14 +950,13 @@ function Leftovers({L}) {
 
 // ------------------------------------------------------------------ a model's card
 function Card({m}) {
-  const s = m.settings, open = !!MS.details[m.file], editing = MS.edit === m.file, r = MS.restart;
+  const s = m.settings, r = MS.restart, sheet = MS.sheet && MS.sheet.file === m.file ? MS.sheet.tab : null;
   const stopping = m.running && r && r.why === "switch", restarting = m.running && r && r.why === "settings";
   const loading = r && r.why === "switch" && r.file === m.file;
   const chips = [[tr("Context"), ctxfmt(s.context)], [tr("Draft"), DRAFTS[s.draft] ? tr(DRAFTS[s.draft]) : s.draft], [tr("GPUs"), s.gpus.join(", ") || "–"],
                  [tr("Images"), s.images ? tr("on") : tr("off")], ...(s.parallel > 1 ? [[tr("At once"), String(s.parallel)]] : [])];
   const about = [m.backend === "hip" ? "HIP" : "CUDA", size(m.size), setUpOn(m.written)].filter(Boolean).join(" · ");
-  const facts = [[tr("Config"), m.path, true], [tr("Start script"), m.script ? `./${m.script}` : "–", !!m.script], [tr("Model folder"), m.folder || "–", true],
-                 ["Port", m.port ? String(m.port) : "8080"], [tr("API model name"), m.model, true]];
+  const why = deleteBlock(m);
   return html`<section class=${`card mdl-card${m.running ? " is-running" : ""}${loading ? " is-loading" : ""}`} aria-label=${titleOf(m)}>
     <div class="mdl-card__head">
       <${ModelLogo} model=${m.model} size=${44}/>
@@ -800,22 +977,27 @@ function Card({m}) {
         ${m.running ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${() => showView("monitor")}><${Icon} name="activity" sm/>${tr("Monitor")}</button>` : null}
         ${m.running && MS.data.can_unload && !r ? html`<button type="button" class="btn btn--ghost btn--sm" disabled=${!!MS.loadBusy}
           onClick=${() => loadOrUnload(MS.data.loaded ? "unload" : "load")}><${Icon} name=${MS.data.loaded ? "stop" : "refresh"} sm/>${MS.data.loaded ? tr("Unload") : tr("Load")}</button>` : null}
-        <button type="button" class=${`btn btn--ghost btn--sm${editing ? " is-on" : ""}`} aria-expanded=${String(editing)} disabled=${!m.ok}
-          onClick=${() => openEditor(m)}><${Icon} name="sliders" sm/>${tr("Engine settings")}</button>
-        <button type="button" class="btn btn--ghost btn--sm" aria-expanded=${String(open)} onClick=${() => { MS.details[m.file] = !open; emit(); }}>
-          ${tr("Details")}<${Icon} name="chevron" sm cls=${`chev${open ? "" : " is-closed"}`}/></button>
-        ${m.running && !(MS.data.restarts && startable().length) ? null : html`<button type="button" class="btn btn--ghost btn--sm" aria-haspopup="dialog"
-          aria-label=${tr("Delete {model}", {model:titleOf(m)})} disabled=${!!r} onClick=${() => askDelete(m)}><${Icon} name="trash" sm/>${tr("Delete")}</button>`}
+        <button type="button" class=${`btn btn--ghost btn--sm${sheet === "engine" ? " is-on" : ""}`} aria-haspopup="dialog" disabled=${!m.ok}
+          onClick=${() => openSheet(m, "engine")}><${Icon} name="sliders" sm/>${tr("Engine settings")}</button>
+        <button type="button" class=${`btn btn--ghost btn--sm${sheet === "overview" ? " is-on" : ""}`} aria-haspopup="dialog"
+          onClick=${() => openSheet(m, "overview")}><${Icon} name="info" sm/>${tr("Details")}</button>
+        <button type="button" class=${`btn btn--ghost btn--sm${sheet === "storage" ? " is-on" : ""}`} aria-haspopup="dialog"
+          onClick=${() => openSheet(m, "storage")}><${Icon} name="disk" sm/>${tr("Storage")}</button>
+        <button type="button" class="btn btn--ghost btn--sm mdl-card__del" aria-haspopup="dialog" aria-label=${tr("Delete {model}", {model:titleOf(m)})}
+          disabled=${!!why} title=${why || tr("Delete {model} and free its disk space", {model:titleOf(m)})} onClick=${() => askDelete(m)}><${Icon} name="trash" sm/>${tr("Delete")}</button>
       </span>
     </div>
-    ${open ? html`<dl class="mdl-facts">${facts.map(([k, v, mono]) => html`<dt>${tr(k)}</dt><dd style=${mono ? `font-family:${MONO}` : ""}>${v}</dd>`)}</dl>` : null}
-    ${editing ? html`<${Editor} m=${m} key=${m.file}/>` : null}
   </section>`;
 }
 
 // ------------------------------------------------------------------ the page
 export function ModelsPage() {
-  useEffect(() => { loadModels(); }, []);
+  useEffect(() => {
+    loadModels();
+    const again = () => loadModels();             // (a context size reloaded from Settings: the configs say it now)
+    window.addEventListener("maya:context", again);
+    return () => window.removeEventListener("maya:context", again);
+  }, []);
   const phone = isPhone(), D = MS.data, r = MS.restart;
   const cmds = [[tr("Linux and macOS"), "./maya.sh --setup"], ["Windows", "START-MAYA.bat --setup"]];
   return html`<main class="mon mdl">
@@ -856,6 +1038,7 @@ export function ModelsPage() {
         ? tr("Switching, or saving the running model's engine settings, starts Maya again through its start script, as a port change does. Each model keeps its own chat settings.")
         : tr("This server was not started by maya.sh or START-MAYA.bat, so it cannot start again by itself: a switch or new settings apply from Maya's next start.")}</span></p>` : null}
     </div></div>
+    ${MS.sheet ? html`<${Sheet} key=${MS.sheet.file}/>` : null}
     ${MS.del ? html`<${DeleteDialog} key=${MS.del.m.file}/>` : null}
   </main>`;
 }

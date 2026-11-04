@@ -3365,8 +3365,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;
-        // the draft head's vocabulary (the one-GPU MTP decode; several conversations drafting, STRATA_GLM_MULTI_MTP)
-        if (mtp_il_ >= 0 && (mtp_one || multi_mtp_setting() > 0)) mtp_vocab_scan(gfs);
+        // the draft head's vocabulary (the one-GPU MTP decode, decode_spec, decode_spec_pipe, STRATA_GLM_MULTI_MTP)
+        if (mtp_il_ >= 0) mtp_vocab_scan(gfs);
     }
 
     // 5. the router bias, host-side: the prefetch ranks the next-best experts per layer, and the

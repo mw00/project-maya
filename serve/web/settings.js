@@ -1,8 +1,12 @@
-// serve/web/settings.js - the Settings dialog: General, Model (the context size and the port: each a restart), Savings
-// (the API prices the sidebar's Saved counts with), Chat defaults (sampling, thinking, shared with other apps), Instructions, Tools (MCP), Connect your tools, Data, About and
-// updates.  A change applies at once; the two that restart the model ask first.
+// serve/web/settings.js - the Settings dialog, its pages in five groups: General (Appearance; Chat defaults:
+// the running model - its context size, also on the Models page's Engine settings, and the port - sampling, thinking,
+// shared with other apps; Global instructions), Integrations (Connect your tools: the OpenAI and Anthropic base URLs, the
+// model's name, the API key and the examples on one page, as in v1.1.52; MCP tools), Usage (the API prices the sidebar's
+// Saved counts with), Privacy (Data) and About (updates).  A change applies at once; the two that restart the model (the
+// context size, the port) ask first.  Each page is inset groups of rows (the grouped look); on a phone the dialog opens
+// on the list of pages and a page has a way back to it.
 import {html, useEffect, useRef, useState} from "./preact.js";
-import {MOD, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
+import {MOD, SUPPORT_URL, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
 import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emit, presetOf, resetPrefs, savePrefs, schemeChoice, setScheme, setTheme,
         themeChoice, thinkTitles, toast} from "./state.js";
 import {usd} from "./sidebar.js";
@@ -10,21 +14,31 @@ import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStop
         budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
 import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
+import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
 import {CtxSlider, Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 import {languageChoice, setLanguage, t, tr} from "./i18n.js";
 
-const SECTIONS = [
-  {id: "general", key: "settings.general", label: "General", icon: "settings"},
-  {id: "model", key: "settings.model", label: "Model", icon: "cpu"},
-  {id: "savings", key: "settings.savings", label: "Savings", icon: "dollar"},
-  {id: "chat", key: "settings.chat", label: "Chat defaults", icon: "gauge"},
-  {id: "instr", key: "settings.instructions", label: "Instructions", icon: "edit"},
-  {id: "tools", key: "settings.tools", label: "Tools", icon: "tool"},
-  {id: "connect", key: "settings.connect", label: "Connect your tools", icon: "link"},
-  {id: "data", key: "settings.data", label: "Data", icon: "disk"},
-  {id: "about", key: "settings.about", label: "About and updates", icon: "info"},
+const GROUPS = [
+  {label: "General", items: [{id: "general", label: "Appearance", icon: "settings"},
+                             {id: "chat", label: "Chat defaults", icon: "gauge"},
+                             {id: "instr", label: "Global instructions", icon: "edit"}]},
+  {label: "Integrations", items: [{id: "connect", label: "Connect your tools", icon: "link"},
+                                  {id: "tools", label: "MCP tools", icon: "tool"}]},
+  {label: "Usage", items: [{id: "savings", label: "Usage and savings", icon: "dollar"}]},
+  {label: "Privacy", items: [{id: "data", label: "Data and privacy", icon: "disk"}]},
+  {label: "About", items: [{id: "about", label: "About and updates", icon: "info"}]},
 ];
+// other names a link or a hash may say: the Model page before the groups (its context size and port are on Chat
+// defaults now), and the revamp's API pages (one page again: Connect your tools)
+const OLD_IDS = {model: "chat", connection: "connect", openai: "connect", anthropic: "connect"};
+
+
+// a page's title and its line under it; an inset group of rows (an optional caption above it, a note under it)
+const Head = ({title, intro, children}) => html`<div class="set-head"><div class="set-head__text"><h3>${title}</h3>
+  ${intro ? html`<p class="set-intro">${intro}</p>` : null}</div>${children}</div>`;
+const Group = ({cap, note, children, cls = ""}) => html`<section class="set-sec">${cap ? html`<span class="set-cap">${cap}</span>` : null}
+  <div class=${`set-group ${cls}`}>${children}</div>${note ? html`<p class="set-foot-note">${note}</p>` : null}</section>`;
 
 const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`set-row ${cls}`}>
   <span class="set-row__text">${htmlFor ? html`<label for=${htmlFor}>${label}</label>` : html`<span class="set-row__label">${tr(label)}</span>`}
@@ -38,7 +52,8 @@ const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", m
 function General() {
   const keys = [["Send", "Enter"], ["New line", "Shift Enter"], ["New chat", `${MOD} Shift O`], ["Search chats", `${MOD} K`],
                 ["Stop the answer", "Esc"], ["Settings", `${MOD} ,`], ["Show or hide the sidebar", `${MOD} Shift S`]];
-  return html`<h3>${t("settings.general", "General")}</h3>
+  return html`<${Head} title=${tr("Appearance")}/>
+    <${Group}>
     <${Row} label=${t("language", "Language")} sub=${t("language-help", "The interface language is saved in this browser. Untranslated text stays in English.")}>
       <${Seg} label=${t("language", "Language")} value=${languageChoice()} onChange=${setLanguage}
         options=${[{id: "en", label: t("english", "English")}, {id: "zh-CN", label: t("simplified-chinese", "Simplified Chinese")}]}/><//>
@@ -51,15 +66,14 @@ function General() {
     <${Row} label=${tr("Show thinking as it's written")} sub=${tr("It folds away into “Thought for …” once the answer starts.")}>
       <${Switch} label=${tr("Show thinking as it's written")} on=${P.show} onChange=${(v) => savePrefs({show: v})}/><//>
     ${isPhone() ? null
-      : html`<div class="set-block"><span class="set-row__label">${tr("Keyboard shortcuts")}</span>
-      <div class="keys">${keys.map(([w, k]) => html`<span class="keys__row"><span>${tr(w)}</span><${Kbd} k=${k}/></span>`)}</div></div>`}`;
+      : html`<${Group} cap=${tr("Keyboard shortcuts")} cls="set-group--keys">
+      ${keys.map(([w, k]) => html`<span class="keys__row"><span>${tr(w)}</span><${Kbd} k=${k}/></span>`)}<//>`}<//>`;
 }
 
-// ------------------------------------------------------------------ Model: the context size and the port
-function Model() {
+// ------------------------------------------------------------------ the running model and its context size (Chat defaults)
+function ModelCtx() {
   const c = S.ctxInfo, stops = ctxStops(), h = S.health, eng = (S.metrics && S.metrics.engine) || {};
-  const [ctx, setCtx] = useState(null), [port, setPort] = useState("");
-  useEffect(() => { if (S.portInfo) setPort(String(S.portInfo.port)); }, [S.portInfo && S.portInfo.port]);
+  const [ctx, setCtx] = useState(null);
   const v = ctx != null && stops[ctx] ? stops[ctx] : c && c.context;
   const changed = c && v !== c.context && !S.reload;
   const e = c ? ctxEstimate(v) : null;
@@ -76,14 +90,12 @@ function Model() {
     if (e && e.ram && e.free != null && e.delta > e.free - 8) warns.push(tr("That takes more RAM than is free now: fewer experts stay in RAM (answers slower), and it may not start (the current size then comes back)."));
     warns.push(`${tr("Reloading takes")} ${loadTime()}${tr("; your chats stay, and other apps are asked to try again meanwhile.")}`);
   }
-  const pi = S.portInfo, pv = /^\d+$/.test(port.trim()) ? +port.trim() : null;
-  const portChanged = pi && pv != null && pv !== pi.port;
   const engine = ENGINES[eng.engine_kind] || eng.engine_kind;
   const reload = async () => {
     const tokens = S.ctx.tokens != null ? S.ctx.tokens : estimateTokens(S.current.messages);
     if (await confirmContext(v, tokens)) setCtx(null);
   };
-  return html`<h3>${t("settings.model", "Model")}</h3>
+  return html`<${Group} cap=${tr("The running model")}>
     <div class="model-card"><${ModelLogo} model=${h.model} size=${36}/>
       <span><b>${modelName(h.model)}</b><span>${[h.model, engine, h.version ? `Project Maya v${h.version}` : ""].filter(Boolean).join(" · ")}</span></span></div>
     ${c ? html`<div class="set-block">
@@ -92,7 +104,19 @@ function Model() {
       ${changed ? html`<div class="callout callout--warn"><span>${warns.join(" ")}</span>
         <button type="button" class="btn btn--primary btn--sm" onClick=${reload}>${tr("Reload with")} ${ctxfmt(v)}</button></div>` : null}
     </div>` : html`<p class="set-note">${tr("This server does not say its context range, so it can't be changed from here.")}</p>`}
-    ${pi && pi.port && pi.saved ? html`
+    ${c ? html`<${Row} label=${tr("Engine settings")} sub=${tr("The context size is on the Models page too, with this model's other engine settings: one setting, the same value.")}>
+      <button type="button" class="btn btn--ghost btn--sm" onClick=${() => { S.settings = null; openModelSheet("engine"); }}>
+        ${tr("Models")}<${Icon} name="chevron-right" sm/></button><//>` : null}
+    <${Port}/><//>`;
+}
+
+// ------------------------------------------------------------------ the port (with the running model): a restart
+function Port() {
+  const [port, setPort] = useState("");
+  useEffect(() => { if (S.portInfo) setPort(String(S.portInfo.port)); }, [S.portInfo && S.portInfo.port]);
+  const pi = S.portInfo, pv = /^\d+$/.test(port.trim()) ? +port.trim() : null;
+  const portChanged = pi && pv != null && pv !== pi.port;
+  return html`${pi && pi.port && pi.saved ? html`
       <${Row} label=${tr("Port")} htmlFor="set-port" sub=${tr("Where this page and the API listen. A new port starts Maya again there, and this page follows.")}>
         <input id="set-port" class="input input--num" inputmode="numeric" value=${port} onInput=${(ev) => setPort(ev.target.value)}/><//>
       ${portChanged ? html`<div class="callout callout--warn">
@@ -147,8 +171,10 @@ function ChatDefaults() {
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? tr("API clients get now: ") + Object.entries(S.shared.now).map(([k, v]) => `${names[k] ? tr(names[k]) : k} ${v}`).join(", ")
     : tr("API clients get them for anything they don't set themselves.");
-  return html`<div class="set-head"><h3>${t("settings.chat", "Chat defaults")}</h3><${TurboButton}/></div>
-    <p class="set-intro">${tr("How {model} writes new answers. Each model keeps its own.", {model: modelName(S.health.model)})}</p>
+  return html`<${Head} title=${tr("Chat defaults")} intro=${tr("How {model} writes new answers. Each model keeps its own.", {model: modelName(S.health.model)})}>
+      <${TurboButton}/><//>
+    <${ModelCtx}/>
+    <${Group} cap=${tr("Sampling")}>
     <${Row} label=${tr("Presets")}><${Seg} label=${tr("Presets")} value=${preset} onChange=${(id) => set(PRESETS[id])}
       options=${[{id: "precise", label: tr("Precise"), title: tr("Temperature 0: the same question gives the same answer")},
                  {id: "balanced", label: tr("Balanced"), title: tr("Temperature 0.6, top-p 0.95, top-k 20")},
@@ -163,7 +189,8 @@ function ChatDefaults() {
       <label for=${`set-${r.k}`}><span>${tr(r.label)}</span><span class="set-row__sub">${tr(r.hint)}${isDefault(r.k) ? tr(" · the model's default") : ""}</span></label>
       <input id=${`set-${r.k}`} type="range" class="range" min=${r.min} max=${r.max} step=${r.step} value=${P[r.k]} disabled=${r.off}
         onInput=${(e) => set({[r.k]: +e.target.value})}/>
-      <b class="num">${r.shown}</b></div>`)}
+      <b class="num">${r.shown}</b></div>`)}<//>
+    <${Group} cap=${tr("Length and repeats")}>
     <div class="set-pair">
       <label class="field"><span class="field__label">${tr("Max tokens")}</span>
         <input class="input" inputmode="numeric" placeholder=${tr("Until done")} value=${P.max}
@@ -173,15 +200,16 @@ function ChatDefaults() {
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
     <${ThinkBudget}/>
-    <p class="set-row__sub">${tr("Penalties: none by default (no model has any as a standard). Set one to discourage repeats.")}</p>
+    <div class="set-block set-block--pens"><span class="set-row__sub">${tr("Penalties: none by default (no model has any as a standard). Set one to discourage repeats.")}</span>
     <div class="set-pair set-pair--3">
       ${[["repetition_penalty", tr("Repetition"), tr("1.0 off, e.g. 1.1")], ["frequency_penalty", tr("Frequency"), tr("0 off, e.g. 0.3")],
          ["presence_penalty", tr("Presence"), tr("0 off, e.g. 0.3")]].map(([k, label, ph]) => html`<label class="field"><span class="field__label">${tr(label)}</span>
         <input class="input" inputmode="decimal" placeholder=${tr(ph)} value=${P[k]} aria-label=${tr("{label} penalty", {label: tr(label)})}
           onInput=${(e) => set({[k]: e.target.value.replace(/[^\d.]/g, "")})}/></label>`)}
-    </div>
+    </div></div><//>
+    <${Group} cap=${tr("Other apps")} note=${tr("The OpenAI and Anthropic APIs both take them: a request's own settings still win.")}>
     <${Row} label=${tr("Use these for other apps too")} sub=${sharedNow}>
-      <${Switch} label=${tr("Use these for other apps too")} on=${S.shared.on} onChange=${share}/><//>
+      <${Switch} label=${tr("Use these for other apps too")} on=${S.shared.on} onChange=${share}/><//><//>
     <div class="set-foot"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => {
       resetPrefs(["thinking", "temperature", "top_p", "top_k", "min_p", "max", "seed", ...PENALTIES]);   // (the model's own again)
       syncShared();
@@ -192,18 +220,17 @@ function ChatDefaults() {
 // ------------------------------------------------------------------ Instructions
 function Instructions() {
   const c = S.current;
-  return html`<h3>${t("settings.instructions", "Instructions")}</h3>
-    <label for="set-instr" class="set-row__text"><span class="set-row__label">${tr("For new chats")}</span>
-      <span class="set-row__sub">${tr("The model reads them before your first message. A chat can change its own from its ⋯ menu.")}</span></label>
+  return html`<${Head} title=${tr("Global instructions")} intro=${tr("Every new chat starts with these: the model reads them before your first message. A chat can change its own from its ⋯ menu.")}/>
+    <section class="set-sec"><label for="set-instr" class="set-cap">${tr("For new chats")}</label>
     <textarea id="set-instr" class="input input--area" rows="8" placeholder=${tr("e.g. Answer briefly. Write code in TypeScript.")}
       value=${P.sys_default ? P.system : ""} onInput=${(e) => {
         savePrefs({system: e.target.value, sys_default: true});
         if (S.current && !S.current.messages.length) { S.current.system = e.target.value; updateCtxMeter(); }   // (the new chat on screen)
-      }}></textarea>
-    ${c && c.messages.length ? html`<div class="set-row">
+      }}></textarea></section>
+    ${c && c.messages.length ? html`<${Group}><div class="set-row">
       <span class="set-row__text"><span class="set-row__label">${tr("This chat")}</span>
         <span class="set-row__sub">${c.system && c.system.trim() ? `“${c.system.trim().slice(0, 90)}${c.system.trim().length > 90 ? "…" : ""}”` : tr("No instructions of its own.")}</span></span>
-      <span class="set-row__ctl"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => chatInstructions(c)}>${tr("Edit")}</button></span></div>` : null}`;
+      <span class="set-row__ctl"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => chatInstructions(c)}>${tr("Edit")}</button></span></div><//>` : null}`;
 }
 
 // ------------------------------------------------------------------ Tools (MCP)
@@ -212,11 +239,11 @@ const MCP_STATE = {ready: ["ok", "Connected"], starting: ["info", "Starting"], f
 function Tools() {
   const servers = S.mcp.servers || [];
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
-  return html`<h3>${t("settings.tools", "Tools")}</h3>
+  return html`<${Head} title=${tr("MCP tools")} intro=${tr("Local tool servers the model may call in this page's chat.")}/>
+    <${Group}>
     <${Row} label=${tr("Let the model use MCP tools")} sub=${tr("They run on this machine with your rights, when the model decides to call them. Only this page's chat uses them.")}>
-      <${Switch} label=${tr("Let the model use MCP tools")} on=${P.mcp !== false} onChange=${(v) => savePrefs({mcp: v})}/><//>
-    ${servers.length ? html`<div class="set-block">
-      <span class="set-caption">${tr("Servers in the run config · {tools} tools · {ready} of {total} connected", {tools:fmt(S.mcp.tools),ready:ready.length,total:servers.length})}</span>
+      <${Switch} label=${tr("Let the model use MCP tools")} on=${P.mcp !== false} onChange=${(v) => savePrefs({mcp: v})}/><//><//>
+    ${servers.length ? html`<${Group} cap=${tr("Servers in the run config · {tools} tools · {ready} of {total} connected", {tools:fmt(S.mcp.tools),ready:ready.length,total:servers.length})}>
       ${servers.map((s) => {
         const [tone, label] = MCP_STATE[s.status] || ["muted", s.status];
         const info = s.info && s.info.name ? ` · ${s.info.name}${s.info.version ? ` ${s.info.version}` : ""}` : "";
@@ -226,11 +253,12 @@ function Tools() {
           ${s.error ? html`<div class="msg-error">${s.error}</div>` : null}
           ${s.tools.length ? html`<div class="mcp__tools">${s.tools.map((t) => html`<span class="tag" title=${t.description || ""}>${t.tool}</span>`)}</div>` : null}
         </div>`;
-      })}</div>`
+      })}<//>`
     : html`<p class="set-note">${tr("No MCP servers are set up. Add them to the run config (“mcpServers”, as Claude Desktop writes them) or start Maya with --mcp-config, and their tools appear here.")}</p>`}`;
 }
 
-// ------------------------------------------------------------------ Connect your tools
+// ------------------------------------------------------------------ Connect your tools (as in v1.1.52: both APIs' base URLs,
+// the model's name and the API key on one page, then the examples)
 function Connect() {
   const base = location.origin, model = S.health.model, key = !!S.health.api_key;
   const [tab, setTab] = useState("claude");
@@ -241,29 +269,30 @@ function Connect() {
     openai: [tr("OpenAI apps and SDKs"), `OPENAI_BASE_URL=${base}/v1\nOPENAI_API_KEY=${key ? "<your API key>" : "any-text"}\nmodel: ${model}`],
     curl: [tr("A first request"), `curl ${base}/v1/chat/completions -H "Content-Type: application/json" ${key ? '-H "Authorization: Bearer <your API key>" ' : ""}\\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello!"}]}'`],
   };
-  const addrs = [[tr("OpenAI base URL"), `${base}/v1`], [tr("Anthropic base URL"), base], [tr("Model name"), model]];
-  return html`<h3>${t("settings.connect", "Connect your tools")}</h3>
-    <p class="set-intro">${tr("Any OpenAI- or Anthropic-compatible app or coding agent works with these.")}</p>
+  const addrs = [["OpenAI base URL", `${base}/v1`], ["Anthropic base URL", base], ["Model name", model]];
+  return html`<${Head} title=${tr("Connect your tools")} intro=${tr("Any OpenAI- or Anthropic-compatible app or coding agent works with these.")}/>
+    <${Group} cls="set-group--connect">
     ${addrs.map(([k, v]) => html`<div class="addr"><span>${tr(k)}</span><code>${v}</code>
       <button type="button" class="icon-btn icon-btn--sm" aria-label=${tr("Copy the {label}", {label:tr(k)})} title=${tr("Copy")} onClick=${() => copyText(v)}><${Icon} name="copy" sm/></button></div>`)}
     <${Row} label=${tr("API key")} htmlFor="set-key" sub=${key ? tr("This server needs one. It is kept in this browser only.") : tr("Only if the server was started with one. Kept in this browser only.")}>
       <input id="set-key" class="input input--key" type="password" autocomplete="off" placeholder=${tr("Not needed")} value=${apikey}
         onInput=${(e) => { setKey(e.target.value); store.set("apikey", e.target.value.trim()); }}
-        onChange=${() => toast("success", tr("API key saved"), tr("Kept in this browser only."))}/><//>
-    <div class="set-block">
+        onChange=${() => toast("success", tr("API key saved"), tr("Kept in this browser only."))}/><//><//>
+    <${Group}><div class="set-block">
       <div class="tabs" role="tablist" aria-label=${tr("Examples")}>${Object.entries(examples).map(([id, [label]]) => html`
         <button type="button" role="tab" aria-selected=${String(tab === id)} class="tabs__tab" onClick=${() => setTab(id)}>${label}</button>`)}</div>
       <div onClick=${onCodeClick} dangerouslySetInnerHTML=${{__html: codeBlock("bash", examples[tab][1])}}></div>
-    </div>`;
+    </div><//>`;
 }
+
 
 // ------------------------------------------------------------------ Data
 function Data() {
   const n = S.chats.length;
-  return html`<h3>${t("settings.data", "Data")}</h3>
-    <p class="set-intro">${tr(n === 1 ? "Chats, images and attached files are kept in this browser only ({count} chat now). The server keeps none of them." : "Chats, images and attached files are kept in this browser only ({count} chats now). The server keeps none of them.", {count:fmt(n)})}</p>
+  return html`<${Head} title=${tr("Data and privacy")} intro=${tr(n === 1 ? "Chats, images and attached files are kept in this browser only ({count} chat now). The server keeps none of them. Model files are managed on Models." : "Chats, images and attached files are kept in this browser only ({count} chats now). The server keeps none of them. Model files are managed on Models.", {count:fmt(n)})}/>
+    <${Group}>
     <${Row} label=${tr("Clear chats and settings")} sub=${tr("Every chat and folder, these settings and the API key in this browser. The model, its files and the server's own settings are not touched.")}>
-      <button type="button" class="btn btn--danger" onClick=${clearBrowser}>${tr("Clear")}</button><//>`;
+      <button type="button" class="btn btn--danger" onClick=${clearBrowser}>${tr("Clear")}</button><//><//>`;
 }
 
 // ------------------------------------------------------------------ Savings: the API prices the sidebar's Saved counts with
@@ -318,16 +347,19 @@ function Savings() {
     catch (e) { toast("error", tr("Not reset"), e.message, 6000); }
   };
   const since = r && r.since ? new Date(r.since * 1000).toLocaleDateString(languageChoice(), {month: "short", day: "numeric"}) : "";
-  return html`<h3>${t("settings.savings", "Savings")}</h3>
-    <p class="set-intro">${tr("The sidebar's Saved line: what each model's own API would have charged for the same tokens. Change a price when the API's changes, or give one to a model without it. Maya keeps the tokens, so every total is counted again with the new prices.")}</p>
+  return html`<${Head} title=${tr("Usage and savings")} intro=${tr("The sidebar's Saved line: what each model's own API would have charged for the same tokens. Change a price when the API's changes, or give one to a model without it. Maya keeps the tokens, so every total is counted again with the new prices.")}/>
     ${err ? html`<p class="set-note">${err}</p>` : !r ? html`<p class="set-note">${tr("Reading the prices…")}</p>`
       : !(r.price_list || []).length ? html`<p class="set-note">${tr("Nothing is counted on this server: it runs without a model config.")}</p>`
       : html`<div class="prices">${r.price_list.map((p) => html`<${PriceCard} key=${p.model} p=${p} onSaved=${setR}/>`)}</div>
         <${Row} label=${tr("Start over from $0")} sub=${tr("Every model's count of tokens: {saved} saved{since}. The prices stay.", {saved:usd(r.usd),since:since ? tr(" since {date}", {date:since}) : ""})}>
-          <button type="button" class="btn btn--danger" onClick=${reset}>${tr("Start over")}</button><//>`}`;
+          <button type="button" class="btn btn--danger" onClick=${reset}>${tr("Start over")}</button><//><//>`}`;
 }
 
 // ------------------------------------------------------------------ About and updates
+// supporting Maya (GitHub Sponsors): one warm line, never a popup - on About, and as a row of its own under an update's
+// button (a little more visible there, still only where the update shows)
+const SupportLine = ({cls = "set-support"}) => html`<p class=${cls}><${Icon} name="heart" sm/><span>${tr("Maya is free and open, made by one person with help from a small community. If it makes your work a little easier,")}${" "}<a class="support-link" href=${SUPPORT_URL}
+  target="_blank" rel="noopener" title=${tr("Sponsor Maya on GitHub")}>${tr("sponsoring it")}</a>${tr(", in any amount, helps it keep growing. Thank you.")}</span></p>`;
 function UpdateCard() {
   const u = S.update, w = S.updateWatch;
   if (!w && (!u || !u.enabled)) return null;
@@ -368,7 +400,8 @@ function UpdateCard() {
   }
   return html`<div class=${`update${tone ? ` update--${tone}` : ""}`} aria-live="polite"><${Icon} name=${icon}/>
     <span class="update__text"><b>${title}</b>${text ? html`<span>${text}</span>` : null}${how ? html`<span class="update__how">${how}</span>` : null}</span>
-    ${acts ? html`<span class="update__acts">${acts}</span>` : null}</div>`;
+    ${acts ? html`<span class="update__acts">${acts}</span>` : null}
+    ${u && u.newer && !w && !(state && state.state) ? html`<${SupportLine} cls="update__support"/>` : null}</div>`;
 }
 // "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
 function gpuNames(name, count) {
@@ -438,22 +471,29 @@ function About() {
     if (log != null) { setLog(null); return; }
     try { setLog(await fetchReport()); } catch (e) { toast("error", tr("No report"), e.message, 5000); }
   };
-  return html`<h3>${t("settings.about", "About and updates")}</h3>
+  const newer = S.update && S.update.newer && !S.updateWatch;   // (then the ask is beside the update instead)
+  return html`<${Head} title=${tr("About and updates")}/>
     <${UpdateCard}/>
-    <dl class="facts">${facts().map(([k, v]) => html`<dt>${k}</dt><dd>${v}</dd>`)}</dl>
+    ${newer ? null : html`<${SupportLine}/>`}
+    <${Group} cap=${tr("This server")}><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
+    <${Group}>
     <div class="set-row set-row--top">
       <span class="set-row__text"><span class="set-row__label">${tr("Troubleshooting")}</span>
         <span class="set-row__sub">${tr("A report for a GitHub issue: the versions, this PC, the engine's settings and the telling lines of its log, never the API key. Read it before you share it.")}</span></span>
       <span class="set-row__ctl set-row__ctl--two"><button type="button" class="btn btn--secondary btn--sm" onClick=${show}>${log != null ? tr("Hide") : tr("Show engine log")}</button>
         <button type="button" class="btn btn--primary btn--sm" onClick=${copy}><${Icon} name="report" sm/>${tr("Copy report")}</button></span></div>
-    ${log != null ? html`<pre class="report">${log}</pre>` : null}`;
+    ${log != null ? html`<pre class="report">${log}</pre>` : null}<//>`;
 }
 
 // ------------------------------------------------------------------ the dialog
-const BODIES = {general: General, model: Model, savings: Savings, chat: ChatDefaults, instr: Instructions, tools: Tools, connect: Connect, data: Data, about: About};
+const BODIES = {general: General, chat: ChatDefaults, instr: Instructions, connect: Connect,
+                tools: Tools, savings: Savings, data: Data, about: About};
 export function SettingsDialog() {
   const box = useRef(null), body = useRef(null);
-  const sec = BODIES[S.settings] ? S.settings : "general";
+  const want = OLD_IDS[S.settings] || S.settings;
+  const sec = BODIES[want] ? want : "general";
+  // a phone: the list of pages first (as opened from the sidebar or Ctrl+,), a page when a link names one
+  const [list, setList] = useState(() => isPhone() && (!S.settings || S.settings === "general"));
   useEffect(() => {
     loadShared(); loadMcp(); loadCtxInfo(); loadPortInfo(); loadThinkBudget(); loadUpdate();
     const ret = document.activeElement;
@@ -462,6 +502,7 @@ export function SettingsDialog() {
   }, []);
   useEffect(() => { if (body.current) body.current.scrollTop = 0; }, [sec]);
   const close = () => { S.settings = null; emit(); };
+  const pick = (id) => { S.settings = id; setList(false); emit(); };
   const keys = (e) => {
     if (e.key === "Tab") trapTab(e, box.current);
     else if (e.key === "Escape" && !e.defaultPrevented) { e.stopPropagation(); close(); }
@@ -469,15 +510,19 @@ export function SettingsDialog() {
   const Body = BODIES[sec];
   const newer = S.update && S.update.newer && !S.updateWatch;
   return html`<div class="dialog-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) close(); }}>
-    <div ref=${box} class="dialog settings" role="dialog" aria-modal="true" aria-labelledby="settings-title" onKeyDown=${keys}>
-      <div class="dialog__head"><h2 id="settings-title">${t("settings", "Settings")}</h2>
-        <button type="button" class="icon-btn" aria-label=${t("close", "Close")} onClick=${close}><${Icon} name="close"/></button></div>
+    <div ref=${box} class=${`dialog settings${list ? " is-list" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-title" onKeyDown=${keys}>
+      <div class="dialog__head">${list ? null : html`<button type="button" class="btn btn--ghost btn--sm set-back" onClick=${() => setList(true)}>
+          <${Icon} name="chevron-right" sm/>${tr("Settings")}</button>`}<h2 id="settings-title">${tr("Settings")}</h2>
+        <button type="button" class="icon-btn" aria-label=${tr("Close")} onClick=${close}><${Icon} name="close"/></button></div>
       <div class="settings__main">
-        <nav class="set-nav" aria-label=${tr("Settings sections")}>${SECTIONS.map((s) => html`
-          <button type="button" class="nav-item" aria-current=${s.id === sec ? "page" : undefined}
-            onClick=${() => { S.settings = s.id; emit(); }}><${Icon} name=${s.icon}/><span>${t(s.key, s.label)}</span>
-            ${s.id === "about" && newer ? html`<i class="nav-item__dot" title=${tr("A new version is available")}></i>` : null}</button>`)}</nav>
-        <div class="set-body" ref=${body}><${Body}/></div>
+        <nav class="set-nav" aria-label=${tr("Settings sections")}>${GROUPS.map((g) => html`
+          <span class="set-nav__group">${tr(g.label)}</span>
+          <div class="set-nav__items">${g.items.map((s) => html`
+          <button type="button" class="nav-item" aria-current=${s.id === sec && !list ? "page" : undefined}
+            onClick=${() => pick(s.id)}><${Icon} name=${s.icon}/><span>${tr(s.label)}</span>
+            ${s.id === "about" && newer ? html`<i class="nav-item__dot" title=${tr("A new version is available")}></i>` : null}
+            <${Icon} name="chevron-right" sm cls="set-nav__chev"/></button>`)}</div>`)}</nav>
+        <div class="set-body" ref=${body}><div class="set-page"><${Body}/></div></div>
       </div>
     </div></div>`;
 }

@@ -27,6 +27,8 @@ inline void cpu_relax() {
     _mm_pause();
 #elif defined(__x86_64__) || defined(_M_X64)
     __builtin_ia32_pause();
+#elif defined(__powerpc64__) || defined(__ppc64__) || defined(__PPC64__)
+    __asm__ __volatile__("or 27,27,27" ::: "memory");   // POWER9: the low-priority spin hint
 #endif
 }
 

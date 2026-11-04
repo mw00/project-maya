@@ -20,6 +20,8 @@ const {api} = await import("./web/lib.js");
 const {phaseText} = await import("./web/server.js");
 const stateModule = await import("./web/state.js");
 const {exportChat} = await import("./web/chats.js");
+await import("./web/settings.js"); // New grouped Settings must retain valid cross-page imports.
+const {freeAdvice} = await import("./web/monitor.js");
 assert.equal(languageChoice(), "en");
 assert.equal(t("new-chat", "New chat"), "New chat");
 
@@ -77,6 +79,17 @@ for (const name of ["settings.js", "server.js", "monitor.js", "ui.js", "turbo.js
   }
 }
 assert.deepEqual(missing, [], "Static UI phrases missing from zh-CN catalog");
+for (const label of ["Overview", "Engine", "Storage", "Its folder", "The pack Maya built", "A model file",
+  "Its image encoder", "Its DFlash2 drafter", "The folder", "The pack", "The image encoder", "The DFlash2 drafter",
+  "Appearance", "Global instructions", "Integrations", "Usage", "Privacy", "About", "peak this request", "peak last request"])
+  assert.notEqual(t(label, "__MISSING__"), "__MISSING__", `Missing upstream UI label: ${label}`);
+const gib = 2 ** 30;
+const tpPair = [{index:0,free:gib,tp_room:gib,tp_group:0,slots:1000,parts:{pool:10*gib,drafter:gib}},
+  {index:1,free:9*gib,tp_room:gib,tp_group:0,slots:1000,parts:{pool:10*gib}}];
+const tpAdvice = freeAdvice([tpPair[1]], tpPair, {engine_kind:"ds4"}, () => "RAW_GPU_1", () => "RAW_POOL", () => 999);
+assert.match(tpAdvice, /RAW_GPU_1.*8.*闲置/);
+assert.match(tpAdvice, /MAYA_DS4_DRAFT_DEV/);
+assert.doesNotMatch(tpAdvice, /999/); // A full TP partner cannot grow the pool on restart.
 assert.equal(tr("How {model} writes new answers. Each model keeps its own.", {model:"RAW_MODEL_<>&"}),
   "RAW_MODEL_<>& 生成新回答的方式。每个模型分别保存设置。");
 assert.equal(t("toString", "English fallback"), "English fallback");
