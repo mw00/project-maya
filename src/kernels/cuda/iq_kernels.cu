@@ -295,6 +295,36 @@ __device__ __forceinline__ float vec_dot_iq4_nl_q8_1(const void* __restrict__ vb
     return d * sumi;
 }
 
+// Q5_0 (vecdotq.cuh's vec_dot_q5_0_q8_1 + _impl<VDR 2>, unchanged): unsloth's Qwen3.8 UD-IQ2_XS keeps one layer's
+// routed down experts (blk.4) in this format.  One call covers half a 32-value block (iqs 0 or 2).
+__device__ __forceinline__ float vec_dot_q5_0_q8_1(const void* __restrict__ vbq, const block_q8_1* __restrict__ bq8_1,
+                                                   const int& kbx, const int& iqs) {
+    const block_q5_0* bq5_0 = (const block_q5_0*) vbq + kbx;
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int vl = get_int_b2(bq5_0->qs, iqs + i);
+        const int vh = get_int_b2(bq5_0->qh, 0) >> (4 * (iqs + i));
+        const int u0 = get_int_b4(bq8_1->qs, iqs + i);
+        const int u1 = get_int_b4(bq8_1->qs, iqs + i + QI5_0);
+        int vi0 = (vl >> 0) & 0x0F0F0F0F;
+        vi0 |= (vh << 4) & 0x00000010;
+        vi0 |= (vh << 11) & 0x00001000;
+        vi0 |= (vh << 18) & 0x00100000;
+        vi0 |= (vh << 25) & 0x10000000;
+        sumi = ggml_cuda_dp4a(vi0, u0, sumi);
+        int vi1 = (vl >> 4) & 0x0F0F0F0F;
+        vi1 |= (vh >> 12) & 0x00000010;
+        vi1 |= (vh >> 5) & 0x00001000;
+        vi1 |= (vh << 2) & 0x00100000;
+        vi1 |= (vh << 9) & 0x10000000;
+        sumi = ggml_cuda_dp4a(vi1, u1, sumi);
+    }
+    const float d5 = __half2float(bq5_0->d);
+    const float2 ds8f = __half22float2(bq8_1->ds);
+    return d5 * (sumi * ds8f.x - (16 * 2 / QI5_0) * ds8f.y);
+}
+
 // IQ4_XS: 256 values as 8 sub-blocks of 32 (6-bit scale each); one call covers one sub-block (iqs = 4 * sub-block),
 // and `bq8_1` is the super-block's first q8_1 block, so the call's activation is bq8_1[iqs / 4].  Strata's Qwen IQ3_S
 // file keeps one layer's routed gate/up experts in this format.
@@ -381,6 +411,8 @@ template<> struct Fmt<18> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_xxs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<20> { static constexpr int qk = 32, ipb = 2, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq4_nl_q8_1(v, y, kbx, iqs); } };
+template<> struct Fmt<6> { static constexpr int qk = 32, ipb = 2, step = 2;    // Q5_0: QI5_0 4 / VDR 2
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_q5_0_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<21> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq3_s_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<23> { static constexpr int qk = 256, ipb = 8, step = 4;
@@ -840,9 +872,29 @@ __device__ void dq_q2_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
     }
 }
 
+// Q5_0 (llama.cpp's dequantize_q5_0): 8 blocks of 32 per "superblock" of 256, laid out like dq_iq4_nl
+template<typename dst_t>
+__device__ void dq_q5_0(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const block_q5_0* x = (const block_q5_0*) vx + ibs * (QK_K / QK5_0);
+    const int64_t il = tid / 8, ib = tid % 8;
+    dst_t* y = yy + 32 * ib + 4 * il;
+    const uint8_t* qs = x[ib].qs + 4 * il;
+    const uint32_t qh = (uint32_t) x[ib].qh[0] | ((uint32_t) x[ib].qh[1] << 8) | ((uint32_t) x[ib].qh[2] << 16) |
+                        ((uint32_t) x[ib].qh[3] << 24);
+    const float d = (float) x[ib].d;
+    for (int j = 0; j < 4; ++j) {
+        const int k = 4 * (int) il + j;
+        const int x0 = (qs[j] & 0xf) | (((qh >> k) << 4) & 0x10);
+        const int x1 = (qs[j] >> 4) | ((qh >> (k + 12)) & 0x10);
+        y[j + 0] = cvt<dst_t>((x0 - 16) * d);
+        y[j + 16] = cvt<dst_t>((x1 - 16) * d);
+    }
+}
+
 template<typename dst_t>
 __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs, dst_t* y, int tid) {
     switch (ty) {
+        case 6: dq_q5_0(vx, ibs, y, tid); break;
         case 16: dq_iq2_xxs(vx, ibs, y, tid); break;
         case 17: dq_iq2_xs(vx, ibs, y, tid); break;
         case 18: dq_iq3_xxs(vx, ibs, y, tid); break;
@@ -933,7 +985,8 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
 }
 
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
-    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
+    // (+ Q5_0: a routed down matrix of unsloth's Qwen3.8 UD-IQ2_XS; iq_supported() stays the i-quant set)
+    if (n % 256 != 0 || !(is_iq(t) || t == 6)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst);
     check("iq_dequant_f16");
 }
@@ -1025,6 +1078,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 20: native_down_kernel<20><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 23: native_down_kernel<23><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 42: native_down_kernel<42><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 6: native_down_kernel<6><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: std::fprintf(stderr, "native_expert_grouped: down type %d\n", L.d_type); std::exit(1);
     }
     check("native_expert_grouped/down");

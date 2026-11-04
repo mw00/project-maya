@@ -541,6 +541,21 @@ std::vector<std::string> model_shards(const std::string& first) {
     return out.empty() ? std::vector<std::string>{first} : out;
 }
 
+/// The first of the model's shards (model_shards) that holds `tensor`, else `first`: a split whose shard 1 carries
+/// only the metadata (unsloth's Qwen3.8 GGUFs: the weights in shard 2, the n-gram table in shard 3) keeps
+/// token_embd / output.weight in a later shard.
+std::string shard_with(const std::string& first, const char* tensor) {
+    for (const auto& p : model_shards(first)) {
+        try {
+            strata::GgufFile f(p);
+            for (const auto& t : f.tensors())
+                if (t.name == tensor) return p;
+        } catch (const std::exception&) {
+        }
+    }
+    return first;
+}
+
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
     out.clear();
     std::string text(s);
@@ -5001,7 +5016,7 @@ int main(int argc, char** argv) {
         o.native_bf16 = o.native_bf16_extra = true;
         o.native_ple_key = o.native_moe_combine = o.native_gdn = o.native_router = true;
         o.native_qsa = o.native_qsa_indexer = o.native_rope = o.native_ple_postops = true;
-        if (o.native_head_gguf.empty()) o.native_head_gguf = o.native_preset;
+        if (o.native_head_gguf.empty()) o.native_head_gguf = shard_with(o.native_preset, "output.weight");
         if (o.native_dense_gguf.empty()) {
             // every shard of the model (<name>-0000N-of-0000M.gguf beside --native), then the PLE shard: a split
             // may put any layer in any shard (Swift's GGUFs: layers 13-47 in shard 2, the PLE table in shard 1)
@@ -5137,7 +5152,7 @@ int main(int argc, char** argv) {
             return 2;
         }
         const strata::core::ModelGeometry g0;
-        if (!native_embed.load(o.native_preset, g0.n_embd, 248320, err)) {
+        if (!native_embed.load(shard_with(o.native_preset, "token_embd.weight"), g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "maya generate: %s\n", err.c_str());
             return 1;
         }
