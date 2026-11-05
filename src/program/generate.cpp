@@ -326,6 +326,12 @@ struct Options {
     int prompt_cache = 6;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
+    /// --serve: also keep a checkpoint every N tokens the answer writes (the last two; 0 = off).  The next prompt does
+    /// not always go on from everything the session holds: the server's own restarts (the thinking budget closed at a
+    /// sentence's end, the loop guard, a fair-share slice) and a history whose last answer reads back differently
+    /// (re-tokenized, trimmed) continue from INSIDE the answer, where the session cannot be rewound - without these
+    /// they read the whole conversation again (a 32K-token thinking closed by its budget: 88 s on a V100)
+    int64_t decode_cache_every = 1024;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
     /// prompt, which every chat of the same client shares - when that is at least N tokens (0 = never)
     int64_t prompt_cache_root = 2048;
@@ -452,6 +458,8 @@ void usage() {
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --decode-cache-every N  --serve: also checkpoint every N written tokens, the last 2 kept (default\n"
+                 "                       1024, 0 = off): a prompt that goes on from inside the answer reads from there\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
                  "                       of the batched prompt path (default 64, 0 = off)\n"
@@ -848,6 +856,7 @@ struct ConvCheckpoint {
     std::vector<ImgKey> imgs;     ///< the images among them
     std::vector<uint8_t> gdn, ple, tails;
     uint64_t used = 0;            ///< last-use stamp for the retention policy (conv_cache.hpp)
+    bool decode = false;          ///< taken inside an answer (--decode-cache-every), not at a prompt position
     std::vector<ConvCheckpoint> stage_parts;   ///< a layer split's later stages: their sessions' running state
 };
 
@@ -4741,6 +4750,7 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+        else if (a == "--decode-cache-every") o.decode_cache_every = std::max(0LL, std::atoll(next("--decode-cache-every")));
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
@@ -7135,13 +7145,20 @@ int main(int argc, char** argv) {
         std::map<int64_t, std::vector<ConvCheckpoint>> part_at;   // position -> one part per stage
         std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
-        // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr) -> bool {
+        // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L).
+        // `written`: the tokens the session consumed instead of `cur` (a checkpoint inside the answer, at L > n)
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr,
+                                 const std::vector<int32_t>* written = nullptr) -> bool {
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
                 if ((int64_t) c.ids.size() == L) { c.used = ++check_clock; return true; }
             ConvCheckpoint c;
-            c.ids.assign(cur.begin(), cur.begin() + L);
+            if (written != nullptr) {
+                c.ids.assign(written->begin(), written->begin() + L);
+                c.decode = true;
+            } else {
+                c.ids.assign(cur.begin(), cur.begin() + L);
+            }
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
                 if (parts->size() != stages.size() + 1) return false;
@@ -7858,11 +7875,24 @@ int main(int argc, char** argv) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
+                // where the prompt left what the session holds (a conversation that "reads everything again" shows
+                // here why: an edited message, a changed system prompt or thinking level, a turn read back otherwise)
+                if (live_ok && !from_live && !live.empty()) {
+                    const int64_t m = std::min<int64_t>((int64_t) live.size(), n);
+                    int64_t k = 0;
+                    while (k < m && (int32_t) ids[(size_t) k] == live[(size_t) k]) ++k;
+                    std::fprintf(stderr, "maya serve: the prompt leaves the session's %zu tokens at token %lld; %lld "
+                                         "reused from a checkpoint (%zu kept)\n",
+                                 live.size(), (long long) k, (long long) resume, checks.size());
+                }
             }
             // this request rewrites every cell from `resume` on, so a checkpoint past it (or not on this prompt's
             // path) no longer has its cells; the ones kept are prefixes of both the old tokens and the new
+            // (a checkpoint inside an earlier answer below `resume` is of no more use: this request writes the cells
+            //  after it, and the one it starts from - a restart's - stays; so at most the last answer's two are kept)
             checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& c) {
-                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                             return (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs) ||
+                                    (c.decode && (int64_t) c.ids.size() < resume);
                          }), checks.end());
             live_ok = false;   // until this request has finished, the session is in between
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
@@ -8219,6 +8249,11 @@ int main(int argc, char** argv) {
             int64_t think_left = req_think_budget > 0 && req_think_end >= 0 ? req_think_budget : 0;
             bool force_end = false;
             bool window_failed = false;   // a window failed: the request ends here, the engine lives
+            // the next checkpoint inside the answer (--decode-cache-every): at that many consumed tokens
+            int64_t dc_next = o.prompt_cache > 0 && o.decode_cache_every > 0
+                                  ? (int64_t) consumed.size() + o.decode_cache_every : INT64_MAX;
+            static int dc_request = 0;   // (MAYA_DECODE_CKPT_ROUNDTRIP=alt: the check on every other request)
+            ++dc_request;
             if (cancelled) finish = "cancel";
             while (!cancelled && produced_n < max_new) {
                 int T = S_mtp;
@@ -8360,6 +8395,46 @@ int main(int argc, char** argv) {
                 if (timed_round && !eos)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                // A CHECKPOINT INSIDE THE ANSWER (--decode-cache-every): the state after everything consumed so far,
+                // which the session holds after the commit (taken once the draft and the adaptive tier are done:
+                // nothing else is on the GPU).  The last two of this answer are kept (the older ones go), so a prompt
+                // that goes on from a point inside it - a server restart at the thinking budget, a history that
+                // reads the answer back differently - reads at most ~2N tokens again.
+                if (!eos && (int64_t) consumed.size() >= dc_next) {
+                    const int64_t L = (int64_t) consumed.size();
+                    dc_next = L + o.decode_cache_every;
+                    if (!checkpoint_at(L, nullptr, &consumed)) {
+                        std::fprintf(stderr, "maya serve: a checkpoint inside the answer failed at %lld; none more "
+                                             "for this request\n", (long long) L);
+                        dc_next = INT64_MAX;
+                    } else {
+                        // MAYA_DECODE_CKPT_ROUNDTRIP (a check): put the checkpoint just taken back at once - the
+                        // answer must go on token for token as without it (a deterministic run: --mtp-max-t 1)
+                        // (=alt: only on every other request, so one engine compares both)
+                        static const char* rt_env = std::getenv("MAYA_DECODE_CKPT_ROUNDTRIP");
+                        const bool roundtrip = rt_env != nullptr && (std::strcmp(rt_env, "alt") != 0 || dc_request % 2 == 1);
+                        if (roundtrip)
+                            for (const ConvCheckpoint& k : checks)
+                                if ((int64_t) k.ids.size() == L) {
+                                    bool ok = checkpoint_restore(k, ss, g) && k.stage_parts.size() == stages.size();
+                                    for (size_t i = 0; ok && i < stages.size(); ++i) {
+                                        const strata::core::OnDevice on(stages[i]->dev);
+                                        ok = checkpoint_restore(k.stage_parts[i], stages[i]->ss, g);
+                                    }
+                                    std::fprintf(stderr, "maya serve: MAYA_DECODE_CKPT_ROUNDTRIP at %lld: %s\n",
+                                                 (long long) L, ok ? "put back" : "FAILED");
+                                }
+                        int n_dec = 0;
+                        for (const ConvCheckpoint& k : checks) n_dec += k.decode ? 1 : 0;
+                        while (n_dec > 2) {   // the oldest one inside an answer goes
+                            auto old = checks.end();
+                            for (auto it = checks.begin(); it != checks.end(); ++it)
+                                if (it->decode && (old == checks.end() || it->ids.size() < old->ids.size())) old = it;
+                            checks.erase(old);
+                            --n_dec;
+                        }
+                    }
+                }
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
