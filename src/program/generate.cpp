@@ -170,6 +170,7 @@ struct Options {
     double ple_delay_us = 0;           ///< fault injection: every row read completes no earlier than this
     bool ple_sync_submit = false;      ///< A/B arm: submit reads on the token thread, no I/O worker
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
+    bool kv_given = false;             ///< --kv on the command line (GLM: INT8 when not, since v1.1.55)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     std::string kv_streaming;          ///< --kv-streaming on|off: streaming with kv_resident's window (32768 if none)
     std::string dump_residual;
@@ -4670,7 +4671,7 @@ int main(int argc, char** argv) {
         else if (a == "--ple-inflight") o.ple_inflight = std::atoi(next("--ple-inflight"));
         else if (a == "--ple-delay-us") o.ple_delay_us = std::atof(next("--ple-delay-us"));
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
-        else if (a == "--kv") o.kv = next("--kv");
+        else if (a == "--kv") { o.kv = next("--kv"); o.kv_given = true; }
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-streaming") o.kv_streaming = next("--kv-streaming");
         else if (a == "--stream-token") o.stream_token = true;
@@ -4848,6 +4849,9 @@ int main(int argc, char** argv) {
         }
     }
     if (!o.glm_pack.empty()) {
+        // GLM without --kv: INT8, as the setup writes it (v1.1.55: KL against the full model within FP16's own
+        // run-to-run spread, no new loops; half the latent cache's VRAM); --kv fp16 or MAYA_GLM_KV_INT8=0 keeps FP16
+        if (!o.kv_given && std::getenv("STRATA_GLM_KV_INT8") == nullptr) o.kv = "int8";
         // --kv int8 on the GLM path: the INT8 latent cache (Glm5Model::lat_q8_, read at load)
         if (o.kv == "int8" && std::getenv("STRATA_GLM_KV_INT8") == nullptr) set_env("STRATA_GLM_KV_INT8", "1");
         // --kv-resident N: KV streaming of the DSA latent cache (Glm5Model::kv_resident_cells, read at load)
