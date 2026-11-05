@@ -50,7 +50,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大的内存池；最接近原版 |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (默认) · `deepseek-maya-s` | 340 GB | 任意内存大小：显存和内存放不下的部分从固态硬盘读取 |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
-| **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
+| **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](licenses/LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
 
 它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
@@ -59,7 +59,7 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 Maya 的量化版本由各模型公开发布的权重制作，并与原版对比测量：
 
-- **GLM-5.3 · Maya 量化**保留了 FP8 模型零样本准确率的 97.7-99.2%，下一个 token 与原版一致的比例为 83-90% (Maya-L：99.2%，90%)。制作与测量方法：[MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
+- **GLM-5.3 · Maya 量化**保留了 FP8 模型零样本准确率的 97.7-99.2%，下一个 token 与原版一致的比例为 83-90% (Maya-L：99.2%，90%)。制作与测量方法：[MAYA-S](docs/benchmarks/results/MAYA-S.md)、[MAYA-S24](docs/benchmarks/results/MAYA-S24.md)、[MAYA-M](docs/benchmarks/results/MAYA-M.md)、[MAYA-L](docs/benchmarks/results/MAYA-L.md)。
 - **DeepSeek V4.1 · Maya-S** 与原版选择相同下一个 token 的概率为 92.6%。
 - **MiniMax M3.1 · Maya-S** 为 87.6% (各类别平均值)。
 

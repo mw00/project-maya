@@ -50,7 +50,7 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-L · `glm-maya-l` | 156,3 GB | os maiores pools de memória; o mais próximo do original |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (padrão) · `deepseek-maya-s` | 340 GB | qualquer quantidade de memória: o que a VRAM e a RAM não comportam é lido do SSD |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | o modelo inteiro na memória de um PC de 128 GB (as tabelas Engram ficam no SSD); a v2 é cerca de 12% mais próxima do original e cerca de 20% mais rápida para escrever que a v1 - rodar a instalação de novo oferece a atualização |
-| **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
+| **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](licenses/LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
 
 Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
@@ -59,7 +59,7 @@ Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que
 
 As quantizações do Maya são feitas a partir dos pesos divulgados de cada modelo e medidas contra o original:
 
-- **GLM-5.3 · quantizações Maya** mantêm 97,7-99,2% da precisão zero-shot do modelo FP8 e acertam o próximo token dele em 83-90% das vezes (Maya-L: 99,2%, 90%). Como são feitas e medidas: [MAYA-S](bench/results/MAYA-S.md), [MAYA-S24](bench/results/MAYA-S24.md), [MAYA-M](bench/results/MAYA-M.md), [MAYA-L](bench/results/MAYA-L.md).
+- **GLM-5.3 · quantizações Maya** mantêm 97,7-99,2% da precisão zero-shot do modelo FP8 e acertam o próximo token dele em 83-90% das vezes (Maya-L: 99,2%, 90%). Como são feitas e medidas: [MAYA-S](docs/benchmarks/results/MAYA-S.md), [MAYA-S24](docs/benchmarks/results/MAYA-S24.md), [MAYA-M](docs/benchmarks/results/MAYA-M.md), [MAYA-L](docs/benchmarks/results/MAYA-L.md).
 - **DeepSeek V4.1 · Maya-S** escolhe o mesmo próximo token que o original em 92,6% das vezes.
 - **MiniMax M3.1 · Maya-S** em 87,6% das vezes (a média das suas categorias).
 

@@ -52,7 +52,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 | | Maya-L · `glm-maya-l` | 156.3 GB | 最大クラスのメモリ; 元のモデルに最も近い |
 | **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)**<br><sub>DeepSeek · MIT · 748 B</sub> | **Maya-S** (デフォルト) · `deepseek-maya-s` | 340 GB | メモリ量を問わず: VRAM と RAM に収まらない分は SSD から読み込む |
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 128 GB の PC のメモリにモデル全体を載せる (Engram テーブルは SSD に置く); v2 は v1 より元のモデルに約 12% 近く、書き出しが約 20% 速い - セットアップを再実行すると更新を案内します |
-| **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
+| **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](licenses/LICENSE.minimax-m31) · 428 B、アクティブ 23 B · 最大 1M コンテキスト</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 128 GB の PC のメモリにモデル全体を載せる |
 | | Maya-S · `minimax-maya-s` | 122 GB | 元のモデルにより近い |
 
 いずれも NVIDIA の V100 / RTX 20 以降、および AMD と Windows ([必要なもの](#what-you-need)を参照) で動きます。DeepSeek のサイズには Engram テーブルが含まれます。セットアップでは、unsloth の GGUF と LibertAIDAI の DeepSeek 用 EXL3 量子化、orcarouter の abliterated 版 DeepSeek、Mia-AiLab の MiniMax 用 EXL3 量子化、turboderp の GLM 用 EXL3 量子化、画像対応の Q5_K_M GGUF としての Qwen-3.8-Flash-Next (CYBER-FROST)、そして同じく画像対応の unsloth の UD-IQ2_XS GGUF としての Qwen-3.8-Flash-Next 本体 ([その設定](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)) も選べます。**各モデルのファイル、ドラフター、画像、オプション: [docs/MODELS.md](docs/MODELS.md)。**
@@ -61,7 +61,7 @@ Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L�
 
 Maya の量子化は、各モデルの公開された重みから作られ、元のモデルと比較して測定されています。
 
-- **GLM-5.3 · Maya の量子化**は FP8 モデルのゼロショット精度の 97.7-99.2% を保ち、次トークンを 83-90% の確率で一致させます (Maya-L: 99.2%、90%)。作り方と測定方法: [MAYA-S](bench/results/MAYA-S.md)、[MAYA-S24](bench/results/MAYA-S24.md)、[MAYA-M](bench/results/MAYA-M.md)、[MAYA-L](bench/results/MAYA-L.md)。
+- **GLM-5.3 · Maya の量子化**は FP8 モデルのゼロショット精度の 97.7-99.2% を保ち、次トークンを 83-90% の確率で一致させます (Maya-L: 99.2%、90%)。作り方と測定方法: [MAYA-S](docs/benchmarks/results/MAYA-S.md)、[MAYA-S24](docs/benchmarks/results/MAYA-S24.md)、[MAYA-M](docs/benchmarks/results/MAYA-M.md)、[MAYA-L](docs/benchmarks/results/MAYA-L.md)。
 - **DeepSeek V4.1 · Maya-S** は元のモデルと同じ次トークンを 92.6% の確率で選びます。
 - **MiniMax M3.1 · Maya-S** は 87.6% です (カテゴリ平均)。
 
