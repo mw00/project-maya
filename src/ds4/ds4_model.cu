@@ -8991,11 +8991,29 @@ struct Model::Impl {
                             failed.store(true); break;
                         }
                         if (ds4_env("DS4_HELPER_CHECK") != nullptr) {
-                            std::vector<uint8_t> got(l.blob);
-                            if (cudaMemcpy(got.data(), l.helper[(size_t) e], l.blob, cudaMemcpyDeviceToHost) != cudaSuccess ||
-                                std::memcmp(got.data(), stage, l.blob) != 0) {
+                            // read back into the thread's pinned stage2 (free until the slot copies below): a read into
+                            // pageable memory from the twelve loader threads at once now and then came back with a
+                            // 28-128 KiB run never written (ROCm 7.2.4, a Radeon 8060S: zeros, the same read again right)
+                            // - a mismatch is read once more before it fails the load, and named
+                            const auto differ = [&](size_t& first) {
+                                size_t n = 0;
+                                for (size_t k = 0; k < l.blob; ++k)
+                                    if (stage2[k] != stage[k] && n++ == 0) first = k;
+                                return n;
+                            };
+                            size_t first = 0, bad = SIZE_MAX;
+                            for (int read = 0; read < 2 && bad != 0; ++read)
+                                bad = cudaMemcpy(stage2, l.helper[(size_t) e], l.blob, cudaMemcpyDeviceToHost) == cudaSuccess
+                                          ? differ(first)
+                                          : SIZE_MAX;
+                            if (bad != 0) {
                                 std::lock_guard<std::mutex> lk(emu);
-                                ferr = "helper expert byte check failed"; failed.store(true); break;
+                                ferr = "helper expert byte check failed: layer " + std::to_string(l.il) + " expert " +
+                                       std::to_string(e) +
+                                       (bad == SIZE_MAX ? std::string(": its read back failed")
+                                                        : ": " + std::to_string(bad) + " of " + std::to_string(l.blob) +
+                                                              " bytes differ, the first at " + std::to_string(first));
+                                failed.store(true); break;
                             }
                         }
                     }
