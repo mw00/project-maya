@@ -810,6 +810,27 @@ console.log(JSON.stringify({glm: sv.tierShares(n, {experts: 2000}), none: sv.tie
         self.assertIsNone(got["none"]["diskGb"])                                   # (an engine that reports no bytes: the count alone)
         self.assertEqual((got["full"]["disk"], got["full"]["diskGb"]), (0, 0))
 
+    def test_qwen_file_reads_are_named_for_what_they_count_and_the_ssd_tip_needs_ssd_only_experts(self):
+        # Mercury's Monitor, Qwen3.8 UD-IQ2_XS on 1x V100: 13,199 experts in VRAM, 11,377 in pinned RAM, none on the SSD
+        # alone - but 8.23 experts a token read from the model file; the card said "From SSD" and advised more RAM
+        got = self.node("""
+const m = await import(web + "/monitor.js");
+const q = {engine_kind: "qwen", experts: 24576}, n = {vram_used: 13199, ram_used: 11377, disk: 8.23, vram_hit: 0.93};
+const g = {experts: 2000}, gn = {vram_used: 300, ram_used: 500, disk: 4, vram_hit: 0.9};
+console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glmSet: m.tierSet(g).find((x) => x.key === "disk"),
+  homes: m.tierTip(n, q, {disk: sv.tierShares(n, q).disk}),
+  ssdOnly: m.tierTip({...n, ram_used: 9000}, q, {disk: sv.tierShares({...n, ram_used: 9000}, q).disk}),
+  glm: m.tierTip(gn, g, {disk: sv.tierShares(gn, g).disk}), stale: m.tierTip(gn, g, {disk: 1200, stale: true}),
+  cfCpu: m.tierTip({vram_used: 100, ram_used: 24476, disk: 0, vram_hit: 0.3}, q, {disk: 0})}));""")
+        self.assertEqual(got["set"]["label"], "From the model file")
+        self.assertIn("page cache or SSD", got["set"]["sub"])
+        self.assertEqual(got["glmSet"]["label"], "From SSD")                    # (GLM's own reads: unchanged)
+        self.assertEqual(got["homes"], "")                                      # every expert has a home: no "more RAM"
+        self.assertTrue(got["ssdOnly"].startswith("Many experts are read from the SSD"))   # 2,377 on the SSD alone
+        self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
+        self.assertEqual(got["stale"], "")
+        self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
+
     def test_context_slider_reaches_each_models_own_top(self):
         # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
         # 1M), the size a config has kept as a stop of its own

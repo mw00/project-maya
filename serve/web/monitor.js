@@ -228,18 +228,44 @@ const TIER_SETS = {
     {key: "disk", label: "From SSD", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", unit: "/tok", digits: 2, sub: "experts copied into the VRAM cache"},
   ],
-  // CYBER-FROST (the maya engine's Qwen path): the CPU computes the experts VRAM does not hold, from RAM or read from the
-  // model file; the drafts' windows count too
+  // the maya engine's Qwen path (CYBER-FROST, Qwen3.8-Flash-Next): the CPU computes the experts VRAM does not hold, from
+  // RAM or read from the model file - its "disk" counts every expert read from the file, through the page cache or from
+  // the SSD (the engine cannot tell which); the drafts' windows count too
   qwen: [
     {key: "ram_fetch", label: "From RAM", unit: "/tok", digits: 1, tone: "info", sub: "experts the CPU computed from RAM"},
-    {key: "disk", label: "From SSD", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the model file"},
+    {key: "disk", label: "From the model file", unit: "/tok", digits: 2, tone: "warn",
+     sub: "experts read from the model file (page cache or SSD)"},
   ],
 };
-function Tiers({t, eng}) {
-  if (!t || !t.now) return null;
+export const tierSet = (eng) => TIER_SETS[eng && eng.engine_kind === "ds4" ? "ds4" : eng && eng.engine_kind === "mm3" ? "mm3"
+                                           : eng && eng.engine_kind === "qwen" ? "qwen" : "glm"];
+// the card's advice, from the live reading n (stale: the last answer's), the SSD-only share (disk: experts with no home
+// in VRAM or RAM) and the helper pool.  The "more RAM" advice only where experts really live on the SSD alone: a model
+// read from its file (Qwen) can count file reads while every expert has a home in VRAM or RAM
+export function tierTip(n, eng, {stale = false, disk = 0, helper = false} = {}) {
   const ds4 = !!(eng && eng.engine_kind === "ds4"), mm3 = !!(eng && eng.engine_kind === "mm3");
   const qwen = !!(eng && eng.engine_kind === "qwen");
-  const set = TIER_SETS[ds4 ? "ds4" : mm3 ? "mm3" : qwen ? "qwen" : "glm"];
+  if (stale) return "";
+  if (ds4) {
+    if (n.disk_mb != null && n.disk_mb >= 500) return "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
+    if (n.vram_hit != null && n.vram_hit < 0.5)
+      return helper && !n.helper_dead ? "Most selections miss the primary cache; the helper handles some before CPU fallback."
+                                      : "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
+    return "";
+  }
+  if (n.disk != null && n.disk >= 3 && disk > 0)
+    return "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
+  if (mm3 || qwen) {   // (MiniMax, Qwen: the CPU computes the experts VRAM does not hold)
+    return n.vram_hit != null && n.vram_hit < 0.5 ? "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card." : "";
+  }
+  if (n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4)
+    return "Most misses come from RAM over PCIe: more VRAM (or a second GPU) keeps more experts on the card.";
+  return "";
+}
+function Tiers({t, eng}) {
+  if (!t || !t.now) return null;
+  const ds4 = !!(eng && eng.engine_kind === "ds4");
+  const set = tierSet(eng);
   const n = t.now, h = t.history || {};
   const helper = ds4 && ((n.helper_held || 0) > 0 || (n.helper || 0) > 0 || +eng.helper_allocated_bytes > 0);
   const helperHeld = n.helper_held != null ? n.helper_held : +eng.helper_slots || 0;
@@ -247,19 +273,7 @@ function Tiers({t, eng}) {
   const stale = age != null && age > 30;               // a reading from the last answer, not live
   // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
   const {vu, ru, total, disk, vramGb, ramGb, diskGb} = tierShares(n, eng || {});
-  let tip = "";
-  if (ds4) {
-    if (!stale && n.disk_mb != null && n.disk_mb >= 500) tip = "Much of every token is read from the SSD: more RAM keeps more of the model's experts cached, and answers get faster.";
-    else if (!stale && n.vram_hit != null && n.vram_hit < 0.5)
-      tip = helper && !n.helper_dead ? "Most selections miss the primary cache; the helper handles some before CPU fallback."
-                   : "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
-  } else if (!stale && n.disk != null && n.disk >= 3) {
-    tip = "Many experts are read from the SSD for every token: more RAM, a smaller model or a shorter context makes answers faster.";
-  } else if (mm3 || qwen) {   // (MiniMax, CYBER-FROST: the CPU computes the experts VRAM does not hold)
-    if (!stale && n.vram_hit != null && n.vram_hit < 0.5) tip = "Most experts run on the CPU: more VRAM (or a second GPU) keeps more of them on the card.";
-  } else if (!stale && n.vram_hit != null && n.vram_hit < 0.85 && (n.ram_fetch || 0) >= 4) {
-    tip = "Most misses come from RAM over PCIe: more VRAM (or a second GPU) keeps more experts on the card.";
-  }
+  const tip = tierTip(n, eng, {stale, disk, helper});
   const pc = (x) => (100 * x) / total;
   return html`<section class=${`card${stale ? " is-stale" : ""}`} aria-label="Where the experts live">
     <div class="card__head"><span class="card__title">${helper ? "Primary cache and RAM backing" : "Where the experts live"}</span>
