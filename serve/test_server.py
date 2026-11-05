@@ -2761,6 +2761,14 @@ class EngineEndTests(unittest.TestCase):
         self.assertIn("the engine ends (exit 3)", n)
         self.assertNotIn("RAM", n)
 
+    def test_gguf_row_failure_is_not_reported_as_ram(self):
+        n = self.note("ds4 gguf rows: an unsupported shape\n"
+                      "maya ds4 serve: GGUF prompt row reconstruction failed; stopping the engine "
+                      "so the server can restart it for the next request\n")
+        self.assertIn("GGUF prompt row failed", n)
+        self.assertIn("earlier log lines", n)
+        self.assertNotIn("running out of RAM", n)
+
     def test_end_ahead_of_done_marks_the_engine_ended_before_the_request_ends(self):
         import io
         import queue

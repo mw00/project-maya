@@ -89,8 +89,8 @@ void q8_round(const float* x, int k, int8_t* q, float* d, cudaStream_t s);
 /// The columns [c0, c0 + nc) of such a matrix: its rows c0 .. c0 + nc - 1, a contiguous range.
 x3::Mat view(const x3::Mat& m, int c0, int nc);
 /// x3::reconstruct_rows' layout from a BF16 or Q8_0 matrix: dst[r][c] = W[c][r] (n rows of k values), F16 or BF16
-/// bits (a Q8_0 weight rounded to them).
-void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
+/// bits (a Q8_0 weight rounded to them). False means no valid output was queued.
+bool rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s);
 
 /// x3::moe_gate_up / moe_down / win_experts / set_gate_up / set_down for a GGUF's experts (lay.fmt == kFmtMXFP4; the
 /// roles' types in lay.gg_type, see expert_type).

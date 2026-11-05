@@ -265,6 +265,8 @@ public:
     /// context returns that error from then on) or the prompt path's room was not handed back.  The serve loop then
     /// ends the engine (exit 3) once the request's DONE is out, and the server starts a fresh one for the next request.
     bool broken();
+    /// Thread-safe prompt-row failure flag, including failures that leave a TP peer unable to finish its chunk.
+    bool gguf_row_failed() const;
     /// Asked while a run of chunks goes through the layers: true (a yield) ends it at a chunk every GPU reaches, as a
     /// Stop does, but keeps the chunks read - feed() / feed_mark() return true having taken fed() of their tokens (the
     /// rest a later feed's; feed_mark's checkpoint then not kept).  Not on a run that goes layer by layer.

@@ -2314,14 +2314,18 @@ __global__ void __launch_bounds__(kThreads) swiglu_f16_kernel(const float* __res
 static unsigned grid_for(long long items) {
     return (unsigned) std::max<long long>(1, std::min<long long>(4096, (items + kThreads - 1) / kThreads));
 }
-bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, cudaStream_t s) {
+bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, cudaStream_t s,
+              cudaError_t* launch_error) {
+    if (launch_error != nullptr) *launch_error = cudaSuccess;
     if (k % block_values(type) != 0 || k % 32 != 0 || n < 1 || ldd % 8 != 0 || ((uintptr_t) dst & 15) != 0)
         return false;
     const unsigned blocks = grid_for((long long) n * (k / 8));
 #define FR_(T) pdl_launch(f16_rows_kernel<T>, blocks, kThreads, 0, s, w, k, n, dst, ldd)
     DS4_IQ_SWITCH_MV(type, FR_)
 #undef FR_
-    return cudaGetLastError() == cudaSuccess;
+    const cudaError_t status = cudaGetLastError();
+    if (launch_error != nullptr) *launch_error = status;
+    return status == cudaSuccess;
 }
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s) {
     pdl_launch(gather_f16_kernel, grid_for((long long) n * (k / 8)), kThreads, 0, s, x, ldx, idx, n, k, dst);

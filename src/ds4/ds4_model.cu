@@ -2094,16 +2094,18 @@ struct Model::Impl {
     // a hand-back that could not finish (a device selection, sync, copy or table write failed): an expert table may
     // name a slot the prompt path's buffers overwrote - no later request runs (forward / forward_chunks refuse)
     bool lend_broken = false;
+    // A failed row reconstruction leaves the current prompt's state incomplete.
+    std::atomic<bool> gguf_rows_broken{false};
     static constexpr const char* kLendBroken =
         "the prompt path's room could not be handed back - the expert tables are unknown; restart the engine";
-    // Model::broken: no later request can trust this process's state - the hand-back above failed, or a layer device's
-    // context took a fault inside a kernel (an illegal address, a failed launch, ...), after which every call on it
+    // Model::broken: no later request can trust this process's state - the hand-back or a GGUF prompt row failed, or a
+    // layer device's context took a fault inside a kernel (an illegal address, a failed launch, ...), after which every call on it
     // returns that error for the rest of the process.  A query of each device's stream returns it at once and never
-    // waits (a stream still at work is not one); an error a call returned and nothing later repeats - a failed
-    // allocation, a bad argument - is not one.  The helper is not asked: an error there already hands its picks to the
+    // waits (a stream still at work is not one); other errors a call returned and nothing later repeats are not sticky.
+    // The helper is not asked: an error there already hands its picks to the
     // CPU lane (helper_dead) and the layer devices go on
     bool broken() {
-        if (lend_broken) return true;
+        if (lend_broken || gguf_rows_broken.load(std::memory_order_relaxed)) return true;
         int cur = -1;
         const bool had = cudaGetDevice(&cur) == cudaSuccess;
         bool bad = false;
@@ -5473,8 +5475,13 @@ struct Model::Impl {
         const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
         for (int c0 = 0; c0 < m.n; c0 += cols) {
             const int nc = std::min(cols, m.n - c0);
-            if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
-            else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
+            if (m.fmt != 0) {
+                if (!gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st)) {
+                    gguf_rows_broken.store(true, std::memory_order_relaxed);
+                    err = "GGUF prompt row reconstruction failed; model reload required";
+                    return false;
+                }
+            } else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
             if (beta == 0.0f && lt::gemm(d.st, c.w16, nc, m.k, x16, ldx, rows, y + c0, ldy)) continue;   // (AMD)
             const float one = 1.0f;
             const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
@@ -19889,6 +19896,10 @@ struct Model::Impl {
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1,
                         const FeedPlan* whole = nullptr, int k0 = 0, int k1 = 0, int after = 0,
                         const std::vector<std::pair<int64_t, bool>>* inner = nullptr) {
+        if (gguf_rows_broken.load(std::memory_order_relaxed)) {
+            err = "GGUF prompt row reconstruction failed; model reload required";
+            return false;
+        }
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
@@ -20529,6 +20540,10 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+        if (gguf_rows_broken.load(std::memory_order_relaxed)) {
+            err = "GGUF prompt row reconstruction failed; model reload required";
+            return false;
+        }
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
@@ -22413,6 +22428,7 @@ void Model::set_yield(std::function<bool()> f) { p_->yield_to = std::move(f); }
 int Model::fed() const { return p_->fed_n; }
 bool Model::cancelled() const { return p_->halted; }
 bool Model::broken() { return p_->broken(); }
+bool Model::gguf_row_failed() const { return p_->gguf_rows_broken.load(std::memory_order_relaxed); }
 void Model::begin_request() { p_->begin_request(); }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample(t, tp, tk, mp, seed, counter);

@@ -711,13 +711,22 @@ void start_watchdog(const strata::ds4::Model& m) {
     const char* v = std::getenv("STRATA_DS4_WATCHDOG_S");
     if (v == nullptr) v = std::getenv("MAYA_DS4_WATCHDOG_S");
     const int limit = v != nullptr ? std::atoi(v) : 600;
-    if (limit <= 0) return;
     std::thread([&m, limit] {
         strata::ds4::StallRule rule;   // (ds4_watchdog.hpp: the time since the last beat, never the request's length)
         rule.limit_s = limit;
         const auto t0 = std::chrono::steady_clock::now();
         for (;;) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
+            // One TP member can leave a chunk on a GGUF row error while its partner waits in a GPU collective.
+            // In that case the request thread cannot reach end_note(); end the engine so the server can recover.
+            // This remains active even if the independent no-progress watchdog is disabled.
+            if (m.gguf_row_failed()) {
+                std::fprintf(stderr, "maya ds4 serve: GGUF prompt row reconstruction failed; stopping the engine "
+                                     "so the server can restart it for the next request\n");
+                std::fflush(stderr);
+                std::_Exit(3);
+            }
+            if (limit <= 0) continue;
             const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
             if (!rule.stalled(g_busy.load(), g_beats.load(), now)) continue;
             std::fprintf(stderr, "maya ds4 serve: where it stopped: %s\n", m.where().c_str());
