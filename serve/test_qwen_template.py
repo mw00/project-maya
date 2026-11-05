@@ -98,19 +98,53 @@ class ServerClose(unittest.TestCase):
     def test_the_close_is_the_next_turns_rendering(self):
         svc, tok = self.svc()
         think_end = tok.encode("</think>", parse_special=True)[0]
+        im_end = tok.encode("<|im_end|>", parse_special=True)[0]
         u1 = {"role": "user", "content": "What is 17*23?"}
         u2 = {"role": "user", "content": "And times 3?"}
         ids = svc.render_ids(*openai_to_messages({"messages": [u1]}))
         for reasoning in ("Let me add: 17*20 = 340, plus 51.\nSo it is 391.", "First 17*20 = 340.\n\n",
-                          "\n  ünïcödé 日本語 🚀 and code:\n```python\nx = 1\n```\n"):
+                          "ünïcödé 日本語 🚀 and code:\n```python\nx = 1\n```\n  \n"):
             with self.subTest(repr(reasoning[:20])):
                 produced = tok.encode(reasoning)
-                canon = svc._closed_as_rendered(ids, produced, think_end)
-                self.assertIsNotNone(canon)
+                closed = svc._closed_as_rendered(ids, produced, think_end)
+                self.assertIsNotNone(closed)
+                self.assertEqual(closed[-3:-2], [think_end])
+                keep = len(tok.encode(reasoning.rstrip())) - 2   # (only the trailing whitespace is written anew)
+                self.assertEqual(closed[:keep], produced[:keep])
+                written = closed + tok.encode("391") + [im_end]   # the engine's answer after the close
+                svc._note_written(ids, written, None)
                 a1 = {"role": "assistant", "content": "391", "reasoning_content": tok.decode(produced)}
-                nxt = svc.render_ids(*openai_to_messages({"messages": [u1, a1, u2]}))
-                self.assertEqual(nxt[:len(ids) + len(canon)], ids + canon)
-                self.assertEqual(canon[-3:-2], [think_end])
+                nxt = svc._as_written(svc.render_ids(*openai_to_messages({"messages": [u1, a1, u2]})))
+                self.assertEqual(nxt[:len(ids) + len(written)], ids + written)
+        # leading whitespace: the next render writes the reasoning from its first non-blank character - the bare close
+        self.assertIsNone(svc._closed_as_rendered(ids, tok.encode("\n  Hm."), think_end))
+
+    def test_the_history_keeps_the_models_own_ids(self):
+        """An answer written in other ids than its text tokenizes to (one character a token) goes back in those ids:
+        the next prompt starts with everything the engine holds.  An edited history, another template: not."""
+        svc, tok = self.svc()
+        im_end = tok.encode("<|im_end|>", parse_special=True)[0]
+        u1 = {"role": "user", "content": "Read the file and tell me."}
+        u2 = {"role": "user", "content": "And then?"}
+        ids = svc.render_ids(*openai_to_messages({"messages": [u1]}))
+        reasoning, answer = "I should read the file first.\n", "The quick brown fox."
+        own = [i for ch in reasoning for i in tok.encode(ch)] + tok.encode("</think>", parse_special=True) + \
+            tok.encode("\n\n") + [i for ch in answer for i in tok.encode(ch)] + [im_end]
+        a1 = {"role": "assistant", "content": answer, "reasoning_content": reasoning}
+        canon = svc.render_ids(*openai_to_messages({"messages": [u1, a1, u2]}))
+        self.assertNotEqual(canon[:len(ids) + len(own)], ids + own)   # (the test's premise: other ids)
+        svc._note_written(ids, own, None)
+        nxt = svc._as_written(canon)
+        self.assertEqual(nxt[:len(ids) + len(own)], ids + own)
+        self.assertEqual(tok.decode(nxt), tok.decode(canon))          # the same text
+        edited = svc.render_ids(*openai_to_messages({"messages": [{"role": "user", "content": "Read it."}, a1, u2]}))
+        self.assertEqual(svc._as_written(edited), edited)
+        other = {**a1, "content": answer + " Then a dog."}
+        changed = svc.render_ids(*openai_to_messages({"messages": [u1, other, u2]}))
+        self.assertEqual(svc._as_written(changed), changed)
+        glm, gtok = self.svc("glm5")
+        glm._note_written(ids, own, None)
+        self.assertFalse(getattr(glm, "_written", None))
 
     def test_other_templates_and_prompts_keep_the_bare_close(self):
         svc, tok = self.svc("qwen")
