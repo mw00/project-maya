@@ -3770,7 +3770,8 @@ class Service:
     def _note_written(self, ids, produced, emb) -> None:
         """A finished answer's tokens as the engine read and wrote them (prompt + answer up to its end-of-turn token),
         for _as_written: Qwen3.x templates, text prompts, answers that ended at a stop token.  The last 4 kept."""
-        if not getattr(self.template, "qwen", False) or emb or not produced or produced[-1] not in self.stop_ids:
+        if not getattr(self.template, "qwen", False) or emb or not produced or produced[-1] not in self.stop_ids or \
+                not hasattr(self.tok, "token_bytes"):
             return
         seq = list(ids) + list(produced)
         kept = [w for w in (getattr(self, "_written", None) or []) if w[1] != seq]
@@ -3782,7 +3783,14 @@ class Service:
         left the session at the first such spot and the engine read the rest of the answer again (an ISO-8601 parser's
         thinking: 2,055 of 2,134 tokens).  Where the new prompt holds a remembered answer's text byte for byte (and
         the same special tokens), the engine's ids go in its place - the text the model reads is unchanged.  Qwen3.x
-        templates only (_note_written)."""
+        templates only (_note_written).  Anything unexpected: the prompt as rendered (never a failed request)."""
+        try:
+            return self._as_written_ids(new)
+        except Exception as e:  # noqa: BLE001
+            print(f"[maya] the history's own ids were not used ({type(e).__name__}: {e})", flush=True)
+            return new
+
+    def _as_written_ids(self, new: list[int]) -> list[int]:
         for plen, seq in getattr(self, "_written", None) or []:
             m = min(len(new), len(seq))
             k = 0
