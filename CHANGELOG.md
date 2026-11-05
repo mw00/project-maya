@@ -15,6 +15,7 @@ Much faster DeepSeek prompts on AMD Strix / Gorgon Halo, faster ones on multi-GP
   - The off switches go in the config's `"env"` block, or on the command line with `--env`. Decode speed is unchanged.
 - **Qwen-3.8-Flash-Next (the base model), unsloth's UD-IQ2_XS GGUF:** the setup and the Models page's Add a model offer it beside the other models (NVIDIA from the V100 on, and AMD), with pictures, its MTP drafter, the model's own sampling and the n-gram table from Maya's Hugging Face repo (`./setup.sh --model qwen-ud-iq2_xs`). unsloth's other UD quants of it run on the same code but are not listed.
 - **Qwen, Monitor:** "Where the experts live" names its figure for what the engine counts - experts read from the model file, through the page cache or the SSD - and advises more RAM only when experts really live on the SSD alone.
+- **Qwen-3.8-Flash-Next, chats:** a follow-up message in a chat now reads only the new part instead of the whole conversation again, and tools reach the model in the format of Qwen's official template.
 - **Fix, Pascal cards (compute capability 6.x):** the engine's build stopped at a compile error; it compiles again.
 - **Community pull requests:**
   - AMD on Linux with a distribution's own ROCm 6.x packages (Debian / Ubuntu layout): the setup finds them, and goes on with a warning when you set `MAYA_HIP_ALLOW_ROCM6=1` (ROCm 7 stays the default requirement); CPUs without AVX2 no longer stop the AMD setup - the CPU lane uses ggml's kernels, as on NVIDIA (#832, thanks @Huskynarr).
