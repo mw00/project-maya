@@ -225,8 +225,8 @@ def config_key(cfg: dict) -> str | None:
         return inst.get("ds4_quant") or "exl3"
     if fam == "minimax":
         return inst.get("mm3_quant") or "exl3"
-    if fam == "qwen":
-        return inst.get("qwen_quant") or "q5_k_m"
+    if fam == "qwen":   # (its keys are lower case: a hand-edited "UD-IQ2_XS" is the same files and the same name)
+        return str(inst.get("qwen_quant") or "q5_k_m").lower()
     return inst.get("quant")
 
 

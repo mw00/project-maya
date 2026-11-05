@@ -379,5 +379,30 @@ class DeepSeekContext(unittest.TestCase):
             self.assertEqual(maya.choose_context(args(context=None), None, maya.DS4_CONTEXTS, 262144), 262144)
 
 
+class QwenNames(unittest.TestCase):
+    """unsloth's UD-IQ2_XS is the base Qwen3.8-Flash-Next, not CYBER-FROST: its name on screen has no "(CYBER-FROST)"
+    (picker, Models page, chat header / Monitor label); CYBER-FROST's own names stay as they were."""
+    UD = {"exe": "/m/build/maya", "args": ["--pack", "/m/pack", "--ple-gguf", "/m/x-00003-of-00003.gguf"],
+          "model_name": "qwen3.8-flash-next",
+          "installer": {"family": "qwen", "quant": "Qwen3.8-Flash-Next-UD-IQ2_XS", "qwen_quant": "ud-iq2_xs"}}
+    CF = {"exe": "/m/build/maya", "args": ["--pack", "/m/pack", "--ple-gguf", "/m/cf.gguf"],
+          "model_name": "cyber-frost-3.8-ps", "installer": {"family": "qwen", "quant": "CYBER-FROST-3.8-PS"}}
+
+    def test_the_base_model_without_cyber_frost(self):
+        self.assertEqual(Q.shown("qwen", "ud-iq2_xs"), "Qwen-3.8-Flash-Next · unsloth UD-IQ2_XS")
+        self.assertEqual(Q.config_label(self.UD), "Qwen-3.8-Flash-Next · unsloth UD-IQ2_XS")
+        self.assertNotIn("CYBER-FROST", Q.shown("qwen", "ud-iq2_xs", 80.9))
+        ud = json.loads(json.dumps(self.UD)); ud["installer"]["qwen_quant"] = "UD-IQ2_XS"   # (any case: the same name)
+        self.assertEqual(Q.config_label(ud), "Qwen-3.8-Flash-Next · unsloth UD-IQ2_XS")
+
+    def test_cyber_frost_unchanged(self):
+        self.assertEqual(Q.SHOWN["qwen"], "Qwen-3.8-Flash-Next (CYBER-FROST)")
+        self.assertEqual(Q.shown("qwen", "q5_k_m"), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
+        self.assertEqual(Q.config_label(self.CF), "Qwen-3.8-Flash-Next (CYBER-FROST) · Q5_K_M")
+        self.assertEqual(Q.shown("qwen"), "Qwen-3.8-Flash-Next (CYBER-FROST)")
+        self.assertEqual(Q.config_stem("qwen", "q5_k_m"), "maya-cyber-frost")
+        self.assertEqual(Q.config_stem("qwen", "ud-iq2_xs"), "maya-qwen-ud-iq2_xs")
+
+
 if __name__ == "__main__":
     unittest.main()
