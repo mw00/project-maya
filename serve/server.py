@@ -2015,7 +2015,8 @@ class ByteTokenizer:
 
 # ------------------------------------------------------------------------------------------------ core
 def prompt_memo_on() -> bool:
-    return os.environ.get("MAYA_PROMPT_MEMO", "") not in ("", "0")
+    """On unless MAYA_PROMPT_MEMO=0 (v1.1.55: the same token ids, a long agent turn prepared faster)."""
+    return os.environ.get("MAYA_PROMPT_MEMO", "1") != "0"
 
 
 TURN_TRACE = os.environ.get("MAYA_TURN_TRACE", "") not in ("", "0")

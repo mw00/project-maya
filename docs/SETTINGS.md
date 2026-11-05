@@ -885,7 +885,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
   `DS4_CHUNK_AUTO_MIN` and at most `--prefill-chunk`. A prompt that fit one chunk ran the groups one after another;
   smaller chunks keep every group busy. Only with more than one group. `DS4_CHUNK_MIN` is still the windows threshold.
   The chunks' boundaries move, so the answers can differ slightly from a run without it (as another `--prefill-chunk` does).
-- `DS4_AI_RUN=1`: the indexer's slabs sized by the keys this prompt has, not by `--max-context`. A large context split
+- `DS4_AI_RUN` (on by default since v1.1.55; `0` turns it off): the indexer's slabs sized by the keys this prompt has, not by `--max-context`. A large context split
   every prompt's indexer into many small slabs; now a prompt gets the rows a context of its own length would (the same
   GEMM shapes, fewer launches). Its buffers take room for 128 rows: at 512K about 2-3 experts of VRAM a GPU.
 
@@ -896,7 +896,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 | `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work (changes the answers slightly) |
 | `DS4_CHUNK_PER_GROUP` | 2 | with `DS4_CHUNK_AUTO=1`: chunks a group |
 | `DS4_CHUNK_AUTO_MIN` | 1024 | with `DS4_CHUNK_AUTO=1`: the smallest chunk, in tokens |
-| `DS4_AI_RUN` | off (0) | `1`: the indexer's slab rows from this prompt's keys, not the context's (the same answers; VRAM for 128 rows) |
+| `DS4_AI_RUN` | on (1) | the indexer's slab rows from this prompt's keys, not the context's (the same answers; VRAM for 128 rows); `0`: the context's rows, as before v1.1.55 |
 
 ## DeepSeek: a long conversation's next turn (lent experts in RAM, prompt preparation by increment)
 
@@ -910,7 +910,7 @@ Two costs of a turn in a long conversation that are not the model's work:
   the ones the slot held, so the answers are the same. Full, the oldest copy not lent now gives its place up.
   `DS4_CHECK_LEND=1` compares every copy handed back with the model's files (slow; for tests).
 - **Prompt preparation.** The server marks the special-token literals in every message of every request, and an agent
-  client re-sends the whole history each turn: about 1.8 s a turn at 150-350K tokens. `MAYA_PROMPT_MEMO=1` remembers
+  client re-sends the whole history each turn: about 1.8 s a turn at 150-350K tokens. `MAYA_PROMPT_MEMO` (on by default since v1.1.55; `0` turns it off) remembers
   the marked text per string and builds the token ids by increment from the last prompt's, the same ids;
   `MAYA_PROMPT_MEMO=verify` also builds them the whole way and fails a request whose ids differ (for tests). This one
   is the server's, so it works the same for every model (GLM, MiniMax and Qwen prompts too, not only DeepSeek). It
@@ -925,7 +925,7 @@ done with a prompt run (50 ms, the progress line keeps its 50 ms).
 | --- | --- | --- |
 | `DS4_LENT_RAM_GB` | off (0) | N: pinned RAM copies (N GB) of the experts a prompt's borrowed buffers lie over; they go back from RAM, not from the disk (the same bytes) |
 | `DS4_CHECK_LEND` | off | `1`: every expert handed back from its RAM copy compared with the files |
-| `MAYA_PROMPT_MEMO` | off (0) | `1`: the server's prompt preparation by increment (the same token ids); `verify`: checked against the whole way every request |
+| `MAYA_PROMPT_MEMO` | on (1) | the server's prompt preparation by increment (the same token ids); `0`: the whole way every request, as before v1.1.55; `verify`: checked against the whole way every request |
 | `MAYA_TURN_TRACE` | off | `1`: a line a request with the server's clock marks |
 | `DS4_TURN_TRACE` | off | `1`: a line a request with the engine's clock marks |
 | `DS4_RUN_POLL_MS` | 50 | 1-50: how often the engine looks whether a prompt run's GPUs are done |
@@ -1389,7 +1389,7 @@ split change does.
 
 A group of two sums its members' partial rows (the attention output's and the MoE's, every layer) by writing its whole
 partial out to host-mapped memory and then reading the other's in, four bytes a lane - one direction of the links at a
-time. `MAYA_DS4_AR2=1` does a prompt chunk's all-reduces in one launch that writes and reads in 128 KB pieces, the
+time. `MAYA_DS4_AR2=1` (the default on NVIDIA since v1.1.55: prompts +1.5% at 8K and +3% at 32K on 3x V100, `--tp 2`) does a prompt chunk's all-reduces in one launch that writes and reads in 128 KB pieces, the
 other member's rows read 16 bytes a lane: the same sums, bit for bit. `2` also sends both partials as FP16 (half the
 bytes; both members round theirs alike, so they stay equal, but the sums are FP16's, not exact).
 `MAYA_DS4_AR2_DECODE=1` takes the decode windows' all-reduces to the same kernel, exact. A group of three or more is
@@ -1399,7 +1399,7 @@ against the host's sums on two GPUs and times them.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_AR2` | off (0) | a group of two's prompt-chunk all-reduces: `1` pipelined in one launch, the same sums; `2` FP16 on the wire (half the bytes, the sums FP16's) |
+| `MAYA_DS4_AR2` | `1` on NVIDIA, `0` on AMD | a group of two's prompt-chunk all-reduces: `1` pipelined in one launch, the same sums; `2` FP16 on the wire (half the bytes, the sums FP16's); `0`: as before v1.1.55 |
 | `MAYA_DS4_AR2_DECODE` | off (0) | `1`: a group of two's decode-window all-reduces in the same kernel, exact |
 | `DS4_AR_P2P` | off (0) | `1`: a group's all-reduce buffers in its first GPU's memory (above); `DS4_AR_P2P_LOG=1` names a group that stays host-mapped |
 | `--prefill-chunk` (DeepSeek, default) | auto: 4096 / 8192 | the prompt chunk a PC sets when the model loads, by the share of the experts on the CPU lane (estimated from the VRAM and the pack): under 40% 4096, 40% and above 8192 (the engine log prints `prompt chunk 8192 (about N% ...)`); a prompt streams every expert from RAM once a chunk, so where the RAM holds most of them the larger chunk reads long prompts up to ~19% faster. With 40% and above on the CPU lane and each layer on one GPU (several GPUs, one pipeline) the chunk is 16384 and the prompt path borrows the room of the expert cache's last slots for the length of a prompt instead of keeping its own buffers (one GPU always did): the experts' room grows by ~7-10% (the decode up to 2-4% faster) and prompts of 12K-30K tokens read 5-12% faster, 2 x V100 (Maya-XS, 8000 MiB reserve) 12K +10%, 20K +9%, 29K +12%, 1K-3K unchanged, 8K about -3% (the lent experts are read back after the prompt: 0.3 s). While the prompt runs, the lent experts' file ranges are read into the page cache by 4 threads so that the read-back is not the disk's (`DS4_LEND_PREFETCH=0` off; only where the RAM has four times their size to spare; Linux and Windows file cache). `DS4_BORROW=0` keeps the 8192 chunk and its own buffers. `--prefill-chunk N` sets it by hand |
@@ -1628,7 +1628,7 @@ by default.
 | --- | --- | --- |
 | `MAYA_DS4_LOAD_DROP_CACHE` | on | drop each region's pages from the file cache once its bytes are copied; `0` keeps them |
 | `MAYA_DS4_LOAD_THREADS` | 12 | the threads that read the experts' regions (an EXL3 or other region pack; a GGUF pack's copies keep their own count): more threads load faster on a machine with the cores |
-| `MAYA_DS4_LOAD_INTERLEAVE` | off | `1`: the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both); `0`: file by file, as before |
+| `MAYA_DS4_LOAD_INTERLEAVE` | on (1) | the files round-robin - the first expert of each file, then the second, ... - so the threads read several files at once (a pack split over two drives streams both; the same bytes; a Gorgon Halo's EXL3 2.9 load 109 -> 75 s); `0`: file by file, as before v1.1.55 |
 | `MAYA_DS4_INPLACE_TRIM_GB` | 6 on Windows, 0 elsewhere | the in-place experts' pages the working set may hold above the load's own: over it a trimmer demotes the oldest noted ranges to the standby list (`VirtualUnlock`), where they count as available and soft-fault back unchanged; `0` disables the trimmer |
 | `MAYA_DS4_INPLACE_TRIM_MS` | 250 | the trimmer's pass interval, in milliseconds (minimum 50) |
 
