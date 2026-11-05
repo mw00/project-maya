@@ -48,14 +48,27 @@ constexpr size_t kBand = 64u << 20;  // a GEMM's FP16 weight band (bytes): the r
 // ---- int8 activations
 // per 32 values (llama.cpp's q8_1 scale, ds4_gguf.cu's q8_quant - the same operations): rows of k F32 values (row r
 // at x + r ldx) -> q[r][k], d[r][k / 32] = max|x| / 127 (a warp a 32-block)
+__device__ __forceinline__ float warp_max32(float am) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, am), 0x401f)));
+    am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, am), 0x201f)));
+    am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, am), 0x101f)));
+    am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, am), 0x4e, 0xf, 0xf, false)));
+    am = fmaxf(am, __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, am), 0xb1, 0xf, 0xf, false)));
+    return am;
+#else
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    return am;
+#endif
+}
+
 __global__ void __launch_bounds__(kThreads) q8_kernel(const float* __restrict__ x, size_t ldx, int k,
                                                       int8_t* __restrict__ q, float* __restrict__ d) {
     const int r = blockIdx.y, b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (b * 32 >= k) return;
     const float v = x[(size_t) r * ldx + (size_t) b * 32 + lane];
-    float am = fabsf(v);
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float am = warp_max32(fabsf(v));
     const float sc = am / 127.0f;
     q[(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
     if (lane == 0) d[(size_t) r * (k / 32) + b] = sc;
@@ -113,15 +126,20 @@ __global__ void __launch_bounds__(kThreads) q8s_kernel(const float* __restrict__
     const int r = blockIdx.y, b = blockIdx.x * kWarps + (threadIdx.x >> 5), lane = threadIdx.x & 31;
     if (b * 32 >= k) return;
     const float v = x[(size_t) r * ldx + (size_t) b * 32 + lane];
-    float am = fabsf(v);
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+    const float am = warp_max32(fabsf(v));
     const float sc = am / 127.0f;
     const int qi = am > 0.0f ? __float2int_rn(v / sc) : 0;
     q[(size_t) r * k + (size_t) b * 32 + lane] = (int8_t) qi;
     int sm = qi;
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    sm += __builtin_amdgcn_ds_swizzle(sm, 0x201f);
+    sm += __builtin_amdgcn_ds_swizzle(sm, 0x101f);
+    sm += __builtin_amdgcn_update_dpp(0, sm, 0x4e, 0xf, 0xf, false);
+    sm += __builtin_amdgcn_update_dpp(0, sm, 0xb1, 0xf, 0xf, false);
+#else
 #pragma unroll
     for (int o = 8; o > 0; o >>= 1) sm += __shfl_xor_sync(0xffffffffu, sm, o);
+#endif
     const int hi = __shfl_sync(0xffffffffu, sm, 16);
     if (lane == 0) {
         d[(size_t) r * (k / 32) + b] = sc;

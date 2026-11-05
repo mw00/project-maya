@@ -640,7 +640,41 @@ __device__ __forceinline__ void deq8(const uint8_t* __restrict__ row, int kb, in
     }
 }
 
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+__device__ __forceinline__ float hip_xor16(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x401f));
+}
+__device__ __forceinline__ float hip_xor8(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x201f));
+}
+__device__ __forceinline__ float hip_xor4(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(__builtin_bit_cast(int, v), 0x101f));
+}
+__device__ __forceinline__ float hip_xor2(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0x4e, 0xf, 0xf, false));
+}
+__device__ __forceinline__ float hip_xor1(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xb1, 0xf, 0xf, false));
+}
+#endif
+
 __device__ __forceinline__ float warp_sum(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if DS4_IQ_STRICT_FP
+    v = fadd_no_fma(v, hip_xor16(v));
+    v = fadd_no_fma(v, hip_xor8(v));
+    v = fadd_no_fma(v, hip_xor4(v));
+    v = fadd_no_fma(v, hip_xor2(v));
+    v = fadd_no_fma(v, hip_xor1(v));
+#else
+    v += hip_xor16(v);
+    v += hip_xor8(v);
+    v += hip_xor4(v);
+    v += hip_xor2(v);
+    v += hip_xor1(v);
+#endif
+    return v;
+#else
 #pragma unroll
 #if DS4_IQ_STRICT_FP
     for (int o = 16; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -648,6 +682,7 @@ __device__ __forceinline__ float warp_sum(float v) {
     for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
 #endif
     return v;
+#endif
 }
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {   // (ds4_gguf.cu's)
     if (limit > 0.0f) {
@@ -697,6 +732,22 @@ __device__ __forceinline__ bool group(const Args& a, int grp, const uint8_t*& bl
 // RW rows a warp, 32 / RW lanes a row (a lane a sub-block a step), their sums over those lanes
 template <int RW>
 __device__ __forceinline__ float lanes_sum(float v) {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+#if DS4_IQ_STRICT_FP
+    if constexpr (RW <= 1) v = fadd_no_fma(v, hip_xor16(v));
+    if constexpr (RW <= 2) v = fadd_no_fma(v, hip_xor8(v));
+    if constexpr (RW <= 4) v = fadd_no_fma(v, hip_xor4(v));
+    if constexpr (RW <= 8) v = fadd_no_fma(v, hip_xor2(v));
+    if constexpr (RW <= 16) v = fadd_no_fma(v, hip_xor1(v));
+#else
+    if constexpr (RW <= 1) v += hip_xor16(v);
+    if constexpr (RW <= 2) v += hip_xor8(v);
+    if constexpr (RW <= 4) v += hip_xor4(v);
+    if constexpr (RW <= 8) v += hip_xor2(v);
+    if constexpr (RW <= 16) v += hip_xor1(v);
+#endif
+    return v;
+#else
 #pragma unroll
 #if DS4_IQ_STRICT_FP
     for (int o = 16 / RW; o > 0; o >>= 1) v = fadd_no_fma(v, __shfl_xor_sync(0xffffffffu, v, o));
@@ -704,6 +755,7 @@ __device__ __forceinline__ float lanes_sum(float v) {
     for (int o = 16 / RW; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
 #endif
     return v;
+#endif
 }
 constexpr int kGuRW = 1, kDnRW = 2;   // rows a warp: gate / up (n_embd 5120: 10 sub-blocks a lane), down (2304: 9)
 
@@ -1202,8 +1254,16 @@ __global__ void __launch_bounds__(kThreads) light_q8_kernel(const float* __restr
     const size_t at = (size_t) b * 32 + lane, qr = (size_t) blockIdx.y;
     const float v = xf != nullptr ? xf[(size_t) idx[lr] * ldx + at] : __half2float(__ushort_as_half(xh[(size_t) lr * ldx + at]));
     float am = fabsf(v);
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    am = fmaxf(am, hip_xor16(am));
+    am = fmaxf(am, hip_xor8(am));
+    am = fmaxf(am, hip_xor4(am));
+    am = fmaxf(am, hip_xor2(am));
+    am = fmaxf(am, hip_xor1(am));
+#else
 #pragma unroll
     for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+#endif
     const float sc = am / 127.0f;   // (ds4_gguf.cu's q8_quant: the same operations)
     q[qr * k + at] = (int8_t) (am > 0.0f ? __float2int_rn(v / sc) : 0);
     if (lane == 0) d[qr * (k / 32) + b] = sc;
