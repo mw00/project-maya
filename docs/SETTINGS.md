@@ -2045,7 +2045,8 @@ Setup and debugging variables:
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_EXPERT_MMQ` | unset (off) | `1`: use the existing GLM q8_1/int8 MMQ path for supported DeepSeek IQ expert prompt sets of at least 32 rows; other sets keep the existing path. HIP only. |
+| `MAYA_DS4_EXPERT_MMQ` | unset (off) | `1`: use the existing GLM q8_1/int8 MMQ path for supported DeepSeek IQ expert prompt sets (IQ1_S, IQ2_S, IQ2_XXS, IQ3_S, IQ3_XXS) of at least 32 rows; other sets keep the existing path. HIP only. |
+| `MAYA_DS4_EXPERT_MMQ_MIN` | 32 for IQ1_S, else 1 | the rows an expert needs to take MMQ within such a set; the set's other experts stay on the existing path. `1`: every expert of the set |
 | `MAYA_DS4_PREFILL_FUSED` | on for gfx1151 (Strix / Gorgon Halo) | the prompt sets through GLM's fused int8 experts (`MAYA_GLM_PREFILL_FUSED`'s kernels at DeepSeek-V4.1's 5120 / 2304 shape, with IQ1_M gate / up and down and IQ2_XXS / IQ2_XS downs added): the weights decoded to int8 in the WMMA tiles' shared memory, the activations and the SwiGLU's H rounded to int8 per 32 values, the products on the int8 matrix cores - where it covers both formats of a layer's experts (IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS gate / ups), else the existing path. No VRAM of its own: the int8 rows sit in the set's down output and H in its FP16 rows until the down writes them. Radeon 8060S, the GSQ-RCO IQ2_XXS GGUF (IQ1_M / IQ2_XXS / IQ2_XS experts): `--bench` prompts 234 -> 257 tok/s (2K), 430 -> 468 (8K), decode unchanged; perplexity over 7,699 tokens of these docs 8.4907 -> 8.4937. It changes answers slightly (the int8 activations). `0` = off; `1` = on for gfx1100 and RDNA4 too (not measured). Takes the sets it covers before `MAYA_DS4_EXPERT_MMQ` |
 
 The switch quantizes both the prompt activations and the FP16 SwiGLU intermediate to q8_1.
