@@ -355,6 +355,10 @@ function answerMeta(m, n, secs) {
   const s = parts.join(" · ");   // ("Stopped", not "stopped", when nothing comes before it: a stop has no usage)
   return s && s[0].toUpperCase() + s.slice(1);
 }
+// when the page was last shown: a phone's page wakes with its Wi-Fi still coming back, so the reconnecting's 10
+// minutes count from the moment the page is seen again, not from before the screen slept
+let shownAt = Date.now();
+document.addEventListener("visibilitychange", () => { if (!document.hidden) shownAt = Date.now(); });
 const sleepOrVisible = (ms) => new Promise((ok) => {
   const go = () => { document.removeEventListener("visibilitychange", go); clearTimeout(tm); ok(); };
   const tm = setTimeout(go, ms);
@@ -485,7 +489,7 @@ export async function answer(resumeJob = null) {
         /* still offline: try again */
       }
       // (checked after a try, not before one: a page woken from a long sleep tries once before it gives up)
-      if (Date.now() - t0 > 600000) { keep = true; throw gone; }
+      if (Date.now() - Math.max(t0, shownAt) > 600000) { keep = true; throw gone; }
       await sleepOrVisible(2000);
     }
   };
@@ -514,7 +518,7 @@ export async function answer(resumeJob = null) {
     if (e.name === "AbortError") m.stopped = true;
     else if (keep) {
       m.error = `The connection to the answer was lost (${e.message || e}). Come back to this page or reload it to take ` +
-                "the answer up again - the server keeps it for 15 minutes after it ends.";
+                "the answer up again - it runs to its end on the server, which keeps it for a day.";
       toast("error", "Connection lost", m.error, 6000);
     } else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
   }
@@ -542,6 +546,8 @@ export function resumePending(again = false) {
   if (!S.busy && m && m.role === "assistant" && m.pending && m.job && (again || !m.lost)) answer(m.job);
 }
 document.addEventListener("visibilitychange", () => { if (!document.hidden) resumePending(true); });
+if (typeof globalThis.addEventListener === "function")              // the network back (a phone off Wi-Fi a while)
+  globalThis.addEventListener("online", () => resumePending(true));
 
 export async function send() {
   const text = S.draft.trim();
