@@ -8310,6 +8310,17 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // the window ends at the first end of turn (and at the token limit): the session then holds exactly
+                // what was sent before the last token, as with one token a window, so the next turn's prompt goes on
+                // from it (until v1.1.54 the drafts accepted past <|im_end|> joined it: the next prompt left the
+                // session at its last token and read back from a checkpoint inside the answer).  Nothing past the
+                // end of turn is ever sent, so the answer is the same.
+                for (int i = 0; i < a; ++i)
+                    if (produced_n + i + 1 >= max_new ||
+                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
+                        a = i;
+                        break;
+                    }
                 if (force_end) {                       // (the budget: the answer starts here, whatever came out)
                     outv[0] = (int32_t) req_think_end;
                     force_end = false;
