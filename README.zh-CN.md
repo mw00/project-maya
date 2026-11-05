@@ -196,6 +196,8 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **思考：** Off、Low、High (默认) 或 Max，可在设置中或按请求指定；还有一个**思考预算**字段，设置模型在回答前最多可以思考多少个 token。
 - **循环防护：** 默认开启 - 当智能体用同样的结果反复发出同一个工具调用时，会被引导走出循环。
 - **图片：** 在聊天中附加，或通过任一 API 发送图片内容。每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
+- **MCP 工具：** 在配置中列出 MCP 服务器 (`"mcp_servers"`；Claude Desktop 的 `mcpServers` 块可原样使用)，网页聊天中的模型就能调用它们的工具。聊天的 **+** 菜单里有开关。具体行为见 [serve/mcp.py](serve/mcp.py)。
+- **Docker：** 没有官方镜像。[docs/DOCKER.md](docs/DOCKER.md) 是基于某个发布版本构建镜像的方法。
 - **从其他设备访问：** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。务必设置密钥。
 - **调优：** `./maya.sh --calibrate` 用 10-15 分钟让引擎适配你的硬件。全部设置：[docs/SETTINGS.md](docs/SETTINGS.md)。
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**各模型自己的选项** - GLM-5.3-Flash 的同时多请求 (`--parallel`)、长上下文和 DFlash2 草稿模型；DeepSeek 的会话保留、专家加载和 Engram 预读；MiniMax 的思考级别：[docs/MODELS.md](docs/MODELS.md)。

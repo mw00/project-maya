@@ -239,6 +239,10 @@ slowest while the caches fill with what you use.
 - **Loop guard:** on by default - an agent that repeats the same tool call with the same result is steered off it.
 - **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them (setup details per
   model: [docs/MODELS.md](docs/MODELS.md)).
+- **MCP tools:** list MCP servers in the config (`"mcp_servers"`; Claude Desktop's `mcpServers` block works as it is)
+  and the web chat's model can call their tools. A switch in the chat's **+** menu turns them on and off. What it
+  does: [serve/mcp.py](serve/mcp.py).
+- **Docker:** there is no official image. [docs/DOCKER.md](docs/DOCKER.md) is a recipe to build one from a release.
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).
