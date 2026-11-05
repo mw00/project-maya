@@ -6908,7 +6908,7 @@ def set_up_qwen(a, prev: dict) -> Path | None:
     step(2, "your choices")                            # 2
     ok(f"model: {Q.shown('qwen', quant, m['download_gb'])} - " +
        ("unsloth's GGUF of Qwen3.8-Flash-Next " if quant == QWEN_UD else "a fine-tune of Qwen3.8-Flash-Next ") +
-       "(Qwen Community License 1.0: LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
+       "(Qwen Community License 1.0: licenses/LICENSE.qwen-community-1.0; a Model-as-a-Service business needs Qwen's own license)")
     rec = qwen_recommended_context(vram, vram + total < m["memory_gb"])
     ctx = choose_context(a, prev_ctx, QWEN_CONTEXTS, rec)
     ok(f"context: {ctx} tokens" + (" (recommended for this PC's VRAM)" if ctx == rec else "") +

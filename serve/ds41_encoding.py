@@ -1,4 +1,4 @@
-# Copyright (c) 2023 DeepSeek. Licensed under the MIT License; see LICENSE.deepseek-v41.
+# Copyright (c) 2023 DeepSeek. Licensed under the MIT License; see licenses/LICENSE.deepseek-v41.
 # Vendored without functional changes from deepseek-ai/DeepSeek-V4.1-Flash-1017,
 # encoding/encoding.py at revision 1bae0e1088993b9b82de08f59de5be5a34e42170.
 # https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/encoding/encoding.py

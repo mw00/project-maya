@@ -100,7 +100,7 @@ class Setup(unittest.TestCase):
         for name, sha in m["sha256"].items():
             self.assertRegex(sha, r"^[0-9a-f]{64}$", name)
             self.assertGreater(m["files"][name], 100e9)
-        self.assertTrue((ROOT / "LICENSE.qwen-community-1.0").is_file())
+        self.assertTrue((ROOT / "licenses/LICENSE.qwen-community-1.0").is_file())
 
     def test_context_by_vram(self):
         self.assertEqual(maya.qwen_recommended_context(32), 262144)   # (INT8 K / V: 3.5 GB at 256K)
