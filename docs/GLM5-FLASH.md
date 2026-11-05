@@ -362,7 +362,7 @@ judged):
   (`expert_feed_forward_length` is an ARRAY - `MetaValue::u` is 0 for arrays). It also fixed
   glm.py's hc flat to ggml stream-major.
 
-Phase 2 status: **COMPLETE** - all seven suites green on Mercury (glm_hc, router_sigmoid, glm_kda,
+Phase 2 status: **COMPLETE** - all seven suites green on the 2x V100 PC (glm_hc, router_sigmoid, glm_kda,
 glm_ffn, glm_dsa, file_expert_source, glm_layer_parity). The last composition bug was the layer
 test's own down-exps read: ffn_down_exps is {n_ff, n_embd, n_expert}, so ne0 is the INPUT dim and
 down_e[o, v] lives at v + n_ff*o + n_ff*n_embd*e (the transpose of gate/up, whose ne0 is the
@@ -373,7 +373,7 @@ verified - `glm_model_test` holds it to the oracle at every position of a 12-tok
 (batched-vs-oracle 2e-3, all 8 prefix argmaxes, streaming-vs-batched 1e-5), derives the greedy
 chain from the dump rather than a constant (a hardcoded Phase-1 chain went stale when the oracle's
 conv einsum was repaired - four independent reviews converged on this diagnosis), and checks the
-streaming continuation at positions 8-11. **8/8 suites green on Mercury in 2.1 s of GPU.** The
+streaming continuation at positions 8-11. **8/8 suites green on the 2x V100 PC in 2.1 s of GPU.** The
 packer (`iq_pack.py`) recognizes `glm5-next` and carries the per-architecture BF16-preserve list
 (the mHC fn/base/scale names, the glm5 indexer set, the router + noaux_tc bias, the KDA gates)
 with 3-D tensors packing byte-exactly as (ne0*ne1, ne2) views; `strata_tokenizer` implements the
@@ -381,7 +381,7 @@ glm4/glm5 pre-tokenizer scheme (a verbatim CHATGLM4 transcription from llama-voc
 in groups of at most 3, no `\p{M}` in the letter/punct classes, `ignore_merges` whole-vocab-hit
 emission) and still refuses schemes it has not transcribed; the pack export ships the per-scheme
 pattern and the ignore_merges flag. The driver gate now points at the verified runner.
-Re-verified 2026-10-01 on a fresh Mercury extract: 8/8 suites in 2.0 s of GPU. Remaining for
+Re-verified 2026-10-01 on a fresh extract on the 2x V100 PC: 8/8 suites in 2.0 s of GPU. Remaining for
 Phase 4: quantized-kernel wiring for the production driver path, the installer FAMILIES entry
 (deliberately deferred - it would advertise a model the driver still refuses to serve), and
 serve/measure - the owner has ordered the **IQ1_M quant first**, end-to-end before optimizing
@@ -423,7 +423,7 @@ path runs through the MLA attention kernels and their parity harness.
   `glm_model_test`); `iq_pack.py`'s glm5-next support (`tools/test_iq_pack_glm.py`) and the
   glm4/glm5 pre-tokenizer in `strata_tokenizer` (`tools/test_tokenizer_glm.py`).
 
-A note on running the kernel parity tests on a 2x V100 machine (Mercury): its GPUs are V100s (sm_70), BELOW
+A note on running the kernel parity tests on a 2x V100 machine: its GPUs are V100s (sm_70), BELOW
 the engine's sm_75 minimum, so the prebuilt archs produce binaries the V100 cannot launch ("no kernel
 image"). The kernel sources themselves are arch-portable (the sm_80 features have the fp32 fallback),
 so the local test tree relaxes the configure guard one line (`sed -i 's/_base LESS 75/_base LESS 70/'`)
@@ -471,7 +471,7 @@ them.  Result, all 512 columns:
 Phase-4 acceptance thresholds calibrated on this pair: KL p99 < 1e-5, top-1 agreement > 99%,
 with every disagreement traceable to a selection-boundary gap below ~1e-4.  The 272aad8b pin is
 unusable for the cross-check (its graph_reserve aborts on the scatter dead-slot bug master
-fixed); /tmp/llama-ref on Mercury holds the master build + tools/llm_logits_dump.cpp.
+fixed); /tmp/llama-ref on the 2x V100 PC holds the master build + tools/llm_logits_dump.cpp.
 
 ### 8.2.1 The REAL-model cross-check (UD-IQ1_S vs llama.cpp, 2026-10-04) and the quantized gates
 

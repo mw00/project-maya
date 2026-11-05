@@ -1,7 +1,7 @@
 # GLM-5.3-Flash UD-IQ1_S on one GPU at several VRAM budgets (2026-10-05)
 
 Build: glm5-flash after commit 54f6fc5 + `STRATA_GLM_VRAM_GB` (caps the engine's total use of the card, so the
-expert pool gets what a card of that size would leave it). Host: Mercury - one Tesla V100-PCIE-32GB (PCIe 3.0 x16,
+expert pool gets what a card of that size would leave it). Host: the 2x V100 PC, using one Tesla V100-PCIE-32GB (PCIe 3.0 x16,
 900 GB/s HBM2), Xeon E5-2690 v4, **30 GB RAM** (the pinned RAM tier gets ~23 GB), NVMe at ~2.2-2.4 GB/s.
 Protocol: `CUDA_VISIBLE_DEVICES=0 STRATA_GLM_SPLIT=0`, fresh process (tiers warmed at load from expert_prior.txt),
 three requests of 128 tokens on different prompts (chat 40 tokens, code 61, math 61), context 4096.
@@ -20,6 +20,6 @@ Reading it:
 - On every single-GPU budget the DISK is the wall: VRAM + this host's 23 GB RAM tier hold 4,300-7,300 of the
   12,096 experts, so 25-96 experts per token come from the NVMe (~3 ms each). A typical 64 GB-RAM PC would hold
   ~2x as many in RAM, which removes most of those reads; then PCIe fetches dominate (consumer cards have PCIe 4.0,
-  ~2x Mercury's gen3). Not measured here - Mercury has 30 GB RAM.
+  ~2x this PC's gen3). Not measured here - this PC has 30 GB RAM.
 - The numbers climb across requests: the LFU adapts from the prior to the live routing (short 128-token runs).
 - Nothing is tuned for these budgets yet (no CPU expert path, no smaller dense footprint, no pruning).

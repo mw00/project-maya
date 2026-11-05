@@ -1,10 +1,10 @@
-# Maya-S v2 against the FP8 model (2026-10-07, Uranus)
+# Maya-S v2 against the FP8 model (2026-10-07, the 1x V100 PC)
 
 `GLM-5.3-Flash-Maya-S-v2-IQ2_XXS` (96.5 GB, 3 shards): the same IQ2_XXS gate/up experts with error-feedback rounding as
 v1, the down projections one step up everywhere - IQ3_XXS in the first and last four MoE layers (3-6, 41-44), IQ2_S in
 the rest - and the rest as v1 (Q6_K attention, shared experts, dense layers, embeddings and output; Q8_0 small KDA
 projections and the DSA indexer; F32 router and mixing weights; the NextN block with Q2_K/Q3_K experts).
-Recipe: `tools/maya_quant/recipes/maya-s-v2.json`, from v1's calibration statistics; 255 min on Uranus.
+Recipe: `tools/maya_quant/recipes/maya-s-v2.json`, from v1's calibration statistics; 255 min on the 1x V100 PC.
 
 ## Distribution match on held-out text
 

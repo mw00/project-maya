@@ -1,7 +1,7 @@
 # GLM-5.3-Flash (UD-IQ1_S pack) on Project Maya - 2026-10-06
 
-Mercury: 2x V100-32GB PCIe3, Xeon E5-2690 v4, 30 GB RAM (the RAM tier is ~22 GB; ~1-10% of experts stay disk-only).
-Uranus: 1x V100-32GB, i5-12600T, 45 GB RAM.  All decode numbers greedy, after a prompt, several hundred tokens.
+2x V100 PC: 2x V100-32GB PCIe3, Xeon E5-2690 v4, 30 GB RAM (the RAM tier is ~22 GB; ~1-10% of experts stay disk-only).
+1x V100 PC: 1x V100-32GB, i5-12600T, 45 GB RAM.  All decode numbers greedy, after a prompt, several hundred tokens.
 
 ## What changed (branch glm5-flash, 161aecf .. this commit)
 
@@ -18,7 +18,7 @@ Uranus: 1x V100-32GB, i5-12600T, 45 GB RAM.  All decode numbers greedy, after a 
 
 ### Later the same day (06d07ef, 1afdec9)
 
-| change | effect (Mercury, 500-token prompt, 200 tokens, RAM tier pinned at 20 GB) |
+| change | effect (the 2x V100 PC, 500-token prompt, 200 tokens, RAM tier pinned at 20 GB) |
 |---|---|
 | **FIX**: one between-token table batch could edit a key twice (made live, then freed); the parallel update kernel let either value win, so the device could later fetch another expert's bytes | exact; found by an A/B that should have been token-identical (decode is now verified identical across tier states) |
 | MLA split kernel grid (chunks x head groups) - 19 blocks left most SMs idle | 208 -> ~50 us a DSA layer |
@@ -29,7 +29,7 @@ Uranus: 1x V100-32GB, i5-12600T, 45 GB RAM.  All decode numbers greedy, after a 
 | prompt path: coalesced Q5_K/Q6_K/Q8_0 -> f16 dequant (the projections' weights, every 256-token sub-batch) | **4.5 -> 3.8 ms/token** (~265 tok/s), bit-identical |
 | live server (multi-turn, 60-150 token answers) | 30 -> 39 -> 42 tok/s as the tiers warm (was 31-34) |
 
-Tried and measured NOT faster on Mercury (kept, off by default): reading predicted disk-only experts ahead in decode
+Tried and measured NOT faster on the 2x V100 PC (kept, off by default): reading predicted disk-only experts ahead in decode
 (STRATA_GLM_AHEAD - only ~40% of disk misses are predictable within 4 layers, the wasted reads share the one NVMe),
 and in the prompt path reading the next layer's whole disk-only set ahead (STRATA_GLM_PREFILL_PRED_T - a 2k chunk
 leaves ~40% of them unrouted).  A CPU expert path is slower than the PCIe pull on this Xeon (1.4 vs 0.56 ms an expert).
@@ -39,7 +39,7 @@ reaches 98.6 / 98.0% - the misses are capacity (30 GB RAM), not policy.
 Where a token's time goes now (per half, median): ~11 ms of compute, plus ~8 ms of misses (RAM->VRAM pulls over
 PCIe ~0.56 ms an expert, disk reads ~3.1 ms) - the two halves wait on each other's slow tokens.
 
-## Mercury (2x V100), decode after a 500-token prompt, 300 tokens
+## The 2x V100 PC: decode after a 500-token prompt, 300 tokens
 
 | mode | ms/token | tok/s | drafts accepted |
 |---|---|---|---|
@@ -52,12 +52,12 @@ warm; 83-86% of drafts accepted; disk waits 10-15 ms/token (the 30 GB host is th
 
 Prompt path, 2.6k-token prompt: 12.2 s (4.7 ms/token, 213 tok/s) vs ~91 s token by token.
 
-## Uranus (1x V100), live server
+## The 1x V100 PC: live server
 
 Decode 6.2-7.2 tok/s (VRAM hit ~70%, ~75 RAM fetches and ~20 disk reads per token: disk-bound - the single-GPU work
 is Part 2).  TTFT 13 s for ~880 prompt tokens, 33 s for ~3.5k.
 
-## Reproduce (Mercury)
+## Reproduce (the 2x V100 PC)
 
     STRATA_GLM_RAM_GB=20 STRATA_GLM_SPLIT=24 build/strata --glm-pack <pack> --max-context 8192 --greedy --max-new 300 --tokens <ids>
     (STRATA_GLM_NO_SPEC=1 for the plain loop; STRATA_GLM_SPEC_PROF=1 prints the per-step host phases;

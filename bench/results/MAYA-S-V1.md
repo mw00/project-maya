@@ -1,9 +1,9 @@
-# Maya-S v1 against the FP8 model (2026-10-07, Uranus)
+# Maya-S v1 against the FP8 model (2026-10-07, the 1x V100 PC)
 
 `GLM-5.3-Flash-Maya-S-IQ2_XXS` (90.1 GB, 2 shards): IQ2_XXS experts (gate/up with error-feedback rounding), IQ2_S down
 in MoE layers 3-6 and 41-44, Q6_K attention / shared experts / dense layers / embeddings / output, Q8_0 small KDA
 projections and the DSA indexer, F32 router and mixing weights, NextN layer included (Q2_K/Q3_K experts).
-Recipe: `tools/maya_quant/recipes/maya-s-v1.json`. Made in 280 min on Uranus (1x V100, 6 cores) from the FP8 release.
+Recipe: `tools/maya_quant/recipes/maya-s-v1.json`. Made in 280 min on the 1x V100 PC (1x V100, 6 cores) from the FP8 release.
 
 ## Distribution match on held-out text
 
@@ -47,7 +47,7 @@ prompts is the model's habit at High; a thinking budget in the server would boun
 
 ## Context fill
 
-`tools/maya_quant/ctx_fill_test.py` on Uranus (1x V100 32 GB, 64 GB RAM): the project's documents as the context, a
+`tools/maya_quant/ctx_fill_test.py` on the 1x V100 PC (1x V100 32 GB, 64 GB RAM): the project's documents as the context, a
 fact planted at its very start, the question at its end (thinking Low, greedy).
 
 | Prompt | Found the fact | Ended by itself | Loops | Decode | Prompt |
@@ -58,9 +58,9 @@ fact planted at its very start, the question at its end (thinking Low, greedy).
 
 Each answer: the exact code and the one sentence about where it was, then the end-of-turn token.
 
-## Speed at context depth (2026-10-07, Mercury)
+## Speed at context depth (2026-10-07, the 2x V100 PC)
 
-Mercury (2x V100 32 GB, 30 GB RAM), through the dashboard: the repository's documents and kernels as the prompt, then
+The 2x V100 PC (2x V100 32 GB, 30 GB RAM), through the dashboard: the repository's documents and kernels as the prompt, then
 300 new tokens at temperature 1.0, thinking off, the MTP block drafting.  The DSA attention's pool selection used to
 rank every pool against every other on each token (quadratic in the context: 21 ms per DSA layer at 64K); it is now
 a radix select (0.07 ms at 64K, the same pools in the same order - tests/dsa_topk_parity.cu), and the decode no
@@ -72,7 +72,7 @@ longer slows down with the context:
 | Prompt, tok/s | 165 | 384 | 385 | 357\* | 353\* |
 
 \* with the image encoder resident beside the model (2.5 GB less expert cache on the first GPU); the other columns
-with it on demand, as shipped.  The context-fill numbers above (Uranus) predate the fix: there the decode fell from
+with it on demand, as shipped.  The context-fill numbers above (the 1x V100 PC) predate the fix: there the decode fell from
 15.9 tok/s at 8K to 9.6 at 30K.
 
 ## Thinking budget
