@@ -36,6 +36,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 安装程序会询问你想用哪个模型，下载它，一次性构建所有内容，并**启动模型**。然后打开 `http://127.0.0.1:8080`。Windows 请用 `START-MAYA.bat` 代替 `./setup.sh`。详见[安装](#install)。
 
+全部文档：[docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>选择你的模型
 
 每个 Maya 量化版本都以模型名加档位命名：XS、S、M 或 L，按专家保留的位数划分。安装程序会为你的电脑推荐一个；想自己选，请给出它的安装 ID：`./setup.sh --model glm-maya-s24`。

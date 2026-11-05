@@ -46,6 +46,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 The setup asks which model you want, downloads it, builds everything once and **starts the model**. Then open
 `http://127.0.0.1:8080`. Windows: `START-MAYA.bat` instead of `./setup.sh`. More in [Install](#install).
 
+All documentation: [docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Pick your model
 
 Every Maya quant is named after its model, then its tier - XS, S, M or L, by how many bits its experts keep. The setup

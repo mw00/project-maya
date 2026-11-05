@@ -36,6 +36,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 A instalação pergunta qual modelo você quer, baixa, compila tudo uma vez e **inicia o modelo**. Depois abra `http://127.0.0.1:8080`. No Windows, use `START-MAYA.bat` em vez de `./setup.sh`. Mais em [Instalação](#install).
 
+Toda a documentação: [docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Escolha seu modelo
 
 Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou L, conforme quantos bits seus especialistas mantêm. A instalação recomenda uma para o seu PC; para escolher uma você mesmo, informe o id dela: `./setup.sh --model glm-maya-s24`.

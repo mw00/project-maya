@@ -38,6 +38,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 セットアップはどのモデルを使うかを尋ね、ダウンロードし、すべてを一度ビルドして、**モデルを起動します**。その後 `http://127.0.0.1:8080` を開いてください。Windows では `./setup.sh` の代わりに `START-MAYA.bat` を使います。詳しくは[インストール](#install)を参照してください。
 
+すべてのドキュメント: [docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>モデルを選ぶ
 
 Maya の量子化はすべて、モデル名のあとに階層 (XS、S、M、L。エキスパートが何ビットを保つかで分かれます) が付いた名前です。セットアップが PC に合ったものを勧めます。自分で選ぶ場合は、セットアップ ID を指定します: `./setup.sh --model glm-maya-s24`。
