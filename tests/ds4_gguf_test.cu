@@ -277,7 +277,7 @@ void test_mv(cudaStream_t s) {
         const x3::Mat v = gg::view(m, 128, 128);
         std::vector<uint16_t> z((size_t) 128 * k);
         uint16_t* dd = dev(z);
-        gg::rows(v, dd, false, s);
+        if (!gg::rows(v, dd, false, s)) ++g_fail;
         CU(cudaStreamSynchronize(s));
         z = host(dd, z.size());
         std::vector<float> got(z.size());
@@ -301,7 +301,7 @@ void test_mv(cudaStream_t s) {
         const x3::Mat v = gg::view(m, 128, 128);
         std::vector<uint16_t> z((size_t) 128 * k);
         uint16_t* dd = dev(z);
-        gg::rows(v, dd, false, s);
+        if (!gg::rows(v, dd, false, s)) ++g_fail;
         CU(cudaStreamSynchronize(s));
         z = host(dd, z.size());
         std::vector<float> got(z.size());
@@ -747,7 +747,7 @@ void test_f16_rows_launch_error(cudaStream_t s) {
 }
 
 // Run separately: deliberately increments the GGUF launch-error counter.
-void test_rows_launch_error_diagnostic() {
+void test_rows_launch_error_diagnostic(cudaStream_t valid) {
     uint8_t* dw = nullptr;
     uint16_t* dh = nullptr;
     CU(cudaMalloc(&dw, 512));
@@ -761,11 +761,19 @@ void test_rows_launch_error_diagnostic() {
     m.raw = dw;
     m.k = 256;
     m.n = 1;
+    CU(cudaMemset(dw, 0, 512));
     const int before = gg::launch_errors();
-    gg::rows(m, dh, false, destroyed);
-    const bool ok = gg::launch_errors() == before + 1;
+    const bool good = gg::rows(m, dh, false, valid);
+    CU(cudaStreamSynchronize(valid));
+    const bool launched = gg::rows(m, dh, false, destroyed);
+    const bool gg_failure = !launched && gg::launch_errors() == before + 1;
+    m.fmt = gg::kFmtBF16;
+    const bool bf16_failure = !gg::rows(m, dh, false, destroyed) && gg::launch_errors() == before + 2;
+    m.raw = nullptr;
+    const bool invalid = !gg::rows(m, dh, false, valid) && gg::launch_errors() == before + 3;
+    const bool ok = good && gg_failure && bf16_failure && invalid;
     if (!ok) ++g_fail;
-    std::printf("%-52s %s\n", "GGUF rows records the CUDA launch error", ok ? "ok  " : "FAIL");
+    std::printf("%-52s %s\n", "GGUF rows returns and records the launch error", ok ? "ok  " : "FAIL");
     CU(cudaFree(dw));
     CU(cudaFree(dh));
 }
@@ -3326,7 +3334,7 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::strcmp(argv[1], "--f16-rows-errors") == 0) {
         test_f16_rows_launch_error(s);
-        test_rows_launch_error_diagnostic();
+        test_rows_launch_error_diagnostic(s);
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }

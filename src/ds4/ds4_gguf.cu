@@ -28,12 +28,14 @@ namespace {
 
 std::atomic<int> g_errors{0};
 
-void check(const char* what) {
+bool check(const char* what) {
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "ds4 gguf %s: %s\n", what, cudaGetErrorString(e));
         g_errors.fetch_add(1, std::memory_order_relaxed);
+        return false;
     }
+    return true;
 }
 void fail(const char* what) {
     std::fprintf(stderr, "ds4 gguf %s\n", what);
@@ -1838,7 +1840,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
     return true;
 }
 
-void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
+bool rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
     if (m.fmt == kFmtGG && m.raw != nullptr && !bf16) {   // (a low-bit dense matrix: ds4_iq's FP16 values of it)
         cudaError_t launch_error = cudaSuccess;
         if (!iq::f16_rows(m.gg_type, (const uint8_t*) m.raw, m.k, m.n, dst, m.k, s, &launch_error)) {
@@ -1847,20 +1849,20 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
                 std::fprintf(stderr, "ds4 gguf rows: %s\n", cudaGetErrorString(launch_error));
                 g_errors.fetch_add(1, std::memory_order_relaxed);
             }
+            return false;
         }
-        check("rows");
-        return;
+        return check("rows");
     }
     if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0) || m.raw == nullptr) {
         fail("rows: not a BF16 or Q8_0 matrix");
-        return;
+        return false;
     }
     const size_t ld = row_stride(m);
     const size_t total = (size_t) m.n * (size_t) m.k;
     const unsigned blocks = (unsigned) std::min<size_t>((total + 255) / 256, 65535);
     if (m.fmt == kFmtQ8_0) pdl_launch(q8_rows_kernel, blocks, 256, 0, s, (const uint8_t*) m.raw, ld, m.k, m.n, dst, bf16);
     else pdl_launch(bf16_rows_kernel, blocks, 256, 0, s, (const uint16_t*) m.raw, ld, m.k, m.n, dst, bf16);
-    check("rows");
+    return check("rows");
 }
 
 namespace {
