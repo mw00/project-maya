@@ -5626,6 +5626,16 @@ bool Glm5Model::fast_boundary(std::string& err) {
         }
         return best >= 0 ? best : oldest;
     };
+    // STRATA_GLM_DEMOTE=all: every VRAM victim drops into the RAM tier (its victim by the RAM policy), not only one
+    // whose count beats the RAM tier's least-used.  The routes are recency-heavy - an expert just evicted from VRAM is
+    // often the next one back - and a dropped one is read from disk again.  It matters where experts spill to disk and
+    // the RAM tier outweighs the VRAM pool: GLM-5.3-Flash UD-IQ3_XXS, 2x RTX 5090, 8 GB pools + 50 GB RAM tier,
+    // decode 16.1 -> 18.7 tok/s (disk 0.305 -> 0.236 GB a token), 19.2 with RAM_EVICT=lru; with a 20 GB RAM tier
+    // (VRAM-heavy) unchanged
+    static const bool demote_all = [] {
+        const char* v = getenv("STRATA_GLM_DEMOTE");
+        return v != nullptr && std::strcmp(v, "all") == 0;
+    }();
     static const bool tier_gc = [] {
         const char* v = getenv("MAYA_GLM_TIER_GC");
         return v == nullptr || std::atoi(v) != 0;
@@ -5775,7 +5785,7 @@ bool Glm5Model::fast_boundary(std::string& err) {
                 rs = ram_victim(R);
                 if (rs >= 0) rc_min = F->cnt[(size_t) R.key[(size_t) rs]];
             }
-            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || rc_min < bc)) {
+            if (rs >= 0 && (R.st[(size_t) rs] == FastState::kRFree || demote_all || rc_min < bc)) {
                 if (R.st[(size_t) rs] == FastState::kRHold) {
                     const int old = R.key[(size_t) rs];
                     F->left[(size_t) old] = 2;
