@@ -25,11 +25,8 @@
 .set-body h3 { margin: 0; font-size: var(--st-fs-xl); font-weight: 600; letter-spacing: -.01em; line-height: 1.25; }
 .set-intro { margin: 0; font-size: var(--st-fs-md); line-height: 1.45; color: var(--st-ink-muted); }
 /* supporting Maya: one warm line on About; under an update its own violet-tinted row, a little larger */
-.set-support, .update__support { display: flex; align-items: flex-start; gap: 8px; margin: 0; font-size: var(--st-fs-sm); line-height: 1.5; color: var(--st-ink-muted); }
-.set-support > .st-icon, .update__support > .st-icon { flex: none; margin-top: 3px; color: var(--st-accent-text); }
-.set-support .support-link, .update__support .support-link { display: inline; font-weight: 600; }
-.update__support { flex-basis: 100%; padding: 10px 14px; border-radius: var(--st-r-md); font-size: var(--st-fs-md); color: var(--st-ink-soft);
-                   background: color-mix(in srgb, var(--st-accent) 12%, transparent); }
+.set-support { margin: 0; font-size: var(--st-fs-sm); line-height: 1.5; color: var(--st-ink-muted); }
+.set-support .support-link { display: inline; font-weight: 700; color: var(--st-accent-text); }   /* (the violet accent, both themes) */
 .set-note { margin: 0; padding: 12px 14px; border-radius: var(--st-r-md); background: var(--st-card); font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 
 /* an inset group: a fill with rounded corners, its rows split by a hairline; a caption above it, a note under it */

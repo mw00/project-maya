@@ -353,11 +353,11 @@ function Savings() {
 }
 
 // ------------------------------------------------------------------ About and updates
-// supporting Maya (GitHub Sponsors): one warm line, never a popup - on About, and as a row of its own under an update's
-// button (a little more visible there, still only where the update shows)
-const SupportLine = ({cls = "set-support"}) => html`<p class=${cls}><${Icon} name="heart" sm/><span>Maya is free and open, made by one
-  person with help from a small community. If it makes your work a little easier,${" "}<a class="support-link" href=${SUPPORT_URL}
-  target="_blank" rel="noopener" title="Sponsor Maya on GitHub">sponsoring it</a>, in any amount, helps it keep growing. Thank you.</span></p>`;
+// supporting Maya (GitHub Sponsors): one warm line on About, never a popup (the sidebar's heart is the other way in).  No
+// leading heart icon: the line ends with one
+const SupportLine = () => html`<p class="set-support"><span>I build Maya because I believe everyone should have access to great
+  local AI. If you enjoy what I'm building, consider${" "}<a class="support-link" href=${SUPPORT_URL} target="_blank" rel="noopener"
+  title="Sponsor Maya on GitHub">supporting me</a>. Every little bit helps keep the project alive and growing. ❤️</span></p>`;
 function UpdateCard() {
   const u = S.update, w = S.updateWatch;
   if (!w && (!u || !u.enabled)) return null;
@@ -398,8 +398,7 @@ function UpdateCard() {
   }
   return html`<div class=${`update${tone ? ` update--${tone}` : ""}`} aria-live="polite"><${Icon} name=${icon}/>
     <span class="update__text"><b>${title}</b>${text ? html`<span>${text}</span>` : null}${how ? html`<span class="update__how">${how}</span>` : null}</span>
-    ${acts ? html`<span class="update__acts">${acts}</span>` : null}
-    ${u && u.newer && !w && !(state && state.state) ? html`<${SupportLine} cls="update__support"/>` : null}</div>`;
+    ${acts ? html`<span class="update__acts">${acts}</span>` : null}</div>`;
 }
 // "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
 function gpuNames(name, count) {
@@ -470,10 +469,9 @@ function About() {
     if (log != null) { setLog(null); return; }
     try { setLog(await fetchReport()); } catch (e) { toast("error", "No report", e.message, 5000); }
   };
-  const newer = S.update && S.update.newer && !S.updateWatch;   // (then the ask is beside the update instead)
   return html`<${Head} title="About and updates"/>
     <${UpdateCard}/>
-    ${newer ? null : html`<${SupportLine}/>`}
+    <${SupportLine}/>
     <${Group} cap="This server"><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
     <${Group}>
     <div class="set-row set-row--top">

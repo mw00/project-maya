@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -830,6 +831,30 @@ console.log(JSON.stringify({set: m.tierSet(q).find((x) => x.key === "disk"), glm
         self.assertTrue(got["glm"].startswith("Many experts are read from the SSD"))
         self.assertEqual(got["stale"], "")
         self.assertTrue(got["cfCpu"].startswith("Most experts run on the CPU"))
+
+    def test_about_has_the_support_line_always_and_the_update_card_none(self):
+        # owner 2026-11-05: one line on About (always, also while an update shows), its link on "supporting me" in bold
+        # violet; no row under an update's button; the sidebar's heart stays
+        web = ROOT / "serve" / "web"
+        js = (web / "settings.js").read_text(encoding="utf-8")
+        line = js[js.index("const SupportLine"):js.index("function UpdateCard")]
+        body = line.split("<span>", 1)[1].split("</span></p>", 1)[0].replace('${" "}', " ")
+        text = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", body))
+        self.assertEqual(text, "I build Maya because I believe everyone should have access to great local AI. If you enjoy "
+                               "what I'm building, consider supporting me. Every little bit helps keep the project alive "
+                               "and growing. ❤️")
+        self.assertRegex(line, r'<a class="support-link" href=\$\{SUPPORT_URL\} target="_blank" rel="noopener"\s+'
+                               r'title="[^"]*">supporting me</a>')
+        self.assertNotIn('name="heart"', line)                               # (no second heart before the text)
+        card = js[js.index("function UpdateCard"):js.index("\n}\n", js.index("function UpdateCard"))]
+        self.assertNotIn("SupportLine", card)
+        self.assertIn("<${UpdateCard}/>\n    <${SupportLine}/>", js)               # (About: always, under the update)
+        css = (web / "settings.css").read_text(encoding="utf-8")
+        rule = re.search(r"\.set-support \.support-link \{([^}]*)\}", css).group(1)
+        self.assertIn("font-weight: 700", rule)
+        self.assertIn("color: var(--st-accent-text)", rule)
+        self.assertEqual(len(re.findall(r"--st-accent-text:\s*#", (web / "tokens.css").read_text(encoding="utf-8"))), 2)
+        self.assertIn("heart-link", (web / "sidebar.js").read_text(encoding="utf-8"))   # (the sidebar's heart stays)
 
     def test_context_slider_reaches_each_models_own_top(self):
         # the Models page's Context size: Settings > Model's stops over each model's range (its trained context, up to
