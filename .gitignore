@@ -39,6 +39,7 @@ td.log
 /.maya-switch.json
 /token-savings.json*
 /vision-memory.json
+/answers/
 /run-maya-*.sh
 /run-maya-*.bat
 /maya-report.txt

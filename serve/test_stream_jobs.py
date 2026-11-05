@@ -19,9 +19,11 @@ def chunks(n, gate=None, cancel=None):
 class StreamJobs(unittest.TestCase):
     def setUp(self):
         S.JOBS.clear()
+        S.JOBS_DIR = None
 
     def tearDown(self):
         S.JOBS.clear()
+        S.JOBS_DIR = None
 
     def wait_done(self, job, secs=5):
         t0 = time.time()
@@ -80,6 +82,76 @@ class StreamJobs(unittest.TestCase):
         self.assertFalse(cancel.is_set())
         gate.set()
         self.assertTrue(self.wait_done(running))
+
+
+class StreamJobFiles(StreamJobs.__bases__[0]):
+    """The answers on disk (answers/ beside the config): a restart of the server keeps them for the page."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        S.JOBS.clear()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name) / "answers"
+        self.assertEqual(S.jobs_load(self.dir), 0)
+
+    def tearDown(self):
+        S.JOBS.clear()
+        S.JOBS_DIR = None
+        self.tmp.cleanup()
+
+    def restart(self):
+        S.JOBS.clear()
+        S.JOBS_DIR = None
+        return S.jobs_load(self.dir)
+
+    def test_a_finished_answer_survives_a_restart(self):
+        job = S.StreamJob("chatcmpl-a1", chunks(40), threading.Event())
+        S.jobs_put(job)
+        StreamJobs.wait_done(self, job)
+        time.sleep(0.05)
+        self.assertEqual(self.restart(), 1)
+        back = S.JOBS["chatcmpl-a1"]
+        items, done = back.wait(0, 0)
+        self.assertTrue(done)
+        self.assertEqual(items, job.items)
+        self.assertAlmostEqual(back.ended, job.ended, places=3)
+
+    def test_an_answer_cut_by_a_stop_comes_back_with_a_note(self):
+        f = self.dir / "chatcmpl-cut.jsonl"
+        f.write_text('{"id": "x", "i": 0}\n{"id": "x", "i": 1}\n{"id": "x", "i"', encoding="utf-8")   # torn last line
+        self.assertEqual(self.restart(), 1)
+        items, done = S.JOBS["chatcmpl-cut"].wait(0, 0)
+        self.assertTrue(done)
+        self.assertEqual([c.get("i") for c in items[:2]], [0, 1])
+        self.assertEqual(items[-1]["error"]["message"], S.RESTARTED)
+
+    def test_old_files_and_strange_names_are_removed_and_eviction_deletes_the_file(self):
+        import os
+        old = self.dir / "chatcmpl-old.jsonl"
+        old.write_text('{"_done": 1}\n', encoding="utf-8")
+        os.utime(old, (time.time() - S.JOB_KEEP_S - 10,) * 2)
+        odd = self.dir / "bad name!.jsonl"
+        odd.write_text('{"_done": 1}\n', encoding="utf-8")
+        self.assertEqual(self.restart(), 0)
+        self.assertFalse(old.exists())
+        self.assertFalse(odd.exists())
+        job = S.StreamJob("chatcmpl-e", chunks(1), threading.Event())
+        S.jobs_put(job)
+        StreamJobs.wait_done(self, job)
+        time.sleep(0.05)
+        path = self.dir / "chatcmpl-e.jsonl"
+        self.assertTrue(path.exists())
+        job.ended = time.time() - S.JOB_KEEP_S - 1
+        S.jobs_put(S.StreamJob("chatcmpl-f", chunks(1), threading.Event()))
+        self.assertFalse(path.exists())
+
+    def test_without_a_folder_nothing_is_written(self):
+        S.JOBS_DIR = None
+        job = S.StreamJob("chatcmpl-ram", chunks(3), threading.Event())
+        StreamJobs.wait_done(self, job)
+        self.assertIsNone(job.log)
+        self.assertFalse((self.dir / "chatcmpl-ram.jsonl").exists())
 
 
 if __name__ == "__main__":
