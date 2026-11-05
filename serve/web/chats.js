@@ -222,23 +222,30 @@ export function apiMessages(chat, msgs = chat.messages, light = false) {
 }
 // An answer that used MCP tools goes back as the model wrote it: per round the text before the calls, the calls and their
 // results (as the model read them), then the rest - so the next question can build on what the tools found.
+// A model whose template keeps past thinking (the server's `history_thinking`: Qwen3.x) gets each answer's reasoning back
+// too, as `reasoning_content` - the conversation then reads exactly as the model wrote it, so the next message goes on
+// from where the engine is instead of reading the whole answer again (and it is the template's own default rendering).
 function assistantMessages(m) {
+  const reasoning = S.health && S.health.history_thinking && m.reasoning ? m.reasoning : "";
+  const think = (s) => s.trim() ? {reasoning_content: s} : {};
   const ran = (m.tools || []).filter((t) => t.round != null && t.result != null && t.state !== "skipped");
   // (an answer stopped before its text - while the model thought - goes back empty: without it the model reads two
   //  questions in a row and answers the one that was stopped)
-  if (!ran.length) return m.text ? [{role: "assistant", content: m.text}] : m.stopped ? [{role: "assistant", content: ""}] : [];
+  if (!ran.length) return m.text ? [{role: "assistant", content: m.text, ...think(reasoning)}] : m.stopped ? [{role: "assistant", content: ""}] : [];
   const out = [];
-  let pos = 0;
+  let pos = 0, rpos = 0;
   for (const r of [...new Set(ran.map((t) => t.round))]) {
     const calls = ran.filter((t) => t.round === r);
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
-    out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
+    const rat = Math.min(Math.max(rpos, calls[0].rat || 0), reasoning.length);
+    out.push({role: "assistant", content: m.text.slice(pos, at).trim(), ...think(reasoning.slice(rpos, rat)),
               tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
     for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
     pos = at;
+    rpos = rat;
   }
   const rest = m.text.slice(pos).trim();
-  if (rest) out.push({role: "assistant", content: rest});
+  if (rest) out.push({role: "assistant", content: rest, ...think(reasoning.slice(rpos))});
   return out;
 }
 

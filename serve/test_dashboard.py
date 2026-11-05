@@ -70,6 +70,14 @@ class Dashboard(unittest.TestCase):
         s, _, b = self.req("GET", "/health")
         self.assertEqual(json.loads(b)["version"], MAYA_VERSION)
 
+    def test_health_history_thinking(self):
+        """A Qwen3.x template keeps past thinking: the web chat is told to send it back (the GLM-5 one: not)."""
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], True)
+        self.svc.template = ChatTemplate(ROOT / "serve/glm5_chat_template.jinja")
+        s, _, b = self.req("GET", "/health")
+        self.assertIs(json.loads(b)["history_thinking"], False)
+
     def test_context_range(self):
         s, _, b = self.req("GET", "/api/context")
         j = json.loads(b)

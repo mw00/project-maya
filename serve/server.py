@@ -3718,6 +3718,35 @@ class Service:
                 smp["_think_soft"] = max(1, smp["_think_soft"] - len(produced))
         return smp
 
+    def _closed_as_rendered(self, ids, produced, think_end):
+        """The tokens the engine goes on from when the SERVER closes the thinking (its budget at a sentence's end, the
+        loop guard): `produced` (all reasoning, the prompt ending in the open <think>\\n) + think_end - written for a
+        Qwen3.x template the way that template renders the turn in the next request's history, `<think>\\n` +
+        reasoning.strip() + `\\n</think>\\n\\n` + the answer, in its tokenizer's own ids.  The bare close
+        (`...end.</think>`) read back differently there, so the next message read the whole answer again.  What the
+        client got is not changed (the reasoning's outer whitespace is the template's to strip).  None: as before (another
+        template, or a prompt / reasoning this does not apply to)."""
+        if not getattr(self.template, "qwen", False) or not produced:
+            return None
+        tok = self.tok
+        nl, open_ = tok.encode("\n"), tok.encode("<think>", parse_special=True)
+        if len(nl) != 1 or len(open_) != 1 or len(ids) < 2 or list(ids[-2:]) != [open_[0], nl[0]]:
+            return None
+        specials = set(self.stop_ids) | {think_end, open_[0]}
+        if any(t in specials for t in produced):
+            return None
+        try:
+            text = b"".join(tok.token_bytes(t) for t in produced).decode("utf-8")
+        except (UnicodeDecodeError, AttributeError, KeyError, IndexError):
+            return None
+        body = text.strip()
+        if not body:
+            return None
+        canon = tok.encode("\n" + body + "\n")   # (the chunk between <think> and </think> in the next render)
+        if not canon or canon[0] != nl[0]:
+            return None
+        return canon[1:] + [think_end] + tok.encode("\n\n")
+
     def _loop_guard_on(self, sampling) -> bool:
         """The loop guard for this request: its own "loop_guard" when it sends one, else the server's."""
         own = (sampling or {}).get("loop_guard")
@@ -3911,14 +3940,19 @@ class Service:
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
-                produced.append(think_end)
+                later = len(produced) - soft
+                canon = self._closed_as_rendered(ids, produced, think_end)
+                if canon is not None:                   # (the engine goes on from a checkpoint inside the answer)
+                    produced[:] = canon
+                else:
+                    produced.append(think_end)
                 sent = len(produced)
                 soft_text = None
                 yield think_end
                 if guard is not None:
                     guard.thinking_closed(produced)
                 print(f"[maya] thinking reached its budget ({soft} tokens): closed at the end of a sentence or line, "
-                      f"{len(produced) - 1 - soft} tokens later; answering", flush=True)
+                      f"{later} tokens later; answering", flush=True)
                 if cancel.is_set() or self.stopping:
                     break
                 cur, left = list(ids) + produced, max_new - len(produced)
@@ -5655,7 +5689,10 @@ def make_handler(svc: Service):
                                  "max_text_file": text_file_limit(svc.engine.max_context),
                                  "model_label": svc.model_label,   # (the model first: "GLM-5.3 · Maya-S24")
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
-                                 "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded})
+                                 "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded,
+                                 # the web chat sends past answers' thinking back (a Qwen3.x template keeps it): the
+                                 # history then reads as the model wrote it, and the next turn goes on from there
+                                 "history_thinking": bool(getattr(svc.template, "keeps_thinking", False))})
             elif path == "/api/context":
                 # the dashboard's Context size: the range, the measured cost of the current size, a reload's state
                 if self._authorized():

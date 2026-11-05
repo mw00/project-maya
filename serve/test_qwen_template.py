@@ -83,5 +83,47 @@ class Family(unittest.TestCase):
         self.assertIn("<think>\n\n</think>\n\n391<|im_end|>", tpl.render(m, t, **kw))
 
 
+class ServerClose(unittest.TestCase):
+    """The thinking closed by the server (its budget at a sentence's or line's end): the tokens the engine goes on from
+    are the ones the next request's history renders for that turn, so the next message continues the session."""
+
+    def svc(self, model="qwen"):
+        sys.path.insert(0, str(ROOT / "tools"))
+        from serve.server import MockEngine, Service
+        from serve.test_prompt_memo import MODELS, make_tokenizer
+        path, pre, control, user = MODELS[model]
+        tok = make_tokenizer(pre, control, user)
+        return Service(MockEngine(tok, "ok"), tok, ChatTemplate(ROOT / path)), tok
+
+    def test_the_close_is_the_next_turns_rendering(self):
+        svc, tok = self.svc()
+        think_end = tok.encode("</think>", parse_special=True)[0]
+        u1 = {"role": "user", "content": "What is 17*23?"}
+        u2 = {"role": "user", "content": "And times 3?"}
+        ids = svc.render_ids(*openai_to_messages({"messages": [u1]}))
+        for reasoning in ("Let me add: 17*20 = 340, plus 51.\nSo it is 391.", "First 17*20 = 340.\n\n",
+                          "\n  ünïcödé 日本語 🚀 and code:\n```python\nx = 1\n```\n"):
+            with self.subTest(repr(reasoning[:20])):
+                produced = tok.encode(reasoning)
+                canon = svc._closed_as_rendered(ids, produced, think_end)
+                self.assertIsNotNone(canon)
+                a1 = {"role": "assistant", "content": "391", "reasoning_content": tok.decode(produced)}
+                nxt = svc.render_ids(*openai_to_messages({"messages": [u1, a1, u2]}))
+                self.assertEqual(nxt[:len(ids) + len(canon)], ids + canon)
+                self.assertEqual(canon[-3:-2], [think_end])
+
+    def test_other_templates_and_prompts_keep_the_bare_close(self):
+        svc, tok = self.svc("qwen")
+        think_end = tok.encode("</think>", parse_special=True)[0]
+        produced = tok.encode("Done.")
+        self.assertIsNone(svc._closed_as_rendered(tok.encode("Hello"), produced, think_end))   # (no open <think>\n)
+        for model in ("glm5", "deepseek", "minimax"):
+            with self.subTest(model):
+                svc, tok = self.svc(model)
+                end = tok.encode("</think>", parse_special=True)[0]
+                ids = tok.encode("x<think>\n", parse_special=True)
+                self.assertIsNone(svc._closed_as_rendered(ids, tok.encode("Done."), end))
+
+
 if __name__ == "__main__":
     unittest.main()
