@@ -106,13 +106,88 @@ class ToolContracts(ResponseCase):
         events = self.stream(tools=TOOLS, tool_choice="required", max_output_tokens=3)
         self.assertEqual(events[-1]["type"], "response.incomplete")
 
-    def test_the_rejection_names_the_tool_type_and_the_include(self):
-        status, out = self.post(tools=[{"type": "web_search"}])
+    def test_the_rejection_names_the_include(self):
+        status, out = self.post(include=["file_search_call.results"])
         self.assertEqual(status, 400, out)
-        self.assertIn("web_search", json.dumps(out))
-        status, out = self.post(include=["reasoning.encrypted_content"], reasoning={"effort": "high"})
-        self.assertEqual(status, 400, out)
-        self.assertIn("reasoning.encrypted_content", json.dumps(out))
+        self.assertIn("file_search_call.results", json.dumps(out))
+
+    def test_codex_built_in_tools_are_left_out(self):
+        # Codex CLI 0.160.0 sends web_search next to its functions: Maya cannot run it, the model never sees it
+        self.script(CALL)
+        status, out = self.post(tools=[*TOOLS, {"type": "web_search", "external_web_access": False},
+                                       {"type": "local_shell"}], reasoning={"effort": "none", "summary": "auto"})
+        self.assertEqual(status, 200, out)
+        self.assertEqual(out["output"][0]["name"], "lookup")
+        self.assertEqual([t["type"] for t in out["tools"]], ["function", "web_search", "local_shell"])
+        prompt = self.tok.decode(self.engine.last_prompt)
+        self.assertNotIn("web_search", prompt)
+        self.assertNotIn("local_shell", prompt)
+
+    def test_codex_namespace_tools_round_trip(self):
+        # Codex CLI groups its sub-agent tools in a namespace; the model sees "ns::name", the client gets
+        # name + namespace back and sends the call that way in the next turn's history
+        space = {"type": "namespace", "name": "agents", "description": "Sub-agents.",
+                 "tools": [{**TOOLS[0], "name": "wait"}, {"type": "web_search"}]}
+        for script in (CALL, QWEN):
+            with self.subTest(script=script):
+                call_text = script.replace("lookup", "agents::wait")
+                self.script([call_text, "waited"])
+                events = self.stream(tools=[*TOOLS, space])
+                out = events[-1]["response"]
+                self.assertEqual(out["status"], "completed", out)
+                call = out["output"][0]
+                self.assertEqual((call["name"], call["namespace"]), ("wait", "agents"))
+                added = next(e for e in events if e["type"] == "response.output_item.added")
+                self.assertEqual((added["item"]["name"], added["item"]["namespace"]), ("wait", "agents"))
+                prompt = self.tok.decode(self.engine.last_prompt)
+                self.assertIn("agents::wait", prompt)
+                self.assertIn("Sub-agents.", prompt)
+                history = [{"role": "user", "content": "wait"}, *out["output"],
+                           {"type": "function_call_output", "call_id": call["call_id"], "output": "none left"}]
+                status, second = self.post(input=history, tools=[*TOOLS, space])
+                self.assertEqual(status, 200, second)
+                self.assertEqual(second["output"][0]["content"][0]["text"], "waited")
+                prompt = self.tok.decode(self.engine.last_prompt)
+                self.assertIn("agents::wait", prompt.split("Sub-agents.")[-1])   # the replayed call, not the tool list
+                self.assertIn("none left", prompt)
+        self.script('<parameter=key>alpha</parameter>\n</function>\n</tool_call>')   # the forced opening is the prompt's
+        status, out = self.post(tools=[*TOOLS, space],
+                                tool_choice={"type": "function", "name": "wait", "namespace": "agents"})
+        self.assertEqual((status, out["output"][0]["namespace"]), (200, "agents"), out)
+        self.assertIn("<function=agents::wait>", self.tok.decode(self.engine.last_prompt))
+        # a call to the namespace's function under its bare name is not a declared function
+        self.script(CALL.replace("lookup", "wait"))
+        self.assertEqual(self.stream(tools=[space])[-1]["type"], "response.failed")
+
+    def test_codex_encrypted_reasoning_round_trip(self):
+        # include reasoning.encrypted_content with store=false: the reasoning comes back as an opaque blob too;
+        # the next turn may send the text and the blob (Codex does), or the blob alone, or another server's blob
+        self.script(["check the sum</think>\n\n42", "ok", "ok", "ok"])
+        events = self.stream(reasoning={"effort": "high", "summary": "auto"}, include=["reasoning.encrypted_content"],
+                             store=False)
+        out = events[-1]["response"]
+        reasoning = out["output"][0]
+        self.assertEqual(reasoning["type"], "reasoning")
+        self.assertTrue(reasoning["encrypted_content"].startswith("maya-r1:"))
+        done = [e["item"] for e in events if e["type"] == "response.output_item.done"][0]
+        self.assertEqual(done["encrypted_content"], reasoning["encrypted_content"])
+        self.assertEqual(out["reasoning"]["summary"], "auto")
+        blob_only = {"type": "reasoning", "summary": [], "encrypted_content": reasoning["encrypted_content"]}
+        foreign = {"type": "reasoning", "summary": [], "encrypted_content": "gAAAAB-not-ours"}
+        for item, seen in ((reasoning, True), (blob_only, True), (foreign, False)):
+            with self.subTest(item=item):
+                history = [{"role": "user", "content": "What is the sum?"}, item, *out["output"][1:],
+                           {"role": "user", "content": "Check it"}]
+                status, second = self.post(input=history, include=["reasoning.encrypted_content"],
+                                           reasoning={"effort": "high"})
+                self.assertEqual(status, 200, second)
+                prompt = self.tok.decode(self.engine.last_prompt)
+                self.assertIn("42", prompt)
+                self.assertEqual("check the sum" in prompt, seen)
+        # without include, no blob
+        self.script("check the sum</think>\n\n42")
+        out = self.stream(reasoning={"effort": "high"})[-1]["response"]
+        self.assertNotIn("encrypted_content", out["output"][0])
 
     def test_codex_hints_and_reasoning_disabled_projection(self):
         status, out = self.post(prompt_cache_key="test-session", client_metadata={"session_id": "fixture"},
@@ -189,6 +264,23 @@ class DeepSeekToolContracts(ResponseCase):
                               strict_tools=True, single_tool=True)
         self.assertEqual(len([e for e in parser.feed(DSML + DSML) if e.kind == "tool_call"]), 1)
         self.assertEqual(parser.feed(DSML) + parser.finish(), [])
+
+    def test_codex_namespace_tools_round_trip(self):
+        space = {"type": "namespace", "name": "agents", "tools": [{**TOOLS[0], "name": "wait"}]}
+        call_text = DSML.replace('name="lookup"', 'name="agents::wait"')
+        for streamed in (False, True):
+            with self.subTest(stream=streamed):
+                self.script([call_text, "waited"])
+                out = (self.stream(tools=[*TOOLS, space])[-1]["response"] if streamed
+                       else self.post(tools=[*TOOLS, space])[1])
+                self.assertEqual(out["status"], "completed", out)
+                call = out["output"][0]
+                self.assertEqual((call["name"], call["namespace"]), ("wait", "agents"))
+                history = [{"role": "user", "content": "wait"}, *out["output"],
+                           {"type": "function_call_output", "call_id": call["call_id"], "output": "none left"}]
+                status, second = self.post(input=history, tools=[*TOOLS, space])
+                self.assertEqual((status, second["output"][0]["content"][0]["text"]), (200, "waited"), second)
+                self.assertIn(call_text, self.tok.decode(self.engine.last_prompt))
 
 
 if __name__ == "__main__":
