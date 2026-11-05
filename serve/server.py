@@ -1017,6 +1017,10 @@ class StrataEngine:
         except (OSError, TypeError):
             pass
         for line in reversed(tail.splitlines()):
+            if "GGUF prompt row reconstruction failed; stopping the engine" in line:
+                return ("The engine stopped because a GGUF prompt row failed to reconstruct; a fresh engine starts "
+                        "with the next request. Its log line: " + line.strip() +
+                        " - the earlier log lines give the underlying CUDA error or unsupported geometry.")
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/mw00/project-maya/issues.")
