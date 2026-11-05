@@ -1,0 +1,82 @@
+name: Bug report
+description: Something does not work, crashes, or gives a wrong answer
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `./maya.sh --report` (Windows: `START-MAYA.bat --report`) and attach the `maya-report.txt` it writes. It holds your hardware, your setup and the engine's log lines. Nothing is sent anywhere by itself, and API keys are left out.
+  - type: textarea
+    id: happened
+    attributes:
+      label: What happened
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Maya version
+      description: The `VERSION` file in the Maya folder, or Settings > About in the web page.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: Ubuntu 24.04, Windows 11, ...
+    validations:
+      required: true
+  - type: input
+    id: gpus
+    attributes:
+      label: GPU model(s) and VRAM
+      placeholder: 2x RTX 3090 24 GB
+    validations:
+      required: true
+  - type: input
+    id: cpu_ram
+    attributes:
+      label: CPU and RAM
+      placeholder: Ryzen 9 7950X, 96 GB
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: NVIDIA driver or ROCm version
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and quant
+      placeholder: GLM-5.3-Flash, Maya-S
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Context length
+  - type: textarea
+    id: command
+    attributes:
+      label: The command or config you used
+      description: For example `./maya.sh --setup --model glm-maya-s`, or the settings you changed.
+      render: shell
+  - type: textarea
+    id: report
+    attributes:
+      label: maya-report.txt
+      description: Drag the file here, or paste its text.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The engine's log is `maya-<model>.log` in the Maya folder (the report holds its last lines). Attach more of it if the problem is not in those lines.
+      render: text
