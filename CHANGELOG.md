@@ -1943,7 +1943,7 @@ button in the dashboard.
   the same engine (0.188 vs 0.291), it picks the FP8 model's next token 90% of the time, and it wrote two
   14,000-token answers without a loop. The most demanding of the four: fastest when VRAM and RAM hold most of its
   156 GB. It is the setup's fourth download, in place of the 3.5-bit community file offered before.
-  ([bench/results/MAYA-L.md](bench/results/MAYA-L.md))
+  ([bench/results/MAYA-L.md](docs/benchmarks/results/MAYA-L.md))
 - **Thinking levels are GLM's own:** Off / Low / High (the default) / Max in the dashboard, `none` / `low` / `high` /
   `max` in the API (OpenAI's `medium` is High and `xhigh` Max; Anthropic budgets under 2K tokens Low, under 8K High,
   else Max). The page's old "High" asked GLM for Max, its longest thinking; settings saved by the old page are
