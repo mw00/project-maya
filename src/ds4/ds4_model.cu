@@ -5155,7 +5155,10 @@ struct Model::Impl {
     }
     // RDNA 3 / 3.5 (gfx11, HIP): chunks of 4K tokens read a 16K prompt faster than the 32K / 16K default (Strix Halo,
     // Maya-XS, experts resident: 16K prompt 524 -> 550 tok/s, the first one after a start 475 -> 550; 1K 492, 256
-    // 340) - so the default is capped there; DS4_CHUNK_GFX11=N changes the cap, 0 leaves the default
+    // 340) - so the default is capped there. Only on an integrated GPU: a discrete card streams the experts its VRAM
+    // doesn't hold once per chunk, so the default's larger chunks read faster there (one RX 7900 XTX, Maya-XS, 13,198
+    // experts in RAM: a 6K prompt 529 -> 617-676 tok/s, 12K of prose 745 -> 1,000). DS4_CHUNK_GFX11=N sets the cap
+    // on every gfx11 GPU, 0 leaves the default
     int gfx11_chunk_cap(int C) const {
 #if defined(STRATA_USE_HIP)
         const char* e = std::getenv("DS4_CHUNK_GFX11");
@@ -5165,6 +5168,7 @@ struct Model::Impl {
             cudaDeviceProp prop{};
             if (cudaGetDeviceProperties(&prop, d.id) != cudaSuccess || std::strncmp(prop.gcnArchName, "gfx11", 5) != 0)
                 return C;
+            if (e == nullptr && prop.integrated == 0) return C;   // (a discrete card: the default)
         }
         return cap / 16 * 16;
 #else
