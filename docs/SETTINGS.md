@@ -2055,9 +2055,9 @@ host thread, device and stream, and keeps the existing path during graph capture
 ## DeepSeek: the indexer's scores on the matrix cores
 
 The sparse attention's indexer scores every earlier position of the context for each new row (prompt and answer).
-On RDNA 3 / 3.5 (`gfx11`: RX 7000, Radeon 780M, Strix Halo's 8060S / 8065S) these scores run on the WMMAs by
+On RDNA 3 / 3.5 (`gfx11`: RX 7000, Radeon 780M, Strix / Gorgon Halo's 8060S / 8065S) these scores run on the WMMAs by
 default: the same exact products, summed in another order than the portable kernel, so the last bits differ and a
-long greedy answer can part from the other kernel's after a while; the quality is the same (Strix Halo, DeepSeek EXL3
+long greedy answer can part from the other kernel's after a while; the quality is the same (a Gorgon Halo, DeepSeek EXL3
 2.25: KL to the full-precision model 0.1649 against 0.1661, the same top token 91.08% against 91.07%) and long
 prompts read faster (+3% at 8K, +6% at 32K, +10% at 64K; answers the same speed). RDNA 4 (`gfx12`) and other AMD
 cards keep the portable kernel. On NVIDIA it stays opt-in.
