@@ -63,6 +63,14 @@ class ChatTemplate:
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
         self.forced_thinking = bool(re.search(r"set\s+enable_thinking\s*=\s*true", self.source))
+        # A Qwen3.x template (Qwen3.8-Flash-Next's - unsloth's GGUF copy - and CYBER-FROST's): it writes each tool as
+        # `tool | tojson`, and Qwen's reference render (transformers' apply_chat_template, the pack's chat_golden.json)
+        # gets the tools in OpenAI's form - {"type": "function", "function": {...}} - so that is how they go in.
+        self.qwen = (not self.glm_effort and not self.deepseek and not self.minimax and "<|im_start|>" in self.source
+                     and "<function=" in self.source and "tool | tojson" in self.source)
+        # ... and it keeps a past turn's thinking (reasoning_content) unless told preserve_thinking=false: a client that
+        # sends the reasoning back gets the conversation as the model wrote it (the engine then goes on from it)
+        self.keeps_thinking = self.qwen and "preserve_thinking is undefined or preserve_thinking is true" in self.source
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -126,6 +134,8 @@ class ChatTemplate:
             # that same default to templates which use enable_thinking; templates which ignore it
             # remain unchanged.
             kwargs["enable_thinking"] = kwargs.get("enable_thinking") is not False
+        if self.qwen and tools:
+            tools = [t if "function" in t else {"type": "function", "function": t} for t in tools]
         out = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                    **kwargs)
         if off and add_generation_prompt and out.endswith("<think>"):
