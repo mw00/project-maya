@@ -134,7 +134,10 @@ bool set_down(const SetArgs& a, cudaStream_t s);
 /// The busy experts' path (a prompt's experts of many rows): one expert's matrix - n rows of k values, row_bytes(k)
 /// apart - as FP16 rows (ldd apart), the values the tensor-core tiles multiply (their loader's, rounded to FP16 the same
 /// way), for the caller's GEMM: the tiles decode an expert's weights again for every 64 of its rows.
-bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, cudaStream_t s);
+// On failure, launch_error distinguishes an unsupported type/shape (cudaSuccess)
+// from a CUDA launch failure. Existing callers may omit it.
+bool f16_rows(int type, const uint8_t* w, int k, int n, uint16_t* dst, int ldd, cudaStream_t s,
+              cudaError_t* launch_error = nullptr);
 /// dst[r] = x[idx[r]] for r < n (FP16 rows of k values; x ldx apart, dst k apart)
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, cudaStream_t s);
 /// h[r][c] = FP16 of the tiles' clamped SwiGLU of gu[r][c] (gate) and gu[r][ff + c] (up), F32 rows ld apart

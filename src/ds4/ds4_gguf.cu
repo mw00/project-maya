@@ -1840,7 +1840,14 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s, const PreQ8* pre) {
 
 void rows(const x3::Mat& m, uint16_t* dst, bool bf16, cudaStream_t s) {
     if (m.fmt == kFmtGG && m.raw != nullptr && !bf16) {   // (a low-bit dense matrix: ds4_iq's FP16 values of it)
-        if (!iq::f16_rows(m.gg_type, (const uint8_t*) m.raw, m.k, m.n, dst, m.k, s)) fail("rows: a low-bit type not covered");
+        cudaError_t launch_error = cudaSuccess;
+        if (!iq::f16_rows(m.gg_type, (const uint8_t*) m.raw, m.k, m.n, dst, m.k, s, &launch_error)) {
+            if (launch_error == cudaSuccess) fail("rows: a low-bit type or shape not covered");
+            else {
+                std::fprintf(stderr, "ds4 gguf rows: %s\n", cudaGetErrorString(launch_error));
+                g_errors.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         check("rows");
         return;
     }

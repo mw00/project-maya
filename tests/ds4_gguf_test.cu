@@ -722,6 +722,54 @@ void test_f16_rows(cudaStream_t s) {
     }
 }
 
+// Unsupported geometry must remain distinguishable from a CUDA launch error.
+// A destroyed stream produces an invalid-resource launch without exhausting
+// device memory or executing a kernel with invalid memory accesses.
+void test_f16_rows_launch_error(cudaStream_t s) {
+    uint8_t* dw = nullptr;
+    uint16_t* dh = nullptr;
+    CU(cudaMalloc(&dw, 512));
+    CU(cudaMalloc(&dh, 512));
+    cudaError_t error = cudaErrorUnknown;
+    const bool bad_shape = gg::iq::f16_rows(gg::iq::kIQ1_S, dw, 255, 1, dh, 256, s, &error);
+    const bool shape_ok = !bad_shape && error == cudaSuccess;
+    cudaStream_t destroyed = nullptr;
+    CU(cudaStreamCreateWithFlags(&destroyed, cudaStreamNonBlocking));
+    CU(cudaStreamDestroy(destroyed));
+    error = cudaSuccess;
+    const bool launched = gg::iq::f16_rows(gg::iq::kIQ1_S, dw, 256, 1, dh, 256, destroyed, &error);
+    const bool launch_ok = !launched && error != cudaSuccess;
+    if (!shape_ok || !launch_ok) ++g_fail;
+    std::printf("%-52s %s  shape %s; launch %s\n", "f16_rows reports CUDA launch errors",
+                shape_ok && launch_ok ? "ok  " : "FAIL", shape_ok ? "ok" : "FAIL", launch_ok ? "ok" : "FAIL");
+    CU(cudaFree(dw));
+    CU(cudaFree(dh));
+}
+
+// Run separately: deliberately increments the GGUF launch-error counter.
+void test_rows_launch_error_diagnostic() {
+    uint8_t* dw = nullptr;
+    uint16_t* dh = nullptr;
+    CU(cudaMalloc(&dw, 512));
+    CU(cudaMalloc(&dh, 512));
+    cudaStream_t destroyed = nullptr;
+    CU(cudaStreamCreateWithFlags(&destroyed, cudaStreamNonBlocking));
+    CU(cudaStreamDestroy(destroyed));
+    x3::Mat m{};
+    m.fmt = gg::kFmtGG;
+    m.gg_type = gg::iq::kIQ1_S;
+    m.raw = dw;
+    m.k = 256;
+    m.n = 1;
+    const int before = gg::launch_errors();
+    gg::rows(m, dh, false, destroyed);
+    const bool ok = gg::launch_errors() == before + 1;
+    if (!ok) ++g_fail;
+    std::printf("%-52s %s\n", "GGUF rows records the CUDA launch error", ok ? "ok  " : "FAIL");
+    CU(cudaFree(dw));
+    CU(cudaFree(dh));
+}
+
 // every low-bit type's decode against ggml's own dequantize_row_* on random blocks: the token / window / light
 // kernels' codes times their scales, and the prompt tiles' loader - each value equal to ggml's (a zero's sign aside);
 // IQ1_M with the persistent kernels on (its code table) and off (the grid)
@@ -3276,6 +3324,12 @@ int main(int argc, char** argv) {
         bench_cpu(argc >= 3 ? std::atoi(argv[2]) : 1);
         return 0;
     }
+    if (argc >= 2 && std::strcmp(argv[1], "--f16-rows-errors") == 0) {
+        test_f16_rows_launch_error(s);
+        test_rows_launch_error_diagnostic();
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc >= 2 && std::strcmp(argv[1], "--q8k") == 0) {   // the low-bit activations' Q8_K rounding (DS4_IQ_Q8K)
         test_q8k(s);
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
@@ -3345,6 +3399,7 @@ int main(int argc, char** argv) {
     test_experts(512, 256, s);
     test_decode_values(s);
     test_f16_rows(s);
+    test_f16_rows_launch_error(s);
     for (int t : kQTypes) test_mv_q(t, s);
     test_mv_rows(s);
     test_decode_trims(s);
