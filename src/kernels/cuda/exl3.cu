@@ -404,6 +404,28 @@ __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], u
         decode_states<cb>(s, f);
         return;
     }
+    if constexpr (Perm && (K2 & 1) != 0 && Words<K2>::R == 1) {
+        // a half-integer K without the stage: frag8_half's four words fetched from the lanes holding them (lane i
+        // holds word i) by ds_bpermute - no LDS write, no syncs.  The same words, so the same states and bits
+        constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
+        const int v = (int) w[0];
+        const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // (frag8_half's: one ring on, no negative bit index)
+        uint32_t s[8];
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const int e = e7 - (1 - g) * 2 * K2;
+            const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
+            const uint32_t whi = (uint32_t) __builtin_amdgcn_ds_bpermute((hi % NW) << 2, v);
+            const uint32_t wlo = (uint32_t) __builtin_amdgcn_ds_bpermute((lo % NW) << 2, v);
+            const uint32_t x = fsh(whi, wlo, sh);
+            s[4 * g + 3] = x;
+            s[4 * g + 2] = x >> (KA + 1);
+            s[4 * g + 1] = x >> (2 * KA + 1);
+            s[4 * g + 0] = x >> (3 * KA + 2);
+        }
+        decode_states<cb>(s, f);
+        return;
+    }
 #endif
     if constexpr (K2 == 8) {
         uint32_t s[8];
@@ -3177,10 +3199,10 @@ static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{
     f(std::integral_constant<int, 16>{});   // (sm_7x: 32 rows' gate/up block is over the 48 KB of static shared memory)
 #endif
 }
-// gfx11 (an RX 7900 XTX, DeepSeek-V4.1's experts): each bitrate its block shape - K2 4 (K = 2) at 32 rows a block,
-// its words by permlane, fitted to 8 waves a SIMD (-18 % kernel time: the freed registers let 32 rows and 8 waves fit
-// together); the others at 16 rows with 8 waves (-4 %).  The same bits.  Other GPUs, EXL3_WMMA_ROWS set or
-// EXL3_WMMA_SHAPE=0: the uniform blocks as before
+// gfx11 (an RX 7900 XTX, DeepSeek-V4.1's experts): K2 4 and 5 (K = 2 and 2.5) with their tile words moved between
+// lanes (permlane / ds_bpermute, no LDS stage), fitted to 8 waves a SIMD, 32 rows a block once a set has 64 rows
+// (-17 to -18.5 % kernel time from 128 rows a set, none lost below; the freed registers let 32 rows and 8 waves fit
+// together).  The same bits.  Other K2, other GPUs, EXL3_WMMA_ROWS set or EXL3_WMMA_SHAPE=0: the uniform blocks
 static bool wmma_shape() {
 #if defined(STRATA_USE_HIP)
     static const bool off = std::getenv("EXL3_WMMA_ROWS") != nullptr ||
@@ -3203,12 +3225,17 @@ static bool wmma_shape() {
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
-        if (wmma_shape()) {
-            constexpr int NR = K2 == 4 ? 32 : 16;
-            wmma_set8_kernel<K2, cb, true, NR, K2 == 4><<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp),
-                                                          kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
-            return;
-        }
+        if constexpr (K2 == 4 || K2 == 5)
+            if (wmma_shape()) {
+                auto go = [&](auto nr) {
+                    constexpr int NR = decltype(nr)::value;
+                    wmma_set8_kernel<K2, cb, true, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp),
+                                                               kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+                };
+                if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
+                else go(std::integral_constant<int, 16>{});
+                return;
+            }
 #endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
@@ -3220,13 +3247,19 @@ template <int K2, int cb> struct RunWmmaGateUp {
 template <int K2, int cb> struct RunWmmaDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
 #if defined(STRATA_USE_HIP)
-        if (wmma_shape()) {
-            constexpr int NR = K2 == 4 ? 32 : 16;
-            wmma_set8_kernel<K2, cb, false, NR, K2 == 4><<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp),
-                                                           kThreads, 0, s>>>(a, nullptr, 0, nullptr,
-                                                                             const_cast<uint16_t*>(h), ldh, y, ldy);
-            return;
-        }
+        if constexpr (K2 == 4 || K2 == 5)
+            if (wmma_shape()) {
+                auto go = [&](auto nr) {
+                    constexpr int NR = decltype(nr)::value;
+                    wmma_set8_kernel<K2, cb, false, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols,
+                                                                     a.n_exp),
+                                                                kThreads, 0, s>>>(a, nullptr, 0, nullptr,
+                                                                                  const_cast<uint16_t*>(h), ldh, y, ldy);
+                };
+                if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
+                else go(std::integral_constant<int, 16>{});
+                return;
+            }
 #endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
