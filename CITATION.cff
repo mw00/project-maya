@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Project Maya in published work, cite it as below."
+title: "Project Maya: a local inference engine for frontier-scale mixture-of-experts models"
+type: software
+authors:
+  - name: "Peasant Smith"
+    alias: mw00
+    website: "https://github.com/mw00"
+repository-code: "https://github.com/mw00/project-maya"
+url: "https://github.com/mw00/project-maya"
+license: MIT
+version: "1.1.55"
+date-released: "2026-11-05"
+keywords:
+  - local inference
+  - mixture of experts
+  - GLM
+  - DeepSeek
+  - MiniMax
+  - quantization
+  - GGUF
+  - ROCm
+  - CUDA

@@ -1,0 +1,91 @@
+name: Speed report
+description: Report tokens per second for a model on your machine
+title: "Speed report: <model> / <quant> on <GPU>"
+labels: ["speed-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks - reports like this build the public speed table. Measure the way `--bench` does: a warm model,
+        three greedy 256-token answers, thinking off, and prefill at 2048 and 8192 tokens. Say what you measured
+        and what you did not.
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model(s) and count
+      placeholder: "2x RTX 4090 24 GB"
+    validations:
+      required: true
+  - type: input
+    id: vram
+    attributes:
+      label: Total VRAM
+      placeholder: "48 GB"
+    validations:
+      required: true
+  - type: input
+    id: cpu
+    attributes:
+      label: CPU and core count
+      placeholder: "Ryzen 9 5950X, 16 cores"
+    validations:
+      required: true
+  - type: input
+    id: ram
+    attributes:
+      label: System RAM
+      placeholder: "128 GB DDR5"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Docker
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model and quant
+      placeholder: "GLM-5.3-Flash / Maya-M"
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Context length used
+      placeholder: "32768"
+    validations:
+      required: true
+  - type: input
+    id: ttft
+    attributes:
+      label: Time to first token (ms)
+  - type: input
+    id: prefill
+    attributes:
+      label: Prefill tokens/s
+  - type: input
+    id: decode
+    attributes:
+      label: Decode tokens/s
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command and MAYA_* overrides
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Thermals, other load, variance between runs, tuning you did.

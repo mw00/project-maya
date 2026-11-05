@@ -1,0 +1,7 @@
+# Default owner for everything.
+* @mw00
+
+# Kernel and quant changes need the co-maintainer as well.
+/src/kernels/ @mw00 @needmorevram
+/tools/maya_quant/ @mw00 @needmorevram
+/docs/ @mw00

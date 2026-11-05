@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://github.com/mw00/project-maya/blob/main/docs/README.md
+    about: Setup, settings, models, compatibility, troubleshooting.
+  - name: FAQ
+    url: https://github.com/mw00/project-maya/blob/main/docs/FAQ.md
+    about: Short answers to the questions that come up most.
+  - name: Questions and show and tell
+    url: https://github.com/mw00/project-maya/discussions
+    about: Ask a question or show what you run, instead of opening an issue.
+  - name: Model downloads
+    url: https://huggingface.co/peasantsmith
+    about: Maya quants and model cards on Hugging Face.

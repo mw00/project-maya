@@ -1,0 +1,75 @@
+name: Bug report
+description: Something broke, hung, crashed or gave a wrong answer
+title: "Bug: "
+labels: ["bug", "needs-repro"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Run `./maya.sh --report` (Windows: `START-MAYA.bat --report`) right after the problem and attach
+        `maya-report.txt`. It holds your hardware, setup and the engine's speed lines.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Maya version
+      description: Output of `cat VERSION`, or the release tag.
+      placeholder: "1.1.55"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Docker
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU model(s), count and VRAM
+      placeholder: "2x RTX 3090 24 GB"
+    validations:
+      required: true
+  - type: input
+    id: driver
+    attributes:
+      label: Driver / CUDA or ROCm version
+      placeholder: "NVIDIA 580.95, CUDA 12.9 / ROCm 7.0"
+  - type: input
+    id: model
+    attributes:
+      label: Model and quant
+      placeholder: "GLM-5.3-Flash / Maya-S24"
+    validations:
+      required: true
+  - type: input
+    id: context
+    attributes:
+      label: Context length
+      placeholder: "32768"
+  - type: textarea
+    id: command
+    attributes:
+      label: Command line and MAYA_* settings
+      description: The exact engine command, plus any MAYA_* variables you set.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log excerpt or report
+      description: Attach `maya-report.txt`, and the end of `maya-<model>.log` if the engine stopped.
+      render: text
