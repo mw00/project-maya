@@ -5,9 +5,9 @@ There is no official Maya image yet. This page is a recipe to build one from a r
 it and, if you ask, pushes it. Back to the [README](../README.md).
 
 ```bash
-git checkout v1.1.53
-docker/build.sh                 # project-maya:1.1.53-cuda13: RTX 20 / 30 / 40 / 50, A100, the A-series
-docker/build.sh --cuda 12       # project-maya:1.1.53-cuda12: the same, plus the V100
+git checkout v1.1.54
+docker/build.sh                 # project-maya:1.1.54-cuda13: RTX 20 / 30 / 40 / 50, A100, the A-series
+docker/build.sh --cuda 12       # project-maya:1.1.54-cuda12: the same, plus the V100
 ```
 
 Almost all of a build's time is compiling the engines. `--archs "86"` builds for one kind of card only, so it compiles
@@ -104,7 +104,7 @@ experts they copy into RAM for the GPUs:
 ```bash
 docker run --rm --gpus all --ulimit memlock=-1 -p 8080:8080 \
   -v /path/to/models:/models:ro -v maya-data:/data \
-  project-maya:1.1.53-cuda13 \
+  project-maya:1.1.54-cuda13 \
   /opt/maya/.venv/bin/python /opt/maya/serve/server.py --engine maya --config /data/<model>/<config>.json \
     --host 0.0.0.0 --port 8080
 ```
