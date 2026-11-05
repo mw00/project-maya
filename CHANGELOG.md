@@ -4,7 +4,7 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
-## v1.1.55 - 2026-11-06
+## v1.1.55 - 2026-11-05
 
 Codex CLI works with Maya, web-chat answers always run to their end and survive a restart, and a few speed settings now on by default.
 
