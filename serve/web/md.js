@@ -2,6 +2,7 @@
 // syntax highlighter (no library), and the code blocks' buttons.  Streaming answers are patched in place (patchHtml).
 import {SPRITE, esc, download} from "./lib.js";
 import {copyText, openDialog} from "./state.js";
+import {languageChoice, tr} from "./i18n.js";
 
 const ico = (name) => `<svg class="st-icon st-icon--sm" aria-hidden="true"><use href="${SPRITE}#i-${name}"/></svg>`;
 
@@ -93,11 +94,11 @@ export const isHtmlCode = (lang, code) => ["html", "htm", "xhtml"].includes((lan
 export function codeBlock(lang, code, complete = true) {
   const l = (lang || "").trim().split(/\s+/)[0] || "";
   const btn = (attr, name, title) =>
-    `<button type="button" class="code__btn" ${attr} aria-label="${title}" title="${title}">${ico(name)}</button>`;
+    `<button type="button" class="code__btn" ${attr}${attr === "data-code-wrap" ? ' aria-pressed="false"' : ""} aria-label="${esc(tr(title))}" title="${esc(tr(title))}">${ico(name)}</button>`;
   const actions = (complete && isHtmlCode(l, code) ? btn("data-code-preview", "eye", "Preview this page") : "") +
     btn("data-code-wrap", "wrap", "Wrap long lines") + btn("data-code-download", "download", "Download as a file") +
-    `<button type="button" class="code__btn code__btn--label" data-code-copy aria-label="Copy the code">${ico("copy")}<span>Copy</span></button>`;
-  return `<div class="code" data-lang="${esc(l)}"><div class="code__head"><span class="code__lang">${esc(l || "code")}</span>` +
+    `<button type="button" class="code__btn code__btn--label" data-code-copy aria-label="${esc(tr("Copy the code"))}">${ico("copy")}<span>${esc(tr("Copy"))}</span></button>`;
+  return `<div class="code" data-lang="${esc(l)}"><div class="code__head"><span class="code__lang">${esc(l || tr("code"))}</span>` +
     `<span class="code__actions">${actions}</span></div><pre><code>${highlight(code, l)}</code></pre></div>`;
 }
 // a list, nested by indentation: [{indent, ordered, start, text}]
@@ -182,7 +183,11 @@ export function markdown(text) {
 export function streamingMarkdown(m) {
   const t = m.text;
   if (t.length < 6000) return markdown(t);
-  const c = m._md || (Object.defineProperty(m, "_md", {value: {upto: 0, html: ""}, enumerable: false, writable: true}), m._md);
+  const lang = languageChoice();
+  if (!m._md || m._md.lang !== lang) Object.defineProperty(m, "_md", {
+    value: {upto: 0, html: "", lang}, enumerable: false, writable: true, configurable: true,
+  });
+  const c = m._md;
   let cut = t.lastIndexOf("\n\n", t.length - 3);
   while (cut > c.upto && ((t.slice(0, cut).match(/(^|\n)```/g) || []).length % 2)) cut = t.lastIndexOf("\n\n", cut - 1);
   if (cut > c.upto) { c.html += markdown(t.slice(c.upto, cut)); c.upto = cut; }
@@ -215,7 +220,11 @@ function patchCode(a, b) {
   if (code.innerHTML !== nc.innerHTML) code.innerHTML = nc.innerHTML;
   if (atEnd) pre.scrollTop = pre.scrollHeight;
   const ah = a.querySelector(".code__actions"), bh = b.querySelector(".code__actions");
-  if (ah && bh && ah.children.length !== bh.children.length) ah.replaceWith(bh);
+  const wrap = bh && bh.querySelector("[data-code-wrap]");
+  if (wrap) wrap.setAttribute("aria-pressed", String(a.classList.contains("is-wrapped")));
+  if (ah && bh && !ah.isEqualNode(bh)) ah.replaceWith(bh);
+  const al = a.querySelector(".code__lang"), bl = b.querySelector(".code__lang");
+  if (al && bl && al.textContent !== bl.textContent) al.textContent = bl.textContent;
 }
 
 // ------------------------------------------------------------------ the code blocks' buttons (answers and Settings' examples)
@@ -227,8 +236,8 @@ export function onCodeClick(e) {
     copyText(code, true);
     const use = b.querySelector("use"), label = b.querySelector("span");
     use.setAttribute("href", `${SPRITE}#i-check`);
-    if (label) label.textContent = "Copied";
-    setTimeout(() => { use.setAttribute("href", `${SPRITE}#i-copy`); if (label) label.textContent = "Copy"; }, 1500);
+    if (label) label.textContent = tr("Copied");
+    setTimeout(() => { use.setAttribute("href", `${SPRITE}#i-copy`); if (label) label.textContent = tr("Copy"); }, 1500);
   } else if (b.hasAttribute("data-code-wrap")) {
     block.classList.toggle("is-wrapped");
     b.setAttribute("aria-pressed", String(block.classList.contains("is-wrapped")));
@@ -241,13 +250,12 @@ export function onCodeClick(e) {
 export function previewHtml(code) {
   const wrap = document.createElement("div");
   wrap.className = "preview";
-  wrap.innerHTML = `<p class="muted small">Runs in a sandbox, cut off from this page. Scripts it loads from the web (a
-    three.js CDN, say) come from the internet.</p>`;
+  wrap.innerHTML = `<p class="muted small">${esc(tr("Runs in a sandbox, cut off from this page. Scripts it loads from the web (a three.js CDN, say) come from the internet."))}</p>`;
   const f = document.createElement("iframe");
   f.className = "preview__frame";
   f.setAttribute("sandbox", "allow-scripts allow-pointer-lock allow-modals");
-  f.setAttribute("title", "Preview");
+  f.setAttribute("title", tr("Preview"));
   f.srcdoc = code;
   wrap.appendChild(f);
-  openDialog({title: "Preview", node: wrap, wide: true});
+  openDialog({title: tr("Preview"), node: wrap, wide: true});
 }

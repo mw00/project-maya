@@ -17,6 +17,7 @@ import {codeBlock, onCodeClick} from "./md.js";
 import {openModelSheet} from "./models.js";
 import {TurboButton} from "./turbo.js";
 import {CtxSlider, Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
+import {languageChoice, setLanguage, t, tr} from "./i18n.js";
 
 const GROUPS = [
   {label: "General", items: [{id: "general", label: "Appearance", icon: "settings"},
@@ -40,7 +41,7 @@ const Group = ({cap, note, children, cls = ""}) => html`<section class="set-sec"
   <div class=${`set-group ${cls}`}>${children}</div>${note ? html`<p class="set-foot-note">${note}</p>` : null}</section>`;
 
 const Row = ({label, sub, children, htmlFor, cls = ""}) => html`<div class=${`set-row ${cls}`}>
-  <span class="set-row__text">${htmlFor ? html`<label for=${htmlFor}>${label}</label>` : html`<span class="set-row__label">${label}</span>`}
+  <span class="set-row__text">${htmlFor ? html`<label for=${htmlFor}>${label}</label>` : html`<span class="set-row__label">${tr(label)}</span>`}
     ${sub ? html`<span class="set-row__sub">${sub}</span>` : null}</span>
   <span class="set-row__ctl">${children}</span></div>`;
 
@@ -51,19 +52,22 @@ const ENGINES = {"glm-fast": "GLM fast path", ds4: "DeepSeek-V4.1 (maya-ds4)", m
 function General() {
   const keys = [["Send", "Enter"], ["New line", "Shift Enter"], ["New chat", `${MOD} Shift O`], ["Search chats", `${MOD} K`],
                 ["Stop the answer", "Esc"], ["Settings", `${MOD} ,`], ["Show or hide the sidebar", `${MOD} Shift S`]];
-  return html`<${Head} title="Appearance"/>
+  return html`<${Head} title=${tr("Appearance")}/>
     <${Group}>
-    <${Row} label="Theme" sub="System follows your computer's light or dark setting.">
-      <${Seg} label="Theme" value=${themeChoice()} onChange=${setTheme}
-        options=${[{id: "system", label: "System"}, {id: "dark", label: "Dark"}, {id: "light", label: "Light"}]}/><//>
-    <${Row} label="Colours" sub="Default: neutral greys with violet as the accent. Violet: violet-tinted surfaces and a soft glow.">
-      <${Seg} label="Colours" value=${schemeChoice()} onChange=${setScheme}
-        options=${[{id: "default", label: "Default"}, {id: "violet", label: "Violet"}]}/><//>
-    <${Row} label="Show thinking as it's written" sub="It folds away into “Thought for …” once the answer starts.">
-      <${Switch} label="Show thinking as it's written" on=${P.show} onChange=${(v) => savePrefs({show: v})}/><//><//>
-    ${isPhone() ? null   /* (a phone: Enter is a new line and there are no shortcuts to list) */
-      : html`<${Group} cap="Keyboard shortcuts" cls="set-group--keys">
-      ${keys.map(([w, k]) => html`<span class="keys__row"><span>${w}</span><${Kbd} k=${k}/></span>`)}<//>`}`;
+    <${Row} label=${t("language", "Language")} sub=${t("language-help", "The interface language is saved in this browser. Untranslated text stays in English.")}>
+      <${Seg} label=${t("language", "Language")} value=${languageChoice()} onChange=${setLanguage}
+        options=${[{id: "en", label: t("english", "English")}, {id: "zh-CN", label: t("simplified-chinese", "Simplified Chinese")}]}/><//>
+    <${Row} label=${tr("Theme")} sub=${tr("System follows your computer's light or dark setting.")}>
+      <${Seg} label=${tr("Theme")} value=${themeChoice()} onChange=${setTheme}
+        options=${[{id: "system", label: tr("System")}, {id: "dark", label: tr("Dark")}, {id: "light", label: tr("Light")}]}/><//>
+    <${Row} label=${tr("Colours")} sub=${tr("Default: neutral greys with violet as the accent. Violet: violet-tinted surfaces and a soft glow.")}>
+      <${Seg} label=${tr("Colours")} value=${schemeChoice()} onChange=${setScheme}
+        options=${[{id: "default", label: tr("Default")}, {id: "violet", label: tr("Violet")}]}/><//>
+    <${Row} label=${tr("Show thinking as it's written")} sub=${tr("It folds away into “Thought for …” once the answer starts.")}>
+      <${Switch} label=${tr("Show thinking as it's written")} on=${P.show} onChange=${(v) => savePrefs({show: v})}/><//>
+    ${isPhone() ? null
+      : html`<${Group} cap=${tr("Keyboard shortcuts")} cls="set-group--keys">
+      ${keys.map(([w, k]) => html`<span class="keys__row"><span>${tr(w)}</span><${Kbd} k=${k}/></span>`)}<//>`}<//>`;
 }
 
 // ------------------------------------------------------------------ the running model and its context size (Chat defaults)
@@ -75,34 +79,34 @@ function ModelCtx() {
   const e = c ? ctxEstimate(v) : null;
   // (the same line as the Models page's slider: the engine's measurement; GLM's streamed cache: 12 KB a token in RAM)
   const glmWin = eng.engine_kind === "glm-fast" && c && +c.kv_resident > 0 ? +c.kv_resident : 0;
-  const est = S.reload ? `Reloading with a ${ctxfmt(S.reload.to)} context…`
+  const est = S.reload ? `${tr("Reloading with a")} ${ctxfmt(S.reload.to)} ${tr("context…")}`
     : ctxHint(v, {live: true, now: c && c.context, win: glmWin, whole: true, ram: glmWin ? GLM_KV_BYTES : 0});
   const warns = [];
   if (c && changed) {
     const tested = c.tested || 262144;   // (the largest context run end to end on this engine)
-    if (v > tested) warns.push(`Beyond ${ctxfmt(tested)} is untested on this engine.`);
-    if (e && e.vram && e.gb > e.vram * 0.6) warns.push("That leaves little GPU memory for experts: answers get much slower, and it may not start (the current size then comes back).");
+    if (v > tested) warns.push(`${tr("Beyond")} ${ctxfmt(tested)} ${tr("is untested on this engine.")}`);
+    if (e && e.vram && e.gb > e.vram * 0.6) warns.push(tr("That leaves little GPU memory for experts: answers get much slower, and it may not start (the current size then comes back)."));
     // (8 GB kept for the system: the pinned cache comes out of the RAM the experts not in VRAM use)
-    if (e && e.ram && e.free != null && e.delta > e.free - 8) warns.push("That takes more RAM than is free now: fewer experts stay in RAM (answers slower), and it may not start (the current size then comes back).");
-    warns.push(`Reloading takes ${loadTime()}; your chats stay, and other apps are asked to try again meanwhile.`);
+    if (e && e.ram && e.free != null && e.delta > e.free - 8) warns.push(tr("That takes more RAM than is free now: fewer experts stay in RAM (answers slower), and it may not start (the current size then comes back)."));
+    warns.push(`${tr("Reloading takes")} ${loadTime()}${tr("; your chats stay, and other apps are asked to try again meanwhile.")}`);
   }
   const engine = ENGINES[eng.engine_kind] || eng.engine_kind;
   const reload = async () => {
     const tokens = S.ctx.tokens != null ? S.ctx.tokens : estimateTokens(S.current.messages);
     if (await confirmContext(v, tokens)) setCtx(null);
   };
-  return html`<${Group} cap="The running model">
+  return html`<${Group} cap=${tr("The running model")}>
     <div class="model-card"><${ModelLogo} model=${h.model} size=${36}/>
       <span><b>${modelName(h.model)}</b><span>${[h.model, engine, h.version ? `Project Maya v${h.version}` : ""].filter(Boolean).join(" · ")}</span></span></div>
     ${c ? html`<div class="set-block">
-      <${CtxSlider} id="set-ctx" value=${v} now=${c.context} stops=${stops} disabled=${!!S.reload} hint=${est}
+      <${CtxSlider} id="set-ctx" label=${tr("Context size")} value=${v} now=${c.context} stops=${stops} disabled=${!!S.reload} hint=${est}
         onChange=${(n) => setCtx(stops.indexOf(n))}/>
       ${changed ? html`<div class="callout callout--warn"><span>${warns.join(" ")}</span>
-        <button type="button" class="btn btn--primary btn--sm" onClick=${reload}>Reload with ${ctxfmt(v)}</button></div>` : null}
-    </div>` : html`<p class="set-note">This server does not say its context range, so it can't be changed from here.</p>`}
-    ${c ? html`<${Row} label="Engine settings" sub="The context size is on the Models page too, with this model's other engine settings: one setting, the same value.">
+        <button type="button" class="btn btn--primary btn--sm" onClick=${reload}>${tr("Reload with")} ${ctxfmt(v)}</button></div>` : null}
+    </div>` : html`<p class="set-note">${tr("This server does not say its context range, so it can't be changed from here.")}</p>`}
+    ${c ? html`<${Row} label=${tr("Engine settings")} sub=${tr("The context size is on the Models page too, with this model's other engine settings: one setting, the same value.")}>
       <button type="button" class="btn btn--ghost btn--sm" onClick=${() => { S.settings = null; openModelSheet("engine"); }}>
-        Models<${Icon} name="chevron-right" sm/></button><//>` : null}
+        ${tr("Models")}<${Icon} name="chevron-right" sm/></button><//>` : null}
     <${Port}/><//>`;
 }
 
@@ -113,13 +117,13 @@ function Port() {
   const pi = S.portInfo, pv = /^\d+$/.test(port.trim()) ? +port.trim() : null;
   const portChanged = pi && pv != null && pv !== pi.port;
   return html`${pi && pi.port && pi.saved ? html`
-      <${Row} label="Port" htmlFor="set-port" sub="Where this page and the API listen. A new port starts Maya again there, and this page follows.">
+      <${Row} label=${tr("Port")} htmlFor="set-port" sub=${tr("Where this page and the API listen. A new port starts Maya again there, and this page follows.")}>
         <input id="set-port" class="input input--num" inputmode="numeric" value=${port} onInput=${(ev) => setPort(ev.target.value)}/><//>
       ${portChanged ? html`<div class="callout callout--warn">
-        <span>${pv < 1024 || pv > 65535 ? "Use a number from 1024 to 65535."
-          : pi.restarts ? `Maya starts again on port ${pv} (${loadTime()}). Apps that use the API need the new address too.`
-                        : `Saved for the next start: this server was not started by Maya's start script, so it stays on ${pi.port} until then.`}</span>
-        ${pv >= 1024 && pv <= 65535 ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${() => confirmPort(pv)}>Move to ${pv}</button>` : null}
+        <span>${pv < 1024 || pv > 65535 ? tr("Use a number from 1024 to 65535.")
+          : pi.restarts ? `${tr("Maya starts again on port")} ${pv} (${loadTime()})${tr(". Apps that use the API need the new address too.")}`
+                        : `${tr("Saved for the next start: this server was not started by Maya's start script, so it stays on")} ${pi.port} ${tr("until then.")}`}</span>
+        ${pv >= 1024 && pv <= 65535 ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${() => confirmPort(pv)}>${tr("Move to")} ${pv}</button>` : null}
       </div>` : null}` : null}`;
 }
 
@@ -130,103 +134,103 @@ function ThinkBudget() {
   if (!tb || !tb.supported) return null;
   const bad = budgetError(text), changed = text.trim() !== String(tb.budget);
   return html`<div class="set-block">
-    <label class="field"><span class="field__label">Thinking budget</span>
-      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${tb.saved ? "" : " Not saved: this server runs without a config."}</span>
+    <label class="field"><span class="field__label">${tr("Thinking budget")}</span>
+      <span class="set-row__sub">${tr("Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.")}${tb.saved ? "" : tr(" Not saved: this server runs without a config.")}</span>
       <span class="set-row__ctl"><input id="set-think-budget" class="input input--num" inputmode="numeric" value=${text}
-        aria-invalid=${changed && bad ? "true" : "false"} aria-label="Thinking budget in tokens"
+        aria-invalid=${changed && bad ? "true" : "false"} aria-label=${tr("Thinking budget in tokens")}
         onInput=${(e) => setText(e.target.value.replace(/\D/g, ""))}
         onKeyDown=${(e) => { if (e.key === "Enter" && changed && !bad) saveThinkBudget(text); }}/>
-      ${changed ? html`<button type="button" class="btn btn--primary btn--sm" disabled=${!!bad} onClick=${() => saveThinkBudget(text)}>Save</button>` : null}</span></label>
-    ${changed && bad ? html`<span class="set-row__sub" role="alert">${bad}</span>` : null}</div>`;
+      ${changed ? html`<button type="button" class="btn btn--primary btn--sm" disabled=${!!bad} onClick=${() => saveThinkBudget(text)}>${tr("Save")}</button>` : null}</span></label>
+    ${changed && bad ? html`<span class="set-row__sub" role="alert">${tr(bad)}</span>` : null}</div>`;
 }
 
 // ------------------------------------------------------------------ Chat defaults (sampling)
 function ChatDefaults() {
-  const t = +P.temperature, greedy = t === 0, preset = presetOf(P);
+  const temperature = +P.temperature, greedy = temperature === 0, preset = presetOf(P);
   const titles = thinkTitles();
   const set = (patch) => { savePrefs(patch); syncShared(); };
   // the running model's recommended values (its run config: the model card's) say so
   const isDefault = (k) => !greedy && Math.abs(+P[k] - (+DEFAULTS[k] || 0)) < 1e-9;
   const sliders = [
-    {k: "temperature", label: "Temperature", hint: "0 always picks the likeliest word", min: 0, max: 1.5, step: 0.05,
-     shown: greedy ? "0 · exact" : t.toFixed(2)},
+    {k: "temperature", label: tr("Temperature"), hint: tr("0 always picks the likeliest word"), min: 0, max: 1.5, step: 0.05,
+     shown: greedy ? tr("0 · exact") : temperature.toFixed(2)},
     {k: "top_p", label: "Top-p", hint: "keeps the likeliest words", min: 0.05, max: 1, step: 0.05, shown: (+P.top_p).toFixed(2), off: greedy},
-    {k: "top_k", label: "Top-k", hint: "0 is off", min: 0, max: 64, step: 1, shown: +P.top_k > 0 ? String(P.top_k) : "off", off: greedy},
+    {k: "top_k", label: "Top-k", hint: tr("0 is off"), min: 0, max: 64, step: 1, shown: +P.top_k > 0 ? String(P.top_k) : tr("off"), off: greedy},
     {k: "min_p", label: "Min-p", hint: "drops far less likely words", min: 0, max: 0.5, step: 0.01,
-     shown: +P.min_p > 0 ? (+P.min_p).toFixed(2) : "off", off: greedy},
+     shown: +P.min_p > 0 ? (+P.min_p).toFixed(2) : tr("off"), off: greedy},
   ];
   const share = async (on) => {
     try {
       await saveShared(on);
-      toast("success", on ? "Shared with other apps" : "Not shared any more",
-            on ? "API clients use these settings from their next request." : "Other apps use their own settings again.");
-    } catch (e) { toast("error", "Not saved for other apps", e.message, 6000); }
+      toast("success", on ? tr("Shared with other apps") : tr("Not shared any more"),
+            on ? tr("API clients use these settings from their next request.") : tr("Other apps use their own settings again."));
+    } catch (e) { toast("error", tr("Not saved for other apps"), e.message, 6000); }
   };
   const names = {reasoning_effort: "thinking", temperature: "temperature", top_p: "top-p", top_k: "top-k", min_p: "min-p", seed: "seed", max_tokens: "max tokens",
                  repetition_penalty: "repetition penalty", frequency_penalty: "frequency penalty", presence_penalty: "presence penalty"};
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
-    ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
-    : "API clients get them for anything they don't set themselves.";
-  return html`<${Head} title="Chat defaults" intro=${`How ${modelName(S.health.model)} writes new answers. Each model keeps its own.`}>
+    ? tr("API clients get now: ") + Object.entries(S.shared.now).map(([k, v]) => `${names[k] ? tr(names[k]) : k} ${v}`).join(", ")
+    : tr("API clients get them for anything they don't set themselves.");
+  return html`<${Head} title=${tr("Chat defaults")} intro=${tr("How {model} writes new answers. Each model keeps its own.", {model: modelName(S.health.model)})}>
       <${TurboButton}/><//>
     <${ModelCtx}/>
-    <${Group} cap="Sampling">
-    <${Row} label="Presets"><${Seg} label="Presets" value=${preset} onChange=${(id) => set(PRESETS[id])}
-      options=${[{id: "precise", label: "Precise", title: "Temperature 0: the same question gives the same answer"},
-                 {id: "balanced", label: "Balanced", title: "Temperature 0.6, top-p 0.95, top-k 20"},
-                 {id: "creative", label: "Creative", title: "Temperature 1.0, top-p 0.95, min-p 0.05"}]}/><//>
-    <${Row} label="Thinking" sub="The level a new chat starts with. A chat changes its own with the speedometer in the message box.">
-      <${Seg} label="Thinking" value=${P.thinking} cls=${LEVELS.length > 4 ? "seg--many" : ""} onChange=${(id) => {
+    <${Group} cap=${tr("Sampling")}>
+    <${Row} label=${tr("Presets")}><${Seg} label=${tr("Presets")} value=${preset} onChange=${(id) => set(PRESETS[id])}
+      options=${[{id: "precise", label: tr("Precise"), title: tr("Temperature 0: the same question gives the same answer")},
+                 {id: "balanced", label: tr("Balanced"), title: tr("Temperature 0.6, top-p 0.95, top-k 20")},
+                 {id: "creative", label: tr("Creative"), title: tr("Temperature 1.0, top-p 0.95, min-p 0.05")}]}/><//>
+    <${Row} label=${tr("Thinking")} sub=${tr("The level a new chat starts with. A chat changes its own with the speedometer in the message box.")}>
+      <${Seg} label=${tr("Thinking")} value=${P.thinking} cls=${LEVELS.length > 4 ? "seg--many" : ""} onChange=${(id) => {
         set({thinking: id});
         if (S.current && !S.current.messages.length) S.current.thinking = id;   // (the new chat on screen starts there too)
       }}
-        options=${LEVELS.map((l) => ({id: l.id, label: l.name, title: titles[l.id]}))}/><//>
+        options=${LEVELS.map((l) => ({id: l.id, label: tr(l.name), title: tr(titles[l.id])}))}/><//>
     ${sliders.map((r) => html`<div class="set-slider">
-      <label for=${`set-${r.k}`}><span>${r.label}</span><span class="set-row__sub">${r.hint}${isDefault(r.k) ? " · the model's default" : ""}</span></label>
+      <label for=${`set-${r.k}`}><span>${tr(r.label)}</span><span class="set-row__sub">${tr(r.hint)}${isDefault(r.k) ? tr(" · the model's default") : ""}</span></label>
       <input id=${`set-${r.k}`} type="range" class="range" min=${r.min} max=${r.max} step=${r.step} value=${P[r.k]} disabled=${r.off}
         onInput=${(e) => set({[r.k]: +e.target.value})}/>
       <b class="num">${r.shown}</b></div>`)}<//>
-    <${Group} cap="Length and repeats">
+    <${Group} cap=${tr("Length and repeats")}>
     <div class="set-pair">
-      <label class="field"><span class="field__label">Max tokens</span>
-        <input class="input" inputmode="numeric" placeholder="Until done" value=${P.max}
+      <label class="field"><span class="field__label">${tr("Max tokens")}</span>
+        <input class="input" inputmode="numeric" placeholder=${tr("Until done")} value=${P.max}
           onInput=${(e) => set({max: e.target.value.replace(/\D/g, "")})}/></label>
-      <label class="field"><span class="field__label">Seed</span>
-        <input class="input" inputmode="numeric" placeholder="Random" value=${P.seed}
+      <label class="field"><span class="field__label">${tr("Seed")}</span>
+        <input class="input" inputmode="numeric" placeholder=${tr("Random")} value=${P.seed}
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
     <${ThinkBudget}/>
-    <div class="set-block set-block--pens"><span class="set-row__sub">Penalties: none by default (no model has any as a standard). Set one to discourage repeats.</span>
+    <div class="set-block set-block--pens"><span class="set-row__sub">${tr("Penalties: none by default (no model has any as a standard). Set one to discourage repeats.")}</span>
     <div class="set-pair set-pair--3">
-      ${[["repetition_penalty", "Repetition", "1.0 off, e.g. 1.1"], ["frequency_penalty", "Frequency", "0 off, e.g. 0.3"],
-         ["presence_penalty", "Presence", "0 off, e.g. 0.3"]].map(([k, label, ph]) => html`<label class="field"><span class="field__label">${label}</span>
-        <input class="input" inputmode="decimal" placeholder=${ph} value=${P[k]} aria-label=${`${label} penalty`}
+      ${[["repetition_penalty", tr("Repetition"), tr("1.0 off, e.g. 1.1")], ["frequency_penalty", tr("Frequency"), tr("0 off, e.g. 0.3")],
+         ["presence_penalty", tr("Presence"), tr("0 off, e.g. 0.3")]].map(([k, label, ph]) => html`<label class="field"><span class="field__label">${tr(label)}</span>
+        <input class="input" inputmode="decimal" placeholder=${tr(ph)} value=${P[k]} aria-label=${tr("{label} penalty", {label: tr(label)})}
           onInput=${(e) => set({[k]: e.target.value.replace(/[^\d.]/g, "")})}/></label>`)}
     </div></div><//>
-    <${Group} cap="Other apps" note="The OpenAI and Anthropic APIs both take them: a request's own settings still win.">
-    <${Row} label="Use these for other apps too" sub=${sharedNow}>
-      <${Switch} label="Use these for other apps too" on=${S.shared.on} onChange=${share}/><//><//>
+    <${Group} cap=${tr("Other apps")} note=${tr("The OpenAI and Anthropic APIs both take them: a request's own settings still win.")}>
+    <${Row} label=${tr("Use these for other apps too")} sub=${sharedNow}>
+      <${Switch} label=${tr("Use these for other apps too")} on=${S.shared.on} onChange=${share}/><//><//>
     <div class="set-foot"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => {
       resetPrefs(["thinking", "temperature", "top_p", "top_k", "min_p", "max", "seed", ...PENALTIES]);   // (the model's own again)
       syncShared();
-      toast("success", "Back to the defaults", "The model's recommended settings.");
-    }}>Reset to the defaults</button></div>`;
+      toast("success", tr("Back to the defaults"), tr("The model's recommended settings."));
+    }}>${tr("Reset to the defaults")}</button></div>`;
 }
 
 // ------------------------------------------------------------------ Instructions
 function Instructions() {
   const c = S.current;
-  return html`<${Head} title="Global instructions" intro="Every new chat starts with these: the model reads them before your first message. A chat can change its own from its ⋯ menu."/>
-    <section class="set-sec"><label for="set-instr" class="set-cap">For new chats</label>
-    <textarea id="set-instr" class="input input--area" rows="8" placeholder="e.g. Answer briefly. Write code in TypeScript."
+  return html`<${Head} title=${tr("Global instructions")} intro=${tr("Every new chat starts with these: the model reads them before your first message. A chat can change its own from its ⋯ menu.")}/>
+    <section class="set-sec"><label for="set-instr" class="set-cap">${tr("For new chats")}</label>
+    <textarea id="set-instr" class="input input--area" rows="8" placeholder=${tr("e.g. Answer briefly. Write code in TypeScript.")}
       value=${P.sys_default ? P.system : ""} onInput=${(e) => {
         savePrefs({system: e.target.value, sys_default: true});
         if (S.current && !S.current.messages.length) { S.current.system = e.target.value; updateCtxMeter(); }   // (the new chat on screen)
       }}></textarea></section>
     ${c && c.messages.length ? html`<${Group}><div class="set-row">
-      <span class="set-row__text"><span class="set-row__label">This chat</span>
-        <span class="set-row__sub">${c.system && c.system.trim() ? `“${c.system.trim().slice(0, 90)}${c.system.trim().length > 90 ? "…" : ""}”` : "No instructions of its own."}</span></span>
-      <span class="set-row__ctl"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => chatInstructions(c)}>Edit</button></span></div><//>` : null}`;
+      <span class="set-row__text"><span class="set-row__label">${tr("This chat")}</span>
+        <span class="set-row__sub">${c.system && c.system.trim() ? `“${c.system.trim().slice(0, 90)}${c.system.trim().length > 90 ? "…" : ""}”` : tr("No instructions of its own.")}</span></span>
+      <span class="set-row__ctl"><button type="button" class="btn btn--secondary btn--sm" onClick=${() => chatInstructions(c)}>${tr("Edit")}</button></span></div><//>` : null}`;
 }
 
 // ------------------------------------------------------------------ Tools (MCP)
@@ -235,23 +239,22 @@ const MCP_STATE = {ready: ["ok", "Connected"], starting: ["info", "Starting"], f
 function Tools() {
   const servers = S.mcp.servers || [];
   const ready = servers.filter((s) => s.status === "ready" || s.status === "stopped");
-  return html`<${Head} title="MCP tools" intro="Local tool servers the model may call in this page's chat."/>
+  return html`<${Head} title=${tr("MCP tools")} intro=${tr("Local tool servers the model may call in this page's chat.")}/>
     <${Group}>
-    <${Row} label="Let the model use MCP tools" sub="They run on this machine with your rights, when the model decides to call them. Only this page's chat uses them.">
-      <${Switch} label="Let the model use MCP tools" on=${P.mcp !== false} onChange=${(v) => savePrefs({mcp: v})}/><//><//>
-    ${servers.length ? html`<${Group} cap=${`Servers in the run config · ${fmt(S.mcp.tools)} tools · ${ready.length} of ${servers.length} connected`}>
+    <${Row} label=${tr("Let the model use MCP tools")} sub=${tr("They run on this machine with your rights, when the model decides to call them. Only this page's chat uses them.")}>
+      <${Switch} label=${tr("Let the model use MCP tools")} on=${P.mcp !== false} onChange=${(v) => savePrefs({mcp: v})}/><//><//>
+    ${servers.length ? html`<${Group} cap=${tr("Servers in the run config · {tools} tools · {ready} of {total} connected", {tools:fmt(S.mcp.tools),ready:ready.length,total:servers.length})}>
       ${servers.map((s) => {
         const [tone, label] = MCP_STATE[s.status] || ["muted", s.status];
         const info = s.info && s.info.name ? ` · ${s.info.name}${s.info.version ? ` ${s.info.version}` : ""}` : "";
         return html`<div class="mcp">
-          <div class="mcp__head"><span class=${`badge badge--${tone}`}><i class="badge__dot"></i>${label}</span>
-            <b>${s.name}</b><span class="muted">${s.transport} · ${fmt(s.tools.length)} tools${info}</span></div>
+          <div class="mcp__head"><span class=${`badge badge--${tone}`}><i class="badge__dot"></i>${MCP_STATE[s.status] ? tr(label) : label}</span>
+            <b>${s.name}</b><span class="muted">${tr("{transport} · {count} tools{info}", {transport:s.transport,count:fmt(s.tools.length),info})}</span></div>
           ${s.error ? html`<div class="msg-error">${s.error}</div>` : null}
           ${s.tools.length ? html`<div class="mcp__tools">${s.tools.map((t) => html`<span class="tag" title=${t.description || ""}>${t.tool}</span>`)}</div>` : null}
         </div>`;
       })}<//>`
-    : html`<p class="set-note">No MCP servers are set up. Add them to the run config (“mcpServers”, as Claude Desktop writes them)
-        or start Maya with --mcp-config, and their tools appear here.</p>`}`;
+    : html`<p class="set-note">${tr("No MCP servers are set up. Add them to the run config (“mcpServers”, as Claude Desktop writes them) or start Maya with --mcp-config, and their tools appear here.")}</p>`}`;
 }
 
 // ------------------------------------------------------------------ Connect your tools (as in v1.1.52: both APIs' base URLs,
@@ -263,20 +266,20 @@ function Connect() {
   const auth = key ? "<your API key>" : "maya";
   const examples = {
     claude: ["Claude Code", `ANTHROPIC_BASE_URL=${base} ANTHROPIC_AUTH_TOKEN=${auth} claude`],
-    openai: ["OpenAI apps and SDKs", `OPENAI_BASE_URL=${base}/v1\nOPENAI_API_KEY=${key ? "<your API key>" : "any-text"}\nmodel: ${model}`],
-    curl: ["A first request", `curl ${base}/v1/chat/completions -H "Content-Type: application/json" ${key ? '-H "Authorization: Bearer <your API key>" ' : ""}\\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello!"}]}'`],
+    openai: [tr("OpenAI apps and SDKs"), `OPENAI_BASE_URL=${base}/v1\nOPENAI_API_KEY=${key ? "<your API key>" : "any-text"}\nmodel: ${model}`],
+    curl: [tr("A first request"), `curl ${base}/v1/chat/completions -H "Content-Type: application/json" ${key ? '-H "Authorization: Bearer <your API key>" ' : ""}\\\n  -d '{"model": "${model}", "messages": [{"role": "user", "content": "Hello!"}]}'`],
   };
   const addrs = [["OpenAI base URL", `${base}/v1`], ["Anthropic base URL", base], ["Model name", model]];
-  return html`<${Head} title="Connect your tools" intro="Any OpenAI- or Anthropic-compatible app or coding agent works with these."/>
+  return html`<${Head} title=${tr("Connect your tools")} intro=${tr("Any OpenAI- or Anthropic-compatible app or coding agent works with these.")}/>
     <${Group} cls="set-group--connect">
-    ${addrs.map(([k, v]) => html`<div class="addr"><span>${k}</span><code>${v}</code>
-      <button type="button" class="icon-btn icon-btn--sm" aria-label=${`Copy the ${k}`} title="Copy" onClick=${() => copyText(v)}><${Icon} name="copy" sm/></button></div>`)}
-    <${Row} label="API key" htmlFor="set-key" sub=${key ? "This server needs one. It is kept in this browser only." : "Only if the server was started with one. Kept in this browser only."}>
-      <input id="set-key" class="input input--key" type="password" autocomplete="off" placeholder="Not needed" value=${apikey}
+    ${addrs.map(([k, v]) => html`<div class="addr"><span>${tr(k)}</span><code>${v}</code>
+      <button type="button" class="icon-btn icon-btn--sm" aria-label=${tr("Copy the {label}", {label:tr(k)})} title=${tr("Copy")} onClick=${() => copyText(v)}><${Icon} name="copy" sm/></button></div>`)}
+    <${Row} label=${tr("API key")} htmlFor="set-key" sub=${key ? tr("This server needs one. It is kept in this browser only.") : tr("Only if the server was started with one. Kept in this browser only.")}>
+      <input id="set-key" class="input input--key" type="password" autocomplete="off" placeholder=${tr("Not needed")} value=${apikey}
         onInput=${(e) => { setKey(e.target.value); store.set("apikey", e.target.value.trim()); }}
-        onChange=${() => toast("success", "API key saved", "Kept in this browser only.")}/><//><//>
+        onChange=${() => toast("success", tr("API key saved"), tr("Kept in this browser only."))}/><//><//>
     <${Group}><div class="set-block">
-      <div class="tabs" role="tablist" aria-label="Examples">${Object.entries(examples).map(([id, [label]]) => html`
+      <div class="tabs" role="tablist" aria-label=${tr("Examples")}>${Object.entries(examples).map(([id, [label]]) => html`
         <button type="button" role="tab" aria-selected=${String(tab === id)} class="tabs__tab" onClick=${() => setTab(id)}>${label}</button>`)}</div>
       <div onClick=${onCodeClick} dangerouslySetInnerHTML=${{__html: codeBlock("bash", examples[tab][1])}}></div>
     </div><//>`;
@@ -286,10 +289,10 @@ function Connect() {
 // ------------------------------------------------------------------ Data
 function Data() {
   const n = S.chats.length;
-  return html`<${Head} title="Data and privacy" intro=${`Chats, images and attached files are kept in this browser only (${fmt(n)} chat${n === 1 ? "" : "s"} now). The server keeps none of them. Model files are managed on Models.`}/>
+  return html`<${Head} title=${tr("Data and privacy")} intro=${tr(n === 1 ? "Chats, images and attached files are kept in this browser only ({count} chat now). The server keeps none of them. Model files are managed on Models." : "Chats, images and attached files are kept in this browser only ({count} chats now). The server keeps none of them. Model files are managed on Models.", {count:fmt(n)})}/>
     <${Group}>
-    <${Row} label="Clear chats and settings" sub="Every chat and folder, these settings and the API key in this browser. The model, its files and the server's own settings are not touched.">
-      <button type="button" class="btn btn--danger" onClick=${clearBrowser}>Clear</button><//><//>`;
+    <${Row} label=${tr("Clear chats and settings")} sub=${tr("Every chat and folder, these settings and the API key in this browser. The model, its files and the server's own settings are not touched.")}>
+      <button type="button" class="btn btn--danger" onClick=${clearBrowser}>${tr("Clear")}</button><//><//>`;
 }
 
 // ------------------------------------------------------------------ Savings: the API prices the sidebar's Saved counts with
@@ -309,29 +312,29 @@ function PriceCard({p, onSaved}) {
   const save = async (price) => {
     try {
       onSaved(await api("api/savings/prices", {method: "POST", body: {model: p.model, price}}));
-      toast("success", "Prices saved", `${modelName(p.model)}: every total is counted again with them.`);
-    } catch (e) { toast("error", "Not saved", e.message, 6000); }
+      toast("success", tr("Prices saved"), tr("{model}: every total is counted again with them.", {model:modelName(p.model)}));
+    } catch (e) { toast("error", tr("Not saved"), e.message, 6000); }
   };
   const id = `price-${p.model.replace(/[^a-z0-9]/gi, "-")}`;
-  return html`<section class="price" aria-label=${`${modelName(p.model)}'s prices`}>
+  return html`<section class="price" aria-label=${tr("{model}'s prices", {model:modelName(p.model)})}>
     <div class="price__head"><${ModelLogo} model=${p.model} size=${32}/>
-      <span><b>${modelName(p.model)}</b><span>${p.custom ? "Your prices" + (def ? ` (built in: ${def.api}'s)` : "")
-        : def ? `${def.api}'s prices, built in (Oct 2026)` : "No API price yet: give it one to count what it saves"}</span></span>
-      ${p.running ? html`<span class="pill pill--accent">Running</span>` : null}</div>
+      <span><b>${modelName(p.model)}</b><span>${p.custom ? tr("Your prices") + (def ? tr(" (built in: {api}'s)", {api:def.api}) : "")
+        : def ? tr("{api}'s prices, built in (Oct 2026)", {api:def.api}) : tr("No API price yet: give it one to count what it saves")}</span></span>
+      ${p.running ? html`<span class="pill pill--accent">${tr("Running")}</span>` : null}</div>
     <div class="price__grid">
-      ${PRICE_FIELDS.map(([k, label]) => html`<label class="field" for=${`${id}-${k}`}><span class="field__label">${label}</span>
+      ${PRICE_FIELDS.map(([k, label]) => html`<label class="field" for=${`${id}-${k}`}><span class="field__label">${tr(label)}</span>
         <span class="price__in"><span aria-hidden="true">$</span><input id=${`${id}-${k}`} class=${`input input--num${bad.includes(k) && d[k] !== "" ? " is-bad" : ""}`}
           inputmode="decimal" value=${d[k]} placeholder=${def ? priceShow(k, def[k]) : "0.00"} onInput=${(e) => setD({...d, [k]: e.target.value})}/></span></label>`)}
-      ${peak ? html`<label class="field" for=${`${id}-peak`}><span class="field__label">Peak hours</span>
+      ${peak ? html`<label class="field" for=${`${id}-peak`}><span class="field__label">${tr("Peak hours")}</span>
         <span class="price__in"><span aria-hidden="true">×</span><input id=${`${id}-peak`} class=${`input input--num${bad.includes("peak") && d.peak !== "" ? " is-bad" : ""}`}
           inputmode="decimal" value=${d.peak} placeholder=${String(def.peak)} onInput=${(e) => setD({...d, peak: e.target.value})}/></span></label>` : null}
     </div>
     <div class="price__foot">
-      <span>Dollars per 1M tokens${peak ? ". DeepSeek's peak hours, weekdays 01–04 and 06–10 UTC, cost this many times as much" : ""}.</span>
-      ${p.custom && def ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${() => save(null)}>Use the built-in prices</button>` : null}
-      ${dirty ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => setD(now)}>Cancel</button>` : null}
+      <span>${tr("Dollars per 1M tokens")}${peak ? tr(". DeepSeek's peak hours, weekdays 01–04 and 06–10 UTC, cost this many times as much") : ""}.</span>
+      ${p.custom && def ? html`<button type="button" class="btn btn--ghost btn--sm" onClick=${() => save(null)}>${tr("Use the built-in prices")}</button>` : null}
+      ${dirty ? html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => setD(now)}>${tr("Cancel")}</button>` : null}
       <button type="button" class="btn btn--primary btn--sm" disabled=${!dirty || bad.length > 0}
-        onClick=${() => save(Object.fromEntries(keys.map((k) => [k, priceNum(d[k])])))}>Save</button>
+        onClick=${() => save(Object.fromEntries(keys.map((k) => [k, priceNum(d[k])])))}>${tr("Save")}</button>
     </div>
   </section>`;
 }
@@ -339,62 +342,61 @@ function Savings() {
   const [r, setR] = useState(null), [err, setErr] = useState("");
   useEffect(() => { api("api/savings").then(setR).catch((e) => setErr(e.message)); }, []);
   const reset = async () => {
-    if (!await confirmDialog("Start over from $0?", "<p>Every model's count of tokens and what they would have cost goes back to zero. The prices stay. This cannot be undone.</p>", "Start over", true)) return;
-    try { setR(await api("api/savings/reset", {method: "POST", body: {}})); toast("success", "Started over", "Maya counts from $0 again."); }
-    catch (e) { toast("error", "Not reset", e.message, 6000); }
+    if (!await confirmDialog(tr("Start over from $0?"), tr("<p>Every model's count of tokens and what they would have cost goes back to zero. The prices stay. This cannot be undone.</p>"), tr("Start over"), true)) return;
+    try { setR(await api("api/savings/reset", {method: "POST", body: {}})); toast("success", tr("Started over"), tr("Maya counts from $0 again.")); }
+    catch (e) { toast("error", tr("Not reset"), e.message, 6000); }
   };
-  const since = r && r.since ? new Date(r.since * 1000).toLocaleDateString([], {month: "short", day: "numeric"}) : "";
-  return html`<${Head} title="Usage and savings" intro="The sidebar's Saved line: what each model's own API would have charged for the same tokens. Change a price when the API's changes, or give one to a model without it. Maya keeps the tokens, so every total is counted again with the new prices."/>
-    ${err ? html`<p class="set-note">${err}</p>` : !r ? html`<p class="set-note">Reading the prices…</p>`
-      : !(r.price_list || []).length ? html`<p class="set-note">Nothing is counted on this server: it runs without a model config.</p>`
+  const since = r && r.since ? new Date(r.since * 1000).toLocaleDateString(languageChoice(), {month: "short", day: "numeric"}) : "";
+  return html`<${Head} title=${tr("Usage and savings")} intro=${tr("The sidebar's Saved line: what each model's own API would have charged for the same tokens. Change a price when the API's changes, or give one to a model without it. Maya keeps the tokens, so every total is counted again with the new prices.")}/>
+    ${err ? html`<p class="set-note">${err}</p>` : !r ? html`<p class="set-note">${tr("Reading the prices…")}</p>`
+      : !(r.price_list || []).length ? html`<p class="set-note">${tr("Nothing is counted on this server: it runs without a model config.")}</p>`
       : html`<div class="prices">${r.price_list.map((p) => html`<${PriceCard} key=${p.model} p=${p} onSaved=${setR}/>`)}</div>
-        <${Group}><${Row} label="Start over from $0" sub=${`Every model's count of tokens: ${usd(r.usd)} saved${since ? ` since ${since}` : ""}. The prices stay.`}>
-          <button type="button" class="btn btn--danger" onClick=${reset}>Start over</button><//><//>`}`;
+        <${Row} label=${tr("Start over from $0")} sub=${tr("Every model's count of tokens: {saved} saved{since}. The prices stay.", {saved:usd(r.usd),since:since ? tr(" since {date}", {date:since}) : ""})}>
+          <button type="button" class="btn btn--danger" onClick=${reset}>${tr("Start over")}</button><//><//>`}`;
 }
 
 // ------------------------------------------------------------------ About and updates
 // supporting Maya (GitHub Sponsors): one warm line, never a popup - on About, and as a row of its own under an update's
 // button (a little more visible there, still only where the update shows)
-const SupportLine = ({cls = "set-support"}) => html`<p class=${cls}><${Icon} name="heart" sm/><span>Maya is free and open, made by one
-  person with help from a small community. If it makes your work a little easier,${" "}<a class="support-link" href=${SUPPORT_URL}
-  target="_blank" rel="noopener" title="Sponsor Maya on GitHub">sponsoring it</a>, in any amount, helps it keep growing. Thank you.</span></p>`;
+const SupportLine = ({cls = "set-support"}) => html`<p class=${cls}><${Icon} name="heart" sm/><span>${tr("Maya is free and open, made by one person with help from a small community. If it makes your work a little easier,")}${" "}<a class="support-link" href=${SUPPORT_URL}
+  target="_blank" rel="noopener" title=${tr("Sponsor Maya on GitHub")}>${tr("sponsoring it")}</a>${tr(", in any amount, helps it keep growing. Thank you.")}</span></p>`;
 function UpdateCard() {
   const u = S.update, w = S.updateWatch;
   if (!w && (!u || !u.enabled)) return null;
   const latest = (u && u.latest) || {}, state = u && u.state;
-  const when = u && u.checked ? new Date(u.checked * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}) : "";
-  const notes = latest.url ? html`<a class="btn btn--secondary btn--sm" href=${latest.url} target="_blank" rel="noopener">What's new</a>` : null;
+  const when = u && u.checked ? new Date(u.checked * 1000).toLocaleTimeString(languageChoice(), {hour: "2-digit", minute: "2-digit"}) : "";
+  const notes = latest.url ? html`<a class="btn btn--secondary btn--sm" href=${latest.url} target="_blank" rel="noopener">${tr("What's new")}</a>` : null;
   const again = (label) => html`<button type="button" class="btn btn--secondary btn--sm" onClick=${() => loadUpdate(true)}>${label}</button>`;
   let tone = "", icon = "info", title, text = "", how = "", acts = null;
   if (w || (state && state.state === "updating")) {
     const to = w ? w.to : state.to;
     tone = "accent"; icon = "download";
-    title = `Updating to v${to}…`;
-    text = w && w.down ? "Maya is starting again: it compiles what changed in the engine and loads the model (a few minutes; the terminal shows the progress). This page reloads when it is back."
-                       : "Maya finishes the answer it is writing, then downloads the update.";
+    title = tr("Updating to v{version}…", {version:to});
+    text = w && w.down ? tr("Maya is starting again: it compiles what changed in the engine and loads the model (a few minutes; the terminal shows the progress). This page reloads when it is back.")
+                       : tr("Maya finishes the answer it is writing, then downloads the update.");
   } else if (state && state.state === "failed") {
     tone = "danger"; icon = "error";
-    title = "The update did not happen";
+    title = tr("The update did not happen");
     text = state.error || "";
-    acts = html`${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>Try again</button>` : null}`;
+    acts = html`${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>${tr("Try again")}</button>` : null}`;
   } else if (u.newer) {
     tone = "accent"; icon = "download";
-    title = `Project Maya v${latest.version} is out`;
+    title = tr("Project Maya v{version} is out", {version:latest.version});
     text = latest.summary || "";
-    if (!u.can_update) how = `Update by hand: ${u.by_hand}. This page can't, because ${u.blocker}.`;
-    acts = html`${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>Update to v${latest.version}</button>` : null}`;
+    if (!u.can_update) how = tr("Update by hand: {command}. This page can't, because {reason}.", {command:u.by_hand,reason:u.blocker});
+    acts = html`${notes}${u.can_update ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${startUpdate}>${tr("Update to v{version}", {version:latest.version})}</button>` : null}`;
   } else if (u.error) {
     icon = "warning";
-    title = "Couldn't check for updates";
-    text = `${u.error}. Project Maya v${u.current || "?"} is running.`;
-    acts = again("Try again");
+    title = tr("Couldn't check for updates");
+    text = tr("{error}. Project Maya v{version} is running.", {error:u.error,version:u.current || "?"});
+    acts = again(tr("Try again"));
   } else if (u.latest) {
     tone = "ok"; icon = "check";
-    title = "Up to date";
-    text = `v${u.current} is the latest release. Checked on GitHub${when ? ` at ${when}` : ""}.`;
-    acts = again("Check again");
+    title = tr("Up to date");
+    text = tr("v{version} is the latest release. Checked on GitHub{when}.", {version:u.current,when:when ? tr(" at {time}", {time:when}) : ""});
+    acts = again(tr("Check again"));
   } else {
-    title = "Checking for updates…";
+    title = tr("Checking for updates…");
   }
   return html`<div class=${`update${tone ? ` update--${tone}` : ""}`} aria-live="polite"><${Icon} name=${icon}/>
     <span class="update__text"><b>${title}</b>${text ? html`<span>${text}</span>` : null}${how ? html`<span class="update__how">${how}</span>` : null}</span>
@@ -419,8 +421,8 @@ function facts() {
   if (eng.engine_kind === "glm-fast") {
     const k = eng.kv === "int8" ? "8-bit (INT8)" : "16-bit";
     kv = eng.kv_resident   // KV streaming (--kv-resident): the cache's VRAM is its window, not a cost per token
-      ? `${k} attention cache, streamed: ${fmt(eng.kv_resident)} positions per layer in VRAM, the rest in RAM`
-      : `${k} attention cache, in VRAM${kvPerTok ? ` (about ${fmt(kvPerTok / 1024)} KB a token, ${fmt(eng.kv_gb, 1)} GB at this size)` : ""}`;
+      ? tr("{format} attention cache, streamed: {positions} positions per layer in VRAM, the rest in RAM", {format:tr(k),positions:fmt(eng.kv_resident)})
+      : tr("{format} attention cache, in VRAM{cost}", {format:tr(k),cost:kvPerTok ? tr(" (about {kb} KB a token, {gb} GB at this size)", {kb:fmt(kvPerTok/1024),gb:fmt(eng.kv_gb,1)}) : ""});
   } else {
     const k = (eng.engine_kind === "mm3"   // (MiniMax's: maya-mm3's KV formats)
       ? {bf16: "16-bit (BF16)", int8: "8-bit (INT8)", fp8: "8-bit (FP8)", fp4: "4-bit (FP4)", nvfp4: "4-bit (NVFP4)",
@@ -429,58 +431,57 @@ function facts() {
          fp4: "4-bit FP4 as DeepSeek stores it (the recent-token window FP8)"})[eng.kv] || eng.kv;
     // (DeepSeek's engine says a window as long as its context: all of it in VRAM)
     const win = +eng.kv_resident > 0 && +eng.kv_resident < (eng.max_context || Infinity) ? +eng.kv_resident : 0;
-    kv = k ? `${k}${win ? `, streamed: ${fmt(win)} positions per layer in VRAM, the rest in RAM` : ", all in VRAM"}` : null;
+    kv = k ? (win ? tr("{format}, streamed: {positions} positions per layer in VRAM, the rest in RAM", {format:tr(k),positions:fmt(win)}) : tr("{format}, all in VRAM", {format:tr(k)})) : null;
   }
   const gpus = hw.gpus || [];
   const link = (g) => `Gen${g.pcie_gen_max || g.pcie_gen || "?"}${g.pcie_width ? ` x${g.pcie_width}` : ""}`;
-  const pcie = gpus.length > 1 ? (gpus.every((g) => link(g) === link(gpus[0])) ? `${link(gpus[0])} on all ${gpus.length} GPUs`
+  const pcie = gpus.length > 1 ? (gpus.every((g) => link(g) === link(gpus[0])) ? tr("{link} on all {count} GPUs", {link:link(gpus[0]),count:gpus.length})
                                   : gpus.map((g) => `GPU ${g.index}: ${link(g)}`).join(" · "))
              : (hw.gpu_pcie_gen_max || hw.gpu_pcie_gen) ? `Gen${hw.gpu_pcie_gen_max || hw.gpu_pcie_gen}${hw.gpu_pcie_width ? ` x${hw.gpu_pcie_width}` : ""}` : null;
   return [
-    ["Version", ver ? `Project Maya v${ver}${eng.version ? ` · engine ${eng.version}` : ""}` : null],
-    ["Model", eng.model || S.health.model],
-    ["Engine", eng.engine_kind ? (ENGINES[eng.engine_kind] || eng.engine_kind) : null],
-    ["Context", eng.max_context ? `${fmt(eng.max_context)} tokens` : null],
-    ["Trained for", eng.trained_context ? `up to ${fmt(eng.trained_context)} tokens` : null],
-    ["KV cache", kv],
-    ["Experts", eng.experts ? `${fmt(eng.experts)} routed; room for ${fmt(eng.expert_slots || 0)} in VRAM` +
-                 `${eng.ram_slots ? ` and ${fmt(eng.ram_slots)} in RAM` : ""}` +
-                 `${+eng.expert_slots + (+eng.ram_slots || 0) >= +eng.experts ? "" : ", the rest read from the SSD"}` : null],
-    ["Speculation", eng.dspark != null
-                  ? (+eng.dspark ? "DSpark: its drafter proposes a few tokens at a time, the full model checks them" +
-                                  (m.tiers && m.tiers.now && m.tiers.now.drafts != null ? ` (${fmt(100 * m.tiers.now.drafts)}% of them kept in the last answer)` : "")
-                                : "off (the config's --dspark, or no DSpark drafter in this pack)")
-                  : eng.mtp == null ? null : +eng.mtp ? "MTP: the model's draft block proposes the next token, the full model checks it"
-                  : "off (one GPU, or no draft block in this model file)"],
-    ["Images", eng.images != null ? (eng.images ? "On" : "Off") : (S.health.images ? "On" : "Off")],
-    ["GPU", st.gpu_name ? `${gpuNames(st.gpu_name, gpus.length)}${hw.gpu_mem_total ? ` · ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (NVML)"],
+    [tr("Version"), ver ? tr("Project Maya v{version}{engine}", {version:ver,engine:eng.version ? tr(" · engine {version}", {version:eng.version}) : ""}) : null],
+    [tr("Model"), eng.model || S.health.model],
+    [tr("Engine"), eng.engine_kind ? (ENGINES[eng.engine_kind] ? tr(ENGINES[eng.engine_kind]) : eng.engine_kind) : null],
+    [tr("Context"), eng.max_context ? tr("{count} tokens", {count:fmt(eng.max_context)}) : null],
+    [tr("Trained for"), eng.trained_context ? tr("up to {count} tokens", {count:fmt(eng.trained_context)}) : null],
+    [tr("KV cache"), kv],
+    [tr("Experts"), eng.experts ? tr("{count} routed; room for {vram} in VRAM{ram}{rest}", {count:fmt(eng.experts),vram:fmt(eng.expert_slots || 0),
+      ram:eng.ram_slots ? tr(" and {count} in RAM", {count:fmt(eng.ram_slots)}) : "",rest:+eng.expert_slots+(+eng.ram_slots||0)>=+eng.experts ? "" : tr(", the rest read from the SSD")}) : null],
+    [tr("Speculation"), eng.dspark != null
+                  ? (+eng.dspark ? tr("DSpark: its drafter proposes a few tokens at a time, the full model checks them") +
+                                  (m.tiers && m.tiers.now && m.tiers.now.drafts != null ? tr(" ({percent}% of them kept in the last answer)", {percent:fmt(100*m.tiers.now.drafts)}) : "")
+                                : tr("off (the config's --dspark, or no DSpark drafter in this pack)"))
+                  : eng.mtp == null ? null : +eng.mtp ? tr("MTP: the model's draft block proposes the next token, the full model checks it")
+                  : tr("off (one GPU, or no draft block in this model file)")],
+    [tr("Images"), eng.images != null ? (eng.images ? tr("On") : tr("Off")) : (S.health.images ? tr("On") : tr("Off"))],
+    ["GPU", st.gpu_name ? `${gpuNames(st.gpu_name, gpus.length)}${hw.gpu_mem_total ? ` · ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : tr("not readable (NVML)")],
     ["PCIe", pcie],
-    ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
+    ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? tr(", {count} threads", {count:st.threads}) : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
-    ["Model folder", storage ? `${storage.path} · ${gb(storage.free, 0)} GB free of ${gb(storage.total, 0)} GB` : null],
+    [tr("Model folder"), storage ? tr("{path} · {free} GB free of {total} GB", {path:storage.path,free:gb(storage.free,0),total:gb(storage.total,0)}) : null],
   ].filter((r) => r[1] != null && r[1] !== "");
 }
 function About() {
   const [log, setLog] = useState(null);
   const copy = async () => {
-    try { await copyText(await fetchReport(), true); toast("success", "Report copied", "Paste it into a GitHub issue - read it first."); }
-    catch (e) { toast("error", "No report", e.message, 5000); }
+    try { await copyText(await fetchReport(), true); toast("success", tr("Report copied"), tr("Paste it into a GitHub issue - read it first.")); }
+    catch (e) { toast("error", tr("No report"), e.message, 5000); }
   };
   const show = async () => {
     if (log != null) { setLog(null); return; }
-    try { setLog(await fetchReport()); } catch (e) { toast("error", "No report", e.message, 5000); }
+    try { setLog(await fetchReport()); } catch (e) { toast("error", tr("No report"), e.message, 5000); }
   };
   const newer = S.update && S.update.newer && !S.updateWatch;   // (then the ask is beside the update instead)
-  return html`<${Head} title="About and updates"/>
+  return html`<${Head} title=${tr("About and updates")}/>
     <${UpdateCard}/>
     ${newer ? null : html`<${SupportLine}/>`}
-    <${Group} cap="This server"><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
+    <${Group} cap=${tr("This server")}><dl class="facts">${facts().map(([k, v]) => html`<div class="facts__row"><dt>${k}</dt><dd>${v}</dd></div>`)}</dl><//>
     <${Group}>
     <div class="set-row set-row--top">
-      <span class="set-row__text"><span class="set-row__label">Troubleshooting</span>
-        <span class="set-row__sub">A report for a GitHub issue: the versions, this PC, the engine's settings and the telling lines of its log, never the API key. Read it before you share it.</span></span>
-      <span class="set-row__ctl set-row__ctl--two"><button type="button" class="btn btn--secondary btn--sm" onClick=${show}>${log != null ? "Hide" : "Show engine log"}</button>
-        <button type="button" class="btn btn--primary btn--sm" onClick=${copy}><${Icon} name="report" sm/>Copy report</button></span></div>
+      <span class="set-row__text"><span class="set-row__label">${tr("Troubleshooting")}</span>
+        <span class="set-row__sub">${tr("A report for a GitHub issue: the versions, this PC, the engine's settings and the telling lines of its log, never the API key. Read it before you share it.")}</span></span>
+      <span class="set-row__ctl set-row__ctl--two"><button type="button" class="btn btn--secondary btn--sm" onClick=${show}>${log != null ? tr("Hide") : tr("Show engine log")}</button>
+        <button type="button" class="btn btn--primary btn--sm" onClick=${copy}><${Icon} name="report" sm/>${tr("Copy report")}</button></span></div>
     ${log != null ? html`<pre class="report">${log}</pre>` : null}<//>`;
 }
 
@@ -511,15 +512,15 @@ export function SettingsDialog() {
   return html`<div class="dialog-scrim" onPointerDown=${(e) => { if (e.target === e.currentTarget) close(); }}>
     <div ref=${box} class=${`dialog settings${list ? " is-list" : ""}`} role="dialog" aria-modal="true" aria-labelledby="settings-title" onKeyDown=${keys}>
       <div class="dialog__head">${list ? null : html`<button type="button" class="btn btn--ghost btn--sm set-back" onClick=${() => setList(true)}>
-          <${Icon} name="chevron-right" sm/>Settings</button>`}<h2 id="settings-title">Settings</h2>
-        <button type="button" class="icon-btn" aria-label="Close" onClick=${close}><${Icon} name="close"/></button></div>
+          <${Icon} name="chevron-right" sm/>${tr("Settings")}</button>`}<h2 id="settings-title">${tr("Settings")}</h2>
+        <button type="button" class="icon-btn" aria-label=${tr("Close")} onClick=${close}><${Icon} name="close"/></button></div>
       <div class="settings__main">
-        <nav class="set-nav" aria-label="Settings sections">${GROUPS.map((g) => html`
-          <span class="set-nav__group">${g.label}</span>
+        <nav class="set-nav" aria-label=${tr("Settings sections")}>${GROUPS.map((g) => html`
+          <span class="set-nav__group">${tr(g.label)}</span>
           <div class="set-nav__items">${g.items.map((s) => html`
           <button type="button" class="nav-item" aria-current=${s.id === sec && !list ? "page" : undefined}
-            onClick=${() => pick(s.id)}><${Icon} name=${s.icon}/><span>${s.label}</span>
-            ${s.id === "about" && newer ? html`<i class="nav-item__dot" title="A new version is available"></i>` : null}
+            onClick=${() => pick(s.id)}><${Icon} name=${s.icon}/><span>${tr(s.label)}</span>
+            ${s.id === "about" && newer ? html`<i class="nav-item__dot" title=${tr("A new version is available")}></i>` : null}
             <${Icon} name="chevron-right" sm cls="set-nav__chev"/></button>`)}</div>`)}</nav>
         <div class="set-body" ref=${body}><div class="set-page"><${Body}/></div></div>
       </div>

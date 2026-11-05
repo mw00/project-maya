@@ -4,6 +4,7 @@
 import {html, render, useEffect, useRef, useState} from "./preact.js";
 import {isPhone} from "./lib.js";
 import {S, applyScheme, applyTheme, closeDialog, emit, useStore} from "./state.js";
+import {applyLanguage} from "./i18n.js";
 import {loadHealth, loadMcp, loadUpdate, poll, whenHealth} from "./server.js";
 import {cancelEdit, chatView, focusInput, loadChats, newChat, newChatObj, openChat, resumePending, send, stopAnswer,
         updateCtxMeter} from "./chats.js";
@@ -17,6 +18,7 @@ import {ModelsPage} from "./models.js";
 
 applyTheme();
 applyScheme();
+applyLanguage();
 
 function App() {
   useStore();

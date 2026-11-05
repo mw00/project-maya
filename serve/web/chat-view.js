@@ -12,6 +12,7 @@ import {ChatMenuItems, openSettings, setSide, showView, status, usd} from "./sid
 import {MS, loadModels} from "./models.js";
 import {CODING_IDEAS} from "./turbo-core.js";
 import {Gauge, Icon, Menu, MenuItem, MenuSep, ModelLogo, useDismiss} from "./ui.js";
+import {languageChoice, t, tr} from "./i18n.js";
 
 // ------------------------------------------------------------------ the header
 function MeterRing({c}) {
@@ -30,18 +31,18 @@ function ModelMenu({open, close, anchor}) {
   const h = S.health, preset = presetOf(P), c = ctxMeter();
   useEffect(() => { if (open && !MS.data) loadModels(); }, [open]);   // (the Models row says how many are set up)
   const go = (s) => () => { close(); openSettings(s); };
-  return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Model" align="left" cls="model-menu" width=${340}>
+  return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label=${t("model", "Model")} align="left" cls="model-menu" width=${340}>
     <div class="model-menu__card"><${ModelLogo} model=${h.model} size=${36}/>
-      <span><b>${modelName(h.model, !!h.model_label)}</b><span>${h.model_label || h.model} · on this machine${h.version ? ` · v${h.version}` : ""}</span></span></div>
+      <span><b>${modelName(h.model, !!h.model_label)}</b><span>${h.model_label || h.model} · ${tr("on this machine")}${h.version ? ` · v${h.version}` : ""}</span></span></div>
     <${MenuSep}/>
-    ${c && isPhone() ? html`<div class="model-menu__meter"><${MeterRing} c=${c}/><span>${c.why}: ${c.approx ? "≈" : ""}${fmt(c.tokens)} of ${fmt(c.max)} tokens</span></div>` : null}
-    <button type="button" role="menuitem" class="menu__item" onClick=${go("model")}><span class="menu__label">Context size</span>
+    ${c && isPhone() ? html`<div class="model-menu__meter"><${MeterRing} c=${c}/><span>${tr("{why}: {tokens} of {max} tokens", {why: c.why, tokens: `${c.approx ? "≈" : ""}${fmt(c.tokens)}`, max: fmt(c.max)})}</span></div>` : null}
+    <button type="button" role="menuitem" class="menu__item" onClick=${go("model")}><span class="menu__label">${t("context-size", "Context size")}</span>
       <span class="menu__sub">${h.max_context ? ctxfmt(h.max_context) : "–"}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
-    <button type="button" role="menuitem" class="menu__item" onClick=${go("chat")}><span class="menu__label">Sampling</span>
-      <span class="menu__sub">${preset ? PRESET_NAMES[preset] : "Custom"}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
+    <button type="button" role="menuitem" class="menu__item" onClick=${go("chat")}><span class="menu__label">${t("sampling", "Sampling")}</span>
+      <span class="menu__sub">${preset ? tr(PRESET_NAMES[preset]) : t("custom", "Custom")}</span><${Icon} name="chevron" sm cls="chev is-closed"/></button>
     <${MenuSep}/>
     <button type="button" role="menuitem" class="menu__item" onClick=${() => { close(); showView("models"); }}>
-      <span class="menu__label">Models</span><span class="menu__sub">${MS.data ? `${MS.data.models.length} set up` : "Switch, settings"}</span>
+      <span class="menu__label">${t("models", "Models")}</span><span class="menu__sub">${MS.data ? tr("{count} set up", {count: MS.data.models.length}) : tr("Switch, settings")}</span>
       <${Icon} name="chevron" sm cls="chev is-closed"/></button>
   <//>`;
 }
@@ -53,18 +54,18 @@ function Header({empty}) {
   const name = modelName(S.health.model, true);   // (the short form here: "Qwen-3.8-Flash-Next"; the menu's line below it has the full one)
   if (isPhone()) {
     return html`<header class="chat-head chat-head--float">
-      <button type="button" class="glass-btn" aria-label="Chats" onClick=${() => { S.drawer = true; emit(); }}><${Icon} name="menu"/></button>
+      <button type="button" class="glass-btn" data-open-chats aria-label=${t("chats", "Chats")} onClick=${() => { S.drawer = true; emit(); }}><${Icon} name="menu"/></button>
       ${empty ? html`<span></span>` : html`<button type="button" ref=${mBtn} class="model-btn model-btn--phone" aria-haspopup="menu" aria-expanded=${String(model)}
         onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>`}
-      <button type="button" class="glass-btn" aria-label="New chat" onClick=${newChat}><${Icon} name="new-chat"/></button>
+      <button type="button" class="glass-btn" aria-label=${t("new-chat", "New chat")} onClick=${newChat}><${Icon} name="new-chat"/></button>
       ${empty ? null : html`<${ModelMenu} open=${model} close=${() => setModel(false)} anchor=${mBtn}/>`}
     </header>`;
   }
   return html`<header class="chat-head">
     <div class="chat-head__left">
       ${S.sideOpen ? null : html`
-        <button type="button" class="icon-btn" aria-label="Open the sidebar" title="Open the sidebar" onClick=${() => setSide(true)}><${Icon} name="panel-left"/></button>
-        <button type="button" class="icon-btn" aria-label="New chat" title="New chat" onClick=${newChat}><${Icon} name="new-chat"/></button>`}
+        <button type="button" class="icon-btn" aria-label=${t("open-sidebar", "Open the sidebar")} title=${t("open-sidebar", "Open the sidebar")} onClick=${() => setSide(true)}><${Icon} name="panel-left"/></button>
+        <button type="button" class="icon-btn" aria-label=${t("new-chat", "New chat")} title=${t("new-chat", "New chat")} onClick=${newChat}><${Icon} name="new-chat"/></button>`}
       ${empty ? null : html`<span class="anchor">
         <button type="button" ref=${mBtn} class=${`model-btn${model ? " is-open" : ""}`} aria-haspopup="menu" aria-expanded=${String(model)}
           title=${S.health.model} onClick=${() => setModel(!model)}>${name}<${Icon} name="chevron" sm/></button>
@@ -74,9 +75,9 @@ function Header({empty}) {
     <div class="chat-head__right">
       ${empty ? null : html`<${Meter}/>`}
       <span class="anchor">
-        <button type="button" ref=${oBtn} class="icon-btn" aria-label="Chat options" title="Chat options" aria-haspopup="menu"
+        <button type="button" ref=${oBtn} class="icon-btn" aria-label=${t("chat-options", "Chat options")} title=${t("chat-options", "Chat options")} aria-haspopup="menu"
           aria-expanded=${String(opts)} onClick=${() => setOpts(!opts)}><${Icon} name="ellipsis"/></button>
-        <${Menu} open=${opts} onClose=${() => setOpts(false)} anchor=${oBtn} label="Chat options" width=${250}>
+        <${Menu} open=${opts} onClose=${() => setOpts(false)} anchor=${oBtn} label=${t("chat-options", "Chat options")} width=${250}>
           <${ChatMenuItems} c=${S.current} close=${() => { setOpts(false); if (oBtn.current) oBtn.current.focus(); }}/>
         <//>
       </span>
@@ -91,12 +92,12 @@ function UserMsg({m, i}) {
   return html`<div class="you" data-id=${m.id}>
     ${(m.files || []).length || (m.images || []).length ? html`<div class="you__files">
       ${(m.files || []).map((f) => html`<span class="chip"><${Icon} name="attach" sm/>${f.name}</span>`)}
-      ${(m.images || []).map((im) => im.url ? html`<img src=${im.url} alt=${im.name || "picture"}/>`
-                                            : html`<span class="chip"><${Icon} name="image" sm/>${im.name || "picture"}</span>`)}</div>` : null}
+      ${(m.images || []).map((im) => im.url ? html`<img src=${im.url} alt=${im.name || tr("picture")}/>`
+                                            : html`<span class="chip"><${Icon} name="image" sm/>${im.name || tr("picture")}</span>`)}</div>` : null}
     ${m.text ? html`<div class="you__bubble">${m.text}</div>` : null}
     <div class="you__actions"><span class="you__time">${m.time ? timeStr(m.time) : ""}</span>
-      <button type="button" class="icon-btn icon-btn--sm" aria-label="Edit and send again" title="Edit" onClick=${() => editMessage(i)}><${Icon} name="edit" sm/></button>
-      <button type="button" class="icon-btn icon-btn--sm" aria-label="Copy" title="Copy" onClick=${copy}><${Icon} name=${copied ? "check" : "copy"} sm/></button>
+      <button type="button" class="icon-btn icon-btn--sm" aria-label=${tr("Edit and send again")} title=${tr("Edit")} onClick=${() => editMessage(i)}><${Icon} name="edit" sm/></button>
+      <button type="button" class="icon-btn icon-btn--sm" aria-label=${tr("Copy")} title=${tr("Copy")} onClick=${copy}><${Icon} name=${copied ? "check" : "copy"} sm/></button>
     </div></div>`;
 }
 
@@ -111,17 +112,17 @@ function toolHtml(t, k) {
   const preview = t.result != null ? t.result : args.replace(/\s+/g, " ");
   let body = "";
   if (t.open) {
-    body = `<div class="tool__label">Arguments</div><pre class="tool__pre">${esc(args || "(being written)")}</pre>`;
+    body = `<div class="tool__label">${tr("Arguments")}</div><pre class="tool__pre">${esc(args || tr("(being written)"))}</pre>`;
     if (t.result != null) {
-      body += `<div class="tool__label">${t.ok ? "Result" : "Error"}${t.chars ? ` · ${fmt(t.chars)} characters` : ""}` +
-              `${t.truncated ? ", cut for the model" : ""}</div><pre class="tool__pre">${esc(t.result)}</pre>`;
+      body += `<div class="tool__label">${t.ok ? tr("Result") : tr("Error")}${t.chars ? ` · ${tr("{count} characters", {count: fmt(t.chars)})}` : ""}` +
+              `${t.truncated ? tr(", cut for the model") : ""}</div><pre class="tool__pre">${esc(t.result)}</pre>`;
     }
   }
   return `<details class="tool" data-tool="${k}" data-state="${esc(t.state)}"${t.open ? " open" : ""}>` +
     `<summary>${ico("tool")}<span class="tool__name" title="${esc(t.name || "")}">${esc(t.tool || t.name || "tool")}</span>` +
     (t.server ? `<span class="tool__server">${esc(t.server)}</span>` : "") +
     `<span class="tool__preview">${esc(preview.slice(0, 200))}</span>` +
-    `<span class="badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="tool__ms">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
+    `<span class="badge ${cls}">${esc(TOOL_STATE[t.state] ? tr(label) : label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="tool__ms">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${ico("chevron")}</summary><div class="tool__body">${body}</div></details>`;
 }
 // the answer's text with the tool blocks where the model called them
@@ -137,8 +138,27 @@ function answerHtml(m, streaming) {
   return out + markdown(m.text.slice(pos));
 }
 
+// m.meta is persisted as compact English telemetry. Translate only the exact UI formats this client writes;
+// anything else (including older or server-provided text) remains untouched.
+export function localizeAnswerMeta(meta) {
+  return String(meta || "").split(" · ").filter(Boolean).map((part) => {
+    let match;
+    if ((match = part.match(/^(\d[\d,]*) tokens$/))) return tr("{count} tokens", {count: match[1]});
+    if ((match = part.match(/^(\d[\d.,]*) tok\/s$/))) return tr("{speed} tok/s", {speed: match[1]});
+    if ((match = part.match(/^read (\d[\d,]*) new prompt tokens in (\d[\d.,]*) s(?: \((\d[\d,]*) reused\))?$/))) {
+      return tr("Read {count} new prompt tokens in {seconds} s{reused}", {
+        count: match[1], seconds: match[2], reused: match[3] ? tr(" ({count} reused)", {count: match[3]}) : "",
+      });
+    }
+    if (/^stopped$/i.test(part)) return tr("Stopped");
+    if ((match = part.match(/^(\d+) tool calls?$/))) return tr(match[1] === "1" ? "{count} tool call" : "{count} tool calls", {count: match[1]});
+    if ((match = part.match(/^stopped at the limit of (\d+) tool rounds \(mcp\.max_rounds\)$/i))) return tr("Stopped at the limit of {count} tool rounds (mcp.max_rounds)", {count: match[1]});
+    return part;
+  });
+}
+
 // An answer: painted in place (it repaints up to every frame while it streams), not re-rendered by the page
-class Answer extends Component {
+export class Answer extends Component {
   constructor() {
     super();
     this.sig = "";
@@ -183,29 +203,30 @@ class Answer extends Component {
   componentDidMount() { painters.set(this.props.m, this.paint); this.update(this.props, true); }
   componentWillUnmount() { this.info(false); if (painters.get(this.props.m) === this.paint) painters.delete(this.props.m); }
   shouldComponentUpdate(np) {
-    if (np.m !== this.props.m) return true;
+    if (np.m !== this.props.m || np.lang !== this.props.lang) return true;
     this.update(np, false);
     return false;
   }
   componentDidUpdate(pp) {
-    if (pp.m === this.props.m) return;
-    if (painters.get(pp.m) === this.paint) painters.delete(pp.m);
-    painters.set(this.props.m, this.paint);
+    if (pp.m !== this.props.m) {
+      if (painters.get(pp.m) === this.paint) painters.delete(pp.m);
+      painters.set(this.props.m, this.paint);
+    }
     this.update(this.props, true);
   }
-  update({m, last}, force) {
+  update({m, last, lang}, force) {
     if (!this.base) return;
     const streaming = !!S.busy && S.busy.msg === m;
     const sig = [m.text.length, (m.reasoning || "").length, (m.tools || []).map((t) => `${t.state}${t.open ? 1 : 0}${t.result != null ? 1 : 0}`).join(),
-                 m.error, m.meta, m.stopped, streaming, last, !!S.busy, P.show].join("|");
+                 m.error, m.meta, m.stopped, streaming, last, !!S.busy, P.show, lang].join("|");
     if (!force && sig === this.sig) return;
     this.sig = sig;
     const det = this.det;
     if (m.reasoning) {
       det.hidden = false;
       const thinkingNow = streaming && !m.text;
-      det.querySelector(".think__title").textContent = thinkingNow ? "Thinking…" :
-        m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts";
+      det.querySelector(".think__title").textContent = thinkingNow ? tr("Thinking…") :
+        m.thinkSecs != null ? tr("Thought for {seconds} s", {seconds: fmt(m.thinkSecs, 1)}) : tr("Thoughts");
       det.classList.toggle("is-live", thinkingNow);
       const body = det.querySelector(".think__body");
       if (det.open || thinkingNow) {
@@ -223,7 +244,7 @@ class Answer extends Component {
     const body = this.body;
     if (m.error) {
       body.innerHTML = `<div class="msg-error"></div>`;
-      body.firstChild.textContent = m.error;
+      body.firstChild.textContent = m.errorUI ? tr(m.errorUI.key, m.errorUI.values) : m.error;
     } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
       body.innerHTML = m.reasoning ? "" : `<p class="answer__wait"><span class="dot-pulse"></span></p>`;
     } else {
@@ -232,8 +253,8 @@ class Answer extends Component {
     body.classList.toggle("is-streaming", streaming && !!m.text);
     const acts = this.acts;
     // (a stop stays in sight; the numbers go behind the info button, a line each)
-    acts.querySelector(".answer__meta").textContent = !streaming && m.stopped ? "Stopped" : "";
-    const lines = streaming ? [] : (m.meta || "").split(" · ").filter(Boolean).map((t) => t[0].toUpperCase() + t.slice(1));
+    acts.querySelector(".answer__meta").textContent = !streaming && m.stopped ? tr("Stopped") : "";
+    const lines = streaming ? [] : localizeAnswerMeta(m.meta);
     this.infoBtn.hidden = !lines.length;
     if (!lines.length) this.info(false);
     if (this.pop.dataset.text !== lines.join("\n")) {
@@ -251,12 +272,12 @@ class Answer extends Component {
         <div class="think__body"></div></details>
       <div class="answer__body prose" ref=${(e) => { this.body = e; }}></div>
       <div class="answer__actions" ref=${(e) => { this.acts = e; }}>
-        <button type="button" class="icon-btn icon-btn--sm" data-a="copy" aria-label="Copy the answer" title="Copy" onClick=${this.copy}><${Icon} name="copy" sm/></button>
-        <button type="button" class="icon-btn icon-btn--sm" data-a="regen" aria-label="Write this answer again" title="Regenerate" onClick=${regenerate}><${Icon} name="refresh" sm/></button>
+        <button type="button" class="icon-btn icon-btn--sm" data-a="copy" aria-label=${t("copy-answer", "Copy the answer")} title=${t("copy", "Copy")} onClick=${this.copy}><${Icon} name="copy" sm/></button>
+        <button type="button" class="icon-btn icon-btn--sm" data-a="regen" aria-label=${t("regenerate", "Write this answer again")} title=${t("regenerate", "Regenerate")} onClick=${regenerate}><${Icon} name="refresh" sm/></button>
         <span class="anchor">
-          <button type="button" class="icon-btn icon-btn--sm" data-a="info" ref=${(e) => { this.infoBtn = e; }} hidden aria-label="About this answer"
-            title="Tokens and speed" aria-haspopup="dialog" aria-expanded="false" onClick=${() => this.info(this.pop.hidden)}><${Icon} name="info" sm/></button>
-          <div class="answer__pop" role="dialog" aria-label="About this answer" hidden ref=${(e) => { this.pop = e; }}></div></span>
+          <button type="button" class="icon-btn icon-btn--sm" data-a="info" ref=${(e) => { this.infoBtn = e; }} hidden aria-label=${t("about-answer", "About this answer")}
+            title=${t("tokens-and-speed", "Tokens and speed")} aria-haspopup="dialog" aria-expanded="false" onClick=${() => this.info(this.pop.hidden)}><${Icon} name="info" sm/></button>
+          <div class="answer__pop" role="dialog" aria-label=${t("about-answer", "About this answer")} hidden ref=${(e) => { this.pop = e; }}></div></span>
         <span class="answer__meta"></span></div>
     </article>`;
   }
@@ -279,7 +300,7 @@ function Thread() {
   };
   return html`<div class="thread" onClick=${click}>
     ${ms.map((m, i) => m.role === "user" ? html`<${UserMsg} key=${m.id} m=${m} i=${i}/>`
-                                          : html`<${Answer} key=${m.id} m=${m} last=${i === ms.length - 1} busy=${!!S.busy}/>`)}
+                                          : html`<${Answer} key=${m.id} m=${m} last=${i === ms.length - 1} busy=${!!S.busy} lang=${languageChoice()}/>`)}
   </div>`;
 }
 
@@ -313,13 +334,13 @@ function ThinkingBar({bar, below}) {
   };
   const cls = `think-bar${isPhone() ? "" : " think-bar--pop"}${below && !isPhone() ? " think-bar--below" : ""}${n > 5 ? " think-bar--many" : ""}`;
   return html`<div ref=${bar} class=${cls} style=${`--n:${n}`}>
-    <div ref=${track} class="think-bar__track" role="slider" tabIndex="0" aria-label="Thinking level, for this chat" aria-valuemin="0"
-      aria-valuemax=${n - 1} aria-valuenow=${li} aria-valuetext=${`${LEVELS[li].name}: ${LEVELS[li].desc}`}
+    <div ref=${track} class="think-bar__track" role="slider" tabIndex="0" aria-label=${tr("Thinking level, for this chat")} aria-valuemin="0"
+      aria-valuemax=${n - 1} aria-valuenow=${li} aria-valuetext=${`${tr(LEVELS[li].name)}: ${tr(LEVELS[li].desc)}`}
       style=${`--at:${pill.at}%;--w:${pill.width}%`}
       onPointerDown=${down} onPointerMove=${move} onPointerUp=${up} onPointerCancel=${up} onKeyDown=${keys}>
       <span class="think-bar__fill"></span>
       ${LEVELS.map((l, i) => html`<span class=${`think-bar__seg${i === li ? " is-sel" : ""}`}
-        title=${titles[l.id]}>${l.name}</span>`)}
+        title=${tr(titles[l.id])}>${tr(l.name)}</span>`)}
     </div>
   </div>`;
 }
@@ -332,12 +353,12 @@ function ThinkingPopover({open, close, anchor, below}) {
 
 function PlusMenu({open, close, anchor, pickFiles}) {
   const servers = (S.mcp.servers || []).length;
-  return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label="Add" align="left" width=${270} cls="plus-menu">
-    <${MenuItem} icon="attach" label="Select file" onClick=${() => { close(); pickFiles(); }}/>
+  return html`<${Menu} open=${open} onClose=${close} anchor=${anchor} label=${tr("Add")} align="left" width=${270} cls="plus-menu">
+    <${MenuItem} icon="attach" label=${tr("Select file")} onClick=${() => { close(); pickFiles(); }}/>
     ${servers ? html`<${MenuSep}/>
       <button type="button" role="menuitemcheckbox" aria-checked=${String(P.mcp !== false)} class="menu__item"
         onClick=${() => savePrefs({mcp: P.mcp === false})}>
-        <${Icon} name="tool" sm/><span class="menu__label">MCP tools<span class="menu__hint">${S.mcp.tools ? `${fmt(S.mcp.tools)} tools the model may call` : "no server connected yet"}</span></span>
+        <${Icon} name="tool" sm/><span class="menu__label">${tr("MCP tools")}<span class="menu__hint">${S.mcp.tools ? tr("{count} tools the model may call", {count: fmt(S.mcp.tools)}) : tr("no server connected yet")}</span></span>
         <span class="switch switch--sm" aria-hidden="true" data-on=${String(P.mcp !== false)}><span class="switch__knob"></span></span></button>` : null}
   <//>`;
 }
@@ -368,30 +389,30 @@ function Composer({center}) {
   };
   const level = thinkingOf(), lv = LEVELS.find((l) => l.id === level) || LEVELS[2];
   return html`<div class="composer-wrap">
-    ${S.editIndex != null ? html`<div class="edit-bar"><${Icon} name="edit" sm/><span>Editing a message: sending it replaces the answers after it.</span>
-      <button type="button" class="btn btn--secondary btn--sm" onClick=${() => cancelEdit()}>Cancel</button></div>` : null}
+    ${S.editIndex != null ? html`<div class="edit-bar"><${Icon} name="edit" sm/><span>${tr("Editing a message: sending it replaces the answers after it.")}</span>
+      <button type="button" class="btn btn--secondary btn--sm" onClick=${() => cancelEdit()}>${tr("Cancel")}</button></div>` : null}
     <form ref=${box} class=${`composer${tall ? " is-tall" : ""}`} onSubmit=${(e) => { e.preventDefault(); send(); }}>
       ${S.attachments.length ? html`<div class="composer__files">${S.attachments.map((a, i) => html`
         <span class="chip chip--file">${a.kind === "image" && a.url ? html`<img src=${a.url} alt=""/>` : html`<${Icon} name=${a.kind === "file" ? "attach" : "image"} sm/>`}
           <span class="chip__name">${a.name}</span>
-          <button type="button" class="chip__x" aria-label=${`Remove ${a.name}`} onClick=${() => removeAttachment(i)}><${Icon} name="close" sm/></button></span>`)}</div>` : null}
+          <button type="button" class="chip__x" aria-label=${tr("Remove {name}", {name: a.name})} onClick=${() => removeAttachment(i)}><${Icon} name="close" sm/></button></span>`)}</div>` : null}
       <span class="anchor composer__plus">
-        <button type="button" ref=${plusBtn} class="icon-btn icon-btn--round" aria-label="Add files, images and tools" title="Add files, images and tools"
+        <button type="button" ref=${plusBtn} class="icon-btn icon-btn--round" aria-label=${tr("Add files, images and tools")} title=${tr("Add files, images and tools")}
           aria-haspopup="menu" aria-expanded=${String(plus)} onClick=${() => setPlus(!plus)}><${Icon} name="plus"/></button>
         <${PlusMenu} open=${plus} close=${() => setPlus(false)} anchor=${plusBtn} pickFiles=${() => file.current.click()}/>
       </span>
       <input type="file" ref=${file} multiple hidden onChange=${(e) => { addFiles(e.target.files); e.target.value = ""; focusInput(); }}/>
-      <textarea id="composer-input" ref=${ta} class="composer__input" rows="1" placeholder="Ask anything" aria-label="Ask anything"
+      <textarea id="composer-input" ref=${ta} class="composer__input" rows="1" placeholder=${tr("Ask anything")} aria-label=${tr("Ask anything")}
         value=${text} onInput=${(e) => { S.draft = e.target.value; emit(); updateCtxMeter(); }} onKeyDown=${keydown} onPaste=${paste}></textarea>
       <div class="composer__tools">
         <span class="anchor">
           <button type="button" ref=${thinkBtn} class=${`think-chip${think ? " is-open" : ""}`} aria-haspopup="dialog" aria-expanded=${String(think)}
-            aria-label=${`Thinking: ${lv.name}. Change it`} title="How long the model thinks" onClick=${() => setThink(!think)}>
-            <${Gauge} level=${level}/><span><span class="think-chip__word">Thinking · </span><b>${lv.name}</b></span></button>
+            aria-label=${tr("Thinking: {level}. Change it", {level: tr(lv.name)})} title=${tr("How long the model thinks")} onClick=${() => setThink(!think)}>
+            <${Gauge} level=${level}/><span><span class="think-chip__word">${tr("Thinking · ")}</span><b>${tr(lv.name)}</b></span></button>
         </span>
-        ${mine ? html`<button type="button" class="send send--stop" aria-label="Stop the answer (Esc)" title="Stop (Esc)" onClick=${stopAnswer}>
+        ${mine ? html`<button type="button" class="send send--stop" aria-label=${tr("Stop the answer (Esc)")} title=${tr("Stop (Esc)")} onClick=${stopAnswer}>
                    <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="7" width="10" height="10" rx="2" fill="currentColor"/></svg></button>`
-               : html`<button type="submit" class="send" aria-label="Send" title="Send (Enter)" disabled=${!canSend}><${Icon} name="arrow-up"/></button>`}
+               : html`<button type="submit" class="send" aria-label=${tr("Send")} title=${tr("Send (Enter)")} disabled=${!canSend}><${Icon} name="arrow-up"/></button>`}
       </div>
       <${ThinkingPopover} open=${think} close=${() => setThink(false)} anchor=${thinkBtn} below=${center}/>
     </form>
@@ -399,10 +420,10 @@ function Composer({center}) {
   </div>`;
 }
 function note() {
-  if (S.hint) return S.hint;
-  if (S.busy && S.busy.chat !== S.current) return "An answer is being written in another chat.";
-  return S.health.mcp_tools && mcpOn() ? "Runs on this machine. Nothing leaves it, unless an MCP tool you turned on reaches the web."
-                                       : "Runs on this machine. Nothing leaves it.";
+  if (S.hint) return S.hint.key ? tr(S.hint.key, S.hint.values) : S.hint;
+  if (S.busy && S.busy.chat !== S.current) return tr("An answer is being written in another chat.");
+  return S.health.mcp_tools && mcpOn() ? tr("Runs on this machine. Nothing leaves it, unless an MCP tool you turned on reaches the web.")
+                                       : tr("Runs on this machine. Nothing leaves it.");
 }
 
 // ------------------------------------------------------------------ a new chat: the model, the box, ideas
@@ -410,17 +431,17 @@ function note() {
 // page, to switch to another
 function ModelCard({phone}) {
   const h = S.health || {}, m = S.metrics, st = status(true);
-  const ready = S.conn === "ok" && st.text === "Idle";
+  const ready = S.conn === "ok" && st.text === tr("Idle");
   const last = m && (m.requests || [])[0], sv = m && m.savings;
-  const name = h.model_label || modelName(h.model) || "The model", state = ready ? "Ready" : st.text;
+  const name = h.model_label || modelName(h.model) || tr("The model"), state = ready ? tr("Ready") : st.text;
   const pill = html`<span class=${`pill pill--${ready ? "ok" : st.tone}`}><i class="status__dot"></i>${state}</span>`;
   if (phone) {   // (the whole card a button: the name, then its state and the facts on one line, short)
     // (the speed and what it saved; the context size when there is neither yet - a narrow line has room for two)
     let facts = [last && last.decode_tok_s ? `${fmt(last.decode_tok_s, last.decode_tok_s < 10 ? 1 : 0)} tok/s` : null,
-                 sv && sv.priced ? `${usd(sv.usd)} saved` : null].filter(Boolean);
-    if (!facts.length && h.max_context) facts = [`${ctxfmt(h.max_context)} context`];
+                 sv && sv.priced ? tr("{amount} saved", {amount: usd(sv.usd)}) : null].filter(Boolean);
+    if (!facts.length && h.max_context) facts = [tr("{context} context", {context: ctxfmt(h.max_context)})];
     return html`<button type="button" class="model-card model-card--phone" onClick=${() => showView("models")}
-        aria-label=${`${name}, ${state}${facts.length ? `, ${facts.join(", ")}` : ""}. Switch model`}>
+        aria-label=${tr("{name}, {state}{facts}. Switch model", {name, state, facts: facts.length ? `, ${facts.join(", ")}` : ""})}>
       <${ModelLogo} model=${h.model} size=${40}/>
       <span class="model-card__text"><span class="model-card__name"><b>${name}</b></span>
         <span class="model-card__line num"><span class="model-card__state" data-tone=${ready ? "ok" : st.tone}><i></i>${state}</span>${
@@ -429,15 +450,15 @@ function ModelCard({phone}) {
   }
   const facts = [h.max_context ? ["Context", ctxfmt(h.max_context)] : null,
                  last && last.decode_tok_s ? ["Last answer", `${fmt(last.decode_tok_s, 1)} tok/s`] : null,
-                 h.model ? ["Images", h.images ? "on" : "off"] : null,
+                 h.model ? ["Images", tr(h.images ? "on" : "off")] : null,
                  sv && sv.priced ? ["Saved", usd(sv.usd)] : null].filter(Boolean);
-  return html`<section class="model-card" aria-label="The model">
+  return html`<section class="model-card" aria-label=${tr("The model")}>
     <${ModelLogo} model=${h.model} size=${44}/>
     <div class="model-card__text">
       <div class="model-card__name" role="status"><b title=${h.model || ""}>${name}</b>${pill}</div>
-      ${facts.length ? html`<div class="model-card__facts num">${facts.map(([k, v]) => html`<span>${k}<b>${v}</b></span>`)}</div>` : null}
+      ${facts.length ? html`<div class="model-card__facts num">${facts.map(([k, v]) => html`<span>${tr(k)}<b>${v}</b></span>`)}</div>` : null}
     </div>
-    <button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>Switch model</button>
+    <button type="button" class="btn btn--secondary btn--sm" onClick=${() => showView("models")}><${Icon} name="swap" sm/>${tr("Switch model")}</button>
   </section>`;
 }
 
@@ -452,17 +473,17 @@ const IDEAS = [
   {icon: "thinking", label: "Explain a topic clearly",
    q: "Summarize the key ideas of mixture-of-experts language models for a curious engineer, in five short paragraphs."},
 ];
-const useIdea = (q) => { S.draft = q; emit(); updateCtxMeter(); focusInput(); };
+const useIdea = (q) => { S.draft = tr(q); emit(); updateCtxMeter(); focusInput(); };
 
 // a new chat: what are we building, the model that answers it, the box, and ideas to start from
 function Greeting({phone}) {
   return html`<div class=${`greeting${phone ? " greeting--phone" : ""}`}>
-    <h1>What are we building today?</h1>
+    <h1>${tr("What are we building today?")}</h1>
     <${ModelCard} phone=${phone}/>
     ${phone ? null : html`<${Composer} center/>`}
-    <div class="ideas" role="list" aria-label="Ideas to start with">
+    <div class="ideas" role="list" aria-label=${tr("Ideas to start with")}>
       ${(S.turbo && S.turbo.on ? CODING_IDEAS : IDEAS).map((it) => html`<div role="listitem"><button type="button" class="idea" onClick=${() => useIdea(it.q)}>
-        <${Icon} name=${it.icon}/><span>${it.label}</span></button></div>`)}
+        <${Icon} name=${it.icon}/><span>${tr(it.label)}</span></button></div>`)}
     </div>
   </div>`;
 }
@@ -527,9 +548,9 @@ export function ChatPage() {
     <div class="chat__scroll" ref=${scroller} onScroll=${onScroll}>
       ${empty ? html`<${Greeting} phone=${phone}/>` : html`<${Thread}/>`}
     </div>
-    ${jump && !empty ? html`<button type="button" class="jump" onClick=${() => scrollDown(true)} aria-label="Scroll to the latest">
+    ${jump && !empty ? html`<button type="button" class="jump" onClick=${() => scrollDown(true)} aria-label=${tr("Scroll to the latest")}>
       <${Icon} name="arrow-down" sm/></button>` : null}
     ${empty && !phone ? html`<p class="composer-note composer-note--foot">${note()}</p>` : html`<div class="chat__dock"><${Composer}/></div>`}
-    ${drop ? html`<div class="drop" aria-hidden="true"><${Icon} name="attach" lg/><span>Drop files${S.health.images ? " or images" : ""} to attach them</span></div>` : null}
+    ${drop ? html`<div class="drop" aria-hidden="true"><${Icon} name="attach" lg/><span>${tr(S.health.images ? "Drop files or images to attach them" : "Drop files to attach them")}</span></div>` : null}
   </main>`;
 }

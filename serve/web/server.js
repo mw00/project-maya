@@ -1,7 +1,17 @@
 // serve/web/server.js - what the page asks the server: its health (the model, its defaults), the live metrics every
 // second, the MCP servers, the context size and port (each a restart), the update, the shared settings and the report.
 import {api, ctxfmt, esc, fmt, headers} from "./lib.js";
+import {tr} from "./i18n.js";
 import {DEFAULTS, P, PENALTIES, S, THINKING, confirmDialog, emit, loadPrefs, modelId, newModelCheck, setFamily, toast} from "./state.js";
+
+// Only phases produced by this server are UI labels. Future/third-party phases stay verbatim.
+export function phaseText(phase) {
+  const labels = {thinking: "Thinking", answering: "Answering", "reading the prompt": "Reading the prompt",
+                  "tool call complete": "Tool call complete"};
+  if (Object.hasOwn(labels, phase)) return tr(labels[phase]);
+  const tool = /^writing a tool call: (.+)$/.exec(phase || "");
+  return tool ? tr("Writing a tool call: {tool}", {tool: tool[1]}) : phase;
+}
 
 // ------------------------------------------------------------------ health: the model and its recommended settings
 let onHealth = () => {};
@@ -27,8 +37,7 @@ export async function loadHealth() {
       S.current.thinking = P.thinking;
       S.current.thinkingFor = modelId();
     }
-    if (switched) toast("info", `${h.model_label || h.model}: its own settings`, "A new model starts at its standard " +
-                        "parameters and thinking level; change them in Settings › Chat defaults.", 6000);
+    if (switched) toast("info", tr("{model}: its own settings", {model:h.model_label || h.model}), tr("A new model starts at its standard parameters and thinking level; change them in Settings › Chat defaults."), 6000);
     emit();
     onHealth();
     if (h.status === "reloading") watchReload();
@@ -46,7 +55,7 @@ export async function poll() {
     const r = await fetch(reqAll.on ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
       S.conn = "key";
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it in Settings › Connect your tools.", 6000); }
+      if (!keyWarned) { keyWarned = true; toast("warn", tr("API key needed"), tr("This server needs a key: add it in Settings › Connect your tools."), 6000); }
     } else if (r.ok) {
       S.metrics = await r.json();
       S.conn = "ok";
@@ -96,9 +105,9 @@ export function speculationView(m, now = Date.now() / 1000) {
   if (reqOff && !running) return {state: "off", name, text: "off", pct: null};      // (the last answer asked for no drafting)
   if (offered != null && offered > 0) pct = 100 * acc / offered;
   if (pct == null) return {state: "waiting", name, text: "\u2014", pct: null};
-  const text = offered != null && offered > 0 ? `${fmt(pct, 0)}% (${fmt(acc)} of ${fmt(offered)})` : `${fmt(pct, 0)}%`;
+  const text = offered != null && offered > 0 ? `${fmt(pct, 0)}% (${tr("{accepted} of {offered}", {accepted:fmt(acc),offered:fmt(offered)})})` : `${fmt(pct, 0)}%`;
   return {state: "kept", name, text, pct, accepted: acc, offered,
-          short: `${fmt(pct, 0)}%`, detail: offered != null && offered > 0 ? `${fmt(acc)} of ${fmt(offered)} drafted` : ""};
+          short: `${fmt(pct, 0)}%`, detail: offered != null && offered > 0 ? tr("{accepted} of {offered} drafted", {accepted:fmt(acc),offered:fmt(offered)}) : ""};
 }
 
 // "Where the experts live": the experts in VRAM, in RAM and on the SSD only, each with its bytes (the engine's
@@ -169,45 +178,44 @@ export function ctxEstimate(n) {
 // GLM's), `vram`: a cache wholly in VRAM.  `now`: the size it has now (the change in GB is shown against it).
 export function ctxHint(n, {live = false, now = null, win = 0, whole = false, ram = 0, vram = 0} = {}) {
   const e = live ? ctxEstimate(n) : null, same = now == null || n === now;
-  const more = (d) => (same || !d ? "." : ` · ${fmt(Math.abs(d), 1)} GB ${d > 0 ? "more" : "less"} than now.`);
+  const more = (d) => (same || !d ? "." : tr(" · {gb} GB {direction} than now.", {gb:fmt(Math.abs(d),1),direction:d>0 ? tr("more") : tr("less")}));
   const W = ctxfmt(win || (S.ctxInfo && S.ctxInfo.kv_resident) || 0);
-  if (e && e.ram) return `≈ ${fmt(e.gb, 1)} GB of RAM for the context (kept pinned; ${W} positions of it also in VRAM)` + more(e.delta);
-  if (e) return `≈ ${fmt(e.gb, 1)} GB of GPU memory for the context` + (same ? "." : e.experts
-    ? ` · about ${fmt(Math.abs(e.experts))} ${e.experts > 0 ? "fewer" : "more"} experts held in VRAM than now${e.experts > 0 ? " (answers a little slower)" : ""}.` : ".");
+  if (e && e.ram) return tr("≈ {gb} GB of RAM for the context (kept pinned; {window} positions of it also in VRAM)", {gb:fmt(e.gb,1),window:W}) + more(e.delta);
+  if (e) return tr("≈ {gb} GB of GPU memory for the context", {gb:fmt(e.gb,1)}) + (same ? "." : e.experts
+    ? tr(" · about {count} {direction} experts held in VRAM than now{slower}.", {count:fmt(Math.abs(e.experts)),direction:e.experts>0 ? tr("fewer") : tr("more"),slower:e.experts>0 ? tr(" (answers a little slower)") : ""}) : ".");
   const gb = (bytes, k) => (bytes * k) / 2 ** 30;
   if (ram && win) {
-    if (whole && n <= win) return `Up to ${W} the whole cache stays in VRAM.`;
-    return `≈ ${fmt(gb(ram, n), 1)} GB of RAM for the context (kept pinned; ${W} positions of it also in VRAM)` +
+    if (whole && n <= win) return tr("Up to {window} the whole cache stays in VRAM.", {window:W});
+    return tr("≈ {gb} GB of RAM for the context (kept pinned; {window} positions of it also in VRAM)", {gb:fmt(gb(ram,n),1),window:W}) +
       (now != null && whole && now <= win ? "." : more(gb(ram, n - (now || 0))));
   }
-  if (vram) return `≈ ${fmt(gb(vram, n), 1)} GB of GPU memory for the context, taken from the experts` + more(gb(vram, n - (now || 0)));
-  return "How much text the model holds at once: the chat, files and tool output. More context takes GPU memory from the experts, so answers get a little slower.";
+  if (vram) return tr("≈ {gb} GB of GPU memory for the context, taken from the experts", {gb:fmt(gb(vram,n),1)}) + more(gb(vram, n - (now || 0)));
+  return tr("How much text the model holds at once: the chat, files and tool output. More context takes GPU memory from the experts, so answers get a little slower.");
 }
 // how long loading the model takes here: as long as its last load (GET /api/context's load_s), else the usual 1-3 minutes
 export function loadTime() {
   const s = S.ctxInfo && +S.ctxInfo.load_s;
-  if (!(s > 0)) return "about 1–3 minutes";
+  if (!(s > 0)) return tr("about 1–3 minutes");
   const m = Math.round(s / 60);
-  return `about ${m <= 1 ? "a minute" : `${m} minutes`}, as its last load took`;
+  return m <= 1 ? tr("about a minute, as its last load took") : tr("about {minutes} minutes, as its last load took", {minutes:m});
 }
 export async function confirmContext(n, chatTokens) {
   const c = S.ctxInfo, e = ctxEstimate(n);
-  const parts = [`<p>The engine restarts with a <b>${esc(ctxfmt(n))}</b>-token context (now ${esc(ctxfmt(c.context))}). ` +
-                 `That takes ${esc(loadTime())}.</p>`,
-                 "<ul><li>Your chats stay here; the next answer reads the chat again.</li>" +
-                 "<li>Requests from other apps get a “try again” until the model is back.</li>" +
-                 "<li>If the new size does not fit, the current one comes back by itself.</li>" +
-                 (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"];
-  if (e && e.ram) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of RAM, kept pinned for the context.</p>`);
-  else if (e) parts.push(`<p class="muted">Its cost here: about ${esc(fmt(e.gb, 1))} GB of GPU memory` +
-                    (e.experts ? `, ${esc(fmt(Math.abs(e.experts)))} ${e.experts > 0 ? "fewer" : "more"} experts in VRAM than now.` : ".") + "</p>");
-  if (chatTokens > n) parts.push(`<p class="warn-text">The open chat holds about ${esc(fmt(chatTokens))} tokens: more than the new size, so it will not fit. Start a new chat after the reload, or keep a larger context.</p>`);
-  const ok = await confirmDialog(`Reload the model with a ${ctxfmt(n)} context?`, parts.join(""), `Reload with ${ctxfmt(n)}`);
+  const parts = [tr("<p>The engine restarts with a <b>{context}</b>-token context (now {now}). That takes {time}.</p>", {context:esc(ctxfmt(n)),now:esc(ctxfmt(c.context)),time:esc(loadTime())}),
+                 tr("<ul><li>Your chats stay here; the next answer reads the chat again.</li>") +
+                 tr("<li>Requests from other apps get a “try again” until the model is back.</li>") +
+                 tr("<li>If the new size does not fit, the current one comes back by itself.</li>") +
+                 (S.busy ? tr("<li>The answer being written finishes first.</li>") : "") + "</ul>"];
+  if (e && e.ram) parts.push(tr('<p class="muted">Its cost here: about {gb} GB of RAM, kept pinned for the context.</p>', {gb:esc(fmt(e.gb,1))}));
+  else if (e) parts.push(tr('<p class="muted">Its cost here: about {gb} GB of GPU memory', {gb:esc(fmt(e.gb,1))}) +
+                    (e.experts ? tr(", {count} {direction} experts in VRAM than now.", {count:esc(fmt(Math.abs(e.experts))),direction:e.experts>0 ? tr("fewer") : tr("more")}) : ".") + "</p>");
+  if (chatTokens > n) parts.push(tr('<p class="warn-text">The open chat holds about {tokens} tokens: more than the new size, so it will not fit. Start a new chat after the reload, or keep a larger context.</p>', {tokens:esc(fmt(chatTokens))}));
+  const ok = await confirmDialog(tr("Reload the model with a {context} context?", {context:ctxfmt(n)}), parts.join(""), tr("Reload with {context}", {context:ctxfmt(n)}));
   if (!ok) return false;
   try {
     await api("api/context", {method: "POST", body: {max_context: n}});
   } catch (err) {
-    toast("error", "The context did not change", err.message, 6000);
+    toast("error", tr("The context did not change"), err.message, 6000);
     return false;
   }
   watchReload(n);
@@ -217,7 +225,8 @@ export async function confirmContext(n, chatTokens) {
 export async function watchReload(to) {
   if (S.reload) return;
   S.reload = {to: to || (S.ctxInfo && S.ctxInfo.reload && S.ctxInfo.reload.to) || null};
-  S.hint = `Reloading the model${S.reload.to ? ` with a ${ctxfmt(S.reload.to)} context` : ""}…`;
+  S.hint = S.reload.to ? {key: "Reloading the model with a {context} context…", values: {context: ctxfmt(S.reload.to)}}
+                       : {key: "Reloading the model…"};
   emit();
   for (;;) {
     await new Promise((ok) => setTimeout(ok, 2000));
@@ -229,8 +238,8 @@ export async function watchReload(to) {
     S.reload = null;
     S.hint = "";
     await loadHealth();
-    if (rl && rl.state === "failed") toast("error", "The context did not change", rl.error || "the engine did not start with it", 9000);
-    else toast("success", "Model reloaded", `It runs with a ${ctxfmt(info.context)} context now.`, 5000);
+    if (rl && rl.state === "failed") toast("error", tr("The context did not change"), rl.error || tr("the engine did not start with it"), 9000);
+    else toast("success", tr("Model reloaded"), tr("It runs with a {context} context now.", {context:ctxfmt(info.context)}), 5000);
     // (the same setting on the Models page: its Engine settings read the run config again)
     try { window.dispatchEvent(new Event("maya:context")); } catch (e) { /* (no window: a test) */ }
     emit();
@@ -246,20 +255,20 @@ export async function loadThinkBudget() {
 }
 export const budgetError = (text) => {
   const t = String(text).trim();
-  if (!/^\d+$/.test(t)) return "Use a whole number of tokens.";
+  if (!/^\d+$/.test(t)) return tr("Use a whole number of tokens.");
   const n = +t;
-  return n === 0 || (n >= 256 && n <= 262144) ? "" : "Use 0 (no limit) or 256 to 262144 tokens.";
+  return n === 0 || (n >= 256 && n <= 262144) ? "" : tr("Use 0 (no limit) or 256 to 262144 tokens.");
 };
 export async function saveThinkBudget(text) {
   const bad = budgetError(text);
-  if (bad) { toast("error", "The thinking budget did not change", bad, 6000); return false; }
+  if (bad) { toast("error", tr("The thinking budget did not change"), bad, 6000); return false; }
   try {
     S.thinkBudget = await api("api/thinking-budget", {method: "POST", body: {budget: +String(text).trim()}});
     emit();
-    toast("success", "Thinking budget saved", +text ? `Thinking stops at ${fmt(+text)} tokens, from the next answer.` : "Thinking has no limit, from the next answer.", 5000);
+    toast("success", tr("Thinking budget saved"), +text ? tr("Thinking stops at {count} tokens, from the next answer.", {count:fmt(+text)}) : tr("Thinking has no limit, from the next answer."), 5000);
     return true;
   } catch (e) {
-    toast("error", "The thinking budget did not change", e.message, 6000);
+    toast("error", tr("The thinking budget did not change"), e.message, 6000);
     return false;
   }
 }
@@ -275,24 +284,24 @@ export async function loadPortInfo() {
 }
 export async function confirmPort(n) {
   const now = S.portInfo.port, url = `${location.protocol}//${location.hostname}:${n}${location.pathname}`;
-  if (n < 1024 || n > 65535) { toast("error", "The port did not change", "Use a number from 1024 to 65535.", 6000); return false; }
-  const ok = await confirmDialog(`Move Maya to port ${n}?`,
-    `<p>Maya listens on port <b>${esc(String(now))}</b> now. ` + (S.portInfo.restarts
-      ? `Saving starts it again on the new port: the model loads again, ${esc(loadTime())}.</p>` +
-        "<ul><li>This page moves to <b>" + esc(url) + "</b> when Maya is back.</li>" +
-        "<li>Apps that use the API need the new port.</li>" + (S.busy ? "<li>The answer being written finishes first.</li>" : "") + "</ul>"
-      : "The new port is saved and applies from the next start.</p>"), `Use port ${n}`);
+  if (n < 1024 || n > 65535) { toast("error", tr("The port did not change"), tr("Use a number from 1024 to 65535."), 6000); return false; }
+  const ok = await confirmDialog(tr("Move Maya to port {port}?", {port:n}),
+    tr("<p>Maya listens on port <b>{port}</b> now. ", {port:esc(String(now))}) + (S.portInfo.restarts
+      ? tr("Saving starts it again on the new port: the model loads again, {time}.</p>", {time:esc(loadTime())}) +
+        tr("<ul><li>This page moves to <b>") + esc(url) + tr("</b> when Maya is back.</li>") +
+        tr("<li>Apps that use the API need the new port.</li>") + (S.busy ? tr("<li>The answer being written finishes first.</li>") : "") + "</ul>"
+      : tr("The new port is saved and applies from the next start.</p>")), tr("Use port {port}", {port:n}));
   if (!ok) return false;
   try {
     const out = await api("api/port", {method: "POST", body: {port: n}});
-    if (!out.restarts) { toast("success", "Port saved", `Maya uses port ${n} from its next start.`, 6000); loadPortInfo(); return true; }
+    if (!out.restarts) { toast("success", tr("Port saved"), tr("Maya uses port {port} from its next start.", {port:n}), 6000); loadPortInfo(); return true; }
   } catch (err) {
-    toast("error", "The port did not change", err.message, 6000);
+    toast("error", tr("The port did not change"), err.message, 6000);
     return false;
   }
-  S.hint = `Moving Maya to port ${n}…`;
+  S.hint = {key: "Moving Maya to port {port}…", values: {port:n}};
   emit();
-  toast("info", "Starting again", `Maya moves to port ${n}; this page follows when it is back.`, 8000);
+  toast("info", tr("Starting again"), tr("Maya moves to port {port}; this page follows when it is back.", {port:n}), 8000);
   // the new address answers once Maya is back (no-cors: another port is another origin; an answer at all is enough)
   for (let i = 0; i < 300; i++) {
     await new Promise((res) => setTimeout(res, 2000));
@@ -304,7 +313,7 @@ export async function confirmPort(n) {
   }
   S.hint = "";
   emit();
-  toast("error", "Maya is not back yet", `Open ${url} when it is.`, 30000);
+  toast("error", tr("Maya is not back yet"), tr("Open {url} when it is.", {url}), 30000);
   return true;
 }
 
@@ -334,7 +343,7 @@ let sharedTimer = null;
 export function syncShared() {
   if (!S.shared.on) return;
   clearTimeout(sharedTimer);
-  sharedTimer = setTimeout(() => saveShared(true).catch((e) => toast("error", "Not saved for other apps", e.message, 6000)), 600);
+  sharedTimer = setTimeout(() => saveShared(true).catch((e) => toast("error", tr("Not saved for other apps"), e.message, 6000)), 600);
 }
 
 // ------------------------------------------------------------------ updates
@@ -351,16 +360,13 @@ export async function loadUpdate(force = false) {
 export async function startUpdate() {
   const v = S.update && S.update.latest && S.update.latest.version;
   if (!v) return;
-  const ok = await confirmDialog(`Update Project Maya to v${v}?`,
-    "<p>Only Maya's code is updated: <b>the model is not downloaded again</b>, and its files, your settings and the " +
-    "chats in this browser stay.</p><p>Maya finishes the answer it is writing, downloads the new code (git), compiles " +
-    "only the engine files that changed (usually a few minutes; the terminal shows the progress) and loads the model " +
-    "again. Apps using the API are asked to try again meanwhile.</p>", `Update to v${v}`);
+  const ok = await confirmDialog(tr("Update Project Maya to v{version}?", {version:v}),
+    tr("<p>Only Maya's code is updated: <b>the model is not downloaded again</b>, and its files, your settings and the chats in this browser stay.</p><p>Maya finishes the answer it is writing, downloads the new code (git), compiles only the engine files that changed (usually a few minutes; the terminal shows the progress) and loads the model again. Apps using the API are asked to try again meanwhile.</p>"), tr("Update to v{version}", {version:v}));
   if (!ok) return;
   try {
     await api("api/update", {method: "POST", body: {}});
   } catch (e) {
-    toast("error", "The update did not start", e.message, 9000);
+    toast("error", tr("The update did not start"), e.message, 9000);
     loadUpdate();
     return;
   }
@@ -383,7 +389,7 @@ export async function watchUpdate(to) {
       continue;
     }
     if (h.version === to) {
-      toast("success", `Updated to v${to}`, "Reloading the page…", 4000);
+      toast("success", tr("Updated to v{version}", {version:to}), tr("Reloading the page…"), 4000);
       setTimeout(() => location.reload(), 1200);
       return;
     }
@@ -391,8 +397,8 @@ export async function watchUpdate(to) {
     const restarted = S.updateWatch.down;
     S.updateWatch = null;
     await loadUpdate();
-    if (!restarted) toast("error", "The update did not happen", (S.update && S.update.state && S.update.state.error) || "", 9000);
-    else toast("warn", "Maya started again on the same version", "The update's files did not arrive; the terminal shows why.", 9000);
+    if (!restarted) toast("error", tr("The update did not happen"), (S.update && S.update.state && S.update.state.error) || "", 9000);
+    else toast("warn", tr("Maya started again on the same version"), tr("The update's files did not arrive; the terminal shows why."), 9000);
     return;
   }
 }
@@ -400,6 +406,6 @@ export async function watchUpdate(to) {
 // ------------------------------------------------------------------ the troubleshooting report (GET /api/report)
 export async function fetchReport() {
   const r = await fetch("api/report", {headers: headers()});
-  if (!r.ok) throw new Error(r.status === 401 ? "this server needs its API key (Settings › Connect your tools)" : `HTTP ${r.status}`);
+  if (!r.ok) throw new Error(r.status === 401 ? tr("this server needs its API key (Settings › Connect your tools)") : `HTTP ${r.status}`);
   return r.text();
 }

@@ -1,0 +1,22 @@
+// Model cards and page chrome. Models, paths, command examples and raw backend diagnostics are data.
+export default {
+  "{count} change": "{count} 项更改",
+  "on": "开启",
+  "Draft": "草稿", "At once": "同时回答数", "Config": "配置", "Start script": "启动脚本", "API model name": "API 模型名称",
+  "Stopping…": "正在停止…", "Restarting…": "正在重启…", "Loading…": "正在加载…", "Unloaded": "已卸载", "Files missing": "文件缺失", "Incomplete": "不完整",
+  "Switch to this": "切换到此模型", "Engine settings": "引擎设置", "Details": "详情", "Delete": "删除", "Unload": "卸载", "Load": "加载",
+  "It can't start: {reason}. Run the setup again to repair it (": "无法启动：{reason}。请重新运行安装程序修复（",
+  "running now": "当前运行", "last used {time}": "上次使用：{time}", "Yesterday": "昨天", "Delete {model}": "删除 {model}",
+  "Models": "模型", "The models set up on this machine. Maya runs one at a time.": "此机器上已配置的模型，Maya 每次运行一个模型。",
+  "Add a model": "添加模型", "Chats": "对话", "New chat": "新建对话", "Open the sidebar": "打开侧边栏",
+  "Run the setup yourself": "自行运行安装程序", "Or run the setup yourself": "或自行运行安装程序",
+  "It asks which model and quant, shows the download's size first, then builds the model's pack and writes its config, which appears here.": "安装程序会询问模型与量化格式，先显示下载大小，再构建模型包并写入配置；完成后模型会出现在这里。",
+  "Linux and macOS": "Linux 与 macOS", "Copy {command}": "复制 {command}", "Switching to {model}.": "正在切换到 {model}。",
+  "Restarting {model} with the new engine settings.": "正在使用新的引擎设置重启 {model}。",
+  "Maya finishes the answer it is writing, then loads the model (a few minutes). This page reloads when it is back.": "Maya 完成当前回答后将加载模型（需要几分钟），恢复后此页面会刷新。",
+  "{model} is deleted.": "已删除 {model}。", "{bytes} freed on the disk.": "已释放 {bytes} 磁盘空间。", "Its files stay in {folder}.": "文件保留在 {folder}。",
+  " {models} draft with MTP now.": " {models} 现使用 MTP 生成草稿。", " {models} drafts with MTP now.": " {models} 现使用 MTP 生成草稿。", "Dismiss": "关闭",
+  "Reading the models…": "正在读取模型…", "No model is set up in this folder yet. The setup writes one: ": "此目录尚未配置模型，可运行安装程序创建：",
+  "Switching, or saving the running model's engine settings, starts Maya again through its start script, as a port change does. Each model keeps its own chat settings.": "切换模型或保存正在运行的模型引擎设置时，与更改端口相同，会通过启动脚本重启 Maya。每个模型分别保存对话设置。",
+  "This server was not started by maya.sh or START-MAYA.bat, so it cannot start again by itself: a switch or new settings apply from Maya's next start.": "此服务并非通过 maya.sh 或 START-MAYA.bat 启动，无法自动重启；模型切换或新设置将在 Maya 下一次启动时生效。",
+};

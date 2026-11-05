@@ -22,7 +22,7 @@ export function ago(s) {
   if (s < 5400) return `${fmt(Math.round(s / 60))} min`;
   return `${fmt(Math.floor(s / 3600))} h ${fmt(Math.round((s % 3600) / 60))} min`;
 }
-export const timeStr = (t) => new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+export const timeStr = (t, locale = []) => new Date(t).toLocaleTimeString(locale, {hour: "2-digit", minute: "2-digit"});
 export const rate = (mb) => (mb == null ? "–" : mb >= 1000 ? `${fmt(mb / 1024, 1)} GB/s` : `${fmt(mb, mb < 10 ? 1 : 0)} MB/s`);
 
 // settings in localStorage ("maya.<key>", JSON); the names of releases before Maya ("strata.<key>") are still read
@@ -82,7 +82,11 @@ export async function api(path, {method = "GET", body, signal} = {}) {
   if (!r.ok) {
     let msg = `HTTP ${r.status}`;
     try { const e = (await r.json()).error; msg = (e && e.message) || (typeof e === "string" && e) || msg; } catch (e) { /* not json */ }
-    if (r.status === 401) msg = "This server needs its API key: add it in Settings › Connect your tools.";
+    if (r.status === 401) {
+      // Resolve lazily: state.js initializes its stored preferences through this module.
+      const {tr} = await import("./i18n.js");
+      msg = tr("This server needs its API key: add it in Settings › Connect your tools.");
+    }
     const err = new Error(msg);
     err.status = r.status;
     throw err;
@@ -108,22 +112,22 @@ export function download(name, text, type = "text/plain") {
 }
 
 // a chat's age in the sidebar's groups
-export function dayGroup(t, now = new Date()) {
+export function dayGroup(t, now = new Date(), locale = []) {
   const d = new Date(t);
   const start = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
   if (t >= start) return "Today";
   if (t >= start - 86400000) return "Yesterday";
   if (t >= start - 7 * 86400000) return "Previous 7 days";
   if (t >= start - 30 * 86400000) return "Previous 30 days";
-  return d.getFullYear() === now.getFullYear() ? d.toLocaleDateString([], {month: "long"})
-                                               : d.toLocaleDateString([], {month: "long", year: "numeric"});
+  return d.getFullYear() === now.getFullYear() ? d.toLocaleDateString(locale, {month: "long"})
+                                               : d.toLocaleDateString(locale, {month: "long", year: "numeric"});
 }
-export function relTime(t) {
+export function relTime(t, locale = []) {
   const d = new Date(t), now = new Date();
-  if (d.toDateString() === now.toDateString()) return timeStr(t);
+  if (d.toDateString() === now.toDateString()) return timeStr(t, locale);
   const y = new Date(now); y.setDate(now.getDate() - 1);
   if (d.toDateString() === y.toDateString()) return "Yesterday";
-  return d.toLocaleDateString([], {month: "short", day: "numeric"});
+  return d.toLocaleDateString(locale, {month: "short", day: "numeric"});
 }
 
 // the model family's logo (web/logo-*.svg: lobe-icons' marks, MIT) and its name as people write it:
