@@ -35,6 +35,13 @@ print(response.output_text)
   Calls to undeclared or disallowed functions fail the response. Required/named
   choices must produce a complete call. `parallel_tool_calls:false` stops generation
   at the first complete call, with the tokens actually consumed reported in usage.
+- `namespace` tools (a named group of function tools, as Codex CLI sends): the model
+  sees each function as `namespace::name`; a call comes back as a `function_call`
+  with its own `name` plus `namespace`, and history calls are sent back the same
+  way. `tool_choice` may name one with `{"type":"function","name":"...","namespace":"..."}`.
+- Built-in tools Maya cannot run (`web_search`, `local_shell`, `file_search`, ...) are
+  left out of the prompt instead of failing the request; they stay in the echoed
+  `tools`, and the model cannot call them.
 - Truncated function calls have `status:"incomplete"` and do not emit a completed
   function-arguments event. An end-of-turn inside an unfinished call fails the
   response. `strict:true` enables schema validation before any generated content or
@@ -44,7 +51,8 @@ print(response.output_text)
   All calls need their results in the input before generation can continue.
 - `reasoning.effort`, `temperature`, `top_p`, `max_output_tokens`, and `metadata`.
   Reasoning is returned as a `reasoning` item with `reasoning_text` content, and
-  can be replayed in history. It is plain model reasoning, not a generated summary.
+  can be replayed in history. It is plain model reasoning, not a generated summary;
+  `reasoning.summary` (`auto`, `concise`, `detailed`) is accepted and changes nothing.
 - SSE response/item/content lifecycles, text and function-argument deltas, and final
   usage. Hitting the output limit yields `response.incomplete` with
   `incomplete_details.reason="max_output_tokens"`; an engine failure yields
@@ -54,9 +62,11 @@ print(response.output_text)
   echoed in the response. Native prompt-prefix reuse determines actual cache hits;
   the hint does not partition or force the engine cache. String-valued
   `client_metadata` is accepted as diagnostic context and is not stored or echoed.
-- The `include:["reasoning.encrypted_content"]` projection is accepted only with
-  explicit `reasoning.effort:"none"`, when there are no reasoning items to encrypt.
-  Encryption and encrypted reasoning input remain unsupported.
+- `include:["reasoning.encrypted_content"]` (Codex CLI with `store:false`): reasoning
+  items also carry `encrypted_content`, an opaque blob of the same reasoning
+  (encoded, not encrypted). A history reasoning item is read from its text when it
+  has one, else from Maya's blob; another server's blob cannot be read, so that item
+  is left out of the prompt (the rest of the turn is kept).
 - `include:["message.output_text.logprobs"]` and `top_logprobs` (0-20; either one
   asks) return token log-probabilities in the message's `output_text` part and its
   `response.output_text.delta` / `.done` events, on the DeepSeek engine only (another
@@ -284,9 +294,9 @@ history without recursive parent lookups.
 Unsupported parameters and item types return HTTP 400 before generation. In particular:
 
 - the Conversations API, item references, and WebSocket transport;
-- hosted/custom tools, encrypted reasoning, reasoning summaries, files and audio;
+- running hosted tools, custom (free-form) tools, generated reasoning summaries, files and audio;
 - token-level constrained decoding, unsupported JSON Schema keywords, automatic
-  input truncation, and non-default service tiers. Namespace tools remain unsupported.
+  input truncation, and non-default service tiers.
 
 Use `/v1/chat/completions` for Maya-specific extensions such as `return_progress`
 and `strata_mcp`. The `/v1/status` dialect list advertises the Responses endpoint.

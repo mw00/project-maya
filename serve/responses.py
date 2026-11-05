@@ -1,6 +1,7 @@
 """Responses protocol over the same template messages and generation events as the other APIs."""
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import time
@@ -22,6 +23,71 @@ def _arguments(text):
         raise ValueError("function arguments must encode a JSON object")
     json.dumps(value, allow_nan=False)
     return value
+
+
+SEP = "::"                    # a namespace's function inside Maya: "ns::name" (DeepSeek's encoder's own form)
+SEALED = "maya-r1:"           # Maya's encrypted_content: the reasoning itself, base64 - opaque, not encrypted
+SUMMARIES = (None, "auto", "concise", "detailed")
+
+
+def seal(text):
+    return SEALED + base64.b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def unseal(blob):
+    """The reasoning in one of Maya's blobs; None for another server's (its reasoning cannot be read here)."""
+    if not isinstance(blob, str) or not blob.startswith(SEALED):
+        return None
+    try:
+        return base64.b64decode(blob[len(SEALED):], validate=True).decode("utf-8")
+    except ValueError:
+        return None
+
+
+def flat_tools(tools):
+    """Responses tools -> the function tools the template renders.
+
+    A namespace's functions become "ns::name" functions (Codex CLI groups some of its tools this way); built-in
+    tools Maya cannot run (web_search, local_shell, file_search, ...) are left out, so the model never sees them
+    and the rest of the request still works."""
+    if tools is None:
+        return []
+    if not isinstance(tools, list):
+        raise ValueError("tools must be an array")
+    out = []
+    for tool in tools:
+        if not isinstance(tool, dict) or not isinstance(tool.get("type"), str):
+            raise ValueError("tools must be objects with a type")
+        if tool["type"] == "function":
+            out.append(tool)
+        elif tool["type"] == "namespace":
+            space = _string(tool.get("name"), "tools.namespace.name")
+            if SEP in space:
+                raise ValueError(f"a namespace name must not contain {SEP!r}")
+            if set(tool) - {"type", "name", "description", "tools"} or not isinstance(tool.get("tools"), list):
+                raise ValueError("a namespace tool needs name and a tools array")
+            note = tool.get("description")
+            if note is not None:
+                _string(note, "tools.namespace.description", empty=True)
+            for sub in tool["tools"]:
+                if not isinstance(sub, dict) or sub.get("type") != "function":
+                    continue                                   # a built-in inside a namespace: left out as well
+                sub = dict(sub, name=space + SEP + _string(sub.get("name"), "tools.name"))
+                if note:
+                    sub["description"] = note + "\n" + (sub.get("description") or "")
+                out.append(sub)
+    return out
+
+
+def namespaced(tools):
+    """Qualified name -> (namespace, name) for the functions flat_tools took out of a namespace."""
+    out = {}
+    for tool in tools or []:
+        if isinstance(tool, dict) and tool.get("type") == "namespace" and isinstance(tool.get("tools"), list):
+            for sub in tool["tools"]:
+                if isinstance(sub, dict) and sub.get("type") == "function" and isinstance(sub.get("name"), str):
+                    out[tool["name"] + SEP + sub["name"]] = (tool["name"], sub["name"])
+    return out
 
 
 def _content(value, name, *, assistant=False):
@@ -136,19 +202,20 @@ def normalize_request(req):
     top = req.get("top_logprobs")
     if top is not None and (type(top) is not int or not 0 <= top <= 20):
         raise ValueError("top_logprobs must be an integer from 0 to 20")
-    if include not in (None, []):
-        no_reasoning = isinstance(req.get("reasoning"), dict) and req["reasoning"].get("effort") == "none"
-        if include != ["reasoning.encrypted_content"] or not no_reasoning:
-            raise ValueError("encrypted reasoning projection is only accepted with reasoning.effort=none; encryption is unavailable "
-                             f"(this request's include: {str(include)[:80]})")
+    # include "reasoning.encrypted_content" (Codex CLI, store=false): reasoning items also carry the reasoning as an
+    # opaque blob (seal) that the client sends back with the history next turn
+    if include not in (None, []) and include != ["reasoning.encrypted_content"]:
+        raise ValueError(f"include: only reasoning.encrypted_content and message.output_text.logprobs are supported "
+                         f"(this request's include: {str(include)[:80]})")
     if req.get("service_tier", "auto") != "auto":
         raise ValueError("service_tier: only auto is supported")
     reasoning = req.get("reasoning")
     if reasoning is not None:
         if not isinstance(reasoning, dict) or set(reasoning) - {"effort", "summary"}:
-            raise ValueError("reasoning: only effort is supported")
-        if reasoning.get("summary") is not None:
-            raise ValueError("reasoning.summary is not supported; reasoning is returned as reasoning_text")
+            raise ValueError("reasoning: only effort and summary are supported")
+        # a summary request is accepted; the reasoning itself comes back as reasoning_text (no summarizer here)
+        if reasoning.get("summary") not in SUMMARIES:
+            raise ValueError("reasoning.summary must be auto, concise or detailed")
     metadata = req.get("metadata")
     if metadata is not None and (not isinstance(metadata, dict) or len(metadata) > 16 or any(
             not isinstance(k, str) or len(k) > 64 or not isinstance(v, str) or len(v) > 512
@@ -157,15 +224,9 @@ def normalize_request(req):
     if "max_output_tokens" in req and (type(req["max_output_tokens"]) is not int or req["max_output_tokens"] < 1):
         raise ValueError("max_output_tokens must be a positive integer")
 
-    tools = req.get("tools") if req.get("tools") is not None else []
-    if not isinstance(tools, list):
-        raise ValueError("tools must be an array")
+    tools = flat_tools(req.get("tools"))
     names = set()
     for tool in tools:
-        if not isinstance(tool, dict) or tool.get("type") != "function":
-            kind = tool.get("type") if isinstance(tool, dict) else type(tool).__name__
-            raise ValueError(f"only function tools are supported (this request has a tool of type {str(kind)[:40]!r}; "
-                             "a client that sends built-in tools such as web_search or local_shell must send functions only)")
         if set(tool) - {"type", "name", "description", "parameters", "strict"}:
             raise ValueError("unsupported function tool parameter")
         name = _string(tool.get("name"), "tools.name")
@@ -180,9 +241,13 @@ def normalize_request(req):
             raise ValueError("function parameters must be an object")
     choice = req.get("tool_choice", "auto")
     if isinstance(choice, dict):
-        if set(choice) != {"type", "name"} or choice.get("type") != "function" or choice.get("name") not in names:
+        named = choice.get("name")
+        if choice.get("namespace") is not None and isinstance(named, str):
+            named = str(choice["namespace"]) + SEP + named
+        if not {"type", "name"} <= set(choice) <= {"type", "name", "namespace"} or choice.get("type") != "function" \
+                or named not in names:
             raise ValueError("tool_choice must name a declared function")
-        choice = {"type": "function", "function": {"name": choice["name"]}}
+        choice = {"type": "function", "function": {"name": named}}
     elif choice not in ("auto", "none", "required"):
         raise ValueError("unsupported tool_choice")
     if choice == "required" and not tools:
@@ -229,20 +294,27 @@ def normalize_request(req):
                 flush()
                 messages.append({"role": role, "content": content})
         elif kind == "reasoning":
-            if item.get("encrypted_content"):
-                raise ValueError("encrypted reasoning input is not supported")
             content = item.get("content") or item.get("summary") or []
             if not isinstance(content, list) or any(not isinstance(p, dict) or
                     p.get("type") not in ("reasoning_text", "summary_text") or not isinstance(p.get("text"), str)
                     for p in content):
                 raise ValueError("reasoning items must contain reasoning_text or summary_text parts")
+            text = "".join(p["text"] for p in content)
+            if not content and item.get("encrypted_content") is not None:
+                # only the blob: Maya's own gives the reasoning back; another server's cannot be read, so the
+                # item is left out of the prompt (the turn's answer and calls still are)
+                text = unseal(item["encrypted_content"])
+                if text is None:
+                    continue
             turn = assistant_turn()
-            turn["reasoning_content"] = turn.get("reasoning_content", "") + "".join(p["text"] for p in content)
+            turn["reasoning_content"] = turn.get("reasoning_content", "") + text
         elif kind == "function_call":
             call_id = _string(item.get("call_id"), "function_call.call_id")
             if call_id in seen:
                 raise ValueError(f"duplicate function call_id: {call_id}")
             name = _string(item.get("name"), "function_call.name")
+            if item.get("namespace") is not None:            # a call to a namespace's function (see flat_tools)
+                name = _string(item["namespace"], "function_call.namespace") + SEP + name
             args = _string(item.get("arguments"), "function_call.arguments", empty=True)
             _arguments(args or "{}")
             turn = assistant_turn()
@@ -309,16 +381,21 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
         run = validation.events(run, cancel)
     sequence, current, calls = 0, None, {}
     incomplete_call = False
-    names = {tool["name"] for tool in req.get("tools") or []}
+    names = {tool["name"] for tool in flat_tools(req.get("tools"))}
+    spaces = namespaced(req.get("tools"))
+    sealed = "reasoning.encrypted_content" in (req.get("include") or [])
     choice = req.get("tool_choice", "auto")
+    forced = None
+    if isinstance(choice, dict):
+        forced = choice["name"] if choice.get("namespace") is None else choice["namespace"] + SEP + choice["name"]
 
     def check_call(call):
         if choice == "none":
             raise ValueError("tool_choice=none: the model generated a function call")
         if call.name not in names:
             raise ValueError(f"the model generated an undeclared function: {call.name}")
-        if isinstance(choice, dict) and call.name != choice["name"]:
-            raise ValueError(f"tool_choice requires {choice['name']}, but the model called {call.name}")
+        if forced is not None and call.name != forced:
+            raise ValueError(f"tool_choice requires {forced}, but the model called {call.name}")
         if req.get("parallel_tool_calls") is False and calls and call.id not in calls:
             raise ValueError("parallel_tool_calls=false: generation produced more than one function call")
 
@@ -339,6 +416,8 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
         else:
             item = {"id": "fc_" + uuid.uuid4().hex[:24], "type": "function_call", "status": "in_progress",
                     "call_id": call.id, "name": call.name, "arguments": ""}
+            if call.name in spaces:                  # a namespace's function: its own name plus the namespace
+                item["namespace"], item["name"] = spaces[call.name]
         index = len(response["output"])
         response["output"].append(item)
         current = index
@@ -364,6 +443,8 @@ def response_events(model, req, run, prompt_tokens=0, persist=None, response_id=
             yield event("response.content_part.done", **fields, content_index=0, part=part)
         elif item["type"] == "reasoning":
             yield event("response.reasoning_text.done", **fields, content_index=0, text=item["content"][0]["text"])
+            if sealed:
+                item["encrypted_content"] = seal(item["content"][0]["text"])
         elif status == "completed":
             yield event("response.function_call_arguments.done", **fields, arguments=item["arguments"])
         item["status"] = status
