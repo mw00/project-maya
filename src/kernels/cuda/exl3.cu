@@ -2140,7 +2140,7 @@ __device__ void rdna4_block_wmma(const uint32_t* tr, int ld, int tc0, int k0, in
 
 // block_gemv for nc <= NR activations (warp w loads activations w, w + 8, ..: in[j] the one at w + 8 j):
 // sm.out[n * kCols + o]
-template <int K2, int cb, int KS, int NR, bool Perm = false, class Input, class Smem>
+template <int K2, int cb, int KS, int NR, bool Perm = false, bool OneXs = false, class Input, class Smem>
 __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&in)[NR / 8],
                              const uint16_t* __restrict__ suh, int nc, Smem& sm) {
 #if defined(EXL3_WMMA_RDNA4)
@@ -2155,11 +2155,11 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
     uint32_t* wt = sm.wt + warp * 16 * kWtP11;
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
-    float xv[NJ][4], xs[NJ][4];
+    float xv[NJ][4], xs[OneXs ? 1 : NJ][4];   // (OneXs: suh is the same for every row - one copy, its registers freed)
     load_tiles<K2>(tile, sstride, lane, wc);
 #pragma unroll
     for (int j = 0; j < NJ; ++j)
-        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[j]);
+        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[OneXs ? 0 : j]);
     exl3_f8 c[NB];
 #pragma unroll
     for (int b = 0; b < NB; ++b) c[b] = exl3_f8{};
@@ -2167,13 +2167,13 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
         __half* xq = sm.xb + (q & 1) * (NR * kXS);
 #pragma unroll
         for (int j = 0; j < NJ; ++j)
-            if (warp + 8 * j < nc) chunk_store(xv[j], xs[j], lane, xq + (warp + 8 * j) * kXS);
+            if (warp + 8 * j < nc) chunk_store(xv[j], xs[OneXs ? 0 : j], lane, xq + (warp + 8 * j) * kXS);
         __syncthreads();
         if (q + 1 < nq) {
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
 #pragma unroll
             for (int j = 0; j < NJ; ++j)
-                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[j]);
+                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[OneXs ? 0 : j]);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
@@ -2431,7 +2431,7 @@ __device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, 
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;
-        block_gemm_w<K2, cb, K2, NR, Perm>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
+        block_gemm_w<K2, cb, K2, NR, Perm, Shaped>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
                                            (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
         return sm.out;
     };
@@ -2449,6 +2449,13 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
 template <int K2, int cb, bool gate_up, int NR, bool Perm>
 __global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
 wmma_set8_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm, true>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+// ... 64-row blocks fitted to 6 waves a SIMD: their LDS (~41 KB) lets three blocks a WGP run, 6 waves, and the decoded
+// tile feeds four activation tiles (-7 to -12 % kernel time from 128 rows a set against 32-row blocks at 8 waves)
+template <int K2, int cb, bool gate_up, int NR, bool Perm>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(6)))
+wmma_set6_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
     wmma_set_body<K2, cb, gate_up, NR, Perm, true>(a, x, ldx, idx, h, ldh, y, ldy);
 }
 #endif
@@ -3259,7 +3266,8 @@ static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{
 // lanes (permlane / ds_bpermute, no LDS stage), fitted to 8 waves a SIMD, 32 rows a block once a set has 64 rows
 // (-17 to -18.5 % kernel time from 128 rows a set, none lost below; the freed registers let 32 rows and 8 waves fit
 // together), and their LDS cut to let those waves run (out over xb, a 32-row block's gate in registers: another -13 to
-// -15 %).  The same bits.  Other K2, other GPUs, EXL3_WMMA_ROWS set or EXL3_WMMA_SHAPE=0: the uniform blocks
+// -15 %); from 128 rows a set, 64-row blocks at 6 waves (another -7 / -12 % at K2 4 / 5).  The same bits.  Other K2,
+// other GPUs, EXL3_WMMA_ROWS set or EXL3_WMMA_SHAPE=0: the uniform blocks
 static bool wmma_shape() {
 #if defined(STRATA_USE_HIP)
     static const bool off = std::getenv("EXL3_WMMA_ROWS") != nullptr ||
@@ -3284,13 +3292,19 @@ template <int K2, int cb> struct RunWmmaGateUp {
 #if defined(STRATA_USE_HIP)
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
-                auto go = [&](auto nr) {
+                auto go = [&](auto nr, auto w6) {
                     constexpr int NR = decltype(nr)::value;
-                    wmma_set8_kernel<K2, cb, true, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp),
-                                                               kThreads, 0, s>>>(a, x, ldx, idx, h, ldh, nullptr, 0);
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, true, NR, true><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
+                    else
+                        wmma_set8_kernel<K2, cb, true, NR, true><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
                 };
-                if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
-                else go(std::integral_constant<int, 16>{});
+                if (a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::true_type{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::false_type{});
+                else go(std::integral_constant<int, 16>{}, std::false_type{});
                 return;
             }
 #endif
@@ -3306,15 +3320,19 @@ template <int K2, int cb> struct RunWmmaDown {
 #if defined(STRATA_USE_HIP)
         if constexpr (K2 == 4 || K2 == 5)
             if (wmma_shape()) {
-                auto go = [&](auto nr) {
+                auto go = [&](auto nr, auto w6) {
                     constexpr int NR = decltype(nr)::value;
-                    wmma_set8_kernel<K2, cb, false, NR, true><<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols,
-                                                                     a.n_exp),
-                                                                kThreads, 0, s>>>(a, nullptr, 0, nullptr,
-                                                                                  const_cast<uint16_t*>(h), ldh, y, ldy);
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, false, NR, true><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+                    else
+                        wmma_set8_kernel<K2, cb, false, NR, true><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
                 };
-                if (a.max_rows >= 64) go(std::integral_constant<int, 32>{});
-                else go(std::integral_constant<int, 16>{});
+                if (a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::true_type{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::false_type{});
+                else go(std::integral_constant<int, 16>{}, std::false_type{});
                 return;
             }
 #endif
