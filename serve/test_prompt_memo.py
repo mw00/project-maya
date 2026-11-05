@@ -204,7 +204,7 @@ def ids_both(svc: Service, messages, tools, mode: str = "1"):
     if tools:
         req["tools"] = copy.deepcopy(tools)
     deepseek = getattr(svc.template, "deepseek", False)
-    os.environ.pop("MAYA_PROMPT_MEMO", None)
+    os.environ["MAYA_PROMPT_MEMO"] = "0"                  # (the whole way: off; unset is on since v1.1.55)
     m, t, kw = openai_to_messages(copy.deepcopy(req), deepseek=deepseek)
     full = svc.render_ids(m, t, kw)
     os.environ["MAYA_PROMPT_MEMO"] = mode
@@ -257,20 +257,28 @@ class SameIds(_MemoEnv, unittest.TestCase):
                 self.assertEqual(memo, full)
         self.assertIn("prompt memo verified", out.getvalue())
 
-    def test_off_by_default_the_memo_is_never_built(self):
+    def test_off_with_0_the_memo_is_never_built(self):
         svc = service("glm")
+        os.environ["MAYA_PROMPT_MEMO"] = "0"
         req = {"messages": [{"role": "user", "content": "hi <|user|> there"}]}
         m, t, kw = openai_to_messages(req)
         svc.render_ids(m, t, kw)
         self.assertIsNone(getattr(svc, "_prompt_memo", None))
         self.assertIsNone(getattr(svc, "_lit_memo", None))
 
+    def test_on_by_default(self):
+        from serve.server import prompt_memo_on
+        os.environ.pop("MAYA_PROMPT_MEMO", None)
+        self.assertTrue(prompt_memo_on())
+        os.environ["MAYA_PROMPT_MEMO"] = "0"
+        self.assertFalse(prompt_memo_on())
+
     def test_a_suffix_takes_the_whole_way(self):
         svc = service("qwen")
         os.environ["MAYA_PROMPT_MEMO"] = "1"
         m, t, kw = openai_to_messages({"messages": [{"role": "user", "content": "hi"}]})
         a = svc.render_ids(m, t, kw, suffix="<tool_call>")
-        os.environ.pop("MAYA_PROMPT_MEMO")
+        os.environ["MAYA_PROMPT_MEMO"] = "0"
         m, t, kw = openai_to_messages({"messages": [{"role": "user", "content": "hi"}]})
         self.assertEqual(a, svc.render_ids(m, t, kw, suffix="<tool_call>"))
 

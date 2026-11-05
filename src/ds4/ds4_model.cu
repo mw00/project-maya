@@ -5213,8 +5213,8 @@ struct Model::Impl {
         const size_t qb = (slab_mb != nullptr ? (size_t) std::max(1, std::atoi(slab_mb)) : auto_mb) << 20;
         c.A = std::max(64, (int) (qb / (size_t) HQ) / 64 * 64);
         c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
-        // (DS4_AI_RUN=1: room for a run's own rows; unset or 0: the context's rows, the same buffers and expert placement as before)
-        static const bool ai_run = std::getenv("DS4_AI_RUN") != nullptr && std::atoi(std::getenv("DS4_AI_RUN")) != 0;
+        // (DS4_AI_RUN, on unless 0 since v1.1.55: room for a run's own rows; 0: the context's rows, the buffers and expert placement of before)
+        static const bool ai_run = [] { const char* e = std::getenv("DS4_AI_RUN"); return e == nullptr || *e == 0 || std::atoi(e) != 0; }();
         c.AIM = ai_run ? std::max(c.AI, 128) : c.AI;
         c.w16_elems = (w16_mb != nullptr ? (size_t) std::max(1, std::atoi(w16_mb)) : 2 * auto_mb) << 19;
     }
@@ -17255,11 +17255,17 @@ struct Model::Impl {
     // DS4_AR2=1 / 2 (0 / unset: off): a group of two's chunk all-reduces - the attention output's and the MoE's - in
     // ar2_kernel: the put and the sums pipelined in pieces, the other member's rows read 16 bytes a lane.  1:
     // ar_sum_kernel's sums bit for bit; 2: FP16 on the wire (both partials rounded, summed in F32 in member order).
-    // Decode's all-reduces (G.ar) never take it.  Another value: the load refuses (-1)
+    // Decode's all-reduces (G.ar) never take it.  Another value: the load refuses (-1).  Unset: 1 on NVIDIA (the same
+    // sums, prompt +1.5% at 8K and +3% at 32K on 3x V100 --tp 2, v1.1.55), 0 on AMD (its peer path's calibration
+    // decides there, below)
     static int ar2() {
         static const int v = [] {
             const char* e = ds4_env("DS4_AR2");
+#if defined(STRATA_USE_HIP)
             if (e == nullptr || *e == 0) return 0;
+#else
+            if (e == nullptr || *e == 0) return 1;
+#endif
             const int x = std::atoi(e);
             return (x >= 0 && x <= 2 && std::strspn(e, "0123456789") == std::strlen(e)) ? x : -1;
         }();
@@ -17629,8 +17635,8 @@ struct Model::Impl {
                         return false;
                     // the slab's rows as wide as this run's keys, not the context's: a prompt shorter than the
                     // context gets the rows a context of its length would (128 below ~64K keys) - the same GEMM
-                    // shapes, fewer slabs (DS4_AI_RUN=1; unset or 0: the context's AI rows, as before)
-                    static const bool ai_run = std::getenv("DS4_AI_RUN") != nullptr && std::atoi(std::getenv("DS4_AI_RUN")) != 0;
+                    // shapes, fewer slabs (DS4_AI_RUN, on unless 0; 0: the context's AI rows, as before v1.1.55)
+                    static const bool ai_run = [] { const char* e = std::getenv("DS4_AI_RUN"); return e == nullptr || *e == 0 || std::atoi(e) != 0; }();
                     long long ssr = ss;
                     int air = c.AI;
                     if (ai_run) {
