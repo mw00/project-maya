@@ -1956,11 +1956,14 @@ constexpr int kWtP = 9;          // wt's pitch, words a decoded output row (8 + 
 #else
 constexpr int kWtP = 12;
 #endif
+// gfx11's own pitch: 12 words, so a decoded output row is two 16-byte loads (ds_load_b128) instead of eight single
+// words, its rows still on distinct banks for the eight a phase takes
+constexpr int kWtP11 = 12;
 template <int K2, int NR>
 struct WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mixed kernel keeps one for all classes)
     float out[NR * kCols];
     __half xb[2 * NR * kXS];
-    uint32_t wt[kWarps * 16 * kWtP];   // a warp's decoded tile by output, 8 words a row (kWtP apart)
+    uint32_t wt[kWarps * 16 * (kWtP > kWtP11 ? kWtP : kWtP11)];   // a warp's decoded tile by output, 8 words a row
     uint32_t stage[kWarps * 4 * K2];
 };
 #if defined(STRATA_USE_HIP) && defined(__GFX11__)
@@ -2084,7 +2087,7 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
     const size_t sstride = (size_t) ld * W;
     const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
     uint32_t* st = sm.stage + warp * W;
-    uint32_t* wt = sm.wt + warp * 16 * 9;
+    uint32_t* wt = sm.wt + warp * 16 * kWtP11;
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
     float xv[NJ][4], xs[NJ][4];
@@ -2112,22 +2115,22 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
             uint32_t f[4];
             slice_frags<K2, cb>(wc[s], st, lane, f);
             // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
-            wt[g * 9 + t] = f[0];
-            wt[g * 9 + 4 + t] = f[1];
-            wt[(g + 8) * 9 + t] = f[2];
-            wt[(g + 8) * 9 + 4 + t] = f[3];
+            wt[g * kWtP11 + t] = f[0];
+            wt[g * kWtP11 + 4 + t] = f[1];
+            wt[(g + 8) * kWtP11 + t] = f[2];
+            wt[(g + 8) * kWtP11 + 4 + t] = f[3];
             __syncwarp();
-            exl3_u8 aw;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) aw[i] = wt[m * 9 + i];
+            const uint4* wr = reinterpret_cast<const uint4*>(wt + m * kWtP11);   // (two ds_load_b128: 16-byte rows)
+            const uint4 w0 = wr[0], w1 = wr[1];
+            const exl3_u8 aw = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
             __syncwarp();   // (wt: the next slice's)
             const exl3_h16 a = __builtin_bit_cast(exl3_h16, aw);
 #pragma unroll
             for (int b = 0; b < NB; ++b) {   // (activations past nc: whatever xb holds - their outputs are not written)
-                const uint32_t* xr = reinterpret_cast<const uint32_t*>(xq + (b * 16 + m) * kXS + s * 16);
-                exl3_u8 bw;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) bw[i] = xr[i];
+                // (an activation's 16 inputs: two ds_load_b128 - xb's rows are 272 bytes, a slice 32)
+                const uint4* xr = reinterpret_cast<const uint4*>(xq + (b * 16 + m) * kXS + s * 16);
+                const uint4 x0 = xr[0], x1 = xr[1];
+                const exl3_u8 bw = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
                 c[b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, __builtin_bit_cast(exl3_h16, bw), c[b]);
             }
         }
