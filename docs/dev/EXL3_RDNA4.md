@@ -69,8 +69,8 @@ library reads them directly. The same names can be exported for a native
    to re-enable matrix prefill. An environment change does not reconfigure
    an engine that is already loaded.
 
-See [Setup](SETUP.md) for the installation workflow and
-[Settings](SETTINGS.md#rdna4-exl3-matrix-prefill) for the switches.
+See [Setup](../SETUP.md) for the installation workflow and
+[Settings](../SETTINGS.md#rdna4-exl3-matrix-prefill) for the switches.
 
 ## Implementation
 

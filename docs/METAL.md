@@ -75,7 +75,7 @@ layer, two MoE layers, 17 index blocks so the selection must drop one) against a
 forward in `tools/mm3_metal_fixture.py` - logits within 4.2e-5 relative L2 on the Metal GPU (gate 1e-3), a
 sliced prompt equal to a one-shot one, greedy decoding token for token; `tools/test_mm3_serve.py`
 (`metal_mm3_serve_test`) drives the serve protocol the same way. The contributor ran the real Maya-XS set on a 128 GB Mac Studio (M5 Max); bench
-numbers from other Macs are as welcome here as GLM's. The port's notes: [PORT-MINIMAX-METAL.md](PORT-MINIMAX-METAL.md).
+numbers from other Macs are as welcome here as GLM's. The port's notes: [PORT-MINIMAX-METAL.md](dev/PORT-MINIMAX-METAL.md).
 
 ## Speed
 

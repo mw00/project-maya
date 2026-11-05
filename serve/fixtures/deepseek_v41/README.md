@@ -4,7 +4,7 @@
 DeepSeek's [DeepSeek-V4.1-Flash-1017 encoding/tests](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/tree/1bae0e1088993b9b82de08f59de5be5a34e42170/encoding/tests),
 revision `1bae0e1088993b9b82de08f59de5be5a34e42170`.
 
-Copyright (c) 2023 DeepSeek. Distributed under the MIT License; see [LICENSE.deepseek-v41](../../../LICENSE.deepseek-v41).
+Copyright (c) 2023 DeepSeek. Distributed under the MIT License; see [LICENSE.deepseek-v41](../../../licenses/LICENSE.deepseek-v41).
 The upstream [LICENSE](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/LICENSE)
 applies to these fixtures and the reference encoder.
 

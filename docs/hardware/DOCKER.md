@@ -1,8 +1,8 @@
 # A Docker image of Maya
 
 There is no official Maya image yet. This page is a recipe to build one from a release:
-[`docker/Dockerfile`](../docker/Dockerfile) and [`docker/build.sh`](../docker/build.sh), which builds the image, checks
-it and, if you ask, pushes it. Back to the [README](../README.md).
+[`docker/Dockerfile`](../../docker/Dockerfile) and [`docker/build.sh`](../../docker/build.sh), which builds the image, checks
+it and, if you ask, pushes it. Back to the [README](../../README.md).
 
 ```bash
 git checkout v1.1.54
@@ -97,7 +97,7 @@ What the image runs is the server, with a pack and a config made for it. A confi
 the pack in `args`, `tokenizer` and `log`. In the container they have to be the container's: `/opt/maya/build/<engine>`,
 `/opt/maya`, and wherever the packs are mounted. A config written by a setup on the host points at the host's paths.
 Mount the files of one of the models the setup offers (`./maya.sh --setup` asks which model and which quant;
-[MODELS.md](MODELS.md) has each one's files) and a folder for the packs and configs, then start the server with
+[MODELS.md](../MODELS.md) has each one's files) and a folder for the packs and configs, then start the server with
 `--host 0.0.0.0`, so the port reaches the host. `--ulimit memlock=-1` is needed because the engines pin (lock) the
 experts they copy into RAM for the GPUs:
 

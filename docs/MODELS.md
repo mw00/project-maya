@@ -33,8 +33,8 @@ the model's MTP block, which drafts tokens ahead.
 | **GLM-5.3 · Maya-M-Derisked** | `glm-maya-m-derisked` | 116 GB | Maya-M with a weight edit by [Blackfrost_AI](https://x.com/Blackfrost_AI) that reduces blanket refusals ([its repo](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-M-Derisked-IQ2_S-GGUF)); experimental | not measured yet |
 | **GLM-5.3 · Maya-L** | `glm-maya-l` | 156.3 GB | the biggest memory pools | **99.2%**; 90% |
 
-The setup recommends one for your PC. How they're made and measured: [MAYA-S](../bench/results/MAYA-S.md),
-[MAYA-S24](../bench/results/MAYA-S24.md), [MAYA-M](../bench/results/MAYA-M.md), [MAYA-L](../bench/results/MAYA-L.md). On
+The setup recommends one for your PC. How they're made and measured: [MAYA-S](benchmarks/results/MAYA-S.md),
+[MAYA-S24](benchmarks/results/MAYA-S24.md), [MAYA-M](benchmarks/results/MAYA-M.md), [MAYA-L](benchmarks/results/MAYA-L.md). On
 [Hugging Face](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF).
 
 On AMD, GLM-5.3-Flash reads pictures too: setup builds its image encoder for the GPU.
@@ -67,7 +67,7 @@ The setup also offers **[DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepse
 `./setup.sh --model DeepSeek-V4.1-Flash-1017`.
 
 The server uses the pinned official prompt encoder, with numeric reasoning budgets and ID-matched parallel tool
-results. See [the prompt format notes](deepseek-prompt-format.md) for API details and the standalone Jinja limits.
+results. See [the prompt format notes](dev/deepseek-prompt-format.md) for API details and the standalone Jinja limits.
 
 | Files | Size | Runs on |
 | --- | ---: | --- |
@@ -137,7 +137,7 @@ All of these are optional; the details and every setting are in [SETTINGS.md](SE
 ## MiniMax-M3.1-Flash
 
 The setup also offers **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)** (MiniMax; 428 B
-parameters, 23 B active per token, up to 1 M tokens; the [MiniMax Community License](../LICENSE.minimax-m31): free for
+parameters, 23 B active per token, up to 1 M tokens; the [MiniMax Community License](../licenses/LICENSE.minimax-m31): free for
 non-commercial use, commercial use has conditions) on an engine of its own (`maya-mm3`, contributed by
 [@needmorevram](https://github.com/needmorevram), #477): `./setup.sh --model MiniMax-M3.1-Flash`.
 

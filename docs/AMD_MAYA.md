@@ -377,7 +377,7 @@ covers all 65,536 pairs of byte values with varying neighboring lanes and
 permutation selectors, against per-byte CPU references. The runtime rejects
 the uncompiled `gfx1036` integrated GPU with the actual device and compiled
 architecture list in its message. See [R9700 build details](AMD_RDNA4.md) and
-[the shared AMD backport audit](AMD_UPSTREAM.md).
+[the shared AMD backport audit](dev/AMD_UPSTREAM.md).
 
 ```sh
 python3 tools/test_maya_hip.py

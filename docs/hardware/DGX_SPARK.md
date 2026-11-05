@@ -10,7 +10,7 @@ Measured on one DGX Spark (see [Measured](#measured)): **16.8 tokens/s** decodin
 DFlash2 drafter, which takes the decode to **21.1 tokens/s** (greedy; see
 [Drafting and several requests](#drafting-dflash2-and-several-requests-at-once)), and a second config answers four
 requests at once for 1.80x the tokens in all. [Measured](#measured) has the numbers, and the
-README's [speed tables](../README.md#how-fast-is-it) have the DGX Spark beside the other machines.
+README's [speed tables](../../README.md#how-fast-is-it) have the DGX Spark beside the other machines.
 
 What the aarch64 port changed, where each component of the build comes from, and what other people's work it stands
 on are in [DGX_SPARK_BUILD.md](DGX_SPARK_BUILD.md).
@@ -186,7 +186,7 @@ glm stat: decode 59.34 ms/tok (16.85 tok/s) | vram hit 99.97% | ram fetches 0.00
 Every expert sits in the pool (12 096 of 12 096), so a token needs no disk and no RAM: the experts are read into the
 pool at 8.7 GB/s at the start (86 GB in 10 s), and the decode is bound by the kernels.
 
-These numbers reproduce the earlier DGX Spark row in the README's [speed table](../README.md#how-fast-is-it) (16.5 tokens/s, ~730 tokens/s on a 6K
+These numbers reproduce the earlier DGX Spark row in the README's [speed table](../../README.md#how-fast-is-it) (16.5 tokens/s, ~730 tokens/s on a 6K
 prompt, reported by @ericoh88 on v1.1.15); the row above it is this build, at 21.1 tokens/s with the drafter.
 
 ## Drafting (DFlash2) and several requests at once

@@ -9,7 +9,7 @@ Open an issue with:
 - **`./maya.sh --bench`** (Maya stopped) **then `./maya.sh --report`**, and attach `maya-report.txt`. Windows:
   `START-MAYA.bat --bench` / `--report`. The report includes the bench results.
 - **A build from source without the installer** is fine too. Send the same things by hand:
-  - the exact engine command and environment (`STRATA_GLM_*` settings);
+  - the exact engine command and environment (`MAYA_GLM_*` settings; the older `STRATA_GLM_*` names still work);
   - GPUs (model, VRAM, PCIe generation and width as `nvidia-smi` shows them), CPU, RAM, disk;
   - model and context length;
   - the engine log's `glm fast:`, `glm split`, `glm stat:` and `glm spec:` lines.
@@ -17,7 +17,7 @@ Open an issue with:
   For numbers comparable with the README's [speed tables](README.md#how-fast-is-it), measure the way `--bench` does: three questions of 256 tokens,
   greedy, thinking off, one short warm-up first; prefill (reading the prompt) at 2048 and 8192 tokens.
 - **Several conversations at once** (agents, `--parallel`): `--bench` measures one request at a time. Add runs of
-  `tools/agent_bench.py` against your running server ([docs/AGENT_BENCH.md](docs/AGENT_BENCH.md)): a scripted agent
+  `tools/agent_bench.py` against your running server ([docs/AGENT_BENCH.md](docs/benchmarks/AGENT_BENCH.md)): a scripted agent
   workload, the same requests every run, with per-request decode, read speeds and latencies.
 
 Name your Maya version (`VERSION`, or the commit). Say what you measured and what you didn't.
@@ -32,7 +32,7 @@ of its log (the `.log` next to your `maya-*.json`).
 - **Base it on `main`** and keep it to one topic.
 - **Measure before and after** on your hardware, same harness, and put the numbers in the description (a change for
   several conversations at once: `tools/agent_bench.py`, each setting twice or more). If the output changes (it can: which expert runs on the CPU or the GPU changes the last bits), say so.
-- **New settings** are `STRATA_GLM_*` environment variables, off or at today's behaviour by default unless measured
+- **New settings** are `MAYA_GLM_*` environment variables, off or at today's behaviour by default unless measured
   better, with a row in [docs/SETTINGS.md](docs/SETTINGS.md).
 - **AMD (HIP) and other backends:** keep NVIDIA's code path unchanged (`#if defined(STRATA_USE_HIP)`). We can't test
   AMD ourselves, so we merge AMD changes on your measurements once NVIDIA builds and behaves the same.
@@ -57,3 +57,13 @@ of its log (the `.log` next to your `maya-*.json`).
   - docs.
 
 Every merged change ships in a release (`CHANGELOG.md`), with credit.
+
+## House rules for anything you send us
+
+- **No hostnames, personal paths or internal plan identifiers** in code, docs, issues or pull requests. Describe the
+  hardware class instead (for example "4x Tesla V100 32 GB"); the numbers matter, the machine names do not.
+- **Docs links are checked.** If you move or rename a page, update every link and anchor in the same pull request;
+  `README*.md`, `docs/**` and `CHANGELOG.md` are all in scope.
+- **Keep the translations in step.** A `##` heading added to `README.md` needs the same heading in `README.ja.md`,
+  `README.zh-CN.md` and `README.pt-BR.md`.
+- **A speed report is a pull request too.** Use the speed report issue form; rows land in `docs/benchmarks/SPEED-REPORTS.md`.

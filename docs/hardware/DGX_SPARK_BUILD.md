@@ -94,14 +94,14 @@ counts the model's page cache as used. Our change lifts that policy from "AMD on
 the system's, including a GB10". Contributors to the AMD path are credited across the CHANGELOG (@rkarp, @izabera,
 @Gazelle221B, @pepuscz and others).
 
-**The DGX Spark measurement.** The README's [benchmark table](../README.md#how-fast-is-it) already carried a DGX Spark row - **16.5 tokens/s,
+**The DGX Spark measurement.** The README's [benchmark table](../../README.md#how-fast-is-it) already carried a DGX Spark row - **16.5 tokens/s,
 ~730 tokens/s on a 6K prompt, reported by @ericoh88 on v1.1.15 (#282)**. Our measurement (16.8 tokens/s, 730 tokens/s
 on an 8K prompt) reproduces it on the same hardware, which is what makes the port's numbers trustworthy.
 
 **llama.cpp's own implementation of this architecture.** Upstream llama.cpp master carries `glm5-next` - the same
 GLM-5.3-Flash architecture - so it can run the same GGUF. We built it for `sm_121a` on this machine and measured it:
 it was the baseline of this port's measurements (Maya reads a prompt up to 3.2x faster there; the decode is a tie at
-a short context and 3-7% faster at a long one); the DGX Spark rows are in the README's [speed tables](../README.md#how-fast-is-it). The snapshot in `ref/upstream-llama.cpp` is that
+a short context and 3-7% faster at a long one); the DGX Spark rows are in the README's [speed tables](../../README.md#how-fast-is-it). The snapshot in `ref/upstream-llama.cpp` is that
 implementation, and it is also the specification `ref/glm.py` follows.
 
 **The community's model work.** The GGUF this runs is a community quant of zai-org's weights; the speed reports in

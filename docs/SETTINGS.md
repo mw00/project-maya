@@ -70,7 +70,7 @@ These settings change what the engine chooses (put them in the config with `--en
 | `MAYA_GLM_CPU_SHARED` | on with 3+ GPUs | a split of three or more GPUs runs its cards one after another, so one CPU pool serves them all in turn, sized as one GPU's; `0` = a pool per GPU with the cores divided between them (A/B), `1` = one pool for two GPUs too. A card given its own count (`MAYA_GLM_CPU_LANE<n>`) keeps a pool of its own |
 | `MAYA_GLM_CPU_CONCURRENT` | on | the pool a split shares: several GPUs' routes on it at once, a later GPU's jobs first (under DFlash2's pipelined window each GPU holds an earlier token than the one before it); `0` = one route at a time, the others waiting for it whole (A/B). The same answers either way |
 | `MAYA_GLM_CPU_CAL` | unset | a file (e.g. `~/.config/project-maya/cpu-cal.txt`): the CPU lane's timing at start (an expert on the CPU, one over PCIe; ~1.7 s a GPU) is kept there, a line a GPU, and later starts read it. A new engine build, another pack, card, slot or thread count times again; a line that decode finds more than 15% off five times in a row is dropped, and the next start times again |
-| `MAYA_GLM_KDA_GRAPH` | off | experimental: `1` replays single-GPU KDA decode layers as CUDA graphs; DSA, MTP/split, profiling, dumps, prefetch and lookahead stay direct. Two thinking-Max 32K/2048 pairs on v1.0.21: 30.73 -> 31.45 tok/s (+2.35%). Current-main full native/quality validation is pending; see [scope and checks](GLM-KDA-GRAPHS.md) |
+| `MAYA_GLM_KDA_GRAPH` | off | experimental: `1` replays single-GPU KDA decode layers as CUDA graphs; DSA, MTP/split, profiling, dumps, prefetch and lookahead stay direct. Two thinking-Max 32K/2048 pairs on v1.0.21: 30.73 -> 31.45 tok/s (+2.35%). Current-main full native/quality validation is pending; see [scope and checks](dev/GLM-KDA-GRAPHS.md) |
 | `MAYA_GLM_CPU_SPLIT` | about 48 pieces in all | decode: each CPU-lane thread's share of a token's RAM-tier experts is cut into this many pieces (1-64), claimed in turn, so one thread held up by the disk readers doesn't hold up the token. Few threads take several pieces each (6 threads: 8 - one V100, Maya-S: 17.1 tok/s against 14.3 with one); 40 or more take one each, which streams the memory best |
 | `MAYA_GLM_PCIE_SHARE` | measured at start | the share of a token's RAM-tier experts copied over PCIe and run on the GPU instead of on the CPU: `0` = the CPU takes every one, `1` = none (the tuning sets it; `MAYA_GLM_CPU_PLAN` = the split per expert count, digits for 0..8) |
 | `MAYA_GLM_CPU_RETIME` | on | the split the start-up timing chose (neither of the two above set) is timed again in decode: over the first windows of 2,000 CPU-lane experts (at most eight; the first only warms up), when the lane's own cost an expert there is more than 15% from the one the split was planned with the same way in two windows in a row, the split is planned again from their mean, at most three times, with one `CPU lane timed again in decode` line each. A start on a busy CPU (one timed 0.611 ms an expert against the usual ~0.24) no longer keeps its split for the engine's life. `0` = off |
@@ -1405,7 +1405,7 @@ against the host's sums on two GPUs and times them.
 | `--prefill-chunk` (DeepSeek, default) | auto: 4096 / 8192 | the prompt chunk a PC sets when the model loads, by the share of the experts on the CPU lane (estimated from the VRAM and the pack): under 40% 4096, 40% and above 8192 (the engine log prints `prompt chunk 8192 (about N% ...)`); a prompt streams every expert from RAM once a chunk, so where the RAM holds most of them the larger chunk reads long prompts up to ~19% faster. With 40% and above on the CPU lane and each layer on one GPU (several GPUs, one pipeline) the chunk is 16384 and the prompt path borrows the room of the expert cache's last slots for the length of a prompt instead of keeping its own buffers (one GPU always did): the experts' room grows by ~7-10% (the decode up to 2-4% faster) and prompts of 12K-30K tokens read 5-12% faster, 2 x V100 (Maya-XS, 8000 MiB reserve) 12K +10%, 20K +9%, 29K +12%, 1K-3K unchanged, 8K about -3% (the lent experts are read back after the prompt: 0.3 s). While the prompt runs, the lent experts' file ranges are read into the page cache by 4 threads so that the read-back is not the disk's (`DS4_LEND_PREFETCH=0` off; only where the RAM has four times their size to spare; Linux and Windows file cache). `DS4_BORROW=0` keeps the 8192 chunk and its own buffers. `--prefill-chunk N` sets it by hand |
 
 `DS4_AR_P2P=1` puts a group's all-reduce buffers and flags in the memory of its first GPU, the other members reaching them by peer access, where the host-mapped rows were a round trip through RAM. The buffers are moved at the end of the load (peer access enabled earlier broke the load's other kernels). A group of up to four members takes it only when every member's BAR1 is at least 1 GiB (ReBAR on: the kernels' loads and stores through a 256 MiB window hung, even for 64 KB); other groups, and a buffer the first GPU has no room for (raise `--reserve-mib`), stay host-mapped. Measured on 6x RTX 3090 (tensor parallel 2, three pairs), 12K real-text prompt: prefill 1041 -> 1290 tokens/s, 24K: 1116 -> 1399, decode 96 -> 103 (one stream); tensor parallel 3: no change. The output of this engine is not bit-for-bit repeatable with or without it (last-row logits differ by up to ~4 between two runs of the same setup); the sums themselves are the same.
-| `MAYA_DS4_HIP_PEER_AR` | off (0) | a tensor-parallel pair's prompt-chunk all-reduces straight between the two GPUs' VRAM, exact (member 0's partial plus member 1's): HIP, and NVIDIA built with `DS4_CUDA_PEER_AR` (on; NVLink pairs ~1.3x faster long prompts on 8x RTX 3090). `auto` compares host, AR2 (when unset) and peer once at startup for eligible TP2 prompt groups; `0`/unset: the existing transport, no probing; `1` forces compatible P2P without timing. Requires bidirectional peer access and spare VRAM; explicit AR2 and flow groups retain their paths. `DS4_PEER_AR_TIMEOUT_S` (60) bounds a rank's wait for its partner. See [HIP_PEER_PREFILL.md](HIP_PEER_PREFILL.md) |
+| `MAYA_DS4_HIP_PEER_AR` | off (0) | a tensor-parallel pair's prompt-chunk all-reduces straight between the two GPUs' VRAM, exact (member 0's partial plus member 1's): HIP, and NVIDIA built with `DS4_CUDA_PEER_AR` (on; NVLink pairs ~1.3x faster long prompts on 8x RTX 3090). `auto` compares host, AR2 (when unset) and peer once at startup for eligible TP2 prompt groups; `0`/unset: the existing transport, no probing; `1` forces compatible P2P without timing. Requires bidirectional peer access and spare VRAM; explicit AR2 and flow groups retain their paths. `DS4_PEER_AR_TIMEOUT_S` (60) bounds a rank's wait for its partner. See [HIP_PEER_PREFILL.md](dev/HIP_PEER_PREFILL.md) |
 | `DS4_PEER_AR_PROBE_MS` | 3000 | `MAYA_DS4_HIP_PEER_AR=auto`: each pair's startup measurement budget in ms, from after its setup; a probe that does not finish in time keeps the host transport |
 
 ## DeepSeek: helper memory in the Monitor
@@ -1482,7 +1482,7 @@ these kernel switches do not use the `MAYA_*` alias convention.
 
 Restart after changing these settings. Decode/verification kernels retain
 their existing arithmetic, but prefill rounding can change subsequent routing
-and answers. See [RDNA4 EXL3 guided setup](EXL3_RDNA4.md#guided-setup) for the
+and answers. See [RDNA4 EXL3 guided setup](dev/EXL3_RDNA4.md#guided-setup) for the
 configuration example, verification, measured scope and rollback.
 
 ## DeepSeek: a helper GPU for the experts VRAM leaves over
@@ -1528,7 +1528,7 @@ shared mode, the existing rule remains: the helper must be outside `--gpus`.
 `MAYA_DS4_WARM_CAP_GB` remains required with either helper mode. It caps warm copies in mmap mode, not total
 process RAM with `--mmap-experts off`. `MAYA_DS4_HELPER_CHECK=1` also verifies uploaded EXL3 bytes and retained
 CPU fallback. The helper is disabled unless requested; no GPU ID, pool size, CPU thread count or cache policy
-changes by default. See [EXL3 helper configuration and validation](EXL3-HELPER.md) for examples and limitations.
+changes by default. See [EXL3 helper configuration and validation](dev/EXL3-HELPER.md) for examples and limitations.
 
 A prompt's experts that VRAM does not hold are read from the model's files as the prompt picks them (the flow), those
 the helper's pool holds too. With `MAYA_DS4_FLOW_HELPER=1` an expert the pool holds is copied out of it instead - the
@@ -1572,7 +1572,7 @@ DOT2 arithmetic order. Decode/verification-window kernels are unchanged.
 The cutoffs are nonnegative integers (`0` always selects the larger tile); invalid or overflowing values use their
 documented defaults. They are starting points from a small R9700 study, not tuning recommendations for every card.
 Serving configs use `MAYA_*`; native launches also accept `STRATA_*` or the unprefixed `EXL3_*` names. See
-[EXL3_HIP_SCALAR_ROWS.md](EXL3_HIP_SCALAR_ROWS.md) for the measured scope and reproducer.
+[EXL3_HIP_SCALAR_ROWS.md](dev/EXL3_HIP_SCALAR_ROWS.md) for the measured scope and reproducer.
 
 ## DeepSeek: packed EXL3 tensor-parallel cache transfers
 
@@ -2071,7 +2071,7 @@ cards keep the portable kernel. On NVIDIA it stays opt-in.
 `./maya.sh --setup --model cyber-frost` sets up Qwen-3.8-Flash-Next (CYBER-FROST): peasantsmith's GGUF of Blackfrost-AI's
 CYBER-FROST-3.8 (a fine-tune of
 Qwen3.8-Flash-Next: 512 experts, 10 a token, GatedDeltaNet and sparse-attention layers, an n-gram table, an MTP block;
-the Qwen Community License 1.0, `LICENSE.qwen-community-1.0`). One 112.5 GB file, downloaded from the commit
+the Qwen Community License 1.0, `licenses/LICENSE.qwen-community-1.0`). One 112.5 GB file, downloaded from the commit
 `tools/qwen/download.json` pins and checked against its sha256. It runs on the `maya` engine's own Qwen path, from the
 file in place: the setup writes `maya-cyber-frost.json` (`maya-cyber-frost-hip.json` on AMD), the pack (the index of
 the file's tensors, its small float weights and the tokenizer with the model's chat template) and the MTP drafter, built
