@@ -5053,6 +5053,13 @@ struct Model::Impl {
                               (int) D, c.o16, CUDA_R_16F, (int) D, &zero, c.q, CUDA_R_32F, (int) nc, CUBLAS_COMPUTE_32F,
                               CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
         }
+#if defined(STRATA_USE_HIP)
+        if (ok && nc >= 128 && nc * R <= qn && prompt_f16(devs[di])) {   // (DS4_PROMPT_F16: its FP16-out kernels too)
+            ok = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) nc, (int) R, (int) D, &one, c.w16, CUDA_R_16F, (int) D,
+                              c.o16, CUDA_R_16F, (int) D, &zero, c.q, CUDA_R_16F, (int) (2 * nc), CUBLAS_COMPUTE_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP) == CUBLAS_STATUS_SUCCESS;
+        }
+#endif
         if (ok && nix >= 1 && nix * R <= qn) {   // the indexer's FP16 weights (gemm_f16w's shape)
             ok = cudaMemsetAsync(c.w16, 0, nix * D * 2, s) == cudaSuccess &&
                  cudaMemsetAsync(c.o16, 0, R * D * 2, s) == cudaSuccess &&
@@ -5466,6 +5473,35 @@ struct Model::Impl {
         return true;
     }
 
+#if defined(STRATA_USE_HIP)
+    // MAYA_DS4_PROMPT_F16=1: the prompt's dense GEMMs FP16 in and FP16 out on gfx103x (RDNA 2), widened in place.  rocBLAS
+    // is tuned there only for FP16 out (37.7 TFLOPS on an RX 6900 XT, rocBLAS 5.6); FP16 in, FP32 out is a generic fallback
+    // (5.6 TFLOPS; both Strata's bench/results/2026-10-04-rdna2-fp16-prompt).  Not bit-identical: each output is rounded to
+    // FP16 before it is widened.  MAYA_DS4_PROMPT_F16_CHECK=1 counts outputs past FP16's range and says so after each prompt
+    bool prompt_f16(const Dev& d) const {
+        static const bool on = [] {
+            const char* v = ds4_env("DS4_PROMPT_F16");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        if (!on) return false;
+        static std::atomic<signed char> known[64];   // 0: not asked yet, 1: no, 2: yes
+        if (d.id < 0 || d.id >= 64) return false;
+        int v = known[d.id].load(std::memory_order_relaxed);
+        if (v == 0) {
+            cudaDeviceProp prop{};
+            v = cudaGetDeviceProperties(&prop, d.id) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx103", 6) == 0 ? 2 : 1;
+            known[d.id].store((signed char) v, std::memory_order_relaxed);
+            if (v == 2)
+                std::fprintf(stderr, "ds4: CUDA%d (%s): the prompt's dense GEMMs FP16 in and out (DS4_PROMPT_F16; not bit-identical)\n",
+                             d.id, prop.gcnArchName);
+        }
+        return v == 2;
+    }
+    static int prompt_f16_check() {
+        static const int on = ds4_env("DS4_PROMPT_F16_CHECK") != nullptr && std::atoi(ds4_env("DS4_PROMPT_F16_CHECK")) != 0;
+        return on;
+    }
+#endif
     // y[r][c] = x16[r] . W[:, c] (+ beta y) for r < rows: W reconstructed to FP16 in whole 128-column blocks, cuBLAS
     bool gemm(Dev& d, Chunk& c, const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta,
               std::string& err) {
@@ -5475,6 +5511,20 @@ struct Model::Impl {
             const int nc = std::min(cols, m.n - c0);
             if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
             else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
+#if defined(STRATA_USE_HIP)
+            if (beta == 0.0f && prompt_f16(d)) {   // (FP16 written at the start of each FP32 row: 2 ldy halves apart)
+                const float one16 = 1.0f;
+                const cublasStatus_t f16 = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one16, c.w16, CUDA_R_16F,
+                                                        m.k, x16, CUDA_R_16F, ldx, &beta, y + c0, CUDA_R_16F, 2 * ldy,
+                                                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+                if (f16 != CUBLAS_STATUS_SUCCESS) {
+                    err = "cublasGemmEx (FP16 out): status " + std::to_string((int) f16);
+                    return false;
+                }
+                widen_rows_f16(y + c0, nc, (size_t) ldy, rows, d.st, prompt_f16_check());
+                continue;
+            }
+#endif
             if (beta == 0.0f && lt::gemm(d.st, c.w16, nc, m.k, x16, ldx, rows, y + c0, ldy)) continue;   // (AMD)
             const float one = 1.0f;
             const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
@@ -20237,6 +20287,16 @@ struct Model::Impl {
         const double trc_back = now_ms();
         st.layer_ms += now_ms() - tl;
         eg_stats();
+#if defined(STRATA_USE_HIP)
+        if (prompt_f16_check())   // (DS4_PROMPT_F16_CHECK: FP16's range, on every device)
+            for (Dev& dv : devs) {
+                if (!prompt_f16(dv)) continue;
+                cudaSetDevice(dv.id);
+                CK(cudaStreamSynchronize(dv.st));
+                const unsigned long long bad = widen_bad_take();
+                std::fprintf(stderr, "ds4: CUDA%d: FP16-out GEMM outputs not finite in this run: %llu\n", dv.id, bad);
+            }
+#endif
         Dev& d = devs[(size_t) head_dev];
         cudaSetDevice(d.id);
         const double th = now_ms();

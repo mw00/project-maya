@@ -2052,6 +2052,18 @@ The switch quantizes both the prompt activations and the FP16 SwiGLU intermediat
 This approximate prompt path can change answers; it is off by default. It uses a separate workspace for each
 host thread, device and stream, and keeps the existing path during graph capture.
 
+## DeepSeek: the prompt's dense GEMMs on RDNA 2
+
+rocBLAS is tuned on `gfx103x` (RX 6000, Radeon PRO V620) only for GEMMs with FP16 outputs; the prompt's dense projections
+(FP16 in, FP32 out) take a generic route there. With this setting they run FP16 in and FP16 out, and each row is widened to
+FP32 in place. It changes the answers slightly (each output is rounded to FP16 first). AMD `gfx103x` only; other cards and
+NVIDIA keep the existing path.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_PROMPT_F16` | unset (off) | `1`: the prompt's dense GEMMs FP16 in and out on `gfx103x` (the log says so per GPU) |
+| `MAYA_DS4_PROMPT_F16_CHECK` | unset (off) | `1`: with the above, the outputs past FP16's range (not finite after widening) counted, and the log says how many per GPU after each chunked prompt. Should read 0 |
+
 ## DeepSeek: the indexer's scores on the matrix cores
 
 The sparse attention's indexer scores every earlier position of the context for each new row (prompt and answer).

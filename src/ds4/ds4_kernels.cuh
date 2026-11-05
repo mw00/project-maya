@@ -120,6 +120,12 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s);
 /// The same for T activations x[t] = x + t ldx into y + t ldy, each weight read once for all of them; each output is
 /// gemv_f16's bit for bit.
+#if defined(STRATA_USE_HIP)
+/// (DS4_PROMPT_F16) rows of n values an FP16-out GEMM left as FP16 at the start of each FP32 row (ldy floats apart), widened
+/// in place (exact); count_bad: the values that are not finite counted (widen_bad_take, the current device)
+void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad = 0);
+unsigned long long widen_bad_take();
+#endif
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    cudaStream_t s);
 /// The router's weights on the device: F32 (f), or the pack's BF16 rows as they are (h; half the bytes to read, each
