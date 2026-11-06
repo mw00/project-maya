@@ -24,6 +24,8 @@ def normalize_request(req):
         if not isinstance(structured, dict) or not structured:
             raise ValueError("structured_outputs must be a non-empty object")
         for key, value in structured.items():
+            if value is None:
+                continue
             if key == "disable_any_whitespace":
                 if not isinstance(value, bool):
                     raise ValueError("structured_outputs.disable_any_whitespace must be boolean")
