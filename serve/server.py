@@ -3829,10 +3829,16 @@ class Service:
 
     def _block_suffixes(self, blocked, tools, kwargs):
         """{(name, args): (ToolRepeat, ids, thinks)}: for each blocked call (loop_guard.tool_blocked) the prompt that
-        follows the model's own `</tool_call>` when the server answers it itself - the template's call close, the tool
+        follows the model's completed tool-call block when the server answers it itself - its turn close, the tool
         result loop_guard.block_result, a user message loop_guard.block_note and the next assistant turn's opening
         (`thinks`: that opening is an open thinking block, which run() starts with loop_guard.block_steer).  None for
-        a template that does not end a call with </tool_call> or does not render a turn as a prefix of the next."""
+        a template with no supported call boundary or one that does not render a turn as a prefix of the next."""
+        call_end = CALL_END
+        if getattr(self.template, "deepseek", False):
+            from serve.ds41_encoding import dsml_token, tool_calls_block_name
+            # The parser rewrites DSML into CALL_END internally; the prompt and generated token IDs still use
+            # the original DSML. Slice after the outer block, not an invoke or a legacy tag inside an argument.
+            call_end = f"</{dsml_token}{tool_calls_block_name}>"
         out = {}
         for key, rep in blocked.items():
             call = {"id": "call_loop_guard", "type": "function",
@@ -3848,9 +3854,9 @@ class Service:
                 return None
             if kwargs.get("enable_thinking") is False and f.endswith("<think>"):
                 f += "</think>"                     # (as render_ids)
-            if not f.startswith(p) or CALL_END not in p:
+            if not f.startswith(p) or call_end not in p:
                 return None
-            out[key] = (rep, self.tok.encode(p[p.rindex(CALL_END) + len(CALL_END):] + f[len(p):], parse_special=True),
+            out[key] = (rep, self.tok.encode(p[p.rindex(call_end) + len(call_end):] + f[len(p):], parse_special=True),
                         f.rstrip().endswith("<think>"))
         return out
 
