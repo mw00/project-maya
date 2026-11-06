@@ -699,6 +699,11 @@ struct Glm5Model::FastState {
     std::atomic<bool> helper_failed{false};
     std::string helper_error;
     std::atomic<uint64_t> helper_experts{0}, helper_routes{0}, helper_us{0};
+    // STRATA_GLM_HELPER_OVERLAP=1: a route's helper call runs beside its CPU-lane experts (enqueue, the CPU lane, wait)
+    // instead of before them.  The routes that had both, their CPU-lane time (beside the helper), the time then spent
+    // waiting for the helper, and with STRATA_GLM_PROF the time saved (each route's min(CPU lane, helper GPU time))
+    bool helper_overlap = false;
+    std::atomic<uint64_t> helper_ovl_routes{0}, helper_ovl_cpu_us{0}, helper_ovl_wait_us{0}, helper_ovl_saved_us{0};
     // the lane's own thread count when cpu_pool holds more (STRATA_GLM_CPU_LANE_MAX): a request that names no
     // cpu_threads returns to it, not to the whole pool; 0 = the pool's size
     int cpu_threads0 = 0;

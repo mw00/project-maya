@@ -2270,6 +2270,11 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     }
     F->cpu_retime = false;
     F->cal_key.clear();   // the CPU's decode timing must not re-plan the GPU helper's lane
+    if (const char* ov = getenv("STRATA_GLM_HELPER_OVERLAP"); ov != nullptr && std::strcmp(ov, "1") == 0) {
+        F->helper_overlap = true;
+        std::fprintf(stderr, "glm helper: CUDA%d's experts run beside the CPU lane's in a route (STRATA_GLM_HELPER_OVERLAP)\n",
+                     device);
+    }
     if (n_parts_ > 1)
         std::fprintf(stderr, "glm helper: CUDA%d owns %d complementary experts in %.2f GiB of %s for part %d's layers "
                              "[%d, %d); CUDA%d keeps that part's trunk layers; prefill unchanged\n",
@@ -4262,6 +4267,13 @@ void Glm5Model::fast_destroy() {
         std::fprintf(stderr, "glm helper: CUDA%d computed %llu experts in %llu routes, %.1f ms, %llu cache swaps\n", F->helper.device(),
                      (unsigned long long) F->helper_experts.load(), (unsigned long long) F->helper_routes.load(),
                      (double) F->helper_us.load() / 1000.0, (unsigned long long) F->helper_swaps);
+        if (F->helper_overlap)
+            std::fprintf(stderr, "glm helper overlap: CUDA%d beside the CPU lane in %llu routes: the CPU lane's %.1f ms ran "
+                                 "while the helper worked, then %.1f ms waiting for it; saved %s ms (each route's min of the "
+                                 "two%s)\n", F->helper.device(), (unsigned long long) F->helper_ovl_routes.load(),
+                         (double) F->helper_ovl_cpu_us.load() / 1000.0, (double) F->helper_ovl_wait_us.load() / 1000.0,
+                         F->helper.profiling() ? std::to_string(F->helper_ovl_saved_us.load() / 1000).c_str() : "?",
+                         F->helper.profiling() ? ", the helper's by its GPU events" : ": STRATA_GLM_PROF times the helper");
         F->helper.close();
     }
     if (F->helper_owned_d) cudaFree(F->helper_owned_d);
@@ -5094,25 +5106,77 @@ void Glm5Model::fast_service() {
             if (F->helper.device() >= 0) {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);
-                if (F->helper_failed.load(std::memory_order_acquire) || (hn > 0 &&
-                    !(ly.exl3 ? F->helper.compute_exl3(ly.xl, g.swiglu_exp, hn, helper_keys, helper_w, rq->x, ans->part,
-                                                       F->helper_error)
-                              : F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys,
-                                                  helper_w, rq->x, ans->part, F->helper_error)))) {
-                    // Retire the request so the main GPU can finish and report the error, not spin forever.
-                    std::fill_n(ans->part, g.n_embd, 0.0f);
-                    F->helper_failed.store(true, std::memory_order_release);
-                }
-                // Quantize on the CPU only when this route actually has CPU fallback.
-                if (ne > 0) {
-                    const auto cpu_t0 = std::chrono::steady_clock::now();
+                if (F->helper_overlap) {
+                    // STRATA_GLM_HELPER_OVERLAP: the helper's call is queued first - its result copies straight into
+                    // ans->part (mapped pinned memory), which nothing else touches until the wait - then the CPU lane
+                    // computes its experts into its own buffer, then the wait, then the one add per value the serial
+                    // order makes too (helper + CPU lane: the same bits).  The wait comes before this route's answer is
+                    // posted, so no call is pending at the next route nor at the boundary's helper swaps.
+                    bool queued = false;
+                    if (!F->helper_failed.load(std::memory_order_acquire) && hn > 0) {
+                        queued = ly.exl3 ? F->helper.enqueue_exl3(ly.xl, g.swiglu_exp, hn, helper_keys, helper_w, rq->x,
+                                                                  ans->part, F->helper_error)
+                                         : F->helper.enqueue(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn,
+                                                             helper_keys, helper_w, rq->x, ans->part, F->helper_error);
+                        if (!queued) {   // (as the serial path's failure: no helper part, the CPU lane's still added)
+                            std::fill_n(ans->part, g.n_embd, 0.0f);
+                            F->helper_failed.store(true, std::memory_order_release);
+                        }
+                    }
                     float cpu_part[4096];
-                    fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
-                    for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
-                    F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
-                    F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
-                    F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
-                                           std::chrono::steady_clock::now() - cpu_t0).count(), std::memory_order_relaxed);
+                    uint64_t lane_us = 0;
+                    if (ne > 0) {
+                        const auto cpu_t0 = std::chrono::steady_clock::now();
+                        fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
+                        lane_us = (uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - cpu_t0).count();
+                        F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+                        F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
+                        F->cpu_us.fetch_add(lane_us, std::memory_order_relaxed);
+                    }
+                    if (queued) {
+                        const auto w0 = std::chrono::steady_clock::now();
+                        if (!F->helper.wait(F->helper_error)) {
+                            // Retire the request so the main GPU can finish and report the error, not spin forever.
+                            std::fill_n(ans->part, g.n_embd, 0.0f);
+                            F->helper_failed.store(true, std::memory_order_release);
+                        } else if (ne > 0) {
+                            const double gpu_ms = F->helper.last_gpu_ms();
+                            if (gpu_ms >= 0.0)
+                                F->helper_ovl_saved_us.fetch_add(std::min<uint64_t>(lane_us, (uint64_t) (gpu_ms * 1000.0)),
+                                                                 std::memory_order_relaxed);
+                        }
+                        if (ne > 0) {
+                            F->helper_ovl_routes.fetch_add(1, std::memory_order_relaxed);
+                            F->helper_ovl_cpu_us.fetch_add(lane_us, std::memory_order_relaxed);
+                            F->helper_ovl_wait_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                                                std::chrono::steady_clock::now() - w0).count(),
+                                                            std::memory_order_relaxed);
+                        }
+                    }
+                    if (ne > 0)
+                        for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
+                } else {
+                    if (F->helper_failed.load(std::memory_order_acquire) || (hn > 0 &&
+                        !(ly.exl3 ? F->helper.compute_exl3(ly.xl, g.swiglu_exp, hn, helper_keys, helper_w, rq->x, ans->part,
+                                                           F->helper_error)
+                                  : F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys,
+                                                      helper_w, rq->x, ans->part, F->helper_error)))) {
+                        // Retire the request so the main GPU can finish and report the error, not spin forever.
+                        std::fill_n(ans->part, g.n_embd, 0.0f);
+                        F->helper_failed.store(true, std::memory_order_release);
+                    }
+                    // Quantize on the CPU only when this route actually has CPU fallback.
+                    if (ne > 0) {
+                        const auto cpu_t0 = std::chrono::steady_clock::now();
+                        float cpu_part[4096];
+                        fast_cpu_experts(rq->layer, ne, blob, w, rq->x, cpu_part);
+                        for (int j = 0; j < g.n_embd; ++j) ans->part[j] += cpu_part[j];
+                        F->cpu_experts.fetch_add((uint64_t) ne, std::memory_order_relaxed);
+                        F->cpu_routes.fetch_add(1, std::memory_order_relaxed);
+                        F->cpu_us.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                                               std::chrono::steady_clock::now() - cpu_t0).count(), std::memory_order_relaxed);
+                    }
                 }
                 F->helper_experts.fetch_add((uint64_t) hn, std::memory_order_relaxed);
                 F->helper_routes.fetch_add(hn > 0, std::memory_order_relaxed);
