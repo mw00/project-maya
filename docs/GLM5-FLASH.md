@@ -23,7 +23,7 @@ From the released `config.json` (`zai-org/GLM-5.3-Flash`, `Glm5NextForConditiona
 | --- | --- |
 | Total / active params | 320 B (321,323,031,390) / 18 B per token |
 | Native weights | FP8 E4M3, block 128×128, dynamic activation scale; norms, gates, router, embeddings, `lm_head`, vision tower and indexer stay high-precision (BF16/F32) |
-| Layers | 45 (`hidden_size` 4096); layer pattern 3 `linear_attention` then 1 `deepseek_sparse_attention`, so the full-attention layers are 3, 7, ..., 43 - **11 of them**, the same 4-interval as Strata's `qsa_interval` |
+| Layers | 45 (`hidden_size` 4096); layer pattern 3 `linear_attention` then 1 `deepseek_sparse_attention`, so the full-attention layers are 3, 7, ..., 43 - **11 of them**, the same 4-interval as the upstream engine's `qsa_interval` |
 | Full attention (11 layers) | MLA, NoPE: 64 heads, `q_lora_rank` 1536, `kv_lora_rank` 512, `qk_nope_head_dim` 256, `qk_rope_head_dim` 0, `v_head_dim` 256, `mla_use_nope` true. Plus a DeepSeek-style sparse-attention indexer: `index_topk` 2048, `index_n_heads` 32, `index_head_dim` 128, `index_kpool` 4 (compressed index-key pool) |
 | Linear attention (34 layers) | Kimi Delta Attention: 64 heads × head_dim 128, `short_conv_kernel_size` 4, `gate_lower_bound` -5.0 |
 | Hyper-connections | `mhc: true`, `hc_mult` 4, `hc_sinkhorn_iters` 20 - the manifold-constrained variant (mHC) |

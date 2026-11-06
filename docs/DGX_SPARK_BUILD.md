@@ -50,8 +50,8 @@ provides; the licence notices stay with every copy (`third_party/*/LICENSE`).
 | `tools/` | the packer (`iq_pack.py`), the installer (`maya.py`, `setup.py`), the benchmark, the parity tests |
 | `ref/glm.py`, `ref/load.py` | **Maya's own Python reference forward pass** for the architecture, one op at a time - the specification the C++ kernels are parity-tested against (it is written from the upstream snapshot below) |
 
-Maya's engine started from **Strata** ([Niko1221/Strata](https://github.com/Niko1221/Strata), MIT) and was rewritten
-for GLM-5.3-Flash; its server and dashboard grew from Strata's too.
+Maya's engine started from an MIT-licensed upstream engine ([source](https://github.com/Niko1221/Strata)) and was rewritten
+for GLM-5.3-Flash; its server and dashboard grew from it too.
 
 ### What is taken from other projects
 
