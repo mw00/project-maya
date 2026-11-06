@@ -2035,6 +2035,8 @@ Setup and debugging variables:
 | `MAYA_MM3_PROF` | off | debugging: `1` each forward's GPU time by part (events), `2` the same with the host waiting at each part (AMD), and the DSpark proposals' parts |
 | `MAYA_MM3_MIN_CC` | - | testing only: `70` lets the setup take GPUs before RTX 30 / A100 (a V100), with a warning |
 | `MAYA_MM3_IQ_Q8K` | `1` | GGUF quants: the routed experts' inputs rounded as the CPU lane rounds them (a scale every 256 values), so an expert gives the same sums on the GPU and the CPU; `0`: a scale every 32 |
+| `MAYA_MM3_EP` | `4` on gfx906 | Sets the number of asynchronous helper copy threads for MiniMax-M3.1 MoE expert transfers. Defaults to 4 on AMD Instinct MI50 (gfx906), scaling decode throughput by +22.1% (28.5 -> 34.8 tok/s). |
+| `MAYA_MM3_DRAFT` | `1` on gfx906 | Enables speculative drafting verification on gfx906 with Wave64 attention reduction. |
 | `MM3_TIMING`, `MM3_CONF`, `MM3_LANE_PROF`, `MM3_MISS_STATS`, `MM3_TP_PROF`, `MM3_TP_TRACE`, `MM3_NSYS` | off | debugging: the engine prints timings, the drafts' confidences, the CPU lane's and tensor parallel's profiles |
 | `MM3_PROMOTE` | - | debugging: the expert cache's promotion rule with `--tp` (`threshold,pending,decay`) |
 | `MM3_STRESS`, `MM3_STRESS_T` | off | debugging: a drafting stress run |

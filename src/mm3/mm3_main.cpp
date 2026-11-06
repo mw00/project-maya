@@ -1772,6 +1772,19 @@ int main(int argc, char** argv) {
         if (profile_out.empty()) profile_out = learned;
     }
     if (o.cpu_threads == -2) o.cpu_threads = mm3::CpuLane::auto_workers();   // (no --cpu-threads: this host's cores)
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    // On AMD Instinct MI50 (gfx906 CDNA1), default 4-helper EP DMA pipelines and calibrate VRAM staging slots
+    if (const char* ep = std::getenv("MAYA_MM3_EP"); ep != nullptr) {
+        o.cpu_threads = std::max(o.cpu_threads, std::atoi(ep));
+    } else if (const char* ep2 = std::getenv("MM3_EP"); ep2 != nullptr) {
+        o.cpu_threads = std::max(o.cpu_threads, std::atoi(ep2));
+    } else {
+        o.cpu_threads = std::max(o.cpu_threads, 4); // Default 4 helper threads on MI50
+    }
+    if (const char* dv = std::getenv("MAYA_MM3_DRAFT"); dv != nullptr) {
+        o.dspark = (std::atoi(dv) != 0);
+    }
+#endif
     std::vector<int> ids = ids_arg.empty() ? std::vector<int>{0} : parse_ids(ids_arg);
     if (ids.empty()) {
         std::fprintf(stderr, "no token ids\n");
