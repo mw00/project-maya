@@ -653,6 +653,44 @@ def check_request_sampling(req: dict) -> None:
             req["loop_guard"] = bool(guard)
         else:
             raise ValueError("loop_guard: true or false")
+    if req.get("thinking_budget") is not None:   # the thinking budget for this request only (request_think_budget)
+        budget = request_budget_of(req["thinking_budget"])
+        if budget is None:
+            del req["thinking_budget"]
+        else:
+            req["thinking_budget"] = budget
+
+
+def request_budget_of(value) -> int | None:
+    """A request's own "thinking_budget" (Chat Completions, Messages): 0 or 256..262144 tokens as given - a whole
+    number, or one written as text ("8192", "8192.0"); a whole number outside that range taken to its nearest end (100
+    -> 256, 10**400 -> 262144); anything else - a negative number, a fraction, other text, true / false - left out
+    (None), so the config's budget applies, as it did before a request could name one: a client that sent such a value
+    got no error then and gets none now. The server's log says what it changed."""
+    raw, lo, hi = value, maya_quants.THINK_BUDGET_MIN, maya_quants.THINK_BUDGET_MAX
+    if isinstance(value, str) and re.fullmatch(r"\s*\d+(\.0*)?\s*", value):
+        digits = value.strip().split(".")[0]
+        value = int(digits) if len(digits) <= 12 else hi + 1   # (int() refuses past 4300 digits: the top anyway)
+    if isinstance(value, float):
+        value = int(value) if math.isfinite(value) and value.is_integer() else None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        print(f"[maya] a request's thinking_budget {raw!r} is not a whole number of tokens: left out, the config's "
+              "budget applies", flush=True)
+        return None
+    if value == 0 or lo <= value <= hi:
+        return value
+    near = lo if value < lo else hi
+    print(f"[maya] a request's thinking_budget {str(raw)[:40]!r} is outside 0 or {lo}..{hi}: {near} used", flush=True)
+    return near
+
+
+def request_think_budget(config_budget: int, req: dict | None) -> int:
+    """The thinking budget for one request, in tokens (0 = none): its own "thinking_budget" when it names one (checked
+    by check_request_sampling and request_budget_of: 0 or 256..262144, taken into that range), the run config's otherwise.  A client that knows
+    a turn needs more room (a question it was asked to think hard about) or less sets it for that turn alone; the
+    config's stays every other request's."""
+    own = (req or {}).get("thinking_budget")
+    return config_budget if own is None else own
 
 
 def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
@@ -4274,21 +4312,23 @@ class Service:
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
-                budgeted = in_think and self.think_budget > 0   # (0 = no budget: the end token is still tracked)
-                # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
+                think_budget = request_think_budget(self.think_budget, sampling)
+                budgeted = in_think and think_budget > 0   # (0 = no budget: the end token is still tracked)
+                # The thinking budget (request_think_budget); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
                 # side request such as a title, which must still get an answer: a reserve is kept for it (a quarter,
                 # with a preferred floor of MAYA_GLM_THINK_RESERVE, 1024, capped at half the limit). A larger
                 # limit is the client's cap on the whole output and leaves the budget alone: a chat client's
                 # max_tokens=4096 used to cut the thinking to ~3K tokens and close it while the model was still
                 # reasoning. The forced </think> also consumes one token of max_new, so account for it.
-                think_budget = self.think_budget
                 # GLM-5.3, a request that asks for Max itself (asked_max) while the budget is the default: the long
                 # budget (think_budget_max, 65536; the owner, 2026-11-07) as far as its room allows - max_new (its
                 # max_tokens, or the context left) keeps THINK_LONG_RESERVE for the answer - and never below the
-                # budget every level gets; the limits below apply to it alike
+                # budget every level gets; the limits below apply to it alike. A request that names its own budget
+                # (request_think_budget) keeps it
                 top = getattr(self, "think_budget_max", 0)
-                if top > think_budget > 0 and max_new and self.asked_max(sampling):
+                own = (sampling or {}).get("thinking_budget") is not None
+                if not own and top > think_budget > 0 and max_new and self.asked_max(sampling):
                     think_budget = min(top, max(think_budget, int(max_new) - THINK_LONG_RESERVE))
                 soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
                 if budgeted and max_new and int(max_new) <= THINK_TINY_LIMIT:
