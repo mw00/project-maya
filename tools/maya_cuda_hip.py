@@ -11,6 +11,7 @@ import platform
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,71 @@ def hip_devices(env=None):
 
 def clean_visibility(env):
     return {k: v for k, v in env.items() if k not in VISIBILITY}
+
+
+def hip_architecture(pci_bus_id, topology=Path('/sys/class/kfd/kfd/topology/nodes'),
+                     drm=Path('/sys/class/drm')):
+    # Match the HIP runtime device by PCI identity, never by KFD enumeration order.
+    # Use the same gfx_target_version decoding as setup.amd_gpus, without a ctypes
+    # copy of hipDeviceProp_t whose layout depends on the installed HIP ABI.
+    def pci_key(value):
+        return tuple(int(part, 16) for part in re.split(r'[:.]', value.lower()))
+    targets = set()
+    for node in topology.glob('*/properties'):
+        try:
+            props = dict(line.split(maxsplit=1) for line in node.read_text().splitlines())
+            version = int(props.get('gfx_target_version', '0'))
+            device = drm / ('renderD' + props.get('drm_render_minor', '')) / 'device'
+            if version > 0 and device.exists() and pci_key(device.resolve().name) == pci_key(pci_bus_id):
+                targets.add(f'gfx{version // 10000}{(version // 100) % 100:x}{version % 100:x}')
+        except (OSError, ValueError):
+            continue
+    if len(targets) != 1:
+        raise ValueError(f'Cannot establish HIP architecture for PCI device {pci_bus_id}; '
+                         'the matching KFD/DRM sysfs topology must be accessible.')
+    return targets.pop()
+
+
+def check_arch(devices, requested=None):
+    import maya as M
+    if len(devices) != 1 or not devices[0].get('arch'):
+        raise ValueError('Cannot establish the selected HIP device architecture.')
+    arch = devices[0]['arch']
+    if requested is not None and requested != arch:
+        raise ValueError(f'HIP architecture mismatch: selected device is {arch}, requested module is {requested}. '
+                         'Omit --hip-arch to use the detected target, or select the matching device.')
+    if arch not in M.HIP_ARCHS:
+        raise ValueError(f'HIP target {arch} is unsupported by this WMMA helper build; '
+                         f'current targets: {", ".join(M.HIP_ARCHS)}.')
+    return arch
+
+
+def check_pack(pack):
+    import maya as M
+    from gguf_reader import GGUFFile
+    if (pack / 'exl3.txt').exists() or not all(
+            (pack / f).is_file() for f in ('index.txt', 'native_experts.txt', 'dense.bin')):
+        raise ValueError('A native GGUF GLM pack is required; EXL3 and unpacked GGUF files are unsupported.')
+    source = M.pack_source(pack)
+    if not source:
+        raise ValueError('The pack does not name its source GGUF in native_experts.txt.')
+    try:
+        meta = GGUFFile(pack.parent / source).metadata  # header only; no tensor data
+    except (OSError, ValueError, KeyError, struct.error) as e:
+        raise ValueError(f'Cannot read the pack\'s GGUF geometry: {e}') from e
+    if meta.get('general.architecture') not in ('glm5-next', 'glm5next'):
+        raise ValueError('The HIP helper requires a GLM native GGUF pack.')
+    # Same spelling choice as Glm5Geometry::from_gguf. Require explicit geometry:
+    # missing/malformed metadata must not turn into an assumed supported model.
+    prefix = 'glm5next.' if 'glm5next.block_count' in meta else 'glm5-next.'
+    limits = {'embedding_length': (4096, 4096), 'expert_feed_forward_length': (2048, 2048),
+              'expert_used_count': (1, 8)}
+    for key, (lo, hi) in limits.items():
+        value = meta.get(prefix + key)
+        values = value if isinstance(value, list) else [value]
+        if not values or any(type(v) is not int or not lo <= v <= hi for v in values):
+            raise ValueError(f'Unsupported or missing GLM geometry: {prefix + key}={value!r}; '
+                             'the helper requires width 4096, intermediate width 2048 and 1..8 routed experts.')
 
 
 def check_budget(devices, budget):
@@ -98,6 +164,8 @@ def validate(cfg, env=None):
         if platform.system() != 'Linux' or not isinstance(managed, dict) or managed.get('version') != 1:
             raise ValueError('This CUDA+HIP setup requires Linux and manifest version 1.')
         config_env = check_config(cfg)
+        args = cfg['args']
+        check_pack(Path(cfg.get('cwd') or ROOT) / args[args.index('--glm-pack') + 1])
         manifest = Path(managed['manifest']).resolve()
         record = json.loads(manifest.read_text())
         if record.get('version') != 1 or record.get('source') != fingerprint():
@@ -118,7 +186,9 @@ def validate(cfg, env=None):
         if not 1 <= budget <= 131072 or not 0 <= share <= 0.49:
             raise ValueError('Invalid helper budget (1..131072 MiB) or prefill share (0..0.49).')
         if env is not None:
-            check_budget(hip_devices(env), budget)
+            devices = hip_devices(env)
+            check_budget(devices, budget)
+            check_arch(devices, record['hip_arch'])
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as e:
         raise ValueError(f'{e}\nRun ./setup-cuda-hip.sh --config <GLM-config> --hip-device <index> '
                          '--helper-mib <MiB> again. The previous pair is not started.') from e
@@ -248,7 +318,7 @@ def main(argv=None):
     ap.add_argument('--hip-device', type=int, help='HIP runtime ordinal from --list-devices')
     ap.add_argument('--helper-mib', type=int, help='explicit HIP allocation budget in MiB, including scratch')
     ap.add_argument('--cuda-device', type=int, help='NVIDIA index (default: the input config\'s single GPU)')
-    ap.add_argument('--hip-arch', default='gfx1151', help='helper compilation target (default: tested gfx1151)')
+    ap.add_argument('--hip-arch', help='optional target assertion; must match the detected HIP architecture')
     ap.add_argument('--prefill-share', type=float, default=0.25, help='helper row admission cap, 0..0.49 (default .25)')
     ap.add_argument('--nvcc', default=os.environ.get('NVCC'), help='CUDA compiler; otherwise use Maya discovery')
     ap.add_argument('--hipcc', default=os.environ.get('HIPCC'), help='HIP compiler; otherwise PATH/ROCM_PATH')
@@ -281,7 +351,7 @@ def main(argv=None):
             for g in gpus:
                 print(f"CUDA {g['index']}: {g['name']}, {g['vram_gb']:.1f} GiB")
             for g in hip_devices(clean_visibility(os.environ)):
-                print(f"HIP {g['index']}: {g['name']}, {g['free_bytes'] / 2**30:.1f} GiB free / "
+                print(f"HIP {g['index']}: {g['name']} ({g['arch']}), {g['free_bytes'] / 2**30:.1f} GiB free / "
                       f"{g['total_bytes'] / 2**30:.1f} GiB total (runtime allocation limit; UMA shares RAM)")
             return 0
         if a.interactive and not a.check:
@@ -289,14 +359,15 @@ def main(argv=None):
                 a.config = interactive_config()
             if a.hip_device is None or a.helper_mib is None:
                 for d in hip_devices(clean_visibility(os.environ)):
-                    print(f"HIP {d['index']}: {d['name']}, {d['free_bytes'] // 1048576} MiB free (shared UMA)")
+                    print(f"HIP {d['index']}: {d['name']} ({d['arch']}), {d['free_bytes'] // 1048576} MiB free (shared UMA)")
             if a.hip_device is None:
                 a.hip_device = int(input('HIP helper device index: '))
             if a.helper_mib is None:
                 a.helper_mib = int(input('HIP helper budget in MiB (leave room for scratch and other workloads): '))
         if a.config is None or a.hip_device is None or a.helper_mib is None:
             ap.error('--config, --hip-device and --helper-mib are required (or use --list-devices)')
-        if a.hip_device < 0 or not 0 <= a.prefill_share <= 0.49 or not re.fullmatch(r'gfx[0-9a-f]+', a.hip_arch):
+        if a.hip_device < 0 or not 0 <= a.prefill_share <= 0.49 or (
+                a.hip_arch is not None and not re.fullmatch(r'gfx[0-9a-f]+', a.hip_arch)):
             raise ValueError('Invalid HIP ordinal, architecture or prefill share (expected 0..0.49).')
         source_path = a.config.expanduser().resolve()
         base = json.loads(source_path.read_text())
@@ -312,15 +383,15 @@ def main(argv=None):
             raise ValueError(f'CUDA device {device} was not found; use --list-devices.')
         cwd = Path(base.get('cwd') or source_path.parent).resolve()
         args = base['args']; pack = (cwd / args[args.index('--glm-pack') + 1]).resolve()
-        if not all((pack / f).is_file() for f in ('index.txt', 'native_experts.txt', 'dense.bin')):
-            raise ValueError('A native GGUF GLM pack is required; EXL3 and unpacked GGUF files are unsupported.')
+        check_pack(pack)
         if not (cwd / base.get('tokenizer', '') / 'vocab.json').is_file():
             raise ValueError('The input config\'s tokenizer/vocab.json is missing.')
         nvcc, hipcc = toolchains(a, gpu)
         env = dict(clean_visibility(os.environ), HIP_VISIBLE_DEVICES=str(a.hip_device))
         devices = hip_devices(env); check_budget(devices, a.helper_mib)
+        a.hip_arch = check_arch(devices, a.hip_arch)
         print(f"CUDA primary: {gpu['name']} (index {device}); HIP helper: {devices[0]['name']} "
-              f"(runtime index {a.hip_device}), {a.helper_mib} MiB budget.")
+              f"(runtime index {a.hip_device}, {a.hip_arch}), {a.helper_mib} MiB budget.")
         if a.check:
             print('Preflight passed; no files or builds changed.')
             return 0
@@ -369,6 +440,8 @@ def main(argv=None):
 def probe():
     import ctypes as C
     import ctypes.util
+    if os.environ.get('HSA_OVERRIDE_GFX_VERSION'):
+        raise ValueError('Unset HSA_OVERRIDE_GFX_VERSION so setup can establish the real HIP target.')
     hip = C.CDLL(ctypes.util.find_library('amdhip64') or 'libamdhip64.so')
     def ck(rc):
         if rc:
@@ -378,9 +451,13 @@ def probe():
     for i in range(count.value):
         ck(hip.hipSetDevice(i)); name = C.create_string_buffer(256)
         ck(hip.hipDeviceGetName(name, len(name), i))
+        pci = C.create_string_buffer(32)
+        ck(hip.hipDeviceGetPCIBusId(pci, len(pci), i))
+        pci_bus_id = pci.value.decode()
         free, total = C.c_size_t(), C.c_size_t()
         ck(hip.hipMemGetInfo(C.byref(free), C.byref(total)))
-        found.append({'index': i, 'name': name.value.decode(), 'free_bytes': free.value, 'total_bytes': total.value})
+        found.append({'index': i, 'name': name.value.decode(), 'free_bytes': free.value, 'total_bytes': total.value,
+                      'pci_bus_id': pci_bus_id, 'arch': hip_architecture(pci_bus_id)})
     print(json.dumps(found))
 
 

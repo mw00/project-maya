@@ -81,8 +81,21 @@ Compiler discovery reuses Maya's CUDA version selection and finds HIP through
 PATH, `ROCM_PATH` or `/opt/rocm`. It uses the existing pinned
 llama.cpp checkout, downloading it through Maya's normal helper if missing.
 `--ggml-dir` can name an existing checkout at the installer's pinned revision.
-`--nvcc`, `--hipcc` and `--hip-arch` override toolchain discovery; the default HIP
-target is the tested `gfx1151`, and other hardware remains unqualified.
+`--nvcc` and `--hipcc` override toolchain discovery. The HIP compilation target
+is detected for the selected runtime device: its PCI identity is matched to the
+kernel's KFD/DRM topology, independent of device enumeration order. Both sysfs
+views must be accessible. `--list-devices` shows the architecture; an explicit
+`--hip-arch` must match it, including during `--check`. Unknown targets and
+`HSA_OVERRIDE_GFX_VERSION` overrides are rejected. The current WMMA build targets
+are `gfx1100`, `gfx1151` and `gfx1201`; only `gfx1151` has hardware validation here.
+
+Preflight reads the header of the source GGUF named by `native_experts.txt`, using
+Maya's existing reader. It requires explicit GLM geometry: width 4096, intermediate
+width 2048 and 1..8 routed experts, accepting both GLM metadata spellings and
+scalar or array values within these limits. Missing, malformed or incompatible geometry is
+rejected before compilation. Launch validation checks geometry again and matches
+the visible HIP device to the pair's recorded compilation target. These checks
+do not replace the engine's model loader or establish full artifact integrity.
 
 Each successful run produces:
 

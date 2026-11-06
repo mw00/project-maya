@@ -1,5 +1,7 @@
 """Paired installer/launcher regressions: no GPU, compiler, network or model download required."""
 import copy
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,16 +16,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import maya
 import maya_cuda_hip as H
 from serve import models, server
+from gguf_writer import GGUFWriter
 
 
 class CudaHipSetupTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='maya pair ')
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.root = Path(self.tmp.name).resolve()
         self.pack = self.root / 'model pack'; self.pack.mkdir()
         for name in ('index.txt', 'native_experts.txt', 'dense.bin'):
             (self.pack / name).touch()
+        self.write_geometry()
         (self.pack / 'tokenizer').mkdir(); (self.pack / 'tokenizer/vocab.json').write_text('{}')
         self.llama = self.root / 'llama'; (self.llama / 'ggml').mkdir(parents=True)
         (self.llama / 'ggml/CMakeLists.txt').touch()
@@ -36,7 +40,8 @@ class CudaHipSetupTests(unittest.TestCase):
         self.input = self.root / 'maya-glm.json'; self.input.write_text(json.dumps(self.base))
         self.output = self.root / 'maya-glm-cuda-hip.json'
         self.gpu = {'index': 2, 'arch': '120', 'name': 'RTX test', 'driver': '595.0'}
-        self.devices = [{'index': 0, 'name': 'HIP test', 'free_bytes': 4 << 30, 'total_bytes': 4 << 30}]
+        self.devices = [{'index': 0, 'name': 'HIP test', 'arch': 'gfx1151',
+                         'free_bytes': 4 << 30, 'total_bytes': 4 << 30}]
         self.builds = []
         for p in [patch.object(H, 'ROOT', self.root), patch.object(H.platform, 'system', return_value='Linux'),
                   patch.object(H, 'fingerprint', return_value='source-a'),
@@ -50,6 +55,16 @@ class CudaHipSetupTests(unittest.TestCase):
             p.start(); self.addCleanup(p.stop)
         self.args = ['--config', str(self.input), '--hip-device', '1', '--helper-mib', '1024',
                      '--ggml-dir', str(self.llama), '--no-start']
+
+    def write_geometry(self, arch='glm5-next', **changes):
+        values = {'block_count': 46, 'embedding_length': 4096, 'expert_feed_forward_length': [2048] * 46,
+                  'expert_used_count': 8, **changes}
+        writer = GGUFWriter(); writer.add('general.architecture', arch)
+        for key, value in values.items():
+            if value is not None:
+                writer.add(arch + '.' + key, value, 'array:i32' if isinstance(value, list) else None)
+        writer.write(self.pack.parent / 'model.gguf')
+        (self.pack / 'native_experts.txt').write_text('# native experts (absolute offsets in model.gguf, ...)\n')
 
     def fake_build(self, release, *args):
         self.builds.append(release)
@@ -125,6 +140,62 @@ class CudaHipSetupTests(unittest.TestCase):
         with patch.object(maya.S, 'driver_major', return_value=550):
             self.assertEqual(H.main(self.args), 1)
         self.assertEqual(self.builds, [])
+
+    def test_detected_architecture_selects_the_compilation_target(self):
+        self.devices[0]['arch'] = 'gfx1100'
+        with patch.object(H, 'build_pair', side_effect=self.fake_build) as build:
+            cfg = self.install()
+        self.assertEqual(build.call_args.args[4], 'gfx1100')
+        self.assertEqual(json.loads(Path(cfg['cuda_hip']['manifest']).read_text())['hip_arch'], 'gfx1100')
+
+    def test_architecture_mismatch_and_unknown_target_fail_before_check_or_build(self):
+        for arch in ('gfx1100', None, 'gfx1030'):
+            self.devices[0]['arch'] = arch
+            for mode in ([], ['--check']):
+                with self.subTest(arch=arch, mode=mode):
+                    self.assertEqual(H.main([*self.args, '--hip-arch', 'gfx1151', *mode]), 1)
+        self.devices[0]['arch'] = 'gfx1030'
+        self.assertEqual(H.main([*self.args, '--check']), 1)
+        self.assertEqual(self.builds, []); self.assertFalse(self.output.exists())
+
+    def test_valid_geometry_supports_both_metadata_spellings_and_scalar_or_array(self):
+        for arch in ('glm5-next', 'glm5next'):
+            for ff in (2048, [2048] * 46):
+                self.write_geometry(arch, expert_feed_forward_length=ff, expert_used_count=1)
+                self.assertEqual(H.main([*self.args, '--check']), 0)
+        self.assertEqual(self.builds, [])
+
+    def test_unsupported_geometry_fails_before_preflight_or_compilation(self):
+        cases = [{'embedding_length': 8192}, {'expert_feed_forward_length': 4096},
+                 {'expert_feed_forward_length': [2048, 4096]}, {'expert_used_count': 9},
+                 {'expert_used_count': 0}, {'embedding_length': None}, {'embedding_length': True},
+                 {'expert_feed_forward_length': []}, {'expert_used_count': '8'}]
+        for change in cases:
+            self.write_geometry(**change)
+            for mode in ([], ['--check']):
+                with self.subTest(change=change, mode=mode):
+                    self.assertEqual(H.main([*self.args, *mode]), 1)
+        self.assertEqual(self.builds, []); self.assertFalse(self.output.exists())
+
+    def test_unreadable_gguf_and_missing_source_header_fail_preflight(self):
+        gguf = self.pack.parent / 'model.gguf'
+        gguf.write_bytes(b'GGUF')
+        self.assertEqual(H.main([*self.args, '--check']), 1)
+        gguf.unlink()
+        self.assertEqual(H.main([*self.args, '--check']), 1)
+        (self.pack / 'native_experts.txt').write_text('# no source\n')
+        self.assertEqual(H.main([*self.args, '--check']), 1)
+        self.assertEqual(self.builds, [])
+
+    def test_launch_rechecks_model_geometry_and_selected_device_architecture(self):
+        cfg = self.install()
+        self.devices[0]['arch'] = 'gfx1100'
+        with self.assertRaisesRegex(ValueError, 'architecture mismatch'):
+            server.child_env(cfg)
+        self.devices[0]['arch'] = 'gfx1151'
+        self.write_geometry(embedding_length=8192)
+        with self.assertRaisesRegex(ValueError, 'geometry'):
+            H.validate(cfg)
 
     def test_interactive_flow_selects_config_device_and_budget_then_builds(self):
         args = ['--interactive', '--ggml-dir', str(self.llama), '--no-start']
@@ -271,6 +342,44 @@ class BuildPairTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs['env']['CUDA_ARCH'], 'sm_120')
             self.assertEqual(run.call_args.kwargs['env']['HIP_ARCH'], 'gfx1151')
             self.assertEqual((maya.BUILD, maya.EXE, maya.STAMP), before)
+
+
+class HipArchitectureTests(unittest.TestCase):
+    def test_pci_identity_matches_topology_even_when_ordinals_differ(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); nodes = root / 'nodes'; drm = root / 'drm'
+            for n, minor, pci, version in ((7, 129, '0000:c6:00.0', 110501),
+                                            (1, 128, '0000:03:00.0', 110000)):
+                node = nodes / str(n); node.mkdir(parents=True)
+                node.joinpath('properties').write_text(f'gfx_target_version {version}\ndrm_render_minor {minor}\n')
+                device = root / pci; device.mkdir()
+                render = drm / f'renderD{minor}'; render.mkdir(parents=True)
+                render.joinpath('device').symlink_to(device, target_is_directory=True)
+            self.assertEqual(H.hip_architecture('00000000:C6:00.0', nodes, drm), 'gfx1151')
+            self.assertEqual(H.hip_architecture('0000:03:00.0', nodes, drm), 'gfx1100')
+            with self.assertRaisesRegex(ValueError, 'Cannot establish'):
+                H.hip_architecture('0000:04:00.0', nodes, drm)
+            (nodes / '7/properties').write_text('gfx_target_version broken\n')
+            with self.assertRaises(ValueError):
+                H.hip_architecture('0000:c6:00.0', nodes, drm)
+
+    def test_probe_queries_each_runtime_devices_pci_identity(self):
+        class Hip:
+            def hipInit(self, flags): return 0
+            def hipGetDeviceCount(self, count): count._obj.value = 2; return 0
+            def hipSetDevice(self, index): return 0
+            def hipDeviceGetName(self, name, size, index): name.value = b'GPU'; return 0
+            def hipDeviceGetPCIBusId(self, name, size, index):
+                name.value = [b'0000:c6:00.0', b'0000:03:00.0'][index]; return 0
+            def hipMemGetInfo(self, free, total):
+                free._obj.value = 1024; total._obj.value = 2048; return 0
+        with patch('ctypes.CDLL', return_value=Hip()), patch('ctypes.util.find_library', return_value='hip'), \
+                patch.dict(os.environ, {'HSA_OVERRIDE_GFX_VERSION': ''}), \
+                patch.object(H, 'hip_architecture', side_effect=['gfx1151', 'gfx1100']) as arch, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            H.probe()
+        self.assertEqual([c.args[0] for c in arch.call_args_list], ['0000:c6:00.0', '0000:03:00.0'])
+        self.assertEqual([d['arch'] for d in json.loads(output.getvalue())], ['gfx1151', 'gfx1100'])
 
 
 class DependencyShellTests(unittest.TestCase):
