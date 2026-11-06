@@ -4063,6 +4063,57 @@ class Service:
             c[{loop_guard.PENALTY: "penalised", loop_guard.CLOSE_THINKING: "thinking_closed",
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
+    def preread_ids(self, messages, tools, kw, answer: str) -> list[int]:
+        """MAYA_DS4_PREREAD: the prompt this chat's next turn starts with, up to and with its <｜User｜> token, when the
+        client sends the answer back without its reasoning (Open WebUI does).  [] when it cannot be said."""
+        if self.ds_user_id is None:
+            return []
+        kwargs = {k: v for k, v in kw.items() if not k.startswith("_")}
+        if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
+            kwargs = {**kwargs, **deepseek_effort_kwargs(self.default_effort)}
+        ids = self.render_ids(list(messages) + [{"role": "assistant", "content": answer},
+                                                {"role": "user", "content": "\u2063"}], tools, kwargs)
+        for i in range(len(ids) - 1, -1, -1):
+            if ids[i] == self.ds_user_id:
+                return ids[:i + 1]
+        return []
+
+    def preread(self, messages, tools, kw, answer: str, delay: float = 0.1):
+        """MAYA_DS4_PREREAD=1: after a thinking answer, read the next turn's start while nobody waits.  A client that
+        sends the answer back without its reasoning makes the next prompt part from this one's end where the reasoning
+        was, so that prompt reads the whole answer again with the user watching; read ahead, it reads only its own
+        tokens.  A request that comes meanwhile stops it at once, and then reads what it would have read anyway."""
+        def work():
+            time.sleep(delay)
+            t0 = time.time()
+            try:
+                ids = self.preread_ids(messages, tools, kw, answer)
+            except Exception as e:  # noqa: BLE001 - an optimisation: nothing depends on it
+                print(f"[maya] pre-read: not done ({e})", flush=True)
+                return
+            if len(ids) < 2 or len(ids) >= self.engine.max_context - CTX_SLACK or not self.fifo.acquire(blocking=False):
+                return
+            stopped = False
+            try:
+                if not self.engine.alive():
+                    return
+                cancel = threading.Event()
+                gen = self.engine.generate(ids, 1, {}, cancel)   # (one token: sampled from the read's last row, never fed)
+                try:
+                    for _ in gen:
+                        if self.fifo.waiting() or self.stopping:
+                            stopped = True
+                            break
+                finally:
+                    gen.close()                                  # (STOP and drain to DONE, still holding the FIFO)
+                print(f"[maya] pre-read: {len(ids)} tokens, {'stopped by a request' if stopped else 'done'} "
+                      f"after {time.time() - t0:.1f} s", flush=True)
+            except (EngineDied, ValueError, OSError) as e:
+                print(f"[maya] pre-read: {e}", flush=True)
+            finally:
+                self.fifo.release()
+        threading.Thread(target=work, daemon=True, name="pre-read").start()
+
     def _sliced(self, ids, max_new, sampling, cancel, emb, hold, stat, guard=None) -> Iterator[int | None]:
         """engine.generate(), in fair slices (MAYA_FAIR_SLICE_S): once this answer has been decoding that long and
         another request waits for the engine, the engine stops here, the FIFO goes to the next request and this one
@@ -4726,6 +4777,10 @@ class Service:
         for ev in with_lp(parser.finish(), was):
             yield "event", ev
         self._say_malformed(parser)
+        pre = (sampling or {}).get("_preread")
+        if pre and finish == "stop" and not called and not sent_call and said and thinking and not emb \
+                and not cancel.is_set() and not self.stopping:
+            self.preread(*pre, "".join(said))
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
@@ -6554,6 +6609,9 @@ def make_handler(svc: Service):
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
+            if os.environ.get(maya_names.read_as("MAYA_DS4_PREREAD")) == "1" and getattr(svc.template, "deepseek", False) \
+                    and not use_mcp:
+                req = {**req, "_preread": (messages, tools, kw)}   # (Service.preread, after the answer)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)
@@ -6706,7 +6764,7 @@ SERVER_ENV = ("MAYA_ENGINE_STALL_S", "MAYA_REQUEST_QUIET_S", "MAYA_DRAIN_S", "MA
               "MAYA_MAX_BODY_MIB", "MAYA_FAIR_SLICE_S", "MAYA_DS4_KEEP_THINKING",
               "MAYA_SERVER_LOG", "MAYA_GLM_THINK_RESERVE", "MAYA_LOOP_GUARD", "MAYA_QUEUE_PING_S",
               "MAYA_UPDATE_CHECK", "MAYA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
-    tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
+    tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL", "MAYA_DS4_PREREAD"))
 
 
 def apply_server_env(cfg: dict) -> None:
