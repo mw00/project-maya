@@ -1,4 +1,5 @@
-"""The thinking budget: GLM's default 8192 (others 32768, a user's value kept) and the dashboard's field (live + saved)."""
+"""The thinking budget: GLM's default 8192 (others 32768, a user's value kept), the dashboard's field (live + saved)
+and a request's own."""
 import json
 import sys
 import tempfile
@@ -14,6 +15,24 @@ import server  # noqa: E402
 GLM = {"exe": "x/maya", "args": ["--glm-pack", "p"], "installer": {"quant": "Maya-XS-IQ1_S"}}
 GLM_S24 = {"exe": "x/maya", "args": ["--glm-pack", "p"], "installer": {"quant": "Maya-S24"}}
 DS = {"exe": "x/maya-ds4", "args": ["--pack", "p"]}
+
+
+class PerRequest(unittest.TestCase):
+    def test_checked_as_the_dashboard_checks_it(self):
+        for value, want in ((8192, 8192), ("8192", 8192), (8192.0, 8192), (0, 0)):
+            req = {"thinking_budget": value}
+            server.check_request_sampling(req)
+            self.assertEqual(req["thinking_budget"], want)
+        for bad in (100, 262145, -1, 1.5, "lots", True):
+            with self.assertRaises(ValueError, msg=repr(bad)) as e:
+                server.check_request_sampling({"thinking_budget": bad})
+            self.assertIn("thinking_budget", str(e.exception))
+
+    def test_the_request_wins_for_itself(self):
+        self.assertEqual(server.request_think_budget(3000, {"thinking_budget": 8192}), 8192)
+        self.assertEqual(server.request_think_budget(3000, {"thinking_budget": 0}), 0)
+        self.assertEqual(server.request_think_budget(3000, {"temperature": 1.0}), 3000)
+        self.assertEqual(server.request_think_budget(3000, None), 3000)
 
 
 class Default(unittest.TestCase):
