@@ -31,9 +31,8 @@ a:hover { color: var(--st-ink); }
 .gauge { width: 18px; height: 18px; flex: none; stroke-width: 1.75; color: var(--st-accent-text); }
 .gauge path:last-child { transition: transform 220ms var(--st-ease); }
 
-/* the Maya mark (the gradient's one place) and a model's logo */
-.maya-mark { display: inline-grid; place-items: center; flex: none; border-radius: 8px; color: #fff;
-             background: linear-gradient(135deg, #8b7cff, #38bdf8); }
+/* the Maya logo and a model's logo */
+.maya-mark { display: block; flex: none; border-radius: 8px; object-fit: cover; }
 .model-logo { display: inline-grid; place-items: center; flex: none; border-radius: 9px; background: var(--st-surface-2); color: var(--st-ink); }
 .model-logo img { display: block; }
 [data-theme="dark"] .model-logo img.is-mono, :root:not([data-theme="light"]) .model-logo img.is-mono { filter: invert(1); }
