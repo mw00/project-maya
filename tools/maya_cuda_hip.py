@@ -192,6 +192,55 @@ def build_pair(release, gpu, nvcc, hipcc, arch, llama):
     return list(dict.fromkeys([*meta.get('lib_dirs', []), str(Path(hipcc).resolve().parent.parent / 'lib')]))
 
 
+def interactive_config():
+    """Reuse upstream model preparation, rather than a second download/pack wizard."""
+    def configs():
+        found = []
+        for p in sorted(ROOT.glob('maya-*.json')):
+            try:
+                check_config(json.loads(p.read_text()))
+                found.append(p)
+            except (OSError, ValueError, TypeError):
+                continue
+        return found
+    found = configs()
+    if not found:
+        print('No CUDA GLM config found. Starting normal Maya model setup; choose a native GGUF GLM model.')
+        subprocess.run([str(ROOT / 'maya.sh'), '--backend', 'cuda', '--setup', '--plain', '--no-start',
+                        '--no-speed-calibration'], cwd=ROOT, check=True)
+        found = configs()
+    for i, p in enumerate(found, 1):
+        print(f'  {i}. {p.name}')
+    answer = input('GLM configuration number or JSON path: ').strip()
+    if answer.isdecimal() and 1 <= int(answer) <= len(found):
+        return found[int(answer) - 1]
+    if not answer:
+        raise ValueError('Select a GLM configuration or provide its JSON path.')
+    return Path(answer)
+
+
+def toolchains(a, gpu):
+    import maya as M
+    nvcc, version = M.find_nvcc([int(gpu['arch'])], a.nvcc)
+    lo, hi = M.nvcc_range([int(gpu['arch'])])
+    if not nvcc or not version or version < lo or (hi and version >= hi):
+        raise ValueError('A compatible CUDA toolkit is required: ' + M.toolkit_hint([int(gpu['arch'])]))
+    nvcc = shutil.which(nvcc)
+    if not nvcc:
+        raise ValueError('The selected CUDA compiler is not executable.')
+    if M.S.driver_major(gpu) < (580 if version >= (13, 0) else 525):
+        raise ValueError('The NVIDIA driver is too old for the selected CUDA toolkit. Update the driver '
+                         'and reboot before setup; --install-deps installs build tools only.')
+    candidates = [a.hipcc] if a.hipcc else [
+        'hipcc', str(Path(os.environ.get('ROCM_PATH', '/opt/rocm')) / 'bin/hipcc'),
+        *[str(p / 'bin/hipcc') for p in sorted(Path('/opt').glob('rocm-*'), reverse=True)]]
+    hipcc = next((p for c in candidates if (p := shutil.which(c))), None)
+    if not hipcc or M.tool_version(hipcc) < (7, 0) or not shutil.which('g++') or M.pick_cmake() is None:
+        raise ValueError('HIP 7+ hipcc, g++ and CMake 3.24+ are required. On Ubuntu 26.04, rerun '
+                         './setup-cuda-hip.sh with --install-deps; otherwise use --hipcc or ROCM_PATH.')
+    return nvcc, hipcc
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description='Set up an experimental CUDA primary + HIP GLM expert helper. '
                                  'Start with an existing CUDA GLM config; normal builds/configs are preserved.')
@@ -201,8 +250,13 @@ def main(argv=None):
     ap.add_argument('--cuda-device', type=int, help='NVIDIA index (default: the input config\'s single GPU)')
     ap.add_argument('--hip-arch', default='gfx1151', help='helper compilation target (default: tested gfx1151)')
     ap.add_argument('--prefill-share', type=float, default=0.25, help='helper row admission cap, 0..0.49 (default .25)')
-    ap.add_argument('--nvcc', default=os.environ.get('NVCC', '/usr/local/cuda/bin/nvcc'))
-    ap.add_argument('--hipcc', default=os.environ.get('HIPCC', 'hipcc'))
+    ap.add_argument('--nvcc', default=os.environ.get('NVCC'), help='CUDA compiler; otherwise use Maya discovery')
+    ap.add_argument('--hipcc', default=os.environ.get('HIPCC'), help='HIP compiler; otherwise PATH/ROCM_PATH')
+    ap.add_argument('--interactive', action='store_true', help='prompt for missing configuration/device/budget')
+    ap.add_argument('--install-deps', action='store_true', help='Ubuntu 26.04 build packages via the shell wrapper, '
+                    'then Python/CMake/Ninja in .venv; never changes GPU drivers')
+    ap.add_argument('--deps-plan', action='store_true', help='show missing Ubuntu packages without installing (shell wrapper)')
+    ap.add_argument('--yes', action='store_true', help='accept dependency installation; still requires device/budget choices')
     ap.add_argument('--ggml-dir', type=Path, help='existing pinned llama.cpp checkout; otherwise use Maya\'s downloader')
     ap.add_argument('--list-devices', action='store_true', help='list NVIDIA indices and HIP runtime ordinals')
     ap.add_argument('--check', action='store_true', help='validate config, tools and device memory without building')
@@ -212,6 +266,16 @@ def main(argv=None):
         if platform.system() != 'Linux':
             raise ValueError('CUDA+HIP setup currently supports Linux only.')
         import maya as M
+        if a.deps_plan:
+            raise ValueError('Use ./setup-cuda-hip.sh --deps-plan for the package preview.')
+        if a.interactive and not sys.stdin.isatty():
+            raise ValueError('Interactive setup needs a terminal; pass --config, --hip-device and --helper-mib instead.')
+        # --check / --list-devices stay read-only. The shell installs OS packages
+        # before creating .venv; reuse upstream for all Python dependencies.
+        if a.install_deps and not (a.check or a.list_devices):
+            if sys.prefix == sys.base_prefix:
+                raise ValueError('Use ./setup-cuda-hip.sh so Python packages stay inside Maya\'s .venv.')
+            M.S.pip_install(M.PY_PACKAGES, 'Maya Python and build tools')
         gpus = M.S.gpus()
         if a.list_devices:
             for g in gpus:
@@ -220,6 +284,16 @@ def main(argv=None):
                 print(f"HIP {g['index']}: {g['name']}, {g['free_bytes'] / 2**30:.1f} GiB free / "
                       f"{g['total_bytes'] / 2**30:.1f} GiB total (runtime allocation limit; UMA shares RAM)")
             return 0
+        if a.interactive and not a.check:
+            if a.config is None:
+                a.config = interactive_config()
+            if a.hip_device is None or a.helper_mib is None:
+                for d in hip_devices(clean_visibility(os.environ)):
+                    print(f"HIP {d['index']}: {d['name']}, {d['free_bytes'] // 1048576} MiB free (shared UMA)")
+            if a.hip_device is None:
+                a.hip_device = int(input('HIP helper device index: '))
+            if a.helper_mib is None:
+                a.helper_mib = int(input('HIP helper budget in MiB (leave room for scratch and other workloads): '))
         if a.config is None or a.hip_device is None or a.helper_mib is None:
             ap.error('--config, --hip-device and --helper-mib are required (or use --list-devices)')
         if a.hip_device < 0 or not 0 <= a.prefill_share <= 0.49 or not re.fullmatch(r'gfx[0-9a-f]+', a.hip_arch):
@@ -242,9 +316,7 @@ def main(argv=None):
             raise ValueError('A native GGUF GLM pack is required; EXL3 and unpacked GGUF files are unsupported.')
         if not (cwd / base.get('tokenizer', '') / 'vocab.json').is_file():
             raise ValueError('The input config\'s tokenizer/vocab.json is missing.')
-        nvcc, hipcc = shutil.which(a.nvcc), shutil.which(a.hipcc)
-        if not nvcc or not hipcc or M.pick_cmake() is None:
-            raise ValueError('CUDA nvcc, HIP hipcc and CMake 3.24+ are required. Use --nvcc/--hipcc or add them to PATH.')
+        nvcc, hipcc = toolchains(a, gpu)
         env = dict(clean_visibility(os.environ), HIP_VISIBLE_DEVICES=str(a.hip_device))
         devices = hip_devices(env); check_budget(devices, a.helper_mib)
         print(f"CUDA primary: {gpu['name']} (index {device}); HIP helper: {devices[0]['name']} "
@@ -289,7 +361,7 @@ def main(argv=None):
         print('Benchmark:', shlex.join([str(launcher), '--bench']))
         print('After source updates, rerun setup to rebuild both components together.')
         return 0 if a.no_start else subprocess.call([str(launcher)])
-    except (OSError, ValueError, KeyError, IndexError, TypeError, subprocess.SubprocessError) as e:
+    except (OSError, ValueError, KeyError, IndexError, TypeError, EOFError, subprocess.SubprocessError) as e:
         print('CUDA+HIP setup: ' + str(e), file=sys.stderr)
         return 1
 

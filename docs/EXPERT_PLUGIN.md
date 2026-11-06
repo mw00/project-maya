@@ -16,8 +16,48 @@ they do not silently switch to another backend.
 
 The normal installer already separates CUDA (`build/`) and HIP (`build-hip/`)
 engines. A CUDA+HIP configuration needs a CUDA engine plus the external HIP
-executor, not two full engines. On Linux, first use normal Maya setup to prepare
-a CUDA GLM model and its Python dependencies:
+executor, not two full engines. On **Ubuntu 26.04 x86_64**, start the guided flow
+with one command from a terminal:
+
+```sh
+./setup-cuda-hip.sh
+```
+
+It offers to install missing Ubuntu build packages (`sudo` may ask for your
+password), creates Maya's private Python environment, installs Python/CMake/Ninja
+dependencies through Maya's existing helper, and asks for a CUDA GLM config,
+HIP device and memory budget. If no config exists, it invokes normal Maya model
+setup first; choose a native GGUF GLM model. That first model preparation also
+creates the ordinary CUDA build; the paired setup then builds its isolated copy.
+Model downloads retain Maya's normal confirmation. Existing models are reused.
+It builds the CUDA engine, HIP executor and CUDA comparison executor sequentially,
+then generates the paired config/launcher and starts the dashboard.
+
+Preview missing system packages without installing anything:
+
+```sh
+./setup-cuda-hip.sh --deps-plan
+```
+
+For a scripted installation with an existing model config:
+
+```sh
+./setup-cuda-hip.sh --install-deps --yes --config maya-my-glm.json \
+    --hip-device 0 --helper-mib 90112 --no-start
+```
+
+`--yes` accepts dependency installation, not sudo authentication or model
+downloads. Automatic system dependencies are limited to Ubuntu 26.04 x86_64:
+`build-essential`, Python/venv, Git, pkg-config, CMake, Ninja,
+`cuda-toolkit-13-1`, `hipcc` and `libamdhip64-dev`. Already installed packages
+are preserved. The configured Ubuntu repositories must provide these packages;
+the script does not add repositories or install/update GPU drivers. Working
+NVIDIA and AMD drivers, device permissions and any required reboot come first.
+A package plan that removes packages or changes graphics drivers stops before
+installation. Other Linux systems can use preinstalled tools and omit
+`--install-deps`; `--interactive` enables prompts independently.
+
+The original explicit workflow remains available:
 
 ```sh
 ./maya.sh --backend cuda --setup --no-start
@@ -26,15 +66,19 @@ a CUDA GLM model and its Python dependencies:
 ```
 
 Replace `maya-my-glm.json` with the configuration printed by normal setup.
-The example budget requires the tested 96 GiB UMA allocation; it will be rejected
-on a 4 GiB allocation. Stop other GPU workloads and choose a budget within the
-helper's actual free memory. `--list-devices` shows NVIDIA indices separately
+The example budget requires enough HIP runtime memory (the performance fixture
+used 96 GiB UMA). BIOS reservation alone does not determine HIP's allocation
+limit: our current 4 GiB BIOS setup reports about 59.6 GiB to HIP, still too little
+for this 90112 MiB example. Stop other GPU workloads and choose a budget within
+the helper's actual free memory. `--list-devices` shows NVIDIA indices separately
 from **HIP runtime ordinals**; `--hip-device` uses the latter, without inherited
 HIP/ROCR visibility filters. The primary defaults to the input config's one CUDA
 GPU; `--cuda-device` explicitly changes it.
 
 The paired installer reuses Maya's CUDA compiler setup and the executor builder.
-It requires CUDA `nvcc`, ROCm `hipcc`, and CMake 3.24+. It uses the existing pinned
+It requires compatible CUDA `nvcc`, ROCm 7+ `hipcc`, g++ and CMake 3.24+.
+Compiler discovery reuses Maya's CUDA version selection and finds HIP through
+PATH, `ROCM_PATH` or `/opt/rocm`. It uses the existing pinned
 llama.cpp checkout, downloading it through Maya's normal helper if missing.
 `--ggml-dir` can name an existing checkout at the installer's pinned revision.
 `--nvcc`, `--hipcc` and `--hip-arch` override toolchain discovery; the default HIP
