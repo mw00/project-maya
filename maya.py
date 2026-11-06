@@ -81,6 +81,7 @@ import setup as S  # noqa: E402  Strata's installer: PC checks, pip, llama.cpp, 
 from setup import ask, fail, ok, run, say, step, warn  # noqa: E402
 import maya_import as MI  # noqa: E402  --import-model: model files downloaded some other way, found by size + sha256
 import maya_names as N  # noqa: E402  the settings' names users see (MAYA_*) and the older ones the code reads
+import maya_cuda_hip as CH  # noqa: E402  optional paired CUDA engine / HIP expert setup
 import maya_quants as Q  # noqa: E402  the quants' names users see (MiniMax M3.1 · Maya-XS) and the older ones as aliases
 import calibrate_glm as CAL  # noqa: E402  the CPU lane's tuning for this PC (./maya.sh --calibrate)
 import calibrate_ds4_tp as CAL4  # noqa: E402  DeepSeek's: --tp and the CPU threads (./maya.sh --calibrate)
@@ -2220,6 +2221,12 @@ def refresh_engine(cfg: dict) -> None:
     """At a start: the engine's source changed since it was compiled (a git pull) - compile what changed.  Also when
     the stamp has this source but not this target: another model's start compiled only its own engine after the pull
     (the targets share one stamp), so this one is still the old build."""
+    if cfg.get("cuda_hip"):
+        try:
+            CH.validate(cfg)
+        except ValueError as e:
+            fail(str(e))
+        return  # paired setup rebuilds both components; never refresh only the CUDA half
     meta = read_json(STAMP)
     exe = Path(cfg["exe"]).resolve()
     target = "maya-ds4" if exe == DS4_EXE.resolve() else "maya-mm3" if exe == MM3_EXE.resolve() else "maya"
@@ -3747,6 +3754,9 @@ def calibrate_config(cfg_path: Path) -> bool:
     """Tune the CPU lane on this PC (tools/calibrate_glm.py): the result goes into the config's env and into
     CAL_STORE for this PC, model and context (a setup again applies it)."""
     cfg = read_json(cfg_path)
+    if cfg.get("cuda_hip"):
+        warn("CUDA+HIP uses the expert helper; CPU-lane calibration does not apply. Use --bench to measure it.")
+        return False
     if config_family(cfg) == "deepseek":
         return calibrate_ds4_config(cfg_path)
     if config_family(cfg) == "minimax":   # (maya-mm3 sizes its CPU lane by this PC's cores and its pools by its memory:
@@ -3908,6 +3918,8 @@ def needs_speed_calibration(cfg: dict) -> bool:
     """A config that drafts with DFlash2 but has no speed calibration yet (set up before there was one, or its
     calibration could not run then - the GPUs were busy): its next start measures first.  Not with --parallel above 1:
     the engine then decodes without the drafter."""
+    if cfg.get("cuda_hip"):
+        return False  # preserve the user's drafter choice; --speed-calibration remains explicit
     args = cfg.get("args") or []
     if cfg.get("backend") == "metal":                  # (CUDA's measurement: on a Mac MTP or DFlash2 is the user's choice)
         return False
@@ -4526,6 +4538,9 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
     select_build_backend(backend)
     stamp = read_json(STAMP)
 
+    if cfg.get("cuda_hip"):
+        stamp = read_json(Path(cfg["exe"]).parent / "MAYA-BUILD.json")
+
     def add(title, text=""):
         lines.append(f"## {title}")
         lines.extend(str(text).rstrip().replace(home, "~").splitlines() or ["(nothing)"])
@@ -4536,6 +4551,8 @@ def report(version: str, backend: str | None = None, cfg_path: Path | None = Non
                 f"{sys.platform}{' (WSL)' if S.is_wsl() else ''}")
     import platform
     add("System", f"{platform.platform()}")
+    if cfg.get("cuda_hip"):
+        add("CUDA+HIP expert helper", CH.description(cfg))
     if backend == "hip":
         rocm = Path((cfg.get("env") or {}).get("ROCM_PATH") or os.environ.get("ROCM_PATH")
                     or stamp.get("rocm") or "/opt/rocm").expanduser().resolve()
@@ -4757,6 +4774,8 @@ def bench(cfg_path: Path, version: str) -> int:
         found = [by_index[i] for i in SV.gpu_list(cfg) if i in by_index]
     gpus = ", ".join(f"{g['name']} {g['vram_gb']:.0f} GB" for g in found) or (
         "the Apple GPU (Metal)" if cfg.get("backend") == "metal" else "?")
+    if cfg.get("cuda_hip"):
+        gpus += "; " + CH.description(cfg)
     total, _ = mem_gb()
     lines = [f"Project Maya v{version} benchmark, {time.strftime('%Y-%m-%d %H:%M')}",
              f"GPUs: {gpus}; RAM {total:.0f} GB; CPU {S.cpu_info()[0]}",
@@ -6992,6 +7011,8 @@ def model_option(a) -> str | None:
 def main() -> int:
     N.alias_env(os.environ)   # (MAYA_* settings under the names the code and the engines read, for all it starts)
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
+    if "--setup-cuda-hip" in sys.argv[1:]:
+        return CH.main([a for a in sys.argv[1:] if a != "--setup-cuda-hip"])
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["cuda", "hip", "metal"],
                     help="GPU backend (HIP: gfx1100/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "

@@ -12,7 +12,83 @@ other model shapes are unsupported by this adapter. Unset the plugin to retain
 Maya's existing execution path. Unsupported plugin configurations report errors;
 they do not silently switch to another backend.
 
-## Build
+## Paired setup and launcher
+
+The normal installer already separates CUDA (`build/`) and HIP (`build-hip/`)
+engines. A CUDA+HIP configuration needs a CUDA engine plus the external HIP
+executor, not two full engines. On Linux, first use normal Maya setup to prepare
+a CUDA GLM model and its Python dependencies:
+
+```sh
+./maya.sh --backend cuda --setup --no-start
+./setup-cuda-hip.sh --list-devices
+./setup-cuda-hip.sh --config maya-my-glm.json --hip-device 0 --helper-mib 90112
+```
+
+Replace `maya-my-glm.json` with the configuration printed by normal setup.
+The example budget requires the tested 96 GiB UMA allocation; it will be rejected
+on a 4 GiB allocation. Stop other GPU workloads and choose a budget within the
+helper's actual free memory. `--list-devices` shows NVIDIA indices separately
+from **HIP runtime ordinals**; `--hip-device` uses the latter, without inherited
+HIP/ROCR visibility filters. The primary defaults to the input config's one CUDA
+GPU; `--cuda-device` explicitly changes it.
+
+The paired installer reuses Maya's CUDA compiler setup and the executor builder.
+It requires CUDA `nvcc`, ROCm `hipcc`, and CMake 3.24+. It uses the existing pinned
+llama.cpp checkout, downloading it through Maya's normal helper if missing.
+`--ggml-dir` can name an existing checkout at the installer's pinned revision.
+`--nvcc`, `--hipcc` and `--hip-arch` override toolchain discovery; the default HIP
+target is the tested `gfx1151`, and other hardware remains unqualified.
+
+Each successful run produces:
+
+- `build-cuda-hip/pair-*/engine/maya` and its own CMake cache/build stamp;
+- separately named HIP/CUDA executor objects and libraries under that pair's
+  `modules/` directory, plus a source/artifact identity manifest;
+- `maya-<model>-cuda-hip.json` and `run-maya-<model>-cuda-hip.sh` beside `maya.sh`.
+
+Ordinary builds/configurations and previous pairs are preserved. A failed build
+never replaces the existing paired configuration. Configuration publication is
+atomic; running processes keep their old immutable pair. Old pair directories
+are retained for rollback; remove an unused one only after its processes stop.
+The production and diagnostic module builds should still use different output
+directories when running the low-level builder manually.
+
+Setup starts the normal Maya dashboard after success. `--no-start` only builds
+and writes the configuration; `--check` validates the input, tools and available
+HIP memory without building or changing files. The generated launcher supports
+normal Maya arguments, including `--bench` and `--report`:
+
+```sh
+./run-maya-my-glm-cuda-hip.sh
+./run-maya-my-glm-cuda-hip.sh --bench
+./run-maya-my-glm-cuda-hip.sh --report
+```
+
+The new config retains model/drafter, sampling and serving choices. It selects
+GPU-only expert computation, helper readback, mapped buffers, up to 64 admitted
+rows per expert, and 32 prestaged experts; `--prefill-share` defaults to the tested
+0.25 row cap and accepts 0..0.49. Set it to zero for CUDA-only prefill and dual-device
+decode. The primary CUDA pool keeps its existing settings and native auto-sizing
+when the input config uses `--expert-cache auto`. These are fixture defaults,
+not a claim that this split is optimal for every GPU pair.
+
+The Models page labels the configuration **CUDA + HIP**; its GPU selector still
+refers to the CUDA primary. Change device assignments through paired setup. The
+launcher and server verify the source, executable and helper identities, then
+check visible HIP memory before starting the model. Switching models rejects a
+stale pair before stopping the current model. Reports identify the HIP helper
+budget separately; UMA is shared physical RAM, not additional system memory.
+The existing live GPU monitor still charts the primary CUDA GPU only.
+
+After pulling source updates, rerun `setup-cuda-hip.sh` to rebuild the matched
+pair. Ordinary engine refresh cannot replace just its CUDA half. Automatic
+CPU-lane and drafter calibration is skipped for this configuration; explicit
+`--speed-calibration` can measure the retained drafter choice. The generated
+workflow currently supports one CUDA primary and one conversation; unsupported
+model families, layer splitting and parallel settings are rejected.
+
+## Manual build
 
 Build Maya normally with its CUDA backend. Build the executor separately from the
 same source tree with both CUDA and HIP toolchains installed:
