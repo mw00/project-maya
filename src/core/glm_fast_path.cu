@@ -7397,16 +7397,10 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         last_tok_ = y;
         return true;
     };
-    // a draft that is no token id (the argmax found no finite logit: 0x7fffffff) went on into spec_head's embedding
-    // lookup, far past the table: the position is drafted with the confirmed token instead - a wrong draft the tail
-    // rejects as any other, so the answer is unchanged - and it is said once.  A real id passes through untouched.
+    // a draft that is no token id would go on into spec_head's embedding lookup past the table's end: the confirmed
+    // token in its place (glmfast::draft_id - a real id passes through untouched)
     const auto draft_ok = [&](int d, int32_t next) -> int {
-        if (d >= 0 && d < (int) g.n_vocab) return d;
-        static std::atomic<bool> said{false};
-        if (!said.exchange(true))
-            std::fprintf(stderr, "glm spec: the NextN block's draft is no token (%d: its logits are not finite) - drafting "
-                                 "on with the confirmed token in its place (said once)\n", d);
-        return next;
+        return glmfast::draft_id(d, next, g.n_vocab, "glm spec");
     };
     const auto draft = [&](int64_t p, int32_t next, int& d) -> bool {
         cudaSetDevice(TL->dev_);
@@ -7570,6 +7564,7 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
             ok = false;
         }
     }
+    if (ok) glmfast::argmax_nonfinite_note(TL->dev_, "glm spec");   // (the drafts' and the tail's picks; said once)
     cudaSetDevice(dev_);
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pos_ = TL->pos_;
     // the head's recurrent states back to the tail's position (the backup after q+1): the whole model then stands at

@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -49,6 +50,32 @@ inline bool wait_event(cudaEvent_t ev, const char* what, std::string& err) {
 }
 
 namespace gf = strata::kernels::glmf;
+
+// #860: a draft id the host reads back (the NextN block's pick) that is no token id: the confirmed token in its place -
+// a wrong draft the verify rejects like any other, so the answer is unchanged - said once a process.  A real id passes
+// through untouched (nothing on the device, no sync).
+inline int32_t draft_id(int32_t d, int32_t fallback, int64_t n_vocab, const char* who) {
+    if (d >= 0 && (int64_t) d < n_vocab) return d;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "%s: a draft is no token id (%d: its logits are not finite?) - drafting on with the confirmed "
+                             "token in its place (said once)\n", who, (int) d);
+    return fallback;
+}
+// ... and at a drafting decode's end, its devices idle (a synchronous read - never per token): the argmax picks on
+// device `dev` that found no finite logit (gf::argmax_nonfinite: they took token 0), said once a process
+inline void argmax_nonfinite_note(int dev, const char* who) {
+    static std::atomic<bool> said{false};
+    if (said.load(std::memory_order_relaxed)) return;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    cudaSetDevice(dev);
+    const unsigned n = gf::argmax_nonfinite();
+    cudaSetDevice(cur);
+    if (n > 0 && !said.exchange(true))
+        std::fprintf(stderr, "%s: CUDA%d %u argmax pick(s) found no finite logit and took token 0 instead - the model's "
+                             "state holds non-finite values (said once)\n", who, dev, n);
+}
 
 inline void cpu_relax() {
 #if defined(__x86_64__) && !defined(_WIN32)

@@ -1086,8 +1086,10 @@ bool Glm5Model::mtpw_draft_queue(const int* seqs, const int* keep, int n, const 
         if (!glmfast::wait_event(M->ev_draft, "glm multi mtp drafts", err) || !F->route_ok(err)) return false;
         for (int c = 0; c < n; ++c)
             if (M->d_n[(size_t) c] > j) {
-                M->d_tok[(size_t) c] = F->mtp_tok_h[c];
-                M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] = F->mtp_tok_h[c];
+                // (a draft that is no token id: the token before it in its place - glmfast::draft_id, #860)
+                M->d_tok[(size_t) c] = glmfast::draft_id(F->mtp_tok_h[c], M->d_tok[(size_t) c], g_.n_vocab,
+                                                         "glm multi mtp");
+                M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] = M->d_tok[(size_t) c];
             }
     }
     const cudaError_t e = cudaGetLastError();
@@ -1110,7 +1112,9 @@ bool Glm5Model::mtpw_draft_take(int32_t* out, std::string& err) {
         if (!glmfast::wait_event(M->ev_draft, "glm multi mtp drafts", err) || !F->route_ok(err)) return false;
         const int j = M->d_max - 1;
         for (int c = 0; c < M->d_n_ctx; ++c)
-            if (M->d_n[(size_t) c] > j) M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] = F->mtp_tok_h[c];
+            if (M->d_n[(size_t) c] > j)
+                M->d_out[(size_t) c * (size_t) (M->W - 1) + (size_t) j] =
+                    glmfast::draft_id(F->mtp_tok_h[c], M->d_tok[(size_t) c], g_.n_vocab, "glm multi mtp");
     }
     if (gf::launch_errors() > 0) {
         err = "glm multi mtp: " + std::to_string(gf::launch_errors()) + " kernel launch(es) failed (see stderr)";

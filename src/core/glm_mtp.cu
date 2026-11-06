@@ -629,7 +629,9 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                     cudaEventRecord(F->ev_mtp, F->cs);
                     ok = glmfast::wait_event(F->ev_mtp, "glm mtp drafts", err) && F->route_ok(err);
                 }
-                for (int i = 0; i < n && ok; ++i) win[(size_t) i + 1] = F->mtp_tok_h[i];
+                // (a draft that is no token id: the token before it in its place - glmfast::draft_id, #860)
+                for (int i = 0; i < n && ok; ++i)
+                    win[(size_t) i + 1] = glmfast::draft_id(F->mtp_tok_h[i], win[(size_t) i], g.n_vocab, "glm mtp");
                 if (ok) nd = n;
             } else {
                 int32_t tok = y;
@@ -639,7 +641,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                         ok = false;
                         break;
                     }
-                    tok = F->mtp_tok_h[i];
+                    tok = glmfast::draft_id(F->mtp_tok_h[i], tok, g.n_vocab, "glm mtp");
                     win[(size_t) i + 1] = tok;
                     ++nd;
                 }
@@ -754,6 +756,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             if (ok) err = drain_err;
             ok = false;
         }
+        if (ok) glmfast::argmax_nonfinite_note(dev_, "glm mtp");   // (the drafts' picks that found nothing finite)
     }
     win_prof_report();   // (STRATA_GLM_WIN_PROF: the verify windows' phases)
     if (n_ph > 0)
@@ -874,7 +877,9 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                         ok = glmfast::wait_event(FT->ev_mtp, "glm spec pipe drafts", err) && TL->fast_->route_ok(err);
                     }
                     for (int i = 0; i < n && ok; ++i) {
-                        winv[(size_t) i + 1] = FT->mtp_tok_h[i];
+                        // (a draft that is no token id: the token before it in its place - glmfast::draft_id, #860)
+                        winv[(size_t) i + 1] = glmfast::draft_id(FT->mtp_tok_h[i], i == 0 ? y : winv[(size_t) i],
+                                                                 g.n_vocab, "glm spec pipe");
                         if (!batched_win) ok = win_pipe_push(winv[(size_t) i + 1], err);
                     }
                 } else {
@@ -886,7 +891,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                             ok = false;
                             break;
                         }
-                        tok = FT->mtp_tok_h[i];
+                        tok = glmfast::draft_id(FT->mtp_tok_h[i], tok, g.n_vocab, "glm spec pipe");
                         winv[(size_t) i + 1] = tok;
                         if (!batched_win && !win_pipe_push(tok, err)) {
                             ok = false;
@@ -1035,6 +1040,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                 ok = false;
             }
         }
+        if (ok) glmfast::argmax_nonfinite_note(TL->dev_, "glm spec pipe");   // (the drafts' picks; said once)
         cudaSetDevice(dev_);
     }
     if (rounds > 0 && trace)
