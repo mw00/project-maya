@@ -4524,7 +4524,7 @@ struct Model::Impl {
             }
             if (!halloc(embed_pinned, nv, err)) return false;
             if (f16) {
-                // Our GGUF stores originally BF16 embedding values in F16. Accept only an exact
+                // A pack may store originally BF16 embedding values in F16. Accept only an exact
                 // conversion: never silently round a genuinely higher-precision F16 embedding.
                 std::vector<uint16_t> row((size_t) g.dim);
                 for (size_t r = 0; r < (size_t) g.vocab; ++r) {
