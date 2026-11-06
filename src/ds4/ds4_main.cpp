@@ -1400,6 +1400,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                           (long long) d_acc, (long long) d_off);
             out += b;
         }
+        if (s.ahead_picks > s_dec.ahead_picks) {   // (the lookahead, DS4_AHEAD: its guesses' hits on the picks, the
+                                                   //  guessed experts asked for from the files - a token)
+            std::snprintf(b, sizeof b, " ahead_hit=%.3f ahead_pf=%.3f",
+                          (double) (s.ahead_hit - s_dec.ahead_hit) / (double) (s.ahead_picks - s_dec.ahead_picks),
+                          (double) (s.ahead_pf - s_dec.ahead_pf) / fed);
+            out += b;
+        }
         if (s.skipped > s_dec.skipped) {   // (STRATA_DS4_DISK_SKIP_W: experts left out a token)
             std::snprintf(b, sizeof b, " skipped=%.3f", (double) (s.skipped - s_dec.skipped) / fed);
             out += b;

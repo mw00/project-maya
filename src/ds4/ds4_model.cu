@@ -1715,6 +1715,9 @@ struct Model::Impl {
     int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
+    // DS4_AHEAD_EXL3=1 (opt-in until measured on more PCs): an EXL3 pack read in place (--mmap-experts on) guesses and
+    // asks too - a guessed expert's file region read ahead as a GGUF's three matrices are; off: its layers never guessed
+    bool ahead_exl3 = std::getenv("DS4_AHEAD_EXL3") != nullptr && std::atoi(std::getenv("DS4_AHEAD_EXL3")) != 0;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
                                        // 8 asked for (prefetch)
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
@@ -12333,12 +12336,17 @@ struct Model::Impl {
                (l.helper.empty() || l.helper[(size_t) e] == nullptr);
     }
     // the layer whose picks layer l0 guesses a layers ahead (1, 2): the next ones of its stack on its device, MXFP4
-    // experts read in place, some of them from the files now (none: nothing to read early - null)
+    // experts read in place (or, DS4_AHEAD_EXL3, an EXL3 pack's in place), some of them from the files now (none:
+    // nothing to read early - null)
+    bool ahead_fmt(const Layer& n) const {
+        return n.lay.fmt == gg::kFmtMXFP4 ||
+               (ahead_exl3 && file_experts && n.lay.fmt == 0 && n.region_file.size() >= (size_t) n.n_exp);
+    }
     const Layer* ahead_layer(const Layer& l0, int a) const {
         const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
         if (j >= end || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
-        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
+        if (n.dev != l0.dev || n.mtp != l0.mtp || !ahead_fmt(n) || n.gate_w == nullptr || n.n_exp > 1024 ||
             (int) n.slot.size() < n.n_exp)
             return nullptr;
         for (int e = 0; e < n.n_exp; ++e)
@@ -12381,7 +12389,10 @@ struct Model::Impl {
                         store->guess(j, e);
                         continue;
                     }
-                    for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
+                    if (n.lay.fmt == gg::kFmtMXFP4)
+                        for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
+                    else if (!(e < (int) n.esplit.size() && n.esplit[(size_t) e]))   // (EXL3: its file region; one
+                        pf_want.push_back({file_part(n, e), n.region_bytes[(size_t) e]});   //  across two files: none)
                     ip_note_expert(n, e);   // (the Windows trimmer: prefetched pages enter this process's working set)
                 }
         }

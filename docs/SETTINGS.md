@@ -1072,6 +1072,7 @@ The `DS4_STORE_*` settings go in a config's `"env"`, or as `MAYA_DS4_STORE_*` in
 | `DS4_STORE_SPLIT` | 1 | `0`: a token waits for all its reads, then computes its experts at once |
 | `DS4_STORE_FLOW` | 1 | `0`: a prompt's chunks read every expert from the files, as without the store |
 | `DS4_STORE_AHEAD` | 0 | `1`: the lookahead's guesses for the next layers are read into the store behind every demand read, a guess still queued once the token is past its layer dropped. Off: with the store the guesses are not read at all (never into the page cache) |
+| `DS4_AHEAD_EXL3` | 0 | `1`: an EXL3 pack read in place (`--mmap-experts on`) gets the decode's lookahead too - the next layer's guessed experts that the CPU lane will read from the files are read ahead (each its file region) while this layer computes, as a GGUF's are; the same outputs. Off: an EXL3 pack's experts are read when the CPU lane computes them |
 | `DS4_STORE_UNBUFFERED` | 0 | Windows: `1` reads with `FILE_FLAG_NO_BUFFERING`, a handle a reading thread; Windows' unbuffered reads of a file the engine also maps take a slow path, so measure it first |
 
 Not taken over from the design this follows, as they measured as losses there: filling the store in the background
