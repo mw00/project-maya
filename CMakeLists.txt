@@ -491,7 +491,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the same decoders against exllamav3 itself (tools/exl3_exllamav3_fixture.py's tiles): the same bits
     add_test(NAME exl3_exllamav3 COMMAND exl3_test --exllamav3 ${CMAKE_CURRENT_SOURCE_DIR}/data/exl3-exllamav3)
     set_tests_properties(exl3_exllamav3 PROPERTIES TIMEOUT 60)
-  endif()
+    # the latent cache's page-table indirection, wired like glm_pages_parity
+    add_executable(glm_lat_paged_parity src/kernels/glm_lat_paged_parity.cpp)
+    target_link_libraries(glm_lat_paged_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_lat_paged_parity COMMAND glm_lat_paged_parity --selftest)
+    set_tests_properties(glm_lat_paged_parity PROPERTIES TIMEOUT 60)
+    # the paged-gather routing, device-side: dsa_select driven with an identity, a
+    # shuffled and a corrupted table (glm_lat_paged_parity only checked the host map).
+    # Its host mapping layer runs without a GPU, so this is the CI regression subset.
+    add_executable(glm_paged_gather_test src/kernels/glm_paged_gather_test.cpp)
+    target_link_libraries(glm_paged_gather_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_paged_gather_test COMMAND glm_paged_gather_test --selftest)
+    set_tests_properties(glm_paged_gather_test PROPERTIES TIMEOUT 60)
+    endif()
   # the batched rows' MoE pieces (the fused wait / fetch, the rows' CPU-lane waits, a group's experts each once)
   # against the per-row kernels (random Q8_0 experts, no model)
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -604,7 +616,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu src/core/glm_ablate.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu
+    src/core/glm_ablate.cu src/core/glm_pages.cu src/core/glm_prefix.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(WIN32 AND STRATA_ENABLE_CUDA)
@@ -1219,6 +1232,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(qsa_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(qsa_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
+add_executable(glm_pages_parity src/kernels/glm_pages_parity.cpp src/core/glm_pages.cu)
+add_executable(glm_prefix_parity src/kernels/glm_prefix_parity.cpp src/core/glm_prefix.cu)
+target_include_directories(glm_pages_parity PRIVATE include)
+target_include_directories(glm_prefix_parity PRIVATE include)
+target_link_libraries(glm_pages_parity PRIVATE ${_strata_gpu_runtime_target})
+target_link_libraries(glm_prefix_parity PRIVATE ${_strata_gpu_runtime_target})
+add_test(NAME glm_pages_parity COMMAND glm_pages_parity --selftest)
+add_test(NAME glm_prefix_parity COMMAND glm_prefix_parity --selftest)
 
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and
