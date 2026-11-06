@@ -8,6 +8,8 @@
 //   exl3_test --exllamav3 <dir>   the decoders against exllamav3 itself: tools/exl3_exllamav3_fixture.py's random
 //                                 tiles (data/exl3-exllamav3) - the same states and W' bit for bit
 //   exl3_test --expect <dir>      a model's matrices against exllamav3's decode of them (the tool's --model files)
+//   exl3_test --dump-legacy <f>   fixed-seed cases at v1.1.8's kernels' geometry, every output float to <f> (binary)
+//                                 and its hash: STRATA_GLM_EXL3_DECODE=legacy and =legacy-f32 must write the same bytes
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
 #include "strata/kernels/exl3.hpp"
@@ -146,6 +148,94 @@ void test_decode_table() {
         ++g_fail;
     }
 }
+
+#if !defined(STRATA_USE_HIP)
+// The legacy kernels' FP32 decode is built for sm_6x only (sm_70+ device code unchanged): on a device of compute
+// capability 7 or more legacy-f32 is accepted and runs the FP16 kernels (the same bits), legacy_f32() is false and
+// legacy_decode_table(cb, true, ...) writes the FP16 decode.
+bool legacy_f32_built(std::string* sm = nullptr) {
+    int dev = 0;
+    cudaDeviceProp p{};
+    CK(cudaGetDevice(&dev));
+    CK(cudaGetDeviceProperties(&p, dev));
+    if (sm != nullptr) *sm = "sm_" + std::to_string(p.major) + std::to_string(p.minor);
+    return p.major < 7;
+}
+
+// v1.1.8's kernels' FP32 weight decode (STRATA_GLM_EXL3_DECODE=legacy-f32) against their FP16 one: every state (s0 = s,
+// s1 = s ^ 0xffff) and codebook, bit for bit.  The FP16 table against the CPU reference too (informational: a
+// difference there counts only where the FP32 table differs as well).  sm_70+: f32 = true is the FP16 decode too, so
+// there this checks only that it writes the FP16 table - the output lines say so
+void test_legacy_decode_exhaustive() {
+    constexpr int NS = 65536, NV = 2 * NS;
+    std::string sm;
+    const bool built = legacy_f32_built(&sm);
+    const std::string vs = built ? "fp32 vs fp16" : "f32=true vs fp16 (FP16 both, " + sm + ")";
+    const char* name32 = built ? "fp32" : "f32=true";
+    if (!built)
+        std::printf("  legacy decode: %s has no FP32 decode kernels (sm_6x only): f32=true writes the FP16 decode - "
+                    "FP16 against FP16 below, not an F32 check\n", sm.c_str());
+    float *d16 = nullptr, *d32 = nullptr;
+    CK(cudaMalloc(&d16, (size_t) NV * sizeof(float)));
+    CK(cudaMalloc(&d32, (size_t) NV * sizeof(float)));
+    for (int cb = 0; cb <= 2; ++cb) {
+        // different fill bytes: a table left unwritten cannot match the other
+        CK(cudaMemset(d16, 0x7f, (size_t) NV * sizeof(float)));
+        CK(cudaMemset(d32, 0xff, (size_t) NV * sizeof(float)));
+        ex::legacy_decode_table(cb, false, d16, 0);
+        ex::legacy_decode_table(cb, true, d32, 0);
+        CK(cudaDeviceSynchronize());
+        const std::vector<uint32_t> a = host_copy(reinterpret_cast<const uint32_t*>(d16), (size_t) NV);
+        const std::vector<uint32_t> b = host_copy(reinterpret_cast<const uint32_t*>(d32), (size_t) NV);
+        size_t bad = 0, bad_ref = 0, both = 0;
+        for (int i = 0; i < NV; ++i) {
+            const uint32_t st = (i & 1) ? ((uint32_t) (i / 2) ^ 0xffffu) : (uint32_t) (i / 2);
+            if (a[(size_t) i] != b[(size_t) i]) {
+                if (bad < 3)
+                    std::printf("    cb%d state %04x (s%d of %04x): fp16 %08x  %s %08x\n", cb, st, i & 1, i / 2,
+                                a[(size_t) i], name32, b[(size_t) i]);
+                ++bad;
+            }
+            const float r = cpu::exl3_decode(st, cb);
+            uint32_t ru;
+            std::memcpy(&ru, &r, 4);
+            if (a[(size_t) i] != ru) {
+                if (bad_ref < 3)
+                    std::printf("    cb%d state %04x: fp16 table %08x  CPU reference %08x  (informational)\n", cb, st,
+                                a[(size_t) i], ru);
+                ++bad_ref;
+                both += a[(size_t) i] != b[(size_t) i];
+            }
+        }
+        std::printf("  %-44s %zu of %d differ  %s\n", ("legacy decode " + vs + " cb" + std::to_string(cb)).c_str(), bad,
+                    NV, bad ? "FAIL" : "ok");
+        if (bad) ++g_fail;
+        std::printf("  %-44s %zu of %d differ (%zu of them %s too)  info\n",
+                    ("legacy decode fp16 vs CPU reference cb" + std::to_string(cb)).c_str(), bad_ref, NV, both, name32);
+    }
+    CK(cudaFree(d16));
+    CK(cudaFree(d32));
+}
+
+// legacy_f32() follows STRATA_GLM_EXL3_DECODE: true under legacy-f32 (any GPU), false unset / legacy / new
+void test_legacy_choice() {
+    const char* v = std::getenv("STRATA_GLM_EXL3_DECODE");
+    const std::string s = v != nullptr ? v : "";
+    const bool f32 = ex::legacy_f32();
+    bool ok = true;
+    // legacy-f32: legacy_f32() true where the FP32 decode is built (sm_6x); sm_70+ accept it and run the FP16 kernels
+    std::string sm;
+    const bool built = legacy_f32_built(&sm);
+    if (s == "legacy-f32" && !built)
+        std::printf("  (%s: legacy-f32 is built for sm_6x only - it runs the FP16 kernels, legacy_f32() false)\n",
+                    sm.c_str());
+    if (s == "legacy-f32") ok = f32 == built;
+    else if (s.empty() || s == "legacy" || s == "new") ok = !f32;
+    std::printf("  %-44s %s  %s\n", ("legacy_f32() with STRATA_GLM_EXL3_DECODE=" + (v != nullptr ? s : "(unset)")).c_str(),
+                f32 ? "true" : "false", ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+}
+#endif
 
 void test_mv(int k, int n, int k2, int cb, bool q8, int view_c0 = -1, int view_n = 0) {
     HostMat h = make_mat(k, n, k2, cb);
@@ -1714,13 +1804,287 @@ void test_expect(const std::string& dir) {
     if (n_mat == 0) ++g_fail;
 }
 
+#if !defined(STRATA_USE_HIP)
+// ---------------------------------------------------------------- --dump-legacy <file>
+// Fixed-seed cases at v1.1.8's kernels' geometry - GLM-5.3-Flash's routed experts (4096 -> 2048 -> 4096: exl3.cu takes
+// the legacy kernels for n_embd and n_ff <= 4096) through moe_gate_up + moe_down, dense GEMVs up to 4096 through mv -
+// every output float written to <file> in case order, a hash a case and of the whole.  Under
+// STRATA_GLM_EXL3_DECODE=legacy and =legacy-f32 the two files must be the same bytes (tests/exl3_dump_compare.cmake).
+
+int g_dump_outputs = 0;
+
+uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    const uint8_t* b = (const uint8_t*) p;
+    for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull;
+    return h;
+}
+
+// one output from two runs: the same bits run to run (a bitwise A/B needs it), finite where the kernels write (the
+// output starts as NaN bytes); the first run's go to the dump
+void dump_put(std::vector<float>& dump, const std::string& what, const std::vector<float>& r1,
+              const std::vector<float>& r2, bool need_finite) {
+    size_t nd = 0, nf = 0;
+    for (size_t i = 0; i < r1.size(); ++i) {
+        nd += std::memcmp(&r1[i], &r2[i], sizeof(float)) != 0;
+        nf += !std::isfinite(r1[i]);
+    }
+    const bool ok = nd == 0 && (!need_finite || nf == 0);
+    std::printf("  %-44s bits %016llx  %zu differ run to run, %zu not finite  %s\n", what.c_str(),
+                (unsigned long long) fnv1a(r1.data(), r1.size() * 4), nd, nf, ok ? "ok" : "FAIL");
+    if (!ok) ++g_fail;
+    dump.insert(dump.end(), r1.begin(), r1.end());
+    ++g_dump_outputs;
+}
+
+// a token's routed experts: 4 distinct experts in a plan of 5 (entry 1 skipped), each its own weight; variant v turns
+// the CPU lane's part on / off, the shared expert's output, the clamp and a caller's h (dumped too); mixed: each
+// expert its own class (K 1-4 by expert and part).  ref: the output against the CPU reference as well
+void dump_moe(std::vector<float>& dump, int k2, int cb, int v, bool mixed = false, bool ref = false) {
+    constexpr int E = 4096, F = 2048, NX = 4, K = 5;
+    const float limit = v % 2 == 0 ? 1.5f : 0.0f;
+    const bool use_h = v % 2 == 1, use_sh = v % 3 != 2, cpu_on = v % 4 < 2;
+    const int ks[NX][3] = {{2, 2, 4}, {4, 2, 6}, {6, 8, 2}, {8, 4, 4}};
+    const int pos[NX] = {0, 2, 3, 4};   // expert e's plan entry
+    ex::ExpertLayout lay;
+    lay.cb = cb;
+    ex::MixedLayouts mix;
+    if (mixed) mix.n = NX;
+    std::vector<HostMat> parts((size_t) NX * 3);
+    std::vector<uint8_t*> d_blob((size_t) NX);
+    for (int e = 0; e < NX; ++e) {
+        std::vector<uint8_t> b;
+        size_t at = 0;
+        for (int r = 0; r < 3; ++r) {
+            const int kr = mixed ? ks[e][r] : k2;
+            HostMat& p = parts[(size_t) e * 3 + r];
+            p = r < 2 ? make_mat(E, F, kr, cb) : make_mat(F, E, kr, cb);
+            const size_t o_suh = at, o_svh = o_suh + p.suh.size() * 2, o_tr = o_svh + p.svh.size() * 2 + 4;
+            at = o_tr + p.tr.size() * 4;
+            b.resize(at);
+            std::memcpy(&b[o_suh], p.suh.data(), p.suh.size() * 2);
+            std::memcpy(&b[o_svh], p.svh.data(), p.svh.size() * 2);
+            std::memcpy(&b[o_tr], p.tr.data(), p.tr.size() * 4);
+            lay.suh[r] = o_suh;
+            lay.svh[r] = o_svh;
+            lay.trellis[r] = o_tr;
+            lay.k2[r] = kr;
+        }
+        d_blob[(size_t) e] = dev_copy(b);
+        if (mixed) {
+            mix.lay[e] = lay;
+            mix.lo[e] = (unsigned long long) d_blob[(size_t) e];
+            mix.hi[e] = mix.lo[e] + b.size();
+        }
+    }
+    std::vector<unsigned long long> plan((size_t) K, 0ull);
+    for (int e = 0; e < NX; ++e) plan[(size_t) pos[e]] = (unsigned long long) d_blob[(size_t) e];
+    const std::vector<float> pw = {0.37f, 0.21f, 0.18f, 0.15f, 0.09f};
+    const std::vector<float> x = rand_x(E), cpu_part = rand_x(E), sh = rand_x(E);
+    const std::vector<int> flag = {cpu_on ? 1 : 0};
+    auto* d_plan = dev_copy(plan);
+    float* d_pw = dev_copy(pw);
+    float* d_x = dev_copy(x);
+    float* d_cpu = dev_copy(cpu_part);
+    float* d_sh = dev_copy(sh);
+    int* d_flag = dev_copy(flag);
+    float *d_out = nullptr, *d_h = nullptr;
+    CK(cudaMalloc(&d_out, (size_t) E * sizeof(float)));
+    if (use_h) CK(cudaMalloc(&d_h, (size_t) 8 * F * sizeof(float)));
+    ex::MoeArgs a;
+    a.plan_ptr = d_plan;
+    a.plan_w = d_pw;
+    a.cpu_part = d_cpu;
+    a.cpu_flag = d_flag;
+    if (mixed) a.mix = mix;
+    else a.lay = lay;
+    a.k = K;
+    a.n_embd = E;
+    a.n_ff = F;
+    a.limit = limit;
+    std::vector<float> o[2], hv[2];
+    for (int rep = 0; rep < 2; ++rep) {
+        CK(cudaMemset(d_out, 0xff, (size_t) E * sizeof(float)));
+        if (d_h) CK(cudaMemset(d_h, 0, (size_t) 8 * F * sizeof(float)));
+        ex::moe_gate_up(a, d_x, d_h, 0);
+        ex::moe_down(a, d_h, use_sh ? d_sh : nullptr, d_out, 0);
+        CK(cudaDeviceSynchronize());
+        o[rep] = host_copy(d_out, (size_t) E);
+        if (d_h) hv[rep] = host_copy(d_h, (size_t) 8 * F);
+    }
+    const std::string tag = "moe 4096/2048 " + (mixed ? std::string("mixed K1-4") : "K" + kname(k2)) + " cb" +
+                            std::to_string(cb) + " v" + std::to_string(v) + (cpu_on ? " cpu" : "") +
+                            (use_sh ? " sh" : "") + (limit > 0 ? " clamp" : "");
+    dump_put(dump, tag, o[0], o[1], true);
+    if (d_h) dump_put(dump, tag + " h", hv[0], hv[1], false);
+    if (ref && !mixed) {
+        std::vector<float> want((size_t) E, 0.0f);
+        for (int e = 0; e < NX; ++e) {
+            std::vector<float> g((size_t) F), u((size_t) F), hh((size_t) F), dn((size_t) E);
+            for (int r = 0; r < 2; ++r) {
+                const HostMat& p = parts[(size_t) e * 3 + r];
+                std::vector<float> w((size_t) E * F);
+                cpu::exl3_inner_k2(p.tr.data(), F / 16, E, F, k2, cb, w.data());
+                cpu::exl3_mv(w.data(), p.suh.data(), p.svh.data(), E, F, x.data(), r == 0 ? g.data() : u.data());
+            }
+            for (int i = 0; i < F; ++i) {
+                float gv = g[(size_t) i], uv = u[(size_t) i];
+                if (limit > 0) {
+                    gv = std::min(gv, limit);
+                    uv = std::min(std::max(uv, -limit), limit);
+                }
+                hh[(size_t) i] = gv / (1.0f + std::exp(-gv)) * uv;
+            }
+            const HostMat& p = parts[(size_t) e * 3 + 2];
+            std::vector<float> w((size_t) F * E);
+            cpu::exl3_inner_k2(p.tr.data(), E / 16, F, E, k2, cb, w.data());
+            cpu::exl3_mv(w.data(), p.suh.data(), p.svh.data(), F, E, hh.data(), dn.data());
+            for (int i = 0; i < E; ++i) want[(size_t) i] += pw[(size_t) pos[e]] * dn[(size_t) i];
+        }
+        for (int i = 0; i < E; ++i)
+            want[(size_t) i] += (cpu_on ? cpu_part[(size_t) i] : 0.0f) + (use_sh ? sh[(size_t) i] : 0.0f);
+        close((tag + " vs CPU").c_str(), o[0], want, 3e-3);
+    }
+    for (uint8_t* p : d_blob) cudaFree(p);
+    for (void* p : {(void*) d_plan, (void*) d_pw, (void*) d_x, (void*) d_cpu, (void*) d_sh, (void*) d_flag,
+                    (void*) d_out, (void*) d_h})
+        if (p) cudaFree(p);
+}
+
+// a dense GEMV (alpha 0.75, a bias): F32 or q8_1 input, a column view, ncol activations in one job.  ref: column 0
+// against the CPU reference as well
+void dump_mv(std::vector<float>& dump, int k, int n, int k2, int cb, bool q8, int view_c0 = -1, int view_n = 0,
+             int ncol = 1, bool ref = false) {
+    HostMat h = make_mat(k, n, k2, cb);
+    ex::Mat m;
+    m.trellis = dev_copy(h.tr);
+    m.suh = dev_copy(h.suh);
+    m.svh = dev_copy(h.svh);
+    m.k = k;
+    m.n = n;
+    m.k2 = k2;
+    m.cb = cb;
+    const ex::Mat full = m;
+    int c0 = 0, nc = n;
+    if (view_c0 >= 0) {
+        m = ex::view(m, view_c0, view_n);
+        c0 = view_c0;
+        nc = view_n;
+    }
+    const size_t xs = (size_t) k + 128, qs = xs / 32 * 36, ys = (size_t) nc + 64;
+    std::vector<float> x((size_t) ncol * xs, 0.0f), xr0;
+    std::vector<uint8_t> xq((size_t) ncol * qs, 0);
+    for (int c = 0; c < ncol; ++c) {
+        std::vector<float> xc = rand_x(k, 2.0f), deq;
+        std::vector<uint8_t> qc;
+        q8_1(xc, qc, deq);
+        std::copy(xc.begin(), xc.end(), x.begin() + (std::ptrdiff_t) (c * xs));
+        std::copy(qc.begin(), qc.end(), xq.begin() + (std::ptrdiff_t) (c * qs));
+        if (c == 0) xr0 = q8 ? deq : xc;
+    }
+    const std::vector<float> bias = rand_x(nc);
+    float* d_x = dev_copy(x);
+    uint8_t* d_xq = dev_copy(xq);
+    float* d_bias = dev_copy(bias);
+    float* d_y = nullptr;
+    CK(cudaMalloc(&d_y, (size_t) ncol * ys * sizeof(float)));
+    ex::MvJob j;
+    j.m = &m;
+    j.xf = q8 ? nullptr : d_x;
+    j.xq = q8 ? (const void*) d_xq : nullptr;
+    j.y = d_y;
+    j.bias = d_bias;
+    j.alpha = 0.75f;
+    if (ncol > 1) {
+        j.ncol = ncol;
+        j.xf_cs = xs;
+        j.xq_cs = qs;
+        j.y_cs = ys;
+    }
+    const std::string tag = "mv k" + std::to_string(k) + " n" + std::to_string(nc) + " K" + kname(k2) + " cb" +
+                            std::to_string(cb) + (q8 ? " q8_1" : " f32") +
+                            (view_c0 >= 0 ? " view@" + std::to_string(view_c0) : "") +
+                            (ncol > 1 ? " x" + std::to_string(ncol) : "");
+    std::vector<float> y[2];
+    for (int rep = 0; rep < 2; ++rep) {
+        CK(cudaMemset(d_y, 0xff, (size_t) ncol * ys * sizeof(float)));
+        if (!ex::mv(&j, 1, 0)) {
+            std::printf("  %-44s refused  FAIL\n", tag.c_str());
+            ++g_fail;
+        }
+        CK(cudaDeviceSynchronize());
+        const std::vector<float> all = host_copy(d_y, (size_t) ncol * ys);
+        for (int c = 0; c < ncol; ++c)
+            y[rep].insert(y[rep].end(), all.begin() + (std::ptrdiff_t) (c * ys),
+                          all.begin() + (std::ptrdiff_t) (c * ys + nc));
+    }
+    dump_put(dump, tag, y[0], y[1], true);
+    if (ref) {
+        std::vector<float> w((size_t) k * n), wv((size_t) k * nc), want((size_t) nc);
+        cpu::exl3_inner_k2(h.tr.data(), n / 16, k, n, k2, cb, w.data());
+        for (int r = 0; r < k; ++r)
+            for (int c = 0; c < nc; ++c) wv[(size_t) r * nc + c] = w[(size_t) r * n + c0 + c];
+        cpu::exl3_mv(wv.data(), h.suh.data(), h.svh.data() + c0, k, nc, xr0.data(), want.data());
+        for (int c = 0; c < nc; ++c) want[(size_t) c] = 0.75f * want[(size_t) c] + bias[(size_t) c];
+        close((tag + " vs CPU").c_str(), std::vector<float>(y[0].begin(), y[0].begin() + nc), want, 2e-3);
+    }
+    cudaFree((void*) full.trellis);
+    cudaFree((void*) full.suh);
+    cudaFree((void*) full.svh);
+    for (void* p : {(void*) d_x, (void*) d_xq, (void*) d_bias, (void*) d_y}) cudaFree(p);
+}
+
+int dump_legacy(const std::string& path) {
+    g_rng.seed(20260517);   // fixed: every run the same cases
+    int dev = 0;
+    cudaDeviceProp p{};
+    CK(cudaGetDevice(&dev));
+    CK(cudaGetDeviceProperties(&p, dev));
+    std::printf("dump-legacy: sm_%d%d, legacy_f32() %s\n", p.major, p.minor, ex::legacy_f32() ? "true" : "false");
+    std::vector<float> dump;
+    // the routed experts: K 1 / 1.5 / 2 / 2.5 / 3 / 3.5 / 4, every codebook a bitrate takes; a mixed layer
+    int v = 0;
+    for (int k2 : {2, 3, 4, 5, 6, 7, 8})
+        for (int cb = 0; cb <= 2; ++cb)
+            if (ex::k2_supported(k2, cb)) dump_moe(dump, k2, cb, v++, false, k2 == 4 && cb == 2);
+    dump_moe(dump, 0, 2, v++, true);
+    // dense GEMVs up to 4096
+    dump_mv(dump, 4096, 2048, 4, 2, false);
+    dump_mv(dump, 4096, 2048, 3, 2, false);
+    dump_mv(dump, 2048, 4096, 6, 0, false);                     // K 3 (an odd K)
+    dump_mv(dump, 2048, 4096, 6, 1, false, -1, 0, 1, true);
+    dump_mv(dump, 4096, 4096, 5, 2, false);
+    dump_mv(dump, 1024, 512, 2, 1, false);
+    dump_mv(dump, 4096, 512, 7, 2, false);                      // occupancy split
+    dump_mv(dump, 4096, 1024, 8, 2, false, 384, 256);           // a column view
+    dump_mv(dump, 4096, 2048, 16, 2, false);                    // K 8
+    dump_mv(dump, 512, 256, 10, 0, false);
+    dump_mv(dump, 2048, 4096, 6, 2, true);                      // q8_1 input
+    dump_mv(dump, 4096, 2048, 6, 2, false, -1, 0, 3);           // three activations
+    std::ofstream f(path, std::ios::binary);
+    f.write((const char*) dump.data(), (std::streamsize) (dump.size() * sizeof(float)));
+    f.close();
+    if (!f) {
+        std::printf("  cannot write %s  FAIL\n", path.c_str());
+        ++g_fail;
+    }
+    std::printf("dump-legacy: %d outputs, %zu floats, fnv1a %016llx -> %s\n", g_dump_outputs, dump.size(),
+                (unsigned long long) fnv1a(dump.data(), dump.size() * 4), path.c_str());
+    std::printf("exl3_test --dump-legacy: %s (%d failures, %d launch errors)\n", g_fail ? "FAIL" : "ok", g_fail,
+                ex::launch_errors());
+    return g_fail || ex::launch_errors() ? 1 : 0;
+}
+#endif
+
 }  // namespace
 
 // --bench: one decode token's routed experts at DeepSeek-V4.1's geometry (6 of them, 5120 -> 2304 -> 5120), the
 // one-layout kernels against the mixed ones (the same experts as one class each; then K 1 / 2 / 3 mixed) - ms a token
 // for one layer (x40 for the model)
 void bench_moe() {
-    const int E = 5120, F = 2304, k = 6, iters = 200;
+    // (BENCH_MOE_E / BENCH_MOE_F: another geometry, e.g. GLM-5.3-Flash's 4096 / 2048, which takes the legacy kernels)
+    const char* ve = std::getenv("BENCH_MOE_E");
+    const char* vf = std::getenv("BENCH_MOE_F");
+    const int E = ve != nullptr ? std::atoi(ve) : 5120, F = vf != nullptr ? std::atoi(vf) : 2304, k = 6, iters = 200;
     auto build = [&](const int (*ks)[3], ex::MixedLayouts& mix, std::vector<unsigned long long>& ptrs,
                      std::vector<uint8_t*>& blobs) {
         mix = ex::MixedLayouts{};
@@ -2200,6 +2564,9 @@ int main(int argc, char** argv) {
         return g_fail || ex::launch_errors() ? 1 : 0;
     }
 #endif
+#if !defined(STRATA_USE_HIP)
+    if (argc == 3 && std::string(argv[1]) == "--dump-legacy") return dump_legacy(argv[2]);
+#endif
     std::printf("grouped matrix prefill: %s\n", (ex::mma_supported() || ex::prompt_wmma()) ? "enabled" : "disabled");
     if (argc == 2 && std::string(argv[1]) == "--prefill-only") {
         for (int k2 = 2; k2 <= 16; k2 += 2)
@@ -2220,7 +2587,8 @@ int main(int argc, char** argv) {
         } else if (a == "--expect" && i + 1 < argc) {
             expect_dir = argv[++i];
         } else {
-            std::fprintf(stderr, "usage: exl3_test [--prefill-only] [--exllamav3 <fixture dir>] [--expect <model fixture dir>]\n");
+            std::fprintf(stderr, "usage: exl3_test [--prefill-only] [--exllamav3 <fixture dir>] [--expect <model fixture dir>]"
+                                 " | --dump-legacy <file>\n");
             return 2;
         }
     }
@@ -2232,6 +2600,10 @@ int main(int argc, char** argv) {
         return g_fail || ex::launch_errors() ? 1 : 0;
     }
     test_decode_table();
+#if !defined(STRATA_USE_HIP)
+    test_legacy_choice();
+    test_legacy_decode_exhaustive();   // (no random numbers: the cases below keep their matrices)
+#endif
     // the bitrate as k2 = 2 K: the integer K 1..8 first (in the order they always ran: the same random matrices)
     for (int k2 = 2; k2 <= 16; k2 += 2)
         for (int cb = 0; cb <= 2; ++cb) test_mv(256, 256, k2, cb, false);

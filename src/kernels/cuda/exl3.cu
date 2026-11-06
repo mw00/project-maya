@@ -48,6 +48,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s);
 void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s);
 void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const WinArgs& a, cudaStream_t s);
+void decode_table(int cb, bool f32, float* d_out, cudaStream_t s);
 }  // namespace strata::kernels::exl3::legacy
 #define EXL3_LEGACY(call) \
     if (use_legacy()) return legacy::call
@@ -2769,31 +2770,47 @@ int sm_count() {
     return std::max(1, sms);
 }
 
-// Whether the current device decodes with v1.1.8's kernels (exl3_legacy.cu): NVIDIA before sm_80, where this file's
-// tiles run on the CUDA cores and were slower; STRATA_GLM_EXL3_DECODE=legacy | new picks one on any GPU (A/B).  The
-// token path and the verify windows take the same family on a device, so a window stays bit for bit its token path.
-// Asked once per device.
-bool use_legacy() {
+// The current device's decode kernels: 1 v1.1.8's (exl3_legacy.cu), 2 this file's, 3 v1.1.8's with the weights decoded
+// in F32 (legacy_f32).  NVIDIA before sm_80 takes v1.1.8's, where this file's tiles run on the CUDA cores and were
+// slower; STRATA_GLM_EXL3_DECODE=legacy | new | legacy-f32 picks one on any GPU (A/B), legacy-f32 on sm_6x only: its
+// kernels are built for Pascal alone (exl3_legacy.cu's EXL3_F32_KERNEL), so sm_70 and newer take v1.1.8's FP16
+// decode for it, the same bits.  The token path and the verify windows take the same family on a device, so a window
+// stays bit for bit its token path.  Asked once per device.
+int decode_kernels() {
 #if defined(STRATA_USE_HIP)
-    return false;
+    return 2;
 #else
-    static std::atomic<int> cache[64];   // 0 not asked, 1 v1.1.8's kernels, 2 this file's
+    static std::atomic<int> cache[64];   // 0 not asked
     int dev = 0;
     cudaGetDevice(&dev);
-    if (dev < 0 || dev >= 64) return false;
+    if (dev < 0 || dev >= 64) return 2;
     int c = cache[dev].load(std::memory_order_acquire);
     if (c == 0) {
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         const char* v = std::getenv("STRATA_GLM_EXL3_DECODE");
-        c = v != nullptr && std::strcmp(v, "legacy") == 0 ? 1 : v != nullptr && std::strcmp(v, "new") == 0 ? 2
-            : major < 8                                    ? 1
-                                                           : 2;
-        if (c == 1) std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels\n", dev);
+        c = v != nullptr && std::strcmp(v, "legacy") == 0       ? 1
+            : v != nullptr && std::strcmp(v, "new") == 0        ? 2
+            : v != nullptr && std::strcmp(v, "legacy-f32") == 0 ? 3
+            : major < 8                                         ? 1
+                                                                : 2;
+        if (c == 3 && major >= 7) {
+            c = 1;
+            std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels (legacy-f32 is built for sm_6x only; the "
+                                 "same bits)\n", dev);
+        } else if (c == 1) {
+            std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels\n", dev);
+        }
+        if (c == 3) std::fprintf(stderr, "exl3: CUDA%d decodes with v1.1.8's kernels, FP32 decode\n", dev);
         cache[dev].store(c, std::memory_order_release);
     }
-    return c == 1;
+    return c;
 #endif
+}
+// Whether the current device decodes with v1.1.8's kernels (FP16 or F32 decode)
+bool use_legacy() {
+    const int c = decode_kernels();
+    return c == 1 || c == 3;
 }
 
 // the blocks of mv_kernel<K2> an SM of the current device keeps at once (its registers and shared memory), asked once
@@ -2883,6 +2900,21 @@ int mv_cols(const Mat& m) {
     if (S <= 0) return 0;
     if (S == 1) return kTok;
     return (int) std::max<size_t>(1, std::min<size_t>(kTok, kPartFloats / ((size_t) S * m.n)));
+}
+
+bool legacy_f32() { return decode_kernels() == 3; }
+
+void legacy_decode_table(int cb, bool f32, float* d_out, cudaStream_t s) {
+#if !defined(STRATA_USE_HIP)
+    int dev = 0, major = 0;
+    cudaGetDevice(&dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    legacy::decode_table(cb, f32 && major < 7, d_out, s);   // (the F32 decode is built for sm_6x only)
+#else
+    (void) cb, (void) f32, (void) d_out, (void) s;
+    std::fprintf(stderr, "exl3 legacy_decode_table: v1.1.8's kernels are NVIDIA's only\n");
+    g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+#endif
 }
 
 int launch_errors() {
