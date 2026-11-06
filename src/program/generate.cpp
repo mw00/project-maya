@@ -1620,6 +1620,9 @@ static int glm_pack_generate(const Options& o) {
     // the longest slot this prompt continues, back in the model: the tokens it covers (0: none)
     const auto slot_take = [&](const std::vector<int32_t>& prompt) -> size_t {
         if (slot_max <= 0) return 0;
+      for (;;) {   // the longest slot this prompt continues; one that will not load (saved by another model layout, a
+                   // damaged file) is dropped and the next-longest tried - before, the first failure read the whole
+                   // prompt from token 0 although a shorter slot or a checkpoint held most of it
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
@@ -1636,10 +1639,10 @@ static int glm_pack_generate(const Options& o) {
                               ? model.slot_load(*slots[best].data, (int64_t) len, e)
                               : model.slot_load(slots[best].path, (int64_t) len, e);
         if (!back) {
-            note("taking a conversation back failed (" + e + ") - reading its prompt again");
+            note("taking a conversation back failed (" + e + ") - trying the next slot or checkpoint");
             slot_drop(best);
             snap_tokens.clear();
-            return 0;
+            continue;
         }
         snap_tokens = slots[best].tokens;
         snap_img_hash = slots[best].img;
@@ -1657,6 +1660,7 @@ static int glm_pack_generate(const Options& o) {
                       prompt.size() - len);
         note(m);
         return len;
+      }
     };
     // a request's DFlash window and draft cut (its GEN line's spec= / spec_min_p=; 0 / -1: as the engine started)
     int req_spec = 0;
@@ -1859,7 +1863,11 @@ static int glm_pack_generate(const Options& o) {
                         std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin()))
                         slot_len = sl.tokens.size();
             std::string ce;
-            if (slot_len > ck_len) {
+            if (slot_len > ck_len) {   // the slot first; when none loads (another layout, a damaged file) the checkpoint
+                reuse = slot_take(prompt);   // below is used instead of reading from token 0
+                if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
+            }
+            if (reuse > 0) {
             } else if (model.ckpt_restore(ckpt_base + ck, ce)) {
                 reuse = ck_len;
                 from_ckpt = true;
