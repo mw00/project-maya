@@ -123,7 +123,6 @@ class GrammarAdapter(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
-    @unittest.skipUnless(os.name == "posix", "script helper uses a shebang")
     def test_checker_protocol_with_binary_vocab_logs_and_both_spawn_shapes(self):
         script = r'''import sys
 from pathlib import Path
@@ -144,13 +143,17 @@ else:
             checker.chmod(0o755)
             engine = StrataEngine.__new__(StrataEngine)
             engine.grammar_checker = None
+            run = subprocess.run
+            def python_checker(command, **kwargs):
+                return run([sys.executable, *command], **kwargs)
             for extra in ((), ("native",)):
                 with self.subTest(spawn_fields=5 + len(extra)):
                     engine.spawn = (str(Path(directory) / "maya-ds4"), ["--pack", "packs/deepseek"],
                                     directory, None, None) + extra
-                    engine.validate_grammar(GRAMMAR)
-                    with self.assertRaisesRegex(ValueError, "undefined rule missing"):
-                        engine.validate_grammar("root ::= missing")
+                    with patch("serve.server.subprocess.run", side_effect=python_checker):
+                        engine.validate_grammar(GRAMMAR)
+                        with self.assertRaisesRegex(ValueError, "undefined rule missing"):
+                            engine.validate_grammar("root ::= missing")
 
     def test_protocol_keys_greedy_and_sampled_and_replay(self):
         for temperature in (0, 0.5, None):
@@ -209,7 +212,6 @@ else:
                 StrataEngine.grammar_keys({"_grammar_path": path})
         self.assertEqual(StrataEngine.grammar_keys({"_grammar_path": "/tmp/旧.gbnf"}), " grammar=/tmp/旧.gbnf")
 
-    @unittest.skipUnless(os.name == "posix", "script engine uses a shebang")
     def test_native_hex_paths_four_routes_replay_and_cancel_ownership(self):
         script = r'''import sys
 from pathlib import Path
@@ -248,7 +250,11 @@ for line in sys.stdin:
             exe = Path(directory) / "engine"
             exe.write_text(f"#!{sys.executable}\n" + script, encoding="utf-8")
             exe.chmod(0o755)
-            engine = StrataEngine(str(exe), [])
+            popen = subprocess.Popen
+            def python_engine(command, **kwargs):
+                return popen([sys.executable, "-u", *command], **kwargs)
+            with patch("serve.server.subprocess.Popen", side_effect=python_engine):
+                engine = StrataEngine(str(exe), [])
             original_mkstemp = tempfile.mkstemp
             def mkstemp(**kwargs):
                 return original_mkstemp(dir=tempdir, **kwargs)
