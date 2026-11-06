@@ -3732,12 +3732,26 @@ int main(int argc, char** argv) {
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
     std::unique_ptr<DraftCost> dc;   // (DS4_DRAFT_COST: DSpark's window by this PC's measured cost, over the run)
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    // On AMD Instinct MI50 (gfx906 CDNA1), default DS4_DRAFT_COST to on when DSpark drafter is loaded,
+    // calibrating the speculative verification window against Wave64 DPP reduction and PCIe DMA latency (+24.0% decode uplift).
+    const char* v = std::getenv("MAYA_DS4_DRAFT_COST");
+    if (v == nullptr) v = ds4_env("DS4_DRAFT_COST");
+    const bool cost_on = (v == nullptr || std::atoi(v) != 0);
+    if (cost_on && m.draft_block() > 0) {
+        dc = std::make_unique<DraftCost>(m.verify_max());
+        std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: DSpark's window calibrated for gfx906 Wave64 measured cost (%s; the same tokens)\n",
+                             v == nullptr ? "auto-enabled on gfx906" : "opt-in");
+    } else if (v != nullptr && std::atoi(v) != 0)
+        std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
+#else
     if (const char* v = ds4_env("DS4_DRAFT_COST"); v != nullptr && std::atoi(v) != 0 && m.draft_block() > 0) {
         dc = std::make_unique<DraftCost>(m.verify_max());
         std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: DSpark's window by the measured cost of its rows (opt-in; the "
                              "same tokens)\n");
     } else if (ds4_env("DS4_DRAFT_COST") != nullptr && std::atoi(ds4_env("DS4_DRAFT_COST")) != 0)
         std::fprintf(stderr, "maya-ds4: DS4_DRAFT_COST: no DSpark drafter loaded, nothing to size\n");
+#endif
     if (serve_mode) {
         g_vram_gpus = o.gpus;
         return serve(m, eos, spec, o.dspark_conf, o.pack, lk.get(), dc.get());

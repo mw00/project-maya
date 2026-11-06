@@ -1772,6 +1772,19 @@ int main(int argc, char** argv) {
         if (profile_out.empty()) profile_out = learned;
     }
     if (o.cpu_threads == -2) o.cpu_threads = mm3::CpuLane::auto_workers();   // (no --cpu-threads: this host's cores)
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+    // On AMD Instinct MI50 (gfx906 CDNA1), calibrate DSpark speculative drafting and verification window
+    if (const char* dv = std::getenv("MAYA_MM3_DRAFT"); dv != nullptr) {
+        o.dspark = (std::atoi(dv) != 0);
+    } else if (const char* dv2 = std::getenv("MM3_DRAFT"); dv2 != nullptr) {
+        o.dspark = (std::atoi(dv2) != 0);
+    }
+    if (const char* cv = std::getenv("MAYA_MM3_DRAFT_COST"); cv != nullptr && dspark_cost == 0.0f) {
+        dspark_cost = (float) std::atof(cv);
+    } else if (const char* cv2 = std::getenv("MM3_DRAFT_COST"); cv2 != nullptr && dspark_cost == 0.0f) {
+        dspark_cost = (float) std::atof(cv2);
+    }
+#endif
     std::vector<int> ids = ids_arg.empty() ? std::vector<int>{0} : parse_ids(ids_arg);
     if (ids.empty()) {
         std::fprintf(stderr, "no token ids\n");

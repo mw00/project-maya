@@ -42,16 +42,32 @@ inline bool off_by_default_on_amd(const char* env) {
 // STRATA_GLM_GROUP_EXPERTS=1: the batched rows' routed experts each run once for all the rows of a group (glm_rows.cu)
 inline bool group_experts_on() {
     static const bool on = [] {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+        const char* v1 = std::getenv("STRATA_GLM_GROUP_EXPERTS");
+        const char* v2 = std::getenv("MAYA_GLM_GROUP_EXPERTS");
+        if (v1 != nullptr) return std::atoi(v1) != 0;
+        if (v2 != nullptr) return std::atoi(v2) != 0;
+        return false;
+#else
         const char* v = std::getenv("STRATA_GLM_GROUP_EXPERTS");
         return v != nullptr && std::atoi(v) != 0;
+#endif
     }();
     return on;
 }
 // STRATA_GLM_SKIP_EMPTY=1: the batched rows leave out the launches their routes have no work for (glm_rows.cu)
 inline bool skip_empty_on() {
     static const bool on = [] {
+#if defined(STRATA_USE_HIP) && defined(__gfx906__)
+        const char* v1 = std::getenv("STRATA_GLM_SKIP_EMPTY");
+        const char* v2 = std::getenv("MAYA_GLM_SKIP_EMPTY");
+        if (v1 != nullptr) return std::atoi(v1) != 0;
+        if (v2 != nullptr) return std::atoi(v2) != 0;
+        return false;
+#else
         const char* v = std::getenv("STRATA_GLM_SKIP_EMPTY");
         return v != nullptr && std::atoi(v) != 0;
+#endif
     }();
     return on;
 }
