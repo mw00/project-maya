@@ -217,9 +217,25 @@ void test_legacy_decode_exhaustive() {
     CK(cudaFree(d32));
 }
 
-// legacy_f32() follows STRATA_GLM_EXL3_DECODE: true under legacy-f32 (any GPU), false unset / legacy / new
+// legacy_f32() follows STRATA_GLM_EXL3_DECODE<dev> when it names a decode (legacy / new / legacy-f32), else
+// STRATA_GLM_EXL3_DECODE (an unknown <dev> value falls back to it): true under legacy-f32 where the FP32 decode is built
+// (sm_6x), false on sm_70+ (legacy-f32 accepted there: the FP16 kernels, the same bits) and unset / legacy / new
 void test_legacy_choice() {
-    const char* v = std::getenv("STRATA_GLM_EXL3_DECODE");
+    int dev = 0;
+    CK(cudaGetDevice(&dev));
+    const std::string own = "STRATA_GLM_EXL3_DECODE" + std::to_string(dev);
+    const char* v = std::getenv(own.c_str());
+    const auto named = [](const char* c) {
+        return c != nullptr && (std::strcmp(c, "legacy") == 0 || std::strcmp(c, "new") == 0 ||
+                                std::strcmp(c, "legacy-f32") == 0);
+    };
+    const char* which = own.c_str();
+    if (!named(v)) {
+        if (v != nullptr)
+            std::printf("  (%s=%s names no decode: STRATA_GLM_EXL3_DECODE applies)\n", own.c_str(), v);
+        v = std::getenv("STRATA_GLM_EXL3_DECODE");
+        which = "STRATA_GLM_EXL3_DECODE";
+    }
     const std::string s = v != nullptr ? v : "";
     const bool f32 = ex::legacy_f32();
     bool ok = true;
@@ -227,11 +243,11 @@ void test_legacy_choice() {
     std::string sm;
     const bool built = legacy_f32_built(&sm);
     if (s == "legacy-f32" && !built)
-        std::printf("  (%s: legacy-f32 is built for sm_6x only - it runs the FP16 kernels, legacy_f32() false)\n",
-                    sm.c_str());
+        std::printf("  (%s: %s=legacy-f32 - legacy-f32 is built for sm_6x only, it runs the FP16 kernels, "
+                    "legacy_f32() false)\n", sm.c_str(), which);
     if (s == "legacy-f32") ok = f32 == built;
     else if (s.empty() || s == "legacy" || s == "new") ok = !f32;
-    std::printf("  %-44s %s  %s\n", ("legacy_f32() with STRATA_GLM_EXL3_DECODE=" + (v != nullptr ? s : "(unset)")).c_str(),
+    std::printf("  %-44s %s  %s\n", ("legacy_f32() with " + std::string(which) + "=" + (v != nullptr ? s : "(unset)")).c_str(),
                 f32 ? "true" : "false", ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }

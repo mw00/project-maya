@@ -2163,7 +2163,11 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     // helper there - an integrated one aliases this part's RAM tier - over its own layers [l0_, lt_))
     const int device = std::atoi(getenv("STRATA_GLM_EXPERT_HELPER"));
     const bool a_part = device == dev_ || std::find(split_devs_.begin(), split_devs_.end(), device) != split_devs_.end();
-    if (a_part || exl3_ || g_.n_embd > 4096 || g_.n_exp_used > 8) {
+    // an EXL3 pack's experts only with STRATA_GLM_HELPER_EXL3=1 (opt-in, as DS4_HELPER_EXL3): the helper then owns the
+    // mul1 (cb 2) layers' experts - those the CPU lane's kernel takes, whose answer the device adds (cpu_fmt below)
+    const char* hx = getenv("STRATA_GLM_HELPER_EXL3");
+    const bool exl3_helper = exl3_ && hx != nullptr && std::strcmp(hx, "1") == 0;
+    if (a_part || (exl3_ && !exl3_helper) || g_.n_embd > 4096 || g_.n_exp_used > 8) {
         err = "GLM expert helper: a device of its own (not a trunk GPU or a part of the split) and native GGUF experts "
               "(up to 8 per route)";
         return false;
@@ -2171,12 +2175,34 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
     std::vector<std::pair<void*, size_t>> regions;
     for (const auto& r : F->rc)
         for (size_t i = 0; i < r.n_parts(); ++i) regions.push_back({r.part(i), r.part_slots(i) * r.stride});
-    if (!F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err)) return false;
+    if (exl3_helper) {
+        // a Pascal helper (sm_61 / 62: FP16 at 1/64 of its F32 rate) decodes with legacy-f32 - v1.1.8's kernels, the
+        // same bits, ~5.5x faster there (a P4000, 6 experts: 3.87 -> 0.69 ms) - unless STRATA_GLM_EXL3_DECODE<n> or
+        // STRATA_GLM_EXL3_DECODE names its kernels; the trunk GPUs keep their own choice
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device);
+        if (major == 6 && (minor == 1 || minor == 2))
+            std::fprintf(stderr, "glm helper: CUDA%d (sm_%d%d) decodes its EXL3 experts with %s\n", device, major, minor,
+                         strata::kernels::exl3::prefer_legacy_f32(device)
+                             ? "legacy-f32 (v1.1.8's kernels, the weights decoded in FP32: the same bits)"
+                             : "the kernels STRATA_GLM_EXL3_DECODE names");
+    }
+    if (!F->helper.open(device, g_.n_embd, g_.n_ff_exp, regions, err, exl3_helper)) return false;
+    // (an EXL3 layer's experts on the helper: mul1's, not the MTP layer's - the layers whose answer the device adds,
+    // cpu_fmt.n_ff > 0 as the CPU lane sets it; the others stay with the trunk's PCIe fetch)
+    const auto exl3_ok = [&](const FastState::Layer& ly) { return ly.exl3 && !ly.mtp && ly.xl.cb == 2; };
     std::vector<int> ranked;
     size_t requested = 0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& ly = F->L[(size_t) il];
-        if (!ly.moe || !gf::moe_supported(ly.gu_type) || !gf::moe_supported(ly.d_type)) continue;
+        if (!ly.moe) continue;
+        if (ly.exl3 && !exl3_ok(ly)) {
+            std::fprintf(stderr, "glm helper: layer %d's EXL3 experts stay off CUDA%d (%s)\n", il, device,
+                         ly.mtp ? "the MTP layer" : ("codebook " + std::to_string(ly.xl.cb) + ", not mul1").c_str());
+            continue;
+        }
+        if (!ly.exl3 && (!gf::moe_supported(ly.gu_type) || !gf::moe_supported(ly.d_type))) continue;
         const int c = F->layer_rc[(size_t) il];
         if (c < 0) continue;
         const auto& R = F->rc[(size_t) c];
@@ -2227,6 +2253,19 @@ bool Glm5Model::fast_helper_setup(std::string& err) {
         if (ly.moe && gf::moe_supported(ly.gu_type) && gf::moe_supported(ly.d_type)) {
             if (!strata::kernels::cpu::native_fmt(ly.gu_type, ly.d_type, g_.n_embd, g_.n_ff_exp,
                                                  F->cpu_fmt[(size_t) il], err)) return false;
+        } else if (ly.moe && exl3_ok(ly)) {
+            // EXL3: the device adds the host's answer (the helper's sum) only where cpu_fmt marks the layer (the
+            // `lane` of fast_moe_experts, glm_window.cu, glm_rows.cu) - set exactly as fast_cpu_lane_setup does, so a
+            // layer the CPU lane takes keeps the same entry, and only on the layers holding helper experts (with the
+            // CPU lane off, cpu_plan 0: those layers' routes send the helper's keys to the host and nothing else)
+            bool held = false;
+            for (int e = 0; e < g_.n_expert && !held; ++e) held = F->helper.owns(il * g_.n_expert + e);
+            if (held) {
+                auto& f = F->cpu_fmt[(size_t) il];
+                f.gu_type = f.d_type = strata::kernels::exl3::kTypeEXL3;
+                f.n_embd = g_.n_embd;
+                f.n_ff = g_.n_ff_exp;
+            }
         }
     }
     F->cpu_retime = false;
@@ -2261,7 +2300,7 @@ bool Glm5Model::fast_helper_check(std::string& err) {
     if (per_layer == 0) return true;
     const Glm5Geometry& g = g_;
     int moe_layers = 0;
-    for (int il = l0_; il < lt_; ++il) moe_layers += F->L[(size_t) il].moe && !F->L[(size_t) il].exl3;
+    for (int il = l0_; il < lt_; ++il) moe_layers += F->L[(size_t) il].moe;
     if (F->helper.device() < 0) {
         std::fprintf(stderr, "glm helper check: CUDA%d part %d layers [%d, %d): NO helper (%d MoE layers) - nothing checked\n",
                      dev_, part_, l0_, lt_, moe_layers);
@@ -2270,7 +2309,7 @@ bool Glm5Model::fast_helper_check(std::string& err) {
     if (!glmfast::cuda_ok(cudaSetDevice(dev_), "GLM helper check device", err)) return false;
     size_t max_blob = 0;
     for (int il = l0_; il < lt_; ++il)
-        if (F->L[(size_t) il].moe && !F->L[(size_t) il].exl3) max_blob = std::max(max_blob, F->L[(size_t) il].blob);
+        if (F->L[(size_t) il].moe) max_blob = std::max(max_blob, F->L[(size_t) il].blob);
     if (max_blob == 0 || F->stage.empty() || F->stage[0] == nullptr || F->stage_bytes < max_blob) {
         err = "GLM helper check: no staging buffer for an expert";
         return false;
@@ -2317,7 +2356,7 @@ bool Glm5Model::fast_helper_check(std::string& err) {
     double worst = 0.0;
     for (int il = l0_; il < lt_; ++il) {
         const auto& Ly = F->L[(size_t) il];
-        if (!Ly.moe || Ly.exl3) continue;
+        if (!Ly.moe) continue;
         std::vector<int> owned;
         for (int e = 0; e < g.n_expert; ++e)
             if (F->helper.owns(il * g.n_expert + e)) owned.push_back(e);
@@ -2335,7 +2374,7 @@ bool Glm5Model::fast_helper_check(std::string& err) {
             const int rs = F->ram_of[(size_t) keys[i]];
             if (rs >= 0) {
                 const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-                if (std::memcmp(R.base + (size_t) rs * R.stride, F->stage[0], Ly.blob) != 0)
+                if (std::memcmp(R.slot((size_t) rs), F->stage[0], Ly.blob) != 0)
                     return fail("GLM helper check: CUDA" + std::to_string(dev_) + "'s RAM tier holds other bytes than the "
                                 "pack for layer " + std::to_string(il) + " expert " + std::to_string(e));
             }
@@ -2349,13 +2388,33 @@ bool Glm5Model::fast_helper_check(std::string& err) {
             !glmfast::cuda_ok(cudaMemcpyAsync(plan.plan_w, w, (size_t) n * sizeof(float), cudaMemcpyHostToDevice, s),
                               "GLM helper check weights", err))
             return fail("");
-        gf::moe_gate_up(Ly.gu_type, plan, n, g.n_embd, g.n_ff_exp, g.swiglu_exp, xq, hq, nullptr, 0, nullptr, 0, nullptr, s);
-        gf::moe_down(Ly.d_type, plan, n, g.n_embd, g.n_ff_exp, Ly.down_off, hq, nullptr, out_d, s);
+        const int x3_errors = strata::kernels::exl3::launch_errors();
+        if (Ly.exl3) {
+            // EXL3: the trunk's decode call over the F32 input (fast_moe_experts), no CPU part, no shared expert
+            strata::kernels::exl3::MoeArgs xa;
+            xa.plan_ptr = plan.plan_ptr;
+            xa.plan_w = plan.plan_w;
+            xa.lay = Ly.xl;
+            xa.k = n;
+            xa.n_embd = g.n_embd;
+            xa.n_ff = g.n_ff_exp;
+            xa.limit = g.swiglu_exp;
+            strata::kernels::exl3::moe_gate_up(xa, x_d, nullptr, s);
+            strata::kernels::exl3::moe_down(xa, nullptr, nullptr, out_d, s);
+        } else {
+            gf::moe_gate_up(Ly.gu_type, plan, n, g.n_embd, g.n_ff_exp, g.swiglu_exp, xq, hq, nullptr, 0, nullptr, 0, nullptr, s);
+            gf::moe_down(Ly.d_type, plan, n, g.n_embd, g.n_ff_exp, Ly.down_off, hq, nullptr, out_d, s);
+        }
         if (!glmfast::cuda_ok(cudaMemcpyAsync(ref.data(), out_d, ref.size() * sizeof(float), cudaMemcpyDeviceToHost, s),
                               "GLM helper check result", err) ||
             !glmfast::cuda_ok(cudaStreamSynchronize(s), "GLM helper check", err))
             return fail("");
-        if (!F->helper.compute(Ly.gu_type, Ly.d_type, Ly.down_off, g.swiglu_exp, n, keys, w, x.data(), got.data(), err))
+        if (Ly.exl3 && strata::kernels::exl3::launch_errors() != x3_errors)
+            return fail("GLM helper check: CUDA" + std::to_string(dev_) + "'s EXL3 kernels did not run for layer " +
+                        std::to_string(il));
+        if (!(Ly.exl3 ? F->helper.compute_exl3(Ly.xl, g.swiglu_exp, n, keys, w, x.data(), got.data(), err)
+                      : F->helper.compute(Ly.gu_type, Ly.d_type, Ly.down_off, g.swiglu_exp, n, keys, w, x.data(),
+                                          got.data(), err)))
             return fail("");
         if (!glmfast::cuda_ok(cudaSetDevice(dev_), "GLM helper check device", err)) return fail("");
         double d2 = 0.0, r2 = 0.0;
@@ -5036,8 +5095,10 @@ void Glm5Model::fast_service() {
                 const auto& ly = F->L[(size_t) rq->layer];
                 std::fill_n(ans->part, g.n_embd, 0.0f);
                 if (F->helper_failed.load(std::memory_order_acquire) || (hn > 0 &&
-                    !F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys, helper_w,
-                                       rq->x, ans->part, F->helper_error))) {
+                    !(ly.exl3 ? F->helper.compute_exl3(ly.xl, g.swiglu_exp, hn, helper_keys, helper_w, rq->x, ans->part,
+                                                       F->helper_error)
+                              : F->helper.compute(ly.gu_type, ly.d_type, ly.down_off, g.swiglu_exp, hn, helper_keys,
+                                                  helper_w, rq->x, ans->part, F->helper_error)))) {
                     // Retire the request so the main GPU can finish and report the error, not spin forever.
                     std::fill_n(ans->part, g.n_embd, 0.0f);
                     F->helper_failed.store(true, std::memory_order_release);

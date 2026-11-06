@@ -5,7 +5,8 @@
 #
 # The FP32 decode is built for sm_6x only: on compute capability 7 and later legacy-f32 is accepted and runs the FP16
 # kernels - the start-up line "exl3: CUDA<n> decodes with v1.1.8's kernels (legacy-f32 is built for sm_6x only; the
-# same bits)" and legacy_f32() false; the same bytes.
+# same bits)" and legacy_f32() false; the same bytes.  STRATA_GLM_EXL3_DECODE<n> (device n's own setting) the same,
+# over the global setting; one that names no decode falls back to the global one.
 #
 # Each invocation writes its dumps to a directory of its own under OUT (two runs in one build directory at once, e.g.
 # ctest on two GPUs, would otherwise overwrite each other's files) and removes it when every check passes.
@@ -35,8 +36,10 @@ file(MAKE_DIRECTORY "${DIR}")
 set(_line_legacy "exl3: CUDA[0-9]+ decodes with v1\\.1\\.8's kernels\n")
 set(_line_f32 "exl3: CUDA[0-9]+ decodes with v1\\.1\\.8's kernels, FP32 decode\n")
 set(_line_f32_off "exl3: CUDA[0-9]+ decodes with v1\\.1\\.8's kernels \\(legacy-f32 is built for sm_6x only; the same bits\\)\n")
-# the environment every run starts from: no decode setting of the caller's
-set(_clean_env --unset=MAYA_GLM_EXL3_DECODE --unset=STRATA_GLM_EXL3_DECODE)
+# the environment every run starts from: no decode setting of the caller's (exl3_test runs on device 0: its own
+# setting is STRATA_GLM_EXL3_DECODE0)
+set(_clean_env --unset=MAYA_GLM_EXL3_DECODE --unset=STRATA_GLM_EXL3_DECODE
+               --unset=MAYA_GLM_EXL3_DECODE0 --unset=STRATA_GLM_EXL3_DECODE0)
 
 # one run with the settings in ARGN (NAME=value): its log (stdout and stderr) in <var>; a non-zero exit fails the test
 function(_dump tag var)
@@ -143,9 +146,20 @@ set(_bad_all "")
 _dump(legacy log_legacy STRATA_GLM_EXL3_DECODE=legacy)
 _dump(legacy-f32 log_f32 STRATA_GLM_EXL3_DECODE=legacy-f32)
 _dump(unset log_unset)
+# the device's own setting (STRATA_GLM_EXL3_DECODE<n>) over the global one, both ways; one that names no decode falls
+# back to the global one
+_dump(dev-f32 log_dev_f32 STRATA_GLM_EXL3_DECODE=legacy STRATA_GLM_EXL3_DECODE0=legacy-f32)
+_dump(dev-legacy log_dev_legacy STRATA_GLM_EXL3_DECODE=legacy-f32 STRATA_GLM_EXL3_DECODE0=legacy)
+_dump(dev-invalid log_dev_invalid STRATA_GLM_EXL3_DECODE=legacy-f32 STRATA_GLM_EXL3_DECODE0=bogus)
 _expect(legacy "${log_legacy}" plain)
 _expect(legacy-f32 "${log_f32}" f32)
 _expect(unset "${log_unset}" default)
+_expect(dev-f32 "${log_dev_f32}" f32)
+_expect(dev-legacy "${log_dev_legacy}" plain)
+_expect(dev-invalid "${log_dev_invalid}" f32)
+_same(dev-f32 "${log_dev_f32}")
+_same(dev-legacy "${log_dev_legacy}")
+_same(dev-invalid "${log_dev_invalid}")
 # legacy-f32's bytes are legacy's (on sm_70+ too, where it runs the FP16 kernels)
 _same(legacy-f32 "${log_f32}")
 # the default: where it takes v1.1.8's kernels, their bytes
