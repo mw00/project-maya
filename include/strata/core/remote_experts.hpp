@@ -1,6 +1,8 @@
 #pragma once
 
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/plugin_experts.hpp"
+#include <memory>
 #include "strata/core/expert_source.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
@@ -23,6 +25,22 @@ public:
     GlmExpertHelper& operator=(const GlmExpertHelper&) = delete;
     bool open(int device, int n_embd, int n_ff,
               const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+    bool open_plugin(const std::string& path, int device, size_t budget, int width, int ff,
+                     const std::vector<PluginExperts::Layout>& layouts, const std::vector<int>& ranked,
+                     std::string& error);
+    bool external() const { return plugin_ != nullptr; }
+    bool can_read(int key) const { return plugin_ && plugin_->can_read(key); }
+    bool read(int key, void* output, size_t bytes, std::string& error) {
+        return plugin_ && plugin_->read(key, output, bytes, error);
+    }
+    double prefill_share() const { return plugin_ ? plugin_->prefill_share() : 0; }
+    bool can_rows(int key) const { return plugin_ && plugin_->can_rows(key); }
+    bool compute_rows(int n, int tokens, const int* keys, const int* row_tok,
+                      const float* input, float clamp, float* output, std::string& error) {
+        return plugin_ && plugin_->compute_rows(n,tokens,keys,row_tok,input,clamp,output,error);
+    }
+    bool selected(int key) const { return plugin_ && plugin_->selected(key); }
+    const char* backend_label() const { return external() ? "plugin" : "CUDA"; }
     bool reserve(int keys, size_t requested_bytes, std::string& err);
     bool insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
     bool replace(int out, int in, const uint8_t* host, std::string& err);
@@ -43,6 +61,7 @@ public:
     int device() const { return device_; }
 
 private:
+    std::unique_ptr<PluginExperts> plugin_;
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
     std::vector<Region> regions_;
     struct Slot { uint8_t* host = nullptr; uint8_t* device = nullptr; size_t bytes = 0; };

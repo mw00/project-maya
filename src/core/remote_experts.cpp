@@ -139,6 +139,19 @@ bool GlmExpertHelper::open(int device, int n_embd, int n_ff,
     return true;
 }
 
+bool GlmExpertHelper::open_plugin(const std::string& path, int device, size_t budget, int width, int ff,
+    const std::vector<PluginExperts::Layout>& layouts, const std::vector<int>& ranked, std::string& error) {
+    close();
+    plugin_ = std::make_unique<PluginExperts>();
+    if (!plugin_->open(path, device, budget, width, ff, layouts, ranked, error)) { plugin_.reset(); return false; }
+    device_ = device; n_embd_ = width; n_ff_ = ff;
+    capacity_ = plugin_->capacity(); used_ = 0;
+    slots_.assign(layouts.size(), {}); owned_.assign(layouts.size(), 0);
+    std::fprintf(stderr, "glm plugin: allocated %.2f MiB within %.2f MiB budget on plugin device %d\n",
+                 double(plugin_->allocated())/1048576.0, double(budget)/1048576.0, device);
+    return true;
+}
+
 bool GlmExpertHelper::reserve(int keys, size_t requested_bytes, std::string& err) {
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
@@ -157,6 +170,10 @@ bool GlmExpertHelper::reserve(int keys, size_t requested_bytes, std::string& err
 }
 
 bool GlmExpertHelper::insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err) {
+    if (plugin_) {
+        if (!plugin_->insert(key, host, bytes, err)) return false;
+        slots_[(size_t) key] = {nullptr, nullptr, bytes}; owned_[(size_t) key] = 1; used_ += bytes; return true;
+    }
     if (key < 0 || (size_t) key >= slots_.size() || owns(key) || bytes > stride || stride > available()) {
         err = "GLM expert helper: invalid cache insertion"; return false;
     }
@@ -185,6 +202,11 @@ bool GlmExpertHelper::insert(int key, const uint8_t* host, size_t bytes, size_t 
 bool GlmExpertHelper::replace(int out, int in, const uint8_t* host, std::string& err) {
     if (out < 0 || (size_t) out >= slots_.size() || in < 0 || (size_t) in >= slots_.size() || !owns(out) || owns(in)) {
         err = "GLM expert helper: invalid cache replacement"; return false;
+    }
+    if (plugin_) {
+        if (!plugin_->replace(out, in, host, err)) return false;
+        slots_[(size_t) in] = slots_[(size_t) out]; slots_[(size_t) out] = {};
+        owned_[(size_t) out] = 0; owned_[(size_t) in] = 1; return true;
     }
     Slot s = slots_[(size_t) out];
     if (integrated_) {
@@ -243,6 +265,7 @@ std::vector<GlmExpertHelper::Swap> GlmExpertHelper::swaps(const std::vector<uint
 bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                               const int* keys, const float* weights, const float* x,
                               float* out, std::string& err) {
+    if (plugin_) return plugin_->compute(gu_type, d_type, down_off, limit, ne, keys, weights, x, out, err);
     namespace gf = strata::kernels::glmf;
     if (device_ < 0 || ne < 1 || ne > 8 || !gf::moe_supported(gu_type) || !gf::moe_supported(d_type)) {
         err = "GLM expert helper: unsupported expert types or route width";
@@ -303,6 +326,9 @@ bool GlmExpertHelper::compute(int gu_type, int d_type, size_t down_off, float li
 }
 
 void GlmExpertHelper::close() {
+    if (plugin_) {
+        plugin_.reset(); device_ = -1; capacity_ = used_ = 0; slots_.clear(); owned_.clear(); return;
+    }
     if (device_ < 0) return;
     if (prof_ && calls_ > 0) {
         const double n = (double) calls_, kernels_ms = stage_ms_[2] + stage_ms_[3];

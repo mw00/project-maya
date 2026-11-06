@@ -2168,3 +2168,23 @@ untested and refused unless this is set when the setup or `--check` runs (in the
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_HIP_ALLOW_ROCM6` | unset (ROCm 6 refused) | `1`: the setup goes on with a ROCm 6.x, with a warning (untested: the build or the engine may fail); the build then takes hipBLAS 2's `HIPBLAS_V2` API and leaves out `hipblasSetWorkspace`, which hipBLAS 2 does not have |
+
+## Experimental external GLM expert executor
+
+Linux CUDA builds can use a separately compiled HIP expert helper for decode,
+weight backing and optional prefill work. This feature is off by default. See
+[External expert executor](EXPERT_PLUGIN.md) for the build, settings, ownership
+rules and current capability limits.
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `STRATA_GLM_EXPERT_PLUGIN` | unset | Absolute executor library path; opt-in. |
+| `STRATA_GLM_EXPERT_PLUGIN_DEVICE` | required with plugin | Helper runtime's device ordinal. |
+| `STRATA_GLM_EXPERT_PLUGIN_MIB` | required with plugin | Helper allocation budget, including scratch. |
+| `STRATA_GLM_EXPERT_PLUGIN_READ` | off | Read helper weights for CUDA prefill. |
+| `STRATA_GLM_EXPERT_PLUGIN_PREFILL_SHARE` | `0` | Helper prefill row-fraction cap, `0..0.49`. |
+| `STRATA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS` | `16` | Per-expert prefill admission limit. |
+| `STRATA_GLM_HELPER_COST` | `0` | Opt into measured-cost prefill admission for the external helper. Requires a positive helper prefill share; retains share and buffer bounds. See [cost-based admission](EXPERT_PLUGIN.md#cost-based-prefill-admission). |
+| `STRATA_GLM_HELPER_COST_TRACE` | `0` | Print observed per-layer helper/staging costs for diagnosis, including with adaptive admission off. Keep off for throughput tests. |
+| `STRATA_GLM_EXPERT_PLUGIN_PRESTAGE` | `0` | Per-layer helper-backed prestage cap. |
+| `STRATA_GLM_HELPER_ZEROCOPY` (external executor) | off | Opt into mapped decode buffers on integrated devices. |
