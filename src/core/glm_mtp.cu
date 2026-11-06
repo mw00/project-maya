@@ -207,8 +207,11 @@ void Glm5Model::mtp_draft_setup(bool chain) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const WSlot& ow = ws_map_.at("output.weight");
-    const size_t hb = ow.type == 0 ? (size_t) g.n_embd * sizeof(float) : ggml_row_size((ggml_type) ow.type, g.n_embd);
-    const void* head = ow.type == 0 ? (const void*) ow.f32 : ow.q;
+    // an EXL3 head (a type past ggml's table) has no rows to gather: it drafts over the whole vocabulary (#857: its
+    // ggml_row_size divided by zero)
+    const bool gguf_head = ow.type < (int) GGML_TYPE_COUNT;
+    const size_t hb = !gguf_head ? 0 : ow.type == 0 ? (size_t) g.n_embd * sizeof(float) : ggml_row_size((ggml_type) ow.type, g.n_embd);
+    const void* head = !gguf_head ? nullptr : ow.type == 0 ? (const void*) ow.f32 : ow.q;
     if (mtp_vlead_ > 0 && head != nullptr) {
         const int dx = (int) mtp_vextra_.size();
         bool ok = true;
