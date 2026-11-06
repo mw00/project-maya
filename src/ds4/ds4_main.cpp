@@ -1343,6 +1343,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                           (double) (s.store_hits - s_dec.store_hits) / fed, (double) (s.store_misses - s_dec.store_misses) / fed,
                           (s.store_wait_ms - s_dec.store_wait_ms) / fed);
             out += b;
+            std::snprintf(b, sizeof b, " store_grow=%lld store_shrink=%lld",
+                          (long long) (s.store_grown - s_dec.store_grown),
+                          (long long) (s.store_shrunk - s_dec.store_shrunk));
+            out += b;
         }
         if (s.helper_held > 0) {   // (DS4_HELPER: experts a token the helper GPU computed, the CPU lane for it after
                                    //  a failure; the service thread's wait for it, ms a token; its pool; failed)

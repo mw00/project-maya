@@ -47,3 +47,19 @@ jobs:
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
+
+  expert-store:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure the CPU-only expert-store tests
+        run: cmake -S tests/ds4_store -B build-store -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build-store --config Release
+      - name: Test fixed and layout-sized allocators
+        run: ctest --test-dir build-store -C Release --output-on-failure

@@ -8335,6 +8335,7 @@ struct Model::Impl {
         }
         ExpertStore::Cfg c;
         c.budget = (size_t) bytes;
+        c.sized_slots = store_env("DS4_STORE_SIZED", 1.0) != 0;
         c.floor = (size_t) (std::max(0.0, store_env("DS4_STORE_FLOOR_GB", 4.0)) * 1e9);
         c.grow_room = std::max(c.floor, (size_t) (std::max(0.0, store_env("DS4_STORE_GROW_GB", 8.0)) * 1e9));
         c.policy = o.ssd_policy == 1 ? ExpertStore::kLfu : ExpertStore::kLru;
@@ -8361,7 +8362,14 @@ struct Model::Impl {
         store_put = store_env("DS4_STORE_PUT", 1.0) != 0;
         store_ahead = store_env("DS4_STORE_AHEAD", 0.0) != 0;
         store_flow = store_env("DS4_STORE_FLOW", 1.0) != 0;
-        std::fprintf(stderr, "ds4: RAM store (--ssd-cache): up to %zu experts in slots of %.1f MB (%.1f GB; the CPU lane "
+        if (c.sized_slots) std::fprintf(stderr, "ds4: RAM store (--ssd-cache): %zu size classes, %.1f GB shared budget, "
+                             "%zu expert identities at most (the CPU lane reads %zu in place), %s, %d readers, %s; "
+                             "below %.1f GB of free RAM it gives RAM back\n",
+                     store->size_classes(), bytes / 1e9, store->slots_max(), lane,
+                     c.policy == ExpertStore::kLfu ? "lfu" : "lru", c.readers,
+                     direct ? "reads past the page cache" : "reads through the page cache (no unbuffered handle)",
+                     c.floor / 1e9);
+        else std::fprintf(stderr, "ds4: RAM store (--ssd-cache): up to %zu experts in slots of %.1f MB (%.1f GB; the CPU lane "
                              "reads %zu in place), %s, %d readers, %s; below %.1f GB of free RAM it gives RAM back\n",
                      store->slots_max(), sb / 1e6, store->slots_max() * (double) sb / 1e9, lane,
                      c.policy == ExpertStore::kLfu ? "lfu" : "lru", c.readers,
@@ -8385,9 +8393,12 @@ struct Model::Impl {
                 if (store->covers(x.first)) list.push_back(x);
             const double t0 = now_ms();
             const size_t n = store->preload(list, 0);
-            std::fprintf(stderr, "ds4: RAM store: %zu experts read in at load (%.1f GB, %.1f s) - the profile's hottest "
+            std::fprintf(stderr, "ds4: RAM store: %zu experts read in at load (%.1f GB backing, %.1f GB payload, "
+                                 "%.1f GB free, %.1f s) - the profile's hottest "
                                  "CPU-lane experts first (%zu)%s\n",
-                         n, n * (double) sb / 1e9, (now_ms() - t0) / 1000.0, std::min(n, n_hot),
+                         n, store->allocated_bytes() / 1e9, store->payload_bytes() / 1e9,
+                         (store->allocated_bytes() - store->active_bytes()) / 1e9,
+                         (now_ms() - t0) / 1000.0, std::min(n, n_hot),
                          spare ? ", then the VRAM ones it counts least (DS4_STORE_SPARE)" : "");
         }
         store->watch_every(1000);
@@ -11464,6 +11475,8 @@ struct Model::Impl {
         const ExpertStore::Counts& c = store->counts();
         st.store_slots = (int64_t) store->slots_max();
         st.store_held = (int64_t) store->held();
+        st.store_grown = c.grown.load(std::memory_order_relaxed);
+        st.store_shrunk = c.shrunk.load(std::memory_order_relaxed);
         st.store_hits = c.hits.load(std::memory_order_relaxed);
         st.store_misses = c.misses.load(std::memory_order_relaxed);
         st.store_no_slot = c.no_slot.load(std::memory_order_relaxed);
@@ -22801,6 +22814,7 @@ Model::Tiers Model::tiers() const {
     else t.ram = t.cpu;
     if (m.store) t.ram = (int) std::min<size_t>((size_t) t.cpu, (size_t) t.ram + m.store->held());
     t.ram_gb = t.ram * t.cpu_blob / 1e9;
+    if (m.store) t.ram_gb = ((double) m.ram_held * t.cpu_blob + (double) m.store->payload_bytes()) / 1e9;
     t.disk_gb = std::max(0, t.cpu - t.ram) * t.cpu_blob / 1e9;
     return t;
 }

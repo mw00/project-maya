@@ -32,7 +32,8 @@ namespace os = strata::ds4::os;
 
 namespace {
 
-int failures = 0;
+std::atomic<int> failures{0};
+bool sized_test_mode = false;
 #define EXPECT(c)                                                               \
     do {                                                                        \
         if (!(c)) {                                                             \
@@ -162,6 +163,7 @@ struct Mk {
 };
 bool make_store(const Model& m, const Mk& k, ExpertStore& st) {
     ExpertStore::Cfg c;
+    c.sized_slots = sized_test_mode;
     c.chunk_slots = k.chunk;
     c.policy = k.policy;
     c.readers = k.readers;
@@ -439,11 +441,12 @@ void test_shrink(const Model& m) {
     if (s >= 0) EXPECT(same(m, 0, 7, 2, st.mat_of(s, 2)));
     avail = 3 * G;   // (below the 4 GB floor)
     size_t gave = st.watch();
-    EXPECT(gave == 0);
-    EXPECT(st.slots_now() == 8);
+    EXPECT(gave == (sized_test_mode ? 3u : 0u));
+    EXPECT(st.slots_now() == (sized_test_mode ? 2u : 8u));
+    if (s >= 0) EXPECT(same(m, 0, 7, 2, st.mat_of(s, 2)));
     if (s >= 0) st.unpin(s);
     gave = st.watch();
-    EXPECT(gave == 4);
+    EXPECT(gave == (sized_test_mode ? 1u : 4u));
     EXPECT(st.slots_now() == 0 && st.held() == 0);
     EXPECT(!st.has(0, 0) && !st.has(0, 7));
     EXPECT(st.counts().shrunk.load() == 4);
@@ -453,7 +456,7 @@ void test_shrink(const Model& m) {
     EXPECT(st.watch() == 0);
     const std::vector<uint8_t> b = ask(st, m, 0, {1});
     EXPECT(b.size() == 1 && b[0] == ExpertStore::kMiss);
-    EXPECT(st.slots_now() == 2);
+    EXPECT(st.slots_now() == (sized_test_mode ? 1u : 2u));
     avail = 5 * G;   // (above the floor: kept, but no new chunk)
     EXPECT(st.watch() == 0);
     ask(st, m, 0, {2});
@@ -553,6 +556,319 @@ void test_put(const Model& m) {
 
 }  // namespace
 
+void test_pool_reclaim_free_first(const std::string& dir) {
+    Model m;
+    EXPECT(make_model(dir, m));
+    for (int r = 0; r < 3; ++r) m.geo[0].bytes[r] = 1000;
+    ExpertStore st;
+    ExpertStore::Cfg c;
+    c.chunk_slots = 1;
+    c.budget = ExpertStore::slot_layout({m.geo[0]}) + ExpertStore::slot_layout({m.geo[2]});
+    c.floor = 1ull << 30;
+    c.grow_room = 2ull << 30;
+    std::atomic<uint64_t> available{16ull << 30};
+    c.ram_avail = [&] { return available.load(); };
+    std::string err;
+    EXPECT(st.init(c, m.geo, m.files, err));
+    ask(st, m, 0, {0});
+    ask(st, m, 2, {0});
+    const int pinned = st.acquire(2, 0);
+    EXPECT(pinned >= 0);
+    const auto no = ask(st, m, 2, {1});
+    EXPECT(no.size() == 1 && no[0] == ExpertStore::kNone);
+    EXPECT(!st.has(0, 0) && st.has(2, 0));
+    if (pinned >= 0) st.unpin(pinned);
+    available = c.floor - 1;
+    EXPECT(st.watch() == 1);
+    EXPECT(st.has(2, 0) && st.held() == 1);
+    EXPECT(st.allocated_bytes() == ExpertStore::slot_layout({m.geo[2]}));
+}
+
+void test_pool_pending_headroom(const Model& m) {
+    ExpertStore st;
+    ExpertStore::Cfg c;
+    c.chunk_slots = 1;
+    const size_t bytes = ExpertStore::slot_layout(m.geo);
+    c.budget = 4 * bytes;
+    c.floor = 0;
+    c.grow_room = 1ull << 30;
+    std::atomic<uint64_t> available{c.grow_room + bytes};
+    c.ram_avail = [&] { return available.load(); };
+    Gate gate;
+    gate.shut.insert({0, 0});
+    c.before_read = [&](const ExpertStore::ReadNote& n) { gate.hook(n); };
+    std::string err;
+    EXPECT(st.init(c, m.geo, m.files, err));
+    ExpertStore::Hold waiting, blocked, later;
+    int expert = 0;
+    st.begin(0, &expert, 1, waiting);
+    st.begin(1, &expert, 1, blocked);
+    EXPECT(waiting.st[0] == ExpertStore::kMiss && blocked.st[0] == ExpertStore::kNone);
+    EXPECT(st.counts().grown.load() == 1 && st.allocated_bytes() == bytes);
+    gate.open(0, 0);
+    std::vector<int> got;
+    while (st.next(waiting, got, true)) {}
+    EXPECT(waiting.st[0] == ExpertStore::kHit);
+    available = c.grow_room + 3 * bytes;
+    st.begin(1, &expert, 1, later);
+    while (st.next(later, got, true)) {}
+    EXPECT(later.st[0] == ExpertStore::kHit && st.counts().grown.load() == 2);
+    for (int r = 0; r < 3; ++r) EXPECT(same(m, 0, 0, r, st.mat(waiting, 0, r)));
+    st.release(waiting); st.release(blocked); st.release(later);
+}
+
+void test_pool_concurrent(const Model& m) {
+    ExpertStore st;
+    ExpertStore::Cfg c;
+    c.chunk_slots = 2;
+    c.budget = 8 * ExpertStore::slot_layout(m.geo);
+    c.floor = 1ull << 30;
+    c.grow_room = 2ull << 30;
+    std::atomic<uint64_t> available{16ull << 30};
+    c.ram_avail = [&] { return available.load(); };
+    std::string err;
+    EXPECT(st.init(c, m.geo, m.files, err));
+    ask(st, m, 0, {0});
+    const int pinned = st.acquire(0, 0);
+    EXPECT(pinned >= 0);
+    std::atomic<bool> done{false};
+    std::thread pressure([&] {
+        while (!done.load()) {
+            available = 0;
+            st.watch();
+            available = 16ull << 30;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    std::vector<std::thread> clients;
+    for (int client = 0; client < 4; ++client)
+        clients.emplace_back([&, client] {
+            for (int i = 0; i < 256; ++i) {
+                ask(st, m, (i + client) % 3, {1 + (i * 3 + client) % 7});
+                EXPECT(st.active_bytes() <= c.budget);
+                EXPECT(st.allocated_bytes() <= c.budget);
+            }
+        });
+    for (auto& client : clients) client.join();
+    done = true;
+    pressure.join();
+    if (pinned >= 0) {
+        for (int r = 0; r < 3; ++r) EXPECT(same(m, 0, 0, r, st.mat_of(pinned, r)));
+        st.unpin(pinned);
+    }
+    available = 0;
+    st.watch();
+    EXPECT(st.allocated_bytes() == 0 && st.active_bytes() == 0 && st.held() == 0);
+}
+
+void test_pool_repack(const std::string& dir) {
+    Model m;
+    EXPECT(make_model(dir, m));
+    const size_t page = ExpertStore::kAlign;
+    for (int r = 0; r < 3; ++r) {
+        m.geo[0].bytes[r] = page;
+        m.geo[1].bytes[r] = page;
+        m.geo[2].bytes[r] = 4 * page;
+    }
+    std::vector<uint8_t> data[3];
+    const uint8_t* src[3];
+    for (int r = 0; r < 3; ++r) {
+        data[r].resize(4 * page);
+        for (size_t i = 0; i < data[r].size(); ++i) data[r][i] = byte_at(r, i);
+        src[r] = data[r].data();
+    }
+    ExpertStore::Cfg c;
+    c.budget = 15 * page;
+    c.chunk_slots = 1;
+    c.floor = c.grow_room = 0;
+    ExpertStore st;
+    std::string err;
+    EXPECT(st.init(c, m.geo, m.files, err));
+    EXPECT(st.put(0, 0, src));
+    EXPECT(st.put(1, 0, src));
+    EXPECT(st.active_bytes() == 12 * page && st.allocated_bytes() == c.budget);
+    EXPECT(st.put(2, 0, src));
+    EXPECT(st.held() == 1 && st.active_bytes() == c.budget && st.allocated_bytes() == c.budget);
+    EXPECT(st.counts().grown.load() == 3 && st.counts().shrunk.load() == 2);
+    int id = st.acquire(2, 0);
+    EXPECT(id >= 0);
+    if (id >= 0) {
+        for (int r = 0; r < 3; ++r) EXPECT(std::memcmp(st.mat_of(id, r), src[r], data[r].size()) == 0);
+        st.unpin(id);
+    }
+
+    int calls = 0;
+    bool room = false;
+    c.ram_avail = [&] { return room ? (uint64_t) c.budget : ++calls == 1 ? 5 * page : 0; };
+    ExpertStore limited;
+    EXPECT(limited.init(c, m.geo, m.files, err));
+    EXPECT(!limited.put(2, 0, src));
+    EXPECT(limited.held() == 0 && limited.active_bytes() == 0 && limited.allocated_bytes() == 0);
+    room = true;
+    EXPECT(limited.put(2, 0, src));
+    EXPECT(limited.active_bytes() == c.budget && limited.allocated_bytes() == c.budget);
+    id = limited.acquire(2, 0);
+    EXPECT(id >= 0);
+    if (id >= 0) {
+        for (int r = 0; r < 3; ++r) EXPECT(std::memcmp(limited.mat_of(id, r), src[r], data[r].size()) == 0);
+        limited.unpin(id);
+    }
+}
+
+void test_sized_slots(const std::string& dir) {
+    Model m;
+    EXPECT(make_model(dir, m));
+    for (int r = 0; r < 3; ++r) {
+        m.geo[0].bytes[r] = 1000;
+        m.geo[1].bytes[r] = 5000;
+    }
+    const size_t small = ExpertStore::slot_layout({m.geo[0]});
+    const size_t large = ExpertStore::slot_layout(m.geo);
+    ExpertStore::Cfg c;
+    c.sized_slots = true;
+    c.chunk_slots = 4;
+    c.budget = 4 * small + large;
+    c.readers = 2;
+    ExpertStore st;
+    std::string err;
+    ExpertStore fixed;
+    ExpertStore::Cfg fallback = c;
+    fallback.sized_slots = false;
+    EXPECT(fixed.init(fallback, m.geo, m.files, err));
+    EXPECT(fixed.preload({{0,0}, {0,1}, {0,2}, {0,3}, {2,0}}, 0) == 2);
+    EXPECT(st.init(c, m.geo, m.files, err));
+    EXPECT(st.size_classes() == 3);
+    EXPECT(st.preload({{0,0}, {0,1}, {0,2}, {0,3}, {2,0}}, 0) == 5);
+    EXPECT(st.held() == 5 && fixed.held() == 2);
+    EXPECT(st.allocated_bytes() == 4 * small + large);
+    EXPECT(st.payload_bytes() == 4 * 3000 + kBytes[0] + kBytes[1] + kBytes[2]);
+    const int pinned = st.acquire(0, 0);
+    EXPECT(pinned >= 0);
+    const auto grown = st.counts().grown.load(), shrunk = st.counts().shrunk.load();
+    for (int i = 0; i < 2048; ++i) {
+        const int layer = i % 3, e = 1 + i % 7;
+        const auto kinds = ask(st, m, layer, {e});
+        EXPECT(kinds.size() == 1 && kinds[0] != ExpertStore::kNone);
+        EXPECT(st.allocated_bytes() <= c.budget);
+        EXPECT(st.active_bytes() <= st.allocated_bytes());
+        EXPECT(st.has(0, 0));
+        if (pinned >= 0) EXPECT(same(m, 0, 0, 2, st.mat_of(pinned, 2)));
+    }
+    EXPECT(st.counts().grown.load() == grown && st.counts().shrunk.load() == shrunk);
+    if (pinned >= 0) st.unpin(pinned);
+    // An expert larger than the whole byte budget must not evict the smaller resident experts.
+    ExpertStore tiny;
+    c.budget = 2 * small;
+    EXPECT(tiny.init(c, m.geo, m.files, err));
+    EXPECT(tiny.preload({{0,0}, {0,1}}, 0) == 2);
+    const auto miss = ask(tiny, m, 2, {0});
+    EXPECT(miss.size() == 1 && miss[0] == ExpertStore::kNone);
+    EXPECT(tiny.held() == 2 && tiny.has(0, 0) && tiny.has(0, 1));
+
+    // In-flight reads in different size classes cannot be reclaimed to admit another class.
+    Gate gate;
+    gate.shut.insert({0,0}); gate.shut.insert({1,0});
+    ExpertStore busy;
+    c.budget = small + ExpertStore::slot_layout({m.geo[1]});
+    c.before_read = [&](const ExpertStore::ReadNote& n) { gate.hook(n); };
+    EXPECT(busy.init(c, m.geo, m.files, err));
+    ExpertStore::Hold a, b, no;
+    int e = 0;
+    busy.begin(0, &e, 1, a); busy.begin(1, &e, 1, b); busy.begin(2, &e, 1, no);
+    EXPECT(a.slot[0] >= 0 && b.slot[0] >= 0 && no.slot[0] < 0);
+    EXPECT(busy.held() == 2 && busy.allocated_bytes() <= c.budget);
+    { std::lock_guard<std::mutex> lock(gate.mu); gate.shut.clear(); }
+    gate.cv.notify_all();
+    std::vector<int> got;
+    EXPECT(busy.next(a, got, true)); EXPECT(a.st[0] == ExpertStore::kHit);
+    EXPECT(busy.next(b, got, true)); EXPECT(b.st[0] == ExpertStore::kHit);
+    EXPECT(same(m, 0, 0, 0, busy.mat(a, 0, 0)));
+    EXPECT(same(m, 1, 0, 2, busy.mat(b, 0, 2)));
+    busy.release(a); busy.release(b); busy.release(no);
+    Model equal;
+    EXPECT(make_model(dir, equal));
+    equal.geo[0].bytes[1] = 5000;
+    equal.geo[1].bytes[0] = 5000;
+    const size_t equal_bytes = ExpertStore::slot_layout({equal.geo[0]});
+    EXPECT(equal_bytes == ExpertStore::slot_layout({equal.geo[1]}));
+    for (ExpertStore::Policy policy : {ExpertStore::kLru, ExpertStore::kLfu}) {
+        ExpertStore global;
+        c.budget = 2 * equal_bytes;
+        c.chunk_slots = 4;
+        c.before_read = nullptr;
+        c.ram_avail = nullptr;
+        c.policy = policy;
+        EXPECT(global.init(c, equal.geo, equal.files, err));
+        EXPECT(global.preload({{0,0}, {1,0}}, 0) == 2);
+        const int hot = global.acquire(1, 0);
+        EXPECT(hot >= 0);
+        if (hot >= 0) global.unpin(hot);
+        ask(global, equal, 1, {1});
+        EXPECT(!global.has(0, 0) && global.has(1, 0) && global.has(1, 1));
+        EXPECT(global.held() == 2 && global.allocated_bytes() == 2 * equal_bytes);
+    }
+
+    std::atomic<uint64_t> pressure{3ull << 30};
+    ExpertStore reclaim;
+    c.budget = small + large;
+    c.chunk_slots = 1;
+    c.floor = 1ull << 30;
+    c.grow_room = 2ull << 30;
+    c.ram_avail = [&] { return pressure.load(); };
+    EXPECT(reclaim.init(c, m.geo, m.files, err));
+    EXPECT(reclaim.preload({{0,0}, {2,0}}, 0) == 2);
+    const int held_large = reclaim.acquire(2, 0);
+    EXPECT(held_large >= 0);
+    pressure = c.floor - small;
+    EXPECT(reclaim.watch() == 1);
+    EXPECT(reclaim.allocated_bytes() == large && reclaim.slots_now() == 1);
+    EXPECT(!reclaim.has(0, 0) && reclaim.has(2, 0));
+    if (held_large >= 0) {
+        EXPECT(same(m, 2, 0, 2, reclaim.mat_of(held_large, 2)));
+        reclaim.unpin(held_large);
+    }
+    pressure = c.floor - large;
+    EXPECT(reclaim.watch() == 1);
+    EXPECT(reclaim.allocated_bytes() == 0 && reclaim.slots_now() == 0 && reclaim.payload_bytes() == 0);
+
+    ExpertStore leave_room;
+    c.budget = 4 * small + large;
+    c.chunk_slots = 4;
+    c.ram_avail = nullptr;
+    EXPECT(leave_room.init(c, m.geo, m.files, err));
+    std::vector<std::pair<int, int>> smalls;
+    for (int i = 0; i < kExp; ++i) smalls.push_back({0,i});
+    EXPECT(leave_room.preload(smalls, 1) == 4);
+    EXPECT(leave_room.active_bytes() == 4 * small);
+    EXPECT(leave_room.allocated_bytes() <= c.budget);
+    ask(leave_room, m, 2, {0});
+    EXPECT(leave_room.held() == 5 && leave_room.has(0, 0));
+
+    // Block every read: preload must release its bookkeeping lock after two admissions, not queue the budget.
+    std::atomic<uint64_t> available{(8 << 20) + 2 * small};
+    Gate preload_gate;
+    for (int i = 0; i < kExp; ++i) preload_gate.shut.insert({0,i});
+    ExpertStore bounded;
+    c.chunk_slots = 2;
+    c.budget = 8 * small;
+    c.grow_room = 8 << 20;
+    c.floor = 4 << 20;
+    c.ram_avail = [&] { return available.load(); };
+    c.before_read = [&](const ExpertStore::ReadNote& n) { preload_gate.hook(n); };
+    EXPECT(bounded.init(c, m.geo, m.files, err));
+    std::vector<std::pair<int,int>> candidates;
+    for (int i = 0; i < kExp; ++i) candidates.push_back({0,i});
+    size_t preloaded = 0;
+    std::thread loader([&] { preloaded = bounded.preload(candidates, 0); });
+    EXPECT(wait_for([&] { std::lock_guard<std::mutex> lock(preload_gate.mu); return !preload_gate.notes.empty(); }));
+    EXPECT(bounded.held() == 2 && bounded.allocated_bytes() == 2 * small);
+    available = c.grow_room;
+    { std::lock_guard<std::mutex> lock(preload_gate.mu); preload_gate.shut.clear(); }
+    preload_gate.cv.notify_all();
+    loader.join();
+    EXPECT(preloaded == 2 && bounded.held() == 2);
+}
+
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : ".";
     Model m;
@@ -563,18 +879,27 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "ds4_store_test: files in %s (O_DIRECT %s)\n", dir.c_str(),
                  m.direct_open ? "opened" : "refused: buffered reads only");
     test_auto_size();
-    test_reads(m, true);
-    test_reads(m, false);
-    test_direct_refused(m);
-    test_lru(m);
-    test_lfu(m);
-    test_pinned(m);
-    test_queue(m);
-    test_preload(m);
-    test_shrink(m);
-    test_split(m);
-    test_put(m);
+    test_pool_reclaim_free_first(dir);
+    test_pool_pending_headroom(m);
+    test_pool_concurrent(m);
+    test_pool_repack(dir);
+    test_sized_slots(dir);
+    for (bool sized : {false, true}) {
+        sized_test_mode = sized;
+        std::fprintf(stderr, "  allocator: %s\n", sized ? "layout-sized" : "fixed");
+        test_reads(m, true);
+        test_reads(m, false);
+        test_direct_refused(m);
+        test_lru(m);
+        test_lfu(m);
+        test_pinned(m);
+        test_queue(m);
+        test_preload(m);
+        test_shrink(m);
+        test_split(m);
+        test_put(m);
+    }
     if (failures == 0) std::fprintf(stderr, "ds4_store_test: ALL OK\n");
-    else std::fprintf(stderr, "ds4_store_test: %d FAILED\n", failures);
+    else std::fprintf(stderr, "ds4_store_test: %d FAILED\n", failures.load());
     return failures == 0 ? 0 : 1;
 }

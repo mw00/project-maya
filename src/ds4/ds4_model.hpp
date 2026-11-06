@@ -132,6 +132,7 @@ struct Stats {
     // (and of them could not take: read in place), the lookahead's guesses (started, asked for later, dropped unread),
     // experts the VRAM cache put in, experts given up, failed reads, the CPU lane's waits for its reads
     int64_t store_slots = 0, store_held = 0;
+    int64_t store_grown = 0, store_shrunk = 0;
     int64_t store_hits = 0, store_misses = 0, store_no_slot = 0;
     int64_t store_guesses = 0, store_guess_used = 0, store_cancelled = 0;
     int64_t store_put = 0, store_evicted = 0, store_failed = 0;

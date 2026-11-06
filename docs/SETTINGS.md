@@ -1067,10 +1067,16 @@ experts came (`RAM store: ...`; STAT lines: `store_hit=`, `store_miss=`, `store_
 
 The `DS4_STORE_*` settings go in a config's `"env"`, or as `MAYA_DS4_STORE_*` in the settings.
 
+The DeepSeek GGUF RAM store packs layout-sized matrices into reusable backing chunks by default. The shared byte
+budget includes active matrices, retained free spans and padding. Eviction returns spans to the pool, where adjacent
+free spans coalesce; RAM pressure releases unpinned chunks. LRU/LFU replacement remains global. Unpopulated backing
+reserves headroom until its reads complete, and preload waits for bounded batches before checking headroom again.
+
 | Setting | Default | |
 | --- | --- | --- |
 | `--ssd-cache GB\|auto\|off` (or `DS4_STORE_GB`) | off | the store's size in GB, at most every expert it could hold; `auto`: the free RAM at load (after VRAM's experts and any RAM copies) less `DS4_STORE_ROOM_GB`, not started under 4 GB |
 | `--ssd-policy lru\|lfu` (or `DS4_STORE_POLICY`) | `lru` | which expert gives way when it is full |
+| `DS4_STORE_SIZED` | 1 | `1`: size RAM slots by expert layout under the shared byte budget. Global LRU/LFU, pinned-slot protection and the existing RAM floor are retained. `0`: fixed-size slots |
 | `DS4_STORE_ROOM_GB` | 12 | `auto` leaves this much of the free RAM to the system and the owner's programs |
 | `DS4_STORE_FLOOR_GB` | 4 | below this much free RAM the store gives chunks back |
 | `DS4_STORE_GROW_GB` | 8 | a new chunk only while this much RAM stays free beside it |
