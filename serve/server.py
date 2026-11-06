@@ -3430,8 +3430,11 @@ class Service:
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
-        if isinstance(self.vision, mm3_vision.Vision) and any(kind == "video" for kind, _ in media):
-            raise ValueError("MiniMax-M3.1 reads pictures, not videos")
+        if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
+            # the engines' own vision towers (DeepSeek, MiniMax) read pictures only: say so instead of dropping the
+            # video (with a picture next to it) or failing on a missing video encoder (without one)
+            raise ValueError(("MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
+                             + " reads pictures, not videos")
         if images and isinstance(self.vision, ENGINE_VISION):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
             # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
