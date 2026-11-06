@@ -922,6 +922,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 | --- | --- | --- |
 | `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy in one part is DMA'd from that copy, any format (the same bytes) |
 | `DS4_YOCO_FLOW` | off (0) | `1`: the YOCO prompt skip also on a layer split whose groups are on the flow (changes the answers slightly) |
+| `DS4_CHUNK_GFX11` | `4096` on RDNA 3 / 3.5 (gfx11) GPUs | the largest prompt chunk, in tokens, on gfx11 GPUs. Integrated ones (Strix / Gorgon Halo) read a long prompt faster in 4K chunks (experts resident); a discrete card that streams its experts from RAM can read faster in the default's larger chunks (one RX 7900 XTX: +15-45% prompt speed with `0`). `N`: this cap; `0`: the default chunk (changes the answers slightly) |
 | `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work (changes the answers slightly) |
 | `DS4_CHUNK_PER_GROUP` | 2 | with `DS4_CHUNK_AUTO=1`: chunks a group |
 | `DS4_CHUNK_AUTO_MIN` | 1024 | with `DS4_CHUNK_AUTO=1`: the smallest chunk, in tokens |
