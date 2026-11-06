@@ -384,8 +384,49 @@ __device__ __forceinline__ void load_tiles(const uint32_t* __restrict__ tile0, s
 // one slice's fragment from the lane's words: K = 4 straight from the registers (the lane's steps end in its own word,
 // the first three reach into the previous lane's), other K (a half-integer one too) through the warp's stage (4 K2
 // words)
-template <int K2, int cb>
+template <int K2, int cb, bool Perm = false>
 __device__ __forceinline__ void slice_frags(const uint32_t (&w)[Words<K2>::R], uint32_t* st, int lane, uint32_t (&f)[4]) {
+#if defined(STRATA_USE_HIP) && (defined(__GFX10__) || defined(__GFX11__) || defined(__GFX12__))
+    if constexpr (Perm && K2 == 4) {
+        // K = 2 without the stage: lane l's steps are in words l / 2 and l / 2 - 1 (the tile's last for l < 2), which
+        // lanes 0-15 hold - v_permlane16 within a row of 16 lanes, v_permlanex16 from the other row for lanes 16-31;
+        // no LDS round trip a slice.  The same words, so the same states and bits
+        const uint32_t v = w[0];
+        const uint32_t a0 = __builtin_amdgcn_permlane16(v, v, 0x33221100u, 0x77665544u, false, false);
+        const uint32_t a1 = __builtin_amdgcn_permlanex16(v, v, 0xBBAA9988u, 0xFFEEDDCCu, false, false);
+        const uint32_t b0 = __builtin_amdgcn_permlane16(v, v, 0x221100FFu, 0x66554433u, false, false);
+        const uint32_t b1 = __builtin_amdgcn_permlanex16(v, v, 0xAA998877u, 0xEEDDCCBBu, false, false);
+        const bool row1 = lane >= 16;
+        const uint32_t b = fsh(row1 ? a1 : a0, row1 ? b1 : b0, (1 - (lane & 1)) * 16);
+        uint32_t s[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) s[j] = b >> ((7 - j) * 2);
+        decode_states<cb>(s, f);
+        return;
+    }
+    if constexpr (Perm && (K2 & 1) != 0 && Words<K2>::R == 1) {
+        // a half-integer K without the stage: frag8_half's four words fetched from the lanes holding them (lane i
+        // holds word i) by ds_bpermute - no LDS write, no syncs.  The same words, so the same states and bits
+        constexpr int KA = K2 / 2, NW = 4 * K2, span = 18 + 3 * KA;
+        const int v = (int) w[0];
+        const int e7 = (lane * 4 + 4) * K2 + 128 * K2;   // (frag8_half's: one ring on, no negative bit index)
+        uint32_t s[8];
+#pragma unroll
+        for (int g = 0; g < 2; ++g) {
+            const int e = e7 - (1 - g) * 2 * K2;
+            const int hi = (e - 1) >> 5, lo = (e - span) >> 5, sh = ((hi + 1) << 5) - e;
+            const uint32_t whi = (uint32_t) __builtin_amdgcn_ds_bpermute((hi % NW) << 2, v);
+            const uint32_t wlo = (uint32_t) __builtin_amdgcn_ds_bpermute((lo % NW) << 2, v);
+            const uint32_t x = fsh(whi, wlo, sh);
+            s[4 * g + 3] = x;
+            s[4 * g + 2] = x >> (KA + 1);
+            s[4 * g + 1] = x >> (2 * KA + 1);
+            s[4 * g + 0] = x >> (3 * KA + 2);
+        }
+        decode_states<cb>(s, f);
+        return;
+    }
+#endif
     if constexpr (K2 == 8) {
         uint32_t s[8];
         states4(__shfl_sync(0xffffffffu, w[0], (lane + 31) & 31), w[0], s);
@@ -730,6 +771,16 @@ __device__ __forceinline__ void block_out(const float* red, const uint16_t* svh,
     had128(v, lane);
 #pragma unroll
     for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
+}
+// ... the same into the lane's own 4 (the shaped kernels' gate in registers: the lane that makes them uses them)
+__device__ __forceinline__ void block_out_r(const float* red, const uint16_t* svh, float (&dst)[4]) {
+    const int lane = threadIdx.x & 31;
+    float v[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) v[i] = red[lane * 4 + i];
+    had128(v, lane);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) dst[i] = __fmul_rn(v[i], h2f(svh[lane * 4 + i]));
 }
 // ... the clamped swiglu ...
 __device__ __forceinline__ float swiglu(float gv, float uv, float limit) {
@@ -1964,11 +2015,28 @@ constexpr int kWtP = 9;          // wt's pitch, words a decoded output row (8 + 
 #else
 constexpr int kWtP = 12;
 #endif
+// gfx11's own pitch: 12 words, so a decoded output row is two 16-byte loads (ds_load_b128) instead of eight single
+// words, its rows still on distinct banks for the eight a phase takes
+constexpr int kWtP11 = 12;
 template <int K2, int NR>
 struct WmmaSmem {   // (out, xb and wt at the same offsets for every K2: the mixed kernel keeps one for all classes)
+    static constexpr bool kUnion = false;
     float out[NR * kCols];
     __half xb[2 * NR * kXS];
-    uint32_t wt[kWarps * 16 * kWtP];   // a warp's decoded tile by output, 8 words a row (kWtP apart)
+    uint32_t wt[kWarps * 16 * (kWtP > kWtP11 ? kWtP : kWtP11)];   // a warp's decoded tile by output, 8 words a row
+    uint32_t stage[kWarps * 4 * K2];
+};
+// gfx11's shaped kernels: out over xb (out is written only once every warp has read xb's last chunk), so a block's
+// LDS no longer caps the waves a SIMD below what its registers allow (a 32-row gate / up block: 57 -> 41 KB, with the
+// gate in registers 24 KB; two blocks a WGP were 4 waves a SIMD)
+template <int K2, int NR>
+struct WmmaSmem11 {
+    static constexpr bool kUnion = true;
+    union {
+        float out[NR * kCols];
+        __half xb[2 * NR * kXS];
+    };
+    uint32_t wt[kWarps * 16 * kWtP11];
     uint32_t stage[kWarps * 4 * K2];
 };
 #if defined(STRATA_USE_HIP) && defined(__GFX11__)
@@ -2080,7 +2148,7 @@ __device__ void rdna4_block_wmma(const uint32_t* tr, int ld, int tc0, int k0, in
 
 // block_gemv for nc <= NR activations (warp w loads activations w, w + 8, ..: in[j] the one at w + 8 j):
 // sm.out[n * kCols + o]
-template <int K2, int cb, int KS, int NR, class Input, class Smem>
+template <int K2, int cb, int KS, int NR, bool Perm = false, bool OneXs = false, class Input, class Smem>
 __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, int k0, int k1, const Input (&in)[NR / 8],
                              const uint16_t* __restrict__ suh, int nc, Smem& sm) {
 #if defined(EXL3_WMMA_RDNA4)
@@ -2092,14 +2160,14 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
     const size_t sstride = (size_t) ld * W;
     const uint32_t* tile = tr + ((size_t) (k0 / 16) * ld + tc0 + warp) * W;
     uint32_t* st = sm.stage + warp * W;
-    uint32_t* wt = sm.wt + warp * 16 * 9;
+    uint32_t* wt = sm.wt + warp * 16 * kWtP11;
     const int nq = (k1 - k0) / kCols;
     uint32_t wc[8][R], wn[8][R];
-    float xv[NJ][4], xs[NJ][4];
+    float xv[NJ][4], xs[OneXs ? 1 : NJ][4];   // (OneXs: suh is the same for every row - one copy, its registers freed)
     load_tiles<K2>(tile, sstride, lane, wc);
 #pragma unroll
     for (int j = 0; j < NJ; ++j)
-        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[j]);
+        if (warp + 8 * j < nc) chunk_load(in[j], suh, k0, lane, xv[j], xs[OneXs ? 0 : j]);
     exl3_f8 c[NB];
 #pragma unroll
     for (int b = 0; b < NB; ++b) c[b] = exl3_f8{};
@@ -2107,35 +2175,35 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
         __half* xq = sm.xb + (q & 1) * (NR * kXS);
 #pragma unroll
         for (int j = 0; j < NJ; ++j)
-            if (warp + 8 * j < nc) chunk_store(xv[j], xs[j], lane, xq + (warp + 8 * j) * kXS);
+            if (warp + 8 * j < nc) chunk_store(xv[j], xs[OneXs ? 0 : j], lane, xq + (warp + 8 * j) * kXS);
         __syncthreads();
         if (q + 1 < nq) {
             load_tiles<K2>(tile + (size_t) (q + 1) * 8 * sstride, sstride, lane, wn);
 #pragma unroll
             for (int j = 0; j < NJ; ++j)
-                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[j]);
+                if (warp + 8 * j < nc) chunk_load(in[j], suh, k0 + (q + 1) * kCols, lane, xv[j], xs[OneXs ? 0 : j]);
         }
 #pragma unroll
         for (int s = 0; s < 8; ++s) {
             uint32_t f[4];
-            slice_frags<K2, cb>(wc[s], st, lane, f);
+            slice_frags<K2, cb, Perm>(wc[s], st, lane, f);
             // f: outputs g (f[0], f[1]) and g + 8 (f[2], f[3]), inputs 2t, 2t + 1 (f[0], f[2]) / 2t + 8, 2t + 9
-            wt[g * 9 + t] = f[0];
-            wt[g * 9 + 4 + t] = f[1];
-            wt[(g + 8) * 9 + t] = f[2];
-            wt[(g + 8) * 9 + 4 + t] = f[3];
+            wt[g * kWtP11 + t] = f[0];
+            wt[g * kWtP11 + 4 + t] = f[1];
+            wt[(g + 8) * kWtP11 + t] = f[2];
+            wt[(g + 8) * kWtP11 + 4 + t] = f[3];
             __syncwarp();
-            exl3_u8 aw;
-#pragma unroll
-            for (int i = 0; i < 8; ++i) aw[i] = wt[m * 9 + i];
+            const uint4* wr = reinterpret_cast<const uint4*>(wt + m * kWtP11);   // (two ds_load_b128: 16-byte rows)
+            const uint4 w0 = wr[0], w1 = wr[1];
+            const exl3_u8 aw = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
             __syncwarp();   // (wt: the next slice's)
             const exl3_h16 a = __builtin_bit_cast(exl3_h16, aw);
 #pragma unroll
             for (int b = 0; b < NB; ++b) {   // (activations past nc: whatever xb holds - their outputs are not written)
-                const uint32_t* xr = reinterpret_cast<const uint32_t*>(xq + (b * 16 + m) * kXS + s * 16);
-                exl3_u8 bw;
-#pragma unroll
-                for (int i = 0; i < 8; ++i) bw[i] = xr[i];
+                // (an activation's 16 inputs: two ds_load_b128 - xb's rows are 272 bytes, a slice 32)
+                const uint4* xr = reinterpret_cast<const uint4*>(xq + (b * 16 + m) * kXS + s * 16);
+                const uint4 x0 = xr[0], x1 = xr[1];
+                const exl3_u8 bw = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w};
                 c[b] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, __builtin_bit_cast(exl3_h16, bw), c[b]);
             }
         }
@@ -2144,6 +2212,7 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 #pragma unroll
             for (int r = 0; r < R; ++r) wc[s][r] = wn[s][r];
     }
+    if constexpr (Smem::kUnion) __syncthreads();   // (out over xb: every warp past its last chunk)
 #pragma unroll
     for (int b = 0; b < NB; ++b)
         if (b * 16 + m < nc)
@@ -2287,12 +2356,38 @@ __device__ void block_gemm_w(const uint32_t* __restrict__ tr, int ld, int tc0, i
 
 // a block's rows [row, row + nc) of one expert (gemm(r, in): part r's NR-row product, its out): gate / up into h
 // through the clamped swiglu, or down into y - hip_set_kernel's arithmetic around the product
-template <int NR, bool gate_up, class Gemm>
+template <int NR, bool gate_up, bool GateReg = false, class Gemm>
 __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const uint16_t* svh0, const uint16_t* svh1,
                                            const uint16_t* svh2, const float* x, int ldx, const int* idx, uint16_t* h,
                                            int ldh, float* y, int ldy, int row, int nc, int g, float* gate) {
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if constexpr (gate_up) {
+    if constexpr (gate_up && GateReg) {   // (the gate in the lane's registers, no LDS for it)
+        Xin in[NR / 8];
+#pragma unroll
+        for (int j = 0; j < NR / 8; ++j)
+            if (warp + 8 * j < nc) in[j].f = x + (size_t) idx[row + warp + 8 * j] * ldx;
+        float gr[NR / kWarps][4];
+        const float* o = gemm(0, in);
+#pragma unroll
+        for (int j = 0; j < NR / kWarps; ++j)
+            if (warp + kWarps * j < nc) block_out_r(o + (warp + kWarps * j) * kCols, svh0 + g * kCols, gr[j]);
+        __syncthreads();
+        o = gemm(1, in);
+#pragma unroll
+        for (int j = 0; j < NR / kWarps; ++j) {
+            const int rr = warp + kWarps * j;
+            if (rr >= nc) continue;
+            float v[4];
+            for (int i = 0; i < 4; ++i) v[i] = o[rr * kCols + lane * 4 + i];
+            had128(v, lane);
+            for (int i = 0; i < 4; ++i) {
+                const int cc = lane * 4 + i;
+                const float up = v[i] * h2f(svh1[g * kCols + cc]);
+                h[(size_t) (row + rr) * ldh + g * kCols + cc] =
+                    __half_as_ushort(__float2half_rn(swiglu(gr[j][i], up, a.limit)));
+            }
+        }
+    } else if constexpr (gate_up) {
         Xin in[NR / 8];
 #pragma unroll
         for (int j = 0; j < NR / 8; ++j)
@@ -2323,15 +2418,19 @@ __device__ __forceinline__ void set_rows_w(const SetArgs& a, Gemm&& gemm, const 
     }
 }
 
-template <int K2, int cb, bool gate_up, int NR>
-__global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
-                                                         uint16_t* h, int ldh, float* y, int ldy) {
+template <int K2, int cb, bool gate_up, int NR, bool Perm, bool Shaped = false>
+__device__ __forceinline__ void wmma_set_body(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h,
+                                              int ldh, float* y, int ldy) {
 #if defined(EXL3_WMMA_RDNA4)
     __shared__ __align__(16) Rdna4Smem<NR> sm;
 #else
-    __shared__ __align__(32) WmmaSmem<K2, NR> sm;   // (wmma: 256-bit aligned operands)
+    // (wmma: 256-bit aligned operands; the shaped kernels: out over xb)
+    __shared__ __align__(32) typename std::conditional<Shaped, WmmaSmem11<K2, NR>, WmmaSmem<K2, NR>>::type sm;
 #endif
-    __shared__ float gate[NR * kCols];
+    // the shaped kernels' 32-row blocks: the gate in registers (-13 to -15 % kernel time from 128 rows a set); their
+    // 16-row blocks keep it in LDS (in registers 1-8 rows a set lost up to 2 %)
+    constexpr bool kGateReg = Shaped && NR >= 32;
+    __shared__ float gate[(Shaped && (kGateReg || !gate_up)) ? 1 : NR * kCols];
     const int e = blockIdx.z, g = blockIdx.y;
     const int start = a.bounds[e], end = a.bounds[e + 1];
     const int row = start - a.row0 + (int) blockIdx.x * NR;
@@ -2340,13 +2439,34 @@ __global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const flo
     const uint8_t* blob = a.wbase + (size_t) e * a.stride;
     auto gemm = [&](int r, const auto& in) -> const float* {
         const int ld = r < 2 ? a.n_ff / 16 : a.n_embd / 16, k1 = r < 2 ? a.n_embd : a.n_ff;
-        block_gemm_w<K2, cb, K2, NR>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
-                                     (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
+        block_gemm_w<K2, cb, K2, NR, Perm, Shaped>((const uint32_t*) (blob + a.lay.trellis[r]), ld, g * 8, 0, k1, in,
+                                           (const uint16_t*) (blob + a.lay.suh[r]), nc, sm);
         return sm.out;
     };
-    set_rows_w<NR, gate_up>(a, gemm, (const uint16_t*) (blob + a.lay.svh[0]), (const uint16_t*) (blob + a.lay.svh[1]),
-                            (const uint16_t*) (blob + a.lay.svh[2]), x, ldx, idx, h, ldh, y, ldy, row, nc, g, gate);
+    set_rows_w<NR, gate_up, kGateReg>(a, gemm, (const uint16_t*) (blob + a.lay.svh[0]),
+                                      (const uint16_t*) (blob + a.lay.svh[1]), (const uint16_t*) (blob + a.lay.svh[2]),
+                                      x, ldx, idx, h, ldh, y, ldy, row, nc, g, gate);
 }
+template <int K2, int cb, bool gate_up, int NR, bool Perm = false>
+__global__ void __launch_bounds__(kThreads) wmma_set_kernel(SetArgs a, const float* x, int ldx, const int* idx,
+                                                         uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+#if defined(STRATA_USE_HIP)
+// gfx11's shaped prompt kernels (wmma_shape): the same, with the compiler fitting the registers to 8 waves a SIMD
+template <int K2, int cb, bool gate_up, int NR, bool Perm>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(8)))
+wmma_set8_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm, true>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+// ... 64-row blocks fitted to 6 waves a SIMD: their LDS (~41 KB) lets three blocks a WGP run, 6 waves, and the decoded
+// tile feeds four activation tiles (-7 to -12 % kernel time from 128 rows a set against 32-row blocks at 8 waves)
+template <int K2, int cb, bool gate_up, int NR, bool Perm>
+__global__ void __launch_bounds__(kThreads) __attribute__((amdgpu_waves_per_eu(6)))
+wmma_set6_kernel(SetArgs a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, float* y, int ldy) {
+    wmma_set_body<K2, cb, gate_up, NR, Perm, true>(a, x, ldx, idx, h, ldh, y, ldy);
+}
+#endif
 
 template <int cb, bool gate_up, int NR>
 __global__ void __launch_bounds__(kThreads) wmma_set_mix_kernel(SetArgs a, KMix mx, const float* x, int ldx,
@@ -3150,8 +3270,52 @@ static void with_rows(F&& f) {   // (f(std::integral_constant<int, wmma_rows()>{
     f(std::integral_constant<int, 16>{});   // (sm_7x: 32 rows' gate/up block is over the 48 KB of static shared memory)
 #endif
 }
+// gfx11 (an RX 7900 XTX, DeepSeek-V4.1's experts): K2 4 and 5 (K = 2 and 2.5) with their tile words moved between
+// lanes (permlane / ds_bpermute, no LDS stage), fitted to 8 waves a SIMD, 32 rows a block once a set has 64 rows
+// (-17 to -18.5 % kernel time from 128 rows a set, none lost below; the freed registers let 32 rows and 8 waves fit
+// together), and their LDS cut to let those waves run (out over xb, a 32-row block's gate in registers: another -13 to
+// -15 %); from 128 rows a set, 64-row blocks at 6 waves (another -7 / -12 % at K2 4 / 5).  The same bits.  Other K2,
+// other GPUs, EXL3_WMMA_ROWS set or EXL3_WMMA_SHAPE=0: the uniform blocks
+static bool wmma_shape() {
+#if defined(STRATA_USE_HIP)
+    static const bool off = std::getenv("EXL3_WMMA_ROWS") != nullptr ||
+                            (std::getenv("EXL3_WMMA_SHAPE") != nullptr && std::atoi(std::getenv("EXL3_WMMA_SHAPE")) == 0);
+    static signed char known[64] = {};
+    int dev = -1;
+    cudaGetDevice(&dev);
+    if (off || dev < 0 || dev >= 64) return false;
+    if (known[dev] == 0) {
+        cudaDeviceProp p;
+        known[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && std::strncmp(p.gcnArchName, "gfx11", 5) == 0
+                         ? 1
+                         : -1;
+    }
+    return known[dev] == 1;
+#else
+    return false;
+#endif
+}
 template <int K2, int cb> struct RunWmmaGateUp {
     static void run(const SetArgs& a, const float* x, int ldx, const int* idx, uint16_t* h, int ldh, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if constexpr (K2 == 4 || K2 == 5)
+            if (wmma_shape()) {
+                auto go = [&](auto nr, auto w6) {
+                    constexpr int NR = decltype(nr)::value;
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, true, NR, true><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
+                    else
+                        wmma_set8_kernel<K2, cb, true, NR, true><<<grid, kThreads, 0, s>>>(a, x, ldx, idx, h, ldh,
+                                                                                            nullptr, 0);
+                };
+                if (a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::true_type{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::false_type{});
+                else go(std::integral_constant<int, 16>{}, std::false_type{});
+                return;
+            }
+#endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
             wmma_set_kernel<K2, cb, true, NR><<<dim3((a.max_rows + NR - 1) / NR, a.n_ff / kCols, a.n_exp), kThreads, 0,
@@ -3161,6 +3325,25 @@ template <int K2, int cb> struct RunWmmaGateUp {
 };
 template <int K2, int cb> struct RunWmmaDown {
     static void run(const SetArgs& a, const uint16_t* h, int ldh, float* y, int ldy, cudaStream_t s) {
+#if defined(STRATA_USE_HIP)
+        if constexpr (K2 == 4 || K2 == 5)
+            if (wmma_shape()) {
+                auto go = [&](auto nr, auto w6) {
+                    constexpr int NR = decltype(nr)::value;
+                    const dim3 grid((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp);
+                    if constexpr (decltype(w6)::value)
+                        wmma_set6_kernel<K2, cb, false, NR, true><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+                    else
+                        wmma_set8_kernel<K2, cb, false, NR, true><<<grid, kThreads, 0, s>>>(
+                            a, nullptr, 0, nullptr, const_cast<uint16_t*>(h), ldh, y, ldy);
+                };
+                if (a.max_rows >= 128) go(std::integral_constant<int, 64>{}, std::true_type{});
+                else if (a.max_rows >= 64) go(std::integral_constant<int, 32>{}, std::false_type{});
+                else go(std::integral_constant<int, 16>{}, std::false_type{});
+                return;
+            }
+#endif
         with_rows([&](auto nr) {
             constexpr int NR = decltype(nr)::value;
             wmma_set_kernel<K2, cb, false, NR><<<dim3((a.max_rows + NR - 1) / NR, a.n_embd / kCols, a.n_exp), kThreads,
