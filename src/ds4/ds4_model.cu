@@ -36,6 +36,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 #include "ds4_path_policy.hpp"
+#include "ds4_peer_policy.hpp"
 #include "ds4_place.hpp"
 #include "ds4_prefill_stats.hpp"
 #include "ds4_prompt_mem.hpp"
@@ -17290,9 +17291,9 @@ struct Model::Impl {
         const bool implicit_ar2 = ds4_env("DS4_AR2") == nullptr;
         bool eligible = false;
         for (const Group& G : groups)
-            eligible = eligible || (G.mem.size() == 2 && G.arb.nm == 2 &&
-                (G.arb.ar2 == 0 || (implicit_ar2 && G.arb.ar2 == 1)) &&
-                !chunks[(size_t) G.mem[0]]->flow && !chunks[(size_t) G.mem[1]]->flow);
+            eligible = eligible || (G.mem.size() == 2 && peer_ar_group_eligible(
+                G.arb.nm, G.arb.ar2, implicit_ar2,
+                chunks[(size_t) G.mem[0]]->flow, chunks[(size_t) G.mem[1]]->flow));
         if (!eligible) return true; // no allocations, queries or timing for single-GPU/other group shapes
         const bool automatic = std::strcmp(opt, "auto") == 0;
         if (!automatic && std::strcmp(opt, "1") != 0) {
@@ -17312,8 +17313,8 @@ struct Model::Impl {
         for (Group& G : groups) {
             if (G.mem.size() != 2 || G.arb.nm != 2) continue;
             // Keep upstream's opt-in AR2 and the flow loader on their existing transports.
-            if ((G.arb.ar2 != 0 && !(implicit_ar2 && G.arb.ar2 == 1)) ||
-                chunks[(size_t) G.mem[0]]->flow || chunks[(size_t) G.mem[1]]->flow) {
+            if (!peer_ar_group_eligible(G.arb.nm, G.arb.ar2, implicit_ar2,
+                                        chunks[(size_t) G.mem[0]]->flow, chunks[(size_t) G.mem[1]]->flow)) {
                 std::fprintf(stderr, "ds4: peer prefill all-reduce not selected for AR2/flow group\n");
                 continue;
             }
