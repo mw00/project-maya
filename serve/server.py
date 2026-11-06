@@ -2513,15 +2513,17 @@ class Service:
         for key in list(req):
             if key.startswith("_grammar_"):
                 req.pop(key)
-        grammar, _fmt = structured.normalize_request(req)
-        if grammar is not None:
+        outputs = req.get("structured_outputs")
+        has_grammar = req.get("grammar") is not None or req.get("guided_grammar") is not None or (
+            isinstance(outputs, dict) and "grammar" in outputs
+        )
+        if has_grammar:
+            grammar, _fmt = structured.normalize_request(req)
             info = getattr(self.engine, "info", None) or {}
             if info.get("grammar") != 1 or info.get("grammar_replay") != 1:
                 raise ValueError("grammar: this engine does not support native GBNF with replay")
             self.engine.validate_grammar(grammar)
             req["_grammar_text"] = grammar
-        elif req.get("structured_outputs") is not None or any(k in req for k in ("guided_json", "json_schema")):
-            raise ValueError("structured output: use a native GBNF grammar")
         check_request_sampling(req)
         bias = logit_bias_of(req.get("logit_bias"), len(getattr(self.tok, "tokens", None) or ()) or None)
         if bias and (getattr(self.engine, "info", None) or {}).get("logit_bias") != 1:
