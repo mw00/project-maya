@@ -2,11 +2,7 @@
 # llama is CPU-only, vocab-only at runtime; no second inference engine is loaded.
 # CPU-only and unrelated engine builds retain their existing dependency graph.
 # An explicit ON also allows building the metadata-only checker without DS4.
-set(_ds4_grammar_default OFF)
-if(TARGET maya-ds4 AND STRATA_NATIVE_EXPERTS)
-  set(_ds4_grammar_default ON)
-endif()
-option(MAYA_DS4_GRAMMAR "Enable DeepSeek native GBNF constrained decoding" ${_ds4_grammar_default})
+option(MAYA_DS4_GRAMMAR "Enable DeepSeek native GBNF constrained decoding" OFF)
 if(MAYA_DS4_GRAMMAR)
   if(NOT STRATA_NATIVE_EXPERTS)
     message(FATAL_ERROR "MAYA_DS4_GRAMMAR requires STRATA_NATIVE_EXPERTS")

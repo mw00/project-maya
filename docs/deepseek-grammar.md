@@ -1,12 +1,16 @@
 # DeepSeek constrained decoding
 
-Build with `MAYA_DS4_GRAMMAR=ON` (the default for native DeepSeek GPU builds).
-CPU-only and unrelated engine builds leave it off by default; explicitly enable
+Build with `MAYA_DS4_GRAMMAR=ON` (off by default, including native DeepSeek builds).
+CPU-only and unrelated engine builds also leave it off by default; explicitly enable
 it to build the host checker there. The CPU grammar library uses the
 same pinned llama.cpp checkout as ggml; no GPU llama backend or model tensors
 are loaded. A full llama.cpp source checkout is required when overriding
 `STRATA_GGML_DIR`. `MAYA_DS4_GRAMMAR=OFF` retains the ordinary engine without
 the grammar capability.
+
+Only an explicit `grammar`, `guided_grammar` or `structured_outputs.grammar`
+selects native GBNF validation. Other structured-output fields keep their existing
+server handling, including the ordinary `response_format` JSON response path.
 
 `maya-ds4-grammar-check --pack PACK --grammar FILE` validates a UTF-8 GBNF file
 against the pack's exact tokenizer before an HTTP response starts. Success is
