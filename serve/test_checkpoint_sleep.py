@@ -3,12 +3,17 @@ import threading
 import time
 import unittest
 import json
+import io
+import sys
+import tempfile
+from pathlib import Path
 import urllib.request
 import urllib.error
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from serve import deep_sleep as d
+from serve import server as server_module
 from serve.server import Service, StrataEngine, FairLock, MockEngine, ByteTokenizer, ChatTemplate, ROOT, serve
 
 
@@ -150,6 +155,42 @@ class CheckpointTests(unittest.TestCase):
             for t in threads: t.start()
             for t in threads: t.join()
         self.assertEqual(len(calls), 1)
+
+    def test_disabled_sleep_close_uses_the_original_quit_protocol(self):
+        engine = object.__new__(StrataEngine)
+        engine.deep_sleep = "off"
+        engine.can_stop = True
+        engine.proc = unittest.mock.Mock()
+        engine.proc.poll.return_value = 0
+        with patch.object(d, "end") as checkpoint_end:
+            engine.close()
+        checkpoint_end.assert_not_called()
+        self.assertEqual(engine.proc.stdin.write.call_args_list,
+                         [unittest.mock.call("STOP\n"), unittest.mock.call("QUIT\n")])
+        engine.proc.wait.assert_called_once()
+        engine.proc.kill.assert_not_called()
+
+    def test_main_shutdown_only_takes_the_sleep_lock_when_enabled(self):
+        for mode in ("off", "checkpoint"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                config = Path(directory) / "config.json"
+                config.write_text(json.dumps({"deep_sleep": mode}))
+                events = []
+                engine = MockEngine(ByteTokenizer(), "ok", max_context=1024)
+                engine.close = lambda: events.append("close")
+                def fake_serve(svc, **kwargs):
+                    svc.fifo = unittest.mock.MagicMock()
+                    svc.fifo.__enter__.side_effect = lambda: events.append("lock")
+                    svc.fifo.__exit__.side_effect = lambda *args: events.append("unlock")
+                    return SimpleNamespace(shutdown=lambda: events.append("http shutdown"))
+                args = ["server", "--engine", "mock", "--host", "127.0.0.1", "--config", str(config)]
+                with patch.object(sys, "argv", args), patch.object(sys, "stdout", io.StringIO()), \
+                     patch.object(server_module, "MockEngine", return_value=engine), \
+                     patch.object(server_module, "serve", side_effect=fake_serve), \
+                     patch.object(server_module, "stop_signals", side_effect=lambda stop: stop.set()):
+                    self.assertEqual(server_module.main(), 0)
+                expected = ["http shutdown", "close"] if mode == "off" else ["http shutdown", "lock", "close", "unlock"]
+                self.assertEqual(events, expected)
 
 
 class HttpTests(unittest.TestCase):
