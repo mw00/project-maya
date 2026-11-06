@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | Português</p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) e MiniMax-M3.1-Flash (428 B) na sua própria GPU</b><br>
@@ -35,6 +37,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 ```
 
 A instalação pergunta qual modelo você quer, baixa, compila tudo uma vez e **inicia o modelo**. Depois abra `http://127.0.0.1:8080`. No Windows, use `START-MAYA.bat` em vez de `./setup.sh`. Mais em [Instalação](#install).
+
+Toda a documentação: [docs/README.md](docs/README.md)
 
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Escolha seu modelo
 
@@ -198,6 +202,8 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 - **Raciocínio:** Off, Low, High (o padrão) ou Max, em Settings ou por requisição, e um campo de **orçamento de raciocínio** que define quantos tokens o modelo pode usar pensando antes de responder.
 - **Guarda contra loops:** ligada por padrão - um agente que repete a mesma chamada de ferramenta com o mesmo resultado é conduzido para fora disso.
 - **Imagens:** anexe uma no chat, ou envie partes de imagem por qualquer uma das APIs. Todos os modelos leem imagens (detalhes da instalação por modelo: [docs/MODELS.md](docs/MODELS.md)).
+- **Ferramentas MCP:** liste servidores MCP na configuração (`"mcp_servers"`; o bloco `mcpServers` do Claude Desktop funciona como está) e o modelo do chat na web pode chamar as ferramentas deles. Um interruptor no menu **+** do chat liga e desliga. O que ele faz: [serve/mcp.py](serve/mcp.py).
+- **Docker:** não há imagem oficial. [docs/DOCKER.md](docs/DOCKER.md) é uma receita para montar uma a partir de uma versão.
 - **De outro dispositivo:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Sempre defina uma chave.
 - **Ajuste fino:** `./maya.sh --calibrate` ajusta o motor ao seu hardware em 10-15 minutos. Todas as configurações: [docs/SETTINGS.md](docs/SETTINGS.md).
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**As opções próprias de cada modelo** - várias requisições ao mesmo tempo no GLM-5.3-Flash (`--parallel`), contextos longos e o drafter DFlash2; as conversas mantidas, o carregamento de especialistas e a leitura antecipada do Engram no DeepSeek; os níveis de raciocínio do MiniMax: [docs/MODELS.md](docs/MODELS.md).

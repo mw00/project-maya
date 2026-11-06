@@ -1,5 +1,7 @@
 <p align="center">English | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) and MiniMax-M3.1-Flash (428 B) on your own GPU</b><br>
@@ -45,6 +47,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 The setup asks which model you want, downloads it, builds everything once and **starts the model**. Then open
 `http://127.0.0.1:8080`. Windows: `START-MAYA.bat` instead of `./setup.sh`. More in [Install](#install).
+
+All documentation: [docs/README.md](docs/README.md)
 
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Pick your model
 
@@ -245,6 +249,10 @@ slowest while the caches fill with what you use.
   first pages as pictures; Word, Excel, PowerPoint, OpenDocument, EPUB and RTF files as their text. Anything Maya can't
   read says why. The same works through the APIs: OpenAI `file` / `input_file` parts and Anthropic `document` blocks
   (sent inline). poppler, when installed (`sudo apt install poppler-utils`), reads PDFs a little better; it is optional.
+- **MCP tools:** list MCP servers in the config (`"mcp_servers"`; Claude Desktop's `mcpServers` block works as it is)
+  and the web chat's model can call their tools. A switch in the chat's **+** menu turns them on and off. What it
+  does: [serve/mcp.py](serve/mcp.py).
+- **Docker:** there is no official image. [docs/DOCKER.md](docs/DOCKER.md) is a recipe to build one from a release.
 - **From another device:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **Tuning:** `./maya.sh --calibrate` tunes the engine to your hardware in 10-15 minutes. Every setting:
   [docs/SETTINGS.md](docs/SETTINGS.md).

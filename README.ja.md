@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | 日本語 | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B)、MiniMax-M3.1-Flash (428 B) を自分の GPU で</b><br>
@@ -37,6 +39,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 ```
 
 セットアップはどのモデルを使うかを尋ね、ダウンロードし、すべてを一度ビルドして、**モデルを起動します**。その後 `http://127.0.0.1:8080` を開いてください。Windows では `./setup.sh` の代わりに `START-MAYA.bat` を使います。詳しくは[インストール](#install)を参照してください。
+
+すべてのドキュメント: [docs/README.md](docs/README.md)
 
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>モデルを選ぶ
 
@@ -200,6 +204,8 @@ Maya の量子化は、各モデルの公開された重みから作られ、元
 - **思考:** Off、Low、High (デフォルト)、Max を、設定またはリクエストごとに指定できます。さらに**思考予算**の欄で、モデルが回答の前に思考に使えるトークン数を設定できます。
 - **ループガード:** デフォルトで有効です。同じツール呼び出しを同じ結果で繰り返すエージェントを、その繰り返しから外へ誘導します。
 - **画像:** チャットに添付するか、どちらの API でも画像パートを送ります。すべてのモデルが画像を読めます (モデルごとのセットアップの詳細: [docs/MODELS.md](docs/MODELS.md))。
+- **MCP ツール:** 設定に MCP サーバーを書くと (`"mcp_servers"`。Claude Desktop の `mcpServers` ブロックはそのまま使えます)、Web チャットのモデルがそのツールを呼び出せます。チャットの **+** メニューのスイッチでオン・オフできます。動作の詳細: [serve/mcp.py](serve/mcp.py)。
+- **Docker:** 公式イメージはありません。[docs/DOCKER.md](docs/DOCKER.md) は、リリースからイメージをビルドするための手順です。
 - **ほかのデバイスから:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。キーは必ず設定してください。
 - **チューニング:** `./maya.sh --calibrate` が 10-15 分でエンジンをお使いのハードウェアに合わせます。すべての設定: [docs/SETTINGS.md](docs/SETTINGS.md)。
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**各モデル固有のオプション** - GLM-5.3-Flash の複数リクエスト同時処理 (`--parallel`)、長いコンテキスト、DFlash2 ドラフター; DeepSeek の会話の保持、エキスパートの読み込み、Engram の先読み; MiniMax の思考レベル: [docs/MODELS.md](docs/MODELS.md)。
