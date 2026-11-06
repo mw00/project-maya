@@ -20,6 +20,7 @@
 
 #include "strata/core/exl3_mma_rows.hpp"
 #include "strata/core/prefill_chunks.hpp"
+#include "strata/core/helper_prefill_cost.hpp"
 #include "strata/core/prefill_gaps.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
@@ -773,6 +774,31 @@ struct Glm5Model::PrefillState {
     uint64_t helper_wide_experts = 0;
     int helper_max_rows = 0;
     double helper_ms = 0;
+    bool helper_cost = [] { const char* v=getenv("STRATA_GLM_HELPER_COST"); return v && std::atoi(v)!=0; }();
+    bool helper_cost_trace = [] { const char* v=getenv("STRATA_GLM_HELPER_COST_TRACE"); return v && std::atoi(v)!=0; }();
+    HelperPrefillCost helper_costs[3];
+    struct HelperSample {
+        bool pending = false;
+        int layer = 0, tokens = 0, rows = 0, experts = 0;
+        double mib = 0, worker_ms = 0, join_ms = 0;
+    } helper_sample;
+    // Called after the next routing sync, before re-recording the shared events.
+    // The previous combine already waited for both lanes; no new GPU wait.
+    void collect_helper_cost() {
+        auto& h=helper_sample;
+        if (!h.pending) return;
+        float copy=0;
+        if (cudaEventQuery(ev_c1)==cudaSuccess &&
+            cudaEventElapsedTime(&copy,ev_c0,ev_c1)==cudaSuccess) {
+            auto& cost=helper_costs[HelperPrefillCost::bucket(h.tokens)];
+            cost.observe(h.rows,h.worker_ms,h.mib,copy);
+            if (helper_cost_trace)
+                std::fprintf(stderr,"glm helper cost: layer=%d tokens=%d rows=%d experts=%d mib=%.3f worker_ms=%.3f join_ms=%.3f copy_ms=%.3f row_ms=%.6f mib_ms=%.6f adaptive=%d\n",
+                    h.layer,h.tokens,h.rows,h.experts,h.mib,h.worker_ms,h.join_ms,
+                    copy,cost.row_ms,cost.mib_ms,int(helper_cost));
+        }
+        h.pending=false;
+    }
     double ms_cpu = 0, row_ms = 0.05;   // row_ms: the host's cost of a row, learned (the split's estimate)
     // the split's balance, learned: the host's estimates times kappa, nudged each layer by the host's time over the
     // copy stream's (ev_c0 .. ev_c1: the staged copies) - the two lanes should end together
@@ -2943,6 +2969,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             cudaEventCreate(&S->ev_c0);
             cudaEventCreate(&S->ev_c1);
         }
+        S->collect_helper_cost();
         cudaEventRecord(S->ev_c0, s);
         if (calc_on) {
             if (S->calc_measure) calc_balance();   // (the last helped layer's events are done: its sum was added)
@@ -3092,10 +3119,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 const char* v = getenv("STRATA_GLM_EXPERT_PLUGIN_PREFILL_MAX_ROWS");
                 return v ? std::max(1, std::min(256, std::atoi(v))) : 16;
             }();
+            const auto& cost=S->helper_costs[HelperPrefillCost::bucket(T)];
+            const bool adaptive=S->helper_cost && T>=64 && cost.ready();
+            // Until calibrated, preserve the validated 64-row admission ceiling.
+            const int limit=S->helper_cost && !adaptive ? std::min(64,max_rows) : max_rows;
+            double remaining_mib=0;
+            for (const auto& st:staged) if (!st.dev) remaining_mib+=double(Ly.blob)/(1024*1024);
             std::vector<size_t> eligible;
             for (size_t i=0;i<staged.size();i++) {
                 const auto& st=staged[i];
-                if (!st.dev && S->h_counts[st.e]>0 && S->h_counts[st.e]<=max_rows &&
+                if (!st.dev && S->h_counts[st.e]>0 && S->h_counts[st.e]<=limit &&
                     F->helper.can_rows(il*g.n_expert+st.e)) eligible.push_back(i);
             }
             std::stable_sort(eligible.begin(),eligible.end(),[&](size_t a,size_t b) {
@@ -3107,6 +3140,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             for (size_t i:eligible) {
                 const int count=S->h_counts[staged[i].e];
                 if (taken+count>cap) break;
+                const double left=remaining_mib-double(Ly.blob)/(1024*1024);
+                if (adaptive && !cost.fits(taken+count,left)) break;
+                remaining_mib=left;
                 taken+=count; take[i]=1;
             }
             std::vector<Staged> rest;
@@ -3838,7 +3874,12 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         }
         dq.copied.store(std::max(dq.copied.load(), seg_end), std::memory_order_release);   // predicted, never routed
         S->staged_disk += dlist.size();
-        if (cpu_nrows > 0) cudaEventRecord(S->ev_c1, F->copy);
+        if (cpu_nrows > 0 || (helper_on && (S->helper_cost || S->helper_cost_trace)))
+            cudaEventRecord(S->ev_c1, F->copy);
+        if (helper_on && (S->helper_cost || S->helper_cost_trace)) {
+            S->helper_sample={true,il,T,cpu_nrows,int(cpu_set.size()),
+                double(n_staged_pcie)*double(Ly.blob)/(1024*1024),0,0};
+        }
         if (calc_run) {   // this link's lane ends here (the balance reads it at the next helped layer)
             cudaEventRecord(S->ev_a1, F->copy);
             int na = 0;
@@ -3872,7 +3913,10 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
             std::vector<int> r_of((size_t) ncx);   // each expert's first row in the CPU segment
             for (int j = 0; j < ncx; ++j) r_of[(size_t) j] = S->h_base[cpu_set[(size_t) j].e] - cpu_r0;
             if (Ly.exl3 || helper_on) {
+                const auto join_start=std::chrono::steady_clock::now();
                 x3_th.join();   // (the host's experts, from the plan on)
+                if (helper_on) S->helper_sample.join_ms=
+                    std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-join_start).count();
                 if (!x3_ok) {
                     err = helper_on ? "glm prefill helper: "+helper_error : "glm prefill: the CPU experts' inputs did not come down";
                     return false;
@@ -4026,6 +4070,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 S->helper_experts += (uint64_t) ncx;
                 S->helper_rows += (uint64_t) cpu_nrows;
                 S->helper_ms += dt;
+                S->helper_sample.worker_ms=dt;
                 for (const auto& st : cpu_set) {
                     const int count = S->h_counts[st.e];
                     S->helper_max_rows = std::max(S->helper_max_rows, count);

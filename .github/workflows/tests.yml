@@ -35,6 +35,10 @@ jobs:
         run: '"$RUNNER_TEMP/venv/bin/python" tools/check_hip_compat.py'
       - name: Prefill reader buffer lifetime (CPU only, Release)
         run: '"$RUNNER_TEMP/venv/bin/python" tests/mixed_runtime/test_prefill_reader.py'
+      - name: Helper prefill cost estimates (CPU only, Release)
+        run: |
+          c++ -std=c++17 -O2 -DNDEBUG -Wall -Wextra -Werror -Iinclude tests/mixed_runtime/helper_prefill_cost_test.cpp -o "$RUNNER_TEMP/helper_prefill_cost_test"
+          "$RUNNER_TEMP/helper_prefill_cost_test"
       - name: GLM memory policy and RAM planner (CPU only)
         run: |
           c++ -std=c++20 -O2 -DNDEBUG -Wall -Wextra -Werror tests/glm_memory_test.cpp -o "$RUNNER_TEMP/glm_memory_test"
