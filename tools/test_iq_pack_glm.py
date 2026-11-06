@@ -38,8 +38,14 @@ class Glm5NextBf16List(unittest.TestCase):
         for name in ("blk.3.indexer.attn_q_b.weight", "blk.3.indexer.attn_k.weight",
                      "blk.3.indexer_compressor_gate.weight", "blk.3.indexer_compressor_ape.weight",
                      "blk.3.indexer.proj.weight", "blk.3.indexer.k_norm.bias",
-                     "blk.3.ffn_gate_inp.weight", "blk.3.exp_probs_b.bias"):
+                     "blk.3.ffn_gate_inp.weight"):
             self.assertTrue(iq_pack.needs_bf16(name, "Q3_K", "glm5-next"), name)
+
+    def test_glm5_selection_bias_stays_f32(self):
+        # the noaux_tc selection bias has a large per-layer offset and small within-layer differences: BF16 rounding
+        # collapsed 288 values to 6-11 (#861); the pack keeps the stored F32 (kind 2, which the loader reads as is)
+        self.assertFalse(iq_pack.needs_bf16("blk.3.exp_probs_b.bias", "F32", "glm5-next"))
+        self.assertNotIn("exp_probs_b.bias", iq_pack.GLM5NEXT_BF16)
 
     def test_glm5_kda_gates_and_conv_preserved(self):
         for name in ("blk.0.ssm_a", "blk.0.ssm_dt.bias", "blk.0.ssm_norm.weight",
