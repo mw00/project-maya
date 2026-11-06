@@ -199,6 +199,7 @@ class Sampler(unittest.TestCase):
         self.assertEqual([(v["index"], v["pci"], v["procs"]) for v in s["vram"]],
                          [(0, "0000:01:00", {4242: 1 << 30}), (1, "0000:02:00", {4242: 1 << 30})])
         self.assertNotIn("gpu_procs", s)
+        self.assertIn("cpu_temp", s)
         json.dumps(t.snapshot())
 
     def test_without_nvml(self):
@@ -259,6 +260,21 @@ class Sampler(unittest.TestCase):
         r2 = reader(absent=True)
         with mock.patch.object(T, "_READER", r2):
             self.assertIsNone(T.gpu_pids())
+
+    def test_cpu_temperature_from_hwmon(self):
+        """The CPU's own hwmon chip (k10temp here): its hottest sensor; another chip's reading is not the CPU's, and
+        the ACPI zone is not used while the CPU's own chip answers."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            for hwmon, chip, values in (("hwmon0", "nvme", ("90000",)), ("hwmon1", "k10temp", ("52500", "55000")),
+                                        ("hwmon2", "acpitz", ("80000",))):
+                (root / "class/hwmon" / hwmon).mkdir(parents=True)
+                (root / "class/hwmon" / hwmon / "name").write_text(chip + "\n", encoding="utf-8")
+                for i, value in enumerate(values, 1):
+                    (root / "class/hwmon" / hwmon / f"temp{i}_input").write_text(value + "\n", encoding="utf-8")
+            with mock.patch.object(T, "SYSFS", d):
+                self.assertEqual(T.cpu_temp(), 55.0)
 
     def test_this_machine(self):
         """The real reader on this machine (NVML or none): it answers or says there is nothing - never raises."""

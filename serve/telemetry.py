@@ -13,7 +13,9 @@ A background thread samples once a second and keeps the last 60 readings of each
   DXGI (name, memory size) and Windows' GPU performance counters in pdh.dll (load, memory used), as Task Manager does:
   the _WinGpu class (no temperature, power or PCIe link there).
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
-  the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
+  the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.  The CPU's
+  temperature comes from the kernel's hwmon (k10temp, coretemp, zenpower, ...; Linux), or from psutil's sensors when
+  those are the only source (macOS).
 Anything that cannot be read is None; nothing here can stop the server.
 """
 from __future__ import annotations
@@ -889,6 +891,67 @@ def _cpu_name():
     return platform.processor() or None
 
 
+# the hwmon chips that carry the CPU's own sensors (a board's Super I/O chip is not one: its "CPU" reading is a
+# thermistor near the socket, not the die).  acpitz is only a fallback: an ACPI thermal zone is not always the CPU's.
+CPU_TEMP_CHIPS = frozenset(("k10temp", "coretemp", "zenpower", "cpu_thermal", "soc_thermal"))
+CPU_TEMP_FALLBACK = frozenset(("acpitz",))
+
+
+def _cpu_temp_of(chips, found):
+    vals = [found[c] for c in chips if c in found]
+    return max(vals) if vals else None
+
+
+def cpu_temp():
+    """The CPU's temperature in °C: the hottest sensor of its own hwmon chip (k10temp / coretemp / zenpower on
+    Linux; psutil's sensors where /sys is not the source, as on macOS), or None when this machine has no CPU sensor
+    (Windows, a container without /sys/class/hwmon, a board that only reports a socket thermistor)."""
+    hwmon = os.path.join(SYSFS, "class", "hwmon")
+    try:
+        dirs = sorted(os.listdir(hwmon))
+    except OSError:
+        dirs = ()
+    found = {}
+    for n in dirs:
+        d = os.path.join(hwmon, n)
+        try:
+            with open(os.path.join(d, "name"), encoding="utf-8") as f:
+                chip = f.read().strip()
+        except (OSError, TypeError):
+            continue
+        if chip not in CPU_TEMP_CHIPS and chip not in CPU_TEMP_FALLBACK:
+            continue
+        try:
+            files = sorted(f for f in os.listdir(d) if f.startswith("temp") and f.endswith("_input"))
+        except OSError:
+            continue
+        for name in files:
+            try:
+                with open(os.path.join(d, name), encoding="utf-8") as f:
+                    t = int(f.read().strip())
+            except (OSError, ValueError, TypeError):
+                continue
+            if t > 0:
+                found[chip] = max(found.get(chip, 0), t / 1000.0)
+    best = _cpu_temp_of(CPU_TEMP_CHIPS, found)
+    if best is None:
+        best = _cpu_temp_of(CPU_TEMP_FALLBACK, found)
+    if best is not None:
+        return best
+    try:
+        import psutil
+        sensors = psutil.sensors_temperatures()
+    except (ImportError, OSError, AttributeError, RuntimeError):
+        return None
+    found = {}
+    for chip, rows in sensors.items():
+        vals = [s.current for s in rows if s.current and s.current > 0]
+        if vals:
+            found[chip] = max(vals)
+    best = _cpu_temp_of(CPU_TEMP_CHIPS, found)
+    return best if best is not None else _cpu_temp_of(CPU_TEMP_FALLBACK, found)
+
+
 class _CpuRamFallback:
     """CPU load and RAM without psutil."""
 
@@ -1061,6 +1124,7 @@ class Telemetry:
             s["cpu"] = self.fallback.cpu()
             s["ram_used"], s["ram_total"] = self.fallback.ram()
         s["disk_read_mb"], s["disk_write_mb"] = self._disk()
+        s["cpu_temp"] = cpu_temp()
         if self.extra:
             try:
                 s.update(self.extra())
@@ -1095,8 +1159,8 @@ class Telemetry:
             last = now
             with self.lock:
                 self.now = s
-                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",
-                          "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
+                for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "cpu_temp",
+                          "ram_used", "disk_read_mb", "tok_s", "prefill_tok_s_mean"):
                     v = s.get(k)
                     for _ in range(held):
                         self.hist[k].append(round(v, 2) if isinstance(v, float) else v)
