@@ -17,6 +17,13 @@ Attach any file in the chat - PDFs, Word, Excel, PowerPoint and more - with ever
   - **APIs:** the same files work through OpenAI `file` / Responses `input_file` parts and Anthropic `document` blocks, sent inline.
   - Built on the PDF work in #842 (thanks @org-tekeli-borisp).
 - **Fixes:**
+  - GLM on two GPUs: since v1.1.52 the drafting decode could crash ("illegal memory access") or slow to a crawl on some two-GPU PCs. A two-GPU split now drafts exactly as in v1.1.51, and a draft with no valid token can no longer read past its table on any setup (#860).
+  - `MAYA_GLM_NO_SPEC`, `MAYA_GLM_NO_MTP` and `MAYA_GLM_NO_PREFILL` set to `0`, `false`, `off` or `no` now mean off; before, any value turned them on (#860).
+  - GLM: a sampled request without a `seed` now gets a fresh random seed, so asking again gives a different answer; a `seed` in the request (or `--seed`) still repeats exactly (#845).
+  - GLM EXL3 packs: `MAYA_GLM_SPEC_WIN` no longer stops the load (#857).
+  - The pack tool keeps GLM-5.3-Flash's expert selection bias in full precision (F32) instead of rounding it (packs built from now on) (#861).
+  - DeepSeek on AMD: the VRAM BAR size is read correctly for the GPU-to-GPU all-reduce check (#809).
+  - The Engram RAM lock error now names the current memory-lock limit and how to raise it (#836).
   - GLM: a saved conversation whose slot failed to load now tries the next saved slot and then the checkpoint, instead of reading the whole conversation again (#840, fixes #838, thanks @tragicwinds).
   - DeepSeek: the loop guard now catches DeepSeek's repeated tool calls too; before, it never fired on DeepSeek (#844, thanks @oscarlius).
   - DeepSeek EXL3 quants that name the drafter's head differently (turboderp's) now pack and draft with DSpark on (#835, thanks @pepuscz).
