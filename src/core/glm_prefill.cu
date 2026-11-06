@@ -2637,7 +2637,7 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                     gb::dsa_score(B.iq, state_ + dsa_pool_[(size_t) il], B.iw, g.idx_key, g.idx_heads, pt, kp, tn,
                                   max_vis, B.score, B.score_ld, s);
                 gb::dsa_select(B.score, B.score_ld, pt, kp, g.top_pools_max(), g.idx_select_tail, tn, g.n_sel_max(),
-                               B.cells, B.n_sel, s);
+                               B.cells, B.n_sel, s, lat_table_, lat_pages_.page_size(), lat_max_rows());
                 S->mark("dsa_index", s);
                 // q_abs[t][h] = wk_b[h] (kv_lora x qk_nope) . q[t][h]
 #if defined(STRATA_USE_HIP)
@@ -4041,6 +4041,9 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
                 d.lat_table = kv_->map[(size_t) mtp_il_].page_table;
                 d.lat_page = kv_->page;
             }
+ d.paged_lat_table = lat_table_; // NULL when STRATA_GLM_PAGED is off
+            d.paged_page_rows = lat_pages_.page_size();
+            d.paged_max_rows = lat_max_rows();
             d.lat_q8 = lat_q8_;
             d.kv_lora = g.kv_lora;
             d.ik_raw = ik;
@@ -4499,6 +4502,27 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
     const size_t row_b = ggml_row_size((ggml_type) pack_emb_type_, E);
     int Tc = pf_->T_bound;
     for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) Tc = std::min(Tc, m->pf_->T_bound);
+ // the align semantics (the LMCache contract), OPT-IN. When the
+    // operator sets STRATA_GLM_PREFIX_PAGE_ALIGN=1 and the prefix store is
+    // live, a chunk advances exactly one page, so every chunk end is a block
+    // boundary and its stateful tile carries the 34 KDA layers' state snapshot
+    // at the boundary - the finest partial-prefix reuse at every page edge.
+    // Default OFF: the page-aligned clamp is a chunking tax paid on every
+    // prompt just because the pool is on, whereas the reuse it buys only
+    // materializes on a shared prefix. Off, the stateful tile is captured at
+    // the natural chunk end (a partial page, which prefix_capture_part handles)
+    // and the prompt keeps its full chunk size. The staging stays carved for
+    // the unclamped chunk (the kernels read only the chunk's rows); the
+    // reference window (STRATA_GLM_NO_PREFIX) always keeps the unclamped chunk.
+    if (getenv("STRATA_GLM_NO_PREFIX") == nullptr &&
+        getenv("STRATA_GLM_PREFIX_PAGE_ALIGN") != nullptr && std::atoi(getenv("STRATA_GLM_PREFIX_PAGE_ALIGN")) != 0) {
+        int32_t pg_rows = 0;
+        for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+            if (m->lat_pages_.n_pages() > 0)
+                pg_rows = pg_rows > 0 ? std::min(pg_rows, m->lat_pages_.page_size())
+                                      : m->lat_pages_.page_size();
+        if (pg_rows > 0 && Tc > pg_rows) Tc = pg_rows;
+    }
     const int64_t pos_start = pos_;
     const int nc = (int) ((n + Tc - 1) / Tc);
     const auto chunk_len = [&](int c) { return (int) std::min<int64_t>(Tc, n - (int64_t) c * Tc); };
@@ -4665,6 +4689,9 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             pos_ = p0 + T;
             for (Glm5Model* m = split_next_.get(); m != nullptr; m = m->split_next_.get()) m->pos_ = pos_;
             ++pf_->chunks;
+ if (lat_pages_.n_pages() > 0) // the chunk end's tiles (every part's share)
+                for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get())
+                    m->prefix_capture_part(pos_, p0, pos_start);
             if (prefill_progress && c + 1 < nc && !prefill_progress(pos_ - pos_start, n)) {
                 cancelled = true;
                 break;
@@ -4750,6 +4777,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                         fail(e2.empty() ? "glm prefill: part " + std::to_string(k) + " failed" : e2);
                         return;
                     }
+ if (lat_pages_.n_pages() > 0) // this part's share of the chunk end
+                        m->prefix_capture_part(p0 + T, p0, pos_start);
                     // (gaps: a part has read its chunk once its stream is synchronized - the hop out does it here)
                     const auto read_done = [&] {
                         {
@@ -4792,6 +4821,13 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
                 break;
             }
             if (!hand_on(0, c, T)) break;
+ if (lat_pages_.n_pages() > 0) // the head part's share of the chunk end (the
+                                            // tail thread captures its own share; without this the
+                                            // finalize sees 1 of np parts per chunk and drops every
+                                            // pending tile as incomplete, so the store stays empty
+                                            // and the intake always misses (an earlier run
+                                            // skipped 0/1024 with 0 tiles in the store)
+                prefix_capture_part(p0 + T, p0, pos_start);
             ++pf_->chunks;
             // gaps: boundary c - once every later part has read its chunk before it, the other requests decode, then
             // the parts go on (part 1 with chunk c, this thread with c + 1)
@@ -4845,6 +4881,8 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
         return false;
     }
     cudaSetDevice(dev_);
+ if (lat_pages_.n_pages() > 0) // the chunk ends' tiles become store entries
+        prefix_finalize(tokens, pos_start, pos_start + n, true);
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     pf_->ms += ms;
     for (Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) m->pf_->tokens += n;

@@ -1126,6 +1126,25 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set(_strata_gpu_glm_libs strata_engine)
   endif()
   add_executable(glm_model_test src/core/glm_model_test.cpp)
+  add_executable(glm_seq_dynamic_test src/core/glm_seq_dynamic_test.cpp)
+  target_include_directories(glm_seq_dynamic_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(glm_seq_dynamic_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
+    # the lifecycle runs on the REAL pack loader - the fixture packs data/glm5-synth.gguf
+  # through tools/iq_pack.py (the Maya-S24 packer) into the build tree; without python3 the test
+  # falls back to data/glm5-synth-pack beside the committed GGUF (generated once by hand)
+  find_program(STRATA_PYTHON3_SEQ python3)
+  if(STRATA_PYTHON3_SEQ)
+    add_test(NAME glm_seq_dynamic_pack_gen
+             COMMAND ${STRATA_PYTHON3_SEQ} ${CMAKE_CURRENT_SOURCE_DIR}/tools/glm_synth_pack.py
+                     --out ${CMAKE_CURRENT_BINARY_DIR}/glm5-synth-pack)
+    set_tests_properties(glm_seq_dynamic_pack_gen PROPERTIES FIXTURES_SETUP glm5_synth_pack)
+    add_test(NAME glm_seq_dynamic_test COMMAND glm_seq_dynamic_test --selftest
+             ${CMAKE_CURRENT_BINARY_DIR}/glm5-synth-pack)
+    set_tests_properties(glm_seq_dynamic_test PROPERTIES FIXTURES_REQUIRED glm5_synth_pack)
+  else()
+    add_test(NAME glm_seq_dynamic_test COMMAND glm_seq_dynamic_test --selftest)
+  endif()
+  set_tests_properties(glm_seq_dynamic_test PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
   target_include_directories(glm_model_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_model_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})
   add_test(NAME glm_model_test COMMAND glm_model_test --selftest)
