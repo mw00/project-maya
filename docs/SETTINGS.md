@@ -326,10 +326,13 @@ things differ:
 `MAYA_DS4_LANE_PARITY=1` (opt-in) makes an expert's part the same bits on either lane, in the same place of the sum:
 
 - **The CPU lane in the device's arithmetic** (`src/ds4/ds4_lane_parity.cpp`; IQ2_XXS, IQ2_S, IQ3_XXS and IQ3_S
-  experts, Maya-S's types): the activation rounded as the device's Q8_K, each row's 32-value sub-blocks dealt to the
-  token kernels' lanes (32 a gate / up row, 16 a down row) and summed in their order, the lanes added in the kernels'
-  tree. The integer dots run in AVX2 where the CPU has it (exact either way), checked against the scalar form at the
-  first use.
+  experts, Maya-S's types, and MXFP4 experts, the GGUF packs'): the activation rounded as the device's Q8_K (MXFP4: as
+  its own per-32 rounding), each row's 32-value sub-blocks dealt to the token kernels' lanes (32 a gate / up row, 16 a
+  down row; MXFP4: 32 for both) and summed in their order, the lanes added in the kernels' tree. The integer dots run in
+  AVX2 where the CPU has it (exact either way), checked against the scalar form at the first use.
+- **A tensor-parallel group's members each their own FF band of the expert**, as the device cuts it (gate / up rows
+  `[ff0, ff0 + ffn)`, the down's blocks of that range in each row): the lane answers a part a member, each member adds
+  its own before the group's all-reduce, so `--tp 2` keeps the bits too - even with unequal FFN shares.
 - **The SwiGLU's `exp` in plain IEEE operations on both sides** (`src/ds4/ds4_par_exp.h`): fma, multiply, add and an
   exact power-of-two scale, within 1 ulp of e^x for x >= -87.
 - **Each CPU-lane pick its own part of the sum:** the lane writes each pick's output (`Resp::pmask` says which), and the
@@ -360,11 +363,26 @@ VRAM a GPU (335 MB at 8192 tokens: ~30 experts a GPU fewer). A 3,000-token promp
 against 1.10 with every expert in VRAM, 1.45-1.50 against 1.40-1.46 with 720-790 on the lane. `build/ds4_gguf_test --parity`
 checks the rows and the `exp` against the device's kernels bit for bit (no model needed).
 
-Not covered yet (their answers still follow the placement): other expert formats on the CPU lane (MXFP4, EXL3,
-IQ1_S / IQ1_M, IQ4_XS, IQ4_NL), mixed layers, the helper GPU (`MAYA_DS4_HELPER`), tensor-parallel groups, the
-host-routed path (`DS4_SYNC=1`), and AMD builds (the rows follow the CUDA kernels; there the setting is ignored). The
-chunk's size comes from the free VRAM at the load, so a prompt longer than a chunk can still differ between two
-configurations (not between two starts of one).
+Not covered yet (their answers still follow the placement): other expert formats on the CPU lane (EXL3, IQ1_S / IQ1_M,
+IQ4_XS, IQ4_NL), mixed layers, the helper GPU (`MAYA_DS4_HELPER`), the host-routed path (`DS4_SYNC=1`), and AMD builds
+(the rows follow the CUDA kernels; there the setting is ignored). The chunk's size comes from the free VRAM at the load,
+so a prompt longer than a chunk can still differ between two configurations (not between two starts of one).
+
+MXFP4 (a GGUF pack's experts, 32 values a block) and the tensor-parallel groups measured on 2x RTX PRO 6000,
+DeepSeek-V4.1-Flash UD-Q8_K_XL (all experts MXFP4), greedy, `3,360`-token prompt, `--expert-profile none
+DS4_RING_MB=64`, logits compared row by row:
+
+| Path | `--reserve-mib` 3072 vs 8192 (6,138 vs 6,709 experts on the CPU lane) |
+| --- | --- |
+| the chunked pass (`--window 4096`) | 0 of 6,720 logit rows differ, max \|dlogit\| 0 |
+| windows of 16 (`--window 16`) | 0 of 3,361, max 0, same top-1 |
+| decode (`--window 1`, 200-token prompt) | 0 of 201, max 0 |
+| `--tp 2` with unequal FFN shares (`DS4_TP_SHARES=19,17`: 1,216 / 1,088 values a member, 6,626 vs 7,167 on the lane) | 0 of 3,361 and 0 of 201 |
+
+Its cost there: the lane's MXFP4 down takes 1.3-1.5x the whole row's time an expert when a group's two FF bands are
+summed instead of one row (`build/ds4_par_bench`), and a `--tp 2` run's window prefill 59.2 tok/s against 71.2 without
+the parity rows (decode 23.4 against 24.1). `build/ds4_gguf_test --mx-lane` checks an MXFP4 expert's rows and both
+members' bands against the device's kernels bit for bit.
 
 | Setting | Default | |
 | --- | --- | --- |

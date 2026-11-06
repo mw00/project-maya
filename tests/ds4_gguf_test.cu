@@ -1015,7 +1015,7 @@ void test_lane_parity(int D, int F, int tg, int td, cudaStream_t s) {
         float* hw[8];
         float* yw[8];
         for (int j = 0; j < nt; ++j) {
-            par::quant(x.data() + (size_t) ti[j].first * D, D, xa[j].data());
+            par::quant(tg, x.data() + (size_t) ti[j].first * D, D, xa[j].data());
             ap[j] = xa[j].data();
             hw[j] = hh[j].data();
         }
@@ -1023,7 +1023,7 @@ void test_lane_parity(int D, int F, int tg, int td, cudaStream_t s) {
         for (int j = 0; j < nt; ++j) {
             const float* hd = hA.data() + ((size_t) ti[j].first * 8 + ti[j].second) * F;
             for (int f = 0; f < F; ++f) hdiff += std::memcmp(&hh[j][f], &hd[f], 4) != 0, ++hn;
-            par::quant(hh[j].data(), F, ha[j].data());
+            par::quant(td, hh[j].data(), F, ha[j].data());
             hp[j] = ha[j].data();
             yw[j] = picks.data() + ((size_t) ti[j].first * 8 + ti[j].second) * D;
         }
@@ -1118,8 +1118,9 @@ void test_lane_parity_all(cudaStream_t s) {   // (on for these, whatever MAYA_DS
 #endif
     test_par_exp(s);
     gg::lane_parity_mode(1);
-    const int pairs[4][2] = {{GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS}, {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S},
-                             {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S}};
+    const int pairs[5][2] = {{GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS}, {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S},
+                             {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_S}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ2_S},
+                             {gg::kTypeMXFP4, gg::kTypeMXFP4}};   // (a GGUF's MXFP4 experts: both roles)
     for (const auto& pr : pairs)
         for (const auto& df : {std::make_pair(5120, 2304), std::make_pair(512, 256), std::make_pair(1024, 768)})
             test_lane_parity(df.first, df.second, pr[0], pr[1], s);
@@ -3220,6 +3221,259 @@ void test_ar2(int da, int db, int rows) {
     hfree(a.pflags);
 }
 
+// ---- MXFP4: the CPU lane's rows against the device's three MXFP4 arithmetics, bit for bit (DS4_LANE_PARITY's
+// question for that format).  One expert, one token: the token path (moe_gate_up / moe_down: int8 x per 32, F32 h),
+// the prompt path's light kernels (<= 16 rows: int8 x per 32 from the F32 row, F16 h) and its tiles (more rows: the
+// FP16 rows), and the CPU lane's own rows (gg::mx_rows: int8 x per 32, F32 h, std::exp).  Prints, for h and y, how many
+// values are bit for bit equal and the largest difference.
+struct MxLane {
+    std::vector<float> h, y;
+    const char* name = "";
+};
+static void mx_lane_cmp(const char* what, const std::vector<float>& a, const std::vector<float>& b) {
+    size_t same = 0;
+    double worst = 0.0, mx = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        same += std::memcmp(&a[i], &b[i], 4) == 0;
+        worst = std::max(worst, (double) std::fabs((double) a[i] - (double) b[i]));
+        mx = std::max(mx, (double) std::fabs((double) a[i]));
+    }
+    std::printf("    %-34s %6zu / %-6zu bit-gleich   max |d| %-10.4g  rel %.3g\n", what, same, a.size(), worst,
+                mx > 0.0 ? worst / mx : worst);
+}
+void test_mx_lane(cudaStream_t s) {
+    namespace par = strata::ds4::par;
+    const int D = 5120, F = 2304, n_exp = 9;   // (experts 0..8: the stability section uses up to 9 in one call)
+    const float lim = 10.0f;
+    Experts E = make_experts(D, F, n_exp);
+    std::vector<float> x((size_t) D);
+    for (auto& v : x) v = frand();
+    float* dx = dev(x);
+    // ---- the device's token path (what an expert in VRAM gives a decoded token)
+    std::vector<int> pick(8, 0);
+    std::vector<float> pw(8, 0.0f);
+    std::vector<unsigned long long> pp(8, 0ull);
+    pick[0] = 0;
+    pw[0] = 1.0f;
+    pp[0] = (unsigned long long) (E.dev);
+    float* dpw = dev(pw);
+    unsigned long long* dpp = dev(pp);
+    float* dh = dev(std::vector<float>((size_t) 8 * F));
+    float* dout = dev(std::vector<float>(D));
+    x3::MoeArgs ma;
+    ma.plan_ptr = dpp;
+    ma.plan_w = dpw;
+    ma.lay = E.lay;
+    ma.k = 1;
+    ma.n_embd = D;
+    ma.n_ff = F;
+    ma.limit = lim;
+    gg::moe_gate_up(ma, dx, dh, s);
+    gg::moe_down(ma, dh, nullptr, dout, s);
+    CU(cudaStreamSynchronize(s));
+    const std::vector<float> h_tok = host(dh, (size_t) F), y_tok = host(dout, (size_t) D);
+    // ---- the prompt path's set with 1 row (the light kernels) and with 32 rows (the tiles; the light ones take <= 16)
+    auto set_path = [&](int rows) {
+        std::vector<int> bounds = {0, rows};
+        std::vector<int> idx((size_t) rows, 0);   // every row the same token's input
+        std::vector<float> xs((size_t) rows * D, 0.0f);
+        for (int r = 0; r < rows; ++r) std::memcpy(xs.data() + (size_t) r * D, x.data(), (size_t) D * 4);
+        int* dbd = dev(bounds);
+        int* didx = dev(idx);
+        float* dxs = dev(xs);
+        uint16_t* dh16 = dev(std::vector<uint16_t>((size_t) rows * F));
+        float* dy = dev(std::vector<float>((size_t) rows * D));
+        x3::SetArgs sa;
+        sa.wbase = E.dev;
+        sa.stride = E.blob;
+        sa.lay = E.lay;
+        sa.n_exp = 1;
+        sa.bounds = dbd;
+        sa.row0 = 0;
+        sa.max_rows = rows;
+        sa.n_embd = D;
+        sa.n_ff = F;
+        sa.limit = lim;
+        gg::set_gate_up(sa, dxs, D, didx, dh16, F, s);
+        gg::set_down(sa, dh16, F, dy, D, s);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<uint16_t> h16 = host(dh16, (size_t) rows * F);
+        const std::vector<float> y = host(dy, (size_t) rows * D);
+        std::vector<float> hf((size_t) F);
+        for (int f = 0; f < F; ++f) hf[(size_t) f] = __half2float(*(const __half*) &h16[(size_t) f]);
+        cudaFree(dbd), cudaFree(didx), cudaFree(dxs), cudaFree(dh16), cudaFree(dy);
+        return std::make_pair(hf, std::vector<float>(y.begin(), y.begin() + D));
+    };
+    const auto light = set_path(1);
+    const auto tile = set_path(32);
+    // ---- the CPU lane's rows (gg::mx_rows, as cpu_experts_mx calls them): int8 x per 32, F32 h, std::exp
+    const size_t gr = gg::mx_row_bytes(D), dr = gg::mx_row_bytes(F);
+    std::vector<uint8_t> qx(gg::mx_act_bytes(D));
+    gg::mx_quant(x.data(), D, qx.data());
+    std::vector<float> hg((size_t) F), hu((size_t) F), yc((size_t) D);
+    const void* ap[1] = {qx.data()};
+    float* gp[1] = {hg.data()};
+    float* up[1] = {hu.data()};
+    gg::mx_rows(emat(E, 0, 0), gr, D, 0, F, ap, 1, gp);
+    gg::mx_rows(emat(E, 0, 1), gr, D, 0, F, ap, 1, up);
+    std::vector<float> h_cpu((size_t) F);
+    for (int f = 0; f < F; ++f) {
+        float gv = hg[(size_t) f], uv = hu[(size_t) f];
+        if (lim > 0.0f) {
+            gv = std::min(gv, lim);
+            uv = std::min(std::max(uv, -lim), lim);
+        }
+        h_cpu[(size_t) f] = gv / (1.0f + std::exp(-gv)) * uv;
+    }
+    std::vector<uint8_t> qh(gg::mx_act_bytes(F));
+    gg::mx_quant(h_cpu.data(), F, qh.data());
+    const void* hp[1] = {qh.data()};
+    float* yp[1] = {yc.data()};
+    gg::mx_rows(emat(E, 0, 2), dr, F, 0, D, hp, 1, yp);
+    // ---- DS4_LANE_PARITY's MXFP4 rows (par::): the same arithmetic as the device's token kernels, in their order
+    auto par_rows = [&](int type, const uint8_t* gate, const uint8_t* up, int k, const float* xv, int rows,
+                        std::vector<float>& out) {
+        std::vector<uint8_t> a(par::act_bytes(k));
+        par::quant(type, xv, k, a.data());
+        const void* ap[1] = {a.data()};
+        out.assign((size_t) rows, 0.0f);
+        float* op[1] = {out.data()};
+        if (up != nullptr) par::gate_up(type, gate, up, k, ap, 1, op, 0, rows, lim);
+        else par::down(type, gate, k, ap, 1, op, 0, rows);
+        return a;
+    };
+    std::vector<float> h_par((size_t) F), y_par((size_t) D);
+    const std::vector<uint8_t> ax = par_rows(gg::kTypeMXFP4, emat(E, 0, 0), emat(E, 0, 1), D, x.data(), F, h_par);
+    par_rows(gg::kTypeMXFP4, emat(E, 0, 2), nullptr, F, h_par.data(), D, y_par);
+    // the two quantizations (par::'s Q8-like, gg::mx_quant's) against each other
+    {
+        long qs = 0, qn = 0;
+        double dm = 0.0;
+        for (int b = 0; b < D / 32; ++b) {
+            for (int j = 0; j < 32; ++j) {
+                qs += ((const int8_t*) ax.data())[b * 32 + j] == gg::mx_act_value(qx.data(), b, j);
+                ++qn;
+            }
+            dm = std::max(dm, (double) std::fabs(((const float*) (ax.data() + D))[b] - gg::mx_act_scale(qx.data(), D, b)));
+        }
+        std::printf("  activation: %ld / %ld int8 gleich wie gg::mx_quant, max |dscale| %.3g\n", qs, qn, dm);
+    }
+    // ---- the table
+    std::printf("MXFP4 expert 0, one token (D %d, F %d), limit %.0f; CPU rows %s\n", D, F, lim,
+                gg::mx_tier_name(gg::mx_tier()));
+    std::printf("  h (%d values):\n", F);
+    mx_lane_cmp("par:: (PARITY) vs token path", h_par, h_tok);
+    mx_lane_cmp("par:: vs gg::mx_rows rows", h_par, h_cpu);
+    mx_lane_cmp("CPU lane (mx_rows) vs token path", h_cpu, h_tok);
+    mx_lane_cmp("light (<=16 rows) vs token path", light.first, h_tok);
+    mx_lane_cmp("tiles (32 rows) vs token path", tile.first, h_tok);
+    mx_lane_cmp("light vs tiles", light.first, tile.first);
+    mx_lane_cmp("CPU lane vs light", h_cpu, light.first);
+    std::printf("  y (%d values, the token path's F32 h vs the set's F16 h):\n", D);
+    mx_lane_cmp("par:: (PARITY) vs token path", y_par, y_tok);
+    mx_lane_cmp("CPU lane (mx_rows) vs token path", yc, y_tok);
+    mx_lane_cmp("light (<=16 rows) vs token path", light.second, y_tok);
+    mx_lane_cmp("tiles (32 rows) vs token path", tile.second, y_tok);
+    mx_lane_cmp("light vs tiles", light.second, tile.second);
+    mx_lane_cmp("CPU lane vs light", yc, light.second);
+    // ---- ein Tensor-Parallel-Paar (--tp 2): die beiden FF-Baender eines Experten, wie die Gruppe ihn teilt - Gate / Up
+    // die Zeilen [ff0, ff0 + ffn), die Down in jeder Zeile nur die Bloecke des Bandes.  Das Geraet summiert je Mitglied
+    // ueber sein Band und addiert dann die zwei Teil-Summen; die Lane muss je Mitglied dieselben Bits liefern, sonst
+    // kippt die Platzierung das Ergebnis um 1 ulp (und spaeter das Routing).
+    for (const auto& band_of : {std::make_pair(0, 1152), std::make_pair(1216, 1088)}) {   // (1152/1152 und 1216/1088:
+        const int ff0 = band_of.first, fn = band_of.second;                              //  36 und 38/34 Bloecke)
+        const size_t gr = gg::mx_row_bytes(D), dr = gg::mx_row_bytes(F);
+        const size_t d0 = gg::type_row_bytes(gg::kTypeMXFP4, ff0), dh = gg::type_row_bytes(gg::kTypeMXFP4, fn);
+        x3::ExpertLayout ml = E.lay;
+        size_t off = 0;
+        for (int r = 0; r < 3; ++r) {
+            ml.trellis[r] = off;
+            off += (((r < 2 ? (size_t) fn * gr : (size_t) D * dh) + 255) >> 8) << 8;
+        }
+        std::vector<uint8_t> mblob(off, 0);
+        for (int r = 0; r < 2; ++r)
+            std::memcpy(mblob.data() + ml.trellis[r], emat(E, 0, r) + (size_t) ff0 * gr, (size_t) fn * gr);
+        for (int r = 0; r < D; ++r)
+            std::memcpy(mblob.data() + ml.trellis[2] + (size_t) r * dh, emat(E, 0, 2) + (size_t) r * dr + d0, dh);
+        // das Gerat: der Token-Pfad mit dem Band des Mitglieds (n_ff = ffn, sein Layout, sein Blob)
+        uint8_t* dmb = dev(mblob);
+        float* dh_m = dev(std::vector<float>((size_t) 8 * (size_t) fn));
+        float* dout_m = dev(std::vector<float>((size_t) D));
+        std::vector<unsigned long long> p1(8, 0ull);
+        p1[0] = (unsigned long long) dmb;
+        unsigned long long* dp1 = dev(p1);
+        x3::MoeArgs mb = ma;
+        mb.plan_ptr = dp1;
+        mb.lay = ml;
+        mb.n_ff = fn;
+        gg::moe_gate_up(mb, dx, dh_m, s);
+        gg::moe_down(mb, dh_m, nullptr, dout_m, s);
+        CU(cudaStreamSynchronize(s));
+        const std::vector<float> h_m = host(dh_m, (size_t) fn), y_m = host(dout_m, (size_t) D);
+        // die Lane: dasselbe Band, dasselbe h (des ganzen Experten), ab dem ersten Block des Bandes
+        std::vector<uint8_t> band(par::act_bytes(fn));
+        par::quant(gg::kTypeMXFP4, h_par.data() + ff0, fn, band.data());
+        std::vector<float> y_lane((size_t) D), y_ref((size_t) D);
+        const void* bp[1] = {band.data()};
+        float* yl[1] = {y_lane.data()};
+        float* yr[1] = {y_ref.data()};
+        par::down_band(gg::kTypeMXFP4, emat(E, 0, 2) + d0, dr, fn, bp, 1, yl, 0, D);
+        par::down_band_ref(gg::kTypeMXFP4, emat(E, 0, 2) + d0, dr, fn, bp, 1, yr, 0, D);
+        std::printf("  TP-Band [%4d, %4d) (%2d Bloecke):\n", ff0, ff0 + fn, fn / 32);
+        mx_lane_cmp("h des Bandes: Lane vs Gerat", std::vector<float>(h_par.begin() + ff0, h_par.begin() + ff0 + fn), h_m);
+        mx_lane_cmp("down des Bandes: Lane vs Gerat", y_lane, y_m);
+        mx_lane_cmp("down des Bandes: AVX2 vs skalar", y_lane, y_ref);
+        cudaFree(dmb), cudaFree(dh_m), cudaFree(dout_m), cudaFree(dp1);
+    }
+    // ---- Stabilitaet: derselbe Experte mit denselben 8 Zeilen, aber in Aufrufen unterschiedlicher Zusammensetzung.
+    // Genau das ist die Platzierungsabhaengigkeit im Prefill: welche Experten in einem Aufruf landen, entscheidet der
+    // Ring, und dessen Groesse kommt aus dem freien VRAM.
+    auto run_set = [&](const std::vector<int>& er) {   // er[i]: Zeilen des Experten i (alle Zeilen = derselbe Token)
+        int R = 0;
+        for (int r : er) R += r;
+        std::vector<int> bounds(1, 0);
+        for (int r : er) bounds.push_back(bounds.back() + r);
+        std::vector<int> idx((size_t) R, 0);
+        std::vector<float> xs((size_t) R * D, 0.0f);
+        for (int r = 0; r < R; ++r) std::memcpy(xs.data() + (size_t) r * D, x.data(), (size_t) D * 4);
+        int* dbd = dev(bounds);
+        int* didx = dev(idx);
+        float* dxs = dev(xs);
+        uint16_t* dh16 = dev(std::vector<uint16_t>((size_t) R * F));
+        float* dy = dev(std::vector<float>((size_t) R * D));
+        x3::SetArgs sa;
+        sa.wbase = E.dev;
+        sa.stride = E.blob;
+        sa.lay = E.lay;
+        sa.n_exp = (int) er.size();
+        sa.bounds = dbd;
+        sa.row0 = 0;
+        sa.max_rows = *std::max_element(er.begin(), er.end());
+        sa.n_embd = D;
+        sa.n_ff = F;
+        sa.limit = lim;
+        gg::set_gate_up(sa, dxs, D, didx, dh16, F, s);
+        gg::set_down(sa, dh16, F, dy, D, s);
+        CU(cudaStreamSynchronize(s));
+        std::vector<float> y = host(dy, (size_t) R * D);
+        cudaFree(dbd), cudaFree(didx), cudaFree(dxs), cudaFree(dh16), cudaFree(dy);
+        return y;   // rows 0..7 = expert 0
+    };
+    const std::vector<float> s1 = run_set({8});
+    const std::vector<float> s2 = run_set({8, 2});
+    const std::vector<float> s3 = run_set({8, 20});
+    const std::vector<float> s4 = run_set({8, 2, 2, 2, 2, 2, 2, 2, 2});
+    const size_t n8 = (size_t) 8 * D;
+    std::printf("  derselbe Experte (8 Zeilen), anderer Aufruf drumherum: y der 8 Zeilen\n");
+    mx_lane_cmp("[8] vs [8,2]      (light)", std::vector<float>(s1.begin(), s1.begin() + n8),
+                std::vector<float>(s2.begin(), s2.begin() + n8));
+    mx_lane_cmp("[8] vs [8,2]x8    (light)", std::vector<float>(s1.begin(), s1.begin() + n8),
+                std::vector<float>(s4.begin(), s4.begin() + n8));
+    mx_lane_cmp("[8] vs [8,20]     (light -> tiles)", std::vector<float>(s1.begin(), s1.begin() + n8),
+                std::vector<float>(s3.begin(), s3.begin() + n8));
+    cudaFree(dx), cudaFree(dpw), cudaFree(dpp), cudaFree(dh), cudaFree(dout), cudaFree(E.dev);
+}
+
 int main(int argc, char** argv) {
     cudaStream_t s;
     CU(cudaStreamCreate(&s));
@@ -3278,6 +3532,11 @@ int main(int argc, char** argv) {
     }
     if (argc >= 2 && std::strcmp(argv[1], "--q8k") == 0) {   // the low-bit activations' Q8_K rounding (DS4_IQ_Q8K)
         test_q8k(s);
+        std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
+        return g_fail ? 1 : 0;
+    }
+    if (argc >= 2 && std::strcmp(argv[1], "--mx-lane") == 0) {   // MXFP4: the CPU lane's rows vs the device's
+        test_mx_lane(s);
         std::printf("%s (%d failed)\n", g_fail ? "FAILED" : "ALL OK", g_fail);
         return g_fail ? 1 : 0;
     }
