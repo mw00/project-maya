@@ -7,6 +7,10 @@ The settings below are environment variables named `MAYA_*`: set them before a s
 with `./maya.sh --setup --env MAYA_NAME=value`. Their earlier `STRATA_*` spellings still work; where both are set, the
 `MAYA_` one counts.
 
+The switches that turn something off - `MAYA_GLM_NO_SPEC` (no drafting on a split: token by token), `MAYA_GLM_NO_MTP`
+(the NextN draft block not loaded) and `MAYA_GLM_NO_PREFILL` (prompts read token by token) - are on with `1`, and off
+when unset or set to `0`, `false`, `off`, `no` or nothing. (Before v1.1.56 any value turned them on, `0` included.)
+
 Responses API cache, background queue, event/reader limits and owner quotas are
 server settings under `MAYA_GLM_RESPONSES_*`, with defaults and units in
 [Responses settings](RESPONSES.md#settings-and-metrics). They can be set in the same

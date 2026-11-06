@@ -23,6 +23,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 #include "strata/kernels/cpu/exl3_ref.hpp"
+#include "strata/platform/env_switch.hpp"
 #include "strata/platform/idle_gate.hpp"
 
 #include "ggml.h"
@@ -1163,7 +1164,8 @@ bool Glm5Model::fast_setup(std::string& err) {
     // allocatable.  The head group is the parts [0, h) that kda_all walks; h comes from part_/n_parts_ because
     // split_next_ is linked only after every part has loaded.
     if (!dflash_on_ && g_.nextn > 0 && n_parts_ > 1 && part_ < spec_head_parts(n_parts_) &&
-        getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr && !spec_kda_reserve(err))
+        !strata::platform::env_switch("STRATA_GLM_NO_MTP") && !strata::platform::env_switch("STRATA_GLM_NO_SPEC") &&
+        !spec_kda_reserve(err))
         return false;
     // ---- the expert pool: per-layer partitions (equal quota per layer within its size class)
     size_t blob_max = 0;
@@ -1762,7 +1764,8 @@ bool Glm5Model::fast_setup(std::string& err) {
                     total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf);
                 }
                 remaining = total;
-                remaining_layers = g.n_layers - g.dense_lead + (getenv("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
+                remaining_layers =
+                    g.n_layers - g.dense_lead + (strata::platform::env_switch("STRATA_GLM_NO_MTP") ? 0 : g.nextn);
             }
             // the last half takes everything left (one device: the NextN block, counted above, is not loaded)
             budget = l1_ >= g.n_layers ? remaining
@@ -6958,7 +6961,7 @@ int Glm5Model::mtp_draft(int32_t next_tok, std::string& err) {
 // position with the real token.  Only the head speculates - the tail, the NextN block and the sampler see confirmed
 // tokens only - so the output is exactly what the token-at-a-time decode would produce for the same samples.
 bool Glm5Model::spec_ready() const {
-    if (fast_ == nullptr || split_next_ == nullptr || getenv("STRATA_GLM_NO_SPEC") != nullptr) return false;
+    if (fast_ == nullptr || split_next_ == nullptr || strata::platform::env_switch("STRATA_GLM_NO_SPEC")) return false;
     const Glm5Model* last = this;
     for (const Glm5Model* m = this; m != nullptr; m = m->split_next_.get()) {
         if (m->fast_ == nullptr) return false;

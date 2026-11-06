@@ -28,6 +28,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/platform/env_switch.hpp"
 
 #include "ggml.h"
 
@@ -76,7 +77,8 @@ bool mtp_chain_wanted() {
 
 // load_pack / fast_setup: whether this model decodes with the MTP block on one GPU (see the top of this file)
 bool Glm5Model::mtp_decode_wanted(int dev, int n_parts) {
-    if (getenv("STRATA_GLM_NO_SPEC") != nullptr || getenv("STRATA_GLM_NO_MTP") != nullptr || mtp_draft_cap() <= 0)
+    if (strata::platform::env_switch("STRATA_GLM_NO_SPEC") || strata::platform::env_switch("STRATA_GLM_NO_MTP") ||
+        mtp_draft_cap() <= 0)
         return false;
     if (const char* q = getenv("STRATA_GLM_SEQS"); q != nullptr && std::atoi(q) > 1) return false;   // (--parallel)
     if (const char* d = getenv("STRATA_GLM_DFLASH"); d != nullptr && d[0] != '\0') return false;

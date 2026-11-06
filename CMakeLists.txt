@@ -326,6 +326,13 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_report_test.cpp")
   target_link_libraries(env_report_test PRIVATE strata_warnings)
   add_test(NAME env_report_test COMMAND env_report_test)
 endif()
+# the NO_* on/off switches (include/strata/platform/env_switch.hpp, #860: =0 / off / false / no is off); host code only
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/env_switch_test.cpp")
+  add_executable(env_switch_test EXCLUDE_FROM_ALL tests/env_switch_test.cpp)
+  target_include_directories(env_switch_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+  target_link_libraries(env_switch_test PRIVATE strata_warnings)
+  add_test(NAME env_switch_test COMMAND env_switch_test)
+endif()
 
 # ---- idle_gate_test --------------------------------------------------------
 # The gate an idle engine's service threads sleep on, and a request's line wakes (strata/platform/idle_gate.hpp):
