@@ -201,7 +201,7 @@ class MarkovNames(unittest.TestCase):
 
     def test_exllamav3_names(self):
         import st
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:   # (Windows: the maps stay open)
             m = pathlib.Path(td)
             write_st(m / "model-00001-of-00001.safetensors", {
                 "mtp.2.markov_head.markov_w1.weight": ("BF16", [4, 2], bytes(range(16))),

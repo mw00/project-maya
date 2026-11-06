@@ -3962,7 +3962,7 @@ void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alph
     pdl_launch(gemv_f16_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, alpha, y);
 }
 #if defined(STRATA_USE_HIP)
-// DS4_PROMPT_F16 (ds4_model.cu's prompt_f16; as Strata's prefill gemm.cu, MIT): float c overwrites halves 2c and 2c + 1, so
+// DS4_PROMPT_F16 (ds4_model.cu's prompt_f16): float c overwrites halves 2c and 2c + 1, so
 // a row is walked from its end in blocks of 256 values: a block's halves read into registers, the block synced, then its
 // floats written - they only cover halves of blocks already read
 __device__ unsigned long long g_widen_bad = 0;

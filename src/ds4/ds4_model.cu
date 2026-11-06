@@ -1717,7 +1717,11 @@ struct Model::Impl {
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
     // DS4_AHEAD_EXL3=1 (opt-in until measured on more PCs): an EXL3 pack read in place (--mmap-experts on) guesses and
     // asks too - a guessed expert's file region read ahead as a GGUF's three matrices are; off: its layers never guessed
-    bool ahead_exl3 = std::getenv("DS4_AHEAD_EXL3") != nullptr && std::atoi(std::getenv("DS4_AHEAD_EXL3")) != 0;
+    bool ahead_exl3 = [] {   // (MAYA_DS4_AHEAD_EXL3, read as STRATA_DS4_AHEAD_EXL3, or the bare name)
+        const char* v = std::getenv("STRATA_DS4_AHEAD_EXL3");
+        if (v == nullptr) v = std::getenv("DS4_AHEAD_EXL3");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
                                        // 8 asked for (prefetch)
     std::vector<uint8_t> ahead_rank;   // [layer][1024]: 1 + the expert's rank in the guess a layer before (0: not guessed)
@@ -5498,7 +5502,7 @@ struct Model::Impl {
 #if defined(STRATA_USE_HIP)
     // MAYA_DS4_PROMPT_F16=1: the prompt's dense GEMMs FP16 in and FP16 out on gfx103x (RDNA 2), widened in place.  rocBLAS
     // is tuned there only for FP16 out (37.7 TFLOPS on an RX 6900 XT, rocBLAS 5.6); FP16 in, FP32 out is a generic fallback
-    // (5.6 TFLOPS; both Strata's bench/results/2026-10-04-rdna2-fp16-prompt).  Not bit-identical: each output is rounded to
+    // (5.6 TFLOPS; both measured with rocBLAS on that card).  Not bit-identical: each output is rounded to
     // FP16 before it is widened.  MAYA_DS4_PROMPT_F16_CHECK=1 counts outputs past FP16's range and says so after each prompt
     bool prompt_f16(const Dev& d) const {
         static const bool on = [] {

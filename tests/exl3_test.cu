@@ -2061,7 +2061,7 @@ void bench_mv() {
 // --bench-set: a prompt chunk's routed experts on one tensor-parallel member at DeepSeek-V4.1's geometry (5120 -> its
 // 1152 of 2304 -> 5120, mul1, K 2 and 2.5 as turboderp's 2.25 bpw): BENCH_SET_EXPERTS (default 16) experts of
 // BENCH_SET_ROWS rows each (default 256: a 16K chunk's 6 of 384), set_gate_up + set_down - the ms a call, the us an
-// expert, and the outputs' bits (equal before and after a change that keeps the bits; EXL3_WMMA_V2 / EXL3_WMMA_ROWS
+// expert, and the outputs' bits (equal before and after a change that keeps the bits; EXL3_WMMA_SHAPE / EXL3_WMMA_ROWS
 // pick the kernels).  BENCH_SET_K2: one K2 (default 4 and 5).
 void bench_set() {
     auto env_int = [](const char* n, int d) {
@@ -2300,6 +2300,8 @@ int main(int argc, char** argv) {
     for (int k2 : {3, 5, 7}) test_set(k2, 2);
     test_set(7, 2, 10);
     test_set(5, 2, 8);
+    test_set(4, 2, 0, 130, 140);   // 128+ rows a set: gfx11's 64-row shaped blocks (EXL3_WMMA_SHAPE) against the reference
+    test_set(5, 2, 0, 130, 140);
     for (int cb : {0, 2}) test_mixed(cb);   // (a mixed-precision layer)
     for (int T : {2, 7, 16}) test_win(4, 2, T, 0, true);   // (a mixed layer's window: the token path's bits too)
     test_win(4, 0, 7, 0, true);
