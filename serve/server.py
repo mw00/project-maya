@@ -4091,34 +4091,34 @@ class Service:
             c[{loop_guard.PENALTY: "penalised", loop_guard.CLOSE_THINKING: "thinking_closed",
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
-    def preread_ids(self, messages, tools, kw, answer: str) -> list[int]:
+    def preread_ids(self, messages, tools, kw, answer: str, guard=None) -> list[int]:
         """MAYA_DS4_PREREAD: the prompt this chat's next turn starts with, up to and with its <｜User｜> token, when the
-        client sends the answer back without its reasoning (Open WebUI does).  [] when it cannot be said."""
+        client sends the answer back without its reasoning (Open WebUI does).  [] when it cannot be said.  Through
+        prepare, as the next request goes: with the loop guard (`guard`: the request's) a conversation that repeats
+        itself leaves some of the model's earlier text out of the prompt, and a guess without that misses."""
         if self.ds_user_id is None:
             return []
-        kwargs = {k: v for k, v in kw.items() if not k.startswith("_")}
-        if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
-            kwargs = {**kwargs, **deepseek_effort_kwargs(self.default_effort)}
-        ids = self.render_ids(list(messages) + [{"role": "assistant", "content": answer},
-                                                {"role": "user", "content": "\u2063"}], tools, kwargs)
+        kwargs = {k: v for k, v in kw.items() if not k.startswith("_")}   # (a copy: prepare writes into it)
+        ids = self.prepare(list(messages) + [{"role": "assistant", "content": answer},
+                                             {"role": "user", "content": "\u2063"}], tools, kwargs, 1, guard=guard)[0]
         for i in range(len(ids) - 1, -1, -1):
             if ids[i] == self.ds_user_id:
                 return ids[:i + 1]
         return []
 
-    def preread(self, messages, tools, kw, answer: str, prompt_ids=(), delay: float = 0.1):
+    def preread(self, messages, tools, kw, guard, answer: str, prompt_ids=(), delay: float = 0.1):
         """MAYA_DS4_PREREAD=1: after a thinking answer, read the next turn's start while nobody waits.  A client that
         sends the answer back without its reasoning makes the next prompt part from this one's end where the reasoning
         was, so that prompt reads the whole answer again with the user watching; read ahead, it reads only its own
         tokens.  In pieces (MAYA_DS4_PREREAD_PIECE): a request that comes meanwhile waits at most for the piece being
         read, then reads what it would have read anyway.  The first piece keeps a restore point one token past where
-        this turn's prompt ended, so a next prompt that differs from the guess (a client that changes the answer) goes
-        back there, not to the system prompt: it reads what it would have read without the setting."""
+        this turn's prompt and the guess part, so a next prompt that differs from the guess (a client that changes the
+        answer) goes back there, not to the system prompt: it reads what it would have read without the setting."""
         def work():
             time.sleep(delay)
             t0 = time.time()
             try:
-                ids = self.preread_ids(messages, tools, kw, answer)
+                ids = self.preread_ids(messages, tools, kw, answer, guard)
             except Exception as e:  # noqa: BLE001 - an optimisation: nothing depends on it
                 print(f"[maya] pre-read: not done ({e})", flush=True)
                 return
@@ -4141,8 +4141,9 @@ class Service:
                     if self.fifo.waiting() or self.stopping:
                         stopped = True
                         break
-                    # (the first piece: a restore point at shared + 1, the template's own token there - </think> - in
-                    #  every client's history, so only text the client sent can differ after it)
+                    # (the first piece: a restore point at shared + 1.  The token at shared is the template's own - </think>
+                    #  after this turn's prompt, or where the loop guard left text out, the first one that changed - so
+                    #  every client's next prompt has it, and only text the client sent can differ after it)
                     sampling = {"_restore": {"marks": [shared + 1]}} if k == 0 and point and shared + 1 < end - 1 else {}
                     gen = self.engine.generate(ids[:end], 1, sampling, threading.Event())   # (one token, never fed)
                     try:
@@ -6662,7 +6663,7 @@ def make_handler(svc: Service):
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
             if preread_on() and getattr(svc.template, "deepseek", False) and not use_mcp and \
                     preread_applies(messages, tools):
-                req = {**req, "_preread": (messages, tools, kw)}   # (Service.preread, after the answer)
+                req = {**req, "_preread": (messages, tools, kw, svc._loop_guard_on(req))}   # (Service.preread, after the answer)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
             if not (req.get("stream") and req.get("strata_resume") is True):   # (the web app's runs on, by design)

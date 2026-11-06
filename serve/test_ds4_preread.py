@@ -93,7 +93,7 @@ class PreRead(unittest.TestCase):
                 if k not in env:
                     os.environ.pop(k, None)
             if preread_on() and preread_applies(msgs, schemas):
-                req = {**req, "_preread": (msgs, schemas, kw)}
+                req = {**req, "_preread": (msgs, schemas, kw, svc._loop_guard_on(req))}
             out = openai_collect(openai_chunks(svc, req, ids, thinking, schemas, max_new, threading.Event()))
             wait_preread()                                       # (inside: the read reads its settings when it runs)
         return ids, out["choices"][0]["message"]
@@ -164,7 +164,7 @@ class PreRead(unittest.TestCase):
         req = {"messages": messages, "reasoning_effort": "high", "_preread": None}
         msgs, schemas, kw = openai_to_messages(req, deepseek=True)
         ids, thinking, max_new = svc.prepare(msgs, schemas, kw, 200)
-        openai_collect(openai_chunks(svc, {**req, "_preread": (msgs, schemas, kw)}, ids, thinking, schemas, max_new,
+        openai_collect(openai_chunks(svc, {**req, "_preread": (msgs, schemas, kw, None)}, ids, thinking, schemas, max_new,
                                      threading.Event()))
         for _ in range(200):                                     # the pre-read has the engine
             if len(eng.calls) == 2:
@@ -208,7 +208,7 @@ class PreRead(unittest.TestCase):
         msgs, schemas, kw = openai_to_messages(req, deepseek=True)
         ids, thinking, max_new = svc.prepare(msgs, schemas, kw, 4000)
         with unittest.mock.patch.dict(os.environ, {PIECE: "64"}):
-            openai_collect(openai_chunks(svc, {**req, "_preread": (msgs, schemas, kw)}, ids, thinking, schemas, max_new,
+            openai_collect(openai_chunks(svc, {**req, "_preread": (msgs, schemas, kw, None)}, ids, thinking, schemas, max_new,
                                          threading.Event()))
             for _ in range(200):
                 if len(eng.calls) >= 2:
@@ -224,6 +224,26 @@ class PreRead(unittest.TestCase):
         pieces = [c for c in eng.calls[1:] if c[1] == 1]
         self.assertLess(len(pieces), 10)                             # (stopped well before its ~18 pieces)
         self.assertLess(took, 1.5)
+
+    def test_the_loop_guards_history_edits_too(self):
+        # a conversation that repeats itself: the loop guard leaves the repeated text out of the prompt it renders, so
+        # the guess has to go the same way (seen on the GPU: every answer ended "Used: my own knowledge; no sources
+        # consulted.", the third time the guard dropped them, and every pre-read after that missed)
+        svc, _ = self.service()
+        svc.loop_guard = True
+        tail = " Used: my own knowledge, nothing else; no sources were consulted for this answer at all."
+        messages = [{"role": "system", "content": SYSTEM}]
+        for i in range(4):
+            messages += [{"role": "user", "content": f"Question {i}?"}, {"role": "assistant", "content": f"Answer {i}." + tail}]
+        messages.append({"role": "user", "content": "Question 4?"})
+        answer = "Answer 4." + tail
+        msgs, schemas, kw = openai_to_messages({"messages": messages, "reasoning_effort": "high", "tools": [TOOL]}, deepseek=True)
+        plain = svc.prepare([dict(m) for m in msgs], schemas, dict(kw), 200, guard=False)[0]
+        guarded = svc.prepare([dict(m) for m in msgs], schemas, dict(kw), 200, guard=True)[0]
+        self.assertLess(len(guarded), len(plain))                    # (the guard did leave text out: the case is real)
+        pre = svc.preread_ids(msgs, schemas, kw, answer, True)
+        nxt = self.next_ids(svc, messages, answer, [TOOL])           # (prepare, the server's guard: on)
+        self.assertEqual(nxt[:len(pre)], pre)
 
     def test_not_for_a_client_that_sends_the_reasoning_back(self):
         back = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a", "reasoning_content": "r"}]
