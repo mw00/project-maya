@@ -1118,7 +1118,7 @@ precision, the GPU selection or the VRAM reserve.
 **Locked-memory limit.** MXFP8 / native FP8 tables for 1017 occupy about 202.76 GB decimal; Q6_K depends on the pack.
 The process's soft and hard `RLIMIT_MEMLOCK` must cover the page-rounded mappings. Set the limit for the account
 or service that actually starts Maya (for systemd, the user manager's hard limit matters as well as the service's
-`LimitMEMLOCK`). An unlimited limit does not supply RAM. A failed `mlock`, invalid range or unsupported table type
+`LimitMEMLOCK`). Many distributions start at 8 MB (`ulimit -l` prints 8192), which fails at the first chunk; the durable fix is a drop-in such as `/etc/security/limits.d/99-maya-memlock.conf` with the lines `<user> soft memlock unlimited` and `<user> hard memlock unlimited`, then a new login session (an old tmux or SSH session keeps the old limit). The error line names the limit it found. An unlimited limit does not supply RAM. A failed `mlock`, invalid range or unsupported table type
 stops initialization with the reason; the engine does not silently fall back to disk.
 
 **NUMA and cache pressure.** Locked file mappings can reuse pages already on one socket even with an interleave
