@@ -1149,7 +1149,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) mtp_draft_setup(false);
         }
     }
-    if (mtp_il_ >= 0 && F->mtp_dv == 0 && F->mtp_emb_h == nullptr &&
+    // (the draft vocabulary's rows for the speculative decode on a split of 3+ GPUs; a two-GPU split drafts over the
+    // whole head, as up to v1.1.51 - #860)
+    if (mtp_il_ >= 0 && F->mtp_dv == 0 && F->mtp_emb_h == nullptr && n_parts_ != 2 &&
         ws_map_.find("output.weight") != ws_map_.end() &&
         ws_map_.at("output.weight").type < (int) GGML_TYPE_COUNT) {
         mtp_draft_setup(false);
@@ -6556,7 +6558,9 @@ bool Glm5Model::fast_mtp(int64_t p, int32_t next_tok, std::string& err, int step
         return v != nullptr && std::atoi(v) != 0;
     }();
     const bool sample_draft_on = mtp_sample_ != nullptr && F->spec_q != nullptr && step == 0;
-    sub = (sub || (!full_head && !sample_draft_on)) && F->mtp_dv > 0;
+    // (a two-GPU split: only where the caller asks for it, as up to v1.1.51 - its speculative decode drafts over the
+    // whole head, #860)
+    sub = (sub || (!full_head && !sample_draft_on && n_parts_ != 2)) && F->mtp_dv > 0;
     mtp_hx_pos_ = -1;   // head_x becomes the block's own hidden state
     if (next_tok < 0) {
         if (F->mtp_emb == nullptr || step < 1) {
@@ -7199,13 +7203,15 @@ bool Glm5Model::spec_tail(Glm5Model* head, int64_t p, std::string& err) {
     if (sprof) cudaEventRecord(spec_ev_[0], F->cs);
     cudaMemcpyAsync(state_, head->spec_hop_h_[sl], hop, cudaMemcpyHostToDevice, F->cs);
     if (!fast_layers(p, true, err)) return false;
+    // (a two-GPU split picks with the argmax here and samples on the host after it, as up to v1.1.51 - decode_spec, #860)
+    const bool pick_here = n_parts_ != 2;
     const auto enqueue_pick = [&](Glm5Model* m, FastState* FL) {
-        if (m->mtp_sample_ != nullptr && FL->spec_q != nullptr) {
+        if (pick_here && m->mtp_sample_ != nullptr && FL->spec_q != nullptr) {
             strata::kernels::sample_verify(m->sc_ + m->sc_logits, 1, (int) g.n_vocab, *m->mtp_sample_,
                                            (const strata::kernels::SpecList*) FL->spec_q, FL->mtp_tok, m->d_tok_,
                                            FL->cs);
             cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
-        } else if (m->mtp_sample_ != nullptr) {
+        } else if (pick_here && m->mtp_sample_ != nullptr) {
             m->pick_tokens(m->sc_ + m->sc_logits, 1, *m->mtp_sample_, nullptr, 0, m->d_tok_, FL->cs);
             cudaMemcpyAsync(FL->tok_h, m->d_tok_, sizeof(int), cudaMemcpyDeviceToHost, FL->cs);
         } else {
@@ -7358,16 +7364,24 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         std::fprintf(stderr, "glm spec: speculative sampling ON (MAYA_GLM_SPEC_SAMPLE) - sampled requests draw the draft "
                              "from the draft block and keep it with min(1, p/q)\n");
     }
-    const bool tail_samples = !sp.greedy && sp.penalty_last_n <= 0;
+    // A two-GPU split (#860) decodes as up to v1.1.51: a sampled token is picked on the host after the tail's pass (not
+    // on the device inside it), and each round's draft is made and waited for before the redo and the tail's next
+    // position, over the whole head (fast_setup / fast_mtp).  The on-device pick, the draft queued ahead of the tail and
+    // the draft vocabulary (#795) stay with the splits of three GPUs or more they were measured on: since they came,
+    // a two-GPU split (RTX PRO 5000 + RTX 4090, Windows) decoded at 0.1 tok/s and then failed with an illegal memory
+    // access, where v1.1.51 and MAYA_GLM_NO_SPEC=1 did not.
+    const bool v51 = n_parts_ == 2;
+    const bool tail_samples = !v51 && !sp.greedy && sp.penalty_last_n <= 0;
+    const bool sample_hook = tail_samples || spec_sample;   // (3+ GPUs: tail_samples - spec_sample is one of them)
     struct MtpSampleOff {   // fast_mtp / spec_tail draw only inside this request's decode
         Glm5Model* m;
         ~MtpSampleOff() { if (m != nullptr) m->mtp_sample_ = nullptr; }
-    } mtp_sample_off{tail_samples ? TL : nullptr};
-    if (tail_samples) TL->mtp_sample_ = &sp;
+    } mtp_sample_off{sample_hook ? TL : nullptr};
+    if (sample_hook) TL->mtp_sample_ = &sp;
     bool have_draft = false;   // the verify needs a draft drawn for its position: none before the first one
     // the tail's token for its last position: the argmax/sample spec_tail left in tok_h, or a sample from its logits
     const auto take = [&](int& y) -> bool {
-        if ((sp.greedy || have_draft) && sp.penalty_last_n <= 0) {
+        if ((sp.greedy || (have_draft && !v51)) && sp.penalty_last_n <= 0) {
             cudaSetDevice(TL->dev_);
             if (!glmfast::wait_event(TL->fast_->ev_done, "glm spec token", err)) return false;
             y = TL->fast_->tok_h[0];
@@ -7383,11 +7397,22 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         last_tok_ = y;
         return true;
     };
+    // a draft that is no token id (the argmax found no finite logit: 0x7fffffff) went on into spec_head's embedding
+    // lookup, far past the table: the position is drafted with the confirmed token instead - a wrong draft the tail
+    // rejects as any other, so the answer is unchanged - and it is said once.  A real id passes through untouched.
+    const auto draft_ok = [&](int d, int32_t next) -> int {
+        if (d >= 0 && d < (int) g.n_vocab) return d;
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "glm spec: the NextN block's draft is no token (%d: its logits are not finite) - drafting "
+                                 "on with the confirmed token in its place (said once)\n", d);
+        return next;
+    };
     const auto draft = [&](int64_t p, int32_t next, int& d) -> bool {
         cudaSetDevice(TL->dev_);
         if (!TL->fast_mtp(p, next, err)) return false;
         if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err) || !TL->fast_->route_ok(err)) return false;
-        d = TL->fast_->mtp_tok_h[0];
+        d = draft_ok(TL->fast_->mtp_tok_h[0], next);
         have_draft = true;
         return true;
     };
@@ -7458,43 +7483,73 @@ bool Glm5Model::decode_spec(strata::kernels::SamplerParams& sp, int64_t max_new,
         const bool more = emit(y2) && produced < max_new && q + 3 < max_ctx_;
         if (!more) break;
         const bool wrong = d != y2;
-        // a wrong draft: the head's standing speculative pass for q+2 is redone with the true token.  This must go
-        // BEFORE the tail's q+2 enqueue: the tail's pass snapshots the head's hop event as it is enqueued, so the
-        // redo's hop record has to be the one in place already.  (STRATA_GLM_SPEC_CANCEL: the head's speculative
-        // pass stops at its next layer, its states are restored behind it and the redo goes in now - the head
-        // redoes q+2 while the tail drafts)
-        if (wrong) {
-            if (cancel) {
+        int d2 = -1;
+        if (v51) {
+            // two GPUs (#860): v1.1.51's round.  (STRATA_GLM_SPEC_CANCEL) a wrong draft: the head's speculative pass
+            // for q+2 stops at its next layer, its states are restored behind it and the redo goes in now
+            if (cancel && wrong) {
                 *(volatile int*) fast_->spec_live_h = 0;
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 kda_all(true);
-            } else {
-                kda_all(true);
+                if (!spec_head(q + 2, y2, err)) { ok = false; break; }
+                lap(2);
             }
-            if (!spec_head(q + 2, y2, err)) { ok = false; break; }
+            // (2) the draft for q+3 from (h_{q+1}, y2), made and waited for
+            if (!draft(q + 1, y2, d2)) { ok = false; break; }
+            lap(1);
+            // (3) the head's speculative position q+2 stands iff its draft was y2; else restore and redo it
+            ++spec_steps_;
+            if (!wrong) {
+                ++spec_hits_;
+            } else if (!cancel) {
+                kda_all(true);
+                if (!spec_head(q + 2, y2, err)) { ok = false; break; }
+            }
             lap(2);
+            // (4) the tail's next position goes in first (it waits for the head's hop on the device)
+            if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
+            lap(3);
+            kda_all(false);
+            if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
+        } else {
+            // a wrong draft: the head's standing speculative pass for q+2 is redone with the true token.  This must
+            // go BEFORE the tail's q+2 enqueue: the tail's pass snapshots the head's hop event as it is enqueued, so
+            // the redo's hop record has to be the one in place already.  (STRATA_GLM_SPEC_CANCEL: the head's
+            // speculative pass stops at its next layer, its states are restored behind it and the redo goes in now -
+            // the head redoes q+2 while the tail drafts)
+            if (wrong) {
+                if (cancel) {
+                    *(volatile int*) fast_->spec_live_h = 0;
+                    std::atomic_thread_fence(std::memory_order_seq_cst);
+                    kda_all(true);
+                } else {
+                    kda_all(true);
+                }
+                if (!spec_head(q + 2, y2, err)) { ok = false; break; }
+                lap(2);
+            }
+            // (2) the draft for q+3 from (h_{q+1}, y2) is enqueued BEFORE the tail's q+2 pass: the drafter reads the
+            //     tail's head_x for position q+1, which the q+2 pass's own head would overwrite once its kernels run
+            //     (stream order).  The host waits for it after enqueuing the tail's pass below.
+            int64_t dp = q + 1;
+            cudaSetDevice(TL->dev_);
+            if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
+            // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
+            //     layers while the host waits for the draft (and the head group's next enqueue)
+            if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
+            lap(3);
+            kda_all(false);
+            if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
+            cudaSetDevice(TL->dev_);
+            if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err)) { ok = false; break; }
+            d2 = draft_ok(TL->fast_->mtp_tok_h[0], y2);
+            if (!TL->fast_->route_ok(err)) { ok = false; break; }
+            lap(1);
+            have_draft = true;
+            // (3) the head's speculative position q+2 stood iff its draft was y2 (redone above otherwise)
+            ++spec_steps_;
+            if (!wrong) ++spec_hits_;
         }
-        // (2) the draft for q+3 from (h_{q+1}, y2) is enqueued BEFORE the tail's q+2 pass: the drafter reads the
-        //     tail's head_x for position q+1, which the q+2 pass's own head would overwrite once its kernels run
-        //     (stream order).  The host waits for it after enqueuing the tail's pass below.
-        int64_t dp = q + 1;
-        cudaSetDevice(TL->dev_);
-        if (!TL->fast_mtp(dp, y2, err)) { ok = false; break; }
-        // (4) the tail's next position goes in first: it waits for the head's hop on the device and starts its
-        //     layers while the host waits for the draft (and the head group's next enqueue)
-        if (!B->spec_tail(hl, q + 2, err)) { ok = false; break; }
-        lap(3);
-        kda_all(false);
-        if (cancel) fast_->spec_cancellable = true;   // q+3 with the new draft: speculative
-        cudaSetDevice(TL->dev_);
-        if (!glmfast::wait_event(TL->fast_->ev_mtp, "glm spec draft", err)) { ok = false; break; }
-        int d2 = TL->fast_->mtp_tok_h[0];
-        if (!TL->fast_->route_ok(err)) { ok = false; break; }
-        lap(1);
-        have_draft = true;
-        // (3) the head's speculative position q+2 stood iff its draft was y2 (redone above otherwise)
-        ++spec_steps_;
-        if (!wrong) ++spec_hits_;
         // (5) the head's next speculative position (its boundary waits for the head's current one)
         cudaSetDevice(dev_);
         if (!spec_head(q + 3, d2, err)) { ok = false; break; }
