@@ -29,6 +29,8 @@ class GrammarAdapter(unittest.TestCase):
     def test_aliases_and_ambiguities(self):
         self.assertEqual(structured.normalize_request({"grammar": GRAMMAR, "structured_outputs": {
             "grammar": GRAMMAR, "disable_any_whitespace": True}}), (GRAMMAR, None))
+        self.assertEqual(structured.normalize_request({"structured_outputs": {
+            "grammar": GRAMMAR, "json": None, "choice": None, "regex": None}}), (GRAMMAR, None))
         for request in ({"grammar": GRAMMAR, "structured_outputs": {"grammar": 'root ::= "B"'}},
                         {"grammar": ""}, {"grammar": "a\0b"},
                         {"structured_outputs": {"grammar": GRAMMAR, "disable_any_whitespace": 1}}):
@@ -84,6 +86,7 @@ class GrammarAdapter(unittest.TestCase):
 
     def test_legacy_structured_fields_keep_their_existing_request_behavior(self):
         fields = ({"structured_outputs": {"json": {"type": "object"}}},
+                  {"structured_outputs": {"json": {"type": "object"}, "grammar": None}},
                   {"structured_outputs": {"regex": "[A-Z]+"}},
                   {"structured_outputs": {}}, {"guided_json": {"type": "object"}},
                   {"json_schema": {"type": "object"}},

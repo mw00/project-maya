@@ -2502,7 +2502,7 @@ class Service:
                 req.pop(key)
         outputs = req.get("structured_outputs")
         has_grammar = req.get("grammar") is not None or req.get("guided_grammar") is not None or (
-            isinstance(outputs, dict) and "grammar" in outputs
+            isinstance(outputs, dict) and outputs.get("grammar") is not None
         )
         if has_grammar:
             grammar, _fmt = structured.normalize_request(req)
