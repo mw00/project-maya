@@ -23,6 +23,15 @@ WARMING = re.compile(r"glm fast: (\S+?)(\d+) warming the expert tiers \d+% \(([\
 WARMED = re.compile(r"glm fast: (\S+?)(\d+) tiers warm: \d+ experts \(([\d.]+) GB\)")
 
 
+def output_text(line: bytes) -> str:
+    """Decode command output bytes to text.  Tries UTF-8 first.  On Windows, falls back to the console's OEM code page
+    (e.g., CP932/Shift-JIS for MSVC cl.exe output) to prevent garbled text."""
+    try:
+        return line.decode("utf-8")
+    except UnicodeDecodeError:
+        return line.decode("oem" if os.name == "nt" else "utf-8", "replace")
+
+
 def curl_meter(line: str):
     """(share done, what to show) from a line of curl's progress meter, or None.  Its columns: % Total, Total,
     % Received, Received, % Xferd, Xferd, Dload, Upload, Time Total, Spent, Left, Current - e.g.
@@ -210,9 +219,9 @@ class Bridge:
                 parts = re.split(rb"(\r\n|\n|\r)", rest[:cut])
                 rest = parts.pop() + rest[cut:]
                 for text, end in zip(parts[::2], parts[1::2]):
-                    self._output(text.decode("utf-8", "replace"), end == b"\r", keep)
+                    self._output(output_text(text), end == b"\r", keep)
             if rest.strip(b"\r\n"):
-                self._output(rest.decode("utf-8", "replace").rstrip("\r\n"), False, keep)
+                self._output(output_text(rest).rstrip("\r\n"), False, keep)
         self.proc = None
         self.events.put(("ran", p.returncode))
         if self.stopped.is_set():
