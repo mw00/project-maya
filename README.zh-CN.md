@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | <a href="README.ja.md">日本語</a> | 简体中文 | <a href="README.pt-BR.md">Português</a></p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>在你自己的 GPU 上运行 GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B) 和 MiniMax-M3.1-Flash (428 B)</b><br>
