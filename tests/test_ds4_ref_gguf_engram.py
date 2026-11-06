@@ -43,6 +43,30 @@ class EngramRowsTest(unittest.TestCase):
                 got = ref_gguf.engram_row_values(raw, kind, np.array([[1, 0]]), 256, "cpu", "test")
                 np.testing.assert_array_equal(got.numpy(), np.zeros((1, 2, 256), np.float32))
 
+    def test_q5_and_q6_nonzero_rows(self):
+        # Encode all values as 1 times the block's FP16 scale in each layout.
+        def block(kind, scale):
+            bits = np.array([scale], np.float16).view(np.uint8)
+            if kind == "Q5_K":
+                data = np.zeros(176, np.uint8)
+                data[:2] = bits
+                data[4:8] = 1
+                data[12:16] = 1
+                data[48:] = 0x11
+            else:
+                data = np.zeros(210, np.uint8)
+                data[:128] = 0x11
+                data[128:192] = 0xAA
+                data[192:208] = 1
+                data[208:] = bits
+            return data
+        for kind in ("Q5_K", "Q6_K"):
+            with self.subTest(kind=kind):
+                raw = np.concatenate([block(kind, 1.0), block(kind, 2.0)])
+                got = ref_gguf.engram_row_values(raw, kind, np.array([[1, 0]]), 256, "cpu", "test")
+                expected = np.repeat(np.array([[2, 1]], np.float32)[..., None], 256, axis=2)
+                np.testing.assert_array_equal(got.numpy(), expected)
+
     def test_mxfp8_rows(self):
         # E8M0 scale 127 and FP8 E4M3 value 0x38 represent 1.0.
         raw = np.array([127] + [0x38] * 32, dtype=np.uint8)
