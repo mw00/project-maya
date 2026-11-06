@@ -1841,7 +1841,7 @@ class StrataEngine:
     def close(self):
         """QUIT, then wait for the engine to end: with kept conversations (MAYA_GLM_SLOT_KEEP) it first writes the
         one it holds, so it gets MAYA_ENGINE_QUIT_S seconds (50; llama-swap's unloadTimeout should exceed it)."""
-        if deep_sleep.end(self):
+        if getattr(self, "deep_sleep", "off") != "off" and deep_sleep.end(self):
             self.proc.wait(timeout=20)
             self.ended = True
             return
@@ -7540,7 +7540,7 @@ def main() -> int:
         if mixed is not None:
             engine = mixed_gpus.engine_class(StrataEngine, wait_gpu_release)(
                 cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env, mixed=mixed)
-            engine.sleep_mode = sleep_mode
+            engine.deep_sleep = sleep_mode
         else:
             engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env,
                                   sleep_mode=sleep_mode)
@@ -7746,13 +7746,19 @@ def main() -> int:
                 # last lines are read by the request and not by close()
                 with svc.fifo:
                     pass
-        # A control request may be checkpointing or restoring even when status.busy is false.
-        # Hold all places until the engine and vision helper have ended.
-        with svc.fifo:
+        if sleep_mode == "off":
             if hasattr(engine, "close"):
                 engine.close()
             if vision:
                 vision.close()
+        else:
+            # Sleep control may be checkpointing or restoring even when status.busy is false.
+            # Hold all places until the engine and vision helper have ended.
+            with svc.fifo:
+                if hasattr(engine, "close"):
+                    engine.close()
+                if vision:
+                    vision.close()
         if hub is not None:
             hub.close()
     except KeyboardInterrupt:                          # a second Ctrl+C: at once
