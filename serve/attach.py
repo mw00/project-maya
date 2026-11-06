@@ -1,6 +1,6 @@
 """serve/attach.py - any file a chat attaches, read into what the model takes: text, or pictures for a model that
 reads them.  The web chat sends here what the browser cannot read itself (POST /attach); the APIs' own file parts
-(OpenAI "file" / Responses "input_file" / Anthropic "document") go through expand_messages() before the template.
+(OpenAI "file" / Responses "input_file" / Anthropic "document") go through expand_request() before the template.
 
     extract(name, data, want_images=..., text_limit=...) -> a JSON-ready dict, one of:
       {"kind": "text", "text", "format", "truncated", "note", "pages"}   the file's text, capped at text_limit
