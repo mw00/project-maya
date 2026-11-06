@@ -1,7 +1,7 @@
 """Native grammar adapter contracts; no model or GPU required."""
 import concurrent.futures
 import json
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 import subprocess
 import sys
 import tempfile
@@ -55,15 +55,73 @@ class GrammarAdapter(unittest.TestCase):
 
     def test_native_checker_uses_pack_and_reports_precise_error(self):
         engine = StrataEngine.__new__(StrataEngine)
-        engine.spawn = ("/build/maya-ds4", ["--pack", "packs/deepseek"], "/model", None, None)
+        with tempfile.TemporaryDirectory() as directory:
+            suffix = ".exe" if os.name == "nt" else ""
+            exe = Path(directory) / ("maya-ds4" + suffix)
+            helper = exe.with_name("maya-ds4-grammar-check" + suffix)
+            engine.spawn = (str(exe), ["--pack", "packs/deepseek"], directory, None, None)
+            engine.grammar_checker = None
+            def checker(command, **kwargs):
+                self.assertEqual(command[:3], [str(helper), "--pack", "packs/deepseek"])
+                self.assertEqual(Path(command[-1]).read_text(), GRAMMAR)
+                self.assertEqual(kwargs["cwd"], directory)
+                return subprocess.CompletedProcess(command, 1, "", "undefined rule missing")
+            with patch("serve.server.subprocess.run", side_effect=checker), self.assertRaisesRegex(ValueError, "undefined rule"):
+                engine.validate_grammar(GRAMMAR)
+
+    def test_windows_checker_command_preserves_native_paths(self):
+        engine = StrataEngine.__new__(StrataEngine)
+        engine.spawn = (r"C:\Program Files\Maya\maya-ds4.exe", ["--pack", r"C:\Models\DeepSeek"],
+                        r"C:\Models", None, None)
         engine.grammar_checker = None
-        def checker(command, **kwargs):
-            self.assertEqual(command[:3], ["/build/maya-ds4-grammar-check", "--pack", "packs/deepseek"])
-            self.assertEqual(Path(command[-1]).read_text(), GRAMMAR)
-            self.assertEqual(kwargs["cwd"], "/model")
-            return subprocess.CompletedProcess(command, 1, "", "undefined rule missing")
-        with patch("serve.server.subprocess.run", side_effect=checker), self.assertRaisesRegex(ValueError, "undefined rule"):
+        with patch("serve.server.Path", PureWindowsPath), patch("serve.server.grammar_file") as temporary, \
+             patch("serve.server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "GRAMMAR_OK\n", "")) as run:
+            temporary.return_value.__enter__.return_value = r"C:\Temp\grammar file.gbnf"
             engine.validate_grammar(GRAMMAR)
+        self.assertEqual(run.call_args.args[0], [r"C:\Program Files\Maya\maya-ds4-grammar-check.exe",
+                         "--pack", r"C:\Models\DeepSeek", "--grammar", r"C:\Temp\grammar file.gbnf"])
+        self.assertEqual(run.call_args.kwargs["cwd"], r"C:\Models")
+
+    def test_legacy_structured_fields_keep_their_existing_request_behavior(self):
+        fields = ({"structured_outputs": {"json": {"type": "object"}}},
+                  {"structured_outputs": {"regex": "[A-Z]+"}},
+                  {"structured_outputs": {}}, {"guided_json": {"type": "object"}},
+                  {"json_schema": {"type": "object"}},
+                  {"response_format": {"type": "json_object"}})
+        for native_grammar in (False, True):
+            svc = self.service()
+            svc.engine.info = {"grammar": 1, "grammar_replay": 1} if native_grammar else {}
+            svc.engine.validate_grammar = Mock()
+            for field in fields:
+                with self.subTest(field=field, native_grammar=native_grammar):
+                    req = json.loads(json.dumps(field))
+                    svc.check_request(req)
+                    for key, value in field.items():
+                        self.assertEqual(req[key], value)
+            svc.engine.validate_grammar.assert_not_called()
+
+    def test_legacy_json_requests_reach_both_http_apis(self):
+        svc = self.service(MockEngine(ByteTokenizer(), '{"ok":true}', max_context=4096))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+        fields = ({"structured_outputs": {"json": {"type": "object"}}},
+                  {"guided_json": {"type": "object"}}, {"json_schema": {"type": "object"}},
+                  {"response_format": {"type": "json_object"}})
+        try:
+            for api in ("chat/completions", "messages"):
+                for stream in (False, True):
+                    for field in fields:
+                        with self.subTest(api=api, stream=stream, field=field):
+                            body = {"model": "test", "messages": [{"role": "user", "content": "hi"}],
+                                    "max_tokens": 64, "stream": stream, **field}
+                            request = urllib.request.Request(base + "/v1/" + api,
+                                json.dumps(body).encode(), {"Content-Type": "application/json"})
+                            with urllib.request.urlopen(request, timeout=10) as response:
+                                self.assertEqual(response.status, 200)
+                                response.read()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
 
     @unittest.skipUnless(os.name == "posix", "script helper uses a shebang")
     def test_checker_protocol_with_binary_vocab_logs_and_both_spawn_shapes(self):
@@ -188,7 +246,7 @@ for line in sys.stdin:
             tempdir = Path(directory) / "spaced 目录"
             tempdir.mkdir()
             exe = Path(directory) / "engine"
-            exe.write_text(f"#!{sys.executable}\n" + script)
+            exe.write_text(f"#!{sys.executable}\n" + script, encoding="utf-8")
             exe.chmod(0o755)
             engine = StrataEngine(str(exe), [])
             original_mkstemp = tempfile.mkstemp
