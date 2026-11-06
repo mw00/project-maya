@@ -424,6 +424,14 @@ constexpr int kMinBlocksMv = 2;
 #else
 #define EXL3_BOUNDS(n) __launch_bounds__(kThreads, n)
 #endif
+// HIP: the decode kernels' block_gemv (moe_*, win_*) inlined into the kernel.  Left to the compiler it can stay a call
+// - it did in v1.1.52 - and a call's arguments arrive in vector registers, so the block's activation count reads as
+// per-lane and every `cc < nc` of the token loop is a branch on the lane mask.  The same arithmetic, the same bits.
+#if defined(STRATA_USE_HIP)
+#define EXL3_DECODE_INLINE [[clang::always_inline]]
+#else
+#define EXL3_DECODE_INLINE
+#endif
 
 // the shared memory of a block_gemv block
 template <int K2, int Tokens = kTok>
@@ -804,8 +812,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_gate_up_kernel(const KMoe a) {
         return;
     }
 #else
-    block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
-                      (const uint16_t*) (blob + a.suh[r]), 1, sm);
+    EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                                         (const uint16_t*) (blob + a.suh[r]), 1, sm);
 #endif
     const size_t row = (size_t) ei * a.n_ff + g * kCols;
     if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[r]) + g * kCols, (r == 0 ? a.h : a.u) + row);
@@ -842,8 +850,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) moe_down_kernel(const KMoe a) {
             return;
         }
 #else
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
-                          (const uint16_t*) (blob + a.suh[2]), 1, sm);
+        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                                             (const uint16_t*) (blob + a.suh[2]), 1, sm);
 #endif
         if (warp == 0) block_out(sm.out, (const uint16_t*) (blob + a.svh[2]) + g * kCols, part);
     } else if (threadIdx.x < kCols) {
@@ -928,8 +936,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_gu_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
-                          (const uint16_t*) (blob + a.suh[r]), nc, sm);
+        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd, x,
+                                             (const uint16_t*) (blob + a.suh[r]), nc, sm);
         if (warp < nc)
 #endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
@@ -969,8 +977,8 @@ __global__ void EXL3_BOUNDS(kMinBlocksX<K2>) win_down_kernel(const KWin a) {
             });
         else if (warp < nc)
 #else
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
-                          (const uint16_t*) (blob + a.suh[2]), nc, sm);
+        EXL3_DECODE_INLINE block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff, x,
+                                             (const uint16_t*) (blob + a.suh[2]), nc, sm);
         if (warp < nc)
 #endif
             block_out(sm.out + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
