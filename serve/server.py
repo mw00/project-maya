@@ -743,6 +743,27 @@ def preread_on(env=None) -> bool:
     return str(env.get(maya_names.read_as("MAYA_DS4_PREREAD"), "")).strip() == "1"
 
 
+PREREAD_PIECE = 256          # MAYA_DS4_PREREAD_PIECE's default: tokens a piece of the read-ahead
+
+
+def preread_piece(env=None) -> int:
+    """MAYA_DS4_PREREAD_PIECE (256): the read-ahead goes in pieces of this many tokens, each its own engine call, and a
+    request that comes meanwhile waits at most for the piece being read (on a layer split the engine stops a read only
+    between its chunks, and a whole answer is one chunk); 0: one read."""
+    env = os.environ if env is None else env
+    try:
+        return max(0, int(str(env.get(maya_names.read_as("MAYA_DS4_PREREAD_PIECE"), PREREAD_PIECE)).strip()))
+    except ValueError:
+        return PREREAD_PIECE
+
+
+def preread_applies(messages, tools) -> bool:
+    """False for a client that sends the answers' reasoning back where DeepSeek's template keeps it (a past turn's
+    reasoning stays only when tools are given): its next prompt already goes on from the engine's own state (the
+    reasoning it wrote), and a read of the answer without it would take the engine off that state."""
+    return not (tools and any(m.get("role") == "assistant" and m.get("reasoning_content") for m in messages or ()))
+
+
 def restore_point_settings(env=None) -> tuple[bool, int]:
     """(on, tail) from MAYA_DS4_RESTORE_POINTS and MAYA_DS4_RESTORE_TAIL (as the code reads them: maya_names)."""
     env = os.environ if env is None else env
@@ -3961,11 +3982,14 @@ class Service:
                 return ids[:i + 1]
         return []
 
-    def preread(self, messages, tools, kw, answer: str, delay: float = 0.1):
+    def preread(self, messages, tools, kw, answer: str, prompt_ids=(), delay: float = 0.1):
         """MAYA_DS4_PREREAD=1: after a thinking answer, read the next turn's start while nobody waits.  A client that
         sends the answer back without its reasoning makes the next prompt part from this one's end where the reasoning
         was, so that prompt reads the whole answer again with the user watching; read ahead, it reads only its own
-        tokens.  A request that comes meanwhile stops it at once, and then reads what it would have read anyway."""
+        tokens.  In pieces (MAYA_DS4_PREREAD_PIECE): a request that comes meanwhile waits at most for the piece being
+        read, then reads what it would have read anyway.  The first piece keeps a restore point one token past where
+        this turn's prompt ended, so a next prompt that differs from the guess (a client that changes the answer) goes
+        back there, not to the system prompt: it reads what it would have read without the setting."""
         def work():
             time.sleep(delay)
             t0 = time.time()
@@ -3974,23 +3998,43 @@ class Service:
             except Exception as e:  # noqa: BLE001 - an optimisation: nothing depends on it
                 print(f"[maya] pre-read: not done ({e})", flush=True)
                 return
-            if len(ids) < 2 or len(ids) >= self.engine.max_context - CTX_SLACK or not self.fifo.acquire(blocking=False):
+            shared = 0                                   # (what the next prompt shares with this turn's)
+            for a, b in zip(prompt_ids, ids):
+                if a != b:
+                    break
+                shared += 1
+            if len(ids) - shared < 2 or len(ids) >= self.engine.max_context - CTX_SLACK or \
+                    not self.fifo.acquire(blocking=False):
                 return
-            stopped = False
+            piece = preread_piece()
+            ends = (list(range(shared + piece, len(ids), piece)) if piece > 0 else []) + [len(ids)]
+            point, _ = restore_point_settings()
+            stopped, read_to, n = False, shared, 0
             try:
                 if hasattr(self.engine, "alive") and not self.engine.alive():   # (unloaded: nothing to read into)
                     return
-                cancel = threading.Event()
-                gen = self.engine.generate(ids, 1, {}, cancel)   # (one token: sampled from the read's last row, never fed)
-                try:
-                    for _ in gen:
-                        if self.fifo.waiting() or self.stopping:
-                            stopped = True
-                            break
-                finally:
-                    gen.close()                                  # (STOP and drain to DONE, still holding the FIFO)
+                for k, end in enumerate(ends):
+                    if self.fifo.waiting() or self.stopping:
+                        stopped = True
+                        break
+                    # (the first piece: a restore point at shared + 1, the template's own token there - </think> - in
+                    #  every client's history, so only text the client sent can differ after it)
+                    sampling = {"_restore": {"marks": [shared + 1]}} if k == 0 and point and shared + 1 < end - 1 else {}
+                    gen = self.engine.generate(ids[:end], 1, sampling, threading.Event())   # (one token, never fed)
+                    try:
+                        for _ in gen:
+                            if self.fifo.waiting() or self.stopping:
+                                stopped = True
+                                break
+                    finally:
+                        gen.close()                      # (STOP and drain to DONE, still holding the FIFO)
+                    n += 1
+                    if stopped:
+                        break
+                    read_to = end
                 print(f"[maya] pre-read: {len(ids)} tokens, {'stopped by a request' if stopped else 'done'} "
-                      f"after {time.time() - t0:.1f} s", flush=True)
+                      f"after {time.time() - t0:.1f} s ({read_to - shared} of {len(ids) - shared} read ahead, "
+                      f"{n} of {len(ends)} pieces)", flush=True)
             except (EngineDied, ValueError, OSError) as e:
                 print(f"[maya] pre-read: {e}", flush=True)
             finally:
@@ -4638,7 +4682,7 @@ class Service:
         pre = (sampling or {}).get("_preread")
         if pre and finish == "stop" and not called and not sent_call and said and thinking and not emb \
                 and not cancel.is_set() and not self.stopping:
-            self.preread(*pre, "".join(said))
+            self.preread(*pre, "".join(said), ids)
         yield "done", {"finish": finish, "completion_tokens": n, "reasoning_tokens": reasoning_tokens,
                        "reused": (timings or {}).get("cache_n", 0),
                        "timings": timings, "stop_sequence": matched if finish == "stop" else None}
@@ -6448,7 +6492,8 @@ def make_handler(svc: Service):
                 req = {**req, "_prefill": kw["_prefill"]}
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
-            if preread_on() and getattr(svc.template, "deepseek", False) and not use_mcp:
+            if preread_on() and getattr(svc.template, "deepseek", False) and not use_mcp and \
+                    preread_applies(messages, tools):
                 req = {**req, "_preread": (messages, tools, kw)}   # (Service.preread, after the answer)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
@@ -6601,7 +6646,8 @@ SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
               "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD", "STRATA_QUEUE_PING_S",
               "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
-    tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL", "MAYA_DS4_PREREAD"))
+    tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL", "MAYA_DS4_PREREAD",
+                                          "MAYA_DS4_PREREAD_PIECE"))
 
 
 def apply_server_env(cfg: dict) -> None:
