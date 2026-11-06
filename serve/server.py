@@ -253,6 +253,7 @@ class FairLock:
         self._queue: collections.deque = collections.deque()   # [token, units]
         self.capacity = max(1, int(capacity))
         self._used = 0
+        self._yields = 0                                       # runners that decided to give their place up (claim_yield)
 
     def set_capacity(self, n: int):
         with self._cv:
@@ -286,9 +287,42 @@ class FairLock:
     def enqueue(self, units: int | None = None) -> object:
         """A place in line (wait_turn waits for it, leave gives it up): a waiter that wakes up now and then (to send
         a heartbeat) keeps its place."""
-        me = [object(), self._units(units), time.monotonic()]    # (token, units, asked at: the queue watchdog's age)
+        me = [object(), self._units(units), time.monotonic(), False]    # (token, units, asked at: the queue watchdog's age, queued again by a fair slice)
         with self._cv:
             self._queue.append(me)
+        return me
+
+    def claim_yield(self, slice_s: float) -> bool:
+        """The fair slices' decision, made one runner at a time: True when this runner should give its place up now,
+        and then counted until it does (yield_place) or says it did not (unclaim_yield).  Without the count, every
+        runner past its slice saw the same waiter and gave up its place for it: with 4 conversations running, one
+        short request cut all 4, each to read all it had written again.  The waiters that count are the ones that
+        asked for a place (a request that has not run yet), and those a slice put back in line once they have waited
+        a slice themselves (long answers still take turns); what they need, less the places free and the runners
+        already on their way out, is how many more runners give up a place."""
+        now = time.monotonic()
+        with self._cv:
+            need = sum(min(e[1], self.capacity) for e in self._queue
+                       if not (len(e) > 3 and e[3]) or now - e[2] >= slice_s)
+            if need - (self.capacity - self._used) - self._yields > 0:
+                self._yields += 1
+                return True
+            return False
+
+    def unclaim_yield(self):
+        with self._cv:
+            self._yields = max(0, self._yields - 1)
+
+    def yield_place(self, units: int | None = 1) -> object:
+        """A runner's place given up, and a place in line behind whoever waits now, in one step (the claim ends with it:
+        the free place is counted from here)."""
+        k = self._units(units)
+        me = [object(), k, time.monotonic(), True]
+        with self._cv:
+            self._queue.append(me)
+            self._used -= min(k, self._used)
+            self._yields = max(0, self._yields - 1)
+            self._cv.notify_all()
         return me
 
     def wait_turn(self, me, timeout: float = -1) -> bool:
@@ -4050,7 +4084,7 @@ class Service:
             smp_call, n_call = guard.sampling(smp, len(produced), left) if guard is not None else (smp, left)
             gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, n_call, smp_call, cancel)
-            slice_s, t0, cut, pausing = fair_slice_seconds(), None, False, False
+            slice_s, t0, cut, pausing, claimed = fair_slice_seconds(), None, False, False, False
             act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
             try:
                 for t in gen:
@@ -4083,7 +4117,9 @@ class Service:
                     if t0 is None:
                         t0 = time.monotonic()
                     if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
-                            and self.fifo.waiting() and time.monotonic() - t0 >= slice_s:
+                            and self.fifo.waiting() and time.monotonic() - t0 >= slice_s \
+                            and self.fifo.claim_yield(slice_s):     # (one runner a waiter, not every runner)
+                        claimed = True
                         if getattr(self.engine, "can_pause", False):
                             # PAUSE: the engine keeps the state with what it wrote; the tokens it still writes
                             # before its DONE go to the client as usual, so the next prompt continues that state
@@ -4097,6 +4133,8 @@ class Service:
                     cut = len(produced) < max_new and (done is last0 or (done or {}).get("finish") == "cancel")
             finally:
                 gen.close()                             # STOP + drain to this slice's DONE, still holding the FIFO
+                if claimed and not (cut and not closed and act is None):
+                    self.fifo.unclaim_yield()           # (it ends, or goes on some other way: no place given up)
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
@@ -4146,9 +4184,8 @@ class Service:
                 self.status["busy"] = self.active > 0
                 self.status["queued"] += 1
             waiting = self.fifo.waiting()
-            place = self.fifo.enqueue(units=1)          # in line before letting go: behind whoever waits now
+            place = self.fifo.yield_place(units=1)      # in line, and the place free, in one step: behind whoever waits now
             hold[0] = False
-            self.fifo.release(units=1)
             print(f"[maya] fair slice: {len(produced)} tokens written, the engine goes to the next request "
                   f"({waiting} waiting); this one continues after it", flush=True)
             try:
