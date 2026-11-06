@@ -4347,7 +4347,7 @@ static int glm_pack_generate(const Options& o) {
             int64_t max_new = 0;
             ss >> max_new;
             strata::kernels::SamplerParams rq = sp;
-            bool any_key = false, greedy_req = false;
+            bool any_key = false, greedy_req = false, seed_req = false;
             req_think_budget = 0;
             req_think_end = -1;
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
@@ -4381,7 +4381,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "top_p") { rq.top_p = (float) std::atof(v.c_str()); any_key = true; }
                 else if (k == "top_k") { rq.top_k = std::atoi(v.c_str()); any_key = true; }
                 else if (k == "min_p") { rq.min_p = (float) std::atof(v.c_str()); any_key = true; }
-                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); }
+                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); seed_req = rq.seed != 0; }
                 else if (k == "think_budget") { req_think_budget = std::atoll(v.c_str()); }
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
@@ -4421,6 +4421,10 @@ static int glm_pack_generate(const Options& o) {
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
+            // a sampled request without a seed draws a new one (#845: seed 0 for every such request gave the same answer
+            // each time); a seed in the request, or --seed when the engine started, stays exact
+            if (!rq.greedy && !seed_req && o.seed == 0)
+                rq.seed = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
             // a repeat penalty of 0 or below (some clients' "off"; the logits would be divided by it) or a value that is
             // not a number counts as neutral
             if (!std::isfinite(pen_repeat) || pen_repeat <= 0.0f) pen_repeat = 1.0f;
