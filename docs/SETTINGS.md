@@ -371,6 +371,9 @@ configurations (not between two starts of one).
 | `MAYA_DS4_LANE_PARITY` | off | `1`: as above (with `DS4_IQ_Q8K` on, the default) |
 | `MAYA_DS4_LANE_PARITY_SCALAR` | off | `1` (tests): the CPU lane's parity rows in their scalar form - the same bits, slower |
 
+`MAYA_DS4_LANE_PARITY` takes precedence over the older `STRATA_DS4_LANE_PARITY` and `DS4_LANE_PARITY` aliases,
+in that order. A set value of `0` disables parity even if a lower-priority alias is `1`.
+
 ## Repetition penalties
 
 A request's `repeat_penalty` (or `repetition_penalty`), `frequency_penalty` and `presence_penalty` work as in
