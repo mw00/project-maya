@@ -91,7 +91,8 @@ function UserMsg({m, i}) {
   return html`<div class="you" data-id=${m.id}>
     ${(m.files || []).length || (m.images || []).length ? html`<div class="you__files">
       ${(m.files || []).map((f) => html`<span class="chip"><${Icon} name="attach" sm/>${f.name}</span>`)}
-      ${(m.images || []).map((im) => im.url ? html`<img src=${im.url} alt=${im.name || "picture"}/>`
+      ${(m.images || []).map((im) => im.url ? (im.kind === "video" ? html`<video src=${im.url} controls preload="metadata" aria-label=${im.name || "video"}></video>`
+                                                                     : html`<img src=${im.url} alt=${im.name || "picture"}/>`)
                                             : html`<span class="chip"><${Icon} name="image" sm/>${im.name || "picture"}</span>`)}</div>` : null}
     ${m.text ? html`<div class="you__bubble">${m.text}</div>` : null}
     <div class="you__actions"><span class="you__time">${m.time ? timeStr(m.time) : ""}</span>

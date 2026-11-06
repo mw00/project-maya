@@ -97,7 +97,7 @@ class Extract(unittest.TestCase):
 
     def test_not_a_pdf(self):
         r = pdfmod.extract(b"hello, not a PDF at all", want_images=True, text_limit=LIMIT)
-        self.assertIn("could not be read", r["error"]["message"])
+        self.assertIn("not a PDF", r["error"]["message"])
 
 
 @unittest.skipUnless(POPPLER, "poppler is not installed")
@@ -112,19 +112,32 @@ class RealPdfExtras(unittest.TestCase):
 
 
 class MissingPoppler(unittest.TestCase):
-    """The machine without poppler - a PATH where neither tool answers, however the rest of the test happens to
-    look - gets Maya's answer: the exact command, apt and pacman both."""
+    """The machine without poppler - a PATH where no tool answers, however the rest of the test happens to look
+    (most Windows and macOS PCs): the pure-Python reader (serve/pdf_text.py) reads the text layer, and only a PDF
+    nothing came out of names poppler, apt and pacman both."""
 
-    def test_install_command_named(self):
+    def test_text_layer_read_without_poppler(self):
         with mock.patch.object(shutil, "which", return_value=None):
-            r = pdfmod.extract(b"%PDF-1.4 whatever", want_images=True, text_limit=LIMIT)
+            r = pdfmod.extract(_pdf([_lines(WORDS), b""]), want_images=True, text_limit=LIMIT)
+        self.assertEqual((r["kind"], r["pages"]), ("text", 2))
+        self.assertIn("The quick brown fox jumps over the lazy dog, line 0", r["text"])
+        self.assertIn("line 5", r["text"])
+
+    def test_install_command_named_when_nothing_came_out(self):
+        with mock.patch.object(shutil, "which", return_value=None):
+            r = pdfmod.extract(_pdf([b""]), want_images=True, text_limit=LIMIT)
         m = r["error"]["message"]
         self.assertIn("sudo apt install poppler-utils", m)
         self.assertIn("sudo pacman -S poppler", m)
 
+    def test_no_pictures_wanted_says_so(self):
+        with mock.patch.object(shutil, "which", return_value=None):
+            r = pdfmod.extract(_pdf([b""]), want_images=False, text_limit=LIMIT)
+        self.assertIn("no text layer", r["error"]["message"])
+
 
 class Route(unittest.TestCase):
-    """POST /pdf against the mock engine (no GPU): the guards a dashboard route keeps, and the JSON that comes
+    """POST /pdf (now also /attach) against the mock engine (no GPU): the guards a dashboard route keeps, and the JSON that comes
     back for the page to attach.  The mock service has no vision, so scanned PDFs error the way a model without
     images should see them."""
 
@@ -150,8 +163,6 @@ class Route(unittest.TestCase):
                 return e.code, json.loads(e.read())
 
     def test_text_pdf_round_trip(self):
-        if not POPPLER:
-            self.skipTest("poppler is not installed")
         s, j = self.post(_pdf([_lines(WORDS)]))
         self.assertEqual(s, 200)
         self.assertEqual(j["kind"], "text")
@@ -159,15 +170,14 @@ class Route(unittest.TestCase):
 
     def test_wants_pdf_bytes_not_json(self):
         s, j = self.post(b"{}", "application/json")
-        self.assertEqual((s, "application/pdf" in j["error"]["message"]), (415, True))
+        self.assertEqual((s, "application/octet-stream" in j["error"]["message"]), (415, True))
 
-    def test_rejects_what_is_not_a_pdf(self):
-        s, j = self.post(b"GIF89a....")
-        self.assertEqual((s, "not a PDF" in j["error"]["message"]), (400, True))
+    def test_says_what_it_cannot_read(self):
+        s, j = self.post(b"MZ\x90\x00\x03" + bytes(range(256)) * 4)
+        self.assertEqual(s, 200)                               # (the error is the result's, for the page to toast)
+        self.assertIn("Windows program", j["error"]["message"])
 
     def test_scanned_pdf_errors_when_the_model_reads_no_pictures(self):
-        if not POPPLER:
-            self.skipTest("poppler is not installed")
         s, j = self.post(_pdf([b""]))
         self.assertEqual(s, 200)                               # (the error is the result's, for the page to toast)
         self.assertIn("no text layer", j["error"]["message"])
