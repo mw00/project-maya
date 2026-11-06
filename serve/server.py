@@ -778,6 +778,13 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int], window_s: flo
 RESTORE_LEAST = 1024        # no point before this many tokens: such a start is read again in about the time a point costs
 
 
+def preread_on(env=None) -> bool:
+    """MAYA_DS4_PREREAD=1 (off by default): after a DeepSeek thinking answer, read the chat's next turn start while
+    nobody waits (Service.preread).  OpenAI chat completions only, the client's own tools only (not the web app's MCP)."""
+    env = os.environ if env is None else env
+    return str(env.get(maya_names.read_as("MAYA_DS4_PREREAD"), "")).strip() == "1"
+
+
 def restore_point_settings(env=None) -> tuple[bool, int]:
     """(on, tail) from MAYA_DS4_RESTORE_POINTS and MAYA_DS4_RESTORE_TAIL (as the code reads them: maya_names)."""
     env = os.environ if env is None else env
@@ -4095,7 +4102,7 @@ class Service:
                 return
             stopped = False
             try:
-                if not self.engine.alive():
+                if hasattr(self.engine, "alive") and not self.engine.alive():   # (unloaded: nothing to read into)
                     return
                 cancel = threading.Event()
                 gen = self.engine.generate(ids, 1, {}, cancel)   # (one token: sampled from the read's last row, never fed)
@@ -6609,8 +6616,7 @@ def make_handler(svc: Service):
             req = {**req, "_blocked": kw.get("_blocked")}      # calls the loop guard blocks (Service.prepare)
             req = {**req, "_think_resume": kw.get("_think_resume")}
             req = {**req, "_think_max": kw.get("_think_max")}          # (GLM-5.3: Max's long budget, Service.asked_max)
-            if os.environ.get(maya_names.read_as("MAYA_DS4_PREREAD")) == "1" and getattr(svc.template, "deepseek", False) \
-                    and not use_mcp:
+            if preread_on() and getattr(svc.template, "deepseek", False) and not use_mcp:
                 req = {**req, "_preread": (messages, tools, kw)}   # (Service.preread, after the answer)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             cancel = threading.Event()
