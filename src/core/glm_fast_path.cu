@@ -1337,6 +1337,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (long long) max_ctx_, (double) state_bytes_ / G,
                          (double) (sc_bytes_ + F->arena_bytes + 8 * sstride) / G, (used - known) / G);
         }
+ // the parked sequence slots no longer hold their bytes
+        // (seq_alloc_arenas parks them null), and the pool sizes for the guaranteed states'
+        // floor (seq_bytes_floor_) - the cap's tail is the ladder's to arbitrate (each parked
+        // acquire the device cannot honor evicts live-idle states, or the request waits)
+        free_b = free_b > seq_bytes_floor_ ? free_b - seq_bytes_floor_ : 0;
         // the budget: the free VRAM less the reserve (--vram-reserve-mib), or --expert-cache N's (pool_budget)
         pool_b_ = part_budget(free_b, total_b, floor_b, stride_max);
         const size_t reserve = pool_b_.reserve;
@@ -6101,6 +6106,9 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     d.kv_raw = F->kv_raw;
     d.kv_norm = Ly.kv_a_norm;
     kv_prep_targets(kv_, il, lat, d);
+ d.paged_lat_table = lat_table_; // NULL when STRATA_GLM_PAGED is off (incumbent rows)
+    d.paged_page_rows = lat_pages_.page_size();
+    d.paged_max_rows = lat_max_rows();
     d.kv_lora = g.kv_lora;
     d.lat_q8 = lat_q8_;
     d.ik_raw = F->ik_raw;
@@ -6143,7 +6151,8 @@ bool Glm5Model::fast_dsa(int il, int64_t p, std::string& err) {
     const int top_pools = std::min(g.top_pools_max(), pool_done);
     const int n_sel = g.idx_kpool * top_pools + (g.idx_select_tail ? g.idx_kpool - 1 : 0);
     if (all) gf::dsa_select_all(pool_done, g.idx_kpool, n_sel, (int) p, F->cells, s);
-    else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s);
+    else gf::dsa_select(F->score, pool_done, g.idx_kpool, top_pools, n_sel, (int) p, F->cells, s, lat_table_,
+                        lat_pages_.page_size(), lat_max_rows());
     if (F->prof_on) F->mark("dsa_select");
     // KV streaming: the selected blocks into VRAM slots, the attention reading the selection in slot rows
     const int* cells = kv_attend_cells(kv_, il, lat, F->cells, n_sel, F->slot_cells, s);
