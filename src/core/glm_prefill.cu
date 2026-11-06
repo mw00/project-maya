@@ -28,6 +28,7 @@
 #include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_batch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/platform/env_switch.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused_rdna4.hpp"
@@ -1046,7 +1047,7 @@ static constexpr size_t kPfWorkspace = (size_t) 16 << 20;   // cuBLAS
 // ---------------------------------------------------------------- setup
 bool Glm5Model::prefill_setup(std::string& err) {
     (void) err;
-    if (getenv("STRATA_GLM_NO_PREFILL") != nullptr) return true;
+    if (strata::platform::env_switch("STRATA_GLM_NO_PREFILL")) return true;
     if (prefill_mode() != "auto" && std::atoll(prefill_mode().c_str()) <= 0) {
         std::fprintf(stderr, "glm prefill: --prefill %s: the prompt runs token by token\n", prefill_mode().c_str());
         return true;

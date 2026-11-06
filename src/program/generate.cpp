@@ -1620,6 +1620,9 @@ static int glm_pack_generate(const Options& o) {
     // the longest slot this prompt continues, back in the model: the tokens it covers (0: none)
     const auto slot_take = [&](const std::vector<int32_t>& prompt) -> size_t {
         if (slot_max <= 0) return 0;
+      for (;;) {   // the longest slot this prompt continues; one that will not load (saved by another model layout, a
+                   // damaged file) is dropped and the next-longest tried - before, the first failure read the whole
+                   // prompt from token 0 although a shorter slot or a checkpoint held most of it
         size_t best = SIZE_MAX, len = 0;
         for (size_t i = 0; i < slots.size(); ++i) {
             const auto& t = slots[i].tokens;
@@ -1636,10 +1639,10 @@ static int glm_pack_generate(const Options& o) {
                               ? model.slot_load(*slots[best].data, (int64_t) len, e)
                               : model.slot_load(slots[best].path, (int64_t) len, e);
         if (!back) {
-            note("taking a conversation back failed (" + e + ") - reading its prompt again");
+            note("taking a conversation back failed (" + e + ") - trying the next slot or checkpoint");
             slot_drop(best);
             snap_tokens.clear();
-            return 0;
+            continue;
         }
         snap_tokens = slots[best].tokens;
         snap_img_hash = slots[best].img;
@@ -1657,6 +1660,7 @@ static int glm_pack_generate(const Options& o) {
                       prompt.size() - len);
         note(m);
         return len;
+      }
     };
     // a request's DFlash window and draft cut (its GEN line's spec= / spec_min_p=; 0 / -1: as the engine started)
     int req_spec = 0;
@@ -1859,7 +1863,11 @@ static int glm_pack_generate(const Options& o) {
                         std::equal(sl.tokens.begin(), sl.tokens.end(), prompt.begin()))
                         slot_len = sl.tokens.size();
             std::string ce;
-            if (slot_len > ck_len) {
+            if (slot_len > ck_len) {   // the slot first; when none loads (another layout, a damaged file) the checkpoint
+                reuse = slot_take(prompt);   // below is used instead of reading from token 0
+                if (reuse > 0) ckpt_drop_past(0);   // another conversation's state now
+            }
+            if (reuse > 0) {
             } else if (model.ckpt_restore(ckpt_base + ck, ce)) {
                 reuse = ck_len;
                 from_ckpt = true;
@@ -4339,7 +4347,7 @@ static int glm_pack_generate(const Options& o) {
             int64_t max_new = 0;
             ss >> max_new;
             strata::kernels::SamplerParams rq = sp;
-            bool any_key = false, greedy_req = false;
+            bool any_key = false, greedy_req = false, seed_req = false;
             req_think_budget = 0;
             req_think_end = -1;
             double req_pcie = -1.0;   // setup's calibration: this request's CPU lane (as the engine started: -1 / 0)
@@ -4373,7 +4381,7 @@ static int glm_pack_generate(const Options& o) {
                 else if (k == "top_p") { rq.top_p = (float) std::atof(v.c_str()); any_key = true; }
                 else if (k == "top_k") { rq.top_k = std::atoi(v.c_str()); any_key = true; }
                 else if (k == "min_p") { rq.min_p = (float) std::atof(v.c_str()); any_key = true; }
-                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); }
+                else if (k == "seed") { rq.seed = (uint64_t) std::atoll(v.c_str()); seed_req = rq.seed != 0; }
                 else if (k == "think_budget") { req_think_budget = std::atoll(v.c_str()); }
                 else if (k == "think_end") { req_think_end = std::atoi(v.c_str()); }
                 else if (k == "pcie_frac") { req_pcie = std::atof(v.c_str()); }
@@ -4413,6 +4421,10 @@ static int glm_pack_generate(const Options& o) {
             }
             if (any_key) rq.greedy = false;   // any sampler key switches the request to the sampled path
             if (greedy_req) rq.greedy = true;
+            // a sampled request without a seed draws a new one (#845: seed 0 for every such request gave the same answer
+            // each time); a seed in the request, or --seed when the engine started, stays exact
+            if (!rq.greedy && !seed_req && o.seed == 0)
+                rq.seed = (uint64_t) std::chrono::steady_clock::now().time_since_epoch().count();
             // a repeat penalty of 0 or below (some clients' "off"; the logits would be divided by it) or a value that is
             // not a number counts as neutral
             if (!std::isfinite(pen_repeat) || pen_repeat <= 0.0f) pen_repeat = 1.0f;

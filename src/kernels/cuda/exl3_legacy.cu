@@ -3,7 +3,9 @@
 // slower here than these (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  exl3.cu's mv / moe_gate_up / moe_down
 // / win_experts / prepare / several_ok call these on such a GPU (STRATA_GLM_EXL3_DECODE=legacy|new picks one on any
 // GPU); the prompt path is exl3.cu's on every GPU.  The code below is v1.1.8's, the prompt path's kernels left out
-// and decode8's trellis windows cut eight at a time (as exl3.cu's frag8) - the same values.
+// and decode8's trellis windows cut eight at a time (as exl3.cu's frag8) - the same values.  =legacy-f32 runs these
+// kernels with the weights decoded in F32 instead of FP16 (decode2f, for Pascal), the same bits; those kernels are
+// built for sm_6x only (EXL3_F32_KERNEL).
 //
 // The codebooks and the trellis window arithmetic follow exllamav3 (MIT, turboderp - exllamav3_ext/quant/
 // codebook.cuh, exl3_dq.cuh, hadamard_inner.cuh); the kernels around them are shaped for this engine's decode:
@@ -87,6 +89,59 @@ __device__ __forceinline__ float2 decode2(uint32_t s0, uint32_t s1) {
     return __half22float2(decode2h<cb>(s0, s1));
 }
 
+// The same values without FP16 arithmetic (STRATA_GLM_EXL3_DECODE=legacy-f32): Pascal's sm_61 (P4000, P40, GTX 10)
+// runs FP16 at 1/64 of its F32 rate, so decode2h's one HFMA2 / HADD2 a pair was most of the decode's time there.
+// Each FP16 op is done exactly in F32 and rounded once to FP16's 11 significant bits (to nearest, ties to even, as the
+// FP16 unit rounds) with integer ops; every result is a normal FP16 number, so that rounding is all FP16 does to it.
+// decode2f is __half22float2(decode2h) bit for bit, for every state and codebook (legacy_decode_table compares them).
+__device__ __forceinline__ float round_f16(float x) {   // x: F32, |x| within FP16's normal range
+    const uint32_t u = __float_as_uint(x);
+    return __uint_as_float((u + 0xfffu + ((u >> 13) & 1u)) & 0xffffe000u);
+}
+// (a & 0x81ffe000) ^ 0x3f6c0000 in one LOP3 (the compiler makes two LOP32I of it): an FP16 half of decode1f's x, its
+// sign at bit 31 and its 12 low bits at 24..13, to F32
+__device__ __forceinline__ uint32_t and_xor(uint32_t a) {
+    uint32_t d;
+    asm("lop3.b32 %0, %1, %2, %3, 0x6a;" : "=r"(d) : "r"(a), "r"(0x81ffe000u), "r"(0x3f6c0000u));
+    return d;
+}
+template <int cb>
+__device__ __forceinline__ float decode1f(uint32_t s) {   // s < 2^16
+    if constexpr (cb == 2) {
+        // with b the bytesum (at most 1020): t = 2^23 + 8 b exactly (dp4a adds 8 b to the F32 bits 0x4b000000), and
+        //   t * fp16(0x1eee) / 8 - 7099.453125 = (1024 + b) * fp16(0x1eee) + fp16(0xc931)
+        // exactly (fp16(0x1eee) = 1774 * 2^-18, fp16(0xc931) = -10632 * 2^-10; both F32 constants exact).  That is
+        // (1774 b - 905216) * 2^-18, under 4 in magnitude: the one F32 FMA is exact and the one rounding is
+        // round_f16's, as the HFMA2's.  The results lie 476 * 2^-18 or more from 0 (b 510): normal FP16
+        const float t = __uint_as_float(__dp4a(s * 0x83DCD12Du, 0x08080808u, 0x4b000000u));
+        return round_f16(__fmaf_rn(t, 0x1.bb8p-11f, -7099.453125f));
+    } else {
+        // x's two FP16 halves after (x & 0x8fff8fff) ^ 0x3b603b60 have the exponents 12..15 (magnitudes 1/8 to 2),
+        // so each widens to F32 by moving its sign, its exponent's two free bits and its mantissa (the rest of the
+        // F32 exponent is 0x7c..0x7f's 011111): sign to bit 31, x's 12 bits under it to bits 24..13 (the arithmetic
+        // shifts), and the mask's and xor's constants in their F32 places.  Their F32 sum is exact (two 11-bit
+        // significands within a factor of 16, a multiple of 2^-13 under 4), 0 or 2^-13 or more: normal FP16.  (The low
+        // half moves up with a byte permute: written as a shift, the compiler folds it into a second multiply.)
+        const uint32_t x = cb == 1 ? s * 0xCBAC1FEDu : s * 89226354u + 64248484u;
+        const float lo = __uint_as_float(and_xor((uint32_t) ((int32_t) __byte_perm(x, 0u, 0x1044u) >> 3)));
+        const float hi = __uint_as_float(and_xor((uint32_t) ((int32_t) x >> 3)));
+        return round_f16(__fadd_rn(lo, hi));
+    }
+}
+template <int cb>
+__device__ __forceinline__ float2 decode2f(uint32_t s0, uint32_t s1) {
+    return make_float2(decode1f<cb>(s0), decode1f<cb>(s1));
+}
+// legacy-f32 is for Pascal: the kernels' F32 instantiations have their bodies on sm_6x only and are empty on sm_70 and
+// newer, where the host never launches them (exl3.cu's decode_kernels takes the FP16 decode there, the same bits).
+// Built for every architecture they made a Turing (sm_75) module 5.3 MB larger, its expert pool a slot smaller.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+#define EXL3_F32_KERNEL(F32) \
+    if constexpr (F32) return
+#else
+#define EXL3_F32_KERNEL(F32) (void) 0
+#endif
+
 // The lane's 8 steps (lane * 8 + j): v[j] sits at tile row (lane & 3) * 2 + (j & 1) + 8 (j >> 1 & 1), column
 // (lane >> 2) + 8 (j >> 2).  Step p's state is the 16-bit window ending at bit S(p) = floor((p + 1) K2 / 2) of the
 // tile's MSB-first bit stream (w: its 4 K2 words), wrapping around the tile.  v1.1.8 cut every step's window on its
@@ -162,14 +217,16 @@ __device__ __forceinline__ void states8_half(const uint32_t* w, int lane, uint32
         s[4 * g + 0] = x >> (3 * KA + 2);
     }
 }
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __device__ __forceinline__ void decode8(const uint32_t* w, int lane, float* v) {
     uint32_t s[8];
     if constexpr ((K2 & 1) != 0) states8_half<K2>(w, lane, s);
     else states8_int<K2 / 2>(w, lane, s);
 #pragma unroll
     for (int j = 0; j < 8; j += 2) {
-        const float2 d = decode2<cb>(s[j] & 0xffffu, s[j + 1] & 0xffffu);
+        float2 d;
+        if constexpr (F32) d = decode2f<cb>(s[j] & 0xffffu, s[j + 1] & 0xffffu);
+        else d = decode2<cb>(s[j] & 0xffffu, s[j + 1] & 0xffffu);
         v[j] = d.x;
         v[j + 1] = d.y;
     }
@@ -231,7 +288,7 @@ __device__ __forceinline__ float dot4_acc(float a, const float* v, float x0, flo
 // red[c] (c < 128) = sum over the 16-row slices [ks0, ks1) of x' . W'[:, tc0 * 16 + c], x' = xs from slice ks0 on.
 // tr: the matrix's first tile, ld tiles per slice row.  stage: kWarps * 32 K2 words, red: kWarps * 128 floats.
 // Ends with a __syncthreads (red[0..127] complete).
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int ks0, int ks1, const __half* xs,
                            uint32_t* stage, float* red) {
     constexpr int W = 4 * K2, TW = 8 * W;
@@ -253,7 +310,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 #pragma unroll
         for (int t = 0; t < 8; ++t) {
             float v[8];
-            decode8<K2, cb>(st + t * W, lane, v);
+            decode8<K2, cb, F32>(st + t * W, lane, v);
             acc[t][0] = dot4_acc(acc[t][0], v, x0, x1, x2, x3);
             acc[t][1] = dot4_acc(acc[t][1], v + 4, x0, x1, x2, x3);
         }
@@ -287,7 +344,7 @@ __device__ void block_gemv(const uint32_t* __restrict__ tr, int ld, int tc0, int
 // kernels share a tile's decode among the rows of an MMA, but with block_gemv's own F32 arithmetic, so outc[c * 128 +
 // i] (i < 128) is bit for bit block_gemv's red[i] for activation c alone.  Ends with a __syncthreads.
 constexpr int kNC = 4;
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __device__ void block_gemv_n(const uint32_t* __restrict__ tr, int ld, int tc0, int ks0, int ks1, const __half* xs,
                              int nc, uint32_t* stage, float* red, float* outc) {
     constexpr int W = 4 * K2, TW = 8 * W;
@@ -319,7 +376,7 @@ __device__ void block_gemv_n(const uint32_t* __restrict__ tr, int ld, int tc0, i
 #pragma unroll
         for (int t = 0; t < 8; ++t) {
             float v[8];
-            decode8<K2, cb>(st + t * W, lane, v);
+            decode8<K2, cb, F32>(st + t * W, lane, v);
 #pragma unroll
             for (int c = 0; c < kNC; ++c)
                 if (c < nc) {
@@ -416,8 +473,9 @@ __device__ __forceinline__ SmemN smem_n(unsigned char* p) {
     return s;
 }
 
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __global__ void __launch_bounds__(kThreads) mv_kernel(const KBatch b) {
+    EXL3_F32_KERNEL(F32);
     __shared__ __half xs[kMaxKR];
     __shared__ uint32_t stage[kWarps * 32 * K2];
     __shared__ float red[kWarps * kCols];
@@ -430,7 +488,7 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const KBatch b) {
     const int k0 = sp * J.kr, k1 = min(J.k, k0 + J.kr);
     rotate_in(J.xf, J.xq, J.suh, k0, k1 - k0, xs);
     __syncthreads();
-    block_gemv<K2, cb>(J.tr, J.ld, g * 8, k0 / 16, k1 / 16, xs, stage, red);
+    block_gemv<K2, cb, F32>(J.tr, J.ld, g * 8, k0 / 16, k1 / 16, xs, stage, red);
     const int warp = threadIdx.x >> 5;
     if (J.S == 1) {
         if (warp == 0)
@@ -459,8 +517,9 @@ __global__ void __launch_bounds__(kThreads) mv_kernel(const KBatch b) {
 // mv_kernel for a job's nc activations at once (a verify window's tokens): the same input split, the weights read and
 // decoded once for all of them (block_gemv_n), each activation's partials and sums in mv_kernel's order - every
 // activation's y is mv_kernel's for it alone, bit for bit
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __global__ void __launch_bounds__(kThreads) mv_n_kernel(const KBatch b) {
+    EXL3_F32_KERNEL(F32);
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const SmemN sm = smem_n<K2>(smem_raw);
     __shared__ int last;
@@ -475,7 +534,7 @@ __global__ void __launch_bounds__(kThreads) mv_n_kernel(const KBatch b) {
                   J.xq != nullptr ? (const Q81*) ((const uint8_t*) J.xq + c * J.xq_cs) : nullptr, J.suh, k0, k1 - k0,
                   sm.xs + c * kMaxKR);
     __syncthreads();
-    block_gemv_n<K2, cb>(J.tr, J.ld, g * 8, k0 / 16, k1 / 16, sm.xs, J.nc, sm.stage, sm.red, sm.outc);
+    block_gemv_n<K2, cb, F32>(J.tr, J.ld, g * 8, k0 / 16, k1 / 16, sm.xs, J.nc, sm.stage, sm.red, sm.outc);
     const int warp = threadIdx.x >> 5;
     const float* bias = J.bias != nullptr ? J.bias + g * kCols : nullptr;
     if (J.S == 1) {
@@ -550,8 +609,9 @@ __device__ __forceinline__ float combine(const float* plan_w, const float* p, in
 }
 
 // grid (n_ff / 128, k): expert blockIdx.y's gate and up for 128 h values, then the clamped swiglu
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __global__ void __launch_bounds__(kThreads) moe_gate_up_kernel(const KMoe a) {
+    EXL3_F32_KERNEL(F32);
     __shared__ __half xs[2][kMaxKR];
     __shared__ uint32_t stage[kWarps * 32 * K2];
     __shared__ float red[kWarps * kCols];
@@ -564,7 +624,8 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up_kernel(const KMoe a) {
     for (int r = 0; r < 2; ++r) rotate_in(a.x, nullptr, (const uint16_t*) (blob + a.suh[r]), 0, a.n_embd, xs[r]);
     __syncthreads();
     for (int r = 0; r < 2; ++r) {
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, xs[r], stage, red);
+        block_gemv<K2, cb, F32>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, xs[r], stage,
+                                red);
         if (warp == 0) block_out(red, (const uint16_t*) (blob + a.svh[r]) + g * kCols, gu[r]);
         __syncthreads();
     }
@@ -577,8 +638,9 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up_kernel(const KMoe a) {
 // for as many bytes).  Each block's product and block_out are moe_gate_up_kernel's; it leaves its 128 values in part
 // ([k][2][n_ff], the stream's scratch - live only within the kernel), and the second of an (expert, output block)'s
 // pair to finish takes both through the swiglu - the same bits (STRATA_EXL3_GU_SPLIT=0: moe_gate_up_kernel)
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __global__ void __launch_bounds__(kThreads) moe_gate_up2_kernel(const KMoe a) {
+    EXL3_F32_KERNEL(F32);
     __shared__ __half xs[kMaxKR];
     __shared__ uint32_t stage[kWarps * 32 * K2];
     __shared__ float red[kWarps * kCols];
@@ -590,7 +652,7 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up2_kernel(const KMoe a) {
     const int warp = threadIdx.x >> 5;
     rotate_in(a.x, nullptr, (const uint16_t*) (blob + a.suh[r]), 0, a.n_embd, xs);
     __syncthreads();
-    block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, xs, stage, red);
+    block_gemv<K2, cb, F32>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, xs, stage, red);
     float* gu = a.part + ((size_t) ei * 2) * a.n_ff + g * kCols;
     if (warp == 0) block_out(red, (const uint16_t*) (blob + a.svh[r]) + g * kCols, gu + (size_t) r * a.n_ff);
     __threadfence();
@@ -608,8 +670,9 @@ __global__ void __launch_bounds__(kThreads) moe_gate_up2_kernel(const KMoe a) {
 
 // grid (n_embd / 128, k): expert blockIdx.y's down rows for 128 outputs; the last block of each output block adds
 // the experts up in plan order (as the engine's moe_down), then the CPU lane's part and the shared expert
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __global__ void __launch_bounds__(kThreads) moe_down_kernel(const KMoe a) {
+    EXL3_F32_KERNEL(F32);
     __shared__ __half xs[kMaxKR];
     __shared__ uint32_t stage[kWarps * 32 * K2];
     __shared__ float red[kWarps * kCols];
@@ -622,7 +685,8 @@ __global__ void __launch_bounds__(kThreads) moe_down_kernel(const KMoe a) {
         const uint8_t* blob = (const uint8_t*) ptr;
         rotate_in(a.h + (size_t) ei * a.n_ff, nullptr, (const uint16_t*) (blob + a.suh[2]), 0, a.n_ff, xs);
         __syncthreads();
-        block_gemv<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff / 16, xs, stage, red);
+        block_gemv<K2, cb, F32>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff / 16, xs, stage,
+                                red);
         if (warp == 0) block_out(red, (const uint16_t*) (blob + a.svh[2]) + g * kCols, part);
     } else if (threadIdx.x < kCols) {
         part[threadIdx.x] = 0.0f;
@@ -668,8 +732,9 @@ struct KWin {
 };
 
 // grid (n_ff / 128, groups at most): group blockIdx.y's gate and up for 128 h values of each entry, the clamped swiglu
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __global__ void __launch_bounds__(kThreads) win_gu_kernel(const KWin a) {
+    EXL3_F32_KERNEL(F32);
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const SmemN sm = smem_n<K2>(smem_raw);
     const int grp = blockIdx.y, g = blockIdx.x;
@@ -684,8 +749,8 @@ __global__ void __launch_bounds__(kThreads) win_gu_kernel(const KWin a) {
                 rotate_in(a.x + (size_t) (a.grp_ent[m0 + c] >> 3) * a.x_stride, nullptr,
                           (const uint16_t*) (blob + a.suh[r]), 0, a.n_embd, sm.xs + c * kMaxKR);
             __syncthreads();
-            block_gemv_n<K2, cb>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, sm.xs, nc,
-                                sm.stage, sm.red, sm.outc);
+            block_gemv_n<K2, cb, F32>((const uint32_t*) (blob + a.tr[r]), a.n_ff / 16, g * 8, 0, a.n_embd / 16, sm.xs,
+                                      nc, sm.stage, sm.red, sm.outc);
             if (warp < nc)
                 block_out(sm.outc + warp * kCols, (const uint16_t*) (blob + a.svh[r]) + g * kCols,
                           sm.gu + (r * kNC + warp) * kCols);
@@ -700,8 +765,9 @@ __global__ void __launch_bounds__(kThreads) win_gu_kernel(const KWin a) {
 }
 
 // grid (n_embd / 128, groups at most): group blockIdx.y's down rows for 128 outputs of each entry into its part rows
-template <int K2, int cb>
+template <int K2, int cb, bool F32>
 __global__ void __launch_bounds__(kThreads) win_down_kernel(const KWin a) {
+    EXL3_F32_KERNEL(F32);
     extern __shared__ __align__(16) unsigned char smem_raw[];
     const SmemN sm = smem_n<K2>(smem_raw);
     const int grp = blockIdx.y, g = blockIdx.x;
@@ -715,8 +781,8 @@ __global__ void __launch_bounds__(kThreads) win_down_kernel(const KWin a) {
             rotate_in(a.h + (size_t) a.grp_ent[m0 + c] * a.n_ff, nullptr, (const uint16_t*) (blob + a.suh[2]), 0,
                       a.n_ff, sm.xs + c * kMaxKR);
         __syncthreads();
-        block_gemv_n<K2, cb>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff / 16, sm.xs, nc,
-                            sm.stage, sm.red, sm.outc);
+        block_gemv_n<K2, cb, F32>((const uint32_t*) (blob + a.tr[2]), a.n_embd / 16, g * 8, 0, a.n_ff / 16, sm.xs, nc,
+                                  sm.stage, sm.red, sm.outc);
         if (warp < nc)
             block_out(sm.outc + warp * kCols, (const uint16_t*) (blob + a.svh[2]) + g * kCols,
                       a.part + (size_t) a.grp_ent[m0 + warp] * a.n_embd + g * kCols);
@@ -738,20 +804,27 @@ __global__ void __launch_bounds__(kCols) win_combine_kernel(const KWin a) {
 }
 
 // ---------------------------------------------------------------- dispatch
-// F(K2, cb) for K 1..8 (K2 = 2 K) and the three codebooks, and for the half-integer K 1.5 / 2.5 / 3.5 (K2 3, 5, 7)
-// with mul1 (exl3.cu's dispatch)
-template <template <int, int> class F, typename... A>
-bool dispatch(int K2, int cb, A&&... args) {
+// F(K2, cb, F32) for K 1..8 (K2 = 2 K) and the three codebooks, and for the half-integer K 1.5 / 2.5 / 3.5 (K2 3, 5, 7)
+// with mul1 (exl3.cu's dispatch); F32: the decode without FP16 arithmetic (decode2f, legacy_f32())
+template <template <int, int, bool> class F, typename... A>
+bool dispatch(int K2, int cb, bool f32, A&&... args) {
+#define EXL3_RUN(KK, CB)                                                 \
+    if (f32) F<KK, CB, true>::run(std::forward<A>(args)...);             \
+    else F<KK, CB, false>::run(std::forward<A>(args)...);
 #define EXL3_CASE(KK)                                                    \
     case KK:                                                             \
-        if (cb == 2) F<KK, 2>::run(std::forward<A>(args)...);            \
-        else if (cb == 1) F<KK, 1>::run(std::forward<A>(args)...);       \
-        else F<KK, 0>::run(std::forward<A>(args)...);                    \
+        if (cb == 2) {                                                   \
+            EXL3_RUN(KK, 2)                                              \
+        } else if (cb == 1) {                                            \
+            EXL3_RUN(KK, 1)                                              \
+        } else {                                                         \
+            EXL3_RUN(KK, 0)                                              \
+        }                                                                \
         return true;
 #define EXL3_HALF(KK)                                                    \
     case KK:                                                             \
         if (cb != 2) return false;                                       \
-        F<KK, 2>::run(std::forward<A>(args)...);                         \
+        EXL3_RUN(KK, 2)                                                  \
         return true;
     if (cb < 0 || cb > 2) return false;
     switch (K2) {
@@ -761,50 +834,63 @@ bool dispatch(int K2, int cb, A&&... args) {
     }
 #undef EXL3_HALF
 #undef EXL3_CASE
+#undef EXL3_RUN
 }
 
-template <int K2, int cb> struct RunMv {
-    static void run(const KBatch& b, int blocks, cudaStream_t s) { mv_kernel<K2, cb><<<blocks, kThreads, 0, s>>>(b); }
-};
-template <int K2, int cb> struct RunMvN {
+template <int K2, int cb, bool F32> struct RunMv {
     static void run(const KBatch& b, int blocks, cudaStream_t s) {
-        mv_n_kernel<K2, cb><<<blocks, kThreads, smem_n_bytes(K2), s>>>(b);
+        mv_kernel<K2, cb, F32><<<blocks, kThreads, 0, s>>>(b);
     }
 };
-template <int K2, int cb> struct RunWin {
+template <int K2, int cb, bool F32> struct RunMvN {
+    static void run(const KBatch& b, int blocks, cudaStream_t s) {
+        mv_n_kernel<K2, cb, F32><<<blocks, kThreads, smem_n_bytes(K2), s>>>(b);
+    }
+};
+template <int K2, int cb, bool F32> struct RunWin {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_gu_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), kThreads, smem_n_bytes(K2), s>>>(a);
+        win_gu_kernel<K2, cb, F32><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) groups), kThreads, smem_n_bytes(K2),
+                                     s>>>(a);
     }
 };
-template <int K2, int cb> struct RunWinDown {
+template <int K2, int cb, bool F32> struct RunWinDown {
     static void run(const KWin& a, int groups, cudaStream_t s) {
-        win_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads, smem_n_bytes(K2),
-                                 s>>>(a);
+        win_down_kernel<K2, cb, F32><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) groups), kThreads,
+                                       smem_n_bytes(K2), s>>>(a);
     }
 };
-template <int K2, int cb> struct AllowSmemN {
+template <int K2, int cb, bool F32> struct AllowSmemN {
     static void run() {
         const int b = (int) smem_n_bytes(K2);
-        cudaFuncSetAttribute(mv_n_kernel<K2, cb>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
-        cudaFuncSetAttribute(win_gu_kernel<K2, cb>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
-        cudaFuncSetAttribute(win_down_kernel<K2, cb>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
+        cudaFuncSetAttribute(mv_n_kernel<K2, cb, F32>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
+        cudaFuncSetAttribute(win_gu_kernel<K2, cb, F32>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
+        cudaFuncSetAttribute(win_down_kernel<K2, cb, F32>, cudaFuncAttributeMaxDynamicSharedMemorySize, b);
     }
 };
-template <int K2, int cb> struct RunGU {
+template <int K2, int cb, bool F32> struct RunGU {
     static void run(const KMoe& a, cudaStream_t s) {
-        moe_gate_up_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k), kThreads, 0, s>>>(a);
+        moe_gate_up_kernel<K2, cb, F32><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k), kThreads, 0, s>>>(a);
     }
 };
-template <int K2, int cb> struct RunGU2 {
+template <int K2, int cb, bool F32> struct RunGU2 {
     static void run(const KMoe& a, cudaStream_t s) {
-        moe_gate_up2_kernel<K2, cb><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u), kThreads, 0, s>>>(a);
+        moe_gate_up2_kernel<K2, cb, F32><<<dim3((unsigned) (a.n_ff / kCols), (unsigned) a.k, 2u), kThreads, 0, s>>>(a);
     }
 };
-template <int K2, int cb> struct RunDown {
+template <int K2, int cb, bool F32> struct RunDown {
     static void run(const KMoe& a, cudaStream_t s) {
-        moe_down_kernel<K2, cb><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), kThreads, 0, s>>>(a);
+        moe_down_kernel<K2, cb, F32><<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.k), kThreads, 0, s>>>(a);
     }
 };
+
+// every state's pair (s, s ^ 0xffff) through decode2 (FP16) or decode2f (legacy_decode_table)
+template <int cb, bool F32>
+__global__ void decode_table_kernel(float2* out) {
+    EXL3_F32_KERNEL(F32);
+    const uint32_t s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s < 65536u) out[s] = F32 ? decode2f<cb>(s, s ^ 0xffffu) : decode2<cb>(s, s ^ 0xffffu);
+}
+
 // ---------------------------------------------------------------- per-stream scratch
 constexpr size_t kPartFloats = (size_t) 2 << 20;   // split partials: 8 MB
 constexpr size_t kCounters = 16384;
@@ -860,13 +946,16 @@ bool allow_smem_n() {
     if (st != 0) return st == 1;
     std::lock_guard<std::mutex> lk(g_mu);
     if (g_smem_n[dev].load(std::memory_order_relaxed) != 0) return g_smem_n[dev].load() == 1;
-    int optin = 0;
+    int optin = 0, major = 0;
     cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
     bool ok = (size_t) optin >= smem_n_bytes(16);   // the widest bitrate, K 8
     if (ok) {
         for (int k2 = 2; k2 <= 16; ++k2)
             for (int cb = 0; cb <= 2; ++cb)
-                if (k2_supported(k2, cb)) dispatch<AllowSmemN>(k2, cb);
+                if (k2_supported(k2, cb))
+                    for (const bool f32 : {false, true})
+                        if (!f32 || major < 7) dispatch<AllowSmemN>(k2, cb, f32);   // (F32: sm_6x's only)
         ok = cudaGetLastError() == cudaSuccess;
     }
     if (!ok)
@@ -899,11 +988,37 @@ bool prepare(cudaStream_t s) {
 
 bool several_ok() { return allow_smem_n(); }
 
+void decode_table(int cb, bool f32, float* d_out, cudaStream_t s) {
+    if (d_out == nullptr) {
+        std::fprintf(stderr, "exl3 legacy_decode_table: no output\n");
+        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    float2* out = reinterpret_cast<float2*>(d_out);
+    const unsigned blocks = 65536u / kThreads;
+    if (cb == 2) {
+        if (f32) decode_table_kernel<2, true><<<blocks, kThreads, 0, s>>>(out);
+        else decode_table_kernel<2, false><<<blocks, kThreads, 0, s>>>(out);
+    } else if (cb == 1) {
+        if (f32) decode_table_kernel<1, true><<<blocks, kThreads, 0, s>>>(out);
+        else decode_table_kernel<1, false><<<blocks, kThreads, 0, s>>>(out);
+    } else if (cb == 0) {
+        if (f32) decode_table_kernel<0, true><<<blocks, kThreads, 0, s>>>(out);
+        else decode_table_kernel<0, false><<<blocks, kThreads, 0, s>>>(out);
+    } else {
+        std::fprintf(stderr, "exl3 legacy_decode_table: no codebook %d\n", cb);
+        g_launch_errors.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    launch_check("legacy_decode_table");
+}
+
 bool mv(const MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > kMaxMvJobs) return false;
     Scratch* sc = scratch(s);
     if (sc == nullptr) return false;
     const int sms = sm_count();
+    const bool f32 = legacy_f32();
     // the launch units: a job of one activation is mv_kernel's, a job of several mv_n_kernel's in runs of up to kNC
     // (one mv_kernel unit an activation where the device lacks the shared memory)
     struct Unit {
@@ -974,7 +1089,8 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
             b.blk_end[nb++] = blocks;
         }
         b.n = nb;
-        if (!(multi ? dispatch<RunMvN>(m0.k2, m0.cb, b, blocks, s) : dispatch<RunMv>(m0.k2, m0.cb, b, blocks, s)))
+        if (!(multi ? dispatch<RunMvN>(m0.k2, m0.cb, f32, b, blocks, s)
+                    : dispatch<RunMv>(m0.k2, m0.cb, f32, b, blocks, s)))
             return false;
     }
     launch_check("mv");
@@ -1025,12 +1141,12 @@ void moe_gate_up(const MoeArgs& a, const float* x, float* h, cudaStream_t s) {
     }();
     // (the split's scratch: [k][2][n_ff] partials, k * n_ff / 128 counters)
     if (split && (size_t) a.k * 2 * a.n_ff <= kPartFloats && (size_t) a.k * (a.n_ff / kCols) <= kCounters) {
-        if (!dispatch<RunGU2>(a.lay.k2[0], a.lay.cb, m, s))
+        if (!dispatch<RunGU2>(a.lay.k2[0], a.lay.cb, legacy_f32(), m, s))
             std::fprintf(stderr, "exl3 moe_gate_up: K %g cb %d\n", a.lay.k2[0] / 2.0, a.lay.cb);
         launch_check("moe_gate_up (split)");
         return;
     }
-    if (!dispatch<RunGU>(a.lay.k2[0], a.lay.cb, m, s))
+    if (!dispatch<RunGU>(a.lay.k2[0], a.lay.cb, legacy_f32(), m, s))
         std::fprintf(stderr, "exl3 moe_gate_up: K %g cb %d\n", a.lay.k2[0] / 2.0, a.lay.cb);
     launch_check("moe_gate_up");
 }
@@ -1041,7 +1157,7 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
     if (h != nullptr) m.h = const_cast<float*>(h);
     m.sh_out = sh_out;
     m.out = out;
-    if (!dispatch<RunDown>(a.lay.k2[2], a.lay.cb, m, s))
+    if (!dispatch<RunDown>(a.lay.k2[2], a.lay.cb, legacy_f32(), m, s))
         std::fprintf(stderr, "exl3 moe_down: K %g cb %d\n", a.lay.k2[2] / 2.0, a.lay.cb);
     launch_check("moe_down");
 }
@@ -1054,6 +1170,7 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
         return false;
     }
     if (!allow_smem_n()) return false;
+    const bool f32 = legacy_f32();
     KWin w{};
     w.grp_ptr = a.grp_ptr;
     w.grp_start = a.grp_start;
@@ -1080,8 +1197,8 @@ bool win_experts(const WinArgs& a, cudaStream_t s) {
     w.n_ff = a.n_ff;
     w.limit = a.limit;
     const int groups = a.T * a.k;   // at most (the blocks past the real count return at once)
-    if (!dispatch<RunWin>(a.lay.k2[0], a.lay.cb, w, groups, s) ||
-        !dispatch<RunWinDown>(a.lay.k2[2], a.lay.cb, w, groups, s))
+    if (!dispatch<RunWin>(a.lay.k2[0], a.lay.cb, f32, w, groups, s) ||
+        !dispatch<RunWinDown>(a.lay.k2[2], a.lay.cb, f32, w, groups, s))
         return false;
     win_combine_kernel<<<dim3((unsigned) (a.n_embd / kCols), (unsigned) a.T), kCols, 0, s>>>(w);
     launch_check("win_experts");

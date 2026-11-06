@@ -5,7 +5,8 @@
     st.raw(name), st.f32(name)            -> numpy views / float32 copies
 
 The index's own files come first; any other .safetensors in the directory (the Engram shards 47 / 48 of the base
-repo, model-0004[78]-of-00048.safetensors) only adds names the index does not have.
+repo, model-0004[78]-of-00048.safetensors) only adds names the index does not have.  A name exllamav3 renamed (its
+DeepSeek-V4.1 get_tensor_name_fixes: turboderp's EXL3 quants) is listed under DeepSeek's own (NAME_FIXES).
 """
 from __future__ import annotations
 
@@ -14,6 +15,18 @@ import pathlib
 import struct
 
 import numpy as np
+
+# exllamav3's renames, undone: the markov head's embed (BF16) and head (F16) as markov_w1 / markov_w2
+NAME_FIXES = {".markov_head.markov_w1.weight": ".markov_head.embed.weight",
+              ".markov_head.markov_w2.weight": ".markov_head.head.weight"}
+
+
+def deepseek_name(k: str) -> str:
+    for a, b in NAME_FIXES.items():
+        if k.endswith(a):
+            return k[:-len(a)] + b
+    return k
+
 
 DTYPE_BYTES = {"F32": 4, "F16": 2, "BF16": 2, "I32": 4, "I16": 2, "F8_E4M3": 1, "F8_E8M0": 1, "U8": 1, "I8": 1,
                "I64": 8}
@@ -36,7 +49,10 @@ class SafeTensors:
             base = 8 + n
             self.files.append(fn)
             for k, v in h.items():
-                if k == "__metadata__" or k in self.t:
+                if k == "__metadata__":
+                    continue
+                k = deepseek_name(k)
+                if k in self.t:
                     continue
                 a, b = v["data_offsets"]
                 self.t[k] = (fn, v["dtype"], tuple(v["shape"]), base + a, b - a)

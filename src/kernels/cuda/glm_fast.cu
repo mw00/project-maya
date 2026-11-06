@@ -5333,6 +5333,9 @@ __global__ void __launch_bounds__(1024) rms_q8_kernel(float* __restrict__ h, con
     }
 }
 
+// argmax_kernel's calls that found no finite value (argmax_nonfinite reads it; one word a device)
+__device__ unsigned int g_argmax_nonfinite = 0;
+
 // one block: float4 loads, four in flight per thread (the vocabulary is ~0.6 MB; scalar loads ran at ~10 GB/s)
 __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ x, int n, int* __restrict__ out,
                                                       const int* __restrict__ map, int map_from) {
@@ -5387,7 +5390,12 @@ __global__ void __launch_bounds__(1024) argmax_kernel(const float* __restrict__ 
     if (threadIdx.x == 0) {
         for (int i = 1; i < (int) (blockDim.x >> 5); ++i)
             if (sv[i] > best || (sv[i] == best && si[i] < bi)) { best = sv[i]; bi = si[i]; }
-        *out = map != nullptr && bi >= map_from ? map[bi - map_from] : bi;
+        if (bi >= n) {   // nothing finite (#860): a valid id instead of 0x7fffffff, and map[] is not read past its end
+            atomicAdd(&g_argmax_nonfinite, 1u);
+            *out = 0;
+        } else {
+            *out = map != nullptr && bi >= map_from ? map[bi - map_from] : bi;
+        }
     }
 }
 
@@ -7303,6 +7311,15 @@ void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_em
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map, int map_from) {
     argmax_kernel<<<1, 1024, 0, s>>>(x, n, out, map, map_from);
     launch_check("argmax");
+}
+
+unsigned argmax_nonfinite() {
+    unsigned n = 0;
+    if (cudaMemcpyFromSymbol(&n, g_argmax_nonfinite, sizeof n) != cudaSuccess) {
+        cudaGetLastError();
+        return 0;
+    }
+    return n;
 }
 
 // argmax_kernel's pick with its value: out[0] the index (0x7fffffff: none finite), out[1] the value's bits

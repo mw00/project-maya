@@ -28,6 +28,7 @@
 #include "strata/core/glm_model.hpp"
 #include "strata/kernels/glm_fast.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/platform/env_switch.hpp"
 
 #include "ggml.h"
 
@@ -76,7 +77,8 @@ bool mtp_chain_wanted() {
 
 // load_pack / fast_setup: whether this model decodes with the MTP block on one GPU (see the top of this file)
 bool Glm5Model::mtp_decode_wanted(int dev, int n_parts) {
-    if (getenv("STRATA_GLM_NO_SPEC") != nullptr || getenv("STRATA_GLM_NO_MTP") != nullptr || mtp_draft_cap() <= 0)
+    if (strata::platform::env_switch("STRATA_GLM_NO_SPEC") || strata::platform::env_switch("STRATA_GLM_NO_MTP") ||
+        mtp_draft_cap() <= 0)
         return false;
     if (const char* q = getenv("STRATA_GLM_SEQS"); q != nullptr && std::atoi(q) > 1) return false;   // (--parallel)
     if (const char* d = getenv("STRATA_GLM_DFLASH"); d != nullptr && d[0] != '\0') return false;
@@ -207,8 +209,11 @@ void Glm5Model::mtp_draft_setup(bool chain) {
     FastState* F = fast_;
     const Glm5Geometry& g = g_;
     const WSlot& ow = ws_map_.at("output.weight");
-    const size_t hb = ow.type == 0 ? (size_t) g.n_embd * sizeof(float) : ggml_row_size((ggml_type) ow.type, g.n_embd);
-    const void* head = ow.type == 0 ? (const void*) ow.f32 : ow.q;
+    // an EXL3 head (a type past ggml's table) has no rows to gather: it drafts over the whole vocabulary (#857: its
+    // ggml_row_size divided by zero)
+    const bool gguf_head = ow.type < (int) GGML_TYPE_COUNT;
+    const size_t hb = !gguf_head ? 0 : ow.type == 0 ? (size_t) g.n_embd * sizeof(float) : ggml_row_size((ggml_type) ow.type, g.n_embd);
+    const void* head = !gguf_head ? nullptr : ow.type == 0 ? (const void*) ow.f32 : ow.q;
     if (mtp_vlead_ > 0 && head != nullptr) {
         const int dx = (int) mtp_vextra_.size();
         bool ok = true;
@@ -624,7 +629,9 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                     cudaEventRecord(F->ev_mtp, F->cs);
                     ok = glmfast::wait_event(F->ev_mtp, "glm mtp drafts", err) && F->route_ok(err);
                 }
-                for (int i = 0; i < n && ok; ++i) win[(size_t) i + 1] = F->mtp_tok_h[i];
+                // (a draft that is no token id: the token before it in its place - glmfast::draft_id, #860)
+                for (int i = 0; i < n && ok; ++i)
+                    win[(size_t) i + 1] = glmfast::draft_id(F->mtp_tok_h[i], win[(size_t) i], g.n_vocab, "glm mtp");
                 if (ok) nd = n;
             } else {
                 int32_t tok = y;
@@ -634,7 +641,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
                         ok = false;
                         break;
                     }
-                    tok = F->mtp_tok_h[i];
+                    tok = glmfast::draft_id(F->mtp_tok_h[i], tok, g.n_vocab, "glm mtp");
                     win[(size_t) i + 1] = tok;
                     ++nd;
                 }
@@ -749,6 +756,7 @@ bool Glm5Model::decode_mtp(strata::kernels::SamplerParams& sp, int64_t max_new, 
             if (ok) err = drain_err;
             ok = false;
         }
+        if (ok) glmfast::argmax_nonfinite_note(dev_, "glm mtp");   // (the drafts' picks that found nothing finite)
     }
     win_prof_report();   // (STRATA_GLM_WIN_PROF: the verify windows' phases)
     if (n_ph > 0)
@@ -869,7 +877,9 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                         ok = glmfast::wait_event(FT->ev_mtp, "glm spec pipe drafts", err) && TL->fast_->route_ok(err);
                     }
                     for (int i = 0; i < n && ok; ++i) {
-                        winv[(size_t) i + 1] = FT->mtp_tok_h[i];
+                        // (a draft that is no token id: the token before it in its place - glmfast::draft_id, #860)
+                        winv[(size_t) i + 1] = glmfast::draft_id(FT->mtp_tok_h[i], i == 0 ? y : winv[(size_t) i],
+                                                                 g.n_vocab, "glm spec pipe");
                         if (!batched_win) ok = win_pipe_push(winv[(size_t) i + 1], err);
                     }
                 } else {
@@ -881,7 +891,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                             ok = false;
                             break;
                         }
-                        tok = FT->mtp_tok_h[i];
+                        tok = glmfast::draft_id(FT->mtp_tok_h[i], tok, g.n_vocab, "glm spec pipe");
                         winv[(size_t) i + 1] = tok;
                         if (!batched_win && !win_pipe_push(tok, err)) {
                             ok = false;
@@ -1030,6 +1040,7 @@ bool Glm5Model::decode_spec_pipe(strata::kernels::SamplerParams& sp, int64_t max
                 ok = false;
             }
         }
+        if (ok) glmfast::argmax_nonfinite_note(TL->dev_, "glm spec pipe");   // (the drafts' picks; said once)
         cudaSetDevice(dev_);
     }
     if (rounds > 0 && trace)

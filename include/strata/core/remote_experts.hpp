@@ -2,10 +2,13 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/kernels/exl3.hpp"
 #include "strata/kernels/glm_fast.hpp"
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -21,8 +24,10 @@ public:
     ~GlmExpertHelper();
     GlmExpertHelper(const GlmExpertHelper&) = delete;
     GlmExpertHelper& operator=(const GlmExpertHelper&) = delete;
+    /// exl3: the experts are an EXL3 pack's (compute_exl3): the helper stream's EXL3 scratch is made here, before
+    /// reserve() measures the free VRAM
     bool open(int device, int n_embd, int n_ff,
-              const std::vector<std::pair<void*, size_t>>& regions, std::string& err);
+              const std::vector<std::pair<void*, size_t>>& regions, std::string& err, bool exl3 = false);
     bool reserve(int keys, size_t requested_bytes, std::string& err);
     bool insert(int key, const uint8_t* host, size_t bytes, size_t stride, std::string& err);
     bool replace(int out, int in, const uint8_t* host, std::string& err);
@@ -39,10 +44,47 @@ public:
     bool compute(int gu_type, int d_type, size_t down_off, float limit, int ne,
                  const int* keys, const float* weights, const float* x,
                  float* out, std::string& err);
+    /// The same for an EXL3 pack's experts (lay: their layer's blob layout; open(..., exl3 = true)): the F32 input
+    /// through exl3::moe_gate_up / moe_down on the helper's device - its decode kernels are exl3.cu's choice for it
+    /// (STRATA_GLM_EXL3_DECODE<n>).  A launch that failed there (exl3::launch_errors) fails the call.
+    bool compute_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                      const int* keys, const float* weights, const float* x,
+                      float* out, std::string& err);
+    /// compute / compute_exl3 in two halves, for a caller with work of its own meanwhile (STRATA_GLM_HELPER_OVERLAP):
+    /// enqueue copies the input and the plan up and queues the kernels and the result's copy into out - out must stay
+    /// untouched until wait returns (mapped pinned memory: the copy runs while the caller works) - and wait finishes
+    /// the call (the stream, the EXL3 launch check, the profile).  One call at a time: wait before the next enqueue
+    /// and before replace() - each refuses while a call or a replacement holds the helper (pending()).  A failed
+    /// enqueue leaves nothing to wait for; a failed wait leaves out undefined.  The hold ends only once the helper's
+    /// stream has been synchronized: if even that fails it stays until close().
+    bool enqueue(int gu_type, int d_type, size_t down_off, float limit, int ne,
+                 const int* keys, const float* weights, const float* x,
+                 float* out, std::string& err);
+    bool enqueue_exl3(const strata::kernels::exl3::ExpertLayout& lay, float limit, int ne,
+                      const int* keys, const float* weights, const float* x,
+                      float* out, std::string& err);
+    bool wait(std::string& err);
+    bool pending() const { return pending_.load(std::memory_order_acquire); }
+    /// the last waited call's GPU time (its stages' events, ms) with STRATA_GLM_PROF, else -1
+    double last_gpu_ms() const { return last_gpu_ms_; }
     void close();
     int device() const { return device_; }
 
 private:
+    bool start(const strata::kernels::exl3::ExpertLayout* xl, int gu_type, int d_type, size_t down_off, float limit,
+               int ne, const int* keys, const float* weights, const float* x, float* out, std::string& err);
+    bool finish(std::string& err, bool split);
+    // the call enqueued and not yet waited for
+    struct Pending {
+        bool exl3 = false;
+        int x3_errors = 0, ne = 0;
+        size_t bytes = 0;
+        float* out = nullptr;
+        std::chrono::steady_clock::time_point t0{}, t1{};   // the enqueue's start and end
+    };
+    Pending pend_;
+    std::atomic<bool> pending_{false};   // a call (enqueue .. wait) or a replace holds the stream and the buffers
+    double last_gpu_ms_ = -1.0;
     struct Region { const uint8_t* host; uint8_t* mapped; size_t bytes; };
     std::vector<Region> regions_;
     struct Slot { uint8_t* host = nullptr; uint8_t* device = nullptr; size_t bytes = 0; };
@@ -69,8 +111,9 @@ private:
     // STRATA_GLM_PROF: each call's host time and its stages' GPU time, summed; printed when the helper closes
     bool prof_ = false;
     cudaEvent_t ev_[6] = {};
-    unsigned long long calls_ = 0, experts_ = 0, bytes_ = 0;
+    unsigned long long calls_ = 0, experts_ = 0, bytes_ = 0, split_calls_ = 0;
     double enqueue_ms_ = 0, wait_ms_ = 0, out_ms_ = 0, stage_ms_[5] = {};   // (out: the zero-copy result's host copy)
+    double beside_ms_ = 0;   // split calls: the time between enqueue's end and wait's start (the caller's own work)
 };
 
 /// A static, profile-filled expert tier on another CUDA device. CUDA0 keeps all

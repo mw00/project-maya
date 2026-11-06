@@ -11,6 +11,7 @@
 #include "glm_metal.hpp"
 #include "sampler.hpp"
 #include "spec.hpp"
+#include "../../include/strata/platform/env_switch.hpp"   // (header only; maya-metal's include path is src/metal)
 
 #include <algorithm>
 #include <atomic>
@@ -543,10 +544,10 @@ int serve(GlmMetal& model, const std::vector<std::string>& args) {
     // MTP decode is on by default only where memory is unified and large.  MAYA_GLM_MTP_DECODE=0/1 decides instead.
     const char* md = std::getenv("MAYA_GLM_MTP_DECODE");
     const bool mtp_wanted = md && *md ? std::atoi(md) != 0 : model.stats().experts_all_resident;
-    s.mtp = mtp_wanted && model.has_mtp() && std::getenv("MAYA_GLM_NO_MTP") == nullptr &&
-            std::getenv("MAYA_GLM_NO_SPEC") == nullptr;
-    s.mtp_auto = !(md && *md) && model.has_mtp() && std::getenv("MAYA_GLM_NO_MTP") == nullptr &&
-                 std::getenv("MAYA_GLM_NO_SPEC") == nullptr;
+    const bool no_mtp =
+        strata::platform::env_switch("MAYA_GLM_NO_MTP") || strata::platform::env_switch("MAYA_GLM_NO_SPEC");
+    s.mtp = mtp_wanted && model.has_mtp() && !no_mtp;
+    s.mtp_auto = !(md && *md) && model.has_mtp() && !no_mtp;
     if (model.has_mtp() && !s.mtp)
         std::printf("NOTE MTP drafting is off (the experts stream from the SSD); MAYA_GLM_NO_MTP=1 frees the NextN "
                     "block's memory for the expert pool\n");

@@ -186,5 +186,42 @@ class TypeOrdered(unittest.TestCase):
         self.assertIsNone(pack.type_ordered(st))
 
 
+def write_st(path: pathlib.Path, tensors: dict[str, tuple[str, list[int], bytes]]):
+    """A .safetensors file: name -> (dtype, shape, bytes)."""
+    h, off = {}, 0
+    for name, (dt, shape, b) in tensors.items():
+        h[name] = {"dtype": dt, "shape": shape, "data_offsets": [off, off + len(b)]}
+        off += len(b)
+    hb = json.dumps(h).encode()
+    path.write_bytes(len(hb).to_bytes(8, "little") + hb + b"".join(b for _, _, b in tensors.values()))
+
+
+class MarkovNames(unittest.TestCase):
+    """exllamav3 renames the drafter's markov head (turboderp's EXL3 quants): SafeTensors lists it under DeepSeek's names."""
+
+    def test_exllamav3_names(self):
+        import st
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as td:   # (Windows: the maps stay open)
+            m = pathlib.Path(td)
+            write_st(m / "model-00001-of-00001.safetensors", {
+                "mtp.2.markov_head.markov_w1.weight": ("BF16", [4, 2], bytes(range(16))),
+                "mtp.2.markov_head.markov_w2.weight": ("F16", [4, 2], bytes(range(16, 32))),
+                "mtp.2.confidence_head.proj.weight": ("F16", [1, 4], bytes(8))})
+            (m / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {
+                k: "model-00001-of-00001.safetensors" for k in ("mtp.2.markov_head.markov_w1.weight",
+                                                                 "mtp.2.markov_head.markov_w2.weight",
+                                                                 "mtp.2.confidence_head.proj.weight")}}))
+            s = st.SafeTensors(m)
+            self.assertEqual(sorted(s.t), ["mtp.2.confidence_head.proj.weight", "mtp.2.markov_head.embed.weight",
+                                           "mtp.2.markov_head.head.weight"])
+            self.assertEqual(s.t["mtp.2.markov_head.embed.weight"][1:3], ("BF16", (4, 2)))
+            self.assertEqual(bytes(s.raw("mtp.2.markov_head.head.weight")), bytes(range(16, 32)))
+
+    def test_deepseeks_own_names_unchanged(self):
+        import st
+        self.assertEqual(st.deepseek_name("mtp.2.markov_head.embed.weight"), "mtp.2.markov_head.embed.weight")
+        self.assertEqual(st.deepseek_name("layers.0.attn.wq_a.trellis"), "layers.0.attn.wq_a.trellis")
+
+
 if __name__ == "__main__":
     unittest.main()

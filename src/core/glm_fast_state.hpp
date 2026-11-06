@@ -21,6 +21,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <map>
@@ -49,6 +50,32 @@ inline bool wait_event(cudaEvent_t ev, const char* what, std::string& err) {
 }
 
 namespace gf = strata::kernels::glmf;
+
+// #860: a draft id the host reads back (the NextN block's pick) that is no token id: the confirmed token in its place -
+// a wrong draft the verify rejects like any other, so the answer is unchanged - said once a process.  A real id passes
+// through untouched (nothing on the device, no sync).
+inline int32_t draft_id(int32_t d, int32_t fallback, int64_t n_vocab, const char* who) {
+    if (d >= 0 && (int64_t) d < n_vocab) return d;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "%s: a draft is no token id (%d: its logits are not finite?) - drafting on with the confirmed "
+                             "token in its place (said once)\n", who, (int) d);
+    return fallback;
+}
+// ... and at a drafting decode's end, its devices idle (a synchronous read - never per token): the argmax picks on
+// device `dev` that found no finite logit (gf::argmax_nonfinite: they took token 0), said once a process
+inline void argmax_nonfinite_note(int dev, const char* who) {
+    static std::atomic<bool> said{false};
+    if (said.load(std::memory_order_relaxed)) return;
+    int cur = 0;
+    cudaGetDevice(&cur);
+    cudaSetDevice(dev);
+    const unsigned n = gf::argmax_nonfinite();
+    cudaSetDevice(cur);
+    if (n > 0 && !said.exchange(true))
+        std::fprintf(stderr, "%s: CUDA%d %u argmax pick(s) found no finite logit and took token 0 instead - the model's "
+                             "state holds non-finite values (said once)\n", who, dev, n);
+}
 
 inline void cpu_relax() {
 #if defined(__x86_64__) && !defined(_WIN32)
@@ -699,6 +726,11 @@ struct Glm5Model::FastState {
     std::atomic<bool> helper_failed{false};
     std::string helper_error;
     std::atomic<uint64_t> helper_experts{0}, helper_routes{0}, helper_us{0};
+    // STRATA_GLM_HELPER_OVERLAP=1: a route's helper call runs beside its CPU-lane experts (enqueue, the CPU lane, wait)
+    // instead of before them.  The routes that had both, their CPU-lane time (beside the helper), the time then spent
+    // waiting for the helper, and with STRATA_GLM_PROF the time saved (each route's min(CPU lane, helper GPU time))
+    bool helper_overlap = false;
+    std::atomic<uint64_t> helper_ovl_routes{0}, helper_ovl_cpu_us{0}, helper_ovl_wait_us{0}, helper_ovl_saved_us{0};
     // the lane's own thread count when cpu_pool holds more (STRATA_GLM_CPU_LANE_MAX): a request that names no
     // cpu_threads returns to it, not to the whole pool; 0 = the pool's size
     int cpu_threads0 = 0;

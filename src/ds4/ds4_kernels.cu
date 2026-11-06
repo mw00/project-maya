@@ -3961,6 +3961,35 @@ void moe_combine(float* acc, const float* y, const int* pos, const float* w, int
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, cudaStream_t s) {
     pdl_launch(gemv_f16_kernel, dim3(cdiv(n, kThreads / 32), T), kThreads, 0, s, W, x, n, k, alpha, y);
 }
+#if defined(STRATA_USE_HIP)
+// DS4_PROMPT_F16 (ds4_model.cu's prompt_f16): float c overwrites halves 2c and 2c + 1, so
+// a row is walked from its end in blocks of 256 values: a block's halves read into registers, the block synced, then its
+// floats written - they only cover halves of blocks already read
+__device__ unsigned long long g_widen_bad = 0;
+__global__ void __launch_bounds__(kThreads) widen_rows_f16_kernel(float* y0, int n, size_t ldy, int count_bad) {
+    float* y = y0 + (size_t) blockIdx.x * ldy;
+    const uint16_t* h = (const uint16_t*) y;
+    const int nb = (n + kThreads - 1) / kThreads;
+    for (int b = nb - 1; b >= 0; --b) {
+        const int c = b * kThreads + (int) threadIdx.x;
+        const float v = c < n ? __half2float(__ushort_as_half(h[c])) : 0.0f;
+        if (count_bad && c < n && !isfinite(v)) atomicAdd(&g_widen_bad, 1ull);
+        __syncthreads();
+        if (c < n) y[c] = v;
+        __syncthreads();
+    }
+}
+void widen_rows_f16(float* y, int n, size_t ldy, int rows, cudaStream_t s, int count_bad) {
+    if (rows > 0) pdl_launch(widen_rows_f16_kernel, dim3((unsigned) rows), kThreads, 0, s, y, n, ldy, count_bad);
+}
+unsigned long long widen_bad_take() {
+    unsigned long long bad = 0;
+    const unsigned long long zero = 0;
+    if (hipMemcpyFromSymbol(&bad, HIP_SYMBOL(g_widen_bad), sizeof bad) != hipSuccess) return 0;
+    if (bad != 0) (void) hipMemcpyToSymbol(HIP_SYMBOL(g_widen_bad), &zero, sizeof zero);
+    return bad;
+}
+#endif
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    cudaStream_t s) {
     if (T > 0)

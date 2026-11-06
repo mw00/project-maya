@@ -186,7 +186,7 @@
 .you__bubble { padding: 10px 16px; border-radius: var(--st-r-xl); background: var(--st-surface-2); font-size: var(--st-fs-chat); line-height: 1.6;
                white-space: pre-wrap; overflow-wrap: anywhere; }
 .you__files { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
-.you__files img { max-width: 220px; max-height: 220px; border-radius: var(--st-r-md); border: 1px solid var(--st-line); object-fit: cover; }
+.you__files img, .you__files video { max-width: 220px; max-height: 220px; border-radius: var(--st-r-md); border: 1px solid var(--st-line); object-fit: cover; }
 .you__actions { position: absolute; top: 100%; right: 0; display: flex; align-items: center; gap: 2px; opacity: 0; transition: opacity var(--st-dur); }
 .you__actions .icon-btn--sm { width: 28px; height: 28px; }
 .you:last-child { margin-bottom: 24px; }
