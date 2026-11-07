@@ -72,7 +72,7 @@ void row_case(int k, int n, int pattern, int offset, unsigned seed, int tier) {
     std::vector<float> ref(std::max(1, n) * out_stride, -12345.25f), got(ref);
     std::vector<float*> rp(std::max(1, n)), yp(std::max(1, n));
     for (int i = 0; i < n; ++i) { ap[i] = a.data() + size_t(i) * ab; rp[i] = ref.data() + i * out_stride + 1; yp[i] = got.data() + i * out_stride + 1; }
-    gg::mx_rows_tier(gg::kMxScalar, w.data() + offset, rb, k, r0, r1, ap.data(), n, rp.data());
+    gg::mx_rows_reference(w.data() + offset, rb, k, r0, r1, ap.data(), n, rp.data());
     gg::mx_rows_tier(tier, w.data() + offset, rb, k, r0, r1, ap.data(), n, yp.data(), offset ? 64 : 0);
     equal(ref, got, "row parity / guards");
     // Empty row range must preserve both guard and output values.
@@ -91,8 +91,13 @@ std::vector<float> expert(int tier, int nt, int threads, const std::vector<uint8
         const int lo = j * RB, hi = std::min(FF, lo + RB);
         std::vector<float> g(nt * RB), u(nt * RB); std::vector<const void*> ap(nt); std::vector<float*> gp(nt), up(nt);
         for (int t = 0; t < nt; ++t) { ap[t] = xq.data() + size_t(t) * xa; gp[t] = g.data() + t * RB; up[t] = u.data() + t * RB; }
-        gg::mx_rows_tier(tier, w.data(), gr, E, lo, hi, ap.data(), nt, gp.data());
-        gg::mx_rows_tier(tier, w.data() + mat, gr, E, lo, hi, ap.data(), nt, up.data());
+        if (tier == -2) {
+            gg::mx_rows_reference(w.data(), gr, E, lo, hi, ap.data(), nt, gp.data());
+            gg::mx_rows_reference(w.data() + mat, gr, E, lo, hi, ap.data(), nt, up.data());
+        } else {
+            gg::mx_rows_tier(tier, w.data(), gr, E, lo, hi, ap.data(), nt, gp.data());
+            gg::mx_rows_tier(tier, w.data() + mat, gr, E, lo, hi, ap.data(), nt, up.data());
+        }
         for (int t = 0; t < nt; ++t)
             for (int r = lo; r < hi; ++r) { float gv = std::min(gp[t][r-lo], 10.0f), uv = std::clamp(up[t][r-lo], -10.0f, 10.0f); h[size_t(t)*FF+r] = gv / (1.0f + std::exp(-gv)) * uv; }
     };
@@ -102,7 +107,8 @@ std::vector<float> expert(int tier, int nt, int threads, const std::vector<uint8
         const int lo = j * RB, hi = std::min(E, lo + RB);
         std::vector<const void*> ap(nt); std::vector<float*> yp(nt);
         for (int t = 0; t < nt; ++t) { ap[t] = hq.data() + size_t(t) * ha; yp[t] = out.data() + size_t(t)*E + lo; }
-        gg::mx_rows_tier(tier, w.data() + 2 * mat, dr, FF, lo, hi, ap.data(), nt, yp.data());
+        if (tier == -2) gg::mx_rows_reference(w.data() + 2 * mat, dr, FF, lo, hi, ap.data(), nt, yp.data());
+        else gg::mx_rows_tier(tier, w.data() + 2 * mat, dr, FF, lo, hi, ap.data(), nt, yp.data());
     };
     pool.run((E + RB - 1) / RB, down);
     return out;
@@ -113,7 +119,7 @@ void expert_cases() {
     for (size_t b = 0; b < bytes; b += 17) { w[b] = uint8_t(114 + rng() % 9); for (int j = 1; j < 17; ++j) w[b+j] = uint8_t(rng()); }
     std::vector<float> x(size_t(9) * 5120); for (auto& v : x) v = float(int(rng()%65536)-32768) / 32768.0f;
     for (int nt : {1, 4, 9}) {
-        auto ref = expert(gg::kMxScalar, nt, 1, w, x);
+        auto ref = expert(-2, nt, 1, w, x);
         for (int threads : {1, 12, 24}) equal(ref, expert(gg::kMxSsse3, nt, threads, w, x), "complete expert / threads");
     }
 }

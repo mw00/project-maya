@@ -1,9 +1,11 @@
 // src/ds4/ds4_gguf_cpu.cpp - a GGUF's MXFP4 experts on the CPU lane (see ds4_gguf_cpu.hpp).
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_mx_fma.hpp"
 
 #include "strata/kernels/cpu/exl3_cpu.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -182,6 +184,7 @@ void quant_scalar(const float* x, int b0, int b1, uint8_t* act, int k) {
     }
 }
 
+template <bool Fast>
 void rows_q_scalar(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n, float* const* y) {
     const float* t = e8().v;
     for (int r = r0; r < r1; ++r) {
@@ -198,7 +201,7 @@ void rows_q_scalar(const uint8_t* w, size_t rb, int k, int r0, int r1, const voi
                 const uint8_t* a = (const uint8_t*) act[i];
                 int s = 0;
                 for (int j = 0; j < kBlock; ++j) s += wv[j] * act_q(a, b, j);
-                acc[i][l] = std::fma((float) s, t[p[0]] * act_d(a, k, b), acc[i][l]);
+                acc[i][l] = detail::mx_fma<Fast>((float) s, t[p[0]] * act_d(a, k, b), acc[i][l]);
             }
         }
         for (int i = 0; i < n; ++i) {
@@ -269,6 +272,10 @@ const Cpu& cpu() {
 std::string g_tier_report;
 int measure_tier(const std::vector<int>& cand);
 int pick_tier() {
+    if (const char* s = std::getenv("DS4_MX_SSSE3"); s && std::strcmp(s, "1") == 0 && mx_tier_ok(kMxSsse3)) {
+        g_tier_report = "DS4_MX_SSSE3=1";
+        return kMxSsse3;
+    }
     if (const char* f = std::getenv("DS4_MX_TIER"))
         for (int t = 0; t < kMxTiers; ++t)
             if (std::string(f) == mx_tier_name(t) && mx_tier_ok(t)) {
@@ -358,7 +365,7 @@ void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float
 bool mx_tier_ok(int t) {
     switch (t) {
         case kMxScalar: return true;
-        case kMxSsse3: return cpu().ssse3;
+        case kMxSsse3: return cpu().ssse3 && mx_ssse3_enabled();
         case kMxAvx2: return cpu().avx2;
 #if defined(MX_AVXVNNI)
         case kMxAvxVnni: return cpu().vnni256;
@@ -388,6 +395,59 @@ const char* mx_tier_report() {
     return g_tier_report.c_str();
 }
 
+bool mx_ssse3_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_MX_SSSE3");
+        return v == nullptr || std::strcmp(v, "0") != 0;
+    }();
+    return on;
+}
+bool mx_fast_fma_requested() {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_MX_FAST_FMA");
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+bool mx_fast_fma_active() { return mx_fast_fma_requested() && detail::fast_fma_environment_ok(); }
+
+namespace {
+std::atomic<uint64_t> fma_verified_values{0}, fma_verified_batches{0};
+bool verify_fma() {
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_MX_FMA_VERIFY");
+        const bool yes = v != nullptr && std::strcmp(v, "1") == 0;
+        if (yes) std::atexit([] {
+            std::fprintf(stderr, "ds4 MX FMA verify: %llu values in %llu batches, 0 mismatches (fail-fast on mismatch)\n",
+                         (unsigned long long) fma_verified_values.load(), (unsigned long long) fma_verified_batches.load());
+        });
+        return yes;
+    }();
+    return on;
+}
+void check_fma(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n, float* const* y) {
+    const int rows = std::max(0, r1 - r0);
+    if (n <= 0 || rows == 0) return;
+    std::vector<float> ref((size_t) rows * n);
+    std::vector<float*> rp((size_t) n);
+    for (int i = 0; i < n; ++i) rp[(size_t) i] = ref.data() + (size_t) i * rows;
+    mx_rows_reference(w, rb, k, r0, r1, act, n, rp.data());
+    for (int i = 0; i < n; ++i)
+        if (std::memcmp(rp[(size_t) i], y[i], (size_t) rows * sizeof(float))) {
+            std::fprintf(stderr, "ds4 MX FMA verify FAILED: k=%d rows=%d tokens=%d\n", k, rows, n);
+            std::abort();
+        }
+    fma_verified_values.fetch_add((uint64_t) rows * n, std::memory_order_relaxed);
+    fma_verified_batches.fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace
+
+void mx_rows_reference(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
+                       float* const* y) {
+    for (int i = 0; i < n; i += kMxCpuMaxN)
+        rows_q_scalar<false>(w, rb, k, r0, r1, act + i, std::min(kMxCpuMaxN, n - i), y + i);
+}
+
 void mx_quant_blocks(const float* x, int b0, int b1, void* act, int k) {
 #if defined(MX_X86)
     if (cpu().avx2 && k % 256 == 0) return mx_avx2::quant(x, b0, b1, (uint8_t*) act, k);
@@ -405,9 +465,14 @@ void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, con
     // SSSE3 handles partial groups; AVX2+ takes eight blocks a step.
     if (!mx_tier_ok(t) || (t != kMxSsse3 && k % 256 != 0)) t = kMxScalar;
     const float* tb = e8().v;
+    const bool fast = mx_fast_fma_active();
 #if defined(MX_X86)
     switch (t) {
-        case kMxSsse3: return rows_ssse3(w, rb, k, r0, r1, act, n, y, tb, pf);
+        case kMxSsse3:
+            if (fast) rows_ssse3<true>(w, rb, k, r0, r1, act, n, y, tb, pf);
+            else rows_ssse3<false>(w, rb, k, r0, r1, act, n, y, tb, pf);
+            if (fast && verify_fma()) check_fma(w, rb, k, r0, r1, act, n, y);
+            return;
         case kMxAvx2: return mx_avx2::rows(w, rb, k, r0, r1, act, n, y, tb, pf);
 #if defined(MX_AVXVNNI)
         case kMxAvxVnni: return mx_avxvnni::rows(w, rb, k, r0, r1, act, n, y, tb, pf);
@@ -418,8 +483,11 @@ void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, con
     }
 #endif
     (void) tb, (void) pf;
-    for (int i0 = 0; i0 < n; i0 += kMxCpuMaxN)
-        rows_q_scalar(w, rb, k, r0, r1, act + i0, std::min(kMxCpuMaxN, n - i0), y + i0);
+    for (int i0 = 0; i0 < n; i0 += kMxCpuMaxN) {
+        if (fast) rows_q_scalar<true>(w, rb, k, r0, r1, act + i0, std::min(kMxCpuMaxN, n - i0), y + i0);
+        else rows_q_scalar<false>(w, rb, k, r0, r1, act + i0, std::min(kMxCpuMaxN, n - i0), y + i0);
+    }
+    if (fast && verify_fma()) check_fma(w, rb, k, r0, r1, act, n, y);
 }
 
 void mx_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n, float* const* y) {

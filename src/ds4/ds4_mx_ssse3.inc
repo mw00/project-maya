@@ -3,7 +3,7 @@
 // LUT entries are w+12 (0..24). A pmaddubsw pair is at most 2*24*128=6144 in magnitude; adding low/high
 // halves is at most 12288. Neither 16-bit step saturates, including activation -128. The existing int32
 // activation correction removes 12*sum(x), giving the same exact signed integer dot as rows_q_scalar.
-template <int N>
+template <int N, bool Fast>
 MX_TARGET("ssse3") void rows_ssse3_n(const uint8_t* w, size_t rb, int k, int r0, int r1,
                                      const void* const* act, float* const* y, const float* tb, int pf) {
     const __m128i lut = _mm_setr_epi8(12, 13, 14, 15, 16, 18, 20, 24, 12, 11, 10, 9, 8, 6, 4, 0);
@@ -35,7 +35,7 @@ MX_TARGET("ssse3") void rows_ssse3_n(const uint8_t* w, size_t rb, int k, int r0,
                 sum = _mm_hadd_epi32(sum, sum);
                 sum = _mm_hadd_epi32(sum, sum);
                 const int s = _mm_cvtsi128_si32(sum) + ac[i][a];
-                acc[i][lane] = std::fma((float) s, dw * ad[i][a], acc[i][lane]);
+                acc[i][lane] = detail::mx_fma<Fast>((float) s, dw * ad[i][a], acc[i][lane]);
             }
         }
         for (int i = 0; i < N; ++i) {
@@ -44,12 +44,13 @@ MX_TARGET("ssse3") void rows_ssse3_n(const uint8_t* w, size_t rb, int k, int r0,
         }
     }
 }
+template <bool Fast>
 void rows_ssse3(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
                 float* const* y, const float* tb, int pf) {
     for (int i = 0; i < n; i += kMxCpuMaxN) {
         const int count = std::min(kMxCpuMaxN, n - i);
         switch (count) {
-#define MX_SSSE3_CASE(N) case N: rows_ssse3_n<N>(w, rb, k, r0, r1, act + i, y + i, tb, pf); break
+#define MX_SSSE3_CASE(N) case N: rows_ssse3_n<N, Fast>(w, rb, k, r0, r1, act + i, y + i, tb, pf); break
             MX_SSSE3_CASE(1);
             MX_SSSE3_CASE(2);
             MX_SSSE3_CASE(3);

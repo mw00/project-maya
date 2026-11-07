@@ -1150,6 +1150,24 @@ On a CPU without the AVX2/FMA tier the start measures scalar against SSSE3 and k
 auto-selection is unchanged. `DS4_MX_TIER=ssse3` or `DS4_MX_TIER=scalar` selects one manually (only where supported).
 These are read at engine startup; changing the environment does not switch a loaded engine's tier.
 
+SSSE3 decoding/integer dot products and software-FMA acceleration have separate switches:
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `DS4_MX_SSSE3` | unset: automatic tier selection above | `0`: exclude SSSE3; `1`: explicitly select it where supported, taking precedence over `DS4_MX_TIER`. Unsupported CPUs retain a supported tier. |
+| `DS4_MX_FAST_FMA` | off | `1`: accelerate binary32 FMA in the scalar and SSSE3 MXFP4 tiers using an exact binary64 product/sum with guarded fallback to `std::fma`. Independent of `DS4_MX_SSSE3`; AVX2+ kernels are unchanged. |
+| `DS4_MX_FMA_VERIFY` | off | `1`: recompute accelerated matrix outputs with the original scalar `std::fma`, compare bits, and abort on a mismatch. Prints checked values/batches on clean exit. This is a slow diagnostic; leave it off when measuring speed. |
+
+For an E5 v2, the four combinations are `DS4_MX_SSSE3=0 DS4_MX_FAST_FMA=0` (original scalar),
+`1 0` (SSSE3 only), `0 1` (FMA acceleration only), and `1 1` (both). Set them in the engine environment
+before starting it. To restore automatic selection, unset `DS4_MX_SSSE3` and `DS4_MX_TIER`.
+
+The FMA shortcut requires x86-64, round-to-nearest/ties-to-even and gradual underflow. Other rounding modes
+or FTZ/DAZ retain `std::fma`. Midpoints between adjacent normal binary32 values, zeros, subnormals, overflow
+and nonfinite results also use `std::fma`. This avoids binary64-to-binary32 double rounding; it does not
+replace fused arithmetic with float multiplication/addition. The source is compiled with FP contraction
+disabled. The shortcut preserves result bits; floating-point exception flags are not part of its API contract.
+
 ## DeepSeek: the CPU lane's threads
 
 DeepSeek's engine computes the routed experts that are not in VRAM on the CPU (the CPU lane), a thread per physical

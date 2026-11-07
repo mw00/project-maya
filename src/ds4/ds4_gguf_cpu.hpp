@@ -74,6 +74,12 @@ int mx_tier();                   // the tier mx_rows takes (measured on first us
 const char* mx_tier_report();    // the measurement behind it (each candidate's time), or how it was picked
 bool mx_tier_ok(int t);          // this CPU runs tier t
 const char* mx_tier_name(int t);
+bool mx_ssse3_enabled();         // DS4_MX_SSSE3=0 disables, 1 forces when supported, unset keeps the automatic selection
+bool mx_fast_fma_requested();    // DS4_MX_FAST_FMA=1 opts in, independently of the integer tier (default: off)
+bool mx_fast_fma_active();       // requested and this thread's FP environment is supported
+/// Unchanged scalar std::fma arithmetic, independent of both flags: numerical reference / diagnostics.
+void mx_rows_reference(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
+                       float* const* y);
 /// Whether the rows of `type` are ds4's own here (IQ3_XXS / IQ3_S on AVX2 / AVX-512 VBMI, IQ2_XS / IQ1_M on AVX-512
 /// without VBMI - ds4_iq512_kern.inc, DS4_IQ512: ggml-cpu's numbers bit for bit, checked against its dot on first use;
 /// DS4_IQ_OWN=0 turns them off) rather than ggml's / the GLM lane's.
