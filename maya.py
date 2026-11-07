@@ -1723,6 +1723,10 @@ def config_family(cfg: dict) -> str:
     return Q.family_of(cfg)
 
 
+# each model's name on the setup's screen, under its logo (Qwen's: the model, whichever of its files - never its id)
+FAMILY_TITLE = {**Q.MODEL, "qwen": "Qwen-3.8-Flash-Next"}
+
+
 # the models whose engine answers several requests at once (--parallel): GLM-5.3-Flash's, DeepSeek-V4.1-Flash's
 # (maya-ds4 --parallel: a conversation's state each, their tokens decoded together), MiniMax-M3.1-Flash's (maya-mm3
 # --parallel: a KV cache each in VRAM - no KV streaming, no DSpark)
@@ -4360,6 +4364,7 @@ def stop_signals() -> None:
 def serve_on_screen(cfg_path: Path, a) -> int:
     """Maya's server on the setup's screen (setup.UI): its exit code; one it did not choose stops there, with the
     last line its engine logged in this start (mostly the reason: "strata generate: pack: out of memory")."""
+    S.model_named(FAMILY_TITLE.get(config_family(read_json(cfg_path)), ""))
     cmd, env, info = server_command(cfg_path, a)
     log = Path(info["log"]) if info.get("log") else None
     seen = log.stat().st_size if log is not None and log.is_file() else 0
@@ -4817,6 +4822,7 @@ def set_up(a, prev: dict) -> Path | None:
     config of the setup before (its answers are the defaults).  The model comes first: GLM-5.3-Flash or DeepSeek-V4.1-
     Flash-1017 (set_up_ds4), each then with the answers of its own setup before."""
     family = choose_family(a, prev)
+    S.model_named(FAMILY_TITLE[family])
     check_parallel(a, family)
     if config_family(prev) != family:
         prev = next((c for c in map(read_json, configs()) if config_family(c) == family and

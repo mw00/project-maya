@@ -152,6 +152,10 @@ class Bridge:
             self.step_no = n
         return self._emit(("step", n, title), f"=== Step {n}: {title} ===")
 
+    def model(self, name):
+        """The model this setup or start is for, once it is known: the line under the logo names it (no log line)."""
+        return self._emit(("model", str(name)))
+
     def ok(self, msg):
         return self._emit(("ok", str(msg)), f"  [ok] {msg}")
 
