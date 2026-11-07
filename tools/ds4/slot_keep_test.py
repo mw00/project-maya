@@ -10,7 +10,7 @@ settings (`DS4_*` and the `MAYA_DS4_*` names, under the names the engine reads):
 sizes from hipMemGetInfo is not the one a config pins (`DS4_POOL_GB`), and there a QUIT can hang for its 300 s.  The
 slot settings this test sets win over the config's - the test decides what it measures.
 
-Six runs of the engine's `--serve` protocol (greedy, spec=0 so the state's position is the answer's, exactly):
+Seven runs of the engine's `--serve` protocol (greedy, spec=0 so the state's position is the answer's, exactly):
   no-keep  A, B, A's next turn (MAYA_DS4_SLOT_KEEP=0)  the reference: reused 0, and its answer to A builds the turn
                                                        every later run sends, so they all send the same prompt byte
                                                        for byte
@@ -18,6 +18,9 @@ Six runs of the engine's `--serve` protocol (greedy, spec=0 so the state's posit
                                                        determinism (a prompt's path is not promised to be identical
                                                        across runs, so this is measured, not assumed)
   in-run   A, B, A's next turn, one process            the third request reports A's full prefix as reused
+  cancel   A, a read a STOP ends, A's next turn       the STOP leaves the shared start (the GEN's `shared=`) and
+                                                       nothing else in the model - A's next turn takes A's
+                                                       conversation back from its slot, not the start alone
   kept     A, B, then QUIT                             the folder keeps both conversations (2 .bin + .meta, under a
                                                        0.05 GB MAYA_DS4_SLOT_GB)
   restart  A's next turn alone, a new process          the same prefix reused, from the folder
@@ -168,15 +171,25 @@ class Engine:
         line, self.buffer = self.buffer.split(b"\n", 1)
         return line.decode("utf-8", "replace").strip()
 
-    def request(self, prompt: list[int], max_new: int, spec: int = 0, timeout: float = 3600.0) -> dict:
-        self.proc.stdin.write(f"GEN {max_new} spec={spec} {','.join(str(t) for t in prompt)}\n".encode())
+    def request(self, prompt: list[int], max_new: int, spec: int = 0, timeout: float = 3600.0, keys: str = "",
+                stop_after_pp: int = 0) -> dict:
+        """`keys`: the GEN line's own keys ("shared=2000", "marks=12"); `stop_after_pp`: a STOP after that many PP
+        progress lines of the prompt read - the read ends there, as a client's Escape does (DONE ... cancel)."""
+        self.proc.stdin.write(f"GEN {max_new} {keys + ' ' if keys else ''}spec={spec} "
+                              f"{','.join(str(t) for t in prompt)}\n".encode())
         self.proc.stdin.flush()
         out = {"tokens": [], "reused": None, "prompt": None, "finish": None, "s": 0.0}
         t0 = time.monotonic()
         end = t0 + timeout
+        pp = 0
         while True:
             line = self._line(end)
-            if line.startswith("T "):
+            if stop_after_pp and line.startswith("PP"):
+                pp += 1
+                if pp == stop_after_pp:
+                    self.proc.stdin.write(b"STOP\n")
+                    self.proc.stdin.flush()
+            elif line.startswith("T "):
                 out["tokens"].append(int(line[2:]))
             elif line.startswith("ERR "):
                 out["error"] = line[4:]
@@ -251,9 +264,11 @@ def engine_env(settings: dict, keep: bool, slots: str, slot_gb: float | None) ->
     return env
 
 
-def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, steps: list[tuple[str, Callable]],
+def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool,
+        steps: list[tuple],
         max_new: int, slot_gb: float | None = None, settings: dict | None = None) -> tuple[dict, list[str], float]:
-    """One engine process: each step (a name, and a function of the answers so far that gives its prompt) in order.
+    """One engine process: each step (a name, and a function of the answers so far that gives its prompt) in order; a
+    third element is Engine.request's own keywords (`{"keys": "shared=2000"}`).
     `settings`: the config's engine settings (config_env), the slot settings here over them."""
     env = engine_env(settings or {}, keep, slots, slot_gb)
     args = [*(("--gpus", ",".join(str(g) for g in gpus)) if gpus else ()), "--pack", pack, "--max-context", str(ctx),
@@ -264,9 +279,10 @@ def run(exe: str, gpus: list[int], pack: str, ctx: int, slots: str, keep: bool, 
     try:
         eng.start(timeout=1800.0)
         load_s = time.monotonic() - t0
-        for name, make in steps:
+        for step in steps:
+            name, make = step[0], step[1]
             prompt = make(answers)
-            answers[name] = eng.request(prompt, max_new)
+            answers[name] = eng.request(prompt, max_new, **(step[2] if len(step) > 2 else {}))
             if "error" in answers[name]:
                 raise RuntimeError(f"{name}: {answers[name]['error']}")
             answers[name]["len"] = len(prompt)
@@ -389,6 +405,29 @@ def main() -> int:
         reuse_check("in-run", third["reused"], an["tokens"])
         check(f"in-run: the prompt's length agrees ({third['prompt']} of {third['len']})",
               third["prompt"] == third["len"])
+
+        print("cancel: A, then a read a STOP ends (the model holds only the shared start), then A's next turn",
+              flush=True)
+        s = text_tokens(tok, "A shared start.", 2000)     # (>= MAYA_DS4_PREFIX_MIN: the engine keeps it)
+        a2 = s + text_tokens(tok, "Conversation A.", 6000)
+        b2 = s + text_tokens(tok, "Conversation B.", 20000)   # (chunks: the STOP meets the read, not its end)
+        dir_cancel = os.path.join(tmp, "cancel")
+        rc, notes_c, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_cancel, True,
+                             [("A", lambda _: a2, {"keys": f"shared={len(s)}"}),
+                              ("B", lambda _: b2, {"keys": f"shared={len(s)}", "stop_after_pp": 1}),
+                              ("A-turn", lambda ans: a2 + ans["A"]["tokens"] + turn)], max_new, settings=settings)
+        ca, cb, ct = rc["A"], rc["B"], rc["A-turn"]
+        print(f"        A {len(a2)} tok in {ca['s']:.0f} s; the stopped read {cb['len']} tok in {cb['s']:.1f} s "
+              f"({cb['finish']}); A's next turn {ct['len']} tok in {ct['s']:.1f} s, reused {ct['reused']}", flush=True)
+        check("cancel: the read was stopped mid-prompt (DONE ... cancel)", cb["finish"] == "cancel")
+        # (DONE's kept position: 0 when the read had no state before it - the shared start must be what it kept)
+        check(f"cancel: the stopped read left the shared start alone ({cb['reused']} of {len(s)})",
+              cb["reused"] == len(s))
+        # (A's state is A and all but its answer's last fed token; a STOP on another prompt leaves only the shared
+        #  start in the model - A's next turn must take A's conversation back, not read it again)
+        want_c = len(a2) + len(ca["tokens"]) - 1
+        check(f"cancel: A's next turn reuses A's full prefix ({ct['reused']} of {want_c})", ct["reused"] == want_c)
+        check(f"cancel: the prompt's length agrees ({ct['prompt']} of {ct['len']})", ct["prompt"] == ct["len"])
 
         print("kept: A, B, then QUIT (both conversations written to the folder)", flush=True)
         rk, _, _ = run(a_.exe, gpus, a_.pack, a_.ctx, dir_kept, True,
