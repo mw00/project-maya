@@ -201,6 +201,16 @@ class HipSetupTests(unittest.TestCase):
                               self.root / "pack", "test", 8192, self.root / "data", None)
         self.assertEqual(maya.read_json(p)["env"]["STRATA_HIPBLASLT_TUNING"], "/selected/table.txt")
 
+    def test_shipped_glm_tuning_tables_name_their_architecture(self):
+        """The tables shipped in tools/hip (gfx1200's tuned on a RX 9060 XT): the engine accepts a table only for
+        its own arch and hipBLASLt version, so a header that does not match the file name's arch would silently
+        leave that card's prompts on plain hipBLAS."""
+        for table in sorted((Path(__file__).resolve().parents[1] / "tools" / "hip").glob("*-glm-hipblaslt-*.txt")):
+            magic = next((l for l in table.read_text(errors="replace").splitlines()
+                          if l.startswith("STRATA_HIPBLASLT_TUNING_V1")), None)
+            self.assertIsNotNone(magic, table.name)
+            self.assertEqual(magic.split()[1], table.name.split("-")[0], table.name)
+
     def test_rocm_devel_links_repaired(self):
         # #574: rocm-sdk init skipped the device-library links whose unnormalized target passed 260 characters
         site = self.root / "site"
