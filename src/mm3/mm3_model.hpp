@@ -75,6 +75,10 @@ struct Options {
     bool verbose = false;
 };
 
+/// MAYA_MM3_HELPER: the visible CUDA index of the helper GPU (-1: none) - read where --gpus' default list is made, so
+/// the helper is left out of it.
+int helper_env_id();
+
 struct Stats {
     double load_s = 0;
     long staged = 0;              // expert blobs copied into staging slots
@@ -91,6 +95,13 @@ struct Stats {
     long promoted = 0;            // experts copied into a staging slot because they kept coming back
     double t_promo = 0;           // a forward's start waiting for those copies
     double t_sync = 0, t_lane = 0, t_token = 0;   // decode: waiting on the routing, the CPU lane, all (seconds)
+    // the helper GPU (MAYA_MM3_HELPER): its pool, the picks it computed instead of the CPU lane, the ones the CPU lane
+    // took after it failed, and the host's waits for its answers after the CPU lane's own part
+    int helper_id = -1, helper_dead = 0;
+    long helper_held = 0;
+    double helper_gb = 0;
+    long helper_experts = 0, helper_fallback = 0;
+    double t_helper = 0;
 };
 
 /// A forward's logits rows as the sampler's candidates (Model::forward_cands): per row the kc largest logits and every
