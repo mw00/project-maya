@@ -660,7 +660,8 @@ MM3_SAMPLING = Q.MODEL_DEFAULTS["minimax"][0]
 # thinking level for requests that name none: "auto" - the card names no default effort, so none is set and the
 # template's own default applies (adaptive: the model decides whether to think); the card's five efforts low .. max
 MM3_EFFORT = Q.MODEL_DEFAULTS["minimax"][1]
-MM3_MEMORY_GB = 250                                # VRAM + RAM: 179 GiB of weights, the experts not in VRAM pinned
+MM3_MEMORY_GB = 200                                # VRAM + RAM: 179 GiB of weights + the vision tower and DSpark
+                                                   # draft (197 GB of files) and ~3 GB of buffers, the KV cache aside
 MM3_PROFILE = ROOT / "data" / "expert-profile-mm3.bin"
 # ... or Project Maya's own GGUF quants of it (tools/mm3/download_gguf.json, packed by tools/mm3/pack_gguf.py): the routed
 # experts in ~1.6 bits (Maya-XS, ~93 GB) or ~2.1 bits (Maya-S, ~122 GB) on maya-ds4's low-bit kernels - NVIDIA from V100

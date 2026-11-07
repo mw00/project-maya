@@ -45,7 +45,7 @@ It first asks which model to set up:
   (197 GB with MiniMax's DSpark drafter; every file pinned and checked, `tools/mm3/download.json`) on its own engine
   (`build/maya-mm3`): NVIDIA from V100 on, Linux and Windows, and AMD (as GLM's EXL3 quants); Maya's GGUF quants
   (`--model minimax-maya-xs` / `minimax-maya-s`: [SETTINGS.md](SETTINGS.md#minimax-m31-flash)) run on both too.
-  About 250 GB of VRAM
+  About 200 GB of VRAM
   and RAM hold all of it; with less the setup warns. The same steps with these differences: the contexts are 32K-1M,
   the recommended one the largest (up to 256K) whose KV cache fits beside the model in this PC's VRAM + RAM, its RAM
   said, with warnings past 256K and when the cache would take the experts' RAM; the pack is `DIR/maya-mm3/`

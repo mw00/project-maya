@@ -123,11 +123,11 @@ class Contexts(unittest.TestCase):
         bf16 = maya.MM3_KV_BYTES["bf16"]
         self.assertAlmostEqual(maya.mm3_kv_gb(1048576, "bf16"), 1048576 * bf16 / 2**30)
         self.assertEqual(maya.mm3_recommended_context(48, 512, "bf16"), 262144)    # (never past the tested 256K)
-        self.assertEqual(maya.mm3_recommended_context(48, 256, "bf16"), 262144)    # (54 GB spare: 30 GB at 256K)
-        self.assertEqual(maya.mm3_recommended_context(48, 220, "bf16"), 131072)    # (18 GB spare: 15 GB at 128K)
+        self.assertEqual(maya.mm3_recommended_context(48, 206, "bf16"), 262144)    # (54 GB spare: 30 GB at 256K)
+        self.assertEqual(maya.mm3_recommended_context(48, 170, "bf16"), 131072)    # (18 GB spare: 15 GB at 128K)
         self.assertEqual(maya.mm3_recommended_context(24, 128, "bf16"), 32768)     # (below the model: the smallest)
         self.assertEqual(maya.mm3_recommended_context(48, 0, "bf16"), maya.MM3_DEFAULT_CONTEXT)   # (RAM unknown)
-        self.assertGreater(maya.mm3_recommended_context(48, 214, "int8"), maya.mm3_recommended_context(48, 214, "bf16"))
+        self.assertGreater(maya.mm3_recommended_context(48, 164, "int8"), maya.mm3_recommended_context(48, 164, "bf16"))
 
     def test_recommended_by_host(self):
         """#663: the pinned cache is RAM - a VRAM with room beyond the model does not hold it; a Windows APU maps at
@@ -356,7 +356,7 @@ class Gguf(unittest.TestCase):
     def test_choice(self):
         with patch.object(maya, "fail", fail):
             self.assertEqual(maya.choose_mm3_quant(args(mm3_quant="gguf-s"), {}), "gguf-s")
-            # the one recommended by the PC's VRAM + RAM: the EXL3 quant where it fits (250 GB), else the biggest GGUF
+            # the one recommended by the PC's VRAM + RAM: the EXL3 quant where it fits (200 GB), else the biggest GGUF
             # that fits, else the smallest
             for ram, vram, want in ((256, 96, "exl3"), (128, 32, "gguf-s"), (96, 24, "gguf-xs"), (32, 8, "gguf-xs")):
                 with patch.object(maya, "mem_gb", return_value=(float(ram), float(ram))), \
