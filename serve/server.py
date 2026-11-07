@@ -6749,6 +6749,15 @@ def request_stop(stop: threading.Event, why: str) -> None:
         print(f"[maya] stopping ({why}): the engine ends", flush=True)
 
 
+def wait_for_stop(stop: threading.Event, step: float = 0.5) -> None:
+    """main()'s wait until the server stops. It polls the flag and never waits on the Event: the signal handlers
+    (stop_signals) run on this same thread, between steps, and call stop.set() - while Event.wait holds the Event's
+    lock, a SIGTERM / Ctrl+C landing in it made that stop.set() wait for the same lock forever (the server never
+    ended; only SIGKILL did). time.sleep is interruptible on Windows too: Ctrl+C / Ctrl+Break act within a step."""
+    while not stop.is_set():
+        time.sleep(step)
+
+
 def stop_signals(stop: threading.Event) -> None:
     """SIGTERM, SIGINT (Ctrl+C), SIGHUP (the terminal closed) and Windows' SIGBREAK (Ctrl+Break) stop the server
     (request_stop).  A later one is ignored while it stops - but a second Ctrl+C raises KeyboardInterrupt: at once.  A
@@ -7163,8 +7172,7 @@ def main() -> int:
     if a.parent_pipe:
         watch_parent(lambda why: request_stop(stop, why))
     try:
-        while not stop.wait(0.5):                      # (a timed wait: signal handlers run on Windows too)
-            pass
+        wait_for_stop(stop)
     except KeyboardInterrupt:
         request_stop(stop, "Ctrl+C")
     try:

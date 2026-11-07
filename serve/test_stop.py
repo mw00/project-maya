@@ -175,6 +175,32 @@ class WatchParent(unittest.TestCase):
         SV.request_stop(stop, "b")
         self.assertTrue(stop.is_set())
 
+    def test_the_main_wait_never_holds_the_events_lock(self):
+        """main()'s wait polls the flag: Event.wait held the Event's lock while a signal handler (same thread) called
+        stop.set() on it - a SIGTERM / Ctrl+C at that moment hung the server for good."""
+        class NoWait(threading.Event):
+            def wait(self, timeout=None):
+                raise AssertionError("main()'s stop wait must not call Event.wait")
+        stop = NoWait()
+        threading.Timer(0.05, lambda: SV.request_stop(stop, "test")).start()
+        t0 = time.monotonic()
+        SV.wait_for_stop(stop, step=0.01)
+        self.assertTrue(stop.is_set())
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+    @unittest.skipIf(WIN, "POSIX signals")
+    def test_a_signal_handler_stops_the_main_wait(self):
+        """The real handler path: SIGALRM's handler calls request_stop on the main thread while it waits."""
+        stop = threading.Event()
+        old = signal.signal(signal.SIGALRM, lambda s, f: SV.request_stop(stop, "SIGALRM"))
+        self.addCleanup(signal.signal, signal.SIGALRM, old)
+        signal.setitimer(signal.ITIMER_REAL, 0.05)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        t0 = time.monotonic()
+        SV.wait_for_stop(stop, step=0.01)
+        self.assertTrue(stop.is_set())
+        self.assertLess(time.monotonic() - t0, 2.0)
+
 
 @unittest.skipIf(psutil is None, "psutil is not installed")
 class ServerStops(unittest.TestCase):
