@@ -118,8 +118,8 @@ def _options(req: dict, out: dict):
     for k in ("temperature", "top_p"):             # (the top level of an OpenAI-style call too)
         if req.get(k) is not None and k not in out:
             out[k] = req[k]
-    if req.get("think") is False:
-        out["thinking"] = {"type": "disabled"}
+    if req.get("think") is False:                  # (the OpenAI path reads chat_template_kwargs, not Anthropic's "thinking")
+        out["chat_template_kwargs"] = {"enable_thinking": False}
     fmt = req.get("format")
     if fmt == "json":
         out["response_format"] = {"type": "json_object"}
