@@ -108,6 +108,45 @@ class ReaderProcess(unittest.TestCase):
         self.readers = getattr(self, "readers", []) + [r]
         return r
 
+    def test_disabled_nvml_never_starts_a_reader(self):
+        for values in ({"MAYA_GLM_NVML": "0"}, {"STRATA_GLM_NVML": "0"}):
+            with self.subTest(values=values), mock.patch.dict(os.environ, values, clear=True), \
+                    mock.patch.object(T.subprocess, "Popen") as spawn, mock.patch.object(T, "_READER", None), \
+                    mock.patch.object(T, "SYSFS", str(ROOT / "no-such-sysfs")), mock.patch.object(T, "WINDOWS", False):
+                r = self.keep(T._reader())
+                self.assertIsNone(r.call({"op": "info", "idx": [0]}))
+                self.assertIsNone(r.call({"op": "read", "idx": [0]}))
+                self.assertIsNone(T.gpu_pids())
+                t = T.Telemetry(gpu_index=0, reader=r, start=False)
+                sample = t.sample()
+                self.assertIn("ram_total", sample)
+                self.assertNotIn("gpu_util", sample)
+                self.assertIsNone(r.proc)
+                self.assertEqual(r.crashes, 0)
+                spawn.assert_not_called()
+
+    def test_nvml_default_and_maya_precedence(self):
+        for values in ({}, {"MAYA_GLM_NVML": "1", "STRATA_GLM_NVML": "0"}):
+            with self.subTest(values=values), mock.patch.dict(os.environ, values, clear=True):
+                r = self.keep(reader())
+                self.assertFalse(r.off)
+                self.assertEqual(r.call({"op": "read", "idx": [0]})["gpus"][0]["util"], 42)
+
+    def test_nvml_setting_from_config_reaches_reader(self):
+        from serve import server as S
+        from tools import maya_names
+        with mock.patch.dict(os.environ, {}, clear=True):
+            try:
+                S.apply_server_env(maya_names.env_in({"env": {"MAYA_GLM_NVML": "0"}}))
+                r = self.keep(reader())
+                self.assertTrue(r.off)
+                self.assertIsNone(r.call({"op": "pids"}))
+                self.assertIsNone(r.proc)
+            finally:
+                os.environ.pop("MAYA_GLM_NVML", None)
+                os.environ.pop("STRATA_GLM_NVML", None)
+                S.apply_server_env({})
+
     def test_readings(self):
         r = self.keep(reader())
         info = r.call({"op": "info", "idx": [0, 1]})
