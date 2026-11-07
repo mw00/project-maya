@@ -42,6 +42,22 @@ class ModelChoice(unittest.TestCase):
         self.assertEqual(m["vision"]["repo"], maya.MODELS["Maya-M"]["repo"])   # its repo holds no vision files
         self.assertEqual(m["vision"]["sha256"], maya.MODELS["Maya-M"]["vision"]["sha256"])
 
+    def test_tev_download_is_offered_with_the_right_urls(self):
+        """Tev-320B-Uncensored (nimbz's Maya-M-style quant of gordonhu's community fine-tune): offered in the setup's
+        download menu, its three shards from QuantaPlanta's repo (the sha256 per shard matches the published files)."""
+        m = maya.MODELS["Tev-320B-Uncensored"]
+        names = maya.shard_names(m)
+        self.assertEqual(names, ["Tev-320B-Uncensored-nimbz-m-00001-of-00003.gguf",
+                                 "Tev-320B-Uncensored-nimbz-m-00002-of-00003.gguf",
+                                 "Tev-320B-Uncensored-nimbz-m-00003-of-00003.gguf"])
+        self.assertEqual(maya.quant_of(Path(names[0])), "Tev-320B-Uncensored")
+        self.assertNotIn("Tev-320B-Uncensored", maya.MODELS_BY_HAND)
+        self.assertEqual(maya.hf_url(m["repo"], m["revision"], m["folder"], names[0]),
+                         "https://huggingface.co/QuantaPlanta/Tev-320B-Uncensored-Project-Maya-GGUF/resolve/main/"
+                         "Tev-320B-Uncensored-nimbz-m-00001-of-00003.gguf")
+        self.assertEqual(m["vision"]["sha256"], maya.MODELS["Maya-M"]["vision"]["sha256"])
+        self.assertEqual(maya.Q.shown("glm", "Tev-320B-Uncensored"), "GLM-5.3 \u00b7 Tev-320B-Uncensored")
+
     def test_24gb_cards_get_maya_s24(self):
         self.assertEqual(self.choose({}, vram_gb=24.0)[1], "Maya-S24")
 

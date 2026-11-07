@@ -30,7 +30,7 @@ import maya_quants  # noqa: E402  (tools/) the quants' names users see, and each
 
 SWITCH_FILE = ".maya-switch.json"           # the server's note to maya.py: start this config next (a switch)
 DELETE_FILE = ".maya-delete.json"           # ... and to the next server: delete this config (it was the one running)
-CONTEXTS = [8192, 32768, 65536, 131072]       # the setup's choices (a config's own size is offered too)
+CONTEXTS = [8192, 32768, 65536, *range(131072, 524289, 16384)]   # the setup's choices (a config's own size is offered too)
 DS4_CONTEXTS = [32768, 65536, 131072, 262144, 524288, 1048576]   # ... for DeepSeek (maya.py's DS4_CONTEXTS)
 MM3_CONTEXTS = DS4_CONTEXTS                                       # ... and MiniMax (maya.py's MM3_CONTEXTS)
 QWEN_CONTEXTS = [32768, 65536, 131072, 262144]                    # ... and CYBER-FROST (maya.py's QWEN_CONTEXTS)
