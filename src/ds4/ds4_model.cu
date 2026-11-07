@@ -36,6 +36,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_pool.hpp"
 #include "ds4_path_policy.hpp"
+#include "ds4_peer_policy.hpp"
 #include "ds4_place.hpp"
 #include "ds4_prefill_stats.hpp"
 #include "ds4_prompt_mem.hpp"
@@ -17513,14 +17514,17 @@ struct Model::Impl {
     // original host transport intact for both ranks, without changing expert cache capacity.
     bool init_peer_ar(std::string& err) {
         if (chunk <= 0) return true;
-        bool eligible = false;
-        for (const Group& G : groups)
-            eligible = eligible || (G.mem.size() == 2 && G.arb.nm == 2 && G.arb.ar2 == 0 &&
-                !chunks[(size_t) G.mem[0]]->flow && !chunks[(size_t) G.mem[1]]->flow);
-        if (!eligible) return true; // no allocations, queries or timing for single-GPU/other group shapes
-        // (opt-in until a two-GPU AMD PC we can run has measured it: unset = 0, the existing transport)
+        // NVIDIA defaults to exact AR2 when the user did not choose a transport.  An opt-in peer
+        // request must be able to compete with that default; an explicit AR2 choice still wins.
         const char* opt = ds4_env("DS4_HIP_PEER_AR");
         if (!opt || std::strcmp(opt, "0") == 0) return true;
+        const bool implicit_ar2 = ds4_env("DS4_AR2") == nullptr;
+        bool eligible = false;
+        for (const Group& G : groups)
+            eligible = eligible || (G.mem.size() == 2 && peer_ar_group_eligible(
+                G.arb.nm, G.arb.ar2, implicit_ar2,
+                chunks[(size_t) G.mem[0]]->flow, chunks[(size_t) G.mem[1]]->flow));
+        if (!eligible) return true; // no allocations, queries or timing for single-GPU/other group shapes
         const bool automatic = std::strcmp(opt, "auto") == 0;
         if (!automatic && std::strcmp(opt, "1") != 0) {
             err = "DS4_HIP_PEER_AR takes auto, 0 or 1";
@@ -17539,7 +17543,8 @@ struct Model::Impl {
         for (Group& G : groups) {
             if (G.mem.size() != 2 || G.arb.nm != 2) continue;
             // Keep upstream's opt-in AR2 and the flow loader on their existing transports.
-            if (G.arb.ar2 != 0 || chunks[(size_t) G.mem[0]]->flow || chunks[(size_t) G.mem[1]]->flow) {
+            if (!peer_ar_group_eligible(G.arb.nm, G.arb.ar2, implicit_ar2,
+                                        chunks[(size_t) G.mem[0]]->flow, chunks[(size_t) G.mem[1]]->flow)) {
                 std::fprintf(stderr, "ds4: peer prefill all-reduce not selected for AR2/flow group\n");
                 continue;
             }
@@ -17607,7 +17612,7 @@ struct Model::Impl {
             }
             if (!ok) {
                 release();
-                std::fprintf(stderr, "ds4: peer prefill all-reduce unavailable on GPU%d/GPU%d (%s); retaining host transport\n",
+                std::fprintf(stderr, "ds4: peer prefill all-reduce unavailable on GPU%d/GPU%d (%s); retaining existing transport\n",
                              devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id, why.empty() ? "setup failed" : why.c_str());
                 continue;
             }
@@ -17616,7 +17621,9 @@ struct Model::Impl {
                 a[m].peer_flags = a[1-m].flags;
             }
             if (automatic) {
-                ArGroup ar2_group = G.arb;
+                ArGroup host_group = G.arb;
+                host_group.ar2 = 0;
+                ArGroup ar2_group = host_group;
                 unsigned* progress = nullptr;
                 // Respect an explicit AR2 setting, including 0. Unset: compare its exact-F32 mode too.
                 if (ds4_env("DS4_AR2") == nullptr) {
@@ -17628,7 +17635,7 @@ struct Model::Impl {
                     } else hipGetLastError();
                 }
                 const int ids[2] = {devs[(size_t) G.mem[0]].id, devs[(size_t) G.mem[1]].id};
-                const auto result = calibrate_peer(ids, G.arb, progress ? &ar2_group : nullptr, a.data(),
+                const auto result = calibrate_peer(ids, host_group, progress ? &ar2_group : nullptr, a.data(),
                                                    int(G.arb.stride), probe_ms);
                 const char* selected = result.complete && result.selected == PeerTransport::peer ? "peer" :
                                        result.complete && result.selected == PeerTransport::ar2 ? "ar2" : "host";
@@ -17644,7 +17651,7 @@ struct Model::Impl {
                 }
                 if (!result.valid || !result.complete) {
                     // drained: nothing reads the probe's buffers any more and the host rows' flags are reset
-                    std::fprintf(stderr, "ds4: peer prefill all-reduce probe on GPU%d/GPU%d %s; keeping the host transport\n",
+                    std::fprintf(stderr, "ds4: peer prefill all-reduce probe on GPU%d/GPU%d %s; keeping the existing transport\n",
                                  ids[0], ids[1], !result.valid ? "failed validation"
                                                                : "did not finish within its budget (DS4_PEER_AR_PROBE_MS)");
                     release();
@@ -17656,6 +17663,7 @@ struct Model::Impl {
                     host_allocs.push_back(progress);
                     progress = nullptr;
                 }
+                if (result.selected == PeerTransport::host) G.arb.ar2 = 0;
                 if (progress) hipHostFree(progress);
                 if (!result.complete || result.selected != PeerTransport::peer) { release(); continue; }
             }
@@ -17668,6 +17676,7 @@ struct Model::Impl {
                 d.scratch += 2 * a[m].stride * sizeof(float) +
                              (2 * kPeerArBlocks * kPeerArFlagStride + 1) * sizeof(unsigned) + sizeof(PeerArFailure);
             }
+            G.arb.ar2 = 0; // peer was selected, including the forced-peer mode
             G.peer_arb = a;
             G.peer_arb_on = true;
             std::fprintf(stderr, "ds4: exact peer prefill all-reduce enabled on GPU%d/GPU%d (%zu MiB/rank)\n",
