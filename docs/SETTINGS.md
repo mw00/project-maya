@@ -973,6 +973,46 @@ done with a prompt run (50 ms, the progress line keeps its 50 ms).
 | `DS4_TURN_TRACE` | off | `1`: a line a request with the engine's clock marks |
 | `DS4_RUN_POLL_MS` | 50 | 1-50: how often the engine looks whether a prompt run's GPUs are done |
 
+## DeepSeek: the next turn read ahead (`MAYA_DS4_PREREAD`, opt-in)
+
+DeepSeek's template drops a past turn's reasoning at the next user turn (unless tools are given or
+`MAYA_DS4_KEEP_THINKING=1`), and some clients (Open WebUI) send the answer back without it in any case. Then the
+next prompt differs from the one the engine holds where that reasoning began, and the follow-up reads the whole answer
+again while the user waits: 3-18 s after answers of 100-1,900 tokens on 2x RX 6900 XT (Maya-XS, layer split).
+
+With `MAYA_DS4_PREREAD=1`, after a thinking answer to an OpenAI chat completion, the server builds the prompt the
+chat's next turn starts with (the history and this answer as the client sends it back, up to the next `<｜User｜>`) the
+way a request's is built, the loop guard's edits included, and reads it while nobody waits. The next message then
+reads only its own tokens.
+
+- **In pieces** of `MAYA_DS4_PREREAD_PIECE` tokens (256), each an engine call of its own: a request that comes
+  meanwhile waits at most for the piece being read (on a layer split the engine stops a read only between its chunks,
+  and a whole answer is one chunk), then reads what it would have read anyway.
+- **A wrong guess costs nothing extra:** the first piece keeps a restore point one token past where this turn's prompt
+  and the guess part (`marks=`, with `MAYA_DS4_RESTORE_POINTS` on), so a next prompt that differs (a client that edits
+  the answer) goes back to the last piece before the change.
+- **Not for** a history whose reasoning the template keeps (tools given, or `MAYA_DS4_KEEP_THINKING=1`): that next
+  prompt already goes on from the engine's own state. Nor after a tool call, a thinking-off answer or one cut short,
+  nor for the web app's MCP chats.
+- **The follow-up's logits move slightly:** its prompt is read in other chunks than without the setting (pinned
+  placement, the follow-up's first rows: truncated top-20 KL 0.025-0.027 against 0.003 between two unset runs, top-1
+  the same 92%).
+- The log has a line a pre-read: `[maya] pre-read: N tokens, done after S s (R of M read ahead, P of Q pieces)`, or
+  `stopped by a request`.
+
+2x RX 6900 XT, Maya-XS, `--tp 2` (a layer split), a six-turn chat in Open WebUI's request shape, thinking low, 25 s
+between turns: the next message's first token 3.3-17.9 s unset, 0.4-1.7 s with the setting (9 of 10; the tenth
+5.0 s against 17-18 s, a long answer whose read-ahead was not done in the 25 s); after a client's edit of the
+answer 4.8-5.6 s unset, 1.4-2.0 s with it. Another chat's message 0.5 s after a long answer:
+0.95 s unset, 4.8-5.5 s with it (it waits for a piece). With the timing pick, 2 of 4 server starts with the setting
+read some long follow-ups through windows of 16 (~60 tok/s against ~100); `MAYA_DS4_PROMPT_PICK=length` kept them on
+the chunked pass (0 of 2), at no visible cost unset.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_DS4_PREREAD` | off | `1`: after a thinking answer, the server reads the chat's next turn start (above). OpenAI chat completions; one conversation at a time measured, not `--parallel` |
+| `MAYA_DS4_PREREAD_PIECE` | 256 | tokens a piece of the read-ahead: a request that comes meanwhile waits at most for one piece (~4 s at 256 on the PC above; 128: ~3 s, but the read-ahead of a long answer is not done before the next message); `0`: the whole read in one call |
+
 ## DeepSeek: choosing the drafter GPU group (experimental)
 
 With several GPU groups, the DSpark drafter normally occupies the first group's lead GPU. Set
