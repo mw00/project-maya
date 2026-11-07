@@ -1,5 +1,5 @@
 """tools/ds4/ref_gguf.py - tools/ds4/ref.py's oracle over a GGUF (tools/ds4/pack_gguf.py's pack): the same forward,
-each weight dequantised in torch from the GGUF's own blocks (BF16, Q8_0, MXFP4, MXFP8) - a check of maya-ds4's GGUF
+each weight dequantised from the GGUF's own blocks (including the quantized Engram) - a check of maya-ds4's GGUF
 path that shares none of its code.
 
     python tools/ds4/ref_gguf.py --pack <model>/maya-ds4 --ids 0,671,6102 [--dump out.npz] [--gen 8]
@@ -143,9 +143,27 @@ class Hasher:
         return np.concatenate(out, axis=-1) + self.off[None]
 
 
-def q6k_rows(rows: np.ndarray, name: str) -> np.ndarray:
-    """Engram rows of Q6_K superblocks as F32 (ggml's dequantize_row_q6_K, through gguf-py)."""
-    return gq_values(rows.reshape(-1), "Q6_K", name)
+def engram_row_values(raw: np.ndarray, dt: str, hash_ids: np.ndarray, hd: int, dev, name: str) -> torch.Tensor:
+    """Decode just the requested Engram rows, respecting the table's GGUF type."""
+    layouts = {"MXFP8": (32, 33), "IQ4_NL": (32, 18), "Q5_K": (256, 176), "Q6_K": (256, 210)}
+    if dt not in layouts:
+        raise ValueError(f"{name}: unsupported Engram dtype {dt}")
+    block, size = layouts[dt]
+    if hd <= 0 or hd % block:
+        raise ValueError(f"{name}: Engram row width {hd} must be a positive multiple of {block}")
+    rb = hd // block * size
+    tab = raw.reshape(-1, rb)
+    flat = hash_ids.reshape(-1)
+    order = np.argsort(flat)
+    rows = np.empty((flat.size, rb), np.uint8)
+    rows[order] = tab[flat[order]]
+    if dt == "MXFP8":
+        b = torch.from_numpy(rows).to(dev).view(-1, 33)
+        s = torch.ldexp(torch.ones(1, device=dev), b[:, :1].int() - 127)
+        values = b[:, 1:].contiguous().view(torch.float8_e4m3fn).float() * s
+    else:
+        values = torch.from_numpy(gq_values(rows.reshape(-1), dt, name)).to(dev)
+    return values.reshape(*hash_ids.shape, hd)
 
 
 class RefGguf(R.Ref):
@@ -192,21 +210,10 @@ class RefGguf(R.Ref):
 
     def engram(self, li, x, hash_ids):
         P = "layers.%d.engram." % li
-        T, cols = hash_ids.shape
         hd = self.lay.head_dim
         dt = self.st.t[P + "embed.weight"][0]
-        rb = hd // 256 * 210 if dt == "Q6_K" else hd // 32 * 33        # (a row's bytes: Q6_K or MXFP8 blocks)
-        tab = self.st.raw(P + "embed.weight").reshape(-1, rb)
-        flat = hash_ids.reshape(-1)
-        order = np.argsort(flat)
-        rows = np.empty((flat.size, rb), np.uint8)
-        rows[order] = tab[flat[order]]
-        if dt == "Q6_K":
-            e = torch.from_numpy(q6k_rows(rows, P)).to(self.dev).view(T, cols * hd)
-        else:
-            b = torch.from_numpy(rows).to(self.dev).view(-1, 33)
-            s = torch.ldexp(torch.ones(1, device=self.dev), b[:, :1].int() - 127)
-            e = (b[:, 1:].contiguous().view(torch.float8_e4m3fn).float() * s).view(T, cols * hd)
+        T, cols = hash_ids.shape
+        e = engram_row_values(self.st.raw(P + "embed.weight"), dt, hash_ids, hd, self.dev, P).view(T, cols * hd)
         e = e.to(torch.bfloat16).float()
         kv = e @ self.W(P + "wkv").T
         d, hc = self.dim, self.hc
