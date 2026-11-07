@@ -1772,7 +1772,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
         }
         const double room =
             c.free > used ? (double) Glm5Model::pool_budget((size_t) (c.free - used), (size_t) c.total, i,
-                                                            (size_t) ((double) keep * ssum), (size_t) smax).avail
+                                                            (size_t) ((double) keep * ssum), (size_t) smax, false, c.dev).avail
                           : 0.0;
         Eval ev;
         ev.per = bsum > 0 ? std::min<int64_t>(g.n_expert, (int64_t) (room / bsum)) : 0;

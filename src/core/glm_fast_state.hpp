@@ -30,6 +30,7 @@
 #include <numeric>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef __linux__
 #include <pthread.h>
@@ -388,6 +389,12 @@ inline size_t expert_stride(size_t blob, int gu_type, int d_type) {
 // page cache does, but MemAvailable leaves it out (#89: an ARC of 54 GB after a 95 GB download, MemAvailable 5 GB),
 // so the RAM-free measurements add it.  0 without ZFS and elsewhere.
 int64_t zfs_arc_reclaimable();
+
+// A device's GTT budget and use (Linux, bytes; {0, 0} when unknown): the amdgpu driver's sysfs for the card on
+// this PCI address (mem_info_gtt_total / mem_info_gtt_used).  A unified-memory APU's allocations are GTT into the
+// system's RAM - HIP's own free figure sees only the firmware's small carve-out - so the pool is also capped by
+// what the GTT has left beside the reserve (the desktop, the vision encoder and other programs hold GTT too).
+std::pair<size_t, size_t> gtt_info(int dev);
 
 // --dump-routing (Glm5Model::set_routing_dump): whether a trace file is open, and one route appended to it as
 // Strata's trace record (int32 layer, int32 k, then k int32 expert ids and k float weights), under a lock - the

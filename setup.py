@@ -657,14 +657,18 @@ def pip_install(packages, what):
 
 
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",
+             "gfx1102": "AMD Radeon RX 7600 / 7600 XT (gfx1102)",
              "gfx1200": "AMD Radeon RX 9050 / 9060 XT (gfx1200)",
              "gfx1201": "AMD Radeon RX 9070 / AI PRO R9700 (gfx1201)",
              "gfx1030": "AMD Radeon RX 6800 / 6900 / PRO V620 / W6800 (gfx1030)"}   # when sysfs has no product name
 # Windows without ROCm's hipInfo yet: the architecture from the adapter's PCI device ID (Navi 31, Navi 48, the
 # Strix Halo / Gorgon Halo APU, Navi 21), else from its name ("AMD Radeon(TM) 8060S Graphics", 8050S, 8065S, ...)
-AMD_DEVICE_ARCHS = {"744c": "gfx1100", "7590": "gfx1200", "7550": "gfx1201", "7551": "gfx1201", "1586": "gfx1151",
-                    "73a1": "gfx1030", "73a3": "gfx1030", "73a5": "gfx1030", "73af": "gfx1030", "73bf": "gfx1030"}
+AMD_DEVICE_ARCHS = {"744c": "gfx1100", "747e": "gfx1102", "7480": "gfx1102", "7481": "gfx1102",
+                    "7487": "gfx1102", "748a": "gfx1102", "7590": "gfx1200", "7550": "gfx1201", "7551": "gfx1201",
+                    "1586": "gfx1151", "73a1": "gfx1030", "73a3": "gfx1030", "73a5": "gfx1030", "73af": "gfx1030",
+                    "73bf": "gfx1030"}
 AMD_NAME_ARCHS = ((r"Radeon(?:\s*\(TM\))?\s+80[4-6]\dS", "gfx1151"), (r"RX\s*7900|PRO\s*W7[89]00", "gfx1100"),
+                  (r"RX\s*76[05]0(?:\s*XT)?\b|PRO\s*W7600", "gfx1102"),
                   (r"RX\s*9070|R9700", "gfx1201"), (r"RX\s*90[56]0(?:\s*XT)?\b", "gfx1200"),
                   (r"RX\s*6[89][05]0(?:\s*XT)?\b|PRO\s*V620|PRO\s*W6800", "gfx1030"))   # (not the 6800M / 6800S: Navi 22 / 23)
 
