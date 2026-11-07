@@ -2215,3 +2215,37 @@ untested and refused unless this is set when the setup or `--check` runs (in the
 | Variable | Default | What it does |
 |---|---|---|
 | `MAYA_HIP_ALLOW_ROCM6` | unset (ROCm 6 refused) | `1`: the setup goes on with a ROCm 6.x, with a warning (untested: the build or the engine may fail); the build then takes hipBLAS 2's `HIPBLAS_V2` API and leaves out `hipblasSetWorkspace`, which hipBLAS 2 does not have |
+
+## Native GBNF (DeepSeek)
+
+A DeepSeek engine built with native grammar support advertises `INFO grammar=1 grammar_replay=1`.
+`POST /v1/chat/completions` accepts a GBNF string in `grammar`, `guided_grammar`, or
+`structured_outputs.grammar`. Identical aliases may be sent together; conflicting constraints are a 400.
+`structured_outputs.disable_any_whitespace` is accepted as a boolean compatibility field: an explicit
+GBNF controls its own whitespace, so this field does not rewrite it.
+
+```json
+{"messages":[{"role":"user","content":"Choose A or B"}],
+ "grammar":"root ::= \"A\" | \"B\"",
+ "chat_template_kwargs":{"enable_thinking":false},"max_tokens":16}
+```
+
+The server compiles the grammar with the native `maya-ds4-grammar-check` helper before sending HTTP
+headers. Install that executable beside `maya-ds4`, or set `grammar_checker` in the server's engine
+configuration. The helper uses the engine's `--pack` tokenizer; no model weights or GPU are loaded for
+validation. Missing native support or an invalid grammar returns 400, including for streaming requests.
+The request then constrains native sampling rather than adding an instruction to the prompt. If a grammar
+has no valid continuation during generation, the request reports an error; streaming clients can already
+have received a partial answer before that error.
+
+Each native request has its own compiled state. Fair scheduling resumes it by replaying its generated token
+IDs, including the end-of-thinking trigger when applicable. The loop guard is disabled for constrained
+requests, since its inserted steering text would change the grammar's language. Streaming and nonstreaming
+chat completions use the same native grammar path. Responses API extensions for GBNF are not provided;
+unsupported fields there are rejected. Existing `response_format` behavior is separate.
+
+The native `grammar_hex=1` capability transports temporary grammar paths as UTF-8 hex, so spaces and
+Unicode in the platform's temporary directory remain one protocol field. Older engines use `grammar=`
+only for paths without whitespace or NUL; an unsafe legacy path is rejected explicitly. A host subprocess
+test covers hex paths, parallel routes, replay fields and cancellation ownership with spaces and Unicode.
+This is CPU protocol coverage, not Windows GPU qualification.

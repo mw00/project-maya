@@ -1759,3 +1759,5 @@ if(STRATA_BUILD_TESTS)
     add_subdirectory(tests)
   endif()
 endif()
+
+include(cmake/ds4_grammar.cmake)

@@ -47,3 +47,21 @@ jobs:
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s serve -p "test_*.py" -t .'
       - name: Installer and tools tests
         run: '"$RUNNER_TEMP/venv/bin/python" -m unittest discover -s tools -p "test_*.py"'
+
+  grammar-windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Python packages
+        run: |
+          python -m venv "$RUNNER_TEMP/grammar-venv"
+          "$RUNNER_TEMP/grammar-venv/Scripts/python.exe" -m pip install --quiet numpy jinja2 regex pyyaml tqdm psutil 'jsonschema>=4.18,<5'
+      - name: Grammar API, native paths and subprocess protocol
+        run: '"$RUNNER_TEMP/grammar-venv/Scripts/python.exe" -m unittest serve.test_grammar -v'

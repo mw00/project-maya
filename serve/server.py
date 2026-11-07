@@ -54,6 +54,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
+from serve import structured
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
 from serve import attach  # noqa: E402
 
@@ -369,6 +370,26 @@ def fair_slice_seconds() -> float:
         return max(0.0, float(os.environ.get("STRATA_FAIR_SLICE_S", "0") or 0))
     except ValueError:
         return 0.0
+
+
+@contextlib.contextmanager
+def grammar_file(text, lease=None, proc=None):
+    # Keep the platform temp directory; the native hex-path capability handles spaces and Unicode.
+    fd, path = tempfile.mkstemp(prefix="maya-grammar-", suffix=".gbnf")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(text)
+        yield path
+    finally:
+        def remove():
+            Path(path).unlink(missing_ok=True)
+        if lease is not None and not lease["read"] and proc.poll() is None:
+            def after_exit():
+                proc.wait()
+                remove()
+            threading.Thread(target=after_exit, daemon=True).start()
+        else:
+            remove()
 
 
 class EngineDied(RuntimeError):
@@ -853,6 +874,7 @@ class StrataEngine:
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
+        self.grammar_checker = getattr(self, "grammar_checker", None)  # preserved across restart
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
@@ -1208,7 +1230,8 @@ class StrataEngine:
             # sampler key goes (with only a config's top_p the engine took its sampled path: not deterministic) - but
             # the penalties do: they change the logits greedy picks from (#273: a greedy answer's loops)
             return (" temperature=0" + penalty_keys + think + tune_keys + StrataEngine.projection_key(sampling) +
-                    bias_key + StrataEngine.restore_keys(sampling) + StrataEngine.logprob_key(sampling))
+                    bias_key + StrataEngine.restore_keys(sampling) + StrataEngine.logprob_key(sampling) +
+                    StrataEngine.grammar_keys(sampling))
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
         tp = sampling.get("top_p")
@@ -1227,7 +1250,7 @@ class StrataEngine:
             keys += f" seed={seed}"
         keys += think + tune_keys
         return (keys + StrataEngine.projection_key(sampling) + bias_key + StrataEngine.restore_keys(sampling) +
-                StrataEngine.logprob_key(sampling))
+                StrataEngine.logprob_key(sampling) + StrataEngine.grammar_keys(sampling))
 
     @staticmethod
     def penalty_keys(sampling: dict) -> str:
@@ -1291,7 +1314,62 @@ class StrataEngine:
         on = sampling.get("experimental_speed_projection")
         return f" cvec={int(on)}" if isinstance(on, bool) else ""
 
+    def validate_grammar(self, grammar):
+        """Compile against the native vocabulary before HTTP headers, without starting a model."""
+        exe, args, cwd, _log, env = self.spawn[:5]
+        checker = self.grammar_checker or str(Path(exe).with_name("maya-ds4-grammar-check" + (".exe" if Path(exe).suffix.lower() == ".exe" else "")))
+        pack = next((args[i + 1] for i, arg in enumerate(args[:-1]) if arg == "--pack"), None)
+        if not pack:
+            raise ValueError("grammar: native validation needs the engine's --pack")
+        with grammar_file(grammar) as path:
+            try:
+                result = subprocess.run([checker, "--pack", pack, "--grammar", path], cwd=cwd, env=env,
+                                        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                raise ValueError(f"grammar: native checker unavailable: {exc}") from exc
+        if result.returncode:
+            detail = (result.stderr or result.stdout).strip()[-4096:]
+            raise ValueError("grammar: " + (detail or "native compilation failed"))
+        if "GRAMMAR_OK" not in result.stdout.splitlines():
+            raise ValueError("grammar: native checker returned no GRAMMAR_OK acknowledgement")
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        text = (sampling or {}).get("_grammar_text")
+        if text is None:
+            yield from self._generate_native(ids, max_new, sampling, cancel, embeddings)
+            return
+        # The native parser reads and compiles this file before its first reply. Keep it until
+        # the generator has drained; on a bounded drain timeout with no reply retain it until exit.
+        lease = {"read": True}  # no native reader until the path has passed protocol validation
+        with grammar_file(text, lease, self.proc) as path:
+            smp = {**sampling, "_grammar_path": path, "_grammar_lease": lease,
+                   "_grammar_hex_supported": (getattr(self, "info", None) or {}).get("grammar_hex") == 1}
+            self.grammar_keys(smp)  # reject unsafe legacy paths before submitting any native request
+            lease["read"] = False
+            yield from self._generate_native(ids, max_new, smp, cancel, embeddings)
+
+    @staticmethod
+    def grammar_keys(sampling):
+        path = sampling.get("_grammar_path")
+        if not path:
+            return ""
+        if "\0" in path:
+            raise ValueError("grammar: a native grammar path cannot contain NUL")
+        if sampling.get("_grammar_hex_supported"):
+            keys = " grammar_hex=" + path.encode("utf-8").hex()
+        else:
+            if any(char.isspace() for char in path):
+                raise ValueError("grammar: this engine cannot read a grammar path containing whitespace; update the engine for grammar_hex support")
+            keys = " grammar=" + path
+        after = sampling.get("_grammar_after")
+        if isinstance(after, int):
+            keys += f" grammar_after={after}"
+        prefix = sampling.get("_grammar_prefix")
+        if prefix:
+            keys += " grammar_prefix=" + ",".join(str(int(t)) for t in prefix)
+        return keys
+
+    def _generate_native(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -1340,6 +1418,8 @@ class StrataEngine:
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                if (sampling or {}).get("_grammar_lease") is not None and line and line.startswith(("T ", "PP ", "DONE", "ERR")):
+                    sampling["_grammar_lease"]["read"] = True
                 heard = time.monotonic()
                 stall.clear()
                 if lp_wait is not None and not line.startswith("LP "):
@@ -1380,6 +1460,8 @@ class StrataEngine:
                 elif line.startswith("DONE"):
                     self._parse_done(line)
                     done = True
+                    if self.last.get("finish") == "grammar":
+                        raise ValueError("grammar: no valid token remains in this grammar state")
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -1418,6 +1500,8 @@ class StrataEngine:
                             self._end(why)
                             break
                         continue
+                    if (sampling or {}).get("_grammar_lease") is not None and line and line.startswith(("T ", "PP ", "DONE", "ERR")):
+                        sampling["_grammar_lease"]["read"] = True
                     heard = time.monotonic()
                     stall.clear()
                     if line is None:
@@ -1549,6 +1633,8 @@ class StrataEngine:
                 if line is None:
                     done = True
                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+                if (sampling or {}).get("_grammar_lease") is not None and line and line.startswith(("T ", "PP ", "DONE", "ERR")):
+                    sampling["_grammar_lease"]["read"] = True
                 heard = time.monotonic()
                 stall.clear()
                 f = line.split()
@@ -1578,6 +1664,8 @@ class StrataEngine:
                 elif line.startswith("DONE "):
                     self._parse_done("DONE " + line.split(None, 2)[2])
                     done = True
+                    if self.last.get("finish") == "grammar":
+                        raise ValueError("grammar: no valid token remains in this grammar state")
                     return
                 elif line.startswith("ERR "):
                     done = True
@@ -2407,6 +2495,22 @@ class Service:
         """A request's sampling fields and logit_bias, checked (a ValueError is the 400) and kept in the form the engine
         line takes, before anything is sent.  A logit_bias needs an engine that applies it (INFO logit_bias=1): an
         older one would answer as if it had none."""
+        # Protocol paths/replay are private: never trust client-supplied internal fields.
+        req.pop("grammar_hex", None)  # public clients cannot supply native file paths
+        for key in list(req):
+            if key.startswith("_grammar_"):
+                req.pop(key)
+        outputs = req.get("structured_outputs")
+        has_grammar = req.get("grammar") is not None or req.get("guided_grammar") is not None or (
+            isinstance(outputs, dict) and outputs.get("grammar") is not None
+        )
+        if has_grammar:
+            grammar, _fmt = structured.normalize_request(req)
+            info = getattr(self.engine, "info", None) or {}
+            if info.get("grammar") != 1 or info.get("grammar_replay") != 1:
+                raise ValueError("grammar: this engine does not support native GBNF with replay")
+            self.engine.validate_grammar(grammar)
+            req["_grammar_text"] = grammar
         check_request_sampling(req)
         bias = logit_bias_of(req.get("logit_bias"), len(getattr(self.tok, "tokens", None) or ()) or None)
         if bias and (getattr(self.engine, "info", None) or {}).get("logit_bias") != 1:
@@ -3708,6 +3812,8 @@ class Service:
     def _resumed_sampling(sampling, produced):
         """The sampling for an engine call that goes on after `produced`: the thinking budget counts from where it got
         to (and is gone once the thinking was closed)."""
+        if (sampling or {}).get("_grammar_text") is not None:
+            sampling = {**sampling, "_grammar_prefix": list(produced)}
         tb = (sampling or {}).get("_think_budget")
         if not (isinstance(tb, int) and tb > 0):
             return sampling
@@ -3821,6 +3927,8 @@ class Service:
 
     def _loop_guard_on(self, sampling) -> bool:
         """The loop guard for this request: its own "loop_guard" when it sends one, else the server's."""
+        if (sampling or {}).get("_grammar_text") is not None:
+            return False
         own = (sampling or {}).get("loop_guard")
         return own if isinstance(own, bool) else bool(self.loop_guard)
 
@@ -4220,6 +4328,8 @@ class Service:
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
+                if (sampling or {}).get("_grammar_text") is not None and in_think:
+                    sampling = {**sampling, "_grammar_after": self.think_end_id}
                 budgeted = in_think and self.think_budget > 0   # (0 = no budget: the end token is still tracked)
                 # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
@@ -7015,6 +7125,7 @@ def main() -> int:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
         t0 = time.time()
         engine = StrataEngine(cfg["exe"], engine_args(cfg), cwd=cfg.get("cwd"), log=cfg.get("log"), env=engine_env)
+        engine.grammar_checker = cfg.get("grammar_checker")
         engine.load_s = round(time.time() - t0, 1)      # (the dashboard's estimate of a reload: this start's time)
         warn_tight_ram(engine.info.get("arena_mib"))
         if vision is None and not vcfg and engine.info.get("vision") == "ds4":
