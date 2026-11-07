@@ -10,8 +10,8 @@
 //    layer), never one a window is computing (pinned) or one still being read
 //  - reads queue by kind: a demand read (the CPU lane waits for it) always before a guess (the lookahead's); a guess
 //    asked for becomes a demand read, and a guess still queued once the token is past its layer is dropped unread
-//  - the slots come in chunks as they are first needed, while `grow_room` of RAM stays free beside them; watch() gives
-//    chunks back from the end when the free RAM falls below `floor`
+//  - layout-sized matrices reuse spans of shared backing chunks; fixed slots remain available as a fallback
+//  - watch() releases backing below `floor`, never a pinned or in-flight slot
 //  - put(): an expert whose bytes are in memory already (one the VRAM cache gives back to the CPU lane) copied into a
 //    slot - no read
 // Host code only (no GPU runtime): tests/ds4_store_test.cpp runs it over a file of fake experts.
@@ -29,6 +29,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -73,6 +74,7 @@ public:
         size_t budget = 0;                     // bytes at most (whole slots)
         size_t floor = (size_t) 4 << 30;       // free RAM below this: watch() gives chunks back
         size_t grow_room = (size_t) 8 << 30;   // a new chunk only while this much RAM stays free beside it
+        bool sized_slots = true;               // false keeps the legacy fixed-slot allocator
         size_t chunk_slots = 32;               // slots a chunk (the unit of growing and of giving back)
         Policy policy = kLru;
         int readers = 8;                       // reading threads
@@ -90,7 +92,7 @@ public:
     struct Counts {
         std::atomic<int64_t> hits{0}, misses{0}, no_slot{0}, guesses{0}, guess_used{0}, guess_wasted{0}, cancelled{0},
             evicted{0}, failed{0}, put{0}, bytes{0}, direct_bytes{0}, wait_ns{0}, shrunk{0};
-        std::atomic<int64_t> direct_off{0};   // files whose unbuffered reads failed where buffered ones worked
+        std::atomic<int64_t> grown{0}, direct_off{0};   // backing chunks allocated; files that refused direct reads
     };
     /// a window's experts of one layer from begin() to release(): st[i] kHit (in its slot, pinned - mat() reads it),
     /// kMiss (its read under way, the slot pinned), kNone (no slot to be had, or its read failed: read it in place)
@@ -120,7 +122,11 @@ public:
         }
         q_cv_.notify_all();
         for (std::thread& t : th_) t.join();   // (a read under way ends first: it writes into a chunk)
-        for (const auto& c : chunks_) os::anon_free(c.first, c.second);
+        if (cfg_.sized_slots) {
+            for (const auto& c : backing_) os::anon_free(c.base, c.bytes);
+        } else {
+            for (const auto& c : chunks_) os::anon_free(c.first, c.second);
+        }
     }
 
     /// a slot's bytes for these layers, and where matrix r's region starts in it (tr): each region holds the aligned
@@ -152,7 +158,20 @@ public:
             err = "the RAM store: no layer of experts to hold";
             return false;
         }
-        nmax_ = cfg_.budget / slot_bytes_;
+        size_t smallest = slot_bytes_, total = 0;
+        layout_for_layer_.assign(geo_.size(), -1);
+        for (size_t l = 0; l < geo_.size(); ++l) {
+            if (geo_[l].n_exp <= 0) continue;
+            Layout layout;
+            layout.bytes = slot_layout({geo_[l]}, layout.tr);
+            size_t k = 0;
+            while (k < layouts_.size() && !layout.same(layouts_[k])) ++k;
+            if (k == layouts_.size()) layouts_.push_back(layout);
+            layout_for_layer_[l] = (int) k;
+            smallest = std::min(smallest, layout.bytes);
+            total += (size_t) geo_[l].n_exp;
+        }
+        nmax_ = cfg_.sized_slots ? std::min(total, cfg_.budget / smallest) : cfg_.budget / slot_bytes_;
         if (nmax_ == 0) {
             err = "the RAM store: its size holds no expert";
             return false;
@@ -173,10 +192,23 @@ public:
     }
 
     size_t slot_bytes() const { return slot_bytes_; }
-    size_t slots_max() const { return nmax_; }
-    size_t slots_now() const {   // (allocated)
+    size_t slots_max() const { return nmax_; }   // metadata ceiling; sized slots also share the byte budget
+    size_t size_classes() const { return layouts_.size(); }
+    size_t payload_bytes() const {
         std::lock_guard<std::mutex> lk(mu_);
-        return nalloc_;
+        return payload_bytes_;
+    }
+    size_t allocated_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return cfg_.sized_slots ? mapped_bytes_ : nalloc_ * slot_bytes_;
+    }
+    size_t active_bytes() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return cfg_.sized_slots ? active_bytes_ : nalloc_ * slot_bytes_;
+    }
+    size_t slots_now() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return cfg_.sized_slots ? mapped_slots_ : nalloc_;
     }
     size_t held() const {   // (slots holding an expert, or reading one)
         std::lock_guard<std::mutex> lk(mu_);
@@ -227,7 +259,7 @@ public:
                 continue;
             }
             counts_.misses.fetch_add(1, std::memory_order_relaxed);
-            s = take_slot(true);
+            s = take_slot(layer, true);
             if (s < 0) {
                 counts_.no_slot.fetch_add(1, std::memory_order_relaxed);
                 continue;
@@ -291,7 +323,7 @@ public:
     /// expert i's matrix r in its slot (kHit), else null (read it in place)
     const uint8_t* mat(const Hold& h, int i, int r) const {
         if (h.st[(size_t) i] != kHit) return nullptr;
-        return slots_[(size_t) h.slot[(size_t) i]].base + tr_[r] + lead(h.layer, h.e[(size_t) i], r);
+        return matrix(slots_[(size_t) h.slot[(size_t) i]], r) + lead(h.layer, h.e[(size_t) i], r);
     }
     void release(Hold& h) {
         if (!covers(h.layer)) return;
@@ -310,7 +342,7 @@ public:
         if (!covers(layer) || e < 0 || e >= geo_[(size_t) layer].n_exp) return false;
         std::lock_guard<std::mutex> lk(mu_);
         if (where_[(size_t) layer][(size_t) e] >= 0) return false;
-        const int s = take_slot(true);
+        const int s = take_slot(layer, true);
         if (s < 0) return false;
         fill(s, layer, e, true, 0, false);
         counts_.guesses.fetch_add(1, std::memory_order_relaxed);
@@ -357,39 +389,47 @@ public:
     /// returns once they are in: the first ones that fit, `leave` slots left over.  Each later one is put before the
     /// earlier ones in the policy's order, so the coldest is the first to give way.  Returns how many were read.
     size_t preload(const std::vector<std::pair<int, int>>& list, size_t leave) {
-        std::vector<int> mine;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            const size_t room = nmax_ > leave ? nmax_ - leave : 0;
-            for (size_t k = 0; k < list.size() && mine.size() < room; ++k) {
-                const int layer = list[k].first, e = list[k].second;
-                if (!covers(layer) || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
-                if (where_[(size_t) layer][(size_t) e] >= 0) continue;
-                const int s = take_slot(false);
-                if (s < 0) break;
-                fill(s, layer, e, false, 0, true);
-                mine.push_back(s);
-            }
-        }
-        for (;;) {
-            uint64_t seen;
+        const size_t room = nmax_ > leave ? nmax_ - leave : 0;
+        const size_t reserve = leave > cfg_.budget / slot_bytes_ ? cfg_.budget : leave * slot_bytes_;
+        // Bound pending reads so headroom checks include the preceding batch's committed pages.
+        const size_t batch = cfg_.sized_slots ? chunk_slots_ : std::max<size_t>(1, room);
+        size_t cursor = 0, queued = 0, read = 0;
+        bool full = false;
+        while (cursor < list.size() && queued < room && !full) {
+            std::vector<int> mine;
             {
-                std::lock_guard<std::mutex> lk(done_mu_);
-                seen = done_;
+                std::lock_guard<std::mutex> lk(mu_);
+                while (cursor < list.size() && queued < room && mine.size() < batch) {
+                    const auto item = list[cursor++];
+                    const int layer = item.first, e = item.second;
+                    if (!covers(layer) || e < 0 || e >= geo_[(size_t) layer].n_exp) continue;
+                    if (where_[(size_t) layer][(size_t) e] >= 0) continue;
+                    const int s = take_slot(layer, false, reserve);
+                    if (s < 0) { full = true; break; }
+                    fill(s, layer, e, false, 0, true);
+                    mine.push_back(s);
+                    ++queued;
+                }
             }
-            bool busy = false;
-            for (int s : mine) busy = busy || slots_[(size_t) s].left.load(std::memory_order_acquire) > 0;
-            if (!busy) break;
-            std::unique_lock<std::mutex> lk(done_mu_);
-            done_cv_.wait_for(lk, std::chrono::milliseconds(5), [&] { return done_ != seen; });
+            for (;;) {
+                uint64_t seen;
+                {
+                    std::lock_guard<std::mutex> lk(done_mu_);
+                    seen = done_;
+                }
+                bool busy = false;
+                for (int s : mine) busy = busy || slots_[(size_t) s].left.load(std::memory_order_acquire) > 0;
+                if (!busy) break;
+                std::unique_lock<std::mutex> lk(done_mu_);
+                done_cv_.wait_for(lk, std::chrono::milliseconds(5), [&] { return done_ != seen; });
+            }
+            std::lock_guard<std::mutex> lk(mu_);
+            for (int s : mine) {
+                settle(s);
+                read += slots_[(size_t) s].state == kReady ? 1 : 0;
+            }
         }
-        std::lock_guard<std::mutex> lk(mu_);
-        size_t n = 0;
-        for (int s : mine) {
-            settle(s);
-            n += slots_[(size_t) s].state == kReady ? 1 : 0;
-        }
-        return n;
+        return read;
     }
 
     /// An expert whose bytes are in memory already (src[r]: its matrix r) copied into a slot - one given up for it if
@@ -400,11 +440,13 @@ public:
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (where_[(size_t) layer][(size_t) e] >= 0) return false;
-            s = take_slot(true);
+            s = take_slot(layer, true);
             if (s < 0) return false;
             Slot& sp = slots_[(size_t) s];   // (loading, pinned: nothing takes it while the copy runs)
             sp.layer = layer;
             sp.e = e;
+            const Geo& geometry = geo_[(size_t) layer];
+            payload_bytes_ += geometry.bytes[0] + geometry.bytes[1] + geometry.bytes[2];
             sp.pin = 1;
             sp.guess = false;
             sp.state = kLoading;
@@ -414,7 +456,7 @@ public:
             link_back(s);
         }
         const Geo& g = geo_[(size_t) layer];
-        for (int r = 0; r < 3; ++r) std::memcpy(slots_[(size_t) s].base + tr_[r] + lead(layer, e, r), src[r], (size_t) g.bytes[r]);
+        for (int r = 0; r < 3; ++r) std::memcpy(matrix(slots_[(size_t) s], r) + lead(layer, e, r), src[r], (size_t) g.bytes[r]);
         {
             std::lock_guard<std::mutex> lk(mu_);
             Slot& sp = slots_[(size_t) s];
@@ -451,7 +493,7 @@ public:
     }
     const uint8_t* mat_of(int s, int r) const {
         const Slot& sp = slots_[(size_t) s];
-        return sp.base + tr_[r] + lead(sp.layer, sp.e, r);
+        return matrix(sp, r) + lead(sp.layer, sp.e, r);
     }
     void unpin(int s) {
         std::lock_guard<std::mutex> lk(mu_);
@@ -483,7 +525,8 @@ public:
         const size_t cb = chunk_slots_ * slot_bytes_;
         size_t gave = 0;
         if (av < cfg_.floor) {
-            gave = shrink((size_t) ((cfg_.floor - av + cb - 1) / cb));
+            gave = cfg_.sized_slots ? shrink_sized((size_t) (cfg_.floor - av)) :
+                                     shrink((size_t) ((cfg_.floor - av + cb - 1) / cb));
             grow_ok_ = false;
         } else {
             grow_ok_ = av >= (uint64_t) cfg_.grow_room + cb;
@@ -507,7 +550,13 @@ public:
 
 private:
     static constexpr uint8_t kFree = 0, kLoading = 1, kReady = 2;
+    struct Region {
+        uint8_t* base = nullptr;
+        size_t bytes = 0;
+        int chunk = -1;
+    };
     struct Slot {
+        Region region[3];
         uint8_t* base = nullptr;            // (page-aligned; null: its chunk is not allocated)
         int layer = -1, e = -1, pin = 0;
         uint8_t state = kFree;              // (mu_)
@@ -516,6 +565,122 @@ private:
         std::atomic<int> left{0};           // its matrices' reads still to land
         std::atomic<bool> bad{false};       // a read failed
     };
+    struct Layout {
+        size_t tr[3] = {0, 0, 0}, bytes = 0;
+        bool same(const Layout& x) const {
+            return bytes == x.bytes && tr[0] == x.tr[0] && tr[1] == x.tr[1] && tr[2] == x.tr[2];
+        }
+    };
+    uint8_t* matrix(const Slot& s, int r) const { return cfg_.sized_slots ? s.region[r].base : s.base + tr_[r]; }
+    struct Backing {
+        uint8_t* base = nullptr;
+        size_t bytes = 0, unpopulated = 0;
+        std::vector<uint64_t> populated;
+        std::map<size_t, size_t> free;
+        std::map<int, int> owners;
+    };
+    void note_populated(const Slot& slot) {
+        const Geo& g = geo_[(size_t) slot.layer];
+        for (int r = 0; r < 3; ++r) {
+            const Region& region = slot.region[r];
+            Backing& chunk = backing_[(size_t) region.chunk];
+            const size_t at = (size_t) (region.base - chunk.base);
+            size_t page = at / kAlign;
+            const size_t end = (at + lead(slot.layer, slot.e, r) + (size_t) g.bytes[r] + kAlign - 1) / kAlign;
+            while (page < end) {
+                const size_t count = std::min(end - page, 64 - page % 64);
+                const uint64_t mask = (~uint64_t{0} >> (64 - count)) << (page % 64);
+                uint64_t fresh = mask & ~chunk.populated[page / 64];
+                size_t bytes = 0;
+                while (fresh) { fresh &= fresh - 1; bytes += kAlign; }
+                chunk.populated[page / 64] |= mask;
+                chunk.unpopulated -= bytes;
+                unpopulated_bytes_ -= bytes;
+                page += count;
+            }
+        }
+    }
+    void release_regions(int id) {
+        Slot& slot = slots_[(size_t) id];
+        for (auto& region : slot.region) {
+            if (!region.base) continue;
+            Backing& chunk = backing_[(size_t) region.chunk];
+            size_t at = (size_t) (region.base - chunk.base), bytes = region.bytes;
+            auto next = chunk.free.lower_bound(at);
+            if (next != chunk.free.begin()) {
+                auto prev = std::prev(next);
+                if (prev->first + prev->second == at) {
+                    at = prev->first;
+                    bytes += prev->second;
+                    chunk.free.erase(prev);
+                }
+            }
+            if (next != chunk.free.end() && at + bytes == next->first) {
+                bytes += next->second;
+                chunk.free.erase(next);
+            }
+            chunk.free.emplace(at, bytes);
+            auto owner = chunk.owners.find(id);
+            if (--owner->second == 0) chunk.owners.erase(owner);
+            active_bytes_ -= region.bytes;
+            region = Region{};
+        }
+    }
+    void release_backing(Backing& chunk) {
+        os::anon_free(chunk.base, chunk.bytes);
+        mapped_bytes_ -= chunk.bytes;
+        unpopulated_bytes_ -= chunk.unpopulated;
+        chunk = Backing{};
+        counts_.shrunk.fetch_add(1, std::memory_order_relaxed);
+    }
+    bool grow_backing(size_t need, size_t expert_bytes) {
+        uint64_t avail = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
+        if (avail != ~uint64_t{0}) avail = avail > unpopulated_bytes_ ? avail - unpopulated_bytes_ : 0;
+        const size_t remaining = cfg_.budget - mapped_bytes_;
+        size_t bytes = std::min(remaining, expert_bytes > cfg_.budget / chunk_slots_
+                               ? cfg_.budget : expert_bytes * chunk_slots_);
+        if (remaining - bytes < bytes) bytes = remaining;
+        if (avail != ~uint64_t{0}) bytes = (size_t) std::min<uint64_t>(bytes, avail > cfg_.grow_room ? avail - cfg_.grow_room : 0);
+        bytes -= bytes % kAlign;
+        if (bytes < need) return false;
+        uint8_t* base = (uint8_t*) os::anon_alloc(bytes, -1, 1);
+        if (!base) return false;
+        size_t index = 0;
+        while (index < backing_.size() && backing_[index].base) ++index;
+        if (index == backing_.size()) backing_.emplace_back();
+        Backing& chunk = backing_[index];
+        chunk.base = base;
+        chunk.bytes = bytes;
+        chunk.unpopulated = bytes;
+        chunk.populated.resize((bytes / kAlign + 63) / 64, 0);
+        chunk.free.emplace(0, bytes);
+        mapped_bytes_ += bytes;
+        unpopulated_bytes_ += bytes;
+        counts_.grown.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    bool take_region(int id, int r, size_t bytes, size_t expert_bytes) {
+        for (;;) {
+            int best = -1;
+            size_t at = 0, room = ~size_t{0};
+            for (size_t k = 0; k < backing_.size() && room != bytes; ++k)
+                for (const auto& span : backing_[k].free)
+                    if (span.second >= bytes && span.second < room) {
+                        best = (int) k; at = span.first; room = span.second;
+                        if (room == bytes) break;
+                    }
+            if (best >= 0) {
+                Backing& chunk = backing_[(size_t) best];
+                chunk.free.erase(at);
+                if (room > bytes) chunk.free.emplace(at + bytes, room - bytes);
+                ++chunk.owners[id];
+                slots_[(size_t) id].region[r] = {chunk.base + at, bytes, best};
+                active_bytes_ += bytes;
+                return true;
+            }
+            if (!grow_backing(bytes, expert_bytes)) return false;
+        }
+    }
     struct Job {
         int slot = -1, layer = -1, e = -1, r = 0, file = -1;
         uint64_t off = 0, len = 0;
@@ -558,10 +723,16 @@ private:
         if (sp.layer >= 0 && sp.e >= 0 && where_[(size_t) sp.layer][(size_t) sp.e] == s)
             where_[(size_t) sp.layer][(size_t) sp.e] = -1;
         unlink(s);
+        const Geo& geometry = geo_[(size_t) sp.layer];
+        payload_bytes_ -= geometry.bytes[0] + geometry.bytes[1] + geometry.bytes[2];
         sp.layer = sp.e = -1;
         sp.pin = 0;
         sp.guess = false;
         sp.state = kFree;
+        if (cfg_.sized_slots) {
+            release_regions(s);
+            --mapped_slots_;
+        }
         free_.push_back(s);
     }
     // a slot whose reads have all landed: read (whole) or empty again (a read failed)
@@ -569,6 +740,7 @@ private:
         Slot& sp = slots_[(size_t) s];
         if (sp.state != kLoading || sp.left.load(std::memory_order_acquire) > 0) return;
         if (!sp.bad.load(std::memory_order_acquire)) {
+            if (cfg_.sized_slots) note_populated(sp);
             sp.state = kReady;
             return;
         }
@@ -597,6 +769,8 @@ private:
         Slot& sp = slots_[(size_t) s];
         sp.layer = layer;
         sp.e = e;
+        const Geo& geometry = geo_[(size_t) layer];
+        payload_bytes_ += geometry.bytes[0] + geometry.bytes[1] + geometry.bytes[2];
         sp.pin = pin;
         sp.guess = guess;
         sp.state = kLoading;
@@ -617,7 +791,7 @@ private:
                 j.file = g.file[r];
                 j.off = g.off[r] + (uint64_t) e * g.stride[r];
                 j.len = g.bytes[r];
-                j.dst = sp.base + tr_[r];
+                j.dst = matrix(sp, r);
                 j.guess = guess;
                 (guess ? guess_q_ : demand_q_).push_back(j);
             }
@@ -627,6 +801,13 @@ private:
     }
     // a chunk more, while the budget and the free RAM allow (mu_ held)
     bool grow() {
+        if (cfg_.sized_slots) {
+            const size_t n = std::min(chunk_slots_, nmax_ - nalloc_);
+            if (!n) return false;
+            for (size_t i = n; i-- > 0;) free_.push_back((int) (nalloc_ + i));
+            nalloc_ += n;
+            return true;
+        }
         if (!grow_ok_ || nalloc_ >= nmax_) return false;
         const size_t n = std::min(chunk_slots_, nmax_ - nalloc_), bytes = n * slot_bytes_;
         const uint64_t av = cfg_.ram_avail ? cfg_.ram_avail() : ~uint64_t{0};
@@ -640,6 +821,7 @@ private:
             return false;
         }
         chunks_.push_back({p, bytes});
+        counts_.grown.fetch_add(1, std::memory_order_relaxed);
         for (size_t i = n; i-- > 0;) {   // (the lowest first out of free_)
             slots_[nalloc_ + i].base = p + i * slot_bytes_;
             free_.push_back((int) (nalloc_ + i));
@@ -656,8 +838,9 @@ private:
             Slot& sp = slots_[(size_t) s];
             const int nx = sp.next;
             if (sp.state == kLoading) {
+                const size_t before = free_.size();
                 settle(s);
-                if (!free_.empty()) return -1;
+                if (free_.size() > before) return -1;
             }
             if (sp.state == kReady && sp.pin == 0) {
                 if (cfg_.policy == kLru) return s;
@@ -672,7 +855,8 @@ private:
         return best;
     }
     // a slot for a new expert: a free one, a new chunk's, or (evict) one given up (mu_ held); -1: none
-    int take_slot(bool evict) {
+    int take_slot(int layer, bool evict, size_t reserve = 0) {
+        if (cfg_.sized_slots) return take_sized_slot(layer, evict, reserve);
         if (free_.empty()) grow();
         if (free_.empty() && evict) {
             const int v = victim();
@@ -686,6 +870,84 @@ private:
         const int s = free_.back();
         free_.pop_back();
         return s;
+    }
+    int take_sized_slot(int layer, bool evict, size_t reserve) {
+        const Layout& layout = layouts_[(size_t) layout_for_layer_[(size_t) layer]];
+        const size_t budget = cfg_.budget - reserve;
+        if (layout.bytes > budget) return -1;
+        bool repacked = false;
+        for (;;) {
+            if (free_.empty()) grow();
+            if (!free_.empty() && active_bytes_ <= budget - layout.bytes) {
+                const int id = free_.back();
+                bool complete = true;
+                int order[3] = {0, 1, 2};
+                const size_t sizes[3] = {layout.tr[1], layout.tr[2] - layout.tr[1], layout.bytes - layout.tr[2]};
+                std::sort(order, order + 3, [&](int a, int b) { return sizes[a] > sizes[b]; });
+                for (int r : order) {
+                    const size_t bytes = (r < 2 ? layout.tr[r + 1] : layout.bytes) - layout.tr[r];
+                    if (!take_region(id, r, bytes, layout.bytes)) { complete = false; break; }
+                }
+                if (complete) {
+                    free_.pop_back();
+                    ++mapped_slots_;
+                    return id;
+                }
+                release_regions(id);
+                if (!repacked) {
+                    repacked = true;
+                    bool released = false;
+                    for (auto& chunk : backing_)
+                        if (chunk.base && chunk.owners.empty()) {
+                            release_backing(chunk);
+                            released = true;
+                        }
+                    if (released) continue;
+                }
+            }
+            if (!evict) return -1;
+            const size_t before = free_.size();
+            const int v = victim();
+            if (v < 0) {
+                if (free_.size() > before) continue;
+                return -1;
+            }
+            if (slots_[(size_t) v].guess) counts_.guess_wasted.fetch_add(1, std::memory_order_relaxed);
+            counts_.evicted.fetch_add(1, std::memory_order_relaxed);
+            drop(v);
+        }
+    }
+    size_t shrink_sized(size_t bytes) {
+        size_t released = 0, chunks = 0;
+        auto release_empty = [&] {
+            for (size_t end = backing_.size(); end > 0 && released < bytes;) {
+                Backing& chunk = backing_[--end];
+                if (!chunk.base || !chunk.owners.empty()) continue;
+                released += chunk.bytes - chunk.unpopulated;
+                release_backing(chunk);
+                ++chunks;
+            }
+        };
+        release_empty();
+        for (size_t end = backing_.size(); end > 0 && released < bytes;) {
+            Backing& chunk = backing_[--end];
+            if (!chunk.base) continue;
+            std::vector<int> owners;
+            for (const auto& owner : chunk.owners) owners.push_back(owner.first);
+            bool busy = false;
+            for (int id : owners) {
+                settle(id);
+                busy = busy || slots_[(size_t) id].state == kLoading || slots_[(size_t) id].pin > 0;
+            }
+            if (busy) continue;
+            for (int id : owners)
+                if (slots_[(size_t) id].state != kFree) {
+                    counts_.evicted.fetch_add(1, std::memory_order_relaxed);
+                    drop(id);
+                }
+            release_empty();
+        }
+        return chunks;
     }
     // up to `want` chunks given back from the end (mu_ held)
     size_t shrink(size_t want) {
@@ -778,6 +1040,11 @@ private:
         for (os::fd_t f : own) os::close_fd(f);
     }
 
+    std::vector<Layout> layouts_;
+    std::vector<int> layout_for_layer_;
+    std::vector<Backing> backing_;
+    size_t mapped_bytes_ = 0, active_bytes_ = 0, payload_bytes_ = 0, unpopulated_bytes_ = 0;
+    size_t mapped_slots_ = 0;
     Cfg cfg_;
     std::vector<Geo> geo_;
     Files files_;

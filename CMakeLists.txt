@@ -1746,7 +1746,7 @@ if(STRATA_BUILD_TESTS)
   # directory (~1 MB, removed): reads, where they land, eviction, the read queue, giving RAM back, preload, the miss
   # split's order, put - host code only, no GPU
   add_executable(ds4_store_test tests/ds4_store_test.cpp)
-  target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4)
+  target_include_directories(ds4_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/ds4 ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(ds4_store_test PRIVATE strata_warnings Threads::Threads)
   add_test(NAME ds4_store_test COMMAND ds4_store_test ${CMAKE_CURRENT_BINARY_DIR})
   set_tests_properties(ds4_store_test PROPERTIES TIMEOUT 120)
