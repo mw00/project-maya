@@ -251,6 +251,26 @@ what you changed there):
 One card streams nearly every expert over PCIe for each chunk, so fewer, larger chunks pay off on long prompts. On a
 split, a prompt that fits one chunk runs the cards one after the other, while two or more keep both busy.
 
+## GLM: projecting a direction out (`MAYA_GLM_ABLATE`)
+
+`MAYA_GLM_ABLATE FILE` removes the directions in FILE from the GLM fast path's residual writes; the pack is not changed,
+and FILE is raw float32. Outputs mode (the default): K orthonormal directions of `n_embd` values each - the token
+embedding and every block's output (the mixer's and the FFN's) lose their component along them before the mHC write, and
+since the streams are only linear mixes of those rows, every stream stays orthogonal to the directions: the effect of
+orthogonalizing every matrix that writes into the stream, with nothing requantized. Per-layer mode
+(`MAYA_GLM_ABLATE_LAYERS=<n_layers>`): `n_layers * K * n_embd` values, layer l's own directions; a layer whose
+directions are all zero is not steered, and after its FFN write both operands of that write lose their components along
+its directions. The use it is written for is abliteration (r a refusal direction), as DeepSeek's `--ablate`; the NextN
+draft block is left alone (a draft only has to be a good guess). It is the same operation as exllamav3's `EXL3_CVEC`
+hook after each block. Off unless the variable is set; the load prints one `glm ablate:` line with the values, their
+norm and the scale, and a missing or wrong-width file leaves the stock model running.
+
+| Setting | Default | |
+| --- | --- | --- |
+| `MAYA_GLM_ABLATE FILE` | unset (off) | a raw float32 file: K x `n_embd` values in outputs mode, `n_layers` x K x `n_embd` with `MAYA_GLM_ABLATE_LAYERS` |
+| `MAYA_GLM_ABLATE_SCALE F` | 1 | s in `x - s (x . v) v`; 1 removes the component along v, above 1 over-projects |
+| `MAYA_GLM_ABLATE_LAYERS N` | unset (outputs mode) | per-layer mode: N layers, layer l's own directions (all zero = that layer is not steered) |
+
 ## The expert pool's size
 
 What each GPU's VRAM holds besides the model's dense weights, its context state and the drafter goes to experts (the
