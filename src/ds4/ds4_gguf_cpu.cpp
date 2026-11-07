@@ -208,9 +208,13 @@ void rows_q_scalar(const uint8_t* w, size_t rb, int k, int r0, int r1, const voi
     }
 }
 
+#if defined(MX_X86)
+#include "ds4_mx_ssse3.inc"
+#endif
+
 // ---- which tiers this CPU runs
 struct Cpu {
-    bool avx2 = false, vnni256 = false, avx512 = false, vnni512 = false, vbmi = false, bmi2 = false;
+    bool ssse3 = false, avx2 = false, vnni256 = false, avx512 = false, vnni512 = false, vbmi = false, bmi2 = false;
 };
 Cpu detect() {
     Cpu c;
@@ -227,10 +231,11 @@ Cpu detect() {
     };
     cpuid(0, 0);
     const unsigned max_leaf = r[0];
-    if (max_leaf < 7) return c;
+    if (max_leaf < 1) return c;
     cpuid(1, 0);
+    c.ssse3 = (r[2] >> 9) & 1u;   // XMM only: no AVX, OSXSAVE or hardware FMA required
     const bool fma = (r[2] >> 12) & 1u, osxsave = (r[2] >> 27) & 1u, avx = (r[2] >> 28) & 1u;
-    if (!fma || !osxsave || !avx) return c;
+    if (max_leaf < 7 || !fma || !osxsave || !avx) return c;
 #if defined(_MSC_VER)
     const unsigned long long xcr0 = _xgetbv(0);
 #else
@@ -271,9 +276,14 @@ int pick_tier() {
                 return t;
             }
     std::vector<int> cand;
-    for (int t = 1; t < kMxTiers; ++t)
+    for (int t = 1; t < kMxTiers; ++t) {
+        // Preserve the AVX2+ auto-selection; SSSE3 is available there by explicit request.
+        if (t == kMxSsse3 && cpu().avx2) continue;
         if (mx_tier_ok(t)) cand.push_back(t);
+    }
     if (cand.empty()) return kMxScalar;
+    // On pre-AVX2 CPUs measure scalar too instead of assuming SSSE3 always wins.
+    if (cand.size() == 1 && cand[0] == kMxSsse3) cand.insert(cand.begin(), kMxScalar);
     if (cand.size() == 1) return cand[0];
     return measure_tier(cand);
 }
@@ -348,6 +358,7 @@ void mx_cpu_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const float
 bool mx_tier_ok(int t) {
     switch (t) {
         case kMxScalar: return true;
+        case kMxSsse3: return cpu().ssse3;
         case kMxAvx2: return cpu().avx2;
 #if defined(MX_AVXVNNI)
         case kMxAvxVnni: return cpu().vnni256;
@@ -360,6 +371,7 @@ bool mx_tier_ok(int t) {
 const char* mx_tier_name(int t) {
     switch (t) {
         case kMxScalar: return "scalar";
+        case kMxSsse3: return "ssse3";
         case kMxAvx2: return "avx2";
         case kMxAvxVnni: return "avxvnni";
         case kMxAvx512: return "avx512";
@@ -390,10 +402,12 @@ float mx_act_scale(const void* act, int k, int b) { return act_d((const uint8_t*
 
 void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
                   float* const* y, int pf) {
-    if (k % 256 != 0 || !mx_tier_ok(t)) t = kMxScalar;   // (the vector tiers take a group of 8 blocks a step)
+    // SSSE3 handles partial groups; AVX2+ takes eight blocks a step.
+    if (!mx_tier_ok(t) || (t != kMxSsse3 && k % 256 != 0)) t = kMxScalar;
     const float* tb = e8().v;
 #if defined(MX_X86)
     switch (t) {
+        case kMxSsse3: return rows_ssse3(w, rb, k, r0, r1, act, n, y, tb, pf);
         case kMxAvx2: return mx_avx2::rows(w, rb, k, r0, r1, act, n, y, tb, pf);
 #if defined(MX_AVXVNNI)
         case kMxAvxVnni: return mx_avxvnni::rows(w, rb, k, r0, r1, act, n, y, tb, pf);

@@ -1141,6 +1141,15 @@ A small model-free regression test is available as `python tools/test_ds4_engram
 It checks file/RAM byte agreement, reads after unlink, split FP8 scales, MXFP8 extraction, bounds, and failure when
 the memlock limit is zero. Run it as an ordinary user without `CAP_IPC_LOCK`.
 
+## DeepSeek: MXFP4 on pre-AVX2 CPUs
+
+MXFP4 experts can use the `ssse3` CPU tier (Intel Core 2 and later, including Xeon E5 v2): 128-bit integer
+shuffles and dot products, without requiring SSE4.1, AVX2 or hardware FMA. Activation quantization, the fused
+floating-point accumulation and the scalar tier's addition order are preserved, so the outputs are bit-identical.
+On a CPU without the AVX2/FMA tier the start measures scalar against SSSE3 and keeps the faster one. The AVX2+
+auto-selection is unchanged. `DS4_MX_TIER=ssse3` or `DS4_MX_TIER=scalar` selects one manually (only where supported).
+These are read at engine startup; changing the environment does not switch a loaded engine's tier.
+
 ## DeepSeek: the CPU lane's threads
 
 DeepSeek's engine computes the routed experts that are not in VRAM on the CPU (the CPU lane), a thread per physical
