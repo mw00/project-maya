@@ -2135,9 +2135,13 @@ CPU, and the engine's log says why. `--no-vision`, or Images off on the Models p
 **Where the experts live.** The most-used experts go to VRAM (`--expert-cache auto`: the free VRAM less the reserve).
 When this PC's RAM cannot hold all the others, the engine reads them straight from the GGUF: the next-most-used are
 copied into RAM, as many as the available RAM allows less 12% of it (at least 6 GB) for the system and the page cache,
-and the rest are read from the file when they are routed (from the page cache, or the SSD). The 52 GB n-gram table is
-always read from the SSD row by row and never enters RAM. With about 84 GB of VRAM and RAM together every expert stays
-in memory.
+and the rest are read from the file when they are routed (from the page cache, or the SSD). With direct I/O, n-gram
+rows are read without the page cache; with mmap, the OS can keep table pages in RAM. With about 84 GB of VRAM and RAM
+together every expert stays in memory.
+
+The Qwen n-gram table can also be a Q8_0 `per_layer_token_embd.weight` GGUF shard. Point `--ple-gguf` at that
+shard and use `--ple-io mmap`; Q8_0 direct I/O is not supported and is rejected at startup. Q8_0 uses about
+54.4 GB for the table, compared with about 28.8 GB for IQ4_NL. Select a table from the same model.
 
 **Defaults from the model card**: temperature 1.0, top-p 0.95, top-k 20 (the GGUF's `general.sampling`). Its template
 always thinks; its reasoning effort is the thinking level:
