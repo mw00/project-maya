@@ -60,7 +60,7 @@ from serve import attach  # noqa: E402
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
                             EFFORT_WORDS, QWEN_EFFORT, anthropic_to_messages, config_effort, deepseek_effort_kwargs,
-                            deepseek_images,
+                            deepseek_images, deepseek_keep_thinking,
                             effort_kwargs,
                             effort_level, effort_name, literal_tags, mark_literals, media_of, openai_to_messages,
                             unmark_literals, LiteralMemo)
@@ -759,9 +759,11 @@ def preread_piece(env=None) -> int:
 
 def preread_applies(messages, tools) -> bool:
     """False for a client that sends the answers' reasoning back where DeepSeek's template keeps it (a past turn's
-    reasoning stays only when tools are given): its next prompt already goes on from the engine's own state (the
-    reasoning it wrote), and a read of the answer without it would take the engine off that state."""
-    return not (tools and any(m.get("role") == "assistant" and m.get("reasoning_content") for m in messages or ()))
+    reasoning stays when tools are given, or with MAYA_DS4_KEEP_THINKING=1): its next prompt already goes on from the
+    engine's own state (the reasoning it wrote), and a read of the answer without it would take the engine off that
+    state."""
+    return not ((tools or deepseek_keep_thinking()) and
+                any(m.get("role") == "assistant" and m.get("reasoning_content") for m in messages or ()))
 
 
 def restore_point_settings(env=None) -> tuple[bool, int]:
