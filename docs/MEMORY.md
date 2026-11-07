@@ -30,6 +30,7 @@ and 4 GB for the system, rounded up to the next GB.
 | | UD-IQ1_M (unsloth) | 301 ¹ | 140 | **145** | NVIDIA, AMD |
 | | UD-IQ3_S (unsloth) | 424 ¹ | 263 | **268** | NVIDIA, AMD |
 | | UD-Q8_K_XL (unsloth) | ~470 ¹ | ~306 | **311** | NVIDIA, AMD |
+| | EXL3 2.25 bpw (turboderp, set up by hand) | 361 ¹ | 178 | **183** | NVIDIA, AMD (x86-64) |
 | | EXL3 2.9 bpw (LibertAIDAI) | 414 ¹ | 230 | **235** | NVIDIA, AMD (x86-64) |
 | | EXL3 3.5 bpw (LibertAIDAI) | 461 ¹ | 280 | **285** | NVIDIA, AMD (x86-64) |
 | | Abliterated Mix-128G (orcarouter) | 275 ¹ | 114 | **119** | NVIDIA, AMD |
@@ -51,8 +52,8 @@ and 4 GB for the system, rounded up to the next GB.
 | 16 GB GPU + 48 GB RAM | 64 | Qwen UD-IQ2_XS | GLM Maya-XS / Maya-S24 |
 | 24 GB GPU + 64 GB RAM | 88 | GLM Maya-XS, Qwen UD-IQ2_XS | GLM Maya-S24 / Maya-S, Qwen CYBER-FROST |
 | 32 GB GPU + 96 GB RAM, or a 128 GB Strix/Gorgon Halo | 128 | GLM Maya-S / S24, DeepSeek Maya-XS, MiniMax Maya-XS, DeepSeek Mix-128G, Qwen CYBER-FROST | GLM Maya-M |
-| 48 GB of GPUs + 128 GB RAM | 176 | the above + GLM Maya-M, Maya-L and EXL3 3.05, MiniMax Maya-S, DeepSeek UD-IQ1_M | GLM EXL3 4.05, DeepSeek Maya-S |
-| 64 GB of GPUs + 128 GB RAM, or a 192 GB Gorgon Halo | 192 | the above + GLM EXL3 4.05, DeepSeek Maya-S | MiniMax EXL3, DeepSeek EXL3 2.9 |
+| 48 GB of GPUs + 128 GB RAM | 176 | the above + GLM Maya-M, Maya-L and EXL3 3.05, MiniMax Maya-S, DeepSeek UD-IQ1_M | GLM EXL3 4.05, DeepSeek Maya-S and EXL3 2.25 |
+| 64 GB of GPUs + 128 GB RAM, or a 192 GB Gorgon Halo | 192 | the above + GLM EXL3 4.05, DeepSeek Maya-S and EXL3 2.25 | MiniMax EXL3, DeepSeek EXL3 2.9 |
 | 64+ GB of GPUs + 192 GB RAM | 256+ | the above + DeepSeek EXL3 2.9, Mix-256G, MiniMax EXL3 | DeepSeek UD-IQ3_S, EXL3 3.5 |
 | a large-RAM server (384 GB or more) | 384+ | every model, DeepSeek UD-Q8_K_XL included | - |
 
