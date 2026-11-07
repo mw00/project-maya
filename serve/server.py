@@ -4035,9 +4035,13 @@ class Service:
                     if stopped:
                         break
                     read_to = end
+                # (stopped inside a piece: the engine may still finish it - on a layer split it does, a piece being one
+                #  chunk - so R counts only the pieces done before the stop)
+                under_way = stopped and n > 0 and read_to != ends[n - 1]
                 print(f"[maya] pre-read: {len(ids)} tokens, {'stopped by a request' if stopped else 'done'} "
                       f"after {time.time() - t0:.1f} s ({read_to - shared} of {len(ids) - shared} read ahead, "
-                      f"{n} of {len(ends)} pieces)", flush=True)
+                      f"{f'piece {n} of {len(ends)} under way' if under_way else f'{n} of {len(ends)} pieces'})",
+                      flush=True)
             except (EngineDied, ValueError, OSError) as e:
                 print(f"[maya] pre-read: {e}", flush=True)
             finally:
