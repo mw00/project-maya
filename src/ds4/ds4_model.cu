@@ -775,6 +775,7 @@ struct Chunk {
         int mi = 0;                                    // the device's member index in the layer's group
         const uint8_t* src[3] = {nullptr, nullptr, nullptr};   // where its gate / up / down (its parts) lie once read
         const uint8_t* ram = nullptr;                  // its RAM-tier blob, copied into staging (not pinned there)
+        bool direct = false;                            // DS4_FLOW_DIRECT_NH: 3*NH H2D copies, no staging
         uint8_t* keep = nullptr;                       // (layer-major) its layer-cache slot: what is read kept there
         const uint8_t* hsrc = nullptr;                 // (DS4_FLOW_HELPER) its blob in the helper's pool, copied into
                                                        // staging out of the helper's memory instead of read
@@ -6189,8 +6190,27 @@ struct Model::Impl {
     // member without one (a scratch flow_down_bytes did not give it) fails, nothing enqueued.  Alone (nm 1): each
     // matrix whole, as staged.  dpart (DS4_FLOW_DOWN_PART): staging holds the member's columns of the down already,
     // compacted - one run into the slot, no scratch
+    bool flow_direct_nh(const Layer& l, int e) const {
+        return ds4_env("DS4_FLOW_DIRECT_NH") != nullptr && std::atoi(ds4_env("DS4_FLOW_DIRECT_NH")) != 0 &&
+               copy_mode && cp_dma && NH > 0 && l.lay.fmt == gg::kFmtMXFP4 && l.nm == 1 && !l.ram.empty() &&
+               e >= 0 && e < l.n_exp && l.ram[(size_t) e] >= 0 && mx_n(0) % NH == 0 && mx_n(1) % NH == 0 &&
+               mx_n(2) % NH == 0;
+    }
     bool flow_copy(const Layer& l, int mi, const uint8_t* const* src, bool whole, uint8_t* dst, uint8_t* down,
-                   cudaStream_t s, bool dpart = false) const {
+                   cudaStream_t s, bool dpart = false, bool direct = false, int e = -1) const {
+        if (direct) {
+            if (!flow_direct_nh(l, e)) return false;
+            const int slot = l.ram[(size_t) e];
+            for (int r = 0; r < 3; ++r) {
+                const size_t nb = (size_t) (mx_n(r) / NH) * mx_row_b(l, r);
+                for (int X = 0; X < NH; ++X)
+                    if (cudaMemcpyAsync(dst + l.lay.trellis[r] + (size_t) X * nb,
+                                        ram_part[(size_t) slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r], nb,
+                                        cudaMemcpyHostToDevice, s) != cudaSuccess)
+                        return false;
+            }
+            return true;
+        }
         if (l.nm > 1 && tp_uneven && down == nullptr && !dpart) return false;
         const Layer& x = member(l, mi);
         const x3::ExpertLayout& lay = l.nm > 1 ? x.hlay : l.lay;
@@ -6229,6 +6249,11 @@ struct Model::Impl {
         it.e = e;
         it.v = v;
         const bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
+        if (in_ram && flow_direct_nh(l, e)) {
+            it.direct = true;
+            ++c.it_ram;
+            return;
+        }
         if (in_ram && ram_pinned) {   // (DMA'd from where it lies)
             const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
             for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
@@ -6557,8 +6582,9 @@ struct Model::Impl {
                 if (!flow_helper_same(l, it, err)) return false;
                 ++c.chk_n;
             }
-            // (staging holds the member's gate / up rows only - a read's and, since #377, a copy's)
-            if (!flow_copy(l, it.mi, it.src, false, c.ring + r * c.ring_stride, c.down, c.cs, it.dpart)) {
+            // (staging holds the member's gate / up rows only - a read's and, since #377, a copy's; direct skips it)
+            if (!flow_copy(l, it.mi, it.src, false, c.ring + r * c.ring_stride, c.down, c.cs, it.dpart, it.direct,
+                           it.e)) {
                 const cudaError_t e = cudaGetLastError();   // (none: the uneven split's member without its down scratch)
                 err = "the flow's copy of layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) + ": " +
                       (e != cudaSuccess ? cudaGetErrorString(e) : "no down scratch for the uneven split's member");
