@@ -20,6 +20,7 @@
 #include "ds4_gguf.cuh"
 #if defined(STRATA_USE_HIP)
 #include "ds4_iq.cuh"
+#include "ds4_cache_sub_config.hpp"
 #endif
 #include "ds4_gguf_cpu.hpp"
 #include "ds4_iq.cuh"
@@ -1063,6 +1064,7 @@ constexpr int kMaxL = 64;   // layers (the trunk's and the drafter's) a window p
 // blocks as each layer sees them, the window's hand-off seq
 struct WinPlan {
     bool par = false, async = false;
+    float sub_ratio = 0.0f;   // immutable generation-only policy snapshot (prefill and drafter: zero)
     unsigned win = 0;
     int k = 0;              // (a run of chunks) the chunk's index: its hand-off slot k % 2
     // (a run of chunks) the chunk's rows whose states before them the layers keep: row snap_t[i] into the layers'
@@ -1563,6 +1565,11 @@ struct Model::Impl {
     // the decode path (windows of one): the device publishes each layer's routing into reqs, the service thread
     // answers in resps with the CPU lane's part, and the device waits for the answer only before the expert sum
     Req* reqs = nullptr;
+    cache_sub::Config substitution;
+    SubRoute* sub_routes = nullptr;       // optional sideband, same ring ownership as reqs
+    uint8_t* sub_helper = nullptr;         // window-stable helper membership, shared by every TP member
+    std::atomic<bool> sub_active[kRing]{}; // whether this exact request published original routing
+
     Resp* resps = nullptr;
     // DS4_LANE_PARITY (gg::lane_parity, a GGUF): the CPU lane's low-bit experts in the device's arithmetic
     // (cpu_experts_par), each pick's output its own part of the sum - lane_picks [kRing][lane_nm][kWin][kPicks][dim],
@@ -3533,6 +3540,23 @@ struct Model::Impl {
     // ---- loading
     bool load(const Options& opt, std::string& err) {
         o = opt;
+        if (!cache_sub::parse(ds4_env("DS4_CACHE_SUB_RATIO"), ds4_env("DS4_CACHE_SUB_N"),
+                              ds4_env("DS4_CACHE_SUB_NORM"), ds4_env("DS4_CACHE_SUB_RISK_BUDGET"),
+                              substitution, err)) return false;
+        if (substitution.ratio > 0) {
+            auto enabled = [&](const char* name) {
+                const char* value = ds4_env(name);
+                return value != nullptr && std::atof(value) > 0;
+            };
+            if (sync_decode || disk_skip_w > 0 || ram_skip_w > 0 ||
+                enabled("DS4_RESIDENT_SKIP_W") || enabled("DS4_RESIDENT_TOPK")) {
+                err = "cache substitution cannot combine with DS4_SYNC or resident/RAM/disk expert skipping";
+                return false;
+            }
+            std::fprintf(stderr, "ds4: APPROXIMATE cache substitution: ratio %.3g, top %d, reference normalization, "
+                                 "mass budget %.3g; changes answers and depends on cache residency\n",
+                         substitution.ratio, substitution.candidates, substitution.budget);
+        }
         const double t0 = now_ms();
         if (!pk.load(o.pack, err)) return false;
         // (AMD: the prompt GEMMs' measured kernels) the pack's lt-picks.txt, or MAYA_DS4_LT_STORE's file - empty: none,
@@ -4917,6 +4941,10 @@ struct Model::Impl {
             }
             if (!hmap(lane_done, 32, err)) return false;
             std::memset((void*) reqs, 0, sizeof(Req) * kRing);
+            // Opt-in only: do not grow the native mailbox or its disabled routing kernel.
+            if (substitution.ratio > 0 &&
+                (!hmap(sub_routes, (size_t) kRing, err) ||
+                 !hmap(sub_helper, (size_t) kMaxL * 1024, err))) return false;
             std::memset((void*) resps, 0, sizeof(Resp) * kRing);
             for (auto& x : layer_of) x.store(-1);
             ahead_fl.assign(L.size() * 1024, 0);
@@ -15151,6 +15179,36 @@ struct Model::Impl {
                 // CPU lane's cache hits, RAM tier, disk skip or stream
                 const bool hon = l.helper_tab != nullptr && !helper_dead.load(std::memory_order_relaxed);
                 hpicks.clear();
+                const bool csu = sub_routes != nullptr && !l.mtp &&
+                    sub_active[next % kRing].load(std::memory_order_acquire);
+                if (csu) {
+                    const SubRoute& original = sub_routes[next % kRing];
+                    st.sub_rows += T;
+                    for (int t = 0; t < T; ++t) {
+                        double mass = 0, removed = 0, added = 0;
+                        for (int i = 0; i < l.k_exp; ++i) {
+                            const int e = original.ids[t][i], actual = r.ids[t][i];
+                            if (e < 0 || e >= l.n_exp) continue;
+                            ++pr[e];
+                            l.heat[(size_t) e] += 1.0f;
+                            ++st.sub_picks;
+                            const bool resident = l.slot[(size_t) e] >= 0 || (hon && helper_owned(l, e));
+                            st.sub_demand_gpu += resident;
+                            st.sub_executed_gpu += l.slot[(size_t) actual] >= 0 || (hon && helper_owned(l, actual));
+                            if (!resident) l.cpu_hits.push_back(e);
+                            mass += original.weights[t][i];
+                            if (e != actual) {
+                                ++st.cache_substituted;
+                                removed += original.weights[t][i];
+                                added += r.w[t][i];
+                            }
+                        }
+                        if (mass > 0) {
+                            st.sub_removed_mass += removed / mass;
+                            st.sub_executed_mass += added / mass;
+                        }
+                    }
+                }
                 const bool dsk_rule = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 // (DISK_SKIP_AUTO: skipping now; its counts only then - the routed experts computed either way, of them
                 //  on the CPU lane and not in RAM, of them on the CPU lane)
@@ -15166,8 +15224,10 @@ struct Model::Impl {
                     for (int i = 0; i < l.k_exp; ++i) {
                         const int e = r.ids[t][i];
                         if (e < 0 || e >= l.n_exp) continue;
-                        ++pr[e];
-                        l.heat[(size_t) e] += 1.0f;
+                        if (!csu) {
+                            ++pr[e];
+                            l.heat[(size_t) e] += 1.0f;
+                        }
                         if (fl != nullptr) {
                             ++st.ahead_picks;
                             st.ahead_hit_k += fl[e] & 1;
@@ -15187,7 +15247,7 @@ struct Model::Impl {
                                 }
                                 continue;
                             }
-                            l.cpu_hits.push_back(e);
+                            if (!csu) l.cpu_hits.push_back(e);
                             if ((light && !in_ram(l, e)) || (rsk && r.w[t][i] < ram_skip_w * wsum)) {
                                 ++st.skipped;
                                 continue;
@@ -16698,6 +16758,7 @@ struct Model::Impl {
             dp.seq[il] = 0;
             if (host_free(L[(size_t) il])) continue;
             dp.seq[il] = ++seq_issued;
+            if (sub_routes != nullptr) sub_active[dp.seq[il] % kRing].store(false, std::memory_order_release);
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
@@ -17007,6 +17068,7 @@ struct Model::Impl {
             dp.seq[il] = 0;
             if (host_free(L[(size_t) il])) continue;
             dp.seq[il] = ++seq_issued;
+            if (sub_routes != nullptr) sub_active[dp.seq[il] % kRing].store(false, std::memory_order_release);
             layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
         }
         int cur = d_dev;   // the device the blocks' rows are on
@@ -17337,7 +17399,7 @@ struct Model::Impl {
         for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
         spec_win = true;
         const double tv = now_ms();
-        const bool ok = forward(tk, T, T, err, 0);   // (a window streams nothing - the lane is a decoded token's)
+        const bool ok = forward(tk, T, T, err, 0, true);   // (a window streams nothing - the lane is a decoded token's)
         st.verify_ms += now_ms() - tv;
         spec_win = false;
         if (!ok) return false;
@@ -17476,7 +17538,7 @@ struct Model::Impl {
     bool step(int token, bool want_logits, std::string& err) {
         main_at.store("a decode step", std::memory_order_relaxed);
         tok_ab_begin();
-        const bool ok = forward(&token, 1, want_logits ? 1 : 0, err);
+        const bool ok = forward(&token, 1, want_logits ? 1 : 0, err, -1, true);
         tok_ab_end(1, ok);
         return ok;
     }
@@ -20648,11 +20710,12 @@ struct Model::Impl {
 
     // the window's plan, in window order (the indexer's and the candidate source's sizes carry from window to window)
     // (wp.nrow > 0: a multi step's rows, row t at wp.rpos[t] - decoded tokens, never a picture's)
-    void plan_window(int64_t p0, int T, WinPlan& wp) {
+    void plan_window(int64_t p0, int T, WinPlan& wp, bool generation = false) {
         wp.par = par;
+        wp.sub_ratio = generation ? substitution.ratio : 0.0f;
         // (a multi step's rows always on the async path, whatever their count: its verify windows reach 16 rows,
         //  and the host-routed path's sums for them were not its own decode's - the answers drifted from alone; DS4_ASYNC_T, now 16, covers one request's windows)
-        wp.async = par || (!sync_decode && (T <= async_max_t || wp.nrow > 0));
+        wp.async = par || (!sync_decode && (T <= async_max_t || wp.nrow > 0 || wp.sub_ratio > 0));
         wp.vl = 0;
         for (int t = 0; t < T && !imgs.empty() && wp.nrow == 0; ++t)
             if (in_image(p0 + t)) wp.vl |= 1u << t;
@@ -20674,9 +20737,17 @@ struct Model::Impl {
                 }
                 for (int t = 0; t < T; ++t) wp.topk[il][t] = cur_topk_n[t];
             }
+            // Cache and helper mappings change at window boundaries, never while TP members read this snapshot.
+            if (wp.sub_ratio > 0) {
+                uint8_t* resident = sub_helper + (size_t) il * 1024;
+                const bool healthy = l.helper_tab != nullptr && !helper_dead.load(std::memory_order_acquire);
+                for (int e = 0; e < l.n_exp; ++e)
+                    resident[e] = healthy && helper_owned(l, e);
+            }
             wp.seq[il] = 0;
             if (wp.async && !host_free(l)) {
                 wp.seq[il] = ++seq_issued;
+                if (sub_routes != nullptr) sub_active[wp.seq[il] % kRing].store(wp.sub_ratio > 0, std::memory_order_release);
                 layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
             }
         }
@@ -20780,7 +20851,7 @@ struct Model::Impl {
         return true;
     }
 
-    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+    bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1, bool generation = false) {
 #if defined(STRATA_USE_HIP) || defined(DS4_CUDA_PEER_AR)
         if (peer_ar_failed.load(std::memory_order_relaxed)) {
             err = "peer all-reduce failed; model reload required";
@@ -20824,7 +20895,7 @@ struct Model::Impl {
         for (int t = 0; t < T; ++t)   // (h_emb is written again by the next window, after this one's last sync)
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         wplan.nrow = 0;
-        plan_window(p0, T, wplan);
+        plan_window(p0, T, wplan, generation);
         if (helper_n > 0 && wplan.async) helper_window(T, wplan);   // (DS4_HELPER: its share, in seq order)
         prof_window = prof_on && T == 1;
         n_logits = std::min(logits_rows, T);
@@ -21687,7 +21758,7 @@ struct Model::Impl {
             //  gates in one launch, the routing and the guesses in another; =2 a window's rows too; every other case as
             //  before)
             const bool rf_t = T == 1 || (route_fuse_win && T <= kWin);
-            const Layer* nx1 = route_fuse && rf_t && !l.mtp && lead && ahead_mode == 1 ? ahead_layer(L0, 1) : nullptr;
+            const Layer* nx1 = route_fuse && wp.sub_ratio == 0 && rf_t && !l.mtp && lead && ahead_mode == 1 ? ahead_layer(L0, 1) : nullptr;
             const int m1 = nx1 != nullptr ? std::max(1, std::min(kAhead1, nx1->k_exp + ahead_extra)) : 0;
             RoutePair rp;
             if (nx1 != nullptr) {
@@ -21735,10 +21806,16 @@ struct Model::Impl {
                     route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                     na[a - 1] = m;
                 }
+                CacheSub sub;
+                sub.ratio = !l.mtp ? wp.sub_ratio : 0.0f;
+                sub.budget = substitution.budget;
+                sub.candidates = substitution.candidates;
+                sub.helper = sub_helper != nullptr ? sub_helper + (size_t) l.il * 1024 : nullptr;
+                sub.original = lead && sub.ratio > 0 ? sub_routes + slot : nullptr;
                 route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                               d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
                               na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any,
-                              lane_done);
+                              lane_done, sub.ratio > 0 ? &sub : nullptr);
             }
             {
                 x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)};
@@ -22133,7 +22210,7 @@ struct Model::Impl {
         const int D = g.dim;
         for (int t = 0; t < T; ++t)
             std::memcpy(h_emb + (size_t) t * D, embed_pinned + (size_t) tk[t] * D, (size_t) D * 2);
-        plan_window(0, T, wp);
+        plan_window(0, T, wp, true);
         if (helper_n > 0 && wp.async) helper_window(T, wp);
         prof_window = false;
         n_logits = T;

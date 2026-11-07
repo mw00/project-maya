@@ -1,3 +1,4 @@
+#include "ds4_cache_sub.hpp"
 // src/ds4/ds4_kernels.cu - DeepSeek-V4.1's device kernels (see ds4_kernels.cuh).  No fast math here: the rotary
 // angles, the softmaxes and the roundings follow the reference's F32 arithmetic.  A window's token is blockIdx.y.
 #include "ds4_kernels.cuh"
@@ -2930,6 +2931,104 @@ __global__ void __launch_bounds__(512) route_publish_kernel(const float* __restr
         for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
 }
 
+// Opt-in only. Keep the native kernel (and its reductions) untouched when disabled.
+// The mass gate operates on positive unbiased scores; biased order still chooses candidates.
+__global__ void __launch_bounds__(512) route_publish_sub_kernel(const float* __restrict__ logits,
+                                                            const float* __restrict__ bias, int n, int k,
+                                                            float route_scale, const unsigned long long* __restrict__ vram,
+                                                            const float* __restrict__ x, int dim, int* idx, float* w,
+                                                            unsigned long long* plan_ptr, Req* req,
+                                                            const float* __restrict__ bias_vl, unsigned vl,
+                                                            const uint8_t* helper_resident, SubRoute* original,
+                                                            int candidate_n, float ratio, float budget, int* cpu_any) {
+    pdl_wait();
+    pdl_trigger();
+    __shared__ float sc[1024], bs[1024];
+    __shared__ float bv[32];
+    __shared__ int bi[32];
+    __shared__ int pick[32];
+    __shared__ float candidate_scores[32];
+    __shared__ std::uint8_t resident[32];
+    __shared__ int on_cpu;
+    const int t = blockIdx.x;
+    logits += (size_t) t * 1024;
+    if (bias_vl != nullptr && ((vl >> t) & 1u)) bias = bias_vl;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float l = logits[i];
+        const float sp = l > 20.0f ? l : log1pf(expf(l));
+        sc[i] = sqrtf(sp);
+        bs[i] = sc[i] + bias[i];
+    }
+    __syncthreads();
+    const int lane = threadIdx.x & 31, wp = threadIdx.x >> 5;
+    const int count = min(n, candidate_n);
+    const bool substitute = count > k && ratio > 0;
+    for (int r = 0; r < count; ++r) {
+        float best = -FLT_MAX;
+        int bix = 0x7fffffff;
+        for (int i = threadIdx.x; i < n; i += blockDim.x)
+            if (bs[i] > best || (bs[i] == best && i < bix)) best = bs[i], bix = i;
+        for (int o = 16; o > 0; o >>= 1) {
+            const float ov = __shfl_xor_sync(0xffffffffu, best, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, bix, o);
+            if (ov > best || (ov == best && oi < bix)) best = ov, bix = oi;
+        }
+        if (lane == 0) bv[wp] = best, bi[wp] = bix;
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            float b = -FLT_MAX;
+            int ix = 0x7fffffff;
+            for (int q = 0; q < (int) (blockDim.x >> 5); ++q)
+                if (bv[q] > b || (bv[q] == b && bi[q] < ix)) b = bv[q], ix = bi[q];
+            pick[r] = ix;
+            bs[ix] = -FLT_MAX;
+        }
+        __syncthreads();
+    }
+    if (substitute) {
+        if (threadIdx.x < count) {
+            const int rank = threadIdx.x, e = pick[rank];
+            candidate_scores[rank] = sc[e];
+            resident[rank] = vram[e] != 0ull || (helper_resident != nullptr && helper_resident[e]);
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        float s = 0.0f;
+        for (int r = 0; r < k; ++r) s += sc[pick[r]];
+        if (original != nullptr) {
+            for (int r = 0; r < k; ++r) {
+                original->ids[t][r] = pick[r];
+                original->weights[t][r] = sc[pick[r]] / (s + 1e-20f) * route_scale;
+            }
+        }
+        int selected[kPicks];
+        for (int r = 0; r < k; ++r) selected[r] = r;
+        if (substitute) cache_sub::choose(pick, candidate_scores, resident, k, count, ratio, true, budget, selected);
+        int cpu = 0;
+        for (int r = 0; r < k; ++r) {
+            const int e = pick[selected[r]];
+            const float wv = sc[e] / (s + 1e-20f) * route_scale;
+            idx[(size_t) t * kPicks + r] = e;
+            w[(size_t) t * kPicks + r] = wv;
+            plan_ptr[(size_t) t * kPicks + r] = vram[e];
+            cpu |= vram[e] == 0ull;
+            if (req != nullptr) {
+                req->ids[t][r] = e;
+                req->w[t][r] = wv;
+            }
+        }
+        on_cpu = cpu;
+        if (cpu && cpu_any != nullptr) atomicOr(cpu_any, 1);
+    }
+    // the token's FFN input to the host only where the CPU lane reads it (a pick of its on the CPU lane): each row
+    // 20 KB over PCIe, where most windows have none
+    __syncthreads();
+    if (req != nullptr && on_cpu)
+        for (int i = threadIdx.x; i < dim; i += blockDim.x) req->x[t][i] = x[(size_t) t * dim + i];
+}
+
+
 // a later layer's m likely picks (route_kernel's choice from its logits) into req->ahead[t][off ..)
 __global__ void __launch_bounds__(512) route_ahead_kernel(const float* __restrict__ logits,
                                                           const float* __restrict__ bias, int n, int m, Req* req,
@@ -3808,12 +3907,18 @@ ResidentSkip resident_skip() {
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, cudaStream_t s, const float* bias_vl,
-                   unsigned vl, int na0, int na1, Resp* resp, int* cpu_any, const unsigned* host_done) {
+                   unsigned vl, int na0, int na1, Resp* resp, int* cpu_any, const unsigned* host_done, const CacheSub* substitute) {
     if (req == nullptr || host_done == nullptr) resp = nullptr;
     if (resp == nullptr) cpu_any = nullptr;
     const ResidentSkip rs = resident_skip();
-    pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
-               vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k);
+    if (substitute != nullptr && substitute->ratio > 0) {
+        pdl_launch(route_publish_sub_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w,
+                   plan_ptr, req, vl != 0 ? bias_vl : nullptr, vl, substitute->helper, substitute->original,
+                   substitute->candidates, substitute->ratio, substitute->budget, cpu_any);
+    } else {
+        pdl_launch(route_publish_kernel, T, 512, 0, s, logits, bias, n, k, route_scale, vram, x, dim, idx, w, plan_ptr, req,
+                   vl != 0 ? bias_vl : nullptr, vl, cpu_any, rs.w, rs.k);
+    }
     if (req != nullptr) pdl_launch(publish_kernel, 1, 1, 0, s, req, T, seq, na0, na1, resp, cpu_any, host_done);
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s) {
