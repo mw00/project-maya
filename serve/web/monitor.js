@@ -494,6 +494,7 @@ const METRICS = [
   {key: "temp", label: "GPU temp", unit: "°C", series: "gpu_temp", tone: "warn"},
   {key: "pcie", label: "PCIe", series: "gpu_pcie_rx_mb", tone: "info"},
   {key: "cpu", label: "CPU", unit: "%", series: "cpu", max: 100},
+  {key: "cputemp", label: "CPU temp", unit: "°C", series: "cpu_temp", max: 100, tone: "warn"},
   {key: "ram", label: "System RAM", series: "ram_used", tone: "info"},
   {key: "disk", label: "Disk read", series: "disk_read_mb", tone: "info"},
 ];
@@ -520,6 +521,7 @@ function Hardware({m, gpuEach}) {
            each ? per((g) => `${sameLink ? "" : `${link(g)} `}${rate(g.pcie_rx_mb)}`)
                 : hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${rate(hw.gpu_pcie_rx_mb)}` + (hw.gpu_pcie_gen && gen && hw.gpu_pcie_gen < gen ? ` · idle Gen${hw.gpu_pcie_gen}` : "")],
     cpu: [hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : ""],
+    cputemp: [hw.cpu_temp == null ? null : fmt(hw.cpu_temp), "°C", hw.cpu_temp == null ? "no CPU sensor" : "the hottest sensor"],
     ram: [hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB", eng.ram_gb ? `${fmt(+eng.ram_gb, 1)} GB pinned for experts` : ""],
     disk: hw.disk_read_mb == null ? [null, "", st.psutil ? "" : "needs psutil (setup installs it)"]
       : [big ? fmt(hw.disk_read_mb / 1024, 2) : fmt(hw.disk_read_mb, hw.disk_read_mb < 10 ? 1 : 0), big ? "GB/s" : "MB/s",
