@@ -646,6 +646,23 @@ def check_request_sampling(req: dict) -> None:
             req["loop_guard"] = bool(guard)
         else:
             raise ValueError("loop_guard: true or false")
+    budget = req.get("thinking_budget")         # the thinking budget for this request only (request_think_budget)
+    if budget is not None:
+        if isinstance(budget, str) and budget.strip().isdecimal():
+            budget = int(budget)
+        try:
+            req["thinking_budget"] = maya_quants.check_thinking_budget(budget)
+        except ValueError as e:
+            raise ValueError(f"thinking_budget: {e}") from None
+
+
+def request_think_budget(config_budget: int, req: dict | None) -> int:
+    """The thinking budget for one request, in tokens (0 = none): its own "thinking_budget" when it names one (checked
+    by check_request_sampling: 0 or 256..262144, as the dashboard's), the run config's otherwise.  A client that knows
+    a turn needs more room (a question it was asked to think hard about) or less sets it for that turn alone; the
+    config's stays every other request's."""
+    own = (req or {}).get("thinking_budget")
+    return config_budget if own is None else own
 
 
 def logit_bias_of(value, vocab_size: int | None = None) -> dict[int, float]:
@@ -4220,15 +4237,15 @@ class Service:
                 # the thinking budget goes to the engine with the request: a reasoning block still open after that many
                 # tokens is closed there (its next token is </think>) and the answer follows in the same decode
                 in_think = bool(thinking) and self.think_end_id is not None   # (tracked with no budget too, #786)
-                budgeted = in_think and self.think_budget > 0   # (0 = no budget: the end token is still tracked)
-                # The thinking budget is the config's ("thinking_budget"); a request's max_tokens (or the context
+                think_budget = request_think_budget(self.think_budget, sampling)
+                budgeted = in_think and think_budget > 0   # (0 = no budget: the end token is still tracked)
+                # The thinking budget (request_think_budget); a request's max_tokens (or the context
                 # left) lowers it only when that output limit is tiny, THINK_TINY_LIMIT (1024) tokens or fewer - a
                 # side request such as a title, which must still get an answer: a reserve is kept for it (a quarter,
                 # with a preferred floor of MAYA_GLM_THINK_RESERVE, 1024, capped at half the limit). A larger
                 # limit is the client's cap on the whole output and leaves the budget alone: a chat client's
                 # max_tokens=4096 used to cut the thinking to ~3K tokens and close it while the model was still
                 # reasoning. The forced </think> also consumes one token of max_new, so account for it.
-                think_budget = self.think_budget
                 soft = None                             # (the budget closed at a sentence's or line's end: _sliced)
                 if budgeted and max_new and int(max_new) <= THINK_TINY_LIMIT:
                     reserve_floor = max(0, int(os.environ.get("STRATA_GLM_THINK_RESERVE", "1024") or 1024))
