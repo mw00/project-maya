@@ -1969,6 +1969,22 @@ def engine_args(cfg: dict) -> list[str]:
     return args
 
 
+def drop_one_card_split(cfg: dict) -> None:
+    """A one-card HIP setup writes STRATA_GLM_SPLIT=0 (the whole model on the first card, no MTP draft across
+    parts).  A start that overrides the config's card with several (`--gpu 0,1,2,3`) must not keep it: the engine
+    then splits the layers as a setup on these cards would (it picks the split and drafts with MTP), while the stale
+    setting pins every layer to the first card and leaves the rest idle (0.1 GB of VRAM each).  In place; a real
+    split spec (a boundary list like 96,192) stays."""
+    env = cfg.get("env")
+    if not (isinstance(env, dict) and "," in str(cfg.get("gpu", ""))):
+        return
+    names = ("STRATA_GLM_SPLIT", "MAYA_GLM_SPLIT")   # (env_in left the config with the STRATA_ one; a hand-written one either)
+    if any(env.get(k) == "0" for k in names):
+        cfg["env"] = {k: v for k, v in env.items() if k not in names}
+        print("[maya] --gpu with several cards: the one-card split-off (STRATA_GLM_SPLIT=0) is dropped for this "
+              "start; the layers split across them as a setup on these cards would", flush=True)
+
+
 def child_env(cfg: dict) -> dict:
     """The engine's environment: the CUDA libraries setup installed (pip's nvidia packages, or the toolkit that
     compiled it) first on the library search path."""
@@ -6945,6 +6961,7 @@ def main() -> int:
         tee_server_log(_srv_log)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+        drop_one_card_split(cfg)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()

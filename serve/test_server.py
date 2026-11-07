@@ -877,6 +877,21 @@ class GpuChoice(unittest.TestCase):
         self.assertEqual(plain.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_VISIBLE_DEVICES"))
         self.assertEqual(plain.get("CUDA_DEVICE_ORDER"), os.environ.get("CUDA_DEVICE_ORDER"))
 
+    def test_a_start_on_several_cards_drops_a_one_card_setup_split_off(self):
+        """A one-card HIP setup writes STRATA_GLM_SPLIT=0 (everything on the first card): a start that overrides the
+        card with several (--gpu 0,1,2,3) drops it, so the layers split as a setup on these cards would."""
+        from serve.server import drop_one_card_split
+        cfg = {"gpu": "0,1,2,3", "env": {"STRATA_GLM_SPLIT": "0", "STRATA_GLM_RESERVE_MB": "3072"}}
+        drop_one_card_split(cfg)
+        self.assertEqual(cfg["env"], {"STRATA_GLM_RESERVE_MB": "3072"})
+        cfg = {"gpu": "0,1,2,3", "env": {"STRATA_GLM_SPLIT": "96,192"}}   # a real split spec stays
+        drop_one_card_split(cfg)
+        self.assertEqual(cfg["env"], {"STRATA_GLM_SPLIT": "96,192"})
+        cfg = {"gpu": 0, "env": {"STRATA_GLM_SPLIT": "0"}}                # one card: the setting stays
+        drop_one_card_split(cfg)
+        self.assertEqual(cfg["env"], {"STRATA_GLM_SPLIT": "0"})
+        drop_one_card_split({"gpu": "0,1,2,3"})                          # no env: nothing to drop, no error
+
 
 class RecordingPrompt(MockEngine):
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
