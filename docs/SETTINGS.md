@@ -905,7 +905,7 @@ below that prompts run in windows of 16. The log says which.
 With the layers split across GPUs (one GPU a group) a prompt runs as a relay: a chunk goes through the first GPU's
 layers, then the next GPU's. Four settings help that path when the experts sit in RAM; each is off by default.
 
-- `DS4_FLOW_COPY_DMA=1`: a streamed expert whose RAM copy is in one pinned part is DMA'd to the GPU from that copy.
+- `DS4_FLOW_COPY_DMA=1` (on by default with AMD): a streamed expert whose RAM copy is in one pinned part is DMA'd to the GPU from that copy.
   Without it only MXFP4 experts went that way; the GGUF low-bit experts (IQ2_XXS, IQ3_S, ...) were first copied by a
   reader thread into the pinned staging, about 2.7 GB/s a GPU on PCIe 3.0, which the four GPUs waited on. The same bytes.
 - `DS4_YOCO_FLOW=1`: the prompt skip of the layers after the YOCO source (`DS4_YOCO`) also on a layer split whose groups
@@ -920,7 +920,7 @@ layers, then the next GPU's. Four settings help that path when the experts sit i
 
 | Setting | Default | |
 | --- | --- | --- |
-| `DS4_FLOW_COPY_DMA` | off (0) | `1`: on the flow, an expert with a pinned RAM copy in one part is DMA'd from that copy, any format (the same bytes) |
+| `DS4_FLOW_COPY_DMA` | on with AMD (HIP), off with NVIDIA | `1`: on the flow, an expert with a pinned RAM copy in one part is DMA'd from that copy, any format (the same bytes); `0`: the readers copy it into the pinned staging first, as before. On by default with AMD since one RX 7900 XTX beside 128 GB of dual-channel DDR4-3200 (Maya-XS, 94 GB of CPU-lane experts copied and pinned) read prompts of 16 / 64 / 256 / 1,024 / 4,096 new tokens 42-49% faster (4K: 28%): the staging's memcpy took 75-82% of the engine's CPU time while a prompt read, and the RAM's own counters gave ~1,350 GB of traffic for the reads against ~455 GB without it. The logits are the same bit for bit |
 | `DS4_YOCO_FLOW` | off (0) | `1`: the YOCO prompt skip also on a layer split whose groups are on the flow (changes the answers slightly) |
 | `DS4_CHUNK_GFX11` | `4096` on RDNA 3 / 3.5 (gfx11) GPUs | the largest prompt chunk, in tokens, on gfx11 GPUs. Integrated ones (Strix / Gorgon Halo) read a long prompt faster in 4K chunks (experts resident); a discrete card that streams its experts from RAM can read faster in the default's larger chunks (one RX 7900 XTX: +15-45% prompt speed with `0`). `N`: this cap; `0`: the default chunk (changes the answers slightly) |
 | `DS4_CHUNK_AUTO` | off (0) | `1`: on a layer split, a prompt's chunk from its length, so every group has work (changes the answers slightly) |
