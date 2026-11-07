@@ -15,6 +15,7 @@ Every page in this folder, by what you want to do. Back to the [README](../READM
 - [DOCKER.md](DOCKER.md): a recipe to build a Docker image of Maya (there is no official image).
 - [AGENT_BENCH.md](AGENT_BENCH.md): `tools/agent_bench.py`, a benchmark that loads a running server like coding agents do.
 - [EXL3-HELPER.md](EXL3-HELPER.md): the experimental helper GPU that runs EXL3 experts the main GPUs miss.
+- [KEEPWARM.md](KEEPWARM.md): `tools/maya_keepwarm.py`, keep the model files' page-cache working set across restarts on Linux (a `mincore` snapshot, a `fadvise(WILLNEED)` restore), so the first minutes after a boot skip the SSD re-read.
 
 ## Platforms and hardware
 
