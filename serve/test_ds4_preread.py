@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import sys
 import threading
@@ -164,23 +166,29 @@ class PreRead(unittest.TestCase):
         req = {"messages": messages, "reasoning_effort": "high", "_preread": None}
         msgs, schemas, kw = openai_to_messages(req, deepseek=True)
         ids, thinking, max_new = svc.prepare(msgs, schemas, kw, 200)
-        openai_collect(openai_chunks(svc, {**req, "_preread": (msgs, schemas, kw, None)}, ids, thinking, schemas, max_new,
-                                     threading.Event()))
-        for _ in range(200):                                     # the pre-read has the engine
-            if len(eng.calls) == 2:
-                break
-            time.sleep(0.01)
-        self.assertEqual(eng.calls[1][1], 1)
-        t0 = time.time()
-        other = {"messages": [{"role": "user", "content": "Another chat."}], "reasoning_effort": "high"}
-        m2, s2, k2 = openai_to_messages(other, deepseek=True)
-        ids2, th2, mx2 = svc.prepare(m2, s2, k2, 200)
-        out = openai_collect(openai_chunks(svc, other, ids2, th2, s2, mx2, threading.Event()))
-        took = time.time() - t0
-        wait_preread()
+        log = io.StringIO()
+        with contextlib.redirect_stdout(log):                    # (the pre-read's log line)
+            openai_collect(openai_chunks(svc, {**req, "_preread": (msgs, schemas, kw, None)}, ids, thinking, schemas,
+                                         max_new, threading.Event()))
+            for _ in range(200):                                 # the pre-read has the engine
+                if len(eng.calls) == 2:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(eng.calls[1][1], 1)
+            t0 = time.time()
+            other = {"messages": [{"role": "user", "content": "Another chat."}], "reasoning_effort": "high"}
+            m2, s2, k2 = openai_to_messages(other, deepseek=True)
+            ids2, th2, mx2 = svc.prepare(m2, s2, k2, 200)
+            out = openai_collect(openai_chunks(svc, other, ids2, th2, s2, mx2, threading.Event()))
+            took = time.time() - t0
+            wait_preread()
         self.assertTrue(eng.stopped.is_set())
         self.assertLess(took, 5.0)                               # not the pre-read's 30 s
         self.assertEqual(out["choices"][0]["message"]["content"].strip(), "The answer is 42.")
+        line = next(x for x in log.getvalue().splitlines() if "pre-read:" in x)
+        self.assertIn("stopped by a request", line)
+        self.assertIn("(0 of ", line)                            # (no piece done before the stop ...)
+        self.assertIn("piece 1 of 1 under way", line)            # (... and its one piece stopped inside)
 
     def test_a_long_answer_in_pieces(self):
         svc, eng = self.service(script="Let me think.</think>" + LONG)

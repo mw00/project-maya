@@ -998,7 +998,7 @@ reads only its own tokens.
   placement, the follow-up's first rows: truncated top-20 KL 0.025-0.027 against 0.003 between two unset runs, top-1
   the same 92%).
 - The log has a line a pre-read: `[maya] pre-read: N tokens, done after S s (R of M read ahead, P of Q pieces)`, or
-  `stopped by a request`.
+  `stopped by a request` (`piece P of Q under way`: stopped inside a piece, which the engine may still finish).
 
 2x RX 6900 XT, Maya-XS, `--tp 2` (a layer split), a six-turn chat in Open WebUI's request shape, thinking low, 25 s
 between turns: the next message's first token 3.3-17.9 s unset, 0.4-1.7 s with the setting (9 of 10; the tenth
