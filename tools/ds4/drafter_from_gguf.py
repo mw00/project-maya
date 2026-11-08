@@ -6,6 +6,7 @@
 The JSON has the same ``tensors`` and ``config`` entries as drafter_pack.py's output. Its sibling .bin is a
 relative symlink to the GGUF; tensor offsets point into that file, past its GGUF header. The GGUF must hold the
 three-block, single-pass DeepSeek-V4.1-Flash drafter in F32, BF16 and MXFP4.
+The output path cannot contain whitespace because tensors.txt uses whitespace-separated file paths.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import math
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
 
 from pack_gguf import Gguf, LAYER, TYPES
@@ -146,11 +148,14 @@ def convert(source: Path, out: Path) -> dict:
     out = out.expanduser()
     if out.suffix != ".json":
         raise SystemExit("--out must name a .json file")
+    if any(char.isspace() for char in str(out.absolute())):
+        raise SystemExit("--out path cannot contain whitespace (tensors.txt file paths are whitespace-separated)")
     out.parent.mkdir(parents=True, exist_ok=True)
     output = out.parent.resolve() / out.name  # use the physical directory when a mount has another alias
+    if any(char.isspace() for char in str(output)):
+        raise SystemExit("--out path cannot contain whitespace (tensors.txt file paths are whitespace-separated)")
     binary = output.with_suffix(".bin")
-    temporary = output.with_suffix(output.suffix + ".part")
-    if source in (output, binary, temporary):
+    if source in (output, binary):
         raise SystemExit("Refusing to overwrite the source GGUF")
     if binary.exists() or binary.is_symlink():
         if not binary.is_symlink() or binary.resolve() != source:
@@ -159,17 +164,30 @@ def convert(source: Path, out: Path) -> dict:
     else:
         new_link = True
     created_link = False
+    temporary = None
     try:
-        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        for _ in range(10):
+            candidate = output.with_name(f".{output.name}.{secrets.token_hex(12)}.part")
+            try:
+                with candidate.open("x", encoding="utf-8") as handle:
+                    temporary = candidate
+                    handle.write(json.dumps(payload, indent=2) + "\n")
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise SystemExit(f"Could not create a temporary file beside {output}")
         if new_link:
             binary.symlink_to(os.path.relpath(source, binary.parent))
             created_link = True
         temporary.replace(output)
-    except OSError:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
         if created_link:
             binary.unlink(missing_ok=True)
         raise
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
     return {"json": str(output), "binary_symlink": str(binary), "source_tensors": len(payload["source_tensors"]),
             "mapped_entries": len(payload["tensors"]), "config": payload["config"], "payload_bytes_written": 0}
 

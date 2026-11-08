@@ -153,6 +153,37 @@ class ExistingDrafterGguf(unittest.TestCase):
             DG.convert(self.source, output)
         self.assertEqual((physical / "dspark.bin").read_bytes(), b"unrelated")
 
+    def test_rejects_whitespace_output_path_before_writing(self):
+        synthetic_gguf(self.source, tensors())
+        spaced = self.root / "draft with space"
+        with self.assertRaisesRegex(SystemExit, "cannot contain whitespace"):
+            DG.convert(self.source, spaced / "dspark.json")
+        self.assertFalse(spaced.exists())
+
+        spaced.mkdir()
+        alias = self.root / "draft_alias"
+        alias.symlink_to(spaced, target_is_directory=True)
+        with self.assertRaisesRegex(SystemExit, "cannot contain whitespace"):
+            DG.convert(self.source, alias / "dspark.json")
+        self.assertFalse((spaced / "dspark.json").exists())
+        self.assertFalse((spaced / "dspark.bin").exists())
+
+    def test_existing_part_symlink_is_not_followed_or_replaced(self):
+        synthetic_gguf(self.source, tensors())
+        draft = self.root / "draft"
+        draft.mkdir()
+        victim = self.root / "victim.txt"
+        victim.write_text("keep this file")
+        old_part = draft / "dspark.json.part"
+        old_part.symlink_to(victim)
+
+        DG.convert(self.source, draft / "dspark.json")
+        self.assertEqual(victim.read_text(), "keep this file")
+        self.assertTrue(old_part.is_symlink())
+        self.assertEqual(old_part.resolve(), victim)
+        self.assertTrue((draft / "dspark.json").is_file())
+        self.assertEqual((draft / "dspark.bin").resolve(), self.source)
+
     def test_rejects_out_of_bounds_and_overlapping_source_ranges(self):
         specs = tensors()
         synthetic_gguf(self.source, specs, offsets=[0] * (len(specs) - 1) + [10**9])
@@ -201,8 +232,16 @@ class ExistingDrafterGguf(unittest.TestCase):
         self.assertEqual(entries["mtp.1.attn.wo_a.slice.1.weight"],
                          [wo_a[1], str(draft_file), str(wo_a[2] + wo_a[3] // 2), str(wo_a[3] // 2), "1", "4"])
 
+        spaced = self.root / "draft with space"
+        draft_json.parent.rename(spaced)
+        with patch.object(sys, "argv", ["pack_gguf.py", "--model", str(model_dir), "--out",
+                                        str(self.root / "bad-pack"), "--drafter", str(spaced / "dspark.json")]):
+            with self.assertRaisesRegex(SystemExit, "relative to the model cannot contain whitespace"):
+                PG.main()
+        self.assertFalse((self.root / "bad-pack").exists())
+
     def test_refuses_to_overwrite_source(self):
-        source = self.root / "dspark.json.part"
+        source = self.root / "dspark.bin"
         synthetic_gguf(source, tensors())
         before = source.read_bytes()
         with self.assertRaisesRegex(SystemExit, "Refusing to overwrite"):

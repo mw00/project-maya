@@ -586,7 +586,13 @@ def main() -> int:
             print("DSpark geometry not in the GGUF, taken from %s: %s" %
                   (src, ", ".join("%s %s" % (k, fill[k]) for k in DSPARK_KEYS if k in fill)))
     if drafter_in:
-        files.append(rel(drafter.with_suffix(".bin")))
+        try:
+            drafter_file = rel(drafter.with_suffix(".bin"))
+        except ValueError as exc:  # Windows: another drive
+            raise SystemExit(f"{drafter}: the drafter must be on the model's drive") from exc
+        if any(char.isspace() for char in drafter_file):
+            raise SystemExit(f"{drafter}: the drafter path relative to the model cannot contain whitespace")
+        files.append(drafter_file)
         groups = int(kv["%s.attention.output_group_count" % kv["general.architecture"]])
         for name, dt, off, nb, shape in dinfo["tensors"]:
             if name.endswith(".attn.wo_a.weight"):   # (one entry a group, as the trunk's)
