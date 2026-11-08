@@ -1173,6 +1173,10 @@ class StrataEngine:
             think += f" think_soft={soft}{stops}"   # (#746: the engine closes at the sentence's end, a prefix of the state)
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
+        _spec_def = os.environ.get("STRATA_SPEC_DEFAULT", "").strip()
+        if _spec_def.isdigit() and not (isinstance(tune, dict) and tune.get("spec") is not None):
+            # local: default the DFlash verify window (spec tune) for requests that name none
+            tune = {**(tune if isinstance(tune, dict) else {}), "spec": int(_spec_def)}
         if isinstance(tune, dict):
             for k in ("pcie_frac", "spec_min_p", "spec_cum"):
                 v = tune.get(k)
