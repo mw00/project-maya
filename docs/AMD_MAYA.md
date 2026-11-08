@@ -341,13 +341,13 @@ table keeps only the rows that were at least 2% faster.
 - Fixed the KDA parity fixture to initialize its recurrence state explicitly;
   its numerical tolerance is unchanged.
 - The HIP post-store system fences in both shared doorbell kernels and Maya's
-  fused routing signal (backported from Strata) arrived separately in v1.0.7
+  fused routing signal (backported from the upstream engine) arrived separately in v1.0.7
   (#2); the validation below includes them.
 
-Upstream Strata was inspected at `d5ea713` (0.1.40.3). Its AMD backend documents
+The upstream engine was inspected at `d5ea713` (0.1.40.3). Its AMD backend documents
 runtime selection, memory limits, desktop VRAM headroom, and newer packed-byte
-optimizations. Maya's GLM engine is separate from Strata's current Qwen engine,
-so Strata's model benchmarks do not establish Maya performance.
+optimizations. Maya's GLM engine is separate from the upstream engine's current Qwen engine,
+so its model benchmarks do not establish Maya performance.
 
 ## Validation
 

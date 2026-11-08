@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | Português</p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>GLM-5.3-Flash (321 B), DeepSeek-V4.1-Flash-1017 (748 B) e MiniMax-M3.1-Flash (428 B) na sua própria GPU</b><br>
@@ -36,6 +38,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 A instalação pergunta qual modelo você quer, baixa, compila tudo uma vez e **inicia o modelo**. Depois abra `http://127.0.0.1:8080`. No Windows, use `START-MAYA.bat` em vez de `./setup.sh`. Mais em [Instalação](#install).
 
+Toda a documentação: [docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>Escolha seu modelo
 
 Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou L, conforme quantos bits seus especialistas mantêm. A instalação recomenda uma para o seu PC; para escolher uma você mesmo, informe o id dela: `./setup.sh --model glm-maya-s24`.
@@ -52,6 +56,8 @@ Toda quantização do Maya tem o nome do modelo seguido do nível - XS, S, M ou 
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | o modelo inteiro na memória de um PC de 128 GB (as tabelas Engram ficam no SSD); a v2 é cerca de 12% mais próxima do original e cerca de 20% mais rápida para escrever que a v1 - rodar a instalação de novo oferece a atualização |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B, 23 B ativos · até 1M de contexto</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | o modelo inteiro na memória de um PC de 128 GB |
 | | Maya-S · `minimax-maya-s` | 122 GB | mais próximo do original |
+
+**Qual modelo cabe no seu PC?** Veja em [docs/MEMORY.md](docs/MEMORY.md) a memória recomendada de cada modelo (VRAM + RAM somadas).
 
 Todos rodam em NVIDIA a partir da V100 / RTX 20, e em AMD e Windows (veja [O que você precisa](#what-you-need)). Os tamanhos do DeepSeek incluem as tabelas Engram. A instalação também oferece os GGUFs da unsloth e as quantizações EXL3 da LibertAIDAI do DeepSeek, o DeepSeek abliterated da orcarouter, a quantização EXL3 do MiniMax da Mia-AiLab, as quantizações EXL3 do GLM da turboderp o Qwen-3.8-Flash-Next (CYBER-FROST) como GGUF Q5_K_M e o próprio Qwen-3.8-Flash-Next como GGUF UD-IQ2_XS da unsloth, ambos com imagens ([suas configurações](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost)). **Arquivos, drafters, imagens e opções de cada modelo: [docs/MODELS.md](docs/MODELS.md).**
 
@@ -97,6 +103,8 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | **4x RTX 3090 24 GB** (PCIe 4.0 x8 behind one switch), Xeon Platinum 8260M, 376 GB RAM | Maya-L, 1M context | 44.2 tokens/s (tuned) | 698 tokens/s | @foureight84 (v1.1.17, #302) |
 | **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 4.0 x8 each), Ryzen 5 3600, 64 GB RAM | Maya-S24 / Maya-M-Derisked, 256K context | 44.1 / 24.9 tokens/s | 704 / 617 tokens/s | @gegnep (v1.1.20, #395) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x16, power-capped at 250 W), EPYC 7452, 256 GB RAM | Maya-M / Maya-L, 128K context | 44.0 / 30.2 tokens/s | 860 / 801 tokens/s | @orochifj (v1.1.4, #165) |
+| **8x AMD Instinct MI50 32 GB** (gfx906, PCIe), EPYC 7K62, 112 GB RAM | Maya-L, 128K context | 43.3 tokens/s | 288 tokens/s | @abluesheep (v1.1.52, #830) |
+| **RTX PRO 6000 Blackwell 96 GB** (PCIe 5.0 x16), Ryzen 9 9950X3D, 253 GB RAM, Windows 11 | Maya-L, a coding-agent session grown from 265K to 482K tokens | 42.4 tokens/s (median of 51 answers) | - | @Andrey0710 (v1.1.53, #873) |
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-S24 | 40.5 tokens/s | 1271 tokens/s | @fuad00 (v1.1.0, #122) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 4.0 x16), Ryzen 5 5600, 92 GB DDR4 | Maya-L, 1M context | 39.6 tokens/s | 2708 tokens/s (3246 warm) | @QueTensors (v1.1.28, #532) |
 | **4x Tesla T10 15 GB** (PCIe 3.0 x16), Xeon E5-2680 v4, 63 GB RAM | Maya-S24, 100K context | 38.4 tokens/s | 393 tokens/s | @zeallag (v1.1.16, #291) |
@@ -159,6 +167,7 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | **4x RTX 3090 24 GB** (PCIe 4.0 x16), Threadripper PRO 3975WX, 502 GB RAM | UD-Q8_K_XL, 256K context | 37.1 tokens/s | 596 tokens/s | @bandito1 (v1.1.50, #766) |
 | **4x RX 7900 XT 20 GB** (gfx1100, `--tp 4`, tuned), 2x Xeon E5-2699C v4 (a Dell T7910), 1 TB DDR4-2400 | UD-Q4_K_XL | 35.0 tokens/s | - | @Cass67 (v1.1.32, #566) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x8, 270 W), Core Ultra 7 265K, 192 GB DDR5 | Maya-S, 1M context, tuned | 33.3 tokens/s | 467 tokens/s | @Jellepepe (v1.1.35, #614) |
+| **2x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v4, 128 GB DDR3-1866 | Maya-XS (v2), 256K context, DSpark | 32.0 tokens/s | 420 tokens/s | @c200762620-max (v1.1.51, #815) |
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v3, 128 GB DDR3L, Windows 10 | Maya-S, 64K context | 23-26 tokens/s (long answers) | 377 tokens/s | @noahark (v1.1.26, #450) |
 | **2x RTX 2080 Ti 22 GB** (modded, PCIe 3.0 x16, power-capped at 250 W), 2x Xeon E5-2696 v4, 94 GB RAM | Maya-XS, 128K context | 23.1 tokens/s | 317 tokens/s | @NorwinYu (v1.1.36, #659) |
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-XS, 64K context | 21.5 tokens/s | 573 tokens/s | @fuad00 (v1.1.22, #393) |
@@ -177,6 +186,7 @@ Máquinas reais medidas por nossos usuários, a maioria com `./maya.sh --bench` 
 | **1x L40S 48 GB** (vGPU), Xeon Platinum 8580 (a VM, 32 vCPUs), 504 GB RAM | Maya-S / EXL3 3.55 bpw, 256K context | 23.4 / 16.7 tokens/s | 332 / 273 tokens/s (158K) | @talisp (v1.1.32, #577) |
 | **2x RTX 3090 24 GB** (power-capped at 230 W), EPYC 7543 (a VM, 32 vCPUs), 224 GB RAM | Maya-S, 200K context, DSpark | 22.0 tokens/s (code), 18.4 (prose) | 163 tokens/s (10K) | @noonghunna (v1.1.30, #549) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | Maya-S, 128K context, DSpark | 21.0 tokens/s | 139 tokens/s | @tobitege (v1.1.37, #663) |
+| **2x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v4, 128 GB DDR3-1866 | Maya-XS, 256K context, DSpark | 14.5 tokens/s | 254 tokens/s | @c200762620-max (v1.1.51, #816) |
 
 </details>
 
@@ -194,6 +204,8 @@ Um token equivale a cerca de ¾ de uma palavra. A velocidade se mantém conforme
 - **Raciocínio:** Off, Low, High (o padrão) ou Max, em Settings ou por requisição, e um campo de **orçamento de raciocínio** que define quantos tokens o modelo pode usar pensando antes de responder.
 - **Guarda contra loops:** ligada por padrão - um agente que repete a mesma chamada de ferramenta com o mesmo resultado é conduzido para fora disso.
 - **Imagens:** anexe uma no chat, ou envie partes de imagem por qualquer uma das APIs. Todos os modelos leem imagens (detalhes da instalação por modelo: [docs/MODELS.md](docs/MODELS.md)).
+- **Ferramentas MCP:** liste servidores MCP na configuração (`"mcp_servers"`; o bloco `mcpServers` do Claude Desktop funciona como está) e o modelo do chat na web pode chamar as ferramentas deles. Um interruptor no menu **+** do chat liga e desliga. O que ele faz: [serve/mcp.py](serve/mcp.py).
+- **Docker:** não há imagem oficial. [docs/DOCKER.md](docs/DOCKER.md) é uma receita para montar uma a partir de uma versão.
 - **De outro dispositivo:** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`. Sempre defina uma chave.
 - **Ajuste fino:** `./maya.sh --calibrate` ajusta o motor ao seu hardware em 10-15 minutos. Todas as configurações: [docs/SETTINGS.md](docs/SETTINGS.md).
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**As opções próprias de cada modelo** - várias requisições ao mesmo tempo no GLM-5.3-Flash (`--parallel`), contextos longos e o drafter DFlash2; as conversas mantidas, o carregamento de especialistas e a leitura antecipada do Engram no DeepSeek; os níveis de raciocínio do MiniMax: [docs/MODELS.md](docs/MODELS.md).

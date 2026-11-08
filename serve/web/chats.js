@@ -213,7 +213,8 @@ export function apiMessages(chat, msgs = chat.messages, light = false) {
       const imgs = (m.images || []).filter((i) => i.url);
       const text = userText(m);
       out.push({role: "user", content: imgs.length ? [{type: "text", text},
-        ...imgs.map((i) => ({type: "image_url", image_url: {url: light ? "data:," : i.url}}))] : text});
+        ...imgs.map((i) => i.kind === "video" ? {type: "video_url", video_url: {url: light ? "data:," : i.url}}
+                                              : {type: "image_url", image_url: {url: light ? "data:," : i.url}})] : text});
     } else if (!m.error) {
       out.push(...assistantMessages(m));
     }
@@ -258,7 +259,7 @@ function draftChat() {
   const c = S.current, base = S.editIndex != null ? c.messages.slice(0, S.editIndex) : c.messages;
   const text = S.draft.trim();
   if (!text && !S.attachments.length) return base;
-  return [...base, {role: "user", text, images: S.attachments.filter((a) => a.kind === "image"),
+  return [...base, {role: "user", text, images: S.attachments.filter((a) => a.kind !== "file"),
                     files: S.attachments.filter((a) => a.kind === "file")}];
 }
 export function estimateTokens(msgs, c = S.current) {   // an older server without /api/tokens: about 3.5 characters a token
@@ -578,7 +579,7 @@ export function editMessage(i) {
   const m = S.current.messages[i];
   S.editIndex = i;
   S.draft = m.text || "";
-  S.attachments = [...(m.images || []).filter((a) => a.url).map((a) => ({...a, kind: "image"})),
+  S.attachments = [...(m.images || []).filter((a) => a.url).map((a) => ({...a, kind: a.kind === "video" ? "video" : "image"})),
                    ...(m.files || []).filter((f) => f.text != null).map((f) => ({...f, kind: "file"}))];
   emit();
   focusInput();
@@ -599,7 +600,7 @@ export function stopAnswer() {
   b.controller.abort();
 }
 
-// ------------------------------------------------------------------ attachments: the + menu, a drop, a pasted picture
+// ------------------------------------------------------------------ attachments: the + menu, a drop, a pasted picture, any file
 const TEXT_EXT = /\.(txt|md|markdown|rst|tex|py|pyi|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|jsonl|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|less|c|cc|cpp|cxx|h|hh|hpp|cu|cuh|rs|go|java|kt|kts|swift|rb|php|pl|lua|r|jl|scala|sql|sh|bash|zsh|fish|ps1|psm1|bat|cmd|diff|patch|gradle|cmake|mk|dockerfile|gitignore|proto|graphql)$/i;
 // the server says how big a text file the context holds (health.max_text_file: about 4 bytes a token); 512 KB before it did
 const textLimit = () => S.health.max_text_file || 512 * 1024;
@@ -608,18 +609,37 @@ function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
 }
+// Everything else goes to the server (POST /attach, serve/attach.py), which reads what the browser cannot: a PDF's text
+// (or a scanned one's pages as pictures, for a model that reads them), Word / Excel / PowerPoint / OpenDocument / EPUB /
+// RTF text, a text file of any name and encoding - and says plainly what it does not read (#837).
+const ATTACH_MAX = 64 * 1048576;   // the server's cap (attach.MAX_BYTES in serve/attach.py), checked here before the read
+const VIDEO_MAX = 100 * 1048576;   // a video goes in the request as a data URL: the server's request cap is 256 MB
 const attached = (a) => { S.attachments = [...S.attachments, a]; emit(); updateCtxMeter(); };
+function asDataUrl(f, kind) {
+  const r = new FileReader();
+  r.onload = () => attached({kind, name: f.name || `pasted ${kind}`, url: r.result});
+  r.onerror = () => toast("error", "The file could not be read", `${f.name}: ${r.error ? r.error.message : "the browser could not open it"}.`);
+  r.readAsDataURL(f);
+}
 export function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
       if (!S.health.images) { toast("warn", "Images are off", "This model runs without images: Models › Engine settings turns them on when it can."); continue; }
       if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
-      const r = new FileReader();
-      r.onload = () => attached({kind: "image", name: f.name || "pasted image", url: r.result});
-      r.readAsDataURL(f);
+      asDataUrl(f, "image");
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${S.health.images ? " or images" : ""}.`); continue; }
+    if (f.type.startsWith("video/")) {
+      if (!S.health.videos) {
+        toast("warn", "Videos are not read here", S.health.images ? `${f.name}: this model reads pictures, not videos.`
+          : `${f.name}: this model runs without images or videos (Models › Engine settings turns images on when it can).`);
+        continue;
+      }
+      if (f.size > VIDEO_MAX) { toast("warn", "Video too large", `${f.name} is over ${sizeLabel(VIDEO_MAX)}.`); continue; }
+      asDataUrl(f, "video");
+      continue;
+    }
+    if (!isTextFile(f)) { addViaServer(f); continue; }
     if (f.size > textLimit()) {
       const ctx = S.health.max_context;
       toast("warn", "File too large", `${f.name} (${sizeLabel(f.size)}) is over the limit for this model's ${ctx ? ctxfmt(ctx) + "-token " : ""}context ` +
@@ -629,11 +649,37 @@ export function addFiles(files) {
     const r = new FileReader();
     r.onload = () => {
       const text = String(r.result);
-      if (text.includes("\u0000")) { toast("warn", "Not a text file", `${f.name} looks like a binary file.`); return; }
+      // a text name on a file that is not UTF-8 text (UTF-16, Latin-1, a binary): the server knows more encodings and
+      // says what it is
+      if (text.includes("\u0000") || text.includes("\ufffd")) { addViaServer(f); return; }
       attached({kind: "file", name: f.name, text});
     };
     r.readAsText(f);
   }
+}
+// one file read by the server: its text arrives as an ordinary text part, a scanned PDF's pages as pictures for the
+// vision path like any attached image; the toast says what came of it, and anything unreadable says why
+export async function addViaServer(f) {
+  if (f.size > ATTACH_MAX) { toast("warn", "File too large", `${f.name} is over ${sizeLabel(ATTACH_MAX)}.`); return; }
+  let j;
+  try {
+    const r = await fetch("attach", {method: "POST", headers: {...headers(), "Content-Type": "application/octet-stream",
+                                                               "X-File-Name": encodeURIComponent(f.name || "file")},
+                                     body: await f.arrayBuffer()});
+    j = await r.json();
+  } catch (e) { toast("error", "The file could not be read", `${f.name}: ${e.message || e}.`); return; }
+  if (!j || j.error) { toast("error", `Not attached: ${f.name}`, (j && j.error && j.error.message) || "the server did not say why", 9000); return; }
+  const what = j.format || "File";
+  if (j.kind === "images") {
+    for (const [k, im] of (j.images || []).entries()) attached({kind: "image", name: `${f.name} · page ${k + 1}`, url: im.data});
+    toast("info", `${what} attached as pictures`, `${f.name}: ${j.pages} page${j.pages > 1 ? "s" : ""}` +
+      (j.note ? ` (${j.note})` : "") + ". It has no text layer; dense pages read better as text than as pictures.", 9000);
+    return;
+  }
+  attached({kind: "file", name: f.name, text: j.text});
+  if (j.format !== "text file" || j.truncated)
+    toast(j.truncated ? "warn" : "success", `${what} attached`, `${f.name}: ${fmt(j.text.length)} characters${j.pages ? ` from ${j.pages} pages` : ""}` +
+      (j.truncated ? " - the rest is over the limit for this model's context." : "."), 8000);
 }
 export function removeAttachment(i) {
   S.attachments = S.attachments.filter((_, k) => k !== i);

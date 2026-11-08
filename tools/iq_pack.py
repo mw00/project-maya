@@ -70,8 +70,9 @@ GLM5NEXT_BF16 = (
     "indexer.attn_q_b.weight", "indexer.attn_k.weight", "indexer_compressor_gate.weight",
     "indexer_compressor_ape.weight", "indexer.proj.weight", "indexer.k_norm.weight",
     "indexer.k_norm.bias",
-    # the router and its noaux_tc selection bias (F32 by config: moe_router_dtype float32)
-    "ffn_gate_inp.weight", "exp_probs_b.bias",
+    # the router (F32 by config: moe_router_dtype float32).  Its noaux_tc selection bias, exp_probs_b.bias, is NOT
+    # here: it stays F32 as stored (#861: BF16 left 6-11 distinct values of 288 in a layer)
+    "ffn_gate_inp.weight",
     # the KDA gates and norms (gates stay unquantized in the released model); the conv weights
     # seed the whole KDA recurrence, so their quantization noise would accumulate per token
     "ssm_a", "ssm_dt.bias", "ssm_norm.weight", "ssm_beta.weight",

@@ -28,6 +28,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 
 #include "strata/core/glm_split_devices.hpp"
+#include "strata/platform/env_switch.hpp"
 
 #include "ggml.h"
 
@@ -1582,7 +1583,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
     bool mtp = false;
     double mtp_dense = 0;
     std::unique_ptr<strata::GgufFile> extra;
-    if (fast && n == 2 && getenv("STRATA_GLM_NO_MTP") == nullptr) {
+    if (fast && n == 2 && !strata::platform::env_switch("STRATA_GLM_NO_MTP")) {
         const std::string P = "blk." + std::to_string(L) + ".";
         const char* mg = getenv("STRATA_GLM_MTP_GGUF");
         if (find(P + "nextn.eh_proj.weight") == nullptr && mg != nullptr && mg[0] != '\0') try {
@@ -1624,7 +1625,7 @@ static std::vector<int> glm_search_bounds(const std::string& pack_dir, int64_t m
             mtp = true;
         }
     }
-    const bool pipelined = n == 2 && mtp && getenv("STRATA_GLM_NO_SPEC") == nullptr;
+    const bool pipelined = n == 2 && mtp && !strata::platform::env_switch("STRATA_GLM_NO_SPEC");
     // a DFlash drafter's pipelined window (dflash_pipelined): the anchor crosses every part, and each draft kept behind
     // it costs about the slowest part, so a round of a kept drafts costs sum + a * slowest for a + 1 tokens (a ~1.5 at
     // the pipelined window's default cut); the batched one crosses the parts in turn (the parts added)
@@ -1939,7 +1940,7 @@ bool Glm5Model::load_pack_env(const std::string& pack_dir, int64_t max_ctx, std:
                               const std::string& layer_split) {
     if (const char* df = getenv("STRATA_GLM_DFLASH"); df != nullptr && df[0] != '\0') {
         dflash_path_ = df;
-        if (getenv("STRATA_GLM_NO_MTP") == nullptr) {
+        if (!strata::platform::env_switch("STRATA_GLM_NO_MTP")) {   // (unset, or 0 / off: it is set to 1)
 #if defined(_WIN32)
             _putenv_s("STRATA_GLM_NO_MTP", "1");
 #else
@@ -2025,7 +2026,8 @@ bool Glm5Model::load_pack_place(const std::string& pack_dir, int64_t max_ctx, st
             bounds = glm_search_bounds(pack_dir, max_ctx, devs);
         if (bounds.empty() && devs.size() == 2)
             bounds = {g_.n_layers / 2 +
-                      (getenv("STRATA_GLM_NO_MTP") == nullptr && getenv("STRATA_GLM_NO_SPEC") == nullptr ? 2 : 0)};
+                      (!strata::platform::env_switch("STRATA_GLM_NO_MTP") &&
+                               !strata::platform::env_switch("STRATA_GLM_NO_SPEC") ? 2 : 0)};
         if (bounds.empty()) bounds = glm_auto_bounds(pack_dir, g_.n_layers, devs);
     }
     if (devs.size() == 2 && getenv("STRATA_GLM_DEVS") == nullptr && !spec.empty() && spec != "auto")
@@ -3371,7 +3373,8 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     // (the pipelined speculative decode is a two-part one: a longer split leaves the block unloaded; one GPU loads it
     // for the one-GPU MTP decode - glm_mtp.cu: by default on the Strix / Gorgon Halo APUs)
     const bool mtp_one = l0_ == 0 && mtp_decode_wanted(dev_, n_parts_);
-    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) && getenv("STRATA_GLM_NO_MTP") == nullptr &&
+    if (fast_mode_ && l1_ == g_.n_layers && (g_.nextn > 0 || mtp_extra) &&
+        !strata::platform::env_switch("STRATA_GLM_NO_MTP") &&
         (l0_ > 0 || getenv("STRATA_GLM_MTP") != nullptr || mtp_one)) {   // any split: the speculative decode, 2+ parts
         if (!load_mtp(gfs, err)) return false;
         if (mtp_il_ >= 0) lt_ = l1_ + 1;

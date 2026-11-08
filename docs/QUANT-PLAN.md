@@ -26,7 +26,7 @@ Two quants of our own, made from the official weights with error-feedback roundi
   160 GB for the GPU), 2-4 TB Gen4 NVMe. It does the heavy passes: one MoE layer in BF16 is 14.5 GB, so a layer, its
   Hessians and the calibration activations all fit at once. BF16 is native here (the V100s don't have it). Needs
   PyTorch for ROCm (gfx1151-class); check that first.
-- **Mercury / Uranus**: the engine side.
+- **2x V100 / 1x V100 PCs**: the engine side.
   - Score every candidate quant in our engine (`MAYA_GLM_SCORE`: NLL, perplexity, top-1, and KL against a
     reference dump).
   - Add kernels for the new types.
@@ -108,7 +108,7 @@ Every tensor is quantized at each candidate GGUF type with **error-feedback roun
 - **Maya-specific: per-expert bits.** Our engine loads its own pack, so experts don't all need the same type.
   - Hot experts (high routing frequency and saliency) get more bits; the long tail gets fewer.
   - The GGUF version keeps one type per tensor so it still loads in llama.cpp.
-  - Usage on real text is very skewed (that is why Mercury's VRAM tier hits 97%), so this should buy more quality
+  - Usage on real text is very skewed (that is why the 2x V100 PC's VRAM tier hits 97%), so this should buy more quality
     per GB than anything else.
 - **Fixed floors against loops and drift**. These parts are only ~6 GB:
   - attention, MLA, KDA and shared experts at Q6_K-Q8_0
@@ -148,9 +148,9 @@ checks and the loop test. My expectation is that light or no pruning wins and pe
   - IFEval subset
   - MMLU-Pro (300)
   - a Portuguese chat set
-- **Speed** on Uranus (64 + 32) and Mercury.
+- **Speed** on the 1x V100 PC (64 + 32) and the 2x V100 PC.
 
-## Engine work (Mercury/Uranus)
+## Engine work (2x V100 / 1x V100 PCs)
 
 - **Done 2026-10-06: the decode kernels** for IQ2_XS 17, IQ2_S 22, IQ3_S 21 and IQ1_M 29, beside IQ2_XXS 16,
   IQ3_XXS 18, IQ1_S 19, IQ4_XS 23, Q2_K 10 and Q3_K 11.
@@ -186,10 +186,10 @@ The engine kernels go in parallel on the V100s.
     scales and grid choices, and a short distillation of the small floating-point parts against the
     FP8 teacher's outputs.
   - Every candidate passes the loop test before it is called a release.
-- **Made on Uranus** (the EVO-X5 slipped a day):
+- **Made on the 1x V100 PC** (the EVO-X5 slipped a day):
   - The FP8 source is on its PCIe 4 NVMe, and the 64 GB RAM holds the calibration activations.
-  - The V100 does the statistics pass; its CPUs, plus Mercury's, quantise.
-  - Mercury tests the two-GPU case.
+  - The V100 does the statistics pass; its CPUs, plus the 2x V100 PC's, quantise.
+  - The 2x V100 PC tests the two-GPU case.
 - **Vision:** the release carries the vision tower.
   - The FP8 checkpoint's 347 vision tensors are converted into an mmproj GGUF (BF16; Q8_0 measured as an option).
   - The engine's GLM vision path is a release item.

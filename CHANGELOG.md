@@ -4,6 +4,39 @@ Every release is on GitHub (Releases) with these notes; every published change m
 page's Settings › About and updates (About > Update before the redesign; from v1.0.18), or `git pull`, then `./setup.sh` (Windows: `START-MAYA.bat`) - it recompiles
 only what changed and starts; the model is not downloaded again.
 
+## v1.1.56 - 2026-11-06
+
+Attach any file in the chat - PDFs, Word, Excel, PowerPoint and more - with every model, and community pull requests: fixes, and opt-in speed-ups for AMD and multi-GPU PCs.
+
+- **Files in the chat (#837):** the attach button (and drag and drop) now takes any file, for every model:
+  - **PDFs** come in as their text. A scanned PDF with no text in it comes in as its first pages as pictures, for a model with images on. This works on every PC: Maya reads PDFs itself, and uses poppler first when it is installed.
+  - **Word, Excel, PowerPoint, OpenDocument, EPUB and RTF** files come in as their text (a spreadsheet as its sheets' rows).
+  - **Text and code** in any encoding come in as they are, whatever the file's name.
+  - **Videos** attach for the models that read them.
+  - A file Maya can't read (an old .doc, an archive, audio, a program) is not attached, and a message says what it is and what to send instead. A file over the model's context limit is cut, and the message says so.
+  - **APIs:** the same files work through OpenAI `file` / Responses `input_file` parts and Anthropic `document` blocks, sent inline.
+  - Built on the PDF work in #842 (thanks @org-tekeli-borisp).
+- **Fixes:**
+  - GLM on two GPUs: since v1.1.52 the drafting decode could crash ("illegal memory access") or slow to a crawl on some two-GPU PCs. A two-GPU split now drafts exactly as in v1.1.51, and a draft with no valid token can no longer read past its table on any setup (#860).
+  - `MAYA_GLM_NO_SPEC`, `MAYA_GLM_NO_MTP` and `MAYA_GLM_NO_PREFILL` set to `0`, `false`, `off` or `no` now mean off; before, any value turned them on (#860).
+  - GLM: a sampled request without a `seed` now gets a fresh random seed, so asking again gives a different answer; a `seed` in the request (or `--seed`) still repeats exactly (#845).
+  - GLM EXL3 packs: `MAYA_GLM_SPEC_WIN` no longer stops the load (#857).
+  - The pack tool keeps GLM-5.3-Flash's expert selection bias in full precision (F32) instead of rounding it (packs built from now on) (#861).
+  - DeepSeek on AMD: the VRAM BAR size is read correctly for the GPU-to-GPU all-reduce check (#809).
+  - The Engram RAM lock error now names the current memory-lock limit and how to raise it (#836).
+  - GLM: a saved conversation whose slot failed to load now tries the next saved slot and then the checkpoint, instead of reading the whole conversation again (#840, fixes #838, thanks @tragicwinds).
+  - DeepSeek: the loop guard now catches DeepSeek's repeated tool calls too; before, it never fired on DeepSeek (#844, thanks @oscarlius).
+  - DeepSeek EXL3 quants that name the drafter's head differently (turboderp's) now pack and draft with DSpark on (#835, thanks @pepuscz).
+  - `MAYA_DS4_LANE_PARITY` is honoured everywhere it applies (#852, thanks @pattalkslaw-del).
+  - The `DS4_HELPER_CHECK` diagnostic no longer fails at random on AMD (it read back through pageable memory) (#868, thanks @pepuscz).
+- **Speed-ups, AMD, EXL3 quants (the same answers, bit for bit):** on RDNA 3 / 3.5 (Strix / Gorgon Halo included) the prompt's expert kernels pick their block size by how many tokens an expert takes - about 39% less kernel time on the contributor's RX 7900 XTX (#864); and the decode kernels' inner product is inlined on every AMD GPU (#834) (thanks @pepuscz). Together, on a Gorgon Halo with DeepSeek-V4.1-Flash EXL3 2.25 bpw, against v1.1.55: decode **+4%** (32.3 -> 33.6 tok/s), prompt reading (prefill) **+3%** at 2K and 8K tokens, the same answers.
+- **Opt-in speed-ups** (off by default; each one in [docs/SETTINGS.md](docs/SETTINGS.md)):
+  - DeepSeek EXL3 read from the model's files, with a helper GPU: prompt experts the helper already holds are not read from the disk again - prompts about 2x faster on the contributor's two RX 7900 XTX plus an iGPU helper; the decode's look-ahead reads EXL3 experts too (`MAYA_DS4_FLOW_HELPER=1`, `MAYA_DS4_AHEAD_EXL3=1`; the same answers; #865, #866, thanks @pepuscz).
+  - DeepSeek on RDNA 2 (RX 6000) and on AMD with Maya-XS: two prompt settings, +18-33% prompt speed on the contributor's two RX 6900 XT (`MAYA_DS4_PROMPT_F16=1`, `MAYA_DS4_EXPERT_MMQ=1`; they change the answers slightly; #869, #870, thanks @danexpo).
+  - GLM's expert helper: EXL3 packs too, and the helper's work overlapped with the CPU's (+11% decode on the contributor's PC, the same bits); EXL3 decode on Pascal cards (`MAYA_GLM_HELPER_EXL3=1`, `MAYA_GLM_HELPER_OVERLAP=1`, `MAYA_GLM_EXL3_DECODE=legacy-f32`; #849, #850, #851, thanks @arpleasa).
+  - DeepSeek: lane parity for MXFP4 experts and tensor-parallel groups (#858, thanks @markrussi).
+  - GLM across several GPUs: direct GPU-to-GPU copies on any pair that supports it, not only the MI50 (`MAYA_GLM_P2P=1`, the same answers; #853, thanks @izabera).
+
 ## v1.1.55 - 2026-11-05
 
 Codex CLI works with Maya, web-chat answers always run to their end and survive a restart, and a few speed settings now on by default.

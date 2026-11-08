@@ -469,8 +469,12 @@ void rms_q8(float* h, const float* add, const float* w, float eps, int n, float*
 /// Q6_K or 8 = Q8_0), dequantized as ggml's to_float does (the same floats).  n_embd % 256 == 0.
 void embed_tok(const void* table, int type, int n_rows, const int* tok, int n_embd, float* out, cudaStream_t s);
 /// argmax over n floats -> *out (device int).  Ties: lowest index.  map: an index i >= map_from is written as
-/// map[i - map_from] (a draft head's gathered rows -> their token ids).
+/// map[i - map_from] (a draft head's gathered rows -> their token ids).  No finite value among the n (#860): *out is
+/// 0 - a valid id, map[] never read - and the current device's argmax_nonfinite() count goes up.
 void argmax(const float* x, int n, int* out, cudaStream_t s, const int* map = nullptr, int map_from = 0);
+/// How many argmax calls on the current device found no finite value since the process started (a synchronous read
+/// of a device word: call it with the device idle, never per token).  0 on a read error.
+unsigned argmax_nonfinite();
 /// argmax over x[0..n) with its value: out[0] the index (0x7fffffff when nothing is finite), out[1] the value's bits.
 void argmax_pair(const float* x, int n, int* out, cudaStream_t s);
 /// The pick of a row split in two at c0 from both halves' argmax_pair (b's index relative to c0): argmax's for the

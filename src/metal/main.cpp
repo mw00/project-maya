@@ -4,6 +4,7 @@
 //   maya-metal --gguf MODEL.gguf --ids 1,2,3 [--n 64]            greedy continuation of token ids, with timings
 #include "glm_metal.hpp"
 #include "spec.hpp"
+#include "../../include/strata/platform/env_switch.hpp"   // (header only; maya-metal's include path is src/metal)
 
 #include <chrono>
 #include <cstdio>
@@ -57,7 +58,7 @@ int main(int argc, char** argv) {
     std::vector<int32_t> ids;
     int n_gen = 32;
     maya::metal::GlmOptions o;
-    o.mtp = std::getenv("MAYA_GLM_NO_MTP") == nullptr && std::getenv("MAYA_GLM_NO_SPEC") == nullptr;
+    o.mtp = !strata::platform::env_switch("MAYA_GLM_NO_MTP") && !strata::platform::env_switch("MAYA_GLM_NO_SPEC");
     if (const char* v = std::getenv("MAYA_METAL_DSA_MM"); v && *v) o.dsa_mm = std::atoi(v) != 0;
     if (const char* v = std::getenv("MAYA_METAL_DSA_KERNEL"); v && *v) o.dsa_kernel = std::atoi(v) != 0;
     if (const char* v = std::getenv("MAYA_METAL_KV_F32"); v && *v) o.kv_f32 = std::atoi(v) != 0;

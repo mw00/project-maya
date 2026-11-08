@@ -9,6 +9,7 @@
 #pragma once
 #if !defined(_WIN32)
 #include <fcntl.h>
+#include <sys/resource.h>
 #endif
 
 #include "ds4_os.hpp"
@@ -172,8 +173,15 @@ public:
         const size_t chunk = 256ull << 20;
         for (size_t pos = 0; pos < length; pos += chunk) {
             if (::mlock(base + pos, std::min(chunk, length - pos)) != 0) {
+                // (#836: the distro default of 8 MB fails at the first chunk; say what the limit is and the durable fix)
+                std::string lim = "unknown";
+                struct rlimit rl{};
+                if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0)
+                    lim = rl.rlim_cur == RLIM_INFINITY ? "unlimited" : std::to_string((unsigned long long) rl.rlim_cur >> 10) + " KiB";
                 err = "Engram RAM: mlock failed: " + std::string(std::strerror(errno)) +
-                      "; check available RAM and RLIMIT_MEMLOCK (ulimit -l)";
+                      "; check available RAM and RLIMIT_MEMLOCK (ulimit -l is " + lim + "; to raise it for good add "
+                      "'<user> soft memlock unlimited' and '<user> hard memlock unlimited' to a file in "
+                      "/etc/security/limits.d/ and log in again)";
                 ::munlock(base, length); ::munmap(base, length); return false;
             }
             if ((pos / chunk) % 32 == 0 || pos + chunk >= length)

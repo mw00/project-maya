@@ -1,5 +1,7 @@
 <p align="center"><a href="README.md">English</a> | <a href="README.ja.md">日本語</a> | 简体中文 | <a href="README.pt-BR.md">Português</a></p>
 
+<p align="center"><img src="assets/maya-logo.png" width="128" alt="Maya logo"></p>
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>在你自己的 GPU 上运行 GLM-5.3-Flash (321 B)、DeepSeek-V4.1-Flash-1017 (748 B) 和 MiniMax-M3.1-Flash (428 B)</b><br>
@@ -36,6 +38,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 
 安装程序会询问你想用哪个模型，下载它，一次性构建所有内容，并**启动模型**。然后打开 `http://127.0.0.1:8080`。Windows 请用 `START-MAYA.bat` 代替 `./setup.sh`。详见[安装](#install)。
 
+全部文档：[docs/README.md](docs/README.md)
+
 ## <a name="the-models"></a><a name="deepseek-v41-flash-1017-new"></a><a name="minimax-m31-flash-new"></a>选择你的模型
 
 每个 Maya 量化版本都以模型名加档位命名：XS、S、M 或 L，按专家保留的位数划分。安装程序会为你的电脑推荐一个；想自己选，请给出它的安装 ID：`./setup.sh --model glm-maya-s24`。
@@ -52,6 +56,8 @@ git clone https://github.com/mw00/project-maya.git && cd project-maya
 | | Maya-XS (v2) · `deepseek-maya-xs` | 277 GB | 整个模型装进 128 GB 电脑的内存 (Engram 表留在固态硬盘上)；v2 比 v1 更接近原版约 12%，写作速度快约 20% - 再次运行安装程序会提示更新 |
 | **[MiniMax-M3.1-Flash](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)**<br><sub>MiniMax · [MiniMax Community License](LICENSE.minimax-m31) · 428 B，激活 23 B · 最高 1M 上下文</sub> | Maya-XS · `minimax-maya-xs` | 93 GB | 整个模型装进 128 GB 电脑的内存 |
 | | Maya-S · `minimax-maya-s` | 122 GB | 更接近原版 |
+
+**哪个模型适合你的电脑？** 请看 [docs/MEMORY.md](docs/MEMORY.md)，里面有每个模型的推荐内存（VRAM 与 RAM 合计）。
 
 它们都能在 V100 / RTX 20 及更新的 NVIDIA 显卡上运行，也支持 AMD 和 Windows (见[你需要什么](#what-you-need))。DeepSeek 的大小包含其 Engram 表。安装程序还提供 unsloth 的 GGUF 和 LibertAIDAI 的 DeepSeek EXL3 量化、orcarouter 的 abliterated DeepSeek、Mia-AiLab 的 MiniMax EXL3 量化、turboderp 的 GLM EXL3 量化，以 Q5_K_M GGUF 提供的 Qwen-3.8-Flash-Next (CYBER-FROST)，以及以 unsloth 的 UD-IQ2_XS GGUF 提供的 Qwen-3.8-Flash-Next 本身 (两者都支持图片) ([其设置](docs/SETTINGS.md#qwen-38-flash-next-cyber-frost))。**每个模型的文件、草稿模型、图片和选项：[docs/MODELS.md](docs/MODELS.md)。**
 
@@ -97,6 +103,8 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **4x RTX 3090 24 GB** (PCIe 4.0 x8 behind one switch), Xeon Platinum 8260M, 376 GB RAM | Maya-L, 1M context | 44.2 tokens/s (tuned) | 698 tokens/s | @foureight84 (v1.1.17, #302) |
 | **2x Radeon AI PRO R9700 32 GB** (gfx1201, PCIe 4.0 x8 each), Ryzen 5 3600, 64 GB RAM | Maya-S24 / Maya-M-Derisked, 256K context | 44.1 / 24.9 tokens/s | 704 / 617 tokens/s | @gegnep (v1.1.20, #395) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x16, power-capped at 250 W), EPYC 7452, 256 GB RAM | Maya-M / Maya-L, 128K context | 44.0 / 30.2 tokens/s | 860 / 801 tokens/s | @orochifj (v1.1.4, #165) |
+| **8x AMD Instinct MI50 32 GB** (gfx906, PCIe), EPYC 7K62, 112 GB RAM | Maya-L, 128K context | 43.3 tokens/s | 288 tokens/s | @abluesheep (v1.1.52, #830) |
+| **RTX PRO 6000 Blackwell 96 GB** (PCIe 5.0 x16), Ryzen 9 9950X3D, 253 GB RAM, Windows 11 | Maya-L, a coding-agent session grown from 265K to 482K tokens | 42.4 tokens/s (median of 51 answers) | - | @Andrey0710 (v1.1.53, #873) |
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-S24 | 40.5 tokens/s | 1271 tokens/s | @fuad00 (v1.1.0, #122) |
 | **RTX PRO 6000 Blackwell 96 GB** (PCIe 4.0 x16), Ryzen 5 5600, 92 GB DDR4 | Maya-L, 1M context | 39.6 tokens/s | 2708 tokens/s (3246 warm) | @QueTensors (v1.1.28, #532) |
 | **4x Tesla T10 15 GB** (PCIe 3.0 x16), Xeon E5-2680 v4, 63 GB RAM | Maya-S24, 100K context | 38.4 tokens/s | 393 tokens/s | @zeallag (v1.1.16, #291) |
@@ -159,6 +167,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **4x RTX 3090 24 GB** (PCIe 4.0 x16), Threadripper PRO 3975WX, 502 GB RAM | UD-Q8_K_XL, 256K context | 37.1 tokens/s | 596 tokens/s | @bandito1 (v1.1.50, #766) |
 | **4x RX 7900 XT 20 GB** (gfx1100, `--tp 4`, tuned), 2x Xeon E5-2699C v4 (a Dell T7910), 1 TB DDR4-2400 | UD-Q4_K_XL | 35.0 tokens/s | - | @Cass67 (v1.1.32, #566) |
 | **2x RTX 3090 24 GB** (PCIe 4.0 x8, 270 W), Core Ultra 7 265K, 192 GB DDR5 | Maya-S, 1M context, tuned | 33.3 tokens/s | 467 tokens/s | @Jellepepe (v1.1.35, #614) |
+| **2x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v4, 128 GB DDR3-1866 | Maya-XS (v2), 256K context, DSpark | 32.0 tokens/s | 420 tokens/s | @c200762620-max (v1.1.51, #815) |
 | **3x Tesla V100 32 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v3, 128 GB DDR3L, Windows 10 | Maya-S, 64K context | 23-26 tokens/s (long answers) | 377 tokens/s | @noahark (v1.1.26, #450) |
 | **2x RTX 2080 Ti 22 GB** (modded, PCIe 3.0 x16, power-capped at 250 W), 2x Xeon E5-2696 v4, 94 GB RAM | Maya-XS, 128K context | 23.1 tokens/s | 317 tokens/s | @NorwinYu (v1.1.36, #659) |
 | **2x RTX 4090 24 GB** (PCIe 3.0 + 4.0 x16), 2x Xeon Silver 4309Y, 188 GB RAM | Maya-XS, 64K context | 21.5 tokens/s | 573 tokens/s | @fuad00 (v1.1.22, #393) |
@@ -177,6 +186,7 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 | **1x L40S 48 GB** (vGPU), Xeon Platinum 8580 (a VM, 32 vCPUs), 504 GB RAM | Maya-S / EXL3 3.55 bpw, 256K context | 23.4 / 16.7 tokens/s | 332 / 273 tokens/s (158K) | @talisp (v1.1.32, #577) |
 | **2x RTX 3090 24 GB** (power-capped at 230 W), EPYC 7543 (a VM, 32 vCPUs), 224 GB RAM | Maya-S, 200K context, DSpark | 22.0 tokens/s (code), 18.4 (prose) | 163 tokens/s (10K) | @noonghunna (v1.1.30, #549) |
 | **AMD Radeon 8065S** (Ryzen AI Max+ PRO 495, 192 GB, 160 GB of it for the GPU), Windows 11 | Maya-S, 128K context, DSpark | 21.0 tokens/s | 139 tokens/s | @tobitege (v1.1.37, #663) |
+| **2x Tesla V100 16 GB** (PCIe 3.0 x16), 2x Xeon E5-2696 v4, 128 GB DDR3-1866 | Maya-XS, 256K context, DSpark | 14.5 tokens/s | 254 tokens/s | @c200762620-max (v1.1.51, #816) |
 
 </details>
 
@@ -194,6 +204,8 @@ Maya 的量化版本由各模型公开发布的权重制作，并与原版对比
 - **思考：** Off、Low、High (默认) 或 Max，可在设置中或按请求指定；还有一个**思考预算**字段，设置模型在回答前最多可以思考多少个 token。
 - **循环防护：** 默认开启 - 当智能体用同样的结果反复发出同一个工具调用时，会被引导走出循环。
 - **图片：** 在聊天中附加，或通过任一 API 发送图片内容。每个模型都能读取图片 (各模型的安装细节：[docs/MODELS.md](docs/MODELS.md))。
+- **MCP 工具：** 在配置中列出 MCP 服务器 (`"mcp_servers"`；Claude Desktop 的 `mcpServers` 块可原样使用)，网页聊天中的模型就能调用它们的工具。聊天的 **+** 菜单里有开关。具体行为见 [serve/mcp.py](serve/mcp.py)。
+- **Docker：** 没有官方镜像。[docs/DOCKER.md](docs/DOCKER.md) 是基于某个发布版本构建镜像的方法。
 - **从其他设备访问：** `./maya.sh --setup --host 0.0.0.0 --api-key <secret>`。务必设置密钥。
 - **调优：** `./maya.sh --calibrate` 用 10-15 分钟让引擎适配你的硬件。全部设置：[docs/SETTINGS.md](docs/SETTINGS.md)。
 - <a name="deepseek-engram-prompt-read-ahead"></a><a name="deepseek-conversations-kept"></a><a name="deepseek-loading-the-experts"></a>**各模型自己的选项** - GLM-5.3-Flash 的同时多请求 (`--parallel`)、长上下文和 DFlash2 草稿模型；DeepSeek 的会话保留、专家加载和 Engram 预读；MiniMax 的思考级别：[docs/MODELS.md](docs/MODELS.md)。

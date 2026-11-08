@@ -115,6 +115,27 @@ class Api(Served):
         self.assertIn("hello", b["response"])
         self.assertEqual(self.req("POST", "/api/chat", {"model": "nope", "messages": [{"role": "user", "content": "x"}]})[0], 404)
 
+    def test_think_false_turns_thinking_off(self):
+        """"think": false reaches the template as enable_thinking False, also over the web app's shared thinking level;
+        true or no "think" leave thinking on (v1.1.56 dropped the false: thinking stayed on)."""
+        seen, real = [], Service.prepare
+
+        def spy(svc, messages, tools, kw, *a, **k):
+            r = real(svc, messages, tools, dict(kw), *a, **k)
+            seen.append((kw.get("enable_thinking"), r[1]))
+            return r
+        bodies = (("/api/chat", {"messages": [{"role": "user", "content": "hi"}]}), ("/api/generate", {"prompt": "hi"}))
+        with mock.patch.object(Service, "prepare", spy):
+            for shared in ({}, {"reasoning_effort": "high"}):
+                self.svc.shared = shared
+                for path, body in bodies:
+                    for think in (False, True, None):
+                        b = {"model": self.run_name, "stream": False, **body}
+                        if think is not None:
+                            b["think"] = think
+                        self.assertEqual(self.req("POST", path, b)[0], 200, (path, think, shared))
+        self.assertEqual(seen, [(False, False), (None, True), (None, True)] * 4)
+
     def test_keep_alive(self):
         self.svc.idle_unload_s = 600.0
         self.req("POST", "/api/generate", {"model": self.run_name, "prompt": "hi", "stream": False, "keep_alive": "5m"})

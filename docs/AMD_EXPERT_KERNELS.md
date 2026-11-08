@@ -30,7 +30,7 @@ IQ3_XXS keeps its 1 KiB codebook in LDS. The grid selection and sign operations
 are HIP-only.
 
 The signed-codebook technique was adapted from
-[Strata's moe_fused_iq.cu](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/src/prefill/moe_fused_iq.cu)
+[the upstream engine's moe_fused_iq.cu](https://github.com/Niko1221/Strata/blob/fb58e0dbc8399662c0e47c76578c6e878b14f6cf/src/prefill/moe_fused_iq.cu)
 (MIT). Its HIP sign lookup tables were measured first; direct sign arithmetic
 performed better here. The benchmark retains alternatives for reproducible
 comparison: sign LUTs, global/LDS codebooks, eight/sixteen gate waves,

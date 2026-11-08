@@ -12,6 +12,12 @@ other model shapes are unsupported by this adapter. Unset the plugin to retain
 Maya's existing execution path. Unsupported plugin configurations report errors;
 they do not silently switch to another backend.
 
+Upstream's native helper EXL3 and `MAYA_GLM_HELPER_OVERLAP=1` paths are preserved.
+The external executor does not implement their asynchronous enqueue/wait API;
+requesting native helper overlap with the plugin fails explicitly. Leave that
+setting unset for CUDA+HIP. This is separate from the plugin's grouped prefill
+overlap, which remains supported.
+
 ## Paired setup and launcher
 
 The normal installer already separates CUDA (`build/`) and HIP (`build-hip/`)

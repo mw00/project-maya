@@ -49,12 +49,13 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Iterator, Protocol
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+from serve import attach  # noqa: E402
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -3435,8 +3436,11 @@ class Service:
         media = media_of(messages)
         images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
-        if isinstance(self.vision, mm3_vision.Vision) and any(kind == "video" for kind, _ in media):
-            raise ValueError("MiniMax-M3.1 reads pictures, not videos")
+        if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
+            # the engines' own vision towers (DeepSeek, MiniMax) read pictures only: say so instead of dropping the
+            # video (with a picture next to it) or failing on a missing video encoder (without one)
+            raise ValueError(("MiniMax-M3.1" if isinstance(self.vision, mm3_vision.Vision) else "DeepSeek-V4.1-Flash")
+                             + " reads pictures, not videos")
         if images and isinstance(self.vision, ENGINE_VISION):
             # DeepSeek: the engine encodes the pictures itself; each placeholder the template wrote (user text's are
             # plain text, see render_ids) becomes its picture's span, the resized pixels go in the GENI file
@@ -3834,10 +3838,16 @@ class Service:
 
     def _block_suffixes(self, blocked, tools, kwargs):
         """{(name, args): (ToolRepeat, ids, thinks)}: for each blocked call (loop_guard.tool_blocked) the prompt that
-        follows the model's own `</tool_call>` when the server answers it itself - the template's call close, the tool
+        follows the model's completed tool-call block when the server answers it itself - its turn close, the tool
         result loop_guard.block_result, a user message loop_guard.block_note and the next assistant turn's opening
         (`thinks`: that opening is an open thinking block, which run() starts with loop_guard.block_steer).  None for
-        a template that does not end a call with </tool_call> or does not render a turn as a prefix of the next."""
+        a template with no supported call boundary or one that does not render a turn as a prefix of the next."""
+        call_end = CALL_END
+        if getattr(self.template, "deepseek", False):
+            from serve.ds41_encoding import dsml_token, tool_calls_block_name
+            # The parser rewrites DSML into CALL_END internally; the prompt and generated token IDs still use
+            # the original DSML. Slice after the outer block, not an invoke or a legacy tag inside an argument.
+            call_end = f"</{dsml_token}{tool_calls_block_name}>"
         out = {}
         for key, rep in blocked.items():
             call = {"id": "call_loop_guard", "type": "function",
@@ -3853,9 +3863,9 @@ class Service:
                 return None
             if kwargs.get("enable_thinking") is False and f.endswith("<think>"):
                 f += "</think>"                     # (as render_ids)
-            if not f.startswith(p) or CALL_END not in p:
+            if not f.startswith(p) or call_end not in p:
                 return None
-            out[key] = (rep, self.tok.encode(p[p.rindex(CALL_END) + len(CALL_END):] + f[len(p):], parse_special=True),
+            out[key] = (rep, self.tok.encode(p[p.rindex(call_end) + len(call_end):] + f[len(p):], parse_special=True),
                         f.rstrip().endswith("<think>"))
         return out
 
@@ -5785,7 +5795,7 @@ def make_handler(svc: Service):
                 # the web app's own files (serve/web): styles, script, icon sprite - same origin, no CDN
                 name = path[len("/web/"):]
                 types = {".css": "text/css; charset=utf-8", ".js": "text/javascript; charset=utf-8",
-                         ".svg": "image/svg+xml", ".webmanifest": "application/manifest+json"}
+                         ".svg": "image/svg+xml", ".png": "image/png", ".webmanifest": "application/manifest+json"}
                 f = ROOT / "serve" / "web" / name
                 ext = os.path.splitext(name)[1]
                 if "/" in name or "\\" in name or ext not in types or not f.is_file():
@@ -5843,6 +5853,9 @@ def make_handler(svc: Service):
                                  "max_text_file": text_file_limit(svc.engine.max_context),
                                  "model_label": svc.model_label,   # (the model first: "GLM-5.3 · Maya-S24")
                                  "images": svc.vision is not None, "api_key": bool(svc.api_key), "defaults": rec,
+                                 # videos: the llama.cpp encoder's (as /v1/models' input_modalities); DeepSeek's and
+                                 # MiniMax's engine-run towers read pictures only
+                                 "videos": isinstance(svc.vision, Vision),
                                  "version": MAYA_VERSION, "mcp_tools": bool(svc.mcp), "unloaded": svc.unloaded,
                                  # the web chat sends past answers' thinking back (a Qwen3.x template keeps it): the
                                  # history then reads as the model wrote it, and the next turn goes on from there
@@ -5976,6 +5989,9 @@ def make_handler(svc: Service):
                 if path == "/settings":
                     self._settings()
                     return
+                if path in ("/attach", "/pdf"):
+                    self._attach()
+                    return
                 if path == "/v1/strata/cancel":
                     self._job_cancel()
                     return
@@ -6062,6 +6078,12 @@ def make_handler(svc: Service):
                     self.end_headers()
                     self.wfile.write(body)
                     return
+                if path in ("/v1/chat/completions", "/v1/responses", "/v1/messages"):
+                    # file parts (OpenAI file / Responses input_file / Anthropic document): their text, or a
+                    # scanned PDF's pages as pictures, before anything reads the messages (serve/attach.py)
+                    attach.expand_request(req, {"/v1/responses": "responses", "/v1/messages": "anthropic"}.get(
+                        path, "openai"), want_images=svc.vision is not None,
+                        text_limit=text_file_limit(svc.engine.max_context))
                 if path == "/v1/chat/completions":
                     self._openai(req)
                 elif path == "/v1/responses":
@@ -6217,6 +6239,34 @@ def make_handler(svc: Service):
             print("[maya] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
                   if shared else "[maya] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
+
+        def _attach(self):
+            """POST /attach (and /pdf, its first name): a file the chat page attached that the browser cannot read
+            itself, as its raw bytes, its name in X-File-Name (percent-encoded) - back as text (PDF, Word, Excel,
+            PowerPoint, OpenDocument, EPUB, RTF, text in any common encoding), as a scanned PDF's pages in pictures
+            when the model reads pictures, or as the error the page shows (serve/attach.py, #837).  The app's own
+            page only, like the other dashboard routes: the API key answers it as everywhere, and where _own_page
+            asks for application/json this asks for application/octet-stream (or application/pdf) - a form can
+            carry neither, which is what the check is for."""
+            raw = self._body()      # (read first even when refused: an unread body resets the answer on Windows)
+            ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if ctype not in ("application/octet-stream", "application/pdf"):
+                self._json(415, {"error": {"message": "send the file's bytes as application/octet-stream"}})
+                return
+            origin = self.headers.get("Origin")
+            if origin and origin.split("://", 1)[-1] != self.headers.get("Host", ""):
+                self._json(403, {"error": {"message": "files are read only for Maya's own page"}})
+                return
+            if len(raw) > attach.MAX_BYTES:
+                self._json(413, {"error": {"message": f"the file is over the {attach.MAX_BYTES >> 20} MB a chat "
+                                                      "attachment can be"}})
+                return
+            name = unquote(self.headers.get("X-File-Name", "") or "")[:255] or ("file.pdf" if ctype ==
+                                                                                 "application/pdf" else "file")
+            # the same text-file cap health advertises (the page's own limit), and the same images flag: a model
+            # without vision gets a clear error instead of pictures its request would drop
+            self._json(200, attach.extract(name, raw, want_images=svc.vision is not None,
+                                           text_limit=text_file_limit(svc.engine.max_context)))
 
         def _sse(self):
             # token frames are small and flushed as they come; Nagle would otherwise hold one
@@ -6705,6 +6755,15 @@ def request_stop(stop: threading.Event, why: str) -> None:
         print(f"[maya] stopping ({why}): the engine ends", flush=True)
 
 
+def wait_for_stop(stop: threading.Event, step: float = 0.5) -> None:
+    """main()'s wait until the server stops. It polls the flag and never waits on the Event: the signal handlers
+    (stop_signals) run on this same thread, between steps, and call stop.set() - while Event.wait holds the Event's
+    lock, a SIGTERM / Ctrl+C landing in it made that stop.set() wait for the same lock forever (the server never
+    ended; only SIGKILL did). time.sleep is interruptible on Windows too: Ctrl+C / Ctrl+Break act within a step."""
+    while not stop.is_set():
+        time.sleep(step)
+
+
 def stop_signals(stop: threading.Event) -> None:
     """SIGTERM, SIGINT (Ctrl+C), SIGHUP (the terminal closed) and Windows' SIGBREAK (Ctrl+Break) stop the server
     (request_stop).  A later one is ignored while it stops - but a second Ctrl+C raises KeyboardInterrupt: at once.  A
@@ -7121,8 +7180,7 @@ def main() -> int:
     if a.parent_pipe:
         watch_parent(lambda why: request_stop(stop, why))
     try:
-        while not stop.wait(0.5):                      # (a timed wait: signal handlers run on Windows too)
-            pass
+        wait_for_stop(stop)
     except KeyboardInterrupt:
         request_stop(stop, "Ctrl+C")
     try:
