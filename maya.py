@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Project Maya - set up and start GLM-5.3-Flash, DeepSeek-V4.1-Flash-1017, MiniMax-M3.1-Flash or Qwen-3.8-Flash-Next
 (CYBER-FROST) on your own GPU(s).  Qwen-3.8-Flash-Next (CYBER-FROST): CUDA from V100 on and HIP, Linux and Windows, pictures too.
-GLM-5.3-Flash: CUDA on Linux and Windows; HIP: gfx1100/gfx1102/gfx1200/gfx1201/gfx1151 (gfx1030: experimental, not
+GLM-5.3-Flash: CUDA on Linux and Windows; HIP: gfx1100/gfx1200/gfx1201/gfx1151 (gfx1030: experimental, not
 validated), Linux and Windows, text only; Metal: experimental, macOS on Apple Silicon, GLM-5.3-Flash only, text only,
 one conversation at a time.  DeepSeek-V4.1-Flash-1017 and MiniMax-M3.1-Flash: CUDA from V100 on, Linux
 and Windows; on HIP too (their GGUFs and their EXL3 quants).
@@ -30,7 +30,7 @@ no tuning step - it balances its own split):
 
   1. checks the PC: NVIDIA GPU(s) of compute capability 7.0+ (6.x, Pascal: experimental), driver, CUDA toolkit (nvcc),
      the C++ compiler (g++; on Windows Visual Studio's Build Tools - 2019/2022 always, 2026 with CUDA 13.2+), CMake,
-     RAM, CPU; HIP checks AMD gfx1100/gfx1102/gfx1200/gfx1201/gfx1151 and ROCm 7 instead
+     RAM, CPU; HIP checks AMD gfx1100/gfx1200/gfx1201/gfx1151 and ROCm 7 instead
      (on Windows AMD's ROCm SDK wheels in .venv, offered when they are not there)
   2. asks: which GPUs (one, or several that split the layers), how much context, which model to download (GLM-5.3 ·
      Maya-S, Maya-S24, Maya-M, Maya-M-Derisked or Maya-L; or turboderp's EXL3 quant at 3.05 or 4.05 bits or the
@@ -103,8 +103,7 @@ VSTAMP = VBUILD / "MAYA-BUILD.json"
 MIN_CC = 60                                        # Pascal and newer (the GLM path; see arch_setting) ...
 VALIDATED_CC = 70                                  # ... Volta (V100) and newer validated, Pascal experimental (#212)
 MAX_GPUS = 16                                      # the layer split's parts at most (glm_model.hpp, kMaxParts)
-HIP_ARCHS = ("gfx1100", "gfx1102", "gfx1200", "gfx1201", "gfx1151")   # gfx1200: RX 9050 / 9060 XT (RDNA4, like gfx1201);
-                                                   # gfx1102: RX 7600 / 7600 XT (RDNA3, like gfx1101, community run #311);
+HIP_ARCHS = ("gfx1100", "gfx1200", "gfx1201", "gfx1151")   # gfx1200: RX 9050 / 9060 XT (RDNA4, like gfx1201);
                                                    # Maya also supports Strix Halo (unified memory)
 HIP_ARCHS_UNVALIDATED = ("gfx1030",)               # RDNA 2 (RX 6800 / 6900, Radeon PRO V620 / W6800), experimental: not
                                                    # validated on a card; no matrix cores, the portable kernels; compiled
@@ -1174,10 +1173,9 @@ def check_hip_pc(a, installed=False, text_only=True) -> dict:
     for g in found:
         say(f"    {gpu_label(g)} - " + ("can be used" if g in usable else "not supported by Maya's HIP build"))
     if not usable:
-        fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 7600 / 7600 XT "
-             "(gfx1102), RX 9050 / 9060 XT (gfx1200), RX 9070 / AI PRO R9700 (gfx1201), and Strix Halo / Gorgon "
-             "Halo, Radeon 8050S / 8060S / 8065S (gfx1151); experimental, not validated: RX 6800 / 6900, Radeon "
-             "PRO V620 / W6800 (gfx1030)")
+        fail("no supported AMD GPU found", "this port targets RX 7900 XT / XTX (gfx1100), RX 9050 / 9060 XT "
+             "(gfx1200), RX 9070 / AI PRO R9700 (gfx1201), and Strix Halo / Gorgon Halo, Radeon 8050S / 8060S / "
+             "8065S (gfx1151); experimental, not validated: RX 6800 / 6900, Radeon PRO V620 / W6800 (gfx1030)")
     if WIN and hipinfo and all(g.get("source") == "registry" for g in found):
         warn(f"ROCm's hipInfo sees no AMD GPU (the list above is Windows'): the engine cannot start until it does - "
              f"update AMD's driver (AMD Software: Adrenalin Edition, https://www.amd.com/en/support), restart, and "
@@ -7017,7 +7015,7 @@ def main() -> int:
     stop_signals()            # (SIGTERM / SIGHUP stop it as Ctrl+C does: the server it runs with it)
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--backend", choices=["cuda", "hip", "metal"],
-                    help="GPU backend (HIP: gfx1100/gfx1102/gfx1200/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
+                    help="GPU backend (HIP: gfx1100/gfx1200/gfx1201/gfx1151 on Linux and Windows; Metal: experimental, "
                          "Apple Silicon Macs, text only; the default on a Mac)")
     ap.add_argument("--setup", action="store_true", help="set up again instead of starting the installed model")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
@@ -7094,7 +7092,7 @@ def main() -> int:
                          "up (MiniMax: no KV streaming and no DSpark while N is above 1)")
     ap.add_argument("--vram-reserve-mib", type=int, metavar="N",
                     help="VRAM in MiB the expert pool leaves free on each GPU for the driver, the desktop and other "
-                         "programs (default 700; on a unified-memory APU also in its GTT budget), kept in the config")
+                         "programs (default 700), kept in the config")
     ap.add_argument("--mmap-experts", choices=["auto", "on", "off"],
                     help="DeepSeek: the experts VRAM does not hold - read in place from the files (auto, the default), "
                          "or off: copied into RAM (with DS4_REQUIRE_ALL_RAM=1 all of them); kept in the config")
@@ -7191,15 +7189,6 @@ def main() -> int:
                 set_arg(cfg.setdefault("args", []), "--mmap-experts", a.mmap_experts)
                 pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
                 ok(f"{pick.name}: --mmap-experts {a.mmap_experts}")
-        if getattr(a, "vram_reserve_mib", None) is not None:   # (given on a start too - written into the config, kept)
-            cfg = read_json(pick)
-            if cfg.get("backend") == "metal":
-                warn("--vram-reserve-mib is not a Metal setting: this config does not use it")
-            else:
-                flag = "--reserve-mib" if config_family(cfg) == "deepseek" else "--vram-reserve-mib"
-                set_arg(cfg.setdefault("args", []), flag, a.vram_reserve_mib)
-                pick.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-                ok(f"{pick.name}: {flag} {a.vram_reserve_mib} (VRAM kept free beside the expert pool)")
         if (a.calibrate or a.speed_calibration) and read_json(pick).get("backend") == "metal":
             ok("the Metal engine has no CPU lane to tune and no drafter to measure: nothing to tune")
             a.calibrate = a.speed_calibration = False

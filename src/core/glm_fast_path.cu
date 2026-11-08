@@ -581,34 +581,6 @@ static int64_t avail_ram_now() {
 #endif
 }
 
-// see glm_fast_state.hpp: the amdgpu driver's sysfs for the card on this device's PCI address.  HIP's device order
-// maps to the cards through their symlinks (cardN/device -> .../0000:xx:yy.z, the bus id HIP reports, lowercased).
-std::pair<size_t, size_t> glmfast::gtt_info(int dev) {
-#ifdef __linux__
-    char bus[32] = {0};
-    if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, dev) != cudaSuccess) {
-        cudaGetLastError();
-        return {0, 0};
-    }
-    std::string b = bus;
-    for (char& ch : b) ch = (char) std::tolower((unsigned char) ch);
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator("/sys/class/drm", ec)) {
-        const std::string n = e.path().filename().string();
-        if (n.rfind("card", 0) != 0 || n.find_first_not_of("0123456789", 4) != std::string::npos) continue;
-        const auto target = std::filesystem::read_symlink(e.path() / "device", ec);
-        if (ec || target.filename().string() != b) continue;
-        long long total = -1, used = -1;
-        std::ifstream((e.path() / "device" / "mem_info_gtt_total").string()) >> total;
-        std::ifstream((e.path() / "device" / "mem_info_gtt_used").string()) >> used;
-        return total > 0 && used >= 0 ? std::make_pair((size_t) total, (size_t) used) : std::make_pair((size_t) 0, (size_t) 0);
-    }
-#else
-    (void) dev;
-#endif
-    return {0, 0};
-}
-
 static void numa_pinned_free(void* p, size_t bytes) {
 #ifdef __linux__
     cudaHostUnregister(p);
@@ -1348,19 +1320,6 @@ bool Glm5Model::fast_setup(std::string& err) {
                                      "%zu MB reserve, experts need %.2f GB, pool budget %.2f GB\n", dev_,
                              (double) avail_kb / 1048576.0, head_gb, reserve >> 20,
                              (double) expert_bytes / 1073741824.0, (double) avail / 1073741824.0);
-            }
-            // the GTT cap (pool_budget's, against what the driver hands out now): the RAM sizing above can still
-            // promise more than the GTT has left beside the reserve - its total is below the box's RAM on a Strix
-            // Halo, and the desktop and other programs hold GTT beside this process
-            const auto [gtt, gused] = glmfast::gtt_info(dev_);
-            if (gtt > 0) {
-                const size_t room = gtt > gused + reserve ? gtt - gused - reserve : 0;
-                if (room < avail)
-                    std::fprintf(stderr, "glm fast: CUDA%d the GTT budget is %.2f GB with %.2f GB in use: the pool "
-                                         "keeps %zu MB free in it (--vram-reserve-mib), %.2f GB instead of %.2f\n",
-                                 dev_, (double) gtt / 1073741824.0, (double) gused / 1073741824.0, reserve >> 20,
-                                 (double) room / 1073741824.0, (double) avail / 1073741824.0);
-                avail = std::min(avail, room);
             }
         }
 #endif
@@ -6722,7 +6681,7 @@ int Glm5Model::fast_sample_verify(strata::kernels::SamplerParams& sp, std::strin
 // layer split search size from the same number, before the pool is carved (a discrete card's: fast_setup prices a
 // unified-memory APU's pool from its RAM).
 Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int part, size_t floor_b, size_t slot_b,
-                                             bool unified, int dev) {
+                                             bool unified) {
     PoolBudget b;
     const char* later = part > 0 ? getenv("STRATA_GLM_RESERVE_LATER_MB") : nullptr;
     const char* r = later != nullptr && later[0] ? later : getenv("STRATA_GLM_RESERVE_MB");
@@ -6745,14 +6704,6 @@ Glm5Model::PoolBudget Glm5Model::pool_budget(size_t free_b, size_t total_b, int 
             b.avail = room > b.reserve ? room - b.reserve : 0;
         } else {
             b.avail = free_b > b.reserve ? free_b - b.reserve : 0;   // (no /proc/meminfo: the old figure)
-        }
-        // the GTT cap: the RAM sizing above can still promise more than the driver's GTT budget has left - its
-        // total is what it hands out before allocations fail (a Strix Halo's is below its RAM), and the desktop and
-        // other programs hold GTT beside this process.  The pool keeps the reserve free in the GTT too.
-        const auto [gtt, gused] = glmfast::gtt_info(dev);
-        if (gtt > 0) {
-            const size_t room = gtt > gused + b.reserve ? gtt - gused - b.reserve : 0;
-            b.avail = std::min(b.avail, room);
         }
     } else {
         b.avail = glmfast::expert_pool_budget(false, free_b, 0, b.reserve, 0, 0);
@@ -6786,8 +6737,7 @@ size_t Glm5Model::mmq_scratch_reserve() {
 
 // this part's budget: the one above, less what pool_check found short of the reserve once it was written
 Glm5Model::PoolBudget Glm5Model::part_budget(size_t free_b, size_t total_b, size_t floor_b, size_t slot_b) const {
-    PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, fast_ != nullptr && fast_->unified_memory,
-                               dev_);
+    PoolBudget b = pool_budget(free_b, total_b, part_, floor_b, slot_b, fast_ != nullptr && fast_->unified_memory);
     b.avail = b.avail > pool_short_ ? b.avail - pool_short_ : 0;
     return b;
 }
