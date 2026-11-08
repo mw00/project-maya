@@ -206,6 +206,9 @@ bool read_cgroup_memory_stat(const std::filesystem::path& path, uint64_t current
     return true;
 }
 #endif
+}  // namespace
+
+namespace detail {
 
 bool available_memory_bytes(uint64_t& bytes) {
 #if defined(_WIN32)
@@ -273,7 +276,7 @@ bool available_memory_bytes(uint64_t& bytes) {
 #endif
 }
 
-}  // namespace
+}  // namespace detail
 
 // ================================ THE FILE-BACKED SOURCE ================================
 
@@ -590,7 +593,7 @@ bool FileExpertSource::pin_cache_complement(
 
     if (bytes > 0) {
         uint64_t physical = 0;
-        if (!available_memory_bytes(physical)) {
+        if (!detail::available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available RAM for the resident-memory safety check";
             return false;
         }
@@ -1503,7 +1506,7 @@ int drive_reads_at_once(int dfd, uint64_t file_bytes, uint64_t piece, std::strin
 uint64_t expert_ram_room(uint64_t* avail_out, uint64_t* headroom_out, bool unbuffered) {
     uint64_t avail = 0;
     const uint64_t total = total_memory_bytes();
-    if (!available_memory_bytes(avail)) avail = total / 2;   // (no reading of it: assume half the RAM is free)
+    if (!detail::available_memory_bytes(avail)) avail = total / 2;   // (no reading of it: assume half the RAM is free)
     // the file cache the other experts are read through needs this much; read unbuffered (O_DIRECT) they need none, and
     // the OS, the server and the engine's own buffers are what stays free
     uint64_t headroom = unbuffered ? std::max<uint64_t>(4ull << 30, total / 100 * 8)

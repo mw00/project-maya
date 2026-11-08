@@ -53,6 +53,11 @@ struct CgroupMemoryStat {
 /// Returns false when the required memory.stat counters were unavailable.
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes);
 
+/// The RAM free now (bytes): MemAvailable, bounded by the tightest cgroup-v2 ancestor limit when one is visible
+/// (an LXC's /proc/meminfo is the host's: its MemAvailable says nothing about the container's own limit).  The
+/// clean inactive file cache counts as available, as MemAvailable's does.  false when nothing readable.
+bool available_memory_bytes(uint64_t& bytes);
+
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
 bool make_cache_complement_plan(

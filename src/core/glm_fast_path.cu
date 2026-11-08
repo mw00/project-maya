@@ -563,13 +563,17 @@ int64_t glmfast::zfs_arc_reclaimable() {
 }
 
 // the RAM free now: MemAvailable and ZFS's reclaimable ARC (Windows: the smaller of the free RAM and the free commit,
-// which pinning is charged to); 0 when unknown
+// which pinning is charged to); 0 when unknown.  Linux reads it cgroup-aware first: in an LXC /proc/meminfo is the
+// host's, and its MemAvailable says nothing about this container's own limit (a 108 GB Strix Halo LXC read the
+// host's 114 GB free and sized the load past its cgroup - the pool OOMed and the server started it again, forever)
 static int64_t avail_ram_now() {
 #ifdef _WIN32
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
     return GlobalMemoryStatusEx(&ms) ? (int64_t) std::min(ms.ullAvailPhys, ms.ullAvailPageFile) : 0;
 #else
+    uint64_t cgroup_b = 0;
+    if (detail::available_memory_bytes(cgroup_b)) return (int64_t) cgroup_b;
     long long kb = 0;
     if (FILE* f = std::fopen("/proc/meminfo", "r")) {
         char line[256];
@@ -1718,6 +1722,13 @@ bool Glm5Model::fast_setup(std::string& err) {
         static int64_t total = -1, remaining = -1;
         static int remaining_layers = 0;
         static int64_t unpinned = 0;   // a parallel load: the earlier parts' planned tiers, none pinned yet
+        static int64_t unpinned_pools = 0;   // ... and the earlier unified parts' pools (reserved, not yet touched)
+        // a unified-memory APU: this part's pool above is GTT into the same RAM the tier pins - reserved, but its
+        // pages are only touched once the tiers warm (the written check skips an APU), so the free figure still
+        // counts it.  Take it out of the budget here, or the tier double-books the pool and the warm-up OOMs (a
+        // Strix Halo LXC: pool 56 + tier 45 GB pinned on a 108 GB box)
+        const int64_t pool_b = F->unified_memory && ram_budget_ < 0
+                                   ? (int64_t) (F->pool_bytes + F->xpool_bytes) : 0;
         const auto pinned_pf = prefill_pinned();
         const int later = n_parts_ - 1 - part_;   // the parts that start after this one
         const int64_t unseen_pf = (int64_t) std::max(0, later - 1) * (int64_t) pinned_pf.staging +
@@ -1751,19 +1762,26 @@ bool Glm5Model::fast_setup(std::string& err) {
                                          (double) ms.ullAvailPhys / G, (double) ms.ullAvailPageFile / G, short_gb + 4.0);
                     }
 #else
-                    if (FILE* mf = std::fopen("/proc/meminfo", "r")) {
-                        char line[256];
-                        while (std::fgets(line, sizeof line, mf))
-                            if (std::sscanf(line, "MemAvailable: %lld kB", (long long*) &avail_kb) == 1) break;
-                        std::fclose(mf);
-                    }
-                    if (const int64_t arc = glmfast::zfs_arc_reclaimable(); arc > 0 && avail_kb > 0) {
-                        avail_kb += arc >> 10;
-                        std::fprintf(stderr, "glm fast: ZFS's ARC holds %.1f GB above its floor: counted as free RAM "
-                                             "(it gives it back under pressure)\n", (double) arc / 1073741824.0);
+                    // cgroup-aware first (an LXC's /proc/meminfo is the host's - see avail_ram_now)
+                    uint64_t cgroup_b = 0;
+                    if (detail::available_memory_bytes(cgroup_b)) {
+                        avail_kb = (int64_t) (cgroup_b / 1024);
+                    } else {
+                        if (FILE* mf = std::fopen("/proc/meminfo", "r")) {
+                            char line[256];
+                            while (std::fgets(line, sizeof line, mf))
+                                if (std::sscanf(line, "MemAvailable: %lld kB", (long long*) &avail_kb) == 1) break;
+                            std::fclose(mf);
+                        }
+                        if (const int64_t arc = glmfast::zfs_arc_reclaimable(); arc > 0 && avail_kb > 0) {
+                            avail_kb += arc >> 10;
+                            std::fprintf(stderr, "glm fast: ZFS's ARC holds %.1f GB above its floor: counted as free "
+                                                 "RAM (it gives it back under pressure)\n",
+                                         (double) arc / 1073741824.0);
+                        }
                     }
 #endif
-                    total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf);
+                    total = std::max<int64_t>(0, avail_kb * 1024 - head_b - unseen_pf - pool_b);
                 }
                 remaining = total;
                 remaining_layers =
@@ -1774,13 +1792,18 @@ bool Glm5Model::fast_setup(std::string& err) {
                                        : std::min<int64_t>(remaining, (int64_t) ((double) remaining * (double) n_moe /
                                                                                  (double) std::max(1, remaining_layers)));
             // a later part: no more than is free now, less what is still to come and half the headroom (a parallel
-            // load: and less the earlier parts' tiers, planned but not pinned yet)
+            // load: and less the earlier parts' tiers, planned but not pinned yet, and their untouched pools)
             if (part_ > 0 && !fixed_ram) {
                 const int64_t now = avail_ram_now();
                 if (now > 0)
-                    budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - unpinned - head_b / 2 - unseen_pf));
+                    budget = std::min<int64_t>(budget, std::max<int64_t>(0, now - unpinned - unpinned_pools - pool_b -
+                                                                            head_b / 2 - unseen_pf));
             }
         }
+        // this part's pool joins the later parts' measurement (a unified one is reserved but untouched, see pool_b
+        // above; the tiers it plans are added to `unpinned` once they are planned, below) - a staging-only tier
+        // (the pool holds every expert) skips the budget block above, the pool's RAM claim counts all the same
+        unpinned_pools += pool_b;
         F->rc.assign(cls_stride.size(), FastState::RamClass{});
         std::vector<int64_t> cls_n(cls_stride.size(), 0), cls_cap(cls_stride.size(), 0);
         for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
