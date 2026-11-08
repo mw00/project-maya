@@ -52,6 +52,13 @@ def step(n, title):
     say(f"=== Step {n}: {title} ===")
 
 
+def model_named(name):
+    """The model being set up (or started), once it is known: the setup's screen names it under its logo.  Nothing is
+    printed without the screen."""
+    if UI is not None and hasattr(UI, "model"):
+        UI.model(name)
+
+
 def ok(msg):
     if UI is not None and UI.ok(msg):
         return
