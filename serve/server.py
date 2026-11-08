@@ -37,6 +37,7 @@ import os
 import queue
 import socket
 import re
+import shutil
 import subprocess
 import struct
 import sys
@@ -1800,7 +1801,9 @@ class Vision:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
-                return self.cache[key]
+                if self.cache[key][0].is_file():
+                    return self.cache[key]
+                del self.cache[key]
             if self.proc is None:
                 self._start()
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
@@ -1855,7 +1858,9 @@ class Vision:
         key = hashlib.sha256(data).hexdigest()[:32]
         with self.lock:
             if key in self.cache:
-                return self.cache[key]
+                if self.cache[key][0].is_file():
+                    return self.cache[key]
+                del self.cache[key]
             vid, out = self.dir / f"{key}.vid", self.dir / f"{key}.sve"
             vid.write_bytes(data)
             # a long video is many frames (every one an image's tokens): refused before it is decoded
@@ -3475,12 +3480,26 @@ class Service:
                 self.ensure_engine()                     # (the encoder borrows the engine's memory: it must run)
                 with self.vision.active():
                     enc = []
-                    for kind, src in media:
-                        if cancel is not None and cancel.is_set():
-                            raise ValueError("image preparation was cancelled")
-                        enc.append((kind, self.vision.encode(src) if kind == "image"
-                                    else self.vision.encode_video(src)))
+                    combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
+                    try:
+                        with open(combined, "wb") as target:
+                            for kind, src in media:
+                                if cancel is not None and cancel.is_set():
+                                    raise ValueError("image preparation was cancelled")
+                                item = self.vision.encode(src) if kind == "image" else self.vision.encode_video(src)
+                                enc.append((kind, item))
+                                # Own the bytes before the next encode can evict this cache entry. active()
+                                # holds the encoder lock, so another preparation cannot evict it mid-copy.
+                                with open(item[0], "rb") as source:
+                                    shutil.copyfileobj(source, target)
+                    except OSError as e:
+                        combined.unlink(missing_ok=True)
+                        raise BadBody(503, "vision embeddings could not be prepared. Retry the request.") from e
+                    except BaseException:
+                        combined.unlink(missing_ok=True)
+                        raise
                 if cancel is not None and cancel.is_set():
+                    combined.unlink(missing_ok=True)
                     raise ValueError("image preparation was cancelled")
             literal = self.tok.encode(image_pad, parse_special=False)
             encoded = [e for kind, e in enc if kind == "image"]
@@ -3497,6 +3516,7 @@ class Service:
                 else:
                     out.append(t)
             if k != len(encoded):
+                combined.unlink(missing_ok=True)
                 raise ValueError("the prompt and its images do not match")
             ids = out
             # each <|video|> marker -> its frames, every frame an independent image wrapped in the image's own
@@ -3515,12 +3535,9 @@ class Service:
                     else:
                         out.append(t)
                 if k != len(videos):
+                    combined.unlink(missing_ok=True)
                     raise ValueError("the prompt and its videos do not match")
                 ids = out
-            combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
-            with open(combined, "wb") as f:
-                for _, (path, _) in enc:
-                    f.write(path.read_bytes())
             self.embeddings.path = combined
         if self.engine.max_context <= 0:   # (a reload / /models/load: the start has not reported its context yet)
             raise BadBody(503, "the model is starting; try again in a moment")
