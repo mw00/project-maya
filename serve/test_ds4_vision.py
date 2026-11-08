@@ -103,5 +103,108 @@ class Template(unittest.TestCase):
         self.assertIn(DV.Geometry().image_token, self.tok.encode(prompt, parse_special=True))
 
 
+class ImageUUIDs(unittest.TestCase):
+    def test_uuid_reuse_miss_and_lru(self):
+        from unittest.mock import patch
+        loads = []
+        def load(source):
+            loads.append(source)
+            return source.encode()
+        with tempfile.TemporaryDirectory() as directory:
+            vision = DV.Vision(DV.Geometry(), Path(directory), load)
+            vision.IMAGE_IDS_MAX = 2
+            with patch.object(DV, "prepare", side_effect=lambda data, g: data):
+                first = vision.picture({"source": "red", "uuid": "a"})
+                self.assertEqual(vision.picture({"source": "blue", "uuid": "a"}), first)
+                self.assertEqual(vision.picture({"source": None, "uuid": "a"}), first)
+                self.assertEqual(loads, ["red"])
+                vision.picture({"source": "blue", "uuid": "b"})
+                vision.picture({"source": None, "uuid": "a"})
+                vision.picture({"source": "green", "uuid": "c"})
+                with self.assertRaisesRegex(DV.ImageCacheMiss, r"Cache miss for image at index 3 but data is not provided\."):
+                    vision.picture({"source": None, "uuid": "b", "index": 3})
+                self.assertEqual(len(vision.image_ids), 2)
+                self.assertEqual(vision.picture("red"), first)
+
+    def test_openai_uuid_roundtrip_and_error(self):
+        from serve.frontend import openai_to_messages, deepseek_images
+        from serve.ds41_encoding import _extract_image
+        from serve.server import error_body
+        req = {"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}, "uuid": "a"},
+            {"type": "image_url", "image_url": None, "uuid": "a"}]}]}
+        messages, _, _ = openai_to_messages(req, deepseek=True)
+        images = deepseek_images(messages, with_ids=True)
+        self.assertEqual(images, [{"source": "data:image/png;base64,abc", "uuid": "a", "index": 0},
+                                  {"source": "", "uuid": "a", "index": 1}])
+        self.assertEqual(_extract_image(req["messages"][0]["content"][1])["uuid"], "a")
+        with self.assertRaises(ValueError):
+            _extract_image({"type": "image_url", "image_url": None})
+        message = "Cache miss for image at index 1 but data is not provided."
+        self.assertEqual(error_body(DV.ImageCacheMiss(message)), {"error": {
+            "type": "BadRequestError", "message": message, "param": None, "code": 400}})
+
+
+class ImageUUIDHTTP(unittest.TestCase):
+    def test_register_reuse_and_miss_before_streaming(self):
+        import http.client
+        import json
+        import threading
+        from unittest.mock import patch
+        from serve.server import serve
+        from serve.test_ds41_conformance import ServiceIntegration
+
+        with tempfile.TemporaryDirectory() as directory:
+            service = ServiceIntegration().service("</think>OK")
+            loads = []
+
+            def load(source):
+                loads.append(source)
+                return source.encode()
+
+            geometry = DV.Geometry(image_token=service.tok.special_tokens[DV.PLACEHOLDER])
+            service.vision = DV.Vision(geometry, Path(directory), load)
+            picture = DV.Picture(bytes(42 * 42 * 3), 42, 42, 1, 1)
+            httpd = serve(service, port=0)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+
+            def post(parts, stream):
+                connection = http.client.HTTPConnection("127.0.0.1", httpd.server_address[1], timeout=10)
+                try:
+                    request = {"model": "default", "stream": stream, "max_tokens": 16,
+                               "chat_template_kwargs": {"enable_thinking": False},
+                               "messages": [{"role": "user", "content": parts}]}
+                    connection.request("POST", "/v1/chat/completions", json.dumps(request),
+                                       {"Content-Type": "application/json"})
+                    response = connection.getresponse()
+                    return response.status, response.getheader("Content-Type"), response.read().decode()
+                finally:
+                    connection.close()
+
+            try:
+                with patch.object(DV, "prepare", return_value=picture):
+                    for stream in (False, True):
+                        with self.subTest(stream=stream):
+                            uid = "frame-" + str(stream)
+                            full = {"type": "image_url", "image_url": {"url": "test-image"}, "uuid": uid}
+                            known = {"type": "image_url", "image_url": None, "uuid": uid}
+                            self.assertEqual(post([full], stream)[0], 200)
+                            loads_before = list(loads)
+                            self.assertEqual(post([known], stream)[0], 200)
+                            self.assertEqual(loads, loads_before)
+                            unknown = {"type": "image_url", "image_url": None, "uuid": "absent"}
+                            status, content_type, raw = post([full, unknown], stream)
+                            self.assertEqual(status, 400)
+                            self.assertIn("application/json", content_type)
+                            self.assertEqual(json.loads(raw), {"error": {"type": "BadRequestError",
+                                "message": "Cache miss for image at index 1 but data is not provided.",
+                                "param": None, "code": 400}})
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=5)
+
+
 if __name__ == "__main__":
     unittest.main()
