@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import collections
 import contextlib
+import dataclasses
 import base64
 import bisect
 import hashlib
@@ -3421,7 +3422,7 @@ class Service:
                 prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
         given["_prefill"] = prefill
         given["_blocked"] = self._block_suffixes(blocked, tools, kwargs) if blocked and force is None else None
-        if looping and tools and force is None:
+        if looping and tools and force is None and not loop_guard.answers_user(asked):   # (an answer to the user ends)
             keep = self._keep_suffix(tools, kwargs)
             if keep is not None:                     # (+ what the model said before: stops_short's `seen`)
                 given["_blocked"] = {**(given["_blocked"] or {}), "_keep": keep + (loop_guard.said_before(asked),)}
@@ -4138,6 +4139,7 @@ class Service:
         think_resume = (sampling or {}).get("_think_resume")   # (ids, thinks): a quoted marker inside the thinking
         think_restarts = 0                          # times the thinking was resumed in this answer
         said = []                                   # this engine call's text for the user (stops_short)
+        join = None                                 # after a keep: the paragraph break before the continuation (#921)
         kept = 0                                    # times it was kept going in this answer
         called = False                              # it wrote a tool call (then its turn does not end here)
         pending, tries, sent_call = [], {}, False
@@ -4386,6 +4388,8 @@ class Service:
                                 # reasoning closed (the continuation opens none: #640's thinking, retracted)
                                 kept += 1
                                 self._kept_going(kept, "".join(said))
+                                tail = "".join(said)      # the join readable: the continuation starts a new
+                                join = "\n\n"[len(tail) - len(tail.rstrip("\n")):] if tail.strip() else ""
                                 ids_k, thinks, _ = keep
                                 if answered and thinks and self.think_end_id is not None:
                                     ids_k, thinks = [*ids_k, self.think_end_id], False
@@ -4452,6 +4456,17 @@ class Service:
                         self._note(n, evs, stat)
                         last_print = self._progress(last_print)
                         for ev in evs:
+                            if ev.kind == "content" and join is not None:
+                                # the continuation after a keep: in the client's text it starts a new paragraph (its
+                                # own leading line breaks go, the break stands - once, before its first words)
+                                t = ev.text.lstrip("\n")
+                                if not t:
+                                    continue
+                                if join:
+                                    yield "event", Event("content", join)
+                                join = None
+                                if t != ev.text:
+                                    ev = dataclasses.replace(ev, text=t)
                             if ev.kind == "content":
                                 said.append(ev.text)
                             elif ev.kind == "tool_call":
