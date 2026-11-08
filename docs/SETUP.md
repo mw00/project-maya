@@ -41,6 +41,21 @@ It first asks which model to set up:
   `tensor parallel 2 -> 1`, as with the Maya quants) - before v1.1.17 those ran every prompt in windows of 16 tokens,
   an order of magnitude slower on long prompts (a community measurement, 7x RTX 3090, Maya-S read in place: 32K tokens
   99 tokens/s in windows, 1010 in chunks). The GGUFs have no DSpark drafter and no vision tower.
+
+  If you already have a separate DeepSeek-V4.1-Flash DSpark GGUF, you can add it to a manually built GGUF pack without
+  copying its weights. The GGUF must contain the three-block, single-pass drafter in F32, BF16 and MXFP4:
+
+  ```sh
+  python3 tools/ds4/drafter_from_gguf.py --gguf /models/dspark/DSpark.gguf --out /models/dspark/dspark.json
+  python3 tools/ds4/pack_gguf.py --model /models/DeepSeek-V4.1-Flash-1017-GGUF/UD-Q8_K_XL --drafter /models/dspark/dspark.json
+  ```
+
+  The first command writes a small manifest and a relative `dspark.bin` symlink to the original GGUF. Use the resulting
+  `<model>/maya-ds4/` pack for the engine. Keep the source GGUF in place and unchanged while the pack is in use: its
+  size and header hash are recorded for provenance, but the pack and engine do not revalidate them at load. The
+  `--out` path and the drafter link path relative to the model cannot contain whitespace (`tensors.txt` separates paths
+  on whitespace). This symlink workflow has been tested on Linux; Windows symlink creation and loading have not been
+  verified and may require Developer Mode or administrator privileges.
 - **MiniMax-M3.1-Flash** (`--model MiniMax-M3.1-Flash`) - [Mia-AiLab's EXL3 quant at 3.5 bits](https://huggingface.co/Mia-AiLab/MiniMax-M3.1-Flash-EXL3-EAQ-v1-3.5-bpw)
   (197 GB with MiniMax's DSpark drafter; every file pinned and checked, `tools/mm3/download.json`) on its own engine
   (`build/maya-mm3`): NVIDIA from V100 on, Linux and Windows, and AMD (as GLM's EXL3 quants); Maya's GGUF quants
