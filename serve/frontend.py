@@ -342,7 +342,10 @@ def _parts_of(content):
         if not isinstance(part, dict):
             continue
         if part.get("type") in IMAGE_PARTS:
-            items.append({"type": "image", "source": _image_source(part)})
+            image = {"type": "image", "source": _image_source(part)}
+            if part.get("uuid"):
+                image["uuid"] = part["uuid"]
+            items.append(image)
         elif part.get("type") in VIDEO_PARTS:
             items.append({"type": "video", "source": _video_source(part)})
         elif part.get("type") in ("text", "input_text", None) and "text" in part:
@@ -364,7 +367,7 @@ def media_of(messages: list[dict]) -> list[tuple[str, str]]:
             for item in m["content"] if item.get("type") in ("image", "video")]
 
 
-def deepseek_images(messages: list[dict]) -> list[str]:
+def deepseek_images(messages: list[dict], *, with_ids: bool = False) -> list:
     """Image sources in the reference encoder's final tool-result/prompt order."""
     from serve.ds41_encoding import (_extract_image, _is_image_block, merge_tool_messages,
                                      sort_tool_results_by_call_order)
@@ -395,6 +398,9 @@ def deepseek_images(messages: list[dict]) -> list[str]:
             sources.append(_image_source({"type": "image", "source": source}))
         else:
             sources.append(item.get("url") or item.get("data") or "")
+    if with_ids:
+        return [{"source": source, "uuid": item["uuid"], "index": index} if item.get("uuid") else source
+                for index, (source, item) in enumerate(zip(sources, images))]
     return sources
 
 

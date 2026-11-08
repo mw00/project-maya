@@ -386,6 +386,8 @@ class ContextOverflow(ValueError):
 
 def error_body(e: Exception, kind: str = "invalid_request_error") -> dict:
     """An error response's body: OpenAI's shape, with the exception's `code` when it has one (ContextOverflow)."""
+    if isinstance(e, ds4_vision.ImageCacheMiss):
+        return {"error": {"type": "BadRequestError", "message": str(e), "param": None, "code": 400}}
     err = {"type": kind, "message": str(e)}
     if getattr(e, "code", None):
         err["code"] = e.code
@@ -3477,7 +3479,7 @@ class Service:
             # screenshot) - its template already wrote its own note in their place ("You are unable to process this
             # image ..."), so the agent's turn goes on instead of failing every retry; a user's picture is the 400 below
             media = []
-        images = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
+        images = (deepseek_images(messages, with_ids=True) if getattr(self.template, "deepseek", False)
                   else [src for kind, src in media if kind == "image"])
         if isinstance(self.vision, ENGINE_VISION) and any(kind == "video" for kind, _ in media):
             # the engines' own vision towers (DeepSeek, MiniMax) read pictures only: say so instead of dropping the
@@ -3645,7 +3647,7 @@ class Service:
         messages, tools, kw = self.chat_prompt(req)
         if getattr(self.template, "deepseek", False) or isinstance(self.vision, mm3_vision.Vision):
             # (DeepSeek, MiniMax: the engine's own vision tower - a picture's span is its resize's)
-            sources = (deepseek_images(messages) if getattr(self.template, "deepseek", False)
+            sources = (deepseek_images(messages, with_ids=True) if getattr(self.template, "deepseek", False)
                        else [src for kind, src in media_of(messages) if kind == "image"])
             n, approximate = len(self.render_ids(messages, tools, kw)), bool(sources)
             if sources and isinstance(self.vision, ENGINE_VISION):

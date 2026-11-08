@@ -248,6 +248,11 @@ slowest while the caches fill with what you use.
 - **Loop guard:** on by default - an agent that repeats the same tool call with the same result is steered off it.
 - **Pictures:** attach one in the chat, or send image parts through either API. Every model reads them (setup details per
   model: [docs/MODELS.md](docs/MODELS.md)). Videos too, for the models that read them.
+  DeepSeek image parts can include a `uuid` alongside their data. Later requests can send
+  `{"type":"image_url","image_url":null,"uuid":"frame-1"}` to reuse that picture. The server keeps the
+  64 most recently used UUIDs in memory. A retained UUID keeps its original picture. After a server restart
+  or eviction, the client can register it again with its data. A missing UUID returns HTTP 400 with `Cache miss for image at index N but data is not provided.`
+  so the client can retry with the image data.
 - **Files:** attach any file in the chat. Text and code go in as they are; **PDFs** as their text, or a scanned one's
   first pages as pictures; Word, Excel, PowerPoint, OpenDocument, EPUB and RTF files as their text. Anything Maya can't
   read says why. The same works through the APIs: OpenAI `file` / `input_file` parts and Anthropic `document` blocks
