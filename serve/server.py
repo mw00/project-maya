@@ -1180,6 +1180,10 @@ class StrataEngine:
             think += f" think_soft={soft}{stops}"   # (#746: the engine closes at the sentence's end, a prefix of the state)
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune, tune_keys = sampling.get("strata_tune"), ""
+        _spec_def = os.environ.get("STRATA_SPEC_DEFAULT", "").strip()
+        if _spec_def.isdigit() and not (isinstance(tune, dict) and tune.get("spec") is not None):
+            # local: default the DFlash verify window (spec tune) for requests that name none
+            tune = {**(tune if isinstance(tune, dict) else {}), "spec": int(_spec_def)}
         if isinstance(tune, dict):
             for k in ("pcie_frac", "spec_min_p", "spec_cum"):
                 v = tune.get(k)
@@ -6611,7 +6615,7 @@ class Server(ThreadingHTTPServer):
 SERVER_ENV = ("STRATA_ENGINE_STALL_S", "STRATA_REQUEST_QUIET_S", "STRATA_DRAIN_S", "STRATA_HTTP_BACKLOG",
               "STRATA_MAX_BODY_MIB", "STRATA_FAIR_SLICE_S", "STRATA_DS4_KEEP_THINKING",
               "STRATA_SERVER_LOG", "STRATA_GLM_THINK_RESERVE", "STRATA_LOOP_GUARD", "STRATA_QUEUE_PING_S",
-              "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE") + RESPONSE_ENV_KEYS + \
+              "STRATA_UPDATE_CHECK", "STRATA_PACK_TEMPLATE", "STRATA_SPEC_DEFAULT") + RESPONSE_ENV_KEYS + \
     tuple(maya_names.read_as(k) for k in ("MAYA_DS4_RESTORE_POINTS", "MAYA_DS4_RESTORE_TAIL"))
 
 
