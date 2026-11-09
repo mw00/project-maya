@@ -109,6 +109,7 @@ class ExistingDrafterGguf(unittest.TestCase):
         result = DG.convert(self.source, output)
         self.assertEqual((result["source_tensors"], result["mapped_entries"], result["payload_bytes_written"]),
                          (78, 1221, 0))
+        self.assertEqual(result["binary_mode"], "symlink")
         self.assertEqual(self.source.read_bytes(), original)
         link = output.with_suffix(".bin")
         self.assertTrue(link.is_symlink())
@@ -152,6 +153,29 @@ class ExistingDrafterGguf(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "Refusing to replace"):
             DG.convert(self.source, output)
         self.assertEqual((physical / "dspark.bin").read_bytes(), b"unrelated")
+
+    def test_windows_copy_fallback_when_symlink_is_unavailable(self):
+        synthetic_gguf(self.source, tensors())
+        output = self.root / "draft" / "dspark.json"
+        with patch.object(DG, "WINDOWS", True), patch.object(Path, "symlink_to", side_effect=OSError("no privilege")):
+            result = DG.convert(self.source, output)
+        binary = output.with_suffix(".bin")
+        self.assertFalse(binary.is_symlink())
+        self.assertEqual(binary.read_bytes(), self.source.read_bytes())
+        self.assertEqual(result["binary_mode"], "copy")
+        self.assertEqual(result["payload_bytes_written"], self.source.stat().st_size)
+        self.assertTrue(output.is_file())
+
+    def test_failed_windows_copy_leaves_no_output(self):
+        synthetic_gguf(self.source, tensors())
+        output = self.root / "draft" / "dspark.json"
+        with patch.object(DG, "WINDOWS", True), patch.object(Path, "symlink_to", side_effect=OSError("no privilege")), \
+                patch.object(DG.shutil, "copyfileobj", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                DG.convert(self.source, output)
+        self.assertFalse(output.exists())
+        self.assertFalse(output.with_suffix(".bin").exists())
+        self.assertEqual(list(output.parent.glob("*.part")), [])
 
     def test_rejects_whitespace_output_path_before_writing(self):
         synthetic_gguf(self.source, tensors())

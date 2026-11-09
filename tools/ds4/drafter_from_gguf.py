@@ -1,10 +1,11 @@
-"""Use an existing DeepSeek-V4.1-Flash DSpark GGUF as a Maya drafter, without copying its weight file.
+"""Use an existing DeepSeek-V4.1-Flash DSpark GGUF as a Maya drafter.
 
     python tools/ds4/drafter_from_gguf.py --gguf <dspark.gguf> --out <dspark.json>
     python tools/ds4/pack_gguf.py --model <model-ggufs> --drafter <dspark.json>
 
 The JSON has the same ``tensors`` and ``config`` entries as drafter_pack.py's output. Its sibling .bin is a
-relative symlink to the GGUF; tensor offsets point into that file, past its GGUF header. The GGUF must hold the
+relative symlink to the GGUF (or a copy on Windows when symlinks are unavailable); tensor offsets point into that
+file, past its GGUF header. The GGUF must hold the
 three-block, single-pass DeepSeek-V4.1-Flash drafter in F32, BF16 and MXFP4.
 The output path cannot contain whitespace because tensors.txt uses whitespace-separated file paths.
 """
@@ -18,6 +19,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import sys
 
 from pack_gguf import Gguf, LAYER, TYPES
@@ -40,6 +42,7 @@ BLOCK_TENSORS = {
     "hc_attn_scale.weight", "hc_ffn_base.weight", "hc_ffn_fn.weight", "hc_ffn_scale.weight",
 }
 PRECISIONS = {0, 30, 39}  # F32, BF16, MXFP4
+WINDOWS = os.name == "nt"
 
 
 def manifest(source: Path) -> dict:
@@ -142,7 +145,7 @@ def manifest(source: Path) -> dict:
 
 
 def convert(source: Path, out: Path) -> dict:
-    """Write only metadata and a link; leave the GGUF untouched."""
+    """Write metadata and a link, or copy on Windows if symlinks are unavailable."""
     source = source.expanduser().resolve(strict=True)
     payload = manifest(source)
     out = out.expanduser()
@@ -160,11 +163,13 @@ def convert(source: Path, out: Path) -> dict:
     if binary.exists() or binary.is_symlink():
         if not binary.is_symlink() or binary.resolve() != source:
             raise SystemExit(f"Refusing to replace {binary}")
-        new_link = False
+        new_binary = False
     else:
-        new_link = True
-    created_link = False
+        new_binary = True
+    created_binary = False
+    binary_mode = "symlink"
     temporary = None
+    temporary_binary = None
     try:
         for _ in range(10):
             candidate = output.with_name(f".{output.name}.{secrets.token_hex(12)}.part")
@@ -177,25 +182,42 @@ def convert(source: Path, out: Path) -> dict:
                 continue
         else:
             raise SystemExit(f"Could not create a temporary file beside {output}")
-        if new_link:
-            binary.symlink_to(os.path.relpath(source, binary.parent))
-            created_link = True
+        if new_binary:
+            try:
+                binary.symlink_to(os.path.relpath(source, binary.parent))
+            except (OSError, ValueError):  # Windows can also report a different source drive.
+                if not WINDOWS:
+                    raise
+                temporary_binary = binary.with_name(f".{binary.name}.{secrets.token_hex(12)}.part")
+                with source.open("rb") as src, temporary_binary.open("xb") as dst:
+                    shutil.copyfileobj(src, dst, 1024 * 1024)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                if binary.exists() or binary.is_symlink():
+                    raise SystemExit(f"Refusing to replace {binary}")
+                temporary_binary.replace(binary)
+                binary_mode = "copy"
+            created_binary = True
         temporary.replace(output)
     except BaseException:
-        if created_link:
+        if created_binary:
             binary.unlink(missing_ok=True)
         raise
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
-    return {"json": str(output), "binary_symlink": str(binary), "source_tensors": len(payload["source_tensors"]),
-            "mapped_entries": len(payload["tensors"]), "config": payload["config"], "payload_bytes_written": 0}
+        if temporary_binary is not None:
+            temporary_binary.unlink(missing_ok=True)
+    return {"json": str(output), "binary": str(binary), "binary_mode": binary_mode,
+            "source_tensors": len(payload["source_tensors"]), "mapped_entries": len(payload["tensors"]),
+            "config": payload["config"], "payload_bytes_written": source.stat().st_size if binary_mode == "copy" else 0}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--gguf", type=Path, required=True, help="the existing DSpark GGUF")
-    ap.add_argument("--out", type=Path, required=True, help="output JSON; a sibling .bin links to the GGUF")
+    ap.add_argument("--out", type=Path, required=True,
+                    help="output JSON; sibling .bin links to the GGUF (Windows: copies if links are unavailable)")
     args = ap.parse_args()
     print(json.dumps(convert(args.gguf, args.out)))
     return 0
