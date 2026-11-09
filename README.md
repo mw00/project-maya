@@ -253,6 +253,11 @@ slowest while the caches fill with what you use.
   64 most recently used UUIDs in memory. A retained UUID keeps its original picture. After a server restart
   or eviction, the client can register it again with its data. A missing UUID returns HTTP 400 with `Cache miss for image at index N but data is not provided.`
   so the client can retry with the image data.
+  UUIDs belong to this server's DeepSeek vision adapter and are shared across conversations and clients;
+  any client admitted by the server can reuse a known UUID. They are not an authorization boundary.
+  Use application-namespaced, unpredictable IDs to avoid collisions; independent tenants need separate server instances.
+  Prepared RGB pictures are stored in host RAM, not VRAM. The limit is 64 IDs, not a byte budget:
+  memory depends on resized dimensions, and the ordinary 32-picture content cache shares references where possible.
 - **Files:** attach any file in the chat. Text and code go in as they are; **PDFs** as their text, or a scanned one's
   first pages as pictures; Word, Excel, PowerPoint, OpenDocument, EPUB and RTF files as their text. Anything Maya can't
   read says why. The same works through the APIs: OpenAI `file` / `input_file` parts and Anthropic `document` blocks
