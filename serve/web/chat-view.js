@@ -360,7 +360,7 @@ function Composer({center}) {
     t.style.height = `${Math.min(t.scrollHeight, Math.round(innerHeight * 0.4))}px`;
   }, [text, S.attachments.length, tall]);   // (not on every repaint: the chat below must not jump while it streams)
   const keydown = (e) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !coarse()) { e.preventDefault(); send(); }
+    if (e.key === "Enter" && !e.shiftKey && !e.isComposing && e.keyCode !== 229 && !coarse()) { e.preventDefault(); send(); }
   };
   const paste = (e) => {
     if (!S.health.images) return;
