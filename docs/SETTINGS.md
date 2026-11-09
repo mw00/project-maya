@@ -988,15 +988,21 @@ reads only its own tokens.
 - **In pieces** of `MAYA_DS4_PREREAD_PIECE` tokens (256), each an engine call of its own: a request that comes
   meanwhile waits at most for the piece being read (on a layer split the engine stops a read only between its chunks,
   and a whole answer is one chunk), then reads what it would have read anyway.
+- **For one person's chats more than a shared server:** a request that arrives while a piece is read waits for it
+  (another chat's message: 4.8-5.5 s against ~1 s unset on the PC below), so a server several people use at once
+  sees those waits.
 - **A wrong guess costs nothing extra:** the first piece keeps a restore point one token past where this turn's prompt
   and the guess part (`marks=`, with `MAYA_DS4_RESTORE_POINTS` on), so a next prompt that differs (a client that edits
   the answer) goes back to the last piece before the change.
 - **Not for** a history whose reasoning the template keeps (tools given, or `MAYA_DS4_KEEP_THINKING=1`): that next
   prompt already goes on from the engine's own state. Nor after a tool call, a thinking-off answer or one cut short,
   nor for the web app's MCP chats.
-- **The follow-up's logits move slightly:** its prompt is read in other chunks than without the setting (pinned
-  placement, the follow-up's first rows: truncated top-20 KL 0.025-0.027 against 0.003 between two unset runs, top-1
-  the same 92%).
+- **The follow-up comes out as different text:** its prompt is read in other chunks than without the setting, so its
+  logits move slightly (pinned placement, the follow-up's first rows: truncated top-20 KL 0.025-0.027 against 0.003
+  between two unset runs, top-1 the same 92%), and greedy decoding forks at the first near-tie: 16 of 16 greedy
+  follow-ups differed from unset ones, in the reasoning after 7-38 words, in a test whose runs otherwise repeat
+  exactly (pinned placement, `MAYA_DS4_STREAM=0`, the same experts in VRAM at start; set against set: 16 of 16 the
+  same). No sign they were worse. This is why the setting is opt-in.
 - The log has a line a pre-read: `[maya] pre-read: N tokens, done after S s (R of M read ahead, P of Q pieces)`, or
   `stopped by a request` (`piece P of Q under way`: stopped inside a piece, which the engine may still finish).
 
@@ -1010,7 +1016,7 @@ the chunked pass (0 of 2), at no visible cost unset.
 
 | Setting | Default | |
 | --- | --- | --- |
-| `MAYA_DS4_PREREAD` | off | `1`: after a thinking answer, the server reads the chat's next turn start (above). OpenAI chat completions; one conversation at a time measured, not `--parallel` |
+| `MAYA_DS4_PREREAD` | off | `1`: after a thinking answer, the server reads the chat's next turn start (above). OpenAI chat completions; one conversation at a time measured, not `--parallel`. A greedy follow-up comes out as different text, and a request that arrives during a pre-read waits for a piece: for one person's chats more than a shared server |
 | `MAYA_DS4_PREREAD_PIECE` | 256 | tokens a piece of the read-ahead: a request that comes meanwhile waits at most for one piece (~4 s at 256 on the PC above; 128: ~3 s, but the read-ahead of a long answer is not done before the next message); `0`: the whole read in one call |
 
 ## DeepSeek: choosing the drafter GPU group (experimental)
