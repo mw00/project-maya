@@ -276,8 +276,7 @@ class Sampler(unittest.TestCase):
             (root / "class/thermal/thermal_zone0").mkdir(parents=True)
             (root / "class/thermal/thermal_zone0/type").write_text("x86_pkg_temp\n", encoding="utf-8")
             (root / "class/thermal/thermal_zone0/temp").write_text("48000\n", encoding="utf-8")
-            with mock.patch.object(T, "SYSFS", d):
-                self.assertEqual(T.cpu_temp(), 55.0)
+            self.assertEqual(T.cpu_temp([d]), 55.0)
 
     def test_cpu_temperature_from_kernel_thermal_zone(self):
         """A Xeon whose DTS is only a thermal zone: Maya reads x86_pkg_temp directly; a PCH zone is not the CPU."""
@@ -289,8 +288,18 @@ class Sampler(unittest.TestCase):
                 (root / "class/thermal" / zone).mkdir(parents=True)
                 (root / "class/thermal" / zone / "type").write_text(kind + "\n", encoding="utf-8")
                 (root / "class/thermal" / zone / "temp").write_text(value + "\n", encoding="utf-8")
-            with mock.patch.object(T, "SYSFS", d):
-                self.assertEqual(T.cpu_temp(), 48.0)
+            self.assertEqual(T.cpu_temp([d]), 48.0)
+
+    def test_cpu_temperature_can_be_simulated_from_another_root(self):
+        """MAYA_CPU_SENSOR_ROOT lets a VM read a sensor tree the host shares (here one simulated coretemp chip)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as sim, tempfile.TemporaryDirectory() as real:
+            chip = Path(sim) / "hwmon" / "hwmon0"
+            chip.mkdir(parents=True)
+            (chip / "name").write_text("coretemp\n", encoding="utf-8")
+            (chip / "temp1_input").write_text("42000\n", encoding="utf-8")
+            with mock.patch.object(T, "CPU_SENSOR_ROOT", sim), mock.patch.object(T, "SYSFS", real):
+                self.assertEqual(T.cpu_temp(), 42.0)
 
     def test_this_machine(self):
         """The real reader on this machine (NVML or none): it answers or says there is nothing - never raises."""
