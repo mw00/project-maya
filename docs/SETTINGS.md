@@ -1858,6 +1858,23 @@ The engine's log says what happened (`ds4 slots: saved/took back/wrote ...`; the
 DSpark blocks are loaded, so a slot from another model, another pack or an engine that changed the state's layout is
 refused rather than read.
 
+### Moving a kept conversation to another server
+
+With `MAYA_DS4_SLOT_KEEP=1`, a kept conversation can move to another Maya server of the same model, pack and version -
+another process, another GPU split, another machine - so its next prompt there reads only what was added:
+
+- `POST /slots/export` with a chat request's `messages` (and `tools`) answers with the kept conversation sharing the most
+  of that prompt; an empty body, the latest. The answer is one `application/octet-stream` bundle: `MAYASLT1`, the
+  `.meta`'s length (u64, little-endian), the `.meta`, the `.bin`; `X-Maya-Slot-Tokens` is its length in tokens.
+- `POST /slots/import` with that bundle as the body (with its `Content-Length`) keeps it in the receiver's folder, like a
+  conversation it wrote itself: `{"tokens", "bytes"}`. A bundle from another model, pack or version is a 400 (the
+  identity above) and nothing is kept.
+
+The server only moves the bytes; which conversation goes where is the caller's choice. DeepSeek only so far, and not with
+`--parallel` (both are a 400). A 69,455-token conversation was a 79 MB bundle: exported from a server on two RTX 5090s in
+0.12 s, imported into a fresh server on one of them in 1.05 s, and the same prompt there answered after 0.27 s instead of
+the 21-26 s of a cold read.
+
 ## DeepSeek: restore points inside a prompt (opt-in until measured)
 
 The engine can take a conversation back to three places: the end of its last prompt, the position before it, and the

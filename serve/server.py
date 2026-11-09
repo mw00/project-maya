@@ -37,6 +37,7 @@ import os
 import queue
 import socket
 import re
+import shutil
 import subprocess
 import struct
 import sys
@@ -371,6 +372,9 @@ def fair_slice_seconds() -> float:
         return max(0.0, float(os.environ.get("STRATA_FAIR_SLICE_S", "0") or 0))
     except ValueError:
         return 0.0
+
+
+SLOT_MAGIC = b"MAYASLT1"   # /slots/export's and /slots/import's bundle: this, the .meta's length (u64 LE), the .meta, the .bin
 
 
 class EngineDied(RuntimeError):
@@ -3612,6 +3616,42 @@ class Service:
                                   else effort_kwargs(self.default_effort))}
         return messages, tools, kw
 
+    def _slot_engine(self, what: str):
+        if not getattr(self.template, "deepseek", False) or not hasattr(self.engine, "command"):
+            raise ValueError(f"{what}: only the DeepSeek engine exports and imports conversations so far")
+        if int(getattr(self.engine, "multi", 0) or 0) > 1:
+            raise ValueError(f"{what}: not with --parallel (one conversation at a time)")
+
+    def slot_export(self, req: dict) -> tuple[str, int, int]:
+        """POST /slots/export (#655): a kept conversation as SLOT_MAGIC + the .meta's length + the .meta + the .bin,
+        which /slots/import on an engine of the same model, pack and Maya version takes in.  `messages` (with `tools`,
+        as a chat request) picks the kept conversation that shares the most of that prompt; without them the latest.
+        -> (the temporary .bin, its tokens, its bytes); the caller sends it and removes its folder."""
+        self._slot_engine("export")
+        ids = []
+        if "messages" in req:
+            messages, tools, kw = self.chat_prompt(req)
+            ids = self.render_ids(messages, tools, kw)
+        tmp = tempfile.mkdtemp(prefix="maya-slot-out-")
+        path = os.path.join(tmp, "slot.bin")
+        line = f"SLOTOUT {path}" + (" " + ",".join(str(t) for t in ids) if ids else "")
+        try:
+            with self.fifo:
+                got = self.engine.command(line, "SLOTSAVED", timeout=600.0)
+        except Exception:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+        _, n, size = got.split()
+        return path, int(n), int(size)
+
+    def slot_import(self, path: str) -> dict:
+        """POST /slots/import (#655): the .bin at `path` (its .meta beside it) into the engine's kept conversations."""
+        self._slot_engine("import")
+        with self.fifo:
+            got = self.engine.command(f"SLOTIN {path}", "SLOTADDED", timeout=600.0)
+        _, n, size = got.split()
+        return {"tokens": int(n), "bytes": int(size)}
+
     def tokenize(self, req: dict) -> dict:
         """POST /tokenize (llama.cpp's and vLLM's): the ids of `content` (llama.cpp's name) or `prompt` (vLLM's), or
         of a chat request's whole prompt (`messages`, with its `tools`: chat_prompt, as /api/tokens counts it - a
@@ -5334,6 +5374,72 @@ def make_handler(svc: Service):
                                    "(STRATA_MAX_BODY_MIB raises the limit)")
             return self.rfile.read(length)
 
+        def _slot_export(self):
+            """POST /slots/export: the bundle (SLOT_MAGIC, the .meta's length, the .meta, the .bin) streamed back."""
+            try:
+                req = json.loads(self._body() or b"{}")
+                if not isinstance(req, dict):
+                    raise ValueError("the request body must be a JSON object")
+                path, n, size = svc.slot_export(req)
+            except (ValueError, TypeError) as e:
+                self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+                return
+            try:
+                meta = Path(path[:-4] + ".meta").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Length", str(8 + 8 + len(meta) + size))
+                self.send_header("X-Maya-Slot-Tokens", str(n))
+                self.end_headers()
+                self.wfile.write(SLOT_MAGIC + struct.pack("<Q", len(meta)) + meta)
+                with open(path, "rb") as f:
+                    shutil.copyfileobj(f, self.wfile, 8 << 20)
+            finally:
+                shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+        def _slot_import(self):
+            """POST /slots/import: a /slots/export bundle as the body (Content-Length, streamed to a temporary pair)."""
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+            except ValueError:
+                length = -1
+            if length <= 16:
+                self.close_connection = True
+                self._json(400, {"error": {"type": "invalid_request_error",
+                                           "message": "/slots/import needs a /slots/export bundle with Content-Length"}})
+                return
+            tmp = tempfile.mkdtemp(prefix="maya-slot-in-")
+            got, err = None, ""
+            try:
+                head = self.rfile.read(16)
+                if len(head) != 16 or head[:8] != SLOT_MAGIC:
+                    raise ValueError("the body is not a /slots/export bundle")
+                (ml,) = struct.unpack("<Q", head[8:])
+                if ml > 64 << 20 or 16 + ml > length:
+                    raise ValueError("the bundle's .meta length does not fit the body")
+                meta = self.rfile.read(ml)
+                if len(meta) != ml:
+                    raise ValueError("the bundle ended inside its .meta")
+                Path(tmp, "slot.meta").write_bytes(meta)
+                left = length - 16 - ml
+                with open(os.path.join(tmp, "slot.bin"), "wb") as f:
+                    while left > 0:
+                        piece = self.rfile.read(min(left, 8 << 20))
+                        if not piece:
+                            raise ValueError("the bundle ended inside its .bin")
+                        f.write(piece)
+                        left -= len(piece)
+                got = svc.slot_import(os.path.join(tmp, "slot.bin"))
+            except (ValueError, TypeError) as e:
+                err = str(e)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)   # (before the answer: the copy is gone when the client hears)
+            if got is None:
+                self.close_connection = True
+                self._json(400, {"error": {"type": "invalid_request_error", "message": err}})
+            else:
+                self._json(200, got)
+
         def _json(self, code, obj):
             body = json.dumps(obj, ensure_ascii=False).encode()
             self.send_response(code)
@@ -6096,6 +6202,12 @@ def make_handler(svc: Service):
                         return
                     svc.savings.reset()
                     self._json(200, svc.savings.report())
+                    return
+                if path == "/slots/export":
+                    self._slot_export()
+                    return
+                if path == "/slots/import":
+                    self._slot_import()
                     return
                 if path == "/api/savings/prices":
                     # Settings > Savings: a model's API prices ({"model", "price": {input, cached, output} or null:
