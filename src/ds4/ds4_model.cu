@@ -1520,6 +1520,7 @@ struct Model::Impl {
     // call's jobs' times summed (x rows, gate / up, down) and each call's wall
     long iq_calls = 0, iq_ents_n = 0, iq_rows_n = 0;
     std::atomic<uint64_t> iq_call_ns{}, iq_gu_ns{}, iq_dn_ns{}, iq_xq_ns{}, iq_gu_n{}, iq_dn_n{}, iq_xq_n{};
+    long iq_flo_chk_ok = 0;   // (DS4_IQ_FLOW_CHECK: the flow's calls whose per-call compare came back clean)
     Exl3Lane lane_x;                            // (cpu_experts' view of them, ds4_cpu_exl3.hpp)
     // the state
     int64_t pos = 0;
@@ -11167,6 +11168,97 @@ struct Model::Impl {
                 iq_call_ns.fetch_add((uint64_t) ((now_ms() - tc) * 1e6), std::memory_order_relaxed);
                 iq_ents_n += (long) ents.size();
                 for (const Ent& en : ents) iq_rows_n += (long) en.n;
+            }
+            // ---- DS4_IQ_FLOW_CHECK=1: the flow's outputs of THIS call against the two-barrier steps, bit for
+            // bit: snapshot every slot's h and yd rows, quantize the x rows again (the same floats, the same
+            // quantize), run the serial phases into the same buffers, and compare every byte.  The buffers
+            // end as the flow's either way: a byte that differs is counted and restored from the snapshot,
+            // and reported with the profile's save.  The check path costs the serial phases again a call.
+            static const bool flo_chk = std::getenv("DS4_IQ_FLOW_CHECK") != nullptr &&
+                                        std::atoi(std::getenv("DS4_IQ_FLOW_CHECK")) != 0;
+            if (flo_chk) {
+                int rows = 0;
+                for (const Ent& en : ents) rows = std::max(rows, en.slot0 + en.n);
+                std::vector<float> iq_yd((size_t) rows * E);
+                std::memcpy(iq_yd.data(), c_yd.data(), iq_yd.size() * 4);
+                std::vector<uint8_t> iq_hq((size_t) rows * fm.h_bytes);
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i)
+                        std::memcpy(iq_hq.data() + (size_t) (en.slot0 + i) * fm.h_bytes,
+                                    aq + (size_t) (kWin + en.slot0 + i) * E * 4, fm.h_bytes);
+                {
+                    bool done[kWin] = {};
+                    for (const Ent& en : ents)
+                        for (int i = 0; i < en.n; ++i) {
+                            const int t = en.tok[i];
+                            if (t < kWin && done[t]) continue;
+                            if (t < kWin) done[t] = true;
+                            gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
+                        }
+                }
+                // the gate / up phase, across the pools the same way the steps run it: node X its rows
+                std::function<void(int)> fc[4];
+                for (int X = 0; X < NH; ++X)
+                    fc[X] = [&, X](int j) {
+                        const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
+                        const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                        const void* ap[gg::kMxCpuMaxN];
+                        float* hp[gg::kMxCpuMaxN];
+                        for (int i = 0; i < en.n; ++i) {
+                            ap[i] = x_act(en, i);
+                            hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;
+                        }
+                        gg::iq_cpu_gate_up(fm, ent_part(l, en, 0, X), ent_part(l, en, 1, X), ap, en.n, hp,
+                                           r0 - X * FFh, r1 - X * FFh, lim);
+                    };
+                run_nodes(ne * GB, fc);
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i)
+                        gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                         aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+                for (int X = 0; X < NH; ++X)
+                    fc[X] = [&, X](int j) {
+                        const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
+                        const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                        const void* hp[gg::kMxCpuMaxN];
+                        float* yp[gg::kMxCpuMaxN];
+                        for (int i = 0; i < en.n; ++i) {
+                            hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                            yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;
+                        }
+                        gg::iq_cpu_down(fm, ent_part(l, en, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+                    };
+                run_nodes(ne * DB, fc);
+                // the compare: every slot's h bytes and yd row, bank against bank
+                int dbad = 0, hbad = 0, dfirst = -1;
+                for (const Ent& en : ents)
+                    for (int i = 0; i < en.n; ++i) {
+                        const int s = en.slot0 + i;
+                        const uint8_t* got_hq = aq + (size_t) (kWin + s) * E * 4;
+                        for (size_t o = 0; o < fm.h_bytes && hbad < 4; ++o)
+                            if (iq_hq[(size_t) s * fm.h_bytes + o] != got_hq[o]) {
+                                ++hbad;
+                                if (hbad == 1) std::fprintf(stderr, "  first h byte diff: slot %d offset %zu\n", s, o);
+                            }
+                        for (int e = 0; e < E; ++e)
+                            if (std::memcmp(&iq_yd[(size_t) s * E + e], &c_yd[(size_t) s * E + e], 4) != 0) {
+                                ++dbad;
+                                if (dfirst < 0) dfirst = e;
+                            }
+                    }
+                if (hbad || dbad) {
+                    std::fprintf(stderr, "ds4: IQ flow check FAILED: %ld calls ok, %d slots' h bytes differ, "
+                                         "%d outputs differ (first row column %d) - restoring the flow's bytes and "
+                                         "\n", iq_flo_chk_ok, hbad, dbad, dfirst);
+                    std::fflush(stderr);
+                    std::abort();
+                }
+                ++iq_flo_chk_ok;
+                for (const Ent& en : ents)   // (restore the flow's own outputs: the steps' equal them, so this
+                    for (int i = 0; i < en.n; ++i)   //  is for the next call's snapshot integrity)
+                        std::memcpy(aq + (size_t) (kWin + en.slot0 + i) * E * 4,
+                                    iq_hq.data() + (size_t) (en.slot0 + i) * fm.h_bytes, fm.h_bytes);
+                std::memcpy(c_yd.data(), iq_yd.data(), iq_yd.size() * 4);
             }
             return;
         }
@@ -22539,6 +22631,9 @@ struct Model::Impl {
                          (double) iq_gu_ns.load() / 1e3 / std::max(1l, (long) iq_gu_n.load()),
                          (double) iq_dn_ns.load() / 1e3 / std::max(1l, (long) iq_dn_n.load()),
                          (double) iq_call_ns.load() / 1e6 / iq_calls);
+        if (std::getenv("DS4_CPU_STATS") != nullptr && iq_flo_chk_ok > 0)
+            std::fprintf(stderr, "CPU lane iq flow check: %ld calls matched the two-barrier steps bit for bit\n",
+                         iq_flo_chk_ok);
         if (std::getenv("DS4_CPU_STATS") != nullptr && cpu_calls > 0)
             std::fprintf(stderr, "CPU lane: %ld calls, %.2f experts and %.2f rows a call; per call: gate/up %.3f ms, "
                                  "bands %.3f, down %.3f, down bands %.3f\n", cpu_calls, (double) cpu_ents / cpu_calls,
