@@ -13,6 +13,7 @@ import errno
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 
@@ -84,6 +85,9 @@ class CudaCheckpoint:
     @classmethod
     def get(cls):
         """The driver, or None when this host has no CUDA driver with process checkpoints (cached)."""
+        if sys.platform != "linux":
+            cls.unavailable = "CUDA checkpoint sleep is supported only on Linux"
+            return None
         with cls._lock:
             if cls._shared is None:
                 try:
