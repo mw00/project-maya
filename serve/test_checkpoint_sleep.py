@@ -45,6 +45,27 @@ class CheckpointTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             d.mode_from_config({"deep_sleep": "native"})
 
+    def test_non_linux_checkpoint_does_not_load_cuda(self):
+        for platform in ("win32", "darwin"):
+            with self.subTest(platform=platform), \
+                    patch.object(d, "sys", SimpleNamespace(platform=platform)), \
+                    patch.object(d.ctypes, "CDLL") as load:
+                self.assertIsNone(d.CudaCheckpoint.get())
+                load.assert_not_called()
+
+    def test_no_driver_or_non_cuda_engine_cleanly_refuses_sleep(self):
+        for available in (False, True):
+            with self.subTest(driver_available=available):
+                svc = self.service()
+                svc.engine.deep_sleep = "checkpoint"
+                svc.engine.proc = SimpleNamespace(pid=123)
+                with patch.object(d, "driver", return_value=Driver() if available else None), \
+                        patch.object(d, "cuda_processes", return_value=[]), \
+                        patch.object(d, "sleep") as checkpoint:
+                    self.assertEqual(svc.sleep(), {"status": "unsupported"})
+                    checkpoint.assert_not_called()
+                    self.assertFalse(svc.engine.sleeping)
+
     def test_sleep_and_wake_are_idempotent(self):
         svc = self.service()
         svc.engine.sleeping = True
